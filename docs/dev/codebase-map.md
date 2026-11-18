@@ -35,12 +35,13 @@ locations, browse `src/luxir/<area>/`.
    - `ReaderManager`: Per-collection snapshot publication, reader refresh, and filter cache;
      searches do not require an `IndexWriter`. Schema-only snapshots share physical cores.
    - `ResolvedSchema.cpp`: Declared representations and segment-generation coverage
-   - `IndexReader` is for reading a whole index and contains a `PostingsReader` per index segment;
-     opening secures every file by handle (`HeldFiles`) and reads only summaries; each segment's
-     base, live docs and overlays are lazy parts (`SegmentBase`, `SegmentLive`, `SegmentOverlay`)
-     materialized by `IndexReader::materialize` at the search's batched point
-     (`SearchEngine::submitBody`) or on first use. A reopen shares each unchanged part, opened or
-     not, with the previous snapshot, and the writer's open segments in both directions
+   - `IndexReader` is a view of one path in a snapshot, with a leaf per bundle;
+     opening secures every file by handle (`HeldFiles`) and reads only the manifest
+     (row counts per space) and summaries; each bundle's core, live docs and overlays
+     are lazy parts (`SegmentBase`, `SegmentLive`, `SegmentOverlay`) materialized by
+     `IndexReader::materialize` at the search's batched point (`SearchEngine::submitBody`)
+     or on first use. A reopen shares each unchanged part, opened or not, with the
+     previous snapshot, and the writer's open segments in both directions
      - Physical field catalog records available columns and stored resources;
        logical retrieval discovery is cached per reader and schema identity
    - `SearchEngine`: Coordinates query parsing, execution, and result collection
@@ -51,9 +52,14 @@ locations, browse `src/luxir/<area>/`.
      read source; wildcard discovery returns logical primaries only
 
 3. **Segment Reading** (`src/luxir/reader/`)
-   - `PostingsReader` reads a single segment and owns the open files for that segment, plus
-     views derived from its immutable bytes (numeric leaf metadata), which therefore live
-     exactly as long as the mapped files
+   - `SegmentCore` owns a segment bundle's open files, streams and root VersionRuns, shared
+     across snapshots and with the writer. Its base footer catalogs row spaces and their
+     field tables, keyed by path name (root is the empty path). It owns a concrete `PostingsReader` per space, each with its own maxDoc,
+     field catalog and lazy immutable field metadata
+     (including numeric leaf bounds). Codec cursors borrow the space reader and mapped bytes
+   - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
+     optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
+     opening reads metadata and endpoints without scanning child rows.
    - `FieldReader` finds metadata for a field in the segment (`SegFieldInfo`)
    - `TermsEnum` enumerates or finds indexed terms for a field found by `FieldReader`
    - `DocsEnum` returns the documents for a term found with the `TermsEnum`. Optionally returns term positions for each document.
@@ -61,12 +67,15 @@ locations, browse `src/luxir/<area>/`.
      classes store an order-preserving encoded int64)
    - `PointsReader` reads the optional 1-D sorted-leaf points index of a
      `RANGE`-indexed numeric field (value-sorted leaves + fence directory;
-     exact ordinal counts). `BKDReader` reads the 2-D int32 BKD of a
-     `GEO_POINT` field. Absence of either = `SegFieldInfo.pointsMetaOff == 0`.
+     exact ordinal counts). `BasicBKDReader<PointTraits>` shares 2-D tree
+     traversal and leaf decoding: `BKDInt32Traits` serves geo coordinates
+     (`BKDReader`), and `BKDInt64Traits` serves range endpoints. Traits own
+     scalar types, format layouts, and coordinate codecs. Absence of any
+     points index = `SegFieldInfo.pointsMetaOff == 0`.
 
 4. **Query System** (`src/luxir/query/`)
 
-   Query execution flows from an index-independent `Query` through a
+   Query execution flows from a logical `Query` through a
    cross-segment `Weight`, then through a per-segment `ScorerSupplier` that
    resolves retained construction plans for the cursor, docs-only, bulk, or
    constant-count product the consumer will execute. The Overview in
@@ -83,6 +92,14 @@ locations, browse `src/luxir/<area>/`.
    Weight and scorers are in `BooleanWeight.h`, which only `BooleanQuery.cpp`
    and white-box tests include.
 
+   - `ToParentQuery` reduces child matches onto owners through `RowRelation`.
+     Ordinary children stream raw membership; domain-consuming children prepare
+     against mapped live eligibility. `RowRelation::Mapping` carries an
+     expand/project direction across operation domains. `OwnershipRelation` owns the shared per-leaf mappers and reducing
+     scorer. Ownership-specific mapping stays outside
+     generic weights and domain scope.
+   - Child liveness is derived lazily from root deletes through ownership ranges;
+     metadata-only count probes use conservative bounds until it is known.
    - Supports Term, Boolean, Phrase, and All queries
    - `Query::mayMatch` proves from a segment's `SummaryView` that a query
      cannot match it (`SummaryPredicates.h` holds the leaf proofs);
@@ -92,9 +109,12 @@ locations, browse `src/luxir/<area>/`.
      [segment summaries](../design/segment-summaries.md#pruning).
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
-     column scans; `GeoBoxQuery` executes through the BKD. Both share the
-     `PointsMaterialize` scorer/bitset primitives and keep a sparse
-     two-phase column verify for small lead costs.
+     column scans. `BKDQueryWeight<QueryType, Relation>` serves geo box,
+     distance, polygon, and range-field queries through the shared BKD reader.
+     `GeoPointSource` and `RangePointSource`, selected by the query, own point
+     cardinality, column decoding, reader traits, pricing, and skip counters.
+     All share the `PointsMaterialize` scorer/bitset primitives and keep a
+     sparse two-phase column verify for small lead costs.
    - `ProtobufQueryParser` lowers the wire tree (`luxir::api::Query`) via `QueryBuilder`
      (the single place query-time analysis is applied); `ParseContext` carries the
      request pool, schema, warnings sink, and shared nesting budget
@@ -126,9 +146,12 @@ locations, browse `src/luxir/<area>/`.
      `TieredMergePolicy` ("tiered") is the default; `MergePolicyRegistry` holds the
      named makers plugins extend, and the schema's `merge_policy` selects one per
      collection. Scheduling, admission and concurrency stay in `IndexWriter`.
-   - `PointsWriter` (1-D sorted leaves) and `BKDWriter` (2-D geo) build the
-     optional points indexes at flush; `SegmentMerger` carries 1-D points
-     forward by run-merging and rebuilds geo BKDs from the merged column.
+   - `PointsWriter` builds 1-D sorted leaves. `BasicBKDWriter<PointTraits>`
+     shares 2-D tree construction, docid codecs, and the bounded parallel leaf
+     pipeline: `BKDInt32Traits` serves geo (`BKDWriter`), and `BKDInt64Traits`
+     serves range endpoints. The int64 coordinate codec splits wide residuals
+     into low/high FOR streams. `SegmentMerger` carries 1-D points forward by
+     run-merging and rebuilds 2-D BKDs from the merged column.
    - `SummaryCollector` gathers each field's bounds while flush and merge
      write it, and `PostingsWriter::finish` turns the field directory into one
      summary record per field; `IndexWriter` writes the result as the segment's

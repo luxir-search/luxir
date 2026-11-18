@@ -76,6 +76,12 @@ class ScoreCollector {
 
   int64_t hitCount = 0;
   bool countIncomplete = false;
+  // Requested estimates: each segment's share of the count. countEstimated is
+  // set when a share was extrapolated from a sample, and countFloored when one
+  // is only the lower bound the segment could prove.
+  int64_t estimatedHits = 0;
+  bool countEstimated = false;
+  bool countFloored = false;
 
   float minCompetitiveVal = std::numeric_limits<float>::lowest();
 
@@ -104,6 +110,13 @@ class ScoreCollector {
     // topCount == 0 is valid ("count/aggregate only, no docs", e.g. limit 0): the heap is
     // empty and collect() only counts.  Negative counts are a bug in the caller.
     assert(topCount >= 0);
+  }
+
+  void reset() requires (!Collapsed) {
+    pq.clear();
+    hitCount = estimatedHits = 0;
+    countIncomplete = countEstimated = countFloored = false;
+    minCompetitiveVal = std::numeric_limits<float>::lowest();
   }
 
   void collect(int32_t segment, int32_t docid, float score) {
@@ -140,7 +153,7 @@ class ScoreCollector {
         // soon as the heap fills, not only when a doc evicts one: best-docs-first / index-
         // sorted / clustered input never evicts, so the old "update on overflow only" left the
         // threshold at lowest() forever and defeated impact pruning exactly when it helps most.
-        if (pq.size() >= topCount) {
+        if ((int64_t)pq.size() >= topCount) {
           minCompetitiveVal = pq.top().score;
         }
       }
@@ -169,7 +182,7 @@ class ScoreCollector {
   // A later segdoc loses an equal score, even under collapse. Publish the
   // next float only for that stream; sibling streams retain an inclusive floor.
   float minCompetitiveScoreForNextDoc(int32_t segment, int32_t docid) const {
-    if (topCount == 0 || pq.size() < topCount) {
+    if (topCount == 0 || (int64_t)pq.size() < topCount) {
       return std::numeric_limits<float>::lowest();
     }
     const ScoreDoc& floor = pq.top();
@@ -193,6 +206,9 @@ class ScoreCollector {
     // Self-merge would iterate a span that collect() can reallocate out from under us.
     assert(this != &other);
     countIncomplete |= other.countIncomplete;
+    estimatedHits += other.estimatedHits;
+    countEstimated |= other.countEstimated;
+    countFloored |= other.countFloored;
     // In some scenarios, popping the top of the other heap until it's no longer competitive will be faster,
     // while in other scenarios just a linear scan of the other heap will be faster.
     // We'll just do a linear scan for now.
@@ -440,6 +456,25 @@ public:
 
   float get() const {
     return maxScore.load(std::memory_order_acquire);
+  }
+};
+
+// A bounded hit count shared by every segment's count pass. Counting stops
+// once the total passes the limit; until then each segment's count is exact.
+class BoundedHitTotal {
+  int64_t limit = 0;
+  std::atomic<int64_t> counted{0};
+
+public:
+  void setLimit(int64_t value) { limit = value; }
+
+  bool exceeded() const {
+    return counted.load(std::memory_order_relaxed) > limit;
+  }
+
+  // Returns whether the total now passes the limit.
+  bool add(int64_t hits) {
+    return counted.fetch_add(hits, std::memory_order_relaxed) + hits > limit;
   }
 };
 
@@ -940,6 +975,50 @@ inline int64_t countMatchesWindowed(BulkScorer* bulk, DocSet* filter,
     cursor = next;
   }
   assert(builder == nullptr || count == builder->card());
+  return count;
+}
+
+// Count a windowed bulk's matches in [min, max). Later calls may count later,
+// disjoint ranges of the same bulk.
+inline int64_t countMatchesInRange(BulkScorer* bulk, DocSet* filter,
+                                   int32_t min, int32_t max) {
+  assert(bulk != nullptr);
+  int64_t count = 0;
+  int32_t cursor = min;
+  while (cursor != PostingsReader::END && cursor < max) {
+    int32_t next = bulk->countNextWindow(count, nullptr, filter, cursor, max);
+    if (next == PostingsReader::END) break;
+    assert(next > cursor);
+    cursor = next;
+  }
+  return count;
+}
+
+// Visit matches in [min, max). Scored traversal retains ordinary scorer
+// state; membership traversal bounds verification to this range. The visitor
+// may stop early, and a later call can resume at a later range.
+template <bool Scored = false, typename Visitor>
+void visitMatchesInRange(Query::Scorer* scorer, DocSet* filter,
+                         int32_t min, int32_t max, Visitor&& visitor) {
+  assert(scorer != nullptr);
+  DocSetProbe accepted(filter);
+  if (min >= max) return;
+  auto advance = [&](int32_t target) {
+    if constexpr (Scored) {
+      return scorer->docId() < target ? scorer->advance(target) : scorer->docId();
+    } else return scorer->advanceWindow(target, max);
+  };
+  for (int32_t doc = advance(min); doc < max; doc = advance(doc + 1)) {
+    if (accepted.get(doc) && !visitor(doc)) break;
+  }
+}
+
+// Count an unscored pull scorer's matches in [min, max) that filter accepts.
+// Verification stays inside the range, so later calls may count later ranges.
+inline int64_t countMatchesInRange(Query::Scorer* scorer, DocSet* filter,
+                                   int32_t min, int32_t max) {
+  int64_t count = 0;
+  visitMatchesInRange(scorer, filter, min, max, [&](int32_t) { count++; return true; });
   return count;
 }
 

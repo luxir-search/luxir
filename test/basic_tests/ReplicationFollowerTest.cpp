@@ -4,9 +4,11 @@
 #include "test/LuxirTest.h"
 #include "test/StorageTestUtils.h"
 #include "test/CollectionHelper.h"
+#include "luxir/reader/OwnershipShape.h"
 #include "test/HttpReq.h"
 #include "test/DurableIndexInfo.h"
 #include "test/SchemaBuilder.h"
+#include "test/NestedTestData.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/Scrubber.h"
 #include "luxir/server/ReplicationFollower.h"
@@ -47,7 +49,8 @@ protected:
   void advance(std::chrono::milliseconds by) { elapsedMs += by.count(); }
   void SetUp() override {
     LuxirTest::SetUp();
-    path = std::filesystem::temp_directory_path() / ("luxir-follower-" + newUuid());
+    // Canonical, as the server reports it: macOS reaches its temporary directory through a symlink.
+    path = std::filesystem::canonical(std::filesystem::temp_directory_path()) / ("luxir-follower-" + newUuid());
     sourceConfig.store.backend = followerConfig.store.backend = "fs";
     sourceConfig.store.checked_dir.sync = followerConfig.store.checked_dir.sync = "throw";
     sourceConfig.store.data_dir = (path / "source").string();
@@ -87,6 +90,21 @@ protected:
       catch (const CollectionNotFoundError&) { return false; }
       catch (const CollectionUnavailableError&) { return false; }
     });
+  }
+  // Serves "main" on the follower, then stops the source and republishes "main" there as a
+  // new incarnation sharing the served files. Returns the follower's copy; the source stays stopped.
+  std::shared_ptr<Collection> serveThenReplaceIncarnation() {
+    startSource(); startFollower();
+    { CollectionHelper h(*source, "main"); EXPECT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+    EXPECT_TRUE(caughtUp());
+    auto old = follower->getCollection("main");
+    stopSource();
+    FSDirFactory factory(sourceConfig.store.data_dir);
+    TenantCatalog storage(factory, "t0", "test", newUuid());
+    storage.adopt();
+    auto selected = *storage.current("main");
+    storage.activate("main", copySnapshot(storage, "main", selected, Manifest::load(*storage.directory(selected))));
+    return old;
   }
   bool caughtUp(const CollectionId& id) {
     auto target = source->getCollection(id)->getShard()->getSnapshots().snapshot()->id;
@@ -250,14 +268,16 @@ TEST_F(ReplicationFollowerTest, restartsBindingAndAcknowledgment) {
   char host[256] = {};
   ASSERT_EQ(0, ::gethostname(host, sizeof(host) - 1));
   EXPECT_EQ(std::string(host) + ":9500", after.follower);
+  EXPECT_EQ(follower->nodeId(), after.follower);
   EXPECT_EQ(before.follower, after.follower);
   stopFollower();
-  followerConfig.replication.follower_id = "reader-a";
+  followerConfig.node.id = "reader-a";
   startFollower();
+  EXPECT_EQ("reader-a", follower->nodeId());
   ASSERT_TRUE(until([&] {
     return std::ranges::any_of(source->getReplication().status(), [](const auto& row) { return row.follower == "reader-a"; });
   }));
-  followerConfig.replication.follower_id.clear();
+  followerConfig.node.id.clear();
   stopSource(); startSource();
   ASSERT_TRUE(until([&] { return !source->getReplication().status().empty() && !source->getReplication().status()[0].commit.incarnation.empty(); }));
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
@@ -606,7 +626,7 @@ TEST_F(ReplicationFollowerTest, unreadableStartupCanBeDeletedBySourceOrAsOrphan)
       follower->deleteCollection("main");
     }
     ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); }));
-    EXPECT_FALSE(std::filesystem::exists(retained));
+    EXPECT_TRUE(until([&] { return !std::filesystem::exists(retained); }));
     stopFollower(); stopSource();
     std::filesystem::remove_all(path);
   }
@@ -902,7 +922,9 @@ TEST_F(ReplicationFollowerTest, promotionRebuildsInvalidRecordedTargets) {
     std::string target;
     {
       FSDirFactory factory(followerConfig.store.data_dir);
-      target = TenantCatalog(factory).reserve("main");
+      TenantCatalog catalog(factory, "t0", "test", newUuid());
+      catalog.adopt();
+      target = catalog.reserve("main");
     }
     state.collection(CollectionId::of("main")).promoted = target;
     state.write(metadata);
@@ -1305,8 +1327,11 @@ TEST_F(ReplicationFollowerTest, pullAcceptsNewSourceAndRefusesUnrelatedData) {
   auto sentinel = std::filesystem::path(followerConfig.store.data_dir) / "unrelated";
   { std::ofstream file(sentinel); file << "keep me"; }
   auto unrelated = pull();
-  EXPECT_NE(0, unrelated.first);
-  EXPECT_NE(std::string::npos, unrelated.second.find("empty data directory"));
+  EXPECT_EQ(1, unrelated.first);
+  EXPECT_NE(std::string::npos, unrelated.second.find("Pull failed: data directory fs:" + followerConfig.store.data_dir + ": "));
+  EXPECT_NE(std::string::npos, unrelated.second.find("no LAYOUT marker but is not empty (first entries: \"unrelated\")"));
+  EXPECT_NE(std::string::npos, unrelated.second.find("check the path or finish an interrupted copy"));
+  EXPECT_EQ(std::string::npos, unrelated.second.find("reindex"));
   EXPECT_TRUE(std::filesystem::exists(sentinel));
   followerConfig.store.data_dir = (path / "offline").string();
   stopSource();
@@ -1535,6 +1560,26 @@ TEST_F(ReplicationFollowerTest, followsCollectionsOfEveryTenant) {
   }));
 }
 
+
+TEST_F(ReplicationFollowerTest, nodeIdConfig) {
+  LuxirConfig config;
+  CLI::App app;
+  config.addOptions(app);
+  app.parse("--node.id reader-a");
+  EXPECT_EQ("reader-a", config.node.id);
+  EXPECT_NO_THROW(config.normalize());
+
+  config.node.id = std::string(250, 'n') + " :\"~!";
+  EXPECT_EQ(config.node.id, LuxirNode(config).nodeId());
+  for (const auto& id : std::vector<std::string>{".", "..", "a/b", "a\\b", "\n", "\x7f", "\x80",
+                                               std::string("a\0b", 3), std::string(256, 'n')}) {
+    config.node.id = id;
+    EXPECT_THROW(config.normalize(), std::invalid_argument);
+  }
+  EXPECT_THROW(LuxirNode{config}, std::invalid_argument); // a config assembled in code is checked too
+  config.node.id.clear();
+  EXPECT_NO_THROW(config.normalize()); // empty requests automatic resolution
+}
 
 TEST_F(ReplicationFollowerTest, tenantFilterConfig) {
   LuxirConfig config;
@@ -1954,41 +1999,57 @@ TEST_F(ReplicationFollowerTest, staleRepairLeavesUnrelatedReplacementAvailable) 
 }
 
 TEST_F(ReplicationFollowerTest, delayedRepairRefetchesSuspectsLinkedIntoReplacement) {
-  startSource(); startFollower();
-  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
-  ASSERT_TRUE(caughtUp());
-  auto old = follower->getCollection("main");
+  auto old = serveThenReplaceIncarnation();
   std::array<FileDescriptor, 1> suspects{old->getShard()->getSnapshots().snapshot()->files.front()};
-  stopSource();
-  {
-    FSDirFactory factory(sourceConfig.store.data_dir);
-    TenantCatalog storage(factory);
-    auto selected = *storage.current("main");
-    storage.activate("main", copySnapshot(storage, "main", selected, Manifest::load(*storage.directory(selected))));
-  }
-  startSource();
-  ASSERT_TRUE(caughtUp());
-  auto current = follower->getCollection("main");
-  ASSERT_NE(old, current);
-  auto snapshot = current->getShard()->getSnapshots().snapshot();
-  ASSERT_NE(snapshot->files.end(), std::ranges::find(snapshot->files, suspects[0]));
+  // The report arrives once the replacement is visible, before the follower records the switch.
+  std::atomic<bool> reported{false};
   std::atomic<unsigned> downloads{0}, otherDownloads{0};
   Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    if (!reported) return nullptr;
     if (((FileDescriptor*)descriptor)->name == suspects[0].name) downloads++;
     else otherDownloads++;
     return nullptr;
   });
+  auto* catalog = &follower->collections().catalog("t0");
+  Signal::listen("catalogRead", [&](void* reader, void*, void*) -> void* {
+    if (reader != catalog || reported) return nullptr;
+    try { if (follower->getCollection("main") == old) return nullptr; }
+    catch (const CollectionUnavailableError&) { return nullptr; }
+    reported = true;
+    old->fail("late scrub result");
+    follower->getFollower()->repair(CollectionId::of("main"), old, "late scrub result", suspects);
+    return nullptr;
+  });
   auto cleanup = scope_guard([&] { stopFollower(); });
-  old->fail("late scrub result");
-  follower->getFollower()->repair(CollectionId::of("main"), old, "late scrub result", suspects);
-  ASSERT_TRUE(until([&] {
-    try { return follower->getCollection("main") != current; }
-    catch (const CollectionUnavailableError&) { return false; }
-  }));
+  startSource();
+  ASSERT_TRUE(until([&] { return downloads.load() == 1; }));
   ASSERT_TRUE(caughtUp());
   EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
   EXPECT_EQ(1u, downloads.load());
   EXPECT_EQ(0u, otherDownloads.load());
+}
+
+// A report that arrives before a mapping attempt fails still reaches the replacement on the retry.
+TEST_F(ReplicationFollowerTest, repairSurvivesFailedMappingAttempt) {
+  auto old = serveThenReplaceIncarnation();
+  std::array<FileDescriptor, 1> suspects{old->getShard()->getSnapshots().snapshot()->files.front()};
+  std::atomic<bool> reported{false};
+  std::atomic<unsigned> downloads{0};
+  Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    if (reported && ((FileDescriptor*)descriptor)->name == suspects[0].name) downloads++;
+    return nullptr;
+  });
+  Signal::listen("replicationMappingReady", [&](void*, void*, void*) -> void* {
+    if (reported.exchange(true)) return nullptr;
+    old->fail("late scrub result");
+    follower->getFollower()->repair(CollectionId::of("main"), old, "late scrub result", suspects);
+    throw std::runtime_error("injected mapping failure");
+  });
+  auto cleanup = scope_guard([&] { stopFollower(); });
+  startSource();
+  ASSERT_TRUE(until([&] { return downloads.load() >= 1; }));
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
 }
 
 TEST_F(ReplicationFollowerTest, promotionPreservesSuspectFiles) {
@@ -2302,7 +2363,8 @@ TEST_F(ReplicationFollowerTest, promotionPreservesIncompatibleSavedTarget) {
   std::string selected, target, root;
   {
     FSDirFactory factory(followerConfig.store.data_dir);
-    TenantCatalog catalog(factory, "t0");
+    TenantCatalog catalog(factory, "t0", "test", newUuid());
+    catalog.adopt();
     selected = catalog.current("main").value();
     target = copySnapshot(catalog, "main", selected, Manifest::load(*catalog.directory(selected)));
     auto directory = catalog.directory(target);
@@ -2327,4 +2389,182 @@ TEST_F(ReplicationFollowerTest, promotionPreservesIncompatibleSavedTarget) {
   EXPECT_TRUE(std::filesystem::exists(base / "t" / "t0" / "i" / target / root));
   EXPECT_TRUE(std::filesystem::exists(base / "node" / "replication.json"));
 }
+
+TEST_F(ReplicationFollowerTest, promoteRefusesAnUnreadableDirectory) {
+  auto older = path / "older-layout";
+  std::filesystem::create_directories(older / "t");
+  std::filesystem::create_directories(older / "node");
+  std::ofstream(older / "node" / "replication.json") << "{}";
+  std::ofstream(older / "t" / "LAYOUT") << "tenant/collection/incarnation 1\n";
+  auto refused = promote(older.string());
+  EXPECT_EQ(1, refused.first);
+  EXPECT_NE(std::string::npos, refused.second.find("Promote failed: data directory fs:" + older.string() + ": ")) << refused.second;
+  EXPECT_NE(std::string::npos, refused.second.find("no LAYOUT marker but is not empty (first entries: \"t\")")) << refused.second;
+  EXPECT_NE(std::string::npos, refused.second.find("check the path or finish an interrupted copy")) << refused.second;
+  EXPECT_EQ(std::string::npos, refused.second.find("reindex"));
+}
+
+TEST_F(ReplicationFollowerTest, largestSpaceMergeRowsTravelWithManifest) {
+  sourceConfig.index.merge_factor = 10;
+  startSource();
+  {
+    CollectionHelper helper(*source);
+    CollectionHelper::UpdateBuilder input;
+    nested_test::add(input, R"({"id":"a","items_nested":[{},{},{},{},{},{},{},{},{},{},{},{}]})");
+    input.commit(); ASSERT_TRUE(helper.submit(input).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  }
+  startFollower(); ASSERT_TRUE(caughtUp());
+  auto check = [&](size_t segments) {
+    auto leader = source->getCollection("main")->getShard()->getSnapshots().snapshot();
+    auto replica = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
+    EXPECT_EQ(*leader->bytes, *replica->bytes);
+    std::pmr::monotonic_buffer_resource arena;
+    auto info = Manifest::decode(replica->bytes, arena);
+    ASSERT_EQ(segments, info.segments.size());
+    EXPECT_EQ(12, info.segments[0].merge_rows);
+    if (segments == 2) { EXPECT_FALSE(info.segments[1].merge_rows); }
+    auto writer = source->getCollection("main")->getShard()->getIndexWriter();
+    auto stats = writer->stats(true, false);
+    ASSERT_EQ(segments, stats.segmentStats.size());
+    auto nested = std::ranges::find(stats.segmentStats, info.segments[0].seg_id, &IndexWriter::SegmentStats::segId);
+    ASSERT_NE(stats.segmentStats.end(), nested);
+    EXPECT_EQ(1, nested->mergeLevel);
+  };
+  check(2);
+  {
+    CollectionHelper helper(*source);
+    CollectionHelper::UpdateBuilder input;
+    input.commit(true, 1); ASSERT_TRUE(helper.submit(input).success);
+  }
+  ASSERT_TRUE(caughtUp()); check(1);
+  stopFollower(); stopSource(); startSource(); startFollower();
+  ASSERT_TRUE(caughtUp()); check(1);
+}
+
+TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSchema) {
+  startSource();
+  {
+    CollectionHelper h(*source);
+    nested_test::setSchema(h.collection());
+    for (int batch = 0; batch < 2; batch++) {
+      SchemaBuilder settings;
+      auto& outer = settings.field("items"); outer.type = api::FieldDef::FieldClass::NESTED; outer.reverse_map = batch != 0;
+      auto& inner = settings.field("items.parts"); inner.type = api::FieldDef::FieldClass::NESTED; inner.reverse_map = batch == 0;
+      settings.set(h.collection());
+      CollectionHelper::UpdateBuilder input;
+      for (int i = batch * 2; i < batch * 2 + 2; i++) nested_test::add(input, nested_test::DOCS[i]);
+      input.commit(); ASSERT_TRUE(h.submit(input).success);
+    }
+  }
+  startFollower(); ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source));
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::rowOperations(*source), nested_test::rowOperations(*follower));
+  auto originalProjection = nested_test::retrieval(*source);
+  EXPECT_EQ(originalProjection, nested_test::retrieval(*follower));
+  auto replica = follower->getCollection("main");
+  auto old = replica->getReaderManager().getReader();
+  ASSERT_EQ(2u, old->segments().size());
+  for (size_t i = 0; i < old->segments().size(); i++) {
+    EXPECT_EQ(i != 0, old->segments()[i].segmentCore().ownership("items")->hasReverseMap());
+    auto* parts = old->segments()[i].segmentCore().ownership("items.parts");
+    if (i == 0) { ASSERT_NE(nullptr, parts); EXPECT_TRUE(parts->hasReverseMap()); }
+    else EXPECT_EQ(nullptr, parts);
+  }
+  auto leaderOld = source->getCollection("main")->getReaderManager().getReader();
+  {
+    CollectionHelper h(*source);
+    CollectionHelper::UpdateBuilder input;
+    input.commit(true, 1); ASSERT_TRUE(h.submit(input).success);
+  }
+  ASSERT_TRUE(caughtUp());
+  auto merged = replica->getReaderManager().getReader();
+  ASSERT_EQ(1u, merged->segments().size());
+  EXPECT_TRUE(merged->segments()[0].segmentCore().ownership("items")->hasReverseMap());
+  EXPECT_FALSE(merged->segments()[0].segmentCore().ownership("items.parts")->hasReverseMap());
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source));
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::rowOperations(*source), nested_test::rowOperations(*follower));
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source, leaderOld));
+  EXPECT_EQ(originalProjection, nested_test::retrieval(*source, leaderOld));
+  EXPECT_EQ(originalProjection, nested_test::retrieval(*follower, old));
+  EXPECT_EQ(nested_test::retrieval(*source), nested_test::retrieval(*follower));
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower, old));
+  auto before = replica->getShard()->getSnapshots().snapshot();
+  {
+    CollectionHelper h(*source);
+    ASSERT_TRUE(h.deleteById("a", UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(caughtUp());
+  auto current = replica->getReaderManager().getReader();
+  ASSERT_EQ(1u, current->segments().size());
+  EXPECT_EQ(merged->segments()[0].segmentCoreShared(), current->segments()[0].segmentCoreShared());
+  auto child = current->view("items");
+  EXPECT_NE(child->segments()[0].liveCountBounds().first, child->segments()[0].liveCountBounds().second);
+  auto after = replica->getShard()->getSnapshots().snapshot();
+  uint64_t bytes = 0; size_t files = 0;
+  for (const auto& file : after->files) {
+    if (std::ranges::find(before->files, file) != before->files.end()) continue;
+    bytes += file.size; ++files;
+    EXPECT_NE(std::string::npos, file.name.find("__L")) << file.name;
+  }
+  EXPECT_EQ(1u, files);
+  std::pmr::monotonic_buffer_resource arena;
+  api::ReplicationStatus stats; follower->getFollower()->stats(stats, arena);
+  ASSERT_EQ(1u, stats.collections.size()); EXPECT_EQ(bytes, stats.collections[0].bytes_downloaded);
+  const nested_test::Counts deleted{{"notes",1},{"part_notes",1},{"implicit",1},{"group",1},{"explicit",1},{"exists",2},
+      {"deep",1},{"deep_group",1},{"rows",2},{"rows.up",2},{"parts",1},
+      {"parts.up",1},{"parts.root",1},{"parts.two",1}};
+  EXPECT_EQ(deleted, nested_test::local(*source)); EXPECT_EQ(deleted, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::rowOperations(*source), nested_test::rowOperations(*follower));
+  EXPECT_EQ(2, child->segments()[0].liveCountBounds().first);
+  EXPECT_EQ(2, child->segments()[0].liveCountBounds().second);
+  auto deletedProjection = nested_test::retrieval(*source);
+  EXPECT_EQ(deletedProjection, nested_test::retrieval(*follower));
+  EXPECT_EQ(originalProjection, nested_test::retrieval(*follower, old));
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source, leaderOld));
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower, old));
+  EXPECT_EQ(after->files, replica->getShard()->getSnapshots().snapshot()->files);
+  EXPECT_EQ(after->files, source->getCollection("main")->getShard()->getSnapshots().snapshot()->files);
+  {
+    CollectionHelper h(*source);
+    SchemaBuilder schema;
+    schema.field("later").type = api::FieldDef::FieldClass::NESTED;
+    auto& code = schema.field("later.code");
+    code.type = api::FieldDef::FieldClass::STRING; code.stored = true; code.column = false;
+    schema.set(h.collection());
+    auto req = localReq(source->getSearchEngine());
+    req->topDocs().exprQuery("later:*").countLimit().limit(0);
+    req->execute(1); ASSERT_OK(req); EXPECT_EQ(0, req->getMatchCount());
+    ASSERT_TRUE(caughtUp());
+    auto empty = localReq(follower->getSearchEngine());
+    empty->topDocs().allQuery().countLimit().limit(0).rawOp().domain.emplace().to = "later";
+    empty->execute(1); ASSERT_OK(empty); EXPECT_EQ(0, empty->getMatchCount());
+    CollectionHelper::UpdateBuilder input;
+    nested_test::add(input, R"({"id":"late","later":{"code":"stored"}})");
+    input.commit(); ASSERT_TRUE(h.submit(input).success);
+  }
+  ASSERT_TRUE(caughtUp());
+  child.reset(); current.reset(); merged.reset(); old.reset(); leaderOld.reset();
+  replica.reset(); before.reset(); after.reset();
+  stopFollower(); stopSource(); startSource(); startFollower(); ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(deleted, nested_test::local(*source)); EXPECT_EQ(deleted, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::rowOperations(*source), nested_test::rowOperations(*follower));
+  EXPECT_EQ(deletedProjection, nested_test::retrieval(*source));
+  EXPECT_EQ(deletedProjection, nested_test::retrieval(*follower));
+  for (auto* node : {source.get(), follower.get()}) {
+    auto schema = node->getCollection("main")->getSchema();
+    EXPECT_TRUE(((const NestedFieldType*)schema->resolveInput("items").fieldType)->reverseMap);
+    EXPECT_FALSE(((const NestedFieldType*)schema->resolveInput("items.parts").fieldType)->reverseMap);
+    auto reader = node->getCollection("main")->getReaderManager().getReader();
+    EXPECT_TRUE(reader->segments()[0].segmentCore().ownership("items")->hasReverseMap());
+    EXPECT_FALSE(reader->segments()[0].segmentCore().ownership("items.parts")->hasReverseMap());
+    auto req = localReq(node->getSearchEngine());
+    req->topDocs().allQuery().countLimit().fields({"code"}).rawOp().domain.emplace().to = "later";
+    req->execute(1); ASSERT_OK(req); EXPECT_EQ(1, req->getMatchCount());
+    EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("code", "stored")));
+  }
+}
+
 }

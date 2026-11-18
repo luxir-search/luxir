@@ -28,6 +28,7 @@ struct AggregateFunction {
   // Bits name trailing arguments used only by finish, starting at zero.
   uint32_t readoutArguments = 0;
   CanonicalArgument canonicalArgument = nullptr;
+  NaturePolicy natures = NaturePolicy::NUMBER;
 
   bool sameStateArguments(std::span<const AggregateConstant> left,
                           std::span<const AggregateConstant> right) const;

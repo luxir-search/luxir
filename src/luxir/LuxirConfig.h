@@ -15,6 +15,12 @@ namespace CLI { class App; }
 
 namespace luxir {
 
+struct NodeConfig {
+  std::string id; // empty: derive at LuxirNode construction
+  bool random = false; // id was derived without a stable hostname:port
+  void validate() const;
+};
+
 struct ServerConfig {
   // Cap on buffered (rendered/serialized) response bytes, per HTTP connection
   // and per gRPC call (an HTTP/2 connection can multiplex several calls, each
@@ -75,7 +81,7 @@ struct CheckedDirConfig {
 };
 
 struct StoreConfig {
-  std::string backend = "ram";           // built in: ram, fs; plugins may add more
+  std::string backend = "ram";           // built in: ram, fs, shared_fs; plugins may add more
   std::string data_dir = "luxir_data";
   // Layers wrapped around the backend, innermost first, inside checked_dir and read_only.
   std::vector<std::string> layers;
@@ -83,6 +89,8 @@ struct StoreConfig {
   std::map<std::string, std::map<std::string, std::string>> options;
   uint64_t ram_limit_mb = 0; // RAM storage only; zero is unlimited.
   CheckedDirConfig checked_dir;
+  // Superseded commits, in milliseconds. -1: 0 on exclusive stores, 5 minutes on shared stores.
+  int64_t retention_ms = -1;
   // Before a collection serves at startup: none trusts the manifest footer and
   // file sizes; full also reads every file the committed snapshot lists and
   // checks its size and xxh3, failing only that collection on a mismatch.
@@ -168,6 +176,9 @@ struct IngestConfig {
 };
 
 struct SearchConfig {
+  // Process-wide fan-out policy, installed by LuxirConfig::apply().
+  int64_t fanout_grain_us = 50;
+  int64_t fanout_sibling_grain_us = 1000;
   // Max nesting depth of search operations in one request (ops within ops).
   // A request-shape limit like the query parsers' nesting budget, but much
   // lower: every level is a full search operation, not just a query node.
@@ -198,7 +209,6 @@ struct ReplicationConfig {
   // retry of a failed collection sync (doubling per consecutive failure, to 60 s).
   int64_t retry_ms = 1000;
   std::string source;
-  std::string follower_id; // empty: host:port of this node's listener
   std::string tenants; // comma-separated; empty subscribes to every tenant
   // Comma-separated http:// nodes that serve verified file copies, tried in
   // order before the source; they never decide which commit is current.
@@ -211,6 +221,7 @@ struct ReplicationConfig {
 };
 
 struct LuxirConfig {
+  NodeConfig node;
   ReplicationConfig replication;
   // Serve an existing data directory without owning it: the write lock is not taken,
   // nothing is written, and every mutating request is rejected.  Lets a second process

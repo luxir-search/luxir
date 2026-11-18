@@ -384,3 +384,53 @@ TEST_F(BooleanUnscoredOptionalTest, scoredTopKAndTopKCountAreUnchanged) {
     EXPECT_EQ(testCase.expected, topKCount.count);
   }
 }
+
+// Every doc matches both clauses with the same score, so the top-k floor
+// settles one float above the tied score. The two-clause bound is exact, so
+// that floor ends the conjunction instead of sweeping every match.
+TEST(BooleanTieBoundTest, tiedTwoClauseConjunctionTopKStopsEarly) {
+  constexpr int32_t n = 50000;
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int32_t i = 0; i < n; i++) {
+    docs.push_back(flatdoc("id", "d" + std::to_string(i), "body_w", "a b"));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+
+  SkipStatsGuard stats;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& cursor = req->topDocs("q");
+  cursor.getScores().limit(3).batchSize(4).fields({"id"});
+  auto& mr = cursor.mr();
+  cursor.rawQuery() = qb::boolean(
+      mr, {qb::match(mr, "body_w", "a"), qb::match(mr, "body_w", "b")});
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+
+  const auto* list = req->docList("q");
+  ASSERT_NE(list, nullptr);
+  const auto* ids = std::get_if<api::ColStr>(&list->columns.find("id")->kind);
+  const auto* scores = std::get_if<api::ColFloat>(&list->columns.find("_score_")->kind);
+  ASSERT_NE(ids, nullptr);
+  ASSERT_NE(scores, nullptr);
+  ASSERT_EQ(3u, ids->v.size());
+  EXPECT_EQ("d0", std::string(ids->v[0]));
+  EXPECT_EQ("d1", std::string(ids->v[1]));
+  EXPECT_EQ("d2", std::string(ids->v[2]));
+  EXPECT_EQ(scores->v[0], scores->v[2]);
+  // Two terms, 391 blocks each; a full sweep decodes all of them.
+  EXPECT_LT(SkipStats::docBlocksDecoded, 100) << SkipStats::docBlocksDecoded;
+
+  // The exact count is unaffected by the early stop.
+  auto counted = localReq(helper.getSearchEngine());
+  counted->collection("main");
+  auto& countCursor = counted->topDocs("q");
+  countCursor.countLimit().limit(-1);
+  auto& cmr = countCursor.mr();
+  countCursor.rawQuery() = qb::boolean(
+      cmr, {qb::match(cmr, "body_w", "a"), qb::match(cmr, "body_w", "b")});
+  counted->execute(false);
+  ASSERT_TRUE(counted->ok()) << counted->errorMsg();
+  EXPECT_EQ(n, counted->getMatchCount());
+}

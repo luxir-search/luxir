@@ -31,7 +31,16 @@ if(DEFINED LUXIR_NATIVE_DEPS AND NOT DEFINED VCPKG_TARGET_TRIPLET)
   set(VCPKG_HOST_TRIPLET ${_luxir_host_triplet} CACHE STRING "")
 endif()
 
-project(Luxir VERSION 0.1.0)
+if(CMAKE_HOST_APPLE)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/deps/triplets/common/macos-version.cmake")
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "${LUXIR_MACOS_DEPLOYMENT_TARGET}" CACHE STRING "macOS baseline" FORCE)
+endif()
+
+project(Luxir VERSION 0.2.0)
+# Marks builds that are not a release. Empty on a release branch.
+set(LUXIR_VERSION_SUFFIX "-dev")
+# The reported version. Cached so packaging can read it.
+set(LUXIR_VERSION "${PROJECT_VERSION}${LUXIR_VERSION_SUFFIX}" CACHE INTERNAL "Reported version")
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
@@ -77,12 +86,27 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-fstack-protector)
 endif()
 
-option(LUXIR_STATIC_RUNTIME "Link GCC runtimes statically, retaining dynamic glibc" OFF)
-if(LUXIR_STATIC_RUNTIME)
-  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "LUXIR_STATIC_RUNTIME requires GCC on Linux")
+# A program the build itself runs (code generator, dependency check) must run
+# on the build machine, which need not support a named LUXIR_CPU_TARGET tier:
+# an x86-64-v4 build on a CPU without AVX-512 would otherwise die generating
+# code. Later -march options win, so this replaces the tree-wide tier.
+function(luxir_runs_during_build target)
+  if(NOT CMAKE_CROSSCOMPILING AND LUXIR_CPU_TARGET MATCHES "^(x86-64-v|armv8)")
+    target_compile_options(${target} PRIVATE -march=native)
   endif()
-  add_link_options(-static-libstdc++ -static-libgcc -static-libasan -Wl,--as-needed)
+endfunction()
+
+option(LUXIR_STATIC_RUNTIME "Link GCC runtimes statically, retaining system libraries" OFF)
+if(LUXIR_STATIC_RUNTIME)
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+    message(FATAL_ERROR "LUXIR_STATIC_RUNTIME requires GCC on Linux or macOS")
+  endif()
+  add_link_options(-static-libstdc++ -static-libgcc)
+  if(APPLE)
+    link_libraries(iconv)
+  else()
+    add_link_options(-static-libasan -Wl,--as-needed)
+  endif()
   # FindOpenMP otherwise selects the compiler's shared libgomp.
   execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libgomp.a
                   OUTPUT_VARIABLE _luxir_gomp OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -297,7 +321,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-include_directories(SYSTEM ./src)
+include_directories(./src)
 
 find_package(xxHash CONFIG REQUIRED)
 
@@ -317,6 +341,11 @@ find_package(zstd CONFIG REQUIRED)
 # locate OpenMP before find_package(faiss).
 find_package(OpenMP REQUIRED)
 find_package(faiss CONFIG REQUIRED)
+# FAISS's BLAS: OpenBLAS everywhere but macOS, which uses Accelerate. KernelInfo
+# reports the OpenBLAS core.
+if(NOT APPLE)
+  find_package(OpenBLAS CONFIG REQUIRED)
+endif()
 # protobuf (DescriptorPool + google::protobuf::Arena) and gRPC are linked directly into
 # luxir_lib now that myproto is gone; they used to arrive transitively via myproto.
 find_package(Protobuf CONFIG REQUIRED)
@@ -426,6 +455,7 @@ target_compile_definitions(luxir_lib PUBLIC
   # every translation unit, and the precompiled headers that include
   # task_arena.h, sees the same TBB declarations.
   TBB_PREVIEW_PARALLEL_PHASE=1
+  TBB_PREVIEW_ISOLATED_TASK_GROUP=1
   # GCC -Og cannot honor xxHash's always_inline AVX-512 accumulator through
   # its function-pointer dispatch. Keep header inlining in optimized builds,
   # but use the linked implementation in Debug.
@@ -558,6 +588,9 @@ target_link_libraries(luxir_lib PRIVATE CLI11::CLI11)
 target_link_libraries(luxir_lib PRIVATE lz4::lz4)
 target_link_libraries(luxir_lib PRIVATE zstd::libzstd)
 target_link_libraries(luxir_lib PRIVATE faiss)
+if(NOT APPLE)
+  target_link_libraries(luxir_lib PRIVATE OpenBLAS::OpenBLAS)
+endif()
 # uni-algo (vendored): Unicode case folding / NFKC / UAX#29 segmentation, used by
 # the analysis chain (src/luxir/analysis/Analyzer.cpp).
 target_link_libraries(luxir_lib PRIVATE uni_algo)

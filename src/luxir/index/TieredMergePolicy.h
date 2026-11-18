@@ -11,8 +11,8 @@
 namespace luxir {
 
 // The default policy ("tiered"): a segment's level is the number of times
-// merge_factor divides into its maxDoc (factor 10: 0-9 docs is level 0,
-// 10-99 level 1, ...), and once merge_factor segments share a level, all of
+// merge_factor divides into its largest row space (mergeRows; factor 10: 0-9
+// rows is level 0, 10-99 level 1, ...), and once merge_factor segments share a level, all of
 // that level's segments merge into one, lowest level first.
 //
 // TODO: Hmmm, a high merge floor can lead to some O^N2 behavior: see
@@ -25,7 +25,7 @@ namespace luxir {
 // through an API that requests a more aggressive merge to sweep up small
 // segments.
 //
-// TODO: deletes are not considered. The level comes from maxDoc and a merge
+// TODO: deletes are not considered. The level comes from physical rows and a merge
 // needs merge_factor segments at one level, so a mostly-deleted segment keeps
 // its level and its dead docs are reclaimed only once that level fills;
 // overwrite-heavy loads grow the index until then.
@@ -39,16 +39,16 @@ public:
   explicit TieredMergePolicy(int32_t mergeFactor = DEFAULT_MERGE_FACTOR) : mergeFactor(std::max(2, mergeFactor)) {}
 
   // Integer arithmetic: a floating-point log ratio rounds exact powers of the
-  // merge factor (e.g. 100 docs for factor 10) down a level.
-  int32_t levelForMaxDoc(int32_t maxDoc) const {
+  // merge factor (e.g. 100 rows for factor 10) down a level.
+  int32_t levelForRows(int32_t rows) const {
     int32_t level = 0;
-    for (int64_t bound = mergeFactor; maxDoc >= bound; bound *= mergeFactor) {
+    for (int64_t bound = mergeFactor; rows >= bound; bound *= mergeFactor) {
       level++;
     }
     return level;
   }
 
-  int32_t level(const MergeSegment& segment) const override { return levelForMaxDoc(segment.maxDoc); }
+  int32_t level(const MergeSegment& segment) const override { return levelForRows(segment.mergeRows); }
 
   std::vector<MergeSpec> findMerges(std::span<const MergeSegment> segments) const override;
 };

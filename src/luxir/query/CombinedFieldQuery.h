@@ -78,10 +78,10 @@ public:
                      std::span<const float> weights, std::span<const Term> terms)
     : Query(QueryKind::COMBINED_FIELDS), fields(fields), weights(weights), terms(terms) {
     assert(!fields.empty() && fields.size() == weights.size() && !terms.empty());
-    for (const auto& term : terms) {
+    for ([[maybe_unused]] const auto& term : terms) {
       assert(term.field < fields.size() && term.weight > 0.0f && term.weight <= 1.0f);
     }
-    for (float weight : weights) assert(weight > 0.0f && std::isfinite(weight));
+    for ([[maybe_unused]] float weight : weights) assert(weight > 0.0f && std::isfinite(weight));
   }
 
   // Estimated pair-table evaluations that amortize building it: the 64K
@@ -374,7 +374,7 @@ public:
         const auto& segInfos = fieldInfos[i]->segInfos;
         for (size_t seg = 0; seg < segInfos.size(); seg++) {
           if (const auto* info = segInfos.at(seg)) {
-            bool text = info->type == FieldType::TEXT;
+            bool text = FieldType::storage(info->type) == FieldType::Storage::TEXT;
             assert(!fieldHasNorms || *fieldHasNorms == text);
             fieldHasNorms = text;
             break;
@@ -485,7 +485,7 @@ public:
         if (fieldInfos[i] == nullptr) continue;
         const SegFieldInfo* segInfo = fieldInfos[i]->segInfos.at(segment);
         if (segInfo == nullptr) continue;
-        assert(segInfo->type == FieldType::TEXT);
+        assert(FieldType::storage(segInfo->type) == FieldType::Storage::TEXT);
         if (segInfo->normsFormat == SegFieldInfo::NORMS_NONE) continue;
         auto* reader = targetPool.make<NormsReader>(segment.postingsReader(), *segInfo);
         if (reader->numBytes() == 0) continue;
@@ -508,6 +508,8 @@ public:
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
+
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
 
   bool recoverableAsPredicate() const noexcept override { return true; }
 };

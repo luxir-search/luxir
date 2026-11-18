@@ -34,6 +34,7 @@ struct MergeSegment {
   uint64_t segId = 0;
   int32_t maxDoc = 0;        // documents written, deleted ones included
   int32_t liveDocs = 0;      // documents not deleted
+  int32_t mergeRows = 0;     // rows of its largest row space (maxDoc without nested documents)
   uint64_t bytes = 0;        // size of the segment's data files
   uint64_t minVersion = 0;   // update versions of its documents, which follow ingest order
   uint64_t maxVersion = 0;

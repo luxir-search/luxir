@@ -238,8 +238,24 @@ counters of actual segment opens and bytes are described under lazy opening.
 
 Opening a snapshot reads the manifest and each segment's summary, and
 nothing else of the segment. What becomes lazy is materialization: mapping
-and decoding the segment files (the `PostingsReader` and its field
-catalog), the live docs, and the overlay readers (vector indexes).
+and decoding the segment files (the `SegmentCore`, with a `PostingsReader`
+and field catalog per row space), the live docs, and the overlay readers
+(vector indexes).
+
+A view of any row space is sized without opening a segment: the manifest
+records each segment's child row spaces with their row counts
+(`SegmentInfo.spaces`, sorted by path as the core's own catalog is), so a
+child view's row bases, `maxDoc`, `hasSpace` and space ordinals come from it.
+An opened core must agree with them, or the segment is unreadable. A child
+space's live rows derive from the root's live docs through ownership, so
+they materialize the segment when first used; until then a child view
+reports its live count as bounds (`liveCountBounds`).
+
+Summaries describe the root space only. A child view has none, so a field's
+presence and header totals in a child space come from its segments' headers:
+the first lookup of a child field opens the segments that hold that space,
+together and in parallel. Joins between spaces bind each segment's ownership
+lazily, when a query first reaches that segment.
 
 ### Securing the snapshot's files
 
@@ -286,13 +302,14 @@ publishing, so a snapshot that cannot be read fails before it is visible.
 ### Parts and reuse
 
 A segment has three kinds of lazy part, each a `SharedLazyCell` with its
-held files: the base (`SegmentBase`, the `PostingsReader`), the live docs of
-one delete generation (`SegmentLive`), and each known overlay
-(`SegmentOverlay`). A part is shared by every snapshot holding the same
-files, materialized or not, so a reopen reuses an unopened part as it
-reuses an opened one, and materializing it through either reader opens it
-once for both. The writer's open readers (`CommitSnapshot::openReaders`)
-seed a new base when they differ. A part's handles close once it is built;
+held files: the base (`SegmentBase`, the `SegmentCore` with every row
+space), the live docs of one delete generation (`SegmentLive`), and each
+known overlay (`SegmentOverlay`). The parts belong to the segment's bundle
+(`PhysicalCore::Bundle`), so every space's view of the segment shares them.
+A part is shared by every snapshot holding the same files, materialized or
+not, so a reopen reuses an unopened part as it reuses an opened one, and
+materializing it through either reader opens it once for both. The writer's
+open cores (`CommitSnapshot::openCores`) seed a new base when they differ. A part's handles close once it is built;
 the mappings keep the bytes from then on. A build that fails on an I/O or
 resource error (a failed mmap, a memory limit) throws and a later call
 retries. One that fails on the bytes themselves (a format or checksum error,
@@ -324,7 +341,8 @@ scrub, is the way to find damaged bytes before a query touches them.
 Follower installs still materialize every segment before publishing.
 
 Facts the manifest or summary already holds never materialize a segment:
-`maxDoc`, `numLive`, `hasDeletes`; `IndexReader::field()` presence and its
+`maxDoc` in every space, the root's `numLive` and `hasDeletes`;
+`IndexReader::field()` presence and its
 persisted-type check, and `FieldSegments::stats()`/`flagsUnion()`, come from
 complete summaries (a segment without one is probed as before).
 `FieldSegments::at()` materializes a segment only where the field may be
@@ -347,6 +365,8 @@ union of two sets, kept apart:
 
 The batch materializes those segments in parallel: base, live docs and
 overlays. A pruned segment that nothing prepares over gets none of them.
+Materializing a segment opens its bundle, so a join's child views use the
+segments the root view's batch opened.
 
 Planning itself may open a segment's base where statistics or planning
 estimates need its data: term statistics seek every segment not proven to
@@ -362,7 +382,7 @@ First-use fallbacks remain for paths that need a segment outside that
 point, each materializing only the part it touches:
 
 - the writer: deletes, merges, id ranges and vector builds take the
-  published reader's base and live docs (`postingsReaderShared`,
+  published reader's core and live docs (`segmentCoreShared`,
   `liveDocsShared`), so writer and readers share one instance;
 - term statistics and planning estimates during parsing (the base, and the
   live docs for whole-index count planning);

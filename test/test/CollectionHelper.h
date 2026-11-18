@@ -122,9 +122,9 @@ public:
         [&](float v) { val->kind = v; },
         [&](double v) { val->kind = v; },
         [&](const std::string& v) { val->kind = build::arenaStr(mr, v); },
-        [&](const std::vector<bool>&) {
-          // No bool-array wire encoding exists; fail loudly rather than silently drop the field.
-          throw std::runtime_error("convertDocToProto: bool-array field values are not supported");
+        [&](const std::vector<bool>& v) {
+          auto* a = build::allocArray(val->kind.emplace<ArrVal>().v, v.size(), mr);
+          for (size_t i = 0; i < v.size(); i++) a[i].kind = (bool)v[i];
         },
         [&](const std::vector<int64_t>& v) {
           auto& arr = val->kind.emplace<ArrInt>();
@@ -423,7 +423,7 @@ public:
     if (reuseIndex) {
       for (size_t i = 0; i < docsPerSeg.size(); i++) {
         auto& seg = reader->segments()[i];
-        if (seg.postingsReader().maxDoc() != docsPerSeg[i]) { reuseIndex = false; break; }
+        if (seg.maxDoc() != docsPerSeg[i]) { reuseIndex = false; break; }
       }
     }
     return reuseIndex;

@@ -10,7 +10,7 @@ std::vector<MergeSpec> TieredMergePolicy::findMerges(std::span<const MergeSegmen
   levels.reserve(segments.size());
   std::vector<int32_t> counts;
   for (const auto& segment : segments) {
-    int32_t level = levelForMaxDoc(segment.maxDoc);
+    int32_t level = levelForRows(segment.mergeRows);
     levels.push_back(level);
     if ((size_t)level >= counts.size()) counts.resize((size_t)level + 1);
     counts[(size_t)level]++;

@@ -39,7 +39,7 @@ public:
       : Base(pool, te, prefix, LevenshteinAutomaton(suffix, maxEdits, prefixMode)),
         n((int)suffix.size()), prefixMode(prefixMode),
         matchable(prefix.size() <= PackedTerm::MAX_LEN
-            && n <= (PackedTerm::MAX_LEN - (int)prefix.size()) + maxEdits) {}
+            && n <= ((int)PackedTerm::MAX_LEN - (int)prefix.size()) + maxEdits) {}
 
   float currentScore() const override { return score; }
 };
