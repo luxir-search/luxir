@@ -39,6 +39,10 @@ public:
   CountingDirectory(std::shared_ptr<Directory> inner, std::shared_ptr<StorageCounters> counters, std::string path)
       : DelegatingDirectory(std::move(inner)), counters(std::move(counters)), path(std::move(path)) {}
 
+  void listFiles(std::vector<FileInfo>& target) override {
+    counters->add("list", path);
+    delegate->listFiles(target);
+  }
   std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
     counters->add("open", path);
     return delegate->openFile(name, expectSynced);
@@ -58,6 +62,7 @@ public:
   std::shared_ptr<StorageCounters> counters = std::make_shared<StorageCounters>();
 
   using DelegatingDirFactory::DelegatingDirFactory;
+  bool exclusive() const override { return delegate->exclusive(); }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
     return std::make_shared<CountingDirectory>(delegate->directory(root, path, std::move(options)), counters, viewLabel(root, path));
   }
@@ -70,6 +75,7 @@ public:
 
   explicit CountingRamBackend(const StorageContext& ctx)
       : DelegatingDirFactory(StorageRegistry::global().makeBackend("ram", ctx)) {}
+  bool exclusive() const override { return true; }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
     counters->add("open", viewLabel(root, path));
     return delegate->directory(root, path, std::move(options));

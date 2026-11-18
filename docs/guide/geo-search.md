@@ -130,7 +130,7 @@ POST /collections/places/_search
     }
   },
   "fields": ["id","name_s"],
-  "count_limit": -1
+  "count_limit": -2
 }
 ```
 
@@ -171,7 +171,7 @@ POST /collections/places/_search
     }
   },
   "fields":["id","name_s"],
-  "count_limit":-1
+  "count_limit":-2
 }
 ```
 
@@ -329,7 +329,8 @@ field.
 
 ## Limits
 
-- Geo-distance sorting is not implemented.
+- There is no distance sort field. Sort by distance with the sort expression
+  `geo_distance(field, lat, lon)`, in meters.
 - The query does not emit the computed distance as a result field.
 - Polygons cannot cross the date line.
 - Polygon vertices are `{"lat","lon"}` objects; GeoJSON `Polygon` and

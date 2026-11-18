@@ -360,12 +360,12 @@ public:
 
   // ProtobufSearchParser resolves the OrdMap and passes it in
   // (see TopDocsReq's ctor comment).
-  StrFacetOp(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
+  StrFacetOp(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     std::shared_ptr<OrdMap> ordMap,
     std::span<const std::string_view> selected,
     std::optional<FacetTermFilterSpec> termFilterSpec = std::nullopt) :
-  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
+  FieldFacetReq(req, view, fieldFacet, fieldName, facetName, limit, minCount, missing,
                 {}, selected),
   ordMap(std::move(ordMap)) {
     if (!selected.empty() || termFilterSpec) {
@@ -632,15 +632,15 @@ public:
         inlineOps(((StrFacetOp&)op).inlineSubOps),
         feedOps(((StrFacetOp&)op).subOps.begin(),
                 ((StrFacetOp&)op).subOps.end()),
-        driver(op.req.reader->segments().size(),
+        driver(op.view->segments().size(),
                [this](std::unique_ptr<MergeableStrData> m){ facetResult(std::move(m)); }),
-        inlineDriver(op.req.reader->segments().size(),
+        inlineDriver(op.view->segments().size(),
                      [this](std::unique_ptr<MergeableFieldFacetInline> m){ facetResult2(std::move(m)); }) {
       // An inline-all candidate always starts with feed ops, so this also
       // covers its gather.
       assert(!thisOp().inlineAllCandidate || !feedOps.empty());
-      if (!feedOps.empty()) input.resize(op.req.reader->segments().size());
-      topTermsSegments.resize(op.req.reader->segments().size());
+      if (!feedOps.empty()) input.resize(op.view->segments().size());
+      topTermsSegments.resize(op.view->segments().size());
       inlineDriver.setCreator([this]() {
         return createInlineData(inlineOps,
             thisOp().ordMap ? thisOp().ordMap->numOrds() : 0);
@@ -670,8 +670,8 @@ public:
       int64_t totalDomainSize = 0;
       inlineExpectedValues = inlineOps.empty() ? -1 : 0;
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
-        auto& postings = thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postings.maxDoc();
+        domains[segnum].assertScope(thisOp().reader.segments()[segnum]);
+        int32_t maxDoc = thisOp().reader.segments()[segnum].maxDoc();
         int64_t domainSize = domains[segnum].get() != nullptr
             ? domains[segnum].get()->card() : maxDoc;
         if (domainSize > std::numeric_limits<int64_t>::max()
@@ -700,13 +700,25 @@ public:
       inlinePlanResolved = true;
     }
 
-    void dispatchSegments(oneapi::tbb::task_group* tg,
+    uint64_t fanoutStealUnits(int32_t segnum, uint64_t docs) override {
+      auto* info = thisOp().fieldInfo(segnum);
+      if (!info) return 0;
+      int32_t maxDoc = thisOp().reader.segments()[(size_t)segnum].maxDoc();
+      int64_t keys = thisOp().ordMap ? thisOp().ordMap->numOrds() : info->nTerms;
+      int64_t values = scaleExpectedValues((int64_t)docs, info->numValues, maxDoc);
+      return (uint64_t)std::max<int64_t>(0, std::min(keys, values));
+    }
+
+    void dispatchSegments(FanoutScope* tg,
                           std::span<const DomainHandle> domains) {
       if (domains.empty()) {
         calcSegment(tg, -1, {});
         return;
       }
-      task_group_fanout(tg, domains.size(), [&](size_t segnum) {
+      task_group_fanout(tg, domains.size(), FanoutKind::EXHAUSTIVE, [&](size_t segnum) {
+        uint64_t units = fanoutDomainUnits(thisOp().reader.segments()[segnum], domains[segnum]);
+        return FanoutSize{units, fanoutStealUnits((int32_t)segnum, units)};
+      }, [&](size_t segnum) {
         return [this, tg, segnum, domain = domains[segnum]]() {
           assert(domain.isDeliverable());
           calcSegment(tg, (int32_t)segnum, domain);
@@ -715,13 +727,13 @@ public:
     }
 
 
-    void calcAll(oneapi::tbb::task_group* tg,
+    void calcAll(FanoutScope* tg,
                  std::span<const DomainHandle> domains) override {
       resolveInlinePlan(domains);
       dispatchSegments(tg, domains);
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domainHandle) override {
       if (thisOp().inlineAllCandidate) {
         if (segnum == -1) {
@@ -744,7 +756,7 @@ public:
       calcSegment(tg, segnum, std::move(domainHandle));
     }
 
-    void calcSegment(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calcSegment(FanoutScope* tg, int32_t segnum,
                      DomainHandle domainHandle) {
       // Result-child execution is synchronous under the bucket-domain stage,
       // so the per-segment parent count needs no task group.
@@ -756,7 +768,7 @@ public:
       }
 
       assert(domainHandle.isDeliverable());
-      DocSet* domain = domainHandle.get();
+      DocSet* domain = domainHandle.get(op.view->segments()[(size_t)segnum]);
       if (!feedOps.empty()) input[(size_t)segnum] = std::move(domainHandle);
 
       if (profileRun != nullptr) {
@@ -782,8 +794,8 @@ public:
                ExecutionProfilePieceState* profile) {
       inlineDriver.contribute([&](MergeableFieldFacetInline& data) {
         InlineSegmentScope inlineScope(data.inlineCalcs, segnum);
-        PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postingsReader.maxDoc();
+        auto& segment = thisOp().reader.segments()[segnum];
+        int32_t maxDoc = segment.maxDoc();
         if (profile != nullptr) {
           profile->wire.max_doc = maxDoc;
           profile->wire.domain_size = domain ? domain->card() : maxDoc;
@@ -824,7 +836,7 @@ public:
           // Each decoded ord batch goes to the calculators whole: they read
           // their columns for its docs and fold the values into the ords'
           // entries in one call.
-          OrdColReader ordColReader(postingsReader, *segFieldInfo);
+          OrdColReader ordColReader(segment.postingsReader(), *segFieldInfo);
           OrdValueBatches values(domain, ordColReader, mapping, maxDoc,
                                  false, nullptr);
           OrdValueBatches::Batch batch;
@@ -865,8 +877,8 @@ public:
                       ExecutionProfilePieceState* profile,
                       bool allowTopTerms) {
         //write only to different slots, so no need to synchronize
-        auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postingsReader.maxDoc();
+        auto& segment = thisOp().reader.segments()[segnum];
+        int32_t maxDoc = segment.maxDoc();
         int32_t domainSize = domain ? domain->card() : maxDoc;
         if (profile != nullptr) {
           profile->wire.max_doc = maxDoc;
@@ -884,6 +896,7 @@ public:
           }
           return; // field not found, but still a contribution (driver releases)
         }
+        auto& postingsReader = segment.postingsReader();
         const auto& segFieldInfo = *info;
 
         int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms;
@@ -1641,9 +1654,8 @@ public:
       auto selected = StrFacetSelectedOrdMap::selectedBuckets(buckets);
 
       for (size_t segnum = 0; segnum < numSegments; segnum++) {
-        auto& postingsReader =
-            thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postingsReader.maxDoc();
+        auto& segment = thisOp().reader.segments()[segnum];
+        int32_t maxDoc = segment.maxDoc();
         auto poolGuard = MemPool::threadLocalPoolGuard();
         // Reserved up front: DocSetBuilder holds a pointer into its own
         // optional bitset, so it must never be reallocated once built into.
@@ -1653,7 +1665,7 @@ public:
 
         if (auto* info = thisOp().fieldInfo((int32_t)segnum)) {
           const auto& segFieldInfo = *info;
-          OrdColReader ordColReader(postingsReader, segFieldInfo);
+          OrdColReader ordColReader(segment.postingsReader(), segFieldInfo);
           auto mapping = thisOp().ordMap->getSegToGlobal((int32_t)segnum);
           StrFacetSelectedOrdMap selectedMap(mapping, selected);
           int64_t missing_num = 0;
@@ -1672,7 +1684,7 @@ public:
 
         for (size_t i = 0; i < numBuckets; i++) {
           domains[segnum * numBuckets + i] =
-              DomainHandle(builders[i].build());
+              DomainHandle(builders[i].build()).scoped(segment);
         }
       }
       return domains;
@@ -1786,7 +1798,7 @@ public:
       if (ordColumnDomains) built = ordColumnBucketDomains(buckets);
 
       FacetBucketBlockExecutor::execute<std::string_view>(
-          *this, children, buckets, *op.req.reader,
+          *this, children, buckets, *op.view,
           FacetBucketProducer::INDEPENDENT,
           [&](size_t segnum, auto block, FacetBucketFeed feed) {
             for (size_t i = 0; i < block.size(); i++) {
@@ -1818,7 +1830,7 @@ public:
       return nullptr;
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domain) override {
       unused(tg);
       unused(segnum);
@@ -1841,7 +1853,7 @@ public:
 
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr ordMapStr(poolGuard.pool(), child.ordMap.get(),
-                         *child.req.reader, child.segInfos);
+                         *child.view, child.segInfos);
       // term_filter: one term-tier pass over every row's ords, and one
       // ascending accepted-ord stream for every row's zero-count padding.
       std::optional<FacetOrdFilter::Selection> selection;
@@ -1872,7 +1884,7 @@ public:
         }
         auto& facetResultProto = oneofMut<luxir::api::FacetResult>(
             const_cast<luxir::api::Val&>(arr.v[(size_t)output]));
-        emitBuckets(facetResultProto, countVec, mr);
+        child.emitFieldBuckets(facetResultProto, countVec, mr);
         if (child.missing) {
           facetResultProto.missing = missingCounts[(size_t)owner];
         }
@@ -1989,31 +2001,19 @@ public:
     void replaySegment(Bank& bank,
                        std::vector<int64_t>& missingCounts,
                        int32_t segnum) {
-      auto& postingsReader =
-          child.reader.segments()[(size_t)segnum].postingsReader();
-      int32_t maxDoc = postingsReader.maxDoc();
+      auto& segment = child.reader.segments()[(size_t)segnum];
+      int32_t maxDoc = segment.maxDoc();
       auto profile = parent.profilePiece(
           TrackProfile ? profileRun : nullptr, segnum);
       int64_t routedDocs = 0;
       int64_t routedValues = 0;
 
-      auto* parentInfo = source.segInfos.at((size_t)segnum);
+      auto* parentInfo = SegFieldInfo::column(source.segInfos.at((size_t)segnum));
       if (!parentInfo) return;
-      const auto& parentFieldInfo = *parentInfo;
-      OrdColReader parentColumn(postingsReader, parentFieldInfo);
-      auto parentMapping = source.ordMap.getSegToGlobal(segnum);
-      StrFacetSelectedOrdMap selected(parentMapping, selectedBuckets);
-
       auto* childFieldInfo = child.fieldInfo(segnum);
       bool childFieldFound = childFieldInfo != nullptr;
       std::optional<OrdColReader> childColumn;
       std::optional<OrdColReader::Iterator> childIterator;
-      auto childMapping = child.ordMap->getSegToGlobal(segnum);
-      if (childFieldFound) {
-        childColumn.emplace(postingsReader, *childFieldInfo);
-        childIterator.emplace(*childColumn);
-      }
-
       if (!childFieldFound && !child.missing) {
         if constexpr (TrackProfile) {
           if (auto* piece = profile.get()) {
@@ -2022,6 +2022,17 @@ public:
           }
         }
         return;
+      }
+
+      auto& postingsReader = segment.postingsReader();
+      const auto& parentFieldInfo = *parentInfo;
+      OrdColReader parentColumn(postingsReader, parentFieldInfo);
+      auto parentMapping = source.ordMap.getSegToGlobal(segnum);
+      StrFacetSelectedOrdMap selected(parentMapping, selectedBuckets);
+      auto childMapping = child.ordMap->getSegToGlobal(segnum);
+      if (childFieldFound) {
+        childColumn.emplace(postingsReader, *childFieldInfo);
+        childIterator.emplace(*childColumn);
       }
 
       selected.visit([&](const auto& selectedMap) {
@@ -2078,9 +2089,7 @@ public:
       }
       __int128 childValues = 0;
       for (size_t segnum = 0; segnum < source.domains.size(); segnum++) {
-        auto& postingsReader =
-            child.reader.segments()[segnum].postingsReader();
-        int32_t segmentMax = postingsReader.maxDoc();
+        int32_t segmentMax = child.reader.segments()[segnum].maxDoc();
         maxDocs += segmentMax;
         DocSet* domain = source.domains[segnum].get();
         domainDocs += domain != nullptr ? domain->card() : segmentMax;
@@ -2146,7 +2155,7 @@ public:
 
   FacetChildExecutor* bindFacetChild(
       const FacetChildContext& context) override {
-    if (bucketDomain != nullptr || needsStructuralScope) return nullptr;
+    if (inputDomain != nullptr || bucketDomain != nullptr || needsStructuralScope) return nullptr;
     if (countDistinct != nullptr || context.stringColumn == nullptr || ordMap == nullptr
         || !subOps.empty() || !inlineSubOps.empty() || !fieldFacet.sort.empty()) {
       return nullptr;

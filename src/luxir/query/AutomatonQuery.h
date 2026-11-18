@@ -56,6 +56,8 @@ public:
         scanPlan(scanPlan),
         fittedPolicy(fittedPolicy) {}
 
+  bool hasScoredRewrite() const { return automatonKind == Kind::MATCH && caseInsensitive; }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const AutomatonQuery&>(other);
     return automatonKind == rhs.automatonKind && caseInsensitive == rhs.caseInsensitive
@@ -100,11 +102,16 @@ public:
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
 
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
+
   FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override;
 
   const DfaScanPlan& getScanPlan() const { return scanPlan; }
 
 protected:
+  // A scored case_insensitive match: the union of indexed case variants.
+  Query* rewriteCaseVariants(Context& context);
+
   void validateLogicalImpl(PlanningContext& context, float multiplier) const override {
     checkedBoostProduct(multiplier, 1.0f);
     if (!fittedPolicy) return;

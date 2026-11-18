@@ -33,7 +33,10 @@ class Query;
 class Schema;
 class ValueProgram;
 struct ParseContext;
+struct RowReduction;
 struct ValueResult;
+struct ResolvedFieldHandle;
+
 
 // The search REQUEST proto tree is a NON-OWNING concrete view (luxir::api::*) over the
 // kept-alive request bytes (see SearchRequest.h: ReqProto = luxir::api::SearchRequest).
@@ -46,8 +49,8 @@ class ProtobufQueryParser {
   MemPool& pool;      // = context.pool (the parsed query tree's storage)
   Schema& schema;     // = context.schema
 
-  Query* parseMatch(const luxir::api::Match& matchQuery);
-  Query* parseAnyOf(const luxir::api::AnyOfQuery& anyOfQuery);
+  Query* parseMatch(const luxir::api::Match& matchQuery, const ResolvedFieldHandle& target);
+  Query* parseAnyOf(const luxir::api::AnyOfQuery& anyOfQuery, const ResolvedFieldHandle& target);
 
   // Copy a repeated string field into a pool-allocated MUTABLE span of
   // string_views (createPhraseFromTerms rewrites entries in place).  The source
@@ -58,27 +61,31 @@ class ProtobufQueryParser {
   // string_view over the request bytes.
   std::span<std::string_view> binToSpan(std::span<const ::hpp_proto::bytes_view> vals);
 
-  Query* parsePhrase(const luxir::api::PhraseQuery& phraseQuery);
-  Query* parsePrefix(const luxir::api::PrefixQuery& prefixQuery);
-  Query* parseWildcard(const luxir::api::WildcardQuery& wildcardQuery);
-  Query* parseRegex(const luxir::api::RegexQuery& regexQuery);
-  Query* parseExists(const luxir::api::ExistsQuery& existsQuery);
-  Query* parseRange(const luxir::api::RangeQuery& rangeQuery);
-  Query* parseGeoBox(const luxir::api::GeoBoxQuery& geoBoxQuery);
-  Query* parseGeoDistance(const luxir::api::GeoDistanceQuery& geoDistanceQuery);
-  Query* parseGeoPolygon(const luxir::api::GeoPolygonQuery& geoPolygonQuery);
-  Query* parseFuzzy(const luxir::api::FuzzyQuery& fuzzyQuery);
-  Query* parseKnn(const luxir::api::KnnQuery& knnQuery);
+  Query* parsePhrase(const luxir::api::PhraseQuery& phraseQuery, const ResolvedFieldHandle& target);
+  Query* parsePrefix(const luxir::api::PrefixQuery& prefixQuery, const ResolvedFieldHandle& target);
+  Query* parseWildcard(const luxir::api::WildcardQuery& wildcardQuery, const ResolvedFieldHandle& target);
+  Query* parseRegex(const luxir::api::RegexQuery& regexQuery, const ResolvedFieldHandle& target);
+  Query* parseExists(const luxir::api::ExistsQuery& existsQuery, const ResolvedFieldHandle& target);
+  Query* parseRange(const luxir::api::RangeQuery& rangeQuery, const ResolvedFieldHandle& target);
+  Query* parseGeoBox(const luxir::api::GeoBoxQuery& geoBoxQuery, const ResolvedFieldHandle& target);
+  Query* parseGeoDistance(const luxir::api::GeoDistanceQuery& geoDistanceQuery, const ResolvedFieldHandle& target);
+  Query* parseGeoPolygon(const luxir::api::GeoPolygonQuery& geoPolygonQuery, const ResolvedFieldHandle& target);
+  Query* parseFuzzy(const luxir::api::FuzzyQuery& fuzzyQuery, const ResolvedFieldHandle& target);
+  Query* parseKnn(const luxir::api::KnnQuery& knnQuery, const ResolvedFieldHandle& target);
   std::span<Query*> parseQueryList(std::span<const luxir::api::Query> queries);
   Query* parseBoolean(const luxir::api::BooleanQuery& booleanQuery);
   Query* parseSimpleQuery(const luxir::api::SimpleQuery& sq, const luxir::api::Query& node);
   Query* parseExpr(const luxir::api::ExprQuery& exprQuery, const luxir::api::Query& node);
   Query* parseConstantScore(const luxir::api::ConstantScoreQuery& constantScoreQuery);
+  Query* parseToParent(const luxir::api::ToParentQuery& query);
   Query* parseBoost(const luxir::api::BoostQuery& boostQuery);
   Query* parseRescore(const luxir::api::RescoreQuery& rescoreQuery);
   Query* parseMultiMatch(const luxir::api::MultiMatchQuery& query);
   Query* parseDisMax(const luxir::api::DisMaxQuery& query);
   Query* parsePlugin(const luxir::api::PluginQuery& query);
+
+  template <class Lower> Query* inPath(std::string_view path, RowReduction reduction, Lower&& lower);
+  template <class Leaf, class Lower> Query* parseLeaf(const Leaf& leaf, Lower&& lower);
 
   static std::optional<float> constantOutput(const ValueProgram& program);
   static bool exactlyRepresented(const ValueResult& result, float value);

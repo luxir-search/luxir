@@ -750,16 +750,16 @@ TEST_F(FusionOpTest, countLimit) {
   CollectionHelper helper;
   ASSERT_TRUE(helper.indexAll(std::array{flatdoc("id", "a"), flatdoc("id", "b")},
                              UpdateMessage::COMMIT).success);
-  for (int64_t limit : {-2, -1, 0, 1, 10}) {
+  for (int64_t limit : {-3, -2, -1, 0, 1, 10}) {
     auto req = localReq(helper.getSearchEngine());
     parseQueryRequest(R"({"ops":{"f":{"fusion":{"sources":{"a":{}},"rrf":{},"count_limit":)"
         + std::to_string(limit) + "}}}}", req->rawRequest(), req->mr);
     req->collection("main");
     ExpectLog quiet("Search request rejected");
     req->execute(1);
-    if (limit < -1) {
+    if (limit < -2) {
       EXPECT_FALSE(req->ok());
-      EXPECT_NE(std::string::npos, req->errorMsg().find("count_limit must be >= -1"));
+      EXPECT_NE(std::string::npos, req->errorMsg().find("count_limit must be >= -2"));
     } else {
       ASSERT_OK(req);
       auto* docs = req->docList("f");

@@ -6,6 +6,7 @@
 #include "luxir/index/MergePolicyRegistry.h"
 #include "luxir/index/SegmentOverlayRegistry.h"
 #include "luxir/plugin/Plugin.h"
+#include "luxir/search/HitDecorator.h"
 #include "luxir/store/StorageRegistry.h"
 #include "luxir/query/QueryRegistry.h"
 #include "luxir/search/SearchOpRegistry.h"
@@ -25,6 +26,7 @@ struct Registries {
   SearchOpRegistry& searchOps;
   // Plugin HTTP routes.
   HttpRouteRegistry& http;
+  HitDecoratorRegistry& hitDecorators;
   // Segment merge policies, selected per collection (SchemaDef.merge_policy).
   MergePolicyRegistry& mergePolicies;
   // Per-segment overlays, selected per collection (SchemaDef.segment_overlays).

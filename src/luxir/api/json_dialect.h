@@ -348,6 +348,10 @@ struct from<JSON, luxir::api::Domain> {
                 value.query, ctx, vit, vend);
           } else if (key == "apply_parent_filters") {
             util::from_json<O>(value.apply_parent_filters, ctx, vit, vend);
+          } else if (key == "from_match") {
+            util::from_json<O>(value.from_match, ctx, vit, vend);
+          } else if (key == "to") {
+            util::from_json<O>(value.to, ctx, vit, vend);
           } else if (key == "filter") {
             decltype(auto) filters =
                 ::hpp_proto::detail::as_modifiable(ctx, value.filter);
@@ -935,12 +939,16 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.normalized, ctx, vit, vend);
           } else if (key == "normalize_on_write") {
             util::from_json<V>(value.normalize_on_write, ctx, vit, vend);
+          } else if (key == "scale") {
+            util::from_json<V>(value.scale, ctx, vit, vend);
           } else if (key == "ann") {
             util::from_json<V>(value.ann, ctx, vit, vend);
           } else if (key == "ignore_malformed") {
             util::from_json<V>(value.ignore_malformed, ctx, vit, vend);
           } else if (key == "ignore_z_value") {
             util::from_json<V>(value.ignore_z_value, ctx, vit, vend);
+          } else if (key == "reverse_map") {
+            util::from_json<V>(value.reverse_map, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -1089,7 +1097,11 @@ struct from<JSON, luxir::api::Query> {
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
           // "boost" is type-directed: a JSON object is the oneof arm, while a
-          // number is the sole non-arm sibling accepted on a Query object.
+          // number wraps the arm. Clause names are independent metadata.
+          if (key == "name") {
+            util::from_json<V>(value.name, ctx, vit, vend);
+            return bool(ctx.error);
+          }
           if (key == "boost") {
             auto probe = vit;
             while (probe != vend) {
@@ -1140,6 +1152,8 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::KnnQuery>);
           } else if (key == "constant_score") {
             arm(std::in_place_type<api::ConstantScoreQuery>);
+          } else if (key == "to_parent") {
+            arm(std::in_place_type<api::ToParentQuery>);
           } else if (key == "prefix") {
             arm(std::in_place_type<api::PrefixQuery>);
           } else if (key == "wildcard") {
@@ -1186,6 +1200,7 @@ struct from<JSON, luxir::api::Query> {
           auto &mr = ctx.memory_resource();
           auto *child = (api::Query *)mr.allocate(sizeof(api::Query), alignof(api::Query));
           new (child) api::Query(value);
+          child->name.reset();
           api::BoostQuery wrapper;
           wrapper.query = child;
           wrapper.boost = siblingBoost;
@@ -1425,6 +1440,20 @@ struct from<JSON, luxir::api::Diversify> {
   }
 };
 
+// Registered decorators share the canonical decorate map on the wire.
+template <auto Opts>
+void readDecorator(std::string_view key, auto& entries, auto& ctx, auto& it, auto& end) {
+  namespace api = luxir::api;
+  auto* val = new (ctx.memory_resource().allocate(sizeof(api::Val), alignof(api::Val))) api::Val();
+  util::from_json<Opts>(*val, ctx, it, end);
+  char* name = (char*)ctx.memory_resource().allocate(key.size(), alignof(char));
+  std::memcpy(name, key.data(), key.size());
+  decltype(auto) target = ::hpp_proto::detail::as_modifiable(ctx, entries);
+  size_t n = target.size();
+  target.resize(n + 1);
+  target[n] = {std::string_view(name, key.size()), ::hpp_proto::indirect_view<api::Val>(val)};
+}
+
 template <>
 struct from<JSON, luxir::api::TopDocs> {
   template <auto Opts>
@@ -1467,9 +1496,17 @@ struct from<JSON, luxir::api::TopDocs> {
             util::from_json<O>(value.batch_size, ctx, vit, vend);
           } else if (key == "document_format") {
             util::from_json<O>(value.document_format, ctx, vit, vend);
+          } else if (key == "row_ops") {
+            decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.row_ops);
+            glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
           } else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          } else if (key == "decorate") {
+            decltype(auto) decorators = ::hpp_proto::detail::as_modifiable(ctx, value.decorate);
+            glz::util::parse_repeated<O>(true, decorators, ctx, vit, vend);
+          } else if (luxir::api::isPluginDecoratorArm(key)) {
+            readDecorator<O>(key, value.decorate, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -1536,6 +1573,11 @@ struct from<JSON, luxir::api::Fusion> {
               util::from_json<O>(value.method.template emplace<luxir::api::LinearFusion>(),
                                  ctx, vit, vend);
             }
+          } else if (key == "decorate") {
+            decltype(auto) decorators = ::hpp_proto::detail::as_modifiable(ctx, value.decorate);
+            glz::util::parse_repeated<O>(true, decorators, ctx, vit, vend);
+          } else if (luxir::api::isPluginDecoratorArm(key)) {
+            readDecorator<O>(key, value.decorate, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -1770,6 +1812,14 @@ struct from<JSON, luxir::api::SearchRequest> {
             util::from_json<O>(shorthand().get_scores, ctx, vit, vend);
           } else if (key == "min_score") {
             util::from_json<O>(shorthand().min_score, ctx, vit, vend);
+          } else if (key == "row_ops") {
+            decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, shorthand().row_ops);
+            glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          } else if (key == "decorate") {
+            decltype(auto) decorators = ::hpp_proto::detail::as_modifiable(ctx, shorthand().decorate);
+            glz::util::parse_repeated<O>(true, decorators, ctx, vit, vend);
+          } else if (luxir::api::isPluginDecoratorArm(key)) {
+            readDecorator<O>(key, shorthand().decorate, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

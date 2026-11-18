@@ -17,6 +17,7 @@ using namespace screaming;
 namespace luxir {
 
 class DocSetBuilder;
+class Segment;
 
 class DocSet {
   friend DocSetBuilder;
@@ -101,6 +102,7 @@ class DomainHandle {
   static inline const char chargedLifetime = 0;
 
   DocSet* docs = nullptr;
+  const Segment* leaf = nullptr;
   std::shared_ptr<const void> lifetime;
 
   DomainHandle(DocSet* docs, std::shared_ptr<const void> lifetime)
@@ -174,7 +176,25 @@ public:
   bool isCharged() const noexcept { return lifetime.get() == &chargedLifetime; }
   bool ownsStorage() const noexcept { return docs && lifetime.get() == docs; }
 
+  // Scope borrows the request-pinned view; it never owns a reader or core.
+  const Segment* scope() const noexcept { return leaf; }
+  void assertScope(const Segment& segment) const { assert(leaf == &segment); }
+  void assertSameScope(const DomainHandle& other) const {
+    assert(leaf == other.leaf);
+  }
+  DomainHandle scoped(const Segment& segment) && {
+    assert(leaf == nullptr || leaf == &segment);
+    leaf = &segment;
+    return std::move(*this);
+  }
+  DomainHandle scopedLike(const DomainHandle& other) && {
+    assert(leaf == nullptr || leaf == other.leaf);
+    leaf = other.leaf;
+    return std::move(*this);
+  }
+
   DocSet* get() const { return docs; }
+  DocSet* get(const Segment& segment) const { assertScope(segment); return docs; }
   bool isDeliverable() const { return docs == nullptr || lifetime != nullptr; }
 
   // A deliverable handle on DocSet::emptyInstance(), which lives forever.

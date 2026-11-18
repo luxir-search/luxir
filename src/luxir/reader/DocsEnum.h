@@ -1059,7 +1059,7 @@ private:
     }
     const int32_t idx = docOrd - residentBlockStartOrd;
     const uint32_t docBase = residentDocBase;
-    const uint32_t blockLast = residentBlockLast;
+    [[maybe_unused]] const uint32_t blockLast = residentBlockLast;
     const int32_t numWords = residentNumWords;
     const char* wordsPtr = residentWordsPtr;
     if (numWords == 0) {
@@ -1098,7 +1098,7 @@ private:
     const int32_t encodedBytes = tfreqBufEnd;
     assert(encodedBytes > 0);
     const char* freqPtr = docIS.ptr() - encodedBytes;
-    uint32_t bytesRead = decodeScoredProbeFreqs(
+    [[maybe_unused]] uint32_t bytesRead = decodeScoredProbeFreqs(
         freqPtr, (uint32_t) encodedBytes);
     assert(bytesRead == (uint32_t) encodedBytes);
   }
@@ -3084,7 +3084,7 @@ class BasicDocsEnum<DocsEnumTier::DOCS> final : public DocsEnumMeta {
     }
     const int32_t idx = docOrd - residentBlockStartOrd;
     const uint32_t docBase = residentDocBase;
-    const uint32_t blockLast = residentBlockLast;
+    [[maybe_unused]] const uint32_t blockLast = residentBlockLast;
     const int32_t numWords = residentNumWords;
     const char* wordsPtr = residentWordsPtr;
     if (numWords == 0) {

@@ -4,14 +4,17 @@
 #include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 #include <chrono>
+#include <functional>
 #include <thread>
 #include <latch>
+#include <utility>
 #include "luxir/util/Signal.h"
 #include <filesystem>
 #include "test/TestUtils.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "luxir/store/Manifest.h"
+#include "luxir/store/DelegatingDirectory.h"
 #include "test/LuxirTest.h"
 
 using namespace luxir;
@@ -19,6 +22,103 @@ using namespace luxir::test;
 using namespace std::chrono_literals;
 
 class CommitSnapshotTest : public LuxirTest {};
+
+TEST_F(CommitSnapshotTest, retentionUsesTheLastReferenceAndSurvivesPinLimits) {
+  RAMDir dir;
+  auto time = CommitSnapshotRegistry::Clock::now(), start = time;
+  CommitSnapshotRegistry snapshots(reserveIncarnation(dir), {}, [&] { return time; }, {}, "t0", 100ms);
+  IndexWriter writer(snapshots);
+  auto first = snapshots.acquire();
+  writer.commit();
+  auto second = snapshots.snapshot();
+  ASSERT_GT(second->id.index_gen, first->id.index_gen);
+  ASSERT_EQ(first->files, second->files);
+  time += 10ms;
+  writer.setSchema(Schema::createDefaultSchema());
+  auto third = snapshots.snapshot();
+  snapshots.setPolicy({1ms, 0});
+  EXPECT_EQ(0u, snapshots.stats().budgetDrops);
+  EXPECT_FALSE(snapshots.reclaimOldestPin());
+  auto firstExpiry = start + 100ms;
+  auto secondExpiry = start + 110ms;
+  time = firstExpiry;
+  snapshots.expire();
+  EXPECT_EQ(0u, snapshots.stats().pins);
+  EXPECT_FALSE(dir.openFile(first->manifestName()));
+  EXPECT_TRUE(dir.openFile(second->manifestName()));
+  for (const auto& file : first->files) EXPECT_TRUE(dir.openFile(file.name));
+  auto old = snapshots.resolve(first->bytes); // Its schema still opens after pin expiry.
+  EXPECT_EQ(0, IndexReader(dir, *old).liveDocs());
+  time = secondExpiry - 1us;
+  snapshots.expire();
+  for (const auto& file : second->files) EXPECT_TRUE(dir.openFile(file.name));
+  time = secondExpiry;
+  snapshots.expire();
+  EXPECT_FALSE(dir.openFile(second->manifestName()));
+  for (const auto& file : second->files) EXPECT_FALSE(dir.openFile(file.name));
+  for (const auto& file : third->files) EXPECT_TRUE(dir.openFile(file.name));
+}
+
+TEST_F(CommitSnapshotTest, startupRetainsAllHistoryForAFullWindow) {
+  RAMDir dir;
+  std::shared_ptr<const CommitSnapshot> first, second, third;
+  {
+    CommitSnapshotRegistry snapshots(reserveIncarnation(dir), {}, CommitSnapshotRegistry::Clock::now, {}, "t0", 1h);
+    IndexWriter writer(snapshots);
+    first = snapshots.snapshot();
+    writer.setSchema(Schema::createDefaultSchema());
+    second = snapshots.snapshot();
+    writer.setSchema(Schema::createDefaultSchema());
+    third = snapshots.snapshot();
+  }
+  ASSERT_TRUE(dir.openFile(first->manifestName())); // Closing preserves time holds.
+  auto time = CommitSnapshotRegistry::Clock::now(), start = time;
+  CommitSnapshotRegistry snapshots(dir, {}, [&] { return time; }, {}, "t0", 100ms);
+  IndexWriter reopened(snapshots);
+  time = start + 100ms - 1us;
+  snapshots.expire();
+  for (const auto& old : {first, second}) {
+    EXPECT_TRUE(dir.openFile(old->manifestName()));
+    for (const auto& file : old->files) EXPECT_TRUE(dir.openFile(file.name));
+  }
+  time = start + 100ms;
+  snapshots.expire();
+  for (const auto& old : {first, second}) {
+    EXPECT_FALSE(dir.openFile(old->manifestName()));
+    for (const auto& file : old->files) EXPECT_FALSE(dir.openFile(file.name));
+  }
+  EXPECT_TRUE(dir.openFile(third->manifestName()));
+  for (const auto& file : third->files) EXPECT_TRUE(dir.openFile(file.name));
+}
+
+TEST_F(CommitSnapshotTest, stalledStatePublicationDoesNotConsumeRetention) {
+  auto path = std::filesystem::temp_directory_path() / "luxir-retention-publication";
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  FSDirFactory factory(path);
+  auto dir = factory.directory(StorageRoot::AUTHORITATIVE, "index");
+  auto time = CommitSnapshotRegistry::Clock::now();
+  CommitSnapshotRegistry snapshots(reserveIncarnation(*dir), {}, [&] { return time; }, {}, "t0", 20ms);
+  IndexWriter writer(snapshots);
+  auto previous = snapshots.snapshot();
+  bool stalled = false;
+  Signal::listen("publishSynced", [&](void*, void* value, void*) -> void* {
+    if (*(std::string_view*)value == "STATE") {
+      stalled = true;
+      std::this_thread::sleep_for(60ms);
+      time += 60ms;
+    }
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("publishSynced"); });
+  writer.commit();
+  ASSERT_TRUE(stalled);
+  time += 20ms - 1us;
+  snapshots.expire();
+  EXPECT_TRUE(dir->openFile(previous->manifestName()));
+  time += 1us;
+  snapshots.expire();
+  EXPECT_FALSE(dir->openFile(previous->manifestName()));
+}
 
 TEST_F(CommitSnapshotTest, slowTransferSurvivesDeletesAndMerge) {
   auto path = std::filesystem::temp_directory_path() / "luxir-snapshot-transfer";
@@ -314,6 +414,74 @@ TEST_F(CommitSnapshotTest, fallbackDoesNotSweepNewestFiles) {
   EXPECT_THROW(IndexWriter{recovered}, std::runtime_error);
   EXPECT_EQ(1, IndexReader(writer->dir).liveDocs());
   for (const auto& desc : newest->files) EXPECT_NE(nullptr, writer->dir.openFile(desc.name));
+}
+
+namespace {
+class ListCountingDirectory : public DelegatingDirectory {
+public:
+  std::atomic<int> lists{0};
+  std::function<void()> afterNextList;
+  using DelegatingDirectory::DelegatingDirectory;
+  void listFiles(std::vector<FileInfo>& target) override {
+    lists++;
+    delegate->listFiles(target);
+    if (auto hook = std::exchange(afterNextList, {})) hook();
+  }
+};
+}
+
+// STATE alone selects the root, so a healthy tip loads without a listing; a
+// torn tip still falls back to the newest intact generation the listing shows.
+TEST_F(CommitSnapshotTest, loadListsOnlyToFallBack) {
+  LuxirNode node;
+  CollectionHelper h(node, "main");
+  auto writer = h.getIndexWriter();
+  writer->setMergeFactor(100);
+  ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  auto previous = writer->snapshots.snapshot();
+  ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  auto newest = writer->snapshots.snapshot();
+  auto& catalog = node.collections().catalog();
+  ListCountingDirectory dir(catalog.directory(*catalog.current("main")));
+
+  auto healthy = Manifest::load(dir);
+  EXPECT_EQ(0, dir.lists.load()) << "a healthy tip was loaded with a listing";
+  EXPECT_EQ(newest->id.index_gen, healthy.generation);
+  EXPECT_EQ(healthy.generation, healthy.highestGeneration);
+  EXPECT_FALSE(healthy.listed);
+  // Asked for, the listing is taken once and kept.
+  auto names = healthy.listingOf(dir).size();
+  EXPECT_GT(names, 0u);
+  EXPECT_EQ(names, healthy.listingOf(dir).size());
+  EXPECT_EQ(1, dir.lists.load());
+
+  writer->close();
+  dir.publishFile(previous->manifestName(), Manifest::withFooter(*previous->bytes), Directory::PublishMode::REPLACE);
+  dir.publishFile(newest->manifestName(), std::as_bytes(std::span("torn", 4)), Directory::PublishMode::REPLACE);
+  dir.lists = 0;
+  auto fallback = Manifest::load(dir);
+  EXPECT_EQ(1, dir.lists.load()) << "the fallback did not list exactly once";
+  EXPECT_TRUE(fallback.listed);
+  EXPECT_EQ(previous->id.index_gen, fallback.generation);
+  EXPECT_EQ(newest->id.index_gen, fallback.highestGeneration);
+  fallback.listingOf(dir);
+  EXPECT_EQ(1, dir.lists.load()) << "the fallback's listing was not reused";
+}
+
+TEST_F(CommitSnapshotTest, loadRetriesWhenStateAdvancesDuringFallbackListing) {
+  auto store = std::make_shared<RAMDir>();
+  CommitSnapshotRegistry snapshots(reserveIncarnation(*store), {}, CommitSnapshotRegistry::Clock::now, {}, "t0", 1h);
+  IndexWriter writer(snapshots);
+  writer.commit(); // Retention keeps the initial generation available for fallback.
+  auto torn = snapshots.snapshot();
+  ASSERT_TRUE(store->deleteFile(torn->manifestName()));
+
+  ListCountingDirectory dir(store);
+  dir.afterNextList = [&] { writer.commit(); };
+  auto loaded = Manifest::load(dir);
+  EXPECT_EQ(1, dir.lists.load());
+  EXPECT_GT(loaded.generation, torn->id.index_gen);
+  EXPECT_EQ(snapshots.snapshot()->id.index_gen, loaded.generation);
 }
 
 TEST_F(CommitSnapshotTest, segmentNamesSurviveEmptySnapshotAndRestart) {

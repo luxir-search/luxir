@@ -7,6 +7,7 @@
 #include "luxir/server/ReplicationFollower.h"
 #include "HttpServer.h"
 #include "luxir/BuildInfo.h"
+#include "luxir/KernelInfo.h"
 #include "Prometheus.h"
 
 #include <cassert>
@@ -1595,6 +1596,8 @@ private:
         json.string("version", build.version);
         json.string("source_commit", build.sourceCommit);
         json.string("cpu_target", build.cpuTarget);
+        json.string("faiss_simd", kernelInfo().faissSimd);
+        json.string("blas_core", kernelInfo().blasCore);
         respondJson(http::status::ok, json.finish());
         break;
       }
@@ -2667,6 +2670,7 @@ private:
 
             if (params.prometheus) {
               out = renderPrometheus(response);
+              out += loadSignalDebugText();
             } else if (!luxir::api::write_json(response, out)) {
               throw std::runtime_error("failed to serialize stats response");
             }
@@ -4298,15 +4302,7 @@ void HttpSearchRequest::failDelivery(const SearchResponse& response) noexcept {
 }
 
 void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
-  if (maxParallel == -1) {
-    // The parallel lane runs on this shard inside the arena (see
-    // SearchEngine::dispatch), and so does resumed production: its per-batch
-    // task groups must spawn into the node arena, not this thread's implicit
-    // one.
-    resume = [&node = session->node(), resume = std::move(resume)] {
-      node.executeIsolated(resume);
-    };
-  } else if (maxParallel != 0) {
+  if (maxParallel == 1) {
     // The request opted its query work off the io plane (max_parallel=1),
     // so resumed production belongs on the arena too.  The wrapper runs on
     // the shard (see maybeFireDrainWaiters) and must not throw: fall back to
@@ -4385,6 +4381,7 @@ void HttpServer::armReplicationExpiry() {
           if (entry.error.empty()) entry.collection->getShard()->getSnapshots().expire();
         }
         node.getReplication().expire();
+        node.collections().expireRetirements();
         Signal::emit("replicationExpiryTick");
       } catch (const std::exception& e) { LOG_WARN("Replication expiry failed: {}", e.what()); }
       net::post(acceptIoc, [this, guard] { armReplicationExpiry(); });
