@@ -177,6 +177,7 @@ public:
       src->init();
     }
     for (auto& [name, child] : groupOps) child->init();
+    for (auto* row : rowOps) row->init();
   }
 
   class Calc : public SearchOp::Calculator {
@@ -527,7 +528,7 @@ public:
         op.needsCount(),
         op.fusionProto.get_scores,
         op.fusionProto.document_format,
-        emission, {}, false, false, {}, op.decorators);
+        emission, {}, false, false, op.rowColumns(), op.decorators);
     }
   };
 

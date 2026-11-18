@@ -1370,7 +1370,9 @@ See [Nested documents](nested.md).
 `top_docs.row_ops` maps output names to ordinary operations. Each runs over
 one returned row, after ranking, offset and limit, and its result sits beside
 that row's fields. HTTP root shorthand accepts `row_ops` too. In `columns` or
-`adaptive` format these results are row-aligned value columns.
+`adaptive` format these results are row-aligned value columns. A collapsed
+list runs them for each returned group's head, a diversified list for each
+returned row, and `fusion.row_ops` for each fused row (or group head).
 
 ```json
 {
@@ -1394,21 +1396,32 @@ fields expanded by `*`), decorators or reserved keys such as `_score_`.
 
 A structured query may carry a request-unique `name`. In a row operation,
 `domain.from_match` references a named descendant clause of the list's query
-or filters. It selects that clause's matching rows in the clause's own view.
-Names do not change query equality, scores, plans or filter-cache identity.
+or filters, or under `fusion.row_ops` of any source's query or filters. It
+selects that clause's matching rows in the clause's own view. Names do not
+change query equality, scores, plans or filter-cache identity.
 See [Matched children per hit](nested.md#matched-children-per-hit).
 
 With `from_match` and no query, the named clause supplies the score and
 ranking. With an explicit `top_docs.query`, the named clause only restricts
 the domain; the explicit query supplies the score and ranking. In both cases
 `domain.filter` may narrow the eligible rows further. `from_match` cannot be
-combined with `to`. Unknown names, non-descendant clauses, prohibited clauses
-and clauses containing kNN are rejected.
+combined with `to`. Unknown names, non-descendant clauses and prohibited
+clauses are rejected.
+
+A named kNN clause selects rows across the whole index, which one row's
+operation cannot repeat. Its replay instead scores every row of the family
+exactly against the clause's query vector: the rows with a vector, above the
+clause's `similarity` threshold, ranked by the score the kNN gives a row it
+selects (times any boost on the named clause). `k`, candidate budgets and
+approximate search do not apply, so the family's best row always leads. Name
+the kNN clause itself: a kNN inside a compound clause (a Boolean, for
+example) is rejected, and the clause's siblings do not restrict its replay;
+restate them in `domain.filter`.
 
 A row operation is a `top_docs`, which includes count-only lists (`limit` 0
 with a count). Not supported yet: per-row facets and metrics, row operations
 inside a row operation, decorators, domain resets (`domain.query`), row
-queries that need a prepare pass (kNN), and `row_ops` on fusion sources or on
-collapsed or diversified lists. Group operations on collapsed lists are
-unaffected. Row results count against the request's memory limit; their size
+queries that need a prepare pass (a kNN in `top_docs.query`; replaying a named
+kNN is supported), and `row_ops` on individual fusion sources (use
+`fusion.row_ops`). Group operations on collapsed lists are unaffected. Row results count against the request's memory limit; their size
 grows with page size times the inner limit.

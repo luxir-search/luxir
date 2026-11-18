@@ -3506,6 +3506,7 @@ private:
     return std::nextafter(std::numeric_limits<float>::lowest(), 0.0f);
   }
 
+ public:
   // Keep L2's nonnegative branch and IP in sync with scoreFromDist below.
   // COSINE has a separate stored-vector norm branch for raw-column rescore mode.
   static LUXIR_INLINE float exactScore(const float* queryPtr,
@@ -3539,6 +3540,7 @@ private:
     }
   }
 
+ private:
   static void sortCandidatesByScore(std::vector<VectorEngineHit>& candidates) {
     std::stable_sort(candidates.begin(), candidates.end(),
         [](const VectorEngineHit& a, const VectorEngineHit& b) {

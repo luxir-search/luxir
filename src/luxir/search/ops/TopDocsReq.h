@@ -33,6 +33,8 @@
 
 namespace luxir {
 
+struct RowVectorReplay;
+
 struct ParsedFilter {
   Query* query;
   std::span<const std::string_view> exceptOps;
@@ -59,9 +61,10 @@ protected:
 
 public:
   class CalcBase;
-  std::vector<TopDocsReq*> rowOps;
   std::span<ReturnField> rowFields;
-  std::vector<ExtraColumn> rowColumns();
+  // A row operation replaying a named kNN clause (from_match) scores rows
+  // with this instead of its weight's score; see RowVectorReplay.
+  RowVectorReplay* vectorReplay = nullptr;
 
   // Exact COUNT + pruned TOP_100 over the 5M/301-union cohort crossed between
   // glass (0.758%, 1.008 compose/exhaustive) and philadelphia (0.861%, 0.977).

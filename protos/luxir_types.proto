@@ -246,6 +246,9 @@ message TopDocs {
 //
 // The fusion-level `filter` is ANDed with each source's own filters.
 message Fusion {
+  // Operations evaluated on each returned fused row, as TopDocs.row_ops.
+  // domain.from_match may name a clause of any source.
+  map<string, SearchOp> row_ops = 28;
   // Plugin result decorators, executed only for emitted rows.
   map<string, Val> decorate = 27;
   // Named source queries. At least one source is required.

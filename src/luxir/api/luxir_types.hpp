@@ -937,6 +937,7 @@ struct TopDocs {                                                 // all indirect
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
 };
 struct Fusion {                                                  // needs TopDocs, RrfFusion, LinearFusion
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> row_ops;
   map_view<std::string_view, TopDocs> sources;
   std::span<const Filter> filter;
   std::optional<std::int64_t> limit;

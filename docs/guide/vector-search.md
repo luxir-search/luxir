@@ -104,6 +104,10 @@ is empty. With the default `unit: "docs"`, `k` still selects documents before
 list collapse, so repeated keys can leave fewer than `k` groups. `groups`
 without an enclosing collapse is a request error.
 
+In a nested child view, `collapse: {"owner": "root"}` makes each chunk's
+document its group, so `k` counts documents while the list returns their best
+chunks; see [chunks capped per document](nested.md#chunks-capped-per-document).
+
 `exact: true` finds the exact nearest groups and their best members. ANN
 uses group-aware admission while scanning and refining candidates, but
 both group recall and the choice of representative can be approximate.

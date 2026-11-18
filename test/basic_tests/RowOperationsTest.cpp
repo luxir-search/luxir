@@ -245,14 +245,15 @@ TEST_F(RowOperationsTest, grandchildListsCanReturnOwnerAndRootRows) {
   EXPECT_EQ("red", rows[0]["parent"]["docs"][0]["color"].get_string());
 }
 
-TEST_F(RowOperationsTest, replayRejectsKnnAndAClauseFromAnotherList) {
+TEST_F(RowOperationsTest, replayRejectsACompoundKnnAndAClauseFromAnotherList) {
   SchemaBuilder schema;
   auto& vector = schema.field("items.vector");
   vector.type = api::FieldDef::FieldClass::VECTOR; vector.dims = 2; vector.metric = api::VectorMetric::L2;
   schema.set(helper.collection());
-  error(R"JSON({"ops":{"q":{"top_docs":{"query":{"name":"m","knn":{"field":"items.vector","query":[0,0],"k":2}},"row_ops":{
+  error(R"JSON({"ops":{"q":{"top_docs":{"query":{"name":"m","to_parent":{"path":"items","query":{"boolean":{
+      "required":[{"knn":{"field":"vector","query":[0,0],"k":2}}],"filter":[{"match":{"field":"color","val":"red"}}]}}}},"row_ops":{
     "inner":{"domain":{"from_match":"m"},"top_docs":{}}
-  }}}}})JSON", "'m': kNN and other domain-consuming");
+  }}}}})JSON", "'m': a kNN inside a compound clause");
   error(R"JSON({"ops":{"a":{"top_docs":{"query":{"name":"m","expr":"items.color:red"}}},"b":{"top_docs":{"row_ops":{
     "inner":{"domain":{"from_match":"m"},"top_docs":{}}
   }}}}})JSON", "'m': the clause is not part of this list");
@@ -272,7 +273,6 @@ TEST_F(RowOperationsTest, responseMemoryLimitAccountsForInnerResults) {
 
 TEST_F(RowOperationsTest, invalidNamesScopesAndUnsupportedOperationsAreRejected) {
   error(R"JSON({"ops":{"q":{"top_docs":{"fields":["id"],"row_ops":{"id":{"top_docs":{}}}}}}})JSON", "conflicts with a returned field");
-  error(R"JSON({"ops":{"q":{"top_docs":{"collapse":{"field":"id"},"row_ops":{"inner":{"top_docs":{}}}}}}})JSON", "row_ops on collapsed");
   for (auto name : {"color", "_score_"}) {
     auto fields = std::string(name) == "color" ? "*" : "color";
     auto request = std::string(R"JSON({"ops":{"q":{"domain":{"to":"items"},"top_docs":{"fields":[")JSON") + fields

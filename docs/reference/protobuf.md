@@ -1198,6 +1198,7 @@ Required fusion method: exactly one.
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.fusion.row_ops"></a>[`row_ops`](#field-luxir.fusion.row_ops) | 28 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Operations evaluated on each returned fused row, as TopDocs.row\_ops. domain.from\_match may name a clause of any source. |
 | <a id="field-luxir.fusion.decorate"></a>[`decorate`](#field-luxir.fusion.decorate) | 27 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | Plugin result decorators, executed only for emitted rows. |
 | <a id="field-luxir.fusion.sources"></a>[`sources`](#field-luxir.fusion.sources) | 1 | map&lt;`string`, [`TopDocs`](#message-luxir.topdocs)&gt; | map | Named source queries. At least one source is required. |
 | <a id="field-luxir.fusion.filter"></a>[`filter`](#field-luxir.fusion.filter) | 2 | [`Filter`](#message-luxir.filter) | repeated | Filters applied to every source. except\_ops is not supported here or in source filters. |
