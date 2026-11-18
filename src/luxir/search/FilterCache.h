@@ -37,7 +37,6 @@ class IndexReader;
 
 struct FilterCacheConfig {
   size_t maxBytes = 64ULL * 1024 * 1024;
-  size_t lowWatermarkBytes = 0;
   size_t maxEntryBytes = 0;
   // Segment values below this floor may be populated only by a WHOLE-lane Use:
   // complete reader residency unlocks Weight omission. CLAUSE-only Uses retain
@@ -55,8 +54,7 @@ struct FilterCacheConfig {
   // while remaining independently configurable.
   size_t wholeAdmissionHistorySize = 0;
   uint32_t admissionThreshold = 2;
-  // Eviction policy: scale density by recent key demand. False selects plain GDS.
-  bool recentDemandEviction = true;
+  uint64_t recentWorkEpochs = 4096;
   size_t maxMetadataEntries = 8192;
   size_t maxMetadataBytes = 0;
   // A metadata sweep started by exceeding maxMetadataBytes trims to this
@@ -81,9 +79,9 @@ struct FilterCacheConfig {
 // for a key until either bounded observation lane has admitted it (second
 // sighting by default); clause and whole-query traffic use separate equal-
 // policy histories. Oversized keys bypass before ring recording, and key
-// metadata has its own maxMetadataBytes budget. One benefit-density sweeper
-// trims segment payloads individually and ReaderValues as whole units from the
-// high watermark to the low watermark.
+// metadata has its own maxMetadataBytes budget. One recent-work sweeper
+// trims segment payloads individually and ReaderValues as whole units until
+// payloads fit their budget.
 //
 // Query::Context and SearchRequest's request-destructed registry own borrowed
 // shared_ptr pins and request-local raw values. MemPool-allocated weights and
@@ -175,21 +173,6 @@ public:
     friend bool operator==(const CounterValues&, const CounterValues&) = default;
   };
 
-  // Values keep pure GDS state: frozen build-nanoseconds / effective bytes
-  // and the clock at publish / last shared hit. Sweep ranks by touchClock +
-  // density * bit_width(max(count, 1)), using the max of both admission lanes'
-  // window counts for the key. Counts include misses and survive value turnover
-  // (segment flush/merge and reader refresh). The window is admissionHistorySize
-  // lane uses, not requests or time: requests with many filters shorten it.
-  // A key outside both windows ranks as plain GDS. Metadata eviction uses GDS.
-  // Hits only store when the clock moved; concurrent relaxed touches remain a
-  // benign approximation. Credits repay the metadata ledger independently.
-  static void updateTouchClock(std::atomic<double>& clock, double next) {
-    if (clock.load(std::memory_order_relaxed) != next) {
-      clock.store(next, std::memory_order_relaxed);
-    }
-  }
-
   // Recency only needs to be approximate. Skip the store when a Use with the
   // same or a newer epoch already recorded it (all segments of one Use share
   // an epoch), so a hot entry is written once per Use rather than per hit.
@@ -208,10 +191,9 @@ public:
     uint32_t charge;
     uint64_t buildCostNanos;
     const bool claimedBuild;
-    mutable std::atomic<uint64_t> cacheHits{0};
     mutable std::atomic<double> creditedTotal{0};
-    double density = 0;
-    mutable std::atomic<double> touchClock;
+    double residencyBytes = 0;
+    uint64_t published = 0;
     #ifndef NDEBUG
     SegmentIdentity identityForTest;
     #endif
@@ -228,12 +210,6 @@ public:
       return docs->cachedCard();
     }
     size_t ramBytesUsed() const { return charge; }
-    void touch(double evictionClock) const {
-      updateTouchClock(touchClock, evictionClock);
-    }
-    double evictionPriority(uint32_t weight = 1) const {
-      return touchClock.load(std::memory_order_relaxed) + density * weight;
-    }
   };
 
   // A globally bounded query such as kNN selects membership across all
@@ -255,10 +231,9 @@ public:
     size_t charge;
     uint64_t buildCostNanos;
     const bool claimedBuild;
-    mutable std::atomic<uint64_t> cacheHits{0};
     mutable std::atomic<double> creditedTotal{0};
-    double density = 0;
-    mutable std::atomic<double> touchClock;
+    double residencyBytes = 0;
+    uint64_t published = 0;
 
     ReaderValue(uint64_t readerVersion,
                 std::span<const SegmentIdentity> identities,
@@ -269,12 +244,6 @@ public:
     uint64_t readerVersion() const { return readerVersion_; }
     size_t ramBytesUsed() const { return charge; }
     DocSet* docSet(size_t segmentOrd, const SegmentIdentity& identity) const;
-    void touch(double evictionClock) const {
-      updateTouchClock(touchClock, evictionClock);
-    }
-    double evictionPriority(uint32_t weight = 1) const {
-      return touchClock.load(std::memory_order_relaxed) + density * weight;
-    }
   };
 
   class Probe {
@@ -672,6 +641,10 @@ private:
   // serializes charges, grants, production and repayment.
   struct Ledger {
     double owed = 0;
+    double work = 0;
+    double recent = 0;
+    uint64_t recentEpochs = 0;
+    double creditSnapshot = 0;
     std::atomic<double> debt{0};
     uint64_t referenceNanos = 0;
     size_t referenceBytes = 0;
@@ -695,6 +668,15 @@ private:
     void unlock() { transition.clear(std::memory_order_release); }
     void production(uint64_t nanos, size_t bytes, bool investment);
     void repay(double nanos);
+    void collectCredit(double total) {
+      work += total - creditSnapshot;
+      creditSnapshot = total;
+    }
+    // Work per epoch over the completed interval and what has followed it. A
+    // key observed for less than one window is not extrapolated from that.
+    double rate(uint64_t sinceRoll, uint64_t window) const {
+      return (recent + work) / (double)std::max(window, recentEpochs + sinceRoll);
+    }
     bool canPopulate(double productionNanos) const;
   };
 
@@ -799,14 +781,18 @@ private:
     AdmissionRing(size_t size, uint32_t threshold);
     bool record(uint64_t fingerprint);
     void reset();
-    std::vector<uint64_t> snapshotSortedHistory();
   };
 
-  struct RecentUses {
-    std::vector<uint64_t> clause;
-    std::vector<uint64_t> whole;
-
-    uint32_t count(uint64_t fingerprint) const;
+  struct Resident {
+    std::weak_ptr<FilterEntry> entry;
+    std::weak_ptr<SegmentSlot> slot;
+    std::weak_ptr<const SegmentValue> segment;
+    std::weak_ptr<const ReaderValue> reader;
+    double priority;
+    uint64_t published;
+    bool operator<(const Resident& other) const {
+      return priority != other.priority ? priority < other.priority : published < other.published;
+    }
   };
 
   // Immutable policy and explicit-or-zero overrides. config.maxBytes is only
@@ -821,8 +807,11 @@ private:
   std::atomic<size_t> residentBytes{0};
   std::atomic<size_t> metadataBytes{0};
   std::atomic<uint64_t> epoch{1};
-  // Only the elected sweeper advances the GDS inflation clock.
-  std::atomic<double> evictionClock{0};
+  // Publication joins the list only after releasing its entry and ledger locks.
+  std::mutex residentsMutex;
+  std::vector<Resident> residents;
+  bool residentsReady = false;
+  std::atomic<uint64_t> refreshEpoch{0};
   std::atomic<uint64_t> publishedCoreGen{0};
   std::atomic<uint64_t> publishedReaderVersion{0};
   std::atomic<uint64_t> readerPublications{0};
@@ -879,7 +868,6 @@ private:
       const std::shared_ptr<const ReaderValue>& value, Work work = Work::assumed());
   void observeAdmissionLane(Use& use, AdmissionLane lane);
   AdmissionRing& admissionFor(AdmissionLane lane);
-  RecentUses snapshotRecentUses();
   void recordCapacityEviction(
       const std::shared_ptr<const SegmentValue>& value);
   void recordReaderCapacityEviction(
@@ -892,13 +880,20 @@ private:
       std::vector<std::unique_ptr<DocSet>> liveExact,
       uint64_t buildCostNanos);
   size_t budgetBytes() const { return budget.load(std::memory_order_relaxed); }
-  size_t lowWatermarkBytes(size_t bytes) const;
   size_t maxEntryBytes(size_t bytes) const;
   size_t maxEntryBytes() const { return maxEntryBytes(budgetBytes()); }
   size_t maxMetadataBytes(size_t bytes) const;
   size_t lowWatermarkMetadataBytes(size_t bytes) const;
   void detachEntry(const std::shared_ptr<FilterEntry>& entry);
-  void advanceEvictionClock(double priority);
+  void refreshResidents();
+  void rememberResident(const std::shared_ptr<FilterEntry>& entry,
+      const std::shared_ptr<SegmentSlot>& slot,
+      const std::shared_ptr<const SegmentValue>& segment,
+      const std::shared_ptr<const ReaderValue>& reader);
+  template<class Value>
+  std::shared_ptr<const Value> detachValue(
+      std::atomic<std::shared_ptr<const Value>>& source, Ledger& ledger,
+      std::shared_ptr<const Value> expected = {});
   void maybeSweep();
   void sweepMetadata();
 
@@ -911,9 +906,9 @@ public:
   // The effective configuration, with derived budgets filled in.
   FilterCacheConfig configuration() const;
   // Changes the byte budget at runtime. Budgets the original config left at
-  // zero (watermarks, maxEntryBytes, maxMetadataBytes) are rederived from the
+  // zero (metadata watermark, maxEntryBytes, maxMetadataBytes) are rederived from the
   // new size; explicit ones are kept and clamped as at construction. A
-  // shrink is swept down to the new low watermark, on this thread unless a
+  // shrink is swept down to the new budget, on this thread unless a
   // sweep is already running (that sweeper then loops with the new limits).
   // Zero disables the cache and clears its entries. An insertion racing clear
   // detaches itself if still disabled. Existing request pins remain valid.
@@ -952,6 +947,8 @@ public:
     double servedNanos = 0;
     uint64_t servedCount = 0;
     size_t referenceBytes = 0;
+    double recent = 0;
+    uint64_t recentEpochs = 0;
   };
   struct EntryDump {
     uint64_t keyHash = 0;
@@ -961,14 +958,13 @@ public:
     bool readerValue = false;
     size_t bytes = 0;
     uint32_t segmentsResident = 0;
-    uint64_t hits = 0;
     uint64_t lastUsed = 0;
     uint64_t buildNanos = 0;
-    uint32_t recentUses = 0;
     std::vector<ValueDump> values;
   };
   std::vector<EntryDump> dump(size_t limit, size_t* totalResident, bool includeGhosts = false);
 
+  uint64_t lastRefreshEpoch() const { return refreshEpoch.load(std::memory_order_relaxed); }
   CounterValues counters() const;
   size_t bytesUsed() const { return residentBytes.load(std::memory_order_relaxed); }
   size_t metadataBytesUsed() const {

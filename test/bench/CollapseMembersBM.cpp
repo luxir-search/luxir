@@ -199,7 +199,7 @@ static void BM_CollapseMembers(benchmark::State& state, int mode) {
       size_t entries;
       for (auto& entry : cache->dump(100, &entries)) if (entry.keyText.find("stock_i") != std::string::npos) {
         state.counters["stock_cached_segments"] += (double)entry.segmentsResident;
-        state.counters["stock_cache_hits"] += (double)entry.hits;
+        for (auto& value : entry.values) state.counters["stock_cache_credited_us"] += value.creditedTotal / 1000;
       }
     }
     state.counters["bucket_blocks"] = (double)blocks;

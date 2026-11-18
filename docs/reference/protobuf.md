@@ -502,10 +502,8 @@ One cache key, with resident values or retained ledgers. key\_text is the printa
 | <a id="field-luxir.cacheentrydump.reader_value"></a>[`reader_value`](#field-luxir.cacheentrydump.reader_value) | 5 | `bool` | singular |  |
 | <a id="field-luxir.cacheentrydump.bytes"></a>[`bytes`](#field-luxir.cacheentrydump.bytes) | 6 | `uint64` | singular |  |
 | <a id="field-luxir.cacheentrydump.segments_resident"></a>[`segments_resident`](#field-luxir.cacheentrydump.segments_resident) | 7 | `uint32` | singular |  |
-| <a id="field-luxir.cacheentrydump.hits"></a>[`hits`](#field-luxir.cacheentrydump.hits) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.cacheentrydump.last_used_epoch"></a>[`last_used_epoch`](#field-luxir.cacheentrydump.last_used_epoch) | 9 | `uint64` | singular |  |
 | <a id="field-luxir.cacheentrydump.build_us"></a>[`build_us`](#field-luxir.cacheentrydump.build_us) | 10 | `uint64` | singular | Summed build time of this entry's resident values, in microseconds. |
-| <a id="field-luxir.cacheentrydump.recent_uses"></a>[`recent_uses`](#field-luxir.cacheentrydump.recent_uses) | 11 | `uint32` | singular | Current key uses in the admission window, taking the max of the two lanes. |
 | <a id="field-luxir.cacheentrydump.values"></a>[`values`](#field-luxir.cacheentrydump.values) | 12 | [`CacheValueDump`](#message-luxir.cachevaluedump) | repeated |  |
 
 <a id="message-luxir.cachevaluedump"></a>
@@ -533,6 +531,8 @@ A segment slot or whole-reader entry, including optional payload-free ledgers.
 | <a id="field-luxir.cachevaluedump.absent_count"></a>[`absent_count`](#field-luxir.cachevaluedump.absent_count) | 13 | `uint64` | singular |  |
 | <a id="field-luxir.cachevaluedump.served_mean_us"></a>[`served_mean_us`](#field-luxir.cachevaluedump.served_mean_us) | 14 | `double` | singular |  |
 | <a id="field-luxir.cachevaluedump.served_count"></a>[`served_count`](#field-luxir.cachevaluedump.served_count) | 15 | `uint64` | singular |  |
+| <a id="field-luxir.cachevaluedump.recent_us"></a>[`recent_us`](#field-luxir.cachevaluedump.recent_us) | 16 | `double` | singular |  |
+| <a id="field-luxir.cachevaluedump.recent_epochs"></a>[`recent_epochs`](#field-luxir.cachevaluedump.recent_epochs) | 17 | `uint64` | singular |  |
 
 <a id="message-luxir.calendargap"></a>
 
@@ -2403,6 +2403,8 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.shardcachecontrol.stats"></a>[`stats`](#field-luxir.shardcachecontrol.stats) | 2 | [`QueryCacheStats`](#message-luxir.querycachestats) | singular | gathered after the requested actions |
 | <a id="field-luxir.shardcachecontrol.entries"></a>[`entries`](#field-luxir.shardcachecontrol.entries) | 3 | [`CacheEntryDump`](#message-luxir.cacheentrydump) | repeated | largest payload first, capped |
 | <a id="field-luxir.shardcachecontrol.entries_resident"></a>[`entries_resident`](#field-luxir.shardcachecontrol.entries_resident) | 4 | `uint64` | singular | uncapped resident-entry count at dump time |
+| <a id="field-luxir.shardcachecontrol.recent_work_epochs"></a>[`recent_work_epochs`](#field-luxir.shardcachecontrol.recent_work_epochs) | 5 | `uint64` | singular | minimum observation interval |
+| <a id="field-luxir.shardcachecontrol.last_refresh_epoch"></a>[`last_refresh_epoch`](#field-luxir.shardcachecontrol.last_refresh_epoch) | 6 | `uint64` | singular |  |
 
 <a id="message-luxir.shardstats"></a>
 

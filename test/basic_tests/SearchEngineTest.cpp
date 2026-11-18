@@ -38,6 +38,12 @@ using namespace luxir;
 using namespace luxir::test;
 
 namespace {
+void evictFilterValues(FilterCache& cache) {
+  size_t budget = cache.configuration().maxBytes;
+  cache.resize(1);
+  cache.resize(budget);
+}
+
 class WholeMembershipPlanGuard {
   bool saved;
 
@@ -2300,9 +2306,9 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
   constexpr std::string_view collection = "whole_count_backoff";
   CollectionHelper helper(collection);
   FilterCacheConfig config{
-      .lowWatermarkBytes = 1,
       .minSegmentDocs = 0,
       .admissionThreshold = 1,
+      .maxMetadataBytes = 64 * 1024,
   };
   auto cache = std::make_shared<FilterCache>(config);
   helper.getIndexWriter()->snapshots.readers.filterCache = cache;
@@ -2332,7 +2338,7 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
   auto built = resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr);
   ASSERT_TRUE(built.available);
   EXPECT_EQ(8, built.count);
-  cache->sweep();
+  evictFilterValues(*cache);
   ASSERT_EQ(1u, cache->counters().unrepaidEvictions);
 
   uint64_t thrashSkips = cache->counters().populationDeferred;
@@ -2672,9 +2678,9 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
   constexpr std::string_view collection = "whole_topk_count_backoff";
   CollectionHelper helper(collection);
   auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
-      .lowWatermarkBytes = 1,
       .minSegmentDocs = 0,
       .admissionThreshold = 1,
+      .maxMetadataBytes = 64 * 1024,
   });
   helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   std::vector<Doc> docs;
@@ -2701,7 +2707,7 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
   QueryPrep::WholeMembershipPlan plan(
       *weight, use, context.filterUses);
   ASSERT_TRUE(resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr).available);
-  cache->sweep();
+  evictFilterValues(*cache);
   ASSERT_EQ(1u, cache->counters().unrepaidEvictions);
 
   uint64_t thrashSkips = cache->counters().populationDeferred;
@@ -3383,9 +3389,9 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
   constexpr std::string_view collection = "whole_field_sort_backoff";
   CollectionHelper helper(collection);
   auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
-      .lowWatermarkBytes = 1,
       .minSegmentDocs = 0,
       .admissionThreshold = 1,
+      .maxMetadataBytes = 64 * 1024,
   });
   helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   std::vector<Doc> docs;
@@ -3418,7 +3424,7 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
       *weight, use, context.filterUses);
   ASSERT_TRUE(resolveWholeMembershipForTests(plan,
       *reader, reader->segments()[0], nullptr).available);
-  cache->sweep();
+  evictFilterValues(*cache);
   ASSERT_EQ(1u, cache->counters().unrepaidEvictions);
 
   uint64_t thrashSkips = cache->counters().populationDeferred;

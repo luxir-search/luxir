@@ -855,10 +855,12 @@ Search has its own limits:
   distinct physical targets after resolving search bindings and deduplicating,
   including explicit fields. See [Multi-match](query-reference.md#field-patterns).
 - `query-cache-bytes` caps each collection's filter cache (default `64MB`; `0`
-  disables it). Filters are ranked by rebuild cost per byte, weighted by how
-  often the filter was used recently, including uses that missed the cache.
-  The weight grows logarithmically, so a newly hot filter catches up quickly
-  and an idle one ages out.
+  disables it). Eviction ranks filters by recent charged and credited work
+  per effective residency byte, lowest first; ties evict older publications.
+  A lazy refresh under capacity pressure covers at least 4,096 cache activity
+  epochs, including ordinary uses and shared serves over the same interval.
+  Payload sweeps stop when values fit the budget; only metadata retains a low
+  watermark. Activity excludes idle wall time, and admission is unchanged.
   Cache counters appear in `_stats?collections=true` (and on the collection
   and tenant `_stats` routes). Date ranges with an unrounded `NOW` bound are
   never cached; see [Dates](dates.md#date-math).
@@ -892,7 +894,9 @@ Search has its own limits:
   Cache-control dumps report `owed_us`, `debt_us`, `credited_us`,
   `production_us`, its `production_source` (measured, prior or unknown),
   `absent_mean_us`/`absent_count`, `served_mean_us`/`served_count`, and reference
-  bytes. `include_ghosts` includes retained ledgers without a payload.
+  bytes, plus `recent_us` and its `recent_epochs` interval. The shard reports
+  `recent_work_epochs` and `last_refresh_epoch`. `include_ghosts` includes
+  retained ledgers without a payload.
   A flush drops values and metadata, including ledgers, while keeping sightings,
   so a known query is readmitted immediately; unpriced uses rebuild immediately. Flush with
   `reset_admission` also forgets sightings and restarts admission tracking.

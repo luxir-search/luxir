@@ -817,6 +817,8 @@ struct CacheValueDump {
   uint64_t absent_count = 0;
   double served_mean_us = 0;
   uint64_t served_count = 0;
+  double recent_us = 0;
+  uint64_t recent_epochs = 0;
   uint32_t space = 0;
   int32_t max_doc = 0;
   bool resident = false;
@@ -825,19 +827,19 @@ struct CacheEntryDump {
   std::span<const CacheValueDump> values;
   uint64_t key_hash = 0;
   uint64_t bytes = 0;
-  uint64_t hits = 0;
   uint64_t last_used_epoch = 0;
   uint64_t build_us = 0;
   std::string_view key_text;
   std::string_view scope;
   uint32_t key_bytes = 0;
   uint32_t segments_resident = 0;
-  uint32_t recent_uses = 0;
   bool reader_value = false;
 };
 struct ShardCacheControl {                                      // needs QueryCacheStats,CacheEntryDump
   QueryCacheStats stats;
   uint64_t entries_resident = 0;
+  uint64_t recent_work_epochs = 0;
+  uint64_t last_refresh_epoch = 0;
   std::span<const CacheEntryDump> entries;
   uint32_t shard_id = 0;
 };

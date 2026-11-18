@@ -2349,6 +2349,8 @@ message CacheValueDump {
   uint64 absent_count = 13;
   double served_mean_us = 14;
   uint64 served_count = 15;
+  double recent_us = 16;
+  uint64 recent_epochs = 17;
 }
 
 // One cache key, with resident values or retained ledgers. key_text is the printable-byte extraction from
@@ -2364,12 +2366,9 @@ message CacheEntryDump {
   bool reader_value = 5;
   uint64 bytes = 6;
   uint32 segments_resident = 7;
-  uint64 hits = 8;
   uint64 last_used_epoch = 9;
   // Summed build time of this entry's resident values, in microseconds.
   uint64 build_us = 10;
-  // Current key uses in the admission window, taking the max of the two lanes.
-  uint32 recent_uses = 11;
   repeated CacheValueDump values = 12;
 }
 
@@ -2378,6 +2377,8 @@ message ShardCacheControl {
   QueryCacheStats stats = 2;  // gathered after the requested actions
   repeated CacheEntryDump entries = 3;  // largest payload first, capped
   uint64 entries_resident = 4;  // uncapped resident-entry count at dump time
+  uint64 recent_work_epochs = 5; // minimum observation interval
+  uint64 last_refresh_epoch = 6;
 }
 
 message CollectionCacheControl {

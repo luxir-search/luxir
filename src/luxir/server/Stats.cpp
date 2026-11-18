@@ -466,6 +466,8 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
     size_t resident = 0;
     auto rows = cache->dump(dumpLimit, &resident, request.include_ghosts);
     shardControl.entries_resident = resident;
+    shardControl.recent_work_epochs = cache->configuration().recentWorkEpochs;
+    shardControl.last_refresh_epoch = cache->lastRefreshEpoch();
     auto* dumped = api::build::allocArray(shardControl.entries, rows.size(), resource);
     for (std::size_t r = 0; r < rows.size(); r++) {
       const auto& row = rows[r];
@@ -483,10 +485,8 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
       out.reader_value = row.readerValue;
       out.bytes = row.bytes;
       out.segments_resident = row.segmentsResident;
-      out.hits = row.hits;
       out.last_used_epoch = row.lastUsed;
       out.build_us = row.buildNanos / 1000;
-      out.recent_uses = row.recentUses;
       auto* values = api::build::allocArray(out.values, row.values.size(), resource);
       for (size_t v = 0; v < row.values.size(); v++) {
         const auto& value = row.values[v];
@@ -505,6 +505,8 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
         values[v].served_mean_us = value.servedNanos / 1000;
         values[v].served_count = value.servedCount;
         values[v].reference_bytes = value.referenceBytes;
+        values[v].recent_us = value.recent / 1000;
+        values[v].recent_epochs = value.recentEpochs;
       }
     }
   }

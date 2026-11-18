@@ -61,7 +61,6 @@ FilterKey buildKey(Query& query) {
 FilterCacheConfig cacheConfig() {
   return {
       .maxBytes = 64ULL * 1024 * 1024,
-      .lowWatermarkBytes = 56ULL * 1024 * 1024,
       .maxEntryBytes = 8ULL * 1024 * 1024,
       .minSegmentDocs = 0,
       .admissionHistorySize = 256,

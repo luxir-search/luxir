@@ -911,7 +911,6 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
 
   FilterCacheConfig cacheConfig{
       .maxBytes = 768,
-      .lowWatermarkBytes = 384,
       .maxEntryBytes = 256,
       .minSegmentDocs = 0,
       .admissionHistorySize = 64,

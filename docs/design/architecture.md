@@ -171,21 +171,16 @@ inside the vector search rather than as a post-pass over a fixed unfiltered
 top-k, and hybrid ranking combines lexical and vector evidence in a single
 request.
 
-Filters are cached per collection as document sets. Their eviction rank is the
-clock at last use plus rebuild cost per effective byte weighted by a
-logarithmically scaled recent-use count. Under pressure, a cheap single-term
-filter goes before a compound boolean or kNN membership set of similar size.
-The count includes misses and is the maximum of the key's uses in the two
-admission windows. It survives value turnover from segment flush/merge and
-reader refresh, so all values of a key share that demand signal.
-
-The windows count lane uses, not requests or time. Requests with many filters
-shorten the horizon; a key outside both windows ranks as plain Greedy-Dual-Size
-(GDS). A sweep snapshots the windows and advances the inflation clock by the
-rank it sorted on. Hits only refresh the stored clock when it has moved;
-metadata eviction advances the clock using plain GDS. Cached sets are consumed
-in bulk windows, which is faster than re-decoding postings even for a filter
-that is a single term.
+Filters are cached per collection as document sets. Eviction ranks recent
+charged and credited work per effective residency byte. Slot ledgers retain
+that work across production and eviction; whole-reader values are ranked and
+evicted as one unit. A lazy refresh under pressure rolls a common activity
+interval of at least 4,096 cache epochs. Epochs count cache activity, including
+uses constructed during planning, rather than requests or wall time. Ties
+evict older publications. Payload sweeps free only enough to fit the budget;
+metadata has a separate recency policy and low watermark. The two bounded
+admission histories still track sightings. Cached sets are consumed in bulk
+windows, avoiding repeated postings decoding.
 
 ## Vector search, natively integrated
 
