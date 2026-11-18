@@ -566,13 +566,24 @@ public:
     std::unordered_map<FilterKey, std::unique_ptr<Use>, FilterKeyHash> uses;
     struct Timing {
       std::atomic<uint64_t> nanos{0};
+      std::atomic<bool> produced{false};
     };
-    std::unique_ptr<Timing[]> timing;
-    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    struct Observation {
+      std::unique_ptr<Timing[]> timing;
+      std::shared_ptr<const void> snapshot;
+      std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+
+      explicit Observation(size_t segments) : timing(std::make_unique<Timing[]>(segments)) {}
+    };
+    std::shared_ptr<Observation> observation;
     bool settled = false;
-    static thread_local UseRegistry* timedRegistry;
+    static thread_local Observation* timedObservation;
     static thread_local size_t timedSegment;
 
+    static void recordProduction();
+    UseRegistry(FilterCache* cache, IndexReader& reader, const UseRegistry* related);
+
+    friend class FilterCache;
     friend class Use;
     #ifndef NDEBUG
     std::thread::id owningThread;
@@ -582,7 +593,7 @@ public:
     class SegmentScope {
       UseRegistry& registry;
       size_t segmentOrd;
-      UseRegistry* previousRegistry;
+      Observation* previousObservation;
       size_t previousSegment;
       bool outermost;
       std::chrono::steady_clock::time_point started;
@@ -603,6 +614,7 @@ public:
                 uint64_t readerVersion,
                 std::span<const SegmentIdentity> segments);
     UseRegistry(FilterCache* cache, IndexReader& reader);
+    UseRegistry(FilterCache* cache, IndexReader& reader, const UseRegistry& related);
     UseRegistry(FilterCache& cache, uint64_t readerCoreGen,
                 std::span<const SegmentIdentity> segments);
     UseRegistry(FilterCache& cache, uint64_t readerCoreGen,

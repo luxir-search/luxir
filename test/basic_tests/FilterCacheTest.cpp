@@ -2910,6 +2910,234 @@ TEST(FilterCacheTest, onlyOutermostTimedScopeSelectsObservation) {
   EXPECT_TRUE(use->work(0).isAssumed());
 }
 
+namespace {
+class FilterCacheTimingTest : public ::testing::Test {
+protected:
+  test::CollectionHelper helper{"cache_timing_views"};
+  std::shared_ptr<FilterCache> cache;
+  std::shared_ptr<IndexReader> reader;
+  std::shared_ptr<IndexReader> child;
+
+  void SetUp() override {
+    helper.clear();
+    auto config = testConfig();
+    config.admissionThreshold = 1;
+    cache = std::make_shared<FilterCache>(config);
+    auto writer = helper.getIndexWriter();
+    writer->snapshots.readers.filterCache = cache;
+    writer->mergePolicy->setMergeFactor(100);
+    for (int batch = 0; batch < 2; batch++) {
+      test::CollectionHelper::UpdateBuilder input;
+      for (int i = 0; i < 16; i++) {
+        auto json = "{\"id\":\"" + std::to_string(batch * 16 + i)
+            + "\",\"rows_nested\":[{\"value_i\":0},{\"value_i\":1}]}";
+        input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+      }
+      input.commit();
+      ASSERT_TRUE(helper.submit(input).success);
+    }
+    reader = writer->snapshots.readers.getReader();
+    child = reader->view("rows_nested");
+    ASSERT_EQ(2u, reader->segments().size());
+    ASSERT_NE(reader->segments()[0].maxDoc(), child->segments()[0].maxDoc());
+  }
+
+  FilterCache::ValueDump value(const FilterKey& key, size_t ordinal = 0) {
+    for (const auto& row : cache->dump(100, nullptr, true)) {
+      if (row.keyHash != key.hash()) continue;
+      for (const auto& value : row.values) {
+        if (value.segId == reader->segments()[ordinal].segInfo.seg_id) return value;
+      }
+    }
+    ADD_FAILURE() << "missing ledger";
+    return {};
+  }
+};
+}
+
+TEST_F(FilterCacheTimingTest, alignedViewsShareTotalsAndSettleIndependently) {
+  FilterCache::UseRegistry root(cache.get(), *reader);
+  FilterCache::UseRegistry rows(cache.get(), *child, root);
+  FilterCache::UseRegistry separate(cache.get(), *child);
+  FilterKey rootKey("timed-owner"), childKey("timed-child"), untouched("untouched-child");
+  auto* owner = root.get(rootKey);
+  auto* nested = rows.get(childKey);
+  auto* independent = separate.get(FilterKey("independent"));
+  owner->observe(); nested->observe(); independent->observe();
+  rows.get(untouched);
+  {
+    FilterCache::UseRegistry::SegmentScope pass(root, 0);
+    EXPECT_FALSE(owner->work(0).known());
+    EXPECT_FALSE(nested->work(0).known());
+    EXPECT_TRUE(independent->work(0).isAssumed());
+    EXPECT_TRUE(nested->work(1).isAssumed());
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, owner->probe(0, owner->work(0)).kind());
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, nested->probe(0, nested->work(0)).kind());
+    root.addSegmentNanos(0, 400);
+    rows.addSegmentNanos(0, 600);
+  }
+  root.settle(true);
+  EXPECT_EQ(1u, value(rootKey).absentCount);
+  EXPECT_EQ(0u, value(childKey).absentCount);
+  rows.settle(true);
+  EXPECT_EQ(1u, value(childKey).absentCount);
+  EXPECT_DOUBLE_EQ(value(rootKey).absentNanos, value(childKey).absentNanos);
+  EXPECT_DOUBLE_EQ(value(rootKey).owed, value(childKey).owed);
+  EXPECT_EQ(0u, value(untouched).absentCount);
+  EXPECT_DOUBLE_EQ(0, value(untouched).owed);
+  auto counters = cache->counters();
+  root.settle(true); rows.settle(true);
+  EXPECT_EQ(counters, cache->counters());
+}
+
+TEST_F(FilterCacheTimingTest, nestedViewScopesDoNotRecordAnInnerInterval) {
+  FilterCache::UseRegistry root(cache.get(), *reader);
+  FilterCache::UseRegistry rows(cache.get(), *child, root);
+  FilterKey key("nested-timing");
+  auto* use = rows.get(key);
+  use->observe();
+  {
+    FilterCache::UseRegistry::SegmentScope outer(root, 0);
+    {
+      FilterCache::UseRegistry::SegmentScope inner(rows, 0);
+      use->probe(0, use->work(0));
+      rows.addSegmentNanos(0, 1000);
+    }
+    // The outer scope has not recorded its interval yet.
+    rows.settle(true);
+    EXPECT_DOUBLE_EQ(1000, value(key).absentNanos);
+    EXPECT_FALSE(use->work(0).known());
+  }
+  EXPECT_TRUE(use->work(0).isAssumed());
+}
+
+TEST_F(FilterCacheTimingTest, relatedViewsRequireTheSameSnapshotAndPhysicalSegments) {
+  FilterCache::UseRegistry root(cache.get(), *reader);
+  EXPECT_NO_THROW(FilterCache::UseRegistry(cache.get(), *child, root));
+  ASSERT_TRUE(helper.deleteById("0", UpdateMessage::COMMIT).success);
+  auto deleted = helper.getIndexWriter()->snapshots.readers.getReader();
+  EXPECT_EQ(reader->segments()[0].segInfo.seg_id, deleted->segments()[0].segInfo.seg_id);
+  EXPECT_THROW(FilterCache::UseRegistry(cache.get(), *deleted, root), std::invalid_argument);
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "new"), UpdateMessage::COMMIT).success);
+  auto added = helper.getIndexWriter()->snapshots.readers.getReader();
+  EXPECT_NE(reader->segments().size(), added->segments().size());
+  EXPECT_THROW(FilterCache::UseRegistry(cache.get(), *added, root), std::invalid_argument);
+}
+
+TEST_F(FilterCacheTimingTest, claimedProductionCensorsOtherViewsAndAmbiguousOutcomes) {
+  using Work = FilterCache::Work;
+  for (bool rejected : {false, true}) for (bool priced : {false, true}) {
+    SCOPED_TRACE(::testing::Message() << rejected << '/' << priced);
+    cache->clear();
+    FilterKey served("served-child"), known("known-owner"), ambiguous("ambiguous-owner");
+    {
+      FilterCache::UseRegistry seed(cache.get(), *child);
+      auto* use = seed.get(served);
+      auto build = use->probe(0);
+      use->publishRaw(0, build, docs(child->segments()[0].maxDoc(), {7}), 1000);
+      FilterCache::UseRegistry other(cache.get(), *reader);
+      use = other.get(known);
+      build = use->probe(0);
+      use->publishRaw(0, build, docs(reader->segments()[0].maxDoc(), {7}), 1000);
+    }
+    FilterCache::UseRegistry root(cache.get(), *reader);
+    FilterCache::UseRegistry rows(cache.get(), *child, root);
+    FilterKey rootKey("censored-owner"), childKey("censored-child");
+    root.get(rootKey)->probe(0, Work::pending());
+    auto* nested = rows.get(childKey);
+    nested->probe(0, Work::pending());
+    nested->probe(1, Work::pending());
+    rows.get(served)->probe(0, Work::pending());
+    root.get(known)->probe(0, Work::nanoseconds(250));
+    root.get(known)->probe(0, Work::pending());
+    auto* both = root.get(ambiguous);
+    both->probe(0, Work::pending());
+    FilterCache::UseRegistry offering(cache.get(), *reader);
+    offering.get(ambiguous)->offerRaw(0, docs(reader->segments()[0].maxDoc(), {7}), 1000);
+    both->probe(0, Work::pending());
+    auto* builder = root.get(FilterKey("production"));
+    if (priced) {
+      builder->probe(0, Work::pending());
+      builder->charge(0, Work::nanoseconds(10'000));
+    }
+    {
+      FilterCache::UseRegistry::SegmentScope pass(root, 0);
+      auto probe = builder->probe(0, priced ? Work::pending() : Work::assumed());
+      ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+      DocSetBuilder docs(reader->segments()[0].maxDoc());
+      if (rejected) {
+        for (int i = 0; i < reader->segments()[0].maxDoc(); i++) docs.add(i);
+      } else {
+        docs.add(7);
+      }
+      builder->publishRaw(0, probe, docs.build(), 5000);
+    }
+    root.addSegmentNanos(0, 9000);
+    rows.addSegmentNanos(1, 600);
+    auto before = cache->counters();
+    root.settle(true); rows.settle(true);
+    EXPECT_EQ(0u, value(rootKey).absentCount);
+    EXPECT_EQ(0u, value(childKey).absentCount);
+    EXPECT_EQ(0u, value(served).servedCount);
+    EXPECT_EQ(0u, value(ambiguous).absentCount);
+    EXPECT_EQ(0u, value(ambiguous).servedCount);
+    EXPECT_DOUBLE_EQ(0, value(ambiguous).creditedTotal);
+    EXPECT_DOUBLE_EQ(750, value(known).debt);
+    EXPECT_DOUBLE_EQ(600, value(childKey, 1).owed);
+    EXPECT_EQ(1u, value(childKey, 1).absentCount);
+    auto after = cache->counters();
+    EXPECT_EQ(before.observedCharges + 1, after.observedCharges);
+    EXPECT_EQ(before.assumedCharges, after.assumedCharges);
+    EXPECT_EQ(before.assumedCredits, after.assumedCredits);
+    EXPECT_EQ(before.observedCredits, after.observedCredits);
+    EXPECT_EQ(rejected, value(FilterKey("production")).resident == false);
+  }
+}
+
+TEST_F(FilterCacheTimingTest, byproductsDoNotCensorAndAbortedViewsSettleNothing) {
+  using Work = FilterCache::Work;
+  for (bool completed : {false, true}) {
+    FilterCache::UseRegistry root(cache.get(), *reader);
+    FilterCache::UseRegistry rows(cache.get(), *child, root);
+    FilterKey key(completed ? "byproduct-observation" : "aborted-observation");
+    rows.get(key)->probe(0, Work::pending());
+    {
+      FilterCache::UseRegistry::SegmentScope pass(root, 0);
+      root.get(FilterKey("offered"))->offerRaw(0, docs(reader->segments()[0].maxDoc(), {7}), 1000);
+    }
+    rows.addSegmentNanos(0, 1000);
+    root.settle(completed); rows.settle(completed);
+    EXPECT_EQ(completed ? 1u : 0u, value(key).absentCount);
+  }
+}
+
+TEST_F(FilterCacheTimingTest, readerProductionCensorsOnlyItsExecutingTimedSegment) {
+  using Work = FilterCache::Work;
+  for (bool timed : {false, true}) {
+    FilterCache::UseRegistry root(cache.get(), *reader);
+    FilterCache::UseRegistry rows(cache.get(), *child, root);
+    FilterKey key(timed ? "timed-reader-production" : "untimed-reader-production");
+    rows.get(key)->probe(0, Work::pending());
+    rows.get(key)->probe(1, Work::pending());
+    auto* builder = root.get(FilterKey(timed ? "reader-timed" : "reader-untimed"), FilterKeyScope::READER_STABLE);
+    auto domains = canonicalDomains(*reader);
+    auto claim = builder->probeReaderStable(*reader, domains);
+    ASSERT_EQ(FilterCache::ReaderProbe::Kind::BUILD, claim.kind());
+    auto publish = [&] { builder->publishReaderStable(claim, oneDocPerSegment(*reader), 1000); };
+    if (timed) {
+      FilterCache::UseRegistry::SegmentScope pass(rows, 0);
+      publish();
+    } else {
+      publish();
+    }
+    rows.addSegmentNanos(0, 1000);
+    rows.addSegmentNanos(1, 1000);
+    root.settle(true); rows.settle(true);
+    EXPECT_EQ(timed ? 0u : 1u, value(key).absentCount);
+    EXPECT_EQ(1u, value(key, 1).absentCount);
+  }
+}
+
 TEST(FilterCacheTest, completeResidencyAcceptanceCanDeferObservedCredit) {
   auto config = testConfig();
   config.admissionThreshold = 1;

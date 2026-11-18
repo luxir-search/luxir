@@ -2033,6 +2033,7 @@ public:
           DocSet* borrowedDomain = nullptr;
           bool exactDomain = false;
           DocSet* exactDomainDocs = nullptr;
+          FilterCache::UseRegistry::SegmentScope cacheTiming(*op.planning.filterUses, (size_t)segnum);
           if (!requiresWholeIndexPrepare && op.requirements.needExactDomain
               && !op.exactDomainPlan.empty()) {
             auto result = op.exactDomainPlan.produce(
@@ -2051,7 +2052,6 @@ public:
               skipCount(SkipStats::exactDomainStreamFallbacks);
             }
           }
-          FilterCache::UseRegistry::SegmentScope cacheTiming(*op.planning.filterUses, (size_t)segnum);
           bool wholeFallbackSupplierPending = false;
           auto obtainMainSupplier = [&]() {
             if (wholeFallbackSupplierPending) {

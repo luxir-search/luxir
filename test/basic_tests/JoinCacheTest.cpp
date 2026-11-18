@@ -130,6 +130,44 @@ TEST_F(JoinCacheTest, booleanOwnerFilterRecordsOrdinaryTimeBeforeBuying) {
   }
 }
 
+TEST_F(JoinCacheTest, exactDomainAttemptObservesOwnerBeforeStreamingSubOperations) {
+  CollectionHelper::UpdateBuilder input;
+  for (int i = 0; i < 128; i++) {
+    auto json = "{\"id\":\"d" + std::to_string(i) + "\",\"tag_w\":\"common\","
+        "\"group_s\":\"g\",\"rows_nested\":{\"value_i\":" + std::to_string(i % 4) + "}}";
+    input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+  }
+  input.commit(true, 1);
+  ASSERT_TRUE(helper.submit(input).success);
+  auto run = [&](bool subOperations) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& mr = req->mr;
+    auto join = qb::toParent(mr, "rows_nested",
+        qb::range(mr, "value_i", qb::valI64(mr, 1), nullptr, qb::valI64(mr, 2), nullptr), "max");
+    auto& top = req->topDocs().getScores().limit(10).countLimit(20);
+    top.rawQuery() = qb::boolean(mr, {qb::match(mr, "tag_w", "common")}, {}, {}, {join});
+    if (subOperations) {
+      top.limit(0);
+      top.facet("groups", "group_s").limit(-1);
+    }
+    req->execute(1);
+    ASSERT_OK(req);
+    EXPECT_GE(req->getMatchCount(), 20);
+  };
+  run(false);
+  SkipStatsScope stats;
+  run(true);
+  EXPECT_GT(SkipStats::exactDomainStreamFallbacks, 0);
+  EXPECT_EQ(0u, cache->counters().buildAttempts);
+  uint64_t samples = 0;
+  for (const auto& entry : cache->dump(20, nullptr, true)) {
+    for (const auto& value : entry.values) {
+      if (value.space == SpaceOrdinal::ROOT) samples += value.absentCount;
+    }
+  }
+  EXPECT_EQ(1u, samples);
+}
+
 TEST_F(JoinCacheTest, explicitFilterAdmitsAndServesReducerIndependentMembership) {
   EXPECT_EQ(12, count(1));
   EXPECT_EQ(0u, cache->counters().admissions);
@@ -234,7 +272,8 @@ TEST_F(JoinCacheTest, rawMembershipSurvivesRootDeletesAndAnUntouchedSegmentReope
   {
     SearchOverridesGuard guard(QueryPrep::disableWholeMembershipPlanForTests);
     QueryPrep::disableWholeMembershipPlanForTests = true;
-    for (int i = 0; i < 3; i++) EXPECT_EQ(1, count(1, false, 0, true));
+    // The id filter's build excludes one request from the owner's observations.
+    for (int i = 0; i < 4; i++) EXPECT_EQ(1, count(1, false, 0, true));
   }
   SkipStatsScope stats;
   EXPECT_EQ(12, count());

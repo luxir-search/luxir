@@ -1033,11 +1033,11 @@ size_t FilterCache::Use::ownedBytesForTest() {
   return result;
 }
 
-thread_local FilterCache::UseRegistry* FilterCache::UseRegistry::timedRegistry = nullptr;
+thread_local FilterCache::UseRegistry::Observation* FilterCache::UseRegistry::timedObservation = nullptr;
 thread_local size_t FilterCache::UseRegistry::timedSegment = 0;
 
 FilterCache::Work FilterCache::Use::work(size_t segmentOrd) const {
-  return observed && registry != nullptr && registry == UseRegistry::timedRegistry
+  return observed && registry != nullptr && registry->observation.get() == UseRegistry::timedObservation
       && segmentOrd == UseRegistry::timedSegment ? Work::pending() : Work::assumed();
 }
 
@@ -1085,12 +1085,12 @@ void FilterCache::Use::settle(size_t segmentOrd, uint64_t nanos,
 }
 
 FilterCache::UseRegistry::SegmentScope::SegmentScope(UseRegistry& registry, size_t segmentOrd)
-    : registry(registry), segmentOrd(segmentOrd), previousRegistry(timedRegistry),
-      previousSegment(timedSegment), outermost(timedRegistry != &registry || timedSegment != segmentOrd) {
+    : registry(registry), segmentOrd(segmentOrd), previousObservation(timedObservation),
+      previousSegment(timedSegment), outermost(timedObservation != registry.observation.get() || timedSegment != segmentOrd) {
   assert(segmentOrd < registry.segments.size());
   if (!outermost) return;
   started = std::chrono::steady_clock::now();
-  timedRegistry = &registry;
+  timedObservation = registry.observation.get();
   timedSegment = segmentOrd;
 }
 
@@ -1098,22 +1098,32 @@ FilterCache::UseRegistry::SegmentScope::~SegmentScope() {
   if (!outermost) return;
   registry.addSegmentNanos(segmentOrd, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - started).count());
-  timedRegistry = previousRegistry;
+  timedObservation = previousObservation;
   timedSegment = previousSegment;
 }
 
 void FilterCache::UseRegistry::addSegmentNanos(size_t segmentOrd, uint64_t nanos) {
   if (segmentOrd >= segments.size()) throw std::out_of_range("cache timing segment ordinal");
-  timing[segmentOrd].nanos.fetch_add(nanos, std::memory_order_relaxed);
+  observation->timing[segmentOrd].nanos.fetch_add(nanos, std::memory_order_relaxed);
+}
+
+void FilterCache::UseRegistry::recordProduction() {
+  if (timedObservation != nullptr) {
+    timedObservation->timing[timedSegment].produced.store(true, std::memory_order_relaxed);
+  }
 }
 
 void FilterCache::UseRegistry::settle(bool completed) noexcept {
   if (settled) return;
   settled = true;
   if (!completed) return;
-  for (auto& [key, use] : uses) {
-    for (size_t i = 0; i < segments.size(); i++) {
-      use->settle(i, timing[i].nanos.load(std::memory_order_relaxed), started);
+  for (size_t i = 0; i < segments.size(); i++) {
+    const auto& timing = observation->timing[i];
+    // Investment changes the executed plan and cannot teach an ordinary price.
+    if (timing.produced.load(std::memory_order_relaxed)) continue;
+    uint64_t nanos = timing.nanos.load(std::memory_order_relaxed);
+    for (auto& [key, use] : uses) {
+      use->settle(i, nanos, observation->started);
     }
   }
 }
@@ -1129,7 +1139,7 @@ FilterCache::UseRegistry::UseRegistry(
     std::span<const SegmentIdentity> segments)
   : cache(cache), segments(segments.begin(), segments.end()),
     readerCoreGen(readerCoreGen), readerVersion(readerVersion),
-    timing(std::make_unique<Timing[]>(segments.size()))
+    observation(std::make_shared<Observation>(segments.size()))
     #ifndef NDEBUG
     , owningThread(std::this_thread::get_id())
     #endif
@@ -1137,8 +1147,31 @@ FilterCache::UseRegistry::UseRegistry(
 }
 
 FilterCache::UseRegistry::UseRegistry(FilterCache* cache, IndexReader& reader)
-  : UseRegistry(cache, reader.coreGen(), reader.coreCommitTime(),
-                readerIdentities(reader)) {
+  : UseRegistry(cache, reader, nullptr) {}
+
+FilterCache::UseRegistry::UseRegistry(FilterCache* cache, IndexReader& reader, const UseRegistry& related)
+  : UseRegistry(cache, reader, &related) {}
+
+FilterCache::UseRegistry::UseRegistry(FilterCache* cache, IndexReader& reader, const UseRegistry* related)
+  : cache(cache), segments(readerIdentities(reader)), readerCoreGen(reader.coreGen()),
+    readerVersion(reader.coreCommitTime()),
+    observation(related ? related->observation : std::make_shared<Observation>(segments.size()))
+    #ifndef NDEBUG
+    , owningThread(std::this_thread::get_id())
+    #endif
+    {
+  if (related) {
+    if (observation->snapshot != reader.snapshot || segments.size() != related->segments.size()) {
+      throw std::invalid_argument("cache observations require aligned views of one snapshot");
+    }
+    for (size_t i = 0; i < segments.size(); i++) {
+      if (segments[i].segId != related->segments[i].segId) {
+        throw std::invalid_argument("cache observation views have different physical segments");
+      }
+    }
+  } else {
+    observation->snapshot = reader.snapshot;
+  }
 }
 
 FilterCache::UseRegistry::UseRegistry(
@@ -1153,8 +1186,7 @@ FilterCache::UseRegistry::UseRegistry(
   : UseRegistry(&cache, readerCoreGen, readerVersion, segments) {}
 
 FilterCache::UseRegistry::UseRegistry(FilterCache& cache, IndexReader& reader)
-  : UseRegistry(&cache, reader.coreGen(), reader.coreCommitTime(),
-                readerIdentities(reader)) {
+  : UseRegistry(&cache, reader) {
 }
 
 FilterCache::Use* FilterCache::UseRegistry::get(const FilterKey& key,
@@ -1747,6 +1779,7 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
   // Count claimed work even if publication rejects it. offerRaw and other
   // byproducts were materialized for the query, not at the cache's request.
   if (claimed && !byproduct) {
+    UseRegistry::recordProduction();
     counter.buildNanos.fetch_add(buildCostNanos, std::memory_order_relaxed);
   }
   auto local = std::make_shared<SegmentValue>(
@@ -1841,6 +1874,7 @@ FilterCache::publishReaderValue(
         "whole-reader publication requires READER_STABLE scope");
   }
   if (probe.ownsClaim) {
+    UseRegistry::recordProduction();
     counter.buildNanos.fetch_add(buildCostNanos, std::memory_order_relaxed);
   }
   auto mutableLocal = std::shared_ptr<ReaderValue>(new ReaderValue(

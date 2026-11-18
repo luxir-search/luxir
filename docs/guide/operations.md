@@ -884,6 +884,9 @@ Search has its own limits:
   a prior when available. Untimed and ambiguous uses remain assumed.
   Absent and served times are decayed segment-time means (gain 1/8); their
   difference estimates savings over the request mix, not any one request.
+  Row views share the request's segment observations. A segment containing a
+  claimed cache production teaches no observed times or payments; known
+  payments are unchanged, and byproducts do not exclude observations.
   Borrowing uses repay serves but never charge or populate.
   `build_us` counts claimed production, including rejected publications and
   excluding byproducts. `estimated_saved_us` sums credits; assumed and observed
