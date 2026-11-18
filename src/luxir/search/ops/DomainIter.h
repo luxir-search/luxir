@@ -16,6 +16,26 @@
 
 namespace luxir {
 
+// How the domain will be walked, for the piece's human-readable detail.
+// ARRAY domains point-select ords. Bitset domains adapt for DOCID columns and
+// retain fixed bulk decoding for RANK columns; null domains use fixed bulk.
+inline const char* domainDesc(DocSet* domain, bool docIdIndexed) {
+  if (domain == nullptr) {
+    return "all-docs domain, bulk ord loads";
+  }
+  if (domain->type == DocSet::Type::ARRAY) {
+    return "array domain, point ord loads";
+  }
+  return docIdIndexed ? "bitset domain, adaptive point/bulk ord loads"
+                      : "bitset domain, bulk ord loads";
+}
+
+inline const char* domainDesc(DocSet* domain) {
+  return domain == nullptr ? "all-docs domain"
+      : domain->type == DocSet::Type::ARRAY ? "array domain, point ord loads"
+                                            : "bitset domain";
+}
+
 // Resolved once per (segment, facet), rather than rediscovering the domain
 // representation for every term.
 struct DomainView {
@@ -613,6 +633,29 @@ void forEachOrdDocument(DocSet* domain, OrdColReader& column,
   }
 }
 
+// The complement of a partial domain, as a pool-backed bitset over maxDoc.
+inline FixedBitSet complementBits(const DomainView& view, MemPool& pool) {
+  assert(view.domain != nullptr && view.compCard > 0);
+  size_t numWords = FixedBitSet::sizeInWords(view.maxDoc);
+  auto* words = (uint64_t*)pool.alloc(numWords * sizeof(uint64_t),
+                                      alignof(uint64_t));
+  if (view.bits != nullptr) {
+    // Liveness and every DocSetBuilder output are sized at maxDoc.
+    assert(view.bits->size() == view.maxDoc);
+    for (size_t i = 0; i < numWords; i++) words[i] = ~view.bits->words[i];
+  } else {
+    std::memset(words, 0xff, numWords * sizeof(uint64_t));
+    for (int32_t doc : view.arr->docs()) {
+      words[(uint32_t)doc >> 6] &= ~(1ULL << ((uint32_t)doc & 63));
+    }
+  }
+  int32_t trailing = view.maxDoc & 63;
+  if (trailing != 0) {
+    words[numWords - 1] &= (1ULL << trailing) - 1;
+  }
+  return FixedBitSet(words, view.maxDoc);
+}
+
 // Walk the complement of a resolved facet domain over the ord column. Bitset
 // domains drive the shared adaptive machinery through inverted word reads, so
 // no second bitset is materialized. Array domains (reachable only when a
@@ -627,19 +670,7 @@ void forEachComplementOrdValue(DomainView& view, MemPool& pool,
                                std::string_view label, F&& callback) {
   assert(view.domain != nullptr && view.compCard > 0);
   if (view.bits == nullptr) {
-    size_t numWords = FixedBitSet::sizeInWords(view.maxDoc);
-    auto* words = (uint64_t*)pool.alloc(numWords * sizeof(uint64_t),
-                                        alignof(uint64_t));
-    std::memset(words, 0xff, numWords * sizeof(uint64_t));
-    for (int32_t doc : view.arr->docs()) {
-      words[(uint32_t)doc >> 6] &= ~(1ULL << ((uint32_t)doc & 63));
-    }
-    int32_t trailing = view.maxDoc & 63;
-    if (trailing != 0) {
-      words[numWords - 1] &= (1ULL << trailing) - 1;
-    }
-    FixedBitSet complementBits(words, view.maxDoc);
-    BitDocSet complement(complementBits, view.compCard);
+    BitDocSet complement(complementBits(view, pool), view.compCard);
     forEachOrdDocument(&complement, ordColReader, OrdMap::SegToGlobal::identity(),
                     view.maxDoc, missing_num, tracker, label, std::forward<F>(callback));
     return;

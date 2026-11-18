@@ -33,6 +33,8 @@
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/SegmentMergeDriver.h"
 #include "luxir/search/ops/DomainIter.h"
+#include "luxir/search/ops/StrFacetPlanning.h"
+#include "luxir/search/ops/StrFacetReplay.h"
 
 namespace luxir {
 
@@ -1012,6 +1014,7 @@ public:
     globalMin = range.min;
     globalMax = range.max;
     useVector = range.useVector;
+    enableExecutionProfile();
   }
 
   FacetDimension valueDimension() const {
@@ -1050,6 +1053,7 @@ public:
   }
 
   class Calc : public FieldFacetReq::Calc {
+    ExecutionProfileRun* profileRun;
     SegmentMergeDriver<MergeableIntFacet> driver;
     std::optional<SegmentMergeDriver<MergeableFieldFacetInline>> inlineDriver;
     std::vector<DomainHandle> input;
@@ -1057,6 +1061,7 @@ public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
         const StructuralConstraint* structural = nullptr)
       : FieldFacetReq::Calc(op, parent, slot, numSlots, structural),
+        profileRun(op.addExecutionProfileRun()),
         driver(op.view->segments().size(),
                [this](std::unique_ptr<MergeableIntFacet> m){ facetResult(*m); }) {
       if (!thisOp().subOps.empty()) input.resize(op.view->segments().size());
@@ -1086,10 +1091,17 @@ public:
           return;
         }
         if (!input.empty()) input[(size_t)segnum] = std::move(domainHandle);
+        auto profile = profilePiece(profileRun, segnum);
         inlineDriver->contribute([&](MergeableFieldFacetInline& data) {
           InlineSegmentScope scope(data.inlineCalcs, segnum);
           int64_t expectedValues = domain ? domain->card()
               : thisOp().reader.segments()[(size_t)segnum].maxDoc();
+          if (auto* piece = profile.get()) {
+            piece->wire.max_doc = thisOp().reader.segments()[(size_t)segnum].maxDoc();
+            piece->wire.domain_size = expectedValues;
+            piece->wire.strategy = "inline";
+            piece->details.emplace_back(domainDesc(domain));
+          }
           data.counts.initialize(expectedValues,
               forcedInlineFacetEntryMode == InlineFacetEntryMode::FORCE_DENSE,
               forcedInlineFacetEntryMode == InlineFacetEntryMode::FORCE_SPARSE);
@@ -1127,35 +1139,186 @@ public:
         return;
       }
       if (!input.empty()) input[(size_t)segnum] = std::move(domainHandle);
+      auto profile = profilePiece(profileRun, segnum);
       driver.contribute([&](MergeableIntFacet& data) {
-        auto& facetReq = (FacetReq&)getOp();
-        // Initialize storage based on the pre-determined type (first segment).
-        if (std::holds_alternative<std::monostate>(data.counts)) {
-          if (thisOp().useVector) {
-            int64_t range = thisOp().globalMax - thisOp().globalMin + 1;
-            data.counts = MergeableIntFacet::CountVector(range, 0);
-            data.minValue = thisOp().globalMin;
-          } else {
-            data.counts = MergeableIntFacet::IntHash();
-          }
-        }
-        if (auto* countVec = std::get_if<MergeableIntFacet::CountVector>(&data.counts)) {
-          int64_t minVal = data.minValue;
-          facetReq.facetSegIntDistinct(domain, segnum, data.missing_num,
-            [countVec, minVal](int32_t docid, int64_t val) LUXIR_INLINE {
-              unused(docid);
-              (*countVec)[val - minVal]++;
-            });
-        } else {
-          auto* countMap = &std::get<MergeableIntFacet::IntHash>(data.counts);
-          facetReq.facetSegIntDistinct(domain, segnum, data.missing_num,
-            [countMap](int32_t docid, int64_t val) LUXIR_INLINE {
-              unused(docid);
-              (*countMap)[val]++;
-            });
-        }
+        countSegment(data, segnum, domain, profile.get());
       });
     };
+
+    void countSegment(MergeableIntFacet& data, int32_t segnum, DocSet* domain,
+                      ExecutionProfilePieceState* profile) {
+      auto& facetReq = (FacetReq&)getOp();
+      // Initialize storage based on the pre-determined type (first segment).
+      if (std::holds_alternative<std::monostate>(data.counts)) {
+        if (thisOp().useVector) {
+          int64_t range = thisOp().globalMax - thisOp().globalMin + 1;
+          data.counts = MergeableIntFacet::CountVector(range, 0);
+          data.minValue = thisOp().globalMin;
+        } else {
+          data.counts = MergeableIntFacet::IntHash();
+        }
+      }
+      int32_t maxDoc = thisOp().reader.segments()[(size_t)segnum].maxDoc();
+      if (profile != nullptr) {
+        profile->wire.max_doc = maxDoc;
+        profile->wire.domain_size = domain ? domain->card() : maxDoc;
+        profile->wire.strategy =
+            std::holds_alternative<MergeableIntFacet::CountVector>(data.counts) ? "vector" : "hash";
+      }
+      auto* info = facetReq.fieldInfo(segnum);
+      if (info != nullptr && (info->flags & FieldType::INDEX_DOCS) && info->nTerms > 0) {
+        DomainView view(domain, maxDoc);
+        auto plan = StrFacetCountPlan::select(
+            StrFacetCountInputs{
+                .maxDoc = maxDoc,
+                .domainCardinality = view.card,
+                .complementCardinality = view.compCard,
+                .segmentTerms = info->nTerms,
+                .sumDocFreq = info->sumDocFreq,
+                .docsWithField = info->docsWithField,
+                .limit = thisOp().limit,
+                .topTermsAvailable = 0,
+                .domainHasBitset = view.bits != nullptr,
+                .missingRequested = thisOp().missing,
+                .allowTopTerms = false,
+                .hasGlobalOrdMap = false,
+                .readerHasNoDeletes = thisOp().reader.liveDocs() == thisOp().reader.maxDoc(),
+                .dfCost = StrFacetCountPlan::NUMERIC_DF_COST,
+                .priceAllDocsWalk = true
+            },
+            forcedStrFacetStrategy);
+        if (profile != nullptr) {
+          profile->wire.cardinality = info->nTerms;
+          if (!plan.forcedFallback.empty()) profile->details.emplace_back(plan.forcedFallback);
+        }
+        if (plan.strategy != StrFacetCountKind::COLUMN_DOMAIN) {
+          if (auto* counts = std::get_if<MergeableIntFacet::CountVector>(&data.counts)) {
+            int64_t minValue = data.minValue;
+            countFromTerms(data, segnum, view, *info, plan.strategy, profile,
+                [&](int64_t value, int64_t count) { (*counts)[value - minValue] += count; });
+          } else {
+            auto& hash = std::get<MergeableIntFacet::IntHash>(data.counts);
+            countFromTerms(data, segnum, view, *info, plan.strategy, profile,
+                [&](int64_t value, int64_t count) { hash[value] += count; });
+          }
+          return;
+        }
+      }
+      if (profile != nullptr) {
+        profile->details.emplace_back("parent-count=column-domain");
+        profile->details.emplace_back(domainDesc(domain));
+      }
+      if (auto* countVec = std::get_if<MergeableIntFacet::CountVector>(&data.counts)) {
+        int64_t minVal = data.minValue;
+        facetReq.facetSegIntDistinct(domain, segnum, data.missing_num,
+          [countVec, minVal](int32_t docid, int64_t val) LUXIR_INLINE {
+            unused(docid);
+            (*countVec)[val - minVal]++;
+          });
+      } else {
+        auto* countMap = &std::get<MergeableIntFacet::IntHash>(data.counts);
+        facetReq.facetSegIntDistinct(domain, segnum, data.missing_num,
+          [countMap](int32_t docid, int64_t val) LUXIR_INLINE {
+            unused(docid);
+            (*countMap)[val]++;
+          });
+      }
+    }
+
+    // Count a segment from its term dictionary (index: match). Terms are the
+    // order-preserving encoding of the column values, so each decodes to its
+    // bucket key, and a term's postings hold each document with that value
+    // once, as the distinct column walk counts it. add(value, count) receives
+    // only finished positive counts: the accumulator is shared across
+    // segments.
+    //   all docs:   a term's count is its docFreq.
+    //   complement: docFreq minus the term's documents outside the domain,
+    //               read from the column. Deleted documents are in both.
+    //   term:       each term's postings intersected with the domain.
+    void LUXIR_NOINLINE countFromTerms(MergeableIntFacet& data, int32_t segnum, DomainView& view,
+                                       const SegFieldInfo& info, StrFacetCountKind strategy,
+                                       ExecutionProfilePieceState* profile, auto&& add) {
+      auto& facet = thisOp();
+      auto& postingsReader = facet.reader.segments()[(size_t)segnum].postingsReader();
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      auto& pool = poolGuard.pool();
+      TermsEnum terms(pool, postingsReader, info);
+      auto emitCounts = [&](auto&& countOf) {
+        while (terms.nextTerm()) {
+          int64_t value = decodeNumericTerm(std::string_view(terms.term()));
+          int32_t count = countOf(value, terms.docFreq());
+          assert(count >= 0);
+          if (count > 0) add(value, (int64_t)count);
+        }
+      };
+      auto detail = [&](std::string_view parentCount, std::string_view how) {
+        if (profile == nullptr) return;
+        profile->details.emplace_back(parentCount);
+        profile->details.emplace_back(how);
+      };
+
+      if (view.compCard == 0) {
+        detail("parent-count=column-complement", "all-docs domain, docFreq-only dictionary walk");
+        emitCounts([](int64_t, int32_t docFreq) { return docFreq; });
+        if (facet.missing) data.missing_num += (int64_t)view.maxDoc - info.docsWithField;
+        return;
+      }
+
+      if (strategy == StrFacetCountKind::TERM_DRIVEN) {
+        detail("parent-count=term-driven", "per-term smallest-side postings intersection");
+        view.materializeBits(pool);
+        emitCounts([&](int64_t, int32_t docFreq) {
+          DocsOnlyEnum postings(terms);
+          return countTermInDomain(view, postings, docFreq);
+        });
+        if (facet.missing) {
+          DocsReader docsReader(postingsReader, info);
+          data.missing_num += countMissingInDomain(view, docsReader);
+        }
+        return;
+      }
+
+      assert(strategy == StrFacetCountKind::COLUMN_COMPLEMENT);
+      BitDocSet complement(complementBits(view, pool), view.compCard);
+      int64_t compMissing = 0;
+      // Stage the complement's counts by value: a dense array over the
+      // segment's value span when that span is near the term count, else the
+      // sorted values, merged into the ascending term walk.
+      const auto& bounds = *facet.segInfos.at((size_t)segnum)->columnBounds;
+      uint64_t span = (uint64_t)bounds.max - (uint64_t)bounds.min;
+      if (span < (uint64_t)std::max<int64_t>(4 * info.nTerms, 4096)) {
+        detail("parent-count=column-complement", "inverted domain view, dense value staging");
+        std::vector<int32_t> staged((size_t)span + 1);
+        int64_t base = bounds.min;
+        facet.facetSegIntDistinct(&complement, segnum, compMissing,
+            [&](int32_t, int64_t value) LUXIR_INLINE { staged[(size_t)(value - base)]++; });
+        emitCounts([&](int64_t value, int32_t docFreq) {
+          int32_t outside = staged[(size_t)(value - base)];
+          assert(outside <= docFreq);
+          return docFreq - outside;
+        });
+      } else {
+        detail("parent-count=column-complement", "inverted domain view, sorted value staging");
+        std::vector<int64_t> outside;
+        facet.facetSegIntDistinct(&complement, segnum, compMissing,
+            [&](int32_t, int64_t value) LUXIR_INLINE { outside.push_back(value); });
+        std::sort(outside.begin(), outside.end());
+        size_t next = 0;
+        emitCounts([&](int64_t value, int32_t docFreq) {
+          // Every column value is a term, so the sorted values never fall
+          // behind the term walk.
+          assert(next == outside.size() || outside[next] >= value);
+          int32_t count = docFreq;
+          while (next < outside.size() && outside[next] == value) { count--; next++; }
+          return count;
+        });
+        assert(next == outside.size());
+      }
+      if (facet.missing) {
+        int64_t inComplement = view.compCard - compMissing;
+        data.missing_num += view.card - (info.docsWithField - inComplement);
+      }
+    }
 
     void facetResult(MergeableIntFacet& merged) {
       auto lookup = [&](int64_t selected) -> int64_t {
@@ -1223,7 +1386,38 @@ public:
           });
     }
 
+    // Bucket domains come from the term postings, one bucket at a time, when
+    // every segment holding the field has them and they read less than the
+    // column pass (StrFacetBucketDomainPlan's rule for string facets).
+    bool postingsBucketDomains(std::span<const SelectedFacetBucket<int64_t>> buckets) {
+      if (forcedFacetBucketDomainSource == FacetBucketDomainSource::ORD_COLUMN) return false;
+      int64_t domainDocs = 0, maxDocs = 0, selectedDocs = 0;
+      for (size_t segnum = 0; segnum < input.size(); segnum++) {
+        auto* info = thisOp().fieldInfo((int32_t)segnum);
+        if (info != nullptr && !(info->flags & FieldType::INDEX_DOCS)) return false;
+        int32_t segmentMax = thisOp().reader.segments()[segnum].maxDoc();
+        maxDocs += segmentMax;
+        DocSet* domain = input[segnum].get();
+        domainDocs += domain != nullptr ? domain->card() : segmentMax;
+      }
+      if (forcedFacetBucketDomainSource == FacetBucketDomainSource::POSTINGS) return true;
+      for (const auto& bucket : buckets) selectedDocs += bucket.count;
+      return !StrFacetBucketDomainPlan::columnFaster(
+          domainDocs, selectedDocs, maxDocs, (int64_t)buckets.size());
+    }
+
     void executeResultChildren(std::span<const SelectedFacetBucket<int64_t>> buckets) {
+      if (!thisOp().subOps.empty() && !buckets.empty() && postingsBucketDomains(buckets)) {
+        executeBucketChildren<int64_t>(buckets, FacetBucketProducer::INDEPENDENT, input,
+            [this](size_t segnum, auto block, FacetBucketFeed feed) {
+              for (size_t i = 0; i < block.size(); i++) {
+                auto term = encodeNumericTerm(block[i].key);
+                feed(i, materializeTermDomain((int32_t)segnum,
+                    std::string_view(term.data(), term.size()), input[segnum].get()));
+              }
+            });
+        return;
+      }
       executeBucketChildren<int64_t>(buckets, FacetBucketProducer::JOINT, input,
           [this](size_t segnum, auto block, FacetBucketFeed feed) {
             feedFacetBucketDomainChunks(

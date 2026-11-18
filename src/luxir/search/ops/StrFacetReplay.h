@@ -132,6 +132,14 @@ struct StrFacetBucketDomainPlan {
     if (bucketDomainBytes(numBuckets, numSegments, domainDocs) > MAX_BYTES) {
       return false;
     }
+    return columnFaster(domainDocs, selectedDocs, maxDocs, numBuckets);
+  }
+
+  // The speed half alone, for a column pass whose residency is bounded
+  // elsewhere (a numeric facet builds its column domains in chunks).
+  static bool columnFaster(int64_t domainDocs, int64_t selectedDocs,
+                           int64_t maxDocs, int64_t numBuckets) {
+    if (domainDocs <= 0 || maxDocs <= 0 || numBuckets <= 0) return false;
     __int128 postingsRead =
         (__int128)selectedDocs * maxDocs / domainDocs
         + (__int128)numBuckets * SEEK_DOC_EQUIVALENT;
