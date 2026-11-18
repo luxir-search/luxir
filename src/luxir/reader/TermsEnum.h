@@ -579,7 +579,7 @@ protected:
     }
     uint32_t keyBytes = svbKeyBytes(count);
     assert(runLen >= keyBytes);
-    uint8_t* dataEnd = svb_decode_avx_simple(out, (uint8_t*) run, (uint8_t*) run + keyBytes, count);
+    [[maybe_unused]] uint8_t* dataEnd = svb_decode_avx_simple(out, (uint8_t*) run, (uint8_t*) run + keyBytes, count);
     assert(dataEnd == (uint8_t*) run + runLen);
   }
 
@@ -629,7 +629,7 @@ protected:
     } else {
       const char* p = docsEndRun;
       const char* end = docsEndRun + docsEndRunLen;
-      uint64_t prevDocsEnd = 0;
+      [[maybe_unused]] uint64_t prevDocsEnd = 0;
       for (uint32_t i = 0; i < n; i++) {
         uint64_t docsEnd = InputStream::readVlong(p, end);
         assert(docsEnd >= prevDocsEnd);
@@ -894,7 +894,7 @@ protected:
     // Suffixes are short: usually one fixed 16-byte move (copyIntoTerm).
 
     assert(blockPrefixLen <= len);
-    uint32_t factoredLen = len - blockPrefixLen;
+    [[maybe_unused]] uint32_t factoredLen = len - blockPrefixLen;
     assert(prefixLen <= factoredLen);
     assert(blockPrefixLen + prefixLen + suffixLen <= PackedTerm::MAX_LEN);
     // prefixLen is measured against the previous term after factoring out

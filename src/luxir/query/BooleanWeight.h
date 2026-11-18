@@ -7914,7 +7914,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       return {};
     }
     auto weights = targetPool.make_arr<Query::Weight*>(queries.size());
-    for (int i = 0; i < queries.size(); ++i) {
+    for (size_t i = 0; i < queries.size(); ++i) {
       weights[i] = queries[i]->createWeight(context, flags, multiplier);
     }
     return {weights, queries.size()};
@@ -9842,14 +9842,14 @@ class BooleanQuery::Weight final : public Query::Weight {
       bool docSetFilter;
       bool scoring;
       size_t order;
-      Query::PlanContext buildContext;
+      Query::PlanContext buildContext = {};
       Query::ScorerPlan* plan = nullptr;
     };
 
     struct PlannedSupplier {
       Query::ScorerSupplier* supplier;
       Query::ScorerShape shape;
-      Query::PlanContext buildContext;
+      Query::PlanContext buildContext = {};
       Query::ScorerPlan* plan = nullptr;
     };
 

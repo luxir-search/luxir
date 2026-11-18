@@ -1500,7 +1500,7 @@ public:
         for (uint64_t key : seenVectors) {
           size_t i = (size_t)(key >> PACK_RANK_BITS);
           int64_t rank = (int64_t)(key & (((uint64_t)1 << PACK_RANK_BITS) - 1));
-          bool fresh = rankEligibility[i].clear(rank, segVectorCounts[i], workBySeg[i]);
+          [[maybe_unused]] bool fresh = rankEligibility[i].clear(rank, segVectorCounts[i], workBySeg[i]);
           assert(fresh);
           eligibleSpans[i] = rankEligibility[i].bits;
         }

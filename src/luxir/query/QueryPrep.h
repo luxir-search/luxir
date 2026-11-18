@@ -1268,8 +1268,8 @@ inline Query::ScorerSupplier* filterSupplier(
           && cost < segment.maxDoc() / kMaskFilterDensityInverse)
       || (mode == FilterSupplierMode::SPARSE_BATCH
           && (sparseBatchDensityInverse <= 0
-              || cost > segment.maxDoc() / sparseBatchDensityInverse
-                  && cost < segment.maxDoc() / kMaskFilterDensityInverse))) {
+              || (cost > segment.maxDoc() / sparseBatchDensityInverse
+                  && cost < segment.maxDoc() / kMaskFilterDensityInverse)))) {
     return uncached;
   }
 
@@ -1481,7 +1481,7 @@ inline DomainHandle materializeEffectiveFilter(
 
   if (use->scope() == FilterKeyScope::READER_STABLE) {
     if (auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared)) {
-      DocSet* canonical = segment.liveDocSet();
+      [[maybe_unused]] DocSet* canonical = segment.liveDocSet();
       assert(domain == nullptr || domain == canonical);
       return DomainHandle::borrowed(cached->docSet(segment)).scoped(segment);
     }
