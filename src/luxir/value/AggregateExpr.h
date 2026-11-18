@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory_resource>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -141,6 +142,10 @@ struct AggregateStateOps {
   bool replayCapable = true;
   bool orderSensitive = false;
   AccumulateOrdBatch accumulateOrdBatch = nullptr;
+  // The aggregate needs only how many values each document holds. A bare
+  // column input then binds to its shape (BoundValueCounts), and every raw
+  // input (point, batch, keyed) is a per-document value count, not a value.
+  bool countsValues = false;
 };
 
 // Optional packed state for a bare, single-valued column that is present on
@@ -183,6 +188,11 @@ struct AggregateProducer {
   uint32_t stateOffset = 0;
 
   bool sameState(const AggregateProducer& other) const;
+
+  // Reads per-document value counts from a column shape (see countsValues).
+  bool countsColumnValues() const {
+    return resolved.state.countsValues && input->root().kind == ValueNodeKind::COLUMN;
+  }
 };
 
 struct AggregateLeaf {
@@ -319,11 +329,33 @@ public:
 };
 
 void writeAggregateValue(api::Val& target, const BucketScalar& value);
+
+// How many values each document of a segment holds in a bare column, read
+// from the column shape (docs with the field plus end value ranks) without
+// decoding a value. A nested descendant column counts the values of every row
+// the owner holds. Without either the segment has no such column.
+struct BoundValueCounts {
+  const ColumnShape* shape = nullptr;
+  std::optional<ColumnShape::Cursor> cursor;
+  BoundColumnRange* mapping = nullptr;
+
+  int64_t count(int32_t docid) {
+    if (mapping != nullptr) {
+      auto [first, end] = mapping->range(docid);
+      return end - first;
+    }
+    return cursor && cursor->seek(docid) ? cursor->count() : 0;
+  }
+};
+
 struct BoundAggregateInput {
   BoundValueProgram* values = nullptr;
   const AggregateProducer* producer = nullptr;
   OrdMap::SegToGlobal ordMapping;
   IntColReader::BulkIterator* columnIterator = nullptr;
+  // Set for a countsColumnValues() producer, which is then a bareColumn whose
+  // raw point is the document's value count.
+  BoundValueCounts* valueCounts = nullptr;
   AggregateStateOps::AccumulateRawPoint accumulateRawPoint = nullptr;
   std::span<const AggregateConstant> arguments;
   uint32_t producerStateOffset = 0;
@@ -369,7 +401,11 @@ struct BoundAggregateInput {
   }
 
   bool readRawPoint(int32_t docid, int64_t& raw) {
-    assert(bareColumn && scalar());
+    assert(bareColumn && (scalar() || valueCounts != nullptr));
+    if (valueCounts != nullptr) {
+      raw = valueCounts->count(docid);
+      return raw != 0;
+    }
     if (columnIterator == nullptr) return false;
     IntColReader::BulkIterator& iterator = *columnIterator;
     if (iterator.docId() < docid) iterator.advance(docid);
@@ -388,7 +424,7 @@ struct BoundAggregateInput {
   }
 
   void accumulatePoint(void* aggregateState, int32_t docid) {
-    assert(scalar());
+    assert(scalar() || valueCounts != nullptr);
     void* producerState = static_cast<std::byte*>(aggregateState)
         + producerStateOffset;
     if (bareColumn) {

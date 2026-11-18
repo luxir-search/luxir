@@ -1362,6 +1362,70 @@ ResolvedAggregate resolvePercentile(
   return {BucketValueType::DOUBLE, input->nature, ops};
 }
 
+// value_count: the number of values, an uint64_t that cannot overflow (a
+// request sees fewer than 2^63 values). A bare column binds with countsValues,
+// so its raw inputs are per-document value counts read from the column shape,
+// never column values. Any other input counts each value it yields.
+void addValueCountBy(void* target, uint64_t count) {
+  storeState(target, loadState<uint64_t>(target) + count);
+}
+
+void addValueCount(void* target, const ValueResult& value,
+                   std::span<const AggregateConstant> arguments) {
+  unused(value);
+  unused(arguments);
+  addValueCountBy(target, 1);
+}
+
+void addValueCountBatch(void* target, std::span<const ScalarValueResult> values,
+                        std::span<const AggregateConstant> arguments) {
+  unused(arguments);
+  uint64_t count = 0;
+  for (const ScalarValueResult& value : values) count += value.valid ? 1 : 0;
+  addValueCountBy(target, count);
+}
+
+void addValueCountRaw(void* target, int64_t count, FieldType::Type columnType,
+                      std::span<const AggregateConstant> arguments) {
+  unused(columnType);
+  unused(arguments);
+  assert(count >= 0);
+  addValueCountBy(target, (uint64_t)count);
+}
+
+void addValueCountRawBatch(void* target, std::span<const int64_t> counts,
+                           FieldType::Type columnType,
+                           std::span<const AggregateConstant> arguments) {
+  unused(columnType);
+  unused(arguments);
+  uint64_t count = 0;
+  for (int64_t value : counts) count += (uint64_t)value;
+  addValueCountBy(target, count);
+}
+
+void mergeValueCount(void* target, const void* source,
+                     std::span<const AggregateConstant> arguments) {
+  unused(arguments);
+  addValueCountBy(target, loadState<uint64_t>(source));
+}
+
+BucketScalar finishValueCount(const void* source,
+                              std::span<const AggregateConstant> arguments) {
+  unused(arguments);
+  return BucketScalar::integer((__int128)loadState<uint64_t>(source));
+}
+
+ResolvedAggregate resolveValueCount(
+    const ValueNode* input, std::span<AggregateConstant> arguments) {
+  unused(input);
+  assert(arguments.empty());
+  AggregateStateOps ops{sizeof(uint64_t), initState<uint64_t>, addValueCount,
+      addValueCountBatch, addValueCountRaw, addValueCountRawBatch, mergeValueCount,
+      finishValueCount, addKeyedRaw<addValueCountRaw>};
+  ops.countsValues = true;
+  return {BucketValueType::INT128, ValueNature::NUMBER, ops};
+}
+
 AggregateConstant canonicalCardinalityArgument(
     std::span<const AggregateConstant> arguments, uint8_t index) {
   assert(index == 0);
@@ -1380,6 +1444,7 @@ constexpr AggregateFunction FUNCTIONS[] = {
     {"min", 1, 1, resolveMin, false, 0, nullptr, NaturePolicy::SAME},
     {"max", 1, 1, resolveMax, false, 0, nullptr, NaturePolicy::SAME},
     {"cardinality", 1, 2, resolveCardinality, true, 0, canonicalCardinalityArgument, NaturePolicy::RAW},
+    {"value_count", 1, 1, resolveValueCount, true, 0, nullptr, NaturePolicy::RAW, true},
     {"percentile_rank", 2, 2, resolveRank},
     {"percentile", 2, 3, resolvePercentile, false, 1, canonicalPercentileArgument, NaturePolicy::DECIMAL},
 };

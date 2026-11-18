@@ -269,7 +269,8 @@ private:
             ValueExprOptions valueOptions{opts.schema, opts.vars, budget, false, opts.fieldResolver, opts.opName};
             valueOptions.view = opts.view;
             try {
-              input = ValueExprParser(valueOptions, arena).parsePartial(*cur, function.natures);
+              input = ValueExprParser(valueOptions, arena).parsePartial(
+                  *cur, function.natures, function.acceptsGeoPoints);
             } catch (const std::runtime_error& error) {
               throw std::runtime_error(fmt::format(
                   "op '{}': {}", opts.opName, error.what()));

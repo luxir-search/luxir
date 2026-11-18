@@ -99,6 +99,8 @@ TEST_F(NestedValueExprTest, metricsRelativeViewsStringCountsAndRescoreUseTheSame
   req->expr("counts", "sum(count(items_nested.n_i))");
   req->expr("means", "avg(avg(items_nested.n_i))");
   req->expr("labels", "sum(count(items_nested.label_s))");
+  req->expr("value_counts", "value_count(items_nested.n_i)");
+  req->expr("value_labels", "value_count(items_nested.label_s)");
   req->expr("distinct", "cardinality(items_nested.label_s)");
   auto& rows = req->topDocs("rows").allQuery().limit(0);
   rows.rawOp().domain.emplace().to = "items_nested";
@@ -108,6 +110,7 @@ TEST_F(NestedValueExprTest, metricsRelativeViewsStringCountsAndRescoreUseTheSame
   EXPECT_EQ(16, req->scalar<int64_t>("maxima")); EXPECT_EQ(4, req->scalar<int64_t>("counts"));
   EXPECT_DOUBLE_EQ(5.25, req->scalar<double>("means"));
   EXPECT_EQ(4, req->scalar<int64_t>("labels")); EXPECT_EQ(3, req->scalar<int64_t>("distinct"));
+  EXPECT_EQ(4, req->scalar<int64_t>("value_counts")); EXPECT_EQ(4, req->scalar<int64_t>("value_labels"));
   EXPECT_EQ(14, req->docList("rows")->ops.at("parts")->asInt()); EXPECT_DOUBLE_EQ(3.75, req->scalar<double>("floats"));
   auto scores = localReq(helper.getSearchEngine());
   scores->topDocs().getScores().fields({"id"}).rawQuery() = qb::rescore(scores->mr, qb::all(), "def(max(items_nested.n_i),0)");
@@ -161,12 +164,17 @@ TEST_F(NestedValueExprTest, longSparseFamiliesKeepTypedColumnSemantics) {
   req->expr("price", "sum(sum(items_nested.price))");
   req->expr("distance", "max(max(geo_distance(items_nested.point,0,0)))");
   req->expr("empty", "sum(count(empty_nested.n_i))");
+  req->expr("value_arrays", "value_count(items_nested.many)");
+  req->expr("value_points", "value_count(items_nested.point)");
+  req->expr("value_empty", "value_count(empty_nested.n_i)");
   req->execute(1); ASSERT_OK(req);
   EXPECT_EQ(299, req->scalar<int64_t>("largest")); EXPECT_EQ(44871, req->scalar<int64_t>("total"));
   EXPECT_EQ(306, req->scalar<int64_t>("arrays")); EXPECT_EQ(32, req->scalar<int64_t>("array_sum"));
   EXPECT_DOUBLE_EQ(2000, req->scalar<double>("date")); EXPECT_DOUBLE_EQ(-1.25, req->scalar<double>("price"));
   EXPECT_GT(req->scalar<double>("distance"), 100000); EXPECT_LT(req->scalar<double>("distance"), 120000);
   EXPECT_EQ(0, req->scalar<int64_t>("empty"));
+  EXPECT_EQ(306, req->scalar<int64_t>("value_arrays")); EXPECT_EQ(2, req->scalar<int64_t>("value_points"));
+  EXPECT_EQ(0, req->scalar<int64_t>("value_empty"));
 }
 
 TEST_F(NestedValueExprTest, componentsMapOverDescendantsAtEachDepth) {

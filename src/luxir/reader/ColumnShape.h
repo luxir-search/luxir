@@ -32,6 +32,17 @@ public:
 
   bool multiValued() const noexcept { return endValueRanks.has_value(); }
 
+  // Whether every document of the segment holds exactly one value.
+  bool oneValuePerDoc() const noexcept {
+    return !endValueRanks && !docs.hasBitset() && docs.numDocs() > 0;
+  }
+
+  // Values held by all documents of the segment.
+  int64_t numValues() const {
+    if (!endValueRanks) return docs.numDocs();
+    return docs.numDocs() == 0 ? 0 : endValueRanks->valueAt(docs.numDocs() - 1);
+  }
+
   // Seeks documents in any order: repeating a target is free, and a target
   // behind the previous one restarts the scan.
   class Cursor {

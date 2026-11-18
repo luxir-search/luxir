@@ -29,6 +29,8 @@ struct AggregateFunction {
   uint32_t readoutArguments = 0;
   CanonicalArgument canonicalArgument = nullptr;
   NaturePolicy natures = NaturePolicy::NUMBER;
+  // Counts values without reading them, so a GEO_POINT input is valid.
+  bool acceptsGeoPoints = false;
 
   bool sameStateArguments(std::span<const AggregateConstant> left,
                           std::span<const AggregateConstant> right) const;

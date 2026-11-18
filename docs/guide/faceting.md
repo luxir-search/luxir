@@ -379,12 +379,22 @@ shortest form is a bare expression string in an operation position:
 "average_price": "avg(price_f)"
 ```
 
-The aggregates are `avg`, `sum`, `min`, `max`, `cardinality`, `percentile`, and
-`percentile_rank`. Their value arguments use the same expression language as
-[sort expressions](searching.md#sorting):
+The aggregates are `avg`, `sum`, `min`, `max`, `value_count`, `cardinality`,
+`percentile`, and `percentile_rank`. Their value arguments use the same expression
+language as [sort expressions](searching.md#sorting):
 arithmetic, parentheses, `def`, unary math, and per-document array reducers.
-`sum(count(field))` counts values, like Elasticsearch `value_count`, for
-numeric, boolean, date, STRING, ID and GEO_POINT fields alike.
+
+`value_count(field)` counts values, like Elasticsearch `value_count`, for
+numeric, boolean, date, IP, decimal, STRING, ID and GEO_POINT fields alike: every
+value of every document, so a multi-valued document adds each of its values and
+a document without the field adds nothing. A [set](schema.md#multi-valued-modes)
+holds a repeated value once and an array holds each repeat, so a set counts
+like an Elasticsearch `keyword` field and an array like its numeric fields.
+The count is an int64 and is `0`, not null, when nothing matches. On a bare
+field it reads only how many values each document holds, never the values, so
+it costs about as much as the bucket count and joins the fused per-facet column
+pass beside `avg`, `sum`, `min`, and `max`. Over any other expression it
+counts the present values the expression yields per document.
 A composite metric is a single expression:
 
 ```json

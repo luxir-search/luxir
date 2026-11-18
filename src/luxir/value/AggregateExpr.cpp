@@ -316,7 +316,8 @@ std::span<const AggregateFieldInfos> resolveAggregateFields(
   for (size_t i = 0; i < fields.size(); i++) {
     const ValueProgram& input = *program.producers[i].input;
     fields[i].values = input.resolveFields(pool, reader);
-    if (input.root().type == ValueType::COLUMN_ONLY) {
+    // A value count reads only the column shape, never an ordinal.
+    if (input.root().type == ValueType::COLUMN_ONLY && !program.producers[i].countsColumnValues()) {
       fields[i].ords = (input.root().source ? *input.root().source : reader).getOrdMap(input.root().text).get();
     }
   }
@@ -345,12 +346,27 @@ std::vector<BoundAggregateInput> bindAggregateInputs(
     }
     bool columnScan = root.kind == ValueNodeKind::COLUMN && !root.source && (!strings || root.columnIndexed);
     bool bareColumn = columnScan && !strings && !valueArray(root.type);
+    BoundValueCounts* valueCounts = nullptr;
+    if (producer.countsColumnValues()) {
+      valueCounts = pool.make<BoundValueCounts>();
+      if (rootBinding.mapping != nullptr) {
+        valueCounts->mapping = rootBinding.mapping;
+      } else if (!root.source) {
+        if (auto* info = SegFieldInfo::column(fields[index].values[producer.input->rootNode].at(segment))) {
+          valueCounts->shape = rootBinding.stringColumn != nullptr ? &rootBinding.stringColumn->shape
+              : pool.make<ColumnShape>(segment.postingsReader(), *info);
+          valueCounts->cursor.emplace(*valueCounts->shape);
+        }
+      }
+      bareColumn = true;
+    }
     bindings.push_back({
         .values = values,
         .producer = &producer,
         .ordMapping = ordMapping,
-        .columnIterator = bareColumn && rootBinding.bulkIterator
+        .columnIterator = bareColumn && !valueCounts && rootBinding.bulkIterator
             ? &*rootBinding.bulkIterator : nullptr,
+        .valueCounts = valueCounts,
         .accumulateRawPoint = producer.resolved.state.accumulateRawPoint,
         .arguments = producer.arguments,
         .producerStateOffset = (uint32_t)sizeof(AggregateFailure)

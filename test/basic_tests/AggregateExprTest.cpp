@@ -703,6 +703,132 @@ TEST_F(AggregateExprTest, countReadsStoredValuesOfEveryColumnKind) {
   EXPECT_EQ(2, req->scalar<int64_t>("distinct"));
 }
 
+// value_count(f) reads per-document value counts from the column shape. It
+// must agree with sum(count(f)) on every route: whole match set, a filtered
+// domain, bucket domains, column replay, inline and the fused column batch.
+TEST_F(AggregateExprTest, valueCountMatchesSumOfCountsOnEveryRoute) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  SchemaBuilder schema;
+  for (auto [name, type, indexed] : {std::tuple{"arr_s", api::FieldDef::FieldClass::STRING, true},
+                                     {"arr_i", api::FieldDef::FieldClass::INT, true},
+                                     {"raw", api::FieldDef::FieldClass::STRING, false}}) {
+    auto& field = schema.field(name);
+    field.type = type;
+    field.multi = indexed ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+    if (!indexed) {
+      field.index = api::FieldDef::IndexMode::NONE;
+      field.column = true;
+    }
+  }
+  schema.set(helper.collection());
+  helper.indexAll({
+      flatdoc("id", "a", "cat_s", "x", "tags_ss", vecs("p", "q", "p"), "arr_s", vecs("p", "q", "p"),
+              "raw", vecs("p", "q"), "n_is", vec_i(1, 2, 2), "arr_i", vec_i(1, 2, 2), "n_i", 1,
+              "s_s", "u", "d_d", 1.5),
+      flatdoc("id", "b", "cat_s", "y", "tags_ss", vecs("r"), "n_is", vec_i(3), "n_i", 2),
+      flatdoc("id", "c", "cat_s", "x", "tags_ss", vecs("p", "s"), "arr_i", vec_i(5, 5, 5),
+              "s_s", "v")}, UpdateMessage::COMMIT);
+  helper.indexAll({
+      flatdoc("id", "d", "cat_s", "y", "arr_s", vecs("z", "z"), "raw", vecs("z"), "d_d", 2.5),
+      flatdoc("id", "e", "cat_s", "x", "tags_ss", vecs("q"), "arr_i", vec_i(7), "n_i", 3, "s_s", "w"),
+      flatdoc("id", "f", "cat_s", "z")}, UpdateMessage::COMMIT);
+  ASSERT_TRUE(helper.deleteById("c", UpdateMessage::COMMIT).success);
+  std::vector<std::string> fields{"tags_ss", "arr_s", "raw", "n_is", "arr_i", "n_i", "s_s", "d_d", "id"};
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  auto& selected = root.topDocs("selected").exprQuery("cat_s:x").limit(0);
+  auto& none = root.topDocs("none").exprQuery("cat_s:nothing").limit(0);
+  for (const auto& field : fields) {
+    root.expr("vc_" + field, "value_count(" + field + ")");
+    root.expr("sc_" + field, "sum(count(" + field + "))");
+    selected.expr("vc_" + field, "value_count(" + field + ")");
+    selected.expr("sc_" + field, "sum(count(" + field + "))");
+    none.expr("vc_" + field, "value_count(" + field + ")");
+  }
+  req->execute(-1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  for (const auto& field : fields) {
+    SCOPED_TRACE(field);
+    EXPECT_EQ(req->scalar<int64_t>("sc_" + field), req->scalar<int64_t>("vc_" + field));
+    const auto& filtered = req->docList("selected")->ops;
+    EXPECT_EQ(filtered.at("sc_" + field)->asInt(), filtered.at("vc_" + field)->asInt());
+    // An empty domain counts zero values, as Elasticsearch value_count does.
+    EXPECT_EQ(0, req->docList("none")->ops.at("vc_" + field)->asInt());
+  }
+  // Sets count a repeated value once, arrays every repeat; c is deleted.
+  EXPECT_EQ(4, req->scalar<int64_t>("vc_tags_ss"));
+  EXPECT_EQ(5, req->scalar<int64_t>("vc_arr_s"));
+  EXPECT_EQ(3, req->scalar<int64_t>("vc_n_is"));
+  EXPECT_EQ(4, req->scalar<int64_t>("vc_arr_i"));
+  EXPECT_EQ(5, req->scalar<int64_t>("vc_id"));
+
+  auto facetValues = [&](bool native, FacetSubOpInlineMode mode, FacetFeedStrategy feed,
+                         size_t* keyedBatches = nullptr) {
+    SearchOverridesGuard guard(forcedFacetSubOpInline, forcedFacetFeedStrategy,
+                               inlineFacetEntryStatsForTests);
+    forcedFacetSubOpInline = mode;
+    forcedFacetFeedStrategy = feed;
+    InlineFacetEntryStats stats;
+    inlineFacetEntryStatsForTests = &stats;
+    auto req = localReq(helper.getSearchEngine());
+    auto& facet = req->collection("main").facet("f", "cat_s").limit(-1);
+    for (const auto& field : fields) {
+      facet.expr(field, native ? "value_count(" + field + ")" : "sum(count(" + field + "))");
+    }
+    facet.expr("avg", "avg(n_i)");
+    req->execute(-1);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+    std::map<std::string, std::vector<int64_t>> values;
+    for (const auto& id : std::get<api::ColStr>(result->bucket_ids->kind).v) {
+      values["ids"].push_back(id == "x" ? 0 : id == "y" ? 1 : 2);
+    }
+    for (const auto& field : fields) {
+      for (const auto& value : std::get<api::ArrVal>(result->ops.at(field)->kind).v) {
+        values[field].push_back(value.asInt());
+      }
+    }
+    if (keyedBatches != nullptr) *keyedBatches = stats.keyedBatches.load();
+    return values;
+  };
+  auto expected = facetValues(false, FacetSubOpInlineMode::SORT_KEY_ONLY,
+                              FacetFeedStrategy::BUCKET_DOMAINS);
+  EXPECT_EQ((std::vector<int64_t>{3, 1, 0}), expected.at("tags_ss"));  // x: a, e; y: b, d; z: f
+  size_t fused = 0;
+  EXPECT_EQ(expected, facetValues(true, FacetSubOpInlineMode::AUTO, FacetFeedStrategy::AUTO, &fused));
+  EXPECT_GT(fused, 0u);
+  EXPECT_EQ(expected, facetValues(true, FacetSubOpInlineMode::ALL, FacetFeedStrategy::AUTO));
+  EXPECT_EQ(expected, facetValues(true, FacetSubOpInlineMode::SORT_KEY_ONLY,
+                                  FacetFeedStrategy::BUCKET_DOMAINS));
+  EXPECT_EQ(expected, facetValues(true, FacetSubOpInlineMode::SORT_KEY_ONLY,
+                                  FacetFeedStrategy::STRING_COLUMN_REPLAY));
+  {
+    SearchOverridesGuard guard(disableKeyedInlineBatchesForTests);
+    disableKeyedInlineBatchesForTests = true;
+    EXPECT_EQ(expected, facetValues(true, FacetSubOpInlineMode::ALL, FacetFeedStrategy::AUTO));
+  }
+
+  // A collapse group ranks by the metric through the same inline fold.
+  auto collapse = localReq(helper.getSearchEngine());
+  parseQueryRequest(R"JSON({"query":{"all":true},"limit":10,"collapse":{"field":"cat_s","sort":"n desc",
+      "ops":{"n":"value_count(tags_ss)"}},"fields":["id"],"document_format":"rows"})JSON",
+      collapse->rawRequest(), collapse->mr);
+  collapse->collection("main");
+  collapse->execute(1);
+  ASSERT_TRUE(collapse->ok()) << collapse->errorMsg();
+  const auto& groups = std::get<api::ArrVal>(collapse->docList()->groups->ops.at("n")->kind).v;
+  ASSERT_EQ(3u, groups.size());
+  EXPECT_EQ(3, groups[0].asInt());
+  EXPECT_EQ(1, groups[1].asInt());
+  EXPECT_EQ(0, groups[2].asInt());
+
+  auto parseSchema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  expectParseError(memory, *parseSchema, "value_count(n_i, 3)", "value_count");
+}
+
 TEST_F(AggregateExprTest, countAndCardinalitySeeNoValuesInAColumnEmptiedByMerge) {
   CollectionHelper helper;
   helper.indexAll({flatdoc("id", "a", "s_s", "x", "tags_ss", vecs("p", "q")),
