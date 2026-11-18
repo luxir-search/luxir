@@ -887,7 +887,9 @@ Search has its own limits:
   Row views share the request's segment observations. A segment containing a
   claimed cache production teaches no observed times or payments; known
   payments are unchanged, and byproducts do not exclude observations.
-  Borrowing uses repay serves but never charge or populate.
+  Join children and restricted exact-domain sources require timed observations
+  to fund population. Outside a timed scope they serve resident values with
+  assumed credit and otherwise execute without charging or claiming a build.
   `build_us` counts claimed production, including rejected publications and
   excluding byproducts. `estimated_saved_us` sums credits; assumed and observed
   credits are estimates of savings. `unrepaid_evictions` counts capacity

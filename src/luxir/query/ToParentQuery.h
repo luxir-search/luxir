@@ -66,14 +66,10 @@ public:
       auto childMode = child->consumesDomain() ? mode : Query::SupplierExecutionMode::RAW_MEMBERSHIP;
       skipCount(SkipStats::joinChildSuppliers);
       auto* supplier = childUse
-          // Raw child population is not priced against this request's demand
-          // yet, so this join only borrows it. Reader-stable children still
-          // populate through prepareFilterSources; owner membership is cached
-          // independently.
           ? QueryPrep::filterSupplier(pool, input, source, leaf,
                 allowsPruning() ? QueryPrep::FilterSupplierMode::DENSITY_ROUTED
                     : QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE,
-                0, childMode, FilterCache::Population::BORROW_ONLY)
+                0, childMode, childUse->work((size_t)leaf.ord).observedOnly())
           : input.segmentSource().scorerSupplier(pool, leaf, childMode);
       if (!supplier) return nullptr;
       return relation.reduce(pool, (size_t)segment.ord, *supplier,
@@ -141,6 +137,7 @@ public:
       // Every row of the path is not a set worth materializing or caching.
       childUse = !child->needsScores() && !child->allowsPruning() && !child->matchesAllDocs()
           ? childContext->getFilterUse(*query.child) : nullptr;
+      if (childUse && childUse->scope() != FilterKeyScope::READER_STABLE) childUse->observe();
       traits = OBSERVED_FILTER_CACHE | (child->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN));
       if (child->consumesDomain()) traits |= NEEDS_PREPARE;
       if (reduction.kind == RowReduction::FIXED || reduction.kind == RowReduction::CONSTANT) {

@@ -343,7 +343,7 @@ void FilterCache::Use::ordinaryReaderUse(bool populationAllowed) {
 
 void FilterCache::Use::chargeLedger(Ledger& ledger, Accounting& accounting,
                                     std::mutex& mutex, Work work) {
-  if (!work.known()) return;
+  if (!work.known() || work.isUnfunded()) return;
   std::lock_guard<std::mutex> lock(mutex);
   if (!accounting.populationAllowed || accounting.charged) return;
   accounting.charged = true;
@@ -545,7 +545,7 @@ FilterCache::Probe FilterCache::Use::accept(SegmentCandidate&& candidate, Work w
   return Probe(Probe::Kind::HIT, nullptr, nullptr, false, raw);
 }
 
-FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Work work, Population population) {
+FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Work work) {
   if (scope_ == FilterKeyScope::READER_STABLE
       || segmentOrd >= readerSegments.size()
       || segmentOrd >= requestSlotCount) {
@@ -609,12 +609,7 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Work work, Populat
     return sharedHit(std::move(value));
   }
 
-  if (population == Population::BORROW_ONLY) {
-    ordinaryUse(segmentOrd, false);
-    return bypass();
-  }
-
-  if (!admitted || !allowsSegmentPopulation(slot->maxDoc)
+  if (work.isUnfunded() || !admitted || !allowsSegmentPopulation(slot->maxDoc)
       || readerCoreGen < cache->publishedCoreGen.load(std::memory_order_acquire)) {
     ordinaryUse(segmentOrd, false);
     return bypass();
@@ -772,7 +767,7 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
     return sharedHit(std::move(value));
   }
 
-  if (readerVersion
+  if (work.isUnfunded() || readerVersion
       != cache->publishedReaderVersion.load(std::memory_order_acquire)) {
     ordinaryReaderUse(false);
     return {};

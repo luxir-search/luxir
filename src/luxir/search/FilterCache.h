@@ -104,14 +104,9 @@ public:
     WHOLE
   };
 
-  enum class Population : uint8_t {
-    ALLOW,
-    BORROW_ONLY
-  };
-
   class Work {
   public:
-    enum class Tag : uint8_t { PENDING, ASSUMED, OBSERVED };
+    enum class Tag : uint8_t { PENDING, ASSUMED, OBSERVED, UNFUNDED };
 
   private:
     double amount;
@@ -128,7 +123,9 @@ public:
       return Work(amount, Tag::OBSERVED);
     }
     bool known() const { return tag != Tag::PENDING; }
-    bool isAssumed() const { return tag == Tag::ASSUMED; }
+    bool isAssumed() const { return tag == Tag::ASSUMED || isUnfunded(); }
+    bool isUnfunded() const { return tag == Tag::UNFUNDED; }
+    Work observedOnly() const { return isAssumed() ? Work(0, Tag::UNFUNDED) : *this; }
     double resolve(double productionNanos) const {
       assert(known());
       return isAssumed() ? productionNanos : amount;
@@ -484,11 +481,9 @@ public:
 
     // Known work is charged once before checking the population threshold.
     // Pending work is finalized afterward with charge() or credit().
-    // BORROW_ONLY never charges or claims population, but still credits serves.
-    Probe probe(size_t segmentOrd, Population population = Population::ALLOW) {
-      return probe(segmentOrd, Work::assumed(), population);
-    }
-    Probe probe(size_t segmentOrd, Work work, Population population = Population::ALLOW);
+    // Observation-only work outside a timed scope cannot charge or claim;
+    // a resident serve still repays its production as an assumed credit.
+    Probe probe(size_t segmentOrd, Work work = Work::assumed());
     ReaderProbe probeReaderStable(
         IndexReader& reader, std::span<DocSet* const> domainPerSeg,
         Work work = Work::assumed());

@@ -109,9 +109,8 @@ TEST_F(NestedQueryTest, implicitExplicitAndSingletonGroupHaveOneIdentityAndCache
   EXPECT_EQ(1, SkipStats::wholeCountHits);
 }
 
-TEST_F(NestedQueryTest, toParentBorrowsButNeverBuildsItsChildSet) {
-  // A join does not start raw per-segment child population, however often
-  // the same child recurs. Its owner membership can still populate.
+TEST_F(NestedQueryTest, ownerProductionDoesNotFundChildExperiments) {
+  // Whole-owner production excludes child observations; owner hits skip the child.
   auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
       .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 1});
   helper.getIndexWriter()->snapshots.readers.filterCache = cache;
@@ -120,10 +119,9 @@ TEST_F(NestedQueryTest, toParentBorrowsButNeverBuildsItsChildSet) {
     EXPECT_EQ(4, count("items.size:L"));
     EXPECT_EQ(2, count("items.color:blue AND items.size:S"));
   }
-  // Only the three whole-join keys may build, one value per segment each; a
-  // child set would add one more build per query.
+  // These executions give the child no ordinary observation to fund a build.
   EXPECT_EQ(3u, cache->counters().builds);
-  // A recurring raw child takes no build claim and counts no build attempt.
+  // Repeated owner serves do not create a child outcome.
   EXPECT_EQ(3u, cache->counters().buildAttempts);
   cache->validateForTest();
 }

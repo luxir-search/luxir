@@ -8,6 +8,8 @@
 #include "test/SchemaBuilder.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/query/QueryPrep.h"
+#include "luxir/query/ParseContext.h"
+#include "luxir/query/ProtobufQueryParser.h"
 
 namespace luxir::test {
 namespace {
@@ -32,6 +34,24 @@ protected:
     }
     input.commit();
     ASSERT_TRUE(helper.submit(input).success);
+  }
+
+  void fundSource(std::string_view path, const api::Query& wire) {
+    auto req = localReq(helper.getSearchEngine());
+    req->reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    req->schema = req->reader->schema();
+    req->filterUses = std::make_shared<FilterCache::UseRegistry>(cache.get(), *req->reader);
+    auto view = req->pinView(path);
+    ParseView parseView(*req->schema, nullptr, &view, req.get());
+    ParseContext parseContext(req->requestPool, *req->schema, req->arena,
+        CoerceContext{}, "q", nullptr, &parseView);
+    auto* query = ProtobufQueryParser(parseContext).parse(wire);
+    auto* planning = req->createPlanningContext(*view);
+    auto* use = planning->getFilterUse(*query);
+    ASSERT_NE(nullptr, use);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
+    planning->filterUses->addSegmentNanos(0, 1'000'000'000);
+    planning->filterUses->settle(true);
   }
 
   int64_t count(int32_t position = 0, bool maximum = false, int32_t kind = 0,
@@ -92,6 +112,14 @@ TEST_F(JoinCacheTest, residentRangeOwnerAvoidsChildSupplier) {
     run(false);
     auto after = cache->counters();
     EXPECT_EQ(0, SkipStats::joinChildSuppliers);
+    for (const auto& entry : cache->dump(20, nullptr, true)) {
+      for (const auto& value : entry.values) {
+        if (value.space != SpaceOrdinal::ROOT) {
+          EXPECT_EQ(0u, value.absentCount);
+          EXPECT_EQ(0u, value.servedCount);
+        }
+      }
+    }
     EXPECT_EQ(1u, after.hits - before.hits);
     EXPECT_EQ(exact ? 1u : 0u, after.misses - before.misses);
     EXPECT_EQ(before.buildAttempts, after.buildAttempts);
@@ -122,11 +150,14 @@ TEST_F(JoinCacheTest, booleanOwnerFilterRecordsOrdinaryTimeBeforeBuying) {
       ASSERT_OK(req);
     }
     EXPECT_EQ(0u, cache->counters().buildAttempts);
-    uint64_t samples = 0;
+    uint64_t owners = 0, children = 0;
     for (const auto& entry : cache->dump(20, nullptr, true)) {
-      for (const auto& value : entry.values) samples += value.absentCount;
+      for (const auto& value : entry.values) {
+        (value.space == SpaceOrdinal::ROOT ? owners : children) += value.absentCount;
+      }
     }
-    EXPECT_EQ(1u, samples);
+    EXPECT_EQ(1u, owners);
+    EXPECT_EQ(1u, children);
   }
 }
 
@@ -166,6 +197,110 @@ TEST_F(JoinCacheTest, exactDomainAttemptObservesOwnerBeforeStreamingSubOperation
     }
   }
   EXPECT_EQ(1u, samples);
+}
+
+TEST_F(JoinCacheTest, requiredUniformRangeEarnsChildMembershipAndPreservesScores) {
+  SearchOverridesGuard whole(QueryPrep::disableWholeMembershipPlanForTests);
+  QueryPrep::disableWholeMembershipPlanForTests = true;
+  CollectionHelper::UpdateBuilder input;
+  for (int i = 0; i < 128; i++) {
+    auto json = "{\"id\":\"s" + std::to_string(i) + "\",\"tag_w\":\"common\","
+        "\"rows_nested\":{\"value_i\":" + std::to_string(i % 4) + "}}";
+    input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+  }
+  input.commit(true, 1); ASSERT_TRUE(helper.submit(input).success);
+  auto run = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    auto join = qb::toParent(req->mr, "rows_nested",
+        qb::range(req->mr, "value_i", qb::valI64(req->mr, 1), nullptr, qb::valI64(req->mr, 2), nullptr), "max");
+    req->topDocs().getScores().fields({"id"}).limit(10).countLimit(20).rawQuery() =
+        qb::boolean(req->mr, {qb::match(req->mr, "tag_w", "common"), join});
+    req->execute(1); EXPECT_OK(req);
+    std::vector<std::pair<std::string, float>> result;
+    auto* docs = req->docList();
+    auto ids = std::get<api::ColStr>(docs->columns.at("id").kind).v;
+    auto scores = std::get<api::ColFloat>(docs->columns.at("_score_").kind).v;
+    for (size_t i = 0; i < ids.size(); i++) result.emplace_back(ids[i], scores[i]);
+    EXPECT_EQ(20, req->getMatchCount());
+    return result;
+  };
+  auto ordinary = run();
+  auto wire = localReq(helper.getSearchEngine());
+  fundSource("rows_nested", qb::range(wire->mr, "value_i", qb::valI64(wire->mr, 1), nullptr,
+      qb::valI64(wire->mr, 2), nullptr));
+  auto builds = cache->counters().builds;
+  EXPECT_EQ(ordinary, run());
+  EXPECT_EQ(builds + 1, cache->counters().builds);
+  auto hits = cache->counters().hits;
+  EXPECT_EQ(ordinary, run());
+  EXPECT_GT(cache->counters().hits, hits);
+  cache->resize(0);
+  EXPECT_EQ(ordinary, run());
+}
+
+TEST_F(JoinCacheTest, untimedJoinOnlyServesItsChildAndNeverFundsIt) {
+  auto run = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    req->reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    req->schema = req->reader->schema();
+    req->filterUses = std::make_shared<FilterCache::UseRegistry>(cache.get(), *req->reader);
+    ParseView view(*req->schema, nullptr, &req->reader, req.get());
+    ParseContext parseContext(req->requestPool, *req->schema, req->arena,
+        CoerceContext{}, "q", nullptr, &view);
+    auto wire = qb::toParent(req->mr, "items_nested", qb::match(req->mr, "color_s", "red"), "none");
+    auto* query = ProtobufQueryParser(parseContext).parse(wire);
+    auto* context = Query::Context::create(&req->arena, *req->createPlanningContext(*req->reader));
+    auto* weight = query->createWeight(*context, 0);
+    auto& segment = req->reader->segments()[0];
+    auto* supplier = weight->scorerSupplier(req->requestPool, segment);
+    EXPECT_NE(nullptr, supplier);
+    auto docs = QueryPrep::materialize(supplier, req->requestPool, segment, nullptr);
+    EXPECT_EQ(12, docs->card());
+  };
+  for (int i = 0; i < 20; i++) run();
+  EXPECT_EQ(0u, cache->counters().assumedCharges);
+  EXPECT_EQ(0u, cache->counters().buildAttempts);
+  auto wire = localReq(helper.getSearchEngine());
+  fundSource("items_nested", qb::match(wire->mr, "color_s", "red"));
+  EXPECT_EQ(12, count());
+  auto before = cache->counters();
+  for (int i = 0; i < 20; i++) run();
+  EXPECT_EQ(before.buildAttempts, cache->counters().buildAttempts);
+  EXPECT_EQ(before.assumedCharges, cache->counters().assumedCharges);
+  EXPECT_EQ(before.observedCharges, cache->counters().observedCharges);
+  EXPECT_GE(cache->counters().hits, before.hits + 20);
+}
+
+TEST_F(JoinCacheTest, nestedTopDocsFundsAnExactSourceBeyondItsSmallParentDomain) {
+  CollectionHelper::UpdateBuilder input;
+  for (int i = 0; i < 16; i++) {
+    auto json = "{\"id\":\"n" + std::to_string(i)
+        + "\",\"tag_w\":\"common\",\"value_i\":" + std::to_string(i) + "}";
+    input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+  }
+  input.commit(true, 1); ASSERT_TRUE(helper.submit(input).success);
+  auto run = [&](std::string_view id, bool source) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& root = req->topDocs("root").matchQuery("id", id).limit(0);
+    auto& nested = root.topDocs("inside").countLimit().limit(0);
+    if (source) nested.matchQuery("tag_w", "common");
+    else nested.allQuery();
+    nested.avg("mean", "value_i");
+    req->execute(1); ASSERT_OK(req);
+    auto* inner = req->docList("root")->ops.at("inside")->docList();
+    ASSERT_NE(nullptr, inner);
+    EXPECT_EQ(1, *inner->found);
+  };
+  run("n0", false); run("n0", false);
+  run("n0", true);
+  auto wire = localReq(helper.getSearchEngine());
+  fundSource("", qb::match(wire->mr, "tag_w", "common"));
+  auto before = cache->counters();
+  run("n0", true);
+  EXPECT_EQ(before.builds + 1, cache->counters().builds);
+  auto hits = cache->counters().hits;
+  run("n1", true);
+  EXPECT_GT(cache->counters().hits, hits);
 }
 
 TEST_F(JoinCacheTest, explicitFilterAdmitsAndServesReducerIndependentMembership) {
@@ -272,8 +407,11 @@ TEST_F(JoinCacheTest, rawMembershipSurvivesRootDeletesAndAnUntouchedSegmentReope
   {
     SearchOverridesGuard guard(QueryPrep::disableWholeMembershipPlanForTests);
     QueryPrep::disableWholeMembershipPlanForTests = true;
-    // The id filter's build excludes one request from the owner's observations.
-    for (int i = 0; i < 4; i++) EXPECT_EQ(1, count(1, false, 0, true));
+    for (int i = 0; i < 2; i++) EXPECT_EQ(1, count(1, false, 0, true));
+    auto wire = localReq(helper.getSearchEngine());
+    fundSource("", qb::toParent(wire->mr, "items_nested",
+        qb::match(wire->mr, "color_s", "red"), "none"));
+    EXPECT_EQ(1, count(1, false, 0, true));
   }
   SkipStatsScope stats;
   EXPECT_EQ(12, count());
@@ -295,18 +433,17 @@ TEST_F(JoinCacheTest, rawMembershipSurvivesRootDeletesAndAnUntouchedSegmentReope
   EXPECT_EQ(11, count());
 }
 
-TEST_F(JoinCacheTest, joinDoesNotPopulateRawChildMembershipForAnotherJoin) {
+TEST_F(JoinCacheTest, fundedRawChildIsReusedAcrossDirectAndComposedJoins) {
   EXPECT_EQ(6, count(0, false, 2));
-  EXPECT_EQ(6, count(0, false, 2));
-  auto warm = cache->counters();
-  // The composed join is cold. A join only borrows a resident child set and
-  // does not populate raw child membership, so the first left no child hit.
+  auto wire = localReq(helper.getSearchEngine());
+  fundSource("items_nested.deep_nested", qb::phraseText(wire->mr, "text_w", "deep common"));
+  auto before = cache->counters();
   EXPECT_EQ(6, count(0, false, 3));
-  EXPECT_EQ(warm.admissions, cache->counters().admissions);
-  EXPECT_EQ(warm.builds, cache->counters().builds);
-  EXPECT_EQ(warm.hits, cache->counters().hits);
-  cache->resize(0);
+  EXPECT_GT(cache->counters().builds, before.builds);
+  auto hits = cache->counters().hits;
   EXPECT_EQ(6, count(0, false, 2));
+  EXPECT_GT(cache->counters().hits, hits);
+  cache->resize(0);
   EXPECT_EQ(6, count(0, false, 3));
 }
 
@@ -337,7 +474,7 @@ TEST_F(JoinCacheTest, ownerAdmissionDoesNotRequireAnAdmittedChildEntry) {
 TEST_F(JoinCacheTest, coreStableChildKeepsItsStricterScope) {
   EXPECT_EQ(12, count(0, false, 4));
   EXPECT_EQ(12, count(0, false, 4));
-  // Only owner membership is cached; the join does not populate its raw child.
+  // Owner production censors child observations; the resident owner skips it.
   auto entries = cache->dump(10, nullptr);
   ASSERT_EQ(1u, entries.size());
   for (const auto& entry : entries) { EXPECT_EQ(FilterKeyScope::CORE_STABLE, entry.scope); }

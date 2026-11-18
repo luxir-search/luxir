@@ -27,6 +27,8 @@ protected:
   };
 
   void index(CollectionHelper& helper, int32_t segments) {
+    helper.getIndexWriter()->snapshots.readers.filterCache =
+        std::make_shared<FilterCache>(FilterCacheConfig{.maxBytes = 0});
     for (int32_t segment = 0; segment < segments; segment++) {
       CollectionHelper::UpdateBuilder input;
       for (int32_t root = 0; root < 2048; root++) {
@@ -52,6 +54,7 @@ protected:
       input.commit();
       ASSERT_TRUE(helper.submit(input).success);
     }
+    helper.getIndexWriter()->snapshots.readers.filterCache->resize(0);
     auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ((size_t)segments, reader->segments().size());
   }

@@ -1219,7 +1219,6 @@ inline Query::ScorerSupplier* filterSupplier(
     int32_t sparseBatchDensityInverse = 0,
     Query::SupplierExecutionMode executionMode =
         Query::SupplierExecutionMode::ORDINARY,
-    FilterCache::Population population = FilterCache::Population::ALLOW,
     FilterCache::Work work = FilterCache::Work::assumed()) {
   auto& weight = *source.weight;
   auto* prepared = source.prepared.get();
@@ -1268,15 +1267,13 @@ inline Query::ScorerSupplier* filterSupplier(
     return uncached;
   }
 
-  auto probe = use->probe((size_t) segment.ord, work, population);
+  auto probe = use->probe((size_t) segment.ord, work);
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
     DocSet* docs = executionMode
             == Query::SupplierExecutionMode::RAW_MEMBERSHIP
         ? probe.docSet()
         : use->effectiveDocSet((size_t) segment.ord, reader);
     return targetPool.make<DocSetSupplier>(docs, segment);
-  } else if (population == FilterCache::Population::BORROW_ONLY) {
-    return uncached;  // ~Probe releases the request resolving claim
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
@@ -1288,7 +1285,7 @@ inline Query::ScorerSupplier* filterSupplier(
         && !disableSparseBatchPostingsFeedForTests) {
       return uncached;
     }
-    if (!shouldOwnFilterValue(
+    if (work.isUnfunded() || !shouldOwnFilterValue(
             mode, cost, segment.maxDoc(), sparseBatchDensityInverse)) {
       return uncached;
     }
@@ -1310,14 +1307,13 @@ inline Query::ScorerSupplier* filterSupplier(
     int32_t sparseBatchDensityInverse = 0,
     Query::SupplierExecutionMode executionMode =
         Query::SupplierExecutionMode::ORDINARY,
-    FilterCache::Population population = FilterCache::Population::ALLOW,
     FilterCache::Work work = FilterCache::Work::assumed()) {
   PreparedSource source;
   source.weight = &weight;
   source.cacheUse = use;
   return filterSupplier(
       targetPool, source, reader, segment, mode,
-      sparseBatchDensityInverse, executionMode, population, work);
+      sparseBatchDensityInverse, executionMode, work);
 }
 
 struct ExactDomainSource {
@@ -1338,9 +1334,8 @@ struct ExactDomainResult {
 
 // Try the separable exact-DocSet route for one segment. At the root, the
 // ordinary exhaustive filter policy may admit/build a source. Beneath an
-// explicit parent domain, only already-resident exact values are accepted:
-// a miss falls back to streaming the complete effective query through that
-// domain instead of materializing unrestricted source sets first.
+// explicit parent domain, ordinary observations can fund canonical raw
+// sources. Unavailable exact values fall back to streaming through the domain.
 inline ExactDomainResult tryExactDomain(
     MemPool& targetPool, std::span<const ExactDomainSource> sources,
     IndexReader& reader, IndexReader::Segment& segment, DocSet* domain) {
@@ -1370,35 +1365,25 @@ inline ExactDomainResult tryExactDomain(
 
     DocSet* exact = nullptr;
     bool matchesNone = false;
-    if (domain != nullptr && source.cacheUse != nullptr) {
-      if (source.cacheUse->scope() == FilterKeyScope::READER_STABLE) {
-        allAvailable = false;
-        continue;
-      }
-      auto probe = source.cacheUse->probe(
-          (size_t) segment.ord, FilterCache::Population::BORROW_ONLY);
-      if (probe.kind() != FilterCache::Probe::Kind::HIT) {
-        allAvailable = false;
-        continue;
-      }
-      exact = source.cacheUse->effectiveDocSet(
-          (size_t) segment.ord, reader);
+    if (domain != nullptr && source.cacheUse != nullptr
+        && source.cacheUse->scope() == FilterKeyScope::READER_STABLE) {
+      allAvailable = false;
+      continue;
+    }
+    auto work = domain != nullptr && source.cacheUse != nullptr
+        ? source.cacheUse->work((size_t)segment.ord).observedOnly()
+        : FilterCache::Work::assumed();
+    auto* supplier = filterSupplier(
+        targetPool, *source.weight, source.cacheUse, reader, segment,
+        FilterSupplierMode::EXHAUSTIVE_CLAUSE, 0,
+        Query::SupplierExecutionMode::ORDINARY, work);
+    if (supplier == nullptr) {
+      matchesNone = true;
+    } else {
+      exact = supplier->exactDocSet();
       if (exact == nullptr) {
         allAvailable = false;
         continue;
-      }
-    } else {
-      auto* supplier = filterSupplier(
-          targetPool, *source.weight, source.cacheUse,
-          reader, segment, FilterSupplierMode::EXHAUSTIVE_CLAUSE);
-      if (supplier == nullptr) {
-        matchesNone = true;
-      } else {
-        exact = supplier->exactDocSet();
-        if (exact == nullptr) {
-          allAvailable = false;
-          continue;
-        }
       }
     }
 
@@ -1423,6 +1408,7 @@ class ExactDomainPlan {
 
 public:
   void add(Query::Weight& weight, FilterCache::Use* cacheUse) {
+    if (cacheUse) cacheUse->observe();
     sources.push_back({ExactDomainSource::Source::WEIGHT, &weight, cacheUse});
   }
 

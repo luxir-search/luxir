@@ -3138,6 +3138,150 @@ TEST_F(FilterCacheTimingTest, readerProductionCensorsOnlyItsExecutingTimedSegmen
   }
 }
 
+TEST(FilterCacheTest, childExperimentLearnsZeroOrProfitableSaving) {
+  auto config = testConfig(); config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  observedRequest(cache, segments, FilterKey("prior"), 1);
+  observedRequest(cache, segments, FilterKey("prior"), 1, 90'000'000);
+  FilterKey child("child-experiment");
+  for (int i = 0; i < 29; i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, observedRequest(cache, segments, child, 3'200'000));
+  }
+  EXPECT_DOUBLE_EQ(92'800'000, ledgerFor(cache, child).owed);
+  observedRequest(cache, segments, child, 1, 90'000'000);
+  for (int i = 0; i < 5; i++) observedRequest(cache, segments, child, 3'200'000);
+  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, child).creditedTotal);
+  EXPECT_DOUBLE_EQ(90'000'000, ledgerFor(cache, child).debt);
+
+  FilterKey profitable("profitable-child");
+  for (int i = 0; i < 4; i++) observedRequest(cache, segments, profitable, 23'200'000);
+  observedRequest(cache, segments, profitable, 1, 90'000'000);
+  for (int i = 0; i < 5; i++) observedRequest(cache, segments, profitable, 3'200'000);
+  EXPECT_DOUBLE_EQ(100'000'000, ledgerFor(cache, profitable).creditedTotal);
+  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, profitable).debt);
+  evictValues(cache);
+  for (int i = 0; i < 5; i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, observedRequest(cache, segments, child, 3'200'000));
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, observedRequest(cache, segments, profitable, 23'200'000));
+  }
+  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, child).owed);
+  EXPECT_DOUBLE_EQ(100'000'000, ledgerFor(cache, profitable).owed);
+  observedRequest(cache, segments, profitable, 1, 90'000'000);
+}
+
+TEST(FilterCacheTest, unservedChildKeepsDebtAndFacesCapacityComparison) {
+  size_t bytes = bitDocs(100, 7)->ramBytesUsed();
+  auto config = capacityConfig(bytes + 1);
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterKey child("unserved-child");
+  seedCapacityValue(cache, segments, child, 0, 90'000'000, true);
+  evictValues(cache);
+  observedRequest(cache, segments, child, 3'200'000);
+  EXPECT_DOUBLE_EQ(90'000'000, ledgerFor(cache, child).debt);
+  EXPECT_DOUBLE_EQ(3'200'000, ledgerFor(cache, child).owed);
+  FilterKey resident("valuable-resident");
+  seedCapacityValue(cache, segments, resident, 900'000'000, 90'000'000);
+  fundCapacityValue(cache, segments, child, 180'000'000);
+  auto before = cache.counters();
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(child);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
+  EXPECT_EQ(before.capacityDeferred + 1, cache.counters().capacityDeferred);
+  EXPECT_EQ(before.buildAttempts, cache.counters().buildAttempts);
+}
+
+TEST_F(FilterCacheTimingTest, ownerFundsBeforeChildAndProductionDoesNotFinishChildFunding) {
+  using Work = FilterCache::Work;
+  FilterKey owner("funded-owner"), childKey("nearly-funded-child");
+  auto seed = [&](IndexReader& view, const FilterKey& key, uint64_t nanos) {
+    FilterCache::UseRegistry request(cache.get(), view);
+    auto* use = request.get(key);
+    auto claim = use->probe(0);
+    use->publishRaw(0, claim, docs(view.segments()[0].maxDoc(), {7}), nanos);
+    FilterCache::UseRegistry serve(cache.get(), view);
+    serve.get(key)->probe(0);
+  };
+  seed(*reader, owner, 85'000'000); seed(*child, childKey, 90'000'000);
+  evictValues(*cache);
+  for (int i = 0; i < 17; i++) {
+    FilterCache::UseRegistry root(cache.get(), *reader), rows(cache.get(), *child, root);
+    root.get(owner)->probe(0, Work::pending()); rows.get(childKey)->probe(0, Work::pending());
+    root.addSegmentNanos(0, 5'000'000);
+    root.settle(true); rows.settle(true);
+  }
+  FilterCache::UseRegistry root(cache.get(), *reader), rows(cache.get(), *child, root);
+  {
+    FilterCache::UseRegistry::SegmentScope pass(root, 0);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, rows.get(childKey)->probe(0, Work::pending()).kind());
+    auto* use = root.get(owner);
+    auto build = use->probe(0, Work::pending());
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
+    use->publishRaw(0, build, docs(reader->segments()[0].maxDoc(), {7}), 85'000'000);
+  }
+  root.addSegmentNanos(0, 5'000'000);
+  root.settle(true); rows.settle(true);
+  EXPECT_DOUBLE_EQ(85'000'000, value(childKey).owed);
+  EXPECT_EQ(17u, value(childKey).absentCount);
+}
+
+TEST_F(FilterCacheTimingTest, unknownPriorLetsTheFirstProbedChildBootstrap) {
+  using Work = FilterCache::Work;
+  FilterKey owner("bootstrap-owner"), childKey("bootstrap-child");
+  {
+    FilterCache::UseRegistry root(cache.get(), *reader), rows(cache.get(), *child, root);
+    root.get(owner)->probe(0, Work::pending()); rows.get(childKey)->probe(0, Work::pending());
+    root.addSegmentNanos(0, 5'000'000);
+    root.settle(true); rows.settle(true);
+  }
+  FilterCache::UseRegistry root(cache.get(), *reader), rows(cache.get(), *child, root);
+  {
+    FilterCache::UseRegistry::SegmentScope pass(root, 0);
+    auto* use = rows.get(childKey);
+    auto build = use->probe(0, Work::pending());
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
+    use->publishRaw(0, build, docs(child->segments()[0].maxDoc(), {7}), 90'000'000);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, root.get(owner)->probe(0, Work::pending()).kind());
+  }
+  root.settle(true); rows.settle(true);
+  EXPECT_DOUBLE_EQ(5'000'000, value(owner).owed);
+  EXPECT_DOUBLE_EQ(90'000'000, value(childKey).debt);
+}
+
+TEST(FilterCacheTest, untimedObservedWorkCannotChargeOrClaimEvenWhenFunded) {
+  auto config = testConfig(); config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterKey key("untimed-child-or-source");
+  for (int i = 0; i < 40; i++) {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(key); use->observe();
+    auto work = use->work(0).observedOnly();
+    EXPECT_TRUE(work.isUnfunded());
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, work).kind());
+    use->charge(0, work);
+    EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).owed);
+  }
+  EXPECT_EQ(0u, cache.counters().assumedCharges);
+  EXPECT_EQ(0u, cache.counters().buildAttempts);
+  FilterCache::UseRegistry funded(cache, 1, segments);
+  auto* use = funded.get(key);
+  use->probe(0, FilterCache::Work::pending());
+  use->charge(0, FilterCache::Work::nanoseconds(1000));
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, use->work(0).observedOnly()).kind());
+  auto build = use->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
+  use->publishRaw(0, build, docs(100, {7}), 1000);
+  FilterCache::UseRegistry serve(cache, 1, segments);
+  auto* hit = serve.get(key);
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, hit->probe(0, hit->work(0).observedOnly()).kind());
+  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).debt);
+}
+
 TEST(FilterCacheTest, completeResidencyAcceptanceCanDeferObservedCredit) {
   auto config = testConfig();
   config.admissionThreshold = 1;
@@ -3537,7 +3681,7 @@ TEST(FilterCacheTest, unrepaidEvictionsRequireTriangularWorkInOrderedReplay) {
   ASSERT_NO_THROW(cache.validateForTest());
 }
 
-TEST(FilterCacheTest, borrowingMissDoesNotFundPopulation) {
+TEST(FilterCacheTest, untimedObservedMissDoesNotFundPopulation) {
   size_t charge = bitDocs(4096, 1)->ramBytesUsed();
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
@@ -3559,7 +3703,7 @@ TEST(FilterCacheTest, borrowingMissDoesNotFundPopulation) {
   ASSERT_TRUE(use->wasAdmitted());
   auto before = cache.counters();
   EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
-            use->probe(0, FilterCache::Population::BORROW_ONLY).kind());
+            use->probe(0, use->work(0).observedOnly()).kind());
   use->charge(0, FilterCache::Work::nanoseconds(100));
   auto after = cache.counters();
   EXPECT_EQ(before.misses + 1, after.misses);
@@ -3567,7 +3711,7 @@ TEST(FilterCacheTest, borrowingMissDoesNotFundPopulation) {
   EXPECT_EQ(before.populationDeferred, after.populationDeferred);
   EXPECT_EQ(before.observedCharges, after.observedCharges);
   EXPECT_DOUBLE_EQ(0, ledgerFor(cache, victim).owed);
-  // A borrowing miss leaves owed at zero. One assumed charge cannot fund
+  // An untimed observation leaves owed at zero. One assumed charge cannot fund
   // another build, and repeated probes in this request cannot add to it.
   for (int i = 0; i < 3; i++) {
     EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0).kind());
@@ -3580,7 +3724,7 @@ TEST(FilterCacheTest, borrowingMissDoesNotFundPopulation) {
   cache.validateForTest();
 }
 
-TEST(FilterCacheTest, borrowingPinsAnotherConsumersValueAcrossEviction) {
+TEST(FilterCacheTest, untimedObservedServePinsAcrossEviction) {
   size_t charge = bitDocs(4096, 1)->ramBytesUsed();
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
@@ -3597,7 +3741,7 @@ TEST(FilterCacheTest, borrowingPinsAnotherConsumersValueAcrossEviction) {
   auto* use = request.get(key);
   DocSet* borrowed;
   {
-    auto hit = use->probe(0, FilterCache::Population::BORROW_ONLY);
+    auto hit = use->probe(0, use->work(0).observedOnly());
     ASSERT_EQ(FilterCache::Probe::Kind::HIT, hit.kind());
     borrowed = hit.docSet();
   }
@@ -3605,7 +3749,7 @@ TEST(FilterCacheTest, borrowingPinsAnotherConsumersValueAcrossEviction) {
   EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
             servePolicyValue(cache, segments, FilterKey("replacement"), 2, 100'000));
   ASSERT_EQ(1u, cache.counters().evictions);
-  auto hit = use->probe(0, FilterCache::Population::BORROW_ONLY);
+  auto hit = use->probe(0, use->work(0).observedOnly());
   ASSERT_EQ(FilterCache::Probe::Kind::HIT, hit.kind());
   EXPECT_EQ(borrowed, hit.docSet());
   EXPECT_TRUE(borrowed->get(1));
@@ -3614,7 +3758,7 @@ TEST(FilterCacheTest, borrowingPinsAnotherConsumersValueAcrossEviction) {
   cache.validateForTest();
 }
 
-TEST(FilterCacheTest, borrowingAndPopulationShareOneRequestValue) {
+TEST(FilterCacheTest, untimedAndFundedConsumersShareOneRequestValue) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   FilterCache cache(config);
@@ -3624,13 +3768,13 @@ TEST(FilterCacheTest, borrowingAndPopulationShareOneRequestValue) {
   FilterKey key("same-request");
   auto* borrowing = request.get(key);
   EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
-            borrowing->probe(0, FilterCache::Population::BORROW_ONLY).kind());
+            borrowing->probe(0, borrowing->work(0).observedOnly()).kind());
   auto* ordinary = request.get(key);
   EXPECT_EQ(borrowing, ordinary);
   auto build = ordinary->probe(0);
   ASSERT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
   ordinary->publishRaw(0, build, docs(100, {7}), 1);
-  auto hit = borrowing->probe(0, FilterCache::Population::BORROW_ONLY);
+  auto hit = borrowing->probe(0, borrowing->work(0).observedOnly());
   ASSERT_EQ(FilterCache::Probe::Kind::HIT, hit.kind());
   EXPECT_TRUE(hit.docSet()->get(7));
   EXPECT_EQ(1u, cache.counters().buildAttempts);
@@ -4585,40 +4729,65 @@ TEST(FilterCacheTest, buildRaceLoserOwnsWithoutPublishingOrReprobing) {
   EXPECT_GT(cache.bytesUsed(), 0u);
 }
 
-TEST(FilterCacheTest, exactDomainBorrowsWithoutStartingPopulation) {
-  FilterCacheConfig config = testConfig();
-  config.admissionThreshold = 1;
+TEST(FilterCacheTest, observedExactSourceDoesNotPricePlainBooleanFilter) {
+  auto config = testConfig(); config.admissionThreshold = 1;
   RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
-  IndexWriter writer(writerSnapshots);
-  addTermDoc(writer, "selected");
-  addTermDoc(writer, "other");
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), config);
+  IndexWriter writer(snapshots);
+  addTermDoc(writer, "selected"); addTermDoc(writer, "other");
   writer.commit();
   auto reader = writer.snapshots.readers.getReader();
-  auto& segment = reader->segments()[0];
   MemPool pool;
   Query::Context context(pool, *reader);
-  TermQuery query("text_w", "selected");
-  auto* use = context.getFilterUse(query);
-  std::array sources{QueryPrep::ExactDomainSource{
-      .weight = query.createWeight(context, 0), .cacheUse = use}};
-  auto domain = docs(2, {0, 1});
-  auto before = reader->filterCache()->counters();
-  auto miss = QueryPrep::tryExactDomain(pool, sources, *reader, segment, domain.get());
-  EXPECT_FALSE(miss.available);
-  auto after = reader->filterCache()->counters();
-  EXPECT_EQ(before.misses + 1, after.misses);
-  EXPECT_EQ(before.buildAttempts, after.buildAttempts);
-  EXPECT_EQ(before.populationDeferred, after.populationDeferred);
+  TermQuery selected("text_w", "selected");
+  QueryPrep::ExactDomainPlan plan;
+  plan.add(*selected.createWeight(context, 0), context.getFilterUse(selected));
+  std::array<Query*, 1> filters{&selected};
+  BooleanQuery query({}, {}, {}, filters);
+  auto* weight = query.createWeight(context, 0);
+  FilterCache::UseRegistry::SegmentScope pass(*context.filterUses, 0);
+  EXPECT_NE(nullptr, weight->scorerSupplier(pool, reader->segments()[0]));
+  EXPECT_EQ(1u, reader->filterCache()->counters().buildAttempts);
+  EXPECT_EQ(1u, reader->filterCache()->counters().assumedCharges);
+}
 
-  auto build = use->probe(0);
-  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
-  use->publishRaw(0, build, docs(2, {0}), 1);
-  auto hit = QueryPrep::tryExactDomain(pool, sources, *reader, segment, domain.get());
-  ASSERT_TRUE(hit.available);
-  ASSERT_NE(nullptr, hit.docs.get());
-  EXPECT_EQ(1, hit.docs.get()->card());
-  EXPECT_TRUE(hit.docs.get()->get(0));
+TEST(FilterCacheTest, restrictedExactDomainEarnsCanonicalRawMembership) {
+  test::CollectionHelper helper("funded_exact_domain");
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  auto cache = std::make_shared<FilterCache>(config);
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "0", "text_w", "selected"),
+      test::flatdoc("id", "1", "text_w", "selected"),
+      test::flatdoc("id", "2", "text_w", "other")}, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  TermQuery query("text_w", "selected");
+  auto run = [&](IndexReader& view, DocSet* domain, bool timed) {
+    MemPool pool;
+    Query::Context context(pool, view);
+    auto* use = context.getFilterUse(query);
+    QueryPrep::ExactDomainPlan plan;
+    plan.add(*query.createWeight(context, 0), use);
+    std::optional<FilterCache::UseRegistry::SegmentScope> scope;
+    if (timed) scope.emplace(*context.filterUses, 0);
+    auto result = plan.produce(pool, view, view.segments()[0], domain);
+    return result.available ? result.docs.get()->card() : -1;
+  };
+  auto first = docs(3, {0});
+  for (int i = 0; i < 20; i++) EXPECT_EQ(-1, run(*reader, first.get(), false));
+  EXPECT_EQ(0u, cache->counters().buildAttempts);
+  EXPECT_EQ(0u, cache->counters().assumedCharges);
+  EXPECT_EQ(-1, run(*reader, first.get(), true));
+  EXPECT_EQ(1, run(*reader, first.get(), true));
+  ASSERT_EQ(1u, cache->counters().builds);
+  auto other = docs(3, {1, 2});
+  EXPECT_EQ(1, run(*reader, other.get(), false));
+  auto attempts = cache->counters().buildAttempts;
+  ASSERT_TRUE(helper.deleteById("0", UpdateMessage::COMMIT).success);
+  auto deleted = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto both = docs(3, {0, 1});
+  EXPECT_EQ(1, run(*deleted, both.get(), false));
+  EXPECT_EQ(attempts, cache->counters().buildAttempts);
 }
 
 TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {

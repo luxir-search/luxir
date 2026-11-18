@@ -13224,8 +13224,9 @@ public:
                       ? filteredDisjunctionBatchDensityInverseForTests
                       : QueryPrep::kSparseBatchCountOwnDensityInverse
                 : 0,
-            executionMode, FilterCache::Population::ALLOW,
-            filterUses[i] ? filterUses[i]->work((size_t)segment.ord) : FilterCache::Work::assumed());
+            executionMode,
+            filterUses[i] && filterWeights[i]->observesFilterCache()
+                ? filterUses[i]->work((size_t)segment.ord) : FilterCache::Work::assumed());
       }
     }
     return makeSupplier(targetPool, segment, mandatorySources, mandatoryScores,
