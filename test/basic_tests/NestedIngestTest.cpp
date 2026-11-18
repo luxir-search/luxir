@@ -331,7 +331,7 @@ TEST_F(NestedIngestTest, childOverlayBuildsOnItsOwnReaderAndServesAJoinedKnn) {
       R"({"id":"a","items_nested":[{"embedding_v":[1,0]},{"embedding_v":[2,0]}]})",
       R"({"id":"b","items_nested":[{"embedding_v":[10,0]},{"embedding_v":[11,0]}]})"}).success);
   CollectionHelper::UpdateBuilder build;
-  build.commitWithAux({"*"});
+  build.commitWithAux(std::vector<std::string>{"*"});
   ASSERT_TRUE(helper.submit(build).success);
   auto root = reader(helper);
   auto child = root->view("items_nested");
