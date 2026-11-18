@@ -88,7 +88,7 @@ struct StatsRequest; struct StatsResponse; struct StatsTotals; struct Collection
 struct ShardStats; struct IndexStats; struct SegmentStats; struct RowSpaceStats; struct AuxStats;
 struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats;
 struct HistogramStats; struct ActivityStats; struct TransportStats; struct ServiceStats; struct SystemStats;
-struct HostStats; struct OutcomeStats; struct CollectionActivityStats; struct ProcessIoStats;
+struct HostStats; struct SearchFanoutStats; struct OutcomeStats; struct CollectionActivityStats; struct ProcessIoStats;
 struct ProcessStats; struct CpuTimes; struct HostCpuStats; struct HostMemoryStats; struct NetworkInterfaceStats;
 struct TcpStats; struct DiskStats; struct FilesystemStats; struct PressureStats; struct CgroupStats;
 struct CgroupMemoryStats; struct CgroupCpuStats; struct CgroupTaskStats;
@@ -570,6 +570,15 @@ struct TransportStats {
   uint64_t connections = 0;
   int64_t io_threads = 0;
 };
+struct SearchFanoutStats {
+  uint64_t serial_searches = 0;
+  uint64_t parallel_searches = 0;
+  uint64_t published = 0;
+  uint64_t shares = 0;
+  uint64_t denied_grain = 0;
+  uint64_t denied_siblings_only = 0;
+  uint64_t denied_saturated = 0;
+};
 struct ServiceStats {
   std::string_view version;
   std::string_view cpu_target;
@@ -599,6 +608,7 @@ struct ServiceStats {
   uint64_t control_busy = 0;
   uint64_t control_queued = 0;
   uint64_t control_completed = 0;
+  SearchFanoutStats search_fanout;
   bool read_only = false;
 };
 struct ProcessStats {

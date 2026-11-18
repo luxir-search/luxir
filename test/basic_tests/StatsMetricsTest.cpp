@@ -4,6 +4,9 @@
 #include "test/HttpReq.h"
 #include "test/GrpcClient.h"
 #include "test/GrpcLuxirTest.h"
+#include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
+#include "test/TaskSpawnCounter.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/Prometheus.h"
 #include "luxir/server/Stats.h"
@@ -190,6 +193,52 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
   for (const auto& [path, scale] : perSecond) EXPECT_TRUE(seen.contains(path)) << "stale per-second entry: " << path;
   // The fill reached the whole response, not just its top level.
   EXPECT_GT(seen.size(), 250u);
+}
+
+TEST_F(StatsMetricsTest, SearchFanoutDecisions) {
+  CollectionHelper helper("fanout_stats");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  for (int seg = 0; seg < 5; seg++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 64; i++) docs.push_back(flatdoc("id", std::to_string(seg * 64 + i), "cat_s", "c" + std::to_string(i % 8)));
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  auto fanout = [&] {
+    std::pmr::monotonic_buffer_resource resource;
+    api::StatsResponse response;
+    gatherStats(*luxirNode, {}, response, resource);
+    return response.service->search_fanout;
+  };
+  auto run = [&](int32_t maxParallel) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("fanout_stats").facet("cats", "cat_s").limit(-1);
+    req->execute(maxParallel);
+    ASSERT_OK(req);
+  };
+  FanoutLoadGuard load;
+  auto before = fanout();
+  auto evaluations = fanoutEvaluations.load();
+  {
+    FanoutGrainGuard grain(1);
+    run(0);
+  }
+  {
+    FanoutGrainGuard grain(FANOUT_GRAIN_NEVER);
+    run(0);
+  }
+  run(-2);
+  run(-1);
+  auto after = fanout();
+  EXPECT_EQ(before.parallel_searches + 1, after.parallel_searches);
+  EXPECT_EQ(before.serial_searches + 1, after.serial_searches);
+  EXPECT_LT(before.published, after.published);
+  EXPECT_LE(after.published - before.published, after.shares - before.shares);
+  // Each evaluation publishes or is denied exactly once.
+  EXPECT_EQ(fanoutEvaluations.load() - evaluations,
+            after.published + after.denied_grain + after.denied_siblings_only + after.denied_saturated
+                - before.published - before.denied_grain - before.denied_siblings_only - before.denied_saturated);
+  EXPECT_EQ((double)after.parallel_searches,
+            sample(render(*luxirNode), "luxir_search_fanout_searches_total{fanout=\"parallel\"}"));
 }
 
 TEST_F(StatsMetricsTest, HttpTrafficAndIndexingOutcomes) {

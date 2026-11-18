@@ -27,8 +27,11 @@ enum class MetricOutcome { OK, ERROR, CANCELLED, COUNT };
 // Timed engine work. Searches, their execution and index batches are
 // request-sized; the rest runs in the background.
 enum class MetricStage { SEARCH, SEARCH_EXECUTION, INDEX_BATCH, FLUSH, COMMIT, DELETE_PASS, MERGE, VECTOR_BUILD, READER_REFRESH, COUNT };
+// Adaptive (max_parallel 0) searches count once each, by whether they
+// published any fan-out share.
 enum class MetricCounter {
-  SEARCH_RESOURCE_EXHAUSTED, SEARCH_WARNINGS, DOCUMENTS_ACCEPTED, DOCUMENTS_REJECTED, DELETE_IDS_ACCEPTED, COUNT
+  SEARCH_RESOURCE_EXHAUSTED, SEARCH_WARNINGS, SEARCH_FANOUT_SERIAL, SEARCH_FANOUT_PARALLEL,
+  DOCUMENTS_ACCEPTED, DOCUMENTS_REJECTED, DELETE_IDS_ACCEPTED, COUNT
 };
 enum class MetricTransportCounter { RECEIVED_BYTES, SENT_BYTES, STREAM_PAUSES, COUNT };
 

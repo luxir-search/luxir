@@ -5,6 +5,7 @@
 #include "luxir/query/QueryStats.h"
 #include "luxir/util/ApiError.h"
 #include "luxir/util/ProcessAllocator.h"
+#include "luxir/util/TaskWork.h"
 #include "luxir/util/log.h"
 #include "ReplicationFollower.h"
 #include "Scrubber.h"
@@ -175,6 +176,15 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   dst.control_busy = control.busy;
   dst.control_queued = control.queued;
   dst.control_completed = control.completed;
+  auto& fanout = dst.search_fanout;
+  auto load = [](const std::atomic<uint64_t>& c) { return c.load(std::memory_order_relaxed); };
+  fanout.serial_searches = counter(MetricCounter::SEARCH_FANOUT_SERIAL);
+  fanout.parallel_searches = counter(MetricCounter::SEARCH_FANOUT_PARALLEL);
+  for (const auto& decisions : fanoutShareDecisions) fanout.published += load(decisions);
+  fanout.shares = load(fanoutAdaptiveShares);
+  fanout.denied_grain = load(fanoutGrainDenials);
+  fanout.denied_siblings_only = load(fanoutLoadDenials[0]);
+  fanout.denied_saturated = load(fanoutLoadDenials[1]);
 }
 
 void fillOutcomes(api::OutcomeStats& dst, const std::array<uint64_t, (size_t)MetricOutcome::COUNT>& outcomes,
