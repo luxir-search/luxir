@@ -56,22 +56,39 @@ uint64_t nanosFromWork(double amount) {
 } // namespace
 
 void FilterCache::Ledger::production(uint64_t nanos, size_t bytes, bool investment) {
-  referenceNanos = nanos;
   referenceBytes = bytes;
   if (investment) {
+    referenceNanos = nanos;
+    measured = true;
+    completed = std::chrono::steady_clock::now();
     owed = 0;
-    debt.store(debt.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    debt.store(debt.load(std::memory_order_relaxed) + nanos, std::memory_order_relaxed);
   }
 }
 
-void FilterCache::Ledger::repay(double fraction) {
+void FilterCache::Ledger::repay(double nanos) {
   if (debt.load(std::memory_order_relaxed) == 0) return;
   std::lock_guard<Ledger> lock(*this);
-  debt.store(std::max(0.0, debt.load(std::memory_order_relaxed) - fraction), std::memory_order_relaxed);
+  debt.store(std::max(0.0, debt.load(std::memory_order_relaxed) - nanos), std::memory_order_relaxed);
 }
 
-bool FilterCache::Ledger::canPopulate() const {
-  return owed >= std::nextafter(1 + debt.load(std::memory_order_relaxed), 0.0);
+bool FilterCache::Ledger::canPopulate(double productionNanos) const {
+  return owed >= std::nextafter(std::max(0.0, productionNanos)
+      + debt.load(std::memory_order_relaxed), 0.0);
+}
+
+double FilterCache::productionNanos(const Ledger& ledger, int32_t maxDoc, bool observed) const {
+  if (ledger.measured) return (double)ledger.referenceNanos;
+  double prior = observed ? priorNanosPerDoc.load(std::memory_order_relaxed) : -1;
+  return prior < 0 ? -1 : prior * maxDoc;
+}
+
+void FilterCache::recordProduction(uint64_t nanos, int32_t maxDoc) {
+  if (maxDoc <= 0) return;
+  double sample = (double)nanos / maxDoc;
+  double old = priorNanosPerDoc.load(std::memory_order_relaxed);
+  while (!priorNanosPerDoc.compare_exchange_weak(old,
+      old < 0 ? sample : old + (sample - old) / 8, std::memory_order_relaxed)) {}
 }
 
 FilterCache::SegmentValue::SegmentValue(std::unique_ptr<DocSet> docs,
@@ -326,17 +343,17 @@ void FilterCache::Use::ordinaryReaderUse(bool populationAllowed) {
 }
 
 void FilterCache::Use::chargeLedger(Ledger& ledger, Accounting& accounting,
-                                    std::mutex& mutex, Fraction work) {
+                                    std::mutex& mutex, Work work) {
   if (!work.known()) return;
   std::lock_guard<std::mutex> lock(mutex);
   if (!accounting.populationAllowed || accounting.charged) return;
   accounting.charged = true;
-  ledger.owed += work.value();
-  auto& count = work.isAssumed() ? cache->counter.assumedCharges : cache->counter.quotedCharges;
+  ledger.owed += work.resolve(ledger.measured ? (double)ledger.referenceNanos : 0);
+  auto& count = work.isAssumed() ? cache->counter.assumedCharges : cache->counter.observedCharges;
   count.add(1);
 }
 
-void FilterCache::Use::charge(size_t segmentOrd, Fraction work) {
+void FilterCache::Use::charge(size_t segmentOrd, Work work) {
   if (cache == nullptr || !cache->enabled() || scope_ == FilterKeyScope::READER_STABLE
       || segmentOrd >= slotsByOrd.size()) return;
   const auto& slot = slotsByOrd[segmentOrd];
@@ -345,7 +362,7 @@ void FilterCache::Use::charge(size_t segmentOrd, Fraction work) {
   chargeLedger(slot->ledger, requestSlots[segmentOrd].accounting, requestSlots[segmentOrd].mutex, work);
 }
 
-void FilterCache::Use::chargeReaderStable(Fraction work) {
+void FilterCache::Use::chargeReaderStable(Work work) {
   if (cache == nullptr || !cache->enabled() || scope_ != FilterKeyScope::READER_STABLE
       || entry == nullptr) return;
   std::lock_guard<FilterEntry> lock(*entry);
@@ -353,15 +370,17 @@ void FilterCache::Use::chargeReaderStable(Fraction work) {
 }
 
 template<class Value>
-void FilterCache::creditValue(Ledger& ledger, const Value& value, Fraction work) {
-  value.creditedTotal.fetch_add(work.value(), std::memory_order_relaxed);
-  ledger.repay(work.value());
-  auto& count = work.isAssumed() ? counter.assumedCredits : counter.quotedCredits;
+void FilterCache::creditValue(Ledger& ledger, const Value& value, Work work) {
+  // An assumed serve is worth the production of the value it was served from.
+  double nanos = work.resolve((double)value.buildCostNanos);
+  value.creditedTotal.fetch_add(nanos, std::memory_order_relaxed);
+  ledger.repay(nanos);
+  auto& count = work.isAssumed() ? counter.assumedCredits : counter.observedCredits;
   count.add(1);
-  counter.estimatedSavedNanos.add(nanosFromWork(work.value() * value.buildCostNanos));
+  counter.estimatedSavedNanos.add(nanosFromWork(nanos));
 }
 
-void FilterCache::Use::credit(size_t segmentOrd, Fraction work) {
+void FilterCache::Use::credit(size_t segmentOrd, Work work) {
   if (cache == nullptr || segmentOrd >= requestSlotCount) return;
   auto& slot = requestSlots[segmentOrd];
   const SegmentValue* value;
@@ -372,7 +391,7 @@ void FilterCache::Use::credit(size_t segmentOrd, Fraction work) {
   if (value) cache->creditValue(slotsByOrd[segmentOrd]->ledger, *value, work);
 }
 
-void FilterCache::Use::creditReaderStable(Fraction work) {
+void FilterCache::Use::creditReaderStable(Work work) {
   if (cache == nullptr) return;
   const ReaderValue* value;
   {
@@ -399,12 +418,13 @@ void FilterCache::Use::deferReaderPopulation() {
 
 void FilterCache::acceptSharedHit(
     Use& use, size_t segmentOrd,
-    std::shared_ptr<const SegmentValue> value, Fraction work) {
+    std::shared_ptr<const SegmentValue> value, Work work) {
   const SegmentValue* credited;
   {
     auto& request = use.requestSlots[segmentOrd];
     std::lock_guard<std::mutex> lock(request.mutex);
     const auto* served = value.get();
+    request.accounting.pending |= !work.known();
     use.pinValue(segmentOrd, std::move(value));
     if (request.servedValue == nullptr) {
       request.servedValue = served;
@@ -420,7 +440,7 @@ void FilterCache::acceptSharedHit(
 
 void FilterCache::acceptReaderSharedHit(
     Use& use, const std::shared_ptr<FilterEntry>& entry,
-    const std::shared_ptr<const ReaderValue>& value, Fraction work) {
+    const std::shared_ptr<const ReaderValue>& value, Work work) {
   const ReaderValue* credited;
   {
     std::lock_guard<std::mutex> lock(use.readerStateMutex);
@@ -488,7 +508,7 @@ std::optional<FilterCache::SegmentCandidate> FilterCache::Use::look(size_t segme
   return SegmentCandidate(this, segmentOrd, std::move(value));
 }
 
-FilterCache::Probe FilterCache::Use::accept(SegmentCandidate&& candidate, Fraction work) {
+FilterCache::Probe FilterCache::Use::accept(SegmentCandidate&& candidate, Work work) {
   if (candidate.use != this || candidate.segmentOrd >= requestSlotCount) {
     throw std::logic_error("segment candidate belongs to a different filter use");
   }
@@ -496,6 +516,7 @@ FilterCache::Probe FilterCache::Use::accept(SegmentCandidate&& candidate, Fracti
   auto& requestSlot = requestSlots[segmentOrd];
   {
     std::unique_lock<std::mutex> lock(requestSlot.mutex);
+    requestSlot.accounting.pending |= !work.known();
     requestSlot.condition.wait(lock, [&] {
       return !requestSlot.resolving || requestSlot.raw != nullptr;
     });
@@ -523,7 +544,7 @@ FilterCache::Probe FilterCache::Use::accept(SegmentCandidate&& candidate, Fracti
   return Probe(Probe::Kind::HIT, nullptr, nullptr, false, raw);
 }
 
-FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Fraction work, Population population) {
+FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Work work, Population population) {
   if (scope_ == FilterKeyScope::READER_STABLE
       || segmentOrd >= readerSegments.size()
       || segmentOrd >= requestSlotCount) {
@@ -533,6 +554,7 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Fraction work, Pop
   auto& requestSlot = requestSlots[segmentOrd];
   {
     std::unique_lock<std::mutex> lock(requestSlot.mutex);
+    requestSlot.accounting.pending |= !work.known();
     requestSlot.condition.wait(lock, [&] {
       return !requestSlot.resolving || requestSlot.raw != nullptr;
     });
@@ -617,7 +639,9 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Fraction work, Pop
   if (work.known()) {
     chargeLedger(slot->ledger, requestSlot.accounting, requestSlot.mutex, work);
   }
-  if (!slot->ledger.canPopulate()) {
+  slot->ledger.observed |= !work.isAssumed();
+  if ((!work.known() && slot->ledger.owed <= 0)
+      || !slot->ledger.canPopulate(cache->productionNanos(slot->ledger, slot->maxDoc, !work.isAssumed()))) {
     deferPopulation(segmentOrd);
     return bypass();
   }
@@ -628,6 +652,10 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Fraction work, Pop
           std::memory_order_relaxed)) {
     return bypass();
   }
+  {
+    std::lock_guard<std::mutex> lock(requestSlot.mutex);
+    requestSlot.accounting.pricedClaim = !work.isAssumed();
+  }
   cache->counter.buildAttempts.fetch_add(1, std::memory_order_relaxed);
   uint64_t now = cache->nextEpoch();
   entry->lastUsed.store(now, std::memory_order_relaxed);
@@ -635,7 +663,7 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Fraction work, Pop
 }
 
 FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
-    IndexReader& reader, std::span<DocSet* const> domainPerSeg, Fraction work) {
+    IndexReader& reader, std::span<DocSet* const> domainPerSeg, Work work) {
   if (cache == nullptr || !cache->enabled()
       || scope_ != FilterKeyScope::READER_STABLE
       || reader.coreCommitTime() != readerVersion
@@ -751,7 +779,7 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
 
   ordinaryReaderUse(true);
   if (work.known()) chargeLedger(localEntry->ledger, readerAccounting, readerStateMutex, work);
-  if (!localEntry->ledger.canPopulate()) {
+  if (!localEntry->ledger.canPopulate(cache->productionNanos(localEntry->ledger, 0, false))) {
     deferReaderPopulation();
     return {};
   }
@@ -980,6 +1008,91 @@ size_t FilterCache::Use::ownedBytesForTest() {
   return result;
 }
 
+thread_local FilterCache::UseRegistry* FilterCache::UseRegistry::timedRegistry = nullptr;
+thread_local size_t FilterCache::UseRegistry::timedSegment = 0;
+
+FilterCache::Work FilterCache::Use::work(size_t segmentOrd) const {
+  return observed && registry != nullptr && registry == UseRegistry::timedRegistry
+      && segmentOrd == UseRegistry::timedSegment ? Work::pending() : Work::assumed();
+}
+
+void FilterCache::Use::settle(size_t segmentOrd, uint64_t nanos,
+    std::chrono::steady_clock::time_point started) {
+  if (cache == nullptr || segmentOrd >= requestSlotCount
+      || segmentOrd >= slotsByOrd.size() || slotsByOrd[segmentOrd] == nullptr) return;
+  auto& request = requestSlots[segmentOrd];
+  const auto& accounting = request.accounting;
+  if (!accounting.pending || accounting.built) return;
+  bool served = request.servedValue != nullptr;
+  if (nanos == 0 || (accounting.ordinary && served)) {
+    if (accounting.ordinary) charge(segmentOrd, Work::assumed());
+    if (served) credit(segmentOrd, Work::assumed());
+    return;
+  }
+  auto& slot = *slotsByOrd[segmentOrd];
+  Work payment = Work::pending();
+  {
+    std::lock_guard<SegmentSlot> lock(slot);
+    auto& ledger = slot.ledger;
+    ledger.observed = true;
+    if (accounting.ordinary) {
+      if (ledger.measured && started < ledger.completed) return;
+      ledger.absent.add((double)nanos);
+    } else if (served) {
+      ledger.served.add((double)nanos);
+    } else {
+      return;
+    }
+    double saving = ledger.absent.count && ledger.served.count
+        ? std::max(0.0, ledger.absent.nanos - ledger.served.nanos)
+        : accounting.ordinary ? (double)nanos : 0;
+    if (accounting.ordinary) {
+      double price = cache->productionNanos(ledger, slot.maxDoc, true);
+      if (price >= 0) saving = std::min(price, saving);
+    }
+    payment = Work::nanoseconds(saving);
+    if (accounting.ordinary) {
+      chargeLedger(ledger, request.accounting, request.mutex, payment);
+      return;
+    }
+  }
+  credit(segmentOrd, payment);
+}
+
+FilterCache::UseRegistry::SegmentScope::SegmentScope(UseRegistry& registry, size_t segmentOrd)
+    : registry(registry), segmentOrd(segmentOrd), previousRegistry(timedRegistry),
+      previousSegment(timedSegment), outermost(timedRegistry != &registry || timedSegment != segmentOrd) {
+  assert(segmentOrd < registry.segments.size());
+  if (!outermost) return;
+  started = std::chrono::steady_clock::now();
+  timedRegistry = &registry;
+  timedSegment = segmentOrd;
+}
+
+FilterCache::UseRegistry::SegmentScope::~SegmentScope() {
+  if (!outermost) return;
+  registry.addSegmentNanos(segmentOrd, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - started).count());
+  timedRegistry = previousRegistry;
+  timedSegment = previousSegment;
+}
+
+void FilterCache::UseRegistry::addSegmentNanos(size_t segmentOrd, uint64_t nanos) {
+  if (segmentOrd >= segments.size()) throw std::out_of_range("cache timing segment ordinal");
+  timing[segmentOrd].nanos.fetch_add(nanos, std::memory_order_relaxed);
+}
+
+void FilterCache::UseRegistry::settle(bool completed) noexcept {
+  if (settled) return;
+  settled = true;
+  if (!completed) return;
+  for (auto& [key, use] : uses) {
+    for (size_t i = 0; i < segments.size(); i++) {
+      use->settle(i, timing[i].nanos.load(std::memory_order_relaxed), started);
+    }
+  }
+}
+
 FilterCache::UseRegistry::UseRegistry(
     FilterCache* cache, uint64_t readerCoreGen,
     std::span<const SegmentIdentity> segments)
@@ -990,7 +1103,8 @@ FilterCache::UseRegistry::UseRegistry(
     FilterCache* cache, uint64_t readerCoreGen, uint64_t readerVersion,
     std::span<const SegmentIdentity> segments)
   : cache(cache), segments(segments.begin(), segments.end()),
-    readerCoreGen(readerCoreGen), readerVersion(readerVersion)
+    readerCoreGen(readerCoreGen), readerVersion(readerVersion),
+    timing(std::make_unique<Timing[]>(segments.size()))
     #ifndef NDEBUG
     , owningThread(std::this_thread::get_id())
     #endif
@@ -1043,6 +1157,7 @@ FilterCache::Use* FilterCache::UseRegistry::get(const FilterKey& key,
           segments, readerCoreGen, readerVersion, false,
           (uint8_t)(1U << (uint8_t)lane)));
   Use* result = use.get();
+  result->registry = this;
   uses.emplace(key, std::move(use));
   return result;
 }
@@ -1061,7 +1176,7 @@ FilterCache::UseRegistry::lookupExisting(
 }
 
 FilterCache::Use* FilterCache::UseRegistry::acceptExisting(
-    ExistingCandidate&& candidate, AdmissionLane lane, Fraction work) {
+    ExistingCandidate&& candidate, AdmissionLane lane, Work work) {
   #ifndef NDEBUG
   assert(owningThread == std::this_thread::get_id());
   #endif
@@ -1071,6 +1186,7 @@ FilterCache::Use* FilterCache::UseRegistry::acceptExisting(
     return nullptr;
   }
   Use* result = candidate.use.get();
+  result->registry = this;
   uses.emplace(result->key, std::move(candidate.use));
   return result;
 }
@@ -1246,18 +1362,18 @@ void FilterCache::advanceEvictionClock(double priority) {
 
 void FilterCache::recordCapacityEviction(
     const std::shared_ptr<const SegmentValue>& value) {
-  double unpaid = std::max(0.0, 1 - value->creditedTotal.load(std::memory_order_relaxed));
+  double unpaid = std::max(0.0, (double)value->buildCostNanos - value->creditedTotal.load(std::memory_order_relaxed));
   if (!value->claimedBuild || unpaid == 0) return;
   counter.unrepaidEvictions.fetch_add(1, std::memory_order_relaxed);
-  counter.unpaidBuildNanos.fetch_add(nanosFromWork(unpaid * value->buildCostNanos), std::memory_order_relaxed);
+  counter.unpaidBuildNanos.fetch_add(nanosFromWork(unpaid), std::memory_order_relaxed);
 }
 
 void FilterCache::recordReaderCapacityEviction(
     const std::shared_ptr<const ReaderValue>& value) {
-  double unpaid = std::max(0.0, 1 - value->creditedTotal.load(std::memory_order_relaxed));
+  double unpaid = std::max(0.0, (double)value->buildCostNanos - value->creditedTotal.load(std::memory_order_relaxed));
   if (!value->claimedBuild || unpaid == 0) return;
   counter.unrepaidEvictions.fetch_add(1, std::memory_order_relaxed);
-  counter.unpaidBuildNanos.fetch_add(nanosFromWork(unpaid * value->buildCostNanos), std::memory_order_relaxed);
+  counter.unpaidBuildNanos.fetch_add(nanosFromWork(unpaid), std::memory_order_relaxed);
 }
 
 bool FilterCache::isActive(const ActiveSnapshot& snapshot,
@@ -1498,7 +1614,7 @@ std::unique_ptr<FilterCache::Use> FilterCache::lookupExisting(
   return use;
 }
 
-bool FilterCache::acceptExisting(Use& use, AdmissionLane lane, Fraction work) {
+bool FilterCache::acceptExisting(Use& use, AdmissionLane lane, Work work) {
   if (use.cache != this) return false;
   if (use.existingAccepted) {
     observeAdmissionLane(use, lane);
@@ -1682,6 +1798,11 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
 
   if (segmentOrd < use.requestSlotCount) {
     std::lock_guard<std::mutex> lock(use.requestSlots[segmentOrd].mutex);
+    auto& accounting = use.requestSlots[segmentOrd].accounting;
+    accounting.built |= claimed && !byproduct;
+    if (claimed && !byproduct && accounting.pricedClaim && attempted) {
+      recordProduction(buildCostNanos, identity.maxDoc);
+    }
     use.pinValue(segmentOrd, chosen, chosen == local && !inserted);
   }
   if (probe != nullptr) probe->releaseClaims();
@@ -2157,9 +2278,9 @@ void FilterCache::resetCounters() {
   counter.unrepaidEvictions.store(0, std::memory_order_relaxed);
   counter.populationDeferred.store(0, std::memory_order_relaxed);
   counter.assumedCharges.reset();
-  counter.quotedCharges.reset();
+  counter.observedCharges.reset();
   counter.assumedCredits.reset();
-  counter.quotedCredits.reset();
+  counter.observedCredits.reset();
   counter.purges.store(0, std::memory_order_relaxed);
   counter.oversizedKeyBypasses.store(0, std::memory_order_relaxed);
   counter.readerStableHits.store(0, std::memory_order_relaxed);
@@ -2187,7 +2308,13 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
       if (!value.resident && !includeGhosts) return;
       value.owed = ledger.owed;
       value.debt = ledger.debt.load(std::memory_order_relaxed);
-      value.referenceNanos = ledger.referenceNanos;
+      double price = productionNanos(ledger, value.maxDoc, ledger.observed);
+      value.productionNanos = std::max(0.0, price);
+      value.productionSource = ledger.measured ? "measured" : price >= 0 ? "prior" : "unknown";
+      value.absentNanos = ledger.absent.nanos;
+      value.absentCount = ledger.absent.count;
+      value.servedNanos = ledger.served.nanos;
+      value.servedCount = ledger.served.count;
       value.referenceBytes = ledger.referenceBytes;
       row.values.push_back(value);
     };
@@ -2282,16 +2409,16 @@ FilterCache::CounterValues FilterCache::counters() const {
       .readerStableRetires = counter.readerStableRetires.load(
           std::memory_order_relaxed),
       .assumedCharges = counter.assumedCharges.load(),
-      .quotedCharges = counter.quotedCharges.load(),
+      .observedCharges = counter.observedCharges.load(),
       .assumedCredits = counter.assumedCredits.load(),
-      .quotedCredits = counter.quotedCredits.load(),
+      .observedCredits = counter.observedCredits.load(),
       .residentBytes = residentBytes.load(std::memory_order_relaxed),
       .metadataBytes = metadataBytes.load(std::memory_order_relaxed)};
   double debtNanos = 0;
   entries.cvisit_all([&](const auto& item) {
     auto add = [&](Ledger& ledger) {
       std::lock_guard<Ledger> lock(ledger);
-      debtNanos += ledger.debt.load(std::memory_order_relaxed) * ledger.referenceNanos;
+      debtNanos += ledger.debt.load(std::memory_order_relaxed);
     };
     if (item.second->scope == FilterKeyScope::READER_STABLE) add(item.second->ledger);
     auto slots = item.second->slots.load(std::memory_order_acquire);

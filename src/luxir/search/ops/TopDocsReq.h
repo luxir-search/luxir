@@ -2051,6 +2051,7 @@ public:
               skipCount(SkipStats::exactDomainStreamFallbacks);
             }
           }
+          FilterCache::UseRegistry::SegmentScope cacheTiming(*op.planning.filterUses, (size_t)segnum);
           bool wholeFallbackSupplierPending = false;
           auto obtainMainSupplier = [&]() {
             if (wholeFallbackSupplierPending) {

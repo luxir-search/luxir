@@ -7,6 +7,7 @@
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 #include "luxir/reader/SkipStats.h"
+#include "luxir/query/QueryPrep.h"
 
 namespace luxir::test {
 namespace {
@@ -97,6 +98,38 @@ TEST_F(JoinCacheTest, residentRangeOwnerAvoidsChildSupplier) {
   }
 }
 
+TEST_F(JoinCacheTest, booleanOwnerFilterRecordsOrdinaryTimeBeforeBuying) {
+  CollectionHelper::UpdateBuilder input;
+  for (int i = 0; i < 128; i++) {
+    auto json = "{\"id\":\"t" + std::to_string(i) + "\",\"tag_w\":\"common\","
+        "\"rows_nested\":{\"value_i\":" + std::to_string(i % 4) + "}}";
+    input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+  }
+  input.commit(true, 1);
+  ASSERT_TRUE(helper.submit(input).success);
+  for (bool folded : {false, true}) {
+    cache->clear();
+    cache->resetAdmission();
+    for (int i = 0; i < 2; i++) {
+      auto req = localReq(helper.getSearchEngine());
+      auto& mr = req->mr;
+      auto join = qb::toParent(mr, "rows_nested",
+          qb::range(mr, "value_i", qb::valI64(mr, 1), nullptr, qb::valI64(mr, 2), nullptr), "max");
+      auto& op = req->topDocs().getScores().limit(10).countLimit(20);
+      if (folded) { op.rawQuery() = qb::match(mr, "tag_w", "common"); op.filter(join); }
+      else op.rawQuery() = qb::boolean(mr, {qb::match(mr, "tag_w", "common")}, {}, {}, {join});
+      req->execute(1);
+      ASSERT_OK(req);
+    }
+    EXPECT_EQ(0u, cache->counters().buildAttempts);
+    uint64_t samples = 0;
+    for (const auto& entry : cache->dump(20, nullptr, true)) {
+      for (const auto& value : entry.values) samples += value.absentCount;
+    }
+    EXPECT_EQ(1u, samples);
+  }
+}
+
 TEST_F(JoinCacheTest, explicitFilterAdmitsAndServesReducerIndependentMembership) {
   EXPECT_EQ(12, count(1));
   EXPECT_EQ(0u, cache->counters().admissions);
@@ -108,8 +141,8 @@ TEST_F(JoinCacheTest, explicitFilterAdmitsAndServesReducerIndependentMembership)
   EXPECT_GT(cache->counters().hits, hits);
 }
 
-TEST_F(JoinCacheTest, mainFilterAndProhibitedPositionsAdmitOnSecondSighting) {
-  for (int32_t position : {0, 1, 2, 3}) {
+TEST_F(JoinCacheTest, mainAndProhibitedPositionsAdmitOnSecondSighting) {
+  for (int32_t position : {0, 2}) {
     cache->clear();
     cache->resetAdmission();
     cache->resetCounters();
@@ -198,8 +231,11 @@ TEST_F(JoinCacheTest, prunedUniformMaximumRoutesResidentChildMembershipByDensity
 }
 
 TEST_F(JoinCacheTest, rawMembershipSurvivesRootDeletesAndAnUntouchedSegmentReopen) {
-  EXPECT_EQ(1, count(1, false, 0, true));
-  EXPECT_EQ(1, count(1, false, 0, true));
+  {
+    SearchOverridesGuard guard(QueryPrep::disableWholeMembershipPlanForTests);
+    QueryPrep::disableWholeMembershipPlanForTests = true;
+    for (int i = 0; i < 3; i++) EXPECT_EQ(1, count(1, false, 0, true));
+  }
   SkipStatsScope stats;
   EXPECT_EQ(12, count());
   EXPECT_EQ(1, SkipStats::cacheFirstMembershipWeightSkips);

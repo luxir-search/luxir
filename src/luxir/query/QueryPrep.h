@@ -1219,7 +1219,8 @@ inline Query::ScorerSupplier* filterSupplier(
     int32_t sparseBatchDensityInverse = 0,
     Query::SupplierExecutionMode executionMode =
         Query::SupplierExecutionMode::ORDINARY,
-    FilterCache::Population population = FilterCache::Population::ALLOW) {
+    FilterCache::Population population = FilterCache::Population::ALLOW,
+    FilterCache::Work work = FilterCache::Work::assumed()) {
   auto& weight = *source.weight;
   auto* prepared = source.prepared.get();
   auto* use = source.cacheUse;
@@ -1242,7 +1243,7 @@ inline Query::ScorerSupplier* filterSupplier(
     auto candidate = use->look((size_t) segment.ord);
     if (candidate && filterDensityRoutesToCache(
             mode, candidate->card(), segment.maxDoc(), sparseBatchDensityInverse)) {
-      auto hit = use->accept(std::move(*candidate));
+      auto hit = use->accept(std::move(*candidate), work);
       DocSet* docs = executionMode == Query::SupplierExecutionMode::RAW_MEMBERSHIP
           ? hit.docSet() : use->effectiveDocSet((size_t) segment.ord, reader);
       return targetPool.make<DocSetSupplier>(docs, segment);
@@ -1267,7 +1268,7 @@ inline Query::ScorerSupplier* filterSupplier(
     return uncached;
   }
 
-  auto probe = use->probe((size_t) segment.ord, population);
+  auto probe = use->probe((size_t) segment.ord, work, population);
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
     DocSet* docs = executionMode
             == Query::SupplierExecutionMode::RAW_MEMBERSHIP
@@ -1309,13 +1310,14 @@ inline Query::ScorerSupplier* filterSupplier(
     int32_t sparseBatchDensityInverse = 0,
     Query::SupplierExecutionMode executionMode =
         Query::SupplierExecutionMode::ORDINARY,
-    FilterCache::Population population = FilterCache::Population::ALLOW) {
+    FilterCache::Population population = FilterCache::Population::ALLOW,
+    FilterCache::Work work = FilterCache::Work::assumed()) {
   PreparedSource source;
   source.weight = &weight;
   source.cacheUse = use;
   return filterSupplier(
       targetPool, source, reader, segment, mode,
-      sparseBatchDensityInverse, executionMode, population);
+      sparseBatchDensityInverse, executionMode, population, work);
 }
 
 struct ExactDomainSource {

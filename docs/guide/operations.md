@@ -866,27 +866,35 @@ Search has its own limits:
   request, key and segment (or whole-reader value); a look counts neither.
   A request that builds counts as an ordinary use. Prometheus exposes these as
   `luxir_filter_cache_uses_total{route="resident"}` and `{route="ordinary"}`.
-  Tracked keys accumulate ordinary work in units of their own full production.
-  Population requires owed work of at least one plus the unpaid build debt;
-  completion spends owed work, adds one debt unit and serves repay it.
-  Unpriced consumers assume one unit; pending quotes are finalized later.
+  Tracked keys accumulate ordinary work and unpaid investment in nanoseconds.
+  Population requires owed work to cover production time plus debt; completion
+  spends owed work and adds its measured production time to debt. Serves repay
+  debt. An unpriced miss is charged the slot's last measured production and an
+  unpriced serve is credited the production time of the value it used.
+  Boolean filter-list joins instead settle from TopDocs segment execution time;
+  their first purchase requires an ordinary observation. Before a measured
+  production, they use the cache's decayed priced-build time per document as
+  a prior when available. Untimed and ambiguous uses remain assumed.
+  Absent and served times are decayed segment-time means (gain 1/8); their
+  difference estimates savings over the request mix, not any one request.
   Borrowing uses repay serves but never charge or populate.
   `build_us` counts claimed production, including rejected publications and
-  excluding byproducts. `estimated_saved_us` sums credited work times reference
-  production time; assumed credits are estimates, not measured savings.
-  `unrepaid_evictions` counts capacity evictions credited less than one unit
-  since production, and `unpaid_build_us` sums their unpaid production time.
-  `population_deferred` counts tracked population uses below the ledger
-  threshold, once per request and value unit. `assumed_charges`,
-  `quoted_charges`, `assumed_credits` and `quoted_credits` count ledger events by
-  source. `outstanding_debt_us` is a gauge of unpaid investment and survives
-  counter resets. Prometheus time counters use seconds and the corresponding
+  excluding byproducts. `estimated_saved_us` sums credits; assumed and observed
+  credits are estimates of savings. `unrepaid_evictions` counts capacity
+  evictions credited less than their investment, and `unpaid_build_us` sums the
+  unpaid time. `population_deferred` counts tracked population uses below the
+  ledger threshold, once per request and value unit. `assumed_charges`,
+  `observed_charges`, `assumed_credits` and `observed_credits` count ledger events
+  by source. `outstanding_debt_us` sums unpaid investment and survives counter
+  resets. Prometheus time counters use seconds and corresponding
   `luxir_filter_cache_*_seconds_total` names; outstanding debt uses
   `luxir_filter_cache_outstanding_debt_seconds`.
-  Cache-control dumps include per-value owed work, debt, credit, reference time
-  and bytes. `include_ghosts` includes retained ledgers without a payload.
+  Cache-control dumps report `owed_us`, `debt_us`, `credited_us`,
+  `production_us`, its `production_source` (measured, prior or unknown),
+  `absent_mean_us`/`absent_count`, `served_mean_us`/`served_count`, and reference
+  bytes. `include_ghosts` includes retained ledgers without a payload.
   A flush drops values and metadata, including ledgers, while keeping sightings,
-  so a known query is readmitted and rebuilds immediately. Flush with
+  so a known query is readmitted immediately; unpriced uses rebuild immediately. Flush with
   `reset_admission` also forgets sightings and restarts admission tracking.
   Metadata retirement and disabling the cache discard ledgers.
   The gRPC `Admin/CacheControl` call's `max_bytes` (administration only)

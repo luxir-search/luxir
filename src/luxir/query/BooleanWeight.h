@@ -12868,12 +12868,6 @@ public:
     auto prohibitedClauses = query.prohibited;
     auto filterClauses = query.filter;
     minShouldMatch = query.minShouldMatch;
-    if (!filterClauses.empty()) {
-      filterUses = context.pool.make_span<FilterCache::Use*>(filterClauses.size());
-      for (size_t i = 0; i < filterClauses.size(); i++) {
-        filterUses[i] = context.getFilterUse(*filterClauses[i]);
-      }
-    }
     createMandatoryWeights(context, mandatoryClauses, flags, multiplier);
     // With a mandatory clause and minShouldMatch unset, optional clauses are
     // a pure score add (MandOpt) - they never affect membership.  Without
@@ -12974,6 +12968,13 @@ public:
     int32_t exhaustiveFilterFlags = flags & ~(NEED_SCORES | ALLOW_PRUNING);
     filterWeights = createWeights(context.pool, context, filterClauses,
                                   exhaustiveFilterFlags, 1.0f);
+    if (!filterClauses.empty()) {
+      filterUses = context.pool.make_span<FilterCache::Use*>(filterClauses.size());
+      for (size_t i = 0; i < filterClauses.size(); i++) {
+        filterUses[i] = context.getFilterUse(*filterClauses[i]);
+        if (filterUses[i] && filterWeights[i]->observesFilterCache()) filterUses[i]->observe();
+      }
+    }
     if (QueryPrep::anyNeedsPrepare(mandatoryWeights) ||
         QueryPrep::anyNeedsPrepare(optionalWeights) ||
         QueryPrep::anyNeedsPrepare(prohibitedWeights) ||
@@ -13223,7 +13224,8 @@ public:
                       ? filteredDisjunctionBatchDensityInverseForTests
                       : QueryPrep::kSparseBatchCountOwnDensityInverse
                 : 0,
-            executionMode);
+            executionMode, FilterCache::Population::ALLOW,
+            filterUses[i] ? filterUses[i]->work((size_t)segment.ord) : FilterCache::Work::assumed());
       }
     }
     return makeSupplier(targetPool, segment, mandatorySources, mandatoryScores,

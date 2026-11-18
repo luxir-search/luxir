@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
@@ -110,28 +111,30 @@ public:
     BORROW_ONLY
   };
 
-  class Fraction {
+  class Work {
   public:
-    enum class Tag : uint8_t { ASSUMED, QUOTED };
+    enum class Tag : uint8_t { PENDING, ASSUMED, OBSERVED };
 
   private:
     double amount;
     Tag tag;
-    constexpr Fraction(double amount, Tag tag) : amount(amount), tag(tag) {}
+    constexpr Work(double amount, Tag tag) : amount(amount), tag(tag) {}
 
   public:
-    static constexpr Fraction assumed() { return Fraction(1, Tag::ASSUMED); }
-    // An unfinished quote neither charges a miss nor credits a hit.
-    static constexpr Fraction quoted() { return Fraction(-1, Tag::QUOTED); }
-    static Fraction quoted(double amount) {
+    static constexpr Work assumed() { return Work(0, Tag::ASSUMED); }
+    static constexpr Work pending() { return Work(0, Tag::PENDING); }
+    static Work nanoseconds(double amount) {
       if (!std::isfinite(amount) || amount < 0) {
-        throw std::invalid_argument("cache work fraction must be finite and nonnegative");
+        throw std::invalid_argument("cache work must be finite nonnegative nanoseconds");
       }
-      return Fraction(amount, Tag::QUOTED);
+      return Work(amount, Tag::OBSERVED);
     }
-    bool known() const { return amount >= 0; }
+    bool known() const { return tag != Tag::PENDING; }
     bool isAssumed() const { return tag == Tag::ASSUMED; }
-    double value() const { assert(known()); return amount; }
+    double resolve(double productionNanos) const {
+      assert(known());
+      return isAssumed() ? productionNanos : amount;
+    }
   };
 
   struct SegmentIdentity {
@@ -162,9 +165,9 @@ public:
     uint64_t readerStableRefreshes = 0;
     uint64_t readerStableRetires = 0;
     uint64_t assumedCharges = 0;
-    uint64_t quotedCharges = 0;
+    uint64_t observedCharges = 0;
     uint64_t assumedCredits = 0;
-    uint64_t quotedCredits = 0;
+    uint64_t observedCredits = 0;
     uint64_t outstandingDebtNanos = 0;
     size_t residentBytes = 0;
     size_t metadataBytes = 0;
@@ -393,9 +396,12 @@ public:
       bool credited = false;
       bool populationAllowed = false;
       bool deferred = false;
+      bool pending = false;
+      bool built = false;
+      bool pricedClaim = false;
 
       template<class Value>
-      const Value* takeCredit(const Value* value, Fraction work) {
+      const Value* takeCredit(const Value* value, Work work) {
         if (value == nullptr || !work.known() || credited) return nullptr;
         credited = true;
         return value;
@@ -435,6 +441,8 @@ public:
     };
 
     FilterCache* cache;
+    UseRegistry* registry = nullptr;
+    bool observed = false;
     FilterKey key;
     FilterKeyScope scope_;
     std::shared_ptr<FilterEntry> entry;
@@ -488,32 +496,35 @@ public:
     bool allowsSegmentPopulation(int32_t maxDoc) const;
     void ordinaryUse(size_t segmentOrd, bool populationAllowed);
     void ordinaryReaderUse(bool populationAllowed);
-    void chargeLedger(Ledger& ledger, Accounting& accounting, std::mutex& mutex, Fraction work);
+    void chargeLedger(Ledger& ledger, Accounting& accounting, std::mutex& mutex, Work work);
     void deferPopulation(size_t segmentOrd);
     void deferReaderPopulation();
+    void settle(size_t segmentOrd, uint64_t nanos, std::chrono::steady_clock::time_point started);
 
   public:
     ~Use();
+    void observe() { observed = true; }
+    Work work(size_t segmentOrd) const;
 
     // Look only pins existing membership. Acceptance has the same hit and
     // request-local deduplication effects as probe(), including late hits.
     std::optional<SegmentCandidate> look(size_t segmentOrd);
-    Probe accept(SegmentCandidate&& candidate, Fraction work = Fraction::assumed());
+    Probe accept(SegmentCandidate&& candidate, Work work = Work::assumed());
 
     // Known work is charged once before checking the population threshold.
     // Pending work is finalized afterward with charge() or credit().
     // BORROW_ONLY never charges or claims population, but still credits serves.
     Probe probe(size_t segmentOrd, Population population = Population::ALLOW) {
-      return probe(segmentOrd, Fraction::assumed(), population);
+      return probe(segmentOrd, Work::assumed(), population);
     }
-    Probe probe(size_t segmentOrd, Fraction work, Population population = Population::ALLOW);
+    Probe probe(size_t segmentOrd, Work work, Population population = Population::ALLOW);
     ReaderProbe probeReaderStable(
         IndexReader& reader, std::span<DocSet* const> domainPerSeg,
-        Fraction work = Fraction::assumed());
-    void charge(size_t segmentOrd, Fraction work);
-    void credit(size_t segmentOrd, Fraction work);
-    void chargeReaderStable(Fraction work);
-    void creditReaderStable(Fraction work);
+        Work work = Work::assumed());
+    void charge(size_t segmentOrd, Work work);
+    void credit(size_t segmentOrd, Work work);
+    void chargeReaderStable(Work work);
+    void creditReaderStable(Work work);
 
     // Shared-cache insertion and request-local adoption both accept raw filter
     // membership. Domain and liveDocs composition happen afterward through the
@@ -582,11 +593,39 @@ public:
     uint64_t readerCoreGen;
     uint64_t readerVersion;
     std::unordered_map<FilterKey, std::unique_ptr<Use>, FilterKeyHash> uses;
+    struct Timing {
+      std::atomic<uint64_t> nanos{0};
+    };
+    std::unique_ptr<Timing[]> timing;
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    bool settled = false;
+    static thread_local UseRegistry* timedRegistry;
+    static thread_local size_t timedSegment;
+
+    friend class Use;
     #ifndef NDEBUG
     std::thread::id owningThread;
     #endif
 
   public:
+    class SegmentScope {
+      UseRegistry& registry;
+      size_t segmentOrd;
+      UseRegistry* previousRegistry;
+      size_t previousSegment;
+      bool outermost;
+      std::chrono::steady_clock::time_point started;
+
+    public:
+      SegmentScope(UseRegistry& registry, size_t segmentOrd);
+      ~SegmentScope();
+      SegmentScope(const SegmentScope&) = delete;
+      SegmentScope& operator=(const SegmentScope&) = delete;
+    };
+
+    void addSegmentNanos(size_t segmentOrd, uint64_t nanos);
+    void settle(bool completed) noexcept;
+
     UseRegistry(FilterCache* cache, uint64_t readerCoreGen,
                 std::span<const SegmentIdentity> segments);
     UseRegistry(FilterCache* cache, uint64_t readerCoreGen,
@@ -618,7 +657,7 @@ public:
     // domain before lookup; effectiveDocSet rechecks before serving values.
     Use* acceptExisting(
         ExistingCandidate&& candidate, AdmissionLane lane,
-        Fraction work = Fraction::assumed());
+        Work work = Work::assumed());
     void enableRoutedAccounting(
         size_t segmentOrd, RequestMemTracker& tracker,
         std::string_view detail);
@@ -629,13 +668,25 @@ public:
 private:
   using SlotVector = std::vector<std::shared_ptr<SegmentSlot>>;
 
-  // One unit is this representation's reference production. The owning
-  // slot/entry lock serializes charges, grants, production and repayment.
+  // Balances and observations are nanoseconds. The owning slot/entry lock
+  // serializes charges, grants, production and repayment.
   struct Ledger {
     double owed = 0;
     std::atomic<double> debt{0};
     uint64_t referenceNanos = 0;
     size_t referenceBytes = 0;
+    bool measured = false;
+    bool observed = false;
+    struct Mean {
+      double nanos = 0;
+      uint64_t count = 0;
+      void add(double value) {
+        nanos = count++ == 0 ? value : nanos + (value - nanos) / 8;
+      }
+    };
+    Mean absent;
+    Mean served;
+    std::chrono::steady_clock::time_point completed;
     std::atomic_flag transition = ATOMIC_FLAG_INIT;
 
     void lock() {
@@ -643,8 +694,8 @@ private:
     }
     void unlock() { transition.clear(std::memory_order_release); }
     void production(uint64_t nanos, size_t bytes, bool investment);
-    void repay(double fraction);
-    bool canPopulate() const;
+    void repay(double nanos);
+    bool canPopulate(double productionNanos) const;
   };
 
   // active means this exact (seg_id, maxDoc) belongs to the latest published
@@ -711,7 +762,7 @@ private:
     // Shared serves and ordinary uses, each once per Use and value unit.
     StripedCounter hits;
     StripedCounter misses;
-    // Fractional credits times their reference production time.
+    // Estimated nanoseconds saved by credited serves.
     StripedCounter estimatedSavedNanos;
     std::atomic<uint64_t> buildNanos{0};
     std::atomic<uint64_t> unpaidBuildNanos{0};
@@ -724,9 +775,9 @@ private:
     std::atomic<uint64_t> unrepaidEvictions{0};
     std::atomic<uint64_t> populationDeferred{0};
     StripedCounter assumedCharges;
-    StripedCounter quotedCharges;
+    StripedCounter observedCharges;
     StripedCounter assumedCredits;
-    StripedCounter quotedCredits;
+    StripedCounter observedCredits;
     std::atomic<uint64_t> purges{0};
     std::atomic<uint64_t> oversizedKeyBypasses{0};
     std::atomic<uint64_t> readerStableHits{0};
@@ -779,6 +830,10 @@ private:
   std::atomic_flag sweeping = ATOMIC_FLAG_INIT;
   std::mutex publicationMutex;
   AtomicCounters counter;
+  std::atomic<double> priorNanosPerDoc{-1};
+
+  double productionNanos(const Ledger& ledger, int32_t maxDoc, bool observed) const;
+  void recordProduction(uint64_t nanos, int32_t maxDoc);
 
   // Approximate value-object, shared_ptr control-block, and segment-slot share.
   // Metadata is added separately and amortized over resident values.
@@ -813,15 +868,15 @@ private:
       const FilterKey& key, FilterKeyScope scope,
       uint64_t readerCoreGen, uint64_t readerVersion,
       std::span<const SegmentIdentity> readerSegments);
-  bool acceptExisting(Use& use, AdmissionLane lane, Fraction work);
+  bool acceptExisting(Use& use, AdmissionLane lane, Work work);
   template<class Value>
-  void creditValue(Ledger& ledger, const Value& value, Fraction work);
+  void creditValue(Ledger& ledger, const Value& value, Work work);
   void acceptSharedHit(
       Use& use, size_t segmentOrd,
-      std::shared_ptr<const SegmentValue> value, Fraction work = Fraction::assumed());
+      std::shared_ptr<const SegmentValue> value, Work work = Work::assumed());
   void acceptReaderSharedHit(
       Use& use, const std::shared_ptr<FilterEntry>& entry,
-      const std::shared_ptr<const ReaderValue>& value, Fraction work = Fraction::assumed());
+      const std::shared_ptr<const ReaderValue>& value, Work work = Work::assumed());
   void observeAdmissionLane(Use& use, AdmissionLane lane);
   AdmissionRing& admissionFor(AdmissionLane lane);
   RecentUses snapshotRecentUses();
@@ -890,7 +945,12 @@ public:
     double owed = 0;
     double debt = 0;
     double creditedTotal = 0;
-    uint64_t referenceNanos = 0;
+    double productionNanos = 0;
+    std::string_view productionSource = "unknown";
+    double absentNanos = 0;
+    uint64_t absentCount = 0;
+    double servedNanos = 0;
+    uint64_t servedCount = 0;
     size_t referenceBytes = 0;
   };
   struct EntryDump {

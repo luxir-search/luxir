@@ -2030,75 +2030,260 @@ FilterCache::ValueDump ledgerFor(FilterCache& cache, const FilterKey& key) {
 }
 }
 
-TEST(FilterCacheTest, fractionalChargesBuyOneProductionAndDeduplicate) {
-  auto config = testConfig();
-  config.admissionThreshold = 1;
-  FilterCache cache(config);
-  std::array segments{FilterCache::SegmentIdentity{1, 100}};
-  cache.onReaderPublished(1, segments);
-  FilterKey key("fractional-charges");
-  using Work = FilterCache::Fraction;
-  for (double fraction : {0.4, 0.4, 0.2}) {
-    FilterCache::UseRegistry request(cache, 1, segments);
-    auto* use = request.get(key);
-    for (int i = 0; i < 3; i++) {
-      EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, Work::quoted()).kind());
-    }
-    for (int i = 0; i < 3; i++) use->charge(0, Work::quoted(fraction));
-  }
-  EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).owed);
-  EXPECT_EQ(3u, cache.counters().misses);
-  EXPECT_EQ(3u, cache.counters().quotedCharges);
-  EXPECT_EQ(0u, cache.counters().buildAttempts);
+namespace {
+FilterCache::Probe::Kind observedRequest(FilterCache& cache,
+    std::span<const FilterCache::SegmentIdentity> segments, const FilterKey& key,
+    uint64_t nanos, std::optional<uint64_t> buildNanos = std::nullopt, bool completed = true) {
   FilterCache::UseRegistry request(cache, 1, segments);
   auto* use = request.get(key);
-  auto build = use->probe(0, Work::quoted());
-  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
-  use->publishRaw(0, build, docs(100, {7}), 1000);
-  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).owed);
-  EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).debt);
-  EXPECT_EQ(1u, cache.counters().builds);
+  auto probe = use->probe(0, FilterCache::Work::pending());
+  auto kind = probe.kind();
+  if (buildNanos) {
+    EXPECT_EQ(FilterCache::Probe::Kind::BUILD, kind);
+    if (kind == FilterCache::Probe::Kind::BUILD) {
+      use->publishRaw(0, probe, docs(segments[0].maxDoc, {7}), *buildNanos);
+    }
+  }
+  request.addSegmentNanos(0, nanos);
+  request.settle(completed);
+  request.settle(completed);
+  return kind;
+}
 }
 
-TEST(FilterCacheTest, knownFractionsPriceBothProbeOutcomes) {
+TEST(FilterCacheTest, firstObservedProductionWaitsForAnOrdinarySample) {
+  FilterCache cache(testConfig());
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterKey key("observed-first");
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, observedRequest(cache, segments, key, 400));
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, observedRequest(cache, segments, key, 400));
+  auto ledger = ledgerFor(cache, key);
+  EXPECT_EQ(1u, ledger.absentCount);
+  EXPECT_EQ("unknown", ledger.productionSource);
+  EXPECT_DOUBLE_EQ(400, ledger.owed);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, observedRequest(cache, segments, key, 10'000, 1000));
+  ledger = ledgerFor(cache, key);
+  EXPECT_EQ(1u, ledger.absentCount);
+  EXPECT_DOUBLE_EQ(0, ledger.owed);
+  EXPECT_DOUBLE_EQ(1000, ledger.debt);
+  EXPECT_EQ("measured", ledger.productionSource);
+}
+
+TEST(FilterCacheTest, observedPriorFundsPopulationAndLeavesAssumedConsumersUnchanged) {
   auto config = testConfig();
   config.admissionThreshold = 1;
   FilterCache cache(config);
   std::array segments{FilterCache::SegmentIdentity{1, 100}};
   cache.onReaderPublished(1, segments);
-  FilterKey key("known-fractions");
-  using Work = FilterCache::Fraction;
-  for (double fraction : {0.4, 0.4, 0.2}) {
+  FilterKey seed("prior-seed"), key("prior-priced"), assumed("prior-assumed");
+  observedRequest(cache, segments, seed, 100);
+  observedRequest(cache, segments, seed, 100, 1000);
+  std::array larger{FilterCache::SegmentIdentity{2, 200}};
+  cache.onReaderPublished(1, larger);
+  for (int i = 0; i < 5; i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, observedRequest(cache, larger, key, 400));
+  }
+  EXPECT_DOUBLE_EQ(2000, ledgerFor(cache, key).owed);
+  EXPECT_DOUBLE_EQ(2000, ledgerFor(cache, key).productionNanos);
+  EXPECT_EQ("prior", ledgerFor(cache, key).productionSource);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, observedRequest(cache, larger, key, 400, 2000));
+  EXPECT_DOUBLE_EQ(2000, ledgerFor(cache, key).debt);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, servePolicyValue(cache, larger, assumed, 7, 500));
+  FilterKey verify("prior-after-assumed-build");
+  observedRequest(cache, larger, verify, 1);
+  EXPECT_DOUBLE_EQ(2000, ledgerFor(cache, verify).productionNanos);
+}
+
+TEST(FilterCacheTest, knownNanosecondsPriceBothProbeOutcomes) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterKey key("known-nanoseconds");
+  servePolicyValue(cache, segments, key, 7, 1000);
+  evictValues(cache);
+  using Work = FilterCache::Work;
+  for (double nanos : {800, 800, 400}) {
     FilterCache::UseRegistry request(cache, 1, segments);
     auto* use = request.get(key);
-    auto probe = use->probe(0, Work::quoted(fraction));
-    if (fraction == 0.2) {
+    auto probe = use->probe(0, Work::nanoseconds(nanos));
+    if (nanos == 400) {
       ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
-      use->publishRaw(0, probe, docs(100, {7}), 1000);
+      use->publishRaw(0, probe, docs(100, {7}), 2000);
     } else {
       ASSERT_EQ(FilterCache::Probe::Kind::BYPASS, probe.kind());
       probe = {};
-      EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
-                use->probe(0, Work::quoted(fraction)).kind());
+      EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, Work::nanoseconds(nanos)).kind());
     }
   }
-  EXPECT_EQ(3u, cache.counters().quotedCharges);
-  EXPECT_EQ(1u, cache.counters().builds);
-  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).owed);
+  EXPECT_DOUBLE_EQ(3000, ledgerFor(cache, key).debt);
   FilterCache::UseRegistry request(cache, 1, segments);
-  EXPECT_EQ(FilterCache::Probe::Kind::HIT,
-            request.get(key)->probe(0, Work::quoted(0.25)).kind());
-  EXPECT_DOUBLE_EQ(0.75, ledgerFor(cache, key).debt);
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, request.get(key)->probe(0, Work::nanoseconds(250)).kind());
+  EXPECT_DOUBLE_EQ(2750, ledgerFor(cache, key).debt);
   EXPECT_EQ(250u, cache.counters().estimatedSavedNanos);
+  FilterKey next("prior-after-explicit-work");
+  observedRequest(cache, segments, next, 1);
+  EXPECT_DOUBLE_EQ(2000, ledgerFor(cache, next).productionNanos);
 }
 
-TEST(FilterCacheTest, completeResidencyAcceptanceCanDeferQuotedCredit) {
+TEST(FilterCacheTest, observedServesNeedABaselineAndSlowerSetsEarnNothing) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterKey key("observed-baseline");
+  servePolicyValue(cache, segments, key, 7, 1000);
+  observedRequest(cache, segments, key, 100);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, key).debt);
+  EXPECT_EQ(0u, ledgerFor(cache, key).absentCount);
+  evictValues(cache);
+  observedRequest(cache, segments, key, 400);
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    request.get(key)->offerRaw(0, docs(100, {7}), 1);
+  }
+  observedRequest(cache, segments, key, 100);
+  EXPECT_DOUBLE_EQ(700, ledgerFor(cache, key).debt);
+  EXPECT_DOUBLE_EQ(300, ledgerFor(cache, key).creditedTotal);
+  EXPECT_EQ(300u, cache.counters().estimatedSavedNanos);
+
+  FilterKey slow("observed-slower");
+  observedRequest(cache, segments, slow, 1000);
+  observedRequest(cache, segments, slow, 1, 1000);
+  observedRequest(cache, segments, slow, 2000);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, slow).debt);
+  evictValues(cache);
+  observedRequest(cache, segments, slow, 1000);
+  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, slow).owed);
+}
+
+TEST(FilterCacheTest, matchedVariableAbsentAndServedMixHasNoResidualCharge) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterKey key("matched-variable-times");
+  constexpr uint64_t low = 1'000'000, high = 100'000'000, production = 1'000'000'000;
+  observedRequest(cache, segments, key, high);
+  observedRequest(cache, segments, key, 1, production);
+  observedRequest(cache, segments, key, high);
+  for (int i = 0; i < 40; i++) {
+    observedRequest(cache, segments, key, high);
+    evictValues(cache);
+    observedRequest(cache, segments, key, high);
+    observedRequest(cache, segments, key, low);
+    {
+      FilterCache::UseRegistry request(cache, 1, segments);
+      request.get(key)->offerRaw(0, docs(100, {7}), 1);
+    }
+    observedRequest(cache, segments, key, low);
+  }
+  auto ledger = ledgerFor(cache, key);
+  EXPECT_DOUBLE_EQ(ledger.absentNanos, ledger.servedNanos);
+  EXPECT_DOUBLE_EQ(0, ledger.owed);
+  EXPECT_DOUBLE_EQ(production, ledger.debt);
+  EXPECT_EQ(0u, cache.counters().estimatedSavedNanos);
+}
+
+TEST(FilterCacheTest, timedPassesSettleOnceAndFailedOrPreproductionRequestsTeachNothing) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterKey key("two-timed-passes");
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(key);
+    for (int i = 0; i < 3; i++) use->probe(0, FilterCache::Work::pending());
+    request.addSegmentNanos(0, 400);
+    request.addSegmentNanos(0, 600);
+    request.settle(true);
+    request.settle(true);
+  }
+  EXPECT_EQ(1u, ledgerFor(cache, key).absentCount);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, key).owed);
+  EXPECT_EQ(1u, cache.counters().observedCharges);
+  observedRequest(cache, segments, key, 99'000, 1000);
+  EXPECT_EQ(1u, ledgerFor(cache, key).absentCount);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, key).absentNanos);
+  auto before = cache.counters();
+  observedRequest(cache, segments, key, 100, std::nullopt, false);
+  EXPECT_EQ(0u, ledgerFor(cache, key).servedCount);
+  EXPECT_EQ(before.observedCredits, cache.counters().observedCredits);
+  FilterKey aborted("aborted-ordinary");
+  observedRequest(cache, segments, aborted, 1000, std::nullopt, false);
+  EXPECT_EQ(0u, ledgerFor(cache, aborted).absentCount);
+  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, aborted).owed);
+
+  FilterKey stale("before-production");
+  FilterCache::UseRegistry old(cache, 1, segments);
+  old.get(stale)->probe(0, FilterCache::Work::pending());
+  observedRequest(cache, segments, stale, 1000);
+  observedRequest(cache, segments, stale, 1000, 1000);
+  old.addSegmentNanos(0, 10'000);
+  old.settle(true);
+  EXPECT_EQ(1u, ledgerFor(cache, stale).absentCount);
+  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, stale).owed);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, stale).debt);
+}
+
+TEST(FilterCacheTest, observedDebtRequiresNetWorkAndNewProductionDoesNotRebaseIt) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterKey key("net-time-repayment");
+  observedRequest(cache, segments, key, 400);
+  observedRequest(cache, segments, key, 1, 1000);
+  observedRequest(cache, segments, key, 100);
+  EXPECT_DOUBLE_EQ(700, ledgerFor(cache, key).debt);
+  evictValues(cache);
+  for (int i = 0; i < 6; i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, observedRequest(cache, segments, key, 400));
+  }
+  EXPECT_DOUBLE_EQ(1800, ledgerFor(cache, key).owed);
+  observedRequest(cache, segments, key, 1, 2000);
+  EXPECT_DOUBLE_EQ(2700, ledgerFor(cache, key).debt);
+  EXPECT_DOUBLE_EQ(2000, ledgerFor(cache, key).productionNanos);
+}
+
+TEST(FilterCacheTest, onlyOutermostTimedScopeSelectsObservation) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(FilterKey("timed-intent"));
+  use->observe();
+  EXPECT_TRUE(use->work(0).isAssumed());
+  {
+    FilterCache::UseRegistry::SegmentScope outer(request, 0);
+    EXPECT_FALSE(use->work(0).known());
+    {
+      FilterCache::UseRegistry::SegmentScope inner(request, 0);
+      EXPECT_FALSE(use->work(0).known());
+    }
+    EXPECT_FALSE(use->work(0).known());
+    std::thread untimed([&] { EXPECT_TRUE(use->work(0).isAssumed()); });
+    untimed.join();
+  }
+  EXPECT_TRUE(use->work(0).isAssumed());
+}
+
+TEST(FilterCacheTest, completeResidencyAcceptanceCanDeferObservedCredit) {
   auto config = testConfig();
   config.admissionThreshold = 1;
   FilterCache cache(config);
   std::array segments{FilterCache::SegmentIdentity{1, 4096}};
   cache.onReaderPublished(1, segments);
-  FilterKey key("complete-quoted-credit");
+  FilterKey key("complete-observed-credit");
   servePolicyValue(cache, segments, key, 7, 1000);
   FilterCache::UseRegistry request(cache, 1, segments);
   auto before = cache.counters();
@@ -2106,14 +2291,14 @@ TEST(FilterCacheTest, completeResidencyAcceptanceCanDeferQuotedCredit) {
   ASSERT_TRUE(candidate);
   EXPECT_EQ(before, cache.counters());
   auto* use = request.acceptExisting(std::move(*candidate),
-      FilterCache::AdmissionLane::WHOLE, FilterCache::Fraction::quoted());
+      FilterCache::AdmissionLane::WHOLE, FilterCache::Work::pending());
   ASSERT_NE(nullptr, use);
-  EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).debt);
-  use->credit(0, FilterCache::Fraction::quoted(0.25));
-  use->probe(0, FilterCache::Fraction::quoted(0.75));
-  EXPECT_DOUBLE_EQ(0.75, ledgerFor(cache, key).debt);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, key).debt);
+  use->credit(0, FilterCache::Work::nanoseconds(250));
+  use->probe(0, FilterCache::Work::nanoseconds(750));
+  EXPECT_DOUBLE_EQ(750, ledgerFor(cache, key).debt);
   EXPECT_EQ(1u, cache.counters().hits);
-  EXPECT_EQ(1u, cache.counters().quotedCredits);
+  EXPECT_EQ(1u, cache.counters().observedCredits);
   EXPECT_EQ(250u, cache.counters().estimatedSavedNanos);
 }
 
@@ -2125,47 +2310,47 @@ TEST(FilterCacheTest, partialCreditsCarryInvestmentAcrossEvictionAndRebuild) {
   std::array segments{FilterCache::SegmentIdentity{1, 4096}};
   cache.onReaderPublished(1, segments);
   FilterKey key("partial-credit");
-  using Work = FilterCache::Fraction;
+  using Work = FilterCache::Work;
   servePolicyValue(cache, segments, key, 7, 1000);
-  for (double fraction : {0.04, 0.06}) {
+  for (double nanos : {40, 60}) {
     FilterCache::UseRegistry request(cache, 1, segments);
     auto* use = request.get(key);
     auto candidate = use->look(0);
     ASSERT_TRUE(candidate);
-    auto hit = use->accept(std::move(*candidate), Work::quoted());
-    use->credit(0, Work::quoted(fraction));
-    use->credit(0, Work::quoted(fraction));
+    auto hit = use->accept(std::move(*candidate), Work::pending());
+    use->credit(0, Work::nanoseconds(nanos));
+    use->credit(0, Work::nanoseconds(nanos));
   }
-  EXPECT_NEAR(0.1, ledgerFor(cache, key).creditedTotal, 1e-15);
+  EXPECT_NEAR(100, ledgerFor(cache, key).creditedTotal, 1e-15);
   cache.sweep();
   EXPECT_EQ(1u, cache.counters().unrepaidEvictions);
   EXPECT_EQ(900u, cache.counters().unpaidBuildNanos);
-  EXPECT_NEAR(0.9, ledgerFor(cache, key).debt, 1e-15);
-  auto charge = [&](double fraction) {
+  EXPECT_NEAR(900, ledgerFor(cache, key).debt, 1e-15);
+  auto charge = [&](double nanos) {
     FilterCache::UseRegistry request(cache, 1, segments);
     auto* use = request.get(key);
-    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, Work::quoted()).kind());
-    use->charge(0, Work::quoted(fraction));
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, Work::pending()).kind());
+    use->charge(0, Work::nanoseconds(nanos));
   };
   auto rebuild = [&] {
     FilterCache::UseRegistry request(cache, 1, segments);
     auto* use = request.get(key);
-    auto build = use->probe(0, Work::quoted());
+    auto build = use->probe(0, Work::pending());
     EXPECT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
     use->publishRaw(0, build, bitDocs(4096, 7), 1000);
   };
-  charge(1.8);
-  charge(0.1);
+  charge(1800);
+  charge(100);
   rebuild();
-  EXPECT_NEAR(1.9, ledgerFor(cache, key).debt, 1e-15);
+  EXPECT_NEAR(1900, ledgerFor(cache, key).debt, 1e-15);
   cache.sweep();
-  charge(2.8);
-  charge(0.1);
+  charge(2800);
+  charge(100);
   rebuild();
-  EXPECT_NEAR(2.9, ledgerFor(cache, key).debt, 1e-15);
+  EXPECT_NEAR(2900, ledgerFor(cache, key).debt, 1e-15);
   FilterCache::UseRegistry hitRequest(cache, 1, segments);
   auto* use = hitRequest.get(key);
-  EXPECT_EQ(FilterCache::Probe::Kind::HIT, use->probe(0, Work::quoted(2.9)).kind());
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, use->probe(0, Work::nanoseconds(2900)).kind());
   EXPECT_NEAR(0, ledgerFor(cache, key).debt, 1e-15);
   cache.validateForTest();
 }
@@ -2177,7 +2362,7 @@ TEST(FilterCacheTest, lateCreditPaysOnceWithoutForgivingNewInvestment) {
   std::array segments{FilterCache::SegmentIdentity{1, 4096}};
   cache.onReaderPublished(1, segments);
   FilterKey key("late-ledger-credit");
-  using Work = FilterCache::Fraction;
+  using Work = FilterCache::Work;
   servePolicyValue(cache, segments, key, 7, 1000);
   FilterCache::UseRegistry oldRequest(cache, 1, segments);
   auto* old = oldRequest.get(key);
@@ -2185,19 +2370,19 @@ TEST(FilterCacheTest, lateCreditPaysOnceWithoutForgivingNewInvestment) {
   ASSERT_TRUE(candidate);
   evictValues(cache);
   EXPECT_EQ(0u, cache.bytesUsed());
-  EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).debt);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, key).debt);
   EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, servePolicyValue(cache, segments, key, 8, 2000));
   EXPECT_EQ(FilterCache::Probe::Kind::BUILD, servePolicyValue(cache, segments, key, 8, 2000));
-  EXPECT_DOUBLE_EQ(2, ledgerFor(cache, key).debt);
-  EXPECT_TRUE(old->accept(std::move(*candidate), Work::quoted(1)).docSet()->get(7));
-  old->credit(0, Work::quoted(1));
-  EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).debt);
+  EXPECT_DOUBLE_EQ(3000, ledgerFor(cache, key).debt);
+  EXPECT_TRUE(old->accept(std::move(*candidate), Work::nanoseconds(1000)).docSet()->get(7));
+  old->credit(0, Work::nanoseconds(1000));
+  EXPECT_DOUBLE_EQ(2000, ledgerFor(cache, key).debt);
   EXPECT_EQ(1000u, cache.counters().estimatedSavedNanos);
   EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).creditedTotal);
   FilterCache::UseRegistry current(cache, 1, segments);
   EXPECT_EQ(FilterCache::Probe::Kind::HIT, current.get(key)->probe(0).kind());
   EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).debt);
-  EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).creditedTotal);
+  EXPECT_DOUBLE_EQ(2000, ledgerFor(cache, key).creditedTotal);
 }
 
 TEST(FilterCacheTest, assumedCreditRepaysOneInvestmentAndCounterResetKeepsDebt) {
@@ -2211,9 +2396,9 @@ TEST(FilterCacheTest, assumedCreditRepaysOneInvestmentAndCounterResetKeepsDebt) 
   evictValues(cache);
   servePolicyValue(cache, segments, key, 7, 1000);
   servePolicyValue(cache, segments, key, 7, 1000);
-  EXPECT_DOUBLE_EQ(2, ledgerFor(cache, key).debt);
+  EXPECT_DOUBLE_EQ(2000, ledgerFor(cache, key).debt);
   servePolicyValue(cache, segments, key, 7, 1000);
-  EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).debt);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, key).debt);
   EXPECT_EQ(1000u, cache.counters().outstandingDebtNanos);
   cache.resetCounters();
   EXPECT_EQ(1000u, cache.counters().outstandingDebtNanos);
@@ -2238,20 +2423,20 @@ TEST(FilterCacheTest, rejectedInvestmentAddsDebtAndByproductsDoNot) {
     use->publishRaw(0, build, DocSet::andNot(nullptr, {}, 100), 1000);
   }
   EXPECT_EQ(1u, cache.counters().publishRejects);
-  EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).debt);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, key).debt);
   {
     FilterCache::UseRegistry request(cache, 1, segments);
     auto* use = request.get(key);
     EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
-              use->probe(0, FilterCache::Fraction::quoted(0.5)).kind());
+              use->probe(0, FilterCache::Work::nanoseconds(500)).kind());
   }
   {
     FilterCache::UseRegistry request(cache, 1, segments);
     request.get(key)->offerRaw(0, docs(100, {7}), 2000);
   }
-  EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).debt);
-  EXPECT_DOUBLE_EQ(0.5, ledgerFor(cache, key).owed);
-  EXPECT_EQ(2000u, ledgerFor(cache, key).referenceNanos);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, key).debt);
+  EXPECT_DOUBLE_EQ(500, ledgerFor(cache, key).owed);
+  EXPECT_EQ(1000u, ledgerFor(cache, key).productionNanos);
   EXPECT_GT(ledgerFor(cache, key).referenceBytes, 0u);
   FilterKey byproduct("claimed-byproduct");
   FilterCache::UseRegistry request(cache, 1, segments);
@@ -2260,7 +2445,7 @@ TEST(FilterCacheTest, rejectedInvestmentAddsDebtAndByproductsDoNot) {
   ASSERT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
   use->publishRawByproduct(0, build, docs(100, {7}), 1000);
   EXPECT_DOUBLE_EQ(0, ledgerFor(cache, byproduct).debt);
-  EXPECT_DOUBLE_EQ(1, ledgerFor(cache, byproduct).owed);
+  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, byproduct).owed);
   cache.validateForTest();
 }
 
@@ -2271,12 +2456,12 @@ TEST(FilterCacheTest, concurrentGrantsSpendOwedOnlyOnCompletion) {
   std::array segments{FilterCache::SegmentIdentity{1, 100}};
   cache.onReaderPublished(1, segments);
   FilterKey key("ledger-claimants");
-  using Work = FilterCache::Fraction;
+  using Work = FilterCache::Work;
   {
     FilterCache::UseRegistry request(cache, 1, segments);
     auto* use = request.get(key);
-    use->probe(0, Work::quoted());
-    use->charge(0, Work::quoted(1));
+    use->probe(0, Work::pending());
+    use->charge(0, Work::nanoseconds(1));
   }
   std::barrier phase(2);
   std::atomic<int> grants{0};
@@ -2284,7 +2469,7 @@ TEST(FilterCacheTest, concurrentGrantsSpendOwedOnlyOnCompletion) {
     FilterCache::UseRegistry request(cache, 1, segments);
     auto* use = request.get(key);
     phase.arrive_and_wait();
-    auto probe = use->probe(0, Work::quoted());
+    auto probe = use->probe(0, Work::pending());
     if (probe.kind() == FilterCache::Probe::Kind::BUILD) grants.fetch_add(1);
     phase.arrive_and_wait();
     EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).owed);
@@ -2296,7 +2481,7 @@ TEST(FilterCacheTest, concurrentGrantsSpendOwedOnlyOnCompletion) {
   EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).owed);
   EXPECT_THROW({
     FilterCache::UseRegistry request(cache, 1, segments);
-    auto probe = request.get(key)->probe(0, Work::quoted());
+    auto probe = request.get(key)->probe(0, Work::pending());
     ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
     auto moved = std::move(probe);
     throw std::runtime_error("production failed");
@@ -2305,21 +2490,21 @@ TEST(FilterCacheTest, concurrentGrantsSpendOwedOnlyOnCompletion) {
   EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).debt);
   FilterCache::UseRegistry request(cache, 1, segments);
   auto* use = request.get(key);
-  auto build = use->probe(0, Work::quoted());
+  auto build = use->probe(0, Work::pending());
   ASSERT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
   {
     FilterCache::UseRegistry duringBuild(cache, 1, segments);
     EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
-              duringBuild.get(key)->probe(0, Work::quoted(0.4)).kind());
+              duringBuild.get(key)->probe(0, Work::nanoseconds(0.4)).kind());
   }
   EXPECT_DOUBLE_EQ(1.4, ledgerFor(cache, key).owed);
   use->publishRaw(0, build, docs(100, {7}), 1000);
   EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).owed);
-  EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).debt);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, key).debt);
   cache.validateForTest();
 }
 
-TEST(FilterCacheTest, readerFractionalDebtSurvivesEvictionAndRebuild) {
+TEST(FilterCacheTest, readerNanosecondDebtSurvivesEvictionAndRebuild) {
   RAMDir dir;
   CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
   IndexWriter writer(snapshots);
@@ -2333,8 +2518,8 @@ TEST(FilterCacheTest, readerFractionalDebtSurvivesEvictionAndRebuild) {
   config.lowWatermarkBytes = 1;
   FilterCache cache(config);
   cache.onReaderPublished(*reader);
-  FilterKey key("reader-fractional-debt");
-  using Work = FilterCache::Fraction;
+  FilterKey key("reader-nanosecond-debt");
+  using Work = FilterCache::Work;
   auto build = [&](Work work) {
     FilterCache::UseRegistry request(cache, *reader);
     auto* use = request.get(key, FilterKeyScope::READER_STABLE);
@@ -2342,13 +2527,13 @@ TEST(FilterCacheTest, readerFractionalDebtSurvivesEvictionAndRebuild) {
     EXPECT_EQ(FilterCache::ReaderProbe::Kind::BUILD, probe.kind());
     use->publishReaderStable(probe, oneDocPerSegment(*reader), 1000);
   };
-  auto charge = [&](double fraction) {
+  auto charge = [&](double nanos) {
     FilterCache::UseRegistry request(cache, *reader);
     auto* use = request.get(key, FilterKeyScope::READER_STABLE);
     EXPECT_EQ(FilterCache::ReaderProbe::Kind::BYPASS,
-              use->probeReaderStable(*reader, domains, Work::quoted()).kind());
-    use->chargeReaderStable(Work::quoted(fraction));
-    use->chargeReaderStable(Work::quoted(fraction));
+              use->probeReaderStable(*reader, domains, Work::pending()).kind());
+    use->chargeReaderStable(Work::nanoseconds(nanos));
+    use->chargeReaderStable(Work::nanoseconds(nanos));
   };
   build(Work::assumed());
   {
@@ -2356,26 +2541,26 @@ TEST(FilterCacheTest, readerFractionalDebtSurvivesEvictionAndRebuild) {
     auto candidate = request.lookupExisting(key, FilterKeyScope::READER_STABLE);
     ASSERT_TRUE(candidate);
     auto* use = request.acceptExisting(std::move(*candidate),
-        FilterCache::AdmissionLane::WHOLE, Work::quoted());
+        FilterCache::AdmissionLane::WHOLE, Work::pending());
     ASSERT_NE(nullptr, use);
-    use->creditReaderStable(Work::quoted(0.1));
-    use->creditReaderStable(Work::quoted(0.1));
+    use->creditReaderStable(Work::nanoseconds(100));
+    use->creditReaderStable(Work::nanoseconds(100));
   }
   cache.sweep();
-  EXPECT_NEAR(0.9, ledgerFor(cache, key).debt, 1e-15);
+  EXPECT_NEAR(900, ledgerFor(cache, key).debt, 1e-15);
   EXPECT_EQ(900u, cache.counters().unpaidBuildNanos);
-  charge(1.8); charge(0.1);
-  build(Work::quoted());
-  EXPECT_NEAR(1.9, ledgerFor(cache, key).debt, 1e-15);
+  charge(1800); charge(100);
+  build(Work::pending());
+  EXPECT_NEAR(1900, ledgerFor(cache, key).debt, 1e-15);
   cache.sweep();
-  charge(2.8); charge(0.1);
-  build(Work::quoted());
-  EXPECT_NEAR(2.9, ledgerFor(cache, key).debt, 1e-15);
+  charge(2800); charge(100);
+  build(Work::pending());
+  EXPECT_NEAR(2900, ledgerFor(cache, key).debt, 1e-15);
   {
     FilterCache::UseRegistry request(cache, *reader);
     auto* use = request.get(key, FilterKeyScope::READER_STABLE);
     EXPECT_EQ(FilterCache::ReaderProbe::Kind::HIT,
-              use->probeReaderStable(*reader, domains, Work::quoted(2.9)).kind());
+              use->probeReaderStable(*reader, domains, Work::nanoseconds(2900)).kind());
   }
   EXPECT_NEAR(0, ledgerFor(cache, key).debt, 1e-15);
   cache.validateForTest();
@@ -2394,17 +2579,17 @@ TEST(FilterCacheTest, readerFailedProductionLeavesOwedAvailable) {
   FilterCache cache(config);
   cache.onReaderPublished(*reader);
   FilterKey key("reader-failed-production");
-  using Work = FilterCache::Fraction;
+  using Work = FilterCache::Work;
   {
     FilterCache::UseRegistry request(cache, *reader);
     auto* use = request.get(key, FilterKeyScope::READER_STABLE);
     EXPECT_EQ(FilterCache::ReaderProbe::Kind::BUILD,
-              use->probeReaderStable(*reader, domains, Work::quoted(1)).kind());
+              use->probeReaderStable(*reader, domains, Work::nanoseconds(1)).kind());
   }
   EXPECT_THROW({
     FilterCache::UseRegistry request(cache, *reader);
     auto probe = request.get(key, FilterKeyScope::READER_STABLE)
-        ->probeReaderStable(*reader, domains, Work::quoted());
+        ->probeReaderStable(*reader, domains, Work::pending());
     ASSERT_EQ(FilterCache::ReaderProbe::Kind::BUILD, probe.kind());
     FilterCache::ReaderProbe moved;
     moved = std::move(probe);
@@ -2415,11 +2600,11 @@ TEST(FilterCacheTest, readerFailedProductionLeavesOwedAvailable) {
   EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).debt);
   FilterCache::UseRegistry request(cache, *reader);
   auto* use = request.get(key, FilterKeyScope::READER_STABLE);
-  auto build = use->probeReaderStable(*reader, domains, Work::quoted());
+  auto build = use->probeReaderStable(*reader, domains, Work::pending());
   ASSERT_EQ(FilterCache::ReaderProbe::Kind::BUILD, build.kind());
   use->publishReaderStable(build, oneDocPerSegment(*reader), 1000);
   EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).owed);
-  EXPECT_DOUBLE_EQ(1, ledgerFor(cache, key).debt);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, key).debt);
   cache.validateForTest();
 }
 
@@ -2511,12 +2696,12 @@ TEST(FilterCacheTest, borrowingMissDoesNotFundPopulation) {
   auto before = cache.counters();
   EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
             use->probe(0, FilterCache::Population::BORROW_ONLY).kind());
-  use->charge(0, FilterCache::Fraction::quoted(100));
+  use->charge(0, FilterCache::Work::nanoseconds(100));
   auto after = cache.counters();
   EXPECT_EQ(before.misses + 1, after.misses);
   EXPECT_EQ(before.buildAttempts, after.buildAttempts);
   EXPECT_EQ(before.populationDeferred, after.populationDeferred);
-  EXPECT_EQ(before.quotedCharges, after.quotedCharges);
+  EXPECT_EQ(before.observedCharges, after.observedCharges);
   EXPECT_DOUBLE_EQ(0, ledgerFor(cache, victim).owed);
   // A borrowing miss leaves owed at zero. One assumed charge cannot fund
   // another build, and repeated probes in this request cannot add to it.
@@ -2824,7 +3009,7 @@ TEST(FilterCacheTest, metadataBytesAreAccountedAndSweepNonemptyEntries) {
   config.admissionThreshold = 1;
   config.maxEntryBytes = 1024;
   config.maxMetadataEntries = 100;
-  config.maxMetadataBytes = 1024;
+  config.maxMetadataBytes = 1280;
   FilterCache cache(config);
   std::array segments{FilterCache::SegmentIdentity{1, 100}};
   cache.onReaderPublished(1, segments);
@@ -5971,9 +6156,10 @@ TEST(FilterCacheIntegrationTest, cacheControlIncludesLedgerGhosts) {
     ASSERT_EQ(1u, shard.entries[0].values.size());
     const auto& value = shard.entries[0].values[0];
     EXPECT_EQ(stage == 0, value.resident);
-    EXPECT_DOUBLE_EQ(0, value.owed);
-    EXPECT_DOUBLE_EQ(1, value.debt);
-    EXPECT_EQ(4u, value.reference_us);
+    EXPECT_DOUBLE_EQ(0, value.owed_us);
+    EXPECT_DOUBLE_EQ(4, value.debt_us);
+    EXPECT_EQ(4u, value.production_us);
+    EXPECT_EQ("measured", value.production_source);
     EXPECT_GT(value.reference_bytes, 0u);
     EXPECT_EQ(4u, shard.stats.outstanding_debt_us);
   }

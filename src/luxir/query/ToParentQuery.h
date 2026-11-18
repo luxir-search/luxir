@@ -141,7 +141,7 @@ public:
       // Every row of the path is not a set worth materializing or caching.
       childUse = !child->needsScores() && !child->allowsPruning() && !child->matchesAllDocs()
           ? childContext->getFilterUse(*query.child) : nullptr;
-      traits = child->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN);
+      traits = OBSERVED_FILTER_CACHE | (child->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN));
       if (child->consumesDomain()) traits |= NEEDS_PREPARE;
       if (reduction.kind == RowReduction::FIXED || reduction.kind == RowReduction::CONSTANT) {
         traits |= IS_CONSTANT_SCORING;

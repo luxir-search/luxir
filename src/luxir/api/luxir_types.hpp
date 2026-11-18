@@ -353,12 +353,12 @@ struct QueryCacheStats {
   uint64_t unrepaid_evictions = 0;
   uint64_t population_deferred = 0;
   uint64_t assumed_charges = 0;
-  uint64_t quoted_charges = 0;
+  uint64_t observed_charges = 0;
   uint64_t build_us = 0;
   uint64_t estimated_saved_us = 0;
   uint64_t unpaid_build_us = 0;
   uint64_t assumed_credits = 0;
-  uint64_t quoted_credits = 0;
+  uint64_t observed_credits = 0;
   uint64_t outstanding_debt_us = 0;
   bool enabled = false;
 };
@@ -807,11 +807,16 @@ struct CacheControlRequest {
 struct CacheValueDump {
   uint64_t seg_id = 0;
   uint64_t reader_version = 0;
-  uint64_t reference_us = 0;
   uint64_t reference_bytes = 0;
-  double owed = 0;
-  double debt = 0;
-  double credited_total = 0;
+  std::string_view production_source;
+  double owed_us = 0;
+  double debt_us = 0;
+  double credited_us = 0;
+  double production_us = 0;
+  double absent_mean_us = 0;
+  uint64_t absent_count = 0;
+  double served_mean_us = 0;
+  uint64_t served_count = 0;
   uint32_t space = 0;
   int32_t max_doc = 0;
   bool resident = false;

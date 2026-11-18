@@ -229,12 +229,12 @@ void fillQueryCacheStats(api::QueryCacheStats& dst, const ReaderManager::CacheSt
   dst.unrepaid_evictions = src.filterCacheCounters.unrepaidEvictions;
   dst.population_deferred = src.filterCacheCounters.populationDeferred;
   dst.assumed_charges = src.filterCacheCounters.assumedCharges;
-  dst.quoted_charges = src.filterCacheCounters.quotedCharges;
+  dst.observed_charges = src.filterCacheCounters.observedCharges;
   dst.build_us = src.filterCacheCounters.buildNanos / 1000;
   dst.estimated_saved_us = src.filterCacheCounters.estimatedSavedNanos / 1000;
   dst.unpaid_build_us = src.filterCacheCounters.unpaidBuildNanos / 1000;
   dst.assumed_credits = src.filterCacheCounters.assumedCredits;
-  dst.quoted_credits = src.filterCacheCounters.quotedCredits;
+  dst.observed_credits = src.filterCacheCounters.observedCredits;
   dst.outstanding_debt_us = src.filterCacheCounters.outstandingDebtNanos / 1000;
 }
 
@@ -495,10 +495,15 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
         values[v].max_doc = value.maxDoc;
         values[v].reader_version = value.readerVersion;
         values[v].resident = value.resident;
-        values[v].owed = value.owed;
-        values[v].debt = value.debt;
-        values[v].credited_total = value.creditedTotal;
-        values[v].reference_us = value.referenceNanos / 1000;
+        values[v].owed_us = value.owed / 1000;
+        values[v].debt_us = value.debt / 1000;
+        values[v].credited_us = value.creditedTotal / 1000;
+        values[v].production_us = value.productionNanos / 1000;
+        values[v].production_source = value.productionSource;
+        values[v].absent_mean_us = value.absentNanos / 1000;
+        values[v].absent_count = value.absentCount;
+        values[v].served_mean_us = value.servedNanos / 1000;
+        values[v].served_count = value.servedCount;
         values[v].reference_bytes = value.referenceBytes;
       }
     }

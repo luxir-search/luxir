@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <exception>
 #include <cstdint>
 #include <cmath>
 #include <limits>
@@ -1258,6 +1259,8 @@ public:
 
   private:
     std::unique_ptr<MultiTermBudget> ownedMultiTermBudget;
+    bool ownsFilterUses = false;
+    int uncaught = std::uncaught_exceptions();
 
   public:
     RequestMemTracker& memoryTracker;
@@ -1287,9 +1290,14 @@ public:
       }
       auto* filterCache = topReader.filterCache();
       if (this->filterUses == nullptr) {
+        ownsFilterUses = true;
         this->filterUses = std::make_shared<FilterCache::UseRegistry>(
             filterCache, topReader);
       }
+    }
+
+    ~PlanningContext() {
+      if (ownsFilterUses) filterUses->settle(std::uncaught_exceptions() == uncaught);
     }
 
     // Serial request-build memo. A query may create several Weights for
@@ -1757,6 +1765,7 @@ public:
     // descendant prepared in it (kNN top-k). Unlike ordinary predicates,
     // exclusions applied after it can change that selection.
     static constexpr int32_t CONSUMES_DOMAIN = 1 << 5;
+    static constexpr int32_t OBSERVED_FILTER_CACHE = 1 << 6;
     static constexpr int32_t IS_CONSTANT_SCORING = 1 << 1;  // every matching doc scores the same
     static constexpr int32_t PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN = 1 << 2;
     static constexpr int32_t MATCHES_ALL_DOCS = 1 << 3;     // matches every doc in the segment
@@ -1783,6 +1792,7 @@ public:
     /// True if every matching doc receives the same score. Leaf terms/phrases
     /// set this when built without NEED_SCORES; wrappers and compounds set it
     /// from their scoring semantics. Advisory: false is always safe.
+    bool observesFilterCache() const noexcept { return (traits & OBSERVED_FILTER_CACHE) != 0; }
     bool isConstantScoring() const noexcept { return (traits & IS_CONSTANT_SCORING) != 0; }
 
     bool prefersPullForSparseArrayDomain() const noexcept {

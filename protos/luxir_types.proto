@@ -2243,21 +2243,21 @@ message QueryCacheStats {
   uint64 build_attempts = 17;
   // Capacity evictions of claimed builds credited less than one production.
   uint64 unrepaid_evictions = 18;
-  // Tracked population uses whose owed work did not cover 1 + debt.
+  // Tracked population uses whose owed nanoseconds did not cover production plus debt.
   uint64 population_deferred = 19;
   uint64 assumed_charges = 20;
-  uint64 quoted_charges = 21;
+  uint64 observed_charges = 21;
   // Build time of claimed cache builds, including rejected publications,
   // in microseconds. Excludes byproducts.
   uint64 build_us = 22;
-  // Estimated saved time: each credited fraction times its reference build
-  // time, in microseconds. Assumed credits are one, not measured savings.
+  // Estimated saved time: the sum of credited nanoseconds, in microseconds.
+  // An assumed credit is the production time of the value served.
   uint64 estimated_saved_us = 23;
   // Uncredited portion of claimed builds at capacity eviction, in microseconds.
   uint64 unpaid_build_us = 24;
   uint64 assumed_credits = 25;
-  uint64 quoted_credits = 26;
-  // Current unpaid investment, weighted by each ledger's reference time.
+  uint64 observed_credits = 26;
+  // Current unpaid production time.
   // A gauge, in microseconds; reset_counters does not change it.
   uint64 outstanding_debt_us = 27;
 }
@@ -2338,12 +2338,17 @@ message CacheValueDump {
   int32 max_doc = 3;
   uint64 reader_version = 4;
   bool resident = 5;
-  double owed = 6;
-  double debt = 7;
+  double owed_us = 6;
+  double debt_us = 7;
   // Credit total for a resident payload; zero when no payload is present.
-  double credited_total = 8;
-  uint64 reference_us = 9;
+  double credited_us = 8;
+  double production_us = 9;
   uint64 reference_bytes = 10;
+  string production_source = 11; // measured | prior | unknown
+  double absent_mean_us = 12;
+  uint64 absent_count = 13;
+  double served_mean_us = 14;
+  uint64 served_count = 15;
 }
 
 // One cache key, with resident values or retained ledgers. key_text is the printable-byte extraction from

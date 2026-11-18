@@ -523,11 +523,16 @@ A segment slot or whole-reader entry, including optional payload-free ledgers.
 | <a id="field-luxir.cachevaluedump.max_doc"></a>[`max_doc`](#field-luxir.cachevaluedump.max_doc) | 3 | `int32` | singular |  |
 | <a id="field-luxir.cachevaluedump.reader_version"></a>[`reader_version`](#field-luxir.cachevaluedump.reader_version) | 4 | `uint64` | singular |  |
 | <a id="field-luxir.cachevaluedump.resident"></a>[`resident`](#field-luxir.cachevaluedump.resident) | 5 | `bool` | singular |  |
-| <a id="field-luxir.cachevaluedump.owed"></a>[`owed`](#field-luxir.cachevaluedump.owed) | 6 | `double` | singular |  |
-| <a id="field-luxir.cachevaluedump.debt"></a>[`debt`](#field-luxir.cachevaluedump.debt) | 7 | `double` | singular |  |
-| <a id="field-luxir.cachevaluedump.credited_total"></a>[`credited_total`](#field-luxir.cachevaluedump.credited_total) | 8 | `double` | singular | Credit total for a resident payload; zero when no payload is present. |
-| <a id="field-luxir.cachevaluedump.reference_us"></a>[`reference_us`](#field-luxir.cachevaluedump.reference_us) | 9 | `uint64` | singular |  |
+| <a id="field-luxir.cachevaluedump.owed_us"></a>[`owed_us`](#field-luxir.cachevaluedump.owed_us) | 6 | `double` | singular |  |
+| <a id="field-luxir.cachevaluedump.debt_us"></a>[`debt_us`](#field-luxir.cachevaluedump.debt_us) | 7 | `double` | singular |  |
+| <a id="field-luxir.cachevaluedump.credited_us"></a>[`credited_us`](#field-luxir.cachevaluedump.credited_us) | 8 | `double` | singular | Credit total for a resident payload; zero when no payload is present. |
+| <a id="field-luxir.cachevaluedump.production_us"></a>[`production_us`](#field-luxir.cachevaluedump.production_us) | 9 | `double` | singular |  |
 | <a id="field-luxir.cachevaluedump.reference_bytes"></a>[`reference_bytes`](#field-luxir.cachevaluedump.reference_bytes) | 10 | `uint64` | singular |  |
+| <a id="field-luxir.cachevaluedump.production_source"></a>[`production_source`](#field-luxir.cachevaluedump.production_source) | 11 | `string` | singular | measured \| prior \| unknown |
+| <a id="field-luxir.cachevaluedump.absent_mean_us"></a>[`absent_mean_us`](#field-luxir.cachevaluedump.absent_mean_us) | 12 | `double` | singular |  |
+| <a id="field-luxir.cachevaluedump.absent_count"></a>[`absent_count`](#field-luxir.cachevaluedump.absent_count) | 13 | `uint64` | singular |  |
+| <a id="field-luxir.cachevaluedump.served_mean_us"></a>[`served_mean_us`](#field-luxir.cachevaluedump.served_mean_us) | 14 | `double` | singular |  |
+| <a id="field-luxir.cachevaluedump.served_count"></a>[`served_count`](#field-luxir.cachevaluedump.served_count) | 15 | `uint64` | singular |  |
 
 <a id="message-luxir.calendargap"></a>
 
@@ -1933,15 +1938,15 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.querycachestats.reader_stable_retires"></a>[`reader_stable_retires`](#field-luxir.querycachestats.reader_stable_retires) | 16 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.build_attempts"></a>[`build_attempts`](#field-luxir.querycachestats.build_attempts) | 17 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.unrepaid_evictions"></a>[`unrepaid_evictions`](#field-luxir.querycachestats.unrepaid_evictions) | 18 | `uint64` | singular | Capacity evictions of claimed builds credited less than one production. |
-| <a id="field-luxir.querycachestats.population_deferred"></a>[`population_deferred`](#field-luxir.querycachestats.population_deferred) | 19 | `uint64` | singular | Tracked population uses whose owed work did not cover 1 + debt. |
+| <a id="field-luxir.querycachestats.population_deferred"></a>[`population_deferred`](#field-luxir.querycachestats.population_deferred) | 19 | `uint64` | singular | Tracked population uses whose owed nanoseconds did not cover production plus debt. |
 | <a id="field-luxir.querycachestats.assumed_charges"></a>[`assumed_charges`](#field-luxir.querycachestats.assumed_charges) | 20 | `uint64` | singular |  |
-| <a id="field-luxir.querycachestats.quoted_charges"></a>[`quoted_charges`](#field-luxir.querycachestats.quoted_charges) | 21 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.observed_charges"></a>[`observed_charges`](#field-luxir.querycachestats.observed_charges) | 21 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.build_us"></a>[`build_us`](#field-luxir.querycachestats.build_us) | 22 | `uint64` | singular | Build time of claimed cache builds, including rejected publications, in microseconds. Excludes byproducts. |
-| <a id="field-luxir.querycachestats.estimated_saved_us"></a>[`estimated_saved_us`](#field-luxir.querycachestats.estimated_saved_us) | 23 | `uint64` | singular | Estimated saved time: each credited fraction times its reference build time, in microseconds. Assumed credits are one, not measured savings. |
+| <a id="field-luxir.querycachestats.estimated_saved_us"></a>[`estimated_saved_us`](#field-luxir.querycachestats.estimated_saved_us) | 23 | `uint64` | singular | Estimated saved time: the sum of credited nanoseconds, in microseconds. An assumed credit is the production time of the value served. |
 | <a id="field-luxir.querycachestats.unpaid_build_us"></a>[`unpaid_build_us`](#field-luxir.querycachestats.unpaid_build_us) | 24 | `uint64` | singular | Uncredited portion of claimed builds at capacity eviction, in microseconds. |
 | <a id="field-luxir.querycachestats.assumed_credits"></a>[`assumed_credits`](#field-luxir.querycachestats.assumed_credits) | 25 | `uint64` | singular |  |
-| <a id="field-luxir.querycachestats.quoted_credits"></a>[`quoted_credits`](#field-luxir.querycachestats.quoted_credits) | 26 | `uint64` | singular |  |
-| <a id="field-luxir.querycachestats.outstanding_debt_us"></a>[`outstanding_debt_us`](#field-luxir.querycachestats.outstanding_debt_us) | 27 | `uint64` | singular | Current unpaid investment, weighted by each ledger's reference time. A gauge, in microseconds; reset\_counters does not change it. |
+| <a id="field-luxir.querycachestats.observed_credits"></a>[`observed_credits`](#field-luxir.querycachestats.observed_credits) | 26 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.outstanding_debt_us"></a>[`outstanding_debt_us`](#field-luxir.querycachestats.outstanding_debt_us) | 27 | `uint64` | singular | Current unpaid production time. A gauge, in microseconds; reset\_counters does not change it. |
 
 <a id="message-luxir.queryfacet"></a>
 

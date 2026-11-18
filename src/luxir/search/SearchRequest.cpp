@@ -75,6 +75,7 @@ SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
 
 // A dispatched search that never sent its final response was abandoned.
 SearchRequest::~SearchRequest() {
+  settleFilterUses(false);
   if (counting && !finalSent) count(MetricOutcome::CANCELLED, std::chrono::steady_clock::now());
 }
 
@@ -105,6 +106,13 @@ void SearchRequest::warnOnce(std::string_view code, std::string_view message) {
                       build::arenaStr(requestPool, message)});
 }
 
+void SearchRequest::settleFilterUses(bool completed) noexcept {
+  if (filterUses) filterUses->settle(completed);
+  if (scopedStates) {
+    for (auto& [path, state] : *scopedStates) state.uses->settle(completed);
+  }
+}
+
 void SearchRequest::maybeSendFinal(bool endingStream) {
   bool send;
   {
@@ -125,6 +133,7 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
     }
   }
   if (send) {
+    settleFilterUses(!lastResponse->proto.error.has_value() && !waitCancellation.stop_requested());
     // The only clock read at the end of a request: no other thread touches
     // lastResponse once finalSent is decided.
     auto end = std::chrono::steady_clock::now();

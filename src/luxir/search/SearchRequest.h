@@ -68,6 +68,7 @@ class SearchRequest : public ExecutionWarnings, public ExecutionProfileSink {
   };
   friend class SearchEngine;
   void count(MetricOutcome outcome, std::chrono::steady_clock::time_point end);
+  void settleFilterUses(bool completed) noexcept;
 
 public:
   std::stop_source waitCancellation{std::nostopstate};
