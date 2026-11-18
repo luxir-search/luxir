@@ -1221,7 +1221,8 @@ inline Query::ScorerSupplier* filterSupplier(
     int32_t sparseBatchDensityInverse = 0,
     Query::SupplierExecutionMode executionMode =
         Query::SupplierExecutionMode::ORDINARY,
-    FilterCache::Work work = FilterCache::Work::assumed()) {
+    FilterCache::Work work = FilterCache::Work::assumed(),
+    Query::Weight* rawWeight = nullptr, float cachedScore = 0.0f) {
   auto& weight = *source.weight;
   auto* prepared = source.prepared.get();
   auto* use = source.cacheUse;
@@ -1247,7 +1248,7 @@ inline Query::ScorerSupplier* filterSupplier(
       auto hit = use->accept(std::move(*candidate), work);
       DocSet* docs = executionMode == Query::SupplierExecutionMode::RAW_MEMBERSHIP
           ? hit.docSet() : use->effectiveDocSet((size_t) segment.ord, reader);
-      return targetPool.make<DocSetSupplier>(docs, segment);
+      return targetPool.make<DocSetSupplier>(docs, segment, cachedScore);
     }
   }
 
@@ -1275,10 +1276,11 @@ inline Query::ScorerSupplier* filterSupplier(
             == Query::SupplierExecutionMode::RAW_MEMBERSHIP
         ? probe.docSet()
         : use->effectiveDocSet((size_t) segment.ord, reader);
-    return targetPool.make<DocSetSupplier>(docs, segment);
+    return targetPool.make<DocSetSupplier>(docs, segment, cachedScore);
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
-    auto raw = materializeRawFilter(weight, prepared, segment);
+    auto raw = materializeRawFilter(
+        rawWeight ? *rawWeight : weight, rawWeight ? nullptr : prepared, segment);
     uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
     use->publishRaw(
         (size_t) segment.ord, probe, std::move(raw), buildCostNanos);
@@ -1291,7 +1293,8 @@ inline Query::ScorerSupplier* filterSupplier(
             mode, cost, segment.maxDoc(), sparseBatchDensityInverse)) {
       return uncached;
     }
-    auto raw = materializeRawFilter(weight, prepared, segment);
+    auto raw = materializeRawFilter(
+        rawWeight ? *rawWeight : weight, rawWeight ? nullptr : prepared, segment);
     use->adoptOwnedRaw((size_t) segment.ord, probe, std::move(raw));
   }
 
@@ -1299,7 +1302,7 @@ inline Query::ScorerSupplier* filterSupplier(
           == Query::SupplierExecutionMode::RAW_MEMBERSHIP
       ? use->rawDocSet((size_t) segment.ord)
       : use->effectiveDocSet((size_t) segment.ord, reader);
-  return targetPool.make<DocSetSupplier>(docs, segment);
+  return targetPool.make<DocSetSupplier>(docs, segment, cachedScore);
 }
 
 inline Query::ScorerSupplier* filterSupplier(
@@ -1309,13 +1312,14 @@ inline Query::ScorerSupplier* filterSupplier(
     int32_t sparseBatchDensityInverse = 0,
     Query::SupplierExecutionMode executionMode =
         Query::SupplierExecutionMode::ORDINARY,
-    FilterCache::Work work = FilterCache::Work::assumed()) {
+    FilterCache::Work work = FilterCache::Work::assumed(),
+    Query::Weight* rawWeight = nullptr, float cachedScore = 0.0f) {
   PreparedSource source;
   source.weight = &weight;
   source.cacheUse = use;
   return filterSupplier(
       targetPool, source, reader, segment, mode,
-      sparseBatchDensityInverse, executionMode, work);
+      sparseBatchDensityInverse, executionMode, work, rawWeight, cachedScore);
 }
 
 struct ExactDomainSource {

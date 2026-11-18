@@ -14,9 +14,10 @@ class ToParentQuery final : public Query {
   RowRelation& relation;
   RowReduction reduction;
 
-  static std::optional<float> uniformChildScore(Query& child, float multiplier = 1.0f);
-
 public:
+  // The score every match receives, when the tree alone fixes it exactly.
+  static std::optional<float> uniformScore(Query& query, float multiplier = 1.0f);
+
   ToParentQuery(Query* child, PlanningContext& source, RowRelation& relation, RowReduction reduction)
       : Query(QueryKind::TO_PARENT), child(child), source(source), relation(relation), reduction(reduction) {}
 
@@ -122,7 +123,7 @@ public:
       }
       auto constant = reduction.kind != RowReduction::FIXED
               && reduction.kind != RowReduction::SUM
-          ? uniformChildScore(*query.child) : std::nullopt;
+          ? uniformScore(*query.child) : std::nullopt;
       if (constant) {
         // Uniform reductions retain the child's rounding before the multiplier.
         this->multiplier = *constant * this->multiplier;

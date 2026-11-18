@@ -7826,6 +7826,14 @@ public:
 class BooleanQuery::Weight final : public Query::Weight {
   std::span<Query::Weight*> mandatoryWeights;
   std::span<uint8_t> mandatoryScores;
+  struct MandatoryCache {
+    size_t clause;
+    Query::Weight* weight;
+    Query::Weight* rawWeight;
+    FilterCache::Use* use;
+    float score;
+  };
+  std::span<MandatoryCache> mandatoryCache;
   std::span<Query::Weight*> optionalWeights;
   std::span<Query::Weight*> prohibitedWeights;
   std::span<Query::Weight*> filterWeights;
@@ -7920,6 +7928,19 @@ class BooleanQuery::Weight final : public Query::Weight {
     return {weights, queries.size()};
   }
 
+  // A required clause that scores every match the same is a filter and a
+  // constant. One that is constant only because nothing asked for its score is
+  // not: its set would be valued by the time of requests it does not govern.
+  static std::optional<float> mandatoryConstant(Query& query, Query::Weight& weight, bool contributes) {
+    if (contributes) {
+      if (!weight.isConstantScoring()) return std::nullopt;
+    } else if (!luxir::scoresUniformly(query)) {
+      return std::nullopt;
+    }
+    if (weight.matchesAllDocs() || weight.needsPrepare() || weight.consumesDomain()) return std::nullopt;
+    return contributes ? weight.constantContribution() : std::optional<float>(0.0f);
+  }
+
   void createMandatoryWeights(Context& context, std::span<Query*> queries,
                               int32_t flags, float multiplier) {
     if (queries.empty()) return;
@@ -7927,6 +7948,9 @@ class BooleanQuery::Weight final : public Query::Weight {
     mandatoryScores = context.pool.make_span<uint8_t>(queries.size());
     int32_t noScore = flags & ~NEED_SCORES;
     bool parentNeedsScores = (flags & NEED_SCORES) != 0;
+    auto* cache = context.topReader.filterCache();
+    bool cacheEnabled = !disableMandatoryCacheForTests && cache && cache->enabled();
+    size_t candidates = 0;
     for (size_t i = 0; i < queries.size(); i++) {
       bool contributes = parentNeedsScores
           && luxir::scoreProfile(*queries[i]).kind
@@ -7934,7 +7958,23 @@ class BooleanQuery::Weight final : public Query::Weight {
       mandatoryScores[i] = contributes ? 1 : 0;
       mandatoryWeights[i] = queries[i]->createWeight(
           context, contributes ? flags : noScore, multiplier);
+      if (cacheEnabled && mandatoryConstant(*queries[i], *mandatoryWeights[i], contributes)) candidates++;
     }
+    if (candidates == 0) return;
+    size_t used = 0;
+    for (size_t i = 0; i < queries.size(); i++) {
+      auto* weight = mandatoryWeights[i];
+      auto constant = mandatoryConstant(*queries[i], *weight, mandatoryScores[i] != 0);
+      if (!constant) continue;
+      auto* use = context.getFilterUse(*queries[i]);
+      if (!use) continue;
+      if (mandatoryCache.empty()) mandatoryCache = context.pool.make_span<MandatoryCache>(candidates);
+      auto* raw = !weight->needsScores() && !weight->allowsPruning() ? weight
+          : queries[i]->createWeight(context, flags & ~(NEED_SCORES | ALLOW_PRUNING), 1.0f);
+      use->observe();
+      mandatoryCache[used++] = {i, weight, raw, use, *constant};
+    }
+    mandatoryCache = mandatoryCache.first(used);
   }
 
   // The required (mandatory + filter) clauses of one segment, built but not
@@ -12591,12 +12631,22 @@ class BooleanQuery::Weight final : public Query::Weight {
   template <typename SourceAt>
   static std::span<Query::ScorerSupplier*> collectMandatorySuppliers(
       MemPool& targetPool, IndexReader::Segment& segment, size_t count,
-      SourceAt sourceAt, Query::SupplierExecutionMode executionMode) {
+      SourceAt sourceAt, Query::SupplierExecutionMode executionMode,
+      std::span<const MandatoryCache> cache, IndexReader& reader, bool allowsPruning) {
     if (count == 0) return {};
     auto suppliers = targetPool.make_span<Query::ScorerSupplier*>(count);
+    size_t next = 0;
+    auto mode = allowsPruning ? QueryPrep::FilterSupplierMode::DENSITY_ROUTED
+        : QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE;
     for (size_t i = 0; i < count; i++) {
-      suppliers[i] = sourceAt(i).scorerSupplier(
-          targetPool, segment, executionMode);
+      if (next < cache.size() && cache[next].clause == i) {
+        const auto& entry = cache[next++];
+        suppliers[i] = QueryPrep::filterSupplier(targetPool, *entry.weight, entry.use,
+            reader, segment, mode, 0, executionMode,
+            entry.use->work((size_t)segment.ord).observedOnly(), entry.rawWeight, entry.score);
+      } else {
+        suppliers[i] = sourceAt(i).scorerSupplier(targetPool, segment, executionMode);
+      }
     }
     return suppliers;
   }
@@ -12682,6 +12732,7 @@ class BooleanQuery::Weight final : public Query::Weight {
     IndexReader& reader;
     std::vector<QueryPrep::PreparedSource> mandatorySources;
     std::vector<uint8_t> mandatoryScores;
+    std::span<const MandatoryCache> mandatoryCache;
     std::vector<QueryPrep::PreparedSource> optionalSources;
     std::vector<QueryPrep::PreparedSource> prohibitedSources;
     std::vector<DomainHandle> filterDomains;
@@ -12702,6 +12753,7 @@ class BooleanQuery::Weight final : public Query::Weight {
                           IndexReader& reader,
                           std::vector<QueryPrep::PreparedSource>&& mandatorySources,
                           std::span<const uint8_t> mandatoryScores,
+                          std::span<const MandatoryCache> mandatoryCache,
                           std::vector<QueryPrep::PreparedSource>&& optionalSources,
                           std::vector<QueryPrep::PreparedSource>&& prohibitedSources,
                           std::vector<DomainHandle>&& filterDomains,
@@ -12714,7 +12766,7 @@ class BooleanQuery::Weight final : public Query::Weight {
                           ScorePolicy scorePolicy, Query::SupplierExecutionMode preparedMode)
       : filterWeights(filterWeights), reader(reader),
         mandatorySources(std::move(mandatorySources)),
-        mandatoryScores(mandatoryScores.begin(), mandatoryScores.end()),
+        mandatoryScores(mandatoryScores.begin(), mandatoryScores.end()), mandatoryCache(mandatoryCache),
         optionalSources(std::move(optionalSources)),
         prohibitedSources(std::move(prohibitedSources)),
         filterDomains(std::move(filterDomains)),
@@ -12776,7 +12828,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           targetPool, segment, mandatorySources.size(),
           [&](size_t i) -> Query::SegmentSource& {
             return mandatorySources[i].segmentSource();
-          }, executionMode);
+          }, executionMode, mandatoryCache, reader, allowsPruning);
       return makeSupplier(
         targetPool, segment, mandatorySuppliers,
         mandatoryScores,
@@ -12799,6 +12851,9 @@ class BooleanQuery::Weight final : public Query::Weight {
       for (const auto& source : optionalSources) source.releaseSegmentState(segment);
       for (const auto& source : prohibitedSources) source.releaseSegmentState(segment);
       for (auto* weight : filterWeights) weight->releaseSegmentState(segment);
+      for (const auto& entry : mandatoryCache) {
+        if (entry.rawWeight != entry.weight) entry.rawWeight->releaseSegmentState(segment);
+      }
     }
 
     bool outputIsSubsetOfDomain() const noexcept override {
@@ -13028,6 +13083,9 @@ public:
   }
 
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+    for (const auto& entry : mandatoryCache) {
+      if (entry.rawWeight != entry.weight) entry.rawWeight->releaseSegmentState(segment);
+    }
     for (auto weights : {mandatoryWeights, optionalWeights, prohibitedWeights, filterWeights}) {
       for (auto* weight : weights) {
         if (weight) weight->releaseSegmentState(segment);
@@ -13036,6 +13094,9 @@ public:
   }
 
   bool hasReleasableSegmentState() const noexcept override {
+    for (const auto& entry : mandatoryCache) {
+      if (entry.rawWeight != entry.weight && entry.rawWeight->hasReleasableSegmentState()) return true;
+    }
     for (auto weights : {mandatoryWeights, optionalWeights, prohibitedWeights, filterWeights}) {
       for (auto* weight : weights) {
         if (weight && weight->hasReleasableSegmentState()) return true;
@@ -13144,7 +13205,7 @@ public:
     }
 
     return std::make_unique<BooleanPreparedWeight>(
-      filterWeights, ctx.reader, std::move(mandatorySources), mandatoryScores,
+      filterWeights, ctx.reader, std::move(mandatorySources), mandatoryScores, mandatoryCache,
       std::move(optionalSources),
       std::move(prohibitedSources), std::move(filterDomains),
       prohibitedCacheRoutes, !filterSources.empty() || foldProhibited,
@@ -13207,7 +13268,7 @@ public:
     auto mandatorySuppliers = collectMandatorySuppliers(
         targetPool, segment, mandatoryWeights.size(),
         [&](size_t i) -> Query::SegmentSource& { return *mandatoryWeights[i]; },
-        executionMode);
+        executionMode, mandatoryCache, context.topReader, allowsPruning);
     return makeSupplier(targetPool, segment, mandatorySuppliers, mandatoryScores,
                         optionalSources,
                         prohibitedSources, prohibitedSuppliers,

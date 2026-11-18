@@ -2408,6 +2408,7 @@ Query* peelBoost(Query* query, float& boost);
 bool sameScoringClause(const Query* a, const Query* b);
 uint64_t scoringClauseHash(const Query* query);
 Query::ScoreProfile scoreProfile(const Query& query);
+bool scoresUniformly(Query& query);
 bool logicalConsumesDomain(const Query& query);
 bool canOmitWeightForCacheFirstMembership(const Query& query);
 bool exactDomainIdentity(const Query& query);

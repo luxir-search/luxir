@@ -5,6 +5,7 @@
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/NestedTestData.h"
+#include "test/QueryBuild.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/query/ProtobufQueryParser.h"
@@ -139,6 +140,46 @@ TEST_F(RowOperationsTest, limitsOffsetsSortEmptyFamiliesAndLargeFamilies) {
   CollectionHelper::UpdateBuilder merge; merge.commit(true, 1);
   ASSERT_TRUE(helper.submit(merge).success);
   check();
+}
+
+TEST_F(RowOperationsTest, cachedRequiredConstantKeepsNamedMatchingRows) {
+  SearchOverridesGuard whole(QueryPrep::disableWholeMembershipPlanForTests);
+  QueryPrep::disableWholeMembershipPlanForTests = true;
+  CollectionHelper::UpdateBuilder merge; merge.commit(true, 1);
+  ASSERT_TRUE(helper.submit(merge).success);
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
+      .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  auto request = R"JSON({"ops":{"q":{"top_docs":{
+    "get_scores":true,"count_limit":-1,"fields":["id"],"sort":[{"field":"id"}],
+    "query":{"boolean":{"required":[{"match":{"field":"id","val":"a"}},
+      {"name":"m","constant_score":{"score":3.25,"query":{
+        "to_parent":{"path":"items","score":"none","query":{"match":{"field":"color","val":"red"}}}}}}]}},
+    "row_ops":{"matched":{"domain":{"from_match":"m"},"top_docs":{
+      "get_scores":true,"count_limit":-1,"fields":["color","size"]}}}
+  }}}})JSON";
+  cache->resize(0);
+  auto off = run(request);
+  cache->resize(1024 * 1024);
+  auto cold = run(request);
+  EXPECT_EQ(glz::write_json(off["ops"]["q"]).value(), glz::write_json(cold["ops"]["q"]).value());
+  QueryPrep::disableWholeMembershipPlanForTests = false;
+  for (int i = 0; i < 2; i++) {
+    auto req = localReq(helper.getSearchEngine());
+    req->topDocs().limit(0).countLimit().rawQuery() = qb::toParent(req->mr, "items",
+        qb::match(req->mr, "color", "red"), "none");
+    req->execute(1); ASSERT_OK(req);
+  }
+  QueryPrep::disableWholeMembershipPlanForTests = true;
+  auto hits = cache->counters().hits;
+  SkipStatsScope stats;
+  auto warm = run(request);
+  EXPECT_EQ(0, SkipStats::joinChildSuppliers);
+  EXPECT_GT(cache->counters().hits, hits);
+  EXPECT_EQ(glz::write_json(off["ops"]["q"]).value(), glz::write_json(warm["ops"]["q"]).value());
+  const auto& rows = warm["ops"]["q"]["docs"][0]["matched"]["docs"].get_array();
+  ASSERT_EQ(1u, rows.size());
+  EXPECT_EQ("red", rows[0]["color"].get_string());
 }
 
 TEST_F(RowOperationsTest, namesDoNotChangeMembershipCacheOrPlanning) {

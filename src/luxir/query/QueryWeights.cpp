@@ -162,19 +162,19 @@ Query::Weight* ConstantScoreQuery::createWeight(Context& context, int32_t flags,
                                                        multiplier);
 }
 
-std::optional<float> ToParentQuery::uniformChildScore(Query& query, float multiplier) {
+std::optional<float> ToParentQuery::uniformScore(Query& query, float multiplier) {
   switch (query.getKind()) {
     case QueryKind::BOOST: {
       auto& boost = (BoostQuery&)query;
-      return uniformChildScore(*boost.getChild(), checkedBoostProduct(multiplier, boost.getBoost()));
+      return uniformScore(*boost.getChild(), checkedBoostProduct(multiplier, boost.getBoost()));
     }
     case QueryKind::FORCE_PREPARE:
-      return uniformChildScore(*((ForcePrepareQuery&)query).getChild(), multiplier);
+      return uniformScore(*((ForcePrepareQuery&)query).getChild(), multiplier);
     case QueryKind::TO_PARENT: {
       auto& join = (ToParentQuery&)query;
       if (join.reduction.kind == RowReduction::NONE) return 0.0f;
       if (join.reduction.kind == RowReduction::SUM) return std::nullopt;
-      auto child = uniformChildScore(*join.child);
+      auto child = uniformScore(*join.child);
       return child ? std::optional<float>(*child * multiplier) : std::nullopt;
     }
     case QueryKind::AUTOMATON:

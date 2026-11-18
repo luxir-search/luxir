@@ -1575,6 +1575,38 @@ protected:
   }
 };
 
+TEST_F(KnnBooleanDomainTest, residentRequiredMembershipDoesNotRestrictSiblingSelection) {
+  auto collect = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->topDocs("q").getScores().countLimit().fields({"id"});
+    auto& mr = top.mr();
+    auto range = qb::range(mr, "rank_i", qb::valI64(mr, 1), nullptr, nullptr, nullptr);
+    top.rawQuery() = qb::boolean(mr, {qb::knn(mr, "body_v", {0, 0}, 2, 0, true),
+        qb::constantScore(mr, range, 3.25f)});
+    req->execute(1); EXPECT_OK(req);
+    return std::pair(resultIds(*req), resultScores(*req));
+  };
+  cache->resize(0);
+  auto ordinary = collect();
+  EXPECT_EQ((std::vector<std::string>{"1"}), ordinary.first);
+  cache->resize(4 * 1024 * 1024);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  MemPool pool;
+  Query::Context context(pool, *reader, {}, nullptr,
+      FilterKeyContext{.schemaGen = reader->schema()->gen_, .timeZone = {}});
+  NumericPredicateQuery range("rank_i", 1, INT64_MAX);
+  auto* use = context.getFilterUse(range);
+  auto probe = use->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+  auto* weight = range.createWeight(context, 0);
+  use->publishRaw(0, probe, QueryPrep::materializeRawFilter(
+      *weight, nullptr, reader->segments()[0]), 1'000'000);
+  auto hits = cache->counters().hits;
+  auto resident = collect();
+  EXPECT_EQ(ordinary, resident);
+  EXPECT_GT(cache->counters().hits, hits);
+}
+
 TEST_F(KnnBooleanDomainTest, requiredFilterConsumerKeepsOuterDomain) {
   expect(Shape::REQUIRED_FILTER_CONSUMER, {"2", "3"});
 }

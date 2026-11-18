@@ -8,6 +8,7 @@
 #include "test/SchemaBuilder.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/query/QueryPrep.h"
+#include "luxir/query/BooleanQuery.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/query/ProtobufQueryParser.h"
 
@@ -34,6 +35,41 @@ protected:
     }
     input.commit();
     ASSERT_TRUE(helper.submit(input).success);
+  }
+
+  Query* parseQuery(LocalReq& req, const api::Query& wire, std::string_view path = "") {
+    req.reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    req.schema = req.reader->schema();
+    req.filterUses = std::make_shared<FilterCache::UseRegistry>(cache.get(), *req.reader);
+    auto view = req.pinView(path);
+    ParseView parseView(*req.schema, nullptr, &view, &req);
+    ParseContext parseContext(req.requestPool, *req.schema, req.arena,
+        CoerceContext{}, "q", nullptr, &parseView);
+    return ProtobufQueryParser(parseContext).parse(wire);
+  }
+
+  void publishSource(const api::Query& wire) {
+    fundSource("", wire);
+    auto req = localReq(helper.getSearchEngine());
+    auto* query = parseQuery(*req, wire);
+    auto* context = Query::Context::create(&req->arena, *req->createPlanningContext(*req->reader));
+    auto* use = context->getFilterUse(*query);
+    auto* weight = query->createWeight(*context, 0);
+    auto probe = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+    auto docs = QueryPrep::materializeRawFilter(*weight, nullptr, req->reader->segments()[0]);
+    use->publishRaw(0, probe, std::move(docs), 1'000'000);
+  }
+
+  void indexRangeOwners(int32_t size = 128) {
+    CollectionHelper::UpdateBuilder input;
+    for (int32_t i = 0; i < size; i++) {
+      auto json = "{\"id\":\"r" + std::to_string(i) + "\",\"tag_w\":\"common\",\"band_w\":\""
+          + (i < 3 ? "below" : i < 7 ? "at" : "other") + "\",\"rows_nested\":[{\"value_i\":"
+          + std::to_string(i % 4) + "},{\"value_i\":9}]}";
+      input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+    }
+    input.commit(true, 1); ASSERT_TRUE(helper.submit(input).success);
   }
 
   void fundSource(std::string_view path, const api::Query& wire) {
@@ -142,6 +178,219 @@ TEST_F(JoinCacheTest, bulkFallbackReusesMandatorySuppliers) {
     EXPECT_EQ(multiple ? 1 : 12, count);
     EXPECT_EQ(1, SkipStats::joinChildSuppliers);
   }
+}
+
+TEST_F(JoinCacheTest, requiredTermsRegisterNoUsesScoredOrCounted) {
+  indexRangeOwners();
+  auto req = localReq(helper.getSearchEngine());
+  auto term = qb::match(req->mr, "tag_w", "common");
+  auto* terms = parseQuery(*req, qb::boolean(req->mr, {term, qb::match(req->mr, "id", "r1")}));
+  auto* context = Query::Context::create(&req->arena, *req->createPlanningContext(*req->reader));
+  auto epoch = cache->currentEpoch();
+  auto* scored = terms->createWeight(*context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  EXPECT_NE(nullptr, scored->scorerSupplier(req->requestPool, req->reader->segments()[0]));
+  EXPECT_NE(nullptr, terms->createWeight(*context, 0)->scorerSupplier(req->requestPool, req->reader->segments()[0]));
+  EXPECT_EQ(epoch, cache->currentEpoch());
+  EXPECT_TRUE(cache->dump(100, nullptr, true).empty());
+  // A counted clause that would score a constant is the one that registers.
+  auto registered = [&](bool disabled) {
+    SearchOverridesGuard mandatory(BooleanQuery::disableMandatoryCacheForTests);
+    BooleanQuery::disableMandatoryCacheForTests = disabled;
+    auto counted = localReq(helper.getSearchEngine());
+    auto* query = parseQuery(*counted, qb::boolean(counted->mr, {qb::match(counted->mr, "tag_w", "common"),
+        qb::toParent(counted->mr, "rows_nested", qb::range(counted->mr, "value_i",
+            qb::valI64(counted->mr, 1), nullptr, qb::valI64(counted->mr, 2), nullptr), "max")}));
+    auto before = cache->currentEpoch();
+    query->createWeight(*Query::Context::create(&counted->arena, *counted->createPlanningContext(*counted->reader)), 0);
+    return cache->currentEpoch() - before;
+  };
+  auto without = registered(true);
+  EXPECT_GT(registered(false), without);
+}
+
+TEST_F(JoinCacheTest, requiredConstantsShareOwnerMembershipAndKeepTheirScores) {
+  SearchOverridesGuard whole(QueryPrep::disableWholeMembershipPlanForTests);
+  QueryPrep::disableWholeMembershipPlanForTests = true;
+  indexRangeOwners();
+  for (int variant = 0; variant < 4; variant++) for (bool requiredFirst : {false, true}) {
+    SCOPED_TRACE(variant);
+    SCOPED_TRACE(requiredFirst);
+    auto wire = localReq(helper.getSearchEngine());
+    auto join = qb::toParent(wire->mr, "rows_nested",
+        qb::range(wire->mr, "value_i", qb::valI64(wire->mr, 1), nullptr,
+            qb::valI64(wire->mr, 2), nullptr), variant == 3 ? "none" : "max");
+    if (variant == 1) join = qb::boost(wire->mr, join, 2.5f);
+    if (variant == 2) join = qb::constantScore(wire->mr, join, 3.25f);
+    auto run = [&](bool required) {
+      auto req = localReq(helper.getSearchEngine());
+      auto term = qb::match(req->mr, "tag_w", "common");
+      auto& top = req->topDocs().getScores().fields({"id"}).limit(10).countLimit();
+      top.rawQuery() = required ? qb::boolean(req->mr, {term, join})
+          : qb::boolean(req->mr, {term}, {}, {}, {join});
+      req->execute(1); EXPECT_OK(req);
+      EXPECT_EQ(64, req->getMatchCount());
+      std::vector<std::pair<std::string, float>> result;
+      auto* docs = req->docList();
+      auto ids = std::get<api::ColStr>(docs->columns.at("id").kind).v;
+      auto scores = std::get<api::ColFloat>(docs->columns.at("_score_").kind).v;
+      for (size_t i = 0; i < ids.size(); i++) result.emplace_back(ids[i], scores[i]);
+      return result;
+    };
+    cache->resize(0);
+    auto requiredOff = run(true), filteredOff = run(false);
+    cache->resize(1024 * 1024); cache->resetAdmission();
+    fundSource("", join);
+    fundSource("", join);
+    auto builds = cache->counters().builds;
+    EXPECT_EQ(requiredFirst ? requiredOff : filteredOff, run(requiredFirst));
+    EXPECT_GT(cache->counters().builds, builds);
+    SkipStatsScope stats;
+    EXPECT_EQ(requiredFirst ? filteredOff : requiredOff, run(!requiredFirst));
+    EXPECT_EQ(0, SkipStats::joinChildSuppliers);
+    for (const auto& entry : cache->dump(100, nullptr, true)) for (const auto& value : entry.values) {
+      if (value.space != SpaceOrdinal::ROOT) {
+        EXPECT_EQ(0u, value.absentCount); EXPECT_EQ(0u, value.servedCount);
+      }
+    }
+  }
+}
+
+TEST_F(JoinCacheTest, residentConstantKeepsBoundsWithSeveralScoringClauses) {
+  SearchOverridesGuard whole(QueryPrep::disableWholeMembershipPlanForTests);
+  QueryPrep::disableWholeMembershipPlanForTests = true;
+  indexRangeOwners();
+  auto wire = localReq(helper.getSearchEngine());
+  auto join = qb::boost(wire->mr, qb::toParent(wire->mr, "rows_nested",
+      qb::range(wire->mr, "value_i", qb::valI64(wire->mr, 1), nullptr,
+          qb::valI64(wire->mr, 2), nullptr), "max"), 1.3f);
+  auto run = [&](bool pruned) {
+    auto req = localReq(helper.getSearchEngine());
+    req->topDocs().getScores().fields({"id"}).limit(1).countLimit(pruned ? 1 : -1).rawQuery() =
+        qb::boolean(req->mr, {qb::match(req->mr, "tag_w", "common"),
+            qb::match(req->mr, "band_w", "at"), join});
+    req->execute(1); EXPECT_OK(req);
+    auto* docs = req->docList();
+    auto ids = std::get<api::ColStr>(docs->columns.at("id").kind).v;
+    auto scores = std::get<api::ColFloat>(docs->columns.at("_score_").kind).v;
+    EXPECT_EQ(1u, ids.size());
+    return std::pair(std::string(ids[0]), scores[0]);
+  };
+  cache->resize(0); auto ordinary = run(false);
+  cache->resize(1024 * 1024); publishSource(join);
+  for (bool pruned : {false, true}) {
+    SkipStatsScope stats;
+    auto resident = run(pruned);
+    EXPECT_EQ(ordinary.first, resident.first);
+    EXPECT_FLOAT_EQ(ordinary.second, resident.second);
+    EXPECT_EQ(0, SkipStats::joinChildSuppliers);
+  }
+}
+
+TEST_F(JoinCacheTest, scoredSumJoinKeepsItsOrdinarySourceWithResidentOwners) {
+  SearchOverridesGuard whole(QueryPrep::disableWholeMembershipPlanForTests);
+  QueryPrep::disableWholeMembershipPlanForTests = true;
+  indexRangeOwners();
+  auto run = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    auto join = qb::toParent(req->mr, "rows_nested",
+        qb::range(req->mr, "value_i", qb::valI64(req->mr, 1), nullptr,
+            qb::valI64(req->mr, 2), nullptr), "sum");
+    req->topDocs().getScores().limit(10).countLimit().rawQuery() =
+        qb::boolean(req->mr, {qb::match(req->mr, "tag_w", "common"), join});
+    req->execute(1); EXPECT_OK(req);
+    EXPECT_EQ(64, req->getMatchCount());
+    return req->getDocs();
+  };
+  cache->resize(0); auto ordinary = run();
+  cache->resize(1024 * 1024);
+  auto wire = localReq(helper.getSearchEngine());
+  publishSource(qb::toParent(wire->mr, "rows_nested",
+      qb::range(wire->mr, "value_i", qb::valI64(wire->mr, 1), nullptr,
+          qb::valI64(wire->mr, 2), nullptr), "none"));
+  SkipStatsScope stats;
+  auto resident = run();
+  EXPECT_GT(SkipStats::joinChildSuppliers, 0);
+  ASSERT_EQ(ordinary.size(), resident.size());
+  for (size_t i = 0; i < ordinary.size(); i++) EXPECT_TRUE(docEquals(ordinary[i], resident[i]));
+}
+
+TEST_F(JoinCacheTest, mandatoryResidentSourceServesPullBulkCountAndSingleton) {
+  indexRangeOwners(1024);
+  auto wire = localReq(helper.getSearchEngine());
+  for (auto word : {"below", "at"}) {
+    auto constant = qb::constantScore(wire->mr, qb::match(wire->mr, "band_w", word), 3.25f);
+    publishSource(constant);
+    for (int mode = 0; mode < 4; mode++) {
+      SCOPED_TRACE(word);
+      SCOPED_TRACE(mode);
+      auto req = localReq(helper.getSearchEngine());
+      auto term = qb::match(req->mr, "tag_w", "common");
+      auto queryWire = mode == 3 ? qb::boolean(req->mr, {constant}, {term})
+          : qb::boolean(req->mr, {term, constant});
+      auto* query = parseQuery(*req, queryWire);
+      auto* context = Query::Context::create(&req->arena, *req->createPlanningContext(*req->reader));
+      int32_t flags = mode >= 2 ? 0 : Query::NEED_SCORES | (mode == 0 ? Query::ALLOW_PRUNING : 0);
+      auto* weight = query->createWeight(*context, flags);
+      auto before = cache->counters();
+      auto& segment = req->reader->segments()[0];
+      auto* supplier = weight->scorerSupplier(req->requestPool, segment);
+      bool accepted = std::string_view(word) == "at" || mode != 0;
+      EXPECT_EQ(accepted ? 1u : 0u, cache->counters().hits - before.hits);
+      int32_t expected = std::string_view(word) == "at" ? 4 : 3;
+      if (mode == 0) {
+        auto* scorer = supplier->resolve(req->requestPool, supplier->makePlanContext(
+            Query::Demand::fromLeadCost(segment.maxDoc())))->build(req->requestPool);
+        int32_t count = 0;
+        while (scorer->next() != PostingsReader::END) { count++; EXPECT_GT(scorer->score(), 3.25f); }
+        EXPECT_EQ(expected, count);
+      } else {
+        auto use = mode == 1 ? Query::ExecutionUse::SCORED_WINDOWS : Query::ExecutionUse::COUNT_WINDOWS;
+        auto plan = supplier->planBulk(use, {});
+        ASSERT_EQ(Query::ScorerSupplier::BulkAnswer::YES, plan.available);
+        if (mode == 3) { EXPECT_NE(nullptr, supplier->exactDocSet()); }
+        if (plan.hasConstantCount()) { EXPECT_EQ(expected, plan.constantCount); continue; }
+        auto* bulk = supplier->buildBulk(req->requestPool, plan);
+        int64_t count = 0;
+        for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc();) {
+          if (mode == 1) {
+            ScoreWindow window;
+            cursor = bulk->scoreNextWindow(window, nullptr, cursor, segment.maxDoc(), 0);
+            count += window.size;
+            for (int32_t i = 0; i < window.size; i++) EXPECT_GT(window.scores[i], 3.25f);
+          } else cursor = bulk->countNextWindow(count, nullptr, nullptr, cursor, segment.maxDoc());
+        }
+        EXPECT_EQ(expected, count);
+      }
+    }
+  }
+}
+
+TEST_F(JoinCacheTest, untimedRequiredClausesDoNotFundTheirMembership) {
+  indexRangeOwners();
+  auto wire = localReq(helper.getSearchEngine());
+  auto join = qb::toParent(wire->mr, "rows_nested",
+      qb::range(wire->mr, "value_i", qb::valI64(wire->mr, 1), nullptr,
+          qb::valI64(wire->mr, 2), nullptr), "max");
+  auto run = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    auto* query = parseQuery(*req, qb::boolean(req->mr, {qb::match(req->mr, "tag_w", "common"), join}));
+    auto* context = Query::Context::create(&req->arena, *req->createPlanningContext(*req->reader));
+    auto* weight = query->createWeight(*context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    auto docs = QueryPrep::materialize(weight->scorerSupplier(req->requestPool, req->reader->segments()[0]),
+        req->requestPool, req->reader->segments()[0], nullptr);
+    EXPECT_EQ(64, docs->card());
+  };
+  for (int i = 0; i < 10; i++) run();
+  EXPECT_EQ(0u, cache->counters().assumedCharges);
+  EXPECT_EQ(0u, cache->counters().observedCharges);
+  EXPECT_EQ(0u, cache->counters().buildAttempts);
+  publishSource(join);
+  auto before = cache->counters();
+  SkipStatsScope stats;
+  run();
+  EXPECT_EQ(0, SkipStats::joinChildSuppliers);
+  EXPECT_EQ(before.buildAttempts, cache->counters().buildAttempts);
+  EXPECT_EQ(before.hits + 1, cache->counters().hits);
 }
 
 TEST_F(JoinCacheTest, residentRangeOwnerAvoidsChildSupplier) {
@@ -267,8 +516,10 @@ TEST_F(JoinCacheTest, exactDomainAttemptObservesOwnerBeforeStreamingSubOperation
 }
 
 TEST_F(JoinCacheTest, requiredUniformRangeEarnsChildMembershipAndPreservesScores) {
-  SearchOverridesGuard whole(QueryPrep::disableWholeMembershipPlanForTests);
+  SearchOverridesGuard whole(QueryPrep::disableWholeMembershipPlanForTests,
+      BooleanQuery::disableMandatoryCacheForTests);
   QueryPrep::disableWholeMembershipPlanForTests = true;
+  BooleanQuery::disableMandatoryCacheForTests = true;
   CollectionHelper::UpdateBuilder input;
   for (int i = 0; i < 128; i++) {
     auto json = "{\"id\":\"s" + std::to_string(i) + "\",\"tag_w\":\"common\","

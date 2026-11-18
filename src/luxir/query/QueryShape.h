@@ -69,6 +69,12 @@ inline bool logicalConsumesDomain(const Query& query) {
   std::unreachable();
 }
 
+// Whether every match scores the same when scores are requested.
+inline bool scoresUniformly(Query& query) {
+  return scoreProfile(query).kind != Query::ScoreProfile::Kind::VARIABLE
+      || ToParentQuery::uniformScore(query).has_value();
+}
+
 inline Query::ScoreProfile scoreProfile(const Query& query) {
   switch (query.getKind()) {
     case QueryKind::TO_PARENT:

@@ -722,6 +722,7 @@ public:
   static inline bool disableWindowDispatchForTests = false;
   static inline bool disablePartitionLatchForTests = false;
   static inline bool disableMandOptBulkForTests = false;
+  static inline bool disableMandatoryCacheForTests = false;
   // Test hook: route scored top-k queries with direct window filters through
   // the pull ConjunctionScorer instead of the window-filter bulk scorer.
   static inline bool disableFilteredScoredBulkForTests = false;

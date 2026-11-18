@@ -890,6 +890,10 @@ Search has its own limits:
   Join children and restricted exact-domain sources require timed observations
   to fund population. Outside a timed scope they serve resident values with
   assumed credit and otherwise execute without charging or claiming a build.
+  A required Boolean clause whose score is the same for every match shares
+  the set its filter spelling would use, under the same timed rule; a term or
+  phrase that is constant only because the request asked for no scores does
+  not.
   `build_us` counts claimed production, including rejected publications and
   excluding byproducts. `estimated_saved_us` sums credits; assumed and observed
   credits are estimates of savings. `unrepaid_evictions` counts capacity
