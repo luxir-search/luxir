@@ -18,6 +18,7 @@ void ReaderManager::throwClosed() {
 
 std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot, Directory& source) {
   MetricWork metric(*metrics, MetricStage::READER_REFRESH);
+  Signal::emit("indexReaderPreparing", this);
   std::lock_guard lock(indexReaderMutex);
   checkOpen();
   auto previous = indexReader.load();
@@ -33,16 +34,23 @@ void ReaderManager::publishReader(std::shared_ptr<IndexReader> reader) {
 void ReaderManager::publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened) {
   std::unique_lock lock(indexReaderMutex, std::defer_lock);
   if (opened) {
+    // A durable snapshot still publishes after close(); a closed manager
+    // serves no searches, so its reader is dropped rather than thrown on.
     lock.lock();
-    checkOpen();
     assert(opened->commitId() == snapshot->id.index_gen && opened->schema() == snapshot->schema);
-    publishReader(std::move(opened));
+    if (!isClosed()) publishReader(std::move(opened));
   }
   // Hints precede the owning state: a fast-path miss may reopen early, but
   // satisfied searches acquire only the reader and plain scalar atomics.
   lastAdvertisedCommitTime.store(snapshot->commitTime, std::memory_order_relaxed);
   publishedSchemaGen.store(snapshot->schema->gen_, std::memory_order_relaxed);
   published.store(std::move(snapshot), std::memory_order_release);
+}
+
+void ReaderManager::testSetFilterCache(std::shared_ptr<FilterCache> cache) {
+  std::lock_guard lock(indexReaderMutex);
+  filterCache = std::move(cache);
+  indexReader.store(nullptr, std::memory_order_release);
 }
 
 void ReaderManager::testReset() {
@@ -68,14 +76,22 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
     return publishedSchemaGen.load(std::memory_order_relaxed) > reader.schema()->gen_;
   };
 
-  // Fast path, no lock: the published reader is acceptable as it is, so a
-  // reopen in progress on another thread never delays this request.
+  // Fast path, no lock. Publication opens the reader before it advertises the
+  // snapshot, so this normally holds right after every commit.
   auto reader = indexReader.load(std::memory_order_acquire);
   if (reader && !stale(*reader) && !schemaChanged(*reader)) return reader;
 
-  // One thread reopens or swaps the schema; the others that need the result
-  // wait here and then find it published, so re-check under the lock.
-  const std::lock_guard<std::mutex> readerLock(indexReaderMutex);
+  // The publication-time open was skipped (a writer reopening an existing
+  // index) or failed. One thread reopens. While it does, a request the
+  // published reader still satisfies (within its freshness, only the schema
+  // lags) takes that reader instead of parking its thread; the rest wait, and
+  // are counted.
+  std::unique_lock readerLock(indexReaderMutex, std::try_to_lock);
+  if (!readerLock.owns_lock()) {
+    if (reader && !stale(*reader)) return reader;
+    MetricWork wait(*metrics, MetricStage::READER_WAIT);
+    readerLock.lock();
+  }
   reader = indexReader.load(std::memory_order_acquire);
   if (!reader || stale(*reader) || schemaChanged(*reader)) {
     MetricWork metric(*metrics, MetricStage::READER_REFRESH);

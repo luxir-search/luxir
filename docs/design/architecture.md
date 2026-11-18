@@ -39,7 +39,9 @@ Most of what follows depends on segments being immutable:
 
 - Writers never modify what readers are using. A search pins a consistent
   snapshot for its whole lifetime; new commits swap in atomically without
-  pausing queries.
+  pausing queries. The publisher (the commit, a schema update, a follower
+  install) opens the new reader before it advertises the snapshot, so
+  searches never reopen readers on their own threads in the normal path.
 - Crash safety comes from the write protocol: `Directory::sync` makes both
   file bytes and names durable before `publishFile` atomically publishes a
   durable commit point. `deleteDurably` persists removals. After a crash the

@@ -2474,6 +2474,17 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       if (ownedSegments.contains(segment.seg_id)) for (const auto& file : segment.files) retainedFiles.emplace(file.name);
     }
   }
+  // Open the reader here, on the publishing thread (the commit node or the
+  // schema caller), so searches find it on their lock-free path instead of
+  // reopening under the reader lock. Best-effort: on failure searches reopen.
+  std::shared_ptr<IndexReader> opened;
+  try {
+    if (!snapshots.readers.isClosed()) opened = snapshots.readers.prepare(*snapshot);
+  } catch (const std::exception& e) {
+    LOG_WARN("Reader open on publication failed; searches will reopen: {}", e.what());
+  } catch (...) {
+    LOG_WARN("Reader open on publication failed; searches will reopen: unknown exception");
+  }
   manifestNames.push_back(Manifest::name(info.index_gen, info.writer_epoch));
   auto failure = std::make_shared<const std::string>("snapshot publication failed");
   auto superseded = std::make_shared<const std::string>("index writer was superseded");
@@ -2522,7 +2533,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
     // first, so observing the new schema cannot admit an old-format CAS.
     if (dictionarySlots) storedDictionaries.setSchema(std::move(*dictionarySlots));
     lastSnapshot.store(snapshot);
-    snapshots.publish(snapshot);
+    snapshots.publish(snapshot, std::move(opened));
   } catch (...) {
     if (durable || stateAttempted) {
       try { throw; } catch (const WriterSupersededError&) {

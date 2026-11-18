@@ -271,7 +271,13 @@ new index view is published. `commit_within_ms` can coalesce publication and
 return before the update is visible while still bounding staleness.
 
 Search `freshness_ms` expresses how stale a reader may be; `0` requires the
-latest commit. Decide these together:
+latest commit. The commit (or schema update) opens the new reader on the
+indexing side before it publishes the view, so searches start on it without
+reopening anything and the first search after a commit costs no more than
+the others. If that open fails (logged as a warning), the first search that
+needs the view reopens it; meanwhile searches the previous reader still
+satisfies keep using it, and those that require the new view wait, counted in
+`service.reader_wait`. Decide these together:
 
 - Interactive writes that must be read immediately should use an immediate
   commit.
@@ -453,7 +459,7 @@ Two byte counts measure different things and will disagree:
 
 `service` counters are process-wide and reset on restart. Each activity
 (`operations` per transport, `search`, `index_batches`, `flush`, `commit`,
-`delete_pass`, `merge`, `vector_build`, `reader_refresh`) reports `in_flight`, completions by outcome
+`delete_pass`, `merge`, `vector_build`, `reader_refresh`, `reader_wait`) reports `in_flight`, completions by outcome
 (`ok`, `error`, `cancelled`) and a `duration` histogram. Histogram `counts` are
 cumulative, aligned with `service.request_duration_bounds` (requests, search
 execution and index batches, from 10 microseconds) or
@@ -546,7 +552,7 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
 | `luxir_stream_pauses_total` | Response backpressure events by transport. |
 | `luxir_http_connections`, `luxir_http_io_threads` | Live HTTP sessions and running connection-shard threads; the thread gauge excludes the accept thread. gRPC active calls are in `luxir_requests_in_flight`. |
-| `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, merge, vector-build, and reader-refresh stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
+| `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, delete-pass, merge, vector-build, reader-refresh (reader opens, normally on the publishing thread) and reader-wait (searches waiting for another thread's reader open) stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
 | `luxir_node_memory_budget_bytes`, `luxir_search_request_memory_limit_bytes` | Configured managed-memory budget and tracked per-search ceiling. Neither is a process RSS limit. |
 | `luxir_index_ram_*_bytes` | Indexing reservations, budget, draining reservations, pending merge demand, and retained delete packets (part of the reservations, never freed by a flush). The budget is soft; pending demand is capped at that budget when limited. |
 | `luxir_storage_ram_bytes`, `luxir_storage_ram_limit_bytes` | RAM storage consumption and its cap, separate from filesystem usage. |

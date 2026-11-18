@@ -103,18 +103,27 @@ public:
   Stats stats(bool includeSegments, bool includeFiles = true);
   void cacheStats(CacheStats& out) const;
   explicit ReaderManager(Directory& dir, FilterCacheConfig config = {});
+  // Searches take the published reader without a lock when it satisfies their
+  // freshness. Otherwise one thread reopens under indexReaderMutex; while it
+  // does, a request the published reader satisfies apart from a lagging schema
+  // takes that reader, and the rest wait (counted as READER_WAIT).
   std::shared_ptr<IndexReader> getReader(uint64_t freshness_us = 0);
   std::shared_ptr<const CommitSnapshot> snapshot() const { return published.load(); }
   std::shared_ptr<Schema> getSchema() const { return snapshot()->schema; }
-  // Opens a reader for a snapshot before it is published.
+  // Opens a reader for a snapshot before it is published, on the publisher's
+  // thread (writer commits and schema updates, follower installs).
   std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot) { return prepare(snapshot, dir); }
   std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot, Directory& source);
   // Publishes a durable snapshot. With a reader from prepare() searches switch
-  // to it now; without one, readers reopen lazily on demand (local writers).
+  // to it before the snapshot is advertised, so none of them reopens; without
+  // one (a writer reopening an existing index, a failed prepare), the first
+  // search that needs it reopens.
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
   std::string resolvedSchema();
   void close() noexcept { closed.store(true, std::memory_order_release); }
   bool isClosed() const { return closed.load(std::memory_order_acquire); }
+  // Tests only: the next search opens its reader with this cache.
+  void testSetFilterCache(std::shared_ptr<FilterCache> cache);
   // Quiescent tests only: clear the physical namespace and cache together.
   void testReset();
 };
