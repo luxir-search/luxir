@@ -16,6 +16,8 @@
 #include "luxir/api/build.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/reader/SkipStats.h"
+#include "luxir/search/FilterCache.h"
+#include "luxir/search/ops/FacetOp.h"
 #include "luxir/server/JsonRequest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -861,6 +863,148 @@ TEST_F(QueryFacetParserTest, SelectedPreparedAndStreamingBucketsWork) {
               queryRows(*request->docList("q")->ops.at("mixed")->facetResult()))
         << "selectPrepared=" << selectPrepared;
   }
+}
+
+// A query facet nested under range and terms buckets resolves each query's
+// segment membership once and intersects it with every parent bucket domain.
+// Every route must reproduce the per-domain evaluation exactly, across
+// segments, deletes, sparse and dense queries, sub-ops inside the query facet
+// and a warm filter cache.
+class NestedQueryFacetTest : public LuxirTest {
+protected:
+  struct ModelDoc {
+    int ts;
+    bool dense;
+    bool rare;
+    int price;
+    int cat;
+    bool live = true;
+  };
+
+  std::vector<ModelDoc> docs;
+
+  void index(CollectionHelper& helper) {
+    std::mt19937 random(0x9e57u);
+    for (int i = 0; i < 1200; i++) {
+      ModelDoc doc{
+        .ts = (int)(random() % 1000),
+        .dense = random() % 10 < 4,
+        .rare = random() % 97 == 0,
+        .price = (int)(random() % 100),
+        .cat = (int)(random() % 5),
+      };
+      docs.push_back(doc);
+      helper.index(
+          flatdoc("id", std::to_string(i), "ts_i", (int64_t)doc.ts,
+                  "tag_s", doc.dense ? "d" : "o", "rare_s", doc.rare ? "yes" : "no",
+                  "price_i", (int64_t)doc.price, "cat_s", "c" + std::to_string(doc.cat)),
+          i % 300 == 299 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+    }
+    std::vector<std::string> deleted;
+    for (int i = 0; i < 1200; i += 7) {
+      deleted.push_back(std::to_string(i));
+      docs[(size_t)i].live = false;
+    }
+    ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
+  }
+
+  static std::string body(std::string_view parent, bool filtered) {
+    std::string nested = R"j({"query_facet":{"buckets":{
+      "dense":"tag_s:d","sparse":"rare_s:yes","cheap":"price_i:[10 TO 40]","none":"tag_s:x"},
+      "ops":{"avg":"avg(price_i)","cats":{"field_facet":{"field":"cat_s","limit":-1}}}}})j";
+    std::string range = R"({"range_facet":{"field":"ts_i","start":0,"end":1000,"gap":25,
+      "ops":{"f":)" + nested + "}}}";
+    std::string terms = R"({"field_facet":{"field":"cat_s","limit":-1,"ops":{"f":)" + nested + "}}}";
+    std::string deep = R"({"range_facet":{"field":"ts_i","start":0,"end":1000,"gap":250,
+      "ops":{"t":)" + terms + "}}}";
+    std::string op = parent == "range" ? range : parent == "terms" ? terms : deep;
+    std::string filter = filtered ? R"j(,"filter":["price_i:[0 TO 70]"])j" : "";
+    return R"({"ops":{"q":{"top_docs":{"query":{"all":true},"limit":0)" + filter
+        + R"(,"ops":{"h":)" + op + "}}}}}";
+  }
+
+  std::string run(CollectionHelper& helper, std::string_view parent, bool filtered,
+                   QueryFacetDomainRoute route) {
+    queryFacetDomainRouteForTests = route;
+    auto restore = scope_guard([]() noexcept {
+      queryFacetDomainRouteForTests = QueryFacetDomainRoute::AUTO;
+    });
+    auto request = localReq(helper.getSearchEngine());
+    parseQueryRequest(body(parent, filtered), request->rawRequest(), request->mr);
+    request->execute();
+    EXPECT_TRUE(request->ok()) << request->errorMsg();
+    EXPECT_EQ(0u, request->memoryTracker.bytes());
+    std::string json;
+    EXPECT_TRUE(api::write_json(request->responses[0]->proto, json));
+    return json;
+  }
+
+  void expectRoutesAgree(CollectionHelper& helper) {
+    for (std::string_view parent : {"range", "terms", "deep"}) {
+      for (bool filtered : {false, true}) {
+        std::string expected = run(helper, parent, filtered, QueryFacetDomainRoute::PER_DOMAIN);
+        for (auto route : {QueryFacetDomainRoute::AUTO, QueryFacetDomainRoute::AUTO,
+                           QueryFacetDomainRoute::DOMAIN_DRIVEN, QueryFacetDomainRoute::MEMBERSHIP}) {
+          EXPECT_EQ(expected, run(helper, parent, filtered, route))
+              << parent << " filtered=" << filtered << " route=" << (int)route;
+        }
+      }
+    }
+  }
+};
+
+TEST_F(NestedQueryFacetTest, RoutesMatchPerDomainEvaluationAndOracle) {
+  CollectionHelper helper;
+  index(helper);
+  expectRoutesAgree(helper);
+
+  auto request = localReq(helper.getSearchEngine());
+  parseQueryRequest(body("range", true), request->rawRequest(), request->mr);
+  request->execute();
+  ASSERT_TRUE(request->ok()) << request->errorMsg();
+  const auto& histogram = *request->docList("q")->ops.at("h")->facetResult();
+  const auto& nested = std::get<api::ArrVal>(histogram.ops.at("f")->kind).v;
+  ASSERT_EQ(40u, nested.size());
+  for (size_t bucket = 0; bucket < nested.size(); bucket++) {
+    int64_t dense = 0, sparse = 0, cheap = 0;
+    for (const ModelDoc& doc : docs) {
+      if (!doc.live || doc.price > 70 || doc.ts / 25 != (int)bucket) continue;
+      dense += doc.dense;
+      sparse += doc.rare;
+      cheap += doc.price >= 10 && doc.price <= 40;
+    }
+    EXPECT_EQ((std::vector<std::pair<std::string, int64_t>>{
+                  {"dense", dense}, {"sparse", sparse}, {"cheap", cheap}, {"none", 0}}),
+              queryRows(std::get<api::FacetResult>(nested[bucket].kind)))
+        << "bucket=" << bucket;
+  }
+}
+
+TEST_F(NestedQueryFacetTest, CachedMembershipIsBuiltOnceAndReused) {
+  CollectionHelper helper;
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
+      .minSegmentDocs = 0, .admissionThreshold = 1});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  index(helper);
+
+  std::string expected = run(helper, "range", false, QueryFacetDomainRoute::PER_DOMAIN);
+  auto before = cache->counters();
+  EXPECT_EQ(expected, run(helper, "range", false, QueryFacetDomainRoute::MEMBERSHIP));
+  auto built = cache->counters();
+  EXPECT_GT(built.builds, before.builds);
+  EXPECT_EQ(expected, run(helper, "range", false, QueryFacetDomainRoute::MEMBERSHIP));
+  auto warm = cache->counters();
+  EXPECT_EQ(built.builds, warm.builds);
+  EXPECT_GT(warm.hits, built.hits);
+  expectRoutesAgree(helper);
+}
+
+TEST_F(NestedQueryFacetTest, RoutesMatchWithoutRequestOwnedMembership) {
+  CollectionHelper helper;
+  index(helper);
+  QueryPrep::disableFilterOwnForTests = true;
+  auto restore = scope_guard([]() noexcept { QueryPrep::disableFilterOwnForTests = false; });
+  expectRoutesAgree(helper);
 }
 
 } // namespace

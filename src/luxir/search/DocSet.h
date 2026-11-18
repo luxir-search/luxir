@@ -64,6 +64,9 @@ public:
 
   static std::unique_ptr<DocSet> intersect(std::span<DocSet*> sets);
 
+  /// |a AND b| without building the intersection. Bitsets must share a size.
+  static int64_t intersectionCard(DocSet* a, DocSet* b);
+
   /// Union two or more DocSets into a single new DocSet.  All BITSET inputs
   /// must share a size (caller's responsibility - typically all from the same
   /// segment's maxDoc).  Result is BITSET if any input is BITSET, otherwise
@@ -825,6 +828,31 @@ public:
     return std::make_unique<ArrDocSet>(std::move(docs));
   }
 };
+
+inline int64_t DocSet::intersectionCard(DocSet* a, DocSet* b) {
+  if (a == b) return a->card();
+  if (a->type == BITSET && b->type == BITSET) {
+    const FixedBitSet& x = ((BitDocSet*) a)->bits();
+    const FixedBitSet& y = ((BitDocSet*) b)->bits();
+    if (x.size() != y.size()) {
+      throw std::invalid_argument("DocSet bitset sizes differ");
+    }
+    size_t nWords = FixedBitSet::sizeInWords(x.size());
+    int64_t count = 0;
+    for (size_t word = 0; word < nWords; word++) {
+      count += std::popcount(x.words[word] & y.words[word]);
+    }
+    return count;
+  }
+  // Drive an array (the smaller one when both are) and probe the other set.
+  if (a->type != ARRAY || (b->type == ARRAY && b->card() < a->card())) {
+    std::swap(a, b);
+  }
+  DocSetProbe probe(b);
+  int64_t count = 0;
+  probe.intersect(((ArrDocSet*) a)->docs(), [&](int32_t, auto) LUXIR_INLINE { count++; });
+  return count;
+}
 
 /// Merge two or more DocSets into a single new DocSet.
 inline std::unique_ptr<DocSet> DocSet::intersect(std::span<DocSet*> sets) {

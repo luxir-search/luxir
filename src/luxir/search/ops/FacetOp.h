@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <array>
 #include <atomic>
+#include <mutex>
 #include <string_view>
 #include <vector>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -2302,33 +2304,151 @@ public:
   }
 };
 
+// Test override for how a nested bucket query meets a parent bucket domain.
+// AUTO is the production policy; PER_DOMAIN restores evaluating the query
+// against every domain (the pre-membership behavior).
+enum class QueryFacetDomainRoute : uint8_t {
+  AUTO,
+  PER_DOMAIN,
+  DOMAIN_DRIVEN,
+  MEMBERSHIP
+};
+inline QueryFacetDomainRoute queryFacetDomainRouteForTests = QueryFacetDomainRoute::AUTO;
+
 class QueryFacetReq : public FixedBucketFacetReq {
   const ReqQueryFacet& queryFacet;
   std::span<Query*> bucketQueries;
   std::span<Query::Weight*> bucketWeights;
+  // Filter-cache uses of the bucket queries of a nested (bucket child) query
+  // facet, null where a query has no cacheable identity. Empty at the top.
+  std::span<FilterCache::Use*> bucketUses;
+  // Per (bucket query, segment): parent bucket docs already evaluated
+  // domain-driven while the query's segment membership was unresolved.
+  std::unique_ptr<std::atomic<int64_t>[]> deferredDocs;
+  // Per (bucket query, segment): a membership the filter cache did not take.
+  // It is charged to the request and dropped with the segment's state
+  // (releaseSegmentState); cached memberships are pinned by their use.
+  struct OwnedMembership {
+    std::unique_ptr<DocSet> docs;
+    std::unique_ptr<DomainVariantPlan::Reservation> charge;
+  };
+  std::mutex ownedMutex;
+  std::vector<OwnedMembership> owned;
   bool preparedBuckets;
 
 public:
+  // A domain-driven doc (a scorer advance) costs about this many bulk
+  // postings decodes into a raw membership.
+  static constexpr int64_t DOMAIN_DRIVEN_DOC_COST = 32;
+
   QueryFacetReq(
       SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqQueryFacet& queryFacet,
       std::string_view facetName, std::span<Query*> bucketQueries,
-      std::span<Query::Weight*> bucketWeights)
+      std::span<Query::Weight*> bucketWeights,
+      std::span<FilterCache::Use*> bucketUses = {})
     : FixedBucketFacetReq(
           req, view, {}, facetName, 0, false, queryFacet.buckets.size(), {}),
       queryFacet(queryFacet), bucketQueries(bucketQueries),
-      bucketWeights(bucketWeights),
+      bucketWeights(bucketWeights), bucketUses(bucketUses),
       preparedBuckets(QueryPrep::anyNeedsPrepare(bucketWeights)) {
     assert(bucketQueries.size() == queryFacet.buckets.size());
     assert(bucketWeights.size() == queryFacet.buckets.size());
+    assert(bucketUses.empty() || bucketUses.size() == queryFacet.buckets.size());
+    if (!bucketUses.empty()) {
+      size_t slots = bucketUses.size() * view->segments().size();
+      deferredDocs = std::make_unique<std::atomic<int64_t>[]>(slots);
+      for (size_t i = 0; i < slots; i++) deferredDocs[i].store(0, std::memory_order_relaxed);
+      owned.resize(slots);
+    }
+  }
+
+  // How one bucket query meets one non-null parent bucket domain. A nested
+  // query facet sees a domain per parent bucket and segment, and evaluating
+  // the query against each one repeats its whole-segment work (a bulk term
+  // scorer decodes every posting before masking), so the cost grows with the
+  // parent's bucket count. MEMBERSHIP resolves the query's segment membership
+  // once through its filter-cache use (a hit, a cache build, or an owned set
+  // kept while the parent's buckets pass over the segment), and each domain
+  // then only intersects with it. A domain much sparser than the query's postings is
+  // cheaper to evaluate domain-driven; those domains accumulate per segment
+  // until their total would pay for the membership (ski rental: at most about
+  // twice the cheaper choice).
+  struct DomainEvaluation {
+    DocSet* membership = nullptr;
+    Query::ScorerSupplier* supplier = nullptr;
+    QueryPrep::MaterializeMode mode = QueryPrep::MaterializeMode::ORDINARY;
+    bool shared = false;  // false: the caller keeps its per-domain path
+  };
+
+  DomainEvaluation evaluateInDomain(size_t bucket, IndexReader::Segment& segment,
+                                    DocSet* domain, MemPool& pool) {
+    DomainEvaluation evaluation;
+    auto route = queryFacetDomainRouteForTests;
+    if (domain == nullptr || bucketUses.empty() || bucketUses[bucket] == nullptr
+        || route == QueryFacetDomainRoute::PER_DOMAIN) {
+      return evaluation;
+    }
+    auto& weight = *bucketWeights[bucket];
+    auto& use = *bucketUses[bucket];
+    assert(!weight.needsPrepare());
+    evaluation.shared = true;
+    // Domains carry liveness, so a match-all query's matches are the domain.
+    if (weight.matchesAllDocs()) {
+      evaluation.membership = domain;
+      return evaluation;
+    }
+    size_t slot = bucket * reader.segments().size() + (size_t)segment.ord;
+    if (route != QueryFacetDomainRoute::DOMAIN_DRIVEN) {
+      {
+        std::lock_guard lock(ownedMutex);
+        evaluation.membership = owned[slot].docs.get();
+      }
+      if (evaluation.membership == nullptr) {
+        evaluation.membership = use.effectiveDocSet((size_t)segment.ord, reader);
+      }
+      if (evaluation.membership != nullptr) return evaluation;
+    }
+    evaluation.supplier = weight.scorerSupplier(pool, segment);
+    if (evaluation.supplier == nullptr) return evaluation;
+    auto& deferred = deferredDocs[slot];
+    int64_t docs = deferred.load(std::memory_order_relaxed) + domain->card();
+    bool domainDriven = route == QueryFacetDomainRoute::DOMAIN_DRIVEN
+        || (route == QueryFacetDomainRoute::AUTO
+            && docs <= evaluation.supplier->cost() / DOMAIN_DRIVEN_DOC_COST);
+    if (domainDriven) {
+      deferred.store(docs, std::memory_order_relaxed);
+      evaluation.mode = QueryPrep::MaterializeMode::DOMAIN_DRIVEN;
+      return evaluation;
+    }
+    auto membership = QueryPrep::resolveFilterMembership(weight, use, reader, segment);
+    evaluation.membership = membership.docs;
+    if (membership.owned != nullptr) {
+      auto charge = std::make_unique<DomainVariantPlan::Reservation>(
+          req.memoryTracker, membership.owned->ramBytesUsed(), "query facet bucket membership");
+      std::lock_guard lock(ownedMutex);
+      owned[slot] = {std::move(membership.owned), std::move(charge)};
+    }
+    return evaluation;
   }
 
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;
     for (auto* weight : bucketWeights) weight->releaseSegmentState(segment);
+    if (!owned.empty()) {
+      std::lock_guard lock(ownedMutex);
+      for (size_t bucket = 0; bucket < bucketUses.size(); bucket++) {
+        owned[bucket * reader.segments().size() + (size_t)segment.ord] = {};
+      }
+    }
     SearchOp::releaseSegmentState(segment);
   }
 
+  // A segment membership is state every parent bucket of a block reuses, so
+  // wide blocks share it (a match-all query needs none).
   bool facetBucketSharesSegmentState() const override {
+    for (size_t bucket = 0; bucket < bucketUses.size(); bucket++) {
+      if (bucketUses[bucket] != nullptr && !bucketWeights[bucket]->matchesAllDocs()) return true;
+    }
     return std::ranges::any_of(bucketWeights, [](const auto* weight) {
              return weight->hasReleasableSegmentState();
            })
@@ -2387,6 +2507,16 @@ public:
 
     DomainHandle materializeBucket(size_t segnum, size_t bucket, DocSet* domain) {
       auto& segment = queryOp().reader.segments()[segnum];
+      auto guard = MemPool::threadLocalPoolGuard();
+      auto evaluation = queryOp().evaluateInDomain(bucket, segment, domain, guard.pool());
+      if (evaluation.shared) {
+        if (evaluation.membership != nullptr) {
+          std::array<DocSet*, 2> sets{evaluation.membership, domain};
+          return DomainHandle(DocSet::intersect(sets)).scoped(segment);
+        }
+        return DomainHandle(QueryPrep::materialize(evaluation.supplier, guard.pool(),
+            segment, domain, evaluation.mode)).scoped(segment);
+      }
       return DomainHandle(QueryPrep::materialize(
           bucketSource(bucket), segment, domain,
           Query::SupplierExecutionMode::ORDINARY,
@@ -2477,6 +2607,18 @@ public:
           if (!count) count = QueryPrep::supplierCount(obtainSupplier());
           if (count) {
             data.counts[bucket] += *count;
+            continue;
+          }
+        }
+        if (!countOnly) {
+          auto evaluation = queryOp().evaluateInDomain(bucket, segment, domain, guard.pool());
+          if (evaluation.membership != nullptr) {
+            data.counts[bucket] += DocSet::intersectionCard(evaluation.membership, domain);
+            continue;
+          }
+          if (evaluation.shared) {
+            if (evaluation.supplier != nullptr) data.counts[bucket] += QueryPrep::materialize(
+                evaluation.supplier, guard.pool(), segment, domain, evaluation.mode)->card();
             continue;
           }
         }

@@ -577,7 +577,8 @@ public:
               name, facetReq, placement, parser);
           validateQueryFacetQueries(plan);
         }
-        FacetReq* facet = createQueryFacetReq(name, facetReq, plan);
+        FacetReq* facet = createQueryFacetReq(
+            name, facetReq, plan, placement == OpsPlacement::FACET_BUCKET);
         auto* oldMeasure = inheritedFacetMeasure;
         inheritedFacetMeasure = facet->countDistinct;
         auto restore = scope_guard([&]() noexcept { inheritedFacetMeasure = oldMeasure; });
@@ -1515,7 +1516,7 @@ public:
 
   FacetReq* createQueryFacetReq(
       std::string_view facetName, const api::QueryFacet& facetReq,
-      const FacetParsePlan& plan) {
+      const FacetParsePlan& plan, bool bucketChild) {
     assert(plan.planning != nullptr);
     Query::Context* context = Query::Context::create(
         &req.arena, *plan.planning);
@@ -1524,8 +1525,19 @@ public:
     for (size_t i = 0; i < weights.size(); i++) {
       weights[i] = plan.bucketQueries[i]->createWeight(*context, 0);
     }
+    // A bucket child meets one domain per parent bucket and segment; its
+    // queries resolve their segment membership once, through the same filter
+    // cache lanes as filter clauses (QueryFacetReq::evaluateInDomain).
+    std::span<FilterCache::Use*> uses;
+    if (bucketChild && &plan.planning->topReader == view().get()) {
+      uses = req.requestPool.make_span<FilterCache::Use*>(weights.size());
+      for (size_t i = 0; i < weights.size(); i++) {
+        uses[i] = weights[i]->needsPrepare() ? nullptr
+            : plan.planning->getFilterUse(*plan.bucketQueries[i]);
+      }
+    }
     auto* facet = luxir::arenaCreate<QueryFacetReq>(
-        req.arena, req, view(), facetReq, facetName, plan.bucketQueries, weights);
+        req.arena, req, view(), facetReq, facetName, plan.bucketQueries, weights, uses);
     configureMeasure(*facet, resolveMeasure(facetReq));
     return facet;
   }

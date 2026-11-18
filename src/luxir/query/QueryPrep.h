@@ -1622,6 +1622,50 @@ inline DomainHandle materializeEffectiveFilter(
   return materializeEffectiveFilter(source, reader, segment, domain);
 }
 
+// A filter's live membership in one segment, resolved through its cache use.
+// A shared hit borrows the cached value and a claimed build publishes one;
+// both stay pinned by the use for the request. Any other outcome returns a
+// caller-owned membership (raw AND liveDocs), so the caller decides its
+// lifetime and accounting. Empty when the use cannot serve raw membership
+// (reader-stable scope, a scored or prepared weight, or owned filter values
+// disabled for tests); the caller then evaluates the weight itself.
+struct FilterMembership {
+  DocSet* docs = nullptr;
+  std::unique_ptr<DocSet> owned;
+};
+
+inline FilterMembership resolveFilterMembership(
+    Query::Weight& weight, FilterCache::Use& use, IndexReader& reader,
+    IndexReader::Segment& segment) {
+  if (use.scope() == FilterKeyScope::READER_STABLE || weight.needsPrepare()
+      || weight.needsScores() || weight.allowsPruning()) {
+    return {};
+  }
+  auto ord = (size_t) segment.ord;
+  if (DocSet* docs = use.effectiveDocSet(ord, reader)) return {docs, nullptr};
+  auto probe = use.probe(ord);
+  if (probe.kind() == FilterCache::Probe::Kind::HIT) {
+    return {use.effectiveDocSet(ord, reader), nullptr};
+  }
+  if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+    auto buildStart = std::chrono::steady_clock::now();
+    auto raw = materializeRawFilter(weight, nullptr, segment);
+    uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
+    use.publishRaw(ord, probe, std::move(raw), buildCostNanos);
+    return {use.effectiveDocSet(ord, reader), nullptr};
+  }
+  if (disableFilterOwnForTests) return {};
+  FilterMembership membership;
+  membership.owned = materializeRawFilter(weight, nullptr, segment);
+  if (segment.hasDeletes()) {
+    std::array<DocSet*, 2> sets{membership.owned.get(), segment.liveDocSet()};
+    membership.owned = DocSet::intersect(sets);
+  }
+  membership.owned->card();
+  membership.docs = membership.owned.get();
+  return membership;
+}
+
 inline std::unique_ptr<DocSet> intersectOwned(std::vector<std::unique_ptr<DocSet>>& sets) {
   if (sets.empty()) return nullptr;
   if (sets.size() == 1) return std::move(sets[0]);

@@ -167,6 +167,13 @@ public:
         || std::ranges::any_of(children, [](auto* child) {
           return child->bucketDomain != nullptr || child->needsStructuralScope;
         });
+    // Children may keep segment state that every bucket shares (a nested
+    // query facet's memberships); none of it outlives this execution.
+    auto release = scope_guard([&]() noexcept {
+      for (SearchOp* child : children) {
+        for (auto& segment : child->view->segments()) child->releaseSegmentState(segment);
+      }
+    });
     if (structural) executeRoute<true>(parent, children, buckets, reader, producer,
         bucketDomains, bindingStateBytes, input, identityDomains, selection);
     else executeRoute<false>(parent, children, buckets, reader, producer,
