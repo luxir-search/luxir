@@ -84,7 +84,7 @@ inline void lowerCopySwar(char* dst, const char* src, size_t n) {
   }
   for (; i < n; i++) {
     unsigned char c = (unsigned char) src[i];
-    dst[i] = (char) (c - 'A' < 26u ? c + 32 : c);
+    dst[i] = (char) ((unsigned) (c - 'A') < 26u ? c + 32 : c);
   }
 }
 
