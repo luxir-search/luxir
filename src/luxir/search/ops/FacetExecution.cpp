@@ -112,7 +112,7 @@ void FacetBucketBlockExecutor::executeComplete(SearchOp::Calculator& parent,
           return *sources;
         };
         routed.emplace_back(plan, plan->variants.produceBucketDomains(
-                                      reader, *plan->planning, inputs[bucket], resetBase, false,
+                                      reader, *plan->planning, inputs[bucket], resetBase, nullptr,
                                       &parent.getOp().req, tracker, sourcesFor,
                                       binding->structuralFinish(parent.getOp().view, binding->inputConstraint())));
         found = std::prev(routed.end());

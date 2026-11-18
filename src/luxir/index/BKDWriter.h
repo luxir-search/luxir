@@ -292,8 +292,8 @@ private:
     std::span<Point> left = points.first(leftPoints);
     std::span<Point> right = points.subspan(leftPoints);
     if (points.size() >= SPAWN_MIN_POINTS) {
-      TaskGroupRunner runner;
-      runner.run(true, [this, left, leftLeaves, nodeId, splitDim] {
+      FanoutScope runner(nullptr, FanoutPolicy::EVERY);
+      runner.spawn([this, left, leftLeaves, nodeId, splitDim] {
         partition(left, leftLeaves, nodeId * 2, splitDim);
       });
       partition(right, leaves - leftLeaves, nodeId * 2 + 1, splitDim);

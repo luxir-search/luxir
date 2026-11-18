@@ -82,17 +82,14 @@ One request contains:
 - `freshness_ms` and `time_zone`: request-level view/date controls.
 - `profile`: include instrumented per-segment execution details on the final
   response; string field facets are currently instrumented.
-- `max_parallel`: maximum intra-request parallelism - `1` for serial, `-1`
-  for unlimited (shared workers join in across segments and operations).
-  `0` (the default) lets the engine decide: serial, unless the operator has set
-  `search.auto-parallel-min-work` and the request visits at least that many
-  documents, in which case it runs like `-1`. Over gRPC
-  every search runs on the shared worker pool, never on the completion-queue
-  thread that received it: gRPC offers a connection's new calls to its
-  preferred completion queue first, so running queries there would
-  serialize the calls multiplexed on that connection. A serial `0` and `1`
-  therefore behave alike,
-  and `-1` fans out from a worker. Larger values are reserved.
+- `max_parallel`: `0` (the default) adaptively uses idle cores after earning
+  work credit; `1` and `-2` run serially on an arena worker; `-1` publishes every
+  sibling regardless of credit and load. Other values are rejected. Every
+  gRPC search starts on an arena worker, keeping completion queues available
+  for other calls on the same HTTP/2 connection. The adaptive grain is
+  `--search.fanout-grain-us` (default 50 us); `-1` pins `0` to serial execution.
+  `--search.fanout-sibling-grain-us` sets the minimum share with only idle SMT
+  siblings (default 1000 us); `-1` disables publication in that tier.
 
 Unlike HTTP, gRPC does not have the root `top_docs` shorthand. Populate the
 `ops` map explicitly. It also does not use HTTP's document-line

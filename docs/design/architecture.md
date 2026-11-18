@@ -84,17 +84,15 @@ response paths keep connection handling separate from long-running engine work.
   shard with the fewest live connections and the connection stays pinned to
   that shard; an idle shard parks independently and does no per-request work
   for active shards. The gRPC server runs on completion queues.
-- HTTP search work defaults to serial execution inline on the connection
-  thread that received it: cheap queries pay no scheduler handoff, and
-  request rate never wakes idle workers. A request can instead opt onto the
-  shared work-stealing scheduler (`max_parallel: 1`) so an expensive query
-  does not occupy its connection thread, or parallelize (`max_parallel:
-  -1`): it starts on the receiving thread, which enters the scheduler with
-  a slot reserved for transport threads, and idle workers steal its tasks.
-  gRPC hands every search to the scheduler instead: it offers a
-  connection's new calls to that connection's preferred completion queue
-  first, so inline execution would serialize the calls a client (a gateway,
-  say) multiplexes over one HTTP/2 connection.
+- HTTP searches with `max_parallel: 0` (the default) start inline on the
+  connection thread and adaptively publish work when credit and idle cores
+  permit. The task group and arena entry are lazy. `1` runs serially on an
+  arena worker to keep an expensive query off its connection thread. `-1`
+  publishes every sibling regardless of credit and load; `-2` runs serially
+  inline. The adaptive grain defaults to 50 us, with a 1000 us minimum share
+  when only SMT siblings are idle. `--search.fanout-grain-us=-1` pins `0` to
+  serial execution. gRPC and continuations after `min_commit` waits start on
+  arena workers for every value.
 - Ingest is streaming and incremental: NDJSON bodies are framed as bytes
   arrive and each document enters the indexing pipeline immediately - a
   document can be getting inverted while the request that carried it is

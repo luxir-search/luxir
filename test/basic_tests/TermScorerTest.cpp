@@ -4623,7 +4623,7 @@ TEST_F(TermScorerTest, mandOptBulkPreparedSourcesCanRouteToBulk) {
   BooleanQuery query(mandatory, optional, empty, empty);
   auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
   ASSERT_TRUE(weight->needsPrepare());
-  Query::Weight::PrepareContext pctx{*reader, std::span<DocSet* const>{}, false, nullptr};
+  Query::Weight::PrepareContext pctx{*reader, std::span<DocSet* const>{}, nullptr, nullptr};
   auto prepared = weight->prepare(pctx);
   auto& segment = qContext.topReader.segments()[0];
   auto* supplier = prepared->scorerSupplier(pool, segment);

@@ -117,7 +117,7 @@ std::vector<ExtraColumn> TopDocsReq::rowColumns() {
         auto placement = op.topDocsProto.document_format;
         if (placement == api::DocFormat::DEFAULT) placement = op.req.docFormatDefault;
         loadDocuments(response, target, selected, fields, result, memory,
-            {op.flags, false, placement, fields.size() + 1, 0, op.topDocsProto.get_scores, &memory},
+            {op.flags, {}, placement, fields.size() + 1, 0, op.topDocsProto.get_scores, &memory},
             [&](int64_t i) { return selectedScores[(size_t)i]; }, scratch);
         previous = bounds;
         previousValue = values[row];

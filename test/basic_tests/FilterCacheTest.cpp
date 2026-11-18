@@ -4138,7 +4138,7 @@ TEST(FilterCacheTest, preparedDomainProvenanceControlsQueryKeyPublication) {
   std::array<FilterCache::Use*, 1> canonicalUses{
       canonicalContext.getFilterUse(forcedTerm)};
   Query::Weight::PrepareContext canonicalPrepare{
-      *reader, std::span<DocSet* const>{}, false, nullptr};
+      *reader, std::span<DocSet* const>{}, nullptr, nullptr};
   auto canonical = QueryPrep::prepareFilterSources(
       canonicalWeights, canonicalUses, canonicalPrepare);
   ASSERT_EQ(1u, canonical.size());
@@ -4164,7 +4164,7 @@ TEST(FilterCacheTest, preparedDomainProvenanceControlsQueryKeyPublication) {
   std::array<FilterCache::Use*, 1> dependentUses{
       dependentContext.getFilterUse(domainDependent)};
   Query::Weight::PrepareContext dependentPrepare{
-      *reader, std::span<DocSet* const>{}, false, nullptr};
+      *reader, std::span<DocSet* const>{}, nullptr, nullptr};
   auto dependent = QueryPrep::prepareFilterSources(
       dependentWeights, dependentUses, dependentPrepare);
   ASSERT_EQ(1u, dependent.size());
@@ -4446,7 +4446,7 @@ TEST(FilterCacheTest, preparedProhibitedSourceBuildsThenHits) {
     EXPECT_TRUE(weight->needsPrepare());
     EXPECT_FALSE(weight->consumesDomain());
     Query::Weight::PrepareContext prepareContext{
-        *reader, std::span<DocSet* const>{}, false, nullptr};
+        *reader, std::span<DocSet* const>{}, nullptr, nullptr};
     auto prepared = weight->prepare(prepareContext);
     if (prepared == nullptr) {
       ADD_FAILURE() << "Boolean prohibited preparation returned null";
@@ -4841,7 +4841,7 @@ TEST(FilterCacheTest, wholeReaderPlanRejectsNestedDomainWithoutSighting) {
       nestedDomains.push_back(ownedDomains.back().get());
     }
     Query::Weight::PrepareContext prepareContext{
-        *reader, nestedDomains, /*parallel=*/false, nullptr};
+        *reader, nestedDomains, nullptr, nullptr};
     auto prepared = plan.prepareMainWeight(prepareContext);
     ASSERT_NE(nullptr, prepared);
     auto result = test::resolveWholeMembershipForTests(plan,
@@ -4862,7 +4862,7 @@ TEST(FilterCacheTest, wholeReaderPlanRejectsNestedDomainWithoutSighting) {
         QueryPrep::WholeMembershipConsumer::COUNT);
     auto rootDomains = canonicalDomains(*reader);
     Query::Weight::PrepareContext prepareContext{
-        *reader, rootDomains, /*parallel=*/false, nullptr};
+        *reader, rootDomains, nullptr, nullptr};
     EXPECT_THROW(plan.prepareMainWeight(prepareContext), std::logic_error);
   }
   EXPECT_EQ(prepares + 2,
@@ -5889,7 +5889,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
     QueryPrep::WholeMembershipPlan buildPlan(
         *buildWeight, buildUse, buildContext.filterUses);
     Query::Weight::PrepareContext buildPrepareContext{
-        *reader, domains, /*parallel=*/false, nullptr};
+        *reader, domains, nullptr, nullptr};
     auto buildPrepared = buildPlan.prepareMainWeight(buildPrepareContext);
     int64_t built = 0;
     for (auto& segment : reader->segments()) {
@@ -5915,7 +5915,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   QueryPrep::WholeMembershipPlan plan(
       *weight, use, context.filterUses);
   Query::Weight::PrepareContext prepareContext{
-      *reader, domains, /*parallel=*/false, nullptr};
+      *reader, domains, nullptr, nullptr};
   uint64_t hitsBefore = cache->counters().readerStableHits;
   auto prepared = plan.prepareMainWeight(prepareContext);
   ASSERT_NE(nullptr, prepared);

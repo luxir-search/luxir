@@ -552,6 +552,10 @@ public:
   // use a multfunction node when there is no downstream consumer (i.e. the output is dropped or can be dropped)
   // using a normal function node would cause buffering.
 
+  // The graph outlives whatever task first uses it (a collection is built
+  // inside a shared lazy build's short-lived group), so its cancellation
+  // context must not bind to that task's context as a parent.
+  tbb::task_group_context updateContext{tbb::task_group_context::isolated};
   // A flow graph runs its tasks in the arena it is constructed in, so the ctor
   // emplaces it inside the writer's arena.
   std::optional<tbb::flow::graph> updateGraph;

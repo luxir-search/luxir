@@ -37,6 +37,7 @@
 #include "Query.h"
 #include "KnnIntervalCollector.h"
 #include "KnnPlanner.h"
+#include "RaBitQScorer.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
@@ -285,6 +286,9 @@ public:
   // are identical in serial and parallel mode. Shared confidence pruning
   // can change work and rare approximate misses with scheduling. Mutable for tests.
   static inline int64_t scanTaskGrainVectors = 8192;
+  // Scores 1-bit RaBitQ through FAISS's distance computer instead of
+  // RaBitQScorer; tests compare the two.
+  static inline bool forceFaissRaBitQ = false;
 
   static constexpr float RABITQ_GATE_EPSILON = 1.9f;
   static constexpr float RABITQ_SELECTION_EPSILON = 1.9f;
@@ -1159,6 +1163,8 @@ public:
               input.codec = vaux->isRaBitQ() ? KnnPlanner::Codec::RABITQ : KnnPlanner::Codec::PQ;
               input.nlist = vaux->getNList(); input.pqM = vaux->getPqM(); input.pqBits = vaux->getPqBits();
               input.rabitqBits = vaux->getRaBitQBits();
+              input.rabitqQueryBits = query.getFieldType().ann().rabitqQueryBits;
+              input.forceFaissRaBitQ = forceFaissRaBitQ;
               input.pqPerListTable = input.codec == KnnPlanner::Codec::PQ && input.l2
                   && !VectorAuxReader::usePrecomputedTable(faiss::METRIC_L2, true,
                       input.nlist, input.pqM, 1 << input.pqBits, segCount, dims);
@@ -1458,7 +1464,7 @@ public:
       int64_t eligibleExamined = 0;
       VectorSearchRound round = VectorSearchRound::BREADTH;
       auto baseEngine = std::make_unique<CompositeVectorEngine<Groups, Owned>>(std::move(slots), ivfLiveTotal, kDocs,
-            metric, ctx.parallel, query.groups, v2dSpan, intervals, workBySeg);
+            metric, ctx.fanout, query.groups, v2dSpan, intervals, workBySeg);
       VectorEngine* engine = baseEngine.get();
       std::unique_ptr<VectorEngine> wrapperEngine;
       if (engineWrapperForTests) {
@@ -1785,7 +1791,7 @@ public:
       }
       rescoreAndCollapseCandidates<Groups, Owned>(candidateHits, intervals, reader, segInfos, v2dSpan,
           segApproxInPool, queryPtr, dims, metric, normalizeColumnOnCosineRescore,
-          selectedLimit, docHits, ctx.parallel, workBySeg, query.groups);
+          selectedLimit, docHits, ctx.fanout, workBySeg, query.groups);
       // If terminal T exceeds the witness floor, k distinct exact seeds
       // already support it. Per-unit skips also have a better exact member.
       // Thus valid intervals must leave k exact units at or above the floor.
@@ -2244,14 +2250,37 @@ public:
         }();
         std::unique_ptr<faiss::InvertedListScanner> pqScanner;
         std::vector<float> centroid;
-        if (rabitq != nullptr) centroid.resize((size_t)ivf.d);
-        else {
+        std::optional<RaBitQScorer> oneBitScorer;
+        bool multiBit = rabitq != nullptr && rabitq->rabitq.nb_bits > 1;
+        if (rabitq != nullptr) {
+          centroid.resize((size_t)ivf.d);
+          // FAISS's distance computer remains for extended codes and for the
+          // unquantized query (query bits 0).
+          if (KnnPlanner::usesScorer((int32_t)rabitq->rabitq.nb_bits, preparedQuery.queryBits, forceFaissRaBitQ))
+            oneBitScorer.emplace(ivf.d, preparedQuery.queryBits,
+                                 rabitq->rabitq.metric_type == faiss::METRIC_INNER_PRODUCT, preparedQuery.query);
+        } else {
           pqScanner.reset(ivf.get_InvertedListScanner(false, selector.get()));
           pqScanner->set_query(preparedQuery.query);
         }
         int64_t scanned = 0, extra = 0, rejected = 0, visited = 0;
-        bool multiBit = rabitq != nullptr && rabitq->rabitq.nb_bits > 1;
         bool keepMax = metric != (int32_t)api::VectorMetric::L2;
+        const float* listAmplitudes = nullptr;
+        double selectionScale = 0;
+        const faiss::idx_t* rowIds = nullptr;
+        // The candidate test after any scoring: the handler's threshold moves
+        // as results arrive, so rows are admitted strictly in order.
+        auto admit = [&](float distance, size_t row) LUXIR_INLINE {
+          if constexpr (Interval) {
+            double error = listAmplitudes[row] * selectionScale;
+            double optimistic = keepMax ? (double)distance + error : (double)distance - error;
+            if (keepMax ? optimistic <= handler.threshold : optimistic >= handler.threshold) return;
+            auto [lower, upper] = scoreInterval(distance, error, metric);
+            handler.offer(scoreFromDist(distance, metric), lower, upper, rowIds[row]);
+          } else if (keepMax ? distance > handler.threshold : distance < handler.threshold) {
+            handler.add_result(distance, rowIds[row]);
+          }
+        };
         for (size_t list = 0; list < listIds.size(); list++) {
           auto id = listIds[list];
           if (id < 0) continue;
@@ -2259,28 +2288,54 @@ public:
           faiss::InvertedLists::ScopedCodes codes(ivf.invlists, (size_t)id);
           size_t count = ivf.invlists->list_size((size_t)id);
           visited += (int64_t)count;
+          rowIds = ids.get();
           std::unique_ptr<faiss::FlatCodesDistanceComputer> distanceComputer;
           faiss::RaBitQDistanceComputer* dc = nullptr;
+          float gError = 0;
           if (rabitq != nullptr) {
             ivf.quantizer->reconstruct(id, centroid.data());
-            distanceComputer.reset(rabitq->rabitq.get_distance_computer(
-                preparedQuery.queryBits, centroid.data()));
-            distanceComputer->set_query(preparedQuery.query);
-            dc = dynamic_cast<faiss::RaBitQDistanceComputer*>(distanceComputer.get());
-            assert(dc != nullptr);
+            if (oneBitScorer) {
+              oneBitScorer->setList(centroid.data());
+              gError = oneBitScorer->queryToCentroid();
+            } else {
+              distanceComputer.reset(rabitq->rabitq.get_distance_computer(
+                  preparedQuery.queryBits, centroid.data()));
+              distanceComputer->set_query(preparedQuery.query);
+              dc = dynamic_cast<faiss::RaBitQDistanceComputer*>(distanceComputer.get());
+              assert(dc != nullptr);
+              gError = dc->g_error;
+            }
           } else pqScanner->set_list(id, centroidDists[list]);
-          const float* listAmplitudes = nullptr;
           if constexpr (Interval) listAmplitudes = amplitudes.list((size_t)id).data();
-          double gateScale = dc ? (double)dc->g_error * (RABITQ_GATE_EPSILON / 1.9f) : 0;
-          double selectionScale = dc ? (double)dc->g_error * RABITQ_SELECTION_EPSILON : 0;
+          double gateScale = (double)gError * (RABITQ_GATE_EPSILON / 1.9f);
+          selectionScale = (double)gError * RABITQ_SELECTION_EPSILON;
 
           // Keep the PQ kernel, refreshing the shared floor between blocks
           // even when no result reaches the handler. RaBitQ uses the same
           // handler after its separate 1-bit and extra-bit stages.
-          for (size_t begin = 0; begin < count; begin += 256) {
-            size_t end = std::min(count, begin + 256);
+          for (size_t begin = 0; begin < count; begin += RaBitQScorer::BLOCK_ROWS) {
+            size_t end = std::min(count, begin + RaBitQScorer::BLOCK_ROWS);
             handler.updateThreshold();
-            if (dc == nullptr) {
+            if (oneBitScorer) {
+              alignas(64) float distances[RaBitQScorer::BLOCK_ROWS];
+              const uint8_t* block = codes.get() + begin * ivf.code_size;
+              if constexpr (std::is_same_v<Probe, std::nullptr_t>) {
+                size_t rows = end - begin;
+                oneBitScorer->score(block, ivf.code_size, rows, distances);
+                scanned += (int64_t)rows;
+                for (size_t k = 0; k < rows; k++) admit(distances[k], begin + k);
+              } else {
+                uint16_t selected[RaBitQScorer::BLOCK_ROWS];
+                size_t rows = 0;
+                for (size_t k = 0; k < end - begin; k++) {
+                  selected[rows] = (uint16_t)k;
+                  rows += probe(ids[begin + k]) ? 1 : 0;
+                }
+                oneBitScorer->score(block, ivf.code_size, selected, rows, distances);
+                scanned += (int64_t)rows;
+                for (size_t k = 0; k < rows; k++) admit(distances[k], begin + selected[k]);
+              }
+            } else if (dc == nullptr) {
               if constexpr (!Interval) pqScanner->scan_codes(end - begin, codes.get() + begin * ivf.code_size,
                                     ids.get() + begin, handler);
             } else for (size_t i = begin; i < end; i++) {
@@ -2302,15 +2357,7 @@ public:
                 distance = dc->distance_to_code_full(code);
                 extra++;
               }
-              if constexpr (Interval) {
-                double error = listAmplitudes[i] * selectionScale;
-                double optimistic = keepMax ? (double)distance + error : (double)distance - error;
-                if (keepMax ? optimistic <= handler.threshold : optimistic >= handler.threshold) continue;
-                auto [lower, upper] = scoreInterval(distance, error, metric);
-                handler.offer(scoreFromDist(distance, metric), lower, upper, ids[i]);
-              } else if (keepMax ? distance > handler.threshold : distance < handler.threshold) {
-                handler.add_result(distance, ids[i]);
-              }
+              admit(distance, i);
             }
           }
           handler.flush();
@@ -2700,7 +2747,7 @@ public:
       int64_t ivfLiveTotal;
       int64_t kDocs;
       int32_t metric;
-      bool parallel;
+      FanoutScope* fanout;
 
       struct CoarseRun {
         std::vector<faiss::idx_t> listIds;
@@ -2879,11 +2926,11 @@ public:
     public:
       CompositeVectorEngine(std::vector<EngineSlot<Groups, Owned>>&& slots,
                             int64_t ivfLiveTotal, int64_t kDocs, int32_t metric,
-                            bool parallel, const CollapsePlan* groupPlan,
+                            FanoutScope* fanout, const CollapsePlan* groupPlan,
                             std::span<const Binding<Owned>> groupV2d, KnnIntervalCollector<Groups>& intervals,
                             std::span<VectorSearchWork> workBySeg) noexcept
         : intervals(intervals), groupPlan(groupPlan), groupV2d(groupV2d), slots(std::move(slots)),
-          workBySeg(workBySeg), ivfLiveTotal(ivfLiveTotal), kDocs(kDocs), metric(metric), parallel(parallel) {}
+          workBySeg(workBySeg), ivfLiveTotal(ivfLiveTotal), kDocs(kDocs), metric(metric), fanout(fanout) {}
 
       double coveredFraction() const { return std::min(1.0, allocation.cost); }
       std::vector<size_t> listsProbedBySegment() const {
@@ -2999,11 +3046,11 @@ public:
           // A new cut is a fresh epoch, including DEPTH rounds that exclude
           // the banked hits. Carrying their previous floor would starve it.
           BoundedScanCut<Groups, Owned> cut(request.candidates, groupPlan, groupV2d, request.perKey);
-          bool spawnTasks = parallel && units.size() > 1;
+          bool spawnTasks = fanout && fanout->publishesEvery() && units.size() > 1;
           if (spawnTasks) parallelScanRoundsForTests.fetch_add(1, std::memory_order_relaxed);
           std::vector<VectorSearchWork> work(units.size());
-          TaskGroupRunner runner;
-          task_group_fanout(spawnTasks ? runner.group() : nullptr, units.size(), [&](size_t i) {
+          FanoutScope runner = fanout ? fanout->child() : FanoutScope(nullptr, FanoutPolicy::EVERY);
+          task_group_fanout(spawnTasks ? &runner : nullptr, units.size(), [&](size_t i) {
             return [&, i]() { work[i] = scanUnit(units[i], request, cut); };
           });
           runner.join();
@@ -3267,7 +3314,7 @@ private:
                                            const float* queryPtr, int32_t dims, int32_t metric,
                                            bool normalizeColumnOnCosineRescore,
                                            int64_t kDocs, std::vector<DocHit>& docHits,
-                                           bool parallel, std::span<VectorSearchWork> workBySeg,
+                                           FanoutScope* fanout, std::span<VectorSearchWork> workBySeg,
                                            const CollapsePlan* groupPlan = nullptr) {
     auto rankOrder = [](const VectorEngineHit& a, const VectorEngineHit& b) {
       return a.segOrd != b.segOrd ? a.segOrd < b.segOrd : a.valueRank < b.valueRank;
@@ -3383,12 +3430,12 @@ private:
       };
       std::pmr::vector<size_t> tasks(resource), local(resource);
       for (size_t i = 0; i < buckets.size(); i++) {
-        if (parallel && ((int64_t)(buckets[i].second - buckets[i].first) >= rescoreTaskGrainCandidates
+        if (fanout && fanout->publishesEvery() && ((int64_t)(buckets[i].second - buckets[i].first) >= rescoreTaskGrainCandidates
                          || i + 1 == buckets.size())) tasks.push_back(i);
         else local.push_back(i);
       }
-      TaskGroupRunner runner;
-      task_group_fanout(tasks.size() > 1 ? runner.group() : nullptr, tasks.size(),
+      FanoutScope runner = fanout ? fanout->child() : FanoutScope(nullptr, FanoutPolicy::EVERY);
+      task_group_fanout(tasks.size() > 1 ? &runner : nullptr, tasks.size(),
                        [&](size_t i) { return readBucket(tasks[i]); });
       for (size_t i : local) readBucket(i)();
       runner.join();
