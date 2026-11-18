@@ -228,6 +228,7 @@ void fillQueryCacheStats(api::QueryCacheStats& dst, const ReaderManager::CacheSt
   dst.build_attempts = src.filterCacheCounters.buildAttempts;
   dst.unrepaid_evictions = src.filterCacheCounters.unrepaidEvictions;
   dst.population_deferred = src.filterCacheCounters.populationDeferred;
+  dst.capacity_deferred = src.filterCacheCounters.capacityDeferred;
   dst.assumed_charges = src.filterCacheCounters.assumedCharges;
   dst.observed_charges = src.filterCacheCounters.observedCharges;
   dst.build_us = src.filterCacheCounters.buildNanos / 1000;
@@ -468,6 +469,7 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
     shardControl.entries_resident = resident;
     shardControl.recent_work_epochs = cache->configuration().recentWorkEpochs;
     shardControl.last_refresh_epoch = cache->lastRefreshEpoch();
+    shardControl.current_epoch = cache->currentEpoch();
     auto* dumped = api::build::allocArray(shardControl.entries, rows.size(), resource);
     for (std::size_t r = 0; r < rows.size(); r++) {
       const auto& row = rows[r];
@@ -507,6 +509,10 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
         values[v].reference_bytes = value.referenceBytes;
         values[v].recent_us = value.recent / 1000;
         values[v].recent_epochs = value.recentEpochs;
+        values[v].work_us = value.work / 1000;
+        values[v].residency_bytes = value.residencyBytes;
+        values[v].ranked_rate_us_per_epoch = value.rankedRate / 1000;
+        values[v].spoken_for = value.spokenFor;
       }
     }
   }

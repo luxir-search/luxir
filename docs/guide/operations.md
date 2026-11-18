@@ -860,7 +860,12 @@ Search has its own limits:
   A lazy refresh under capacity pressure covers at least 4,096 cache activity
   epochs, including ordinary uses and shared serves over the same interval.
   Payload sweeps stop when values fit the budget; only metadata retains a low
-  watermark. Activity excludes idle wall time, and admission is unchanged.
+  watermark. Activity excludes idle wall time.
+  A funded build that needs eviction must rank above its victims and earn more
+  than they do by its production cost over one activity window; equality keeps
+  the resident.
+  A key with a smaller advantage is not built while the cache is full.
+  First builds with unknown production or size remain measurement experiments.
   Cache counters appear in `_stats?collections=true` (and on the collection
   and tenant `_stats` routes). Date ranges with an unrounded `NOW` bound are
   never cached; see [Dates](dates.md#date-math).
@@ -887,7 +892,9 @@ Search has its own limits:
   unpaid time. `population_deferred` counts tracked population uses below the
   ledger threshold, once per request and value unit. `assumed_charges`,
   `observed_charges`, `assumed_credits` and `observed_credits` count ledger events
-  by source. `outstanding_debt_us` sums unpaid investment and survives counter
+  by source. `capacity_deferred` counts funded uses refused by the capacity
+  comparison, once per request and value unit, separately from funding
+  deferrals. `outstanding_debt_us` sums unpaid investment and survives counter
   resets. Prometheus time counters use seconds and corresponding
   `luxir_filter_cache_*_seconds_total` names; outstanding debt uses
   `luxir_filter_cache_outstanding_debt_seconds`.
@@ -895,7 +902,9 @@ Search has its own limits:
   `production_us`, its `production_source` (measured, prior or unknown),
   `absent_mean_us`/`absent_count`, `served_mean_us`/`served_count`, and reference
   bytes, plus `recent_us` and its `recent_epochs` interval. The shard reports
-  `recent_work_epochs` and `last_refresh_epoch`. `include_ghosts` includes
+  `recent_work_epochs`, `last_refresh_epoch` and `current_epoch`. Values also
+  report `work_us`, `residency_bytes`, `ranked_rate_us_per_epoch` and `spoken_for`
+  to inspect pending work and frozen victim prices. `include_ghosts` includes
   retained ledgers without a payload.
   A flush drops values and metadata, including ledgers, while keeping sightings,
   so a known query is readmitted immediately; unpriced uses rebuild immediately. Flush with

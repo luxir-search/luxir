@@ -352,6 +352,7 @@ struct QueryCacheStats {
   uint64_t build_attempts = 0;
   uint64_t unrepaid_evictions = 0;
   uint64_t population_deferred = 0;
+  uint64_t capacity_deferred = 0;
   uint64_t assumed_charges = 0;
   uint64_t observed_charges = 0;
   uint64_t build_us = 0;
@@ -819,6 +820,10 @@ struct CacheValueDump {
   uint64_t served_count = 0;
   double recent_us = 0;
   uint64_t recent_epochs = 0;
+  double work_us = 0;
+  double residency_bytes = 0;
+  double ranked_rate_us_per_epoch = 0;
+  bool spoken_for = false;
   uint32_t space = 0;
   int32_t max_doc = 0;
   bool resident = false;
@@ -840,6 +845,7 @@ struct ShardCacheControl {                                      // needs QueryCa
   uint64_t entries_resident = 0;
   uint64_t recent_work_epochs = 0;
   uint64_t last_refresh_epoch = 0;
+  uint64_t current_epoch = 0;
   std::span<const CacheEntryDump> entries;
   uint32_t shard_id = 0;
 };

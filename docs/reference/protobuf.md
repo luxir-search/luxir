@@ -533,6 +533,10 @@ A segment slot or whole-reader entry, including optional payload-free ledgers.
 | <a id="field-luxir.cachevaluedump.served_count"></a>[`served_count`](#field-luxir.cachevaluedump.served_count) | 15 | `uint64` | singular |  |
 | <a id="field-luxir.cachevaluedump.recent_us"></a>[`recent_us`](#field-luxir.cachevaluedump.recent_us) | 16 | `double` | singular |  |
 | <a id="field-luxir.cachevaluedump.recent_epochs"></a>[`recent_epochs`](#field-luxir.cachevaluedump.recent_epochs) | 17 | `uint64` | singular |  |
+| <a id="field-luxir.cachevaluedump.work_us"></a>[`work_us`](#field-luxir.cachevaluedump.work_us) | 18 | `double` | singular |  |
+| <a id="field-luxir.cachevaluedump.residency_bytes"></a>[`residency_bytes`](#field-luxir.cachevaluedump.residency_bytes) | 19 | `double` | singular |  |
+| <a id="field-luxir.cachevaluedump.ranked_rate_us_per_epoch"></a>[`ranked_rate_us_per_epoch`](#field-luxir.cachevaluedump.ranked_rate_us_per_epoch) | 20 | `double` | singular |  |
+| <a id="field-luxir.cachevaluedump.spoken_for"></a>[`spoken_for`](#field-luxir.cachevaluedump.spoken_for) | 21 | `bool` | singular |  |
 
 <a id="message-luxir.calendargap"></a>
 
@@ -1947,6 +1951,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.querycachestats.assumed_credits"></a>[`assumed_credits`](#field-luxir.querycachestats.assumed_credits) | 25 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.observed_credits"></a>[`observed_credits`](#field-luxir.querycachestats.observed_credits) | 26 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.outstanding_debt_us"></a>[`outstanding_debt_us`](#field-luxir.querycachestats.outstanding_debt_us) | 27 | `uint64` | singular | Current unpaid production time. A gauge, in microseconds; reset\_counters does not change it. |
+| <a id="field-luxir.querycachestats.capacity_deferred"></a>[`capacity_deferred`](#field-luxir.querycachestats.capacity_deferred) | 28 | `uint64` | singular | Funded population uses refused by the capacity comparison, once per request and value unit. |
 
 <a id="message-luxir.queryfacet"></a>
 
@@ -2405,6 +2410,7 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.shardcachecontrol.entries_resident"></a>[`entries_resident`](#field-luxir.shardcachecontrol.entries_resident) | 4 | `uint64` | singular | uncapped resident-entry count at dump time |
 | <a id="field-luxir.shardcachecontrol.recent_work_epochs"></a>[`recent_work_epochs`](#field-luxir.shardcachecontrol.recent_work_epochs) | 5 | `uint64` | singular | minimum observation interval |
 | <a id="field-luxir.shardcachecontrol.last_refresh_epoch"></a>[`last_refresh_epoch`](#field-luxir.shardcachecontrol.last_refresh_epoch) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.shardcachecontrol.current_epoch"></a>[`current_epoch`](#field-luxir.shardcachecontrol.current_epoch) | 7 | `uint64` | singular |  |
 
 <a id="message-luxir.shardstats"></a>
 

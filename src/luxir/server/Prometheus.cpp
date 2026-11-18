@@ -149,6 +149,7 @@ void cache(Renderer& r, const api::QueryCacheStats& c, const std::string& labels
       {"admissions", c.admissions}, {"publish_rejects", c.publish_rejects}, {"oversized_key_bypasses", c.oversized_key_bypasses},
       {"build_attempts", c.build_attempts}, {"byproduct_inserts", c.byproduct_inserts},
       {"unrepaid_evictions", c.unrepaid_evictions}, {"population_deferred", c.population_deferred},
+      {"capacity_deferred", c.capacity_deferred},
       {"assumed_charges", c.assumed_charges}, {"observed_charges", c.observed_charges},
       {"assumed_credits", c.assumed_credits}, {"observed_credits", c.observed_credits},
       {"reader_stable_hits", c.reader_stable_hits}, {"reader_stable_refreshes", c.reader_stable_refreshes},

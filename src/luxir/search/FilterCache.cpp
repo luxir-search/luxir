@@ -402,19 +402,23 @@ void FilterCache::Use::creditReaderStable(Work work) {
   if (value) cache->creditValue(entry->ledger, *value, work);
 }
 
-void FilterCache::Use::deferPopulation(size_t segmentOrd) {
+void FilterCache::Use::deferPopulation(size_t segmentOrd, Deferral reason) {
   auto& slot = requestSlots[segmentOrd];
   std::lock_guard<std::mutex> lock(slot.mutex);
   if (slot.accounting.deferred) return;
   slot.accounting.deferred = true;
-  cache->counter.populationDeferred.fetch_add(1, std::memory_order_relaxed);
+  auto& counter = reason == Deferral::FUNDING
+      ? cache->counter.populationDeferred : cache->counter.capacityDeferred;
+  counter.fetch_add(1, std::memory_order_relaxed);
 }
 
-void FilterCache::Use::deferReaderPopulation() {
+void FilterCache::Use::deferReaderPopulation(Deferral reason) {
   std::lock_guard<std::mutex> lock(readerStateMutex);
   if (readerAccounting.deferred) return;
   readerAccounting.deferred = true;
-  cache->counter.populationDeferred.fetch_add(1, std::memory_order_relaxed);
+  auto& counter = reason == Deferral::FUNDING
+      ? cache->counter.populationDeferred : cache->counter.capacityDeferred;
+  counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 void FilterCache::acceptSharedHit(
@@ -637,16 +641,28 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Work work, Populat
     chargeLedger(slot->ledger, requestSlot.accounting, requestSlot.mutex, work);
   }
   slot->ledger.observed |= !work.isAssumed();
-  if ((!work.known() && slot->ledger.owed <= 0)
-      || !slot->ledger.canPopulate(cache->productionNanos(slot->ledger, slot->maxDoc, !work.isAssumed()))) {
+  double production = cache->productionNanos(slot->ledger, slot->maxDoc, !work.isAssumed());
+  if ((!work.known() && slot->ledger.owed <= 0) || !slot->ledger.canPopulate(production)) {
     deferPopulation(segmentOrd);
     return bypass();
   }
 
+  size_t bytes = slot->ledger.referenceBytes ? slot->ledger.referenceBytes
+      : sizeof(RAMBitDocSet) + FixedBitSet::sizeInWords(slot->maxDoc) * sizeof(uint64_t);
+  ledgerLock.unlock();
+  if (!cache->capacityAllows(*entry, slot->ledger, bytes, production)) {
+    deferPopulation(segmentOrd, Deferral::CAPACITY);
+    return bypass();
+  }
   bool expected = false;
   if (!slot->building.compare_exchange_strong(
           expected, true, std::memory_order_acq_rel,
           std::memory_order_relaxed)) {
+    return bypass();
+  }
+  // The comparison ran without the slot's lock; a build may have finished since.
+  if (slot->value.load(std::memory_order_acquire) != nullptr) {
+    slot->building.store(false, std::memory_order_release);
     return bypass();
   }
   {
@@ -776,14 +792,26 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
 
   ordinaryReaderUse(true);
   if (work.known()) chargeLedger(localEntry->ledger, readerAccounting, readerStateMutex, work);
-  if (!localEntry->ledger.canPopulate(cache->productionNanos(localEntry->ledger, 0, false))) {
+  double production = cache->productionNanos(localEntry->ledger, 0, false);
+  if (!localEntry->ledger.canPopulate(production)) {
     deferReaderPopulation();
+    return {};
+  }
+  size_t bytes = localEntry->ledger.referenceBytes;
+  ledgerLock.unlock();
+  if (!cache->capacityAllows(*localEntry, localEntry->ledger, bytes, production)) {
+    deferReaderPopulation(Deferral::CAPACITY);
     return {};
   }
   bool expected = false;
   if (!localEntry->readerBuilding.compare_exchange_strong(
           expected, true, std::memory_order_acq_rel,
           std::memory_order_relaxed)) {
+    return {};
+  }
+  value = localEntry->readerValue.load(std::memory_order_acquire);
+  if (value != nullptr && value->readerVersion() == readerVersion) {
+    localEntry->readerBuilding.store(false, std::memory_order_release);
     return {};
   }
   cache->counter.buildAttempts.fetch_add(1, std::memory_order_relaxed);
@@ -1290,6 +1318,7 @@ void FilterCache::resize(size_t maxBytes) {
     {
       std::lock_guard<std::mutex> lock(residentsMutex);
       residentsReady = false;
+      residentsVersion.fetch_add(1, std::memory_order_release);
       residents.clear();
     }
     if (maxBytes < old || residentBytes.load(std::memory_order_relaxed) > maxBytes) {
@@ -2000,6 +2029,7 @@ bool FilterCache::onReaderPublished(
     std::lock_guard<std::mutex> lock(residentsMutex);
     residents.clear();
     residentsReady = false;
+    residentsVersion.fetch_add(1, std::memory_order_release);
   }
   maybeSweep();
   return true;
@@ -2027,6 +2057,67 @@ void FilterCache::maybeSweep() {
   }
 }
 
+bool FilterCache::capacityAllows(const FilterEntry& entry, Ledger& ledger, size_t bytes, double production) {
+  // The byte budget counts payloads; retain its exact free-space fast path.
+  auto fits = [&] {
+    size_t used = residentBytes.load(std::memory_order_relaxed);
+    size_t budget = budgetBytes();
+    return used <= budget && bytes <= budget - used;
+  };
+  if (bytes == 0 || production < 0 || fits()) return true;
+  uint64_t now = currentEpoch();
+  {
+    std::lock_guard<Ledger> lock(ledger);
+    if (ledger.refusedVersion == residentsVersion.load(std::memory_order_acquire)
+        && now - lastRefreshEpoch() < config.recentWorkEpochs
+        && ledger.recent + ledger.work <= ledger.refusedWork) return false;
+  }
+  std::lock_guard<std::mutex> listLock(residentsMutex);
+  Signal::emit("filterCacheCapacityCompared", this);
+  if (fits()) return true;
+  refreshResidents();
+  std::lock_guard<Ledger> lock(ledger);
+  double required = (double)bytes + (double)residentBytes.load(std::memory_order_relaxed)
+      - (double)budgetBytes();
+  double victims = 0;
+  double outranked = 0;
+  auto end = residents.begin();
+  while (end != residents.end() && required > 0) {
+    if (!end->spokenFor) {
+      double size = 0;
+      size_t payload = 0;
+      if (auto slot = end->slot.lock()) {
+        if (auto value = end->segment.lock(); value && slot->value.load(std::memory_order_acquire) == value) {
+          size = value->residencyBytes;
+          payload = value->ramBytesUsed();
+        }
+      } else if (auto owner = end->entry.lock()) {
+        if (auto value = end->reader.lock(); value && owner->readerValue.load(std::memory_order_acquire) == value) {
+          size = value->residencyBytes;
+          payload = value->ramBytesUsed();
+        }
+      }
+      required -= payload;
+      victims += end->priority * size;
+      if (payload) outranked = end->priority;
+    }
+    ++end;
+  }
+  // The sweep evicts in list order, so the value must also rank above what it displaces.
+  outranked *= effectiveValueBytes(entry, bytes, residentValueCount(entry) + 1);
+  uint64_t sinceRoll = currentEpoch() - lastRefreshEpoch();
+  double rate = ledger.rate(sinceRoll, config.recentWorkEpochs);
+  if (required <= 0 && rate >= outranked && (rate - victims) * config.recentWorkEpochs > production) {
+    for (auto it = residents.begin(); it != end; ++it) it->spokenFor = true;
+    return true;
+  }
+  ledger.refusedVersion = residentsVersion.load(std::memory_order_relaxed);
+  ledger.refusedWork = required > 0 ? std::numeric_limits<double>::infinity()
+      : std::max(outranked, victims + production / config.recentWorkEpochs)
+          * std::max(config.recentWorkEpochs, ledger.recentEpochs + sinceRoll);
+  return false;
+}
+
 void FilterCache::rememberResident(const std::shared_ptr<FilterEntry>& entry,
     const std::shared_ptr<SegmentSlot>& slot,
     const std::shared_ptr<const SegmentValue>& segment,
@@ -2049,6 +2140,8 @@ void FilterCache::refreshResidents() {
   uint64_t elapsed = now - refreshEpoch.load(std::memory_order_relaxed);
   bool roll = elapsed >= config.recentWorkEpochs;
   if (residentsReady && !roll) return;
+  // Invalidate refusals before any ledger rolls into the new list state.
+  residentsVersion.fetch_add(1, std::memory_order_release);
   // Rebuilding identities does not complete an observation interval early.
   residents.clear();
   entries.cvisit_all([&](const auto& item) {
@@ -2135,6 +2228,7 @@ void FilterCache::sweep() {
           // A list that no longer names what is resident is rebuilt once.
           if (rebuilt) break;
           residentsReady = false;
+          residentsVersion.fetch_add(1, std::memory_order_release);
           rebuilt = true;
         }
       }
@@ -2228,6 +2322,7 @@ void FilterCache::sweepMetadata() {
     std::lock_guard<std::mutex> lock(residentsMutex);
     residents.clear();
     residentsReady = false;
+    residentsVersion.fetch_add(1, std::memory_order_release);
   }
 }
 
@@ -2267,6 +2362,7 @@ void FilterCache::clear() {
   std::lock_guard<std::mutex> lock(residentsMutex);
   std::vector<Resident>{}.swap(residents);
   residentsReady = false;
+  residentsVersion.fetch_add(1, std::memory_order_release);
 }
 
 void FilterCache::resetAdmission() {
@@ -2288,6 +2384,7 @@ void FilterCache::resetCounters() {
   counter.evictions.store(0, std::memory_order_relaxed);
   counter.unrepaidEvictions.store(0, std::memory_order_relaxed);
   counter.populationDeferred.store(0, std::memory_order_relaxed);
+  counter.capacityDeferred.store(0, std::memory_order_relaxed);
   counter.assumedCharges.reset();
   counter.observedCharges.reset();
   counter.assumedCredits.reset();
@@ -2313,6 +2410,7 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
     const FilterKey& key = item.first;
     const std::shared_ptr<FilterEntry>& entry = item.second;
     EntryDump row;
+    size_t valueCount = residentValueCount(*entry) + 1;
     auto addLedger = [&](Ledger& ledger, ValueDump value) {
       std::lock_guard<Ledger> lock(ledger);
       if (!value.resident && !includeGhosts) return;
@@ -2328,6 +2426,10 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
       value.referenceBytes = ledger.referenceBytes;
       value.recent = ledger.recent;
       value.recentEpochs = ledger.recentEpochs;
+      value.work = ledger.work;
+      if (!value.resident && ledger.referenceBytes) {
+        value.residencyBytes = effectiveValueBytes(*entry, ledger.referenceBytes, valueCount);
+      }
       row.values.push_back(value);
     };
     auto readerValue = entry->readerValue.load(std::memory_order_acquire);
@@ -2335,7 +2437,9 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
       row.readerValue = true;
       addLedger(entry->ledger, {.readerVersion = readerValue == nullptr ? 0 : readerValue->readerVersion(),
           .resident = readerValue != nullptr,
-          .creditedTotal = readerValue == nullptr ? 0 : readerValue->creditedTotal.load(std::memory_order_relaxed)});
+          .creditedTotal = readerValue == nullptr ? 0 : readerValue->creditedTotal.load(std::memory_order_relaxed),
+          .residencyBytes = readerValue == nullptr ? 0 : readerValue->residencyBytes,
+          .published = readerValue == nullptr ? 0 : readerValue->published});
     }
     if (readerValue != nullptr) {
       row.readerValue = true;
@@ -2347,7 +2451,9 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
       auto value = slot->value.load(std::memory_order_acquire);
       addLedger(slot->ledger, {.segId = slot->segId, .maxDoc = slot->maxDoc, .space = slot->space,
           .resident = value != nullptr,
-          .creditedTotal = value == nullptr ? 0 : value->creditedTotal.load(std::memory_order_relaxed)});
+          .creditedTotal = value == nullptr ? 0 : value->creditedTotal.load(std::memory_order_relaxed),
+          .residencyBytes = value == nullptr ? 0 : value->residencyBytes,
+          .published = value == nullptr ? 0 : value->published});
       if (value == nullptr) continue;
       row.segmentsResident++;
       row.bytes += value->ramBytesUsed();
@@ -2388,6 +2494,18 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
     return a.bytes > b.bytes;
   });
   if (rows.size() > limit) rows.resize(limit);
+  std::unordered_map<uint64_t, ValueDump*> values;
+  for (auto& row : rows) for (auto& value : row.values) {
+    if (value.published) values.emplace(value.published, &value);
+  }
+  std::lock_guard<std::mutex> lock(residentsMutex);
+  for (const auto& resident : residents) {
+    auto it = values.find(resident.published);
+    if (it == values.end()) continue;
+    auto& value = *it->second;
+    value.rankedRate = resident.priority * value.residencyBytes;
+    value.spokenFor = resident.spokenFor;
+  }
   return rows;
 }
 
@@ -2408,6 +2526,7 @@ FilterCache::CounterValues FilterCache::counters() const {
           std::memory_order_relaxed),
       .populationDeferred = counter.populationDeferred.load(
           std::memory_order_relaxed),
+      .capacityDeferred = counter.capacityDeferred.load(std::memory_order_relaxed),
       .purges = counter.purges.load(std::memory_order_relaxed),
       .oversizedKeyBypasses = counter.oversizedKeyBypasses.load(
           std::memory_order_relaxed),

@@ -2260,6 +2260,8 @@ message QueryCacheStats {
   // Current unpaid production time.
   // A gauge, in microseconds; reset_counters does not change it.
   uint64 outstanding_debt_us = 27;
+  // Funded population uses refused by the capacity comparison, once per request and value unit.
+  uint64 capacity_deferred = 28;
 }
 
 // Indexing RAM budget: the configured limit and the bytes reserved against it.
@@ -2351,6 +2353,10 @@ message CacheValueDump {
   uint64 served_count = 15;
   double recent_us = 16;
   uint64 recent_epochs = 17;
+  double work_us = 18;
+  double residency_bytes = 19;
+  double ranked_rate_us_per_epoch = 20;
+  bool spoken_for = 21;
 }
 
 // One cache key, with resident values or retained ledgers. key_text is the printable-byte extraction from
@@ -2379,6 +2385,7 @@ message ShardCacheControl {
   uint64 entries_resident = 4;  // uncapped resident-entry count at dump time
   uint64 recent_work_epochs = 5; // minimum observation interval
   uint64 last_refresh_epoch = 6;
+  uint64 current_epoch = 7;
 }
 
 message CollectionCacheControl {

@@ -1081,6 +1081,7 @@ TEST(FilterCacheTest, segmentCandidatePinsAcrossDetachAndDeduplicatesAcceptance)
   EXPECT_EQ(docs, use->probe(0).docSet());
   EXPECT_EQ(docs, use->accept(std::move(*second)).docSet());
   EXPECT_EQ(before, cache.counters());
+  cache.resize(charge * 2);
   FilterCache::UseRegistry next(cache, 1, segments);
   EXPECT_EQ(FilterCache::Probe::Kind::BUILD, next.get(key)->probe(0).kind());
   cache.validateForTest();
@@ -1478,6 +1479,7 @@ TEST(FilterCacheTest, existingAcceptancePaysDetachedInvestment) {
   ASSERT_NE(nullptr, accepted.docSet());
   EXPECT_TRUE(accepted.docSet()->get(7));
 
+  cache.resize(charge * 2);
   FilterCache::UseRegistry retry(cache, 1, segments);
   EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
             retry.get(candidateKey)->probe(0).kind());
@@ -1978,7 +1980,7 @@ TEST(FilterCacheTest, evictsLowerRecentWorkAndPinsRetiredValue) {
   size_t charge = sample->ramBytesUsed();
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
-  config.recentWorkEpochs = 1;
+  config.recentWorkEpochs = 16;
   config.maxEntryBytes = charge + 1;
   config.maxBytes = charge * 2 - 1;
 
@@ -2259,6 +2261,423 @@ FilterCache::Probe::Kind observedRequest(FilterCache& cache,
   request.settle(completed);
   return kind;
 }
+}
+
+namespace {
+FilterCacheConfig capacityConfig(size_t bytes, uint64_t window = 1024) {
+  auto config = testConfig();
+  config.maxBytes = bytes;
+  config.maxMetadataBytes = 64 << 20;
+  config.maxMetadataEntries = 4096;
+  config.admissionThreshold = 1;
+  config.recentWorkEpochs = window;
+  return config;
+}
+
+void seedCapacityValue(FilterCache& cache,
+    std::span<const FilterCache::SegmentIdentity> segments, const FilterKey& key,
+    double credit, uint64_t production = 1000, bool trainPrior = false,
+    std::unique_ptr<DocSet> raw = {}) {
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(key);
+    auto probe = use->probe(0, trainPrior ? FilterCache::Work::nanoseconds(0) : FilterCache::Work::assumed());
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+    use->publishRaw(0, probe, raw ? std::move(raw) : bitDocs(segments[0].maxDoc, 7), production);
+  }
+  if (credit > 0) {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    ASSERT_EQ(FilterCache::Probe::Kind::HIT,
+        request.get(key)->probe(0, FilterCache::Work::nanoseconds(credit)).kind());
+  }
+}
+
+void fundCapacityValue(FilterCache& cache,
+    std::span<const FilterCache::SegmentIdentity> segments, const FilterKey& key, double work) {
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(key);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
+  use->charge(0, FilterCache::Work::nanoseconds(work));
+}
+
+class CapacityChecks {
+  FilterCache& cache;
+public:
+  int count = 0;
+  explicit CapacityChecks(FilterCache& cache) : cache(cache) {
+    Signal::listen("filterCacheCapacityCompared", [this](void* object, void*, void*) -> void* {
+      if (object == &this->cache) count++;
+      return nullptr;
+    });
+  }
+  ~CapacityChecks() { Signal::unlisten("filterCacheCapacityCompared"); }
+};
+}
+
+TEST(FilterCacheTest, capacityGateStartsAtShrinkAndEndsAtGrow) {
+  size_t bytes = bitDocs(1024, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(bytes * 2));
+  std::array segments{FilterCache::SegmentIdentity{1, 1024}};
+  cache.onReaderPublished(1, segments);
+  seedCapacityValue(cache, segments, FilterKey("resident"), 10000, 1000, true);
+  FilterKey candidate("priced-candidate");
+  fundCapacityValue(cache, segments, candidate, 1000);
+  CapacityChecks checks(cache);
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BUILD, request.get(candidate)->probe(0, FilterCache::Work::pending()).kind());
+  }
+  EXPECT_EQ(0, checks.count);
+  cache.resize(bytes);
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, request.get(candidate)->probe(0, FilterCache::Work::pending()).kind());
+  }
+  EXPECT_EQ(1, checks.count);
+  cache.resize(bytes * 2);
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BUILD, request.get(candidate)->probe(0, FilterCache::Work::pending()).kind());
+  }
+  EXPECT_EQ(1, checks.count);
+  FilterCache::UseRegistry assumed(cache, 1, segments);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, assumed.get(FilterKey("assumed"))->probe(0).kind());
+}
+
+TEST(FilterCacheTest, capacityEqualityAndSmallAdvantagesKeepTheResident) {
+  for (double work : {1050, 1100, 1101}) {
+    SCOPED_TRACE(work);
+    size_t bytes = bitDocs(1024, 7)->ramBytesUsed();
+    FilterCache cache(capacityConfig(bytes));
+    std::array segments{FilterCache::SegmentIdentity{1, 1024}};
+    cache.onReaderPublished(1, segments);
+    seedCapacityValue(cache, segments, FilterKey("resident"), 100, 1000, true);
+    FilterKey candidate("candidate");
+    fundCapacityValue(cache, segments, candidate, work);
+    auto before = cache.counters();
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto result = request.get(candidate)->probe(0, FilterCache::Work::pending());
+    EXPECT_EQ(work > 1100 ? FilterCache::Probe::Kind::BUILD : FilterCache::Probe::Kind::BYPASS, result.kind());
+    EXPECT_EQ(before.populationDeferred, cache.counters().populationDeferred);
+    EXPECT_EQ(before.capacityDeferred + (work <= 1100), cache.counters().capacityDeferred);
+    EXPECT_EQ(work > 1100, ledgerFor(cache, FilterKey("resident")).spokenFor);
+  }
+}
+
+TEST(FilterCacheTest, capacityRefusalMemoAvoidsListWorkUntilDemandOrRefresh) {
+  size_t bytes = bitDocs(1024, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(bytes, 64));
+  std::array segments{FilterCache::SegmentIdentity{1, 1024}};
+  cache.onReaderPublished(1, segments);
+  seedCapacityValue(cache, segments, FilterKey("resident"), 2000, 1000, true);
+  FilterKey candidate("equal-key");
+  fundCapacityValue(cache, segments, candidate, 2000);
+  CapacityChecks checks(cache);
+  auto before = cache.counters();
+  for (int i = 0; i < 3; i++) {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(candidate);
+    for (int j = 0; j < 3; j++) {
+      EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
+    }
+  }
+  EXPECT_EQ(1, checks.count);
+  EXPECT_EQ(before.capacityDeferred + 3, cache.counters().capacityDeferred);
+  EXPECT_EQ(before.populationDeferred, cache.counters().populationDeferred);
+  advanceCacheActivity(cache, segments, 64);
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(candidate);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
+    use->charge(0, FilterCache::Work::nanoseconds(20000));
+  }
+  EXPECT_EQ(2, checks.count);
+  FilterCache::UseRegistry request(cache, 1, segments);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, request.get(candidate)->probe(0, FilterCache::Work::pending()).kind());
+  EXPECT_EQ(3, checks.count);
+}
+
+TEST(FilterCacheTest, capacityUsesOneWindowEvenAfterALateRoll) {
+  for (bool late : {false, true}) {
+    size_t bytes = bitDocs(1024, 7)->ramBytesUsed();
+    FilterCache cache(capacityConfig(bytes, late ? 16 : 1024));
+    std::array segments{FilterCache::SegmentIdentity{1, 1024}};
+    cache.onReaderPublished(1, segments);
+    seedCapacityValue(cache, segments, FilterKey("resident"), 0, 1000, true);
+    FilterKey candidate("not-extrapolated");
+    fundCapacityValue(cache, segments, candidate, late ? 2000 : 1000);
+    if (late) advanceCacheActivity(cache, segments, 64);
+    FilterCache::UseRegistry request(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, request.get(candidate)->probe(0, FilterCache::Work::pending()).kind());
+    EXPECT_GT(cache.counters().capacityDeferred, 0u);
+    if (late) { EXPECT_GT(ledgerFor(cache, candidate).recentEpochs, 16u); }
+  }
+}
+
+TEST(FilterCacheTest, capacitySumsSmallVictimsAndCountsLargeVictimsWhole) {
+  for (bool largeCandidate : {true, false}) {
+    std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+    size_t small = docs(4096, {7})->ramBytesUsed();
+    size_t big = bitDocs(4096, 7)->ramBytesUsed();
+    FilterCache cache(capacityConfig(1 << 20));
+    cache.onReaderPublished(1, segments);
+    FilterKey candidate("candidate");
+    if (largeCandidate) {
+      cache.resize(small * 16);
+      for (int i = 0; i < 16; i++) {
+        seedCapacityValue(cache, segments, FilterKey("victim-" + std::to_string(i)),
+            i == 0 ? 0 : 1000, 1000, i == 0, docs(4096, {7}));
+      }
+    } else {
+      seedCapacityValue(cache, segments, candidate, 1000, 1000, true, docs(4096, {7}));
+      evictValues(cache);
+      cache.resize(big);
+      seedCapacityValue(cache, segments, FilterKey("large-victim"), 10000);
+    }
+    size_t budget = cache.configuration().maxBytes;
+    cache.resize(budget + 1);
+    cache.resize(budget);
+    fundCapacityValue(cache, segments, candidate, largeCandidate ? 3000 : 2000);
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(candidate);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
+    if (largeCandidate) {
+      use->charge(0, FilterCache::Work::nanoseconds(100000));
+      auto grant = use->probe(0, FilterCache::Work::pending());
+      EXPECT_EQ(FilterCache::Probe::Kind::BUILD, grant.kind());
+      size_t covered = 0;
+      for (const auto& row : cache.dump(100, nullptr)) if (row.values[0].spokenFor) covered += row.bytes;
+      EXPECT_GE(covered, big);
+      EXPECT_LT(covered - small, big);
+    }
+  }
+}
+
+TEST(FilterCacheTest, capacityMarksSurviveInsertionAndPrefixEviction) {
+  size_t bytes = bitDocs(1024, 7)->ramBytesUsed();
+  size_t small = docs(1024, {7})->ramBytesUsed();
+  FilterCache cache(capacityConfig(bytes * 2 + small + 1));
+  std::array segments{FilterCache::SegmentIdentity{1, 1024}};
+  cache.onReaderPublished(1, segments);
+  FilterKey a("victim-a"), b("victim-b"), first("first"), second("second"), third("third");
+  seedCapacityValue(cache, segments, a, 1000, 1000, true);
+  seedCapacityValue(cache, segments, b, 5000);
+  fundCapacityValue(cache, segments, first, 10000);
+  fundCapacityValue(cache, segments, second, 20000);
+  fundCapacityValue(cache, segments, third, 100000);
+  FilterCache::UseRegistry r1(cache, 1, segments), r2(cache, 1, segments);
+  auto p1 = r1.get(first)->probe(0, FilterCache::Work::pending());
+  auto p2 = r2.get(second)->probe(0, FilterCache::Work::pending());
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, p1.kind());
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, p2.kind());
+  {
+    FilterCache::UseRegistry byproduct(cache, 1, segments);
+    byproduct.get(FilterKey("tiny-idle"))->offerRaw(0, docs(1024, {7}), 1);
+    byproduct.get(FilterKey("large-idle"))->offerRaw(0, bitDocs(1024, 7), 1);
+  }
+  EXPECT_TRUE(ledgerFor(cache, a).spokenFor);
+  EXPECT_TRUE(ledgerFor(cache, b).spokenFor);
+  FilterCache::UseRegistry r3(cache, 1, segments);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, r3.get(third)->probe(0, FilterCache::Work::pending()).kind());
+}
+
+TEST(FilterCacheTest, capacityMarksOutliveThrowingAndAbandonedBuilds) {
+  size_t bytes = bitDocs(1024, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(bytes));
+  std::array segments{FilterCache::SegmentIdentity{1, 1024}};
+  cache.onReaderPublished(1, segments);
+  FilterKey victim("victim"), candidate("candidate"), other("other");
+  seedCapacityValue(cache, segments, victim, 0, 1000, true);
+  fundCapacityValue(cache, segments, candidate, 10000);
+  fundCapacityValue(cache, segments, other, 10000);
+  EXPECT_THROW({
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto probe = request.get(candidate)->probe(0, FilterCache::Work::pending());
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+    auto moved = std::move(probe);
+    throw std::runtime_error("production failed");
+  }, std::runtime_error);
+  EXPECT_TRUE(ledgerFor(cache, victim).spokenFor);
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, request.get(other)->probe(0, FilterCache::Work::pending()).kind());
+  }
+  cache.resize(bytes + 1);
+  cache.resize(bytes);
+  FilterCache::UseRegistry request(cache, 1, segments);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, request.get(candidate)->probe(0, FilterCache::Work::pending()).kind());
+  EXPECT_EQ(0, ledgerFor(cache, candidate).debt);
+  EXPECT_EQ(10000, ledgerFor(cache, candidate).owed);
+}
+
+TEST(FilterCacheTest, assumedFirstBuildIsAnExperimentButRebuildIsCompared) {
+  size_t bytes = bitDocs(1024, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(bytes));
+  std::array segments{FilterCache::SegmentIdentity{1, 1024}};
+  cache.onReaderPublished(1, segments);
+  FilterKey resident("resident"), unknown("unknown");
+  seedCapacityValue(cache, segments, resident, 10000, 1000, true);
+  seedCapacityValue(cache, segments, unknown, 0);
+  EXPECT_FALSE(ledgerFor(cache, unknown).resident);
+  EXPECT_EQ(0u, cache.counters().capacityDeferred);
+  FilterCache::UseRegistry first(cache, 1, segments);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, first.get(unknown)->probe(0).kind());
+  FilterCache::UseRegistry next(cache, 1, segments);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, next.get(unknown)->probe(0).kind());
+  EXPECT_EQ(1u, cache.counters().capacityDeferred);
+}
+
+TEST(FilterCacheTest, capacityWorkingSetShiftAdmitsAfterIdleWindow) {
+  size_t bytes = bitDocs(1024, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(bytes, 16));
+  std::array segments{FilterCache::SegmentIdentity{1, 1024}};
+  cache.onReaderPublished(1, segments);
+  FilterKey candidate("new-working-set");
+  seedCapacityValue(cache, segments, FilterKey("old-working-set"), 100000, 1000, true);
+  fundCapacityValue(cache, segments, candidate, 10000);
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, request.get(candidate)->probe(0, FilterCache::Work::pending()).kind());
+  }
+  for (int i = 0; i < 64; i++) {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(candidate);
+    auto probe = use->probe(0, FilterCache::Work::pending());
+    if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+      use->publishRaw(0, probe, bitDocs(1024, 7), 1000);
+      EXPECT_TRUE(ledgerFor(cache, candidate).resident);
+      return;
+    }
+    use->charge(0, FilterCache::Work::nanoseconds(1000));
+  }
+  FAIL() << "new working set did not replace idle resident";
+}
+
+TEST(FilterCacheTest, capacityCandidateMustOutrankItsVictims) {
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  size_t small = docs(4096, {7})->ramBytesUsed();
+  size_t big = bitDocs(4096, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(big + small - 1));
+  cache.onReaderPublished(1, segments);
+  FilterKey dense("small-dense"), candidate("large-candidate");
+  seedCapacityValue(cache, segments, dense, 5000, 1000, true, docs(4096, {7}));
+  cache.resize(big + small);
+  cache.resize(big + small - 1);
+  // More work than the victim plus production, but less per byte than the victim.
+  fundCapacityValue(cache, segments, candidate, 7000);
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(candidate);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
+  EXPECT_FALSE(ledgerFor(cache, dense).spokenFor);
+  use->charge(0, FilterCache::Work::nanoseconds(100000));
+  auto grant = use->probe(0, FilterCache::Work::pending());
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, grant.kind());
+  use->publishRaw(0, grant, bitDocs(4096, 7), 1000);
+  EXPECT_TRUE(ledgerFor(cache, candidate).resident);
+  EXPECT_FALSE(ledgerFor(cache, dense).resident);
+}
+
+TEST(FilterCacheTest, capacityComparisonKeepsReaderValuesWhole) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
+  IndexWriter writer(snapshots);
+  addTermDoc(writer, "first"); addTermDoc(writer, "second"); writer.commit();
+  auto reader = writer.snapshots.readers.getReader();
+  auto domains = canonicalDomains(*reader);
+  auto segments = readerIdentitiesForTest(*reader);
+  FilterCache cache(capacityConfig(1 << 20));
+  cache.onReaderPublished(*reader);
+  auto seed = [&](const FilterKey& key, double credit) {
+    {
+      FilterCache::UseRegistry request(cache, *reader);
+      auto* use = request.get(key, FilterKeyScope::READER_STABLE);
+      auto probe = use->probeReaderStable(*reader, domains);
+      ASSERT_EQ(FilterCache::ReaderProbe::Kind::BUILD, probe.kind());
+      use->publishReaderStable(probe, oneDocPerSegment(*reader), 1000);
+    }
+    FilterCache::UseRegistry request(cache, *reader);
+    request.get(key, FilterKeyScope::READER_STABLE)->probeReaderStable(
+        *reader, domains, FilterCache::Work::nanoseconds(credit));
+  };
+  FilterKey candidate("reader-candidate"), victim("reader-victim"), expensive("reader-expensive"), segment("segment");
+  {
+    FilterCache::UseRegistry request(cache, *reader);
+    auto* use = request.get(segment);
+    auto probe = use->probe(0, FilterCache::Work::nanoseconds(0));
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+    use->publishRaw(0, probe, docs(segments[0].maxDoc, {0}), 1000);
+  }
+  {
+    FilterCache::UseRegistry request(cache, *reader);
+    request.get(segment)->probe(0);
+  }
+  seed(candidate, 1000);
+  size_t size = ledgerFor(cache, candidate).referenceBytes;
+  evictValues(cache);
+  cache.resize(size * 2);
+  seed(victim, 1000); seed(expensive, 10000);
+  cache.resize(size * 2 + 1);
+  cache.resize(size * 2);
+  EXPECT_GT(ledgerFor(cache, expensive).rankedRate, 0);
+  {
+    FilterCache::UseRegistry request(cache, *reader);
+    auto* use = request.get(candidate, FilterKeyScope::READER_STABLE);
+    EXPECT_EQ(FilterCache::ReaderProbe::Kind::BYPASS, use->probeReaderStable(*reader, domains, FilterCache::Work::pending()).kind());
+    use->chargeReaderStable(FilterCache::Work::nanoseconds(5000));
+  }
+  FilterCache::UseRegistry request(cache, *reader);
+  auto* use = request.get(candidate, FilterKeyScope::READER_STABLE);
+  auto grant = use->probeReaderStable(*reader, domains, FilterCache::Work::pending());
+  ASSERT_EQ(FilterCache::ReaderProbe::Kind::BUILD, grant.kind());
+  EXPECT_TRUE(ledgerFor(cache, victim).spokenFor);
+  EXPECT_FALSE(ledgerFor(cache, expensive).spokenFor);
+  use->publishReaderStable(grant, oneDocPerSegment(*reader), 1000);
+  EXPECT_FALSE(ledgerFor(cache, victim).resident);
+  {
+    FilterCache::UseRegistry request(cache, *reader);
+    auto* source = request.get(segment);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, source->probe(0, FilterCache::Work::pending()).kind());
+    source->charge(0, FilterCache::Work::nanoseconds(2000));
+  }
+  FilterCache::UseRegistry smaller(cache, *reader);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, smaller.get(segment)->probe(0, FilterCache::Work::pending()).kind());
+}
+
+TEST(FilterCacheTest, capacityBoundsIrregularUniformProduction) {
+  for (bool small : {false, true}) {
+    int keys = small ? 1225 : 400, fit = small ? 50 : 47;
+    uint64_t production = small ? 1000 : 17000, saving = 1000;
+    size_t bytes = small ? docs(1024, {7})->ramBytesUsed() : bitDocs(1024, 7)->ramBytesUsed();
+    FilterCache cache(capacityConfig(bytes * keys, 4096));
+    std::array segments{FilterCache::SegmentIdentity{1, 1024}};
+    cache.onReaderPublished(1, segments);
+    std::vector<FilterKey> names;
+    for (int i = 0; i < keys; i++) {
+      names.emplace_back("uniform-key-" + std::to_string(i));
+      seedCapacityValue(cache, segments, names.back(), production, production, false,
+          small ? docs(1024, {7}) : bitDocs(1024, 7));
+    }
+    cache.resize(bytes * fit);
+    for (int i = 0; i < 2; i++) { advanceCacheActivity(cache, segments, 4096); cache.sweep(); }
+    cache.resetCounters();
+    uint32_t random = 0x3267a9d1;
+    for (int i = 0; i < 20000; i++) {
+      random ^= random << 13; random ^= random >> 17; random ^= random << 5;
+      FilterCache::UseRegistry request(cache, 1, segments);
+      auto* use = request.get(names[random % keys]);
+      auto probe = use->probe(0, FilterCache::Work::nanoseconds(saving));
+      if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+        use->publishRaw(0, probe, small ? docs(1024, {7}) : bitDocs(1024, 7), production);
+      }
+    }
+    auto counts = cache.counters();
+    std::printf("capacity-replay small=%d hits=%llu builds=%llu build_ns=%llu saved_ns=%llu deferred=%llu\n",
+        small, (unsigned long long)counts.hits, (unsigned long long)counts.builds,
+        (unsigned long long)counts.buildNanos, (unsigned long long)counts.estimatedSavedNanos,
+        (unsigned long long)counts.capacityDeferred);
+    EXPECT_LE(counts.buildNanos, small ? 5000 * production : 3 * production);
+    cache.validateForTest();
+  }
 }
 
 TEST(FilterCacheTest, firstObservedProductionWaitsForAnOrdinarySample) {
@@ -3098,7 +3517,7 @@ TEST(FilterCacheTest, recentWorkIncludesEffectiveResidencyForTinyPayloads) {
 
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
-  config.recentWorkEpochs = 1;
+  config.recentWorkEpochs = 16;
   config.maxEntryBytes = largeCharge + 1;
   config.maxBytes = tinyCharge + largeCharge - 1;
 
@@ -6345,7 +6764,13 @@ TEST(FilterCacheIntegrationTest, cacheControlIncludesLedgerGhosts) {
 
   cache->sweep();
   for (int stage = 0; stage < 3; stage++) {
-    if (stage == 1) evictValues(*cache);
+    if (stage == 1) {
+      evictValues(*cache);
+      FilterCache::UseRegistry request(*cache, *reader);
+      auto* ghost = request.get(FilterKey("dump-ledger"));
+      EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, ghost->probe(0, FilterCache::Work::pending()).kind());
+      ghost->charge(0, FilterCache::Work::nanoseconds(1000));
+    }
     std::pmr::monotonic_buffer_resource arena;
     api::CacheControlRequest request;
     request.collection = "cache_ledger_dump";
@@ -6365,7 +6790,7 @@ TEST(FilterCacheIntegrationTest, cacheControlIncludesLedgerGhosts) {
     ASSERT_EQ(1u, shard.entries[0].values.size());
     const auto& value = shard.entries[0].values[0];
     EXPECT_EQ(stage == 0, value.resident);
-    EXPECT_DOUBLE_EQ(0, value.owed_us);
+    EXPECT_DOUBLE_EQ(stage == 1 ? 1 : 0, value.owed_us);
     EXPECT_DOUBLE_EQ(4, value.debt_us);
     EXPECT_EQ(4u, value.production_us);
     EXPECT_EQ("measured", value.production_source);

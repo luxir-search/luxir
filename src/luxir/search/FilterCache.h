@@ -157,6 +157,7 @@ public:
     uint64_t evictions = 0;
     uint64_t unrepaidEvictions = 0;
     uint64_t populationDeferred = 0;
+    uint64_t capacityDeferred = 0;
     uint64_t purges = 0;
     uint64_t oversizedKeyBypasses = 0;
     uint64_t readerStableHits = 0;
@@ -359,6 +360,7 @@ public:
   };
 
   class Use {
+    enum class Deferral { FUNDING, CAPACITY };
     struct Accounting {
       bool ordinary = false;
       bool charged = false;
@@ -466,8 +468,8 @@ public:
     void ordinaryUse(size_t segmentOrd, bool populationAllowed);
     void ordinaryReaderUse(bool populationAllowed);
     void chargeLedger(Ledger& ledger, Accounting& accounting, std::mutex& mutex, Work work);
-    void deferPopulation(size_t segmentOrd);
-    void deferReaderPopulation();
+    void deferPopulation(size_t segmentOrd, Deferral reason = Deferral::FUNDING);
+    void deferReaderPopulation(Deferral reason = Deferral::FUNDING);
     void settle(size_t segmentOrd, uint64_t nanos, std::chrono::steady_clock::time_point started);
 
   public:
@@ -645,6 +647,8 @@ private:
     double recent = 0;
     uint64_t recentEpochs = 0;
     double creditSnapshot = 0;
+    uint64_t refusedVersion = 0;
+    double refusedWork = 0;
     std::atomic<double> debt{0};
     uint64_t referenceNanos = 0;
     size_t referenceBytes = 0;
@@ -756,6 +760,7 @@ private:
     std::atomic<uint64_t> evictions{0};
     std::atomic<uint64_t> unrepaidEvictions{0};
     std::atomic<uint64_t> populationDeferred{0};
+    std::atomic<uint64_t> capacityDeferred{0};
     StripedCounter assumedCharges;
     StripedCounter observedCharges;
     StripedCounter assumedCredits;
@@ -790,6 +795,7 @@ private:
     std::weak_ptr<const ReaderValue> reader;
     double priority;
     uint64_t published;
+    bool spokenFor = false;
     bool operator<(const Resident& other) const {
       return priority != other.priority ? priority < other.priority : published < other.published;
     }
@@ -812,6 +818,7 @@ private:
   std::vector<Resident> residents;
   bool residentsReady = false;
   std::atomic<uint64_t> refreshEpoch{0};
+  std::atomic<uint64_t> residentsVersion{1};
   std::atomic<uint64_t> publishedCoreGen{0};
   std::atomic<uint64_t> publishedReaderVersion{0};
   std::atomic<uint64_t> readerPublications{0};
@@ -886,6 +893,7 @@ private:
   size_t lowWatermarkMetadataBytes(size_t bytes) const;
   void detachEntry(const std::shared_ptr<FilterEntry>& entry);
   void refreshResidents();
+  bool capacityAllows(const FilterEntry& entry, Ledger& ledger, size_t bytes, double production);
   void rememberResident(const std::shared_ptr<FilterEntry>& entry,
       const std::shared_ptr<SegmentSlot>& slot,
       const std::shared_ptr<const SegmentValue>& segment,
@@ -949,6 +957,11 @@ public:
     size_t referenceBytes = 0;
     double recent = 0;
     uint64_t recentEpochs = 0;
+    double work = 0;
+    double residencyBytes = 0;
+    uint64_t published = 0;
+    double rankedRate = 0;
+    bool spokenFor = false;
   };
   struct EntryDump {
     uint64_t keyHash = 0;
@@ -964,6 +977,7 @@ public:
   };
   std::vector<EntryDump> dump(size_t limit, size_t* totalResident, bool includeGhosts = false);
 
+  uint64_t currentEpoch() const { return epoch.load(std::memory_order_relaxed); }
   uint64_t lastRefreshEpoch() const { return refreshEpoch.load(std::memory_order_relaxed); }
   CounterValues counters() const;
   size_t bytesUsed() const { return residentBytes.load(std::memory_order_relaxed); }
