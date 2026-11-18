@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "luxir/reader/SegmentCore.h"
 #include "PostingsReader.h"
 #include "luxir/util/screaming.h"
 
@@ -18,7 +19,7 @@ public:
   DocsReader(PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) {
     ndocs = fieldInfo.docsWithField;
     if (ndocs != postingsReader.maxDoc()) {
-      InputStream docsWithValIs = postingsReader.getInputStreamSeek(fieldInfo.docsWithFieldEndLoc);
+      InputStream docsWithValIs = postingsReader.core().getInputStreamSeek(fieldInfo.docsWithFieldEndLoc);
       bits.set( docsWithValIs.ptr() );
     }
   }

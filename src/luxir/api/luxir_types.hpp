@@ -66,7 +66,7 @@ namespace luxir::api {
 struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
 struct Diversify; struct Collapse; struct GroupComponent; struct GroupKey; struct GroupTable;
 struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
-struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
+struct ToParentQuery; struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct GeoLatLon; struct GeoRing; struct GeoPolygon; struct GeoPolygonQuery; struct ExprQuery; struct WeightedField; struct PhraseOptions; struct MultiMatchQuery;
 struct DisMaxQuery; struct PluginQuery; struct PluginOp;
@@ -109,7 +109,7 @@ namespace LinearFusion_ { enum class Normalization { MIN_MAX = 0 }; }
 namespace Collapse_ { enum class MissingPolicy { EXPAND = 0, GROUP = 1, DROP = 2 }; }
 namespace FieldFacet_ { enum class CountUnit { DOCS = 0, GROUPS = 1 }; }
 namespace RangeFacet_ { enum class Bounds { EXPLICIT = 0, DATA = 1 }; }
-namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3 }; }
+namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3, BOOLEAN = 4, DECIMAL = 5, IP = 6 }; }
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
 // Enums an expr callable takes as an argument also describe the values it
 // accepts (ExprFunctions.h); keep each list beside its enum.
@@ -127,11 +127,11 @@ enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR =
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
-enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64_STR_BIT = 2 };
+enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64_STR_BIT = 2, ESTIMATE_COUNT_BIT = 3, DECIMAL_SCALED_BIT = 4 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
-enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
+enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9, BOOLEAN = 11, IP = 12, DECIMAL = 13, NESTED = 14 };
 enum class MultiMode { SINGLE = 0, DEFAULT = 1, SET = 2, ARRAY = 3 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
@@ -304,6 +304,7 @@ struct FieldDef {
   std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<LongTerms> long_terms;                          // align 4 (enum)
+  std::optional<std::int32_t> scale;
   std::optional<DateUnit> unit;                                // align 4 (enum)
   std::optional<std::int32_t> dims;                             // align 4
   std::optional<std::int32_t> truncate_dims;                    // align 4
@@ -347,6 +348,9 @@ struct QueryCacheStats {
   uint64_t thrash_build_skips = 0;
   uint64_t reader_dead_builds = 0;
   uint64_t reader_thrash_build_skips = 0;
+  uint64_t build_us = 0;
+  uint64_t served_build_us = 0;
+  uint64_t dead_build_us = 0;
   bool enabled = false;
 };
 struct StorageRamStats { uint64_t used_bytes = 0; uint64_t limit_bytes = 0; };
@@ -383,6 +387,8 @@ struct FieldMetadataStats {
   uint64_t entry_bytes = 0;
   uint64_t names = 0;
   uint64_t name_bytes = 0;
+  uint64_t live_views = 0;
+  uint64_t live_view_bytes = 0;
 };
 struct MemoryStats {
   IndexRamStats indexing_budget;
@@ -551,6 +557,8 @@ struct ServiceStats {
   std::string_view version;
   std::string_view cpu_target;
   std::string_view source_commit;
+  std::string_view faiss_simd;
+  std::string_view blas_core;
   std::span<const double> request_duration_bounds;
   std::span<const double> background_duration_bounds;
   TransportStats http;
@@ -782,10 +790,12 @@ struct CacheEntryDump {
   uint64_t bytes = 0;
   uint64_t hits = 0;
   uint64_t last_used_epoch = 0;
+  uint64_t build_us = 0;
   std::string_view key_text;
   std::string_view scope;
   uint32_t key_bytes = 0;
   uint32_t segments_resident = 0;
+  uint32_t recent_uses = 0;
   bool reader_value = false;
 };
 struct ShardCacheControl {                                      // needs QueryCacheStats,CacheEntryDump
@@ -910,6 +920,7 @@ struct TopDocs {                                                 // all indirect
   ::hpp_proto::optional_indirect_view<Diversify> diversify;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_scores = false;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
 };
 struct Fusion {                                                  // needs TopDocs, RrfFusion, LinearFusion
   map_view<std::string_view, TopDocs> sources;
@@ -925,8 +936,10 @@ struct Fusion {                                                  // needs TopDoc
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_scores = false;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
 };
 struct Domain {
+  std::optional<std::string_view> to;
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const Query> filter;
   std::optional<bool> apply_parent_filters;
@@ -989,7 +1002,7 @@ struct SearchRequest {
 };
 struct Map { map_view<std::string_view, ::hpp_proto::indirect_view<Val>> fields; };
 struct GroupComponent {
-  std::variant<std::monostate, google::protobuf::NullValue, std::string_view, std::int64_t> value;
+  std::variant<std::monostate, google::protobuf::NullValue, std::string_view, std::int64_t, bool, double> value;
   GroupComponent_::Type type = GroupComponent_::Type::STRING;
 };
 struct GroupKey {
@@ -1016,6 +1029,7 @@ struct DocList {                                                // needs Column 
   int32_t row_count = 0;                                       // align 4
   bool more = false;
   bool found_gte = false;
+  bool found_estimated = false;
 };
 struct FacetResult {                                           // needs Column (optional)
   std::optional<Column> bucket_ids;
@@ -1117,6 +1131,11 @@ struct ConstantScoreQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::optional<float> score;
 };
+struct ToParentQuery {
+  std::string_view path;
+  ::hpp_proto::optional_indirect_view<Query> query;
+  std::string_view score;
+};
 struct BoostQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::optional<float> boost;
@@ -1198,7 +1217,7 @@ struct Query {                                                 // needs Match,An
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
-               AnyOfQuery, MultiMatchQuery, GeoPolygonQuery, DisMaxQuery, PluginQuery>
+               AnyOfQuery, MultiMatchQuery, GeoPolygonQuery, DisMaxQuery, PluginQuery, ToParentQuery>
       kind;
 };
 struct UpdateRequest {                                         // needs CommitParams
@@ -1221,7 +1240,7 @@ LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
 LUXIR_TD(Diversify) LUXIR_TD(Collapse) LUXIR_TD(GroupComponent) LUXIR_TD(GroupKey) LUXIR_TD(GroupTable)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
-LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
+LUXIR_TD(ToParentQuery) LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
 LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(GeoLatLon) LUXIR_TD(GeoRing) LUXIR_TD(GeoPolygon) LUXIR_TD(GeoPolygonQuery) LUXIR_TD(ExprQuery) LUXIR_TD(WeightedField) LUXIR_TD(PhraseOptions) LUXIR_TD(MultiMatchQuery) LUXIR_TD(DisMaxQuery) LUXIR_TD(PluginQuery) LUXIR_TD(PluginOp)
 LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
@@ -1267,7 +1286,7 @@ LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
 LUXIR_ENTRY(Diversify) LUXIR_ENTRY(Collapse) LUXIR_ENTRY(GroupComponent)
 LUXIR_ENTRY(GroupKey) LUXIR_ENTRY(GroupTable)
 LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(LinearFusion) LUXIR_ENTRY(SortSpec)
-LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
+LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ToParentQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(GeoPolygonQuery) LUXIR_ENTRY(ExprQuery)

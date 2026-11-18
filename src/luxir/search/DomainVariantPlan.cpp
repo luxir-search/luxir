@@ -22,12 +22,15 @@ DomainHandle DomainVariantPlan::account(DomainHandle domain, RequestMemTracker& 
 
 DomainHandle DomainVariantPlan::composeTracked(std::vector<DomainHandle> parts, RequestMemTracker& tracker) {
   std::vector<DomainHandle> distinct;
+  DomainHandle identity;
+  if (!parts.empty()) identity = DomainHandle().scopedLike(parts[0]);
   for (auto& part : parts) {
+    part.assertSameScope(identity);
     if (!part.get()) continue;
     if (std::ranges::any_of(distinct, [&](const auto& old) { return old.get() == part.get(); })) continue;
     distinct.push_back(std::move(part));
   }
-  if (distinct.size() <= 1) return freeze(distinct.empty() ? DomainHandle{} : distinct.front());
+  if (distinct.size() <= 1) return freeze(distinct.empty() ? identity : distinct.front());
   return account(compose(std::move(distinct)), tracker, "composed segment domain");
 }
 
@@ -95,11 +98,12 @@ void DomainVariantPlan::SegmentSources::init(size_t source, Query::Weight* weigh
     return;
   }
   auto& seg = reader.segments()[(size_t)segment];
-  value.stable = materialize(source, seg.hasDeletes() ? &seg.liveDocs()->docset() : nullptr, std::move(probe));
+  value.stable = materialize(source, seg.liveDocSet(), std::move(probe));
 }
 
 DomainHandle DomainVariantPlan::SegmentSources::resolve(size_t source, DomainHandle base,
                                                         const QueryPrep::PreparedSource* prepared) {
+  base.assertScope(reader.segments()[(size_t)segment]);
   auto& value = values[source];
   if (value.weight->matchesAllDocs()) return freeze(std::move(base));
   DomainHandle result;
@@ -109,20 +113,21 @@ DomainHandle DomainVariantPlan::SegmentSources::resolve(size_t source, DomainHan
     result = account(
         DomainHandle(QueryPrep::materialize(*value.weight, prepared ? prepared->prepared.get() : nullptr,
                                             reader.segments()[(size_t)segment], base.get())),
-        tracker, "scoped segment source");
+        tracker, "scoped segment source").scopedLike(base);
   } else if (!value.stable) {
     result = materialize(source, base.get());
   } else {
     auto& domain = *value.stable;
+    domain.assertSameScope(base);
     auto& seg = reader.segments()[(size_t)segment];
-    DocSet* live = seg.hasDeletes() ? &seg.liveDocs()->docset() : nullptr;
+    DocSet* live = seg.liveDocSet();
     if (!domain.get())
       result = base;
     else if (!base.get() || base.get() == live || base.get() == domain.get())
       result = domain;
     else {
       std::array<DocSet*, 2> parts{base.get(), domain.get()};
-      result = account(DomainHandle(DocSet::intersect(parts)), tracker, "scoped segment source");
+      result = account(DomainHandle(DocSet::intersect(parts)), tracker, "scoped segment source").scopedLike(base);
     }
   }
   assert(result.isDeliverable());

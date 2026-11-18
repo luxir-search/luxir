@@ -59,6 +59,11 @@ struct AuxIndexInfo {
   uint64_t built_core_gen = 0;
 };
 
+struct SegmentSpaceInfo {
+  std::string_view path;
+  int32_t rows = 0;
+};
+
 struct SegmentInfo {
   uint64_t creator_epoch = 0;
   uint64_t live_epoch = 0;
@@ -71,8 +76,10 @@ struct SegmentInfo {
   SchemaReference schema;
   std::span<const AuxIndexInfo> overlays;
   std::span<const FileDescriptor> files;
+  std::span<const SegmentSpaceInfo> spaces;
   int32_t max_doc = 0;
   int32_t live_docs = 0;
+  std::optional<int32_t> merge_rows;
 };
 
 struct IndexInfo {
@@ -119,7 +126,7 @@ struct SegmentSummaryInfo {
 };
 
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
-LUXIR_TD(IndexInfo) LUXIR_TD(SegmentInfo) LUXIR_TD(AuxIndexInfo)
+LUXIR_TD(IndexInfo) LUXIR_TD(SegmentInfo) LUXIR_TD(SegmentSpaceInfo) LUXIR_TD(AuxIndexInfo)
 LUXIR_TD(SchemaVersion) LUXIR_TD(SchemaReference) LUXIR_TD(SchemaInfo) LUXIR_TD(FileDescriptor)
 LUXIR_TD(FieldSummary) LUXIR_TD(SegmentSummaryInfo)
 #undef LUXIR_TD
@@ -132,7 +139,7 @@ LUXIR_TD(FieldSummary) LUXIR_TD(SegmentSummaryInfo)
                  std::string *error = nullptr);                                          \
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,         \
                   std::string *error = nullptr);
-LUXIR_ENTRY(IndexInfo) LUXIR_ENTRY(SegmentInfo) LUXIR_ENTRY(AuxIndexInfo)
+LUXIR_ENTRY(IndexInfo) LUXIR_ENTRY(SegmentInfo) LUXIR_ENTRY(SegmentSpaceInfo) LUXIR_ENTRY(AuxIndexInfo)
 LUXIR_ENTRY(SchemaVersion) LUXIR_ENTRY(SchemaReference) LUXIR_ENTRY(SchemaInfo) LUXIR_ENTRY(FileDescriptor)
 LUXIR_ENTRY(FieldSummary) LUXIR_ENTRY(SegmentSummaryInfo)
 #undef LUXIR_ENTRY

@@ -35,12 +35,13 @@ locations, browse `src/luxir/<area>/`.
    - `ReaderManager`: Per-collection snapshot publication, reader refresh, and filter cache;
      searches do not require an `IndexWriter`. Schema-only snapshots share physical cores.
    - `ResolvedSchema.cpp`: Declared representations and segment-generation coverage
-   - `IndexReader` is for reading a whole index and contains a `PostingsReader` per index segment;
-     opening secures every file by handle (`HeldFiles`) and reads only summaries; each segment's
-     base, live docs and overlays are lazy parts (`SegmentBase`, `SegmentLive`, `SegmentOverlay`)
-     materialized by `IndexReader::materialize` at the search's batched point
-     (`SearchEngine::submitBody`) or on first use. A reopen shares each unchanged part, opened or
-     not, with the previous snapshot, and the writer's open segments in both directions
+   - `IndexReader` is a view of one path in a snapshot, with a leaf per bundle;
+     opening secures every file by handle (`HeldFiles`) and reads only the manifest
+     (row counts per space) and summaries; each bundle's core, live docs and overlays
+     are lazy parts (`SegmentBase`, `SegmentLive`, `SegmentOverlay`) materialized by
+     `IndexReader::materialize` at the search's batched point (`SearchEngine::submitBody`)
+     or on first use. A reopen shares each unchanged part, opened or not, with the
+     previous snapshot, and the writer's open segments in both directions
      - Physical field catalog records available columns and stored resources;
        logical retrieval discovery is cached per reader and schema identity
    - `SearchEngine`: Coordinates query parsing, execution, and result collection
@@ -51,9 +52,14 @@ locations, browse `src/luxir/<area>/`.
      read source; wildcard discovery returns logical primaries only
 
 3. **Segment Reading** (`src/luxir/reader/`)
-   - `PostingsReader` reads a single segment and owns the open files for that segment, plus
-     views derived from its immutable bytes (numeric leaf metadata), which therefore live
-     exactly as long as the mapped files
+   - `SegmentCore` owns a segment bundle's open files, streams and root VersionRuns, shared
+     across snapshots and with the writer. Its base footer catalogs row spaces and their
+     field tables, keyed by path name (root is the empty path). It owns a concrete `PostingsReader` per space, each with its own maxDoc,
+     field catalog and lazy immutable field metadata
+     (including numeric leaf bounds). Codec cursors borrow the space reader and mapped bytes
+   - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
+     optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
+     opening reads metadata and endpoints without scanning child rows.
    - `FieldReader` finds metadata for a field in the segment (`SegFieldInfo`)
    - `TermsEnum` enumerates or finds indexed terms for a field found by `FieldReader`
    - `DocsEnum` returns the documents for a term found with the `TermsEnum`. Optionally returns term positions for each document.
@@ -66,7 +72,7 @@ locations, browse `src/luxir/<area>/`.
 
 4. **Query System** (`src/luxir/query/`)
 
-   Query execution flows from an index-independent `Query` through a
+   Query execution flows from a logical `Query` through a
    cross-segment `Weight`, then through a per-segment `ScorerSupplier` that
    resolves retained construction plans for the cursor, docs-only, bulk, or
    constant-count product the consumer will execute. The Overview in
@@ -83,6 +89,14 @@ locations, browse `src/luxir/<area>/`.
    Weight and scorers are in `BooleanWeight.h`, which only `BooleanQuery.cpp`
    and white-box tests include.
 
+   - `ToParentQuery` reduces child matches onto owners through `RowRelation`.
+     Ordinary children stream raw membership; domain-consuming children prepare
+     against mapped live eligibility. `RowRelation::Mapping` carries an
+     expand/project direction across operation domains. `OwnershipRelation` owns the shared per-leaf mappers and reducing
+     scorer. Ownership-specific mapping stays outside
+     generic weights and domain scope.
+   - Child liveness is derived lazily from root deletes through ownership ranges;
+     metadata-only count probes use conservative bounds until it is known.
    - Supports Term, Boolean, Phrase, and All queries
    - `Query::mayMatch` proves from a segment's `SummaryView` that a query
      cannot match it (`SummaryPredicates.h` holds the leaf proofs);

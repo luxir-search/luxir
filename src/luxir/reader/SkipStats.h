@@ -33,6 +33,10 @@ struct SkipStats {
   // Documents pulled by collapsed bounded constant-score collection (added
   // per pull), and retained-group remap probes (per segment switch).
   static inline int64_t collapseDocsVisited = 0;
+  // Candidate-family boundary work, accumulated once per owner window.
+  static inline int64_t joinBoundaryPointFamilies = 0;
+  static inline int64_t joinBoundaryRuns = 0;
+  static inline int64_t joinCandidatesVisited = 0;
   static inline int64_t collapseRemapProbes = 0;
   // Full 128-value tfreq block decodes. StreamVByte tails are excluded because
   // their docs/freq streams have no independently skippable block boundary.
@@ -205,6 +209,10 @@ struct SkipStats {
   static inline int64_t exactCountTopKProfitabilityRejects = 0;
   static inline int64_t exactCountTopKSparseFilterSinglePassRejects = 0;
   static inline int64_t exactCountTopKBulkFallbacks = 0;
+  // Bounded counts counted apart from ranking: segments whose count pass
+  // ran, and passes stopped by the limit before their segment's end.
+  static inline int64_t boundedCountSegments = 0;
+  static inline int64_t boundedCountStops = 0;
   static inline int64_t bulkBuiltThenRejected = 0;
   static inline int64_t bulkBuiltThenRejectedWrapperRoute = 0;
   static inline int64_t bulkBuiltThenRejectedMandOptTwoPhase = 0;
@@ -222,6 +230,7 @@ struct SkipStats {
   static inline int64_t conjPlanUnknownIslandNumericGeo = 0;
   static inline int64_t conjPlanUnknownIslandOther = 0;
   static inline int64_t multitermExpansions = 0;
+  static inline int64_t multitermUnionBuilds = 0;
   static inline int64_t sparseFilteredTopKReroutes = 0;
   static inline int64_t sparseFilteredTopKUnionReroutes = 0;
   static inline int64_t sparseFilteredTopKDensityRejects = 0;
@@ -336,6 +345,9 @@ struct SkipStats {
   static inline int64_t numericPredicateSparseVerifyArms = 0;
   static inline int64_t numericPredicateComplementArms = 0;
   static inline int64_t numericPredicatePointsArms = 0;
+  static inline int64_t numericPredicatePostingsArms = 0;
+  // Matching dictionary candidates examined, including the budget's rejecting term.
+  static inline int64_t numericPredicatePostingsTerms = 0;
   static inline int64_t numericPredicateZoneArms = 0;
   static inline int64_t numericPredicateScanArms = 0;
   static inline int64_t numericPredicateClassifiedBlocks = 0;
@@ -397,6 +409,9 @@ struct SkipStats {
     docBlocksDecoded = 0;
     termDictionarySeeks = 0;
     collapseDocsVisited = 0;
+    joinBoundaryPointFamilies = 0;
+    joinBoundaryRuns = 0;
+    joinCandidatesVisited = 0;
     collapseRemapProbes = 0;
     tfreqBlocksDecoded = 0;
     l0HeaderSteps = 0;
@@ -539,6 +554,8 @@ struct SkipStats {
     exactCountTopKProfitabilityRejects = 0;
     exactCountTopKSparseFilterSinglePassRejects = 0;
     exactCountTopKBulkFallbacks = 0;
+    boundedCountSegments = 0;
+    boundedCountStops = 0;
     bulkBuiltThenRejected = 0;
     bulkBuiltThenRejectedWrapperRoute = 0;
     bulkBuiltThenRejectedMandOptTwoPhase = 0;
@@ -556,6 +573,7 @@ struct SkipStats {
     conjPlanUnknownIslandNumericGeo = 0;
     conjPlanUnknownIslandOther = 0;
     multitermExpansions = 0;
+    multitermUnionBuilds = 0;
     sparseFilteredTopKReroutes = 0;
     sparseFilteredTopKUnionReroutes = 0;
     sparseFilteredTopKDensityRejects = 0;
@@ -638,6 +656,8 @@ struct SkipStats {
     numericPredicateSparseVerifyArms = 0;
     numericPredicateComplementArms = 0;
     numericPredicatePointsArms = 0;
+    numericPredicatePostingsArms = 0;
+    numericPredicatePostingsTerms = 0;
     numericPredicateZoneArms = 0;
     numericPredicateScanArms = 0;
     numericPredicateClassifiedBlocks = 0;

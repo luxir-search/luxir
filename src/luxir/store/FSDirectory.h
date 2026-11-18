@@ -4,13 +4,11 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
-#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <limits>
-#include <signal.h>
+#include <mutex>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -20,6 +18,7 @@
 #include <xxhash.h>
 #include "Directory.h"
 #include "luxir/util/Signal.h"
+#include "luxir/util/Uuid.h"
 #include "luxir/util/luxir_util.h"
 
 namespace luxir {
@@ -496,16 +495,20 @@ public:
 /// Filesystem-backed Directory using mmap for reads and buffered writes.
 class FSDirectory : public Directory {
 public:
+  static constexpr std::string_view kPublicationLock = ".luxir-publish.lock";
+  // Per-path state shared by a factory's views of one directory.
   struct ParentSync {
     std::mutex mutex;
     bool durable = false;
+    // Serializes this process's publications and deletions here: on NFS,
+    // flock is emulated by process-scoped POSIX locks, which do not exclude threads.
+    std::mutex publication;
   };
 private:
   std::filesystem::path basePath_;
   std::filesystem::path durabilityRoot;
   std::shared_ptr<ParentSync> parents;
-  inline static std::atomic<uint64_t> nextPublishTemp{0};
-  static constexpr std::string_view publishTempPrefix = ".luxir-publish-";
+  std::filesystem::path publishTemps;
 
   static PublicationVersion versionOf(int fd, std::span<const std::byte> bytes) {
     struct stat info;
@@ -521,19 +524,21 @@ private:
         modified.tv_sec, modified.tv_nsec, info.st_size, XXH3_64bits(bytes.data(), bytes.size()));
   }
 
-  // Fresh file descriptions serialize threads and processes alike. Deletion
-  // shares this lock with publication so it cannot race a Match check/install.
-  // No fsync holds the lock; local filesystems release it on process death.
-  // Network filesystems that can revoke a stalled client's lock are unsafe.
+  // Callers hold parents->publication: NFS-emulated flock is process-scoped.
+  // Deletion shares the lock with publication; fsyncs run outside it.
+  // A stall past the NFSv4 lease between Match and rename can lose the lock
+  // and overwrite a newer STATE. Files stay intact; acknowledged commits can
+  // drop out of STATE. Retention does not close this revocation window.
   int lockDirectory() const {
-    int fd = ::open(basePath_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    auto path = basePath_ / kPublicationLock;
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) {
       if (errno == ENOENT) return -1;
-      throw FileIOException("Cannot open publication directory: " + basePath_.string() + ": " + strerror(errno));
+      throw FileIOException("Cannot open publication lock: " + path.string() + ": " + strerror(errno));
     }
     while (::flock(fd, LOCK_EX) < 0) {
       if (errno != EINTR) {
-        auto message = "Cannot lock publication directory: " + basePath_.string() + ": " + strerror(errno);
+        auto message = "Cannot lock publication directory: " + path.string() + ": " + strerror(errno);
         ::close(fd);
         throw FileIOException(message);
       }
@@ -542,15 +547,13 @@ private:
   }
 
   std::filesystem::path filePath(std::string_view name) const {
-    if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\\0", 0, 3) != std::string_view::npos) {
+    if (name.empty() || name == "." || name == ".." || name == kPublicationLock || name.find_first_of("/\\\0", 0, 3) != std::string_view::npos) {
       throw std::invalid_argument("invalid directory file name");
     }
     return basePath_ / name;
   }
 
 public:
-  // Listings hide scratch files. Owned factories remove dead processes' temps.
-  static bool isPublishTemp(std::string_view name) { return name.starts_with(publishTempPrefix); }
   Capabilities capabilities() const override { return HARD_LINK | ATOMIC_RENAME | DURABLE_SYNC | MEMORY_MAPPED; }
 
   void linkFile(Directory& source, std::string_view name) override {
@@ -560,34 +563,20 @@ public:
   }
 
   explicit FSDirectory(const std::filesystem::path& path, std::filesystem::path root = {},
-                       std::shared_ptr<ParentSync> parents = std::make_shared<ParentSync>())
+                       std::shared_ptr<ParentSync> parents = std::make_shared<ParentSync>(),
+                       std::filesystem::path publishTemps = {})
       : basePath_(std::filesystem::absolute(path).lexically_normal()),
         durabilityRoot(root.empty() ? basePath_ : std::filesystem::absolute(root).lexically_normal()),
-        parents(std::move(parents)) {
+        parents(std::move(parents)),
+        publishTemps(publishTemps.empty() ? durabilityRoot / "node/tmp" : std::move(publishTemps)) {
     if (root.empty()) while (!std::filesystem::is_directory(durabilityRoot)) durabilityRoot = durabilityRoot.parent_path();
-  }
-
-  static void cleanPublicationTemps(const std::filesystem::path& path) {
-    for (const auto& entry : std::filesystem::directory_iterator(path)) {
-      auto name = entry.path().filename().string();
-      if (!isPublishTemp(name)) continue;
-      auto text = std::string_view(name).substr(publishTempPrefix.size());
-      auto dash = text.find('-');
-      if (dash == std::string_view::npos) continue;
-      uint64_t pid = 0;
-      auto [end, error] = std::from_chars(text.data(), text.data() + dash, pid);
-      if (error == std::errc() && end == text.data() + dash && pid <= (uint64_t)std::numeric_limits<pid_t>::max()
-          && (pid == 0 || (::kill((pid_t)pid, 0) < 0 && errno == ESRCH))) {
-        if (::unlink(entry.path().c_str()) < 0 && errno != ENOENT) throw FileIOException("Cannot remove publication temp: " + entry.path().string());
-      }
-    }
   }
 
   void listFiles(std::vector<FileInfo>& target) override {
     if (!std::filesystem::exists(basePath_)) return;
     auto startIdx = target.size();
     for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
-      if (isPublishTemp(entry.path().filename().string())) continue;
+      if (entry.path().filename() == kPublicationLock) continue;
       // A file may be deleted between readdir and stat; skip on any error.
       std::error_code ec;
       if (!entry.is_regular_file(ec) || ec) {
@@ -641,6 +630,7 @@ public:
 
   bool deleteFile(std::string_view name) override {
     auto path = filePath(name);
+    std::lock_guard local(parents->publication);
     int fd = lockDirectory();
     if (fd < 0) return false;
     auto unlock = scope_guard([&] { ::close(fd); });
@@ -648,11 +638,15 @@ public:
   }
 
   void deletePrefix(std::string_view prefix) override {
-    if (!std::filesystem::exists(basePath_)) return;
+    std::lock_guard local(parents->publication);
+    int fd = lockDirectory();
+    if (fd < 0) return;
+    auto unlock = scope_guard([&] { ::close(fd); });
     std::vector<std::string> toDelete;
     for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
       if (entry.is_regular_file()) {
         std::string name = entry.path().filename().string();
+        if (name == kPublicationLock) continue;
         if (name.starts_with(prefix)) {
           toDelete.push_back(std::move(name));
         }
@@ -696,18 +690,12 @@ public:
   }
 
   std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) override {
-    if (isPublishTemp(name)) throw std::invalid_argument("reserved publication temp name");
     auto target = filePath(name);
     std::filesystem::create_directories(basePath_);
-    std::filesystem::path temp;
-    int fd;
-    for (;;) {
-      temp = filePath(std::format("{}{}-{}", publishTempPrefix, getpid(),
-          nextPublishTemp.fetch_add(1, std::memory_order_relaxed)));
-      fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-      if (fd >= 0) break;
-      if (errno != EEXIST) throw FileIOException("Cannot create publication temp: " + temp.string() + ": " + strerror(errno));
-    }
+    std::filesystem::create_directories(publishTemps);
+    auto temp = publishTemps / newUuid();
+    int fd = ::open(temp.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) throw FileIOException("Cannot create publication temp: " + temp.string() + ": " + strerror(errno));
     auto cleanup = scope_guard([&] { ::close(fd); ::unlink(temp.c_str()); });
     // The open hook exposes the fd for real I/O failure injection in tests.
     Signal::emit("publishOpened", this, &name, &fd);
@@ -726,6 +714,7 @@ public:
     Signal::emit("publishSynced", this, &name);
     auto version = versionOf(fd, bytes);
     {
+      std::lock_guard local(parents->publication);
       int directoryFd = lockDirectory();
       if (directoryFd < 0) throw FileIOException("Publication directory was removed: " + basePath_.string());
       auto unlock = scope_guard([&] { ::close(directoryFd); });
@@ -790,6 +779,7 @@ public:
 
   void deleteDurably(std::span<const std::string> names) override {
     {
+      std::lock_guard local(parents->publication);
       int fd = lockDirectory();
       if (fd < 0) return;
       auto unlock = scope_guard([&] { ::close(fd); });
@@ -803,8 +793,12 @@ public:
   }
 
   void clear() override {
-    if (!std::filesystem::exists(basePath_)) return;
+    std::lock_guard local(parents->publication);
+    int fd = lockDirectory();
+    if (fd < 0) return;
+    auto unlock = scope_guard([&] { ::close(fd); });
     for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
+      if (entry.path().filename() == kPublicationLock) continue;
       if (entry.is_regular_file()) {
         std::filesystem::remove(entry.path());
       }

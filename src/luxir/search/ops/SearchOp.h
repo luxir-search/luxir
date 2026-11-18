@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/search/HitDecorator.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,6 +22,7 @@
 #include "luxir/query/SegmentMask.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/DomainVariantPlan.h"
+#include "luxir/search/RowRelation.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/util/BigBuffer.h"
@@ -98,13 +100,14 @@ struct StructuralConstraint {
 
     using Feed = std::function_ref<void(size_t, DomainHandle)>;
     SearchRequest& req;
+    const std::shared_ptr<IndexReader>& view;
     const StructuralConstraint* ancestor;
     size_t bucketCount;
     std::pmr::vector<std::pmr::vector<DomainHandle>> memo;
     // 0 = not produced, 1 = retained, 2 = streaming segment released.
     std::pmr::vector<uint8_t> ready;
 
-    Producer(SearchRequest& req, const StructuralConstraint* ancestor, size_t bucketCount);
+    Producer(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const StructuralConstraint* ancestor, size_t bucketCount);
     void releaseSegment(int32_t segment);
 
     DomainVariantPlan::SegmentSources& segmentSources(const DomainVariantPlan& plan,
@@ -129,8 +132,15 @@ struct StructuralConstraint {
   Producer* producer;
   size_t bucket;
   Query::Weight* selection = nullptr;
+  const RowRelation::Mapping* mapping = nullptr;
 
   bool hasSelection() const;
+  bool hasBucket() const {
+    for (auto* node = this; node; node = node->parent) {
+      if (node->producer || node->selection) return true;
+    }
+    return false;
+  }
 
   DomainHandle prefix(int32_t segment, DomainHandle eligibility) const;
 
@@ -143,17 +153,27 @@ struct BucketDomainPlan {
   Query::PlanningContext* planning = nullptr;
 };
 
+struct InputDomainPlan {
+  RowRelation::Mapping mapping;
+  DomainVariantPlan variants;
+  Query::PlanningContext* planning = nullptr;
+  bool applyParentFilters = false;
+};
+
 class SearchOp {
   std::vector<uint32_t> segmentStateRetentions;
 
 public:
+  std::vector<std::shared_ptr<HitDecorator>> decorators;
   SearchRequest& req;
+  const std::shared_ptr<IndexReader>& view;
   std::string_view name;
   uint64_t flags = 0; // effective packed options, set by the parser
   SearchOp* parent = nullptr;  // set by parser after construction.
   boost::unordered_flat_map<std::string_view, SearchOp*> subOps;  // set by parser after construction.
   ExecutionProfileOpState* executionProfile = nullptr;
   BucketDomainPlan* bucketDomain = nullptr;
+  InputDomainPlan* inputDomain = nullptr;
   bool needsStructuralScope = false;
   // The op's root mask: the segments its own query and filters (and the
   // domains of the children it produces) may match, from segment summaries.
@@ -165,8 +185,8 @@ public:
   // We can't pass both the parent and children to constructors (and have them fully formed)
   // one has to come before the other.  The parser currently sets subOps and parent
   // after construction, so do not inspect these fields in the constructor.
-  SearchOp(SearchRequest& req, std::string_view name)
-    : segmentStateRetentions(req.reader->segments().size()), req(req), name(name) {
+  SearchOp(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view name)
+    : segmentStateRetentions(view->segments().size()), req(req), view(view), name(name) {
   }
 
   bool segmentPruned(int32_t segment) const noexcept {
@@ -177,6 +197,20 @@ public:
     for (auto& [name, subOp] : subOps) {
       subOp->init();
     }
+  }
+
+  // True when the op finds its own matches rather than consuming its parent's
+  // domain whole, as a list or a fusion does.
+  virtual bool ownsMatchDomain() const { return false; }
+
+  // Upper bound on the documents this op and its children visit, from index
+  // metadata alone (see SearchConfig::auto_parallel_min_work).
+  virtual size_t workEstimate() {
+    size_t total = 0;
+    for (auto& [name, subOp] : subOps) {
+      total = saturatingAdd(total, subOp->workEstimate());
+    }
+    return total;
   }
 
   // Bucket blocks execute synchronously. Segment tasks otherwise own distinct
@@ -190,7 +224,8 @@ public:
 
   virtual void releaseSegmentState(IndexReader::Segment& segment) noexcept {
     if (segmentStateRetained(segment)) return;
-    for (auto& [name, child] : subOps) child->releaseSegmentState(segment);
+    if (inputDomain) inputDomain->variants.releaseSegmentState(view->segments()[(size_t)segment.ord]);
+    for (auto& [name, child] : subOps) child->releaseSegmentState(child->view->segments()[(size_t)segment.ord]);
   }
 
   class SegmentStateRetention {
@@ -210,7 +245,7 @@ public:
     ~SegmentStateRetention() {
       for (auto& segment : segments) {
         for (auto* op : ops) --op->segmentStateRetentions[(size_t)segment.ord];
-        for (auto* op : ops) op->releaseSegmentState(segment);
+        for (auto* op : ops) op->releaseSegmentState(op->view->segments()[(size_t)segment.ord]);
       }
     }
   };
@@ -227,7 +262,7 @@ public:
     return false;
   }
 
-  bool canInlineInBucket() { return bucketDomain == nullptr && canInline(); }
+  bool canInlineInBucket() { return inputDomain == nullptr && bucketDomain == nullptr && canInline(); }
 
   // Whether this op's inline calculator accumulates keyed batches
   // (InlineCalculator::updateKeyedBatch) from bare column reads alone, so a
@@ -275,6 +310,7 @@ public:
   // A descendant that gathers segment inputs may ask for earlier structural
   // prefixes only after the last feed. Ordinary streaming bindings do not.
   virtual bool needsCompleteBucketInput() const {
+    if (inputDomain && !inputDomain->variants.empty() && !inputDomain->variants.segmentLocal()) return true;
     if (bucketDomain && !bucketDomain->variants.segmentLocal()) return true;
     return std::ranges::any_of(subOps, [](const auto& entry) {
       return entry.second->needsCompleteBucketInput();
@@ -304,6 +340,17 @@ public:
 
   class Calculator {
   protected:
+    struct InputDomains {
+      RequestMemResource resource;
+      std::pmr::vector<DomainHandle> domains;
+      std::atomic<size_t> arrived{0};
+      InputDomains(RequestMemTracker& memory, size_t leaves)
+          : resource(memory, "mapped input domains", "domain variants"), domains(&resource) {
+        domains.resize(leaves);
+      }
+    };
+    std::unique_ptr<InputDomains> inputDomains;
+    std::optional<StructuralConstraint> mappedStructural;
     SearchOp& op;
     Calculator* parent;
     int64_t slot; // the slot this calculator is for, or -1 if not applicable
@@ -350,15 +397,38 @@ public:
     Calculator(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
         const StructuralConstraint* structural = nullptr)
         : op(op), parent(parent), slot(slot), numSlots(numSlots),
-          structural(structural ? structural : parent ? parent->structural : nullptr) {}
+          structural(structural ? structural : parent ? parent->structural : nullptr) {
+      if (op.inputDomain) {
+        mappedStructural.emplace(StructuralConstraint{this->structural, nullptr, 0, nullptr,
+            &op.inputDomain->mapping});
+        this->structural = &*mappedStructural;
+        if (!op.inputDomain->variants.empty()
+            && !op.inputDomain->variants.segmentLocal(this->structural->hasSelection())) {
+          inputDomains = std::make_unique<InputDomains>(op.req.memoryTracker, op.view->segments().size());
+        }
+      }
+    }
+
+    // Delivery binds the input domain before the operation sees it. The
+    // calculators retain their ordinary per-leaf and whole-index contracts.
+    void accept(oneapi::tbb::task_group* tg, int32_t segment, DomainHandle domain);
+    void acceptAll(oneapi::tbb::task_group* tg, std::span<const DomainHandle> domains);
 
     const StructuralConstraint* structuralConstraint() const {
       return structural;
     }
 
+    const StructuralConstraint* inputConstraint() const {
+      return mappedStructural ? mappedStructural->parent : structural;
+    }
+
     std::vector<DomainHandle> structuralDomains() const;
+    std::vector<DomainHandle> structuralDomains(const std::shared_ptr<IndexReader>& view,
+        const StructuralConstraint* path) const;
 
     StructuralConstraint::Finish structuralFinish() const;
+    StructuralConstraint::Finish structuralFinish(const std::shared_ptr<IndexReader>& view,
+        const StructuralConstraint* path) const;
 
     virtual size_t facetBucketObservedBytes() const { return op.facetBucketResidentBytes(); }
 
@@ -494,8 +564,8 @@ public:
     // individual handles, never the span.
     virtual void calcAll(oneapi::tbb::task_group* tg,
                          std::span<const DomainHandle> domains) {
-      assert(structural == nullptr || tg == nullptr);
-      assert(domains.size() == op.req.reader->segments().size());
+      assert(structural == nullptr || !structural->hasBucket() || tg == nullptr);
+      assert(domains.size() == op.view->segments().size());
       if (domains.empty()) {
         calc(tg, -1, {});
         return;
@@ -505,6 +575,7 @@ public:
       task_group_fanout(tg, domains.size(), [&](size_t segnum) {
         return [this, tg, segnum, domain = domains[segnum]]() {
           assert(domain.isDeliverable());
+          domain.assertScope(op.view->segments()[segnum]);
           calc(tg, (int32_t)segnum, domain);
         };
       });

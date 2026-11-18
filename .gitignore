@@ -67,3 +67,4 @@ LocalTargets.cmake
 
 # editor swap files
 .*.sw[a-p]
+__pycache__/

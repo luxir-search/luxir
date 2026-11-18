@@ -198,6 +198,8 @@ TEST(PluginQueryTest, identityAndSharedFilterCache) {
   auto* alias = parse(R"({"field_value_alias":{"value":"x"}})");
   auto* different = parse(R"({"field_value":{"value":"y"}})");
   ASSERT_EQ(QueryKind::PLUGIN, category->getKind());
+  EXPECT_FALSE(logicalConsumesDomain(*category));
+  EXPECT_FALSE(logicalConsumesDomain(*byId));
   EXPECT_NE(nullptr, dynamic_cast<example::CategoryValueQuery*>(category));
   EXPECT_NE(nullptr, dynamic_cast<example::IdValueQuery*>(byId));
   EXPECT_TRUE(category->equals(*same));
@@ -287,6 +289,20 @@ TEST_F(PluginExtensionTest, searchOpWithExtraColumnAndNestedOps) {
   // Out-of-tree plugins may register more operations beside the example's.
   EXPECT_NE(std::string::npos, unknown.body().find("unknown search op 'nope'; registered plugin operations: ")) << unknown.body();
   EXPECT_NE(std::string::npos, unknown.body().find("sample_docs")) << unknown.body();
+}
+
+TEST_F(PluginExtensionTest, hitDecoratorAddsColumnToEmittedHits) {
+  for (std::string_view decorate : {R"("decorate":{"label":{"text":"hi"}})", R"("label":{"text":"hi"})"}) {
+    SCOPED_TRACE(decorate);
+    auto res = search(R"({"ops":{"q":{"top_docs":{"query":"id:d1","fields":["id"],)" + std::string(decorate) + "}}}}");
+    ASSERT_EQ(200, res.result_int()) << res.body();
+    EXPECT_NE(std::string::npos, res.body().find(R"({"id":"d1","label":"hi"})")) << res.body();
+  }
+  auto unknownParam = search(R"({"ops":{"q":{"top_docs":{"decorate":{"label":{"text":"hi","x":1}}}}}})");
+  EXPECT_EQ(400, unknownParam.result_int()) << unknownParam.body();
+  auto unknownName = search(R"({"ops":{"q":{"top_docs":{"decorate":{"nope":{}}}}}})");
+  EXPECT_EQ(400, unknownName.result_int()) << unknownName.body();
+  EXPECT_NE(std::string::npos, unknownName.body().find("unknown hit decorator 'nope'")) << unknownName.body();
 }
 
 TEST_F(PluginExtensionTest, extraColumnRejectsDiscoveredFieldCollisions) {
@@ -450,4 +466,22 @@ TEST(PluginQueryTest, nodeConstructorRethrowsStateCreationFailure) {
   }
   LuxirNode node;
   EXPECT_NE(nullptr, node.pluginState<example::NodeState>("example"));
+}
+
+TEST_F(PluginExtensionTest, decoratorInspectsFuzzyRankingTerms) {
+  auto res = search(R"({"ops":{"q":{"top_docs":{"query":{"fuzzy":{"field":"id","term":"d1","max_edits":1,"prefix_length":1}},"sort":"score desc","fields":["id"],"decorate":{"ranking_terms":{}}}}}})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_NE(std::string::npos, res.body().find(R"("ranking_terms":"id:d1,id:d2,id:d3,id:d4")")) << res.body();
+}
+
+TEST_F(PluginExtensionTest, decoratorInspectsBrowseNestedAndFusionSources) {
+  const std::pair<std::string_view, std::string_view> cases[] = {
+      {R"({"ops":{"q":{"top_docs":{"fields":["id"],"decorate":{"ranking_terms":{}}}}}})", ""},
+      {R"({"ops":{"cats":{"field_facet":{"field":"cat_s","ops":{"q":{"top_docs":{"query":"id:d1","fields":["id"],"decorate":{"ranking_terms":{}}}}}}}}})", "id:d1"},
+      {R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{"a":{"query":"id:d1"},"b":{"query":"id:d2"}},"fields":["id"],"decorate":{"ranking_terms":{}}}}}})", "id:d1,id:d2"}};
+  for (const auto& [request, terms] : cases) {
+    auto res = search(std::string(request));
+    ASSERT_EQ(200, res.result_int()) << res.body();
+    EXPECT_NE(std::string::npos, res.body().find("\"ranking_terms\":\"" + std::string(terms) + "\"")) << res.body();
+  }
 }

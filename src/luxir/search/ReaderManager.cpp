@@ -27,7 +27,7 @@ std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapsh
 
 void ReaderManager::publishReader(std::shared_ptr<IndexReader> reader) {
   auto previous = indexReader.load(std::memory_order_relaxed);
-  if (!previous || reader->core != previous->core) filterCache->onReaderPublished(*reader);
+  if (!previous || reader->snapshot->core != previous->snapshot->core) filterCache->onReaderPublished(*reader);
   indexReader.store(std::move(reader), std::memory_order_release);
 }
 

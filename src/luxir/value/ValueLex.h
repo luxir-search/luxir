@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <memory_resource>
@@ -54,6 +55,11 @@ inline std::string_view scanVariable(Cursor& cur) {
 inline std::string_view scanNumber(Cursor& cur) {
   size_t start = cur.position();
   if (cur.peek() == '+' || cur.peek() == '-') cur.advance();
+  if (cur.peek() == '0' && (cur.peekAt(1) == 'x' || cur.peekAt(1) == 'X')) {
+    cur.advance(2);
+    cur.takeWhile([](char c) { return digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); });
+    return cur.slice(start, cur.position());
+  }
   bool digitsBefore = false;
   while (digit(cur.peek())) {
     digitsBefore = true;
@@ -88,6 +94,7 @@ struct NumericLiteral {
   bool floating = false;
   int64_t intValue = 0;
   double doubleValue = 0.0;
+  bool hex = false;
 };
 
 template <class Fail>
@@ -100,11 +107,28 @@ NumericLiteral parseNumericLiteral(Cursor& cur, Fail&& fail) {
     return literal;
   }
   char next = cur.peek();
-  constexpr std::string_view TERMINATORS = ",)+-*/<>=!?:&|";
+  constexpr std::string_view TERMINATORS = ",)+-*/%^<>=!?:&|";
   if (!cur.atEnd() && cur.wsLen() == 0
       && TERMINATORS.find(next) == std::string_view::npos) {
     fail(pos, fmt::format("invalid numeric literal '{}'",
                           cur.slice(pos, cur.position() + 1)));
+    return literal;
+  }
+
+  std::string_view hex = literal.text;
+  bool negative = hex.starts_with('-');
+  if (negative || hex.starts_with('+')) hex.remove_prefix(1);
+  if (hex.starts_with("0x") || hex.starts_with("0X")) {
+    hex.remove_prefix(2);
+    uint64_t bits = 0;
+    auto [ptr, ec] = std::from_chars(hex.data(), hex.data() + hex.size(), bits, 16);
+    int64_t value = std::bit_cast<int64_t>(bits);
+    if (ec != std::errc() || ptr != hex.data() + hex.size()
+        || (negative && __builtin_sub_overflow(INT64_C(0), value, &value))) {
+      fail(pos, fmt::format("hex integer literal '{}' is out of range or invalid", literal.text));
+    }
+    literal.intValue = value;
+    literal.hex = true;
     return literal;
   }
 
