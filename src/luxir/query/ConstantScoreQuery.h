@@ -312,6 +312,10 @@ public:
           | (childWeight->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN | OBSERVED_FILTER_CACHE));
     }
 
+    std::optional<float> constantContribution() const override {
+      return constantScore;
+    }
+
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
       QueryPrep::PreparedSource source;
       source.weight = childWeight;

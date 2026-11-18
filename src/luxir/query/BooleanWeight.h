@@ -8532,48 +8532,14 @@ class BooleanQuery::Weight final : public Query::Weight {
     return optionalCost(costs, minShouldMatch, maxDoc);
   }
 
-  // Estimates the boolean match cost from child supplier costs.
-  static int64_t compositeCost(
-      MemPool& targetPool,
-      IndexReader::Segment& segment,
-      std::span<Query::SegmentSource* const> mandatorySources,
-      std::span<Query::SegmentSource* const> optionalSources,
-      std::span<Query::ScorerSupplier* const> filterSuppliers,
-      int minShouldMatch) {
-    int64_t maxDoc = segment.maxDoc();
-    bool hasMandatory = !mandatorySources.empty();
-    if (hasMandatory || !filterSuppliers.empty()) {
-      // Required = mandatory + filter, conjoined: at most the rarest clause.
-      int64_t minReq = maxDoc;
-      for (auto* source : mandatorySources) {
-        auto* supplier = source->scorerSupplier(targetPool, segment);
-        if (supplier == nullptr) return 0;
-        minReq = std::min(minReq, supplier->cost());
-      }
-      for (auto* supplier : filterSuppliers) {
-        if (supplier == nullptr) return 0;
-        minReq = std::min(minReq, supplier->cost());
-      }
-      // A rank-only optional group (min_match unset) never decides a match,
-      // so it cannot tighten the estimate; a constraining group
-      // (min_match >= 1) is conjoined and can.
-      if (minShouldMatch >= 1 && !optionalSources.empty()) {
-        return std::min(minReq, optionalCost(targetPool, segment, optionalSources, minShouldMatch, maxDoc));
-      }
-      return minReq;
-    }
-    return optionalCost(targetPool, segment, optionalSources, minShouldMatch, maxDoc);
-  }
-
   class Supplier final : public Query::ScorerSupplier {
     MemPool& pool;
     IndexReader::Segment& segment;
-    std::span<Query::SegmentSource* const> mandatorySources;
+    std::span<Query::ScorerSupplier* const> mandatoryShapeSuppliers;
     std::span<const uint8_t> mandatoryScores;
     std::span<Query::SegmentSource* const> optionalSources;
     std::span<Query::SegmentSource* const> prohibitedSources;
     std::span<Query::ScorerSupplier* const> filterSuppliers;
-    std::span<Query::ScorerSupplier* const> mandatoryShapeSuppliers;
     std::span<Query::ScorerSupplier* const> optionalShapeSuppliers;
     std::span<Query::ScorerSupplier* const> prohibitedShapeSuppliers;
     int64_t shapeRequiredCost;
@@ -8878,7 +8844,7 @@ class BooleanQuery::Weight final : public Query::Weight {
     }
 
     std::optional<bool> directWindowFilters(const ChildPlans& members) const {
-      if (!mandatorySources.empty() || filterSuppliers.empty()) return false;
+      if (!mandatoryShapeSuppliers.empty() || filterSuppliers.empty()) return false;
       for (auto* supplier : filterSuppliers) {
         if (supplier == nullptr) return false;
         Query::ScorerShape shape = supplier->describeScorer(members.contextOf(supplier));
@@ -8926,7 +8892,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       bool filteredUnionWandCandidate =
           !buildContext.disableFilteredUnionWandForTests
           && needsScores && minShouldMatch == 1
-          && mandatorySources.empty() && prohibitedSources.empty()
+          && mandatoryShapeSuppliers.empty() && prohibitedSources.empty()
           && filterDensityRoutesToPull(
               shapeRequiredCost, segment.maxDoc());
       if (filteredUnionWandCandidate
@@ -9035,7 +9001,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         }
         return assembleScorer(
             targetPool, supplier.segment, required, optional, prohibited,
-            requiredLeadCost, sourceGroup, supplier.mandatorySources.size(),
+            requiredLeadCost, sourceGroup, supplier.mandatoryShapeSuppliers.size(),
             supplier.filterSuppliers.size(),
             supplier.optionalSources.size(),
             supplier.prohibitedSources.size(), supplier.minShouldMatch,
@@ -9072,13 +9038,11 @@ class BooleanQuery::Weight final : public Query::Weight {
 
   public:
     Supplier(MemPool& pool, IndexReader::Segment& segment,
-             std::span<Query::SegmentSource* const> mandatorySources,
+             std::span<Query::ScorerSupplier* const> mandatoryShapeSuppliers,
              std::span<const uint8_t> mandatoryScores,
              std::span<Query::SegmentSource* const> optionalSources,
              std::span<Query::SegmentSource* const> prohibitedSources,
              std::span<Query::ScorerSupplier* const> filterSuppliers,
-             std::span<Query::ScorerSupplier* const>
-                 mandatoryShapeSuppliers,
              std::span<Query::ScorerSupplier* const>
                  optionalShapeSuppliers,
              std::span<Query::ScorerSupplier* const>
@@ -9090,11 +9054,10 @@ class BooleanQuery::Weight final : public Query::Weight {
              bool uniformConstantCandidate,
              Query::SupplierExecutionMode executionMode,
              ScorePolicy scorePolicy)
-      : pool(pool), segment(segment), mandatorySources(mandatorySources),
+      : pool(pool), segment(segment), mandatoryShapeSuppliers(mandatoryShapeSuppliers),
         mandatoryScores(mandatoryScores),
         optionalSources(optionalSources), prohibitedSources(prohibitedSources),
         filterSuppliers(filterSuppliers),
-        mandatoryShapeSuppliers(mandatoryShapeSuppliers),
         optionalShapeSuppliers(optionalShapeSuppliers),
         prohibitedShapeSuppliers(prohibitedShapeSuppliers),
         shapeRequiredCost(shapeRequiredCost),
@@ -9195,7 +9158,7 @@ class BooleanQuery::Weight final : public Query::Weight {
 
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
-      bool hasRequired = !mandatorySources.empty()
+      bool hasRequired = !mandatoryShapeSuppliers.empty()
           || !filterSuppliers.empty();
       Query::PlanContext unboundedContext = childPlanContext(
           buildContext, std::numeric_limits<int64_t>::max());
@@ -9292,7 +9255,7 @@ class BooleanQuery::Weight final : public Query::Weight {
                                     members.contextOf(child.supplier)));
       }
 
-      bool hasRequired = !mandatorySources.empty()
+      bool hasRequired = !mandatoryShapeSuppliers.empty()
           || !filterSuppliers.empty();
       Query::PlanContext unboundedContext = childPlanContext(
           buildContext, std::numeric_limits<int64_t>::max());
@@ -9752,7 +9715,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       if (!needsScores && disableFilterClauseCountForTests) {
         return nullptr;
       }
-      if (!mandatorySources.empty() || !optionalSources.empty()
+      if (!mandatoryShapeSuppliers.empty() || !optionalSources.empty()
           || !prohibitedSources.empty() || filterSuppliers.size() != 1
           || filterSuppliers[0] == nullptr || minShouldMatch != 0) {
         return nullptr;
@@ -9762,7 +9725,7 @@ class BooleanQuery::Weight final : public Query::Weight {
 
     Query::ScorerSupplier::ExactCountTopKCosts
     exactCountTopKCosts() override {
-      if (!mandatorySources.empty() || optionalSources.size() < 2
+      if (!mandatoryShapeSuppliers.empty() || optionalSources.size() < 2
           || !prohibitedSources.empty() || filterSuppliers.size() != 1
           || filterSuppliers[0] == nullptr || minShouldMatch != 1) {
         return {};
@@ -11015,7 +10978,7 @@ class BooleanQuery::Weight final : public Query::Weight {
 
     bool filteredDisjunctionDensityDecline() const {
       if (disableFilteredDisjunctionBatchForTests || allowsPruning
-          || !mandatorySources.empty() || optionalSources.size() < 2
+          || !mandatoryShapeSuppliers.empty() || optionalSources.size() < 2
           || !prohibitedSources.empty() || filterSuppliers.size() != 1
           || minShouldMatch != 1 || filterSuppliers[0] == nullptr) {
         return false;
@@ -11409,7 +11372,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         const ConjunctionBulkResult& result) const {
       assert(result.usesCandidateRoute());
       skipCount(SkipStats::filteredConjBatchEngagements);
-      if (mandatorySources.size() > 1) {
+      if (mandatoryShapeSuppliers.size() > 1) {
         skipCount(SkipStats::filteredConjBatchMultiTermEngagements);
       }
       if (result.route
@@ -11667,7 +11630,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       // A pure scored disjunction rescores candidates exactly, which the
       // exact-count composition needs from its scoring bulk.
       if (needsScores && use == BulkUse::EXACT_CANDIDATE_SCORING
-          && prohibited.empty() && mandatorySources.empty()) {
+          && prohibited.empty() && mandatoryShapeSuppliers.empty()) {
         plan.supportsExactCandidateScoring = BulkAnswer::YES;
       }
       return plan;
@@ -11750,7 +11713,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           noBulkPlan(), FilteredDisjunctionDisposition::DECLINED};
       };
       if (disableFilteredDisjunctionBatchForTests || allowsPruning
-          || mandatorySources.size() != 0 || optionalSources.size() < 2
+          || mandatoryShapeSuppliers.size() != 0 || optionalSources.size() < 2
           || prohibitedSources.size() != 0 || filterSuppliers.size() != 1
           || minShouldMatch != 1) {
         return declined();
@@ -11896,7 +11859,7 @@ class BooleanQuery::Weight final : public Query::Weight {
 
     BulkPlan planExactFilteredMandOptBulk(BulkUse use) {
       if (disableExactFilteredMandOptCompositionForTests || allowsPruning
-          || mandatorySources.size() != 1 || optionalSources.empty()
+          || mandatoryShapeSuppliers.size() != 1 || optionalSources.empty()
           || !prohibitedSources.empty() || filterSuppliers.size() != 1
           || minShouldMatch >= 1) {
         return noBulkPlan();
@@ -11980,7 +11943,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       // must stay on the pull MandOptScorer path.
       if (!needsScores || filterSuppliers.empty()
           || minShouldMatch > 1
-          || (mandatorySources.empty() && minShouldMatch < 1)) {
+          || (mandatoryShapeSuppliers.empty() && minShouldMatch < 1)) {
         return noBulkPlan();
       }
       int64_t localFilterCost = minFilterCost();
@@ -12004,7 +11967,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       // the existing scored-body plus WindowFilter plan below.
       if (allowsPruning && !disableFilteredConjunctionBatchForTests
           && filterSuppliers.size() == 1
-          && !mandatorySources.empty() && optionalSources.empty()
+          && !mandatoryShapeSuppliers.empty() && optionalSources.empty()
           && minShouldMatch == 0) {
         ConjunctionPlanningResult candidate = planConjunction(
             pool, ConjunctionMode::CANDIDATE,
@@ -12031,16 +11994,15 @@ class BooleanQuery::Weight final : public Query::Weight {
       // construct the scorer, independent of whether normalization exposed
       // the body directly or wrapped it as a single child.
       Query::ScorerSupplier* bodySupplier = nullptr;
-      if (mandatorySources.size() == 1 && optionalSources.empty()
+      if (mandatoryShapeSuppliers.size() == 1 && optionalSources.empty()
           && minShouldMatch < 1) {
-        bodySupplier = mandatorySources[0]->scorerSupplier(
-            pool, segment, executionMode);
-      } else if (mandatorySources.empty() && optionalSources.size() == 1) {
+        bodySupplier = mandatoryShapeSuppliers[0];
+      } else if (mandatoryShapeSuppliers.empty() && optionalSources.size() == 1) {
         bodySupplier = optionalSources[0]->scorerSupplier(
             pool, segment, executionMode);
       } else {
         bodySupplier = makeSupplier(
-            pool, segment, mandatorySources, mandatoryScores,
+            pool, segment, mandatoryShapeSuppliers, mandatoryScores,
             optionalSources,
             std::span<Query::SegmentSource* const>{},
             std::span<Query::ScorerSupplier* const>{},
@@ -12262,7 +12224,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         BulkUse use, const BulkScorerContext& bulkContext) override {
       if (scorePolicy.kind != ScorePolicy::SUM) return noBulkPlan();
       if (bulkContext.requireConstantCount) {
-        if (mandatorySources.empty() && prohibitedSources.empty()
+        if (mandatoryShapeSuppliers.empty() && prohibitedSources.empty()
             && filterSuppliers.empty() && minShouldMatch <= 1
             && optionalShapeSuppliers.size() == 1
             && optionalShapeSuppliers[0] != nullptr) {
@@ -12279,7 +12241,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       if (hasEnclosingFilters && !disableIntegratedFilteredCountForTests
           && !needsScores && optionalSources.empty()
           && prohibitedSources.empty() && minShouldMatch < 1) {
-        if (mandatorySources.size() == 1) {
+        if (mandatoryShapeSuppliers.size() == 1) {
           Query::ScorerSupplier* child = mandatoryShapeSuppliers[0];
           if (child != nullptr) {
             BulkPlan childPlan = child->planBulk(use, bulkContext);
@@ -12294,7 +12256,7 @@ class BooleanQuery::Weight final : public Query::Weight {
               return plan;
             }
           }
-        } else if (mandatorySources.size() >= 2
+        } else if (mandatoryShapeSuppliers.size() >= 2
                    && !bulkContext.filterSuppliers.empty()) {
           BulkPlan plan = planConjunctionBulk(
               use, ConjunctionMode::EXHAUSTIVE, allRouteMask(),
@@ -12306,7 +12268,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         return noBulkPlan();
       }
 
-      if (mandatorySources.empty() && optionalSources.empty()
+      if (mandatoryShapeSuppliers.empty() && optionalSources.empty()
           && prohibitedSources.empty() && !filterSuppliers.empty()) {
         return planFilterOnlyBulk(use, bulkContext);
       }
@@ -12317,7 +12279,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           BulkPlan filtered = planFilteredScoredBulk(use);
           if (filtered.available == BulkAnswer::YES) return filtered;
         }
-        bool maxScoreShape = mandatorySources.empty()
+        bool maxScoreShape = mandatoryShapeSuppliers.empty()
             && filterSuppliers.empty() && minShouldMatch <= 1
             && optionalSources.size() >= 2;
         if (!maxScoreShape || disableBulkExclusionForTests) {
@@ -12326,7 +12288,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         return planMaxScoreBulk(use, true, bulkContext);
       }
 
-      if (!filterSuppliers.empty() && mandatorySources.empty()
+      if (!filterSuppliers.empty() && mandatoryShapeSuppliers.empty()
           && prohibitedSources.empty() && optionalSources.size() >= 2
           && minShouldMatch == 1 && !allowsPruning) {
         auto disjunction = planFilteredDisjunctionBulk(use, bulkContext);
@@ -12343,9 +12305,9 @@ class BooleanQuery::Weight final : public Query::Weight {
       if (needsScores && !allowsPruning
           && !disableFilteredConjunctionBatchForTests
           && !filterSuppliers.empty()
-          && mandatorySources.size() >= 1
+          && mandatoryShapeSuppliers.size() >= 1
           && (!disableFilteredConjMultiTermForTests
-              || mandatorySources.size() == 1)
+              || mandatoryShapeSuppliers.size() == 1)
           && optionalSources.empty() && prohibitedSources.empty()) {
         BulkPlan candidate = planConjunctionBulk(
             BulkUse::EXACT_CANDIDATE_SCORING,
@@ -12353,7 +12315,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         if (candidate.available == BulkAnswer::YES) return candidate;
       }
 
-      bool hasFilteredCountBody = !mandatorySources.empty()
+      bool hasFilteredCountBody = !mandatoryShapeSuppliers.empty()
           || (minShouldMatch >= 1 && !optionalSources.empty());
       if (!needsScores && hasFilteredCountBody
           && optionalSources.empty() == (minShouldMatch < 1)
@@ -12364,7 +12326,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           return noBulkPlan();
         }
         if (!disableIntegratedFilteredCountForTests
-            && mandatorySources.size() == 1
+            && mandatoryShapeSuppliers.size() == 1
             && optionalSources.empty() && prohibitedSources.empty()
             && !filterSuppliers.empty() && minShouldMatch < 1) {
           Query::ScorerSupplier* child = mandatoryShapeSuppliers[0];
@@ -12392,7 +12354,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         if (conjunction.available == BulkAnswer::YES) {
           return conjunction;
         }
-        bool pureFilteredDisjunction = mandatorySources.empty()
+        bool pureFilteredDisjunction = mandatoryShapeSuppliers.empty()
             && prohibitedSources.empty() && optionalSources.size() >= 2
             && minShouldMatch == 1;
         if (!pureFilteredDisjunction) return noBulkPlan();
@@ -12404,7 +12366,7 @@ class BooleanQuery::Weight final : public Query::Weight {
             ? noBulkPlan() : planFilteredScoredBulk(use);
       }
       if (optionalSources.empty() && prohibitedSources.empty()
-          && filterSuppliers.empty() && mandatorySources.size() >= 2) {
+          && filterSuppliers.empty() && mandatoryShapeSuppliers.size() >= 2) {
         // An unscored count or domain over required clauses alone is
         // membership like a filtered count body: per-clause demand lets a
         // verifying clause (a column check beside a term) take the lead's
@@ -12420,12 +12382,12 @@ class BooleanQuery::Weight final : public Query::Weight {
             use, ConjunctionMode::SCORED_BODY,
             routeBit(ConjunctionRoute::GENERIC), {}, bulkContext);
       }
-      if (!disableMandOptBulkForTests && mandatorySources.size() == 1
+      if (!disableMandOptBulkForTests && mandatoryShapeSuppliers.size() == 1
           && !optionalSources.empty() && prohibitedSources.empty()
           && filterSuppliers.empty() && minShouldMatch < 1) {
         return planMandOptBulk(use, bulkContext);
       }
-      if (!mandatorySources.empty() || !prohibitedSources.empty()
+      if (!mandatoryShapeSuppliers.empty() || !prohibitedSources.empty()
           || !filterSuppliers.empty() || minShouldMatch > 1
           || optionalSources.size() < 2) {
         return noBulkPlan();
@@ -12438,7 +12400,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         const BulkPlan& plan) override {
       if (plan.available == BulkAnswer::NO && needsScores
           && !prohibitedSources.empty()) {
-        bool maxScoreShape = mandatorySources.empty()
+        bool maxScoreShape = mandatoryShapeSuppliers.empty()
             && filterSuppliers.empty() && minShouldMatch <= 1
             && optionalSources.size() >= 2;
         if (!maxScoreShape) {
@@ -12469,7 +12431,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       if (plan.available == BulkAnswer::NO
           && bulkContext.hasFilter()
           && !disableMandOptBulkForTests
-          && mandatorySources.size() == 1
+          && mandatoryShapeSuppliers.size() == 1
           && !optionalSources.empty() && prohibitedSources.empty()
           && filterSuppliers.empty() && minShouldMatch < 1
           && !disableFilteredMandOptFillGateForTests
@@ -12488,15 +12450,15 @@ class BooleanQuery::Weight final : public Query::Weight {
           && !filterDensityRoutesToPull(
               localFilterCost, segment.maxDoc())) {
         Query::ScorerSupplier* body = nullptr;
-        if (mandatorySources.size() == 1 && optionalSources.empty()
+        if (mandatoryShapeSuppliers.size() == 1 && optionalSources.empty()
             && minShouldMatch < 1) {
           body = mandatoryShapeSuppliers[0];
-        } else if (mandatorySources.empty()
+        } else if (mandatoryShapeSuppliers.empty()
                    && optionalSources.size() == 1) {
           body = optionalShapeSuppliers[0];
         } else {
           body = makeSupplier(
-              pool, segment, mandatorySources, mandatoryScores,
+              pool, segment, mandatoryShapeSuppliers, mandatoryScores,
               optionalSources,
               std::span<Query::SegmentSource* const>{},
               std::span<Query::ScorerSupplier* const>{},
@@ -12530,7 +12492,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         return;
       }
 
-      bool hasFilteredCountBody = !mandatorySources.empty()
+      bool hasFilteredCountBody = !mandatoryShapeSuppliers.empty()
           || (minShouldMatch >= 1 && !optionalSources.empty());
       if (needsScores || !hasFilteredCountBody
           || optionalSources.empty() != (minShouldMatch < 1)
@@ -12538,7 +12500,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           || minShouldMatch > 1) {
         return;
       }
-      bool pureFilteredDisjunction = mandatorySources.empty()
+      bool pureFilteredDisjunction = mandatoryShapeSuppliers.empty()
           && prohibitedSources.empty() && optionalSources.size() >= 2
           && minShouldMatch == 1;
       if (!pureFilteredDisjunction) {
@@ -12555,7 +12517,7 @@ class BooleanQuery::Weight final : public Query::Weight {
 
     void recordDisjunctionCountIdentityShapeFallbacks() const {
       if (needsScores || optionalSources.size() < 2) return;
-      if (!mandatorySources.empty()) {
+      if (!mandatoryShapeSuppliers.empty()) {
         skipCount(SkipStats::disjCountIdentityRequiredFallbacks);
       }
       if (!prohibitedSources.empty()) {
@@ -12626,10 +12588,23 @@ class BooleanQuery::Weight final : public Query::Weight {
     }
   };
 
+  template <typename SourceAt>
+  static std::span<Query::ScorerSupplier*> collectMandatorySuppliers(
+      MemPool& targetPool, IndexReader::Segment& segment, size_t count,
+      SourceAt sourceAt, Query::SupplierExecutionMode executionMode) {
+    if (count == 0) return {};
+    auto suppliers = targetPool.make_span<Query::ScorerSupplier*>(count);
+    for (size_t i = 0; i < count; i++) {
+      suppliers[i] = sourceAt(i).scorerSupplier(
+          targetPool, segment, executionMode);
+    }
+    return suppliers;
+  }
+
   static Query::ScorerSupplier* makeSupplier(
       MemPool& targetPool,
       IndexReader::Segment& segment,
-      std::span<Query::SegmentSource* const> mandatorySources,
+      std::span<Query::ScorerSupplier* const> mandatorySuppliers,
       std::span<const uint8_t> mandatoryScores,
       std::span<Query::SegmentSource* const> optionalSources,
       std::span<Query::SegmentSource* const> prohibitedSources,
@@ -12644,15 +12619,12 @@ class BooleanQuery::Weight final : public Query::Weight {
     // Weight-time optional removal can expose a Boolean child that
     // normalization could not unwrap while the optionals were still present.
     // Preserve the child's complete supplier contract, including bulkScorer.
-    if (minShouldMatch < 1 && mandatorySources.size() == 1
+    if (minShouldMatch < 1 && mandatorySuppliers.size() == 1
         && optionalSources.empty()
         && prohibitedSources.empty() && filterSuppliers.empty()) {
-      auto* child = mandatorySources[0]->scorerSupplier(
-          targetPool, segment, executionMode);
+      auto* child = mandatorySuppliers[0];
       if (child != nullptr) return child;
     }
-    auto mandatoryShapeSuppliers = QueryPrep::collectSuppliers(
-        targetPool, segment, mandatorySources, executionMode);
     auto optionalShapeSuppliers = QueryPrep::collectSuppliers(
         targetPool, segment, optionalSources, executionMode);
     assert(prohibitedShapeSuppliers.size() == prohibitedSources.size());
@@ -12662,7 +12634,7 @@ class BooleanQuery::Weight final : public Query::Weight {
     // a dropped-clause singleton keeps the clause's own execution routes.
     // A clause is dead only when its own shape proves it empty; the cost
     // check just keeps describeScorer off live-clause construction.
-    if (minShouldMatch <= 1 && mandatorySources.empty()
+    if (minShouldMatch <= 1 && mandatorySuppliers.empty()
         && prohibitedSources.empty() && filterSuppliers.empty()) {
       Query::ScorerSupplier* survivor = nullptr;
       bool single = true;
@@ -12687,7 +12659,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
     }
     int64_t shapeRequiredCost = segment.maxDoc();
-    for (auto* supplier : mandatoryShapeSuppliers) {
+    for (auto* supplier : mandatorySuppliers) {
       if (supplier != nullptr) {
         shapeRequiredCost = std::min(shapeRequiredCost, supplier->cost());
       }
@@ -12698,8 +12670,8 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
     }
     return targetPool.make<Supplier>(
-      targetPool, segment, mandatorySources, mandatoryScores, optionalSources,
-      prohibitedSources, filterSuppliers, mandatoryShapeSuppliers,
+      targetPool, segment, mandatorySuppliers, mandatoryScores, optionalSources,
+      prohibitedSources, filterSuppliers,
       optionalShapeSuppliers, prohibitedShapeSuppliers, shapeRequiredCost,
       minShouldMatch, needsScores, allowsPruning,
       uniformConstantCandidate, executionMode, scorePolicy);
@@ -12800,9 +12772,13 @@ class BooleanQuery::Weight final : public Query::Weight {
             targetPool, prohibitedSources[i], reader, segment,
             prohibitedCacheEnabled, route, executionMode);
       }
+      auto mandatorySuppliers = collectMandatorySuppliers(
+          targetPool, segment, mandatorySources.size(),
+          [&](size_t i) -> Query::SegmentSource& {
+            return mandatorySources[i].segmentSource();
+          }, executionMode);
       return makeSupplier(
-        targetPool, segment,
-        QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(mandatorySources)),
+        targetPool, segment, mandatorySuppliers,
         mandatoryScores,
         QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
         prohibitedSegmentSources, prohibitedSuppliers,
@@ -13181,7 +13157,6 @@ public:
       luxir::MemPool& targetPool,
       luxir::IndexReader::Segment& segment,
       Query::SupplierExecutionMode executionMode) override {
-    auto mandatorySources = QueryPrep::liveSources(targetPool, mandatoryWeights);
     auto optionalSources = QueryPrep::liveSources(targetPool, optionalWeights);
     auto prohibitedSources = QueryPrep::liveSources(targetPool, prohibitedWeights);
     auto prohibitedSuppliers = targetPool.make_span<Query::ScorerSupplier*>(
@@ -13229,7 +13204,11 @@ public:
                 ? filterUses[i]->work((size_t)segment.ord) : FilterCache::Work::assumed());
       }
     }
-    return makeSupplier(targetPool, segment, mandatorySources, mandatoryScores,
+    auto mandatorySuppliers = collectMandatorySuppliers(
+        targetPool, segment, mandatoryWeights.size(),
+        [&](size_t i) -> Query::SegmentSource& { return *mandatoryWeights[i]; },
+        executionMode);
+    return makeSupplier(targetPool, segment, mandatorySuppliers, mandatoryScores,
                         optionalSources,
                         prohibitedSources, prohibitedSuppliers,
                         filterSuppliers, minShouldMatch,

@@ -11,6 +11,7 @@
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/AllQuery.h"
+#include "luxir/query/QueryPrep.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -73,6 +74,60 @@ public:
     return q->createWeight(ctx, flags)->isConstantScoring();
   }
 };
+
+TEST_F(ScorerCostTest, docSetSupplierCarriesItsConstantThroughPullAndBulk) {
+  auto& segment = reader->segments()[0];
+  DocSetBuilder builder(segment.maxDoc());
+  builder.add(1); builder.add(4);
+  auto docs = builder.build();
+  QueryPrep::DocSetSupplier unscored(docs.get(), segment);
+  QueryPrep::DocSetSupplier scored(docs.get(), segment, 3.25f);
+  for (auto* supplier : {&unscored, &scored}) {
+    float expected = supplier == &unscored ? 0.0f : 3.25f;
+    EXPECT_EQ(docs.get(), supplier->exactDocSet());
+    EXPECT_EQ(2, supplier->cost());
+    auto* plan = supplier->resolve(pool, supplier->makePlanContext(
+        Query::Demand::fromLeadCost(segment.maxDoc())));
+    EXPECT_EQ(Query::DirectScorerKind::DOC_SET, plan->shape().directKind);
+    EXPECT_TRUE(plan->supportsReset());
+    auto* scorer = plan->build(pool);
+    ASSERT_NE(nullptr, scorer);
+    EXPECT_EQ(1, scorer->next());
+    EXPECT_FLOAT_EQ(expected, scorer->score());
+    EXPECT_FLOAT_EQ(expected, scorer->getMaxScore(segment.maxDoc()));
+    EXPECT_FLOAT_EQ(expected, scorer->refineMaxScore(segment.maxDoc()));
+    auto bounds = scorer->getScoreBounds(segment.maxDoc());
+    auto refined = scorer->refineScoreBounds(segment.maxDoc());
+    EXPECT_FLOAT_EQ(expected, bounds.lo); EXPECT_FLOAT_EQ(expected, bounds.hi);
+    EXPECT_FLOAT_EQ(expected, refined.lo); EXPECT_FLOAT_EQ(expected, refined.hi);
+    auto bulkPlan = supplier->planBulk(Query::ExecutionUse::SCORED_WINDOWS, {});
+    ASSERT_EQ(Query::ScorerSupplier::BulkAnswer::YES, bulkPlan.available);
+    auto* bulk = supplier->buildBulk(pool, bulkPlan);
+    ScoreWindow window;
+    bulk->scoreNextWindow(window, nullptr, 0, segment.maxDoc(), expected);
+    ASSERT_EQ(2, window.size);
+    EXPECT_EQ(1, window.docs[0]); EXPECT_EQ(4, window.docs[1]);
+    EXPECT_FLOAT_EQ(expected, window.scores[0]);
+    EXPECT_FLOAT_EQ(expected, window.scores[1]);
+    EXPECT_EQ(2, QueryPrep::supplierCount(supplier));
+    auto* countBulk = supplier->buildBulk(pool, bulkPlan);
+    int64_t count = 0;
+    countBulk->countNextWindow(count, nullptr, nullptr, 0, segment.maxDoc());
+    EXPECT_EQ(2, count);
+  }
+}
+
+TEST_F(ScorerCostTest, weightConstantContributionIsKnownWithoutExecution) {
+  Query::Context context(pool, *reader);
+  auto* variable = term("a");
+  EXPECT_EQ(std::nullopt, variable->createWeight(
+      context, Query::NEED_SCORES)->constantContribution());
+  EXPECT_EQ(0.0f, variable->createWeight(context, 0)->constantContribution());
+  ConstantScoreQuery constant(variable, 3.25f);
+  EXPECT_EQ(6.5f, constant.createWeight(
+      context, Query::NEED_SCORES, 2.0f)->constantContribution());
+  EXPECT_EQ(0.0f, constant.createWeight(context, 0)->constantContribution());
+}
 
 TEST_F(ScorerCostTest, termCostIsDocFreq) {
   EXPECT_EQ(6, cost(term("a")));

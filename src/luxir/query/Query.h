@@ -1795,6 +1795,11 @@ public:
     bool observesFilterCache() const noexcept { return (traits & OBSERVED_FILTER_CACHE) != 0; }
     bool isConstantScoring() const noexcept { return (traits & IS_CONSTANT_SCORING) != 0; }
 
+    /// The exact per-match contribution, when known without execution.
+    virtual std::optional<float> constantContribution() const {
+      return needsScores() ? std::nullopt : std::optional<float>(0.0f);
+    }
+
     bool prefersPullForSparseArrayDomain() const noexcept {
       return (traits & PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN) != 0;
     }

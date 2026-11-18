@@ -289,6 +289,7 @@ inline Query::Scorer* createDocSetScorer(MemPool& targetPool, DocSet* docs,
 class DocSetSupplier final : public Query::ScorerSupplier {
   DocSet* docs;
   IndexReader::Segment& segment;
+  float score;
 
   class Plan final : public Query::ScorerPlan {
     DocSetSupplier& supplier;
@@ -296,7 +297,7 @@ class DocSetSupplier final : public Query::ScorerSupplier {
   protected:
     Query::Scorer* buildScorer(MemPool& targetPool) override {
       return createDocSetScorer(
-          targetPool, supplier.docs, supplier.segment);
+          targetPool, supplier.docs, supplier.segment, supplier.score);
     }
 
   public:
@@ -312,7 +313,8 @@ class DocSetSupplier final : public Query::ScorerSupplier {
   };
 
 public:
-  DocSetSupplier(DocSet* docs, IndexReader::Segment& segment) : docs(docs), segment(segment) {}
+  DocSetSupplier(DocSet* docs, IndexReader::Segment& segment, float score = 0.0f)
+      : docs(docs), segment(segment), score(score) {}
 
   int64_t cost() override { return docs == nullptr ? 0 : (int64_t)docs->card(); }
 
@@ -377,7 +379,7 @@ public:
     assert(!plan.hasConstantCount());
     if (docs == nullptr || docs->card() == 0) return nullptr;
     return targetPool.make<DocSetBulkScorer>(
-        targetPool, docs, segment.maxDoc());
+        targetPool, docs, segment.maxDoc(), score);
   }
 };
 

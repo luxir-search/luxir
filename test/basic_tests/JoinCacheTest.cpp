@@ -77,6 +77,73 @@ protected:
   }
 };
 
+TEST_F(JoinCacheTest, fixedJoinWeightKnowsItsConstantContribution) {
+  CollectionHelper::UpdateBuilder input;
+  input.addRaw([](auto& doc, auto& arena) {
+    ASSERT_TRUE(api::read_json(doc, R"({"id":"range","items_nested":{"value_i":2}})", arena));
+  });
+  input.commit(); ASSERT_TRUE(helper.submit(input).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  req->schema = req->reader->schema();
+  ParseView view(*req->schema, nullptr, &req->reader, req.get());
+  ParseContext parseContext(req->requestPool, *req->schema, req->arena,
+      CoerceContext{}, "q", nullptr, &view);
+  auto* context = Query::Context::create(&req->arena, *req->createPlanningContext(*req->reader));
+  for (auto mode : {"max", "none", "sum"}) for (float boost : {1.0f, 2.5f}) {
+    auto child = qb::range(req->mr, "value_i", qb::valI64(req->mr, 1), nullptr,
+        qb::valI64(req->mr, 3), nullptr);
+    auto wire = qb::boost(req->mr, qb::toParent(req->mr, "items_nested", child, mode), boost);
+    auto* query = ProtobufQueryParser(parseContext).parse(wire);
+    auto* scored = query->createWeight(*context, Query::NEED_SCORES);
+    auto expected = std::string_view(mode) == "sum" ? std::nullopt
+        : std::optional<float>(std::string_view(mode) == "none" ? 0.0f : boost);
+    EXPECT_EQ(expected, scored->constantContribution()) << mode << ' ' << boost;
+    EXPECT_EQ(0.0f, query->createWeight(*context, 0)->constantContribution());
+  }
+}
+
+TEST_F(JoinCacheTest, bulkFallbackReusesMandatorySuppliers) {
+  cache->resize(0);
+  for (bool prepared : {false, true}) for (bool multiple : {false, true}) {
+    SCOPED_TRACE(prepared);
+    SCOPED_TRACE(multiple);
+    auto req = localReq(helper.getSearchEngine());
+    req->reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    req->schema = req->reader->schema();
+    ParseView view(*req->schema, nullptr, &req->reader, req.get());
+    ParseContext parseContext(req->requestPool, *req->schema, req->arena,
+        CoerceContext{}, "q", nullptr, &view);
+    auto join = qb::toParent(req->mr, "items_nested", qb::match(req->mr, "color_s", "red"), "max");
+    auto wire = multiple
+        ? qb::boolean(req->mr, {join, qb::match(req->mr, "id", "0")}, {}, {}, {qb::exists(req->mr, "id")})
+        : qb::boolean(req->mr, {join}, {}, {}, {qb::exists(req->mr, "id")});
+    auto* query = ProtobufQueryParser(parseContext).parse(wire);
+    auto* context = Query::Context::create(&req->arena, *req->createPlanningContext(*req->reader));
+    auto* weight = query->createWeight(*context, Query::NEED_SCORES);
+    Query::Weight::PrepareContext prepareContext{*req->reader, {}, nullptr, nullptr};
+    auto selection = prepared ? weight->prepare(prepareContext) : nullptr;
+    auto& segment = req->reader->segments()[0];
+    SkipStatsScope stats;
+    Query::SegmentSource* source = weight;
+    if (selection) source = selection.get();
+    auto* supplier = source->scorerSupplier(req->requestPool, segment);
+    ASSERT_NE(nullptr, supplier);
+    EXPECT_EQ(1, SkipStats::joinChildSuppliers);
+    auto plan = supplier->planBulk(Query::ExecutionUse::SCORED_WINDOWS, {});
+    ASSERT_EQ(Query::ScorerSupplier::BulkAnswer::NO, plan.available);
+    supplier->recordBulkPlanCommitment(Query::ExecutionUse::SCORED_WINDOWS, {}, plan);
+    EXPECT_EQ(1, SkipStats::joinChildSuppliers);
+    auto* scorer = supplier->resolve(req->requestPool, supplier->makePlanContext(
+        Query::Demand::fromLeadCost(segment.maxDoc())))->build(req->requestPool);
+    ASSERT_NE(nullptr, scorer);
+    int32_t count = 0;
+    while (scorer->next() != PostingsReader::END) { count++; EXPECT_GE(scorer->score(), 0.0f); }
+    EXPECT_EQ(multiple ? 1 : 12, count);
+    EXPECT_EQ(1, SkipStats::joinChildSuppliers);
+  }
+}
+
 TEST_F(JoinCacheTest, residentRangeOwnerAvoidsChildSupplier) {
   CollectionHelper::UpdateBuilder input;
   for (int i = 0; i < 256; i++) {

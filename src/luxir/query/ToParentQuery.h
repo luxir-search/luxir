@@ -146,6 +146,10 @@ public:
       assert(&context.topReader == &relation.one);
       assert(&source == &relation.many);
     }
+    std::optional<float> constantContribution() const override {
+      return reduction.kind == RowReduction::FIXED
+          ? std::optional<float>(multiplier) : std::nullopt;
+    }
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& prepareContext) override {
       std::vector<DomainHandle> eligibility;
       std::vector<DocSet*> views;
