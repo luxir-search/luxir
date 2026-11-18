@@ -193,6 +193,11 @@ public:
               std::shared_ptr<const UnreadableHook> onUnreadable)
       : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), segId(segId),
         creatorEpoch(creatorEpoch), liveGen(liveGen), liveEpoch(liveEpoch), maxDoc(maxDoc), numLive(numLive) {}
+  // A part born ready with already loaded live docs.
+  SegmentLive(uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch,
+              std::shared_ptr<LiveDocs> opened)
+      : SegmentPart(opened), segId(segId), creatorEpoch(creatorEpoch), liveGen(liveGen), liveEpoch(liveEpoch),
+        maxDoc(opened->size()), numLive(opened->numLive()) {}
   std::shared_ptr<LiveDocs> get();
 };
 
