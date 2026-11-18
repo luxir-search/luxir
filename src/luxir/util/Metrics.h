@@ -31,6 +31,12 @@ enum class MetricCounter {
   SEARCH_RESOURCE_EXHAUSTED, SEARCH_WARNINGS, DOCUMENTS_ACCEPTED, DOCUMENTS_REJECTED, DELETE_IDS_ACCEPTED, COUNT
 };
 enum class MetricTransportCounter { RECEIVED_BYTES, SENT_BYTES, STREAM_PAUSES, COUNT };
+// HTTP connection limits: connections refused past server.http.max-connections,
+// failed accepts, connections closed by each client timeout, and requests
+// refused at the buffered body cap.
+enum class MetricHttpEvent {
+  CONNECTION_REJECTED, ACCEPT_ERROR, HEADER_TIMEOUT, BODY_TIMEOUT, IDLE_TIMEOUT, BODY_REJECTED, COUNT
+};
 
 inline constexpr std::array<std::string_view, (size_t)MetricOperation::COUNT> metricOperations = {
     "search", "update", "schema", "collections", "stats", "health", "other"};
@@ -118,6 +124,11 @@ public:
   // Gauges that move per connection or thread, not per request.
   std::atomic<int64_t> httpConnections{0};
   std::atomic<int64_t> httpThreads{0};
+  // Bytes reserved by buffered HTTP request bodies; also the node-wide
+  // server.http.max-buffered-body-bytes ledger.
+  std::atomic<int64_t> httpBufferedBodyBytes{0};
+  // Rare events, counted without stripes.
+  std::array<std::atomic<uint64_t>, (size_t)MetricHttpEvent::COUNT> httpEvents{};
 
   MetricCells& local() { return cells.local(); }
 
@@ -127,6 +138,8 @@ public:
   void add(MetricTransportCounter counter, MetricTransport transport, uint64_t delta = 1) {
     local().transport[(size_t)counter][(size_t)transport].fetch_add(delta, std::memory_order_relaxed);
   }
+  void add(MetricHttpEvent event) { httpEvents[(size_t)event].fetch_add(1, std::memory_order_relaxed); }
+  uint64_t count(MetricHttpEvent event) const { return httpEvents[(size_t)event].load(std::memory_order_relaxed); }
   void requestError(MetricTransport transport, ErrorKind kind) {
     local().requestErrors[(size_t)transport][errorKindIndex(kind)].fetch_add(1, std::memory_order_relaxed);
   }

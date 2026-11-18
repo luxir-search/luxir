@@ -164,6 +164,27 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--server.http.threads", server.http.threads,
                  "HTTP connection I/O shards (one thread each, plus one accept thread; 0 = auto)")
       ->default_val(server.http.threads);
+  app.add_option("--server.http.header-timeout-ms", server.http.header_timeout_ms,
+                 "Close a connection whose request headers (or first bytes) take longer (0 = never)")
+      ->default_val(server.http.header_timeout_ms)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--server.http.body-timeout-ms", server.http.body_timeout_ms,
+                 "Close a connection whose request body makes no progress for this long (0 = never)")
+      ->default_val(server.http.body_timeout_ms)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--server.http.idle-timeout-ms", server.http.idle_timeout_ms,
+                 "Close a keep-alive connection idle between requests this long (0 = never)")
+      ->default_val(server.http.idle_timeout_ms)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--server.http.max-connections", server.http.max_connections,
+                 "Open HTTP connections; more are closed on accept (0 = half the fd limit, -1 = unlimited)")
+      ->default_val(server.http.max_connections)
+      ->check(CLI::Range((int64_t)-1, std::numeric_limits<int64_t>::max()));
+  app.add_option("--server.http.max-buffered-body-bytes", server.http.max_buffered_body_bytes,
+                 "Node-wide buffered request body bytes; more get 503 (0 = 8 x --indexing.max-request-body)")
+      ->transform(CLI::AsSizeValue(false))
+      ->check(CLI::NonNegativeNumber)
+      ->default_str("0");
   app.add_option("--server.workers", server.workers,
                  "Task-arena worker threads for indexing, merges and parallel search "
                  "(0 = auto: all CPUs on nodes of up to 4, else all but one)")
