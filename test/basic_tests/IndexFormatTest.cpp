@@ -41,10 +41,10 @@ namespace {
 // change alters the bytes Luxir writes, this test fails: bump
 // IndexFormat::VERSION, then update kReferenceVersion and kReferenceDigest. Changing
 // only the digest leaves old collections loading under the new reader.
-constexpr uint64_t kReferenceVersion = 13;
-constexpr uint64_t kReferenceDigest = 0xbf22b3f3bbe90ae2;
+constexpr uint64_t kReferenceVersion = 14;
+constexpr uint64_t kReferenceDigest = 0x26041a282703487d;
 
-// A small index over every default field template's kind, with two segments
+// A small index over every default field template's kind, with three segments
 // and a delete. Each segment is one request flushed by a single inverter.
 // Merges are left out: fields merge as parallel tasks, so a merged segment's
 // file layout varies.
@@ -60,6 +60,9 @@ void buildReferenceIndex(CollectionHelper& ch) {
   decimal.type = api::FieldDef::FieldClass::DECIMAL;
   decimal.scale = 2;
   decimal.index = api::FieldDef::IndexMode::RANGE;
+  auto& interval = schema.field("interval_value");
+  interval.type = api::FieldDef::FieldClass::LONG_RANGE;
+  interval.index = api::FieldDef::IndexMode::RANGE;
   schema.set(ch.collection());
   ASSERT_TRUE(ch.indexAll({
       flatdoc("id", "a", "numeric_match", (int64_t)-7, "numeric_array", vec_i(2, 1, 2), "title_t", "the quick brown fox", "tag_s", "red", "tags_ss", vecs("x", "y"),
@@ -73,6 +76,16 @@ void buildReferenceIndex(CollectionHelper& ch) {
       flatdoc("id", "b", "title_t", "lazy dogs sleep", "tag_s", "blue", "n_i", (int64_t)-3,
               "vec_v", std::vector<float>{0, 1}, "at_p", std::vector<double>{2.3522, 48.8566}),
   }, UpdateMessage::COMMIT).success);
+  CollectionHelper::UpdateBuilder range;
+  for (std::string_view json : {
+      R"({"id":"range","interval_value":{"gte":-9223372036854775808,"lte":9223372036854775807}})",
+      R"({"id":"range_point","interval_value":{"gte":0,"lte":0}})"}) {
+    range.addRaw([json](api::Map& doc, std::pmr::memory_resource& mr) {
+      ASSERT_TRUE(api::read_json(doc, json, mr));
+    });
+  }
+  range.commit();
+  ASSERT_TRUE(ch.submit(range).success);
   ASSERT_TRUE(ch.indexAll({
       flatdoc("id", "c", "title_t", "quick quick fox", "tag_s", "red", "n_i", (int64_t)42,
               "dt_dt", "2025-12-31T00:00:00Z", "vec_v", std::vector<float>{0.5f, 0.5f},
@@ -221,7 +234,7 @@ TEST_F(IndexFormatTest, referenceIndexBytesMatchFormatVersion) {
 TEST_F(IndexFormatTest, serialRootMergeBytesMatchReference) {
   auto digest = buildMergedReferenceDigest();
   ASSERT_EQ(digest, buildMergedReferenceDigest()) << "the serial merge is not deterministic";
-  EXPECT_EQ(0x060891e1a79722f8ULL, digest) << std::format("merged digest {:#x}", digest);
+  EXPECT_EQ(0x5f88710743474121ULL, digest) << std::format("merged digest {:#x}", digest);
 }
 
 TEST_F(IndexFormatTest, otherFormatVersionFailsToLoad) {

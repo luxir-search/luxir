@@ -483,6 +483,56 @@ inline void loadNumCol(SearchRequest& req, IndexReader& reader, IndexReader::Fie
   });
 }
 
+// A range field's values as a Column.col_val, one Val per output row:
+// {"gte": min, "lte": max} through the element output policy, with an open
+// end omitted. Rows without a value stay unset.
+// There is no typed column arm for intervals; placeBatchColumns moves the
+// column to the row maps when the placement asks for rows.
+inline void loadRangeVals(SearchRequest& req, IndexReader& reader, IndexReader::FieldSegments infos,
+                          RangeFieldType& fieldType, uint64_t flags, std::span<const segdoc> segDocs,
+                          SegmentRuns runs, luxir::api::Column& fieldCol,
+                          FieldLoaders* loaders, std::pmr::memory_resource& mr)
+{
+  auto& col = fieldCol.kind.emplace<luxir::api::ColVal>();
+  if (segDocs.empty()) return;
+  auto* vals = build::allocArray(col.v, segDocs.size(), mr);
+  std::span<luxir::api::Val> target(vals, segDocs.size());
+  withNatureOutput(fieldType.element->valueNature(), flags, mr, [&] { return fieldType.name(); }, [&](auto output) {
+    addFieldLoader(loaders, runs, [&req, &reader, infos, &fieldType, segDocs, target, &mr, output](std::span<RowIndex> idxSpan) {
+      auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
+      auto segNum = sortedSegDocs[0].segment();
+      auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
+      auto* info = infos.at(segNum);
+      if (!info) return;
+
+      auto& postingsReader = reader.segments()[segNum].postingsReader();
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      bool isDouble = fieldType.elementType() == FieldType::DOUBLE;
+      auto setBound = [&](luxir::api::Map& map, std::string_view key, int64_t encoded) {
+        auto* bound = build::mapSlot<luxir::api::Val>(map.fields, 2, key, mr);
+        if (isDouble) bound->kind = sortableInt64ToDouble(encoded);
+        else bound->kind = encoded;
+        renderValue(*bound, output);
+      };
+      int64_t min = 0;
+      auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
+        assert(segDocs[idxSpan[idx]].docId() == doc);
+        unused(doc, numVals);
+        if (valIdx == 0) {
+          min = val;
+        } else if (valIdx == 1) {
+          // Single-valued: the doc's first pair is its interval.
+          auto& map = target[idxSpan[idx]].kind.emplace<luxir::api::Map>();
+          auto domain = fieldType.domainBounds();
+          if (min != domain.lo) setBound(map, "gte", min);
+          if (val != domain.hi) setBound(map, "lte", val);
+        }
+      };
+      IntColReader::getValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
+    });
+  });
+}
+
 // Decode a GEO_POINT column as col_val in the ingest shape, so returned
 // points index back unchanged: a single-valued field gives each document
 // [lon, lat] and a multi-valued one [[lon, lat], ...], by the field's
@@ -1208,6 +1258,9 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
           loadNumCol<ColEmit<float>>(req, sourceReader, rf.infos, fieldType, sourceDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
         } else if (fieldType.type() == FieldType::DOUBLE) {
           loadNumCol<ColEmit<double>>(req, sourceReader, rf.infos, fieldType, sourceDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+        } else if (fieldType.type() == FieldType::INTERVAL) {
+          loadRangeVals(req, sourceReader, rf.infos, (RangeFieldType&)fieldType, flags, sourceDocs, runs,
+                        outputColumn(), pendingLoaders, mr);
         } else if (fieldType.type() == FieldType::GEO_POINT) {
           loadGeoCol(req, sourceReader, rf.infos, fieldType, sourceDocs, runs, outputColumn(), pendingLoaders, mr);
         } else {

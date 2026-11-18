@@ -1967,7 +1967,7 @@ Numeric or DATE buckets using the field's value binding. Each bucket is inclusiv
 
 ### luxir.RangeQuery
 
-Matches documents whose field value falls in the given range. All bounds are optional; omit a side for an open-ended range. Set at most one of gte/gt (lower) and at most one of lte/lt (upper); setting both of a pair is an error. With no bounds the query matches every document that has a value for the field. A doc with no value never matches.<br><br>Numeric fields (INT/FLOAT/DOUBLE/DATE) require a column. Bounds go through the same value-coercion contract as ingest, so querying a literal finds the documents ingested with it. DATE accepts ISO-8601 strings or epoch values in the field's unit, and a partial date names its whole window: bounds include the granule they name (\[2024-01 TO 2024-06\] covers January through June; exclusive bounds exclude the granule whole). FLOAT/DOUBLE compare by IEEE-754 total order: -0.0 sorts below +0.0 and NaN sorts above +Inf.<br><br>Term-backed fields (TEXT/STRING/ID) range over indexed terms in byte order (no collation), constant-scoring. TEXT bounds use multi-term normalization without tokenization; STRING bounds use the field's normalizer. Exact bounds follow the field's long\_terms policy. Uses the field's value binding.
+Matches documents whose field value falls in the given range. All bounds are optional; omit a side for an open-ended range. Set at most one of gte/gt (lower) and at most one of lte/lt (upper); setting both of a pair is an error. With no bounds the query matches every document that has a value for the field. A doc with no value never matches.<br><br>Numeric fields (INT/FLOAT/DOUBLE/DATE) require a column. Bounds go through the same value-coercion contract as ingest, so querying a literal finds the documents ingested with it. DATE accepts ISO-8601 strings or epoch values in the field's unit, and a partial date names its whole window: bounds include the granule they name (\[2024-01 TO 2024-06\] covers January through June; exclusive bounds exclude the granule whole). FLOAT/DOUBLE compare by IEEE-754 total order: -0.0 sorts below +0.0 and NaN sorts above +Inf.<br><br>Term-backed fields (TEXT/STRING/ID) range over indexed terms in byte order (no collation), constant-scoring. TEXT bounds use multi-term normalization without tokenization; STRING bounds use the field's normalizer. Exact bounds follow the field's long\_terms policy. Uses the field's value binding.<br><br>Range fields (LONG\_RANGE, DOUBLE\_RANGE, DATE\_RANGE) compare each stored \[min, max\] interval with the query interval by \`relation\`. Bounds use the element's scalar range-query rules. Partial date bounds name their whole granule. Open long/date ends extend to int64 limits; open double ends are -Infinity and +Infinity. Explicit double infinities at those ends are equivalent; NaN is rejected. Date endpoints in results follow date output modes. Sort, facets, collapse, value expressions, and any\_of are unsupported.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1978,6 +1978,7 @@ Matches documents whose field value falls in the given range. All bounds are opt
 | <a id="field-luxir.rangequery.gt"></a>[`gt`](#field-luxir.rangequery.gt) | 3 | [`Val`](#message-luxir.val) | singular | lower bound, exclusive (&gt;) |
 | <a id="field-luxir.rangequery.lte"></a>[`lte`](#field-luxir.rangequery.lte) | 4 | [`Val`](#message-luxir.val) | singular | upper bound, inclusive (&lt;=) |
 | <a id="field-luxir.rangequery.lt"></a>[`lt`](#field-luxir.rangequery.lt) | 5 | [`Val`](#message-luxir.val) | singular | upper bound, exclusive (&lt;) |
+| <a id="field-luxir.rangequery.relation"></a>[`relation`](#field-luxir.rangequery.relation) | 15 | [`RangeQuery.Relation`](#enum-luxir.rangequery.relation) | singular | Range fields only; rejected on other field types unless INTERSECTS. |
 
 <a id="message-luxir.regexquery"></a>
 
@@ -2818,6 +2819,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`Match.Operator`](#enum-luxir.match.operator)
 - [`MultiMatchQuery.Mode`](#enum-luxir.multimatchquery.mode)
 - [`RangeFacet.Bounds`](#enum-luxir.rangefacet.bounds)
+- [`RangeQuery.Relation`](#enum-luxir.rangequery.relation)
 - [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome)
 - [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state)
 - [`RequestFlagBit`](#enum-luxir.requestflagbit)
@@ -2923,6 +2925,9 @@ DATE only: unit of numeric ingest and stored epoch values. ISO-8601 text is conv
 | <a id="value-luxir.fielddef.fieldclass.ip"></a>[`IP`](#value-luxir.fielddef.fieldclass.ip) | 12 | IPv4 or IPv6 address, stored as 16-byte terms |
 | <a id="value-luxir.fielddef.fieldclass.decimal"></a>[`DECIMAL`](#value-luxir.fielddef.fieldclass.decimal) | 13 | fixed-point number, stored as int64 value \* 10^scale |
 | <a id="value-luxir.fielddef.fieldclass.nested"></a>[`NESTED`](#value-luxir.fielddef.fieldclass.nested) | 14 | structural path of nested object rows |
+| <a id="value-luxir.fielddef.fieldclass.long_range"></a>[`LONG_RANGE`](#value-luxir.fielddef.fieldclass.long_range) | 18 | Single-valued intervals written as {"gte"\|"gt": a, "lte"\|"lt": b}; either side may be omitted for an open end. Ingest rejects fractional long endpoints, out-of-domain endpoints, NaN, and empty intervals. Partial dates name their whole granule, in UTC without an explicit offset. index=range adds a query index; index=none is the default. match and explicit multi\_match selectors are supported; wildcard field selectors do not select range fields. Multi-valued ranges are unsupported.<br><br>int64 endpoints |
+| <a id="value-luxir.fielddef.fieldclass.double_range"></a>[`DOUBLE_RANGE`](#value-luxir.fielddef.fieldclass.double_range) | 19 | double endpoints |
+| <a id="value-luxir.fielddef.fieldclass.date_range"></a>[`DATE_RANGE`](#value-luxir.fielddef.fieldclass.date_range) | 20 | DATE endpoints (epoch millis, ISO-8601 or date math) |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 
@@ -2936,7 +2941,7 @@ Index acceleration. Numeric Match/Range and geographic predicates can scan a col
 |---|---|---|
 | <a id="value-luxir.fielddef.indexmode.none"></a>[`NONE`](#value-luxir.fielddef.indexmode.none) | 0 | no index |
 | <a id="value-luxir.fielddef.indexmode.match"></a>[`MATCH`](#value-luxir.fielddef.indexmode.match) | 1 | term index for STRING/TEXT/ID, including term ranges |
-| <a id="value-luxir.fielddef.indexmode.range"></a>[`RANGE`](#value-luxir.fielddef.indexmode.range) | 2 | numeric Match/Range or GEO\_POINT predicates; requires column=true |
+| <a id="value-luxir.fielddef.indexmode.range"></a>[`RANGE`](#value-luxir.fielddef.indexmode.range) | 2 | numeric Match/Range, GEO\_POINT or range-field predicates; requires column=true |
 
 <a id="enum-luxir.fielddef.longterms"></a>
 
@@ -3039,6 +3044,18 @@ Whether the extent is explicit or derived from this facet instance's values.
 |---|---|---|
 | <a id="value-luxir.rangefacet.bounds.explicit"></a>[`EXPLICIT`](#value-luxir.rangefacet.bounds.explicit) | 0 | start and end are required. Fixed DATE grids use the local time of start as their phase; calendar grids step from start for every n. The last fence is clipped to end. |
 | <a id="value-luxir.rangefacet.bounds.data"></a>[`DATA`](#value-luxir.rangefacet.bounds.data) | 1 | Span the smallest through largest matching finite values, plus optional start/end widening. Queries, filters and deletions affect the extent; each parent bucket's child histogram has its own span. Occupancy is from raw values, even when a distinct key is dropped and its measured count is zero. Empty domains return no buckets unless both widening bounds supply a span. NaN/Inf are outside every bucket and never fail DATA. Calendar grids use the 1970 civil epoch (ISO weeks: Monday 1969-12-29); a civil day starts at its first midnight, or first valid instant. selected is unsupported. The 100000-bucket cap applies to the actual span including widening and empty interior cells; use a larger gap. |
+
+<a id="enum-luxir.rangequery.relation"></a>
+
+### luxir.RangeQuery.Relation
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.rangequery.relation.intersects"></a>[`INTERSECTS`](#value-luxir.rangequery.relation.intersects) | 0 | the stored interval overlaps the query interval |
+| <a id="value-luxir.rangequery.relation.contains"></a>[`CONTAINS`](#value-luxir.rangequery.relation.contains) | 1 | the stored interval covers the whole query interval |
+| <a id="value-luxir.rangequery.relation.within"></a>[`WITHIN`](#value-luxir.rangequery.relation.within) | 2 | the stored interval lies inside the query interval |
 
 <a id="enum-luxir.replicaresult.outcome"></a>
 

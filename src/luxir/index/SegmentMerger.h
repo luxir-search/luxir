@@ -869,6 +869,10 @@ private:
     return FieldType::usesGeoPoints(type) && (flags & FieldType::INDEX_RANGE) != 0;
   }
 
+  static bool hasRangePoints(FieldType::Type type, int32_t flags) {
+    return type == FieldType::INTERVAL && (flags & FieldType::INDEX_RANGE) != 0;
+  }
+
   static void batchTypeAndFlags(std::span<const MergeFieldInfo> fields, FieldType::Type& type, int32_t& allFlags) {
     type = FieldType::Type::NONE;
     allFlags = 0;
@@ -938,7 +942,9 @@ private:
         ? MergeCostModel::pointsBytes((int64_t)fields.size(), numValues,
                                       synthesizedPointValues)
         : hasGeoPoints(type, allFlags)
-          ? MergeCostModel::geoPointsBytes(numValues) : 0;
+          ? MergeCostModel::geoPointsBytes(numValues)
+          : hasRangePoints(type, allFlags)
+            ? MergeCostModel::rangePointsBytes(numValues) : 0;
 
     if (storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS) != 0
         && ordColumn) {
@@ -1006,7 +1012,7 @@ private:
     return MergeCostModel::INT_COL_STREAMS
         + (hasOneDimensionalPoints(type, allFlags)
            ? MergeCostModel::POINTS_STREAMS
-           : hasGeoPoints(type, allFlags)
+           : hasGeoPoints(type, allFlags) || hasRangePoints(type, allFlags)
              ? MergeCostModel::GEO_POINTS_STREAMS : 0);
   }
 
@@ -1984,10 +1990,22 @@ private:
     } else {
       // int column that is not an ord column (assume all other field types have this (currently true)
       std::vector<BKDWriter::Point> geoPoints;
+      std::vector<BasicBKDWriter<BKDInt64Traits>::Point> rangePoints;
       bool rebuildGeo = hasGeoPoints(type, allFlags);
+      bool rebuildRange = hasRangePoints(type, allFlags);
       mergeIntCol(space, sortedFields, postingsWriter, outputFieldInfo,
-                   rebuildGeo ? &geoPoints : nullptr);
-      if (rebuildGeo) {
+                  rebuildGeo ? &geoPoints : nullptr,
+                  rebuildRange ? &rangePoints : nullptr);
+      if (rebuildRange) {
+        if (!rangePoints.empty()) {
+          auto output = postingsWriter.getOutputStream();
+          BasicBKDWriter<BKDInt64Traits> writer(*output);
+          auto data = writer.write(rangePoints);
+          assert(data.pointCount * 2 == (uint64_t)outputFieldInfo.numValues);
+          outputFieldInfo.pointsLoc = data.pointsLoc;
+          outputFieldInfo.pointsMetaOff = data.pointsMetaOff;
+        }
+      } else if (rebuildGeo) {
         if (!geoPoints.empty()) {
           auto output = postingsWriter.getOutputStream();
           BKDWriter writer(*output);
@@ -2459,7 +2477,8 @@ private:
   void mergeIntCol(const Space& space, std::span<MergeFieldInfo*> sortedFields,
                    PostingsWriter& postingsWriter,
                    PostingsWriter::IndexFieldInfo& outputFieldInfo,
-                   std::vector<BKDWriter::Point>* geoPoints) {
+                   std::vector<BKDWriter::Point>* geoPoints,
+                   std::vector<BasicBKDWriter<BKDInt64Traits>::Point>* rangePoints) {
     assert(sortedFields.size() == space.segs.size());  // expect non-compacted fields to make the code a little simpler.
 
     auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -2483,6 +2502,7 @@ private:
 
     int64_t endValueRankBase = 0;  // used to calculate the endValueRank for each segment, if multivalued.
     [[maybe_unused]] int32_t docsWithField = 0;
+    int64_t rangeMin = 0;  // the pending min of a range field's (min, max) pair
 
     for (size_t segnum = 0; segnum < sortedFields.size(); segnum++) {
       auto* field = sortedFields[segnum];
@@ -2587,6 +2607,11 @@ private:
             if (geoPoints != nullptr) {
               geoPoints->push_back({geo::unpackLatitude(val),
                                     geo::unpackLongitude(val), mappedDoc});
+            }
+            // Range columns hold (min, max) pairs: the pair ends on odd offsets.
+            if (rangePoints != nullptr) {
+              if ((inRank - lastEndValueRankIn) % 2 == 0) rangeMin = val;
+              else rangePoints->push_back({rangeMin, val, mappedDoc});
             }
           }
 

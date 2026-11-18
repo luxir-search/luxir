@@ -198,7 +198,7 @@ public:
     if (isUtc()) return "UTC";
     if (isIana()) return std::string(zone_->name());
     int magnitude = std::abs(offsetMinutes_);
-    char buf[7];
+    char buf[16];
     std::snprintf(buf, sizeof(buf), "%c%02d:%02d",
                   offsetMinutes_ < 0 ? '-' : '+', magnitude / 60, magnitude % 60);
     return buf;

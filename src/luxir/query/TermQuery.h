@@ -543,7 +543,7 @@ public:
         return flatNormsBase[doc];
       }
       if (normsIter) {
-        int32_t normDoc = normsIter->advance(doc);
+        [[maybe_unused]] int32_t normDoc = normsIter->advance(doc);
         assert(normDoc == doc);
         return normsIter->value();
       }
