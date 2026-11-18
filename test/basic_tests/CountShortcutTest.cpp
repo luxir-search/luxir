@@ -14,6 +14,7 @@
 #include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PrefixQuery.h"
+#include "luxir/query/PhraseQuery.h"
 #include "luxir/query/RescoreQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/TermInSetQuery.h"
@@ -178,6 +179,44 @@ TEST_P(CountShortcutTest, metadataLeavesAndWrappersAgree) {
     PrefixQuery prefix("body_w", "a");
     check(prefix, Query::CountHow::ITERATE);
   }
+}
+
+TEST_P(CountShortcutTest, scalarCountUsesConstantsWindowsAndPull) {
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto& segment = reader->segments()[0];
+  Query::ScorerSupplier::BulkScorerContext constantContext;
+  constantContext.requireConstantCount = true;
+  AllQuery all;
+  auto* allSupplier = all.createWeight(context, 0)->scorerSupplier(pool, segment);
+  ASSERT_TRUE(allSupplier->planBulk(Query::ExecutionUse::COUNT_WINDOWS, constantContext).hasConstantCount());
+  EXPECT_EQ(DOCS, QueryPrep::countSegment(pool, allSupplier, nullptr, DOCS));
+
+  TermQuery alpha("body_w", "alpha"), beta("body_w", "beta");
+  std::array<Query*, 2> required{&alpha, &beta};
+  BooleanQuery conjunction(required, {}, {}, {});
+  auto* windows = conjunction.createWeight(context, 0)->scorerSupplier(pool, segment);
+  EXPECT_FALSE(QueryPrep::supplierCount(windows));
+  auto windowsPlan = windows->planBulk(Query::ExecutionUse::COUNT_WINDOWS, {});
+  ASSERT_EQ(Query::ScorerSupplier::BulkAnswer::YES, windowsPlan.available);
+  EXPECT_FALSE(windowsPlan.hasConstantCount());
+  CountStats stats;
+  EXPECT_EQ(DOCS / 2, QueryPrep::countSegment(pool, windows, nullptr, DOCS));
+
+  std::array<std::string_view, 2> terms{"alpha", "beta"};
+  std::array<int32_t, 2> positions{0, 1};
+  PhraseQuery phrase("body_w", terms, positions);
+  auto* pull = phrase.createWeight(context, 0)->scorerSupplier(pool, segment);
+  EXPECT_FALSE(QueryPrep::supplierCount(pull));
+  EXPECT_EQ(Query::ScorerSupplier::BulkAnswer::NO,
+      pull->planBulk(Query::ExecutionUse::COUNT_WINDOWS, {}).available);
+  EXPECT_EQ(DOCS / 2, QueryPrep::countSegment(pool, pull, nullptr, DOCS));
+  EXPECT_GT(SkipStats::phraseVerifies, 0);
+
+  RAMBitDocSet domain(DOCS);
+  domain.mutableBits().set(1); domain.mutableBits().set(3);
+  EXPECT_EQ(2, QueryPrep::countSegment(pool, allSupplier, &domain, DOCS));
+  EXPECT_EQ(0, SkipStats::bulkDomainWindowsFed);
 }
 
 TEST_P(CountShortcutTest, numericLevelsAgree) {

@@ -654,7 +654,7 @@ struct WholeTopKRun {
   int64_t cacheFirstRankingWeights = 0;
   int64_t contextsCreated = 0;
   int64_t contextsOmitted = 0;
-  int64_t localProductions = 0;
+  int64_t localCounts = 0;
   int64_t cardinalityCounts = 0;
 };
 
@@ -693,7 +693,7 @@ WholeTopKRun runWholeTopK(
     SkipStats::cacheFirstTopKRankingWeights,
     SkipStats::queryContextsCreated,
     SkipStats::cacheFirstQueryContextsOmitted,
-    SkipStats::wholeTopKCountLocalProductions,
+    SkipStats::wholeTopKCountLocalCounts,
     SkipStats::wholeMembershipCardinalityCounts,
   };
 }
@@ -2472,7 +2472,7 @@ TEST_F(SearchEngineTest, wholeTopKCountFamiliesMatchCacheOffAtAllDepths) {
     expectSameWholeTopK(offA, build);
     expectSameWholeTopK(offA, hit);
     EXPECT_EQ(1, bypass.bypasses);
-    EXPECT_EQ(0, bypass.localProductions + offA.localProductions);
+    EXPECT_EQ(0, bypass.localCounts + offA.localCounts);
     EXPECT_EQ(1, bypass.fallbackSuppliers);
     EXPECT_EQ(1, bypass.contextsCreated);
     EXPECT_EQ(0, bypass.contextsOmitted);
@@ -2718,7 +2718,7 @@ TEST_F(SearchEngineTest, priorCardinalityKeepsCountsAndScoreBitsAtEveryRankingDe
       expectBitIdenticalScoreMap(offRanked.scores, result.scores);
       EXPECT_EQ(1, result.cardinalityCounts);
       EXPECT_EQ(1, result.bypasses);
-      EXPECT_EQ(0, result.localProductions + result.fallbackSuppliers + result.hits + result.builds);
+      EXPECT_EQ(0, result.localCounts + result.fallbackSuppliers + result.hits + result.builds);
     } else {
       auto result = count();
       EXPECT_EQ(offCount.found, result.found);
@@ -2785,7 +2785,7 @@ TEST_F(SearchEngineTest, localWholeMembershipCombinesHitsBypassAndAnEmptySegment
   EXPECT_EQ(2, mixed.hits);
   EXPECT_EQ(2, mixed.bypasses);
   EXPECT_EQ(1, mixed.cardinalityCounts);
-  EXPECT_EQ(1, mixed.localProductions);
+  EXPECT_EQ(1, mixed.localCounts);
   EXPECT_EQ(0, mixed.builds + mixed.fallbackSuppliers);
 }
 
@@ -2831,7 +2831,7 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
       "s3back", 10);
   EXPECT_EQ(16, fallback.found);
   EXPECT_EQ(1, fallback.bypasses);
-  EXPECT_EQ(0, fallback.localProductions);
+  EXPECT_EQ(0, fallback.localCounts);
   EXPECT_EQ(1, fallback.cardinalityCounts);
   EXPECT_EQ(0, fallback.fallbackSuppliers);
   EXPECT_EQ(0, fallback.builds + fallback.hits);

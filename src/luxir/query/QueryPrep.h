@@ -35,6 +35,10 @@ inline std::optional<int64_t> supplierCount(Query::ScorerSupplier* supplier) {
   return plan.hasConstantCount() ? std::optional<int64_t>(plan.constantCount) : std::nullopt;
 }
 
+// Count one unscored segment under its effective domain without retaining matches.
+int64_t countSegment(MemPool& pool, Query::ScorerSupplier* supplier,
+                     DocSet* domain, int32_t maxDoc);
+
 // A probe stops before a crossing-leaf walk. Execution may resolve that level
 // too, using the resolver's supplier rather than constructing a composite.
 template <typename SupplierFor>
@@ -1055,8 +1059,7 @@ public:
       IndexReader& reader, IndexReader::Segment& segment,
       DocSet* incomingDomain, Query::Weight::PreparedWeight* prepared,
       SupplierFor&& supplierFor, int32_t localDensityInverse = 0,
-      int32_t localMaxCandidatesPerMatch = 0,
-      RequestMemTracker* localMemory = nullptr) const {
+      int32_t localMaxCandidatesPerMatch = 0) const {
     if (source == Source::EMPTY) return {};
     if (source == Source::ACCEPTED_EXISTING) {
       DomainHandle docs = cacheUse->effectiveDomain(
@@ -1147,30 +1150,27 @@ public:
             *cardinality, segment.maxDoc(), localDensityInverse)
         && localMaxCandidatesPerMatch > 0
         && (int64_t)*cardinality * localMaxCandidatesPerMatch >= shortcut.maxMatches;
-    if (build || (local && !cacheZero)) {
+    if (!build && local && !cacheZero) {
+      auto guard = MemPool::threadLocalPoolGuard();
+      auto* supplier = supplierFor(*weight);
+      DocSet* domain = incomingDomain ? incomingDomain : segment.liveDocSet();
+      int64_t count = countSegment(guard.pool(), supplier, domain, segment.maxDoc());
+      skipCount(SkipStats::wholeTopKCountLocalCounts);
+      return {true, {}, count};
+    }
+    if (build) {
       if (domainDependence
           != PreparedDomainDependence::QUERY_CANONICAL) {
         throw std::logic_error(
             "whole membership publication requires a query-canonical source");
       }
-      if (!build && localMemory != nullptr) {
-        cacheUse->enableRoutedAccounting(
-            (size_t)segment.ord, *localMemory, "local query membership");
-      }
-      auto buildStart = build ? std::chrono::steady_clock::now()
-          : std::chrono::steady_clock::time_point{};
+      auto buildStart = std::chrono::steady_clock::now();
       auto raw = materializeRawFilter(*weight, prepared, segment);
-      DomainHandle docs;
-      if (build) {
-        cacheUse->publishRaw(
-            (size_t) segment.ord, probe, std::move(raw), elapsedBuildNanos(buildStart));
-        record(SkipStats::wholeCountBuilds, SkipStats::wholeTopKCountBuilds,
-               SkipStats::wholeFieldSortBuilds);
-      } else {
-        skipCount(SkipStats::wholeTopKCountLocalProductions);
-        cacheUse->adoptOwnedRaw((size_t)segment.ord, probe, std::move(raw));
-      }
-      docs = cacheUse->effectiveDomain(
+      cacheUse->publishRaw(
+          (size_t)segment.ord, probe, std::move(raw), elapsedBuildNanos(buildStart));
+      record(SkipStats::wholeCountBuilds, SkipStats::wholeTopKCountBuilds,
+             SkipStats::wholeFieldSortBuilds);
+      DomainHandle docs = cacheUse->effectiveDomain(
           (size_t)segment.ord, reader, incomingDomain).pinnedWith(lifetime);
       if (docs.get() == nullptr) return {};
       int64_t card = docs.get()->card();

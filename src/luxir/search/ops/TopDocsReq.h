@@ -1211,24 +1211,8 @@ public:
         MemPool& pool, int32_t segnum,
         Query::ScorerSupplier& countSupplier, DocSet* collectorFilter,
         auto& collector, int32_t maxDoc) {
-      Query::ScorerSupplier::BulkScorerContext bulkContext;
-      auto countPlan = countSupplier.planBulk(
-          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
-      BulkScorer* countBulk = nullptr;
-      if (countPlan.available == Query::ScorerSupplier::BulkAnswer::YES) {
-        countBulk = countSupplier.buildBulk(pool, countPlan);
-      } else {
-        countSupplier.recordBulkPlanCommitment(
-            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
-            bulkContext, countPlan);
-      }
-      int64_t count = 0;
-      if (countBulk != nullptr) {
-        count = countMatchesWindowed(
-            countBulk, collectorFilter, nullptr, maxDoc);
-      } else if (auto* scorer = buildPullScorer(pool, countSupplier)) {
-        count = countMatchesInRange(scorer, collectorFilter, 0, maxDoc);
-      }
+      int64_t count = QueryPrep::countSegment(
+          pool, &countSupplier, collectorFilter, maxDoc);
       auto* rankingSupplier = thisOp().rankingWeight->scorerSupplier(
           pool, thisOp().planning.topReader.segments()[segnum]);
       collectKnownCountTopK(
@@ -2083,8 +2067,7 @@ public:
                         && op.wholeRankingWeight != nullptr
                         && op.wholeRankingWeight->allowsPruning()
                     ? exactCountTopKMinCandidateDensityInverseForTests : 0,
-                localWholeMembershipMaxCandidatesPerMatchForTests,
-                &op.req.memoryTracker);
+                localWholeMembershipMaxCandidatesPerMatchForTests);
           }
           bool wholeMembershipAvailable = wholeMembershipResult.available;
           bool wholeTopKCountAvailable = wholeMembershipAvailable

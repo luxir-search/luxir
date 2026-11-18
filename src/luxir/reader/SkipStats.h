@@ -343,7 +343,7 @@ struct SkipStats {
   static inline int64_t wholeTopKCountBypasses = 0;
   static inline int64_t wholeTopKCountConstant = 0;
   static inline int64_t wholeTopKCountFallbackSuppliers = 0;
-  static inline int64_t wholeTopKCountLocalProductions = 0;
+  static inline int64_t wholeTopKCountLocalCounts = 0;
   static inline int64_t wholeMembershipCardinalityCounts = 0;
   static inline int64_t wholeFieldSortHits = 0;
   static inline int64_t wholeFieldSortBuilds = 0;
@@ -662,7 +662,7 @@ struct SkipStats {
     wholeTopKCountBypasses = 0;
     wholeTopKCountConstant = 0;
     wholeTopKCountFallbackSuppliers = 0;
-    wholeTopKCountLocalProductions = 0;
+    wholeTopKCountLocalCounts = 0;
     wholeMembershipCardinalityCounts = 0;
     wholeFieldSortHits = 0;
     wholeFieldSortBuilds = 0;

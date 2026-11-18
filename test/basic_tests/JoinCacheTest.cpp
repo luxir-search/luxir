@@ -300,7 +300,7 @@ TEST_F(JoinCacheTest, exactLocalMembershipKeepsScoresAndResidentOwnerSources) {
       {
         SkipStatsScope stats;
         EXPECT_EQ(off, run());
-        EXPECT_EQ(0, SkipStats::wholeTopKCountLocalProductions);
+        EXPECT_EQ(0, SkipStats::wholeTopKCountLocalCounts);
       }
       cache->resize(1024 * 1024); cache->resetAdmission();
       publishSource(join);
@@ -308,7 +308,7 @@ TEST_F(JoinCacheTest, exactLocalMembershipKeepsScoresAndResidentOwnerSources) {
         SkipStatsScope stats;
         auto before = cache->counters();
         EXPECT_EQ(off, run());
-        EXPECT_EQ(0, SkipStats::wholeTopKCountLocalProductions);
+        EXPECT_EQ(0, SkipStats::wholeTopKCountLocalCounts);
         EXPECT_EQ(1, SkipStats::wholeTopKCountFallbackSuppliers);
         EXPECT_EQ(0, SkipStats::joinChildSuppliers);
         EXPECT_EQ(before.builds, cache->counters().builds);
@@ -322,7 +322,7 @@ TEST_F(JoinCacheTest, exactLocalMembershipKeepsScoresAndResidentOwnerSources) {
         SkipStatsScope stats;
         EXPECT_EQ(off, run());
         EXPECT_EQ(1, SkipStats::wholeTopKCountBuilds);
-        EXPECT_EQ(0, SkipStats::wholeTopKCountLocalProductions);
+        EXPECT_EQ(0, SkipStats::wholeTopKCountLocalCounts);
         EXPECT_EQ(0, SkipStats::joinChildSuppliers);
       }
       cache->resize(1); cache->sweep(); cache->resize(1024 * 1024);
@@ -331,7 +331,7 @@ TEST_F(JoinCacheTest, exactLocalMembershipKeepsScoresAndResidentOwnerSources) {
         SkipStatsScope stats;
         auto before = cache->counters();
         EXPECT_EQ(off, run());
-        EXPECT_EQ(deleted ? 1 : 0, SkipStats::wholeTopKCountLocalProductions);
+        EXPECT_EQ(deleted ? 1 : 0, SkipStats::wholeTopKCountLocalCounts);
         EXPECT_EQ(deleted ? 0 : 1, SkipStats::wholeMembershipCardinalityCounts);
         EXPECT_EQ(0, SkipStats::joinChildSuppliers);
         EXPECT_EQ(before.builds, cache->counters().builds);
@@ -351,7 +351,7 @@ TEST_F(JoinCacheTest, exactLocalMembershipKeepsScoresAndResidentOwnerSources) {
   }
 }
 
-TEST_F(JoinCacheTest, localWholeMembershipScreensBeforeConstructingTheRawSupplier) {
+TEST_F(JoinCacheTest, localWholeCountScreensBeforeConstructingTheSupplier) {
   cache = std::make_shared<FilterCache>(FilterCacheConfig{.maxBytes = 1024 * 1024,
       .minSegmentDocs = 0, .admissionThreshold = 2, .maxMetadataBytes = 256 * 1024});
   helper.getIndexWriter()->snapshots.readers.filterCache = cache;
@@ -377,8 +377,11 @@ TEST_F(JoinCacheTest, localWholeMembershipScreensBeforeConstructingTheRawSupplie
   auto result = resolveWholeMembershipForTests(plan, *req->reader, req->reader->segments()[0], nullptr, nullptr, 128);
   ASSERT_TRUE(result.available);
   EXPECT_EQ(64, result.count);
+  EXPECT_EQ(nullptr, result.docs.get());
+  EXPECT_EQ(nullptr, use->rawDocSet(0));
+  EXPECT_EQ(0u, use->ownedBytesForTest());
   EXPECT_EQ(1, SkipStats::joinChildSuppliers);
-  EXPECT_EQ(1, SkipStats::wholeTopKCountLocalProductions);
+  EXPECT_EQ(1, SkipStats::wholeTopKCountLocalCounts);
 }
 
 TEST_F(JoinCacheTest, residentConstantKeepsBoundsWithSeveralScoringClauses) {

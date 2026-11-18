@@ -5028,11 +5028,15 @@ TEST(FilterCacheTest, localWholeMembershipUsesAnEvictedProduction) {
   RAMDir dir;
   CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), config);
   IndexWriter writer(snapshots, {}, nullptr);
-  for (auto text : {"alpha beta", "alpha", "alpha beta", "beta", "alpha beta"}) addTermDoc(writer, text);
+  int32_t id = 0;
+  for (auto text : {"alpha beta", "alpha", "alpha beta", "beta", "alpha beta"}) {
+    addIdTermDoc(writer, std::to_string(id++), text);
+  }
   addIdTermDoc(writer, "deleted", "other");
   writer.commit();
   auto& deletes = writer.obtainInverter();
   deletes.deleteId("deleted", 1);
+  deletes.deleteId("4", 1);
   writer.releaseInverter(deletes);
   writer.commit();
   auto reader = snapshots.readers.getReader();
@@ -5051,7 +5055,11 @@ TEST(FilterCacheTest, localWholeMembershipUsesAnEvictedProduction) {
   }
   evictValues(*cache);
   MemPool pool;
-  Query::Context context(pool, *reader);
+  RequestMemTracker memory(0);
+  google::protobuf::Arena arena;
+  auto* planning = luxir::arenaCreate<Query::PlanningContext>(arena, pool, *reader,
+      Query::PlanningContext::Limits{}, nullptr, FilterKeyContext{}, nullptr, &memory);
+  auto& context = *Query::Context::create(&arena, *planning);
   auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
   {
     auto probe = use->probe(0);
@@ -5068,13 +5076,15 @@ TEST(FilterCacheTest, localWholeMembershipUsesAnEvictedProduction) {
   auto before = cache->counters();
   auto result = test::resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr, nullptr, 128);
   ASSERT_TRUE(result.available);
-  EXPECT_EQ(3, result.count);
-  EXPECT_TRUE(result.docs.isDeliverable());
-  EXPECT_TRUE(result.docs.get()->get(2));
-  EXPECT_FALSE(result.docs.get()->get(1));
-  EXPECT_GT(use->ownedBytesForTest(), 0u);
+  EXPECT_EQ(2, result.count);
+  EXPECT_EQ(nullptr, result.docs.get());
+  EXPECT_EQ(nullptr, use->rawDocSet(0));
+  EXPECT_EQ(0u, use->ownedBytesForTest());
+  EXPECT_EQ(0u, memory.bytes());
+  EXPECT_EQ(0u, memory.peak());
   auto again = test::resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr, nullptr, 128);
-  EXPECT_EQ(result.docs.get(), again.docs.get());
+  EXPECT_EQ(result.count, again.count);
+  EXPECT_EQ(nullptr, again.docs.get());
   auto after = cache->counters();
   EXPECT_EQ(before.buildAttempts, after.buildAttempts);
   EXPECT_EQ(before.builds, after.builds);
@@ -5084,7 +5094,8 @@ TEST(FilterCacheTest, localWholeMembershipUsesAnEvictedProduction) {
   EXPECT_EQ(before.outstandingDebtNanos, after.outstandingDebtNanos);
   EXPECT_EQ(before.byproductInserts, after.byproductInserts);
   EXPECT_EQ(0u, after.residentBytes);
-  EXPECT_EQ(1, SkipStats::wholeTopKCountLocalProductions);
+  EXPECT_EQ(2, SkipStats::wholeTopKCountLocalCounts);
+  EXPECT_EQ(0, SkipStats::bulkDomainWindowsFed);
 }
 
 TEST(FilterCacheTest, priorCardinalityAnswersCountsWithoutMembershipOrSuppliers) {
@@ -5147,7 +5158,7 @@ TEST(FilterCacheTest, priorCardinalityAnswersCountsWithoutMembershipOrSuppliers)
   EXPECT_FALSE(preparedPlan.resolve(*reader, segment, nullptr, prepared.get(), supplierFor).available);
   EXPECT_EQ(0, suppliers);
   EXPECT_EQ(2, SkipStats::wholeMembershipCardinalityCounts);
-  EXPECT_EQ(0, SkipStats::wholeTopKCountLocalProductions);
+  EXPECT_EQ(0, SkipStats::wholeTopKCountLocalCounts);
   EXPECT_EQ(before, cache->counters());
 }
 
@@ -5176,7 +5187,7 @@ TEST(FilterCacheTest, localWholeMembershipRequiresAPriorProduction) {
         PreparedDomainDependence::QUERY_CANONICAL, QueryPrep::WholeMembershipConsumer::TOP_K_COUNT);
     EXPECT_FALSE(test::resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr, nullptr, 128).available);
   }
-  EXPECT_EQ(0, SkipStats::wholeTopKCountLocalProductions);
+  EXPECT_EQ(0, SkipStats::wholeTopKCountLocalCounts);
 }
 
 TEST(FilterCacheTest, localWholeMembershipScreensExactSizeAndYieldBoundaries) {
@@ -5275,7 +5286,7 @@ TEST(FilterCacheTest, priorCardinalityIncludesByproductsAndRejectedPublications)
   }
 }
 
-TEST(FilterCacheTest, failedLocalWholeProductionReleasesTheClaimWithoutInvestment) {
+TEST(FilterCacheTest, failedLocalWholeCountReleasesTheClaimWithoutInvestment) {
   auto config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
@@ -5291,7 +5302,8 @@ TEST(FilterCacheTest, failedLocalWholeProductionReleasesTheClaimWithoutInvestmen
   auto reader = snapshots.readers.getReader();
   auto cache = snapshots.readers.filterCache;
   auto& segment = reader->segments()[0];
-  TermQuery alpha("text_w", "alpha"), beta("text_w", "beta");
+  PrefixQuery alpha("text_w", "alph", 1);
+  TermQuery beta("text_w", "beta");
   std::array<Query*, 2> required{&alpha, &beta};
   BooleanQuery query(required, {}, {}, {});
   {
@@ -5305,9 +5317,11 @@ TEST(FilterCacheTest, failedLocalWholeProductionReleasesTheClaimWithoutInvestmen
   evictValues(*cache);
   RequestMemTracker memory(1024);
   MemPool pool;
-  Query::Context context(pool, *reader);
+  google::protobuf::Arena arena;
+  auto* planning = luxir::arenaCreate<Query::PlanningContext>(arena, pool, *reader,
+      Query::PlanningContext::Limits{}, nullptr, FilterKeyContext{}, nullptr, &memory);
+  auto& context = *Query::Context::create(&arena, *planning);
   auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
-  use->enableRoutedAccounting(0, memory, "local query membership");
   auto* raw = query.createWeight(context, 0);
   QueryPrep::WholeMembershipPlan plan(*raw, use, context.filterUses,
       PreparedDomainDependence::QUERY_CANONICAL, QueryPrep::WholeMembershipConsumer::TOP_K_COUNT);
@@ -5317,8 +5331,13 @@ TEST(FilterCacheTest, failedLocalWholeProductionReleasesTheClaimWithoutInvestmen
   memory.release(1024);
   EXPECT_EQ(before.buildAttempts, cache->counters().buildAttempts);
   EXPECT_EQ(before.outstandingDebtNanos, cache->counters().outstandingDebtNanos);
-  EXPECT_TRUE(test::resolveWholeMembershipForTests(plan, *reader, segment, nullptr, nullptr, 128).available);
-  EXPECT_GT(memory.bytes(), 0u);
+  auto result = test::resolveWholeMembershipForTests(plan, *reader, segment, nullptr, nullptr, 128);
+  EXPECT_TRUE(result.available);
+  EXPECT_EQ(1, result.count);
+  EXPECT_EQ(nullptr, result.docs.get());
+  EXPECT_EQ(nullptr, use->rawDocSet(0));
+  EXPECT_EQ(0u, use->ownedBytesForTest());
+  EXPECT_EQ(0u, memory.bytes());
   EXPECT_EQ(before.builds, cache->counters().builds);
   EXPECT_EQ(before.outstandingDebtNanos, cache->counters().outstandingDebtNanos);
 }
