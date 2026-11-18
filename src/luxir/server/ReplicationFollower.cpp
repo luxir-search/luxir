@@ -253,6 +253,11 @@ struct ReplicationFollower::Impl {
     // advertised), and when a failed sync may retry.
     Clock::time_point readySince{};
     Clock::time_point retry{};
+    // Readiness: since when `serving` has trailed `advertised`, and whether
+    // it has matched it since this process discovered the source.
+    Clock::time_point behindSince{};
+    bool caughtUp = false;
+    void noteSynced() { if (serving && serving == advertised) caughtUp = true; }
     uint64_t downloaded = 0, reused = 0, total = 0;
     // The incarnation `verified` describes, and its staged candidate when
     // that is not the active collection's incarnation.
@@ -478,6 +483,7 @@ struct ReplicationFollower::Impl {
       state.replaceEmpty = state.seenBoot == sourceBoot;
     if (desired != state.advertised) {
       if (!state.advertised || state.advertised == state.serving || state.waiting) state.readySince = node.now();
+      if (!state.advertised || state.advertised == state.serving) state.behindSince = node.now();
       state.advertised = std::move(desired); state.waiting = false;
     }
     state.advertisedDigest = announced ? announced->digest : 0;
@@ -612,6 +618,7 @@ struct ReplicationFollower::Impl {
             auto shard = state.local->getShard();
             if (shard) {
               state.serving = shard->getSnapshots().snapshot()->id;
+              state.noteSynced();
               if (installed) { state.ready.reset(); state.unreadable.reset(); state.error.clear(); state.verified.clear(); }
             }
           }
@@ -921,6 +928,7 @@ struct ReplicationFollower::Impl {
       state.error.clear(); state.verified.clear();
       auto& advertised = state.advertised;
       if (advertised && advertised->incarnation == snapshot->id.incarnation && advertised->index_gen < snapshot->id.index_gen) advertised = snapshot->id;
+      state.noteSynced();
     }
   }
 
@@ -1123,6 +1131,20 @@ void ReplicationFollower::repair(const CollectionId& id, const std::shared_ptr<C
   }
   impl->changed.notify_all();
 }
+ReplicationFollower::Progress ReplicationFollower::progress() {
+  std::lock_guard lock(impl->mutex);
+  Progress out;
+  out.discovered = impl->discovered;
+  for (auto& [key, state] : impl->states) {
+    if (!state.advertised || !impl->includes(state.name) || state.name.name.empty()) continue;
+    bool synced = state.serving && state.serving == state.advertised;
+    if (synced && impl->discovered) state.caughtUp = true;
+    out.collections.push_back({state.name, state.serving.has_value(), state.caughtUp,
+                               synced ? std::nullopt : std::optional(state.behindSince)});
+  }
+  return out;
+}
+
 void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_resource& arena) {
   std::lock_guard lock(impl->mutex);
   auto str = [&](std::string_view value) { return api::build::arenaStr(arena, value); };

@@ -95,6 +95,7 @@ defaults and constraints are described in the comments and guides.
 - [`CollectionActivityStats`](#message-luxir.collectionactivitystats)
 - [`CollectionCacheControl`](#message-luxir.collectioncachecontrol)
 - [`CollectionCommit`](#message-luxir.collectioncommit)
+- [`CollectionReadiness`](#message-luxir.collectionreadiness)
 - [`CollectionStats`](#message-luxir.collectionstats)
 - [`Column`](#message-luxir.column)
 - [`CommitParams`](#message-luxir.commitparams)
@@ -170,6 +171,7 @@ defaults and constraints are described in the comments and guides.
 - [`QueryFacet`](#message-luxir.queryfacet)
 - [`RangeFacet`](#message-luxir.rangefacet)
 - [`RangeQuery`](#message-luxir.rangequery)
+- [`ReadinessStats`](#message-luxir.readinessstats)
 - [`RegexQuery`](#message-luxir.regexquery)
 - [`RenameCollectionRequest`](#message-luxir.renamecollectionrequest)
 - [`RenameCollectionResponse`](#message-luxir.renamecollectionresponse)
@@ -218,6 +220,7 @@ defaults and constraints are described in the comments and guides.
 - [`VectorAnnDef`](#message-luxir.vectoranndef)
 - [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq)
 - [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq)
+- [`WarmupStatus`](#message-luxir.warmupstatus)
 - [`Warning`](#message-luxir.warning)
 - [`WeightedField`](#message-luxir.weightedfield)
 - [`WildcardQuery`](#message-luxir.wildcardquery)
@@ -698,6 +701,26 @@ Engine work that reached this collection since it was opened. The node's Service
 | <a id="field-luxir.collectioncommit.commit"></a>[`commit`](#field-luxir.collectioncommit.commit) | 1 | `string` | singular | Durable snapshot identity, retained even if the replica wait fails. |
 | <a id="field-luxir.collectioncommit.replicas"></a>[`replicas`](#field-luxir.collectioncommit.replicas) | 2 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
 | <a id="field-luxir.collectioncommit.error"></a>[`error`](#field-luxir.collectioncommit.error) | 3 | [`Error`](#message-luxir.error) | singular | Local commit failure for this collection. |
+
+<a id="message-luxir.collectionreadiness"></a>
+
+### luxir.CollectionReadiness
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.collectionreadiness.name"></a>[`name`](#field-luxir.collectionreadiness.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.collectionreadiness.tenant"></a>[`tenant`](#field-luxir.collectionreadiness.tenant) | 2 | `string` | singular |  |
+| <a id="field-luxir.collectionreadiness.ready"></a>[`ready`](#field-luxir.collectionreadiness.ready) | 3 | `bool` | singular |  |
+| <a id="field-luxir.collectionreadiness.reason"></a>[`reason`](#field-luxir.collectionreadiness.reason) | 4 | `string` | singular | why the collection holds back readiness; empty when ready |
+| <a id="field-luxir.collectionreadiness.follower_lag_ms"></a>[`follower_lag_ms`](#field-luxir.collectionreadiness.follower_lag_ms) | 5 | `uint64` | optional | Followers: how long the local copy has trailed the source's latest commit. |
+| <a id="field-luxir.collectionreadiness.file_bytes"></a>[`file_bytes`](#field-luxir.collectionreadiness.file_bytes) | 6 | `uint64` | singular | Bytes of the files the current reader holds open, the estimated resident bytes of those whose storage can tell, and the bytes of those that cannot. |
+| <a id="field-luxir.collectionreadiness.resident_bytes"></a>[`resident_bytes`](#field-luxir.collectionreadiness.resident_bytes) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.collectionreadiness.unknown_bytes"></a>[`unknown_bytes`](#field-luxir.collectionreadiness.unknown_bytes) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.collectionreadiness.resident_fraction"></a>[`resident_fraction`](#field-luxir.collectionreadiness.resident_fraction) | 9 | `double` | optional | resident\_bytes / (file\_bytes - unknown\_bytes); absent when nothing could tell. |
+| <a id="field-luxir.collectionreadiness.filter_cache_hit_ratio"></a>[`filter_cache_hit_ratio`](#field-luxir.collectionreadiness.filter_cache_hit_ratio) | 10 | `double` | optional | Filter-cache hits per lookup since the previous evaluation; absent without lookups. |
+| <a id="field-luxir.collectionreadiness.warmup"></a>[`warmup`](#field-luxir.collectionreadiness.warmup) | 11 | [`WarmupStatus`](#message-luxir.warmupstatus) | singular | the latest warmup of this collection, if any |
 
 <a id="message-luxir.collectionstats"></a>
 
@@ -1979,6 +2002,21 @@ Matches documents whose field value falls in the given range. All bounds are opt
 | <a id="field-luxir.rangequery.lte"></a>[`lte`](#field-luxir.rangequery.lte) | 4 | [`Val`](#message-luxir.val) | singular | upper bound, inclusive (&lt;=) |
 | <a id="field-luxir.rangequery.lt"></a>[`lt`](#field-luxir.rangequery.lt) | 5 | [`Val`](#message-luxir.val) | singular | upper bound, exclusive (&lt;) |
 
+<a id="message-luxir.readinessstats"></a>
+
+### luxir.ReadinessStats
+
+Whether the node should receive traffic (GET /\_ready), from the latest background evaluation. Ready means every collection this node should serve is available, followers have caught up with their source within server.ready.max-follower-lag-ms, and each collection's resident fraction reaches server.ready.min-resident-fraction.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.readinessstats.ready"></a>[`ready`](#field-luxir.readinessstats.ready) | 1 | `bool` | singular |  |
+| <a id="field-luxir.readinessstats.reason"></a>[`reason`](#field-luxir.readinessstats.reason) | 2 | `string` | singular | why the node is not ready; empty when it is |
+| <a id="field-luxir.readinessstats.checked"></a>[`checked`](#field-luxir.readinessstats.checked) | 3 | `uint64` | singular | Unix milliseconds of the evaluation; zero before the first |
+| <a id="field-luxir.readinessstats.collections"></a>[`collections`](#field-luxir.readinessstats.collections) | 4 | [`CollectionReadiness`](#message-luxir.collectionreadiness) | repeated |  |
+
 <a id="message-luxir.regexquery"></a>
 
 ### luxir.RegexQuery
@@ -2441,6 +2479,7 @@ Which statistics to gather. The node scope (no collection, no tenant) always ret
 | <a id="field-luxir.statsresponse.host"></a>[`host`](#field-luxir.statsresponse.host) | 15 | [`HostStats`](#message-luxir.hoststats) | singular | Set by StatsRequest.host. |
 | <a id="field-luxir.statsresponse.duration_seconds"></a>[`duration_seconds`](#field-luxir.statsresponse.duration_seconds) | 13 | `double` | singular | Time spent gathering this response, excluding serialization. |
 | <a id="field-luxir.statsresponse.scrub"></a>[`scrub`](#field-luxir.statsresponse.scrub) | 14 | [`ScrubStats`](#message-luxir.scrubstats) | singular | Node-wide checksum scrub counters; set when store.scrub-interval-s is. |
+| <a id="field-luxir.statsresponse.readiness"></a>[`readiness`](#field-luxir.statsresponse.readiness) | 40 | [`ReadinessStats`](#message-luxir.readinessstats) | singular | Node scope only: the latest readiness evaluation, as GET /\_ready reports it. |
 
 <a id="message-luxir.statstotals"></a>
 
@@ -2759,6 +2798,24 @@ Approximate nearest-neighbor index settings for a VECTOR field: the codec and pa
 |---|---|---|---|---|
 | <a id="field-luxir.vectoranndef.rabitq.bits"></a>[`bits`](#field-luxir.vectoranndef.rabitq.bits) | 1 | `int32` | optional | Bits per dimension, 0..9. Absent or 0: 2 below 384 stored dims, 1 at or above. Above 1 (extended RaBitQ) a 1-bit pass prunes with the error bound and survivors are re-estimated with the extra bits. |
 | <a id="field-luxir.vectoranndef.rabitq.query_bits"></a>[`query_bits`](#field-luxir.vectoranndef.rabitq.query_bits) | 2 | `int32` | optional | Query quantization bits, 0..8; 0 scans with the float query. Absent: 4. Read at search time, so a change applies to existing overlays. |
+
+<a id="message-luxir.warmupstatus"></a>
+
+### luxir.WarmupStatus
+
+A warmup reads a collection's files into the page cache (or its storage's own cache), smallest files first, up to a byte budget.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.warmupstatus.budget_bytes"></a>[`budget_bytes`](#field-luxir.warmupstatus.budget_bytes) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.warmupstatus.loaded_bytes"></a>[`loaded_bytes`](#field-luxir.warmupstatus.loaded_bytes) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.warmupstatus.running"></a>[`running`](#field-luxir.warmupstatus.running) | 3 | `bool` | singular |  |
+| <a id="field-luxir.warmupstatus.automatic"></a>[`automatic`](#field-luxir.warmupstatus.automatic) | 4 | `bool` | singular | started by server.ready.min-resident-fraction, not POST \_warm |
+| <a id="field-luxir.warmupstatus.started"></a>[`started`](#field-luxir.warmupstatus.started) | 5 | `uint64` | singular | Unix milliseconds |
+| <a id="field-luxir.warmupstatus.finished"></a>[`finished`](#field-luxir.warmupstatus.finished) | 6 | `uint64` | singular | Unix milliseconds; zero while queued or running |
+| <a id="field-luxir.warmupstatus.error"></a>[`error`](#field-luxir.warmupstatus.error) | 7 | `string` | singular |  |
 
 <a id="message-luxir.warning"></a>
 

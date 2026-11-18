@@ -306,6 +306,8 @@ class VectorAuxReader : public AuxReader {
 public:
   static constexpr std::string_view KIND = "vector_faiss";
 
+  void visitFiles(const std::function<void(InputFile&)>& visit) const override { visit(*file); }
+
   static bool usePrecomputedTable(faiss::MetricType metric, bool byResidual,
                                   int64_t nlist, int64_t m, int64_t ksub, int64_t ntotal, int32_t dims) {
     // Bound the L2 residual table by the raw vector size, in floats.

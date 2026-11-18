@@ -167,6 +167,9 @@ public:
               oneapi::tbb::task_arena& arena, std::shared_ptr<Metrics> metrics = Metrics::detached());
   ~Collections();
 
+  // An unavailable reason that is not this node's failure: the collection is
+  // being deleted, or another node serves it. It does not hold back readiness.
+  static bool expectedAbsence(std::string_view reason);
   // A tenant or collection name: [a-z][a-z0-9_]*, at most 255 bytes.
   static void validateName(std::string_view name, std::string_view kind = "collection");
   static void validate(const CollectionId& id);

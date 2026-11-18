@@ -4,10 +4,14 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string_view>
+#include "luxir/util/luxir_util.h"
 
 namespace luxir {
+
+class InputFile;
 
 /// Read-side handle for one entry in IndexInfo.aux_indexes.  Subclasses own
 /// whatever the underlying aux kind needs to answer queries (e.g. a
@@ -33,6 +37,8 @@ public:
   // Identity from the AuxIndexInfo entry.  `getName()` is unique within an index.
   virtual std::string_view getKind() const = 0;
   virtual std::string_view getName() const = 0;
+  // The files this reader holds open, for residency checks and warmup.
+  virtual void visitFiles(const std::function<void(InputFile&)>& visit) const { unused(visit); }
   uint64_t getGen() const noexcept { return gen; }
   uint64_t getBuiltCoreGen() const noexcept { return builtCoreGen; }
 

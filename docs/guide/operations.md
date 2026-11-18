@@ -303,7 +303,7 @@ an authenticated TLS proxy/service mesh.
 
 ## Health and logging
 
-HTTP liveness:
+HTTP liveness (`/_health` is a synonym):
 
 ```bash
 curl http://localhost:9400/health
@@ -313,8 +313,84 @@ curl http://localhost:9400/health
 {"status":"ok"}
 ```
 
-gRPC registers the standard health service. The current HTTP check is process
-liveness, not a deep read/write check of every collection or storage device.
+Liveness answers on the connection's I/O shard and never waits behind
+searches. It says the process is up, not that any collection can serve.
+
+### Readiness and load balancers
+
+`GET /_ready` says whether a load balancer should send this node traffic:
+200 when ready, 503 when not, with a JSON body either way. A background
+thread evaluates readiness every `--server.ready.refresh-ms` (default 5000),
+off the search and indexing arenas; the endpoint returns the latest result
+on the I/O shard without waiting. The node is ready when:
+
+- every collection it should serve is available. A collection that failed to
+  load or failed a checksum scrub holds back the whole node; one being
+  deleted, or assigned to another node of a shared store, does not;
+- on a follower, the source's catalog has been read, every advertised
+  collection is installed and has matched the source's latest commit at least
+  once since start, and none has trailed the source for longer than
+  `--server.ready.max-follower-lag-ms` (default 30000; 0 removes the bound
+  after the first catch-up). A follower that loses its source stays ready on
+  its installed copies: they are not behind anything it knows of;
+- with `--server.ready.min-resident-fraction` above 0 (default 0, report
+  only), each collection's estimated resident fraction reaches it.
+
+```json
+{"ready":true,"checked":1795000000000,"collections":[{"name":"main","tenant":"t0",
+  "ready":true,"file_bytes":73400320,"resident_bytes":73400320,"resident_fraction":1,
+  "filter_cache_hit_ratio":0.93}]}
+```
+
+Per collection, `file_bytes` counts the files the current reader holds open
+(segment files and vector overlays) and `resident_bytes` estimates how much of
+them is in the page cache: `mincore` over every page of a file of up to 4 MiB,
+evenly spaced samples of a larger one. Storage that cannot tell (a file the
+process neither owns nor can write, where the kernel reports every page
+resident, or a backend without a cache report) counts in `unknown_bytes` and
+never holds back readiness. RAM storage is always resident. Without
+min-resident-fraction the numbers cover only a reader already open; with it
+the evaluation opens the reader. `filter_cache_hit_ratio` is the hit rate
+since the previous evaluation, absent when there were no lookups;
+`follower_lag_ms` is how long a follower copy has trailed its source.
+
+With min-resident-fraction set, a collection below it is warmed
+automatically, once per reader, so a restarted node does not wait for traffic
+it cannot receive. Set it below what the page cache can hold: a collection
+larger than the cache never becomes ready. A warmup can also be started by
+hand, for example from a Kubernetes `postStart` hook or before a node is
+added to a pool:
+
+```bash
+curl -X POST 'http://localhost:9400/collections/main/_warm?budget_mb=2048'
+```
+
+It returns 202 at once (409 if a warmup of the collection is queued or
+running) and loads the reader's files smallest first, up to `budget_mb`
+(default: all of them), in 4 MiB chunks on the readiness thread:
+`MADV_WILLNEED` then a read of each page for mapped files. Progress appears
+under the collection's `warmup` in `/_ready`.
+
+gRPC registers the standard `grpc.health.v1.Health` service: the unnamed
+service is liveness and stays `SERVING`, and the service `luxir.ready` follows
+`/_ready`. Kubernetes probes:
+
+```yaml
+livenessProbe:
+  httpGet: {path: /health, port: 9400}
+readinessProbe:
+  httpGet: {path: /_ready, port: 9400}
+  periodSeconds: 5
+# or: readinessProbe: {grpc: {port: 9401, service: luxir.ready}}
+```
+
+A probe period near `--server.ready.refresh-ms` sees each evaluation once.
+Readiness is also in node-scope `/_stats` as `readiness`, and in Prometheus as
+`luxir_ready` and the per-collection `luxir_collection_ready`,
+`luxir_collection_file_bytes`, `luxir_collection_resident_bytes`,
+`luxir_collection_resident_fraction`,
+`luxir_collection_filter_cache_hit_ratio` and
+`luxir_collection_follower_lag_seconds`.
 
 Operational statistics and Prometheus metrics are described in
 [Stats and monitoring](#stats-and-monitoring).
@@ -553,6 +629,7 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_field_metadata_objects`, `luxir_field_metadata_bytes` | Cached field metadata by `part` (directory, page, entry, name). |
 | `luxir_allocator_bytes`, `luxir_allocator_arena_*_bytes` | Jemalloc allocated, active, resident, mapped, retained, dirty, and metadata memory, plus indexing/big-buffer arenas. Resident is an allocator estimate, not process RSS. Absent without jemalloc; check `luxir_allocator_stats_available`. |
 | `luxir_scrub_*_total`, `luxir_scrub_last_pass_end_timestamp_seconds` | Checksum scrub passes, files, read bytes, mismatches, and other check errors, and when the last pass ended. Present only while scrubbing is enabled; the timestamp is absent before the first pass. |
+| `luxir_ready`, `luxir_collection_ready`, `luxir_collection_file_bytes`, `luxir_collection_resident_bytes`, `luxir_collection_resident_fraction`, `luxir_collection_filter_cache_hit_ratio`, `luxir_collection_follower_lag_seconds` | The latest [readiness](#readiness-and-load-balancers) evaluation: node and collection readiness, the current reader's file bytes and their estimated page-cache residency, the filter-cache hit rate since the previous evaluation, and follower lag. |
 | `luxir_multiterm_expansion_refills_total` | Process-wide multi-term expansion refills. |
 | `luxir_build_info`, `luxir_node_read_only` | Build version, CPU target, source commit, and the FAISS SIMD level and BLAS core selected at startup; read-only configuration. |
 | `luxir_stats_duration_seconds` | Time gathering the response, excluding serialization. |

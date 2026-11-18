@@ -17,6 +17,10 @@ namespace luxir {
 
 static constexpr std::string_view DELETING_REASON = "being deleted";
 
+bool Collections::expectedAbsence(std::string_view reason) {
+  return reason == DELETING_REASON || reason.starts_with(CollectionServedByError::kPrefix);
+}
+
 std::shared_ptr<Collection> Collection::placeholder(CollectionId id, std::string reason) {
   auto collection = std::make_shared<Collection>();
   collection->id = std::move(id);

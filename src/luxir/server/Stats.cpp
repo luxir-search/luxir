@@ -7,6 +7,7 @@
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/util/log.h"
 #include "ReplicationFollower.h"
+#include "Readiness.h"
 #include "Scrubber.h"
 
 #include <cassert>
@@ -406,8 +407,40 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     auto scrub = node.getScrubber().stats();
     response.scrub = api::ScrubStats{scrub.passes, scrub.files, scrub.bytes, scrub.mismatches, scrub.errors, scrub.lastPassEnd};
   }
+  if (nodeScope) gatherReadiness(node, response.readiness.emplace(), resource);
   response.duration_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+void gatherReadiness(LuxirNode& node, api::ReadinessStats& out, std::pmr::memory_resource& resource) {
+  auto report = node.readiness().report();
+  if (!report) {
+    out.reason = "not evaluated yet";
+    return;
+  }
+  auto str = [&](std::string_view value) { return api::build::arenaStr(resource, value); };
+  out.ready = report->ready;
+  out.reason = str(report->reason);
+  out.checked = report->checked;
+  auto* rows = api::build::allocArray(out.collections, report->collections.size(), resource);
+  for (size_t i = 0; i < report->collections.size(); i++) {
+    const auto& c = report->collections[i];
+    auto& row = rows[i];
+    row.name = str(c.id.name);
+    row.tenant = str(c.id.tenant);
+    row.ready = c.ready;
+    row.reason = str(c.reason);
+    row.follower_lag_ms = c.followerLagMs;
+    row.file_bytes = c.fileBytes;
+    row.resident_bytes = c.residentBytes;
+    row.unknown_bytes = c.unknownBytes;
+    row.resident_fraction = c.residentFraction();
+    row.filter_cache_hit_ratio = c.filterCacheHitRatio;
+    if (c.warmup) {
+      const auto& w = *c.warmup;
+      row.warmup = api::WarmupStatus{w.budget, w.loaded, w.running, w.automatic, w.started, w.finished, str(w.error)};
+    }
+  }
 }
 
 void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request,

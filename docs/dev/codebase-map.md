@@ -24,6 +24,9 @@ locations, browse `src/luxir/<area>/`.
      when their old data now belongs to another name
    - `Scrubber`: Paced background re-verification of published snapshot files; a mismatch
      fails the collection (`Collections::fail`) and a follower repairs it
+   - `Readiness`: Background thread behind `GET /_ready` and the gRPC `luxir.ready` health
+     status: collection availability, follower lag (`ReplicationFollower::progress`), page-cache
+     residency of each reader's files (`InputFile::residentBytes`) and warmups (`InputFile::load`)
    - `ReplicationSource`: Local discovery catalog, cursors, follower liveness and acknowledgments,
      fed by the ordered `CollectionEvents` interface.
    - `CommitWaits`: Node-local publication floors and replica barriers; owns deadlines,

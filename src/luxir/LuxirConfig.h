@@ -74,6 +74,20 @@ struct ServerConfig {
       return std::max(1, oneapi::tbb::info::default_concurrency());
     }
   } http;
+
+  // GET /_ready: when the node should receive traffic (see Readiness).
+  struct Ready {
+    // A follower collection stays ready while it has been behind its source's
+    // latest commit for at most this long, once it has caught up after start.
+    // 0 = no bound after the first catch-up.
+    int64_t max_follower_lag_ms = 30000;
+    // Fraction of each collection's current file bytes that must be resident
+    // in the page cache (or a backend's own cache). 0 = report only. Above 0,
+    // a collection below it is also warmed automatically once per reader.
+    double min_resident_fraction = 0;
+    // How often the background evaluation runs; /_ready serves the latest.
+    int64_t refresh_ms = 5000;
+  } ready;
 };
 
 struct CheckedDirConfig {

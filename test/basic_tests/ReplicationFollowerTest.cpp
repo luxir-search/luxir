@@ -12,6 +12,7 @@
 #include "luxir/server/Scrubber.h"
 #include "luxir/server/ReplicationFollower.h"
 #include "luxir/server/Promotion.h"
+#include "luxir/server/Readiness.h"
 #include "luxir/server/ReplicationSource.h"
 #include "luxir/server/CommitWaits.h"
 #include "luxir/server/ReplicationState.h"
@@ -664,6 +665,36 @@ TEST_F(ReplicationFollowerTest, sourceCatalogNeverRegresses) {
   ASSERT_TRUE(until([&] { return stateIs("serving"); }));
   stopFollower(); startFollower();
   EXPECT_EQ(served, follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id);
+}
+
+TEST_F(ReplicationFollowerTest, readinessBoundsFollowerLag) {
+  followerConfig.server.ready.max_follower_lag_ms = 1000;
+  startSource();
+  CollectionHelper h(*source, "main");
+  ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  startFollower(manualClock());
+  ASSERT_TRUE(caughtUp());
+  auto ready = [&] { return follower->readiness().refresh()->ready; };
+  ASSERT_TRUE(until(ready));
+  // The next commit cannot install: the copy falls behind, within the bound at first.
+  Signal::listen("snapshotRootDurable", [](void*, void*, void*) -> void* { throw std::runtime_error("interrupted root"); });
+  ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(until([&] { return stateIs("error"); }));
+  auto report = follower->readiness().refresh();
+  EXPECT_TRUE(report->ready);
+  ASSERT_EQ(1u, report->collections.size());
+  EXPECT_EQ(0u, report->collections[0].followerLagMs.value_or(1));
+  advance(1500ms);
+  report = follower->readiness().refresh();
+  EXPECT_FALSE(report->ready);
+  EXPECT_EQ(1500u, report->collections[0].followerLagMs.value_or(0));
+  EXPECT_NE(std::string::npos, report->reason.find("behind the source")) << report->reason;
+  EXPECT_EQ(503, httpRequest(followerServer->getPort(), http::verb::get, "/_ready").result_int());
+  Signal::unlisten("snapshotRootDurable");
+  advance(60s);  // past the sync retry
+  ASSERT_TRUE(caughtUp());
+  ASSERT_TRUE(until(ready));
+  EXPECT_EQ(200, httpRequest(followerServer->getPort(), http::verb::get, "/_ready").result_int());
 }
 
 TEST_F(ReplicationFollowerTest, sweepKeepsInstalledRootAfterInterruptedNewerRoot) {

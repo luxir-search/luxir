@@ -14,7 +14,9 @@ credentials. Administration and snapshot routes may name another tenant under
 | Method and path | Purpose |
 |---|---|
 | `GET /` | Binary version, full source commit hash, and CPU target. |
-| `GET /health` | Process liveness. |
+| `GET /health` | Process liveness; `GET /_health` is a synonym. |
+| `GET /_ready` | Readiness for traffic: 200 or 503 with per-collection detail; see [Readiness](operations.md#readiness-and-load-balancers). |
+| `POST /collections/{collection}/_warm` | Load the collection's current files into the page cache, up to optional `budget_mb`; 202, or 409 while one runs. |
 | `GET` or `POST /collections/{collection}/_search` | Search; URL request fields and optional POST JSON body, chunked NDJSON response. |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
@@ -31,7 +33,7 @@ credentials. Administration and snapshot routes may name another tenant under
 | `GET /collections/{collection}/_snapshot` | Pin the current snapshot for copying; see [Replication](replication.md). |
 | `GET /collections/{collection}/_snapshot/files/{name}` | One file of a pinned snapshot. |
 | `GET /tenants` | Tenants that own a collection. |
-| `/tenants/{tenant}/collections/...` | The administration and snapshot routes above (`_list`, `_create`, `_delete`, `_rename`, `_swap`, `_schema`, `_stats`, `_snapshot`) for a named tenant; `GET /tenants/{tenant}/_stats` covers that tenant. |
+| `/tenants/{tenant}/collections/...` | The administration and snapshot routes above (`_list`, `_create`, `_delete`, `_rename`, `_swap`, `_schema`, `_stats`, `_warm`, `_snapshot`) for a named tenant; `GET /tenants/{tenant}/_stats` covers that tenant. |
 | `GET /_replication/watch`, `POST /_replication/installed`, `GET /_replication/status` | Replication discovery, acknowledgments and status; see [Replication](replication.md). |
 
 Collection names occupy one URL path component. Names beginning with `_` are

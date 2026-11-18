@@ -149,6 +149,13 @@ query makes and the rounds of requests it waits on in sequence, since each
 read today depends on the one before it: the catalog, the term index, term
 blocks, then postings.
 
+Readiness already asks storage how warm it is. `InputFile::residentBytes`
+reports the bytes a read would find without the device or the network (the
+page cache for mapped files, all of a RAM file; unknown by default), and
+`InputFile::load` brings a range in and returns once it is there (prefetch by
+default). A remote backend with a local cache implements both against that
+cache, and `/_ready` and `_warm` then cover it unchanged.
+
 Merging requests reduces their number but not the rounds, so the index
 format can change too. A later layout could let a reader know, from
 metadata it already holds, where all of a query's data lies, and gather it

@@ -49,8 +49,9 @@ public:
 
 class CollectionServedByError : public CollectionUnavailableError {
 public:
+  static constexpr std::string_view kPrefix = "served by ";
   explicit CollectionServedByError(std::string_view node)
-    : CollectionUnavailableError("served by " + std::string(node.empty() ? "(unassigned)" : node)) {}
+    : CollectionUnavailableError(std::string(kPrefix) + std::string(node.empty() ? "(unassigned)" : node)) {}
 };
 
 class NodeSupersededError : public CollectionUnavailableError {

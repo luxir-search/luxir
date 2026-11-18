@@ -134,6 +134,25 @@ void scrub(Renderer& r, const api::ScrubStats& s) {
     r.gauge("luxir_scrub_last_pass_end_timestamp_seconds", "When the last completed scrub pass ended, since Unix epoch.", s.last_pass_end / 1e3);
 }
 
+void readiness(Renderer& r, const api::ReadinessStats& s) {
+  r.gauge("luxir_ready", "Whether GET /_ready reports the node ready.", s.ready);
+  for (const auto& c : s.collections) {
+    auto labels = PrometheusText::label("tenant", c.tenant) + "," + PrometheusText::label("collection", c.name);
+    r.gauge("luxir_collection_ready", "Whether the collection lets the node report ready.", c.ready, labels);
+    r.gauge("luxir_collection_file_bytes", "Bytes of the files the collection's current reader holds open.", (double)c.file_bytes, labels);
+    r.gauge("luxir_collection_resident_bytes", "Estimated bytes of those files resident in the page cache or the storage's own cache.",
+            (double)c.resident_bytes, labels);
+    if (c.resident_fraction)
+      r.gauge("luxir_collection_resident_fraction", "Resident bytes over the file bytes whose residency is known.", *c.resident_fraction, labels);
+    if (c.filter_cache_hit_ratio)
+      r.gauge("luxir_collection_filter_cache_hit_ratio", "Filter-cache hits per lookup since the previous readiness evaluation.",
+              *c.filter_cache_hit_ratio, labels);
+    if (c.follower_lag_ms)
+      r.gauge("luxir_collection_follower_lag_seconds", "How long the follower copy has trailed its source's latest commit.",
+              (double)*c.follower_lag_ms / 1e3, labels);
+  }
+}
+
 void cache(Renderer& r, const api::QueryCacheStats& c, const std::string& labels) {
   r.gauge("luxir_filter_cache_resident_bytes", "Resident filter-cache payload bytes.", (double)c.resident_bytes, labels);
   r.gauge("luxir_filter_cache_metadata_bytes", "Filter-cache metadata bytes.", (double)c.metadata_bytes, labels);
@@ -409,6 +428,7 @@ std::string renderPrometheus(const api::StatsResponse& stats) {
   if (stats.system) systemStats(r, *stats.system);
   if (stats.host) hostStats(r, *stats.host);
   if (stats.scrub) scrub(r, *stats.scrub);
+  if (stats.readiness) readiness(r, *stats.readiness);
   r.counter("luxir_multiterm_expansion_refills_total", "Process-wide multi-term expansion refills.", (double)stats.multiterm_expansion_refills);
   r.gauge("luxir_stats_duration_seconds", "Time gathering this response, excluding serialization and transmission.", stats.duration_seconds);
   return out.str();

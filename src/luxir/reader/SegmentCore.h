@@ -67,6 +67,11 @@ public:
     return total;
   }
 
+  // Every physical base-segment file this core holds open.
+  template <class Visit> void visitFiles(Visit&& visit) const {
+    for (const auto& file : files) if (file) visit(*file);
+  }
+
   InputFile* getFile(uint32_t fnum) {
     assert(fnum < files.size());
     assert(files[fnum] != nullptr);
