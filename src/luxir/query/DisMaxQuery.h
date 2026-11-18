@@ -45,6 +45,15 @@ public:
   static Query* make(MemPool& pool, std::span<Query*> disjuncts, float tie);
 
   std::span<Query*> getDisjuncts() const { return disjuncts; }
+
+  // A document matches when some disjunct does.
+  MatchState mayMatch(const SummaryView& view) const override {
+    if (disjuncts.empty()) return MatchState::UNKNOWN;
+    for (Query* disjunct : disjuncts) {
+      if (disjunct->mayMatch(view) != MatchState::EMPTY) return MatchState::UNKNOWN;
+    }
+    return MatchState::EMPTY;
+  }
   float getTie() const { return tie; }
   Query* getMembership() const { return membership; }
 

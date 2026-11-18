@@ -97,6 +97,12 @@ locations, browse `src/luxir/<area>/`.
    - Child liveness is derived lazily from root deletes through ownership ranges;
      metadata-only count probes use conservative bounds until it is known.
    - Supports Term, Boolean, Phrase, and All queries
+   - `Query::mayMatch` proves from a segment's `SummaryView` that a query
+     cannot match it (`SummaryPredicates.h` holds the leaf proofs);
+     `QueryPruning` evaluates and memoizes those verdicts per request as
+     `SegmentMask`s, which the parser turns into each op's root mask
+     (`SearchOp::viable`). See
+     [segment summaries](../design/segment-summaries.md#pruning).
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
      column scans. `BKDQueryWeight<QueryType, Relation>` serves geo box,

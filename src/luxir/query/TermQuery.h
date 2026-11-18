@@ -16,6 +16,7 @@
 #include "Query.h"
 #include "luxir/reader/NormsReader.h"
 #include "luxir/util/luxir_util.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -84,6 +85,10 @@ public:
       PlanningContext& context, float multiplier = 1.0f) const override {
     unused(context);
     checkedBoostProduct(multiplier, boost);
+  }
+
+  MatchState mayMatch(const SummaryView& view) const override {
+    return summary::termMatch(view, field, term);
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
