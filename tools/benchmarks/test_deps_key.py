@@ -9,17 +9,22 @@ spec = importlib.util.spec_from_file_location('deps_key', Path(__file__).with_na
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
-DOCKERFILE = '''FROM ubuntu:22.04 AS toolchain
+DOCKERFILE = '''ARG TOOLCHAIN=toolchain
+ARG NORMAL_DEPENDENCIES=normal-dependencies
+FROM ubuntu:22.04 AS base
+FROM base AS gcc-amd64
+FROM base AS gcc-arm64
+FROM gcc-${TARGETARCH} AS toolchain
 COPY .devcontainer/check-toolchain.cpp .devcontainer/check-toolchain.sh /opt/luxir-checks/
-FROM toolchain AS normal-dependencies
+FROM ${TOOLCHAIN} AS normal-dependencies
 COPY deps/vcpkg.json deps/vcpkg-configuration.json /opt/luxir-deps/
 COPY deps/ports /opt/luxir-deps/ports
 COPY deps/triplets /opt/luxir-deps/triplets
 ARG BUILD_JOBS=12
 COPY test/blas_lapack_test.cpp /opt/luxir-checks/check-lapack.cpp
-FROM normal-dependencies AS dependencies
+FROM ${NORMAL_DEPENDENCIES} AS dependencies
 RUN echo later-stage
-FROM toolchain AS dev
+FROM ${TOOLCHAIN} AS dev
 COPY --from=dependencies /opt/vcpkg /opt/vcpkg
 COPY --from=dependencies /opt/luxir-deps /opt/luxir-deps
 RUN apt-get install wamerican
@@ -27,6 +32,33 @@ RUN apt-get install wamerican
 
 
 class KeyContract(unittest.TestCase):
+    def test_macos_identity(self):
+        root = Path(__file__).resolve().parents[2]
+        key = module.macos_key(root)
+        self.assertEqual(key, module.macos_key(root))
+        with tempfile.TemporaryDirectory() as tmp:
+            import shutil
+            target = Path(tmp)
+            for name in ('deps', 'tools'):
+                # Copy only key inputs, not fetched dependency sources/builds.
+                (target / name).mkdir()
+            for name in ('deps/vcpkg.json', 'deps/vcpkg-configuration.json', 'deps/ports',
+                         'deps/triplets', 'deps/make_deps.sh', 'deps/fetch_sources.sh',
+                         'tools/macos-deps', 'tools/macos-toolchain'):
+                source = root / name
+                if source.is_dir():
+                    shutil.copytree(source, target / name)
+                else:
+                    (target / name).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target / name)
+            self.assertEqual(key, module.macos_key(target))
+            for path in sorted(target.rglob('*')):
+                if path.is_file():
+                    data = path.read_bytes()
+                    path.write_bytes(data + b'changed')
+                    self.assertNotEqual(key, module.macos_key(target), str(path))
+                    path.write_bytes(data)
+
     def test_inputs_and_normalization(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -60,8 +92,11 @@ class KeyContract(unittest.TestCase):
             self.assertNotEqual(key, module.deps_key(root))
             for old, new in [('RUN apt-get install wamerican', 'RUN apt-get install other'),
                              ('AS dev', 'AS other'),
+                             ('base AS gcc-arm64', 'gcc-amd64 AS gcc-arm64'),
+                             ('gcc-${TARGETARCH} AS toolchain', 'gcc-amd64 AS toolchain'),
                              ('--from=dependencies /opt/vcpkg', '--from=toolchain /opt/vcpkg'),
-                             ('FROM normal-dependencies', 'FROM toolchain')]:
+                             ('FROM ${NORMAL_DEPENDENCIES}', 'FROM toolchain'),
+                             ('ARG NORMAL_DEPENDENCIES=normal-dependencies', 'ARG NORMAL_DEPENDENCIES=toolchain')]:
                 dockerfile.write_text(DOCKERFILE.replace(old, new))
                 if old.startswith('RUN'):
                     self.assertNotEqual(key, module.deps_key(root))

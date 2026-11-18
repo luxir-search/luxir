@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/FieldReader.h"
 #include <tuple>
 #include "luxir/index/PostingsWriter.h"
@@ -33,7 +34,8 @@ public:
   uint32_t termsPerFieldMax = 100;  // TODO: stick to a single term block for now
   int32_t highestDoc = -1;
 
-  std::unique_ptr<PostingsReader> reader;
+  std::unique_ptr<SegmentCore> core;
+  PostingsReader* reader = nullptr;
   std::unique_ptr<FieldReader> fieldReader;
   std::unique_ptr<TermsEnum> tenum;
   std::unique_ptr<DocsPosEnum> docsEnum;
@@ -88,7 +90,8 @@ public:
     tenum.reset();
     fieldReader.reset();
     writer.reset();
-    reader.reset();
+    reader = nullptr;
+    core.reset();
 
     pool.rewind(save);
 
@@ -108,7 +111,8 @@ public:
     luxir::test::writeUnversionedRuns(*postingsWriter);
     postingsWriter->finish();
 
-    reader = std::make_unique<PostingsReader>(dir, 0, 1);
+    core = std::make_unique<SegmentCore>(dir, 0, 1);
+    reader = &core->rootReader();
     fieldReader = std::make_unique<FieldReader>(*reader);
 
     // restore the RNG state
@@ -160,7 +164,7 @@ public:
 
   void getFieldName(std::string& target, uint32_t fieldNum) {
     target.resize(13);
-    sprintf(term.data(), "field%08d", fieldNum);
+    snprintf(target.data(), target.size() + 1, "field%08u", fieldNum);
   }
 
 
@@ -268,7 +272,7 @@ public:
       makeTermsEnum();
     } else {
       writer = std::make_unique<TextWriter>(*postingsWriter);
-      writer->startField(fname);
+      writer->startField(SpaceOrdinal::ROOT, fname);
     }
     int realNumTerms = 0;
     for (uint32_t i = 0; i < numTerms; i++) {

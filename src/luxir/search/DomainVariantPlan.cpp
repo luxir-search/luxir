@@ -22,12 +22,15 @@ DomainHandle DomainVariantPlan::account(DomainHandle domain, RequestMemTracker& 
 
 DomainHandle DomainVariantPlan::composeTracked(std::vector<DomainHandle> parts, RequestMemTracker& tracker) {
   std::vector<DomainHandle> distinct;
+  DomainHandle identity;
+  if (!parts.empty()) identity = DomainHandle().scopedLike(parts[0]);
   for (auto& part : parts) {
+    part.assertSameScope(identity);
     if (!part.get()) continue;
     if (std::ranges::any_of(distinct, [&](const auto& old) { return old.get() == part.get(); })) continue;
     distinct.push_back(std::move(part));
   }
-  if (distinct.size() <= 1) return freeze(distinct.empty() ? DomainHandle{} : distinct.front());
+  if (distinct.size() <= 1) return freeze(distinct.empty() ? identity : distinct.front());
   return account(compose(std::move(distinct)), tracker, "composed segment domain");
 }
 
@@ -95,11 +98,12 @@ void DomainVariantPlan::SegmentSources::init(size_t source, Query::Weight* weigh
     return;
   }
   auto& seg = reader.segments()[(size_t)segment];
-  value.stable = materialize(source, seg.hasDeletes() ? &seg.liveDocs()->docset() : nullptr, std::move(probe));
+  value.stable = materialize(source, seg.liveDocSet(), std::move(probe));
 }
 
 DomainHandle DomainVariantPlan::SegmentSources::resolve(size_t source, DomainHandle base,
                                                         const QueryPrep::PreparedSource* prepared) {
+  base.assertScope(reader.segments()[(size_t)segment]);
   auto& value = values[source];
   if (value.weight->matchesAllDocs()) return freeze(std::move(base));
   DomainHandle result;
@@ -109,20 +113,21 @@ DomainHandle DomainVariantPlan::SegmentSources::resolve(size_t source, DomainHan
     result = account(
         DomainHandle(QueryPrep::materialize(*value.weight, prepared ? prepared->prepared.get() : nullptr,
                                             reader.segments()[(size_t)segment], base.get())),
-        tracker, "scoped segment source");
+        tracker, "scoped segment source").scopedLike(base);
   } else if (!value.stable) {
     result = materialize(source, base.get());
   } else {
     auto& domain = *value.stable;
+    domain.assertSameScope(base);
     auto& seg = reader.segments()[(size_t)segment];
-    DocSet* live = seg.hasDeletes() ? &seg.liveDocs()->docset() : nullptr;
+    DocSet* live = seg.liveDocSet();
     if (!domain.get())
       result = base;
     else if (!base.get() || base.get() == live || base.get() == domain.get())
       result = domain;
     else {
       std::array<DocSet*, 2> parts{base.get(), domain.get()};
-      result = account(DomainHandle(DocSet::intersect(parts)), tracker, "scoped segment source");
+      result = account(DomainHandle(DocSet::intersect(parts)), tracker, "scoped segment source").scopedLike(base);
     }
   }
   assert(result.isDeliverable());
@@ -132,16 +137,16 @@ DomainHandle DomainVariantPlan::SegmentSources::resolve(size_t source, DomainHan
 
 std::vector<std::vector<DomainHandle>> DomainVariantPlan::produceBucketDomains(
     IndexReader& reader, Query::PlanningContext& planning, std::span<const DomainHandle> inherited,
-    std::span<const DomainHandle> resetBase, bool parallel, ExecutionWarnings* warnings,
+    std::span<const DomainHandle> resetBase, FanoutScope* fanout, ExecutionWarnings* warnings,
     RequestMemTracker& tracker, Sources sources, const Finish& finish) const {
   BucketProduction production{tracker, sources};
-  return producePreparedDomains(reader, planning, inherited, resetBase, parallel, warnings, production,
+  return producePreparedDomains(reader, planning, inherited, resetBase, fanout, warnings, production,
                                 finish);
 }
 
 std::vector<std::vector<DomainHandle>> DomainVariantPlan::producePreparedDomains(
     IndexReader& reader, Query::PlanningContext& planning, std::span<const DomainHandle> inherited,
-    std::span<const DomainHandle> resetBase, bool parallel, ExecutionWarnings* warnings,
+    std::span<const DomainHandle> resetBase, FanoutScope* fanout, ExecutionWarnings* warnings,
     BucketProduction& production, const Finish& finish) const {
   assert(inherited.size() == resetBase.size());
   std::vector<Query::Weight*> weights(this->sourceCount());
@@ -154,7 +159,7 @@ std::vector<std::vector<DomainHandle>> DomainVariantPlan::producePreparedDomains
   auto preparationBase = hasResetVariants() ? resetBase : inherited;
   for (const auto& domain : preparationBase) views.push_back(domain.get());
   Query::Weight::PrepareContext prepareContext{reader, std::span<DocSet* const>(views.data(), views.size()),
-                                               parallel, warnings};
+                                               fanout, warnings};
   std::vector<QueryPrep::PreparedSource> prepared(weights.size());
   std::vector<QueryPrep::PreparedSource> inheritedExtras;
   auto release = scope_guard([&]() noexcept {
@@ -212,7 +217,7 @@ std::vector<std::vector<DomainHandle>> DomainVariantPlan::producePreparedDomains
       std::vector<DocSet*> localViews;
       for (const auto& domain : inherited) localViews.push_back(domain.get());
       Query::Weight::PrepareContext context{
-          reader, std::span<DocSet* const>(localViews.data(), localViews.size()), parallel, warnings};
+          reader, std::span<DocSet* const>(localViews.data(), localViews.size()), fanout, warnings};
       auto local = QueryPrep::prepareFilterSources(localWeights, localUses, context);
       inheritedExtras.resize(weights.size());
       for (size_t i = 0; i < sources.size(); i++) inheritedExtras[sources[i]] = std::move(local[i]);
@@ -263,7 +268,7 @@ std::vector<std::vector<DomainHandle>> DomainVariantPlan::producePreparedDomains
   }
 
   auto preparedVariants = this->prepareResetVariants(
-      prepared, eligibility, std::span<DocSet* const>(views.data(), views.size()), reader, parallel, warnings,
+      prepared, eligibility, std::span<DocSet* const>(views.data(), views.size()), reader, fanout, warnings,
       [&](size_t variant, size_t segnum) {
         std::string detail =
             "reset variant " + std::to_string(variant) + " segment " + std::to_string(segnum);

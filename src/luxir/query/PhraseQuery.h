@@ -362,6 +362,8 @@ public:
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
 
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
+
   class Weight final : public Query::Weight {
     PhraseQuery& query;
     CachedFieldInfo* cachedFieldInfo;
@@ -440,13 +442,16 @@ public:
         : Query::Weight(context, query, flags), query(query) {
       bool needScores = (flags & NEED_SCORES) != 0;
       if (!needScores) traits |= IS_CONSTANT_SCORING;
+      // Only exact phrases prune on impacts, which is what an exact count
+      // composed with a separate ranking pass gains.
+      if (needScores && query.getSlop() == 0) traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
       if (cachedFieldInfo == nullptr) return;
 
       cachedTermInfos = context.pool.make_span<CachedTermInfo*>(query.getTerms().size());
       Similarity similarity;
       double idf = 0.0;
-      for (int i = 0; i < cachedTermInfos.size(); i++) {
+      for (size_t i = 0; i < cachedTermInfos.size(); i++) {
         cachedTermInfos[i] = context.getCachedTerminfo(*cachedFieldInfo, query.getTerms()[i]);
         if (cachedTermInfos[i] == nullptr) {
           cachedFieldInfo = nullptr;
@@ -664,6 +669,16 @@ public:
       };
 
     public:
+      BulkPlan planBulk(
+          BulkUse use, const BulkScorerContext& bulkContext) override {
+        BulkPlan plan = Query::ScorerSupplier::planBulk(use, bulkContext);
+        if (use == BulkUse::EXACT_CANDIDATE_SCORING
+            && weight.needsScores() && weight.query.getSlop() == 0) {
+          plan.rankingScoresExact = BulkAnswer::YES;
+        }
+        return plan;
+      }
+
       Supplier(PhraseQuery::Weight& weight, IndexReader::Segment& segment)
           : weight(weight), segment(segment) {}
 
@@ -774,7 +789,7 @@ public:
           return PostingsReader::END;
         }
 
-        for (int j = 1; j < posEnums.size(); j++) {
+        for (size_t j = 1; j < posEnums.size(); j++) {
           int32_t adjustedTarget = target + positions[j];
           int32_t p = posEnums[j]->advancePosition((int32_t) adjustedTarget);
           assert(p >= adjustedTarget);
@@ -807,7 +822,7 @@ public:
           return PostingsReader::END;
         }
 
-        for (int j = 1; j < posEnums.size(); j++) {
+        for (size_t j = 1; j < posEnums.size(); j++) {
           int32_t adjustedTarget = target + positions[j];
           int32_t p = scorer.repeatSlotAdvance(j, adjustedTarget);
           assert(p >= adjustedTarget);
@@ -1231,7 +1246,7 @@ public:
       auto* firstEnum = conjunctionEnums[0];
       outer:
       for (;;) {
-        for (int j = 1; j < conjunctionEnums.size(); j++) {
+        for (size_t j = 1; j < conjunctionEnums.size(); j++) {
           if (conjunctionEnums[j]->docId() < target) {
             int32_t id = conjunctionEnums[j]->advanceInline(target);
             assert(id >= target);

@@ -78,6 +78,7 @@ namespace luxir {
 class StoredFieldsWriter {
 private:
   PostingsWriter& postingsWriter;
+  SpaceOrdinal space;
   std::string resourceName_;
   StoredChunkFormat format_;
   OutputStreamPtr chunkOutput;
@@ -119,11 +120,11 @@ public:
   // under which the resource is registered in the segment's per-field index;
   // the caller resolves the format from the schema's StoredFieldType.  See
   // Postings::STORED_DEFAULT_RESOURCE for the canonical default.
-  explicit StoredFieldsWriter(PostingsWriter& pw,
+  explicit StoredFieldsWriter(PostingsWriter& pw, SpaceOrdinal space,
                               std::string_view resourceName = Postings::STORED_DEFAULT_RESOURCE,
                               const StoredChunkFormat& format = {},
                               std::shared_ptr<const StoredCompressionDictionary> dictionary = {})
-    : postingsWriter(pw),
+    : postingsWriter(pw), space(space),
       resourceName_(resourceName),
       format_(format),
       compressor(dictionary)
@@ -209,7 +210,7 @@ public:
       chunkOutput->writePackedTerm(name);
     }
 
-    auto& fi = postingsWriter.addField(resourceName_);
+    auto& fi = postingsWriter.addField(space, resourceName_);
     fi.type = FieldType::BIN;
     fi.flags = FieldType::STORED;
     fi.columnLoc = seg_location(chunkOutput->streamNumber, (uint64_t)chunksStart);

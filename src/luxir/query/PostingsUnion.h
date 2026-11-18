@@ -24,9 +24,10 @@ static_assert(ExpansionStates::CHUNK_SIZE * sizeof(TermsEnum::PostingsState) == 
 
 // Shared skeleton of the windowed constant scorers: set-bit production out
 // of one L1-sized doc window, refilled forward-only by the derived class.
-// fillWindow(target) populates windowBits/windowStart/windowEnd and leaves
-// nextWindowTarget at the next docid worth filling a window at (>= windowEnd,
-// or >= maxDoc once the postings are exhausted).
+// fillWindow(target, end) populates windowBits over [target, min(end,
+// target + WINDOW_SIZE)) and leaves nextWindowTarget at the next docid worth
+// filling a window at (>= windowEnd, or >= maxDoc once the postings are
+// exhausted).
 template <class Derived>
 class UnionWindowScorer : public Query::ConstantScorer {
 public:
@@ -69,7 +70,11 @@ protected:
     }
   }
 
-  int32_t seek(int32_t target) {
+  // Seeks the first match at or after target. Windows end at fillEnd, so a
+  // membership window decodes only the postings blocks its span covers; with
+  // no match before fillEnd, returns a resume point >= fillEnd without moving.
+  int32_t seek(int32_t target, int32_t fillEnd = PostingsReader::END) {
+    int32_t end = std::min(maxDoc, fillEnd);
     if (target >= maxDoc) {
       return docid = PostingsReader::END;
     }
@@ -80,17 +85,14 @@ protected:
       // fill leaves nextWindowTarget valid.
       target = nextWindowTarget;
     }
-    if (target >= maxDoc) {
-      return docid = PostingsReader::END;
-    }
     while (found == PostingsReader::END) {
-      static_cast<Derived*>(this)->fillWindow(target);
+      if (target >= end) {
+        return target >= maxDoc ? docid = PostingsReader::END : target;
+      }
+      static_cast<Derived*>(this)->fillWindow(target, end);
       found = findInWindow(target);
       if (found != PostingsReader::END) {
         break;
-      }
-      if (nextWindowTarget >= maxDoc) {
-        return docid = PostingsReader::END;
       }
       target = nextWindowTarget;
     }
@@ -108,6 +110,11 @@ public:
     assert(docid < target);
     return seek(target);
   }
+  int32_t advanceWindow(int32_t min, int32_t max) override {
+    if (min >= max) return max;
+    if (docid >= min) return docid;
+    return seek(min, max);
+  }
   int32_t docId() override { return docid; }
 
 protected:
@@ -122,9 +129,9 @@ class UnionLazyScorer final : public UnionWindowScorer<UnionLazyScorer> {
 
   std::span<DocsOnlyEnum> docsEnums;
 
-  void fillWindow(int32_t target) {
+  void fillWindow(int32_t target, int32_t end) {
     windowStart = target;
-    windowEnd = (int32_t) std::min<int64_t>(maxDoc, (int64_t) target + WINDOW_SIZE);
+    windowEnd = (int32_t) std::min<int64_t>(end, (int64_t) target + WINDOW_SIZE);
     nextWindowTarget = windowEnd;
     memset(windowBits.data(), 0, windowBits.size_bytes());
 
@@ -207,9 +214,9 @@ class UnionHeapScorer final : public UnionWindowScorer<UnionHeapScorer> {
     windowBits[index >> 6] |= 1ULL << (index & 63);
   }
 
-  void fillWindow(int32_t target) {
+  void fillWindow(int32_t target, int32_t end) {
     windowStart = target;
-    windowEnd = (int32_t) std::min<int64_t>(maxDoc, (int64_t) target + WINDOW_SIZE);
+    windowEnd = (int32_t) std::min<int64_t>(end, (int64_t) target + WINDOW_SIZE);
     memset(windowBits.data(), 0, windowBits.size_bytes());
 
     while (heapSize != 0 && entryDoc(heap[0]) < windowEnd) {

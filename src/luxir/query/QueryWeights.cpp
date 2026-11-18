@@ -13,7 +13,9 @@
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/CombinedFieldQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/ToParentQuery.h"
 #include "luxir/query/ExistsQuery.h"
+#include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/FuzzyQuery.h"
 #include "luxir/query/GeoBoxQuery.h"
@@ -25,12 +27,20 @@
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
+#include "luxir/query/RangeFieldQuery.h"
 #include "luxir/query/RescoreQuery.h"
 #include "luxir/query/TermInSetQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/TermRangeQuery.h"
 
 namespace luxir {
+
+#ifndef NDEBUG
+void Query::Weight::assertLogicalDomainConsumption() const {
+  assert(luxir::logicalConsumesDomain(owner)
+      && "Weight consumes a domain absent from its logical query");
+}
+#endif
 
 AllQuery::Weight* AllQuery::createWeight(Context& context, int32_t flags,
                                          float multiplier) {
@@ -56,10 +66,32 @@ FilteredTermsEnum* AutomatonQuery::createFilteredEnum(MemPool& pool, TermsEnum& 
 
 Query::Weight* AutomatonQuery::createWeight(
     Context& context, int32_t flags, float multiplier) {
-  if (automatonKind != Kind::MATCH || !caseInsensitive || (flags & NEED_SCORES) == 0) {
+  if (!hasScoredRewrite()) {
     return MultiTermQuery::createWeight(context, flags, multiplier);
   }
+  // A scored weight rewrites to the union of indexed case variants. Unscored
+  // weights of the same query match that union as a constant-score filter once
+  // it exists, so the variant scan is charged to the request's budget once;
+  // before it, they take the multi-term filter form. The parser builds a
+  // query's scored weight before its count weight, so in a ranked request the
+  // rewrite exists by then.
+  Query*& rewritten = MultiTermQuery::Weight::sharedRewrite(context, *this);
+  if ((flags & NEED_SCORES) == 0) {
+    if (rewritten == nullptr) return MultiTermQuery::createWeight(context, flags, multiplier);
+    auto* filter = context.pool.make<ConstantScoreQuery>(rewritten);
+    filter->markPlannerGenerated();
+    return filter->createWeight(context, flags, multiplier);
+  }
+  if (rewritten == nullptr) rewritten = rewriteCaseVariants(context);
+#ifndef NDEBUG
+  if (context.logicalValidationActive()) {
+    rewritten->validateLogical(context.planningContext(), multiplier);
+  }
+#endif
+  return rewritten->createWeight(context, flags, multiplier);
+}
 
+Query* AutomatonQuery::rewriteCaseVariants(Context& context) {
   // Discover the union across segments before computing shared synonym stats.
   // Unlike fuzzy, case matching promises every alternate, so an operator limit
   // rejects rather than truncates, as this query's filter form does.
@@ -116,12 +148,7 @@ Query::Weight* AutomatonQuery::createWeight(
     weights[0] = 1.0f;
     rewritten = context.pool.make<CombinedFieldQuery>(fields, weights, terms);
   }
-#ifndef NDEBUG
-  if (context.logicalValidationActive()) {
-    rewritten->validateLogical(context.planningContext(), multiplier);
-  }
-#endif
-  return rewritten->createWeight(context, flags, multiplier);
+  return rewritten;
 }
 
 Query::Weight* BoostQuery::createWeight(Context& context, int32_t flags,
@@ -133,6 +160,43 @@ Query::Weight* ConstantScoreQuery::createWeight(Context& context, int32_t flags,
                                                 float multiplier) {
   return context.pool.make<ConstantScoreQuery::Weight>(context, *this, flags,
                                                        multiplier);
+}
+
+std::optional<float> ToParentQuery::uniformChildScore(Query& query, float multiplier) {
+  switch (query.getKind()) {
+    case QueryKind::BOOST: {
+      auto& boost = (BoostQuery&)query;
+      return uniformChildScore(*boost.getChild(), checkedBoostProduct(multiplier, boost.getBoost()));
+    }
+    case QueryKind::FORCE_PREPARE:
+      return uniformChildScore(*((ForcePrepareQuery&)query).getChild(), multiplier);
+    case QueryKind::TO_PARENT: {
+      auto& join = (ToParentQuery&)query;
+      if (join.reduction.kind == RowReduction::NONE) return 0.0f;
+      if (join.reduction.kind == RowReduction::SUM) return std::nullopt;
+      auto child = uniformChildScore(*join.child);
+      return child ? std::optional<float>(*child * multiplier) : std::nullopt;
+    }
+    case QueryKind::AUTOMATON:
+      // Literal case-insensitive matches rewrite to scored alternatives.
+      if (((AutomatonQuery&)query).hasScoredRewrite()) return std::nullopt;
+      break;
+    case QueryKind::BOOLEAN:
+    case QueryKind::RESCORE:
+      // Compiled addition order and expression conversion determine the
+      // rounded result. Quote it from the built scorer, not the tree.
+      return std::nullopt;
+    default:
+      break;
+  }
+  auto profile = luxir::scoreProfile(query);
+  return profile.kind == ScoreProfile::Kind::VARIABLE ? std::nullopt
+      : std::optional<float>(multiplier * profile.value);
+
+}
+
+Query::Weight* ToParentQuery::createWeight(Context& context, int32_t flags, float multiplier) {
+  return context.pool.make<ToParentQuery::Weight>(context, *this, flags, multiplier);
 }
 
 ExistsQuery::Weight* ExistsQuery::createWeight(
@@ -203,9 +267,21 @@ Query::Weight* CombinedFieldQuery::createWeight(
   return rewritten->createWeight(context, flags, multiplier);
 }
 
+Query& FuzzyQuery::logicalRewrite(Context& context) const {
+  // The kept terms do not depend on flags, so every weight the request builds
+  // for this query (ranking, count, domain) reuses one dictionary scan.
+  struct Rewrite {
+    Query* query;
+  };
+  Query* rewritten = context.getOrCreateLogicalPlan<Rewrite>(*this, [&]() {
+    return context.pool.make<Rewrite>(rewriteToDisjunction(context));
+  }).query;
+  return *rewritten;
+}
+
 Query::Weight* FuzzyQuery::createWeight(
     Context& context, int32_t flags, float multiplier) {
-  Query* rewritten = rewriteToDisjunction(context);
+  Query* rewritten = &logicalRewrite(context);
 #ifndef NDEBUG
   if (context.logicalValidationActive()) {
     rewritten->validateLogical(context.planningContext(), multiplier);
@@ -222,6 +298,12 @@ Query::Weight* GeoBoxQuery::createWeight(Context& context, int32_t flags,
 
 Query::Weight* GeoDistanceQuery::createWeight(Context& context, int32_t flags,
                                               float multiplier) {
+  float score = constantWhenScored(flags, multiplier);
+  return context.pool.make<Weight>(context, *this, flags, score);
+}
+
+Query::Weight* RangeFieldQuery::createWeight(Context& context, int32_t flags,
+                                             float multiplier) {
   float score = constantWhenScored(flags, multiplier);
   return context.pool.make<Weight>(context, *this, flags, score);
 }
@@ -296,5 +378,87 @@ BulkScorer* TermQuery::Weight::Supplier::buildBulk(
 FilteredTermsEnum* TermRangeQuery::createFilteredEnum(MemPool& pool, TermsEnum& te) {
   return pool.make<RangeTermsEnum>(te, lower, includeLower, upper, includeUpper);
 }
+
+void TermQuery::visitImpl(QueryVisitor& visitor, Context&, float multiplier) const {
+  visitor.term(field, term, checkedBoostProduct(multiplier, boost));
+}
+
+void PhraseQuery::visitImpl(QueryVisitor& visitor, Context&, float boost) const {
+  for (auto term : terms) visitor.term(field, term, boost);
+}
+
+void BooleanQuery::visitImpl(QueryVisitor& visitor, Context& context, float boost) const {
+  auto visitClauses = [&](std::span<Query*> clauses, QueryVisitor::Occur occur, float multiplier) {
+    if (clauses.empty()) return;
+    if (auto* childVisitor = visitor.sub(occur, *this)) {
+      for (const auto* clause : clauses) clause->visit(*childVisitor, context, multiplier);
+    }
+  };
+  visitClauses(mandatory, QueryVisitor::Occur::MUST, boost);
+  visitClauses(optional, QueryVisitor::Occur::SHOULD, boost);
+  visitClauses(filter, QueryVisitor::Occur::FILTER, 1.0f);
+  visitClauses(prohibited, QueryVisitor::Occur::MUST_NOT, 1.0f);
+}
+
+void BoostQuery::visitImpl(QueryVisitor& visitor, Context& context, float multiplier) const {
+  child->visit(visitor, context, checkedBoostProduct(multiplier, boost));
+}
+
+void ConstantScoreQuery::visitImpl(QueryVisitor& visitor, Context& context, float) const {
+  if (auto* childVisitor = visitor.sub(QueryVisitor::Occur::FILTER, *this)) {
+    child->visit(*childVisitor, context, 1.0f);
+  }
+}
+
+void DisMaxQuery::visitImpl(QueryVisitor& visitor, Context& context, float boost) const {
+  if (auto* childVisitor = visitor.sub(QueryVisitor::Occur::SHOULD, *this)) {
+    for (const auto* disjunct : disjuncts) disjunct->visit(*childVisitor, context, boost);
+  }
+}
+
+void ForcePrepareQuery::visitImpl(QueryVisitor& visitor, Context& context, float boost) const {
+  child->visit(visitor, context, boost);
+}
+
+void RescoreQuery::visitImpl(QueryVisitor& visitor, Context& context, float) const {
+  // The value expression can transform scores arbitrarily. Report the matching
+  // child's terms with its own scoring multiplier, as used by execution.
+  child->visit(visitor, context, 1.0f);
+}
+
+void MinScoreQuery::visitImpl(QueryVisitor& visitor, Context& context, float) const {
+  child->visit(visitor, context, 1.0f);
+}
+
+void CombinedFieldQuery::visitImpl(QueryVisitor& visitor, Context&, float boost) const {
+  for (const auto& term : terms) {
+    visitor.term(fields[term.field], term.text,
+        checkedBoostProduct(boost, weights[term.field] * term.weight));
+  }
+}
+
+void FuzzyQuery::visitImpl(QueryVisitor& visitor, Context& context, float boost) const {
+  logicalRewrite(context).visit(visitor, context, boost);
+}
+
+void AutomatonQuery::visitImpl(QueryVisitor& visitor, Context& context, float boost) const {
+  // Show the representation execution uses. Inspection must not cause an
+  // unscored multi-term filter to switch to the scored case-variant rewrite.
+  if (automatonKind == Kind::MATCH && caseInsensitive) {
+    if (const auto* rewritten = MultiTermQuery::Weight::sharedRewrite(context, *this)) {
+      rewritten->visit(visitor, context, boost);
+      return;
+    }
+  }
+  visitor.leaf(*this);
+}
+
+void TermInSetQuery::visitImpl(QueryVisitor& visitor, Context&, float boost) const {
+  for (auto term : terms) visitor.term(field, term, boost);
+}
+
+// ALL and NONE have a complete, empty term picture.
+void AllQuery::visitImpl(QueryVisitor&, Context&, float) const {}
+void MatchNoDocsQuery::visitImpl(QueryVisitor&, Context&, float) const {}
 
 } // namespace luxir

@@ -107,6 +107,7 @@ private:
     Collections& owner;
     CollectionId name;
     std::unique_lock<std::recursive_mutex> catalogLock;
+    friend class Collections;
   public:
     Transition(Collections& owner, CollectionId name);
     ~Transition();
@@ -124,6 +125,7 @@ private:
   std::shared_ptr<UnreadableRelay> unreadableRelay = std::make_shared<UnreadableRelay>();
   std::shared_ptr<Metrics> metrics;
   const LuxirConfig& config;
+  const std::string lifetime;
   CollectionEvents& events;
   IndexRamBudget& indexRamBudget;
   oneapi::tbb::task_arena& arena;  // runs every writer's indexing (the node's index arena)
@@ -144,11 +146,14 @@ private:
   std::map<std::string, std::map<std::string, std::shared_ptr<Collection>>, std::less<>> listing;
 
   std::shared_ptr<Collection> makeCollection(const CollectionId& id, std::shared_ptr<Directory> directory);
-  std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<std::string>& selected);
-  std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {}, bool startup = false, std::optional<std::string> reserved = {});
+  void openOne(Opened& row, Role role, const std::shared_ptr<Collection>& expected = {});
+  std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<TenantCatalog::Entry>& selected);
+  std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {}, bool startup = false,
+                                        std::optional<TenantCatalog::Entry> entry = {});
+  void unload(const Transition& transition, const std::shared_ptr<Collection>& expected, std::string reason);
   // A writer whose newest root is invalid continues from the newest valid one
-  // under a new incarnation. Returns the incarnation to open.
-  std::string recoverWriter(const CollectionId& id, TenantCatalog& storage, const std::string& selected);
+  // under a new incarnation. Updates opened to match the returned incarnation.
+  std::string recoverWriter(const CollectionId& id, TenantCatalog& storage, const std::string& selected, WriterOpen& opened);
   void observe(const CollectionId& id, Collection& collection);
   // The policy helpers require cachePolicyMutex. Listing locks nest inside it.
   size_t cacheBytes(const CollectionId& id) const;
@@ -168,7 +173,7 @@ private:
   void retire(const CollectionId& id, const std::string& selected) noexcept;
 
 public:
-  Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget,
+  Collections(const LuxirConfig& config, std::string lifetime, CollectionEvents& events, IndexRamBudget& indexRamBudget,
               oneapi::tbb::task_arena& arena, std::shared_ptr<Metrics> metrics = Metrics::detached());
   ~Collections();
 
@@ -177,6 +182,7 @@ public:
   static void validate(const CollectionId& id);
   DirectoryFactory& storage() { return *factory; }
   TenantCatalog& catalog(std::string_view tenant = CollectionId::kDefaultTenant);
+  void expireRetirements();
   uint64_t storageBytes(const CollectionId& id);
   uint64_t storageBytes(const Collection& collection);
 
@@ -205,6 +211,11 @@ public:
   // Removes the entry and all storage. Without `mustExist`, an absent entry
   // still removes leftover storage. Refused while a candidate is staged.
   void remove(const CollectionId& id, bool mustExist = true);
+  // Final commit (best effort), close, and hand off the existing incarnation.
+  // A commit failure is thrown after the handoff; assignment failures also unload.
+  void detach(const CollectionId& id, std::string_view target);
+  // Open an active catalog entry, optionally taking its assignment first.
+  std::shared_ptr<Collection> attach(const CollectionId& id, bool force = false);
 
   void rename(const CollectionId& from, const CollectionId& to) { changeNames(from, to, false); }
   void swap(const CollectionId& a, const CollectionId& b) { changeNames(a, b, true); }

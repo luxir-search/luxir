@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <bit>
+#include <cmath>
 #include <format>
 #include <limits>
 #include <type_traits>
@@ -111,6 +112,33 @@ protected:
     b.set(col);
   }
 };
+
+// A child score below the child floor never reaches the floor once scaled:
+// the score is child * multiplier in float, so checking the float just below
+// the child floor covers every lower one. Zero and subnormal floors round
+// absolutely, which a multiplier under 1 magnifies past the one-ulp margin.
+TEST(MinScoreFloorTest, childFloorKeepsEveryChildThatReachesTheFloor) {
+  constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
+  const float step = std::numeric_limits<float>::denorm_min();
+  SplitMix64 rng(17);
+  std::vector<float> floors{0.0f};
+  for (int k = 1; k <= 64; k++) floors.push_back((float)k * step);
+  for (int i = 0; i < 4000; i++) {
+    floors.push_back(std::ldexp(1.0f + (float)(rng() % 4096) / 4096.0f, (int)(rng() % 270) - 150));
+  }
+  for (float multiplier : {0.1f, 0.3f, 0.5f, 0.75f, 0.99999994f, 1.0f, 2.5f,
+                           1e-20f, 1e-40f, 1e20f}) {
+    EXPECT_EQ(-5.0f, MinScoreQuery::childFloor(NEG_INF, -5.0f, multiplier, true));
+    for (float magnitude : floors) {
+      for (float floor : {magnitude, -magnitude}) {
+        float child = MinScoreQuery::childFloor(floor, NEG_INF, multiplier, true);
+        float below = std::nextafter(child, NEG_INF);
+        ASSERT_FALSE(below * multiplier >= floor)
+            << "floor " << floor << " multiplier " << multiplier << " child floor " << child;
+      }
+    }
+  }
+}
 
 TEST_F(MinScoreTest, topDocsExcludesHitsCountsAndFacets) {
   CollectionHelper h;

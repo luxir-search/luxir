@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include "test/StorageTestUtils.h"
 #include "gtest/gtest.h"
 #include "luxir/index/IndexWriter.h"
@@ -361,7 +362,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   PostingsWriter sourcePostings(sourceDir, 0, 1, 1);
   {
     TextWriter writer(sourcePostings);
-    auto& fieldInfo = sourcePostings.addField("pos");
+    auto& fieldInfo = sourcePostings.addField(SpaceOrdinal::ROOT, "pos");
     fieldInfo.type = FieldType::TEXT;
     fieldInfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
     writer.startField(&fieldInfo);
@@ -378,7 +379,8 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   writeUnversionedRuns(sourcePostings);
   sourcePostings.finish();
 
-  PostingsReader sourceReader(sourceDir, 0, 1);
+  SegmentCore sourceReaderCore(sourceDir, 0, 1);
+  auto& sourceReader = sourceReaderCore.rootReader();
   FieldReader sourceFields(sourceReader);
   ASSERT_TRUE(sourceFields.readNextField());
   SegFieldInfo sourceInfo;
@@ -395,7 +397,7 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   PostingsWriter targetPostings(targetDir, 1, 1, 1);
   {
     TextWriter writer(targetPostings);
-    auto& fieldInfo = targetPostings.addField("pos");
+    auto& fieldInfo = targetPostings.addField(SpaceOrdinal::ROOT, "pos");
     fieldInfo.type = FieldType::TEXT;
     fieldInfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
     writer.startField(&fieldInfo);
@@ -417,7 +419,8 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   writeUnversionedRuns(targetPostings);
   targetPostings.finish();
 
-  PostingsReader targetReader(targetDir, 1, 1);
+  SegmentCore targetReaderCore(targetDir, 1, 1);
+  auto& targetReader = targetReaderCore.rootReader();
   FieldReader targetFields(targetReader);
   ASSERT_TRUE(targetFields.readNextField());
   SegFieldInfo targetInfo;
