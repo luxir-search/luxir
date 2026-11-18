@@ -189,6 +189,7 @@ defaults and constraints are described in the comments and guides.
 - [`SchemaRequest`](#message-luxir.schemarequest)
 - [`SchemaResponse`](#message-luxir.schemaresponse)
 - [`ScrubStats`](#message-luxir.scrubstats)
+- [`SearchFanoutStats`](#message-luxir.searchfanoutstats)
 - [`SearchOp`](#message-luxir.searchop)
 - [`SearchRequest`](#message-luxir.searchrequest)
 - [`SearchResponse`](#message-luxir.searchresponse)
@@ -2264,6 +2265,24 @@ Background checksum scrub of published snapshot files. A mismatch also makes its
 | <a id="field-luxir.scrubstats.last_pass_end"></a>[`last_pass_end`](#field-luxir.scrubstats.last_pass_end) | 5 | `uint64` | singular | Unix milliseconds; absent before the first pass |
 | <a id="field-luxir.scrubstats.errors"></a>[`errors`](#field-luxir.scrubstats.errors) | 6 | `uint64` | singular | other file check errors; retried on the next pass |
 
+<a id="message-luxir.searchfanoutstats"></a>
+
+### luxir.SearchFanoutStats
+
+What the adaptive segment fan-out (max\_parallel 0) decided. An evaluation is a fan-out point that had earned a grain of inline time and priced the children still to run; a search can evaluate several times. Each evaluation publishes or is denied once, so published and the denied\_\* fields sum to the evaluations.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.searchfanoutstats.serial_searches"></a>[`serial_searches`](#field-luxir.searchfanoutstats.serial_searches) | 1 | `uint64` | singular | Adaptive searches that published no share. Searches run with max\_parallel 1, -1 or -2 are not counted. |
+| <a id="field-luxir.searchfanoutstats.parallel_searches"></a>[`parallel_searches`](#field-luxir.searchfanoutstats.parallel_searches) | 2 | `uint64` | singular | Adaptive searches that published at least one share. |
+| <a id="field-luxir.searchfanoutstats.published"></a>[`published`](#field-luxir.searchfanoutstats.published) | 3 | `uint64` | singular | Evaluations that published shares. |
+| <a id="field-luxir.searchfanoutstats.shares"></a>[`shares`](#field-luxir.searchfanoutstats.shares) | 4 | `uint64` | singular | Shares those evaluations published. |
+| <a id="field-luxir.searchfanoutstats.denied_grain"></a>[`denied_grain`](#field-luxir.searchfanoutstats.denied_grain) | 5 | `uint64` | singular | Evaluations where no share would cover the grain: search.fanout-grain-us, or search.fanout-sibling-grain-us when only SMT siblings were idle. |
+| <a id="field-luxir.searchfanoutstats.denied_siblings_only"></a>[`denied_siblings_only`](#field-luxir.searchfanoutstats.denied_siblings_only) | 6 | `uint64` | singular | Evaluations denied because only SMT siblings were idle and search.fanout-sibling-grain-us is -1. |
+| <a id="field-luxir.searchfanoutstats.denied_saturated"></a>[`denied_saturated`](#field-luxir.searchfanoutstats.denied_saturated) | 7 | `uint64` | singular | Evaluations denied because the machine was saturated. |
+
 <a id="message-luxir.searchop"></a>
 
 ### luxir.SearchOp
@@ -2396,6 +2415,7 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.control_busy"></a>[`control_busy`](#field-luxir.servicestats.control_busy) | 61 | `uint64` | singular | tasks running now |
 | <a id="field-luxir.servicestats.control_queued"></a>[`control_queued`](#field-luxir.servicestats.control_queued) | 62 | `uint64` | singular | tasks waiting for a thread |
 | <a id="field-luxir.servicestats.control_completed"></a>[`control_completed`](#field-luxir.servicestats.control_completed) | 63 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.search_fanout"></a>[`search_fanout`](#field-luxir.servicestats.search_fanout) | 97 | [`SearchFanoutStats`](#message-luxir.searchfanoutstats) | singular |  |
 
 <a id="message-luxir.shardcachecontrol"></a>
 

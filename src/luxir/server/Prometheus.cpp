@@ -77,6 +77,15 @@ void service(Renderer& r, const api::ServiceStats& s) {
               s.request_duration_bounds, s.search_execution);
   r.counter("luxir_search_resource_exhausted_total", "Searches rejected by resource limits, including the request memory breaker.", (double)s.search_resource_exhausted);
   r.counter("luxir_search_warnings_total", "Searches completing with at least one declared degradation warning.", (double)s.search_warnings);
+  const auto& f = s.search_fanout;
+  constexpr std::string_view fanoutSearches = "Adaptive (max_parallel 0) searches, by whether they published any fan-out share.";
+  r.counter("luxir_search_fanout_searches_total", fanoutSearches, (double)f.serial_searches, "fanout=\"serial\"");
+  r.counter("luxir_search_fanout_searches_total", fanoutSearches, (double)f.parallel_searches, "fanout=\"parallel\"");
+  constexpr std::string_view fanoutDecisions = "Adaptive fan-out evaluations, by whether they published or why they were denied.";
+  for (auto [outcome, count] : {std::pair{"published", f.published}, {"denied_grain", f.denied_grain},
+                                {"denied_siblings_only", f.denied_siblings_only}, {"denied_saturated", f.denied_saturated}})
+    r.counter("luxir_search_fanout_decisions_total", fanoutDecisions, (double)count, PrometheusText::label("outcome", outcome));
+  r.counter("luxir_search_fanout_shares_total", "Fan-out shares published by adaptive decisions.", (double)f.shares);
   r.activity("luxir_index_batches", "luxir_index_batch_duration_seconds", s.index_batches, s.request_duration_bounds);
   constexpr std::string_view docs = "Documents accepted into indexing or rejected/rolled back; acceptance is not durable acknowledgment.";
   r.counter("luxir_ingest_documents_total", docs, (double)s.documents_accepted, "outcome=\"accepted\"");

@@ -114,6 +114,11 @@ void SearchEngine::submitBody(SearchRequest& req) {
     req.setError(info);
   }
 
+  if (req.tg && req.tg->getPolicy() == FanoutPolicy::ADAPTIVE) {
+    node.metrics->add(req.tg->published() ? MetricCounter::SEARCH_FANOUT_PARALLEL
+                                          : MetricCounter::SEARCH_FANOUT_SERIAL);
+  }
+
   if (root != nullptr) {
     for (auto& segment : req.reader->segments()) root->releaseSegmentState(segment);
   }

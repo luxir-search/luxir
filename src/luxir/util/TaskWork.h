@@ -23,6 +23,10 @@ inline std::atomic<uint64_t> fanoutSiblingGrainNs{1'000'000};
 inline std::atomic<uint64_t> fanoutEvaluations{0};
 inline std::atomic<uint64_t> fanoutPublishedShares{0};
 inline std::atomic<uint64_t> fanoutLoadDenials[2]{};  // Siblings only, saturated.
+// Evaluations whose shares missed the grain (or the sibling grain). With
+// publishing decisions and load denials they sum to fanoutEvaluations.
+inline std::atomic<uint64_t> fanoutGrainDenials{0};
+inline std::atomic<uint64_t> fanoutAdaptiveShares{0};  // Published by adaptive decisions.
 inline std::atomic<uint64_t> fanoutShareStartDelayNsSum{0};
 inline std::atomic<uint64_t> fanoutShareStartDelayCount{0};
 inline std::atomic<uint64_t> fanoutShareStartDelayNsMax{0};

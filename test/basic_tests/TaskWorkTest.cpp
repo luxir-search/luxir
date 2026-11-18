@@ -497,6 +497,7 @@ TEST_F(TaskWorkTest, stealBlocksSharesThatCannotPayIt) {
   std::array<int, 8> completed{};
   FanoutScope runner(nullptr, FanoutPolicy::ADAPTIVE);
   TaskSpawnCounter counter;
+  auto evaluations = fanoutEvaluations.load(), denials = fanoutGrainDenials.load();
   EXPECT_EQ(0u, task_group_fanout(&runner, completed.size(), FanoutKind::EXHAUSTIVE, [](size_t) {
     return FanoutSize{1, 4};
   }, [&](size_t i) { return [&, i] {
@@ -506,6 +507,9 @@ TEST_F(TaskWorkTest, stealBlocksSharesThatCannotPayIt) {
   runner.join();
   EXPECT_EQ(0, counter.count());
   EXPECT_EQ((std::array<int, 8>{1, 1, 1, 1, 1, 1, 1, 1}), completed);
+  // Every evaluation that sized shares was denied by the grain.
+  EXPECT_GT(fanoutEvaluations.load(), evaluations);
+  EXPECT_EQ(fanoutEvaluations.load() - evaluations, fanoutGrainDenials.load() - denials);
 }
 
 TEST_F(TaskWorkTest, publishResetsCredit) {

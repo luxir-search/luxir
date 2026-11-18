@@ -3,6 +3,8 @@
 
 
 #include <gtest/gtest.h>
+#include <glaze/glaze.hpp>
+#include <glaze/json/generic.hpp>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -23,6 +25,7 @@
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
+#include "test/TaskSpawnCounter.h"
 #include "luxir/query/BooleanWeight.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/query/ProtobufQueryParser.h"
@@ -35,6 +38,7 @@
 #include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/server/GRPCServer.h"
 #include "luxir/server/JsonRequest.h"
+#include "luxir/server/JsonResponse.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -8428,4 +8432,63 @@ TEST_F(SearchEngineTest, scalarFactsKeepTheExistingKnownCountRankingFormation) {
   EXPECT_EQ(oldKnown.first, fact.first);
   expectBitIdenticalScoreMap(oldKnown.second, fact.second);
   EXPECT_EQ(1u, cache->counters().builds);
+}
+
+// max_parallel picks where work runs, never what it returns: adaptive (0,
+// with a 1 ns grain so it publishes), every sibling (-1) and serial on the
+// caller (1) must render the same response as serial inline (-2).
+TEST_F(SearchEngineTest, maxParallelNeverChangesResults) {
+  CollectionHelper helper("max_parallel");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  SchemaBuilder schema;
+  auto& vector = schema.field("v_v");
+  vector.type = api::FieldDef::FieldClass::VECTOR;
+  vector.column = true;
+  vector.dims = 2;
+  vector.metric = api::VectorMetric::L2;
+  schema.set(helper.collection());
+  const char* words[] = {"alpha", "alpha beta", "beta gamma", "alpha gamma beta", "gamma"};
+  for (int seg = 0; seg < 5; seg++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 80; i++) {
+      int64_t n = seg * 80 + i;
+      docs.push_back(flatdoc("id", std::to_string(n), "body_w", words[(n * 7) % 5],
+          "cat_s", "c" + std::to_string(n % 6), "key_s", "k" + std::to_string(n % 13), "n_i", n,
+          "v_v", std::vector<float>{(float)(n % 17), (float)(n % 11)}));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_EQ(5u, helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+
+  auto render = [&](std::string_view body, int32_t maxParallel) {
+    auto req = localReq(helper.getSearchEngine());
+    parseQueryRequest(body, req->rawRequest(), req->mr);
+    req->collection("max_parallel").execute(maxParallel);
+    EXPECT_TRUE(req->ok()) << body << ": " << req->errorMsg();
+    if (req->responses.size() != 1) return std::string("responses: ") + std::to_string(req->responses.size());
+    glz::generic_sorted_u64 json;
+    EXPECT_FALSE(glz::read_json(json, renderSearchResponseBody(req->responses[0]->proto)));
+    return glz::write_json(json).value();
+  };
+  FanoutLoadGuard load;
+  FanoutGrainGuard grain(1);
+  TaskSpawnCounter spawns;
+  for (std::string_view body : std::initializer_list<std::string_view>{
+      R"j({"query":"body_w:alpha","get_scores":true,"count_limit":-1,"fields":["id"],"limit":15})j",
+      R"j({"query":"body_w:alpha body_w:gamma","get_scores":true,"count_limit":-1,"fields":["id"],"limit":15})j",
+      R"j({"query":"body_w:alpha AND body_w:beta","get_scores":true,"count_limit":-1,"fields":["id"],"limit":15})j",
+      R"j({"query":"body_w:\"alpha beta\"","get_scores":true,"count_limit":-1,"fields":["id"],"limit":15})j",
+      R"j({"query":"n_i:[30 TO 350]","sort":"n_i desc","count_limit":-1,"fields":["id","n_i"],"limit":15})j",
+      R"j({"query":"body_w:beta","limit":0,"count_limit":-1,"ops":{
+          "cats":{"field_facet":{"field":"cat_s","limit":-1}},
+          "ranges":{"range_facet":{"field":"n_i","start":0,"end":400,"gap":50}},
+          "total":{"expr_op":"sum(n_i)"}}})j",
+      R"j({"query":"body_w:gamma","collapse":"key_s","sort":"n_i asc","count_limit":-1,"fields":["id"],"limit":8})j",
+      R"j({"query":{"knn":{"field":"v_v","query":[3,4],"k":12}},"get_scores":true,"count_limit":-1,"fields":["id"],"limit":12})j"}) {
+    SCOPED_TRACE(body);
+    auto expected = render(body, -2);
+    EXPECT_NE(std::string::npos, expected.find("\"found\":"));  // Zero is omitted.
+    for (int32_t maxParallel : {0, -1, 1}) EXPECT_EQ(expected, render(body, maxParallel)) << maxParallel;
+  }
+  EXPECT_GT(spawns.count(), 0);
 }

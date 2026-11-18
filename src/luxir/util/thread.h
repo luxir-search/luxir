@@ -289,7 +289,10 @@ size_t task_group_fanout(FanoutScope* tg, size_t n, FanoutKind kind,
       costs.push_back({scale(sizes[i].units), scale(sizes[i].steal)});
     }
     auto shares = planTaskShares(costs, grain, n);
-    if (shares.empty()) continue;
+    if (shares.empty()) {
+      fanoutGrainDenials.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
     auto budget = LoadRegistry::fanoutBudget(grain);
     fanoutTaskStart = now;
     if (budget.grainNs == FANOUT_GRAIN_NEVER) {
@@ -297,7 +300,10 @@ size_t task_group_fanout(FanoutScope* tg, size_t n, FanoutKind kind,
       continue;
     }
     shares = planTaskShares(costs, budget.grainNs, (size_t)budget.maxPublished + 1);
-    if (shares.empty()) continue;
+    if (shares.empty()) {
+      fanoutGrainDenials.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
     size_t keep = shares.size() - 1;
     if (kind == FanoutKind::EXHAUSTIVE) {
       for (size_t s = 0; s < shares.size(); s++) if (shares[s].work >= shares[keep].work) keep = s;
@@ -305,6 +311,7 @@ size_t task_group_fanout(FanoutScope* tg, size_t n, FanoutKind kind,
     fanoutShareCreditNsSum.fetch_add(creditElapsed, std::memory_order_relaxed);
     fanoutShareCreditCount.fetch_add(1, std::memory_order_relaxed);
     fanoutShareDecisions[std::min(shares.size(), size_t{5}) - 2].fetch_add(1, std::memory_order_relaxed);
+    fanoutAdaptiveShares.fetch_add(shares.size() - 1, std::memory_order_relaxed);
     fanoutShareKeptEstimatedNsSum.fetch_add(shares[keep].work, std::memory_order_relaxed);
     uint64_t largestPublished = 0;
     tg->enter([&] {

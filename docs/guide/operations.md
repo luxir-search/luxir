@@ -553,6 +553,7 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_searches_total`, `luxir_searches_in_flight`, `luxir_search_duration_seconds` | Searches the engine accepted, by `outcome`, from submission to the final response. A gRPC `Search` call can carry many searches, so this is its per-search view; `cancelled` means the search ended without a final response. |
 | `luxir_search_execution_duration_seconds` | Search-body execution, excluding scheduler/visibility waits and later streaming drains. |
 | `luxir_search_resource_exhausted_total`, `luxir_search_warnings_total` | Resource-limit failures (including the request memory breaker), and searches with declared degradation warnings. |
+| `luxir_search_fanout_searches_total`, `luxir_search_fanout_decisions_total`, `luxir_search_fanout_shares_total` | What the adaptive fan-out (`max_parallel: 0`) decided; see [Threads and streaming backpressure](#threads-and-streaming-backpressure). |
 | `luxir_index_batches_total`, `luxir_index_batches_in_flight`, `luxir_index_batch_duration_seconds` | Index-batch processing inside the engine, excluding queueing and commit work. HTTP NDJSON can produce many batches per request. A batch fails only when none of it applied. |
 | `luxir_ingest_documents_total`, `luxir_ingest_delete_ids_total` | Documents accepted into indexing or rejected/rolled back, and accepted delete IDs. Acceptance does not mean durability; commits can still fail. Deletes count submitted IDs, not matched documents. |
 | `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
@@ -704,6 +705,24 @@ microseconds (default 50). It accepts `-1` or values from 1 through 60000000.
 are idle (default 1000 us, the same accepted range); `-1` disables publication
 in that load tier. Saturated requests never publish adaptively. Neither grain
 option changes `max_parallel: -1`.
+
+`service.search_fanout` in `/_stats` (and the matching Prometheus series)
+reports what the adaptive fan-out decided:
+
+| Field | Prometheus series | Meaning |
+| --- | --- | --- |
+| `serial_searches`, `parallel_searches` | `luxir_search_fanout_searches_total{fanout="serial"\|"parallel"}` | Adaptive searches that published no share, and those that published at least one. Searches with `max_parallel` `1`, `-1` or `-2` are not counted. |
+| `published` | `luxir_search_fanout_decisions_total{outcome="published"}` | Evaluations that published shares. |
+| `shares` | `luxir_search_fanout_shares_total` | Shares those evaluations published. |
+| `denied_grain` | `luxir_search_fanout_decisions_total{outcome="denied_grain"}` | No share would cover the grain (the sibling grain when only SMT siblings were idle). |
+| `denied_siblings_only`, `denied_saturated` | `luxir_search_fanout_decisions_total{outcome="denied_siblings_only"\|"denied_saturated"}` | The load signal denied publication: only SMT siblings were idle with the sibling grain disabled, or the machine was saturated. |
+
+An evaluation is one point where a fan-out had earned a grain of inline time
+and priced the children still to run; a search can evaluate several times, so
+decisions are not per search. Each evaluation publishes or is denied once. A
+rising `parallel_searches` share means the grain is being earned; rising load
+denials with few `parallel_searches` mean the node is busy enough that
+searches stay serial by design.
 
 A request with `min_commit` continues on an arena worker once its commit wait
 ends, whatever the setting. gRPC searches always start on arena workers, so
