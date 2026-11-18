@@ -20,8 +20,7 @@ namespace luxir {
 struct Manifest {
   using Bytes = std::shared_ptr<const std::vector<std::byte>>;
   std::vector<std::string> names;
-  // The directory's files, once something needed them: load() lists only to
-  // fall back below a torn tip. listingOf() lists at most once per Manifest.
+  // Shared by fallback selection, marker checks and the writer's orphan sweep.
   std::vector<Directory::FileInfo> listing;
   bool listed = false;
   Bytes bytes;
@@ -130,11 +129,12 @@ struct Manifest {
     return bytes;
   }
 
-  // The files of `dir`, listed on first use and kept: one open lists once
-  // however many of its steps need the listing.
+  // Cache the first successful listing of this manifest's directory.
   const std::vector<Directory::FileInfo>& listingOf(Directory& dir) {
     if (!listed) {
-      dir.listFiles(listing);
+      std::vector<Directory::FileInfo> files;
+      dir.listFiles(files);
+      listing = std::move(files);
       listed = true;
     }
     return listing;
@@ -162,12 +162,14 @@ struct Manifest {
         result.names.push_back(name(gen, epoch));
         return result;
       }
+      const auto& listing = result.listingOf(dir);
+      // STATE may have advanced or disappeared while the listing was collected.
       auto latest = IncarnationState::read(dir);
       if (!latest) throw WriterSupersededError();
       if (!claimed && latest->version != state->version) { state = std::move(latest); continue; }
       std::vector<std::pair<uint64_t, uint64_t>> older;
       std::map<std::string, uint64_t> sizes;
-      for (const auto& file : result.listingOf(dir)) {
+      for (const auto& file : listing) {
         sizes.emplace(file.name, file.size);
         auto id = candidate(file.name);
         if (id.first && id.first < gen) older.push_back(id);
@@ -244,5 +246,14 @@ struct Manifest {
     out.close();
     dir.finishFile(*file);
   }
+};
+
+// A writer's claim and the root loaded under it, including any open-time listing.
+struct WriterOpen {
+  IncarnationState state;
+  Manifest manifest;
+
+  WriterOpen(Directory& dir, IncarnationState claimed)
+    : state(std::move(claimed)), manifest(Manifest::load(dir, &state)) {}
 };
 } // namespace luxir
