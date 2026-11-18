@@ -48,15 +48,19 @@ bool CorruptionMarker::present(Directory& dir) {
   return std::ranges::any_of(listing, [](const auto& entry) { return isMarker(entry.name); });
 }
 
+std::vector<std::string> CorruptionMarker::names(std::span<const Directory::FileInfo> listing) {
+  std::vector<std::string> result;
+  for (const auto& entry : listing) if (isMarker(entry.name)) result.push_back(entry.name);
+  return result;
+}
+
 void CorruptionMarker::clear(Directory& dir) {
   std::vector<Directory::FileInfo> listing;
   dir.listFiles(listing);
-  clear(dir, listing);
+  clear(dir, names(listing));
 }
 
-void CorruptionMarker::clear(Directory& dir, std::span<const Directory::FileInfo> listing) {
-  std::vector<std::string> names;
-  for (const auto& entry : listing) if (isMarker(entry.name)) names.push_back(entry.name);
+void CorruptionMarker::clear(Directory& dir, std::span<const std::string> names) {
   dir.deleteDurably(names);
 }
 

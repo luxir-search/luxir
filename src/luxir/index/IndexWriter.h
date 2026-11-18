@@ -20,7 +20,7 @@
 #include "luxir/util/ApiError.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/store/Directory.h"
-#include "luxir/store/IncarnationState.h"
+#include "luxir/store/Manifest.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/search/ReaderManager.h"
 #include "luxir/server/LuxirError.h"
@@ -585,15 +585,13 @@ public:
   // A nonnull schema is for creation only; reopening loads the manifest schema.
   // arena runs the writer's batches, flushes and merges (the node's index
   // arena, for a collection); null means the arena of the constructing thread.
-  // A supplied claim was established by the caller after checking its catalog.
-  // `opened`, with a claim, is the manifest the caller loaded under that claim
-  // from this directory: the writer uses it (and any listing it holds) rather
-  // than reading the root again.
+  // `opened` owns a claim established after checking the caller's catalog and
+  // the root loaded under it from this directory, including any listing. The
+  // writer consumes it; without one, it claims and loads the root itself.
   explicit IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
                        int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {},
-                       oneapi::tbb::task_arena* arena = nullptr, std::optional<IncarnationState> claimed = {},
-                       Manifest* opened = nullptr);
+                       oneapi::tbb::task_arena* arena = nullptr, std::optional<WriterOpen> opened = {});
   ~IndexWriter();
   void close();
 

@@ -129,8 +129,8 @@ void CommitSnapshotRegistry::sweepOrphans(Manifest& manifest, uint64_t writerEpo
               manifest.generation, manifest.highestGeneration);
     return;
   }
-  // The open's listing when it took one already. Older-epoch files cannot
-  // appear after the claim, so an earlier listing finds the same orphans.
+  // The open's listing supplies best-effort cleanup candidates. Late files
+  // from older epochs stay for a later sweep.
   auto listing = manifest.listingOf(dir);
   std::erase_if(listing, [&](const auto& file) {
     auto epoch = Manifest::fileEpoch(file.name);

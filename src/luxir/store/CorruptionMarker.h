@@ -28,11 +28,12 @@ struct CorruptionMarker {
   // The same from a listing of `dir` already taken: no listing of its own.
   static std::vector<std::string> read(Directory& dir, std::span<const Directory::FileInfo> listing);
   static bool present(Directory& dir);
+  // Marker names in an existing listing, for clearing after verification.
+  static std::vector<std::string> names(std::span<const Directory::FileInfo> listing);
   // Removes every marker; the removal is synced.
   static void clear(Directory& dir);
-  // Removes the markers in `listing`: a marker written after it stays, so
-  // only markers whose files were checked against that listing go.
-  static void clear(Directory& dir, std::span<const Directory::FileInfo> listing);
+  // Removes only these markers; markers written after the listing stay.
+  static void clear(Directory& dir, std::span<const std::string> names);
 };
 
 }

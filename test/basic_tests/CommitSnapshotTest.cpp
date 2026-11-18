@@ -4,8 +4,10 @@
 #include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 #include <chrono>
+#include <functional>
 #include <thread>
 #include <latch>
+#include <utility>
 #include "luxir/util/Signal.h"
 #include <filesystem>
 #include "test/TestUtils.h"
@@ -415,14 +417,15 @@ TEST_F(CommitSnapshotTest, fallbackDoesNotSweepNewestFiles) {
 }
 
 namespace {
-// Counts listings; everything else goes to the wrapped directory.
 class ListCountingDirectory : public DelegatingDirectory {
 public:
   std::atomic<int> lists{0};
+  std::function<void()> afterNextList;
   using DelegatingDirectory::DelegatingDirectory;
   void listFiles(std::vector<FileInfo>& target) override {
     lists++;
     delegate->listFiles(target);
+    if (auto hook = std::exchange(afterNextList, {})) hook();
   }
 };
 }
@@ -463,6 +466,22 @@ TEST_F(CommitSnapshotTest, loadListsOnlyToFallBack) {
   EXPECT_EQ(newest->id.index_gen, fallback.highestGeneration);
   fallback.listingOf(dir);
   EXPECT_EQ(1, dir.lists.load()) << "the fallback's listing was not reused";
+}
+
+TEST_F(CommitSnapshotTest, loadRetriesWhenStateAdvancesDuringFallbackListing) {
+  auto store = std::make_shared<RAMDir>();
+  CommitSnapshotRegistry snapshots(reserveIncarnation(*store), {}, CommitSnapshotRegistry::Clock::now, {}, "t0", 1h);
+  IndexWriter writer(snapshots);
+  writer.commit(); // Retention keeps the initial generation available for fallback.
+  auto torn = snapshots.snapshot();
+  ASSERT_TRUE(store->deleteFile(torn->manifestName()));
+
+  ListCountingDirectory dir(store);
+  dir.afterNextList = [&] { writer.commit(); };
+  auto loaded = Manifest::load(dir);
+  EXPECT_EQ(1, dir.lists.load());
+  EXPECT_GT(loaded.generation, torn->id.index_gen);
+  EXPECT_EQ(snapshots.snapshot()->id.index_gen, loaded.generation);
 }
 
 TEST_F(CommitSnapshotTest, segmentNamesSurviveEmptySnapshotAndRestart) {
