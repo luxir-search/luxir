@@ -1660,6 +1660,9 @@ message StatsResponse {
   double duration_seconds = 13;
   // Node-wide checksum scrub counters; set when store.scrub-interval-s is.
   ScrubStats scrub = 14;
+  // Node scope only. Set when the previous process on this data directory did
+  // not shut down cleanly, until a later start follows a clean shutdown.
+  UncleanExitStats unclean_exit = 30;
 }
 
 // Cumulative duration histogram. counts[i] is the number of observations at or
@@ -1959,6 +1962,44 @@ message ScrubStats {
   uint64 mismatches = 4;      // checksum mismatches, EIO, or unexpectedly missing files
   uint64 last_pass_end = 5;   // Unix milliseconds; absent before the first pass
   uint64 errors = 6;          // other file check errors; retried on the next pass
+}
+
+// A request that was running when the previous process died.
+message InflightRequestStats {
+  string kind = 1;        // search, update or admin
+  string transport = 2;   // grpc, http or internal
+  string phase = 3;       // queued, running or replying
+  string tenant = 4;
+  string collection = 5;
+  string request_id = 6;
+  // Search: "name:kind" per op; update: document and delete counts; admin:
+  // the operation. Truncated to 87 bytes.
+  string operation = 7;
+  int32 max_parallel = 8; // search only
+  uint64 started = 9;     // Unix milliseconds
+}
+
+// The previous process on this data directory did not shut down cleanly.
+// Read from the request table it kept in a file in the data directory, which
+// survives SIGKILL; see the operations guide, "Post-mortem".
+message UncleanExitStats {
+  // signal, uncaught_exception, oom_kill (the cgroup's oom_kill counter rose),
+  // memory_limit (memory was within 10% of the limit at the last sample), or
+  // unknown (killed without a report).
+  string cause = 1;
+  string detail = 2;
+  uint32 pid = 3;
+  string version = 4;
+  uint64 started = 5;          // Unix milliseconds
+  uint64 last_sample = 6;      // Unix milliseconds of the last memory sample; 0 if none
+  uint64 resident_bytes = 7;   // at the last sample
+  uint64 resident_peak_bytes = 8;
+  int64 cgroup_bytes = 9;      // -1 when unknown
+  int64 cgroup_max_bytes = 10; // -1 when unknown or unlimited
+  uint64 detected = 11;        // Unix milliseconds this process found the record
+  // Requests that were running past a full table, not listed below.
+  uint64 untracked = 12;
+  repeated InflightRequestStats requests = 13;
 }
 
 // Cached field metadata payload, excluding allocator overhead and unused

@@ -10,6 +10,7 @@
 #include "luxir/schema/Schema.h"
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <cstdio>
 #include <new>
 #include <optional>
 #include <variant>
@@ -166,7 +167,17 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 }
 
 
+void ProtoUpdateMessage::track(LuxirNode& node, InflightTransport transport) {
+  char operation[InflightRegistry::kOperationBytes];
+  snprintf(operation, sizeof(operation), "docs=%zu deletes=%zu%s", req->docs.size(), req->delete_ids.size(),
+           req->commit ? " commit" : "");
+  inflight = node.inflight().track({.tenant = target.tenant, .collection = target.name, .requestId = req->request_id,
+                                    .operation = operation, .kind = InflightKind::UPDATE, .transport = transport,
+                                    .phase = InflightPhase::QUEUED});
+}
+
 void ProtoUpdateMessage::handle(IndexWriter& iw) {
+  inflight.phase(InflightPhase::RUNNING);
   // Counts the batch for the node and its collection as it leaves, however
   // it leaves. A message with no documents and no delete ids (a commit-only
   // message) is not a batch; its commit counts under the COMMIT stage.
@@ -293,6 +304,7 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
 
 
 std::shared_ptr<ProtoUpdateMessage::Completion> ProtoUpdateMessage::takeCompletion(LuxirNode& node) {
+  inflight.release();
   auto completed = std::make_shared<Completion>();
   completed->response = *finishResponse();
   auto errors = completed->response.errors;

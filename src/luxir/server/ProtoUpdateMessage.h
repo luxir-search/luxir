@@ -14,6 +14,7 @@
 #include "CommitWaits.h"
 #include "luxir/api/build.h"
 #include "luxir/util/Clock.h"
+#include "luxir/util/InflightRegistry.h"
 
 namespace luxir {
 
@@ -54,6 +55,9 @@ public:
   // The collection the transport resolved and submitted to; replica waits
   // target it rather than re-resolving req->collection.
   CollectionId target;
+  // The update's slot in the node's in-flight table, from admission until
+  // takeCompletion() (or the message's destruction).
+  InflightRegistry::Entry inflight;
   const int64_t dateMathNowEpochMillis;
   explicit ProtoUpdateMessage(const RequestProto* req)
     : req(req), dateMathNowEpochMillis(currentEpochMillis()) {
@@ -130,6 +134,10 @@ public:
     void await(LuxirNode& node, std::function<void(std::shared_ptr<Completion>)> delivery, std::stop_token stop = {});
   };
   std::shared_ptr<Completion> takeCompletion(LuxirNode& node);
+
+  // Claims the update's in-flight slot. Call once target is set, before
+  // submitting the message to its writer.
+  void track(LuxirNode& node, InflightTransport transport);
 
   // For now, we will allow the handler to obtain/release an inverter.  We could also optionally pass it
   // as a param in the future if obtain/release becomes more complex.

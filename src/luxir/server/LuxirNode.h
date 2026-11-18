@@ -20,6 +20,7 @@
 #include "oneapi/tbb/task_scheduler_observer.h"
 #include "luxir/search/SearchEngine.h"
 #include "luxir/LuxirConfig.h"
+#include "luxir/util/InflightRegistry.h"
 #include "luxir/util/Metrics.h"
 #include "luxir/util/SharedLazyMap.h"
 #include "luxir/util/thread.h"
@@ -67,6 +68,9 @@ public:
   Scrubber& getScrubber() { return *scrubber; }
   bool following() const { return !config.replication.source.empty(); }
   ReplicationSource& getReplication() { return *replication; }
+  // The node's running requests; with an owned filesystem data directory the
+  // table survives the process, and previousExit() reports an unclean exit.
+  InflightRegistry& inflight() { return *inflightRegistry; }
   CommitWaits& getCommitWaits() { return *commitWaits; }
   Collections& collections() { return *collections_; }
 
@@ -152,6 +156,9 @@ private:
   std::string lifetime;
   const Mode mode;
   Now clock;
+  // Declared first among the node's state: requests hold entries in it until
+  // the very end, and destroying it marks the shutdown clean.
+  std::unique_ptr<InflightRegistry> inflightRegistry;
 
   // Query work.  Workers: server.workers (resolveWorkers(); at least
   // one, since an arena of only reserved slots never serves enqueued tasks).

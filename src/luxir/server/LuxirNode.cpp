@@ -6,6 +6,7 @@
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
 #include "Scrubber.h"
+#include "Stats.h"
 #include "luxir/plugin/Plugin.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/Uuid.h"
@@ -160,6 +161,15 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
   collections_ = std::make_unique<Collections>(this->config, lifetime, *events, indexRamBudget, indexArena, metrics);
+  {
+    // The storage owns the directory now (write lock), so no other process
+    // shares the request file.
+    InflightRegistry::Options inflightOptions;
+    if (auto* fs = collections_->storage().find<FSDirFactory>()) inflightOptions.directory = fs->nodePrivatePath();
+    if (!inflightOptions.directory.empty()) inflightOptions.cgroupDirectory = cgroupDirectoryPath();
+    inflightRegistry = std::make_unique<InflightRegistry>(std::move(inflightOptions));
+    if (const auto& exit = inflightRegistry->previousExit()) LOG_WARN("{}", exit->describe());
+  }
 
   if (following()) {
     // The follower first checks that it owns the data directory.

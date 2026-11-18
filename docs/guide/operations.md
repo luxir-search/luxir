@@ -877,6 +877,102 @@ will not silently recreate storage over it. Other segment corruption is
 detected when the affected reader is opened, or earlier with the
 [file integrity checks](#file-integrity-checks) below.
 
+## Crash reports
+
+On a fatal signal (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGABRT`) the
+server writes a report to stderr and then dies by the same signal, so a core
+dump is still produced when the core limit allows one. The report starts with
+the signal, the fault address, the thread name, the version and commit, the
+executable's build ID and load base, and the raw frame addresses, written with
+async-signal-safe calls only:
+
+```
+Luxir crashed: SIGSEGV (code 1, addr 0x10) in thread luxir_tbb_3 (tid 4242)
+Luxir 0.5.0 (armv8-a) commit 0123abcd...
+build-id 5f2c... load base 0xaaaab2c40000
+#0 0xaaaab3a1c7e4 (luxir+0xddc7e4)
+Running requests: 2, recorded in /data/node/inflight
+  search grpc running tenant=t0 collection=products request_id=r-17 max_parallel=0 age_ms=1532 tid=4242 op=q:top_docs [crashing thread]
+  update http queued tenant=t0 collection=logs age_ms=40 tid=4198 op=docs=500 deletes=0
+  memory 2210 ms ago: resident 1934622720 bytes, peak 2013265920 bytes, cgroup 2041577472 of 2147483648 bytes
+```
+
+The running requests follow the frames (see [Post-mortem](#post-mortem)
+below); `[crashing thread]` marks those last advanced by the thread that
+crashed. With a filesystem data directory, the same report is also written to
+`node/crash.txt` in it, replacing the previous one, so it survives a lost
+stderr.
+
+On Linux a symbolized stack trace follows: function names from the
+executable's symbol table, and source lines when it carries DWARF. It is
+abandoned after a few seconds (for example when the crash corrupted the
+allocator); the raw frames remain usable with the debug file whose build ID
+matches: `addr2line -f -C -e luxir.debug 0xddc7e4`. An uncaught exception is
+reported with its type and message before the abort. Threads the server names
+(request, search, accept and background threads) get an alternate signal
+stack, so a stack overflow on them is reported too. `--no-crash-handler`
+leaves fatal signals to their default action, for example under a debugger.
+AddressSanitizer builds keep ASan's own report.
+
+### Post-mortem
+
+Every node keeps a fixed table of its running requests: searches from
+dispatch to their final reply (`queued` while waiting for `min_commit`,
+`running`, then `replying`), update batches from admission until indexed
+(`queued` behind the writer, then `running`), and administration requests
+(collection create, delete, rename and swap, schema, stats, cache control and
+plugin routes) while their handler runs. Each entry records the kind,
+transport, tenant and collection, `request_id`, start time, thread, a short
+operation summary (a search's `name:kind` ops and its `max_parallel`, an
+update's document and delete counts) and its phase. Fields longer than the
+table's fixed width are truncated. The table has 256 entries; requests past a
+full table run normally and are counted as untracked.
+
+With a filesystem data directory the table lives in `node/inflight` (about
+64 KiB, mapped shared), so the kernel keeps its last state even when the
+process cannot report anything itself: `SIGKILL`, the kernel or cgroup OOM
+killer. The file also records whether the node shut down cleanly, the fatal
+signal or uncaught exception the crash handler saw, and a memory sample taken
+every 5 seconds: resident and peak resident bytes, and the cgroup's
+`memory.current`, `memory.max` and `memory.events` `oom_kill` count.
+
+When a node starts on a directory whose previous process did not shut down
+cleanly, it logs a warning naming the likeliest cause, the memory at the last
+sample, and every request and collection that was running:
+
+```
+The previous run on this data directory did not shut down cleanly: oom_kill (cgroup memory.events oom_kill rose from 0 to 1)
+  pid 812, Luxir 0.5.0 commit 0123abcd5678, started 2026-11-18T09:12:03Z; at the last memory sample (2026-11-18T10:40:51Z): resident 1953 MiB, peak 1990 MiB, cgroup 2040 MiB of 2048 MiB
+  2 requests were running; collections: t0/logs (1) t0/products (1)
+    search grpc running t0/products request_id=r-17 op=q:top_docs,f:field_facet started 2026-11-18T10:40:50Z
+    update http queued t0/logs op=docs=500 deletes=0 started 2026-11-18T10:40:52Z
+```
+
+The cause is the strongest evidence available:
+
+| `cause` | Evidence |
+|---|---|
+| `uncaught_exception` | `std::terminate` ran; `detail` has the exception's type and message |
+| `signal` | The crash handler saw a fatal signal; `detail` names it, and `node/crash.txt` has the report |
+| `oom_kill` | The cgroup's `oom_kill` count rose since the last sample (same cgroup only, e.g. a systemd restart) |
+| `memory_limit` | At the last sample, cgroup memory or resident memory was within 10% of the cgroup limit or of host memory |
+| `unknown` | Killed without a report: `SIGKILL`, an OOM kill in a cgroup this process cannot see (a container that was recreated), or power loss |
+
+The same record is in `/_stats` as `unclean_exit` (cause, detail, pid,
+version, start and last sample times, memory, and the `requests` that were
+running) and in Prometheus as `luxir_unclean_exit_info{cause,version}`,
+`luxir_unclean_exit_timestamp_seconds`, `luxir_unclean_exit_resident_bytes`,
+`luxir_unclean_exit_cgroup_memory_bytes`, `luxir_unclean_exit_cgroup_memory_max_bytes`,
+`luxir_unclean_exit_requests` and
+`luxir_unclean_exit_collection_requests{tenant,collection}`. They stay until
+the node restarts after a clean shutdown, so an alert on
+`luxir_unclean_exit_info` fires for the whole life of the process that
+followed a crash. The file is versioned and checked field by field: a record
+that does not validate is ignored with a warning, and the node starts
+normally. A RAM data directory and a read-only node keep the table in memory
+only: a crash report still lists the running requests, but nothing survives
+the process.
+
 ## File integrity checks
 
 Every committed manifest records each file it references with its size and

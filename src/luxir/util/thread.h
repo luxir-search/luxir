@@ -19,16 +19,19 @@
 #include <oneapi/tbb/info.h>
 #include <oneapi/tbb/task_arena.h>
 #include <oneapi/tbb/task_group.h>
+#include "luxir/util/CrashHandler.h"
 
 namespace luxir {
 
-/// Label the calling thread for ps/top/gdb (15-char kernel limit).
+/// Label the calling thread for ps/top/gdb (15-char kernel limit), and give it
+/// an alternate signal stack so a stack overflow on it is reported.
 inline void nameThisThread(const char* name) {
 #if defined(__APPLE__)
   pthread_setname_np(name);
 #else
   pthread_setname_np(pthread_self(), name);
 #endif
+  installCrashAltStack();
 }
 
 

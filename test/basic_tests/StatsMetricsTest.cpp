@@ -160,6 +160,9 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
       "memory.field_metadata.bytes",
       // HTTP only.
       "service.grpc.connections", "service.grpc.io_threads",
+      // Post-mortem detail; the log line and JSON carry it.
+      "unclean_exit.detected", "unclean_exit.pid", "unclean_exit.requests.max_parallel",
+      "unclean_exit.resident_peak_bytes", "unclean_exit.started", "unclean_exit.untracked",
   };
   std::pmr::monotonic_buffer_resource resource;
   api::StatsResponse response;
@@ -171,7 +174,7 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
       {"collections.shards.index.query_cache.build_us", 1e6},
       {"collections.shards.index.query_cache.served_build_us", 1e6},
       {"collections.shards.index.query_cache.dead_build_us", 1e6},
-      {"scrub.last_pass_end", 1e3}};
+      {"scrub.last_pass_end", 1e3}, {"unclean_exit.last_sample", 1e3}};
   auto rendered = renderedNumbers(renderPrometheus(response));
   std::string json;
   ASSERT_TRUE(api::write_json(response, json));
