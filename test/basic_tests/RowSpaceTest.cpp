@@ -443,12 +443,15 @@ TEST_F(RowSpaceTest, derivedLivenessClearsRangesAndWalksOwnerChains) {
   auto words = FixedBitSet::allocate(5, true);
   words[0] &= ~((1ULL << 1) | (1ULL << 2)); // Root 1 has no children.
   auto roots = std::make_shared<LiveDocs>(std::move(words), 5, 3);
-  ChildLiveDocs child(core, roots, "items");
+  auto base = std::make_shared<SegmentBase>(1, 1, 5, SegmentBase::SpaceRows{{"items", 205}, {"items.deep", 3}},
+                                            core);
+  auto rootLive = std::make_shared<SegmentLive>(1, 1, 1, 1, roots);
+  ChildLiveDocs child(base, rootLive, "items");
   auto live = child.get();
   ASSERT_NE(nullptr, live);
   EXPECT_EQ(75, live->numLive());
   for (int32_t row = 0; row < 205; row++) EXPECT_EQ(row < 70 || row >= 200, live->docset().get(row));
-  ChildLiveDocs deep(core, roots, "items.deep");
+  ChildLiveDocs deep(base, rootLive, "items.deep");
   EXPECT_EQ(nullptr, deep.get());
 }
 
@@ -640,8 +643,14 @@ protected:
         for (uint32_t row = 0; row < roots.size(); row++) versions.add(row, 100 + (uint64_t)i * 10 + row);
         writer.writeVersionRuns(versions);
         ASSERT_TRUE(writer.finish(nullptr, &files));
+        if (i < 2) {
+          auto* spaces = build::allocArray(segment.spaces, 2, arena);
+          spaces[0] = {build::arenaStr(arena, Fixture::CHILD), (int32_t)CHILDREN.size()};
+          spaces[1] = {build::arenaStr(arena, "items.deep"), 4};
+        }
       } else {
         auto& old = previous[(size_t)i];
+        segment.spaces = old.spaces;
         for (const auto& file : old.files) {
           files.push_back({std::string(file.name), file.size, file.xxh3});
         }
@@ -863,6 +872,8 @@ TEST_F(ScopedRowSpaceTest, openingViewsUsesCountsWithoutScanningChildRows) {
   segment.creator_epoch = 1;
   segment.schema = *manifest.schema;
   segment.max_doc = segment.live_docs = 1;
+  auto* spaces = build::allocArray(segment.spaces, 1, arena);
+  spaces[0] = {build::arenaStr(arena, Fixture::CHILD), count};
   auto* descriptors = build::allocArray(segment.files, files.size(), arena);
   for (size_t i = 0; i < files.size(); i++) {
     descriptors[i] = {build::arenaStr(arena, files[i].name), files[i].size, files[i].xxh3};

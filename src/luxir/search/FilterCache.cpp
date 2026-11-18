@@ -1753,9 +1753,11 @@ bool FilterCache::onReaderPublished(
 bool FilterCache::onReaderPublished(IndexReader& reader) {
   std::vector<SegmentIdentity> identities;
   for (const auto& bundle : reader.snapshot->core->bundles) {
-    const auto& catalog = bundle.core->spaces();
-    for (size_t i = 0; i < catalog.size(); i++) {
-      identities.push_back({bundle.info.seg_id, catalog[i].maxDoc, (SpaceOrdinal)i});
+    // Sized from the manifest so publishing a reader opens no segment.
+    identities.push_back({bundle.info.seg_id, bundle.info.max_doc, SpaceOrdinal::ROOT});
+    const auto& spaces = bundle.core->spaces;
+    for (size_t i = 0; i < spaces.size(); i++) {
+      identities.push_back({bundle.info.seg_id, spaces[i].second, (SpaceOrdinal)(i + 1)});
     }
   }
   return onReaderPublished(reader.coreGen(), reader.coreCommitTime(), identities);

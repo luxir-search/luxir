@@ -24,6 +24,23 @@ class SharedLazyCell {
   std::variant<Pointer, std::shared_ptr<SharedLazyBuild<Value>>> value;
 
 public:
+  SharedLazyCell() = default;
+  // A cell born ready with an already built value.
+  explicit SharedLazyCell(Pointer initial) : value(std::move(initial)) {
+    if (cacheNull || std::get<Pointer>(value)) ready.store(true, std::memory_order_release);
+  }
+
+  // The value once built, else null; never builds or waits.
+  Pointer peek() const noexcept {
+    if (!ready.load(std::memory_order_acquire)) return nullptr;
+    return std::get<Pointer>(value);
+  }
+  // peek() without a reference count, for hot accessors; valid while the cell lives.
+  Value* peekRaw() const noexcept {
+    if (!ready.load(std::memory_order_acquire)) return nullptr;
+    return std::get<Pointer>(value).get();
+  }
+
   template <typename CreateFunc>
   Pointer getOrCreate(CreateFunc&& createFunc) {
     if (ready.load(std::memory_order_acquire)) return std::get<Pointer>(value);

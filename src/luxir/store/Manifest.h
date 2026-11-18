@@ -98,6 +98,12 @@ struct Manifest {
       if (segment.merge_rows && *segment.merge_rows < segment.max_doc) {
         throw std::runtime_error("Invalid segment merge row count");
       }
+      for (size_t i = 0; i < segment.spaces.size(); i++) {
+        const auto& space = segment.spaces[i];
+        if (space.path.empty() || space.rows <= 0 || (i > 0 && segment.spaces[i - 1].path >= space.path)) {
+          throw std::runtime_error("Invalid segment row space list");
+        }
+      }
     }
     return info;
   }

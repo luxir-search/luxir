@@ -57,6 +57,9 @@ public:
     int32_t maxDoc;            // one-past-highest-doc (doesn't count deletes)
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
     int32_t mergeRows;         // largest physical row space, for merge sizing
+    // Each child row space and its row count, sorted by path; published in the
+    // manifest so readers size views without opening the segment.
+    std::vector<std::pair<std::string, int32_t>> spaceRows;
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
     int64_t mergedLiveGen = -1;  // source generation covered by the merge

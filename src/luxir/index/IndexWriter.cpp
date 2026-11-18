@@ -206,6 +206,8 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       seg.maxVersion = segment.max_version;
       seg.liveDocs = segment.live_docs;
       seg.mergeRows = segment.merge_rows.value_or(segment.max_doc);
+      seg.spaceRows.reserve(segment.spaces.size());
+      for (const auto& space : segment.spaces) seg.spaceRows.emplace_back(std::string(space.path), space.rows);
       seg.schema = SchemaBinding(segment.schema);
       seg.files = fromWire(segment.files);
       seg.firstCommitTime = segment.commit_time;  // firstCommitTime is stored in the segment meta.
@@ -1474,6 +1476,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
                                         inverter.getPostingsWriter().creatorEpoch,
                                         inverter.getPostingsWriter().getMaxDoc(SpaceOrdinal::ROOT));
     segInfo->mergeRows = inverter.getPostingsWriter().getMaxSpaceRows();
+    segInfo->spaceRows = inverter.getPostingsWriter().getChildSpaceRows();
     segInfo->unsyncedFiles = std::move(flushedFiles);
     segInfo->files = std::move(descriptors);
     segInfo->minVersion = inverter.minVersion;
@@ -2618,6 +2621,11 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
     wire.schema = seg.schema.wire();
     wire.next_overlay_gen = seg.nextOverlayGen;
     wire.files = toWire(seg.files, arena);
+    auto* spaces = api::build::allocArray(wire.spaces, seg.spaceRows.size(), arena);
+    for (size_t j = 0; j < seg.spaceRows.size(); j++) {
+      spaces[j].path = api::build::arenaStr(arena, seg.spaceRows[j].first);
+      spaces[j].rows = seg.spaceRows[j].second;
+    }
     auto* overlays = api::build::allocArray(wire.overlays, seg.auxOverlays.size(), arena);
     for (size_t j = 0; j < seg.auxOverlays.size(); j++) overlays[j] = toWire(seg.auxOverlays[j], arena);
   }
@@ -2928,6 +2936,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       phase = "postings_finish";
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
       newSegInfo->mergeRows = pwriter.getMaxSpaceRows();
+      newSegInfo->spaceRows = pwriter.getChildSpaceRows();
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
       phase = "segment_summary";
