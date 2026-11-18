@@ -91,6 +91,7 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
 void LuxirNode::ArenaThreadNamer::on_scheduler_entry(bool worker) {
   omp_set_num_threads(1);
   if (!worker) return;
+  active.fetch_add(1, std::memory_order_relaxed);
   if (loadActivity) loadActivity->begin(LoadRegistry::local());
   char name[16];
   snprintf(name, sizeof(name), "%s%d", prefix,
@@ -99,7 +100,9 @@ void LuxirNode::ArenaThreadNamer::on_scheduler_entry(bool worker) {
 }
 
 void LuxirNode::ArenaThreadNamer::on_scheduler_exit(bool worker) {
-  if (worker && loadActivity) loadActivity->end(LoadRegistry::local());
+  if (!worker) return;
+  active.fetch_sub(1, std::memory_order_relaxed);
+  if (loadActivity) loadActivity->end(LoadRegistry::local());
 }
 
 // host:port of the listener, so a restarted node keeps its identity (and a
@@ -116,14 +119,15 @@ static std::string defaultNodeId(const ServerConfig& server, bool& random) {
 
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   : config(std::move(config)), mode(mode), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
+    indexThreads(this->config.resolveIndexThreads()),
     reservedSlots(reservedArenaSlots(this->config)),
     taskArena(workers + reservedSlots, reservedSlots,
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
-    indexArena(workers + 1, 1, oneapi::tbb::task_arena::priority::low) {
+    indexArena(indexThreads + 1, 1, oneapi::tbb::task_arena::priority::low) {
   if (this->config.node.id.empty()) this->config.node.id = defaultNodeId(this->config.server, this->config.node.random);
   this->config.node.validate();
   if (!this->config.read_only) lifetime = newUuid();
-  ensureWorkerPool(workers + 1);
+  ensureWorkerPool(workers + kBackgroundFloor);
   if (following() && this->config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers
@@ -159,6 +163,9 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   events = std::make_shared<Events>(replication, commitWaits);
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
+  // Before the writers open: their first tasks already get the priority.
+  indexNiceIncrement = ArenaNice::resolve(this->config.index.nice, IndexConfig::AUTO_NICE, "indexing.nice");
+  if (indexNiceIncrement) indexNice.emplace(indexArena, indexNiceIncrement);
   collections_ = std::make_unique<Collections>(this->config, lifetime, *events, indexRamBudget, indexArena, metrics);
 
   if (following()) {
@@ -184,6 +191,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
 }
 
 LuxirNode::~LuxirNode() {
+  collections_->closing();
   pluginStates.clear();
   scrubber->stop();
   if (follower) follower->stop();

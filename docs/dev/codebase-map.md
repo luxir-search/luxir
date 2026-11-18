@@ -10,14 +10,28 @@ locations, browse `src/luxir/<area>/`.
 1. **Server Layer** (`src/luxir/server/`)
    - `GRPCServer`: Manages gRPC services and thread pool
    - `HttpServer`: JSON/HTTP API (Boost.Beast), including NDJSON streaming ingest
-   - `LuxirNode`: Central coordinator wiring collections and services
+   - `LuxirNode`: Central coordinator wiring collections and services. Owns the
+     worker pool's two arenas: `taskArena` (queries, buffered update decoding,
+     admin, plugin routes; normal priority, reserved slots for transport threads
+     counted by `ArenaEntrants`) and `indexArena` (every writer's update graph:
+     batches, flushes, merges, commits, vector builds; low priority, width
+     `index.threads`, see `LuxirConfig::backgroundThreads`). `ensureWorkerPool`
+     sizes TBB's pool `kBackgroundFloor` past the query arena, which keeps
+     indexing at least one worker under any search load; `ArenaThreadNamer`
+     names workers (`luxir_tbb_`, `luxir_idx_`), counts them per arena and
+     pins FAISS OpenMP to one thread; `ArenaNice` (`server/ArenaNice.h`,
+     reusable by any background arena) renices workers while they are in
+     `indexArena` when the restore is permitted (`index.nice`)
    - `Stats`: The one mapping from engine state (`IndexWriter`/`ReaderManager::stats`, RAM budgets,
      allocator, `util/Metrics.h` service counters, `SystemStats` procfs/cgroup readers) into
      `api::StatsResponse`; `Prometheus` renders that response as text for `/metrics` and `_stats?format=prometheus`
    - `Collections`: Owns the name -> collection map and every transition of it
      (startup discovery, creation, activation, rename, swap, removal), announced
      in order through `CollectionEvents`; a multi-name mapping is one event and
-     atomic per-name lookup changes
+     atomic per-name lookup changes. Shares the node-wide merge limit
+     (`index/MergeSlots.h`, a FIFO of writers whose merge is due, woken through
+     a graph task) and merge write pacing (`util/ByteRateLimiter.h`) with every
+     writer
    - `ReplicationFollower`: Discovery and transfer protocol, with work keyed by
      tenant/incarnation. Stages missing data, then applies each tenant mapping
      through `Collections` for ready bindings, leaving dependent names unavailable
@@ -215,13 +229,14 @@ locations, browse `src/luxir/<area>/`.
 **Indexing**: gRPC/HTTP Request -> IndexWriter -> Document Processing (Inverter) -> Segment Writing -> optional Commit
 
 HTTP update bodies are not decoded on the connection's I/O shard thread. A
-buffered JSON body is decoded in the task-arena task that submits it. An
+buffered JSON body is decoded in the query-arena (`taskArena`) task that
+submits it. An
 NDJSON stream is only framed on the shard: records that may be control
 records (`{}` or a first key shaped `"_name_"`) are decoded there, in stream
 order, and document records stay where the body was read: `NdjsonFramer`
 reads the body straight into chunks and returns views, and the batch
 (`HttpStreamBatchState::records`) holds the chunks until it has decoded them. `StreamingUpdateMessage::handle` decodes
-them on the update graph's process node, after `startUpdateNode` has fixed
+them on the update graph's process node (in `indexArena`), after `startUpdateNode` has fixed
 the batch's update version, so batches of one connection decode in parallel.
 
 ## Key Design Patterns

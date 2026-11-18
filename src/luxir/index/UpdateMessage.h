@@ -103,6 +103,7 @@ class MergeMessage : public UpdateMessage {
 public:
   int32_t mergeLevel = -1;  // Segment level to merge.  -1 means unspecified.
   UpdateMessage* forcedBy = nullptr;  // Client commit whose layout promise this merge completes.
+  bool holdsSlot = false;  // holds a node-wide merge slot (MergeSlots) until its tail
 };
 
 }

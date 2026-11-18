@@ -15,6 +15,8 @@
 #include "CollectionEvents.h"
 #include "luxir/LuxirConfig.h"
 #include "luxir/index/IndexRamBudget.h"
+#include "luxir/index/MergeSlots.h"
+#include "luxir/util/ByteRateLimiter.h"
 #include "TenantCatalog.h"
 #include "luxir/util/SharedLazyMap.h"
 
@@ -119,6 +121,9 @@ private:
   CollectionEvents& events;
   IndexRamBudget& indexRamBudget;
   oneapi::tbb::task_arena& arena;  // runs every writer's indexing (the node's index arena)
+  // Shared by every writer, which keeps them alive should it outlive the node.
+  std::shared_ptr<ByteRateLimiter> mergeRateLimiter; // index.merge_max_bytes_per_sec
+  std::shared_ptr<MergeSlots> mergeSlots;            // index.max_concurrent_merges
   bool verifyOnOpen; // store.verify-on-open=full
   std::unique_ptr<DirectoryFactory> factory;
   std::mutex catalogsMutex;
@@ -171,6 +176,10 @@ public:
   static void validateName(std::string_view name, std::string_view kind = "collection");
   static void validate(const CollectionId& id);
   DirectoryFactory& storage() { return *factory; }
+  const ByteRateLimiter& getMergeRateLimiter() const { return *mergeRateLimiter; }
+  MergeSlots& getMergeSlots() { return *mergeSlots; }
+  // Node shutdown: merge pacing stops, so writers drain at full speed.
+  void closing() { mergeRateLimiter->close(); }
   TenantCatalog& catalog(std::string_view tenant = CollectionId::kDefaultTenant);
   void expireRetirements();
   uint64_t storageBytes(const CollectionId& id);

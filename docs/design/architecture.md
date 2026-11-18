@@ -45,7 +45,8 @@ Most of what follows depends on segments being immutable:
   durable commit point. `deleteDurably` persists removals. After a crash the
   index reopens at a complete commit.
 - Compaction is concurrent merging: merges produce new segments in the
-  background and never stall ingest or search.
+  background and never block ingest or search. They do share CPU, disk
+  bandwidth and page cache with searches; see the indexing arena below.
 
 ## Designed for modern hardware
 
@@ -53,6 +54,42 @@ Most of what follows depends on segments being immutable:
 
 All parallelism runs on a work-stealing task scheduler, which keeps
 every core busy even when work is skewed.
+
+The node's worker pool serves two arenas. Searches, buffered update decoding
+and administration run in the query arena at normal priority; indexing (update
+batches, flushes, merges, delete passes, vector builds, commits) runs in the
+indexing arena at low priority. The scheduler gives queries workers first and
+recalls workers from indexing between tasks. Neither side can starve the
+other:
+
+- The pool is one worker wider than the query arena, and the scheduler never
+  gives an arena more workers than its width, so that worker always goes to
+  indexing when it has work. Strict priority alone would let a sustained
+  search load stop indexing entirely while updates kept queueing.
+- The indexing arena is narrower than the pool (`--indexing.threads`; by
+  default a quarter of the workers, at least one, are held back), so a query
+  never waits for a worker to free up, and on a 2-core node search always
+  keeps one of the two.
+
+The floor is pool width rather than a reserved arena slot because slots are
+seats for threads entering an arena, not workers. Priority orders pool work
+only: inline HTTP searches never enter the pool, so indexing workers are also
+niced while they run indexing work (`--indexing.nice`). The nice observer
+(`ArenaNice`) and the width rule (`LuxirConfig::backgroundThreads`) are not
+tied to the indexing arena, so another background arena can reuse them.
+
+Merges are limited per collection (one policy merge at a time) and node-wide
+(`--indexing.max-concurrent-merges`). The node-wide limit is held as data:
+`MergeSlots` keeps a FIFO of collections whose merge is due, and the merge
+that frees a slot hands it to the first of them by queueing a task on that
+collection's graph, so no thread ever blocks for a slot. Merges a client
+waits for take a slot at once. Background merge writes can be paced
+(`--indexing.merge-max-bytes-per-sec`) on one node-wide timeline, charged in
+chunks of a few milliseconds so a merge task never sleeps long; a merge is a
+synchronous call stack that holds its worker until its current field is done,
+so deferring the rest of it as a continuation would first need resumable
+merge phases. See
+[Threads and streaming backpressure](../guide/operations.md#threads-and-streaming-backpressure).
 
 - **Search** parallelizes across segments (and within segments) and
   across the independent operations in
@@ -99,7 +136,7 @@ response paths keep connection handling separate from long-running engine work.
   still on the wire. The connection thread only splits records, recognizes
   control records, and cuts batches; JSON decoding of documents happens on
   the indexing workers, so one connection can keep several cores busy.
-  Buffered JSON update bodies are likewise decoded on the task arena.
+  Buffered JSON update bodies are decoded in the query arena instead.
   Responses stream back the same way, a chunk at a time.
   For HTTP/JSON clients, there is no maximum stream size and no required
   user-visible bulk-request boundary.

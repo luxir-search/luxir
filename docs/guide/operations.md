@@ -546,6 +546,10 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
 | `luxir_stream_pauses_total` | Response backpressure events by transport. |
 | `luxir_http_connections`, `luxir_http_io_threads` | Live HTTP sessions and running connection-shard threads; the thread gauge excludes the accept thread. gRPC active calls are in `luxir_requests_in_flight`. |
+| `luxir_arena_workers` | Pool workers now in the `query` and `indexing` arenas. Indexing keeps at least one while it has work. |
+| `luxir_merges_running`, `luxir_merges_waiting` | Merges holding a node-wide merge slot (`--indexing.max-concurrent-merges`), and collections queued for one. |
+| `luxir_merge_slot_waits_total`, `luxir_merge_slot_wait_seconds_total` | Merges that waited for a node-wide slot, and their summed wait. |
+| `luxir_merge_paced_seconds_total` | Time merge writes waited on `--indexing.merge-max-bytes-per-sec`. |
 | `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, merge, vector-build, and reader-refresh stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
 | `luxir_node_memory_budget_bytes`, `luxir_search_request_memory_limit_bytes` | Configured managed-memory budget and tracked per-search ceiling. Neither is a process RSS limit. |
 | `luxir_index_ram_*_bytes` | Indexing reservations, budget, draining reservations, pending merge demand, and retained delete packets (part of the reservations, never freed by a flush). The budget is soft; pending demand is capped at that budget when limited. |
@@ -664,17 +668,82 @@ to 28 HTTP shards and 14 gRPC threads. Set explicit counts with:
 count; each shard owns one `io_context` and one runner. Connections are
 assigned round-robin at accept and remain pinned to their shard.
 
-Indexing, merges, and search work moved off a transport thread run on a shared
-pool of worker threads. `--server.workers` sets its size. The default (`0`) is
-one worker per available logical CPU less one, which leaves a CPU for the
-transport threads; on machines with 4 or fewer logical CPUs it is one worker per
-CPU, because holding one back would idle a large share of a small node (half of
-a 2-vCPU one). Transport threads are not counted: they share the CPUs with the
-workers.
+Work moved off a transport thread runs on a pool of worker threads.
+`--server.workers` sets its size. The default (`0`) is one worker per available
+logical CPU less one, which leaves a CPU for the transport threads; on machines
+with 4 or fewer logical CPUs it is one worker per CPU, because holding one back
+would idle a large share of a small node (half of a 2-vCPU one). Transport
+threads are not counted: they share the CPUs with the workers.
 
 ```bash
 ./luxir --server.workers=2
 ```
+
+The pool serves two arenas, and a worker belongs to one at a time:
+
+- The **query arena** runs dispatched and parallel searches, buffered JSON
+  update decoding, plugin routes and administration requests, at normal
+  priority. Its workers are named `luxir_tbb_<n>`.
+- The **indexing arena** runs update batches (including NDJSON document
+  decoding), flushes, merges, delete application, vector index builds and
+  commits, at low priority. Its workers are named `luxir_idx_<n>`.
+
+The query arena can use `--server.workers` workers and the indexing arena
+`--indexing.threads`; the pool has one thread more than the query arena. The
+scheduler serves the query arena first but never beyond its width, so that
+last worker always goes to indexing when it has work: under any search load
+indexing keeps at least one worker and updates keep draining. In the other
+direction, the indexing arena is narrower than the pool, so a query handed to
+the pool finds a worker at once even while indexing occupies all of its own.
+Further workers move to queries as indexing tasks finish: a worker leaves the
+indexing arena only between tasks, and tasks are coarse (an update batch, a
+segment flush, one field of a merge, a slice of a vector build). The floor is
+per process; nodes embedded side by side in one process share it.
+
+Arena priority orders work in the pool. It does not reserve CPUs, and it does
+nothing for searches that never enter the pool: a default HTTP search starts on
+its io shard (see below) and competes with indexing workers only through the
+operating system's scheduler. These options limit how much indexing can take:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--indexing.threads=N` | `0`: auto | Workers the indexing arena uses at once, capped at `--server.workers`. Auto holds a quarter of the workers back from indexing, at least one: 1 of 2, 2 of 3, 3 of 4, 6 of 8, 12 of 16. The workers held back keep CPU for searches whatever the indexing load, at the cost of slower bulk loads and merges. Set `--server.workers` here to give indexing every worker. |
+| `--indexing.nice=N` | `-1`: auto | Raises the nice value of a worker by `N` (`0`-`19`) while it runs indexing work and restores it when the worker returns to queries. Auto uses `5` when the node may restore it and is off otherwise. |
+| `--indexing.max-concurrent-merges=N` | `0`: auto | Background merges running at once across all collections (each collection runs at most one). Auto is half of the resolved `--indexing.threads`, at least one. A collection whose merge is due while every slot is taken queues for one, as data rather than a waiting thread, and slots go to collections in the order they queued. Merges a client waits for (`max_segments`, `wait_for_merges`) start at once, past the limit, and count against it. Bounds the CPU, disk bandwidth and indexing RAM overdraft that merges take on a node with many collections. |
+| `--indexing.merge-max-bytes-per-sec=RATE` | `0`: unlimited | Paces the segment data that background merges write, node-wide across all collections (for example `64MB`). Merges then compete less with searches for disk bandwidth and page cache. |
+
+**Nice.** Lowering priority is always allowed, but raising it back needs
+`CAP_SYS_NICE` or an `RLIMIT_NICE` of at least 20 minus the base nice value
+(20 for a process at nice 0): systemd `LimitNICE=20` or
+`AmbientCapabilities=CAP_SYS_NICE`, Docker `--ulimit nice=20` or
+`--cap-add SYS_NICE`, Kubernetes
+`securityContext.capabilities.add: [SYS_NICE]`. Luxir checks this at startup
+on a scratch thread; an explicit value it cannot restore is logged and
+ignored. Linux only. A niced indexing worker still gets a share of a CPU busy
+with searches (about a third of a nice-0 thread's at nice 5), so the indexing
+floor holds under the operating system's scheduler too.
+
+**Merge pacing.** Each write is split into chunks of about 5 ms of the rate
+(4 KiB to 1 MiB), and a merge waits for each chunk's turn on one node-wide
+timeline, so no single wait is long and concurrent merges split the rate.
+Forced merges (`max_segments`) are not paced, because a client is waiting for
+them. Node shutdown wakes every paced merge and turns pacing off, so closing
+is never slowed by it. A paced merge holds its indexing worker (idle, using no
+CPU) and its share of the indexing RAM budget for longer, so pair it with
+`--indexing.threads` and `--indexing.max-concurrent-merges`, and keep the rate
+above the sustained ingest rate, or segments accumulate.
+
+`/_stats` reports `query_workers` and `indexing_workers` (the pool workers in
+each arena now), `merges_running`, `merges_waiting`, `merge_slot_waits`,
+`merge_slot_wait_seconds` and `merge_paced_seconds` in `service`; see
+[Service and engine metrics](#service-and-engine-metrics) for the Prometheus names.
+
+The startup log prints the resolved values (`Threads: ...`).
+
+Other background threads sit outside the pool: the checksum scrubber (one
+thread, low CPU priority, paced by `--store.scrub-max-bytes-per-sec`; see
+[File integrity checks](#file-integrity-checks)) and, on a follower, up to
+`--replication.downloads` collection download threads.
 
 HTTP searches with `max_parallel: 0` (the default) start on the receiving
 connection thread and adaptively use idle cores after earning work credit.
@@ -773,8 +842,8 @@ The HTTP request limits distinguish bounded material from streams:
 - `stream-batch-size` and `stream-batch-docs` are internal handoff thresholds,
   not limits on the number of documents in one HTTP stream.
 - `max-inflight-batches` bounds the number of internal batches one connection
-  has decoding or indexing at once. `0` (the default) uses the worker count
-  (`--server.workers`) plus two; `1` indexes one batch at a time. Reads pause
+  has decoding or indexing at once. `0` (the default) uses the resolved
+  `--indexing.threads` plus two; `1` indexes one batch at a time. Reads pause
   when the limit is reached and resume as batches are indexed, without waiting
   for earlier batches to complete. A larger limit uses more staging memory.
 
