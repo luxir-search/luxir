@@ -63,8 +63,11 @@ locations, browse `src/luxir/<area>/`.
      classes store an order-preserving encoded int64)
    - `PointsReader` reads the optional 1-D sorted-leaf points index of a
      `RANGE`-indexed numeric field (value-sorted leaves + fence directory;
-     exact ordinal counts). `BKDReader` reads the 2-D int32 BKD of a
-     `GEO_POINT` field. Absence of either = `SegFieldInfo.pointsMetaOff == 0`.
+     exact ordinal counts). `BasicBKDReader<PointTraits>` shares 2-D tree
+     traversal and leaf decoding: `BKDInt32Traits` serves geo coordinates
+     (`BKDReader`), and `BKDInt64Traits` serves range endpoints. Traits own
+     scalar types, format layouts, and coordinate codecs. Absence of any
+     points index = `SegFieldInfo.pointsMetaOff == 0`.
 
 4. **Query System** (`src/luxir/query/`)
 
@@ -96,9 +99,12 @@ locations, browse `src/luxir/<area>/`.
    - Supports Term, Boolean, Phrase, and All queries
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
-     column scans; `GeoBoxQuery` executes through the BKD. Both share the
-     `PointsMaterialize` scorer/bitset primitives and keep a sparse
-     two-phase column verify for small lead costs.
+     column scans. `BKDQueryWeight<QueryType, Relation>` serves geo box,
+     distance, polygon, and range-field queries through the shared BKD reader.
+     `GeoPointSource` and `RangePointSource`, selected by the query, own point
+     cardinality, column decoding, reader traits, pricing, and skip counters.
+     All share the `PointsMaterialize` scorer/bitset primitives and keep a
+     sparse two-phase column verify for small lead costs.
    - `ProtobufQueryParser` lowers the wire tree (`luxir::api::Query`) via `QueryBuilder`
      (the single place query-time analysis is applied); `ParseContext` carries the
      request pool, schema, warnings sink, and shared nesting budget
@@ -125,9 +131,12 @@ locations, browse `src/luxir/<area>/`.
      - `IndexHandler`: One physical representation, owned by `indexHandlers`;
        finish/flush visits each once in global physical-name order
    - `PostingsWriter`: used by an Inverter on flush to write a new segment.
-   - `PointsWriter` (1-D sorted leaves) and `BKDWriter` (2-D geo) build the
-     optional points indexes at flush; `SegmentMerger` carries 1-D points
-     forward by run-merging and rebuilds geo BKDs from the merged column.
+   - `PointsWriter` builds 1-D sorted leaves. `BasicBKDWriter<PointTraits>`
+     shares 2-D tree construction, docid codecs, and the bounded parallel leaf
+     pipeline: `BKDInt32Traits` serves geo (`BKDWriter`), and `BKDInt64Traits`
+     serves range endpoints. The int64 coordinate codec splits wide residuals
+     into low/high FOR streams. `SegmentMerger` carries 1-D points forward by
+     run-merging and rebuilds 2-D BKDs from the merged column.
    - `SummaryCollector` gathers each field's bounds while flush and merge
      write it, and `PostingsWriter::finish` turns the field directory into one
      summary record per field; `IndexWriter` writes the result as the segment's

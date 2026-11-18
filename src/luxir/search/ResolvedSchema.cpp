@@ -26,6 +26,7 @@ std::string ReaderManager::resolvedSchema() {
     auto* structural = schema->physical(name);
     if (structural->type() == FieldType::NESTED) {
       logical["type"] = "nested";
+      logical["reverse_map"] = ((const NestedFieldType*)structural)->reverseMap;
       logical["introduced_generation"] = schema->introduction(name);
       continue;
     }

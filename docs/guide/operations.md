@@ -676,24 +676,27 @@ workers.
 ./luxir --server.workers=2
 ```
 
-HTTP search requests default to serial execution directly on the io shard
-that received them. This avoids a scheduler handoff and idle-worker wakeups
-but occupies that connection's thread for the query's duration. The
-request-level `max_parallel` changes that: `1` moves the request onto the
-shared work-stealing scheduler, still serial (use this for requests expected
-to be expensive, so they do not delay other traffic on the same connection
-thread); `-1` keeps the request on its transport thread but lets the
-scheduler's workers join in with unlimited intra-request parallelism; values
-above `1` are reserved for a bounded parallelism budget and not implemented
-yet. A request with `min_commit` continues on a shared worker once its commit
-wait ends, whatever the setting.
+HTTP searches with `max_parallel: 0` (the default) start on the receiving
+connection thread and adaptively use idle cores after earning work credit.
+`1` runs serially on an arena worker, keeping an expensive query off its
+connection thread. `-1` publishes every sibling regardless of credit and load.
+`-2` runs serially inline on the receiving thread. Other values are rejected.
+The receiving thread stays occupied for the duration of requests with `0`,
+`-1`, or `-2`.
 
-gRPC searches always run on the shared workers, never on the completion-queue
-thread: a client such as a gateway multiplexes many calls over one HTTP/2
-connection, and gRPC offers a connection's new calls to its preferred
-completion queue first, so inline execution would run them one at a time.
-`max_parallel` keeps its parallelism meaning there: `0` and `1` run serially
-on a worker, and `-1` fans out from one.
+`--search.fanout-grain-us` sets adaptive work credit and the minimum share in
+microseconds (default 50). It accepts `-1` or values from 1 through 60000000.
+`-1` is the server-wide serial pin for `max_parallel: 0`.
+`--search.fanout-sibling-grain-us` sets the minimum share when only SMT siblings
+are idle (default 1000 us, the same accepted range); `-1` disables publication
+in that load tier. Saturated requests never publish adaptively. Neither grain
+option changes `max_parallel: -1`.
+
+A request with `min_commit` continues on an arena worker once its commit wait
+ends, whatever the setting. gRPC searches always start on arena workers, so
+`1` and `-2` are serial there, `0` is adaptive, and `-1` publishes every sibling.
+gRPC keeps searches off completion-queue threads so calls multiplexed on one
+HTTP/2 connection can execute concurrently.
 
 `--server.stream_buffer_bytes` sets the per-HTTP-connection and per-gRPC-call
 high-water mark for serialized responses (default 1 MiB). Producers pause above
@@ -799,12 +802,6 @@ Search has its own limits:
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state and prefix top-term selection; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
-- `search.auto-parallel-min-work` lets `max_parallel: 0`, the default, run a
-  request across segments in parallel, like `-1`, when its lists and
-  operations visit at least that many documents by index metadata. Counts that
-  metadata answers cost nothing. `0` (the default) keeps `max_parallel: 0`
-  serial. Parallel runs cost more CPU in exchange for latency, so set it only
-  where large requests are common.
 - Multi-term expansion limits are operator opt-ins, all off by default (`0`).
   With limits off, broad patterns on high-cardinality fields simply run. Operators
   exposing public endpoints can bound this work using the following options.

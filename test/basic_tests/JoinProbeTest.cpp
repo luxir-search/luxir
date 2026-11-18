@@ -66,7 +66,7 @@ TEST_F(JoinProbeTest, sparseFamiliesUsePointChecksAndBoundedCandidateMasks) {
     std::string field = std::string(path) + ".n_i";
     NumericPredicateQuery numeric(field, 0, high);
     auto* source = numeric.createWeight(context, 0)->scorerSupplier(pool, many->segments()[0]);
-    auto* supplier = relation.reduce(pool, 0, *source, root->segments()[0].liveDocSet(), RowRelation::Reduction::NONE, 1.0f);
+    auto* supplier = relation.reduce(pool, 0, *source, root->segments()[0].liveDocSet(), RowReduction{RowReduction::FIXED}, 1.0f);
     auto planContext = Query::PlanContext::fromLeadCost(N / 17 + 1, Query::ExecutionUse::COUNT_WINDOWS);
     planContext.demand.span = N;
     planContext.membershipConsumption = Query::MembershipConsumption::CANDIDATES;
@@ -99,7 +99,7 @@ TEST_F(JoinProbeTest, sparseFamiliesUsePointChecksAndBoundedCandidateMasks) {
         int32_t before = verified;
         EXPECT_TRUE(probe->matches()); EXPECT_TRUE(probe->matches());
         EXPECT_EQ(owner, probe->docId()); EXPECT_FLOAT_EQ(1.0f, probe->score());
-        EXPECT_EQ(before, verified);
+        if constexpr (NumericVerificationObserver::enabled) { EXPECT_EQ(before, verified); }
       }
     }
     for (int32_t owner : {17, LARGE}) {
@@ -110,8 +110,10 @@ TEST_F(JoinProbeTest, sparseFamiliesUsePointChecksAndBoundedCandidateMasks) {
       EXPECT_EQ(owner == LARGE && high == 101,
           (one[(size_t)owner >> 6] & (1ULL << (owner & 63))) != 0);
     }
-    EXPECT_GT(verified, 0);
-    EXPECT_LE(verified, 2 * (int32_t)rootOfRow.size());
+    if constexpr (NumericVerificationObserver::enabled) {
+      EXPECT_GT(verified, 0);
+      EXPECT_LE(verified, 2 * (int32_t)rootOfRow.size());
+    }
     sparse = false;
     SkipStats::reset();
     auto* dense = supplier->resolve(pool, planContext)->build(pool);
@@ -149,7 +151,7 @@ TEST_F(JoinProbeTest, firstPageDoesNotVerifyAWholePostingWindow) {
     if (count) op.countLimit(count);
     req->execute(1); ASSERT_OK(req);
     if (count >= 0) {
-      EXPECT_LT(checked, count ? 600 : 20);
+      if constexpr (NumericVerificationObserver::enabled) { EXPECT_LT(checked, count ? 600 : 20); }
       EXPECT_GT(SkipStats::numericPredicateSparseVerifyArms, 0);
       EXPECT_EQ(0, SkipStats::numericPredicateScanArms);
     } else { EXPECT_EQ(N / 4, req->getMatchCount()); }
@@ -173,7 +175,7 @@ TEST_F(JoinProbeTest, childProofProjectsEmptyZonesWithoutRejectingPossibleOwners
   OwnershipRelation relation(*many, *root, context.planningContext().memoryTracker);
   NumericPredicateQuery numeric("items_nested.n_i", 0, 1);
   auto* source = numeric.createWeight(context, 0)->scorerSupplier(pool, many->segments()[0]);
-  auto* supplier = relation.reduce(pool, 0, *source, nullptr, RowRelation::Reduction::NONE, 1.0f);
+  auto* supplier = relation.reduce(pool, 0, *source, nullptr, RowReduction{RowReduction::FIXED}, 1.0f);
   auto planContext = Query::PlanContext::fromLeadCost(N, Query::ExecutionUse::COUNT_WINDOWS);
   planContext.membershipConsumption = Query::MembershipConsumption::CANDIDATES;
   auto* plan = supplier->resolve(pool, planContext);

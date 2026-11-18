@@ -1193,7 +1193,8 @@ inline Query::ScorerSupplier* filterSupplier(
     FilterSupplierMode mode = FilterSupplierMode::DENSITY_ROUTED,
     int32_t sparseBatchDensityInverse = 0,
     Query::SupplierExecutionMode executionMode =
-        Query::SupplierExecutionMode::ORDINARY) {
+        Query::SupplierExecutionMode::ORDINARY,
+    FilterCache::Population population = FilterCache::Population::ALLOW) {
   auto& weight = *source.weight;
   auto* prepared = source.prepared.get();
   auto* use = source.cacheUse;
@@ -1235,13 +1236,15 @@ inline Query::ScorerSupplier* filterSupplier(
     return uncached;
   }
 
-  auto probe = use->probe((size_t) segment.ord);
+  auto probe = use->probe((size_t) segment.ord, population);
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
     DocSet* docs = executionMode
             == Query::SupplierExecutionMode::RAW_MEMBERSHIP
         ? probe.docSet()
         : use->effectiveDocSet((size_t) segment.ord, reader);
     return targetPool.make<DocSetSupplier>(docs, segment);
+  } else if (population == FilterCache::Population::BORROW_ONLY) {
+    return uncached;  // ~Probe releases the request resolving claim
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
@@ -1274,13 +1277,14 @@ inline Query::ScorerSupplier* filterSupplier(
     FilterSupplierMode mode = FilterSupplierMode::DENSITY_ROUTED,
     int32_t sparseBatchDensityInverse = 0,
     Query::SupplierExecutionMode executionMode =
-        Query::SupplierExecutionMode::ORDINARY) {
+        Query::SupplierExecutionMode::ORDINARY,
+    FilterCache::Population population = FilterCache::Population::ALLOW) {
   PreparedSource source;
   source.weight = &weight;
   source.cacheUse = use;
   return filterSupplier(
       targetPool, source, reader, segment, mode,
-      sparseBatchDensityInverse, executionMode);
+      sparseBatchDensityInverse, executionMode, population);
 }
 
 struct ExactDomainSource {
@@ -1338,7 +1342,8 @@ inline ExactDomainResult tryExactDomain(
         allAvailable = false;
         continue;
       }
-      auto probe = source.cacheUse->probe((size_t) segment.ord);
+      auto probe = source.cacheUse->probe(
+          (size_t) segment.ord, FilterCache::Population::BORROW_ONLY);
       if (probe.kind() != FilterCache::Probe::Kind::HIT) {
         allAvailable = false;
         continue;

@@ -18,6 +18,8 @@ class NumericVerificationObserver {
   std::function<void(const NumericPredicateQuery&, int32_t)> callback;
 
 public:
+  static constexpr bool enabled = true;
+
   explicit NumericVerificationObserver(std::function<void(const NumericPredicateQuery&, int32_t)> callback)
       : callback(std::move(callback)) {
     active = this;
@@ -31,6 +33,8 @@ public:
         }) {}
 #else
 public:
+  static constexpr bool enabled = false;
+
   explicit NumericVerificationObserver(std::function<void(int32_t)>) {}
   explicit NumericVerificationObserver(std::function<void(const NumericPredicateQuery&, int32_t)>) {}
 #endif

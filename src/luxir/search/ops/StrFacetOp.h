@@ -700,13 +700,25 @@ public:
       inlinePlanResolved = true;
     }
 
-    void dispatchSegments(oneapi::tbb::task_group* tg,
+    uint64_t fanoutStealUnits(int32_t segnum, uint64_t docs) override {
+      auto* info = thisOp().fieldInfo(segnum);
+      if (!info) return 0;
+      int32_t maxDoc = thisOp().reader.segments()[(size_t)segnum].maxDoc();
+      int64_t keys = thisOp().ordMap ? thisOp().ordMap->numOrds() : info->nTerms;
+      int64_t values = scaleExpectedValues((int64_t)docs, info->numValues, maxDoc);
+      return (uint64_t)std::max<int64_t>(0, std::min(keys, values));
+    }
+
+    void dispatchSegments(FanoutScope* tg,
                           std::span<const DomainHandle> domains) {
       if (domains.empty()) {
         calcSegment(tg, -1, {});
         return;
       }
-      task_group_fanout(tg, domains.size(), [&](size_t segnum) {
+      task_group_fanout(tg, domains.size(), FanoutKind::EXHAUSTIVE, [&](size_t segnum) {
+        uint64_t units = fanoutDomainUnits(thisOp().reader.segments()[segnum], domains[segnum]);
+        return FanoutSize{units, fanoutStealUnits((int32_t)segnum, units)};
+      }, [&](size_t segnum) {
         return [this, tg, segnum, domain = domains[segnum]]() {
           assert(domain.isDeliverable());
           calcSegment(tg, (int32_t)segnum, domain);
@@ -715,13 +727,13 @@ public:
     }
 
 
-    void calcAll(oneapi::tbb::task_group* tg,
+    void calcAll(FanoutScope* tg,
                  std::span<const DomainHandle> domains) override {
       resolveInlinePlan(domains);
       dispatchSegments(tg, domains);
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domainHandle) override {
       if (thisOp().inlineAllCandidate) {
         if (segnum == -1) {
@@ -744,7 +756,7 @@ public:
       calcSegment(tg, segnum, std::move(domainHandle));
     }
 
-    void calcSegment(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calcSegment(FanoutScope* tg, int32_t segnum,
                      DomainHandle domainHandle) {
       // Result-child execution is synchronous under the bucket-domain stage,
       // so the per-segment parent count needs no task group.
@@ -1818,7 +1830,7 @@ public:
       return nullptr;
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domain) override {
       unused(tg);
       unused(segnum);

@@ -42,6 +42,13 @@ public:
     return range(owner, owner + 1);
   }
 
+  // Random lookups use each level's reverse map when present. Forward walks
+  // use Cursor to retain family boundaries instead.
+  int32_t owner(int32_t child) const {
+    for (auto it = shapes.rbegin(); it != shapes.rend(); ++it) child = (*it)->owner(child);
+    return child;
+  }
+
   // Compose one boundary run into the descendant space without retaining
   // intermediate rows or decoding the gaps between sampled frames.
   void readBoundaries(int32_t first, int32_t end, std::span<int64_t> out) const {
@@ -59,7 +66,7 @@ public:
     std::span<OwnershipShape::Cursor> cursors;
     OwnershipShape::Family current{-1, 0, 0};
 
-    OwnershipShape::Family descend(OwnershipShape::Family family) {
+    [[gnu::always_inline]] OwnershipShape::Family descend(OwnershipShape::Family family) {
       current = family;
       // The top family's range is in its immediate child space. Descend its
       // boundaries through the same cursors to get the full descendant range.

@@ -121,16 +121,6 @@ public:
   // The task arena's worker threads (server.workers, resolved).
   int getWorkers() const { return workers; }
 
-  // Runs f on the calling thread inside the task arena, in one of the slots
-  // reserved for threads entering from outside.  Tasks f spawns are stealable
-  // by the arena's workers, and f's waits run only tasks spawned within f
-  // (isolation): a transport thread never picks up a merge or another
-  // request's work while its connections wait.
-  template <typename F>
-  void executeIsolated(const F& f) {
-    taskArena.execute([&] { oneapi::tbb::this_task_arena::isolate(f); });
-  }
-
   // Counts a transport server's threads against the task arena's reserved
   // slots for the holder's lifetime.  Warns when entrants outnumber the slots
   // (servers run with more threads than the config the node was built from):
@@ -187,14 +177,22 @@ private:
   class ArenaThreadNamer : public oneapi::tbb::task_scheduler_observer {
     const char* prefix;
     int reservedSlots;  // workers occupy the slots after these
+    // apply() installs startup flags before node construction. Capture enable
+    // for this observer's lifetime so its entries and exits always pair.
+    std::unique_ptr<LoadRegistry::ArenaActivity> loadActivity;
   public:
-    ArenaThreadNamer(oneapi::tbb::task_arena& arena, const char* prefix, int reservedSlots)
+    ArenaThreadNamer(oneapi::tbb::task_arena& arena, const char* prefix, int reservedSlots, bool trackLoad)
       : oneapi::tbb::task_scheduler_observer(arena), prefix(prefix), reservedSlots(reservedSlots) {
+      if (trackLoad && LoadRegistry::enabled.load(std::memory_order_relaxed)) {
+        loadActivity = std::make_unique<LoadRegistry::ArenaActivity>(LoadRegistry::global());
+      }
       observe(true);
     }
+    ~ArenaThreadNamer() override { observe(false); }
     void on_scheduler_entry(bool worker) override;
+    void on_scheduler_exit(bool worker) override;
   };
-  ArenaThreadNamer arenaThreadNamer{taskArena, "luxir_tbb_", reservedSlots};
+  ArenaThreadNamer arenaThreadNamer{taskArena, "luxir_tbb_", reservedSlots, false};
 
   // Every collection's indexing: update batches, flushes, merges (each
   // writer's update graph runs here; see Collections).  Its own arena at low
@@ -204,7 +202,7 @@ private:
   // while indexing holds all of its own.  One reserved seat for a thread
   // waiting on a graph (close, tests).
   oneapi::tbb::task_arena indexArena;
-  ArenaThreadNamer indexThreadNamer{indexArena, "luxir_idx_", 1};
+  ArenaThreadNamer indexThreadNamer{indexArena, "luxir_idx_", 1, true};
 
   IndexRamBudget indexRamBudget;
   std::shared_ptr<ReplicationSource> replication;

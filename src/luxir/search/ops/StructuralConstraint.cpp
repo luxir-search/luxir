@@ -96,7 +96,7 @@ std::vector<DomainHandle> StructuralConstraint::finish(IndexReader& reader, std:
   // No FilterUse: the selected window is derived request-local state.
   std::vector<DocSet*> views;
   for (const auto& domain : domains) views.push_back(domain.get());
-  Query::Weight::PrepareContext context{reader, std::span<DocSet* const>(views.data(), views.size()), false,
+  Query::Weight::PrepareContext context{reader, std::span<DocSet* const>(views.data(), views.size()), nullptr,
                                         warnings};
   auto* weight = selection;
   auto prepared = weight->prepare(context);

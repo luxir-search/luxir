@@ -155,6 +155,8 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
     if (!nested) nested = std::make_unique<NestedState>(*this);
     fieldHandler = pool.make_unique<handler::NestedHandler>(*this, name, fieldType, space,
                                                            *nested, nested->path(name));
+  } else if (fieldType->type() == FieldType::INTERVAL) {
+    fieldHandler = pool.make_unique<handler::RangeHandler>(*this, name, fieldType, space);
   } else if (fieldType->type() == FieldType::GEO_POINT) {
     if (fieldType->multiValued()) {
       fieldHandler = pool.make_unique<handler::MultiGeoPointHandler>(*this, name, fieldType, space);
@@ -211,6 +213,7 @@ Inverter::InputHandler::InputHandler(Inverter& inverter, const ResolvedFieldHand
             resolved.fieldType->type() == FieldType::VECTOR ? LogicalField::Shape::VECTOR :
             resolved.fieldType->type() == FieldType::GEO_POINT ? LogicalField::Shape::GEO :
             resolved.fieldType->type() == FieldType::NESTED ? LogicalField::Shape::NESTED :
+            resolved.fieldType->type() == FieldType::INTERVAL ? LogicalField::Shape::RANGE :
             LogicalField::Shape::SCALAR),
       multi(resolved.owner ? resolved.owner->multi : resolved.fieldType->multiValued()), writer(writer) {}
 

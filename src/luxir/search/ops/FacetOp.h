@@ -909,7 +909,7 @@ public:
       if (!this->fieldOp().subOps.empty()) input.resize(op.view->segments().size());
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DomainHandle domain) override {
+    void calc(FanoutScope* tg, int32_t segnum, DomainHandle domain) override {
       unused(tg);
       if (segnum == -1) { driver.completeEmpty(); return; }
       DocSet* docs = domain.get(op.view->segments()[(size_t)segnum]);
@@ -1076,7 +1076,7 @@ public:
       return (IntFacetReq&)getOp();
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domainHandle) override {
       assert(domainHandle.isDeliverable());
       if (segnum >= 0) domainHandle.assertScope(op.view->segments()[(size_t)segnum]);
@@ -1376,7 +1376,7 @@ public:
       return (FullTextFacetReq&)getOp();
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domainHandle) override {
       assert(domainHandle.isDeliverable());
       if (segnum >= 0) domainHandle.assertScope(op.view->segments()[(size_t)segnum]);
@@ -1708,7 +1708,7 @@ public:
         std::span<const SelectedFacetBucket<size_t>> block, DomainHandle eligibility,
         FacetBucketFeed feed) = 0;
     virtual Query::Weight* bucketSelection(size_t) { return nullptr; }
-    virtual void prepareGatheredDomains(oneapi::tbb::task_group* tg) {
+    virtual void prepareGatheredDomains(FanoutScope* tg) {
       unused(tg);
     }
 
@@ -1720,9 +1720,11 @@ public:
       });
     }
 
-    void prepareAndDispatch(oneapi::tbb::task_group* tg) {
+    void prepareAndDispatch(FanoutScope* tg) {
       prepareGatheredDomains(tg);
-      task_group_fanout(tg, input.size(), [&](size_t segnum) {
+      task_group_fanout(tg, input.size(), FanoutKind::EXHAUSTIVE, [&](size_t segnum) {
+        return FanoutSize{fanoutDomainUnits(fixedOp().reader.segments()[segnum], input[segnum]), 0};
+      }, [&](size_t segnum) {
         return [this, segnum, domain = input[segnum]]() {
           collectInputSegment((int32_t)segnum, domain.get());
         };
@@ -1831,7 +1833,7 @@ public:
           result.ops, fixedOp().subOps.size(), sub.name, resp->mr);
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domainHandle) final {
       assert(domainHandle.isDeliverable());
       if (segnum == -1) {
@@ -1860,7 +1862,7 @@ public:
       if (seen == (int32_t)input.size()) prepareAndDispatch(tg);
     }
 
-    void calcAll(oneapi::tbb::task_group* tg,
+    void calcAll(FanoutScope* tg,
                  std::span<const DomainHandle> domains) final {
       if (!fixedOp().requiresWholeReaderDomain()) {
         Calculator::calcAll(tg, domains);
@@ -2391,7 +2393,7 @@ public:
           QueryPrep::MaterializeMode::ORDINARY)).scoped(segment);
     }
 
-    void prepareGatheredDomains(oneapi::tbb::task_group* tg) override {
+    void prepareGatheredDomains(FanoutScope* tg) override {
       std::vector<DocSet*> domains;
       domains.reserve(this->input.size());
       for (const DomainHandle& domain : this->input) {
@@ -2400,7 +2402,7 @@ public:
       Query::Weight::PrepareContext context{
         *queryOp().view,
         std::span<DocSet* const>(domains.data(), domains.size()),
-        tg != nullptr, &queryOp().req};
+        tg, &queryOp().req};
       preparedSources = QueryPrep::prepareSources(
           queryOp().bucketWeights, context);
       assert(preparedSources.size() == queryOp().bucketCount());

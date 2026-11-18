@@ -242,8 +242,8 @@ private:
 
   static bool termQueryable(FieldType& ft) { return SimpleQueryParser::termQueryable(ft); }
 
-  static bool numericQueryable(FieldType& ft) {
-    return ft.supports(FieldType::MATCH) && FieldType::isNumericColumn(ft.type()) && ft.hasColumn();
+  static bool columnMatchQueryable(FieldType& ft) {
+    return SimpleQueryParser::columnMatchQueryable(ft);
   }
 
   FieldType& resolveField(std::string_view name, size_t pos, OpClass op) {
@@ -268,7 +268,7 @@ private:
 
   void requireValueQueryable(std::string_view field, FieldType& ft, size_t pos) {
     requireCapability(ft, FieldType::MATCH, "query", field, pos);
-    if (!termQueryable(ft) && !numericQueryable(ft)) {
+    if (!termQueryable(ft) && !columnMatchQueryable(ft)) {
       fail(pos, fmt::format(
           "field '{}' does not support term, phrase, or range syntax", field));
     }
@@ -547,7 +547,7 @@ private:
   // leading plus is not part of any numeric literal the coercion accepts,
   // and "+5 required" happens to mean what the writer meant anyway.
   bool minusSignOfNumber(const FieldScope* scope) {
-    if (cur.peek() != '-' || scope == nullptr || !numericQueryable(resolveField(scope->field, scope->pos, OpClass::SEARCH))) return false;
+    if (cur.peek() != '-' || scope == nullptr || !columnMatchQueryable(resolveField(scope->field, scope->pos, OpClass::SEARCH))) return false;
     char next = cur.peekAt(1);
     return digit(next) || next == '.';
   }

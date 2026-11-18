@@ -112,6 +112,13 @@ class ScoreCollector {
     assert(topCount >= 0);
   }
 
+  void reset() requires (!Collapsed) {
+    pq.clear();
+    hitCount = estimatedHits = 0;
+    countIncomplete = countEstimated = countFloored = false;
+    minCompetitiveVal = std::numeric_limits<float>::lowest();
+  }
+
   void collect(int32_t segment, int32_t docid, float score) {
     if constexpr (Collapsed) {
       // A doc losing to (bottom score, bottom doc) cannot enter as a new
@@ -987,17 +994,31 @@ inline int64_t countMatchesInRange(BulkScorer* bulk, DocSet* filter,
   return count;
 }
 
+// Visit matches in [min, max). Scored traversal retains ordinary scorer
+// state; membership traversal bounds verification to this range. The visitor
+// may stop early, and a later call can resume at a later range.
+template <bool Scored = false, typename Visitor>
+void visitMatchesInRange(Query::Scorer* scorer, DocSet* filter,
+                         int32_t min, int32_t max, Visitor&& visitor) {
+  assert(scorer != nullptr);
+  DocSetProbe accepted(filter);
+  if (min >= max) return;
+  auto advance = [&](int32_t target) {
+    if constexpr (Scored) {
+      return scorer->docId() < target ? scorer->advance(target) : scorer->docId();
+    } else return scorer->advanceWindow(target, max);
+  };
+  for (int32_t doc = advance(min); doc < max; doc = advance(doc + 1)) {
+    if (accepted.get(doc) && !visitor(doc)) break;
+  }
+}
+
 // Count an unscored pull scorer's matches in [min, max) that filter accepts.
 // Verification stays inside the range, so later calls may count later ranges.
 inline int64_t countMatchesInRange(Query::Scorer* scorer, DocSet* filter,
                                    int32_t min, int32_t max) {
-  assert(scorer != nullptr);
-  DocSetProbe accepted(filter);
   int64_t count = 0;
-  for (int32_t doc = scorer->advanceWindow(min, max); doc < max;
-       doc = scorer->advanceWindow(doc + 1, max)) {
-    if (accepted.get(doc)) count++;
-  }
+  visitMatchesInRange(scorer, filter, min, max, [&](int32_t) { count++; return true; });
   return count;
 }
 

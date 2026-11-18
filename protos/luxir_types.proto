@@ -52,12 +52,14 @@ message SearchRequest {
   // Return execution details for instrumented operations; see ExecutionProfile.
   bool profile = 7;
 
-  // Intra-request parallelism: 0 (default) lets the engine choose: serial
-  // (over HTTP normally inline on the receiving thread, over gRPC on the shared
-  // executor) unless the operator's search.auto-parallel-min-work admits it.
-  // 1 runs serially on the shared executor; -1 permits unlimited parallelism,
-  // with shared workers joining in (starting on the receiving HTTP thread, or
-  // on the shared executor over gRPC). Other values are rejected.
+  // Intra-request parallelism: 0 (default) starts on the receiving thread and
+  // adaptively uses idle cores after earning work credit. 1 runs serially on
+  // an arena worker; -1 publishes every sibling regardless of credit and load;
+  // -2 runs serially inline. gRPC and min_commit continuations start on arena
+  // workers for every value. search.fanout-grain-us defaults to 50 us;
+  // -1 disables adaptive publication. search.fanout-sibling-grain-us defaults
+  // to 1000 us when only SMT siblings are idle; -1 disables that tier.
+  // Other values of max_parallel are rejected.
   int32 max_parallel = 8;
 
   // Require a local snapshot at least this new (incarnation:index_gen).
@@ -170,6 +172,8 @@ message Diversify {
 }
 
 message TopDocs {
+  // Operations evaluated on each returned row, with that row as incoming domain.
+  map<string, SearchOp> row_ops = 26;
   // Plugin result decorators, executed only for emitted rows.
   map<string, Val> decorate = 25;
   Query query = 1;            // unset selects all documents (browse / filter-only search)
@@ -329,6 +333,8 @@ message SortSpec {
 }
 
 message Query {
+  // A request-unique reference to this clause; does not affect query identity.
+  optional string name = 28;
   // An unset kind selects all documents, same as `all`.
   oneof kind {
     Match match = 1;                // selects all documents with a value match in the specified field
@@ -361,8 +367,14 @@ message Query {
 message ToParentQuery {
   string path = 1;
   Query query = 2;
-  // none (constant score) or max. Unset selects max.
+  // How matching child scores reduce to the owner's score: max (default),
+  // min, sum, avg, or none (the join contributes zero).
   string score = 3;
+  // Fewest matching children an owner needs. Unset = 1; must be >= 1.
+  optional int32 min_children = 4;
+  // Most matching children an owner may have. Unset = unbounded; must be
+  // >= min_children.
+  optional int32 max_children = 5;
 }
 
 message ExistsQuery {
@@ -603,12 +615,28 @@ message PluginQuery {
 // (no collation), constant-scoring. TEXT bounds use multi-term normalization
 // without tokenization; STRING bounds use the field's normalizer. Exact
 // bounds follow the field's long_terms policy. Uses the field's value binding.
+//
+// Range fields (LONG_RANGE, DOUBLE_RANGE, DATE_RANGE) compare each stored
+// [min, max] interval with the query interval by `relation`. Bounds use the
+// element's scalar range-query rules. Partial date bounds name their whole
+// granule. Open long/date ends extend to int64 limits; open double ends are
+// -Infinity and +Infinity. Explicit double infinities at those ends are
+// equivalent; NaN is rejected. Date endpoints in results follow date output
+// modes. Sort, facets, collapse, value expressions, and any_of are unsupported.
 message RangeQuery {
   string field = 1;
   Val gte = 2;   // lower bound, inclusive (>=)
   Val gt  = 3;   // lower bound, exclusive (>)
   Val lte = 4;   // upper bound, inclusive (<=)
   Val lt  = 5;   // upper bound, exclusive (<)
+
+  enum Relation {
+    INTERSECTS = 0; // the stored interval overlaps the query interval
+    CONTAINS = 1;   // the stored interval covers the whole query interval
+    WITHIN = 2;     // the stored interval lies inside the query interval
+  }
+  // Range fields only; rejected on other field types unless INTERSECTS.
+  Relation relation = 15;
 }
 
 // Inclusive geographic bounding box in degrees. Bounds are quantized to the
@@ -1028,6 +1056,8 @@ message QueryFacet {
 // scope; child membership can differ from the parent's counted window.
 // Not supported directly in Fusion.ops.
 message Domain {
+  // In row_ops, select this named clause's matching descendant rows.
+  optional string from_match = 7;
   // Relative descendant path, .. steps to ancestors, or / for root documents.
   optional string to = 6;
   // If present, replaces the incoming domain with this query's matches
@@ -2163,6 +2193,14 @@ message SegmentStats {
   uint32 merge_level = 12;
   repeated AuxStats overlays = 13;
   uint64 bytes = 14;
+  repeated RowSpaceStats spaces = 15; // non-root spaces; bytes already included in the segment
+}
+
+message RowSpaceStats {
+  string path = 1;
+  int32 max_doc = 2; // physical child rows, including rows of deleted roots
+  uint64 ends_bytes = 3; // payload, alignment and block directory
+  uint64 owners_bytes = 4; // zero when the reverse map is absent
 }
 
 message AuxStats {
@@ -2451,6 +2489,16 @@ message FieldDef {
     IP = 12;       // IPv4 or IPv6 address, stored as 16-byte terms
     DECIMAL = 13;  // fixed-point number, stored as int64 value * 10^scale
     NESTED = 14;   // structural path of nested object rows
+    // Single-valued intervals written as {"gte"|"gt": a, "lte"|"lt": b};
+    // either side may be omitted for an open end. Ingest rejects fractional
+    // long endpoints, out-of-domain endpoints, NaN, and empty intervals.
+    // Partial dates name their whole granule, in UTC without an explicit
+    // offset. index=range adds a query index; index=none is the default.
+    // match and explicit multi_match selectors are supported; wildcard field
+    // selectors do not select range fields. Multi-valued ranges are unsupported.
+    LONG_RANGE = 18;   // int64 endpoints
+    DOUBLE_RANGE = 19; // double endpoints
+    DATE_RANGE = 20;   // DATE endpoints (epoch millis, ISO-8601 or date math)
   }
   optional FieldClass type = 2; // required unless inherited from parent
 
@@ -2460,7 +2508,7 @@ message FieldDef {
   enum IndexMode {
     NONE = 0;    // no index
     MATCH = 1;   // term index for STRING/TEXT/ID, including term ranges
-    RANGE = 2;   // numeric Match/Range or GEO_POINT predicates; requires column=true
+    RANGE = 2;   // numeric Match/Range, GEO_POINT or range-field predicates; requires column=true
   }
 
   // Unset inherits, falling back to MATCH for STRING/TEXT/ID and NONE
@@ -2572,6 +2620,10 @@ message FieldDef {
   // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
   // inherits, else true. Set false to reject a point with a z coordinate.
   optional bool ignore_z_value = 29;
+
+  // NESTED only. Store child-to-owner row lookups in segments written later.
+  // Unset inherits, else true. Changing it does not rewrite existing segments.
+  optional bool reverse_map = 30;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

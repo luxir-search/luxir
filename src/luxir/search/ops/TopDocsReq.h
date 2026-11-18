@@ -59,6 +59,9 @@ protected:
 
 public:
   class CalcBase;
+  std::vector<TopDocsReq*> rowOps;
+  std::span<ReturnField> rowFields;
+  std::vector<ExtraColumn> rowColumns();
 
   // Exact COUNT + pruned TOP_100 over the 5M/301-union cohort crossed between
   // glass (0.758%, 1.008 compose/exhaustive) and philadelphia (0.861%, 0.977).
@@ -587,6 +590,7 @@ public:
 
   void init() override {
     SearchOp::init();
+    for (auto* row : rowOps) row->init();
     for (auto& [name, child] : groupOps) child->init();
     if (collapse && !topDocsProto.collapse->sort.empty()) resolveMetricGroupOrder(*this);
   }
@@ -637,31 +641,6 @@ public:
   std::function<void(CalcBase&, MergeableCollector*)> rankingSink;
 
 
-  bool ownsMatchDomain() const override { return true; }
-
-  // Counting and ranking are priced apart, each at the matches it may visit.
-  // A count that metadata answers costs nothing, and score-ordered
-  // constant-score ranking stops at the first K. Sub-ops need every match. A
-  // prepared query's work is not a document count; it adds none.
-  size_t workEstimate() override {
-    size_t total = SearchOp::workEstimate();
-    if (weight == nullptr || weight->needsPrepare()) return total;
-    bool firstK = weight->isConstantScoring() && !sortPlan.useFieldSort;
-    for (auto& segment : view->segments()) {
-      auto shortcut = weight->countShortcut(segment, nullptr);
-      auto matches = (size_t) shortcut.maxMatches;
-      size_t counting = !requirements.needsCount()
-              || shortcut.how == Query::CountHow::METADATA
-          ? 0 : matches;
-      size_t ranking = !requirements.needRankedDocs ? 0
-          : firstK ? std::min(matches, (size_t) std::max<int64_t>(topCount, 0))
-          : matches;
-      size_t work = subOps.empty() ? std::max(counting, ranking) : matches;
-      total = saturatingAdd(total, work);
-    }
-    return total;
-  }
-
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;
     for (auto* source : {weight, variantMembershipWeight, countWeight,
@@ -705,6 +684,9 @@ public:
   }
 
   class CalcBase : public SearchOp::Calculator {
+#ifndef NDEBUG
+    bool prunedFanout = false;
+#endif
   public:
     // Page result columns live in the final response arena, pinned through
     // all streaming batches. They are sliced only after every binding closes.
@@ -1106,7 +1088,8 @@ public:
         BulkScorer* exactScorer = nullptr) {
       int64_t before = collector.totalHits();
       rankTopK(pool, segnum, rankingSupplier, collectorFilter, collector,
-               maxDoc, allowPruning, allowPruning ? &scoreAccumulator : nullptr,
+               maxDoc, allowPruning,
+               checkedRankingBound(allowPruning ? &scoreAccumulator : nullptr),
                exactScorer);
       int64_t ranked = collector.totalHits() - before;
       assert(count >= ranked);
@@ -1163,7 +1146,7 @@ public:
       int64_t before = collector.totalHits();
       if (collector.topCount > 0 && (!count || *count > 0)) {
         rankTopK(pool, segnum, rankingSupplier, collectorFilter, collector,
-                 seg.maxDoc(), true, &rankingAccumulator);
+                 seg.maxDoc(), true, checkedRankingBound(&rankingAccumulator));
       }
       if (!count) {
         collector.countIncomplete = true;
@@ -1349,7 +1332,7 @@ public:
         if (rankingScorer == nullptr) return false;
         captured = collectFirstKConstant(
             segnum, rankingScorer, collectorFilter, collector,
-            collector.topCount);
+            collector.topCount, checkedRankingBound(nullptr));
       }
       assert(count >= captured);
       collector.hitCount += count - captured;
@@ -1446,7 +1429,7 @@ public:
     void configureDiversify();
 
     template <bool MetricGroups = false>
-    void completeEmpty(oneapi::tbb::task_group* tg) {
+    void completeEmpty(FanoutScope* tg) {
       std::span<const DomainHandle> noDomains;
       for (auto& subCalc : subCalcs) {
         subCalc->acceptAll(tg, noDomains);
@@ -1455,32 +1438,31 @@ public:
     }
 
     template <bool Structural>
-    void prepareMainVariants(oneapi::tbb::task_group* tg);
+    void prepareMainVariants(FanoutScope* tg);
 
     template <bool Structural>
     void prepareDomainQueryVariants(
         std::span<DocSet* const> liveDomains,
-        oneapi::tbb::task_group* tg);
+        FanoutScope* tg);
 
     template <bool Structural, bool MetricGroups = false, typename Admission = CollapseAdmission>
-    void prepareAndDispatch(oneapi::tbb::task_group* tg);
+    void prepareAndDispatch(FanoutScope* tg);
 
     template <bool Structural>
-    void prepareDomains(oneapi::tbb::task_group* tg);
+    void prepareDomains(FanoutScope* tg);
+
+    uint64_t fanoutStealUnits(int32_t segnum, uint64_t docs) override {
+      uint64_t steal = 0;
+      for (auto& calc : subCalcs) steal = taskWorkAdd(steal, calc->fanoutStealUnits(segnum, docs));
+      return steal;
+    }
 
     template <bool Structural, bool MetricGroups = false, typename Admission = CollapseAdmission>
     void dispatch(
-        oneapi::tbb::task_group* tg,
+        FanoutScope* tg,
         std::span<const DomainHandle> domains) {
       assert(domains.size() == thisOp().view->segments().size());
-      // Keep the same task-stack ordering as Calculator::calcAll, except
-      // that a field sort visits segments in its visit order
-      // (fieldSortVisitOrder). Sequentially, one collector then carries its
-      // heap from segment to segment, so the segments holding the best keys
-      // go first. In parallel the segments are spawned in reverse:
-      // the best segment is the final index and runs inline, so this
-      // thread's heap fills with good keys early. Thieves steal the worst
-      // segments, with heaps of their own.
+      // Ranked lists keep their visit order on the caller.
       auto& op = thisOp();
       std::vector<int32_t> order;
       if (domains.size() > 1 && subCalcs.empty()
@@ -1490,8 +1472,24 @@ public:
             fieldSortSegmentKeys(*op.view, op.sortPlan, op.sortValues),
             op.topCount, fieldSortMissingFirst(op.sortPlan, op.sortValues));
       }
-      task_group_fanout(tg, domains.size(), [&](size_t i) {
-        int32_t segnum = order.empty() ? (int32_t)i : order[tg ? order.size() - 1 - i : i];
+      size_t n = domains.size();
+      bool ranked = subCalcs.empty() && op.requirements.needRankedDocs && op.topCount > 0;
+      FanoutKind kind = !ranked ? FanoutKind::EXHAUSTIVE
+          : !MetricGroups && rankingSharesBound() ? FanoutKind::PRUNED : FanoutKind::SERIAL;
+#ifndef NDEBUG
+      prunedFanout = kind == FanoutKind::PRUNED;
+#endif
+      bool back = fanoutCallerStartsAtBack(tg);
+      auto segmentAt = [&](size_t i) {
+        size_t visit = ranked && back ? n - 1 - i : i;
+        return order.empty() ? (int32_t)visit : order[visit];
+      };
+      task_group_fanout(tg, n, kind, [&](size_t i) {
+        int32_t segnum = segmentAt(i);
+        uint64_t units = fanoutDomainUnits(op.view->segments()[(size_t)segnum], domains[(size_t)segnum]);
+        return FanoutSize{units, fanoutStealUnits(segnum, units)};
+      }, [&](size_t i) {
+        int32_t segnum = segmentAt(i);
         return [this, tg, segnum, domain = domains[(size_t)segnum]]() {
           assert(domain.isDeliverable());
           domain.assertScope(thisOp().view->segments()[(size_t)segnum]);
@@ -1894,7 +1892,7 @@ public:
     }
 
     template <bool Structural, bool MetricGroups = false, typename Admission = CollapseAdmission>
-    void doCollect(oneapi::tbb::task_group* tg, int32_t segnum,
+    void doCollect(FanoutScope* tg, int32_t segnum,
                    DomainHandle domainHandle) {
       if constexpr (Admission::isDiversified) {
         doCollectPolicy<Structural, true, false, Admission>(tg, segnum, std::move(domainHandle));
@@ -1906,12 +1904,31 @@ public:
       else doCollectPolicy<Structural, false>(tg, segnum, std::move(domainHandle));
     }
 
+    // Every ranking route, including count compositions and their fallbacks,
+    // must share the bound before ranked segments may fan out with pruning.
+    bool rankingSharesBound() const {
+      const auto& op = static_cast<const TopDocsReq&>(this->op);
+      return !op.sortPlan.useFieldSort
+          && !op.requirements.needExactDomain && op.domainVariants.empty()
+          && op.weight && !op.weight->isConstantScoring() && op.weight->allowsPruning()
+          && (!op.rankingWeight || op.rankingWeight->allowsPruning())
+          && (!op.wholeRankingWeight || op.wholeRankingWeight->allowsPruning())
+          && (!op.collapse || (!op.requirements.needsCount() && !disableCollapsePruningForTests));
+    }
+
+    MaxScoreAccumulator* checkedRankingBound(MaxScoreAccumulator* accumulator) {
+      // Check the actual argument at every ranking route. Segments with no
+      // scorer do no ranking and have no bound to share.
+      assert(!prunedFanout || accumulator == &scoreAccumulator || accumulator == &rankingAccumulator);
+      return accumulator;
+    }
+
     // One collection ladder, specialized once per segment. Document requests
     // instantiate their original admission loop without per-hit group checks.
     template <bool Structural, bool Collapsed, bool MetricGroups = false,
               typename Admission = CollapseAdmission>
     void doCollectPolicy(
-        oneapi::tbb::task_group* tg, int32_t segnum,
+        FanoutScope* tg, int32_t segnum,
         DomainHandle domainHandle) {
       auto& op = thisOp();
       assert(domainHandle.isDeliverable());
@@ -2108,6 +2125,7 @@ public:
             assert(rankFromDocOrder);
             assert(scoreCollector->topCount > 0);
             if (op.wholeConstantRanking) {
+              (void)checkedRankingBound(nullptr);
               int64_t ranked = 0;
               if (wholeMembershipResult.count > 0) {
                 Query::Scorer* scorer = nullptr;
@@ -2133,7 +2151,7 @@ public:
                 if (scorer != nullptr) {
                   ranked = collectFirstKConstant(
                       segnum, scorer, collectorFilter,
-                      *scoreCollector, scoreCollector->topCount);
+                      *scoreCollector, scoreCollector->topCount, checkedRankingBound(nullptr));
                 }
               }
               assert(wholeMembershipResult.count >= ranked);
@@ -2154,6 +2172,7 @@ public:
                   seg.maxDoc(), op.wholeRankingWeight->allowsPruning());
             }
           } else if (identityResult) {
+            (void)checkedRankingBound(nullptr);
             DocSet* identityDomain = wholeMembershipAvailable
                 ? wholeMembershipResult.docs.get()
                 : exactDomain
@@ -2189,7 +2208,7 @@ public:
               if (scorer != nullptr) {
                 ranked = collectFirstKConstant(
                     segnum, scorer, collectorFilter,
-                    *scoreCollector, data->topCount());
+                    *scoreCollector, data->topCount(), checkedRankingBound(nullptr));
               }
             }
             assert(total >= ranked);
@@ -2252,6 +2271,7 @@ public:
               }
             }
             if (counted) {
+              (void)checkedRankingBound(nullptr);
               // fall through to the sub-calc/merge tail below
             } else if (!Collapsed && routedDomainsReady && !data->useFieldSort
                        && op.requirements.needsCount()
@@ -2264,6 +2284,7 @@ public:
                   *scoreCollector, seg.maxDoc(),
                   op.weight->allowsPruning());
             } else if (data->useFieldSort) {
+              (void)checkedRankingBound(nullptr);
               // Ranking permission and completeness production are separate
               // facts. A known whole-membership card satisfies exact count, but
               // its borrowed set is not a produced sub-op domain.
@@ -2535,7 +2556,7 @@ public:
                   }
                   collectTopK(segnum, scorer, collectorFilter, builderPtr,
                               *fieldCollector,
-                              maySkipNoncompetitiveDocs, nullptr,
+                              maySkipNoncompetitiveDocs, checkedRankingBound(nullptr),
                               captureSharedRaw
                                   ? DomainBuildMode::RAW_QUERY_MATCHES
                                   : DomainBuildMode::FILTERED_MATCHES,
@@ -2645,6 +2666,7 @@ public:
                 // The separate count supplied the hit count and competitively
                 // pruned ranking.
               } else if (useSparseConstantPull) {
+                (void)checkedRankingBound(nullptr);
                 auto* scorer = buildPullScorer(poolGuard.pool(), *supplier);
                 if (scorer != nullptr) {
                   collectConstantTopKAndDomain(
@@ -2653,6 +2675,7 @@ public:
                 }
               } else if ((bulk = buildDeclaredBulk()) != nullptr) {
                 if (scoreCollector->topCount == 0) {
+                  (void)checkedRankingBound(nullptr);
                   // limit 0: the collector keeps nothing but the total, so count
                   // windows without materializing docs or scores.
                   collectCountWindowed(bulk, collectorFilter, builderPtr, *scoreCollector,
@@ -2673,7 +2696,7 @@ public:
                           ? ConstantScoreDrain::LIMIT_ONLY
                           : op.boundedCount ? ConstantScoreDrain::BOUNDED
                                             : ConstantScoreDrain::COMPLETE,
-                      op.boundedCount ? &scoreAccumulator : nullptr);
+                      checkedRankingBound(op.boundedCount ? &scoreAccumulator : nullptr));
                 } else if (!Collapsed && op.weight->isConstantScoring()) {
                   // In the test-forced arrangement, the bulk scorer drives the
                   // exhaustive count/domain and an independent scorer visits only
@@ -2686,7 +2709,7 @@ public:
                     if (captureScorer != nullptr) {
                       captured = collectFirstKConstant(
                           segnum, captureScorer, collectorFilter,
-                          *scoreCollector, scoreCollector->topCount);
+                          *scoreCollector, scoreCollector->topCount, checkedRankingBound(nullptr));
                     }
                   }
                   int64_t count = countMatchesWindowed(
@@ -2702,7 +2725,7 @@ public:
                 } else {
                   collectTopKWindowed(
                       segnum, bulk, collectorFilter, *scoreCollector,
-                      allowPruning ? &scoreAccumulator : nullptr,
+                      checkedRankingBound(allowPruning ? &scoreAccumulator : nullptr),
                       seg.maxDoc(), allowPruning);
                 }
               } else {
@@ -2721,12 +2744,12 @@ public:
                         segnum, scorer, collectorFilter,
                         *scoreCollector,
                         scoreCollector->topCount,
-                        op.boundedCount ? &scoreAccumulator : nullptr);
+                        checkedRankingBound(op.boundedCount ? &scoreAccumulator : nullptr));
                   } else {
                     collectTopK(
                         segnum, scorer, collectorFilter, builderPtr,
                         *scoreCollector, allowPruning,
-                        &scoreAccumulator,
+                        checkedRankingBound(&scoreAccumulator),
                         captureSharedRaw
                             ? DomainBuildMode::RAW_QUERY_MATCHES
                             : DomainBuildMode::FILTERED_MATCHES,
@@ -2950,7 +2973,7 @@ public:
       }
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DomainHandle domain) override {
+    void calc(FanoutScope* tg, int32_t segnum, DomainHandle domain) override {
       if constexpr (Structural) assert(tg == nullptr);
       assert(domain.isDeliverable());
       if (segnum < 0) {
@@ -2973,7 +2996,7 @@ public:
       prepareAndDispatch<Structural, MetricGroups, Admission>(tg);
     }
 
-    void calcAll(oneapi::tbb::task_group* tg, std::span<const DomainHandle> domains) override {
+    void calcAll(FanoutScope* tg, std::span<const DomainHandle> domains) override {
       if constexpr (Structural) assert(tg == nullptr);
       assert(domains.size() == thisOp().view->segments().size());
       if (domains.empty()) {

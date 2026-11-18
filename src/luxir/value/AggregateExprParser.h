@@ -33,6 +33,7 @@ struct AggregateExprOptions {
   int* nestingBudget = nullptr;
   FieldResolver* fieldResolver = nullptr;
   bool shareProducers = true;
+  ParseView* view = nullptr;
 };
 
 class AggregateExprParser {
@@ -266,6 +267,7 @@ private:
           if (argument == 0) {
             argumentStart = cur->position();
             ValueExprOptions valueOptions{opts.schema, opts.vars, budget, false, opts.fieldResolver, opts.opName};
+            valueOptions.view = opts.view;
             try {
               input = ValueExprParser(valueOptions, arena).parsePartial(*cur, function.natures);
             } catch (const std::runtime_error& error) {

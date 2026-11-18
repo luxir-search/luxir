@@ -299,6 +299,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
     };
     DocEmission emission = calc.underBucketSlot()
         ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
+    auto extra = qr.rowColumns();
 
     if (qr.diversify != nullptr) {
       fillDiversifyResponse(calc, *mergeableCollector);
@@ -321,7 +322,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission, {}, false, false, {}, qr.decorators);
+        emission, {}, false, false, extra, qr.decorators);
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();
@@ -349,7 +350,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission, {}, foundGte, foundEstimated, {}, qr.decorators);
+        emission, {}, foundGte, foundEstimated, extra, qr.decorators);
     }
   }
 

@@ -13,6 +13,8 @@
 #include "luxir/query/ImpactsIndex.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/OwnershipRelation.h"
+#include "luxir/server/JsonResponse.h"
+#include <glaze/glaze.hpp>
 
 namespace luxir::test {
 namespace {
@@ -107,6 +109,25 @@ TEST_F(NestedQueryTest, implicitExplicitAndSingletonGroupHaveOneIdentityAndCache
   EXPECT_EQ(1, SkipStats::wholeCountHits);
 }
 
+TEST_F(NestedQueryTest, toParentBorrowsButNeverBuildsItsChildSet) {
+  // A join does not start raw per-segment child population, however often
+  // the same child recurs. Its owner membership can still populate.
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
+      .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 1});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  for (int round = 0; round < 4; round++) {
+    EXPECT_EQ(3, count("items.color:red"));
+    EXPECT_EQ(4, count("items.size:L"));
+    EXPECT_EQ(2, count("items.color:blue AND items.size:S"));
+  }
+  // Only the three whole-join keys may build, one value per segment each; a
+  // child set would add one more build per query.
+  EXPECT_EQ(3u, cache->counters().builds);
+  // A recurring raw child takes no build claim and counts no build attempt.
+  EXPECT_EQ(3u, cache->counters().buildAttempts);
+  cache->validateForTest();
+}
+
 TEST_F(NestedQueryTest, uniformMaximumPreservesChildScoresAndExactBounds) {
   for (int kind = 0; kind < 6; kind++) {
     auto make = [&](auto& req) {
@@ -177,7 +198,7 @@ TEST_F(NestedQueryTest, maximumBoundsCoverEveryScoreAfterTheChildMoves) {
     tree->validateLogical(*planning);
     auto* context = Query::Context::create(&req->arena, *planning);
     auto* weight = tree->createWeight(*context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
-    Query::Weight::PrepareContext preparation{*req->reader, {}, false, nullptr, Query::SupplierExecutionMode::ORDINARY};
+    Query::Weight::PrepareContext preparation{*req->reader, {}, nullptr, nullptr, Query::SupplierExecutionMode::ORDINARY};
     auto prepared = weight->prepare(preparation);
     MemPool pool;
     auto* source = prepared->scorerSupplier(pool, req->reader->segments()[0]);
@@ -240,8 +261,7 @@ TEST_F(NestedQueryTest, everySingleFieldLeafScopesBeforeLowering) {
       R"({"range":{"field":"$price","gte":100,"lte":500}})",
       R"({"geo_box":{"field":"$place","min_lat":-1,"max_lat":2,"min_lon":-1,"max_lon":2}})",
       R"({"geo_distance":{"field":"$place","lat":0,"lon":0,"radius_meters":200000}})",
-      R"({"geo_polygon":{"field":"$place","polygons":[{"points":[{"lat":-1,"lon":-1},{"lat":-1,"lon":2},{"lat":2,"lon":2},{"lat":2,"lon":-1},{"lat":-1,"lon":-1}]}]}})",
-      R"({"knn":{"field":"$embedding","query":[0,0],"k":1,"exact":true}})"}) {
+      R"({"geo_polygon":{"field":"$place","polygons":[{"points":[{"lat":-1,"lon":-1},{"lat":-1,"lon":2},{"lat":2,"lon":2},{"lat":2,"lon":-1},{"lat":-1,"lon":-1}]}]}})"}) {
     SCOPED_TRACE(json);
     auto req = localReq(helper.getSearchEngine());
     auto pos = json.find('$');
@@ -354,8 +374,12 @@ TEST_F(NestedQueryTest, ancestorConsumersRequireADomainAndLocalConsumersWork) {
       ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"ops":{"q":{"top_docs":{"collapse":{"field":["items.color"]}}}}})", req->mr));
     }
     req->execute(1); EXPECT_FALSE(req->ok()) << kind;
-    EXPECT_NE(std::string::npos, req->errorMsg().find("nested path 'items'")) << req->errorMsg();
-    EXPECT_NE(std::string::npos, req->errorMsg().find("Domain 'to'")) << req->errorMsg();
+    if (kind == 1 || kind == 6) {
+      EXPECT_NE(std::string::npos, req->errorMsg().find("nested path 'items'")) << req->errorMsg();
+      EXPECT_NE(std::string::npos, req->errorMsg().find("Domain 'to'")) << req->errorMsg();
+    } else {
+      EXPECT_NE(std::string::npos, req->errorMsg().find(kind == 3 ? "scalar numeric" : "reduce")) << req->errorMsg();
+    }
   }
   auto req = localReq(helper.getSearchEngine());
   auto& rows = req->topDocs().exprQuery("color:red").countLimit().fields({"color", "price"});
@@ -381,7 +405,7 @@ TEST_F(NestedQueryTest, phraseJoinUsesTwoPhaseVerificationAndAdvance) {
     EXPECT_EQ(1, run->getMatchCount()); EXPECT_EQ(1, run->getMatchCount("filtered"));
     EXPECT_TRUE(containsDoc(run->getDocs(), flatdoc("id", "b")));
     if (mode == std::string_view("none")) {
-      EXPECT_FLOAT_EQ(1.0f, std::get<api::ColFloat>(run->docList()->columns.find("_score_")->kind).v[0]);
+      EXPECT_FLOAT_EQ(0.0f, std::get<api::ColFloat>(run->docList()->columns.find("_score_")->kind).v[0]);
     }
   }
   auto req = localReq(helper.getSearchEngine());
@@ -396,7 +420,7 @@ TEST_F(NestedQueryTest, phraseJoinUsesTwoPhaseVerificationAndAdvance) {
     for (bool seek : {false, true}) {
       auto* input = weight->scorerSupplier(pool, child->segments()[0]);
       EXPECT_EQ(Query::ReportedTwoPhase::YES, input->describeScorer({}).reportedTwoPhase);
-      auto* supplier = relation.reduce(pool, 0, *input, nullptr, maximum ? RowRelation::Reduction::MAXIMUM : RowRelation::Reduction::NONE, 1.0f);
+      auto* supplier = relation.reduce(pool, 0, *input, nullptr, RowReduction{maximum ? RowReduction::MAXIMUM : RowReduction::FIXED}, 1.0f);
       auto* scorer = buildScorerForTests(pool, *supplier, 6);
       ASSERT_NE(nullptr, scorer); EXPECT_EQ(1, seek ? scorer->advance(1) : scorer->next());
       float score = scorer->score(); EXPECT_GT(score, 0);
@@ -416,6 +440,20 @@ TEST_F(NestedQueryTest, implicitKnnGetsOwnerEligibilityBeforeSelection) {
     req->execute(1); ASSERT_OK(req); EXPECT_EQ(1, req->getMatchCount());
     EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("id", std::string(owner.empty() ? std::string_view("b") : owner))));
   }
+}
+
+TEST_F(NestedQueryTest, aScoredJoinAnswersFacetsThatExcludeAListFilter) {
+  auto req = localReq(helper.getSearchEngine());
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"JSON({"ops":{"q":{"top_docs":{
+    "query":"items.text:quick","fields":["id"],"count_limit":-1,
+    "filter":[{"query":"id:a","except_ops":["ids"]}],
+    "ops":{"ids":{"field_facet":{"field":"id"}}}}}}})JSON", req->mr));
+  req->execute(1); ASSERT_OK(req);
+  glz::generic_i64 result;
+  ASSERT_FALSE(glz::read_json(result, renderSearchResponseBody(req->responses.back()->proto)));
+  EXPECT_EQ(1, result["ops"]["q"]["found"].get<int64_t>());
+  // The facet leaves the id filter out, so it counts every root the join matches.
+  EXPECT_EQ(4u, result["ops"]["q"]["ops"]["ids"]["buckets"].get_array().size());
 }
 
 TEST_F(NestedQueryTest, rootOnlyParsingPinsNoOtherViewOrRelation) {

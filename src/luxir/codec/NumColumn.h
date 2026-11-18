@@ -65,6 +65,11 @@ public:
     return nValues;
   }
 
+  // Packed payload, alignment and block directory; excludes optional zones.
+  uint64_t blockBytes() const {
+    return (uint64_t)(blockMeta - blocks) + (uint64_t)numBlocks() * sizeof(NumBlockInfo);
+  }
+
   int64_t numBlocks() const {
     return (nValues + BLOCK_SIZE - 1) / BLOCK_SIZE;
   }

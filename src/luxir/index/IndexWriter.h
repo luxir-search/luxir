@@ -20,7 +20,7 @@
 #include "luxir/util/ApiError.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/store/Directory.h"
-#include "luxir/store/IncarnationState.h"
+#include "luxir/store/Manifest.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/search/ReaderManager.h"
 #include "luxir/server/LuxirError.h"
@@ -552,6 +552,10 @@ public:
   // use a multfunction node when there is no downstream consumer (i.e. the output is dropped or can be dropped)
   // using a normal function node would cause buffering.
 
+  // The graph outlives whatever task first uses it (a collection is built
+  // inside a shared lazy build's short-lived group), so its cancellation
+  // context must not bind to that task's context as a parent.
+  tbb::task_group_context updateContext{tbb::task_group_context::isolated};
   // A flow graph runs its tasks in the arena it is constructed in, so the ctor
   // emplaces it inside the writer's arena.
   std::optional<tbb::flow::graph> updateGraph;
@@ -592,11 +596,13 @@ public:
   // A nonnull schema is for creation only; reopening loads the manifest schema.
   // arena runs the writer's batches, flushes and merges (the node's index
   // arena, for a collection); null means the arena of the constructing thread.
-  // A supplied claim was established by the caller after checking its catalog.
+  // `opened` owns a claim established after checking the caller's catalog and
+  // the root loaded under it from this directory, including any listing. The
+  // writer consumes it; without one, it claims and loads the root itself.
   explicit IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
                        int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {},
-                       oneapi::tbb::task_arena* arena = nullptr, std::optional<IncarnationState> claimed = {});
+                       oneapi::tbb::task_arena* arena = nullptr, std::optional<WriterOpen> opened = {});
   ~IndexWriter();
   void close();
 
