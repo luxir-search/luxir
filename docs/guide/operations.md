@@ -585,7 +585,7 @@ With `collections=true`:
 | `luxir_collection_index_batches_total`, `luxir_collection_index_batch_seconds_total` | The collection's index batches by `outcome`, and their summed processing time. |
 | `luxir_collection_documents_total`, `luxir_collection_delete_ids_total` | Documents the collection accepted or rejected, and its accepted delete IDs. |
 | `luxir_inverters`, `luxir_merge_tasks` | Busy, idle, and flushing inverters; outstanding merge work includes queued tasks. |
-| `luxir_filter_cache_*` | Hit/miss counters, build attempts, builds, dead builds, build/served-build/dead-build time, thrash skips, admissions, rejections, evictions, purges, bypasses, reader-stable counters, payload/metadata memory, and payload budget. |
+| `luxir_filter_cache_*` | Resident/ordinary uses, build attempts, builds, estimated savings, unrepaid evictions and time, ledger deferrals and outstanding debt, assumed/quoted ledger events, admissions, rejections, evictions, purges, bypasses, reader-stable counters, payload/metadata memory, and payload budget. |
 | `luxir_snapshot_pins`, `luxir_snapshot_retained_bytes`, `luxir_snapshot_pin_drops_total` | Current pins, retired files held only by pins, and pins dropped by `reason` (idle, budget). A stats request never expires pins or removes files. |
 
 Counters reset when their owner restarts. Collection cache counters also reset
@@ -862,14 +862,33 @@ Search has its own limits:
   Cache counters appear in `_stats?collections=true` (and on the collection
   and tenant `_stats` routes). Date ranges with an unrounded `NOW` bound are
   never cached; see [Dates](dates.md#date-math).
-  Stats report claimed build time in `build_us`, build time served by shared
-  hits in `served_build_us`, and zero-hit eviction build time in `dead_build_us`.
-  Their Prometheus equivalents are `luxir_filter_cache_build_seconds_total`,
-  `luxir_filter_cache_served_build_seconds_total`, and
-  `luxir_filter_cache_dead_build_seconds_total`, respectively. Served build time
-  is an upper bound on time saved. Claimed time includes rejected publications
-  and excludes byproducts; cache-control dumps report resident build time
-  and recent use counts.
+  `hits` counts shared serves and `misses` counts ordinary uses, each once per
+  request, key and segment (or whole-reader value); a look counts neither.
+  A request that builds counts as an ordinary use. Prometheus exposes these as
+  `luxir_filter_cache_uses_total{route="resident"}` and `{route="ordinary"}`.
+  Tracked keys accumulate ordinary work in units of their own full production.
+  Population requires owed work of at least one plus the unpaid build debt;
+  completion spends owed work, adds one debt unit and serves repay it.
+  Unpriced consumers assume one unit; pending quotes are finalized later.
+  Borrowing uses repay serves but never charge or populate.
+  `build_us` counts claimed production, including rejected publications and
+  excluding byproducts. `estimated_saved_us` sums credited work times reference
+  production time; assumed credits are estimates, not measured savings.
+  `unrepaid_evictions` counts capacity evictions credited less than one unit
+  since production, and `unpaid_build_us` sums their unpaid production time.
+  `population_deferred` counts tracked population uses below the ledger
+  threshold, once per request and value unit. `assumed_charges`,
+  `quoted_charges`, `assumed_credits` and `quoted_credits` count ledger events by
+  source. `outstanding_debt_us` is a gauge of unpaid investment and survives
+  counter resets. Prometheus time counters use seconds and the corresponding
+  `luxir_filter_cache_*_seconds_total` names; outstanding debt uses
+  `luxir_filter_cache_outstanding_debt_seconds`.
+  Cache-control dumps include per-value owed work, debt, credit, reference time
+  and bytes. `include_ghosts` includes retained ledgers without a payload.
+  A flush drops values and metadata, including ledgers, while keeping sightings,
+  so a known query is readmitted and rebuilds immediately. Flush with
+  `reset_admission` also forgets sightings and restarts admission tracking.
+  Metadata retirement and disabling the cache discard ledgers.
   The gRPC `Admin/CacheControl` call's `max_bytes` (administration only)
   changes the budget at runtime: a shrink evicts down to the new budget, a
   grow evicts nothing, and `0` disables the cache and drops its entries.

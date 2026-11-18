@@ -3169,6 +3169,9 @@ TEST_F(KnnQueryTest, wholeReaderRefreshAndDeleteOnlyRefreshRebuild) {
             run());
   EXPECT_EQ(beforeRefreshBuild.readerStableRefreshes + 1,
             cache->counters().readerStableRefreshes);
+  // Repay this reader's production before testing a second refresh.
+  EXPECT_EQ((std::vector<std::string>{"d0", "d1", "d2", "d3", "d4", "d5"}),
+            run());
 
   std::vector<std::string> deletes{"d0"};
   h.deleteByIds(deletes, UpdateMessage::COMMIT);

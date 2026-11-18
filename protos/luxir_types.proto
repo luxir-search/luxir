@@ -2226,6 +2226,8 @@ message QueryCacheStats {
   uint64 max_bytes = 2;
   uint64 resident_bytes = 3;
   uint64 metadata_bytes = 4;
+  // Shared serves and ordinary uses, each once per request, key and value unit.
+  // An inert look counts neither; an absent build probe counts as an ordinary use.
   uint64 hits = 5;
   uint64 misses = 6;
   uint64 admissions = 7;
@@ -2239,19 +2241,25 @@ message QueryCacheStats {
   uint64 reader_stable_refreshes = 15;
   uint64 reader_stable_retires = 16;
   uint64 build_attempts = 17;
-  uint64 capacity_dead_builds = 18;
-  uint64 thrash_build_skips = 19;
-  uint64 reader_dead_builds = 20;
-  uint64 reader_thrash_build_skips = 21;
+  // Capacity evictions of claimed builds credited less than one production.
+  uint64 unrepaid_evictions = 18;
+  // Tracked population uses whose owed work did not cover 1 + debt.
+  uint64 population_deferred = 19;
+  uint64 assumed_charges = 20;
+  uint64 quoted_charges = 21;
   // Build time of claimed cache builds, including rejected publications,
   // in microseconds. Excludes byproducts.
   uint64 build_us = 22;
-  // Build time of values served as shared hits, in microseconds.
-  // An upper bound on time saved, not measured savings.
-  uint64 served_build_us = 23;
-  // Build time of zero-hit capacity evictions that install bypass debt,
-  // in microseconds.
-  uint64 dead_build_us = 24;
+  // Estimated saved time: each credited fraction times its reference build
+  // time, in microseconds. Assumed credits are one, not measured savings.
+  uint64 estimated_saved_us = 23;
+  // Uncredited portion of claimed builds at capacity eviction, in microseconds.
+  uint64 unpaid_build_us = 24;
+  uint64 assumed_credits = 25;
+  uint64 quoted_credits = 26;
+  // Current unpaid investment, weighted by each ledger's reference time.
+  // A gauge, in microseconds; reset_counters does not change it.
+  uint64 outstanding_debt_us = 27;
 }
 
 // Indexing RAM budget: the configured limit and the bytes reserved against it.
@@ -2298,10 +2306,10 @@ message ArenaStats {
 
 // Admin control over the per-collection query cache. Actions compose and
 // apply in this order: max_bytes, flush, reset_admission, reset_counters, then dump.
-// flush drops resident values and entry metadata; sighting history survives,
-// so a known query can be readmitted and rebuilt immediately.
+// flush drops resident values and entry metadata, including ledgers; sighting
+// history survives, so a known query can be readmitted and rebuilt immediately.
 // flush + reset_admission also forgets sightings, restarting admission
-// tracking. reset_counters zeroes the cumulative stats.
+// tracking. reset_counters zeroes cumulative stats without forgiving debt.
 // An empty collection targets every collection.
 message CacheControlRequest {
   // Empty selects every collection of `tenant`, or of every tenant when
@@ -2314,6 +2322,7 @@ message CacheControlRequest {
   bool reset_counters = 4;
   bool dump = 5;
   uint32 dump_limit = 6;  // max dump rows per shard; 0 = 100
+  bool include_ghosts = 9;  // with dump, include retained ledgers without payloads
   // Administration only. Sets the selected caches' byte budget before the
   // other actions; 0 disables caching and drops entries. With collection and
   // tenant both empty it is also the budget for collections created later.
@@ -2322,7 +2331,22 @@ message CacheControlRequest {
   optional uint64 max_bytes = 8;
 }
 
-// One resident cache entry. key_text is the printable-byte extraction from
+// A segment slot or whole-reader entry, including optional payload-free ledgers.
+message CacheValueDump {
+  uint64 seg_id = 1;
+  uint32 space = 2;
+  int32 max_doc = 3;
+  uint64 reader_version = 4;
+  bool resident = 5;
+  double owed = 6;
+  double debt = 7;
+  // Credit total for a resident payload; zero when no payload is present.
+  double credited_total = 8;
+  uint64 reference_us = 9;
+  uint64 reference_bytes = 10;
+}
+
+// One cache key, with resident values or retained ledgers. key_text is the printable-byte extraction from
 // the serialized key (field names and terms survive; structure bytes do
 // not); key_hash is a diagnostic fingerprint. bytes counts resident value
 // payloads; segments_resident counts slots currently holding a value;
@@ -2341,6 +2365,7 @@ message CacheEntryDump {
   uint64 build_us = 10;
   // Current key uses in the admission window, taking the max of the two lanes.
   uint32 recent_uses = 11;
+  repeated CacheValueDump values = 12;
 }
 
 message ShardCacheControl {

@@ -142,20 +142,22 @@ void cache(Renderer& r, const api::QueryCacheStats& c, const std::string& labels
   r.gauge("luxir_filter_cache_resident_bytes", "Resident filter-cache payload bytes.", (double)c.resident_bytes, labels);
   r.gauge("luxir_filter_cache_metadata_bytes", "Filter-cache metadata bytes.", (double)c.metadata_bytes, labels);
   r.gauge("luxir_filter_cache_budget_bytes", "Filter-cache payload budget; zero disables caching.", (double)c.max_bytes, labels);
-  constexpr std::string_view lookups = "Shared filter-cache lookups; reset by cache-control reset_counters.";
-  r.counter("luxir_filter_cache_lookups_total", lookups, (double)c.hits, labels + ",result=\"hit\"");
-  r.counter("luxir_filter_cache_lookups_total", lookups, (double)c.misses, labels + ",result=\"miss\"");
+  constexpr std::string_view uses = "Membership uses, once per request, key and value unit; looks excluded. Reset by cache-control reset_counters.";
+  r.counter("luxir_filter_cache_uses_total", uses, (double)c.hits, labels + ",route=\"resident\"");
+  r.counter("luxir_filter_cache_uses_total", uses, (double)c.misses, labels + ",route=\"ordinary\"");
   for (auto [name, value] : {std::pair{"builds", c.builds}, {"evictions", c.evictions}, {"purges", c.purges},
       {"admissions", c.admissions}, {"publish_rejects", c.publish_rejects}, {"oversized_key_bypasses", c.oversized_key_bypasses},
       {"build_attempts", c.build_attempts}, {"byproduct_inserts", c.byproduct_inserts},
-      {"dead_builds", c.capacity_dead_builds}, {"thrash_skips", c.thrash_build_skips},
-      {"reader_dead_builds", c.reader_dead_builds}, {"reader_thrash_skips", c.reader_thrash_build_skips},
+      {"unrepaid_evictions", c.unrepaid_evictions}, {"population_deferred", c.population_deferred},
+      {"assumed_charges", c.assumed_charges}, {"quoted_charges", c.quoted_charges},
+      {"assumed_credits", c.assumed_credits}, {"quoted_credits", c.quoted_credits},
       {"reader_stable_hits", c.reader_stable_hits}, {"reader_stable_refreshes", c.reader_stable_refreshes},
       {"reader_stable_retires", c.reader_stable_retires}})
     r.counter(std::string("luxir_filter_cache_") + name + "_total", "Filter-cache events; reset by cache-control reset_counters.", (double)value, labels);
-  r.counter("luxir_filter_cache_build_seconds_total", "Build time of claimed cache builds, including rejected publications; excludes byproducts. Reset by cache-control reset_counters.", (double)c.build_us / 1e6, labels);
-  r.counter("luxir_filter_cache_served_build_seconds_total", "Build time of values served as shared hits; an upper bound on time saved. Reset by cache-control reset_counters.", (double)c.served_build_us / 1e6, labels);
-  r.counter("luxir_filter_cache_dead_build_seconds_total", "Build time of zero-hit capacity evictions that install bypass debt. Reset by cache-control reset_counters.", (double)c.dead_build_us / 1e6, labels);
+  r.counter("luxir_filter_cache_build_seconds_total", "Claimed build time, including rejected publications; excludes byproducts. Reset by cache-control reset_counters.", (double)c.build_us / 1e6, labels);
+  r.counter("luxir_filter_cache_estimated_saved_seconds_total", "Credits times their reference production time; assumed credits are one. Reset by cache-control reset_counters.", (double)c.estimated_saved_us / 1e6, labels);
+  r.counter("luxir_filter_cache_unpaid_build_seconds_total", "Uncredited claimed build time at capacity eviction. Reset by cache-control reset_counters.", (double)c.unpaid_build_us / 1e6, labels);
+  r.gauge("luxir_filter_cache_outstanding_debt_seconds", "Outstanding investment weighted by reference production time.", (double)c.outstanding_debt_us / 1e6, labels);
 }
 
 void collectionActivity(Renderer& r, const api::CollectionActivityStats& a, const std::string& labels) {

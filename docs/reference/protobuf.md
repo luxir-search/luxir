@@ -80,6 +80,7 @@ defaults and constraints are described in the comments and guides.
 - [`CacheControlRequest`](#message-luxir.cachecontrolrequest)
 - [`CacheControlResponse`](#message-luxir.cachecontrolresponse)
 - [`CacheEntryDump`](#message-luxir.cacheentrydump)
+- [`CacheValueDump`](#message-luxir.cachevaluedump)
 - [`CalendarGap`](#message-luxir.calendargap)
 - [`CgroupCpuStats`](#message-luxir.cgroupcpustats)
 - [`CgroupMemoryStats`](#message-luxir.cgroupmemorystats)
@@ -458,7 +459,7 @@ A list of vectors, used as a per-doc cell for multi-valued vector fields.
 
 ### luxir.CacheControlRequest
 
-Admin control over the per-collection query cache. Actions compose and apply in this order: max\_bytes, flush, reset\_admission, reset\_counters, then dump. flush drops resident values and entry metadata; sighting history survives, so a known query can be readmitted and rebuilt immediately. flush + reset\_admission also forgets sightings, restarting admission tracking. reset\_counters zeroes the cumulative stats. An empty collection targets every collection.
+Admin control over the per-collection query cache. Actions compose and apply in this order: max\_bytes, flush, reset\_admission, reset\_counters, then dump. flush drops resident values and entry metadata, including ledgers; sighting history survives, so a known query can be readmitted and rebuilt immediately. flush + reset\_admission also forgets sightings, restarting admission tracking. reset\_counters zeroes cumulative stats without forgiving debt. An empty collection targets every collection.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -471,6 +472,7 @@ Admin control over the per-collection query cache. Actions compose and apply in 
 | <a id="field-luxir.cachecontrolrequest.reset_counters"></a>[`reset_counters`](#field-luxir.cachecontrolrequest.reset_counters) | 4 | `bool` | singular |  |
 | <a id="field-luxir.cachecontrolrequest.dump"></a>[`dump`](#field-luxir.cachecontrolrequest.dump) | 5 | `bool` | singular |  |
 | <a id="field-luxir.cachecontrolrequest.dump_limit"></a>[`dump_limit`](#field-luxir.cachecontrolrequest.dump_limit) | 6 | `uint32` | singular | max dump rows per shard; 0 = 100 |
+| <a id="field-luxir.cachecontrolrequest.include_ghosts"></a>[`include_ghosts`](#field-luxir.cachecontrolrequest.include_ghosts) | 9 | `bool` | singular | with dump, include retained ledgers without payloads |
 | <a id="field-luxir.cachecontrolrequest.max_bytes"></a>[`max_bytes`](#field-luxir.cachecontrolrequest.max_bytes) | 8 | `uint64` | optional | Administration only. Sets the selected caches' byte budget before the other actions; 0 disables caching and drops entries. With collection and tenant both empty it is also the budget for collections created later. Lasts for the node session: kept when a collection is replaced, dropped when it is deleted, back to --query-cache-bytes on restart. |
 
 <a id="message-luxir.cachecontrolresponse"></a>
@@ -487,7 +489,7 @@ Admin control over the per-collection query cache. Actions compose and apply in 
 
 ### luxir.CacheEntryDump
 
-One resident cache entry. key\_text is the printable-byte extraction from the serialized key (field names and terms survive; structure bytes do not); key\_hash is a diagnostic fingerprint. bytes counts resident value payloads; segments\_resident counts slots currently holding a value; reader\_value marks a whole-reader live-exact value.
+One cache key, with resident values or retained ledgers. key\_text is the printable-byte extraction from the serialized key (field names and terms survive; structure bytes do not); key\_hash is a diagnostic fingerprint. bytes counts resident value payloads; segments\_resident counts slots currently holding a value; reader\_value marks a whole-reader live-exact value.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -504,6 +506,28 @@ One resident cache entry. key\_text is the printable-byte extraction from the se
 | <a id="field-luxir.cacheentrydump.last_used_epoch"></a>[`last_used_epoch`](#field-luxir.cacheentrydump.last_used_epoch) | 9 | `uint64` | singular |  |
 | <a id="field-luxir.cacheentrydump.build_us"></a>[`build_us`](#field-luxir.cacheentrydump.build_us) | 10 | `uint64` | singular | Summed build time of this entry's resident values, in microseconds. |
 | <a id="field-luxir.cacheentrydump.recent_uses"></a>[`recent_uses`](#field-luxir.cacheentrydump.recent_uses) | 11 | `uint32` | singular | Current key uses in the admission window, taking the max of the two lanes. |
+| <a id="field-luxir.cacheentrydump.values"></a>[`values`](#field-luxir.cacheentrydump.values) | 12 | [`CacheValueDump`](#message-luxir.cachevaluedump) | repeated |  |
+
+<a id="message-luxir.cachevaluedump"></a>
+
+### luxir.CacheValueDump
+
+A segment slot or whole-reader entry, including optional payload-free ledgers.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.cachevaluedump.seg_id"></a>[`seg_id`](#field-luxir.cachevaluedump.seg_id) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.cachevaluedump.space"></a>[`space`](#field-luxir.cachevaluedump.space) | 2 | `uint32` | singular |  |
+| <a id="field-luxir.cachevaluedump.max_doc"></a>[`max_doc`](#field-luxir.cachevaluedump.max_doc) | 3 | `int32` | singular |  |
+| <a id="field-luxir.cachevaluedump.reader_version"></a>[`reader_version`](#field-luxir.cachevaluedump.reader_version) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.cachevaluedump.resident"></a>[`resident`](#field-luxir.cachevaluedump.resident) | 5 | `bool` | singular |  |
+| <a id="field-luxir.cachevaluedump.owed"></a>[`owed`](#field-luxir.cachevaluedump.owed) | 6 | `double` | singular |  |
+| <a id="field-luxir.cachevaluedump.debt"></a>[`debt`](#field-luxir.cachevaluedump.debt) | 7 | `double` | singular |  |
+| <a id="field-luxir.cachevaluedump.credited_total"></a>[`credited_total`](#field-luxir.cachevaluedump.credited_total) | 8 | `double` | singular | Credit total for a resident payload; zero when no payload is present. |
+| <a id="field-luxir.cachevaluedump.reference_us"></a>[`reference_us`](#field-luxir.cachevaluedump.reference_us) | 9 | `uint64` | singular |  |
+| <a id="field-luxir.cachevaluedump.reference_bytes"></a>[`reference_bytes`](#field-luxir.cachevaluedump.reference_bytes) | 10 | `uint64` | singular |  |
 
 <a id="message-luxir.calendargap"></a>
 
@@ -1895,7 +1919,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.querycachestats.max_bytes"></a>[`max_bytes`](#field-luxir.querycachestats.max_bytes) | 2 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.resident_bytes"></a>[`resident_bytes`](#field-luxir.querycachestats.resident_bytes) | 3 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.metadata_bytes"></a>[`metadata_bytes`](#field-luxir.querycachestats.metadata_bytes) | 4 | `uint64` | singular |  |
-| <a id="field-luxir.querycachestats.hits"></a>[`hits`](#field-luxir.querycachestats.hits) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.hits"></a>[`hits`](#field-luxir.querycachestats.hits) | 5 | `uint64` | singular | Shared serves and ordinary uses, each once per request, key and value unit. An inert look counts neither; an absent build probe counts as an ordinary use. |
 | <a id="field-luxir.querycachestats.misses"></a>[`misses`](#field-luxir.querycachestats.misses) | 6 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.admissions"></a>[`admissions`](#field-luxir.querycachestats.admissions) | 7 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.builds"></a>[`builds`](#field-luxir.querycachestats.builds) | 8 | `uint64` | singular |  |
@@ -1908,13 +1932,16 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.querycachestats.reader_stable_refreshes"></a>[`reader_stable_refreshes`](#field-luxir.querycachestats.reader_stable_refreshes) | 15 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.reader_stable_retires"></a>[`reader_stable_retires`](#field-luxir.querycachestats.reader_stable_retires) | 16 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.build_attempts"></a>[`build_attempts`](#field-luxir.querycachestats.build_attempts) | 17 | `uint64` | singular |  |
-| <a id="field-luxir.querycachestats.capacity_dead_builds"></a>[`capacity_dead_builds`](#field-luxir.querycachestats.capacity_dead_builds) | 18 | `uint64` | singular |  |
-| <a id="field-luxir.querycachestats.thrash_build_skips"></a>[`thrash_build_skips`](#field-luxir.querycachestats.thrash_build_skips) | 19 | `uint64` | singular |  |
-| <a id="field-luxir.querycachestats.reader_dead_builds"></a>[`reader_dead_builds`](#field-luxir.querycachestats.reader_dead_builds) | 20 | `uint64` | singular |  |
-| <a id="field-luxir.querycachestats.reader_thrash_build_skips"></a>[`reader_thrash_build_skips`](#field-luxir.querycachestats.reader_thrash_build_skips) | 21 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.unrepaid_evictions"></a>[`unrepaid_evictions`](#field-luxir.querycachestats.unrepaid_evictions) | 18 | `uint64` | singular | Capacity evictions of claimed builds credited less than one production. |
+| <a id="field-luxir.querycachestats.population_deferred"></a>[`population_deferred`](#field-luxir.querycachestats.population_deferred) | 19 | `uint64` | singular | Tracked population uses whose owed work did not cover 1 + debt. |
+| <a id="field-luxir.querycachestats.assumed_charges"></a>[`assumed_charges`](#field-luxir.querycachestats.assumed_charges) | 20 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.quoted_charges"></a>[`quoted_charges`](#field-luxir.querycachestats.quoted_charges) | 21 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.build_us"></a>[`build_us`](#field-luxir.querycachestats.build_us) | 22 | `uint64` | singular | Build time of claimed cache builds, including rejected publications, in microseconds. Excludes byproducts. |
-| <a id="field-luxir.querycachestats.served_build_us"></a>[`served_build_us`](#field-luxir.querycachestats.served_build_us) | 23 | `uint64` | singular | Build time of values served as shared hits, in microseconds. An upper bound on time saved, not measured savings. |
-| <a id="field-luxir.querycachestats.dead_build_us"></a>[`dead_build_us`](#field-luxir.querycachestats.dead_build_us) | 24 | `uint64` | singular | Build time of zero-hit capacity evictions that install bypass debt, in microseconds. |
+| <a id="field-luxir.querycachestats.estimated_saved_us"></a>[`estimated_saved_us`](#field-luxir.querycachestats.estimated_saved_us) | 23 | `uint64` | singular | Estimated saved time: each credited fraction times its reference build time, in microseconds. Assumed credits are one, not measured savings. |
+| <a id="field-luxir.querycachestats.unpaid_build_us"></a>[`unpaid_build_us`](#field-luxir.querycachestats.unpaid_build_us) | 24 | `uint64` | singular | Uncredited portion of claimed builds at capacity eviction, in microseconds. |
+| <a id="field-luxir.querycachestats.assumed_credits"></a>[`assumed_credits`](#field-luxir.querycachestats.assumed_credits) | 25 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.quoted_credits"></a>[`quoted_credits`](#field-luxir.querycachestats.quoted_credits) | 26 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.outstanding_debt_us"></a>[`outstanding_debt_us`](#field-luxir.querycachestats.outstanding_debt_us) | 27 | `uint64` | singular | Current unpaid investment, weighted by each ledger's reference time. A gauge, in microseconds; reset\_counters does not change it. |
 
 <a id="message-luxir.queryfacet"></a>
 

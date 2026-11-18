@@ -10,11 +10,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -90,6 +92,7 @@ class FilterCache {
   struct ActiveSnapshot;
   struct FilterEntry;
   struct SegmentSlot;
+  struct Ledger;
 
 public:
   class Use;
@@ -107,6 +110,30 @@ public:
     BORROW_ONLY
   };
 
+  class Fraction {
+  public:
+    enum class Tag : uint8_t { ASSUMED, QUOTED };
+
+  private:
+    double amount;
+    Tag tag;
+    constexpr Fraction(double amount, Tag tag) : amount(amount), tag(tag) {}
+
+  public:
+    static constexpr Fraction assumed() { return Fraction(1, Tag::ASSUMED); }
+    // An unfinished quote neither charges a miss nor credits a hit.
+    static constexpr Fraction quoted() { return Fraction(-1, Tag::QUOTED); }
+    static Fraction quoted(double amount) {
+      if (!std::isfinite(amount) || amount < 0) {
+        throw std::invalid_argument("cache work fraction must be finite and nonnegative");
+      }
+      return Fraction(amount, Tag::QUOTED);
+    }
+    bool known() const { return amount >= 0; }
+    bool isAssumed() const { return tag == Tag::ASSUMED; }
+    double value() const { assert(known()); return amount; }
+  };
+
   struct SegmentIdentity {
     uint64_t segId;
     int32_t maxDoc;
@@ -122,20 +149,23 @@ public:
     uint64_t buildAttempts = 0;
     uint64_t builds = 0;
     uint64_t buildNanos = 0;
-    uint64_t servedBuildNanos = 0;
-    uint64_t deadBuildNanos = 0;
+    uint64_t estimatedSavedNanos = 0;
+    uint64_t unpaidBuildNanos = 0;
     uint64_t byproductInserts = 0;
     uint64_t publishRejects = 0;
     uint64_t evictions = 0;
-    uint64_t capacityDeadBuilds = 0;
-    uint64_t thrashBuildSkips = 0;
-    uint64_t readerDeadBuilds = 0;
-    uint64_t readerThrashBuildSkips = 0;
+    uint64_t unrepaidEvictions = 0;
+    uint64_t populationDeferred = 0;
     uint64_t purges = 0;
     uint64_t oversizedKeyBypasses = 0;
     uint64_t readerStableHits = 0;
     uint64_t readerStableRefreshes = 0;
     uint64_t readerStableRetires = 0;
+    uint64_t assumedCharges = 0;
+    uint64_t quotedCharges = 0;
+    uint64_t assumedCredits = 0;
+    uint64_t quotedCredits = 0;
+    uint64_t outstandingDebtNanos = 0;
     size_t residentBytes = 0;
     size_t metadataBytes = 0;
 
@@ -150,7 +180,7 @@ public:
   // lane uses, not requests or time: requests with many filters shorten it.
   // A key outside both windows ranks as plain GDS. Metadata eviction uses GDS.
   // Hits only store when the clock moved; concurrent relaxed touches remain a
-  // benign approximation. cacheHits is solely the zero-hit backoff signal.
+  // benign approximation. Credits repay the metadata ledger independently.
   static void updateTouchClock(std::atomic<double>& clock, double next) {
     if (clock.load(std::memory_order_relaxed) != next) {
       clock.store(next, std::memory_order_relaxed);
@@ -176,8 +206,7 @@ public:
     uint64_t buildCostNanos;
     const bool claimedBuild;
     mutable std::atomic<uint64_t> cacheHits{0};
-    // Set once capacity eviction has detached this value from its slot.
-    mutable std::atomic<bool> capacityDetached{false};
+    mutable std::atomic<double> creditedTotal{0};
     double density = 0;
     mutable std::atomic<double> touchClock;
     #ifndef NDEBUG
@@ -224,6 +253,7 @@ public:
     uint64_t buildCostNanos;
     const bool claimedBuild;
     mutable std::atomic<uint64_t> cacheHits{0};
+    mutable std::atomic<double> creditedTotal{0};
     double density = 0;
     mutable std::atomic<double> touchClock;
 
@@ -357,7 +387,23 @@ public:
   };
 
   class Use {
+    struct Accounting {
+      bool ordinary = false;
+      bool charged = false;
+      bool credited = false;
+      bool populationAllowed = false;
+      bool deferred = false;
+
+      template<class Value>
+      const Value* takeCredit(const Value* value, Fraction work) {
+        if (value == nullptr || !work.known() || credited) return nullptr;
+        credited = true;
+        return value;
+      }
+    };
     struct RequestSlot {
+      Accounting accounting;
+      const SegmentValue* servedValue = nullptr;
       std::mutex mutex;
       std::condition_variable condition;
       bool resolving = false;
@@ -394,7 +440,7 @@ public:
     std::shared_ptr<FilterEntry> entry;
     std::vector<std::shared_ptr<SegmentSlot>> slotsByOrd;
     // Pure preflight pins. They are not request-visible and carry no hit,
-    // recency, admission, or feedback effects until acceptExisting commits
+    // recency, admission, or ledger effects until acceptExisting commits
     // the complete candidate.
     std::vector<std::shared_ptr<const SegmentValue>> existingCandidates;
     std::shared_ptr<const ReaderValue> existingReaderCandidate;
@@ -410,6 +456,8 @@ public:
     std::mutex readerStateMutex;
     std::shared_ptr<const ReaderValue> readerPin;
     bool readerPinRequestOwned = false;
+    Accounting readerAccounting;
+    const ReaderValue* readerServedValue = nullptr;
     RequestMemTracker* readerRoutedTracker = nullptr;
     size_t readerRoutedBytes = 0;
     std::string readerRoutedDetail;
@@ -429,6 +477,7 @@ public:
     friend class Probe;
     friend class UseRegistry;
 
+    // Pinning requires the corresponding request mutex.
     void pinValue(size_t segmentOrd,
                   std::shared_ptr<const SegmentValue> value,
                   bool requestOwned = false);
@@ -437,6 +486,11 @@ public:
         bool requestOwned = false);
     void releaseRequestClaim(size_t segmentOrd);
     bool allowsSegmentPopulation(int32_t maxDoc) const;
+    void ordinaryUse(size_t segmentOrd, bool populationAllowed);
+    void ordinaryReaderUse(bool populationAllowed);
+    void chargeLedger(Ledger& ledger, Accounting& accounting, std::mutex& mutex, Fraction work);
+    void deferPopulation(size_t segmentOrd);
+    void deferReaderPopulation();
 
   public:
     ~Use();
@@ -444,14 +498,22 @@ public:
     // Look only pins existing membership. Acceptance has the same hit and
     // request-local deduplication effects as probe(), including late hits.
     std::optional<SegmentCandidate> look(size_t segmentOrd);
-    Probe accept(SegmentCandidate&& candidate);
+    Probe accept(SegmentCandidate&& candidate, Fraction work = Fraction::assumed());
 
-    // BORROW_ONLY counts a miss but takes no build claim, counts no build
-    // attempt and spends no backoff. Both policies take the request slot's
-    // resolving claim and may wait for a resolver in the same request.
-    Probe probe(size_t segmentOrd, Population population = Population::ALLOW);
+    // Known work is charged once before checking the population threshold.
+    // Pending work is finalized afterward with charge() or credit().
+    // BORROW_ONLY never charges or claims population, but still credits serves.
+    Probe probe(size_t segmentOrd, Population population = Population::ALLOW) {
+      return probe(segmentOrd, Fraction::assumed(), population);
+    }
+    Probe probe(size_t segmentOrd, Fraction work, Population population = Population::ALLOW);
     ReaderProbe probeReaderStable(
-        IndexReader& reader, std::span<DocSet* const> domainPerSeg);
+        IndexReader& reader, std::span<DocSet* const> domainPerSeg,
+        Fraction work = Fraction::assumed());
+    void charge(size_t segmentOrd, Fraction work);
+    void credit(size_t segmentOrd, Fraction work);
+    void chargeReaderStable(Fraction work);
+    void creditReaderStable(Fraction work);
 
     // Shared-cache insertion and request-local adoption both accept raw filter
     // membership. Domain and liveDocs composition happen afterward through the
@@ -555,7 +617,8 @@ public:
     // established that this request is on the exact reader and canonical root
     // domain before lookup; effectiveDocSet rechecks before serving values.
     Use* acceptExisting(
-        ExistingCandidate&& candidate, AdmissionLane lane);
+        ExistingCandidate&& candidate, AdmissionLane lane,
+        Fraction work = Fraction::assumed());
     void enableRoutedAccounting(
         size_t segmentOrd, RequestMemTracker& tracker,
         std::string_view detail);
@@ -565,6 +628,24 @@ public:
 
 private:
   using SlotVector = std::vector<std::shared_ptr<SegmentSlot>>;
+
+  // One unit is this representation's reference production. The owning
+  // slot/entry lock serializes charges, grants, production and repayment.
+  struct Ledger {
+    double owed = 0;
+    std::atomic<double> debt{0};
+    uint64_t referenceNanos = 0;
+    size_t referenceBytes = 0;
+    std::atomic_flag transition = ATOMIC_FLAG_INIT;
+
+    void lock() {
+      while (transition.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
+    }
+    void unlock() { transition.clear(std::memory_order_release); }
+    void production(uint64_t nanos, size_t bytes, bool investment);
+    void repay(double fraction);
+    bool canPopulate() const;
+  };
 
   // active means this exact (seg_id, maxDoc) belongs to the latest published
   // reader. A successful value CAS/exchange from non-null to null is the single
@@ -577,23 +658,13 @@ private:
     std::atomic<bool> active{true};
     std::atomic<bool> building{false};
     std::atomic<std::shared_ptr<const SegmentValue>> value;
-    // Serializes absent-value backoff decisions with publication and capacity
-    // eviction. Shared hits stay lock-free unless they lose an eviction race.
-    std::atomic_flag feedbackTransition = ATOMIC_FLAG_INIT;
-    std::atomic<uint32_t> deadBuildStreak{0};
-    std::atomic<uint32_t> buildBypassesRemaining{0};
+    Ledger ledger;
 
     SegmentSlot(uint64_t segId, int32_t maxDoc, SpaceOrdinal space)
       : segId(segId), maxDoc(maxDoc), space(space) {}
 
-    void lock() {
-      while (feedbackTransition.test_and_set(std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
-    }
-    void unlock() {
-      feedbackTransition.clear(std::memory_order_release);
-    }
+    void lock() { ledger.lock(); }
+    void unlock() { ledger.unlock(); }
   };
 
   // resident means the outer map still owns this key's metadata; false is
@@ -612,11 +683,7 @@ private:
     std::atomic<std::shared_ptr<const SlotVector>> slots;
     std::atomic<std::shared_ptr<const ReaderValue>> readerValue;
     std::atomic<bool> readerBuilding{false};
-    // ReaderValues are one atomic cache unit. This entry-stable ghost orders
-    // zero-hit capacity feedback with shared HIT reset and survives refreshes.
-    std::atomic_flag readerFeedbackTransition = ATOMIC_FLAG_INIT;
-    std::atomic<uint32_t> readerDeadBuildStreak{0};
-    std::atomic<uint32_t> readerBuildBypassesRemaining{0};
+    Ledger ledger;
     std::mutex mutex;
     std::atomic<uint64_t> lastUsed{0};
     const size_t metadataCharge;
@@ -629,15 +696,8 @@ private:
         lastUsed(epoch),
         metadataCharge(metadataCharge) {}
 
-    void lock() {
-      while (readerFeedbackTransition.test_and_set(
-          std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
-    }
-    void unlock() {
-      readerFeedbackTransition.clear(std::memory_order_release);
-    }
+    void lock() { ledger.lock(); }
+    void unlock() { ledger.unlock(); }
   };
 
   struct ActiveSnapshot {
@@ -648,24 +708,25 @@ private:
   };
 
   struct AtomicCounters {
-    // Bumped on every segment probe by every search thread.
+    // Shared serves and ordinary uses, each once per Use and value unit.
     StripedCounter hits;
     StripedCounter misses;
-    // Build time served is an upper bound on savings: uncached evaluation may
-    // avoid materializing a DocSet. Keep nanoseconds until API conversion.
-    StripedCounter servedBuildNanos;
+    // Fractional credits times their reference production time.
+    StripedCounter estimatedSavedNanos;
     std::atomic<uint64_t> buildNanos{0};
-    std::atomic<uint64_t> deadBuildNanos{0};
+    std::atomic<uint64_t> unpaidBuildNanos{0};
     std::atomic<uint64_t> admissions{0};
     std::atomic<uint64_t> buildAttempts{0};
     std::atomic<uint64_t> builds{0};
     std::atomic<uint64_t> byproductInserts{0};
     std::atomic<uint64_t> publishRejects{0};
     std::atomic<uint64_t> evictions{0};
-    std::atomic<uint64_t> capacityDeadBuilds{0};
-    std::atomic<uint64_t> thrashBuildSkips{0};
-    std::atomic<uint64_t> readerDeadBuilds{0};
-    std::atomic<uint64_t> readerThrashBuildSkips{0};
+    std::atomic<uint64_t> unrepaidEvictions{0};
+    std::atomic<uint64_t> populationDeferred{0};
+    StripedCounter assumedCharges;
+    StripedCounter quotedCharges;
+    StripedCounter assumedCredits;
+    StripedCounter quotedCredits;
     std::atomic<uint64_t> purges{0};
     std::atomic<uint64_t> oversizedKeyBypasses{0};
     std::atomic<uint64_t> readerStableHits{0};
@@ -752,22 +813,21 @@ private:
       const FilterKey& key, FilterKeyScope scope,
       uint64_t readerCoreGen, uint64_t readerVersion,
       std::span<const SegmentIdentity> readerSegments);
-  bool acceptExisting(Use& use, AdmissionLane lane);
+  bool acceptExisting(Use& use, AdmissionLane lane, Fraction work);
+  template<class Value>
+  void creditValue(Ledger& ledger, const Value& value, Fraction work);
   void acceptSharedHit(
       Use& use, size_t segmentOrd,
-      const std::shared_ptr<SegmentSlot>& slot,
-      std::shared_ptr<const SegmentValue> value);
+      std::shared_ptr<const SegmentValue> value, Fraction work = Fraction::assumed());
   void acceptReaderSharedHit(
       Use& use, const std::shared_ptr<FilterEntry>& entry,
-      const std::shared_ptr<const ReaderValue>& value);
+      const std::shared_ptr<const ReaderValue>& value, Fraction work = Fraction::assumed());
   void observeAdmissionLane(Use& use, AdmissionLane lane);
   AdmissionRing& admissionFor(AdmissionLane lane);
   RecentUses snapshotRecentUses();
   void recordCapacityEviction(
-      const std::shared_ptr<SegmentSlot>& slot,
       const std::shared_ptr<const SegmentValue>& value);
   void recordReaderCapacityEviction(
-      const std::shared_ptr<FilterEntry>& entry,
       const std::shared_ptr<const ReaderValue>& value);
   std::shared_ptr<const SegmentValue> publish(
       Use& use, size_t segmentOrd, Probe* probe, std::unique_ptr<DocSet> raw,
@@ -812,17 +872,27 @@ public:
   bool onReaderPublished(IndexReader& reader);
   void sweep();
   void clear();
-  // Forgets admission-lane sighting history. clear() alone leaves the rings
-  // populated, so a re-request of a known query re-admits and builds
-  // immediately (the eviction-refill posture); clear() + resetAdmission()
-  // restarts the whole sighting ladder (the first-sighting posture).
+  // Forgets both admission-lane sighting histories.
   void resetAdmission();
   void resetCounters();
 
-  // Diagnostic snapshot of resident entries, largest payload first, capped at
+  // Diagnostic snapshot, optionally including payload-free ledgers, largest
+  // payload first, capped at
   // limit. keyText is the printable-byte extraction from the serialized key
   // (field names and terms survive; structure bytes do not). totalResident
   // receives the uncapped count of entries holding at least one value.
+  struct ValueDump {
+    uint64_t segId = 0;
+    int32_t maxDoc = 0;
+    SpaceOrdinal space = SpaceOrdinal::ROOT;
+    uint64_t readerVersion = 0;
+    bool resident = false;
+    double owed = 0;
+    double debt = 0;
+    double creditedTotal = 0;
+    uint64_t referenceNanos = 0;
+    size_t referenceBytes = 0;
+  };
   struct EntryDump {
     uint64_t keyHash = 0;
     size_t keyBytes = 0;
@@ -835,8 +905,9 @@ public:
     uint64_t lastUsed = 0;
     uint64_t buildNanos = 0;
     uint32_t recentUses = 0;
+    std::vector<ValueDump> values;
   };
-  std::vector<EntryDump> dump(size_t limit, size_t* totalResident);
+  std::vector<EntryDump> dump(size_t limit, size_t* totalResident, bool includeGhosts = false);
 
   CounterValues counters() const;
   size_t bytesUsed() const { return residentBytes.load(std::memory_order_relaxed); }

@@ -226,13 +226,16 @@ void fillQueryCacheStats(api::QueryCacheStats& dst, const ReaderManager::CacheSt
   dst.reader_stable_refreshes = src.filterCacheCounters.readerStableRefreshes;
   dst.reader_stable_retires = src.filterCacheCounters.readerStableRetires;
   dst.build_attempts = src.filterCacheCounters.buildAttempts;
-  dst.capacity_dead_builds = src.filterCacheCounters.capacityDeadBuilds;
-  dst.thrash_build_skips = src.filterCacheCounters.thrashBuildSkips;
-  dst.reader_dead_builds = src.filterCacheCounters.readerDeadBuilds;
-  dst.reader_thrash_build_skips = src.filterCacheCounters.readerThrashBuildSkips;
+  dst.unrepaid_evictions = src.filterCacheCounters.unrepaidEvictions;
+  dst.population_deferred = src.filterCacheCounters.populationDeferred;
+  dst.assumed_charges = src.filterCacheCounters.assumedCharges;
+  dst.quoted_charges = src.filterCacheCounters.quotedCharges;
   dst.build_us = src.filterCacheCounters.buildNanos / 1000;
-  dst.served_build_us = src.filterCacheCounters.servedBuildNanos / 1000;
-  dst.dead_build_us = src.filterCacheCounters.deadBuildNanos / 1000;
+  dst.estimated_saved_us = src.filterCacheCounters.estimatedSavedNanos / 1000;
+  dst.unpaid_build_us = src.filterCacheCounters.unpaidBuildNanos / 1000;
+  dst.assumed_credits = src.filterCacheCounters.assumedCredits;
+  dst.quoted_credits = src.filterCacheCounters.quotedCredits;
+  dst.outstanding_debt_us = src.filterCacheCounters.outstandingDebtNanos / 1000;
 }
 
 template<class Stats>
@@ -461,7 +464,7 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
 
     if (!request.dump) continue;
     size_t resident = 0;
-    auto rows = cache->dump(dumpLimit, &resident);
+    auto rows = cache->dump(dumpLimit, &resident, request.include_ghosts);
     shardControl.entries_resident = resident;
     auto* dumped = api::build::allocArray(shardControl.entries, rows.size(), resource);
     for (std::size_t r = 0; r < rows.size(); r++) {
@@ -484,6 +487,20 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
       out.last_used_epoch = row.lastUsed;
       out.build_us = row.buildNanos / 1000;
       out.recent_uses = row.recentUses;
+      auto* values = api::build::allocArray(out.values, row.values.size(), resource);
+      for (size_t v = 0; v < row.values.size(); v++) {
+        const auto& value = row.values[v];
+        values[v].seg_id = value.segId;
+        values[v].space = (uint32_t)value.space;
+        values[v].max_doc = value.maxDoc;
+        values[v].reader_version = value.readerVersion;
+        values[v].resident = value.resident;
+        values[v].owed = value.owed;
+        values[v].debt = value.debt;
+        values[v].credited_total = value.creditedTotal;
+        values[v].reference_us = value.referenceNanos / 1000;
+        values[v].reference_bytes = value.referenceBytes;
+      }
     }
   }
 }

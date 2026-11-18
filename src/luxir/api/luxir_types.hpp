@@ -92,7 +92,7 @@ struct HostStats; struct OutcomeStats; struct CollectionActivityStats; struct Pr
 struct ProcessStats; struct CpuTimes; struct HostCpuStats; struct HostMemoryStats; struct NetworkInterfaceStats;
 struct TcpStats; struct DiskStats; struct FilesystemStats; struct PressureStats; struct CgroupStats;
 struct CgroupMemoryStats; struct CgroupCpuStats; struct CgroupTaskStats;
-struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
+struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump; struct CacheValueDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
 namespace KnnQuery_ { struct Ivf; }
@@ -350,13 +350,16 @@ struct QueryCacheStats {
   uint64_t reader_stable_refreshes = 0;
   uint64_t reader_stable_retires = 0;
   uint64_t build_attempts = 0;
-  uint64_t capacity_dead_builds = 0;
-  uint64_t thrash_build_skips = 0;
-  uint64_t reader_dead_builds = 0;
-  uint64_t reader_thrash_build_skips = 0;
+  uint64_t unrepaid_evictions = 0;
+  uint64_t population_deferred = 0;
+  uint64_t assumed_charges = 0;
+  uint64_t quoted_charges = 0;
   uint64_t build_us = 0;
-  uint64_t served_build_us = 0;
-  uint64_t dead_build_us = 0;
+  uint64_t estimated_saved_us = 0;
+  uint64_t unpaid_build_us = 0;
+  uint64_t assumed_credits = 0;
+  uint64_t quoted_credits = 0;
+  uint64_t outstanding_debt_us = 0;
   bool enabled = false;
 };
 struct StorageRamStats { uint64_t used_bytes = 0; uint64_t limit_bytes = 0; };
@@ -799,8 +802,22 @@ struct CacheControlRequest {
   bool reset_admission = false;
   bool reset_counters = false;
   bool dump = false;
+  bool include_ghosts = false;
+};
+struct CacheValueDump {
+  uint64_t seg_id = 0;
+  uint64_t reader_version = 0;
+  uint64_t reference_us = 0;
+  uint64_t reference_bytes = 0;
+  double owed = 0;
+  double debt = 0;
+  double credited_total = 0;
+  uint32_t space = 0;
+  int32_t max_doc = 0;
+  bool resident = false;
 };
 struct CacheEntryDump {
+  std::span<const CacheValueDump> values;
   uint64_t key_hash = 0;
   uint64_t bytes = 0;
   uint64_t hits = 0;
@@ -1288,7 +1305,7 @@ LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(RowSpa
 LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
 LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats) LUXIR_TD(ScrubStats)
 LUXIR_TD(HistogramStats) LUXIR_TD(ActivityStats) LUXIR_TD(TransportStats) LUXIR_TD(ServiceStats) LUXIR_TD(HostStats) LUXIR_TD(SystemStats) LUXIR_TD(ProcessIoStats) LUXIR_TD(ProcessStats) LUXIR_TD(CpuTimes) LUXIR_TD(HostCpuStats) LUXIR_TD(HostMemoryStats) LUXIR_TD(NetworkInterfaceStats) LUXIR_TD(TcpStats) LUXIR_TD(DiskStats) LUXIR_TD(FilesystemStats) LUXIR_TD(PressureStats) LUXIR_TD(CgroupStats) LUXIR_TD(CgroupMemoryStats) LUXIR_TD(CgroupCpuStats) LUXIR_TD(CgroupTaskStats)
-LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
+LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump) LUXIR_TD(CacheValueDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
 LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) LUXIR_TD(ReplicationCatalogEntry) LUXIR_TD(ReplicationTenant) LUXIR_TD(ReplicationInstalled)
 #undef LUXIR_TD
@@ -1339,7 +1356,7 @@ LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(RowSpaceStats) LUXIR_ENTRY(AuxStats) LUXIR
 LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(ArenaStats)
 LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(FieldMetadataStats) LUXIR_ENTRY(MemoryStats) LUXIR_ENTRY(ScrubStats)
 LUXIR_ENTRY(HistogramStats) LUXIR_ENTRY(ActivityStats) LUXIR_ENTRY(TransportStats) LUXIR_ENTRY(ServiceStats) LUXIR_ENTRY(HostStats) LUXIR_ENTRY(SystemStats) LUXIR_ENTRY(ProcessIoStats) LUXIR_ENTRY(ProcessStats) LUXIR_ENTRY(CpuTimes) LUXIR_ENTRY(HostCpuStats) LUXIR_ENTRY(HostMemoryStats) LUXIR_ENTRY(NetworkInterfaceStats) LUXIR_ENTRY(TcpStats) LUXIR_ENTRY(DiskStats) LUXIR_ENTRY(FilesystemStats) LUXIR_ENTRY(PressureStats) LUXIR_ENTRY(CgroupStats) LUXIR_ENTRY(CgroupMemoryStats) LUXIR_ENTRY(CgroupCpuStats) LUXIR_ENTRY(CgroupTaskStats)
-LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
+LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump) LUXIR_ENTRY(CacheValueDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
 LUXIR_ENTRY(AllReplicas) LUXIR_ENTRY(ReplicaRequirement) LUXIR_ENTRY(ReplicationCatalog) LUXIR_ENTRY(ReplicationCatalogEntry) LUXIR_ENTRY(ReplicationTenant) LUXIR_ENTRY(ReplicationInstalled)
 #undef LUXIR_ENTRY

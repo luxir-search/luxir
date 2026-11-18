@@ -1,6 +1,8 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <numeric>
+
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -93,9 +95,35 @@ protected:
   void compare(const Run& exhaustive, const Run& pruned) {
     ASSERT_EQ(exhaustive.docs.size(), pruned.docs.size());
     ASSERT_EQ(exhaustive.scores.size(), pruned.scores.size());
+    bool sameOrder = true;
     for (size_t i = 0; i < exhaustive.docs.size(); i++) {
-      EXPECT_TRUE(docEquals(exhaustive.docs[i], pruned.docs[i])) << i;
+      sameOrder &= docEquals(exhaustive.docs[i], pruned.docs[i]);
       EXPECT_FLOAT_EQ(exhaustive.scores[i], pruned.scores[i]) << i;
+    }
+    if (sameOrder) return;
+    // Scorer paths can sum in different orders. Keep identical members and
+    // per-document scores while allowing ranking within the score tolerance.
+    auto byId = [](const Run& run) {
+      std::vector<size_t> order(run.docs.size());
+      std::iota(order.begin(), order.end(), 0);
+      std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return std::get<std::string>(*find(run.docs[a], "id"))
+            < std::get<std::string>(*find(run.docs[b], "id"));
+      });
+      return order;
+    };
+    auto exactOrder = byId(exhaustive), prunedOrder = byId(pruned);
+    std::vector<std::pair<size_t, size_t>> unchangedOrder;
+    for (size_t i = 0; i < exactOrder.size(); i++) {
+      size_t a = exactOrder[i], b = prunedOrder[i];
+      EXPECT_TRUE(docEquals(exhaustive.docs[a], pruned.docs[b])) << i;
+      EXPECT_FLOAT_EQ(exhaustive.scores[a], pruned.scores[b]) << i;
+      if (exhaustive.scores[a] == pruned.scores[b]) unchangedOrder.emplace_back(b, a);
+    }
+    std::sort(unchangedOrder.begin(), unchangedOrder.end());
+    for (size_t i = 1; i < unchangedOrder.size(); i++) {
+      EXPECT_LT(unchangedOrder[i - 1].second, unchangedOrder[i].second)
+          << "unchanged scores must keep their relative document order";
     }
   }
 };

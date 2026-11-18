@@ -169,8 +169,9 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
   // Rendered in seconds, from microseconds and milliseconds.
   static const std::map<std::string, double> perSecond = {{"collections.shards.index.commit_time", 1e6},
       {"collections.shards.index.query_cache.build_us", 1e6},
-      {"collections.shards.index.query_cache.served_build_us", 1e6},
-      {"collections.shards.index.query_cache.dead_build_us", 1e6},
+      {"collections.shards.index.query_cache.estimated_saved_us", 1e6},
+      {"collections.shards.index.query_cache.unpaid_build_us", 1e6},
+      {"collections.shards.index.query_cache.outstanding_debt_us", 1e6},
       {"scrub.last_pass_end", 1e3}};
   auto rendered = renderedNumbers(renderPrometheus(response));
   std::string json;

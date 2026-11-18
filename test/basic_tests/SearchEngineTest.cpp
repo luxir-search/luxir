@@ -2333,9 +2333,9 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
   ASSERT_TRUE(built.available);
   EXPECT_EQ(8, built.count);
   cache->sweep();
-  ASSERT_EQ(1u, cache->counters().capacityDeadBuilds);
+  ASSERT_EQ(1u, cache->counters().unrepaidEvictions);
 
-  uint64_t thrashSkips = cache->counters().thrashBuildSkips;
+  uint64_t thrashSkips = cache->counters().populationDeferred;
   WholeCountRun fallback = runWholeCount(
       helper.getSearchEngine(), collection, [](auto& mr) {
         return qb::boolean(
@@ -2346,7 +2346,7 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
   EXPECT_EQ(1, fallback.bypasses);
   EXPECT_EQ(1, fallback.fallbackSuppliers);
   EXPECT_EQ(0, fallback.builds + fallback.hits);
-  EXPECT_EQ(thrashSkips + 1, cache->counters().thrashBuildSkips);
+  EXPECT_EQ(thrashSkips + 1, cache->counters().populationDeferred);
 }
 
 TEST_F(SearchEngineTest, wholeTopKCountFamiliesMatchCacheOffAtAllDepths) {
@@ -2702,9 +2702,9 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
       *weight, use, context.filterUses);
   ASSERT_TRUE(resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr).available);
   cache->sweep();
-  ASSERT_EQ(1u, cache->counters().capacityDeadBuilds);
+  ASSERT_EQ(1u, cache->counters().unrepaidEvictions);
 
-  uint64_t thrashSkips = cache->counters().thrashBuildSkips;
+  uint64_t thrashSkips = cache->counters().populationDeferred;
   WholeTopKRun fallback = runWholeTopK(
       helper.getSearchEngine(), collection, WholeTopKFamily::INTERSECTION,
       "s3back", 10);
@@ -2712,7 +2712,7 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
   EXPECT_EQ(1, fallback.bypasses);
   EXPECT_EQ(1, fallback.fallbackSuppliers);
   EXPECT_EQ(0, fallback.builds + fallback.hits);
-  EXPECT_EQ(thrashSkips + 1, cache->counters().thrashBuildSkips);
+  EXPECT_EQ(thrashSkips + 1, cache->counters().populationDeferred);
 }
 
 TEST_F(SearchEngineTest,
@@ -3419,9 +3419,9 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
   ASSERT_TRUE(resolveWholeMembershipForTests(plan,
       *reader, reader->segments()[0], nullptr).available);
   cache->sweep();
-  ASSERT_EQ(1u, cache->counters().capacityDeadBuilds);
+  ASSERT_EQ(1u, cache->counters().unrepaidEvictions);
 
-  uint64_t thrashSkips = cache->counters().thrashBuildSkips;
+  uint64_t thrashSkips = cache->counters().populationDeferred;
   WholeFieldSortRun fallback = runWholeFieldSort(
       helper.getSearchEngine(), collection,
       "s4backoff", "sort_i", qb::ASC, 9, true,
@@ -3432,7 +3432,7 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
   EXPECT_EQ(1, fallback.fallbackSuppliers);
   EXPECT_EQ(0, fallback.builds + fallback.hits
                    + fallback.cachedBestFirst);
-  EXPECT_EQ(thrashSkips + 1, cache->counters().thrashBuildSkips);
+  EXPECT_EQ(thrashSkips + 1, cache->counters().populationDeferred);
 }
 
 TEST_F(SearchEngineTest, wholeFieldSortHitComposesFusionDomainOnce) {
