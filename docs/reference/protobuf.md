@@ -657,6 +657,7 @@ Partition matching documents by an exact, single-valued key.
 | <a id="field-luxir.collapse.get_count"></a>[`get_count`](#field-luxir.collapse.get_count) | 4 | `bool` | singular | Count members of each returned group in the finalized match set. |
 | <a id="field-luxir.collapse.ops"></a>[`ops`](#field-luxir.collapse.ops) | 5 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Per-group operations on matching members; facet count units start at docs. Explicit group units still resolve to this nearest enclosing collapse. |
 | <a id="field-luxir.collapse.sort"></a>[`sort`](#field-luxir.collapse.sort) | 6 | [`SortSpec`](#message-luxir.sortspec) | repeated | Exhaustive group order by metrics in ops; missing/failed values last. Ties use the best member under the list sort, then document order. |
+| <a id="field-luxir.collapse.owner"></a>[`owner`](#field-luxir.collapse.owner) | 7 | `string` | singular | In a nested child view (domain.to), "root" adds each row's owning root document as a structural key component. No field is named or decoded; field may then be empty. |
 
 <a id="message-luxir.collectionactivitystats"></a>
 
@@ -887,6 +888,7 @@ A document cap, applied before paging in the list's ordinary rank order.
 |---|---|---|---|---|
 | <a id="field-luxir.diversify.field"></a>[`field`](#field-luxir.diversify.field) | 1 | `string` | repeated | One field or an exact tuple, as in Collapse. |
 | <a id="field-luxir.diversify.missing"></a>[`missing`](#field-luxir.diversify.missing) | 3 | [`Collapse.MissingPolicy`](#enum-luxir.collapse.missingpolicy) | singular |  |
+| <a id="field-luxir.diversify.owner"></a>[`owner`](#field-luxir.diversify.owner) | 4 | `string` | singular | "root": cap child rows per root document, as in Collapse.owner. |
 | <a id="field-luxir.diversify.max_per_key"></a>[`max_per_key`](#field-luxir.diversify.max_per_key) | 2 | `int64` | oneof [`kind`](#oneof-luxir.diversify.kind) | Positive cap; keeps each key's best documents. |
 
 <a id="message-luxir.doclist"></a>

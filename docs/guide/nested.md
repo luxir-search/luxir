@@ -193,7 +193,8 @@ Filter results of nested clauses are cached like other filters.
 Queries can reach into children implicitly, and returned fields can reach
 children and owners (see [Returning nested values](#returning-nested-values)).
 Facets, collapse keys, and direct field sorts read the fields of their own
-view. Value expressions can reduce descendant values (see below). To run an
+view; collapse and diversify can also
+[key rows by their document](#keying-child-rows-by-their-document). Value expressions can reduce descendant values (see below). To run an
 operation over child rows themselves, move its domain:
 
 ```json
@@ -230,6 +231,44 @@ belong to:
   "documents":{"domain":{"to":"/"},"top_docs":{"count_limit":-1,"limit":0}}
 }}}
 ```
+
+## Keying child rows by their document
+
+In a child view, `"owner": "root"` in `collapse` or `diversify` keys each row
+by the root document that owns it. No field is named, so the children need no
+copy of the document's id. The top 20 chunks, at most 3 per document:
+
+```json
+{"ops":{"chunks":{"domain":{"to":"chunks"},"top_docs":{
+  "query":{"knn":{"field":"embedding","query":[0.1,0.2],"k":100}},
+  "limit":20,"fields":["text","/id","/title"],
+  "diversify":{"owner":"root","max_per_key":3}}}}}
+```
+
+With `collapse`, the same key returns one row per document, its best child,
+and `get_count` reports how many of its children matched:
+
+```json
+{"ops":{"best":{"domain":{"to":"items"},"top_docs":{
+  "filter":["color:red"],"sort":[{"field":"price"}],"fields":["price","/id"],
+  "collapse":{"owner":"root","get_count":true}}}}}
+```
+
+- `root` is the only owner. At a deeper path such as `items.parts` it is still
+  the root document, not the item.
+- `field` may be omitted. When given, the owner is one more component of the
+  key tuple: `{"owner":"root","field":"color"}` keeps one row per document
+  and color.
+- A row always has an owner, so `missing` only concerns the named fields.
+- Counts, paging, `head_sort`, `ops` and `sort` behave as with a field key.
+  `found` counts documents under `collapse`; `found_docs` counts child rows.
+- The returned group value is the owner's row number in the current index
+  snapshot. It changes when segments merge; use a returned `/id` to identify
+  the document.
+- A facet's `count_distinct` accepts the same key, counting documents instead
+  of child rows per bucket.
+- Outside a child view the option is an error. An owner's field is still not
+  a key: `"field":["/id"]` is rejected.
 
 ## Reducers over child values
 
@@ -412,6 +451,7 @@ of each child matter together.
 ## Not supported yet
 
 - Storing the submitted nested value verbatim.
-- Owner fields in sorts, facets, collapse keys and value expressions.
+- Owner fields in sorts, facets, collapse keys and value expressions. Collapse
+  and diversify can key child rows by their root document with `owner`.
 - Updating or addressing a single child.
 - `domain.to` paths that go up and then down.

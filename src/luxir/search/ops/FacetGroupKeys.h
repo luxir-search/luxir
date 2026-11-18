@@ -22,6 +22,7 @@ class FacetGroupPlan {
   static FacetDimension componentDimension(const CollapsePlan& key, const CollapsePlan::Field& field) {
     if (field.ordinal()) return {true, 0,
         (uint64_t)(field.ords ? field.ords->numOrds() : 0)};
+    if (field.owner) return {true, 0, (uint64_t)key.owners->maxDoc()};
     int64_t lo = INT64_MAX, hi = INT64_MIN;
     for (size_t segnum = 0; segnum < key.reader.segments().size(); segnum++) {
       auto* info = field.segments.at(segnum);

@@ -160,12 +160,17 @@ message Collapse {
   // Exhaustive group order by metrics in ops; missing/failed values last.
   // Ties use the best member under the list sort, then document order.
   repeated SortSpec sort = 6;
+  // In a nested child view (domain.to), "root" adds each row's owning root
+  // document as a structural key component. No field is named or decoded;
+  // field may then be empty.
+  string owner = 7;
 }
 
 // A document cap, applied before paging in the list's ordinary rank order.
 message Diversify {
   repeated string field = 1; // One field or an exact tuple, as in Collapse.
   Collapse.MissingPolicy missing = 3;
+  string owner = 4;          // "root": cap child rows per root document, as in Collapse.owner.
   oneof kind {
     int64 max_per_key = 2; // Positive cap; keeps each key's best documents.
   }

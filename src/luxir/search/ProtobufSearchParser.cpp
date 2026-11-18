@@ -652,7 +652,13 @@ public:
     using Missing = luxir::api::Collapse_::MissingPolicy;
     if (spec.missing != Missing::EXPAND && spec.missing != Missing::GROUP
         && spec.missing != Missing::DROP) throw RequestError("invalid collapse.missing");
-    if (spec.field.empty()) throw RequestError("collapse.field must not be empty");
+    if (spec.field.empty() && spec.owner.empty()) throw RequestError("collapse.field must not be empty");
+    if (!spec.owner.empty()) {
+      if (spec.owner != "root") throw RequestError("owner must be \"root\"");
+      if (view()->path().empty()) {
+        throw RequestError("owner keys apply to the rows of a nested path (a domain.to child view)");
+      }
+    }
     auto* collapse = luxir::arenaCreate<CollapsePlan>(
         req.arena, *view(), spec.missing, getNumber);
     std::unordered_set<std::string> resolved;
@@ -687,6 +693,7 @@ public:
           ordinal ? view()->getOrdMap(field.physicalName) : nullptr,
           view()->field(field.physicalName), type.valueNature()});
     }
+    if (!spec.owner.empty()) collapse->addOwnerKey(*req.pinView(""));
     return collapse;
   }
 

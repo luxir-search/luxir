@@ -1392,6 +1392,7 @@ struct from<JSON, luxir::api::Collapse> {
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
           if (key == "field") readFields(vit, vend);
+          else if (key == "owner") util::from_json<O>(value.owner, ctx, vit, vend);
           else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
           else if (key == "get_count") util::from_json<O>(value.get_count, ctx, vit, vend);
           else if (key == "ops") {
@@ -1432,6 +1433,7 @@ struct from<JSON, luxir::api::Diversify> {
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
           if (key == "field") readFields(vit, vend);
+          else if (key == "owner") util::from_json<O>(value.owner, ctx, vit, vend);
           else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
           else if (key == "max_per_key") util::from_json<O>(value.max_per_key, ctx, vit, vend);
           else { ctx.error = error_code::unknown_key; return true; }
