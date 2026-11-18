@@ -572,6 +572,7 @@ With `collections=true`:
 | `luxir_index_directory_bytes` | Directory-listing bytes; only with `files=true`. See the two byte counts above. |
 | `luxir_index_commits_total` | Commits since the writer opened. |
 | `luxir_index_retained_delete_bytes` | Delete packets the writer retains for its pending set and merge catch-up, counted once per packet; part of `luxir_index_ram_reserved_bytes`. |
+| `luxir_index_vector_overlay_backlog_segments`, `luxir_index_vector_overlay_backlog_vectors` | Live segments on an `ann.auto_build` field that pass the overlay thresholds without a published overlay, and the vectors in them, served by exact scan until the overlays publish. See [Build in the background](vector-search.md#build-in-the-background). |
 | `luxir_collection_searches_total`, `luxir_collection_search_seconds_total` | Searches that reached the collection, by `outcome`, and their summed duration from submission to the final response. The mean is the ratio of the two rates. |
 | `luxir_collection_index_batches_total`, `luxir_collection_index_batch_seconds_total` | The collection's index batches by `outcome`, and their summed processing time. |
 | `luxir_collection_documents_total`, `luxir_collection_delete_ids_total` | Documents the collection accepted or rejected, and its accepted delete IDs. |
@@ -685,8 +686,9 @@ The pool serves two arenas, and a worker belongs to one at a time:
   update decoding, plugin routes and administration requests, at normal
   priority. Its workers are named `luxir_tbb_<n>`.
 - The **indexing arena** runs update batches (including NDJSON document
-  decoding), flushes, merges, delete application, vector index builds and
-  commits, at low priority. Its workers are named `luxir_idx_<n>`.
+  decoding), flushes, merges, delete application, vector index builds
+  (including background `ann.auto_build` builds) and commits, at low
+  priority. Its workers are named `luxir_idx_<n>`.
 
 The query arena can use `--server.workers` workers and the indexing arena
 `--indexing.threads`; the pool has one thread more than the query arena. The
@@ -709,7 +711,7 @@ operating system's scheduler. These options limit how much indexing can take:
 | --- | --- | --- |
 | `--indexing.threads=N` | `0`: auto | Workers the indexing arena uses at once, capped at `--server.workers`. Auto holds a quarter of the workers back from indexing, at least one: 1 of 2, 2 of 3, 3 of 4, 6 of 8, 12 of 16. The workers held back keep CPU for searches whatever the indexing load, at the cost of slower bulk loads and merges. Set `--server.workers` here to give indexing every worker. |
 | `--indexing.nice=N` | `-1`: auto | Raises the nice value of a worker by `N` (`0`-`19`) while it runs indexing work and restores it when the worker returns to queries. Auto uses `5` when the node may restore it and is off otherwise. |
-| `--indexing.max-concurrent-merges=N` | `0`: auto | Background merges running at once across all collections (each collection runs at most one). Auto is half of the resolved `--indexing.threads`, at least one. A collection whose merge is due while every slot is taken queues for one, as data rather than a waiting thread, and slots go to collections in the order they queued. Merges a client waits for (`max_segments`, `wait_for_merges`) start at once, past the limit, and count against it. Bounds the CPU, disk bandwidth and indexing RAM overdraft that merges take on a node with many collections. |
+| `--indexing.max-concurrent-merges=N` | `0`: auto | Background merges running at once across all collections (each collection runs at most one). Auto is half of the resolved `--indexing.threads`, at least one. A collection whose merge is due while every slot is taken queues for one, as data rather than a waiting thread, and slots go to collections in the order they queued. Merges a client waits for (`max_segments`, `wait_for_merges`) start at once, past the limit, and count against it. Background vector overlay builds (`ann.auto_build`) take a slot each in the same queue, since a build holds its worker as long as a merge, and are counted in the running and waiting merge metrics. Bounds the CPU, disk bandwidth and indexing RAM overdraft that merges take on a node with many collections. |
 | `--indexing.merge-max-bytes-per-sec=RATE` | `0`: unlimited | Paces the segment data that background merges write, node-wide across all collections (for example `64MB`). Merges then compete less with searches for disk bandwidth and page cache. |
 
 **Nice.** Lowering priority is always allowed, but raising it back needs

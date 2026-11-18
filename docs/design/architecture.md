@@ -83,7 +83,9 @@ Merges are limited per collection (one policy merge at a time) and node-wide
 `MergeSlots` keeps a FIFO of collections whose merge is due, and the merge
 that frees a slot hands it to the first of them by queueing a task on that
 collection's graph, so no thread ever blocks for a slot. Merges a client
-waits for take a slot at once. Background merge writes can be paced
+waits for take a slot at once. Background vector overlay builds
+(`ann.auto_build`) queue for the same slots: a build, like a merge, holds an
+indexing worker until it is done. Background merge writes can be paced
 (`--indexing.merge-max-bytes-per-sec`) on one node-wide timeline, charged in
 chunks of a few milliseconds so a merge task never sleeps long; a merge is a
 synchronous call stack that holds its worker until its current field is done,

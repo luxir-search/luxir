@@ -14,7 +14,8 @@ locations, browse `src/luxir/<area>/`.
      worker pool's two arenas: `taskArena` (queries, buffered update decoding,
      admin, plugin routes; normal priority, reserved slots for transport threads
      counted by `ArenaEntrants`) and `indexArena` (every writer's update graph:
-     batches, flushes, merges, commits, vector builds; low priority, width
+     batches, flushes, merges, commits, vector builds including background
+     `ann.auto_build` ones; low priority, width
      `index.threads`, see `LuxirConfig::backgroundThreads`). `ensureWorkerPool`
      sizes TBB's pool `kBackgroundFloor` past the query arena, which keeps
      indexing at least one worker under any search load; `ArenaThreadNamer`
@@ -29,8 +30,8 @@ locations, browse `src/luxir/<area>/`.
      (startup discovery, creation, activation, rename, swap, removal), announced
      in order through `CollectionEvents`; a multi-name mapping is one event and
      atomic per-name lookup changes. Shares the node-wide merge limit
-     (`index/MergeSlots.h`, a FIFO of writers whose merge is due, woken through
-     a graph task) and merge write pacing (`util/ByteRateLimiter.h`) with every
+     (`index/MergeSlots.h`, a FIFO of writers whose merge or background overlay
+     build is due, woken through a graph task) and merge write pacing (`util/ByteRateLimiter.h`) with every
      writer
    - `ReplicationFollower`: Discovery and transfer protocol, with work keyed by
      tenant/incarnation. Stages missing data, then applies each tenant mapping
