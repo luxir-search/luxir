@@ -72,6 +72,7 @@ enum class QueryKind : uint8_t {
   ALL,
   NONE,
   RESCORE,
+  RANGE_FIELD,
   MIN_SCORE,
   COMBINED_FIELDS,
   DIS_MAX,
