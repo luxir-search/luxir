@@ -73,6 +73,11 @@ struct RangePointSource {
       auto& values, int64_t pointRank) {
     return {values.valueAt(pointRank * 2), values.valueAt(pointRank * 2 + 1)};
   }
+
+  // The point of the iterator's document when it holds exactly one pair.
+  static std::pair<PointTraits::Scalar, PointTraits::Scalar> docPoint(auto& iter) {
+    return pointAt(iter.values(), iter.rank());
+  }
 };
 
 } // namespace luxir

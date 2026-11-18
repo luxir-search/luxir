@@ -38,7 +38,10 @@ class BKDQueryScorer final : public Query::ConstantScorer {
   bool valueMatches() {
     if (docid == PostingsReader::END) return false;
     // With one point per populated document, point rank is document rank.
-    if (singlePoint) return pointMatches(iter.rank());
+    if (singlePoint) {
+      auto [v0, v1] = PointSource::docPoint(iter);
+      return relation.matches(v0, v1);
+    }
     auto [start, end] = PointSource::pointRanks(reader, iter.rank());
     for (int64_t rank = start; rank < end; rank++) {
       if (pointMatches(rank)) return true;

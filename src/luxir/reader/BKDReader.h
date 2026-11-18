@@ -823,14 +823,6 @@ public:
     if (bytes1 > std::numeric_limits<uint32_t>::max()) {
       invalid("dimension 1 payload exceeds uint32");
     }
-    if (header.bits0 > std::numeric_limits<Unsigned>::digits
-        || header.bits1 > std::numeric_limits<Unsigned>::digits) {
-      invalid("coordinate bit width exceeds scalar width");
-    }
-    if (header.bytes0 != CoordinateCodec::byteSize(header.count, header.bits0)
-        || bytes1 != CoordinateCodec::byteSize(header.count, header.bits1)) {
-      invalid("invalid coordinate payload length");
-    }
     return {header.count, header.docCodec, header.docBits, header.bits0,
             header.bits1, header.docBase, header.docBytes, header.min0,
             header.min1, header.bytes0, (uint32_t)bytes1};

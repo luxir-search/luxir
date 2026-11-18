@@ -68,10 +68,19 @@ struct GeoPointSource {
     return column.getStartEndValueRank(docRank);
   }
 
+  static std::pair<PointTraits::Scalar, PointTraits::Scalar> unpack(int64_t packed) {
+    return {geo::unpackLatitude(packed), geo::unpackLongitude(packed)};
+  }
+
   static std::pair<PointTraits::Scalar, PointTraits::Scalar> pointAt(
       auto& values, int64_t pointRank) {
-    int64_t packed = values.valueAt(pointRank);
-    return {geo::unpackLatitude(packed), geo::unpackLongitude(packed)};
+    return unpack(values.valueAt(pointRank));
+  }
+
+  // The point of the iterator's document when it holds exactly one: the
+  // iterator's current value, with no access by rank.
+  static std::pair<PointTraits::Scalar, PointTraits::Scalar> docPoint(auto& iter) {
+    return unpack(iter.value());
   }
 };
 
