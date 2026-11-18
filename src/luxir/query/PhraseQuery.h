@@ -451,7 +451,7 @@ public:
       cachedTermInfos = context.pool.make_span<CachedTermInfo*>(query.getTerms().size());
       Similarity similarity;
       double idf = 0.0;
-      for (int i = 0; i < cachedTermInfos.size(); i++) {
+      for (size_t i = 0; i < cachedTermInfos.size(); i++) {
         cachedTermInfos[i] = context.getCachedTerminfo(*cachedFieldInfo, query.getTerms()[i]);
         if (cachedTermInfos[i] == nullptr) {
           cachedFieldInfo = nullptr;
@@ -789,7 +789,7 @@ public:
           return PostingsReader::END;
         }
 
-        for (int j = 1; j < posEnums.size(); j++) {
+        for (size_t j = 1; j < posEnums.size(); j++) {
           int32_t adjustedTarget = target + positions[j];
           int32_t p = posEnums[j]->advancePosition((int32_t) adjustedTarget);
           assert(p >= adjustedTarget);
@@ -822,7 +822,7 @@ public:
           return PostingsReader::END;
         }
 
-        for (int j = 1; j < posEnums.size(); j++) {
+        for (size_t j = 1; j < posEnums.size(); j++) {
           int32_t adjustedTarget = target + positions[j];
           int32_t p = scorer.repeatSlotAdvance(j, adjustedTarget);
           assert(p >= adjustedTarget);
@@ -1246,7 +1246,7 @@ public:
       auto* firstEnum = conjunctionEnums[0];
       outer:
       for (;;) {
-        for (int j = 1; j < conjunctionEnums.size(); j++) {
+        for (size_t j = 1; j < conjunctionEnums.size(); j++) {
           if (conjunctionEnums[j]->docId() < target) {
             int32_t id = conjunctionEnums[j]->advanceInline(target);
             assert(id >= target);

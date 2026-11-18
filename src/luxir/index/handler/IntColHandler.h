@@ -469,6 +469,7 @@ public:
                   const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
     : IntColHandler(inverter, fieldName, fieldType, space) {}
 
+  using IntColHandler::index;
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
     if (points.empty()) return;
     if (points.size() != 1) {
@@ -486,6 +487,7 @@ public:
                        const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
     : MultiIntColHandler(inverter, fieldName, fieldType, space) {}
 
+  using MultiIntColHandler::index;
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
     indexMulti(inverter, points | std::views::transform([](const GeoPoint& point) {
       return geo::encodePoint(point.latitude, point.longitude);
