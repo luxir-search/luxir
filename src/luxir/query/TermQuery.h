@@ -282,6 +282,11 @@ public:
 
       BulkPlan planBulk(
           BulkUse use, const BulkScorerContext& bulkContext) override {
+        if (bulkContext.requireExactRankingScores) {
+          BulkPlan plan;
+          plan.rankingScoresExact = BulkAnswer::YES;
+          return plan;
+        }
         if (bulkContext.requireConstantCount) {
           if (segment.mayHaveDeletes()) {
             return {

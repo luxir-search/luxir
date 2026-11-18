@@ -901,6 +901,8 @@ public:
       // Economics only: total expected consumption, including disjoint windows
       // and revisits. Never limits the scorer's membership or exhaustion.
       Demand expectedConsumption{};
+      // Ask only whether native pruned scores need no survivor rescoring.
+      bool requireExactRankingScores = false;
 
       bool hasFilter() const noexcept { return filterCost >= 0; }
     };

@@ -7830,3 +7830,189 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
     }
   }
 }
+
+TEST_F(SearchEngineTest, forcedCountCompositionKeepsCanonicalScores) {
+  CollectionHelper helper("forced_count_composition");
+  for (int segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    for (int doc = 0; doc < 1600; doc++) {
+      std::string body = "pad";
+      if (doc % 2) body += " alpha alpha";
+      if (doc % 3) body += " beta";
+      if (doc % 5) body += " gamma gamma gamma";
+      if (doc % 7) body += " delta";
+      if (doc % 11 == 0) body += " excluded";
+      if (doc % 13 == 0) body += " alpha beta";
+      docs.push_back(flatdoc("id", std::to_string(segment) + "_" + std::to_string(doc), "body_w", body));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteById("1_1", UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  reader->filterCache()->resize(0);
+  WholeMembershipPlanGuard whole(true);
+  SearchOverridesGuard guard(TopDocsReq::forceExactCountTopKCompositionForTests);
+  struct Result {
+    int64_t count;
+    std::vector<std::string> ids;
+    std::map<std::string, float> scores;
+    int64_t forced;
+    int64_t rejected;
+    int64_t compositions;
+    int64_t profitabilityRejects;
+  };
+  auto run = [&](auto makeQuery, bool forced, bool prepared = false) {
+    TopDocsReq::forceExactCountTopKCompositionForTests = forced;
+    auto req = localReq(helper.getSearchEngine());
+    req->testForcePrepare = prepared;
+    auto& top = req->topDocs("q").countLimit().getScores().fields({"id"}).limit(10);
+    top.rawQuery() = makeQuery(req->mr);
+    SkipStatsGuard stats;
+    req->execute(reader, false);
+    EXPECT_OK(req);
+    return Result{req->getMatchCount("q"), resultIds(*req, "q"), resultScoreMap(*req, "q"),
+        SkipStats::forcedExactCountTopKCompositions,
+        SkipStats::forcedExactCountTopKCertificateRejects + SkipStats::forcedExactCountTopKCapabilityRejects,
+        SkipStats::exactCountTopKCompositions, SkipStats::exactCountTopKProfitabilityRejects};
+  };
+  auto check = [&](auto makeQuery, bool accepted = true, bool prepared = false) {
+    auto off = run(makeQuery, false, prepared);
+    auto on = run(makeQuery, true, prepared);
+    EXPECT_EQ(0, off.forced);
+    EXPECT_EQ(off.count, on.count);
+    EXPECT_EQ(off.ids, on.ids);
+    expectBitIdenticalScoreMap(off.scores, on.scores);
+    if (accepted) { EXPECT_GT(on.forced, 0); }
+    else { EXPECT_EQ(0, on.forced); EXPECT_GT(on.rejected, 0); }
+  };
+  for (int clauses : {2, 3, 4}) for (bool filtered : {false, true}) {
+    SCOPED_TRACE(clauses);
+    SCOPED_TRACE(filtered);
+    check([&](auto& mr) {
+      std::array<std::string_view, 4> terms{"alpha", "beta", "gamma", "delta"};
+      std::vector<api::Query> required;
+      for (int i = 0; i < clauses; i++) required.push_back(
+          qb::boost(mr, qb::match(mr, "body_w", terms[(size_t)i]), 1.3f + (float)i * 0.7f));
+      std::vector<api::Query> filters;
+      if (filtered) filters.push_back(qb::match(mr, "body_w", "excluded"));
+      return qb::boolean(mr, required, {}, {}, filters);
+    });
+  }
+  check([](auto& mr) {
+    return qb::boolean(mr, {qb::match(mr, "body_w", "alpha"), qb::match(mr, "body_w", "beta")},
+        {}, {qb::match(mr, "body_w", "excluded")});
+  });
+  for (int minMatch : {0, 1}) {
+    SCOPED_TRACE(minMatch);
+    check([&](auto& mr) {
+      return qb::boolean(mr, {qb::match(mr, "body_w", "alpha"), qb::match(mr, "body_w", "beta")},
+          {qb::match(mr, "body_w", "gamma"), qb::match(mr, "body_w", "delta")}, {}, {}, minMatch);
+    });
+  }
+  check([](auto& mr) {
+    return qb::boolean(mr, {qb::boolean(mr,
+        {qb::match(mr, "body_w", "alpha"), qb::match(mr, "body_w", "beta")}),
+        qb::match(mr, "body_w", "gamma")});
+  });
+  check([](auto& mr) {
+    return qb::boolean(mr, {qb::phraseWords(mr, "body_w", {"alpha", "beta"}),
+        qb::match(mr, "body_w", "gamma")});
+  });
+  check([](auto& mr) {
+    auto query = qb::phraseWords(mr, "body_w", {"alpha", "beta"});
+    std::get<api::PhraseQuery>(query.kind).slop = 2;
+    return query;
+  }, false);
+  check([](auto& mr) {
+    return qb::boolean(mr, {qb::match(mr, "body_w", "alpha"), qb::match(mr, "body_w", "beta")});
+  }, false, true);
+
+  {
+    SearchOverridesGuard screen(TopDocsReq::exactCountTopKMinCandidateDensityInverseForTests);
+    for (int inverse : {0, 128}) for (bool phrase : {false, true}) {
+      TopDocsReq::exactCountTopKMinCandidateDensityInverseForTests = inverse;
+      auto make = [&](auto& mr) {
+        return phrase ? qb::phraseWords(mr, "body_w", {"alpha", "beta"})
+            : qb::match(mr, "body_w", "alpha beta gamma");
+      };
+      auto off = run(make, false), on = run(make, true);
+      EXPECT_EQ(0, on.forced + on.rejected);
+      EXPECT_EQ(off.compositions, on.compositions);
+      EXPECT_EQ(off.profitabilityRejects, on.profitabilityRejects);
+      EXPECT_EQ(off.count, on.count);
+      EXPECT_EQ(off.ids, on.ids);
+      expectBitIdenticalScoreMap(off.scores, on.scores);
+    }
+  }
+
+  TopDocsReq::forceExactCountTopKCompositionForTests = true;
+  {
+    auto nested = localReq(helper.getSearchEngine());
+    auto& outer = nested->topDocs("outer").matchQuery("id", "0_1").countLimit().limit(0);
+    outer.topDocs("inner").exprQuery("body_w:(+alpha +beta)")
+        .countLimit().getScores().fields({"id"}).limit(10);
+    SkipStatsGuard stats;
+    nested->execute(reader, false);
+    EXPECT_OK(nested);
+    EXPECT_EQ(0, SkipStats::forcedExactCountTopKCompositions);
+    EXPECT_GT(SkipStats::forcedExactCountTopKCapabilityRejects, 0);
+  }
+
+  TopDocsReq::forceExactCountTopKCompositionForTests = false;
+  auto req = localReq(helper.getSearchEngine());
+  req->reader = reader;
+  req->schema = helper.collection().getSchema();
+  req->topDocs("q").exprQuery("body_w:(+alpha +beta)").countLimit().getScores().limit(10);
+  auto* root = ProtobufSearchParser(*req).parse();
+  auto* top = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
+  ASSERT_NE(nullptr, top);
+  EXPECT_EQ(nullptr, top->countWeight);
+  EXPECT_EQ(nullptr, top->rankingWeight);
+  EXPECT_FALSE(top->forcedExactCountTopKComposition);
+}
+
+TEST_F(SearchEngineTest, forcedCompositionYieldsToWholeMembershipOutcomes) {
+  CollectionHelper helper("forced_whole_precedence");
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
+      .maxBytes = 1024 * 1024, .maxEntryBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2, .maxMetadataBytes = 64 * 1024});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 1000; doc++) docs.push_back(flatdoc(
+      "id", std::to_string(doc), "body_w", doc % 2 ? "facta factb" : "facta"));
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  WholeMembershipPlanGuard whole(false);
+  SearchOverridesGuard force(TopDocsReq::forceExactCountTopKCompositionForTests);
+  TopDocsReq::forceExactCountTopKCompositionForTests = true;
+  auto run = [&]() {
+    return runWholeTopK(helper.getSearchEngine(), "forced_whole_precedence",
+        WholeTopKFamily::INTERSECTION, "fact", 10);
+  };
+  auto first = run();
+  EXPECT_EQ(1, first.bypasses);
+  EXPECT_GT(first.compositions, 0);
+  auto build = run();
+  EXPECT_EQ(1, build.builds);
+  EXPECT_EQ(0, build.compositions);
+  ASSERT_GT(cache->counters().residentBytes, 0u);
+  cache->resize(1);
+  ASSERT_EQ(0u, cache->counters().residentBytes);
+  auto remembered = run();
+  EXPECT_EQ(1, remembered.bypasses);
+  EXPECT_EQ(0, remembered.hits);
+  EXPECT_EQ(0, remembered.builds);
+  EXPECT_EQ(1, remembered.cardinalityCounts);
+  EXPECT_EQ(0, remembered.compositions);
+  cache->resize(1024 * 1024);
+  EXPECT_EQ(1, run().builds);
+  auto hit = run();
+  EXPECT_EQ(1, hit.hits);
+  EXPECT_EQ(0, hit.compositions);
+  expectSameWholeTopK(first, hit);
+  ASSERT_TRUE(helper.deleteById("1", UpdateMessage::COMMIT).success);
+  cache->resize(1);
+  auto local = run();
+  EXPECT_EQ(499, local.found);
+  EXPECT_EQ(1, local.localCounts);
+  EXPECT_EQ(0, local.compositions);
+
+}

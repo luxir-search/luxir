@@ -8,19 +8,27 @@ namespace luxir::QueryPrep {
 
 int64_t countSegment(MemPool& pool, Query::ScorerSupplier* supplier,
                      DocSet* domain, int32_t maxDoc) {
-  if (supplier == nullptr) return 0;
+  if (supplier == nullptr) {
+    skipCount(SkipStats::scalarCountConstants);
+    return 0;
+  }
   Query::ScorerSupplier::BulkScorerContext bulkContext;
   auto plan = supplier->planBulk(Query::ExecutionUse::COUNT_WINDOWS, bulkContext);
   if (plan.available == Query::ScorerSupplier::BulkAnswer::YES) {
     if (plan.hasConstantCount()) {
-      if (domain == nullptr) return plan.constantCount;
+      if (domain == nullptr) {
+        skipCount(SkipStats::scalarCountConstants);
+        return plan.constantCount;
+      }
     } else if (auto* bulk = supplier->buildBulk(pool, plan)) {
+      skipCount(SkipStats::scalarCountWindows);
       return countMatchesWindowed(bulk, domain, nullptr, maxDoc);
     }
   } else {
     supplier->recordBulkPlanCommitment(
         Query::ExecutionUse::COUNT_WINDOWS, bulkContext, plan);
   }
+  skipCount(SkipStats::scalarCountPulls);
   auto demand = Query::Demand::fromLeadCost(std::numeric_limits<int64_t>::max());
   auto* pull = supplier->resolve(pool, supplier->makePlanContext(demand));
   auto* scorer = pull->build(pool);

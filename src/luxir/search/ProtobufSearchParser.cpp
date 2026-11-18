@@ -2216,9 +2216,17 @@ public:
     }
     Query::Weight* countWeight = nullptr;
     Query::Weight* rankingWeight = nullptr;
+    bool forceComposition = TopDocsReq::forceExactCountTopKCompositionForTests
+        && exactCountTopK && weight != nullptr && !weight->canComposeExactCountTopK();
+    bool forcedComposition = forceComposition
+        && topCount <= TopDocsReq::kExactCountTopKMaxDepth
+        && !weight->needsPrepare() && !weight->consumesDomain()
+        && !weight->isConstantScoring();
+    if (forceComposition && !forcedComposition) skipCount(SkipStats::forcedExactCountTopKCapabilityRejects);
     if (weight != nullptr && !cacheFirstTopKCount
         && !disableTopKCountComposition && exactCountTopK
-        && !weight->needsPrepare() && weight->canComposeExactCountTopK()
+        && !weight->needsPrepare()
+        && (weight->canComposeExactCountTopK() || forcedComposition)
         // A constant-score ranking pass is bounded only when no collector
         // filter can reject its first K matches. Variable-score composition
         // retains its existing filtered candidate route.
@@ -2410,6 +2418,7 @@ public:
 
     qr->collapse = collapse;
     qr->diversify = diversify;
+    qr->forcedExactCountTopKComposition = forcedComposition && countWeight != nullptr;
     qr->boundedCount = boundedCount && wholeMembershipWeight == nullptr
         && wholeMembershipUse == nullptr;
     if (qr->boundedCount && filterWeights.empty()) {

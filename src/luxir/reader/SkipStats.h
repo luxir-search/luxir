@@ -344,6 +344,12 @@ struct SkipStats {
   static inline int64_t wholeTopKCountConstant = 0;
   static inline int64_t wholeTopKCountFallbackSuppliers = 0;
   static inline int64_t wholeTopKCountLocalCounts = 0;
+  static inline int64_t forcedExactCountTopKCompositions = 0;
+  static inline int64_t forcedExactCountTopKCertificateRejects = 0;
+  static inline int64_t forcedExactCountTopKCapabilityRejects = 0;
+  static inline int64_t scalarCountConstants = 0;
+  static inline int64_t scalarCountWindows = 0;
+  static inline int64_t scalarCountPulls = 0;
   static inline int64_t wholeMembershipCardinalityCounts = 0;
   static inline int64_t wholeFieldSortHits = 0;
   static inline int64_t wholeFieldSortBuilds = 0;
@@ -663,6 +669,12 @@ struct SkipStats {
     wholeTopKCountConstant = 0;
     wholeTopKCountFallbackSuppliers = 0;
     wholeTopKCountLocalCounts = 0;
+    forcedExactCountTopKCompositions = 0;
+    forcedExactCountTopKCertificateRejects = 0;
+    forcedExactCountTopKCapabilityRejects = 0;
+    scalarCountConstants = 0;
+    scalarCountWindows = 0;
+    scalarCountPulls = 0;
     wholeMembershipCardinalityCounts = 0;
     wholeFieldSortHits = 0;
     wholeFieldSortBuilds = 0;

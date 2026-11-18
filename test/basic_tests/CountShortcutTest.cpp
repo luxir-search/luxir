@@ -182,15 +182,21 @@ TEST_P(CountShortcutTest, metadataLeavesAndWrappersAgree) {
 }
 
 TEST_P(CountShortcutTest, scalarCountUsesConstantsWindowsAndPull) {
+  CountStats stats;
   MemPool pool;
   Query::Context context(pool, *reader);
   auto& segment = reader->segments()[0];
   Query::ScorerSupplier::BulkScorerContext constantContext;
   constantContext.requireConstantCount = true;
+  MatchNoDocsQuery none;
+  EXPECT_EQ(0, QueryPrep::countSegment(pool, none.createWeight(context, 0)
+      ->scorerSupplier(pool, segment), nullptr, DOCS));
   AllQuery all;
   auto* allSupplier = all.createWeight(context, 0)->scorerSupplier(pool, segment);
   ASSERT_TRUE(allSupplier->planBulk(Query::ExecutionUse::COUNT_WINDOWS, constantContext).hasConstantCount());
   EXPECT_EQ(DOCS, QueryPrep::countSegment(pool, allSupplier, nullptr, DOCS));
+
+  EXPECT_EQ(1, SkipStats::scalarCountConstants);
 
   TermQuery alpha("body_w", "alpha"), beta("body_w", "beta");
   std::array<Query*, 2> required{&alpha, &beta};
@@ -200,8 +206,9 @@ TEST_P(CountShortcutTest, scalarCountUsesConstantsWindowsAndPull) {
   auto windowsPlan = windows->planBulk(Query::ExecutionUse::COUNT_WINDOWS, {});
   ASSERT_EQ(Query::ScorerSupplier::BulkAnswer::YES, windowsPlan.available);
   EXPECT_FALSE(windowsPlan.hasConstantCount());
-  CountStats stats;
   EXPECT_EQ(DOCS / 2, QueryPrep::countSegment(pool, windows, nullptr, DOCS));
+
+  EXPECT_EQ(2, SkipStats::scalarCountWindows);
 
   std::array<std::string_view, 2> terms{"alpha", "beta"};
   std::array<int32_t, 2> positions{0, 1};
@@ -212,6 +219,7 @@ TEST_P(CountShortcutTest, scalarCountUsesConstantsWindowsAndPull) {
       pull->planBulk(Query::ExecutionUse::COUNT_WINDOWS, {}).available);
   EXPECT_EQ(DOCS / 2, QueryPrep::countSegment(pool, pull, nullptr, DOCS));
   EXPECT_GT(SkipStats::phraseVerifies, 0);
+  EXPECT_EQ(1, SkipStats::scalarCountPulls);
 
   RAMBitDocSet domain(DOCS);
   domain.mutableBits().set(1); domain.mutableBits().set(3);

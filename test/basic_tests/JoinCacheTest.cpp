@@ -11,6 +11,7 @@
 #include "luxir/query/QueryPrep.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/ParseContext.h"
+#include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/query/ProtobufQueryParser.h"
 
 namespace luxir::test {
@@ -972,6 +973,40 @@ TEST_F(JoinCacheTest, readerStableChildAndOwnerSelectionRespectLiveEligibility) 
   EXPECT_GT(cache->counters().readerStableRetires, 0u);
   cache->resize(0);
   EXPECT_TRUE(containsDoc(selected(false), flatdoc("id", "v1")));
+}
+
+TEST_F(JoinCacheTest, forcedCompositionKeepsJoinScoresWithAndWithoutOwnerSets) {
+  indexRangeOwners();
+  SearchOverridesGuard force(TopDocsReq::forceExactCountTopKCompositionForTests);
+  SearchOverridesGuard whole(QueryPrep::disableWholeMembershipPlanForTests);
+  QueryPrep::disableWholeMembershipPlanForTests = true;
+  auto wire = localReq(helper.getSearchEngine());
+  auto join = qb::boost(wire->mr, qb::toParent(wire->mr, "rows_nested",
+      qb::range(wire->mr, "value_i", qb::valI64(wire->mr, 1), nullptr,
+          qb::valI64(wire->mr, 2), nullptr)), 2.5f);
+  auto run = [&](bool required, bool forced, bool owner) {
+    TopDocsReq::forceExactCountTopKCompositionForTests = forced;
+    auto req = localReq(helper.getSearchEngine());
+    auto term = qb::match(req->mr, "tag_w", "common");
+    req->topDocs().countLimit().getScores().fields({"id"}).limit(10).rawQuery() = required
+        ? qb::boolean(req->mr, {term, join}) : qb::boolean(req->mr, {term}, {}, {}, {join});
+    SkipStatsScope stats;
+    req->execute(1); EXPECT_OK(req);
+    EXPECT_EQ(64, req->getMatchCount());
+    EXPECT_EQ(forced ? 1 : 0, SkipStats::forcedExactCountTopKCompositions);
+    if (owner) { EXPECT_EQ(0, SkipStats::joinChildSuppliers); }
+    std::vector<std::pair<std::string, uint32_t>> result;
+    auto* docs = req->docList();
+    auto ids = std::get<api::ColStr>(docs->columns.at("id").kind).v;
+    auto scores = std::get<api::ColFloat>(docs->columns.at("_score_").kind).v;
+    for (size_t i = 0; i < ids.size(); i++) result.emplace_back(ids[i], std::bit_cast<uint32_t>(scores[i]));
+    return result;
+  };
+  cache->resize(0);
+  for (bool required : {false, true}) EXPECT_EQ(run(required, false, false), run(required, true, false));
+  cache->resize(1024 * 1024); cache->resetAdmission();
+  publishSource(join);
+  for (bool required : {false, true}) EXPECT_EQ(run(required, false, true), run(required, true, true));
 }
 
 } // namespace

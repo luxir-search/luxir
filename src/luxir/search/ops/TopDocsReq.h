@@ -76,6 +76,7 @@ public:
   static inline int32_t exactCountTopKMinCandidateDensityInverseForTests =
       kExactCountTopKMinCandidateDensityInverse;
   static inline int32_t localWholeMembershipMaxCandidatesPerMatchForTests = 8;
+  static inline bool forceExactCountTopKCompositionForTests = false;
   // A sparse filter that is cheaper than its union body makes the exhaustive
   // scored batch the natural single pass. Keep this knee separate from the
   // batch admission constant even though both measured at /44.
@@ -608,6 +609,7 @@ public:
   Query::Weight* variantMembershipWeight;
   Query::Weight* countWeight;
   Query::Weight* rankingWeight;
+  bool forcedExactCountTopKComposition = false;
   Query::Weight* wholeRankingWeight;
   bool wholeConstantRanking;
   Query::ScoreProfile scoreProfile;
@@ -1226,9 +1228,15 @@ public:
         Query::ScorerSupplier& countSupplier, DocSet* collectorFilter,
         auto& collector, int32_t maxDoc) {
       Query::ScorerSupplier::BulkScorerContext bulkContext;
+      bulkContext.requireExactRankingScores = thisOp().forcedExactCountTopKComposition;
       auto scoringPlan = scoringSupplier.planBulk(
           Query::ScorerSupplier::BulkUse::EXACT_CANDIDATE_SCORING,
           bulkContext);
+      if (bulkContext.requireExactRankingScores
+          && scoringPlan.rankingScoresExact != Query::ScorerSupplier::BulkAnswer::YES) {
+        skipCount(SkipStats::forcedExactCountTopKCertificateRejects);
+        return false;
+      }
       bool scoringDeclined =
           scoringPlan.available
               != Query::ScorerSupplier::BulkAnswer::YES
@@ -2591,11 +2599,14 @@ public:
               if (!Collapsed && builderPtr == nullptr
                   && scoreCollector->topCount > 0
                   && op.countWeight != nullptr && op.rankingWeight != nullptr) {
-                auto* countSupplier = op.countWeight->scorerSupplier(
-                    poolGuard.pool(), seg);
+                bool forced = op.forcedExactCountTopKComposition;
+                bool canonical = domain == nullptr || domain == seg.liveDocSet();
+                if (forced && !canonical) skipCount(SkipStats::forcedExactCountTopKCapabilityRejects);
+                auto* countSupplier = forced && !canonical ? nullptr
+                    : op.countWeight->scorerSupplier(poolGuard.pool(), seg);
                 if (countSupplier != nullptr
-                    && admitExactCountTopK(
-                        *countSupplier, collectorFilter, seg.maxDoc())) {
+                    && (forced || admitExactCountTopK(
+                        *countSupplier, collectorFilter, seg.maxDoc()))) {
                   switch (exactCountTopKRoute) {
                     case ExactCountTopKRoute::EXACT_CANDIDATE_SCORING:
                       composedExactCountTopK =
@@ -2611,6 +2622,7 @@ public:
                           seg.maxDoc());
                       break;
                   }
+                  if (forced && composedExactCountTopK) skipCount(SkipStats::forcedExactCountTopKCompositions);
                   skipCount(composedExactCountTopK
                       ? SkipStats::exactCountTopKCompositions
                       : SkipStats::exactCountTopKBulkFallbacks);

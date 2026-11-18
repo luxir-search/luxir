@@ -10997,8 +10997,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           }
           BulkPlan bulkPlan = knownBulkPlan(
               BulkAnswer::YES, BulkAnswer::YES,
-              mode == ConjunctionMode::CANDIDATE
-                  ? BulkAnswer::YES : BulkAnswer::NO,
+              BulkAnswer::NO,
               enclosingFilterSuppliers.empty()
                   ? BulkAnswer::NO : BulkAnswer::YES,
               acceptsWindowFilter
@@ -12263,6 +12262,21 @@ class BooleanQuery::Weight final : public Query::Weight {
     BulkPlan planBulk(
         BulkUse use, const BulkScorerContext& bulkContext) override {
       if (scorePolicy.kind != ScorePolicy::SUM) return noBulkPlan();
+      if (bulkContext.requireExactRankingScores) {
+        BulkPlan plan;
+        if (mandatoryShapeSuppliers.empty()) return plan;
+        for (size_t i = 0; i < mandatoryShapeSuppliers.size(); i++) {
+          auto* child = mandatoryShapeSuppliers[i];
+          if (mandatoryScores[i] && child != nullptr
+              && child->planBulk(use, bulkContext).rankingScoresExact != BulkAnswer::YES) return plan;
+        }
+        for (auto* child : optionalShapeSuppliers) {
+          if (child != nullptr
+              && child->planBulk(use, bulkContext).rankingScoresExact != BulkAnswer::YES) return plan;
+        }
+        plan.rankingScoresExact = BulkAnswer::YES;
+        return plan;
+      }
       if (bulkContext.requireConstantCount) {
         if (mandatoryShapeSuppliers.empty() && prohibitedSources.empty()
             && filterSuppliers.empty() && minShouldMatch <= 1

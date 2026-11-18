@@ -280,3 +280,30 @@ TEST_F(DenseScoredAdmissionTest, segmentsDecideIndependently) {
 }
 
 } // namespace
+
+TEST(CandidateScoringContractTest, candidatePlanDescribesItsExactScoringProduct) {
+  CollectionHelper helper("candidate_certificate");
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 256; doc++) {
+    std::string body = doc % 3 ? "alpha beta" : "alpha";
+    if (doc % 16 == 0) body += " keep";
+    docs.push_back(flatdoc("id", std::to_string(doc), "body_w", body));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = std::make_shared<IndexReader>(helper.getIndexWriter()->dir);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  TermQuery alpha("body_w", "alpha"), beta("body_w", "beta"), keep("body_w", "keep");
+  std::array<Query*, 2> required{&alpha, &beta};
+  std::array<Query*, 1> filters{&keep};
+  BooleanQuery query(required, {}, {}, filters);
+  auto* supplier = query.createWeight(context, Query::NEED_SCORES)
+      ->scorerSupplier(pool, reader->segments()[0]);
+  auto plan = supplier->planBulk(Query::ExecutionUse::EXACT_CANDIDATE_SCORING, {});
+  ASSERT_EQ(Query::ScorerSupplier::BulkAnswer::YES, plan.available);
+  auto* bulk = supplier->buildBulk(pool, plan);
+  ASSERT_NE(nullptr, bulk);
+  EXPECT_EQ(bulk->supportsExactCandidateScoring(),
+      plan.supportsExactCandidateScoring == Query::ScorerSupplier::BulkAnswer::YES);
+  EXPECT_FALSE(bulk->supportsExactCandidateScoring());
+}

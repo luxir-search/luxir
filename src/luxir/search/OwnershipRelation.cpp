@@ -662,6 +662,15 @@ public:
       : child(child), mapper(mapper), domain(domain), ownerCount(ownerCount), childCount(childCount),
         reduction(reduction), multiplier(multiplier) {}
 
+  BulkPlan planBulk(BulkUse use, const BulkScorerContext& context) override {
+    BulkPlan plan;
+    if (context.requireExactRankingScores
+        && (reduction.kind == RowReduction::FIXED || reduction.kind == RowReduction::CONSTANT)) {
+      plan.rankingScoresExact = BulkAnswer::YES;
+    }
+    return plan;
+  }
+
   int64_t cost() override { return std::min(child.cost(), (int64_t)ownerCount); }
 
   Query::ScorerShape describeScorer(const Query::PlanContext& context) const override {
