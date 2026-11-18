@@ -67,6 +67,8 @@ public:
 
   FilteredTermsEnum* createFilteredEnum(MemPool& pool,
                                         TermsEnum& te) override;
+
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
 };
 
 } // namespace luxir

@@ -16,17 +16,16 @@ DomainHandle materializeEffectiveFilter(const PreparedSource& source, IndexReade
     use = nullptr;
   }
   if (use == nullptr) {
-    return DomainHandle(materialize(weight, prepared, segment, domain));
+    return DomainHandle(materialize(weight, prepared, segment, domain)).scoped(segment);
   }
 
   if (use->scope() == FilterKeyScope::READER_STABLE) {
     if (auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared)) {
-      [[maybe_unused]] DocSet* canonical =
-          !segment.hasDeletes() ? nullptr : &segment.liveDocs()->docset();
+      [[maybe_unused]] DocSet* canonical = segment.liveDocSet();
       assert(domain == nullptr || domain == canonical);
-      return DomainHandle::borrowed(cached->docSet(segment));
+      return DomainHandle::borrowed(cached->docSet(segment)).scoped(segment);
     }
-    return DomainHandle(materialize(weight, prepared, segment, domain));
+    return DomainHandle(materialize(weight, prepared, segment, domain)).scoped(segment);
   }
 
   if (probe.kind() == FilterCache::Probe::Kind::HIT) {
@@ -34,25 +33,25 @@ DomainHandle materializeEffectiveFilter(const PreparedSource& source, IndexReade
   } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
-    uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
-    use->publishRawByproduct((size_t)segment.ord, probe, std::move(raw), buildCostMicros);
+    uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
+    use->publishRawByproduct((size_t)segment.ord, probe, std::move(raw), buildCostNanos);
   } else {
     // A non-folded raw materialization is free by-product population. A
     // domain-composed set must never enter the raw cache.
     if (domain == nullptr && use->wasAdmitted() && !weight.needsScores() && !weight.allowsPruning()) {
       auto buildStart = std::chrono::steady_clock::now();
       auto raw = materializeRawFilter(weight, prepared, segment);
-      uint32_t buildCostMicros = elapsedBuildMicros(buildStart);
-      use->offerRaw((size_t)segment.ord, std::move(raw), buildCostMicros);
+      uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
+      use->offerRaw((size_t)segment.ord, std::move(raw), buildCostNanos);
       DocSet* docs = use->effectiveDocSet((size_t)segment.ord, reader);
-      return DomainHandle::borrowed(docs);
+      return DomainHandle::borrowed(docs).scoped(segment);
     }
     if (!disableFilterOwnForTests && !weight.needsScores() && !weight.allowsPruning()) {
       auto raw = materializeRawFilter(weight, prepared, segment);
       use->adoptOwnedRaw((size_t)segment.ord, probe, std::move(raw));
       return use->effectiveDomain((size_t)segment.ord, reader, domain);
     }
-    return DomainHandle(materialize(weight, prepared, segment, domain));
+    return DomainHandle(materialize(weight, prepared, segment, domain)).scoped(segment);
   }
 
   return use->effectiveDomain((size_t)segment.ord, reader, domain);

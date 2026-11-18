@@ -26,6 +26,93 @@ class UtilTest : public LuxirTest {
 protected:
 };
 
+TEST_F(UtilTest, scopeCreatesNoGroupUntilSpawn) {
+  FanoutScope scope(nullptr, FanoutPolicy::EVERY);
+  EXPECT_FALSE(scope.published());
+  scope.join();
+  scope.cancel();
+  EXPECT_FALSE(scope.published());
+  EXPECT_FALSE(scope.canceled());
+  bool ran = false;
+  scope.spawn([&] { ran = true; });
+  EXPECT_TRUE(scope.published());
+  scope.join();
+  EXPECT_TRUE(ran);
+  // Reuse after join must re-arm destruction's cancel/drain guard.
+  scope.spawn([&] { ran = false; });
+  scope.join();
+  EXPECT_FALSE(ran);
+}
+
+TEST_F(UtilTest, scopeSpawnsIntoItsArenaFromOutside) {
+  oneapi::tbb::task_arena arena(2);
+  std::thread outside([&] {
+    EXPECT_EQ((int)oneapi::tbb::task_arena::not_initialized,
+              oneapi::tbb::this_task_arena::current_thread_index());
+    FanoutScope scope(&arena, FanoutPolicy::EVERY);
+    bool ran = false;
+    scope.spawn([&] {
+      EXPECT_EQ(2, oneapi::tbb::this_task_arena::max_concurrency());
+      ran = true;
+    });
+    // Publication's execute has returned before the join re-enters the arena.
+    scope.join();
+    EXPECT_TRUE(ran);
+  });
+  outside.join();
+}
+
+TEST_F(UtilTest, scopeJoinRunsOnlyItsOwnTasks) {
+  oneapi::tbb::task_arena arena(2);
+  arena.execute([&] {
+    FanoutScope first(&arena, FanoutPolicy::EVERY), other(&arena, FanoutPolicy::EVERY);
+    std::promise<void> started, release;
+    auto starting = started.get_future();
+    auto released = release.get_future();
+    bool ranFirst = false, ranOther = false;
+    // Hold the worker so only the joiner could pick up the other queued task.
+    // Keep a worker in the arena, as node arenas do: oneTBB's workerless
+    // teardown asserts on deque holes left by waits with different tags.
+    other.spawn([&] { started.set_value(); released.wait(); });
+    EXPECT_EQ(std::future_status::ready, starting.wait_for(std::chrono::seconds(10)));
+    first.spawn([&] { ranFirst = true; });
+    other.spawn([&] {
+      ranOther = true;
+      // A broken isolation tag fails with a timeout rather than hanging.
+      EXPECT_EQ(std::future_status::ready, released.wait_for(std::chrono::seconds(1)));
+    });
+    first.join();
+    EXPECT_TRUE(ranFirst);
+    EXPECT_FALSE(ranOther);
+    release.set_value();
+    other.join();
+    EXPECT_TRUE(ranOther);
+  });
+}
+
+TEST_F(UtilTest, scopeChildInheritsCancellationUnlessIsolated) {
+  oneapi::tbb::task_arena arena(1);
+  for (bool isolated : {false, true}) arena.execute([&] {
+    FanoutScope parent(&arena, FanoutPolicy::EVERY);
+    bool ran = false;
+    parent.spawn([&] {
+      auto child = parent.child(isolated);
+      child.spawn([&] { ran = true; });
+      parent.cancel();
+      EXPECT_EQ(!isolated, child.canceled());
+      child.join();
+    });
+    parent.join();
+    EXPECT_EQ(isolated, ran);
+  });
+}
+
+TEST_F(UtilTest, scopeJoinRethrowsTaskFailure) {
+  FanoutScope scope(nullptr, FanoutPolicy::EVERY);
+  scope.spawn([] { throw std::runtime_error("task failure"); });
+  EXPECT_THROW(scope.join(), std::runtime_error);
+}
+
 TEST_F(UtilTest, packedTermTruncate) {
   std::string atCap(PackedTerm::MAX_LEN, 'a');
   EXPECT_EQ(atCap, PackedTerm::truncate(atCap));            // at the cap: identity
@@ -98,9 +185,9 @@ TEST_F(UtilTest, taskFanoutKeepsLastOnCaller) {
   std::array<int, 4> values;
   int64_t spawns;
   {
-    TaskGroupRunner runner;
+    FanoutScope runner(nullptr, FanoutPolicy::EVERY);
     luxir::test::TaskSpawnCounter counter;
-    task_group_fanout(runner.group(), threads.size(),
+    task_group_fanout(&runner, threads.size(),
         [&, state = std::make_unique<int>(0)](size_t i) mutable {
       madeOn[i] = std::this_thread::get_id();
       int value = ++*state;
@@ -129,14 +216,14 @@ TEST_F(UtilTest, taskFanoutEmptyAndUnaryStayOnCaller) {
   auto caller = std::this_thread::get_id();
   int64_t spawns;
   {
-    TaskGroupRunner runner;
+    FanoutScope runner(nullptr, FanoutPolicy::EVERY);
     luxir::test::TaskSpawnCounter counter;
-    task_group_fanout(runner.group(), 0, [&](size_t) {
+    task_group_fanout(&runner, 0, [&](size_t) {
       ADD_FAILURE() << "empty fan-out invoked its factory";
       return [&]() { completed++; };
     });
     EXPECT_EQ(0, completed);
-    task_group_fanout(runner.group(), 1, [&](size_t i) {
+    task_group_fanout(&runner, 1, [&](size_t i) {
       EXPECT_EQ(0u, i);
       EXPECT_EQ(caller, std::this_thread::get_id());
       return [&]() {
@@ -151,13 +238,13 @@ TEST_F(UtilTest, taskFanoutEmptyAndUnaryStayOnCaller) {
   EXPECT_EQ(0, spawns);
 }
 
-TEST_F(UtilTest, taskGroupRunnerForksAreNotCounted) {
+TEST_F(UtilTest, scopeDirectSpawnsAreNotCounted) {
   std::atomic<int> completed{0};
   int64_t spawns;
   {
-    TaskGroupRunner runner;
+    FanoutScope runner(nullptr, FanoutPolicy::EVERY);
     luxir::test::TaskSpawnCounter counter;
-    runner.run(true, [&] { completed.fetch_add(1); });
+    runner.spawn([&] { completed.fetch_add(1); });
     runner.join();
     spawns = counter.count();
   }
@@ -165,7 +252,7 @@ TEST_F(UtilTest, taskGroupRunnerForksAreNotCounted) {
   EXPECT_EQ(0, spawns);
 }
 
-TEST_F(UtilTest, taskFanoutInlineFailureDrainsSiblings) {
+TEST_F(UtilTest, scopeUnwindCancelsAndDrains) {
   for (bool failFactory : {false, true}) {
     SCOPED_TRACE(failFactory);
     std::promise<void> started, release;
@@ -180,8 +267,8 @@ TEST_F(UtilTest, taskFanoutInlineFailureDrainsSiblings) {
         throw std::runtime_error("stop");
       };
       EXPECT_THROW({
-        TaskGroupRunner runner;
-        task_group_fanout(runner.group(), 2, [&](size_t i) {
+        FanoutScope runner(nullptr, FanoutPolicy::EVERY);
+        task_group_fanout(&runner, 2, [&](size_t i) {
           if (failFactory && i == 1) fail();
           return [&, i]() {
             if (i == 0) {

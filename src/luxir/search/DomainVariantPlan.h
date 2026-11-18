@@ -478,10 +478,11 @@ public:
   template <bool Tracked = false>
   DomainHandle constrainRaw(
       DomainHandle rawMatches, DomainHandle base, RequestMemTracker* tracker = nullptr) const {
+    rawMatches.assertSameScope(base);
     if (rawMatches.get() == nullptr) return freeze(std::move(base));
     if (base.get() == nullptr) return freeze(std::move(rawMatches));
     std::array<DocSet*, 2> parts{rawMatches.get(), base.get()};
-    auto result = freeze(DomainHandle(DocSet::intersect(parts)));
+    auto result = freeze(DomainHandle(DocSet::intersect(parts)).scopedLike(base));
     if constexpr (Tracked) return account(std::move(result), *tracker, "constrained bucket matches");
     else return result;
   }
@@ -508,7 +509,7 @@ public:
     std::vector<DomainHandle> output(inheritBaseCount());
     for (size_t variant = 0; variant < output.size(); variant++) {
       DomainHandle eligibility = composeBase<Tracked>(variant, base, filters, tracker);
-      output[variant] = freeze(producer(eligibility.get()));
+      output[variant] = freeze(producer(eligibility.get()).scopedLike(eligibility));
       if constexpr (Tracked) {
         output[variant] = account(std::move(output[variant]), *tracker, "independent bucket matches");
       }
@@ -526,15 +527,17 @@ public:
   static DomainHandle compose(std::vector<DomainHandle> parts) {
     std::vector<DocSet*> sets;
     DomainHandle single;
+    const DomainHandle* scope = parts.empty() ? nullptr : &parts[0];
     sets.reserve(parts.size());
     for (auto& part : parts) {
+      part.assertSameScope(*scope);
       if (part.get() == nullptr) continue;
       sets.push_back(part.get());
       single = part;
     }
-    if (sets.empty()) return {};
+    if (sets.empty()) return scope ? DomainHandle().scopedLike(*scope) : DomainHandle();
     if (sets.size() == 1) return freeze(std::move(single));
-    return freeze(DomainHandle(DocSet::intersect(sets)));
+    return freeze(DomainHandle(DocSet::intersect(sets)).scopedLike(*scope));
   }
 
   // Exact content equality for whole-reader preparation dedupe. Pointer
@@ -603,6 +606,8 @@ public:
       size_t left, size_t right, std::span<IndexReader::Segment> segments) {
     assert(domains.size() == segments.size());
     for (size_t segnum = 0; segnum < segments.size(); segnum++) {
+      domains[segnum][left].assertScope(segments[segnum]);
+      domains[segnum][right].assertScope(segments[segnum]);
       if (!sameEffectiveDomain(
               domains[segnum][left].get(), domains[segnum][right].get(),
               segments[segnum].maxDoc())) {
@@ -746,7 +751,7 @@ public:
       std::vector<QueryPrep::PreparedSource>& preparedSources,
       const std::vector<std::vector<DomainHandle>>& eligibility,
       std::span<DocSet* const> canonicalDomains,
-      IndexReader& reader, bool parallel, ExecutionWarnings* warnings,
+      IndexReader& reader, FanoutScope* fanout, ExecutionWarnings* warnings,
       Reserve&& reserve, PreparedCharge chargePrepared = {},
       Finish&& finish = nullptr) const {
     auto segments = reader.segments();
@@ -823,7 +828,7 @@ public:
         Query::Weight::PrepareContext context{
           reader,
           std::span<DocSet* const>(views.data(), views.size()),
-          parallel, warnings};
+          fanout, warnings};
         std::array<Query::Weight*, 1> weights{sourceWeight(source)};
         std::array<FilterCache::Use*, 1> uses{sourceUse(source)};
         auto prepared = QueryPrep::prepareFilterSources(
@@ -871,7 +876,7 @@ public:
           Query::Weight::PrepareContext context{
             reader,
             std::span<DocSet* const>(views.data(), views.size()),
-            parallel, warnings};
+            fanout, warnings};
           ownedWeight = sourceWeight(source)->prepare(context);
           variantWeight = ownedWeight.get();
         }
@@ -882,6 +887,7 @@ public:
           DomainHandle matches(QueryPrep::materialize(
               *sourceWeight(source), variantWeight, segments[segnum],
               eligibility[segnum][variant].get()));
+          matches = std::move(matches).scoped(segments[segnum]);
           if (matches.get() != nullptr) {
             reservation->grow(matches.get()->ramBytesUsed());
           }
@@ -917,6 +923,7 @@ public:
             auto charge = reserve(variant, segment);
             DomainHandle matches(QueryPrep::materialize(preparedSources[source].segmentSource(),
                 segments[segment], eligibility[segment][variant].get()));
+            matches = std::move(matches).scoped(segments[segment]);
             if (matches.get()) charge->grow(matches.get()->ramBytesUsed());
             domains.push_back(std::move(matches).chargedWith(std::move(charge)));
           }
@@ -966,13 +973,13 @@ public:
   std::vector<std::vector<DomainHandle>> produceBucketDomains(
       IndexReader& reader, Query::PlanningContext& planning,
       std::span<const DomainHandle> inherited, std::span<const DomainHandle> resetBase,
-      bool parallel, ExecutionWarnings* warnings, RequestMemTracker& tracker,
+      FanoutScope* fanout, ExecutionWarnings* warnings, RequestMemTracker& tracker,
       Sources sources, const Finish& finish = {}) const;
 
   std::vector<std::vector<DomainHandle>> producePreparedDomains(
       IndexReader& reader, Query::PlanningContext& planning,
       std::span<const DomainHandle> inherited, std::span<const DomainHandle> resetBase,
-      bool parallel, ExecutionWarnings* warnings, BucketProduction& production, const Finish& finish) const;
+      FanoutScope* fanout, ExecutionWarnings* warnings, BucketProduction& production, const Finish& finish) const;
 
   void retainReservation(
       std::vector<DomainHandle>& domains,

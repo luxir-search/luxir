@@ -31,9 +31,11 @@ class IdHandler final : public Inverter::IndexHandler {
   std::vector<UndoEntry> undoLog_;
 
 public:
-  IdHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
-    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
-      idPool(std::make_unique<MemPool>(&indexingArena())), ids(*idPool, 4) {}
+  IdHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space),
+      idPool(std::make_unique<MemPool>(&indexingArena())), ids(*idPool, 4) {
+    if (space != SpaceOrdinal::ROOT) throw std::invalid_argument("id handler requires the root space");
+  }
 
   void index(Inverter& inverter, const IndexVal& val) override {
     if (auto s = std::get_if<std::string_view>(&val.kind)) {
@@ -157,11 +159,11 @@ public:
       PostingsWriter& postingsWriter = inverter.getPostingsWriter();
       auto guard = MemPool::threadLocalPoolGuard();
       TextWriter textWriter(postingsWriter);
-      PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
-      fieldInfo.type = fieldType->persistedType();
+      PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(space, fieldName);
+      fieldInfo.type = fieldType->type();
       fieldInfo.flags = fieldType->segmentFlags();
       fieldInfo.typeFlags = fieldType->segmentTypeFlags();
-      OrdCollector ords(guard.pool(), inverter.getMaxDoc());
+      OrdCollector ords(guard.pool(), inverter.getPostingsWriter().getMaxDoc(space));
       inverter.noteFlushWorkspace(ords.slotBytes());
 
       textWriter.startField(&fieldInfo);

@@ -432,10 +432,10 @@ TEST_F(GroupKnnTest, identityIncludesResolvedKeyPolicyAndUnit) {
   using Missing = api::Collapse_::MissingPolicy;
   CollapsePlan first(*reader, Missing::GROUP, false), equal(*reader, Missing::GROUP, false),
       policy(*reader, Missing::EXPAND, false), field(*reader, Missing::GROUP, false);
-  first.fields.push_back({"key_s", api::GroupComponent_::Type::STRING, reader->getOrdMap("key_s"),
+  first.fields.push_back({"key_s", api::GroupComponent_::Type::STRING, FieldType::Storage::TERMS, reader->getOrdMap("key_s"),
       reader->field("key_s")});
   equal.fields = policy.fields = first.fields;
-  field.fields.push_back({"other_s", api::GroupComponent_::Type::STRING, reader->getOrdMap("other_s"),
+  field.fields.push_back({"other_s", api::GroupComponent_::Type::STRING, FieldType::Storage::TERMS, reader->getOrdMap("other_s"),
       reader->field("other_s")});
   std::array<float, 4> vector{0, 0, 0, 0};
   KnnQuery a("vec_vs", type, vector, 2, 0, 0, 0, false, &first),
@@ -551,7 +551,7 @@ TEST_F(GroupKnnTest, approximateMemberCapRecoversExactRepresentative) {
   auto truth = rows(*run("main", R"("limit":-1,"collapse":"key_s","query":)" + knn(3, true)));
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   CollapsePlan plan(*reader, api::Collapse_::MissingPolicy::GROUP, false);
-  plan.fields.push_back({"key_s", api::GroupComponent_::Type::STRING, reader->getOrdMap("key_s"),
+  plan.fields.push_back({"key_s", api::GroupComponent_::Type::STRING, FieldType::Storage::TERMS, reader->getOrdMap("key_s"),
       reader->field("key_s")});
   // Like QuantizingEngine in KnnQueryTest: transform a real exhaustive result,
   // retaining its document identities but deliberately reversing sibling scores.

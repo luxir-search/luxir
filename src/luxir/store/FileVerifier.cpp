@@ -15,7 +15,11 @@ std::string checksumMismatch(const FileDescriptor& expected, const FileCheck& ac
 }
 
 void FileVerification::open(Directory& dir, std::span<const FileDescriptor> files, bool full) {
-  auto suspects = CorruptionMarker::read(dir);
+  open(dir, files, full, CorruptionMarker::read(dir));
+}
+
+void FileVerification::open(Directory& dir, std::span<const FileDescriptor> files, bool full,
+                            std::span<const std::string> suspects) {
   items.reserve(files.size());
   for (const auto& file : files) {
     bool direct = std::ranges::binary_search(suspects, file.name);
@@ -60,6 +64,12 @@ void FileVerification::run() {
 void verifyFiles(Directory& dir, std::span<const FileDescriptor> files, bool full) {
   FileVerification verification;
   verification.open(dir, files, full);
+  verification.run();
+}
+
+void verifyFiles(Directory& dir, std::span<const FileDescriptor> files, bool full, std::span<const std::string> suspects) {
+  FileVerification verification;
+  verification.open(dir, files, full, suspects);
   verification.run();
 }
 

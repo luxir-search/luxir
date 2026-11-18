@@ -63,15 +63,15 @@ namespace luxir {
 // The cap is deliberately soft: forceAcquire() overdraws so a client that has
 // nothing in flight can always make progress (and so a single reservation larger
 // than the whole budget still runs, alone).  The overshoot is bounded at one
-// force-admitted batch per active merge, so it still scales with the number of
-// active collections.  The demand/admission registry added here is groundwork
+// force-admitted batch plus retained row maps per active merge, so it still
+// scales with the number of active collections.  The demand/admission registry added here is groundwork
 // for a node-wide overdraft token, but the token remains deferred: an idle
 // MergeAdmissionDriver that loses it has no task for task_group::wait() to wait
 // on.  Passing the token without spinning or parking a TBB worker first requires
 // a continuation-owned driver lifetime, not just another registry bit.
 //
-// Reservation clients include field merges, inverters, retained delete packets
-// and delete-application scratch.
+// Reservation clients include merge row maps, field merges, inverters,
+// retained delete packets and delete-application scratch.
 // Future reclaimable clients, such as vector index builds, can use the same
 // pressure-listener mechanism.
 class IndexRamBudget {

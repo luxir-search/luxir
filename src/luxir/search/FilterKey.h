@@ -49,11 +49,12 @@ enum class FilterKeyTag : uint8_t {
   BOOLEAN_FILTER = 43,
 };
 
-// Correctness envelope: schemaGen and timeZone always, plus coreGen for CORE_STABLE scope.
+// Correctness envelope: output path, schemaGen and timeZone, plus coreGen for CORE_STABLE scope.
 struct FilterKeyContext {
   uint64_t schemaGen = 0;
   uint64_t coreGen = 0;
   std::string_view timeZone;
+  std::string_view path = {};
 };
 
 class FilterKey {
@@ -187,7 +188,9 @@ public:
                              const FilterKeyContext& ctx) && {
     FilterKeyBuilder envelope;
     envelope.appendUInt64(ctx.schemaGen);
-    envelope.bytes.push_back((std::byte)scope);
+    // Root keys retain their compact envelope. The scoped envelope has a
+    // distinct tag, followed by the output path; no root payload can alias it.
+    envelope.bytes.push_back((std::byte)((uint8_t)scope + (ctx.path.empty() ? 0 : 128)));
     if (scope == FilterKeyScope::CORE_STABLE) {
       envelope.appendUInt64(ctx.coreGen);
     }
@@ -195,6 +198,7 @@ public:
     // identity makes cross-timezone reuse impossible even when two coercions
     // happen to produce the same value.
     envelope.appendString(ctx.timeZone);
+    if (!ctx.path.empty()) envelope.appendString(ctx.path);
     envelope.appendBytes(bytes);
     return FilterKey(std::move(envelope.bytes));
   }

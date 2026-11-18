@@ -7,7 +7,8 @@
 #include <stdexcept>
 #include <string_view>
 
-#include "luxir/query/GeoQuery.h"
+#include "luxir/query/BKDQueryWeight.h"
+#include "luxir/query/GeoPointSource.h"
 #include "luxir/query/Query.h"
 #include "luxir/reader/BKDReader.h"
 #include "luxir/util/geo.h"
@@ -25,7 +26,8 @@ public:
   bool recoverableAsPredicate() const noexcept override { return true; }
 
   static constexpr std::string_view QUERY_NAME = "GeoDistanceQuery";
-  using Weight = GeoQueryWeight<GeoDistanceQuery, BKDDistanceRelation>;
+  using PointSource = GeoPointSource;
+  using Weight = BKDQueryWeight<GeoDistanceQuery, BKDDistanceRelation>;
 
   GeoDistanceQuery(std::string_view field, double centerLatitude,
                    double centerLongitude, double radiusMeters)

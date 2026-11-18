@@ -15,6 +15,7 @@ struct FieldMetadataMemory {
   std::atomic<uint64_t> pages{0}, pageBytes{0};
   std::atomic<uint64_t> entries{0}, entryBytes{0};
   std::atomic<uint64_t> names{0}, nameBytes{0};
+  std::atomic<uint64_t> liveViews{0}, liveViewBytes{0};
 };
 inline FieldMetadataMemory fieldMetadataMemory;
 

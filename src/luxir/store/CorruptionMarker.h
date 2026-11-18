@@ -25,9 +25,15 @@ struct CorruptionMarker {
   static void write(Directory& dir, std::span<const std::string> files, std::string_view reason);
   // The union of every marker's file names, in name order without duplicates.
   static std::vector<std::string> read(Directory& dir);
+  // The same from a listing of `dir` already taken: no listing of its own.
+  static std::vector<std::string> read(Directory& dir, std::span<const Directory::FileInfo> listing);
   static bool present(Directory& dir);
+  // Marker names in an existing listing, for clearing after verification.
+  static std::vector<std::string> names(std::span<const Directory::FileInfo> listing);
   // Removes every marker; the removal is synced.
   static void clear(Directory& dir);
+  // Removes only these markers; markers written after the listing stay.
+  static void clear(Directory& dir, std::span<const std::string> names);
 };
 
 }

@@ -181,6 +181,7 @@ public:
   CheckedDirFactory(std::unique_ptr<DirectoryFactory> inner, CheckedDirMode mode, bool verbose = false)
       : DelegatingDirFactory(std::move(inner)), mode_(mode), verbose_(verbose) {}
   std::string describe() const override { return "checked(" + delegate->describe() + ")"; }
+  bool exclusive() const override { return delegate->exclusive(); }
   DirectoryFactory* inner() override { return delegate.get(); }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
     auto key = std::pair(root, checkedPath(root, path));

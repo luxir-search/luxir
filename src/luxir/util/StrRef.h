@@ -115,7 +115,7 @@ public:
 
   // compare to raw bytes
   bool equals(const void *data, int len) const {
-    return size() == len && memcmp(ptr(), data, (size_t) len) == 0;
+    return (int) size() == len && memcmp(ptr(), data, (size_t) len) == 0;
   }
 
   int compare(const StrRef &other) const {
@@ -381,7 +381,7 @@ template<typename StringType>
 // StringType just needs size() and data().... which std::string and std::string_view both have.
 inline bool operator==(const PackedTerm &p, const StringType &s) noexcept {
   auto[data, sz] = p.unpack();
-  if (sz != (int) s.size()) return false;
+  if (sz != s.size()) return false;
   return memcmp(data, s.data(), sz) == 0;
 }
 

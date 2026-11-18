@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/FieldReader.h"
 #include "luxir/index/PostingsWriter.h"
 #include "luxir/index/SegmentSummary.h"
@@ -192,7 +193,7 @@ TEST_F(PostingsReaderTest, termSeek) {
 
 class FieldMetadataTest : public LuxirTest {
 protected:
-  static std::shared_ptr<PostingsReader> openFields(test::CollectionHelper& helper, int count) {
+  static std::shared_ptr<SegmentCore> openFields(test::CollectionHelper& helper, int count) {
     test::Doc doc{{"id", std::string("one")}};
     for (int i = 0; i < count; i++) {
       doc.push_back({std::format("f{:05}_i", i), (int64_t)i});
@@ -203,13 +204,14 @@ protected:
     auto reader = writer->snapshots.readers.getReader();
     EXPECT_EQ(1u, reader->segments().size());
     auto stored = test::readDurableIndexInfo(writer->dir);
-    return PostingsReader::create(writer->dir, stored->segments[0].seg_id, stored->segments[0].creator_epoch, false, false);
+    return SegmentCore::create(writer->dir, stored->segments[0].seg_id, stored->segments[0].creator_epoch, false, false);
   }
 };
 
 TEST_F(FieldMetadataTest, firstUseRace) {
   test::CollectionHelper helper;
-  auto reader = openFields(helper, 130);
+  auto core = openFields(helper, 130);
+  auto* reader = &core->rootReader();
   constexpr int THREADS = 32;
   std::barrier start(THREADS);
   std::array<const PostingsReader::Field*, THREADS> infos{};
@@ -280,11 +282,11 @@ TEST_F(FieldMetadataTest, columnBoundsComeFromTheSummary) {
   ASSERT_NE(nullptr, summary);
 
   // The summary's bounds are the column's own.
-  auto fromColumn = PostingsReader::create(writer->dir, segId, epoch);
-  auto fromSummary = PostingsReader::create(writer->dir, segId, epoch, false, false, summary);
+  auto fromColumn = SegmentCore::create(writer->dir, segId, epoch);
+  auto fromSummary = SegmentCore::create(writer->dir, segId, epoch, false, false, summary);
   for (auto name : {"dense_i", "sparse_i", "multi_is"}) {
-    auto* expected = fromColumn->fieldInfo(name);
-    auto* actual = fromSummary->fieldInfo(name);
+    auto* expected = fromColumn->rootReader().fieldInfo(name);
+    auto* actual = fromSummary->rootReader().fieldInfo(name);
     ASSERT_TRUE(expected->columnBounds && actual->columnBounds) << name;
     EXPECT_EQ(expected->columnBounds->min, actual->columnBounds->min) << name;
     EXPECT_EQ(expected->columnBounds->max, actual->columnBounds->max) << name;
@@ -297,17 +299,19 @@ TEST_F(FieldMetadataTest, columnBoundsComeFromTheSummary) {
     if (record.fieldname == "dense_i") record.num_min = 1, record.num_max = 2;
     if (record.fieldname == "sparse_i") record.type = (uint32_t)FieldType::TEXT;
   }
-  auto crafted = PostingsReader::create(writer->dir, segId, epoch, false, false,
-                                        SegmentSummary::fromAggregate(records, true));
-  EXPECT_EQ(1, crafted->fieldInfo("dense_i")->columnBounds->min);
-  EXPECT_EQ(2, crafted->fieldInfo("dense_i")->columnBounds->max);
-  EXPECT_EQ(-4, crafted->fieldInfo("sparse_i")->columnBounds->min);
-  EXPECT_EQ(-4, crafted->fieldInfo("sparse_i")->columnBounds->max);
+  auto core = SegmentCore::create(writer->dir, segId, epoch, false, false,
+                                  SegmentSummary::fromAggregate(records, true));
+  auto& crafted = core->rootReader();
+  EXPECT_EQ(1, crafted.fieldInfo("dense_i")->columnBounds->min);
+  EXPECT_EQ(2, crafted.fieldInfo("dense_i")->columnBounds->max);
+  EXPECT_EQ(-4, crafted.fieldInfo("sparse_i")->columnBounds->min);
+  EXPECT_EQ(-4, crafted.fieldInfo("sparse_i")->columnBounds->max);
 }
 
 TEST_F(FieldMetadataTest, ordinalsAndPageBoundaries) {
   test::CollectionHelper helper;
-  auto reader = openFields(helper, 130);
+  auto core = openFields(helper, 130);
+  auto* reader = &core->rootReader();
   EXPECT_EQ(0u, reader->fieldCacheStats().pages);
   EXPECT_EQ(nullptr, reader->fieldInfo(""));
   EXPECT_EQ(nullptr, reader->fieldInfo("f00064_missing"));
@@ -340,7 +344,8 @@ TEST_F(FieldMetadataTest, ordinalsAndPageBoundaries) {
 
 TEST_F(FieldMetadataTest, untouchedFieldsStayUnallocated) {
   test::CollectionHelper helper;
-  auto reader = openFields(helper, 4096);
+  auto core = openFields(helper, 4096);
+  auto* reader = &core->rootReader();
   ASSERT_GT(reader->numFields(), 4096);
   EXPECT_EQ(0u, reader->fieldCacheStats().pages);
   ASSERT_NE(nullptr, reader->fieldInfo(64));
@@ -421,7 +426,7 @@ TEST_F(FieldMetadataTest, coreNamesAreSharedAndLazy) {
   EXPECT_EQ(field, cached->segInfos);
   EXPECT_EQ(nullptr, context.getCachedFieldInfo("absent_i"));
   EXPECT_EQ(nullptr, context.getCachedFieldInfo("absent_i"));
-  EXPECT_EQ(0u, fresh->fieldCacheStats().pages);
+  EXPECT_EQ(0u, fresh->rootReader().fieldCacheStats().pages);
 }
 
 TEST_F(FieldMetadataTest, namesStayFoundWhileTheTableGrows) {
