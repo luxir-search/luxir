@@ -217,9 +217,9 @@ public:
 
   Candidate stage(const CollectionId& id, std::string_view incarnation);
   // Makes `snapshot` durable in the candidate's directory, whose files the
-  // caller verified and synced, and opens its readers. On failure the
-  // candidate stays staged.
-  Prepared prepare(Candidate& candidate, std::shared_ptr<const CommitSnapshot> snapshot);
+  // caller verified and synced, and opens its readers. Clears the markers
+  // read for that verification. On failure the candidate stays staged.
+  Prepared prepare(Candidate& candidate, std::shared_ptr<const CommitSnapshot> snapshot, std::span<const std::string> markers);
   // Activates a prepared candidate in place of `expected` (null: absent):
   // the catalog durably selects it, the map points at it, the events feed
   // announces it, and incarnations nothing else needs are retired.

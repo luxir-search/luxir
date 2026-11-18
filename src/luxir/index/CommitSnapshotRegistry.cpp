@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "CommitSnapshotRegistry.h"
+#include "luxir/store/CorruptionMarker.h"
 #include "luxir/store/VerifiedDirectory.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/util/Signal.h"
@@ -84,7 +85,7 @@ void CommitSnapshotRegistry::fail() noexcept {
   notifyChange();
 }
 
-void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
+std::vector<std::string> CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
   auto manifest = Manifest::load(dir);
   auto changed = [&] {
     auto latest = Manifest::load(dir);
@@ -96,10 +97,13 @@ void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
     if (!manifest.bytes) throw ReadOnlyError("collection has no snapshot");
     auto snapshot = CommitSnapshot::fromBytes(manifest.bytes);
     std::shared_ptr<IndexReader> reader;
+    CorruptionMarker::Observation observed;
     {
       FileVerification verification;
-      try { verification.open(dir, snapshot->files, verify); }
-      catch (...) {
+      try {
+        observed = CorruptionMarker::read(dir, manifest.listingOf(dir));
+        verification.open(dir, snapshot->files, verify, observed.suspects);
+      } catch (...) {
         if (!changed()) throw;
         continue;
       }
@@ -118,7 +122,7 @@ void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
       }
     }
     publish(std::move(snapshot), std::move(reader));
-    return;
+    return std::move(observed.markers);
   }
 }
 

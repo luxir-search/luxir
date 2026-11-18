@@ -355,11 +355,9 @@ std::string Collections::recoverWriter(const CollectionId& name, TenantCatalog& 
 }
 
 // Best-effort marker cleanup after snapshot verification.
-static void clearMarkers(const CollectionId& name, Directory& dir, const std::vector<std::string>* markers = nullptr) {
-  try {
-    if (markers) CorruptionMarker::clear(dir, *markers);
-    else CorruptionMarker::clear(dir);
-  }
+static void clearMarkers(const CollectionId& name, Directory& dir, std::span<const std::string> markers) {
+  if (markers.empty()) return;
+  try { dir.deleteDurably(markers); }
   catch (const ReadOnlyError&) {}
   catch (const std::exception& e) { LOG_WARN("Cannot clear corruption markers of '{}': {}", name.label(), e.what()); }
 }
@@ -389,15 +387,14 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   WriterOpen opened(*storage.directory(selected), storage.claim(name.name, selected, creating ? "reserved" : "active"));
   if (!creating) selected = recoverWriter(name, storage, selected, opened);
   auto col = makeCollection(name, storage.directory(selected));
-  std::vector<std::string> markers;
+  CorruptionMarker::Observation observed;
   if (!creating) {
     auto& manifest = opened.manifest;
     if (!manifest.bytes) throw std::runtime_error("catalog selects an empty index directory");
     if (startup) {
       const auto& listing = manifest.listingOf(*col->shard->dir);
-      auto suspects = CorruptionMarker::read(*col->shard->dir, listing);
-      arena.execute([&] { verifyFiles(*col->shard->dir, Manifest::files(manifest.bytes), verifyOnOpen, suspects); });
-      markers = CorruptionMarker::names(listing);
+      observed = CorruptionMarker::read(*col->shard->dir, listing);
+      arena.execute([&] { verifyFiles(*col->shard->dir, Manifest::files(manifest.bytes), verifyOnOpen, observed.suspects); });
     }
   }
   col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
@@ -413,7 +410,7 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   retire(name, selected);
   observe(name, *col);
   // Marked files still referenced by the selected snapshot passed verification.
-  if (startup && !creating) clearMarkers(name, *col->shard->dir, &markers);
+  clearMarkers(name, *col->shard->dir, observed.markers);
   Signal::emit("collectionInitialized", col.get());
   return col;
 }
@@ -428,11 +425,10 @@ std::shared_ptr<Collection> Collections::openCollection(const CollectionId& name
   } else {
     if (!selected || selected->state != "active") throw ReadOnlyError("Collection has no catalog selection");
     col = makeCollection(name, catalog(name.tenant).directory(selected->id));
-    arena.execute([&] { col->shard->snapshots->openLocalSnapshot(verifyOnOpen); });
+    auto markers = arena.execute([&] { return col->shard->snapshots->openLocalSnapshot(verifyOnOpen); });
     if (col->shard->snapshots->snapshot()->id.incarnation != selected->id) throw std::runtime_error("Snapshot incarnation does not match catalog selection");
     observe(name, *col);
-    // Whatever a marker named was verified before this point.
-    clearMarkers(name, *col->shard->dir);
+    if (role == Role::FOLLOWER) clearMarkers(name, *col->shard->dir, markers);
   }
   return col;
 }
@@ -887,7 +883,8 @@ Collections::Candidate Collections::stage(const CollectionId& key, std::string_v
   return Candidate(key, std::string(incarnation), std::move(collection), std::move(lease));
 }
 
-Collections::Prepared Collections::prepare(Candidate& candidate, std::shared_ptr<const CommitSnapshot> snapshot) {
+Collections::Prepared Collections::prepare(Candidate& candidate, std::shared_ptr<const CommitSnapshot> snapshot,
+                                           std::span<const std::string> markers) {
   if (snapshot->id.incarnation != candidate.incarnation_) throw std::logic_error("snapshot of another incarnation");
   auto& registry = candidate.collection_->getShard()->getSnapshots();
   // An interrupted activation may already have committed this snapshot.
@@ -897,8 +894,7 @@ Collections::Prepared Collections::prepare(Candidate& candidate, std::shared_ptr
     auto opened = registry.readers.prepare(*snapshot);
     registry.commit(std::move(snapshot), std::move(opened));
   }
-  // The caller verified every file the snapshot lists.
-  clearMarkers(candidate.id_, registry.dir);
+  clearMarkers(candidate.id_, registry.dir, markers);
   return Prepared(std::move(candidate));
 }
 
