@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <limits>
 #include <optional>
 
@@ -8,6 +9,7 @@
 
 #include "SearchEngine.h"
 #include "luxir/server/CommitWaits.h"
+#include "luxir/server/MemoryPressure.h"
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
 #include "luxir/reader/SkipStats.h"
@@ -155,10 +157,18 @@ void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
   }
 }
 
+SearchEngine::SearchEngine(LuxirNode& node)
+    : node(node), requestMemory((size_t)std::max<int64_t>(0, node.getConfig().search.node_request_memory_max_bytes)) {}
+
 void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver) {
   req.counting = true;
   req.submitted = std::chrono::steady_clock::now();
   metrics().start(metricActivity(MetricStage::SEARCH));
+  if (auto rejected = node.getMemoryPressure().admit(MemoryPressure::Work::SEARCH)) {
+    req.setError(*rejected);
+    req.bodyDone();
+    return;
+  }
   if (!req.proto.min_commit.empty()) {
     try {
       auto floor = CommitId::parse(req.proto.min_commit);

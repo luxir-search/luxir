@@ -14,6 +14,7 @@
 #include <string_view>
 #include <vector>
 #include "Collections.h"
+#include "MemoryPressure.h"
 #include "PluginNodeState.h"
 #include "luxir/index/IndexRamBudget.h"
 #include "oneapi/tbb/task_arena.h"
@@ -144,6 +145,10 @@ public:
     return *searchEngine;
   }
 
+  // Node-wide memory pressure; transports and the search engine consult it
+  // before admitting new work.
+  MemoryPressure& getMemoryPressure() { return *memoryPressure; }
+
 private:
   // Returns the collection unchanged, or throws if it is unavailable.
   static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
@@ -213,6 +218,8 @@ private:
   std::unique_ptr<Scrubber> scrubber;
   std::unique_ptr<SearchEngine> searchEngine;
   PluginNodeStates pluginStates;
+  // Last: its sampler stops first, while the indexing budget it hints is alive.
+  std::unique_ptr<MemoryPressure> memoryPressure;
 };
 
 }

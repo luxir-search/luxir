@@ -28,6 +28,11 @@ locations, browse `src/luxir/<area>/`.
      fed by the ordered `CollectionEvents` interface.
    - `CommitWaits`: Node-local publication floors and replica barriers; owns deadlines,
      cancellation and captured follower expiry. Satisfied floors retain their exact collection.
+   - `MemoryPressure`: Node-wide memory pressure monitor sampled on the `DeadlineScheduler`
+     (unreclaimable cgroup usage, or process anonymous RSS); `SearchEngine::dispatch` and the
+     transports' update admission read its state, and soft pressure lowers the `IndexRamBudget`
+     cap to flush indexing. `NodeRequestMemory` (in `search/RequestMemTracker.h`) bounds every
+     request tracker's charges together.
    - `ProtoUpdateMessage::Completion`: Owning local result plus copied replica-wait specification;
      transports release indexing bodies before waiting for visibility.
 

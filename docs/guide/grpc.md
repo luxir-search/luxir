@@ -175,6 +175,17 @@ before that status. The kinds, codes, and their meanings are
 transport-independent; see [HTTP API conventions](http-api.md#errors) for the
 table.
 
+Under memory pressure (see
+[Memory pressure admission](operations.md#memory-pressure-admission)) a
+unary `Update`, the first message of an `UpdateStream`, and at hard pressure
+any later message of one, end the call with `RESOURCE_EXHAUSTED` and code
+`memory_pressure`; nothing in that message is applied, and earlier stream
+acknowledgements are delivered first. A refused search reports the same
+error in-band in `SearchResponse.error` (kind `RESOURCE_EXHAUSTED`), as does
+a search that would pass the node-wide query memory ceiling
+(`node_request_memory_exceeded`). Both codes are transient: retry with
+backoff.
+
 ## Packed request flags
 
 `SearchRequest` and the `SearchOp` wrapper carry `uint64 flags` and

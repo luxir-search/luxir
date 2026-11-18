@@ -402,7 +402,7 @@ blocks.
 
 | Parameter | Adds | Cost |
 | --- | --- | --- |
-| (default, node scope) | `service`: request, search, ingest and background activity and latency; `memory`: indexing RAM budget, draining, pending-merge and retained delete bytes, RAM storage, field metadata, jemalloc and its arenas, configured budgets. | Atomic loads and one allocator statistics read. |
+| (default, node scope) | `service`: request, search, ingest and background activity and latency; `memory`: indexing RAM budget, draining, pending-merge and retained delete bytes, RAM storage, field metadata, jemalloc and its arenas, configured budgets, memory pressure state and rejections, node-wide tracked search memory. | Atomic loads and one allocator statistics read. |
 | `collections=true` | `totals` and per-collection `collections`: documents, segments, committed bytes, commit time, generations, merges, inverters, retained delete bytes, snapshot pins and drops, query cache, availability. Implied on tenant and collection routes. | Briefly takes each writer's index lock and decodes each reader-only manifest. No file I/O. |
 | `files=true` | `bytes` from an index directory listing; aux index and segment bytes. Implies `collections`. | Lists every index directory. |
 | `segments=true` | Per-segment records. Implies `files`. | Iterates segments. |
@@ -548,6 +548,9 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_http_connections`, `luxir_http_io_threads` | Live HTTP sessions and running connection-shard threads; the thread gauge excludes the accept thread. gRPC active calls are in `luxir_requests_in_flight`. |
 | `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, merge, vector-build, and reader-refresh stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
 | `luxir_node_memory_budget_bytes`, `luxir_search_request_memory_limit_bytes` | Configured managed-memory budget and tracked per-search ceiling. Neither is a process RSS limit. |
+| `luxir_search_node_request_memory_bytes`, `luxir_search_node_request_memory_limit_bytes` | Query memory tracked across all running searches, and its node-wide ceiling (zero is unlimited). |
+| `luxir_memory_pressure_state`, `luxir_memory_pressure_used_bytes`, `luxir_memory_pressure_limit_bytes`, `luxir_memory_pressure_threshold_ratio`, `luxir_memory_pressure_transitions_total` | Memory pressure admission: the current `state` (1 for normal, soft or hard), the measure and its limit, the thresholds by `level`, and state changes. See [Memory pressure admission](#memory-pressure-admission). |
+| `luxir_admission_rejections_total` | Work refused at admission, by `work` (`search`, `update`, `update_batch`) and `cause` (`memory_pressure_soft`, `memory_pressure_hard`, `node_request_memory`). |
 | `luxir_index_ram_*_bytes` | Indexing reservations, budget, draining reservations, pending merge demand, and retained delete packets (part of the reservations, never freed by a flush). The budget is soft; pending demand is capped at that budget when limited. |
 | `luxir_storage_ram_bytes`, `luxir_storage_ram_limit_bytes` | RAM storage consumption and its cap, separate from filesystem usage. |
 | `luxir_field_metadata_objects`, `luxir_field_metadata_bytes` | Cached field metadata by `part` (directory, page, entry, name). |
@@ -718,6 +721,73 @@ the node unlimited. The resolved values are logged at startup.
 ./luxir --indexing.max-ram-mb=4096  # override just the indexing share
 ```
 
+## Memory pressure admission
+
+Budgets bound what Luxir manages; everything else (allocator overhead,
+transport buffers, caches not yet on a budget, other processes in the same
+container) can still push a node to its limit. Rather than accept work until
+the kernel OOM-kills it, the node watches its memory and refuses new work with
+a retryable error:
+
+```bash
+./luxir \
+  --server.memory-limit-mb=0 \
+  --server.memory-pressure-soft-percent=85 \
+  --server.memory-pressure-hard-percent=92 \
+  --server.memory-pressure-hysteresis-percent=5 \
+  --server.memory-pressure-sample-ms=250
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `server.memory-limit-mb` | `0` | The limit thresholds are a share of. `0` uses the tightest cgroup v2 `memory.max` on the path from this process's cgroup to the root, else system RAM; a value caps the cgroup limit. |
+| `server.memory-pressure-soft-percent` | `85` | At or above it, new update requests are refused and indexing is asked to flush. |
+| `server.memory-pressure-hard-percent` | `92` | At or above it, new searches and further batches of running update streams are refused too. |
+| `server.memory-pressure-hysteresis-percent` | `5` | A level is left only once use drops this many points below its threshold (hard ends below 87%, soft below 80% by default). |
+| `server.memory-pressure-sample-ms` | `250` | Sampling period; `0` turns the monitor off. |
+
+What counts as used excludes reclaimable page cache, so mapped segment files
+and the OS file cache never count as pressure:
+
+- Under a cgroup v2 memory limit (containers), it is that cgroup's
+  `memory.current` less its `active_file` and `inactive_file` pages: anonymous
+  memory, shared memory and kernel memory, which is what the cgroup's OOM
+  killer acts on. Every process in the cgroup counts, as it does for the OOM
+  killer.
+- Otherwise it is this process's anonymous resident memory (`RssAnon`) against
+  `server.memory-limit-mb`, or system RAM when that is unset. Host-wide memory
+  used by other processes is not counted; set `server.memory-limit-mb` to the
+  share of the host this node should stay within.
+
+Allocator statistics are not used: they miss memory allocated outside
+jemalloc, and freed pages awaiting decay are cheap to return. Sampling is a
+timer on the node: admission reads the current state with one atomic load and
+never issues a system call. A state change is logged at warning level.
+
+| Work | Soft | Hard |
+| --- | --- | --- |
+| New update requests: HTTP buffered and NDJSON `_update`, gRPC `Update`, the first message of an `UpdateStream` | refused | refused |
+| Further batches of an accepted NDJSON stream or `UpdateStream` | accepted | refused; the stream ends after its earlier acknowledgements |
+| New searches (HTTP and gRPC) | accepted | refused |
+| Running searches, paused streaming responses and their resumes, commits | continue | continue |
+| Stats, health, metrics, schema reads, collection administration | served | served |
+
+A refusal is `resource_exhausted` with code `memory_pressure`: HTTP `429` with
+`Retry-After: 1` (gRPC `RESOURCE_EXHAUSTED`; a search reports it in-band). See
+[Errors](http-api.md#errors). Soft pressure also halves the shared indexing
+RAM cap below what is reserved, which flushes idle inverters through the
+normal pressure-flush path without waiting for them, and slows new indexing
+reservations; the configured cap returns when pressure ends.
+`memory.pressure` in `_stats` reports the state, the measure, its source,
+the thresholds, transitions and rejection counts.
+
+Sizing: leave the hard threshold enough below the limit for the work already
+accepted when it trips, roughly the indexing budget plus the node-wide search
+memory ceiling plus in-flight request bodies. Lower the thresholds on small
+containers, where one sampling period of growth is a larger share. If the node
+sits at soft pressure while idle, the cause is not request load: look at
+`luxir_allocator_bytes` and the caches.
+
 ## Indexing memory and request limits
 
 ```bash
@@ -801,6 +871,11 @@ Search has its own limits:
 
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state and prefix top-term selection; `0` (the default) is unlimited.
+- `search.node-request-memory-max-bytes` bounds the same tracked memory across
+  every running search together. A charge that would pass it fails its search
+  with the retryable `node_request_memory_exceeded` (HTTP `429` with
+  `Retry-After`). It defaults to half of `--max-ram-mb`, the share indexing
+  leaves, and is unlimited when that is; `0` is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
 - Multi-term expansion limits are operator opt-ins, all off by default (`0`).
   With limits off, broad patterns on high-cardinality fields simply run. Operators
