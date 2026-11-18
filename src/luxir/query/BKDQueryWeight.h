@@ -27,24 +27,20 @@ class BKDQueryScorer final : public Query::ConstantScorer {
   IntColReader& reader;
   ColIter iter;
   Relation relation;
-  bool singlePoint;
+  bool multi;
   int32_t docid = -1;
 
-  bool pointMatches(int64_t rank) {
-    auto [v0, v1] = PointSource::pointAt(iter.values(), rank);
-    return relation.matches(v0, v1);
+  bool pointMatches(std::pair<typename PointSource::PointTraits::Scalar,
+                              typename PointSource::PointTraits::Scalar> point) const {
+    return relation.matches(point.first, point.second);
   }
 
   bool valueMatches() {
     if (docid == PostingsReader::END) return false;
-    // With one point per populated document, point rank is document rank.
-    if (singlePoint) {
-      auto [v0, v1] = PointSource::docPoint(iter);
-      return relation.matches(v0, v1);
-    }
+    if (!multi) return pointMatches(PointSource::docPoint(iter));
     auto [start, end] = PointSource::pointRanks(reader, iter.rank());
     for (int64_t rank = start; rank < end; rank++) {
-      if (pointMatches(rank)) return true;
+      if (pointMatches(PointSource::pointAt(iter.values(), rank))) return true;
     }
     return false;
   }
@@ -53,7 +49,7 @@ public:
   BKDQueryScorer(IntColReader& reader, const Relation& relation,
                  float constantScore)
       : Query::ConstantScorer(constantScore), reader(reader), iter(reader),
-        relation(relation), singlePoint(PointSource::onePointPerDoc(reader)) {}
+        relation(relation), multi(!PointSource::onePointPerDoc(reader)) {}
 
   int32_t approximationNext() override {
     docid = iter.next();

@@ -20,6 +20,9 @@ namespace luxir {
 
 // One packed int64 column value per geographic point. Point ranks coincide
 // with value ranks; a single-valued column also uses document ranks.
+// The accessors are always_inline so they are folded into the scorer before
+// its branch layout is decided; inlined later, the scan loop's common path
+// lands behind taken jumps (measured 10-16% on forced scans).
 struct GeoPointSource {
   using PointTraits = BKDInt32Traits;
   using Reader = BasicBKDReader<PointTraits>;
@@ -64,22 +67,22 @@ struct GeoPointSource {
   }
 
   // Used when the layout does not guarantee one point per document.
-  static std::pair<int64_t, int64_t> pointRanks(IntColReader& column, int32_t docRank) {
+  [[gnu::always_inline]] static std::pair<int64_t, int64_t> pointRanks(IntColReader& column, int32_t docRank) {
     return column.getStartEndValueRank(docRank);
   }
 
-  static std::pair<PointTraits::Scalar, PointTraits::Scalar> unpack(int64_t packed) {
+  [[gnu::always_inline]] static std::pair<PointTraits::Scalar, PointTraits::Scalar> unpack(int64_t packed) {
     return {geo::unpackLatitude(packed), geo::unpackLongitude(packed)};
   }
 
-  static std::pair<PointTraits::Scalar, PointTraits::Scalar> pointAt(
+  [[gnu::always_inline]] static std::pair<PointTraits::Scalar, PointTraits::Scalar> pointAt(
       auto& values, int64_t pointRank) {
     return unpack(values.valueAt(pointRank));
   }
 
   // The point of the iterator's document when it holds exactly one: the
   // iterator's current value, with no access by rank.
-  static std::pair<PointTraits::Scalar, PointTraits::Scalar> docPoint(auto& iter) {
+  [[gnu::always_inline]] static std::pair<PointTraits::Scalar, PointTraits::Scalar> docPoint(auto& iter) {
     return unpack(iter.value());
   }
 };

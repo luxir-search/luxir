@@ -19,6 +19,7 @@ namespace luxir {
 
 // Consecutive (min, max) column values form one point. Point ranks count
 // pairs independently of the physical column's value ranks.
+// The accessors are always_inline for the reason given on GeoPointSource.
 struct RangePointSource {
   using PointTraits = BKDInt64Traits;
   using Reader = BasicBKDReader<PointTraits>;
@@ -64,18 +65,18 @@ struct RangePointSource {
   }
 
   // Used when documents can hold multiple points.
-  static std::pair<int64_t, int64_t> pointRanks(IntColReader& column, int32_t docRank) {
+  [[gnu::always_inline]] static std::pair<int64_t, int64_t> pointRanks(IntColReader& column, int32_t docRank) {
     auto [start, end] = column.getStartEndValueRank(docRank);
     return {start / 2, end / 2};
   }
 
-  static std::pair<PointTraits::Scalar, PointTraits::Scalar> pointAt(
+  [[gnu::always_inline]] static std::pair<PointTraits::Scalar, PointTraits::Scalar> pointAt(
       auto& values, int64_t pointRank) {
     return {values.valueAt(pointRank * 2), values.valueAt(pointRank * 2 + 1)};
   }
 
   // The point of the iterator's document when it holds exactly one pair.
-  static std::pair<PointTraits::Scalar, PointTraits::Scalar> docPoint(auto& iter) {
+  [[gnu::always_inline]] static std::pair<PointTraits::Scalar, PointTraits::Scalar> docPoint(auto& iter) {
     return pointAt(iter.values(), iter.rank());
   }
 };
