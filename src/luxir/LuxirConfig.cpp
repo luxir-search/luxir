@@ -169,6 +169,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "(0 = auto: all CPUs on nodes of up to 4, else all but one)")
       ->default_val(server.workers)
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--server.control-threads", server.control_threads,
+                 "Control-plane threads for administration, schema changes, replication transfers "
+                 "and plugin routes, outside the search and indexing workers")
+      ->default_val(server.control_threads)
+      ->check(CLI::PositiveNumber);
   app.add_option("--server.stream_buffer_bytes", server.stream_buffer_bytes,
                  "Per-connection buffered response bytes before streaming producers pause")
       ->default_val(server.stream_buffer_bytes);

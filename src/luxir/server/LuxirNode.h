@@ -14,6 +14,7 @@
 #include <string_view>
 #include <vector>
 #include "Collections.h"
+#include "ControlExecutor.h"
 #include "PluginNodeState.h"
 #include "luxir/index/IndexRamBudget.h"
 #include "oneapi/tbb/task_arena.h"
@@ -117,6 +118,9 @@ public:
     return taskArena;
   }
   oneapi::tbb::task_arena& getIndexArena() { return indexArena; }
+  // Administration, collection lifecycle, schema changes, replication
+  // transfers and timers, plugin routes: never on the search arena.
+  ControlExecutor& getControlExecutor() { return *control; }
 
   // The task arena's worker threads (server.workers, resolved).
   int getWorkers() const { return workers; }
@@ -156,7 +160,8 @@ private:
   // Query work.  Workers: server.workers (resolveWorkers(); at least
   // one, since an arena of only reserved slots never serves enqueued tasks).
   // Plus a reserved slot per thread that enters from outside (each configured
-  // HTTP shard and the embedding thread; gRPC threads only enqueue), so an execute()
+  // HTTP shard, each control thread and the embedding thread; gRPC threads
+  // only enqueue), so an execute()
   // from a transport thread always finds a free slot instead of handing its
   // functor to the arena and blocking behind arena backlog.  Reserved slots
   // are seats, not threads: they add no workers.  Workers that run out of
@@ -165,8 +170,9 @@ private:
   // CPU than the work.  The arenas are declared ahead of the collections and
   // the search engine so they outlive the work those run in them.
   int workers;
+  int controlThreads;
   int reservedSlots;
-  std::atomic<int> arenaEntrants{1};  // the embedding thread; see ArenaEntrants
+  std::atomic<int> arenaEntrants;  // the embedding and control threads; see ArenaEntrants
   oneapi::tbb::task_arena taskArena;
 
   // Labels arena worker threads for ps/top/gdb. Masters (transport threads
@@ -199,10 +205,11 @@ private:
   // priority, so TBB lends workers to queries in taskArena first and recalls
   // them from indexing at task boundaries; the worker pool has one more thread
   // than either arena uses, so a query hop finds a free worker at once even
-  // while indexing holds all of its own.  One reserved seat for a thread
-  // waiting on a graph (close, tests).
+  // while indexing holds all of its own.  Reserved seats for threads waiting
+  // on a graph: one for the embedding thread (tests), one per control thread
+  // (a collection's close).
   oneapi::tbb::task_arena indexArena;
-  ArenaThreadNamer indexThreadNamer{indexArena, "luxir_idx_", 1, true};
+  ArenaThreadNamer indexThreadNamer{indexArena, "luxir_idx_", 1 + controlThreads, true};
 
   IndexRamBudget indexRamBudget;
   std::shared_ptr<ReplicationSource> replication;
@@ -212,6 +219,9 @@ private:
   std::unique_ptr<ReplicationFollower> follower;
   std::unique_ptr<Scrubber> scrubber;
   std::unique_ptr<SearchEngine> searchEngine;
+  // Started before the collections open and stopped first in the destructor,
+  // so its tasks never outlive what they reference.
+  std::unique_ptr<ControlExecutor> control;
   PluginNodeStates pluginStates;
 };
 

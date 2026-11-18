@@ -10,7 +10,12 @@ locations, browse `src/luxir/<area>/`.
 1. **Server Layer** (`src/luxir/server/`)
    - `GRPCServer`: Manages gRPC services and thread pool
    - `HttpServer`: JSON/HTTP API (Boost.Beast), including NDJSON streaming ingest
-   - `LuxirNode`: Central coordinator wiring collections and services
+   - `LuxirNode`: Central coordinator wiring collections and services; owns the search
+     arena (`getTaskArena`), the index arena (`getIndexArena`) and the control executor
+   - `ControlExecutor`: Dedicated threads, outside the TBB worker pool, for administration,
+     schema changes, collection lifecycle, replication transfers and timers, plugin routes
+     and storage-reading stats; nothing but searches and their continuations runs on the
+     search arena
    - `Stats`: The one mapping from engine state (`IndexWriter`/`ReaderManager::stats`, RAM budgets,
      allocator, `util/Metrics.h` service counters, `SystemStats` procfs/cgroup readers) into
      `api::StatsResponse`; `Prometheus` renders that response as text for `/metrics` and `_stats?format=prometheus`
@@ -215,7 +220,7 @@ locations, browse `src/luxir/<area>/`.
 **Indexing**: gRPC/HTTP Request -> IndexWriter -> Document Processing (Inverter) -> Segment Writing -> optional Commit
 
 HTTP update bodies are not decoded on the connection's I/O shard thread. A
-buffered JSON body is decoded in the task-arena task that submits it. An
+buffered JSON body is decoded in the index-arena task that submits it. An
 NDJSON stream is only framed on the shard: records that may be control
 records (`{}` or a first key shaped `"_name_"`) are decoded there, in stream
 order, and document records stay where the body was read: `NdjsonFramer`

@@ -93,7 +93,7 @@ public:
 using HttpSearchReqProto = luxir::api::SearchRequest;
 using HttpUpdateReqProto = luxir::api::UpdateRequest;
 
-// Pins one shard on behalf of off-io-thread work (engine / task-arena tasks).
+// Pins one shard on behalf of off-io-thread work (engine, arena and control tasks).
 // The guard keeps run() from returning until the work completes; the shared_ptr
 // keeps the context alive so its non-owning executor can be destroyed on any
 // thread after shutdown has joined the runner. `shard` is declared first so it
@@ -144,7 +144,7 @@ enum class HttpSearchFormat {
 struct HttpUpdateState {
   ~HttpUpdateState() { Signal::emit("httpUpdateBodyDestroyed"); }
   std::pmr::monotonic_buffer_resource resource;
-  std::string body;  // raw JSON until it is decoded on the task arena
+  std::string body;  // raw JSON until it is decoded on the index arena
   HttpUpdateReqProto proto;  // JSON readers copy update strings into resource
 };
 
@@ -185,7 +185,7 @@ struct HttpStreamBatchState {
   HttpUpdateReqProto proto;  // non-owning; backed by `resource`, docs by `staging`
   // Raw document records (views into the stream's NDJSON chunks, which
   // `chunks` keeps alive until decodeDocs() has turned them into proto.docs on
-  // the task arena; the I/O thread only frames them) and the decoded docs.
+  // the index arena; the I/O thread only frames them) and the decoded docs.
   // Dropped once the batch is indexed, so a batch waiting for the ones before
   // it to complete holds only its envelope.
   struct Staging {
@@ -219,7 +219,7 @@ struct HttpStreamBatchState {
 
   // Decodes the raw records into proto.docs.  Called from the update message's
   // handle() on an indexing worker, so a single connection's JSON decoding
-  // scales with the task arena instead of its I/O thread.  The I/O thread no
+  // scales with the index arena instead of its I/O thread.  The I/O thread no
   // longer touches the batch once it is submitted.  Decoded strings are copied
   // into the staging arena, so the raw bytes go as soon as decoding succeeds.
   // A malformed record fails the whole batch before any of it is indexed.
@@ -704,12 +704,12 @@ private:
 
   struct Pending { std::string line; bool last; };
 
-  // The last session ref can drop on a task-arena thread after shutdown has
+  // The last session ref can drop on an arena or control thread after shutdown has
   // joined. Declared first so the shard is destroyed after stream_.
   std::shared_ptr<HttpIoShard> shard_;
   beast::tcp_stream stream_;
   LuxirNode& node_;
-  // Session destruction can lag server shutdown on a task-arena thread.
+  // Session destruction can lag server shutdown on an arena or control thread.
   std::shared_ptr<Metrics> metrics;
   std::shared_ptr<HttpSessionRegistry> registry_;
   std::function<void()> deregister_;  // removes this session from the registry
@@ -1743,8 +1743,9 @@ private:
     }
   }
 
-  // A plugin route runs its handler on the task arena, then answers on the
-  // connection's executor: the handler's body, or the search it asked for.
+  // A plugin route runs its handler on the control executor, then answers on
+  // the connection's executor: the handler's body, or the search it asked for
+  // (which runs where any search does).
   void handlePluginRoute(const HttpRoute& route, http::request<http::string_body>& req, std::string_view target) {
     struct Call {
       std::string method;
@@ -1760,7 +1761,7 @@ private:
     call->pathParams = route_.plugin->params;
     for (const auto& param : urlParams_) call->queryParams.emplace_back(param.key, param.value);
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), &route, call, tenant = tenant_, shardPin] {
+    node_.getControlExecutor().enqueue([self = shared_from_this(), &route, call, tenant = tenant_, shardPin] {
       HttpPluginResponse response;
       std::optional<ErrorInfo> failure;
       try {
@@ -1952,9 +1953,10 @@ private:
     engine.dispatch(*sreq, sreq->proto.max_parallel, SearchEngine::Receiver::MAY_EXECUTE);
   }
 
-  // Decodes and normalizes a buffered /update body.  Runs on the task arena:
-  // a large JSON body (vectors especially) must not occupy the connection's
-  // I/O shard, which serves every other connection assigned to it.
+  // Decodes and normalizes a buffered /update body.  Runs on the index arena,
+  // as an NDJSON batch's decode does: a large JSON body (vectors especially)
+  // must not occupy the connection's I/O shard, which serves every other
+  // connection assigned to it, nor a search worker.
   static void prepareBufferedUpdate(HttpUpdateState& state, std::string_view coll,
                                     const UpdateUrlParams& url) {
     std::string err;
@@ -2016,7 +2018,7 @@ private:
     }
   };
 
-  // Task arena: hands a decoded buffered update to its collection's writer.
+  // Index arena: hands a decoded buffered update to its collection's writer.
   static void submitBufferedUpdate(const std::shared_ptr<HttpSession>& self, std::shared_ptr<HttpUpdateState> state,
                                    const std::string& tenant, const std::shared_ptr<ShardPin>& shardPin,
                                    std::chrono::steady_clock::time_point startTime) {
@@ -2049,7 +2051,7 @@ private:
     state->body = std::move(body);
     auto shardPin = makeShardPin();
     try {
-      node_.getTaskArena().enqueue([self = shared_from_this(), slot = UpdateStateSlot{std::move(state)}, coll, url,
+      node_.getIndexArena().enqueue([self = shared_from_this(), slot = UpdateStateSlot{std::move(state)}, coll, url,
                                     tenant = tenant_, shardPin, startTime = requestStart_] {
         auto state = std::move(slot.state);
         std::optional<ErrorInfo> failure;
@@ -2146,7 +2148,7 @@ private:
     } catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
 
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, id, shardPin, wait] {
+    node_.getControlExecutor().enqueue([self = shared_from_this(), state, id, shardPin, wait] {
       try {
         auto created = self->node_.createCollection(id,
             state->request.schema ? &*state->request.schema : nullptr);
@@ -2198,7 +2200,7 @@ private:
     waits.awaitReplicas(waits.prepareReplicas(std::move(id), commit, wait->requirement,
                                               waits.deadlineAfter(wait->timeoutMs), members),
         wait->stop, [self = shared_from_this(), respond = std::move(respond)](api::ReplicaResult replicas) {
-          self->node_.getTaskArena().enqueue([respond, replicas] { respond(replicas); });
+          self->node_.getControlExecutor().enqueue([respond, replicas] { respond(replicas); });
         });
   }
 
@@ -2230,7 +2232,7 @@ private:
     catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
 
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, id, shardPin] {
+    node_.getControlExecutor().enqueue([self = shared_from_this(), state, id, shardPin] {
       std::string out;
       std::optional<ErrorInfo> failure;
       try {
@@ -2272,7 +2274,7 @@ private:
       else { first = adminTarget(req.tenant, req.from); second = adminTarget(req.tenant, req.to); }
     } catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
     auto pin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, first, second, pin] {
+    node_.getControlExecutor().enqueue([self = shared_from_this(), state, first, second, pin] {
       std::string out;
       std::optional<ErrorInfo> failure;
       try {
@@ -2308,7 +2310,7 @@ private:
   void handleSchemaGet(const std::string& coll, bool resolved) {
     if (resolved) {
       auto shardPin = makeShardPin();
-      node_.getTaskArena().enqueue([self = shared_from_this(), coll, tenant = tenant_, shardPin] {
+      node_.getControlExecutor().enqueue([self = shared_from_this(), coll, tenant = tenant_, shardPin] {
         std::string out;
         std::optional<ErrorInfo> failure;
         try {
@@ -2564,7 +2566,7 @@ private:
       }
     } catch (const std::exception& e) { respondError(classifyException(e, ErrorKind::INVALID_REQUEST), requestId_, head); return; }
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), coll, tenant = tenant_, name, id, identity, range, head, json, shardPin] {
+    node_.getControlExecutor().enqueue([self = shared_from_this(), coll, tenant = tenant_, name, id, identity, range, head, json, shardPin] {
       auto transfer = std::make_shared<ReplicationTransfer>();
       transfer->head = head;
       transfer->json = json;
@@ -2648,43 +2650,57 @@ private:
     bool prometheus = false;
   };
 
+  // Counters, gauges and per-collection totals are atomics and short writer
+  // locks that searches never take, so the default /_stats and /metrics run
+  // inline on the shard and answer even while every search worker is busy.
+  // File sizes and per-segment detail read storage; those run on the control
+  // executor.
   void handleStats(std::optional<std::string> coll, std::string tenant, StatsParams params) {
+    auto render = [](LuxirNode& node, const std::optional<std::string>& coll, const std::string& tenant,
+                     const StatsParams& params) -> std::variant<std::string, ErrorInfo> {
+      try {
+        std::pmr::monotonic_buffer_resource resource;
+        luxir::api::StatsRequest request;
+        request.segments = params.segments;
+        request.collections = params.collections;
+        request.files = params.files;
+        request.system = params.system;
+        request.host = params.host;
+        request.tenant = tenant;
+        if (coll) request.collection = *coll;
+
+        luxir::api::StatsResponse response;
+        gatherStats(node, request, response, resource);
+
+        std::string out;
+        if (params.prometheus) {
+          out = renderPrometheus(response);
+          out += loadSignalDebugText();
+        } else if (!luxir::api::write_json(response, out)) {
+          throw std::runtime_error("failed to serialize stats response");
+        }
+        return out;
+      } catch (const std::exception& e) {
+        return classifyException(e, ErrorKind::INTERNAL);
+      }
+    };
+    auto respond = [](HttpSession& self, std::variant<std::string, ErrorInfo>& result, bool prometheus) {
+      if (auto* failure = std::get_if<ErrorInfo>(&result)) self.respondError(*failure);
+      else if (prometheus) self.respondSimple(http::status::ok, prometheusContentType, std::move(std::get<std::string>(result)));
+      else self.respondJson(http::status::ok, std::move(std::get<std::string>(result)));
+    };
+    if (!params.segments && !params.files) {
+      auto result = render(node_, coll, tenant, params);
+      respond(*this, result, params.prometheus);
+      return;
+    }
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue(
-        [self = shared_from_this(), coll = std::move(coll), tenant = std::move(tenant), params, shardPin] {
-          std::string out;
-          std::optional<ErrorInfo> failure;
-          try {
-            std::pmr::monotonic_buffer_resource resource;
-            luxir::api::StatsRequest request;
-            request.segments = params.segments;
-            request.collections = params.collections;
-            request.files = params.files;
-            request.system = params.system;
-            request.host = params.host;
-            request.tenant = tenant;
-            if (coll) request.collection = *coll;
-
-            luxir::api::StatsResponse response;
-            gatherStats(self->node_, request, response, resource);
-
-            if (params.prometheus) {
-              out = renderPrometheus(response);
-              out += loadSignalDebugText();
-            } else if (!luxir::api::write_json(response, out)) {
-              throw std::runtime_error("failed to serialize stats response");
-            }
-          } catch (const std::exception& e) {
-            failure = classifyException(e, ErrorKind::INTERNAL);
-          }
-
-          net::post(self->stream_.get_executor(),
-                    [self, shardPin, failure = std::move(failure), body = std::move(out),
-                     prometheus = params.prometheus]() mutable {
-                      if (failure) self->respondError(*failure);
-                      else if (prometheus) self->respondSimple(http::status::ok, prometheusContentType, std::move(body));
-                      else self->respondJson(http::status::ok, std::move(body));
-                    });
+    node_.getControlExecutor().enqueue(
+        [self = shared_from_this(), coll = std::move(coll), tenant = std::move(tenant), params, shardPin, render, respond] {
+          auto result = render(self->node_, coll, tenant, params);
+          net::post(self->stream_.get_executor(), [self, shardPin, result = std::move(result), params, respond]() mutable {
+            respond(*self, result, params.prometheus);
+          });
         });
   }
 
@@ -2711,10 +2727,10 @@ private:
       return;
     }
 
-    // updateSchema persists (fsync) under the publication mutex, so run
-    // it off the io thread like handleUpdate.
+    // updateSchema persists (fsync) under the publication mutex, and may
+    // create the collection: control-executor work.
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin, mode, wait, target = LuxirNode::target(tenant_, coll)] {
+    node_.getControlExecutor().enqueue([self = shared_from_this(), state, shardPin, mode, wait, target = LuxirNode::target(tenant_, coll)] {
       try {
         auto collection = self->node_.getOrCreateCollection(target);
         auto newSchema = collection->updateSchema(state->def, mode);
@@ -3585,7 +3601,7 @@ private:
 
     // Only a record that may be a control record is decoded here, in stream
     // order; documents stay where the framer read them, the batch holds their
-    // chunk, and they are decoded on the task arena
+    // chunk, and they are decoded on the index arena
     // (HttpStreamBatchState::decodeDocs), where a malformed one fails its batch
     // with the same invalid_json error.
     if (mayBeStreamControl(record)) {
@@ -3857,7 +3873,7 @@ private:
 
   void submitUrlCommit(const std::shared_ptr<HttpStreamUpdateState>& state,
                        const std::shared_ptr<UrlWriters>& writers, size_t index) {
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, writers, index] {
+    node_.getControlExecutor().enqueue([self = shared_from_this(), state, writers, index] {
       try {
         auto request = std::make_shared<HttpUpdateState>();
         request->proto.collection = api::build::arenaStr(request->resource, (*writers)[index].first);
@@ -4373,9 +4389,9 @@ void HttpServer::armReplicationExpiry() {
       node.getConfig().replication.follower_timeout_ms) / 2));
   replicationTimer->async_wait([this](beast::error_code ec) {
     if (ec || shutdownRequested.load(std::memory_order_acquire)) return;
-    // The guard joins this arena task before the accept context can exit.
+    // The guard joins this control task before the accept context can exit.
     auto guard = net::make_work_guard(acceptIoc);
-    node.getTaskArena().enqueue([this, guard = std::move(guard)] {
+    node.getControlExecutor().enqueue([this, guard = std::move(guard)] {
       try {
         for (const auto& entry : node.collectionEntries()) {
           if (entry.error.empty()) entry.collection->getShard()->getSnapshots().expire();

@@ -244,8 +244,11 @@ r.http.add("POST", "/collections/{collection}/_sample",
 });
 ```
 
-- The handler runs on a task-arena worker, so it may block on engine work through
-  `request.node`, which also supplies `pluginState<T>(name)`. It answers with
+- The handler runs on a control-executor thread (`--server.control-threads`),
+  outside the search workers, so it may block on engine work through
+  `request.node`, which also supplies `pluginState<T>(name)`. Handlers share
+  those few threads with administration and replication; hand searches back
+  through `searchBody` rather than running them in the handler. It answers with
   `status`, `contentType` and `body`, or sets
   `searchBody` to have the server run that body as a search with default URL
   options and answer as `_search` would (streaming, errors). The request's URL

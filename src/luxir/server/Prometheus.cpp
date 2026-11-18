@@ -89,6 +89,10 @@ void service(Renderer& r, const api::ServiceStats& s) {
                                 {"vector_build", &s.vector_build}, {"reader_refresh", &s.reader_refresh}})
     r.activity("luxir_background", "luxir_background_duration_seconds", *activity, s.background_duration_bounds,
                PrometheusText::label("kind", kind));
+  r.gauge("luxir_control_threads", "Control executor threads (administration, replication transfers, plugin routes).", (double)s.control_threads);
+  r.gauge("luxir_control_busy", "Control executor tasks running now.", (double)s.control_busy);
+  r.gauge("luxir_control_queued", "Control executor tasks waiting for a thread.", (double)s.control_queued);
+  r.counter("luxir_control_tasks_total", "Control executor tasks completed.", (double)s.control_completed);
 }
 
 void memory(Renderer& r, const api::MemoryStats& m) {

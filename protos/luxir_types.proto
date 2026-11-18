@@ -1744,6 +1744,13 @@ message ServiceStats {
   ActivityStats merge = 16;
   ActivityStats vector_build = 17;
   ActivityStats reader_refresh = 18;
+  // The control executor (server.control_threads): administration, schema
+  // changes, collection lifecycle, replication transfers and timers, plugin
+  // routes and file or segment stats.
+  uint64 control_threads = 60;
+  uint64 control_busy = 61;      // tasks running now
+  uint64 control_queued = 62;    // tasks waiting for a thread
+  uint64 control_completed = 63;
 }
 
 // This process, its data filesystem and its cgroup. Collectors that read their
