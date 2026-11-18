@@ -28,6 +28,7 @@
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/proto.h"
+#include "SearchAdmission.h"
 
 namespace luxir {
 
@@ -70,7 +71,13 @@ class SearchRequest : public ExecutionWarnings, public ExecutionProfileSink {
   void count(MetricOutcome outcome, std::chrono::steady_clock::time_point end);
 
 public:
+  // Requested when the transport gives up on the request: cancels a min_commit
+  // wait and a wait for an admission slot.
   std::stop_source waitCancellation{std::nostopstate};
+  // The token a wait for an admission slot honors.  A transport that wires
+  // waitCancellation only on demand overrides this to wire it here.  Called on
+  // the dispatching thread, only for a search that may queue.
+  virtual std::stop_token admissionStop() { return waitCancellation.get_token(); }
   // The request's tenant, owned for asynchronous resolution; empty is the
   // default tenant.
   std::string tenant;
@@ -123,6 +130,18 @@ public:
   FanoutScope* tg = nullptr; // optional top-level fan-out scope for this request.
   // Resolved parallelism for this submission (see SearchEngine::submit).
   int32_t maxParallel = 0;
+  // The request left its receiving transport thread for the task arena
+  // (SearchEngine::enqueueRun), in any max_parallel lane: it had to queue for
+  // admission, waited for a commit, reads remote storage, or asked for 1.  Its
+  // resumed production stays off that thread too.
+  bool offloaded = false;
+  // The request's admission slot (SearchAdmission), held while its body runs
+  // and released before the final response (see SearchEngine::submitBody), or
+  // at teardown on any path that skips the body.
+  SearchAdmission::Slot admissionSlot;
+  // How a failed final response counts in the search outcome metrics: an
+  // admission refusal is REJECTED, a cancellation while queued CANCELLED.
+  MetricOutcome errorOutcome = MetricOutcome::ERROR;
   SearchResponse* lastResponse = nullptr;
   std::mutex mutex;
   // Declared degradations accumulated during parse/build (see ParseContext);
@@ -218,6 +237,12 @@ public:
   /// gRPC uses an arena worker); producers must not assume one.
   /// The default is for transports without flow control: resume immediately.
   virtual void resumeWhenDrained(std::function<void()> resume) { resume(); }
+
+  /// What producers call after reply() returned PAUSE: resumeWhenDrained(),
+  /// with the resumed burst re-admitted through the admission priority lane
+  /// (SearchEngine::admitResume).  It is never refused; it runs once a slot
+  /// is free, ahead of every queued search.
+  void pauseUntilDrained(std::function<void()> resume);
 
   /// This is called when the reply has completed (e.g. it has been written to a socket and not just buffered)
   /// This may be called from a gRPC server thread (and with a mutex locked), so it should be fast.

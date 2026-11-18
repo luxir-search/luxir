@@ -33,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include <omp.h>
 #include <oneapi/tbb/info.h>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
@@ -123,6 +124,13 @@ static http::status httpStatusFor(const ErrorInfo& info) {
     case ErrorKind::UNKNOWN: break;
   }
   return http::status::internal_server_error;
+}
+
+// Seconds a client should wait before retrying a refused request, or 0 when
+// retrying sooner is not the problem.  Search admission refusals clear as soon
+// as running searches finish.
+static int retryAfterFor(const ErrorInfo& info) {
+  return info.code == "search_queue_full" || info.code == "search_queue_timeout" ? 1 : 0;
 }
 
 struct HttpSearchRequestState {
@@ -615,9 +623,10 @@ public:
   // not streamed anything yet (docs format, failure before the first flush).
   // Dropped if the connection has failed or a streaming response already
   // started (the abortStream contract covers that case).
-  void respondErrorFromEngine(http::status status, std::string body) {
+  // retryAfterSeconds > 0 adds a Retry-After header (an admission refusal).
+  void respondErrorFromEngine(http::status status, std::string body, int retryAfterSeconds = 0) {
     net::post(stream_.get_executor(),
-        [self = shared_from_this(), status, body = std::move(body)]() mutable {
+        [self = shared_from_this(), status, body = std::move(body), retryAfterSeconds]() mutable {
           if (self->errored_) return;
           if (self->ticketLost_.load(std::memory_order_relaxed)) {
             // The lost line never arrives, so this connection cannot stream in
@@ -632,7 +641,7 @@ public:
             self->abandonOutput();
           }
           if (self->headerSent_) return;
-          self->respondJson(status, std::move(body));
+          self->respondSimple(status, "application/json", self->finishJson(std::move(body)), false, retryAfterSeconds);
         });
   }
 
@@ -1931,9 +1940,8 @@ private:
     auto& engine = node_.getSearchEngine();
     auto* sreq = luxir::arenaCreate<HttpSearchRequest>(
         *arena, engine, std::move(requestState), shared_from_this(), *arena, requestStart_);
-    if (!sreq->proto.min_commit.empty()) {
-      sreq->waitCancellation = waitCancellation;
-    }
+    // Cancels a min_commit wait, or a wait for an admission slot.
+    sreq->waitCancellation = waitCancellation;
     sreq->format = format;
     sreq->docsState.multiOp = docsMultiOp;
     sreq->docsState.requestId = sreq->proto.request_id;
@@ -1942,13 +1950,12 @@ private:
     sreq->shardPin = makeShardPin();
     sreq->tenant = tenant_;
 
-    // Route by max_parallel: the default (0) deliberately runs the whole
-    // query right here on the shard thread - serial, no scheduler, blocking
-    // this connection's io until it completes.  -1 also runs here, entering
-    // the task arena so its workers parallelize the query.  1 moves the
-    // synchronous engine.submit() onto the task arena so this io thread is
-    // not occupied for the query's duration; reply() then posts results back
-    // here.
+    // Route by max_parallel: 0, -1 and -2 run right here on the shard thread
+    // when admission has a slot free and nothing queues (see
+    // SearchEngine::dispatch); otherwise, like 1 always, the query runs on the
+    // task arena so this io thread is not occupied for its duration, and
+    // reply() posts results back here.  A collection on remote storage takes
+    // the arena in every lane.
     engine.dispatch(*sreq, sreq->proto.max_parallel, SearchEngine::Receiver::MAY_EXECUTE);
   }
 
@@ -4043,7 +4050,8 @@ private:
   // to this connection's shard, not invoked: an already-drained park must not
   // recurse into produce(), and running production here keeps a default-lane
   // request on the thread that owns it (max_parallel=-1 re-enters the arena
-  // here and 1 re-enqueues - see HttpSearchRequest::resumeWhenDrained).
+  // here and an offloaded request re-enqueues - see
+  // HttpSearchRequest::resumeWhenDrained).
   // Must not throw: it runs inside io handlers (ioc->run() has no catch), and
   // a lost waiter strands its request forever - so a post allocation failure
   // falls back to running the resume inline.
@@ -4081,13 +4089,15 @@ private:
     respondSimple(status, "application/json", finishJson(std::move(compact)));
   }
 
-  void respondSimple(http::status status, std::string_view contentType, std::string body, bool head = false) {
+  void respondSimple(http::status status, std::string_view contentType, std::string body, bool head = false,
+                     int retryAfterSeconds = 0) {
     stopWaitDisconnect();
     if ((unsigned)status >= 400) metricError();
     metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::HTTP, body.size());
     auto resp = std::make_shared<http::response<http::string_body>>(status, httpVersion_);
     resp->set(http::field::server, "luxir");
     resp->set(http::field::content_type, contentType);
+    if (retryAfterSeconds > 0) resp->set(http::field::retry_after, std::to_string(retryAfterSeconds));
     resp->keep_alive(keepAlive_);
     resp->body() = std::move(body);
     resp->prepare_payload();
@@ -4202,7 +4212,8 @@ SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
     } else if (response.proto.error && !outputCommitted) {
       auto info = api::build::errorInfo(*response.proto.error);
       session->respondErrorFromEngine(httpStatusFor(info),
-          renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions));
+          renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions),
+          retryAfterFor(info));
     } else {
       int64_t queued = session->enqueueJson(
           renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions), last);
@@ -4238,7 +4249,8 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
       } else {
         ErrorInfo info = luxir::api::build::errorInfo(*response.proto.error);
         session->respondErrorFromEngine(httpStatusFor(info),
-            renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions));
+            renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions),
+            retryAfterFor(info));
       }
     } else {
       // Document bodies are a pure function of the batch: render them OUTSIDE
@@ -4302,14 +4314,17 @@ void HttpSearchRequest::failDelivery(const SearchResponse& response) noexcept {
 }
 
 void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
-  if (maxParallel == 1) {
-    // The request opted its query work off the io plane (max_parallel=1),
-    // so resumed production belongs on the arena too.  The wrapper runs on
-    // the shard (see maybeFireDrainWaiters) and must not throw: fall back to
-    // producing inline rather than stranding the stream.
+  if (offloaded) {
+    // The query work left the io plane (max_parallel=1, an admission wait, a
+    // commit wait, or a collection on remote storage), so resumed production
+    // belongs on the arena too, isolated like the search itself.  The wrapper
+    // runs on the shard (see maybeFireDrainWaiters) and must not throw: fall
+    // back to producing inline rather than stranding the stream.
     resume = [&node = session->node(), resume = std::move(resume)] {
       try {
-        node.getTaskArena().enqueue(resume);
+        node.getTaskArena().enqueue([resume] {  // copies; resume stays valid if this throws
+          oneapi::tbb::this_task_arena::isolate(resume);
+        });
       } catch (...) {
         if (resume) resume();
       }
@@ -4320,7 +4335,7 @@ void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
 
 HttpServer::HttpServer(LuxirNode& node, int threads, int port, int64_t streamBufferBytes,
                        std::chrono::milliseconds shardIdlePeriod)
-  : node(node), nthreads(threads > 0 ? threads : std::max(1, oneapi::tbb::info::default_concurrency())),
+  : node(node), nthreads(threads > 0 ? threads : ServerConfig::Http::autoThreads()),
     arenaEntrants(node, nthreads, "HttpServer"), requestedPort(port),
     // Clamp to >= 1: a non-positive high-water mark (misconfiguration) would
     // pause every reply while the drain check (queuedBytes <= low) never fires.
@@ -4426,6 +4441,9 @@ void HttpServer::spawnShard(std::size_t idx) {
     char name[16];
     snprintf(name, sizeof(name), "luxir_http_%zu", idx);
     nameThisThread(name);
+    // An inline search runs here outside the arena (whose entry hook sets the
+    // same): FAISS must not start its own OpenMP team on an io thread.
+    omp_set_num_threads(1);
     shard->ioc.run();
     runningShardThreads.fetch_sub(1, std::memory_order_relaxed);
     node.metrics->httpThreads.fetch_sub(1, std::memory_order_relaxed);

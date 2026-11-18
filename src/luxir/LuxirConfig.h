@@ -68,11 +68,16 @@ struct ServerConfig {
     int port = 9400;
     int threads = 0;  // 0 = auto
 
-    /// Resolve shards: 0 means auto (affinity-aware concurrency, minimum 1).
-    int resolveThreads() const {
-      if (threads > 0) return threads;
-      return std::max(1, oneapi::tbb::info::default_concurrency());
+    /// Resolve shards: 0 means auto, one per CPU (affinity-aware), except on
+    /// nodes of up to kSmallNodeShardCores, which get one: each shard competes
+    /// with the workers for the same cores, and an extra shard on a 2-vCPU node
+    /// only oversubscribes it.
+    static constexpr int kSmallNodeShardCores = 2;
+    static int autoThreads() {
+      int cores = std::max(1, oneapi::tbb::info::default_concurrency());
+      return cores <= kSmallNodeShardCores ? 1 : cores;
     }
+    int resolveThreads() const { return threads > 0 ? threads : autoThreads(); }
   } http;
 };
 
@@ -196,6 +201,25 @@ struct SearchConfig {
   int64_t multiterm_max_postings = 0;
   // Pattern-only minimum literal prefix for unbounded prefix/wildcard/regex.
   int32_t multiterm_min_prefix_length = 0;
+
+  // Node-wide search admission (SearchAdmission). Every dispatched search
+  // takes a slot before it runs, inline on an HTTP shard or on a worker.
+  // Searches running at once on the node; 0 = auto: server.workers.
+  int max_running = 0;
+  // Of those, searches of one collection; 0 = auto: max_running less one, at
+  // least one, so long searches on one collection leave a worker for the rest.
+  int max_running_per_collection = 0;
+  // Of those, searches of collections on remote storage (Directory::REMOTE),
+  // which hold a worker while their reads wait on the network; 0 = auto: half
+  // of max_running, at least one.
+  int max_running_remote = 0;
+  // Searches waiting for a slot, node-wide, in per-collection FIFOs served
+  // round robin. One more is refused with RESOURCE_EXHAUSTED (HTTP 429).
+  // -1 = auto: 8 x server.workers; 0 = refuse whenever no slot is free.
+  int max_queued = -1;
+  // Milliseconds a search may wait for a slot (queue time only, never
+  // execution) before it is refused with RESOURCE_EXHAUSTED. 0 = unbounded.
+  int64_t max_queue_ms = 5000;
 };
 
 struct ReplicationConfig {

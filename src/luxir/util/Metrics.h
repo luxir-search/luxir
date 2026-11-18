@@ -23,7 +23,8 @@ namespace luxir {
 // on the request path, and each thread counts into its own stripe.
 enum class MetricOperation { SEARCH, UPDATE, SCHEMA, COLLECTIONS, STATS, HEALTH, OTHER, COUNT };
 enum class MetricTransport { HTTP, GRPC, COUNT };
-enum class MetricOutcome { OK, ERROR, CANCELLED, COUNT };
+// REJECTED: refused by search admission before running (searches only).
+enum class MetricOutcome { OK, ERROR, CANCELLED, REJECTED, COUNT };
 // Timed engine work. Searches, their execution and index batches are
 // request-sized; the rest runs in the background.
 enum class MetricStage { SEARCH, SEARCH_EXECUTION, INDEX_BATCH, FLUSH, COMMIT, DELETE_PASS, MERGE, VECTOR_BUILD, READER_REFRESH, COUNT };
@@ -35,7 +36,7 @@ enum class MetricTransportCounter { RECEIVED_BYTES, SENT_BYTES, STREAM_PAUSES, C
 inline constexpr std::array<std::string_view, (size_t)MetricOperation::COUNT> metricOperations = {
     "search", "update", "schema", "collections", "stats", "health", "other"};
 inline constexpr std::array<std::string_view, (size_t)MetricOutcome::COUNT> metricOutcomes = {
-    "ok", "error", "cancelled"};
+    "ok", "error", "cancelled", "rejected"};
 
 // Histogram upper bounds in seconds; a +Inf bucket follows. Requests run from
 // microsecond searches to slow administration, background stages from reader

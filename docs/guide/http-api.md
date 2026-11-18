@@ -262,12 +262,20 @@ when supplied in the body or as a URL parameter.
 | `not_found` | 404 | The route or the collection does not exist. |
 | `already_exists` | 409 | Creating a collection that already exists. |
 | `failed_precondition` | 403 (409 for `commit_incarnation_mismatch`) | The node's state forbids the operation, such as `--read-only`. |
-| `resource_exhausted` | 429 (413 for `request_too_large`) | A size or memory ceiling was exceeded. |
+| `resource_exhausted` | 429 (413 for `request_too_large`) | A size or memory ceiling was exceeded, or search admission refused the search (`search_queue_full`, `search_queue_timeout`). |
 | `unavailable` | 503 | The collection exists but cannot serve: it is being deleted or failed to load. |
 | `internal` | 500 | A server-side failure the request did not cause. |
 
 A failure detected before output returns the kind's HTTP status and this
 body. A wrong method on a known path returns `405` with an `Allow` header.
+
+A search refused by admission (every slot busy and the queue full, or a wait
+past `--search.max-queue-ms`; see
+[Search admission](operations.md#search-admission)) returns `429` with
+`Retry-After: 1` and code `search_queue_full` or `search_queue_timeout`. It did
+no work, so retrying after a short backoff is safe. A search cancelled while
+queued because its connection closed gets `unavailable` / `cancelled`, though
+its client is usually gone.
 
 Once a chunked response has begun, its HTTP status cannot change, so a search
 that fails after output starts arrives with HTTP 200 as the final NDJSON line in

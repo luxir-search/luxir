@@ -1110,6 +1110,15 @@ message ExecutionProfilePiece {
   optional sint64 domain_size = 6;
   int64 thread_id = 7;
   uint64 elapsed_us = 8;
+  // Storage reads that blocked this piece's thread on bytes not in memory, as
+  // the storage implementation reports them (see ReadWaitStats), and their
+  // summed wait.
+  uint64 blocking_reads = 40;
+  uint64 read_wait_us = 41;
+  // Major page faults on this piece's thread: mapped file pages read from
+  // disk, which a cold local index takes too. Zero where the platform does not
+  // count them per thread.
+  uint64 major_faults = 42;
 
   // Human-readable execution notes. Contents and formatting may change;
   // do not parse these entries.
@@ -1679,6 +1688,8 @@ message ActivityStats {
   uint64 ok = 2;
   uint64 error = 3;
   uint64 cancelled = 4;
+  // Refused by search admission before running (searches only).
+  uint64 rejected = 40;
   HistogramStats duration = 5;
 }
 
@@ -1744,6 +1755,64 @@ message ServiceStats {
   ActivityStats merge = 16;
   ActivityStats vector_build = 17;
   ActivityStats reader_refresh = 18;
+  // Node-wide search admission: limits, load and refusals (see
+  // search.max-running in the operations guide).
+  SearchAdmissionStats search_admission = 50;
+  ReadWaitStats read_wait = 51;
+}
+
+// Search admission: every dispatched search takes a slot before it runs. The
+// rest wait, holding no thread, in per-collection queues served round robin,
+// or are refused with RESOURCE_EXHAUSTED.
+message SearchAdmissionStats {
+  // The resolved limits.
+  uint64 max_running = 1;
+  uint64 max_running_per_collection = 2;
+  uint64 max_running_remote = 3;
+  uint64 max_queued = 4;
+  uint64 max_queue_ms = 5;  // 0: unbounded
+  // Load now. running counts searches and resumed stream bursts holding a
+  // slot; running_remote those of collections on remote storage.
+  uint64 running = 6;
+  uint64 running_remote = 7;
+  uint64 queued = 8;
+  // Resumed stream bursts waiting for a slot; they are served before queued
+  // searches and never refused.
+  uint64 resumes_queued = 9;
+  // Since the node opened: searches started, with or without waiting, and
+  // of those the ones that waited, with their summed queue time.
+  uint64 admitted = 10;
+  uint64 waited = 11;
+  double wait_seconds = 12;
+  // Searches refused because the queue was full, or after waiting
+  // search.max-queue-ms; and searches cancelled by their client while queued.
+  uint64 rejected_queue_full = 13;
+  uint64 rejected_queue_timeout = 14;
+  uint64 cancelled = 15;
+  // Resumed stream bursts started, and of those the ones that waited.
+  uint64 resumes = 16;
+  uint64 resumes_waited = 17;
+  // max_parallel=-1 searches that fanned out adaptively because the node was
+  // crowded.
+  uint64 downgraded = 18;
+  // Collections with a search running or queued now.
+  repeated SearchAdmissionCollection collections = 19;
+}
+
+message SearchAdmissionCollection {
+  string tenant = 4;
+  string collection = 1;
+  uint64 running = 2;
+  uint64 queued = 3;
+}
+
+// Storage reads that blocked a thread on bytes not in memory (a fetch from an
+// object store, a lazily loaded file), as the storage implementations report
+// them. Built-in storage reports none; mapped file reads show as major page
+// faults in ProcessStats instead.
+message ReadWaitStats {
+  uint64 blocking_reads = 1;
+  double wait_seconds = 2;
 }
 
 // This process, its data filesystem and its cgroup. Collectors that read their
@@ -2119,6 +2188,8 @@ message OutcomeStats {
   uint64 ok = 1;
   uint64 error = 2;
   uint64 cancelled = 3;
+  // Refused by search admission before running (searches only).
+  uint64 rejected = 40;
   double seconds = 4;
 }
 

@@ -162,7 +162,8 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--server.http.port,-p", server.http.port, "HTTP/JSON listen port")
       ->default_val(server.http.port);
   app.add_option("--server.http.threads", server.http.threads,
-                 "HTTP connection I/O shards (one thread each, plus one accept thread; 0 = auto)")
+                 "HTTP connection I/O shards (one thread each, plus one accept thread; "
+                 "0 = auto: one per CPU, or one on nodes of up to 2 CPUs)")
       ->default_val(server.http.threads);
   app.add_option("--server.workers", server.workers,
                  "Task-arena worker threads for indexing, merges and parallel search "
@@ -291,6 +292,30 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(search.fanout_sibling_grain_us)
       ->check(CLI::Range((int64_t)-1, (int64_t)60'000'000))
       ->check(!CLI::Range((int64_t)0, (int64_t)0));
+  app.add_option("--search.max-running", search.max_running,
+                 "Searches running at once on the node; the rest queue (0 = auto: server.workers)")
+      ->default_val(search.max_running)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.max-running-per-collection", search.max_running_per_collection,
+                 "Searches of one collection running at once "
+                 "(0 = auto: search.max-running less one, at least one)")
+      ->default_val(search.max_running_per_collection)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.max-running-remote", search.max_running_remote,
+                 "Searches of collections on remote storage running at once "
+                 "(0 = auto: half of search.max-running, at least one)")
+      ->default_val(search.max_running_remote)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.max-queued", search.max_queued,
+                 "Searches waiting for a slot, node-wide; more are refused with 429 / "
+                 "RESOURCE_EXHAUSTED (-1 = auto: 8 x server.workers, 0 = no queue)")
+      ->default_val(search.max_queued)
+      ->check(CLI::Range(-1, std::numeric_limits<int>::max()));
+  app.add_option("--search.max-queue-ms", search.max_queue_ms,
+                 "Milliseconds a search may wait for a slot before it is refused "
+                 "(queue time only, not execution; 0 = unbounded)")
+      ->default_val(search.max_queue_ms)
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--search.request-memory-max-bytes",
                  search.request_memory_max_bytes,
                  "Per-request query-memory breaker ceiling (0 = unlimited)")

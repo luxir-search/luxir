@@ -13,6 +13,7 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <omp.h>
 #include <grpcpp/alarm.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/generic/async_generic_service.h>
@@ -697,6 +698,15 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
                       std::chrono::steady_clock::time_point startTime)
       : SearchRequest(engine, proto, arena, startTime) {}
 
+    // Only searches that have to queue for admission pay for the call's
+    // cancellation hook.  Runs on the call's cq thread (dispatch), or after a
+    // min_commit wait that already enabled it.
+    std::stop_token admissionStop() override {
+      parent->enableWaitCancellation();
+      waitCancellation = parent->waitCancellation;
+      return waitCancellation.get_token();
+    }
+
     ReplyStatus reply(SearchResponse& response) override {
       // Serialize eagerly into an OWNED ByteBuffer, then drop arenas (no post-write callback).
       response.proto.more = !response.last;
@@ -1111,6 +1121,9 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
   // Give threads a name for debugging.
   std::string tname = "luxir_grpc_" + std::to_string(threadInfo.threadno);
   nameThisThread(tname.c_str());
+  // Searches never execute here, but nothing on a cq thread may start its own
+  // OpenMP team either (the arena's entry hook sets the same).
+  omp_set_num_threads(1);
 
   // wait for the server to start before trying to use it.
   startLatch.wait();

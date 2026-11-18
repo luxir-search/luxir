@@ -93,6 +93,20 @@ response paths keep connection handling separate from long-running engine work.
   when only SMT siblings are idle. `--search.fanout-grain-us=-1` pins `0` to
   serial execution. gRPC and continuations after `min_commit` waits start on
   arena workers for every value.
+- Every dispatched search passes a node-wide admission gate
+  (`SearchAdmission`) in `SearchEngine::dispatch`, before the inline/arena
+  split, and after the commit wait of a `min_commit` request. Slots bound the
+  searches running at once node-wide, per collection (one fewer than the node
+  total by default, so one collection's long searches cannot hold every
+  worker) and for remote-storage collections. Waiters hold no thread: they sit
+  in bounded per-collection FIFOs served round robin, and the thread that frees
+  a slot only enqueues the next one. Overflow and queue-time limits refuse with
+  `RESOURCE_EXHAUSTED`, answered on the deciding thread rather than through
+  the saturated arena. The HTTP inline lane runs only with a slot that is free
+  at once while nothing queues; anything that waited runs on a worker. Resumed
+  streaming bursts re-admit through a priority lane that is never refused, so
+  admission neither starves nor deadlocks paused streams, and `-1` fans out
+  adaptively while the node is crowded.
 - Ingest is streaming and incremental: NDJSON bodies are framed as bytes
   arrive and each document enters the indexing pipeline immediately - a
   document can be getting inverted while the request that carried it is
