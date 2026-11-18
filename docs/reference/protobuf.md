@@ -182,6 +182,7 @@ defaults and constraints are described in the comments and guides.
 - [`ReplicationStatus`](#message-luxir.replicationstatus)
 - [`ReplicationTenant`](#message-luxir.replicationtenant)
 - [`RescoreQuery`](#message-luxir.rescorequery)
+- [`RowSpaceStats`](#message-luxir.rowspacestats)
 - [`RrfFusion`](#message-luxir.rrffusion)
 - [`SchemaDef`](#message-luxir.schemadef)
 - [`SchemaRequest`](#message-luxir.schemarequest)
@@ -921,6 +922,7 @@ Overrides an operation's incoming document set, including beneath facet and grou
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.domain.from_match"></a>[`from_match`](#field-luxir.domain.from_match) | 7 | `string` | optional | In row\_ops, select this named clause's matching descendant rows. |
 | <a id="field-luxir.domain.to"></a>[`to`](#field-luxir.domain.to) | 6 | `string` | optional | Relative descendant path, .. steps to ancestors, or / for root documents. |
 | <a id="field-luxir.domain.query"></a>[`query`](#field-luxir.domain.query) | 2 | [`Query`](#message-luxir.query) | singular | If present, replaces the incoming domain with this query's matches within live documents and the enclosing structural bucket identities. If absent, inherits the incoming domain. |
 | <a id="field-luxir.domain.apply_parent_filters"></a>[`apply_parent_filters`](#field-luxir.domain.apply_parent_filters) | 3 | `bool` | optional | With query set, reapply the owning list's filters, including facet selections, while respecting except\_ops. Default false discards them. Requires query; does not restore matching queries above this operation. |
@@ -1065,6 +1067,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
 | <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT only. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. Unset inherits, else false: a malformed point fails the document. |
 | <a id="field-luxir.fielddef.ignore_z_value"></a>[`ignore_z_value`](#field-luxir.fielddef.ignore_z_value) | 29 | `bool` | optional | GEO\_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset inherits, else true. Set false to reject a point with a z coordinate. |
+| <a id="field-luxir.fielddef.reverse_map"></a>[`reverse_map`](#field-luxir.fielddef.reverse_map) | 30 | `bool` | optional | NESTED only. Store child-to-owner row lookups in segments written later. Unset inherits, else true. Changing it does not rewrite existing segments. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -1843,6 +1846,7 @@ An unset kind selects all documents, same as \`all\`.
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.query.name"></a>[`name`](#field-luxir.query.name) | 28 | `string` | optional | A request-unique reference to this clause; does not affect query identity. |
 | <a id="field-luxir.query.match"></a>[`match`](#field-luxir.query.match) | 1 | [`Match`](#message-luxir.match) | oneof [`kind`](#oneof-luxir.query.kind) | selects all documents with a value match in the specified field |
 | <a id="field-luxir.query.boolean"></a>[`boolean`](#field-luxir.query.boolean) | 2 | [`BooleanQuery`](#message-luxir.booleanquery) | oneof [`kind`](#oneof-luxir.query.kind) |  |
 | <a id="field-luxir.query.all"></a>[`all`](#field-luxir.query.all) | 3 | `bool` | oneof [`kind`](#oneof-luxir.query.kind) | selects all documents |
@@ -1963,7 +1967,7 @@ Numeric or DATE buckets using the field's value binding. Each bucket is inclusiv
 
 ### luxir.RangeQuery
 
-Matches documents whose field value falls in the given range. All bounds are optional; omit a side for an open-ended range. Set at most one of gte/gt (lower) and at most one of lte/lt (upper); setting both of a pair is an error. With no bounds the query matches every document that has a value for the field. A doc with no value never matches.<br><br>Numeric fields (INT/FLOAT/DOUBLE/DATE) require a column. Bounds go through the same value-coercion contract as ingest, so querying a literal finds the documents ingested with it. DATE accepts ISO-8601 strings or epoch values in the field's unit, and a partial date names its whole window: bounds include the granule they name (\[2024-01 TO 2024-06\] covers January through June; exclusive bounds exclude the granule whole). FLOAT/DOUBLE compare by IEEE-754 total order: -0.0 sorts below +0.0 and NaN sorts above +Inf.<br><br>Term-backed fields (TEXT/STRING/ID) range over indexed terms in byte order (no collation), constant-scoring. TEXT bounds use multi-term normalization without tokenization; STRING bounds use the field's normalizer. Exact bounds follow the field's long\_terms policy. Uses the field's value binding.
+Matches documents whose field value falls in the given range. All bounds are optional; omit a side for an open-ended range. Set at most one of gte/gt (lower) and at most one of lte/lt (upper); setting both of a pair is an error. With no bounds the query matches every document that has a value for the field. A doc with no value never matches.<br><br>Numeric fields (INT/FLOAT/DOUBLE/DATE) require a column. Bounds go through the same value-coercion contract as ingest, so querying a literal finds the documents ingested with it. DATE accepts ISO-8601 strings or epoch values in the field's unit, and a partial date names its whole window: bounds include the granule they name (\[2024-01 TO 2024-06\] covers January through June; exclusive bounds exclude the granule whole). FLOAT/DOUBLE compare by IEEE-754 total order: -0.0 sorts below +0.0 and NaN sorts above +Inf.<br><br>Term-backed fields (TEXT/STRING/ID) range over indexed terms in byte order (no collation), constant-scoring. TEXT bounds use multi-term normalization without tokenization; STRING bounds use the field's normalizer. Exact bounds follow the field's long\_terms policy. Uses the field's value binding.<br><br>Range fields (LONG\_RANGE, DOUBLE\_RANGE, DATE\_RANGE) compare each stored \[min, max\] interval with the query interval by \`relation\`. Bounds use the element's scalar range-query rules. Partial date bounds name their whole granule. Open long/date ends extend to int64 limits; open double ends are -Infinity and +Infinity. Explicit double infinities at those ends are equivalent; NaN is rejected. Date endpoints in results follow date output modes. Sort, facets, collapse, value expressions, and any\_of are unsupported.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1974,6 +1978,7 @@ Matches documents whose field value falls in the given range. All bounds are opt
 | <a id="field-luxir.rangequery.gt"></a>[`gt`](#field-luxir.rangequery.gt) | 3 | [`Val`](#message-luxir.val) | singular | lower bound, exclusive (&gt;) |
 | <a id="field-luxir.rangequery.lte"></a>[`lte`](#field-luxir.rangequery.lte) | 4 | [`Val`](#message-luxir.val) | singular | upper bound, inclusive (&lt;=) |
 | <a id="field-luxir.rangequery.lt"></a>[`lt`](#field-luxir.rangequery.lt) | 5 | [`Val`](#message-luxir.val) | singular | upper bound, exclusive (&lt;) |
+| <a id="field-luxir.rangequery.relation"></a>[`relation`](#field-luxir.rangequery.relation) | 15 | [`RangeQuery.Relation`](#enum-luxir.rangequery.relation) | singular | Range fields only; rejected on other field types unless INTERSECTS. |
 
 <a id="message-luxir.regexquery"></a>
 
@@ -2140,6 +2145,19 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.rescorequery.vars"></a>[`vars`](#field-luxir.rescorequery.vars) | 3 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
 | <a id="field-luxir.rescorequery.min_score"></a>[`min_score`](#field-luxir.rescorequery.min_score) | 4 | `float` | optional | Minimum rescored value. Documents whose expression output is below it do not match, in scored and unscored (filter) positions alike. Compared before any enclosing boost. Must be finite. |
 
+<a id="message-luxir.rowspacestats"></a>
+
+### luxir.RowSpaceStats
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.rowspacestats.path"></a>[`path`](#field-luxir.rowspacestats.path) | 1 | `string` | singular |  |
+| <a id="field-luxir.rowspacestats.max_doc"></a>[`max_doc`](#field-luxir.rowspacestats.max_doc) | 2 | `int32` | singular | physical child rows, including rows of deleted roots |
+| <a id="field-luxir.rowspacestats.ends_bytes"></a>[`ends_bytes`](#field-luxir.rowspacestats.ends_bytes) | 3 | `uint64` | singular | payload, alignment and block directory |
+| <a id="field-luxir.rowspacestats.owners_bytes"></a>[`owners_bytes`](#field-luxir.rowspacestats.owners_bytes) | 4 | `uint64` | singular | zero when the reverse map is absent |
+
 <a id="message-luxir.rrffusion"></a>
 
 ### luxir.RrfFusion
@@ -2250,7 +2268,7 @@ Top-level search request that can contain multiple search operations.
 | <a id="field-luxir.searchrequest.time_zone"></a>[`time_zone`](#field-luxir.searchrequest.time_zone) | 5 | `string` | singular | Time zone for date math and date literals without an offset. Empty is UTC; accepts Z, UTC, fixed offsets, or a case-sensitive IANA zone name. |
 | <a id="field-luxir.searchrequest.response_format"></a>[`response_format`](#field-luxir.searchrequest.response_format) | 6 | [`ResponseFormat`](#enum-luxir.responseformat) | singular | HTTP response framing. ENVELOPE (default): one JSON envelope per batch. DOCS: one document per line, with optional \_header\_ metadata records. The HTTP ?format=docs parameter also selects DOCS. gRPC rejects DOCS. See docs/guide/http-api.md for the NDJSON formats. |
 | <a id="field-luxir.searchrequest.profile"></a>[`profile`](#field-luxir.searchrequest.profile) | 7 | `bool` | singular | Return execution details for instrumented operations; see ExecutionProfile. |
-| <a id="field-luxir.searchrequest.max_parallel"></a>[`max_parallel`](#field-luxir.searchrequest.max_parallel) | 8 | `int32` | singular | Intra-request parallelism: 0 (default) lets the engine choose: serial (over HTTP normally inline on the receiving thread, over gRPC on the shared executor) unless the operator's search.auto-parallel-min-work admits it. 1 runs serially on the shared executor; -1 permits unlimited parallelism, with shared workers joining in (starting on the receiving HTTP thread, or on the shared executor over gRPC). Other values are rejected. |
+| <a id="field-luxir.searchrequest.max_parallel"></a>[`max_parallel`](#field-luxir.searchrequest.max_parallel) | 8 | `int32` | singular | Intra-request parallelism: 0 (default) starts on the receiving thread and adaptively uses idle cores after earning work credit. 1 runs serially on an arena worker; -1 publishes every sibling regardless of credit and load; -2 runs serially inline. gRPC and min\_commit continuations start on arena workers for every value. search.fanout-grain-us defaults to 50 us; -1 disables adaptive publication. search.fanout-sibling-grain-us defaults to 1000 us when only SMT siblings are idle; -1 disables that tier. Other values of max\_parallel are rejected. |
 | <a id="field-luxir.searchrequest.min_commit"></a>[`min_commit`](#field-luxir.searchrequest.min_commit) | 9 | `string` | singular | Require a local snapshot at least this new (incarnation:index\_gen). Writers reject a different incarnation immediately; followers wait for a switch. |
 | <a id="field-luxir.searchrequest.min_commit_timeout_ms"></a>[`min_commit_timeout_ms`](#field-luxir.searchrequest.min_commit_timeout_ms) | 10 | `uint64` | optional | Search floor deadline. Absent defaults to 30000; zero checks immediately. |
 | <a id="field-luxir.searchrequest.flags"></a>[`flags`](#field-luxir.searchrequest.flags) | 11 | `uint64` | singular | Packed request options. Effective = (inherited &amp; ~flags\_set) \| (flags &amp; flags\_set); the request inherits 0. JSON uses lowercase names, e.g. "flags": \["date\_ms"\], rather than numeric flags/flags\_set. Date modes control numeric date literal units: ms or ns overrides the field unit; native and iso use the field unit. Value arithmetic is unchanged. |
@@ -2299,6 +2317,7 @@ Ids and generations that appear in filenames are reported in their filesystem sp
 | <a id="field-luxir.segmentstats.merge_level"></a>[`merge_level`](#field-luxir.segmentstats.merge_level) | 12 | `uint32` | singular |  |
 | <a id="field-luxir.segmentstats.overlays"></a>[`overlays`](#field-luxir.segmentstats.overlays) | 13 | [`AuxStats`](#message-luxir.auxstats) | repeated |  |
 | <a id="field-luxir.segmentstats.bytes"></a>[`bytes`](#field-luxir.segmentstats.bytes) | 14 | `uint64` | singular |  |
+| <a id="field-luxir.segmentstats.spaces"></a>[`spaces`](#field-luxir.segmentstats.spaces) | 15 | [`RowSpaceStats`](#message-luxir.rowspacestats) | repeated | non-root spaces; bytes already included in the segment |
 
 <a id="message-luxir.servicestats"></a>
 
@@ -2556,7 +2575,9 @@ Restricts which terms of a STRING or ID field can become ordinary buckets of a F
 |---|---|---|---|---|
 | <a id="field-luxir.toparentquery.path"></a>[`path`](#field-luxir.toparentquery.path) | 1 | `string` | singular |  |
 | <a id="field-luxir.toparentquery.query"></a>[`query`](#field-luxir.toparentquery.query) | 2 | [`Query`](#message-luxir.query) | singular |  |
-| <a id="field-luxir.toparentquery.score"></a>[`score`](#field-luxir.toparentquery.score) | 3 | `string` | singular | none (constant score) or max. Unset selects max. |
+| <a id="field-luxir.toparentquery.score"></a>[`score`](#field-luxir.toparentquery.score) | 3 | `string` | singular | How matching child scores reduce to the owner's score: max (default), min, sum, avg, or none (the join contributes zero). |
+| <a id="field-luxir.toparentquery.min_children"></a>[`min_children`](#field-luxir.toparentquery.min_children) | 4 | `int32` | optional | Fewest matching children an owner needs. Unset = 1; must be &gt;= 1. |
+| <a id="field-luxir.toparentquery.max_children"></a>[`max_children`](#field-luxir.toparentquery.max_children) | 5 | `int32` | optional | Most matching children an owner may have. Unset = unbounded; must be &gt;= min\_children. |
 
 <a id="message-luxir.topdocs"></a>
 
@@ -2566,6 +2587,7 @@ Restricts which terms of a STRING or ID field can become ordinary buckets of a F
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.topdocs.row_ops"></a>[`row_ops`](#field-luxir.topdocs.row_ops) | 26 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Operations evaluated on each returned row, with that row as incoming domain. |
 | <a id="field-luxir.topdocs.decorate"></a>[`decorate`](#field-luxir.topdocs.decorate) | 25 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | Plugin result decorators, executed only for emitted rows. |
 | <a id="field-luxir.topdocs.query"></a>[`query`](#field-luxir.topdocs.query) | 1 | [`Query`](#message-luxir.query) | singular | unset selects all documents (browse / filter-only search) |
 | <a id="field-luxir.topdocs.filter"></a>[`filter`](#field-luxir.topdocs.filter) | 2 | [`Filter`](#message-luxir.filter) | repeated |  |
@@ -2796,6 +2818,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`Match.Operator`](#enum-luxir.match.operator)
 - [`MultiMatchQuery.Mode`](#enum-luxir.multimatchquery.mode)
 - [`RangeFacet.Bounds`](#enum-luxir.rangefacet.bounds)
+- [`RangeQuery.Relation`](#enum-luxir.rangequery.relation)
 - [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome)
 - [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state)
 - [`RequestFlagBit`](#enum-luxir.requestflagbit)
@@ -2901,6 +2924,9 @@ DATE only: unit of numeric ingest and stored epoch values. ISO-8601 text is conv
 | <a id="value-luxir.fielddef.fieldclass.ip"></a>[`IP`](#value-luxir.fielddef.fieldclass.ip) | 12 | IPv4 or IPv6 address, stored as 16-byte terms |
 | <a id="value-luxir.fielddef.fieldclass.decimal"></a>[`DECIMAL`](#value-luxir.fielddef.fieldclass.decimal) | 13 | fixed-point number, stored as int64 value \* 10^scale |
 | <a id="value-luxir.fielddef.fieldclass.nested"></a>[`NESTED`](#value-luxir.fielddef.fieldclass.nested) | 14 | structural path of nested object rows |
+| <a id="value-luxir.fielddef.fieldclass.long_range"></a>[`LONG_RANGE`](#value-luxir.fielddef.fieldclass.long_range) | 18 | Single-valued intervals written as {"gte"\|"gt": a, "lte"\|"lt": b}; either side may be omitted for an open end. Ingest rejects fractional long endpoints, out-of-domain endpoints, NaN, and empty intervals. Partial dates name their whole granule, in UTC without an explicit offset. index=range adds a query index; index=none is the default. match and explicit multi\_match selectors are supported; wildcard field selectors do not select range fields. Multi-valued ranges are unsupported.<br><br>int64 endpoints |
+| <a id="value-luxir.fielddef.fieldclass.double_range"></a>[`DOUBLE_RANGE`](#value-luxir.fielddef.fieldclass.double_range) | 19 | double endpoints |
+| <a id="value-luxir.fielddef.fieldclass.date_range"></a>[`DATE_RANGE`](#value-luxir.fielddef.fieldclass.date_range) | 20 | DATE endpoints (epoch millis, ISO-8601 or date math) |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 
@@ -2914,7 +2940,7 @@ Index acceleration. Numeric Match/Range and geographic predicates can scan a col
 |---|---|---|
 | <a id="value-luxir.fielddef.indexmode.none"></a>[`NONE`](#value-luxir.fielddef.indexmode.none) | 0 | no index |
 | <a id="value-luxir.fielddef.indexmode.match"></a>[`MATCH`](#value-luxir.fielddef.indexmode.match) | 1 | term index for STRING/TEXT/ID, including term ranges |
-| <a id="value-luxir.fielddef.indexmode.range"></a>[`RANGE`](#value-luxir.fielddef.indexmode.range) | 2 | numeric Match/Range or GEO\_POINT predicates; requires column=true |
+| <a id="value-luxir.fielddef.indexmode.range"></a>[`RANGE`](#value-luxir.fielddef.indexmode.range) | 2 | numeric Match/Range, GEO\_POINT or range-field predicates; requires column=true |
 
 <a id="enum-luxir.fielddef.longterms"></a>
 
@@ -3017,6 +3043,18 @@ Whether the extent is explicit or derived from this facet instance's values.
 |---|---|---|
 | <a id="value-luxir.rangefacet.bounds.explicit"></a>[`EXPLICIT`](#value-luxir.rangefacet.bounds.explicit) | 0 | start and end are required. Fixed DATE grids use the local time of start as their phase; calendar grids step from start for every n. The last fence is clipped to end. |
 | <a id="value-luxir.rangefacet.bounds.data"></a>[`DATA`](#value-luxir.rangefacet.bounds.data) | 1 | Span the smallest through largest matching finite values, plus optional start/end widening. Queries, filters and deletions affect the extent; each parent bucket's child histogram has its own span. Occupancy is from raw values, even when a distinct key is dropped and its measured count is zero. Empty domains return no buckets unless both widening bounds supply a span. NaN/Inf are outside every bucket and never fail DATA. Calendar grids use the 1970 civil epoch (ISO weeks: Monday 1969-12-29); a civil day starts at its first midnight, or first valid instant. selected is unsupported. The 100000-bucket cap applies to the actual span including widening and empty interior cells; use a larger gap. |
+
+<a id="enum-luxir.rangequery.relation"></a>
+
+### luxir.RangeQuery.Relation
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.rangequery.relation.intersects"></a>[`INTERSECTS`](#value-luxir.rangequery.relation.intersects) | 0 | the stored interval overlaps the query interval |
+| <a id="value-luxir.rangequery.relation.contains"></a>[`CONTAINS`](#value-luxir.rangequery.relation.contains) | 1 | the stored interval covers the whole query interval |
+| <a id="value-luxir.rangequery.relation.within"></a>[`WITHIN`](#value-luxir.rangequery.relation.within) | 2 | the stored interval lies inside the query interval |
 
 <a id="enum-luxir.replicaresult.outcome"></a>
 

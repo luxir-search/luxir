@@ -751,7 +751,7 @@ public:
       std::vector<QueryPrep::PreparedSource>& preparedSources,
       const std::vector<std::vector<DomainHandle>>& eligibility,
       std::span<DocSet* const> canonicalDomains,
-      IndexReader& reader, bool parallel, ExecutionWarnings* warnings,
+      IndexReader& reader, FanoutScope* fanout, ExecutionWarnings* warnings,
       Reserve&& reserve, PreparedCharge chargePrepared = {},
       Finish&& finish = nullptr) const {
     auto segments = reader.segments();
@@ -828,7 +828,7 @@ public:
         Query::Weight::PrepareContext context{
           reader,
           std::span<DocSet* const>(views.data(), views.size()),
-          parallel, warnings};
+          fanout, warnings};
         std::array<Query::Weight*, 1> weights{sourceWeight(source)};
         std::array<FilterCache::Use*, 1> uses{sourceUse(source)};
         auto prepared = QueryPrep::prepareFilterSources(
@@ -876,7 +876,7 @@ public:
           Query::Weight::PrepareContext context{
             reader,
             std::span<DocSet* const>(views.data(), views.size()),
-            parallel, warnings};
+            fanout, warnings};
           ownedWeight = sourceWeight(source)->prepare(context);
           variantWeight = ownedWeight.get();
         }
@@ -973,13 +973,13 @@ public:
   std::vector<std::vector<DomainHandle>> produceBucketDomains(
       IndexReader& reader, Query::PlanningContext& planning,
       std::span<const DomainHandle> inherited, std::span<const DomainHandle> resetBase,
-      bool parallel, ExecutionWarnings* warnings, RequestMemTracker& tracker,
+      FanoutScope* fanout, ExecutionWarnings* warnings, RequestMemTracker& tracker,
       Sources sources, const Finish& finish = {}) const;
 
   std::vector<std::vector<DomainHandle>> producePreparedDomains(
       IndexReader& reader, Query::PlanningContext& planning,
       std::span<const DomainHandle> inherited, std::span<const DomainHandle> resetBase,
-      bool parallel, ExecutionWarnings* warnings, BucketProduction& production, const Finish& finish) const;
+      FanoutScope* fanout, ExecutionWarnings* warnings, BucketProduction& production, const Finish& finish) const;
 
   void retainReservation(
       std::vector<DomainHandle>& domains,

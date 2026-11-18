@@ -779,8 +779,8 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   // Every search leaves this completion-queue thread for the task arena (see
   // SearchEngine::Receiver): gRPC offers a connection's new calls to its
   // preferred cq first, so a query run here would serialize the concurrent
-  // calls on that connection.  max_parallel keeps its parallelism meaning: 0
-  // (the default) and 1 run serially on a worker, -1 fans out from one.  The
+  // calls on that connection. With max_parallel, 0 is adaptive, 1 and -2
+  // are serial on a worker, and -1 publishes every sibling. The
   // reply and the final response come from that worker: respondRaw() is
   // thread-safe and Finish is kicked back to this call's cq thread.  The call
   // outlives the request because its outstanding-response count stays

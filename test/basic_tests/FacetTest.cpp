@@ -3824,7 +3824,7 @@ public:
       return nullptr;
     }
 
-    void calc(oneapi::tbb::task_group*, int32_t segnum,
+    void calc(FanoutScope*, int32_t segnum,
               DomainHandle) override {
       probe.feeds.push_back(
           {segnum, getSlot(), probe.liveBindings, probe.liveDomains});

@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <vector>
+#include <unordered_map>
 
 #include <google/protobuf/arena.h>
 
@@ -22,6 +23,15 @@ class CollapsePlan;
 class IndexReader;
 class LuxirNode;
 class SearchRequest;
+class Query;
+
+struct NamedClause {
+  Query* query;
+  const api::TopDocs* list;
+  std::string path;
+  bool prohibited;
+};
+using NamedClauses = std::unordered_map<std::string_view, NamedClause>;
 
 // Request-scoped context threaded through query parsing and building: the
 // pool the query tree is built into, the schema, the warnings sink (declared
@@ -29,6 +39,10 @@ class SearchRequest;
 // budget and operator rules. This is the request-scoped parse/build context
 // from the query-string design; the limits-config snapshot joins it later.
 struct ParseContext {
+  std::optional<NamedClauses> localNames;
+  NamedClauses* names = nullptr;
+  const api::TopDocs* list = nullptr;
+  bool prohibited = false;
   const CollapsePlan* collapse = nullptr;
   // Null for offline parsing; request parsers pass their engine's node.
   LuxirNode* node = nullptr;

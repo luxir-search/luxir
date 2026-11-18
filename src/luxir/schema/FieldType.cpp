@@ -70,7 +70,7 @@ void VectorFieldType::signatureProps(SignatureProps& out) const {
 
 std::string_view FieldType::typeName(Type type) {
   static constexpr std::string_view names[] = {
-    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point", "boolean", "decimal", "ip", "nested"
+    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point", "boolean", "decimal", "ip", "nested", "interval"
   };
   return (unsigned)type < std::size(names) ? names[(unsigned)type] : "unknown";
 }
@@ -108,6 +108,10 @@ uint32_t FieldType::typeParameters(Type type, uint32_t typeFlags) {
       return typeFlags;
     case NESTED:
       throw std::runtime_error("Nested paths cannot be persisted as fields");
+    case INTERVAL:
+      typeParameters(RangeFieldType::elementTypeFromFlags(typeFlags),
+                     typeFlags >> RangeFieldType::ELEMENT_FLAGS_SHIFT);
+      return typeFlags;
     case NONE: case STRING: case TEXT: case BIN: case INT: case FLOAT:
     case DOUBLE: case ID: case VECTOR: case GEO_POINT: case BOOLEAN: case IP:
       if (typeFlags == 0) return 0;
@@ -123,6 +127,15 @@ std::string FieldType::describeType(Type type, uint32_t typeFlags) {
   }
   typeParameters(type, typeFlags);
   if (type == DECIMAL) return std::format("type 'decimal' scale {}", typeFlags);
+  if (type == INTERVAL) {
+    static constexpr std::string_view names[] = {"long_range", "double_range", "date_range"};
+    std::string description = std::format("type '{}'", names[typeFlags & RangeFieldType::ELEMENT_KIND_MASK]);
+    uint32_t elementFlags = typeFlags >> RangeFieldType::ELEMENT_FLAGS_SHIFT;
+    if (elementFlags != 0) {
+      description += " with element " + describeType(RangeFieldType::elementTypeFromFlags(typeFlags), elementFlags);
+    }
+    return description;
+  }
   return std::format("type '{}'", typeName(type));
 }
 

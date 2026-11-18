@@ -161,6 +161,15 @@ public:
         && (storage == FieldType::Storage::TERMS || storage == FieldType::Storage::TEXT);
   }
 
+  // Column-numeric fields and range fields take exact-match field: syntax
+  // (field:value or a quoted value). Wildcard/fuzzy syntax has no endpoint
+  // meaning and degrades to text. Requires column storage: the match scan
+  // reads the column, so a field without it is not targetable and degrades.
+  static bool columnMatchQueryable(FieldType& fieldType) {
+    return fieldType.supports(FieldType::MATCH) && fieldType.hasColumn()
+        && (FieldType::isNumericColumn(fieldType.type()) || fieldType.supports(FieldType::RANGE_RELATION));
+  }
+
   SimpleQueryParser(const SimpleQueryOptions& opts, std::pmr::memory_resource& arena)
       : opts(opts), mr(arena), buf(&arena), warnings(arena), expFields(&arena),
         parenClose(&arena) {
@@ -420,16 +429,6 @@ private:
 
   // ---- schema consultation (arm selection only; text stays uninterpreted) ----
 
-  // Column-numeric field types (INT/FLOAT/DOUBLE/DATE/BOOLEAN, stored in the shared int
-  // column).  field: syntax targets these with an exact-match arm only
-  // (field:value or a quoted value); wildcard/fuzzy have no numeric meaning and
-  // degrade to text.  Requires column storage - the match scan reads the column,
-  // so a numeric field without it is not targetable and degrades to text.
-  static bool numericQueryable(FieldType& fieldType) {
-    return fieldType.supports(FieldType::MATCH) && FieldType::isNumericColumn(fieldType.type())
-        && fieldType.hasColumn();
-  }
-
   static bool existsQueryable(FieldType& fieldType) {
     return fieldType.indexed() || fieldType.hasColumn();
   }
@@ -450,7 +449,7 @@ private:
     api::Val v;
     v.kind = value;
     try {
-      if (!FieldType::isNumericColumn(fieldType.type())) {
+      if (!columnMatchQueryable(fieldType)) {
         char scratch[coerce::TEXT_BUF_SIZE];
         return fieldType.tryCoerceTermWindow(v, fieldType.name(), scratch).has_value();
       }
@@ -490,7 +489,7 @@ private:
   FieldType* fieldedHead(std::string_view head) {
     auto* target = fieldFor(head, OpClass::SEARCH);
     if (!target || (!termQueryable(*target->fieldType)
-                    && !numericQueryable(*target->fieldType))) return nullptr;
+                    && !columnMatchQueryable(*target->fieldType))) return nullptr;
     if (isAllowed(*target)) return target->fieldType;
     warn("field_narrowed",
          fmt::format("field '{}' is outside this request's allowed_fields; treated as text", head));
@@ -937,7 +936,7 @@ private:
                 }
               } else if (phrase->text.empty()) {
                 clearPending(st);
-              } else if ((numericQueryable(*fieldType) || !fieldType->supports(FieldType::FREE_TEXT))
+              } else if ((columnMatchQueryable(*fieldType) || !fieldType->supports(FieldType::FREE_TEXT))
                          && !literalCoercible(*fieldType, phrase->text)) {
                 // Uncoercible numeric value: degrade like an unknown field -
                 // the head stays literal text and the quoted value is a
@@ -1025,7 +1024,7 @@ private:
             addUnit(st, allocQuery(q));
             return;
           }
-          if (numericQueryable(*ft) || !ft->supports(FieldType::FREE_TEXT)) {
+          if (columnMatchQueryable(*ft) || !ft->supports(FieldType::FREE_TEXT)) {
             // Column numerics and fields without free-text expansion take
             // exact-match literals. Unsupported syntax degrades to text.
             if (prefix || sawFuzzy) {

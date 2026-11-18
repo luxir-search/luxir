@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 
+#include "luxir/index/BKDWriter.h"
 #include "luxir/reader/PostingsReader.h"
 
 namespace luxir {
@@ -101,6 +102,8 @@ struct MergeCostModel {
   static constexpr int64_t SYNTHESIZED_POINT_BYTES = 16;
   // vector growth can retain nearly 2x the 16-byte triple payload.
   static constexpr int64_t GEO_POINT_BYTES = 32;
+  // The same for a range field's 24-byte (min, max, docid) point.
+  static constexpr int64_t RANGE_POINT_BYTES = 48;
   // Three 8-byte directory arrays can each retain nearly 2x vector capacity.
   static constexpr int64_t POINTS_DIRECTORY_BYTES_PER_LEAF = 48;
 
@@ -129,13 +132,14 @@ struct MergeCostModel {
   }
 
   static int64_t geoPointsBytes(int64_t totalValues) {
-    int64_t leaves = totalValues / POINTS_PER_LEAF
-        + (totalValues % POINTS_PER_LEAF != 0);
-    // The merged-column walk buffers every output triple. BKDWriter partitions
-    // that array in place and retains the same directory shape as 1-D points.
-    return POINTS_WRITER_BYTES
-        + totalValues * GEO_POINT_BYTES
-        + leaves * POINTS_DIRECTORY_BYTES_PER_LEAF;
+    return totalValues * GEO_POINT_BYTES + (int64_t)BKDWriter::workspaceBytes(totalValues);
+  }
+
+  // A range column holds two values per point.
+  static int64_t rangePointsBytes(int64_t totalValues) {
+    int64_t points = totalValues / 2;
+    return points * RANGE_POINT_BYTES
+        + (int64_t)BasicBKDWriter<BKDInt64Traits>::workspaceBytes(points);
   }
 };
 

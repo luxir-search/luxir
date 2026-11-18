@@ -308,7 +308,7 @@ public:
       return nullptr;
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domainHandle) override {
       unused(tg);
       assert(domainHandle.isDeliverable());
@@ -843,7 +843,7 @@ public:
         return nullptr;
       }
 
-      void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+      void calc(FanoutScope* tg, int32_t segnum,
                 DomainHandle domain) override {
         unused(tg);
         unused(segnum);
@@ -973,8 +973,8 @@ public:
   public:
     using Calculator::Calculator;
     api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override { return nullptr; }
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DomainHandle domain) override {}
-    void calcAll(oneapi::tbb::task_group* tg, std::span<const DomainHandle> domains) override {}
+    void calc(FanoutScope* tg, int32_t segnum, DomainHandle domain) override {}
+    void calcAll(FanoutScope* tg, std::span<const DomainHandle> domains) override {}
     size_t facetBucketObservedBytes() const override { return 0; }
   };
 

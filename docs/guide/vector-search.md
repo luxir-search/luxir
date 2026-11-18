@@ -806,7 +806,7 @@ every index type.
 |---|---|
 | `field` | Vector field. Required. |
 | `query` | Query vector with `dims` components, or `truncate_dims` when set. Required. |
-| `k` | Nearest documents or groups the query node produces. Required, positive. |
+| `k` | Nearest rows or groups of the view where the query is written. Required, positive; see [child vectors](nested.md#chunks-and-vectors). |
 | `unit` | `docs` (default) or `groups`; groups requires an enclosing collapse. |
 | `exact` | Require the true top-k. Uses the full-precision column scan and ignores overlays and the knobs below. |
 | `similarity` | Minimum similarity of a hit, in the metric's own space; see [Similarity threshold](#similarity-threshold). |

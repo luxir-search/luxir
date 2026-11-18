@@ -23,6 +23,7 @@ Choose a type based on how you want to search and use the values:
 | `date` | Timestamp with `ms` (default) or `ns` storage precision. Ingest accepts ISO-8601 text or numeric epoch values in the field's unit. See [Dates](dates.md). |
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
 | `geo_point` | Geographic location supplied as `[longitude, latitude]`, an object, a string, or a geohash, for distance and bounding-box queries. See [Geo search](geo-search.md). |
+| `long_range`, `double_range`, `date_range` | An interval of `int`, `double`, or `date` endpoints, such as a validity window, a price band, or an event's duration. See [Range types](#range-types). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
 
 ### Decimals
@@ -115,6 +116,53 @@ so gRPC returns a `col_val` column holding one boolean value (or array) per
 document. Value expressions preserve booleans through selection (`min`,
 `max`, and choices between booleans); arithmetic, `sum`, and `avg` produce
 numbers. Summing a boolean counts true values.
+
+### Range types
+
+A range value is an object with an optional lower bound (`gte` or `gt`) and an
+optional upper bound (`lte` or `lt`); a missing side is an open end:
+
+```json
+{"id": "promo-7", "valid": {"gte": "2024-06-01", "lt": "2024-07-01"}, "price": {"gte": 10.5, "lte": 20}}
+```
+
+Ingest is strict about the endpoint type: `long_range` rejects fractional
+endpoints, and long or date endpoints outside the supported scalar domain
+fail the document. An exclusive bound moves one value inward (`{"gt": 5}` on
+`long_range` starts at 6). A lower bound above the upper bound, including an
+empty interval after exclusive bounds, fails the document.
+
+Luxir treats a partial date as its whole granule at ingest: `{"gte": "2024-06"}`
+starts at the first millisecond of June and `{"lte": "2024-06"}` ends at its
+last millisecond. `gt` excludes the whole named granule, as does `lt`.
+Elasticsearch and OpenSearch differ: when they ingest a range field, a
+partial-date `lte` such as `"2024-06"` does not extend to the end of the month. Dates without an explicit
+offset are evaluated in UTC at ingest. `date_range` uses millisecond precision;
+ISO strings, epoch milliseconds, `now`, and date math follow the scalar
+`date` rules. Query bounds follow the scalar range-query coercion rules.
+
+For `double_range`, an open lower end is `-Infinity` and an open upper end is
+`Infinity`; explicit infinities at those ends have the same meaning. NaN is
+rejected at ingest and in queries. `gt: "Infinity"` or `lt: "-Infinity"` makes
+an empty interval. Negative and positive zero remain distinct, with `-0.0`
+below `+0.0`. Long and date open ends extend to the int64 limits.
+
+Search results return `{"gte": lower, "lte": upper}`, omitting open ends.
+Date endpoints follow the request's date output mode: epoch milliseconds by
+default, ISO strings with `date_iso`, milliseconds with `date_ms`, or
+nanoseconds with `date_ns`. This applies to both ROWS and COLUMNS responses.
+
+Range fields require `column` (the default) and support `index: "none"`
+(the default) or `index: "range"` for an optional query index. They do not
+support `stored` or `index: "match"`. Multi-valued range fields are not
+supported yet.
+
+The [range query](query-reference.md#range-fields) supports `intersects`,
+`contains`, and `within`. `match` finds intervals containing a point value;
+a partial date matches intervals overlapping its granule. `multi_match`
+accepts explicitly named range fields and field weights;
+wildcard field selectors do not select range fields. Sort, facets, collapse,
+value expressions, and `any_of` are not supported on range fields.
 
 ### `text` versus `string`
 
@@ -366,7 +414,7 @@ publication advances the schema generation.
 
 | Key | Meaning |
 |---|---|
-| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `decimal`, `boolean`, `ip`, `date`, `vector`, `geo_point`, `id` |
+| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `decimal`, `boolean`, `ip`, `date`, `vector`, `geo_point`, `long_range`, `double_range`, `date_range`, `id` |
 | `scale` | `decimal` only, required from 0 to 18; inherited from `parent`. |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
@@ -382,6 +430,7 @@ publication advances the schema generation.
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
 | `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). |
+| `reverse_map` | `nested` only; defaults to `true`. Store each child row's owner in segments written from now on; see [Declaring nested paths](nested.md#declaring-nested-paths). |
 | `ann` | `vector` only; approximate index codec and parameters. RaBitQ is the default; PQ requires explicit `codec:"pq"`. See [Index settings](vector-search.md#index-settings). |
 
 Every property is optional. Absent means "inherit from `parent`, else the
@@ -742,6 +791,7 @@ The primary and every variant must use types from the same group:
 | Scalar | `text`, `string`, `int`, `float`, `double`, `decimal`, `boolean`, `ip`, `date`. |
 | Vector | `vector`; every branch must resolve to the same positive `dims`. |
 | Geo | `geo_point`. |
+| Range | `long_range`, `double_range`, `date_range`. |
 
 ### Default bindings for variants
 
@@ -1078,6 +1128,10 @@ also work under paths: `lines_nested.color_s` needs no explicit declaration
 in the default schema. A nested path cannot declare scalar value settings,
 variants, indexing, columns or storage. Objects may contain nested paths
 recursively, up to 32 levels.
+
+A nested path's one setting is `reverse_map` (default `true`), described in
+[Declaring nested paths](nested.md#declaring-nested-paths). It can be changed
+on a live collection without reindexing.
 
 Dots separate path components. Each component starts with an ASCII letter
 and contains letters, digits or underscores. A physical name, including

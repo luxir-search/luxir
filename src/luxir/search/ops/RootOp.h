@@ -32,17 +32,6 @@ public:
     SearchOp::releaseSegmentState(segment);
   }
 
-  // Lists price their own matches. Any other top-level op works over the
-  // whole collection.
-  size_t workEstimate() override {
-    size_t total = SearchOp::workEstimate();
-    for (auto& [name, subOp] : subOps) {
-      if (subOp->ownsMatchDomain()) continue;
-      total = saturatingAdd(total, (size_t) view->maxDoc());
-    }
-    return total;
-  }
-
   class Calc final : public SearchOp::Calculator {
     std::vector<std::unique_ptr<Calculator>> subCalcs;
     std::vector<size_t> subCalcVariants;
@@ -59,7 +48,7 @@ public:
     }
 
     void calc(
-        oneapi::tbb::task_group* tg, int32_t segnum,
+        FanoutScope* tg, int32_t segnum,
         DomainHandle domain) override {
       unused(tg);
       unused(segnum);
@@ -69,7 +58,7 @@ public:
     }
 
     void calcAll(
-        oneapi::tbb::task_group* tg,
+        FanoutScope* tg,
         std::span<const DomainHandle> domains) override {
       unused(tg);
       unused(domains);
@@ -77,7 +66,7 @@ public:
       std::unreachable();
     }
 
-    void start(oneapi::tbb::task_group* tg) {
+    void start(FanoutScope* tg) {
       auto& root = static_cast<RootOp&>(op);
       assert(subCalcs.empty());
       subCalcs.reserve(op.subOps.size());
@@ -153,7 +142,7 @@ public:
       Query::Weight::PrepareContext prepareContext{
         *op.view,
         std::span<DocSet* const>(liveViews.data(), liveViews.size()),
-        tg != nullptr, &op.req};
+        tg, &op.req};
       std::vector<QueryPrep::PreparedSource> prepared(weights.size());
       auto release = scope_guard([&]() noexcept {
         for (auto& segment : op.view->segments()) {
@@ -232,7 +221,7 @@ public:
       auto preparedVariants = root.domainVariants.prepareResetVariants(
           prepared, eligibility,
           std::span<DocSet* const>(liveViews.data(), liveViews.size()),
-          *op.view, tg != nullptr, &op.req,
+          *op.view, tg, &op.req,
           [&](size_t variant, size_t segnum) {
             auto& segment = op.view->segments()[segnum];
             return root.domainVariants.reserveVariantPreparation(
