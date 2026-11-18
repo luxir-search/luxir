@@ -8,6 +8,7 @@
 
 #include "SearchEngine.h"
 #include "luxir/server/CommitWaits.h"
+#include "luxir/store/FetchCountdown.h"
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
 #include "luxir/reader/SkipStats.h"
@@ -59,17 +60,33 @@ std::vector<std::string> SearchEngine::explain(const ReqProto& proto, std::strin
 
 Metrics& SearchEngine::metrics() const { return *node.metrics; }
 
-void SearchEngine::submitBody(SearchRequest& req) {
-  MetricScope execution(*node.metrics, metricActivity(MetricStage::SEARCH_EXECUTION));
+void SearchEngine::failBody(SearchRequest& req, std::exception& e, ErrorKind fallback) {
+  // Cancel and drain in-flight tasks before tearing down their response.
+  // Swallow any parked task exception so the original error is preserved.
+  if (req.tg) {
+    req.tg->cancel();
+    try { req.tg->join(); } catch (...) {}
+  }
+  ErrorInfo info = classifyException(e, fallback);
+  if (info.kind == ErrorKind::INTERNAL) {
+    LOG_ERROR("Search request failed: {}", info.message);
+  } else {
+    LOG_WARN("Search request rejected ({}): {}", info.code, info.message);
+  }
+  req.setError(info);
+}
+
+void SearchEngine::submitBody(SearchRequest& req, bool mayDefer, FanoutScope* ownTg) {
+  auto execution = std::make_shared<MetricScope>(*node.metrics, metricActivity(MetricStage::SEARCH_EXECUTION));
   LoadScope load(LoadKind::REQUEST);
   std::optional<FanoutCreditScope> credit;
-  if (req.tg) credit.emplace(execution.startNs());
+  if (req.tg) credit.emplace(execution->startNs());
   // Until the calculators start, an unclassified failure is the request's
   // fault: parsers and planners reject authored input with bare exceptions.
   // Once execution is under way it is the engine's.  Throw sites that know
   // better say so with an ApiError, which classifies itself in either phase.
-  ErrorKind fallback = ErrorKind::INVALID_REQUEST;
   RootOp* root = nullptr;
+  SegmentMask segments;
   try {
     root = prepare(req);
     root->init();
@@ -80,8 +97,72 @@ void SearchEngine::submitBody(SearchRequest& req) {
     // Planning itself opens only what statistics need (a segment's base for
     // term dictionary seeks), never live docs or overlays; a pruned segment
     // nothing prepares over gets nothing more.
-    SegmentMask segments = root->neededSegments();
+    segments = root->neededSegments();
     segments |= root->preparationSegments();
+  } catch (std::exception& e) {
+    failBody(req, e, ErrorKind::INVALID_REQUEST);
+    finishBody(req, root, *execution);
+    return;
+  }
+  if (mayDefer) {
+    ReadSet reads;
+    req.reader->declareMaterialize(segments, reads);
+    auto resume = [this, &req, root, segments, execution] { execute(req, root, segments, *execution); };
+    if (fetchAhead(req, std::move(reads), ownTg, std::move(resume))) return;
+  }
+  execute(req, root, segments, *execution);
+}
+
+bool SearchEngine::fetchAhead(SearchRequest& req, ReadSet reads, FanoutScope* ownTg, std::function<void()> resume) {
+  if (reads.empty()) return false;
+  // The fetch may finish on a worker after this thread returned: the request
+  // must not point at the caller's fan-out scope then. Nothing ran in it yet.
+  bool tookTg = ownTg && req.tg == ownTg;
+  if (tookTg) req.tg = nullptr;
+  auto countdown = FetchCountdown::create(node.getTaskArena(),
+      [this, &req, resume = std::move(resume)](std::exception_ptr error) {
+        // A failed fetch is no failed search: the reads that need the bytes
+        // fetch again and report what they find, as they would without it.
+        if (error && !isFetchNotResident(error)) {
+          try {
+            std::rethrow_exception(error);
+          } catch (const std::exception& e) {
+            LOG_DEBUG("fetch ahead of a search failed: {}", e.what());
+          } catch (...) {}
+        }
+        // Isolated like enqueueSubmit; the resumed request gets the fan-out
+        // scope run() would have made, on this worker's stack.
+        oneapi::tbb::this_task_arena::isolate([&] {
+          std::optional<FanoutScope> tg;
+          if (req.tg == nullptr) {
+            if (auto policy = fanoutPolicy(req.maxParallel)) req.tg = &tg.emplace(&node.getTaskArena(), *policy);
+          }
+          LoadScope load(LoadKind::REQUEST);
+          // Credit starts now: the wait for the fetch is no inline work.
+          std::optional<FanoutCreditScope> credit;
+          if (req.tg) credit.emplace();
+          try {
+            resume();
+          } catch (...) {
+            // The countdown swallows a throw, which would strand the request:
+            // the continuation's own failure paths reply, so this is a throw
+            // outside them (before the final reply), and the request ends here.
+            req.tg = nullptr;
+            req.setError(currentExceptionInfo(ErrorKind::INTERNAL));
+            req.bodyDone();
+          }
+        });
+      });
+  countdown->fetch(reads, kNoReadDeadline);
+  reads.clear();
+  if (!countdown->arm()) return true;  // resumes on a worker; req may be gone
+  if (tookTg) req.tg = ownTg;
+  return false;
+}
+
+void SearchEngine::execute(SearchRequest& req, RootOp* root, const SegmentMask& segments, MetricScope& execution) {
+  ErrorKind fallback = ErrorKind::INVALID_REQUEST;
+  try {
     req.reader->materialize(segments);
     std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can
@@ -109,21 +190,12 @@ void SearchEngine::submitBody(SearchRequest& req) {
       LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
     }
   } catch (std::exception& e) {
-    // Cancel and drain in-flight tasks before tearing down their response.
-    // Swallow any parked task exception so the original error is preserved.
-    if (req.tg) {
-      req.tg->cancel();
-      try { req.tg->join(); } catch (...) {}
-    }
-    ErrorInfo info = classifyException(e, fallback);
-    if (info.kind == ErrorKind::INTERNAL) {
-      LOG_ERROR("Search request failed: {}", info.message);
-    } else {
-      LOG_WARN("Search request rejected ({}): {}", info.code, info.message);
-    }
-    req.setError(info);
+    failBody(req, e, fallback);
   }
+  finishBody(req, root, execution);
+}
 
+void SearchEngine::finishBody(SearchRequest& req, RootOp* root, MetricScope& execution) {
   if (root != nullptr) {
     for (auto& segment : req.reader->segments()) root->releaseSegmentState(segment);
   }
@@ -155,7 +227,7 @@ void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
   try {
     // Isolation also covers waits outside the request's fan-out scope.
     node.getTaskArena().enqueue([this, &req, maxParallel] {
-      oneapi::tbb::this_task_arena::isolate([&] { submit(req, maxParallel); });
+      oneapi::tbb::this_task_arena::isolate([&] { run(req, maxParallel, true); });
     });
   } catch (const std::exception& e) {
     // Nothing was queued: complete the request here so its transport still
@@ -203,20 +275,29 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver re
   if (!runOnReceiver) {
     enqueueSubmit(req, maxParallel);
   } else {
-    submit(req, maxParallel);
+    run(req, maxParallel, true);
   }
 }
 
 void SearchEngine::submit(SearchRequest& req, int32_t maxParallel) {
+  run(req, maxParallel, false);
+}
+
+std::optional<FanoutPolicy> SearchEngine::fanoutPolicy(int32_t maxParallel) {
+  // SkipStats counters are single-threaded; adaptive instrumented runs stay serial.
+  if (maxParallel == -1) return FanoutPolicy::EVERY;
+  if (maxParallel == 0 && !SkipStats::enabled) return FanoutPolicy::ADAPTIVE;
+  return std::nullopt;
+}
+
+void SearchEngine::run(SearchRequest& req, int32_t maxParallel, bool mayDefer) {
   // Ideas: we could keep track of executing requests here, and provide ways to list / cancel them?
   req.maxParallel = maxParallel;
   std::optional<FanoutScope> stackTg;
-  // SkipStats counters are single-threaded; adaptive instrumented runs stay serial.
-  if (req.tg == nullptr && (maxParallel == -1 || (maxParallel == 0 && !SkipStats::enabled))) {
-    req.tg = &stackTg.emplace(&node.getTaskArena(),
-        maxParallel == -1 ? FanoutPolicy::EVERY : FanoutPolicy::ADAPTIVE);
+  if (req.tg == nullptr) {
+    if (auto policy = fanoutPolicy(maxParallel)) req.tg = &stackTg.emplace(&node.getTaskArena(), *policy);
   }
-  submitBody(req);
+  submitBody(req, mayDefer, stackTg ? &*stackTg : nullptr);
 }
 
 void SearchEngine::getResources(SearchRequest& req) {
