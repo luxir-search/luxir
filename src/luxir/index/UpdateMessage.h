@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <deque>
 #include "CommitSnapshot.h"
 #include "Inverter.h"
@@ -93,6 +94,8 @@ public:
   uint64_t updateVersion = 0;         // Durable version used for document and delete ordering
   std::shared_ptr<Schema> schema;     // Pinned at writer admission, before assigning sequence numbers
   uint64_t updateOrdinal = 0;         // Session-local, 0-based update sequencer tag
+  // When the message was submitted; its queue wait runs from here to processing.
+  std::chrono::steady_clock::time_point submitted;
   uint64_t commitNum = 0;             // The 0-based commit number of this update, used to ensure commits are finished in order
   std::unique_ptr<CommitInfo> commitInfo;  // Commit info for this update, if any.  This is set by the IndexWriter when the commit is processed.
 
