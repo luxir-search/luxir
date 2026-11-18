@@ -277,10 +277,11 @@ std::shared_ptr<Value> SegmentPart<Value>::getOrOpen(std::string_view what, Open
     } catch (const std::filesystem::filesystem_error& e) {
       // A held file cannot vanish: one absent at decode was never secured.
       markUnreadable(std::string(what) + " has a file missing: " + e.what());
-    } catch (const std::system_error&) {
-      throw;
+    } catch (const std::system_error& e) {
+      // Retried; classified as the server's failure, not the request's.
+      throw ApiError(ErrorKind::UNAVAILABLE, "segment_open_failed", std::string(what) + " cannot be opened: " + e.what());
     } catch (const std::bad_alloc&) {
-      throw;
+      throw ResourceExhaustedError(std::string(what) + " cannot be opened: out of memory");
     } catch (const std::exception& e) {
       markUnreadable(std::string(what) + " cannot be read: " + e.what());
     }
@@ -388,11 +389,9 @@ std::shared_ptr<AuxReader> Segment::getAuxReader(std::string_view name) const {
   return nullptr;
 }
 
-void IndexReader::materialize(const SegmentMask& mask) {
-  std::vector<const Segment*> pending;
-  for (const auto& segment : space->segs) {
-    if (mask.test((size_t)segment.ord) && !segment.isMaterialized()) pending.push_back(&segment);
-  }
+namespace {
+// Opens segments in parallel: each open maps files and decodes headers independently.
+void materializeAll(const std::vector<const Segment*>& pending) {
   if (pending.size() == 1) {
     pending.front()->materialize();
   } else if (!pending.empty()) {
@@ -400,6 +399,18 @@ void IndexReader::materialize(const SegmentMask& mask) {
                               oneapi::tbb::simple_partitioner());
   }
 }
+
+// Opens the not yet materialized segments the mask keeps, all of them without one.
+void materializeSegments(const std::vector<Segment>& segs, const SegmentMask* mask) {
+  std::vector<const Segment*> pending;
+  for (const auto& segment : segs) {
+    if ((!mask || mask->test((size_t)segment.ord)) && !segment.isMaterialized()) pending.push_back(&segment);
+  }
+  materializeAll(pending);
+}
+}  // namespace
+
+void IndexReader::materialize(const SegmentMask& mask) { materializeSegments(space->segs, &mask); }
 
 IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const IndexReader* previousReader,
                                                 std::shared_ptr<Schema> preferredSchema,
@@ -495,9 +506,7 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
       }
       for (const auto& aux : indexInfo.aux_indexes) core->auxFiles.push_back(fromWire(aux.files));
       if (previous && previous->segmentFiles == core->segmentFiles && previous->auxFiles == core->auxFiles) {
-        if (materialize) {
-          for (const auto& seg : previous->root->segs) seg.materialize();
-        }
+        if (materialize) materializeSegments(previous->root->segs, nullptr);
         return {previousReader->snapshot->core, std::move(schema), indexInfo.commit_time, indexGen};
       }
       commitTimeUs = indexInfo.commit_time;
@@ -652,14 +661,15 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
           auto prevIt = prevSegAuxByKey.find(segmentAuxKey(segId, info.name));
           if (prevIt != prevSegAuxByKey.end()
               && prevIt->second->info.gen == info.gen
-              && prevIt->second->info.built_core_gen == info.built_core_gen) {
+              && prevIt->second->info.built_core_gen == info.built_core_gen
+              && prevIt->second->info.files == files.overlays[(size_t)j]) {
             IREADER_DEBUG("Reusing segment overlay '{}' for seg={} (gen={}) from previous IndexReader",
                           info.name, segId, info.gen);
             segmentOverlays.push_back(prevIt->second);
             continue;
           }
 
-          auto descriptors = fromWire(info.files);
+          const auto& descriptors = files.overlays[(size_t)j];
           auto held = holdAll(dir, descriptors);
           if (!held) {
             if (!missingFileOK) {
@@ -757,9 +767,7 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
     livedocs += bundle.info.live_docs;
   }
 
-  if (materialize) {
-    for (const auto& seg : core->root->segs) seg.materialize();
-  }
+  if (materialize) materializeSegments(core->root->segs, nullptr);
 
   IREADER_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", segs.size(), totalMaxDoc, commitTimeUs);
   return {std::move(core), std::move(schema), commitTimeUs, indexGen};
@@ -954,6 +962,17 @@ const IndexReader::HeaderTotals& IndexReader::FieldSegments::totals() const {
   assert(record);
   auto* totals = record->totals.load(std::memory_order_acquire);
   if (!totals) {
+    // Segments without a complete summary (child spaces have none) need their
+    // headers: open those together rather than one by one in the loop below.
+    std::vector<const Segment*> pending;
+    for (size_t i = 0; i < size(); i++) {
+      const SegmentSummary* summary = segments[i].summary();
+      if ((!summary || !summary->complete()) && presentIn(i) && segments[i].hasSpace()
+          && !segments[i].isMaterialized()) {
+        pending.push_back(&segments[i]);
+      }
+    }
+    materializeAll(pending);
     auto fresh = std::make_unique<HeaderTotals>();
     bool first = true;
     for (size_t i = 0; i < size(); i++) {

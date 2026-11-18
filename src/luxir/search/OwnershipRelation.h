@@ -4,12 +4,12 @@
 #pragma once
 
 #include "RowRelation.h"
-#include "luxir/reader/OwnershipMapper.h"
+#include "LeafOwnershipMappers.h"
 
 namespace luxir {
 
 class OwnershipRelation final : public RowRelation {
-  std::vector<std::optional<OwnershipMapper>> mappers;
+  LeafOwnershipMappers mappers;
 
   class Scorer;
   class Supplier;

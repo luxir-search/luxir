@@ -250,6 +250,12 @@ space's live rows derive from the root's live docs through ownership, so
 they materialize the segment when first used; until then a child view
 reports its live count as bounds (`liveCountBounds`).
 
+Summaries describe the root space only. A child view has none, so a field's
+presence and header totals in a child space come from its segments' headers:
+the first lookup of a child field opens the segments that hold that space,
+together and in parallel. Joins between spaces bind each segment's ownership
+lazily, when a query first reaches that segment.
+
 ### Securing the snapshot's files
 
 A reader must secure its snapshot's files when it opens, or a commit that

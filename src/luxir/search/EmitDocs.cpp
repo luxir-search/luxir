@@ -146,8 +146,9 @@ bool appendMappedSelector(SearchRequest& req, IndexReader& reader, std::string_v
     mergeFields(mapping->fields, additions);
     std::set<std::string_view> paths;
     for (const auto& leaf : child.segments()) {
-      for (const auto& space : leaf.segmentCore().spaces()) {
-        if (spaceParentPath(space.path) == child.path()) paths.insert(space.path);
+      // The manifest's space catalog, so listing sub-paths opens nothing.
+      for (const auto& [path, rows] : leaf.basePart()->spaces) {
+        if (spaceParentPath(path) == child.path()) paths.insert(path);
       }
     }
     for (auto path : paths) {

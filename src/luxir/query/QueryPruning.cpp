@@ -28,7 +28,8 @@ const SegmentMask& QueryPruning::viable(const Query& query) {
   SegmentMask mask = membership(query);
   if (!disableForTests) {
     for (const auto& segment : reader.segments()) {
-      if (segment.numLive() == 0) mask.clear((size_t)segment.ord);
+      // Bounds rather than numLive(): a child count must not derive live rows here.
+      if (segment.liveCountBounds().second == 0) mask.clear((size_t)segment.ord);
     }
   }
   return memo.emplace(&query, std::move(mask)).first->second;
@@ -36,7 +37,7 @@ const SegmentMask& QueryPruning::viable(const Query& query) {
 
 std::string QueryPruning::reason(const Query& query, size_t ord) const {
   const auto& segment = reader.segments()[ord];
-  if (segment.numLive() == 0) return "live_docs=0";
+  if (segment.liveCountBounds().second == 0) return "live_docs=0";
   std::string why;
   SummaryView view(segment.summary(), &why);
   if (query.mayMatch(view) != Query::MatchState::EMPTY) return {};

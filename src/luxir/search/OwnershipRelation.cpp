@@ -564,23 +564,21 @@ public:
 };
 
 OwnershipRelation::OwnershipRelation(IndexReader& many, IndexReader& one, RequestMemTracker& memory)
-    : RowRelation(many, one, memory) {
+    : RowRelation(many, one, memory), mappers(many, one.path()) {
   auto path = many.path();
   if (path == one.path()) throw RequestError("domain transform requires different spaces");
   while (!path.empty() && path != one.path()) path = spaceParentPath(path);
   if (path != one.path()) throw RequestError("domain transform requires ancestor and descendant paths");
-  mappers.reserve(many.segments().size());
+  assert(many.segments().size() == one.segments().size());
   for (size_t leaf = 0; leaf < many.segments().size(); leaf++) {
-    auto& child = many.segments()[leaf];
-    assert(&child.segmentCore() == &one.segments()[leaf].segmentCore());
-    if (child.hasSpace()) mappers.emplace_back(std::in_place, child.segmentCore(), one.path(), many.path());
-    else mappers.emplace_back(std::nullopt);
+    assert(many.segments()[leaf].basePart() == one.segments()[leaf].basePart());
   }
 }
 
 Query::ScorerSupplier* OwnershipRelation::reduce(MemPool& pool, size_t leaf,
     Query::ScorerSupplier& input, DocSet* domain, Reduction reduction, float multiplier) {
-  return mappers[leaf] ? pool.make<Supplier>(input, *mappers[leaf], domain,
+  const auto* mapper = mappers.get(leaf);
+  return mapper ? pool.make<Supplier>(input, *mapper, domain,
       one.segments()[leaf].maxDoc(), many.segments()[leaf].maxDoc(), reduction, multiplier) : nullptr;
 }
 
@@ -595,15 +593,15 @@ DomainHandle OwnershipRelation::expand(size_t leaf, DomainHandle domain) {
   auto& source = one.segments()[leaf];
   auto& destination = many.segments()[leaf];
   domain.assertScope(source);
-  const auto& mapper = mappers[leaf];
-  if (mapper) {
+  if (destination.hasSpace()) {
     if (!domain.get()) return DomainHandle().scoped(destination);
     if (domain.get() == source.liveDocSet()) {
       return DomainHandle::pinned(destination.liveDocSet(), destination.liveDocsShared()).scoped(destination);
     }
   }
   DocSetBuilder builder(destination.maxDoc());
-  if (mapper && domain.get()) {
+  const auto* mapper = domain.get() ? mappers.get(leaf) : nullptr;
+  if (mapper) {
     domain.get()->forEach([&](int32_t row) {
       auto [first, end] = mapper->range(row);
       builder.addRange(first, end);
@@ -616,7 +614,7 @@ DomainHandle OwnershipRelation::project(size_t leaf, DomainHandle domain) {
   auto& source = many.segments()[leaf];
   auto& destination = one.segments()[leaf];
   domain.assertScope(source);
-  const auto& mapper = mappers[leaf];
+  const auto* mapper = mappers.get(leaf);
   DocSetBuilder builder(destination.maxDoc());
   if (mapper && source.maxDoc()) {
     MemPool pool;
