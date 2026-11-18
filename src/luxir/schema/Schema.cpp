@@ -68,6 +68,7 @@ struct ResolvedField {
   const luxir::api::VectorAnnDef* ann = nullptr;
   std::optional<bool> geoIgnoreMalformed;
   std::optional<bool> geoIgnoreZValue;
+  bool reverseMap = true;
 };
 
 struct ResolvedOwnership {
@@ -300,6 +301,7 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorNormalizeOnWrite = parentResolved.vectorNormalizeOnWrite;
   }
 
+  r.reverseMap = def.reverse_map.value_or(parentResolved.reverseMap);
   r.ann = def.ann ? &*def.ann : parentResolved.ann;
   r.geoIgnoreMalformed = def.ignore_malformed ? def.ignore_malformed
                                               : parentResolved.geoIgnoreMalformed;
@@ -446,6 +448,9 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
       || def.normalized || def.normalize_on_write || def.ann || def.ignore_malformed || def.ignore_z_value)) {
     throw SchemaError("Nested path cannot have value settings: " + name);
   }
+  if (def.reverse_map && r.type != FieldClass::NESTED) {
+    throw SchemaError("reverse_map is only valid for nested fields (field: " + name + ")");
+  }
   if (analyzerSet(def) && r.type != FieldClass::TEXT) {
     throw SchemaError("analyzer is only valid for text fields (field: " + name + ")");
   }
@@ -550,7 +555,7 @@ struct FieldCompiler {
           || r.geoIgnoreMalformed || r.geoIgnoreZValue || derived) {
         throw SchemaError("Nested path cannot have value settings: " + std::string(name));
       }
-      auto type = std::make_shared<NestedFieldType>(name);
+      auto type = std::make_shared<NestedFieldType>(name, r.reverseMap);
       if (r.isTemplate) type->flags_ |= FieldType::ABSTRACT;
       return type;
     }
@@ -606,8 +611,10 @@ struct FieldCompiler {
                         r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE ||
                         r.type == FieldClass::BOOLEAN || r.type == FieldClass::DECIMAL;
     bool geoClass = r.type == FieldClass::GEO_POINT;
+    bool rangeClass = r.type == FieldClass::LONG_RANGE || r.type == FieldClass::DOUBLE_RANGE ||
+                      r.type == FieldClass::DATE_RANGE;
     if (index == IndexMode::RANGE) {
-      if (!numericClass && !geoClass) {
+      if (!numericClass && !geoClass && !rangeClass) {
         throw SchemaError(
           "index=range is not supported for this type (field: " + std::string(name) +
           "); MATCH-indexed string/id fields answer range queries through the terms dictionary");
@@ -620,7 +627,7 @@ struct FieldCompiler {
       if (numericClass && !column) {
         throw SchemaError("index=match requires column=true for field: " + std::string(name));
       }
-      if (geoClass || r.type == FieldClass::VECTOR) {
+      if (geoClass || rangeClass || r.type == FieldClass::VECTOR) {
         throw SchemaError("index=match is not supported for this type (field: " + std::string(name) + ")");
       }
     }
@@ -629,6 +636,19 @@ struct FieldCompiler {
       // be returned in search results.  Other types default to false;
       // STRING/ID already expose their value via the column store.
       stored = (r.type == FieldClass::TEXT);
+    }
+    if (rangeClass) {
+      if (!column) {
+        throw SchemaError("range fields require column=true (field: " + std::string(name) + ")");
+      }
+      if (mode != MultiMode::SINGLE) {
+        throw SchemaError("multi-valued range fields are not supported yet (field: " +
+                          std::string(name) + ")");
+      }
+      if (stored) {
+        throw SchemaError("stored is not supported for range fields; values are retrieved "
+                          "from the column (field: " + std::string(name) + ")");
+      }
     }
 
     if (r.type == FieldClass::IP) {
@@ -725,6 +745,15 @@ struct FieldCompiler {
         ft = std::make_shared<GeoPointFieldType>(name, flags, r.geoIgnoreMalformed.value_or(false),
                                                  r.geoIgnoreZValue.value_or(true));
         break;
+      case FieldClass::LONG_RANGE:
+        ft = std::make_shared<RangeFieldType>(name, FieldType::INT, flags);
+        break;
+      case FieldClass::DOUBLE_RANGE:
+        ft = std::make_shared<RangeFieldType>(name, FieldType::DOUBLE, flags);
+        break;
+      case FieldClass::DATE_RANGE:
+        ft = std::make_shared<RangeFieldType>(name, FieldType::DATE, flags);
+        break;
       case FieldClass::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
         // dims may be 0, meaning "infer from first indexed value".
@@ -786,6 +815,10 @@ static LogicalField::Shape shapeFamily(FieldClass type) {
   if (type == FieldClass::NESTED) return LogicalField::Shape::NESTED;
   if (type == FieldClass::VECTOR) return LogicalField::Shape::VECTOR;
   if (type == FieldClass::GEO_POINT) return LogicalField::Shape::GEO;
+  if (type == FieldClass::LONG_RANGE || type == FieldClass::DOUBLE_RANGE ||
+      type == FieldClass::DATE_RANGE) {
+    return LogicalField::Shape::RANGE;
+  }
   return LogicalField::Shape::SCALAR;
 }
 

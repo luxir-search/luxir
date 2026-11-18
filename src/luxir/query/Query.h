@@ -47,6 +47,7 @@
 
 namespace luxir {
 
+class FanoutScope;
 class DocSet;
 class DocSetBuilder;
 class WindowFilter;
@@ -73,6 +74,7 @@ enum class QueryKind : uint8_t {
   ALL,
   NONE,
   RESCORE,
+  RANGE_FIELD,
   MIN_SCORE,
   COMBINED_FIELDS,
   DIS_MAX,
@@ -1730,21 +1732,19 @@ public:
     /// enclosing filters; all docs in the segment are eligible.  RootOp
     /// establishes this, and every domain-deriving path preserves it.
     ///
-    /// parallel is true when the request runs under a TBB task group; a
-    /// prepare() implementation may then spawn internal worker tasks, provided
-    /// they are joined before prepare() returns.  false means the request is
-    /// serial and prepare() must not spawn tasks.
+    /// fanout permits internal worker tasks, joined before prepare() returns.
+    /// A null scope requires synchronous execution on the calling thread.
     struct PrepareContext {
       IndexReader& reader;
       std::span<DocSet* const> domainPerSeg;
-      bool parallel;
+      FanoutScope* fanout;
       ExecutionWarnings* warnings;
       SupplierExecutionMode executionMode;
 
       PrepareContext(IndexReader& reader, std::span<DocSet* const> domainPerSeg,
-                     bool parallel, ExecutionWarnings* warnings,
+                     FanoutScope* fanout, ExecutionWarnings* warnings,
                      SupplierExecutionMode executionMode = SupplierExecutionMode::ORDINARY) noexcept
-        : reader(reader), domainPerSeg(domainPerSeg), parallel(parallel), warnings(warnings),
+        : reader(reader), domainPerSeg(domainPerSeg), fanout(fanout), warnings(warnings),
           executionMode(executionMode) {}
     };
 

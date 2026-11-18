@@ -13154,7 +13154,7 @@ public:
     Query::Weight::PrepareContext childCtx{
       ctx.reader,
       std::span<DocSet* const>(childDomainPtrs.data(), childDomainPtrs.size()),
-      ctx.parallel, ctx.warnings, ctx.executionMode};
+      ctx.fanout, ctx.warnings, ctx.executionMode};
     auto mandatorySources = QueryPrep::prepareSources(mandatoryWeights, childCtx);
     auto optionalSources = QueryPrep::prepareSources(optionalWeights, childCtx);
     // The folded domain supplier is required, which would demote an

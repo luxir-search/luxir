@@ -39,6 +39,13 @@ qualified names; a dot separates path components:
   underscores. A physical name, including a generated `__variant` suffix, must
   fit in 127 bytes.
 
+A nested path stores a reverse map from each child row to its owner, about
+one byte per child row. It speeds up joins led by a selective child query,
+whose matching rows are scattered across owners. `"items": {"type": "nested",
+"reverse_map": false}` leaves it out; each nested path has its own setting and
+a template can carry it. A change applies to segments written afterwards,
+merges included, and never changes results.
+
 See [Schema and fields](schema.md#nested-paths-and-qualified-field-names) for
 where these declarations sit in a schema.
 
@@ -54,8 +61,10 @@ Send nested values as ordinary JSON, an object or an array of objects:
 - Each object creates one child row, including an empty object `{}`. A single
   object counts as one row.
 - Null, an empty array and an absent field create no rows.
-- A scalar or a non-object array element is a document error. Any error inside
-  a child rejects its whole root document.
+- A `null` element of an array is an empty child row, like `{}`, at every
+  depth. It is returned as `{}`.
+- A scalar, or an array element that is neither an object nor `null`, is a
+  document error. Any error inside a child rejects its whole root document.
 - Supply child keys inside their objects. A dotted key at the root
   (`"items.color": "red"`) cannot create a child row. `field_map` and
   `drop_unmapped` apply to root keys only.
@@ -134,8 +143,37 @@ path components are not supported.
 ### Scoring
 
 A document's score from a nested clause is the score of its best matching
-child (`score: "max"`, the default, and what implicit references use).
-`score: "none"` gives a constant score with the same matches.
+child. That is `score: "max"`, the default, and what implicit references and
+nested-path groups always use. The structured `to_parent` form takes the
+other reductions:
+
+| `score` | The document's score from the clause |
+| --- | --- |
+| `max` (default) | highest score among its matching children |
+| `min` | lowest score among its matching children |
+| `sum` | sum of its matching children's scores |
+| `avg` | average of its matching children's scores |
+| `none` | zero: the clause selects documents without ranking them |
+
+A boost on the join multiplies the reduced score. Every mode matches the same
+documents; a mode other than `max` needs the score of every matching child,
+so `max` is the cheapest ranked mode.
+
+`min_children` and `max_children` bound how many children must match:
+
+```json
+{"to_parent":{"path":"items","score":"avg","min_children":2,"max_children":5,
+              "query":{"match":{"field":"color","val":"red"}}}}
+```
+
+matches documents with two to five red items and scores each by the average
+over all of its red items. The defaults are 1 and unbounded. `min_children`
+must be at least 1; for documents with no matching child, negate the clause.
+
+A dotted path (`"path":"items.parts"`) reduces over all of the document's
+matching rows at that path, and its bounds count those rows. A join written
+inside a join reduces and counts level by level instead, which can give a
+different average or a different count.
 
 ### As a filter
 
@@ -154,9 +192,9 @@ Filter results of nested clauses are cached like other filters.
 
 Queries can reach into children implicitly, and returned fields can reach
 children and owners (see [Returning nested values](#returning-nested-values)).
-Everything else that reads fields (facets, sorts, collapse keys, value
-expressions) reads the fields of its own view. To run an operation over
-children, move its domain:
+Facets, collapse keys, and direct field sorts read the fields of their own
+view. Value expressions can reduce descendant values (see below). To run an
+operation over child rows themselves, move its domain:
 
 ```json
 {"query":"body_w:camera", "filter":["items:(color:red AND size:L)"],
@@ -192,6 +230,34 @@ belong to:
   "documents":{"domain":{"to":"/"},"top_docs":{"count_limit":-1,"limit":0}}
 }}}
 ```
+
+## Reducers over child values
+
+A descendant field in a value expression is an array of its values from all
+children owned by the current row. For example, sort questions by their newest
+answer:
+
+```json
+{"limit":10,"fields":["id"],"count_limit":10000,
+ "query":{"match":{"field":"tag","val":"java"}},
+ "sort":[{"expr":"max(answers.date)","dir":"desc"}]}
+```
+
+Names are relative to the current view: `parts.price` in the items view, or
+`items.parts.price` at the root. Values follow descendant row order, and a
+multi-valued child field contributes all its values. The array includes all
+owned descendants, regardless of which children matched a query.
+
+Use the usual `min`, `max`, `avg`, `sum`, and `count` reducers. A scalar
+position requires a reducer; a bare descendant field cannot be a sort key.
+No children, or no values among them, means missing, except `count`, which
+returns zero. Empty values sort last in either direction. DATE and DECIMAL
+values retain their usual expression semantics.
+
+The same expressions work in rescoring and metrics. For example,
+`sum(max(items.price))` sums each root's maximum item price over the operation's
+domain. Upward names in value expressions are not supported. Facet and
+collapse field keys still require `domain.to` to operate in the child's view.
 
 ## Names are relative to the view
 
@@ -254,16 +320,78 @@ Return the item color and the document id with each matching part:
 - `_version_` on any row is its owning root's version. Scores of owners and
   children are not returned.
 
+## Matched children per hit
+
+Name the descendant clause and reference it from a row operation. This
+returns only the matching answers for each returned root, rather than every
+answer as a returned-field selector would.
+
+```json
+{
+  "limit": 10, "fields": ["id"], "count_limit": 10000,
+  "query": {"boolean": {"required": [
+    {"match": {"field": "tag", "val": "java"}},
+    {"name": "recent", "range": {
+      "field": "answers.date", "lte": "2012-04-08T21:15:33.873Z"}}
+  ]}},
+  "row_ops": {"inner": {
+    "domain": {"from_match": "recent"},
+    "top_docs": {"limit": 3, "fields": ["date", "user"]}
+  }}
+}
+```
+
+A name may mark an explicit `to_parent`, a nested-path expression group, or
+an implicit descendant leaf. Each row operation sees that root's own family.
+Without a query of its own, the operation uses the named clause's child-side
+query for matching and scoring. An explicit query instead scores within the
+named clause's matching rows. A `domain.filter` narrows either form further.
+To retrieve children independently of a matching clause, use `domain.to`;
+with no query those children are unscored and in row order.
+
+When the named clause is a join with `min_children` or `max_children`, the
+bounds decide which documents are hits and `from_match` still selects every
+matching child of each hit.
+
+See [Per-row operations](searching.md#per-row-operations) for controls,
+restrictions, formats and result-name rules.
+
 ## Chunks and vectors
 
 Text chunks are a natural use: `chunks_nested:(text_wl:"quick fox")` requires
 the phrase within one chunk, and words split across sibling chunks do not form
 a phrase.
 
-A kNN leaf on a child vector field selects the k nearest child rows, which may
-belong to fewer than k documents. Vector ANN indexes can be built on child
-fields using their qualified names, for example
-`vec.lines_nested.embedding_v`.
+A kNN clause's `k` counts rows of the view where the clause is written. At
+root, a child vector field selects distinct documents by their best child:
+
+```json
+{"query":{"knn":{"field":"chunks_nested.embedding_v","query":[1,0],"k":10}}}
+```
+
+Inside an explicit join, the same search selects child rows before the join
+reduces them, so it may match fewer than ten documents:
+
+```json
+{"query":{"to_parent":{"path":"chunks_nested","query":{
+  "knn":{"field":"embedding_v","query":[1,0],"k":10}}}}}
+```
+
+A list with `domain.to: chunks_nested` also counts child rows. At deeper paths,
+`k` counts roots, items or parts according to the view where the clause is
+written. Filters and deletes decide which rows of that view are eligible
+before the search, and an owner with no vectors is never a neighbor.
+
+An owner is scored like a document of a
+[multi-valued vector field](vector-search.md#define-a-vector-field): by its nearest
+child with `exact: true`, and by the nearest of its examined children in an
+approximate search. [Candidate budgets](vector-search.md#query-knobs) count
+owners where they count documents; with PQ or an explicit `refine_candidates`,
+one owner with thousands of near vectors can crowd the budget and leave fewer
+than `k` owners.
+
+Vector ANN indexes can be built on child fields using their qualified names,
+for example `vec.lines_nested.embedding_v`.
 
 Ordinary multi-valued vector fields already cover plain chunking, where a
 chunk is only a vector. Use nested rows when the text, vectors or other fields
@@ -285,10 +413,5 @@ of each child matter together.
 
 - Storing the submitted nested value verbatim.
 - Owner fields in sorts, facets, collapse keys and value expressions.
-- Score modes other than `max` and `none`, and bounds on the number of
-  matching children.
-- kNN counted in distinct documents.
-- Sorting or computing over child values from the owning document.
-- Returning the matching children beside each hit.
 - Updating or addressing a single child.
 - `domain.to` paths that go up and then down.

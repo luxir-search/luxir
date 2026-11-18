@@ -248,6 +248,13 @@ public:
   // per-document reads.
   LUXIR_NOINLINE int64_t scanSelectedValue(int32_t docRank, bool maximum, auto& values) {
     auto [start, end] = getStartEndValueRank(docRank);
+    return selectedRangeValue(start, end, maximum, values);
+  }
+
+  // Select over a contiguous range of value ranks, independent of which
+  // documents contributed them. Values remain in their encoded order.
+  LUXIR_INLINE int64_t selectedRangeValue(int64_t start, int64_t end, bool maximum, auto& values) {
+    assert(start < end);
     int64_t selected = values.valueAt(start);
     for (int64_t rank = start + 1; rank < end; rank++) {
       int64_t next = values.valueAt(rank);

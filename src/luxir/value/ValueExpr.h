@@ -18,6 +18,7 @@
 #include "luxir/reader/ColumnShape.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/OrdColReader.h"
+#include "luxir/reader/OwnershipMapper.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/MemPool.h"
@@ -54,6 +55,9 @@ struct ValueNode {
   uint8_t flags = 0;
   size_t sourcePos = 0;
   std::string_view text;
+  // A request-pinned descendant column; null reads the current view.
+  IndexReader* source = nullptr;
+  std::string_view ownerPath;
   int64_t intValue = 0;
   // A second integer parameter for functions that keep one (a box's longitudes,
   // a date's unit); prepare() sets it.
@@ -101,7 +105,7 @@ public:
   void resolveFields(IndexReader& reader, std::span<IndexReader::FieldSegments> fields) const {
     for (size_t i = 0; i < nodes.size(); i++) {
       fields[i] = nodes[i].kind == ValueNodeKind::COLUMN
-          ? reader.field(nodes[i].text) : IndexReader::FieldSegments{};
+          ? (nodes[i].source ? *nodes[i].source : reader).field(nodes[i].text) : IndexReader::FieldSegments{};
     }
   }
 
@@ -177,6 +181,19 @@ struct ValueMemo {
   uint32_t scoreBits = 0;
 };
 
+struct BoundColumnRange {
+  OwnershipMapper::Cursor owners;
+  ColumnShape::Cursor values;
+
+  BoundColumnRange(MemPool& pool, const OwnershipMapper& mapper, const ColumnShape& shape)
+      : owners(mapper, pool), values(shape) {}
+
+  std::pair<int64_t, int64_t> range(int32_t owner) {
+    auto family = owners.seek(owner);
+    return values.range(family.first, family.end);
+  }
+};
+
 struct BoundValueNode {
   // Allocated only for nodes with repeated consumers (including scalar
   // operands revisited by lazy array elements).
@@ -185,6 +202,7 @@ struct BoundValueNode {
   std::optional<IntColReader::SparseIterator> iterator;
   std::optional<IntColReader::BulkIterator> bulkIterator;
   BoundStringColumn* stringColumn = nullptr;
+  BoundColumnRange* mapping = nullptr;
   ValueBounds bounds;
   int32_t cachedDoc = -1;
   int64_t valueStart = 0;

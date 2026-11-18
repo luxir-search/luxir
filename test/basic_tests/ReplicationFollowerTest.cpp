@@ -4,6 +4,7 @@
 #include "test/LuxirTest.h"
 #include "test/StorageTestUtils.h"
 #include "test/CollectionHelper.h"
+#include "luxir/reader/OwnershipShape.h"
 #include "test/HttpReq.h"
 #include "test/DurableIndexInfo.h"
 #include "test/SchemaBuilder.h"
@@ -2427,6 +2428,10 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
     CollectionHelper h(*source);
     nested_test::setSchema(h.collection());
     for (int batch = 0; batch < 2; batch++) {
+      SchemaBuilder settings;
+      auto& outer = settings.field("items"); outer.type = api::FieldDef::FieldClass::NESTED; outer.reverse_map = batch != 0;
+      auto& inner = settings.field("items.parts"); inner.type = api::FieldDef::FieldClass::NESTED; inner.reverse_map = batch == 0;
+      settings.set(h.collection());
       CollectionHelper::UpdateBuilder input;
       for (int i = batch * 2; i < batch * 2 + 2; i++) nested_test::add(input, nested_test::DOCS[i]);
       input.commit(); ASSERT_TRUE(h.submit(input).success);
@@ -2435,11 +2440,18 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
   startFollower(); ASSERT_TRUE(caughtUp());
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::rowOperations(*source), nested_test::rowOperations(*follower));
   auto originalProjection = nested_test::retrieval(*source);
   EXPECT_EQ(originalProjection, nested_test::retrieval(*follower));
   auto replica = follower->getCollection("main");
   auto old = replica->getReaderManager().getReader();
   ASSERT_EQ(2u, old->segments().size());
+  for (size_t i = 0; i < old->segments().size(); i++) {
+    EXPECT_EQ(i != 0, old->segments()[i].segmentCore().ownership("items")->hasReverseMap());
+    auto* parts = old->segments()[i].segmentCore().ownership("items.parts");
+    if (i == 0) { ASSERT_NE(nullptr, parts); EXPECT_TRUE(parts->hasReverseMap()); }
+    else EXPECT_EQ(nullptr, parts);
+  }
   auto leaderOld = source->getCollection("main")->getReaderManager().getReader();
   {
     CollectionHelper h(*source);
@@ -2449,8 +2461,11 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
   ASSERT_TRUE(caughtUp());
   auto merged = replica->getReaderManager().getReader();
   ASSERT_EQ(1u, merged->segments().size());
+  EXPECT_TRUE(merged->segments()[0].segmentCore().ownership("items")->hasReverseMap());
+  EXPECT_FALSE(merged->segments()[0].segmentCore().ownership("items.parts")->hasReverseMap());
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::rowOperations(*source), nested_test::rowOperations(*follower));
   EXPECT_EQ(nested_test::INITIAL, nested_test::local(*source, leaderOld));
   EXPECT_EQ(originalProjection, nested_test::retrieval(*source, leaderOld));
   EXPECT_EQ(originalProjection, nested_test::retrieval(*follower, old));
@@ -2482,6 +2497,7 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
       {"deep",1},{"deep_group",1},{"rows",2},{"rows.up",2},{"parts",1},
       {"parts.up",1},{"parts.root",1},{"parts.two",1}};
   EXPECT_EQ(deleted, nested_test::local(*source)); EXPECT_EQ(deleted, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::rowOperations(*source), nested_test::rowOperations(*follower));
   EXPECT_EQ(2, child->segments()[0].liveCountBounds().first);
   EXPECT_EQ(2, child->segments()[0].liveCountBounds().second);
   auto deletedProjection = nested_test::retrieval(*source);
@@ -2514,10 +2530,16 @@ TEST_F(ReplicationFollowerTest, nestedSpacesPublishRootDeletesAndReloadTheirSche
   replica.reset(); before.reset(); after.reset();
   stopFollower(); stopSource(); startSource(); startFollower(); ASSERT_TRUE(caughtUp());
   EXPECT_EQ(deleted, nested_test::local(*source)); EXPECT_EQ(deleted, nested_test::local(*follower));
+  EXPECT_EQ(nested_test::rowOperations(*source), nested_test::rowOperations(*follower));
   EXPECT_EQ(deletedProjection, nested_test::retrieval(*source));
   EXPECT_EQ(deletedProjection, nested_test::retrieval(*follower));
   for (auto* node : {source.get(), follower.get()}) {
-    EXPECT_EQ(FieldType::NESTED, node->getCollection("main")->getSchema()->resolveFor("items", OpClass::PRIMARY).fieldType->type());
+    auto schema = node->getCollection("main")->getSchema();
+    EXPECT_TRUE(((const NestedFieldType*)schema->resolveInput("items").fieldType)->reverseMap);
+    EXPECT_FALSE(((const NestedFieldType*)schema->resolveInput("items.parts").fieldType)->reverseMap);
+    auto reader = node->getCollection("main")->getReaderManager().getReader();
+    EXPECT_TRUE(reader->segments()[0].segmentCore().ownership("items")->hasReverseMap());
+    EXPECT_FALSE(reader->segments()[0].segmentCore().ownership("items.parts")->hasReverseMap());
     auto req = localReq(node->getSearchEngine());
     req->topDocs().allQuery().countLimit().fields({"code"}).rawOp().domain.emplace().to = "later";
     req->execute(1); ASSERT_OK(req); EXPECT_EQ(1, req->getMatchCount());

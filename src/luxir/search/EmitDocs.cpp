@@ -15,7 +15,7 @@ api::DocList mappedDocuments(SearchResponse& response, MappedReturnFields& selec
   result.row_count = (int32_t)docs.size();
   DocBatchScratch scratch;
   loadDocuments(response, selection.target, docs, selection.fields, result, mr,
-      {flags, false, api::DocFormat::ROWS, selection.fields.size() + 1, 0, false, &mr},
+      {flags, {}, api::DocFormat::ROWS, selection.fields.size() + 1, 0, false, &mr},
       [](int64_t) { return 0.0f; }, scratch);
   if (result.docs.empty()) build::allocArray(result.docs, docs.size(), mr);
   return result;

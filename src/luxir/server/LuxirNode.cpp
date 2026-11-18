@@ -91,10 +91,15 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
 void LuxirNode::ArenaThreadNamer::on_scheduler_entry(bool worker) {
   omp_set_num_threads(1);
   if (!worker) return;
+  if (loadActivity) loadActivity->begin(LoadRegistry::local());
   char name[16];
   snprintf(name, sizeof(name), "%s%d", prefix,
            oneapi::tbb::this_task_arena::current_thread_index() - reservedSlots);
   nameThisThread(name);
+}
+
+void LuxirNode::ArenaThreadNamer::on_scheduler_exit(bool worker) {
+  if (worker && loadActivity) loadActivity->end(LoadRegistry::local());
 }
 
 // host:port of the listener, so a restarted node keeps its identity (and a

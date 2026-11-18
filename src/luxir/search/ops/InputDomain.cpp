@@ -5,7 +5,7 @@
 
 namespace luxir {
 
-void SearchOp::Calculator::accept(oneapi::tbb::task_group* tg, int32_t segment, DomainHandle domain) {
+void SearchOp::Calculator::accept(FanoutScope* tg, int32_t segment, DomainHandle domain) {
   auto* input = op.inputDomain;
   if (!input) {
     calc(tg, segment, std::move(domain));
@@ -37,7 +37,7 @@ void SearchOp::Calculator::accept(oneapi::tbb::task_group* tg, int32_t segment, 
   calc(tg, segment, std::move(domain));
 }
 
-void SearchOp::Calculator::acceptAll(oneapi::tbb::task_group* tg, std::span<const DomainHandle> domains) {
+void SearchOp::Calculator::acceptAll(FanoutScope* tg, std::span<const DomainHandle> domains) {
   auto* input = op.inputDomain;
   if (!input) {
     calcAll(tg, domains);
@@ -61,7 +61,7 @@ void SearchOp::Calculator::acceptAll(oneapi::tbb::task_group* tg, std::span<cons
     return *source;
   };
   auto variants = input->variants.produceBucketDomains(*op.view, *input->planning, mapped, reset,
-      tg != nullptr, &op.req, op.req.memoryTracker, sourcesFor, structuralFinish());
+      tg, &op.req, op.req.memoryTracker, sourcesFor, structuralFinish());
   size_t variant = input->variants.variantForChild(op.name);
   for (size_t segment = 0; segment < mapped.size(); segment++) mapped[segment] = std::move(variants[segment][variant]);
   calcAll(tg, mapped);

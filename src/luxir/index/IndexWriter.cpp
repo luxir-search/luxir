@@ -151,16 +151,17 @@ public:
 
 IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema,
                          IndexRamBudget* sharedIndexRamBudget, int mergeFactor, std::string initialIncarnation,
-                         oneapi::tbb::task_arena* arena, std::optional<IncarnationState> claimed)
+                         oneapi::tbb::task_arena* arena, std::optional<WriterOpen> opened)
   : dir(snapshots.dir),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
     snapshots(snapshots) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   mergePolicy->setMergeFactor(mergeFactor);
-  writerState = claimed ? std::move(*claimed) : IncarnationState::claim(dir);
+  if (!opened) opened.emplace(dir, IncarnationState::claim(dir));
+  writerState = std::move(opened->state);
   writerEpoch = writerState.value.epoch;
-  auto manifest = Manifest::load(dir, &writerState);
+  auto& manifest = opened->manifest;
   if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
     throw std::runtime_error("snapshot fallback requires recovery into a new incarnation");
   }
@@ -270,8 +271,8 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     seedActiveVectorOverlayNamesFromManifestLocked();
   }
 
-  if (arena) arena->execute([this] { updateGraph.emplace(); });
-  else updateGraph.emplace();
+  if (arena) arena->execute([this] { updateGraph.emplace(updateContext); });
+  else updateGraph.emplace(updateContext);
 
   // Create the updateGraph.  Start with a serial node that assigns an order to each update command
   // This could be done in a quick synchronized block instead... and could then be safely inspected by the client
@@ -3413,6 +3414,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
   Stats out;
   std::vector<uint64_t> committedIds;
   std::vector<uint64_t> writerSegmentIds;
+  std::vector<std::shared_ptr<SegmentCore>> cores;
   auto copyAux = [](const AuxInfo& src) {
     AuxStats dst;
     dst.kind = src.kind;
@@ -3465,7 +3467,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
 
     committedIds = lastCommittedSegIds;
     if (!includeSegments) writerSegmentIds.reserve(segInfos.size());
-    if (includeSegments) out.segmentStats.reserve(segInfos.size());
+    if (includeSegments) { out.segmentStats.reserve(segInfos.size()); cores.reserve(segInfos.size()); }
     for (const auto& [segId, seg] : segInfos) {
       unused(segId);
       if (!includeSegments) writerSegmentIds.push_back(seg->segId);
@@ -3474,6 +3476,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
       if (!includeSegments) continue;
 
       auto& dst = out.segmentStats.emplace_back();
+      cores.push_back(seg->sharedSegmentCore.load());
       dst.segId = seg->segId;
       dst.creatorEpoch = seg->creatorEpoch;
       dst.liveGen = seg->liveGen;
@@ -3489,6 +3492,13 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
       dst.merging = seg->merging;
     }
   }
+
+  for (size_t i = 0; i < cores.size(); i++) {
+    auto& segment = out.segmentStats[i];
+    if (!cores[i]) cores[i] = SegmentCore::create(dir, segment.segId, segment.creatorEpoch, true);
+    if (cores[i]) segment.readSpaces(*cores[i]);
+  }
+  cores.clear();
 
   boost::unordered_flat_set<uint64_t> committedSet(committedIds.begin(), committedIds.end());
   for (uint64_t segId : writerSegmentIds) {

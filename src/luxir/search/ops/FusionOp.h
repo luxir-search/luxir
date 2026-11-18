@@ -103,14 +103,6 @@ public:
     }
   }
 
-  bool ownsMatchDomain() const override { return true; }
-
-  size_t workEstimate() override {
-    size_t total = SearchOp::workEstimate();
-    for (auto* source : sources) total = saturatingAdd(total, source->workEstimate());
-    return total;
-  }
-
   bool needsCount() const {
     return fusionProto.count_limit.has_value()
         ? *fusionProto.count_limit != 0
@@ -213,7 +205,7 @@ public:
     std::vector<DomainHandle> segFilters;
     std::vector<std::unique_ptr<SearchOp::Calculator>> subCalcs;
     std::vector<DomainHandle> fusedDomains;
-    oneapi::tbb::task_group* taskGroup = nullptr;
+    FanoutScope* taskGroup = nullptr;
 
     bool needsPrepare = false;
     std::atomic<int32_t> preparedDomainsSeen{0};
@@ -266,7 +258,7 @@ public:
       return build::opsSlot(dl.ops, op.subOps.size(), sub.name, resp->mr);
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domain) override {
       assert(domain.isDeliverable());
       if (segnum >= 0) domain.assertScope(op.view->segments()[(size_t)segnum]);
@@ -324,7 +316,7 @@ public:
       return DomainHandle(DocSet::intersect(filterPtrs)).scoped(seg);
     }
 
-    void doPrepareDomain(oneapi::tbb::task_group* tg, int32_t segnum,
+    void doPrepareDomain(FanoutScope* tg, int32_t segnum,
                          DomainHandle domain) {
       auto& op = thisOp();
       if (segnum < 0) {
@@ -342,7 +334,7 @@ public:
       Query::Weight::PrepareContext baseCtx{
         *op.view,
         std::span<DocSet* const>(baseDomainViews.data(), baseDomainViews.size()),
-        tg != nullptr, &op.req};
+        tg, &op.req};
       preparedFilterSources = QueryPrep::prepareFilterSources(
           op.filterWeights, op.filterUses, baseCtx);
 
@@ -357,7 +349,7 @@ public:
       });
     }
 
-    void doCalc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void doCalc(FanoutScope* tg, int32_t segnum,
                 DomainHandle domain) {
       auto& op = thisOp();
       if (segnum < 0) {
@@ -384,7 +376,7 @@ public:
       dispatchSources(tg, segnum, std::move(sharedFilter));
     }
 
-    void dispatchSources(oneapi::tbb::task_group* tg, int32_t segnum,
+    void dispatchSources(FanoutScope* tg, int32_t segnum,
                          DomainHandle sharedFilter) {
       // Dispatch each source's TopDocsReq::Calc::calc with the shared
       // filter as its domain.  The source will intersect with its own

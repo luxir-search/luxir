@@ -137,8 +137,8 @@ TEST_F(RescoreQueryTest, fieldMetadataBelongsToEachWeight) {
     std::unique_ptr<Query::Weight::PreparedWeight> firstPrepared;
     std::unique_ptr<Query::Weight::PreparedWeight> secondPrepared;
     if (prepare) {
-      Query::Weight::PrepareContext firstPrepare{*firstReader, {}, false, nullptr};
-      Query::Weight::PrepareContext secondPrepare{*secondReader, {}, false, nullptr};
+      Query::Weight::PrepareContext firstPrepare{*firstReader, {}, nullptr, nullptr};
+      Query::Weight::PrepareContext secondPrepare{*secondReader, {}, nullptr, nullptr};
       firstPrepared = firstWeight->prepare(firstPrepare);
       secondPrepared = secondWeight->prepare(secondPrepare);
     }
@@ -362,7 +362,7 @@ TEST_F(RescoreQueryTest, childScoreDependencyAndScorelessBinding) {
       preparedQuery.createWeight(preparedContext, Query::NEED_SCORES);
   ASSERT_TRUE(preparedWeight->needsPrepare());
   Query::Weight::PrepareContext prepareContext{
-      *reader, std::span<DocSet* const>{}, false, nullptr};
+      *reader, std::span<DocSet* const>{}, nullptr, nullptr};
   auto prepared = preparedWeight->prepare(prepareContext);
   ASSERT_NE(nullptr, prepared);
   Query::Scorer* preparedScorer =

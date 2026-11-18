@@ -55,6 +55,14 @@ inline size_t saturatingMultiply(size_t a, size_t b) {
       ? std::numeric_limits<size_t>::max() : a * b;
 }
 
+// Relative segment work from already-known domain facts. Never computes a
+// cardinality just to size a fan-out.
+inline uint64_t fanoutDomainUnits(IndexReader::Segment& segment, const DomainHandle& domain) {
+  DocSet* docs = domain.get();
+  int32_t card = docs ? docs->cachedCard() : segment.maxDoc();
+  return (uint64_t)(card >= 0 ? card : segment.numLive());
+}
+
 struct CollectionRequirements {
   bool needRankedDocs = false;
   int64_t countLimit = 0; // 0: none; -1: exact; positive: at least this many.
@@ -197,20 +205,6 @@ public:
     for (auto& [name, subOp] : subOps) {
       subOp->init();
     }
-  }
-
-  // True when the op finds its own matches rather than consuming its parent's
-  // domain whole, as a list or a fusion does.
-  virtual bool ownsMatchDomain() const { return false; }
-
-  // Upper bound on the documents this op and its children visit, from index
-  // metadata alone (see SearchConfig::auto_parallel_min_work).
-  virtual size_t workEstimate() {
-    size_t total = 0;
-    for (auto& [name, subOp] : subOps) {
-      total = saturatingAdd(total, subOp->workEstimate());
-    }
-    return total;
   }
 
   // Bucket blocks execute synchronously. Segment tasks otherwise own distinct
@@ -411,8 +405,8 @@ public:
 
     // Delivery binds the input domain before the operation sees it. The
     // calculators retain their ordinary per-leaf and whole-index contracts.
-    void accept(oneapi::tbb::task_group* tg, int32_t segment, DomainHandle domain);
-    void acceptAll(oneapi::tbb::task_group* tg, std::span<const DomainHandle> domains);
+    void accept(FanoutScope* tg, int32_t segment, DomainHandle domain);
+    void acceptAll(FanoutScope* tg, std::span<const DomainHandle> domains);
 
     const StructuralConstraint* structuralConstraint() const {
       return structural;
@@ -552,8 +546,11 @@ public:
     // lifetime with them.
     // if segnum == -1, then this is called not for a specific segment, but for the whole index.
     // segnum=-1 is also used for an empty index reader (no segments).
-    virtual void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    virtual void calc(FanoutScope* tg, int32_t segnum,
                       DomainHandle domain) = 0;
+
+    // Extra cost, in documents, for a share's private accumulator and merge.
+    virtual uint64_t fanoutStealUnits(int32_t segnum, uint64_t docs) { return 0; }
 
     // Whole-index delivery. domains[i] is the domain for reader segment i;
     // an empty span represents an empty index. The default implementation
@@ -562,7 +559,7 @@ public:
     //
     // The span storage is borrowed only for this call. Async work copies the
     // individual handles, never the span.
-    virtual void calcAll(oneapi::tbb::task_group* tg,
+    virtual void calcAll(FanoutScope* tg,
                          std::span<const DomainHandle> domains) {
       assert(structural == nullptr || !structural->hasBucket() || tg == nullptr);
       assert(domains.size() == op.view->segments().size());
@@ -570,9 +567,12 @@ public:
         calc(tg, -1, {});
         return;
       }
-      // Ascending submission leaves the last, typically smaller segment on
-      // this thread while earlier segments are available to steal.
-      task_group_fanout(tg, domains.size(), [&](size_t segnum) {
+      // Index-order children let the caller probe the last, typically smaller
+      // segment first, leaving larger segments available for front shares.
+      task_group_fanout(tg, domains.size(), FanoutKind::EXHAUSTIVE, [&](size_t segnum) {
+        uint64_t units = fanoutDomainUnits(op.req.reader->segments()[segnum], domains[segnum]);
+        return FanoutSize{units, fanoutStealUnits((int32_t)segnum, units)};
+      }, [&](size_t segnum) {
         return [this, tg, segnum, domain = domains[segnum]]() {
           assert(domain.isDeliverable());
           domain.assertScope(op.view->segments()[segnum]);
@@ -592,7 +592,7 @@ public:
     }
 
     luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override { return nullptr; }
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domain) override {};
     virtual void startSeg(int32_t segnum) {};
     virtual void endSeg(int32_t segnum) {};

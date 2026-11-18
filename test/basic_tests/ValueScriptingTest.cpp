@@ -874,6 +874,8 @@ TEST_F(ValueScriptingTest, letScopeAndNameRules) {
   expectError("let(score, 1, score)", "cannot be used as a variable name");
   expectConstant("let(doc, 1, let(params, 2, doc + params))", 3);
   expectError("let(1, 1, 1)", "expected a variable name");
+  expectValues("let(a, vals_ds, sum(a))", {50, 70, std::nullopt, std::nullopt, std::nullopt});
+  expectValues("let(a, vals_ds, max(a)+max(a))", {80, 140, std::nullopt, std::nullopt, std::nullopt});
   expectError("let(a, vals_ds, a)", "must be a scalar");
   expectError("let(a, 1, vals_ds)", "must be a scalar");
   expectError("let(a, loc_p, a)", "GEO_POINT is not numeric");

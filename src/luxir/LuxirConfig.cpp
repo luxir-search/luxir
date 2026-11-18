@@ -4,6 +4,8 @@
 #include "LuxirConfig.h"
 #include <CLI/CLI.hpp>
 #include "luxir/util/ProcessAllocator.h"
+#include "luxir/util/TaskWork.h"
+#include "luxir/util/LoadSignal.h"
 #include "luxir/server/Collections.h"
 #include <unistd.h>
 #ifdef __APPLE__
@@ -279,16 +281,20 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Max nesting depth of search operations in one request")
       ->default_val(search.max_op_depth)
       ->check(CLI::PositiveNumber);
+  app.add_option("--search.fanout-grain-us", search.fanout_grain_us,
+                 "Adaptive fan-out grain and credit in microseconds (-1 = never publish)")
+      ->default_val(search.fanout_grain_us)
+      ->check(CLI::Range((int64_t)-1, (int64_t)60'000'000))
+      ->check(!CLI::Range((int64_t)0, (int64_t)0));
+  app.add_option("--search.fanout-sibling-grain-us", search.fanout_sibling_grain_us,
+                 "Fan-out grain with only idle SMT siblings in microseconds (-1 = never publish)")
+      ->default_val(search.fanout_sibling_grain_us)
+      ->check(CLI::Range((int64_t)-1, (int64_t)60'000'000))
+      ->check(!CLI::Range((int64_t)0, (int64_t)0));
   app.add_option("--search.request-memory-max-bytes",
                  search.request_memory_max_bytes,
                  "Per-request query-memory breaker ceiling (0 = unlimited)")
       ->default_val(search.request_memory_max_bytes)
-      ->check(CLI::NonNegativeNumber);
-  app.add_option("--search.auto-parallel-min-work",
-                 search.auto_parallel_min_work,
-                 "Operator opt-in: run a max_parallel 0 request in parallel when its "
-                 "lists visit at least this many documents by index metadata (0 = off, default)")
-      ->default_val(search.auto_parallel_min_work)
       ->check(CLI::NonNegativeNumber);
   app.add_option("--search.multiterm-max-expansions",
                  search.multiterm_max_expansions,
@@ -380,6 +386,11 @@ void LuxirConfig::normalize() {
 
 void LuxirConfig::apply() const {
   configureIndexingArena(index.huge_pages);
+  fanoutGrainNs.store(search.fanout_grain_us < 0 ? FANOUT_GRAIN_NEVER
+      : (uint64_t)search.fanout_grain_us * 1000, std::memory_order_relaxed);
+  fanoutSiblingGrainNs.store(search.fanout_sibling_grain_us < 0 ? FANOUT_GRAIN_NEVER
+      : (uint64_t)search.fanout_sibling_grain_us * 1000, std::memory_order_relaxed);
+  LoadRegistry::enabled.store(search.fanout_grain_us >= 1, std::memory_order_relaxed);
   auto level = spdlog::level::from_str(log_level);
   spdlog::set_level(level);
 }

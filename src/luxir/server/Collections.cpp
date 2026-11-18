@@ -347,19 +347,24 @@ void Collections::observe(const CollectionId& name, Collection& collection) {
 }
 
 std::string Collections::recoverWriter(const CollectionId& name, TenantCatalog& storage, const std::string& selected,
-                                       const Manifest& manifest, IncarnationState& claimed) {
+                                       WriterOpen& opened) {
+  const auto& manifest = opened.manifest;
   if (!manifest.bytes || manifest.generation == manifest.highestGeneration) return selected;
+  IncarnationState claimed;
   auto recovered = copySnapshot(storage, name.name, selected, manifest, false, &claimed);
   LOG_ERROR("Recovered collection '{}' from snapshot {} below {}; using new incarnation {}",
             name.label(), manifest.generation, manifest.highestGeneration, recovered);
   storage.activate(name.name, recovered, selected);
+  opened = WriterOpen(*storage.directory(recovered), std::move(claimed));
   return recovered;
 }
 
-// Clears suspect-file markers once their files verified: best effort, and
-// never on a read-only directory.
-static void clearMarkers(const CollectionId& name, Directory& dir) {
-  try { CorruptionMarker::clear(dir); }
+// Best-effort marker cleanup after snapshot verification.
+static void clearMarkers(const CollectionId& name, Directory& dir, const std::vector<std::string>* markers = nullptr) {
+  try {
+    if (markers) CorruptionMarker::clear(dir, *markers);
+    else CorruptionMarker::clear(dir);
+  }
   catch (const ReadOnlyError&) {}
   catch (const std::exception& e) { LOG_WARN("Cannot clear corruption markers of '{}': {}", name.label(), e.what()); }
 }
@@ -384,18 +389,25 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   bool creating = entry->state == "reserved";
   if (creating && !reserved) throw CollectionUnavailableError("collection is being created");
   auto selected = entry->id;
-  auto claimed = storage.claim(name.name, selected, creating ? "reserved" : "active");
-  auto manifest = Manifest::load(*storage.directory(selected), &claimed);
-  if (!creating) selected = recoverWriter(name, storage, selected, manifest, claimed);
+  // A healthy reopen shares one root read and one listing. Copying a fallback
+  // snapshot requires additional listings of the source and destination.
+  WriterOpen opened(*storage.directory(selected), storage.claim(name.name, selected, creating ? "reserved" : "active"));
+  if (!creating) selected = recoverWriter(name, storage, selected, opened);
   auto col = makeCollection(name, storage.directory(selected));
+  std::vector<std::string> markers;
   if (!creating) {
-    manifest = Manifest::load(*col->shard->dir, &claimed);
+    auto& manifest = opened.manifest;
     if (!manifest.bytes) throw std::runtime_error("catalog selects an empty index directory");
-    if (startup) arena.execute([&] { verifyFiles(*col->shard->dir, Manifest::files(manifest.bytes), verifyOnOpen); });
+    if (startup) {
+      const auto& listing = manifest.listingOf(*col->shard->dir);
+      auto suspects = CorruptionMarker::read(*col->shard->dir, listing);
+      arena.execute([&] { verifyFiles(*col->shard->dir, Manifest::files(manifest.bytes), verifyOnOpen, suspects); });
+      markers = CorruptionMarker::names(listing);
+    }
   }
   col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
     std::move(initialSchema), &indexRamBudget,
-    config.index.merge_factor, creating ? selected : std::string{}, &arena, std::move(claimed));
+    config.index.merge_factor, creating ? selected : std::string{}, &arena, std::move(opened));
   col->shard->iw->onSuperseded = storage.supersededLogger(selected);
   col->shard->iw->metrics = metrics;
   col->shard->iw->collectionMetrics = col->metrics;
@@ -405,6 +417,8 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   if (creating) storage.activate(name.name, selected);
   retire(name, selected);
   observe(name, *col);
+  // Marked files still referenced by the selected snapshot passed verification.
+  if (startup && !creating) clearMarkers(name, *col->shard->dir, &markers);
   Signal::emit("collectionInitialized", col.get());
   return col;
 }
@@ -422,9 +436,9 @@ std::shared_ptr<Collection> Collections::openCollection(const CollectionId& name
     arena.execute([&] { col->shard->snapshots->openLocalSnapshot(verifyOnOpen); });
     if (col->shard->snapshots->snapshot()->id.incarnation != selected->id) throw std::runtime_error("Snapshot incarnation does not match catalog selection");
     observe(name, *col);
+    // Whatever a marker named was verified before this point.
+    clearMarkers(name, *col->shard->dir);
   }
-  // Whatever a marker named was verified before this point.
-  clearMarkers(name, *col->shard->dir);
   return col;
 }
 

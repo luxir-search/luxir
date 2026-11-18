@@ -120,6 +120,44 @@ TEST_F(NestedTransportTest, nestedAndAncestorSelectionsTravelThroughBothTranspor
   EXPECT_EQ(1, rows);
 }
 
+TEST_F(NestedTransportTest, rowOperationsAndClauseNamesTravelThroughBothTransports) {
+  nested_test::setSchema(helper.collection());
+  CollectionHelper::UpdateBuilder input;
+  for (auto doc : nested_test::DOCS) nested_test::add(input, doc);
+  input.commit(); ASSERT_TRUE(helper.submit(input).success);
+  auto expected = nested_test::rowOperations(*luxirNode);
+  HttpServer server(*luxirNode, 2, 0); server.start();
+  auto stop = scope_guard([&] { server.shutdown(); });
+  for (auto format : {api::DocFormat::ROWS, api::DocFormat::COLUMNS, api::DocFormat::ADAPTIVE}) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    ASSERT_TRUE(api::read_json(req->rawRequest(), nested_test::ROW_QUERY, req->mr));
+    auto& top = const_cast<api::TopDocs&>(std::get<api::TopDocs>(req->rawRequest().ops.at("q")->kind));
+    top.document_format = format;
+    for (const auto& [key, row] : top.row_ops) {
+      const_cast<api::TopDocs&>(std::get<api::TopDocs>(row->kind)).document_format = format;
+    }
+    grpc::ClientContext context;
+    HppClientReaderWriter<api::SearchRequest, api::SearchResponse> stream(getChannel().get(), rpc::Search, &context);
+    ASSERT_TRUE(stream.Write(req->proto)); ASSERT_TRUE(stream.WritesDone());
+    Reply<api::SearchResponse> reply;
+    ASSERT_TRUE(stream.Read(&reply)); EXPECT_EQ(expected, nested_test::captureRows(reply.msg));
+    EXPECT_FALSE(stream.Read(&reply)); ASSERT_TRUE(stream.Finish().ok());
+    std::string body; ASSERT_TRUE(api::write_json(req->proto, body));
+    auto response = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search", body);
+    ASSERT_EQ(200, response.result_int()) << response.body();
+    glz::generic_i64 json; ASSERT_FALSE(glz::read_json(json, response.body()));
+    EXPECT_EQ("red", json["ops"]["q"]["docs"][0]["matched"]["docs"][0]["color"].get_string());
+  }
+  auto docs = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search?format=docs", std::string(nested_test::ROW_QUERY));
+  ASSERT_EQ(200, docs.result_int()) << docs.body();
+  EXPECT_NE(std::string::npos, docs.body().find("\"matched\""));
+  auto shorthand = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+      R"({"query":"id:a","fields":["id"],"row_ops":{"self":{"top_docs":{"fields":["id"]}}}})");
+  ASSERT_EQ(200, shorthand.result_int()) << shorthand.body();
+  glz::generic_i64 json; ASSERT_FALSE(glz::read_json(json, shorthand.body()));
+  EXPECT_EQ("a", json["docs"][0]["self"]["docs"][0]["id"].get_string());
+}
+
 TEST_F(NestedTransportTest, unaryAndStreamingProtobufCarryNestedValues) {
   for (bool streaming : {false, true}) {
     SCOPED_TRACE(streaming);

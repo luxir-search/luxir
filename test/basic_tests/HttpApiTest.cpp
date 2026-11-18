@@ -22,6 +22,7 @@
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
+#include "test/TaskSpawnCounter.h"
 #include "test/HttpReq.h"
 #include "test/SchemaBuilder.h"
 #include "luxir/api/build.h"
@@ -503,7 +504,7 @@ TEST_F(HttpApiTest, connectionsStayPinnedToIoShards) {
     request.set(http::field::content_type, "application/json");
     request.keep_alive(true);
     request.body() =
-        R"({"profile":true,"max_parallel":0,"ops":{"affinity":{"field_facet":{"field":"affinity_s","limit":-1}}}})";
+        R"({"profile":true,"max_parallel":-2,"ops":{"affinity":{"field_facet":{"field":"affinity_s","limit":-1}}}})";
     request.prepare_payload();
     http::write(connection.stream, request);
 
@@ -751,6 +752,50 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   EXPECT_FALSE((*shards)[0]["index"].contains("segments"));
 }
 
+TEST_F(HttpApiTest, loadClassificationsAreOptInAndFanoutMetricsAreAlwaysPresent) {
+  bool saved = LoadRegistry::enabled.exchange(false);
+  auto restore = scope_guard([&] { LoadRegistry::enabled.store(saved); });
+  auto disabled = httpRequest(port(), http::verb::get, "/metrics");
+  ASSERT_EQ(200, disabled.result_int());
+  EXPECT_EQ(std::string::npos, disabled.body().find("luxir_debug_load_"));
+  for (const char* name : {"luxir_debug_fanout_evaluations_total ", "luxir_debug_fanout_published_shares_total ",
+                          "luxir_debug_fanout_share_start_delay_ns_sum ",
+                          "luxir_debug_fanout_share_start_delay_count ",
+                          "luxir_debug_fanout_share_start_delay_ns_max ",
+                          "luxir_debug_fanout_share_run_ns_sum ",
+                          "luxir_debug_fanout_share_estimated_ns_sum ",
+                          "luxir_debug_fanout_share_publisher_runs_total ",
+                          "luxir_debug_fanout_share_credit_ns_sum ",
+                          "luxir_debug_fanout_share_credit_count ",
+                          "luxir_debug_fanout_share_decisions_total{shares=\"2\"} ",
+                          "luxir_debug_fanout_share_decisions_total{shares=\"3\"} ",
+                          "luxir_debug_fanout_share_decisions_total{shares=\"4\"} ",
+                          "luxir_debug_fanout_share_decisions_total{shares=\"5+\"} ",
+                          "luxir_debug_fanout_share_kept_estimated_ns_sum ",
+                          "luxir_debug_fanout_share_largest_published_estimated_ns_sum ",
+                          "luxir_debug_fanout_share_wait_ns_sum ",
+                          "luxir_debug_fanout_share_wait_count ",
+                          "luxir_debug_fanout_load_denials_total{class=\"siblings_only\"}",
+                          "luxir_debug_fanout_load_denials_total{class=\"saturated\"}"}) {
+    EXPECT_NE(std::string::npos, disabled.body().find(name)) << name;
+  }
+
+  LoadRegistry::enabled.store(true);
+  for (const char* target : {"/metrics", "/_stats?format=prometheus"}) {
+    auto metrics = httpRequest(port(), http::verb::get, target);
+    ASSERT_EQ(200, metrics.result_int()) << target;
+    for (const char* name : {"luxir_debug_load_samples_total{", "luxir_debug_load_hot_threads_sum{",
+                            "luxir_debug_load_cpus{", "luxir_debug_load_slots_exhausted_total ",
+                            "luxir_debug_fanout_evaluations_total ", "luxir_debug_fanout_published_shares_total ",
+                            "luxir_debug_fanout_load_denials_total{"}) {
+      EXPECT_NE(std::string::npos, metrics.body().find(name)) << name;
+    }
+  }
+  auto json = httpRequest(port(), http::verb::get, "/_stats");
+  ASSERT_EQ(200, json.result_int());
+  EXPECT_EQ(std::string::npos, json.body().find("luxir_debug_"));
+}
+
 TEST_F(HttpApiTest, statsSegmentsAfterCommit) {
   auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"id":"stats-1","title_w":"segment stats"}],"commit":{}})");
@@ -934,9 +979,8 @@ TEST_F(HttpApiTest, maxParallelModesAllAnswer) {
       R"({"docs":[{"id":"mp1","http_mp_s":"x"},{"id":"mp2","http_mp_s":"x"},{"id":"mp3","http_mp_s":"y"}],"commit":{}})");
   ASSERT_EQ(200, update.result_int()) << update.body();
 
-  // 0 = inline on the shard, 1 = serial on the arena, -1 = parallel on the
-  // arena; same answer from every lane.
-  for (std::string mp : {"-1", "0", "1"}) {
+  // All four modes return the same answer.
+  for (std::string mp : {"-2", "-1", "0", "1"}) {
     auto response = httpRequest(port(), http::verb::post, "/collections/main/_search",
         R"({"max_parallel":)" + mp +
         R"(,"ops":{"cats":{"field_facet":{"field":"http_mp_s","limit":-1}}}})");
@@ -4073,7 +4117,7 @@ TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
 // server-side buffering.  A private server with a tiny stream buffer forces
 // the emitter to pause (observable via streamPauseCount) while the client
 // withholds reads; draining the response resumes it and every doc arrives.
-static void expectBackpressureDrains(HttpServer& server, const std::string& body,
+static std::string expectBackpressureDrains(HttpServer& server, const std::string& body,
                                      size_t expectedDocs) {
   SCOPED_TRACE(body);
   net::io_context cioc;
@@ -4115,6 +4159,7 @@ static void expectBackpressureDrains(HttpServer& server, const std::string& body
 
   beast::error_code ec;
   sock.shutdown(tcp::socket::shutdown_both, ec);
+  return res.body();
 }
 
 static std::vector<Doc> backpressureDocs() {
@@ -4135,33 +4180,40 @@ TEST_F(HttpApiTest, backpressurePausesEmitter) {
   HttpServer bpServer(*LuxirTest::luxirNode, 2, 0, /*streamBufferBytes=*/4096);
   bpServer.start();
 
-  // All three dispatch lanes pause and drain: the default (0) parks and
-  // resumes on the connection shard; 1 and -1 re-enqueue their resumes onto
-  // the arena (HttpSearchRequest::resumeWhenDrained's arena-lane wrapper).
-  for (std::string mp : {"0", "1", "-1"}) {
-    expectBackpressureDrains(bpServer,
-        R"({"query":{"all":true},"limit":-1,"batch_size":100,"max_parallel":)" + mp
-            + R"(,"fields":["id","pad_s"]})",
-        2000);
-  }
+  expectBackpressureDrains(bpServer,
+      R"({"query":{"all":true},"limit":-1,"batch_size":100,"fields":["id","pad_s"]})",
+      2000);
   bpServer.shutdown();
 }
 
-// The engine's own parallel lane resumes inside the arena too.
-TEST_F(HttpApiTest, backpressurePausesAutoParallelEmitter) {
-  LuxirConfig config;
-  config.search.auto_parallel_min_work = 1;
-  LuxirNode node(config);
-  CollectionHelper ch(node, "http_bp");
+TEST_F(HttpApiTest, adaptiveZeroMatchesSerialAfterBackpressure) {
+  LuxirTest::clearCollection("http_bp");
+  FanoutGrainGuard grain(1);
+  CollectionHelper ch("http_bp");
+  ch.getIndexWriter()->mergePolicy->setMergeFactor(100);
   auto docs = backpressureDocs();
-  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs).first(1000), UpdateMessage::COMMIT).success);
-  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs).subspan(1000), UpdateMessage::COMMIT).success);
-
-  HttpServer bpServer(node, 2, 0, /*streamBufferBytes=*/4096);
+  for (size_t first = 0; first < docs.size(); first += 400) {
+    ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs).subspan(first, 400),
+                           UpdateMessage::COMMIT).success);
+  }
+  ASSERT_EQ(5u, ch.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+  HttpServer bpServer(*luxirNode, 2, 0, /*streamBufferBytes=*/4096);
   bpServer.start();
-  expectBackpressureDrains(bpServer,
-      R"({"query":"k_s:odd k_s:even","limit":-1,"batch_size":100,"fields":["id","pad_s"]})",
-      2000);
+  std::string serial;
+  for (int parallel : {-2, 0}) {
+    auto body = expectBackpressureDrains(bpServer,
+        R"({"query":"k_s:odd k_s:even","limit":-1,"batch_size":100,"max_parallel":)"
+            + std::to_string(parallel) + R"(,"fields":["id","pad_s"]})", 2000);
+    if (parallel == -2) serial = std::move(body);
+    else {
+      auto expected = splitLines(serial);
+      auto actual = splitLines(body);
+      EXPECT_EQ(expected.size(), actual.size());
+      for (size_t i = 0; i < std::min(expected.size(), actual.size()); i++) {
+        expectResponse(expected[i], actual[i]);
+      }
+    }
+  }
   bpServer.shutdown();
 }
 

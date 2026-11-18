@@ -152,9 +152,8 @@ private:
                                         std::optional<TenantCatalog::Entry> entry = {});
   void unload(const Transition& transition, const std::shared_ptr<Collection>& expected, std::string reason);
   // A writer whose newest root is invalid continues from the newest valid one
-  // under a new incarnation. Returns the incarnation to open.
-  std::string recoverWriter(const CollectionId& id, TenantCatalog& storage, const std::string& selected,
-                            const Manifest& manifest, IncarnationState& claimed);
+  // under a new incarnation. Updates opened to match the returned incarnation.
+  std::string recoverWriter(const CollectionId& id, TenantCatalog& storage, const std::string& selected, WriterOpen& opened);
   void observe(const CollectionId& id, Collection& collection);
   // The policy helpers require cachePolicyMutex. Listing locks nest inside it.
   size_t cacheBytes(const CollectionId& id) const;

@@ -944,7 +944,7 @@ TEST_F(ScopedRowSpaceTest, joinReducersComposeWithRootQueries) {
     EXPECT_EQ(2, req->getMatchCount("filtered"));
     if (score == std::string_view("none")) {
       auto scores = std::get<api::ColFloat>(req->docList()->columns.find("_score_")->kind).v;
-      for (float value : scores) EXPECT_FLOAT_EQ(1, value);
+      for (float value : scores) EXPECT_FLOAT_EQ(0, value);
     }
   }
 }
@@ -1151,7 +1151,7 @@ TEST_F(ScopedRowSpaceTest, noneReducerKeepsReadsStableAcrossNextAndAdvance) {
   auto* weight = all.createWeight(context, 0);
   for (bool seek : {false, true}) {
     auto* input = weight->scorerSupplier(pool, many->segments()[0]);
-    auto* supplier = relation.reduce(pool, 0, *input, nullptr, RowRelation::Reduction::NONE, 2.0f);
+    auto* supplier = relation.reduce(pool, 0, *input, nullptr, RowReduction{RowReduction::FIXED}, 2.0f);
     auto* scorer = buildScorerForTests(pool, *supplier, 4);
     ASSERT_NE(nullptr, scorer);
     EXPECT_EQ(0, scorer->next());

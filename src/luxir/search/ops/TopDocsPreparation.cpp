@@ -16,7 +16,7 @@ void retainPreparedWindow(RequestMemTracker& tracker,
 }  // namespace
 
 template <bool Structural, bool MetricGroups, typename Admission>
-void TopDocsReq::CalcBase::prepareAndDispatch(oneapi::tbb::task_group* tg) {
+void TopDocsReq::CalcBase::prepareAndDispatch(FanoutScope* tg) {
   {
     auto release = scope_guard([&]() noexcept {
       for (auto& segment : thisOp().view->segments()) releaseSegmentState(segment);
@@ -28,10 +28,10 @@ void TopDocsReq::CalcBase::prepareAndDispatch(oneapi::tbb::task_group* tg) {
 }
 
 template <bool Structural>
-void TopDocsReq::CalcBase::prepareDomains(oneapi::tbb::task_group* tg) {
+void TopDocsReq::CalcBase::prepareDomains(FanoutScope* tg) {
   auto& op = thisOp();
   auto baseDomains = std::span<DocSet* const>(inputDomainViews.data(), inputDomainViews.size());
-  Query::Weight::PrepareContext baseCtx{*op.view, baseDomains, tg != nullptr, &op.req};
+  Query::Weight::PrepareContext baseCtx{*op.view, baseDomains, tg, &op.req};
   bool routed = !op.domainVariants.empty();
   bool mainNeedsPrepare = op.weight != nullptr && (op.wholeMembershipPlan.preparesMainWeight(*op.weight) ||
                                                    op.weight->needsPrepare());
@@ -64,7 +64,7 @@ void TopDocsReq::CalcBase::prepareDomains(oneapi::tbb::task_group* tg) {
     }
     Query::Weight::PrepareContext liveCtx{*op.view,
                                           std::span<DocSet* const>(liveDomains.data(), liveDomains.size()),
-                                          tg != nullptr, &op.req};
+                                          tg, &op.req};
     if (op.domainVariants.needsResetParentFilters()) {
       preparedResetFilterSources = QueryPrep::prepareFilterSources(op.filterWeights, op.filterUses, liveCtx);
       if constexpr (Structural)
@@ -89,7 +89,7 @@ void TopDocsReq::CalcBase::prepareDomains(oneapi::tbb::task_group* tg) {
       }
       Query::Weight::PrepareContext queryCtx{
           *op.view, std::span<DocSet* const>(effectiveDomainViews.data(), effectiveDomainViews.size()),
-          tg != nullptr, &op.req};
+          tg, &op.req};
       if (op.wholeMembershipPlan.preparesMainWeight(*op.weight)) {
         preparedWeight = op.wholeMembershipPlan.prepareMainWeight(queryCtx);
       } else {
@@ -117,7 +117,7 @@ void TopDocsReq::CalcBase::prepareDomains(oneapi::tbb::task_group* tg) {
 
   Query::Weight::PrepareContext queryCtx{
       *op.view, std::span<DocSet* const>(effectiveDomainViews.data(), effectiveDomainViews.size()),
-      tg != nullptr, &op.req};
+      tg, &op.req};
   if (op.weight != nullptr && op.wholeMembershipPlan.preparesMainWeight(*op.weight)) {
     preparedWeight = op.wholeMembershipPlan.prepareMainWeight(queryCtx);
   } else if (op.weight != nullptr && op.weight->needsPrepare()) {
@@ -129,7 +129,7 @@ void TopDocsReq::CalcBase::prepareDomains(oneapi::tbb::task_group* tg) {
 }
 
 template <bool Structural>
-void TopDocsReq::CalcBase::prepareMainVariants(oneapi::tbb::task_group* tg) {
+void TopDocsReq::CalcBase::prepareMainVariants(FanoutScope* tg) {
   auto& op = thisOp();
   if (preparedWeight == nullptr || !op.domainVariants.needsInheritProduction() ||
       preparedWeight->domainDependence() == PreparedDomainDependence::QUERY_CANONICAL) {
@@ -184,7 +184,7 @@ void TopDocsReq::CalcBase::prepareMainVariants(oneapi::tbb::task_group* tg) {
       }
       Query::Weight::PrepareContext context{*op.view,
                                             std::span<DocSet* const>(domainViews.data(), domainViews.size()),
-                                            tg != nullptr, &op.req};
+                                            tg, &op.req};
       ownedWeight = op.weight->prepare(context);
       variantWeight = ownedWeight.get();
     }
@@ -221,7 +221,7 @@ void TopDocsReq::CalcBase::prepareMainVariants(oneapi::tbb::task_group* tg) {
 
 template <bool Structural>
 void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> liveDomains,
-                                                      oneapi::tbb::task_group* tg) {
+                                                      FanoutScope* tg) {
   auto& op = thisOp();
   size_t sourceCount = op.domainVariants.sourceCount();
   size_t segmentCount = op.view->segments().size();
@@ -242,7 +242,7 @@ void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> l
       resetExtraSources.push_back(source);
     }
   }
-  Query::Weight::PrepareContext liveContext{*op.view, liveDomains, tg != nullptr, &op.req};
+  Query::Weight::PrepareContext liveContext{*op.view, liveDomains, tg, &op.req};
   auto preparedExtras = QueryPrep::prepareFilterSources(extraWeights, extraUses, liveContext);
   if constexpr (Structural)
     for (const auto& source : preparedExtras) {
@@ -307,7 +307,7 @@ void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> l
 
   if constexpr (!Structural) {
     preparedDomainVariants = op.domainVariants.prepareResetVariants(
-        preparedDomainSources, eligibility, liveDomains, *op.view, tg != nullptr, &op.req,
+        preparedDomainSources, eligibility, liveDomains, *op.view, tg, &op.req,
         [&](size_t variant, size_t segnum) {
           auto& segment = op.view->segments()[segnum];
           return reserveVariantPreparation<Structural>(
@@ -316,7 +316,7 @@ void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> l
         });
   } else {
     preparedDomainVariants = op.domainVariants.prepareResetVariants(
-        preparedDomainSources, eligibility, liveDomains, *op.view, tg != nullptr, &op.req,
+        preparedDomainSources, eligibility, liveDomains, *op.view, tg, &op.req,
         [&](size_t variant, size_t segnum) {
           auto& segment = op.view->segments()[segnum];
           return reserveVariantPreparation<Structural>(
@@ -330,21 +330,21 @@ void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> l
   }
 }
 
-template void TopDocsReq::CalcBase::prepareAndDispatch<false, false>(oneapi::tbb::task_group*);
-template void TopDocsReq::CalcBase::prepareAndDispatch<true, false>(oneapi::tbb::task_group*);
-template void TopDocsReq::CalcBase::prepareAndDispatch<false, true>(oneapi::tbb::task_group*);
-template void TopDocsReq::CalcBase::prepareAndDispatch<true, true>(oneapi::tbb::task_group*);
+template void TopDocsReq::CalcBase::prepareAndDispatch<false, false>(FanoutScope*);
+template void TopDocsReq::CalcBase::prepareAndDispatch<true, false>(FanoutScope*);
+template void TopDocsReq::CalcBase::prepareAndDispatch<false, true>(FanoutScope*);
+template void TopDocsReq::CalcBase::prepareAndDispatch<true, true>(FanoutScope*);
 template void TopDocsReq::CalcBase::prepareAndDispatch<false, false, DiversifyAdmission>(
-    oneapi::tbb::task_group*);
+    FanoutScope*);
 template void TopDocsReq::CalcBase::prepareAndDispatch<true, false, DiversifyAdmission>(
-    oneapi::tbb::task_group*);
-template void TopDocsReq::CalcBase::prepareDomains<false>(oneapi::tbb::task_group*);
-template void TopDocsReq::CalcBase::prepareDomains<true>(oneapi::tbb::task_group*);
-template void TopDocsReq::CalcBase::prepareMainVariants<false>(oneapi::tbb::task_group*);
-template void TopDocsReq::CalcBase::prepareMainVariants<true>(oneapi::tbb::task_group*);
+    FanoutScope*);
+template void TopDocsReq::CalcBase::prepareDomains<false>(FanoutScope*);
+template void TopDocsReq::CalcBase::prepareDomains<true>(FanoutScope*);
+template void TopDocsReq::CalcBase::prepareMainVariants<false>(FanoutScope*);
+template void TopDocsReq::CalcBase::prepareMainVariants<true>(FanoutScope*);
 template void TopDocsReq::CalcBase::prepareDomainQueryVariants<false>(std::span<DocSet* const>,
-                                                                      oneapi::tbb::task_group*);
+                                                                      FanoutScope*);
 template void TopDocsReq::CalcBase::prepareDomainQueryVariants<true>(std::span<DocSet* const>,
-                                                                     oneapi::tbb::task_group*);
+                                                                     FanoutScope*);
 
 }  // namespace luxir

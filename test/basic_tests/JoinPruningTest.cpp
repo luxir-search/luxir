@@ -55,7 +55,8 @@ protected:
   }
 
   Run run(CollectionHelper& helper, int32_t family, int32_t outer, bool reversed,
-          float boost, int32_t k, bool count, int64_t countLimit = -1) {
+          float boost, int32_t k, bool count, int64_t countLimit = -1,
+          std::string_view mode = "max", int32_t minimum = 1, int32_t maximum = INT32_MAX) {
     auto req = localReq(helper.getSearchEngine());
     req->collection(helper.collection().getId().name);
     auto& op = req->topDocs().fields({"id"}).getScores().limit(k);
@@ -64,7 +65,10 @@ protected:
     auto a = qb::match(mr, "text_w", "alpha");
     api::Query inner = family == 0 ? a : family == 1 ? qb::boolean(mr, {}, {a, qb::match(mr, "text_w", "rare"), qb::match(mr, "text_w", "scarce")})
         : family == 2 ? qb::boolean(mr, {a, qb::match(mr, "text_w", "rare")}) : qb::phraseText(mr, "text_w", "alpha beta");
-    auto join = qb::boost(mr, qb::toParent(mr, "chunks_nested", inner), boost);
+    auto joined = qb::toParent(mr, "chunks_nested", inner, mode);
+    auto& spec = std::get<api::ToParentQuery>(joined.kind);
+    spec.min_children = minimum; spec.max_children = maximum;
+    auto join = qb::boost(mr, joined, boost);
     auto root = qb::match(mr, "body_w", "root");
     auto first = reversed ? root : join;
     auto second = reversed ? join : root;
@@ -95,6 +99,22 @@ protected:
     }
   }
 };
+
+TEST_F(JoinPruningTest, everyReductionAndBoundMatchesAnUnprunedTopK) {
+  SearchOverridesGuard impacts(ImpactsIndex::forceEagerForTests);
+  SearchOverridesGuard composition(disableTopKCountComposition);
+  disableTopKCountComposition = true; ImpactsIndex::forceEagerForTests = true;
+  CollectionHelper helper("all_join_reductions"); index(helper, 2);
+  ASSERT_TRUE(helper.deleteByIds({"0","1","2050"}, UpdateMessage::COMMIT).success);
+  for (auto mode : {"max","min","sum","avg","none"}) for (bool bounded : {false,true}) {
+    for (int family : {0,1,2,3}) for (int outer : {0,1,2}) {
+      SCOPED_TRACE(::testing::Message() << mode << '/' << bounded << '/' << family << '/' << outer);
+      auto exhaustive = run(helper,family,outer,false,0.7f,5,true,-1,mode,bounded ? 2 : 1,bounded ? 3 : INT32_MAX);
+      auto pruned = run(helper,family,outer,false,0.7f,5,false,-1,mode,bounded ? 2 : 1,bounded ? 3 : INT32_MAX);
+      compare(exhaustive,pruned);
+    }
+  }
+}
 
 TEST_F(JoinPruningTest, maximumTopKMatchesExhaustiveWithBoostsDeletesAndBooleanClauses) {
   SearchOverridesGuard impacts(ImpactsIndex::forceEagerForTests);

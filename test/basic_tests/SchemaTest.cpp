@@ -2296,3 +2296,47 @@ TEST_F(SchemaTest, qualifiedNamesRemainOpaqueInOverlayFilenames) {
   EXPECT_EQ(2u, Manifest::fileEpoch(name));
   EXPECT_NE(name, Postings::getSegmentOverlayFileName(1, "vec.items.parts.embedding_v__raw", 3, 0, 1, 2));
 }
+
+TEST_F(SchemaTest, nestedReverseMapIsAnInheritedWriteSetting) {
+  auto schema = schemaJson(R"({"templates":{"_nested":{"type":"nested","reverse_map":false}},
+    "fields":{"items":{"parent":"_nested"},"items.parts":"nested",
+      "enabled":{"parent":"_nested","reverse_map":true}}})");
+  auto enabled = [&](std::string_view name) {
+    return ((const NestedFieldType*)schema->resolveInput(name).fieldType)->reverseMap;
+  };
+  EXPECT_FALSE(enabled("items")); EXPECT_TRUE(enabled("items.parts")); EXPECT_TRUE(enabled("enabled"));
+  EXPECT_FALSE(enabled("dynamic_nested")); EXPECT_FALSE(enabled("items.dynamic_nested"));
+  EXPECT_TRUE(((const NestedFieldType*)Schema::createDefaultSchema()->resolveInput("dynamic_nested").fieldType)->reverseMap);
+  auto serialized = authoredJson(*schema);
+  EXPECT_NE(std::string::npos, serialized.find("\"reverse_map\":false"));
+  auto roundTrip = schemaJson(serialized);
+  EXPECT_FALSE(((const NestedFieldType*)roundTrip->resolveInput("dynamic_nested").fieldType)->reverseMap);
+  for (auto type : {"string","int","text","geo_point"}) {
+    try {
+      schemaJson("{\"fields\":{\"value\":{\"type\":\"" + std::string(type) + "\",\"reverse_map\":false}}}");
+      FAIL() << type;
+    } catch (const SchemaError& e) {
+      EXPECT_NE(std::string::npos, std::string(e.what()).find("reverse_map"));
+      EXPECT_NE(std::string::npos, std::string(e.what()).find("value"));
+    }
+  }
+  EXPECT_THROW(schemaJson(R"({"fields":{"value":{"type":"string","variants":{"s":{"type":"string","reverse_map":true}}}}})"), SchemaError);
+}
+
+TEST_F(SchemaTest, changingNestedReverseMapPreservesIntroductionAndPersists) {
+  CollectionHelper helper;
+  SchemaBuilder initial;
+  initial.field("items").type = api::FieldDef::FieldClass::NESTED;
+  auto first = initial.set(helper.collection());
+  SchemaBuilder change;
+  auto& path = change.field("items"); path.type = api::FieldDef::FieldClass::NESTED; path.reverse_map = false;
+  auto next = change.set(helper.collection());
+  EXPECT_EQ(first->introduction("items"), next->introduction("items"));
+  EXPECT_EQ(first->signatures().at("items").properties, next->signatures().at("items").properties);
+  auto manifest = readDurableIndexInfo(helper.getIndexWriter()->dir);
+  auto stored = SchemaCache{}.load(helper.getIndexWriter()->dir, *manifest);
+  EXPECT_FALSE(((const NestedFieldType*)stored->resolveInput("items").fieldType)->reverseMap);
+  glz::generic_sorted_u64 json;
+  ASSERT_FALSE(glz::read_json(json, helper.getIndexWriter()->snapshots.readers.resolvedSchema()));
+  EXPECT_EQ("false", glz::write_json(json["fields"]["items"]["reverse_map"]).value());
+}

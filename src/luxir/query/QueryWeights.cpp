@@ -27,6 +27,7 @@
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
+#include "luxir/query/RangeFieldQuery.h"
 #include "luxir/query/RescoreQuery.h"
 #include "luxir/query/TermInSetQuery.h"
 #include "luxir/query/TermQuery.h"
@@ -171,7 +172,8 @@ std::optional<float> ToParentQuery::uniformChildScore(Query& query, float multip
       return uniformChildScore(*((ForcePrepareQuery&)query).getChild(), multiplier);
     case QueryKind::TO_PARENT: {
       auto& join = (ToParentQuery&)query;
-      if (!join.maximum) return multiplier;
+      if (join.reduction.kind == RowReduction::NONE) return 0.0f;
+      if (join.reduction.kind == RowReduction::SUM) return std::nullopt;
       auto child = uniformChildScore(*join.child);
       return child ? std::optional<float>(*child * multiplier) : std::nullopt;
     }
@@ -296,6 +298,12 @@ Query::Weight* GeoBoxQuery::createWeight(Context& context, int32_t flags,
 
 Query::Weight* GeoDistanceQuery::createWeight(Context& context, int32_t flags,
                                               float multiplier) {
+  float score = constantWhenScored(flags, multiplier);
+  return context.pool.make<Weight>(context, *this, flags, score);
+}
+
+Query::Weight* RangeFieldQuery::createWeight(Context& context, int32_t flags,
+                                             float multiplier) {
   float score = constantWhenScored(flags, multiplier);
   return context.pool.make<Weight>(context, *this, flags, score);
 }
