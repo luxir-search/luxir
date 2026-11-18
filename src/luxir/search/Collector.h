@@ -153,7 +153,7 @@ class ScoreCollector {
         // soon as the heap fills, not only when a doc evicts one: best-docs-first / index-
         // sorted / clustered input never evicts, so the old "update on overflow only" left the
         // threshold at lowest() forever and defeated impact pruning exactly when it helps most.
-        if (pq.size() >= topCount) {
+        if ((int64_t)pq.size() >= topCount) {
           minCompetitiveVal = pq.top().score;
         }
       }
@@ -182,7 +182,7 @@ class ScoreCollector {
   // A later segdoc loses an equal score, even under collapse. Publish the
   // next float only for that stream; sibling streams retain an inclusive floor.
   float minCompetitiveScoreForNextDoc(int32_t segment, int32_t docid) const {
-    if (topCount == 0 || pq.size() < topCount) {
+    if (topCount == 0 || (int64_t)pq.size() < topCount) {
       return std::numeric_limits<float>::lowest();
     }
     const ScoreDoc& floor = pq.top();

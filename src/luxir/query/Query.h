@@ -111,8 +111,8 @@ struct ScoreWindow {
   int32_t min = 0;
   int32_t max = 0;
   int32_t size = 0;
-  std::span<int32_t> docs;
-  std::span<float> scores;
+  std::span<int32_t> docs = {};
+  std::span<float> scores = {};
 };
 
 // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
@@ -668,7 +668,7 @@ public:
     // Point emissions (see Demand) of one two-phase check, when the arm knows
     // it. A parent choosing where verification runs prices the checks a
     // schedule adds with it.
-    std::optional<double> verificationPoints;
+    std::optional<double> verificationPoints = {};
     // Receiving a floor on this scorer's own score saves work, and a floor
     // that skips nothing has negligible cost. False is always conservative.
     bool competitiveFloorPays = false;
@@ -1609,7 +1609,7 @@ public:
       int foundInSegCount = 0;
       result.postingsStates = {
           pool.make_arr<const TermsEnum::PostingsState*>(numSegs), numSegs};
-      for (int i = 0; i < numSegs; ++i) {
+      for (size_t i = 0; i < numSegs; ++i) {
         auto* termsEnum = cachedFieldInfo.termsEnums[i];
         if (!termsEnum || !termsEnum->seek(term)) {
           result.postingsStates[i] = nullptr;

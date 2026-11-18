@@ -78,7 +78,7 @@ public:
       return normsBytes[doc];
     }
     screaming::BitSet::Iterator iter(docs.bitset());
-    int32_t found = iter.advance(doc);
+    [[maybe_unused]] int32_t found = iter.advance(doc);
     assert(found == doc);
     return normsBytes[iter.rank()];
   }

@@ -128,14 +128,14 @@ public:
 
 
   void set(index_type val) {
-    assert(val >= 0 && val < fixedSize);
+    assert(val >= 0 && (uint64_t)val < fixedSize);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     words[wordIdx] |= (word_type)1 << bitIdx;
   }
 
   bool get(index_type val) const {
-    assert(val >= 0 && val < fixedSize);
+    assert(val >= 0 && (uint64_t)val < fixedSize);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     return words[wordIdx] & ((word_type)1 << bitIdx);
@@ -143,7 +143,7 @@ public:
 
   // returns 0 or 1
   int getInt(index_type val) const {
-    assert(val >= 0 && val < fixedSize);
+    assert(val >= 0 && (uint64_t)val < fixedSize);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     return (words[wordIdx] >> bitIdx) & 0x01;
@@ -154,7 +154,7 @@ public:
   // Assumes that any unused high bits in the last word are cleared.
   // If that is not the case, this can return a value >= size.
   index_type nextSetBit(index_type val, index_type numWords = fixedNumWords) const {
-    assert(val >= 0 && val < fixedSize);
+    assert(val >= 0 && (uint64_t)val < fixedSize);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     word_type word = words[wordIdx] >> bitIdx;
@@ -234,7 +234,7 @@ class FixedBitSet : public OpenBitSet<std::numeric_limits<int32_t>::max(), uint6
   const uint32_t nwords;
 public:
   FixedBitSet(uint64_t* ptr, int32_t nbits) : OpenBitSet(ptr), nbits(nbits), nwords(sizeInWords(nbits)) {
-    assert(nbits >= 0 && nbits <= OBS::fixedSize);
+    assert(nbits >= 0 && (uint64_t)nbits <= OBS::fixedSize);
     assert(ptr != nullptr || nbits == 0); // if nbits is 0, we can have a null pointer
   }
 
@@ -273,7 +273,7 @@ public:
 
   int32_t card() const {
     int32_t count = 0;
-    for (int32_t i = 0; i < nwords; i++) {
+    for (uint32_t i = 0; i < nwords; i++) {
       count += std::popcount(words[i]);
     }
     return count;
@@ -401,7 +401,7 @@ public:
     }
     
     // Check subsequent words
-    for (auto i = wordIdx + 1; i < nwords; i++) {
+    for (auto i = wordIdx + 1; (uint32_t)i < nwords; i++) {
       word = ~words[i];  // invert to find clear bits
       if (word != 0) {
         int32_t result = (i << OBS::wordShift) + std::countr_zero(word);
@@ -560,8 +560,7 @@ public:
     // enum that takes 16 bits
     enum BucketType : std::uint8_t {
       SPARSE,
-      DENSE,
-      NEGATIVE
+      DENSE
     };
 
     BucketType bucketType;
@@ -662,7 +661,7 @@ public:
     // and may have to advance to the next bucket to get it.
     int32_t denseNextMaybe() {
       int next = curr + 1;
-      if (next < bucketBase + Bits::fixedSize) {
+      if (next < (int64_t)bucketBase + (int64_t)Bits::fixedSize) {
         auto localIndex = uint16_t(next);
         // if localIndex==0 then we wrapped
         auto localFound = bucket.bits.obs.nextSetBit(localIndex);
@@ -725,7 +724,7 @@ public:
       const BucketDescriptor& desc = set->descriptors[bucketIdx];
       bucketBase = desc.upperBits << BUCKET_BITS;
       bucketSize = desc.size + 1;
-      if (bucketSize <= BUCKET_SPARSE_MAX) {
+      if ((uint32_t)bucketSize <= BUCKET_SPARSE_MAX) {
         bucketType = SPARSE;
         bucket.setSparse((uint16_t*)(set->start + desc.offset));
         return sparseNext();
@@ -758,7 +757,7 @@ public:
       const BucketDescriptor& desc = set->descriptors[bucketIdx];
       bucketBase = desc.upperBits << BUCKET_BITS;
       bucketSize = desc.size + 1;
-      if (bucketSize <= BUCKET_SPARSE_MAX) {
+      if ((uint32_t)bucketSize <= BUCKET_SPARSE_MAX) {
         bucketType = SPARSE;
         bucket.setSparse((uint16_t*)(set->start + desc.offset));
       } else {
@@ -887,7 +886,7 @@ protected:
   // NOTE: this requires knowing if a rank index is being used for dense blocks!
   static constexpr int blockBytes(const BucketDescriptor& desc) {
     int sz = (int)desc.size + 1;
-    if (sz <= BUCKET_SPARSE_MAX) {
+    if ((uint32_t)sz <= BUCKET_SPARSE_MAX) {
       return (int)((sz * sizeof(uint16_t) + BLOCK_ALIGN - 1) & ~(size_t)(BLOCK_ALIGN - 1));
     } else {
       return DENSE_CONTAINER_SIZE;
@@ -982,7 +981,7 @@ public:
   }
 
   void add(int32_t val) {
-    auto bucket = val >> BitSet::BUCKET_BITS;
+    auto bucket = (uint32_t)(val >> BitSet::BUCKET_BITS);
     if (bucket != currBucket) {
       assert(bucket > currBucket);
       flushBucket();
@@ -1008,12 +1007,11 @@ public:
   uint32_t flush() {
     flushBucket();
 
-    uint32_t descriptorStart = bucketStart; // offset of where we are writing descriptors
     uint32_t totalSize = bucketStart;
 
     // write bucket descriptors
     void* scratchBuf = startScratch;
-    for (int nDescriptors = 0; nDescriptors < numBuckets; nDescriptors += maxDescriptors) {
+    for (uint32_t nDescriptors = 0; nDescriptors < numBuckets; nDescriptors += maxDescriptors) {
       auto descriptorsInBuffer = std::min(maxDescriptors, numBuckets - nDescriptors);
       uint32_t writeSize = descriptorsInBuffer * sizeof(BucketDescriptor);
       write(scratchBuf, writeSize);
@@ -1104,9 +1102,9 @@ protected:
         // Don't count the last block... it would never be used in our current round-down scheme in the iterator.
         // This also prevents cumulativeRank from overflowing 16 bits.  The other way to prevent it is to
         // implement the all-bits-set optimization of skipping the block entirely.
-        for (int i=0; i<bits.fixedNumWords - wordsPerCount; i += wordsPerCount) {
+        for (uint32_t i=0; i<bits.fixedNumWords - wordsPerCount; i += wordsPerCount) {
           int rank = 0;
-          for (int j=i; j < i + wordsPerCount; j++) {
+          for (uint32_t j=i; j < i + wordsPerCount; j++) {
             rank += std::popcount(bits.words[j]);
           }
           cumulativeRank += rank;

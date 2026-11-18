@@ -236,7 +236,7 @@ public:
 #endif
     }
 
-    bool matchesAt(int32_t doc, int32_t rank) {
+    bool rankMatches(int32_t doc, int32_t rank) {
       observe(doc);
       if (!multi) {
         if (allMatch) return true;
@@ -251,7 +251,7 @@ public:
     }
 
     bool valueMatches() {
-      return docid != PostingsReader::END && matchesAt(docid, iter.rank());
+      return docid != PostingsReader::END && rankMatches(docid, iter.rank());
     }
 
     // Calls scan(test) with this column's per-document test. Scans step with
@@ -266,7 +266,7 @@ public:
           return query.matchesValue(iter.values().valueAt(rank));
         });
       }
-      return scan([this](int32_t doc, int32_t rank) { return matchesAt(doc, rank); });
+      return scan([this](int32_t doc, int32_t rank) { return rankMatches(doc, rank); });
     }
 
   public:
