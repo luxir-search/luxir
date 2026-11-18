@@ -10,7 +10,8 @@
 #include <stdexcept>
 #include <string_view>
 
-#include "luxir/query/GeoQuery.h"
+#include "luxir/query/BKDQueryWeight.h"
+#include "luxir/query/GeoPointSource.h"
 #include "luxir/query/Query.h"
 #include "luxir/reader/BKDReader.h"
 #include "luxir/util/MemPool.h"
@@ -102,7 +103,8 @@ public:
   bool recoverableAsPredicate() const noexcept override { return true; }
 
   static constexpr std::string_view QUERY_NAME = "GeoPolygonQuery";
-  using Weight = GeoQueryWeight<GeoPolygonQuery, BKDPolygonRelation>;
+  using PointSource = GeoPointSource;
+  using Weight = BKDQueryWeight<GeoPolygonQuery, BKDPolygonRelation>;
 
   GeoPolygonQuery(MemPool& pool, std::string_view field,
                   std::span<const geo::PolygonRings> polygons)

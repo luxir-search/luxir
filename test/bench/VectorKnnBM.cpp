@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -65,7 +66,10 @@ void setBenchAnn(api::FieldDef& f, int32_t dims, int32_t codec) {
                   luxir::unit_tests ? 2 : codec == PQ_D8 ? dims / 8 : 0,
                   luxir::unit_tests ? 1 : 8);
   } else {
-    f.ann = rabitqAnn(luxir::unit_tests ? 4 : 0, benchRaBitQBits(codec));
+    // LUXIR_VECTOR_NLIST overrides the default list count, to weigh per-list
+    // against per-code work at equal coverage (nprobe is a scan fraction).
+    const char* nlist = std::getenv("LUXIR_VECTOR_NLIST");
+    f.ann = rabitqAnn(luxir::unit_tests ? 4 : nlist ? std::atoi(nlist) : 0, benchRaBitQBits(codec));
   }
 }
 
@@ -238,12 +242,13 @@ void buildVectorBenchIndex(CollectionHelper& helper, int64_t nDocs, int32_t dims
 LocalReq* makeKnnBenchReq(SearchEngine& engine, std::string_view field,
                           const std::vector<float>& queryVec, int32_t k,
                           int32_t nprobe = 0, int32_t refineCandidates = 0,
-                          bool exact = false, bool groups = false) {
+                          bool exact = false, bool groups = false, bool scores = false) {
   auto* req = LocalReq::create(engine);
   req->collection("main").requestId("vector-bench");
 
   auto& cur = req->topDocs();
   cur.limit(k).countLimit().fields({"id"});
+  if (scores) cur.getScores();
   cur.rawQuery() = qb::knn(cur.mr(), field, queryVec, k, nprobe, exact, refineCandidates);
   if (groups) {
     std::get<api::KnnQuery>(cur.rawQuery().kind).unit = "groups";
@@ -385,7 +390,7 @@ void BM_VectorKnnFlatDomain(benchmark::State& state) {
     KnnQuery query(field, type, vector, 10);
     auto* weight = query.createWeight(context, Query::NEED_SCORES);
     std::array<DocSet*, 1> domains{domain};
-    Query::Weight::PrepareContext prepare(*reader, domains, false, nullptr);
+    Query::Weight::PrepareContext prepare(*reader, domains, nullptr, nullptr);
     auto prepared = weight->prepare(prepare);
     auto* scorer = prepared->createScorer(pool, seg);
     uint64_t fp = 0;
@@ -875,7 +880,9 @@ void BM_VectorIvfIncrementalBuild(benchmark::State& state) {
 // (LUXIR_VECTOR_DIMS, default 768); the last LUXIR_VECTOR_QUERIES rows
 // (default 200) are held-out queries and up to LUXIR_VECTOR_N (default: the
 // rest) leading rows are indexed into LUXIR_VECTOR_SEGMENTS (default 4)
-// segments under LUXIR_VECTOR_METRIC (l2, ip, cosine; default cosine).  Per
+// segments under LUXIR_VECTOR_METRIC (l2, ip, cosine; default cosine).
+// LUXIR_FORCE_FAISS_RABITQ, when set, uses FAISS's RaBitQ distance computer
+// instead of RaBitQScorer, to compare both kernels with one binary. Per
 // codec it reports the aux build time (train + encode + write over every
 // segment), overlay bytes per vector, recall@10 against the exact path, and
 // serial single-query latency.  Instances are grouped by codec so the built
@@ -1037,7 +1044,9 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
     }
     builtCodec = codec;
   }
-  SearchOverridesGuard saved(KnnQuery::tuning.filteredCoverageAlpha, KnnQuery::statsForTests, KnnQuery::tuning.routing, KnnQuery::tuning.selector, KnnQuery::tuning.completion);
+  SearchOverridesGuard saved(KnnQuery::tuning.filteredCoverageAlpha, KnnQuery::statsForTests, KnnQuery::tuning.routing, KnnQuery::tuning.selector, KnnQuery::tuning.completion,
+                             KnnQuery::forceFaissRaBitQ);
+  KnnQuery::forceFaissRaBitQ = std::getenv("LUXIR_FORCE_FAISS_RABITQ") != nullptr;
   KnnQuery::tuning.routing = (KnnQuery::Routing)state.range(4);
   KnnQuery::tuning.selector = (KnnPlanner::Selector)state.range(5);
   KnnQuery::tuning.completion = (KnnQuery::Completion)state.range(6);
@@ -1160,6 +1169,8 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
 
 void BM_VectorAnnDataset(benchmark::State& state) {
   ForceIvfGuard forceIvf;
+  SearchOverridesGuard savedKernel(KnnQuery::forceFaissRaBitQ);
+  KnnQuery::forceFaissRaBitQ = std::getenv("LUXIR_FORCE_FAISS_RABITQ") != nullptr;
   const VectorDataset* ds = VectorDataset::get();
   if (skipBenchIfDataMissing(state, ds != nullptr, "LUXIR_VECTOR_DATASET")) return;
   int32_t codec = (int32_t)state.range(0);
@@ -1217,26 +1228,42 @@ void BM_VectorAnnDataset(benchmark::State& state) {
 
   std::vector<std::vector<float>> queries;
   for (int32_t q = 0; q < ds->nQueries; q++) queries.push_back(ds->query(q));
+  KnnQuery::Stats stats;
+  std::optional<SearchOverridesGuard<KnnQuery::Stats*>> statsGuard;
+  statsGuard.emplace(KnnQuery::statsForTests);
+  KnnQuery::statsForTests = &stats;
   double recallSum = 0;
-  for (int32_t q = 0; q < ds->nQueries; q++) {
-    auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v", queries[(size_t)q], k,
-                                nprobe, cand);
-    req->execute(false);
-    std::vector<std::string> ids;
-    std::string error;
-    bool ok = responseIds(*req, ids, error);
-    req->done();
-    if (!ok) {
-      state.SkipWithError(error.c_str());
-      return;
+  // Ids and score bits across all queries: equal digests mean equal results.
+  uint64_t resultsDigest = 0;
+  {
+    for (int32_t q = 0; q < ds->nQueries; q++) {
+      auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v", queries[(size_t)q], k,
+                                  nprobe, cand, false, false, true);
+      req->execute(false);
+      std::vector<std::string> ids;
+      std::string error;
+      bool ok = responseIds(*req, ids, error);
+      if (ok) {
+        for (const auto& id : ids) resultsDigest = resultsDigest * 131 + (uint32_t)java_string_hashcode(id);
+        const auto& docs = std::get<api::DocList>((*req->responses[0]->proto.ops.find("q"))->kind);
+        for (float score : std::get<api::ColFloat>(docs.columns.find("_score_")->kind).v) resultsDigest = resultsDigest * 131 + std::bit_cast<uint32_t>(score);
+      }
+      req->done();
+      if (!ok) {
+        state.SkipWithError(error.c_str());
+        return;
+      }
+      int32_t hits = 0;
+      for (const auto& id : ids) hits += std::ranges::count(truth[(size_t)q], id) > 0 ? 1 : 0;
+      recallSum += (double)hits / (double)truth[(size_t)q].size();
     }
-    int32_t hits = 0;
-    for (const auto& id : ids) hits += std::ranges::count(truth[(size_t)q], id) > 0 ? 1 : 0;
-    recallSum += (double)hits / (double)truth[(size_t)q].size();
   }
+  statsGuard.reset();
 
   int32_t queryOrd = 0;
+  std::vector<double> latencies;
   for (auto _ : state) {
+    auto queryStart = std::chrono::steady_clock::now();
     auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v", queries[(size_t)queryOrd],
                                 k, nprobe, cand);
     req->execute(false);
@@ -1250,10 +1277,23 @@ void BM_VectorAnnDataset(benchmark::State& state) {
     }
     queryOrd = (queryOrd + 1) % ds->nQueries;
     benchmark::DoNotOptimize(ids);
+    latencies.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - queryStart).count());
   }
 
   state.SetLabel(benchCodecName(codec));
+  if (!latencies.empty()) {
+    std::ranges::sort(latencies);
+    state.counters["p50_us"] = latencies[latencies.size() / 2];
+    state.counters["p99_us"] = latencies[latencies.size() * 99 / 100];
+  }
+  double queryCount = (double)ds->nQueries;
+  state.counters["list_setups"] = stats.lists.load() / queryCount;
+  state.counters["one_bit_scores"] = stats.oneBitScores.load() / queryCount;
+  state.counters["terminal_reads"] = stats.terminalReads.load() / queryCount;
+  state.counters["results_digest"] = (double)(resultsDigest & (((uint64_t)1 << 48) - 1));
   state.counters["recall"] = recallSum / (double)ds->nQueries;
+  state.counters["unsupported_floors"] = (double)stats.unsupportedFloors.load();
+  state.counters["unsupported_floor_shortfall"] = (double)stats.unsupportedFloorShortfall.load();
   state.counters["buildSecs"] = buildSecs;
   state.counters["bytesPerVec"] = overlayBytes / (double)ds->nBase;
   state.counters["overlaySegs"] = (double)overlaySegments;
@@ -1276,6 +1316,7 @@ static void datasetSweep(benchmark::Benchmark* b, int64_t codec) {
 TUNING_BENCHMARK(BM_VectorAnnDataset)->ArgNames({"codec", "nprobe", "cand"})
     ->Apply([](benchmark::Benchmark* b) {
       datasetSweep(b, RABITQ1);
+      b->Args({RABITQ1, 1 << 30, 0}); // nprobe beyond any nlist: a full scan.
       datasetSweep(b, RABITQ2);
       datasetSweep(b, RABITQ4);
       datasetSweep(b, PQ);

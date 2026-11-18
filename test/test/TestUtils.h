@@ -19,7 +19,7 @@ namespace luxir::test {
 
 inline void writeUnversionedRuns(PostingsWriter& writer) {
   PostingsWriter::VersionRunsWriter versions(writer);
-  if (writer.getMaxDoc() > 0) versions.add(0, 0);
+  if (writer.getMaxDoc(SpaceOrdinal::ROOT) > 0) versions.add(0, 0);
   versions.finish();
 }
 

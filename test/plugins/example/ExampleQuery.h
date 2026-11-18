@@ -6,6 +6,7 @@
 #include "luxir/query/ParseContext.h"
 #include "luxir/query/PluginQueryBase.h"
 #include "luxir/query/QueryRegistry.h"
+#include "luxir/query/QueryShape.h"
 #include "luxir/query/TermQuery.h"
 
 namespace example {
@@ -59,6 +60,10 @@ public:
     : PluginQueryBase(ctx), term(ById ? "id" : "cat_s", value) {}
 
   bool recoverableAsPredicate() const noexcept override { return true; }
+
+  bool logicalConsumesDomain() const override {
+    return luxir::logicalConsumesDomain(term);
+  }
 
   luxir::Query::Weight* createWeight(Context& context, int32_t flags,
                                     float multiplier = 1.0f) override {

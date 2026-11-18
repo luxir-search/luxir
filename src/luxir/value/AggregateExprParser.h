@@ -33,6 +33,7 @@ struct AggregateExprOptions {
   int* nestingBudget = nullptr;
   FieldResolver* fieldResolver = nullptr;
   bool shareProducers = true;
+  ParseView* view = nullptr;
 };
 
 class AggregateExprParser {
@@ -158,6 +159,28 @@ private:
               ? ValueType::DOUBLE : ValueType::INT64,
           child.nature};
     }
+    auto natureConversions = function.natureConversions({args.data(), children.size()});
+    for (size_t i = 0; i < children.size(); i++) {
+      if (!natureConversions[i]) continue;
+      AggregateNode child = program->nodes[children[i]];
+      if (valueDecimal(child.nature)) {
+        AggregateNode scale;
+        scale.intValue = valueDecimalScale(child.nature);
+        uint32_t scaleIndex = program->addNode(scale);
+        AggregateNode decode;
+        decode.kind = AggregateNodeKind::FUNCTION;
+        decode.type = BucketValueType::DOUBLE;
+        decode.children = {children[i], scaleIndex};
+        decode.childCount = 2;
+        decode.function = ValueFunctionRegistry::decimalDecoder();
+        children[i] = program->addNode(decode);
+      } else {
+        child.nature = ValueNature::NUMBER;
+        children[i] = program->addNode(child);
+      }
+      args[i] = {program->nodes[children[i]].type == BucketValueType::DOUBLE ? ValueType::DOUBLE : ValueType::INT64,
+                 ValueNature::NUMBER};
+    }
     auto conversions = function.dateConversionOperands(
         std::span<const ResolvedValue>(args.data(), children.size()));
     for (size_t convert = 0; convert < children.size(); convert++) {
@@ -199,6 +222,10 @@ private:
     size_t pos = cur->position();
     std::string_view name = value::lex::scanVariable(*cur);
     if (name.empty()) fail(pos, "'$' must be followed by a variable name");
+    return parseVariableNamed(name, pos);
+  }
+
+  uint32_t parseVariableNamed(std::string_view name, size_t pos) {
     const auto* view = opts.vars.find(name);
     if (view == nullptr) fail(pos, fmt::format("undefined variable ${}", name));
 
@@ -240,8 +267,9 @@ private:
           if (argument == 0) {
             argumentStart = cur->position();
             ValueExprOptions valueOptions{opts.schema, opts.vars, budget, false, opts.fieldResolver, opts.opName};
+            valueOptions.view = opts.view;
             try {
-              input = ValueExprParser(valueOptions, arena).parsePartial(*cur);
+              input = ValueExprParser(valueOptions, arena).parsePartial(*cur, function.natures);
             } catch (const std::runtime_error& error) {
               throw std::runtime_error(fmt::format(
                   "op '{}': {}", opts.opName, error.what()));
