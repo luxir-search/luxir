@@ -274,10 +274,11 @@ Search `freshness_ms` expresses how stale a reader may be; `0` requires the
 latest commit. The commit (or schema update) opens the new reader on the
 indexing side before it publishes the view, so searches start on it without
 reopening anything and the first search after a commit costs no more than
-the others. If that open fails (logged as a warning), the first search that
+the others. A collection with no search in the last minute skips that open,
+and if it fails (logged as a warning) the same applies: the first search that
 needs the view reopens it; meanwhile searches the previous reader still
-satisfies keep using it, and those that require the new view wait, counted in
-`service.reader_wait`. Decide these together:
+satisfies keep using it, and those that require the new view (by freshness, or
+after a schema change) wait, counted in `service.reader_wait`. Decide these together:
 
 - Interactive writes that must be read immediately should use an immediate
   commit.

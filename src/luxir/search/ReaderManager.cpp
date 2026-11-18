@@ -10,7 +10,8 @@
 namespace luxir {
 
 ReaderManager::ReaderManager(Directory& dir, FilterCacheConfig config)
-    : dir(dir), originalFilterCacheConfig(config), filterCache(std::make_shared<FilterCache>(config)) {}
+    : dir(dir), lastSearchUs(steadyUs()), originalFilterCacheConfig(config),
+      filterCache(std::make_shared<FilterCache>(config)) {}
 
 void ReaderManager::throwClosed() {
   throw ApiError(ErrorKind::UNAVAILABLE, "reader_closed", "reader manager is closed");
@@ -18,10 +19,11 @@ void ReaderManager::throwClosed() {
 
 std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot, Directory& source) {
   MetricWork metric(*metrics, MetricStage::READER_REFRESH);
-  Signal::emit("indexReaderPreparing", this);
-  std::lock_guard lock(indexReaderMutex);
   checkOpen();
-  auto previous = indexReader.load();
+  // No lock: searches and a search-side reopen proceed while this opens. The
+  // previous reader only lends its segments; publish() swaps under the lock.
+  auto previous = indexReader.load(std::memory_order_acquire);
+  Signal::emit("indexReaderPreparing", this);
   return std::make_shared<IndexReader>(source, snapshot, previous.get(), filterCache);
 }
 
@@ -76,19 +78,22 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
     return publishedSchemaGen.load(std::memory_order_relaxed) > reader.schema()->gen_;
   };
 
+  // Mark the collection searched, writing the shared line at most once per
+  // SEARCH_MARK_US.
+  auto nowSteady = steadyUs();
+  if (auto last = lastSearchUs.load(std::memory_order_relaxed); nowSteady >= last + SEARCH_MARK_US)
+    lastSearchUs.store(nowSteady, std::memory_order_relaxed);
+
   // Fast path, no lock. Publication opens the reader before it advertises the
   // snapshot, so this normally holds right after every commit.
   auto reader = indexReader.load(std::memory_order_acquire);
   if (reader && !stale(*reader) && !schemaChanged(*reader)) return reader;
 
-  // The publication-time open was skipped (a writer reopening an existing
-  // index) or failed. One thread reopens. While it does, a request the
-  // published reader still satisfies (within its freshness, only the schema
-  // lags) takes that reader instead of parking its thread; the rest wait, and
-  // are counted.
+  // The publication-time open was skipped (an idle collection, a writer
+  // reopening an existing index) or failed. One thread reopens; the others
+  // need the new snapshot (freshness or schema), so they wait, and are counted.
   std::unique_lock readerLock(indexReaderMutex, std::try_to_lock);
   if (!readerLock.owns_lock()) {
-    if (reader && !stale(*reader)) return reader;
     MetricWork wait(*metrics, MetricStage::READER_WAIT);
     readerLock.lock();
   }

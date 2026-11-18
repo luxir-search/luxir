@@ -36,8 +36,9 @@ message SearchRequest {
   // freshness_ms=0 search is guaranteed to see it.
   // Commits open their reader before the commit is advertised, so the current
   // reader is normally the latest. A positive value lets the search keep a
-  // reader up to this stale when it lags (its open at commit failed) instead
-  // of reopening it or waiting for another search's reopen. It is a
+  // reader up to this stale when it lags (the collection was idle, or its open
+  // at commit failed) instead of reopening it or waiting for another search's
+  // reopen. A schema change always requires the new reader. It is a
   // tolerance, not a latency bound: there is no guaranteed time from ingest to
   // visibility.
   uint64 freshness_ms = 4;
