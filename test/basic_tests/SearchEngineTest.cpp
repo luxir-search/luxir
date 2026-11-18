@@ -550,6 +550,7 @@ struct WholeCountRun {
   int64_t weightSkips = 0;
   int64_t contextsCreated = 0;
   int64_t contextsOmitted = 0;
+  int64_t cardinalityCounts = 0;
 };
 
 using WholeCountQueryBuilder =
@@ -590,6 +591,7 @@ WholeCountRun runWholeCount(
     SkipStats::cacheFirstMembershipWeightSkips,
     SkipStats::queryContextsCreated,
     SkipStats::cacheFirstQueryContextsOmitted,
+    SkipStats::wholeMembershipCardinalityCounts,
   };
 }
 
@@ -652,6 +654,8 @@ struct WholeTopKRun {
   int64_t cacheFirstRankingWeights = 0;
   int64_t contextsCreated = 0;
   int64_t contextsOmitted = 0;
+  int64_t localProductions = 0;
+  int64_t cardinalityCounts = 0;
 };
 
 WholeTopKRun runWholeTopK(
@@ -689,6 +693,8 @@ WholeTopKRun runWholeTopK(
     SkipStats::cacheFirstTopKRankingWeights,
     SkipStats::queryContextsCreated,
     SkipStats::cacheFirstQueryContextsOmitted,
+    SkipStats::wholeTopKCountLocalProductions,
+    SkipStats::wholeMembershipCardinalityCounts,
   };
 }
 
@@ -2350,7 +2356,8 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
       });
   EXPECT_EQ(8, fallback.found);
   EXPECT_EQ(1, fallback.bypasses);
-  EXPECT_EQ(1, fallback.fallbackSuppliers);
+  EXPECT_EQ(0, fallback.fallbackSuppliers);
+  EXPECT_EQ(1, fallback.cardinalityCounts);
   EXPECT_EQ(0, fallback.builds + fallback.hits);
   EXPECT_EQ(thrashSkips + 1, cache->counters().populationDeferred);
 }
@@ -2465,6 +2472,7 @@ TEST_F(SearchEngineTest, wholeTopKCountFamiliesMatchCacheOffAtAllDepths) {
     expectSameWholeTopK(offA, build);
     expectSameWholeTopK(offA, hit);
     EXPECT_EQ(1, bypass.bypasses);
+    EXPECT_EQ(0, bypass.localProductions + offA.localProductions);
     EXPECT_EQ(1, bypass.fallbackSuppliers);
     EXPECT_EQ(1, bypass.contextsCreated);
     EXPECT_EQ(0, bypass.contextsOmitted);
@@ -2674,6 +2682,113 @@ TEST_F(SearchEngineTest, wholeTopKCountHandlesEmptyAndNonemptySegments) {
   EXPECT_EQ(0, hit.constants);
 }
 
+TEST_F(SearchEngineTest, priorCardinalityKeepsCountsAndScoreBitsAtEveryRankingDepth) {
+  constexpr std::string_view collection = "whole_cardinality";
+  CollectionHelper helper(collection);
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
+      .minSegmentDocs = 0, .maxMetadataBytes = 64 * 1024});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  std::vector<Doc> docs;
+  for (int doc = 0; doc < 256; doc++) {
+    docs.push_back(flatdoc("id", std::to_string(doc), "body_w",
+        doc % 3 ? "carda" : doc % 2 ? "carda cardb" : "carda cardb cardb"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  for (bool constant : {false, true}) for (int64_t depth : {0, 10, 1000}) {
+    SCOPED_TRACE(::testing::Message() << constant << '/' << depth);
+    auto count = [&]() {
+      return runWholeCount(helper.getSearchEngine(), collection, [&](auto& mr) {
+        return wholeTopKQuery(mr, WholeTopKFamily::INTERSECTION, "card", constant);
+      });
+    };
+    auto ranked = [&]() {
+      return runWholeTopK(helper.getSearchEngine(), collection, WholeTopKFamily::INTERSECTION, "card", depth, constant);
+    };
+    cache->resize(0);
+    auto offCount = count();
+    auto offRanked = depth ? ranked() : WholeTopKRun{};
+    cache->resize(1024 * 1024); cache->resetAdmission();
+    if (depth) { ranked(); EXPECT_EQ(1, ranked().builds); }
+    else { count(); EXPECT_EQ(1, count().builds); }
+    evictFilterValues(*cache);
+    auto before = cache->counters();
+    if (depth) {
+      auto result = ranked();
+      expectSameWholeTopK(offRanked, result);
+      expectBitIdenticalScoreMap(offRanked.scores, result.scores);
+      EXPECT_EQ(1, result.cardinalityCounts);
+      EXPECT_EQ(1, result.bypasses);
+      EXPECT_EQ(0, result.localProductions + result.fallbackSuppliers + result.hits + result.builds);
+    } else {
+      auto result = count();
+      EXPECT_EQ(offCount.found, result.found);
+      EXPECT_EQ(1, result.cardinalityCounts);
+      EXPECT_EQ(1, result.bypasses);
+      EXPECT_EQ(0, result.fallbackSuppliers + result.hits + result.builds);
+    }
+    auto after = cache->counters();
+    EXPECT_EQ(before.builds, after.builds);
+    EXPECT_EQ(before.hits, after.hits);
+    EXPECT_EQ(before.assumedCredits, after.assumedCredits);
+    EXPECT_EQ(before.assumedCharges + 1, after.assumedCharges);
+    EXPECT_EQ(before.outstandingDebtNanos, after.outstandingDebtNanos);
+    EXPECT_EQ(0u, after.residentBytes);
+  }
+}
+
+TEST_F(SearchEngineTest, localWholeMembershipCombinesHitsBypassAndAnEmptySegment) {
+  CollectionHelper helper("local_whole_segments");
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
+      .minSegmentDocs = 0, .admissionThreshold = 1, .maxMetadataBytes = 64 * 1024});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  for (int segment = 0; segment < 4; segment++) {
+    std::vector<Doc> docs;
+    for (int doc = 0; doc < 128; doc++) {
+      docs.push_back(flatdoc("id", std::to_string(segment) + "_" + std::to_string(doc),
+          "body_w", segment == 3 ? "other" : doc % 2 ? "mixsega" : "mixsega mixsegb"));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteById("2_0", UpdateMessage::COMMIT).success);
+  SearchOverridesGuard local(QueryPrep::disableWholeMembershipBypassReuseForTests);
+  QueryPrep::disableWholeMembershipBypassReuseForTests = true;
+  cache->resize(0);
+  auto off = runWholeTopK(helper.getSearchEngine(), "local_whole_segments",
+      WholeTopKFamily::INTERSECTION, "mixseg", 10);
+  cache->resize(1024 * 1024); cache->resetAdmission();
+  QueryPrep::disableWholeMembershipBypassReuseForTests = false;
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(4u, reader->segments().size());
+  TermQuery a("body_w", "mixsega"), b("body_w", "mixsegb");
+  std::array<Query*, 2> required{&a, &b};
+  BooleanQuery query(required, {}, {}, {});
+  auto seed = [&](std::initializer_list<size_t> ords) {
+    MemPool pool;
+    Query::Context context(pool, *reader, {}, nullptr,
+        FilterKeyContext{.schemaGen = reader->schema()->gen_, .timeZone = {}});
+    auto* weight = query.createWeight(context, 0);
+    auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
+    for (size_t ord : ords) {
+      auto claim = use->probe(ord);
+      ASSERT_EQ(FilterCache::Probe::Kind::BUILD, claim.kind());
+      use->publishRaw(ord, claim,
+          QueryPrep::materializeRawFilter(*weight, nullptr, reader->segments()[ord]), 1'000'000);
+    }
+  };
+  seed({1, 2});
+  evictFilterValues(*cache);
+  seed({0, 3});
+  auto mixed = runWholeTopK(helper.getSearchEngine(), "local_whole_segments",
+      WholeTopKFamily::INTERSECTION, "mixseg", 10);
+  expectSameWholeTopK(off, mixed);
+  EXPECT_EQ(191, mixed.found);
+  EXPECT_EQ(2, mixed.hits);
+  EXPECT_EQ(2, mixed.bypasses);
+  EXPECT_EQ(1, mixed.cardinalityCounts);
+  EXPECT_EQ(1, mixed.localProductions);
+  EXPECT_EQ(0, mixed.builds + mixed.fallbackSuppliers);
+}
+
 TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
   constexpr std::string_view collection = "whole_topk_count_backoff";
   CollectionHelper helper(collection);
@@ -2716,7 +2831,9 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
       "s3back", 10);
   EXPECT_EQ(16, fallback.found);
   EXPECT_EQ(1, fallback.bypasses);
-  EXPECT_EQ(1, fallback.fallbackSuppliers);
+  EXPECT_EQ(0, fallback.localProductions);
+  EXPECT_EQ(1, fallback.cardinalityCounts);
+  EXPECT_EQ(0, fallback.fallbackSuppliers);
   EXPECT_EQ(0, fallback.builds + fallback.hits);
   EXPECT_EQ(thrashSkips + 1, cache->counters().populationDeferred);
 }

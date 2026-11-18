@@ -170,9 +170,10 @@ void FilterCache::Probe::releaseClaims() {
 FilterCache::Probe::Probe(Probe&& other) noexcept
   : slot(std::move(other.slot)), value(std::move(other.value)),
     requestValue(other.requestValue), requestUse(other.requestUse),
-    requestSegmentOrd(other.requestSegmentOrd), kind_(other.kind_),
-    ownsClaim(other.ownsClaim), ownsRequestClaim(other.ownsRequestClaim) {
+    requestSegmentOrd(other.requestSegmentOrd), producedCardinality(other.producedCardinality),
+    kind_(other.kind_), ownsClaim(other.ownsClaim), ownsRequestClaim(other.ownsRequestClaim) {
   other.kind_ = Kind::BYPASS;
+  other.producedCardinality = -1;
   other.requestValue = nullptr;
   other.requestUse = nullptr;
   other.ownsClaim = false;
@@ -188,9 +189,11 @@ FilterCache::Probe& FilterCache::Probe::operator=(Probe&& other) noexcept {
   requestUse = other.requestUse;
   requestSegmentOrd = other.requestSegmentOrd;
   kind_ = other.kind_;
+  producedCardinality = other.producedCardinality;
   ownsClaim = other.ownsClaim;
   ownsRequestClaim = other.ownsRequestClaim;
   other.kind_ = Kind::BYPASS;
+  other.producedCardinality = -1;
   other.requestValue = nullptr;
   other.requestUse = nullptr;
   other.ownsClaim = false;
@@ -572,8 +575,13 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Work work) {
   }
 
   auto bypass = [&] {
-    return Probe(Probe::Kind::BYPASS, nullptr, nullptr, false, nullptr,
-                 this, segmentOrd, true);
+    auto result = Probe(Probe::Kind::BYPASS, nullptr, nullptr, false, nullptr,
+                        this, segmentOrd, true);
+    if (segmentOrd < slotsByOrd.size() && slotsByOrd[segmentOrd] != nullptr) {
+      result.producedCardinality = slotsByOrd[segmentOrd]->ledger.rawCardinality.load(
+          std::memory_order_relaxed);
+    }
+    return result;
   };
   // The request slot pins the value for the life of this Use, so a HIT probe
   // borrows the raw pointer and holds no shared_ptr of its own: every
@@ -1793,6 +1801,7 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
     std::lock_guard<SegmentSlot> ledgerLock(*slot);
     if (use.entry->resident && slot->active.load(std::memory_order_acquire)) {
       slot->ledger.production(buildCostNanos, local->ramBytesUsed(), claimed && !byproduct);
+      slot->ledger.rawCardinality.store(local->card(), std::memory_order_relaxed);
     }
     auto current = slot->value.load(std::memory_order_acquire);
     if (current != nullptr) {
@@ -2453,6 +2462,7 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
       value.servedNanos = ledger.served.nanos;
       value.servedCount = ledger.served.count;
       value.referenceBytes = ledger.referenceBytes;
+      value.rawCardinality = ledger.rawCardinality.load(std::memory_order_relaxed);
       value.recent = ledger.recent;
       value.recentEpochs = ledger.recentEpochs;
       value.work = ledger.work;

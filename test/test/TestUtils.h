@@ -84,11 +84,12 @@ inline int64_t countForTests(Query::Weight* weight, IndexReader::Segment& segmen
 inline QueryPrep::WholeMembershipResult resolveWholeMembershipForTests(
     const QueryPrep::WholeMembershipPlan& plan, IndexReader& reader,
     IndexReader::Segment& segment, DocSet* domain,
-    Query::Weight::PreparedWeight* prepared = nullptr) {
+    Query::Weight::PreparedWeight* prepared = nullptr,
+    int32_t localDensityInverse = 0, int32_t localMaxCandidatesPerMatch = 8) {
   auto guard = MemPool::threadLocalPoolGuard();
   return plan.resolve(reader, segment, domain, prepared, [&](Query::Weight& resolver) {
     return resolver.scorerSupplier(guard.pool(), segment);
-  });
+  }, localDensityInverse, localMaxCandidatesPerMatch);
 }
 
 inline std::span<const uint8_t> singlePhaseScorersForTests(

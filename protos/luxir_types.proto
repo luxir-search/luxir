@@ -2357,6 +2357,8 @@ message CacheValueDump {
   double residency_bytes = 19;
   double ranked_rate_us_per_epoch = 20;
   bool spoken_for = 21;
+  // Exact raw cardinality from a completed segment production, retained after eviction; absent when unknown.
+  optional uint32 raw_cardinality = 22;
 }
 
 // One cache key, with resident values or retained ledgers. key_text is the printable-byte extraction from

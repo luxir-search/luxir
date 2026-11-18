@@ -914,7 +914,10 @@ Search has its own limits:
   `recent_work_epochs`, `last_refresh_epoch` and `current_epoch`. Values also
   report `work_us`, `residency_bytes`, `ranked_rate_us_per_epoch` and `spoken_for`
   to inspect pending work and frozen victim prices. `include_ghosts` includes
-  retained ledgers without a payload.
+  retained ledgers without a payload. `raw_cardinality`, when known, is the
+  exact raw count from a completed segment production, including after eviction.
+  On a cache bypass, COUNT and TOP_K_COUNT can use it directly on segments without
+  deletes in the canonical query domain, avoiding count execution and materialization.
   A flush drops values and metadata, including ledgers, while keeping sightings,
   so a known query is readmitted immediately; unpriced uses rebuild immediately. Flush with
   `reset_admission` also forgets sightings and restarts admission tracking.

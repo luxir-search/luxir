@@ -537,6 +537,7 @@ A segment slot or whole-reader entry, including optional payload-free ledgers.
 | <a id="field-luxir.cachevaluedump.residency_bytes"></a>[`residency_bytes`](#field-luxir.cachevaluedump.residency_bytes) | 19 | `double` | singular |  |
 | <a id="field-luxir.cachevaluedump.ranked_rate_us_per_epoch"></a>[`ranked_rate_us_per_epoch`](#field-luxir.cachevaluedump.ranked_rate_us_per_epoch) | 20 | `double` | singular |  |
 | <a id="field-luxir.cachevaluedump.spoken_for"></a>[`spoken_for`](#field-luxir.cachevaluedump.spoken_for) | 21 | `bool` | singular |  |
+| <a id="field-luxir.cachevaluedump.raw_cardinality"></a>[`raw_cardinality`](#field-luxir.cachevaluedump.raw_cardinality) | 22 | `uint32` | optional | Exact raw cardinality from a completed segment production, retained after eviction; absent when unknown. |
 
 <a id="message-luxir.calendargap"></a>
 

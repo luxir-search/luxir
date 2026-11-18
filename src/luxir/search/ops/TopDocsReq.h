@@ -75,6 +75,7 @@ public:
   static constexpr int32_t kExactCountTopKMaxDepth = 100;
   static inline int32_t exactCountTopKMinCandidateDensityInverseForTests =
       kExactCountTopKMinCandidateDensityInverse;
+  static inline int32_t localWholeMembershipMaxCandidatesPerMatchForTests = 8;
   // A sparse filter that is cheaper than its union body makes the exhaustive
   // scored batch the natural single pass. Keep this knee separate from the
   // batch admission constant even though both measured at /44.
@@ -962,8 +963,8 @@ public:
         candidateCost = std::min<int64_t>(
             candidateCost, collectorFilter->card());
       }
-      if (candidateCost < std::max<int64_t>(
-              1, (int64_t) maxDoc / densityInverse)) {
+      if (!QueryPrep::exactCountTopKCandidateDensity(
+              candidateCost, maxDoc, densityInverse)) {
         return false;
       }
 
@@ -2074,7 +2075,16 @@ public:
                 [&](Query::Weight& resolver) {
                   return &resolver == op.weight ? obtainMainSupplier()
                       : resolver.scorerSupplier(poolGuard.pool(), seg);
-                });
+                }, op.requirements.countLimit < 0
+                        && op.topCount <= kExactCountTopKMaxDepth
+                        && op.weight != nullptr && !op.weight->needsPrepare()
+                        && !op.weight->consumesDomain() && !op.weight->isConstantScoring()
+                        && !op.weight->canComposeExactCountTopK()
+                        && op.wholeRankingWeight != nullptr
+                        && op.wholeRankingWeight->allowsPruning()
+                    ? exactCountTopKMinCandidateDensityInverseForTests : 0,
+                localWholeMembershipMaxCandidatesPerMatchForTests,
+                &op.req.memoryTracker);
           }
           bool wholeMembershipAvailable = wholeMembershipResult.available;
           bool wholeTopKCountAvailable = wholeMembershipAvailable

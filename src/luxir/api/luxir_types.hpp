@@ -810,6 +810,7 @@ struct CacheValueDump {
   uint64_t reader_version = 0;
   uint64_t reference_bytes = 0;
   std::string_view production_source;
+  std::optional<uint32_t> raw_cardinality;
   double owed_us = 0;
   double debt_us = 0;
   double credited_us = 0;

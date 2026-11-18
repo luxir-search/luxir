@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <bit>
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -253,6 +254,131 @@ TEST_F(JoinCacheTest, requiredConstantsShareOwnerMembershipAndKeepTheirScores) {
       }
     }
   }
+}
+
+TEST_F(JoinCacheTest, exactLocalMembershipKeepsScoresAndResidentOwnerSources) {
+  cache = std::make_shared<FilterCache>(FilterCacheConfig{.maxBytes = 1024 * 1024,
+      .minSegmentDocs = 0, .admissionThreshold = 2, .maxMetadataBytes = 256 * 1024});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  indexRangeOwners();
+  SearchOverridesGuard local(QueryPrep::disableWholeMembershipBypassReuseForTests);
+  for (bool deleted : {false, true}) {
+    if (deleted) { ASSERT_TRUE(helper.deleteById("r0", UpdateMessage::COMMIT).success); }
+    for (bool required : {false, true}) for (int variant = 0; variant < 5; variant++) {
+      SCOPED_TRACE(required);
+      SCOPED_TRACE(variant);
+      auto wire = localReq(helper.getSearchEngine());
+      auto join = qb::toParent(wire->mr, "rows_nested",
+          qb::range(wire->mr, "value_i", qb::valI64(wire->mr, 1), nullptr,
+              qb::valI64(wire->mr, 2), nullptr), variant == 3 ? "none" : "max");
+      if (variant == 1) join = qb::boost(wire->mr, join, 2.5f);
+      if (variant == 2) join = qb::constantScore(wire->mr, join, 3.25f);
+      auto run = [&]() {
+        auto req = localReq(helper.getSearchEngine());
+        auto term = qb::match(req->mr, "tag_w", "common");
+        auto& top = req->topDocs().countLimit().getScores().fields({"id"}).limit(10);
+        if (variant == 4) {
+          top.rawQuery() = required ? qb::boolean(req->mr, {term, join, join})
+              : qb::boolean(req->mr, {term}, {}, {}, {join, join});
+        } else {
+          top.rawQuery() = required ? qb::boolean(req->mr, {term, join})
+              : qb::boolean(req->mr, {term}, {}, {}, {join});
+        }
+        req->execute(1); EXPECT_OK(req);
+        EXPECT_EQ(64, req->getMatchCount());
+        std::vector<std::pair<std::string, uint32_t>> result;
+        auto* docs = req->docList();
+        auto ids = std::get<api::ColStr>(docs->columns.at("id").kind).v;
+        auto scores = std::get<api::ColFloat>(docs->columns.at("_score_").kind).v;
+        for (size_t i = 0; i < ids.size(); i++) result.emplace_back(ids[i], std::bit_cast<uint32_t>(scores[i]));
+        return result;
+      };
+      cache->resize(0);
+      QueryPrep::disableWholeMembershipBypassReuseForTests = true;
+      auto off = run();
+      QueryPrep::disableWholeMembershipBypassReuseForTests = false;
+      {
+        SkipStatsScope stats;
+        EXPECT_EQ(off, run());
+        EXPECT_EQ(0, SkipStats::wholeTopKCountLocalProductions);
+      }
+      cache->resize(1024 * 1024); cache->resetAdmission();
+      publishSource(join);
+      {
+        SkipStatsScope stats;
+        auto before = cache->counters();
+        EXPECT_EQ(off, run());
+        EXPECT_EQ(0, SkipStats::wholeTopKCountLocalProductions);
+        EXPECT_EQ(1, SkipStats::wholeTopKCountFallbackSuppliers);
+        EXPECT_EQ(0, SkipStats::joinChildSuppliers);
+        EXPECT_EQ(before.builds, cache->counters().builds);
+      }
+      bool ownerSample = false;
+      for (const auto& entry : cache->dump(100, nullptr, true)) for (const auto& value : entry.values) {
+        ownerSample |= value.resident && value.space == SpaceOrdinal::ROOT && value.servedCount > 0;
+      }
+      EXPECT_TRUE(ownerSample);
+      {
+        SkipStatsScope stats;
+        EXPECT_EQ(off, run());
+        EXPECT_EQ(1, SkipStats::wholeTopKCountBuilds);
+        EXPECT_EQ(0, SkipStats::wholeTopKCountLocalProductions);
+        EXPECT_EQ(0, SkipStats::joinChildSuppliers);
+      }
+      cache->resize(1); cache->sweep(); cache->resize(1024 * 1024);
+      publishSource(join);
+      {
+        SkipStatsScope stats;
+        auto before = cache->counters();
+        EXPECT_EQ(off, run());
+        EXPECT_EQ(deleted ? 1 : 0, SkipStats::wholeTopKCountLocalProductions);
+        EXPECT_EQ(deleted ? 0 : 1, SkipStats::wholeMembershipCardinalityCounts);
+        EXPECT_EQ(0, SkipStats::joinChildSuppliers);
+        EXPECT_EQ(before.builds, cache->counters().builds);
+      }
+      {
+        SkipStatsScope stats;
+        EXPECT_EQ(off, run());
+        EXPECT_EQ(1, SkipStats::wholeTopKCountBuilds);
+      }
+      {
+        SkipStatsScope stats;
+        EXPECT_EQ(off, run());
+        EXPECT_EQ(1, SkipStats::wholeTopKCountHits);
+        EXPECT_EQ(0, SkipStats::joinChildSuppliers);
+      }
+    }
+  }
+}
+
+TEST_F(JoinCacheTest, localWholeMembershipScreensBeforeConstructingTheRawSupplier) {
+  cache = std::make_shared<FilterCache>(FilterCacheConfig{.maxBytes = 1024 * 1024,
+      .minSegmentDocs = 0, .admissionThreshold = 2, .maxMetadataBytes = 256 * 1024});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  indexRangeOwners();
+  ASSERT_TRUE(helper.deleteById("r0", UpdateMessage::COMMIT).success);
+  auto wireReq = localReq(helper.getSearchEngine());
+  auto join = qb::toParent(wireReq->mr, "rows_nested", qb::range(wireReq->mr, "value_i",
+      qb::valI64(wireReq->mr, 1), nullptr, qb::valI64(wireReq->mr, 2), nullptr), "none");
+  auto wire = qb::boolean(wireReq->mr, {qb::match(wireReq->mr, "tag_w", "common"), join});
+  publishSource(wire);
+  cache->resize(1); cache->sweep(); cache->resize(1024 * 1024);
+  auto req = localReq(helper.getSearchEngine());
+  auto* query = parseQuery(*req, wire);
+  auto* context = Query::Context::create(&req->arena, *req->createPlanningContext(*req->reader));
+  auto* weight = query->createWeight(*context, 0);
+  auto* use = context->getFilterUse(*query, FilterCache::AdmissionLane::WHOLE);
+  QueryPrep::WholeMembershipPlan plan(*weight, use, context->filterUses,
+      PreparedDomainDependence::QUERY_CANONICAL, QueryPrep::WholeMembershipConsumer::TOP_K_COUNT);
+  SkipStatsScope stats;
+  EXPECT_FALSE(resolveWholeMembershipForTests(plan, *req->reader, req->reader->segments()[0], nullptr, nullptr, 1).available);
+  EXPECT_FALSE(resolveWholeMembershipForTests(plan, *req->reader, req->reader->segments()[0], nullptr, nullptr, 128, 1).available);
+  EXPECT_EQ(0, SkipStats::joinChildSuppliers);
+  auto result = resolveWholeMembershipForTests(plan, *req->reader, req->reader->segments()[0], nullptr, nullptr, 128);
+  ASSERT_TRUE(result.available);
+  EXPECT_EQ(64, result.count);
+  EXPECT_EQ(1, SkipStats::joinChildSuppliers);
+  EXPECT_EQ(1, SkipStats::wholeTopKCountLocalProductions);
 }
 
 TEST_F(JoinCacheTest, residentConstantKeepsBoundsWithSeveralScoringClauses) {

@@ -495,6 +495,7 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
         values[v].seg_id = value.segId;
         values[v].space = (uint32_t)value.space;
         values[v].max_doc = value.maxDoc;
+        if (value.rawCardinality >= 0) values[v].raw_cardinality = (uint32_t)value.rawCardinality;
         values[v].reader_version = value.readerVersion;
         values[v].resident = value.resident;
         values[v].owed_us = value.owed / 1000;

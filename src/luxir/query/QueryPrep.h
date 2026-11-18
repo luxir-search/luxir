@@ -20,6 +20,7 @@ namespace luxir::QueryPrep {
 
 inline bool disableDirectPostingsMaterializationForTests = false;
 inline bool disableWholeMembershipPlanForTests = false;
+inline bool disableWholeMembershipBypassReuseForTests = false;
 inline bool disableProhibitedCacheForTests = false;
 inline bool disableProhibitedDomainFoldForTests = false;
 // A/B toggle: restore request-local sparse batch materialization on cache
@@ -44,6 +45,12 @@ inline std::optional<int64_t> resolveCount(
   if (shortcut.how == Query::CountHow::ITERATE || shortcut.how > through) return std::nullopt;
   assert(shortcut.resolver != nullptr);
   return supplierCount(supplierFor(*shortcut.resolver));
+}
+
+inline bool exactCountTopKCandidateDensity(
+    int64_t candidates, int32_t maxDoc, int32_t densityInverse) {
+  return densityInverse > 0
+      && candidates >= std::max<int64_t>(1, (int64_t)maxDoc / densityInverse);
 }
 
 inline uint64_t elapsedBuildNanos(
@@ -1047,7 +1054,9 @@ public:
   WholeMembershipResult resolve(
       IndexReader& reader, IndexReader::Segment& segment,
       DocSet* incomingDomain, Query::Weight::PreparedWeight* prepared,
-      SupplierFor&& supplierFor) const {
+      SupplierFor&& supplierFor, int32_t localDensityInverse = 0,
+      int32_t localMaxCandidatesPerMatch = 0,
+      RequestMemTracker* localMemory = nullptr) const {
     if (source == Source::EMPTY) return {};
     if (source == Source::ACCEPTED_EXISTING) {
       DomainHandle docs = cacheUse->effectiveDomain(
@@ -1109,7 +1118,6 @@ public:
       return {};
     }
     if (cacheUse == nullptr) return {};
-
     auto probe = cacheUse->probe((size_t) segment.ord);
     if (probe.kind() == FilterCache::Probe::Kind::HIT) {
       DomainHandle docs = cacheUse->effectiveDomain(
@@ -1120,22 +1128,51 @@ public:
       int64_t card = docs.get()->card();
       return {true, std::move(docs), card};
     }
-    if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+    auto cardinality = probe.priorCardinality();
+    bool canonical = !weight->needsPrepare() && !weight->consumesDomain()
+        && domainDependence == PreparedDomainDependence::QUERY_CANONICAL
+        && (incomingDomain == nullptr || incomingDomain == segment.liveDocSet());
+    bool reuse = !disableWholeMembershipBypassReuseForTests && canonical && cardinality;
+    bool build = probe.kind() == FilterCache::Probe::Kind::BUILD;
+    if (!build) {
+      record(SkipStats::wholeCountBypasses,
+             SkipStats::wholeTopKCountBypasses,
+             SkipStats::wholeFieldSortBypasses);
+      if (reuse && !isFieldSort() && !segment.hasDeletes()) {
+        skipCount(SkipStats::wholeMembershipCardinalityCounts);
+        return {true, {}, *cardinality};
+      }
+    }
+    bool local = reuse && isTopKCount() && exactCountTopKCandidateDensity(
+            *cardinality, segment.maxDoc(), localDensityInverse)
+        && localMaxCandidatesPerMatch > 0
+        && (int64_t)*cardinality * localMaxCandidatesPerMatch >= shortcut.maxMatches;
+    if (build || (local && !cacheZero)) {
       if (domainDependence
           != PreparedDomainDependence::QUERY_CANONICAL) {
         throw std::logic_error(
             "whole membership publication requires a query-canonical source");
       }
-      auto buildStart = std::chrono::steady_clock::now();
+      if (!build && localMemory != nullptr) {
+        cacheUse->enableRoutedAccounting(
+            (size_t)segment.ord, *localMemory, "local query membership");
+      }
+      auto buildStart = build ? std::chrono::steady_clock::now()
+          : std::chrono::steady_clock::time_point{};
       auto raw = materializeRawFilter(*weight, prepared, segment);
-      uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
-      cacheUse->publishRaw(
-          (size_t) segment.ord, probe, std::move(raw), buildCostNanos);
-      DomainHandle docs = cacheUse->effectiveDomain(
-          (size_t) segment.ord, reader, incomingDomain).pinnedWith(lifetime);
+      DomainHandle docs;
+      if (build) {
+        cacheUse->publishRaw(
+            (size_t) segment.ord, probe, std::move(raw), elapsedBuildNanos(buildStart));
+        record(SkipStats::wholeCountBuilds, SkipStats::wholeTopKCountBuilds,
+               SkipStats::wholeFieldSortBuilds);
+      } else {
+        skipCount(SkipStats::wholeTopKCountLocalProductions);
+        cacheUse->adoptOwnedRaw((size_t)segment.ord, probe, std::move(raw));
+      }
+      docs = cacheUse->effectiveDomain(
+          (size_t)segment.ord, reader, incomingDomain).pinnedWith(lifetime);
       if (docs.get() == nullptr) return {};
-      record(SkipStats::wholeCountBuilds, SkipStats::wholeTopKCountBuilds,
-             SkipStats::wholeFieldSortBuilds);
       int64_t card = docs.get()->card();
       return {
         true, std::move(docs), card
@@ -1144,9 +1181,6 @@ public:
 
     // Probe destruction releases RequestSlot::resolving before the caller
     // constructs and streams its ordinary fallback supplier.
-    record(SkipStats::wholeCountBypasses,
-           SkipStats::wholeTopKCountBypasses,
-           SkipStats::wholeFieldSortBypasses);
     if (cacheZero) {
       record(SkipStats::wholeCountConstant, SkipStats::wholeTopKCountConstant,
              SkipStats::wholeFieldSortConstant);

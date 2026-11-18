@@ -5022,6 +5022,307 @@ TEST(FilterCacheTest,
   EXPECT_EQ(1, retry.count);
 }
 
+TEST(FilterCacheTest, localWholeMembershipUsesAnEvictedProduction) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), config);
+  IndexWriter writer(snapshots, {}, nullptr);
+  for (auto text : {"alpha beta", "alpha", "alpha beta", "beta", "alpha beta"}) addTermDoc(writer, text);
+  addIdTermDoc(writer, "deleted", "other");
+  writer.commit();
+  auto& deletes = writer.obtainInverter();
+  deletes.deleteId("deleted", 1);
+  writer.releaseInverter(deletes);
+  writer.commit();
+  auto reader = snapshots.readers.getReader();
+  auto cache = snapshots.readers.filterCache;
+  TermQuery alpha("text_w", "alpha"), beta("text_w", "beta");
+  std::array<Query*, 2> required{&alpha, &beta};
+  BooleanQuery query(required, {}, {}, {});
+  {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
+    auto probe = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+    use->publishRaw(0, probe, QueryPrep::materializeRawFilter(
+        *query.createWeight(context, 0), nullptr, reader->segments()[0]), 1000);
+  }
+  evictValues(*cache);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
+  {
+    auto probe = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BYPASS, probe.kind());
+    EXPECT_EQ(3, probe.priorCardinality());
+    auto moved = std::move(probe);
+    FilterCache::Probe assigned;
+    assigned = std::move(moved);
+    EXPECT_EQ(3, assigned.priorCardinality());
+  }
+  QueryPrep::WholeMembershipPlan plan(*query.createWeight(context, 0), use, context.filterUses,
+      PreparedDomainDependence::QUERY_CANONICAL, QueryPrep::WholeMembershipConsumer::TOP_K_COUNT);
+  OwnedFilterStatsGuard stats;
+  auto before = cache->counters();
+  auto result = test::resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr, nullptr, 128);
+  ASSERT_TRUE(result.available);
+  EXPECT_EQ(3, result.count);
+  EXPECT_TRUE(result.docs.isDeliverable());
+  EXPECT_TRUE(result.docs.get()->get(2));
+  EXPECT_FALSE(result.docs.get()->get(1));
+  EXPECT_GT(use->ownedBytesForTest(), 0u);
+  auto again = test::resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr, nullptr, 128);
+  EXPECT_EQ(result.docs.get(), again.docs.get());
+  auto after = cache->counters();
+  EXPECT_EQ(before.buildAttempts, after.buildAttempts);
+  EXPECT_EQ(before.builds, after.builds);
+  EXPECT_EQ(before.hits, after.hits);
+  EXPECT_EQ(before.assumedCharges, after.assumedCharges);
+  EXPECT_EQ(before.assumedCredits, after.assumedCredits);
+  EXPECT_EQ(before.outstandingDebtNanos, after.outstandingDebtNanos);
+  EXPECT_EQ(before.byproductInserts, after.byproductInserts);
+  EXPECT_EQ(0u, after.residentBytes);
+  EXPECT_EQ(1, SkipStats::wholeTopKCountLocalProductions);
+}
+
+TEST(FilterCacheTest, priorCardinalityAnswersCountsWithoutMembershipOrSuppliers) {
+  auto config = testConfig(); config.admissionThreshold = 1;
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), config);
+  IndexWriter writer(snapshots, {}, nullptr);
+  for (auto text : {"alpha beta", "alpha", "alpha beta", "beta", "alpha beta"}) addTermDoc(writer, text);
+  writer.commit();
+  auto reader = snapshots.readers.getReader();
+  auto cache = snapshots.readers.filterCache;
+  auto& segment = reader->segments()[0];
+  TermQuery alpha("text_w", "alpha"), beta("text_w", "beta");
+  std::array<Query*, 2> required{&alpha, &beta};
+  BooleanQuery query(required, {}, {}, {});
+  {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
+    auto claim = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, claim.kind());
+    use->publishRaw(0, claim, QueryPrep::materializeRawFilter(
+        *query.createWeight(context, 0), nullptr, segment), 1000);
+  }
+  evictValues(*cache);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
+  { auto probe = use->probe(0); ASSERT_EQ(FilterCache::Probe::Kind::BYPASS, probe.kind()); }
+  auto before = cache->counters();
+  auto* weight = query.createWeight(context, 0);
+  OwnedFilterStatsGuard stats;
+  int32_t suppliers = 0;
+  auto supplierFor = [&](Query::Weight& source) {
+    suppliers++;
+    return source.scorerSupplier(pool, segment);
+  };
+  for (auto consumer : {QueryPrep::WholeMembershipConsumer::COUNT, QueryPrep::WholeMembershipConsumer::TOP_K_COUNT}) {
+    QueryPrep::WholeMembershipPlan plan(*weight, use, context.filterUses,
+        PreparedDomainDependence::QUERY_CANONICAL, consumer);
+    auto result = plan.resolve(*reader, segment, nullptr, nullptr, supplierFor);
+    ASSERT_TRUE(result.available);
+    EXPECT_EQ(3, result.count);
+    EXPECT_EQ(nullptr, result.docs.get());
+    EXPECT_EQ(nullptr, use->rawDocSet(0));
+    auto restricted = docs(segment.maxDoc(), {1, 2});
+    EXPECT_FALSE(plan.resolve(*reader, segment, restricted.get(), nullptr, supplierFor).available);
+    test::SearchOverridesGuard guard(QueryPrep::disableWholeMembershipBypassReuseForTests);
+    QueryPrep::disableWholeMembershipBypassReuseForTests = true;
+    EXPECT_FALSE(plan.resolve(*reader, segment, nullptr, nullptr, supplierFor).available);
+  }
+  QueryPrep::WholeMembershipPlan fieldSort(*weight, use, context.filterUses,
+      PreparedDomainDependence::QUERY_CANONICAL, QueryPrep::WholeMembershipConsumer::FIELD_SORT);
+  EXPECT_FALSE(fieldSort.resolve(*reader, segment, nullptr, nullptr, supplierFor).available);
+  ForcePrepareQuery forced(&query);
+  auto* preparedWeight = forced.createWeight(context, 0);
+  Query::Weight::PrepareContext prepareContext{*reader, {}, nullptr, nullptr};
+  auto prepared = preparedWeight->prepare(prepareContext);
+  QueryPrep::WholeMembershipPlan preparedPlan(*preparedWeight, use, context.filterUses);
+  EXPECT_FALSE(preparedPlan.resolve(*reader, segment, nullptr, prepared.get(), supplierFor).available);
+  EXPECT_EQ(0, suppliers);
+  EXPECT_EQ(2, SkipStats::wholeMembershipCardinalityCounts);
+  EXPECT_EQ(0, SkipStats::wholeTopKCountLocalProductions);
+  EXPECT_EQ(before, cache->counters());
+}
+
+TEST(FilterCacheTest, localWholeMembershipRequiresAPriorProduction) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), testConfig());
+  IndexWriter writer(snapshots, {}, nullptr);
+  for (auto text : {"alpha beta", "alpha", "beta"}) addTermDoc(writer, text);
+  writer.commit();
+  auto reader = snapshots.readers.getReader();
+  TermQuery alpha("text_w", "alpha"), beta("text_w", "beta");
+  std::array<Query*, 2> required{&alpha, &beta};
+  BooleanQuery query(required, {}, {}, {});
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
+  {
+    auto probe = use->probe(0);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, probe.kind());
+    EXPECT_FALSE(probe.priorCardinality());
+  }
+  auto* weight = query.createWeight(context, 0);
+  OwnedFilterStatsGuard stats;
+  for (auto* selected : {use, (FilterCache::Use*)nullptr}) {
+    QueryPrep::WholeMembershipPlan plan(*weight, selected, context.filterUses,
+        PreparedDomainDependence::QUERY_CANONICAL, QueryPrep::WholeMembershipConsumer::TOP_K_COUNT);
+    EXPECT_FALSE(test::resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr, nullptr, 128).available);
+  }
+  EXPECT_EQ(0, SkipStats::wholeTopKCountLocalProductions);
+}
+
+TEST(FilterCacheTest, localWholeMembershipScreensExactSizeAndYieldBoundaries) {
+  struct Case { int32_t matches; int32_t candidates; bool local; };
+  constexpr std::array cases{Case{39, 312, false}, Case{40, 320, true}, Case{40, 321, false}, Case{41, 320, true}};
+  auto config = testConfig(); config.admissionThreshold = 1;
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), config);
+  IndexWriter writer(snapshots, {}, nullptr);
+  for (int32_t doc = 0; doc < 5120; doc++) {
+    std::string text = "other";
+    for (size_t i = 0; i < cases.size(); i++) {
+      const auto& c = cases[i];
+      if (doc < c.candidates) text += " a" + std::to_string(i);
+      if (doc < c.matches || (doc >= c.candidates && doc < 2*c.candidates-c.matches)) text += " b" + std::to_string(i);
+    }
+    addTermDoc(writer, text);
+  }
+  addIdTermDoc(writer, "deleted", "other");
+  writer.commit();
+  auto& deletes = writer.obtainInverter();
+  deletes.deleteId("deleted", 1);
+  writer.releaseInverter(deletes);
+  writer.commit();
+  auto reader = snapshots.readers.getReader();
+  auto cache = snapshots.readers.filterCache;
+  auto& segment = reader->segments()[0];
+  for (size_t i = 0; i < cases.size(); i++) {
+    SCOPED_TRACE(i);
+    std::string aTerm = "a" + std::to_string(i), bTerm = "b" + std::to_string(i);
+    TermQuery a("text_w", aTerm), b("text_w", bTerm);
+    std::array<Query*, 2> required{&a, &b};
+    BooleanQuery query(required, {}, {}, {});
+    {
+      MemPool pool;
+      Query::Context context(pool, *reader);
+      auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
+      auto probe = use->probe(0);
+      ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+      use->publishRaw(0, probe, QueryPrep::materializeRawFilter(*query.createWeight(context, 0), nullptr, segment), 1000);
+    }
+    evictValues(*cache);
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* weight = query.createWeight(context, 0);
+    EXPECT_EQ(cases[i].candidates, weight->countShortcut(segment, nullptr).maxMatches);
+    auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
+    QueryPrep::WholeMembershipPlan plan(*weight, use, context.filterUses,
+        PreparedDomainDependence::QUERY_CANONICAL, QueryPrep::WholeMembershipConsumer::TOP_K_COUNT);
+    if (i == 1) {
+      auto restricted = docs(segment.maxDoc(), {0, 1});
+      EXPECT_FALSE(test::resolveWholeMembershipForTests(plan, *reader, segment, restricted.get(), nullptr, 128).available);
+      EXPECT_FALSE(test::resolveWholeMembershipForTests(plan, *reader, segment, nullptr, nullptr, 128, 7).available);
+      EXPECT_FALSE(test::resolveWholeMembershipForTests(plan, *reader, segment, nullptr, nullptr, 128, 0).available);
+      test::SearchOverridesGuard guard(QueryPrep::disableWholeMembershipBypassReuseForTests);
+      QueryPrep::disableWholeMembershipBypassReuseForTests = true;
+      EXPECT_FALSE(test::resolveWholeMembershipForTests(plan, *reader, segment, nullptr, nullptr, 128).available);
+    }
+    auto result = test::resolveWholeMembershipForTests(plan, *reader, segment, nullptr, nullptr, 128);
+    EXPECT_EQ(cases[i].local, result.available);
+    if (result.available) { EXPECT_EQ(cases[i].matches, result.count); }
+  }
+}
+
+TEST(FilterCacheTest, priorCardinalityIncludesByproductsAndRejectedPublications) {
+  for (int mode = 0; mode < 4; mode++) {
+    SCOPED_TRACE(mode);
+    auto config = testConfig(); config.admissionThreshold = 1;
+    FilterCache cache(config);
+    std::array segments{FilterCache::SegmentIdentity{41, 128}};
+    cache.onReaderPublished(1, segments);
+    FilterKey key("prior-cardinality");
+    int32_t count = mode == 2 ? 128 : mode == 3 ? 0 : 3;
+    {
+      FilterCache::UseRegistry request(cache, 1, segments);
+      auto* use = request.get(key);
+      auto probe = use->probe(0);
+      ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+      auto value = std::make_unique<RAMBitDocSet>(128);
+      for (int32_t doc = 0; doc < count; doc++) value->mutableBits().set(doc);
+      if (mode == 1 || mode == 3) use->publishRawByproduct(0, probe, std::move(value), 1000);
+      else use->publishRaw(0, probe, std::move(value), 1000);
+    }
+    evictValues(cache);
+    {
+      FilterCache::UseRegistry request(cache, 1, segments);
+      auto probe = request.get(key)->probe(0, FilterCache::Work::assumed().observedOnly());
+      EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, probe.kind());
+      EXPECT_EQ(count, probe.priorCardinality());
+      EXPECT_EQ(count, ledgerFor(cache, key).rawCardinality);
+      EXPECT_EQ(mode == 1 || mode == 3 ? 0u : 1000u, cache.counters().outstandingDebtNanos);
+    }
+    cache.clear();
+    FilterCache::UseRegistry request(cache, 1, segments);
+    EXPECT_FALSE(request.get(key)->probe(0, FilterCache::Work::assumed().observedOnly()).priorCardinality());
+  }
+}
+
+TEST(FilterCacheTest, failedLocalWholeProductionReleasesTheClaimWithoutInvestment) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir), config);
+  IndexWriter writer(snapshots, {}, nullptr);
+  for (auto text : {"alpha beta", "alpha", "beta"}) addTermDoc(writer, text);
+  addIdTermDoc(writer, "deleted", "other");
+  writer.commit();
+  auto& deletes = writer.obtainInverter();
+  deletes.deleteId("deleted", 1);
+  writer.releaseInverter(deletes);
+  writer.commit();
+  auto reader = snapshots.readers.getReader();
+  auto cache = snapshots.readers.filterCache;
+  auto& segment = reader->segments()[0];
+  TermQuery alpha("text_w", "alpha"), beta("text_w", "beta");
+  std::array<Query*, 2> required{&alpha, &beta};
+  BooleanQuery query(required, {}, {}, {});
+  {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
+    auto claim = use->probe(0);
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, claim.kind());
+    use->publishRaw(0, claim, docs(segment.maxDoc(), {0}), 1000);
+  }
+  evictValues(*cache);
+  RequestMemTracker memory(1024);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
+  use->enableRoutedAccounting(0, memory, "local query membership");
+  auto* raw = query.createWeight(context, 0);
+  QueryPrep::WholeMembershipPlan plan(*raw, use, context.filterUses,
+      PreparedDomainDependence::QUERY_CANONICAL, QueryPrep::WholeMembershipConsumer::TOP_K_COUNT);
+  auto before = cache->counters();
+  memory.charge(1024, "domain variants", "retained domain");
+  EXPECT_THROW(test::resolveWholeMembershipForTests(plan, *reader, segment, nullptr, nullptr, 128), ResourceExhaustedError);
+  memory.release(1024);
+  EXPECT_EQ(before.buildAttempts, cache->counters().buildAttempts);
+  EXPECT_EQ(before.outstandingDebtNanos, cache->counters().outstandingDebtNanos);
+  EXPECT_TRUE(test::resolveWholeMembershipForTests(plan, *reader, segment, nullptr, nullptr, 128).available);
+  EXPECT_GT(memory.bytes(), 0u);
+  EXPECT_EQ(before.builds, cache->counters().builds);
+  EXPECT_EQ(before.outstandingDebtNanos, cache->counters().outstandingDebtNanos);
+}
+
 TEST(FilterCacheTest, wholeAdmissionDiscriminatesSchemaGeneration) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
@@ -7187,6 +7488,7 @@ TEST(FilterCacheIntegrationTest, cacheControlIncludesLedgerGhosts) {
     ASSERT_EQ(1u, shard.entries[0].values.size());
     const auto& value = shard.entries[0].values[0];
     EXPECT_EQ(stage == 0, value.resident);
+    EXPECT_EQ(1u, value.raw_cardinality);
     EXPECT_DOUBLE_EQ(stage == 1 ? 1 : 0, value.owed_us);
     EXPECT_DOUBLE_EQ(4, value.debt_us);
     EXPECT_EQ(4u, value.production_us);

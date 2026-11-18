@@ -258,6 +258,7 @@ public:
     DocSet* requestValue = nullptr;
     Use* requestUse = nullptr;
     size_t requestSegmentOrd = 0;
+    int32_t producedCardinality = -1;
     Kind kind_ = Kind::BYPASS;
     bool ownsClaim = false;
     bool ownsRequestClaim = false;
@@ -280,6 +281,10 @@ public:
     ~Probe();
 
     Kind kind() const { return kind_; }
+    std::optional<int32_t> priorCardinality() const {
+      return producedCardinality < 0 ? std::nullopt
+          : std::optional<int32_t>(producedCardinality);
+    }
     DocSet* docSet() const {
       return requestValue != nullptr ? requestValue
           : value == nullptr ? nullptr : value->docSet();
@@ -659,6 +664,7 @@ private:
     std::atomic<double> debt{0};
     uint64_t referenceNanos = 0;
     size_t referenceBytes = 0;
+    std::atomic<int32_t> rawCardinality{-1};
     bool measured = false;
     bool observed = false;
     struct Mean {
@@ -952,6 +958,7 @@ public:
     SpaceOrdinal space = SpaceOrdinal::ROOT;
     uint64_t readerVersion = 0;
     bool resident = false;
+    int32_t rawCardinality = -1;
     double owed = 0;
     double debt = 0;
     double creditedTotal = 0;
