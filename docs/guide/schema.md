@@ -282,7 +282,10 @@ The built-in templates are:
 Text fields are **stored** in the default compressed **stored_resource**.
 Numeric suffixes are column-backed but do not build a points index by default;
 range and exact-match queries still work by quickly scanning the column. Define a
-concrete field with `index: "range"` when those operations need a points index.
+concrete field with `index: "range"` when those operations need a points index,
+or `index: "match"` for a term dictionary that serves exact matches and lets
+field facets on low- and medium-cardinality values count without scanning the
+column (see [Faceting](faceting.md)).
 The geo suffixes `_p` and `_ps` build one by default, because geo queries are
 their only use.
 

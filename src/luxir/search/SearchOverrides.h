@@ -202,6 +202,8 @@ enum class FacetCounterMode {
   SKINNY_GLOBAL, SKINNY_LOCAL
 };
 
+// How a field facet counts a segment (LUXIR_FACET_STRATEGY): string facets,
+// and numeric facets whose segment has a term dictionary (index: match).
 enum class StrFacetStrategy {
   AUTO, TOP_TERMS, COLUMN_DOMAIN, COLUMN_COMPLEMENT, TERM_DRIVEN
 };

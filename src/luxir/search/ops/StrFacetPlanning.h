@@ -34,6 +34,15 @@ struct StrFacetCountInputs {
   bool allowTopTerms;
   bool hasGlobalOrdMap;
   bool readerHasNoDeletes;
+  // Dictionary walk cost per term in column-read-equivalents; 0 is DF_COST.
+  // A numeric facet walks term bytes to recover each value, where a string
+  // facet streams docFreqs alone.
+  double dfCost = 0;
+  // Price the all-docs dictionary walk against the column. A string column
+  // holds ords that a walk never costs more than; a numeric column holds the
+  // values themselves, so a near-unique numeric field reads its column faster
+  // than its dictionary.
+  bool priceAllDocsWalk = false;
 };
 
 struct StrFacetCountPlan {
@@ -41,6 +50,9 @@ struct StrFacetCountPlan {
   // compare whole strategies under the counter representation each uses.
   // DF_COST covers the per-term docFreq walk and local-to-global drain.
   static constexpr double DF_COST = 2.25;
+  // The numeric walk: rebuild each term's bytes, decode its value, add its
+  // count by value.
+  static constexpr double NUMERIC_DF_COST = 4.0;
   static constexpr double POSTINGS_SETUP_COST = 30.0;
   static constexpr double POSTINGS_ADVANCE_COST = 4.0;
   // Complement must win decisively. Near-tie complement choices measured
@@ -65,8 +77,9 @@ struct StrFacetCountPlan {
     if (termsAvailable) {
       int64_t bitsetBuildWords = in.domainHasBitset
           ? 0 : ((int64_t)in.maxDoc + 63) >> 6;
+      double dfCost = in.dfCost > 0 ? in.dfCost : DF_COST;
       plan.complementWork = (double)in.complementCardinality
-          + (double)in.segmentTerms * DF_COST
+          + (double)in.segmentTerms * dfCost
           + (double)bitsetBuildWords;
       int32_t advanceSide = in.domainHasBitset
           ? std::min(in.domainCardinality, in.complementCardinality)
@@ -121,7 +134,9 @@ struct StrFacetCountPlan {
     assert(forced == StrFacetStrategy::AUTO);
     if (topTermsLegal) {
       plan.strategy = StrFacetCountKind::TOP_TERMS;
-    } else if (termsAvailable && in.complementCardinality == 0) {
+    } else if (termsAvailable && in.complementCardinality == 0
+               && (!in.priceAllDocsWalk
+                   || plan.complementWork < plan.columnWork)) {
       plan.strategy = StrFacetCountKind::COLUMN_COMPLEMENT;
     } else if (plan.complementWork < plan.columnWork * COMPLEMENT_MARGIN
                && plan.complementWork <= plan.termWork) {

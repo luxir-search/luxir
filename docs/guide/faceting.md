@@ -309,6 +309,21 @@ FLOAT/DOUBLE keep `-0.0` and `0.0` in separate buckets, matching exact query
 equality; all NaNs share one bucket. HTTP JSON renders NaN and infinities as
 `null`, so those bucket labels cannot be sent back as selections.
 
+A numeric, boolean, or date field declared with `index: "match"` also has a
+term dictionary, and its field facets count from it wherever that reads less
+than the column: an unfiltered facet takes each value's document count from
+the dictionary without visiting documents, a facet over most of the index
+subtracts the documents outside the result set, and a selective one can
+intersect each value's postings with the result set. Bucket domains for
+sub-operations come from the same postings when they read less than the
+column. Each segment chooses by its number of distinct values against the
+documents to count, so a field with a distinct value per document keeps the
+column scan, and segments written before the field had a dictionary keep it
+too. Results do not depend on the choice. Declare `match` on low- and
+medium-cardinality fields that are faceted (ports, status codes, enumerated
+ids); the dictionary adds index size and indexing work, and a field has one
+index mode, so it cannot also have the `range` points index.
+
 Text fields facet on analyzed terms, not on the stored text: a facet on
 `body_t` returns indexed words, while a facet on `category_s` returns whole
 category values. Text facets also accept `mincount: 0`, while numeric, boolean, and date

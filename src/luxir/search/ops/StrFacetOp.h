@@ -26,26 +26,6 @@
 
 namespace luxir {
 
-// How the domain will be walked, for the piece's human-readable detail.
-// ARRAY domains point-select ords. Bitset domains adapt for DOCID columns and
-// retain fixed bulk decoding for RANK columns; null domains use fixed bulk.
-inline const char* domainDesc(DocSet* domain, bool docIdIndexed) {
-  if (domain == nullptr) {
-    return "all-docs domain, bulk ord loads";
-  }
-  if (domain->type == DocSet::Type::ARRAY) {
-    return "array domain, point ord loads";
-  }
-  return docIdIndexed ? "bitset domain, adaptive point/bulk ord loads"
-                      : "bitset domain, bulk ord loads";
-}
-
-inline const char* domainDesc(DocSet* domain) {
-  return domain == nullptr ? "all-docs domain"
-      : domain->type == DocSet::Type::ARRAY ? "array domain, point ord loads"
-                                            : "bitset domain";
-}
-
 // `out` takes add(ord, count) per counted ord and reports size(), the number
 // added so far.
 template<typename Counter, typename Sink>
