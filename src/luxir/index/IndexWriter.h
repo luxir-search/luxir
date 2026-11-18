@@ -878,6 +878,11 @@ private:
                                    boost::unordered_flat_set<std::string>& matchedSelectors,
                                    const char*& phase);
   uint64_t nextSegmentOverlayGen(SegInfo& seg);
+  // Writes the segment summary sidecar `pwriter` collected and registers it
+  // as the segment's "segment_summary" overlay. A failure leaves the segment
+  // without a summary, which proves nothing, and never fails the flush or
+  // merge.
+  void writeSegmentSummary(SegInfo& seg, PostingsWriter& pwriter) noexcept;
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,
       SegmentCore& core,

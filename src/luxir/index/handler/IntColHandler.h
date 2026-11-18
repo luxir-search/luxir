@@ -205,6 +205,9 @@ public:
       longStream.pushValues(inverter.pool, writer);
       writer.finish(fieldInfo);
     }
+    if (fieldType->type() == FieldType::GEO_POINT) {
+      longStream.visitValues(inverter.pool, [&](int64_t value) { fieldInfo.summary.addGeoPacked(value); });
+    }
 
     if (fieldType->rangeIndexed()) {
       if (fieldType->type() == FieldType::GEO_POINT) {
@@ -365,6 +368,9 @@ public:
       IntColWriter writer(*outputPtr);
       longStream.pushValues(inverter.pool, writer);
       writer.finish(fieldInfo);
+    }
+    if (fieldType->type() == FieldType::GEO_POINT) {
+      longStream.visitValues(inverter.pool, [&](int64_t value) { fieldInfo.summary.addGeoPacked(value); });
     }
 
     if (fieldType->rangeIndexed()) {

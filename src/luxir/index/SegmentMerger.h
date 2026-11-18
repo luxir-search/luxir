@@ -1757,6 +1757,7 @@ private:
       int64_t sumDocFreq = 0;
       int64_t sumTotalTermFreq = 0;
       bool mayHaveFitted = false;
+      std::string firstTerm;
 
       for (auto& outputPtr : outputs) {
         RangeOutput& output = *outputPtr;
@@ -1765,6 +1766,7 @@ private:
           output.termsGuard.release();
           continue;
         }
+        if (termOrd == 0) firstTerm = result.firstTerm;
 
         seg_location termsBase = termsOut.slocation();
         if (blockOrd != 0) {
@@ -1797,6 +1799,9 @@ private:
         previousLastTerm = result.lastTerm;
       }
 
+      // Ranges are disjoint and ascending: the first range's first term and
+      // the last range's last term bound the field.
+      outputFieldInfo->summary.setTermBounds(firstTerm, previousLastTerm, (uint64_t)termOrd);
       outputFieldInfo->nTerms = termOrd;
       outputFieldInfo->sumDocFreq = sumDocFreq;
       outputFieldInfo->sumTotalTermFreq = sumTotalTermFreq;
@@ -2604,6 +2609,7 @@ private:
           for (int64_t inRank = lastEndValueRankIn; inRank < endValueRank; inRank++) {
             auto val = values.valueAt(inRank);
             intColWriter->addInt64(val);
+            if (outputFieldInfo.type == FieldType::GEO_POINT) outputFieldInfo.summary.addGeoPacked(val);
             if (geoPoints != nullptr) {
               geoPoints->push_back({geo::unpackLatitude(val),
                                     geo::unpackLongitude(val), mappedDoc});
@@ -2621,6 +2627,7 @@ private:
           // single-valued
           auto val = values.valueAt(docRankIn);
           intColWriter->addInt64(val);
+          if (outputFieldInfo.type == FieldType::GEO_POINT) outputFieldInfo.summary.addGeoPacked(val);
           if (geoPoints != nullptr) {
             geoPoints->push_back({geo::unpackLatitude(val),
                                   geo::unpackLongitude(val), mappedDoc});

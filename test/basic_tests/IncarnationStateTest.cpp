@@ -38,8 +38,10 @@ TEST_F(IncarnationStateTest, laterWritersNameLiveDocsAndOverlaysWithBothEpochs) 
     EXPECT_EQ(1u, segment.creator_epoch);
     EXPECT_EQ(2u, segment.live_epoch);
     EXPECT_TRUE(dir.openFile(Postings::getLiveDocsFileName(Postings::segmentKey(segment.seg_id, 1), segment.live_gen, 2)));
-    ASSERT_EQ(1u, segment.overlays.size());
-    EXPECT_EQ(Postings::getSegmentOverlayFileName(segment.seg_id, TestOverlayAuxReader::NAME, segment.overlays[0].gen, 0, 1, 2), segment.overlays[0].files[0].name);
+    // The test overlay, beside the segment summary written with the segment.
+    auto overlay = std::ranges::find(segment.overlays, TestOverlayAuxReader::KIND, &api::AuxIndexInfo::kind);
+    ASSERT_NE(segment.overlays.end(), overlay);
+    EXPECT_EQ(Postings::getSegmentOverlayFileName(segment.seg_id, TestOverlayAuxReader::NAME, overlay->gen, 0, 1, 2), overlay->files[0].name);
     auto reader = std::make_shared<IndexReader>(dir);
     EXPECT_EQ(2, reader->liveDocs());
     EXPECT_TRUE(reader->segments()[0].getAuxReader(TestOverlayAuxReader::NAME));
