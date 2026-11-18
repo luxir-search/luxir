@@ -8,6 +8,7 @@
 #include "test/SchemaBuilder.h"
 #include "test/QueryBuild.h"
 #include "test/RowSpaceFixture.h"
+#include "luxir/reader/IntColReader.h"
 #include "luxir/reader/OwnershipShape.h"
 #include "luxir/reader/Postings.h"
 
@@ -240,6 +241,127 @@ TEST(NestedMergeTest, physicalChildRowsPastTheLimitSkipTheMerge) {
   auto req = localReq(helper.getSearchEngine());
   req->collection(helper.collection().getId().name).topDocs().exprQuery("items_nested:*").countLimit().limit(0);
   req->execute(1); ASSERT_OK(req); EXPECT_EQ(1, req->getMatchCount());
+}
+
+// Runs the same root and element-scope reads over a collection before and
+// after merging it to one segment.
+struct ScopedReads {
+  CollectionHelper& helper;
+  int64_t count(std::string_view query, std::string_view path = "") {
+    auto req = localReq(helper.getSearchEngine());
+    auto& op = req->collection(helper.collection().getId().name).topDocs().exprQuery(query).countLimit().limit(0);
+    if (!path.empty()) op.rawOp().domain.emplace().to = path;
+    req->execute(1); EXPECT_OK(req);
+    return req->getMatchCount();
+  }
+  std::vector<std::string> ids(std::string_view query) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(helper.collection().getId().name).topDocs().exprQuery(query).fields({"id"}).limit(-1);
+    req->execute(1); EXPECT_OK(req);
+    std::vector<std::string> out;
+    for (const auto& doc : req->getDocs()) out.push_back(std::get<std::string>(*find(doc, "id")));
+    std::ranges::sort(out);
+    return out;
+  }
+  int64_t scalar(std::string_view expr) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(helper.collection().getId().name).expr("e", expr);
+    req->execute(1); EXPECT_OK(req);
+    return req->scalar<int64_t>("e");
+  }
+};
+
+// A declared multi-valued int column (the _is suffix) where every document
+// holds one value reads as single-valued. Merged with a segment holding
+// arrays, the column is multi-valued again, and every read stays exact.
+TEST(NestedMergeTest, oneValueEachIntColumnsStayExactThroughMerges) {
+  CollectionHelper helper("one_value_each");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  for (auto batch : {std::vector<std::string_view>{
+           R"({"id":"a","tag_s":"x","n_is":5,"items_nested":[{"n_is":5},{"n_is":[7]}]})",
+           R"({"id":"b","tag_s":"x","items_nested":[{}]})"},
+       std::vector<std::string_view>{
+           R"({"id":"c","tag_s":"y","n_is":[1,9],"items_nested":[{"n_is":[1,9]}]})",
+           R"({"id":"d","tag_s":"x","n_is":6,"items_nested":[{"n_is":6}]})"}}) {
+    CollectionHelper::UpdateBuilder input;
+    for (auto doc : batch) add(input, doc);
+    input.commit(); ASSERT_TRUE(helper.submit(input).success);
+  }
+  // Per segment, whether the root and the element n_is columns read multi-valued.
+  auto multiValued = [&] {
+    std::vector<bool> out;
+    for (auto path : {"", "items_nested"}) {
+      auto root = helper.getIndexWriter()->snapshots.readers.getReader();
+      auto reader = *path ? root->view(path) : root;
+      auto infos = reader->field(*path ? "items_nested.n_is" : "n_is");
+      for (const auto& segment : reader->segments()) {
+        auto* info = infos.at(segment);
+        if (info == nullptr) { ADD_FAILURE() << "no n_is column in " << path; continue; }
+        IntColReader column(segment.postingsReader(), *info);
+        out.push_back(column.multiValued());
+        EXPECT_NE(nullptr, column.getEndValueRankReader());
+      }
+    }
+    return out;
+  };
+  EXPECT_EQ((std::vector<bool>{false, true, false, true}), multiValued());
+  ScopedReads reads{helper};
+  auto check = [&] {
+    EXPECT_EQ((std::vector<std::string>{"a", "d"}), reads.ids("n_is:[5 TO 8]"));
+    EXPECT_EQ((std::vector<std::string>{"c"}), reads.ids("n_is:[* TO 1]"));
+    EXPECT_EQ((std::vector<std::string>{"a", "d"}), reads.ids("tag_s:x AND items_nested.n_is:[5 TO 8]"));
+    EXPECT_EQ(2, reads.count("tag_s:x AND items_nested.n_is:[5 TO 8]"));
+    EXPECT_EQ(3, reads.count("n_is:[5 TO 8]", "items_nested"));
+    EXPECT_EQ(22, reads.scalar("sum(max(items_nested.n_is))"));
+    EXPECT_EQ(5, reads.scalar("sum(count(items_nested.n_is))"));
+  };
+  check();
+  merge(helper);
+  EXPECT_EQ((std::vector<bool>{true, true}), multiValued());
+  check();
+}
+
+// Segments without elements for a path serve element-scope counts,
+// reductions, joins and projections, alone and merged with one that has them.
+TEST(NestedMergeTest, segmentsWithoutElementsServeEveryScopedOperation) {
+  CollectionHelper helper("elementless_segments");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  for (auto doc : {R"({"id":"E","title_s":"cap"})",
+                   R"({"id":"A","title_s":"shirt","variants_nested":[{"color_s":"red","price_i":10},{"color_s":"blue","price_i":12}]})"}) {
+    CollectionHelper::UpdateBuilder input;
+    add(input, doc);
+    input.commit(); ASSERT_TRUE(helper.submit(input).success);
+  }
+  ASSERT_EQ(2u, helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+  ScopedReads reads{helper};
+  auto check = [&] {
+    EXPECT_EQ(2, reads.count("*:*", "variants_nested"));
+    EXPECT_EQ(1, reads.count("color_s:blue", "variants_nested"));
+    EXPECT_EQ((std::vector<std::string>{"A"}), reads.ids("variants_nested.color_s:red"));
+    EXPECT_EQ((std::vector<std::string>{"E"}), reads.ids("NOT variants_nested.color_s:*"));
+    EXPECT_EQ(22, reads.scalar("sum(sum(variants_nested.price_i))"));
+    auto req = localReq(helper.getSearchEngine());
+    auto& rows = req->collection("elementless_segments").topDocs().allQuery().countLimit().limit(0);
+    rows.rawOp().domain.emplace().to = "variants_nested";
+    rows.topDocs("owners").allQuery().fields({"id"}).countLimit().limit(-1).rawOp().domain.emplace().to = "..";
+    req->execute(1); ASSERT_OK(req);
+    EXPECT_EQ(2, *req->docList()->found);
+    auto* owners = (*req->docList()->ops.find("owners"))->docList();
+    ASSERT_NE(nullptr, owners);
+    EXPECT_EQ(1, *owners->found);
+    EXPECT_EQ("A", std::get<api::ColStr>(owners->columns.at("id").kind).v.at(0));
+    auto sorted = localReq(helper.getSearchEngine());
+    sorted->collection("elementless_segments").topDocs().getScores().fields({"id"}).limit(-1).rawQuery() =
+        qb::rescore(sorted->mr, qb::all(), "def(max(variants_nested.price_i),0)");
+    sorted->execute(1); ASSERT_OK(sorted);
+    ASSERT_EQ(2u, sorted->getDocs().size());
+    EXPECT_EQ("A", std::get<std::string>(*find(sorted->getDocs()[0], "id")));
+    EXPECT_EQ(12, std::get<api::ColFloat>(sorted->docList()->columns.at("_score_").kind).v.at(0));
+  };
+  check();
+  merge(helper);
+  ASSERT_EQ(1u, helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+  check();
 }
 
 } // namespace
