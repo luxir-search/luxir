@@ -93,8 +93,8 @@ one.
 |---|---|
 | `query` | One structured query object or an expression string. Omitted: match all. |
 | `filter` | Non-scoring queries ANDed with the main query: expression strings, query objects, or `{"query": ..., "except_ops": [...]}` wrappers that hide a filter from named sub-operations. |
-| `limit` | Maximum documents returned. Default `10`; `0` for count/analytics only; `-1` for all matches. |
-| `offset` | Zero-based rank of the first returned document. Default `0`. |
+| `limit` | Maximum documents returned. Default `10`; `0` for count/analytics only; `-1` for all matches up to the [result window](#limits). |
+| `offset` | Zero-based rank of the first returned document. Default `0`. `offset + limit` may not pass the [result window](#limits). |
 | `count_limit` | Match count: unset or `0` omits `found`; `-1` counts exactly; `-2` permits an estimate; positive `N` permits a lower bound at `N`. |
 | `get_scores` | Add `_score_` to every returned document. |
 | `min_score` | Minimum relevance score. Documents scoring below it do not match; see [Minimum score](#minimum-score). |
@@ -1269,7 +1269,10 @@ reader applies backpressure instead of accumulating the result in RAM.
 
 Add `?format=docs` and set `limit: -1` when the consumer wants documents
 rather than response envelopes. Every match streams over one connection;
-there is no cursor, scroll state, or page size to manage:
+there is no cursor, scroll state, or page size to manage. The export is exempt
+from `search.max-result-window`; the matches it ranks still count against the
+request memory breaker (about 12 bytes per match, more with a sort), so a very
+large export may need a larger `search.request-memory-max-bytes`:
 
 ```http
 POST /collections/books/_search?format=docs
@@ -1352,6 +1355,24 @@ preparation without collecting results. See
   retains up to `offset + limit` documents or group heads, so deep pages cost more. An offset past the
   matches returns one empty final batch. Use document-per-line export when the
   goal is to consume every match.
+- `offset + limit` of a list, a fusion, or a fusion source may not pass the
+  node's result window, `search.max-result-window` (default `10000`). A larger
+  explicit page fails with `INVALID_REQUEST` code `result_window_exceeded`.
+  `limit: -1` returns every match up to the window; when the list fills it, the
+  response carries a `result_window_capped` warning, since more matches may
+  exist. `format=docs` exports are exempt.
+- A field facet returns at most `search.max-facet-buckets` buckets (default
+  `65536`). A larger explicit `limit` fails with `INVALID_REQUEST` code
+  `facet_limit_exceeded`, and so does `limit: -1` when the facet has more
+  buckets than that.
+- One request may hold at most `search.max-ops` search operations (default
+  `1000`), counting every nesting level, fusion sources, and row operations,
+  and nest them at most `search.max-op-depth` deep (default `10`). Past either
+  the request fails with `INVALID_REQUEST`, code `too_many_ops` for the count.
+- The memory one request ranks, sorts, facets, and collapses with is bounded by
+  `search.request-memory-max-bytes`. Past it the request fails with
+  `RESOURCE_EXHAUSTED` code `request_memory_exceeded` (HTTP 429 before output
+  starts), never with partial results. See [Operations](operations.md#indexing-memory-and-request-limits).
 - The `(segment, docid)` tiebreak is reader-local and can change after segment
   merges, so it is not a durable pagination token.
 - `max_parallel` supports `-2`, `-1`, `0`, and `1`; other values are rejected.

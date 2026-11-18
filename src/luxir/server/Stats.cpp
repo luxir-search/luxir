@@ -9,6 +9,7 @@
 #include "ReplicationFollower.h"
 #include "Scrubber.h"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <string_view>
@@ -41,7 +42,7 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   memory.indexing_budget.pending_merge_bytes = (uint64_t)ram.pendingMergeDemandBytes();
   memory.indexing_budget.retained_delete_bytes = (uint64_t)ram.retainedDeleteBytesCount();
   memory.node_budget_bytes = node.getConfig().max_ram_mb * 1024 * 1024;
-  memory.search_request_limit_bytes = node.getConfig().search.request_memory_max_bytes;
+  memory.search_request_limit_bytes = (uint64_t)std::max<int64_t>(node.getConfig().search.request_memory_max_bytes, 0);
   memory.schema_cache_bytes = node.collections().schemaBytes();
   memory.storage_ram.used_bytes = node.storageBytes();
   auto storageMemory = node.collections().storage().memory();

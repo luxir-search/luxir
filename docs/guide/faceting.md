@@ -286,7 +286,7 @@ the facet's `limit: 10` returns up to ten categories.
 | Field | Meaning |
 |---|---|
 | `field` | Field to group. Required. |
-| `limit` | Maximum returned buckets. Default `5`; `-1` returns all. |
+| `limit` | Maximum returned buckets. Default `5`; `-1` returns all. Both are bounded by `search.max-facet-buckets` (default `65536`): a larger explicit limit, or `-1` on a facet with more buckets, fails with `facet_limit_exceeded`. |
 | `mincount` | Drop buckets below this count. |
 | `missing` | Also return the count of documents with no value in the field. |
 | `sort` | Sort buckets by one of the facet's metric sub-operations: a one-element list such as `["name desc"]` or `["name asc"]`. Default: count descending. |

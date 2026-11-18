@@ -391,6 +391,18 @@ TEST_F(HttpApiTest, prettyExplainAndErrors) {
   }
 }
 
+TEST_F(HttpApiTest, resultWindowIs400AndExportIsExempt) {
+  helper.indexAll(std::array{flatdoc("id", "w1"), flatdoc("id", "w2")}, UpdateMessage::COMMIT);
+  const std::string body = R"({"query":{"all":true},"limit":20000,"fields":["id"]})";
+  auto rejected = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
+  EXPECT_EQ(400, rejected.result_int()) << rejected.body();
+  EXPECT_NE(std::string::npos, rejected.body().find("\"result_window_exceeded\"")) << rejected.body();
+  // The URL alias for the docs format reaches the engine as an export.
+  auto exported = httpRequest(port(), http::verb::post, "/collections/main/_search?format=docs", body);
+  EXPECT_EQ(200, exported.result_int()) << exported.body();
+  EXPECT_NE(std::string::npos, exported.body().find("\"w2\"")) << exported.body();
+}
+
 TEST_F(HttpApiTest, prettySearchError) {
   helper.index(flatdoc("id", "p1"), UpdateMessage::COMMIT);
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_search?pretty",

@@ -52,7 +52,7 @@ protected:
   }
 };
 
-TEST_F(MultiTermLimitsTest, serverDefaultsMatchBudgetDefaults) {
+TEST_F(MultiTermLimitsTest, serverShipsBoundedDefaults) {
   LuxirConfig defaults;
   const auto& search = defaults.search;
   MultiTermBudget budget;
@@ -61,9 +61,10 @@ TEST_F(MultiTermLimitsTest, serverDefaultsMatchBudgetDefaults) {
   EXPECT_EQ(0, limits.maxTermsExamined);
   EXPECT_EQ(0, limits.maxPostings);
   EXPECT_EQ(0, search.multiterm_min_prefix_length);
-  EXPECT_EQ(limits.maxExpansions, search.multiterm_max_expansions);
-  EXPECT_EQ(limits.maxTermsExamined, search.multiterm_max_terms_examined);
-  EXPECT_EQ(limits.maxPostings, search.multiterm_max_postings);
+  // The mechanism is unlimited by default; the server ships bounded limits.
+  EXPECT_EQ(10000, search.multiterm_max_expansions);
+  EXPECT_EQ(10'000'000, search.multiterm_max_terms_examined);
+  EXPECT_EQ(100'000'000, search.multiterm_max_postings);
 }
 
 TEST_F(MultiTermLimitsTest, completeExpansionRejectedAtServerCap) {
@@ -545,14 +546,23 @@ TEST_F(MultiTermLimitsTest, concurrentChargesDependOnlyOnTotal) {
   }
 }
 
-TEST_F(MultiTermLimitsTest, defaultsRunWidePrefix) {
-  CollectionHelper helper;
+TEST_F(MultiTermLimitsTest, defaultsBoundWidePrefixUnlessTurnedOff) {
   std::string body;
   for (int i = 0; i < 65'537; i++) body += "t" + std::to_string(i) + " ";
-  ASSERT_TRUE(helper.index(flatdoc("id", "wide", "body_w", body), UpdateMessage::COMMIT).success);
-  auto req = localReq(helper.getSearchEngine());
-  req->topDocs("q").prefixQuery("body_w", "t").countLimit();
-  req->execute(false);
+  auto run = [&](CollectionHelper& helper) {
+    EXPECT_TRUE(helper.index(flatdoc("id", "wide", "body_w", body), UpdateMessage::COMMIT).success);
+    auto req = localReq(helper.getSearchEngine());
+    req->topDocs("q").prefixQuery("body_w", "t").countLimit();
+    req->execute(false);
+    return req;
+  };
+  CollectionHelper bounded;
+  auto rejected = run(bounded);
+  EXPECT_EQ("too_many_expansions", rejected->errorCode()) << rejected->errorMsg();
+
+  LuxirNode node(config(0, 0, 0));
+  CollectionHelper unlimited(node);
+  auto req = run(unlimited);
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ(1, req->getMatchCount());
 }

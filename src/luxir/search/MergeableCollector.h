@@ -71,6 +71,25 @@ public:
     return useFieldSort ? fieldCollector->topCount : scoreCollector->topCount;
   }
 
+  /// Docs or groups the active arm retains now.
+  int64_t size() const {
+    if (diverseFieldCollector) return (int64_t)diverseFieldCollector->size();
+    if (diverseScoreCollector) return diverseScoreCollector->size();
+    if (groupFieldCollector) return (int64_t)groupFieldCollector->size();
+    if (groupScoreCollector) return groupScoreCollector->size();
+    return useFieldSort ? (int64_t)fieldCollector->size() : scoreCollector->size();
+  }
+
+  /// Charge the active arm's heap and sort slots to `meter` as they grow.
+  void setMeter(StorageMeter* meter) {
+    if (diverseFieldCollector) diverseFieldCollector->setMeter(meter);
+    else if (diverseScoreCollector) diverseScoreCollector->setMeter(meter);
+    else if (groupFieldCollector) groupFieldCollector->setMeter(meter);
+    else if (groupScoreCollector) groupScoreCollector->setMeter(meter);
+    else if (useFieldSort) fieldCollector->setMeter(meter);
+    else scoreCollector->setMeter(meter);
+  }
+
   /// Add matches the active arm did not see individually, for callers that
   /// derive part of the count instead of collecting it doc by doc.
   void addHits(int64_t hits) {

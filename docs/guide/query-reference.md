@@ -418,10 +418,11 @@ Term ranges are subject to any operator-configured [Expansion limits](#expansion
 ## Expansion limits
 
 Prefix, wildcard, regex, term-range, fuzzy, and `case_insensitive` match queries
-expand against the field's term dictionary, so their cost grows with its cardinality. Every
-expansion limit is an operator opt-in, off by default. With limits off, a broad
-pattern on a high-cardinality field simply runs. Operators exposing a public
-endpoint can set these options to bound dictionary work and postings estimates.
+expand against the field's term dictionary, so their cost grows with its cardinality. The
+server bounds that work by default: at most 10,000 expanded terms per query and
+segment, 10,000,000 dictionary terms examined per request, and an estimate of
+100,000,000 selected postings per request. Operators can lower or raise these, or
+set `0` to remove one; the minimum literal prefix rule is an opt-in, off by default.
 
 When a configured limit is exceeded, the request fails with
 `RESOURCE_EXHAUSTED`, naming the query and limit, never a truncated match set.

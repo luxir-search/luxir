@@ -1915,6 +1915,11 @@ private:
     if (requestState->proto.response_format == luxir::api::ResponseFormat::DOCS) {
       format = HttpSearchFormat::DOCS;
     }
+    // The engine sees the export through the proto field (it lifts
+    // search.max_result_window), so the URL alias sets it too.
+    if (format == HttpSearchFormat::DOCS) {
+      requestState->proto.response_format = luxir::api::ResponseFormat::DOCS;
+    }
     bool docsMultiOp = false;
     if (format == HttpSearchFormat::DOCS) {
       if (const char* err = validateDocsFormat(requestState->proto)) {

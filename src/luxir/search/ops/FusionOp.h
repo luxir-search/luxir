@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <format>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -70,6 +71,8 @@ public:
   // Fusion weight per source, parallel to `sources`; every entry is > 0.
   std::vector<double> sourceWeights;
   int64_t topCount; // Collection depth (offset + page size, capped by maxDoc).
+  // limit -1 resolved to search.max_result_window.
+  bool windowCapped = false;
   std::span<ParsedFilter> filters;  // shared fusion-level filters
   std::span<Query::Weight*> filterWeights;
   std::span<FilterCache::Use*> filterUses;
@@ -382,6 +385,7 @@ public:
     // the parser when wiring the rankingSink.
     void acceptSourceRanking(size_t idx, MergeableCollector* mc) {
       deliveredCollectors[idx] = mc;
+      if (mc != nullptr) thisOp().sources[idx]->noteWindow(mc->size());
 
       // Release side of this fetch_add publishes the deliveredCollectors[idx]
       // write above; the last thread's acquire side observes all prior
@@ -509,6 +513,11 @@ public:
       });
 
       int64_t numCollected = std::min((int64_t)fusedList.size(), op.topCount);
+      if (op.windowCapped && numCollected >= op.topCount) {
+        op.req.warnOnce("result_window_capped", std::format(
+            "fusion '{}': limit -1 stopped at the result window of {} "
+            "(search.max_result_window); more matches may exist", op.name, op.topCount));
+      }
       int64_t totalHits = (int64_t)fused.size();
       auto getDocList = [this](SearchResponse* resp) -> luxir::api::DocList& {
         return *slotArm<luxir::api::DocList>(resp);

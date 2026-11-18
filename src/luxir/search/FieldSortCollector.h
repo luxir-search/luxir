@@ -172,6 +172,8 @@ public:
   // before the first write to a new slot.  slotCapacity is what has been
   // grown so far; it doubles up to topCount.
   int64_t slotCapacity = 0;
+  // Request accounting for the clauses' slot storage (setMeter).
+  MeteredBytes slotsMetered;
   std::vector<RuntimeClause> clauses;
   // Single-column plans keep the pre-clause-walk cost on the per-doc admission
   // path: one direct virtual compareBottom instead of the generic clause walk
@@ -311,6 +313,13 @@ public:
     for (const RuntimeClause& clause : this->clauses) {
       hasExpr |= clause.descriptor.getKind() == SortClause::EXPR;
     }
+  }
+
+  // Charge the heap and every clause's slot storage to `meter` as they grow.
+  void setMeter(StorageMeter* meter) {
+    assert(slotCapacity == 0);
+    pq.setMeter(meter);
+    slotsMetered.setMeter(meter);
   }
 
   // The pq's functor holds a back-pointer to this collector; moving would leave
@@ -1268,6 +1277,14 @@ private:
     assert(required <= topCount);
     int64_t capacity = std::min(topCount,
         std::max({required, slotCapacity * 2, (int64_t)64}));
+    size_t perSlot = 0;
+    for (const auto& clause : clauses) {
+      perSlot += clause.comparator != nullptr ? clause.comparator->slotBytes()
+          : clause.expr != nullptr ? sizeof(typename RuntimeClause::ExprSlot) : 0;
+    }
+    // The first 64 slots, which cover typical top-k requests, are free.
+    int64_t charged = std::max(slotCapacity, (int64_t)64);
+    if (capacity > charged) slotsMetered.grow((size_t)(capacity - charged) * perSlot);
     for (auto& clause : clauses) {
       if (clause.comparator != nullptr) {
         clause.comparator->growSlots((int32_t)capacity);

@@ -996,7 +996,11 @@ TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
 
 
 TEST_F(FusionOpTest, offsetPagesSourceWindows) {
-  CollectionHelper helper;
+  // Pages past any result window: these test the offset arithmetic itself.
+  LuxirConfig config;
+  config.search.max_result_window = 0;
+  LuxirNode node(config);
+  CollectionHelper helper(node);
   for (int i = 0; i < 10; i++) {
     helper.index(flatdoc("id", std::to_string(i), "rank_i", (int64_t)i));
   }

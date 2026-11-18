@@ -2741,10 +2741,8 @@ TEST_F(AggregateExprTest, defaultBudgetCoversHighCardinalityParallelExtremes) {
   constexpr size_t REQUIRED =
       BUCKETS * STRIDE * LIVE_PIECES + LIVE_PIECES * CHUNK_BYTES;
   static_assert(REQUIRED == 94147218);
-  // The breaker defaults to 0 (track, never reject); the documented sizing
-  // guidance for operators enabling it must still cover this workload.
-  EXPECT_EQ(0u, SearchConfig{}.request_memory_max_bytes);
-  EXPECT_GE(160ULL * 1024 * 1024, REQUIRED);
+  // The derived breaker never drops below a floor that covers this workload.
+  EXPECT_GE(SearchConfig::REQUEST_MEMORY_MIN_AUTO_BYTES, (int64_t)REQUIRED);
 
   constexpr size_t STATE_BYTES = BUCKETS * STRIDE;
   constexpr size_t RESERVED_PER_PIECE =

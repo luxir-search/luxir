@@ -10,6 +10,8 @@
 #include <vector>
 #include <type_traits>
 
+#include "luxir/util/StorageMeter.h"
+
 namespace luxir {
 
 /// Restores the heap invariant after the top (i.e. *begin) has been changed.
@@ -305,6 +307,8 @@ template <class T, class Comp, bool Indexed = false>
 class ExpandingPQ {
   std::vector<T> heap;  // heap.size() is the current heap size; grows up to maxSize
   size_t maxSize;
+  // Optional accounting for the backing storage; charged before each growth.
+  MeteredBytes metered;
   [[no_unique_address]] Comp comp{};  // Use [[no_unique_address]] to optimize away storage for empty comparators
 
   [[no_unique_address]] std::conditional_t<Indexed, HeapPositions, NoHeapPositions> positions;
@@ -342,6 +346,15 @@ public:
   void clear() {
     heap.clear();
     if constexpr (Indexed) positions.values.clear();
+  }
+
+  /// Charge every growth of the backing storage past the initial reservation
+  /// to `meter`, until destruction (release() hands the storage out but keeps
+  /// its charge). The small initial reservation, which covers typical top-k
+  /// requests, is free.
+  void setMeter(StorageMeter* meter) {
+    metered.reset();
+    metered.setMeter(meter);
   }
 
   // Reference to the top element.
@@ -406,8 +419,10 @@ public:
     if (heap.size() == heap.capacity()) {
       // Grow explicitly: push_back's own doubling would overshoot maxSize by
       // up to 2x on the final step; reserve is exact and clamps at the bound.
-      heap.reserve(std::min(maxSize,
-                            std::max(heap.capacity() * 2, initialReserve)));
+      size_t target = std::min(maxSize, std::max(heap.capacity() * 2, initialReserve));
+      size_t charged = std::max(heap.capacity(), std::min(maxSize, initialReserve));
+      if (target > charged) metered.grow((target - charged) * sizeof(T));
+      heap.reserve(target);
     }
     heap.push_back(elem);
     if constexpr (Indexed) {

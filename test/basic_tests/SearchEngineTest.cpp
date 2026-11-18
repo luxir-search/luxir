@@ -7511,7 +7511,11 @@ TEST_F(SearchEngineTest,
 
 
 TEST_F(SearchEngineTest, offsetRankedPages) {
-  CollectionHelper helper;
+  // Pages past any result window: these test the offset arithmetic itself.
+  LuxirConfig config;
+  config.search.max_result_window = 0;
+  LuxirNode node(config);
+  CollectionHelper helper(node);
   for (int i = 0; i < 11; i++) {
     std::string body = "apple";
     for (int j = 0; j < i; j++) body += " pear";
@@ -7599,7 +7603,11 @@ TEST_F(SearchEngineTest, offsetStreamingBatches) {
 }
 
 TEST_F(SearchEngineTest, offsetEmptyIndexAndNoMatches) {
-  CollectionHelper helper;
+  // Pages past any result window: these test the offset arithmetic itself.
+  LuxirConfig config;
+  config.search.max_result_window = 0;
+  LuxirNode node(config);
+  CollectionHelper helper(node);
   for (bool populated : {false, true}) {
     if (populated) helper.index(flatdoc("id", "a", "body_w", "pear"), UpdateMessage::COMMIT);
     for (bool count : {false, true}) {

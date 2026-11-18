@@ -790,22 +790,54 @@ ceilings move together. A larger message fails with `RESOURCE_EXHAUSTED`
 before it is decoded; see [gRPC API](grpc.md#message-size). Replies have no
 size limit; search results are streamed in bounded batches.
 
-Search has its own limits:
+Search has its own limits. Every one is on by default and bounds a single
+request; a request can never raise or disable one, and `0` turns a limit off:
 
 ```bash
 ./luxir \
-  --search.request-memory-max-bytes=0 \
-  --search.max-op-depth=8 \
+  --search.request-memory-max-bytes=512MB \
+  --search.max-result-window=10000 \
+  --search.max-facet-buckets=65536 \
+  --search.max-ops=1000 \
+  --search.max-op-depth=10 \
   --query-cache-bytes=64MB
 ```
 
-- `search.request-memory-max-bytes` is a per-request breaker for query memory
-  such as facet aggregate state and prefix top-term selection; `0` (the default) is unlimited.
+| Option | Default | Exceeded |
+|---|---|---|
+| `search.request-memory-max-bytes` | an eighth of `--max-ram-mb`, at least 256 MiB; 1 GiB when the node budget is unlimited | `RESOURCE_EXHAUSTED` `request_memory_exceeded` (HTTP 429) |
+| `search.max-result-window` | `10000` | `INVALID_REQUEST` `result_window_exceeded` (HTTP 400) |
+| `search.max-facet-buckets` | `65536` | `INVALID_REQUEST` `facet_limit_exceeded` (HTTP 400) |
+| `search.max-ops` | `1000` | `INVALID_REQUEST` `too_many_ops` (HTTP 400) |
+| `search.max-op-depth` | `10` | `INVALID_REQUEST` (HTTP 400) |
+| `search.multiterm-max-expansions` | `10000` | `RESOURCE_EXHAUSTED` `too_many_expansions` (HTTP 429) |
+| `search.multiterm-max-terms-examined` | `10000000` | `RESOURCE_EXHAUSTED` `too_many_terms_examined` (HTTP 429) |
+| `search.multiterm-max-postings` | `100000000` | `RESOURCE_EXHAUSTED` `too_many_expansion_postings` (HTTP 429) |
+| `search.multiterm-min-prefix-length` | `0` (off) | `RESOURCE_EXHAUSTED` `pattern_prefix_too_short` (HTTP 429) |
+
+- `search.request-memory-max-bytes` is a per-request breaker for query memory:
+  top-docs heaps and sort slots, facet aggregate state, collapse groups,
+  prefix top-term selection, and filter-cache routing. A request that would
+  pass it fails with `request_memory_exceeded`; it never returns partial
+  results. The ceiling is per request, not shared: many concurrent requests
+  can each hold up to it. The resolved value is reported as
+  `luxir_search_request_memory_limit_bytes`.
+- `search.max-result-window` caps `offset + limit` of one ranked list: a
+  `top_docs`, a fusion, and a fusion source's candidate pool. An explicit
+  page past it is rejected. `limit: -1` returns every match up to the window;
+  when it stops there the response carries a `result_window_capped` warning.
+  The `format=docs` export is exempt: it streams every match, bounded by the
+  memory breaker instead. See [Pagination](searching.md#limits).
+- `search.max-facet-buckets` caps the buckets one field facet returns. An
+  explicit larger `limit` is rejected up front; `limit: -1` still means every
+  bucket, and fails with the same code when there are more than the cap.
+  Facets count every value whatever the limit, so the cap bounds the response
+  and the per-bucket sub-operations, not the counting.
+- `search.max-ops` counts every search operation in the request, at any
+  nesting depth: named operations, fusion sources, and row operations.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
-- Multi-term expansion limits are operator opt-ins, all off by default (`0`).
-  With limits off, broad patterns on high-cardinality fields simply run. Operators
-  exposing public endpoints can bound this work using the following options.
-  A request cannot raise or disable an operator limit. Exceeding one fails with
+- Multi-term expansion limits bound the term-dictionary work of prefix,
+  wildcard, regex, range, and fuzzy queries. Exceeding one fails with
   `RESOURCE_EXHAUSTED` naming the query and limit, never a truncated match set.
   See [Expansion limits](query-reference.md#expansion-limits).
   - `search.multiterm-max-expansions`: terms one query may expand per segment,

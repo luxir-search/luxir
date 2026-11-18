@@ -297,6 +297,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
     auto getDocList = [&calc](SearchResponse* resp) -> luxir::api::DocList& {
       return *calc.slotArm<luxir::api::DocList>(resp);
     };
+    qr.noteWindow(mergeableCollector->size());
     DocEmission emission = calc.underBucketSlot()
         ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
     auto extra = qr.rowColumns();

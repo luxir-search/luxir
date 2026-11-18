@@ -3,6 +3,7 @@
 
 #pragma once
 #include <atomic>
+#include <format>
 #include <string_view>
 #include <vector>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -76,6 +77,9 @@ public:
   IndexReader& reader;
   std::string_view fieldName;
   int64_t limit;
+  // For limit -1 (all): search.max_facet_buckets, which the returned page
+  // may not pass (emitFieldBuckets). Zero is unlimited.
+  int64_t maxBuckets = 0;
   int64_t minCount; // minimum count for a facet to be included in the result
   bool missing;
 
@@ -106,6 +110,12 @@ public:
   void emitFieldBuckets(api::FacetResult& result,
                         const std::vector<std::pair<Label, int64_t>>& buckets,
                         std::pmr::memory_resource& mr) const {
+    if (maxBuckets > 0 && (int64_t)buckets.size() > maxBuckets) {
+      throw RequestError(std::format(
+          "facet '{}': limit -1 would return {} buckets, more than the maximum of {} "
+          "(search.max_facet_buckets); set an explicit limit", facetName,
+          buckets.size(), maxBuckets), "facet_limit_exceeded");
+    }
     if constexpr (std::is_same_v<Label, int64_t>) {
       withValueOutput(mr, [&](auto output) {
         emitBuckets(result, buckets, mr, output);

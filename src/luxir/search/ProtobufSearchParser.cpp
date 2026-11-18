@@ -133,6 +133,8 @@ struct SearchParserImpl {
   // Root-level ops are depth 1. Ops nested past the configured cap are rejected
   // in addSubs, the single funnel for op recursion.
   const int maxOpDepth;
+  // Ops parsed so far, against search.max_ops (countOp).
+  int64_t opCount = 0;
   static constexpr size_t MAX_RANGE_BUCKETS = 100000;
 
   enum class TopDocsPlacement : uint8_t {
@@ -174,6 +176,49 @@ struct SearchParserImpl {
 
   void warnOnce(std::string_view code, const std::string& message) {
     req.warnOnce(code, message);
+  }
+
+  // Every search operation of the request counts against search.max_ops,
+  // whatever its nesting: named ops, fusion sources, and row ops.
+  void countOp(std::string_view name) {
+    int64_t maxOps = req.searchConfig.max_ops;
+    if (maxOps > 0 && ++opCount > maxOps) {
+      throw RequestError(std::format(
+          "operation '{}' exceeds the limit of {} search operations per request "
+          "(search.max_ops)", name, maxOps), "too_many_ops");
+    }
+  }
+
+  // Applies search.max_result_window to one ranked list's requested page.
+  // An explicit offset + limit past the window is rejected; limit -1 (all)
+  // resolves to the rest of the window. The docs response format streams
+  // every match as an export, so it is exempt, bounded by the request memory
+  // breaker instead. Returns the limit to use (-1 still means all).
+  int64_t windowLimit(std::string_view what, int64_t offset, int64_t limit) {
+    int64_t window = req.searchConfig.max_result_window;
+    if (window <= 0 || req.proto.response_format == api::ResponseFormat::DOCS) return limit;
+    if (limit < 0 ? offset >= window : limit > window || offset > window - limit) {
+      throw RequestError(std::format(
+          "{}: offset {} + limit {} exceeds the result window of {} "
+          "(search.max_result_window); page with a smaller offset, or stream every "
+          "match with response_format docs", what, offset,
+          limit < 0 ? std::string("-1 (all)") : std::to_string(limit), window),
+          "result_window_exceeded");
+    }
+    return limit < 0 ? window - offset : limit;
+  }
+
+  // Applies search.max_facet_buckets to one field facet's explicit limit.
+  // limit -1 (all) keeps its meaning; the facet fails at emission if all is
+  // more than the cap (FacetReq::maxBuckets).
+  void checkFacetBucketLimit(std::string_view facetName, int64_t limit) {
+    int64_t cap = req.searchConfig.max_facet_buckets;
+    if (cap > 0 && limit > cap) {
+      throw RequestError(std::format(
+          "facet '{}': limit {} exceeds the maximum of {} buckets "
+          "(search.max_facet_buckets)", facetName, limit, cap),
+          "facet_limit_exceeded");
+    }
   }
 
   static std::optional<CalendarUnit> calendarUnit(
@@ -449,6 +494,7 @@ public:
 
   SearchOp* parseOp(std::string_view name, const luxir::api::SearchOp& searchOp,
                     int depth, OpsPlacement placement) {
+    countOp(name);
     auto inherited = options;
     options = inherited.child(searchOp, name);
     auto restoreOptions = scope_guard([&]() noexcept { options = inherited; });
@@ -820,6 +866,7 @@ public:
       // -1 sentinel exactly.
       limit = std::max<int64_t>(*facetReq.limit, -1);
     }
+    checkFacetBucketLimit(facetName, limit);
     int64_t minCount = -1;
     if (facetReq.mincount.has_value()) {
       minCount = *facetReq.mincount;
@@ -911,6 +958,7 @@ public:
     if (facet == nullptr) {
       throw std::logic_error("Unhandled field facet storage");
     }
+    if (limit < 0) facet->maxBuckets = std::max<int64_t>(req.searchConfig.max_facet_buckets, 0);
     configureMeasure(*facet, measure);
     return facet;
   }
@@ -1829,6 +1877,10 @@ public:
   TopDocsReq* parseTopDocs(std::string_view name,
                            const luxir::api::TopDocs& topDocsReq,
                            TopDocsPlacement placement, Query* selectedRows = nullptr) {
+    // Ordinary placements were counted by parseOp.
+    if (placement == TopDocsPlacement::FUSION_SOURCE || placement == TopDocsPlacement::ROW_OP) {
+      countOp(name);
+    }
     int64_t countLimit = topDocsReq.count_limit.value_or(0);
     if (countLimit < -2) {
       throw std::runtime_error(
@@ -1897,9 +1949,15 @@ public:
           "top_docs '" + std::string(name) + "': offset must be >= 0");
     }
     int64_t specifiedLimit = topDocsReq.limit.has_value() ? *topDocsReq.limit : 10;
+    // Fusion source offsets are ignored, so only their limit meets the window.
+    int64_t windowed = windowLimit("top_docs '" + std::string(name) + "'",
+        placement == TopDocsPlacement::FUSION_SOURCE ? 0 : offset, specifiedLimit);
     // limit to actual number of docs in the index (or all if limit == -1)
     int64_t maxDoc = view()->maxDoc();
-    int64_t limit = specifiedLimit < 0 ? maxDoc : std::min(specifiedLimit, maxDoc);
+    int64_t limit = windowed < 0 ? maxDoc : std::min(windowed, maxDoc);
+    // limit -1 resolved to the window, which may cut the list short.
+    bool windowCapped = specifiedLimit < 0 && windowed >= 0
+        && (placement == TopDocsPlacement::FUSION_SOURCE ? 0 : offset) + windowed < maxDoc;
     // Keep limit as the page size for request-shape decisions. Fusion source
     // offsets are response-shape fields and do not enlarge candidate pools.
     int64_t topCount = limit;
@@ -2410,6 +2468,7 @@ public:
 
     qr->collapse = collapse;
     qr->diversify = diversify;
+    qr->windowCapped = windowCapped;
     qr->boundedCount = boundedCount && wholeMembershipWeight == nullptr
         && wholeMembershipUse == nullptr;
     if (qr->boundedCount && filterWeights.empty()) {
@@ -2716,8 +2775,10 @@ public:
     }
 
     int64_t specifiedLimit = fusionProto.limit.has_value() ? *fusionProto.limit : 10;
+    int64_t windowed = windowLimit("fusion '" + std::string(name) + "'", offset, specifiedLimit);
     int64_t maxDoc = view()->maxDoc();
-    int64_t limit = specifiedLimit < 0 ? maxDoc : std::min(specifiedLimit, maxDoc);
+    int64_t limit = windowed < 0 ? maxDoc : std::min(windowed, maxDoc);
+    bool windowCapped = specifiedLimit < 0 && windowed >= 0 && offset + windowed < maxDoc;
     int64_t topCount = limit == 0 ? 0
         : offset >= maxDoc ? maxDoc : offset + std::min(limit, maxDoc - offset);
 
@@ -2727,6 +2788,7 @@ public:
       method, rrfK);
 
     fusion->collapse = collapse;
+    fusion->windowCapped = windowCapped;
     if (collapse && !fusionProto.collapse->head_sort.empty()) {
       fusion->headSort = parseSorts(fusionProto.collapse->head_sort);
     }
