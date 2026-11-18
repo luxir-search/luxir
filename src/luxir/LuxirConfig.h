@@ -55,6 +55,14 @@ struct ServerConfig {
     // buffered-request ceilings move together.  Values above INT_MAX (gRPC's
     // own ceiling) are clamped by the server.
     int64_t max_receive_message_size = 0;
+    // HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS: calls one client connection
+    // may have open at once.  0 = gRPC's own default (unlimited).
+    int64_t max_concurrent_streams = 1024;
+    // Memory gRPC itself may use for transport buffers, across connections
+    // (grpc::ResourceQuota); under pressure it shrinks windows and refuses
+    // new calls.  -1 = auto: a quarter of the node budget (max_ram_mb), at
+    // least 64 MiB, or unlimited when that budget is.  0 = unlimited.
+    int64_t resource_quota_mb = -1;
 
     /// Resolve threads: 0 means auto (affinity-aware concurrency / 2, minimum 1).
     int resolveThreads() const {
@@ -158,12 +166,33 @@ struct IngestConfig {
   int64_t stream_batch_docs = 10000;
 
   // Maximum number of streaming NDJSON batches one connection has decoding or
-  // being indexed at once.  0 derives the window from the node's workers
+  // being indexed at once, and of updates one gRPC UpdateStream call has in
+  // flight (admitted, not yet answered).  0 derives the window from the node's workers
   // (server.workers) plus two; 1 indexes one batch at a time.  An indexed batch
   // frees its slot without waiting for earlier batches to complete.  Staging
   // memory grows roughly with this window, and live inverter memory grows with
   // min(window, workers).
   int64_t max_inflight_batches = 0;
+  // The resolved window: also the most updates one gRPC UpdateStream call
+  // has admitted and not yet answered.
+  int64_t inflightBatches(int workers) const {
+    return max_inflight_batches == 0 ? (int64_t)workers + 2 : max_inflight_batches;
+  }
+
+  // Node-wide admission of update requests (UpdateAdmission): updates that
+  // are admitted and not yet complete, across every transport and
+  // collection, and the raw request bytes they hold.  Past either limit a
+  // unary gRPC Update fails with RESOURCE_EXHAUSTED, a buffered HTTP update
+  // gets 429 with Retry-After, and gRPC UpdateStream calls and NDJSON streams
+  // stop reading until updates complete.  An update larger than the whole
+  // byte limit is admitted alone.
+  // Count: -1 = auto, 32 per task arena worker (server.workers), at least
+  // 256.  0 = unlimited.
+  int64_t max_inflight_updates = -1;
+  // Bytes: -1 = auto, a quarter of indexing.max-ram-mb (or an eighth of
+  // max-ram-mb when that is unlimited), at least two max_request_body; 0 =
+  // unlimited (also the auto value when every RAM budget is unlimited).
+  int64_t max_inflight_update_bytes = -1;
 
   // Effective per-record cap: max_record if set, else the buffered-body cap.
   int64_t maxRecordBytes() const { return max_record != 0 ? max_record : max_request_body; }
@@ -246,7 +275,8 @@ struct LuxirConfig {
   void addOptions(CLI::App& app);
 
   /// Resolve the auto (-1) RAM sentinels: max_ram_mb to a share of system RAM,
-  /// index.max_ram_mb to a share of that.  Idempotent, and called both by
+  /// index.max_ram_mb to a share of that, and the budgets sized from them
+  /// (update admission, the gRPC resource quota).  Idempotent, and called both by
   /// normalize() and by LuxirNode, so a config built in code (tests, embedding)
   /// gets the same budgets as one parsed from the command line.
   void resolveRamBudgets();

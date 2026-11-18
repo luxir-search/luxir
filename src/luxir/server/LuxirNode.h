@@ -15,6 +15,7 @@
 #include <vector>
 #include "Collections.h"
 #include "PluginNodeState.h"
+#include "UpdateAdmission.h"
 #include "luxir/index/IndexRamBudget.h"
 #include "oneapi/tbb/task_arena.h"
 #include "oneapi/tbb/task_scheduler_observer.h"
@@ -140,6 +141,9 @@ public:
     return indexRamBudget;
   }
 
+  // Every transport admits updates through this before submitting them.
+  UpdateAdmission& getUpdateAdmission() { return updateAdmission; }
+
   SearchEngine& getSearchEngine() {
     return *searchEngine;
   }
@@ -205,6 +209,10 @@ private:
   ArenaThreadNamer indexThreadNamer{indexArena, "luxir_idx_", 1, true};
 
   IndexRamBudget indexRamBudget;
+  // Limits set from the resolved config in the constructor.  Declared ahead
+  // of the collections: tickets of messages a closing writer drains release
+  // into it.
+  UpdateAdmission updateAdmission{0, 0, &indexRamBudget};
   std::shared_ptr<ReplicationSource> replication;
   std::shared_ptr<CommitWaits> commitWaits;
   std::shared_ptr<CollectionEvents> events; // ordered feed of the collection map

@@ -30,6 +30,10 @@ locations, browse `src/luxir/<area>/`.
      cancellation and captured follower expiry. Satisfied floors retain their exact collection.
    - `ProtoUpdateMessage::Completion`: Owning local result plus copied replica-wait specification;
      transports release indexing bodies before waiting for visibility.
+   - `UpdateAdmission`: Node-wide count and raw-byte limit on updates between transport
+     admission and `done()`; the ticket rides on the `ProtoUpdateMessage`. Unary gRPC and
+     buffered HTTP are refused past it, gRPC `UpdateStream` and NDJSON park a resume and stop
+     reading. Admitted bytes are transient `IndexRamBudget` reservations.
 
 2. **Search Engine** (`src/luxir/search/`)
    - `ReaderManager`: Per-collection snapshot publication, reader refresh, and filter cache;
@@ -212,7 +216,7 @@ locations, browse `src/luxir/<area>/`.
 
 **Search**: gRPC/HTTP Request -> SearchEngine -> Query Parsing -> Weight Creation -> Per-Segment Plan Resolution and Execution -> Result Collection -> Response
 
-**Indexing**: gRPC/HTTP Request -> IndexWriter -> Document Processing (Inverter) -> Segment Writing -> optional Commit
+**Indexing**: gRPC/HTTP Request -> UpdateAdmission -> IndexWriter -> Document Processing (Inverter) -> Segment Writing -> optional Commit
 
 HTTP update bodies are not decoded on the connection's I/O shard thread. A
 buffered JSON body is decoded in the task-arena task that submits it. An

@@ -655,6 +655,8 @@ public:
   // This is the primary entry point for indexing documents.
   // A closed writer is not rejected here but in startUpdateNode, which is inside the
   // graph and hence ordered against close()'s drain; the message completes with an error.
+  // The graph queues whatever it is given: transports bound what they submit
+  // with the node's UpdateAdmission (server/UpdateAdmission.h).
   bool submitUpdate(UpdateMessage* msg) {
     // this is currently a simple submit to the startUpdateNode, but could be more complex in the future.
     // We could also eliminate the startUpdateNode completely and just submit to the processUpdateNode

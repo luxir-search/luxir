@@ -1697,6 +1697,19 @@ message TransportStats {
   int64 io_threads = 7;      // HTTP only: running connection shard threads
 }
 
+// Updates admitted and not yet complete, against indexing.max-inflight-updates
+// and indexing.max-inflight-update-bytes. Past either limit a unary gRPC
+// Update fails with RESOURCE_EXHAUSTED, a buffered HTTP update gets 429, and
+// streams (gRPC UpdateStream, NDJSON) stop reading until there is room.
+message UpdateAdmissionStats {
+  int64 in_flight = 1;        // updates admitted and not yet complete
+  int64 in_flight_bytes = 2;  // their raw request bytes
+  int64 max_in_flight = 3;    // zero is unlimited
+  int64 max_bytes = 4;        // zero is unlimited
+  uint64 rejected = 5;        // unary gRPC and buffered HTTP updates refused
+  uint64 paused = 6;          // times a stream stopped reading for want of room
+}
+
 // Process-wide service counters since start. Counters reset on restart and
 // cache-control reset_counters does not touch them.
 message ServiceStats {
@@ -1712,6 +1725,8 @@ message ServiceStats {
   // The BLAS kernels selected for this CPU at startup: the OpenBLAS core name,
   // or "Accelerate" on macOS.
   string blas_core = 25;
+  // Node-wide update admission across both transports.
+  UpdateAdmissionStats update_admission = 64;
   bool read_only = 2;
   // Upper bounds, in seconds, of the request, search execution and index batch
   // histograms.

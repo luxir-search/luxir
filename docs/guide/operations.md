@@ -545,6 +545,8 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_ingest_documents_total`, `luxir_ingest_delete_ids_total` | Documents accepted into indexing or rejected/rolled back, and accepted delete IDs. Acceptance does not mean durability; commits can still fail. Deletes count submitted IDs, not matched documents. |
 | `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
 | `luxir_stream_pauses_total` | Response backpressure events by transport. |
+| `luxir_update_admission_in_flight`, `luxir_update_admission_in_flight_bytes`, `luxir_update_admission_max_in_flight`, `luxir_update_admission_max_bytes` | Updates admitted node-wide and not yet complete, their raw request bytes, and the two limits (`0` is unlimited). See [Update admission](#update-admission). |
+| `luxir_update_admission_rejected_total`, `luxir_update_admission_paused_total` | Unary gRPC and buffered HTTP updates refused by update admission, and times an update stream (gRPC `UpdateStream`, NDJSON) stopped reading for want of room. |
 | `luxir_http_connections`, `luxir_http_io_threads` | Live HTTP sessions and running connection-shard threads; the thread gauge excludes the accept thread. gRPC active calls are in `luxir_requests_in_flight`. |
 | `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, merge, vector-build, and reader-refresh stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
 | `luxir_node_memory_budget_bytes`, `luxir_search_request_memory_limit_bytes` | Configured managed-memory budget and tracked per-search ceiling. Neither is a process RSS limit. |
@@ -777,6 +779,68 @@ The HTTP request limits distinguish bounded material from streams:
   (`--server.workers`) plus two; `1` indexes one batch at a time. Reads pause
   when the limit is reached and resume as batches are indexed, without waiting
   for earlier batches to complete. A larger limit uses more staging memory.
+  The same window bounds the updates one gRPC `UpdateStream` call has
+  admitted and not yet answered.
+
+### Update admission
+
+Every update request, on either transport and for every collection, is
+admitted node-wide before it reaches a writer, and holds its slot until it
+completes. Indexing runs at lower priority than search, so without a bound a
+client could queue updates faster than a busy node indexes them until memory
+ran out.
+
+```bash
+./luxir \
+  --indexing.max-inflight-updates=1024 \
+  --indexing.max-inflight-update-bytes=512MB
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `indexing.max-inflight-updates` | 32 per `--server.workers`, at least 256 | Updates admitted and not yet complete. `0` is unlimited. |
+| `indexing.max-inflight-update-bytes` | 25% of `--indexing.max-ram-mb` (12.5% of `--max-ram-mb` when that is unlimited), at least twice `--indexing.max-request-body` | Raw request bytes those updates hold. `0` is unlimited, as is the default when every RAM budget is. |
+
+An update counts its raw body: a buffered HTTP request, one gRPC message, or
+one internal NDJSON batch. A single update larger than the whole byte limit is
+admitted when nothing else is in flight, so the limit never makes a valid
+request impossible. The slot is released when the writer finishes with the
+update, whatever its outcome, before any replica wait.
+
+Past either limit:
+
+- a unary gRPC `Update` fails with `RESOURCE_EXHAUSTED` (code
+  `too_many_updates`);
+- a buffered HTTP `_update` gets `429 Too Many Requests` with `Retry-After: 1`
+  and the same code, before its body is decoded;
+- a gRPC `UpdateStream` call and an NDJSON stream stop reading and resume when
+  updates complete. Nothing is refused mid-stream: the client's writes back up
+  through TCP or HTTP/2 flow control. A message a stream has already read, and
+  an NDJSON group close or commit, still go ahead, so each stream can overshoot
+  by one update.
+
+No thread waits for room; a paused stream is resumed by the release that makes
+it. Refusing or pausing happens before the writer sees the update, so it never
+fails a writer or a shared inverter. Admitted bytes are also charged to the
+indexing RAM budget as draining reservations (`luxir_index_ram_draining_bytes`):
+merges wait for that RAM, but inverters are not flushed for it, since flushing
+would not free it.
+
+`_stats` reports the current state under `service.update_admission`.
+
+gRPC also bounds its transport:
+
+```bash
+./luxir --server.grpc.max-concurrent-streams=1024 --server.grpc.resource-quota-mb=4096
+```
+
+- `server.grpc.max-concurrent-streams` (default 1024) caps the calls one client
+  connection may have open at once (HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`);
+  `0` uses gRPC's own default, unlimited.
+- `server.grpc.resource-quota-mb` caps the memory gRPC's own buffers may use
+  across connections; under it gRPC shrinks flow-control windows and refuses
+  new calls. It defaults to 25% of `--max-ram-mb`, at least 64, and is
+  unlimited when `--max-ram-mb` is. `0` is unlimited.
 
 gRPC has one request limit, on the size of each received message (a unary
 request or one message of a stream):
