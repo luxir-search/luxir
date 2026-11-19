@@ -597,6 +597,7 @@ struct ServiceStats {
   ActivityStats reader_refresh;
   uint64_t segments_opened = 0;
   uint64_t segment_bytes_mapped = 0;
+  ActivityStats reader_wait;
   bool read_only = false;
 };
 struct ProcessStats {
