@@ -164,11 +164,12 @@ public:
   // Each child row space and its row count, sorted by path as in the core's
   // catalog, whose ordinal of the i-th entry is i + 1.
   const SpaceRows spaces;
+  const std::shared_ptr<const SegmentSummary> summary;  // handed to the core it opens; may be null
   SegmentBase(uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc, SpaceRows spaces,
-              std::unique_ptr<HeldFiles> files, std::shared_ptr<Metrics> metrics,
-              std::shared_ptr<const UnreadableHook> onUnreadable)
+              std::unique_ptr<HeldFiles> files, std::shared_ptr<const SegmentSummary> summary,
+              std::shared_ptr<Metrics> metrics, std::shared_ptr<const UnreadableHook> onUnreadable)
       : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), segId(segId),
-        creatorEpoch(creatorEpoch), maxDoc(maxDoc), spaces(std::move(spaces)) {}
+        creatorEpoch(creatorEpoch), maxDoc(maxDoc), spaces(std::move(spaces)), summary(std::move(summary)) {}
   SegmentBase(uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc, SpaceRows spaces,
               std::shared_ptr<SegmentCore> opened)
       : SegmentPart(std::move(opened)), segId(segId), creatorEpoch(creatorEpoch), maxDoc(maxDoc),

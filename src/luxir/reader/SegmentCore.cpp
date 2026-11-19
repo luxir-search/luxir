@@ -260,8 +260,10 @@ bool SegmentCore::initializeFromFiles(Directory& dir, bool missingFileOK, bool e
 }
 
 std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
-                                                 bool missingFileOK, bool expectSynced) {
+                                                 bool missingFileOK, bool expectSynced,
+                                                 std::shared_ptr<const SegmentSummary> summary) {
   auto core = std::shared_ptr<SegmentCore>(new SegmentCore(segId, creatorEpoch));
+  core->root.summary = std::move(summary);
   if (!core->initializeFromFiles(dir, missingFileOK, expectSynced)) return nullptr;
   return core;
 }

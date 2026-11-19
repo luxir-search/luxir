@@ -35,8 +35,11 @@ class SegmentCore {
   bool initializeFromFiles(Directory& dir, bool missingFileOK, bool expectSynced);
 
 public:
+  // `summary`, when given, must be the segment's own (seg_id and max_doc
+  // checked): the root space's reader takes header facts it records from it.
   static std::shared_ptr<SegmentCore> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
-                                            bool missingFileOK = false, bool expectSynced = false);
+                                            bool missingFileOK = false, bool expectSynced = false,
+                                            std::shared_ptr<const SegmentSummary> summary = nullptr);
   explicit SegmentCore(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
   ~SegmentCore();
   SegmentCore(const SegmentCore&) = delete;

@@ -11,6 +11,7 @@
 #include "FieldMetadataMemory.h"
 #include "IntColReader.h"
 #include "Postings.h"
+#include "luxir/index/SegmentSummary.h"
 
 namespace luxir {
 
@@ -104,6 +105,25 @@ int32_t PostingsReader::findOrdinal(std::string_view name) const {
       ? (int32_t)(found - fieldOffsets) : -1;
 }
 
+std::optional<PostingsReader::Field::ColumnBounds> PostingsReader::summaryColumnBounds(const Field& field) const {
+  if (!summary) return std::nullopt;
+  const api::FieldSummary* record = summary->field((std::string_view)field.fieldname);
+  if (!record || record->type != (uint32_t)field.type
+      || (record->summary_flags & SegmentSummary::HAS_NUMERIC) == 0) {
+    return std::nullopt;
+  }
+  return Field::ColumnBounds{record->num_min, record->num_max};
+}
+
+const NumColumnFormat::LeafMeta* PostingsReader::Field::numericLeafMeta() const {
+  if (!FieldType::isNumericColumn(type) || columnLoc.offset() == 0) return nullptr;
+  std::call_once(leafMetaOnce, [this] {
+    IntColReader column(*reader, *this);
+    if (column.leafBounded()) leafMeta = column.leafMeta();
+  });
+  return leafMeta ? &*leafMeta : nullptr;
+}
+
 const PostingsReader::Field* PostingsReader::fieldInfo(std::string_view field) {
   return fieldInfo(findOrdinal(field));
 }
@@ -132,10 +152,14 @@ const PostingsReader::Field* PostingsReader::fieldInfo(int32_t ordinal) {
     if (FieldType::storage(fresh->type) == FieldType::Storage::BIN && (fresh->flags & FieldType::STORED) != 0) {
       fresh->stored = std::make_unique<const StoredFieldsMetadata>(*this, *fresh);
     }
+    fresh->reader = this;
     if (FieldType::isNumericColumn(fresh->type) && fresh->columnLoc.offset() > 0) {
-      IntColReader column(*this, *fresh);
-      fresh->columnBounds = Field::ColumnBounds{column.getMin(), column.getMax()};
-      if (column.leafBounded()) fresh->leafMeta = column.leafMeta();
+      // The summary's bounds are the column writer's own (IntColWriter).
+      fresh->columnBounds = summaryColumnBounds(*fresh);
+      if (!fresh->columnBounds) {
+        IntColReader column(*this, *fresh);
+        fresh->columnBounds = Field::ColumnBounds{column.getMin(), column.getMax()};
+      }
     }
     if (slot.compare_exchange_strong(entry, fresh.get(),
                                     std::memory_order_release,

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -20,6 +21,7 @@ namespace luxir {
 
 class SegmentCore;
 class FieldReader;
+class SegmentSummary;
 class TermsEnum;
 class DocsEnum;
 
@@ -31,6 +33,10 @@ class PostingsReader {
   SegmentCore& segmentCore;
   int32_t maxdoc = 0;
   const SpaceOrdinal ordinal;
+  // The segment's summary sidecar for the root space, when the opener had a
+  // valid one: header facts it records (column bounds) are taken from it
+  // instead of the segment's data files. Null proves nothing; the data files answer.
+  std::shared_ptr<const SegmentSummary> summary;
 
   // Ordinals follow the sorted field index. Only the directory is allocated
   // at open; slot pages and immutable headers are published on first use.
@@ -46,18 +52,23 @@ public:
     struct ColumnBounds {
       int64_t min, max;
     };
+    // From the segment summary when it records them, else from the column
+    // header; opening a field never reads column data when the summary has them.
     std::optional<ColumnBounds> columnBounds;
-    // Field-sort planning reads every segment's leaf bounds. Keep the view
-    // with the header rather than rebuilding it for each request.
-    std::optional<NumColumnFormat::LeafMeta> leafMeta;
     std::unique_ptr<const StoredFieldsMetadata> stored;
+    // Field-sort planning reads every segment's leaf bounds. Keep the view
+    // with the header rather than rebuilding it for each request; it is built
+    // on first use, which reads the column header.
+    PostingsReader* reader = nullptr;
+    mutable std::once_flag leafMetaOnce;
+    mutable std::optional<NumColumnFormat::LeafMeta> leafMeta;
 
     size_t allocatedBytes() const {
       return sizeof(*this) + (stored ? stored->allocatedBytes() : 0);
     }
-    const NumColumnFormat::LeafMeta* numericLeafMeta() const noexcept {
-      return leafMeta ? &*leafMeta : nullptr;
-    }
+    // Null when the field has no leaf-bounded numeric column. May throw on
+    // the first call when the column header cannot be read.
+    const NumColumnFormat::LeafMeta* numericLeafMeta() const;
   };
 
   // used as a sentinel value for docs and positions iterators in a single segment.
@@ -86,6 +97,8 @@ private:
   friend class SegmentCore;
   PostingsReader(SegmentCore& core, SpaceOrdinal ordinal) : segmentCore(core), ordinal(ordinal) {}
   void initialize(int32_t maxDoc, int64_t fieldOffsetsLoc, const uint32_t* fieldOffsets, int32_t count);
+  // The column bounds the summary records for `field`, if any.
+  std::optional<Field::ColumnBounds> summaryColumnBounds(const Field& field) const;
 
 public:
 
