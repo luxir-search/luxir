@@ -33,7 +33,9 @@ The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
 | [`luxir.Admin/Stats`](../reference/protobuf.md#method-luxir.admin.stats) | unary | Read node, tenant or collection statistics (the structured form of HTTP `_stats`). |
 
 The server also registers the standard gRPC health service and descriptor
-reflection. Luxir implements the application services through gRPC's generic
+reflection. In the health service the unnamed service is liveness and
+`luxir.ready` follows HTTP `GET /_ready`; see
+[Readiness](operations.md#readiness-and-load-balancers). Luxir implements the application services through gRPC's generic
 byte transport, so the stock reflection plugin can resolve known symbols but
 does not currently enumerate those services in `ListServices`. Ask for a known
 symbol directly when using a reflection client.

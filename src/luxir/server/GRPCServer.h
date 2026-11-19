@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <thread>
 #include <latch>
 #include <oneapi/tbb/info.h>
@@ -25,6 +26,7 @@ public:
   // config" (per-connection response buffering cap; see ServerConfig).
   GRPCServer(LuxirNode& node, int nthreads = std::max(1, oneapi::tbb::info::default_concurrency() / 2),
              int port = 0, int64_t streamBufferBytes = -1);
+  ~GRPCServer();
 
   /// Per-call cap on buffered response bytes (flow-control high-water mark).
   int64_t streamBufferBytes() const { return streamBufferBytes_; }
@@ -78,6 +80,8 @@ private:
   int serverPort = 0;
   int requestedPort = 0;
   int64_t streamBufferBytes_;
+  // Readiness listener driving the health service's "luxir.ready" status.
+  std::atomic<uint64_t> readyListener{0};
 
 
   // this is run for each thread

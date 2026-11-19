@@ -172,6 +172,20 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--server.stream_buffer_bytes", server.stream_buffer_bytes,
                  "Per-connection buffered response bytes before streaming producers pause")
       ->default_val(server.stream_buffer_bytes);
+  app.add_option("--server.ready.max-follower-lag-ms", server.ready.max_follower_lag_ms,
+                 "Follower collections stay ready while at most this far behind their source, "
+                 "once caught up (0 = no bound)")
+      ->default_val(server.ready.max_follower_lag_ms)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--server.ready.min-resident-fraction", server.ready.min_resident_fraction,
+                 "Fraction of each collection's file bytes that must be cached before /_ready "
+                 "reports ready; above 0 also warms collections below it (0 = report only)")
+      ->default_val(server.ready.min_resident_fraction)
+      ->check(CLI::Range(0.0, 1.0));
+  app.add_option("--server.ready.refresh-ms", server.ready.refresh_ms,
+                 "Milliseconds between readiness evaluations")
+      ->default_val(server.ready.refresh_ms)
+      ->check(CLI::Range((int64_t)1, INT64_MAX));
 
   app.add_option("--replication.pin-idle-timeout-ms", replication.pin_idle_timeout_ms,
                  "Snapshot pin idle timeout in milliseconds")->default_val(replication.pin_idle_timeout_ms);

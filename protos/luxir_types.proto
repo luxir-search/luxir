@@ -1676,6 +1676,8 @@ message StatsResponse {
   double duration_seconds = 13;
   // Node-wide checksum scrub counters; set when store.scrub-interval-s is.
   ScrubStats scrub = 14;
+  // Node scope only: the latest readiness evaluation, as GET /_ready reports it.
+  ReadinessStats readiness = 40;
 }
 
 // Cumulative duration histogram. counts[i] is the number of observations at or
@@ -1975,6 +1977,49 @@ message ScrubStats {
   uint64 mismatches = 4;      // checksum mismatches, EIO, or unexpectedly missing files
   uint64 last_pass_end = 5;   // Unix milliseconds; absent before the first pass
   uint64 errors = 6;          // other file check errors; retried on the next pass
+}
+
+// Whether the node should receive traffic (GET /_ready), from the latest
+// background evaluation. Ready means every collection this node should serve
+// is available, followers have caught up with their source within
+// server.ready.max-follower-lag-ms, and each collection's resident fraction
+// reaches server.ready.min-resident-fraction.
+message ReadinessStats {
+  bool ready = 1;
+  string reason = 2;   // why the node is not ready; empty when it is
+  uint64 checked = 3;  // Unix milliseconds of the evaluation; zero before the first
+  repeated CollectionReadiness collections = 4;
+}
+
+message CollectionReadiness {
+  string name = 1;
+  string tenant = 2;
+  bool ready = 3;
+  string reason = 4;   // why the collection holds back readiness; empty when ready
+  // Followers: how long the local copy has trailed the source's latest commit.
+  optional uint64 follower_lag_ms = 5;
+  // Bytes of the files the current reader holds open, the estimated resident
+  // bytes of those whose storage can tell, and the bytes of those that cannot.
+  uint64 file_bytes = 6;
+  uint64 resident_bytes = 7;
+  uint64 unknown_bytes = 8;
+  // resident_bytes / (file_bytes - unknown_bytes); absent when nothing could tell.
+  optional double resident_fraction = 9;
+  // Filter-cache hits per lookup since the previous evaluation; absent without lookups.
+  optional double filter_cache_hit_ratio = 10;
+  WarmupStatus warmup = 11;  // the latest warmup of this collection, if any
+}
+
+// A warmup reads a collection's files into the page cache (or its storage's
+// own cache), smallest files first, up to a byte budget.
+message WarmupStatus {
+  uint64 budget_bytes = 1;
+  uint64 loaded_bytes = 2;
+  bool running = 3;
+  bool automatic = 4;  // started by server.ready.min-resident-fraction, not POST _warm
+  uint64 started = 5;  // Unix milliseconds
+  uint64 finished = 6; // Unix milliseconds; zero while queued or running
+  string error = 7;
 }
 
 // Cached field metadata payload, excluding allocator overhead and unused

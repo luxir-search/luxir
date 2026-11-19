@@ -5,6 +5,7 @@
 #include "CommitWaits.h"
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
+#include "Readiness.h"
 #include "Scrubber.h"
 #include "luxir/plugin/Plugin.h"
 #include "luxir/util/DateTime.h"
@@ -180,10 +181,13 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   scrubber = std::make_unique<Scrubber>(*this);
   if (mode == Mode::SERVE) scrubber->start();
   if (follower && mode == Mode::SERVE) follower->start();
+  readiness_ = std::make_unique<Readiness>(*this);
   pluginStates.create(*this, PluginRegistry::global());
+  if (mode == Mode::SERVE) readiness_->start();
 }
 
 LuxirNode::~LuxirNode() {
+  if (readiness_) readiness_->stop();
   pluginStates.clear();
   scrubber->stop();
   if (follower) follower->stop();

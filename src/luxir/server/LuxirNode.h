@@ -34,6 +34,7 @@ class ReplicationSource;
 class CommitWaits;
 class ReplicationFollower;
 class Scrubber;
+class Readiness;
 
 class LuxirNode {
 public:
@@ -65,6 +66,8 @@ public:
   // Checksum scrub of published snapshots; runs periodically only when
   // store.scrub-interval-s is set, but scrub() works on demand regardless.
   Scrubber& getScrubber() { return *scrubber; }
+  // GET /_ready and the gRPC "luxir.ready" health service.
+  Readiness& readiness() { return *readiness_; }
   bool following() const { return !config.replication.source.empty(); }
   ReplicationSource& getReplication() { return *replication; }
   CommitWaits& getCommitWaits() { return *commitWaits; }
@@ -211,6 +214,7 @@ private:
   std::unique_ptr<Collections> collections_;
   std::unique_ptr<ReplicationFollower> follower;
   std::unique_ptr<Scrubber> scrubber;
+  std::unique_ptr<Readiness> readiness_;
   std::unique_ptr<SearchEngine> searchEngine;
   PluginNodeStates pluginStates;
 };

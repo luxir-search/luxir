@@ -87,6 +87,7 @@ struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListColl
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct RowSpaceStats; struct AuxStats;
 struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats;
+struct ReadinessStats; struct CollectionReadiness; struct WarmupStatus;
 struct HistogramStats; struct ActivityStats; struct TransportStats; struct ServiceStats; struct SystemStats;
 struct HostStats; struct OutcomeStats; struct CollectionActivityStats; struct ProcessIoStats;
 struct ProcessStats; struct CpuTimes; struct HostCpuStats; struct HostMemoryStats; struct NetworkInterfaceStats;
@@ -775,6 +776,34 @@ struct ScrubStats {
   uint64_t errors = 0;
   uint64_t last_pass_end = 0;
 };
+struct WarmupStatus {
+  uint64_t budget_bytes = 0;
+  uint64_t loaded_bytes = 0;
+  bool running = false;
+  bool automatic = false;
+  uint64_t started = 0;
+  uint64_t finished = 0;
+  std::string_view error;
+};
+struct CollectionReadiness {
+  std::string_view name;
+  std::string_view tenant;
+  bool ready = false;
+  std::string_view reason;
+  std::optional<uint64_t> follower_lag_ms;
+  uint64_t file_bytes = 0;
+  uint64_t resident_bytes = 0;
+  uint64_t unknown_bytes = 0;
+  std::optional<double> resident_fraction;
+  std::optional<double> filter_cache_hit_ratio;
+  std::optional<WarmupStatus> warmup;
+};
+struct ReadinessStats {
+  bool ready = false;
+  std::string_view reason;
+  uint64_t checked = 0;
+  std::span<const CollectionReadiness> collections;
+};
 struct StatsResponse {
   std::optional<StatsTotals> totals;
   std::span<const CollectionStats> collections;
@@ -785,6 +814,7 @@ struct StatsResponse {
   std::optional<HostStats> host;
   double duration_seconds = 0;
   std::optional<ScrubStats> scrub;
+  std::optional<ReadinessStats> readiness;
 };
 struct CacheControlRequest {
   std::string_view collection;
@@ -1283,6 +1313,7 @@ LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(Follo
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(RowSpaceStats) LUXIR_TD(AuxStats)
 LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
 LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats) LUXIR_TD(ScrubStats)
+LUXIR_TD(ReadinessStats) LUXIR_TD(CollectionReadiness) LUXIR_TD(WarmupStatus)
 LUXIR_TD(HistogramStats) LUXIR_TD(ActivityStats) LUXIR_TD(TransportStats) LUXIR_TD(ServiceStats) LUXIR_TD(HostStats) LUXIR_TD(SystemStats) LUXIR_TD(ProcessIoStats) LUXIR_TD(ProcessStats) LUXIR_TD(CpuTimes) LUXIR_TD(HostCpuStats) LUXIR_TD(HostMemoryStats) LUXIR_TD(NetworkInterfaceStats) LUXIR_TD(TcpStats) LUXIR_TD(DiskStats) LUXIR_TD(FilesystemStats) LUXIR_TD(PressureStats) LUXIR_TD(CgroupStats) LUXIR_TD(CgroupMemoryStats) LUXIR_TD(CgroupCpuStats) LUXIR_TD(CgroupTaskStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
@@ -1334,6 +1365,7 @@ LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(RowSpaceStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
 LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(ArenaStats)
 LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(FieldMetadataStats) LUXIR_ENTRY(MemoryStats) LUXIR_ENTRY(ScrubStats)
+LUXIR_ENTRY(ReadinessStats) LUXIR_ENTRY(CollectionReadiness) LUXIR_ENTRY(WarmupStatus)
 LUXIR_ENTRY(HistogramStats) LUXIR_ENTRY(ActivityStats) LUXIR_ENTRY(TransportStats) LUXIR_ENTRY(ServiceStats) LUXIR_ENTRY(HostStats) LUXIR_ENTRY(SystemStats) LUXIR_ENTRY(ProcessIoStats) LUXIR_ENTRY(ProcessStats) LUXIR_ENTRY(CpuTimes) LUXIR_ENTRY(HostCpuStats) LUXIR_ENTRY(HostMemoryStats) LUXIR_ENTRY(NetworkInterfaceStats) LUXIR_ENTRY(TcpStats) LUXIR_ENTRY(DiskStats) LUXIR_ENTRY(FilesystemStats) LUXIR_ENTRY(PressureStats) LUXIR_ENTRY(CgroupStats) LUXIR_ENTRY(CgroupMemoryStats) LUXIR_ENTRY(CgroupCpuStats) LUXIR_ENTRY(CgroupTaskStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)

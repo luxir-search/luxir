@@ -26,6 +26,10 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
 void gatherSystemStats(api::SystemStats* system, api::HostStats* host, std::string_view dataDirectory,
                        std::pmr::memory_resource& resource);
 
+// The node's latest readiness evaluation (GET /_ready); before the first one,
+// not ready with a reason saying so. Same borrowing contract as gatherStats.
+void gatherReadiness(LuxirNode& node, api::ReadinessStats& out, std::pmr::memory_resource& resource);
+
 // Apply the requested filter-cache actions (max_bytes resize / flush /
 // reset_admission / reset_counters) and gather post-action stats plus an
 // optional resident-entry dump. Same borrowing contract as gatherStats.

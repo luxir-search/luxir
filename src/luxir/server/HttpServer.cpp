@@ -60,6 +60,7 @@
 #include "JsonResponse.h"
 #include "NdjsonFramer.h"
 #include "ProtoUpdateMessage.h"
+#include "Readiness.h"
 #include "Stats.h"
 #include "luxir/util/thread.h"
 #include "luxir/util/Signal.h"
@@ -653,7 +654,7 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, BUILD_INFO, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, COLLECTION_RENAME, COLLECTION_SWAP, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
+    NONE, BUILD_INFO, HEALTH, READY, WARM, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, COLLECTION_RENAME, COLLECTION_SWAP, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
     REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED,
     PLUGIN
   };
@@ -746,7 +747,7 @@ private:
       case Route::UPDATE: operation = MetricOperation::UPDATE; break;
       case Route::SCHEMA: operation = MetricOperation::SCHEMA; break;
       case Route::STATS: case Route::METRICS: operation = MetricOperation::STATS; break;
-      case Route::HEALTH: operation = MetricOperation::HEALTH; break;
+      case Route::HEALTH: case Route::READY: operation = MetricOperation::HEALTH; break;
       case Route::TENANT_LIST: case Route::COLLECTION_LIST:
       case Route::COLLECTION_CREATE: case Route::COLLECTION_DELETE: case Route::COLLECTION_RENAME: case Route::COLLECTION_SWAP:
         operation = MetricOperation::COLLECTIONS; break;
@@ -1448,7 +1449,7 @@ private:
   // update and replica waits always act in the caller's own tenant.
   static bool tenantRoute(Route route) {
     return route == Route::COLLECTION_LIST || route == Route::COLLECTION_CREATE || route == Route::COLLECTION_DELETE || route == Route::COLLECTION_RENAME || route == Route::COLLECTION_SWAP ||
-           route == Route::STATS || route == Route::SCHEMA || route == Route::REPLICATION_SNAPSHOT ||
+           route == Route::STATS || route == Route::SCHEMA || route == Route::WARM || route == Route::REPLICATION_SNAPSHOT ||
            route == Route::REPLICATION_FILE;
   }
 
@@ -1475,8 +1476,10 @@ private:
     RouteMatch m;
     if (target == "/") {
       m.route = Route::BUILD_INFO; m.allow = "GET"; m.prettyDefault = true;
-    } else if (target == "/health") {
+    } else if (target == "/health" || target == "/_health") {
       m.route = Route::HEALTH; m.allow = "GET";
+    } else if (target == "/_ready") {
+      m.route = Route::READY; m.allow = "GET"; m.prettyDefault = true;
     } else if (target == "/metrics") {
       m.route = Route::METRICS; m.allow = "GET";
     } else if (target == "/collections/_list") {
@@ -1503,6 +1506,8 @@ private:
       m.route = Route::UPDATE; m.allow = "POST";
     } else if (target == "/_stats" || parseStatsPath(target, m.coll)) {
       m.route = Route::STATS; m.allow = "GET"; m.prettyDefault = true;
+    } else if (parseCollectionPath(target, "/_warm", m.coll)) {
+      m.route = Route::WARM; m.allow = "POST";
     } else if (parseSchemaPath(target, m.coll)) {
       m.route = Route::SCHEMA; m.allow = "GET, POST"; m.prettyDefault = true;
       m.hint = "schema writes are POST (mode=set adds or replaces the named definitions, "
@@ -1527,7 +1532,7 @@ private:
         return m;
       }
     }
-    bool collectionRoute = m.route == Route::SEARCH || m.route == Route::UPDATE ||
+    bool collectionRoute = m.route == Route::SEARCH || m.route == Route::UPDATE || m.route == Route::WARM ||
                            m.route == Route::STATS || m.route == Route::SCHEMA ||
                            m.route == Route::REPLICATION_SNAPSHOT || m.route == Route::REPLICATION_FILE;
     m.emptyCollection = collectionRoute && m.coll.empty() && target.starts_with("/collections/");
@@ -1628,6 +1633,41 @@ private:
       case Route::HEALTH:
         respondJson(http::status::ok, R"({"status":"ok"})");
         break;
+      case Route::READY: {
+        // The latest background evaluation: cheap enough for the io shard.
+        std::pmr::monotonic_buffer_resource arena;
+        api::ReadinessStats ready;
+        gatherReadiness(node_, ready, arena);
+        std::string body;
+        api::write_json(ready, body);
+        respondJson(ready.ready ? http::status::ok : http::status::service_unavailable, std::move(body));
+        break;
+      }
+      case Route::WARM: {
+        uint64_t budget = UINT64_MAX;
+        if (const std::string* text = findParam(params, "budget_mb")) {
+          uint64_t mb = 0;
+          auto [end, ec] = std::from_chars(text->data(), text->data() + text->size(), mb);
+          if (ec != std::errc{} || end != text->data() + text->size() || mb == 0 || mb > UINT64_MAX / (1024 * 1024)) {
+            respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                "invalid URL parameter 'budget_mb': expected a positive integer, got '" + *text + "'"));
+            return;
+          }
+          budget = mb * 1024 * 1024;
+        }
+        auto id = LuxirNode::target(tenant_, coll);
+        try {
+          if (!node_.readiness().warm(id, budget)) {
+            respondError(ErrorInfo::of(ErrorKind::ALREADY_EXISTS, "a warmup of '" + id.label() + "' is already queued or running"));
+            return;
+          }
+        } catch (const std::exception& e) { respondException(e, ErrorKind::INTERNAL); return; }
+        OverlayJsonBuilder json;
+        json.string("collection", id.name);
+        json.string("tenant", id.tenant);
+        respondJson(http::status::accepted, json.finish());
+        break;
+      }
       case Route::COLLECTION_LIST:
         handleCollectionList();
         break;

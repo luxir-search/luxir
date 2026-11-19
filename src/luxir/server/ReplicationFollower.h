@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <chrono>
 #include <iosfwd>
+#include <optional>
 #include <memory>
 #include <memory_resource>
 #include <span>
@@ -37,5 +39,19 @@ public:
   void repair(const CollectionId& id, const std::shared_ptr<Collection>& collection, const std::string& reason,
               std::span<const FileDescriptor> suspects);
   void stats(api::ReplicationStatus& out, std::pmr::memory_resource& arena);
+
+  // Readiness input: each included collection the source advertises.
+  struct Progress {
+    struct Row {
+      CollectionId id;
+      bool installed = false; // a local copy serves some commit
+      bool caughtUp = false;  // it has matched the source since discovery
+      // Node-clock time since which it trails the source; nullopt in sync.
+      std::optional<std::chrono::steady_clock::time_point> behindSince;
+    };
+    bool discovered = false; // a source catalog has been read
+    std::vector<Row> collections;
+  };
+  Progress progress();
 };
 }

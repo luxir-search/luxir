@@ -17,6 +17,7 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/generic/async_generic_service.h>
 #include <grpcpp/health_check_service_interface.h>
+#include "Readiness.h"
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/support/byte_buffer.h>
 #include <hpp_proto/grpc/serialization.hpp>
@@ -112,6 +113,13 @@ void luxir::GRPCServer::run() {
   }
   LOG_INFO("GRPCServer listening on {}:{} (max receive message size {} bytes)", bindHost, serverPort,
            maxReceive);
+
+  // The unnamed service is liveness; "luxir.ready" follows GET /_ready.
+  if (auto* health = server->GetHealthCheckService()) {
+    std::string service(Readiness::kService);
+    health->SetServingStatus(service, false);
+    readyListener = luxirNode.readiness().subscribe([health, service](bool ready) { health->SetServingStatus(service, ready); });
+  }
 
   threads.reserve(nthreads);
   for (int i=0; i<nthreads; i++) {
@@ -1182,8 +1190,13 @@ bool GRPCServer::waitForStart() {
 
     Another grpc example (written by someone else) also showed a leak after upgrading.
  */
+luxir::GRPCServer::~GRPCServer() {
+  if (auto id = readyListener.exchange(0)) luxirNode.readiness().unsubscribe(id);
+}
+
 void luxir::GRPCServer::shutdown() {
   stopping.request_stop();
+  if (auto id = readyListener.exchange(0)) luxirNode.readiness().unsubscribe(id);
   LOG_INFO("Shutting down luxir grpc server.");
   if (!server) {
     return;

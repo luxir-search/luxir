@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory_resource>
+#include <optional>
 
 #include "StorageMemory.h"
 
@@ -498,6 +499,19 @@ public:
   // Advisory asynchronous readahead; memory-backed inputs need no work.
   virtual void prefetch(size_t offset, size_t length) {}
 
+  // Estimated bytes of this file that a read would find without going to the
+  // device or the network: the page cache for a mapped file, or a remote
+  // backend's own cache. Looks at about `maxPages` sampled pages at most, so
+  // it stays cheap on large files. nullopt when the backend cannot tell.
+  virtual std::optional<uint64_t> residentBytes(size_t maxPages) {
+    unused(maxPages);
+    return std::nullopt;
+  }
+
+  // Brings [offset, offset + length) into that cache, returning once it is
+  // there as far as the backend can make sure. Defaults to prefetch().
+  virtual void load(size_t offset, size_t length) { prefetch(offset, length); }
+
   virtual InputStream getInputStream() = 0;
 
   friend std::ostream &operator<<(std::ostream &out, InputFile &inf) {
@@ -522,6 +536,8 @@ public:
   std::string_view read() override {
     return std::string_view(data.get(), sz);
   }
+
+  std::optional<uint64_t> residentBytes(size_t) override { return sz; }
 
   InputStream getInputStream() override {
     return InputStream(data.get(), data.get() + sz);

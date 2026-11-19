@@ -106,11 +106,51 @@ public:
     return {data_, sz_};
   }
 
+  // mincore over every page of a file of up to `maxPages` pages; a larger
+  // file is sampled in evenly spaced windows and scaled to its size.
+  std::optional<uint64_t> residentBytes(size_t maxPages) override {
+    if (!sz_) return 0;
+    if (!checkResidency_) return std::nullopt;
+    static const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
+    size_t pages = (sz_ + pageSize - 1) / pageSize;
+    bool all = pages <= std::max(maxPages, WINDOW_PAGES);
+    size_t windows = all ? (pages + WINDOW_PAGES - 1) / WINDOW_PAGES : std::max<size_t>(2, maxPages / WINDOW_PAGES);
+#if defined(__APPLE__)
+    char vec[WINDOW_PAGES];
+#else
+    unsigned char vec[WINDOW_PAGES];
+#endif
+    size_t sampled = 0, resident = 0;
+    for (size_t w = 0; w < windows; w++) {
+      size_t first = all ? w * WINDOW_PAGES : (pages - WINDOW_PAGES) * w / (windows - 1);
+      size_t count = std::min(WINDOW_PAGES, pages - first);
+      if (mincore(data_ + first * pageSize, std::min(count * pageSize, sz_ - first * pageSize), vec) != 0) return std::nullopt;
+      for (size_t i = 0; i < count; i++) resident += vec[i] & 1;
+      sampled += count;
+    }
+    if (all) return std::min<uint64_t>(sz_, (uint64_t)resident * pageSize);
+    return (uint64_t)((double)sz_ * (double)resident / (double)sampled);
+  }
+
+  // Advises the range, then reads a byte of each page so the call returns
+  // once the kernel has it.
+  void load(size_t offset, size_t length) override {
+    if (offset >= sz_ || length == 0) return;
+    prefetch(offset, length);
+    static const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
+    size_t end = offset + std::min(length, sz_ - offset);
+    unsigned char sum = 0;
+    for (size_t at = offset / pageSize * pageSize; at < end; at += pageSize) sum ^= ((volatile const unsigned char*)data_)[at];
+    unused(sum);
+  }
+
   InputStream getInputStream() override {
     return {data_, data_ + sz_};
   }
 
 private:
+  static constexpr size_t WINDOW_PAGES = 16;
+
   static void advise(char* start, char* end) {
     for (; start < end; start += ADVISE_BYTES) {
       (void)madvise(start, std::min(ADVISE_BYTES, (size_t)(end - start)), MADV_WILLNEED);

@@ -160,6 +160,10 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
       "memory.field_metadata.bytes",
       // HTTP only.
       "service.grpc.connections", "service.grpc.io_threads",
+      // Readiness detail for operators reading /_ready.
+      "readiness.checked", "readiness.collections.unknown_bytes", "readiness.collections.warmup.budget_bytes",
+      "readiness.collections.warmup.loaded_bytes", "readiness.collections.warmup.started",
+      "readiness.collections.warmup.finished",
   };
   std::pmr::monotonic_buffer_resource resource;
   api::StatsResponse response;
@@ -171,7 +175,7 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
       {"collections.shards.index.query_cache.build_us", 1e6},
       {"collections.shards.index.query_cache.served_build_us", 1e6},
       {"collections.shards.index.query_cache.dead_build_us", 1e6},
-      {"scrub.last_pass_end", 1e3}};
+      {"scrub.last_pass_end", 1e3}, {"readiness.collections.follower_lag_ms", 1e3}};
   auto rendered = renderedNumbers(renderPrometheus(response));
   std::string json;
   ASSERT_TRUE(api::write_json(response, json));
