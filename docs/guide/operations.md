@@ -895,7 +895,8 @@ Search has its own limits:
   a measured footprint nor a known raw count, builds once to measure its size.
   Eviction ranks that value by its actual bytes. Later purchases use its
   measured size, price and debt.
-  Prepared and reader-stable field-sort sources retain their existing routing.
+  Prepared and reader-stable field-sort sources retain their preparation reuse,
+  provenance and reader-version checks.
   Join children and restricted exact-domain sources require timed observations
   to fund population. Outside a timed scope they serve resident values with
   assumed credit and otherwise execute without charging or claiming a build.

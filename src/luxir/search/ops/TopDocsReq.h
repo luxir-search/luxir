@@ -160,16 +160,6 @@ public:
     bool available() const noexcept { return keys.batch != nullptr; }
   };
 
-  // Pre-Weight FIELD_SORT outcome: an accepted resident value (the main
-  // Weight is omitted), a build veto (no segment may touch the cache), or
-  // neither, leaving the Weight-bearing router to plan builds per segment.
-  struct CacheFirstFieldSortPlan {
-    FilterCache::Use* acceptedUse = nullptr;
-    bool buildVetoed = false;
-
-    bool omitsWeight() const noexcept { return acceptedUse != nullptr; }
-  };
-
   // `firstDoc` and `lastDoc` span the domain in doc order.
   static ExactDomainSortPlan planExactDomainSort(
       auto& collector, int64_t card, int32_t firstDoc,
@@ -363,155 +353,18 @@ public:
     return order;
   }
 
-  // The visit floors a request is predicted to need, segment by segment in
-  // visit order from an empty heap: each segment's cards[s] domain docs
-  // collected into the heap the earlier ones are predicted to have left
-  // (FieldSortCollector::predictBottom). This is the index-wide view a
-  // decision taken before any heap exists needs: a small segment saturates
-  // on its own, yet past the first few segments a good bottom bounds every
-  // segment, and only a whole-index prediction sees it.
-  // Cache pricing only: these document quantiles never bound collection.
-  // Group multiplicity can bias the estimate; the executing group collector
-  // still requires L distinct groups and keeps every tied primary bound.
-  static void plannedVisitFloors(
-      std::span<const std::optional<SegmentKeys>> keys,
-      std::span<const int32_t> order, std::span<const int64_t> cards,
-      int64_t topCount, std::span<int64_t> floors) {
-    int64_t heapSize = 0;
-    int64_t bottom = 0;
-    for (int32_t s : order) {
-      const auto& segmentKeys = keys[(size_t)s];
-      int64_t card = cards[(size_t)s];
-      floors[(size_t)s] = 0;
-      if (!segmentKeys.has_value() || card <= 0
-          || segmentKeys->values() <= 0) {
-        continue;
-      }
-      auto predicted = FieldSortCollector::predictBottom(
-          *segmentKeys, card, topCount, heapSize, bottom);
-      floors[(size_t)s] = predicted.has_value()
-          ? FieldSortCollector::visitFloorAt(*segmentKeys, *predicted, card,
-                                             topCount)
-          : segmentKeys->leafCount();
-      if (heapSize + card >= topCount) {
-        bottom = predicted.value_or(segmentKeys->keyAt(1));
-      }
-      heapSize = std::min(topCount, heapSize + card);
-    }
-  }
-
-  // Whether the exact-domain driver could bound its visits over a whole
-  // membership of the estimated per-segment cards: the planned visit
-  // floors (plannedVisitFloors) cover under half the leaves of the segments
-  // holding domain docs. The build pays per later request through the
-  // leaves the bounds skip; at saturation the driver would only trade
-  // query evaluation for gathers, which does not repay the cache space.
-  static bool fieldSortVisitsBounded(
-      IndexReader& reader, const SortPlan& sortPlan,
-      std::optional<Query::ValueEnvelope> envelope,
-      std::span<const int64_t> cards, int64_t topCount) {
-    if (disableFieldSortPruning || disableFieldSortBestFirst) return false;
-    auto keys = fieldSortSegmentKeys(reader, sortPlan, envelope);
-    if (std::none_of(keys.begin(), keys.end(),
-                     [](const auto& k) { return k.has_value(); })) {
-      return false;
-    }
-    if (forceFieldSortBestFirst) return true;
-    std::vector<int64_t> floors(keys.size());
-    plannedVisitFloors(
-        keys,
-        fieldSortVisitOrder(keys, topCount,
-                            fieldSortMissingFirst(sortPlan, envelope)),
-        cards, topCount, floors);
-    int64_t visited = 0;
-    int64_t leaves = 0;
-    for (size_t s = 0; s < keys.size(); s++) {
-      if (!keys[s].has_value() || cards[s] <= 0) continue;
-      visited += floors[s];
-      leaves += keys[s]->leafCount();
-    }
-    return 2 * visited < leaves;
-  }
-
-  // Complete resident masks omit the Weight. Ordinary segment membership
-  // earns population from collection time; other sources retain the router.
-  static CacheFirstFieldSortPlan planCacheFirstFieldSortWholeMembership(
-      Query& query, Query::PlanningContext& planning,
-      const SortPlan& sortPlan, bool allowReaderStable) {
-    bool observed = !QueryPrep::disableObservedFieldSortForTests
-        && planning.filterScope(query) <= FilterKeyScope::CORE_STABLE;
-    auto candidate = planning.lookupExistingFilterUse(
-        query, allowReaderStable);
-    if (candidate.has_value()) {
-      FilterCache::Use* use = planning.acceptExistingFilterUse(
-          std::move(*candidate), FilterCache::AdmissionLane::WHOLE,
-          observed ? FilterCache::Work::pending().forWholeQuery() : FilterCache::Work::assumed());
-      if (observed && use != nullptr) use->observe();
-      // A concurrent detach after the lookup leaves the Weight-bearing
-      // router authoritative.
-      return {use, false};
-    }
-    if (observed || membershipVerificationWork(query)
-        == Query::VerificationWork::PRESENT) {
-      return {};
-    }
-    if (fieldSortCanUseMaskedBestFirst(sortPlan)
-        && query.fieldSortConjunction(planning)
-            != Query::FieldSortConjunction::FLAT_LITERAL_CONJUNCTION) {
-      return {};
-    }
-    return {nullptr, true};
-  }
-
-  // Estimate-based population for unobserved sources and the comparison
-  // baseline. Runtime collection independently chooses its field-sort driver.
-  static bool planFieldSortWholeMembershipRoutes(
-      Query& query, Query::Weight& weight, IndexReader& reader,
-      const SortPlan& sortPlan, int64_t topCount,
-      std::span<uint8_t> routes) {
-    assert(routes.size() == reader.segments().size());
-    bool canUseBestFirst = fieldSortCanUseMaskedBestFirst(sortPlan);
-    if (!canUseBestFirst) {
-      bool routed = membershipVerificationWork(query)
-          == Query::VerificationWork::PRESENT;
-      std::fill(routes.begin(), routes.end(), (uint8_t)routed);
-      return routed;
-    }
-    size_t segments = reader.segments().size();
-    std::vector<int64_t> cards(segments, 0);
-    std::vector<uint8_t> boundable(segments, 0);
-    MemPool pool;
-    for (auto& segment : reader.segments()) {
-      auto savepoint = pool.getSavePoint();
-      auto* supplier = weight.scorerSupplier(pool, segment);
-      size_t s = (size_t)segment.ord;
-      routes[s] = 0;
-      if (supplier != nullptr) {
-        int64_t estimatedCard = supplier->cost();
-        if (segment.hasDeletes()) {
-          estimatedCard = std::min(estimatedCard, (int64_t)segment.numLive());
-        }
-        cards[s] = estimatedCard;
-        auto context = supplier->makePlanContext(
-            Query::Demand::fromLeadCost(
-                estimatedCard, Query::ExecutionUse::MATCH_WINDOWS));
-        routes[s] = supplier->verificationWork(context)
-            == Query::VerificationWork::PRESENT;
-        boundable[s] = !routes[s]
-            && supplier->describeScorer(context).termConjunctionClause
-                != Query::ClauseShape::FLAT_CONJUNCTION;
-      }
-      pool.rewind(savepoint);
-    }
-    // Whole membership is planned only with every filter folded into the
-    // query, so the query alone carries the envelope.
-    if (std::find(boundable.begin(), boundable.end(), 1) != boundable.end()
-        && fieldSortVisitsBounded(reader, sortPlan,
-                                  sortValueEnvelope(sortPlan, &query, {}),
-                                  cards, topCount)) {
-      for (size_t s = 0; s < segments; s++) routes[s] |= boundable[s];
-    }
-    return std::find(routes.begin(), routes.end(), 1) != routes.end();
+  // Complete resident masks omit the Weight and retain its request pin.
+  static FilterCache::Use* planCacheFirstFieldSortWholeMembership(
+      Query& query, Query::PlanningContext& planning, bool allowReaderStable) {
+    auto candidate = planning.lookupExistingFilterUse(query, allowReaderStable);
+    if (!candidate) return nullptr;
+    bool observed = QueryPrep::WholeMembershipPlan::observesFieldSort(
+        QueryPrep::WholeMembershipConsumer::FIELD_SORT, planning.filterScope(query));
+    auto* use = planning.acceptExistingFilterUse(
+        std::move(*candidate), FilterCache::AdmissionLane::WHOLE,
+        observed ? FilterCache::Work::pending().forWholeQuery() : FilterCache::Work::assumed());
+    if (observed && use != nullptr) use->observe();
+    return use;
   }
 
   static int32_t sparseFilteredTopKDensityInverse(
@@ -2879,7 +2732,6 @@ public:
     Query::Weight* wholeMembershipWeight,
     Query::Weight* wholeRankingWeight,
     FilterCache::Use* wholeMembershipUse,
-    std::span<const uint8_t> wholeFieldSortCacheRoutes,
     bool wholeConstantRanking, Query::ScoreProfile scoreProfile,
     bool requestNeedsScores,
     std::span<ParsedFilter> filters,
@@ -2912,8 +2764,7 @@ public:
           *wholeMembershipWeight, wholeMembershipUse,
           planning.filterUses,
           PreparedDomainDependence::QUERY_CANONICAL,
-          wholeConsumer,
-          wholeFieldSortCacheRoutes);
+          wholeConsumer);
     } else if (wholeMembershipUse != nullptr) {
       wholeMembershipPlan = QueryPrep::WholeMembershipPlan::acceptedExisting(
           *wholeMembershipUse, planning.filterUses, wholeConsumer);

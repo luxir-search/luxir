@@ -42,11 +42,6 @@ public:
   Query* getChild() const { return child; }
   float getBoost() const { return boost; }
 
-  FieldSortConjunction fieldSortConjunction(
-      PlanningContext& context) const override {
-    return child->fieldSortConjunction(context);
-  }
-
   std::optional<ValueEnvelope> requiredValueEnvelope(
       std::string_view field) const override {
     return child->requiredValueEnvelope(field);

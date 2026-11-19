@@ -230,10 +230,6 @@ public:
   Query* getChild() const { return child; }
   float getConstantScore() const { return profile.value; }
   ScoreProfile getScoreProfile() const { return profile; }
-  FieldSortConjunction fieldSortConjunction(
-      PlanningContext& context) const override {
-    return child->fieldSortConjunction(context);
-  }
   std::optional<ValueEnvelope> requiredValueEnvelope(
       std::string_view field) const override {
     return child->requiredValueEnvelope(field);

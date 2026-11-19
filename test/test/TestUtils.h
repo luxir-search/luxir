@@ -81,6 +81,31 @@ inline int64_t countForTests(Query::Weight* weight, IndexReader::Segment& segmen
   return QueryPrep::supplierCount(weight->scorerSupplier(guard.pool(), segment)).value_or(-1);
 }
 
+inline void publishWholeMembershipForTests(IndexReader& reader, Query& query) {
+  auto* cache = reader.filterCache();
+  ASSERT_NE(nullptr, cache);
+  MemPool pool;
+  for (uint32_t sighting = 0; sighting < cache->configuration().admissionThreshold; sighting++) {
+    Query::Context context(pool, reader, {}, nullptr,
+        FilterKeyContext{.schemaGen = reader.schema()->gen_, .timeZone = {}});
+    auto* use = context.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
+    ASSERT_NE(nullptr, use);
+    if (!use->wasAdmitted()) continue;
+    auto* weight = query.createWeight(context, 0);
+    for (auto& segment : reader.segments()) {
+      if (use->look((size_t)segment.ord)) continue;
+      auto probe = use->probe((size_t)segment.ord,
+          FilterCache::Work::nanoseconds(1'000'000'000).forWholeQuery());
+      ASSERT_EQ(FilterCache::Probe::Kind::BUILD, probe.kind());
+      auto started = std::chrono::steady_clock::now();
+      auto raw = QueryPrep::materializeRawFilter(*weight, nullptr, segment);
+      use->publishRaw((size_t)segment.ord, probe, std::move(raw),
+          QueryPrep::elapsedBuildNanos(started));
+    }
+    return;
+  }
+}
+
 inline QueryPrep::WholeMembershipResult resolveWholeMembershipForTests(
     const QueryPrep::WholeMembershipPlan& plan, IndexReader& reader,
     IndexReader::Segment& segment, DocSet* domain,

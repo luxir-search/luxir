@@ -2149,7 +2149,6 @@ public:
     }
 
     bool cacheFirstFieldSort = false;
-    bool fieldSortBuildVetoed = false;
     bool cacheFirstFieldSortShape =
         collapse == nullptr && diversify == nullptr && placement == TopDocsPlacement::ROOT_OP
         && !QueryPrep::disableWholeMembershipPlanForTests
@@ -2160,12 +2159,9 @@ public:
         && canOmitWeightForCacheFirstMembership(*query)
         && cache != nullptr && cache->enabled();
     if (cacheFirstFieldSortShape) {
-      auto fieldSortPreflight =
-          TopDocsReq::planCacheFirstFieldSortWholeMembership(
-              *query, *planningContext, parsedSorts, true);
-      cacheFirstMembershipUse = fieldSortPreflight.acceptedUse;
-      fieldSortBuildVetoed = fieldSortPreflight.buildVetoed;
-      cacheFirstFieldSort = fieldSortPreflight.omitsWeight();
+      cacheFirstMembershipUse = TopDocsReq::planCacheFirstFieldSortWholeMembership(
+          *query, *planningContext, true);
+      cacheFirstFieldSort = cacheFirstMembershipUse != nullptr;
       if (cacheFirstFieldSort) {
         skipCount(SkipStats::cacheFirstFieldSortWeightSkips);
       }
@@ -2288,7 +2284,6 @@ public:
     Query::Weight* wholeMembershipWeight = nullptr;
     Query::Weight* wholeRankingWeight = nullptr;
     FilterCache::Use* wholeMembershipUse = nullptr;
-    std::span<uint8_t> wholeFieldSortCacheRoutes;
     bool wholeConstantRanking = false;
     bool pureCount = pureCountShape && filterWeights.empty();
     bool wholeTopKCount = !QueryPrep::disableWholeMembershipPlanForTests
@@ -2350,27 +2345,11 @@ public:
             everySegmentConstant = false;
           }
         }
-        bool fieldSortFullyRouted = false;
         if (!boundedCount && !everySegmentConstant && cache != nullptr && cache->enabled()) {
-          bool observedFieldSort = wholeFieldSort && !preparedWhole
-              && !wholeMembershipWeight->consumesDomain()
-              && !QueryPrep::disableObservedFieldSortForTests
-              && planningContext->filterScope(*query) <= FilterKeyScope::CORE_STABLE;
-          bool acquireUse = true;
-          if (wholeFieldSort && !preparedWhole && !observedFieldSort) {
-            wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
-                view()->segments().size());
-            if (fieldSortBuildVetoed) {
-              std::fill(wholeFieldSortCacheRoutes.begin(),
-                        wholeFieldSortCacheRoutes.end(), 0);
-              acquireUse = false;
-            } else {
-              acquireUse = TopDocsReq::planFieldSortWholeMembershipRoutes(
-                  *query, *wholeMembershipWeight, *view(), parsedSorts,
-                  topCount, wholeFieldSortCacheRoutes);
-            }
-            fieldSortFullyRouted = !acquireUse;
-          }
+          bool acquireUse = !wholeFieldSort || preparedWhole
+              || QueryPrep::WholeMembershipPlan::observesFieldSort(
+                  QueryPrep::WholeMembershipConsumer::FIELD_SORT,
+                  planningContext->filterScope(*query), wholeMembershipWeight);
           // An accepted reader-stable value replaces the ANN preparation pass.
           // Its bounded kNN membership is also a valid ladder fallback, while
           // the numeric exact-domain driver still prices exact cardinality per
@@ -2385,10 +2364,8 @@ public:
         // Field-sort constants are useful per segment even without a cache.
         // Prepared membership still requires a cache source and its runtime provenance check.
         if (!everySegmentConstant && wholeMembershipUse == nullptr
-            && !fieldSortFullyRouted
             && !(wholeFieldSort && !wholeMembershipWeight->needsPrepare())) {
           wholeMembershipWeight = nullptr;
-          wholeFieldSortCacheRoutes = {};
         }
       }
 
@@ -2434,7 +2411,7 @@ public:
       query, weight, variantMembershipWeight,
       countWeight, rankingWeight, topCount, std::move(parsedSorts),
       requirements, wholeMembershipWeight, wholeRankingWeight,
-      wholeMembershipUse, wholeFieldSortCacheRoutes,
+      wholeMembershipUse,
       wholeConstantRanking, scoreProfile,
       (requestFlags & Query::NEED_SCORES) != 0,
       filters, filterWeights, std::move(domainVariants),

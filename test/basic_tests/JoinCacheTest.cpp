@@ -258,8 +258,6 @@ TEST_F(JoinCacheTest, requiredConstantsShareOwnerMembershipAndKeepTheirScores) {
 }
 
 TEST_F(JoinCacheTest, exactLocalMembershipKeepsScoresAndResidentOwnerSources) {
-  SearchOverridesGuard countFirst(QueryPrep::disableTrackedCountFirstForTests);
-  QueryPrep::disableTrackedCountFirstForTests = true;
   cache = std::make_shared<FilterCache>(FilterCacheConfig{.maxBytes = 1024 * 1024,
       .minSegmentDocs = 0, .admissionThreshold = 2, .maxMetadataBytes = 256 * 1024});
   helper.getIndexWriter()->snapshots.readers.filterCache = cache;
@@ -324,8 +322,8 @@ TEST_F(JoinCacheTest, exactLocalMembershipKeepsScoresAndResidentOwnerSources) {
       {
         SkipStatsScope stats;
         EXPECT_EQ(off, run());
-        EXPECT_EQ(1, SkipStats::wholeTopKCountBuilds);
-        EXPECT_EQ(0, SkipStats::wholeTopKCountLocalCounts);
+        EXPECT_EQ(deleted ? 1 : 0, SkipStats::wholeTopKCountBuilds);
+        EXPECT_EQ(deleted ? 0 : 1, SkipStats::wholeTopKCountLocalCounts);
         EXPECT_EQ(0, SkipStats::joinChildSuppliers);
       }
       cache->resize(1); cache->sweep(); cache->resize(1024 * 1024);

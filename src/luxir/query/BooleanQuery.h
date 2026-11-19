@@ -1066,54 +1066,6 @@ public:
                    : VerificationWork::ABSENT;
   }
 
-  FieldSortConjunction fieldSortConjunction(
-      PlanningContext& context) const override {
-    CompiledBoolean& plan = logicalPlan(context);
-    // A dropped-optional singleton classifies as its residue: '+a b' resolves
-    // to the same execution as bare 'a', which is not a conjunction, so the
-    // flat-conjunction veto must not fire on it.
-    if (Query* child = plan.unscoredSingleChild()) {
-      return child->fieldSortConjunction(context);
-    }
-
-    bool hasRequired = !plan.mandatory.empty() || !plan.filter.empty();
-    if (!hasRequired || !plan.prohibited.empty()
-        || (!plan.optional.empty() && !plan.dropsOptional(false))) {
-      return FieldSortConjunction::NOT_FLAT;
-    }
-
-    bool hasOther = false;
-    bool hasDynamicTerms = false;
-    auto classify = [&](std::span<Query*> clauses) {
-      for (Query* clause : clauses) {
-        while (clause->getKind() == QueryKind::BOOST) {
-          clause = static_cast<BoostQuery*>(clause)->getChild();
-        }
-        while (clause->getKind() == QueryKind::CONSTANT_SCORE) {
-          clause = static_cast<ConstantScoreQuery*>(clause)->getChild();
-          while (clause->getKind() == QueryKind::BOOST) {
-            clause = static_cast<BoostQuery*>(clause)->getChild();
-          }
-        }
-        if (clause->getKind() == QueryKind::TERM) continue;
-        QueryKind clauseKind = clause->getKind();
-        if (clauseKind == QueryKind::AUTOMATON
-            || clauseKind == QueryKind::PREFIX
-            || clauseKind == QueryKind::TERM_RANGE
-            || clauseKind == QueryKind::TERM_IN_SET) {
-          hasDynamicTerms = true;
-        } else {
-          hasOther = true;
-        }
-      }
-    };
-    classify(plan.mandatory);
-    classify(plan.filter);
-    if (hasDynamicTerms) return FieldSortConjunction::DYNAMIC_TERMS;
-    return hasOther ? FieldSortConjunction::NOT_FLAT
-                    : FieldSortConjunction::FLAT_LITERAL_CONJUNCTION;
-  }
-
   // Every match satisfies every MUST and FILTER clause, so their envelopes
   // intersect. Optional clauses (even under minShouldMatch) and prohibited
   // clauses require nothing of a single field here. Normalization only

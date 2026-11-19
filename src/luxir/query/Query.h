@@ -487,17 +487,6 @@ public:
     UNKNOWN,
   };
 
-  // Logical approximation of the Weight-time flat-term-conjunction veto in
-  // the field-sort cache router. The veto is for genuine conjunctions of two
-  // or more literal terms; a shape whose unscored residue is a single clause
-  // classifies as that residue. DYNAMIC_TERMS means a MultiTerm child can
-  // only be classified after Weight construction and segment expansion.
-  enum class FieldSortConjunction : uint8_t {
-    NOT_FLAT,
-    FLAT_LITERAL_CONJUNCTION,
-    DYNAMIC_TERMS,
-  };
-
   // An inclusive range of encoded numeric column values (the column's
   // order-preserving int64 encoding: INT raw, FLOAT/DOUBLE sortable bits,
   // DATE epoch units). lo > hi is empty.
@@ -686,12 +675,6 @@ public:
           || directDocSet == DirectDocSetAccess::UNKNOWN;
     }
   };
-
-  virtual FieldSortConjunction fieldSortConjunction(
-      PlanningContext& context) const {
-    unused(context);
-    return FieldSortConjunction::NOT_FLAT;
-  }
 
   // The values this query requires of the numeric column `field` (a
   // physical field name): every doc it matches has a value of `field`

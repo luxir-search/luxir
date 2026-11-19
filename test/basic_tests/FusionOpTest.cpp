@@ -439,8 +439,6 @@ TEST_F(FusionOpTest, adaptivePlacesSparseFieldInDocs) {
 }
 
 TEST_F(FusionOpTest, topKCountWholeHitComposesSharedDomainOnce) {
-  SearchOverridesGuard countFirst(QueryPrep::disableTrackedCountFirstForTests);
-  QueryPrep::disableTrackedCountFirstForTests = true;
   CollectionHelper h("main");
   h.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
@@ -456,16 +454,11 @@ TEST_F(FusionOpTest, topKCountWholeHitComposesSharedDomainOnce) {
         mr, {qb::match(mr, "foo_w", "alpha"),
              qb::match(mr, "foo_w", "beta")});
   };
-  for (int round = 0; round < 3; round++) {
-    auto warm = localReq(luxirNode->getSearchEngine());
-    warm->collection("main");
-    auto& topDocs = warm->topDocs("q").countLimit().getScores()
-        .fields({"id"}).limit(10);
-    topDocs.rawQuery() = rankedQuery(topDocs.mr());
-    warm->execute(false);
-    ASSERT_OK(warm);
-    EXPECT_EQ(3, warm->getMatchCount("q"));
-  }
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  TermQuery alpha("foo_w", "alpha"), beta("foo_w", "beta");
+  std::array<Query*, 2> required{&alpha, &beta};
+  BooleanQuery query(required, {}, {}, {});
+  publishWholeMembershipForTests(*reader, query);
 
   auto lreq = localReq(luxirNode->getSearchEngine());
   lreq->collection("main");
