@@ -152,7 +152,6 @@ defaults and constraints are described in the comments and guides.
 - [`Match`](#message-luxir.match)
 - [`MemoryStats`](#message-luxir.memorystats)
 - [`MergePolicyDef`](#message-luxir.mergepolicydef)
-- [`SegmentOverlayDef`](#message-luxir.segmentoverlaydef)
 - [`MultiMatchQuery`](#message-luxir.multimatchquery)
 - [`MultiVector`](#message-luxir.multivector)
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
@@ -193,6 +192,7 @@ defaults and constraints are described in the comments and guides.
 - [`SearchOp`](#message-luxir.searchop)
 - [`SearchRequest`](#message-luxir.searchrequest)
 - [`SearchResponse`](#message-luxir.searchresponse)
+- [`SegmentOverlayDef`](#message-luxir.segmentoverlaydef)
 - [`SegmentStats`](#message-luxir.segmentstats)
 - [`ServiceStats`](#message-luxir.servicestats)
 - [`ShardCacheControl`](#message-luxir.shardcachecontrol)
@@ -1623,22 +1623,6 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.search_request_limit_bytes"></a>[`search_request_limit_bytes`](#field-luxir.memorystats.search_request_limit_bytes) | 6 | `uint64` | singular | Per-request tracked search memory ceiling; zero disables rejection. |
 | <a id="field-luxir.memorystats.schema_cache_bytes"></a>[`schema_cache_bytes`](#field-luxir.memorystats.schema_cache_bytes) | 7 | `uint64` | singular | Estimated parsed schema payload held by snapshots/readers, not allocator RSS. |
 
-<a id="message-luxir.segmentoverlaydef"></a>
-
-### luxir.SegmentOverlayDef
-
-One plugin overlay of a collection's segments (SchemaDef.segment\_overlays).
-
-[Source](../../protos/luxir_types.proto)
-
-| Field | Number | Type | Cardinality / group | Description |
-|---|---|---|---|---|
-| <a id="field-luxir.segmentoverlaydef.name"></a>[`name`](#field-luxir.segmentoverlaydef.name) | 1 | `string` | singular | \[a-z0-9\_\]+, unique in the schema |
-| <a id="field-luxir.segmentoverlaydef.kind"></a>[`kind`](#field-luxir.segmentoverlaydef.kind) | 2 | `string` | singular | a kind registered by a plugin |
-| <a id="field-luxir.segmentoverlaydef.fields"></a>[`fields`](#field-luxir.segmentoverlaydef.fields) | 3 | `string` | repeated | The physical fields the overlay covers: exact names, or globs with one '\*'. |
-| <a id="field-luxir.segmentoverlaydef.params"></a>[`params`](#field-luxir.segmentoverlaydef.params) | 4 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | read by the kind's maker |
-| <a id="field-luxir.segmentoverlaydef.min_docs"></a>[`min_docs`](#field-luxir.segmentoverlaydef.min_docs) | 5 | `int32` | singular | segments with fewer documents get no overlay |
-
 <a id="message-luxir.mergepolicydef"></a>
 
 ### luxir.MergePolicyDef
@@ -2325,6 +2309,22 @@ Top-level response to a Search request
 | <a id="field-luxir.searchresponse.profile"></a>[`profile`](#field-luxir.searchresponse.profile) | 5 | [`ExecutionProfile`](#message-luxir.executionprofile) | singular | final response only, when SearchRequest.profile is true |
 | <a id="field-luxir.searchresponse.took_us"></a>[`took_us`](#field-luxir.searchresponse.took_us) | 8 | `uint64` | singular | Server-side wall time in microseconds from receipt of the complete request message until its final response is ready to serialize. Includes parsing, any min\_commit wait, execution, and earlier streamed batches, including any pause while the client reads them. Excludes serializing, queueing, and sending the final response. Final response only. |
 | <a id="field-luxir.searchresponse.more"></a>[`more`](#field-luxir.searchresponse.more) | 15 | `bool` | singular | if true, expect at least one more streaming response to the logical request. |
+
+<a id="message-luxir.segmentoverlaydef"></a>
+
+### luxir.SegmentOverlayDef
+
+One plugin overlay of a collection's segments (SchemaDef.segment\_overlays).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.segmentoverlaydef.name"></a>[`name`](#field-luxir.segmentoverlaydef.name) | 1 | `string` | singular | \[a-z0-9\_\]+, unique in the schema |
+| <a id="field-luxir.segmentoverlaydef.kind"></a>[`kind`](#field-luxir.segmentoverlaydef.kind) | 2 | `string` | singular | a kind registered by a plugin |
+| <a id="field-luxir.segmentoverlaydef.fields"></a>[`fields`](#field-luxir.segmentoverlaydef.fields) | 3 | `string` | repeated | The physical fields the overlay covers: exact names, or globs with one '\*'. |
+| <a id="field-luxir.segmentoverlaydef.params"></a>[`params`](#field-luxir.segmentoverlaydef.params) | 4 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | read by the kind's maker |
+| <a id="field-luxir.segmentoverlaydef.min_docs"></a>[`min_docs`](#field-luxir.segmentoverlaydef.min_docs) | 5 | `int32` | singular | segments with fewer documents get no overlay |
 
 <a id="message-luxir.segmentstats"></a>
 
