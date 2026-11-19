@@ -3887,7 +3887,8 @@ TEST_F(FacetTest, bucketBlockExecutorBindingAndDomainLifetimes) {
     FacetBucketBlockExecutor::execute<int64_t>(
         *parent, children,
         std::span<const SelectedFacetBucket<int64_t>>(buckets), *req->reader,
-        producer, source, FacetBucketBlockExecutor::BINDING_BYTES);
+        producer, FacetBucketConcurrency::SERIAL, source,
+        FacetBucketBlockExecutor::BINDING_BYTES);
     facetBucketBlockCounter = nullptr;
     EXPECT_EQ(0, probe.liveBindings);
     EXPECT_EQ(0, probe.liveDomains);
@@ -7792,7 +7793,12 @@ TEST_F(FacetTest, dataNumericParentUsesOwnExtentAfterFiltering) {
 }
 
 TEST_F(FacetTest, dataFanoutUsesObservedBytesBeforeMultiplyingWindows) {
-  SearchOverridesGuard guard(forcedRequestMemoryMaxBytes, forcedFacetBucketBlockBuckets, facetBucketBlockCounter);
+  SearchOverridesGuard guard(forcedRequestMemoryMaxBytes, forcedFacetBucketBlockBuckets, facetBucketBlockCounter,
+      forcedFacetBucketFanout);
+  // The breaker measures a serial block, whose bindings all hold their first
+  // segment's state; parallel segment tasks complete a binding as soon as
+  // every segment has reached it.
+  forcedFacetBucketFanout = FacetBucketFanout::SERIAL;
   CollectionHelper helper;
   for (int segment = 0; segment < 2; segment++) {
     std::vector<Doc> docs;

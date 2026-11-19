@@ -67,6 +67,26 @@ inline std::size_t forcedFacetBucketBlockBuckets = [] {
   return e != nullptr ? (std::size_t)std::strtoull(e, nullptr, 10) : 0;
 }();
 
+// Result-stage facet bucket children fan out over the request's task group
+// when it has one (AUTO). SERIAL (LUXIR_FACET_BUCKET_FANOUT=serial) keeps the
+// serial segment loop, as with max_parallel=1.
+enum class FacetBucketFanout { AUTO, SERIAL };
+inline FacetBucketFanout forcedFacetBucketFanout = [] {
+  const char* e = std::getenv("LUXIR_FACET_BUCKET_FANOUT");
+  return e != nullptr && std::string_view(e) == "serial"
+      ? FacetBucketFanout::SERIAL : FacetBucketFanout::AUTO;
+}();
+
+// Test observation of fanned-out bucket blocks, by task granularity: one task
+// per segment feeding every bucket (segments), per segment and bucket
+// (buckets), or per segment with each fed domain fanned out (domains).
+struct FacetBucketFanoutStats {
+  std::atomic<size_t> segments{0};
+  std::atomic<size_t> buckets{0};
+  std::atomic<size_t> domains{0};
+};
+inline FacetBucketFanoutStats* facetBucketFanoutStatsForTests = nullptr;
+
 // Test override for the per-request query-memory breaker ceiling. Zero uses
 // LuxirConfig.
 inline std::size_t forcedRequestMemoryMaxBytes = 0;

@@ -3,12 +3,14 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "SearchOp.h"
@@ -98,6 +100,36 @@ enum class FacetBucketProducer : uint8_t {
   JOINT
 };
 
+// Joint producers build every domain of a chunk in one column pass, so a
+// chunk's builders are alive together. Chunks are bounded by worst-case
+// builder bytes; a block wider than the budget rescans the column per chunk.
+inline constexpr size_t FACET_BUCKET_DOMAIN_BYTES = 64 * 1024 * 1024;
+// The joint builders of all concurrent segment tasks of a parallel block. A
+// task's share bounds its chunks, so a narrow share rescans the column more.
+inline constexpr size_t FACET_BUCKET_PARALLEL_DOMAIN_BYTES = 4 * FACET_BUCKET_DOMAIN_BYTES;
+
+// Set by a parallel bucket executor's segment task for the producer call it
+// makes on its own thread. Concurrent segment tasks split the joint builder
+// budget, and a task that fans out fed domains hears where a chunk ends, so
+// it hands the chunk's domains on before the next chunk is built.
+class FacetBucketTaskScope {
+  inline static thread_local FacetBucketTaskScope* current = nullptr;
+  FacetBucketTaskScope* previous;
+
+public:
+  size_t domainBytes;
+  std::optional<std::function_ref<void()>> chunkFed;
+
+  explicit FacetBucketTaskScope(size_t domainBytes,
+      std::optional<std::function_ref<void()>> chunkFed = std::nullopt)
+      : previous(std::exchange(current, this)), domainBytes(domainBytes), chunkFed(chunkFed) {}
+  FacetBucketTaskScope(const FacetBucketTaskScope&) = delete;
+  FacetBucketTaskScope& operator=(const FacetBucketTaskScope&) = delete;
+  ~FacetBucketTaskScope() { current = previous; }
+
+  static FacetBucketTaskScope* active() { return current; }
+};
+
 // Block bindings, then feed each segment's bucket domains to that bucket's
 // children. A bucket's bindings open at its first feed and close after its
 // last, so whatever a completed child holds does not accumulate across the
@@ -159,6 +191,7 @@ public:
       SearchOp::Calculator& parent, std::span<SearchOp* const> children,
       std::span<const SelectedFacetBucket<Key>> buckets,
       IndexReader& reader, FacetBucketProducer producer,
+      FacetBucketConcurrency producerConcurrency,
       DomainSource&& bucketDomains, size_t bindingStateBytes,
       std::span<const DomainHandle> input = {}, IdentitySource&& identityDomains = nullptr,
       SelectionSource&& selection = nullptr) {
@@ -168,9 +201,135 @@ public:
           return child->bucketDomain != nullptr || child->needsStructuralScope;
         });
     if (structural) executeRoute<true>(parent, children, buckets, reader, producer,
-        bucketDomains, bindingStateBytes, input, identityDomains, selection);
+        producerConcurrency, bucketDomains, bindingStateBytes, input, identityDomains, selection);
     else executeRoute<false>(parent, children, buckets, reader, producer,
-        bucketDomains, bindingStateBytes, input, identityDomains, selection);
+        producerConcurrency, bucketDomains, bindingStateBytes, input, identityDomains, selection);
+  }
+
+  // Feeds one non-structural block over the request's task group. Every
+  // binding opens before the fan-out and closes after the join, and each
+  // binding is fed each segment exactly once, as a top-level calcAll fan-out
+  // feeds it: completion, merging and emission already run concurrently.
+  // The granularity is the finest that every child and the producer allow:
+  //  - SEGMENTS: a task per segment feeds the whole block in bucket order and
+  //    holds that segment's state like a serial segment pass. Only that task
+  //    touches the segment's retention counts and query state.
+  //  - BUCKETS with a per-bucket producer: a task per (segment, bucket).
+  //  - BUCKETS with a per-segment producer (a joint column pass): a task per
+  //    segment produces the block and fans each built chunk's domains out.
+  // Concurrent segment tasks split the joint builder budget, and every fed
+  // domain is charged to the request while a task holds it. Returns false,
+  // having done nothing, when the block would be a single task.
+  template <typename Key, typename DomainSource>
+  static bool executeParallelBlock(
+      SearchOp::Calculator& parent, std::span<SearchOp* const> children,
+      std::span<const SelectedFacetBucket<Key>> block, IndexReader& reader,
+      std::span<const DomainHandle> input, FacetBucketConcurrency producerConcurrency,
+      FacetBucketConcurrency concurrency, size_t contributors, FanoutScope& requestScope,
+      Bindings bindings, BucketAction open, BucketAction close, DomainSource& bucketDomains) {
+    auto segments = reader.segments();
+    bool perBucket = concurrency == FacetBucketConcurrency::BUCKETS
+        && producerConcurrency == FacetBucketConcurrency::BUCKETS;
+    bool perDomain = concurrency == FacetBucketConcurrency::BUCKETS && !perBucket;
+    size_t perSegment = perBucket ? block.size() : 1;
+    size_t tasks = segments.size() * perSegment;
+    if (tasks < 2 && !(perDomain && block.size() > 1)) return false;
+    if (auto* stats = facetBucketFanoutStatsForTests) {
+      (perBucket ? stats->buckets : perDomain ? stats->domains : stats->segments)
+          .fetch_add(1, std::memory_order_relaxed);
+    }
+    auto& tracker = parent.getOp().req.memoryTracker;
+    uint64_t blockCount = 0;
+    for (const auto& bucket : block) blockCount += (uint64_t)std::max<int64_t>(1, bucket.count);
+    size_t domainBytes = std::min(FACET_BUCKET_DOMAIN_BYTES,
+        FACET_BUCKET_PARALLEL_DOMAIN_BYTES / contributors);
+    auto charge = [&](size_t segnum, DomainHandle domain) {
+      if (domain.ownsStorage() && (input.empty() || domain.get() != input[segnum].get())) {
+        domain = DomainVariantPlan::account(std::move(domain), tracker, "parallel bucket domains");
+      }
+      return domain;
+    };
+    auto deliver = [&](size_t bucket, size_t segnum, const DomainHandle& domain) {
+      assert(domain.isDeliverable());
+      for (size_t child = 0; child < children.size(); child++) {
+        bindings[bucket * children.size() + child]->accept(nullptr, (int32_t)segnum, domain);
+      }
+    };
+    auto units = [&](size_t segnum, const DomainHandle& domain) {
+      return FanoutSize{std::max<uint64_t>(1,
+          fanoutDomainUnits(segments[segnum], domain) * children.size()), 0};
+    };
+    for (size_t bucket = 0; bucket < block.size(); bucket++) open(bucket);
+    {
+      // BUCKETS children hold no releasable segment state of their own, so
+      // the coordinator retains every segment around the fan-out.
+      std::optional<SearchOp::SegmentStateRetention> retain;
+      if (concurrency == FacetBucketConcurrency::BUCKETS) retain.emplace(children, segments);
+      // Declared last: an exception joins the published tasks before
+      // anything they borrow is destroyed.
+      FanoutScope scope = requestScope.child();
+      task_group_fanout(&scope, tasks, FanoutKind::EXHAUSTIVE, [&](size_t i) {
+        size_t segnum = i / perSegment;
+        auto size = units(segnum, input.empty() ? DomainHandle() : input[segnum]);
+        if (perBucket) size.units = std::max<uint64_t>(1, (uint64_t)((unsigned __int128)size.units
+            * (uint64_t)std::max<int64_t>(1, block[i % perSegment].count) / blockCount));
+        return size;
+      }, [&](size_t i) {
+        return [&, i] {
+          size_t segnum = i / perSegment;
+          if (perBucket) {
+            size_t bucket = i % perSegment;
+            bucketDomains(segnum, block.subspan(bucket, 1),
+                FacetBucketFeed([&](size_t, DomainHandle domain) {
+                  deliver(bucket, segnum, charge(segnum, std::move(domain)));
+                }));
+            return;
+          }
+          if (!perDomain) {
+            auto release = scope_guard([&]() noexcept {
+              for (auto& binding : bindings) binding->releaseSegmentState(segments[segnum]);
+            });
+            SearchOp::SegmentStateRetention retainSegment(children, segments.subspan(segnum, 1));
+            FacetBucketTaskScope task(domainBytes);
+            [[maybe_unused]] size_t fed = 0;
+            bucketDomains(segnum, block, FacetBucketFeed([&](size_t bucket, DomainHandle domain) {
+              assert(bucket == fed++);
+              deliver(bucket, segnum, charge(segnum, std::move(domain)));
+            }));
+            assert(fed == block.size());
+            return;
+          }
+          std::vector<std::pair<size_t, DomainHandle>> pending;
+          std::vector<FanoutSize> sizes;
+          size_t pendingBytes = 0;
+          auto flush = [&] {
+            sizes.clear();
+            for (const auto& entry : pending) sizes.push_back(units(segnum, entry.second));
+            task_group_fanout(&scope, pending.size(), FanoutKind::EXHAUSTIVE,
+                [&](size_t j) { return sizes[j]; },
+                [&](size_t j) {
+                  return [&deliver, segnum, bucket = pending[j].first,
+                          domain = std::move(pending[j].second)] {
+                    deliver(bucket, segnum, domain);
+                  };
+                });
+            pending.clear();
+            pendingBytes = 0;
+          };
+          FacetBucketTaskScope task(domainBytes, std::function_ref<void()>(flush));
+          bucketDomains(segnum, block, FacetBucketFeed([&](size_t bucket, DomainHandle domain) {
+            domain = charge(segnum, std::move(domain));
+            pendingBytes += domain.get() != nullptr ? domain.get()->ramBytesUsed() : 0;
+            pending.emplace_back(bucket, std::move(domain));
+            if (pendingBytes >= domainBytes) flush();
+          }));
+          flush();
+        };
+      });
+      scope.join();
+    }
+    for (size_t bucket = 0; bucket < block.size(); bucket++) close(bucket);
+    return true;
   }
 
   template <bool Structural, typename Key, typename DomainSource, typename IdentitySource,
@@ -179,6 +338,7 @@ public:
       SearchOp::Calculator& parent, std::span<SearchOp* const> children,
       std::span<const SelectedFacetBucket<Key>> buckets,
       IndexReader& reader, FacetBucketProducer producer,
+      FacetBucketConcurrency producerConcurrency,
       DomainSource&& bucketDomains, size_t bindingStateBytes,
       std::span<const DomainHandle> input, IdentitySource&& identityDomains,
       SelectionSource&& selection) {
@@ -219,7 +379,34 @@ public:
       ancestor = routing.ancestor;
       residentBytesPerBucket = saturatingAdd(residentBytesPerBucket, routing.retainedBytesPerBucket);
     }
-    size_t blockBytes = sharedSegmentWork ? bindingStateBytes
+    // Non-structural blocks may fan out over the request's task group, at
+    // the granularity every child and the producer allow (see
+    // executeParallelBlock). Structural blocks stay serial: their bindings
+    // share prefix producers and plan sources across segments.
+    FanoutScope* requestScope = nullptr;
+    auto concurrency = FacetBucketConcurrency::SERIAL;
+    size_t contributors = 1;
+    if constexpr (!Structural) {
+      requestScope = parent.getOp().req.tg;
+      if (requestScope != nullptr && fanoutCallerStartsAtBack(requestScope)
+          && forcedFacetBucketFanout != FacetBucketFanout::SERIAL) {
+        concurrency = producerConcurrency == FacetBucketConcurrency::SERIAL
+            ? FacetBucketConcurrency::SERIAL : FacetBucketConcurrency::BUCKETS;
+        for (SearchOp* child : children) {
+          concurrency = std::min(concurrency, child->facetBucketConcurrency());
+        }
+      }
+      if (concurrency != FacetBucketConcurrency::SERIAL) {
+        auto* arena = requestScope->getArena();
+        contributors = std::min(segments.size(), (size_t)computeWidth(arena != nullptr
+            ? arena->max_concurrency() : oneapi::tbb::this_task_arena::max_concurrency()));
+        contributors = std::max<size_t>(1, contributors);
+      }
+    }
+    // A BUCKETS fan-out feeds each binding from its own tasks, not in a
+    // segment pass over the block, so only the binding budget bounds it.
+    size_t blockBytes = sharedSegmentWork || concurrency == FacetBucketConcurrency::BUCKETS
+        ? bindingStateBytes
         : std::min(bindingStateBytes, forcedFacetBucketCacheBytes != 0
               ? forcedFacetBucketCacheBytes : CACHE_BYTES);
     size_t bindingBlockSize = std::max<size_t>(
@@ -236,9 +423,12 @@ public:
         // Probe one binding before multiplying an unknown directory by the
         // fan-out. Then use the observed high-water mark directly: joint
         // producers rescan the parent column for each block. The extra factor
-        // covers directory relocation overlap.
+        // covers directory relocation overlap. A parallel block feeds a
+        // binding's segments concurrently, and its merger keeps an
+        // accumulator per concurrent contributor.
         bindingBlockSize = blockBegin == 0 ? 1 : std::max<size_t>(1,
-            budget / std::max<size_t>(1, saturatingMultiply(observedBytesPerBucket, 2)));
+            budget / std::max<size_t>(1, saturatingMultiply(observedBytesPerBucket,
+                saturatingMultiply(2, contributors))));
       }
       if (forcedFacetBucketBlockBuckets != 0) bindingBlockSize = forcedFacetBucketBlockBuckets;
       if (facetBucketBlockCounter != nullptr) (*facetBucketBlockCounter)++;
@@ -351,6 +541,15 @@ public:
         continue;
       }
 
+      if constexpr (!Structural) {
+        if (concurrency != FacetBucketConcurrency::SERIAL
+            && executeParallelBlock<Key>(parent, children, block, reader, input,
+                producerConcurrency, concurrency, contributors, *requestScope, bindings,
+                open, close, bucketDomains)) {
+          continue;
+        }
+      }
+
       for (size_t segnum = 0; segnum < segments.size(); segnum++) {
         bool first = segnum == 0;
         bool last = segnum + 1 == segments.size();
@@ -416,16 +615,13 @@ public:
   }
 };
 
-// Joint producers build every domain of a chunk in one column pass, so a
-// chunk's builders are alive together. Chunks are bounded by worst-case
-// builder bytes; a block wider than the budget rescans the column per chunk.
-inline constexpr size_t FACET_BUCKET_DOMAIN_BYTES = 64 * 1024 * 1024;
-
 template <typename Key, typename BuildChunk>
 void feedFacetBucketDomainChunks(
     int32_t maxDoc, std::span<const SelectedFacetBucket<Key>> block,
     size_t domainBytes, FacetBucketFeed feed, BuildChunk&& buildChunk) {
   constexpr size_t BUILDER_FIXED_BYTES = 128;
+  auto* task = FacetBucketTaskScope::active();
+  if (task != nullptr) domainBytes = std::min(domainBytes, task->domainBytes);
   size_t builderBytes = (size_t)(((uint64_t)maxDoc + 63) / 64) * 8
       + BUILDER_FIXED_BYTES;
   size_t chunkBuckets = std::max<size_t>(1, domainBytes / builderBytes);
@@ -433,11 +629,14 @@ void feedFacetBucketDomainChunks(
        chunkBegin += chunkBuckets) {
     auto chunk = block.subspan(
         chunkBegin, std::min(chunkBuckets, block.size() - chunkBegin));
-    auto domains = buildChunk(chunk);
-    assert(domains.size() == chunk.size());
-    for (size_t i = 0; i < chunk.size(); i++) {
-      feed(chunkBegin + i, std::move(domains[i]));
+    {
+      auto domains = buildChunk(chunk);
+      assert(domains.size() == chunk.size());
+      for (size_t i = 0; i < chunk.size(); i++) {
+        feed(chunkBegin + i, std::move(domains[i]));
+      }
     }
+    if (task != nullptr && task->chunkFed) (*task->chunkFed)();
   }
 }
 

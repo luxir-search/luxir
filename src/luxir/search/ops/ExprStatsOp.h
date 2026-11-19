@@ -166,6 +166,15 @@ public:
 
   bool canEmitAsBucketChild() const override { return true; }
 
+  // A binding owns its accumulators (merged through its SegmentMergeDriver)
+  // and binds immutable columns per call. Input-domain variants run query
+  // state per segment, which only the top-level per-segment contract covers.
+  FacetBucketConcurrency facetBucketConcurrency() const override {
+    if (!facetBucketSegmentLocal()) return FacetBucketConcurrency::SERIAL;
+    return inputDomain == nullptr ? FacetBucketConcurrency::BUCKETS
+                                  : FacetBucketConcurrency::SEGMENTS;
+  }
+
   template <bool Ordered>
   class Calc : public Calculator {
     static constexpr size_t BATCH_SIZE = 1024;
