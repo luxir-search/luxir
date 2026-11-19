@@ -76,7 +76,6 @@ struct SegFieldInfo {
   seg_location columnLoc;    // location of the start of the column
   int64_t columnMetaOff;     // offset from the start of the column to the metadata
   int64_t numValues;         // total number of values in the column across all docs.
-                             // For single-valued fields numValues == docsWithField; for multi-valued it is >=.
   int32_t ordFormat = ORD_NONE;
   int32_t ordIndexing = ORD_INDEX_NONE;
   int32_t ordBits = 0;
@@ -115,6 +114,9 @@ struct SegFieldInfo {
   // back to an existing field, but a field dropped and declared again can
   // still meet such segments, so column readers check per segment.
   bool hasOrdColumn() const { return ordFormat != ORD_NONE; }
+
+  // For value columns, monoLoc stores the end value rank of each populated row.
+  bool hasEndValueRanks() const { return monoLoc.offset() > 0; }
 
   // `info` for column reads: null (no values in this segment) for an indexed
   // TERMS field this segment holds without an ord column.

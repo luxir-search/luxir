@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <array>
 #include <numeric>
 #include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
@@ -8,6 +9,7 @@
 #include "test/LuxirTest.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
+#include "test/TestUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -25,7 +27,7 @@ protected:
   void SetUp() override {
     LuxirTest::SetUp();
     SchemaBuilder schema;
-    for (auto name : {"flat_numbers", "flat_many", "flat_parts", "items_nested.many"}) {
+    for (auto name : {"flat_numbers", "flat_many", "flat_parts", "items_nested.many", "items_nested.n_i"}) {
       auto& field = schema.field(name); field.type = api::FieldDef::FieldClass::INT;
       field.multi = api::FieldDef::MultiMode::ARRAY;
     }
@@ -64,6 +66,40 @@ protected:
     return ids;
   }
 };
+
+TEST_F(NestedValueExprTest, singletonChildColumnSupportsJoinAndElementCount) {
+  auto writer = helper.getIndexWriter();
+  auto check = [&] {
+    auto reader = writer->snapshots.readers.getReader();
+    auto* child = reader->segments()[0].segmentCore().spaceReader("items_nested");
+    ASSERT_NE(nullptr, child);
+    auto* info = child->fieldInfo("items_nested.n_i");
+    ASSERT_NE(nullptr, info);
+    EXPECT_FALSE(info->hasEndValueRanks());
+    EXPECT_NE(0, info->flags & FieldType::MULTI_ARRAY);
+
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->topDocs().countLimit().fields({"id"});
+    auto join = qb::toParent(req->mr, "items_nested",
+        qb::range(req->mr, "n_i", qb::valI64(req->mr, 0), nullptr, nullptr, nullptr));
+    top.rawQuery() = join;
+    qb::sort(top, "id", qb::ASC);
+    top.expr("elements", "sum(count(items_nested.n_i))");
+    std::get<api::ToParentQuery>(join.kind).min_children = 2;
+    req->topDocs("two").countLimit().limit(0).rawQuery() = join;
+    req->execute();
+    ASSERT_OK(req);
+    auto ids = std::get<api::ColStr>(req->docList()->columns.at("id").kind).v;
+    EXPECT_TRUE(std::ranges::equal(ids, std::array<std::string_view, 2>{"a", "b"}));
+    EXPECT_EQ(2, req->getMatchCount());
+    EXPECT_EQ(1, req->getMatchCount("two"));
+    EXPECT_EQ(4, req->docList()->ops.at("elements")->asInt());
+  };
+  check();
+  writer->mergeSegments();
+  ASSERT_EQ(1u, writer->snapshots.readers.getReader()->segments().size());
+  check();
+}
 
 TEST_F(NestedValueExprTest, reducersMatchPlainModelsAndArrayTwinsAcrossMerges) {
   for (bool merge : {false, true}) {

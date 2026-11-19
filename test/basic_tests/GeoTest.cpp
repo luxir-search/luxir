@@ -37,6 +37,7 @@
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
 #include "test/LinearPolygon.h"
+#include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
@@ -870,6 +871,53 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
   EXPECT_EQ(39, countForTests(singleCountState.weight, merged));
   QueryState multiCountState(countPool, *afterMerge, "geo_multi", all);
   EXPECT_EQ(-1, countForTests(multiCountState.weight, merged));
+}
+
+TEST_F(GeoBoxQueryTest, declaredMultiSingletonUsesSinglePointLayout) {
+  CollectionHelper helper;
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "home_ps", vec(13.0, 17.0)),
+                           UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "home_ps", vec(35.0, 40.0)),
+                           UpdateMessage::COMMIT).success);
+  Box box{16.0, 18.0, 12.0, 14.0};
+  auto check = [&] {
+    auto reader = writer->snapshots.readers.getReader();
+    MemPool pool;
+    QueryState state(pool, *reader, "home_ps", box);
+    int64_t count = 0;
+    for (auto& seg : reader->segments()) {
+      auto info = fieldInfo(seg, "home_ps");
+      EXPECT_NE(0, info.flags & FieldType::MULTI_ARRAY);
+      EXPECT_FALSE(info.hasEndValueRanks());
+      ASSERT_NE(0, info.pointsMetaOff);
+      auto matches = countForTests(state.weight, seg);
+      ASSERT_GE(matches, 0);
+      count += matches;
+    }
+    EXPECT_EQ(1, count);
+
+    auto req = localReq(helper.getSearchEngine());
+    req->topDocs().fields({"id", "home_ps"}).rawQuery() =
+        qb::geoBox(req->mr, "home_ps", box.minLat, box.maxLat, box.minLon, box.maxLon);
+    req->execute();
+    ASSERT_OK(req);
+    auto ids = std::get<api::ColStr>(req->docList()->columns.at("id").kind).v;
+    ASSERT_EQ(1u, ids.size());
+    EXPECT_EQ("a", ids[0]);
+    auto geo = std::get<api::ColVal>(req->docList()->columns.at("home_ps").kind).v;
+    auto points = std::get<api::ArrVal>(geo[0].kind).v;
+    ASSERT_EQ(1u, points.size());
+    auto lonLat = std::get<api::ArrDouble>(points[0].kind).v;
+    ASSERT_EQ(2u, lonLat.size());
+    EXPECT_NEAR(13.0, lonLat[0], 1e-6);
+    EXPECT_NEAR(17.0, lonLat[1], 1e-6);
+  };
+  check();
+  writer->mergeSegments();
+  ASSERT_EQ(1u, writer->snapshots.readers.getReader()->segments().size());
+  check();
 }
 
 // The column scan arm agrees with the per-point check for every geo relation

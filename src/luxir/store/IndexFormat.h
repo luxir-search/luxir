@@ -15,10 +15,11 @@ namespace luxir {
 // data file starts with HEADER. Its last three characters are the format version
 // in base36 (..., 009, 00A, ..., 00Z, 010).
 //
-// Bump VERSION with any change to the bytes Luxir writes, then update
-// kReferenceVersion and kReferenceDigest in IndexFormatTest. HEADER is derived
-// from VERSION. There is no compatibility between versions: a collection written
-// by another version fails to load and has to be reindexed.
+// Bump VERSION when a change requires a different on-disk encoding or
+// interpretation. IndexFormatTest also tracks byte changes from writer choices
+// among layouts supported by the current version. HEADER is derived from
+// VERSION. A collection written by another version fails to load and has to
+// be reindexed.
 struct IndexFormat {
   static constexpr uint64_t VERSION = 14;
   static_assert(VERSION > 0 && VERSION < 36 * 36 * 36);

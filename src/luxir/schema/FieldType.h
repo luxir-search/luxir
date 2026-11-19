@@ -194,7 +194,8 @@ public:
   bool isAbstract() { return (bool) (flags_ & ABSTRACT); }
   bool isDerived() const { return (bool) (flags_ & DERIVED); }
 
-  // Segment flags describe physical structures; schema roles stay in the schema.
+  // Segment flags describe physical structures and how field values were indexed.
+  // The multi flags describe value semantics. End ranks are optional for singleton columns.
   flag_type segmentFlags() const {
     flag_type flags = flags_ & ~(ABSTRACT | DERIVED);
     // Intervals are logically single-valued; their endpoint column is a pair array.

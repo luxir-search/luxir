@@ -1627,7 +1627,7 @@ public:
       CountHow how = query.covers(info->columnBounds->min, info->columnBounds->max)
           ? CountHow::METADATA
           : (info->pointsMetaOff != 0 || (info->flags & FieldType::INDEX_DOCS))
-                  && info->monoLoc.offset() == 0
+                  && !info->hasEndValueRanks()
               ? CountHow::SUPPLIER : CountHow::ITERATE;
       auto shortcut = countBound(segment, domain, info->docsWithField, how);
       if (shortcut.how == CountHow::SUPPLIER) shortcut.resolver = this;

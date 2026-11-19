@@ -88,7 +88,7 @@ public:
       columnMax = InputStream::readVlong(minMaxPtr, endPtr);
     }
 
-    if (fieldInfo.monoLoc.offset() > 0) {
+    if (fieldInfo.hasEndValueRanks()) {
       endValueRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
     }
   }
@@ -129,7 +129,7 @@ public:
     return endValueRankReader ? &(*endValueRankReader) : nullptr;
   }
 
-  // Number of values in field.  For a multi-valued field, this will be greater than docsWithValue
+  // Number of values in the field, including repeats in arrays.
   int64_t numValues() const {
     return nvals;
   }

@@ -59,7 +59,7 @@ struct GeoPointSource {
 
   // The column layout guarantees exactly one point per populated document.
   static bool onePointPerDoc(const SegFieldInfo& info) {
-    return info.monoLoc.offset() == 0;
+    return !info.hasEndValueRanks();
   }
 
   static bool onePointPerDoc(const IntColReader& column) {

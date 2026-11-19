@@ -233,7 +233,7 @@ TEST_F(RangeFieldTest, mergeDropsFieldsWithNoSurvivingValues) {
   auto writer = helper.getIndexWriter();
   auto reader = writer->snapshots.readers.getReader();
   auto& postings = reader->segments()[0].postingsReader();
-  ASSERT_GT(postings.fieldInfo("bkd")->monoLoc.offset(), 0);
+  ASSERT_TRUE(postings.fieldInfo("bkd")->hasEndValueRanks());
   ASSERT_NE(0, postings.fieldInfo("bkd")->pointsMetaOff);
   ASSERT_NE(0, postings.fieldInfo("gone_i")->nTerms);
   ASSERT_NE(0, postings.fieldInfo("gone_ps")->pointsMetaOff);

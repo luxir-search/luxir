@@ -2503,175 +2503,90 @@ private:
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
 
-    auto outputPtr = postingsWriter.getOutputStream();
-    auto intColWriter = pool.make_unique_align<IntColWriter>(
-        8, *outputPtr,
-        FieldType::isNumericColumn(outputFieldInfo.type)
-            && !(outputFieldInfo.flags & FieldType::MULTI_VALUED));
+    bool hasEndValueRanks = outputFieldInfo.type == FieldType::INTERVAL
+        || std::ranges::any_of(sortedFields, [](const auto* field) {
+          return field && field->segFieldInfo.hasEndValueRanks();
+        });
+    auto valuesOut = postingsWriter.getOutputStream();
+    IntColWriter valuesWriter(*valuesOut,
+        !hasEndValueRanks && FieldType::isNumericColumn(outputFieldInfo.type));
 
-    u_ptr<DocsWithValWriter> docsWriter = nullptr;  // docs with the field, created on demand if needed
-
-    u_ptr<MonoWriter> endValueRankWriter = nullptr; // null means single valued, otherwise multi-valued
-    OutputStreamPtr monoOut;                   // output stream for the monoWriter.
-
-    if (outputFieldInfo.flags & FieldType::MULTI_VALUED) {
+    OutputStreamPtr monoOut;
+    std::optional<MonoWriter> endRanks;
+    if (hasEndValueRanks) {
       monoOut = postingsWriter.getOutputStream();
-      endValueRankWriter = pool.make_unique_align<MonoWriter>(8, pool, *monoOut);
+      endRanks.emplace(pool, *monoOut);
     }
 
-    int64_t endValueRankBase = 0;  // used to calculate the endValueRank for each segment, if multivalued.
-    [[maybe_unused]] int32_t docsWithField = 0;
-    int64_t rangeMin = 0;  // the pending min of a range field's (min, max) pair
-
+    std::optional<DocsWithValWriter> docsWriter;
+    int32_t docsWithField = 0;
+    int64_t endOut = 0;
     for (size_t segnum = 0; segnum < sortedFields.size(); segnum++) {
       auto* field = sortedFields[segnum];
-      auto& seg = space.segs[segnum];
-      auto base = seg.base;
+      const auto& seg = space.segs[segnum];
+      if (seg.numLive == 0) continue;
 
-      if (field == nullptr) {
-        if (seg.numLive == 0) continue;
-        // If the field didn't exist for this segment, then output can't be dense.
-        // If no docsWriter exists yet (because all full) we need to create one and fill it in up until base.
-        if (docsWriter == nullptr) {
-          docsWriter = pool.make_unique_align<DocsWithValWriter>(8, pool, postingsWriter, outputFieldInfo);
-          for (int32_t i = 0; i < base; i++) {
-            docsWriter->startDoc(i); // write all docs up to base as they were dense before this segment.
-          }
+      int32_t sourceDocs = field ? field->segFieldInfo.docsWithField : 0;
+      if (!docsWriter && sourceDocs != seg.postingsReader->maxDoc()) {
+        docsWriter.emplace(pool, postingsWriter, outputFieldInfo);
+        for (int32_t doc = 0; doc < seg.base; doc++) {
+          docsWriter->startDoc(doc);
         }
-        continue; // no values to write, so skip to next segment.
       }
+      if (sourceDocs == 0) continue;
 
       assert(field->seg == &seg);
+      IntColReader reader(*seg.postingsReader, field->segFieldInfo);
+      IntColReader::Iterator docs(reader);
+      auto* sourceEnds = reader.getEndValueRankReader();
+      assert(outputFieldInfo.type != FieldType::INTERVAL || sourceEnds);
 
-      IntColReader& reader = *pool.make_align<IntColReader>(8, *field->seg->postingsReader, field->segFieldInfo);
-      MonoReader* endValueRankReader = reader.getEndValueRankReader();
-      IntColReader::BulkValues& values = *pool.make_align<IntColReader::BulkValues>(8, reader);
-      screaming::BitSet::Iterator* docsIter = nullptr; // null means all docs have values.
-      if (reader.docsReader().hasBitset()) {
-        docsIter = pool.make_align<screaming::BitSet::Iterator>(8, reader.docsReader().bitset());
-        // not all docs have values, so we need to create a docsWriter and fill it in up until base.
-        if (docsWriter == nullptr) {
-          docsWriter = pool.make_unique_align<DocsWithValWriter>(8, pool, postingsWriter, outputFieldInfo);
-          for (int32_t i = 0; i < base; i++) {
-            docsWriter->startDoc(i); // write all docs up to base as they were dense before this segment.
-          }
-        }
-      }
+      int64_t endIn = 0;
+      for (int32_t localId = docs.next(); localId != IntColReader::ENDDOC; localId = docs.next()) {
+        int64_t startIn = endIn;
+        endIn = sourceEnds ? sourceEnds->valueAt(docs.rank()) : (int64_t)docs.rank() + 1;
+        auto [mappedDoc, deleted] = seg.remapDocId(localId);
+        if (deleted) continue;
 
-      // Strategy:
-      //   - read nextDocWithValue
-      //   - if multiValued, read next endValueRank and calculate number of values (use previous endValueRank)
-      //   - read that many values and write that many values (1 if single valued)
-      //   - write mapped docWithValue, write mapped endValueRank, write values.
-      //   - if the doc is deleted, still do reads, but skip the writes.
-      // variable naming: In suffix is for reading, Out suffix is for writing.
-
-      int32_t localId = -1;
-      int32_t maxDocIn = seg.postingsReader->maxDoc();
-
-      // we don't need to check liveDocs since we have the doc mapping.
-      // auto* liveBits = space.liveDocs[seg.ord] ? &space.liveDocs[seg.ord]->bitset() : nullptr;
-
-      int64_t lastEndValueRankIn = 0;
-      int32_t docRankIn = -1;  // rank of the doc we are on, faster than figuring out from docsIter.
-      for (;;) {
-        if (docsIter) {
-          localId = docsIter->next();
-        } else {
-          localId++;
-        }
-        docRankIn++;
-        if (localId >= maxDocIn) {
-          break;
-        }
-
-        auto [mappedDoc, isDeleted] = seg.remapDocId(localId);
-
-        if (isDeleted) {
-          //
-          // nothing needs to be adjusted for single-valued fields.
-          //   - docRankIn will still be incremented and be correct for reading
-          //   - mappedDoc already contains the adjustments for the docsWithValues (docsWriter)
-          // for multi-valued fields, we need to read how many values there were for this deleted doc.
-          //   - end rank values written need to be adjusted down by the number of values.
-          //     (adjust endValueRankBase by the number of values skipped)
-          //   - lastEndValueRankIn needs to be maintained correctly (that's how we tell how many values a doc has)
-          if (endValueRankReader) {
-            int64_t endValueRank = endValueRankReader->valueAt(docRankIn);
-            auto nVals = endValueRank - lastEndValueRankIn;
-            endValueRankBase -= nVals; // adjust the base down by the number of values skipped.
-            lastEndValueRankIn = endValueRank;
-          }
-          continue;
-        }
-
-
-        if (docsWriter) {
-          docsWriter->startDoc(mappedDoc);
-        }
-
+        if (docsWriter) docsWriter->startDoc(mappedDoc);
         docsWithField++;
-        if (endValueRankReader) {
-          //  multi-valued
-          // TODO: OPT: use a bulk iterator for the ranks.
-          int64_t endValueRank = endValueRankReader->valueAt(docRankIn);
+        endOut += endIn - startIn;
+        if (endRanks) endRanks->addInt64(endOut);
 
-          // write the new endValueRank
-          endValueRankWriter->addInt64(endValueRankBase + endValueRank);
-
-          // transfer the values
-          for (int64_t inRank = lastEndValueRankIn; inRank < endValueRank; inRank++) {
-            auto val = values.valueAt(inRank);
-            intColWriter->addInt64(val);
-            if (geoPoints != nullptr) {
-              geoPoints->push_back({geo::unpackLatitude(val),
-                                    geo::unpackLongitude(val), mappedDoc});
-            }
-            // Range columns hold (min, max) pairs: the pair ends on odd offsets.
-            if (rangePoints != nullptr) {
-              if ((inRank - lastEndValueRankIn) % 2 == 0) rangeMin = val;
-              else rangePoints->push_back({rangeMin, val, mappedDoc});
-            }
+        int64_t rangeMin = 0;
+        assert(!rangePoints || (endIn - startIn) % 2 == 0);
+        for (int64_t rank = startIn; rank < endIn; rank++) {
+          int64_t value = docs.values().valueAt(rank);
+          valuesWriter.addInt64(value);
+          if (geoPoints) {
+            geoPoints->push_back({geo::unpackLatitude(value),
+                                  geo::unpackLongitude(value), mappedDoc});
           }
-
-          // TODO: if doc was deleted, then adjust endValueRankBase down by nValues.
-          lastEndValueRankIn = endValueRank;
-        } else {
-          // single-valued
-          auto val = values.valueAt(docRankIn);
-          intColWriter->addInt64(val);
-          if (geoPoints != nullptr) {
-            geoPoints->push_back({geo::unpackLatitude(val),
-                                  geo::unpackLongitude(val), mappedDoc});
+          if (rangePoints) {
+            if ((rank - startIn) % 2 == 0) rangeMin = value;
+            else rangePoints->push_back({rangeMin, value, mappedDoc});
           }
         }
       }
-
-      // endValueRankBase was already adjusted down for deletes, do just add the last endValueRankIn to
-      // get the new base.
-      endValueRankBase += lastEndValueRankIn;
-    } // for-each-seg
-
-    intColWriter->finish(outputFieldInfo);
-    if (docsWriter) {
-      assert(docsWriter->numAdded() == docsWithField);
-      if (docsWriter->numAdded() == space.maxDoc) {
-        // all docs were added.  We may have written stuff into the index,
-        // but we can forget it (it will be dropped on the next merge).
-        // TODO: we could look into rewinding any part of the OutputStream that was unflushed as well.
-        docsWriter->finishDense(space.maxDoc);
-      } else {
-        // some docs were not added, so we need to finish it.
-        docsWriter->finish();
-      }
-    } else {
-      outputFieldInfo.docsWithField = space.maxDoc;
-      outputFieldInfo.docsWithFieldEndLoc = {0, 0};
     }
-    if (endValueRankWriter) {
-      endValueRankWriter->finish();
-      outputFieldInfo.monoLoc = endValueRankWriter->blockLoc;
-      outputFieldInfo.monoMetaOff = endValueRankWriter->metaOff;
+
+    valuesWriter.finish(outputFieldInfo);
+    assert(docsWithField > 0 && endOut == outputFieldInfo.numValues);
+    assert(docsWriter || docsWithField == space.maxDoc);
+    if (docsWriter && docsWithField != space.maxDoc) {
+      assert(docsWriter->numAdded() == docsWithField);
+      docsWriter->finish();
+    } else {
+      outputFieldInfo.docsWithField = docsWithField;
+      outputFieldInfo.docsWithFieldEndLoc = {};
+    }
+    if (endRanks) {
+      [[maybe_unused]] size_t count = endRanks->finish();
+      assert(count == (size_t)docsWithField);
+      outputFieldInfo.monoLoc = endRanks->blockLoc;
+      outputFieldInfo.monoMetaOff = endRanks->metaOff;
+    } else {
+      assert(endOut == docsWithField);
     }
   }
 

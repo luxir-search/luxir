@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include <map>
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -89,6 +90,119 @@ TEST_F(MultiValuedNumericTest, mergePreservesPerDocOrder) {
   ASSERT_TRUE(helper.submit(merge).success);
   ASSERT_EQ(1u, helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
   expectSortedAndOrdered();
+}
+
+TEST_F(MultiValuedNumericTest, layoutFollowsValuesThroughMerges) {
+  using Multi = api::FieldDef::MultiMode;
+  CollectionHelper helper;
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  SchemaBuilder schema;
+  auto& singleton = schema.field("n_is");
+  singleton.type = api::FieldDef::FieldClass::INT;
+  singleton.index = api::FieldDef::IndexMode::RANGE;
+  singleton.multi = Multi::SET;
+  auto& mixed = schema.field("mixed");
+  mixed.type = api::FieldDef::FieldClass::INT;
+  mixed.index = api::FieldDef::IndexMode::RANGE;
+  mixed.multi = Multi::SINGLE;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.indexAll({
+    flatdoc("id", "a", "n_is", vec_i(4), "mixed", 4),
+    flatdoc("id", "dead-single", "n_is", vec_i(70), "mixed", 70)
+  }, UpdateMessage::COMMIT).success);
+
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "n_is", vec_i(8, 8), "mixed", 8),
+                           UpdateMessage::COMMIT).success);
+
+  auto checkLayout = [](IndexReader::Segment& seg, std::string_view field,
+                        int32_t docs, int64_t values, bool endRanks, Multi mode, bool dense) {
+    auto* info = seg.postingsReader().fieldInfo(field);
+    ASSERT_NE(nullptr, info);
+    EXPECT_EQ(docs, info->docsWithField);
+    EXPECT_EQ(values, info->numValues);
+    EXPECT_EQ(endRanks, info->hasEndValueRanks());
+    EXPECT_EQ(mode != Multi::SINGLE, (info->flags & FieldType::MULTI_VALUED) != 0);
+    EXPECT_EQ(mode == Multi::ARRAY, (info->flags & FieldType::MULTI_ARRAY) != 0);
+    IntColReader column(seg.postingsReader(), *info);
+    EXPECT_EQ(dense, column.denseDocsWithValue());
+    EXPECT_EQ(endRanks, column.leafMeta().valueSketch().empty());
+  };
+  auto reader = writer->snapshots.readers.getReader();
+  ASSERT_EQ(2u, reader->segments().size());
+  for (auto& seg : reader->segments()) {
+    checkLayout(seg, "n_is", seg.maxDoc(), seg.maxDoc(), false, Multi::SET, true);
+    checkLayout(seg, "mixed", seg.maxDoc(), seg.maxDoc(), false, Multi::SINGLE, true);
+  }
+
+  writer->mergeSegments();
+  reader = writer->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  checkLayout(reader->segments()[0], "mixed", 3, 3, false, Multi::SINGLE, true);
+  checkLayout(reader->segments()[0], "n_is", 3, 3, false, Multi::SET, true);
+
+  mixed.multi = Multi::ARRAY;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.indexAll({
+    flatdoc("id", "dead-multi", "n_is", vec_i(99), "mixed", vec_i(99, 100)),
+    flatdoc("id", "c", "n_is", vec_i(10), "mixed", vec_i(14, 1, 14)),
+    flatdoc("id", "e")
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "d"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("dead-single", UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("dead-multi", UpdateMessage::COMMIT).success);
+  reader = writer->snapshots.readers.getReader();
+  ASSERT_EQ(3u, reader->segments().size());
+  checkLayout(reader->segments()[1], "mixed", 2, 5, true, Multi::ARRAY, false);
+  EXPECT_EQ(nullptr, reader->segments()[2].postingsReader().fieldInfo("mixed"));
+
+  auto checkReads = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    for (auto direction : {qb::ASC, qb::DESC}) {
+      auto& top = req->topDocs(direction == qb::ASC ? "asc" : "desc")
+          .allQuery().fields({"id", "mixed"}).limit(10);
+      qb::sort(top, "mixed", direction);
+      qb::sort(top, "id", qb::ASC);
+    }
+    for (std::string_view name : {"hits", "count"}) {
+      auto& top = req->topDocs(name).fields({"id"}).countLimit().limit(name == "hits" ? 10 : 0);
+      top.rawQuery() = qb::range(req->mr, "mixed", qb::valI64(req->mr, 4), nullptr,
+                                qb::valI64(req->mr, 8), nullptr);
+      if (name == "hits") qb::sort(top, "id", qb::ASC);
+    }
+    auto& facet = req->facet("values", "mixed").limit(-1);
+    std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
+    req->execute();
+    ASSERT_OK(req);
+    for (std::string_view name : {"asc", "desc", "hits"}) {
+      auto ids = std::get<api::ColStr>(req->docList(name)->columns.at("id").kind).v;
+      using Ids = std::vector<std::string_view>;
+      Ids expected = name == "hits" ? Ids{"a", "b"}
+          : name == "asc" ? Ids{"c", "a", "b", "d", "e"} : Ids{"c", "b", "a", "d", "e"};
+      EXPECT_EQ(expected, Ids(ids.begin(), ids.end())) << name;
+    }
+    auto arrays = std::get<api::ArrArrInt>(req->docList("asc")->columns.at("mixed").kind).v;
+    ASSERT_EQ(5u, arrays.size());
+    EXPECT_TRUE(std::ranges::equal(arrays[0].v, vec_i(14, 1, 14)));
+    EXPECT_TRUE(std::ranges::equal(arrays[1].v, vec_i(4)));
+    EXPECT_TRUE(std::ranges::equal(arrays[2].v, vec_i(8)));
+    EXPECT_EQ(2, req->getMatchCount("hits"));
+    EXPECT_EQ(2, req->getMatchCount("count"));
+    const auto* result = req->responses[0]->proto.ops.at("values")->facetResult();
+    ASSERT_NE(nullptr, result);
+    auto keys = std::get<api::ColInt>(result->bucket_ids->kind).v;
+    std::map<int64_t, int64_t> counts;
+    for (size_t i = 0; i < keys.size(); i++) counts.emplace(keys[i], result->counts[i]);
+    EXPECT_EQ((std::map<int64_t, int64_t>{{1, 1}, {4, 1}, {8, 1}, {14, 1}}), counts);
+    EXPECT_EQ(2, result->missing.value_or(0));
+  };
+  checkReads();
+  writer->mergeSegments();
+  reader = writer->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  checkLayout(reader->segments()[0], "mixed", 3, 5, true, Multi::ARRAY, false);
+  checkLayout(reader->segments()[0], "n_is", 3, 3, false, Multi::SET, false);
+  checkReads();
 }
 
 TEST_F(MultiValuedNumericTest, arraysPreserveSourceAndSelectExtremaThroughMerge) {

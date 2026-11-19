@@ -248,7 +248,7 @@ public:
 
 
 // Numeric sets sort and deduplicate encoded values before appending. Arrays
-// retain source order and repeats. GEO_POINT is always an array.
+// retain source order and repeats. Multi-valued GEO_POINT uses array semantics.
 class MultiIntColHandler : public Inverter::IndexHandler {
   friend class Inverter;
   LongStream longStream;
@@ -348,11 +348,11 @@ public:
     flushIntCol(inverter, fieldInfo);
   }
 
-  // This is the version called directly from text field for norms
   void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
     auto& pool = MemPool::threadLocal();
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-    auto full = numDocs >= postingsWriter.getMaxDoc(space);
+    bool full = numDocs == postingsWriter.getMaxDoc(space);
+    bool hasEndValueRanks = fieldInfo.type == FieldType::INTERVAL || numVals != numDocs;
 
     if (fieldType->indexed()) {
       auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals, &lengthStream);
@@ -362,7 +362,8 @@ public:
     // push values
     {
       auto outputPtr = postingsWriter.getOutputStream();
-      IntColWriter writer(*outputPtr);
+      IntColWriter writer(*outputPtr,
+                          !hasEndValueRanks && FieldType::isNumericColumn(fieldInfo.type));
       longStream.pushValues(inverter.pool, writer);
       writer.finish(fieldInfo);
     }
@@ -437,8 +438,7 @@ public:
       }
     }
 
-    // push lengths
-    {
+    if (hasEndValueRanks) {
       auto guard = pool.rewindScopeGuard();
       OutputStreamPtr out = postingsWriter.getOutputStream();
       MonoWriter endValueRankWriter(pool, *out);

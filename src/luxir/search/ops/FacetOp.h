@@ -180,8 +180,7 @@ public:
   // Value counts are document counts when every present doc has one value,
   // even if the segment uses the multi-valued column representation.
   static bool valuesAreDocuments(const SegFieldInfo& info) {
-    return !(info.flags & FieldType::MULTI_VALUED)
-        || info.numValues == info.docsWithField;
+    return info.numValues == info.docsWithField;
   }
 
   // Compare a block's shared column pass with its points fences before
