@@ -50,6 +50,15 @@ class IndexWriterTest : public LuxirTest {
 public:
   std::string field = "text_w";
 
+  // Until the guard is destroyed, a publication's reader open fails, so the
+  // snapshot is published without a reader and searches reopen it.
+  static auto failPublicationOpens() {
+    Signal::listen("indexReaderPreparing", [](void*, void*, void*) -> void* {
+      throw std::runtime_error("injected publication open failure");
+    });
+    return scope_guard([] { Signal::unlisten("indexReaderPreparing"); });
+  }
+
   void addDoc(IndexWriter& iw, bool flush = false) {
     auto* inverter = &iw.obtainInverter();
     auto* fieldHandler = &inverter->getIndexHandler(field);
@@ -551,51 +560,186 @@ TEST_F(IndexWriterTest, getReader) {
   ASSERT_EQ(1, reader->maxDoc());
   ASSERT_EQ(1, reader->segments().size());
 
-  // now add another doc, commit, but get a reader with permissive freshness
+  // A commit opens its reader on publication; the first search after it
+  // finds the reader published and reopens nothing.
+  int searchOpens = 0;
+  Signal::listen("indexReaderOpening", [&](void*, void*, void*) -> void* { searchOpens++; return nullptr; });
+  auto unlisten = scope_guard([] { Signal::unlisten("indexReaderOpening"); });
   addDoc(iw);
   iw.commit();
-  reader2 = iw.snapshots.readers.getReader(10000000);  // can be up to 10 seconds old
-  ASSERT_EQ(reader, reader2);  // not guaranteed, but should be the case
+  EXPECT_EQ(iw.snapshots.snapshot()->id.index_gen, iw.snapshots.readers.indexReader.load()->commitId());
+  reader = iw.snapshots.readers.getReader();
+  EXPECT_EQ(2, reader->maxDoc());
+  EXPECT_EQ(reader, iw.snapshots.readers.getReader(1));
+  EXPECT_EQ(0, searchOpens);
 
-  // sleep current thread for a microsecond
+  // When the open on publication fails, freshness decides who reopens.
+  {
+    auto failing = failPublicationOpens();
+    addDoc(iw);
+    iw.commit();
+  }
+  EXPECT_EQ(reader, iw.snapshots.readers.getReader(10000000));  // can be up to 10 seconds old
   std::this_thread::sleep_for(std::chrono::microseconds(1));
-
-  // now test a reader that is not fresh enough
-  reader2 = iw.snapshots.readers.getReader(1);  // can be up to 1 microseconds old! (0 is a special case, so we just chose smallest value we can)
-  ASSERT_NE(reader, reader2);  // It's possible this could spuriously fail if the sleep wasn't long enough or the system clock is changed.
-  ASSERT_EQ(2, reader2->maxDoc());
-  ASSERT_EQ(2, reader2->segments().size());
+  reader2 = iw.snapshots.readers.getReader(1);  // may be at most 1 microsecond old
+  EXPECT_NE(reader, reader2);
+  EXPECT_EQ(3, reader2->maxDoc());
+  EXPECT_EQ(1, searchOpens);
 }
 
-// A request the current reader satisfies must not wait for a reopen in
-// progress: from inside the reopen (lock held), a permissive-freshness
-// acquisition on another thread returns the previous reader at once.
-TEST_F(IndexWriterTest, acquisitionSatisfiedByCurrentReaderDoesNotWaitForReopen) {
+// While a search reopens (its open blocked from inside), a request the
+// published reader satisfies takes it at once. One that needs the new
+// snapshot waits and is counted: freshness_ms=0 always, and a tolerant one
+// when the schema changed, since a schema change always forces a reopen.
+TEST_F(IndexWriterTest, reopenInProgressBlocksOnlyRequestsThatNeedIt) {
+  for (bool schemaChange : {false, true}) {
+    SCOPED_TRACE(schemaChange ? "schema" : "commit");
+    RAMDir dir;
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
+    IndexWriter iw(iwSnapshots);
+    auto metrics = std::make_shared<Metrics>();
+    iw.snapshots.readers.metrics = metrics;
+    addDoc(iw);
+    iw.commit();
+    auto reader = iw.snapshots.readers.getReader();
+    {
+      auto failing = failPublicationOpens();
+      if (schemaChange) iw.setSchema(Schema::createDefaultSchema());
+      else {
+        addDoc(iw);
+        iw.commit();
+      }
+    }
+    auto waits = [&] {
+      return metrics->counts().activities[metricActivity(MetricStage::READER_WAIT)].started;
+    };
+    auto waitFor = [&](uint64_t n) {
+      for (int i = 0; i < 10000 && waits() < n; i++) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    };
+    std::future<std::shared_ptr<IndexReader>> tolerant, strict;
+    bool tolerantReturned = false, strictWaited = false;
+    Signal::listen("indexReaderOpening", [&](void*, void*, void*) -> void* {
+      if (tolerant.valid()) return nullptr;
+      tolerant = std::async(std::launch::async, [&] { return iw.snapshots.readers.getReader(10'000'000); });
+      if (schemaChange) waitFor(1);
+      else tolerantReturned = tolerant.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+      strict = std::async(std::launch::async, [&] { return iw.snapshots.readers.getReader(0); });
+      waitFor(schemaChange ? 2 : 1);
+      strictWaited = strict.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout;
+      return nullptr;
+    });
+    auto cleanup = scope_guard([] { Signal::unlisten("indexReaderOpening"); });
+    auto fresh = iw.snapshots.readers.getReader();
+    ASSERT_TRUE(tolerant.valid() && strict.valid());
+    EXPECT_TRUE(strictWaited);
+    EXPECT_EQ(fresh, strict.get());
+    EXPECT_NE(reader, fresh);
+    EXPECT_EQ(iw.getSchema(), fresh->schema());
+    if (schemaChange) {
+      EXPECT_EQ(fresh, tolerant.get());
+      EXPECT_EQ(2u, waits());
+    } else {
+      EXPECT_TRUE(tolerantReturned);
+      EXPECT_EQ(reader, tolerant.get());
+      EXPECT_EQ(1u, waits());
+    }
+  }
+}
+
+// A publication's reader open holds no lock: a search keeps the previous
+// reader until the snapshot is advertised, and a search that must reopen (the
+// previous publication's open failed) does so without waiting for it.
+TEST_F(IndexWriterTest, commitOpeningReaderDoesNotBlockSearches) {
   RAMDir dir;
   CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
+  auto metrics = std::make_shared<Metrics>();
+  iw.snapshots.readers.metrics = metrics;
   addDoc(iw);
   iw.commit();
   auto reader = iw.snapshots.readers.getReader();
+  for (bool previousFailed : {false, true}) {
+    SCOPED_TRACE(previousFailed ? "previous failed" : "current");
+    if (previousFailed) {
+      auto failing = failPublicationOpens();
+      addDoc(iw);
+      iw.commit();
+    }
+    auto expected = iw.snapshots.snapshot()->id.index_gen;
+    addDoc(iw);
+    std::future<std::shared_ptr<IndexReader>> search;
+    bool returned = false;
+    Signal::listen("indexReaderPreparing", [&](void*, void*, void*) -> void* {
+      if (search.valid()) return nullptr;
+      search = std::async(std::launch::async, [&] { return iw.snapshots.readers.getReader(0); });
+      returned = search.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+      return nullptr;
+    });
+    auto cleanup = scope_guard([] { Signal::unlisten("indexReaderPreparing"); });
+    iw.commit();
+    ASSERT_TRUE(search.valid());
+    EXPECT_TRUE(returned);
+    auto seen = search.get();
+    EXPECT_EQ(expected, seen->commitId());
+    if (!previousFailed) {
+      EXPECT_EQ(reader, seen);
+    }
+    auto fresh = iw.snapshots.readers.getReader(0);
+    EXPECT_EQ(iw.snapshots.snapshot()->id.index_gen, fresh->commitId());
+    EXPECT_EQ(fresh, iw.snapshots.readers.indexReader.load());
+  }
+  EXPECT_EQ(0u, metrics->counts().activities[metricActivity(MetricStage::READER_WAIT)].started);
+}
+
+// A collection no search used within idleAfterUs publishes commits without
+// opening their readers; its next search reopens, and marks it searched.
+TEST_F(IndexWriterTest, idleCollectionSkipsPublicationOpen) {
+  RAMDir dir;
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
+  IndexWriter iw(iwSnapshots);
+  auto& readers = iw.snapshots.readers;
   addDoc(iw);
   iw.commit();
+  auto reader = readers.getReader();
+  int searchOpens = 0;
+  Signal::listen("indexReaderOpening", [&](void*, void*, void*) -> void* { searchOpens++; return nullptr; });
+  auto unlisten = scope_guard([] { Signal::unlisten("indexReaderOpening"); });
 
-  std::future<std::shared_ptr<IndexReader>> concurrent;
-  bool returnedDuringReopen = false;
-  Signal::listen("indexReaderOpened", [&](void* source, void*, void*) -> void* {
-    if (source != &iw.snapshots.readers) return nullptr;
-    concurrent = std::async(std::launch::async, [&] { return iw.snapshots.readers.getReader(10'000'000); });
-    returnedDuringReopen = concurrent.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
-    return nullptr;
-  });
-  auto cleanup = scope_guard([] { Signal::unlisten("indexReaderOpened"); });
-  auto fresh = iw.snapshots.readers.getReader();
-  ASSERT_TRUE(concurrent.valid());
-  EXPECT_TRUE(returnedDuringReopen);
-  EXPECT_EQ(reader, concurrent.get());
-  EXPECT_NE(reader, fresh);
+  readers.idleAfterUs = 0;
+  addDoc(iw);
+  iw.commit();
+  EXPECT_EQ(reader, readers.indexReader.load());
+  EXPECT_EQ(reader, readers.getReader(10'000'000));
+  auto fresh = readers.getReader(0);
   EXPECT_EQ(2, fresh->maxDoc());
-  EXPECT_EQ(fresh, iw.snapshots.readers.getReader());
+  EXPECT_EQ(1, searchOpens);
+
+  readers.idleAfterUs = 60'000'000;
+  EXPECT_TRUE(readers.searchedRecently());
+  addDoc(iw);
+  iw.commit();
+  EXPECT_EQ(iw.snapshots.snapshot()->id.index_gen, readers.indexReader.load()->commitId());
+  EXPECT_EQ(3, readers.getReader(0)->maxDoc());
+  EXPECT_EQ(1, searchOpens);
+}
+
+// An immediate commit responds after its reader is published: a search after
+// it sees the update, and no search opens a reader.
+TEST_F(IndexWriterTest, immediateCommitIsVisibleWithoutSearchReopen) {
+  test::CollectionHelper helper;
+  int searchOpens = 0;
+  Signal::listen("indexReaderOpening", [&](void*, void*, void*) -> void* { searchOpens++; return nullptr; });
+  auto unlisten = scope_guard([] { Signal::unlisten("indexReaderOpening"); });
+  for (int i = 0; i < 3; i++) {
+    auto id = "doc" + std::to_string(i);
+    ASSERT_TRUE(helper.index(test::flatdoc("id", id), UpdateMessage::COMMIT).success);
+    auto req = test::localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").matchQuery("id", id).fields({"id"});
+    req->execute();
+    ASSERT_OK(req);
+    EXPECT_EQ(1, req->getDocs().size());
+  }
+  EXPECT_EQ(0, searchOpens);
 }
 
 TEST_F(IndexWriterTest, filterCachePublishesOnlyInstalledReaders) {
@@ -612,15 +756,16 @@ TEST_F(IndexWriterTest, filterCachePublishesOnlyInstalledReaders) {
   EXPECT_EQ(reader, iw.snapshots.readers.getReader());
   EXPECT_EQ(publications, cache->readerPublicationsForTest());
 
-  addDoc(iw);
-  iw.commit();
-  EXPECT_EQ(reader, iw.snapshots.readers.getReader(10000000));
+  // A prepared reader that is never published does not reach the cache.
+  auto unpublished = iw.snapshots.readers.prepare(*iw.snapshots.snapshot());
   EXPECT_EQ(publications, cache->readerPublicationsForTest());
 
+  addDoc(iw);
+  iw.commit();
+  EXPECT_EQ(publications + 1, cache->readerPublicationsForTest());
   auto newer = iw.snapshots.readers.getReader();
   EXPECT_NE(reader, newer);
   EXPECT_EQ(cache.get(), newer->filterCache());
-  EXPECT_EQ(publications + 1, cache->readerPublicationsForTest());
   EXPECT_EQ(newer, iw.snapshots.readers.getReader());
   EXPECT_EQ(publications + 1, cache->readerPublicationsForTest());
 
@@ -4027,10 +4172,19 @@ TEST_F(IndexWriterTest, readerRetriesAnyFailureOnlyWhenPublicationChanges) {
     RAMDir dir;
     CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
     IndexWriter writer(writerSnapshots);
+    {
+      // The reader lags, so the next search reopens.
+      auto failing = failPublicationOpens();
+      writer.setSchema(Schema::createDefaultSchema());
+    }
     bool first = true;
     Signal::listen("indexReaderOpening", [&](void*, void*, void*) -> void* {
       if (std::exchange(first, false)) {
-        if (change) writer.setSchema(Schema::createDefaultSchema());
+        // Publish without a reader while this open holds the reader lock.
+        if (change) {
+          auto failing = failPublicationOpens();
+          writer.setSchema(Schema::createDefaultSchema());
+        }
         throw std::runtime_error("injected reader failure");
       }
       return nullptr;

@@ -936,10 +936,16 @@ TEST_F(DocFormatTest, readerCapturesSchemaAfterPhysicalOpen) {
   indexBooks(ch);
   auto writer = ch.getIndexWriter();
   auto before = writer->snapshots.readers.getReader();
+  // Publications open no reader, so the search reopens; the schema published
+  // during that open lands after it.
+  Signal::listen("indexReaderPreparing", [](void*, void*, void*) -> void* {
+    throw std::runtime_error("injected publication open failure");
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("indexReaderPreparing"); });
   ASSERT_TRUE(ch.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success);
   std::shared_ptr<Schema> published;
   Signal::listen("indexReaderOpened", [&](void* source, void*, void*) -> void* {
-    if (source == &writer->snapshots.readers) {
+    if (source == &writer->snapshots.readers && !published) {
       SchemaBuilder b;
       b.field("added").type = api::FieldDef::FieldClass::STRING;
       published = b.set(ch.collection());

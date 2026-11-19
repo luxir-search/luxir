@@ -15,6 +15,7 @@
 #include "luxir/store/FileIOException.h"
 #include "luxir/store/RangeFetch.h"
 #include "luxir/util/ApiError.h"
+#include "luxir/util/IoContext.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/Signal.h"
 
@@ -759,7 +760,10 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
             if (opened.file) fetching.push_back(opened.file);
           }
         }
-        fetchWhole(fetching, kNoReadDeadline);
+        // Bounded by the deadline of the request the open is done for (a
+        // search's reopen); an open for no request waits for every fetch.
+        const auto* io = IoContext::current();
+        fetchWhole(fetching, io ? io->fetchDeadline() : kNoReadDeadline);
       }
 
       segs.reserve(indexInfo.segments.size());
