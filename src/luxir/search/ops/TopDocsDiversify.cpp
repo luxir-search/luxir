@@ -32,6 +32,7 @@ void TopDocsReq::CalcBase::configureDiversify() {
   collectorMerger.creator = [&op]() {
     auto* collector = new MergeableCollector(op.topCount, op.sortPlan, op.view.get(),
                                             op.requestNeedsScores, *op.diversify);
+    collector->setMeter(&op.heapMeter);
     if (collector->useFieldSort) collector->diverseFieldCollector->primaryValues = op.sortValues;
     return collector;
   };

@@ -328,6 +328,9 @@ public:
   // Implementations that publish KeyBatch::slotKeys must re-point it here.
   virtual void growSlots(int32_t capacity) = 0;
 
+  // Bytes growSlots allocates per slot, for request memory accounting.
+  virtual size_t slotBytes() const = 0;
+
   virtual KeyBatch* keyBatch() { return nullptr; }
 
   // Optional competitive segment-ord interval for string-sort pruning,
@@ -530,6 +533,8 @@ public:
     resizeExact(values, (size_t)capacity);
     slotKeys = values;
   }
+
+  size_t slotBytes() const override { return sizeof(values[0]); }
 
   // Dense single-valued columns map doc == value rank, so the per-4096-value
   // zone maps are exact per-doc-block key bounds. Sparse and multi-valued
@@ -826,6 +831,8 @@ public:
     }
   }
 
+  size_t slotBytes() const override { return sizeof(globalOrds[0]); }
+
   // Identity mapping only (ordMap == nullptr, the single-segment selection):
   // slot values are then raw segment ords times the direction, so the bottom
   // slot converts straight back to a segment-ord bound. The multi-segment
@@ -1036,6 +1043,8 @@ public:
     if ((size_t)capacity > slots.size()) resizeExact(slots, (size_t)capacity);
   }
 
+  size_t slotBytes() const override { return sizeof(Slot); }
+
   // Bottom state semantics (see setBottom): exact => bottomOrd is the
   // bottom's own 1-based ord, so equal-ord docs tie with the bottom;
   // inexact => the bottom term is absent here and sorts strictly between
@@ -1230,6 +1239,9 @@ public:
       resizeExact(missing, (size_t)capacity);
     }
   }
+
+  // The string bodies a slot copies are not counted.
+  size_t slotBytes() const override { return sizeof(std::string) + sizeof(uint8_t); }
 
   std::optional<std::string_view> getDocValue(int32_t docid) {
     if (!iter.has_value()) {

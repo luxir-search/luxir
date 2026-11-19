@@ -7,7 +7,10 @@
 #include <cstddef>
 #include <string_view>
 #include <string>
+#include <utility>
 #include <memory_resource>
+
+#include "luxir/util/StorageMeter.h"
 
 namespace luxir {
 
@@ -47,6 +50,21 @@ public:
 
   size_t ceiling() const { return maxBytes; }
   size_t peak() const { return peakBytes.load(std::memory_order_relaxed); }
+};
+
+// Charges on-demand container growth (top-docs heaps, sort slots) to the
+// request breaker under one breaker name and detail.
+class RequestStorageMeter final : public StorageMeter {
+  RequestMemTracker& tracker;
+  std::string breaker;
+  std::string detail;
+
+public:
+  RequestStorageMeter(RequestMemTracker& tracker, std::string breaker, std::string detail)
+      : tracker(tracker), breaker(std::move(breaker)), detail(std::move(detail)) {}
+
+  void charge(size_t bytes) override { tracker.charge(bytes, breaker, detail); }
+  void release(size_t bytes) noexcept override { tracker.release(bytes); }
 };
 
 // Actual allocation accounting, including container growth overlap.

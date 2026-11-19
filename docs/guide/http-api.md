@@ -99,7 +99,8 @@ Each normal line is one complete response batch. A small default-limit search
 usually has one line and therefore also parses as an ordinary JSON object. Use
 `?format=docs` for document-per-line export without response envelopes; it
 emits row documents, so `document_format` `columns` or `adaptive` is rejected
-with it.
+with it. The export is exempt from `search.max-result-window`, so `limit: -1`
+streams every match; envelope responses page within the window.
 
 Explicit request `ops` return named results under response `ops`, preserving
 their hierarchy in every batch. Root query shorthand returns its implicit
@@ -292,6 +293,16 @@ local commit failed. Replica wait outcomes (`satisfied`, `timed_out`,
 `cancelled`) retain the token and do not change local commit success. A local
 failure sets overall `status: "error"` and a top-level `error`, with HTTP 200,
 consistent with unary commit failures. See [Indexing](indexing.md#per-document-failures).
+
+Per-request search limits map onto these kinds. A request shape the node
+refuses (`result_window_exceeded`, `facet_limit_exceeded`, `too_many_ops`) is
+`invalid_request`, HTTP 400; retrying it unchanged fails again. A request that
+outgrows a work or memory ceiling while it runs (`request_memory_exceeded`,
+`too_many_expansions`, `too_many_terms_examined`,
+`too_many_expansion_postings`) is `resource_exhausted`, HTTP 429 when it fails
+before output starts, or the final NDJSON error line after it. See
+[Operations](operations.md#indexing-memory-and-request-limits) for the limits
+and their defaults.
 
 Search warnings are successful results with a bounded declared degradation.
 Use `warnings[].code` as the machine key and the message as diagnostic detail;

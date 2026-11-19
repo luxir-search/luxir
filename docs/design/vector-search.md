@@ -670,7 +670,7 @@ invalid interval.
 
 There is no interval retention cap. `RequestMemResource` charges records,
 canonical unit keys, witness heaps, pending batches and terminal selection
-storage to the request's existing opt-in byte ceiling. Exceeding it throws
+storage to the request's byte ceiling (search.request-memory-max-bytes). Exceeding it throws
 `request_memory_exceeded`, including from scan tasks; cancellation and joining
 precede destruction of shared state. Bounded candidate limits and explicit
 probe pins remain separate policies.

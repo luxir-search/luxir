@@ -52,6 +52,10 @@ protected:
                std::optional<int64_t> countLimit, int64_t limit = 10, int parallel = 0) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
+    // A list deeper than the result window is an export.
+    if (limit > luxirNode->getConfig().search.max_result_window) {
+      req->responseFormat(api::ResponseFormat::DOCS);
+    }
     auto& cur = req->topDocs("q").fields({"id"}).limit(limit);
     if (countLimit) cur.countLimit(*countLimit);
     cur.rawQuery() = qb::match(cur.mr(), "body_w", text);

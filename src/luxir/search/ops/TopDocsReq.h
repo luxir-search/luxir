@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <format>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -612,6 +613,11 @@ public:
   Query::ScoreProfile scoreProfile;
   bool requestNeedsScores;
   int64_t topCount; // Collection depth (offset + page size, capped by maxDoc).
+  // limit -1 resolved to search.max_result_window (noteWindow).
+  bool windowCapped = false;
+  // Charges every collector's heap and sort slots to the request breaker.
+  RequestStorageMeter heapMeter{req.memoryTracker, "top docs heap",
+                                "top_docs '" + std::string(name) + "'"};
   std::span<ParsedFilter> filters;
   std::span<Query::Weight*> filterWeights;
   std::span<FilterCache::Use*> filterUses;
@@ -719,6 +725,7 @@ public:
         auto* collector = new MergeableCollector(
             op.topCount, op.sortPlan, op.view.get(),
             op.requestNeedsScores, op.collapse);
+        collector->setMeter(&op.heapMeter);
         if (collector->useFieldSort) {
           if (op.collapse != nullptr) collector->groupFieldCollector->primaryValues = op.sortValues;
           else collector->fieldCollector->primaryValues = op.sortValues;
@@ -3020,6 +3027,16 @@ public:
   Calculator* createCalculator(
       Calculator* parent, int64_t slot = -1, int64_t numSlots = -1,
       const StructuralConstraint* structural = nullptr) override;
+
+  // A list whose limit -1 resolved to the result window and filled it may
+  // have left matches out: the response says so.
+  void noteWindow(int64_t retained) {
+    if (!windowCapped || retained < topCount) return;
+    req.warnOnce("result_window_capped", std::format(
+        "top_docs '{}': limit -1 stopped at the result window of {} "
+        "(search.max_result_window); more matches may exist, stream them with "
+        "response_format docs", name, topCount));
+  }
 
   // A facet bucket child runs one independent TopDocs per bucket over that
   // bucket's domain; its DocList lands in the bucket's slot of the parent

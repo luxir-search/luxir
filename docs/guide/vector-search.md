@@ -833,7 +833,7 @@ reusing seed scores. Final scores and unit representatives are exact within
 this selected set.
 
 Interval state, witnesses and seed storage are charged to the uniform request
-memory budget. There is no interval candidate-count cap. The opt-in request
+memory budget. There is no interval candidate-count cap. The request
 byte ceiling fails the request with `request_memory_exceeded`; it never silently
 truncates the interval set. IVF list selection and empirical confidence pruning
 still make the search approximate.

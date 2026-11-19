@@ -180,20 +180,37 @@ struct SearchConfig {
   // A request-shape limit like the query parsers' nesting budget, but much
   // lower: every level is a full search operation, not just a query node.
   int max_op_depth = 10;
-  // Per-request query-memory breaker ceiling; zero (the default) tracks but
-  // never rejects. Facet aggregate state is the first charge site; sorts and
-  // domains will join it over time. Sizing guidance when enabling: a
-  // 278,741-bucket min/max metric needs a 10-byte state;
+  // Max search operations in one request, counted across every nesting level
+  // (named ops, fusion sources, and row ops). Zero is unlimited.
+  int64_t max_ops = 1000;
+  // Max offset + limit of one ranked list (top_docs, a fusion, a fusion
+  // source's candidate pool). An explicit page past it is rejected; limit -1
+  // means all matches up to it. The response_format=docs export is exempt:
+  // it streams every match, bounded by the request memory breaker. Zero is
+  // unlimited.
+  int64_t max_result_window = 10000;
+  // Max buckets one field facet may return. An explicit larger limit is
+  // rejected; limit -1 means all buckets up to it. Zero is unlimited.
+  int64_t max_facet_buckets = 65536;
+  // Per-request query-memory breaker ceiling in bytes. -1 = auto: an eighth
+  // of the node budget (max_ram_mb), at least REQUEST_MEMORY_MIN_AUTO_BYTES,
+  // or REQUEST_MEMORY_UNLIMITED_NODE_BYTES when the node budget is
+  // unlimited. Zero tracks but never rejects. Resolved by
+  // LuxirConfig::resolveRamBudgets(). Charged by top-docs heaps and sort
+  // slots, facet aggregate state, collapse, and filter-cache routing.
+  // Sizing: a 278,741-bucket min/max metric needs a 10-byte state;
   // 278,741 * 10 * (32 live collectors + one merge copy), plus 33 * 64 KiB
-  // reservation tails, is 158,536,389 bytes - so 160 MiB covers it.
+  // reservation tails, is 94,147,218 bytes, which the 256 MiB floor covers.
   // Early-merge degradation is future work.
-  size_t request_memory_max_bytes = 0;
+  int64_t request_memory_max_bytes = -1;
+  static constexpr int64_t REQUEST_MEMORY_MIN_AUTO_BYTES = 256LL * 1024 * 1024;
+  static constexpr int64_t REQUEST_MEMORY_UNLIMITED_NODE_BYTES = 1024LL * 1024 * 1024;
   // Term-dictionary expansion guards for prefix, wildcard, regex, string
   // range, and fuzzy queries (see MultiTermLimits). Zero is unlimited; a
   // request can never raise or disable them.
-  int32_t multiterm_max_expansions = 0;
-  int64_t multiterm_max_terms_examined = 0;
-  int64_t multiterm_max_postings = 0;
+  int32_t multiterm_max_expansions = 10000;
+  int64_t multiterm_max_terms_examined = 10'000'000;
+  int64_t multiterm_max_postings = 100'000'000;
   // Pattern-only minimum literal prefix for unbounded prefix/wildcard/regex.
   int32_t multiterm_min_prefix_length = 0;
 };

@@ -291,27 +291,42 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(search.fanout_sibling_grain_us)
       ->check(CLI::Range((int64_t)-1, (int64_t)60'000'000))
       ->check(!CLI::Range((int64_t)0, (int64_t)0));
+  app.add_option("--search.max-ops", search.max_ops,
+                 "Max search operations in one request, across all nesting (0 = unlimited)")
+      ->default_val(search.max_ops)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.max-result-window", search.max_result_window,
+                 "Max offset + limit of one ranked list; format=docs exports are exempt "
+                 "(0 = unlimited)")
+      ->default_val(search.max_result_window)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.max-facet-buckets", search.max_facet_buckets,
+                 "Max buckets one field facet may return (0 = unlimited)")
+      ->default_val(search.max_facet_buckets)
+      ->check(CLI::NonNegativeNumber);
+  // No default_val: the -1 sentinel tells resolveRamBudgets() to derive it.
   app.add_option("--search.request-memory-max-bytes",
                  search.request_memory_max_bytes,
-                 "Per-request query-memory breaker ceiling (0 = unlimited)")
-      ->default_val(search.request_memory_max_bytes)
+                 "Per-request query-memory breaker ceiling (default: an eighth of "
+                 "max-ram-mb, at least 256MB; 0 = track only)")
+      ->transform(CLI::AsSizeValue(false))
       ->check(CLI::NonNegativeNumber);
   app.add_option("--search.multiterm-max-expansions",
                  search.multiterm_max_expansions,
-                 "Operator opt-in term cap per segment for prefix/wildcard/regex/range; "
-                 "a merge can change acceptance (0 = off, default)")
+                 "Terms one prefix/wildcard/regex/range query may expand to per segment; "
+                 "a merge can change acceptance (0 = unlimited)")
       ->default_val(search.multiterm_max_expansions)
       ->check(CLI::NonNegativeNumber);
   app.add_option("--search.multiterm-max-terms-examined",
                  search.multiterm_max_terms_examined,
                  "Dictionary terms all multi-term and fuzzy scans of one request "
-                 "may visit; operator opt-in (0 = off, default)")
+                 "may visit (0 = unlimited)")
       ->default_val(search.multiterm_max_terms_examined)
       ->check(CLI::NonNegativeNumber);
   app.add_option("--search.multiterm-max-postings",
                  search.multiterm_max_postings,
-                 "Operator opt-in postings estimate: summed selected docFreq, excluding "
-                 "fuzzy scored rewrites (0 = off, default)")
+                 "Postings estimate of one request's multi-term expansions: summed "
+                 "selected docFreq, excluding fuzzy scored rewrites (0 = unlimited)")
       ->default_val(search.multiterm_max_postings)
       ->check(CLI::NonNegativeNumber);
   app.add_option("--search.multiterm-min-prefix-length",
@@ -338,6 +353,16 @@ void LuxirConfig::resolveRamBudgets() {
     // never indexes, so it carves out nothing (0 is also "unlimited" for the
     // budget object, which is moot when nothing ever reserves against it).
     index.max_ram_mb = (read_only || !replication.source.empty()) ? 0 : max_ram_mb / 2;
+  }
+
+  if (search.request_memory_max_bytes < 0) {
+    // An eighth of the node budget keeps one request from taking more than a
+    // small share of it while leaving room for deep sorts and high-cardinality
+    // facets; the floor covers those on small nodes. A node-wide breaker
+    // across concurrent requests is separate future work.
+    search.request_memory_max_bytes = max_ram_mb > 0
+        ? (std::max)(max_ram_mb * 1024 * 1024 / 8, SearchConfig::REQUEST_MEMORY_MIN_AUTO_BYTES)
+        : SearchConfig::REQUEST_MEMORY_UNLIMITED_NODE_BYTES;
   }
 
   if (index.max_inverter_ram_mb < 0) {

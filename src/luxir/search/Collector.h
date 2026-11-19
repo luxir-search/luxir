@@ -112,6 +112,9 @@ class ScoreCollector {
     assert(topCount >= 0);
   }
 
+  // Charge the heap to `meter` as it grows.
+  void setMeter(StorageMeter* meter) { pq.setMeter(meter); }
+
   void reset() requires (!Collapsed) {
     pq.clear();
     hitCount = estimatedHits = 0;
