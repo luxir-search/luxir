@@ -8104,6 +8104,7 @@ TEST_F(SearchEngineTest, forcedCompositionYieldsToWholeMembershipOutcomes) {
   {
     SearchOverridesGuard facts(QueryPrep::disableCanonicalCountFactsForTests);
     QueryPrep::disableCanonicalCountFactsForTests = true;
+    EXPECT_EQ(1, run().bypasses);
     EXPECT_EQ(1, run().builds);
   }
   auto hit = run();
@@ -8283,6 +8284,76 @@ TEST_F(SearchEngineTest, countBuildServesFieldSortAndEvictionKeepsTheCount) {
   }
 }
 
+TEST_F(SearchEngineTest, scalarPreflightCreditsOnlySegmentsThatNeedMembership) {
+  CollectionHelper helper("scalar_hit_credit");
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{.minSegmentDocs = 0});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  for (int seg = 0; seg < 3; seg++) {
+    std::vector<Doc> docs;
+    for (int doc = 0; doc < 96; doc++) {
+      std::string body = "pad";
+      if (doc % 2 == 0) body += " alpha";
+      if (doc % 3 == 0) body += " beta";
+      docs.push_back(flatdoc("id", std::to_string(seg) + "_" + std::to_string(doc), "body_w", body));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteById("2_0", UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(3u, reader->segments().size());
+  auto run = [&](int limit, int64_t countLimit = -1) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->collection("scalar_hit_credit").topDocs("q")
+        .exprQuery("body_w:(+alpha +beta)").countLimit(countLimit).limit(limit);
+    if (limit) top.getScores().fields({"id"});
+    req->execute(false); EXPECT_OK(req);
+    if (countLimit < 0) {
+      EXPECT_EQ(47, req->getMatchCount("q"));
+    }
+    return std::pair{resultIds(*req, "q"), resultScoreMap(*req, "q")};
+  };
+  std::pair<std::vector<std::string>, std::map<std::string, float>> off;
+  {
+    WholeMembershipPlanGuard disabled(true);
+    off = run(10);
+  }
+  run(0); run(0);
+  ASSERT_EQ(3u, cache->counters().builds);
+  uint64_t deletedPrice = 0;
+  for (const auto& entry : cache->dump(100, nullptr)) for (const auto& value : entry.values) {
+    for (const auto& segment : reader->segments()) {
+      if (segment.segInfo.seg_id == value.segId && segment.hasDeletes()) {
+        deletedPrice = (uint64_t)value.productionNanos;
+      }
+    }
+  }
+  for (int limit : {0, 10}) {
+    SkipStatsGuard stats;
+    auto before = cache->counters();
+    auto result = run(limit);
+    if (limit) {
+      EXPECT_EQ(off.first, result.first);
+      expectBitIdenticalScoreMap(off.second, result.second);
+    } else {
+      EXPECT_EQ(1, SkipStats::cacheFirstMembershipWeightSkips);
+    }
+    EXPECT_EQ(before.hits + 3, cache->counters().hits);
+    EXPECT_EQ(before.assumedCredits + 1, cache->counters().assumedCredits);
+    EXPECT_EQ(before.observedCredits, cache->counters().observedCredits);
+    EXPECT_EQ(before.estimatedSavedNanos + deletedPrice, cache->counters().estimatedSavedNanos);
+  }
+  auto before = cache->counters();
+  auto ranked = run(10, 0);
+  EXPECT_EQ(off.first, ranked.first);
+  expectBitIdenticalScoreMap(off.second, ranked.second);
+  EXPECT_EQ(before.hits, cache->counters().hits);
+  EXPECT_EQ(before.assumedCredits, cache->counters().assumedCredits);
+  auto bounded = run(10, 5);
+  EXPECT_EQ(off.first, bounded.first);
+  expectBitIdenticalScoreMap(off.second, bounded.second);
+  EXPECT_EQ(before.assumedCredits + 3, cache->counters().assumedCredits);
+}
+
 TEST_F(SearchEngineTest, trackedCountFirstLearnsWithoutMembership) {
   CollectionHelper helper("scalar_counts");
   auto cache = std::make_shared<FilterCache>(FilterCacheConfig{.minSegmentDocs = 0});
@@ -8347,7 +8418,7 @@ TEST_F(SearchEngineTest, trackedCountFirstLearnsWithoutMembership) {
   auto after = cache->counters();
   EXPECT_EQ(before.buildAttempts, after.buildAttempts);
   EXPECT_EQ(before.hits + 1, after.hits);
-  EXPECT_EQ(before.assumedCredits + 1, after.assumedCredits);
+  EXPECT_EQ(before.assumedCredits, after.assumedCredits);
 }
 
 TEST_F(SearchEngineTest, composedCountsRecordFactsPerCanonicalSegment) {

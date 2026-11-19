@@ -957,6 +957,13 @@ class WholeMembershipPlan {
   WholeMembershipConsumer consumer = WholeMembershipConsumer::COUNT;
   std::span<const uint8_t> fieldSortCacheRoutes;
 
+  bool scalarCount(IndexReader::Segment& segment, bool canonical) const {
+    return !disableCanonicalCountFactsForTests && canonical && !segment.hasDeletes()
+        && !isReaderStable()
+        && (consumer == WholeMembershipConsumer::COUNT
+            || consumer == WholeMembershipConsumer::TOP_K_COUNT);
+  }
+
   bool observesFieldSort() const {
     return isFieldSort() && cacheUse != nullptr && weight != nullptr
         && !disableObservedFieldSortForTests && !weight->needsPrepare()
@@ -1102,6 +1109,12 @@ public:
         throw std::logic_error(
             "accepted complete membership lost a segment value");
       }
+      // The pinned raw value supplies its cardinality. Only membership or
+      // noncanonical live counts need a payment deferred by the preflight.
+      if (!disableCanonicalCountFactsForTests && !isFieldSort() && !isReaderStable()
+          && !scalarCount(segment, Query::isCanonicalCountDomain(segment, incomingDomain))) {
+        cacheUse->credit((size_t)segment.ord, FilterCache::Work::assumed());
+      }
       record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits,
              SkipStats::wholeFieldSortHits);
       int64_t card = docs.get()->card();
@@ -1158,9 +1171,7 @@ public:
     bool canonical = !weight->needsPrepare() && !weight->consumesDomain()
         && domainDependence == PreparedDomainDependence::QUERY_CANONICAL
         && Query::isCanonicalCountDomain(segment, incomingDomain);
-    bool scalar = !disableCanonicalCountFactsForTests && canonical && !segment.hasDeletes()
-        && (consumer == WholeMembershipConsumer::COUNT
-            || consumer == WholeMembershipConsumer::TOP_K_COUNT);
+    bool scalar = scalarCount(segment, canonical);
     auto cardinality = scalar ? cacheUse->cardinality((size_t)segment.ord) : std::nullopt;
     // Known counts and count-first learning need no membership.
     bool inert = scalar && (cardinality || (!disableTrackedCountFirstForTests

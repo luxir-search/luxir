@@ -3476,6 +3476,59 @@ TEST(FilterCacheTest, untimedObservedWorkCannotChargeOrClaimEvenWhenFunded) {
   EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).debt);
 }
 
+TEST(FilterCacheTest, zeroCreditServeLeavesAnotherConsumersPaymentAvailable) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  cache.onReaderPublished(1, segments);
+  FilterKey key("count-without-payload-credit");
+  servePolicyValue(cache, segments, key, 7, 1000);
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto candidate = request.lookupExisting(key);
+  ASSERT_TRUE(candidate);
+  auto before = cache.counters();
+  auto* use = request.acceptExisting(std::move(*candidate),
+      FilterCache::AdmissionLane::WHOLE, FilterCache::Work::nanoseconds(0));
+  ASSERT_NE(nullptr, use);
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, use->probe(0, FilterCache::Work::nanoseconds(0)).kind());
+  EXPECT_EQ(before.hits + 1, cache.counters().hits);
+  EXPECT_EQ(before.assumedCredits, cache.counters().assumedCredits);
+  EXPECT_EQ(before.observedCredits, cache.counters().observedCredits);
+  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).creditedTotal);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, key).debt);
+  evictValues(cache);
+  EXPECT_EQ(before.unrepaidEvictions + 1, cache.counters().unrepaidEvictions);
+  EXPECT_EQ(before.unpaidBuildNanos + 1000, cache.counters().unpaidBuildNanos);
+  EXPECT_EQ(use, request.get(key));
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT, use->probe(0).kind());
+  use->credit(0, FilterCache::Work::assumed());
+  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).debt);
+  EXPECT_EQ(before.assumedCredits + 1, cache.counters().assumedCredits);
+  EXPECT_EQ(before.estimatedSavedNanos + 1000, cache.counters().estimatedSavedNanos);
+}
+
+TEST(FilterCacheTest, zeroCreditValueLosesToRealSavedWork) {
+  constexpr int32_t maxDoc = 1024;
+  size_t bytes = bitDocs(maxDoc, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(2 * bytes));
+  std::array segments{FilterCache::SegmentIdentity{1, maxDoc}};
+  cache.onReaderPublished(1, segments);
+  FilterKey count("count-value"), real("real-saving");
+  seedCapacityValue(cache, segments, count, 0);
+  seedCapacityValue(cache, segments, real, 1000);
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+        request.get(count)->probe(0, FilterCache::Work::nanoseconds(0)).kind());
+    request.get(FilterKey("new-value"))->offerRaw(0, bitDocs(maxDoc, 7), 1000);
+  }
+  EXPECT_FALSE(ledgerFor(cache, count).resident);
+  EXPECT_TRUE(ledgerFor(cache, real).resident);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, count).debt);
+  EXPECT_EQ(1u, cache.counters().unrepaidEvictions);
+}
+
 TEST(FilterCacheTest, completeResidencyAcceptanceCanDeferObservedCredit) {
   auto config = testConfig();
   config.admissionThreshold = 1;

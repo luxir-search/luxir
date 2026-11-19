@@ -134,6 +134,7 @@ public:
     bool known() const { return tag != Tag::PENDING; }
     bool isAssumed() const { return tag == Tag::ASSUMED || isUnfunded(); }
     bool isUnfunded() const { return tag == Tag::UNFUNDED; }
+    bool isZero() const { return tag == Tag::OBSERVED && amount == 0; }
     Work observedOnly() const { return isAssumed() ? Work(0, Tag::UNFUNDED) : *this; }
     double resolve(double productionNanos) const {
       assert(known());
@@ -391,7 +392,8 @@ public:
 
       template<class Value>
       const Value* takeCredit(const Value* value, Work work) {
-        if (value == nullptr || !work.known() || credited) return nullptr;
+        // Zero work leaves the shared use's credit for another consumer.
+        if (value == nullptr || !work.known() || work.isZero() || credited) return nullptr;
         credited = true;
         return value;
       }

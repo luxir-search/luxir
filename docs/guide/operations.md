@@ -925,7 +925,10 @@ Search has its own limits:
   TOP_K consumers that need only the count read it before population, avoiding
   count execution and materialization. Unknown counts keep their normal
   population decision, while exact-count top-k counts first on tracked unknown keys.
-  Complete resident membership can still serve counts and omit their weights.
+  Complete resident membership
+  can still serve these counts and omit their weights, but earns no payload
+  credit on canonical segments without deletes. Reader-stable, restricted-domain
+  and deleted-segment counts retain their membership credit.
   Constant first-K membership and consumers that read the set retain their demand.
   A flush drops values and metadata, including ledgers, while keeping sightings,
   so a known query is readmitted immediately; unpriced membership uses rebuild immediately. Flush with

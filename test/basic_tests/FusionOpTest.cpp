@@ -359,6 +359,8 @@ TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
   rankedSource.query = arenaQuery(mr, countQuery(mr));
   addFilter(fusion.filter, qb::match(mr, "keep_s", "yes"), mr);
 
+  auto cache = h.getIndexWriter()->snapshots.readers.filterCache;
+  auto credits = cache->counters().assumedCredits;
   bool saved = SkipStats::enabled;
   SkipStats::enabled = true;
   SkipStats::reset();
@@ -371,6 +373,7 @@ TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
   EXPECT_EQ(1, wholeHits);
   EXPECT_EQ(0, wholeBuilds);
   EXPECT_EQ(0, wholeBypasses);
+  EXPECT_EQ(credits + 1, cache->counters().assumedCredits);
   EXPECT_EQ((std::vector<std::string>{"a", "d"}), resultIds(*lreq));
 }
 

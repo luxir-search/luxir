@@ -2067,6 +2067,11 @@ public:
         && (foldFilters || filters.empty());
     FilterCache::Use* cacheFirstMembershipUse = nullptr;
     auto* cache = view()->filterCache();
+    auto wholeCountWork = [&] {
+      return !QueryPrep::disableCanonicalCountFactsForTests
+          && planningContext->filterScope(*query) <= FilterKeyScope::CORE_STABLE
+          ? FilterCache::Work::nanoseconds(0) : FilterCache::Work::assumed();
+    };
     if (pureCountShape && canOmitWeightForCacheFirstMembership(*query)
         && !directCountAvailable(*query, *view())
         && cache != nullptr && cache->enabled()) {
@@ -2074,7 +2079,7 @@ public:
           *query, placement == TopDocsPlacement::ROOT_OP);
       if (candidate.has_value()) {
         cacheFirstMembershipUse = planningContext->acceptExistingFilterUse(
-            std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+            std::move(*candidate), FilterCache::AdmissionLane::WHOLE, wholeCountWork());
       }
       if (cacheFirstMembershipUse != nullptr) {
         skipCount(SkipStats::cacheFirstMembershipWeightSkips);
@@ -2092,7 +2097,7 @@ public:
       auto candidate = planningContext->lookupExistingFilterUse(*query, true);
       if (candidate.has_value()) {
         cacheFirstMembershipUse = planningContext->acceptExistingFilterUse(
-            std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+            std::move(*candidate), FilterCache::AdmissionLane::WHOLE, wholeCountWork());
       }
       cacheFirstTopKCount = cacheFirstMembershipUse != nullptr;
       if (cacheFirstTopKCount) {
