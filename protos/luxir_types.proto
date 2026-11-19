@@ -1767,32 +1767,41 @@ message ServiceStats {
   uint64 control_busy = 61;      // tasks running now
   uint64 control_queued = 62;    // tasks waiting for a thread
   uint64 control_completed = 63;
-  SearchFanoutStats search_fanout = 97;
+  SearchFanoutStats search_fanout = 26;
 }
 
-// What the adaptive segment fan-out (max_parallel 0) decided. An evaluation
-// is a fan-out point that had earned a grain of inline time and priced the
-// children still to run; a search can evaluate several times. Each evaluation
-// publishes or is denied once, so published and the denied_* fields sum to
-// the evaluations.
+// What the adaptive segment fan-out (max_parallel 0) decided, process-wide.
+// An evaluation is a fan-out point that had earned a grain of inline time and
+// priced the children still to run; a search can evaluate several times, and
+// can publish at one evaluation and be refused at a later one. Each evaluation
+// that returns normally records one outcome, so published and the four
+// refusals sum to those evaluations. Load means this process's recent search
+// and indexing work, not host CPU usage. Searches with max_parallel 1, -1 or
+// -2 are not counted.
 message SearchFanoutStats {
-  // Adaptive searches that published no share. Searches run with
-  // max_parallel 1, -1 or -2 are not counted.
-  uint64 serial_searches = 1;
-  // Adaptive searches that published at least one share.
-  uint64 parallel_searches = 2;
-  // Evaluations that published shares.
-  uint64 published = 3;
-  // Shares those evaluations published.
-  uint64 shares = 4;
-  // Evaluations where no share would cover the grain: search.fanout-grain-us,
-  // or search.fanout-sibling-grain-us when only SMT siblings were idle.
-  uint64 denied_grain = 5;
-  // Evaluations denied because only SMT siblings were idle and
-  // search.fanout-sibling-grain-us is -1.
-  uint64 denied_siblings_only = 6;
-  // Evaluations denied because the machine was saturated.
-  uint64 denied_saturated = 7;
+  // Adaptive searches that published at least one share and completed their
+  // body without error. Its rate over the rate of all searches (search ok +
+  // error + cancelled, every max_parallel mode) estimates the fraction that
+  // published adaptively.
+  uint64 parallel_searches = 1;
+  // Evaluations that submitted shares.
+  uint64 published = 2;
+  // Shares those evaluations submitted, excluding the part the caller keeps.
+  uint64 shares = 3;
+  // Evaluations where the planner found no split of the measured remaining
+  // work: no shares that each cover search.fanout-grain-us plus their steal
+  // cost while leaving the caller a large enough share. Load was not read.
+  uint64 no_split = 4;
+  // The planner found a split at the grain and physical cores were idle, but
+  // it found none within the number of shares those idle cores allow.
+  uint64 capped = 5;
+  // The planner found a split at the grain, but only SMT siblings were idle:
+  // either search.fanout-sibling-grain-us is -1, or it found none under the
+  // sibling grain and the number of idle siblings.
+  uint64 siblings_only = 6;
+  // The planner found a split at the grain, but the load signal found no idle
+  // logical CPU.
+  uint64 saturated = 7;
 }
 
 // This process, its data filesystem and its cgroup. Collectors that read their

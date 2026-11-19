@@ -97,6 +97,9 @@ void SearchEngine::submitBody(SearchRequest& req) {
       LOG_TRACE("SearchRequest: waiting for task group to finish for req={}", (void*)&req);
       wait();
       LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
+      if (req.tg->getPolicy() == FanoutPolicy::ADAPTIVE && req.tg->published()) {
+        fanoutParallelSearches.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   } catch (std::exception& e) {
     // Cancel and drain in-flight tasks before tearing down their response.
@@ -112,11 +115,6 @@ void SearchEngine::submitBody(SearchRequest& req) {
       LOG_WARN("Search request rejected ({}): {}", info.code, info.message);
     }
     req.setError(info);
-  }
-
-  if (req.tg && req.tg->getPolicy() == FanoutPolicy::ADAPTIVE) {
-    node.metrics->add(req.tg->published() ? MetricCounter::SEARCH_FANOUT_PARALLEL
-                                          : MetricCounter::SEARCH_FANOUT_SERIAL);
   }
 
   if (root != nullptr) {

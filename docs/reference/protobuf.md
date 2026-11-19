@@ -2269,19 +2269,19 @@ Background checksum scrub of published snapshot files. A mismatch also makes its
 
 ### luxir.SearchFanoutStats
 
-What the adaptive segment fan-out (max\_parallel 0) decided. An evaluation is a fan-out point that had earned a grain of inline time and priced the children still to run; a search can evaluate several times. Each evaluation publishes or is denied once, so published and the denied\_\* fields sum to the evaluations.
+What the adaptive segment fan-out (max\_parallel 0) decided, process-wide. An evaluation is a fan-out point that had earned a grain of inline time and priced the children still to run; a search can evaluate several times, and can publish at one evaluation and be refused at a later one. Each evaluation that returns normally records one outcome, so published and the four refusals sum to those evaluations. Load means this process's recent search and indexing work, not host CPU usage. Searches with max\_parallel 1, -1 or -2 are not counted.
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.searchfanoutstats.serial_searches"></a>[`serial_searches`](#field-luxir.searchfanoutstats.serial_searches) | 1 | `uint64` | singular | Adaptive searches that published no share. Searches run with max\_parallel 1, -1 or -2 are not counted. |
-| <a id="field-luxir.searchfanoutstats.parallel_searches"></a>[`parallel_searches`](#field-luxir.searchfanoutstats.parallel_searches) | 2 | `uint64` | singular | Adaptive searches that published at least one share. |
-| <a id="field-luxir.searchfanoutstats.published"></a>[`published`](#field-luxir.searchfanoutstats.published) | 3 | `uint64` | singular | Evaluations that published shares. |
-| <a id="field-luxir.searchfanoutstats.shares"></a>[`shares`](#field-luxir.searchfanoutstats.shares) | 4 | `uint64` | singular | Shares those evaluations published. |
-| <a id="field-luxir.searchfanoutstats.denied_grain"></a>[`denied_grain`](#field-luxir.searchfanoutstats.denied_grain) | 5 | `uint64` | singular | Evaluations where no share would cover the grain: search.fanout-grain-us, or search.fanout-sibling-grain-us when only SMT siblings were idle. |
-| <a id="field-luxir.searchfanoutstats.denied_siblings_only"></a>[`denied_siblings_only`](#field-luxir.searchfanoutstats.denied_siblings_only) | 6 | `uint64` | singular | Evaluations denied because only SMT siblings were idle and search.fanout-sibling-grain-us is -1. |
-| <a id="field-luxir.searchfanoutstats.denied_saturated"></a>[`denied_saturated`](#field-luxir.searchfanoutstats.denied_saturated) | 7 | `uint64` | singular | Evaluations denied because the machine was saturated. |
+| <a id="field-luxir.searchfanoutstats.parallel_searches"></a>[`parallel_searches`](#field-luxir.searchfanoutstats.parallel_searches) | 1 | `uint64` | singular | Adaptive searches that published at least one share and completed their body without error. Its rate over the rate of all searches (search ok + error + cancelled, every max\_parallel mode) estimates the fraction that published adaptively. |
+| <a id="field-luxir.searchfanoutstats.published"></a>[`published`](#field-luxir.searchfanoutstats.published) | 2 | `uint64` | singular | Evaluations that submitted shares. |
+| <a id="field-luxir.searchfanoutstats.shares"></a>[`shares`](#field-luxir.searchfanoutstats.shares) | 3 | `uint64` | singular | Shares those evaluations submitted, excluding the part the caller keeps. |
+| <a id="field-luxir.searchfanoutstats.no_split"></a>[`no_split`](#field-luxir.searchfanoutstats.no_split) | 4 | `uint64` | singular | Evaluations where the planner found no split of the measured remaining work: no shares that each cover search.fanout-grain-us plus their steal cost while leaving the caller a large enough share. Load was not read. |
+| <a id="field-luxir.searchfanoutstats.capped"></a>[`capped`](#field-luxir.searchfanoutstats.capped) | 5 | `uint64` | singular | The planner found a split at the grain and physical cores were idle, but it found none within the number of shares those idle cores allow. |
+| <a id="field-luxir.searchfanoutstats.siblings_only"></a>[`siblings_only`](#field-luxir.searchfanoutstats.siblings_only) | 6 | `uint64` | singular | The planner found a split at the grain, but only SMT siblings were idle: either search.fanout-sibling-grain-us is -1, or it found none under the sibling grain and the number of idle siblings. |
+| <a id="field-luxir.searchfanoutstats.saturated"></a>[`saturated`](#field-luxir.searchfanoutstats.saturated) | 7 | `uint64` | singular | The planner found a split at the grain, but the load signal found no idle logical CPU. |
 
 <a id="message-luxir.searchop"></a>
 
@@ -2415,7 +2415,7 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.control_busy"></a>[`control_busy`](#field-luxir.servicestats.control_busy) | 61 | `uint64` | singular | tasks running now |
 | <a id="field-luxir.servicestats.control_queued"></a>[`control_queued`](#field-luxir.servicestats.control_queued) | 62 | `uint64` | singular | tasks waiting for a thread |
 | <a id="field-luxir.servicestats.control_completed"></a>[`control_completed`](#field-luxir.servicestats.control_completed) | 63 | `uint64` | singular |  |
-| <a id="field-luxir.servicestats.search_fanout"></a>[`search_fanout`](#field-luxir.servicestats.search_fanout) | 97 | [`SearchFanoutStats`](#message-luxir.searchfanoutstats) | singular |  |
+| <a id="field-luxir.servicestats.search_fanout"></a>[`search_fanout`](#field-luxir.servicestats.search_fanout) | 26 | [`SearchFanoutStats`](#message-luxir.searchfanoutstats) | singular |  |
 
 <a id="message-luxir.shardcachecontrol"></a>
 

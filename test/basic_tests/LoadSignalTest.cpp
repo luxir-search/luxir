@@ -280,10 +280,10 @@ TEST(LoadSignalTest, optionsAreApplied) {
   config.apply();
   EXPECT_FALSE(LoadRegistry::enabled.load());
   auto text = loadSignalDebugText();
-  EXPECT_NE(std::string::npos, text.find("luxir_debug_fanout_evaluations_total "
-      + std::to_string(fanoutEvaluations.load()) + "\n"));
-  EXPECT_NE(std::string::npos, text.find("luxir_debug_fanout_published_shares_total "
-      + std::to_string(fanoutPublishedShares.load()) + "\n"));
+  EXPECT_NE(std::string::npos, text.find("luxir_debug_fanout_share_credit_ns_sum "
+      + std::to_string(fanoutShareCreditNsSum.load()) + "\n"));
+  EXPECT_NE(std::string::npos, text.find("luxir_debug_fanout_share_decisions_total{shares=\"2\"} "
+      + std::to_string(fanoutShareDecisions[0].load()) + "\n"));
 }
 
 

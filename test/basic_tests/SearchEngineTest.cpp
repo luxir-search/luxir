@@ -8435,8 +8435,10 @@ TEST_F(SearchEngineTest, scalarFactsKeepTheExistingKnownCountRankingFormation) {
 }
 
 // max_parallel picks where work runs, never what it returns: adaptive (0,
-// with a 1 ns grain so it publishes), every sibling (-1) and serial on the
-// caller (1) must render the same response as serial inline (-2).
+// with a 1 ns grain so it publishes) and every sibling (-1) must render the
+// same response as serial inline (-2). (1 differs from -2 only in which thread
+// runs the request.) Each row states whether 0 can publish, so a row cannot
+// pass on another row's or another mode's spawns.
 TEST_F(SearchEngineTest, maxParallelNeverChangesResults) {
   CollectionHelper helper("max_parallel");
   helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
@@ -8460,35 +8462,50 @@ TEST_F(SearchEngineTest, maxParallelNeverChangesResults) {
   }
   ASSERT_EQ(5u, helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
 
-  auto render = [&](std::string_view body, int32_t maxParallel) {
+  struct Run { std::string rendered; int64_t spawns; };
+  auto run = [&](std::string_view body, int32_t maxParallel, size_t docs) {
+    TaskSpawnCounter spawns;
     auto req = localReq(helper.getSearchEngine());
     parseQueryRequest(body, req->rawRequest(), req->mr);
     req->collection("max_parallel").execute(maxParallel);
-    EXPECT_TRUE(req->ok()) << body << ": " << req->errorMsg();
-    if (req->responses.size() != 1) return std::string("responses: ") + std::to_string(req->responses.size());
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(1u, req->responses.size());
+    if (!req->ok() || req->responses.size() != 1) return Run{"", spawns.count()};
+    EXPECT_EQ(docs, req->getDocs().size());
     glz::generic_sorted_u64 json;
     EXPECT_FALSE(glz::read_json(json, renderSearchResponseBody(req->responses[0]->proto)));
-    return glz::write_json(json).value();
+    return Run{glz::write_json(json).value(), spawns.count()};
   };
+  struct Case { std::string_view body; bool adaptive; size_t docs; std::vector<std::string_view> shows; };
+  // count_limit 0 keeps score-ranked lists on the shared-bound (PRUNED) path,
+  // independent of the filter cache. Exact counts, field sorts, collapse and
+  // kNN stay serial under 0.
   FanoutLoadGuard load;
   FanoutGrainGuard grain(1);
-  TaskSpawnCounter spawns;
-  for (std::string_view body : std::initializer_list<std::string_view>{
-      R"j({"query":"body_w:alpha","get_scores":true,"count_limit":-1,"fields":["id"],"limit":15})j",
-      R"j({"query":"body_w:alpha body_w:gamma","get_scores":true,"count_limit":-1,"fields":["id"],"limit":15})j",
-      R"j({"query":"body_w:alpha AND body_w:beta","get_scores":true,"count_limit":-1,"fields":["id"],"limit":15})j",
-      R"j({"query":"body_w:\"alpha beta\"","get_scores":true,"count_limit":-1,"fields":["id"],"limit":15})j",
-      R"j({"query":"n_i:[30 TO 350]","sort":"n_i desc","count_limit":-1,"fields":["id","n_i"],"limit":15})j",
-      R"j({"query":"body_w:beta","limit":0,"count_limit":-1,"ops":{
+  for (const Case& c : std::initializer_list<Case>{
+      {R"j({"query":"body_w:alpha","get_scores":true,"count_limit":0,"fields":["id"],"limit":15})j", true, 15, {"_score_"}},
+      {R"j({"query":"body_w:alpha body_w:gamma","get_scores":true,"count_limit":0,"fields":["id"],"limit":15})j", true, 15, {"_score_"}},
+      {R"j({"query":"body_w:alpha AND body_w:beta","get_scores":true,"count_limit":0,"fields":["id"],"limit":15})j", true, 15, {"_score_"}},
+      {R"j({"query":"body_w:\"alpha beta\"","get_scores":true,"count_limit":0,"fields":["id"],"limit":15})j", true, 15, {"_score_"}},
+      {R"j({"query":"body_w:beta","limit":0,"count_limit":-1,"ops":{
           "cats":{"field_facet":{"field":"cat_s","limit":-1}},
           "ranges":{"range_facet":{"field":"n_i","start":0,"end":400,"gap":50}},
-          "total":{"expr_op":"sum(n_i)"}}})j",
-      R"j({"query":"body_w:gamma","collapse":"key_s","sort":"n_i asc","count_limit":-1,"fields":["id"],"limit":8})j",
-      R"j({"query":{"knn":{"field":"v_v","query":[3,4],"k":12}},"get_scores":true,"count_limit":-1,"fields":["id"],"limit":12})j"}) {
-    SCOPED_TRACE(body);
-    auto expected = render(body, -2);
-    EXPECT_NE(std::string::npos, expected.find("\"found\":"));  // Zero is omitted.
-    for (int32_t maxParallel : {0, -1, 1}) EXPECT_EQ(expected, render(body, maxParallel)) << maxParallel;
+          "total":{"expr_op":"sum(n_i)"}}})j", true, 0, {"\"found\":240",
+          "\"cats\":{\"buckets\":[{\"count\":41,\"val\":\"c3\"}",
+          "\"ranges\":{\"buckets\":[{\"count\":30,\"val\":[0,50]}", "\"total\":48040"}},
+      {R"j({"query":"body_w:alpha","get_scores":true,"count_limit":-1,"fields":["id"],"limit":15})j", false, 15, {"\"found\":240"}},
+      {R"j({"query":"n_i:[30 TO 350]","sort":"n_i desc","count_limit":-1,"fields":["id","n_i"],"limit":15})j", false, 15, {"\"found\":321"}},
+      {R"j({"query":"body_w:gamma","collapse":"key_s","sort":"n_i asc","count_limit":-1,"fields":["id"],"limit":8})j", false, 8, {"\"found\":"}},
+      {R"j({"query":{"knn":{"field":"v_v","query":[3,4],"k":12}},"get_scores":true,"count_limit":-1,"fields":["id"],"limit":12})j", false, 12, {"_score_"}}}) {
+    SCOPED_TRACE(c.body);
+    auto serial = run(c.body, -2, c.docs);
+    EXPECT_EQ(0, serial.spawns);
+    for (auto shows : c.shows) EXPECT_NE(std::string::npos, serial.rendered.find(shows)) << shows << " in " << serial.rendered;
+    auto adaptive = run(c.body, 0, c.docs);
+    EXPECT_EQ(c.adaptive, adaptive.spawns > 0) << adaptive.spawns;
+    EXPECT_EQ(serial.rendered, adaptive.rendered);
+    auto every = run(c.body, -1, c.docs);
+    EXPECT_GT(every.spawns, 0);
+    EXPECT_EQ(serial.rendered, every.rendered);
   }
-  EXPECT_GT(spawns.count(), 0);
 }

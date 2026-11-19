@@ -758,7 +758,9 @@ TEST_F(HttpApiTest, loadClassificationsAreOptInAndFanoutMetricsAreAlwaysPresent)
   auto disabled = httpRequest(port(), http::verb::get, "/metrics");
   ASSERT_EQ(200, disabled.result_int());
   EXPECT_EQ(std::string::npos, disabled.body().find("luxir_debug_load_"));
-  for (const char* name : {"luxir_debug_fanout_evaluations_total ", "luxir_debug_fanout_published_shares_total ",
+  for (const char* name : {"luxir_search_fanout_parallel_searches_total ",
+                          "luxir_search_fanout_decisions_total{outcome=\"capped\"} ",
+                          "luxir_search_fanout_shares_total ",
                           "luxir_debug_fanout_share_start_delay_ns_sum ",
                           "luxir_debug_fanout_share_start_delay_count ",
                           "luxir_debug_fanout_share_start_delay_ns_max ",
@@ -766,7 +768,6 @@ TEST_F(HttpApiTest, loadClassificationsAreOptInAndFanoutMetricsAreAlwaysPresent)
                           "luxir_debug_fanout_share_estimated_ns_sum ",
                           "luxir_debug_fanout_share_publisher_runs_total ",
                           "luxir_debug_fanout_share_credit_ns_sum ",
-                          "luxir_debug_fanout_share_credit_count ",
                           "luxir_debug_fanout_share_decisions_total{shares=\"2\"} ",
                           "luxir_debug_fanout_share_decisions_total{shares=\"3\"} ",
                           "luxir_debug_fanout_share_decisions_total{shares=\"4\"} ",
@@ -774,9 +775,7 @@ TEST_F(HttpApiTest, loadClassificationsAreOptInAndFanoutMetricsAreAlwaysPresent)
                           "luxir_debug_fanout_share_kept_estimated_ns_sum ",
                           "luxir_debug_fanout_share_largest_published_estimated_ns_sum ",
                           "luxir_debug_fanout_share_wait_ns_sum ",
-                          "luxir_debug_fanout_share_wait_count ",
-                          "luxir_debug_fanout_load_denials_total{class=\"siblings_only\"}",
-                          "luxir_debug_fanout_load_denials_total{class=\"saturated\"}"}) {
+                          "luxir_debug_fanout_share_wait_count "}) {
     EXPECT_NE(std::string::npos, disabled.body().find(name)) << name;
   }
 
@@ -786,8 +785,7 @@ TEST_F(HttpApiTest, loadClassificationsAreOptInAndFanoutMetricsAreAlwaysPresent)
     ASSERT_EQ(200, metrics.result_int()) << target;
     for (const char* name : {"luxir_debug_load_samples_total{", "luxir_debug_load_hot_threads_sum{",
                             "luxir_debug_load_cpus{", "luxir_debug_load_slots_exhausted_total ",
-                            "luxir_debug_fanout_evaluations_total ", "luxir_debug_fanout_published_shares_total ",
-                            "luxir_debug_fanout_load_denials_total{"}) {
+                            "luxir_debug_fanout_share_decisions_total{", "luxir_search_fanout_decisions_total{"}) {
       EXPECT_NE(std::string::npos, metrics.body().find(name)) << name;
     }
   }

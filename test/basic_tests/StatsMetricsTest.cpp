@@ -217,28 +217,38 @@ TEST_F(StatsMetricsTest, SearchFanoutDecisions) {
   };
   FanoutLoadGuard load;
   auto before = fanout();
-  auto evaluations = fanoutEvaluations.load();
+  FanoutOutcomeDelta outcomes;
   {
     FanoutGrainGuard grain(1);
+    TaskSpawnCounter spawns;
     run(0);
+    ASSERT_GT(outcomes(FanoutOutcome::PUBLISHED), 0u);
+    EXPECT_EQ((uint64_t)spawns.count(), outcomes.shares());
   }
   {
-    FanoutGrainGuard grain(FANOUT_GRAIN_NEVER);
-    run(0);
+    // Serial pin, serial inline and every sibling (which publishes) record nothing.
+    FanoutOutcomeDelta rest;
+    {
+      FanoutGrainGuard grain(FANOUT_GRAIN_NEVER);
+      run(0);
+    }
+    run(-2);
+    run(-1);
+    EXPECT_EQ(0u, rest.evaluations());
+    EXPECT_EQ(0u, rest.shares());
   }
-  run(-2);
-  run(-1);
   auto after = fanout();
   EXPECT_EQ(before.parallel_searches + 1, after.parallel_searches);
-  EXPECT_EQ(before.serial_searches + 1, after.serial_searches);
-  EXPECT_LT(before.published, after.published);
-  EXPECT_LE(after.published - before.published, after.shares - before.shares);
-  // Each evaluation publishes or is denied exactly once.
-  EXPECT_EQ(fanoutEvaluations.load() - evaluations,
-            after.published + after.denied_grain + after.denied_siblings_only + after.denied_saturated
-                - before.published - before.denied_grain - before.denied_siblings_only - before.denied_saturated);
-  EXPECT_EQ((double)after.parallel_searches,
-            sample(render(*luxirNode), "luxir_search_fanout_searches_total{fanout=\"parallel\"}"));
+  EXPECT_EQ(before.shares + outcomes.shares(), after.shares);
+  EXPECT_EQ(before.published + outcomes(FanoutOutcome::PUBLISHED), after.published);
+  EXPECT_EQ(before.no_split + outcomes(FanoutOutcome::NO_SPLIT), after.no_split);
+  EXPECT_EQ(before.capped + outcomes(FanoutOutcome::CAPPED), after.capped);
+  EXPECT_EQ(before.siblings_only + outcomes(FanoutOutcome::SIBLINGS_ONLY), after.siblings_only);
+  EXPECT_EQ(before.saturated + outcomes(FanoutOutcome::SATURATED), after.saturated);
+  auto text = render(*luxirNode);
+  EXPECT_EQ((double)after.parallel_searches, sample(text, "luxir_search_fanout_parallel_searches_total"));
+  EXPECT_EQ((double)after.published, sample(text, "luxir_search_fanout_decisions_total{outcome=\"published\"}"));
+  EXPECT_EQ((double)after.shares, sample(text, "luxir_search_fanout_shares_total"));
 }
 
 TEST_F(StatsMetricsTest, HttpTrafficAndIndexingOutcomes) {

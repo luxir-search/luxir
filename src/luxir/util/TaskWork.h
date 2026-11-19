@@ -19,14 +19,22 @@ inline constexpr uint64_t FANOUT_GRAIN_NEVER = UINT64_MAX;
 // Credit and minimum share in nanoseconds; NEVER disables adaptive publication.
 inline std::atomic<uint64_t> fanoutGrainNs{50'000};
 inline std::atomic<uint64_t> fanoutSiblingGrainNs{1'000'000};
-// Process counters reserved for fan-out measurements.
-inline std::atomic<uint64_t> fanoutEvaluations{0};
-inline std::atomic<uint64_t> fanoutPublishedShares{0};
-inline std::atomic<uint64_t> fanoutLoadDenials[2]{};  // Siblings only, saturated.
-// Evaluations whose shares missed the grain (or the sibling grain). With
-// publishing decisions and load denials they sum to fanoutEvaluations.
-inline std::atomic<uint64_t> fanoutGrainDenials{0};
-inline std::atomic<uint64_t> fanoutAdaptiveShares{0};  // Published by adaptive decisions.
+// What an adaptive evaluation (a fan-out point that earned the grain and
+// priced the remaining children) decided. Each evaluation that returns
+// normally records exactly one outcome; their sum is the evaluation count.
+enum class FanoutOutcome {
+  PUBLISHED,      // At least one share was submitted.
+  NO_SPLIT,       // The base plan is empty; load was not read.
+  // A base split existed and the load budget refused it, by load tier.
+  CAPPED,         // Idle physical cores, but no split within their width cap.
+  SIBLINGS_ONLY,  // Sibling grain disabled, or no split under its grain and cap.
+  SATURATED,      // No idle logical CPU.
+  COUNT
+};
+// Process counters for fan-out measurements. Production counters come first.
+inline std::atomic<uint64_t> fanoutOutcomes[(size_t)FanoutOutcome::COUNT]{};
+inline std::atomic<uint64_t> fanoutPublishedShares{0};  // Submitted by adaptive evaluations.
+inline std::atomic<uint64_t> fanoutParallelSearches{0};  // Adaptive searches that published.
 inline std::atomic<uint64_t> fanoutShareStartDelayNsSum{0};
 inline std::atomic<uint64_t> fanoutShareStartDelayCount{0};
 inline std::atomic<uint64_t> fanoutShareStartDelayNsMax{0};
@@ -34,8 +42,8 @@ inline std::atomic<uint64_t> fanoutShareRunNsSum{0};
 inline std::atomic<uint64_t> fanoutShareEstimatedNsSum{0};
 inline std::atomic<uint64_t> fanoutSharePublisherRuns{0};
 inline std::atomic<uint64_t> fanoutShareCreditNsSum{0};
-inline std::atomic<uint64_t> fanoutShareCreditCount{0};
-inline std::atomic<uint64_t> fanoutShareDecisions[4]{};  // 2, 3, 4, 5+ shares, including the caller.
+// Planned width of each admitted plan: 2, 3, 4, 5+ shares, including the caller.
+inline std::atomic<uint64_t> fanoutShareDecisions[4]{};
 inline std::atomic<uint64_t> fanoutShareKeptEstimatedNsSum{0};
 inline std::atomic<uint64_t> fanoutShareLargestPublishedEstimatedNsSum{0};
 inline std::atomic<uint64_t> fanoutShareWaitNsSum{0};

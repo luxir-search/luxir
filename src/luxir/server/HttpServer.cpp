@@ -1944,13 +1944,12 @@ private:
     sreq->shardPin = makeShardPin();
     sreq->tenant = tenant_;
 
-    // Route by max_parallel: the default (0) deliberately runs the whole
-    // query right here on the shard thread - serial, no scheduler, blocking
-    // this connection's io until it completes.  -1 also runs here, entering
-    // the task arena so its workers parallelize the query.  1 moves the
-    // synchronous engine.submit() onto the task arena so this io thread is
-    // not occupied for the query's duration; reply() then posts results back
-    // here.
+    // Route by max_parallel: the default (0) starts the query here on the
+    // shard thread and publishes segment shares to the task arena only once
+    // it has run inline for a grain.  -1 also starts here and publishes every
+    // sibling; -2 stays serial here.  1 moves the synchronous engine.submit()
+    // onto the task arena so this io thread is not occupied for the query's
+    // duration; reply() then posts results back here.
     engine.dispatch(*sreq, sreq->proto.max_parallel, SearchEngine::Receiver::MAY_EXECUTE);
   }
 
