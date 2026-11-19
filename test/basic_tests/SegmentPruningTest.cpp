@@ -38,7 +38,7 @@ protected:
     LuxirTest::SetUp();
     helper = std::make_unique<CollectionHelper>("prune");
     helper->clear();
-    helper->getIndexWriter()->mergePolicy->setMergeFactor(100);
+    helper->getIndexWriter()->setMergeFactor(100);
     QueryPruning::disableForTests = false;
     Signal::listen("searchTopDocsSegmentPruned", [this](void*, void*, void*) -> void* {
       prunedSegments.fetch_add(1);

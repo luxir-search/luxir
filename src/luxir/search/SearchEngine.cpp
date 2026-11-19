@@ -10,6 +10,7 @@
 #include "luxir/server/CommitWaits.h"
 #include "luxir/store/FetchCountdown.h"
 #include "ProtobufSearchParser.h"
+#include "TermReads.h"
 #include "luxir/search/ops/RootOp.h"
 #include "luxir/reader/SkipStats.h"
 
@@ -20,6 +21,11 @@ const SearchConfig& SearchEngine::searchConfig() const {
 }
 
 RootOp* SearchEngine::prepare(SearchRequest& req) {
+  admit(req);
+  return parse(req);
+}
+
+void SearchEngine::admit(SearchRequest& req) {
   if (!req.timeZone) throw RequestError(req.timeZoneError);
   if (req.maxParallel > 1 || req.maxParallel < -2) {
     throw RequestError(
@@ -28,7 +34,9 @@ RootOp* SearchEngine::prepare(SearchRequest& req) {
   }
   getResources(req);
   req.lastResponse = SearchResponse::create(req, true);
+}
 
+RootOp* SearchEngine::parse(SearchRequest& req) {
   ProtobufSearchParser parser(req);
   return parser.parse();
 }
@@ -90,10 +98,54 @@ void SearchEngine::submitBody(SearchRequest& req, bool mayDefer, FanoutScope* ow
   // fault: parsers and planners reject authored input with bare exceptions.
   // Once execution is under way it is the engine's.  Throw sites that know
   // better say so with an ApiError, which classifies itself in either phase.
+  try {
+    admit(req);
+  } catch (std::exception& e) {
+    failBody(req, e, ErrorKind::INVALID_REQUEST);
+    finishBody(req, nullptr, *execution);
+    return;
+  }
+  if (mayDefer) {
+    // Term membership overlays decide which dictionaries need fetching, so
+    // their ranges come first.
+    ReadSet probes;
+    try {
+      declareTermProbes(req.proto, *req.schema, *req.reader, probes);
+    } catch (const std::exception& e) {
+      LOG_DEBUG("declaring term probes failed: {}", e.what());  // they are read as they are used
+      probes.clear();
+    }
+    auto resume = [this, &req, execution] { fetchTermReads(req, true, req.tg, execution); };
+    if (fetchAhead(req, std::move(probes), ownTg, std::move(resume))) return;
+  }
+  fetchTermReads(req, mayDefer, ownTg, execution);
+}
+
+void SearchEngine::fetchTermReads(SearchRequest& req, bool mayDefer, FanoutScope* ownTg,
+                                  std::shared_ptr<MetricScope> execution) {
+  if (mayDefer) {
+    // Parsing seeks terms in the segments it may match: fetch the term
+    // dictionaries first, so those seeks read resident bytes.
+    ReadSet reads;
+    try {
+      declareTermReads(req.proto, *req.schema, *req.reader, reads);
+    } catch (const std::exception& e) {
+      LOG_DEBUG("declaring term reads failed: {}", e.what());  // parse reads them as it goes
+      reads.clear();
+    }
+    // Resumed under the fan-out scope fetchAhead made, which plan's own round may leave behind.
+    auto resume = [this, &req, execution] { plan(req, true, req.tg, execution); };
+    if (fetchAhead(req, std::move(reads), ownTg, std::move(resume))) return;
+  }
+  plan(req, mayDefer, ownTg, execution);
+}
+
+void SearchEngine::plan(SearchRequest& req, bool mayDefer, FanoutScope* ownTg,
+                        std::shared_ptr<MetricScope> execution) {
   RootOp* root = nullptr;
   SegmentMask segments;
   try {
-    root = prepare(req);
+    root = parse(req);
     root->init();
     // The one batched point: planning is done and every op's root mask is
     // known, so the segments the search needs materialize now, together:

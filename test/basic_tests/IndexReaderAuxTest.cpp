@@ -643,7 +643,7 @@ TEST_F(IndexReaderAuxTest, schemaOnlyReaderSharesPhysicalState) {
 TEST_F(IndexReaderAuxTest, testOverlayConcurrentOpenHammer) {
   CollectionHelper h("main");
   auto iw = h.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(100);
+  iw->setMergeFactor(100);
 
   for (int seg = 0; seg < 2; seg++) {
     h.index(flatdoc("id", "seed" + std::to_string(seg)));
@@ -661,8 +661,7 @@ TEST_F(IndexReaderAuxTest, testOverlayConcurrentOpenHammer) {
     EXPECT_GT(testAux->size(), 0u);
   }
 
-  iw->mergePolicy->setMergeFactor(2);
-  iw->mergePolicy->refresh();
+  iw->setMergeFactor(2);
 
   std::atomic_bool stop{false};
   std::atomic_int failures{0};

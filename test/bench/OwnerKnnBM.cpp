@@ -25,7 +25,7 @@ void BM_OwnerKnn(benchmark::State& state) {
   CollectionHelper helper(name);
   helper.clear();
   helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(FilterCacheConfig{.maxBytes = 0});
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   for (int segment = 0; segment < 2; segment++) {
     SchemaBuilder schema;
     auto& path = schema.field("chunks");

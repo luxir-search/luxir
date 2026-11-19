@@ -83,7 +83,7 @@ TEST_F(NumericMatchTest, modesAgreeAcrossFlushDeleteAndMerge) {
       }
       schema.set(helper.collection());
       auto writer = helper.getIndexWriter();
-      writer->mergePolicy->setMergeFactor(1000);
+      writer->setMergeFactor(1000);
       bool integral = type == FC::INT || type == FC::DATE;
       const char* negative = integral ? "-2" : "-2.5";
       const char* positive = integral ? "1" : "1.5";
@@ -200,7 +200,7 @@ TEST_F(NumericMatchTest, rareLeadUsesPostingsAndCandidateFilterUsesColumn) {
 TEST_F(NumericMatchTest, mixedIndexModesKeepCompleteResultsAfterMerge) {
   CollectionHelper helper;
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(1000);
+  writer->setMergeFactor(1000);
   int value = 0;
   for (auto mode : {IM::NONE, IM::MATCH, IM::MATCH}) {
     SchemaBuilder schema;

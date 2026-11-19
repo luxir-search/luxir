@@ -246,7 +246,7 @@ void verifyCollapsedMerge(Directory& directory, size_t tagBytes = 0) {
   auto schema = compoundSchema();
   CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(directory));
   IndexWriter writer(writerSnapshots, schema);
-  writer.mergePolicy->setMergeFactor(1000);
+  writer.setMergeFactor(1000);
   for (int32_t source = 0; source < 3; source++) {
     addMergeSource(writer, source, tagBytes);
   }
@@ -558,7 +558,7 @@ TEST(CompoundFileTest, DelegatingFlushAndMergeChargeBudget) {
   CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(directory));
 
   IndexWriter writer(writerSnapshots, schema, &budget);
-  writer.mergePolicy->setMergeFactor(1000);
+  writer.setMergeFactor(1000);
   Inverter& first = writer.obtainInverter();
   first.startDoc();
   first.getIndexHandler("body").index(first, std::string_view("first common"));
@@ -595,7 +595,7 @@ TEST(CompoundFileTest, PartitionRowsMaterializeDelegatingFiles) {
   auto schema = compoundSchema();
   CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(directory));
   IndexWriter writer(writerSnapshots, schema);
-  writer.mergePolicy->setMergeFactor(1000);
+  writer.setMergeFactor(1000);
   writer.termPartitionMinBytes = 1;
   writer.termPartitionMinRangeBytes = 1;
   writer.termPartitionMaxRanges = 4;
