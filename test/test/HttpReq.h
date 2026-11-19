@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <string>
 #include <vector>
 #include <optional>
@@ -28,7 +29,8 @@ using tcp = net::ip::tcp;
 // Returns the full (de-chunked) response so NDJSON bodies arrive as one string.
 inline http::response<http::string_body>
 httpRequest(int port, http::verb method, std::string_view target, std::string body = {},
-            std::string_view contentType = "application/json") {
+            std::string_view contentType = "application/json",
+            std::chrono::steady_clock::duration responseTimeout = {}) {
   net::io_context ioc;
   tcp::resolver resolver(ioc);
   beast::tcp_stream stream(ioc);
@@ -45,7 +47,15 @@ httpRequest(int port, http::verb method, std::string_view target, std::string bo
   beast::flat_buffer buffer;
   http::response_parser<http::string_body> parser;
   parser.skip(method == http::verb::head);
-  http::read(stream, buffer, parser);
+  if (responseTimeout == std::chrono::steady_clock::duration::zero()) {
+    http::read(stream, buffer, parser);
+  } else {
+    stream.expires_after(responseTimeout);
+    beast::error_code error;
+    http::async_read(stream, buffer, parser, [&](beast::error_code ec, std::size_t) { error = ec; });
+    ioc.run();
+    if (error) throw boost::system::system_error(error);
+  }
   auto res = parser.release();
 
   beast::error_code ec;

@@ -63,6 +63,14 @@ every core busy even when work is skewed.
   Independent updates are automatically parallelized. A single HTTP NDJSON
   connection submits multiple internal batches for concurrent indexing, with
   a bounded number in flight and backpressure when that limit is reached.
+- **Blocking control work runs on dedicated threads.** Administration, schema
+  changes, replication transfer setup and expiry, and detailed stats run on a
+  node-owned pool (`--server.control-threads`, default 2). Fsync, catalog
+  writes, and writer drains can occupy those threads while search workers
+  remain available. Writer drains enter the index arena through reserved
+  seats. Bare node stats run on the connection or completion-queue thread.
+  The default `/metrics` includes collection and system stats and uses the
+  control pool.
 - **Merging** parallelizes inside a single merge, not just across merges:
   every field merges as its own task, because the segment format does not
   tie index structures to specific files - concurrent tasks write their own
@@ -99,7 +107,7 @@ response paths keep connection handling separate from long-running engine work.
   still on the wire. The connection thread only splits records, recognizes
   control records, and cuts batches; JSON decoding of documents happens on
   the indexing workers, so one connection can keep several cores busy.
-  Buffered JSON update bodies are likewise decoded on the task arena.
+  Buffered JSON update bodies are likewise decoded on the indexing workers.
   Responses stream back the same way, a chunk at a time.
   For HTTP/JSON clients, there is no maximum stream size and no required
   user-visible bulk-request boundary.
