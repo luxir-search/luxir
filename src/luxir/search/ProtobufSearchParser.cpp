@@ -2347,8 +2347,12 @@ public:
         }
         bool fieldSortFullyRouted = false;
         if (!boundedCount && !everySegmentConstant && cache != nullptr && cache->enabled()) {
+          bool observedFieldSort = wholeFieldSort && !preparedWhole
+              && !wholeMembershipWeight->consumesDomain()
+              && !QueryPrep::disableObservedFieldSortForTests
+              && planningContext->filterScope(*query) <= FilterKeyScope::CORE_STABLE;
           bool acquireUse = true;
-          if (wholeFieldSort && !preparedWhole) {
+          if (wholeFieldSort && !preparedWhole && !observedFieldSort) {
             wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
                 view()->segments().size());
             if (fieldSortBuildVetoed) {

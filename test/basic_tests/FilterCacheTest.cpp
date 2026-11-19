@@ -2245,10 +2245,12 @@ TEST(FilterCacheTest, metadataOnlySweepKeepsFittingPayloads) {
 namespace {
 FilterCache::Probe::Kind observedRequest(FilterCache& cache,
     std::span<const FilterCache::SegmentIdentity> segments, const FilterKey& key,
-    uint64_t nanos, std::optional<uint64_t> buildNanos = std::nullopt, bool completed = true) {
+    uint64_t nanos, std::optional<uint64_t> buildNanos = std::nullopt, bool completed = true,
+    FilterCache::Work work = FilterCache::Work::pending()) {
   FilterCache::UseRegistry request(cache, 1, segments);
-  auto* use = request.get(key);
-  auto probe = use->probe(0, FilterCache::Work::pending());
+  auto* use = request.get(key, FilterKeyScope::SEGMENT_STABLE,
+      work.isWholeConsumer() ? FilterCache::AdmissionLane::WHOLE : FilterCache::AdmissionLane::CLAUSE);
+  auto probe = use->probe(0, work);
   auto kind = probe.kind();
   if (buildNanos) {
     EXPECT_EQ(FilterCache::Probe::Kind::BUILD, kind);
@@ -2678,6 +2680,118 @@ TEST(FilterCacheTest, capacityBoundsIrregularUniformProduction) {
     EXPECT_LE(counts.buildNanos, small ? 5000 * production : 3 * production);
     cache.validateForTest();
   }
+}
+
+TEST(FilterCacheTest, wholeObservationsUseOwnPriceAndDoNotTrainClausePrior) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterKey seed("clause-prior"), wholeKey("whole-price"), after("clause-after-whole");
+  observedRequest(cache, segments, seed, 1);
+  observedRequest(cache, segments, seed, 1, 1'000'000);
+  auto whole = FilterCache::Work::pending().forWholeQuery();
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+      observedRequest(cache, segments, wholeKey, 400, {}, true, whole));
+  auto price = ledgerFor(cache, wholeKey);
+  EXPECT_EQ("absent", price.productionSource);
+  EXPECT_DOUBLE_EQ(400, price.productionNanos);
+  EXPECT_DOUBLE_EQ(400, price.owed);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+      observedRequest(cache, segments, wholeKey, 1, 100, true, whole));
+  EXPECT_EQ(1u, ledgerFor(cache, wholeKey).absentCount);
+  observedRequest(cache, segments, after, 1);
+  EXPECT_EQ("prior", ledgerFor(cache, after).productionSource);
+  EXPECT_DOUBLE_EQ(1'000'000, ledgerFor(cache, after).productionNanos);
+  auto scoped = FilterCache::Work::pending().forWholeQuery(false);
+  FilterKey scopedKey("scoped-whole");
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+      observedRequest(cache, segments, scopedKey, 400, {}, true, scoped));
+  EXPECT_EQ("prior", ledgerFor(cache, scopedKey).productionSource);
+  EXPECT_DOUBLE_EQ(1'000'000, ledgerFor(cache, scopedKey).productionNanos);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, observedRequest(cache, segments, scopedKey,
+      1, 100, true, FilterCache::Work::nanoseconds(1'000'000).forWholeQuery(false)));
+  FilterKey afterScoped("clause-after-scoped-whole");
+  observedRequest(cache, segments, afterScoped, 1);
+  EXPECT_DOUBLE_EQ(1'000'000, ledgerFor(cache, afterScoped).productionNanos);
+}
+
+TEST(FilterCacheTest, wholePriceBelongsToTheUseAndMixedPaymentsUseClausePricing) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterKey seed("basis-prior"), key("shared-basis");
+  observedRequest(cache, segments, seed, 1);
+  observedRequest(cache, segments, seed, 1, 1'000'000);
+  auto whole = FilterCache::Work::pending().forWholeQuery();
+  observedRequest(cache, segments, key, 100, {}, true, whole);
+  EXPECT_EQ("absent", ledgerFor(cache, key).productionSource);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, observedRequest(cache, segments, key, 100));
+  EXPECT_EQ("prior", ledgerFor(cache, key).productionSource);
+  EXPECT_DOUBLE_EQ(1'000'000, ledgerFor(cache, key).productionNanos);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+      observedRequest(cache, segments, key, 1, 100, true, whole));
+  for (bool wholeFirst : {false, true}) {
+    FilterKey mixed(wholeFirst ? "whole-first" : "clause-first");
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(mixed, FilterKeyScope::SEGMENT_STABLE, FilterCache::AdmissionLane::WHOLE);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+        use->probe(0, wholeFirst ? whole : FilterCache::Work::pending()).kind());
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+        use->probe(0, wholeFirst ? FilterCache::Work::pending() : whole).kind());
+    request.addSegmentNanos(0, 100);
+    request.settle(true);
+    EXPECT_EQ(1u, ledgerFor(cache, mixed).absentCount);
+    EXPECT_DOUBLE_EQ(100, ledgerFor(cache, mixed).owed);
+    EXPECT_EQ("prior", ledgerFor(cache, mixed).productionSource);
+  }
+}
+
+TEST(FilterCacheTest, wholeExperimentUsesMeasuredPriceAfterEviction) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterKey key("underpriced-whole");
+  auto whole = FilterCache::Work::pending().forWholeQuery();
+  observedRequest(cache, segments, key, 100, {}, true, whole);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+      observedRequest(cache, segments, key, 1, 10'000, true, whole));
+  evictValues(cache);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+      observedRequest(cache, segments, key, 100, {}, true, whole));
+  auto price = ledgerFor(cache, key);
+  EXPECT_EQ("measured", price.productionSource);
+  EXPECT_DOUBLE_EQ(10'000, price.productionNanos);
+  EXPECT_DOUBLE_EQ(10'000, price.debt);
+  EXPECT_DOUBLE_EQ(100, price.owed);
+}
+
+TEST(FilterCacheTest, completeWholeAcceptanceDefersCreditToSegmentTime) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+  FilterKey key("whole-preflight");
+  auto whole = FilterCache::Work::pending().forWholeQuery();
+  observedRequest(cache, segments, key, 1000, {}, true, whole);
+  observedRequest(cache, segments, key, 1, 500, true, whole);
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto candidate = request.lookupExisting(key);
+  ASSERT_TRUE(candidate);
+  ASSERT_NE(nullptr, request.acceptExisting(std::move(*candidate), FilterCache::AdmissionLane::WHOLE, whole));
+  EXPECT_DOUBLE_EQ(500, ledgerFor(cache, key).debt);
+  request.addSegmentNanos(0, 100);
+  request.settle(true);
+  request.settle(true);
+  EXPECT_EQ(1u, ledgerFor(cache, key).servedCount);
+  EXPECT_DOUBLE_EQ(0, ledgerFor(cache, key).debt);
+  EXPECT_EQ(900u, cache.counters().estimatedSavedNanos);
 }
 
 TEST(FilterCacheTest, firstObservedProductionWaitsForAnOrdinarySample) {
@@ -5019,6 +5133,11 @@ TEST(FilterCacheTest,
       *retryWeight, retryUse, retryContext.filterUses,
       PreparedDomainDependence::QUERY_CANONICAL, QueryPrep::WholeMembershipConsumer::FIELD_SORT);
   auto retry = test::resolveWholeMembershipForTests(retryPlan, *reader, segment, nullptr);
+  EXPECT_FALSE(retry.available);
+  auto claim = retryUse->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, claim.kind());
+  retryUse->publishRaw(0, claim, QueryPrep::materializeRawFilter(*retryWeight, nullptr, segment), 1000);
+  retry = test::resolveWholeMembershipForTests(retryPlan, *reader, segment, nullptr);
   ASSERT_TRUE(retry.available);
   EXPECT_EQ(1, retry.count);
 }

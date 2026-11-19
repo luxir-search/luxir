@@ -4280,6 +4280,8 @@ TEST_F(SortCollectorTest, predictedBottomFollowsHeapAcrossSegments) {
 // the newest segment first for that sort and the oldest first ascending.
 // Every request matches exhaustive collection.
 TEST_F(SortCollectorTest, indexWidePlanBuildsAcrossSmallSegments) {
+  SearchOverridesGuard observation(QueryPrep::disableObservedFieldSortForTests);
+  QueryPrep::disableObservedFieldSortForTests = true;
   WholeMembershipPlanGuard wholeGuard(false);
   CollectionHelper helper("index_wide_plan");
   helper.getIndexWriter()->snapshots.readers.filterCache =

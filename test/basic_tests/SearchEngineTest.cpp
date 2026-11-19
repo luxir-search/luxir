@@ -2645,6 +2645,8 @@ TEST_F(SearchEngineTest,
 }
 
 TEST_F(SearchEngineTest, wholeTopKCountHandlesEmptyAndNonemptySegments) {
+  SearchOverridesGuard countFirst(QueryPrep::disableTrackedCountFirstForTests);
+  QueryPrep::disableTrackedCountFirstForTests = true;
   constexpr std::string_view collection = "whole_topk_count_segments";
   CollectionHelper helper(collection);
   helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
@@ -2684,6 +2686,8 @@ TEST_F(SearchEngineTest, wholeTopKCountHandlesEmptyAndNonemptySegments) {
 }
 
 TEST_F(SearchEngineTest, priorCardinalityKeepsCountsAndScoreBitsAtEveryRankingDepth) {
+  SearchOverridesGuard countFirst(QueryPrep::disableTrackedCountFirstForTests);
+  QueryPrep::disableTrackedCountFirstForTests = true;
   constexpr std::string_view collection = "whole_cardinality";
   CollectionHelper helper(collection);
   auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
@@ -2839,8 +2843,75 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
   EXPECT_EQ(thrashSkips, cache->counters().populationDeferred);
 }
 
+TEST_F(SearchEngineTest, wholeFieldSortFundsItsOwnMembershipFromSegmentTime) {
+  for (bool deleted : {false, true}) for (std::string_view sort : {"sort_i", "sort_s"}) for (bool verify : {false, true}) {
+    SCOPED_TRACE(::testing::Message() << deleted << '/' << sort);
+    std::string collection = deleted ? "observed_sort_deleted" : "observed_sort";
+    collection += sort;
+    collection += verify ? "_phrase" : "_terms";
+    CollectionHelper helper(collection);
+    auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
+        .minSegmentDocs = 0, .admissionThreshold = 2});
+    helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+    std::vector<Doc> docs;
+    for (int i = 0; i < 256; i++) {
+      docs.push_back(flatdoc("id", std::to_string(i), "body_w",
+          i % 2 ? "other" : "observea observeb", "sort_s", std::to_string(255 - i), "sort_i", (int64_t)(255 - i)));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    if (deleted) {
+      ASSERT_TRUE(helper.deleteByIds({"0"}, UpdateMessage::COMMIT).success);
+    }
+    auto run = [&] {
+      return runWholeFieldSort(helper.getSearchEngine(), collection,
+          "observe", sort, qb::ASC, 7, true, false, false, false, verify);
+    };
+    WholeFieldSortRun off;
+    {
+      WholeMembershipPlanGuard disable(true);
+      off = run();
+    }
+    auto first = run();
+    expectSameWholeFieldSort(off, first);
+    EXPECT_EQ(1, first.bypasses);
+    EXPECT_EQ(0u, cache->entryCountForTest());
+    auto beforeAbsent = cache->counters();
+    auto absent = run();
+    expectSameWholeFieldSort(off, absent);
+    EXPECT_EQ(1, absent.bypasses);
+    EXPECT_EQ(0, absent.builds + absent.routingBypasses);
+    EXPECT_EQ(beforeAbsent.observedCharges + 1, cache->counters().observedCharges);
+    EXPECT_EQ(beforeAbsent.assumedCharges, cache->counters().assumedCharges);
+    auto ghosts = cache->dump(100, nullptr, true);
+    ASSERT_EQ(1u, ghosts.size());
+    ASSERT_EQ(1u, ghosts[0].values.size());
+    EXPECT_EQ(1u, ghosts[0].values[0].absentCount);
+    EXPECT_EQ("absent", ghosts[0].values[0].productionSource);
+    auto build = run();
+    expectSameWholeFieldSort(off, build);
+    EXPECT_EQ(1, build.builds);
+    auto before = cache->counters();
+    auto hit = run();
+    expectSameWholeFieldSort(off, hit);
+    EXPECT_EQ(1, hit.hits);
+    EXPECT_EQ(1, hit.weightSkips);
+    EXPECT_EQ(1, hit.contextsOmitted);
+    EXPECT_EQ(0, hit.contextsCreated);
+    auto after = cache->counters();
+    EXPECT_EQ(before.assumedCredits, after.assumedCredits);
+    EXPECT_EQ(before.observedCredits + 1, after.observedCredits);
+    auto entries = cache->dump(100, nullptr, true);
+    ASSERT_EQ(1u, entries.size());
+    EXPECT_EQ(1u, entries[0].values[0].absentCount);
+    EXPECT_EQ(1u, entries[0].values[0].servedCount);
+    EXPECT_EQ(128, entries[0].values[0].rawCardinality);
+  }
+}
+
 TEST_F(SearchEngineTest,
        wholeFieldSortMembershipMatrixMatchesCacheOff) {
+  SearchOverridesGuard observation(QueryPrep::disableObservedFieldSortForTests);
+  QueryPrep::disableObservedFieldSortForTests = true;
   constexpr std::string_view enabledCollection = "whole_field_sort_matrix";
   constexpr std::string_view disabledCollection =
       "whole_field_sort_matrix_off";
@@ -2942,6 +3013,8 @@ TEST_F(SearchEngineTest,
 }
 
 TEST_F(SearchEngineTest, wholeFieldSortDroppedOptionalSingletonServesResident) {
+  SearchOverridesGuard observation(QueryPrep::disableObservedFieldSortForTests);
+  QueryPrep::disableObservedFieldSortForTests = true;
   constexpr std::string_view enabledCollection = "whole_field_sort_mandopt";
   constexpr std::string_view disabledCollection =
       "whole_field_sort_mandopt_off";
@@ -3044,6 +3117,8 @@ TEST_F(SearchEngineTest, wholeFieldSortDroppedOptionalSingletonServesResident) {
 }
 
 TEST_F(SearchEngineTest, wholeFieldSortRoutesBeforeCacheTrafficByShape) {
+  SearchOverridesGuard observation(QueryPrep::disableObservedFieldSortForTests);
+  QueryPrep::disableObservedFieldSortForTests = true;
   constexpr std::string_view enabledCollection = "whole_field_sort_gate";
   constexpr std::string_view disabledCollection =
       "whole_field_sort_gate_off";
@@ -3139,6 +3214,8 @@ TEST_F(SearchEngineTest, wholeFieldSortRoutesBeforeCacheTrafficByShape) {
 // exact-domain driver, the string sort through the ladder over it. Without
 // the resident value they keep the query route and leave the cache untouched.
 TEST_F(SearchEngineTest, wholeFieldSortServesResidentMembershipItNeverBuilds) {
+  SearchOverridesGuard observation(QueryPrep::disableObservedFieldSortForTests);
+  QueryPrep::disableObservedFieldSortForTests = true;
   constexpr std::string_view enabledCollection = "whole_field_sort_resident";
   constexpr std::string_view disabledCollection =
       "whole_field_sort_resident_off";
@@ -3216,6 +3293,8 @@ TEST_F(SearchEngineTest, wholeFieldSortServesResidentMembershipItNeverBuilds) {
 
 TEST_F(SearchEngineTest,
        wholeFieldSortMultiTermConjunctionKeepsWeightRouter) {
+  SearchOverridesGuard observation(QueryPrep::disableObservedFieldSortForTests);
+  QueryPrep::disableObservedFieldSortForTests = true;
   constexpr std::string_view enabledCollection =
       "whole_field_sort_multiterm";
   constexpr std::string_view disabledCollection =
@@ -3264,6 +3343,8 @@ TEST_F(SearchEngineTest,
 }
 
 TEST_F(SearchEngineTest, wholeFieldSortPartialResidencyKeepsOrdinaryPath) {
+  SearchOverridesGuard observation(QueryPrep::disableObservedFieldSortForTests);
+  QueryPrep::disableObservedFieldSortForTests = true;
   constexpr std::string_view enabledCollection =
       "whole_field_sort_partial";
   constexpr std::string_view disabledCollection =
@@ -3312,6 +3393,8 @@ TEST_F(SearchEngineTest, wholeFieldSortPartialResidencyKeepsOrdinaryPath) {
 }
 
 TEST_F(SearchEngineTest, wholeFieldSortContinuationGatesAndScoreExclusions) {
+  SearchOverridesGuard observation(QueryPrep::disableObservedFieldSortForTests);
+  QueryPrep::disableObservedFieldSortForTests = true;
   constexpr std::string_view enabledCollection = "whole_field_sort_routes";
   constexpr std::string_view disabledCollection =
       "whole_field_sort_routes_off";
@@ -3504,6 +3587,8 @@ TEST_F(SearchEngineTest, wholeFieldSortConstantFactFallsBackWithoutCacheUse) {
 }
 
 TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
+  SearchOverridesGuard observation(QueryPrep::disableObservedFieldSortForTests);
+  QueryPrep::disableObservedFieldSortForTests = true;
   constexpr std::string_view collection = "whole_field_sort_backoff";
   CollectionHelper helper(collection);
   auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
@@ -3560,6 +3645,8 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
 }
 
 TEST_F(SearchEngineTest, wholeFieldSortHitComposesFusionDomainOnce) {
+  SearchOverridesGuard observation(QueryPrep::disableObservedFieldSortForTests);
+  QueryPrep::disableObservedFieldSortForTests = true;
   constexpr std::string_view collection = "whole_field_sort_fusion";
   CollectionHelper helper(collection);
   helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
@@ -5558,6 +5645,8 @@ TEST_F(SearchEngineTest, sparseFilteredTopKRerouteAdmitsConjunctionShapes) {
 
 TEST_F(SearchEngineTest,
        wholeTopKCountHitPreservesFoldedSparseRankingDisposition) {
+  SearchOverridesGuard countFirst(QueryPrep::disableTrackedCountFirstForTests);
+  QueryPrep::disableTrackedCountFirstForTests = true;
   constexpr std::string_view collection =
       "whole_topk_count_sparse_reroute";
   CollectionHelper helper(collection);
@@ -5600,6 +5689,8 @@ TEST_F(SearchEngineTest,
 
 TEST_F(SearchEngineTest,
        wholeTopKCountHitUsesCountFreeMaxScoreRankingAccounting) {
+  SearchOverridesGuard countFirst(QueryPrep::disableTrackedCountFirstForTests);
+  QueryPrep::disableTrackedCountFirstForTests = true;
   constexpr std::string_view collection = "whole_topk_count_max_score";
   CollectionHelper helper(collection);
   helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
@@ -7806,8 +7897,8 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
   // the domain, so its plan must use offset + limit even though limit stays
   // 1.
   BestFirstGuard bestFirst(false, false);
-  for (int round = 0; round < 3; round++) {
-    int32_t offset = round == 2 ? 49 : 0;
+  for (int round = 0; round < 4; round++) {
+    int32_t offset = round == 3 ? 49 : 0;
     auto req = localReq(helper.getSearchEngine());
     auto& q = req->collection("main").topDocs("q").fields({"id"})
         .limit(1).offset(offset).countLimit();
@@ -7820,13 +7911,13 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
     EXPECT_EQ(2048, req->docList()->found.value_or(-1));
     EXPECT_EQ((std::vector<std::string>{members[(size_t)offset].second}),
               resultIds(*req, "q"));
-    if (round > 0) {
+    if (round > 1) {
       EXPECT_EQ(1, SkipStats::cacheFirstFieldSortWeightSkips);
       EXPECT_EQ(1, SkipStats::wholeFieldSortHits);
       EXPECT_EQ(1, SkipStats::wholeFieldSortBestFirstActivations);
       EXPECT_EQ(0, SkipStats::wholeFieldSortLadderFallbacks);
-      EXPECT_EQ(round == 1 ? 1 : 0, SkipStats::fieldSortBestFirstActivations);
-      EXPECT_EQ(round == 1 ? 0 : 1, SkipStats::fieldSortDocOrderSweeps
+      EXPECT_EQ(round == 2 ? 1 : 0, SkipStats::fieldSortBestFirstActivations);
+      EXPECT_EQ(round == 2 ? 0 : 1, SkipStats::fieldSortDocOrderSweeps
                                         + SkipStats::fieldSortDomainScans);
     }
   }
@@ -7975,6 +8066,8 @@ TEST_F(SearchEngineTest, forcedCountCompositionKeepsCanonicalScores) {
 }
 
 TEST_F(SearchEngineTest, forcedCompositionYieldsToWholeMembershipOutcomes) {
+  SearchOverridesGuard countFirst(QueryPrep::disableTrackedCountFirstForTests);
+  QueryPrep::disableTrackedCountFirstForTests = true;
   CollectionHelper helper("forced_whole_precedence");
   auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
       .maxBytes = 1024 * 1024, .maxEntryBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2, .maxMetadataBytes = 64 * 1024});
@@ -8130,6 +8223,8 @@ TEST_F(SearchEngineTest, provedDensitySelectsSegmentsBeforeConstructingCompanion
 }
 
 TEST_F(SearchEngineTest, countBuildServesFieldSortAndEvictionKeepsTheCount) {
+  SearchOverridesGuard countFirst(QueryPrep::disableTrackedCountFirstForTests);
+  QueryPrep::disableTrackedCountFirstForTests = true;
   for (bool topKFirst : {false, true}) {
     SCOPED_TRACE(topKFirst);
     std::string collection = topKFirst ? "topk_count_sort_fact" : "count_sort_fact";
@@ -8201,8 +8296,8 @@ TEST_F(SearchEngineTest, trackedCountFirstLearnsWithoutMembership) {
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   SearchOverridesGuard switches(QueryPrep::disableCanonicalCountFactsForTests,
-      QueryPrep::trackedCountFirstForTests);
-  QueryPrep::trackedCountFirstForTests = true;
+      QueryPrep::disableTrackedCountFirstForTests);
+  QueryPrep::disableTrackedCountFirstForTests = false;
   auto run = [&](int limit, bool facts, int recorded, int read, int counted = 0) {
     QueryPrep::disableCanonicalCountFactsForTests = !facts;
     auto req = localReq(helper.getSearchEngine());
@@ -8270,8 +8365,10 @@ TEST_F(SearchEngineTest, composedCountsRecordFactsPerCanonicalSegment) {
     ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   }
   ASSERT_TRUE(helper.deleteById("2_0", UpdateMessage::COMMIT).success);
-  SearchOverridesGuard forced(TopDocsReq::forceExactCountTopKCompositionForTests);
+  SearchOverridesGuard forced(TopDocsReq::forceExactCountTopKCompositionForTests,
+      QueryPrep::disableTrackedCountFirstForTests);
   TopDocsReq::forceExactCountTopKCompositionForTests = true;
+  QueryPrep::disableTrackedCountFirstForTests = true;
   auto run = [&](int records, int reads, int compositions) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("composed_scalar_facts");

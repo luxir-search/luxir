@@ -22,7 +22,8 @@ inline bool disableDirectPostingsMaterializationForTests = false;
 inline bool disableWholeMembershipPlanForTests = false;
 inline bool disableWholeMembershipBypassReuseForTests = false;
 inline bool disableCanonicalCountFactsForTests = false;
-inline bool trackedCountFirstForTests = false;
+inline bool disableTrackedCountFirstForTests = false;
+inline bool disableObservedFieldSortForTests = false;
 inline bool disableProhibitedCacheForTests = false;
 inline bool disableProhibitedDomainFoldForTests = false;
 // A/B toggle: restore request-local sparse batch materialization on cache
@@ -956,6 +957,12 @@ class WholeMembershipPlan {
   WholeMembershipConsumer consumer = WholeMembershipConsumer::COUNT;
   std::span<const uint8_t> fieldSortCacheRoutes;
 
+  bool observesFieldSort() const {
+    return isFieldSort() && cacheUse != nullptr && weight != nullptr
+        && !disableObservedFieldSortForTests && !weight->needsPrepare()
+        && !weight->consumesDomain() && cacheUse->scope() <= FilterKeyScope::CORE_STABLE;
+  }
+
   struct AcceptedExistingTag {};
 
   WholeMembershipPlan(
@@ -998,7 +1005,9 @@ public:
       std::span<const uint8_t> fieldSortCacheRoutes = {})
     : source(Source::WEIGHT), weight(&weight), cacheUse(cacheUse),
       lifetime(std::move(lifetime)), domainDependence(domainDependence),
-      consumer(consumer), fieldSortCacheRoutes(fieldSortCacheRoutes) {}
+      consumer(consumer), fieldSortCacheRoutes(fieldSortCacheRoutes) {
+    if (observesFieldSort()) cacheUse->observe();
+  }
 
   static WholeMembershipPlan acceptedExisting(
       FilterCache::Use& cacheUse,
@@ -1153,10 +1162,12 @@ public:
         && (consumer == WholeMembershipConsumer::COUNT
             || consumer == WholeMembershipConsumer::TOP_K_COUNT);
     auto cardinality = scalar ? cacheUse->cardinality((size_t)segment.ord) : std::nullopt;
-    // Known counts need no membership; count-first learning is opt-in.
-    bool inert = scalar && (cardinality || (trackedCountFirstForTests
+    // Known counts and count-first learning need no membership.
+    bool inert = scalar && (cardinality || (!disableTrackedCountFirstForTests
         && consumer == WholeMembershipConsumer::TOP_K_COUNT));
-    auto probe = inert ? FilterCache::Probe{} : cacheUse->probe((size_t)segment.ord);
+    auto probe = inert ? FilterCache::Probe{} : cacheUse->probe((size_t)segment.ord,
+        observesFieldSort() ? cacheUse->work((size_t)segment.ord).observedOnly().forWholeQuery(canonical)
+                            : FilterCache::Work::assumed());
     if (probe.kind() == FilterCache::Probe::Kind::HIT) {
       DomainHandle docs = cacheUse->effectiveDomain(
           (size_t) segment.ord, reader, incomingDomain).pinnedWith(lifetime);

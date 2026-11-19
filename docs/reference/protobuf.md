@@ -526,7 +526,7 @@ A segment slot or whole-reader entry, including optional payload-free ledgers.
 | <a id="field-luxir.cachevaluedump.credited_us"></a>[`credited_us`](#field-luxir.cachevaluedump.credited_us) | 8 | `double` | singular | Credit total for a resident payload; zero when no payload is present. |
 | <a id="field-luxir.cachevaluedump.production_us"></a>[`production_us`](#field-luxir.cachevaluedump.production_us) | 9 | `double` | singular |  |
 | <a id="field-luxir.cachevaluedump.reference_bytes"></a>[`reference_bytes`](#field-luxir.cachevaluedump.reference_bytes) | 10 | `uint64` | singular |  |
-| <a id="field-luxir.cachevaluedump.production_source"></a>[`production_source`](#field-luxir.cachevaluedump.production_source) | 11 | `string` | singular | measured \| prior \| unknown |
+| <a id="field-luxir.cachevaluedump.production_source"></a>[`production_source`](#field-luxir.cachevaluedump.production_source) | 11 | `string` | singular | measured \| absent \| prior \| unknown |
 | <a id="field-luxir.cachevaluedump.absent_mean_us"></a>[`absent_mean_us`](#field-luxir.cachevaluedump.absent_mean_us) | 12 | `double` | singular |  |
 | <a id="field-luxir.cachevaluedump.absent_count"></a>[`absent_count`](#field-luxir.cachevaluedump.absent_count) | 13 | `uint64` | singular |  |
 | <a id="field-luxir.cachevaluedump.served_mean_us"></a>[`served_mean_us`](#field-luxir.cachevaluedump.served_mean_us) | 14 | `double` | singular |  |

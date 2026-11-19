@@ -436,6 +436,8 @@ TEST_F(FusionOpTest, adaptivePlacesSparseFieldInDocs) {
 }
 
 TEST_F(FusionOpTest, topKCountWholeHitComposesSharedDomainOnce) {
+  SearchOverridesGuard countFirst(QueryPrep::disableTrackedCountFirstForTests);
+  QueryPrep::disableTrackedCountFirstForTests = true;
   CollectionHelper h("main");
   h.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});

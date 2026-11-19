@@ -880,13 +880,18 @@ Search has its own limits:
   unpriced serve is credited the production time of the value it used.
   Boolean filter-list joins instead settle from TopDocs segment execution time;
   their first purchase requires an ordinary observation. Before a measured
-  production, they use the cache's decayed priced-build time per document as
-  a prior when available. Untimed and ambiguous uses remain assumed.
+  production, clause uses estimate from decayed clause-build time per document
+  when available. Untimed and ambiguous settlements remain assumed.
   Absent and served times are decayed segment-time means (gain 1/8); their
   difference estimates savings over the request mix, not any one request.
   Row views share the request's segment observations. A segment containing a
   claimed cache production teaches no observed times or payments; known
   payments are unchanged, and byproducts do not exclude observations.
+  Ordinary segment/core-stable whole-query field-sort uses pay by observation.
+  Before their first production, canonical whole-query demand uses its own absent
+  mean as the price; a selective parent domain keeps the prior estimate. Whole-query
+  productions do not train the clause prior. Measured prices replace both estimates.
+  Prepared and reader-stable field-sort sources retain their existing routing.
   Join children and restricted exact-domain sources require timed observations
   to fund population. Outside a timed scope they serve resident values with
   assumed credit and otherwise execute without charging or claiming a build.
@@ -908,7 +913,7 @@ Search has its own limits:
   `luxir_filter_cache_*_seconds_total` names; outstanding debt uses
   `luxir_filter_cache_outstanding_debt_seconds`.
   Cache-control dumps report `owed_us`, `debt_us`, `credited_us`,
-  `production_us`, its `production_source` (measured, prior or unknown),
+  `production_us`, its `production_source` (measured, absent, prior or unknown),
   `absent_mean_us`/`absent_count`, `served_mean_us`/`served_count`, and reference
   bytes, plus `recent_us` and its `recent_epochs` interval. The shard reports
   `recent_work_epochs`, `last_refresh_epoch` and `current_epoch`. Values also
@@ -919,7 +924,7 @@ Search has its own limits:
   including after eviction. On segments without deletes, COUNT and exact-count
   TOP_K consumers that need only the count read it before population, avoiding
   count execution and materialization. Unknown counts keep their normal
-  population decision.
+  population decision, while exact-count top-k counts first on tracked unknown keys.
   Complete resident membership can still serve counts and omit their weights.
   Constant first-K membership and consumers that read the set retain their demand.
   A flush drops values and metadata, including ledgers, while keeping sightings,

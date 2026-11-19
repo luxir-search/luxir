@@ -1353,6 +1353,8 @@ public:
           ? filterUses->get(*identity.key, identity.scope, lane) : nullptr;
     }
 
+    FilterKeyScope filterScope(const Query& query) { return filterIdentity(query).scope; }
+
     FilterKey structuralFilterKey(const Query& query) const {
       FilterKeyBuilder builder;
       FilterKeyScope scope = query.appendFilterKey(builder, filterKeyContext);
@@ -1387,9 +1389,10 @@ public:
 
     FilterCache::Use* acceptExistingFilterUse(
         FilterCache::ExistingCandidate&& candidate,
-        FilterCache::AdmissionLane lane) {
+        FilterCache::AdmissionLane lane,
+        FilterCache::Work work = FilterCache::Work::assumed()) {
       return filterUses == nullptr ? nullptr
-          : filterUses->acceptExisting(std::move(candidate), lane);
+          : filterUses->acceptExisting(std::move(candidate), lane, work);
     }
 
     // Accept a complete set of separable resident sources as one planning

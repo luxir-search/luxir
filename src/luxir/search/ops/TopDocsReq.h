@@ -433,32 +433,25 @@ public:
     return 2 * visited < leaves;
   }
 
-  // Pre-Weight FIELD_SORT planning. A complete resident whole membership
-  // serves every shape: the Calc serves it per segment through the
-  // exact-domain driver, or through the doc-order ladder over it when the
-  // sort offers no masked leaf bounds, and either replaces query
-  // evaluation. That includes shapes this planner never builds for, whose
-  // membership another consumer (a count over the same query) made
-  // resident; accepting applies the ordinary shared-hit effects. The inert
-  // lookup records nothing when the value is absent. Building stays a
-  // separate decision: verification-bearing and non-flat numeric shapes
-  // return undecided so the Weight-bearing router admits per segment on its
-  // estimates; flat literal conjunctions and docs-only non-numeric sorts
-  // veto every segment here, so a field sort never builds them, records
-  // their sighting, or creates their cache entry.
+  // Complete resident masks omit the Weight. Ordinary segment membership
+  // earns population from collection time; other sources retain the router.
   static CacheFirstFieldSortPlan planCacheFirstFieldSortWholeMembership(
       Query& query, Query::PlanningContext& planning,
       const SortPlan& sortPlan, bool allowReaderStable) {
+    bool observed = !QueryPrep::disableObservedFieldSortForTests
+        && planning.filterScope(query) <= FilterKeyScope::CORE_STABLE;
     auto candidate = planning.lookupExistingFilterUse(
         query, allowReaderStable);
     if (candidate.has_value()) {
       FilterCache::Use* use = planning.acceptExistingFilterUse(
-          std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+          std::move(*candidate), FilterCache::AdmissionLane::WHOLE,
+          observed ? FilterCache::Work::pending().forWholeQuery() : FilterCache::Work::assumed());
+      if (observed && use != nullptr) use->observe();
       // A concurrent detach after the lookup leaves the Weight-bearing
       // router authoritative.
       return {use, false};
     }
-    if (membershipVerificationWork(query)
+    if (observed || membershipVerificationWork(query)
         == Query::VerificationWork::PRESENT) {
       return {};
     }
@@ -470,18 +463,8 @@ public:
     return {nullptr, true};
   }
 
-  // Building membership pays for FIELD_SORT when it removes verification
-  // work from the query-driven ladder, or when the estimated cardinalities
-  // let the exact-domain driver bound its visits across the whole index
-  // (fieldSortVisitsBounded) - one decision for every segment, so a
-  // membership a later request finds is complete. Flat term conjunction
-  // cost is only the cheapest posting list, not a useful estimate of
-  // intersection membership, so it cannot establish that by itself.
-  // VerificationWork includes nested two-phase children hidden behind a
-  // single-phase compound protocol. Serving an already resident value is not
-  // decided here: the pre-Weight planner accepts it for every shape. Plan
-  // before getFilterUse(): a request rejected in every segment must not
-  // create a Use, record a WHOLE-lane sighting, or admit metadata.
+  // Estimate-based population for unobserved sources and the comparison
+  // baseline. Runtime collection independently chooses its field-sort driver.
   static bool planFieldSortWholeMembershipRoutes(
       Query& query, Query::Weight& weight, IndexReader& reader,
       const SortPlan& sortPlan, int64_t topCount,

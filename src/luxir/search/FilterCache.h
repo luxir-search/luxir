@@ -111,6 +111,8 @@ public:
   private:
     double amount;
     Tag tag;
+    enum class Consumer : uint8_t { CLAUSE, WHOLE_QUERY, SCOPED_QUERY };
+    Consumer consumer = Consumer::CLAUSE;
     constexpr Work(double amount, Tag tag) : amount(amount), tag(tag) {}
 
   public:
@@ -122,6 +124,13 @@ public:
       }
       return Work(amount, Tag::OBSERVED);
     }
+    Work forWholeQuery(bool canonical = true) const {
+      Work result = *this;
+      result.consumer = canonical ? Consumer::WHOLE_QUERY : Consumer::SCOPED_QUERY;
+      return result;
+    }
+    bool isWholeQuery() const { return consumer == Consumer::WHOLE_QUERY; }
+    bool isWholeConsumer() const { return consumer != Consumer::CLAUSE; }
     bool known() const { return tag != Tag::PENDING; }
     bool isAssumed() const { return tag == Tag::ASSUMED || isUnfunded(); }
     bool isUnfunded() const { return tag == Tag::UNFUNDED; }
@@ -371,7 +380,14 @@ public:
       bool deferred = false;
       bool pending = false;
       bool built = false;
-      bool pricedClaim = false;
+      bool clauseClaim = false;
+      bool wholeQuery = false;
+
+      void pend(Work work) {
+        if (work.known()) return;
+        wholeQuery = !pending ? work.isWholeQuery() : wholeQuery && work.isWholeQuery();
+        pending = true;
+      }
 
       template<class Value>
       const Value* takeCredit(const Value* value, Work work) {
@@ -675,6 +691,8 @@ private:
     std::atomic<int32_t> rawCardinality{-1};
     bool measured = false;
     bool observed = false;
+    // The last observed consumer, for dump pricing only.
+    bool wholeQuery = false;
     struct Mean {
       double nanos = 0;
       uint64_t count = 0;
@@ -849,7 +867,8 @@ private:
   AtomicCounters counter;
   std::atomic<double> priorNanosPerDoc{-1};
 
-  double productionNanos(const Ledger& ledger, int32_t maxDoc, bool observed) const;
+  double productionNanos(const Ledger& ledger, int32_t maxDoc,
+                         bool observed, bool wholeQuery = false) const;
   void recordProduction(uint64_t nanos, int32_t maxDoc);
 
   // Approximate value-object, shared_ptr control-block, and segment-slot share.

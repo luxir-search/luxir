@@ -78,8 +78,10 @@ bool FilterCache::Ledger::canPopulate(double productionNanos) const {
       + debt.load(std::memory_order_relaxed), 0.0);
 }
 
-double FilterCache::productionNanos(const Ledger& ledger, int32_t maxDoc, bool observed) const {
+double FilterCache::productionNanos(const Ledger& ledger, int32_t maxDoc,
+                                    bool observed, bool wholeQuery) const {
   if (ledger.measured) return (double)ledger.referenceNanos;
+  if (observed && wholeQuery) return ledger.absent.count ? ledger.absent.nanos : -1;
   double prior = observed ? priorNanosPerDoc.load(std::memory_order_relaxed) : -1;
   return prior < 0 ? -1 : prior * maxDoc;
 }
@@ -432,7 +434,7 @@ void FilterCache::acceptSharedHit(
     auto& request = use.requestSlots[segmentOrd];
     std::lock_guard<std::mutex> lock(request.mutex);
     const auto* served = value.get();
-    request.accounting.pending |= !work.known();
+    request.accounting.pend(work);
     use.pinValue(segmentOrd, std::move(value));
     if (request.servedValue == nullptr) {
       request.servedValue = served;
@@ -545,7 +547,7 @@ FilterCache::Probe FilterCache::Use::accept(SegmentCandidate&& candidate, Work w
   auto& requestSlot = requestSlots[segmentOrd];
   {
     std::unique_lock<std::mutex> lock(requestSlot.mutex);
-    requestSlot.accounting.pending |= !work.known();
+    requestSlot.accounting.pend(work);
     requestSlot.condition.wait(lock, [&] {
       return !requestSlot.resolving || requestSlot.raw != nullptr;
     });
@@ -583,7 +585,7 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Work work) {
   auto& requestSlot = requestSlots[segmentOrd];
   {
     std::unique_lock<std::mutex> lock(requestSlot.mutex);
-    requestSlot.accounting.pending |= !work.known();
+    requestSlot.accounting.pend(work);
     requestSlot.condition.wait(lock, [&] {
       return !requestSlot.resolving || requestSlot.raw != nullptr;
     });
@@ -668,8 +670,12 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Work work) {
   if (work.known()) {
     chargeLedger(slot->ledger, requestSlot.accounting, requestSlot.mutex, work);
   }
-  slot->ledger.observed |= !work.isAssumed();
-  double production = cache->productionNanos(slot->ledger, slot->maxDoc, !work.isAssumed());
+  if (!work.isAssumed()) {
+    slot->ledger.observed = true;
+    slot->ledger.wholeQuery = work.isWholeQuery();
+  }
+  double production = cache->productionNanos(
+      slot->ledger, slot->maxDoc, !work.isAssumed(), work.isWholeQuery());
   if ((!work.known() && slot->ledger.owed <= 0) || !slot->ledger.canPopulate(production)) {
     deferPopulation(segmentOrd);
     return bypass();
@@ -695,7 +701,7 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Work work) {
   }
   {
     std::lock_guard<std::mutex> lock(requestSlot.mutex);
-    requestSlot.accounting.pricedClaim = !work.isAssumed();
+    requestSlot.accounting.clauseClaim = !work.isAssumed() && !work.isWholeConsumer();
   }
   cache->counter.buildAttempts.fetch_add(1, std::memory_order_relaxed);
   uint64_t now = cache->nextEpoch();
@@ -1088,6 +1094,7 @@ void FilterCache::Use::settle(size_t segmentOrd, uint64_t nanos,
     std::lock_guard<SegmentSlot> lock(slot);
     auto& ledger = slot.ledger;
     ledger.observed = true;
+    ledger.wholeQuery = accounting.wholeQuery;
     if (accounting.ordinary) {
       if (ledger.measured && started < ledger.completed) return;
       ledger.absent.add((double)nanos);
@@ -1100,7 +1107,7 @@ void FilterCache::Use::settle(size_t segmentOrd, uint64_t nanos,
         ? std::max(0.0, ledger.absent.nanos - ledger.served.nanos)
         : accounting.ordinary ? (double)nanos : 0;
     if (accounting.ordinary) {
-      double price = cache->productionNanos(ledger, slot.maxDoc, true);
+      double price = cache->productionNanos(ledger, slot.maxDoc, true, accounting.wholeQuery);
       if (price >= 0) saving = std::min(price, saving);
     }
     payment = Work::nanoseconds(saving);
@@ -1870,7 +1877,7 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
     std::lock_guard<std::mutex> lock(use.requestSlots[segmentOrd].mutex);
     auto& accounting = use.requestSlots[segmentOrd].accounting;
     accounting.built |= claimed && !byproduct;
-    if (claimed && !byproduct && accounting.pricedClaim && attempted) {
+    if (claimed && !byproduct && accounting.clauseClaim && attempted) {
       recordProduction(buildCostNanos, identity.maxDoc);
     }
     use.pinValue(segmentOrd, chosen, chosen == local && !inserted);
@@ -2479,9 +2486,10 @@ std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
       if (!value.resident && !includeGhosts) return;
       value.owed = ledger.owed;
       value.debt = ledger.debt.load(std::memory_order_relaxed);
-      double price = productionNanos(ledger, value.maxDoc, ledger.observed);
+      double price = productionNanos(ledger, value.maxDoc, ledger.observed, ledger.wholeQuery);
       value.productionNanos = std::max(0.0, price);
-      value.productionSource = ledger.measured ? "measured" : price >= 0 ? "prior" : "unknown";
+      value.productionSource = ledger.measured ? "measured" : price < 0 ? "unknown"
+          : ledger.wholeQuery ? "absent" : "prior";
       value.absentNanos = ledger.absent.nanos;
       value.absentCount = ledger.absent.count;
       value.servedNanos = ledger.served.nanos;

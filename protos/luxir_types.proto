@@ -2346,7 +2346,7 @@ message CacheValueDump {
   double credited_us = 8;
   double production_us = 9;
   uint64 reference_bytes = 10;
-  string production_source = 11; // measured | prior | unknown
+  string production_source = 11; // measured | absent | prior | unknown
   double absent_mean_us = 12;
   uint64 absent_count = 13;
   double served_mean_us = 14;
