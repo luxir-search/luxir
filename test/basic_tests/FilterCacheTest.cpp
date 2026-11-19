@@ -2479,6 +2479,153 @@ TEST(FilterCacheTest, measuredFootprintTakesPrecedenceOverCardinalityEstimate) {
   EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
 }
 
+TEST(FilterCacheTest, unknownWholeSizeMeasuresAtTheFirstFundedProbe) {
+  constexpr int32_t maxDoc = 65536;
+  auto config = capacityConfig(bitDocs(maxDoc, 7)->ramBytesUsed());
+  config.admissionThreshold = 2;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, maxDoc}};
+  cache.onReaderPublished(1, segments);
+  FilterKey resident("large-resident"), candidate("unknown-whole-size");
+  {
+    FilterCache::UseRegistry sighting(cache, 1, segments);
+    sighting.get(resident);
+  }
+  seedCapacityValue(cache, segments, resident, 2000);
+  auto whole = FilterCache::Work::pending().forWholeQuery();
+  CapacityChecks checks(cache);
+  for (int i = 0; i < 2; i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+        observedRequest(cache, segments, candidate, 1000, {}, true, whole));
+  }
+  EXPECT_EQ(1u, ledgerFor(cache, candidate).absentCount);
+  EXPECT_EQ(0, checks.count);
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(candidate, FilterKeyScope::SEGMENT_STABLE, FilterCache::AdmissionLane::WHOLE);
+  auto grant = use->probe(0, whole);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, grant.kind());
+  EXPECT_EQ(0, checks.count);
+  use->publishRaw(0, grant, docs(maxDoc, {7}), 800);
+  EXPECT_FALSE(ledgerFor(cache, resident).resident);
+  auto value = ledgerFor(cache, candidate);
+  ASSERT_TRUE(value.resident);
+  EXPECT_EQ(use->rawDocSet(0)->ramBytesUsed(), cache.bytesUsed());
+  EXPECT_EQ(cache.bytesUsed(), value.referenceBytes);
+  EXPECT_EQ(1, value.rawCardinality);
+  EXPECT_EQ("measured", value.productionSource);
+  EXPECT_DOUBLE_EQ(800, value.debt);
+  EXPECT_DOUBLE_EQ(1000.0 / config.recentWorkEpochs, value.rankedRate);
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, wholeMeasurementCanBeEvictedOrRejectedAndIsNotFreeAgain) {
+  constexpr int32_t maxDoc = 65536;
+  for (bool rejected : {false, true}) {
+    SCOPED_TRACE(rejected);
+    size_t bytes = bitDocs(maxDoc, 7)->ramBytesUsed();
+    FilterCache cache(capacityConfig(bytes));
+    std::array segments{FilterCache::SegmentIdentity{1, maxDoc}};
+    cache.onReaderPublished(1, segments);
+    FilterKey resident("valuable-resident"), candidate("expensive-measurement");
+    seedCapacityValue(cache, segments, resident, 100000);
+    auto whole = FilterCache::Work::pending().forWholeQuery();
+    observedRequest(cache, segments, candidate, 100, {}, true, whole);
+    CapacityChecks checks(cache);
+    auto before = cache.counters();
+    {
+      FilterCache::UseRegistry request(cache, 1, segments);
+      auto* use = request.get(candidate, FilterKeyScope::SEGMENT_STABLE, FilterCache::AdmissionLane::WHOLE);
+      auto grant = use->probe(0, whole);
+      ASSERT_EQ(FilterCache::Probe::Kind::BUILD, grant.kind());
+      DocSetBuilder raw(maxDoc);
+      raw.addRange(0, rejected ? maxDoc : maxDoc / 2);
+      use->publishRaw(0, grant, raw.build(), 1000);
+      EXPECT_EQ(rejected ? maxDoc : maxDoc / 2, use->rawDocSet(0)->card());
+    }
+    EXPECT_EQ(0, checks.count);
+    EXPECT_TRUE(ledgerFor(cache, resident).resident);
+    auto ghost = ledgerFor(cache, candidate);
+    EXPECT_FALSE(ghost.resident);
+    EXPECT_EQ(bytes, ghost.referenceBytes);
+    EXPECT_EQ("measured", ghost.productionSource);
+    EXPECT_DOUBLE_EQ(1000, ghost.productionNanos);
+    EXPECT_DOUBLE_EQ(1000, ghost.debt);
+    EXPECT_DOUBLE_EQ(0, ghost.owed);
+    EXPECT_EQ(before.buildAttempts + 1, cache.counters().buildAttempts);
+    EXPECT_EQ(before.evictions + !rejected, cache.counters().evictions);
+    EXPECT_EQ(before.publishRejects + rejected, cache.counters().publishRejects);
+    for (int i = 0; i < 20; i++) {
+      EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+          observedRequest(cache, segments, candidate, 100, {}, true, whole));
+    }
+    EXPECT_DOUBLE_EQ(2000, ledgerFor(cache, candidate).owed);
+    EXPECT_EQ(0, checks.count);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+        observedRequest(cache, segments, candidate, 100, {}, true, whole));
+    EXPECT_EQ(1, checks.count);
+    EXPECT_EQ(before.buildAttempts + 1, cache.counters().buildAttempts);
+    cache.validateForTest();
+  }
+}
+
+TEST(FilterCacheTest, knownCountsAndPriorPricedUsesStillCompareCapacity) {
+  constexpr int32_t maxDoc = 65536;
+  using Work = FilterCache::Work;
+  for (Work work : {Work::pending(), Work::pending().forWholeQuery(false), Work::pending().forWholeQuery()}) {
+    bool knownCount = work.isWholeQuery();
+    SCOPED_TRACE(knownCount);
+    FilterCache cache(capacityConfig(bitDocs(maxDoc, 7)->ramBytesUsed()));
+    std::array segments{FilterCache::SegmentIdentity{1, maxDoc}};
+    cache.onReaderPublished(1, segments);
+    seedCapacityValue(cache, segments, FilterKey("valuable-resident"), 100000, 1000, true);
+    FilterKey candidate("compared-candidate");
+    observedRequest(cache, segments, candidate, 1000, {}, true, work);
+    CapacityChecks checks(cache);
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(candidate, FilterKeyScope::SEGMENT_STABLE, FilterCache::AdmissionLane::WHOLE);
+    if (knownCount) {
+      ASSERT_TRUE(use->recordCardinality(0, 1));
+    }
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, work).kind());
+    EXPECT_EQ(1, checks.count);
+  }
+}
+
+TEST(FilterCacheTest, concurrentUnknownWholeMeasurementsHaveOneCompletedProduction) {
+  constexpr int32_t maxDoc = 1024;
+  FilterCache cache(capacityConfig(bitDocs(maxDoc, 7)->ramBytesUsed()));
+  std::array segments{FilterCache::SegmentIdentity{1, maxDoc}};
+  cache.onReaderPublished(1, segments);
+  seedCapacityValue(cache, segments, FilterKey("valuable-resident"), 100000);
+  FilterKey candidate("concurrent-measurement");
+  auto whole = FilterCache::Work::pending().forWholeQuery();
+  observedRequest(cache, segments, candidate, 1000, {}, true, whole);
+  auto before = cache.counters();
+  std::barrier phase(2);
+  std::atomic<int> grants{0};
+  auto claimant = [&] {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(candidate, FilterKeyScope::SEGMENT_STABLE, FilterCache::AdmissionLane::WHOLE);
+    phase.arrive_and_wait();
+    auto probe = use->probe(0, whole);
+    if (probe.kind() == FilterCache::Probe::Kind::BUILD) grants.fetch_add(1);
+    phase.arrive_and_wait();
+    if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+      use->publishRaw(0, probe, bitDocs(maxDoc, 7), 1000);
+    }
+    phase.arrive_and_wait();
+    FilterCache::UseRegistry after(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, after.get(candidate)->probe(0, whole).kind());
+  };
+  std::thread first(claimant), second(claimant);
+  first.join(); second.join();
+  EXPECT_EQ(1, grants.load());
+  EXPECT_EQ(before.buildAttempts + 1, cache.counters().buildAttempts);
+  EXPECT_FALSE(ledgerFor(cache, candidate).resident);
+  EXPECT_DOUBLE_EQ(1000, ledgerFor(cache, candidate).debt);
+  cache.validateForTest();
+}
+
 TEST(FilterCacheTest, capacityUsesOneWindowEvenAfterALateRoll) {
   for (bool late : {false, true}) {
     size_t bytes = bitDocs(1024, 7)->ramBytesUsed();

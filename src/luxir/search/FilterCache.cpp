@@ -684,13 +684,21 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Work work) {
   size_t bytes = slot->ledger.referenceBytes;
   if (bytes == 0) {
     int32_t card = slot->ledger.rawCardinality.load(std::memory_order_relaxed);
-    bytes = card >= 0 ? DocSetBuilder::estimateBytes(slot->maxDoc, card)
-                      : RAMBitDocSet::ramBytesForSize(slot->maxDoc);
+    if (card >= 0) {
+      bytes = DocSetBuilder::estimateBytes(slot->maxDoc, card);
+    } else if (slot->ledger.measured || slot->ledger.absent.count == 0
+               || work.isAssumed() || !work.isWholeQuery()) {
+      bytes = RAMBitDocSet::ramBytesForSize(slot->maxDoc);
+    }
   }
-  ledgerLock.unlock();
-  if (!cache->capacityAllows(*entry, slot->ledger, bytes, production)) {
-    deferPopulation(segmentOrd, Deferral::CAPACITY);
-    return bypass();
+  // Unknown whole-query size is measured once. Keep its ledger locked through
+  // the claim so a completed production cannot leave a stale size decision.
+  if (bytes != 0) {
+    ledgerLock.unlock();
+    if (!cache->capacityAllows(*entry, slot->ledger, bytes, production)) {
+      deferPopulation(segmentOrd, Deferral::CAPACITY);
+      return bypass();
+    }
   }
   bool expected = false;
   if (!slot->building.compare_exchange_strong(

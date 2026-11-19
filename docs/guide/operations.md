@@ -891,6 +891,10 @@ Search has its own limits:
   Before their first production, canonical whole-query demand uses its own absent
   mean as the price; a selective parent domain keeps the prior estimate. Whole-query
   productions do not train the clause prior. Measured prices replace both estimates.
+  A funded canonical whole-query use priced from its absent mean, with neither
+  a measured footprint nor a known raw count, builds once to measure its size.
+  Eviction ranks that value by its actual bytes. Later purchases use its
+  measured size, price and debt.
   Prepared and reader-stable field-sort sources retain their existing routing.
   Join children and restricted exact-domain sources require timed observations
   to fund population. Outside a timed scope they serve resident values with
