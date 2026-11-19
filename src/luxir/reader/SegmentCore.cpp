@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include "Postings.h"
 #include "OwnershipShape.h"
+#include "luxir/util/log.h"
 #include <algorithm>
 
 namespace luxir {
@@ -80,10 +81,23 @@ SegmentCore::SegmentCore(uint64_t segId, uint64_t creatorEpoch)
 
 SegmentCore::~SegmentCore() = default;
 
-InputStream SegmentCore::materializeStream(uint32_t fnum) {
+std::string SegmentCore::fileName(uint32_t fnum) const {
+  return Postings::getIndexFileName(Postings::segmentKey(segId, creatorEpoch), fnum);
+}
+
+InputStream SegmentCore::materializeStream(uint32_t fnum, std::string_view caller) {
   StreamSlot& slot = streams[fnum];
   std::lock_guard lock(slot.mutex);  // other files materialize in parallel
   if (!slot.ready.load(std::memory_order_relaxed)) {
+    InputFile& file = *files[fnum];
+    uint64_t limit = maxMaterializeBytes.load(std::memory_order_relaxed);
+    if (!slot.warned && file.lazy() && limit > 0 && file.size() > limit) {
+      // Every concurrent reader of this file waits on this fetch.
+      slot.warned = true;
+      largeMaterializations.fetch_add(1, std::memory_order_relaxed);
+      LOG_WARN("Materializing the whole of lazy segment file '{}' ({} bytes, over reader.max-materialize-bytes={}){}{}",
+               fileName(fnum), file.size(), limit, caller.empty() ? "" : " for ", caller);
+    }
     // May fetch the whole file and throw; the slot stays unready then and the
     // next caller retries.
     slot.stream = files[fnum]->getInputStream();

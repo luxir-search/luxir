@@ -111,6 +111,13 @@ Luxir's own `--store.checked-dir.sync` and `--read-only` wrappers always sit
 outside the layers. The effective stack is logged at startup as
 `storage: ...`. See [plugins](../dev/plugins.md#storage-backends-and-layers).
 
+A backend that fetches segment bytes on first use (an object store) serves
+most reads by range. Some readers still take a whole segment file the first
+time they touch it, and every concurrent search that needs that file waits for
+the fetch. `--reader.max-materialize-bytes` (default `64MB`, `0` disables)
+logs each such file larger than the limit once, naming the file and the
+reader's field, so these reads are visible.
+
 `--store.retention-ms` keeps superseded commits and their files for that many
 milliseconds after their successor is published. After a restart, every older
 commit gets a full window. It defaults to 0 on exclusive stores and 300000

@@ -5,6 +5,7 @@
 #include <CLI/CLI.hpp>
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/server/Collections.h"
+#include "luxir/reader/SegmentCore.h"
 #include <unistd.h>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -314,6 +315,12 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "type-ahead keystrokes shorter than N are rejected (0 = off, default)")
       ->default_val(search.multiterm_min_prefix_length)
       ->check(CLI::NonNegativeNumber);
+
+  app.add_option("--reader.max-materialize-bytes", reader.max_materialize_bytes,
+                 "Log a lazy (remote) segment file larger than this that a reader "
+                 "materializes whole, once per file (0 = never)")
+      ->transform(CLI::AsSizeValue(false))
+      ->default_str("64MB");
 }
 
 void LuxirConfig::resolveRamBudgets() {
@@ -382,6 +389,7 @@ void LuxirConfig::apply() const {
   configureIndexingArena(index.huge_pages);
   auto level = spdlog::level::from_str(log_level);
   spdlog::set_level(level);
+  SegmentCore::maxMaterializeBytes.store(reader.max_materialize_bytes, std::memory_order_relaxed);
 }
 
 } // namespace luxir
