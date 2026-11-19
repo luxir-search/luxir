@@ -43,6 +43,7 @@ public:
     counter(std::string(name) + "_total", help, (double)a.ok, join(labels, "outcome=\"ok\""));
     counter(std::string(name) + "_total", help, (double)a.error, join(labels, "outcome=\"error\""));
     counter(std::string(name) + "_total", help, (double)a.cancelled, join(labels, "outcome=\"cancelled\""));
+    counter(std::string(name) + "_total", help, (double)a.rejected, join(labels, "outcome=\"rejected\""));
     out.histogram(duration, "Operation duration in seconds, including failed operations.",
                   bounds, a.duration, labels);
   }
@@ -89,6 +90,43 @@ void service(Renderer& r, const api::ServiceStats& s) {
                                 {"vector_build", &s.vector_build}, {"reader_refresh", &s.reader_refresh}})
     r.activity("luxir_background", "luxir_background_duration_seconds", *activity, s.background_duration_bounds,
                PrometheusText::label("kind", kind));
+  const auto& gate = s.search_admission;
+  r.gauge("luxir_search_admission_max_running", "Searches allowed to run at once on the node.", (double)gate.max_running);
+  r.gauge("luxir_search_admission_max_running_per_collection", "Searches of one collection allowed to run at once.",
+          (double)gate.max_running_per_collection);
+  r.gauge("luxir_search_admission_max_running_remote", "Searches of remote-storage collections allowed to run at once.",
+          (double)gate.max_running_remote);
+  r.gauge("luxir_search_admission_max_queued", "Searches allowed to wait for a slot.", (double)gate.max_queued);
+  r.gauge("luxir_search_admission_max_queue_seconds", "How long a search may wait for a slot; 0 is unbounded.",
+          (double)gate.max_queue_ms / 1e3);
+  r.gauge("luxir_searches_running", "Searches and resumed stream bursts holding an admission slot.", (double)gate.running);
+  r.gauge("luxir_searches_running_remote", "Searches of remote-storage collections holding an admission slot.",
+          (double)gate.running_remote);
+  r.gauge("luxir_searches_queued", "Searches waiting for an admission slot.", (double)gate.queued);
+  r.gauge("luxir_search_resumes_queued", "Resumed stream bursts waiting for an admission slot.", (double)gate.resumes_queued);
+  r.counter("luxir_searches_admitted_total", "Searches started, with or without waiting for a slot.", (double)gate.admitted);
+  r.counter("luxir_searches_waited_total", "Searches that waited for a slot before starting.", (double)gate.waited);
+  r.counter("luxir_search_queue_wait_seconds_total", "Summed queue time of the searches that waited for a slot.",
+            gate.wait_seconds);
+  constexpr std::string_view refused = "Searches refused by admission, by reason.";
+  r.counter("luxir_search_admission_rejected_total", refused, (double)gate.rejected_queue_full, "reason=\"queue_full\"");
+  r.counter("luxir_search_admission_rejected_total", refused, (double)gate.rejected_queue_timeout,
+            "reason=\"queue_timeout\"");
+  r.counter("luxir_search_admission_cancelled_total", "Searches cancelled by their client while waiting for a slot.",
+            (double)gate.cancelled);
+  r.counter("luxir_search_resumes_total", "Resumed stream bursts started.", (double)gate.resumes);
+  r.counter("luxir_search_resumes_waited_total", "Resumed stream bursts that waited for a slot.", (double)gate.resumes_waited);
+  r.counter("luxir_search_parallel_downgraded_total",
+            "max_parallel=-1 searches that fanned out adaptively because the node was crowded.", (double)gate.downgraded);
+  for (const auto& lane : gate.collections) {
+    auto label = PrometheusText::label("tenant", lane.tenant) + "," + PrometheusText::label("collection", lane.collection);
+    r.gauge("luxir_collection_searches_running", "Searches of the collection holding an admission slot.",
+            (double)lane.running, label);
+    r.gauge("luxir_collection_searches_queued", "Searches of the collection waiting for an admission slot.",
+            (double)lane.queued, label);
+  }
+  r.counter("luxir_storage_blocking_reads_total", "Storage reads that blocked a thread on bytes not in memory, as storage reports them.", (double)s.read_wait.blocking_reads);
+  r.counter("luxir_storage_read_wait_seconds_total", "Summed wait of storage reads that blocked a thread.", s.read_wait.wait_seconds);
 }
 
 void memory(Renderer& r, const api::MemoryStats& m) {
@@ -164,6 +202,7 @@ void collectionActivity(Renderer& r, const api::CollectionActivityStats& a, cons
     r.counter(total, help, (double)o->ok, labels + ",outcome=\"ok\"");
     r.counter(total, help, (double)o->error, labels + ",outcome=\"error\"");
     r.counter(total, help, (double)o->cancelled, labels + ",outcome=\"cancelled\"");
+    r.counter(total, help, (double)o->rejected, labels + ",outcome=\"rejected\"");
     r.counter(seconds, "Summed duration of the completions; divide its rate by the completion rate for the mean.",
               o->seconds, labels);
   }

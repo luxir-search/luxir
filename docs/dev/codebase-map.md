@@ -44,6 +44,9 @@ locations, browse `src/luxir/<area>/`.
      - Implements parallel segment searching using TBB
      - Ordinary preparation is shared with HTTP `?explain=resolved`;
        `?explain=request` only parses and serializes
+     - `SearchAdmission`: node-wide admission of dispatched searches
+       (`search.max-running`, per-collection and remote caps, bounded
+       round-robin queues, the resume priority lane)
    - `EmitDocs`: `ReturnField` separates the requested output key from the physical
      read source; wildcard discovery returns logical primaries only
 

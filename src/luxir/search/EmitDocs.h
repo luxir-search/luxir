@@ -1583,7 +1583,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           break;
         case SearchRequest::ReplyStatus::PAUSE:
           streamPauseCount++;
-          req.resumeWhenDrained([this] { produce(); });
+          req.pauseUntilDrained([this] { produce(); });
           return false;  // paused: the stream is NOT over; resume re-enters produce()
         case SearchRequest::ReplyStatus::CANCEL:
           batchStart = numCollected;  // client is gone; skip the remaining batches

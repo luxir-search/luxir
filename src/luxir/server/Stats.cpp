@@ -22,6 +22,8 @@
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/search/SearchEngine.h"
+#include "luxir/store/ReadWait.h"
 
 namespace luxir {
 namespace {
@@ -103,9 +105,10 @@ void fillActivity(api::ActivityStats& dst, const MetricCounts& counts, size_t ac
   dst.ok = src.completed[(size_t)MetricOutcome::OK];
   dst.error = src.completed[(size_t)MetricOutcome::ERROR];
   dst.cancelled = src.completed[(size_t)MetricOutcome::CANCELLED];
+  dst.rejected = src.completed[(size_t)MetricOutcome::REJECTED];
   // Stripes are summed one at a time, so work finishing during the read can
   // briefly count as completed before it counts as started.
-  uint64_t completed = dst.ok + dst.error + dst.cancelled;
+  uint64_t completed = dst.ok + dst.error + dst.cancelled + dst.rejected;
   dst.in_flight = src.started > completed ? (int64_t)(src.started - completed) : 0;
   fillHistogram(dst.duration, src, metricBounds(activity), resource);
 }
@@ -170,6 +173,40 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   fillActivity(dst.merge, counts, metricActivity(MetricStage::MERGE), resource);
   fillActivity(dst.vector_build, counts, metricActivity(MetricStage::VECTOR_BUILD), resource);
   fillActivity(dst.reader_refresh, counts, metricActivity(MetricStage::READER_REFRESH), resource);
+  auto admission = node.getSearchEngine().getAdmission().snapshot();
+  auto& gate = dst.search_admission;
+  gate.max_running = admission.limits.maxRunning;
+  gate.max_running_per_collection = admission.limits.maxRunningPerCollection;
+  gate.max_running_remote = admission.limits.maxRunningRemote;
+  gate.max_queued = admission.limits.maxQueued;
+  gate.max_queue_ms = (uint64_t)admission.limits.maxQueueWait.count();
+  gate.running = admission.running;
+  gate.running_remote = admission.runningRemote;
+  gate.queued = admission.queued;
+  gate.resumes_queued = admission.resumesQueued;
+  gate.admitted = admission.admitted;
+  gate.waited = admission.waited;
+  gate.wait_seconds = (double)admission.waitNanos / 1e9;
+  gate.rejected_queue_full = admission.rejectedFull;
+  gate.rejected_queue_timeout = admission.rejectedTimeout;
+  gate.cancelled = admission.cancelled;
+  gate.resumes = admission.resumes;
+  gate.resumes_waited = admission.resumesWaited;
+  gate.downgraded = admission.downgraded;
+  if (!admission.collections.empty()) {
+    auto* rows = api::build::allocArray(gate.collections, admission.collections.size(), resource);
+    for (size_t i = 0; i < admission.collections.size(); i++) {
+      // Admission keys a collection as tenant/name (SearchEngine::admitThenRun).
+      std::string_view key = admission.collections[i].collection;
+      auto slash = std::min(key.find('/'), key.size());
+      rows[i].tenant = api::build::arenaStr(resource, key.substr(0, slash));
+      rows[i].collection = api::build::arenaStr(resource, key.substr(std::min(slash + 1, key.size())));
+      rows[i].running = admission.collections[i].running;
+      rows[i].queued = admission.collections[i].queued;
+    }
+  }
+  dst.read_wait.blocking_reads = ReadWait::totalReads.load(std::memory_order_relaxed);
+  dst.read_wait.wait_seconds = (double)ReadWait::totalNanos.load(std::memory_order_relaxed) / 1e9;
 }
 
 void fillOutcomes(api::OutcomeStats& dst, const std::array<uint64_t, (size_t)MetricOutcome::COUNT>& outcomes,
@@ -177,6 +214,7 @@ void fillOutcomes(api::OutcomeStats& dst, const std::array<uint64_t, (size_t)Met
   dst.ok = outcomes[(size_t)MetricOutcome::OK];
   dst.error = outcomes[(size_t)MetricOutcome::ERROR];
   dst.cancelled = outcomes[(size_t)MetricOutcome::CANCELLED];
+  dst.rejected = outcomes[(size_t)MetricOutcome::REJECTED];
   dst.seconds = (double)nanos / 1e9;
 }
 

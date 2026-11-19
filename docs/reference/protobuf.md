@@ -170,6 +170,7 @@ defaults and constraints are described in the comments and guides.
 - [`QueryFacet`](#message-luxir.queryfacet)
 - [`RangeFacet`](#message-luxir.rangefacet)
 - [`RangeQuery`](#message-luxir.rangequery)
+- [`ReadWaitStats`](#message-luxir.readwaitstats)
 - [`RegexQuery`](#message-luxir.regexquery)
 - [`RenameCollectionRequest`](#message-luxir.renamecollectionrequest)
 - [`RenameCollectionResponse`](#message-luxir.renamecollectionresponse)
@@ -188,6 +189,8 @@ defaults and constraints are described in the comments and guides.
 - [`SchemaRequest`](#message-luxir.schemarequest)
 - [`SchemaResponse`](#message-luxir.schemaresponse)
 - [`ScrubStats`](#message-luxir.scrubstats)
+- [`SearchAdmissionCollection`](#message-luxir.searchadmissioncollection)
+- [`SearchAdmissionStats`](#message-luxir.searchadmissionstats)
 - [`SearchOp`](#message-luxir.searchop)
 - [`SearchRequest`](#message-luxir.searchrequest)
 - [`SearchResponse`](#message-luxir.searchresponse)
@@ -236,6 +239,7 @@ One kind of work: currently running, completed by outcome, and the duration of c
 | <a id="field-luxir.activitystats.ok"></a>[`ok`](#field-luxir.activitystats.ok) | 2 | `uint64` | singular |  |
 | <a id="field-luxir.activitystats.error"></a>[`error`](#field-luxir.activitystats.error) | 3 | `uint64` | singular |  |
 | <a id="field-luxir.activitystats.cancelled"></a>[`cancelled`](#field-luxir.activitystats.cancelled) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.activitystats.rejected"></a>[`rejected`](#field-luxir.activitystats.rejected) | 40 | `uint64` | singular | Refused by search admission before running (searches only). |
 | <a id="field-luxir.activitystats.duration"></a>[`duration`](#field-luxir.activitystats.duration) | 5 | [`HistogramStats`](#message-luxir.histogramstats) | singular |  |
 
 <a id="message-luxir.allreplicas"></a>
@@ -983,6 +987,9 @@ Execution details for one segment of an operation.
 | <a id="field-luxir.executionprofilepiece.domain_size"></a>[`domain_size`](#field-luxir.executionprofilepiece.domain_size) | 6 | `sint64` | optional |  |
 | <a id="field-luxir.executionprofilepiece.thread_id"></a>[`thread_id`](#field-luxir.executionprofilepiece.thread_id) | 7 | `int64` | singular |  |
 | <a id="field-luxir.executionprofilepiece.elapsed_us"></a>[`elapsed_us`](#field-luxir.executionprofilepiece.elapsed_us) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.executionprofilepiece.blocking_reads"></a>[`blocking_reads`](#field-luxir.executionprofilepiece.blocking_reads) | 40 | `uint64` | singular | Storage reads that blocked this piece's thread on bytes not in memory, as the storage implementation reports them (see ReadWaitStats), and their summed wait. |
+| <a id="field-luxir.executionprofilepiece.read_wait_us"></a>[`read_wait_us`](#field-luxir.executionprofilepiece.read_wait_us) | 41 | `uint64` | singular |  |
+| <a id="field-luxir.executionprofilepiece.major_faults"></a>[`major_faults`](#field-luxir.executionprofilepiece.major_faults) | 42 | `uint64` | singular | Major page faults on this piece's thread: mapped file pages read from disk, which a cold local index takes too. Zero where the platform does not count them per thread. |
 | <a id="field-luxir.executionprofilepiece.details"></a>[`details`](#field-luxir.executionprofilepiece.details) | 9 | `string` | repeated | Human-readable execution notes. Contents and formatting may change; do not parse these entries. |
 
 <a id="message-luxir.existsquery"></a>
@@ -1704,6 +1711,7 @@ Completed work by outcome, and its summed duration.
 | <a id="field-luxir.outcomestats.ok"></a>[`ok`](#field-luxir.outcomestats.ok) | 1 | `uint64` | singular |  |
 | <a id="field-luxir.outcomestats.error"></a>[`error`](#field-luxir.outcomestats.error) | 2 | `uint64` | singular |  |
 | <a id="field-luxir.outcomestats.cancelled"></a>[`cancelled`](#field-luxir.outcomestats.cancelled) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.outcomestats.rejected"></a>[`rejected`](#field-luxir.outcomestats.rejected) | 40 | `uint64` | singular | Refused by search admission before running (searches only). |
 | <a id="field-luxir.outcomestats.seconds"></a>[`seconds`](#field-luxir.outcomestats.seconds) | 4 | `double` | singular |  |
 
 <a id="message-luxir.phraseoptions"></a>
@@ -1980,6 +1988,19 @@ Matches documents whose field value falls in the given range. All bounds are opt
 | <a id="field-luxir.rangequery.lt"></a>[`lt`](#field-luxir.rangequery.lt) | 5 | [`Val`](#message-luxir.val) | singular | upper bound, exclusive (&lt;) |
 | <a id="field-luxir.rangequery.relation"></a>[`relation`](#field-luxir.rangequery.relation) | 15 | [`RangeQuery.Relation`](#enum-luxir.rangequery.relation) | singular | Range fields only; rejected on other field types unless INTERSECTS. |
 
+<a id="message-luxir.readwaitstats"></a>
+
+### luxir.ReadWaitStats
+
+Storage reads that blocked a thread on bytes not in memory (a fetch from an object store, a lazily loaded file), as the storage implementations report them. Built-in storage reports none; mapped file reads show as major page faults in ProcessStats instead.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.readwaitstats.blocking_reads"></a>[`blocking_reads`](#field-luxir.readwaitstats.blocking_reads) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.readwaitstats.wait_seconds"></a>[`wait_seconds`](#field-luxir.readwaitstats.wait_seconds) | 2 | `double` | singular |  |
+
 <a id="message-luxir.regexquery"></a>
 
 ### luxir.RegexQuery
@@ -2226,6 +2247,49 @@ Background checksum scrub of published snapshot files. A mismatch also makes its
 | <a id="field-luxir.scrubstats.last_pass_end"></a>[`last_pass_end`](#field-luxir.scrubstats.last_pass_end) | 5 | `uint64` | singular | Unix milliseconds; absent before the first pass |
 | <a id="field-luxir.scrubstats.errors"></a>[`errors`](#field-luxir.scrubstats.errors) | 6 | `uint64` | singular | other file check errors; retried on the next pass |
 
+<a id="message-luxir.searchadmissioncollection"></a>
+
+### luxir.SearchAdmissionCollection
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.searchadmissioncollection.tenant"></a>[`tenant`](#field-luxir.searchadmissioncollection.tenant) | 4 | `string` | singular |  |
+| <a id="field-luxir.searchadmissioncollection.collection"></a>[`collection`](#field-luxir.searchadmissioncollection.collection) | 1 | `string` | singular |  |
+| <a id="field-luxir.searchadmissioncollection.running"></a>[`running`](#field-luxir.searchadmissioncollection.running) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.searchadmissioncollection.queued"></a>[`queued`](#field-luxir.searchadmissioncollection.queued) | 3 | `uint64` | singular |  |
+
+<a id="message-luxir.searchadmissionstats"></a>
+
+### luxir.SearchAdmissionStats
+
+Search admission: every dispatched search takes a slot before it runs. The rest wait, holding no thread, in per-collection queues served round robin, or are refused with RESOURCE\_EXHAUSTED.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.searchadmissionstats.max_running"></a>[`max_running`](#field-luxir.searchadmissionstats.max_running) | 1 | `uint64` | singular | The resolved limits. |
+| <a id="field-luxir.searchadmissionstats.max_running_per_collection"></a>[`max_running_per_collection`](#field-luxir.searchadmissionstats.max_running_per_collection) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.searchadmissionstats.max_running_remote"></a>[`max_running_remote`](#field-luxir.searchadmissionstats.max_running_remote) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.searchadmissionstats.max_queued"></a>[`max_queued`](#field-luxir.searchadmissionstats.max_queued) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.searchadmissionstats.max_queue_ms"></a>[`max_queue_ms`](#field-luxir.searchadmissionstats.max_queue_ms) | 5 | `uint64` | singular | 0: unbounded |
+| <a id="field-luxir.searchadmissionstats.running"></a>[`running`](#field-luxir.searchadmissionstats.running) | 6 | `uint64` | singular | Load now. running counts searches and resumed stream bursts holding a slot; running\_remote those of collections on remote storage. |
+| <a id="field-luxir.searchadmissionstats.running_remote"></a>[`running_remote`](#field-luxir.searchadmissionstats.running_remote) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.searchadmissionstats.queued"></a>[`queued`](#field-luxir.searchadmissionstats.queued) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.searchadmissionstats.resumes_queued"></a>[`resumes_queued`](#field-luxir.searchadmissionstats.resumes_queued) | 9 | `uint64` | singular | Resumed stream bursts waiting for a slot; they are served before queued searches and never refused. |
+| <a id="field-luxir.searchadmissionstats.admitted"></a>[`admitted`](#field-luxir.searchadmissionstats.admitted) | 10 | `uint64` | singular | Since the node opened: searches started, with or without waiting, and of those the ones that waited, with their summed queue time. |
+| <a id="field-luxir.searchadmissionstats.waited"></a>[`waited`](#field-luxir.searchadmissionstats.waited) | 11 | `uint64` | singular |  |
+| <a id="field-luxir.searchadmissionstats.wait_seconds"></a>[`wait_seconds`](#field-luxir.searchadmissionstats.wait_seconds) | 12 | `double` | singular |  |
+| <a id="field-luxir.searchadmissionstats.rejected_queue_full"></a>[`rejected_queue_full`](#field-luxir.searchadmissionstats.rejected_queue_full) | 13 | `uint64` | singular | Searches refused because the queue was full, or after waiting search.max-queue-ms; and searches cancelled by their client while queued. |
+| <a id="field-luxir.searchadmissionstats.rejected_queue_timeout"></a>[`rejected_queue_timeout`](#field-luxir.searchadmissionstats.rejected_queue_timeout) | 14 | `uint64` | singular |  |
+| <a id="field-luxir.searchadmissionstats.cancelled"></a>[`cancelled`](#field-luxir.searchadmissionstats.cancelled) | 15 | `uint64` | singular |  |
+| <a id="field-luxir.searchadmissionstats.resumes"></a>[`resumes`](#field-luxir.searchadmissionstats.resumes) | 16 | `uint64` | singular | Resumed stream bursts started, and of those the ones that waited. |
+| <a id="field-luxir.searchadmissionstats.resumes_waited"></a>[`resumes_waited`](#field-luxir.searchadmissionstats.resumes_waited) | 17 | `uint64` | singular |  |
+| <a id="field-luxir.searchadmissionstats.downgraded"></a>[`downgraded`](#field-luxir.searchadmissionstats.downgraded) | 18 | `uint64` | singular | max\_parallel=-1 searches that fanned out adaptively because the node was crowded. |
+| <a id="field-luxir.searchadmissionstats.collections"></a>[`collections`](#field-luxir.searchadmissionstats.collections) | 19 | [`SearchAdmissionCollection`](#message-luxir.searchadmissioncollection) | repeated | Collections with a search running or queued now. |
+
 <a id="message-luxir.searchop"></a>
 
 ### luxir.SearchOp
@@ -2354,6 +2418,8 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.merge"></a>[`merge`](#field-luxir.servicestats.merge) | 16 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.vector_build"></a>[`vector_build`](#field-luxir.servicestats.vector_build) | 17 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.reader_refresh"></a>[`reader_refresh`](#field-luxir.servicestats.reader_refresh) | 18 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.search_admission"></a>[`search_admission`](#field-luxir.servicestats.search_admission) | 50 | [`SearchAdmissionStats`](#message-luxir.searchadmissionstats) | singular | Node-wide search admission: limits, load and refusals (see search.max-running in the operations guide). |
+| <a id="field-luxir.servicestats.read_wait"></a>[`read_wait`](#field-luxir.servicestats.read_wait) | 51 | [`ReadWaitStats`](#message-luxir.readwaitstats) | singular |  |
 
 <a id="message-luxir.shardcachecontrol"></a>
 

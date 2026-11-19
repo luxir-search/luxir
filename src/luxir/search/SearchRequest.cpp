@@ -130,9 +130,13 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
     auto end = std::chrono::steady_clock::now();
     lastResponse->proto.took_us = microsSince(startTime, end);
     if (!warnings.empty()) engine.metrics().add(MetricCounter::SEARCH_WARNINGS);
-    if (counting) count(lastResponse->proto.error ? MetricOutcome::ERROR : MetricOutcome::OK, end);
+    if (counting) count(lastResponse->proto.error ? errorOutcome : MetricOutcome::OK, end);
     reply(*lastResponse);  // may delete *this*; nothing after this call
   }
+}
+
+void SearchRequest::pauseUntilDrained(std::function<void()> resume) {
+  resumeWhenDrained(engine.admitResume(std::move(resume)));
 }
 
 void SearchRequest::setError(const ErrorInfo& info) {

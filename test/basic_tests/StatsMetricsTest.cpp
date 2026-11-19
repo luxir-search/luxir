@@ -171,7 +171,7 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
       {"collections.shards.index.query_cache.build_us", 1e6},
       {"collections.shards.index.query_cache.served_build_us", 1e6},
       {"collections.shards.index.query_cache.dead_build_us", 1e6},
-      {"scrub.last_pass_end", 1e3}};
+      {"scrub.last_pass_end", 1e3}, {"service.search_admission.max_queue_ms", 1e3}};
   auto rendered = renderedNumbers(renderPrometheus(response));
   std::string json;
   ASSERT_TRUE(api::write_json(response, json));

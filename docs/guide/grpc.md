@@ -90,6 +90,9 @@ One request contains:
   `--search.fanout-grain-us` (default 50 us); `-1` pins `0` to serial execution.
   `--search.fanout-sibling-grain-us` sets the minimum share with only idle SMT
   siblings (default 1000 us); `-1` disables publication in that tier.
+  Every search first takes a node-wide admission slot
+  ([Search admission](operations.md#search-admission)); while the node is
+  crowded, `-1` fans out adaptively like `0`.
 
 Unlike HTTP, gRPC does not have the root `top_docs` shorthand. Populate the
 `ops` map explicitly. It also does not use HTTP's document-line
@@ -174,6 +177,12 @@ collection cannot be resolved. Responses already accepted are still delivered
 before that status. The kinds, codes, and their meanings are
 transport-independent; see [HTTP API conventions](http-api.md#errors) for the
 table.
+
+A search refused by admission (all slots busy and the queue full, or a wait
+past `--search.max-queue-ms`) ends with `SearchResponse.error` of kind
+`RESOURCE_EXHAUSTED` and code `search_queue_full` or `search_queue_timeout`,
+on the stream like any other search failure; the call stays open. It did no
+work, so the client may retry after a short backoff.
 
 ## Packed request flags
 

@@ -11,8 +11,46 @@
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
 #include "luxir/reader/SkipStats.h"
+#include "luxir/store/Directory.h"
 
 namespace luxir {
+
+namespace {
+
+// The final response of a search admission refused.
+ErrorInfo refusalError(SearchAdmission::Refusal why) {
+  switch (why) {
+    case SearchAdmission::Refusal::QUEUE_FULL:
+      return {ErrorKind::RESOURCE_EXHAUSTED, "search_queue_full",
+              "too many searches are waiting for a slot (search.max-queued); retry later"};
+    case SearchAdmission::Refusal::QUEUE_TIMEOUT:
+      return {ErrorKind::RESOURCE_EXHAUSTED, "search_queue_timeout",
+              "search waited longer than search.max-queue-ms for a slot; retry later"};
+    case SearchAdmission::Refusal::CANCELLED:
+      return {ErrorKind::UNAVAILABLE, "cancelled", "search cancelled while waiting for a slot"};
+    case SearchAdmission::Refusal::SHUTDOWN:
+      break;
+  }
+  return {ErrorKind::UNAVAILABLE, "shutting_down", "search refused: the node is shutting down"};
+}
+
+}  // namespace
+
+SearchAdmission::Limits SearchEngine::admissionLimits(const SearchConfig& config, int workers) {
+  workers = std::max(1, workers);
+  SearchAdmission::Limits limits;
+  limits.maxRunning = (uint32_t)(config.max_running > 0 ? config.max_running : workers);
+  limits.maxRunningPerCollection = (uint32_t)(config.max_running_per_collection > 0
+      ? config.max_running_per_collection : std::max(1, (int)limits.maxRunning - 1));
+  limits.maxRunningRemote = (uint32_t)(config.max_running_remote > 0
+      ? config.max_running_remote : std::max(1, (int)limits.maxRunning / 2));
+  limits.maxQueued = (uint32_t)(config.max_queued >= 0 ? config.max_queued : 8 * workers);
+  limits.maxQueueWait = std::chrono::milliseconds(std::max<int64_t>(0, config.max_queue_ms));
+  return limits;
+}
+
+SearchEngine::SearchEngine(LuxirNode& node)
+    : node(node), admission(admissionLimits(node.getConfig().search, node.getWorkers())) {}
 
 const SearchConfig& SearchEngine::searchConfig() const {
   return node.getConfig().search;
@@ -138,20 +176,91 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // The request scope is stack-owned; emitters retain only configuration.
   req.tg = nullptr;
   execution.finish();
+  // The admission slot goes to the next search now, before the final
+  // response: the body's work is done, and a paused stream's resumed bursts
+  // re-admit through the priority lane (admitResume).
+  req.admissionSlot.reset();
   req.bodyDone();
 }
 
-void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
+void SearchEngine::failHere(SearchRequest& req, const ErrorInfo& error, MetricOutcome outcome) noexcept {
+  req.errorOutcome = outcome;
+  try {
+    req.setError(error);
+  } catch (...) {
+    LOG_ERROR("Search request could not record its failure: {}", error.message);
+  }
+  // Without a response to carry it there is nothing to send; setError creates
+  // it, so this holds only if that allocation failed too.
+  if (req.lastResponse) req.bodyDone();
+}
+
+void SearchEngine::enqueueRun(SearchRequest& req, int32_t maxParallel) noexcept {
+  req.offloaded = true;
   try {
     // Isolation also covers waits outside the request's fan-out scope.
     node.getTaskArena().enqueue([this, &req, maxParallel] {
       oneapi::tbb::this_task_arena::isolate([&] { submit(req, maxParallel); });
     });
-  } catch (const std::exception& e) {
+  } catch (...) {
     // Nothing was queued: complete the request here so its transport still
-    // sees exactly one final reply.
-    req.setError(classifyException(e, ErrorKind::INTERNAL));
-    req.bodyDone();
+    // sees exactly one final reply, and free its slot first.
+    req.admissionSlot.reset();
+    failHere(req, currentExceptionInfo(ErrorKind::INTERNAL), MetricOutcome::ERROR);
+  }
+}
+
+bool SearchEngine::readsRemotely(const Collection& collection) noexcept {
+  try {
+    return collection.getShard()->getDirectory()->capabilities() & Directory::REMOTE;
+  } catch (const std::exception&) {
+    return false;  // getResources reports the unavailable collection
+  }
+}
+
+bool SearchEngine::readsRemotely(const SearchRequest& req) {
+  try {
+    return readsRemotely(*node.getCollection(LuxirNode::target(req.tenant, req.proto.collection)));
+  } catch (const std::exception&) {
+    return false;  // getResources reports the failed lookup, as for any collection
+  }
+}
+
+void SearchEngine::admitThenRun(SearchRequest& req, int32_t maxParallel, Receiver receiver, bool remote) {
+  // Inline only where the transport allows it, for a lane that wants it, and
+  // for a collection whose reads cannot wait on the network.
+  bool inlineLane = receiver == Receiver::MAY_EXECUTE && maxParallel != 1 && !remote;
+  SearchAdmission::Slot slot;
+  try {
+    auto id = LuxirNode::target(req.tenant, req.proto.collection);
+    auto collection = id.tenant + "/" + id.name;  // _stats splits it back
+    slot = admission.tryAcquire(collection, remote);
+    if (!slot) {
+      // A queued search holds no thread and always runs on the arena: the
+      // thread that frees a slot only enqueues it.  Refusals and cancellations
+      // answer from the thread that decides them, never through the arena the
+      // search was refused from.
+      admission.admit(collection, remote, req.admissionStop(),
+          [this, &req, maxParallel](SearchAdmission::Slot granted) {
+            req.admissionSlot = std::move(granted);
+            enqueueRun(req, maxParallel);
+          },
+          [&req](SearchAdmission::Refusal why) {
+            failHere(req, refusalError(why),
+                     why == SearchAdmission::Refusal::CANCELLED ? MetricOutcome::CANCELLED : MetricOutcome::REJECTED);
+          });
+      return;
+    }
+  } catch (...) {
+    // admit() throws only before it takes the search.
+    failHere(req, currentExceptionInfo(ErrorKind::INTERNAL), MetricOutcome::ERROR);
+    return;
+  }
+  req.admissionSlot = std::move(slot);
+  if (inlineLane) {
+    submit(req, maxParallel);
+  } else {
+    enqueueRun(req, maxParallel);
   }
 }
 
@@ -164,22 +273,19 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver re
       auto floor = CommitId::parse(req.proto.min_commit);
       auto collection = LuxirNode::target(req.tenant, req.proto.collection);
       auto& waits = node.getCommitWaits();
+      // Admitted after the wait, so no slot is held through it, and run on the
+      // arena: the continuation may fire on a commit or timer thread.
       waits.awaitCommit(std::move(collection), std::move(floor),
           waits.deadlineAfter(req.proto.min_commit_timeout_ms.value_or(30000)), req.waitCancellation.get_token(),
           [this, &req, maxParallel](CommitWaits::CommitResult result) {
             if (!result.error) {
               req.floorCollection = result.collection;
-              enqueueSubmit(req, maxParallel);
+              admitThenRun(req, maxParallel, Receiver::OFFLOAD, readsRemotely(*result.collection));
               return;
             }
             // CommitWaits swallows a throw from here, which would strand the
-            // request: if the enqueue fails, fail the request on this thread.
-            auto fail = [&req, error = *result.error] { req.setError(error); req.bodyDone(); };
-            try {
-              node.getTaskArena().enqueue(fail);  // copies; fail stays valid if this throws
-            } catch (...) {
-              fail();
-            }
+            // request: answer on this thread.
+            failHere(req, *result.error, MetricOutcome::ERROR);
           });
       return;
 
@@ -189,16 +295,44 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver re
       return;
     }
   }
-  bool runOnReceiver = receiver == Receiver::MAY_EXECUTE && maxParallel != 1;
-  if (!runOnReceiver) {
-    enqueueSubmit(req, maxParallel);
-  } else {
-    submit(req, maxParallel);
-  }
+  admitThenRun(req, maxParallel, receiver, readsRemotely(req));
+}
+
+std::function<void()> SearchEngine::admitResume(std::function<void()> resume) {
+  return [this, resume = std::move(resume)] {
+    try {
+      admission.resume([this, resume](SearchAdmission::Slot slot) {
+        if (!slot.waited()) {
+          resume();  // here, where the transport placed it; the slot frees after the burst
+          return;
+        }
+        // Started by the thread that freed a slot, which only hands work off.
+        auto run = [held = std::make_shared<SearchAdmission::Slot>(std::move(slot)), resume] {
+          oneapi::tbb::this_task_arena::isolate(resume);
+          held->reset();
+        };
+        try {
+          node.getTaskArena().enqueue(run);  // copies; run stays valid if this throws
+        } catch (...) {
+          run();
+        }
+      });
+    } catch (...) {
+      // Nothing was queued (the lane allocates first): never strand a stream.
+      resume();
+    }
+  };
 }
 
 void SearchEngine::submit(SearchRequest& req, int32_t maxParallel) {
   // Ideas: we could keep track of executing requests here, and provide ways to list / cancel them?
+  // -1 is not load aware (task_group_fanout publishes every sibling): an
+  // admitted -1 search fans out adaptively, like 0, while searches queue or
+  // others run, so it does not take every worker from them.
+  if (maxParallel == -1 && req.admissionSlot && admission.crowded((uint32_t)node.getWorkers())) {
+    maxParallel = 0;
+    admission.countDowngrade();
+  }
   req.maxParallel = maxParallel;
   std::optional<FanoutScope> stackTg;
   // SkipStats counters are single-threaded; adaptive instrumented runs stay serial.

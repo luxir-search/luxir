@@ -545,6 +545,13 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_ingest_documents_total`, `luxir_ingest_delete_ids_total` | Documents accepted into indexing or rejected/rolled back, and accepted delete IDs. Acceptance does not mean durability; commits can still fail. Deletes count submitted IDs, not matched documents. |
 | `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
 | `luxir_stream_pauses_total` | Response backpressure events by transport. |
+| `luxir_searches_running`, `luxir_searches_running_remote`, `luxir_searches_queued`, `luxir_search_resumes_queued` | Search admission load: searches (and resumed stream bursts) holding a slot, those of remote-storage collections, searches waiting for a slot, and resumed bursts waiting. JSON: `service.search_admission`. |
+| `luxir_collection_searches_running`, `luxir_collection_searches_queued` | The same per `tenant` and `collection`, for collections with a search running or queued now. |
+| `luxir_search_admission_max_running`, `..._max_running_per_collection`, `..._max_running_remote`, `..._max_queued`, `..._max_queue_seconds` | The resolved admission limits (see [Search admission](#search-admission)). |
+| `luxir_searches_admitted_total`, `luxir_searches_waited_total`, `luxir_search_queue_wait_seconds_total` | Searches started, those that queued first, and their summed queue time (queue time only, not execution). |
+| `luxir_search_admission_rejected_total`, `luxir_search_admission_cancelled_total` | Searches refused by admission, by `reason` (`queue_full`, `queue_timeout`), and searches cancelled by their client while queued. Refusals also count as `outcome="rejected"` in `luxir_searches_total` and `luxir_collection_searches_total`. |
+| `luxir_search_resumes_total`, `luxir_search_resumes_waited_total`, `luxir_search_parallel_downgraded_total` | Resumed stream bursts started and those that waited for a slot, and `max_parallel: -1` searches that fanned out adaptively because the node was crowded. |
+| `luxir_storage_blocking_reads_total`, `luxir_storage_read_wait_seconds_total` | Storage reads that blocked a thread on bytes not in memory, and their summed wait, as storage implementations report them (`service.read_wait`). Built-in storage reports none; cold reads of mapped local files show as major page faults in the process metrics. |
 | `luxir_http_connections`, `luxir_http_io_threads` | Live HTTP sessions and running connection-shard threads; the thread gauge excludes the accept thread. gRPC active calls are in `luxir_requests_in_flight`. |
 | `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, merge, vector-build, and reader-refresh stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
 | `luxir_node_memory_budget_bytes`, `luxir_search_request_memory_limit_bytes` | Configured managed-memory budget and tracked per-search ceiling. Neither is a process RSS limit. |
@@ -649,7 +656,9 @@ statistics exist for those features.
 ## Threads and streaming backpressure
 
 HTTP defaults to one connection-I/O shard per available logical CPU, with a
-minimum of one, plus one dedicated accept thread. gRPC defaults to half the
+minimum of one, plus one dedicated accept thread; on nodes of 2 or fewer
+logical CPUs it defaults to one shard, since every shard competes with the
+workers for the same cores. gRPC defaults to half the
 available logical CPUs, also with a minimum of one; its completion-queue
 threads only move bytes and hand requests off, so they need not match the
 query concurrency. Automatic sizing respects
@@ -697,6 +706,53 @@ ends, whatever the setting. gRPC searches always start on arena workers, so
 `1` and `-2` are serial there, `0` is adaptive, and `-1` publishes every sibling.
 gRPC keeps searches off completion-queue threads so calls multiplexed on one
 HTTP/2 connection can execute concurrently.
+
+A search of a collection on a remote storage backend (one whose directory
+reports `Directory::REMOTE`) leaves the shard in every lane, because its reads
+can wait on the network: `0`, `1` and `-2` run on a worker, and `-1` fans out
+from one. Its resumed streaming batches run on the workers too.
+
+### Search admission
+
+Every search the engine dispatches takes an admission slot before it runs,
+whatever its transport or lane, so a few long searches cannot occupy every
+worker and stall the rest of the node:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--search.max-running` | `0` = `server.workers` | Searches running at once on the node, inline on an HTTP shard or on a worker. |
+| `--search.max-running-per-collection` | `0` = `max-running` less one, at least one | Searches of one collection running at once, so long searches on one collection always leave a slot for the others. |
+| `--search.max-running-remote` | `0` = half of `max-running`, at least one | Searches of collections on remote storage running at once; they hold a worker while their reads wait on the network. |
+| `--search.max-queued` | `-1` = 8 x `server.workers` | Searches waiting for a slot, node-wide. `0` refuses whenever no slot is free. |
+| `--search.max-queue-ms` | `5000` | How long a search may wait for a slot. Queue time only, never execution; `0` is unbounded. |
+
+A search that finds no slot waits without holding a thread, in a per-collection
+FIFO; freed slots go to the waiting collections in round-robin order, so one
+collection's backlog delays another's searches by at most one turn. A search
+arriving at a full queue, or still waiting after `--search.max-queue-ms`, is
+refused with `RESOURCE_EXHAUSTED` (HTTP 429 with `Retry-After: 1`, codes
+`search_queue_full` and `search_queue_timeout`); refusals are answered from the
+thread that decides them, never by queueing behind the busy workers. A queued
+search whose client goes away (the HTTP connection closes, the gRPC call is
+cancelled) leaves the queue. A `min_commit` search is admitted after its commit
+wait, so it never holds a slot through it. The slot is released when the search
+body finishes, on success or failure and before its final response.
+
+An HTTP search in a lane that runs on the shard (`0`, `-1`, `-2`) runs there
+only when a slot is free right now and nothing queues; otherwise it waits like
+any other search and then runs on a worker, and so do its resumed streaming
+batches. A streamed response paused by backpressure does not keep its slot:
+each resumed batch re-admits through a priority lane that is never refused and
+is served before any queued search, holding a slot for that batch only.
+
+`max_parallel: -1` publishes every sibling regardless of load. While the node
+is crowded (searches queue, or other searches hold slots so that its fan-out
+would pass `--search.max-running`), an admitted `-1` search fans out adaptively
+like `0` instead (`luxir_search_parallel_downgraded_total`).
+
+Search deadlines and cancellation of running searches are separate work
+(issue #280); admission bounds only how many run and how long one waits to
+start.
 
 `--server.stream_buffer_bytes` sets the per-HTTP-connection and per-gRPC-call
 high-water mark for serialized responses (default 1 MiB). Producers pause above

@@ -1158,8 +1158,11 @@ beside `ops` in the full form:
   starts on the receiving HTTP thread and adaptively uses idle cores after
   earning work credit. `1` runs serially on an arena worker, so an expensive
   query does not occupy its connection thread. `-1` publishes every sibling
-  regardless of work credit and load. `-2` runs serially inline. Values `0`,
-  `-1`, and `-2` occupy the receiving HTTP thread for the request's duration.
+  regardless of work credit and load (adaptively, like `0`, while the node is
+  crowded). `-2` runs serially inline. Values `0`, `-1`, and `-2` occupy the
+  receiving HTTP thread for the request's duration when a
+  [search admission](operations.md#search-admission) slot is free and nothing
+  queues; otherwise the request waits for one and runs on an arena worker.
   gRPC and requests continuing after a `min_commit` wait start on arena workers
   for every value. The server-wide serial pin is `--search.fanout-grain-us=-1`;
   it disables adaptive publication for `0`. The default grain is 50 us, and
@@ -1252,6 +1255,13 @@ number of distinct lists scanned in that segment. Rescans do not increase
 `lists_probed`. These are per-segment counts, in different units from
 `initial_nprobe`, so they are not directly comparable to it. Pieces that never
 ran IVF carry none of these fields.
+
+A piece whose thread waited on storage also reports it, so a slow piece can be
+told apart from a cold one. `blocking_reads` and `read_wait_us` count the reads
+that blocked on bytes not in memory, as the storage implementation reports
+them (built-in storage reports none), and `major_faults` counts mapped file
+pages read from disk, which a cold local index takes too. They cover the
+piece's own thread and are omitted when zero.
 
 ## Streaming HTTP responses
 
