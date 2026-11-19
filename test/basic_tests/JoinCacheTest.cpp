@@ -340,12 +340,13 @@ TEST_F(JoinCacheTest, exactLocalMembershipKeepsScoresAndResidentOwnerSources) {
       {
         SkipStatsScope stats;
         EXPECT_EQ(off, run());
-        EXPECT_EQ(1, SkipStats::wholeTopKCountBuilds);
+        EXPECT_EQ(deleted ? 1 : 0, SkipStats::wholeTopKCountBuilds);
       }
       {
         SkipStatsScope stats;
         EXPECT_EQ(off, run());
-        EXPECT_EQ(1, SkipStats::wholeTopKCountHits);
+        EXPECT_EQ(deleted ? 1 : 0, SkipStats::wholeTopKCountHits);
+        EXPECT_EQ(deleted ? 0 : 1, SkipStats::canonicalCountFactsRead);
         EXPECT_EQ(0, SkipStats::joinChildSuppliers);
       }
     }
@@ -1027,6 +1028,10 @@ TEST_F(JoinCacheTest, countFloorsDoNotConstructAChildLiveView) {
   for (Query* query : std::array<Query*, 3>{&red, &both, &all}) {
     auto* weight = query->createWeight(context, 0);
     EXPECT_EQ(0, weight->countShortcut(segment, &domain).minimum());
+    EXPECT_EQ(initial, segment.liveCountBounds());
+    auto* use = context.getFilterUse(*query, FilterCache::AdmissionLane::WHOLE);
+    QueryPrep::WholeMembershipPlan plan(*weight, use, context.filterUses);
+    EXPECT_FALSE(plan.canRecordCount(segment, &domain));
     EXPECT_EQ(initial, segment.liveCountBounds());
   }
 }

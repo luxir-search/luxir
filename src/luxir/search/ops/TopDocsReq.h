@@ -2011,9 +2011,13 @@ public:
           auto* fieldCollector = data->template fields<Collapsed, Admission>();
           using ActiveFieldCollector = FieldCollector<Collapsed, Admission>;
 
+          bool recordCount = !Collapsed && !data->useFieldSort
+              && op.requirements.countLimit < 0 && op.filterWeights.empty()
+              && !requiresWholeIndexPrepare && op.wholeMembershipPlan.canRecordCount(seg, domain);
+
           // A segment ranking never pruned has its exact count already. Track
           // pruning per segment, restoring the collector's own flag afterward.
-          int64_t hitsBeforeSegment = 0;
+          int64_t hitsBeforeSegment = recordCount ? scoreCollector->totalHits() : 0;
           bool prunedBeforeSegment = false;
           DocSet* estimateFilter = nullptr;
           bool estimatorReady = false;
@@ -2786,6 +2790,9 @@ public:
               }
             }
           }
+          if (recordCount) {
+            op.wholeMembershipPlan.recordCount(seg, scoreCollector->totalHits() - hitsBeforeSegment);
+          }
           if constexpr (!Collapsed) {
             if (op.estimateCount) {
               int64_t seen = scoreCollector->totalHits() - hitsBeforeSegment;
@@ -2913,7 +2920,9 @@ public:
     auto wholeConsumer = this->sortPlan.useFieldSort
         ? QueryPrep::WholeMembershipConsumer::FIELD_SORT
         : requirements.needRankedDocs
-              ? QueryPrep::WholeMembershipConsumer::TOP_K_COUNT
+              ? wholeConstantRanking || requirements.countLimit >= 0
+                    ? QueryPrep::WholeMembershipConsumer::TOP_K_MEMBERSHIP
+                    : QueryPrep::WholeMembershipConsumer::TOP_K_COUNT
               : QueryPrep::WholeMembershipConsumer::COUNT;
     if (wholeMembershipWeight != nullptr) {
       wholeMembershipPlan = QueryPrep::WholeMembershipPlan(

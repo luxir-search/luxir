@@ -447,6 +447,9 @@ public:
     // One recency epoch for every hit this Use accepts.
     uint64_t epoch;
 
+    // This Use's remembered raw count while its segment slot identity holds.
+    std::atomic<int32_t>* cardinalityFact(size_t segmentOrd) const;
+
     Use(FilterCache* cache, FilterKey key, FilterKeyScope scope,
         std::shared_ptr<FilterEntry> entry,
         std::vector<std::shared_ptr<SegmentSlot>> slotsByOrd,
@@ -478,6 +481,11 @@ public:
     ~Use();
     void observe() { observed = true; }
     Work work(size_t segmentOrd) const;
+    // Complete canonical raw counts use existing metadata without serving or funding membership.
+    std::optional<int32_t> cardinality(size_t segmentOrd) const;
+    bool recordCardinality(size_t segmentOrd, int32_t count);
+    // Whether this use has metadata that can remember a count for the segment.
+    bool tracksCardinality(size_t segmentOrd) const { return cardinalityFact(segmentOrd) != nullptr; }
 
     // Look only pins existing membership. Acceptance has the same hit and
     // request-local deduplication effects as probe(), including late hits.

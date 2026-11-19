@@ -2302,7 +2302,8 @@ TEST_F(SearchEngineTest, fuzzyWholeCountSeparatesCoreGenerations) {
   // disjunction's count is a constant df there and never touches the cache.
   EXPECT_EQ(1, newBypass.bypasses);
   EXPECT_EQ(1, newBuild.builds);
-  EXPECT_EQ(1, newHit.hits);
+  EXPECT_EQ(0, newHit.hits);
+  EXPECT_EQ(1, newHit.cardinalityCounts);
   EXPECT_EQ(1, newBypass.constants);
   EXPECT_EQ(1, newBuild.constants);
   EXPECT_EQ(1, newHit.constants);
@@ -2359,7 +2360,7 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
   EXPECT_EQ(0, fallback.fallbackSuppliers);
   EXPECT_EQ(1, fallback.cardinalityCounts);
   EXPECT_EQ(0, fallback.builds + fallback.hits);
-  EXPECT_EQ(thrashSkips + 1, cache->counters().populationDeferred);
+  EXPECT_EQ(thrashSkips, cache->counters().populationDeferred);
 }
 
 TEST_F(SearchEngineTest, wholeTopKCountFamiliesMatchCacheOffAtAllDepths) {
@@ -2730,7 +2731,7 @@ TEST_F(SearchEngineTest, priorCardinalityKeepsCountsAndScoreBitsAtEveryRankingDe
     EXPECT_EQ(before.builds, after.builds);
     EXPECT_EQ(before.hits, after.hits);
     EXPECT_EQ(before.assumedCredits, after.assumedCredits);
-    EXPECT_EQ(before.assumedCharges + 1, after.assumedCharges);
+    EXPECT_EQ(before.assumedCharges + (constant && depth > 0 ? 1 : 0), after.assumedCharges);
     EXPECT_EQ(before.outstandingDebtNanos, after.outstandingDebtNanos);
     EXPECT_EQ(0u, after.residentBytes);
   }
@@ -2782,9 +2783,9 @@ TEST_F(SearchEngineTest, localWholeMembershipCombinesHitsBypassAndAnEmptySegment
       WholeTopKFamily::INTERSECTION, "mixseg", 10);
   expectSameWholeTopK(off, mixed);
   EXPECT_EQ(191, mixed.found);
-  EXPECT_EQ(2, mixed.hits);
-  EXPECT_EQ(2, mixed.bypasses);
-  EXPECT_EQ(1, mixed.cardinalityCounts);
+  EXPECT_EQ(0, mixed.hits);
+  EXPECT_EQ(4, mixed.bypasses);
+  EXPECT_EQ(3, mixed.cardinalityCounts);
   EXPECT_EQ(1, mixed.localCounts);
   EXPECT_EQ(0, mixed.builds + mixed.fallbackSuppliers);
 }
@@ -2835,7 +2836,7 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
   EXPECT_EQ(1, fallback.cardinalityCounts);
   EXPECT_EQ(0, fallback.fallbackSuppliers);
   EXPECT_EQ(0, fallback.builds + fallback.hits);
-  EXPECT_EQ(thrashSkips + 1, cache->counters().populationDeferred);
+  EXPECT_EQ(thrashSkips, cache->counters().populationDeferred);
 }
 
 TEST_F(SearchEngineTest,
@@ -7992,10 +7993,12 @@ TEST_F(SearchEngineTest, forcedCompositionYieldsToWholeMembershipOutcomes) {
   auto first = run();
   EXPECT_EQ(1, first.bypasses);
   EXPECT_GT(first.compositions, 0);
-  auto build = run();
-  EXPECT_EQ(1, build.builds);
-  EXPECT_EQ(0, build.compositions);
-  ASSERT_GT(cache->counters().residentBytes, 0u);
+  auto built = run();
+  EXPECT_EQ(1, built.builds);
+  EXPECT_EQ(0, built.localCounts + built.compositions);
+  expectSameWholeTopK(first, built);
+  EXPECT_GT(cache->counters().residentBytes, 0u);
+  EXPECT_EQ(1, run().hits);
   cache->resize(1);
   ASSERT_EQ(0u, cache->counters().residentBytes);
   auto remembered = run();
@@ -8005,9 +8008,14 @@ TEST_F(SearchEngineTest, forcedCompositionYieldsToWholeMembershipOutcomes) {
   EXPECT_EQ(1, remembered.cardinalityCounts);
   EXPECT_EQ(0, remembered.compositions);
   cache->resize(1024 * 1024);
-  EXPECT_EQ(1, run().builds);
+  {
+    SearchOverridesGuard facts(QueryPrep::disableCanonicalCountFactsForTests);
+    QueryPrep::disableCanonicalCountFactsForTests = true;
+    EXPECT_EQ(1, run().builds);
+  }
   auto hit = run();
   EXPECT_EQ(1, hit.hits);
+  EXPECT_EQ(0, hit.cardinalityCounts);
   EXPECT_EQ(0, hit.compositions);
   expectSameWholeTopK(first, hit);
   ASSERT_TRUE(helper.deleteById("1", UpdateMessage::COMMIT).success);
@@ -8119,4 +8127,223 @@ TEST_F(SearchEngineTest, provedDensitySelectsSegmentsBeforeConstructingCompanion
   refused->execute(reader, false); EXPECT_OK(refused);
   EXPECT_EQ(2, SkipStats::provedDensityCompositionCertificateRejects);
   EXPECT_EQ(0, SkipStats::exactCountTopKCountSuppliers);
+}
+
+TEST_F(SearchEngineTest, countBuildServesFieldSortAndEvictionKeepsTheCount) {
+  for (bool topKFirst : {false, true}) {
+    SCOPED_TRACE(topKFirst);
+    std::string collection = topKFirst ? "topk_count_sort_fact" : "count_sort_fact";
+    CollectionHelper helper(collection);
+    auto cache = std::make_shared<FilterCache>(FilterCacheConfig{.minSegmentDocs = 0, .maxMetadataBytes = 64 * 1024});
+    helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+    std::vector<Doc> docs;
+    for (int doc = 0; doc < 128; doc++) {
+      docs.push_back(flatdoc("id", std::to_string(doc), "sort_i", (int64_t)(127 - doc),
+          "body_w", doc % 2 ? "other" : "countsorta countsortb"));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    auto count = [&] {
+      return runWholeCount(helper.getSearchEngine(), collection, [](auto& mr) {
+        return qb::boolean(mr, {qb::match(mr, "body_w", "countsorta"),
+                               qb::match(mr, "body_w", "countsortb")});
+      });
+    };
+    WholeFieldSortRun off;
+    {
+      WholeMembershipPlanGuard disable(true);
+      off = runWholeFieldSort(helper.getSearchEngine(), collection,
+          "countsort", "sort_i", qb::ASC);
+    }
+    EXPECT_EQ(1, count().bypasses);
+    if (topKFirst) {
+      auto built = runWholeTopK(helper.getSearchEngine(), collection,
+          WholeTopKFamily::INTERSECTION, "countsort", 10);
+      EXPECT_EQ(1, built.builds);
+      EXPECT_EQ(0, built.localCounts);
+    } else {
+      EXPECT_EQ(1, count().builds);
+    }
+    auto resident = count();
+    EXPECT_EQ(64, resident.found);
+    EXPECT_EQ(1, resident.hits);
+    EXPECT_EQ(1, resident.weightSkips);
+    EXPECT_EQ(1, resident.contextsOmitted);
+    auto sorted = runWholeFieldSort(helper.getSearchEngine(), collection,
+        "countsort", "sort_i", qb::ASC);
+    expectSameWholeFieldSort(off, sorted);
+    EXPECT_EQ(1, sorted.hits);
+    EXPECT_EQ(1, sorted.weightSkips);
+    EXPECT_EQ(0, sorted.builds);
+    evictFilterValues(*cache);
+    auto before = cache->counters();
+    auto remembered = count();
+    EXPECT_EQ(64, remembered.found);
+    EXPECT_EQ(1, remembered.cardinalityCounts);
+    EXPECT_EQ(0, remembered.fallbackSuppliers + remembered.builds + remembered.hits);
+    auto after = cache->counters();
+    EXPECT_EQ(before.buildAttempts, after.buildAttempts);
+    EXPECT_EQ(before.assumedCharges, after.assumedCharges);
+    EXPECT_EQ(before.assumedCredits, after.assumedCredits);
+    EXPECT_EQ(before.hits, after.hits);
+  }
+}
+
+TEST_F(SearchEngineTest, trackedCountFirstLearnsWithoutMembership) {
+  CollectionHelper helper("scalar_counts");
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{.minSegmentDocs = 0});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  std::vector<Doc> docs;
+  for (int doc = 0; doc < 96; doc++) {
+    std::string body = "pad";
+    if (doc % 2 == 0) body += " alpha";
+    if (doc % 3 == 0) body += " beta";
+    docs.push_back(flatdoc("id", std::to_string(doc), "body_w", body));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  SearchOverridesGuard switches(QueryPrep::disableCanonicalCountFactsForTests,
+      QueryPrep::trackedCountFirstForTests);
+  QueryPrep::trackedCountFirstForTests = true;
+  auto run = [&](int limit, bool facts, int recorded, int read, int counted = 0) {
+    QueryPrep::disableCanonicalCountFactsForTests = !facts;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("scalar_counts");
+    req->topDocs("q").exprQuery("body_w:(+alpha +beta)").countLimit().getScores()
+        .fields({"id"}).limit(limit);
+    SkipStatsGuard stats;
+    req->execute(false); EXPECT_OK(req);
+    EXPECT_EQ(16, req->getMatchCount("q"));
+    EXPECT_EQ(recorded, SkipStats::canonicalCountFactsRecorded);
+    EXPECT_EQ(read, SkipStats::canonicalCountFactsRead);
+    EXPECT_EQ(counted, SkipStats::wholeTopKCountLocalCounts);
+    if (read) {
+      EXPECT_EQ(0, SkipStats::wholeCountFallbackSuppliers + SkipStats::wholeTopKCountFallbackSuppliers);
+      EXPECT_EQ(0, SkipStats::wholeCountHits + SkipStats::wholeTopKCountHits);
+    }
+    return std::pair{resultIds(*req, "q"), resultScoreMap(*req, "q")};
+  };
+  for (int64_t countLimit : {0, 8}) {
+    auto req = localReq(helper.getSearchEngine()); req->collection("scalar_counts");
+    req->topDocs("q").exprQuery("body_w:(+alpha +beta)")
+        .countLimit(countLimit).getScores().limit(10);
+    SkipStatsGuard stats;
+    req->execute(false); EXPECT_OK(req);
+    EXPECT_EQ(0, SkipStats::canonicalCountFactsRecorded + SkipStats::canonicalCountFactsRead);
+  }
+  auto first = run(10, true, 0, 0);
+  // The tracked request counts apart from ranking and keeps no set.
+  auto counted = run(10, true, 1, 0, 1);
+  EXPECT_EQ(first.first, counted.first);
+  expectBitIdenticalScoreMap(first.second, counted.second);
+  auto known = run(10, true, 0, 1);
+  EXPECT_EQ(first.first, known.first);
+  expectBitIdenticalScoreMap(first.second, known.second);
+  run(0, true, 0, 1);
+  EXPECT_EQ(0u, cache->counters().buildAttempts);
+  EXPECT_EQ(0u, cache->counters().assumedCharges);
+  EXPECT_EQ(0u, cache->counters().assumedCredits);
+  EXPECT_EQ(0u, cache->bytesUsed());
+  // A membership demand for the same key still buys its set.
+  QueryPrep::disableCanonicalCountFactsForTests = true;
+  run(10, false, 0, 0);
+  EXPECT_EQ(1u, cache->counters().buildAttempts);
+  auto before = cache->counters();
+  auto resident = run(10, true, 0, 0);
+  expectBitIdenticalScoreMap(first.second, resident.second);
+  auto after = cache->counters();
+  EXPECT_EQ(before.buildAttempts, after.buildAttempts);
+  EXPECT_EQ(before.hits + 1, after.hits);
+  EXPECT_EQ(before.assumedCredits + 1, after.assumedCredits);
+}
+
+TEST_F(SearchEngineTest, composedCountsRecordFactsPerCanonicalSegment) {
+  CollectionHelper helper("composed_scalar_facts");
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{.minSegmentDocs = 0, .admissionThreshold = 1});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  for (int seg = 0; seg < 3; seg++) {
+    std::vector<Doc> docs;
+    for (int doc = 0; doc < 96; doc++) {
+      std::string body = "pad";
+      if (doc % 2 == 0) body += " alpha";
+      if (doc % 3 == 0) body += " beta";
+      docs.push_back(flatdoc("id", std::to_string(seg) + "_" + std::to_string(doc), "body_w", body));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteById("2_0", UpdateMessage::COMMIT).success);
+  SearchOverridesGuard forced(TopDocsReq::forceExactCountTopKCompositionForTests);
+  TopDocsReq::forceExactCountTopKCompositionForTests = true;
+  auto run = [&](int records, int reads, int compositions) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("composed_scalar_facts");
+    req->topDocs("q").exprQuery("body_w:(+alpha +beta)").countLimit().getScores().fields({"id"}).limit(10);
+    SkipStatsGuard stats;
+    req->execute(false); EXPECT_OK(req);
+    EXPECT_EQ(47, req->getMatchCount("q"));
+    EXPECT_EQ(records, SkipStats::canonicalCountFactsRecorded);
+    EXPECT_EQ(reads, SkipStats::canonicalCountFactsRead);
+    EXPECT_EQ(compositions, SkipStats::forcedExactCountTopKCompositions);
+    return std::pair{resultIds(*req, "q"), resultScoreMap(*req, "q")};
+  };
+  cache->resize(0);
+  auto off = run(0, 0, 3);
+  cache->resize(1024 * 1024);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  MemPool claimPool;
+  TermQuery alpha("body_w", "alpha"), beta("body_w", "beta");
+  std::array<Query*, 2> required{&alpha, &beta};
+  BooleanQuery query(required, {}, {}, {});
+  Query::Context claimContext(claimPool, *reader, {}, nullptr,
+      FilterKeyContext{.schemaGen = helper.collection().getSchema()->gen_, .timeZone = {}});
+  auto* use = claimContext.getFilterUse(query, FilterCache::AdmissionLane::WHOLE);
+  std::vector<FilterCache::Probe> claims;
+  for (size_t ord : {0u, 1u}) {
+    claims.push_back(use->probe(ord));
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, claims.back().kind());
+  }
+  auto first = run(2, 0, 2);
+  auto known = run(0, 2, 0);
+  EXPECT_EQ(off.first, first.first);
+  EXPECT_EQ(off.first, known.first);
+  expectBitIdenticalScoreMap(off.second, first.second);
+  expectBitIdenticalScoreMap(off.second, known.second);
+  EXPECT_EQ(3u, cache->counters().buildAttempts);
+  EXPECT_EQ(1u, cache->counters().builds);
+}
+
+TEST_F(SearchEngineTest, scalarFactsKeepTheExistingKnownCountRankingFormation) {
+  CollectionHelper helper("scalar_rank_formation");
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{.maxEntryBytes = 1024 * 1024, .minSegmentDocs = 0, .maxMetadataBytes = 64 * 1024});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  std::vector<Doc> docs;
+  for (int doc = 0; doc < 96; doc++) {
+    std::string body = "pad";
+    if (doc % 2 == 0) body += " alpha";
+    if (doc % 3 == 0) body += " beta beta";
+    docs.push_back(flatdoc("id", std::to_string(doc), "body_w", body));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  SearchOverridesGuard switches(QueryPrep::disableCanonicalCountFactsForTests,
+      TopDocsReq::forceExactCountTopKCompositionForTests);
+  TopDocsReq::forceExactCountTopKCompositionForTests = true;
+  auto run = [&](bool facts, int refused, int reads) {
+    QueryPrep::disableCanonicalCountFactsForTests = !facts;
+    auto req = localReq(helper.getSearchEngine()); req->collection("scalar_rank_formation");
+    req->topDocs("q").exprQuery("body_w:(+(alpha beta) pad)")
+        .countLimit().getScores().fields({"id"}).limit(10);
+    SkipStatsGuard stats;
+    req->execute(false); EXPECT_OK(req);
+    EXPECT_EQ(64, req->getMatchCount("q"));
+    EXPECT_EQ(refused, SkipStats::forcedExactCountTopKCertificateRejects);
+    EXPECT_EQ(reads, SkipStats::canonicalCountFactsRead);
+    return std::pair{resultIds(*req, "q"), resultScoreMap(*req, "q")};
+  };
+  run(false, 1, 0);
+  run(false, 0, 0);
+  EXPECT_EQ(1u, cache->counters().builds);
+  cache->resize(1);
+  auto oldKnown = run(false, 0, 0);
+  auto fact = run(true, 0, 1);
+  EXPECT_EQ(oldKnown.first, fact.first);
+  expectBitIdenticalScoreMap(oldKnown.second, fact.second);
+  EXPECT_EQ(1u, cache->counters().builds);
 }

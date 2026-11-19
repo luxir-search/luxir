@@ -5016,7 +5016,8 @@ TEST(FilterCacheTest,
   auto* retryUse = retryContext.getFilterUse(
       dependentQuery, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan retryPlan(
-      *retryWeight, retryUse, retryContext.filterUses);
+      *retryWeight, retryUse, retryContext.filterUses,
+      PreparedDomainDependence::QUERY_CANONICAL, QueryPrep::WholeMembershipConsumer::FIELD_SORT);
   auto retry = test::resolveWholeMembershipForTests(retryPlan, *reader, segment, nullptr);
   ASSERT_TRUE(retry.available);
   EXPECT_EQ(1, retry.count);
@@ -5142,8 +5143,12 @@ TEST(FilterCacheTest, priorCardinalityAnswersCountsWithoutMembershipOrSuppliers)
     EXPECT_EQ(nullptr, result.docs.get());
     EXPECT_EQ(nullptr, use->rawDocSet(0));
     auto restricted = docs(segment.maxDoc(), {1, 2});
+    EXPECT_TRUE(plan.canRecordCount(segment, nullptr));
+    EXPECT_FALSE(plan.canRecordCount(segment, restricted.get()));
     EXPECT_FALSE(plan.resolve(*reader, segment, restricted.get(), nullptr, supplierFor).available);
-    test::SearchOverridesGuard guard(QueryPrep::disableWholeMembershipBypassReuseForTests);
+    test::SearchOverridesGuard guard(QueryPrep::disableWholeMembershipBypassReuseForTests,
+        QueryPrep::disableCanonicalCountFactsForTests);
+    QueryPrep::disableCanonicalCountFactsForTests = true;
     QueryPrep::disableWholeMembershipBypassReuseForTests = true;
     EXPECT_FALSE(plan.resolve(*reader, segment, nullptr, nullptr, supplierFor).available);
   }
@@ -5155,6 +5160,7 @@ TEST(FilterCacheTest, priorCardinalityAnswersCountsWithoutMembershipOrSuppliers)
   Query::Weight::PrepareContext prepareContext{*reader, {}, nullptr, nullptr};
   auto prepared = preparedWeight->prepare(prepareContext);
   QueryPrep::WholeMembershipPlan preparedPlan(*preparedWeight, use, context.filterUses);
+  EXPECT_FALSE(preparedPlan.canRecordCount(segment, nullptr));
   EXPECT_FALSE(preparedPlan.resolve(*reader, segment, nullptr, prepared.get(), supplierFor).available);
   EXPECT_EQ(0, suppliers);
   EXPECT_EQ(2, SkipStats::wholeMembershipCardinalityCounts);
@@ -7912,7 +7918,8 @@ TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
   EXPECT_EQ(3, plain);
   EXPECT_EQ(1u, cache->entryCountForTest());
   EXPECT_EQ(afterPlain.builds, afterBoosted.builds);
-  EXPECT_GT(afterBoosted.hits, afterPlain.hits);
+  EXPECT_EQ(afterBoosted.hits, afterPlain.hits);
+  EXPECT_EQ(1u, afterPlain.builds);
 }
 
 TEST(FilterCacheIntegrationTest, cacheFirstKnnCountOmitsWeightAndPrepare) {
@@ -9506,4 +9513,52 @@ TEST(FilterCacheTest, readerRefresh) {
     EXPECT_GT(trace.cache.counters().readerStableRefreshes, 0u);
     trace.report("reader-refresh", convergence);
   }
+}
+
+TEST(FilterCacheTest, scalarFactsUseOnlyTrackedSlotMetadata) {
+  FilterCache cache(testConfig());
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("scalar-fact");
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(key);
+    auto before = cache.counters();
+    EXPECT_FALSE(use->recordCardinality(0, 7));
+    EXPECT_FALSE(use->cardinality(0));
+    EXPECT_EQ(before, cache.counters());
+    EXPECT_EQ(0u, cache.entryCountForTest());
+  }
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(key);
+  auto before = cache.counters();
+  EXPECT_TRUE(use->recordCardinality(0, 7));
+  EXPECT_FALSE(use->recordCardinality(0, 7));
+  EXPECT_FALSE(use->recordCardinality(0, -1));
+  EXPECT_FALSE(use->recordCardinality(1, 0));
+  EXPECT_EQ(7, use->cardinality(0));
+  EXPECT_EQ(before, cache.counters());
+  const auto& ledger = ledgerFor(cache, key);
+  EXPECT_EQ(0, ledger.owed);
+  EXPECT_EQ(0, ledger.debt);
+  EXPECT_EQ(0, ledger.productionNanos);
+  EXPECT_EQ(0u, ledger.referenceBytes);
+  {
+    auto ordinary = use->probe(0, FilterCache::Work::pending());
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, ordinary.kind());
+    EXPECT_FALSE(use->recordCardinality(0, 7));
+  }
+  request.addSegmentNanos(0, 1000);
+  request.settle(true);
+  EXPECT_EQ(1u, ledgerFor(cache, key).absentCount);
+  EXPECT_EQ(1000, ledgerFor(cache, key).owed);
+  auto claim = use->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, claim.kind());
+  use->publishRaw(0, claim, docs(100, {0, 1, 2, 3, 4, 5, 6}), 1000);
+  evictValues(cache);
+  EXPECT_EQ(7, use->cardinality(0));
+  std::array replacement{FilterCache::SegmentIdentity{2, 100}};
+  ASSERT_TRUE(cache.onReaderPublished(2, replacement));
+  EXPECT_FALSE(use->cardinality(0));
+  EXPECT_FALSE(use->recordCardinality(0, 7));
 }

@@ -190,10 +190,15 @@ TEST_F(RowOperationsTest, namesDoNotChangeMembershipCacheOrPlanning) {
     auto request = std::string(R"JSON({"ops":{"q":{"top_docs":{"limit":0,"count_limit":-1,"query":{)JSON")
         + (pass == 2 ? R"JSON("name":"same",)JSON" : "")
         + R"JSON("match":{"field":"items.color","val":"red"}}}}}})JSON";
+    SkipStatsScope stats;
     auto hits = cache->counters().hits;
     auto result = run(request);
     EXPECT_EQ(2, result["ops"]["q"]["found"].get<int64_t>());
-    if (pass == 2) { EXPECT_GT(cache->counters().hits, hits); }
+    if (pass == 2) {
+      EXPECT_EQ(cache->counters().hits, hits);
+      EXPECT_EQ((int64_t)helper.getIndexWriter()->snapshots.readers.getReader()->segments().size(),
+          SkipStats::canonicalCountFactsRead);
+    }
   }
 }
 

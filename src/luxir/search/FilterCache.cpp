@@ -493,6 +493,31 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::lookSegmentValue(
   return slot->value.load(std::memory_order_acquire);
 }
 
+std::atomic<int32_t>* FilterCache::Use::cardinalityFact(size_t segmentOrd) const {
+  if (cache == nullptr || !cache->enabled() || scope_ == FilterKeyScope::READER_STABLE
+      || segmentOrd >= slotsByOrd.size()) return nullptr;
+  const auto& slot = slotsByOrd[segmentOrd];
+  const auto& identity = readerSegments[segmentOrd];
+  if (slot == nullptr || !slot->active.load(std::memory_order_acquire)
+      || slot->segId != identity.segId || slot->maxDoc != identity.maxDoc
+      || slot->space != identity.space) return nullptr;
+  return &slot->ledger.rawCardinality;
+}
+
+std::optional<int32_t> FilterCache::Use::cardinality(size_t segmentOrd) const {
+  auto* fact = cardinalityFact(segmentOrd);
+  int32_t count = fact ? fact->load(std::memory_order_relaxed) : -1;
+  return count < 0 ? std::nullopt : std::optional<int32_t>(count);
+}
+
+bool FilterCache::Use::recordCardinality(size_t segmentOrd, int32_t count) {
+  auto* fact = cardinalityFact(segmentOrd);
+  if (fact == nullptr || count < 0 || count > readerSegments[segmentOrd].maxDoc
+      || fact->load(std::memory_order_relaxed) >= 0) return false;
+  int32_t unknown = -1;
+  return fact->compare_exchange_strong(unknown, count, std::memory_order_relaxed);
+}
+
 std::optional<FilterCache::SegmentCandidate> FilterCache::Use::look(size_t segmentOrd) {
   if (scope_ == FilterKeyScope::READER_STABLE || segmentOrd >= requestSlotCount) {
     return std::nullopt;

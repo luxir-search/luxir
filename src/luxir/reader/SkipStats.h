@@ -346,6 +346,8 @@ struct SkipStats {
   static inline int64_t wholeTopKCountLocalCounts = 0;
   static inline int64_t forcedExactCountTopKCompositions = 0;
   static inline int64_t provedDensityCompositions = 0;
+  static inline int64_t canonicalCountFactsRecorded = 0;
+  static inline int64_t canonicalCountFactsRead = 0;
   static inline int64_t provedDensityCompositionCertificateRejects = 0;
   static inline int64_t exactCountTopKCountSuppliers = 0;
   static inline int64_t forcedExactCountTopKCertificateRejects = 0;
@@ -674,6 +676,8 @@ struct SkipStats {
     wholeTopKCountLocalCounts = 0;
     forcedExactCountTopKCompositions = 0;
     provedDensityCompositions = 0;
+    canonicalCountFactsRecorded = 0;
+    canonicalCountFactsRead = 0;
     provedDensityCompositionCertificateRejects = 0;
     exactCountTopKCountSuppliers = 0;
     forcedExactCountTopKCertificateRejects = 0;

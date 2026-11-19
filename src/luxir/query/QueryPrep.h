@@ -21,6 +21,8 @@ namespace luxir::QueryPrep {
 inline bool disableDirectPostingsMaterializationForTests = false;
 inline bool disableWholeMembershipPlanForTests = false;
 inline bool disableWholeMembershipBypassReuseForTests = false;
+inline bool disableCanonicalCountFactsForTests = false;
+inline bool trackedCountFirstForTests = false;
 inline bool disableProhibitedCacheForTests = false;
 inline bool disableProhibitedDomainFoldForTests = false;
 // A/B toggle: restore request-local sparse batch materialization on cache
@@ -930,6 +932,7 @@ struct WholeMembershipResult {
 enum class WholeMembershipConsumer : uint8_t {
   COUNT,
   TOP_K_COUNT,
+  TOP_K_MEMBERSHIP,
   FIELD_SORT,
 };
 
@@ -974,6 +977,7 @@ class WholeMembershipPlan {
         skipCount(countCounter);
         break;
       case WholeMembershipConsumer::TOP_K_COUNT:
+      case WholeMembershipConsumer::TOP_K_MEMBERSHIP:
         skipCount(topKCountCounter);
         break;
       case WholeMembershipConsumer::FIELD_SORT:
@@ -1015,8 +1019,24 @@ public:
   bool empty() const { return source == Source::EMPTY; }
   bool hasCacheUse() const { return cacheUse != nullptr; }
   bool isTopKCount() const {
-    return consumer == WholeMembershipConsumer::TOP_K_COUNT;
+    return consumer == WholeMembershipConsumer::TOP_K_COUNT
+        || consumer == WholeMembershipConsumer::TOP_K_MEMBERSHIP;
   }
+  bool canRecordCount(IndexReader::Segment& segment, DocSet* domain) const {
+    return !disableCanonicalCountFactsForTests && cacheUse != nullptr
+        && !isFieldSort() && weight != nullptr && !weight->needsPrepare()
+        && !weight->consumesDomain()
+        && domainDependence == PreparedDomainDependence::QUERY_CANONICAL
+        && Query::isCanonicalCountDomain(segment, domain) && !segment.hasDeletes();
+  }
+
+  void recordCount(IndexReader::Segment& segment, int64_t count) const {
+    if (count >= 0 && count <= segment.maxDoc()
+        && cacheUse->recordCardinality((size_t)segment.ord, (int32_t)count)) {
+      skipCount(SkipStats::canonicalCountFactsRecorded);
+    }
+  }
+
   bool isFieldSort() const {
     return consumer == WholeMembershipConsumer::FIELD_SORT;
   }
@@ -1126,7 +1146,17 @@ public:
       return {};
     }
     if (cacheUse == nullptr) return {};
-    auto probe = cacheUse->probe((size_t) segment.ord);
+    bool canonical = !weight->needsPrepare() && !weight->consumesDomain()
+        && domainDependence == PreparedDomainDependence::QUERY_CANONICAL
+        && Query::isCanonicalCountDomain(segment, incomingDomain);
+    bool scalar = !disableCanonicalCountFactsForTests && canonical && !segment.hasDeletes()
+        && (consumer == WholeMembershipConsumer::COUNT
+            || consumer == WholeMembershipConsumer::TOP_K_COUNT);
+    auto cardinality = scalar ? cacheUse->cardinality((size_t)segment.ord) : std::nullopt;
+    // Known counts need no membership; count-first learning is opt-in.
+    bool inert = scalar && (cardinality || (trackedCountFirstForTests
+        && consumer == WholeMembershipConsumer::TOP_K_COUNT));
+    auto probe = inert ? FilterCache::Probe{} : cacheUse->probe((size_t)segment.ord);
     if (probe.kind() == FilterCache::Probe::Kind::HIT) {
       DomainHandle docs = cacheUse->effectiveDomain(
           (size_t) segment.ord, reader, incomingDomain).pinnedWith(lifetime);
@@ -1136,11 +1166,9 @@ public:
       int64_t card = docs.get()->card();
       return {true, std::move(docs), card};
     }
-    auto cardinality = probe.priorCardinality();
-    bool canonical = !weight->needsPrepare() && !weight->consumesDomain()
-        && domainDependence == PreparedDomainDependence::QUERY_CANONICAL
-        && (incomingDomain == nullptr || incomingDomain == segment.liveDocSet());
-    bool reuse = !disableWholeMembershipBypassReuseForTests && canonical && cardinality;
+    if (!inert) cardinality = probe.priorCardinality();
+    bool reuse = canonical && cardinality
+        && (scalar || !disableWholeMembershipBypassReuseForTests);
     bool build = probe.kind() == FilterCache::Probe::Kind::BUILD;
     if (!build) {
       record(SkipStats::wholeCountBypasses,
@@ -1148,6 +1176,7 @@ public:
              SkipStats::wholeFieldSortBypasses);
       if (reuse && !isFieldSort() && !segment.hasDeletes()) {
         skipCount(SkipStats::wholeMembershipCardinalityCounts);
+        if (scalar) skipCount(SkipStats::canonicalCountFactsRead);
         return {true, {}, *cardinality};
       }
     }
@@ -1155,12 +1184,16 @@ public:
             *cardinality, segment.maxDoc(), localDensityInverse)
         && localMaxCandidatesPerMatch > 0
         && (int64_t)*cardinality * localMaxCandidatesPerMatch >= shortcut.maxMatches;
-    if (!build && local && !cacheZero) {
+    // Tracked count-first requests learn a scalar without producing a set.
+    bool learn = inert && !cardinality
+        && cacheUse->tracksCardinality((size_t)segment.ord);
+    if (!build && (local || learn) && !cacheZero) {
       auto guard = MemPool::threadLocalPoolGuard();
       auto* supplier = supplierFor(*weight);
       DocSet* domain = incomingDomain ? incomingDomain : segment.liveDocSet();
       int64_t count = countSegment(guard.pool(), supplier, domain, segment.maxDoc());
       skipCount(SkipStats::wholeTopKCountLocalCounts);
+      if (learn) recordCount(segment, count);
       return {true, {}, count};
     }
     if (build) {
