@@ -19,7 +19,7 @@
 #include "SkinnyCounter.h"
 #include "luxir/search/SearchOverrides.h"
 #include "SpanCounter.h"
-#include "StrFacetPlanning.h"
+#include "FieldFacetPlanning.h"
 #include "StrFacetReplay.h"
 #include "luxir/util/SegmentMergeDriver.h"
 #include "luxir/util/log.h"
@@ -896,28 +896,32 @@ public:
         };
 
         DomainView domainView(domain, maxDoc);
-        auto countPlan = StrFacetCountPlan::select(
-            StrFacetCountInputs{
+        auto countPlan = FieldFacetCountPlan::select(
+            FieldFacetCountInputs{
                 .maxDoc = maxDoc,
                 .domainCardinality = domainView.card,
                 .complementCardinality = domainView.compCard,
                 .segmentTerms = segFieldInfo.nTerms,
                 .sumDocFreq = segFieldInfo.sumDocFreq,
                 .docsWithField = segFieldInfo.docsWithField,
-                .limit = thisOp().limit,
-                .topTermsAvailable = thisOp().ordMap == nullptr
-                    ? 0 : (int64_t)thisOp().ordMap->topTerms().entries.size(),
                 .domainHasBitset = domainView.bits != nullptr,
                 .missingRequested = thisOp().missing,
-                .allowTopTerms = allowTopTerms && thisOp().termFilter == nullptr,
-                .hasGlobalOrdMap = thisOp().ordMap != nullptr,
-                .readerHasNoDeletes =
-                    thisOp().reader.liveDocs() == thisOp().reader.maxDoc()
+                .topTermsLegal = allowTopTerms && thisOp().termFilter == nullptr && thisOp().ordMap
+                    && domainView.compCard == 0 && thisOp().reader.liveDocs() == thisOp().reader.maxDoc()
+                    && thisOp().limit >= 0
+                    && (int64_t)thisOp().ordMap->topTerms().entries.size() >= thisOp().limit,
+                // The all-docs column reads every stored ord, including multiple ords per doc.
+                .columnWork = (double)(domainView.compCard == 0 ? segFieldInfo.numValues : domainView.card),
+                // Forced string all-docs walk/column at one term per doc (2M): 7.6/10.2 ms.
+                .walkTermCost = 0.75,
+                .complementTermCost = 2.25, // DocFreq + local-to-global drain, forced partial-domain grid.
+                .complementValueWork = (double)domainView.compCard,
+                .complementSetupWork = domainView.bits ? 0.0 : (double)FixedBitSet::sizeInWords(maxDoc)
             },
-            forcedStrFacetStrategy);
-        StrFacetCountKind strategy = countPlan.strategy;
+            forcedFieldFacetStrategy);
+        FieldFacetCountKind strategy = countPlan.strategy;
 
-        if (strategy == StrFacetCountKind::TOP_TERMS) {
+        if (strategy == FieldFacetCountKind::TOP_TERMS) {
           if (thisOp().missing) {
             data.topTermsMissing +=
                 (int64_t)maxDoc - segFieldInfo.docsWithField;
@@ -961,7 +965,7 @@ public:
           // below (big-G cells, where vector's O(G) int64 accumulator costs
           // more than the whole complement walk - measured 2.2x at
           // 99%/1M-terms when the per-doc R=16 rule picked vector here).
-          bool postingsSide = strategy != StrFacetCountKind::COLUMN_DOMAIN;
+          bool postingsSide = strategy != FieldFacetCountKind::COLUMN_DOMAIN;
           int64_t adds = postingsSide
               ? std::min((int64_t)domainSize, globVals)
               : (int64_t)domainSize;
@@ -1006,11 +1010,11 @@ public:
           profile->details.emplace_back(
               "seg maxOrd=" + std::to_string(segFieldInfo.nTerms)
               + (mapping.bits == 0 ? " ords=identity" : " ords=remapped"));
-          if (strategy == StrFacetCountKind::COLUMN_DOMAIN) {
+          if (strategy == FieldFacetCountKind::COLUMN_DOMAIN) {
             profile->details.emplace_back("parent-count=column-domain");
             profile->details.emplace_back(domainDesc(
                 domain, segFieldInfo.ordIndexing == SegFieldInfo::ORD_DOCID));
-          } else if (strategy == StrFacetCountKind::COLUMN_COMPLEMENT) {
+          } else if (strategy == FieldFacetCountKind::COLUMN_COMPLEMENT) {
             profile->details.emplace_back("parent-count=column-complement");
             profile->details.emplace_back(domainView.compCard == 0
                 ? "all-docs domain, docFreq-only dictionary walk"
@@ -1052,7 +1056,7 @@ public:
           }
         };
 
-        if (strategy != StrFacetCountKind::COLUMN_DOMAIN) {
+        if (strategy != FieldFacetCountKind::COLUMN_DOMAIN) {
           TermsEnum terms(poolGuard.pool(), postingsReader, segFieldInfo);
           int64_t nTerms = segFieldInfo.nTerms;
 
@@ -1081,7 +1085,7 @@ public:
               data.missing_num +=
                   (int64_t)maxDoc - segFieldInfo.docsWithField;
             }
-          } else if (strategy == StrFacetCountKind::COLUMN_COMPLEMENT) {
+          } else if (strategy == FieldFacetCountKind::COLUMN_COMPLEMENT) {
             int64_t compMissing = 0;
             OrdColReader ordColReader(postingsReader, segFieldInfo);
             // Local staging is a SkinnyCounter, for skinny's reason: a u8

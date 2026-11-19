@@ -83,9 +83,9 @@ std::vector<std::byte> facetBytes(CollectionHelper& helper, std::string_view fie
   return encoded;
 }
 
-void setSchema(CollectionHelper& helper, FC type, MM multi) {
+void setSchema(CollectionHelper& helper, FC type, MM multi, IM matchMode = IM::MATCH) {
   SchemaBuilder schema;
-  for (auto [name, index] : {std::pair{"n", IM::NONE}, {"m", IM::MATCH}}) {
+  for (auto [name, index] : {std::pair{"n", IM::NONE}, {"m", matchMode}}) {
     auto& f = schema.field(name);
     f.type = type;
     f.index = index;
@@ -143,13 +143,13 @@ TEST_F(NumericTermsFacetTest, dictionaryStrategiesMatchColumnScan) {
           for (auto shape : {FacetShape{4, 0, true, true}, FacetShape{-1, 2, false, false}}) {
             SCOPED_TRACE(shape.limit);
             auto expected = facetBytes(helper, "n", domain, shape);
-            for (auto strategy : {StrFacetStrategy::AUTO, StrFacetStrategy::COLUMN_DOMAIN,
-                                  StrFacetStrategy::COLUMN_COMPLEMENT, StrFacetStrategy::TERM_DRIVEN}) {
+            for (auto strategy : {FieldFacetStrategy::AUTO, FieldFacetStrategy::COLUMN_DOMAIN,
+                                  FieldFacetStrategy::COLUMN_COMPLEMENT, FieldFacetStrategy::TERM_DRIVEN}) {
               for (auto source : {FacetBucketDomainSource::AUTO, FacetBucketDomainSource::POSTINGS}) {
                 SCOPED_TRACE((int)strategy);
                 SCOPED_TRACE((int)source);
-                SearchOverridesGuard guard(forcedStrFacetStrategy, forcedFacetBucketDomainSource);
-                forcedStrFacetStrategy = strategy;
+                SearchOverridesGuard guard(forcedFieldFacetStrategy, forcedFacetBucketDomainSource);
+                forcedFieldFacetStrategy = strategy;
                 forcedFacetBucketDomainSource = source;
                 EXPECT_EQ(expected, facetBytes(helper, "m", domain, shape));
               }
@@ -192,4 +192,75 @@ TEST_F(NumericTermsFacetTest, plannerWalksDictionaryForLowCardinality) {
   facetBytes(helper, "unique", Domain::ALL, shape, &unique);
   EXPECT_NE(std::string::npos, low.find("docFreq-only dictionary walk")) << low;
   EXPECT_NE(std::string::npos, unique.find("parent-count=column-domain")) << unique;
+}
+
+TEST_F(NumericTermsFacetTest, wideFilterWithFewWidelySpacedKeysUsesPostings) {
+  CollectionHelper helper;
+  setSchema(helper, FC::INT, MM::SINGLE);
+  std::vector<Doc> docs;
+  for (int i = 0; i < 4096; i++) {
+    int64_t value = (i % 2) * 86400000;
+    docs.push_back(flatdoc("id", std::to_string(i), "m", value, "n", value,
+                           "g", i % 10 < 7 ? "hi" : "lo"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  FacetShape shape{2, 0, false, false};
+  std::string details;
+  EXPECT_EQ(facetBytes(helper, "n", Domain::WIDE, shape),
+            facetBytes(helper, "m", Domain::WIDE, shape, &details));
+  EXPECT_NE(details.npos, details.find("parent-count=term-driven")) << details;
+}
+
+TEST_F(NumericTermsFacetTest, mixedSegmentDictionaries) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  for (auto mode : {IM::NONE, IM::MATCH}) {
+    setSchema(helper, FC::INT, MM::SINGLE, mode);
+    std::vector<Doc> docs;
+    for (int i = 0; i < 12; i++) {
+      int key = i % 3 + (mode == IM::MATCH);
+      docs.push_back(flatdoc("id", std::to_string(i + (mode == IM::MATCH ? 12 : 0)),
+                             "m", key, "n", key, "w", i));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_EQ(2u, helper.durableSegmentCount());
+  FacetShape shape{3, 0, true, true};
+  SearchOverridesGuard guard(forcedFieldFacetStrategy);
+  forcedFieldFacetStrategy = FieldFacetStrategy::COLUMN_COMPLEMENT;
+  auto expected = facetBytes(helper, "n", Domain::ALL, shape);
+  std::string details;
+  EXPECT_EQ(expected, facetBytes(helper, "m", Domain::ALL, shape, &details));
+  EXPECT_NE(details.npos, details.find("docFreq-only dictionary walk")) << details;
+  EXPECT_NE(details.npos, details.find("parent-count=column-domain")) << details;
+  EXPECT_NE(details.npos, details.find("bucket-domain-source=column")) << details;
+
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(helper.submit(merge).success);
+  ASSERT_EQ(1u, helper.durableSegmentCount());
+  details.clear();
+  EXPECT_EQ(expected, facetBytes(helper, "m", Domain::ALL, shape, &details));
+  EXPECT_NE(details.npos, details.find("parent-count=column-domain")) << details;
+}
+
+TEST_F(NumericTermsFacetTest, complementStagingUsesRequestBreaker) {
+  CollectionHelper helper;
+  setSchema(helper, FC::INT, MM::SINGLE);
+  std::vector<Doc> docs;
+  for (int i = 0; i < 4096; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i), "m", (int64_t)i * 100000,
+                           "g", i % 3 == 0 ? "lo" : "hi"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  SearchOverridesGuard guard(forcedFieldFacetStrategy, forcedRequestMemoryMaxBytes);
+  forcedFieldFacetStrategy = FieldFacetStrategy::COLUMN_COMPLEMENT;
+  forcedRequestMemoryMaxBytes = 4096;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").limit(0).countLimit()
+      .matchQuery("g", "hi").facet("f", "m").limit(1);
+  req->execute(false);
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("numeric facet complement staging"));
+  EXPECT_EQ(0u, req->memoryTracker.bytes());
 }
