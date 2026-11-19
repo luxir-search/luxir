@@ -20,8 +20,8 @@ class Schema;
 /// of every segment not open yet where a term-level query (match, any_of,
 /// phrase, prefix, fuzzy, wildcard, regex, multi_match, through boolean,
 /// boost, constant_score, rescore and dis_max) names a TEXT, STRING or ID
-/// field that may be present. An exact STRING or ID value skips the segments
-/// whose summary proves it absent, as the seek does.
+/// field that may be present. A match value skips the segments whose summary
+/// or term membership overlay proves it absent, as the seek does.
 ///
 /// Only a fetch depends on this, never a result: a read it misses blocks in
 /// parse as before, and one it adds costs bytes. Fields are taken by their
@@ -29,5 +29,10 @@ class Schema;
 /// and field defaults are not resolved here, so their seeks still block.
 void declareTermReads(const api::SearchRequest& request, const Schema& schema, IndexReader& reader,
                       ReadSet& reads);
+
+/// The term membership overlay ranges those lookups will consult. Fetched in
+/// a round of its own before declareTermReads, so that a segment an overlay
+/// proves cannot hold the value has no dictionary fetched at all.
+void declareTermProbes(const api::SearchRequest& request, const Schema& schema, IndexReader& reader, ReadSet& reads);
 
 }  // namespace luxir
