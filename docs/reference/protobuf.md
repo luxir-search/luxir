@@ -142,6 +142,7 @@ defaults and constraints are described in the comments and guides.
 - [`HostStats`](#message-luxir.hoststats)
 - [`IndexRamStats`](#message-luxir.indexramstats)
 - [`IndexStats`](#message-luxir.indexstats)
+- [`InflightRequestStats`](#message-luxir.inflightrequeststats)
 - [`JemallocStats`](#message-luxir.jemallocstats)
 - [`KnnQuery`](#message-luxir.knnquery)
 - [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf)
@@ -210,6 +211,7 @@ defaults and constraints are described in the comments and guides.
 - [`ToParentQuery`](#message-luxir.toparentquery)
 - [`TopDocs`](#message-luxir.topdocs)
 - [`TransportStats`](#message-luxir.transportstats)
+- [`UncleanExitStats`](#message-luxir.uncleanexitstats)
 - [`UpdateRequest`](#message-luxir.updaterequest)
 - [`UpdateResponse`](#message-luxir.updateresponse)
 - [`UpdateResponse.DocError`](#message-luxir.updateresponse.docerror)
@@ -1488,6 +1490,26 @@ Indexing RAM budget: the configured limit and the bytes reserved against it.
 | <a id="field-luxir.indexstats.commits"></a>[`commits`](#field-luxir.indexstats.commits) | 18 | `uint64` | singular | writer only: commits since the writer opened |
 | <a id="field-luxir.indexstats.retained_delete_bytes"></a>[`retained_delete_bytes`](#field-luxir.indexstats.retained_delete_bytes) | 19 | `uint64` | singular | Writer only: resident delete packets held by its pending set or merge catch-up, deduplicated across owners. Included in the node indexing reservation. |
 
+<a id="message-luxir.inflightrequeststats"></a>
+
+### luxir.InflightRequestStats
+
+A request that was running when the previous process died.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.inflightrequeststats.kind"></a>[`kind`](#field-luxir.inflightrequeststats.kind) | 1 | `string` | singular | search, update or admin |
+| <a id="field-luxir.inflightrequeststats.transport"></a>[`transport`](#field-luxir.inflightrequeststats.transport) | 2 | `string` | singular | grpc, http or internal |
+| <a id="field-luxir.inflightrequeststats.phase"></a>[`phase`](#field-luxir.inflightrequeststats.phase) | 3 | `string` | singular | queued, running or replying |
+| <a id="field-luxir.inflightrequeststats.tenant"></a>[`tenant`](#field-luxir.inflightrequeststats.tenant) | 4 | `string` | singular |  |
+| <a id="field-luxir.inflightrequeststats.collection"></a>[`collection`](#field-luxir.inflightrequeststats.collection) | 5 | `string` | singular |  |
+| <a id="field-luxir.inflightrequeststats.request_id"></a>[`request_id`](#field-luxir.inflightrequeststats.request_id) | 6 | `string` | singular |  |
+| <a id="field-luxir.inflightrequeststats.operation"></a>[`operation`](#field-luxir.inflightrequeststats.operation) | 7 | `string` | singular | Search: "name:kind" per op; update: document and delete counts; admin: the operation. Truncated to 87 bytes. |
+| <a id="field-luxir.inflightrequeststats.max_parallel"></a>[`max_parallel`](#field-luxir.inflightrequeststats.max_parallel) | 8 | `int32` | singular | search only |
+| <a id="field-luxir.inflightrequeststats.started"></a>[`started`](#field-luxir.inflightrequeststats.started) | 9 | `uint64` | singular | Unix milliseconds |
+
 <a id="message-luxir.jemallocstats"></a>
 
 ### luxir.JemallocStats
@@ -2442,6 +2464,7 @@ Which statistics to gather. The node scope (no collection, no tenant) always ret
 | <a id="field-luxir.statsresponse.host"></a>[`host`](#field-luxir.statsresponse.host) | 15 | [`HostStats`](#message-luxir.hoststats) | singular | Set by StatsRequest.host. |
 | <a id="field-luxir.statsresponse.duration_seconds"></a>[`duration_seconds`](#field-luxir.statsresponse.duration_seconds) | 13 | `double` | singular | Time spent gathering this response, excluding serialization. |
 | <a id="field-luxir.statsresponse.scrub"></a>[`scrub`](#field-luxir.statsresponse.scrub) | 14 | [`ScrubStats`](#message-luxir.scrubstats) | singular | Node-wide checksum scrub counters; set when store.scrub-interval-s is. |
+| <a id="field-luxir.statsresponse.unclean_exit"></a>[`unclean_exit`](#field-luxir.statsresponse.unclean_exit) | 30 | [`UncleanExitStats`](#message-luxir.uncleanexitstats) | singular | Node scope only. Set when the previous process on this data directory did not shut down cleanly, until a later start follows a clean shutdown. |
 
 <a id="message-luxir.statstotals"></a>
 
@@ -2621,6 +2644,30 @@ Request traffic on one transport. Replication routes are not counted.
 | <a id="field-luxir.transportstats.stream_pauses"></a>[`stream_pauses`](#field-luxir.transportstats.stream_pauses) | 5 | `uint64` | singular | response producers paused by flow control |
 | <a id="field-luxir.transportstats.connections"></a>[`connections`](#field-luxir.transportstats.connections) | 6 | `uint64` | singular | HTTP only: live sessions, including idle keep-alive |
 | <a id="field-luxir.transportstats.io_threads"></a>[`io_threads`](#field-luxir.transportstats.io_threads) | 7 | `int64` | singular | HTTP only: running connection shard threads |
+
+<a id="message-luxir.uncleanexitstats"></a>
+
+### luxir.UncleanExitStats
+
+The previous process on this data directory did not shut down cleanly. Read from the request table it kept in a file in the data directory, which survives SIGKILL; see the operations guide, "Post-mortem".
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.uncleanexitstats.cause"></a>[`cause`](#field-luxir.uncleanexitstats.cause) | 1 | `string` | singular | signal, uncaught\_exception, oom\_kill (the cgroup's oom\_kill counter rose), memory\_limit (memory was within 10% of the limit at the last sample), or unknown (killed without a report). |
+| <a id="field-luxir.uncleanexitstats.detail"></a>[`detail`](#field-luxir.uncleanexitstats.detail) | 2 | `string` | singular |  |
+| <a id="field-luxir.uncleanexitstats.pid"></a>[`pid`](#field-luxir.uncleanexitstats.pid) | 3 | `uint32` | singular |  |
+| <a id="field-luxir.uncleanexitstats.version"></a>[`version`](#field-luxir.uncleanexitstats.version) | 4 | `string` | singular |  |
+| <a id="field-luxir.uncleanexitstats.started"></a>[`started`](#field-luxir.uncleanexitstats.started) | 5 | `uint64` | singular | Unix milliseconds |
+| <a id="field-luxir.uncleanexitstats.last_sample"></a>[`last_sample`](#field-luxir.uncleanexitstats.last_sample) | 6 | `uint64` | singular | Unix milliseconds of the last memory sample; 0 if none |
+| <a id="field-luxir.uncleanexitstats.resident_bytes"></a>[`resident_bytes`](#field-luxir.uncleanexitstats.resident_bytes) | 7 | `uint64` | singular | at the last sample |
+| <a id="field-luxir.uncleanexitstats.resident_peak_bytes"></a>[`resident_peak_bytes`](#field-luxir.uncleanexitstats.resident_peak_bytes) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.uncleanexitstats.cgroup_bytes"></a>[`cgroup_bytes`](#field-luxir.uncleanexitstats.cgroup_bytes) | 9 | `int64` | singular | -1 when unknown |
+| <a id="field-luxir.uncleanexitstats.cgroup_max_bytes"></a>[`cgroup_max_bytes`](#field-luxir.uncleanexitstats.cgroup_max_bytes) | 10 | `int64` | singular | -1 when unknown or unlimited |
+| <a id="field-luxir.uncleanexitstats.detected"></a>[`detected`](#field-luxir.uncleanexitstats.detected) | 11 | `uint64` | singular | Unix milliseconds this process found the record |
+| <a id="field-luxir.uncleanexitstats.untracked"></a>[`untracked`](#field-luxir.uncleanexitstats.untracked) | 12 | `uint64` | singular | Requests that were running past a full table, not listed below. |
+| <a id="field-luxir.uncleanexitstats.requests"></a>[`requests`](#field-luxir.uncleanexitstats.requests) | 13 | [`InflightRequestStats`](#message-luxir.inflightrequeststats) | repeated |  |
 
 <a id="message-luxir.updaterequest"></a>
 

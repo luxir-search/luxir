@@ -15,6 +15,7 @@
 #include "luxir/BuildInfo.h"
 #include "luxir/KernelInfo.h"
 #include "luxir/server/Promotion.h"
+#include "luxir/util/CrashHandler.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/util/thread.h"
@@ -90,12 +91,16 @@ int luxir_main(int argc, char** argv, void (*addPlugins)(PluginRegistry&)) {
   pull->add_option("dir", config.store.data_dir, "Destination data directory")->required();
   auto* promote = app.add_subcommand("promote", "Make a stopped follower data directory an independent writer");
   promote->add_option("dir", config.store.data_dir, "Follower data directory")->required();
+  bool noCrashHandler = false;
+  app.add_flag("--no-crash-handler", noCrashHandler,
+      "Do not report fatal signals and std::terminate on stderr (for debuggers); the process still dumps core");
 
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError &e) {
     return app.exit(e);
   }
+  if (!noCrashHandler) installCrashHandler();
   if (*pull) {
     if (config.replication.source.empty() || config.store.data_dir.empty()) {
       std::cerr << "pull requires nonempty source and directory arguments\n";

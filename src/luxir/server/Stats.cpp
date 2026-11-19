@@ -406,6 +406,31 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     auto scrub = node.getScrubber().stats();
     response.scrub = api::ScrubStats{scrub.passes, scrub.files, scrub.bytes, scrub.mismatches, scrub.errors, scrub.lastPassEnd};
   }
+  if (nodeScope) {
+    if (const auto& exit = node.inflight().previousExit()) {
+      using api::build::arenaStr;
+      auto& out = response.unclean_exit.emplace();
+      out.cause = arenaStr(resource, exit->cause);
+      out.detail = arenaStr(resource, exit->detail);
+      out.pid = exit->pid;
+      out.version = arenaStr(resource, exit->version);
+      out.started = (uint64_t)exit->startedMs;
+      out.last_sample = (uint64_t)exit->lastSampleMs;
+      out.resident_bytes = exit->residentBytes;
+      out.resident_peak_bytes = exit->residentPeakBytes;
+      out.cgroup_bytes = exit->cgroupBytes;
+      out.cgroup_max_bytes = exit->cgroupMaxBytes;
+      out.detected = (uint64_t)exit->detectedMs;
+      out.untracked = exit->untracked;
+      auto* rows = api::build::allocArray(out.requests, exit->requests.size(), resource);
+      for (size_t i = 0; i < exit->requests.size(); i++) {
+        const auto& src = exit->requests[i];
+        rows[i] = {(uint64_t)src.startedMs, inflightName(src.kind), inflightName(src.transport), inflightName(src.phase),
+                   arenaStr(resource, src.tenant), arenaStr(resource, src.collection), arenaStr(resource, src.requestId),
+                   arenaStr(resource, src.operation), src.maxParallel};
+      }
+    }
+  }
   response.duration_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }

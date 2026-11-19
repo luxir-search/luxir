@@ -553,6 +553,11 @@ set_property(SOURCE src/luxir/util/ProcessAllocator.cpp APPEND PROPERTY
     "LUXIR_SANITIZER_NAME=\"${_luxir_sanitizer}\"")
 
 target_link_libraries(luxir_lib PRIVATE TBB::tbb)
+# std::stacktrace (the crash handler's symbolized trace) lives in libstdc++exp,
+# a static archive, so it adds no runtime library.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(luxir_lib PUBLIC stdc++exp)
+endif()
 get_target_property(_luxir_tbb_type TBB::tbb TYPE)
 if(_luxir_tbb_type STREQUAL "STATIC_LIBRARY")
   # Preserve TBB's internal allocator when its weak references cannot dlopen

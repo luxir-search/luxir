@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <map>
 #include <stdexcept>
 
 namespace luxir {
@@ -122,6 +123,25 @@ void memory(Renderer& r, const api::MemoryStats& m) {
     r.gauge("luxir_allocator_arena_allocated_bytes", "Live arena allocations.", (double)arena->allocated_bytes, PrometheusText::label("arena", name));
     r.gauge("luxir_allocator_arena_resident_bytes", "Allocator estimate of resident arena memory.", (double)arena->resident_bytes, PrometheusText::label("arena", name));
   }
+}
+
+void uncleanExit(Renderer& r, const api::UncleanExitStats& e) {
+  r.gauge("luxir_unclean_exit_info", "The previous process on this data directory did not shut down cleanly; cause is its likeliest reason.", 1,
+          PrometheusText::label("cause", e.cause) + "," + PrometheusText::label("version", e.version));
+  r.gauge("luxir_unclean_exit_timestamp_seconds", "Last sign of life of the previous process (its last memory sample, else its start), since Unix epoch.",
+          (double)(e.last_sample ? e.last_sample : e.started) / 1e3);
+  r.gauge("luxir_unclean_exit_resident_bytes", "Resident memory of the previous process at its last memory sample.", (double)e.resident_bytes);
+  if (e.cgroup_bytes >= 0)
+    r.gauge("luxir_unclean_exit_cgroup_memory_bytes", "Cgroup memory.current of the previous process at its last memory sample.", (double)e.cgroup_bytes);
+  if (e.cgroup_max_bytes > 0)
+    r.gauge("luxir_unclean_exit_cgroup_memory_max_bytes", "Cgroup memory.max of the previous process at its last memory sample.", (double)e.cgroup_max_bytes);
+  std::map<std::pair<std::string_view, std::string_view>, int> running;
+  for (const auto& request : e.requests) running[{request.tenant, request.collection}]++;
+  r.gauge("luxir_unclean_exit_requests", "Requests the previous process was running when it died, including untracked ones.",
+          (double)(e.requests.size() + e.untracked));
+  for (const auto& [id, count] : running)
+    r.gauge("luxir_unclean_exit_collection_requests", "Requests the previous process was running when it died, by collection.",
+            (double)count, PrometheusText::label("tenant", id.first) + "," + PrometheusText::label("collection", id.second));
 }
 
 void scrub(Renderer& r, const api::ScrubStats& s) {
@@ -409,6 +429,7 @@ std::string renderPrometheus(const api::StatsResponse& stats) {
   if (stats.system) systemStats(r, *stats.system);
   if (stats.host) hostStats(r, *stats.host);
   if (stats.scrub) scrub(r, *stats.scrub);
+  if (stats.unclean_exit) uncleanExit(r, *stats.unclean_exit);
   r.counter("luxir_multiterm_expansion_refills_total", "Process-wide multi-term expansion refills.", (double)stats.multiterm_expansion_refills);
   r.gauge("luxir_stats_duration_seconds", "Time gathering this response, excluding serialization and transmission.", stats.duration_seconds);
   return out.str();

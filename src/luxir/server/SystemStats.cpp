@@ -383,6 +383,13 @@ void cgroupTasks(api::CgroupTaskStats& out, const std::filesystem::path& path) {
 #endif
 } // namespace
 
+std::string cgroupDirectoryPath() {
+#ifdef __linux__
+  try { return cgroupDirectory().string(); } catch (const std::exception&) {}
+#endif
+  return {};
+}
+
 void gatherSystemStats(api::SystemStats* system, api::HostStats* host, std::string_view dataDirectory,
                        std::pmr::memory_resource& resource) {
 #ifdef __linux__
