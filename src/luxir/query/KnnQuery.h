@@ -3089,9 +3089,9 @@ public:
         // first block again, each on its own fetch, and so do live-size
         // lookups under deletes, which read a list's ids while allocating.
         if (!declared.empty()) {
-          bool spawnTasks = parallel && declared.size() > 1;
-          TaskGroupRunner runner;
-          task_group_fanout(spawnTasks ? runner.group() : nullptr, declared.size(), [&](size_t i) {
+          bool spawnTasks = fanout && fanout->publishesEvery() && declared.size() > 1;
+          FanoutScope runner = fanout ? fanout->child() : FanoutScope(nullptr, FanoutPolicy::EVERY);
+          task_group_fanout(spawnTasks ? &runner : nullptr, declared.size(), [&](size_t i) {
             return [&, i]() {
               const auto& unit = declared[i];
               slots[(size_t)unit.slotOrd].ivfEngine->declareLists(std::span<const faiss::idx_t>(
