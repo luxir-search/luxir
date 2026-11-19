@@ -11,6 +11,7 @@
 #include "IntColReader.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/store/InputStream.h"
+#include "luxir/store/OutputStream.h"  // ByteRange
 #include "luxir/schema/FieldType.h"
 
 namespace luxir {
@@ -23,11 +24,21 @@ namespace luxir {
 ///     the same size; in that case fixedSize holds the common value size.
 ///   - endValueRankReader (optional): per-doc -> per-value rank boundary. Present only for
 ///     multi-valued fields.  For single-valued, value rank == doc rank.
+///
+/// Values::DEFERRED keeps a lazy (remote) values file unmaterialized: values are
+/// then read by range (valueAt fetches what covers one value, valuesWindow() a
+/// run of fixed-size values) and valuesData is null.  Resident files, and lazy
+/// ones some reader already materialized, keep the pointer path either way.
+/// The docs bitset and the mono readers often share the values' file (the
+/// writer reuses its largest free stream), so DEFERRED reads them by range too.
 class StrColReader {
+public:
+  enum class Values { WHOLE, DEFERRED };
+
 private:
   DocsReader docs;
   InputStream valuesIS;                       // Stream for concatenated string values
-  const char* valuesData;                     // Pointer to concatenated string data
+  const char* valuesData;                     // Pointer to concatenated string data; null when deferred
   InputFile* valuesInput;                     // File holding valuesData (for read-ahead)
   size_t valuesFileOffset;                    // Offset of valuesData in valuesInput
   std::optional<MonoReader> endValueRankReader;    // per-doc -> end value rank (multi-valued only)
@@ -38,11 +49,28 @@ private:
   int64_t nvals = 0;
   int32_t fixedSize = -1;                     // -1 for variable size, >= 0 for fixed size
 
+  static InputStream openValues(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo, Values values) {
+    seg_location loc = fieldInfo.columnLoc;
+    if (values == Values::DEFERRED && postingsReader.core().getFile(loc.filenum())->lazy()) {
+      auto resident = postingsReader.core().residentStream(loc.filenum());
+      if (!resident) return InputStream();
+      resident->seek((int64_t)loc.offset());
+      return *resident;
+    }
+    return postingsReader.core().getInputStreamSeek(loc, (std::string_view)fieldInfo.fieldname);
+  }
+
+  std::string_view deferredValue(int64_t startOffset, int64_t size) const {
+    if (size == 0) return {};
+    InputStream range = valuesInput->rangeStream(valuesFileOffset + (uint64_t)startOffset, (uint64_t)size);
+    return std::string_view(range.ptr(), (size_t)size);
+  }
+
 public:
   /// The fieldInfo is only used in the constructor and can be discarded after.
-  StrColReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) :
-    docs(postingsReader, fieldInfo),
-    valuesIS(postingsReader.core().getInputStreamSeek(fieldInfo.columnLoc)),
+  StrColReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo, Values values = Values::WHOLE) :
+    docs(postingsReader, fieldInfo, values == Values::DEFERRED),
+    valuesIS(openValues(postingsReader, fieldInfo, values)),
     valuesData(valuesIS.ptr()),
     valuesInput(postingsReader.core().getFile(fieldInfo.columnLoc.filenum())),
     valuesFileOffset((size_t)fieldInfo.columnLoc.offset()),
@@ -50,17 +78,18 @@ public:
     docsWithField(fieldInfo.docsWithField),
     nvals(fieldInfo.numValues)
   {
+    bool deferred = values == Values::DEFERRED;
     if (fieldInfo.flags & FieldType::MULTI_VALUED) {
-      endValueRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
+      endValueRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField, deferred);
     }
     if (fieldInfo.mono2Loc.offset() == 0 && fieldInfo.mono2Loc.filenum() == 0) {
       fixedSize = (int32_t)fieldInfo.mono2MetaOff;
     } else {
-      endOffsetReader.emplace(postingsReader, fieldInfo.mono2Loc, fieldInfo.mono2MetaOff, fieldInfo.numValues);
+      endOffsetReader.emplace(postingsReader, fieldInfo.mono2Loc, fieldInfo.mono2MetaOff, fieldInfo.numValues, deferred);
     }
     // valDoc map is optional (only multi-valued vector columns write it).
     if (!(fieldInfo.valDocLoc.offset() == 0 && fieldInfo.valDocLoc.filenum() == 0)) {
-      valDocReader.emplace(postingsReader, fieldInfo.valDocLoc, fieldInfo.valDocMetaOff, fieldInfo.numValues);
+      valDocReader.emplace(postingsReader, fieldInfo.valDocLoc, fieldInfo.valDocMetaOff, fieldInfo.numValues, deferred);
     }
   }
 
@@ -130,6 +159,27 @@ public:
   InputFile* valuesFile() const { return valuesInput; }
   size_t valuesOffset() const { return valuesFileOffset; }
 
+  /// True when the values are read by range from a lazy file (Values::DEFERRED).
+  bool valuesDeferred() const { return valuesData == nullptr; }
+
+  /// File range of fixed-size value ranks [begin, end).
+  ByteRange valuesRange(int64_t begin, int64_t end) const {
+    assert(isFixedSize() && 0 <= begin && begin <= end && end <= nvals);
+    return {valuesFileOffset + (uint64_t)begin * (uint64_t)fixedSize, (uint64_t)(end - begin) * (uint64_t)fixedSize};
+  }
+
+  /// Bytes of fixed-size value ranks [begin, end), valid while the file lives.
+  /// A slice of the mapping on the pointer path; a deferred column fetches
+  /// just this range.
+  InputStream valuesWindow(int64_t begin, int64_t end) const {
+    ByteRange range = valuesRange(begin, end);
+    if (valuesData) {
+      const char* start = valuesData + (int64_t)(range.offset - valuesFileOffset);
+      return InputStream(start, start + range.length);
+    }
+    return valuesInput->rangeStream(range.offset, range.length);
+  }
+
   /// Fixed value size for fixed-size fields; -1 for variable size.
   int32_t fixedValueSize() const {
     return fixedSize;
@@ -137,13 +187,17 @@ public:
 
   /// Get the value at a given global value rank (0..numValues()-1).
   // Keep fixed-size column access in scan loops independent of the TU inline budget.
+  /// A deferred column fetches what covers the value; prefer valuesWindow()
+  /// (or a prefetchRanges() of valuesRange()) for runs of values.
   LUXIR_INLINE std::string_view valueAt(int64_t valueRank) const {
     assert(valueRank >= 0 && valueRank < nvals);
     if (endOffsetReader) {
       auto [startOffset, endOffset] = endOffsetReader->valuesAt(valueRank);
+      if (!valuesData) [[unlikely]] return deferredValue(startOffset, endOffset - startOffset);
       return std::string_view(valuesData + startOffset, endOffset - startOffset);
     }
     int64_t startOffset = valueRank * fixedSize;
+    if (!valuesData) [[unlikely]] return deferredValue(startOffset, fixedSize);
     return std::string_view(valuesData + startOffset, fixedSize);
   }
 
@@ -176,12 +230,13 @@ public:
   /// slot); callers that need concurrent access should construct one per thread.
   class DocValues {
     std::optional<MonoReader::BulkValues> offsets;  // absent for fixed-size
+    const StrColReader& reader;
     const char* valuesData;
     int64_t nvals;
     int32_t fixedSize;
   public:
     DocValues(const StrColReader& reader)
-      : valuesData(reader.valuesData), nvals(reader.nvals), fixedSize(reader.fixedSize) {
+      : reader(reader), valuesData(reader.valuesData), nvals(reader.nvals), fixedSize(reader.fixedSize) {
       if (reader.endOffsetReader) {
         offsets.emplace(*reader.endOffsetReader);
       }
@@ -193,6 +248,7 @@ public:
       assert(valueRank >= 0 && valueRank < nvals);
       if (!offsets) {
         int64_t startOffset = valueRank * fixedSize;
+        if (!valuesData) return reader.deferredValue(startOffset, fixedSize);
         return std::string_view(valuesData + startOffset, fixedSize);
       }
       // MonoReader::BulkValues::valueAt caches a 128-value sub-block.  valueRank-1 and
@@ -200,6 +256,7 @@ public:
       // (on miss) plus two array reads.
       int64_t startOffset = valueRank > 0 ? offsets->valueAt(valueRank - 1) : 0;
       int64_t endOffset = offsets->valueAt(valueRank);
+      if (!valuesData) return reader.deferredValue(startOffset, endOffset - startOffset);
       return std::string_view(valuesData + startOffset, endOffset - startOffset);
     }
   };
@@ -283,7 +340,8 @@ public:
   /// Calls callback(size_t input_index, int32_t docid, std::string_view value) for each docid that has a value.
   static void getValues(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& segFieldInfo,
                         std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
-    StrColReader strColReader(postingsReader, segFieldInfo);
+    // Sparse (top-K) access: a lazy file is read per value, not materialized.
+    StrColReader strColReader(postingsReader, segFieldInfo, Values::DEFERRED);
     StrColReader::Iterator iter(strColReader);
 
     int32_t foundid = -1;
@@ -308,7 +366,7 @@ public:
   /// accessed sparsely (once per matched doc), appropriate for top-K style callers.
   static void getMultiValues(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& segFieldInfo,
                              std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
-    StrColReader strColReader(postingsReader, segFieldInfo);
+    StrColReader strColReader(postingsReader, segFieldInfo, Values::DEFERRED);
     StrColReader::Iterator iter(strColReader);
     StrColReader::DocValues docValues(strColReader);
 

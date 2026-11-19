@@ -201,6 +201,13 @@ struct SearchConfig {
   int32_t multiterm_min_prefix_length = 0;
 };
 
+struct ReaderConfig {
+  // A lazy (remote) segment file larger than this that a reader materializes
+  // whole is logged once per file: every concurrent reader of that file waits
+  // on the fetch. Zero logs none. Applied to PostingsReader::maxMaterializeBytes.
+  uint64_t max_materialize_bytes = 64ULL * 1024 * 1024;
+};
+
 struct ReplicationConfig {
   int64_t pin_idle_timeout_ms = 60'000;
   uint64_t pin_retained_bytes = 1024ULL * 1024 * 1024;
@@ -244,6 +251,7 @@ struct LuxirConfig {
   IndexConfig index;
   IngestConfig ingest;
   SearchConfig search;
+  ReaderConfig reader;
 
   /// Register common CLI options on an app, bound to this config's fields.
   void addOptions(CLI::App& app);
@@ -257,7 +265,7 @@ struct LuxirConfig {
   /// Normalize and validate config after parsing.
   void normalize();
 
-  /// Apply non-node settings (e.g. spdlog level). Call after parse.
+  /// Apply non-node settings (e.g. spdlog level, process-wide reader tuning). Call after parse.
   void apply() const;
 };
 
