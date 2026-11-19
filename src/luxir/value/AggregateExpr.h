@@ -17,6 +17,7 @@
 
 #include "luxir/util/proto.h"
 #include "luxir/reader/OrdColReader.h"
+#include "luxir/reader/StrColReader.h"
 #include "luxir/search/OrdMap.h"
 #include "luxir/value/ValueExpr.h"
 
@@ -144,7 +145,8 @@ struct AggregateStateOps {
   AccumulateOrdBatch accumulateOrdBatch = nullptr;
   // The aggregate needs only how many values each document holds. A bare
   // column input then binds to its shape (BoundValueCounts), and every raw
-  // input (point, batch, keyed) is a per-document value count, not a value.
+  // input (point, batch, keyed) is a per-document value count, not a value
+  // (distinct values for an ARRAY terms column).
   bool countsValues = false;
 };
 
@@ -334,18 +336,41 @@ void writeAggregateValue(api::Val& target, const BucketScalar& value);
 // from the column shape (docs with the field plus end value ranks) without
 // decoding a value. A nested descendant column counts the values of every row
 // the owner holds. Without either the segment has no such column.
+//
+// Like Elasticsearch value_count, a document counts each distinct value of a
+// terms column (STRING, ID, IP) once, since Elasticsearch keeps those as
+// sorted sets, and every value of an int64 column (numeric, date, boolean,
+// geo point), since it keeps those as sorted lists. A SET column already holds
+// a repeated value once, so only a multi-valued ARRAY terms column reads its
+// values (ords, or raw bytes when not indexed) to count each document's
+// distinct ones; every other column counts from the shape alone. A nested row
+// is its own document.
 struct BoundValueCounts {
   const ColumnShape* shape = nullptr;
   std::optional<ColumnShape::Cursor> cursor;
   BoundColumnRange* mapping = nullptr;
+  // At most one is set, for an ARRAY terms column with a multi-valued shape.
+  OrdColReader::BulkOrds* ords = nullptr;
+  StrColReader::DocValues* strings = nullptr;
+
+  bool distinct() const { return ords != nullptr || strings != nullptr; }
 
   int64_t count(int32_t docid) {
-    if (mapping != nullptr) {
-      auto [first, end] = mapping->range(docid);
-      return end - first;
+    if (mapping == nullptr && !distinct()) [[likely]] {
+      return cursor && cursor->seek(docid) ? cursor->count() : 0;
     }
-    return cursor && cursor->seek(docid) ? cursor->count() : 0;
+    return countSlow(docid);
   }
+
+  // Values of every document of the segment.
+  int64_t segmentValues() const;
+
+  // Distinct values in the value rank range [first, end) of one document.
+  int64_t distinctValues(int64_t first, int64_t end) const;
+
+private:
+  // A nested owner's rows, or a document whose repeats count once.
+  int64_t countSlow(int32_t docid);
 };
 
 struct BoundAggregateInput {

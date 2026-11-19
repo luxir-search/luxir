@@ -238,7 +238,9 @@ public:
     }
 
     // A value count over the domain from the column shape alone: no value is
-    // decoded, and a domain of every document needs no walk at all.
+    // decoded, and a domain of every document needs no walk at all. An ARRAY
+    // terms column counts each document's distinct values, so it walks its
+    // documents and reads the values of those holding more than one.
     void accumulateValueCounts(AggregateAccumulator& accumulator,
                                BoundAggregateInput& binding, DocSet* domain,
                                int32_t maxDoc) {
@@ -246,7 +248,7 @@ public:
       if (counts.mapping == nullptr && counts.shape == nullptr) return;
       int64_t total = 0;
       if (counts.mapping == nullptr && domain == nullptr) {
-        total = counts.shape->numValues();
+        total = counts.segmentValues();
       } else if (counts.mapping == nullptr && counts.shape->oneValuePerDoc()) {
         total = domain->card();
       } else {

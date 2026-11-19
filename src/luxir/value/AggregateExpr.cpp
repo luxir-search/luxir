@@ -3,8 +3,12 @@
 
 #include "luxir/value/AggregateExpr.h"
 
+#include <algorithm>
+#include <array>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
+#include <vector>
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/NumericUtils.h"
@@ -310,6 +314,69 @@ void writeAggregateValue(api::Val& target, const BucketScalar& value) {
   target.kind.emplace<int64_t>((int64_t)value.intValue);
 }
 
+namespace {
+
+// Distinct keys among one document's values. Arrays are short, so each key
+// is compared with the distinct ones seen before it; a long array sorts a copy.
+template <typename Key, typename Read>
+int64_t distinctKeys(int64_t first, int64_t end, Read&& read) {
+  constexpr int64_t PAIRWISE_KEYS = 16;
+  if (end - first <= PAIRWISE_KEYS) {
+    std::array<Key, PAIRWISE_KEYS> seen;
+    int64_t distinct = 0;
+    for (int64_t rank = first; rank < end; rank++) {
+      Key key = read(rank);
+      bool repeat = false;
+      for (int64_t i = 0; i < distinct; i++) repeat |= seen[(size_t)i] == key;
+      if (!repeat) seen[(size_t)distinct++] = key;
+    }
+    return distinct;
+  }
+  std::vector<Key> keys;
+  keys.reserve((size_t)(end - first));
+  for (int64_t rank = first; rank < end; rank++) keys.push_back(read(rank));
+  std::sort(keys.begin(), keys.end());
+  return std::unique(keys.begin(), keys.end()) - keys.begin();
+}
+
+} // namespace
+
+int64_t BoundValueCounts::distinctValues(int64_t first, int64_t end) const {
+  if (end - first < 2) return end - first;
+  if (ords != nullptr) {
+    return distinctKeys<int32_t>(first, end, [&](int64_t rank) { return ords->valueAt(rank); });
+  }
+  assert(strings != nullptr);
+  return distinctKeys<std::string_view>(first, end, [&](int64_t rank) { return strings->valueAt(rank); });
+}
+
+int64_t BoundValueCounts::segmentValues() const {
+  assert(shape != nullptr && mapping == nullptr);
+  if (!distinct()) return shape->numValues();
+  int64_t total = 0;
+  shape->forEachDocValues([&](int64_t first, int64_t end) {
+    total += end - first > 1 ? distinctValues(first, end) : end - first;
+  });
+  return total;
+}
+
+int64_t BoundValueCounts::countSlow(int32_t docid) {
+  if (mapping == nullptr) {
+    if (!cursor || !cursor->seek(docid)) return 0;
+    return distinctValues(cursor->begin(), cursor->end());
+  }
+  if (!distinct()) {
+    auto [first, end] = mapping->range(docid);
+    return end - first;
+  }
+  auto family = mapping->owners.seek(docid);
+  int64_t total = 0;
+  for (int32_t row = family.first; row < family.end; row++) {
+    if (mapping->values.seek(row)) total += distinctValues(mapping->values.begin(), mapping->values.end());
+  }
+  return total;
+}
+
 std::span<const AggregateFieldInfos> resolveAggregateFields(
     const AggregateProgram& program, MemPool& pool, IndexReader& reader) {
   auto fields = pool.make_span<AggregateFieldInfos>(program.producers.size());
@@ -349,13 +416,25 @@ std::vector<BoundAggregateInput> bindAggregateInputs(
     BoundValueCounts* valueCounts = nullptr;
     if (producer.countsColumnValues()) {
       valueCounts = pool.make<BoundValueCounts>();
+      auto& source = root.source ? root.source->segments()[(size_t)segment.ord] : segment;
+      const SegFieldInfo* info = rootBinding.mapping != nullptr || !root.source
+          ? SegFieldInfo::column(fields[index].values[producer.input->rootNode].at(source)) : nullptr;
       if (rootBinding.mapping != nullptr) {
         valueCounts->mapping = rootBinding.mapping;
-      } else if (!root.source) {
-        if (auto* info = SegFieldInfo::column(fields[index].values[producer.input->rootNode].at(segment))) {
-          valueCounts->shape = rootBinding.stringColumn != nullptr ? &rootBinding.stringColumn->shape
-              : pool.make<ColumnShape>(segment.postingsReader(), *info);
-          valueCounts->cursor.emplace(*valueCounts->shape);
+      } else if (info != nullptr) {
+        valueCounts->shape = rootBinding.stringColumn != nullptr ? &rootBinding.stringColumn->shape
+            : pool.make<ColumnShape>(segment.postingsReader(), *info);
+        valueCounts->cursor.emplace(*valueCounts->shape);
+      }
+      // Repeats within an ARRAY terms column count once (see BoundValueCounts).
+      if (info != nullptr && strings && (info->flags & FieldType::MULTI_ARRAY) != 0
+          && info->monoLoc.offset() > 0) {
+        if (info->hasOrdColumn()) {
+          valueCounts->ords = pool.make<OrdColReader::BulkOrds>(
+              *pool.make<OrdColReader>(source.postingsReader(), *info));
+        } else {
+          valueCounts->strings = pool.make<StrColReader::DocValues>(
+              *pool.make<StrColReader>(source.postingsReader(), *info));
         }
       }
       bareColumn = true;

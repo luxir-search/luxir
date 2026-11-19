@@ -141,12 +141,15 @@ TEST_F(NestedValueExprTest, longSparseFamiliesKeepTypedColumnSemantics) {
   price.type = api::FieldDef::FieldClass::DECIMAL; price.scale = 2;
   schema.field("items_nested.point").type = api::FieldDef::FieldClass::GEO_POINT;
   schema.field("empty_nested.n_i").type = api::FieldDef::FieldClass::INT;
+  auto& tags = schema.field("items_nested.tags");
+  tags.type = api::FieldDef::FieldClass::STRING; tags.multi = api::FieldDef::MultiMode::ARRAY;
   schema.set(helper.collection());
   std::string json = R"({"id":"long","items_nested":[)";
   for (int i = 0; i < 300; i++) {
     if (i) json += ',';
     json += fmt::format(R"({{"n_i":{})", i);
     if (i % 2 == 0) json += fmt::format(R"(,"many":[{},{}])", i, -i);
+    if (i % 3 == 0) json += R"(,"tags":["a","b","a"])";
     if (i == 0) json += R"(,"stamp":1000,"price":1.25,"point":{"lat":0,"lon":0})";
     if (i == 299) json += R"(,"stamp":2000,"price":-2.5,"point":{"lat":0,"lon":1})";
     json += '}';
@@ -167,6 +170,8 @@ TEST_F(NestedValueExprTest, longSparseFamiliesKeepTypedColumnSemantics) {
   req->expr("value_arrays", "value_count(items_nested.many)");
   req->expr("value_points", "value_count(items_nested.point)");
   req->expr("value_empty", "value_count(empty_nested.n_i)");
+  req->expr("tags", "sum(count(items_nested.tags))");
+  req->expr("value_tags", "value_count(items_nested.tags)");
   req->execute(1); ASSERT_OK(req);
   EXPECT_EQ(299, req->scalar<int64_t>("largest")); EXPECT_EQ(44871, req->scalar<int64_t>("total"));
   EXPECT_EQ(306, req->scalar<int64_t>("arrays")); EXPECT_EQ(32, req->scalar<int64_t>("array_sum"));
@@ -175,6 +180,9 @@ TEST_F(NestedValueExprTest, longSparseFamiliesKeepTypedColumnSemantics) {
   EXPECT_EQ(0, req->scalar<int64_t>("empty"));
   EXPECT_EQ(306, req->scalar<int64_t>("value_arrays")); EXPECT_EQ(2, req->scalar<int64_t>("value_points"));
   EXPECT_EQ(0, req->scalar<int64_t>("value_empty"));
+  // A numeric array counts every repeat (many holds 0 twice in row 0), a
+  // STRING array each row's distinct values: every row is its own document.
+  EXPECT_EQ(300, req->scalar<int64_t>("tags")); EXPECT_EQ(200, req->scalar<int64_t>("value_tags"));
 }
 
 TEST_F(NestedValueExprTest, componentsMapOverDescendantsAtEachDepth) {

@@ -1364,8 +1364,10 @@ ResolvedAggregate resolvePercentile(
 
 // value_count: the number of values, an uint64_t that cannot overflow (a
 // request sees fewer than 2^63 values). A bare column binds with countsValues,
-// so its raw inputs are per-document value counts read from the column shape,
-// never column values. Any other input counts each value it yields.
+// so its raw inputs are per-document value counts (BoundValueCounts): read
+// from the column shape, except that an ARRAY terms column counts each
+// document's distinct values, as Elasticsearch does. Any other input counts
+// each value it yields.
 void addValueCountBy(void* target, uint64_t count) {
   storeState(target, loadState<uint64_t>(target) + count);
 }
