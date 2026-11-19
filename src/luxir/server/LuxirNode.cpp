@@ -129,6 +129,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   // normalize(), so resolve the RAM sentinels here too - before the writers
   // opened below take a pointer to the budget.
   this->config.resolveRamBudgets();
+  this->config.server.validate();
   auto& replicationConfig = this->config.replication;
   replicationConfig.validate();
   replication = std::make_shared<ReplicationSource>(std::chrono::milliseconds(
@@ -177,6 +178,8 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
     collections_->open(this->config.read_only ? Collections::Role::READ_ONLY : Collections::Role::WRITER);
   }
   searchEngine = std::make_unique<SearchEngine>(*this);
+  memoryPressure = std::make_unique<MemoryPressure>(this->config.server, indexRamBudget,
+                                                    this->config.index.max_ram_mb * 1024 * 1024);
   scrubber = std::make_unique<Scrubber>(*this);
   if (mode == Mode::SERVE) scrubber->start();
   if (follower && mode == Mode::SERVE) follower->start();
@@ -184,6 +187,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
 }
 
 LuxirNode::~LuxirNode() {
+  memoryPressure.reset();
   pluginStates.clear();
   scrubber->stop();
   if (follower) follower->stop();

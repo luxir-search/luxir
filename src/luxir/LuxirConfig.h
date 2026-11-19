@@ -38,6 +38,20 @@ struct ServerConfig {
   int workers = 0;
   static constexpr int kSmallNodeCores = 4;
 
+  // Memory pressure admission (see MemoryPressure). The limit is the tightest
+  // cgroup v2 memory.max over this process, capped by memory_limit_mb when
+  // set; without a cgroup limit it is memory_limit_mb, else system RAM.
+  // Thresholds are percentages of it: at soft new update requests are
+  // refused, at hard new searches and further update stream batches too.
+  // Each level is left only once usage drops hysteresis points below it.
+  // sample_ms 0 disables the monitor.
+  int64_t memory_limit_mb = 0;
+  int memory_pressure_soft_percent = 85;
+  int memory_pressure_hard_percent = 92;
+  int memory_pressure_hysteresis_percent = 5;
+  int64_t memory_pressure_sample_ms = 250;
+  void validate() const;
+
   int resolveWorkers() const {
     if (workers > 0) return workers;
     int cores = std::max(1, oneapi::tbb::info::default_concurrency());
@@ -188,6 +202,11 @@ struct SearchConfig {
   // reservation tails, is 158,536,389 bytes - so 160 MiB covers it.
   // Early-merge degradation is future work.
   size_t request_memory_max_bytes = 0;
+  // Node-wide ceiling on the memory tracked by all running requests together;
+  // a charge that would pass it fails its request with the retryable
+  // node_request_memory_exceeded. -1 = auto: half of max_ram_mb (the share
+  // indexing leaves), or unlimited when max_ram_mb is; 0 = unlimited.
+  int64_t node_request_memory_max_bytes = -1;
   // Term-dictionary expansion guards for prefix, wildcard, regex, string
   // range, and fuzzy queries (see MultiTermLimits). Zero is unlimited; a
   // request can never raise or disable them.

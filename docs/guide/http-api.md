@@ -262,12 +262,26 @@ when supplied in the body or as a URL parameter.
 | `not_found` | 404 | The route or the collection does not exist. |
 | `already_exists` | 409 | Creating a collection that already exists. |
 | `failed_precondition` | 403 (409 for `commit_incarnation_mismatch`) | The node's state forbids the operation, such as `--read-only`. |
-| `resource_exhausted` | 429 (413 for `request_too_large`) | A size or memory ceiling was exceeded. |
+| `resource_exhausted` | 429 (413 for `request_too_large`) | A size or memory ceiling was exceeded. `memory_pressure` and `node_request_memory_exceeded` are transient and carry `Retry-After`. |
 | `unavailable` | 503 | The collection exists but cannot serve: it is being deleted or failed to load. |
 | `internal` | 500 | A server-side failure the request did not cause. |
 
 A failure detected before output returns the kind's HTTP status and this
 body. A wrong method on a known path returns `405` with an `Allow` header.
+
+Two `resource_exhausted` codes describe the node, not the request, so the
+same request succeeds once the condition clears: `memory_pressure` (the node
+is refusing new work under memory pressure; see
+[Memory pressure admission](operations.md#memory-pressure-admission)) and
+`node_request_memory_exceeded` (running searches together hold the node-wide
+query memory ceiling). Both answer `429 Too Many Requests` with
+`Retry-After: 1`; retry with backoff, preferably on another replica. `429`
+rather than `503` because the node is healthy and still serving accepted
+work, stats and health checks: a load balancer must not eject it.
+`request_memory_exceeded` (the request alone outgrew its own ceiling) fails
+the same way again and has no `Retry-After`. An update refused at admission
+was not applied at all; an NDJSON stream refused mid-way ends with a terminal
+`memory_pressure` line after the acknowledgements of the batches it applied.
 
 Once a chunked response has begun, its HTTP status cannot change, so a search
 that fails after output starts arrives with HTTP 200 as the final NDJSON line in

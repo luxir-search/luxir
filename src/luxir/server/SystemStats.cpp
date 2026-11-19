@@ -308,41 +308,6 @@ void pressure(std::span<const api::PressureStats>& out, std::pmr::memory_resourc
   std::copy(rows.begin(), rows.end(), dst);
 }
 
-// Match the current cgroup to its mount root, including cgroup namespaces and
-// bind mounts. Never blindly report the host root as this process's cgroup.
-std::filesystem::path cgroupDirectory() {
-  auto membership = input("/proc/self/cgroup");
-  std::string line, group;
-  while (std::getline(membership, line)) if (line.starts_with("0::")) group = line.substr(3);
-  if (group.empty()) throw std::runtime_error("cgroup v2 unavailable");
-  auto mounts = input("/proc/self/mountinfo");
-  while (std::getline(mounts, line)) {
-    if (line.find(" - cgroup2 ") == std::string::npos) continue;
-    std::istringstream row(line);
-    std::string id, parent, device, root, mount;
-    row >> id >> parent >> device >> root >> mount;
-    // Mountinfo encodes whitespace and backslashes as octal escapes.
-    auto unescape = [](std::string s) {
-      for (size_t p = 0; p + 3 < s.size(); ++p) if (s[p] == '\\' &&
-          s[p+1] >= '0' && s[p+1] <= '7' && s[p+2] >= '0' && s[p+2] <= '7' && s[p+3] >= '0' && s[p+3] <= '7') {
-        char c = (char)((s[p+1]-'0')*64 + (s[p+2]-'0')*8 + s[p+3]-'0');
-        s.replace(p, 4, 1, c);
-      }
-      return s;
-    };
-    root = unescape(root); mount = unescape(mount);
-    if (root == "/" || group == root || group.starts_with(root + "/")) {
-      std::string relative = root == "/" ? group.substr(1) : group.substr(root.size());
-      while (relative.starts_with('/')) relative.erase(0, 1);
-      auto path = (std::filesystem::path(mount) / relative).lexically_normal();
-      auto rel = path.lexically_relative(mount);
-      if (rel.empty() || *rel.begin() == "..") continue;
-      return path;
-    }
-  }
-  throw std::runtime_error("cgroup v2 mount unavailable");
-}
-
 // A cgroup limit file: a number, or "max" for unlimited (-1).
 int64_t cgroupLimit(const std::filesystem::path& path) {
   auto in = input(path);
@@ -383,6 +348,45 @@ void cgroupTasks(api::CgroupTaskStats& out, const std::filesystem::path& path) {
 #endif
 } // namespace
 
+#ifdef __linux__
+// Match the current cgroup to its mount root, including cgroup namespaces and
+// bind mounts. Never blindly report the host root as this process's cgroup.
+std::filesystem::path cgroupV2Directory() {
+  auto membership = input("/proc/self/cgroup");
+  std::string line, group;
+  while (std::getline(membership, line)) if (line.starts_with("0::")) group = line.substr(3);
+  if (group.empty()) throw std::runtime_error("cgroup v2 unavailable");
+  auto mounts = input("/proc/self/mountinfo");
+  while (std::getline(mounts, line)) {
+    if (line.find(" - cgroup2 ") == std::string::npos) continue;
+    std::istringstream row(line);
+    std::string id, parent, device, root, mount;
+    row >> id >> parent >> device >> root >> mount;
+    // Mountinfo encodes whitespace and backslashes as octal escapes.
+    auto unescape = [](std::string s) {
+      for (size_t p = 0; p + 3 < s.size(); ++p) if (s[p] == '\\' &&
+          s[p+1] >= '0' && s[p+1] <= '7' && s[p+2] >= '0' && s[p+2] <= '7' && s[p+3] >= '0' && s[p+3] <= '7') {
+        char c = (char)((s[p+1]-'0')*64 + (s[p+2]-'0')*8 + s[p+3]-'0');
+        s.replace(p, 4, 1, c);
+      }
+      return s;
+    };
+    root = unescape(root); mount = unescape(mount);
+    if (root == "/" || group == root || group.starts_with(root + "/")) {
+      std::string relative = root == "/" ? group.substr(1) : group.substr(root.size());
+      while (relative.starts_with('/')) relative.erase(0, 1);
+      auto path = (std::filesystem::path(mount) / relative).lexically_normal();
+      auto rel = path.lexically_relative(mount);
+      if (rel.empty() || *rel.begin() == "..") continue;
+      return path;
+    }
+  }
+  throw std::runtime_error("cgroup v2 mount unavailable");
+}
+#else
+std::filesystem::path cgroupV2Directory() { throw std::runtime_error("cgroup v2 unavailable"); }
+#endif
+
 void gatherSystemStats(api::SystemStats* system, api::HostStats* host, std::string_view dataDirectory,
                        std::pmr::memory_resource& resource) {
 #ifdef __linux__
@@ -405,7 +409,7 @@ void gatherSystemStats(api::SystemStats* system, api::HostStats* host, std::stri
       });
     }
     std::filesystem::path cgroupPath;
-    if (c.collect("cgroup", [&] { cgroupPath = cgroupDirectory(); })) {
+    if (c.collect("cgroup", [&] { cgroupPath = cgroupV2Directory(); })) {
       auto& cgroup = system->cgroup.emplace();
       cgroup.path = arenaStr(resource, cgroupPath.string());
       // Controllers are independent: a missing pids controller must not hide
