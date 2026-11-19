@@ -6,7 +6,9 @@
 // /var/tmp), and before every iteration a fixed subset of
 // the column's pages is evicted with MADV_PAGEOUT, which needs no root.
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -22,9 +24,11 @@
 #include "luxir/server/LuxirNode.h"
 #include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/reader/RowReadAhead.h"
+#include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
@@ -67,12 +71,12 @@ std::vector<float> randomVector(uint64_t seed, int32_t dims) {
 // overlay (exact=true queries bypass it).  bucket_i = id % 1000 serves clustered
 // filters (runs of consecutive docs) and spread_i a scattered hash of the id;
 // deletes removes every 100th doc, so the scan's domain is the live docs.
-ColdIndex& coldIndex(int32_t dims, int64_t nDocs, int32_t nSegs, bool deletes) {
+ColdIndex& coldIndex(int32_t dims, int64_t nDocs, int32_t nSegs, bool deletes, bool rabitq = false) {
   static std::mutex mutex;
   static std::map<std::string, std::unique_ptr<ColdIndex>> indexes;
   std::lock_guard lock(mutex);
   std::string key = "d" + std::to_string(dims) + "-n" + std::to_string(nDocs) + "-s" +
-                    std::to_string(nSegs) + (deletes ? "-del" : "");
+                    std::to_string(nSegs) + (deletes ? "-del" : "") + (rabitq ? "-rabitq" : "");
   auto& slot = indexes[key];
   if (slot) return *slot;
   slot = std::make_unique<ColdIndex>();
@@ -92,7 +96,7 @@ ColdIndex& coldIndex(int32_t dims, int64_t nDocs, int32_t nSegs, bool deletes) {
   f.column = true;
   f.dims = dims;
   f.metric = api::VectorMetric::IP;
-  f.ann = pqAnn();
+  f.ann = rabitq ? rabitqAnn() : pqAnn();
   b.set(h.collection());
   std::vector<Doc> docs;
   int64_t id = 0;
@@ -289,6 +293,129 @@ void BM_VectorColdColumn(benchmark::State& state) {
   if (state.thread_index() == 0) RowReadAhead::enabled = true;
 }
 
+// The page-aligned span of each segment's IVF lists (ids, codes, amplitudes).
+std::vector<std::pair<char*, size_t>> listSpans(ColdIndex& index, std::vector<std::shared_ptr<AuxReader>>& held) {
+  std::vector<std::pair<char*, size_t>> spans;
+  auto reader = index.helper->getIndexWriter()->snapshots.readers.getReader();
+  size_t page = (size_t)sysconf(_SC_PAGESIZE);
+  for (const auto& seg : reader->segments()) {
+    auto aux = seg.getAuxReader("vec.bench_v");
+    auto* vaux = dynamic_cast<const VectorAuxReader*>(aux.get());
+    if (vaux == nullptr) continue;
+    held.push_back(aux);
+    auto layout = vaux->getListLayout();
+    auto* mapped = (char*)layout.file->getInputStream().ptr();
+    auto begin = (uintptr_t)mapped + layout.ids;
+    auto end = (uintptr_t)mapped + layout.amplitudes + layout.offsets.back() * sizeof(float);
+    begin = (begin + page - 1) & ~(uintptr_t)(page - 1);
+    end &= ~(uintptr_t)(page - 1);
+    if (end > begin) spans.emplace_back((char*)begin, (size_t)(end - begin));
+  }
+  return spans;
+}
+
+// RaBitQ interval search with the IVF lists cold and the column resident, so
+// the time is the lists' own.  Args: dims, nDocs, coldPermille, readAhead (0/1).
+void BM_VectorColdIvfLists(benchmark::State& state) {
+  if (luxir::unit_tests) {
+    state.SkipWithMessage("measurement-only");
+    return;
+  }
+  int32_t dims = (int32_t)state.range(0);
+  int64_t coldPermille = state.range(2);
+  ColdIndex& index = coldIndex(dims, state.range(1), 1, false, true);
+  RowReadAhead::enabled = state.range(3) != 0;
+  std::vector<std::shared_ptr<AuxReader>> held;
+  auto lists = listSpans(index, held);
+  warm(columnSpans(index));
+  warm(lists);
+  std::vector<std::vector<float>> queries;
+  for (int q = 0; q < 8; q++) queries.push_back(randomVector(1'000'000'000ULL + (uint64_t)q, dims));
+
+  double coldSum = 0;
+  long faults = 0;
+  int64_t bytes = 0, iteration = 0;
+  std::vector<double> millis;
+  for (auto _ : state) {
+    if (coldPermille > 0) {
+      state.PauseTiming();
+      coldSum += evict(lists, coldPermille);
+      state.ResumeTiming();
+    }
+    long faults0 = processMajorFaults();
+    int64_t bytes0 = readBytes();
+    auto started = std::chrono::steady_clock::now();
+    auto* req = LocalReq::create(index.helper->getSearchEngine());
+    req->collection("main").requestId("cold-bench");
+    auto& cur = req->topDocs();
+    cur.limit(10).countLimit().fields({"id"});
+    cur.rawQuery() = qb::knn(cur.mr(), "bench_v", queries[(size_t)(iteration++ % 8)], 10);
+    req->execute(false);
+    if (req->responses.empty() || req->responses[0]->proto.error) {
+      state.SkipWithError("search failed");
+      break;
+    }
+    millis.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+    faults += processMajorFaults() - faults0;
+    bytes += readBytes() - bytes0;
+  }
+  if (state.iterations() > 0) {
+    double n = (double)state.iterations();
+    state.counters["coldPct"] = 100.0 * coldSum / n;
+    state.counters["majflt"] = (double)faults / n;
+    state.counters["readMB"] = (double)bytes / n / (1024.0 * 1024.0);
+    // A mean over few iterations hides whether one stall or every query moved it.
+    std::sort(millis.begin(), millis.end());
+    state.counters["p50ms"] = millis[millis.size() / 2];
+    state.counters["maxms"] = millis.back();
+  }
+  RowReadAhead::enabled = true;
+}
+
+// Bytes an overlay open reads with the whole file cold.  checkAll replays a
+// validation of every amplitude at open, the cost a lazy check avoids.
+void BM_VectorColdOverlayOpen(benchmark::State& state) {
+  if (luxir::unit_tests) {
+    state.SkipWithMessage("measurement-only");
+    return;
+  }
+  ColdIndex& index = coldIndex((int32_t)state.range(0), state.range(1), 1, false, true);
+  bool checkAll = state.range(2) != 0;
+  auto& dir = index.helper->getIndexWriter()->dir;
+  auto durable = readDurableIndexInfo(dir);
+  const api::AuxIndexInfo* info = nullptr;
+  for (const auto& seg : durable->segments) {
+    for (const auto& overlay : seg.overlays) {
+      if (overlay.kind == VectorIndexBuilder::KIND) info = &overlay;
+    }
+  }
+  if (info == nullptr) {
+    state.SkipWithError("no overlay");
+    return;
+  }
+  auto file = dir.openFile(info->files[0].name, true);
+  auto stream = file->getInputStream();
+  size_t page = (size_t)sysconf(_SC_PAGESIZE);
+  std::vector<std::pair<char*, size_t>> spans = {{(char*)stream.ptr(), file->size() & ~(page - 1)}};
+  auto footer = VectorAuxListsFooter::fromFileTail(stream.ptr(), file->size(), info->name);
+  int64_t bytes = 0;
+  volatile float sink = 0;
+  for (auto _ : state) {
+    state.PauseTiming();
+    evict(spans, 1000);
+    state.ResumeTiming();
+    int64_t bytes0 = readBytes();
+    auto aux = VectorAuxReader::open(dir, *info, false);
+    if (checkAll) {
+      const float* values = (const float*)(stream.ptr() + footer.amplitudesOffset());
+      for (int64_t i = 0; i < footer.ntotal; i++) sink = sink + values[i];
+    }
+    bytes += readBytes() - bytes0;
+    benchmark::DoNotOptimize(aux);
+  }
+  if (state.iterations() > 0) state.counters["readMB"] = (double)bytes / (double)state.iterations() / (1024.0 * 1024.0);
+}
+
 // Each point with read-ahead off and on.
 void coldArgs(benchmark::Benchmark* b, std::initializer_list<std::array<int64_t, 6>> points) {
   for (auto& p : points) {
@@ -321,6 +448,16 @@ TUNING_BENCHMARK(BM_VectorColdColumn)
                    {384, 500'000, 1, 0, 1000, 1002}, {384, 500'000, 1, 0, 1000, 1250},
                    {384, 500'000, 1, 0, 1000, 1500}});
     })
+    ->UseRealTime()->Unit(benchmark::kMillisecond);
+
+TUNING_BENCHMARK(BM_VectorColdIvfLists)
+    ->ArgNames({"dims", "docs", "coldPm", "ra"})
+    ->ArgsProduct({{768}, {1'000'000}, {0, 10, 100, 1000}, {0, 1}})
+    ->UseRealTime()->Unit(benchmark::kMillisecond);
+
+TUNING_BENCHMARK(BM_VectorColdOverlayOpen)
+    ->ArgNames({"dims", "docs", "checkAll"})
+    ->ArgsProduct({{768}, {1'000'000}, {0, 1}})
     ->UseRealTime()->Unit(benchmark::kMillisecond);
 
 // Hot, concurrent: syscall contention on the shared mapping.
