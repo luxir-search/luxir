@@ -424,6 +424,17 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       }
     }, MERGE_PRIORITY);
 
+  // A node-wide merge slot handed to this writer (see setMergeSlots).
+  mergeResumeNode = std::make_unique<ContinueMultiFunc>(*updateGraph, 1,
+    [this](tbb::flow::continue_msg,
+           ContinueMultiFunc::output_ports_type& op) {
+      unused(op);
+      if (isClosed()) return;  // close() hands the slot back
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      _resumePolicyMergesLocked();
+      mergeSlots->returnGrant(*mergeTicket);  // not used: no merge is due
+    }, MERGE_PRIORITY);
+
   pressureRegistration = indexRamBudget->registerPressureListener([this]() noexcept {
     requestPressureCheck();
   });
@@ -469,11 +480,16 @@ void IndexWriter::close() {
   // synchronizes with a callback already copied out of the budget; any task it
   // queued before reset is included in wait_for_all below.
   pressureRegistration.reset();
+  // Likewise no merge-slot wake queues a task after the drain.
+  if (mergeTicket) mergeTicket->disable();
 
   // without this, in gcc release mode we can get a crash when the IndexWriter is destroyed, even when
   // the graph wasn't used. Presumably because the test was so fast and there was some async initialization
   // of the graph still going on?
   updateGraph->wait_for_all();
+
+  // Every merge has tailed, so this writer holds no slot but an unused grant.
+  if (mergeTicket) mergeSlots->cancel(*mergeTicket);
 
   std::vector<UpdateMessage*> abandoned;
   {
@@ -541,7 +557,17 @@ void IndexWriter::_releaseMergeWaiterHoldsLocked() {
 // Caller must hold indexMutex.  Admission and waiter accounting are one
 // transaction so a rejected graph submission cannot strand a wait_for_merges
 // commit or leave the policy throttle engaged.
+//
+// With a node-wide merge limit, a policy merge first needs a slot.  When none
+// is free the writer's ticket queues and this returns false; the slot's
+// release wakes mergeResumeNode, which resubmits.  A merge a client waits for
+// (forced, or while a wait_for_merges commit is pending) takes a slot at once.
 bool IndexWriter::_submitMergeLocked(MergeMessage* msg) {
+  if (mergeSlots) {
+    if (msg->forcedBy != nullptr || !waitingForMerges.empty()) mergeSlots->acquireNow();
+    else if (!mergeSlots->tryAcquire(mergeTicket)) return false;
+    msg->holdsSlot = true;
+  }
   mergePolicy->outstandingMerges++;
   _addMergeWaiterHoldsLocked();
 
@@ -549,6 +575,10 @@ bool IndexWriter::_submitMergeLocked(MergeMessage* msg) {
     assert(mergePolicy->outstandingMerges > 0);
     mergePolicy->outstandingMerges--;
     _releaseMergeWaiterHoldsLocked();
+    if (msg->holdsSlot) {
+      msg->holdsSlot = false;
+      mergeSlots->release();
+    }
   };
 
   bool accepted;
@@ -649,6 +679,14 @@ void IndexWriter::_resumePolicyMergesLocked() {
   } catch (const std::exception& e) {
     LOG_ERROR("Policy merge resume failed: exception={}", e.what());
   }
+}
+
+void IndexWriter::setMergeSlots(std::shared_ptr<MergeSlots> slots) {
+  assert(!mergeSlots);
+  // The node queues (try_put never rejects), and its body takes indexMutex,
+  // so the wake is safe from another writer's merge tail.
+  mergeTicket = std::make_shared<MergeSlots::Ticket>([this] { mergeResumeNode->try_put(tbb::flow::continue_msg{}); });
+  mergeSlots = std::move(slots);
 }
 
 // Returns true when the merge message itself should be completed by the merge
@@ -1175,6 +1213,9 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
       if (msg.waitForMerges) {
         waitingForMerges.push_back(&msg);
         commitInfo.leftToFlush += (uint32_t)mergePolicy->outstandingMerges;
+        // A merge queued for a node-wide slot would not be waited for: submit
+        // it now, past the limit, with a hold for this commit.
+        if (mergeTicket && mergeSlots->queued(*mergeTicket)) _resumePolicyMergesLocked();
       }
 
       // first look at any flushing inverters that are not marked for a commit yet
@@ -2606,7 +2647,7 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
   return info.commit_time;
 }
 
-bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge) {
+bool IndexWriter::finishMergeTail(MergeMessage& msg, bool allowSyntheticCommit, bool chainNextMerge) {
   bool triggerCommit = false;
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
@@ -2617,6 +2658,12 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
     // waiters.
     assert(mergePolicy->outstandingMerges > 0);
     mergePolicy->outstandingMerges--;
+    // Before chaining: a writer already queued for the slot gets it first,
+    // and this writer's next merge queues behind it.
+    if (msg.holdsSlot) {
+      msg.holdsSlot = false;
+      mergeSlots->release();
+    }
 
     // On a contained merge FAILURE the caller passes chainNextMerge=false: the
     // sources were restored unchanged, so _maybeMergeSegments would immediately
@@ -2883,6 +2930,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     // Merge cursors borrow the space readers from the pinned cores.
     {
       PostingsWriter pwriter(dir, outputSegId, writerEpoch);
+      if (!clientOrigin) pwriter.setRateLimiter(mergeRateLimiter.get());
 
       phase = "segment_merge";
       // Do the actual merge.  The current schema chooses each stored-fields
@@ -3197,10 +3245,10 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   // failure path above skips source/file restoration and this tail may still
   // request the synthetic publish commit.
   if (clientOrigin) {
-    finishMergeTail(allowSyntheticCommit, chainNextMerge);
+    finishMergeTail(msg, allowSyntheticCommit, chainNextMerge);
     return submitMergeCommit(msg, /*publishOnly=*/true);
   }
-  bool triggerCommit = finishMergeTail(allowSyntheticCommit, chainNextMerge);
+  bool triggerCommit = finishMergeTail(msg, allowSyntheticCommit, chainNextMerge);
   if (triggerCommit) {
     return submitMergeCommit(msg, /*publishOnly=*/false);
   } else {

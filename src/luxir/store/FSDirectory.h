@@ -233,6 +233,7 @@ class FSFile : public File {
   int fd_ = -1;
   size_t fileSize_ = 0;
   XXH3_state_t hash;
+  ByteRateLimiter* rateLimiter_;  // null = unpaced
 
   // Single reusable write buffer
   std::unique_ptr<char[]> buf_;
@@ -251,8 +252,15 @@ class FSFile : public File {
 
   void writeToFd(const char* data, size_t len) {
     XXH3_64bits_update(&hash, data, len);
+    // A paced write charges one chunk at a time, so no single wait is long.
+    size_t chunk = rateLimiter_ ? rateLimiter_->chunk() : len;
+    size_t paid = 0;
     while (len > 0) {
-      auto n = ::write(fd_, data, len);
+      if (rateLimiter_ && paid == 0) {
+        paid = std::min(chunk, len);
+        rateLimiter_->pace(paid);
+      }
+      auto n = ::write(fd_, data, rateLimiter_ ? paid : len);
       if (n < 0) {
         throw FileIOException("FSFile: write failed for: " + path_.string() + ": " + strerror(errno));
       }
@@ -261,6 +269,7 @@ class FSFile : public File {
       }
       data += n;
       len -= (size_t)n;
+      if (rateLimiter_) paid -= (size_t)n;
     }
   }
 
@@ -293,8 +302,8 @@ class FSFile : public File {
   }
 
 public:
-  FSFile(std::string_view name, const std::filesystem::path& path)
-      : File(name), path_(path), tmpPath_(path.string() + ".tmp") {
+  FSFile(std::string_view name, const std::filesystem::path& path, ByteRateLimiter* rateLimiter = nullptr)
+      : File(name), path_(path), tmpPath_(path.string() + ".tmp"), rateLimiter_(rateLimiter) {
     XXH3_64bits_reset(&hash);
   }
 
@@ -342,6 +351,7 @@ class RAMDelegatingFile : public File {
   std::unique_ptr<FSFile> delegate;
   std::function<void(int64_t)> ramBytesChanged;
   size_t spillBytes;
+  ByteRateLimiter* rateLimiter;  // handed to the spill file
   bool bufferingEnabled = true;
 
   void accountChange(int64_t delta) noexcept {
@@ -390,7 +400,7 @@ class RAMDelegatingFile : public File {
 
   void materializeRam() {
     if (delegate != nullptr) return;
-    delegate = std::make_unique<FSFile>(name_, path_);
+    delegate = std::make_unique<FSFile>(name_, path_, rateLimiter);
     size_t before = ramFile.allocatedBytes();
     delegate->destructiveAppend(ramFile);
     accountRamOperation(before);
@@ -453,9 +463,10 @@ class RAMDelegatingFile : public File {
 public:
   RAMDelegatingFile(std::string_view name, const std::filesystem::path& path,
                     size_t spillBytes,
-                    std::function<void(int64_t)>&& ramBytesChanged)
+                    std::function<void(int64_t)>&& ramBytesChanged,
+                    ByteRateLimiter* rateLimiter = nullptr)
       : File(name), path_(path), ramFile(name),
-        ramBytesChanged(std::move(ramBytesChanged)), spillBytes(spillBytes) {
+        ramBytesChanged(std::move(ramBytesChanged)), spillBytes(spillBytes), rateLimiter(rateLimiter) {
     assert(spillBytes > 0);
   }
 
@@ -619,13 +630,13 @@ public:
   std::unique_ptr<File> createFile(
       std::string_view name, FileCreateOptions options) override {
     std::filesystem::create_directories(basePath_);
-    if (!options.ramDelegating) return createFile(name);
+    if (!options.ramDelegating) return std::make_unique<FSFile>(name, filePath(name), options.rateLimiter);
     if (options.ramSpillBytes == 0) {
       throw std::invalid_argument("RAM-delegating file requires a spill threshold");
     }
     return std::make_unique<RAMDelegatingFile>(
         name, filePath(name), options.ramSpillBytes,
-        std::move(options.ramBytesChanged));
+        std::move(options.ramBytesChanged), options.rateLimiter);
   }
 
   bool deleteFile(std::string_view name) override {

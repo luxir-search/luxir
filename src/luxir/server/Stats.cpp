@@ -170,6 +170,14 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   fillActivity(dst.merge, counts, metricActivity(MetricStage::MERGE), resource);
   fillActivity(dst.vector_build, counts, metricActivity(MetricStage::VECTOR_BUILD), resource);
   fillActivity(dst.reader_refresh, counts, metricActivity(MetricStage::READER_REFRESH), resource);
+  dst.query_workers = node.getQueryWorkersActive();
+  dst.indexing_workers = node.getIndexWorkersActive();
+  auto merges = node.collections().getMergeSlots().stats();
+  dst.merges_running = merges.running;
+  dst.merges_waiting = merges.waiting;
+  dst.merge_slot_waits = merges.waits;
+  dst.merge_slot_wait_seconds = (double)merges.waitNanos / 1e9;
+  dst.merge_paced_seconds = std::chrono::duration<double>(node.collections().getMergeRateLimiter().paused()).count();
 }
 
 void fillOutcomes(api::OutcomeStats& dst, const std::array<uint64_t, (size_t)MetricOutcome::COUNT>& outcomes,

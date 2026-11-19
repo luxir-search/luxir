@@ -1760,6 +1760,21 @@ message ServiceStats {
   ActivityStats merge = 16;
   ActivityStats vector_build = 17;
   ActivityStats reader_refresh = 18;
+  // Pool workers now in the query arena and in the low-priority indexing
+  // arena. Indexing keeps at least one worker whenever it has work, however
+  // busy the query arena is.
+  int64 query_workers = 40;
+  int64 indexing_workers = 41;
+  // Policy merges holding a node-wide merge slot (indexing.max-concurrent-merges;
+  // merges a client waits for count too and may exceed it), and collections
+  // queued for one.
+  int64 merges_running = 42;
+  int64 merges_waiting = 43;
+  // Merges that waited for a slot, and their summed wait.
+  uint64 merge_slot_waits = 44;
+  double merge_slot_wait_seconds = 45;
+  // Time merge writes waited on indexing.merge-max-bytes-per-sec.
+  double merge_paced_seconds = 46;
 }
 
 // This process, its data filesystem and its cgroup. Collectors that read their

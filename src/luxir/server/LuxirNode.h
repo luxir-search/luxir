@@ -7,12 +7,15 @@
 #include <chrono>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+#include "ArenaNice.h"
 #include "Collections.h"
 #include "PluginNodeState.h"
 #include "luxir/index/IndexRamBudget.h"
@@ -120,6 +123,26 @@ public:
 
   // The task arena's worker threads (server.workers, resolved).
   int getWorkers() const { return workers; }
+  // Workers the indexing arena may use at once (index.threads, resolved).
+  int getIndexThreads() const { return indexThreads; }
+  // Pool workers currently in each arena.
+  int64_t getQueryWorkersActive() const { return arenaThreadNamer.activeWorkers(); }
+  int64_t getIndexWorkersActive() const { return indexThreadNamer.activeWorkers(); }
+
+  // Pool workers past the query arena's width.  TBB fills arenas in priority
+  // order but never past an arena's own worker cap (market::update_allotment),
+  // so whenever background arenas have work they share these workers however
+  // busy the query arena is: indexing keeps at least one worker under any
+  // search load, and never stalls behind it.  The reverse needs no floor: a
+  // query hop finds a worker at once, because indexing is capped below the
+  // pool (index.threads), and further workers are recalled from indexing at
+  // task boundaries.  The floor is per process: nodes embedded side by side
+  // share one, and so does any other background arena.  Holding it as pool
+  // width, not a reserved arena slot (slots are seats for entering threads, not
+  // workers), is what keeps it out of the query arena's reach.
+  static constexpr int kBackgroundFloor = 1;
+  // Nice increment applied to workers running indexing work; 0 = off.
+  int getIndexNice() const { return indexNiceIncrement; }
 
   // Counts a transport server's threads against the task arena's reserved
   // slots for the holder's lifetime.  Warns when entrants outnumber the slots
@@ -165,6 +188,7 @@ private:
   // CPU than the work.  The arenas are declared ahead of the collections and
   // the search engine so they outlive the work those run in them.
   int workers;
+  int indexThreads;
   int reservedSlots;
   std::atomic<int> arenaEntrants{1};  // the embedding thread; see ArenaEntrants
   oneapi::tbb::task_arena taskArena;
@@ -177,6 +201,7 @@ private:
   class ArenaThreadNamer : public oneapi::tbb::task_scheduler_observer {
     const char* prefix;
     int reservedSlots;  // workers occupy the slots after these
+    std::atomic<int64_t> active{0};  // workers in the arena
     // apply() installs startup flags before node construction. Capture enable
     // for this observer's lifetime so its entries and exits always pair.
     std::unique_ptr<LoadRegistry::ArenaActivity> loadActivity;
@@ -189,6 +214,7 @@ private:
       observe(true);
     }
     ~ArenaThreadNamer() override { observe(false); }
+    int64_t activeWorkers() const { return active.load(std::memory_order_relaxed); }
     void on_scheduler_entry(bool worker) override;
     void on_scheduler_exit(bool worker) override;
   };
@@ -197,12 +223,17 @@ private:
   // Every collection's indexing: update batches, flushes, merges (each
   // writer's update graph runs here; see Collections).  Its own arena at low
   // priority, so TBB lends workers to queries in taskArena first and recalls
-  // them from indexing at task boundaries; the worker pool has one more thread
-  // than either arena uses, so a query hop finds a free worker at once even
-  // while indexing holds all of its own.  One reserved seat for a thread
-  // waiting on a graph (close, tests).
+  // them from indexing at task boundaries, down to the kBackgroundFloor
+  // workers queries cannot take.  index.threads wide, below the pool, so a
+  // query hop finds a free worker at once even while indexing holds all of
+  // its own.  One reserved seat for a thread waiting on a graph (close, tests).
   oneapi::tbb::task_arena indexArena;
   ArenaThreadNamer indexThreadNamer{indexArena, "luxir_idx_", 1, true};
+
+  // Nices the indexing arena's workers (index.nice); emplaced only when the
+  // probe in ArenaNice::resolve proved the restore is permitted.
+  int indexNiceIncrement = 0;
+  std::optional<ArenaNice> indexNice;
 
   IndexRamBudget indexRamBudget;
   std::shared_ptr<ReplicationSource> replication;
