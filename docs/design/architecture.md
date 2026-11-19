@@ -63,19 +63,14 @@ every core busy even when work is skewed.
   Independent updates are automatically parallelized. A single HTTP NDJSON
   connection submits multiple internal batches for concurrent indexing, with
   a bounded number in flight and backpressure when that limit is reached.
-- **The control plane is not on the scheduler.** Administration (collection
-  lifecycle, schema changes), replication transfers and timers, plugin routes
-  and storage-reading stats run FIFO on a small node-owned pool of dedicated
-  threads (`--server.control-threads`, default 2), not as tasks in the search
-  arena. Control work blocks: fsync, catalog writes, a writer's close draining
-  its update graph and any running merge, a large file read. As an arena task,
-  each block would hold a worker from the pool the search arena draws on,
-  and under search load the work would sit behind every queued search, so
-  monitoring and administration would go dark exactly when needed. The
-  dedicated threads take no worker from the pool and enter an arena only
-  through seats reserved for them, as transport threads do. Cheap stats
-  (`/_stats`, `/metrics` without `files` or `segments`) are built inline on
-  the connection or completion-queue thread.
+- **Blocking control work runs on dedicated threads.** Administration, schema
+  changes, replication transfer setup and expiry, and detailed stats run on a
+  node-owned pool (`--server.control-threads`, default 2). Fsync, catalog
+  writes, and writer drains can occupy those threads while search workers
+  remain available. Writer drains enter the index arena through reserved
+  seats. Bare node stats run on the connection or completion-queue thread.
+  The default `/metrics` includes collection and system stats and uses the
+  control pool.
 - **Merging** parallelizes inside a single merge, not just across merges:
   every field merges as its own task, because the segment format does not
   tie index structures to specific files - concurrent tasks write their own

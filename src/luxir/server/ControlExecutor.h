@@ -16,7 +16,7 @@
 namespace luxir {
 
 // The node's control plane: administration (collection lifecycle, schema
-// changes), replication transfers and timers, plugin routes and expensive
+// changes), replication transfers and timers, and detailed
 // stats run here, FIFO, on a few dedicated OS threads (server.control_threads).
 //
 // Not a TBB arena on purpose. Control work blocks: fsync, catalog writes, a
@@ -25,10 +25,8 @@ namespace luxir {
 // arena (whose workers come from the same pool) would lose it, and a control
 // arena large enough not to queue behind such a block would take more. These
 // threads are outside the pool: they never take a worker from searches or
-// indexing, and searches never delay them. A control thread that enters an
-// arena (a writer's close() waiting on its graph, a plugin route running a
-// search) uses one of the seats the node reserves for it, as a transport
-// thread does.
+// indexing while blocked. A control thread waiting on a writer's graph
+// enters the index arena through a reserved seat.
 class ControlExecutor {
 public:
   struct Stats {

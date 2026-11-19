@@ -2353,7 +2353,7 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.merge"></a>[`merge`](#field-luxir.servicestats.merge) | 16 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.vector_build"></a>[`vector_build`](#field-luxir.servicestats.vector_build) | 17 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.reader_refresh"></a>[`reader_refresh`](#field-luxir.servicestats.reader_refresh) | 18 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
-| <a id="field-luxir.servicestats.control_threads"></a>[`control_threads`](#field-luxir.servicestats.control_threads) | 60 | `uint64` | singular | The control executor (server.control\_threads): administration, schema changes, collection lifecycle, replication transfers and timers, plugin routes and file or segment stats. |
+| <a id="field-luxir.servicestats.control_threads"></a>[`control_threads`](#field-luxir.servicestats.control_threads) | 60 | `uint64` | singular | The control executor (server.control\_threads): administration, schema changes, collection lifecycle, replication transfers and timers, and detailed stats. |
 | <a id="field-luxir.servicestats.control_busy"></a>[`control_busy`](#field-luxir.servicestats.control_busy) | 61 | `uint64` | singular | tasks running now |
 | <a id="field-luxir.servicestats.control_queued"></a>[`control_queued`](#field-luxir.servicestats.control_queued) | 62 | `uint64` | singular | tasks waiting for a thread |
 | <a id="field-luxir.servicestats.control_completed"></a>[`control_completed`](#field-luxir.servicestats.control_completed) | 63 | `uint64` | singular |  |

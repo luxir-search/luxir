@@ -48,9 +48,9 @@ PluginNodeState* PluginNodeStates::find(std::string_view name) const {
 // One arena slot per thread that enters the task arena from outside: each
 // HTTP shard the configured server runs, plus the embedding (main or test)
 // thread.  gRPC threads never enter: they enqueue their work.
-static int reservedArenaSlots(const LuxirConfig& config, int controlThreads) {
+static int reservedArenaSlots(const LuxirConfig& config) {
   const auto& server = config.server;
-  return (server.http.enabled ? server.http.resolveThreads() : 0) + 1 + controlThreads;
+  return (server.http.enabled ? server.http.resolveThreads() : 0) + 1;
 }
 
 // TBB's global pool lends at most max_allowed_parallelism - 1 workers to all
@@ -82,8 +82,8 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
   : node(node), n(n) {
   int total = node.arenaEntrants.fetch_add(n, std::memory_order_relaxed) + n;
   if (total > node.reservedSlots) {
-    LOG_WARN("{} with {} threads brings task arena entrants to {}, past the {} slots reserved from "
-             "server.http.threads; excess entrants can block behind arena work",
+    LOG_WARN("{} with {} threads brings task arena entrants to {}, past the {} reserved slots; "
+             "excess entrants can block behind arena work",
              server, n, total, node.reservedSlots);
   }
 }
@@ -117,7 +117,7 @@ static std::string defaultNodeId(const ServerConfig& server, bool& random) {
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   : config(std::move(config)), mode(mode), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
     controlThreads(std::max(1, this->config.server.control_threads)),
-    reservedSlots(reservedArenaSlots(this->config, controlThreads)), arenaEntrants(1 + controlThreads),
+    reservedSlots(reservedArenaSlots(this->config)),
     taskArena(workers + reservedSlots, reservedSlots,
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
     indexArena(workers + 1 + controlThreads, 1 + controlThreads, oneapi::tbb::task_arena::priority::low) {
@@ -186,13 +186,14 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
 }
 
 LuxirNode::~LuxirNode() {
-  // Queued control work (a delete, a replication expiry tick) completes
-  // against a whole node.
+  // Complete pending waits while they can still enqueue replies. A control
+  // task registering a wait during the drain gets an immediate cancellation.
+  commitWaits->close();
+  // Drain before tearing down the node state used by queued control work.
   control->stop();
   pluginStates.clear();
   scrubber->stop();
   if (follower) follower->stop();
-  commitWaits->close();
 }
 
 std::shared_ptr<Collection> LuxirNode::checkLoaded(std::shared_ptr<Collection> collection) {

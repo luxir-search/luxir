@@ -119,7 +119,7 @@ public:
   }
   oneapi::tbb::task_arena& getIndexArena() { return indexArena; }
   // Administration, collection lifecycle, schema changes, replication
-  // transfers and timers, plugin routes: never on the search arena.
+  // transfers and timers, and detailed stats run off the search arena.
   ControlExecutor& getControlExecutor() { return *control; }
 
   // The task arena's worker threads (server.workers, resolved).
@@ -160,9 +160,8 @@ private:
   // Query work.  Workers: server.workers (resolveWorkers(); at least
   // one, since an arena of only reserved slots never serves enqueued tasks).
   // Plus a reserved slot per thread that enters from outside (each configured
-  // HTTP shard, each control thread and the embedding thread; gRPC threads
-  // only enqueue), so an execute()
-  // from a transport thread always finds a free slot instead of handing its
+  // HTTP shard and the embedding thread; gRPC threads only enqueue), so an
+  // execute() from a transport thread always finds a free slot instead of handing its
   // functor to the arena and blocking behind arena backlog.  Reserved slots
   // are seats, not threads: they add no workers.  Workers that run out of
   // work leave at once (leave_policy::fast) instead of yielding for up to a
@@ -172,7 +171,7 @@ private:
   int workers;
   int controlThreads;
   int reservedSlots;
-  std::atomic<int> arenaEntrants;  // the embedding and control threads; see ArenaEntrants
+  std::atomic<int> arenaEntrants{1};  // the embedding thread; see ArenaEntrants
   oneapi::tbb::task_arena taskArena;
 
   // Labels arena worker threads for ps/top/gdb. Masters (transport threads
@@ -219,8 +218,7 @@ private:
   std::unique_ptr<ReplicationFollower> follower;
   std::unique_ptr<Scrubber> scrubber;
   std::unique_ptr<SearchEngine> searchEngine;
-  // Started before the collections open and stopped first in the destructor,
-  // so its tasks never outlive what they reference.
+  // Drained before tearing down the node state used by its tasks.
   std::unique_ptr<ControlExecutor> control;
   PluginNodeStates pluginStates;
 };

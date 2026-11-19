@@ -1053,13 +1053,9 @@ static void handleStats(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       finishWithException(call, e);
     }
   };
-  // Counters and per-collection totals are atomics and short writer locks
-  // that searches never take: answer on the completion-queue thread, so stats
-  // never queue behind searches. File sizes and per-segment output read
-  // storage and are unbounded; those run on the control executor, where
-  // responsesExpected keeps the call alive and requestActive preserves
-  // per-call request ordering.
-  if (!request->proto.segments && !request->proto.files) {
+  // Collection walks and system sampling run off the completion queue.
+  // responsesExpected keeps the call alive and requestActive preserves order.
+  if (canGatherStatsInline(request->proto)) {
     run();
     return;
   }

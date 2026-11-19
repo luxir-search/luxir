@@ -1686,7 +1686,8 @@ private:
         // /metrics is the Prometheus scrape of the node: the same stats, with
         // the collections and system sections on unless the URL turns them off.
         bool scrape = match.route == Route::METRICS;
-        StatsParams stats{.collections = scrape, .system = scrape};
+        api::StatsRequest stats;
+        stats.collections = stats.system = scrape;
         std::string err;
         const std::string* format = findParam(params, "format");
         if (format && *format != "json" && *format != "prometheus") {
@@ -1701,10 +1702,10 @@ private:
           respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
           return;
         }
-        stats.prometheus = format ? *format == "prometheus" : scrape;
         // /_stats covers every tenant; a tenant route or a collection is scoped.
-        handleStats(coll.empty() ? std::nullopt : std::optional<std::string>(coll),
-                    match.tenantRoute || !coll.empty() ? tenant_ : std::string(), stats);
+        stats.collection = coll;
+        if (match.tenantRoute || !coll.empty()) stats.tenant = tenant_;
+        handleStats(stats, format ? *format == "prometheus" : scrape);
         break;
       }
       case Route::SCHEMA: {
@@ -1743,7 +1744,7 @@ private:
     }
   }
 
-  // A plugin route runs its handler on the control executor, then answers on
+  // A plugin route runs its handler on the search arena, then answers on
   // the connection's executor: the handler's body, or the search it asked for
   // (which runs where any search does).
   void handlePluginRoute(const HttpRoute& route, http::request<http::string_body>& req, std::string_view target) {
@@ -1761,7 +1762,7 @@ private:
     call->pathParams = route_.plugin->params;
     for (const auto& param : urlParams_) call->queryParams.emplace_back(param.key, param.value);
     auto shardPin = makeShardPin();
-    node_.getControlExecutor().enqueue([self = shared_from_this(), &route, call, tenant = tenant_, shardPin] {
+    node_.getTaskArena().enqueue([self = shared_from_this(), &route, call, tenant = tenant_, shardPin] {
       HttpPluginResponse response;
       std::optional<ErrorInfo> failure;
       try {
@@ -2641,39 +2642,18 @@ private:
     });
   }
 
-  struct StatsParams {
-    bool segments = false;
-    bool collections = false;
-    bool files = false;
-    bool system = false;
-    bool host = false;
-    bool prometheus = false;
-  };
-
-  // Counters, gauges and per-collection totals are atomics and short writer
-  // locks that searches never take, so the default /_stats and /metrics run
-  // inline on the shard and answer even while every search worker is busy.
-  // File sizes and per-segment detail read storage; those run on the control
-  // executor.
-  void handleStats(std::optional<std::string> coll, std::string tenant, StatsParams params) {
-    auto render = [](LuxirNode& node, const std::optional<std::string>& coll, const std::string& tenant,
-                     const StatsParams& params) -> std::variant<std::string, ErrorInfo> {
+  // The bare node /_stats runs on the shard. Collection walks and system
+  // sampling, including the default /metrics, run on the control executor.
+  void handleStats(api::StatsRequest request, bool prometheus) {
+    auto render = [](LuxirNode& node, const api::StatsRequest& request,
+                     bool prometheus) -> std::variant<std::string, ErrorInfo> {
       try {
         std::pmr::monotonic_buffer_resource resource;
-        luxir::api::StatsRequest request;
-        request.segments = params.segments;
-        request.collections = params.collections;
-        request.files = params.files;
-        request.system = params.system;
-        request.host = params.host;
-        request.tenant = tenant;
-        if (coll) request.collection = *coll;
-
         luxir::api::StatsResponse response;
         gatherStats(node, request, response, resource);
 
         std::string out;
-        if (params.prometheus) {
+        if (prometheus) {
           out = renderPrometheus(response);
           out += loadSignalDebugText();
         } else if (!luxir::api::write_json(response, out)) {
@@ -2689,17 +2669,20 @@ private:
       else if (prometheus) self.respondSimple(http::status::ok, prometheusContentType, std::move(std::get<std::string>(result)));
       else self.respondJson(http::status::ok, std::move(std::get<std::string>(result)));
     };
-    if (!params.segments && !params.files) {
-      auto result = render(node_, coll, tenant, params);
-      respond(*this, result, params.prometheus);
+    if (canGatherStatsInline(request)) {
+      auto result = render(node_, request, prometheus);
+      respond(*this, result, prometheus);
       return;
     }
     auto shardPin = makeShardPin();
     node_.getControlExecutor().enqueue(
-        [self = shared_from_this(), coll = std::move(coll), tenant = std::move(tenant), params, shardPin, render, respond] {
-          auto result = render(self->node_, coll, tenant, params);
-          net::post(self->stream_.get_executor(), [self, shardPin, result = std::move(result), params, respond]() mutable {
-            respond(*self, result, params.prometheus);
+        [self = shared_from_this(), collection = std::string(request.collection), tenant = std::string(request.tenant),
+         request, prometheus, shardPin, render, respond]() mutable {
+          request.collection = collection;
+          request.tenant = tenant;
+          auto result = render(self->node_, request, prometheus);
+          net::post(self->stream_.get_executor(), [self, shardPin, result = std::move(result), prometheus, respond]() mutable {
+            respond(*self, result, prometheus);
           });
         });
   }
@@ -3873,49 +3856,54 @@ private:
 
   void submitUrlCommit(const std::shared_ptr<HttpStreamUpdateState>& state,
                        const std::shared_ptr<UrlWriters>& writers, size_t index) {
-    node_.getControlExecutor().enqueue([self = shared_from_this(), state, writers, index] {
+    // Submitted from the shard as a stream batch is: the EOF barrier has
+    // drained the batches before it, and execute enters the arena only for the
+    // immediate try_put.
+    try {
+      auto request = std::make_shared<HttpUpdateState>();
+      request->proto.collection = api::build::arenaStr(request->resource, (*writers)[index].first);
+      auto& params = request->proto.commit.emplace();
+      params.wait_for_replicas = state->url.waitForReplicas.empty() ? std::nullopt : std::optional(replicaRequirement(state->url.waitForReplicas));
+      params.wait_for_replicas_timeout_ms = state->url.waitForReplicasTimeoutMs;
+      class Commit final : public ProtoUpdateMessage {
+        std::shared_ptr<HttpUpdateState> request;
+        std::shared_ptr<HttpSession> session;
+        std::shared_ptr<HttpStreamUpdateState> state;
+        std::shared_ptr<UrlWriters> writers;
+        size_t index;
+      public:
+        Commit(std::shared_ptr<HttpUpdateState> request, std::shared_ptr<HttpSession> session,
+               std::shared_ptr<HttpStreamUpdateState> state, std::shared_ptr<UrlWriters> writers, size_t index)
+            : ProtoUpdateMessage(&request->proto), request(std::move(request)), session(std::move(session)),
+              state(std::move(state)), writers(std::move(writers)), index(index) {}
+        void done(IndexWriter&) override {
+          auto completed = takeCompletion(session->node_);
+          auto target = session;
+          auto streamState = state;
+          auto collectionName = (*writers)[index].first;
+          delete this;
+          completed->await(target->node_, [target, streamState, collectionName](auto result) {
+            auto error = result->response.error ? std::optional(api::build::errorInfo(*result->response.error)) : std::nullopt;
+            net::post(target->stream_.get_executor(), [target, streamState, collectionName, result, error]() mutable {
+              target->onUrlCommitDone(streamState, collectionName, result->commit, result->response.replicas, std::move(error));
+            });
+          }, target->waitCancellation.get_token());
+        }
+      };
+      auto message = std::make_unique<Commit>(std::move(request), shared_from_this(), state, writers, index);
+      message->target = (*writers)[index].second.collection->getId();
+      auto* msg = message.release();
       try {
-        auto request = std::make_shared<HttpUpdateState>();
-        request->proto.collection = api::build::arenaStr(request->resource, (*writers)[index].first);
-        auto& params = request->proto.commit.emplace();
-        params.wait_for_replicas = state->url.waitForReplicas.empty() ? std::nullopt : std::optional(replicaRequirement(state->url.waitForReplicas));
-        params.wait_for_replicas_timeout_ms = state->url.waitForReplicasTimeoutMs;
-        class Commit final : public ProtoUpdateMessage {
-          std::shared_ptr<HttpUpdateState> request;
-          std::shared_ptr<HttpSession> session;
-          std::shared_ptr<HttpStreamUpdateState> state;
-          std::shared_ptr<UrlWriters> writers;
-          size_t index;
-        public:
-          Commit(std::shared_ptr<HttpUpdateState> request, std::shared_ptr<HttpSession> session,
-                 std::shared_ptr<HttpStreamUpdateState> state, std::shared_ptr<UrlWriters> writers, size_t index)
-              : ProtoUpdateMessage(&request->proto), request(std::move(request)), session(std::move(session)),
-                state(std::move(state)), writers(std::move(writers)), index(index) {}
-          void done(IndexWriter&) override {
-            auto completed = takeCompletion(session->node_);
-            auto target = session;
-            auto streamState = state;
-            auto collectionName = (*writers)[index].first;
-            delete this;
-            completed->await(target->node_, [target, streamState, collectionName](auto result) {
-              auto error = result->response.error ? std::optional(api::build::errorInfo(*result->response.error)) : std::nullopt;
-              net::post(target->stream_.get_executor(), [target, streamState, collectionName, result, error]() mutable {
-                target->onUrlCommitDone(streamState, collectionName, result->commit, result->response.replicas, std::move(error));
-              });
-            }, target->waitCancellation.get_token());
-          }
-        };
-        auto* msg = new Commit(std::move(request), self, state, writers, index);
-        msg->target = (*writers)[index].second.collection->getId();
-        try { if (!(*writers)[index].second.indexWriter->submitUpdate(msg)) throw std::runtime_error("update was not admitted"); }
-        catch (...) { delete msg; throw; }
-      } catch (...) {
-        auto error = currentExceptionInfo(ErrorKind::INTERNAL);
-        net::post(self->stream_.get_executor(), [self, state, writers, index, error] {
-          self->onUrlCommitDone(state, (*writers)[index].first, {}, {}, error);
-        });
-      }
-    });
+        bool admitted = false;
+        node_.getTaskArena().execute([&] { admitted = (*writers)[index].second.indexWriter->submitUpdate(msg); });
+        if (!admitted) throw std::runtime_error("update was not admitted");
+      } catch (...) { delete msg; throw; }
+    } catch (...) {
+      auto error = currentExceptionInfo(ErrorKind::INTERNAL);
+      net::post(stream_.get_executor(), [self = shared_from_this(), state, writers, index, error] {
+        self->onUrlCommitDone(state, (*writers)[index].first, {}, {}, error);
+      });
+    }
   }
 
   void submitUrlCommits() {

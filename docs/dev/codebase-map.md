@@ -13,9 +13,8 @@ locations, browse `src/luxir/<area>/`.
    - `LuxirNode`: Central coordinator wiring collections and services; owns the search
      arena (`getTaskArena`), the index arena (`getIndexArena`) and the control executor
    - `ControlExecutor`: Dedicated threads, outside the TBB worker pool, for administration,
-     schema changes, collection lifecycle, replication transfers and timers, plugin routes
-     and storage-reading stats; nothing but searches and their continuations runs on the
-     search arena
+     schema changes, collection lifecycle, replication transfer setup and expiry,
+     and detailed stats
    - `Stats`: The one mapping from engine state (`IndexWriter`/`ReaderManager::stats`, RAM budgets,
      allocator, `util/Metrics.h` service counters, `SystemStats` procfs/cgroup readers) into
      `api::StatsResponse`; `Prometheus` renders that response as text for `/metrics` and `_stats?format=prometheus`

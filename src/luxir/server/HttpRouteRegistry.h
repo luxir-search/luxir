@@ -46,10 +46,8 @@ struct HttpPluginResponse {
   std::string searchCollection;
 };
 
-// Runs on a control-executor thread (server.control_threads), off the
-// connection's I/O thread and the search workers, so it may block on engine
-// work. A handler that runs a search should hand it back as searchBody, which
-// runs where every search does. Throw RequestError (or any ApiError) to answer with
+// Runs on a task-arena worker, off the connection's I/O thread, so it may
+// block on engine work. Throw RequestError (or any ApiError) to answer with
 // that error; other exceptions answer 500.
 using HttpHandler = std::function<void(HttpPluginRequest& request, HttpPluginResponse& response)>;
 

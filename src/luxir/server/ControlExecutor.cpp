@@ -17,7 +17,12 @@ ControlExecutor::ControlExecutor(int n) {
   width = n;
   live = n;
   threads.reserve((size_t)n);
-  for (int i = 0; i < n; i++) threads.emplace_back([this, i] { runThread(i); });
+  try {
+    for (int i = 0; i < n; i++) threads.emplace_back([this, i] { runThread(i); });
+  } catch (...) {
+    stop();
+    throw;
+  }
 }
 
 void ControlExecutor::push(std::move_only_function<void()> run) {

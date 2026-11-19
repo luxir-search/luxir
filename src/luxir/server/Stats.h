@@ -12,6 +12,12 @@ namespace luxir {
 
 class LuxirNode;
 
+// Only the node-wide counters and memory summary run on a transport thread.
+inline bool canGatherStatsInline(const api::StatsRequest& request) {
+  return request.collection.empty() && request.tenant.empty() && !request.collections &&
+         !request.system && !request.host && !request.files && !request.segments;
+}
+
 // Build one typed stats response. The response borrows all repeated/string
 // backing from `resource`, which must outlive serialization. Both the JSON and
 // the Prometheus renderings are produced from this one response.

@@ -40,9 +40,8 @@ struct ServerConfig {
 
   // Threads of the node's control executor (ControlExecutor): administration,
   // schema changes, collection lifecycle, replication transfers and timers,
-  // plugin routes and file or segment stats.  Dedicated OS threads outside the
-  // worker pool, so control work never waits behind searches and never takes
-  // a worker from them.  At least 1.
+  // and detailed stats. Dedicated OS threads outside the worker pool.
+  // At least 1.
   int control_threads = 2;
 
   int resolveWorkers() const {

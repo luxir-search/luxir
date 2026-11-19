@@ -470,6 +470,7 @@ void IndexWriter::close() {
   // queued before reset is included in wait_for_all below.
   pressureRegistration.reset();
 
+  Signal::emit("writerCloseDrain", this);
   // without this, in gcc release mode we can get a crash when the IndexWriter is destroyed, even when
   // the graph wasn't used. Presumably because the test was so fast and there was some async initialization
   // of the graph still going on?
