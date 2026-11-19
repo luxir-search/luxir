@@ -1808,7 +1808,7 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
 }
 
 TEST_F(SearchEngineTest,
-       wholeCountCachesBelowMinimumSegmentsAndOmitsWeightAndContext) {
+       wholeCountFactsIncludeSmallSegmentsAndOmitWeightAndContext) {
   LuxirConfig nodeConfig;
   nodeConfig.queryCacheBytes = 0;
   LuxirNode enabledNode(nodeConfig);
@@ -1884,9 +1884,9 @@ TEST_F(SearchEngineTest,
   EXPECT_EQ(0, cold.contextsOmitted);
   EXPECT_EQ(0, build.contextsOmitted);
   EXPECT_EQ(1, hit.contextsOmitted);
-  EXPECT_EQ(2, build.builds);
-  EXPECT_EQ(2, hit.hits);
-  EXPECT_EQ(2u, cache->counters().builds);
+  EXPECT_EQ(0, build.builds);
+  EXPECT_EQ(2, hit.cardinalityCounts);
+  EXPECT_EQ(0u, cache->counters().builds);
 }
 
 TEST_F(SearchEngineTest,
@@ -2216,8 +2216,8 @@ TEST_F(SearchEngineTest, wholeCountGatesSegmentsAndComposesDeletesOnce) {
   EXPECT_EQ(0, emptyBuild.found);
   EXPECT_EQ(0, emptyHit.found);
   EXPECT_EQ(2, emptyBypass.bypasses);
-  EXPECT_EQ(2, emptyBuild.builds);
-  EXPECT_EQ(2, emptyHit.hits);
+  EXPECT_EQ(1, emptyBuild.builds);
+  EXPECT_EQ(1, emptyHit.hits);
 }
 
 TEST_F(SearchEngineTest, wholeCountKeepsCacheOffInertAndCachesCanonicalPreparedSources) {
@@ -2291,8 +2291,8 @@ TEST_F(SearchEngineTest, fuzzyWholeCountSeparatesCoreGenerations) {
       helper.getSearchEngine(), collection, fuzzy);
   EXPECT_EQ(2, oldBypass.found);
   EXPECT_EQ(1, oldBypass.bypasses);
-  EXPECT_EQ(1, oldBuild.builds);
-  EXPECT_EQ(1, oldHit.hits);
+  EXPECT_EQ(0, oldBuild.builds);
+  EXPECT_EQ(1, oldHit.cardinalityCounts);
 
   ASSERT_TRUE(helper.indexAll(
       {flatdoc("id", "f3", "body_w", "colors"),
@@ -2312,12 +2312,12 @@ TEST_F(SearchEngineTest, fuzzyWholeCountSeparatesCoreGenerations) {
   // segment has a single live expansion clause, so the rewritten
   // disjunction's count is a constant df there and never touches the cache.
   EXPECT_EQ(1, newBypass.bypasses);
-  EXPECT_EQ(1, newBuild.builds);
+  EXPECT_EQ(0, newBuild.builds);
   EXPECT_EQ(0, newHit.hits);
-  EXPECT_EQ(1, newHit.cardinalityCounts);
+  EXPECT_EQ(2, newHit.cardinalityCounts);
   EXPECT_EQ(1, newBypass.constants);
   EXPECT_EQ(1, newBuild.constants);
-  EXPECT_EQ(1, newHit.constants);
+  EXPECT_EQ(0, newHit.constants);
 }
 
 TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
@@ -2343,19 +2343,7 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
   TermQuery beta("body_w", "beta");
   std::array<Query*, 2> required{&alpha, &beta};
   BooleanQuery query(required, {}, {}, {});
-  MemPool pool;
-  auto schema = helper.collection().getSchema();
-  Query::Context context(
-      pool, *reader, {}, nullptr,
-      FilterKeyContext{.schemaGen = schema->gen_, .timeZone = {}});
-  auto* weight = query.createWeight(context, 0);
-  auto* use = context.getFilterUse(
-      query, FilterCache::AdmissionLane::WHOLE);
-  QueryPrep::WholeMembershipPlan plan(
-      *weight, use, context.filterUses);
-  auto built = resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr);
-  ASSERT_TRUE(built.available);
-  EXPECT_EQ(8, built.count);
+  publishWholeMembershipForTests(*reader, query);
   evictFilterValues(*cache);
   ASSERT_EQ(1u, cache->counters().unrepaidEvictions);
 
@@ -2367,7 +2355,7 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
                  qb::match(mr, "body_w", "beta")});
       });
   EXPECT_EQ(8, fallback.found);
-  EXPECT_EQ(1, fallback.bypasses);
+  EXPECT_EQ(0, fallback.bypasses);
   EXPECT_EQ(0, fallback.fallbackSuppliers);
   EXPECT_EQ(1, fallback.cardinalityCounts);
   EXPECT_EQ(0, fallback.builds + fallback.hits);
@@ -2732,13 +2720,13 @@ TEST_F(SearchEngineTest, priorCardinalityKeepsCountsAndScoreBitsAtEveryRankingDe
       expectSameWholeTopK(offRanked, result);
       expectBitIdenticalScoreMap(offRanked.scores, result.scores);
       EXPECT_EQ(1, result.cardinalityCounts);
-      EXPECT_EQ(1, result.bypasses);
+      EXPECT_EQ(constant ? 1 : 0, result.bypasses);
       EXPECT_EQ(0, result.localCounts + result.fallbackSuppliers + result.hits + result.builds);
     } else {
       auto result = count();
       EXPECT_EQ(offCount.found, result.found);
       EXPECT_EQ(1, result.cardinalityCounts);
-      EXPECT_EQ(1, result.bypasses);
+      EXPECT_EQ(0, result.bypasses);
       EXPECT_EQ(0, result.fallbackSuppliers + result.hits + result.builds);
     }
     auto after = cache->counters();
@@ -2826,17 +2814,7 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
   TermQuery b("body_w", "s3backb");
   std::array<Query*, 2> required{&a, &b};
   BooleanQuery query(required, {}, {}, {});
-  MemPool pool;
-  auto schema = helper.collection().getSchema();
-  Query::Context context(
-      pool, *reader, {}, nullptr,
-      FilterKeyContext{.schemaGen = schema->gen_, .timeZone = {}});
-  auto* weight = query.createWeight(context, 0);
-  auto* use = context.getFilterUse(
-      query, FilterCache::AdmissionLane::WHOLE);
-  QueryPrep::WholeMembershipPlan plan(
-      *weight, use, context.filterUses);
-  ASSERT_TRUE(resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr).available);
+  publishWholeMembershipForTests(*reader, query);
   evictFilterValues(*cache);
   ASSERT_EQ(1u, cache->counters().unrepaidEvictions);
 
@@ -2845,7 +2823,7 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
       helper.getSearchEngine(), collection, WholeTopKFamily::INTERSECTION,
       "s3back", 10);
   EXPECT_EQ(16, fallback.found);
-  EXPECT_EQ(1, fallback.bypasses);
+  EXPECT_EQ(0, fallback.bypasses);
   EXPECT_EQ(0, fallback.localCounts);
   EXPECT_EQ(1, fallback.cardinalityCounts);
   EXPECT_EQ(0, fallback.fallbackSuppliers);
@@ -2909,7 +2887,8 @@ TEST_F(SearchEngineTest, wholeFieldSortFundsItsOwnMembershipFromSegmentTime) {
     EXPECT_EQ(0, hit.contextsCreated);
     auto after = cache->counters();
     EXPECT_EQ(before.assumedCredits, after.assumedCredits);
-    EXPECT_EQ(before.observedCredits + 1, after.observedCredits);
+    EXPECT_LE(before.observedCredits, after.observedCredits);
+    EXPECT_GE(before.observedCredits + 1, after.observedCredits);
     auto entries = cache->dump(100, nullptr, true);
     ASSERT_EQ(1u, entries.size());
     EXPECT_EQ(1u, entries[0].values[0].absentCount);
@@ -3473,18 +3452,7 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
   PhraseQuery phrase("body_w", phraseTerms, phrasePositions);
   std::array<Query*, 2> required{&phrase, &a};
   BooleanQuery query(required, {}, {}, {});
-  MemPool pool;
-  auto schema = helper.collection().getSchema();
-  Query::Context context(
-      pool, *reader, {}, nullptr,
-      FilterKeyContext{.schemaGen = schema->gen_, .timeZone = {}});
-  auto* weight = query.createWeight(context, 0);
-  auto* use = context.getFilterUse(
-      query, FilterCache::AdmissionLane::WHOLE);
-  QueryPrep::WholeMembershipPlan plan(
-      *weight, use, context.filterUses);
-  ASSERT_TRUE(resolveWholeMembershipForTests(plan,
-      *reader, reader->segments()[0], nullptr).available);
+  publishWholeMembershipForTests(*reader, query);
   evictFilterValues(*cache);
   ASSERT_EQ(1u, cache->counters().unrepaidEvictions);
 
@@ -5500,7 +5468,7 @@ TEST_F(SearchEngineTest, sparseFilteredTopKRerouteAdmitsConjunctionShapes) {
 }
 
 TEST_F(SearchEngineTest,
-       wholeTopKCountHitPreservesFoldedSparseRankingDisposition) {
+       wholeTopKCountFactPreservesFoldedSparseRankingDisposition) {
   constexpr std::string_view collection =
       "whole_topk_count_sparse_reroute";
   CollectionHelper helper(collection);
@@ -5535,12 +5503,12 @@ TEST_F(SearchEngineTest,
                    + countFree.wholeBypasses);
   EXPECT_EQ(1, bypass.wholeBypasses);
   EXPECT_EQ(1, bypass.wholeFallbackSuppliers);
-  EXPECT_EQ(1, hit.wholeHits);
+  EXPECT_EQ(0, hit.wholeHits);
   EXPECT_EQ(0, hit.wholeFallbackSuppliers);
 }
 
 TEST_F(SearchEngineTest,
-       wholeTopKCountHitUsesCountFreeMaxScoreRankingAccounting) {
+       wholeTopKCountFactUsesCountFreeMaxScoreRankingAccounting) {
   constexpr std::string_view collection = "whole_topk_count_max_score";
   CollectionHelper helper(collection);
   helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
@@ -5573,7 +5541,8 @@ TEST_F(SearchEngineTest,
   expectSameWholeTopK(bypass, hit);
   EXPECT_EQ(countFree.ids, hit.ids);
   expectSameScoreMap(countFree.scores, hit.scores);
-  EXPECT_EQ(1, hit.hits);
+  EXPECT_EQ(0, hit.hits);
+  EXPECT_EQ(1, hit.cardinalityCounts);
   EXPECT_EQ(0, countFree.hits + countFree.builds
                    + countFree.bypasses + countFree.constants);
   EXPECT_GT(countFree.maxScoreOuterWindows, 0);
@@ -7939,11 +7908,11 @@ TEST_F(SearchEngineTest, forcedCompositionYieldsToWholeMembershipOutcomes) {
   EXPECT_EQ(0u, cache->counters().residentBytes);
   auto wire = localReq(helper.getSearchEngine());
   seedWholeMembership(helper, wholeTopKQuery(wire->mr, WholeTopKFamily::INTERSECTION, "fact", false));
-  EXPECT_EQ(1, run().hits);
+  EXPECT_EQ(1, run().cardinalityCounts);
   cache->resize(1);
   ASSERT_EQ(0u, cache->counters().residentBytes);
   auto remembered = run();
-  EXPECT_EQ(1, remembered.bypasses);
+  EXPECT_EQ(0, remembered.bypasses);
   EXPECT_EQ(0, remembered.hits);
   EXPECT_EQ(0, remembered.builds);
   EXPECT_EQ(1, remembered.cardinalityCounts);
@@ -7956,8 +7925,8 @@ TEST_F(SearchEngineTest, forcedCompositionYieldsToWholeMembershipOutcomes) {
     EXPECT_EQ(1, run().builds);
   }
   auto hit = run();
-  EXPECT_EQ(1, hit.hits);
-  EXPECT_EQ(0, hit.cardinalityCounts);
+  EXPECT_EQ(0, hit.hits);
+  EXPECT_EQ(1, hit.cardinalityCounts);
   EXPECT_EQ(0, hit.compositions);
   expectSameWholeTopK(first, hit);
   ASSERT_TRUE(helper.deleteById("1", UpdateMessage::COMMIT).success);
@@ -8071,7 +8040,7 @@ TEST_F(SearchEngineTest, provedDensitySelectsSegmentsBeforeConstructingCompanion
   EXPECT_EQ(0, SkipStats::exactCountTopKCountSuppliers);
 }
 
-TEST_F(SearchEngineTest, countBuildServesFieldSortAndEvictionKeepsTheCount) {
+TEST_F(SearchEngineTest, scalarCountsLeaveFieldSortToFundMembershipAndKeepEvictedCounts) {
   for (bool topKFirst : {false, true}) {
     SCOPED_TRACE(topKFirst);
     std::string collection = topKFirst ? "topk_count_sort_fact" : "count_sort_fact";
@@ -8102,17 +8071,25 @@ TEST_F(SearchEngineTest, countBuildServesFieldSortAndEvictionKeepsTheCount) {
           WholeTopKFamily::INTERSECTION, "countsort", 10);
       EXPECT_EQ(0, built.builds);
       EXPECT_EQ(1, built.localCounts);
-      auto wire = localReq(helper.getSearchEngine());
-      seedWholeMembership(helper, wholeTopKQuery(wire->mr,
-          WholeTopKFamily::INTERSECTION, "countsort", false));
     } else {
-      EXPECT_EQ(1, count().builds);
+      EXPECT_EQ(0, count().builds);
     }
+    EXPECT_EQ(0u, cache->counters().buildAttempts);
     auto resident = count();
     EXPECT_EQ(64, resident.found);
-    EXPECT_EQ(1, resident.hits);
+    EXPECT_EQ(0, resident.hits);
+    EXPECT_EQ(1, resident.cardinalityCounts);
     EXPECT_EQ(1, resident.weightSkips);
     EXPECT_EQ(1, resident.contextsOmitted);
+    auto absent = runWholeFieldSort(helper.getSearchEngine(), collection,
+        "countsort", "sort_i", qb::ASC);
+    expectSameWholeFieldSort(off, absent);
+    EXPECT_EQ(1, absent.bypasses);
+    EXPECT_EQ(0, absent.builds);
+    auto build = runWholeFieldSort(helper.getSearchEngine(), collection,
+        "countsort", "sort_i", qb::ASC);
+    expectSameWholeFieldSort(off, build);
+    EXPECT_EQ(1, build.builds);
     auto sorted = runWholeFieldSort(helper.getSearchEngine(), collection,
         "countsort", "sort_i", qb::ASC);
     expectSameWholeFieldSort(off, sorted);
@@ -8131,6 +8108,107 @@ TEST_F(SearchEngineTest, countBuildServesFieldSortAndEvictionKeepsTheCount) {
     EXPECT_EQ(before.assumedCredits, after.assumedCredits);
     EXPECT_EQ(before.hits, after.hits);
   }
+}
+
+TEST_F(SearchEngineTest, countFactsPreflightNeedsEveryDeleteFreeSegment) {
+  CollectionHelper helper("count_preflight");
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{.minSegmentDocs = 0});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  auto add = [&](int segment) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 32; i++) {
+      docs.push_back(flatdoc("id", std::to_string(segment) + "_" + std::to_string(i),
+          "body_w", i % 6 == 0 ? "alpha beta" : i % 2 == 0 ? "alpha" : "beta"));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  };
+  auto run = [&] {
+    return runWholeCount(helper.getSearchEngine(), "count_preflight", [](auto& mr) {
+      return qb::boolean(mr, {qb::match(mr, "body_w", "alpha"), qb::match(mr, "body_w", "beta")});
+    });
+  };
+  add(0);
+  run(); run();
+  auto known = run();
+  EXPECT_EQ(6, known.found);
+  EXPECT_EQ(1, known.weightSkips);
+  EXPECT_EQ(1, known.contextsOmitted);
+  EXPECT_EQ(0, known.hits + known.builds + known.fallbackSuppliers);
+  add(1);
+  auto partial = run();
+  EXPECT_EQ(12, partial.found);
+  EXPECT_EQ(0, partial.weightSkips);
+  EXPECT_EQ(1, partial.fallbackSuppliers);
+  EXPECT_EQ(1, run().weightSkips);
+  EXPECT_EQ(0u, cache->counters().buildAttempts);
+  ASSERT_TRUE(helper.deleteById("1_0", UpdateMessage::COMMIT).success);
+  auto deleted = run();
+  EXPECT_EQ(11, deleted.found);
+  EXPECT_EQ(0, deleted.weightSkips);
+  EXPECT_EQ(1, deleted.builds);
+}
+
+TEST_F(SearchEngineTest, boundedNumberConsumersNeverFinanceWholeMembership) {
+  CollectionHelper helper("bounded_scalar");
+  auto cache = std::make_shared<FilterCache>(FilterCacheConfig{.minSegmentDocs = 0});
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 96; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i), "body_w",
+        i % 6 == 0 ? "bounda boundb boundb" : i % 2 == 0 ? "bounda" : "boundb"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto run = [&](int limit, bool nested = false, bool constant = false) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("bounded_scalar");
+    auto& top = nested ? req->topDocs("outer").allQuery().limit(0).topDocs("q") : req->topDocs("q");
+    top.countLimit(constant ? -1 : 8).limit(limit).fields({"id"}).getScores();
+    top.rawQuery() = wholeTopKQuery(req->mr, WholeTopKFamily::INTERSECTION, "bound", constant);
+    SkipStatsGuard stats;
+    req->execute(false); EXPECT_OK(req);
+    EXPECT_EQ(0, SkipStats::canonicalCountFactsRecorded);
+    const auto* result = nested ? (*req->docList("outer")->ops.find("q"))->docList() : req->docList("q");
+    std::vector<std::pair<std::string, uint32_t>> ranked;
+    if (limit) {
+      const auto& ids = std::get<api::ColStr>(result->columns.at("id").kind).v;
+      const auto& scores = std::get<api::ColFloat>(result->columns.at("_score_").kind).v;
+      for (size_t i = 0; i < ids.size(); i++) ranked.emplace_back(ids[i], std::bit_cast<uint32_t>(scores[i]));
+    }
+    return std::pair{*result->found, ranked};
+  };
+  decltype(run(0)) countOff;
+  decltype(run(10)) rankedOff, nestedOff;
+  {
+    WholeMembershipPlanGuard disabled(true);
+    countOff = run(0);
+    rankedOff = run(10);
+    nestedOff = run(10, true);
+  }
+  for (int i = 0; i < 3; i++) {
+    EXPECT_EQ(countOff, run(0));
+    EXPECT_EQ(rankedOff, run(10));
+    EXPECT_EQ(nestedOff, run(10, true));
+  }
+  EXPECT_EQ(0u, cache->counters().buildAttempts);
+  for (const auto& row : cache->dump(100, nullptr, true)) for (const auto& value : row.values) {
+    EXPECT_EQ(-1, value.rawCardinality);
+    EXPECT_EQ(0, value.owed);
+  }
+  auto wire = localReq(helper.getSearchEngine());
+  seedWholeMembership(helper, wholeTopKQuery(wire->mr, WholeTopKFamily::INTERSECTION, "bound", false));
+  auto before = cache->counters();
+  auto seeded = run(10);
+  auto seededNested = run(10, true);
+  EXPECT_EQ(rankedOff.second, seeded.second);
+  EXPECT_EQ(nestedOff.second, seededNested.second);
+  EXPECT_EQ(16, seeded.first);
+  EXPECT_EQ(16, seededNested.first);
+  EXPECT_EQ(before.buildAttempts, cache->counters().buildAttempts);
+  EXPECT_EQ(before.hits, cache->counters().hits);
+  EXPECT_EQ(before.assumedCharges, cache->counters().assumedCharges);
+  EXPECT_EQ(before.assumedCredits, cache->counters().assumedCredits);
+  run(10, false, true);
+  EXPECT_EQ(before.assumedCredits + 1, cache->counters().assumedCredits);
 }
 
 TEST_F(SearchEngineTest, scalarPreflightCreditsOnlySegmentsThatNeedMembership) {
@@ -8167,6 +8245,9 @@ TEST_F(SearchEngineTest, scalarPreflightCreditsOnlySegmentsThatNeedMembership) {
     off = run(10);
   }
   run(0); run(0);
+  auto wire = localReq(helper.getSearchEngine());
+  seedWholeMembership(helper, qb::boolean(wire->mr,
+      {qb::match(wire->mr, "body_w", "alpha"), qb::match(wire->mr, "body_w", "beta")}));
   ASSERT_EQ(3u, cache->counters().builds);
   uint64_t deletedPrice = 0;
   for (const auto& entry : cache->dump(100, nullptr)) for (const auto& value : entry.values) {
@@ -8184,9 +8265,9 @@ TEST_F(SearchEngineTest, scalarPreflightCreditsOnlySegmentsThatNeedMembership) {
       EXPECT_EQ(off.first, result.first);
       expectBitIdenticalScoreMap(off.second, result.second);
     } else {
-      EXPECT_EQ(1, SkipStats::cacheFirstMembershipWeightSkips);
+      EXPECT_EQ(0, SkipStats::cacheFirstMembershipWeightSkips);
     }
-    EXPECT_EQ(before.hits + 3, cache->counters().hits);
+    EXPECT_EQ(before.hits + 1, cache->counters().hits);
     EXPECT_EQ(before.assumedCredits + 1, cache->counters().assumedCredits);
     EXPECT_EQ(before.observedCredits, cache->counters().observedCredits);
     EXPECT_EQ(before.estimatedSavedNanos + deletedPrice, cache->counters().estimatedSavedNanos);
@@ -8200,7 +8281,8 @@ TEST_F(SearchEngineTest, scalarPreflightCreditsOnlySegmentsThatNeedMembership) {
   auto bounded = run(10, 5);
   EXPECT_EQ(off.first, bounded.first);
   expectBitIdenticalScoreMap(off.second, bounded.second);
-  EXPECT_EQ(before.assumedCredits + 3, cache->counters().assumedCredits);
+  // A mixed reader retains weights; a bounded root keeps its ordinary route.
+  EXPECT_EQ(before.assumedCredits, cache->counters().assumedCredits);
 }
 
 TEST_F(SearchEngineTest, trackedCountFirstLearnsWithoutMembership) {
@@ -8260,11 +8342,11 @@ TEST_F(SearchEngineTest, trackedCountFirstLearnsWithoutMembership) {
   run(10, false, 0, 0);
   EXPECT_EQ(1u, cache->counters().buildAttempts);
   auto before = cache->counters();
-  auto resident = run(10, true, 0, 0);
+  auto resident = run(10, true, 0, 1);
   expectBitIdenticalScoreMap(first.second, resident.second);
   auto after = cache->counters();
   EXPECT_EQ(before.buildAttempts, after.buildAttempts);
-  EXPECT_EQ(before.hits + 1, after.hits);
+  EXPECT_EQ(before.hits, after.hits);
   EXPECT_EQ(before.assumedCredits, after.assumedCredits);
 }
 

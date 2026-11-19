@@ -201,7 +201,7 @@ TEST_F(JoinModesTest, membershipKeysShareModesButNotBoundsInBothDirections) {
       auto request = localReq(data.getSearchEngine()); request->collection(data.collection().getId().name);
       auto query = qb::toParent(request->mr,"items_nested",qb::match(request->mr,"label_s","red"),mode);
       auto& spec = std::get<api::ToParentQuery>(query.kind); spec.min_children = minimum; spec.max_children = 2;
-      request->topDocs().limit(0).countLimit().rawQuery() = query;
+      request->topDocs().limit(1).countLimit().rawQuery() = qb::constantScore(request->mr, query, 1.0f);
       request->execute(1); EXPECT_OK(request); return request->getMatchCount();
     };
     EXPECT_EQ(8,count(reverse ? "sum" : "max",2)); EXPECT_EQ(8,count(reverse ? "sum" : "max",2));

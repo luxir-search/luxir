@@ -449,7 +449,7 @@ TEST_P(CountShortcutTest, topDocsKeepsNumericCountExecutor) {
   }
 }
 
-TEST_P(CountShortcutTest, geoWholeCountsKeepCacheRouting) {
+TEST_P(CountShortcutTest, geoWholeCountsRememberFacts) {
   for (bool filtered : {false, true}) {
     int bound = filtered ? 12 : 10;
     int64_t expected = 0;
@@ -473,9 +473,9 @@ TEST_P(CountShortcutTest, geoWholeCountsKeepCacheRouting) {
       EXPECT_EQ(expected, req->getMatchCount());
       EXPECT_EQ(0, SkipStats::wholeCountConstant);
       if (GetParam()) {
-        EXPECT_EQ(repeat == 0 ? 3 : 0, SkipStats::wholeCountBypasses);
-        EXPECT_EQ(repeat == 1 ? 3 : 0, SkipStats::wholeCountBuilds);
-        EXPECT_EQ(repeat == 2 ? 3 : 0, SkipStats::wholeCountHits);
+        EXPECT_EQ(repeat < 2 ? 3 : 0, SkipStats::wholeCountBypasses);
+        EXPECT_EQ(0, SkipStats::wholeCountBuilds + SkipStats::wholeCountHits);
+        EXPECT_EQ(repeat == 2 ? 3 : 0, SkipStats::canonicalCountFactsRead);
       }
     }
   }
@@ -508,7 +508,7 @@ TEST_P(CountShortcutTest, executionCanDiscoverEmptyChildren) {
   }
 }
 
-TEST_P(CountShortcutTest, pointsEmptyDisjunctionUsesWholeCacheRouting) {
+TEST_P(CountShortcutTest, pointsEmptyDisjunctionRemembersWholeCount) {
   for (int repeat = 0; repeat < 3; repeat++) {
     CountStats stats;
     auto req = localReq(luxirNode->getSearchEngine());
@@ -522,9 +522,9 @@ TEST_P(CountShortcutTest, pointsEmptyDisjunctionUsesWholeCacheRouting) {
     ASSERT_OK(req);
     EXPECT_EQ(3 * DOCS / 2, req->getMatchCount());
     EXPECT_EQ(0, SkipStats::wholeCountConstant);
-    EXPECT_EQ(GetParam() && repeat == 0 ? 3 : 0, SkipStats::wholeCountBypasses);
-    EXPECT_EQ(GetParam() && repeat == 1 ? 3 : 0, SkipStats::wholeCountBuilds);
-    EXPECT_EQ(GetParam() && repeat == 2 ? 3 : 0, SkipStats::wholeCountHits);
+    EXPECT_EQ(GetParam() && repeat < 2 ? 3 : 0, SkipStats::wholeCountBypasses);
+    EXPECT_EQ(0, SkipStats::wholeCountBuilds + SkipStats::wholeCountHits);
+    EXPECT_EQ(GetParam() && repeat == 2 ? 3 : 0, SkipStats::canonicalCountFactsRead);
   }
 }
 
@@ -769,14 +769,15 @@ TEST_P(CountShortcutTest, multiTermWholeCountsProbeCacheBeforeExpansion) {
       ASSERT_OK(req);
       EXPECT_EQ(111, req->getMatchCount());
       EXPECT_EQ(GetParam() && repeat == 2 ? 0 : 3, SkipStats::multitermExpansions);
-      // Only two segments have matches; the third publishes an empty set.
-      EXPECT_EQ(GetParam() && repeat == 1 ? 2 : 0, SkipStats::multitermUnionBuilds);
+      // First-K ids still build sets; plain COUNT remembers the empty segment too.
+      EXPECT_EQ(GetParam() && limit > 0 && repeat == 1 ? 2 : 0, SkipStats::multitermUnionBuilds);
       auto bypasses = limit == 0 ? SkipStats::wholeCountBypasses : SkipStats::wholeTopKCountBypasses;
       auto builds = limit == 0 ? SkipStats::wholeCountBuilds : SkipStats::wholeTopKCountBuilds;
       auto hits = limit == 0 ? SkipStats::wholeCountHits : SkipStats::wholeTopKCountHits;
-      EXPECT_EQ(GetParam() && repeat == 0 ? 3 : 0, bypasses);
-      EXPECT_EQ(GetParam() && repeat == 1 ? 3 : 0, builds);
-      EXPECT_EQ(GetParam() && repeat == 2 ? 3 : 0, hits);
+      EXPECT_EQ(GetParam() && (limit == 0 ? repeat < 2 : repeat == 0) ? 3 : 0, bypasses);
+      EXPECT_EQ(GetParam() && limit > 0 && repeat == 1 ? 3 : 0, builds);
+      EXPECT_EQ(GetParam() && limit > 0 && repeat == 2 ? 3 : 0, hits);
+      EXPECT_EQ(GetParam() && limit == 0 && repeat == 2 ? 3 : 0, SkipStats::canonicalCountFactsRead);
     }
   }
 }

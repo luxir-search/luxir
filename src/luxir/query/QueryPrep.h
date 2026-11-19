@@ -931,7 +931,8 @@ struct WholeMembershipResult {
 enum class WholeMembershipConsumer : uint8_t {
   COUNT,
   TOP_K_COUNT,
-  TOP_K_MEMBERSHIP,
+  TOP_K_BOUNDED_COUNT,
+  TOP_K_FIRST_IDS,
   FIELD_SORT,
 };
 
@@ -959,7 +960,8 @@ class WholeMembershipPlan {
     return !disableCanonicalCountFactsForTests && canonical && !segment.hasDeletes()
         && !isReaderStable()
         && (consumer == WholeMembershipConsumer::COUNT
-            || consumer == WholeMembershipConsumer::TOP_K_COUNT);
+            || consumer == WholeMembershipConsumer::TOP_K_COUNT
+            || consumer == WholeMembershipConsumer::TOP_K_BOUNDED_COUNT);
   }
 
   struct AcceptedExistingTag {};
@@ -973,7 +975,7 @@ class WholeMembershipPlan {
       observedFieldSort(observesFieldSort(consumer, cacheUse.scope())) {
     if (!cacheUse.hasAcceptedExisting()) {
       throw std::logic_error(
-          "resident-only membership requires an accepted cache use");
+          "complete source requires an accepted cache use");
     }
   }
 
@@ -984,7 +986,8 @@ class WholeMembershipPlan {
         skipCount(countCounter);
         break;
       case WholeMembershipConsumer::TOP_K_COUNT:
-      case WholeMembershipConsumer::TOP_K_MEMBERSHIP:
+      case WholeMembershipConsumer::TOP_K_BOUNDED_COUNT:
+      case WholeMembershipConsumer::TOP_K_FIRST_IDS:
         skipCount(topKCountCounter);
         break;
       case WholeMembershipConsumer::FIELD_SORT:
@@ -1036,7 +1039,8 @@ public:
   bool hasCacheUse() const { return cacheUse != nullptr; }
   bool isTopKCount() const {
     return consumer == WholeMembershipConsumer::TOP_K_COUNT
-        || consumer == WholeMembershipConsumer::TOP_K_MEMBERSHIP;
+        || consumer == WholeMembershipConsumer::TOP_K_BOUNDED_COUNT
+        || consumer == WholeMembershipConsumer::TOP_K_FIRST_IDS;
   }
   bool canRecordCount(IndexReader::Segment& segment, DocSet* domain) const {
     return !disableCanonicalCountFactsForTests && cacheUse != nullptr
@@ -1098,6 +1102,11 @@ public:
       int32_t localMaxCandidatesPerMatch = 0) const {
     if (source == Source::EMPTY) return {};
     if (source == Source::ACCEPTED_EXISTING) {
+      if (auto count = cacheUse->acceptedCardinality((size_t)segment.ord)) {
+        skipCount(SkipStats::wholeMembershipCardinalityCounts);
+        skipCount(SkipStats::canonicalCountFactsRead);
+        return {true, {}, *count};
+      }
       DomainHandle docs = cacheUse->effectiveDomain(
           (size_t) segment.ord, reader, incomingDomain).pinnedWith(lifetime);
       if (docs.get() == nullptr) {
@@ -1108,6 +1117,7 @@ public:
       // noncanonical live counts need a payment deferred by the preflight.
       if (!disableCanonicalCountFactsForTests && !isFieldSort() && !isReaderStable()
           && !scalarCount(segment, Query::isCanonicalCountDomain(segment, incomingDomain))) {
+        // First-K ids save a prefix; the assumed production-sized credit overestimates it.
         cacheUse->credit((size_t)segment.ord, FilterCache::Work::assumed());
       }
       record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits,
@@ -1159,8 +1169,7 @@ public:
     bool scalar = scalarCount(segment, canonical);
     auto cardinality = scalar ? cacheUse->cardinality((size_t)segment.ord) : std::nullopt;
     // Known counts and count-first learning need no membership.
-    bool inert = scalar && (cardinality
-        || consumer == WholeMembershipConsumer::TOP_K_COUNT);
+    bool inert = scalar;
     auto probe = inert ? FilterCache::Probe{} : cacheUse->probe((size_t)segment.ord,
         observedFieldSort ? cacheUse->work((size_t)segment.ord).observedOnly().forWholeQuery(canonical)
                             : FilterCache::Work::assumed());
@@ -1192,7 +1201,7 @@ public:
         && localMaxCandidatesPerMatch > 0
         && (int64_t)*cardinality * localMaxCandidatesPerMatch >= shortcut.maxMatches;
     // Tracked count-first requests learn a scalar without producing a set.
-    bool learn = inert && !cardinality
+    bool learn = inert && !cardinality && consumer == WholeMembershipConsumer::TOP_K_COUNT
         && cacheUse->tracksCardinality((size_t)segment.ord);
     if (!build && (local || learn) && !cacheZero) {
       auto guard = MemPool::threadLocalPoolGuard();

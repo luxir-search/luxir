@@ -68,11 +68,12 @@ protected:
     return std::move(out).finishStructural(scope, context);
   }
 
-  int64_t count(std::string_view text, bool filter = false) {
+  int64_t count(std::string_view text, bool filter = false, bool firstIds = false) {
     auto req = localReq(helper.getSearchEngine());
     auto& op = req->topDocs().countLimit().limit(0);
     if (filter) op.allQuery().filter(expr(text));
     else op.exprQuery(text);
+    if (firstIds) op.limit(1).rawQuery() = qb::constantScore(req->mr, expr(text), 1.0f);
     req->execute(1);
     EXPECT_OK(req);
     return req->getMatchCount();
@@ -105,8 +106,9 @@ TEST_F(NestedQueryTest, implicitExplicitAndSingletonGroupHaveOneIdentityAndCache
   warmed->execute(1);
   ASSERT_OK(warmed);
   EXPECT_EQ(3, warmed->getMatchCount());
-  EXPECT_GT(cache->counters().hits, hits);
-  EXPECT_EQ(1, SkipStats::wholeCountHits);
+  EXPECT_EQ(cache->counters().hits, hits);
+  EXPECT_EQ(1, SkipStats::canonicalCountFactsRead);
+  EXPECT_EQ(0u, cache->counters().builds);
 }
 
 TEST_F(NestedQueryTest, ownerProductionDoesNotFundChildExperiments) {
@@ -115,9 +117,9 @@ TEST_F(NestedQueryTest, ownerProductionDoesNotFundChildExperiments) {
       .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 1});
   helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   for (int round = 0; round < 4; round++) {
-    EXPECT_EQ(3, count("items.color:red"));
-    EXPECT_EQ(4, count("items.size:L"));
-    EXPECT_EQ(2, count("items.color:blue AND items.size:S"));
+    EXPECT_EQ(3, count("items.color:red", false, true));
+    EXPECT_EQ(4, count("items.size:L", false, true));
+    EXPECT_EQ(2, count("items.color:blue AND items.size:S", false, true));
   }
   // These executions give the child no ordinary observation to fund a build.
   EXPECT_EQ(3u, cache->counters().builds);

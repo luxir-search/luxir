@@ -446,6 +446,7 @@ public:
     std::vector<std::shared_ptr<const SegmentValue>> existingCandidates;
     std::shared_ptr<const ReaderValue> existingReaderCandidate;
     bool existingAccepted = false;
+    bool existingCounts = false;
     // One allocation per Use; RequestSlot holds a mutex, so it is sized once
     // and never moved.
     std::unique_ptr<RequestSlot[]> requestSlots;
@@ -562,6 +563,7 @@ public:
         std::string_view detail);
     bool wasAdmitted() const { return admitted; }
     bool hasAcceptedExisting() const { return existingAccepted; }
+    std::optional<int32_t> acceptedCardinality(size_t segmentOrd) const;
     FilterKeyScope scope() const { return scope_; }
     const void* entryIdentityForTest() const { return entry.get(); }
     size_t ownedBytesForTest();
@@ -656,13 +658,13 @@ public:
     Use* get(const FilterKey& key,
              FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE,
              AdmissionLane lane = AdmissionLane::CLAUSE);
-    // lookupExisting is an inert, complete-residency preflight. A successful
-    // candidate remains invisible to execution until acceptExisting commits
-    // it and applies the ordinary shared-hit effects for each resident value.
+    // An inert complete-source preflight. countsOnly requires a canonical,
+    // delete-free domain and accepts slot facts instead of resident values.
+    // acceptExisting commits it; only resident values apply shared-hit effects.
     // The preflight is first-registration-only for a request key.
     std::optional<ExistingCandidate> lookupExisting(
         const FilterKey& key,
-        FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE);
+        FilterKeyScope scope = FilterKeyScope::SEGMENT_STABLE, bool countsOnly = false);
     // READER_STABLE acceptance has no domain argument. Its caller must have
     // established that this request is on the exact reader and canonical root
     // domain before lookup; effectiveDocSet rechecks before serving values.
@@ -909,7 +911,7 @@ private:
   std::unique_ptr<Use> lookupExisting(
       const FilterKey& key, FilterKeyScope scope,
       uint64_t readerCoreGen, uint64_t readerVersion,
-      std::span<const SegmentIdentity> readerSegments);
+      std::span<const SegmentIdentity> readerSegments, bool countsOnly);
   bool acceptExisting(Use& use, AdmissionLane lane, Work work);
   template<class Value>
   void creditValue(Ledger& ledger, const Value& value, Work work);

@@ -273,7 +273,7 @@ protected:
   }
 };
 
-TEST_F(BoundedCountCachedTest, residentMembershipCountsExactly) {
+TEST_F(BoundedCountCachedTest, knownCountsServeBoundedTopKExactly) {
   std::string query = "body_w:beta OR body_w:gamma";
   for (int i = 0; i < 4; i++) {
     auto bounded = run(search(query, 1000), 1);
@@ -282,16 +282,18 @@ TEST_F(BoundedCountCachedTest, residentMembershipCountsExactly) {
   EXPECT_EQ(0u, cache->entryCountForTest());
   EXPECT_EQ(0u, cache->counters().admissions);
   EXPECT_EQ(0u, cache->counters().builds);
-  auto warm = run(search(query, -1, R"(,"limit":0)"), 1);
-  EXPECT_EQ(1334, warm->getMatchCount());
-  ASSERT_GT(cache->counters().builds, 0u);
+  for (int i = 0; i < 2; i++) {
+    auto warm = run(search(query, -1, R"(,"limit":0)"), 1);
+    EXPECT_EQ(1334, warm->getMatchCount());
+  }
+  EXPECT_EQ(0u, cache->counters().builds);
   for (int parallel : {1, -1}) {
     SkipStatsScope stats;
     SkipStats::enabled = parallel == 1;
     auto bounded = run(search(query, 1000), parallel);
     EXPECT_EQ(1334, bounded->getMatchCount());
     EXPECT_FALSE(bounded->docList()->found_gte);
-    if (parallel == 1) { EXPECT_EQ(4, SkipStats::wholeTopKCountHits); }
+    if (parallel == 1) { EXPECT_EQ(4, SkipStats::canonicalCountFactsRead); }
   }
 }
 

@@ -93,7 +93,7 @@ protected:
   }
 
   int64_t count(int32_t position = 0, bool maximum = false, int32_t kind = 0,
-                bool restricted = false, bool prepared = false) {
+                bool restricted = false, bool prepared = false, int64_t limit = 0) {
     auto req = localReq(helper.getSearchEngine());
     req->testForcePrepare = prepared;
     auto& mr = req->mr;
@@ -103,7 +103,7 @@ protected:
     if (kind == 3) inner = qb::toParent(mr, "deep_nested", inner, "none");
     auto join = qb::toParent(mr, kind == 2 ? "items_nested.deep_nested" : "items_nested", inner,
         maximum ? "max" : "none");
-    auto& op = req->topDocs().countLimit().limit(0);
+    auto& op = req->topDocs().countLimit().limit(limit);
     if (position == 0) op.rawQuery() = join;
     else if (position == 1) op.allQuery().filter(join);
     else if (position == 2) op.rawQuery() = qb::boolean(req->mr, {}, {}, {}, {join});
@@ -113,6 +113,10 @@ protected:
     EXPECT_OK(req);
     return req->getMatchCount();
   }
+  int64_t firstIds(int32_t position = 0, int32_t kind = 0) {
+    return count(position, false, kind, false, false, 1);
+  }
+
 };
 
 TEST_F(JoinCacheTest, fixedJoinWeightKnowsItsConstantContribution) {
@@ -543,7 +547,7 @@ TEST_F(JoinCacheTest, residentRangeOwnerAvoidsChildSupplier) {
       auto& mr = req->mr;
       auto join = qb::toParent(mr, "rows_nested",
           qb::range(mr, "value_i", qb::valI64(mr, 1), nullptr, qb::valI64(mr, 2), nullptr), "max");
-      auto& op = req->topDocs().getScores().limit(warm ? 0 : 10).countLimit(exact ? -1 : 20);
+      auto& op = req->topDocs().getScores().limit(warm ? 1 : 10).countLimit(warm || exact ? -1 : 20);
       if (warm) op.rawQuery() = join;
       else if (folded) { op.rawQuery() = qb::match(mr, "tag_w", "common"); op.filter(join); }
       else op.rawQuery() = qb::boolean(mr, {qb::match(mr, "tag_w", "common")}, {}, {}, {join});
@@ -753,31 +757,31 @@ TEST_F(JoinCacheTest, nestedTopDocsFundsAnExactSourceBeyondItsSmallParentDomain)
 }
 
 TEST_F(JoinCacheTest, explicitFilterAdmitsAndServesReducerIndependentMembership) {
-  EXPECT_EQ(12, count(1));
+  EXPECT_EQ(12, firstIds(1));
   EXPECT_EQ(0u, cache->counters().admissions);
-  EXPECT_EQ(12, count(1));
+  EXPECT_EQ(12, firstIds(1));
   EXPECT_GE(cache->counters().admissions, 1u);
   EXPECT_GE(cache->counters().builds, 1u);
   auto hits = cache->counters().hits;
-  EXPECT_EQ(12, count(1, true));
+  EXPECT_EQ(12, count(1, true, 0, false, false, 1));
   EXPECT_GT(cache->counters().hits, hits);
 }
 
-TEST_F(JoinCacheTest, mainAndProhibitedPositionsAdmitOnSecondSighting) {
+TEST_F(JoinCacheTest, firstIdsAndProhibitedPositionsAdmitOnSecondSighting) {
   for (int32_t position : {0, 2}) {
     cache->clear();
     cache->resetAdmission();
     cache->resetCounters();
-    EXPECT_EQ(12, count(position));
+    EXPECT_EQ(12, firstIds(position));
     EXPECT_EQ(0u, cache->counters().admissions);
-    EXPECT_EQ(12, count(position));
+    EXPECT_EQ(12, firstIds(position));
     EXPECT_GT(cache->counters().admissions, 0u);
     EXPECT_GT(cache->counters().builds, 0u);
     auto hits = cache->counters().hits;
     SkipStatsScope stats;
-    EXPECT_EQ(12, count(position, true));
+    EXPECT_EQ(12, firstIds(position));
     EXPECT_GT(cache->counters().hits, hits);
-    if (position == 0) { EXPECT_EQ(1, SkipStats::cacheFirstMembershipWeightSkips); }
+    if (position == 0) { EXPECT_EQ(1, SkipStats::cacheFirstConstantTopKWeightSkips); }
   }
 }
 
@@ -793,18 +797,18 @@ TEST_F(JoinCacheTest, canonicalPreparedJoinUsesTheSameRawWholeMembershipLane) {
 TEST_F(JoinCacheTest, sameItemAndTwoLevelQueriesHaveTheirOwnOwnerEntries) {
   for (int32_t kind : {1, 2, 3}) {
     int64_t expected = kind == 1 ? 4 : 6;
-    EXPECT_EQ(expected, count(0, false, kind));
-    EXPECT_EQ(expected, count(0, false, kind));
+    EXPECT_EQ(expected, firstIds(0, kind));
+    EXPECT_EQ(expected, firstIds(0, kind));
     SkipStatsScope stats;
-    EXPECT_EQ(expected, count(0, true, kind));
-    EXPECT_EQ(1, SkipStats::cacheFirstMembershipWeightSkips);
-    EXPECT_EQ(1, SkipStats::wholeCountHits);
+    EXPECT_EQ(expected, firstIds(0, kind));
+    EXPECT_EQ(1, SkipStats::cacheFirstConstantTopKWeightSkips);
+    EXPECT_EQ(1, SkipStats::wholeTopKCountHits);
   }
 }
 
-TEST_F(JoinCacheTest, scoredRankingReusesUnscoredOwnerMembershipForItsCount) {
-  EXPECT_EQ(12, count());
-  EXPECT_EQ(12, count());
+TEST_F(JoinCacheTest, scoredRankingUsesRememberedUnscoredOwnerCount) {
+  EXPECT_EQ(12, firstIds());
+  EXPECT_EQ(12, firstIds());
   auto req = localReq(helper.getSearchEngine());
   req->topDocs().countLimit().getScores().limit(3).fields({"id"}).rawQuery() = qb::toParent(req->mr,
       "items_nested", qb::match(req->mr, "color_s", "red"), "max");
@@ -813,7 +817,9 @@ TEST_F(JoinCacheTest, scoredRankingReusesUnscoredOwnerMembershipForItsCount) {
   ASSERT_OK(req);
   EXPECT_EQ(12, req->getMatchCount());
   EXPECT_EQ(3u, req->getDocs().size());
-  EXPECT_GT(SkipStats::wholeTopKCountHits, 0);
+  EXPECT_EQ(1, SkipStats::canonicalCountFactsRead);
+  EXPECT_EQ(1, SkipStats::cacheFirstTopKCountWeightSkips);
+  EXPECT_EQ(1, SkipStats::cacheFirstTopKRankingWeights);
 }
 
 TEST_F(JoinCacheTest, prunedUniformMaximumRoutesResidentChildMembershipByDensity) {
@@ -832,8 +838,8 @@ TEST_F(JoinCacheTest, prunedUniformMaximumRoutesResidentChildMembershipByDensity
     }
     for (int pass = 0; pass < 3; pass++) {
       auto req = localReq(helper.getSearchEngine());
-      auto& op = req->topDocs().countLimit().limit(0);
-      op.rawQuery() = qb::phraseText(req->mr, "text_w", "deep common");
+      auto& op = req->topDocs().countLimit().limit(1);
+      op.rawQuery() = qb::constantScore(req->mr, qb::phraseText(req->mr, "text_w", "deep common"), 1.0f);
       op.rawOp().domain.emplace().to = "items_nested.deep_nested";
       req->execute(1); ASSERT_OK(req);
       EXPECT_EQ(6, req->getMatchCount());
@@ -909,7 +915,7 @@ TEST_F(JoinCacheTest, ownerAdmissionDoesNotRequireAnAdmittedChildEntry) {
   ASSERT_TRUE(small.submit(input).success);
   for (int i = 0; i < 3; i++) {
     auto req = localReq(small.getSearchEngine());
-    req->collection("join_cache_small").topDocs().countLimit().limit(0).rawQuery() = qb::toParent(req->mr,
+    req->collection("join_cache_small").topDocs().countLimit().limit(1).rawQuery() = qb::toParent(req->mr,
         "items_nested", qb::match(req->mr, "color_s", "red"), "none");
     req->execute(1);
     ASSERT_OK(req);
@@ -921,15 +927,15 @@ TEST_F(JoinCacheTest, ownerAdmissionDoesNotRequireAnAdmittedChildEntry) {
 }
 
 TEST_F(JoinCacheTest, coreStableChildKeepsItsStricterScope) {
-  EXPECT_EQ(12, count(0, false, 4));
-  EXPECT_EQ(12, count(0, false, 4));
+  EXPECT_EQ(12, firstIds(0, 4));
+  EXPECT_EQ(12, firstIds(0, 4));
   // Owner production censors child observations; the resident owner skips it.
   auto entries = cache->dump(10, nullptr);
   ASSERT_EQ(1u, entries.size());
   for (const auto& entry : entries) { EXPECT_EQ(FilterKeyScope::CORE_STABLE, entry.scope); }
   SkipStatsScope stats;
-  EXPECT_EQ(12, count(0, false, 4));
-  EXPECT_EQ(1, SkipStats::cacheFirstMembershipWeightSkips);
+  EXPECT_EQ(12, firstIds(0, 4));
+  EXPECT_EQ(1, SkipStats::cacheFirstConstantTopKWeightSkips);
 }
 
 TEST_F(JoinCacheTest, readerStableChildAndOwnerSelectionRespectLiveEligibility) {
@@ -1034,6 +1040,19 @@ TEST_F(JoinCacheTest, countFloorsDoNotConstructAChildLiveView) {
     EXPECT_FALSE(plan.canRecordCount(segment, &domain));
     EXPECT_EQ(initial, segment.liveCountBounds());
   }
+}
+
+TEST_F(JoinCacheTest, mainCountLearnsOwnerCardinalityWithoutBuildingMembership) {
+  EXPECT_EQ(12, count());
+  EXPECT_EQ(12, count());
+  auto before = cache->counters();
+  SkipStatsScope stats;
+  EXPECT_EQ(12, count());
+  EXPECT_EQ(1, SkipStats::cacheFirstMembershipWeightSkips);
+  EXPECT_EQ(1, SkipStats::canonicalCountFactsRead);
+  EXPECT_EQ(0u, cache->counters().buildAttempts);
+  EXPECT_EQ(before.assumedCharges, cache->counters().assumedCharges);
+  EXPECT_EQ(before.assumedCredits, cache->counters().assumedCredits);
 }
 
 } // namespace

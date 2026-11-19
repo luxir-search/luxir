@@ -4612,7 +4612,7 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
   }
   auto count = [&](bool child) {
     auto req = test::localReq(helper.getSearchEngine());
-    auto& op = req->collection("merged_nested_cache").topDocs().countLimit().limit(0);
+    auto& op = req->collection("merged_nested_cache").topDocs().countLimit().limit(child ? 0 : 1);
     if (child) {
       op.allQuery().matchFilter("color_s", "red").rawOp().domain.emplace().to = "items_nested";
     } else {
@@ -8383,7 +8383,7 @@ TEST(FilterCacheIntegrationTest, schemaOnlyPublishKeepsWholeReaderCaching) {
   ASSERT_NO_THROW(cache->validateForTest());
 }
 
-TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
+TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountFact) {
   LuxirConfig config;
   config.queryCacheBytes = 0;
   LuxirNode node(config);
@@ -8413,7 +8413,8 @@ TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
     auto* use = context.getFilterUse(
         query, FilterCache::AdmissionLane::WHOLE);
     QueryPrep::WholeMembershipPlan plan(
-        *weight, use, context.filterUses);
+        *weight, use, context.filterUses, PreparedDomainDependence::QUERY_CANONICAL,
+        QueryPrep::WholeMembershipConsumer::TOP_K_COUNT);
     int64_t result = 0;
     for (auto& segment : reader->segments()) {
       DocSet* domain = segment.liveDocSet();
@@ -8433,7 +8434,7 @@ TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
   EXPECT_EQ(1u, cache->entryCountForTest());
   EXPECT_EQ(afterPlain.builds, afterBoosted.builds);
   EXPECT_EQ(afterBoosted.hits, afterPlain.hits);
-  EXPECT_EQ(1u, afterPlain.builds);
+  EXPECT_EQ(0u, afterPlain.builds);
 }
 
 TEST(FilterCacheIntegrationTest, cacheFirstKnnCountOmitsWeightAndPrepare) {
@@ -9109,7 +9110,7 @@ TEST(FilterCacheIntegrationTest, unroundedNowRangeSkipsAdmission) {
     forcedDateMathNowEpochMillis = now;
     auto request = luxir::test::localReq(node.getSearchEngine());
     auto& cursor = request->collection(collection)
-                       .topDocs("q").allQuery().countLimit().limit(0);
+                       .topDocs("q").allQuery().countLimit().limit(1);
     addFilter(cursor, luxir::test::qb::range(
         cursor.mr(), "when_dt", luxir::test::qb::valStr(cursor.mr(), gte),
         nullptr, luxir::test::qb::valStr(cursor.mr(), lte), nullptr));
@@ -10075,4 +10076,34 @@ TEST(FilterCacheTest, scalarFactsUseOnlyTrackedSlotMetadata) {
   ASSERT_TRUE(cache.onReaderPublished(2, replacement));
   EXPECT_FALSE(use->cardinality(0));
   EXPECT_FALSE(use->recordCardinality(0, 7));
+}
+
+TEST(FilterCacheTest, completeCountPreflightIsInertAndPinsFactsAcrossRetirement) {
+  auto config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}, FilterCache::SegmentIdentity{2, 100}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("complete-counts");
+  FilterCache::UseRegistry learning(cache, 1, segments), accepted(cache, 1, segments), racing(cache, 1, segments);
+  auto* source = learning.get(key);
+  ASSERT_TRUE(source->recordCardinality(0, 2));
+  auto before = cache.counters();
+  EXPECT_FALSE(accepted.lookupExisting(key, FilterKeyScope::SEGMENT_STABLE, true));
+  EXPECT_EQ(before, cache.counters());
+  ASSERT_TRUE(source->recordCardinality(1, 0));
+  auto candidate = accepted.lookupExisting(key, FilterKeyScope::SEGMENT_STABLE, true);
+  ASSERT_TRUE(candidate);
+  auto* use = accepted.acceptExisting(std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+  ASSERT_NE(nullptr, use);
+  EXPECT_EQ(2, use->acceptedCardinality(0));
+  EXPECT_EQ(0, use->acceptedCardinality(1));
+  EXPECT_EQ(before, cache.counters());
+  auto stale = racing.lookupExisting(key, FilterKeyScope::SEGMENT_STABLE, true);
+  ASSERT_TRUE(stale);
+  cache.clear();
+  EXPECT_EQ(nullptr, racing.acceptExisting(std::move(*stale), FilterCache::AdmissionLane::WHOLE));
+  EXPECT_EQ(2, use->acceptedCardinality(0));
+  EXPECT_EQ(0, use->acceptedCardinality(1));
+  EXPECT_FALSE(use->cardinality(0));
 }

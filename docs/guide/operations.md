@@ -928,11 +928,11 @@ Search has its own limits:
   exact raw count from a completed segment production or a complete canonical count,
   including after eviction. On segments without deletes, COUNT and exact-count
   TOP_K consumers that need only the count read it before population, avoiding
-  count execution and materialization. Unknown counts keep their normal
-  population decision, while exact-count top-k counts first on tracked unknown keys.
-  Complete resident membership
-  can still serve these counts and omit their weights, but earns no payload
-  credit on canonical segments without deletes. Reader-stable, restricted-domain
+  count execution and materialization. Count-only consumers never populate or
+  credit membership on canonical segments without deletes. Unknown COUNT and
+  bounded counts keep ordinary execution; exact-count top-k counts first on
+  tracked unknown keys. Complete count facts can omit the membership weight,
+  just as resident sources do. Reader-stable, restricted-domain
   and deleted-segment counts retain their membership credit.
   Constant first-K membership and consumers that read the set retain their demand.
   A flush drops values and metadata, including ledgers, while keeping sightings,

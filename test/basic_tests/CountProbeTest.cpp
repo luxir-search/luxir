@@ -58,7 +58,9 @@ protected:
       EXPECT_EQ(found, req->getMatchCount());
       if (repeat >= 2) {
         EXPECT_EQ(0, SkipStats::termDictionarySeeks);
-        EXPECT_EQ(4, SkipStats::wholeCountHits);
+        bool deleted = helper.getIndexWriter()->snapshots.readers.getReader()->segments()[0].hasDeletes();
+        EXPECT_EQ(deleted ? 4 : 0, SkipStats::wholeCountHits);
+        EXPECT_EQ(deleted ? 0 : 4, SkipStats::canonicalCountFactsRead);
         EXPECT_EQ(1, SkipStats::cacheFirstMembershipWeightSkips);
       }
     }
@@ -75,7 +77,7 @@ TEST_F(CountProbeTest, cachedConjunctionIncludesEmptySegmentsWithoutTermSeeks) {
   }
 }
 
-TEST_F(CountProbeTest, emptyConjunctionBecomesResident) {
+TEST_F(CountProbeTest, emptyConjunctionRemembersZero) {
   index();
   checkCached([](auto& mr) {
     return qb::boolean(mr, {qb::match(mr, "body_w", "even"), qb::match(mr, "body_w", "rare")});
@@ -93,7 +95,7 @@ TEST_F(CountProbeTest, missingTermWithDeletionsBecomesResident) {
   checkCached([](auto& mr) { return qb::match(mr, "body_w", "rare"); }, 38);
 }
 
-TEST_F(CountProbeTest, missingGeoFieldBecomesResident) {
+TEST_F(CountProbeTest, missingGeoFieldRemembersZero) {
   index(true);
   checkCached([](auto& mr) { return qb::geoBox(mr, "point", -1, 1, -1, 1); }, 160);
 }

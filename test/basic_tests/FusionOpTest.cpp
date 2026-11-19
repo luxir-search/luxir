@@ -330,15 +330,11 @@ TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
         mr, {qb::match(mr, "foo_w", "alpha"),
              qb::match(mr, "foo_w", "beta")});
   };
-  for (int round = 0; round < 3; round++) {
-    auto warm = localReq(luxirNode->getSearchEngine());
-    warm->collection("main");
-    auto& topDocs = warm->topDocs("q").countLimit().limit(0);
-    topDocs.rawQuery() = countQuery(topDocs.mr());
-    warm->execute(false);
-    ASSERT_OK(warm);
-    EXPECT_EQ(3, warm->getMatchCount("q"));
-  }
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  TermQuery alpha("foo_w", "alpha"), beta("foo_w", "beta");
+  std::array<Query*, 2> required{&alpha, &beta};
+  BooleanQuery query(required, {}, {}, {});
+  publishWholeMembershipForTests(*reader, query);
 
   auto lreq = localReq(luxirNode->getSearchEngine());
   lreq->collection("main");

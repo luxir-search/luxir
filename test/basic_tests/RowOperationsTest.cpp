@@ -166,7 +166,7 @@ TEST_F(RowOperationsTest, cachedRequiredConstantKeepsNamedMatchingRows) {
   QueryPrep::disableWholeMembershipPlanForTests = false;
   for (int i = 0; i < 2; i++) {
     auto req = localReq(helper.getSearchEngine());
-    req->topDocs().limit(0).countLimit().rawQuery() = qb::toParent(req->mr, "items",
+    req->topDocs().limit(1).countLimit().rawQuery() = qb::toParent(req->mr, "items",
         qb::match(req->mr, "color", "red"), "none");
     req->execute(1); ASSERT_OK(req);
   }

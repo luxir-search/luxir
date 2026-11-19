@@ -1358,7 +1358,7 @@ public:
     }
 
     std::optional<FilterCache::ExistingCandidate> lookupExistingFilterUse(
-        const Query& query, bool allowReaderStable = false) {
+        const Query& query, bool allowReaderStable = false, bool countsOnly = false) {
       if (filterUses == nullptr) return std::nullopt;
       const auto& identity = filterIdentity(query);
       if (!usesSharedFilterCache(identity.scope)
@@ -1367,7 +1367,7 @@ public:
         return std::nullopt;
       }
       if (!identity.key) return std::nullopt;
-      return filterUses->lookupExisting(*identity.key, identity.scope);
+      return filterUses->lookupExisting(*identity.key, identity.scope, countsOnly);
     }
 
     FilterCache::Use* acceptExistingFilterUse(

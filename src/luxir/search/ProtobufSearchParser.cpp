@@ -2072,11 +2072,23 @@ public:
           && planningContext->filterScope(*query) <= FilterKeyScope::CORE_STABLE
           ? FilterCache::Work::nanoseconds(0) : FilterCache::Work::assumed();
     };
+    auto lookupWholeCount = [&](bool needsIds = false) {
+      bool scalar = !needsIds && !QueryPrep::disableCanonicalCountFactsForTests
+          && planningContext->filterScope(*query) <= FilterKeyScope::CORE_STABLE
+          && std::any_of(view()->segments().begin(), view()->segments().end(),
+                         [](auto& segment) { return !segment.hasDeletes(); });
+      if (scalar && (placement != TopDocsPlacement::ROOT_OP
+          || std::any_of(view()->segments().begin(), view()->segments().end(),
+                         [](auto& segment) { return segment.hasDeletes(); }))) {
+        return std::optional<FilterCache::ExistingCandidate>{};
+      }
+      return planningContext->lookupExistingFilterUse(
+          *query, placement == TopDocsPlacement::ROOT_OP, scalar);
+    };
     if (pureCountShape && canOmitWeightForCacheFirstMembership(*query)
         && !directCountAvailable(*query, *view())
         && cache != nullptr && cache->enabled()) {
-      auto candidate = planningContext->lookupExistingFilterUse(
-          *query, placement == TopDocsPlacement::ROOT_OP);
+      auto candidate = lookupWholeCount();
       if (candidate.has_value()) {
         cacheFirstMembershipUse = planningContext->acceptExistingFilterUse(
             std::move(*candidate), FilterCache::AdmissionLane::WHOLE, wholeCountWork());
@@ -2094,7 +2106,7 @@ public:
         && canOmitWeightForCacheFirstMembership(*query)
         && !directCountAvailable(*query, *view())
         && cache != nullptr && cache->enabled()) {
-      auto candidate = planningContext->lookupExistingFilterUse(*query, true);
+      auto candidate = lookupWholeCount(scoreProfile.kind != Query::ScoreProfile::Kind::VARIABLE);
       if (candidate.has_value()) {
         cacheFirstMembershipUse = planningContext->acceptExistingFilterUse(
             std::move(*candidate), FilterCache::AdmissionLane::WHOLE, wholeCountWork());
@@ -2399,7 +2411,7 @@ public:
           wholeRankingWeight = countFreeRankingWeight;
         }
       }
-      wholeConstantRanking = wholeTopKCount
+      wholeConstantRanking = wholeTopKCount && !cacheFirstVariableRanking
           && (weight == nullptr
                   ? scoreProfile.kind
                       != Query::ScoreProfile::Kind::VARIABLE

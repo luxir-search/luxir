@@ -1162,7 +1162,7 @@ TEST_F(ScopedRowSpaceTest, reducersShareFilterCacheMembership) {
   uint64_t hits = 0;
   for (auto reducer : {"none", "max"}) {
     auto req = request();
-    req->topDocs().allQuery().countLimit().limit(0).filter(qb::toParent(req->mr,
+    req->topDocs().allQuery().countLimit().limit(1).filter(qb::toParent(req->mr,
         Fixture::CHILD, qb::match(req->mr, "label", "a"), reducer));
     req->execute(root);
     ASSERT_OK(req);

@@ -531,6 +531,12 @@ std::optional<int32_t> FilterCache::Use::cardinality(size_t segmentOrd) const {
   return count < 0 ? std::nullopt : std::optional<int32_t>(count);
 }
 
+std::optional<int32_t> FilterCache::Use::acceptedCardinality(size_t segmentOrd) const {
+  if (!existingAccepted || !existingCounts || segmentOrd >= slotsByOrd.size()) return std::nullopt;
+  // The accepted slot pin retains this immutable fact after metadata retirement.
+  return slotsByOrd[segmentOrd]->ledger.rawCardinality.load(std::memory_order_relaxed);
+}
+
 bool FilterCache::Use::recordCardinality(size_t segmentOrd, int32_t count) {
   auto* fact = cardinalityFact(segmentOrd);
   if (fact == nullptr || count < 0 || count > readerSegments[segmentOrd].maxDoc
@@ -1291,13 +1297,13 @@ FilterCache::Use* FilterCache::UseRegistry::get(const FilterKey& key,
 
 std::optional<FilterCache::ExistingCandidate>
 FilterCache::UseRegistry::lookupExisting(
-    const FilterKey& key, FilterKeyScope scope) {
+    const FilterKey& key, FilterKeyScope scope, bool countsOnly) {
   #ifndef NDEBUG
   assert(owningThread == std::this_thread::get_id());
   #endif
   if (cache == nullptr || uses.contains(key)) return std::nullopt;
   auto use = cache->lookupExisting(
-      key, scope, readerCoreGen, readerVersion, segments);
+      key, scope, readerCoreGen, readerVersion, segments, countsOnly);
   if (use == nullptr) return std::nullopt;
   return ExistingCandidate(std::move(use));
 }
@@ -1675,13 +1681,14 @@ std::unique_ptr<FilterCache::Use> FilterCache::beginUse(
 std::unique_ptr<FilterCache::Use> FilterCache::lookupExisting(
     const FilterKey& key, FilterKeyScope scope, uint64_t readerCoreGen,
     uint64_t readerVersion,
-    std::span<const SegmentIdentity> readerSegments) {
+    std::span<const SegmentIdentity> readerSegments, bool countsOnly) {
   if (!enabled() || readerSegments.empty()
       || !usesSharedFilterCache(scope)) {
     return nullptr;
   }
   auto entry = findEntry(key);
-  if (entry == nullptr || entry->scope != scope) return nullptr;
+  if (entry == nullptr || entry->scope != scope
+      || (countsOnly && scope > FilterKeyScope::CORE_STABLE)) return nullptr;
 
   if (scope == FilterKeyScope::READER_STABLE) {
     auto value = entry->readerValue.load(std::memory_order_acquire);
@@ -1714,10 +1721,12 @@ std::unique_ptr<FilterCache::Use> FilterCache::lookupExisting(
     if (found == current->end() || !isActive(*active, identity)) {
       return nullptr;
     }
-    auto value = lookSegmentValue(*found, identity);
-    if (value == nullptr) return nullptr;
+    bool fact = countsOnly && (*found)->active.load(std::memory_order_acquire)
+        && (*found)->segId == identity.segId && (*found)->maxDoc == identity.maxDoc
+        && (*found)->space == identity.space
+        && (*found)->ledger.rawCardinality.load(std::memory_order_relaxed) >= 0;
+    if (countsOnly ? !fact : (candidates[i] = lookSegmentValue(*found, identity)) == nullptr) return nullptr;
     aligned[i] = *found;
-    candidates[i] = std::move(value);
   }
 
   auto use = std::unique_ptr<Use>(new Use(
@@ -1726,6 +1735,7 @@ std::unique_ptr<FilterCache::Use> FilterCache::lookupExisting(
                                    readerSegments.end()),
       readerCoreGen, readerVersion, false, 0));
   use->existingCandidates = std::move(candidates);
+  use->existingCounts = countsOnly;
   return use;
 }
 
@@ -1784,7 +1794,7 @@ bool FilterCache::acceptExisting(Use& use, AdmissionLane lane, Work work) {
   for (size_t i = 0; i < use.readerSegments.size(); i++) {
     const auto& identity = use.readerSegments[i];
     const auto& slot = use.slotsByOrd[i];
-    if (slot == nullptr || use.existingCandidates[i] == nullptr
+    if (slot == nullptr || (!use.existingCounts && use.existingCandidates[i] == nullptr)
         || !slot->active.load(std::memory_order_acquire)
         || slot->segId != identity.segId || slot->maxDoc != identity.maxDoc || slot->space != identity.space
         || !isActive(*active, identity)) {
@@ -1793,7 +1803,8 @@ bool FilterCache::acceptExisting(Use& use, AdmissionLane lane, Work work) {
   }
 
   observeAdmissionLane(use, lane);
-  for (size_t i = 0; i < use.readerSegments.size(); i++) {
+  if (use.existingCounts) touchEpoch(use.entry->lastUsed, use.epoch);
+  for (size_t i = 0; !use.existingCounts && i < use.readerSegments.size(); i++) {
     acceptSharedHit(use, i,
                     std::move(use.existingCandidates[i]), work);
   }

@@ -2755,9 +2755,10 @@ public:
     auto wholeConsumer = this->sortPlan.useFieldSort
         ? QueryPrep::WholeMembershipConsumer::FIELD_SORT
         : requirements.needRankedDocs
-              ? wholeConstantRanking || requirements.countLimit >= 0
-                    ? QueryPrep::WholeMembershipConsumer::TOP_K_MEMBERSHIP
-                    : QueryPrep::WholeMembershipConsumer::TOP_K_COUNT
+              ? wholeConstantRanking ? QueryPrep::WholeMembershipConsumer::TOP_K_FIRST_IDS
+                    : requirements.countLimit >= 0
+                          ? QueryPrep::WholeMembershipConsumer::TOP_K_BOUNDED_COUNT
+                          : QueryPrep::WholeMembershipConsumer::TOP_K_COUNT
               : QueryPrep::WholeMembershipConsumer::COUNT;
     if (wholeMembershipWeight != nullptr) {
       wholeMembershipPlan = QueryPrep::WholeMembershipPlan(
@@ -2770,7 +2771,7 @@ public:
           *wholeMembershipUse, planning.filterUses, wholeConsumer);
     }
     if (weight == nullptr) {
-      bool residentWhole = wholeMembershipUse != nullptr
+      bool acceptedWhole = wholeMembershipUse != nullptr
           && !requirements.needExactDomain
           && ((this->sortPlan.useFieldSort
                   && requirements.needRankedDocs && !requestNeedsScores)
@@ -2782,9 +2783,9 @@ public:
           && requirements.needExactDomain && !this->sortPlan.useFieldSort
           && (!requirements.needRankedDocs
               || scoreProfile.kind != Query::ScoreProfile::Kind::VARIABLE);
-      if ((!residentWhole && !residentExact) || !filterWeights.empty()) {
+      if ((!acceptedWhole && !residentExact) || !filterWeights.empty()) {
         throw std::logic_error(
-            "Weight-free TopDocs requires complete resident membership");
+            "Weight-free TopDocs requires a complete cached source");
       }
     }
     if (!filterWeights.empty()) {
