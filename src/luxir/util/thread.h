@@ -20,6 +20,8 @@
 #include <oneapi/tbb/task_arena.h>
 #include <oneapi/tbb/task_group.h>
 
+#include "luxir/util/IoContext.h"
+
 namespace luxir {
 
 /// Label the calling thread for ps/top/gdb (15-char kernel limit).
@@ -109,7 +111,8 @@ public:
       // A scope can be reused after join (the stored-field fallback does so).
       // Shares can also spawn while the owner is joining, hence the atomic.
       joined.store(false, std::memory_order_relaxed);
-      group->run([f = std::forward<F>(f), taskArena = currentArena] {
+      // The task runs under the spawning thread's IoContext.
+      group->run([f = bindIoContext(std::forward<F>(f)), taskArena = currentArena] {
         auto previous = std::exchange(currentArena, taskArena);
         auto restore = scope_guard([&] { currentArena = previous; });
         f();

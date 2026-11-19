@@ -81,6 +81,11 @@ void SearchEngine::submitBody(SearchRequest& req, bool mayDefer, FanoutScope* ow
   LoadScope load(LoadKind::REQUEST);
   std::optional<FanoutCreditScope> credit;
   if (req.tg) credit.emplace(execution->startNs());
+  // Reads done for the request see its context, here and in every task it
+  // fans out (FanoutScope carries it). The scope only touches this thread's
+  // slot, so it may end after bodyDone() has released the request.
+  req.io.requestId = req.proto.request_id;
+  IoScope io(&req.io);
   // Until the calculators start, an unclassified failure is the request's
   // fault: parsers and planners reject authored input with bare exceptions.
   // Once execution is under way it is the engine's.  Throw sites that know
@@ -240,6 +245,7 @@ void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
 void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver) {
   req.counting = true;
   req.submitted = std::chrono::steady_clock::now();
+  if (req.waitCancellation.stop_possible()) req.io.stop = req.waitCancellation.get_token();
   metrics().start(metricActivity(MetricStage::SEARCH));
   if (!req.proto.min_commit.empty()) {
     try {
