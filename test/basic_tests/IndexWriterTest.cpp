@@ -18,13 +18,16 @@
 #include <mutex>
 #include <memory>
 #include <latch>
+#include <format>
 
 #include <CLI/CLI.hpp>
 #include <oneapi/tbb/flow_graph.h>
 #include <luxir/index/Inverter.h>
 #include <luxir/server/ProtoUpdateMessage.h>
 
+#include "luxir/index/IdFilter.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/index/SegmentSummary.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/TermQuery.h"
@@ -4959,4 +4962,110 @@ TEST_F(IndexWriterTest, idTypeSurvivesMergeAndReopen) {
   CommitSnapshotRegistry snapshots(iw->dir);
   IndexWriter reopened(snapshots);
   check(*reopened.snapshots.readers.getReader(), 1);
+}
+
+namespace {
+
+// Ids "s<seg>-<doc>" give each committed segment a disjoint id range.
+std::string idFilterId(int seg, int doc) { return std::format("s{}-{:02}", seg, doc); }
+
+constexpr int ID_FILTER_SEGS = 8;
+constexpr int ID_FILTER_DOCS = 20;
+
+void addIdFilterSegments(test::CollectionHelper& h) {
+  h.getIndexWriter()->setMergeFactor(1000);
+  for (int s = 0; s < ID_FILTER_SEGS; s++) {
+    std::vector<test::Doc> docs;
+    for (int d = 0; d < ID_FILTER_DOCS; d++) docs.push_back(test::flatdoc("id", idFilterId(s, d)));
+    ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT, true).success);
+  }
+}
+
+// Sums, over every segment of a commit, the ids that passed the id range and
+// the id filter and were sought in the dictionary.
+struct SeekCounter {
+  std::atomic<int64_t> seeks = 0;
+  SeekCounter() {
+    Signal::listen("deleteIdsSought", [this](void*, void* n, void*) -> void* {
+      seeks += (int64_t)n;
+      return nullptr;
+    });
+  }
+  ~SeekCounter() { Signal::unlisten("deleteIdsSought"); }
+};
+
+} // namespace
+
+TEST_F(IndexWriterTest, idFilterPrunesOverwritesAcrossSegments) {
+  LuxirNode node;
+  test::CollectionHelper h(node);
+  addIdFilterSegments(h);
+
+  // One overwrite per segment in one request: each id is sought only in the
+  // segment that holds it.
+  SeekCounter counter;
+  std::vector<test::Doc> docs;
+  for (int s = 0; s < ID_FILTER_SEGS; s++) docs.push_back(test::flatdoc("id", idFilterId(s, 7)));
+  ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT, true).success);
+  EXPECT_EQ(ID_FILTER_SEGS, counter.seeks.load());
+
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  EXPECT_EQ(ID_FILTER_SEGS * ID_FILTER_DOCS, reader->liveDocs());
+  EXPECT_EQ(ID_FILTER_SEGS * (ID_FILTER_DOCS + 1), reader->maxDoc());
+}
+
+TEST_F(IndexWriterTest, idFilterSkipsAbsentDeletes) {
+  LuxirNode node;
+  test::CollectionHelper h(node);
+  addIdFilterSegments(h);
+
+  // Ids outside every segment's range never reach a seek; ids inside one
+  // segment's range pass only on a filter false positive (about 1%).
+  SeekCounter counter;
+  std::vector<std::string> ids;
+  for (int i = 0; i < 50; i++) ids.push_back(std::format("t-{}", i));
+  for (int i = 0; i < 50; i++) ids.push_back(idFilterId(i % ID_FILTER_SEGS, i % ID_FILTER_DOCS) + "x");
+  ASSERT_TRUE(h.deleteByIds(ids, UpdateMessage::COMMIT).success);
+  EXPECT_LT(counter.seeks.load(), 10);
+  EXPECT_EQ(ID_FILTER_SEGS * ID_FILTER_DOCS, h.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
+}
+
+TEST_F(IndexWriterTest, idFilterRebuiltOnMerge) {
+  LuxirNode node;
+  test::CollectionHelper h(node);
+  addIdFilterSegments(h);
+  int lastSeg = ID_FILTER_SEGS - 1, lastDoc = ID_FILTER_DOCS - 1;
+  ASSERT_TRUE(h.deleteByIds({idFilterId(0, 0), idFilterId(lastSeg, lastDoc)}, UpdateMessage::COMMIT).success);
+  test::CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(h.submit(merge).success);
+
+  auto iw = h.getIndexWriter();
+  auto info = test::readDurableIndexInfo(iw->dir);
+  ASSERT_EQ(1u, info->segments.size());
+  std::shared_ptr<const IdFilter> filter;
+  std::shared_ptr<const SegmentSummary> summary;
+  for (const auto& overlay : info->segments[0].overlays) {
+    if (overlay.kind == IdFilter::OVERLAY_KIND) filter = IdFilter::open(iw->dir, overlay.files[0].name);
+    if (overlay.kind == SegmentSummary::OVERLAY_KIND) summary = SegmentSummary::open(iw->dir, overlay.files[0].name);
+  }
+  ASSERT_TRUE(filter);
+  ASSERT_TRUE(summary);
+  // The merge drops the deleted ids, so the id range shrinks to the live ones.
+  const auto* id = summary->field("id");
+  ASSERT_TRUE(id);
+  EXPECT_EQ(idFilterId(0, 1), std::string(id->term_min.begin(), id->term_min.end()));
+  EXPECT_EQ(idFilterId(lastSeg, lastDoc - 1), std::string(id->term_max.begin(), id->term_max.end()));
+  EXPECT_EQ(uint64_t(ID_FILTER_SEGS * ID_FILTER_DOCS - 2), filter->numKeys());
+  for (int s = 0; s < ID_FILTER_SEGS; s++) {
+    for (int d = 0; d < ID_FILTER_DOCS; d++) {
+      if ((s == 0 && d == 0) || (s == lastSeg && d == lastDoc)) continue;
+      EXPECT_TRUE(filter->mayContain(idFilterId(s, d))) << idFilterId(s, d);
+    }
+  }
+
+  SeekCounter counter;
+  ASSERT_TRUE(h.index(test::flatdoc("id", idFilterId(4, 4)), UpdateMessage::COMMIT, true).success);
+  EXPECT_EQ(1, counter.seeks.load());
+  EXPECT_EQ(ID_FILTER_SEGS * ID_FILTER_DOCS - 2, iw->snapshots.readers.getReader()->liveDocs());
 }

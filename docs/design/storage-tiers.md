@@ -54,6 +54,16 @@ their streams at open, and a use costs one acquire load.
 `rangeStream` slices `getInputStream()` and `prefetchRanges` calls `prefetch` (an
 `madvise` on mmap files).
 
+Two more members let a reader address a lazy file by absolute offsets while
+fetching only what it names: `unfetchedStream()` returns the whole file's
+stable mapping without fetching anything (only bytes made resident first, by
+`fetchRanges` or `rangeStream`, may be read through it), and
+`resident(offset, length)` says whether a read needs a fetch. The defaults
+(`getInputStream()`, and always resident) keep every other file as it was.
+The writer's id lookups use them (`TermProbe`, see
+[storage](storage.md#a-writer-over-cold-data-optional)): a lazy `TermsEnum`
+reads the block index, trie, term blocks and postings it fetched in rounds.
+
 What this does not do is make a query read less than a whole file. A query that
 needs any term of a field fetches every file holding that field's data in full.
 Declaring the postings ranges a query will read (and fetching only those) is the
@@ -116,6 +126,9 @@ A backend plugin that sets `REMOTE` is expected to:
   what was fetched, keeps the readers' plain-pointer access). `openFile`
   returns null for an absent name, as on every directory; a lazy fetch that
   later finds the object gone throws `std::filesystem::filesystem_error`;
+- override `unfetchedStream()` and `resident()` over that mapping, so a writer
+  probes an id with range reads and leaves cold segments unfetched (without
+  them, an upsert reads every id-bearing file it probes whole);
 - use the hotcache and `knownFiles` as above;
 - keep an object readable while a reader holds it: on a filesystem a merged-away
   segment stays readable for the queries that still hold it, because the unlink

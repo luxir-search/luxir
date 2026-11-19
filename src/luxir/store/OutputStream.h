@@ -541,6 +541,21 @@ public:
   // and the first touch of a range may block on I/O and throw.
   virtual bool lazy() const { return false; }
 
+  // True when reading [offset, offset + length) needs no fetch. Files that are
+  // not lazy are always resident.
+  virtual bool resident(uint64_t offset, uint64_t length) const {
+    (void)offset;
+    (void)length;
+    return true;
+  }
+
+  // The whole file as one stream, without fetching anything: only bytes made
+  // resident first (fetchRanges, rangeStream) may be read through it, which
+  // lets a reader address a lazy file by absolute offsets while fetching only
+  // the ranges it names. Its bytes stay valid as long as the InputFile lives.
+  // The default is getInputStream(), which on a lazy file fetches it all.
+  virtual InputStream unfetchedStream() { return getInputStream(); }
+
   static void checkRange(uint64_t offset, uint64_t length, uint64_t fileSize) {
     if (offset > fileSize || length > fileSize - offset) {
       throw FileIOException("range [" + std::to_string(offset) + ", +" + std::to_string(length)

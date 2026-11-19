@@ -21,6 +21,7 @@
 #include <vector>
 #include "luxir/index/TrieBuilder.h"
 #include "luxir/index/IndexRamBudget.h"
+#include "luxir/index/IdFilter.h"
 #include "luxir/index/IdRange.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/StrRef.h"
@@ -73,6 +74,10 @@ public:
   // when no finalized dictionary was written for it; callers then derive them.
   std::optional<IdRange> idRange;
   std::optional<uint64_t> idDictionaryBlocks;
+  // The id field's membership filter, fed as its terms are written (both
+  // flush and merge); null when the segment wrote no id term. The owner writes
+  // the sidecar (IndexWriter::writeIdFilter).
+  std::unique_ptr<IdFilter::Builder> idFilter;
 
   // The segment summary: one record per field of the directory, filled in
   // finish(). The owner writes the sidecar afterwards
@@ -83,6 +88,7 @@ private:
   Directory& directory;
   int32_t maxDoc;  // Root count, set by caller.
   std::vector<SpaceDescriptor> spaceDescriptors{{}};
+  std::mutex idFilterMutex;
   int64_t sizeInBytes = 0; // total size of all files written
   // Immutable request births, referenced from segment metadata rather than a field.
   seg_location versionRunsLoc;
@@ -423,6 +429,13 @@ public:
     files.resize(0);
     assert(delegatedRamBytes == 0);
     return true;
+  }
+
+  // Sized for maxDoc keys: a segment holds at most one id term per document.
+  IdFilter::Builder& idFilterBuilder() {
+    std::lock_guard lock(idFilterMutex);
+    if (!idFilter) idFilter = std::make_unique<IdFilter::Builder>((uint64_t)std::max(maxDoc, 1));
+    return *idFilter;
   }
 
   void setMaxDoc(int max) {
@@ -869,6 +882,8 @@ public:
 private:
   PostingsWriter& postingsWriter;
   PostingsWriter::IndexFieldInfo* fieldInfo;
+  // The segment's id filter while the field being written is "id".
+  IdFilter::Builder* idFilter = nullptr;
 
   std::array<OutputStreamPtr, 3> streams; // holders for the streams we are using.
   OutputStream& termOutput;    // output stream for termFile
@@ -1396,11 +1411,20 @@ public:
     startField(finfo);
   }
 
+  // Feeds the segment's id filter when `field` is "id"; for a writer whose
+  // field info carries no name (a range of a partitioned merge).
+  void feedIdFilter(std::string_view field) {
+    if (field == "id") idFilter = &postingsWriter.idFilterBuilder();
+  }
+
   void startField(PostingsWriter::IndexFieldInfo* finfo) {
     if (termsLoc == -1) {
       throw std::runtime_error("startField called twice!");
     }
     fieldInfo = finfo;
+    // A range of a partitioned field has no name of its own; its owner names it (feedIdFilter).
+    idFilter = !finfo->fieldname.isNull() && (std::string_view)finfo->fieldname == "id"
+        ? &postingsWriter.idFilterBuilder() : nullptr;
     hasFreqs = FieldType::hasFreqs(finfo->flags);
     hasPositions = FieldType::hasPositions(finfo->flags);
     hasNorms = hasPositions;
@@ -1839,6 +1863,8 @@ public:
       termList.pop_back();
       return;
     }
+    // Only kept terms: a merge drops a deleted id's term here, after startTerm.
+    if (idFilter) idFilter->add(std::string_view(termList.back()));
     // Recorded from the terms actually written, so flush and merge (where
     // deletes may drop the last long value) both derive the flag exactly.
     if (PackedTerm::mayBeFitted(std::string_view(termList.back()))) mayHaveFitted = true;

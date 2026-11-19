@@ -458,10 +458,23 @@ no aggregate.
 from the segments' sidecars (opened once per segment and kept on its
 `SegInfo`), and caches it with the `core_gen` and segment ids it covers. A
 commit whose segment set is unchanged, such as a delete-only commit, copies
-the cached aggregate without reading anything; a flush or merge recomputes
-it. A reopened writer seeds the cache from the manifest it loads, so a later
-delete-only commit copies the stored aggregate (a budget change therefore
-applies from the next segment change). Deletes never change it: the
+the cached aggregate without reading anything. A reopened writer seeds the
+cache from the manifest it loads, so a later delete-only commit copies the
+stored aggregate (a budget change therefore applies from the next segment
+change).
+
+A flush or merge updates it without reading the segments it kept
+(`CollectionSummary::update`): the previous aggregate is unioned with the
+added segments' summaries, and the counts of the retired segments are taken
+out. A merge loads its sources' summaries (it reads the sources anyway), a
+segment emptied by deletes has its summary loaded when the deletes are
+applied, and `moveSegmentToDelete` keeps a retired segment's summary until a
+manifest no longer covers it. Bounds are never narrowed by a removal, which
+keeps them conservative; a record no remaining segment holds is dropped. On
+a collection whose segments are on a remote store, this is what lets a write
+commit without fetching a summary per old segment. Only when the previous
+aggregate is incomplete, or a retired segment's summary is unknown, is the
+aggregate recomputed from every sidecar, fetched in parallel. Deletes never change it: the
 aggregate, like the segment summaries, covers deleted documents.
 Replication copies the manifest, so a follower's reader has the same
 aggregate.

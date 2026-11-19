@@ -15,6 +15,7 @@
 #include <oneapi/tbb/flow_graph.h>
 #include <oneapi/tbb/task_arena.h>
 #include "luxir/index/AuxInfo.h"
+#include "luxir/index/IdFilter.h"
 #include "luxir/index/SegmentSummary.h"
 #include "luxir/index/SummaryInfo.h"
 #include "CommitSnapshotRegistry.h"
@@ -88,6 +89,11 @@ public:
     // collection summary is first computed over it; null until then and
     // when the segment has no readable summary.
     std::atomic<std::shared_ptr<const SegmentSummary>> summary = nullptr;
+
+    // The segment's id filter ("id_filter" overlay), once looked for; null when
+    // it has none.
+    std::atomic<std::shared_ptr<const IdFilter>> idFilter = nullptr;
+    std::atomic<bool> idFilterLoaded = false;
 
     // Null until known; once populated, the physical dictionary's bounds never change.
     std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
@@ -523,6 +529,11 @@ public:
   // Times the collection summary was computed from segment summaries: once
   // per segment set (core_gen), never for a delete-only commit.
   std::atomic<uint64_t> collectionSummaryBuilds{0};
+  // Of those, the ones derived from the previous summary and the added and
+  // retired segments' summaries (CollectionSummary::update).
+  std::atomic<uint64_t> collectionSummaryUpdates{0};
+  // Tests turn it off to stand in for segments written before id filters.
+  static inline bool writeIdFiltersForTests = true;
 
   // TEXT merge partitioning thresholds. Tests and constrained deployments may
   // lower these without changing the on-disk behavior of flushes or serial merges.
@@ -789,6 +800,14 @@ private:
   // The segment's core: its slot's, else the published reader's, else a new one; the
   // slot keeps it.
   std::shared_ptr<SegmentCore> getSegmentCore(SegInfo& seg);
+  // The segment's id bounds: known at flush and merge, else from its summary, else from its
+  // id dictionary. Kept on the SegInfo.
+  std::shared_ptr<const IdRange> idRangeOf(SegInfo& seg);
+  // The segment's id filter, read on first use; null when it has none.
+  std::shared_ptr<const IdFilter> idFilterOf(SegInfo& seg) noexcept;
+  void writeIdFilter(SegInfo& seg, PostingsWriter& pwriter) noexcept;
+  // False for a segment whose data a read would fetch over the network.
+  bool segmentResident(SegInfo& seg);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
   // Builds outstanding active names and matches new in-flight selectors on the
@@ -825,6 +844,10 @@ private:
   };
   std::mutex collectionSummaryMutex;
   CollectionSummaryCache collectionSummaryCache;  // protected by collectionSummaryMutex
+  // Summaries of retired segments that a published collection summary still
+  // covers, by segment id; leaf lock.
+  std::mutex retiredSummariesMutex;
+  boost::unordered_flat_map<uint64_t, std::shared_ptr<const SegmentSummary>> retiredSummaries;
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,
       SegmentCore& core,

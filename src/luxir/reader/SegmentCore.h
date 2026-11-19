@@ -128,6 +128,21 @@ public:
     return slot.stream;
   }
 
+  // The whole file without fetching it: a stream whose bytes may be read only
+  // where the caller made them resident (see InputFile::unfetchedStream).
+  InputStream unfetchedStream(uint32_t fnum) {
+    if (auto stream = residentStream(fnum)) return *stream;
+    return files[fnum]->unfetchedStream();
+  }
+
+  // True when every file of the segment can be read without a fetch.
+  bool resident() const {
+    for (const auto& file : files) {
+      if (file != nullptr && !file->resident(0, (uint64_t)file->size())) return false;
+    }
+    return true;
+  }
+
   // Field metadata of all spaces, resident since open; see `catalog`.
   const InputStream& fieldCatalog() const noexcept { return catalog; }
   int64_t fieldCatalogStart() const noexcept { return catalogStart; }

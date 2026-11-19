@@ -4,6 +4,7 @@
 #include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
+#include "luxir/reader/TermProbe.h"
 #include "luxir/store/Manifest.h"
 
 #include <algorithm>
@@ -81,7 +82,7 @@ SortedDeletes::EntrySpan clipDeletes(SortedDeletes::EntrySpan span, const IdRang
   if (range.empty) return {};
   auto first = std::lower_bound(span.begin(), span.end(), std::string_view(range.min),
       [](const auto& entry, std::string_view id) { return (std::string_view)entry < id; });
-  auto last = std::upper_bound(first, span.end(), std::string_view(range.max),
+  auto last = range.maxUnbounded ? span.end() : std::upper_bound(first, span.end(), std::string_view(range.max),
       [](std::string_view id, const auto& entry) { return id < (std::string_view)entry; });
   return span.subspan((size_t)(first - span.begin()), (size_t)(last - first));
 }
@@ -246,25 +247,34 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   storedDictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(*getSchema()));
   // Only manifest-live segments can seed a resource. Own the winning bytes;
   // later retirement of its segment must not affect inverter/merge writers.
+  // The largest segment (by manifest bytes) holding a dictionary wins, so
+  // usually one segment is opened (its catalog, not its data): opening every
+  // segment of a remote collection would delay the first write.
+  std::vector<SegInfo*> bySize;
+  for (const auto& [id, seg] : segInfos) bySize.push_back(seg.get());
+  auto bytesOf = [](const SegInfo* seg) {
+    uint64_t total = 0;
+    for (const auto& file : seg->files) total += file.size;
+    return total;
+  };
+  std::ranges::sort(bySize, [&](const SegInfo* a, const SegInfo* b) {
+    auto ba = bytesOf(a), bb = bytesOf(b);
+    return ba != bb ? ba > bb : a->segId < b->segId;
+  });
   for (const auto& [name, type] : getSchema()->fieldTypeMap) {
     auto* stored = dynamic_cast<const StoredFieldType*>(type.get());
     if (!stored || !stored->format_.dictionaryBytes) continue;
     std::string_view bestDictionary;
-    int64_t bestBytes = -1;
-    uint64_t bestSegId = 0;
-    for (const auto& [id, seg] : segInfos) {
+    for (SegInfo* seg : bySize) {
       auto readerCore = getSegmentCore(*seg);
       for (const auto& space : readerCore->spaces()) {
         auto* reader = readerCore->spaceReader(space.path);
         const auto* field = reader->fieldInfo(name);
         if (!field || !field->stored || field->stored->dictionary.empty()) continue;
-        auto bytes = field->columnMetaOff;
-        if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
-          bestBytes = bytes;
-          bestSegId = id;
-          bestDictionary = field->stored->dictionary;
-        }
+        bestDictionary = field->stored->dictionary;
+        break;
       }
+      if (!bestDictionary.empty()) break;
     }
     auto token = storedDictionaries.token(name, stored->format_);
     if (!bestDictionary.empty() && token) {
@@ -656,8 +666,16 @@ class IndexWriter::PolicySegmentSummary final : public MergeSegmentSummary {
 public:
   PolicySegmentSummary(IndexWriter& iw, SegInfo& seg) : iw(iw), seg(seg) {}
 
-  // Opens the segment's core on first use; the writer keeps it.
+  // From the segment summary when it settles the answer (the column writer's
+  // own bounds, equal to the column header's); otherwise opens the segment's
+  // core, which the writer keeps.
   std::optional<NumericBounds> numericBounds(std::string_view field) const override {
+    if (auto summary = iw.segmentSummary(seg); summary && summary->complete()) {
+      const auto* record = summary->field(field);
+      if (record == nullptr || (record->summary_flags & SegmentSummary::EMPTY)) return std::nullopt;
+      if ((record->summary_flags & SegmentSummary::HAS_NUM_VALUES) && record->num_values == 0) return std::nullopt;
+      if (record->summary_flags & SegmentSummary::HAS_NUMERIC) return NumericBounds{record->num_min, record->num_max};
+    }
     try {
       auto core = iw.getSegmentCore(seg);
       const auto* info = core->rootReader().fieldInfo(field);
@@ -1434,9 +1452,9 @@ uint64_t IndexWriter::deleteOnlyFlushCapLocked() const {
   uint64_t blocks = 0;
   for (const auto& [_, seg] : segInfos) {
     auto count = seg->idDictionaryBlocks.load();
-    // Reopened segments and merge outputs without a finalized id dictionary
-    // count slots until a reader supplies the exact count (including partial
-    // blocks at partition boundaries).
+    // Segments whose block count is unknown (reopened and not yet opened, or
+    // with a range-partitioned dictionary, which has partial blocks at its
+    // partition boundaries) count slots.
     if (count == UINT64_MAX) count = ((uint64_t)seg->maxDoc + Postings::TERMS_BLOCK_SIZE - 1) / Postings::TERMS_BLOCK_SIZE;
     blocks += count;
   }
@@ -1623,7 +1641,10 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     auto& postings = inverter.getPostingsWriter();
     if (auto& range = postings.idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
     segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
-    if (success) writeSegmentSummary(*segInfo, postings);
+    if (success) {
+      writeSegmentSummary(*segInfo, postings);
+      writeIdFilter(*segInfo, postings);
+    }
     // Set liveDocs + liveGen for deleted docs from errors during indexing
     if (inverter.liveGen > 0) {
       liveDocsBytesWritten += LiveDocsWriter::fileBytes(segInfo->maxDoc);
@@ -2146,6 +2167,12 @@ void IndexWriter::moveSegmentToDelete(uint64_t segId) {
   // It's not an error if not found since someone else may have deleted it already.
   if (it != segInfos.end()) {
     INDEX_DEBUG("ToDelete += {}", *it->second);
+    // A loaded summary lets the collection summary drop this segment without
+    // reading the segments it keeps (writeCollectionSummary).
+    if (auto summary = it->second->summary.load()) {
+      std::lock_guard summariesLock(retiredSummariesMutex);
+      retiredSummaries[segId] = std::move(summary);
+    }
     // Move the segment to deletion list instead of just erasing it
     segmentsToDelete.push_back(std::move(it->second));
     segInfos.erase(it);
@@ -2233,32 +2260,82 @@ std::shared_ptr<SegmentCore> IndexWriter::getSegmentCore(SegInfo& seg) {
   auto core = seg.sharedSegmentCore.load();
   if (!core) {
     std::shared_ptr<IndexReader> reader;
-    if (const auto* published = publishedSegment(seg, reader)) core = published->segmentCoreShared();
+    // Callers may hold indexMutex. Joining a search's in-flight open waits on a
+    // task group; isolated, that wait cannot steal a writer task that would
+    // take indexMutex again on this thread.
+    if (const auto* published = publishedSegment(seg, reader)) {
+      core = oneapi::tbb::this_task_arena::isolate([&] { return published->segmentCoreShared(); });
+    }
     if (!core) core = std::make_shared<SegmentCore>(dir, seg.segId, seg.creatorEpoch);
     seg.sharedSegmentCore.store(core);
   }
-  auto& pr = core->rootReader();
-  bool rangeKnown = seg.idRange.load() != nullptr;
-  if (!rangeKnown || seg.idDictionaryBlocks.load() == UINT64_MAX) {
-    IdRange range;
-    uint64_t blocks = 0;
+  // From the catalog only: reading the dictionary would fetch whole files on a
+  // lazy directory. A range-partitioned dictionary has partial blocks at its
+  // partition boundaries, so its count stays unknown (deleteOnlyFlushCapLocked
+  // estimates it).
+  if (seg.idDictionaryBlocks.load() == UINT64_MAX) {
+    const auto* info = core->rootReader().fieldInfo("id");
+    if (!info || info->nTerms <= 0) seg.idDictionaryBlocks.store(0);
+    else if (info->rangeTableLoc.isNull()) {
+      seg.idDictionaryBlocks.store(((uint64_t)info->nTerms + Postings::TERMS_BLOCK_SIZE - 1) / Postings::TERMS_BLOCK_SIZE);
+    }
+  }
+  return core;
+}
+
+// Segments this writer created were written locally. Any other segment on a
+// remote directory is cold until a reader holds it with every file resident;
+// deciding that never opens it.
+bool IndexWriter::segmentResident(SegInfo& seg) {
+  if (!(dir.capabilities() & Directory::REMOTE) || seg.creatorEpoch == writerEpoch) return true;
+  auto core = seg.sharedSegmentCore.load();
+  std::shared_ptr<IndexReader> reader;
+  if (!core) {
+    if (const auto* published = publishedSegment(seg, reader); published && published->isOpen()) {
+      core = published->segmentCoreShared();
+    }
+  }
+  return core && core->resident();
+}
+
+// Flush and merge outputs know their exact range. A reopened segment takes it
+// from its summary (possibly wider: truncated bounds), which costs one small
+// read and no segment data; only a segment without a usable summary reads the
+// first and last terms of its id dictionary.
+std::shared_ptr<const IdRange> IndexWriter::idRangeOf(SegInfo& seg) {
+  if (auto known = seg.idRange.load()) return known;
+  auto range = std::make_shared<IdRange>();
+  bool found = false;
+  if (auto summary = segmentSummary(seg); summary && summary->complete()) {
+    const auto* record = summary->field("id");
+    if (record == nullptr || (record->summary_flags & SegmentSummary::EMPTY) || record->n_terms == 0) {
+      found = true;
+    } else if (record->summary_flags & SegmentSummary::HAS_TERM_BOUNDS) {
+      range->min.assign((const char*)record->term_min.data(), record->term_min.size());
+      range->max.assign((const char*)record->term_max.data(), record->term_max.size());
+      range->maxUnbounded = (record->summary_flags & SegmentSummary::TERM_MAX_UNBOUNDED) != 0;
+      range->empty = false;
+      found = true;
+    }
+  }
+  if (!found) {
+    auto core = getSegmentCore(seg);
+    auto& pr = core->rootReader();
     if (auto* info = pr.fieldInfo("id"); info && info->nTerms > 0) {
       auto guard = MemPool::threadLocalPoolGuard();
       TermsEnum terms(guard.pool(), pr, *info);
-      blocks = terms.numBlocks();
-      if (!rangeKnown) {
-        terms.seekOrd(0);
-        range.min = (std::string_view)terms.term();
-        terms.seekOrd(info->nTerms - 1);
-        range.max = (std::string_view)terms.term();
-        range.empty = false;
-      }
+      terms.seekOrd(0);
+      range->min = (std::string_view)terms.term();
+      terms.seekOrd(info->nTerms - 1);
+      range->max = (std::string_view)terms.term();
+      range->empty = false;
     }
-    seg.idDictionaryBlocks.store(blocks);
-    // A populated range is never replaced.
-    if (!rangeKnown) seg.idRange.store(std::make_shared<const IdRange>(std::move(range)));
   }
-  return core;
+  // A populated range is never replaced.
+  std::shared_ptr<const IdRange> expected;
+  std::shared_ptr<const IdRange> desired = range;
+  if (seg.idRange.compare_exchange_strong(expected, desired)) return desired;
+  return expected;
 }
 
 // The published reader's segment of the same id is the same physical segment:
@@ -2376,6 +2453,45 @@ void IndexWriter::writeSegmentSummary(SegInfo& seg, PostingsWriter& pwriter) noe
   }
 }
 
+void IndexWriter::writeIdFilter(SegInfo& seg, PostingsWriter& pwriter) noexcept {
+  if (!pwriter.idFilter || pwriter.idFilter->numKeys() == 0 || !writeIdFiltersForTests) return;
+  try {
+    std::string fileName = IdFilter::overlayFileName(seg.segId, seg.creatorEpoch, writerEpoch);
+    auto image = pwriter.idFilter->encode();
+    AuxInfo info;
+    info.kind = std::string(IdFilter::OVERLAY_KIND);
+    info.name = std::string(IdFilter::OVERLAY_NAME);
+    info.gen = IdFilter::OVERLAY_GEN;
+    info.files.push_back(pwriter.idFilter->write(dir, fileName));
+    seg.unsyncedFiles.push_back(fileName);
+    seg.auxOverlays.push_back(std::move(info));
+    seg.idFilter.store(IdFilter::fromBytes(image));
+    seg.idFilterLoaded.store(true);
+  } catch (const std::exception& e) {
+    LOG_WARN("Id filter not written for seg={}: {}", seg.segId, e.what());
+  } catch (...) {
+    LOG_WARN("Id filter not written for seg={}: unknown exception", seg.segId);
+  }
+}
+
+std::shared_ptr<const IdFilter> IndexWriter::idFilterOf(SegInfo& seg) noexcept {
+  if (seg.idFilterLoaded.load()) return seg.idFilter.load();
+  std::shared_ptr<const IdFilter> filter;
+  auto overlay = std::ranges::find_if(seg.auxOverlays, [](const AuxInfo& candidate) {
+    return candidate.kind == IdFilter::OVERLAY_KIND;
+  });
+  if (overlay != seg.auxOverlays.end() && !overlay->files.empty()) {
+    try {
+      filter = IdFilter::open(dir, overlay->files.front().name);
+    } catch (const std::exception& e) {
+      LOG_WARN("Id filter unreadable for seg={}: {}", seg.segId, e.what());
+    }
+  }
+  seg.idFilter.store(filter);
+  seg.idFilterLoaded.store(true);
+  return filter;
+}
+
 std::vector<AuxInfo> IndexWriter::buildPluginOverlays(SegInfo& seg, const Schema& schema,
                                                       std::vector<std::string>& outFiles) noexcept {
   std::vector<AuxInfo> built;
@@ -2384,6 +2500,10 @@ std::vector<AuxInfo> IndexWriter::buildPluginOverlays(SegInfo& seg, const Schema
     std::vector<std::string> staged;
     try {
       if (seg.maxDoc < spec->def.min_docs) continue;
+      // Never fetch a cold segment to build an overlay: writes would wait on
+      // old data. Not marked attempted, so it is built once the segment is
+      // local (a search read it) or a merge rewrites it.
+      if (!segmentResident(seg)) continue;
       if (!seg.attemptedPluginOverlays.insert(overlayName).second) continue;
       if (std::ranges::any_of(seg.auxOverlays, [&](const AuxInfo& info) { return info.name == overlayName; })) continue;
       // Overlays index the root space, whose rows are seg.maxDoc.
@@ -2857,23 +2977,68 @@ void IndexWriter::writeCollectionSummary(std::span<SegInfo*> segs, uint64_t core
   bool sameSegments = cache.valid && cache.coreGen == coreGen && cache.segIds.size() == segs.size()
       && std::ranges::equal(cache.segIds, segs, {}, {}, [](const SegInfo* seg) { return seg->segId; });
   if (!sameSegments) {
+    std::vector<uint64_t> segIds;
+    segIds.reserve(segs.size());
+    for (SegInfo* seg : segs) segIds.push_back(seg->segId);
+    std::ranges::sort(segIds);
     std::vector<std::shared_ptr<const SegmentSummary>> owned;
-    std::vector<const SegmentSummary*> summaries;
-    owned.reserve(segs.size());
-    summaries.reserve(segs.size());
-    for (SegInfo* seg : segs) {
-      owned.push_back(segmentSummary(*seg));
-      summaries.push_back(owned.back().get());
+    std::optional<CollectionSummary> updated;
+    // Incremental when the previous set is known: only the added segments
+    // (new, local) and the retired ones (kept by mergers and delete passes)
+    // are read, so a commit never touches the summaries of segments it kept.
+    if (cache.valid && cache.summary.complete) {
+      std::vector<const SegmentSummary*> added;
+      std::vector<const SegmentSummary*> removed;
+      bool known = true;
+      for (SegInfo* seg : segs) {
+        if (std::ranges::binary_search(cache.segIds, seg->segId)) continue;
+        owned.push_back(segmentSummary(*seg));
+        added.push_back(owned.back().get());
+      }
+      {
+        std::lock_guard summariesLock(retiredSummariesMutex);
+        for (uint64_t id : cache.segIds) {
+          if (std::ranges::binary_search(segIds, id)) continue;
+          auto it = retiredSummaries.find(id);
+          if (it == retiredSummaries.end()) {
+            known = false;
+            break;
+          }
+          owned.push_back(it->second);
+          removed.push_back(it->second.get());
+        }
+      }
+      if (known) updated = CollectionSummary::update(cache.summary, added, removed);
+      if (updated) collectionSummaryUpdates.fetch_add(1, std::memory_order_relaxed);
     }
-    cache.summary = CollectionSummary::aggregate(summaries);
+    if (updated) {
+      cache.summary = std::move(*updated);
+    } else {
+      // Every summary, fetched in parallel: on a remote directory each is a
+      // round trip.
+      owned.assign(segs.size(), nullptr);
+      oneapi::tbb::this_task_arena::isolate([&] {
+        oneapi::tbb::task_group tg;
+        for (size_t i = 0; i < segs.size(); i++) tg.run([&, i] { owned[i] = segmentSummary(*segs[i]); });
+        tg.wait();
+      });
+      std::vector<const SegmentSummary*> summaries;
+      summaries.reserve(segs.size());
+      for (const auto& summary : owned) summaries.push_back(summary.get());
+      cache.summary = CollectionSummary::aggregate(summaries);
+    }
+    {
+      // Only a published segment's summary can be needed again.
+      std::lock_guard summariesLock(retiredSummariesMutex);
+      boost::unordered::erase_if(retiredSummaries, [&](const auto& entry) { return !std::ranges::binary_search(segIds, entry.first); });
+    }
     cache.summary.fit(collectionSummaryMaxBytes);
     if (cache.summary.tier != CollectionSummary::Tier::FULL) {
       LOG_DEBUG("Collection summary at core_gen={} stored at tier {} ({} records)", coreGen,
                 (int)cache.summary.tier, cache.summary.fields.size());
     }
     cache.coreGen = coreGen;
-    cache.segIds.clear();
-    for (SegInfo* seg : segs) cache.segIds.push_back(seg->segId);
+    cache.segIds = std::move(segIds);
     cache.valid = true;
     collectionSummaryBuilds.fetch_add(1, std::memory_order_relaxed);
   }
@@ -3113,11 +3278,13 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     });
 
     phase = "open_source_readers";
-    // Pin the source cores for the merge.
+    // Pin the source cores for the merge, and load their summaries: the commit
+    // that retires them takes their counts out of the collection summary.
     std::vector<std::shared_ptr<SegmentCore>> sourceCores;
     sourceCores.reserve(segs.size());
     for (auto segInfo : segs) {
       sourceCores.emplace_back(getSegmentCore(*segInfo));
+      segmentSummary(*segInfo);
     }
 
     phase = "load_live_docs";
@@ -3177,6 +3344,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
       phase = "segment_summary";
       writeSegmentSummary(*newSegInfo, pwriter);
+      phase = "id_filter";
+      writeIdFilter(*newSegInfo, pwriter);
       phase = "plugin_overlays";
       {
         std::vector<std::string> pluginOverlayFiles;
@@ -3842,21 +4011,30 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       if (!span.empty()) clipped.push_back(span);
     }
   };
-  auto range = seg.idRange.load();
-  if (range) {
-    clip(*range);
-    if (clipped.empty()) return 0;
+  clip(*idRangeOf(seg));
+  if (clipped.empty()) return 0;
+
+  // The id filter rules out most ids the segment does not hold, and the
+  // segment entirely when it holds none of them, before its dictionary is read.
+  auto filter = idFilterOf(seg);
+  if (filter) {
+    bool any = false;
+    for (auto span : clipped) {
+      for (auto& entry : span) {
+        if (entry.val().deleteWatermark != 0 && filter->mayContain((std::string_view)entry)) {
+          any = true;
+          break;
+        }
+      }
+      if (any) break;
+    }
+    if (!any) return 0;
   }
 
   // Read the segment to find documents that should be deleted
   auto core = getSegmentCore(seg);
   PostingsReader& reader = core->rootReader();
   int32_t maxDocId = reader.maxDoc();
-
-  if (!range) {
-    clip(*seg.idRange.load());
-    if (clipped.empty()) return 0;
-  }
 
   // Load existing LiveDocs if they exist: the published reader's when it
   // holds this generation
@@ -3906,6 +4084,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
   };
   const size_t chunk = deleteApplyChunkEntries;
   assert(chunk > 0);
+  std::atomic<int64_t> sought = 0;
   auto drain = [&](std::vector<DeleteCandidate>& hits, IndexRamBudget::Guard& scratch) {
     if (hits.empty()) return;
     scratch.forceResize((int64_t)(hits.capacity() * sizeof(DeleteCandidate)));
@@ -3929,20 +4108,41 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     newDeletesCount.fetch_add(cleared, std::memory_order_relaxed);
     hits.clear();
   };
+  // A lazy dictionary (a segment on a remote store) is probed by range: only
+  // the block index, the blocks the ids route to and postings not inlined are
+  // fetched, not the files holding the field.
+  std::optional<TermProbe> probe;
+  if (TermProbe::saves(reader, *idFieldInfo)) {
+    probe.emplace(reader, *idFieldInfo);
+    std::vector<std::string_view> targets;
+    for (auto span : clipped) {
+      for (auto& entry : span) {
+        std::string_view id = (std::string_view)entry;
+        if (entry.val().deleteWatermark != 0 && (!filter || filter->mayContain(id))) targets.push_back(id);
+      }
+    }
+    auto guard = MemPool::threadLocalPoolGuard();
+    probe->fetchBlocks(probe->enumFor(guard.pool()), targets);
+  }
   auto apply = [&](SortedDeletes::EntrySpan span) {
     auto guard = MemPool::threadLocalPoolGuard();
-    TermsEnum termsEnum(guard.pool(), reader, *idFieldInfo);
+    TermsEnum termsEnum(guard.pool(), reader, *idFieldInfo, probe.has_value());
     std::vector<DeleteCandidate> hits;
     auto scratch = indexRamBudget->forceAcquire(0);
+    int64_t seeks = 0;
     for (auto& entry : span) {
       uint64_t deleteVersion = entry.val().deleteWatermark;
       if (deleteVersion == 0) continue;
       std::string_view deleteId = (std::string_view)entry;
+      if (filter && !filter->mayContain(deleteId)) continue;
+      seeks++;
 
       INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
                deleteId, deleteVersion, seg.name());
 
-      if (termsEnum.seekForward(deleteId)) {
+      bool found = probe ? termsEnum.seek(deleteId) : termsEnum.seekForward(deleteId);
+      if (found && probe) probe->fetchDocs(termsEnum);
+      if (found) {
         // Found the ID term, now get documents containing this ID
         DocsOnlyEnum docsEnum(termsEnum);
 
@@ -3956,6 +4156,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       } // end if termsEnum.seek()
     }
     drain(hits, scratch);
+    sought.fetch_add(seeks, std::memory_order_relaxed);
   };
   // Split large spans into id-ordered chunks so a few big segments still use every
   // worker; each chunk seeks forward from its own enum.
@@ -3977,6 +4178,9 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     }
     tg.wait();
   }
+  // Test hook: (segId, ids that passed the range and filter and were sought).
+  luxir::Signal::emit("deleteIdsSought", (void*)(int64_t)seg.segId,
+                      (void*)sought.load(std::memory_order_relaxed));
 
   // If we found any new documents to delete, write a new delete generation
   if (int32_t deleted = newDeletesCount.load(std::memory_order_relaxed); deleted > 0) {
@@ -3992,6 +4196,9 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
 
     INDEX_DEBUG("Applied {} new deletes to segment {} (new delete generation: {}, total live docs: {})",
                 deleted, seg.name(), newLiveGen, numLiveDocs);
+    // An emptied segment is retired; its summary lets the collection summary
+    // drop it without a full recompute (moveSegmentToDelete keeps it).
+    if (numLiveDocs == 0) segmentSummary(seg);
 
     {
       const std::lock_guard<std::mutex> lock(indexMutex);

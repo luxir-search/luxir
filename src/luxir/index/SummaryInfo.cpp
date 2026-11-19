@@ -218,6 +218,123 @@ CollectionSummary CollectionSummary::aggregate(std::span<const SegmentSummary* c
   return result;
 }
 
+std::optional<CollectionSummary> CollectionSummary::update(const CollectionSummary& prev,
+                                                          std::span<const SegmentSummary* const> added,
+                                                          std::span<const SegmentSummary* const> removed) {
+  if (!prev.complete) return std::nullopt;
+  for (const SegmentSummary* summary : removed) {
+    if (summary == nullptr || !summary->complete()) return std::nullopt;
+  }
+  CollectionSummary fresh = aggregate(added);
+  if (!fresh.complete) return std::nullopt;
+
+  // Merge two sorted record lists. A record that is not EMPTY and lacks a
+  // bound means the bound is unknown, so the union drops it.
+  auto mergeBounds = [](OwnedFieldSummary& r, const OwnedFieldSummary& o) {
+    bool rEmpty = r.summaryFlags & F::EMPTY;
+    bool oEmpty = o.summaryFlags & F::EMPTY;
+    if (r.type != o.type || r.typeFlags != o.typeFlags) {
+      dropNumeric(r);
+      dropGeo(r);
+      dropTermBounds(r);
+      r.summaryFlags &= ~(uint32_t)F::EMPTY;
+      return;
+    }
+    if (oEmpty) return;
+    if (rEmpty) {
+      uint32_t keep = r.summaryFlags & ~(uint32_t)(F::EMPTY | F::HAS_NUMERIC | F::HAS_GEO_BOX | F::HAS_TERM_BOUNDS);
+      std::string name = std::move(r.fieldname);
+      uint64_t counts[5] = {r.docsWithField, r.numValues, r.sumDocFreq, r.sumTotalTermFreq, r.nTerms};
+      uint32_t segs = r.segmentsWithField, flags = r.flags;
+      r = o;
+      r.fieldname = std::move(name);
+      r.summaryFlags = keep | (o.summaryFlags & (F::HAS_NUMERIC | F::HAS_GEO_BOX | F::HAS_TERM_BOUNDS | F::TERM_MAX_UNBOUNDED));
+      r.docsWithField = counts[0];
+      r.numValues = counts[1];
+      r.sumDocFreq = counts[2];
+      r.sumTotalTermFreq = counts[3];
+      r.nTerms = counts[4];
+      r.segmentsWithField = segs;
+      r.flags = flags;
+      return;
+    }
+    if ((r.summaryFlags & F::HAS_NUMERIC) && (o.summaryFlags & F::HAS_NUMERIC)) {
+      r.numMin = std::min(r.numMin, o.numMin);
+      r.numMax = std::max(r.numMax, o.numMax);
+    } else {
+      dropNumeric(r);
+    }
+    if ((r.summaryFlags & F::HAS_GEO_BOX) && (o.summaryFlags & F::HAS_GEO_BOX)) {
+      r.geoMinLat = std::min(r.geoMinLat, o.geoMinLat);
+      r.geoMaxLat = std::max(r.geoMaxLat, o.geoMaxLat);
+      r.geoMinLon = std::min(r.geoMinLon, o.geoMinLon);
+      r.geoMaxLon = std::max(r.geoMaxLon, o.geoMaxLon);
+    } else {
+      dropGeo(r);
+    }
+    if ((r.summaryFlags & F::HAS_TERM_BOUNDS) && (o.summaryFlags & F::HAS_TERM_BOUNDS)) {
+      if (o.termMin < r.termMin) r.termMin = o.termMin;
+      if (o.summaryFlags & F::TERM_MAX_UNBOUNDED) r.summaryFlags |= F::TERM_MAX_UNBOUNDED;
+      if (r.summaryFlags & F::TERM_MAX_UNBOUNDED) r.termMax.clear();
+      else if (o.termMax > r.termMax) r.termMax = o.termMax;
+    } else {
+      dropTermBounds(r);
+    }
+  };
+
+  CollectionSummary result;
+  result.complete = true;
+  result.tier = Tier::FULL;
+  result.fields.reserve(prev.fields.size() + fresh.fields.size());
+  size_t i = 0, j = 0;
+  while (i < prev.fields.size() || j < fresh.fields.size()) {
+    if (j == fresh.fields.size() || (i < prev.fields.size() && prev.fields[i].fieldname < fresh.fields[j].fieldname)) {
+      result.fields.push_back(prev.fields[i++]);
+    } else if (i == prev.fields.size() || fresh.fields[j].fieldname < prev.fields[i].fieldname) {
+      result.fields.push_back(fresh.fields[j++]);
+    } else {
+      OwnedFieldSummary r = prev.fields[i++];
+      const OwnedFieldSummary& o = fresh.fields[j++];
+      mergeBounds(r, o);
+      r.segmentsWithField += o.segmentsWithField;
+      r.flags |= o.flags;
+      saturatingAdd(r.docsWithField, o.docsWithField);
+      saturatingAdd(r.numValues, o.numValues);
+      saturatingAdd(r.sumDocFreq, o.sumDocFreq);
+      saturatingAdd(r.sumTotalTermFreq, o.sumTotalTermFreq);
+      saturatingAdd(r.nTerms, o.nTerms);
+      r.summaryFlags |= o.summaryFlags & (F::MULTI_VALUED | F::TERM_BOUNDS_TRUNCATED);
+      if ((o.summaryFlags & F::HAS_NUM_VALUES) == 0) {
+        r.summaryFlags &= ~(uint32_t)F::HAS_NUM_VALUES;
+        r.numValues = 0;
+      }
+      result.fields.push_back(std::move(r));
+    }
+  }
+
+  // A saturated count stays saturated: what it lost is unknown.
+  auto sub = [](uint64_t& target, uint64_t value) {
+    if (target != UINT64_MAX) target = value > target ? 0 : target - value;
+  };
+  for (const SegmentSummary* summary : removed) {
+    for (const auto& w : summary->fields()) {
+      auto it = std::ranges::lower_bound(result.fields, w.fieldname, {},
+                                         [](const OwnedFieldSummary& r) -> std::string_view { return r.fieldname; });
+      if (it == result.fields.end() || it->fieldname != w.fieldname || it->segmentsWithField == 0) return std::nullopt;
+      if (--it->segmentsWithField == 0) {
+        result.fields.erase(it);
+        continue;
+      }
+      sub(it->docsWithField, w.docs_with_field);
+      sub(it->numValues, w.num_values);
+      sub(it->sumDocFreq, w.sum_doc_freq);
+      sub(it->sumTotalTermFreq, w.sum_total_term_freq);
+      sub(it->nTerms, w.n_terms);
+    }
+  }
+  return result;
+}
+
 size_t CollectionSummary::encodedBytes() const {
   std::pmr::monotonic_buffer_resource arena;
   api::IndexInfo info;

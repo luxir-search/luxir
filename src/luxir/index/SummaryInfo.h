@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory_resource>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -86,6 +87,16 @@ public:
 
   // Encoded bytes of the manifest fields this aggregate becomes.
   size_t encodedBytes() const;
+
+  // `prev` updated for a segment set change without reading the segments it
+  // kept: the union of `prev` and `added`, with the counts of `removed`
+  // (segments `prev` covered) taken out and records no remaining segment
+  // holds dropped. Bounds are never narrowed by a removal, which keeps them
+  // conservative. Null when `prev` is incomplete or any summary is missing or
+  // incomplete: then only a full aggregate can say.
+  static std::optional<CollectionSummary> update(const CollectionSummary& prev,
+                                                 std::span<const SegmentSummary* const> added,
+                                                 std::span<const SegmentSummary* const> removed);
 
   // Copies the stored form of a manifest's aggregate.
   static CollectionSummary fromManifest(std::span<const api::FieldSummary> fields, bool complete);

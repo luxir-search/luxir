@@ -347,10 +347,11 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
   ASSERT_GT(fileSize, 0u);
   auto stats = h.getIndexWriter()->stats(true);
   ASSERT_EQ(1u, stats.segmentStats.size());
-  // The segment summary is an overlay too, at its fixed generation 0; it
-  // takes no generation from the vector overlay, which still gets the first.
+  // The segment summary and the id filter are overlays too, at their fixed
+  // generation 0; they take no generation from the vector overlay, which
+  // still gets the first.
   const auto& overlays = stats.segmentStats[0].overlays;
-  ASSERT_EQ(2u, overlays.size());
+  ASSERT_EQ(3u, overlays.size());
   auto vector = std::ranges::find(overlays, std::string(aux.files[0].name), [](const auto& o) { return o.files.at(0); });
   ASSERT_NE(overlays.end(), vector);
   EXPECT_EQ(fileSize, vector->bytes);

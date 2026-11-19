@@ -150,6 +150,9 @@ public:
   // Records as a lazy file would be read: a reader must not take the whole-file
   // stream eagerly, which would record the whole file as touched.
   bool lazy() const override { return true; }
+  bool resident(uint64_t offset, uint64_t length) const override { return inner->resident(offset, length); }
+  // Reads through it are of ranges already recorded by their fetch.
+  InputStream unfetchedStream() override { return inner->unfetchedStream(); }
 };
 
 RecordingDirectory::RecordingDirectory(Directory& inner)

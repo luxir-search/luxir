@@ -1440,13 +1440,16 @@ TEST_F(StoredFieldsTest, registryUnchangedOnFailedSchemaPublication) {
   }
 }
 
-TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveChunkRegionThenLowestId) {
+// Reopening seeds from the largest live segment by bytes (ties: lowest id),
+// opening segments only until one holds a dictionary.
+TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveSegmentThenLowestId) {
   auto a = std::make_shared<const StoredDictionary>(std::string(4096, 'a'));
   auto b = std::make_shared<const StoredDictionary>(std::string(4096, 'b'));
   for (bool tie : {false, true}) {
     SCOPED_TRACE(tie);
     RAMDir dir;
     int64_t liveBytes = 0;
+    bool firstWins = true;
     std::shared_ptr<const StoredCompressionDictionary> pin;
     {
       CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
@@ -1483,6 +1486,8 @@ TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveChunkRegionThenLowestId) {
         ASSERT_LT(first->chunkRegionBytes(), second->chunkRegionBytes());
       }
       liveBytes = second->chunkRegionBytes();
+      firstWins = reader->segments()[0].postingsReader().core().sizeInBytes()
+          >= reader->segments()[1].postingsReader().core().sizeInBytes();
       iw.setSchema(dictionarySchema()); // leave no current handle to carry through reopen
       EXPECT_EQ(nullptr, iw.storedDictionaries.lookup("_stored_", DICT_FORMAT));
     }
@@ -1501,7 +1506,7 @@ TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveChunkRegionThenLowestId) {
       IndexWriter iw(snapshots);
       pin = iw.storedDictionaries.lookup("_stored_", DICT_FORMAT);
       ASSERT_NE(nullptr, pin);
-      EXPECT_EQ((tie ? a : b)->bytes(), pin->bytes());
+      EXPECT_EQ((firstWins ? a : b)->bytes(), pin->bytes());
       addBodySegment(iw, 136, 8);
       auto reader = snapshots.readers.getReader();
       EXPECT_EQ(pin->bytes(), defaultStored(reader->segments().back().postingsReader())->dictionary());

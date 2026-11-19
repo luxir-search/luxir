@@ -340,8 +340,11 @@ TEST_F(SegmentSummaryTest, sidecarIsAGenerationZeroOverlayListedInStats) {
   auto stats = helper->getIndexWriter()->stats(true);
   ASSERT_EQ(1u, stats.segmentStats.size());
   const auto& segment = stats.segmentStats[0];
-  ASSERT_EQ(1u, segment.overlays.size());
-  const auto& overlay = segment.overlays[0];
+  // The id filter is the segment's other generation-zero overlay.
+  ASSERT_EQ(2u, segment.overlays.size());
+  auto found = std::ranges::find(segment.overlays, std::string(SegmentSummary::OVERLAY_KIND), [](const auto& o) { return o.kind; });
+  ASSERT_NE(segment.overlays.end(), found);
+  const auto& overlay = *found;
   EXPECT_EQ(SegmentSummary::OVERLAY_KIND, overlay.kind);
   EXPECT_EQ(SegmentSummary::OVERLAY_NAME, overlay.name);
   EXPECT_EQ(0u, overlay.gen);
