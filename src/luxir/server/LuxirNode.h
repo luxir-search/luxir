@@ -35,6 +35,7 @@ class ReplicationSource;
 class CommitWaits;
 class ReplicationFollower;
 class Scrubber;
+struct UpdateSubmissionGate;
 
 class LuxirNode {
 public:
@@ -143,6 +144,8 @@ public:
 
   // Every transport admits updates through this before submitting them.
   UpdateAdmission& getUpdateAdmission() { return updateAdmission; }
+  // For submitUpdate() (UpdateSubmission.h), the in-process update path.
+  const std::shared_ptr<UpdateSubmissionGate>& updateSubmissionGate() { return submissionGate; }
 
   SearchEngine& getSearchEngine() {
     return *searchEngine;
@@ -213,6 +216,9 @@ private:
   // of the collections: tickets of messages a closing writer drains release
   // into it.
   UpdateAdmission updateAdmission{0, 0, &indexRamBudget};
+  // Closed first in the destructor, after the plugin states: a parked
+  // in-process update then completes with node_closing instead of submitting.
+  std::shared_ptr<UpdateSubmissionGate> submissionGate;
   std::shared_ptr<ReplicationSource> replication;
   std::shared_ptr<CommitWaits> commitWaits;
   std::shared_ptr<CollectionEvents> events; // ordered feed of the collection map
