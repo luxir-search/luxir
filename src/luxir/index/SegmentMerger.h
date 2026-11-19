@@ -873,6 +873,21 @@ private:
     return type == FieldType::INTERVAL && (flags & FieldType::INDEX_RANGE) != 0;
   }
 
+  static bool hasLiveIntValues(const MergeFieldInfo& field) {
+    const auto& seg = *field.seg;
+    int32_t count = field.segFieldInfo.docsWithField;
+    if (count == 0 || seg.numLive == 0) return false;
+    // If there are more populated rows than deletes, at least one survives.
+    if (count > seg.postingsReader->maxDoc() - seg.numLive) return true;
+
+    DocsReader docs(*seg.postingsReader, field.segFieldInfo);
+    screaming::BitSet::Iterator rows(docs.bitset());
+    for (int32_t row = rows.next(); row != screaming::BitSet::END; row = rows.next()) {
+      if (!seg.remapDocId(row).second) return true;
+    }
+    return false;
+  }
+
   static void batchTypeAndFlags(std::span<const MergeFieldInfo> fields, FieldType::Type& type, int32_t& allFlags) {
     type = FieldType::Type::NONE;
     allFlags = 0;
@@ -1871,6 +1886,10 @@ private:
       mergeStoredFields(space, mergeFieldInfos, batch.bootstrapStoredDictionary);
       return;
     }
+
+    // An int field and its indexes exist only if at least one populated row survives.
+    if (FieldType::storage(firstInfo.type) == FieldType::Storage::INT64
+        && std::ranges::none_of(mergeFieldInfos, hasLiveIntValues)) return;
 
     // sort mergeFieldInfos so we can add docids low to high.
     // This is a simple O(n+m) sort where n=number of segments and m is number of segments with this specific field.

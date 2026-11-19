@@ -221,6 +221,44 @@ TEST_F(RangeFieldTest, mergeAndDeletes) {
   EXPECT_EQ((Ids{"e"}), both(R"("lte":0)"));
 }
 
+TEST_F(RangeFieldTest, mergeDropsFieldsWithNoSurvivingValues) {
+  auto& indexed = schemaBuilder.field("gone_i");
+  indexed.type = FieldClass::INT;
+  indexed.index = IndexMode::MATCH;
+  schemaBuilder.set(helper.collection());
+  ASSERT_TRUE(indexJson({
+    R"({"id":"dead","bkd":{"gte":10,"lte":20},"col":{"gte":10,"lte":20},"gone_i":17,"gone_ps":[13,17]})",
+    R"({"id":"survivor"})"
+  }).success);
+  auto writer = helper.getIndexWriter();
+  auto reader = writer->snapshots.readers.getReader();
+  auto& postings = reader->segments()[0].postingsReader();
+  ASSERT_GT(postings.fieldInfo("bkd")->monoLoc.offset(), 0);
+  ASSERT_NE(0, postings.fieldInfo("bkd")->pointsMetaOff);
+  ASSERT_NE(0, postings.fieldInfo("gone_i")->nTerms);
+  ASSERT_NE(0, postings.fieldInfo("gone_ps")->pointsMetaOff);
+  ASSERT_EQ((Ids{"dead"}), both(R"("gte":17,"lte":17)"));
+  ASSERT_TRUE(helper.deleteById("dead", UpdateMessage::COMMIT).success);
+
+  for (int pass = 0; pass < 2; pass++) {
+    if (pass == 1) {
+      ASSERT_TRUE(indexJson({R"({"id":"another"})"}).success);
+    }
+    writer->mergeSegments();
+    reader = writer->snapshots.readers.getReader();
+    ASSERT_EQ(1u, reader->segments().size());
+    EXPECT_EQ(pass + 1, reader->segments()[0].maxDoc());
+    for (auto field : {"bkd", "col", "gone_i", "gone_ps"}) {
+      EXPECT_EQ(nullptr, reader->segments()[0].postingsReader().fieldInfo(field)) << field;
+    }
+    EXPECT_TRUE(both(R"("gte":17,"lte":17)").empty());
+    auto count = request(R"({"query":{"range":{"field":"bkd","gte":17,"lte":17}},"limit":0,"count_limit":-1})");
+    ASSERT_OK(count);
+    EXPECT_EQ(0, count->getMatchCount());
+    EXPECT_TRUE(ids(R"({"match":{"field":"gone_i","val":17}})").empty());
+  }
+}
+
 TEST_F(RangeFieldTest, invalidValuesAndSchemas) {
   auto result = indexJson({
     R"({"id":"empty","bkd":{"gte":5,"lte":1}})",
