@@ -3,7 +3,9 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <iosfwd>
+#include <memory_resource>
 #include <map>
 #include <string>
 #include <string_view>
@@ -22,6 +24,18 @@ namespace luxir {
 // If supplied, claimed receives the new lifetime for opening its writer.
 std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::string_view from, const Manifest& manifest,
                           bool verify = false, IncarnationState* claimed = nullptr);
+
+// Rewrites a copied root before its files are linked: it may drop segments
+// and write files of its own into `target` (named for `writerEpoch`, the new
+// lifetime). Strings it adds must live in `mr`.
+using SnapshotEdit = std::function<void(api::IndexInfo& info, Directory& target, uint64_t writerEpoch,
+                                        std::pmr::memory_resource& mr)>;
+
+// As copySnapshot, into a fresh incarnation reserved for the free name `to`
+// (incarnation `from` stays selected by its own name), rewritten by `edit`.
+// Returns the reserved incarnation; the caller activates or removes it.
+std::string copySnapshotAs(TenantCatalog& storage, std::string_view to, std::string_view from, const Manifest& manifest,
+                           const SnapshotEdit& edit);
 
 // Offline promotion of a follower data directory to an independent writer:
 // every selected collection gets a new identity. Resumable: each target is

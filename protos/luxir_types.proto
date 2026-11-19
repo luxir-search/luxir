@@ -1614,6 +1614,27 @@ message SwapCollectionsRequest {
 }
 message SwapCollectionsResponse { string a = 1; string b = 2; }
 
+// Divides a collection's committed documents among new collections of its
+// tenant. The source commits first and is not changed; updates it accepts
+// later are in no part. Each part receives whole segments, balanced by live
+// documents, linked rather than copied, so a part has the source's schema and
+// update versions. Either every part is created or none is.
+message SplitCollectionRequest {
+  string from = 1;
+  repeated string to = 2; // part names, each free; or
+  uint32 parts = 3;       // with no `to`: this many parts named <from>_0, <from>_1, ...
+  string tenant = 4;
+}
+message SplitCollectionPart {
+  string name = 1;
+  uint64 docs = 2;     // live documents
+  uint32 segments = 3;
+}
+message SplitCollectionResponse {
+  string from = 1;
+  repeated SplitCollectionPart parts = 2;
+}
+
 // Names of every collection of one tenant, sorted. HTTP-only: GET or POST
 // /collections/_list (also GET /collections) for the caller's tenant, or
 // /tenants/{tenant}/collections/_list.

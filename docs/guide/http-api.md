@@ -24,6 +24,7 @@ credentials. Administration and snapshot routes may name another tenant under
 | `POST /collections/_create` (or `PUT`) | Create a collection; body `{"name": "...", "schema": {...}}`; `wait_for_replicas` waits for [followers](replication.md#2-commit-and-wait-for-followers). |
 | `POST /collections/_rename` | Rename one collection; body `{"from":"old","to":"new"}`. The destination must be free. |
 | `POST /collections/_swap` | Exchange two collection names in one catalog update; body `{"a":"live","b":"staging"}`. |
+| `POST /collections/_split` | Divide a collection's committed documents among new collections; body `{"from":"big","parts":4}` or `{"from":"big","to":["a","b"]}`. See [Splitting a collection](operations.md#splitting-a-collection). |
 | `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
 | `GET /_stats` | Node statistics: service activity and memory by default; `collections`, `files`, `segments`, `system` and `host` opt in to costlier sections; `format=prometheus` renders Prometheus text. See [Stats and monitoring](operations.md#stats-and-monitoring). |
 | `GET /metrics` | The node's Prometheus scrape: `_stats` rendered as Prometheus text, with `collections` and `system` on by default. |
@@ -31,7 +32,7 @@ credentials. Administration and snapshot routes may name another tenant under
 | `GET /collections/{collection}/_snapshot` | Pin the current snapshot for copying; see [Replication](replication.md). |
 | `GET /collections/{collection}/_snapshot/files/{name}` | One file of a pinned snapshot. |
 | `GET /tenants` | Tenants that own a collection. |
-| `/tenants/{tenant}/collections/...` | The administration and snapshot routes above (`_list`, `_create`, `_delete`, `_rename`, `_swap`, `_schema`, `_stats`, `_snapshot`) for a named tenant; `GET /tenants/{tenant}/_stats` covers that tenant. |
+| `/tenants/{tenant}/collections/...` | The administration and snapshot routes above (`_list`, `_create`, `_delete`, `_rename`, `_swap`, `_split`, `_schema`, `_stats`, `_snapshot`) for a named tenant; `GET /tenants/{tenant}/_stats` covers that tenant. |
 | `GET /_replication/watch`, `POST /_replication/installed`, `GET /_replication/status` | Replication discovery, acknowledgments and status; see [Replication](replication.md). |
 
 Collection names occupy one URL path component. Names beginning with `_` are

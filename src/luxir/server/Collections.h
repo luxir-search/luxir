@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -207,6 +208,21 @@ public:
   // Open an active catalog entry, optionally taking its assignment first.
   std::shared_ptr<Collection> attach(const CollectionId& id, bool force = false);
 
+  // One collection made by split().
+  struct SplitPart {
+    CollectionId id;
+    std::shared_ptr<Collection> collection;
+    uint64_t docs = 0;     // live documents
+    uint32_t segments = 0;
+  };
+  static constexpr size_t kMaxSplitParts = 256;
+  // Divides the committed documents of `from` among new collections `to`
+  // (at least two, all free names of its tenant). Each part receives whole
+  // segments, balanced by live documents, whose files are linked rather than
+  // copied, under the source's schema and update versions. The source commits
+  // first and is otherwise unchanged; updates it accepts after that commit are
+  // not in any part. Creates every part or, on failure, none.
+  std::vector<SplitPart> split(const CollectionId& from, std::span<const CollectionId> to);
   void rename(const CollectionId& from, const CollectionId& to) { changeNames(from, to, false); }
   void swap(const CollectionId& a, const CollectionId& b) { changeNames(a, b, true); }
   // Empty incarnation ids leave unavailable names. Running installers retain

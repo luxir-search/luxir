@@ -6,6 +6,9 @@
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
 #include "Scrubber.h"
+#include "luxir/api/build.h"
+#include "luxir/api/luxir_types.hpp"
+#include <format>
 #include "luxir/plugin/Plugin.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/Uuid.h"
@@ -231,6 +234,28 @@ void LuxirNode::renameCollection(const CollectionId& from, const CollectionId& t
 void LuxirNode::swapCollections(const CollectionId& a, const CollectionId& b) {
   if (following() || config.read_only) throw ReadOnlyError("cannot swap collections on a read-only node or follower");
   collections_->swap(a, b);
+}
+std::vector<Collections::SplitPart> LuxirNode::splitCollection(const CollectionId& from, std::span<const CollectionId> to) {
+  if (following() || config.read_only) throw ReadOnlyError("cannot split collections on a read-only node or follower");
+  return collections_->split(from, to);
+}
+
+api::SplitCollectionResponse LuxirNode::splitCollection(const api::SplitCollectionRequest& request, std::pmr::memory_resource& mr) {
+  auto from = adminTarget(request.tenant, request.from);
+  if (!request.to.empty() && request.parts != 0) throw RequestError("split takes either `to` or `parts`, not both");
+  std::vector<CollectionId> to;
+  for (auto name : request.to) to.push_back(adminTarget(request.tenant, name));
+  if (request.to.empty()) {
+    if (request.parts > Collections::kMaxSplitParts) throw RequestError(std::format("a split needs 2 to {} parts", Collections::kMaxSplitParts));
+    for (uint32_t i = 0; i < request.parts; i++) to.push_back(adminTarget(request.tenant, std::format("{}_{}", request.from, i)));
+  }
+  auto parts = splitCollection(from, to);
+  api::SplitCollectionResponse response{request.from, {}};
+  auto* out = api::build::allocArray(response.parts, parts.size(), mr);
+  for (size_t i = 0; i < parts.size(); i++) {
+    out[i] = {parts[i].docs, api::build::arenaStr(mr, parts[i].id.name), parts[i].segments};
+  }
+  return response;
 }
 
 void LuxirNode::deleteCollection(const CollectionId& id) {

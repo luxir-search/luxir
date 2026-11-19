@@ -31,6 +31,7 @@ defaults and constraints are described in the comments and guides.
 | <a id="method-luxir.admin.deletecollection"></a>[`DeleteCollection`](#method-luxir.admin.deletecollection) | [`DeleteCollectionRequest`](#message-luxir.deletecollectionrequest) | [`DeleteCollectionResponse`](#message-luxir.deletecollectionresponse) |  |
 | <a id="method-luxir.admin.renamecollection"></a>[`RenameCollection`](#method-luxir.admin.renamecollection) | [`RenameCollectionRequest`](#message-luxir.renamecollectionrequest) | [`RenameCollectionResponse`](#message-luxir.renamecollectionresponse) |  |
 | <a id="method-luxir.admin.swapcollections"></a>[`SwapCollections`](#method-luxir.admin.swapcollections) | [`SwapCollectionsRequest`](#message-luxir.swapcollectionsrequest) | [`SwapCollectionsResponse`](#message-luxir.swapcollectionsresponse) |  |
+| <a id="method-luxir.admin.splitcollection"></a>[`SplitCollection`](#method-luxir.admin.splitcollection) | [`SplitCollectionRequest`](#message-luxir.splitcollectionrequest) | [`SplitCollectionResponse`](#message-luxir.splitcollectionresponse) |  |
 | <a id="method-luxir.admin.stats"></a>[`Stats`](#method-luxir.admin.stats) | [`StatsRequest`](#message-luxir.statsrequest) | [`StatsResponse`](#message-luxir.statsresponse) |  |
 | <a id="method-luxir.admin.cachecontrol"></a>[`CacheControl`](#method-luxir.admin.cachecontrol) | [`CacheControlRequest`](#message-luxir.cachecontrolrequest) | [`CacheControlResponse`](#message-luxir.cachecontrolresponse) |  |
 
@@ -197,6 +198,9 @@ defaults and constraints are described in the comments and guides.
 - [`ShardStats`](#message-luxir.shardstats)
 - [`SimpleQuery`](#message-luxir.simplequery)
 - [`SortSpec`](#message-luxir.sortspec)
+- [`SplitCollectionPart`](#message-luxir.splitcollectionpart)
+- [`SplitCollectionRequest`](#message-luxir.splitcollectionrequest)
+- [`SplitCollectionResponse`](#message-luxir.splitcollectionresponse)
 - [`StatsRequest`](#message-luxir.statsrequest)
 - [`StatsResponse`](#message-luxir.statsresponse)
 - [`StatsTotals`](#message-luxir.statstotals)
@@ -2406,6 +2410,44 @@ Forgiving end-user query for raw search-box input. Malformed query text degrades
 | <a id="field-luxir.sortspec.expr"></a>[`expr`](#field-luxir.sortspec.expr) | 1 | `string` | singular |  |
 | <a id="field-luxir.sortspec.vars"></a>[`vars`](#field-luxir.sortspec.vars) | 2 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
 | <a id="field-luxir.sortspec.dir"></a>[`dir`](#field-luxir.sortspec.dir) | 10 | [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir) | singular |  |
+
+<a id="message-luxir.splitcollectionpart"></a>
+
+### luxir.SplitCollectionPart
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.splitcollectionpart.name"></a>[`name`](#field-luxir.splitcollectionpart.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.splitcollectionpart.docs"></a>[`docs`](#field-luxir.splitcollectionpart.docs) | 2 | `uint64` | singular | live documents |
+| <a id="field-luxir.splitcollectionpart.segments"></a>[`segments`](#field-luxir.splitcollectionpart.segments) | 3 | `uint32` | singular |  |
+
+<a id="message-luxir.splitcollectionrequest"></a>
+
+### luxir.SplitCollectionRequest
+
+Divides a collection's committed documents among new collections of its tenant. The source commits first and is not changed; updates it accepts later are in no part. Each part receives whole segments, balanced by live documents, linked rather than copied, so a part has the source's schema and update versions. Either every part is created or none is.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.splitcollectionrequest.from"></a>[`from`](#field-luxir.splitcollectionrequest.from) | 1 | `string` | singular |  |
+| <a id="field-luxir.splitcollectionrequest.to"></a>[`to`](#field-luxir.splitcollectionrequest.to) | 2 | `string` | repeated | part names, each free; or |
+| <a id="field-luxir.splitcollectionrequest.parts"></a>[`parts`](#field-luxir.splitcollectionrequest.parts) | 3 | `uint32` | singular | with no \`to\`: this many parts named &lt;from&gt;\_0, &lt;from&gt;\_1, ... |
+| <a id="field-luxir.splitcollectionrequest.tenant"></a>[`tenant`](#field-luxir.splitcollectionrequest.tenant) | 4 | `string` | singular |  |
+
+<a id="message-luxir.splitcollectionresponse"></a>
+
+### luxir.SplitCollectionResponse
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.splitcollectionresponse.from"></a>[`from`](#field-luxir.splitcollectionresponse.from) | 1 | `string` | singular |  |
+| <a id="field-luxir.splitcollectionresponse.parts"></a>[`parts`](#field-luxir.splitcollectionresponse.parts) | 2 | [`SplitCollectionPart`](#message-luxir.splitcollectionpart) | repeated |  |
 
 <a id="message-luxir.statsrequest"></a>
 

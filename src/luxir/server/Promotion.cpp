@@ -12,47 +12,78 @@
 
 namespace luxir {
 
+namespace {
+std::string copyInto(TenantCatalog& storage, std::string_view sourceName, std::string_view name, std::string_view from,
+                     const Manifest& manifest, bool verify, IncarnationState* claimed, const SnapshotEdit& edit) {
+  auto source = storage.owned(from);
+  if (source.name != sourceName || source.state != "active") throw CollectionUnavailableError("snapshot source is no longer selected");
+  auto old = storage.directory(from);
+  bool fresh = name != sourceName;
+  auto incarnation = storage.reserve(name, {}, fresh);
+  // A new name has nothing to recover from: an interrupted copy leaves no reservation.
+  auto abandon = [&]() noexcept {
+    if (!fresh) return;
+    try {
+      storage.retire(name, incarnation);
+      storage.removeIncarnation(incarnation);
+    } catch (const std::exception& e) { LOG_WARN("Cannot remove copy {} of '{}': {}", incarnation, name, e.what()); }
+  };
+  try {
+    auto next = storage.directory(incarnation);
+    auto state = storage.claim(name, incarnation, "reserved");
+    std::pmr::monotonic_buffer_resource arena;
+    auto info = Manifest::decode(manifest.bytes, arena);
+    auto available = filesOf(info);
+    if (edit) edit(info, *next, state.value.epoch, arena);
+    auto files = filesOf(info);
+    // Files the edit wrote are present already; the rest link from the source.
+    next->reuseFiles(*old, available, files);
+    auto suspects = CorruptionMarker::read(*old);
+    std::erase_if(suspects, [&](const auto& name) {
+      return std::ranges::none_of(files, [&](const auto& file) { return file.name == name; });
+    });
+    if (!suspects.empty()) CorruptionMarker::write(*next, suspects, "copied snapshot suspect files");
+    // Under verify-on-open=full the linked files are read once, here, before
+    // a writer builds on them. A mismatch names the file; the follower-bound
+    // directory keeps the damaged copy for a repair.
+    if (verify) verifyFiles(*next, files);
+    // The new root may reference only files that are present in full.
+    std::vector<Directory::FileInfo> listing;
+    next->listFiles(listing);
+    for (const auto& file : files) {
+      auto present = std::ranges::find_if(listing, [&](const auto& entry) { return entry.name == file.name; });
+      if (present == listing.end() || present->size != file.size) throw std::runtime_error("snapshot copy is missing " + file.name);
+    }
+    std::vector<std::string> names;
+    for (const auto& file : files) names.push_back(file.name);
+    next->sync(names);
+    info.incarnation = incarnation;
+    info.index_gen = manifest.highestGeneration + 1;
+    info.commit_time++;
+    info.writer_epoch = state.value.epoch;
+    std::vector<std::byte> bytes;
+    if (!api::encode(info, bytes)) throw std::runtime_error("Failed to encode copied snapshot");
+    Manifest::commit(*next, info.index_gen, bytes, info.writer_epoch);
+    state.advance(*next, Manifest::tip(info.index_gen, info.writer_epoch));
+    if (claimed) *claimed = std::move(state);
+  } catch (...) {
+    abandon();
+    throw;
+  }
+  return incarnation;
+}
+}
+
 std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::string_view from, const Manifest& manifest,
                           bool verify, IncarnationState* claimed) {
+  return copyInto(storage, name, name, from, manifest, verify, claimed, {});
+}
+
+std::string copySnapshotAs(TenantCatalog& storage, std::string_view to, std::string_view from, const Manifest& manifest,
+                           const SnapshotEdit& edit) {
   auto source = storage.owned(from);
-  if (source.name != name || source.state != "active") throw CollectionUnavailableError("snapshot source is no longer selected");
-  auto old = storage.directory(from);
-  auto incarnation = storage.reserve(name);
-  auto next = storage.directory(incarnation);
-  auto state = storage.claim(name, incarnation, "reserved");
-  std::pmr::monotonic_buffer_resource arena;
-  auto info = Manifest::decode(manifest.bytes, arena);
-  auto files = filesOf(info);
-  next->reuseFiles(*old, files, files);
-  auto suspects = CorruptionMarker::read(*old);
-  std::erase_if(suspects, [&](const auto& name) {
-    return std::ranges::none_of(files, [&](const auto& file) { return file.name == name; });
-  });
-  if (!suspects.empty()) CorruptionMarker::write(*next, suspects, "copied snapshot suspect files");
-  // Under verify-on-open=full the linked files are read once, here, before
-  // a writer builds on them. A mismatch names the file; the follower-bound
-  // directory keeps the damaged copy for a repair.
-  if (verify) verifyFiles(*next, files);
-  // The new root may reference only files that are present in full.
-  std::vector<Directory::FileInfo> listing;
-  next->listFiles(listing);
-  for (const auto& file : files) {
-    auto present = std::ranges::find_if(listing, [&](const auto& entry) { return entry.name == file.name; });
-    if (present == listing.end() || present->size != file.size) throw std::runtime_error("snapshot copy is missing " + file.name);
-  }
-  std::vector<std::string> names;
-  for (const auto& file : files) names.push_back(file.name);
-  next->sync(names);
-  info.incarnation = incarnation;
-  info.index_gen = manifest.highestGeneration + 1;
-  info.commit_time++;
-  info.writer_epoch = state.value.epoch;
-  std::vector<std::byte> bytes;
-  if (!api::encode(info, bytes)) throw std::runtime_error("Failed to encode copied snapshot");
-  Manifest::commit(*next, info.index_gen, bytes, info.writer_epoch);
-  state.advance(*next, Manifest::tip(info.index_gen, info.writer_epoch));
-  if (claimed) *claimed = std::move(state);
-  return incarnation;
+  if (!source.name) throw CollectionUnavailableError("snapshot source is no longer selected");
+  return copyInto(storage, *source.name, to, from, manifest, false, nullptr, edit);
 }
 
 namespace {

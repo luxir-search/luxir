@@ -971,6 +971,25 @@ static void handleCollectionNames(GenericCallData& call, grpc::ByteBuffer& readB
   } catch (const std::exception& e) { finishWithException(call, e); }
 }
 
+//   rpc SplitCollection(SplitCollectionRequest) returns (SplitCollectionResponse)  [unary]
+static void handleSplitCollection(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto request = std::make_shared<HppRequestState<api::SplitCollectionRequest>>();
+  if (!parseRequest(readBuf, *request, "SplitCollection")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SplitCollection: malformed request"));
+    return;
+  }
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  try {
+    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+      try {
+        std::pmr::monotonic_buffer_resource arena;
+        auto response = call.server.getLuxirNode().splitCollection(request->proto, arena);
+        call.respondRaw(serializeToByteBuffer(response), 1);
+      } catch (const std::exception& e) { finishWithException(call, e); }
+    });
+  } catch (const std::exception& e) { finishWithException(call, e); }
+}
+
 //   rpc SetSchema(SchemaRequest) returns (SchemaResponse)  [unary]
 static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   HppRequestState<SchemaReqProto> request;
@@ -1098,6 +1117,7 @@ static const MethodEntry* lookupMethod(const std::string& method) {
     {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true, MetricOperation::COLLECTIONS}},
     {"/luxir.Admin/RenameCollection", {handleCollectionNames<false>, true, MetricOperation::COLLECTIONS}},
     {"/luxir.Admin/SwapCollections", {handleCollectionNames<true>, true, MetricOperation::COLLECTIONS}},
+    {"/luxir.Admin/SplitCollection", {handleSplitCollection, true, MetricOperation::COLLECTIONS}},
     {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true, MetricOperation::COLLECTIONS}},
     {"/luxir.Admin/Stats",              {handleStats, false, MetricOperation::STATS}},
     {"/luxir.Admin/CacheControl",       {handleCacheControl, false, MetricOperation::OTHER}},
