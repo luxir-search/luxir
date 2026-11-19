@@ -2399,6 +2399,86 @@ TEST(FilterCacheTest, capacityRefusalMemoAvoidsListWorkUntilDemandOrRefresh) {
   EXPECT_EQ(3, checks.count);
 }
 
+TEST(FilterCacheTest, knownCardinalityFitsWithoutDisplacingPayloads) {
+  constexpr int32_t maxDoc = 65536;
+  size_t small = docs(maxDoc, {1, 2, 3, 4})->ramBytesUsed();
+  size_t big = bitDocs(maxDoc, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(big + small));
+  std::array segments{FilterCache::SegmentIdentity{1, maxDoc}};
+  cache.onReaderPublished(1, segments);
+  FilterKey resident("resident"), candidate("candidate");
+  seedCapacityValue(cache, segments, resident, 10000, 1000, true);
+  fundCapacityValue(cache, segments, candidate, 1000);
+  CapacityChecks checks(cache);
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(candidate);
+  ASSERT_TRUE(use->recordCardinality(0, 4));
+  auto grant = use->probe(0, FilterCache::Work::pending());
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, grant.kind());
+  EXPECT_EQ(0, checks.count);
+  use->publishRaw(0, grant, docs(maxDoc, {1, 2, 3, 4}), 1000);
+  EXPECT_EQ(big + small, cache.bytesUsed());
+  EXPECT_TRUE(ledgerFor(cache, resident).resident);
+  EXPECT_EQ(0u, cache.counters().evictions);
+}
+
+TEST(FilterCacheTest, learnedSizeRechecksRefusalWithoutMoreWorkOrARefresh) {
+  constexpr int32_t maxDoc = 65536;
+  size_t small = docs(maxDoc, {1, 2, 3, 4})->ramBytesUsed();
+  size_t big = bitDocs(maxDoc, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(big + small));
+  std::array segments{FilterCache::SegmentIdentity{1, maxDoc}};
+  cache.onReaderPublished(1, segments);
+  FilterKey cheap("cheap-victim"), costly("costly-victim"), candidate("candidate");
+  seedCapacityValue(cache, segments, cheap, 100, 1000, true, docs(maxDoc, {1, 2, 3, 4}));
+  seedCapacityValue(cache, segments, costly, 10000);
+  fundCapacityValue(cache, segments, candidate, 2000);
+  CapacityChecks checks(cache);
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(candidate);
+  for (int i = 0; i < 2; i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
+  }
+  EXPECT_EQ(1, checks.count);
+  uint64_t rolled = cache.lastRefreshEpoch();
+  auto before = cache.counters();
+  ASSERT_TRUE(use->recordCardinality(0, 4));
+  auto grant = use->probe(0, FilterCache::Work::pending());
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, grant.kind());
+  EXPECT_EQ(2, checks.count);
+  EXPECT_EQ(rolled, cache.lastRefreshEpoch());
+  EXPECT_EQ(before.observedCharges, cache.counters().observedCharges);
+  EXPECT_DOUBLE_EQ(2000, ledgerFor(cache, candidate).owed);
+  EXPECT_TRUE(ledgerFor(cache, cheap).spokenFor);
+  EXPECT_FALSE(ledgerFor(cache, costly).spokenFor);
+  use->publishRaw(0, grant, docs(maxDoc, {1, 2, 3, 4}), 1000);
+  EXPECT_FALSE(ledgerFor(cache, cheap).resident);
+  EXPECT_TRUE(ledgerFor(cache, costly).resident);
+  EXPECT_TRUE(ledgerFor(cache, candidate).resident);
+  EXPECT_EQ(big + small, cache.bytesUsed());
+}
+
+TEST(FilterCacheTest, measuredFootprintTakesPrecedenceOverCardinalityEstimate) {
+  constexpr int32_t maxDoc = 65536;
+  size_t small = docs(maxDoc, {1, 2, 3, 4})->ramBytesUsed();
+  size_t big = bitDocs(maxDoc, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(big + small));
+  std::array segments{FilterCache::SegmentIdentity{1, maxDoc}};
+  cache.onReaderPublished(1, segments);
+  FilterKey candidate("candidate");
+  seedCapacityValue(cache, segments, candidate, 1000, 1000, true);
+  evictValues(cache);
+  ASSERT_EQ(big, ledgerFor(cache, candidate).referenceBytes);
+  seedCapacityValue(cache, segments, FilterKey("cheap-victim"), 100, 1000, false,
+      docs(maxDoc, {1, 2, 3, 4}));
+  seedCapacityValue(cache, segments, FilterKey("costly-victim"), 10000);
+  fundCapacityValue(cache, segments, candidate, 2000);
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(candidate);
+  EXPECT_EQ(1, use->cardinality(0));
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
+}
+
 TEST(FilterCacheTest, capacityUsesOneWindowEvenAfterALateRoll) {
   for (bool late : {false, true}) {
     size_t bytes = bitDocs(1024, 7)->ramBytesUsed();

@@ -250,9 +250,13 @@ public:
     delete[] bits_.words; // free the allocated memory
   }
 
-  size_t ramBytesUsed() const override {
+  static size_t ramBytesForSize(int32_t size) {
     return sizeof(RAMBitDocSet)
-        + FixedBitSet::sizeInWords(bits_.size()) * sizeof(uint64_t);
+        + FixedBitSet::sizeInWords(size) * sizeof(uint64_t);
+  }
+
+  size_t ramBytesUsed() const override {
+    return ramBytesForSize(bits_.size());
   }
 };
 
@@ -289,8 +293,12 @@ public:
     return std::binary_search(docs_.begin(), docs_.end(), docid);
   }
 
+  static size_t ramBytesForCapacity(size_t capacity) {
+    return sizeof(ArrDocSet) + capacity * sizeof(int32_t);
+  }
+
   size_t ramBytesUsed() const override {
-    return sizeof(ArrDocSet) + docs_.capacity() * sizeof(int32_t);
+    return ramBytesForCapacity(docs_.capacity());
   }
 
 };
@@ -666,6 +674,14 @@ public:
 
   static int32_t arrayLimitFor(int32_t maxDoc) noexcept {
     return (maxDoc + 31) >> 5;
+  }
+
+  // build() compacts arrays; empty arrays retain one element of storage.
+  static size_t estimateBytes(int32_t maxDoc, int32_t card) {
+    assert(card >= 0 && card <= maxDoc);
+    return card <= arrayLimitFor(maxDoc)
+        ? ArrDocSet::ramBytesForCapacity((size_t)std::max(1, card))
+        : RAMBitDocSet::ramBytesForSize(maxDoc);
   }
 
   int32_t arrayLimit() const noexcept {

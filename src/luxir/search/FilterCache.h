@@ -685,6 +685,7 @@ private:
     double creditSnapshot = 0;
     uint64_t refusedVersion = 0;
     double refusedWork = 0;
+    size_t refusedBytes = 0;
     std::atomic<double> debt{0};
     uint64_t referenceNanos = 0;
     size_t referenceBytes = 0;

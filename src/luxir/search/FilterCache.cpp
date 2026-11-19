@@ -681,8 +681,12 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Work work) {
     return bypass();
   }
 
-  size_t bytes = slot->ledger.referenceBytes ? slot->ledger.referenceBytes
-      : sizeof(RAMBitDocSet) + FixedBitSet::sizeInWords(slot->maxDoc) * sizeof(uint64_t);
+  size_t bytes = slot->ledger.referenceBytes;
+  if (bytes == 0) {
+    int32_t card = slot->ledger.rawCardinality.load(std::memory_order_relaxed);
+    bytes = card >= 0 ? DocSetBuilder::estimateBytes(slot->maxDoc, card)
+                      : RAMBitDocSet::ramBytesForSize(slot->maxDoc);
+  }
   ledgerLock.unlock();
   if (!cache->capacityAllows(*entry, slot->ledger, bytes, production)) {
     deferPopulation(segmentOrd, Deferral::CAPACITY);
@@ -2138,7 +2142,8 @@ bool FilterCache::capacityAllows(const FilterEntry& entry, Ledger& ledger, size_
   uint64_t now = currentEpoch();
   {
     std::lock_guard<Ledger> lock(ledger);
-    if (ledger.refusedVersion == residentsVersion.load(std::memory_order_acquire)
+    if (ledger.refusedBytes == bytes
+        && ledger.refusedVersion == residentsVersion.load(std::memory_order_acquire)
         && now - lastRefreshEpoch() < config.recentWorkEpochs
         && ledger.recent + ledger.work <= ledger.refusedWork) return false;
   }
@@ -2185,6 +2190,7 @@ bool FilterCache::capacityAllows(const FilterEntry& entry, Ledger& ledger, size_
   ledger.refusedWork = required > 0 ? std::numeric_limits<double>::infinity()
       : std::max(outranked, victims + production / config.recentWorkEpochs)
           * std::max(config.recentWorkEpochs, ledger.recentEpochs + sinceRoll);
+  ledger.refusedBytes = bytes;
   return false;
 }
 

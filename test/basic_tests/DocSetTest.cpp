@@ -326,6 +326,35 @@ TEST_F(DocSetTest, builderAddWindowWordsPromotesAtAddBoundary) {
   EXPECT_EQ(collect(*set, 96), (std::vector<int32_t>{1, 2, 10, 20}));
 }
 
+TEST_F(DocSetTest, builderSizeEstimateMatchesPublishedStorage) {
+  for (int32_t maxDoc : {0, 1, 31, 32, 33, 64, 65, 96, 1024}) {
+    int32_t limit = DocSetBuilder::arrayLimitFor(maxDoc);
+    for (int32_t card : {0, std::min(1, maxDoc), limit, std::min(limit + 1, maxDoc), maxDoc}) {
+      SCOPED_TRACE(::testing::Message() << maxDoc << '/' << card);
+      for (int mode = 0; mode < 4; mode++) {
+        DocSetBuilder builder(maxDoc);
+        if (mode == 0) {
+          for (int32_t doc = 0; doc < card; doc++) builder.add(doc);
+        } else if (mode == 1) {
+          std::vector<int32_t> docs((size_t)card);
+          for (int32_t doc = 0; doc < card; doc++) docs[(size_t)doc] = doc;
+          builder.addSorted(docs);
+        } else if (mode == 2) {
+          builder.addRange(0, card);
+        } else if (card > 0) {
+          std::vector<uint64_t> words((size_t)FixedBitSet::sizeInWords(maxDoc));
+          FixedBitSet bits(words.data(), maxDoc);
+          for (int32_t doc = 0; doc < card; doc++) bits.set(doc);
+          builder.addWindowWords(words.data(), 0, maxDoc, card);
+        }
+        auto docs = builder.build();
+        EXPECT_EQ(card, docs->card());
+        EXPECT_EQ(DocSetBuilder::estimateBytes(maxDoc, card), docs->ramBytesUsed());
+      }
+    }
+  }
+}
+
 TEST_F(DocSetTest, builderAddSortedPromotesOnSpanOverflow) {
   DocSetBuilder builder(96);
   std::array<int32_t, 2> first{1, 2};
