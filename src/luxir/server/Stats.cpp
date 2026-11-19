@@ -176,15 +176,17 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   dst.control_busy = control.busy;
   dst.control_queued = control.queued;
   dst.control_completed = control.completed;
+  // Fan-out counters are process-wide: nodes sharing a process report the same.
   auto& fanout = dst.search_fanout;
   auto load = [](const std::atomic<uint64_t>& c) { return c.load(std::memory_order_relaxed); };
-  fanout.serial_searches = counter(MetricCounter::SEARCH_FANOUT_SERIAL);
-  fanout.parallel_searches = counter(MetricCounter::SEARCH_FANOUT_PARALLEL);
-  for (const auto& decisions : fanoutShareDecisions) fanout.published += load(decisions);
-  fanout.shares = load(fanoutAdaptiveShares);
-  fanout.denied_grain = load(fanoutGrainDenials);
-  fanout.denied_siblings_only = load(fanoutLoadDenials[0]);
-  fanout.denied_saturated = load(fanoutLoadDenials[1]);
+  auto outcome = [&](FanoutOutcome o) { return load(fanoutOutcomes[(size_t)o]); };
+  fanout.parallel_searches = load(fanoutParallelSearches);
+  fanout.published = outcome(FanoutOutcome::PUBLISHED);
+  fanout.shares = load(fanoutPublishedShares);
+  fanout.no_split = outcome(FanoutOutcome::NO_SPLIT);
+  fanout.capped = outcome(FanoutOutcome::CAPPED);
+  fanout.siblings_only = outcome(FanoutOutcome::SIBLINGS_ONLY);
+  fanout.saturated = outcome(FanoutOutcome::SATURATED);
 }
 
 void fillOutcomes(api::OutcomeStats& dst, const std::array<uint64_t, (size_t)MetricOutcome::COUNT>& outcomes,

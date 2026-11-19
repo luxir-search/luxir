@@ -225,10 +225,6 @@ std::string LoadRegistry::debugText() const {
 std::string loadSignalDebugText() {
   std::string out;
   if (LoadRegistry::enabled.load(std::memory_order_relaxed)) out = LoadRegistry::global().debugText();
-  out += "luxir_debug_fanout_evaluations_total "
-      + std::to_string(fanoutEvaluations.load(std::memory_order_relaxed)) + "\n";
-  out += "luxir_debug_fanout_published_shares_total "
-      + std::to_string(fanoutPublishedShares.load(std::memory_order_relaxed)) + "\n";
   auto shareCounter = [&](const char* name, const std::atomic<uint64_t>& counter) {
     out += "luxir_debug_fanout_share_" + std::string(name) + " "
         + std::to_string(counter.load(std::memory_order_relaxed)) + "\n";
@@ -240,7 +236,8 @@ std::string loadSignalDebugText() {
   shareCounter("estimated_ns_sum", fanoutShareEstimatedNsSum);
   shareCounter("publisher_runs_total", fanoutSharePublisherRuns);
   shareCounter("credit_ns_sum", fanoutShareCreditNsSum);
-  shareCounter("credit_count", fanoutShareCreditCount);
+  // Every admitted plan adds its credit and lands in one width bucket, so the
+  // buckets' sum is the credit count.
   constexpr std::array<const char*, 4> shares{"2", "3", "4", "5+"};
   for (size_t s = 0; s < shares.size(); s++) {
     out += "luxir_debug_fanout_share_decisions_total{shares=\"" + std::string(shares[s]) + "\"} "
@@ -250,11 +247,6 @@ std::string loadSignalDebugText() {
   shareCounter("largest_published_estimated_ns_sum", fanoutShareLargestPublishedEstimatedNsSum);
   shareCounter("wait_ns_sum", fanoutShareWaitNsSum);
   shareCounter("wait_count", fanoutShareWaitCount);
-  constexpr std::array<const char*, 2> classes{"siblings_only", "saturated"};
-  for (size_t c = 0; c < classes.size(); c++) {
-    out += "luxir_debug_fanout_load_denials_total{class=\"" + std::string(classes[c]) + "\"} "
-        + std::to_string(fanoutLoadDenials[c].load(std::memory_order_relaxed)) + "\n";
-  }
   return out;
 }
 

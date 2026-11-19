@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include "luxir/util/thread.h"
 
 namespace luxir::test {
@@ -62,6 +64,24 @@ public:
   ~TaskSpawnCounter() {
     countTaskSpawnsForTests.store(saved, std::memory_order_relaxed);
   }
+};
+
+// Adaptive fan-out outcomes and submitted shares recorded since construction.
+class FanoutOutcomeDelta {
+  std::array<uint64_t, (size_t)FanoutOutcome::COUNT> before{};
+  uint64_t sharesBefore = fanoutPublishedShares.load();
+
+public:
+  FanoutOutcomeDelta() {
+    for (size_t o = 0; o < before.size(); o++) before[o] = fanoutOutcomes[o].load();
+  }
+  uint64_t operator()(FanoutOutcome o) const { return fanoutOutcomes[(size_t)o].load() - before[(size_t)o]; }
+  uint64_t evaluations() const {
+    uint64_t sum = 0;
+    for (size_t o = 0; o < before.size(); o++) sum += (*this)((FanoutOutcome)o);
+    return sum;
+  }
+  uint64_t shares() const { return fanoutPublishedShares.load() - sharesBefore; }
 };
 
 }

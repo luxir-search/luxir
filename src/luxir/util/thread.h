@@ -187,10 +187,19 @@ void publishFanoutShare(FanoutScope* tg, size_t begin, size_t end,
       }
     });
   }
-  fanoutPublishedShares.fetch_add(1, std::memory_order_relaxed);
   if (countTaskSpawnsForTests.load(std::memory_order_relaxed)) {
     taskSpawnsForTests.fetch_add(1, std::memory_order_relaxed);
   }
+}
+
+inline void countFanoutOutcome(FanoutOutcome outcome) {
+  fanoutOutcomes[(size_t)outcome].fetch_add(1, std::memory_order_relaxed);
+}
+
+// A viable split the load budget refused, by the load tier that refused it.
+inline FanoutOutcome loadOutcome(LoadClass cls) {
+  return cls == LoadClass::IDLE_CORE ? FanoutOutcome::CAPPED
+      : cls == LoadClass::SIBLINGS_ONLY ? FanoutOutcome::SIBLINGS_ONLY : FanoutOutcome::SATURATED;
 }
 
 }
@@ -278,7 +287,6 @@ size_t task_group_fanout(FanoutScope* tg, size_t n, FanoutKind kind,
     __uint128_t units = 0;
     for (size_t i = end; i < from; i++) units += sizes[i].units;
     if (units == 0 || dt == 0) continue;
-    fanoutEvaluations.fetch_add(1, std::memory_order_relaxed);
     auto scale = [&](uint64_t value) {
       return (uint64_t)std::min<__uint128_t>(
           (__uint128_t)value * dt / units, UINT64_MAX);
@@ -290,18 +298,15 @@ size_t task_group_fanout(FanoutScope* tg, size_t n, FanoutKind kind,
     }
     auto shares = planTaskShares(costs, grain, n);
     if (shares.empty()) {
-      fanoutGrainDenials.fetch_add(1, std::memory_order_relaxed);
+      detail::countFanoutOutcome(FanoutOutcome::NO_SPLIT);
       continue;
     }
     auto budget = LoadRegistry::fanoutBudget(grain);
     fanoutTaskStart = now;
-    if (budget.grainNs == FANOUT_GRAIN_NEVER) {
-      fanoutLoadDenials[budget.cls == LoadClass::SIBLINGS_ONLY ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
-      continue;
-    }
-    shares = planTaskShares(costs, budget.grainNs, (size_t)budget.maxPublished + 1);
+    shares = budget.grainNs == FANOUT_GRAIN_NEVER ? TaskShares{}
+        : planTaskShares(costs, budget.grainNs, (size_t)budget.maxPublished + 1);
     if (shares.empty()) {
-      fanoutGrainDenials.fetch_add(1, std::memory_order_relaxed);
+      detail::countFanoutOutcome(detail::loadOutcome(budget.cls));
       continue;
     }
     size_t keep = shares.size() - 1;
@@ -309,9 +314,7 @@ size_t task_group_fanout(FanoutScope* tg, size_t n, FanoutKind kind,
       for (size_t s = 0; s < shares.size(); s++) if (shares[s].work >= shares[keep].work) keep = s;
     }
     fanoutShareCreditNsSum.fetch_add(creditElapsed, std::memory_order_relaxed);
-    fanoutShareCreditCount.fetch_add(1, std::memory_order_relaxed);
     fanoutShareDecisions[std::min(shares.size(), size_t{5}) - 2].fetch_add(1, std::memory_order_relaxed);
-    fanoutAdaptiveShares.fetch_add(shares.size() - 1, std::memory_order_relaxed);
     fanoutShareKeptEstimatedNsSum.fetch_add(shares[keep].work, std::memory_order_relaxed);
     uint64_t largestPublished = 0;
     tg->enter([&] {
@@ -322,6 +325,10 @@ size_t task_group_fanout(FanoutScope* tg, size_t n, FanoutKind kind,
         ++published;
       }
     });
+    // Counted once every share is submitted: a throwing makeTask or spawn
+    // fails the search, and its evaluation records no outcome.
+    detail::countFanoutOutcome(FanoutOutcome::PUBLISHED);
+    fanoutPublishedShares.fetch_add(shares.size() - 1, std::memory_order_relaxed);
     fanoutShareLargestPublishedEstimatedNsSum.fetch_add(largestPublished, std::memory_order_relaxed);
     size_t newBegin = begin + shares[keep].begin;
     end = begin + shares[keep].end;

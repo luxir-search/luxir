@@ -571,13 +571,13 @@ struct TransportStats {
   int64_t io_threads = 0;
 };
 struct SearchFanoutStats {
-  uint64_t serial_searches = 0;
   uint64_t parallel_searches = 0;
   uint64_t published = 0;
   uint64_t shares = 0;
-  uint64_t denied_grain = 0;
-  uint64_t denied_siblings_only = 0;
-  uint64_t denied_saturated = 0;
+  uint64_t no_split = 0;
+  uint64_t capped = 0;
+  uint64_t siblings_only = 0;
+  uint64_t saturated = 0;
 };
 struct ServiceStats {
   std::string_view version;

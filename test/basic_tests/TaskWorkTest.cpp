@@ -338,7 +338,7 @@ TEST_F(TaskWorkTest, exhaustiveCallerKeepsTheLargestShare) {
   for (bool middle : {false, true}) {
     TaskClockGuard clock(0);
     auto credit = fanoutShareCreditNsSum.load();
-    auto decisions = fanoutShareCreditCount.load();
+    FanoutOutcomeDelta outcomes;
     auto threeShares = fanoutShareDecisions[1].load();
     auto kept = fanoutShareKeptEstimatedNsSum.load();
     auto largestPublished = fanoutShareLargestPublishedEstimatedNsSum.load();
@@ -364,7 +364,9 @@ TEST_F(TaskWorkTest, exhaustiveCallerKeepsTheLargestShare) {
     runner.join();
     EXPECT_EQ((std::array<int, 5>{1, 1, 1, 1, 1}), completed);
     EXPECT_EQ(credit + 15'000, fanoutShareCreditNsSum.load());
-    EXPECT_EQ(decisions + 1, fanoutShareCreditCount.load());
+    EXPECT_EQ(1u, outcomes(FanoutOutcome::PUBLISHED));
+    EXPECT_EQ(1u, outcomes.evaluations());
+    EXPECT_EQ(2u, outcomes.shares());
     EXPECT_EQ(threeShares + 1, fanoutShareDecisions[1].load());
     EXPECT_EQ(kept + 40'000, fanoutShareKeptEstimatedNsSum.load());
     EXPECT_EQ(largestPublished + 30'000, fanoutShareLargestPublishedEstimatedNsSum.load());
@@ -430,8 +432,8 @@ TEST_F(TaskWorkTest, loadDenialResetsCredit) {
     LoadRegistry::Registration caller(registry);
     FanoutLoadGuard load(&caller);
     FanoutCreditScope credit;
-    size_t denial = topology.logical == 1 ? 1 : 0;
-    auto before = fanoutLoadDenials[denial].load();
+    bool saturated = topology.logical == 1;
+    FanoutOutcomeDelta outcomes;
     std::vector<size_t> order;
     FanoutScope runner(nullptr, FanoutPolicy::ADAPTIVE);
     EXPECT_EQ(0u, task_group_fanout(&runner, 10, FanoutKind::EXHAUSTIVE,
@@ -442,10 +444,14 @@ TEST_F(TaskWorkTest, loadDenialResetsCredit) {
     runner.join();
     EXPECT_EQ((std::vector<size_t>{9, 8, 7, 6, 5, 4, 3, 2, 1, 0}), order);
     EXPECT_EQ(150'000u, fanoutTaskStart);
-    EXPECT_EQ(before + 3, fanoutLoadDenials[denial].load());
+    // With the sibling grain disabled, a siblings-only budget refuses outright.
+    // The last two children do not split at the grain, before load is read.
+    EXPECT_EQ(3u, outcomes(saturated ? FanoutOutcome::SATURATED : FanoutOutcome::SIBLINGS_ONLY));
+    EXPECT_EQ(1u, outcomes(FanoutOutcome::NO_SPLIT));
+    EXPECT_EQ(4u, outcomes.evaluations());
     EXPECT_NE(std::string::npos, registry.debugText().find(
         "point=\"fanout_decision\",window_us=\"250\",class=\""
-        + std::string(denial ? "saturated" : "siblings_only") + "\"} 3\n"));
+        + std::string(saturated ? "saturated" : "siblings_only") + "\"} 3\n"));
   }
 }
 
@@ -477,7 +483,7 @@ TEST_F(TaskWorkTest, siblingGrainCanRejectAfterTheSnapshot) {
   LoadRegistry::Registration caller(registry);
   FanoutLoadGuard load(&caller, 1'000'000);
   FanoutCreditScope credit;
-  auto denials = fanoutLoadDenials[0].load();
+  FanoutOutcomeDelta outcomes;
   FanoutScope runner(nullptr, FanoutPolicy::ADAPTIVE);
   EXPECT_EQ(0u, task_group_fanout(&runner, 8, FanoutKind::EXHAUSTIVE,
       [](size_t) { return FanoutSize{1, 0}; }, [](size_t) { return [] {
@@ -485,7 +491,9 @@ TEST_F(TaskWorkTest, siblingGrainCanRejectAfterTheSnapshot) {
   }; }));
   runner.join();
   EXPECT_EQ(300'000u, fanoutTaskStart);
-  EXPECT_EQ(denials, fanoutLoadDenials[0].load());
+  // A viable split that misses the sibling grain is a siblings-only refusal.
+  EXPECT_EQ(6u, outcomes(FanoutOutcome::SIBLINGS_ONLY));
+  EXPECT_EQ(6u, outcomes.evaluations());
   EXPECT_NE(std::string::npos, registry.debugText().find(
       "point=\"fanout_decision\",window_us=\"250\",class=\"siblings_only\"} 6\n"));
 }
@@ -497,7 +505,7 @@ TEST_F(TaskWorkTest, stealBlocksSharesThatCannotPayIt) {
   std::array<int, 8> completed{};
   FanoutScope runner(nullptr, FanoutPolicy::ADAPTIVE);
   TaskSpawnCounter counter;
-  auto evaluations = fanoutEvaluations.load(), denials = fanoutGrainDenials.load();
+  FanoutOutcomeDelta outcomes;
   EXPECT_EQ(0u, task_group_fanout(&runner, completed.size(), FanoutKind::EXHAUSTIVE, [](size_t) {
     return FanoutSize{1, 4};
   }, [&](size_t i) { return [&, i] {
@@ -507,9 +515,34 @@ TEST_F(TaskWorkTest, stealBlocksSharesThatCannotPayIt) {
   runner.join();
   EXPECT_EQ(0, counter.count());
   EXPECT_EQ((std::array<int, 8>{1, 1, 1, 1, 1, 1, 1, 1}), completed);
-  // Every evaluation that sized shares was denied by the grain.
-  EXPECT_GT(fanoutEvaluations.load(), evaluations);
-  EXPECT_EQ(fanoutEvaluations.load() - evaluations, fanoutGrainDenials.load() - denials);
+  // Every evaluation found no split, before consulting the load budget.
+  EXPECT_GT(outcomes(FanoutOutcome::NO_SPLIT), 0u);
+  EXPECT_EQ(outcomes(FanoutOutcome::NO_SPLIT), outcomes.evaluations());
+}
+
+TEST_F(TaskWorkTest, widthCapCanLeaveNoSplit) {
+  FanoutGrainGuard grain(5'000);
+  // One idle physical core caps the plan at two shares. [5 5 75 | 15] leaves
+  // the caller under its floor, so nothing is published; without the cap
+  // every child is its own share.
+  for (LoadTopology topology : {LoadTopology{2, 4}, LoadTopology{8, 16}}) {
+    bool capped = topology.physical == 2;
+    TaskClockGuard clock(0);
+    LoadRegistry registry(topology);
+    LoadRegistry::Registration caller(registry);
+    FanoutLoadGuard load(&caller);
+    std::array<uint64_t, 5> sizes{5, 5, 75, 15, 10};
+    FanoutOutcomeDelta outcomes;
+    FanoutScope runner(nullptr, FanoutPolicy::ADAPTIVE);
+    EXPECT_EQ(capped ? 0u : 3u, task_group_fanout(&runner, sizes.size(), FanoutKind::EXHAUSTIVE,
+        [&](size_t i) { return FanoutSize{sizes[i], 0}; }, [](size_t i) { return [i] {
+      if (i == 4) taskClockNsForTests.fetch_add(10'000);
+    }; }));
+    runner.join();
+    EXPECT_EQ(1u, outcomes(capped ? FanoutOutcome::CAPPED : FanoutOutcome::PUBLISHED));
+    EXPECT_EQ(1u, outcomes.evaluations());
+    EXPECT_EQ(capped ? 0u : 3u, outcomes.shares());
+  }
 }
 
 TEST_F(TaskWorkTest, publishResetsCredit) {
