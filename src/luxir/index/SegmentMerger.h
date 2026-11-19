@@ -1704,6 +1704,7 @@ private:
 
       TextWriter writer(merger.postingsWriter, termsOut, docsOut, posOut);
       writer.startField(&rangeFieldInfo);
+      writer.feedIdFilter((std::string_view) outputFieldInfo->fieldname);
       if (FieldType::hasPositions(flags)) {
         writer.setNorms(preparedNorms.textView());
       }

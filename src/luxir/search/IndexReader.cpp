@@ -4,6 +4,7 @@
 #include "IndexReader.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
+#include "luxir/index/IdFilter.h"
 #include "luxir/reader/FieldReader.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/reader/Postings.h"
@@ -715,6 +716,7 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
             continue;
           }
 
+          if (info.kind == IdFilter::OVERLAY_KIND) continue;  // the writer's, for applying deletes
           if (!isKnownOverlayKind(info.kind)) {
             IREADER_DEBUG("Skipping unknown aux kind '{}' for '{}'", info.kind, info.name);
             continue;

@@ -260,7 +260,14 @@ TEST_F(SegmentSharingTest, newSegmentsShareTheWritersReaders) {
   ASSERT_EQ(3u, after->segments().size());
   EXPECT_EQ(&flushed->segments()[0].postingsReader(), &after->segments()[0].postingsReader());
   EXPECT_EQ(&flushed->segments()[1].postingsReader(), &after->segments()[1].postingsReader());
-  EXPECT_EQ(slots, cores(*after));
+  // A segment the writer did not open (its id filter ruled the id out) has
+  // no slot; every opened one is the reader's.
+  auto readers = cores(*after);
+  for (size_t i = 0; i < slots.size(); i++) {
+    if (slots[i]) {
+      EXPECT_EQ(slots[i], readers[i]) << i;
+    }
+  }
 
   EXPECT_EQ(800, readAll(*before));
   before.reset();

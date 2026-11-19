@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "luxir/index/IdFilter.h"
 #include "luxir/index/SegmentSummary.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/server/LuxirNode.h"
@@ -42,8 +43,8 @@ namespace {
 // change alters the bytes Luxir writes, this test fails: bump
 // IndexFormat::VERSION, then update kReferenceVersion and kReferenceDigest. Changing
 // only the digest leaves old collections loading under the new reader.
-constexpr uint64_t kReferenceVersion = 16;
-constexpr uint64_t kReferenceDigest = 0xea609769a1df6285;
+constexpr uint64_t kReferenceVersion = 17;
+constexpr uint64_t kReferenceDigest = 0x63acfa27541ced28;
 
 // A small index over every default field template's kind, with three segments
 // and a delete. Each segment is one request flushed by a single inverter.
@@ -110,10 +111,10 @@ uint64_t referenceDigest(Directory& dir) {
   std::vector<std::vector<api::FileDescriptor>> files;
   std::vector<std::vector<api::AuxIndexInfo>> overlays;
   for (auto& segment : segments) {
-    // Only the segment summary, whose entry carries a commit time.
+    // Only the segment summary and the id filter, whose entries carry a commit time.
     auto& summaries = overlays.emplace_back(segment.overlays.begin(), segment.overlays.end());
     for (auto& overlay : summaries) {
-      EXPECT_EQ(SegmentSummary::OVERLAY_KIND, overlay.kind);
+      EXPECT_TRUE(overlay.kind == SegmentSummary::OVERLAY_KIND || overlay.kind == IdFilter::OVERLAY_KIND) << overlay.kind;
       overlay.commit_time = 0;
     }
     segment.overlays = summaries;
@@ -242,7 +243,7 @@ TEST_F(IndexFormatTest, referenceIndexBytesMatchFormatVersion) {
 TEST_F(IndexFormatTest, serialRootMergeBytesMatchReference) {
   auto digest = buildMergedReferenceDigest();
   ASSERT_EQ(digest, buildMergedReferenceDigest()) << "the serial merge is not deterministic";
-  EXPECT_EQ(0xf801137578a43c81ULL, digest) << std::format("merged digest {:#x}", digest);
+  EXPECT_EQ(0xc69f91deaa48f945ULL, digest) << std::format("merged digest {:#x}", digest);
 }
 
 TEST_F(IndexFormatTest, otherFormatVersionFailsToLoad) {

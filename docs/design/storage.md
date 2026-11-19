@@ -178,11 +178,39 @@ needs:
 - a merge policy that leaves old, large segments alone, or merges that fetch
   their inputs through the cache;
 - id lookups for updates and deletes that skip cold segments without
-  fetching them. Append-only collections need no lookups. Otherwise
-  per-segment id ranges, which the writer already keeps, and per-segment id
-  filters do the skipping;
+  fetching them (done, below);
 - the syncer reporting which files are published, so that eviction knows
   what it may drop.
+
+What a writer over a cold collection reads today:
+
+- **Opening** reads the manifest only.
+- **Adding documents** (no ids or `allow_dups`, no `delete_ids`) reads no old
+  segment. The collection summary is updated from the added and retired
+  segments' summaries ([segment summaries](segment-summaries.md#when-it-is-computed)).
+  A zstd stored-fields dictionary is seeded from the largest segment that has
+  one (its catalog only). A plugin segment overlay is built for an old segment
+  only once its files are resident (`IndexWriter::segmentResident`), never by
+  fetching it in a commit. Merges still read their sources whole (hence the
+  merge policy above).
+- **Overwrites and deletes** reach only the segments that may hold an id:
+  - The id range comes from the segment summary's `id` bounds, so it needs
+    no open (`IndexWriter::idRangeOf`). Time-ordered ids are pruned by it.
+  - Every segment written by a flush or merge has an id filter, the overlay
+    `s<seg>.<creator epoch>__idfilter_00.<writer epoch>_00` of kind
+    `id_filter` (`IdFilter`): a split block Bloom filter over its id terms at
+    10 bits per id, about 1% false positives. A segment whose filter rules out every id is not opened, and
+    the ids it rules out are not looked up. Random ids are pruned by it.
+    Older segments without one are looked up as below; they get one when a
+    merge rewrites them.
+  - A segment whose id dictionary is lazy and not resident is probed by range
+    (`TermProbe`): the block index and trie, then the term blocks the ids
+    route to, then postings not inlined in their block (an id of one
+    document is inlined). That is three rounds of range fetches, not the
+    files holding the field.
+
+The filter costs about 1.25 bytes per document in each segment's storage, read
+once per segment by the first commit that applies deletes to it.
 
 ## Pruning metadata
 

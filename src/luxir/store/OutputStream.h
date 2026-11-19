@@ -4,6 +4,8 @@
 #pragma once
 
 #include <memory_resource>
+#include <span>
+#include <string>
 
 #include "StorageMemory.h"
 #include "RangeFetch.h"
@@ -508,12 +510,58 @@ public:
   }
 
   // Reads all of the file and returns a pointer to the data, which should be valid as long as the InputFile is valid.
+  // On a lazy file this materializes every byte.
   virtual std::string_view read() = 0;
 
   // Advisory asynchronous readahead; memory-backed inputs need no work.
   virtual void prefetch(size_t offset, size_t length) {}
 
+  // The whole file, as one stream. On a lazy file this materializes every byte.
   virtual InputStream getInputStream() = 0;
+
+  // A stream over [offset, offset + length) whose offsets count from `offset`.
+  // Memory-backed and mapped files return a slice of the same bytes (no copy);
+  // a lazy file fetches only what covers the range. The bytes stay valid as
+  // long as the InputFile lives, like getInputStream(). Throws if the range
+  // leaves the file. The default slices getInputStream().
+  virtual InputStream rangeStream(uint64_t offset, uint64_t length) {
+    InputStream whole = getInputStream();
+    checkRange(offset, length, (uint64_t)whole.size());
+    const char* base = whole.ptr(0);
+    return InputStream(base + offset, base + offset + length);
+  }
+
+  // Advisory: the caller will read these ranges soon. A lazy file fetches them
+  // together (adjacent ranges coalesce); a mapped file hints the kernel.
+  virtual void prefetchRanges(std::span<const ByteRange> ranges) {
+    for (const auto& range : ranges) prefetch((size_t)range.offset, (size_t)range.length);
+  }
+
+  // True when bytes are fetched on first touch, so that read(), getInputStream()
+  // and the first touch of a range may block on I/O and throw.
+  virtual bool lazy() const { return false; }
+
+  // True when reading [offset, offset + length) needs no fetch. Files that are
+  // not lazy are always resident.
+  virtual bool resident(uint64_t offset, uint64_t length) const {
+    (void)offset;
+    (void)length;
+    return true;
+  }
+
+  // The whole file as one stream, without fetching anything: only bytes made
+  // resident first (fetchRanges, rangeStream) may be read through it, which
+  // lets a reader address a lazy file by absolute offsets while fetching only
+  // the ranges it names. Its bytes stay valid as long as the InputFile lives.
+  // The default is getInputStream(), which on a lazy file fetches it all.
+  virtual InputStream unfetchedStream() { return getInputStream(); }
+
+  static void checkRange(uint64_t offset, uint64_t length, uint64_t fileSize) {
+    if (offset > fileSize || length > fileSize - offset) {
+      throw FileIOException("range [" + std::to_string(offset) + ", +" + std::to_string(length)
+                            + ") is outside a file of " + std::to_string(fileSize) + " bytes");
+    }
+  }
 
   friend std::ostream &operator<<(std::ostream &out, InputFile &inf) {
     out << "InputFile: at" << &inf << " stream=" << inf.getInputStream();

@@ -15,7 +15,9 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <span>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,8 @@ class TermsEnum {
   SegmentCore& segmentCore;
 
   const SegFieldInfo& fieldInfo;
+  // Read only bytes the caller made resident (see the constructor).
+  bool lazyReads = false;
 
   // currTerm's buffer holds a full PackedTerm plus COPY_SLACK, and the index
   // files are padded past every term block, so a short copy into currTerm may
@@ -152,20 +156,27 @@ public:
   };
 
   // fieldInfo is not copied and should remain valid throughout the lifetime of this TermsEnum and any related classes such as DocsEnum
-  TermsEnum(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) : pool(pool), segmentCore(postingsReader.core()), fieldInfo(fieldInfo) {
+  // With lazyReads, the enum takes the files' streams without fetching them
+  // (SegmentCore::unfetchedStream) and reads only bytes its caller made
+  // resident first, which TermProbe does: the block index, the trie and the
+  // range table before construction, the block a seek() loads
+  // (blockRangeFor), and the postings of the term it lands on (docsRange). It
+  // supports seek() and postingsState() for docs only.
+  TermsEnum(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& fieldInfo, bool lazyReads = false)
+      : pool(pool), segmentCore(postingsReader.core()), fieldInfo(fieldInfo), lazyReads(lazyReads) {
     unused(this->pool, this->segmentCore);
     currTerm = PackedTerm(pool.alloc(TERM_BUFFER_BYTES), 0);
     if (fieldInfo.nTerms == 0) return;
-    termsIS = segmentCore.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
+    termsIS = streamAt(fieldInfo.termBlockIndexLoc);
     // The writers pad the terms stream so this table starts 8-aligned (see
     // PostingsWriter::finalizeField), which is what lets us read it in place.
     assert((termsIS.offset() & 7) == 0);
     termBlockOffsets = reinterpret_cast<const uint64_t*>(termsIS.ptr());
-    trieIS = segmentCore.getInputStreamSeek(fieldInfo.trieLoc);
+    trieIS = streamAt(fieldInfo.trieLoc);
     trieBase = trieIS.ptr();
 
     if (!fieldInfo.rangeTableLoc.isNull()) {
-      InputStream tableIS = segmentCore.getInputStreamSeek(fieldInfo.rangeTableLoc);
+      InputStream tableIS = streamAt(fieldInfo.rangeTableLoc);
       assert((tableIS.offset() & 7) == 0);
       const auto* header = reinterpret_cast<const TermRangeTableHeader*>(tableIS.ptr());
       rangeCount = (int32_t) header->nRanges;
@@ -449,6 +460,36 @@ public:
     return {start, (uint32_t) (p - start)};
   }
 
+  // Lazy reads: the file and bytes of the block a seek(target) loads, read
+  // slack included (it may pass the file's end; the caller clips).
+  std::pair<uint32_t, ByteRange> blockRangeFor(std::string_view target) const {
+    assert(fieldInfo.nTerms > 0);
+    TrieReader trie(trieBase, (uint64_t)fieldInfo.trieRootOff, numTermBlocks);
+    int32_t block = trie.floorBlock(target);
+    const TermRangeRow* selected = rowForBlock(block);
+    int64_t start = blockLocation(selected, block);
+    int64_t end = block + 1 >= numTermBlocks ? (int64_t) fieldInfo.termBlockIndexLoc.offset()
+                                             : blockLocation(rowForBlock(block + 1), block + 1);
+    assert(end >= start);
+    return {selected->termsBase.filenum(), ByteRange{(uint64_t) start, (uint64_t) (end - start) + COPY_SLACK}};
+  }
+
+  // Lazy reads: the file and bytes of the current term's postings, read
+  // slack included, or nothing when they are inlined in its block (a term of
+  // one document, as an id usually is).
+  std::optional<std::pair<uint32_t, ByteRange>> docsRange() {
+    assert(ordInBlock >= 0);
+    decodePostings();
+    uint64_t startOffset = ordInBlock == 0 ? 0 : docsEnds[(size_t) ordInBlock - 1];
+    uint64_t endOffset = docsEnds[(size_t) ordInBlock];
+    if (startOffset == endOffset) return std::nullopt;
+    uint64_t start = (uint64_t) locOfDocsForTermBlock + startOffset;
+    return std::pair<uint32_t, ByteRange>{rowDocsFile, ByteRange{start, endOffset - startOffset + DOCS_READ_SLACK}};
+  }
+
+  // What a docs enum may read past a term's postings (SVB decoders over-read).
+  static constexpr uint64_t DOCS_READ_SLACK = 16;
+
   PostingsState postingsState() {
     assert(ordInBlock >= 0);
     decodePostings();
@@ -479,11 +520,11 @@ public:
         state.pulsedPos = (int32_t) pulsedValues[valueIndex + 1];
       }
     } else {
-      state.docIS = segmentCore.getInputStream(rowDocsFile);
+      state.docIS = stream(rowDocsFile);
       state.docIS.seek(state.docsStart);
       if (state.hasPositions) {
         state.posStart = locOfPositionsForTermBlock + (int64_t) posOffsets[(size_t) ordInBlock];
-        state.posIS = segmentCore.getInputStream(rowPosFile);
+        state.posIS = stream(rowPosFile);
         state.posIS.seek(state.posStart);
       }
     }
@@ -770,6 +811,16 @@ protected:
     rowPosFile = row->posBase.filenum();
   }
 
+  InputStream stream(uint32_t fnum) const {
+    return lazyReads ? segmentCore.unfetchedStream(fnum) : segmentCore.getInputStream(fnum);
+  }
+
+  InputStream streamAt(seg_location loc) const {
+    InputStream is = stream(loc.filenum());
+    is.seek(loc.offset());
+    return is;
+  }
+
   int64_t blockLocation(const TermRangeRow* selected, int32_t blockOrd) const {
     uint64_t offset = termBlockOffsets[blockOrd];
     assert(offset <= INT64_MAX);
@@ -777,6 +828,7 @@ protected:
   }
 
   PackedTerm firstTermForBlock(int32_t blockOrd) const {
+    assert(!lazyReads);
     const TermRangeRow* selected = rowForBlock(blockOrd);
     InputStream input = segmentCore.getInputStream(selected->termsBase.filenum());
     return input.readPackedTerm(blockLocation(selected, blockOrd));

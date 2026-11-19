@@ -62,6 +62,10 @@ locations, browse `src/luxir/<area>/`.
      opening reads metadata and endpoints without scanning child rows.
    - `FieldReader` finds metadata for a field in the segment (`SegFieldInfo`)
    - `TermsEnum` enumerates or finds indexed terms for a field found by `FieldReader`
+   - `TermProbe` looks up known terms in a lazy segment by range reads (the
+     block index, then the blocks the terms route to, then postings not
+     inlined), without fetching the files holding the field; the writer's id
+     lookups use it on cold segments
    - `DocsEnum` returns the documents for a term found with the `TermsEnum`. Optionally returns term positions for each document.
    - `IntColReader` reads the doc-order numeric column (all numeric field
      classes store an order-preserving encoded int64)
@@ -156,11 +160,14 @@ locations, browse `src/luxir/<area>/`.
      write it, and `PostingsWriter::finish` turns the field directory into one
      summary record per field; `IndexWriter` writes the result as the segment's
      `segment_summary` overlay. `SegmentSummary` is the decoded sidecar, loaded
-     with the segment by `IndexReader` (`Segment::summary()`).
+     with the segment by `IndexReader` (`Segment::summary()`). `IdFilter` is
+     the segment's `id_filter` overlay, a Bloom filter over its id terms that
+     `IndexWriter::applyDeletes` checks before reading the id dictionary.
      `CollectionSummary` (`SummaryInfo.h`) unions the segment summaries into
      the manifest's collection summary under a size budget;
-     `IndexWriter::writeCollectionSummary` recomputes it only when the segment
-     set changes, and `IndexReader::collectionSummary()` serves it to
+     `IndexWriter::writeCollectionSummary` updates it only when the segment
+     set changes (from the added and retired segments' summaries when it can,
+     `CollectionSummary::update`), and `IndexReader::collectionSummary()` serves it to
      `QueryPruning::collectionEmpty`. See
      [segment summaries](../design/segment-summaries.md).
 
@@ -198,6 +205,14 @@ locations, browse `src/luxir/<area>/`.
      delegates. `DirectoryFactory::find<T>()` reaches per-node storage state through the wrappers;
      `Directory::capabilities()` (`HARD_LINK`, `ATOMIC_RENAME`, `DURABLE_SYNC`, `MEMORY_MAPPED`,
      `REMOTE`) lets callers fall back (`reuseFiles` copies when links are unavailable)
+   - `InputFile::rangeStream` / `prefetchRanges` / `lazy()` (`OutputStream.h`): the reader-side
+     contract of backends that fetch byte ranges on first touch (`REMOTE` directories, from plugins);
+     `Directory::knownFiles`: the committed files and sizes of a loaded manifest. See
+     [../design/storage-tiers.md](../design/storage-tiers.md)
+   - `Hotcache` (`reader/Hotcache.h`): the `s<seg>__hot` file listing the ranges opening a segment reads,
+     written by `PostingsWriter::finish` for `REMOTE` directories; `RecordingDirectory` records them.
+     `PostingsReader` opens through ranges (header, file 0 tail, versions, field catalog) and creates
+     each file's whole-file stream on first use
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)
