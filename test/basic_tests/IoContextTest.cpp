@@ -128,6 +128,22 @@ struct ChunkedStates {
 
 constexpr uint64_t kChunk = 1024;
 
+// A file secured by handle (as a reader opens segments) maps to a chunked view.
+class ChunkedHandle : public ChecksumReader {
+  std::shared_ptr<ChecksumReader> inner;
+  std::shared_ptr<ChunkedFile::State> state;
+
+public:
+  ChunkedHandle(std::shared_ptr<ChecksumReader> inner, std::shared_ptr<ChunkedFile::State> state)
+      : inner(std::move(inner)), state(std::move(state)) {}
+  uint64_t size() const override { return inner->size(); }
+  std::shared_ptr<InputFile> map() override {
+    auto file = inner->map();
+    return file ? std::make_shared<ChunkedFile>(std::move(file), state, kChunk) : file;
+  }
+  FileCheck checksum(const std::function<void(size_t)>& progress = {}) override { return inner->checksum(progress); }
+};
+
 class ChunkedDirectory : public DelegatingDirectory {
   std::shared_ptr<ChunkedStates> states;
   std::string label;
@@ -142,6 +158,10 @@ public:
     auto file = delegate->openFile(name, expectSynced);
     if (!file) return file;
     return std::make_shared<ChunkedFile>(std::move(file), states->of(key(name)), kChunk);
+  }
+  std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
+    auto handle = delegate->openChecksum(name, direct);
+    return handle ? std::make_shared<ChunkedHandle>(std::move(handle), states->of(key(name))) : handle;
   }
   std::unique_ptr<File> createFile(std::string_view name) override {
     states->forget(key(name));
