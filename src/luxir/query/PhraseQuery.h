@@ -735,6 +735,15 @@ public:
 
     };
 
+    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+      if (cachedFieldInfo == nullptr) return {0, CountHow::METADATA};
+      int64_t ceiling = segment.maxDoc();
+      for (auto* info : cachedTermInfos) {
+        ceiling = std::min<int64_t>(ceiling, info ? info->docFreq(segment.ord) : 0);
+      }
+      return countBound(segment, domain, ceiling);
+    }
+
     Query::ScorerSupplier* scorerSupplierImpl(
         MemPool& targetPool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {

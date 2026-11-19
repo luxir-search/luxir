@@ -190,7 +190,7 @@ TEST_F(BoundedCountTest, conjunctionCountsApartFromRanking) {
       EXPECT_EQ(gte, bounded->docList()->found_gte) << limit;
       EXPECT_EQ(gte ? limit : 1297, bounded->getMatchCount()) << limit;
       EXPECT_EQ(ranked(*uncounted), ranked(*bounded)) << limit;
-      if (parallel == 1 && limit == 10) { EXPECT_EQ(1, SkipStats::boundedCountSegments); }
+      if (parallel == 1 && limit == 10) { EXPECT_EQ(0, SkipStats::boundedCountSegments); }
       if (parallel == 1 && limit == 10000) { EXPECT_EQ(0, SkipStats::boundedCountSegments); }
     }
   }

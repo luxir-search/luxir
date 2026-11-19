@@ -840,8 +840,17 @@ public:
     int64_t maxMatches;
     CountHow how;
     Weight* resolver = nullptr;
-    int64_t minMatches = 0; // Live-match floor under no additional domain.
+    int64_t minMatches = 0; // Live-match floor under the requested domain.
+
+    int64_t minimum() const { return how == CountHow::METADATA ? maxMatches : minMatches; }
   };
+
+  static bool isCanonicalCountDomain(IndexReader::Segment& segment, DocSet* domain) {
+    if (domain == nullptr) return true;
+    auto [minimum, maximum] = segment.liveCountBounds();
+    // An unresolved child live view cannot be the supplied domain.
+    return minimum == maximum && domain == segment.liveDocSet();
+  }
 
   // Restrict header totals by cheap eligibility bounds; restrictions need iteration.
   static CountShortcut countBound(IndexReader::Segment& segment, DocSet* domain,
@@ -852,9 +861,10 @@ public:
       bound = std::min<int64_t>(bound, domain->cachedCard());
     }
     if (bound == 0) return {0, CountHow::METADATA};
-    int64_t minMatches = how == CountHow::METADATA && domain == nullptr
+    bool canonical = isCanonicalCountDomain(segment, domain);
+    int64_t minMatches = how == CountHow::METADATA && canonical
         ? std::max<int64_t>(0, docs - (segment.maxDoc() - minLive)) : 0;
-    if (domain || minLive != segment.maxDoc()) how = CountHow::ITERATE;
+    if (!canonical || minLive != segment.maxDoc()) how = CountHow::ITERATE;
     return {bound, how, nullptr, minMatches};
   }
 

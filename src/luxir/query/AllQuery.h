@@ -238,7 +238,7 @@ public:
     CountShortcut countShortcut(
         IndexReader::Segment& segment, DocSet* domain) override {
       if (domain && domain->cachedCard() >= 0
-          && (!segment.mayHaveDeletes() || domain == segment.liveDocSet())) {
+          && (!segment.mayHaveDeletes() || isCanonicalCountDomain(segment, domain))) {
         return {domain->cachedCard(), CountHow::METADATA};
       }
       return countBound(segment, domain, segment.maxDoc(), CountHow::METADATA);

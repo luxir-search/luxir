@@ -1009,5 +1009,27 @@ TEST_F(JoinCacheTest, forcedCompositionKeepsJoinScoresWithAndWithoutOwnerSets) {
   for (bool required : {false, true}) EXPECT_EQ(run(required, false, true), run(required, true, true));
 }
 
+TEST_F(JoinCacheTest, countFloorsDoNotConstructAChildLiveView) {
+  ASSERT_TRUE(helper.deleteById("0", UpdateMessage::COMMIT).success);
+  auto root = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto child = root->view("items_nested");
+  auto& segment = child->segments()[0];
+  auto initial = segment.liveCountBounds();
+  ASSERT_NE(initial.first, initial.second);
+  MemPool pool;
+  Query::Context context(pool, *child);
+  TermQuery red("color_s", "red"), large("size_s", "L");
+  AllQuery all;
+  std::array<Query*, 2> required{&red, &large};
+  BooleanQuery both(required, {}, {}, {});
+  RAMBitDocSet domain(segment.maxDoc());
+  domain.mutableBits().set(2);
+  for (Query* query : std::array<Query*, 3>{&red, &both, &all}) {
+    auto* weight = query->createWeight(context, 0);
+    EXPECT_EQ(0, weight->countShortcut(segment, &domain).minimum());
+    EXPECT_EQ(initial, segment.liveCountBounds());
+  }
+}
+
 } // namespace
 } // namespace luxir::test

@@ -2424,7 +2424,7 @@ public:
     if (qr->boundedCount && filterWeights.empty()) {
       int64_t minMatches = 0;
       for (auto& segment : view()->segments()) {
-        minMatches += weight->countShortcut(segment, nullptr).minMatches;
+        minMatches += weight->countShortcut(segment, nullptr).minimum();
       }
       qr->countLimitProven = minMatches >= requirements.countLimit;
     }

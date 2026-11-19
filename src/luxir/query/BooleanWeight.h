@@ -13120,10 +13120,8 @@ public:
   }
 
   // A lone required clause determines membership when optionals only score.
-  // A pure disjunction delegates when at most one clause has a nonzero bound:
-  // union with empty clauses introduces no overlap. More survivors, gating
-  // optionals and exclusions need execution. Required bounds intersect by
-  // minimum, and a constrained optional group's bound is its capped sum.
+  // Required ceilings intersect; their floors use inclusion-exclusion.
+  // Optional membership keeps its largest floor, and exclusions subtract ceilings.
   CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
     auto bound = countBound(segment, domain, segment.maxDoc());
     if (bound.maxMatches == 0) return bound;
@@ -13132,16 +13130,20 @@ public:
       auto* child = mandatoryWeights.empty() ? filterWeights.front() : mandatoryWeights.front();
       return child ? child->countShortcut(segment, domain) : bound;
     }
+    bool canonical = isCanonicalCountDomain(segment, domain);
+    int64_t floor = required ? segment.maxDoc() : 0;
     for (auto weights : {mandatoryWeights, filterWeights}) {
       for (auto* child : weights) {
-        if (child) bound.maxMatches = std::min(bound.maxMatches,
-            child->countShortcut(segment, domain).maxMatches);
+        auto shortcut = child ? child->countShortcut(segment, domain) : bound;
+        bound.maxMatches = std::min(bound.maxMatches, shortcut.maxMatches);
+        floor = std::max<int64_t>(0, floor + shortcut.minimum() - segment.maxDoc());
       }
     }
     if (!optionalWeights.empty() && (required == 0 || minShouldMatch > 0)) {
       int64_t sum = 0;
       size_t live = 0;
       CountShortcut survivor{0, CountHow::METADATA};
+      int64_t optionalFloor = 0;
       for (auto* child : optionalWeights) {
         auto shortcut = child ? child->countShortcut(segment, domain) : bound;
         if (shortcut.maxMatches > 0) {
@@ -13149,15 +13151,25 @@ public:
           survivor = shortcut;
         }
         sum = std::min<int64_t>(segment.maxDoc(), sum + shortcut.maxMatches);
-        if (required == 0 && prohibitedWeights.empty() && minShouldMatch <= 1) {
-          bound.minMatches = std::max(bound.minMatches, shortcut.minMatches);
-        }
+        optionalFloor = std::max(optionalFloor, shortcut.minimum());
       }
       if (minShouldMatch > (int64_t)live) return {0, CountHow::METADATA};
       if (required == 0 && prohibitedWeights.empty() && minShouldMatch <= 1 && live <= 1) {
         return survivor;
       }
       bound.maxMatches = std::min(bound.maxMatches, sum);
+      if (minShouldMatch <= 1) {
+        floor = required ? std::max<int64_t>(0, floor + optionalFloor - segment.maxDoc()) : optionalFloor;
+      } else {
+        floor = 0;
+      }
+    }
+    if (canonical) {
+      for (auto* child : prohibitedWeights) {
+        auto shortcut = child ? child->countShortcut(segment, domain) : bound;
+        floor = std::max<int64_t>(0, floor - shortcut.maxMatches);
+      }
+      bound.minMatches = std::min(floor, bound.maxMatches);
     }
     if (bound.maxMatches == 0) bound.how = CountHow::METADATA;
     return bound;

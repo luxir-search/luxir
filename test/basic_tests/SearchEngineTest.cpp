@@ -2193,7 +2193,7 @@ TEST_F(SearchEngineTest, wholeCountGatesSegmentsAndComposesDeletesOnce) {
   EXPECT_EQ(1, hit.hits);
 
   WholeCountQueryBuilder empty = [](auto& mr) {
-    return qb::phraseWords(mr, "body_w", {"not", "present"});
+    return qb::phraseWords(mr, "body_w", {"alpha", "beta"});
   };
   WholeCountRun emptyBypass = runWholeCount(
       helper.getSearchEngine(), collection, empty);

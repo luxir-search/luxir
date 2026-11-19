@@ -860,3 +860,80 @@ TEST_P(CountShortcutTest, multiTermQueryBucketCountsExactly) {
 }
 
 INSTANTIATE_TEST_SUITE_P(CacheModes, CountShortcutTest, ::testing::Bool());
+
+TEST(CountFloorTest, correlatedMembershipHasOnlyProvedFloors) {
+  CollectionHelper helper("count_floors");
+  std::vector<Doc> docs;
+  for (int doc = 0; doc < 16; doc++) {
+    std::string body = "pad";
+    if (doc < 12) body += " wide twin";
+    body += doc < 8 ? " small" : " other";
+    docs.push_back(flatdoc("id", std::to_string(doc), "body_w", body));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  TermQuery wide("body_w", "wide"), twin("body_w", "twin"), small("body_w", "small"), other("body_w", "other");
+  AllQuery all;
+  std::array<Query*, 2> equal{&wide, &twin}, disjoint{&small, &other}, metadata{&all, &wide};
+  std::array<Query*, 1> smallSide{&small}, wideSide{&wide};
+  BooleanQuery identical(equal, {}, {}, {}), separate(disjoint, {}, {}, {}), allWide(metadata, {}, {}, {});
+  BooleanQuery subset(smallSide, {}, wideSide, {}), united({}, disjoint, {}, {});
+  BooleanQuery wideUnion({}, equal, {}, {});
+  std::array<Query*, 1> unionSide{&wideUnion};
+  BooleanQuery excludedUnion(unionSide, {}, smallSide, {});
+  std::array<std::string_view, 2> words{"wide", "small"};
+  std::array<int32_t, 2> positions{0, 1};
+  PhraseQuery phrase("body_w", words, positions);
+  for (bool deleted : {false, true}) {
+    SCOPED_TRACE(deleted);
+    if (deleted) {
+      ASSERT_TRUE(helper.deleteById("0", UpdateMessage::COMMIT).success);
+      ASSERT_TRUE(helper.deleteById("15", UpdateMessage::COMMIT).success);
+    }
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    reader->filterCache()->resize(0);
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto& segment = reader->segments()[0];
+    auto check = [&](Query& query, int64_t floor, DocSet* domain = nullptr) {
+      auto* weight = query.createWeight(context, Query::NEED_SCORES);
+      auto bound = weight->countShortcut(segment, domain);
+      EXPECT_EQ(floor, bound.minimum());
+      auto count = QueryPrep::countSegment(pool, weight->scorerSupplier(pool, segment),
+          domain ? domain : segment.liveDocSet(), segment.maxDoc());
+      EXPECT_LE(bound.minimum(), count);
+      EXPECT_LE(count, bound.maxMatches);
+    };
+    std::array<std::string_view, 3> missingWords{"wide", "absent", "small"};
+    std::array<int32_t, 3> missingPositions{0, 1, 2};
+    PhraseQuery missing("body_w", missingWords, missingPositions);
+    check(missing, 0);
+    check(subset, 0);
+    check(separate, 0);
+    check(identical, deleted ? 4 : 8);
+    check(united, deleted ? 6 : 8);
+    check(excludedUnion, deleted ? 2 : 4);
+    check(allWide, deleted ? 10 : 12);
+    auto* phraseWeight = phrase.createWeight(context, Query::NEED_SCORES);
+    EXPECT_EQ(8, phraseWeight->countShortcut(segment, nullptr).maxMatches);
+    EXPECT_EQ(0, phraseWeight->countShortcut(segment, nullptr).minimum());
+    RAMBitDocSet domain(segment.maxDoc());
+    for (int32_t doc : {1, 3, 8}) domain.mutableBits().set(doc);
+    check(identical, 0, &domain);
+    check(united, 0, &domain);
+    check(excludedUnion, 0, &domain);
+    check(allWide, 0, &domain);
+    if (deleted) {
+      check(identical, 4, segment.liveDocSet());
+      ForcePrepareQuery preparedAll(&all);
+      std::array<Query*, 2> required{&preparedAll, &wide};
+      BooleanQuery prepared(required, {}, {}, {});
+      auto* weight = prepared.createWeight(context, Query::NEED_SCORES);
+      auto exact = preparedAll.createWeight(context, Query::NEED_SCORES)
+          ->countShortcut(segment, segment.liveDocSet());
+      ASSERT_EQ(Query::CountHow::METADATA, exact.how);
+      EXPECT_EQ(0, exact.minMatches);
+      EXPECT_EQ(14, exact.minimum());
+      EXPECT_EQ(8, weight->countShortcut(segment, segment.liveDocSet()).minimum());
+    }
+  }
+}
