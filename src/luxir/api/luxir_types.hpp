@@ -591,6 +591,7 @@ struct ServiceStats {
   ActivityStats merge;
   ActivityStats vector_build;
   ActivityStats reader_refresh;
+  ActivityStats reader_wait;
   bool read_only = false;
 };
 struct ProcessStats {
