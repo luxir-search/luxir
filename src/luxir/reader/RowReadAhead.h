@@ -163,6 +163,11 @@ public:
     due = NEVER;
 #endif
     if (!enabled || file == nullptr || stride == 0 || rows <= 0) due = NEVER;
+    // A lazy file fetches outside the fault counters, so the gate cannot see
+    // it cold, and its prefetch may fetch in this thread: advice would become
+    // serial requests.  Readers of lazy files declare their ranges in one
+    // prefetchRanges call instead.
+    if (file != nullptr && file->lazy()) due = NEVER;
   }
 
   /// A fixed-size column's values.
@@ -202,7 +207,8 @@ public:
   /// Turns advice on when any of the rows was not resident (and reads them).
   /// Pass rows away from the column's ends: their pages may be shared with
   /// neighbouring data.  The gate's fault baseline is left alone, so faults
-  /// since the last check still count at the next one.
+  /// since the last check still count at the next one.  A cold probe makes
+  /// the next step advise at once.
   void probe(std::initializer_list<int64_t> ranks) {
     if (due == NEVER || gate.on) return;
     long faults, before, after;
@@ -212,7 +218,10 @@ public:
       flush();
     }
     sample(faults, after);
-    if (after > before) gate.on = true;
+    if (after > before) {
+      gate.on = true;
+      due = 0;
+    }
   }
 
   /// Every row of a sequential scan is read.

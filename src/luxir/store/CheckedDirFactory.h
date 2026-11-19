@@ -71,6 +71,8 @@ public:
     }
   }
 
+  void knownFiles(std::span<const FileDescriptor> files) override { delegate->knownFiles(files); }
+
   std::unique_ptr<File> createFile(std::string_view name) override {
     // A non-null test listener result injects a file creation failure.
     if (Signal::emit("checkedCreateFile", this, &name)) return nullptr;

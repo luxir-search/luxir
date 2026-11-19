@@ -21,6 +21,7 @@
 #include "luxir/index/SegmentSummary.h"
 #include "luxir/query/SegmentMask.h"
 #include "luxir/reader/AuxReader.h"
+#include "luxir/reader/Hotcache.h"
 #include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/RankLiveBitmap.h"
 #include "luxir/store/HeldFiles.h"
@@ -167,6 +168,16 @@ public:
 // row space. The manifest's row counts describe it before it is open, and
 // the open core must agree with them.
 class SegmentBase : public SegmentPart<SegmentCore> {
+  // The segment's hotcache, once a declare read it; empty before that, or
+  // when the segment has none or it is unreadable. Under filesMutex.
+  std::optional<Hotcache> hotcache;
+  bool hotcacheRead = false;
+
+protected:
+  // The hotcache's ranges when the segment has one, fetched in a round of its
+  // own first; otherwise each data file's header and file 0's tail.
+  void declareOpen(HeldFiles& held, ReadSet& reads) override;
+
 public:
   using SpaceRows = std::vector<std::pair<std::string, int32_t>>;
   const uint64_t segId;
@@ -214,6 +225,16 @@ public:
 
 // A segment overlay of a known kind (a vector index, the test overlay).
 class SegmentOverlay : public SegmentPart<AuxReader> {
+  // A vector overlay's open ranges, once a declare read its footer; empty
+  // before that. Under filesMutex.
+  std::optional<std::vector<ByteRange>> openRanges;
+
+protected:
+  // A vector overlay (large: its inverted lists) declares its footer, fetched
+  // in a round of its own first, then the header and list sizes the footer
+  // locates. Other overlays are small and declare their files whole.
+  void declareOpen(HeldFiles& held, ReadSet& reads) override;
+
 public:
   const AuxInfo info;
   const SegmentOverlayPolicy policy;

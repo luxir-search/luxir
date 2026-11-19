@@ -83,10 +83,11 @@ void indexSegment(CollectionHelper& h, int64_t first, int64_t count) {
 }
 
 std::vector<std::string> knnIds(CollectionHelper& h, const std::vector<float>& q, bool exact,
-                                int32_t refine, bool groups = false, int32_t parallel = 1, int32_t k = 10) {
+                                int32_t refine, bool groups = false, int32_t parallel = 1, int32_t k = 10,
+                                int32_t nprobe = ALL_LISTS) {
   auto req = localReq(h.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q").limit(k).fields({"id"});
-  cur.rawQuery() = qb::knn(cur.mr(), "emb_v", q, k, ALL_LISTS, exact, refine);
+  cur.rawQuery() = qb::knn(cur.mr(), "emb_v", q, k, nprobe, exact, refine);
   api::Collapse collapse;
   std::array<std::string_view, 1> fields{"id"};
   if (groups) {

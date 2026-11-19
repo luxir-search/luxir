@@ -149,7 +149,7 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   EXPECT_EQ(idx->metric_type, faiss::METRIC_L2);
 }
 
-TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
+TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnFirstListUse) {
   IvfTestGuard guard;
   for (int bits : {1, 4}) {
     CollectionHelper h("main");
@@ -181,7 +181,15 @@ TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
       os.write(payload.data(), payload.size());
       os.close();
       dir.finishFile(*out);
-      EXPECT_THROW(VectorAuxReader::open(dir, info, false), std::runtime_error);
+      std::string synced[] = {"invalid-amplitude"};
+      dir.sync(synced);
+      // Opening reads no amplitudes; the first scan of the list rejects them.
+      auto aux = VectorAuxReader::open(dir, info, false);
+      const auto& amplitudes = aux->getAmplitudes();
+      size_t list = 0;
+      while (amplitudes.list(list).empty()) list++;
+      EXPECT_THROW(amplitudes.checkedList(list), std::runtime_error);
+      aux.reset();
       dir.deleteFile("invalid-amplitude");
     }
   }
@@ -815,4 +823,12 @@ TEST_F(IndexReaderAuxTest, requiredOverlayFailureStillFailsTheSegment) {
   OverlayPolicyGuard guard({}, /*failOpen=*/true);
   auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
   EXPECT_ANY_THROW(reader->segments()[0].materialize());
+}
+
+TEST_F(IndexReaderAuxTest, segmentOverlayFileNamesAreRecognized) {
+  EXPECT_TRUE(Postings::isSegmentOverlayFile(Postings::getSegmentOverlayFileName(7, "vec.title_v", 3, 0, 1, 2)));
+  EXPECT_TRUE(Postings::isSegmentOverlayFile(Postings::getSegmentOverlayFileName(7, "kind.name_with_underscores", 0, 1, 1, 1)));
+  EXPECT_FALSE(Postings::isSegmentOverlayFile(Postings::getLiveDocsFileName(Postings::segmentKey(7, 1), 2, 1)));
+  EXPECT_FALSE(Postings::isSegmentOverlayFile("s7__hot"));
+  EXPECT_FALSE(Postings::isSegmentOverlayFile("CURRENT"));
 }

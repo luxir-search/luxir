@@ -39,6 +39,8 @@ public:
     return delegate->openFile(name, expectSynced);
   }
   void expectSynced(std::span<const FileDescriptor> files) override { delegate->expectSynced(files); }
+  // A read-side hint (sizes of committed files), not a mutation.
+  void knownFiles(std::span<const FileDescriptor> files) override { delegate->knownFiles(files); }
   std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
     return delegate->openChecksum(name, direct);
   }
