@@ -880,7 +880,8 @@ struct RenameCollectionResponse { std::string_view from; std::string_view to; };
 struct SwapCollectionsRequest { std::string_view a; std::string_view b; std::string_view tenant; };
 struct SwapCollectionsResponse { std::string_view a; std::string_view b; };
 struct SplitCollectionRequest {
-  std::string_view from; std::span<const std::string_view> to; std::string_view tenant; uint32_t parts = 0; };
+  std::string_view from; std::span<const std::string_view> to; std::string_view tenant; std::string_view key;
+  uint32_t parts = 0; };
 struct SplitCollectionPart { uint64_t docs = 0; std::string_view name; uint32_t segments = 0; };
 struct SplitCollectionResponse { std::string_view from; std::span<const SplitCollectionPart> parts; };
 struct DeleteCollectionRequest { std::string_view name; std::string_view tenant; };

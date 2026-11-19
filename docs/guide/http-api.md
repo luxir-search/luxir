@@ -24,7 +24,7 @@ credentials. Administration and snapshot routes may name another tenant under
 | `POST /collections/_create` (or `PUT`) | Create a collection; body `{"name": "...", "schema": {...}}`; `wait_for_replicas` waits for [followers](replication.md#2-commit-and-wait-for-followers). |
 | `POST /collections/_rename` | Rename one collection; body `{"from":"old","to":"new"}`. The destination must be free. |
 | `POST /collections/_swap` | Exchange two collection names in one catalog update; body `{"a":"live","b":"staging"}`. |
-| `POST /collections/_split` | Divide a collection's committed documents among new collections; body `{"from":"big","parts":4}` or `{"from":"big","to":["a","b"]}`. See [Splitting a collection](operations.md#splitting-a-collection). |
+| `POST /collections/_split` | Divide a collection's committed documents among new collections; body `{"from":"big","parts":4}` or `{"from":"big","to":["a","b"]}`, optionally with a routing `"key"`. See [Splitting a collection](operations.md#splitting-a-collection). |
 | `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
 | `GET /_stats` | Node statistics: service activity and memory by default; `collections`, `files`, `segments`, `system` and `host` opt in to costlier sections; `format=prometheus` renders Prometheus text. See [Stats and monitoring](operations.md#stats-and-monitoring). |
 | `GET /metrics` | The node's Prometheus scrape: `_stats` rendered as Prometheus text, with `collections` and `system` on by default. |

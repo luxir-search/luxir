@@ -1616,14 +1616,19 @@ message SwapCollectionsResponse { string a = 1; string b = 2; }
 
 // Divides a collection's committed documents among new collections of its
 // tenant. The source commits first and is not changed; updates it accepts
-// later are in no part. Each part receives whole segments, balanced by live
-// documents, linked rather than copied, so a part has the source's schema and
-// update versions. Either every part is created or none is.
+// later are in no part. Segment files are linked rather than copied, so a part
+// has the source's schema and update versions. Either every part is created or
+// none is.
 message SplitCollectionRequest {
   string from = 1;
   repeated string to = 2; // part names, each free; or
   uint32 parts = 3;       // with no `to`: this many parts named <from>_0, <from>_1, ...
   string tenant = 4;
+  // Empty: each part receives whole segments, balanced by live documents.
+  // Otherwise the id or a string field: a document goes to part
+  // xxh3_64(value, seed 0) % parts, by its least value if it has several, and
+  // to the first part if it has none. Route later updates the same way.
+  string key = 5;
 }
 message SplitCollectionPart {
   string name = 1;
