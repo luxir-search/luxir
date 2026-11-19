@@ -292,7 +292,7 @@ void roundTripType(const char* nm) {
   X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVal) X(ColVector) X(MultiVector) X(ColInt) \
   X(ColFloat) X(ColDouble) X(IndexInfo) X(AuxIndexInfo) X(SegmentInfo) X(AnalyzerComponent) X(AnalyzerDef) \
   X(FieldSummary) X(SegmentSummaryInfo) \
-  X(FieldDef) X(SchemaDef) X(SchemaRequest) X(SchemaResponse)                                      \
+  X(FieldDef) X(MergePolicyDef) X(SchemaDef) X(SchemaRequest) X(SchemaResponse)                                      \
   X(CreateCollectionRequest) X(CreateCollectionResponse)                                           \
   X(DeleteCollectionRequest) X(DeleteCollectionResponse) X(ListCollectionsResponse)                \
   X(StatsRequest) X(StatsResponse) X(StatsTotals) X(CollectionStats) X(ShardStats) X(IndexStats)    \

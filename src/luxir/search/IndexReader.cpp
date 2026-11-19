@@ -51,16 +51,21 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
   if (info.kind == TestOverlayAuxReader::KIND) {
     return TestOverlayAuxReader::open(dir, info, missingFileOK);
   }
+  if (const auto* registered = SegmentOverlayRegistry::global().find(info.kind)) {
+    return registered->open(dir, info);
+  }
   IREADER_DEBUG("Skipping unknown aux kind '{}' for '{}'", info.kind, info.name);
   return nullptr;
 }
 
 bool isKnownOverlayKind(std::string_view kind) {
-  return kind == VectorAuxReader::KIND || kind == TestOverlayAuxReader::KIND;
+  return kind == VectorAuxReader::KIND || kind == TestOverlayAuxReader::KIND
+      || SegmentOverlayRegistry::global().find(kind);
 }
 
 SegmentOverlayPolicy overlayPolicyOf(std::string_view kind) {
   if (kind == TestOverlayAuxReader::KIND) return TestOverlayAuxReader::policyForTests;
+  if (const auto* registered = SegmentOverlayRegistry::global().find(kind)) return registered->policy;
   return {};
 }
 
@@ -429,6 +434,12 @@ std::shared_ptr<AuxReader> Segment::getAuxReader(std::string_view name) const {
 void IndexReader::declareMaterialize(const SegmentMask& mask, ReadSet& reads) const {
   for (const auto& segment : space->segs) {
     if (mask.test((size_t)segment.ord) && !segment.isMaterialized()) segment.declareReads(reads);
+  }
+}
+
+void IndexReader::declareBases(const SegmentMask& mask, ReadSet& reads) const {
+  for (const auto& segment : space->segs) {
+    if (mask.test((size_t)segment.ord) && !segment.isOpen()) segment.basePart()->declareReads(reads);
   }
 }
 

@@ -30,7 +30,7 @@ protected:
       field.multi = api::FieldDef::MultiMode::ARRAY;
     }
     schema.set(helper.collection());
-    helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+    helper.getIndexWriter()->setMergeFactor(100);
     int i = 0;
     for (auto json : {
         R"({"id":"a","flat_numbers":[8,-3],"flat_many":[9,2,4,9],"flat_parts":[5,1,7],"items_nested":[{"n_i":8,"many":[9,2],"f_d":1.25,"label_s":"red","parts_nested":[{"p_i":5},{},{"p_i":1}]},{},{"n_i":-3,"many":[4,9],"f_d":-0.5,"label_s":"blue","parts_nested":{"p_i":7}}]})",

@@ -23,7 +23,7 @@ TEST(UnpartitionedByteIdentityTest, DefaultMergeCorpus) {
   TestIndex index;
   test::reserveIncarnation(index.dir);
   index.iw = std::make_unique<IndexWriter>(index.snapshots, schema);
-  index.iw->mergePolicy->setMergeFactor(1000);
+  index.iw->setMergeFactor(1000);
   // This test's contract is the UNPARTITIONED byte format; keep it serial
   // regardless of the debug-build tiny default thresholds.
   index.iw->termPartitionMinBytes = INT64_MAX;

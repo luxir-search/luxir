@@ -62,7 +62,7 @@ protected:
     LuxirTest::SetUp();
     helper = std::make_unique<CollectionHelper>("summary");
     helper->clear();
-    helper->getIndexWriter()->mergePolicy->setMergeFactor(100);
+    helper->getIndexWriter()->setMergeFactor(100);
   }
   void TearDown() override { helper.reset(); }
 

@@ -141,6 +141,11 @@ locations, browse `src/luxir/<area>/`.
      - `IndexHandler`: One physical representation, owned by `indexHandlers`;
        finish/flush visits each once in global physical-name order
    - `PostingsWriter`: used by an Inverter on flush to write a new segment.
+   - `MergePolicy` (`MergePolicy.h`): decides which segments merge, from each live
+     segment's counts, size, versions and a `MergeSegmentSummary` (column bounds).
+     `TieredMergePolicy` ("tiered") is the default; `MergePolicyRegistry` holds the
+     named makers plugins extend, and the schema's `merge_policy` selects one per
+     collection. Scheduling, admission and concurrency stay in `IndexWriter`.
    - `PointsWriter` builds 1-D sorted leaves. `BasicBKDWriter<PointTraits>`
      shares 2-D tree construction, docid codecs, and the bounded parallel leaf
      pipeline: `BKDInt32Traits` serves geo (`BKDWriter`), and `BKDInt64Traits`

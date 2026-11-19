@@ -704,7 +704,7 @@ TEST_F(IntColTest, valueSketchEstimates) {
 TEST_F(IntColTest, valueSketchOnlyForSortableColumns) {
   CollectionHelper helper("sketch_presence");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   for (int32_t seg = 0; seg < 2; seg++) {
     std::vector<Doc> docs;
     for (int64_t v = 0; v < 700; v++) {
@@ -1152,7 +1152,7 @@ TEST_F(IntColTest, testMonoBig) {
 TEST_F(IntColTest, denseAfterFlushAndMerge) {
   CollectionHelper helper("dense_int");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   auto expectDense = [&](std::vector<bool> dense, int64_t sum) {
     auto reader = writer->snapshots.readers.getReader();
     ASSERT_EQ(dense.size(), reader->segments().size());

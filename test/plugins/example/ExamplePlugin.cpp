@@ -44,6 +44,43 @@ class StripXFilter : public CharFilter {
   }
 };
 
+// Merge policy: merges segments whose bounds on one numeric field overlap or
+// touch, so a merged segment keeps a range on that field that excludes it
+// from queries outside it. Segments without values for the field never merge.
+class BoundsOverlapPolicy : public MergePolicy {
+public:
+  std::string field;
+  int64_t minSegments;
+
+  BoundsOverlapPolicy(std::string field, int64_t minSegments) : field(std::move(field)), minSegments(minSegments) {}
+
+  std::vector<MergeSpec> findMerges(std::span<const MergeSegment> segments) const override {
+    struct Range {
+      int64_t min, max;
+      uint64_t segId;
+    };
+    std::vector<Range> ranges;
+    for (const auto& segment : segments) {
+      if (auto bounds = segment.summary->numericBounds(field)) ranges.push_back({bounds->min, bounds->max, segment.segId});
+    }
+    std::ranges::sort(ranges, {}, &Range::min);
+    std::vector<MergeSpec> merges;
+    MergeSpec group;
+    int64_t groupMax = 0;
+    auto close = [&] {
+      if ((int64_t)group.size() >= minSegments) merges.push_back(group);
+      group.clear();
+    };
+    for (const auto& range : ranges) {
+      if (!group.empty() && range.min > groupMax) close();
+      groupMax = group.empty() ? range.max : std::max(groupMax, range.max);
+      group.push_back(range.segId);
+    }
+    close();
+    return merges;
+  }
+};
+
 void noParams(const api::AnalyzerComponent& def) {
   if (!def.params.empty()) throw std::invalid_argument("'" + std::string(def.name) + "' takes no parameters");
 }
@@ -51,6 +88,47 @@ void noParams(const api::AnalyzerComponent& def) {
 // Test-only plugin that exercises the plugin framework: analysis components,
 // query types, search ops, HTTP routes, the node lifecycle, and storage
 // backends and layers.
+namespace {
+
+class FieldListOverlay final : public SegmentOverlayKind {
+  bool fail;
+
+public:
+  explicit FieldListOverlay(bool fail) : fail(fail) {}
+  std::optional<SegmentOverlayOutput> build(const SegmentOverlayBuild& request) const override {
+    if (fail) throw std::runtime_error("example_field_list: failing as asked");
+    std::string text;
+    for (const auto& field : request.fields) text += field + "\n";
+    auto file = request.dir.createFile(request.fileName(0));
+    OutputStream os;
+    os.setFile(&*file);
+    os.write(text.data(), text.size());
+    os.close();
+    request.dir.finishFile(*file);
+    SegmentOverlayOutput output;
+    output.files.push_back(file->descriptor());
+    const std::string meta = std::to_string(request.fields.size());
+    output.meta.assign((const std::byte*)meta.data(), (const std::byte*)meta.data() + meta.size());
+    return output;
+  }
+};
+
+}  // namespace
+
+// Public to the example's tests: what an example_field_list overlay holds.
+class FieldListReader final : public AuxReader {
+  std::string name;
+
+public:
+  std::string fields;
+  std::string meta;
+  FieldListReader(const api::AuxIndexInfo& info, std::string fields)
+      : AuxReader(info.gen, info.built_core_gen), name(info.name), fields(std::move(fields)),
+        meta((const char*)info.opaque_meta.data(), info.opaque_meta.size()) {}
+  std::string_view getKind() const override { return "example_field_list"; }
+  std::string_view getName() const override { return name; }
+};
+
 class ExamplePlugin : public Plugin {
 public:
   static inline std::atomic<bool> throwOnNodeStateCreation{false};
@@ -100,6 +178,25 @@ public:
     r.storage.addLayer("counting", [](std::unique_ptr<DirectoryFactory> inner, const StorageContext&)
                                        -> std::unique_ptr<DirectoryFactory> {
       return std::make_unique<CountingLayer>(std::move(inner));
+    });
+
+    r.mergePolicies.add("example_bounds_overlap", [](const MergePolicyContext& ctx) {
+      std::string field(ctx.params.requireString("field"));
+      int64_t minSegments = ctx.params.getInt("min_segments", 2);
+      if (minSegments < 2) ctx.params.fail("min_segments", "must be at least 2");
+      return std::make_unique<BoundsOverlapPolicy>(std::move(field), minSegments);
+    });
+
+    // Writes a file naming the fields it covers; "fail" makes every build throw.
+    r.segmentOverlays.add("example_field_list", {
+      .maker = [](const SegmentOverlayContext& ctx) -> std::unique_ptr<SegmentOverlayKind> {
+        return std::make_unique<FieldListOverlay>(ctx.params.getBool("fail", false));
+      },
+      .open = [](Directory& dir, const api::AuxIndexInfo& info) -> std::shared_ptr<AuxReader> {
+        auto file = dir.openFile(info.files[0].name, /*expectSynced=*/true);
+        std::string_view text = file->read();
+        return std::make_shared<FieldListReader>(info, std::string(text));
+      },
     });
 
     r.query.add("doc_ids", ::example::docIdsDef());
