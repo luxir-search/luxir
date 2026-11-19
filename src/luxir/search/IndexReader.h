@@ -127,6 +127,9 @@ class SegmentPart {
 protected:
   SharedLazyCell<Value, false> cell;
   std::unique_ptr<HeldFiles> files;
+  // Guards `files` between the build and declareReads, which another request
+  // may run while this one builds.
+  std::mutex filesMutex;
   std::shared_ptr<Metrics> metrics;
   std::shared_ptr<const UnreadableHook> onUnreadable;  // null: nobody to tell
   // Set once by the (serialized) build that found the bytes unreadable;
@@ -142,14 +145,22 @@ protected:
   // Builds through the held files; `what` names the part in errors.
   template <class Open>
   std::shared_ptr<Value> getOrOpen(std::string_view what, Open&& open);
+  // Adds the reads a build of the part makes through `held`, for a fetch
+  // ahead of it, under filesMutex. Every held file whole by default: a part
+  // whose open reads only regions of large files declares those.
+  virtual void declareOpen(HeldFiles& held, ReadSet& reads) { held.declareReads(reads); }
 
 public:
+  virtual ~SegmentPart() = default;
   // The built value, or null when it is not built yet; never builds.
   std::shared_ptr<Value> peek() const noexcept { return cell.peek(); }
   // Whether a build found the part's bytes unreadable; it never retries.
   bool isUnreadable() const noexcept { return unreadable.load(std::memory_order_acquire); }
   // peek() without a reference count; valid while the part lives.
   Value* peekRaw() const noexcept { return cell.peekRaw(); }
+  // Adds the reads a build would make, for a fetch ahead of it; nothing once
+  // built or found unreadable.
+  void declareReads(ReadSet& reads);
 };
 
 // A segment's base data: its SegmentCore over the segment files, with every
@@ -317,6 +328,8 @@ public:
     bool isMaterialized() const noexcept;
     // Materializes the core, root live docs and every overlay opened with the segment.
     void materialize() const;
+    // Adds the reads materialize() would make, for a fetch ahead of it.
+    void declareReads(ReadSet& reads) const;
 
     // Whether this space has deleted rows. For the root, from the manifest;
     // a child space derives its live rows, materializing the segment.
@@ -758,6 +771,11 @@ public:
   // the segments its root masks kept. Materializing a segment opens its
   // bundle, which every space's view shares.
   void materialize(const SegmentMask& mask = {});
+  // Adds the reads materialize(mask) would make, for a fetch ahead of it, so
+  // that a search can wait for them without holding a thread
+  // (FetchCountdown) and then materialize on resident bytes. Reads of
+  // memory-backed and mapped files complete inline.
+  void declareMaterialize(const SegmentMask& mask, ReadSet& reads) const;
 
   // Opens a published snapshot, reusing what it shares with previousReader
   // and the cores its publisher holds open (CommitSnapshot::openCores).
