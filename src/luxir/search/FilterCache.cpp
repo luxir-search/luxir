@@ -56,9 +56,24 @@ uint64_t nanosFromWork(double amount) {
 
 } // namespace
 
-void FilterCache::Ledger::production(uint64_t nanos, size_t bytes, bool investment) {
+FilterCache::Work FilterCache::Ledger::productionDemand(
+    Work requestWork, const std::optional<double>& charged, double price) const {
+  // Known work already entered the rate at the probe. A first assumed use
+  // charged zero because its production time was not yet measured.
+  if (requestWork.isAssumed() && !measured && charged.value_or(0) == 0) {
+    return Work::assumed();
+  }
+  if (charged || requestWork.known()) return Work::nanoseconds(0);
+  double saving = absent.count
+      ? std::max(0.0, absent.nanos - (served.count ? served.nanos : 0)) : 0;
+  return Work::nanoseconds(price >= 0 ? std::min(price, saving) : saving);
+}
+
+void FilterCache::Ledger::production(
+    uint64_t nanos, size_t bytes, bool investment, Work requestWork) {
   referenceBytes = bytes;
   if (investment) {
+    work += requestWork.resolve((double)nanos);
     referenceNanos = nanos;
     measured = true;
     completed = std::chrono::steady_clock::now();
@@ -173,7 +188,8 @@ FilterCache::Probe::Probe(Probe&& other) noexcept
   : slot(std::move(other.slot)), value(std::move(other.value)),
     requestValue(other.requestValue), requestUse(other.requestUse),
     requestSegmentOrd(other.requestSegmentOrd), producedCardinality(other.producedCardinality),
-    kind_(other.kind_), ownsClaim(other.ownsClaim), ownsRequestClaim(other.ownsRequestClaim) {
+    kind_(other.kind_), ownsClaim(other.ownsClaim), ownsRequestClaim(other.ownsRequestClaim),
+    requestWork(other.requestWork) {
   other.kind_ = Kind::BYPASS;
   other.producedCardinality = -1;
   other.requestValue = nullptr;
@@ -194,6 +210,7 @@ FilterCache::Probe& FilterCache::Probe::operator=(Probe&& other) noexcept {
   producedCardinality = other.producedCardinality;
   ownsClaim = other.ownsClaim;
   ownsRequestClaim = other.ownsRequestClaim;
+  requestWork = other.requestWork;
   other.kind_ = Kind::BYPASS;
   other.producedCardinality = -1;
   other.requestValue = nullptr;
@@ -223,7 +240,8 @@ void FilterCache::ReaderProbe::releaseClaim() {
 
 FilterCache::ReaderProbe::ReaderProbe(ReaderProbe&& other) noexcept
   : entry(std::move(other.entry)), value(std::move(other.value)),
-    kind_(other.kind_), ownsClaim(other.ownsClaim), refresh(other.refresh) {
+    kind_(other.kind_), ownsClaim(other.ownsClaim), refresh(other.refresh),
+    requestWork(other.requestWork) {
   other.kind_ = Kind::BYPASS;
   other.ownsClaim = false;
   other.refresh = false;
@@ -238,6 +256,7 @@ FilterCache::ReaderProbe& FilterCache::ReaderProbe::operator=(
   kind_ = other.kind_;
   ownsClaim = other.ownsClaim;
   refresh = other.refresh;
+  requestWork = other.requestWork;
   other.kind_ = Kind::BYPASS;
   other.ownsClaim = false;
   other.refresh = false;
@@ -351,8 +370,8 @@ void FilterCache::Use::chargeLedger(Ledger& ledger, Accounting& accounting,
   if (!work.known() || work.isUnfunded()) return;
   std::lock_guard<std::mutex> lock(mutex);
   if (!accounting.populationAllowed || accounting.charged) return;
-  accounting.charged = true;
   double nanos = work.resolve(ledger.measured ? (double)ledger.referenceNanos : 0);
+  accounting.charged = nanos;
   ledger.owed += nanos;
   ledger.work += nanos;
   auto& count = work.isAssumed() ? cache->counter.assumedCharges : cache->counter.observedCharges;
@@ -718,7 +737,9 @@ FilterCache::Probe FilterCache::Use::probe(size_t segmentOrd, Work work) {
   cache->counter.buildAttempts.fetch_add(1, std::memory_order_relaxed);
   uint64_t now = cache->nextEpoch();
   entry->lastUsed.store(now, std::memory_order_relaxed);
-  return Probe(Probe::Kind::BUILD, slot, nullptr, true, nullptr, this, segmentOrd, true);
+  Probe result(Probe::Kind::BUILD, slot, nullptr, true, nullptr, this, segmentOrd, true);
+  result.requestWork = work;
+  return result;
 }
 
 FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
@@ -865,7 +886,9 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
   localEntry->lastUsed.store(now, std::memory_order_relaxed);
   bool refresh = localEntry->readerValueEverPublished.load(
       std::memory_order_relaxed);
-  return ReaderProbe(ReaderProbe::Kind::BUILD, localEntry, nullptr, true, refresh);
+  ReaderProbe result(ReaderProbe::Kind::BUILD, localEntry, nullptr, true, refresh);
+  result.requestWork = work;
+  return result;
 }
 
 std::shared_ptr<const FilterCache::SegmentValue>
@@ -1844,7 +1867,13 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
     std::lock_guard<std::mutex> lock(use.entry->mutex);
     std::lock_guard<SegmentSlot> ledgerLock(*slot);
     if (use.entry->resident && slot->active.load(std::memory_order_acquire)) {
-      slot->ledger.production(buildCostNanos, local->ramBytesUsed(), claimed && !byproduct);
+      auto demand = claimed && !byproduct
+          ? slot->ledger.productionDemand(probe->requestWork,
+              use.requestSlots[segmentOrd].accounting.charged,
+              productionNanos(slot->ledger, slot->maxDoc,
+                  !probe->requestWork.isAssumed(), probe->requestWork.isWholeQuery()))
+          : Work::nanoseconds(0);
+      slot->ledger.production(buildCostNanos, local->ramBytesUsed(), claimed && !byproduct, demand);
       slot->ledger.rawCardinality.store(local->card(), std::memory_order_relaxed);
     }
     auto current = slot->value.load(std::memory_order_acquire);
@@ -1938,7 +1967,9 @@ FilterCache::publishReaderValue(
     std::lock_guard<std::mutex> lock(localEntry->mutex);
     std::lock_guard<FilterEntry> ledgerLock(*localEntry);
     if (localEntry->resident) {
-      localEntry->ledger.production(buildCostNanos, local->ramBytesUsed(), true);
+      auto demand = localEntry->ledger.productionDemand(probe.requestWork,
+          use.readerAccounting.charged, productionNanos(localEntry->ledger, 0, false));
+      localEntry->ledger.production(buildCostNanos, local->ramBytesUsed(), true, demand);
     }
     auto current = localEntry->readerValue.load(std::memory_order_acquire);
     if (current != nullptr && current->readerVersion() == use.readerVersion) {

@@ -272,6 +272,7 @@ public:
     Kind kind_ = Kind::BYPASS;
     bool ownsClaim = false;
     bool ownsRequestClaim = false;
+    Work requestWork = Work::assumed();
 
     Probe(Kind kind, std::shared_ptr<SegmentSlot> slot,
           std::shared_ptr<const SegmentValue> value, bool ownsClaim,
@@ -319,6 +320,7 @@ public:
     Kind kind_ = Kind::BYPASS;
     bool ownsClaim = false;
     bool refresh = false;
+    Work requestWork = Work::assumed();
 
     ReaderProbe(Kind kind, std::shared_ptr<FilterEntry> entry,
                 std::shared_ptr<const ReaderValue> value, bool ownsClaim,
@@ -375,7 +377,7 @@ public:
     enum class Deferral { FUNDING, CAPACITY };
     struct Accounting {
       bool ordinary = false;
-      bool charged = false;
+      std::optional<double> charged;
       bool credited = false;
       bool populationAllowed = false;
       bool deferred = false;
@@ -712,7 +714,8 @@ private:
       while (transition.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
     }
     void unlock() { transition.clear(std::memory_order_release); }
-    void production(uint64_t nanos, size_t bytes, bool investment);
+    Work productionDemand(Work requestWork, const std::optional<double>& charged, double price) const;
+    void production(uint64_t nanos, size_t bytes, bool investment, Work requestWork);
     void repay(double nanos);
     void collectCredit(double total) {
       work += total - creditSnapshot;
