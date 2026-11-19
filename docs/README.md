@@ -92,6 +92,8 @@ state, and commits are crash-safe on immutable segments.
 - [Segment summaries](design/segment-summaries.md) describes the per-segment
   summary sidecar and the query-time pruning over it: one root mask per
   operation, with scoring statistics over every segment.
+- [Storage tiers](design/storage-tiers.md) explains lazy range reads for
+  remote backends and the per-segment hotcache.
 - [Codebase map](dev/codebase-map.md) traces source components and request
   flow.
 - [Build setup](dev/build-setup.md) covers toolchains, dependencies, presets,
