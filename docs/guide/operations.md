@@ -118,6 +118,12 @@ the fetch. `--reader.max-materialize-bytes` (default `64MB`, `0` disables)
 logs each such file larger than the limit once, naming the file and the
 reader's field, so these reads are visible.
 
+An exact (flat) kNN scan reads a lazily fetched vector file in windows of
+`--knn.scan-window-bytes` (default `8MB`, rounded down to whole vectors),
+fetching the next window while it scores the current one, so a scan never
+holds a whole vector file. A filtered scan that expects less than one vector
+per window reads vector by vector instead. Local files are scanned in place.
+
 `--store.retention-ms` keeps superseded commits and their files for that many
 milliseconds after their successor is published. After a restart, every older
 commit gets a full window. It defaults to 0 on exclusive stores and 300000

@@ -218,6 +218,11 @@ public:
     double filteredCoverageAlpha = 0.25;
     // Both zero select next-list-only growth.
     double breadthHeadroom = 1.25, breadthGrowth = 2.0;
+    // A flat scan of a lazy (remote) vector file reads it in windows of this
+    // many bytes, rounded down to whole vectors (at least one), and fetches
+    // the next window while scoring this one. Resident files scan their
+    // mapping. Set from knn.scan-window-bytes; it does not change results.
+    int64_t scanWindowBytes = 8 << 20;
   };
   static Tuning tuning;
   static constexpr double FLAT_RANGE_POINT_DENSITY = 1.0 / 128.0;
@@ -983,7 +988,7 @@ public:
         if (segInfos.at(i) != nullptr) {
           // FIXED_SIZE vector column.  numVectors == #docs-with-field for
           // single-valued, or the total vector count for multi-valued.
-          VectorReader vr(reader.segments()[i].postingsReader(), *segInfos.at(i));
+          VectorReader vr(reader.segments()[i].postingsReader(), *segInfos.at(i), VectorReader::Values::DEFERRED);
           segCount = vr.numVectors();
           if (segCount > 0) {
             if (vr.dims() != dims) {
@@ -1136,7 +1141,7 @@ public:
             if (seg.hasDeletes()) {
               auto live = seg.liveDocsShared();
               const auto& bitmap = live->rankLiveBitmap(query.getField(), [&]() {
-                VectorReader vr(seg.postingsReader(), *segInfos.at(i));
+                VectorReader vr(seg.postingsReader(), *segInfos.at(i), VectorReader::Values::DEFERRED);
                 return buildRankLiveBitmap(seg, vr, segCount);
               });
               rankLivePerSeg[i] = std::shared_ptr<const RankLiveBitmap>(std::move(live), &bitmap);
@@ -1270,7 +1275,7 @@ public:
         if (!ranks.bits.empty()) return;
         auto& seg = reader.segments()[i];
         DocSet* domain = ctx.domainPerSeg[i];
-        VectorReader vr(seg.postingsReader(), *segInfos.at(i));
+        VectorReader vr(seg.postingsReader(), *segInfos.at(i), VectorReader::Values::DEFERRED);
         if (KnnPlanner::borrowDomain(planSegments[i])) {
           static_assert(std::endian::native == std::endian::little);
           ranks.bits = {(const uint8_t*)((BitDocSet*)domain)->bits().words,
@@ -2196,6 +2201,56 @@ public:
       int32_t metric;
       bool normalizeColumnOnCosineRescore;
 
+      // The vectors as a scan reads them. A resident column is one window
+      // over its mapping (RowReadAhead reads its pages ahead). A deferred
+      // column (a lazy file) is read in windows of tuning.scanWindowBytes,
+      // whole vectors, aligned to multiples of the window: each window is one
+      // range read, and the window after it is declared with prefetchRanges
+      // as it loads, so that fetch overlaps scoring. Ranks may move anywhere;
+      // an ascending scan loads each window once. A walk expecting less than
+      // one vector per window reads vector by vector instead (each fetches
+      // what covers it) rather than fetch windows it mostly skips.
+      class ScanWindows {
+        VectorReader& vr;
+        size_t dims;
+        int64_t numVals;
+        int64_t rows;
+        bool perVector;
+        int64_t begin = 0, end = 0;
+        const float* base = nullptr;
+
+        LUXIR_NOINLINE void load(int64_t rank) {
+          begin = rank / rows * rows;
+          end = std::min(numVals, begin + rows);
+          base = vr.window(begin, end);
+          if (end < numVals) {
+            ByteRange next = vr.windowRange(end, std::min(numVals, end + rows));
+            vr.file()->prefetchRanges(std::span<const ByteRange>(&next, 1));
+          }
+        }
+
+      public:
+        // expectedVectors: how many vectors the scan reads, at most numVectors().
+        ScanWindows(VectorReader& vr, int64_t expectedVectors)
+          : vr(vr), dims((size_t)vr.dims()), numVals(vr.numVectors()),
+            rows(std::max<int64_t>(1, tuning.scanWindowBytes / std::max<int64_t>(1, vr.vectorBytes()))),
+            perVector(vr.deferred() && expectedVectors * rows < numVals) {
+          if (!vr.deferred()) {
+            rows = numVals;
+            end = numVals;
+            base = vr.window(0, numVals);
+          }
+        }
+
+        LUXIR_INLINE std::span<const float> at(int64_t rank) {
+          if ((uint64_t)(rank - begin) >= (uint64_t)(end - begin)) [[unlikely]] {
+            if (perVector) return vr.vectorAtRank(rank);
+            load(rank);
+          }
+          return std::span<const float>(base + (size_t)(rank - begin) * dims, dims);
+        }
+      };
+
       // Keep each shape/arm in its own function so read-ahead and domain
       // dispatch cannot consume the sequential loop's inlining budget.
       static LUXIR_INLINE bool pooledInRun(std::span<const uint8_t> elig, int64_t begin, int64_t end) {
@@ -2205,16 +2260,16 @@ public:
         return false;
       }
       template <bool Multi, class Emit>
-      LUXIR_INLINE void scoreRun(VectorReader& vr, const VectorSearchRequest& request, Emit& emit,
+      LUXIR_INLINE void scoreRun(ScanWindows& vectors, const VectorSearchRequest& request, Emit& emit,
                                 int64_t& scored, int32_t doc, int64_t begin, int64_t end) {
         emit(doc, [&]() LUXIR_INLINE {
           scored += end - begin;
           if constexpr (Multi) {
             auto [rank, score] = bestInRun(begin, end, [&](int64_t r) LUXIR_INLINE {
-              return exactScore(request.query, vr.vectorAtRank(r), dims, metric, normalizeColumnOnCosineRescore, 0.0f);
+              return exactScore(request.query, vectors.at(r), dims, metric, normalizeColumnOnCosineRescore, 0.0f);
             });
             return VectorEngineHit{score, segOrd, rank};
-          } else return VectorEngineHit{exactScore(request.query, vr.vectorAtRank(begin), dims, metric,
+          } else return VectorEngineHit{exactScore(request.query, vectors.at(begin), dims, metric,
               normalizeColumnOnCosineRescore, 0.0f), segOrd, begin};
         });
       }
@@ -2225,6 +2280,9 @@ public:
         RowReadAhead::Gate gate;
         int64_t count = domain->card(), vectorsScored = 0, sparseMaps = 0, multiMaps = 0;
         if (!count) return {};
+        // Domain docs with this field hold about this many vectors.
+        ScanWindows vectors(vr, (int64_t)((double)std::min<int64_t>(count, vr.docsWithValue())
+            * ((double)vr.numVectors() / std::max(1, vr.docsWithValue()))));
         const auto* bits = domain->type == DocSet::BITSET ? &((const BitDocSet*)domain)->bits() : nullptr;
         std::span<const int32_t> docs = domain->type == DocSet::ARRAY
             ? ((const ArrDocSet*)domain)->docs() : std::span<const int32_t>{};
@@ -2313,7 +2371,7 @@ public:
               multiMaps++;
               auto run = queuedRanges->front();
               queuedRanges->pop_front();
-              if (!pooledInRun(elig, run.begin, run.end)) scoreRun<true>(vr, request, emit, vectorsScored, doc, run.begin, run.end);
+              if (!pooledInRun(elig, run.begin, run.end)) scoreRun<true>(vectors, request, emit, vectorsScored, doc, run.begin, run.end);
               return;
             }
           }
@@ -2321,7 +2379,7 @@ public:
           if (rank < 0) return;
           if constexpr (Multi) multiMaps++;
           auto [begin, end] = valueRange(rank);
-          if (!pooledInRun(elig, begin, end)) scoreRun<Multi>(vr, request, emit, vectorsScored, doc, begin, end);
+          if (!pooledInRun(elig, begin, end)) scoreRun<Multi>(vectors, request, emit, vectorsScored, doc, begin, end);
         });
         VectorSearchWork work;
         work.domainDocs = count; work.exactVectors = vectorsScored;
@@ -2333,6 +2391,7 @@ public:
                                                     std::span<const uint8_t> elig, Emit emit) {
         auto& col = vr.strColReader();
         int64_t numVals = vr.numVectors(), vectorsScored = 0, domainProbes = 0, sparseMaps = 0, multiMaps = 0;
+        ScanWindows vectors(vr, numVals);
         RowReadAhead::Gate gate;
         // The dense arm walks ranks sequentially. Independent forward
         // probes keep array domains linear for both scoring and read-ahead.
@@ -2371,7 +2430,7 @@ public:
               valDoc.next();
             } while (end < numVals && (int32_t)valDoc.value() == doc);
             readAhead(rank);
-            if (eligibleDoc(doc) && !pooledInRun(elig, rank, end)) scoreRun<true>(vr, request, emit, vectorsScored, doc, rank, end);
+            if (eligibleDoc(doc) && !pooledInRun(elig, rank, end)) scoreRun<true>(vectors, request, emit, vectorsScored, doc, rank, end);
             rank = end;
           }
         } else {
@@ -2382,7 +2441,7 @@ public:
             if (pooledInRun(elig, rank, rank + 1)) continue;
             if constexpr (Sparse) sparseMaps++;
             int32_t doc = Sparse ? v2d.resolve(rank) : (int32_t)rank;
-            if (eligibleDoc(doc)) scoreRun<false>(vr, request, emit, vectorsScored, doc, rank, rank + 1);
+            if (eligibleDoc(doc)) scoreRun<false>(vectors, request, emit, vectorsScored, doc, rank, rank + 1);
           }
         }
         VectorSearchWork work;
@@ -2434,7 +2493,7 @@ public:
           result.boundedSelection = VectorSelection::COMPLETE;
           return result;
         }
-        VectorReader vr(seg.postingsReader(), *segInfo);
+        VectorReader vr(seg.postingsReader(), *segInfo, VectorReader::Values::DEFERRED);
         int64_t numVals = vr.numVectors();
         if (numVals == 0) {
           result.boundedSelection = VectorSelection::COMPLETE;
@@ -3099,7 +3158,8 @@ private:
       std::optional<VectorReader> column;
       std::optional<VectorReader::Iterator> docs;
       if constexpr (Groups) if (!exact) {
-        column.emplace(reader.segments()[(size_t)segOrd].postingsReader(), *segInfos.at((size_t)segOrd));
+        column.emplace(reader.segments()[(size_t)segOrd].postingsReader(), *segInfos.at((size_t)segOrd),
+                       VectorReader::Values::DEFERRED);
         if (column->isMultiValued()) docs.emplace(column->strColReader());
       }
       int32_t lastDoc = -1;
@@ -3173,11 +3233,20 @@ private:
         return [&, bucket]() {
           auto [b, e] = buckets[bucket];
           int32_t segOrd = records[selected[b]].hit.segOrd;
-          VectorReader column(reader.segments()[(size_t)segOrd].postingsReader(), *segInfos.at((size_t)segOrd));
+          VectorReader column(reader.segments()[(size_t)segOrd].postingsReader(), *segInfos.at((size_t)segOrd),
+                              VectorReader::Values::DEFERRED);
           RowReadAhead::Gate gate;
           RowReadAhead ahead(gate, column.strColReader());
           auto rankAt = [&](int64_t i) { return records[selected[b + (size_t)i]].hit.valueRank; };
           int64_t count = (int64_t)(e - b), reads = 0;
+          if (column.deferred()) {
+            // A lazy file: declare the bucket's vectors at once (ascending, so
+            // neighbours coalesce), and each read below finds its bytes fetched.
+            std::vector<ByteRange> ranges;
+            ranges.reserve((size_t)count);
+            for (int64_t i = 0; i < count; i++) ranges.push_back(column.windowRange(rankAt(i), rankAt(i) + 1));
+            column.file()->prefetchRanges(ranges);
+          }
           ahead.probe({rankAt(count / 4), rankAt(count / 2 + count / 4)});
           for (size_t i = b; i < e; i++) {
             auto& record = records[selected[i]];
