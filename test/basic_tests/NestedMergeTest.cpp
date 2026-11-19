@@ -35,7 +35,7 @@ void schema(CollectionHelper& helper) {
     stored.index = api::FieldDef::IndexMode::NONE; stored.column = false; stored.stored = true;
   }
   b.set(helper.collection());
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  helper.getIndexWriter()->setMergeFactor(1000);
 }
 std::string values(int32_t row) {
   return "\"row_i\":" + std::to_string(row) + R"(,"text_w":"alpha beta alpha gamma","set_ss":["b","a","b"],"array_s":["b","a","b"],"vals_is":[3,1,3],"raw_sc":"bytes\u0000)"
@@ -74,7 +74,7 @@ std::vector<Doc> result(CollectionHelper& helper, std::string_view path, std::st
 TEST(NestedMergeTest, largestSpaceSizesLevelsAndSurvivingOutput) {
   CollectionHelper helper("nested_levels");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(10);
+  writer->setMergeFactor(10);
   auto rows = [](int32_t count) {
     std::string out = "[";
     for (int32_t i = 0; i < count; i++) out += i ? ",{}" : "{}";
@@ -99,7 +99,7 @@ TEST(NestedMergeTest, largestSpaceSizesLevelsAndSurvivingOutput) {
       auto found = std::ranges::find(stats.segmentStats, seg.seg_id, &IndexWriter::SegmentStats::segId);
       EXPECT_NE(stats.segmentStats.end(), found);
       if (found != stats.segmentStats.end()) {
-        EXPECT_EQ(writer->mergePolicy->_mergeLevelForRows(count), found->mergeLevel);
+        EXPECT_EQ(TieredMergePolicy(10).levelForRows(count), found->mergeLevel);
       }
     }
     std::sort(counts.begin(), counts.end());
@@ -189,7 +189,7 @@ TEST(NestedMergeTest, allRepresentationsAndOwnershipMatchFreshSurvivors) {
 TEST(NestedMergeTest, childPartitionsAndStoredCopyAndReaddShareOneBundle) {
   CollectionHelper helper("nested_mechanisms");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(1000);
+  writer->setMergeFactor(1000);
   writer->termPartitionMinBytes = 1; writer->termPartitionMinRangeBytes = 1; writer->termPartitionMaxRanges = 4;
   for (int32_t source = 0; source < 2; source++) {
     CollectionHelper::UpdateBuilder input;
@@ -220,7 +220,7 @@ TEST(NestedMergeTest, childPartitionsAndStoredCopyAndReaddShareOneBundle) {
 TEST(NestedMergeTest, physicalChildRowsPastTheLimitSkipTheMerge) {
   CollectionHelper helper("nested_capacity");
   helper.clear();
-  auto writer = helper.getIndexWriter(); writer->mergePolicy->setMergeFactor(1000);
+  auto writer = helper.getIndexWriter(); writer->setMergeFactor(1000);
   auto& inv = writer->obtainInverter();
   for (auto id : {"dead", "empty"}) { inv.startDoc(); inv.getIndexHandler("id").index(inv, std::string_view(id)); }
   auto& output = inv.getPostingsWriter();

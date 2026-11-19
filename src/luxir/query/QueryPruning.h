@@ -57,9 +57,15 @@ public:
   // Why `query` cannot match segment `ord`, for explain and profile notes.
   std::string reason(const Query& query, size_t ord) const;
 
-  // Whether `segment`'s summary proves `term` absent from the dictionary of
-  // `field`, so its statistics are exactly zero there and need no seek.
+  // Whether `segment`'s summary or a membership overlay proves `term` absent
+  // from the dictionary of `field`, so its statistics are exactly zero there
+  // and need no seek.
   static bool termAbsent(const IndexReader::Segment& segment, std::string_view field, std::string_view term);
+
+  // Fetches, in one batch, the overlay ranges that termAbsent will read for
+  // this term across `reader`'s segments, so the per-segment probes after it
+  // read resident bytes instead of each waiting on the store.
+  static void fetchMembershipProbes(IndexReader& reader, std::string_view field, std::string_view term) noexcept;
 };
 
 } // namespace luxir

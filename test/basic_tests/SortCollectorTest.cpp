@@ -468,7 +468,7 @@ TEST_F(SortCollectorTest, fieldSortLeafMetaLivesWithItsSegment) {
   LuxirNode node(config);
   CollectionHelper helper(node, "reopen");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   int32_t docId = 0;
   for (int32_t docs : {3 * 512 + 17, 2 * 512, 700}) {
     std::vector<Doc> batch;
@@ -2469,7 +2469,7 @@ TEST_F(SortCollectorTest, fieldSortConstantCountWithoutCacheIsPerSegment) {
   auto writer = helper.getIndexWriter();
   writer->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0});
-  writer->mergePolicy->setMergeFactor(10);
+  writer->setMergeFactor(10);
   constexpr int32_t kDocsPerSeg = 5000;
   for (int32_t seg = 0; seg < 2; seg++) {
     for (int32_t i = 0; i < kDocsPerSeg; i++) {
@@ -2522,7 +2522,7 @@ TEST_F(SortCollectorTest, fieldSortConstantCountWithoutCacheIsPerSegment) {
 TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
   WholeMembershipPlanGuard wholeGuard(true);
   CollectionHelper helper;
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  helper.getIndexWriter()->setMergeFactor(10);
   constexpr int32_t kDocsPerSeg = 5000;
   std::vector<std::string> deleted;
   int32_t docId = 0;
@@ -2855,7 +2855,7 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
 // main weight is retained.
 TEST_F(SortCollectorTest, phraseFieldSortPruningMatchesExhaustive) {
   CollectionHelper helper("phrase_field_sort");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  helper.getIndexWriter()->setMergeFactor(10);
   constexpr int32_t kDocsPerSeg = 5000;
   std::vector<std::string> deleted;
   int32_t docId = 0;
@@ -3155,7 +3155,7 @@ TEST_F(SortCollectorTest, keyFloorClipsValueEnvelopes) {
 TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
   WholeMembershipPlanGuard wholeGuard(true);
   CollectionHelper helper("best_first_sort");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  helper.getIndexWriter()->setMergeFactor(10);
   constexpr int32_t kDocsPerSeg = 5000;
   int32_t docId = 0;
   for (int32_t seg = 0; seg < 2; seg++) {
@@ -3857,7 +3857,7 @@ TEST_F(SortCollectorTest, exactDomainCostRouteAcrossSegments) {
   WholeMembershipPlanGuard wholeGuard(true);
   TopDocsFilterFoldGuard foldGuard(true);
   CollectionHelper helper("cost_route_segments");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  helper.getIndexWriter()->setMergeFactor(10);
   constexpr std::array<int32_t, 3> kSegDocs{128 * 512, 64 * 512,
                                             96 * 512 - 200};
   int32_t docId = 0;
@@ -4210,7 +4210,7 @@ TEST_F(SortCollectorTest, segmentKeysEstimateKeysWithinEnvelopes) {
 // pair, one leaf each side of the boundary.
 TEST_F(SortCollectorTest, predictedBottomFollowsHeapAcrossSegments) {
   CollectionHelper helper;
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  helper.getIndexWriter()->setMergeFactor(10);
   constexpr int32_t kSegDocs = 64 * 512;
   int32_t docId = 0;
   for (int32_t seg = 0; seg < 2; seg++) {
@@ -4285,7 +4285,7 @@ TEST_F(SortCollectorTest, indexWidePlanBuildsAcrossSmallSegments) {
   helper.getIndexWriter()->snapshots.readers.filterCache =
       std::make_shared<FilterCache>(
           FilterCacheConfig{.minSegmentDocs = 0, .admissionThreshold = 1});
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  helper.getIndexWriter()->setMergeFactor(10);
   constexpr std::array<int32_t, 5> kSegDocs{64 * 512, 8 * 512, 512, 64, 8};
   int32_t docId = 0;
   for (int32_t docs : kSegDocs) {
@@ -4381,7 +4381,7 @@ TEST_F(SortCollectorTest, indexWidePlanBuildsAcrossSmallSegments) {
 // missing value satisfies one), it goes last.
 TEST_F(SortCollectorTest, visitOrderPlacesSegmentsWithoutKeysAtMissingEdge) {
   CollectionHelper helper("missing_edge");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  helper.getIndexWriter()->setMergeFactor(10);
   int32_t docId = 0;
   for (bool keyed : {true, false, true}) {
     std::vector<Doc> batch;
@@ -4425,7 +4425,7 @@ TEST_F(SortCollectorTest, segmentVisitOrderKeepsTopKExact) {
   WholeMembershipPlanGuard wholeGuard(true);
   TopDocsFilterFoldGuard foldGuard(true);
   CollectionHelper helper("visit_order");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  helper.getIndexWriter()->setMergeFactor(10);
   constexpr std::array<int32_t, 5> kSegDocs{16 * 512, 16 * 512 - 77, 4 * 512,
                                             512 + 40, 300};
   int32_t docId = 0;
@@ -4515,7 +4515,7 @@ TEST_F(SortCollectorTest, segmentVisitOrderKeepsTopKExact) {
 TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
   WholeMembershipPlanGuard wholeGuard(true);
   CollectionHelper helper("seeded_sort");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  helper.getIndexWriter()->setMergeFactor(10);
   constexpr int32_t kDocsPerSeg = 5000;
   int32_t docId = 0;
   for (int32_t seg = 0; seg < 2; seg++) {
@@ -4701,7 +4701,7 @@ TEST_F(SortCollectorTest, seededFieldSortAntiCorrelationAborts) {
   constexpr int32_t kBigSegDocs = 13 * 4096;
   constexpr int32_t kProbeStart = 12 * 4096;
   CollectionHelper helper("seeded_abort");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  helper.getIndexWriter()->setMergeFactor(10);
   CollectionHelper::UpdateBuilder small;
   for (int32_t i = 0; i < 5000; i++) {
     small.add(flatdoc("id", std::to_string(i), "id_s", std::to_string(i),
@@ -4814,7 +4814,7 @@ void SortCollectorTest::runStringCandidatePruning(int32_t nSegs) {
   WholeMembershipPlanGuard wholeGuard(true);
   {
     CollectionHelper helper;
-    helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+    helper.getIndexWriter()->setMergeFactor(10);
     constexpr int32_t kDocsPerSeg = 12000;
     std::vector<std::string> deleted;
     int32_t docId = 0;
@@ -5064,7 +5064,7 @@ TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
 
   // set the mergeFactor very high to avoid merges during indexing
   // we want many segments to try and get
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(nSegs+1);
+  helper.getIndexWriter()->setMergeFactor(nSegs+1);
   
   // Track expected results: tuples of (value, docid, segment)
   struct DocInfo {

@@ -2320,7 +2320,7 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
 
   test::CollectionHelper helper("merged_nested_cache");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   auto shared = std::make_shared<FilterCache>(FilterCacheConfig{
       .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2});
   writer->snapshots.readers.filterCache = shared;
@@ -6969,7 +6969,7 @@ TEST_F(FilterCacheConcurrencyTest, updateMergePurgeEvictFuzz) {
   LuxirNode node(nodeConfig);
   CollectionHelper helper(node, collection);
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(3);
+  writer->setMergeFactor(3);
   writer->perInverterMaxDocs = 4;
   writer->perInverterRamBytes = 16 * 1024;
 

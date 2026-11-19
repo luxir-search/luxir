@@ -666,7 +666,7 @@ TEST_F(TaskWorkTest, optionsAreApplied) {
 TEST_F(TaskWorkTest, adaptiveZeroPublishesNothingBelowTheGrain) {
   FanoutGrainGuard grain(10'000'000'000);
   CollectionHelper helper("fanout_below_grain");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   for (int seg = 0; seg < 5; seg++) {
     helper.index(flatdoc("id", std::to_string(seg), "cat_s", "a"), UpdateMessage::COMMIT);
   }
@@ -681,7 +681,7 @@ TEST_F(TaskWorkTest, adaptiveZeroPublishesNothingBelowTheGrain) {
 
 TEST_F(TaskWorkTest, adaptiveZeroMatchesSerial) {
   CollectionHelper helper("fanout_gate");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   for (int seg = 0; seg < 5; seg++) {
     std::vector<Doc> docs;
     for (int i = 0; i < 64; i++) {

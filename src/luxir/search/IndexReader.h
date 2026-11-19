@@ -22,6 +22,7 @@
 #include "luxir/query/SegmentMask.h"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/Hotcache.h"
+#include "luxir/reader/TermMembership.h"
 #include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/RankLiveBitmap.h"
 #include "luxir/store/HeldFiles.h"
@@ -387,6 +388,15 @@ public:
 
     // Every overlay of a known kind opened with the segment, materialized.
     std::vector<std::shared_ptr<AuxReader>> auxReaders() const;
+
+    // Whether an overlay of this segment can prove terms absent.
+    bool hasTermMembership() const noexcept;
+    // Whether an overlay proves `term` (dictionary form) absent from `field`.
+    // Fills `why` with the proof's label when it does. Never throws: any
+    // failure proves nothing.
+    bool membershipProvesAbsent(std::string_view field, std::string_view term, std::string* why = nullptr) const noexcept;
+    // Adds the byte ranges those probes will read.
+    void declareMembershipProbes(std::string_view field, std::string_view term, ReadSet& reads) const noexcept;
 
     // The overlay `name`, materialized on first use; null when absent.
     std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const;
@@ -797,6 +807,9 @@ public:
   // (FetchCountdown) and then materialize on resident bytes. Reads of
   // memory-backed and mapped files complete inline.
   void declareMaterialize(const SegmentMask& mask, ReadSet& reads) const;
+  // Adds the reads that opening the base of each segment of `mask` makes
+  // (what a term dictionary seek opens), for a fetch ahead of parsing.
+  void declareBases(const SegmentMask& mask, ReadSet& reads) const;
 
   // Opens a published snapshot, reusing what it shares with previousReader
   // and the cores its publisher holds open (CommitSnapshot::openCores).

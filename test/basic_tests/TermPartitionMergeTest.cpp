@@ -123,7 +123,7 @@ void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
   test::reserveIncarnation(index.dir);
   index.iw = std::make_unique<IndexWriter>(
       index.snapshots, schema, budget);
-  index.iw->mergePolicy->setMergeFactor(1000);
+  index.iw->setMergeFactor(1000);
   if (partitioned) {
     index.iw->termPartitionMinBytes = 1;
     index.iw->termPartitionMinRangeBytes = 1;
@@ -159,7 +159,7 @@ void buildWideDictionarySources(TestIndex& index,
   test::reserveIncarnation(index.dir);
   index.iw = std::make_unique<IndexWriter>(
       index.snapshots, schema);
-  index.iw->mergePolicy->setMergeFactor(1000);
+  index.iw->setMergeFactor(1000);
   TestField body(index, "body");
 
   std::string value;
@@ -383,7 +383,7 @@ SegFieldInfo buildSparseRanges(TestIndex& index, const std::shared_ptr<Schema>& 
                                bool keepOneRange) {
   test::reserveIncarnation(index.dir);
   index.iw = std::make_unique<IndexWriter>(index.snapshots, schema);
-  index.iw->mergePolicy->setMergeFactor(1000);
+  index.iw->setMergeFactor(1000);
   index.iw->termPartitionMinBytes = 1;
   index.iw->termPartitionMinRangeBytes = 1;
   index.iw->termPartitionMaxRanges = 4;

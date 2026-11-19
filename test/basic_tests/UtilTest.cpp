@@ -484,6 +484,45 @@ TEST_F(UtilTest, lazyMapDoesNotInheritCancellation) {
   checkCanceledBuilder([&](auto&& create) { return map.getOrCreate(7, create); });
 }
 
+// A waiter leaves a shared build at its own request's deadline or cancel; the
+// build goes on and later callers take its value.
+TEST_F(UtilTest, lazyCellWaitersLeaveWithTheirRequest) {
+  SharedLazyCell<int> cell;
+  std::latch started(1), release(1);
+  std::jthread builder([&] {
+    cell.getOrCreate([&] {
+      started.count_down();
+      release.wait();
+      return std::make_shared<int>(42);
+    });
+  });
+  started.wait();
+  auto waitAs = [&](const IoContext& io) -> std::string {
+    IoScope scope(&io);
+    try {
+      cell.getOrCreate([] { return std::make_shared<int>(0); });
+    } catch (const ApiError& e) {
+      return e.code;
+    }
+    return "returned";
+  };
+  IoContext late;
+  late.deadline = IoContext::Clock::now() + std::chrono::milliseconds(20);
+  EXPECT_EQ("fetch_timeout", waitAs(late));
+  std::stop_source cancel;
+  IoContext cancelled;
+  cancelled.stop = cancel.get_token();
+  std::jthread canceller([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    cancel.request_stop();
+  });
+  EXPECT_EQ("cancelled", waitAs(cancelled));
+  release.count_down();
+  builder.join();
+  EXPECT_EQ(42, *cell.getOrCreate([] { return std::make_shared<int>(0); }));
+  EXPECT_EQ("returned", waitAs(late));  // past its deadline, but nothing to wait for
+}
+
 #ifndef NDEBUG
 TEST_F(UtilTest, lazyMapRejectsRecursiveBuild) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");

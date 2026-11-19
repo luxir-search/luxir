@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "luxir/index/SegmentSummary.h"
+#include "luxir/search/IndexReader.h"
 
 namespace luxir {
 
@@ -19,10 +20,12 @@ enum class FieldPresence : uint8_t { ABSENT, PRESENT, UNKNOWN };
 class SummaryView {
   const SegmentSummary* summary;
   std::string* reason;
+  const IndexReader::Segment* segment;  // null for the collection summary
 
 public:
-  explicit SummaryView(const SegmentSummary* summary, std::string* reason = nullptr)
-      : summary(summary), reason(reason) {}
+  explicit SummaryView(const SegmentSummary* summary, std::string* reason = nullptr,
+                       const IndexReader::Segment* segment = nullptr)
+      : summary(summary), reason(reason), segment(segment) {}
 
   // Every field of the segment has a record: absence of a record is a proof.
   bool complete() const noexcept { return summary != nullptr && summary->complete(); }
@@ -35,6 +38,12 @@ public:
   // The field's record, when the summary has one; null is not a proof.
   const api::FieldSummary* record(std::string_view physicalField) const noexcept {
     return summary != nullptr ? summary->field(physicalField) : nullptr;
+  }
+
+  // Whether one of the segment's overlays proves `term` absent from `field`.
+  bool membershipExcludes(std::string_view field, std::string_view term) const noexcept {
+    if (segment == nullptr || !segment->hasTermMembership()) return false;
+    return segment->membershipProvesAbsent(field, term, reason);
   }
 
   // Records why a leaf proved the segment empty; the first reason wins.

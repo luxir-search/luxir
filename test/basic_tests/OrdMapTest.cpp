@@ -75,7 +75,7 @@ TEST_F(OrdMapTest, EmptyIndex) {
 
 TEST_F(OrdMapTest, concurrentBuildAndCoreGenerationSharing) {
   auto writer = helper->getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   helper->index({{"field1_s", "apple"}, {"id", "1"}}, UpdateMessage::NO_COMMIT);
   helper->index({{"field1_s", "apple"}, {"id", "keep"}}, UpdateMessage::COMMIT);
   helper->index({{"field1_s", "banana"}, {"id", "2"}}, UpdateMessage::COMMIT);
