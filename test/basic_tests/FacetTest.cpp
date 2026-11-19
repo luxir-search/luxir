@@ -295,56 +295,61 @@ TEST_F(FacetTest, stringReplayCounterBanksMatchAcrossRepresentations) {
 }
 
 TEST_F(FacetTest, stringFacetCountPlanSelectsAndForcesLegalOffers) {
-  StrFacetCountInputs in{
+  FieldFacetCountInputs in{
       .maxDoc = 1000,
       .domainCardinality = 1000,
       .complementCardinality = 0,
       .segmentTerms = 10,
       .sumDocFreq = 1000,
       .docsWithField = 1000,
-      .limit = 3,
-      .topTermsAvailable = 10,
       .domainHasBitset = false,
       .missingRequested = false,
-      .allowTopTerms = true,
-      .hasGlobalOrdMap = true,
-      .readerHasNoDeletes = true
+      .topTermsLegal = true,
+      .columnWork = 1000,
+      .walkTermCost = 1,
+      .complementTermCost = 2.25,
+      .complementValueWork = 0,
+      .complementSetupWork = 0
   };
 
-  EXPECT_EQ(StrFacetCountKind::TOP_TERMS,
-            StrFacetCountPlan::select(in, StrFacetStrategy::AUTO).strategy);
-  EXPECT_EQ(StrFacetCountKind::TOP_TERMS,
-            StrFacetCountPlan::select(
-                in, StrFacetStrategy::TOP_TERMS).strategy);
-  EXPECT_EQ(StrFacetCountKind::COLUMN_DOMAIN,
-            StrFacetCountPlan::select(
-                in, StrFacetStrategy::COLUMN_DOMAIN).strategy);
+  EXPECT_EQ(FieldFacetCountKind::TOP_TERMS,
+            FieldFacetCountPlan::select(in, FieldFacetStrategy::AUTO).strategy);
+  EXPECT_EQ(FieldFacetCountKind::TOP_TERMS,
+            FieldFacetCountPlan::select(
+                in, FieldFacetStrategy::TOP_TERMS).strategy);
+  EXPECT_EQ(FieldFacetCountKind::COLUMN_DOMAIN,
+            FieldFacetCountPlan::select(
+                in, FieldFacetStrategy::COLUMN_DOMAIN).strategy);
 
-  in.allowTopTerms = false;
+  in.topTermsLegal = false;
   auto topFallback =
-      StrFacetCountPlan::select(in, StrFacetStrategy::TOP_TERMS);
-  EXPECT_EQ(StrFacetCountKind::COLUMN_DOMAIN, topFallback.strategy);
+      FieldFacetCountPlan::select(in, FieldFacetStrategy::TOP_TERMS);
+  EXPECT_EQ(FieldFacetCountKind::COLUMN_DOMAIN, topFallback.strategy);
   EXPECT_FALSE(topFallback.forcedFallback.empty());
-  EXPECT_EQ(StrFacetCountKind::COLUMN_COMPLEMENT,
-            StrFacetCountPlan::select(in, StrFacetStrategy::AUTO).strategy);
+  EXPECT_EQ(FieldFacetCountKind::COLUMN_COMPLEMENT,
+            FieldFacetCountPlan::select(in, FieldFacetStrategy::AUTO).strategy);
 
   in.domainCardinality = 990;
   in.complementCardinality = 10;
+  in.columnWork = 990;
+  in.complementValueWork = 10;
   in.domainHasBitset = true;
-  EXPECT_EQ(StrFacetCountKind::COLUMN_COMPLEMENT,
-            StrFacetCountPlan::select(in, StrFacetStrategy::AUTO).strategy);
+  EXPECT_EQ(FieldFacetCountKind::COLUMN_COMPLEMENT,
+            FieldFacetCountPlan::select(in, FieldFacetStrategy::AUTO).strategy);
 
   in.domainCardinality = 500;
   in.complementCardinality = 500;
+  in.columnWork = 500;
+  in.complementValueWork = 500;
   in.segmentTerms = 1;
   in.sumDocFreq = 1;
-  EXPECT_EQ(StrFacetCountKind::TERM_DRIVEN,
-            StrFacetCountPlan::select(in, StrFacetStrategy::AUTO).strategy);
+  EXPECT_EQ(FieldFacetCountKind::TERM_DRIVEN,
+            FieldFacetCountPlan::select(in, FieldFacetStrategy::AUTO).strategy);
 
   in.segmentTerms = 0;
   auto complementFallback =
-      StrFacetCountPlan::select(in, StrFacetStrategy::COLUMN_COMPLEMENT);
-  EXPECT_EQ(StrFacetCountKind::COLUMN_DOMAIN, complementFallback.strategy);
+      FieldFacetCountPlan::select(in, FieldFacetStrategy::COLUMN_COMPLEMENT);
+  EXPECT_EQ(FieldFacetCountKind::COLUMN_DOMAIN, complementFallback.strategy);
   EXPECT_FALSE(complementFallback.forcedFallback.empty());
 }
 
@@ -515,7 +520,7 @@ TEST_F(FacetTest, stringFacetCountsMatchValuesAcrossRemappedSegments) {
     }
   }
 
-  SearchOverridesGuard guard(forcedFacetCounterMode, forcedStrFacetStrategy,
+  SearchOverridesGuard guard(forcedFacetCounterMode, forcedFieldFacetStrategy,
                              forcedFacetSubOpInline);
   auto run = [&](size_t f, size_t d, bool inlineAll) {
     auto req = localReq(luxirNode->getSearchEngine());
@@ -551,10 +556,10 @@ TEST_F(FacetTest, stringFacetCountsMatchValuesAcrossRemappedSegments) {
             << fields[f] << " domain=" << domains[d] << " " << what;
       };
       forcedFacetSubOpInline = FacetSubOpInlineMode::AUTO;
-      for (auto strategy : {StrFacetStrategy::AUTO,
-                            StrFacetStrategy::COLUMN_DOMAIN,
-                            StrFacetStrategy::COLUMN_COMPLEMENT,
-                            StrFacetStrategy::TERM_DRIVEN}) {
+      for (auto strategy : {FieldFacetStrategy::AUTO,
+                            FieldFacetStrategy::COLUMN_DOMAIN,
+                            FieldFacetStrategy::COLUMN_COMPLEMENT,
+                            FieldFacetStrategy::TERM_DRIVEN}) {
         for (auto mode : {FacetCounterMode::AUTO, FacetCounterMode::SPAN_GLOBAL,
                           FacetCounterMode::SPAN_LOCAL,
                           FacetCounterMode::FORCE_VECTOR,
@@ -562,13 +567,13 @@ TEST_F(FacetTest, stringFacetCountsMatchValuesAcrossRemappedSegments) {
                           FacetCounterMode::FORCE_HASH,
                           FacetCounterMode::SKINNY_GLOBAL,
                           FacetCounterMode::SKINNY_LOCAL}) {
-          forcedStrFacetStrategy = strategy;
+          forcedFieldFacetStrategy = strategy;
           forcedFacetCounterMode = mode;
           check(run(f, d, false),
                 std::format("strategy={} mode={}", (int)strategy, (int)mode));
         }
       }
-      forcedStrFacetStrategy = StrFacetStrategy::AUTO;
+      forcedFieldFacetStrategy = FieldFacetStrategy::AUTO;
       forcedFacetCounterMode = FacetCounterMode::AUTO;
       forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
       check(run(f, d, true), "inline");
@@ -601,9 +606,9 @@ TEST_F(FacetTest, stringFacetStrategiesMatchAcrossDomainSeams) {
   ASSERT_TRUE(helper.deleteById("deleted", UpdateMessage::COMMIT).success);
   ASSERT_EQ(3u, helper.durableSegmentCount());
 
-  SearchOverridesGuard guard(forcedStrFacetStrategy);
-  auto run = [&](StrFacetStrategy strategy, int domainKind) {
-    forcedStrFacetStrategy = strategy;
+  SearchOverridesGuard guard(forcedFieldFacetStrategy);
+  auto run = [&](FieldFacetStrategy strategy, int domainKind) {
+    forcedFieldFacetStrategy = strategy;
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
 
@@ -644,10 +649,10 @@ TEST_F(FacetTest, stringFacetStrategiesMatchAcrossDomainSeams) {
   };
 
   for (int domainKind : {0, 1, 2}) {
-    auto expected = run(StrFacetStrategy::COLUMN_DOMAIN, domainKind);
-    EXPECT_EQ(expected, run(StrFacetStrategy::COLUMN_COMPLEMENT, domainKind));
-    EXPECT_EQ(expected, run(StrFacetStrategy::TERM_DRIVEN, domainKind));
-    EXPECT_EQ(expected, run(StrFacetStrategy::AUTO, domainKind));
+    auto expected = run(FieldFacetStrategy::COLUMN_DOMAIN, domainKind);
+    EXPECT_EQ(expected, run(FieldFacetStrategy::COLUMN_COMPLEMENT, domainKind));
+    EXPECT_EQ(expected, run(FieldFacetStrategy::TERM_DRIVEN, domainKind));
+    EXPECT_EQ(expected, run(FieldFacetStrategy::AUTO, domainKind));
   }
 }
 
@@ -656,9 +661,9 @@ namespace {
 // Buckets of a facet computed under a forced strategy, over the domain
 // selected by sel_s=yes.
 std::map<std::string, int64_t> filteredFacetBuckets(
-    CollectionHelper& helper, StrFacetStrategy strategy,
+    CollectionHelper& helper, FieldFacetStrategy strategy,
     std::string_view field) {
-  forcedStrFacetStrategy = strategy;
+  forcedFieldFacetStrategy = strategy;
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
   auto& top = req->topDocs("q");
@@ -714,14 +719,14 @@ TEST_F(FacetTest, complementStagingWrapBoundaries) {
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   ASSERT_EQ(1u, helper.durableSegmentCount());
 
-  SearchOverridesGuard guard(forcedStrFacetStrategy);
+  SearchOverridesGuard guard(forcedFieldFacetStrategy);
   auto complement = filteredFacetBuckets(
-      helper, StrFacetStrategy::COLUMN_COMPLEMENT, "w_s");
+      helper, FieldFacetStrategy::COLUMN_COMPLEMENT, "w_s");
   for (int32_t k : {255, 256, 511, 512}) {
     EXPECT_EQ(2, complement["t" + std::to_string(k)]) << "hits=" << k;
   }
   EXPECT_EQ(filteredFacetBuckets(
-                helper, StrFacetStrategy::COLUMN_DOMAIN, "w_s"),
+                helper, FieldFacetStrategy::COLUMN_DOMAIN, "w_s"),
             complement);
 }
 
@@ -740,14 +745,14 @@ TEST_F(FacetTest, complementHashedStagingParity) {
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   ASSERT_EQ(1u, helper.durableSegmentCount());
 
-  SearchOverridesGuard guard(forcedStrFacetStrategy);
+  SearchOverridesGuard guard(forcedFieldFacetStrategy);
   auto complement = filteredFacetBuckets(
-      helper, StrFacetStrategy::COLUMN_COMPLEMENT, "w_s");
+      helper, FieldFacetStrategy::COLUMN_COMPLEMENT, "w_s");
   EXPECT_EQ(93u, complement.size());
   EXPECT_EQ(0u, complement.count("h0"));
   EXPECT_EQ(1, complement["h3"]);
   EXPECT_EQ(filteredFacetBuckets(
-                helper, StrFacetStrategy::COLUMN_DOMAIN, "w_s"),
+                helper, FieldFacetStrategy::COLUMN_DOMAIN, "w_s"),
             complement);
 }
 
@@ -774,13 +779,13 @@ TEST_F(FacetTest, remappedOrdFrameBoundary) {
   }, UpdateMessage::COMMIT).success);
   ASSERT_EQ(2u, helper.durableSegmentCount());
 
-  SearchOverridesGuard guard(forcedStrFacetStrategy);
+  SearchOverridesGuard guard(forcedFieldFacetStrategy);
   auto expected = filteredFacetBuckets(
-      helper, StrFacetStrategy::COLUMN_DOMAIN, "f_s");
+      helper, FieldFacetStrategy::COLUMN_DOMAIN, "f_s");
   EXPECT_EQ(expected, filteredFacetBuckets(
-                helper, StrFacetStrategy::COLUMN_COMPLEMENT, "f_s"));
+                helper, FieldFacetStrategy::COLUMN_COMPLEMENT, "f_s"));
   EXPECT_EQ(expected, filteredFacetBuckets(
-                helper, StrFacetStrategy::TERM_DRIVEN, "f_s"));
+                helper, FieldFacetStrategy::TERM_DRIVEN, "f_s"));
   // Frame slots on both sides of the 128 boundary: odd ords are in the
   // domain, even ords only in the complement.
   EXPECT_EQ(1, expected["m127"]);
@@ -806,10 +811,10 @@ TEST_F(FacetTest, stringFacetTopTermsMatchesForcedStrategies) {
   }, UpdateMessage::COMMIT).success);
   ASSERT_EQ(3u, helper.durableSegmentCount());
 
-  SearchOverridesGuard guard(forcedStrFacetStrategy);
-  auto run = [&](StrFacetStrategy strategy, std::string_view field,
+  SearchOverridesGuard guard(forcedFieldFacetStrategy);
+  auto run = [&](FieldFacetStrategy strategy, std::string_view field,
                  int64_t limit, int64_t mincount, bool missing) {
-    forcedStrFacetStrategy = strategy;
+    forcedFieldFacetStrategy = strategy;
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& facet = req->facet("f", field).limit(limit).mincount(mincount);
@@ -821,11 +826,11 @@ TEST_F(FacetTest, stringFacetTopTermsMatchesForcedStrategies) {
   auto expectMatches = [&](std::string_view field, int64_t limit,
                            int64_t mincount, bool missing) {
     auto expected = run(
-        StrFacetStrategy::COLUMN_DOMAIN, field, limit, mincount, missing);
+        FieldFacetStrategy::COLUMN_DOMAIN, field, limit, mincount, missing);
     EXPECT_EQ(expected, run(
-        StrFacetStrategy::COLUMN_COMPLEMENT, field, limit, mincount, missing));
+        FieldFacetStrategy::COLUMN_COMPLEMENT, field, limit, mincount, missing));
     EXPECT_EQ(expected, run(
-        StrFacetStrategy::AUTO, field, limit, mincount, missing));
+        FieldFacetStrategy::AUTO, field, limit, mincount, missing));
   };
 
   expectMatches("cat_s", 3, 1, false);
@@ -834,8 +839,8 @@ TEST_F(FacetTest, stringFacetTopTermsMatchesForcedStrategies) {
   expectMatches("few_s", 10, 0, true);
   expectMatches("cat_s", -1, 0, true);
 
-  auto runMixedDomain = [&](StrFacetStrategy strategy) {
-    forcedStrFacetStrategy = strategy;
+  auto runMixedDomain = [&](FieldFacetStrategy strategy) {
+    forcedFieldFacetStrategy = strategy;
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& docs = req->topDocs("q");
@@ -849,8 +854,8 @@ TEST_F(FacetTest, stringFacetTopTermsMatchesForcedStrategies) {
     EXPECT_TRUE(api::encode(*result, encoded));
     return encoded;
   };
-  EXPECT_EQ(runMixedDomain(StrFacetStrategy::COLUMN_DOMAIN),
-            runMixedDomain(StrFacetStrategy::AUTO));
+  EXPECT_EQ(runMixedDomain(FieldFacetStrategy::COLUMN_DOMAIN),
+            runMixedDomain(FieldFacetStrategy::AUTO));
 
   ASSERT_TRUE(helper.deleteById("a1", UpdateMessage::COMMIT).success);
   expectMatches("cat_s", 3, 0, true);
@@ -4780,11 +4785,11 @@ TEST_F(FacetTest, forcedTopTermsAndBucketDomainFeedMatchColumnPlan) {
       flatdoc("id", "6", "cat_s", "c", "sub_s", "x", "metric_i", 60),
   }, UpdateMessage::COMMIT).success);
 
-  SearchOverridesGuard guard(forcedStrFacetStrategy,
+  SearchOverridesGuard guard(forcedFieldFacetStrategy,
                              forcedFacetFeedStrategy);
-  auto run = [&](StrFacetStrategy countStrategy,
+  auto run = [&](FieldFacetStrategy countStrategy,
                  FacetFeedStrategy feedStrategy) {
-    forcedStrFacetStrategy = countStrategy;
+    forcedFieldFacetStrategy = countStrategy;
     forcedFacetFeedStrategy = feedStrategy;
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
@@ -4797,14 +4802,14 @@ TEST_F(FacetTest, forcedTopTermsAndBucketDomainFeedMatchColumnPlan) {
   };
 
   auto expected = run(
-      StrFacetStrategy::COLUMN_DOMAIN, FacetFeedStrategy::AUTO);
+      FieldFacetStrategy::COLUMN_DOMAIN, FacetFeedStrategy::AUTO);
   EXPECT_EQ(expected, run(
-      StrFacetStrategy::TOP_TERMS, FacetFeedStrategy::AUTO));
+      FieldFacetStrategy::TOP_TERMS, FacetFeedStrategy::AUTO));
   EXPECT_EQ(expected, run(
-      StrFacetStrategy::COLUMN_DOMAIN,
+      FieldFacetStrategy::COLUMN_DOMAIN,
       FacetFeedStrategy::BUCKET_DOMAINS));
   EXPECT_EQ(expected, run(
-      StrFacetStrategy::COLUMN_DOMAIN,
+      FieldFacetStrategy::COLUMN_DOMAIN,
       FacetFeedStrategy::STRING_COLUMN_REPLAY));
 }
 
@@ -5988,14 +5993,14 @@ TEST_F(RandomFacetTest, randomFaceting) {
   // requests, each issuing several queries x a facet per field (many facet
   // computations, the same field faceted under multiple domains). Indexes and
   // requests are independent work dimensions, so scale each by sqrt(effort).
-  SearchOverridesGuard guard(forcedStrFacetStrategy);
-  for (StrFacetStrategy strategy : {
-      StrFacetStrategy::AUTO,
-      StrFacetStrategy::TOP_TERMS,
-      StrFacetStrategy::COLUMN_DOMAIN,
-      StrFacetStrategy::COLUMN_COMPLEMENT,
-      StrFacetStrategy::TERM_DRIVEN}) {
-    forcedStrFacetStrategy = strategy;
+  SearchOverridesGuard guard(forcedFieldFacetStrategy);
+  for (FieldFacetStrategy strategy : {
+      FieldFacetStrategy::AUTO,
+      FieldFacetStrategy::TOP_TERMS,
+      FieldFacetStrategy::COLUMN_DOMAIN,
+      FieldFacetStrategy::COLUMN_COMPLEMENT,
+      FieldFacetStrategy::TERM_DRIVEN}) {
+    forcedFieldFacetStrategy = strategy;
     runRandomTest(
         (int)scaleTestDimension(2, 2),
         (int)scaleTestDimension(100, 2));
@@ -6119,8 +6124,8 @@ TEST_F(FacetTest, unusedAnySelectionRefinerIsNotPlanned) {
 }
 
 TEST_F(FacetTest, selectedFieldPinsAppendAfterNaturalPage) {
-  SearchOverridesGuard strategyGuard(forcedStrFacetStrategy);
-  forcedStrFacetStrategy = StrFacetStrategy::TOP_TERMS;
+  SearchOverridesGuard strategyGuard(forcedFieldFacetStrategy);
+  forcedFieldFacetStrategy = FieldFacetStrategy::TOP_TERMS;
 
   CollectionHelper helper;
   helper.indexAll(std::array{
@@ -7985,7 +7990,7 @@ TEST_F(FacetTest, indexedStringArrayBucketsCountDocumentsAcrossPlans) {
         i % 2 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT).success);
   }
   ASSERT_TRUE(helper.deleteById("5", UpdateMessage::COMMIT).success);
-  SearchOverridesGuard guard(forcedStrFacetStrategy, forcedFacetSubOpInline, forcedFacetFeedStrategy);
+  SearchOverridesGuard guard(forcedFieldFacetStrategy, forcedFacetSubOpInline, forcedFacetFeedStrategy);
   // Compare complete responses below, using the same operation names in each.
   auto result = [&](bool array, bool metrics, bool nested, bool filtered, bool parallel) {
     auto req = localReq(helper.getSearchEngine());
@@ -8003,12 +8008,12 @@ TEST_F(FacetTest, indexedStringArrayBucketsCountDocumentsAcrossPlans) {
   for (int merge = 0; merge < 2; merge++) {
     for (bool parallel : {false, true}) for (bool filtered : {false, true}) {
       forcedFacetSubOpInline = FacetSubOpInlineMode::AUTO;
-      for (auto strategy : {StrFacetStrategy::COLUMN_DOMAIN, StrFacetStrategy::COLUMN_COMPLEMENT,
-                            StrFacetStrategy::TERM_DRIVEN, StrFacetStrategy::TOP_TERMS}) {
-        forcedStrFacetStrategy = strategy;
+      for (auto strategy : {FieldFacetStrategy::COLUMN_DOMAIN, FieldFacetStrategy::COLUMN_COMPLEMENT,
+                            FieldFacetStrategy::TERM_DRIVEN, FieldFacetStrategy::TOP_TERMS}) {
+        forcedFieldFacetStrategy = strategy;
         EXPECT_EQ(result(false, false, false, filtered, parallel), result(true, false, false, filtered, parallel));
       }
-      forcedStrFacetStrategy = StrFacetStrategy::COLUMN_DOMAIN;
+      forcedFieldFacetStrategy = FieldFacetStrategy::COLUMN_DOMAIN;
       forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
       EXPECT_EQ(result(false, true, false, filtered, parallel), result(true, true, false, filtered, parallel));
       forcedFacetSubOpInline = FacetSubOpInlineMode::AUTO;

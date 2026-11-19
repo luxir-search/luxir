@@ -213,7 +213,7 @@ enum class FacetCounterMode {
 
 // How a field facet counts a segment (LUXIR_FACET_STRATEGY): string facets,
 // and numeric facets whose segment has a term dictionary (index: match).
-enum class StrFacetStrategy {
+enum class FieldFacetStrategy {
   AUTO, TOP_TERMS, COLUMN_DOMAIN, COLUMN_COMPLEMENT, TERM_DRIVEN
 };
 
@@ -269,24 +269,24 @@ enum class StrFacetReplayBankStrategy {
   AUTO, VECTOR, SKINNY, PACKED_HASH, WIDE_HASH
 };
 
-inline StrFacetStrategy parseStrFacetStrategyEnv() {
+inline FieldFacetStrategy parseFieldFacetStrategyEnv() {
   const char* e = std::getenv("LUXIR_FACET_STRATEGY");
   if (e != nullptr) {
     std::string_view s(e);
     if (s == "top_terms") {
-      return StrFacetStrategy::TOP_TERMS;
+      return FieldFacetStrategy::TOP_TERMS;
     }
     if (s == "column") {
-      return StrFacetStrategy::COLUMN_DOMAIN;
+      return FieldFacetStrategy::COLUMN_DOMAIN;
     }
     if (s == "complement") {
-      return StrFacetStrategy::COLUMN_COMPLEMENT;
+      return FieldFacetStrategy::COLUMN_COMPLEMENT;
     }
     if (s == "term") {
-      return StrFacetStrategy::TERM_DRIVEN;
+      return FieldFacetStrategy::TERM_DRIVEN;
     }
   }
-  return StrFacetStrategy::AUTO;
+  return FieldFacetStrategy::AUTO;
 }
 
 inline FacetFeedStrategy parseFacetFeedStrategyEnv() {
@@ -397,7 +397,7 @@ inline FacetCounterMode parseFacetCounterModeEnv() {
 }
 
 inline FacetCounterMode forcedFacetCounterMode = parseFacetCounterModeEnv();
-inline StrFacetStrategy forcedStrFacetStrategy = parseStrFacetStrategyEnv();
+inline FieldFacetStrategy forcedFieldFacetStrategy = parseFieldFacetStrategyEnv();
 inline FacetFeedStrategy forcedFacetFeedStrategy = parseFacetFeedStrategyEnv();
 inline FacetBucketDomainSource forcedFacetBucketDomainSource =
     parseFacetBucketDomainSourceEnv();
