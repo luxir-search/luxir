@@ -422,7 +422,13 @@ void SearchEngine::getResources(SearchRequest& req) {
     constexpr uint64_t maxUs = std::numeric_limits<uint64_t>::max();
     uint64_t freshnessUs = request.freshness_ms > maxUs / 1000
         ? maxUs : request.freshness_ms * 1000;
-    req.reader = collection->getReaderManager().getReader(freshnessUs);
+    // A search with a deadline does not wait out a reopen past it: it searches
+    // the published reader. The wait ends at the request's fetch deadline, a
+    // margin before the transport's, so a fallback search or a reader_opening
+    // error still reaches the client. One that names a min_commit needs the
+    // reopen and waits for it, as its floor check below requires.
+    auto deadline = request.min_commit.empty() ? req.io.fetchDeadline() : std::chrono::steady_clock::time_point::max();
+    req.reader = collection->getReaderManager().getReader(freshnessUs, deadline);
     if (!request.min_commit.empty()) {
       auto floor = CommitId::parse(request.min_commit);
       if (req.reader->incarnation() != floor.incarnation || req.reader->commitId() < floor.index_gen)
