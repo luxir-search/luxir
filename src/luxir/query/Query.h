@@ -1816,6 +1816,9 @@ public:
       return (traits & PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN) != 0;
     }
 
+    // Metadata can rule out native exact ranking; a supplier must still certify it.
+    virtual bool mayRankScoresExactly(IndexReader::Segment& segment) { return true; }
+
     bool canComposeExactCountTopK() const noexcept {
       return (traits & CAN_COMPOSE_EXACT_COUNT_TOPK) != 0;
     }

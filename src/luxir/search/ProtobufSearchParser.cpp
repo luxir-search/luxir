@@ -2216,17 +2216,33 @@ public:
     }
     Query::Weight* countWeight = nullptr;
     Query::Weight* rankingWeight = nullptr;
-    bool forceComposition = TopDocsReq::forceExactCountTopKCompositionForTests
-        && exactCountTopK && weight != nullptr && !weight->canComposeExactCountTopK();
-    bool forcedComposition = forceComposition
-        && topCount <= TopDocsReq::kExactCountTopKMaxDepth
-        && !weight->needsPrepare() && !weight->consumesDomain()
-        && !weight->isConstantScoring();
+    bool newComposition = exactCountTopK && weight != nullptr && !weight->canComposeExactCountTopK();
+    bool legalComposition = newComposition && topCount <= TopDocsReq::kExactCountTopKMaxDepth
+        && !weight->needsPrepare() && !weight->consumesDomain() && !weight->isConstantScoring();
+    bool forceComposition = TopDocsReq::forceExactCountTopKCompositionForTests && newComposition;
+    bool forcedComposition = forceComposition && legalComposition;
     if (forceComposition && !forcedComposition) skipCount(SkipStats::forcedExactCountTopKCapabilityRejects);
+    std::span<uint8_t> provedSegments;
+    if (legalComposition && !forcedComposition && !disableTopKCountComposition
+        && (foldFilters || filters.empty())
+        && !cacheFirstTopKCount && !TopDocsReq::disableProvedDensityCompositionForTests) {
+      for (auto& segment : view()->segments()) {
+        auto bounds = weight->countShortcut(segment, nullptr);
+        int32_t inverse = TopDocsReq::provedDensityCompositionInverseForTests;
+        if (inverse <= 0 || bounds.minimum() <= 0
+            || bounds.minimum() * inverse < segment.maxDoc()
+            || !weight->mayRankScoresExactly(segment)) continue;
+        if (provedSegments.empty()) {
+          provedSegments = qcontext->pool.make_span<uint8_t>(view()->segments().size());
+          std::fill(provedSegments.begin(), provedSegments.end(), 0);
+        }
+        provedSegments[(size_t)segment.ord] = 1;
+      }
+    }
     if (weight != nullptr && !cacheFirstTopKCount
         && !disableTopKCountComposition && exactCountTopK
         && !weight->needsPrepare()
-        && (weight->canComposeExactCountTopK() || forcedComposition)
+        && (weight->canComposeExactCountTopK() || forcedComposition || !provedSegments.empty())
         // A constant-score ranking pass is bounded only when no collector
         // filter can reject its first K matches. Variable-score composition
         // retains its existing filtered candidate route.
@@ -2419,6 +2435,7 @@ public:
     qr->collapse = collapse;
     qr->diversify = diversify;
     qr->forcedExactCountTopKComposition = forcedComposition && countWeight != nullptr;
+    qr->provedDensitySegments = provedSegments;
     qr->boundedCount = boundedCount && wholeMembershipWeight == nullptr
         && wholeMembershipUse == nullptr;
     if (qr->boundedCount && filterWeights.empty()) {

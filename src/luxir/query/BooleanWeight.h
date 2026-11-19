@@ -13119,6 +13119,25 @@ public:
     return false;
   }
 
+  bool mayRankScoresExactly(IndexReader::Segment& segment) override {
+    if (isConstantScoring()) return true;
+    if (scorePolicy.kind != ScorePolicy::SUM) return false;
+    if (mandatoryWeights.empty() && filterWeights.empty()) {
+      int nonempty = 0;
+      for (auto* child : optionalWeights) {
+        if (child->countShortcut(segment, nullptr).minimum() > 0 && ++nonempty >= 2) return false;
+      }
+    }
+    for (size_t i = 0; i < mandatoryWeights.size(); i++) {
+      if (mandatoryScores[i] && !mandatoryWeights[i]->mayRankScoresExactly(segment)) return false;
+    }
+    for (auto* child : optionalWeights) {
+      if (child->countShortcut(segment, nullptr).minimum() > 0
+          && !child->mayRankScoresExactly(segment)) return false;
+    }
+    return true;
+  }
+
   // A lone required clause determines membership when optionals only score.
   // Required ceilings intersect; their floors use inclusion-exclusion.
   // Optional membership keeps its largest floor, and exclusions subtract ceilings.

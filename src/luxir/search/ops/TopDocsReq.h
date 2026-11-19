@@ -77,6 +77,8 @@ public:
       kExactCountTopKMinCandidateDensityInverse;
   static inline int32_t localWholeMembershipMaxCandidatesPerMatchForTests = 8;
   static inline bool forceExactCountTopKCompositionForTests = false;
+  static inline bool disableProvedDensityCompositionForTests = false;
+  static inline int32_t provedDensityCompositionInverseForTests = 8;
   // A sparse filter that is cheaper than its union body makes the exhaustive
   // scored batch the natural single pass. Keep this knee separate from the
   // batch admission constant even though both measured at /44.
@@ -610,6 +612,7 @@ public:
   Query::Weight* countWeight;
   Query::Weight* rankingWeight;
   bool forcedExactCountTopKComposition = false;
+  std::span<const uint8_t> provedDensitySegments;
   Query::Weight* wholeRankingWeight;
   bool wholeConstantRanking;
   Query::ScoreProfile scoreProfile;
@@ -1225,18 +1228,23 @@ public:
     bool composeVariableScoreExactCountTopK(
         MemPool& pool, int32_t segnum,
         Query::ScorerSupplier& scoringSupplier,
-        Query::ScorerSupplier& countSupplier, DocSet* collectorFilter,
-        auto& collector, int32_t maxDoc) {
+        auto&& countSupplierFor, DocSet* collectorFilter,
+        auto& collector, int32_t maxDoc, bool nativeScores) {
       Query::ScorerSupplier::BulkScorerContext bulkContext;
-      bulkContext.requireExactRankingScores = thisOp().forcedExactCountTopKComposition;
+      bulkContext.requireExactRankingScores = nativeScores;
       auto scoringPlan = scoringSupplier.planBulk(
           Query::ScorerSupplier::BulkUse::EXACT_CANDIDATE_SCORING,
           bulkContext);
       if (bulkContext.requireExactRankingScores
           && scoringPlan.rankingScoresExact != Query::ScorerSupplier::BulkAnswer::YES) {
-        skipCount(SkipStats::forcedExactCountTopKCertificateRejects);
+        skipCount(thisOp().forcedExactCountTopKComposition
+            ? SkipStats::forcedExactCountTopKCertificateRejects
+            : SkipStats::provedDensityCompositionCertificateRejects);
         return false;
       }
+      auto* countSource = countSupplierFor();
+      if (countSource == nullptr) return false;
+      auto& countSupplier = *countSource;
       bool scoringDeclined =
           scoringPlan.available
               != Query::ScorerSupplier::BulkAnswer::YES
@@ -2600,22 +2608,34 @@ public:
                   && scoreCollector->topCount > 0
                   && op.countWeight != nullptr && op.rankingWeight != nullptr) {
                 bool forced = op.forcedExactCountTopKComposition;
+                bool proved = !op.provedDensitySegments.empty()
+                    && op.provedDensitySegments[(size_t)segnum];
+                bool native = forced || proved;
                 bool canonical = domain == nullptr || domain == seg.liveDocSet();
                 if (forced && !canonical) skipCount(SkipStats::forcedExactCountTopKCapabilityRejects);
-                auto* countSupplier = forced && !canonical ? nullptr
-                    : op.countWeight->scorerSupplier(poolGuard.pool(), seg);
-                if (countSupplier != nullptr
-                    && (forced || admitExactCountTopK(
-                        *countSupplier, collectorFilter, seg.maxDoc()))) {
+                Query::ScorerSupplier* countSupplier = nullptr;
+                auto obtainCountSupplier = [&]() {
+                  if (countSupplier == nullptr) {
+                    skipCount(SkipStats::exactCountTopKCountSuppliers);
+                    countSupplier = op.countWeight->scorerSupplier(poolGuard.pool(), seg);
+                  }
+                  return countSupplier;
+                };
+                if ((native && canonical)
+                    || (!native && op.provedDensitySegments.empty()
+                        && obtainCountSupplier() != nullptr
+                        && admitExactCountTopK(*countSupplier, collectorFilter, seg.maxDoc()))) {
                   switch (exactCountTopKRoute) {
                     case ExactCountTopKRoute::EXACT_CANDIDATE_SCORING:
                       composedExactCountTopK =
                           composeVariableScoreExactCountTopK(
                               poolGuard.pool(), segnum, *supplier,
-                              *countSupplier, collectorFilter,
-                              *scoreCollector, seg.maxDoc());
+                              obtainCountSupplier, collectorFilter,
+                              *scoreCollector, seg.maxDoc(), native);
                       break;
                     case ExactCountTopKRoute::CONSTANT_FIRST_K:
+                      // Native-score composition is never constant scoring.
+                      assert(countSupplier != nullptr);
                       composedExactCountTopK = countThenCollectConstantTopK(
                           poolGuard.pool(), segnum, *countSupplier,
                           collectorFilter, *scoreCollector,
@@ -2623,6 +2643,7 @@ public:
                       break;
                   }
                   if (forced && composedExactCountTopK) skipCount(SkipStats::forcedExactCountTopKCompositions);
+                  if (proved && composedExactCountTopK) skipCount(SkipStats::provedDensityCompositions);
                   skipCount(composedExactCountTopK
                       ? SkipStats::exactCountTopKCompositions
                       : SkipStats::exactCountTopKBulkFallbacks);

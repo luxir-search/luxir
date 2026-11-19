@@ -7832,6 +7832,8 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
 }
 
 TEST_F(SearchEngineTest, forcedCountCompositionKeepsCanonicalScores) {
+  SearchOverridesGuard defaultPlan(TopDocsReq::disableProvedDensityCompositionForTests);
+  TopDocsReq::disableProvedDensityCompositionForTests = true;
   CollectionHelper helper("forced_count_composition");
   for (int segment = 0; segment < 2; segment++) {
     std::vector<Doc> docs;
@@ -8015,4 +8017,106 @@ TEST_F(SearchEngineTest, forcedCompositionYieldsToWholeMembershipOutcomes) {
   EXPECT_EQ(1, local.localCounts);
   EXPECT_EQ(0, local.compositions);
 
+}
+
+TEST_F(SearchEngineTest, provedDensitySelectsSegmentsBeforeConstructingCompanions) {
+  CollectionHelper helper("proved_density");
+  for (int segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    for (int doc = 0; doc < 64; doc++) {
+      std::string body = "pad";
+      if (doc < 48 - segment) body += " wide";
+      if (doc < 40) body += " excluded";
+      if (doc < 32) body += " a";
+      if (doc >= 24 + segment) body += " b";
+      if (doc % 2) body += " c";
+      if (doc % 5 == 0) body += " helen";
+      if (doc % 7 == 0) body += " ambassador";
+      if (doc % 3 == 0) body += " troy";
+      if (doc % 4 == 0) body += " italy";
+      docs.push_back(flatdoc("id", std::to_string(segment) + "_" + std::to_string(doc), "body_w", body));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  reader->filterCache()->resize(0);
+  WholeMembershipPlanGuard whole(true);
+  SearchOverridesGuard switches(TopDocsReq::disableProvedDensityCompositionForTests,
+      TopDocsReq::forceExactCountTopKCompositionForTests, TopDocsReq::provedDensityCompositionInverseForTests);
+  TopDocsReq::provedDensityCompositionInverseForTests = 8;
+  TopDocsReq::forceExactCountTopKCompositionForTests = false;
+  auto make = [&](std::string_view query, bool filtered = false) {
+    auto req = localReq(helper.getSearchEngine());
+    req->schema = reader->schema(); req->reader = reader;
+    auto& top = req->topDocs("q").exprQuery(std::string("body_w:(") + std::string(query) + ")")
+        .countLimit().getScores().fields({"id"}).limit(10);
+    if (filtered) top.matchFilter("body_w", "c");
+    return req;
+  };
+  auto inspect = [&](std::string_view query, bool companions) {
+    auto req = make(query);
+    auto* root = ProtobufSearchParser(*req).parse();
+    auto* op = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
+    EXPECT_EQ(companions, op->countWeight != nullptr);
+    EXPECT_EQ(companions, op->rankingWeight != nullptr);
+    if (companions && !op->forcedExactCountTopKComposition) {
+      EXPECT_EQ(1, op->provedDensitySegments[0]);
+      EXPECT_EQ(0, op->provedDensitySegments[1]);
+    }
+  };
+  auto run = [&](std::string_view query, bool disabled, int proved, int forced, int suppliers) {
+    TopDocsReq::disableProvedDensityCompositionForTests = disabled;
+    auto req = make(query);
+    SkipStatsGuard stats;
+    req->execute(reader, false); EXPECT_OK(req);
+    EXPECT_EQ(proved, SkipStats::provedDensityCompositions);
+    EXPECT_EQ(forced, SkipStats::forcedExactCountTopKCompositions);
+    EXPECT_EQ(suppliers, SkipStats::exactCountTopKCountSuppliers);
+    return std::tuple{req->getMatchCount("q"), resultIds(*req, "q"), resultScoreMap(*req, "q")};
+  };
+  for (auto query : {"+wide -excluded", "+a +b c^2.3"}) {
+    SCOPED_TRACE(query);
+    TopDocsReq::disableProvedDensityCompositionForTests = false;
+    inspect(query, true);
+    auto base = run(query, true, 0, 0, 0);
+    auto selected = run(query, false, 1, 0, 1);
+    EXPECT_EQ(std::get<0>(base), std::get<0>(selected));
+    EXPECT_EQ(std::get<1>(base), std::get<1>(selected));
+    expectBitIdenticalScoreMap(std::get<2>(base), std::get<2>(selected));
+    TopDocsReq::forceExactCountTopKCompositionForTests = true;
+    auto forced = run(query, true, 0, 2, 2);
+    expectBitIdenticalScoreMap(std::get<2>(base), std::get<2>(forced));
+    EXPECT_EQ(std::get<1>(base), std::get<1>(forced));
+    EXPECT_EQ(std::get<0>(base), std::get<0>(forced));
+    TopDocsReq::forceExactCountTopKCompositionForTests = false;
+    inspect(query, false);
+    TopDocsReq::disableProvedDensityCompositionForTests = false;
+    TopDocsReq::provedDensityCompositionInverseForTests = 1;
+    inspect(query, false);
+    TopDocsReq::provedDensityCompositionInverseForTests = 8;
+  }
+  for (auto query : {"+(helen wide) troy", "+(ambassador wide) italy"}) {
+    SCOPED_TRACE(query);
+    inspect(query, false);
+    run(query, false, 0, 0, 0);
+    TopDocsReq::forceExactCountTopKCompositionForTests = true;
+    run(query, true, 0, 0, 0);
+    TopDocsReq::forceExactCountTopKCompositionForTests = false;
+    TopDocsReq::disableProvedDensityCompositionForTests = false;
+  }
+  {
+    SearchOverridesGuard fold(disableTopDocsFilterFold);
+    disableTopDocsFilterFold = true;
+    auto req = make("+wide -excluded", true);
+    auto* root = ProtobufSearchParser(*req).parse();
+    auto* op = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
+    EXPECT_EQ(nullptr, op->countWeight);
+    EXPECT_EQ(nullptr, op->rankingWeight);
+    EXPECT_TRUE(op->provedDensitySegments.empty());
+  }
+  auto refused = make("+wide \"wide excluded\"~2");
+  SkipStatsGuard stats;
+  refused->execute(reader, false); EXPECT_OK(refused);
+  EXPECT_EQ(2, SkipStats::provedDensityCompositionCertificateRejects);
+  EXPECT_EQ(0, SkipStats::exactCountTopKCountSuppliers);
 }
