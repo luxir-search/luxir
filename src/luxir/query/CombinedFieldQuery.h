@@ -77,10 +77,10 @@ public:
                      std::span<const float> weights, std::span<const Term> terms)
     : Query(QueryKind::COMBINED_FIELDS), fields(fields), weights(weights), terms(terms) {
     assert(!fields.empty() && fields.size() == weights.size() && !terms.empty());
-    for (const auto& term : terms) {
+    for ([[maybe_unused]] const auto& term : terms) {
       assert(term.field < fields.size() && term.weight > 0.0f && term.weight <= 1.0f);
     }
-    for (float weight : weights) assert(weight > 0.0f && std::isfinite(weight));
+    for ([[maybe_unused]] float weight : weights) assert(weight > 0.0f && std::isfinite(weight));
   }
 
   // Estimated pair-table evaluations that amortize building it: the 64K
@@ -496,6 +496,8 @@ public:
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
+
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
 
   bool recoverableAsPredicate() const noexcept override { return true; }
 };

@@ -173,7 +173,9 @@ BucketScalar AggregateStateView::evaluate(AggregateEvalScratch& scratch) const {
       case AggregateNodeKind::FUNCTION: {
         assert(node.function != nullptr);
         std::array<BucketScalar, VALUE_MAX_ARITY> args;
-        for (uint8_t child = 0; child < node.childCount; child++) {
+        assert(node.childCount <= args.size());
+        for (size_t child = 0; child < args.size(); child++) {
+          if (child == node.childCount) break;
           args[child] = scratch.nodes[node.children[child]];
         }
         scratch.nodes[i] = node.function->bucket(
@@ -194,13 +196,7 @@ BucketScalar AggregateStateView::finish(AggregateEvalScratch& scratch) const {
     return BucketScalar::failed(root.type, root.nature, stateFailure);
   }
   auto validateOutput = [](BucketScalar result) {
-    if (result.valid && result.type == BucketValueType::INT128
-        && (result.intValue < std::numeric_limits<int64_t>::min()
-            || result.intValue > std::numeric_limits<int64_t>::max())) {
-      return BucketScalar::failed(result.type, result.nature,
-                                  AggregateFailure::INT64_OUTPUT_OVERFLOW);
-    }
-    return result;
+    return valueDecimal(result.nature) ? result : integerAggregateOutput(result);
   };
   if (root.kind == AggregateNodeKind::AGGREGATE) {
     const AggregateLeaf& leaf = program->leaves[root.aggregate];
@@ -321,7 +317,7 @@ std::span<const AggregateFieldInfos> resolveAggregateFields(
     const ValueProgram& input = *program.producers[i].input;
     fields[i].values = input.resolveFields(pool, reader);
     if (input.root().type == ValueType::COLUMN_ONLY) {
-      fields[i].ords = reader.getOrdMap(input.root().text).get();
+      fields[i].ords = (input.root().source ? *input.root().source : reader).getOrdMap(input.root().text).get();
     }
   }
   return fields;
@@ -343,10 +339,11 @@ std::vector<BoundAggregateInput> bindAggregateInputs(
     OrdMap::SegToGlobal ordMapping;
     if (strings && rootBinding.stringColumn != nullptr && fields[index].ords != nullptr) {
       assert(root.columnIndexed);
-      rootBinding.stringColumn->attachOrds(pool, segment.postingsReader());
+      auto& source = root.source ? root.source->segments()[(size_t)segment.ord] : segment;
+      rootBinding.stringColumn->attachOrds(pool, source.postingsReader());
       ordMapping = fields[index].ords->getSegToGlobal(segment.ord);
     }
-    bool columnScan = root.kind == ValueNodeKind::COLUMN && (!strings || root.columnIndexed);
+    bool columnScan = root.kind == ValueNodeKind::COLUMN && !root.source && (!strings || root.columnIndexed);
     bool bareColumn = columnScan && !strings && !valueArray(root.type);
     bindings.push_back({
         .values = values,

@@ -105,7 +105,6 @@ public:
 
   IndirectPQ(std::span<T> arr, std::span<T*> pointers, bool fillPointers=true)
   : pointers(pointers), end(pointers.data() + arr.size()), reference(arr.data()) {
-    auto sz = arr.size();
     if (fillPointers) {
       fillPtrs(arr);
     }
@@ -217,7 +216,7 @@ public:
           : underlying(underlying), heap(indexes), heapSize(size)
   {
     assert(underlying.size() >= indexes.size());
-    assert(heapSize <= indexes.size());
+    assert((size_t)heapSize <= indexes.size());
     makeHeap();
   }
 
@@ -257,7 +256,7 @@ public:
   }
 
   void insert(const T& elem) {
-    assert(heapSize < heap.size());
+    assert((size_t)heapSize < heap.size());
     underlying[heapSize] = elem;
     heap[heapSize] = heapSize;
     heapSize++;
@@ -269,7 +268,7 @@ public:
   /// Indexed replacements must reuse the evicted entry's stable slot.
   /// @returns true if the new element caused the previous top() to be ejected.
   bool insertWithOverflow(const T& elem) {
-    if (heapSize < heap.size()) {
+    if ((size_t)heapSize < heap.size()) {
       insert(elem);
       return false;
     }
@@ -337,6 +336,11 @@ public:
 
   ExpandingPQ(size_t maxSize, Comp comp) : maxSize(maxSize), comp(comp) {
     heap.reserve(std::min(maxSize, initialReserve));
+  }
+
+  void clear() {
+    heap.clear();
+    if constexpr (Indexed) positions.values.clear();
   }
 
   // Reference to the top element.

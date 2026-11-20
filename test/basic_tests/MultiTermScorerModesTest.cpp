@@ -1220,7 +1220,7 @@ TEST_F(MultiTermScorerModesTest, releaseAllBudgetsPreservesSpillAndEmptyExpansio
   EXPECT_EQ(0, emptySupplier->cost());
   emptyWeight->releaseSegmentState(segment);
   EXPECT_EQ(Query::MatchState::UNKNOWN, emptySupplier->describeScorer(large).matchState);
-  EXPECT_EQ(segment.maxDoc(), emptySupplier->cost());
+  EXPECT_EQ(0, emptySupplier->cost());
   EXPECT_TRUE(emptySupplier->fillExpansionMemo(large));
   EXPECT_EQ(1u, emptyWeight->expansionRefillsForTests());
   EXPECT_EQ(nullptr, emptySupplier->resolve(scratch, large)->build(scratch));
@@ -1267,7 +1267,7 @@ TEST_F(MultiTermScorerModesTest, wrapperReleasePreservesPreparedResults) {
   auto* program = ValueExprParser(options, context.arena()).parse("3.0");
   RescoreQuery rescore(&force, program, 3.0f);
   auto* weight = rescore.createWeight(context, Query::NEED_SCORES);
-  Query::Weight::PrepareContext prepareContext{*ti.reader, {}, false, nullptr};
+  Query::Weight::PrepareContext prepareContext{*ti.reader, {}, nullptr, nullptr};
   QueryPrep::PreparedSource source;
   source.weight = weight;
   source.setPrepared(weight->prepare(prepareContext));

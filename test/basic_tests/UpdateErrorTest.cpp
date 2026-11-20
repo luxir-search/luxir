@@ -364,3 +364,48 @@ TEST_F(UpdateErrorTest, deleteAndRepeatedOverwriteInOneRequestKeepLastDocument) 
   EXPECT_TRUE(matchDocs(helper, "first").empty());
   EXPECT_TRUE(matchDocs(helper, "old").empty());
 }
+
+TEST_F(UpdateErrorTest, malformedNestedInputIsRejectedWithoutDiscardingOtherRoots) {
+  CollectionHelper helper;
+  CollectionHelper::UpdateBuilder input;
+  input.addRaw([](auto& doc, auto& arena) {
+    ASSERT_TRUE(luxir::api::read_json(doc,
+        R"({"id":"bad","items_nested":[7]})", arena));
+  });
+  input.add(flatdoc("id", "good", "color_s", "red"));
+  auto result = helper.submit(input);
+  EXPECT_EQ(ResponseStatus::PARTIAL, result.status);
+  ASSERT_EQ(1u, result.errors.size());
+  EXPECT_NE(std::string::npos, result.errors[0].error_message.find("Nested path"));
+  helper.commit();
+  auto req = localReq(helper.getSearchEngine());
+  req->topDocs().allQuery().countLimit().fields({"id"});
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ(1, req->getMatchCount());
+}
+
+TEST_F(UpdateErrorTest, mappedObjectFieldsKeepLastValuesAcrossChangingLayouts) {
+  CollectionHelper helper;
+  CollectionHelper::UpdateBuilder input;
+  for (auto json : {
+      R"({"doc_id":"a","first":"discard","skip":"ignored","alias":"alpha","first":"bravo"})",
+      R"({"alias":"charlie","doc_id":"b"})",
+      R"({"skip":"ignored","doc_id":"c","first":"discard","alias":"delta"})"}) {
+    input.addRaw([&](auto& doc, auto& arena) {
+      ASSERT_TRUE(luxir::api::read_json(doc, json, arena));
+    });
+  }
+  input.fieldMap({{"doc_id", "id"}, {"first", "text_w"}, {"alias", "text_w"}})
+      .dropUnmapped().returnIds().commit();
+  auto result = helper.submit(input);
+  ASSERT_TRUE(result.success);
+  EXPECT_EQ((std::vector<std::string>{"a", "b", "c"}), result.ids);
+  EXPECT_TRUE(matchDocs(helper, "discard").empty());
+  EXPECT_TRUE(matchDocs(helper, "alpha").empty());
+  for (auto [word, id] : {std::pair{"bravo", "a"}, {"charlie", "b"}, {"delta", "c"}}) {
+    auto docs = matchDocs(helper, word);
+    ASSERT_EQ(1u, docs.size());
+    EXPECT_TRUE(containsDoc(docs, flatdoc("id", id)));
+  }
+}

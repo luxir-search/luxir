@@ -12,33 +12,25 @@
 #include <vector>
 #include "luxir/codec/NumColumnFormat.h"
 #include "SegFieldInfo.h"
+#include "Space.h"
 #include "StoredFieldsMetadata.h"
-#include "VersionRuns.h"
-#include "luxir/store/Directory.h"
 #include "luxir/store/InputStream.h"
 
 namespace luxir {
 
-class PostingsReader;
+class SegmentCore;
 class FieldReader;
 class TermsEnum;
 class DocsEnum;
 
 
-// Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
-// PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
-// This does not contain deleted docs, so one instance serves every index snapshot that holds the segment
-// (IndexReader::openSnapshot shares it from the writer or the previous snapshot, and the writer from
-// the published snapshot), and with it the views derived from the segment's bytes that it caches.
+// Concrete reader of one dense row space within a segment core. Its immutable
+// field catalog and lazy decoded headers live with the core; iterators are local
+// to callers. Liveness belongs to the snapshot's leaf.
 class PostingsReader {
-  // Indexed by physical filenum and intentionally sparse. Segment finalize
-  // folds buffered streams without renaming survivors, which keeps already
-  // spilled filesystem/object-store keys stable.
-  std::vector<std::shared_ptr<InputFile>> files;
-  std::vector<InputStream> inputStreams;
-  int64_t segInfoOffset;  // after this is segInfo, before this is the field index
-  int32_t maxdoc;
-  VersionRuns versions;
+  SegmentCore& segmentCore;
+  int32_t maxdoc = 0;
+  const SpaceOrdinal ordinal;
 
   // Ordinals follow the sorted field index. Only the directory is allocated
   // at open; slot pages and immutable headers are published on first use.
@@ -86,22 +78,14 @@ public:
   // stay quiet on a legal overshoot of the soft cap.
   static constexpr int32_t HARD_MAX_DOC = END - (1 << 20);
 
-  // Static factory method to create PostingsReader with optional handling of missing files.
-  // Returns nullptr if missingFileOK=true and any required files are missing.
-  // If expectSynced=true, the opened files are expected to have been fsynced (committed state).
-  static std::shared_ptr<PostingsReader> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK = false, bool expectSynced = false);
-
-  explicit PostingsReader(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
   ~PostingsReader();
   PostingsReader(const PostingsReader&) = delete;
   PostingsReader& operator=(const PostingsReader&) = delete;
 
 private:
-  // Private default constructor for factory method
-  PostingsReader() = default;
-
-  // Initialize from files, returns false if missing files and missingFileOK=true
-  bool initializeFromFiles(Directory& dir, uint64_t segId, uint64_t creatorEpoch, bool missingFileOK, bool expectSynced);
+  friend class SegmentCore;
+  PostingsReader(SegmentCore& core, SpaceOrdinal ordinal) : segmentCore(core), ordinal(ordinal) {}
+  void initialize(int32_t maxDoc, int64_t fieldOffsetsLoc, const uint32_t* fieldOffsets, int32_t count);
 
 public:
 
@@ -109,8 +93,9 @@ public:
     return maxdoc;
   }
 
+  SpaceOrdinal spaceOrdinal() const noexcept { return ordinal; }
   int32_t numFields() const noexcept { return nFields; }
-  const VersionRuns& versionRuns() const { return versions; }
+  SegmentCore& core() const noexcept { return segmentCore; }
 
   // Immutable headers, decoded on first use and shared by all snapshots.
   // Missing names and ordinals outside the field index return nullptr.
@@ -125,42 +110,6 @@ public:
     size_t bytes = 0;
   };
   FieldCacheStats fieldCacheStats() const noexcept;
-
-  // Total bytes in the physical base-segment files this reader can merge.
-  uint64_t sizeInBytes() const noexcept {
-    uint64_t total = 0;
-    for (const auto& file : files) {
-      if (file == nullptr) continue;
-      uint64_t bytes = (uint64_t) file->size();
-      total = bytes > std::numeric_limits<uint64_t>::max() - total
-          ? std::numeric_limits<uint64_t>::max() : total + bytes;
-    }
-    return total;
-  }
-
-  InputFile* getFile(uint32_t fnum) {
-    assert(fnum < files.size());
-    assert(files[fnum] != nullptr);
-    return files[fnum].get();
-  }
-
-  // We can't get & cache the InputStream in PostingsReader unless we create them all in the constructor (for thread safety)
-  // But if we're using mmap, that's probably fine?  Would not be fine if we need to read everything in the constructor.
-  // TODO: could also have a mode that opens on demand (and hence synchronizes)... that would be good for something like IndexWriter
-  // that needs to only read the ID field to handle overwrites / deletions.  That file *might* already be open by another IndexReader
-  // though?  How to coordinate?
-  InputStream getInputStream(uint32_t fnum) {
-    assert(fnum < inputStreams.size());
-    assert(files[fnum] != nullptr);
-    return inputStreams[fnum];
-  }
-
-  // return an InputStream positioned on the current location specified
-  InputStream getInputStreamSeek(seg_location sloc) {
-    InputStream is = getInputStream(sloc.filenum());
-    is.seek(sloc.offset());
-    return is;
-  }
 
   friend class FieldReader;
 };

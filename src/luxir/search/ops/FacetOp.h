@@ -97,7 +97,7 @@ public:
         emit([](int64_t value) { return sortableInt64ToDouble(value); });
         break;
       default:
-        withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, emit);
+        withNatureOutput<int64_t>(outputNature, flags, mr, [this] { return fieldName; }, emit);
         break;
     }
   }
@@ -110,23 +110,23 @@ public:
       withValueOutput(mr, [&](auto output) {
         emitBuckets(result, buckets, mr, output);
       });
-    } else emitBuckets(result, buckets, mr);
+    } else withNatureOutput<std::string_view>(outputNature, flags, mr, [this] { return fieldName; }, [&](auto output) {
+      emitBuckets(result, buckets, mr, output);
+    });
   }
 
   const SegFieldInfo* fieldInfo(int32_t segnum) const {
-    return segInfos.at((size_t)segnum);
+    return SegFieldInfo::column(segInfos.at((size_t)segnum));
   }
 
-  FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName,
+  FacetReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view fieldName, std::string_view facetName,
     int64_t limit, int64_t minCount, bool missing)
-    : SearchOp(req, facetName), reader(*req.reader), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
+    : SearchOp(req, view, facetName), reader(*view), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
       facetName(facetName), segInfos(fieldName.empty() ? IndexReader::FieldSegments{} : reader.field(fieldName)) {
     if (!fieldName.empty()) {
       auto& type = *req.schema->getFieldTypeEx(fieldName);
       valueType = type.type();
-      if (type.type() == FieldType::DATE) {
-        outputNature = dateValueNature(DateFieldType::unitOf(type));
-      }
+      outputNature = type.valueNature();
     }
   }
 
@@ -174,7 +174,7 @@ public:
   // The points format here is the same one-dimensional numeric format used
   // by range counts. Other points shapes must use the column predicate.
   static bool numericIdentityPoints(const SegFieldInfo& info) {
-    return info.pointsMetaOff != 0 && FieldType::usesOneDimensionalPoints(info.type);
+    return info.pointsMetaOff != 0 && FieldType::isNumericColumn(info.type);
   }
 
   // Value counts are document counts when every present doc has one value,
@@ -476,7 +476,7 @@ public:
         DocSetBuilder empty(maxDoc);
         domain = empty.build();
       }
-      return DomainHandle(std::move(domain));
+      return DomainHandle(std::move(domain)).scoped(segment);
     }
 
     template <typename Key>
@@ -521,7 +521,7 @@ public:
                 if (chunk[i].id) owner.emplace(chunk[i].id->value, (int32_t)i);
               } else owner.emplace(chunk[i].key, (int32_t)i);
             }
-            return buildFacetBucketDomains(maxDoc, chunk.size(), [&](auto&& accept) {
+            return buildFacetBucketDomains(facet.reader.segments()[segnum], chunk.size(), [&](auto&& accept) {
               int64_t missing = 0;
               if constexpr (std::is_same_v<Key, std::string_view>) {
                 assert(ordMap || !info);
@@ -873,7 +873,7 @@ public:
                   for (size_t i = 0; i < chunk.size(); i++) {
                     if (chunk[i].id) bucketOf.emplace(chunk[i].id->value, (int32_t)i);
                   }
-                  return buildFacetBucketDomains(facet.reader.segments()[segnum].maxDoc(), chunk.size(),
+                  return buildFacetBucketDomains(facet.reader.segments()[segnum], chunk.size(),
                       [&](auto&& accept) {
                         int64_t missing = 0;
                         if constexpr (Ordinal) facet.facetSegOrdCol(input[segnum].get(), (int32_t)segnum,
@@ -898,7 +898,7 @@ public:
                  std::shared_ptr<OrdMap> ordMap = {}, FacetDimension values = {},
                  const StructuralConstraint* structural = nullptr)
         : Calc(op, parent, slot, numSlots, structural), ordMap(std::move(ordMap)),
-          driver(op.req.reader->segments().size(),
+          driver(op.view->segments().size(),
               [this](std::unique_ptr<DistinctFacetCounts> data) { result(std::move(data)); }),
           domainResource(op.req.memoryTracker, std::format("facet '{}' domains", op.name)), input(&domainResource) {
       driver.setCreator([this]() { return new DistinctFacetCounts(this->op.req.memoryTracker,
@@ -906,13 +906,13 @@ public:
       if constexpr (Ordinal) valueDimension = {true, 0, (uint64_t)(this->ordMap ? this->ordMap->numOrds() : 0)};
       else valueDimension = values;
       mode = DistinctFacetCounts::select(valueDimension, this->fieldOp().groupDimension(), FacetReq::isContiguous);
-      if (!this->fieldOp().subOps.empty()) input.resize(op.req.reader->segments().size());
+      if (!this->fieldOp().subOps.empty()) input.resize(op.view->segments().size());
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DomainHandle domain) override {
+    void calc(FanoutScope* tg, int32_t segnum, DomainHandle domain) override {
       unused(tg);
       if (segnum == -1) { driver.completeEmpty(); return; }
-      DocSet* docs = domain.get();
+      DocSet* docs = domain.get(op.view->segments()[(size_t)segnum]);
       if (!input.empty()) input[(size_t)segnum] = std::move(domain);
       driver.contribute([&](DistinctFacetCounts& data) { collect(data, segnum, docs); });
     }
@@ -921,11 +921,11 @@ public:
   };
 
 public:
-  FieldFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet,
+  FieldFacetReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqFieldFacet& fieldFacet,
     std::string_view fieldName, std::string_view facetName, int64_t limit,
     int64_t minCount, bool missing, std::span<const int64_t> selectedInts,
     std::span<const std::string_view> selectedStrings) :
-  FacetReq(req, fieldName, facetName, limit, minCount, missing),
+  FacetReq(req, view, fieldName, facetName, limit, minCount, missing),
   fieldFacet(fieldFacet), selectedInts(selectedInts),
   selectedStrings(selectedStrings) {}
 
@@ -1004,10 +1004,10 @@ public:
     bool useVector = false;
   };
 
-  IntFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
+  IntFacetReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     std::span<const int64_t> selected) :
-  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
+  FieldFacetReq(req, view, fieldFacet, fieldName, facetName, limit, minCount, missing,
                 selected, {}) {
     auto range = scanGlobalRange(reader, segInfos);
     globalMin = range.min;
@@ -1058,11 +1058,11 @@ public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
         const StructuralConstraint* structural = nullptr)
       : FieldFacetReq::Calc(op, parent, slot, numSlots, structural),
-        driver(op.req.reader->segments().size(),
+        driver(op.view->segments().size(),
                [this](std::unique_ptr<MergeableIntFacet> m){ facetResult(*m); }) {
-      if (!thisOp().subOps.empty()) input.resize(op.req.reader->segments().size());
+      if (!thisOp().subOps.empty()) input.resize(op.view->segments().size());
       if (!thisOp().inlineSubOps.empty()) {
-        inlineDriver.emplace(op.req.reader->segments().size(),
+        inlineDriver.emplace(op.view->segments().size(),
             [this](std::unique_ptr<MergeableFieldFacetInline> m) {
               facetInlineResult(std::move(m));
             });
@@ -1076,9 +1076,10 @@ public:
       return (IntFacetReq&)getOp();
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domainHandle) override {
       assert(domainHandle.isDeliverable());
+      if (segnum >= 0) domainHandle.assertScope(op.view->segments()[(size_t)segnum]);
       DocSet* domain = domainHandle.get();
       if (!thisOp().inlineSubOps.empty()) {
         if (segnum == -1) {
@@ -1212,7 +1213,7 @@ public:
         builderOfValue.emplace(buckets[i].key, (int32_t)i);
       }
       return buildFacetBucketDomains(
-          thisOp().reader.segments()[segnum].maxDoc(), buckets.size(),
+          thisOp().reader.segments()[segnum], buckets.size(),
           [&](auto&& accept) {
             int64_t missing = 0;
             thisOp().facetSegIntCol(eligibility, (int32_t)segnum,
@@ -1335,11 +1336,11 @@ class FullTextFacetReq : public FieldFacetReq {
   };
 
 public:
-  FullTextFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet,
+  FullTextFacetReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqFieldFacet& fieldFacet,
     std::string_view fieldName, std::string_view facetName, int64_t limit,
     int64_t minCount, bool missing,
     std::span<const std::string_view> selected) :
-  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
+  FieldFacetReq(req, view, fieldFacet, fieldName, facetName, limit, minCount, missing,
                 {}, selected) {}
 
   bool canEmitAsBucketChild() const override {
@@ -1354,11 +1355,11 @@ public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
         const StructuralConstraint* structural = nullptr)
       : FieldFacetReq::Calc(op, parent, slot, numSlots, structural),
-        driver(op.req.reader->segments().size(),
+        driver(op.view->segments().size(),
                [this](std::unique_ptr<MergeableStrFacet> m){ facetResult(*m); }) {
-      if (!thisOp().subOps.empty()) input.resize(op.req.reader->segments().size());
+      if (!thisOp().subOps.empty()) input.resize(op.view->segments().size());
       if (!thisOp().inlineSubOps.empty()) {
-        inlineDriver.emplace(op.req.reader->segments().size(),
+        inlineDriver.emplace(op.view->segments().size(),
             [this](std::unique_ptr<MergeableTextInline> m) {
               facetInlineResult(std::move(m));
             });
@@ -1375,9 +1376,10 @@ public:
       return (FullTextFacetReq&)getOp();
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domainHandle) override {
       assert(domainHandle.isDeliverable());
+      if (segnum >= 0) domainHandle.assertScope(op.view->segments()[(size_t)segnum]);
       DocSet* domain = domainHandle.get();
       if (inlineDriver.has_value()) {
         if (segnum == -1) {
@@ -1535,7 +1537,7 @@ public:
         assert(bucket.key.has_value());
         countVec.emplace_back(std::move(*bucket.key), bucket.count);
       }
-      emitBuckets(facetResultProto, countVec, mr);
+      thisOp().emitFieldBuckets(facetResultProto, countVec, mr);
       if (missing) {
         facetResultProto.missing = merged.missing_num;
       }
@@ -1588,11 +1590,11 @@ public:
   };
 
   FixedBucketFacetReq(
-      SearchRequest& req, std::string_view fieldName,
+      SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view fieldName,
       std::string_view facetName, int64_t minCount, bool missing,
       size_t numBuckets,
       std::span<const size_t> selectedBuckets)
-    : FacetReq(req, fieldName, facetName, -1, minCount, missing),
+    : FacetReq(req, view, fieldName, facetName, -1, minCount, missing),
       numBuckets(numBuckets), selectedBuckets(selectedBuckets) {}
 
   size_t bucketCount() const { return numBuckets; }
@@ -1706,7 +1708,7 @@ public:
         std::span<const SelectedFacetBucket<size_t>> block, DomainHandle eligibility,
         FacetBucketFeed feed) = 0;
     virtual Query::Weight* bucketSelection(size_t) { return nullptr; }
-    virtual void prepareGatheredDomains(oneapi::tbb::task_group* tg) {
+    virtual void prepareGatheredDomains(FanoutScope* tg) {
       unused(tg);
     }
 
@@ -1718,9 +1720,11 @@ public:
       });
     }
 
-    void prepareAndDispatch(oneapi::tbb::task_group* tg) {
+    void prepareAndDispatch(FanoutScope* tg) {
       prepareGatheredDomains(tg);
-      task_group_fanout(tg, input.size(), [&](size_t segnum) {
+      task_group_fanout(tg, input.size(), FanoutKind::EXHAUSTIVE, [&](size_t segnum) {
+        return FanoutSize{fanoutDomainUnits(fixedOp().reader.segments()[segnum], input[segnum]), 0};
+      }, [&](size_t segnum) {
         return [this, segnum, domain = input[segnum]]() {
           collectInputSegment((int32_t)segnum, domain.get());
         };
@@ -1788,7 +1792,7 @@ public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
         const StructuralConstraint* structural = nullptr)
       : Calculator(op, parent, slot, numSlots, structural),
-        driver(op.req.reader->segments().size(),
+        driver(op.view->segments().size(),
                [this](std::unique_ptr<Data> merged) {
                  if constexpr (Storage::growing) {
                    auto release = scope_guard([&]() noexcept { input.clear(); });
@@ -1803,7 +1807,7 @@ public:
         }
       }
       if (!fixedOp().subOps.empty() || fixedOp().requiresWholeReaderDomain()) {
-        input.resize(op.req.reader->segments().size());
+        input.resize(op.view->segments().size());
       }
     }
 
@@ -1829,19 +1833,20 @@ public:
           result.ops, fixedOp().subOps.size(), sub.name, resp->mr);
     }
 
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domainHandle) final {
       assert(domainHandle.isDeliverable());
       if (segnum == -1) {
         driver.completeEmpty();
         return;
       }
+      if (segnum >= 0) domainHandle.assertScope(op.view->segments()[(size_t)segnum]);
       DocSet* domain = domainHandle.get();
       if (!input.empty()) {
         if constexpr (Storage::growing) {
           if (domainHandle.ownsStorage()) domainHandle = DomainVariantPlan::account(
               std::move(domainHandle), op.req.memoryTracker, "retained range bucket inputs");
-          domain = domainHandle.get();
+          domain = domainHandle.get(op.view->segments()[(size_t)segnum]);
           if (domain && domainHandle.isCharged()) storage.retainedInputs.fetch_add(
               domain->ramBytesUsed(), std::memory_order_relaxed);
         }
@@ -1857,7 +1862,7 @@ public:
       if (seen == (int32_t)input.size()) prepareAndDispatch(tg);
     }
 
-    void calcAll(oneapi::tbb::task_group* tg,
+    void calcAll(FanoutScope* tg,
                  std::span<const DomainHandle> domains) final {
       if (!fixedOp().requiresWholeReaderDomain()) {
         Calculator::calcAll(tg, domains);
@@ -1869,8 +1874,9 @@ public:
         return;
       }
       std::copy(domains.begin(), domains.end(), input.begin());
-      for ([[maybe_unused]] const DomainHandle& domain : input) {
-        assert(domain.isDeliverable());
+      for (size_t i = 0; i < input.size(); i++) {
+        assert(input[i].isDeliverable());
+        input[i].assertScope(op.view->segments()[i]);
       }
       prepareAndDispatch(tg);
     }
@@ -1950,7 +1956,7 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
     if (auto domains = zoneBucketDomains(segnum, buckets, builderOfBucket, eligibility, layout)) {
       return std::move(*domains);
     }
-    return buildFacetBucketDomains(reader.segments()[segnum].maxDoc(), buckets.size(),
+    return buildFacetBucketDomains(reader.segments()[segnum], buckets.size(),
         [&](auto&& accept) {
           int64_t missing = 0;
           facetSegIntCol(eligibility, (int32_t)segnum, missing, accept);
@@ -2072,7 +2078,7 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
     }
     std::vector<DomainHandle> domains;
     domains.reserve(buckets.size());
-    for (auto& builder : visitor.builders) domains.emplace_back(builder.build());
+    for (auto& builder : visitor.builders) domains.push_back(DomainHandle(builder.build()).scoped(reader.segments()[segnum]));
     return domains;
   }
 
@@ -2082,22 +2088,22 @@ public:
 
   std::span<const int64_t> bucketFences() const { return fences; }
 
-  IntFacetRangeReq(SearchRequest& req,
+  IntFacetRangeReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view,
     std::string_view fieldName, std::string_view facetName,
     std::span<const int64_t> fences, bool affine, int64_t affineGap,
     int64_t minCount, bool missing,
     std::span<const size_t> selectedBuckets, std::span<const RangeFacetRun> runs)
   : FixedBucketFacetReq(
-        req, fieldName, facetName, minCount, missing,
+        req, view, fieldName, facetName, minCount, missing,
         fences.size() - 1, selectedBuckets),
     fences(fences), affineGap(affineGap),
     affine(affine), runs(runs) {}
 
-  IntFacetRangeReq(SearchRequest& req,
+  IntFacetRangeReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view,
       std::string_view fieldName, std::string_view facetName,
       RangeFacetGrid grid, std::optional<int64_t> start, std::optional<int64_t> end,
       int64_t minCount, bool missing)
-    : FixedBucketFacetReq(req, fieldName, facetName, minCount, missing, 0, {}),
+    : FixedBucketFacetReq(req, view, fieldName, facetName, minCount, missing, 0, {}),
       affineGap(0), affine(false), grid(std::move(grid)),
       wideningStart(start), wideningEnd(end) {}
 
@@ -2157,9 +2163,18 @@ public:
       int64_t* counts = build::allocArray(result.counts, n, mr);
       for (size_t i = 0; i < n; i++) {
         size_t bucket = emitted[i];
-        auto* bounds = build::allocArray(pairs[i].v, 2, mr);
-        bounds[0] = decode(layout[bucket]);
-        bounds[1] = decode(layout[bucket + 1]);
+        auto& pair = [&]() -> auto& {
+          if constexpr (std::is_same_v<Outer, api::ColVal>) return pairs[i].kind.template emplace<api::ArrVal>();
+          else return pairs[i];
+        }();
+        auto* bounds = build::allocArray(pair.v, 2, mr);
+        if constexpr (std::is_same_v<Outer, api::ColVal>) {
+          bounds[0].kind = decode(layout[bucket]);
+          bounds[1].kind = decode(layout[bucket + 1]);
+        } else {
+          bounds[0] = decode(layout[bucket]);
+          bounds[1] = decode(layout[bucket + 1]);
+        }
         counts[i] = merged.counts.empty() ? 0 : merged.counts[bucket];
       }
     });
@@ -2202,7 +2217,7 @@ public:
         auto poolGuard = MemPool::threadLocalPoolGuard();
         if (auto* info = rangeOp().fieldInfo(segnum)) {
           const auto& segFieldInfo = *info;
-          bool oneDimensionalNumeric = FieldType::usesOneDimensionalPoints(segFieldInfo.type);
+          bool oneDimensionalNumeric = FieldType::isNumericColumn(segFieldInfo.type);
           if (segFieldInfo.pointsMetaOff != 0 && oneDimensionalNumeric
               && valuesAreDocuments(segFieldInfo)) {
             IntColReader column(segment.postingsReader(), segFieldInfo);
@@ -2295,11 +2310,11 @@ class QueryFacetReq : public FixedBucketFacetReq {
 
 public:
   QueryFacetReq(
-      SearchRequest& req, const ReqQueryFacet& queryFacet,
+      SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqQueryFacet& queryFacet,
       std::string_view facetName, std::span<Query*> bucketQueries,
       std::span<Query::Weight*> bucketWeights)
     : FixedBucketFacetReq(
-          req, {}, facetName, 0, false, queryFacet.buckets.size(), {}),
+          req, view, {}, facetName, 0, false, queryFacet.buckets.size(), {}),
       queryFacet(queryFacet), bucketQueries(bucketQueries),
       bucketWeights(bucketWeights),
       preparedBuckets(QueryPrep::anyNeedsPrepare(bucketWeights)) {
@@ -2375,19 +2390,19 @@ public:
       return DomainHandle(QueryPrep::materialize(
           bucketSource(bucket), segment, domain,
           Query::SupplierExecutionMode::ORDINARY,
-          QueryPrep::MaterializeMode::ORDINARY));
+          QueryPrep::MaterializeMode::ORDINARY)).scoped(segment);
     }
 
-    void prepareGatheredDomains(oneapi::tbb::task_group* tg) override {
+    void prepareGatheredDomains(FanoutScope* tg) override {
       std::vector<DocSet*> domains;
       domains.reserve(this->input.size());
       for (const DomainHandle& domain : this->input) {
         domains.push_back(domain.get());
       }
       Query::Weight::PrepareContext context{
-        *queryOp().req.reader,
+        *queryOp().view,
         std::span<DocSet* const>(domains.data(), domains.size()),
-        tg != nullptr, &queryOp().req};
+        tg, &queryOp().req};
       preparedSources = QueryPrep::prepareSources(
           queryOp().bucketWeights, context);
       assert(preparedSources.size() == queryOp().bucketCount());
@@ -2415,11 +2430,11 @@ public:
       // latter are applied by StructuralConstraint::finish, never replayed
       // from this placeholder or from the bucket's original selected window.
       if (bucketSelection(bucket)) return DomainHandle(std::make_unique<ArrDocSet>(
-          std::vector<int32_t>{}));
+          std::vector<int32_t>{})).scoped(queryOp().reader.segments()[segnum]);
       auto& segment = queryOp().reader.segments()[segnum];
       auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
       return DomainHandle(QueryPrep::materialize(
-          *queryOp().bucketWeights[bucket], nullptr, segment, eligibility));
+          *queryOp().bucketWeights[bucket], nullptr, segment, eligibility)).scoped(queryOp().reader.segments()[segnum]);
     }
 
     void collectSegment(
@@ -2467,7 +2482,7 @@ public:
         }
         supplier = obtainSupplier();
         if (supplier == nullptr) continue;
-        DomainHandle matches(QueryPrep::materialize(supplier, guard.pool(), segment, domain));
+        DomainHandle matches = DomainHandle(QueryPrep::materialize(supplier, guard.pool(), segment, domain)).scoped(segment);
         data.counts[bucket] += matches.get()->card();
       }
       }

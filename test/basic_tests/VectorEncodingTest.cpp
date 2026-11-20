@@ -61,7 +61,7 @@ void installFields(Collection& col, const Fields& f) {
     def.type = api::FieldDef::FieldClass::VECTOR;
     def.metric = f.metric;
     def.encoding = encoding;
-    def.multi = f.multi;
+    if (f.multi) def.multi = api::FieldDef::MultiMode::ARRAY;
     if (encoding == f.encoding) def.keep_original = f.keepOriginal;
     if (f.ann) {
       def.dims = DIMS;
@@ -83,7 +83,7 @@ std::vector<std::string> knnIds(std::string_view field, int32_t k, bool exact = 
                                 int32_t refine = 0) {
   auto* req = LocalReq::create(LuxirTest::luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  cur.getScores().getNumber().fields({"id"});
+  cur.getScores().countLimit().fields({"id"});
   cur.rawQuery() = qb::knn(cur.mr(), field, QUERY, k, /*nprobe=*/0, exact, refine);
   req->execute();
   EXPECT_TRUE(req->ok()) << req->errorMsg();

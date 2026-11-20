@@ -76,6 +76,7 @@ message SegmentInfo {
   uint64 commit_time = 5;               // First time this segment was committed (microseconds since epoch)
   int32 max_doc = 6;                    // Number of documents in this segment (ignoring deletes)
   int32 live_docs = 7;                  // Number of non-deleted documents in this segment
+  optional int32 merge_rows = 14;       // Largest physical row space; absent when equal to max_doc
   SchemaReference schema = 8;           // Oldest input schema binding; merges never imply backfill
 
   // Segment-local auxiliary overlays. Vector ANN indexes are recorded here

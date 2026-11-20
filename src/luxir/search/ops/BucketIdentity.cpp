@@ -35,7 +35,7 @@ DomainHandle FacetReq::numericPredicateIdentity(size_t segment, int64_t lo, int6
   auto* weight = identity.createWeight(context, 0);
   return DomainHandle(QueryPrep::materialize(*weight, nullptr, reader.segments()[segment], eligibility,
                                              Query::SupplierExecutionMode::ORDINARY,
-                                             QueryPrep::MaterializeMode::DOMAIN_DRIVEN));
+                                             QueryPrep::MaterializeMode::DOMAIN_DRIVEN)).scoped(reader.segments()[segment]);
 }
 
 }  // namespace luxir

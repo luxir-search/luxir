@@ -16,6 +16,7 @@
 
 #include "LuxirNode.h"
 #include "luxir/BuildInfo.h"
+#include "luxir/KernelInfo.h"
 #include "luxir/api/build.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/reader/Postings.h"
@@ -54,7 +55,9 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   fields.entry_bytes = fieldMetadataMemory.entryBytes.load(std::memory_order_relaxed);
   fields.names = fieldMetadataMemory.names.load(std::memory_order_relaxed);
   fields.name_bytes = fieldMetadataMemory.nameBytes.load(std::memory_order_relaxed);
-  fields.bytes = fields.directory_bytes + fields.page_bytes + fields.entry_bytes + fields.name_bytes;
+  fields.live_views = fieldMetadataMemory.liveViews.load(std::memory_order_relaxed);
+  fields.live_view_bytes = fieldMetadataMemory.liveViewBytes.load(std::memory_order_relaxed);
+  fields.bytes = fields.directory_bytes + fields.page_bytes + fields.entry_bytes + fields.name_bytes + fields.live_view_bytes;
   auto process = processAllocatorStats();
   if (!process) return;
   auto& jemalloc = memory.jemalloc.emplace();
@@ -142,6 +145,8 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   dst.version = build.version;
   dst.cpu_target = build.cpuTarget;
   dst.source_commit = build.sourceCommit;
+  dst.faiss_simd = kernelInfo().faissSimd;
+  dst.blas_core = kernelInfo().blasCore;
   dst.read_only = node.readOnly();
   dst.request_duration_bounds = requestBounds;
   dst.background_duration_bounds = backgroundBounds;
@@ -165,6 +170,11 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   fillActivity(dst.merge, counts, metricActivity(MetricStage::MERGE), resource);
   fillActivity(dst.vector_build, counts, metricActivity(MetricStage::VECTOR_BUILD), resource);
   fillActivity(dst.reader_refresh, counts, metricActivity(MetricStage::READER_REFRESH), resource);
+  auto control = node.getControlExecutor().stats();
+  dst.control_threads = control.threads;
+  dst.control_busy = control.busy;
+  dst.control_queued = control.queued;
+  dst.control_completed = control.completed;
 }
 
 void fillOutcomes(api::OutcomeStats& dst, const std::array<uint64_t, (size_t)MetricOutcome::COUNT>& outcomes,
@@ -220,6 +230,9 @@ void fillQueryCacheStats(api::QueryCacheStats& dst, const ReaderManager::CacheSt
   dst.thrash_build_skips = src.filterCacheCounters.thrashBuildSkips;
   dst.reader_dead_builds = src.filterCacheCounters.readerDeadBuilds;
   dst.reader_thrash_build_skips = src.filterCacheCounters.readerThrashBuildSkips;
+  dst.build_us = src.filterCacheCounters.buildNanos / 1000;
+  dst.served_build_us = src.filterCacheCounters.servedBuildNanos / 1000;
+  dst.dead_build_us = src.filterCacheCounters.deadBuildNanos / 1000;
 }
 
 template<class Stats>
@@ -264,6 +277,13 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
       out.merge_level = (uint32_t)in.mergeLevel;
     }
     out.bytes = in.bytes;
+    auto* spaces = api::build::allocArray(out.spaces, in.spaces.size(), resource);
+    for (size_t si = 0; si < in.spaces.size(); si++) {
+      spaces[si].path = api::build::arenaStr(resource, in.spaces[si].path);
+      spaces[si].max_doc = in.spaces[si].maxDoc;
+      spaces[si].ends_bytes = in.spaces[si].endsBytes;
+      spaces[si].owners_bytes = in.spaces[si].ownersBytes;
+    }
 
     auto* overlays = api::build::allocArray(out.overlays, in.overlays.size(), resource);
     for (std::size_t oi = 0; oi < in.overlays.size(); oi++) {
@@ -462,6 +482,8 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
       out.segments_resident = row.segmentsResident;
       out.hits = row.hits;
       out.last_used_epoch = row.lastUsed;
+      out.build_us = row.buildNanos / 1000;
+      out.recent_uses = row.recentUses;
     }
   }
 }

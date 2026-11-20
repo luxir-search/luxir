@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ReaderManager.h"
+#include "luxir/reader/OwnershipShape.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/util/ApiError.h"
 #include "luxir/util/Signal.h"
@@ -25,7 +26,7 @@ std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapsh
 
 void ReaderManager::publishReader(std::shared_ptr<IndexReader> reader) {
   auto previous = indexReader.load(std::memory_order_relaxed);
-  if (!previous || reader->core != previous->core) filterCache->onReaderPublished(*reader);
+  if (!previous || reader->snapshot->core != previous->snapshot->core) filterCache->onReaderPublished(*reader);
   indexReader.store(std::move(reader), std::memory_order_release);
 }
 
@@ -101,11 +102,20 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
   return reader;
 }
 
+void ReaderManager::SegmentStats::readSpaces(const SegmentCore& core) {
+  for (size_t i = 1; i < core.spaces().size(); i++) {
+    const auto& space = core.spaces()[i];
+    const auto& shape = *core.ownership((SpaceOrdinal)i);
+    spaces.push_back({space.path, space.maxDoc, shape.endsBytes(), shape.ownersBytes()});
+  }
+}
+
 ReaderManager::Stats ReaderManager::stats(bool includeSegments, bool includeFiles) {
   Stats out;
   auto current = snapshot();
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(current->bytes, arena);
+  auto reader = includeSegments ? indexReader.load() : nullptr;
   out.commitTime = info.commit_time;
   out.indexGen = info.index_gen;
   out.coreGen = info.core_gen;
@@ -148,6 +158,12 @@ ReaderManager::Stats ReaderManager::stats(bool includeSegments, bool includeFile
       result.overlays.push_back(copyAux(aux));
       result.bytes += result.overlays.back().bytes;
     }
+    std::shared_ptr<SegmentCore> core;
+    if (reader) {
+      if (auto* leaf = reader->findSegment(seg.seg_id)) core = leaf->segmentCoreShared();
+    }
+    if (!core) core = SegmentCore::create(dir, seg.seg_id, seg.creator_epoch, true);
+    if (core) result.readSpaces(*core);
     out.segmentStats.push_back(std::move(result));
   }
   cacheStats(out);
