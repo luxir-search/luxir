@@ -354,6 +354,8 @@ public:
   // Lets tests assert the per-liveGen cache reuses across queries and
   // rebuilds when new deletes commit.
   static inline std::atomic<int64_t> rankLiveBitmapBuildsForTests{0};
+  // IVF list id walks liveListSize() performed (per-list memo misses).
+  static inline std::atomic<int64_t> listLiveCountsForTests{0};
   static inline std::atomic<int64_t> domainWalksForTests{0};
   static inline std::atomic<int64_t> seenFoldsForTests{0};
   // Post-fold hits that were already pooled.  The eligible contract makes
@@ -1095,6 +1097,7 @@ public:
       // out of the scratch VectorReader is safe and cheap.
       std::vector<std::optional<MonoReader>> monoHolders(numSegs);
       std::vector<std::shared_ptr<const RankLiveBitmap>> rankLivePerSeg(numSegs);
+      std::vector<std::span<std::atomic<int64_t>>> listLivePerSeg(numSegs);
 
       int64_t boundedDocsWithValue = 0, boundedVectors = 0, boundedLiveVectors = 0;
       bool anyMultiValued = false, anyEligible = false;
@@ -1294,6 +1297,7 @@ public:
                 VectorReader vr(seg.postingsReader(), *segInfos.at(i));
                 return buildRankLiveBitmap(seg, vr, segCount);
               });
+              listLivePerSeg[i] = live->listLiveCounts(query.getField(), vaux->getGen(), ivf->nlist);
               rankLivePerSeg[i] = std::shared_ptr<const RankLiveBitmap>(std::move(live), &bitmap);
               segLiveVectorCounts[i] = rankLivePerSeg[i]->liveVectors;
             }
@@ -1321,7 +1325,7 @@ public:
             .vectorCount = segCount,
             .liveVectorCount = segLiveVectorCounts[i],
             .ivfEngine = std::make_unique<SegmentIvfScanner<Groups, Owned>>(
-                *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
+                *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i], listLivePerSeg[i],
                 metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
                 vaux->getAmplitudes(), interval ? &intervals : nullptr),
           });
@@ -1992,10 +1996,14 @@ public:
       const Binding<Owned>& v2d;
       LiveDocs* liveDocs;
       // Rank-space liveness bitmap, present iff the segment has deletes
-      // (shared from the VectorAuxReader's per-liveGen cache).  liveListSize
-      // always reads it; RoundSelector hands it to FAISS as the eligibility
-      // bitmap when the domain is exactly liveDocs (unfiltered query).
+      // (cached on the segment's LiveDocs, which it keeps alive).
+      // liveListSize reads it; RoundSelector hands it to FAISS as the
+      // eligibility bitmap when the domain is exactly liveDocs (unfiltered
+      // query).
       std::shared_ptr<const RankLiveBitmap> rankLive;
+      // Per-list live counts memoized on the same LiveDocs (nlist entries,
+      // -1 until counted); empty iff rankLive is null.
+      std::span<std::atomic<int64_t>> listLive;
       // The query domain per the live-filtered contract; domainIsLive marks
       // the unfiltered case (domain == the liveDocs docset) where rank-space
       // bitmaps can stand in for the resolve-based check.
@@ -2161,16 +2169,18 @@ public:
     public:
       SegmentIvfScanner(faiss::IndexIVF& ivf, int32_t segOrd,
                         IndexReader::Segment& seg, const Binding<Owned>& v2d, DocSet* domain,
-                        std::shared_ptr<const RankLiveBitmap> rankLive, int32_t metric,
+                        std::shared_ptr<const RankLiveBitmap> rankLive,
+                        std::span<std::atomic<int64_t>> listLive, int32_t metric,
                         const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
                         RaBitQAmplitudes amplitudes, KnnIntervalCollector<Groups>* intervals)
           : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
             segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
-            domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
+            listLive(listLive), domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
                                         && domain == &liveDocs->docset()),
             metric(metric), preparedQuery(preparedQuery) {
         assert(preparedQuery.query != nullptr);
         assert((liveDocs != nullptr) == (this->rankLive != nullptr));
+        assert(this->rankLive == nullptr || this->listLive.size() == ivf.nlist);
       }
 
       bool usesIntervals() const { return intervals != nullptr; }
@@ -2192,16 +2202,26 @@ public:
       /// Live vector count of one IVF list - the unit the global allocator
       /// charges against the scan-fraction budget (cost = liveListSize / N).
       /// Uses the ACTUAL invlist length so list imbalance prices correctly
-      /// (full selection always sums to ~N).  Under deletes this reads the
-      /// cached rank-space liveness bitmap per id (no rank -> doc resolve);
-      /// liveness only (not the query domain), matching the live-N
+      /// (full selection always sums to ~N).  Under deletes this counts the
+      /// list's ids against the cached rank-space liveness bitmap (no rank
+      /// -> doc resolve) once per list, overlay and delete generation: the
+      /// count is memoized on LiveDocs and shared by later queries, which
+      /// matters when list ids are fetched lazily from a remote directory.
+      /// Liveness only (not the query domain), matching the live-N
       /// denominator.
       int64_t liveListSize(faiss::idx_t listId, VectorSearchWork& work) const {
         if (listId < 0 || (size_t)listId >= ivf.nlist) return 0;
+        if (liveDocs == nullptr) return (int64_t)ivf.invlists->list_size((size_t)listId);
+        auto& memo = listLive[(size_t)listId];
+        int64_t cached = memo.load(std::memory_order_relaxed);
+        if (cached >= 0) return cached;
         size_t rawSize = ivf.invlists->list_size((size_t)listId);
-        if (rawSize == 0) return 0;
-        if (liveDocs == nullptr) return (int64_t)rawSize;
+        if (rawSize == 0) {
+          memo.store(0, std::memory_order_relaxed);
+          return 0;
+        }
 
+        listLiveCountsForTests.fetch_add(1, std::memory_order_relaxed);
         work.allocatorEntries += (int64_t)rawSize;
         const uint8_t* bits = rankLive->bits;
         int64_t liveSize = 0;
@@ -2211,6 +2231,7 @@ public:
           liveSize += (bits[r >> 3] >> (r & 7)) & 1;
         }
         ivf.invlists->release_ids((size_t)listId, listIds);
+        memo.store(liveSize, std::memory_order_relaxed);
         return liveSize;
       }
 

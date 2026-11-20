@@ -2784,19 +2784,47 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
     for (const auto& id : ids) EXPECT_NE(id, deletedId);
   };
 
+  auto walks = [] { return KnnQuery::listLiveCountsForTests.load(std::memory_order_relaxed); };
   int64_t builds0 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  int64_t walks0 = walks();
   runAndCheck("d40");
   int64_t builds1 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  int64_t walks1 = walks();
   EXPECT_EQ(builds1, builds0 + 1) << "first query builds the bitmap";
+  EXPECT_GT(walks1, walks0) << "first query counts its lists' live sizes";
   runAndCheck("d40");
   int64_t builds2 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
   EXPECT_EQ(builds2, builds1) << "second query must reuse the cached bitmap";
+  EXPECT_EQ(walks(), walks1) << "second query must reuse the memoized list counts";
 
   std::vector<std::string> dels2{"d41"};
   h.deleteByIds(dels2, UpdateMessage::COMMIT);
   runAndCheck("d41");
   int64_t builds3 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
   EXPECT_EQ(builds3, builds2 + 1) << "new liveGen must rebuild the bitmap";
+  int64_t walks3 = walks();
+  EXPECT_GT(walks3, walks1) << "new liveGen must recount list sizes";
+
+  // A rebuilt overlay reassigns lists over the same live bits: its counts
+  // are keyed apart from the old overlay's.
+  auto overlay = [&] {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    EXPECT_EQ(reader->segments().size(), 1u);
+    auto aux = reader->segments()[0].getAuxReader("vec.embedding_v");
+    EXPECT_NE(aux, nullptr);
+    return std::pair{aux ? aux->getGen() : 0, reader->segments()[0].liveDocsShared()};
+  };
+  auto [gen0, live0] = overlay();
+  ASSERT_TRUE(h.getIndexWriter()->testDropSegmentOverlay("vec.embedding_v", 0));
+  h.commit();
+  h.commit({"vec.embedding_v"});
+  auto [gen1, live1] = overlay();
+  ASSERT_NE(gen1, gen0);
+  ASSERT_EQ(live1, live0) << "rebuild must keep the live bits";
+  runAndCheck("d41");
+  EXPECT_EQ(KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed), builds3)
+      << "same live bits keep the bitmap";
+  EXPECT_GT(walks(), walks3) << "a rebuilt overlay must recount list sizes";
 }
 
 TEST_F(KnnQueryTest, deleteCommitReleasesSupersededLiveDocs) {
@@ -5354,7 +5382,10 @@ TEST_F(KnnQueryTest, completionPreviewPreservesAllocationAndPins) {
       } else {
         EXPECT_EQ(expected, resultIds(*req));
         ASSERT_EQ(baseline.size(), rounds.size());
-        EXPECT_EQ(allocatorEntries, stats.work.allocatorEntries);
+        // List live counts are memoized across queries, so this run walks
+        // no list ids: preview must not reach lists dispatch never did.
+        if (!nprobe) { EXPECT_GT(allocatorEntries, 0); }
+        EXPECT_EQ(0, stats.work.allocatorEntries);
         for (size_t r = 0; r < rounds.size(); r++) {
           EXPECT_EQ(baseline[r].kind, rounds[r].kind);
           EXPECT_EQ(baseline[r].target, rounds[r].target);

@@ -41,6 +41,7 @@ private:
   size_t derivedBytes = 0;
   mutable std::mutex rankLiveMutex;
   mutable std::vector<std::pair<std::string, std::unique_ptr<const RankLiveBitmap>>> rankLiveViews;
+  mutable std::vector<ListLiveCounts> listLiveViews;
 
 public:
   LiveDocs() : docSet(FixedBitSet(nullptr, 0)) {}
@@ -72,6 +73,23 @@ public:
     auto made = std::make_unique<const RankLiveBitmap>(build());
     rankLiveViews.emplace_back(field, std::move(made));
     return *rankLiveViews.back().second;
+  }
+
+  // Memoized per-list live counts of the ANN overlay (field, overlayGen) over
+  // these bits, all -1 when first created. Like the rank bitmaps they live
+  // exactly as long as this LiveDocs; callers keep it alive while they use
+  // the span.
+  std::span<std::atomic<int64_t>> listLiveCounts(std::string_view field, uint64_t overlayGen,
+                                                 size_t numLists) const {
+    std::lock_guard lock(rankLiveMutex);
+    for (const auto& view : listLiveViews) {
+      if (view.overlayGen == overlayGen && view.numLists == numLists && view.field == field)
+        return {view.counts.get(), view.numLists};
+    }
+    auto counts = std::make_unique<std::atomic<int64_t>[]>(numLists);
+    for (size_t i = 0; i < numLists; i++) counts[i].store(-1, std::memory_order_relaxed);
+    listLiveViews.push_back({std::string(field), overlayGen, numLists, std::move(counts)});
+    return {listLiveViews.back().counts.get(), numLists};
   }
 
   // Get the underlying FixedBitSet for direct access
