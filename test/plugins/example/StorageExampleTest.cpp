@@ -2,10 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include <filesystem>
+#include <unistd.h>
 
 #include "CountingStorage.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/store/ReadOnlyDirectory.h"
+#include "luxir/store/CorruptionMarker.h"
+#include "luxir/util/luxir_util.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
@@ -123,4 +127,71 @@ TEST_F(StorageExampleTest, pluginRamBackendAlsoRejectsReadOnly) {
   config.store.backend = "counting_ram";
   config.read_only = true;
   EXPECT_THROW(LuxirNode node(config), std::runtime_error);
+}
+
+// Reopening a writer at startup reads its commit root once and lists its
+// incarnation once: the recovery check, the marker check, the writer and its
+// orphan sweep share one listing. On an object store a listing is a paginated
+// request priced like a write, so each extra one shows on every restart.
+TEST_F(StorageExampleTest, aWriterOpenListsItsIncarnationOnce) {
+  auto path = std::filesystem::temp_directory_path() / ("luxir-open-listing-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(path);
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  LuxirConfig config;
+  config.store.backend = "fs";
+  config.store.data_dir = path.string();
+  config.store.layers = {"counting"};
+  std::string label;
+  {
+    LuxirNode node(config);
+    CollectionHelper h(node, "main");
+    ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+    auto incarnation = node.collections().catalog().current("main");
+    ASSERT_TRUE(incarnation);
+    label = "t/t0/i/" + *incarnation;
+    // A marker naming a committed file: the reopen verifies it and clears it.
+    auto dir = node.collections().catalog().directory(*incarnation);
+    auto files = h.getIndexWriter()->snapshots.snapshot()->files;
+    ASSERT_FALSE(files.empty());
+    std::vector<std::string> suspects{files.front().name};
+    CorruptionMarker::write(*dir, suspects, "test suspect");
+  }
+  LuxirNode reopened(config);
+  auto* layer = reopened.collections().storage().find<CountingLayer>();
+  ASSERT_NE(nullptr, layer);
+  auto collection = reopened.getCollection("main");
+  ASSERT_NE(nullptr, collection);
+  EXPECT_EQ(2, collection->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(1u, layer->counters->count("list", label)) << "a writer open listed its incarnation more than once";
+  auto dir = reopened.collections().catalog().directory(*reopened.collections().catalog().current("main"));
+  EXPECT_FALSE(CorruptionMarker::present(*dir)) << "the verified marker was not cleared";
+}
+
+TEST_F(StorageExampleTest, aFollowerOpenListsItsIncarnationOnce) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  config.store.layers = {"counting"};
+  config.replication.source = "http://127.0.0.1:1";
+  LuxirNode node(config, LuxirNode::Mode::PULL);
+  auto& collections = node.collections();
+  auto& catalog = collections.catalog();
+  auto id = catalog.reserve("main");
+  auto dir = catalog.directory(id);
+  {
+    CommitSnapshotRegistry snapshots(*dir);
+    IndexWriter writer(snapshots, {}, nullptr, 10, id);
+    auto snapshot = snapshots.snapshot();
+    ASSERT_FALSE(snapshot->files.empty());
+    CorruptionMarker::write(*dir, std::array{snapshot->files.front().name}, "test suspect");
+  }
+  catalog.activate("main", id);
+
+  auto* layer = collections.storage().find<CountingLayer>();
+  ASSERT_NE(nullptr, layer);
+  auto lists = [&] { return layer->counters->count("list", "t/t0/i/" + id); };
+  auto before = lists();
+  collections.open(Collections::Role::FOLLOWER);
+  EXPECT_EQ(id, node.getCollection("main")->getShard()->getSnapshots().snapshot()->id.incarnation);
+  EXPECT_EQ(before + 1, lists());
+  EXPECT_FALSE(CorruptionMarker::present(*dir));
 }

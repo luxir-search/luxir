@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/FieldReader.h"
 #include <luxir/query/AllQuery.h>
 #include <algorithm>
@@ -4622,7 +4623,7 @@ TEST_F(TermScorerTest, mandOptBulkPreparedSourcesCanRouteToBulk) {
   BooleanQuery query(mandatory, optional, empty, empty);
   auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
   ASSERT_TRUE(weight->needsPrepare());
-  Query::Weight::PrepareContext pctx{*reader, std::span<DocSet* const>{}, false, nullptr};
+  Query::Weight::PrepareContext pctx{*reader, std::span<DocSet* const>{}, nullptr, nullptr};
   auto prepared = weight->prepare(pctx);
   auto& segment = qContext.topReader.segments()[0];
   auto* supplier = prepared->scorerSupplier(pool, segment);
@@ -4811,7 +4812,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   PostingsWriter postingsWriter(dir, 0, 1, N + 16);
   {
     TextWriter writer(postingsWriter);
-    auto& finfo = postingsWriter.addField("f");
+    auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
     finfo.type = FieldType::TEXT;
     finfo.flags = FieldType::INDEX_DOCS_FREQS;
     writer.startField(&finfo);
@@ -4826,7 +4827,8 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  PostingsReader reader(dir, 0, 1);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;

@@ -142,9 +142,8 @@ private:
                                         std::optional<TenantCatalog::Entry> entry = {});
   void unload(const Transition& transition, const std::shared_ptr<Collection>& expected, std::string reason);
   // A writer whose newest root is invalid continues from the newest valid one
-  // under a new incarnation. Returns the incarnation to open.
-  std::string recoverWriter(const CollectionId& id, TenantCatalog& storage, const std::string& selected,
-                            const Manifest& manifest, IncarnationState& claimed);
+  // under a new incarnation. Updates opened to match the returned incarnation.
+  std::string recoverWriter(const CollectionId& id, TenantCatalog& storage, const std::string& selected, WriterOpen& opened);
   void observe(const CollectionId& id, Collection& collection);
   // The policy helpers require cachePolicyMutex. Listing locks nest inside it.
   size_t cacheBytes(const CollectionId& id) const;
@@ -218,9 +217,9 @@ public:
 
   Candidate stage(const CollectionId& id, std::string_view incarnation);
   // Makes `snapshot` durable in the candidate's directory, whose files the
-  // caller verified and synced, and opens its readers. On failure the
-  // candidate stays staged.
-  Prepared prepare(Candidate& candidate, std::shared_ptr<const CommitSnapshot> snapshot);
+  // caller verified and synced, and opens its readers. Clears the markers
+  // read for that verification. On failure the candidate stays staged.
+  Prepared prepare(Candidate& candidate, std::shared_ptr<const CommitSnapshot> snapshot, std::span<const std::string> markers);
   // Activates a prepared candidate in place of `expected` (null: absent):
   // the catalog durably selects it, the map points at it, the events feed
   // announces it, and incarnations nothing else needs are retired.

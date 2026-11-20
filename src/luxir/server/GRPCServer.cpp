@@ -779,8 +779,8 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   // Every search leaves this completion-queue thread for the task arena (see
   // SearchEngine::Receiver): gRPC offers a connection's new calls to its
   // preferred cq first, so a query run here would serialize the concurrent
-  // calls on that connection.  max_parallel keeps its parallelism meaning: 0
-  // (the default) and 1 run serially on a worker, -1 fans out from one.  The
+  // calls on that connection. With max_parallel, 0 is adaptive, 1 and -2
+  // are serial on a worker, and -1 publishes every sibling. The
   // reply and the final response come from that worker: respondRaw() is
   // thread-safe and Finish is kicked back to this call's cq thread.  The call
   // outlives the request because its outstanding-response count stays
@@ -871,7 +871,7 @@ static void respondPublished(GenericCallData& call, std::shared_ptr<State> state
   waits.awaitReplicas(waits.prepareReplicas(std::move(name), commit, *requirement,
                                             waits.deadlineAfter(timeoutMs.value_or(30000)), members),
       stop, [&call, state](api::ReplicaResult replicas) {
-        call.server.getLuxirNode().getTaskArena().enqueue([&call, state, replicas] {
+        call.server.getLuxirNode().getControlExecutor().enqueue([&call, state, replicas] {
           try {
             state->response.replicas = replicas;
             call.respondRaw(serializeToByteBuffer(state->response), 1);
@@ -894,7 +894,7 @@ static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& read
       call.enableWaitCancellation();
     }
     { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call, stop = call.waitCancellation.get_token()] {
+    call.server.getLuxirNode().getControlExecutor().enqueue([request, &call, stop = call.waitCancellation.get_token()] {
       try {
         auto id = LuxirNode::adminTarget(request->proto.tenant, request->proto.name);
         auto created = call.server.getLuxirNode().createCollection(id,
@@ -926,7 +926,7 @@ static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& read
 
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   try {
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+    call.server.getLuxirNode().getControlExecutor().enqueue([request, &call] {
       try {
         call.server.getLuxirNode().deleteCollection(LuxirNode::adminTarget(request->proto.tenant, request->proto.name));
         DeleteCollectionRespProto response;
@@ -953,7 +953,7 @@ static void handleCollectionNames(GenericCallData& call, grpc::ByteBuffer& readB
   }
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   try {
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+    call.server.getLuxirNode().getControlExecutor().enqueue([request, &call] {
       try {
         auto& node = call.server.getLuxirNode();
         auto& req = request->proto;
@@ -972,36 +972,42 @@ static void handleCollectionNames(GenericCallData& call, grpc::ByteBuffer& readB
 }
 
 //   rpc SetSchema(SchemaRequest) returns (SchemaResponse)  [unary]
+// updateSchema persists (fsync) under the writer's publication mutex, and may
+// create the collection: control-executor work, off the completion queue.
 static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
-  HppRequestState<SchemaReqProto> request;
-  if (!parseRequest(readBuf, request, "SetSchema")) {
+  auto request = std::make_shared<HppRequestState<SchemaReqProto>>();
+  if (!parseRequest(readBuf, *request, "SetSchema")) {
     finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SetSchema: malformed request"));
     return;
   }
-  if (!request.proto.schema.has_value()) {
+  if (!request->proto.schema.has_value()) {
     finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SetSchema: schema is required"));
     return;
   }
   try {
-    struct State {
-      std::pmr::monotonic_buffer_resource arena;  // backs the non-owning response SchemaDef
-      SchemaRespProto response;
-    };
-    auto state = std::make_shared<State>();
-    if (request.proto.wait_for_replicas) {
-      ReplicationSource::validate(*request.proto.wait_for_replicas);
+    if (request->proto.wait_for_replicas) {
+      ReplicationSource::validate(*request->proto.wait_for_replicas);
       call.enableWaitCancellation();
-      const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true;
     }
-
-    auto collection = call.server.getLuxirNode().getOrCreateCollection(
-        LuxirNode::target(request.proto.tenant, request.proto.collection));
-    auto newSchema = collection->updateSchema(*request.proto.schema, request.proto.mode);
-    newSchema->schema->toProto(&state->response.schema.emplace(), state->arena);
-    state->response.commit = api::build::arenaStr(state->arena, newSchema->id.token());
-    respondPublished(call, state, collection->getId(), newSchema->id, request.proto.wait_for_replicas,
-                     request.proto.wait_for_replicas_timeout_ms, ReplicationSource::Members::SERVING,
-                     call.waitCancellation.get_token());
+    { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+    call.server.getLuxirNode().getControlExecutor().enqueue([request, &call, stop = call.waitCancellation.get_token()] {
+      try {
+        struct State {
+          std::pmr::monotonic_buffer_resource arena;  // backs the non-owning response SchemaDef
+          SchemaRespProto response;
+        };
+        auto state = std::make_shared<State>();
+        auto& proto = request->proto;
+        auto collection = call.server.getLuxirNode().getOrCreateCollection(LuxirNode::target(proto.tenant, proto.collection));
+        auto newSchema = collection->updateSchema(*proto.schema, proto.mode);
+        newSchema->schema->toProto(&state->response.schema.emplace(), state->arena);
+        state->response.commit = api::build::arenaStr(state->arena, newSchema->id.token());
+        respondPublished(call, state, collection->getId(), newSchema->id, proto.wait_for_replicas,
+                         proto.wait_for_replicas_timeout_ms, ReplicationSource::Members::SERVING, stop);
+      } catch (const std::exception& e) {
+        finishWithException(call, e);
+      }
+    });
   } catch (const std::exception& e) {
     finishWithException(call, e);
   }
@@ -1037,22 +1043,25 @@ static void handleStats(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Stats: malformed request"));
     return;
   }
-
-  // Per-segment output is unbounded. Keep both collection sampling and
-  // serialization off the completion-queue thread; responsesExpected keeps
-  // the call alive and requestActive preserves per-call request ordering.
+  auto run = [request, &call] {
+    try {
+      StatsRespProto response;
+      std::pmr::monotonic_buffer_resource respArena;
+      gatherStats(call.server.getLuxirNode(), request->proto, response, respArena);
+      call.respondRaw(serializeToByteBuffer(response), 1);
+    } catch (const std::exception& e) {
+      finishWithException(call, e);
+    }
+  };
+  // Collection walks and system sampling run off the completion queue.
+  // responsesExpected keeps the call alive and requestActive preserves order.
+  if (canGatherStatsInline(request->proto)) {
+    run();
+    return;
+  }
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   try {
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
-      try {
-        StatsRespProto response;
-        std::pmr::monotonic_buffer_resource respArena;
-        gatherStats(call.server.getLuxirNode(), request->proto, response, respArena);
-        call.respondRaw(serializeToByteBuffer(response), 1);
-      } catch (const std::exception& e) {
-        finishWithException(call, e);
-      }
-    });
+    call.server.getLuxirNode().getControlExecutor().enqueue(std::move(run));
   } catch (const std::exception& e) {
     finishWithException(call, e);
   }
@@ -1067,10 +1076,10 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
   }
 
   // A dump is unbounded like per-segment stats, and a flush walks the entry
-  // map; keep both off the completion-queue thread.
+  // map; keep both off the completion-queue thread, on the control executor.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   try {
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+    call.server.getLuxirNode().getControlExecutor().enqueue([request, &call] {
       try {
         CacheControlRespProto response;
         std::pmr::monotonic_buffer_resource respArena;

@@ -5,7 +5,8 @@
 
 Usage: nightly.py plan
        nightly.py test PRESET OUTPUT IMAGE_ID
-       nightly.py publish DOWNLOAD_DIRECTORY COMMIT IMAGE PRESET [PRESET ...]
+       nightly.py publish DOWNLOAD_DIRECTORY COMMIT IMAGE LEG [LEG ...]
+Legs use platform/preset, e.g. linux-arm64/container-release.
 Environment: standard GitHub Actions variables and GH_TOKEN for API operations.
 """
 
@@ -46,36 +47,89 @@ def api(method, endpoint, data=None, missing_ok=False):
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
+def configured_legs():
+    return os.environ["NIGHTLY_LEGS"].split()
+
+
+def split_leg(leg):
+    arch, preset = leg.split("/", 1)
+    allowed = {
+        "linux-amd64": ("container-release", "container-release-v3", "container-release-v4",
+                        "container-debug", "container-asan"),
+        "linux-arm64": ("container-release",),
+        "macos-arm64": ("macos-release",),
+    }
+    if preset not in allowed.get(arch, ()):
+        raise ValueError(f"Invalid nightly leg: {leg}")
+    return arch, preset
+
+
+def published(reference):
+    """Whether a public ghcr.io image or artifact tag exists; needs only curl."""
+    repository, tag = reference.removeprefix("ghcr.io/").rsplit(":", 1)
+    token = json.loads(run("curl", "-fsS", "--max-time", "60",
+                           f"https://ghcr.io/token?scope=repository:{repository}:pull"))["token"]
+    accept = "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, " \
+             "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json"
+    return subprocess.run(["curl", "-fsS", "--max-time", "60", "-o", os.devnull, "-I",
+                           "-H", f"Authorization: Bearer {token}", "-H", f"Accept: {accept}",
+                           f"https://ghcr.io/v2/{repository}/manifests/{tag}"],
+                          stderr=subprocess.DEVNULL).returncode == 0
+
+
 def plan():
     commit = run("git", "rev-parse", "HEAD")
     tags = dict((line.split()[1], line.split()[0]) for line in
                 run("git", "ls-remote", "origin", "refs/tags/nightly", "refs/tags/nightly^{}").splitlines())
     previous = tags.get("refs/tags/nightly^{}", tags.get("refs/tags/nightly"))
     build = os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch" or previous != commit
-    outputs = {"commit": commit, "build": str(build).lower(),
-               "presets": json.dumps(os.environ["NIGHTLY_PRESETS"].split())}
+    outputs = {"commit": commit, "build": str(build).lower()}
     if build:
         key = run("python3", "tools/benchmarks/deps-key.py", ".")
+        macos_key = None
         image = f"ghcr.io/{os.environ['GITHUB_REPOSITORY_OWNER'].lower()}/luxir-dev:{key}"
-        result = subprocess.run(["timeout", "60", "docker", "manifest", "inspect", image],
-                                stdout=subprocess.DEVNULL)
-        if result.returncode:
-            raise RuntimeError(f"Missing {image}. Publish reviewed dependency inputs with deps-image.yml first.")
-        outputs["image"] = image
+        matrix = []
+        for leg in configured_legs():
+            arch, preset = split_leg(leg)
+            if arch == "macos-arm64":
+                if macos_key is None:
+                    macos_key = run("python3", "tools/benchmarks/deps-key.py", ".", "macos")
+                tagged = image.rsplit(":", 1)[0] + f":{macos_key}-macos-arm64"
+            else:
+                tagged = f"{image}-{arch.removeprefix('linux-')}"
+            if not any(item["platform"] == arch for item in matrix):
+                if not published(tagged):
+                    raise RuntimeError(f"Missing {tagged}. Publish reviewed dependency inputs with deps-image.yml first.")
+            matrix.append({"platform": arch, "preset": preset, "dependency": tagged,
+                           "runner": {"linux-arm64": "ubuntu-24.04-arm", "linux-amd64": "ubuntu-24.04",
+                                      "macos-arm64": "macos-15"}[arch]})
+        outputs["image"] = ", ".join(sorted({item["dependency"] for item in matrix}))
+        outputs["matrix"] = json.dumps({"include": matrix})
     with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
         stream.writelines(f"{key}={value}\n" for key, value in outputs.items())
     print(f"Source: {commit}; " + ("build requested" if build else "nightly already current"))
 
 
-def test(preset, output, image):
-    from release_support import cpu_supported
+def failures(log):
+    """The failed assertions and test names; the server log between them is noise.
+
+    Full output is retained in the artifact; this bounds the job summary.
+    """
+    found = re.findall(r"^.*: Failure\n(?:.*\n){0,8}?(?=\n|[IWE] \d\d:)|^\[  FAILED  \] .*\n", log, re.M)
+    # A crash or a timeout reports no gtest failure, so show where it stopped.
+    return "".join(dict.fromkeys(found))[:12000] or log[-12000:]
+
+
+def test(preset, output, builder):
+    from release_support import architecture, cpu_supported
 
     output = Path(output)
     cache = (Path("build") / preset / "CMakeCache.txt").read_text()
     tier = re.search(r"^LUXIR_CPU_TARGET:[^=]+=(.+)$", cache, re.M)[1]
     supported = cpu_supported(tier)
     results = {}
-    summary = [f"### {preset}\n", "| Binary | Status |", "| --- | --- |"]
+    platform = architecture(tier).platform + "-" + architecture(tier).name
+    summary = [f"### {platform}/{preset}\n", "| Binary | Status |", "| --- | --- |"]
     details = []
     for binary in TESTS:
         logfile = output / f"{binary}.log"
@@ -83,7 +137,11 @@ def test(preset, output, image):
             status, code = "not run on this CPU", None
             logfile.write_text(f"{tier} not supported by the container loader on this CPU\n")
         else:
-            env = dict(os.environ, ASAN_OPTIONS="detect_leaks=1:allow_addr2line=1")
+            env = dict(os.environ)
+            if architecture(tier).platform == "linux":
+                env["ASAN_OPTIONS"] = "detect_leaks=1:allow_addr2line=1"
+            else:
+                env.pop("ASAN_OPTIONS", None)
             with logfile.open("w") as stream:
                 try:
                     code = subprocess.run([f"build/{preset}/bin/{binary}", "--gtest_brief=1",
@@ -96,36 +154,46 @@ def test(preset, output, image):
         results[binary] = {"status": status, "exit_code": code}
         summary.append(f"| {binary} | {status} |")
         if status == "fail":
-            # Full output is retained in the artifact; bound the job summary.
-            log = logfile.read_text(errors="replace")[-12000:]
-            details.append(f"\n<details><summary>{binary} failing output (tail)</summary>\n\n"
-                           f"````\n{log}\n````\n</details>\n")
-    report = {"preset": preset, "commit": run("git", "rev-parse", "HEAD"),
+            details.append(f"\n<details><summary>{binary} failures</summary>\n\n"
+                           f"````\n{failures(logfile.read_text(errors='replace'))}\n````\n</details>\n")
+    report = {"platform": platform, "preset": preset, "commit": run("git", "rev-parse", "HEAD"),
               "subject": run("git", "show", "-s", "--format=%s", "HEAD"),
               "date": run("git", "show", "-s", "--format=%cI", "HEAD"),
-              "builder_image": image, "tests": results}
+              "builder": json.loads(builder), "tests": results}
     (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
     (output / "tests.md").write_text("\n".join(summary) + "\n" + "".join(details))
 
 
 def digest(path):
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        digest = hashlib.sha256()
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+        return digest.hexdigest()
 
 
-def assemble(directory, commit, image, presets):
+def validate_builder(builder, platform):
+    kind = "native" if platform == "macos-arm64" else "container"
+    digest = builder.get("dependency_digest" if kind == "native" else "image", "")
+    if builder.get("kind") != kind or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise ValueError("Missing immutable builder content")
+    if kind == "native" and not builder.get("toolchain"):
+        raise ValueError("Missing native toolchain identity")
+
+
+def assemble(directory, commit, image, legs):
     """Validate the complete fan-in before touching the previous nightly."""
     directory = Path(directory)
     assets = directory / "release"
     assets.mkdir()
     reports = []
-    for preset in presets:
-        leg = directory / f"nightly-{preset}"
+    for leg_id in legs:
+        arch, preset = split_leg(leg_id)
+        leg = directory / f"nightly-{arch}-{preset}"
         report = json.loads((leg / "result.json").read_text())
-        if report["commit"] != commit or report["preset"] != preset:
-            raise ValueError(f"Wrong source or preset in {leg}")
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", report["builder_image"]):
-            raise ValueError(f"Missing immutable builder image in {leg}")
+        if report["commit"] != commit or report["preset"] != preset or report["platform"] != arch:
+            raise ValueError(f"Wrong source, platform or preset in {leg}")
+        validate_builder(report["builder"], arch)
         if set(report["tests"]) != set(TESTS) or any(
                 result["status"] not in ("pass", "fail", "not run on this CPU")
                 for result in report["tests"].values()):
@@ -152,21 +220,21 @@ def assemble(directory, commit, image, presets):
     (assets / "SHA256SUMS").write_text("".join(f"{digest(p)}  {p.name}\n" for p in files))
     first = reports[0]
     notes = [f"Commit: `{commit}`", f"Subject: {first['subject']}", f"Date: {first['date']}",
-             f"Dependency image: `{image}`", "", "Tests are advisory; failures do not block publication.",
-             "", "| Preset | luxir_test | decoded_successor_no_avx512_test | decoded_successor_scalar_test | Builder image ID |",
-             "| --- | --- | --- | --- | --- |"]
+             f"Dependency builders: `{image}`", "", "Tests are advisory; failures do not block publication.",
+             "", "| Platform | Preset | luxir_test | decoded_successor_no_avx512_test | decoded_successor_scalar_test | Builder image or dependencies |",
+             "| --- | --- | --- | --- | --- | --- |"]
     for report in reports:
         statuses = " | ".join(report["tests"][binary]["status"] for binary in TESTS)
-        notes.append(f"| {report['preset']} | {statuses} | `{report['builder_image']}` |")
+        notes.append(f"| {report['platform']} | {report['preset']} | {statuses} | `{report['builder'].get('image') or report['builder']['dependency_digest']}` |")
     notes.append(f"\nFull test output: https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
     notes_file = directory / "notes.md"
     notes_file.write_text("\n\n".join(notes[:5]) + "\n" + "\n".join(notes[5:]) + "\n")
     return assets, notes_file
 
 
-def publish(directory, commit, image, *presets):
-    presets = presets or os.environ["NIGHTLY_PRESETS"].split()
-    assets, notes = assemble(directory, commit, image, presets)
+def publish(directory, commit, image, *legs):
+    legs = legs or configured_legs()
+    assets, notes = assemble(directory, commit, image, legs)
     stage = f"nightly-staging-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
     # Upload first. A failed upload leaves nightly and its tag untouched.
     gh("release", "create", stage, "--draft", "--prerelease", "--target", commit,

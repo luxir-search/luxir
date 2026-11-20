@@ -14,9 +14,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NIGHTLY_PRESETS: >-
-    container-release container-release-v3 container-release-v4
-    container-debug container-asan
+  NIGHTLY_LEGS: >-
+    linux-amd64/container-release linux-amd64/container-release-v3 linux-amd64/container-release-v4
+    linux-amd64/container-debug linux-amd64/container-asan linux-arm64/container-release macos-arm64/macos-release
 
 jobs:
   plan:
@@ -25,21 +25,16 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      packages: read
     outputs:
       commit: ${{ steps.plan.outputs.commit }}
       build: ${{ steps.plan.outputs.build }}
       image: ${{ steps.plan.outputs.image }}
-      presets: ${{ steps.plan.outputs.presets }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: main
           persist-credentials: false
-      - name: Sign in to registry
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: Test release assembly
         run: python3 tools/test-nightly
       - name: Resolve source and dependency image
@@ -49,36 +44,33 @@ jobs:
   build:
     needs: plan
     if: needs.plan.outputs.build == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
     permissions:
       contents: read
-      packages: read
     strategy:
       fail-fast: false
-      matrix:
-        preset: ${{ fromJSON(needs.plan.outputs.presets) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      LUXIR_DEV_IMAGE: ${{ needs.plan.outputs.image }}
+      LUXIR_DEV_IMAGE: ${{ matrix.dependency }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.plan.outputs.commit }}
           submodules: true
           persist-credentials: false
-      - name: Sign in to registry
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Install native tools
+        if: matrix.platform == 'macos-arm64'
+        run: tools/macos-toolchain setup
       - name: Build, test, and package
         env:
           PRESET: ${{ matrix.preset }}
-        run: BUILD_JOBS=$(nproc) tools/nightly-build "$PRESET"
+        run: tools/nightly-build "$PRESET"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
-          name: nightly-${{ matrix.preset }}
-          path: build/nightly/${{ matrix.preset }}/
+          name: nightly-${{ matrix.platform }}-${{ matrix.preset }}
+          path: build/nightly/${{ matrix.platform }}-${{ matrix.preset }}/
           if-no-files-found: error
           retention-days: 14
 

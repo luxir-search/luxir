@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "luxir/store/Manifest.h"
@@ -149,16 +150,17 @@ public:
 
 IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema,
                          IndexRamBudget* sharedIndexRamBudget, int mergeFactor, std::string initialIncarnation,
-                         oneapi::tbb::task_arena* arena, std::optional<IncarnationState> claimed)
+                         oneapi::tbb::task_arena* arena, std::optional<WriterOpen> opened)
   : dir(snapshots.dir),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
     snapshots(snapshots) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   mergePolicy->setMergeFactor(mergeFactor);
-  writerState = claimed ? std::move(*claimed) : IncarnationState::claim(dir);
+  if (!opened) opened.emplace(dir, IncarnationState::claim(dir));
+  writerState = std::move(opened->state);
   writerEpoch = writerState.value.epoch;
-  auto manifest = Manifest::load(dir, &writerState);
+  auto& manifest = opened->manifest;
   if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
     throw std::runtime_error("snapshot fallback requires recovery into a new incarnation");
   }
@@ -202,6 +204,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       seg.minVersion = segment.min_version;
       seg.maxVersion = segment.max_version;
       seg.liveDocs = segment.live_docs;
+      seg.mergeRows = segment.merge_rows.value_or(segment.max_doc);
       seg.schema = SchemaBinding(segment.schema);
       seg.files = fromWire(segment.files);
       seg.firstCommitTime = segment.commit_time;  // firstCommitTime is stored in the segment meta.
@@ -241,14 +244,17 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     int64_t bestBytes = -1;
     uint64_t bestSegId = 0;
     for (const auto& [id, seg] : segInfos) {
-      auto reader = getSegmentPostingsReader(*seg);
-      const auto* field = reader->fieldInfo(name);
-      if (!field || !field->stored || field->stored->dictionary.empty()) continue;
-      auto bytes = field->columnMetaOff;
-      if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
-        bestBytes = bytes;
-        bestSegId = id;
-        bestDictionary = field->stored->dictionary;
+      auto readerCore = getSegmentCore(*seg);
+      for (const auto& space : readerCore->spaces()) {
+        auto* reader = readerCore->spaceReader(space.path);
+        const auto* field = reader->fieldInfo(name);
+        if (!field || !field->stored || field->stored->dictionary.empty()) continue;
+        auto bytes = field->columnMetaOff;
+        if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
+          bestBytes = bytes;
+          bestSegId = id;
+          bestDictionary = field->stored->dictionary;
+        }
       }
     }
     auto token = storedDictionaries.token(name, stored->format_);
@@ -262,8 +268,8 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     seedActiveVectorOverlayNamesFromManifestLocked();
   }
 
-  if (arena) arena->execute([this] { updateGraph.emplace(); });
-  else updateGraph.emplace();
+  if (arena) arena->execute([this] { updateGraph.emplace(updateContext); });
+  else updateGraph.emplace(updateContext);
 
   // Create the updateGraph.  Start with a serial node that assigns an order to each update command
   // This could be done in a quick synchronized block instead... and could then be safely inspected by the client
@@ -464,6 +470,7 @@ void IndexWriter::close() {
   // queued before reset is included in wait_for_all below.
   pressureRegistration.reset();
 
+  Signal::emit("writerCloseDrain", this);
   // without this, in gcc release mode we can get a crash when the IndexWriter is destroyed, even when
   // the graph wasn't used. Presumably because the test was so fast and there was some async initialization
   // of the graph still going on?
@@ -697,6 +704,17 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
         && oldUnit->second != newUnit->second) {
       throw SchemaError(std::format("Cannot change unit of existing date field '{}': {} -> {}",
           name, oldUnit->second, newUnit->second));
+    }
+    // Existing segments hold only the postings of an indexed string written
+    // without a column, and ARRAY sequences cannot be rebuilt from those.
+    auto* type = schema->getFieldTypePtr(name);
+    auto oldColumn = old->second.properties.find("column");
+    if (type && FieldType::storage(type->type()) == FieldType::Storage::TERMS && type->indexed()
+        && type->hasColumn() && oldColumn != old->second.properties.end()
+        && oldColumn->second == "false") {
+      throw SchemaError(std::format(
+          "Cannot add a column to existing indexed string field '{}'; reindex into a new field",
+          name));
     }
   }
   std::pmr::monotonic_buffer_resource arena;
@@ -1454,7 +1472,8 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   if (!aborted) {
     segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
                                         inverter.getPostingsWriter().creatorEpoch,
-                                        inverter.getPostingsWriter().getMaxDoc());
+                                        inverter.getPostingsWriter().getMaxDoc(SpaceOrdinal::ROOT));
+    segInfo->mergeRows = inverter.getPostingsWriter().getMaxSpaceRows();
     segInfo->unsyncedFiles = std::move(flushedFiles);
     segInfo->files = std::move(descriptors);
     segInfo->minVersion = inverter.minVersion;
@@ -2029,6 +2048,13 @@ std::vector<AuxInfo> IndexWriter::buildAuxIndexes(
 
 namespace {
 
+std::vector<VectorIndexBuilder::SegInput> vectorInputs(SegInfo& seg, SegmentCore& core) {
+  std::vector<VectorIndexBuilder::SegInput> inputs;
+  inputs.reserve(core.spaces().size());
+  for (const auto& space : core.spaces()) inputs.emplace_back(seg.segId, core.spaceReader(space.path), seg.creatorEpoch);
+  return inputs;
+}
+
 bool eligibleVectorOverlayName(const Schema& schema, std::string_view overlayName) {
   if (!overlayName.starts_with(VectorIndexBuilder::NAME_PREFIX)) return false;
   overlayName.remove_prefix(VectorIndexBuilder::NAME_PREFIX.size());
@@ -2060,25 +2086,26 @@ std::vector<std::string> collectValidatedExactVectorOverlayNames(
 } // namespace
 
 // Benign load-then-store race: the commit thread and a merge thread can both
-// miss and each create a PostingsReader for a source segment - both are valid,
+// miss and each create a SegmentCore for a source segment - both are valid,
 // one is wasted, last store wins.  Deliberately NOT a lock or CAS; do not
 // "fix" this into synchronization.
 //
-std::shared_ptr<PostingsReader> IndexWriter::getSegmentPostingsReader(SegInfo& seg) {
-  auto pr = seg.sharedPostingsReader.load();
-  if (!pr) {
+std::shared_ptr<SegmentCore> IndexWriter::getSegmentCore(SegInfo& seg) {
+  auto core = seg.sharedSegmentCore.load();
+  if (!core) {
     std::shared_ptr<IndexReader> reader;
-    if (const auto* published = publishedSegment(seg, reader)) pr = published->postingsReaderShared();
-    if (!pr) pr = std::make_shared<PostingsReader>(dir, seg.segId, seg.creatorEpoch);
-    seg.sharedPostingsReader.store(pr);
+    if (const auto* published = publishedSegment(seg, reader)) core = published->segmentCoreShared();
+    if (!core) core = std::make_shared<SegmentCore>(dir, seg.segId, seg.creatorEpoch);
+    seg.sharedSegmentCore.store(core);
   }
+  auto& pr = core->rootReader();
   bool rangeKnown = seg.idRange.load() != nullptr;
   if (!rangeKnown || seg.idDictionaryBlocks.load() == UINT64_MAX) {
     IdRange range;
     uint64_t blocks = 0;
-    if (auto* info = pr->fieldInfo("id"); info && info->nTerms > 0) {
+    if (auto* info = pr.fieldInfo("id"); info && info->nTerms > 0) {
       auto guard = MemPool::threadLocalPoolGuard();
-      TermsEnum terms(guard.pool(), *pr, *info);
+      TermsEnum terms(guard.pool(), pr, *info);
       blocks = terms.numBlocks();
       if (!rangeKnown) {
         terms.seekOrd(0);
@@ -2092,7 +2119,7 @@ std::shared_ptr<PostingsReader> IndexWriter::getSegmentPostingsReader(SegInfo& s
     // A populated range is never replaced.
     if (!rangeKnown) seg.idRange.store(std::make_shared<const IdRange>(std::move(range)));
   }
-  return pr;
+  return core;
 }
 
 // The published reader's segment of the same id is the same physical segment:
@@ -2150,10 +2177,10 @@ void IndexWriter::prepareMergedVectorOverlays(SegInfo& output,
   auto schema = getSchema();
   phase = "merged_postings_reader";
   Signal::emit("mergedPostingsReader", &output);
-  auto pr = getSegmentPostingsReader(output);
+  auto prCore = getSegmentCore(output);
   if (!selectors.empty()) {
-    VectorIndexBuilder::SegInput input{output.segId, pr.get(), output.creatorEpoch};
-    VectorIndexBuilder matcher(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
+    auto inputs = vectorInputs(output, *prCore);
+    VectorIndexBuilder matcher(dir, inputs,
                                *schema, 0, writerEpoch);
     for (const auto& name : matcher.matchingOverlayNames(selectors)) {
       if (!attempted.contains(name)) wanted.emplace(name);
@@ -2169,7 +2196,7 @@ void IndexWriter::prepareMergedVectorOverlays(SegInfo& output,
   std::vector<AuxInfo> built;
   try {
     phase = "merge_vector_overlay";
-    built = buildConcreteVectorOverlays(output, *pr, names, *schema,
+    built = buildConcreteVectorOverlays(output, *prCore, names, *schema,
                                         VectorIndexBuilder::BuildSite::MERGE,
                                         stagedOverlayFiles);
     output.unsyncedFiles.reserve(output.unsyncedFiles.size() + stagedOverlayFiles.size());
@@ -2198,7 +2225,7 @@ uint64_t IndexWriter::nextSegmentOverlayGen(SegInfo& seg) {
 
 std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
     SegInfo& seg,
-    PostingsReader& postingsReader,
+    SegmentCore& core,
     std::span<const std::string> overlayNames,
     const Schema& schema,
     VectorIndexBuilder::BuildSite buildSite,
@@ -2213,12 +2240,15 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
     }
   }
 
-  VectorIndexBuilder::SegInput input{seg.segId, &postingsReader, seg.creatorEpoch};
   for (const auto& overlayName : overlayNames) {
     if (existingNames.contains(overlayName)) {
       continue;
     }
 
+    auto fieldName = std::string_view(overlayName).substr(VectorIndexBuilder::NAME_PREFIX.size());
+    auto* reader = core.spaceReader(spaceParentPath(fieldName));
+    if (!reader) continue;
+    VectorIndexBuilder::SegInput input{seg.segId, reader, seg.creatorEpoch};
     uint64_t overlayGen = nextSegmentOverlayGen(seg);
     VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
                           schema, overlayGen, writerEpoch, indexRamBudget);
@@ -2326,14 +2356,13 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
     if (!vectorSelectors.empty() && schema) {
       for (size_t i = 0; i < segsToKeep.size(); i++) {
         auto* seg = segsToKeep[i];
-        auto pr = getSegmentPostingsReader(*seg);
-        VectorIndexBuilder::SegInput input{seg->segId, pr.get(), seg->creatorEpoch};
-        VectorIndexBuilder matcher(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
-                                   *schema, 0, writerEpoch);
+        auto prCore = getSegmentCore(*seg);
+        auto inputs = vectorInputs(*seg, *prCore);
+        VectorIndexBuilder matcher(dir, inputs, *schema, 0, writerEpoch);
         auto overlayNames = matcher.matchingOverlayNames(vectorSelectors);
         stagedActiveOverlayNames.insert(stagedActiveOverlayNames.end(),
                                         overlayNames.begin(), overlayNames.end());
-        auto built = buildConcreteVectorOverlays(*seg, *pr, overlayNames, *schema,
+        auto built = buildConcreteVectorOverlays(*seg, *prCore, overlayNames, *schema,
                                                  VectorIndexBuilder::BuildSite::COMMIT, stagedFiles);
         for (auto& info : built) {
           stagedOverlays.push_back({seg, std::move(info)});
@@ -2420,20 +2449,20 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   // The segments this writer owns, current or awaiting retirement, and the
   // ones of this snapshot it holds open, for the reader that opens it.
   boost::unordered_flat_map<uint64_t, SegInfo*> ownedSegments;
-  std::vector<std::weak_ptr<PostingsReader>> openReaders(info.segments.size());
+  std::vector<std::weak_ptr<SegmentCore>> openCores(info.segments.size());
   {
     std::lock_guard lock(indexMutex);
     for (const auto& [id, seg] : segInfos) ownedSegments.emplace(id, seg.get());
     for (const auto& seg : segmentsToDelete) ownedSegments.emplace(seg->segId, seg.get());
     for (size_t i = 0; i < info.segments.size(); i++) {
       auto owned = ownedSegments.find(info.segments[i].seg_id);
-      if (owned != ownedSegments.end()) openReaders[i] = owned->second->sharedPostingsReader.load();
+      if (owned != ownedSegments.end()) openCores[i] = owned->second->sharedSegmentCore.load();
     }
   }
   auto snapshot = std::make_shared<const CommitSnapshot>(
       std::make_shared<const std::vector<std::byte>>(std::move(serialized)), schema,
       CommitId{incarnation, info.index_gen}, info.commit_time, filesOf(info), CommitSnapshot::populatedOf(info), digest,
-      std::move(openReaders));
+      std::move(openCores));
   std::pmr::monotonic_buffer_resource retirementArena;
   api::IndexInfo obsolete;
   if (previous) obsolete = Manifest::decode(previous->bytes, retirementArena);
@@ -2560,6 +2589,7 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
     wire.creator_epoch = seg.creatorEpoch;
     wire.live_epoch = seg.liveEpoch;
     wire.max_doc = seg.maxDoc;
+    if (seg.mergeRows != seg.maxDoc) wire.merge_rows = seg.mergeRows;
     wire.live_gen = seg.liveGen;
     wire.min_version = seg.minVersion;
     wire.max_version = seg.maxVersion;
@@ -2676,9 +2706,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         size_t target = (size_t)msg.maxSegments;
         if (segs.size() > target) {
           std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
-            if (a->liveDocs != b->liveDocs) {
-              return a->liveDocs < b->liveDocs;
-            }
+            auto aRows = a->estimatedLiveMergeRows(), bRows = b->estimatedLiveMergeRows();
+            if (aRows != bRows) return aRows < bRows;
             return a->segId < b->segId;
           });
           segs.resize(segs.size() - target + 1);
@@ -2709,6 +2738,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       // (the live docs the merger copies) must stay below MAX_SEGMENT_DOCS.
       int64_t mergedDocs = 0;
       boost::unordered_flat_map<std::string, int64_t> ordTermSums;
+      boost::unordered_flat_map<std::string, int64_t> pathRows;
       std::vector<SegInfo*> admitted;
       admitted.reserve(segs.size());
       for (SegInfo* seg : segs) {
@@ -2717,33 +2747,47 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
                       seg->name());
           continue;
         }
-        auto postingsReader = getSegmentPostingsReader(*seg);
+        auto postingsReaderCore = getSegmentCore(*seg);
         MemPool metadataPool;
-        FieldReader fields(*postingsReader);
         boost::unordered_flat_map<std::string, int64_t> additions;
-        bool fits = true;
-        while (fields.readNextField()) {
-          SegFieldInfo info;
-          fields.readFieldInfo(info);
-          if (FieldType::storage(info.type) != FieldType::Storage::TERMS ||
-              (info.flags & FieldType::INDEX_DOCS) == 0 ||
-              (info.flags & FieldType::MULTI_VALUED) == 0) {
-            continue;
+        auto ordsFit = [&](PostingsReader& reader) {
+          FieldReader fields(reader);
+          while (fields.readNextField()) {
+            SegFieldInfo info{};
+            fields.readFieldInfo(info);
+            if (FieldType::storage(info.type) != FieldType::Storage::TERMS ||
+                (info.flags & FieldType::INDEX_DOCS) == 0 ||
+                (info.flags & FieldType::MULTI_VALUED) == 0) {
+              continue;
+            }
+            std::string name((std::string_view)info.fieldname);
+            int64_t next = additions[name] + info.nTerms;
+            if (!MergeCostModel::ordTermsFit(ordTermSums[name], next)) {
+              return false;
+            }
+            additions[name] = next;
           }
-          std::string name((std::string_view)info.fieldname);
-          int64_t next = additions[name] + info.nTerms;
-          if (!MergeCostModel::ordTermsFit(ordTermSums[name], next)) {
-            fits = false;
-            break;
-          }
-          additions[name] = next;
+          return true;
+        };
+        bool fits = ordsFit(postingsReaderCore->rootReader());
+        std::vector<std::pair<std::string, int64_t>> nextRows;
+        for (size_t i = 1; fits && i < postingsReaderCore->spaces().size(); i++) {
+          const auto& space = postingsReaderCore->spaces()[i];
+          // Physical rows bound the merged space from above: rows of deleted
+          // roots still count, so a merge that would fit once they are dropped
+          // can be skipped.
+          int64_t next = pathRows[space.path] + space.maxDoc;
+          fits = MergeCostModel::docsFit(0, next)
+              && ordsFit(*postingsReaderCore->spaceReader(space.path));
+          nextRows.emplace_back(space.path, next);
         }
         if (!fits) {
-          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged ord dictionary would exceed the safety limit",
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged row space or ord dictionary would exceed the safety limit",
                       seg->name());
           continue;
         }
         for (const auto& [field, terms] : additions) ordTermSums[field] += terms;
+        for (const auto& [path, rows] : nextRows) pathRows[path] = rows;
         mergedDocs += seg->liveDocs;
         admitted.push_back(seg);
       }
@@ -2805,11 +2849,11 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     });
 
     phase = "open_source_readers";
-    // grab or open all the postings readers
-    std::vector<std::shared_ptr<PostingsReader>> preaders;
-    preaders.reserve(segs.size());
+    // Pin the source cores for the merge.
+    std::vector<std::shared_ptr<SegmentCore>> sourceCores;
+    sourceCores.reserve(segs.size());
     for (auto segInfo : segs) {
-      preaders.emplace_back(getSegmentPostingsReader(*segInfo));
+      sourceCores.emplace_back(getSegmentCore(*segInfo));
     }
 
     phase = "load_live_docs";
@@ -2837,13 +2881,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     }
 
     phase = "prepare_merge_inputs";
-    // Copy the preaders to a vector of pointers for our underlying merge code.
-    std::vector<PostingsReader*> preaderPtrs;
-    preaderPtrs.reserve(preaders.size());
-    for (auto& preader : preaders) {
-      preaderPtrs.push_back(preader.get());
-    }
-
+    // Merge cursors borrow the space readers from the pinned cores.
     {
       PostingsWriter pwriter(dir, outputSegId, writerEpoch);
 
@@ -2851,14 +2889,14 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       // Do the actual merge.  The current schema chooses each stored-fields
       // resource's output format.
       auto mergeSchema = getSchema();
-      SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget,
+      SegmentMerger merger(sourceCores, liveDocsPtrs, pwriter, *indexRamBudget,
                            termPartitionMinBytes, termPartitionMinRangeBytes,
                            termPartitionMaxRanges, *mergeSchema, storedDictionaries);
       merger.merge();
 
       phase = "new_segment_info";
       // Create the new SegInfo for the output segment.
-      auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.creatorEpoch, pwriter.getMaxDoc());
+      auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.creatorEpoch, pwriter.getMaxDoc(SpaceOrdinal::ROOT));
       newSegInfo->minVersion = segs.front()->minVersion;
       newSegInfo->maxVersion = segs.front()->maxVersion;
       newSegInfo->schema = segs.front()->schema;
@@ -2869,6 +2907,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       }
       phase = "postings_finish";
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
+      newSegInfo->mergeRows = pwriter.getMaxSpaceRows();
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
 
@@ -3344,6 +3383,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
   Stats out;
   std::vector<uint64_t> committedIds;
   std::vector<uint64_t> writerSegmentIds;
+  std::vector<std::shared_ptr<SegmentCore>> cores;
   auto copyAux = [](const AuxInfo& src) {
     AuxStats dst;
     dst.kind = src.kind;
@@ -3396,7 +3436,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
 
     committedIds = lastCommittedSegIds;
     if (!includeSegments) writerSegmentIds.reserve(segInfos.size());
-    if (includeSegments) out.segmentStats.reserve(segInfos.size());
+    if (includeSegments) { out.segmentStats.reserve(segInfos.size()); cores.reserve(segInfos.size()); }
     for (const auto& [segId, seg] : segInfos) {
       unused(segId);
       if (!includeSegments) writerSegmentIds.push_back(seg->segId);
@@ -3405,6 +3445,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
       if (!includeSegments) continue;
 
       auto& dst = out.segmentStats.emplace_back();
+      cores.push_back(seg->sharedSegmentCore.load());
       dst.segId = seg->segId;
       dst.creatorEpoch = seg->creatorEpoch;
       dst.liveGen = seg->liveGen;
@@ -3420,6 +3461,13 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
       dst.merging = seg->merging;
     }
   }
+
+  for (size_t i = 0; i < cores.size(); i++) {
+    auto& segment = out.segmentStats[i];
+    if (!cores[i]) cores[i] = SegmentCore::create(dir, segment.segId, segment.creatorEpoch, true);
+    if (cores[i]) segment.readSpaces(*cores[i]);
+  }
+  cores.clear();
 
   boost::unordered_flat_set<uint64_t> committedSet(committedIds.begin(), committedIds.end());
   for (uint64_t segId : writerSegmentIds) {
@@ -3529,8 +3577,8 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
   }
 
   // Read the segment to find documents that should be deleted
-  auto sharedReader = getSegmentPostingsReader(seg);
-  PostingsReader& reader = *sharedReader;
+  auto core = getSegmentCore(seg);
+  PostingsReader& reader = core->rootReader();
   int32_t maxDocId = reader.maxDoc();
 
   if (!range) {
@@ -3591,7 +3639,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     scratch.forceResize((int64_t)(hits.capacity() * sizeof(DeleteCandidate)));
     std::sort(hits.begin(), hits.end(),
               [](const DeleteCandidate& a, const DeleteCandidate& b) { return a.docId < b.docId; });
-    VersionRuns::Cursor versions(reader.versionRuns());
+    VersionRuns::Cursor versions(reader.core().versionRuns());
     int32_t cleared = 0;
     for (const auto& hit : hits) {
       // A doc goes when any fact outranks its birth; ties survive.

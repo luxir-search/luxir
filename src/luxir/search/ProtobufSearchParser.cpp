@@ -27,14 +27,19 @@
 #include "luxir/search/ops/FusionOp.h"
 #include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/query/AllQuery.h"
+#include "luxir/query/ToParentQuery.h"
+#include "luxir/query/BoostQuery.h"
+#include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/FittedTerms.h"
 #include "luxir/search/RangeFacetGrid.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/MinScoreQuery.h"
 #include "luxir/query/ProtobufQueryParser.h"
+
 #include "luxir/query/QueryBuilder.h"
 #include "luxir/query/QueryShape.h"
+#include "luxir/query/KnnQuery.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/Overloaded.h"
@@ -114,9 +119,10 @@ struct OpParseContext {
 
 struct SearchParserImpl {
   SearchRequest& req;
-  FieldResolver fields;
+  ParseView parseView;
   OpParseContext options;
   TopDocsReq* firstQuery = nullptr;
+  NamedClauses namedClauses;
   size_t nonDefaultDomainVariants = 0;
   std::unordered_map<const api::SearchOp*, FacetParsePlan> preparedFacets;
   const CollapsePlan* enclosingCollapse = nullptr;
@@ -133,6 +139,7 @@ struct SearchParserImpl {
     ROOT_OP,
     NESTED_OP,
     FUSION_SOURCE,
+    ROW_OP,
   };
 
   enum class OpsPlacement : uint8_t {
@@ -215,27 +222,24 @@ public:
   // We need access to the schema to figure out what types of queries to produce?
   // Both the pool and any parsed protobuf objects must outlive the query tree.
 
+  const std::shared_ptr<IndexReader>& view() const { return parseView.reader(); }
+
   explicit SearchParserImpl(SearchRequest& req)
-    : req(req), fields(*req.schema, req.resolvedFields), maxOpDepth(req.searchConfig.max_op_depth) {
+    : req(req), parseView(*req.schema, req.resolvedFields, &req.reader, &req), maxOpDepth(req.searchConfig.max_op_depth) {
   }
 
   // Every planning context of the request draws on one multi-term budget.
   Query::PlanningContext* createPlanningContext() {
-    Query::PlanningContext::Limits limits;
-    limits.multiTermBudget = &req.multiTermBudget;
-    return luxir::arenaCreate<Query::PlanningContext>(
-        req.arena, req.requestPool, *req.reader, limits, &req.warnings,
-        FilterKeyContext{.schemaGen = req.schema->gen_, .timeZone = req.proto.time_zone},
-        req.filterUses, &req.memoryTracker, req.proto.profile ? &req : nullptr);
+    return req.createPlanningContext(*view());
   }
 
   // All request parse paths share the operator rules and field resolver.
   ParseContext createParseContext(std::string_view name) {
     ParseContext parseContext{req.requestPool, *req.schema, req.arena,
-        coerceContext(*req.timeZone), name, &req.warnings, &fields, &req.engine.getNode()};
+        coerceContext(*req.timeZone), name, &req.warnings, &parseView, &req.engine.getNode()};
     parseContext.minLiteralPrefix = req.searchConfig.multiterm_min_prefix_length;
     parseContext.collapse = enclosingCollapse;
-    parseContext.reader = req.reader.get();
+    parseContext.names = &namedClauses;
     return parseContext;
   }
 
@@ -411,11 +415,85 @@ public:
     groupExprStats(currOp, placement, destination ? *destination : currOp.subOps);
   }
 
+  std::string domainPath(std::string_view to) {
+    if (to == "/") return {};
+    if (to.empty()) throw RequestError("domain.to requires a path, .., or /");
+    if (to == ".." || to.starts_with("../")) {
+      size_t levels = 0;
+      for (;;) {
+        auto slash = to.find('/');
+        if (to.substr(0, slash) != "..") {
+          throw RequestError("domain.to requires .. at every upward step; sibling paths such as '../name' are reserved");
+        }
+        ++levels;
+        if (slash == std::string_view::npos) break;
+        to.remove_prefix(slash + 1);
+      }
+      std::string path(view()->path());
+      while (levels--) {
+        if (path.empty()) throw RequestError("domain.to cannot move above the root view");
+        auto dot = path.rfind('.');
+        path.resize(dot == std::string::npos ? 0 : dot);
+      }
+      return path;
+    }
+    if (to.find('/') != std::string_view::npos) {
+      throw RequestError("domain.to uses dots to descend; '/' only separates .. steps or names the root view");
+    }
+    return parseView.fields.resolvePath(to).physicalName;
+  }
+
+  bool movesView(const api::Domain& domain) {
+    return domain.to && domainPath(*domain.to) != view()->path();
+  }
+
   SearchOp* parseOp(std::string_view name, const luxir::api::SearchOp& searchOp,
                     int depth, OpsPlacement placement) {
     auto inherited = options;
     options = inherited.child(searchOp, name);
     auto restoreOptions = scope_guard([&]() noexcept { options = inherited; });
+    auto* previousCollapse = enclosingCollapse;
+    auto* previousMeasure = inheritedFacetMeasure;
+    auto* previousList = owningList;
+    auto restoreScope = scope_guard([&]() noexcept {
+      enclosingCollapse = previousCollapse;
+      inheritedFacetMeasure = previousMeasure;
+      owningList = previousList;
+    });
+    if (searchOp.domain && searchOp.domain->from_match) {
+      throw RequestError("domain.from_match '" + std::string(*searchOp.domain->from_match) + "' is only supported in row_ops");
+    }
+    InputDomainPlan* input = nullptr;
+    std::optional<ParseView::Scope> viewScope;
+    if (searchOp.domain && movesView(*searchOp.domain)) {
+      const auto& domain = *searchOp.domain;
+      const auto& destination = req.pinView(domainPath(*domain.to));
+      bool descending = destination->path().size() > view()->path().size();
+      input = arenaCreate<InputDomainPlan>(req.arena);
+      input->mapping = {&req.ownershipRelation(descending ? *destination : *view(),
+          descending ? *view() : *destination),
+          descending ? RowRelation::Direction::EXPAND : RowRelation::Direction::PROJECT};
+
+      enclosingCollapse = nullptr;
+      inheritedFacetMeasure = nullptr;
+      owningList = nullptr;
+      viewScope.emplace(parseView, destination->path());
+      auto context = createParseContext(name);
+      auto parsed = parseDomain(domain, name, context);
+      input->applyParentFilters = parsed.applyParentFilters;
+      parsed.applyParentFilters = false;
+      if (parsed.query || !parsed.filters.empty()) {
+        input->planning = createPlanningContext();
+        ParsedDomains domains;
+        domains.emplace(name, std::move(parsed));
+        validateDomainQueries(domains, *input->planning);
+        input->variants.begin(0);
+        addDomainRoute(name, &domains.at(name), [](size_t) { return false; },
+            input->planning, input->variants);
+        auto* weights = Query::Context::create(&req.arena, *input->planning);
+        input->variants.buildWeights(*weights, *input->planning, 0);
+      }
+    }
     if (searchOp.domain && placement == OpsPlacement::FUSION) {
       throw RequestError("domain is not supported under Fusion.ops");
     }
@@ -435,6 +513,7 @@ public:
         auto topDocsPlacement = depth == 1 && !searchOp.domain
             ? TopDocsPlacement::ROOT_OP : TopDocsPlacement::NESTED_OP;
         auto* qr = parseTopDocs(name, topDocs, topDocsPlacement);
+        parseRowOps(*qr, topDocs, depth);
         if (topDocs.collapse) {
           addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
           // Keep the nearest collapse for explicit group units, while a
@@ -507,19 +586,20 @@ public:
       },
       [&](const luxir::api::ExprOp& exprOp) -> SearchOp* {
         AggregateExprOptions options{req.schema.get(), exprOp.vars, name};
-        options.fieldResolver = &fields;
+        options.fieldResolver = &parseView.fields;
+        options.view = &parseView;
         options.shareProducers = !disableAggregateSharingForTests;
         AggregateProgram* program =
             AggregateExprParser(options, req.arena).parse(exprOp.expr);
-        auto fields = resolveAggregateFields(*program, req.requestPool, *req.reader);
-        return luxir::arenaCreate<ExprStatsOp>(req.arena, req, name, *program, fields);
+        auto fields = resolveAggregateFields(*program, req.requestPool, *view());
+        return luxir::arenaCreate<ExprStatsOp>(req.arena, req, view(), name, *program, fields);
       },
       [&](const luxir::api::PluginOp& pluginOp) -> SearchOp* {
         return parsePluginOp(name, pluginOp, depth);
       },
       [&](std::monostate) -> SearchOp* { throw std::runtime_error("search op oneof not set"); },
     }, searchOp.kind);
-    if (op != nullptr) op->flags = options.flags;
+    if (op != nullptr) { op->flags = options.flags; op->inputDomain = input; }
     return op;
   }
 
@@ -574,10 +654,10 @@ public:
         && spec.missing != Missing::DROP) throw RequestError("invalid collapse.missing");
     if (spec.field.empty()) throw RequestError("collapse.field must not be empty");
     auto* collapse = luxir::arenaCreate<CollapsePlan>(
-        req.arena, *req.reader, spec.missing, getNumber);
+        req.arena, *view(), spec.missing, getNumber);
     std::unordered_set<std::string> resolved;
     for (std::string_view name : spec.field) {
-      auto field = req.schema->resolveFor(name, OpClass::VALUE);
+      auto field = parseView.fields.resolveLocal(name, OpClass::VALUE);
       auto& type = *field.fieldType;
       if (type.multiValued() || !type.hasColumn()) {
         throw RequestError("collapse key must be single-valued with a column: " + std::string(name));
@@ -604,8 +684,8 @@ public:
         throw RequestError("string collapse key must be indexed: " + std::string(name));
       }
       collapse->fields.push_back({field.physicalName, wireType, storage,
-          ordinal ? req.reader->getOrdMap(field.physicalName) : nullptr,
-          req.reader->field(field.physicalName), type.valueNature()});
+          ordinal ? view()->getOrdMap(field.physicalName) : nullptr,
+          view()->field(field.physicalName), type.valueNature()});
     }
     return collapse;
   }
@@ -674,7 +754,7 @@ public:
                                      context, termFilter.partition, termFilter.num_partitions));
     }
     QueryBuilder builder(req.requestPool, *req.schema, coerceContext(*req.timeZone),
-                         facetName, &req.warnings, &fields);
+                         facetName, &req.warnings, &parseView.fields);
     FacetTermFilterSpec spec;
     // Errors name the term_filter field they came from.
     auto within = [&](std::string_view name, auto&& build) {
@@ -689,7 +769,7 @@ public:
     auto compile = [&](std::string_view pattern, bool positive) {
       TermPattern compiled = builder.compileRegexPattern(target, pattern);
       if (compiled.fittedPolicy && !(positive && compiled.fittedPrefix)) {
-        warnIfFittedTermsReachable(*req.reader, &req.warnings, req.requestPool,
+        warnIfFittedTermsReachable(*view(), &req.warnings, req.requestPool,
             target.physicalName, *compiled.fittedPolicy, [&] {
               return compiled.dfa.maxAcceptedLength() >= (int32_t)PackedTerm::MIN_FITTED_LEN;
             });
@@ -732,7 +812,7 @@ public:
       const CanonicalValueSet* preparedSelected = nullptr) {
     validateSelectionEnvelope(facetName, facetReq, placement);
     const CollapsePlan* measure = resolveMeasure(facetReq);
-    const auto& target = fields.resolve(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
+    const auto& target = parseView.fields.resolveLocal(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
     auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
     int64_t limit = 5; // default limit
     if (facetReq.limit.has_value()) {
@@ -767,7 +847,7 @@ public:
     if (preparedSelected == nullptr && !selectedValues.empty()) {
       CoerceContext selectionContext = coerceContext(*req.timeZone);
       QueryBuilder builder(req.requestPool, *req.schema,
-                           selectionContext, facetName, &req.warnings, &fields);
+                           selectionContext, facetName, &req.warnings, &parseView.fields);
       ownedSelected = builder.canonicalizeFieldValues(
           target, selectedValues, true);
       preparedSelected = &ownedSelected;
@@ -789,7 +869,7 @@ public:
         if (facetReq.mincount.has_value() && *facetReq.mincount < 1) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for numeric field facets");
         }
-        facet = luxir::arenaCreate<IntFacetReq>(req.arena, req, facetReq,
+        facet = luxir::arenaCreate<IntFacetReq>(req.arena, req, view(), facetReq,
             facetField, facetName, limit, minCount, missing, selectedInts);
         break;
       }
@@ -806,19 +886,24 @@ public:
               + std::string(facetField) + "' is column-only (not indexed); string facets "
               "require an indexed field");
         }
+        if (!ftype->hasColumn()) {
+          throw std::runtime_error("facet '" + std::string(facetName) + "': field '"
+              + std::string(facetField) + "' has no column (column: false); string facets "
+              "read the column");
+        }
         std::optional<FacetTermFilterSpec> termFilter;
         if (facetReq.term_filter.has_value()) {
           termFilter = parseTermFilter(facetName, target, *facetReq.term_filter);
         }
-        auto ordMap = req.reader->getOrdMap(facetField);
-        facet = luxir::arenaCreate<StrFacetOp>(req.arena, req, facetReq,
+        auto ordMap = view()->getOrdMap(facetField);
+        facet = luxir::arenaCreate<StrFacetOp>(req.arena, req, view(), facetReq,
             facetField, facetName, limit, minCount, missing,
             std::move(ordMap), selectedStrings, std::move(termFilter));
         break;
       }
       case FieldType::Storage::TEXT:
         if (measure != nullptr) throw RequestError("TEXT field_facet distinct counts are not supported yet");
-        facet = luxir::arenaCreate<FullTextFacetReq>(req.arena, req, facetReq,
+        facet = luxir::arenaCreate<FullTextFacetReq>(req.arena, req, view(), facetReq,
             facetField, facetName, limit, minCount, missing, selectedStrings);
         break;
       default: ;
@@ -835,7 +920,7 @@ public:
       OpsPlacement placement) {
     validateSelectionEnvelope(facetName, facetReq, placement);
     const CollapsePlan* measure = resolveMeasure(facetReq);
-    const auto& target = fields.resolve(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
+    const auto& target = parseView.fields.resolveLocal(facetReq.field, OpClass::VALUE, std::format("facet '{}'", facetName));
     auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
     bool dataBounds = facetReq.bounds == api::RangeFacet_::Bounds::DATA;
     if (!dataBounds && facetReq.bounds != api::RangeFacet_::Bounds::EXPLICIT) {
@@ -1012,7 +1097,7 @@ public:
       auto encodedStart = givenStart ? std::optional<int64_t>(grid.encode(*givenStart)) : std::nullopt;
       auto encodedEnd = givenEnd ? std::optional<int64_t>(grid.encode(*givenEnd)) : std::nullopt;
       if (dataBounds) {
-        auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,
+        auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req, view(),
             facetField, facetName, std::move(grid), encodedStart, encodedEnd,
             minCount, facetReq.missing);
         configureMeasure(*facet, measure);
@@ -1026,7 +1111,7 @@ public:
             : doubleToSortableInt64(canonical);
       });
       auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
-          req.arena, req, facetField, facetName, parsed.values,
+          req.arena, req, view(), facetField, facetName, parsed.values,
           parsed.affine, parsed.affineGap, minCount,
           facetReq.missing, selected, parsed.runs);
       configureMeasure(*facet, measure);
@@ -1066,7 +1151,7 @@ public:
           dataBounds ? std::nullopt : givenStart);
     }();
     if (dataBounds) {
-      auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,
+      auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req, view(),
           facetField, facetName, std::move(grid), givenStart, givenEnd,
           minCount, facetReq.missing);
       configureMeasure(*facet, measure);
@@ -1079,7 +1164,7 @@ public:
     });
 
     auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
-        req.arena, req, facetField, facetName, parsed.values,
+        req.arena, req, view(), facetField, facetName, parsed.values,
         parsed.affine, parsed.affineGap, minCount,
         facetReq.missing, selected, parsed.runs);
     configureMeasure(*facet, measure);
@@ -1095,8 +1180,9 @@ public:
     out.rankNeedsScores = false;
     for (const auto& sortSpec : sorts) {
       ValueExprOptions options{req.schema.get(), sortSpec.vars};
-      options.fieldResolver = &fields;
+      options.fieldResolver = &parseView.fields;
       options.opName = "sort";
+      options.view = &parseView;
       ValueProgram* program = ValueExprParser(options, req.arena).parse(sortSpec.expr);
       const ValueNode& root = program->root();
       bool scoreRoot = root.kind == ValueNodeKind::SCORE;
@@ -1109,6 +1195,11 @@ public:
       // values directly; string comparators binary-search global terms at setup and
       // use the matching ord or insertion point.
       FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
+      if (root.source && (valueArray(root.type) || root.type == ValueType::COLUMN_ONLY)) {
+        throw std::runtime_error(fmt::format(
+            "sort expression '{}' reads descendant field '{}'; choose an explicit reducer such as {}",
+            sortSpec.expr, root.text, ValueFunctionRegistry::arrayReducerNames()));
+      }
       if (root.kind == ValueNodeKind::COLUMN) {
         auto* fieldTypePtr = req.schema->physical(root.text);
         out.clauses.emplace_back(SortField(root.text, *fieldTypePtr, order, missing));
@@ -1172,6 +1263,37 @@ public:
     return weights;
   }
 
+  ParsedDomain parseDomain(const api::Domain& domain, std::string_view key, ParseContext& parseContext) {
+    ProtobufQueryParser parser(parseContext);
+    std::string path = "op '" + std::string(key) + "'.domain";
+    if (domain.apply_parent_filters.has_value()
+        && !domain.query.has_value()) {
+      throw std::runtime_error(
+          path + ".apply_parent_filters requires domain.query");
+    }
+
+    ParsedDomain parsed;
+    parsed.applyParentFilters =
+        domain.apply_parent_filters.value_or(false);
+    if (domain.query.has_value()) {
+      if (std::holds_alternative<std::monostate>(domain.query->kind)) {
+        throw std::runtime_error(path + ".query requires a query kind");
+      }
+      parsed.query = parser.parse(*domain.query);
+    }
+    parsed.filters.reserve(domain.filter.size());
+    for (size_t i = 0; i < domain.filter.size(); i++) {
+      if (std::holds_alternative<std::monostate>(
+              domain.filter[i].kind)) {
+        throw std::runtime_error(
+            path + ".filter[" + std::to_string(i)
+            + "] requires a query kind");
+      }
+      parsed.filters.push_back(parser.parse(domain.filter[i]));
+    }
+    return parsed;
+  }
+
   ParsedDomains parseChildDomains(
       OpsMap ops, ParseContext& parseContext) {
     ParsedDomains out;
@@ -1185,34 +1307,19 @@ public:
       auto restoreCoercion = scope_guard([&]() noexcept {
         parseContext.coerceContext = inheritedCoercion;
       });
-      ProtobufQueryParser parser(parseContext);
-      const api::Domain& domain = *child.domain;
-      std::string path = "op '" + std::string(key) + "'.domain";
-      if (domain.apply_parent_filters.has_value()
-          && !domain.query.has_value()) {
-        throw std::runtime_error(
-            path + ".apply_parent_filters requires domain.query");
-      }
-
-      ParsedDomain parsed;
-      parsed.applyParentFilters =
-          domain.apply_parent_filters.value_or(false);
-      if (domain.query.has_value()) {
-        if (std::holds_alternative<std::monostate>(domain.query->kind)) {
-          throw std::runtime_error(path + ".query requires a query kind");
+      if (movesView(*child.domain)) {
+        if (child.domain->apply_parent_filters.has_value() && !child.domain->query) {
+          throw RequestError("domain.apply_parent_filters requires domain.query");
         }
-        parsed.query = parser.parse(*domain.query);
-      }
-      parsed.filters.reserve(domain.filter.size());
-      for (size_t i = 0; i < domain.filter.size(); i++) {
-        if (std::holds_alternative<std::monostate>(
-                domain.filter[i].kind)) {
-          throw std::runtime_error(
-              path + ".filter[" + std::to_string(i)
-              + "] requires a query kind");
+        if (child.domain->query && child.domain->apply_parent_filters.value_or(false)) {
+          ParsedDomain parsed;
+          parsed.query = req.requestPool.make<AllQuery>();
+          parsed.applyParentFilters = true;
+          out.emplace(key, std::move(parsed));
         }
-        parsed.filters.push_back(parser.parse(domain.filter[i]));
+        continue;
       }
+      auto parsed = parseDomain(*child.domain, key, parseContext);
       if (parsed.query == nullptr && parsed.filters.empty()) continue;
       out.emplace(key, std::move(parsed));
     }
@@ -1232,6 +1339,41 @@ public:
     }
   }
 
+  void addDomainRoute(std::string_view key, const ParsedDomain* domain,
+      std::function_ref<bool(size_t)> excluded, Query::PlanningContext* planning, DomainVariantPlan& plan) {
+    std::optional<DomainVariantPlan::QuerySpec> reset;
+    std::vector<DomainVariantPlan::QuerySpec> extras;
+    if (domain != nullptr) {
+      assert(planning != nullptr);
+      if (domain->query != nullptr) {
+        reset.emplace(DomainVariantPlan::QuerySpec{
+            domain->query,
+            planning->structuralFilterKey(*domain->query)});
+      }
+      extras.reserve(domain->filters.size());
+      for (auto* filter : domain->filters) {
+        extras.push_back({
+            filter, planning->structuralFilterKey(*filter)});
+      }
+    }
+    bool created = plan.addChild(
+        key,
+        excluded,
+        reset ? &*reset : nullptr,
+        domain != nullptr && domain->applyParentFilters,
+        extras);
+    if (!created) return;
+    if (nonDefaultDomainVariants
+        >= DomainVariantPlan::MAX_NON_DEFAULT_VARIANTS) {
+      throw std::runtime_error(
+          "op '" + std::string(key)
+          + (domain != nullptr
+                  ? "': domain variant cap 64 exceeded"
+                  : "': routed filter variant cap 64 exceeded"));
+    }
+    nonDefaultDomainVariants++;
+  }
+
   void addDomainVariants(
       OpsMap ops, std::span<ParsedFilter> filters,
       const ParsedDomains& domains, Query::PlanningContext* planning,
@@ -1241,40 +1383,9 @@ public:
       auto found = domains.find(key);
       const ParsedDomain* domain =
           found == domains.end() ? nullptr : &found->second;
-      std::optional<DomainVariantPlan::QuerySpec> reset;
-      std::vector<DomainVariantPlan::QuerySpec> extras;
-      if (domain != nullptr) {
-        assert(planning != nullptr);
-        if (domain->query != nullptr) {
-          reset.emplace(DomainVariantPlan::QuerySpec{
-              domain->query,
-              planning->structuralFilterKey(*domain->query)});
-        }
-        extras.reserve(domain->filters.size());
-        for (auto* filter : domain->filters) {
-          extras.push_back({
-              filter, planning->structuralFilterKey(*filter)});
-        }
-      }
-      bool created = plan.addChild(
-          key,
-          [&](size_t filter) {
-            return std::ranges::find(filters[filter].exceptOps, key)
-                != filters[filter].exceptOps.end();
-          },
-          reset ? &*reset : nullptr,
-          domain != nullptr && domain->applyParentFilters,
-          extras);
-      if (!created) continue;
-      if (nonDefaultDomainVariants
-          >= DomainVariantPlan::MAX_NON_DEFAULT_VARIANTS) {
-        throw std::runtime_error(
-            "op '" + std::string(key)
-            + (domain != nullptr
-                    ? "': domain variant cap 64 exceeded"
-                    : "': routed filter variant cap 64 exceeded"));
-      }
-      nonDefaultDomainVariants++;
+      addDomainRoute(key, domain, [&](size_t filter) {
+        return std::ranges::find(filters[filter].exceptOps, key) != filters[filter].exceptOps.end();
+      }, planning, plan);
     }
   }
 
@@ -1414,7 +1525,7 @@ public:
       weights[i] = plan.bucketQueries[i]->createWeight(*context, 0);
     }
     auto* facet = luxir::arenaCreate<QueryFacetReq>(
-        req.arena, req, facetReq, facetName, plan.bucketQueries, weights);
+        req.arena, req, view(), facetReq, facetName, plan.bucketQueries, weights);
     configureMeasure(*facet, resolveMeasure(facetReq));
     return facet;
   }
@@ -1443,6 +1554,15 @@ public:
       const auto* queryProto = std::get_if<api::QueryFacet>(&child.kind);
       if (fieldProto == nullptr && rangeProto == nullptr
           && queryProto == nullptr) continue;
+      if (child.domain && movesView(*child.domain)) {
+        const auto& selected = fieldProto ? fieldProto->selected
+            : rangeProto ? rangeProto->selected : queryProto->selected;
+        if (selected && !ValueSequence(*selected, "facet '" + std::string(key) + "': selected").empty()) {
+          throw RequestError("facet '" + std::string(key)
+              + "': selected requires a TopDocs owner in the same space; transform the owning list's domain");
+        }
+        continue;
+      }
 
       auto inherited = options;
       options = inherited.child(child, key);
@@ -1465,9 +1585,9 @@ public:
         if (selected.empty()) continue;
 
         QueryBuilder builder(req.requestPool, *req.schema,
-                             parseContext.coerceContext, key, &req.warnings, &fields);
+                             parseContext.coerceContext, key, &req.warnings, &parseView.fields);
         CanonicalValueSet canonical = builder.canonicalizeFieldValues(
-            fields.resolve(fieldProto->field, OpClass::VALUE), selected, true);
+            parseView.fields.resolveLocal(fieldProto->field, OpClass::VALUE), selected, true);
         FacetReq* facet = createFieldFacetReq(
             key, *fieldProto, OpsPlacement::TOP_DOCS, &canonical);
         preparedFacets.emplace(
@@ -1609,12 +1729,106 @@ public:
     return filters;
   }
 
+  Query* descendantClause(Query* query, std::string& path) {
+    if (query->getKind() == QueryKind::KNN) {
+      path = ((KnnQuery*)query)->getSourcePath();
+      return query;
+    }
+    if (query->getKind() == QueryKind::TO_PARENT) {
+      auto& join = *(ToParentQuery*)query;
+      path = join.sourcePath();
+      return join.getChild();
+    }
+    if (query->getKind() == QueryKind::BOOST) {
+      auto& boost = *(BoostQuery*)query;
+      auto* child = descendantClause(boost.getChild(), path);
+      return req.requestPool.make<BoostQuery>(child, boost.getBoost());
+    }
+    if (query->getKind() == QueryKind::CONSTANT_SCORE) {
+      auto& constant = *(ConstantScoreQuery*)query;
+      auto* child = descendantClause(constant.getChild(), path);
+      return req.requestPool.make<ConstantScoreQuery>(child, constant.getScoreProfile());
+    }
+    return query;
+  }
+
+  void parseRowOps(TopDocsReq& owner, const api::TopDocs& list, int depth) {
+    if (list.row_ops.empty()) return;
+    if (list.collapse || list.diversify) throw RequestError("row_ops on collapsed or diversified lists are not supported yet");
+    if (depth >= maxOpDepth) throw RequestError("row_ops exceeds the operation nesting limit");
+    auto returned = resolveReturnFields(req, *view(), list.fields);
+    for (auto& [name, wire] : lastWins(list.row_ops)) {
+      validateName(name, "row operation");
+      if (name.starts_with('_')) throw RequestError("reserved row operation name '" + std::string(name) + "'");
+      for (const auto& field : returned) if (field.outputKey == name) {
+        throw RequestError("row operation '" + std::string(name) + "' conflicts with a returned field");
+      }
+      for (const auto& decorator : owner.decorators) if (decorator->columnName() == name) {
+        throw RequestError("row operation '" + std::string(name) + "' conflicts with a decorator");
+      }
+      const auto& spec = **wire;
+      auto* top = std::get_if<api::TopDocs>(&spec.kind);
+      if (!top) throw RequestError("row operation '" + std::string(name) + "': this operation kind is not supported yet");
+      if (!top->row_ops.empty() || !top->ops.empty() || top->collapse || top->diversify || !top->decorate.empty()) {
+        throw RequestError("row operation '" + std::string(name) + "': nested operations, collapse, diversify and decorators are not supported yet");
+      }
+      auto inherited = options;
+      options = options.child(spec, name);
+      auto restore = scope_guard([&]() noexcept { options = inherited; });
+      std::string path(view()->path());
+      Query* selectedRows = nullptr;
+      if (spec.domain) {
+        const auto& domain = *spec.domain;
+        if (domain.query) throw RequestError("row operation '" + std::string(name) + "': domain.query is not supported yet");
+        if (domain.apply_parent_filters) throw RequestError("row operation '" + std::string(name) + "': apply_parent_filters requires domain.query");
+        if (domain.from_match) {
+          auto clauseName = *domain.from_match;
+          auto found = namedClauses.find(clauseName);
+          auto fail = [&](std::string_view why) {
+            throw RequestError("domain.from_match '" + std::string(clauseName) + "': " + std::string(why));
+          };
+          if (domain.to) fail("cannot be combined with domain.to");
+          if (found == namedClauses.end()) fail("unknown clause name");
+          const auto& clause = found->second;
+          if (clause.list != &list) fail("the clause is not part of this list's query or filters");
+          if (clause.prohibited) fail("a prohibited clause has no matched rows");
+          path = clause.path;
+          selectedRows = descendantClause(clause.query, path);
+          auto base = view()->path();
+          if (path.empty() || path == base || (!base.empty() && !path.starts_with(std::string(base) + '.'))) {
+            fail("the clause does not select descendant rows");
+          }
+          if (logicalConsumesDomain(*selectedRows)) fail("kNN and other domain-consuming clauses cannot be replayed per row");
+        } else if (domain.to) path = domainPath(*domain.to);
+      }
+      auto scope = parseView.scoped(path);
+      auto* copy = arenaCreate<api::TopDocs>(req.arena, *top);
+      if (spec.domain && !spec.domain->filter.empty()) {
+        auto filters = req.requestPool.make_span<api::Filter>(top->filter.size() + spec.domain->filter.size());
+        std::copy(top->filter.begin(), top->filter.end(), filters.begin());
+        for (size_t i = 0; i < spec.domain->filter.size(); i++) {
+          auto* query = arenaCreate<api::Query>(req.arena, spec.domain->filter[i]);
+          filters[top->filter.size() + i].query = query;
+        }
+        copy->filter = filters;
+      }
+      auto* row = parseTopDocs(name, *copy, TopDocsPlacement::ROW_OP, selectedRows);
+      if (row->weight->needsPrepare() || !row->filterWeights.empty()) {
+        throw RequestError("row operation '" + std::string(name) + "': prepared queries and routed filters are not supported yet");
+      }
+      row->rowFields = resolveReturnFields(req, *row->view, top->fields);
+      resolveReturnFieldMetadata(*row->view, row->rowFields);
+      row->parent = &owner;
+      owner.rowOps.push_back(row);
+    }
+  }
+
   // Build a TopDocsReq from a TopDocs proto. Placement is semantic: ordinary
   // TopDocs can serve a canonical-root whole-reader fact, while a Fusion
   // source delivers candidates into a parent-owned domain.
   TopDocsReq* parseTopDocs(std::string_view name,
                            const luxir::api::TopDocs& topDocsReq,
-                           TopDocsPlacement placement) {
+                           TopDocsPlacement placement, Query* selectedRows = nullptr) {
     int64_t countLimit = topDocsReq.count_limit.value_or(0);
     if (countLimit < -2) {
       throw std::runtime_error(
@@ -1656,14 +1870,15 @@ public:
       inheritedFacetMeasure = collapse;
     }
     auto parseContext = createParseContext(name);
+    parseContext.list = &topDocsReq;
     ProtobufQueryParser parser(parseContext);
     // An absent query selects all documents: the domain is then whatever the
     // filters carve out (browse / filter-only search). Boolean normalization
     // eliminates the match-all when filters fold in beside it.
     Query* query = topDocsReq.query.has_value()
       ? parser.parse(*topDocsReq.query)
-      : req.requestPool.make<AllQuery>();
-    Query* resultQuery = topDocsReq.query ? query : nullptr;
+      : selectedRows ? selectedRows : req.requestPool.make<AllQuery>();
+    Query* resultQuery = topDocsReq.query || selectedRows ? query : nullptr;
     // A minimum score turns the query's score into part of its membership,
     // so the cut-off wraps the query before filters fold in beside it: every
     // ranking, count, and ops-domain route below then sees the same matches.
@@ -1683,7 +1898,7 @@ public:
     }
     int64_t specifiedLimit = topDocsReq.limit.has_value() ? *topDocsReq.limit : 10;
     // limit to actual number of docs in the index (or all if limit == -1)
-    int64_t maxDoc = req.reader->maxDoc();
+    int64_t maxDoc = view()->maxDoc();
     int64_t limit = specifiedLimit < 0 ? maxDoc : std::min(specifiedLimit, maxDoc);
     // Keep limit as the page size for request-shape decisions. Fusion source
     // offsets are response-shape fields and do not enlarge candidate pools.
@@ -1693,6 +1908,7 @@ public:
     }
 
     if (placement == TopDocsPlacement::FUSION_SOURCE) {
+      if (!topDocsReq.row_ops.empty()) throw RequestError("row_ops on fusion sources are not supported yet");
       if (!topDocsReq.ops.empty()) {
         throw std::runtime_error(
             "fusion source '" + std::string(name)
@@ -1709,6 +1925,13 @@ public:
     }
     auto explicitFilters = parseFilters(
         parser, topDocsReq.filter, &topDocsReq.ops, "top_docs.filter");
+    if (selectedRows && topDocsReq.query) {
+      auto all = req.requestPool.make_span<ParsedFilter>(explicitFilters.size() + 1);
+      std::copy(explicitFilters.begin(), explicitFilters.end(), all.begin());
+      all.back() = {selectedRows, {}};
+      explicitFilters = all;
+    }
+    parseContext.list = nullptr;
     auto filters = appendDerivedFilters(
         explicitFilters,
         prepareFacetSelections(
@@ -1806,7 +2029,7 @@ public:
     // iterators. Ranked requests need scores only when their normalized sort
     // plan consumes score (default ranking, SCORE, or a score-dependent EXPR).
     int32_t requestFlags = 0;
-    if (limit > 0
+    if (limit > 0 && (placement != TopDocsPlacement::ROW_OP || topDocsReq.query || selectedRows)
         && (topDocsReq.get_scores || parsedSorts.rankNeedsScores
             || (headSort && headSort->rankNeedsScores))) {
       requestFlags |= Query::NEED_SCORES;
@@ -1836,15 +2059,16 @@ public:
     }
     Query::ScoreProfile scoreProfile = luxir::scoreProfile(*query);
     bool exactCountTopK = exactCountTopKShape && !boundedCount;
-    bool pureCountShape = collapse == nullptr && diversify == nullptr
+    bool pureCountShape = placement != TopDocsPlacement::ROW_OP
+        && collapse == nullptr && diversify == nullptr
         && !QueryPrep::disableWholeMembershipPlanForTests
         && limit == 0 && requirements.needsCount()
         && !requirements.needExactDomain && !parsedSorts.useFieldSort
         && (foldFilters || filters.empty());
     FilterCache::Use* cacheFirstMembershipUse = nullptr;
-    auto* cache = req.reader->filterCache();
+    auto* cache = view()->filterCache();
     if (pureCountShape && canOmitWeightForCacheFirstMembership(*query)
-        && !directCountAvailable(*query, *req.reader)
+        && !directCountAvailable(*query, *view())
         && cache != nullptr && cache->enabled()) {
       auto candidate = planningContext->lookupExistingFilterUse(
           *query, placement == TopDocsPlacement::ROOT_OP);
@@ -1863,7 +2087,7 @@ public:
         && !QueryPrep::disableWholeMembershipPlanForTests
         && exactCountTopKShape && (foldFilters || filters.empty())
         && canOmitWeightForCacheFirstMembership(*query)
-        && !directCountAvailable(*query, *req.reader)
+        && !directCountAvailable(*query, *view())
         && cache != nullptr && cache->enabled()) {
       auto candidate = planningContext->lookupExistingFilterUse(*query, true);
       if (candidate.has_value()) {
@@ -1978,7 +2202,7 @@ public:
         && (allowPruning || cacheFirstVariableRanking) && foldFilters
         && !requirements.needExactDomain && !weight->needsPrepare()
         && TopDocsReq::admitSparseFilteredTopK(
-            *weight, *req.reader, topCount);
+            *weight, *view(), topCount);
     if (sparseFilteredTopKReroute) {
       bool unionFamily = weight->sparseFilteredTopKFamily()
           == Query::Weight::SparseFilteredTopKFamily::UNION;
@@ -2052,10 +2276,10 @@ public:
     // reader domain. Preserve the landed probe there and let
     // probeReaderStable enforce the runtime domain gate. Fusion sources have
     // a different ownership shape and remain excluded.
-    bool readerStableWhole = weight != nullptr && weight->needsPrepare()
+    bool preparedWhole = weight != nullptr && weight->needsPrepare()
         && placement != TopDocsPlacement::FUSION_SOURCE
         && (pureCount || wholeFieldSort);
-    if (weight != nullptr && weight->needsPrepare() && !readerStableWhole) {
+    if (weight != nullptr && weight->needsPrepare() && !preparedWhole) {
       pureCount = false;
       wholeFieldSort = false;
     }
@@ -2081,8 +2305,8 @@ public:
         bool everySegmentConstant = wholeMembershipWeight->matchesAllDocs();
         if (!everySegmentConstant) {
           everySegmentConstant = true;
-          bool everySegmentEmpty = !req.reader->segments().empty();
-          for (auto& segment : req.reader->segments()) {
+          bool everySegmentEmpty = !view()->segments().empty();
+          for (auto& segment : view()->segments()) {
             DocSet* rootDomain = segment.liveDocSet();
             auto shortcut = wholeMembershipWeight->countShortcut(segment, rootDomain);
             everySegmentEmpty &= shortcut.how == Query::CountHow::METADATA
@@ -2100,16 +2324,16 @@ public:
         bool fieldSortFullyRouted = false;
         if (!boundedCount && !everySegmentConstant && cache != nullptr && cache->enabled()) {
           bool acquireUse = true;
-          if (wholeFieldSort && !readerStableWhole) {
+          if (wholeFieldSort && !preparedWhole) {
             wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
-                req.reader->segments().size());
+                view()->segments().size());
             if (fieldSortBuildVetoed) {
               std::fill(wholeFieldSortCacheRoutes.begin(),
                         wholeFieldSortCacheRoutes.end(), 0);
               acquireUse = false;
             } else {
               acquireUse = TopDocsReq::planFieldSortWholeMembershipRoutes(
-                  *query, *wholeMembershipWeight, *req.reader, parsedSorts,
+                  *query, *wholeMembershipWeight, *view(), parsedSorts,
                   topCount, wholeFieldSortCacheRoutes);
             }
             fieldSortFullyRouted = !acquireUse;
@@ -2117,18 +2341,16 @@ public:
           // An accepted reader-stable value replaces the ANN preparation pass.
           // Its bounded kNN membership is also a valid ladder fallback, while
           // the numeric exact-domain driver still prices exact cardinality per
-          // segment.
+          // segment. Query-canonical prepared sources may publish raw segment
+          // membership through the same lane; preparation alone says nothing
+          // about key lifetime.
           if (acquireUse) {
-            wholeMembershipUse = readerStableWhole
-                ? qcontext->getFilterUse(
-                      *query, FilterKeyScope::READER_STABLE,
-                      FilterCache::AdmissionLane::WHOLE)
-                : qcontext->getFilterUse(
-                      *query, FilterCache::AdmissionLane::WHOLE);
+            wholeMembershipUse = qcontext->getFilterUse(
+                *query, FilterCache::AdmissionLane::WHOLE);
           }
         }
         // Field-sort constants are useful per segment even without a cache.
-        // Prepared membership still requires its reader-stable cache source.
+        // Prepared membership still requires a cache source and its runtime provenance check.
         if (!everySegmentConstant && wholeMembershipUse == nullptr
             && !fieldSortFullyRouted
             && !(wholeFieldSort && !wholeMembershipWeight->needsPrepare())) {
@@ -2154,7 +2376,7 @@ public:
         bool reroute = !boundedCount && foldFilters
             && !countFreeRankingWeight->needsPrepare()
             && TopDocsReq::admitSparseFilteredTopK(
-                *countFreeRankingWeight, *req.reader, topCount);
+                *countFreeRankingWeight, *view(), topCount);
         if (reroute) {
           bool unionFamily = countFreeRankingWeight->sparseFilteredTopKFamily()
               == Query::Weight::SparseFilteredTopKFamily::UNION;
@@ -2175,7 +2397,7 @@ public:
     }
 
     auto* qr = luxir::arenaCreate<TopDocsReq>(
-      req.arena, req, name, topDocsReq, *planningContext, qcontext,
+      req.arena, req, view(), name, topDocsReq, *planningContext, qcontext,
       query, weight, variantMembershipWeight,
       countWeight, rankingWeight, topCount, std::move(parsedSorts),
       requirements, wholeMembershipWeight, wholeRankingWeight,
@@ -2192,12 +2414,32 @@ public:
         && wholeMembershipUse == nullptr;
     if (qr->boundedCount && filterWeights.empty()) {
       int64_t minMatches = 0;
-      for (auto& segment : req.reader->segments()) {
+      for (auto& segment : view()->segments()) {
         minMatches += weight->countShortcut(segment, nullptr).minMatches;
       }
       qr->countLimitProven = minMatches >= requirements.countLimit;
     }
     qr->estimateCount = estimateCount && qr->boundedCount;
+    // A bounded count that metadata does not settle is counted apart from
+    // ranking: an unscored pass stops once the total passes the limit, and
+    // ranking prunes from its first page instead of holding its threshold
+    // until the limit is reached. Constant scoring keeps its windowed drain.
+    if (qr->boundedCount && !qr->countLimitProven && !qr->estimateCount
+        && !disableBoundedCountSplit && weight != nullptr && !weight->needsPrepare()
+        && weight->allowsPruning() && !weight->isConstantScoring()) {
+      int64_t remaining = requirements.countLimit;
+      for (auto& segment : view()->segments()) {
+        // Metadata bounds may be loose, but a count that cannot pass the
+        // limit would only duplicate the held ranking pass.
+        auto bound = weight->countShortcut(segment, nullptr).maxMatches;
+        if (bound > remaining) {
+          qr->boundedCountWeight = query->createWeight(
+              *qcontext, requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING));
+          break;
+        }
+        remaining -= bound;
+      }
+    }
     qr->headSort = std::move(headSort);
     qr->resultQuery = resultQuery;
     if (placement != TopDocsPlacement::FUSION_SOURCE && !topDocsReq.decorate.empty()) {
@@ -2272,7 +2514,7 @@ public:
 
   public:
     PluginOpContextImpl(SearchParserImpl& parser, std::string_view name, const luxir::api::PluginOp& proto, int depth)
-      : PluginOpContext(parser.req, name, proto,
+      : PluginOpContext(parser.req, parser.view(), name, proto,
                         ParamReader("op '" + std::string(name) + "': " + std::string(proto.name), proto.params)),
         parser(parser), depth(depth),
         context(parser.createParseContext(name)) {
@@ -2474,13 +2716,13 @@ public:
     }
 
     int64_t specifiedLimit = fusionProto.limit.has_value() ? *fusionProto.limit : 10;
-    int64_t maxDoc = req.reader->maxDoc();
+    int64_t maxDoc = view()->maxDoc();
     int64_t limit = specifiedLimit < 0 ? maxDoc : std::min(specifiedLimit, maxDoc);
     int64_t topCount = limit == 0 ? 0
         : offset >= maxDoc ? maxDoc : offset + std::min(limit, maxDoc - offset);
 
     auto* fusion = luxir::arenaCreate<FusionOp>(
-      req.arena, req, name, fusionProto, std::move(sources),
+      req.arena, req, view(), name, fusionProto, std::move(sources),
       std::move(sourceWeights), topCount, sharedFilters, sharedFilterWeights,
       method, rrfK);
 

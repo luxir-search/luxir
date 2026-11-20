@@ -164,7 +164,7 @@ TEST_F(ChecksumVerifyTest, verifiedReaderSurvivesUnlinkAndViewLifetime) {
     std::shared_ptr<IndexReader> reader;
     {
       FileVerification verification;
-      verification.open(dir, snapshot->files);
+      verification.open(dir, snapshot->files, true, {});
       verification.run();
       VerifiedDirectory source(dir, verification);
       EXPECT_THROW(source.openFile(names.front(), true), std::runtime_error);
@@ -230,7 +230,7 @@ TEST_F(ChecksumVerifyTest, scrubFailsTheWriterAndTheFailureSurvivesRestart) {
   }
   {
     FSDirectory marked(dir);
-    EXPECT_EQ(std::vector<std::string>{damaged.name}, CorruptionMarker::read(marked));
+    EXPECT_EQ(std::vector<std::string>{damaged.name}, CorruptionMarker::read(marked).suspects);
     // Default policy: only the recorded file is checked, and it still fails.
     LuxirNode node(config);
     expectUnavailable(node, "main", damaged);
@@ -268,7 +268,7 @@ TEST_F(ChecksumVerifyTest, writerRecoveryPreservesSuspectFiles) {
   auto selected = storage.current("main");
   ASSERT_TRUE(selected);
   EXPECT_NE(dir.filename().string(), *selected);
-  EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.directory(*selected)));
+  EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.directory(*selected)).suspects);
   EXPECT_NO_THROW(node.getCollection("other"));
 }
 
@@ -302,7 +302,7 @@ TEST_F(ChecksumVerifyTest, scrubFailsOnMissingHeldFileOnWriter) {
   EXPECT_EQ(0u, node.getScrubber().stats().errors);
   EXPECT_EQ("missing file: " + file.name, collection->getUnavailableReason());
   EXPECT_THROW(node.getCollection("main"), CollectionUnavailableError);
-  EXPECT_EQ(std::vector<std::string>{file.name}, CorruptionMarker::read(*collection->getShard()->getDirectory()));
+  EXPECT_EQ(std::vector<std::string>{file.name}, CorruptionMarker::read(*collection->getShard()->getDirectory()).suspects);
 }
 
 // ELOOP is deterministic regardless of the process's filesystem privileges.
@@ -422,16 +422,16 @@ TEST_F(ChecksumVerifyTest, checksumPrimitiveAndVerification) {
     alsoBad.xxh3 ^= 1;
     std::vector<FileDescriptor> files{bad, alsoBad};
     try {
-      verifyFiles(*dir, files);
+      verifyFiles(*dir, files, true, {});
       FAIL() << "verified a damaged file";
     } catch (const ChecksumMismatchError& e) {
       EXPECT_NE(std::string::npos, std::string(e.what()).find("checksum mismatch: s0_b: expected")) << e.what();
       EXPECT_NE(std::string::npos, std::string(e.what()).find("(and 1 more files)")) << e.what();
     }
     FileVerification verification;
-    EXPECT_THROW(verification.open(*dir, std::span(&missing, 1)), ChecksumMismatchError);
+    EXPECT_THROW(verification.open(*dir, std::span(&missing, 1), true, {}), ChecksumMismatchError);
     std::vector<FileDescriptor> okay{write(*dir, "s0_d")};
-    EXPECT_NO_THROW(verifyFiles(*dir, okay));
+    EXPECT_NO_THROW(verifyFiles(*dir, okay, true, {}));
   }
 }
 

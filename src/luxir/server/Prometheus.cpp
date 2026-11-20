@@ -89,6 +89,10 @@ void service(Renderer& r, const api::ServiceStats& s) {
                                 {"vector_build", &s.vector_build}, {"reader_refresh", &s.reader_refresh}})
     r.activity("luxir_background", "luxir_background_duration_seconds", *activity, s.background_duration_bounds,
                PrometheusText::label("kind", kind));
+  r.gauge("luxir_control_threads", "Control executor threads (administration, replication transfers, detailed stats).", (double)s.control_threads);
+  r.gauge("luxir_control_busy", "Control executor tasks running now.", (double)s.control_busy);
+  r.gauge("luxir_control_queued", "Control executor tasks waiting for a thread.", (double)s.control_queued);
+  r.counter("luxir_control_tasks_total", "Control executor tasks completed.", (double)s.control_completed);
 }
 
 void memory(Renderer& r, const api::MemoryStats& m) {
@@ -105,7 +109,8 @@ void memory(Renderer& r, const api::MemoryStats& m) {
   r.gauge("luxir_schema_cache_bytes", "Estimated parsed schema payload held by snapshots and readers.", (double)m.schema_cache_bytes);
   const auto& f = m.field_metadata;
   for (auto [part, count, bytes] : {std::tuple{"directory", f.directories, f.directory_bytes}, {"page", f.pages, f.page_bytes},
-                                    {"entry", f.entries, f.entry_bytes}, {"name", f.names, f.name_bytes}}) {
+                                    {"entry", f.entries, f.entry_bytes}, {"name", f.names, f.name_bytes},
+                                    {"live_view", f.live_views, f.live_view_bytes}}) {
     auto labels = PrometheusText::label("part", part);
     r.gauge("luxir_field_metadata_objects", "Cached field metadata objects.", (double)count, labels);
     r.gauge("luxir_field_metadata_bytes", "Cached field metadata payload bytes, excluding allocator overhead.", (double)bytes, labels);

@@ -38,6 +38,12 @@ struct ServerConfig {
   int workers = 0;
   static constexpr int kSmallNodeCores = 4;
 
+  // Threads of the node's control executor (ControlExecutor): administration,
+  // schema changes, collection lifecycle, replication transfers and timers,
+  // and detailed stats. Dedicated OS threads outside the worker pool.
+  // At least 1.
+  int control_threads = 2;
+
   int resolveWorkers() const {
     if (workers > 0) return workers;
     int cores = std::max(1, oneapi::tbb::info::default_concurrency());
@@ -173,6 +179,9 @@ struct IngestConfig {
 };
 
 struct SearchConfig {
+  // Process-wide fan-out policy, installed by LuxirConfig::apply().
+  int64_t fanout_grain_us = 50;
+  int64_t fanout_sibling_grain_us = 1000;
   // Max nesting depth of search operations in one request (ops within ops).
   // A request-shape limit like the query parsers' nesting budget, but much
   // lower: every level is a full search operation, not just a query node.
@@ -185,10 +194,6 @@ struct SearchConfig {
   // reservation tails, is 158,536,389 bytes - so 160 MiB covers it.
   // Early-merge degradation is future work.
   size_t request_memory_max_bytes = 0;
-  // Operator opt-in: max_parallel 0 runs a request across segments in parallel
-  // when its lists visit at least this many documents by index metadata.
-  // Zero (the default) keeps max_parallel 0 serial.
-  size_t auto_parallel_min_work = 0;
   // Term-dictionary expansion guards for prefix, wildcard, regex, string
   // range, and fuzzy queries (see MultiTermLimits). Zero is unlimited; a
   // request can never raise or disable them.

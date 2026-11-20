@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <ranges>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -32,12 +33,9 @@ enum class ValueOpcode : uint8_t {
   SQRT,
   LOG,
   LOG1P,
-  FLOOR,
   MIN,
   MAX,
   AVG,
-  EXP,
-  POW,
   LT,
   LE,
   GT,
@@ -59,7 +57,8 @@ inline constexpr size_t VALUE_MAX_ARITY = 5;
 struct ValueFunction {
   enum class DateUnit : uint8_t { UNSET, SHARED, RAW };
   // ANY also takes GEO_POINT values and non-numeric (STRING or ID) columns.
-  enum class Kind : uint8_t { NUMERIC, GEO_POINT, ANY };
+  // DATE takes only DATE values (either unit).
+  enum class Kind : uint8_t { NUMERIC, GEO_POINT, DATE, ANY };
   struct Operand {
     DateUnit unit = DateUnit::UNSET;
     bool lazy = false;
@@ -97,6 +96,9 @@ struct ValueFunction {
   Prepare prepare = nullptr;
   NaturePolicy natures = NaturePolicy::NUMBER;
   uint8_t natureStart = 0;
+  bool pure = true;
+  // Optional field-path component on the type declared by operand zero.
+  std::string_view component = {};
 
   std::array<bool, VALUE_MAX_ARITY> natureConversions(std::span<const ResolvedValue> args) const {
     std::array<bool, VALUE_MAX_ARITY> convert{};
@@ -140,11 +142,21 @@ public:
     int64_t bound;
   };
   static const ValueFunction* find(std::string_view name);
-  static std::span<const ValueFunction> entries();
+  using Entries = std::ranges::join_view<std::span<const std::span<const ValueFunction>>>;
+  static Entries entries();
   static std::string arrayReducerNames();
+  static const ValueFunction* findComponent(ValueFunction::Kind kind, std::string_view name);
+  static std::string componentNames(ValueFunction::Kind kind);
   static const ValueFunction* decimalDecoder();
   static std::optional<DecimalComparison> decimalComparison(const ValueFunction* function,
       int scale, const api::Val& literal, bool reverse);
 };
+
+// The function families registered beside the core table, each a constant table
+// defined in its own translation unit.
+std::span<const ValueFunction> valueMathFunctions();
+std::span<const ValueFunction> valueDateFunctions();
+std::span<const ValueFunction> valueGeoFunctions();
+std::span<const ValueFunction> valueHashFunctions();
 
 } // namespace luxir

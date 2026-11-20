@@ -100,10 +100,10 @@ public:
     return hits && hits->contains(id) ? hits->at(id) : 0.0f;
   }
 
-  Query* parse(const api::Query& query, IndexReader* reader = nullptr) {
+  Query* parse(const api::Query& query, const std::shared_ptr<IndexReader>& reader = {}) {
     auto schema = reader ? reader->schema() : helper.collection().getSchema();
-    ParseContext context{parsePool, *schema, protoArena, CoerceContext{}, ""};
-    context.reader = reader;
+    ParseView view(*schema, nullptr, reader ? &reader : nullptr);
+    ParseContext context{parsePool, *schema, protoArena, CoerceContext{}, "", nullptr, &view};
     return ProtobufQueryParser(context).parse(query);
   }
 
@@ -543,12 +543,14 @@ TEST_F(MultiMatchQueryTest, dateGroupsKeepRangeSemantics) {
   auto schema = Schema::createDefaultSchema();
   int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
   QueryBuilder builder(parsePool, *schema, CoerceContext{now});
+  ParseView view(*schema);
   QueryBuilder::WeightedField fields[] = {{"when_dt", 2.0f}};
+  auto resolved = builder.resolveWeightedFields(fields, view);
   for (auto text : {"2024-06", "NOW", "NOW/DAY"}) {
     auto* expected = builder.createMatchQuery("when_dt", text, QueryBuilder::Operator::OR, 0, 2.0f);
-    for (auto* actual : {builder.createMultiMatchCombined(fields, text, QueryBuilder::Operator::OR, 0),
-                        builder.createMultiMatchPerField(fields, text, QueryBuilder::Operator::OR, 0),
-                        builder.createMultiMatchPerField(fields, text, QueryBuilder::Operator::OR, 0, 1.0f, 0)}) {
+    for (auto* actual : {builder.createMultiMatchCombined(resolved, text, QueryBuilder::Operator::OR, 0),
+                        builder.createMultiMatchField(resolved[0], text, QueryBuilder::Operator::OR, 0),
+                        builder.createMultiMatchField(resolved[0], text, QueryBuilder::Operator::OR, 0, 0)}) {
       EXPECT_TRUE(expected->equals(*actual));
       EXPECT_EQ(filterKey(*expected), filterKey(*actual));
     }
@@ -842,20 +844,20 @@ TEST_F(MultiMatchQueryTest, wildcardRootsVariantsAndBindings) {
   for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
     auto wildcard = multiMatch("Dune Messiah", {{"author*", 2.0f}, {"author__words", 3.0f}}, mode);
     auto explicitField = multiMatch("Dune Messiah", {{"author__words", 3.0f}}, mode);
-    EXPECT_TRUE(parse(wildcard, reader.get())->equals(*parse(explicitField, reader.get())));
+    EXPECT_TRUE(parse(wildcard, reader)->equals(*parse(explicitField, reader)));
     EXPECT_EQ(run(explicitField), run(wildcard));
     auto variants = multiMatch("Dune Messiah", {{"author__*", {}}}, mode);
     auto listed = multiMatch("Dune Messiah", {{"author__exact", {}}, {"author__words", {}}}, mode);
-    EXPECT_TRUE(parse(variants, reader.get())->equals(*parse(listed, reader.get())));
+    EXPECT_TRUE(parse(variants, reader)->equals(*parse(listed, reader)));
     EXPECT_EQ(run(listed), run(variants));
-    EXPECT_TRUE(parse(multiMatch("Dune Messiah", {{"note_*", {}}}, mode), reader.get())->equals(
-        *parse(multiMatch("Dune Messiah", {{"note_entry", {}}}, mode), reader.get())));
+    EXPECT_TRUE(parse(multiMatch("Dune Messiah", {{"note_*", {}}}, mode), reader)->equals(
+        *parse(multiMatch("Dune Messiah", {{"note_entry", {}}}, mode), reader)));
   }
   auto id = run(multiMatch("d1", {{"i*", {}}}, Mode::COMBINED));
   ASSERT_TRUE(id);
   EXPECT_TRUE(id->contains("d1"));
   auto* absent = dynamic_cast<TermQuery*>(parse(
-      multiMatch("dune", {{"decl*", {}}}, Mode::PER_FIELD), reader.get()));
+      multiMatch("dune", {{"decl*", {}}}, Mode::PER_FIELD), reader));
   ASSERT_NE(nullptr, absent);
   EXPECT_EQ("declared", absent->getField());
   // Direct builders without a reader still expand concrete schema declarations.
@@ -897,7 +899,7 @@ TEST_F(MultiMatchQueryTest, wildcardFieldLimitCountsPhysicalTargets) {
   schema.set(helper.collection());
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
   auto query = multiMatch("dune", {{"many*", {}}, {"many*", 2.0f}, {"many0__self", 3.0f}}, Mode::PER_FIELD);
-  EXPECT_NO_THROW(parse(query, reader.get()));
+  EXPECT_NO_THROW(parse(query, reader));
   auto hits = run(query);
   ASSERT_TRUE(hits);
   EXPECT_TRUE(hits->empty());

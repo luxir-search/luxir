@@ -31,7 +31,16 @@ if(DEFINED LUXIR_NATIVE_DEPS AND NOT DEFINED VCPKG_TARGET_TRIPLET)
   set(VCPKG_HOST_TRIPLET ${_luxir_host_triplet} CACHE STRING "")
 endif()
 
-project(Luxir VERSION 0.1.0)
+if(CMAKE_HOST_APPLE)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/deps/triplets/common/macos-version.cmake")
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "${LUXIR_MACOS_DEPLOYMENT_TARGET}" CACHE STRING "macOS baseline" FORCE)
+endif()
+
+project(Luxir VERSION 0.2.0)
+# Marks builds that are not a release. Empty on a release branch.
+set(LUXIR_VERSION_SUFFIX "-dev")
+# The reported version. Cached so packaging can read it.
+set(LUXIR_VERSION "${PROJECT_VERSION}${LUXIR_VERSION_SUFFIX}" CACHE INTERNAL "Reported version")
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
@@ -87,12 +96,17 @@ function(luxir_runs_during_build target)
   endif()
 endfunction()
 
-option(LUXIR_STATIC_RUNTIME "Link GCC runtimes statically, retaining dynamic glibc" OFF)
+option(LUXIR_STATIC_RUNTIME "Link GCC runtimes statically, retaining system libraries" OFF)
 if(LUXIR_STATIC_RUNTIME)
-  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "LUXIR_STATIC_RUNTIME requires GCC on Linux")
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+    message(FATAL_ERROR "LUXIR_STATIC_RUNTIME requires GCC on Linux or macOS")
   endif()
-  add_link_options(-static-libstdc++ -static-libgcc -static-libasan -Wl,--as-needed)
+  add_link_options(-static-libstdc++ -static-libgcc)
+  if(APPLE)
+    link_libraries(iconv)
+  else()
+    add_link_options(-static-libasan -Wl,--as-needed)
+  endif()
   # FindOpenMP otherwise selects the compiler's shared libgomp.
   execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libgomp.a
                   OUTPUT_VARIABLE _luxir_gomp OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -307,7 +321,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-include_directories(SYSTEM ./src)
+include_directories(./src)
 
 find_package(xxHash CONFIG REQUIRED)
 
@@ -441,6 +455,7 @@ target_compile_definitions(luxir_lib PUBLIC
   # every translation unit, and the precompiled headers that include
   # task_arena.h, sees the same TBB declarations.
   TBB_PREVIEW_PARALLEL_PHASE=1
+  TBB_PREVIEW_ISOLATED_TASK_GROUP=1
   # GCC -Og cannot honor xxHash's always_inline AVX-512 accumulator through
   # its function-pointer dispatch. Keep header inlining in optimized builds,
   # but use the linked implementation in Debug.

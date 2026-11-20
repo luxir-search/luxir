@@ -9,14 +9,16 @@ from pathlib import Path
 def deps_key(root):
     root = Path(root)
     dockerfile = (root / '.devcontainer/Dockerfile').read_text()
-    # The dev target uses all four stages, including both dependency variants.
-    # Require the reviewed graph; a new stage or changed edge needs key review.
+    # Review every stage edge, including architecture selection and fan-in.
     stages = re.findall(r'^FROM (.+)$', dockerfile, re.M)
-    if (len(stages) != 4 or not stages[0].endswith(' AS toolchain')
-            or stages[1:] != ['toolchain AS normal-dependencies',
-                              '${NORMAL_DEPENDENCIES} AS dependencies', 'toolchain AS dev']
-            or re.findall(r'^ARG NORMAL_DEPENDENCIES\b.*$', dockerfile, re.M)
-            != ['ARG NORMAL_DEPENDENCIES=normal-dependencies']):
+    if (len(stages) != 7 or not stages[0].endswith(' AS base')
+            or stages[1:] != ['base AS gcc-amd64', 'base AS gcc-arm64',
+                              'gcc-${TARGETARCH} AS toolchain',
+                              '${TOOLCHAIN} AS normal-dependencies',
+                              '${NORMAL_DEPENDENCIES} AS dependencies',
+                              '${TOOLCHAIN} AS dev']
+            or re.findall(r'^ARG (?:TOOLCHAIN|NORMAL_DEPENDENCIES)\b.*$', dockerfile, re.M)
+            != ['ARG TOOLCHAIN=toolchain', 'ARG NORMAL_DEPENDENCIES=normal-dependencies']):
         raise ValueError('Dockerfile stage graph changed; review deps-key.py')
     stage = dockerfile
     copies = re.findall(r'^[ \t]*COPY[ \t]+(.+)$', stage, re.M | re.I)
@@ -53,6 +55,10 @@ def deps_key(root):
                     raise ValueError(f'Missing dependency input: {item}')
                 if item.is_file():
                     files[item.relative_to(root).as_posix()] = item.read_bytes()
+    return hash_inputs(files)
+
+
+def hash_inputs(files):
     digest = hashlib.sha256()
     for name, data in sorted(files.items()):
         for value in (name.encode(), data):
@@ -61,5 +67,33 @@ def deps_key(root):
     return digest.hexdigest()
 
 
+def macos_key(root):
+    """Inputs of the prebuilt macOS dependencies.
+
+    The compiler is named by major version in tools/macos-toolchain. Patch
+    releases, Xcode and macOS updates on the hosted runner keep the libstdc++
+    and platform ABIs, so they do not key the artifact; a nightly must not
+    start failing because the runner image moved.
+    """
+    root = Path(root)
+    files = {}
+    inputs = ["deps/vcpkg.json", "deps/vcpkg-configuration.json", "deps/ports",
+              "deps/triplets", "deps/make_deps.sh", "deps/fetch_sources.sh",
+              "tools/macos-deps", "tools/macos-toolchain"]
+    for name in inputs:
+        path = root / name
+        for item in sorted(path.rglob("*")) if path.is_dir() else [path]:
+            if item.is_symlink():
+                raise ValueError(f"Symlink input requires review: {item}")
+            if item.is_file():
+                files[item.relative_to(root).as_posix()] = item.read_bytes()
+            elif not item.exists():
+                raise ValueError(f"Missing dependency input: {item}")
+    return hash_inputs(files)
+
+
 if __name__ == '__main__':
-    print(deps_key(sys.argv[1]))
+    if len(sys.argv) == 2:
+        print(deps_key(sys.argv[1]))
+    else:
+        print(macos_key(sys.argv[1]))

@@ -199,10 +199,10 @@ TEST_F(AggregateExprTest, sharedGrammarLevelsOffsetsAndScoreRejection) {
   EXPECT_EQ(ValueOpcode::ABS,
             parseAggregate(memory, *schema, "abs(sum(price_i))")
                 ->root().function->opcode);
-  EXPECT_EQ(ValueOpcode::FLOOR,
+  EXPECT_EQ("floor",
             parseAggregate(memory, *schema,
                            "floor(sum(price_i) / sum(foo_i))")
-                ->root().function->opcode);
+                ->root().function->name);
 
   AggregateProgram* nested =
       parseAggregate(memory, *schema, "avg(avg(prices_is))");
@@ -1591,6 +1591,7 @@ TEST_F(AggregateExprTest, producerInputsCompareResolvedConstantsStructurally) {
     for (uint8_t i = 0; i < node.childCount; i++) node.children[i]++;
   }
   input.rootNode++;
+  input.retainRoot();
   EXPECT_TRUE(left->producers[0].sameState(right->producers[0]));
   otherIntegers[1]--;
   EXPECT_EQ(2u, parse("cardinality($a) + cardinality($b)")->producers.size());

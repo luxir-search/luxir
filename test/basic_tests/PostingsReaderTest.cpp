@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/FieldReader.h"
 #include "luxir/index/PostingsWriter.h"
 #include "luxir/reader/PostingsReader.h"
@@ -190,7 +191,7 @@ TEST_F(PostingsReaderTest, termSeek) {
 
 class FieldMetadataTest : public LuxirTest {
 protected:
-  static std::shared_ptr<PostingsReader> openFields(test::CollectionHelper& helper, int count) {
+  static std::shared_ptr<SegmentCore> openFields(test::CollectionHelper& helper, int count) {
     test::Doc doc{{"id", std::string("one")}};
     for (int i = 0; i < count; i++) {
       doc.push_back({std::format("f{:05}_i", i), (int64_t)i});
@@ -201,13 +202,14 @@ protected:
     auto reader = writer->snapshots.readers.getReader();
     EXPECT_EQ(1u, reader->segments().size());
     auto stored = test::readDurableIndexInfo(writer->dir);
-    return PostingsReader::create(writer->dir, stored->segments[0].seg_id, stored->segments[0].creator_epoch, false, false);
+    return SegmentCore::create(writer->dir, stored->segments[0].seg_id, stored->segments[0].creator_epoch, false, false);
   }
 };
 
 TEST_F(FieldMetadataTest, firstUseRace) {
   test::CollectionHelper helper;
-  auto reader = openFields(helper, 130);
+  auto core = openFields(helper, 130);
+  auto* reader = &core->rootReader();
   constexpr int THREADS = 32;
   std::barrier start(THREADS);
   std::array<const PostingsReader::Field*, THREADS> infos{};
@@ -264,7 +266,8 @@ TEST_F(FieldMetadataTest, columnBoundsIncludeSparseAndMultipleValues) {
 
 TEST_F(FieldMetadataTest, ordinalsAndPageBoundaries) {
   test::CollectionHelper helper;
-  auto reader = openFields(helper, 130);
+  auto core = openFields(helper, 130);
+  auto* reader = &core->rootReader();
   EXPECT_EQ(0u, reader->fieldCacheStats().pages);
   EXPECT_EQ(nullptr, reader->fieldInfo(""));
   EXPECT_EQ(nullptr, reader->fieldInfo("f00064_missing"));
@@ -297,7 +300,8 @@ TEST_F(FieldMetadataTest, ordinalsAndPageBoundaries) {
 
 TEST_F(FieldMetadataTest, untouchedFieldsStayUnallocated) {
   test::CollectionHelper helper;
-  auto reader = openFields(helper, 4096);
+  auto core = openFields(helper, 4096);
+  auto* reader = &core->rootReader();
   ASSERT_GT(reader->numFields(), 4096);
   EXPECT_EQ(0u, reader->fieldCacheStats().pages);
   ASSERT_NE(nullptr, reader->fieldInfo(64));
@@ -378,7 +382,7 @@ TEST_F(FieldMetadataTest, coreNamesAreSharedAndLazy) {
   EXPECT_EQ(field, cached->segInfos);
   EXPECT_EQ(nullptr, context.getCachedFieldInfo("absent_i"));
   EXPECT_EQ(nullptr, context.getCachedFieldInfo("absent_i"));
-  EXPECT_EQ(0u, fresh->fieldCacheStats().pages);
+  EXPECT_EQ(0u, fresh->rootReader().fieldCacheStats().pages);
 }
 
 TEST_F(FieldMetadataTest, namesStayFoundWhileTheTableGrows) {

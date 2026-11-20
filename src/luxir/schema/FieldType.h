@@ -58,18 +58,22 @@ public:
     GEO_POINT, // latitude/longitude point; packed into one int64 column value
     BOOLEAN,  // true/false; column-stored as 0/1
     DECIMAL,  // fixed-point number; scale in type flags
-    IP        // 16-byte address term
+    IP,       // 16-byte address term
+    NESTED,   // structural row-space declaration, never a physical field
+    // [min, max] interval (RangeFieldType); the column holds two encoded
+    // int64 values per document, min then max.
+    INTERVAL
   };
 
   enum class Storage { NONE, TERMS, TEXT, BIN, INT64, VECTOR };
 
   static constexpr Storage storage(Type type) {
     switch (type) {
-      case NONE: return Storage::NONE;
+      case NONE: case NESTED: return Storage::NONE;
       case STRING: case ID: case IP: return Storage::TERMS;
       case TEXT: return Storage::TEXT;
       case BIN: return Storage::BIN;
-      case INT: case FLOAT: case DOUBLE: case DATE: case GEO_POINT: case BOOLEAN: case DECIMAL: return Storage::INT64;
+      case INT: case FLOAT: case DOUBLE: case DATE: case GEO_POINT: case BOOLEAN: case DECIMAL: case INTERVAL: return Storage::INT64;
       case VECTOR: return Storage::VECTOR;
     }
     throw std::invalid_argument("Unknown field storage type");
@@ -78,7 +82,7 @@ public:
   // Ordered scalar values in the shared int64 column: numeric queries,
   // field sorts and one-dimensional points all use this storage family.
   static constexpr bool isNumericColumn(Type type) {
-    return storage(type) == Storage::INT64 && type != GEO_POINT;
+    return storage(type) == Storage::INT64 && type != GEO_POINT && type != INTERVAL;
   }
 
   static constexpr bool usesGeoPoints(Type type) { return type == GEO_POINT; }
@@ -96,7 +100,7 @@ public:
     PATTERN = 1u << 3, FUZZY = 1u << 4, FREE_TEXT = 1u << 5,
     TERM_FILTER = 1u << 6, RANGE = 1u << 7, SORT = 1u << 8,
     FIELD_FACET = 1u << 9, RANGE_FACET = 1u << 10,
-    COLLAPSE = 1u << 11, VALUE_EXPR = 1u << 12
+    COLLAPSE = 1u << 11, VALUE_EXPR = 1u << 12, RANGE_RELATION = 1u << 13
   };
 
   // Type support only; callers validate indexing and column configuration.
@@ -191,7 +195,12 @@ public:
   bool isDerived() const { return (bool) (flags_ & DERIVED); }
 
   // Segment flags describe physical structures; schema roles stay in the schema.
-  flag_type segmentFlags() const { return flags_ & ~(ABSTRACT | DERIVED); }
+  flag_type segmentFlags() const {
+    flag_type flags = flags_ & ~(ABSTRACT | DERIVED);
+    // Intervals are logically single-valued; their endpoint column is a pair array.
+    if (type_ == INTERVAL) flags |= MULTI_VALUED | MULTI_ARRAY;
+    return flags;
+  }
   virtual uint32_t segmentTypeFlags() const { return 0; }
 
   // TODO: check standard on cast of int to bool (check generated code too)
@@ -288,6 +297,14 @@ public:
                                       std::span<char> buf) const;
 };
 
+
+class NestedFieldType final : public FieldType {
+public:
+  bool reverseMap;
+
+  explicit NestedFieldType(std::string_view name, bool reverseMap = true)
+      : FieldType(name, NESTED, 0), reverseMap(reverseMap) {}
+};
 
 class TextFieldType : public FieldType {
 public:
@@ -494,6 +511,61 @@ public:
 
   ValueNature valueNature() const override { return ValueNature::GEO_POINT; }
   uint32_t capabilities() const override { return VALUE_EXPR; }
+};
+
+// An interval of INT, DOUBLE or DATE endpoints. Each endpoint is stored with
+// its element type's column encoding (raw int64, sortable double bits, epoch
+// millis), so encoded order is value order and both [min, max] and query
+// bounds compare as plain int64. Open double ends store encoded infinities;
+// open long and date ends store the int64 extremes.
+//
+// The segment column is laid out like a multi-valued int column with two
+// values per document (min, max), so merges, deletes and the column scans
+// reuse that machinery. INDEX_RANGE adds a 2-D points index over (min, max)
+// (BasicBKDWriter<BKDInt64Traits>).
+class RangeFieldType : public FieldType {
+public:
+  static constexpr uint32_t ELEMENT_FLAGS_SHIFT = 2;
+  static constexpr uint32_t ELEMENT_KIND_MASK = (1u << ELEMENT_FLAGS_SHIFT) - 1;
+
+  // INT, DOUBLE or DATE: the type each endpoint coerces and renders as.
+  const std::shared_ptr<FieldType> element;
+
+  RangeFieldType(std::string_view name, FieldType::Type elementType, int flags=COLUMN_STORED);
+
+  static Type elementTypeFromFlags(uint32_t flags) {
+    switch (flags & ELEMENT_KIND_MASK) {
+      case 0: return INT;
+      case 1: return DOUBLE;
+      case 2: return DATE;
+      default: throw std::runtime_error("Unknown range element kind");
+    }
+  }
+
+  FieldType::Type elementType() const { return element->type(); }
+  uint32_t capabilities() const override { return MATCH | RANGE | RANGE_RELATION; }
+  // Low bits encode the element kind (long, double, date); upper bits carry
+  // the element's persisted parameters.
+  uint32_t segmentTypeFlags() const override {
+    uint32_t kind = elementType() == DOUBLE ? 1u : elementType() == DATE ? 2u : 0u;
+    return kind | (element->segmentTypeFlags() << ELEMENT_FLAGS_SHIFT);
+  }
+  void signatureProps(SignatureProps& out) const override {
+    element->signatureProps(out);
+    out["type"] = "\"" + std::string(typeName()) + "\"";
+  }
+
+  // The schema type name: long_range, double_range or date_range.
+  std::string_view typeName() const;
+
+  IntWindow domainBounds() const;
+  IntWindow coerceIntWindow(const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+  std::optional<IntWindow> tryCoerceIntWindow(const api::Val& val, LiteralUse use,
+      std::string_view fieldName, const CoerceContext& context = {}) const override;
+  IntWindow coerceIngestBound(const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context) const;
+
 };
 
 // Unique id field

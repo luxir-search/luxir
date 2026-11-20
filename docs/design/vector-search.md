@@ -126,7 +126,20 @@ and result handler. PQ retains FAISS's optimized code kernel; RaBitQ evaluates
 its 1-bit estimate and gates extra-bit work in Luxir. Exact column scans and
 terminal rescoring retain the canonical query.
 
-RaBitQ's estimated squared L2 distance can be negative. Internal ordering
+Codes with one bit per dimension and a quantized query use `RaBitQScorer`.
+It owns its arithmetic: residuals are quantized by rounding half up and
+clamping, and estimates agree with FAISS within query-quantization error;
+last-bit float differences across builds and architectures are accepted.
+Tests check exact quantized values, bit planes and integer counts against a
+scalar reference, and factors and estimates against FAISS within a derived
+one-step tolerance. The scorer removes per-list allocation and bit-at-a-time
+packing, and the per-code virtual call. FAISS's computer remains for extended
+codes and query bits 0.
+
+RaBitQ's estimated squared L2 distance can be negative. Since 1.15, FAISS
+clamps its 1-bit L2 estimates at zero; the port patch
+`deps/ports/faiss/rabitq-negative-l2.diff` removes that clamp so negative
+estimates keep their order. Internal ordering
 scores use `1 / (1 + d)` for `d >= 0` and `1 - d` for `d < 0`, preserving
 ordering across segments and bounded cuts instead of tying negative estimates
 at 1. The common bounded handler inverts this map outward when setting its
@@ -361,12 +374,13 @@ older formats fail on open and must be rebuilt.
 code: `dp_multiplier = ||r||^2 * sqrt(D) / sum(|r_i|)` (zero when the sum is
 zero), sigma1, and upward-rounded `f_error = sigma1 * 1.9` for multi-bit codes.
 FAISS still writes the sign bits, `or_minus_c_l2sqr`, and extra-bit codes and
-factors. This avoids FAISS 1.14.3's small-norm guards: below a squared residual
-of `FLT_EPSILON`, its multiplier scores the residual as if it had unit length,
-and below `sum(|r_i|) = 2 * FLT_EPSILON` its error factor becomes zero. Such
-codes arise near centroids (duplicates, singleton lists, normalized-centroid
-rounding) and throughout small-magnitude L2 data. A false-high 1-bit interval
-can raise the witness floor and prune true neighbors at any probe count.
+factors. This avoids FAISS's small-norm guards (still present in 1.16.0): below
+a squared residual of `FLT_EPSILON`, its multiplier scores the residual as if it
+had unit length, and below `sum(|r_i|) = 2 * FLT_EPSILON` its error factor
+becomes zero. Such codes arise near centroids (duplicates, singleton lists,
+normalized-centroid rounding) and throughout small-magnitude L2 data. A
+false-high 1-bit interval can raise the witness floor and prune true neighbors
+at any probe count.
 The corrected factors preserve residual length and direction across scales,
 but the intervals remain empirical: for IP, float cancellation in FAISS's
 1-bit estimator leaves errors around 1e-7 even at zero amplitude, so they are
@@ -476,12 +490,15 @@ and rank-bitmap folds use the same doc-to-rank walk.
 slots pay per scored dimension, per visited domain doc and per rank mapping.
 IVF slots pay per examined entry, with an extra term for PQ (its FAISS scanner
 tests the selector through a virtual call) and a branch-misprediction term
-proportional to `p(1-p)` for selector pass rate `p`; per codec score (PQ
-subcodes, RaBitQ one-bit and extra-bit dimensions); per list setup; per coarse
+proportional to `p(1-p)` for selector pass rate `p`, except on 1-bit RaBitQ, whose
+selector test does not branch; per codec score (PQ
+subcodes; RaBitQ one-bit and extra-bit scores, each a constant per code plus
+a term per dimension); per list setup; per coarse
 centroid dimension; per slot-round; and per terminal read plus per terminal
 dimension. RaBitQ re-quantizes the query residual for every list, so its list
-setup scales with dimensions. PQ list setup is zero for inner product and
-cosine. Under L2 it scales with subquantizers while the segment keeps FAISS's
+setup scales with dimensions; 1-bit and extended codes have separate unit costs
+for scoring and list setup, since only the former use `RaBitQScorer`. PQ list
+setup is zero for inner product and cosine. Under L2 it scales with subquantizers while the segment keeps FAISS's
 precomputed table; without it, FAISS computes a full distance table per list,
 priced as `2^bits * dims` distance dimensions with an unfitted seed equal to
 the exact-dimension cost. `pq4` differs from both: the kernel scores whole
@@ -686,8 +703,9 @@ All IVF chunks and segments share a bounded cut per fresh epoch and persistent
 interval witness state for the query. Task-local handlers batch admissions and
 canonical keys; group bounded handlers keep their local capped admission.
 Serialized updates publish monotone scalar floors. PQ uses its optimized
-kernel with floor refreshes between 256-code blocks. RaBitQ uses its distance
-computer in the common traversal. Peak and terminal retained counts, seed and
+kernel with floor refreshes between 256-code blocks. 1-bit RaBitQ scores a block
+and then admits its rows in order; extended RaBitQ uses its distance computer per
+code in the common traversal. Peak and terminal retained counts, seed and
 remaining reads, gate rejections and extra-bit evaluations accompany the
 selector-passing scan count in the benchmark stats seam.
 

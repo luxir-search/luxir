@@ -11,6 +11,8 @@
 #include <random>
 #include <stdexcept>
 #include <utility>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <fmt/format.h>
 
@@ -18,24 +20,14 @@
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/geo.h"
 #include "luxir/value/AggregateExpr.h"
+#include "luxir/value/ValueFunctionSupport.h"
 #include "luxir/util/Decimal.h"
 #include "luxir/schema/ValCoerce.h"
 
 namespace luxir {
 namespace {
 
-void requireNumeric(std::span<const ResolvedValue> args) {
-  for (const ResolvedValue& arg : args) {
-    if (arg.nature == ValueNature::GEO_POINT) {
-      throw std::runtime_error("GEO_POINT is not numeric; use geo_distance()");
-    }
-    if (arg.type == ValueType::COLUMN_ONLY) {
-      throw std::runtime_error(
-          "a non-numeric column is only valid as a complete sort expression, "
-          "as the argument of count(), or as the input of cardinality()");
-    }
-  }
-}
+using namespace valuefn;
 
 ValueResult decodeScalarColumnValue(const ValueNode& node, int64_t raw) {
   if (node.columnType == FieldType::FLOAT) {
@@ -54,12 +46,6 @@ ValueResult decodeScalarColumnValue(const ValueNode& node, int64_t raw) {
 ResolvedValue unaryDemote(std::span<const ResolvedValue> args) {
   requireNumeric(args);
   return {args[0].type, ValueNature::NUMBER};
-}
-
-ResolvedValue unaryDouble(std::span<const ResolvedValue> args) {
-  requireNumeric(args);
-  return {valueArray(args[0].type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE,
-          ValueNature::NUMBER};
 }
 
 ValueType binaryNumericType(std::span<const ResolvedValue> args) {
@@ -175,27 +161,11 @@ ResolvedValue countResolve(std::span<const ResolvedValue> args) {
   return {ValueType::INT64, ValueNature::NUMBER};
 }
 
-void requireScalars(std::span<const ResolvedValue> args) {
-  for (const ResolvedValue& arg : args) {
-    if (valueArray(arg.type)) {
-      // Not arrayReducerNames(): it resolves every function, including this one.
-      throw std::runtime_error(
-          "operands must be scalars; reduce an array first, for example with min() or max()");
-    }
-  }
-}
-
 // Comparisons and logical operators produce 0 or 1.
 ResolvedValue truthResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args);
   requireScalars(args);
   return {ValueType::INT64, ValueNature::NUMBER};
-}
-
-ResolvedValue powResolve(std::span<const ResolvedValue> args) {
-  ValueType type = binaryNumericType(args);
-  return {valueArray(type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE,
-          ValueNature::NUMBER};
 }
 
 ResolvedValue ifResolve(std::span<const ResolvedValue> args) {
@@ -237,25 +207,6 @@ ResolvedValue geoDistanceResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args.subspan(1));
   return {valueArray(args[0].type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE,
           ValueNature::NUMBER};
-}
-
-[[noreturn]] void runtimeInvalid(const ValueNode& node, int32_t docid,
-                                 std::string_view reason) {
-  throw ValueEvaluationError(fmt::format(
-      "value function {}() {} at segment doc {}", node.text, reason, docid));
-}
-
-ValueResult promote(ValueResult value, ValueType type) {
-  if (!value.valid) return ValueResult::missing(type);
-  if (valueArray(type)) {
-    value.type = type;
-    return value;
-  }
-  if (type == ValueType::DOUBLE && value.type == ValueType::INT64) {
-    return ValueResult::floating((double)value.intValue);
-  }
-  value.type = type;
-  return value;
 }
 
 enum class ScalarKernelFailure : uint8_t {
@@ -335,12 +286,9 @@ bool compareValues(ValueOpcode opcode, T a, T b) {
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
     case ValueOpcode::MIN:
     case ValueOpcode::MAX:
     case ValueOpcode::AVG:
-    case ValueOpcode::EXP:
-    case ValueOpcode::POW:
     case ValueOpcode::AND:
     case ValueOpcode::OR:
     case ValueOpcode::NOT:
@@ -367,11 +315,9 @@ ScalarKernelValue<Int> evalUnaryKernel(
     switch (opcode) {
       case ValueOpcode::NEG: output = -value; break;
       case ValueOpcode::ABS: output = std::abs(value); break;
-      case ValueOpcode::SQRT: output = std::sqrt(value); break;
-      case ValueOpcode::LOG: output = std::log(value); break;
-      case ValueOpcode::LOG1P: output = std::log1p(value); break;
-      case ValueOpcode::FLOOR: output = std::floor(value); break;
-      case ValueOpcode::EXP: output = std::exp(value); break;
+      case ValueOpcode::SQRT:
+      case ValueOpcode::LOG:
+      case ValueOpcode::LOG1P:
       case ValueOpcode::NONE:
       case ValueOpcode::DEF:
       case ValueOpcode::ADD:
@@ -381,7 +327,6 @@ ScalarKernelValue<Int> evalUnaryKernel(
       case ValueOpcode::MIN:
       case ValueOpcode::MAX:
       case ValueOpcode::AVG:
-      case ValueOpcode::POW:
       case ValueOpcode::LT:
       case ValueOpcode::LE:
       case ValueOpcode::GT:
@@ -423,12 +368,9 @@ ScalarKernelValue<Int> evalUnaryKernel(
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
     case ValueOpcode::MIN:
     case ValueOpcode::MAX:
     case ValueOpcode::AVG:
-    case ValueOpcode::EXP:
-    case ValueOpcode::POW:
     case ValueOpcode::LT:
     case ValueOpcode::LE:
     case ValueOpcode::GT:
@@ -480,7 +422,6 @@ ScalarKernelValue<Int> evalBinaryKernel(
       case ValueOpcode::DIV: output = a / b; break;
       case ValueOpcode::MIN: output = std::min(a, b); break;
       case ValueOpcode::MAX: output = std::max(a, b); break;
-      case ValueOpcode::POW: output = std::pow(a, b); break;
       case ValueOpcode::NONE:
       case ValueOpcode::DEF:
       case ValueOpcode::NEG:
@@ -488,9 +429,7 @@ ScalarKernelValue<Int> evalBinaryKernel(
       case ValueOpcode::SQRT:
       case ValueOpcode::LOG:
       case ValueOpcode::LOG1P:
-      case ValueOpcode::FLOOR:
       case ValueOpcode::AVG:
-      case ValueOpcode::EXP:
       case ValueOpcode::LT:
       case ValueOpcode::LE:
       case ValueOpcode::GT:
@@ -542,10 +481,7 @@ ScalarKernelValue<Int> evalBinaryKernel(
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
     case ValueOpcode::AVG:
-    case ValueOpcode::EXP:
-    case ValueOpcode::POW:
     case ValueOpcode::LT:
     case ValueOpcode::LE:
     case ValueOpcode::GT:
@@ -573,7 +509,7 @@ ScalarKernelValue<int64_t> kernelValue(const ValueResult& value) {
       : integerKernelValue<int64_t>(value.intValue);
 }
 
-ValueResult evalBinaryScalar(const ValueNode& node, ValueResult left, ValueResult right,
+ValueResult evalBinaryScalar(const ValueNode& node, const ValueResult& left, const ValueResult& right,
                              int32_t docid) {
   ScalarKernelValue<int64_t> result = evalBinaryKernel(
       node.opcode, kernelValue(left), kernelValue(right),
@@ -589,7 +525,7 @@ ValueResult evalBinaryScalar(const ValueNode& node, ValueResult left, ValueResul
                          : ValueResult::integer(result.intValue);
 }
 
-ValueResult evalUnaryScalar(const ValueNode& node, ValueResult input,
+ValueResult evalUnaryScalar(const ValueNode& node, const ValueResult& input,
                             int32_t docid) {
   ScalarKernelValue<int64_t> result = evalUnaryKernel(
       node.opcode, kernelValue(input), node.type == ValueType::DOUBLE);
@@ -664,10 +600,7 @@ BucketScalar evalIfBucket(std::span<const BucketScalar> args, ValueType type, Va
 }
 
 bool unaryOpcode(ValueOpcode opcode) {
-  return opcode == ValueOpcode::NEG || opcode == ValueOpcode::ABS
-      || opcode == ValueOpcode::SQRT || opcode == ValueOpcode::LOG
-      || opcode == ValueOpcode::LOG1P || opcode == ValueOpcode::FLOOR
-      || opcode == ValueOpcode::EXP || opcode == ValueOpcode::NOT;
+  return opcode == ValueOpcode::NEG || opcode == ValueOpcode::ABS || opcode == ValueOpcode::NOT;
 }
 
 bool reducerOpcode(ValueOpcode opcode) {
@@ -707,6 +640,10 @@ ValueResult evalCountPoint(BoundValueProgram& program, const ValueNode& node,
                            int32_t docid, float score) {
   if (program.program.nodes[node.children[0]].type == ValueType::COLUMN_ONLY) {
     BoundStringColumn* column = program.nodes[node.children[0]].stringColumn;
+    if (program.nodes[node.children[0]].mapping) {
+      auto value = program.evalColumn(node.children[0], docid, score);
+      return ValueResult::integer(value.valid ? value.array.size : 0);
+    }
     if (column == nullptr || !column->cursor.seek(docid)) return ValueResult::integer(0);
     return ValueResult::integer(column->cursor.count());
   }
@@ -740,80 +677,32 @@ ValueResult evalCountElement(BoundValueProgram& program, const ValueNode& node,
   return invalidReducerElement(program, node, array, index);
 }
 
-ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
-                              int32_t docid, float score) {
+ValueResult evalDefPoint(BoundValueProgram& program, const ValueNode& node,
+                         int32_t docid, float score) {
   ValueResult first = program.evalNode(node.children[0], docid, score);
-  if (node.opcode == ValueOpcode::DEF) {
-    ValueResult selected = first.valid ? first : program.evalNode(node.children[1], docid, score);
-    if (selected.valid && valueArray(node.type)) {
-      return ValueResult::arrayValue(
-          node.type, (uint32_t)(&node - program.program.nodes.data()), docid, score,
-          selected.array.size);
-    }
-    return promote(selected, node.type);
+  ValueResult selected = first.valid ? first : program.evalNode(node.children[1], docid, score);
+  if (selected.valid && valueArray(node.type)) {
+    return ValueResult::arrayValue(
+        node.type, (uint32_t)(&node - program.program.nodes.data()), docid, score,
+        selected.array.size);
   }
+  return promote(selected, node.type);
+}
 
-  if (reducerOpcode(node.opcode)) {
-    bool reducer = node.childCount == 1;
-    if (reducer) {
-      if (!first.valid || first.array.size == 0) return ValueResult::missing(node.type);
-      if (node.opcode != ValueOpcode::AVG
-          && program.program.nodes[first.array.node].kind == ValueNodeKind::COLUMN
-          && program.nodes[first.array.node].column->multiSet()) {
-        // A set column holds the doc's values ascending, so min is the
-        // first present element and max the last (a NaN reads as missing).
-        bool fromEnd = node.opcode == ValueOpcode::MAX;
-        for (int64_t i = 0; i < first.array.size; i++) {
-          ValueResult next = program.evalArrayElement(
-              first.array, fromEnd ? first.array.size - 1 - i : i);
-          if (next.valid) return promote(next, node.type);
-        }
-        return ValueResult::missing(node.type);
-      }
-      ValueResult aggregate = ValueResult::missing(valueScalarType(first.type));
-      double sum = 0.0;
-      __int128 intSum = 0;
-      int64_t present = 0;
-      for (int64_t i = 0; i < first.array.size; i++) {
-        ValueResult next = program.evalArrayElement(first.array, i);
-        if (!next.valid) continue;
-        if (node.opcode == ValueOpcode::AVG) {
-          if (next.type == ValueType::DOUBLE) sum += next.doubleValue;
-          else intSum += (__int128)next.intValue;
-        } else if (!aggregate.valid) {
-          aggregate = next;
-        } else if (node.type == ValueType::DOUBLE) {
-          double a = aggregate.type == ValueType::DOUBLE ? aggregate.doubleValue
-                                                        : (double)aggregate.intValue;
-          double b = next.type == ValueType::DOUBLE ? next.doubleValue : (double)next.intValue;
-          aggregate = ValueResult::floating(
-              node.opcode == ValueOpcode::MIN ? std::min(a, b) : std::max(a, b));
-        } else {
-          aggregate.intValue = node.opcode == ValueOpcode::MIN
-              ? std::min(aggregate.intValue, next.intValue)
-              : std::max(aggregate.intValue, next.intValue);
-        }
-        present++;
-      }
-      if (present == 0) return ValueResult::missing(node.type);
-      if (node.opcode == ValueOpcode::AVG) {
-        double out = (sum + (double)intSum) / (double)present;
-        if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
-        return ValueResult::floating(out);
-      }
-      return promote(aggregate, node.type);
-    }
+ValueResult evalUnaryPoint(BoundValueProgram& program, const ValueNode& node,
+                           int32_t docid, float score) {
+  ValueResult first = program.evalNode(node.children[0], docid, score);
+  if (!first.valid) return ValueResult::missing(node.type);
+  if (valueArray(first.type)) {
+    return ValueResult::arrayValue(node.type, (uint32_t)(&node - program.program.nodes.data()),
+                                   docid, score, first.array.size);
   }
+  return evalUnaryScalar(node, first, docid);
+}
 
-  if (unaryOpcode(node.opcode)) {
-    if (!first.valid) return ValueResult::missing(node.type);
-    if (valueArray(first.type)) {
-      return ValueResult::arrayValue(node.type, (uint32_t)(&node - program.program.nodes.data()),
-                                     docid, score, first.array.size);
-    }
-    return evalUnaryScalar(node, first, docid);
-  }
-
+ValueResult evalBinaryPoint(BoundValueProgram& program, const ValueNode& node,
+                            int32_t docid, float score) {
+  ValueResult first = program.evalNode(node.children[0], docid, score);
   ValueResult second = program.evalNode(node.children[1], docid, score);
   if (valueArray(node.type)) {
     if (!first.valid || !second.valid) return ValueResult::missing(node.type);
@@ -822,6 +711,73 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
                                    docid, score, size);
   }
   return evalBinaryScalar(node, first, second, docid);
+}
+
+ValueResult evalReducerPoint(BoundValueProgram& program, const ValueNode& node,
+                             int32_t docid, float score) {
+  ValueResult first = program.evalNode(node.children[0], docid, score);
+  if (!first.valid || first.array.size == 0) return ValueResult::missing(node.type);
+  if (node.opcode != ValueOpcode::AVG
+      && program.program.nodes[first.array.node].kind == ValueNodeKind::COLUMN
+      && !program.program.nodes[first.array.node].source
+      && program.nodes[first.array.node].column->multiSet()) {
+    // A set column holds the doc's values ascending, so min is the
+    // first present element and max the last (a NaN reads as missing).
+    bool fromEnd = node.opcode == ValueOpcode::MAX;
+    for (int64_t i = 0; i < first.array.size; i++) {
+      ValueResult next = program.evalArrayElement(
+          first.array, fromEnd ? first.array.size - 1 - i : i);
+      if (next.valid) return promote(next, node.type);
+    }
+    return ValueResult::missing(node.type);
+  }
+  if (node.opcode != ValueOpcode::AVG && node.type == ValueType::INT64
+      && program.program.nodes[first.array.node].kind == ValueNodeKind::COLUMN) {
+    auto& bound = program.nodes[first.array.node];
+    bool maximum = node.opcode == ValueOpcode::MAX;
+    int64_t raw = first.array.size >= NumColumnFormat::BULK_SIZE
+        ? bound.column->selectedRangeValue(bound.valueStart, bound.valueEnd, maximum, bound.bulkIterator->values())
+        : bound.column->selectedRangeValue(bound.valueStart, bound.valueEnd, maximum, bound.iterator->values());
+    return ValueResult::integer(raw);
+  }
+  ValueResult aggregate = ValueResult::missing(valueScalarType(first.type));
+  double sum = 0.0;
+  __int128 intSum = 0;
+  int64_t present = 0;
+  for (int64_t i = 0; i < first.array.size; i++) {
+    ValueResult next = program.evalArrayElement(first.array, i);
+    if (!next.valid) continue;
+    if (node.opcode == ValueOpcode::AVG) {
+      if (next.type == ValueType::DOUBLE) sum += next.doubleValue;
+      else intSum += (__int128)next.intValue;
+    } else if (!aggregate.valid) {
+      aggregate = next;
+    } else if (node.type == ValueType::DOUBLE) {
+      double a = aggregate.type == ValueType::DOUBLE ? aggregate.doubleValue
+                                                    : (double)aggregate.intValue;
+      double b = next.type == ValueType::DOUBLE ? next.doubleValue : (double)next.intValue;
+      aggregate = ValueResult::floating(
+          node.opcode == ValueOpcode::MIN ? std::min(a, b) : std::max(a, b));
+    } else {
+      aggregate.intValue = node.opcode == ValueOpcode::MIN
+          ? std::min(aggregate.intValue, next.intValue)
+          : std::max(aggregate.intValue, next.intValue);
+    }
+    present++;
+  }
+  if (present == 0) return ValueResult::missing(node.type);
+  if (node.opcode == ValueOpcode::AVG) {
+    double out = (sum + (double)intSum) / (double)present;
+    if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
+    return ValueResult::floating(out);
+  }
+  return promote(aggregate, node.type);
+}
+
+ValueResult evalMinMaxPoint(BoundValueProgram& program, const ValueNode& node,
+                            int32_t docid, float score) {
+  return node.childCount == 1 ? evalReducerPoint(program, node, docid, score)
+                             : evalBinaryPoint(program, node, docid, score);
 }
 
 bool truthyResult(const ValueResult& value) {
@@ -865,7 +821,7 @@ ValueResult evalRandomPoint(BoundValueProgram& program, const ValueNode& node,
                             int32_t docid, float score) {
   uint64_t key;
   if (node.childCount == 0) {
-    key = (uint64_t)(program.segment.base + docid);
+    key = (uint64_t)(program.segment->base + docid);
   } else {
     ValueResult value = program.evalNode(node.children[1], docid, score);
     if (!value.valid) return ValueResult::missing(node.type);
@@ -882,19 +838,15 @@ ValueResult evalRandomPoint(BoundValueProgram& program, const ValueNode& node,
   return ValueResult::floating((double)(hash >> 40) * 0x1p-24);
 }
 
-double constantNumber(const ValueNode& node) {
-  return node.type == ValueType::DOUBLE ? node.doubleValue : (double)node.intValue;
-}
-
 void prepareGeoDistance(ValueNode&, std::span<const ValueNode* const> args) {
-  geo::checkLatitude(constantNumber(*args[1]));
-  geo::checkLongitude(constantNumber(*args[2]));
+  geo::checkLatitude(numberOf(*args[1]));
+  geo::checkLongitude(numberOf(*args[2]));
 }
 
 double geoMeters(BoundValueProgram& program, const ValueNode& node, int64_t packed) {
   const auto& nodes = program.program.nodes;
   return geo::haversinMeters(
-      constantNumber(nodes[node.children[1]]), constantNumber(nodes[node.children[2]]),
+      numberOf(nodes[node.children[1]]), numberOf(nodes[node.children[2]]),
       geo::decodeLatitude(geo::unpackLatitude(packed)),
       geo::decodeLongitude(geo::unpackLongitude(packed)));
 }
@@ -929,10 +881,10 @@ enum class DecayShape : uint8_t { GAUSS, EXP, LINEAR };
 // (1 - decay for linear, ln(decay) otherwise) in doubleValue.
 template <DecayShape Shape>
 void prepareDecay(ValueNode& node, std::span<const ValueNode* const> args) {
-  double origin = constantNumber(*args[1]);
-  double scale = constantNumber(*args[2]);
-  double offset = args.size() > 3 ? constantNumber(*args[3]) : 0.0;
-  double decay = args.size() > 4 ? constantNumber(*args[4]) : 0.5;
+  double origin = numberOf(*args[1]);
+  double scale = numberOf(*args[2]);
+  double offset = args.size() > 3 ? numberOf(*args[3]) : 0.0;
+  double decay = args.size() > 4 ? numberOf(*args[4]) : 0.5;
   if (!std::isfinite(origin)) throw std::runtime_error("origin must be finite");
   if (!(scale > 0.0) || !std::isfinite(scale)) {
     throw std::runtime_error("scale must be positive and finite");
@@ -976,8 +928,8 @@ ValueResult evalDecayPoint(BoundValueProgram& program, const ValueNode& node,
   const ValueNode& originNode = nodes[node.children[1]];
   ValueResult origin = originNode.type == ValueType::INT64
       ? ValueResult::integer(originNode.intValue) : ValueResult::floating(originNode.doubleValue);
-  double scale = constantNumber(nodes[node.children[2]]);
-  double offset = node.childCount > 3 ? constantNumber(nodes[node.children[3]]) : 0.0;
+  double scale = numberOf(nodes[node.children[2]]);
+  double offset = node.childCount > 3 ? numberOf(nodes[node.children[3]]) : 0.0;
   ValueResult value = program.evalNode(node.children[0], docid, score);
   if (!value.valid) return ValueResult::floating(1.0);
   auto distance = [&](const ValueResult& element) {
@@ -997,24 +949,6 @@ ValueResult evalDecayPoint(BoundValueProgram& program, const ValueNode& node,
     present = true;
   }
   return ValueResult::floating(present ? decayScore(node, closest, scale) : 1.0);
-}
-
-ValueResult evalScalarOnlyElement(BoundValueProgram& program, const ValueNode& node,
-                                  const ValueArrayRef& array, int64_t index) {
-  unused(program);
-  unused(node);
-  unused(array);
-  unused(index);
-  throw std::logic_error("scalar value function used as an array expression");
-}
-
-void evalFunctionBatch(BoundValueProgram& program, const ValueNode& node,
-                       std::span<const int32_t> docids, std::span<const float> scores,
-                       std::span<ValueResult> results) {
-  for (size_t i = 0; i < docids.size(); i++) {
-    float score = scores.empty() ? 0.0f : scores[i];
-    results[i] = node.function->evalPoint(program, node, docids[i], score);
-  }
 }
 
 ValueResult evalFunctionElement(BoundValueProgram& program, const ValueNode& node,
@@ -1039,23 +973,10 @@ ValueResult evalFunctionElement(BoundValueProgram& program, const ValueNode& nod
   return evalBinaryScalar(scalar, first, second, array.docid);
 }
 
-bool invalid(const ValueBounds& bounds) {
-  return bounds.certainty == BoundsCertainty::INVALID;
-}
-
-bool bounded(const ValueBounds& bounds) {
-  return bounds.certainty == BoundsCertainty::BOUNDED;
-}
-
-ValueBounds retag(ValueBounds bounds, ValueType type) {
-  bounds.type = type;
-  return bounds;
-}
-
 ValueBounds promoteBounds(ValueBounds bounds, ValueType type) {
   if (valueDouble(type) && !valueDouble(bounds.type)
       && bounded(bounds)) {
-    ValueBounds promoted = ValueBounds::floating(
+    ValueBounds promoted = ValueBounds::floatingRange(
         (double)bounds.intMin, (double)bounds.intMax, bounds.mayBeMissing);
     promoted.type = type;
     promoted.alwaysMissing = bounds.alwaysMissing;
@@ -1079,45 +1000,38 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
   double high = boundMaxAsDouble(input);
   if ((node.opcode == ValueOpcode::NEG || node.opcode == ValueOpcode::ABS)
       && !valueDouble(node.type)) {
-    if (input.intMin == std::numeric_limits<int64_t>::min() && input.minAttained) {
-      return ValueBounds::invalid(node.type, BoundsInvalidity::INTEGER_OVERFLOW,
-                                  input.mayBeMissing);
+    if (input.intMin == std::numeric_limits<int64_t>::min()) {
+      return input.minAttained
+          ? ValueBounds::invalid(node.type, BoundsInvalidity::INTEGER_OVERFLOW, input.mayBeMissing)
+          : ValueBounds::unbounded(node.type, input.mayBeMissing);
     }
     ValueBounds out;
     if (node.opcode == ValueOpcode::NEG) {
-      out = ValueBounds::integer(-input.intMax, -input.intMin,
+      out = ValueBounds::integerRange(-input.intMax, -input.intMin,
                                  input.mayBeMissing);
     }
-    else if (input.intMin >= 0) out = ValueBounds::integer(input.intMin, input.intMax,
+    else if (input.intMin >= 0) out = ValueBounds::integerRange(input.intMin, input.intMax,
                                                            input.mayBeMissing);
-    else if (input.intMax <= 0) out = ValueBounds::integer(-input.intMax, -input.intMin,
+    else if (input.intMax <= 0) out = ValueBounds::integerRange(-input.intMax, -input.intMin,
                                                            input.mayBeMissing);
-    else out = ValueBounds::integer(0, std::max(-input.intMin, input.intMax),
+    else out = ValueBounds::integerRange(0, std::max(-input.intMin, input.intMax),
                                     input.mayBeMissing);
     out.type = node.type;
     if (node.opcode == ValueOpcode::NEG) {
       out.minAttained = input.maxAttained;
       out.maxAttained = input.minAttained;
-    } else if (input.intMin < 0 && input.intMax > 0) {
+    } else if (input.intMin >= 0) {
+      out.minAttained = input.minAttained;
+      out.maxAttained = input.maxAttained;
+    } else if (input.intMax <= 0) {
+      out.minAttained = input.maxAttained;
+      out.maxAttained = input.minAttained;
+    } else {
       out.minAttained = false;
-      out.maxAttained = input.minAttained || input.maxAttained;
+      out.maxAttained = (-input.intMin == out.intMax && input.minAttained)
+          || (input.intMax == out.intMax && input.maxAttained);
     }
     return out;
-  }
-
-  if (node.opcode == ValueOpcode::SQRT && low < 0.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
-  }
-  if (node.opcode == ValueOpcode::LOG && low <= 0.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
-  }
-  if (node.opcode == ValueOpcode::LOG1P && low <= -1.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
-  }
-  if ((node.opcode == ValueOpcode::SQRT && low < 0.0)
-      || (node.opcode == ValueOpcode::LOG && low <= 0.0)
-      || (node.opcode == ValueOpcode::LOG1P && low <= -1.0)) {
-    return ValueBounds::unbounded(node.type, input.mayBeMissing);
   }
 
   double outLow = 0.0;
@@ -1133,25 +1047,8 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
       outHigh = std::max(std::abs(low), std::abs(high));
       break;
     case ValueOpcode::SQRT:
-      outLow = std::sqrt(low);
-      outHigh = std::sqrt(high);
-      break;
     case ValueOpcode::LOG:
-      outLow = std::log(low);
-      outHigh = std::log(high);
-      break;
     case ValueOpcode::LOG1P:
-      outLow = std::log1p(low);
-      outHigh = std::log1p(high);
-      break;
-    case ValueOpcode::FLOOR:
-      outLow = std::floor(low);
-      outHigh = std::floor(high);
-      break;
-    case ValueOpcode::EXP:
-      outLow = std::exp(low);
-      outHigh = std::exp(high);
-      break;
     case ValueOpcode::NONE:
     case ValueOpcode::DEF:
     case ValueOpcode::ADD:
@@ -1161,7 +1058,6 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
     case ValueOpcode::MIN:
     case ValueOpcode::MAX:
     case ValueOpcode::AVG:
-    case ValueOpcode::POW:
     case ValueOpcode::LT:
     case ValueOpcode::LE:
     case ValueOpcode::GT:
@@ -1187,19 +1083,39 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
     }
     return ValueBounds::unbounded(node.type, input.mayBeMissing);
   }
-  ValueBounds out = ValueBounds::floating(outLow, outHigh, input.mayBeMissing);
+  ValueBounds out = ValueBounds::floatingRange(outLow, outHigh, input.mayBeMissing);
   out.type = node.type;
   if (node.opcode == ValueOpcode::NEG) {
     out.minAttained = input.maxAttained;
     out.maxAttained = input.minAttained;
+  } else if (node.opcode == ValueOpcode::ABS && high <= 0.0) {
+    out.minAttained = input.maxAttained;
+    out.maxAttained = input.minAttained;
   } else if (node.opcode == ValueOpcode::ABS && low < 0.0 && high > 0.0) {
     out.minAttained = false;
-    out.maxAttained = input.minAttained || input.maxAttained;
+    out.maxAttained = (std::abs(low) == outHigh && input.minAttained)
+        || (std::abs(high) == outHigh && input.maxAttained);
   } else {
     out.minAttained = input.minAttained;
     out.maxAttained = input.maxAttained;
   }
   return out;
+}
+
+template <class T, class Eval>
+void attainBinaryBounds(ValueBounds& out, const ValueBounds& left, const ValueBounds& right,
+                        T amin, T amax, T bmin, T bmax, T low, T high, Eval eval) {
+  bool fixed = (amin == amax && !left.mayBeMissing) || (bmin == bmax && !right.mayBeMissing);
+  if (!fixed) return;
+  std::array<T, 2> a{amin, amax}, b{bmin, bmax};
+  std::array<bool, 2> aPresent{left.minAttained, left.maxAttained};
+  std::array<bool, 2> bPresent{right.minAttained, right.maxAttained};
+  for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) {
+    if (!aPresent[i] || !bPresent[j]) continue;
+    auto value = eval(a[i], b[j]);
+    out.minAttained = out.minAttained || value == low;
+    out.maxAttained = out.maxAttained || value == high;
+  }
 }
 
 ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
@@ -1251,10 +1167,7 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
       case ValueOpcode::SQRT:
       case ValueOpcode::LOG:
       case ValueOpcode::LOG1P:
-      case ValueOpcode::FLOOR:
       case ValueOpcode::AVG:
-      case ValueOpcode::EXP:
-      case ValueOpcode::POW:
       case ValueOpcode::LT:
       case ValueOpcode::LE:
       case ValueOpcode::GT:
@@ -1272,16 +1185,24 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
     }
     if (low < std::numeric_limits<int64_t>::min() ||
         high > std::numeric_limits<int64_t>::max()) {
-      bool exact = amin == amax && bmin == bmax && left.minAttained && right.minAttained;
+      bool exact = amin == amax && bmin == bmax && left.minAttained && right.minAttained
+          && (!left.mayBeMissing || !right.mayBeMissing);
       return exact ? ValueBounds::invalid(node.type, BoundsInvalidity::INTEGER_OVERFLOW, mayMissing)
                    : ValueBounds::unbounded(node.type, mayMissing);
     }
-    ValueBounds out = ValueBounds::integer((int64_t)low, (int64_t)high, mayMissing);
+    ValueBounds out = ValueBounds::integerRange((int64_t)low, (int64_t)high, mayMissing);
     out.type = node.type;
-    bool leftFixed = amin == amax && !left.mayBeMissing;
-    bool rightFixed = bmin == bmax && !right.mayBeMissing;
-    out.minAttained = left.minAttained && right.minAttained && (leftFixed || rightFixed);
-    out.maxAttained = left.maxAttained && right.maxAttained && (leftFixed || rightFixed);
+    attainBinaryBounds(out, left, right, (__int128)amin, (__int128)amax, (__int128)bmin,
+                       (__int128)bmax, low, high, [&](auto a, auto b) {
+      switch (node.opcode) {
+        case ValueOpcode::ADD: return a + b;
+        case ValueOpcode::SUB: return a - b;
+        case ValueOpcode::MUL: return a * b;
+        case ValueOpcode::MIN: return std::min(a, b);
+        case ValueOpcode::MAX: return std::max(a, b);
+        default: throw std::logic_error("invalid integer bounds operation");
+      }
+    });
     return out;
   }
 
@@ -1336,10 +1257,7 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
     case ValueOpcode::SQRT:
     case ValueOpcode::LOG:
     case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
     case ValueOpcode::AVG:
-    case ValueOpcode::EXP:
-    case ValueOpcode::POW:
     case ValueOpcode::LT:
     case ValueOpcode::LE:
     case ValueOpcode::GT:
@@ -1358,16 +1276,24 @@ ValueBounds binaryBounds(const ValueNode& node, const ValueBounds& left,
   if ((!std::isfinite(low) || !std::isfinite(high))
       && node.opcode != ValueOpcode::MIN
       && node.opcode != ValueOpcode::MAX) {
-    bool exact = amin == amax && bmin == bmax && left.minAttained && right.minAttained;
+    bool exact = amin == amax && bmin == bmax && left.minAttained && right.minAttained
+          && (!left.mayBeMissing || !right.mayBeMissing);
     return exact ? ValueBounds::invalid(node.type, BoundsInvalidity::POSITIVE_INFINITY, mayMissing)
                  : ValueBounds::unbounded(node.type, mayMissing);
   }
-  ValueBounds out = ValueBounds::floating(low, high, mayMissing);
+  ValueBounds out = ValueBounds::floatingRange(low, high, mayMissing);
   out.type = node.type;
-  bool leftFixed = amin == amax && !left.mayBeMissing;
-  bool rightFixed = bmin == bmax && !right.mayBeMissing;
-  out.minAttained = left.minAttained && right.minAttained && (leftFixed || rightFixed);
-  out.maxAttained = left.maxAttained && right.maxAttained && (leftFixed || rightFixed);
+  attainBinaryBounds(out, left, right, amin, amax, bmin, bmax, low, high, [&](double a, double b) {
+    switch (node.opcode) {
+      case ValueOpcode::ADD: return a + b;
+      case ValueOpcode::SUB: return a - b;
+      case ValueOpcode::MUL: return a * b;
+      case ValueOpcode::DIV: return a / b;
+      case ValueOpcode::MIN: return std::min(a, b);
+      case ValueOpcode::MAX: return std::max(a, b);
+      default: throw std::logic_error("invalid floating bounds operation");
+    }
+  });
   return out;
 }
 
@@ -1390,15 +1316,19 @@ ValueBounds propagateBounds(const ValueNode& node, std::span<const ValueBounds> 
       return ValueBounds::unbounded(node.type, mayMissing, alwaysMissing);
     }
     if (valueDouble(node.type)) {
-      ValueBounds out = ValueBounds::floating(
+      ValueBounds out = ValueBounds::floatingRange(
           std::min(boundMinAsDouble(first), boundMinAsDouble(fallback)),
           std::max(boundMaxAsDouble(first), boundMaxAsDouble(fallback)), mayMissing);
       out.type = node.type;
+      out.minAttained = out.doubleMin == boundMinAsDouble(first) && first.minAttained;
+      out.maxAttained = out.doubleMax == boundMaxAsDouble(first) && first.maxAttained;
       return out;
     }
-    ValueBounds out = ValueBounds::integer(std::min(first.intMin, fallback.intMin),
+    ValueBounds out = ValueBounds::integerRange(std::min(first.intMin, fallback.intMin),
                                            std::max(first.intMax, fallback.intMax), mayMissing);
     out.type = node.type;
+    out.minAttained = out.intMin == first.intMin && first.minAttained;
+    out.maxAttained = out.intMax == first.intMax && first.maxAttained;
     return out;
   }
   if (unaryOpcode(node.opcode)) {
@@ -1407,6 +1337,9 @@ ValueBounds propagateBounds(const ValueNode& node, std::span<const ValueBounds> 
   if (reducerOpcode(node.opcode) && node.childCount == 1) {
     ValueBounds out = args[0];
     out.type = node.type;
+    bool oneValue = singleton(args[0]);
+    out.minAttained = args[0].minAttained && (node.opcode == ValueOpcode::MIN || oneValue);
+    out.maxAttained = args[0].maxAttained && (node.opcode == ValueOpcode::MAX || oneValue);
     if (node.opcode == ValueOpcode::AVG) {
       if (bounded(out)) {
         out.doubleMin = boundMinAsDouble(args[0]);
@@ -1428,15 +1361,15 @@ ValueBounds sumBounds(const ValueNode& node,
 ValueBounds countBounds(const ValueNode& node,
                         std::span<const ValueBounds> args) {
   if (invalid(args[0])) return retag(args[0], node.type);
-  if (args[0].alwaysMissing) return ValueBounds::integer(0, 0);
+  if (args[0].alwaysMissing) return ValueBounds::integerValue(0);
   if (!valueArray(args[0].type) && args[0].type != ValueType::COLUMN_ONLY) {
-    if (!args[0].mayBeMissing) return ValueBounds::integer(1, 1);
-    ValueBounds out = ValueBounds::integer(0, 1);
+    if (!args[0].mayBeMissing) return ValueBounds::integerValue(1);
+    ValueBounds out = ValueBounds::integerRange(0, 1);
     out.minAttained = false;
     out.maxAttained = false;
     return out;
   }
-  ValueBounds out = ValueBounds::integer(
+  ValueBounds out = ValueBounds::integerRange(
       0, std::numeric_limits<int64_t>::max());
   out.minAttained = false;
   out.maxAttained = false;
@@ -1455,8 +1388,11 @@ int boundsTruth(const ValueBounds& bounds) {
 }
 
 ValueBounds truthBounds(int truth, bool mayBeMissing) {
-  if (truth >= 0) return ValueBounds::integer(truth, truth, mayBeMissing);
-  ValueBounds out = ValueBounds::integer(0, 1, mayBeMissing);
+  if (truth >= 0) {
+    auto out = mayBeMissing ? ValueBounds::integerRange(truth, truth, true) : ValueBounds::integerValue(truth);
+    return out;
+  }
+  ValueBounds out = ValueBounds::integerRange(0, 1, mayBeMissing);
   out.minAttained = false;
   out.maxAttained = false;
   return out;
@@ -1493,12 +1429,9 @@ ValueBounds comparisonBounds(const ValueNode& node, std::span<const ValueBounds>
       case ValueOpcode::SQRT:
       case ValueOpcode::LOG:
       case ValueOpcode::LOG1P:
-      case ValueOpcode::FLOOR:
       case ValueOpcode::MIN:
       case ValueOpcode::MAX:
       case ValueOpcode::AVG:
-      case ValueOpcode::EXP:
-      case ValueOpcode::POW:
       case ValueOpcode::AND:
       case ValueOpcode::OR:
       case ValueOpcode::NOT:
@@ -1538,54 +1471,6 @@ ValueBounds logicalBounds(const ValueNode& node, std::span<const ValueBounds> ar
   return truthBounds(rightTruth, mayMissing);
 }
 
-ValueBounds powBounds(const ValueNode& node, std::span<const ValueBounds> args) {
-  const ValueBounds& base = args[0];
-  const ValueBounds& exponent = args[1];
-  if (invalid(base)) return retag(base, node.type);
-  if (invalid(exponent)) return retag(exponent, node.type);
-  bool mayMissing = base.mayBeMissing || exponent.mayBeMissing;
-  if (base.alwaysMissing || exponent.alwaysMissing) {
-    return ValueBounds::unbounded(node.type, true, true);
-  }
-  if (!bounded(base) || !bounded(exponent)) {
-    return ValueBounds::unbounded(node.type, mayMissing);
-  }
-  double amin = boundMinAsDouble(base);
-  double amax = boundMaxAsDouble(base);
-  double e = boundMinAsDouble(exponent);
-  if (e != boundMaxAsDouble(exponent)) return ValueBounds::unbounded(node.type, mayMissing);
-  double low;
-  double high;
-  bool exact = amin == amax;
-  if (exact) {
-    low = high = std::pow(amin, e);
-  } else if (e == 0.0) {
-    low = high = 1.0;
-  } else if (amin >= 0.0 && e > 0.0) {
-    low = std::pow(amin, e);
-    high = std::pow(amax, e);
-  } else if (amin > 0.0 && e < 0.0) {
-    low = std::pow(amax, e);
-    high = std::pow(amin, e);
-  } else {
-    return ValueBounds::unbounded(node.type, mayMissing);
-  }
-  if (!std::isfinite(low) || !std::isfinite(high)) {
-    if (exact && base.minAttained && exponent.minAttained) {
-      return ValueBounds::invalid(
-          node.type, std::isnan(low) ? BoundsInvalidity::NAN_VALUE
-                                     : BoundsInvalidity::POSITIVE_INFINITY,
-          mayMissing);
-    }
-    return ValueBounds::unbounded(node.type, mayMissing);
-  }
-  ValueBounds out = ValueBounds::floating(low, high, mayMissing);
-  out.type = node.type;
-  out.minAttained = exact && base.minAttained && exponent.minAttained;
-  out.maxAttained = out.minAttained;
-  return out;
-}
-
 ValueBounds ifBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   const ValueBounds& condition = args[0];
   if (invalid(condition)) return retag(condition, node.type);
@@ -1593,6 +1478,7 @@ ValueBounds ifBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   auto branch = [&](const ValueBounds& bounds) {
     ValueBounds out = promoteBounds(lazyOperand(bounds), node.type);
     out.mayBeMissing = out.mayBeMissing || condition.mayBeMissing;
+    if (condition.mayBeMissing) out.minAttained = out.maxAttained = false;
     return out;
   };
   int truth = boundsTruth(condition);
@@ -1606,6 +1492,7 @@ ValueBounds ifBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   if (then.alwaysMissing || otherwise.alwaysMissing) {
     ValueBounds out = then.alwaysMissing ? otherwise : then;
     out.mayBeMissing = true;
+    out.minAttained = out.maxAttained = false;
     return out;
   }
   bool mayMissing = then.mayBeMissing || otherwise.mayBeMissing;
@@ -1613,9 +1500,9 @@ ValueBounds ifBounds(const ValueNode& node, std::span<const ValueBounds> args) {
     return ValueBounds::unbounded(node.type, mayMissing);
   }
   ValueBounds out = valueDouble(node.type)
-      ? ValueBounds::floating(std::min(then.doubleMin, otherwise.doubleMin),
+      ? ValueBounds::floatingRange(std::min(then.doubleMin, otherwise.doubleMin),
                               std::max(then.doubleMax, otherwise.doubleMax), mayMissing)
-      : ValueBounds::integer(std::min(then.intMin, otherwise.intMin),
+      : ValueBounds::integerRange(std::min(then.intMin, otherwise.intMin),
                              std::max(then.intMax, otherwise.intMax), mayMissing);
   out.type = node.type;
   out.minAttained = false;
@@ -1630,7 +1517,7 @@ ValueBounds randomBounds(const ValueNode& node, std::span<const ValueBounds> arg
     if (args[1].alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
     mayMissing = args[1].mayBeMissing;
   }
-  ValueBounds out = ValueBounds::floating(0.0, 1.0 - 0x1p-24, mayMissing);
+  ValueBounds out = ValueBounds::floatingRange(0.0, 1.0 - 0x1p-24, mayMissing);
   out.minAttained = false;
   out.maxAttained = false;
   return out;
@@ -1639,7 +1526,7 @@ ValueBounds randomBounds(const ValueNode& node, std::span<const ValueBounds> arg
 ValueBounds geoDistanceBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   if (invalid(args[0])) return retag(args[0], node.type);
   if (args[0].alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
-  ValueBounds out = ValueBounds::floating(
+  ValueBounds out = ValueBounds::floatingRange(
       0.0, geo::EARTH_MEAN_RADIUS_METERS * 2.0 * std::asin(1.0), args[0].mayBeMissing);
   out.type = node.type;
   out.minAttained = false;
@@ -1649,9 +1536,9 @@ ValueBounds geoDistanceBounds(const ValueNode& node, std::span<const ValueBounds
 
 ValueBounds decayBounds(const ValueNode& node, std::span<const ValueBounds> args) {
   const ValueBounds& input = args[0];
-  if (input.alwaysMissing) return ValueBounds::floating(1.0, 1.0);
+  if (input.alwaysMissing) return ValueBounds::floatingValue(1.0);
   if (!bounded(input)) {
-    ValueBounds out = ValueBounds::floating(0.0, 1.0);
+    ValueBounds out = ValueBounds::floatingRange(0.0, 1.0);
     out.minAttained = out.maxAttained = false;
     return out;
   }
@@ -1677,7 +1564,7 @@ ValueBounds decayBounds(const ValueNode& node, std::span<const ValueBounds> args
     near = 0.0;
     nearAttained = false;
   }
-  ValueBounds out = ValueBounds::floating(decayScore(node, far, scale), decayScore(node, near, scale));
+  ValueBounds out = ValueBounds::floatingRange(decayScore(node, far, scale), decayScore(node, near, scale));
   out.minAttained = farAttained && !valueArray(input.type);
   out.maxAttained = nearAttained;
   if (input.mayBeMissing && out.doubleMax != 1.0) {
@@ -1686,8 +1573,6 @@ ValueBounds decayBounds(const ValueNode& node, std::span<const ValueBounds> args
   }
   return out;
 }
-
-constexpr ValueFunction::Operand RAW{ValueFunction::DateUnit::RAW};
 
 ValueResult decodeDecimalResult(ValueResult value, const DecimalScale& scale) {
   if (!value.valid) return ValueResult::missing(ValueType::DOUBLE);
@@ -1715,9 +1600,11 @@ ValueBounds decimalBounds(const ValueNode& node, std::span<const ValueBounds> ar
   const auto& input = args[0];
   if (!bounded(input)) return ValueBounds::unbounded(node.type, input.mayBeMissing, input.alwaysMissing);
   auto scale = DECIMAL_SCALES[args[1].intMin];
-  auto out = ValueBounds::floating(scale(boundMinAsDouble(input)), scale(boundMaxAsDouble(input)), input.mayBeMissing);
+  auto out = ValueBounds::floatingRange(scale(boundMinAsDouble(input)), scale(boundMaxAsDouble(input)), input.mayBeMissing);
   out.type = node.type;
   out.alwaysMissing = input.alwaysMissing;
+  out.minAttained = input.minAttained;
+  out.maxAttained = input.maxAttained;
   return out;
 }
 
@@ -1729,82 +1616,55 @@ BucketScalar evalDecimalBucket(std::span<const BucketScalar> args, ValueType typ
   return BucketScalar::floating(input.type == BucketValueType::DOUBLE ? scale(input.doubleValue) : scale(input.intValue));
 }
 
-constexpr ValueFunction::Operand ANY_VALUE{
-    .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::ANY};
-constexpr ValueFunction::Operand GEO_POINT{
-    .unit = ValueFunction::DateUnit::RAW, .kind = ValueFunction::Kind::GEO_POINT};
-constexpr ValueFunction::Operand CONSTANT_RAW{ValueFunction::DateUnit::RAW, false, true};
-constexpr ValueFunction::Operand SHARED{ValueFunction::DateUnit::SHARED};
-constexpr ValueFunction::Operand LAZY_RAW{ValueFunction::DateUnit::RAW, true};
-constexpr ValueFunction::Operand LAZY_SHARED{ValueFunction::DateUnit::SHARED, true};
-
 constexpr ValueFunction FUNCTIONS[] = {
-    {ValueOpcode::DEF, "def", defResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::DEF, "def", defResolve, evalDefPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, {SHARED, LAZY_SHARED}, nullptr, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::ADD, "add", addResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::ADD, "add", addResolve, evalBinaryPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::ADD, 2>},
-    {ValueOpcode::SUB, "sub", subResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::SUB, "sub", subResolve, evalBinaryPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::SUB, 2>},
-    {ValueOpcode::MUL, "mul", mulResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::MUL, "mul", mulResolve, evalBinaryPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, {RAW, RAW},
      evalBucketOperation<ValueOpcode::MUL, 2>},
-    {ValueOpcode::DIV, "div", divResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::DIV, "div", divResolve, evalBinaryPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, {RAW, RAW},
      evalBucketOperation<ValueOpcode::DIV, 2>},
-    {ValueOpcode::NEG, "neg", unaryDemote, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::NEG, "neg", unaryDemote, evalUnaryPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 1, {RAW},
      evalBucketOperation<ValueOpcode::NEG, 1>},
-    {ValueOpcode::ABS, "abs", unaryDemote, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::ABS, "abs", unaryDemote, evalUnaryPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 1, {RAW},
      evalBucketOperation<ValueOpcode::ABS, 1>},
-    {ValueOpcode::SQRT, "sqrt", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, {RAW},
-     evalBucketOperation<ValueOpcode::SQRT, 1>},
-    {ValueOpcode::LOG, "log", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, {RAW},
-     evalBucketOperation<ValueOpcode::LOG, 1>},
-    {ValueOpcode::LOG1P, "log1p", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, {RAW},
-     evalBucketOperation<ValueOpcode::LOG1P, 1>},
-    {ValueOpcode::FLOOR, "floor", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, {RAW},
-     evalBucketOperation<ValueOpcode::FLOOR, 1>},
-    {ValueOpcode::MIN, "min", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::MIN, "min", minMaxResolve, evalMinMaxPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::MIN, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::MAX, "max", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::MAX, "max", minMaxResolve, evalMinMaxPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::MAX, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::AVG, "avg", avgResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::AVG, "avg", avgResolve, evalReducerPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 1, {RAW}, nullptr, nullptr, NaturePolicy::DECIMAL},
     {ValueOpcode::NONE, "sum", sumResolve, evalSumPoint, evalFunctionBatch,
      sumBounds, evalSumElement, 1, 1, {RAW}, nullptr, nullptr, NaturePolicy::DECIMAL},
     {ValueOpcode::NONE, "count", countResolve, evalCountPoint,
      evalFunctionBatch, countBounds, evalCountElement, 1, 1, {ANY_VALUE}, nullptr},
-    {ValueOpcode::EXP, "exp", unaryDouble, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 1, 1, {RAW},
-     evalBucketOperation<ValueOpcode::EXP, 1>},
-    {ValueOpcode::POW, "pow", powResolve, evalFunctionPoint, evalFunctionBatch,
-     powBounds, evalFunctionElement, 2, 2, {RAW, RAW},
-     evalBucketOperation<ValueOpcode::POW, 2>},
-    {ValueOpcode::LT, "lt", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::LT, "lt", truthResolve, evalBinaryPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::LT, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::LE, "lte", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::LE, "lte", truthResolve, evalBinaryPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::LE, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::GT, "gt", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::GT, "gt", truthResolve, evalBinaryPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::GT, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::GE, "gte", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::GE, "gte", truthResolve, evalBinaryPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::GE, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::EQ, "eq", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::EQ, "eq", truthResolve, evalBinaryPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::EQ, 2>, nullptr, NaturePolicy::SAME},
-    {ValueOpcode::NE, "ne", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::NE, "ne", truthResolve, evalBinaryPoint, evalFunctionBatch,
      comparisonBounds, evalScalarOnlyElement, 2, 2, {SHARED, SHARED},
      evalBucketOperation<ValueOpcode::NE, 2>, nullptr, NaturePolicy::SAME},
     {ValueOpcode::AND, "and", truthResolve, evalLogicalPoint, evalFunctionBatch,
@@ -1813,13 +1673,13 @@ constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::OR, "or", truthResolve, evalLogicalPoint, evalFunctionBatch,
      logicalBounds, evalScalarOnlyElement, 2, 2, {RAW, LAZY_RAW},
      evalBucketOperation<ValueOpcode::OR, 2>},
-    {ValueOpcode::NOT, "not", truthResolve, evalFunctionPoint, evalFunctionBatch,
+    {ValueOpcode::NOT, "not", truthResolve, evalUnaryPoint, evalFunctionBatch,
      logicalBounds, evalScalarOnlyElement, 1, 1, {RAW},
      evalBucketOperation<ValueOpcode::NOT, 1>},
     {ValueOpcode::IF, "if", ifResolve, evalIfPoint, evalFunctionBatch,
      ifBounds, evalScalarOnlyElement, 3, 3, {RAW, LAZY_SHARED, LAZY_SHARED}, evalIfBucket, nullptr, NaturePolicy::SAME, 1},
     {ValueOpcode::RANDOM, "random", randomResolve, evalRandomPoint, evalFunctionBatch,
-     randomBounds, evalScalarOnlyElement, 0, 2, {CONSTANT_RAW, RAW}, nullptr, prepareRandom},
+     randomBounds, evalScalarOnlyElement, 0, 2, {CONSTANT_RAW, RAW}, nullptr, prepareRandom, NaturePolicy::NUMBER, 0, false},
     {ValueOpcode::GEO_DISTANCE, "geo_distance", geoDistanceResolve, evalGeoDistancePoint,
      evalFunctionBatch, geoDistanceBounds, evalGeoDistanceElement, 3, 3,
      {GEO_POINT, CONSTANT_RAW, CONSTANT_RAW}, nullptr, prepareGeoDistance},
@@ -1837,30 +1697,7 @@ constexpr ValueFunction FUNCTIONS[] = {
      prepareDecay<DecayShape::LINEAR>},
 };
 
-consteval std::string_view unsetOperandUnitFunction() {
-  for (const ValueFunction& function : FUNCTIONS) {
-    for (uint8_t i = 0; i < function.maxArity; i++) {
-      if (function.operands[i].unit == ValueFunction::DateUnit::UNSET) {
-        return function.name;
-      }
-    }
-  }
-  return {};
-}
-
-static_assert(unsetOperandUnitFunction().empty(), unsetOperandUnitFunction());
-
-consteval std::string_view constantBucketOperandFunction() {
-  for (const ValueFunction& function : FUNCTIONS) {
-    if (function.evalBucketScalar == nullptr) continue;
-    for (uint8_t i = 0; i < function.maxArity; i++) {
-      if (function.operands[i].constant) return function.name;
-    }
-  }
-  return {};
-}
-
-static_assert(constantBucketOperandFunction().empty(), constantBucketOperandFunction());
+static_assert(badOperandFlags(FUNCTIONS).empty(), badOperandFlags(FUNCTIONS));
 
 [[noreturn]] void throwBindInvalid(const ValueProgram& program, const ValueNode& node,
                                    const ValueBounds& bounds) {
@@ -1925,27 +1762,6 @@ std::optional<ValueFunctionRegistry::DecimalComparison> ValueFunctionRegistry::d
   return DecimalComparison{function, *bound};
 }
 
-uint32_t ValueProgram::numericNode(uint32_t index) {
-  ValueNode node = nodes[index];
-  if (valueDecimal(node.nature)) {
-    ValueNode scale;
-    scale.intValue = valueDecimalScale(node.nature);
-    addNode(scale);
-    auto scaleIndex = rootNode;
-    node.kind = ValueNodeKind::FUNCTION;
-    node.type = valueArray(node.type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE;
-    node.function = ValueFunctionRegistry::decimalDecoder();
-    node.opcode = ValueOpcode::NONE;
-    node.children = {index, scaleIndex};
-    node.childCount = 2;
-    node.text = node.function->name;
-  }
-  node.nature = ValueNature::NUMBER;
-  addNode(node);
-  constantScalar.reset();
-  return rootNode;
-}
-
 BucketScalar ValueFunction::bucket(
     std::span<const BucketScalar> args, ValueType type, ValueNature nature) const {
   for (size_t i = 0; i < args.size(); i++) {
@@ -1962,6 +1778,10 @@ ResolvedValue ValueFunction::resolveOperands(std::span<const ResolvedValue> args
     if (operands[i].kind == Kind::GEO_POINT) {
       if (args[i].nature != ValueNature::GEO_POINT) {
         throw std::runtime_error(fmt::format("argument {} is not a GEO_POINT value", i + 1));
+      }
+    } else if (operands[i].kind == Kind::DATE) {
+      if (!valueDate(args[i].nature)) {
+        throw std::runtime_error(fmt::format("argument {} is not a DATE value", i + 1));
       }
     } else if (operands[i].kind == Kind::NUMERIC) {
       requireNumeric(args.subspan(i, 1));
@@ -1980,8 +1800,9 @@ ValueBounds ValueFunction::bounds(
 
 ValueBounds ValueProgram::constantBounds(uint32_t index) const {
   const ValueNode& node = nodes[index];
-  if (node.type == ValueType::INT64) return ValueBounds::integer(node.intValue, node.intValue);
-  if (node.type == ValueType::DOUBLE) return ValueBounds::floating(node.doubleValue, node.doubleValue);
+  if (node.kind == ValueNodeKind::MISSING) return ValueBounds::unbounded(node.type, true, true);
+  if (node.type == ValueType::INT64) return ValueBounds::integerValue(node.intValue);
+  if (node.type == ValueType::DOUBLE) return ValueBounds::floatingValue(node.doubleValue);
   if (node.arraySize == 0) {
     ValueBounds out = ValueBounds::unbounded(node.type, true, true);
     return out;
@@ -1989,33 +1810,65 @@ ValueBounds ValueProgram::constantBounds(uint32_t index) const {
   if (node.type == ValueType::INT64_ARRAY) {
     auto begin = intArrays.begin() + node.arrayOffset;
     auto [min, max] = std::minmax_element(begin, begin + node.arraySize);
-    ValueBounds out = ValueBounds::integer(*min, *max);
+    ValueBounds out = ValueBounds::observedInteger(*min, *max);
     out.type = node.type;
     return out;
   }
   auto begin = doubleArrays.begin() + node.arrayOffset;
   auto [min, max] = std::minmax_element(begin, begin + node.arraySize);
-  ValueBounds out = ValueBounds::floating(*min, *max);
+  ValueBounds out = ValueBounds::observedFloating(*min, *max);
   out.type = node.type;
   return out;
 }
 
+namespace {
+
+// The core table followed by every family table, in one stable sequence so a
+// function's address is the same whichever way it is looked up.
+ValueFunctionRegistry::Entries allFunctions() {
+  static const std::array<std::span<const ValueFunction>, 5> tables{
+      FUNCTIONS, valueMathFunctions(), valueDateFunctions(), valueGeoFunctions(), valueHashFunctions()};
+  return ValueFunctionRegistry::Entries{std::span<const std::span<const ValueFunction>>(tables)};
+}
+
+} // namespace
+
 const ValueFunction* ValueFunctionRegistry::find(std::string_view name) {
-  for (const ValueFunction& function : FUNCTIONS) {
+  if (name == "ln") name = "log";
+  for (const ValueFunction& function : allFunctions()) {
     if (function.name == name) return &function;
   }
   return nullptr;
 }
 
-std::span<const ValueFunction> ValueFunctionRegistry::entries() {
-  return FUNCTIONS;
+ValueFunctionRegistry::Entries ValueFunctionRegistry::entries() {
+  return allFunctions();
+}
+
+const ValueFunction* ValueFunctionRegistry::findComponent(ValueFunction::Kind kind,
+                                                           std::string_view name) {
+  for (const ValueFunction& function : allFunctions()) {
+    if (!function.component.empty() && function.operands[0].kind == kind
+        && function.component == name) return &function;
+  }
+  return nullptr;
+}
+
+std::string ValueFunctionRegistry::componentNames(ValueFunction::Kind kind) {
+  std::string names;
+  for (const ValueFunction& function : allFunctions()) {
+    if (function.component.empty() || function.operands[0].kind != kind) continue;
+    if (!names.empty()) names += ", ";
+    names += function.component;
+  }
+  return names;
 }
 
 std::string ValueFunctionRegistry::arrayReducerNames() {
   std::vector<std::string_view> names;
   std::array<ResolvedValue, 1> array{{
       {ValueType::INT64_ARRAY, ValueNature::NUMBER}}};
-  for (const ValueFunction& function : FUNCTIONS) {
+  for (const ValueFunction& function : allFunctions()) {
     if (function.minArity > 1 || function.maxArity < 1) continue;
     try {
       ResolvedValue resolved = function.resolveOperands(array);
@@ -2037,69 +1890,164 @@ std::string ValueFunctionRegistry::arrayReducerNames() {
 
 std::string ValueProgram::describeDateSources(uint32_t node) const {
   std::string result;
-  std::vector<std::string_view> fields;
-  auto visit = [&](auto&& self, uint32_t index) -> void {
+  std::unordered_set<std::string_view> fields;
+  walkNodes(node, [&](uint32_t index) {
     const ValueNode& value = nodes[index];
     if (value.kind == ValueNodeKind::COLUMN && valueDate(value.nature)
-        && std::ranges::find(fields, value.text) == fields.end()) {
-      fields.push_back(value.text);
+        && fields.insert(value.text).second) {
       if (!result.empty()) result += ", ";
       result += fmt::format("'{}' ({})", value.text, valueNatureName(value.nature));
     }
-    for (uint8_t i = 0; i < value.childCount; i++) self(self, value.children[i]);
-  };
-  visit(visit, node);
+  });
   return result;
 }
 
-bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
-  auto equalNode = [&](auto&& self, uint32_t leftIndex, uint32_t rightIndex) -> bool {
-    const ValueNode& left = nodes[leftIndex];
-    const ValueNode& right = other.nodes[rightIndex];
-    auto kind = [](ValueNodeKind value) {
-      return value == ValueNodeKind::VARIABLE ? ValueNodeKind::CONSTANT : value;
-    };
-    if (kind(left.kind) != kind(right.kind)
-        || left.type != right.type || left.nature != right.nature) return false;
-    switch (kind(left.kind)) {
-      case ValueNodeKind::CONSTANT:
-        if (left.type == ValueType::INT64) return left.intValue == right.intValue;
-        if (left.type == ValueType::DOUBLE) {
-          return std::bit_cast<uint64_t>(left.doubleValue)
-              == std::bit_cast<uint64_t>(right.doubleValue);
-        }
-        if (left.arraySize != right.arraySize) return false;
-        for (uint32_t i = 0; i < left.arraySize; i++) {
-          if (left.type == ValueType::INT64_ARRAY) {
-            if (intArrays[left.arrayOffset + i]
-                != other.intArrays[right.arrayOffset + i]) return false;
-          } else if (std::bit_cast<uint64_t>(doubleArrays[left.arrayOffset + i])
-              != std::bit_cast<uint64_t>(other.doubleArrays[right.arrayOffset + i])) {
-            return false;
-          }
-        }
-        return true;
-      case ValueNodeKind::COLUMN:
-        return left.text == right.text && left.columnType == right.columnType
-            && left.columnMultiValued == right.columnMultiValued
-            && left.columnIndexed == right.columnIndexed;
-      case ValueNodeKind::FUNCTION:
-        if (left.function != right.function || left.opcode != right.opcode
-            || left.childCount != right.childCount) return false;
-        for (uint8_t i = 0; i < left.childCount; i++) {
-          if (!self(self, left.children[i], right.children[i])) return false;
-        }
-        return true;
-      case ValueNodeKind::SCORE:
-      case ValueNodeKind::DOCID:
-        return true;
-      case ValueNodeKind::VARIABLE:
-        assert(false);
-        return false;
-    }
-    return false;
+namespace {
+
+// A variable is its value: two programs that differ only in how a constant was
+// spelled are the same program.
+ValueNodeKind identityKind(const ValueNode& node) {
+  return node.kind == ValueNodeKind::VARIABLE ? ValueNodeKind::CONSTANT : node.kind;
+}
+
+// Identity of one node given the identity of its children, which the caller
+// has already reduced to node indices that are equal exactly when the child
+// values are.
+size_t nodeHash(const ValueProgram& program, const ValueNode& node) {
+  size_t out = 0;
+  auto add = [&](auto value) {
+    out ^= std::hash<decltype(value)>{}(value) + (size_t)0x9e3779b9 + (out << 6) + (out >> 2);
   };
-  return equalNode(equalNode, rootNode, other.rootNode);
+  auto kind = identityKind(node);
+  add((uint8_t)kind);
+  add((uint8_t)node.type);
+  add((uint8_t)node.nature);
+  if (kind == ValueNodeKind::CONSTANT) {
+    if (node.type == ValueType::INT64) add(node.intValue);
+    else if (node.type == ValueType::DOUBLE) add(std::bit_cast<uint64_t>(node.doubleValue));
+    else {
+      add(node.arraySize);
+      for (uint32_t i = 0; i < node.arraySize; i++) {
+        if (node.type == ValueType::INT64_ARRAY) add(program.intArrays[node.arrayOffset + i]);
+        else add(std::bit_cast<uint64_t>(program.doubleArrays[node.arrayOffset + i]));
+      }
+    }
+  } else if (kind == ValueNodeKind::COLUMN) {
+    add(node.text);
+    add((uint8_t)node.columnType);
+    add(node.columnMultiValued);
+    add(node.columnIndexed);
+    if (node.source) {
+      add(node.ownerPath);
+      add(node.source->path());
+    }
+  } else if (kind == ValueNodeKind::FUNCTION) {
+    add(node.function);
+    add((uint8_t)node.opcode);
+    add(node.intValue);
+    add(node.intValue2);
+    add(std::bit_cast<uint64_t>(node.doubleValue));
+    add(node.childCount);
+    for (uint8_t i = 0; i < node.childCount; i++) add(node.children[i]);
+  }
+  return out;
+}
+
+bool nodeEqual(const ValueProgram& a, const ValueNode& left,
+               const ValueProgram& b, const ValueNode& right) {
+  if (identityKind(left) != identityKind(right)
+      || left.type != right.type || left.nature != right.nature) return false;
+  switch (identityKind(left)) {
+    case ValueNodeKind::CONSTANT:
+      if (left.type == ValueType::INT64) return left.intValue == right.intValue;
+      if (left.type == ValueType::DOUBLE) {
+        return std::bit_cast<uint64_t>(left.doubleValue)
+            == std::bit_cast<uint64_t>(right.doubleValue);
+      }
+      if (left.arraySize != right.arraySize) return false;
+      for (uint32_t i = 0; i < left.arraySize; i++) {
+        if (left.type == ValueType::INT64_ARRAY) {
+          if (a.intArrays[left.arrayOffset + i] != b.intArrays[right.arrayOffset + i]) return false;
+        } else if (std::bit_cast<uint64_t>(a.doubleArrays[left.arrayOffset + i])
+            != std::bit_cast<uint64_t>(b.doubleArrays[right.arrayOffset + i])) {
+          return false;
+        }
+      }
+      return true;
+    case ValueNodeKind::COLUMN:
+      return left.text == right.text && left.columnType == right.columnType
+          && left.columnMultiValued == right.columnMultiValued
+          && left.columnIndexed == right.columnIndexed
+          && left.ownerPath == right.ownerPath
+          && (left.source == nullptr) == (right.source == nullptr)
+          && (!left.source || left.source->path() == right.source->path());
+    case ValueNodeKind::FUNCTION:
+      return left.function == right.function && left.opcode == right.opcode
+          && left.childCount == right.childCount && left.intValue == right.intValue
+          && left.intValue2 == right.intValue2
+          && std::bit_cast<uint64_t>(left.doubleValue) == std::bit_cast<uint64_t>(right.doubleValue)
+          && std::equal(left.children.begin(), left.children.begin() + left.childCount,
+                        right.children.begin());
+    case ValueNodeKind::MISSING:
+    case ValueNodeKind::SCORE:
+    case ValueNodeKind::DOCID:
+      return true;
+    case ValueNodeKind::VARIABLE:
+      assert(false);
+      return false;
+  }
+  return false;
+}
+
+} // namespace
+
+bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
+  // retainRoot() left each program with one node per distinct value, numbered
+  // in postorder from the root, so equal programs have equal node vectors.
+  return std::ranges::equal(nodes, other.nodes, [&](const ValueNode& left, const ValueNode& right) {
+    return nodeEqual(*this, left, other, right);
+  });
+}
+
+void ValueProgram::retainRoot() {
+  std::vector<ValueNode> kept;
+  auto hash = [&](uint32_t index) { return nodeHash(*this, kept[index]); };
+  auto equal = [&](uint32_t left, uint32_t right) {
+    return nodeEqual(*this, kept[left], *this, kept[right]);
+  };
+  std::unordered_set<uint32_t, decltype(hash), decltype(equal)> distinct(0, hash, equal);
+  std::vector<uint32_t> remap(nodes.size());
+  walkNodes(rootNode, [&](uint32_t index) {
+    ValueNode node = nodes[index];
+    for (uint8_t child = 0; child < node.childCount; child++) {
+      node.children[child] = remap[node.children[child]];
+    }
+    kept.push_back(node);
+    auto [found, added] = distinct.insert((uint32_t)kept.size() - 1);
+    if (!added) kept.pop_back();
+    remap[index] = *found;
+  });
+  rootNode = remap[rootNode];
+  assert(rootNode + 1 == kept.size());
+  nodes.assign(kept.begin(), kept.end());
+  needsScore = false;
+  std::vector<uint8_t> uses(nodes.size());
+  for (ValueNode& node : nodes) {
+    node.flags = node.kind == ValueNodeKind::SCORE ? ValueNode::READS_SCORE : 0;
+    needsScore = needsScore || node.kind == ValueNodeKind::SCORE;
+    for (uint8_t i = 0; i < node.childCount; i++) {
+      uint32_t child = node.children[i];
+      node.flags |= nodes[child].flags & ValueNode::READS_SCORE;
+      if (uses[child] < 2) uses[child]++;
+      // Lazy array callbacks revisit scalar operands for every element.
+      if (valueArray(node.type) && !valueArray(nodes[child].type)) uses[child] = 2;
+    }
+  }
+  for (uint32_t i = 0; i < nodes.size(); i++) {
+    // Columns already cache their document cursor; other leaves are cheaper
+    // to evaluate directly than to look up a memo.
+    if (uses[i] > 1 && nodes[i].kind == ValueNodeKind::FUNCTION) nodes[i].flags |= ValueNode::SHARED;
+  }
 }
 
 BoundValueProgram* ValueProgram::bind(MemPool& pool,
@@ -2109,48 +2057,51 @@ BoundValueProgram* ValueProgram::bind(MemPool& pool,
 
 BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
                                      IndexReader::Segment& segment, ValueFieldInfos fields)
-    : program(program), segment(segment),
+    : program(program), segment(&segment),
       nodes(pool.make_span<BoundValueNode>(program.nodes.size())) {
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueNode& node = program.nodes[index];
     BoundValueNode& bound = nodes[index];
-    if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) {
+    if (node.flags & ValueNode::SHARED) bound.memo = pool.make<ValueMemo>();
+    if (node.kind == ValueNodeKind::MISSING || node.kind == ValueNodeKind::CONSTANT
+        || node.kind == ValueNodeKind::VARIABLE) {
       bound.bounds = program.constantBounds(index);
     } else if (node.kind == ValueNodeKind::SCORE) {
       bound.bounds = ValueBounds::unbounded(ValueType::DOUBLE);
     } else if (node.kind == ValueNodeKind::DOCID) {
       int32_t maxDoc = segment.maxDoc();
       bound.bounds = maxDoc == 0 ? ValueBounds::unbounded(ValueType::INT64, true, true)
-                                : ValueBounds::integer(segment.base,
+                                : ValueBounds::observedInteger(segment.base,
                                                        segment.base + maxDoc - 1);
     } else if (node.kind == ValueNodeKind::COLUMN) {
-      auto* fieldInfo = fields[index].at(segment);
+      auto& source = node.source ? node.source->segments()[(size_t)segment.ord] : segment;
+      auto* fieldInfo = SegFieldInfo::column(fields[index].at(source));
       if (!fieldInfo) {
         bound.bounds = ValueBounds::unbounded(node.type, true, true);
       } else if (node.type == ValueType::COLUMN_ONLY) {
-        bound.stringColumn = pool.make<BoundStringColumn>(segment.postingsReader(), *fieldInfo);
+        bound.stringColumn = pool.make<BoundStringColumn>(source.postingsReader(), *fieldInfo);
         bound.bounds = ValueBounds::unbounded(node.type,
-            fieldInfo->docsWithField < segment.maxDoc());
+            node.source || fieldInfo->docsWithField < source.maxDoc());
       } else {
-        bound.column.emplace(segment.postingsReader(), *fieldInfo);
+        bound.column.emplace(source.postingsReader(), *fieldInfo);
         bound.iterator.emplace(*bound.column);
         bound.bulkIterator.emplace(*bound.column);
-        bool missing = bound.column->docsWithValue() < segment.maxDoc();
+        bool missing = node.source || bound.column->docsWithValue() < source.maxDoc();
         auto encoded = bound.column->encodedBounds();
         if (!encoded.hasValues) {
           bound.bounds = ValueBounds::unbounded(node.type, true, true);
         } else if (node.columnType == FieldType::FLOAT) {
           double min = (double)sortableInt32ToFloat((int32_t)encoded.min);
           double max = (double)sortableInt32ToFloat((int32_t)encoded.max);
-          bound.bounds = ValueBounds::floating(min, max, missing);
+          bound.bounds = ValueBounds::observedFloating(min, max, missing);
           bound.bounds.type = node.type;
         } else if (node.columnType == FieldType::DOUBLE) {
           double min = sortableInt64ToDouble(encoded.min);
           double max = sortableInt64ToDouble(encoded.max);
-          bound.bounds = ValueBounds::floating(min, max, missing);
+          bound.bounds = ValueBounds::observedFloating(min, max, missing);
           bound.bounds.type = node.type;
         } else {
-          bound.bounds = ValueBounds::integer(encoded.min, encoded.max, missing);
+          bound.bounds = ValueBounds::observedInteger(encoded.min, encoded.max, missing);
           bound.bounds.type = node.type;
         }
         if (valueDouble(node.type) && bounded(bound.bounds)
@@ -2160,6 +2111,13 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
           // cannot exclude those values to recover the non-NaN interval.
           bound.bounds = ValueBounds::unbounded(node.type, true);
         }
+      }
+      if (node.source && fieldInfo) {
+        assert(&source.segmentCore() == &segment.segmentCore());
+        OwnershipMapper mapper(segment.segmentCore(), node.ownerPath, node.source->path());
+        auto* shape = bound.stringColumn ? &bound.stringColumn->shape
+            : pool.make<ColumnShape>(source.postingsReader(), *fieldInfo);
+        bound.mapping = pool.make<BoundColumnRange>(pool, mapper, *shape);
       }
     }
   }
@@ -2206,12 +2164,11 @@ std::string_view BoundValueProgram::firstUnboundedNode() const {
       && !root.mayBeMissing && !root.alwaysMissing) {
     return {};
   }
-  std::vector<bool> visited(program.nodes.size());
-  auto visit = [&](auto&& self, uint32_t index) -> std::string_view {
-    if (visited[index]) return {};
-    visited[index] = true;
+  std::string_view blocker;
+  program.walkNodes(program.rootNode, [&](uint32_t index) -> uint32_t {
+    if (!blocker.empty()) return 0;
     const ValueBounds& value = nodes[index].bounds;
-    if (bounded(value) && !value.mayBeMissing && !value.alwaysMissing) return {};
+    if (bounded(value) && !value.mayBeMissing && !value.alwaysMissing) return 0u;
     const ValueNode& node = program.nodes[index];
     std::array<bool, VALUE_MAX_ARITY> contributes{};
     std::fill_n(contributes.begin(), node.childCount, true);
@@ -2229,14 +2186,18 @@ std::string_view BoundValueProgram::firstUnboundedNode() const {
       int shortCircuit = node.opcode == ValueOpcode::AND ? 0 : 1;
       contributes[1] = !left.alwaysMissing && boundsTruth(left) != shortCircuit;
     }
-    for (uint8_t child = 0; child < node.childCount; child++) {
-      if (!contributes[child]) continue;
-      std::string_view blocker = self(self, node.children[child]);
-      if (!blocker.empty()) return blocker;
+    uint32_t mask = 0;
+    for (uint8_t i = 0; i < node.childCount; i++) {
+      if (contributes[i]) mask |= 1u << i;
     }
-    return node.text;
-  };
-  return visit(visit, program.rootNode);
+    return mask;
+  }, [&](uint32_t index) {
+    const ValueBounds& value = nodes[index].bounds;
+    if (blocker.empty() && (!bounded(value) || value.mayBeMissing || value.alwaysMissing)) {
+      blocker = program.nodes[index].text;
+    }
+  });
+  return blocker;
 }
 
 ValueResult BoundValueProgram::evalConstant(uint32_t index, int32_t docid, float score) const {
@@ -2249,6 +2210,17 @@ ValueResult BoundValueProgram::evalConstant(uint32_t index, int32_t docid, float
 ValueResult BoundValueProgram::evalColumn(uint32_t index, int32_t docid, float score) {
   const ValueNode& node = program.nodes[index];
   BoundValueNode& bound = nodes[index];
+  if (bound.mapping) {
+    if (bound.cachedDoc != docid) {
+      auto [first, end] = bound.mapping->range(docid);
+      bound.cachedDoc = docid;
+      bound.valueStart = first;
+      bound.valueEnd = end;
+      bound.cachedPresent = first < end;
+    }
+    return bound.cachedPresent ? ValueResult::arrayValue(node.type, index, docid, score, bound.valueEnd - bound.valueStart)
+        : ValueResult::missing(node.type);
+  }
   if (!bound.column) return ValueResult::missing(node.type);
   if (bound.cachedDoc != docid) {
     if (!bound.iterator || bound.iterator->docId() > docid) {
@@ -2279,15 +2251,31 @@ ValueResult BoundValueProgram::evalColumn(uint32_t index, int32_t docid, float s
       node, bound.iterator->values().valueAt(bound.valueStart));
 }
 
+ValueResult BoundValueProgram::evalShared(uint32_t index, const ValueNode& node,
+                                         int32_t docid, float score) {
+  ValueMemo& memo = *nodes[index].memo;
+  uint32_t scoreBits = node.flags & ValueNode::READS_SCORE ? std::bit_cast<uint32_t>(score) : 0;
+  if (memo.docid != docid || memo.scoreBits != scoreBits) {
+    ValueResult result = node.function->evalPoint(*this, node, docid, score);
+    memo.result = result;
+    memo.docid = docid;
+    memo.scoreBits = scoreBits;
+  }
+  return memo.result;
+}
+
 ValueResult BoundValueProgram::evalNode(uint32_t index, int32_t docid, float score) {
   const ValueNode& node = program.nodes[index];
   switch (node.kind) {
+    case ValueNodeKind::MISSING: return ValueResult::missing(node.type);
     case ValueNodeKind::CONSTANT:
     case ValueNodeKind::VARIABLE: return evalConstant(index, docid, score);
     case ValueNodeKind::COLUMN: return evalColumn(index, docid, score);
     case ValueNodeKind::SCORE: return ValueResult::floating((double)score);
-    case ValueNodeKind::DOCID: return ValueResult::integer(segment.base + docid);
-    case ValueNodeKind::FUNCTION: return node.function->evalPoint(*this, node, docid, score);
+    case ValueNodeKind::DOCID: return ValueResult::integer(segment->base + docid);
+    case ValueNodeKind::FUNCTION:
+      if (node.flags & ValueNode::SHARED) return evalShared(index, node, docid, score);
+      return node.function->evalPoint(*this, node, docid, score);
   }
   throw std::runtime_error("invalid ValueExpr node");
 }
@@ -2427,7 +2415,7 @@ void BoundValueProgram::evalBatch(std::span<const int32_t> docids,
 
 ValueResult BoundValueProgram::evalArrayElement(const ValueArrayRef& array, int64_t element) {
   const ValueNode& node = program.nodes[array.node];
-  if (element < 0 || element >= array.size) throw std::runtime_error("ValueExpr array index out of range");
+  if (element < 0 || element >= array.size) throw ValueEvaluationError("ValueExpr array index out of range");
   if (node.kind == ValueNodeKind::CONSTANT || node.kind == ValueNodeKind::VARIABLE) {
     if (node.type == ValueType::INT64_ARRAY) {
       return ValueResult::integer(program.intArrays[node.arrayOffset + element]);
@@ -2437,7 +2425,11 @@ ValueResult BoundValueProgram::evalArrayElement(const ValueArrayRef& array, int6
   if (node.kind == ValueNodeKind::COLUMN) {
     BoundValueNode& bound = nodes[array.node];
     (void)evalColumn(array.node, array.docid, array.score);
-    int64_t raw = bound.iterator->values().valueAt(bound.valueStart + element);
+    // A small family uses points; a long contiguous value run amortizes a
+    // codec frame. The choice depends on values consumed, not owner density.
+    int64_t raw = node.source && array.size >= NumColumnFormat::BULK_SIZE
+        ? bound.bulkIterator->values().valueAt(bound.valueStart + element)
+        : bound.iterator->values().valueAt(bound.valueStart + element);
     if (node.columnType == FieldType::FLOAT) {
       double decoded = (double)sortableInt32ToFloat((int32_t)raw);
       if (std::isnan(decoded)) return ValueResult::missing(valueScalarType(node.type));

@@ -16,6 +16,7 @@
 #include "DisMaxQuery.h"
 #include "BooleanQuery.h"
 #include "PluginQueryBase.h"
+#include "ToParentQuery.h"
 
 namespace luxir {
 
@@ -23,6 +24,8 @@ namespace luxir {
 // Weight can omit them. Eligibility must not depend on execution flags.
 inline bool logicalConsumesDomain(const Query& query) {
   switch (query.getKind()) {
+    case QueryKind::TO_PARENT:
+      return logicalConsumesDomain(*((const ToParentQuery&)query).getChild());
     case QueryKind::KNN:
       return true;
     case QueryKind::BOOLEAN:
@@ -55,6 +58,7 @@ inline bool logicalConsumesDomain(const Query& query) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
+    case QueryKind::RANGE_FIELD:
     case QueryKind::ALL:
     case QueryKind::NONE:
     case QueryKind::COMBINED_FIELDS:
@@ -67,6 +71,9 @@ inline bool logicalConsumesDomain(const Query& query) {
 
 inline Query::ScoreProfile scoreProfile(const Query& query) {
   switch (query.getKind()) {
+    case QueryKind::TO_PARENT:
+      return ((const ToParentQuery&)query).getReduction().kind != RowReduction::NONE ? Query::ScoreProfile::variable()
+          : Query::ScoreProfile::explicitUniform(0.0f);
     case QueryKind::BOOLEAN:
       return static_cast<const BooleanQuery&>(query).shapeScoreProfile();
     case QueryKind::BOOST: {
@@ -97,6 +104,7 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
+    case QueryKind::RANGE_FIELD:
     case QueryKind::ALL:
       return Query::ScoreProfile::automatic(1.0f);
     case QueryKind::TERM:
@@ -117,6 +125,9 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
 
 inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
   switch (query.getKind()) {
+    case QueryKind::TO_PARENT:
+      return canOmitWeightForCacheFirstMembership(
+          *static_cast<const ToParentQuery&>(query).getChild());
     case QueryKind::BOOLEAN:
       return static_cast<const BooleanQuery&>(query)
           .shapeCanOmitWeightForCacheFirstMembership();
@@ -146,6 +157,7 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
+    case QueryKind::RANGE_FIELD:
     case QueryKind::ALL:
     case QueryKind::NONE:
       return true;
@@ -191,8 +203,10 @@ inline bool exactDomainIdentity(const Query& query) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
+    case QueryKind::RANGE_FIELD:
     case QueryKind::NONE:
     case QueryKind::MIN_SCORE:
+    case QueryKind::TO_PARENT:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return false;
@@ -207,7 +221,7 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
       return std::none_of(
           reader.segments().begin(), reader.segments().end(),
           [](const IndexReader::Segment& segment) {
-            return segment.hasDeletes();
+            return segment.mayHaveDeletes();
           });
     case QueryKind::BOOLEAN:
       return static_cast<const BooleanQuery&>(query)
@@ -241,7 +255,9 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
+    case QueryKind::RANGE_FIELD:
     case QueryKind::MIN_SCORE:
+    case QueryKind::TO_PARENT:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return false;
@@ -300,9 +316,11 @@ inline Query::VerificationWork membershipVerificationWork(const Query& query) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::GEO_POLYGON:
+    case QueryKind::RANGE_FIELD:
     case QueryKind::ALL:
     case QueryKind::NONE:
     case QueryKind::RESCORE:
+    case QueryKind::TO_PARENT:
     case QueryKind::PLUGIN:
     case QueryKind::TEST:
       return Query::VerificationWork::UNKNOWN;

@@ -141,12 +141,17 @@ would otherwise stop at N. An explicit `0` or `-1` overrides it, and `-2`
 applies only to its own list.
 
 A positive `count_limit: N` permits counting to stop at N. A relevance-ranked
-list holds competitive-score skipping until N matches have been counted, or
-index statistics already prove at least N matches. If collection then skips
-remaining work, `found` is N and `found_gte: true` marks it as a lower bound.
-Otherwise the count is exact and `found_gte` is omitted. An exact total is a
-valid answer even when it equals or exceeds N. Metadata and already-resident
-membership can supply an exact count without a counting pass.
+list with varying scores may count apart from ranking: when metadata permits
+more than N matches and counting has a bulk membership plan, an unscored pass
+counts until more than N are found, and ranking skips competitively from its
+first page. Otherwise one ranking pass holds competitive-score skipping until
+N matches have been counted. A list with uniform scores holds competitive-score
+skipping until N matches have been counted, or index statistics already prove
+at least N matches. If counting stops before the end, `found` is N and
+`found_gte: true` marks it as a lower bound. Otherwise the count is exact and `found_gte` is
+omitted. An exact total is a valid answer even when it equals or exceeds N.
+Metadata and already-resident membership can supply an exact count without a
+counting pass.
 
 ```http
 POST /collections/books/_search
@@ -838,9 +843,18 @@ to its following value. The function spellings remain available:
   reducer. The two-argument
   `min` and `max` compare scalars, which is useful for clamping.
 
-Field names use the value binding. Numeric, date, string, and ID fields keep
-the direct column-sort path. Use `col("name")` when a field name is reserved
-or is not an identifier. To sort analyzed text, use a string variant.
+Field names use the value binding. Numeric, date, string, and ID fields of
+the current view keep the direct column-sort path. Use `col("name")` when a
+field name is reserved or is not an identifier. To sort analyzed text, use a
+string variant.
+
+A dotted name below the current view, such as `answers.date`, reads an array
+of values from all its owned descendant rows. Multi-valued child fields are
+flattened into that array. Use a reducer in scalar positions, for example
+`max(answers.date)` as a sort key or `sum(max(items.price))` as a bucket metric.
+No descendant values means missing (`count` returns zero). Names stay relative
+to the view, and upward names are not accepted in expressions. See
+[Reducers over child values](nested.md#reducers-over-child-values).
 
 Multi-valued field sorting and per-document reducers follow the field's
 [multi-valued mode](schema.md#multi-valued-modes).
@@ -871,6 +885,13 @@ missing; `def()` chooses a fallback.
 A rescore expression must produce a finite value for every matched document.
 Handle missing values with `def()` or exclude them with an `exists()` child
 query.
+
+More operators and functions are in [Value expressions](value-expressions.md):
+the bitwise operators and `%`, trigonometry and rounding, calendar parts of dates
+(`year(d)`, `day_of_week(d)`), coordinates and distances between places,
+hashing for consistent sampling, `let` variables, `$name` request variables,
+`_score` as an alias of `score`, and typed field components such as `loc.lat`
+and `ts.year`.
 
 ### Decay functions
 
@@ -1134,17 +1155,17 @@ beside `ops` in the full form:
   native. `date_iso` emits UTC strings, and `date_ms`/`date_ns` normalize numeric
   output. Numeric constants in value expressions retain the operand's unit.
 - `max_parallel` chooses where and how the request runs. `0`, the default,
-  lets the engine decide: it executes serially on the HTTP io thread that
-  received it, with no scheduler handoff, unless the operator has set
-  [`search.auto-parallel-min-work`](operations.md#indexing-memory-and-request-limits) and the request visits at
-  least that many documents, in which case it runs like `-1`. `1` moves the request onto the
-  shared work-stealing scheduler, still serial, so an expensive query does
-  not occupy its connection thread. `-1` removes the cap: the request starts
-  on the receiving thread and shared workers join in, parallelizing across
-  segments and operations; like the default, it occupies the receiving
-  thread for its duration. gRPC runs every search on the shared workers
-  instead (see [gRPC](grpc.md)), so there `0` and `1` are alike. The path
-  collection overrides any collection target in the HTTP body.
+  starts on the receiving HTTP thread and adaptively uses idle cores after
+  earning work credit. `1` runs serially on an arena worker, so an expensive
+  query does not occupy its connection thread. `-1` publishes every sibling
+  regardless of work credit and load. `-2` runs serially inline. Values `0`,
+  `-1`, and `-2` occupy the receiving HTTP thread for the request's duration.
+  gRPC and requests continuing after a `min_commit` wait start on arena workers
+  for every value. The server-wide serial pin is `--search.fanout-grain-us=-1`;
+  it disables adaptive publication for `0`. The default grain is 50 us, and
+  `--search.fanout-sibling-grain-us` defaults to 1000 us when only SMT siblings
+  are idle. See [execution settings](operations.md#threads-and-streaming-backpressure).
+  The path collection overrides any collection target in the HTTP body.
 - `profile: true` returns an execution profile on the final response.
 
 Every final response carries `took_us`: the server-side wall time, in
@@ -1192,7 +1213,7 @@ segment:
 says how the segment was counted. Treat `strategy` and the typed numeric
 fields as diagnostics, not a stable performance promise, and treat `details`
 as prose for humans: its wording, ordering, and entry count change with the
-engine, so do not build tooling on it. Serial execution (the default, or
+engine, so do not build tooling on it. Serial execution (`max_parallel: -2` or
 `max_parallel: 1`) keeps parallel scheduling out of segment-timing
 comparisons.
 
@@ -1333,6 +1354,61 @@ preparation without collecting results. See
   goal is to consume every match.
 - The `(segment, docid)` tiebreak is reader-local and can change after segment
   merges, so it is not a durable pagination token.
-- `max_parallel` supports `-1`, `0`, and `1`; higher values are reserved.
+- `max_parallel` supports `-2`, `-1`, `0`, and `1`; other values are rejected.
 - Only string field facets and `knn` queries emit profile entries; other
   operations run unprofiled under `profile: true`.
+
+
+## Queries over nested rows
+
+Documents can contain lists of structured children, queried with forms such as
+`items:(color:red AND size:L)` and reached by operations through `domain.to`.
+See [Nested documents](nested.md).
+
+## Per-row operations
+
+`top_docs.row_ops` maps output names to ordinary operations. Each runs over
+one returned row, after ranking, offset and limit, and its result sits beside
+that row's fields. HTTP root shorthand accepts `row_ops` too. In `columns` or
+`adaptive` format these results are row-aligned value columns.
+
+```json
+{
+  "query": "status_s:active", "fields": ["id"], "limit": 10,
+  "row_ops": {
+    "children": {
+      "domain": {"to": "items", "filter": ["color:red"]},
+      "top_docs": {"fields": ["color", "size"], "limit": 3, "count_limit": -1}
+    },
+    "self": {"top_docs": {"fields": ["id"]}}
+  }
+}
+```
+
+A row operation without a domain sees the row itself. `domain.to` uses the
+same relative paths, `..` and `/` as other operations. Without a query it
+returns rows in row order, unscored. With a query it matches and scores within
+its domain; `filter`, sort, fields, limit, offset and count controls apply
+normally. Output names must not collide with returned fields (including
+fields expanded by `*`), decorators or reserved keys such as `_score_`.
+
+A structured query may carry a request-unique `name`. In a row operation,
+`domain.from_match` references a named descendant clause of the list's query
+or filters. It selects that clause's matching rows in the clause's own view.
+Names do not change query equality, scores, plans or filter-cache identity.
+See [Matched children per hit](nested.md#matched-children-per-hit).
+
+With `from_match` and no query, the named clause supplies the score and
+ranking. With an explicit `top_docs.query`, the named clause only restricts
+the domain; the explicit query supplies the score and ranking. In both cases
+`domain.filter` may narrow the eligible rows further. `from_match` cannot be
+combined with `to`. Unknown names, non-descendant clauses, prohibited clauses
+and clauses containing kNN are rejected.
+
+A row operation is a `top_docs`, which includes count-only lists (`limit` 0
+with a count). Not supported yet: per-row facets and metrics, row operations
+inside a row operation, decorators, domain resets (`domain.query`), row
+queries that need a prepare pass (kNN), and `row_ops` on fusion sources or on
+collapsed or diversified lists. Group operations on collapsed lists are
+unaffected. Row results count against the request's memory limit; their size
+grows with page size times the inner limit.

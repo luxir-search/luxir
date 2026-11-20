@@ -26,13 +26,16 @@
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/Query.h"
+#include "luxir/query/RangeFieldQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/TermInSetQuery.h"
 #include "luxir/query/TermPattern.h"
 #include "luxir/query/TermRangeQuery.h"
 #include "luxir/query/ValueSequence.h"
 #include "luxir/query/FieldResolver.h"
+#include "luxir/query/ParseView.h"
 #include "luxir/schema/ValCoerce.h"
+#include "luxir/schema/RangeBounds.h"
 #include "luxir/schema/FieldPattern.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/Clock.h"
@@ -222,6 +225,14 @@ private:
     return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
   }
 
+  Query* createRangeFieldPredicate(std::string_view field, const FieldType::IntWindow& window,
+      RangeFieldQuery::Relation relation = RangeFieldQuery::Relation::INTERSECTS, float boost = 1.0f) {
+    Query* query = window.empty() ? matchNoDocs()
+        : pool.make<RangeFieldQuery>(field, relation, window.lo, window.hi,
+            window.unroundedNow ? FilterKeyScope::REQUEST_STABLE : FilterKeyScope::SEGMENT_STABLE);
+    return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
+  }
+
   template<typename T>
   std::optional<int64_t> coerceMember(FieldType& fieldType, std::string_view field,
                                       const T& value) {
@@ -397,7 +408,7 @@ public:
                std::string_view opName = {},
                std::vector<api::Warning>* warnings = nullptr, FieldResolver* fields = nullptr,
                IndexReader* reader = nullptr, int32_t minLiteralPrefix = 0)
-    : pool(pool), schema(schema), reader(reader), localFields(schema), fields(fields ? *fields : localFields),
+    : pool(pool), schema(schema), reader(reader), localFields(schema, nullptr, reader ? reader->path() : std::string_view{}), fields(fields ? *fields : localFields),
       coerceContext(coerceContext), opName(opName),
       warnings(warnings), minLiteralPrefix(minLiteralPrefix) {}
 
@@ -406,7 +417,7 @@ public:
   }
 
   Query* createExistsQuery(std::string_view field) {
-    return createExistsQuery(fields.resolve(field, OpClass::EXISTS, opName));
+    return createExistsQuery(fields.resolveLocal(field, OpClass::EXISTS, opName));
   }
 
   Query* createExistsQuery(const ResolvedFieldHandle& target) {
@@ -422,7 +433,7 @@ public:
   CanonicalValueSet canonicalizeFieldValues(
       std::string_view field, ValueSequence values,
       bool preserveInputOrder = false) {
-    return canonicalizeFieldValues(fields.resolve(field, OpClass::VALUE, opName), values, preserveInputOrder);
+    return canonicalizeFieldValues(fields.resolveLocal(field, OpClass::VALUE, opName), values, preserveInputOrder);
   }
 
   CanonicalValueSet canonicalizeFieldValues(
@@ -577,7 +588,7 @@ public:
   // There is no upper bound; operator expansion and memory limits still apply.
   Query* createPrefixQuery(std::string_view field, std::string_view prefix,
                            int32_t maxExpansions = 0, bool caseInsensitive = false) {
-    return createPrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), prefix,
+    return createPrefixQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), prefix,
                              maxExpansions, caseInsensitive);
   }
 
@@ -608,7 +619,7 @@ public:
   // character classes also accept their simple Unicode case alternates.
   Query* createWildcardQuery(std::string_view field, std::string_view pattern,
                              bool caseInsensitive = false) {
-    return createWildcardQuery(fields.resolve(field, OpClass::SEARCH, opName), pattern,
+    return createWildcardQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), pattern,
                                caseInsensitive);
   }
 
@@ -621,7 +632,7 @@ public:
 
   Query* createRegexQuery(std::string_view field, std::string_view pattern,
                           bool caseInsensitive = false) {
-    return createRegexQuery(fields.resolve(field, OpClass::SEARCH, opName), pattern,
+    return createRegexQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), pattern,
                             caseInsensitive);
   }
 
@@ -784,7 +795,7 @@ public:
                           std::optional<int> maxEdits = std::nullopt,
                           std::optional<int> prefixLength = std::nullopt,
                           int maxExpansions = 0) {
-    return createFuzzyQuery(fields.resolve(field, OpClass::SEARCH, opName), term, maxEdits, prefixLength, maxExpansions);
+    return createFuzzyQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), term, maxEdits, prefixLength, maxExpansions);
   }
 
   Query* createFuzzyQuery(const ResolvedFieldHandle& target, std::string_view term,
@@ -848,7 +859,7 @@ public:
   Query* createMatchQuery(std::string_view field, std::string_view value,
                           Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
                           bool caseInsensitive = false) {
-    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), value, op, minMatch, boost, caseInsensitive);
+    return createMatchQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), value, op, minMatch, boost, caseInsensitive);
   }
 
   Query* createMatchQuery(const ResolvedFieldHandle& target, std::string_view value,
@@ -930,7 +941,7 @@ public:
   Query* createMatchQuery(std::string_view field, const luxir::api::Val& val,
                           Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
                           bool caseInsensitive = false) {
-    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), val, op, minMatch,
+    return createMatchQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), val, op, minMatch,
                             boost, caseInsensitive);
   }
 
@@ -942,6 +953,13 @@ public:
         "Match query", target.physicalName);
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
+    if (fieldType.type() == FieldType::INTERVAL) {
+      // Exact match on a range field: the intervals containing the value.
+      if (coerce::isNull(val)) return matchNoDocs();
+      requireNumericColumn(target);
+      return createRangeFieldPredicate(field, coerceIntWindow(target, val, FieldType::LiteralUse::MATCH),
+          RangeFieldQuery::Relation::INTERSECTS, boost);
+    }
     if (FieldType::isNumericColumn(fieldType.type())) {
       if (coerce::isNull(val)) return matchNoDocs();
       requireNumericColumn(target);
@@ -962,18 +980,18 @@ public:
   // Wildcard lists include explicit selectors in this physical-target budget.
   static constexpr size_t MAX_PATTERN_FIELDS = 64;
 
-private:
   struct ResolvedWeightedField {
     const ResolvedFieldHandle* target;
     float weight;
   };
 
+private:
   // Multi-field searches omit only values that cannot coerce to this field.
   // Keep all query construction on the strict match/range path.
   Query* tryCreateMatchQuery(const ResolvedFieldHandle& target, std::string_view text,
                              Operator op, int minMatch, float weight) {
     FieldType& type = *target.fieldType;
-    if (FieldType::isNumericColumn(type.type())) {
+    if (FieldType::isNumericColumn(type.type()) || type.supports(FieldType::RANGE_RELATION)) {
       type.requireCapability(FieldType::MATCH, "Match query", target.physicalName);
       requireNumericColumn(target);
       api::Val value;
@@ -982,6 +1000,10 @@ private:
                                              target.physicalName, coerceContext);
       if (!window) return nullptr;
       warnSkippedGranule(target, value, *window);
+      if (type.supports(FieldType::RANGE_RELATION)) {
+        return createRangeFieldPredicate(poolCopy(target.physicalName), *window,
+            RangeFieldQuery::Relation::INTERSECTS, weight);
+      }
       return createNumericPredicate(poolCopy(target.physicalName), *window, weight);
     }
     type.requireCapability(FieldType::MATCH, "Match query", target.physicalName);
@@ -991,9 +1013,10 @@ private:
     return createMatchQueryImpl(target, retainTermWindow(*window, buf), op, minMatch, weight, false);
   }
 
+public:
   // Expand selectors, resolve search bindings, and keep the largest weight
   // per physical target. Sort before analysis so request order never matters.
-  std::span<ResolvedWeightedField> resolveWeightedFields(std::span<const WeightedField> requested) {
+  std::span<ResolvedWeightedField> resolveWeightedFields(std::span<const WeightedField> requested, ParseView& view) {
     bool patterns = std::ranges::any_of(requested, [](const auto& field) {
       return field.field.find('*') != std::string_view::npos;
     });
@@ -1020,7 +1043,7 @@ private:
         assert(reader->schema().get() == &schema);
         catalog = reader->searchableFields();
       } else {
-        schemaNames = schema.searchableFields();
+        schemaNames = schema.searchableFields({}, fields.path());
         catalog = schemaNames;
       }
     }
@@ -1028,7 +1051,26 @@ private:
       if (field.field.find('*') == std::string_view::npos) {
         add(field.field, field.weight);
       } else {
-        forEachFieldPattern(catalog, field.field,
+        auto pattern = field.field;
+        auto dot = pattern.rfind('.');
+        std::optional<ParseView::Scope> scope;
+        std::vector<std::string> nestedNames;
+        auto names = catalog;
+        if (dot != std::string_view::npos) {
+          auto prefix = pattern.substr(0, dot);
+          if (prefix.find('*') != std::string_view::npos) {
+            throw RequestError("Wildcard nested paths are not supported: " + std::string(pattern));
+          }
+          const auto& path = fields.resolvePath(prefix);
+          scope.emplace(view, path.physicalName);
+          pattern.remove_prefix(dot + 1);
+          if (view.get()) names = view.get()->searchableFields();
+          else {
+            nestedNames = schema.searchableFields({}, fields.path());
+            names = nestedNames;
+          }
+        }
+        forEachFieldPattern(names, pattern,
             [](const auto& name) { return std::string_view(name); },
             [](const auto& name) { return name.find("__") != std::string_view::npos; },
             [&](const auto& name) { add(name, field.weight); });
@@ -1061,7 +1103,7 @@ public:
   // Fields with the same expanded analyzer definition and long-term policy share
   // one analysis pass and one BM25F query per term. Group order follows physical
   // field order, independent of request order and the query text.
-  Query* createMultiMatchCombined(std::span<const WeightedField> requested,
+  Query* createMultiMatchCombined(std::span<const ResolvedWeightedField> resolved,
                                   std::string_view text, Operator op, int minMatch,
                                   float tie = 1.0f) {
     struct Group {
@@ -1070,7 +1112,6 @@ public:
       std::span<float> weights;
       size_t count;
     };
-    auto resolved = resolveWeightedFields(requested);
     auto groups = pool.make_span<Group>(resolved.size());
     auto groupIndices = pool.make_span<size_t>(resolved.size());
     size_t numGroups = 0;
@@ -1133,23 +1174,14 @@ public:
   }
 
   // Each field contributes its own match or phrase score multiplied by its weight.
-  Query* createMultiMatchPerField(std::span<const WeightedField> requested,
-                                  std::string_view text, Operator op, int minMatch,
-                                  float tie = 1.0f, std::optional<int32_t> phraseSlop = {}) {
-    auto resolved = resolveWeightedFields(requested);
-    auto clauses = pool.make_span<Query*>(resolved.size());
-    size_t count = 0;
-    for (size_t i = 0; i < resolved.size(); i++) {
-      const auto& target = *resolved[i].target;
-      if (phraseSlop && target.fieldType->type() == FieldType::Type::TEXT) {
-        clauses[count++] = createPhraseQuery(
-            target, std::span<const std::string_view>(&text, 1), {}, *phraseSlop, resolved[i].weight);
-      } else if (auto* query = tryCreateMatchQuery(target, text, op, minMatch, resolved[i].weight)) {
-        clauses[count++] = query;
-      }
+  Query* createMultiMatchField(const ResolvedWeightedField& field,
+                              std::string_view text, Operator op, int minMatch,
+                              std::optional<int32_t> phraseSlop = {}) {
+    if (phraseSlop && field.target->fieldType->type() == FieldType::TEXT) {
+      return createPhraseQuery(*field.target, std::span<const std::string_view>(&text, 1),
+          {}, *phraseSlop, field.weight);
     }
-    if (count == 0) return matchNoDocs();
-    return DisMaxQuery::make(pool, clauses.first(count), tie);
+    return tryCreateMatchQuery(*field.target, text, op, minMatch, field.weight);
   }
 
   // Build a range query over `field` from raw bound Vals (any may be null for
@@ -1164,31 +1196,33 @@ public:
   // TermRangeQuery over the terms dictionary in byte order: bounds coerce to
   // term bytes, TEXT bounds fold like the field folds (normalizeMultiterm),
   // and exact bounds obey the post-normalization length limit.
+  //
+  // Range fields build a RangeFieldQuery comparing each stored interval with
+  // the query interval by `relation`; other fields accept only INTERSECTS.
   Query* createRangeQuery(std::string_view field,
                           const luxir::api::Val* gte, const luxir::api::Val* gt,
-                          const luxir::api::Val* lte, const luxir::api::Val* lt) {
-    return createRangeQuery(fields.resolve(field, OpClass::VALUE, opName), gte, gt, lte, lt);
+                          const luxir::api::Val* lte, const luxir::api::Val* lt,
+                          RangeFieldQuery::Relation relation = RangeFieldQuery::Relation::INTERSECTS) {
+    return createRangeQuery(fields.resolveLocal(field, OpClass::VALUE, opName), gte, gt, lte, lt, relation);
   }
 
   Query* createRangeQuery(const ResolvedFieldHandle& target,
                           const luxir::api::Val* gte, const luxir::api::Val* gt,
-                          const luxir::api::Val* lte, const luxir::api::Val* lt) {
+                          const luxir::api::Val* lte, const luxir::api::Val* lt,
+                          RangeFieldQuery::Relation relation = RangeFieldQuery::Relation::INTERSECTS) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
+    if (relation != RangeFieldQuery::Relation::INTERSECTS && !fieldType.supports(FieldType::RANGE_RELATION)) {
+      throw std::runtime_error(std::format(
+          "Range query relation applies only to range fields; '{}' is not one", field));
+    }
     fieldType.requireCapability(FieldType::RANGE, "Range query", field);
-    bool numeric = FieldType::isNumericColumn(fieldType.type());
+    bool interval = fieldType.supports(FieldType::RANGE_RELATION);
+    bool numeric = FieldType::isNumericColumn(fieldType.type()) || interval;
     if (numeric) requireNumericColumn(target);
-
-    bool hasGte = gte && !coerce::isNull(*gte);
-    bool hasGt  = gt  && !coerce::isNull(*gt);
-    bool hasLte = lte && !coerce::isNull(*lte);
-    bool hasLt  = lt  && !coerce::isNull(*lt);
-    if (hasGte && hasGt) {
-      throw std::runtime_error(std::format("Range query on '{}' sets both gte and gt", field));
-    }
-    if (hasLte && hasLt) {
-      throw std::runtime_error(std::format("Range query on '{}' sets both lte and lt", field));
-    }
+    auto bounds = rangeBoundLiterals(gte, gt, lte, lt, field);
+    bool hasGte = bounds[0] != nullptr, hasGt = bounds[1] != nullptr;
+    bool hasLte = bounds[2] != nullptr, hasLt = bounds[3] != nullptr;
 
     if (!numeric) {
       auto termBound = [&](const api::Val& v) -> std::string_view {
@@ -1203,19 +1237,10 @@ public:
       return pool.make<TermRangeQuery>(field, lower, hasGte, upper, hasLte);
     }
 
-    // Coerce both bounds before testing emptiness: a malformed upper bound
-    // must still fail when the lower bound already admits no values.
-    FieldType::IntWindow window;
-    auto intersect = [&](const FieldType::IntWindow& bound) {
-      window.lo = std::max(window.lo, bound.lo);
-      window.hi = std::min(window.hi, bound.hi);
-      window.unroundedNow |= bound.unroundedNow;
-    };
-    if (hasGte) intersect(coerceIntWindow(target, *gte, FieldType::LiteralUse::GTE));
-    if (hasGt)  intersect(coerceIntWindow(target, *gt, FieldType::LiteralUse::GT));
-    if (hasLte) intersect(coerceIntWindow(target, *lte, FieldType::LiteralUse::LTE));
-    if (hasLt)  intersect(coerceIntWindow(target, *lt, FieldType::LiteralUse::LT));
-    return createNumericPredicate(field, window);
+    auto domain = interval ? ((RangeFieldType&)fieldType).domainBounds() : FieldType::IntWindow{};
+    auto window = foldRangeBounds(bounds, domain,
+        [&](const api::Val& value, FieldType::LiteralUse use) { return coerceIntWindow(target, value, use); });
+    return interval ? createRangeFieldPredicate(field, window, relation) : createNumericPredicate(field, window);
   }
 
   // Build a phrase query from un-analyzed input by running the field's analyzer.
@@ -1236,7 +1261,7 @@ public:
   Query* createPhraseQuery(std::string_view field, std::span<const std::string_view> values,
                            std::span<const int32_t> valuePositions = {}, int32_t slop = 0,
                            float boost = 1.0f) {
-    return createPhraseQuery(fields.resolve(field, OpClass::SEARCH, opName), values, valuePositions,
+    return createPhraseQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), values, valuePositions,
                               slop, boost);
   }
 
@@ -1307,7 +1332,7 @@ public:
   // The provided span contents are not copied and thus should outlive the returned query.
   Query* createPhraseFromTerms(std::string_view field, std::span<std::string_view> terms,
                                std::span<const int32_t> positions, int32_t slop = 0) {
-    return createPhraseFromTerms(fields.resolve(field, OpClass::SEARCH, opName), terms, positions, slop);
+    return createPhraseFromTerms(fields.resolveLocal(field, OpClass::SEARCH, opName), terms, positions, slop);
   }
 
   Query* createPhraseFromTerms(const ResolvedFieldHandle& target, std::span<std::string_view> terms,

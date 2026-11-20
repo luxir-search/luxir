@@ -1,6 +1,9 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
+#include "luxir/index/SegmentMerger.h"
+#include <oneapi/tbb/task_arena.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -25,6 +28,7 @@
 #include "test/DurableIndexInfo.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
+#include "test/RowSpaceFixture.h"
 #include "test/SchemaBuilder.h"
 
 namespace luxir::test {
@@ -37,10 +41,10 @@ namespace {
 // change alters the bytes Luxir writes, this test fails: bump
 // IndexFormat::VERSION, then update kReferenceVersion and kReferenceDigest. Changing
 // only the digest leaves old collections loading under the new reader.
-constexpr uint64_t kReferenceVersion = 12;
-constexpr uint64_t kReferenceDigest = 0xcb471306f973d8b2;
+constexpr uint64_t kReferenceVersion = 14;
+constexpr uint64_t kReferenceDigest = 0x26041a282703487d;
 
-// A small index over every default field template's kind, with two segments
+// A small index over every default field template's kind, with three segments
 // and a delete. Each segment is one request flushed by a single inverter.
 // Merges are left out: fields merge as parallel tasks, so a merged segment's
 // file layout varies.
@@ -56,6 +60,9 @@ void buildReferenceIndex(CollectionHelper& ch) {
   decimal.type = api::FieldDef::FieldClass::DECIMAL;
   decimal.scale = 2;
   decimal.index = api::FieldDef::IndexMode::RANGE;
+  auto& interval = schema.field("interval_value");
+  interval.type = api::FieldDef::FieldClass::LONG_RANGE;
+  interval.index = api::FieldDef::IndexMode::RANGE;
   schema.set(ch.collection());
   ASSERT_TRUE(ch.indexAll({
       flatdoc("id", "a", "numeric_match", (int64_t)-7, "numeric_array", vec_i(2, 1, 2), "title_t", "the quick brown fox", "tag_s", "red", "tags_ss", vecs("x", "y"),
@@ -69,6 +76,16 @@ void buildReferenceIndex(CollectionHelper& ch) {
       flatdoc("id", "b", "title_t", "lazy dogs sleep", "tag_s", "blue", "n_i", (int64_t)-3,
               "vec_v", std::vector<float>{0, 1}, "at_p", std::vector<double>{2.3522, 48.8566}),
   }, UpdateMessage::COMMIT).success);
+  CollectionHelper::UpdateBuilder range;
+  for (std::string_view json : {
+      R"({"id":"range","interval_value":{"gte":-9223372036854775808,"lte":9223372036854775807}})",
+      R"({"id":"range_point","interval_value":{"gte":0,"lte":0}})"}) {
+    range.addRaw([json](api::Map& doc, std::pmr::memory_resource& mr) {
+      ASSERT_TRUE(api::read_json(doc, json, mr));
+    });
+  }
+  range.commit();
+  ASSERT_TRUE(ch.submit(range).success);
   ASSERT_TRUE(ch.indexAll({
       flatdoc("id", "c", "title_t", "quick quick fox", "tag_s", "red", "n_i", (int64_t)42,
               "dt_dt", "2025-12-31T00:00:00Z", "vec_v", std::vector<float>{0.5f, 0.5f},
@@ -92,6 +109,7 @@ uint64_t referenceDigest(Directory& dir) {
   std::vector<std::vector<api::FileDescriptor>> files;
   for (auto& segment : segments) {
     EXPECT_TRUE(segment.overlays.empty());
+    EXPECT_FALSE(segment.merge_rows.has_value());
     segment.commit_time = 0;
     segment.schema = {};
     auto& kept = files.emplace_back();
@@ -112,7 +130,63 @@ uint64_t buildReferenceDigest() {
   LuxirNode node(LuxirConfig{});
   CollectionHelper ch(node, "main");
   buildReferenceIndex(ch);
-  return referenceDigest(ch.getIndexWriter()->dir);
+  std::vector<uint64_t> fingerprints{referenceDigest(ch.getIndexWriter()->dir)};
+  // Cover the child catalog and both optional reverse-map states as well as
+  // the ordinary root index, so a child-only format change trips the oracle.
+  RAMDir bundles;
+  using Fixture = RowSpaceFixture;
+  std::vector<Fixture::Row> roots{{17, {"root"}, "root", "root source"}, {}, {19, {"root"}, "root", {}}};
+  std::vector<Fixture::Row> children{{11, {"common", "common"}, "a", "child source"}, {}, {11, {"common"}, "a", {}}};
+  std::vector<int64_t> ends{2, 2, 3}, owners{0, 0, 2};
+  // Keep the format oracle's original physical names independent of the
+  // request schema's qualified-name convention.
+  std::vector<FileDescriptor> files;
+  for (uint64_t id = 1; id <= 3; id++) {
+    PostingsWriter writer(bundles, id, 1, (int32_t)roots.size());
+    Fixture::fields(writer, SpaceOrdinal::ROOT, "", roots);
+    if (id < 3) {
+      auto reverse = id == 1 ? std::optional<std::span<const int64_t>>(owners) : std::nullopt;
+      auto child = writer.addSpace(Fixture::CHILD);
+      writer.finishSpace(child, (int32_t)children.size(), Fixture::shape(writer, ends, reverse));
+      Fixture::fields(writer, child, "", children);
+    }
+    writeUnversionedRuns(writer);
+    EXPECT_TRUE(writer.finish(nullptr, &files));
+  }
+  for (const auto& file : files) {
+    fingerprints.push_back(file.size);
+    fingerprints.push_back(file.xxh3);
+  }
+  return XXH3_64bits(fingerprints.data(), fingerprints.size() * sizeof(uint64_t));
+}
+
+uint64_t buildMergedReferenceDigest() {
+  LuxirNode node(LuxirConfig{});
+  CollectionHelper ch(node, "main");
+  buildReferenceIndex(ch);
+  auto reader = ch.getIndexWriter()->snapshots.readers.getReader();
+  std::vector<std::shared_ptr<SegmentCore>> inputs;
+  std::vector<LiveDocs*> live;
+  for (const auto& segment : reader->segments()) {
+    inputs.push_back(segment.segmentCoreShared());
+    live.push_back(segment.liveDocs());
+  }
+  RAMDir output;
+  IndexRamBudget budget;
+  budget.setTotalBytes(1);
+  StoredDictionaryRegistry dictionaries;
+  PostingsWriter writer(output, 3, 1);
+  SegmentMerger merger(inputs, live, writer, budget, INT64_MAX, 1, 4, *reader->schema(), dictionaries);
+  oneapi::tbb::task_arena serial(1);
+  serial.execute([&] { merger.merge(); });
+  std::vector<FileDescriptor> files;
+  EXPECT_TRUE(writer.finish(nullptr, &files));
+  std::vector<uint64_t> fingerprints;
+  for (const auto& file : files) {
+    fingerprints.push_back(file.size);
+    fingerprints.push_back(file.xxh3);
+  }
+  return XXH3_64bits(fingerprints.data(), fingerprints.size() * sizeof(uint64_t));
 }
 
 // Copies every file of the reference index's first segment into a RAM
@@ -155,6 +229,12 @@ TEST_F(IndexFormatTest, referenceIndexBytesMatchFormatVersion) {
   EXPECT_EQ(digest, kReferenceDigest) << std::format(
       "The bytes Luxir writes changed (digest {:#x}). Bump IndexFormat::VERSION, "
       "then update kReferenceVersion and kReferenceDigest.", digest);
+}
+
+TEST_F(IndexFormatTest, serialRootMergeBytesMatchReference) {
+  auto digest = buildMergedReferenceDigest();
+  ASSERT_EQ(digest, buildMergedReferenceDigest()) << "the serial merge is not deterministic";
+  EXPECT_EQ(0x5f88710743474121ULL, digest) << std::format("merged digest {:#x}", digest);
 }
 
 TEST_F(IndexFormatTest, otherFormatVersionFailsToLoad) {
@@ -240,7 +320,7 @@ TEST_F(IndexFormatTest, malformedSegmentMetadataThrows) {
   };
   for (size_t i = 0; i < corruptions.size(); i++) {
     auto copy = copySegment(dir, corruptions[i]);
-    EXPECT_THROW({ PostingsReader reader(*copy, segId, creatorEpoch); }, std::runtime_error) << "corruption " << i;
+    EXPECT_THROW({ SegmentCore readerCore(*copy, segId, creatorEpoch); }, std::runtime_error) << "corruption " << i;
   }
 
   // A field entry whose fields run on: the first value after its name never terminates.
@@ -249,7 +329,8 @@ TEST_F(IndexFormatTest, malformedSegmentMetadataThrows) {
     size_t afterName = entry + 1 + (uint8_t)b[entry];
     std::memset(b.data() + afterName, 0xff, std::min<size_t>(16, offsetsTable(b) - afterName));
   });
-  PostingsReader reader(*copy, segId, creatorEpoch);
+  SegmentCore readerCore(*copy, segId, creatorEpoch);
+  auto& reader = readerCore.rootReader();
   ASSERT_GT(reader.numFields(), 0);
   EXPECT_THROW(reader.fieldInfo(0), std::runtime_error);
 }

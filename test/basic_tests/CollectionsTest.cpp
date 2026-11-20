@@ -33,7 +33,7 @@ protected:
   }
   Collections::Prepared prepared() {
     auto candidate = collections.stage(CollectionId::of("main"), copy);
-    return collections.prepare(candidate, CommitSnapshot::fromBytes(Manifest::load(candidate.dir()).bytes));
+    return collections.prepare(candidate, CommitSnapshot::fromBytes(Manifest::load(candidate.dir()).bytes), {});
   }
 };
 

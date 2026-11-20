@@ -65,7 +65,7 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
       }
       case SortClause::COLUMN: {
         const auto& field = clause.getSortField();
-        auto* found = reader.field(field.getFieldName()).at(segment);
+        auto* found = SegFieldInfo::column(reader.field(field.getFieldName()).at(segment));
         if (!found) break;
         const SegFieldInfo& info = *found;
         auto type = const_cast<FieldType&>(field.getFieldType()).type();

@@ -44,8 +44,8 @@ class StrHandler final : public Inverter::IndexHandler {
   int32_t lastFieldDoc = -1;    // last doc that contributed a value to this field
 
 public:
-  StrHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
-    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
+  StrHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space),
       stringValue(*fieldType), arrayValues(inverter.pool), termsHash(inverter.pool, 4), docsWithField(inverter.pool) {
   }
 
@@ -135,7 +135,7 @@ public:
       return; // drop the field.
     }
 
-    auto nDocs = inverter.getMaxDoc();
+    auto nDocs = inverter.getPostingsWriter().getMaxDoc(space);
     auto guard = MemPool::threadLocalPoolGuard();
 
 
@@ -143,7 +143,7 @@ public:
 
     // TODO: TextWriter should be refactored (or templated) to handle strings without positions.
     TextWriter textWriter(inverter.getPostingsWriter());
-    PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(space, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
@@ -157,6 +157,27 @@ public:
     if (!full) {
       rankToDoc.reserve((size_t)nDocsWithField);
       docsWithField.forEachDoc(termsHash.getMemPool(), [&](int d) { rankToDoc.push_back(d); });
+    }
+
+    if (!fieldType->hasColumn()) {
+      // column: false keeps the postings and the docs-with-field set (exists,
+      // scoring) but no ord column.
+      textWriter.startField(&fieldInfo);
+      for (int32_t tnum = 0; tnum < uniqueVals; tnum++) {
+        auto term = terms[tnum];
+        textWriter.startTerm(term);
+        term.val().forEachDoc(termsHash.getMemPool(), [&](int rank) {
+          textWriter.addDoc(full ? rank : rankToDoc[rank], 1);
+        });
+        textWriter.endTerm(term);
+      }
+      textWriter.endField();
+      termsHash.free();
+      inverter.noteFlushWorkspace(rankToDoc.capacity() * sizeof(int32_t));
+      fieldInfo.numValues = fieldInfo.sumDocFreq;
+      DocsWithValWriter::write(guard.pool(), inverter.postingsWriter, fieldInfo, nDocsWithField,
+                               [&](auto&& accept) { for (int32_t doc : rankToDoc) accept(doc); });
+      return;
     }
 
     std::conditional_t<Array, std::vector<uint32_t>, std::monostate> termToOrd;

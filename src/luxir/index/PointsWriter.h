@@ -209,7 +209,7 @@ private:
       encode(residuals, valueFormat, encodedValues);
     }
 
-    size_t headerStart = out.size();
+    [[maybe_unused]] size_t headerStart = out.size();
     writeU16(out, (uint16_t)leaf.size());
     out.write((char)docCodec);
     out.write((char)docBits);

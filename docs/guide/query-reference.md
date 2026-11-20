@@ -42,6 +42,16 @@ sorts, metrics) use its `value` binding, and `f__label` or `f__self` selects
 one representation directly. See [default bindings for variants](schema.md#default-bindings-for-variants)
 and the [worked example](searching.md#field-bindings).
 
+## Clause names
+
+Any structured query object accepts an optional sibling `name`, unique within
+its request: `{"name":"recent","range":{"field":"answers.date","lte":"2012-04-08"}}`.
+A name references the subtree; it does not wrap it or change scores, equality,
+planning or cache keys. Expression strings have no name syntax, but the
+structured `expr` arm may be named. Row operations use `domain.from_match`
+to select a named clause's matching descendant rows. See
+[Per-row operations](searching.md#per-row-operations) for eligibility and errors.
+
 ## Match all and exists
 
 ```json
@@ -248,7 +258,7 @@ also set a `domain`:
 ```
 
 `domain.query` replaces the incoming document set with that query's matches
-across the collection. Without it, the operation inherits its incoming set.
+across the operation's view. Without it, the operation inherits its incoming set.
 `domain.filter` adds local constraints in either case. With a replacement
 query, `apply_parent_filters: true` reapplies the owning list's filters,
 including facet selections, while respecting `except_ops`. It defaults to
@@ -438,6 +448,57 @@ prefix rule. Case-insensitive matching does not shorten the measured literal.
 Match, fuzzy, term ranges, and facet term filters are also exempt from that rule.
 See [Operations](operations.md) for the server settings.
 
+### Range fields
+
+On a `long_range`, `double_range`, or `date_range` field, the query compares
+each stored interval with the query interval. `relation` picks the test:
+
+| `relation` | A document matches when its interval |
+|---|---|
+| `intersects` (default) | overlaps the query interval |
+| `contains` | covers the whole query interval |
+| `within` | lies inside the query interval |
+
+```json
+{"range":{"field":"open_hours","gte":9,"lte":17,"relation":"contains"}}
+```
+
+Bounds follow the matching scalar type's range-query rules. For example,
+fractional long bounds round inward to integer endpoints; ingest requires
+integral long endpoints. Malformed bounds are errors even when another bound
+already makes the query empty. See [Range types](schema.md#range-types) for
+strict ingest validation and supported endpoint domains.
+
+A partial date names its whole granule: `gte: "2024-06"` includes June from
+its first millisecond and `lte: "2024-06"` through its last; `gt` and `lt`
+exclude the named granule. Luxir uses this rule at ingest too. Elasticsearch
+and OpenSearch differ: when they ingest a range field, a partial-date `lte`
+such as `"2024-06"` does not extend to the end of the month. Ingest uses UTC for dates without an explicit
+offset; query dates use the request's time zone and `now` follows the scalar
+`date` rules.
+
+An open query side and an open stored end are unbounded within the endpoint
+domain: `{"gte":50}` contains every value from 50 up. For doubles, open ends
+are `-Infinity` and `Infinity`, and explicit infinities at those ends are
+equivalent. NaN is an error. `gt: "Infinity"` and `lt: "-Infinity"` match
+nothing. Negative zero sorts below positive zero. Long and date open ends
+extend to the int64 limits.
+
+A `match` on a range field, and `field:[a TO b]` in the
+[query language](query-language.md), are `intersects` queries; `match` with
+one value finds intervals containing it. Explicit field literals also work
+in `simple_query`. `multi_match` accepts explicitly named range fields in
+both modes, applies field weights, and skips literals that cannot coerce to
+an endpoint, as for numeric fields. Wildcard field selectors do not select
+range fields. `relation` is rejected on other field types unless it is
+`intersects`.
+
+Returned intervals omit open ends. Date endpoints follow the request's
+`date_iso`, `date_ms`, or `date_ns` output mode in ROWS and COLUMNS responses,
+with epoch milliseconds as the default. Multi-valued range fields, sort,
+facets, collapse, value expressions, and `any_of` on range fields are not
+supported.
+
 ## Constant score and boost
 
 Replace every child score while retaining its match set:
@@ -494,8 +555,10 @@ The expression uses the same value-expression language as sorting (arithmetic,
 `def`, math such as `exp` and `pow`, comparisons and `?:` conditionals,
 `random`, reducers, and the Elasticsearch-style `gauss_decay`, `exp_decay`,
 and `linear_decay` decay functions; see
-[Searching](searching.md#sort-expressions-in-detail) and
-[Decay functions](searching.md#decay-functions)) and
+[Searching](searching.md#sort-expressions-in-detail),
+[Decay functions](searching.md#decay-functions), and
+[Value expressions](value-expressions.md) for the bitwise operators, trigonometry,
+date parts, geo functions, hashing, and `let`) and
 must produce a finite value for every matched document. Handle missing values
 with `def()` or exclude them with an `exists()` clause in the child query.
 The expression form is
@@ -781,6 +844,8 @@ grammar and the function-call subset.
 Vector and geographic queries use the same `Query` node and are documented
 in their own guides:
 
+- A child-field `knn` counts rows of the view where it is written; see
+  [Chunks and vectors](nested.md#chunks-and-vectors).
 - [`knn`](vector-search.md) covers `field`, `query`, `k`, `refine_candidates`,
   `exact`, `similarity`, and the per-engine `ivf` object (`nprobe`,
   `min_scan_fraction`).
@@ -807,3 +872,22 @@ in their own guides:
 - Fuzzy expansion truncation at `max_expansions` is not reported in the response.
 - Operators can opt in to request-wide limits on multi-term and fuzzy dictionary work; see
   [Expansion limits](#expansion-limits).
+
+
+## Nested row queries and domains
+
+A single-field leaf naming a descendant field implicitly uses to_parent with
+score max; each leaf joins independently. Wrap a Boolean child in
+`{"to_parent":{"path":"items","query":{...}}}` for a same-item query.
+Its optional `score` is `max` (default), `min`, `sum`, `avg` or `none`
+(contributes zero), and optional `min_children` (default 1) and
+`max_children` (default unbounded) bound the number of matching children;
+see [Scoring](nested.md#scoring). An exists query on a nested
+path joins all rows of that path. Query strings additionally support nested
+field groups, such as `items:(color:red AND size:L)`.
+
+Operations move between views through `domain.to`: relative dotted descent,
+`..` or `../..` ascent, and `/` for root documents. Mixed upward/downward
+paths are reserved. Non-query field consumers must run in their field's own
+view. See [Nested documents](nested.md) for examples and the precise
+query/consumer distinction.

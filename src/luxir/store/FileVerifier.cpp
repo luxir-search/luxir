@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/store/FileVerifier.h"
-#include "luxir/store/CorruptionMarker.h"
 #include <format>
 #include <oneapi/tbb/parallel_for.h>
 
@@ -14,8 +13,8 @@ std::string checksumMismatch(const FileDescriptor& expected, const FileCheck& ac
                      expected.name, expected.size, expected.xxh3, actual.size, actual.xxh3);
 }
 
-void FileVerification::open(Directory& dir, std::span<const FileDescriptor> files, bool full) {
-  auto suspects = CorruptionMarker::read(dir);
+void FileVerification::open(Directory& dir, std::span<const FileDescriptor> files, bool full,
+                            std::span<const std::string> suspects) {
   items.reserve(files.size());
   for (const auto& file : files) {
     bool direct = std::ranges::binary_search(suspects, file.name);
@@ -57,9 +56,9 @@ void FileVerification::run() {
   throw std::runtime_error(message);
 }
 
-void verifyFiles(Directory& dir, std::span<const FileDescriptor> files, bool full) {
+void verifyFiles(Directory& dir, std::span<const FileDescriptor> files, bool full, std::span<const std::string> suspects) {
   FileVerification verification;
-  verification.open(dir, files, full);
+  verification.open(dir, files, full, suspects);
   verification.run();
 }
 

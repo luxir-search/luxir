@@ -228,7 +228,12 @@ recreated as a fresh empty collection. New requests receive
 `collection_unavailable` while deletion is in progress. Searches already
 executing keep their index view and complete normally.
 Deletion waits for indexing work already accepted, including a running merge,
-so deleting a collection mid-merge can take as long as that merge.
+so deleting a collection mid-merge can take as long as that merge. Running
+merges are not aborted. A delete dispatched by HTTP or gRPC holds a control
+thread and the tenant's lifecycle lock until the drain finishes. Detach
+commits and drains the writer under the same lock on the caller's thread.
+See [Threads and streaming backpressure](#threads-and-streaming-backpressure)
+for the effect on queued work.
 
 On the filesystem backend, incarnations live at `t/<tenant>/i/<id>/`.
 A tenant's `CATALOG` maps collection names to active incarnations and records
@@ -400,6 +405,13 @@ collections, lists directories, or reads the operating system is opt-in. A
 tenant or collection scope always walks its collections and returns no node
 blocks.
 
+Bare node stats, such as `GET /_stats` without parameters, are built on the
+receiving HTTP shard or gRPC completion-queue thread. All tenant- and
+collection-scoped requests and node requests with `collections`, `system`,
+`host`, `files`, or `segments` enabled run on the control executor. This
+includes the default `/metrics` scrape, which enables collections and system
+sampling.
+
 | Parameter | Adds | Cost |
 | --- | --- | --- |
 | (default, node scope) | `service`: request, search, ingest and background activity and latency; `memory`: indexing RAM budget, draining, pending-merge and retained delete bytes, RAM storage, field metadata, jemalloc and its arenas, configured budgets. | Atomic loads and one allocator statistics read. |
@@ -546,6 +558,7 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
 | `luxir_stream_pauses_total` | Response backpressure events by transport. |
 | `luxir_http_connections`, `luxir_http_io_threads` | Live HTTP sessions and running connection-shard threads; the thread gauge excludes the accept thread. gRPC active calls are in `luxir_requests_in_flight`. |
+| `luxir_control_threads`, `luxir_control_busy`, `luxir_control_queued`, `luxir_control_tasks_total` | Control executor thread count, tasks running, tasks queued, and tasks completed. |
 | `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, merge, vector-build, and reader-refresh stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
 | `luxir_node_memory_budget_bytes`, `luxir_search_request_memory_limit_bytes` | Configured managed-memory budget and tracked per-search ceiling. Neither is a process RSS limit. |
 | `luxir_index_ram_*_bytes` | Indexing reservations, budget, draining reservations, pending merge demand, and retained delete packets (part of the reservations, never freed by a flush). The budget is soft; pending demand is capped at that budget when limited. |
@@ -676,24 +689,46 @@ workers.
 ./luxir --server.workers=2
 ```
 
-HTTP search requests default to serial execution directly on the io shard
-that received them. This avoids a scheduler handoff and idle-worker wakeups
-but occupies that connection's thread for the query's duration. The
-request-level `max_parallel` changes that: `1` moves the request onto the
-shared work-stealing scheduler, still serial (use this for requests expected
-to be expensive, so they do not delay other traffic on the same connection
-thread); `-1` keeps the request on its transport thread but lets the
-scheduler's workers join in with unlimited intra-request parallelism; values
-above `1` are reserved for a bounded parallelism budget and not implemented
-yet. A request with `min_commit` continues on a shared worker once its commit
-wait ends, whatever the setting.
+HTTP searches with `max_parallel: 0` (the default) start on the receiving
+connection thread and adaptively use idle cores after earning work credit.
+`1` runs serially on an arena worker, keeping an expensive query off its
+connection thread. `-1` publishes every sibling regardless of credit and load.
+`-2` runs serially inline on the receiving thread. Other values are rejected.
+The receiving thread stays occupied for the duration of requests with `0`,
+`-1`, or `-2`.
 
-gRPC searches always run on the shared workers, never on the completion-queue
-thread: a client such as a gateway multiplexes many calls over one HTTP/2
-connection, and gRPC offers a connection's new calls to its preferred
-completion queue first, so inline execution would run them one at a time.
-`max_parallel` keeps its parallelism meaning there: `0` and `1` run serially
-on a worker, and `-1` fans out from one.
+`--search.fanout-grain-us` sets adaptive work credit and the minimum share in
+microseconds (default 50). It accepts `-1` or values from 1 through 60000000.
+`-1` is the server-wide serial pin for `max_parallel: 0`.
+`--search.fanout-sibling-grain-us` sets the minimum share when only SMT siblings
+are idle (default 1000 us, the same accepted range); `-1` disables publication
+in that load tier. Saturated requests never publish adaptively. Neither grain
+option changes `max_parallel: -1`.
+
+A request with `min_commit` continues on an arena worker once its commit wait
+ends, whatever the setting. gRPC searches always start on arena workers, so
+`1` and `-2` are serial there, `0` is adaptive, and `-1` publishes every sibling.
+gRPC keeps searches off completion-queue threads so calls multiplexed on one
+HTTP/2 connection can execute concurrently.
+
+The node's control executor is a dedicated thread pool for collection create,
+delete, rename and swap requests, schema changes, detailed stats, cache
+control, replication snapshot and file setup, periodic pin expiry, and admin
+replica-wait replies. The attach and detach node hooks run on their caller's
+thread. Buffered HTTP update bodies and NDJSON batches are decoded on indexing
+workers.
+
+`--server.control-threads` sets the pool size (default `2`, minimum `1`). A
+delete or a detach running on the pool can occupy one thread while a merge
+finishes. A second lifecycle operation in the same tenant can occupy the other
+thread waiting for the tenant lock. Full scrapes, replication transfer opens,
+and admin replica-wait replies then queue. Bare node `/_stats` bypasses the
+pool. Adding threads gives other work more slots. Waiters for the same tenant
+lock still wait for the drain.
+
+```bash
+./luxir --server.control-threads=4
+```
 
 `--server.stream_buffer_bytes` sets the per-HTTP-connection and per-gRPC-call
 high-water mark for serialized responses (default 1 MiB). Producers pause above
@@ -799,12 +834,6 @@ Search has its own limits:
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state and prefix top-term selection; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
-- `search.auto-parallel-min-work` lets `max_parallel: 0`, the default, run a
-  request across segments in parallel, like `-1`, when its lists and
-  operations visit at least that many documents by index metadata. Counts that
-  metadata answers cost nothing. `0` (the default) keeps `max_parallel: 0`
-  serial. Parallel runs cost more CPU in exchange for latency, so set it only
-  where large requests are common.
 - Multi-term expansion limits are operator opt-ins, all off by default (`0`).
   With limits off, broad patterns on high-cardinality fields simply run. Operators
   exposing public endpoints can bound this work using the following options.

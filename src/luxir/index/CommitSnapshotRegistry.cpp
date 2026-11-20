@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "CommitSnapshotRegistry.h"
+#include "luxir/store/CorruptionMarker.h"
 #include "luxir/store/VerifiedDirectory.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/util/Signal.h"
@@ -84,7 +85,7 @@ void CommitSnapshotRegistry::fail() noexcept {
   notifyChange();
 }
 
-void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
+std::vector<std::string> CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
   auto manifest = Manifest::load(dir);
   auto changed = [&] {
     auto latest = Manifest::load(dir);
@@ -96,10 +97,13 @@ void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
     if (!manifest.bytes) throw ReadOnlyError("collection has no snapshot");
     auto snapshot = CommitSnapshot::fromBytes(manifest.bytes);
     std::shared_ptr<IndexReader> reader;
+    CorruptionMarker::Observation observed;
     {
       FileVerification verification;
-      try { verification.open(dir, snapshot->files, verify); }
-      catch (...) {
+      try {
+        observed = CorruptionMarker::read(dir, manifest.listingOf(dir));
+        verification.open(dir, snapshot->files, verify, observed.suspects);
+      } catch (...) {
         if (!changed()) throw;
         continue;
       }
@@ -118,18 +122,20 @@ void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
       }
     }
     publish(std::move(snapshot), std::move(reader));
-    return;
+    return std::move(observed.markers);
   }
 }
 
-void CommitSnapshotRegistry::sweepOrphans(const Manifest& manifest, uint64_t writerEpoch) {
+void CommitSnapshotRegistry::sweepOrphans(Manifest& manifest, uint64_t writerEpoch) {
   if (!manifest.bytes) return;
   if (manifest.generation != manifest.highestGeneration) {
     LOG_ERROR("Recovered snapshot {} below newest generation {}; skipping orphan cleanup",
               manifest.generation, manifest.highestGeneration);
     return;
   }
-  auto listing = manifest.listing;
+  // The open's listing supplies best-effort cleanup candidates. Late files
+  // from older epochs stay for a later sweep.
+  auto listing = manifest.listingOf(dir);
   std::erase_if(listing, [&](const auto& file) {
     auto epoch = Manifest::fileEpoch(file.name);
     return !epoch || epoch >= writerEpoch;

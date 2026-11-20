@@ -1902,6 +1902,101 @@ TEST(FilterCacheTest, zeroHitEvictionBackoffBoundsOrderedReplay) {
   ASSERT_NO_THROW(cache.validateForTest());
 }
 
+TEST(FilterCacheTest, borrowingMissPreservesPopulationBackoff) {
+  size_t charge = bitDocs(4096, 1)->ramBytesUsed();
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 2 - 1;
+  config.lowWatermarkBytes = charge;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey victim("borrow-victim");
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, victim, 1, 1));
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, FilterKey("borrow-winner"), 2, 100'000));
+  ASSERT_EQ(1u, cache.counters().capacityDeadBuilds);
+
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(victim);
+  ASSERT_TRUE(use->wasAdmitted());
+  auto before = cache.counters();
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+            use->probe(0, FilterCache::Population::BORROW_ONLY).kind());
+  auto after = cache.counters();
+  EXPECT_EQ(before.misses + 1, after.misses);
+  EXPECT_EQ(before.buildAttempts, after.buildAttempts);
+  EXPECT_EQ(before.thrashBuildSkips, after.thrashBuildSkips);
+  // The first dead build still owes both ordinary population bypasses.
+  for (int i = 0; i < 2; i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0).kind());
+  }
+  EXPECT_EQ(before.thrashBuildSkips + 2, cache.counters().thrashBuildSkips);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD, use->probe(0).kind());
+  EXPECT_EQ(before.buildAttempts + 1, cache.counters().buildAttempts);
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, borrowingPinsAnotherConsumersValueAcrossEviction) {
+  size_t charge = bitDocs(4096, 1)->ramBytesUsed();
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxEntryBytes = charge + 1;
+  config.maxBytes = charge * 2 - 1;
+  config.lowWatermarkBytes = charge;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterKey key("borrowed-value");
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, key, 1, 1));
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(key);
+  DocSet* borrowed;
+  {
+    auto hit = use->probe(0, FilterCache::Population::BORROW_ONLY);
+    ASSERT_EQ(FilterCache::Probe::Kind::HIT, hit.kind());
+    borrowed = hit.docSet();
+  }
+  auto hits = cache.counters().hits;
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, FilterKey("replacement"), 2, 100'000));
+  ASSERT_EQ(1u, cache.counters().evictions);
+  auto hit = use->probe(0, FilterCache::Population::BORROW_ONLY);
+  ASSERT_EQ(FilterCache::Probe::Kind::HIT, hit.kind());
+  EXPECT_EQ(borrowed, hit.docSet());
+  EXPECT_TRUE(borrowed->get(1));
+  EXPECT_EQ(1, borrowed->card());
+  EXPECT_EQ(hits, cache.counters().hits); // request-local pin
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, borrowingAndPopulationShareOneRequestValue) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  FilterCache::UseRegistry request(cache, 1, segments);
+  FilterKey key("same-request");
+  auto* borrowing = request.get(key);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+            borrowing->probe(0, FilterCache::Population::BORROW_ONLY).kind());
+  auto* ordinary = request.get(key);
+  EXPECT_EQ(borrowing, ordinary);
+  auto build = ordinary->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
+  ordinary->publishRaw(0, build, docs(100, {7}), 1);
+  auto hit = borrowing->probe(0, FilterCache::Population::BORROW_ONLY);
+  ASSERT_EQ(FilterCache::Probe::Kind::HIT, hit.kind());
+  EXPECT_TRUE(hit.docSet()->get(7));
+  EXPECT_EQ(1u, cache.counters().buildAttempts);
+  EXPECT_EQ(1u, cache.counters().builds);
+  cache.validateForTest();
+}
+
 TEST(FilterCacheTest, evictionBackoffRecoversAndHitResetsDebt) {
   size_t charge = bitDocs(4096, 1)->ramBytesUsed();
   FilterCacheConfig config = testConfig();
@@ -2222,6 +2317,67 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
   EXPECT_EQ(0u, cache.metadataBytesUsed());
   EXPECT_EQ(0u, cache.bytesUsed());
   cache.validateForTest();
+
+  test::CollectionHelper helper("merged_nested_cache");
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  auto shared = std::make_shared<FilterCache>(FilterCacheConfig{
+      .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2});
+  writer->snapshots.readers.filterCache = shared;
+  for (int batch = 0; batch < 2; batch++) {
+    test::CollectionHelper::UpdateBuilder input;
+    for (int i = 0; i < 8; i++) {
+      auto json = "{\"id\":\"" + std::to_string(batch * 8 + i)
+          + "\",\"items_nested\":{\"color_s\":\"" + (i % 2 ? "red" : "blue") + "\"}}";
+      input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+    }
+    input.commit(); ASSERT_TRUE(helper.submit(input).success);
+  }
+  auto count = [&](bool child) {
+    auto req = test::localReq(helper.getSearchEngine());
+    auto& op = req->collection("merged_nested_cache").topDocs().countLimit().limit(0);
+    if (child) {
+      op.allQuery().matchFilter("color_s", "red").rawOp().domain.emplace().to = "items_nested";
+    } else {
+      op.rawQuery() = test::qb::toParent(req->mr, "items_nested",
+          test::qb::match(req->mr, "color_s", "red"), "none");
+    }
+    req->execute(1); EXPECT_OK(req); EXPECT_EQ(8, req->getMatchCount());
+  };
+  for (int i = 0; i < 3; i++) { count(false); count(true); }
+  // Only owner membership is resident: to_parent does not populate its raw
+  // child set, and the child-view term count resolves from metadata.
+  auto entries = shared->dump(10, nullptr);
+  ASSERT_EQ(1u, entries.size());
+  for (const auto& entry : entries) EXPECT_EQ(2u, entry.segmentsResident);
+  auto warm = shared->counters();
+  EXPECT_GT(warm.hits, 0u);
+  auto old = writer->snapshots.readers.getReader();
+  ASSERT_EQ(2u, old->segments().size());
+  test::CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1); ASSERT_TRUE(helper.submit(merge).success);
+  auto merged = writer->snapshots.readers.getReader();
+  ASSERT_EQ(1u, merged->segments().size());
+  for (const auto& segment : old->segments()) {
+    EXPECT_NE(segment.segInfo.seg_id, merged->segments()[0].segInfo.seg_id);
+  }
+  EXPECT_TRUE(shared->dump(10, nullptr).empty());
+  EXPECT_EQ(warm.purges + 2, shared->counters().purges);
+  EXPECT_EQ(0u, shared->bytesUsed());
+  // Admission history belongs to the key; the first new sighting builds a
+  // fresh slot under the merged segment identity, then both views hit it.
+  count(false); count(true);
+  auto rebuilt = shared->dump(10, nullptr);
+  ASSERT_EQ(entries.size(), rebuilt.size());
+  for (const auto& entry : rebuilt) {
+    EXPECT_EQ(1u, entry.segmentsResident);
+    EXPECT_TRUE(std::ranges::any_of(entries, [&](const auto& prior) { return prior.keyHash == entry.keyHash; }));
+  }
+  EXPECT_EQ(warm.builds + 1, shared->counters().builds);
+  auto hits = shared->counters().hits;
+  count(false); count(true);
+  EXPECT_GT(shared->counters().hits, hits);
+  shared->validateForTest();
 }
 
 // A metadata sweep started at the byte cap trims to the low watermark, so
@@ -2803,6 +2959,42 @@ TEST(FilterCacheTest, buildRaceLoserOwnsWithoutPublishingOrReprobing) {
   builderUse->publishRaw(0, builderProbe, docs(1024, {5, 9}), 1);
   EXPECT_EQ(1u, cache.counters().builds);
   EXPECT_GT(cache.bytesUsed(), 0u);
+}
+
+TEST(FilterCacheTest, exactDomainBorrowsWithoutStartingPopulation) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  RAMDir dir;
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir), config);
+  IndexWriter writer(writerSnapshots);
+  addTermDoc(writer, "selected");
+  addTermDoc(writer, "other");
+  writer.commit();
+  auto reader = writer.snapshots.readers.getReader();
+  auto& segment = reader->segments()[0];
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  TermQuery query("text_w", "selected");
+  auto* use = context.getFilterUse(query);
+  std::array sources{QueryPrep::ExactDomainSource{
+      .weight = query.createWeight(context, 0), .cacheUse = use}};
+  auto domain = docs(2, {0, 1});
+  auto before = reader->filterCache()->counters();
+  auto miss = QueryPrep::tryExactDomain(pool, sources, *reader, segment, domain.get());
+  EXPECT_FALSE(miss.available);
+  auto after = reader->filterCache()->counters();
+  EXPECT_EQ(before.misses + 1, after.misses);
+  EXPECT_EQ(before.buildAttempts, after.buildAttempts);
+  EXPECT_EQ(before.thrashBuildSkips, after.thrashBuildSkips);
+
+  auto build = use->probe(0);
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, build.kind());
+  use->publishRaw(0, build, docs(2, {0}), 1);
+  auto hit = QueryPrep::tryExactDomain(pool, sources, *reader, segment, domain.get());
+  ASSERT_TRUE(hit.available);
+  ASSERT_NE(nullptr, hit.docs.get());
+  EXPECT_EQ(1, hit.docs.get()->card());
+  EXPECT_TRUE(hit.docs.get()->get(0));
 }
 
 TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {
@@ -3946,7 +4138,7 @@ TEST(FilterCacheTest, preparedDomainProvenanceControlsQueryKeyPublication) {
   std::array<FilterCache::Use*, 1> canonicalUses{
       canonicalContext.getFilterUse(forcedTerm)};
   Query::Weight::PrepareContext canonicalPrepare{
-      *reader, std::span<DocSet* const>{}, false, nullptr};
+      *reader, std::span<DocSet* const>{}, nullptr, nullptr};
   auto canonical = QueryPrep::prepareFilterSources(
       canonicalWeights, canonicalUses, canonicalPrepare);
   ASSERT_EQ(1u, canonical.size());
@@ -3972,7 +4164,7 @@ TEST(FilterCacheTest, preparedDomainProvenanceControlsQueryKeyPublication) {
   std::array<FilterCache::Use*, 1> dependentUses{
       dependentContext.getFilterUse(domainDependent)};
   Query::Weight::PrepareContext dependentPrepare{
-      *reader, std::span<DocSet* const>{}, false, nullptr};
+      *reader, std::span<DocSet* const>{}, nullptr, nullptr};
   auto dependent = QueryPrep::prepareFilterSources(
       dependentWeights, dependentUses, dependentPrepare);
   ASSERT_EQ(1u, dependent.size());
@@ -4254,7 +4446,7 @@ TEST(FilterCacheTest, preparedProhibitedSourceBuildsThenHits) {
     EXPECT_TRUE(weight->needsPrepare());
     EXPECT_FALSE(weight->consumesDomain());
     Query::Weight::PrepareContext prepareContext{
-        *reader, std::span<DocSet* const>{}, false, nullptr};
+        *reader, std::span<DocSet* const>{}, nullptr, nullptr};
     auto prepared = weight->prepare(prepareContext);
     if (prepared == nullptr) {
       ADD_FAILURE() << "Boolean prohibited preparation returned null";
@@ -4649,7 +4841,7 @@ TEST(FilterCacheTest, wholeReaderPlanRejectsNestedDomainWithoutSighting) {
       nestedDomains.push_back(ownedDomains.back().get());
     }
     Query::Weight::PrepareContext prepareContext{
-        *reader, nestedDomains, /*parallel=*/false, nullptr};
+        *reader, nestedDomains, nullptr, nullptr};
     auto prepared = plan.prepareMainWeight(prepareContext);
     ASSERT_NE(nullptr, prepared);
     auto result = test::resolveWholeMembershipForTests(plan,
@@ -4670,7 +4862,7 @@ TEST(FilterCacheTest, wholeReaderPlanRejectsNestedDomainWithoutSighting) {
         QueryPrep::WholeMembershipConsumer::COUNT);
     auto rootDomains = canonicalDomains(*reader);
     Query::Weight::PrepareContext prepareContext{
-        *reader, rootDomains, /*parallel=*/false, nullptr};
+        *reader, rootDomains, nullptr, nullptr};
     EXPECT_THROW(plan.prepareMainWeight(prepareContext), std::logic_error);
   }
   EXPECT_EQ(prepares + 2,
@@ -5697,7 +5889,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
     QueryPrep::WholeMembershipPlan buildPlan(
         *buildWeight, buildUse, buildContext.filterUses);
     Query::Weight::PrepareContext buildPrepareContext{
-        *reader, domains, /*parallel=*/false, nullptr};
+        *reader, domains, nullptr, nullptr};
     auto buildPrepared = buildPlan.prepareMainWeight(buildPrepareContext);
     int64_t built = 0;
     for (auto& segment : reader->segments()) {
@@ -5723,7 +5915,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   QueryPrep::WholeMembershipPlan plan(
       *weight, use, context.filterUses);
   Query::Weight::PrepareContext prepareContext{
-      *reader, domains, /*parallel=*/false, nullptr};
+      *reader, domains, nullptr, nullptr};
   uint64_t hitsBefore = cache->counters().readerStableHits;
   auto prepared = plan.prepareMainWeight(prepareContext);
   ASSERT_NE(nullptr, prepared);
@@ -6185,6 +6377,12 @@ TEST(FilterCacheIntegrationTest, unroundedNowRangeSkipsAdmission) {
   luxir::test::CollectionHelper helper(node, collection);
   auto cache = std::make_shared<FilterCache>(testConfig());
   helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  // Column only: a points index would answer the count without a filter.
+  SchemaBuilder schema;
+  auto& when = schema.field("when_dt");
+  when.type = api::FieldDef_::FieldClass::DATE;
+  when.index = api::FieldDef_::IndexMode::NONE;
+  schema.set(helper.collection());
 
   constexpr int64_t minute = 60000;
   int64_t base = *parseDateToEpochMillis("2026-07-22T08:00:00Z");

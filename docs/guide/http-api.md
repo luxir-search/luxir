@@ -78,8 +78,8 @@ commit, and CPU target. The root endpoint defaults to pretty JSON; use
 
 `cpu_target` covers Luxir's own code. FAISS and OpenBLAS pick their kernels at
 runtime: `faiss_simd` is the FAISS SIMD level (`NONE`, `AVX2`, `AVX512`,
-`AVX512_SPR`, `ARM_NEON` or `ARM_SVE`; the `FAISS_SIMD_LEVEL` environment
-variable overrides it), and `blas_core` is the OpenBLAS core, or `Accelerate` on
+`AVX512_VPOPCNT`, `AVX512_SPR`, `ARM_NEON` or `ARM_SVE`; the `FAISS_SIMD_LEVEL`
+environment variable overrides it), and `blas_core` is the OpenBLAS core, or `Accelerate` on
 macOS. The startup banner, `_stats`, and the `luxir_build_info` metric report the
 same values.
 

@@ -238,6 +238,9 @@ public:
   ~MetricScope() { finish(MetricOutcome::CANCELLED); }
 
   bool active() const { return metrics != nullptr; }
+  uint64_t startNs() const {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count();
+  }
   void begin(Metrics& next, size_t nextActivity) noexcept {
     finish(MetricOutcome::CANCELLED);
     metrics = &next;

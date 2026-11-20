@@ -22,6 +22,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/Cursor.h"
 #include "luxir/query/ExprFunctions.h"
+#include "luxir/query/ParseView.h"
 #include "luxir/query/QueryRegistry.h"
 #include "luxir/query/QueryBuilder.h"
 #include "luxir/query/SimpleQueryParser.h"
@@ -93,7 +94,7 @@ struct ExprOptions {
   // debits, so stacking parsers cannot reset the available depth.  nullptr =
   // parser-local default (tests).
   int* nestingBudget = nullptr;
-  FieldResolver* fieldResolver = nullptr;
+  ParseView* view = nullptr;
   // Source offsets survive structural expansion until exact literals are lowered.
   std::map<const api::Val*, std::pair<std::string_view, size_t>>* exactSources = nullptr;
 };
@@ -108,7 +109,7 @@ class ExprParser {
   static constexpr std::string_view OBJECT_ARG_STOPS = ",)]=[}";
 
   const ExprOptions& opts;
-  std::optional<FieldResolver> localFields;
+  std::optional<ParseView> localView;
   std::pmr::memory_resource& mr;
   Cursor cur{std::string_view{}};
   int localBudget = DEFAULT_NESTING_BUDGET;
@@ -120,6 +121,7 @@ class ExprParser {
   struct FieldScope {
     std::string_view field;
     size_t pos;
+    FieldType* searchType = nullptr;
   };
 
   enum class Conj : uint8_t { NONE, AND, OR };
@@ -148,7 +150,7 @@ class ExprParser {
 public:
   ExprParser(const ExprOptions& opts, std::pmr::memory_resource& arena)
       : opts(opts), mr(arena), budget(opts.nestingBudget ? opts.nestingBudget : &localBudget) {
-    if (!opts.fieldResolver && opts.schema) localFields.emplace(*opts.schema);
+    if (!opts.view && opts.schema) localView.emplace(*opts.schema);
   }
 
   const api::Query* parse(std::string_view q) {
@@ -240,16 +242,17 @@ private:
 
   static bool termQueryable(FieldType& ft) { return SimpleQueryParser::termQueryable(ft); }
 
-  static bool numericQueryable(FieldType& ft) {
-    return ft.supports(FieldType::MATCH) && FieldType::isNumericColumn(ft.type()) && ft.hasColumn();
+  static bool columnMatchQueryable(FieldType& ft) {
+    return SimpleQueryParser::columnMatchQueryable(ft);
   }
 
   FieldType& resolveField(std::string_view name, size_t pos, OpClass op) {
     try {
-      auto& fields = opts.fieldResolver ? *opts.fieldResolver : *localFields;
+      auto& fields = (opts.view ? *opts.view : *localView).fields;
       return *fields.resolve(name, op).fieldType;
     } catch (const RequestError& e) {
-      if (e.code == "unknown_field") fail(pos, fmt::format("unknown field '{}'", name));
+      if (e.code == "unknown_field" && (opts.view ? opts.view->fields.path().empty() : true))
+        fail(pos, fmt::format("unknown field '{}'", name));
       fail(pos, e.what());
     }
   }
@@ -265,7 +268,7 @@ private:
 
   void requireValueQueryable(std::string_view field, FieldType& ft, size_t pos) {
     requireCapability(ft, FieldType::MATCH, "query", field, pos);
-    if (!termQueryable(ft) && !numericQueryable(ft)) {
+    if (!termQueryable(ft) && !columnMatchQueryable(ft)) {
       fail(pos, fmt::format(
           "field '{}' does not support term, phrase, or range syntax", field));
     }
@@ -544,7 +547,7 @@ private:
   // leading plus is not part of any numeric literal the coercion accepts,
   // and "+5 required" happens to mean what the writer meant anyway.
   bool minusSignOfNumber(const FieldScope* scope) {
-    if (cur.peek() != '-' || scope == nullptr || !numericQueryable(resolveField(scope->field, scope->pos, OpClass::SEARCH))) return false;
+    if (cur.peek() != '-' || scope == nullptr || !columnMatchQueryable(resolveField(scope->field, scope->pos, OpClass::SEARCH))) return false;
     char next = cur.peekAt(1);
     return digit(next) || next == '.';
   }
@@ -744,7 +747,27 @@ private:
     size_t pos = cur.position();
     if (c == '(') {
       cur.advance();
-      const api::Query* node = parseLevel(&scope, ")");
+      const api::Query* node;
+      auto& type = resolveField(field, scope.pos, OpClass::SEARCH);
+      if (type.type() == FieldType::NESTED) {
+        auto& view = opts.view ? *opts.view : *localView;
+        const auto& path = view.fields.resolvePath(field);
+        {
+          auto nested = view.scoped(path.physicalName);
+          node = parseLevel(nullptr, ")");
+        }
+        if (node == nullptr) fail(pos, "empty field group");
+        auto* joined = allocQuery();
+        auto& join = joined->kind.emplace<api::ToParentQuery>();
+        join.path = field;
+        join.query = node;
+        join.score = "max";
+        node = joined;
+      } else {
+        auto scalar = scope;
+        scalar.searchType = &type;
+        node = parseLevel(&scalar, ")");
+      }
       if (!cur.consume(')')) fail(pos, "unmatched '(' in field group");
       if (node == nullptr) fail(pos, "empty field group");
       return finishDecorations(node, "a group");
@@ -832,7 +855,7 @@ private:
   // numeric columns match the exact value (the quotes only delimit).
   const api::Query* parsePhraseForm(const FieldScope& scope) {
     auto field = scope.field;
-    auto& ft = resolveField(field, scope.pos, OpClass::SEARCH);
+    auto& ft = scope.searchType ? *scope.searchType : resolveField(field, scope.pos, OpClass::SEARCH);
     requireValueQueryable(field, ft, cur.position());
     std::string_view body = scanQuoted();
     int32_t slop = 0;
@@ -958,8 +981,9 @@ private:
   const api::Query* emitTerm(const FieldScope& scope, const Token& t) {
     auto field = scope.field;
     std::string_view text = t.caretAt == NPOS ? t.text : t.text.substr(0, t.caretAt);
-    auto& ft = resolveField(field, scope.pos,
-        text == "*" && t.trailingStar ? OpClass::EXISTS : OpClass::SEARCH);
+    bool exists = text == "*" && t.trailingStar;
+    auto& ft = scope.searchType && !exists ? *scope.searchType
+        : resolveField(field, scope.pos, exists ? OpClass::EXISTS : OpClass::SEARCH);
 
     // fuzzy: a clean trailing ~N / ~ suffix (mid-token '~' is a literal byte)
     if (t.tildeAt != NPOS) {

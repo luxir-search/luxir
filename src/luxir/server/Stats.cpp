@@ -55,7 +55,9 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   fields.entry_bytes = fieldMetadataMemory.entryBytes.load(std::memory_order_relaxed);
   fields.names = fieldMetadataMemory.names.load(std::memory_order_relaxed);
   fields.name_bytes = fieldMetadataMemory.nameBytes.load(std::memory_order_relaxed);
-  fields.bytes = fields.directory_bytes + fields.page_bytes + fields.entry_bytes + fields.name_bytes;
+  fields.live_views = fieldMetadataMemory.liveViews.load(std::memory_order_relaxed);
+  fields.live_view_bytes = fieldMetadataMemory.liveViewBytes.load(std::memory_order_relaxed);
+  fields.bytes = fields.directory_bytes + fields.page_bytes + fields.entry_bytes + fields.name_bytes + fields.live_view_bytes;
   auto process = processAllocatorStats();
   if (!process) return;
   auto& jemalloc = memory.jemalloc.emplace();
@@ -168,6 +170,11 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   fillActivity(dst.merge, counts, metricActivity(MetricStage::MERGE), resource);
   fillActivity(dst.vector_build, counts, metricActivity(MetricStage::VECTOR_BUILD), resource);
   fillActivity(dst.reader_refresh, counts, metricActivity(MetricStage::READER_REFRESH), resource);
+  auto control = node.getControlExecutor().stats();
+  dst.control_threads = control.threads;
+  dst.control_busy = control.busy;
+  dst.control_queued = control.queued;
+  dst.control_completed = control.completed;
 }
 
 void fillOutcomes(api::OutcomeStats& dst, const std::array<uint64_t, (size_t)MetricOutcome::COUNT>& outcomes,
@@ -270,6 +277,13 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
       out.merge_level = (uint32_t)in.mergeLevel;
     }
     out.bytes = in.bytes;
+    auto* spaces = api::build::allocArray(out.spaces, in.spaces.size(), resource);
+    for (size_t si = 0; si < in.spaces.size(); si++) {
+      spaces[si].path = api::build::arenaStr(resource, in.spaces[si].path);
+      spaces[si].max_doc = in.spaces[si].maxDoc;
+      spaces[si].ends_bytes = in.spaces[si].endsBytes;
+      spaces[si].owners_bytes = in.spaces[si].ownersBytes;
+    }
 
     auto* overlays = api::build::allocArray(out.overlays, in.overlays.size(), resource);
     for (std::size_t oi = 0; oi < in.overlays.size(); oi++) {

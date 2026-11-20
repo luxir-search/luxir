@@ -119,8 +119,9 @@ public:
   // Verifies held files before mapping them into a reader, then publishes.
   // With verify, checks all files; otherwise only marker-named files.
   // Only opening failures retry against a newer root, never hash failures.
-  void openLocalSnapshot(bool verify = false);
-  void sweepOrphans(const Manifest& manifest, uint64_t writerEpoch);
+  // Returns the marker names read by the attempt that published the reader.
+  std::vector<std::string> openLocalSnapshot(bool verify = false);
+  void sweepOrphans(Manifest& manifest, uint64_t writerEpoch);
   void sweepOrphans();
   static std::vector<std::string> obsoleteFiles(const CommitSnapshot& previous,
       const CommitSnapshot& next, boost::unordered_flat_set<std::string> retained = {});

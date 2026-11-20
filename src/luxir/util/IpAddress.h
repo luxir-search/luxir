@@ -32,7 +32,8 @@ inline bool isV4Mapped(const uint8_t* a) {
 // suffixes are not addresses and return nullopt.
 inline std::optional<Address> parse(std::string_view text) {
   char buf[TEXT_BUF_SIZE];
-  if (text.empty() || text.size() >= sizeof(buf) || text.find('\0') != std::string_view::npos) return std::nullopt;
+  // Some inet_pton implementations accept a zone id and fold its interface index into the address.
+  if (text.empty() || text.size() >= sizeof(buf) || text.find_first_of(std::string_view("\0%", 2)) != std::string_view::npos) return std::nullopt;
   std::memcpy(buf, text.data(), text.size());
   buf[text.size()] = '\0';
   Address a{};
