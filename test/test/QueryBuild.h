@@ -274,6 +274,18 @@ inline api::Query constantScore(std::pmr::memory_resource& mr, const api::Query&
   return q;
 }
 
+inline api::Query toParent(std::pmr::memory_resource& mr, std::string_view path,
+                           const api::Query& inner, std::string_view score = "max") {
+  api::Query query;
+  auto& join = query.kind.emplace<api::ToParentQuery>();
+  join.path = build::arenaStr(mr, path);
+  join.score = build::arenaStr(mr, score);
+  auto* child = (api::Query*)mr.allocate(sizeof(api::Query), alignof(api::Query));
+  new (child) api::Query(inner);
+  join.query = child;
+  return query;
+}
+
 inline api::Query boost(std::pmr::memory_resource& mr, const api::Query& inner,
                         std::optional<float> factor = std::nullopt) {
   api::Query q;

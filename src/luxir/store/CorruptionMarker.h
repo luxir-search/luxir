@@ -18,16 +18,18 @@ namespace luxir {
 // the markers once they pass or an install replaced them.
 struct CorruptionMarker {
   static constexpr std::string_view kPrefix = "corrupted_";
+  struct Observation {
+    std::vector<std::string> markers; // Only markers successfully read.
+    std::vector<std::string> suspects; // Their file names, sorted and unique.
+  };
 
   static bool isMarker(std::string_view name) { return name.starts_with(kPrefix) && !name.ends_with(".tmp"); }
 
   // Writes a durable marker naming `files`.
   static void write(Directory& dir, std::span<const std::string> files, std::string_view reason);
-  // The union of every marker's file names, in name order without duplicates.
-  static std::vector<std::string> read(Directory& dir);
+  static Observation read(Directory& dir);
+  static Observation read(Directory& dir, std::span<const Directory::FileInfo> listing);
   static bool present(Directory& dir);
-  // Removes every marker; the removal is synced.
-  static void clear(Directory& dir);
 };
 
 }

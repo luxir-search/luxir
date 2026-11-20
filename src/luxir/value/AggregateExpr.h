@@ -87,6 +87,14 @@ struct AggregateConstant {
   double doubleValue = 0.0;
 };
 
+inline BucketScalar integerAggregateOutput(BucketScalar value) {
+  if (value.valid && value.type == BucketValueType::INT128
+      && (value.intValue < INT64_MIN || value.intValue > INT64_MAX)) {
+    return BucketScalar::failed(value.type, value.nature, AggregateFailure::INT64_OUTPUT_OVERFLOW);
+  }
+  return value;
+}
+
 struct AggregateStateOps {
   using Init = void (*)(void* state,
                         std::span<const AggregateConstant> arguments,
@@ -333,12 +341,20 @@ struct BoundAggregateInput {
   void forEachValue(int32_t docid, Consume&& consume) {
     if (producer->input->root().type == ValueType::COLUMN_ONLY) {
       BoundStringColumn* column = values->nodes[producer->input->rootNode].stringColumn;
-      if (column == nullptr || column->ords == nullptr || !column->cursor.seek(docid)) return;
-      for (int64_t rank = column->cursor.begin(); rank < column->cursor.end(); rank++) {
-        int32_t stored = column->storedOrd(docid, rank);
-        assert(stored != 0);
-        consume(ValueResult::integer(ordMapping.globalOrd(stored - 1)));
-      }
+      if (column == nullptr || column->ords == nullptr) return;
+      auto consumeRow = [&](int32_t row) {
+        if (!column->cursor.seek(row)) return;
+        for (int64_t rank = column->cursor.begin(); rank < column->cursor.end(); rank++) {
+          int32_t stored = column->storedOrd(row, rank);
+          assert(stored != 0);
+          consume(ValueResult::integer(ordMapping.globalOrd(stored - 1)));
+        }
+      };
+      auto* mapping = values->nodes[producer->input->rootNode].mapping;
+      if (mapping) {
+        auto family = mapping->owners.seek(docid);
+        for (int32_t row = family.first; row < family.end; row++) consumeRow(row);
+      } else consumeRow(docid);
       return;
     }
     ValueResult value = evalPoint(docid);

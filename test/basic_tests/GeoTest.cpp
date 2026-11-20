@@ -593,6 +593,10 @@ TEST_F(GeoBoxQueryTest, rejectsInvalidBoxesAndTreatsUnrepresentableEdgesAsEmpty)
                std::invalid_argument);
   EXPECT_TRUE(GeoBoxQuery("geo", 90.0, 90.0, -180.0, 180.0).isEmpty());
   EXPECT_TRUE(GeoBoxQuery("geo", -90.0, 90.0, 180.0, 180.0).isEmpty());
+  GeoBoxQuery pole("geo", 90.0, 90.0, -180.0, 180.0);
+  GeoBoxQuery dateline("geo", -90.0, 90.0, 180.0, 180.0);
+  EXPECT_TRUE(pole.equals(dateline));
+  EXPECT_EQ(pole.hash(), dateline.hash());
 }
 
 TEST_F(GeoBoxQueryTest, scanFallbackWithoutPointsUsesDenseColumnPath) {
@@ -843,7 +847,7 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
         (size_t)merged.maxDoc());
     for (const auto& point : expected) {
       surviving[(size_t)point.docid].push_back(
-          {geo::decodeLatitude(point.lat), geo::decodeLongitude(point.lon)});
+          {geo::decodeLatitude(point.dim0), geo::decodeLongitude(point.dim1)});
     }
     const std::array<Box, 4> boxes = {{{-90.0, 90.0, -180.0, 180.0},
                                        {-30.0, 5.0, 160.0, -160.0},
@@ -853,8 +857,8 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
       EXPECT_EQ(oracle(surviving, box), run(*afterMerge, field, box, false));
     }
     auto byPoint = [](const auto& left, const auto& right) {
-      return std::tie(left.lat, left.lon, left.docid)
-           < std::tie(right.lat, right.lon, right.docid);
+      return std::tie(left.dim0, left.dim1, left.docid)
+           < std::tie(right.dim0, right.dim1, right.docid);
     };
     std::sort(expected.begin(), expected.end(), byPoint);
     std::sort(actual.begin(), actual.end(), byPoint);
