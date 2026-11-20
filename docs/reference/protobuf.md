@@ -210,6 +210,7 @@ defaults and constraints are described in the comments and guides.
 - [`ToParentQuery`](#message-luxir.toparentquery)
 - [`TopDocs`](#message-luxir.topdocs)
 - [`TransportStats`](#message-luxir.transportstats)
+- [`UpdateAdmissionStats`](#message-luxir.updateadmissionstats)
 - [`UpdateRequest`](#message-luxir.updaterequest)
 - [`UpdateResponse`](#message-luxir.updateresponse)
 - [`UpdateResponse.DocError`](#message-luxir.updateresponse.docerror)
@@ -2334,6 +2335,7 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.source_commit"></a>[`source_commit`](#field-luxir.servicestats.source_commit) | 23 | `string` | singular | The full Git commit the binary was built from, or "unknown". |
 | <a id="field-luxir.servicestats.faiss_simd"></a>[`faiss_simd`](#field-luxir.servicestats.faiss_simd) | 24 | `string` | singular | The SIMD level FAISS selected for this CPU at startup: NONE, AVX2, AVX512, AVX512\_VPOPCNT, AVX512\_SPR, ARM\_NEON or ARM\_SVE. FAISS\_SIMD\_LEVEL overrides it. |
 | <a id="field-luxir.servicestats.blas_core"></a>[`blas_core`](#field-luxir.servicestats.blas_core) | 25 | `string` | singular | The BLAS kernels selected for this CPU at startup: the OpenBLAS core name, or "Accelerate" on macOS. |
+| <a id="field-luxir.servicestats.update_admission"></a>[`update_admission`](#field-luxir.servicestats.update_admission) | 64 | [`UpdateAdmissionStats`](#message-luxir.updateadmissionstats) | singular | Node-wide update admission across both transports. |
 | <a id="field-luxir.servicestats.read_only"></a>[`read_only`](#field-luxir.servicestats.read_only) | 2 | `bool` | singular |  |
 | <a id="field-luxir.servicestats.request_duration_bounds"></a>[`request_duration_bounds`](#field-luxir.servicestats.request_duration_bounds) | 3 | `double` | repeated | Upper bounds, in seconds, of the request, search execution and index batch histograms. |
 | <a id="field-luxir.servicestats.background_duration_bounds"></a>[`background_duration_bounds`](#field-luxir.servicestats.background_duration_bounds) | 4 | `double` | repeated | Upper bounds, in seconds, of the flush, commit, delete pass, merge, vector build and reader refresh histograms. |
@@ -2625,6 +2627,23 @@ Request traffic on one transport. Replication routes are not counted.
 | <a id="field-luxir.transportstats.stream_pauses"></a>[`stream_pauses`](#field-luxir.transportstats.stream_pauses) | 5 | `uint64` | singular | response producers paused by flow control |
 | <a id="field-luxir.transportstats.connections"></a>[`connections`](#field-luxir.transportstats.connections) | 6 | `uint64` | singular | HTTP only: live sessions, including idle keep-alive |
 | <a id="field-luxir.transportstats.io_threads"></a>[`io_threads`](#field-luxir.transportstats.io_threads) | 7 | `int64` | singular | HTTP only: running connection shard threads |
+
+<a id="message-luxir.updateadmissionstats"></a>
+
+### luxir.UpdateAdmissionStats
+
+Updates admitted and not yet complete, against indexing.max-inflight-updates and indexing.max-inflight-update-bytes. Past either limit a unary gRPC Update fails with RESOURCE\_EXHAUSTED, a buffered HTTP update gets 429, and streams (gRPC UpdateStream, NDJSON) stop reading until there is room.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.updateadmissionstats.in_flight"></a>[`in_flight`](#field-luxir.updateadmissionstats.in_flight) | 1 | `int64` | singular | updates admitted and not yet complete |
+| <a id="field-luxir.updateadmissionstats.in_flight_bytes"></a>[`in_flight_bytes`](#field-luxir.updateadmissionstats.in_flight_bytes) | 2 | `int64` | singular | their raw request bytes |
+| <a id="field-luxir.updateadmissionstats.max_in_flight"></a>[`max_in_flight`](#field-luxir.updateadmissionstats.max_in_flight) | 3 | `int64` | singular | zero is unlimited |
+| <a id="field-luxir.updateadmissionstats.max_bytes"></a>[`max_bytes`](#field-luxir.updateadmissionstats.max_bytes) | 4 | `int64` | singular | zero is unlimited |
+| <a id="field-luxir.updateadmissionstats.rejected"></a>[`rejected`](#field-luxir.updateadmissionstats.rejected) | 5 | `uint64` | singular | unary gRPC and buffered HTTP updates refused |
+| <a id="field-luxir.updateadmissionstats.paused"></a>[`paused`](#field-luxir.updateadmissionstats.paused) | 6 | `uint64` | singular | times a stream stopped reading for want of room |
 
 <a id="message-luxir.updaterequest"></a>
 

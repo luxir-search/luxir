@@ -216,6 +216,8 @@ public:
     int64_t deleteBytes = 0;
     Kind kind = Kind::Work;
 
+    friend class IndexRamBudget;
+
   public:
     Guard() = default;
     Guard(IndexRamBudget& budget, int64_t bytes) : budget(&budget), bytes(bytes) {}
@@ -628,6 +630,25 @@ public:
   void release(int64_t bytes) noexcept {
     assert(bytes >= 0);
     releaseReservation(bytes, 0);
+  }
+
+  // Charges bytes that leave on their own, such as admitted update requests
+  // waiting for or in the update graph (UpdateAdmission).  Like a draining
+  // inverter they count for admission, so merges wait while ingest has RAM
+  // queued, but not for pressure: flushing inverters would not free them,
+  // only cut small segments.  Never refuses and never blocks; the caller
+  // bounds what it charges.
+  Guard forceAcquireTransient(int64_t bytes) {
+    assert(bytes >= 0);
+    {
+      const std::lock_guard<std::mutex> lock(registryMutex);
+      reserved.fetch_add(bytes, std::memory_order_relaxed);
+      drainingBytes += bytes;
+    }
+    Guard guard(*this, bytes);
+    guard.drainingBytes = bytes;
+    guard.kind = Guard::Kind::Draining;
+    return guard;
   }
 
   MergeDemandRegistration registerMergeDemand(std::function<void()>&& callback) {

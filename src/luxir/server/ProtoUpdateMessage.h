@@ -12,6 +12,7 @@
 
 #include "luxir/index/UpdateMessage.h"
 #include "CommitWaits.h"
+#include "UpdateAdmission.h"
 #include "luxir/api/build.h"
 #include "luxir/util/Clock.h"
 
@@ -55,6 +56,10 @@ public:
   // target it rather than re-resolving req->collection.
   CollectionId target;
   const int64_t dateMathNowEpochMillis;
+  // The transport's node-wide admission slot (UpdateAdmission).  It goes
+  // with the message, so whichever path ends it - done(), or deleting it
+  // after a failed submission - releases the slot exactly once.
+  UpdateAdmission::Ticket admission;
   explicit ProtoUpdateMessage(const RequestProto* req)
     : req(req), dateMathNowEpochMillis(currentEpochMillis()) {
     if (req->commit.has_value()) {

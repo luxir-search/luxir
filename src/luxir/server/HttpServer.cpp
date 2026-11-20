@@ -105,6 +105,9 @@ struct ShardPin {
     : shard(std::move(shard)), guard(this->shard->ioc.get_executor()) {}
 };
 
+// The error code of an update refused by the node's UpdateAdmission.
+static constexpr const char* kTooManyUpdates = "too_many_updates";
+
 // The HTTP status for a classified failure: the error's kind decides, except
 // for conditions with an HTTP idiom of their own.
 static http::status httpStatusFor(const ErrorInfo& info) {
@@ -146,6 +149,8 @@ struct HttpUpdateState {
   std::pmr::monotonic_buffer_resource resource;
   std::string body;  // raw JSON until it is decoded on the index arena
   HttpUpdateReqProto proto;  // JSON readers copy update strings into resource
+  // Taken on the shard before decoding; handed to the update message.
+  UpdateAdmission::Ticket admission;
 };
 
 struct HttpStreamWriterTarget {
@@ -368,6 +373,9 @@ struct HttpStreamUpdateState {
   std::size_t maxInFlight;
   // A batch failed while indexing; its completion ends the stream.
   bool admissionHalted = false;
+  // A ready batch waits for room in the node's UpdateAdmission; a resume
+  // parked there drains the stream again.  Reading stops meanwhile.
+  bool nodeAdmissionWaiting = false;
   std::uint64_t nextSubmitOrdinal = 0;
   std::uint64_t nextFoldOrdinal = 0;
   // url.commit is cleared once the EOF commit is submitted.
@@ -861,6 +869,9 @@ private:
     // Hands the batch's admission slot back as soon as it is indexed; done()
     // follows in stream order.  If the handoff fails, completion frees the slot.
     void indexed(bool ok) noexcept {
+      // The batch's raw records are gone (or never will be read): its node
+      // admission goes with its slot.
+      admission.release();
       try {
         net::post(session_->stream_.get_executor(),
             [session = session_, state = state_, ordinal = ordinal_, ok] {
@@ -871,6 +882,7 @@ private:
 
     void done(IndexWriter& iw) noexcept override {
       unused(iw);
+      admission.release();  // a message rejected in the graph never indexed
       try {
         auto completed = takeCompletion(session_->node_);
         net::post(session_->stream_.get_executor(),
@@ -2026,7 +2038,9 @@ private:
     BufferedUpdate* msg = nullptr;
     ErrorKind fallback = ErrorKind::INVALID_REQUEST;  // the message validates its commit params
     try {
+      auto ticket = std::move(state->admission);
       auto admission = std::make_unique<BufferedUpdate>(self, std::move(state), shardPin, startTime);
+      admission->admission = std::move(ticket);
       fallback = ErrorKind::INTERNAL;
       auto collection = self->node_.getOrCreateCollection(LuxirNode::target(tenant, admission->req->collection));
       admission->target = collection->getId();
@@ -2048,7 +2062,16 @@ private:
 
   void handleUpdate(std::string body, const std::string& coll,
                     const UpdateUrlParams& url) {
+    // Node-wide admission before anything is decoded: past it the client
+    // gets 429 with Retry-After, and the body is dropped here.
+    auto ticket = node_.getUpdateAdmission().tryAdmit((int64_t)body.size());
+    if (!ticket) {
+      respondError({ErrorKind::RESOURCE_EXHAUSTED, kTooManyUpdates,
+                    "the node has too many updates in flight; retry later"});
+      return;
+    }
     auto state = std::make_shared<HttpUpdateState>();
+    state->admission = std::move(*ticket);
     state->body = std::move(body);
     auto shardPin = makeShardPin();
     try {
@@ -2977,9 +3000,7 @@ private:
 
   void startStreamingUpdate(std::string coll, UpdateUrlParams url) {
     const auto& ingest = node_.getConfig().ingest;
-    std::size_t maxInFlight = ingest.max_inflight_batches == 0
-        ? (std::size_t)node_.getWorkers() + 2
-        : (std::size_t)ingest.max_inflight_batches;
+    std::size_t maxInFlight = (std::size_t)ingest.inflightBatches(node_.getWorkers());
     auto state = std::make_shared<HttpStreamUpdateState>(
         (std::size_t)ingest.stream_batch_size,
         (std::size_t)ingest.stream_batch_docs,
@@ -3268,6 +3289,12 @@ private:
     assert(state->batchReady);
     if (!barrierSubmission && !state->canAdmit()) return false;
     assert(state->indexing < state->maxIndexing);
+    // Node-wide admission: an ordinary batch waits for room, pausing the
+    // stream's reads; a barrier batch (group close, inline _update_,
+    // commit) goes ahead, so a stream overshoots by at most one batch.
+    auto& nodeAdmission = node_.getUpdateAdmission();
+    if (!barrierSubmission && !nodeAdmissionAvailable(state)) return false;
+    UpdateAdmission::Ticket ticket = nodeAdmission.admit((int64_t)state->batch->sourceBytes);
 
     ErrorInfo err;
     HttpStreamWriterTarget* target = streamWriterTarget(state->batch->collectionName, err);
@@ -3293,6 +3320,7 @@ private:
     auto message = std::make_shared<StreamingUpdateMessage>(
         &batch->proto, shared_from_this(), state, ordinal, batch);
     message->target = target->collection->getId();
+    message->admission = std::move(ticket);
     batch->message = message;
     auto [entry, inserted] =
         state->inFlightBatches.emplace(ordinal, HttpStreamUpdateState::InFlightBatch{batch});
@@ -3331,6 +3359,21 @@ private:
       return false;
     }
     return true;
+  }
+
+  // Whether the node's UpdateAdmission has room for the stream's next batch;
+  // otherwise parks a resume that drains the stream once it does.
+  bool nodeAdmissionAvailable(const std::shared_ptr<HttpStreamUpdateState>& state) {
+    if (state->nodeAdmissionWaiting) return false;
+    auto resume = [self = shared_from_this(), state] {
+      net::post(self->stream_.get_executor(), [self, state] {
+        state->nodeAdmissionWaiting = false;
+        if (self->streamUpdate_ == state && !state->failed) self->drainStreamRecords();
+      });
+    };
+    if (node_.getUpdateAdmission().whenAvailable(std::move(resume))) return true;
+    state->nodeAdmissionWaiting = true;
+    return false;
   }
 
   void accountStreamSubmission(HttpStreamBatchState& batch, std::size_t docCount,
@@ -4085,7 +4128,8 @@ private:
     respondSimple(status, "application/json", finishJson(std::move(compact)));
   }
 
-  void respondSimple(http::status status, std::string_view contentType, std::string body, bool head = false) {
+  void respondSimple(http::status status, std::string_view contentType, std::string body, bool head = false,
+                     std::string_view retryAfter = {}) {
     stopWaitDisconnect();
     if ((unsigned)status >= 400) metricError();
     metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::HTTP, body.size());
@@ -4093,6 +4137,7 @@ private:
     resp->set(http::field::server, "luxir");
     resp->set(http::field::content_type, contentType);
     resp->keep_alive(keepAlive_);
+    if (!retryAfter.empty()) resp->set(http::field::retry_after, retryAfter);
     resp->body() = std::move(body);
     resp->prepare_payload();
     auto done = [self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
@@ -4118,7 +4163,9 @@ private:
   void respondError(const ErrorInfo& info) { respondError(info, requestId_); }
   void respondError(const ErrorInfo& info, std::string_view requestId, bool head = false) {
     metricError(info.kind);
-    respondSimple(httpStatusFor(info), "application/json", finishJson(renderErrorBody(info, requestId)), head);
+    // Update admission is transient load: say when to come back.
+    respondSimple(httpStatusFor(info), "application/json", finishJson(renderErrorBody(info, requestId)), head,
+                  info.code == kTooManyUpdates ? "1" : "");
   }
   // An unread body cannot be reused as the next request. Answer, then close.
   void respondBeforeBodyError(const ErrorInfo& info) {

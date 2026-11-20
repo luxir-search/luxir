@@ -154,6 +154,9 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   dst.http.connections = (uint64_t)metrics.httpConnections.load(std::memory_order_relaxed);
   dst.http.io_threads = metrics.httpThreads.load(std::memory_order_relaxed);
   fillTransport(dst.grpc, counts, MetricTransport::GRPC, resource);
+  auto admission = node.getUpdateAdmission().snapshot();
+  dst.update_admission = {admission.updates, admission.bytes, admission.maxUpdates, admission.maxBytes,
+                          admission.rejected, admission.paused};
   fillActivity(dst.search, counts, metricActivity(MetricStage::SEARCH), resource);
   fillHistogram(dst.search_execution, counts.activities[metricActivity(MetricStage::SEARCH_EXECUTION)],
                 requestBounds, resource);
