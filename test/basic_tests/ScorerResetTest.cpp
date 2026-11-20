@@ -1,6 +1,8 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/NumericVerification.h"
+
 #include <gtest/gtest.h>
 
 #include <array>
@@ -79,23 +81,15 @@ std::vector<int32_t> pullDocs(Query::Scorer& scorer, int32_t min,
 // The same observer covers nested verifiers, including prohibited children
 // and probes. Fresh-product parity alone would miss identical overproduction.
 struct VerificationBounds {
-#ifndef NDEBUG
-  static inline thread_local int32_t min = 0, max = 0;
   static inline thread_local int64_t observations = 0;
-  static void observe(int32_t doc) {
-    observations++;
-    EXPECT_GE(doc, min);
-    EXPECT_LT(doc, max);
-  }
-  VerificationBounds(int32_t begin, int32_t end) {
-    min = begin;
-    max = end;
-    NumericPredicateQuery::verificationObserver = observe;
-  }
-  ~VerificationBounds() { NumericPredicateQuery::verificationObserver = nullptr; }
-#else
-  VerificationBounds(int32_t, int32_t) {}
-#endif
+  NumericVerificationObserver observer;
+
+  VerificationBounds(int32_t begin, int32_t end)
+      : observer([=](int32_t doc) {
+          observations++;
+          EXPECT_GE(doc, begin);
+          EXPECT_LT(doc, end);
+        }) {}
 };
 
 std::vector<int32_t> bulkDocs(BulkScorer& bulk, DocSet* domain,
@@ -377,12 +371,12 @@ TEST_F(ScorerResetTest, freshProductsAcrossProtocolsAndEncodings) {
     field.type = api::FieldDef::FieldClass::INT;
     field.index = name == "point" ? api::FieldDef::IndexMode::RANGE : api::FieldDef::IndexMode::NONE;
     field.column = true;
-    field.multi = name == "multi";
+    field.multi = (name == "multi") ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
   }
   auto& tags = schema.field("tags");
   tags.type = api::FieldDef::FieldClass::STRING;
   tags.index = api::FieldDef::IndexMode::MATCH;
-  tags.multi = true;
+  tags.multi = api::FieldDef::MultiMode::DEFAULT;
   schema.set(helper.collection());
   auto writer = helper.getIndexWriter();
   auto& inverter = writer->obtainInverter();
@@ -519,7 +513,9 @@ TEST_F(ScorerResetTest, freshProductsAcrossProtocolsAndEncodings) {
   }
   Query* numericExcluded = boolean(clauses({word}), {}, clauses({pointArray}), clauses({zone}));
   checkBulk(*reader, *numericExcluded, true);
-  checkBulk(*reader, *sparse, false);
+  // One block of a sorted ramp: its linear fit leaves only the range edges
+  // to verify, so the zone-map arm takes it.
+  checkBulk(*reader, *sparse, true);
   checkBulk(*reader, *scan, false);
   checkBulk(*reader, *exists, false);
   checkBulk(*reader, *constant, false);

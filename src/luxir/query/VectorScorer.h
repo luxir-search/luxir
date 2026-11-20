@@ -33,11 +33,11 @@ namespace luxir {
 /// The per-element work runs in the SIMD kernels of VectorKernels.h: one
 /// pass over the stored bytes per row, widening f16 / uint8 in registers.
 /// INT8 rows (x[i] = offset + scale * code[i]) are scored without
-/// reconstructing x:
-///   q.x  = offset * sum(q) + scale * dot(q, code)
-///   |q - x|^2 = |q|^2 - 2 q.x + |x|^2
-/// with sum(q) and |q|^2 computed once per query and |x|^2 stored, so the
-/// inner loop is a pure dot(q, code).
+/// reconstructing x in memory: q.x = offset * sum(q) + scale * dot(q, code),
+/// with sum(q) computed once per query, so the inner loop is a pure
+/// dot(q, code).  L2 decodes x in registers and takes the difference
+/// directly, since |q|^2 - 2 q.x + |x|^2 cancels catastrophically when the
+/// offset is large.
 ///
 /// Batched: scoreRows takes a block of row pointers (contiguous column rows
 /// for a scan, rank-sorted candidates for a rescore), dispatches on the
@@ -62,7 +62,6 @@ private:
   bool norms;
   Kind kind = Kind::NONE;
   double querySum = 0.0;
-  double queryNormSq = 0.0;
   // BIT_HAMMING: the query packed like a stored row.
   std::vector<uint8_t> queryBits;
 
@@ -81,10 +80,10 @@ public:
   Kind getKind() const { return kind; }
 
   /// Scores n stored rows (each vcodec::rowBytes(encoding, dims, norms)
-  /// bytes) into out[0..n).  Requires scoresColumn().
+  /// bytes) into out[0..n).  A metric without a column score scores 0.
   void scoreRows(const char* const* rows, size_t n, float* out) const;
 
-  /// Score of one stored row.  Requires scoresColumn().
+  /// Score of one stored row.
   float score(const char* row) const {
     float s;
     scoreRows(&row, 1, &s);

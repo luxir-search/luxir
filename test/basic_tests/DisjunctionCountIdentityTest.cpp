@@ -116,7 +116,7 @@ public:
 
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
-    auto& cursor = req->topDocs("q").getNumber().limit(0);
+    auto& cursor = req->topDocs("q").countLimit().limit(0);
     cursor.rawQuery() = makeQuery(cursor);
     if (externalFilter) {
       cursor.matchFilter("gate_s", "keep");
@@ -312,7 +312,7 @@ TEST_F(DisjunctionCountIdentityTest, multiWindowIdentityStaysDocsOnly) {
     SkipStatsGuard statsGuard;
     auto req = localReq(wide.getSearchEngine());
     req->collection("main");
-    auto& cursor = req->topDocs("q").getNumber().limit(0);
+    auto& cursor = req->topDocs("q").countLimit().limit(0);
     auto& mr = cursor.mr();
     cursor.rawQuery() = qb::boolean(mr, {},
         {qb::match(mr, "body_w", "wcommon"),

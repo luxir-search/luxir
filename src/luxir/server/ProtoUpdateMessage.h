@@ -29,7 +29,7 @@ public:
 private:
   // response is created on-demand.
   std::unique_ptr<ResponseProto> ownedResponse;
-  ResponseProto* response;
+  ResponseProto* response = nullptr;
   // The response is NON-OWNING; its message data (request_id, error strings, ids) and the
   // variable-count errors/ids arrays are backed by this monotonic arena. Update processing
   // for one message is single-threaded, so a plain monotonic resource suffices.
@@ -55,14 +55,8 @@ public:
   // target it rather than re-resolving req->collection.
   CollectionId target;
   const int64_t dateMathNowEpochMillis;
-
-  ProtoUpdateMessage(const RequestProto* req, ResponseProto* rsp=nullptr)
-    : response(rsp), req(req), dateMathNowEpochMillis(currentEpochMillis()) {
-    if (response != nullptr) {
-      // A caller-supplied response (unary path) gets the same initialization an
-      // on-demand one gets in getResponse().
-      initResponse(response);
-    }
+  explicit ProtoUpdateMessage(const RequestProto* req)
+    : req(req), dateMathNowEpochMillis(currentEpochMillis()) {
     if (req->commit.has_value()) {
       commit = COMMIT;
       const auto& params = *req->commit;

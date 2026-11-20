@@ -31,14 +31,14 @@ class FileVerification {
   };
   std::vector<Item> items;
 public:
-  // All files under full, otherwise only marker-named files. Suspect files
-  // always use direct reads, including under full.
-  void open(Directory& dir, std::span<const FileDescriptor> files, bool full = true);
+  // All files under full, otherwise only files in the sorted suspects.
+  // Suspect files always use direct reads, including under full.
+  void open(Directory& dir, std::span<const FileDescriptor> files, bool full, std::span<const std::string> suspects);
   // Throws ChecksumMismatchError for corruption, runtime_error for other
   // failures to verify. Neither writes or clears markers.
   void run();
 };
 
-void verifyFiles(Directory& dir, std::span<const FileDescriptor> files, bool full = true);
+void verifyFiles(Directory& dir, std::span<const FileDescriptor> files, bool full, std::span<const std::string> suspects);
 
 }

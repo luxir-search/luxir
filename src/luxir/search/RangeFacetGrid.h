@@ -36,6 +36,7 @@ private:
   Kind kind;
   FieldType::Type type;
   TimeZone zone;
+  DateUnit dateUnit = DateUnit::MILLIS;
   int64_t gap = 0;
   int64_t origin = 0;
   double floatingGap = 0;
@@ -43,6 +44,7 @@ private:
   CalendarUnit unit = CalendarUnit::DAY;
   int64_t n = 1;
   int64_t anchor = 0;
+  int64_t subMillis = 0;
   std::optional<std::chrono::seconds> preferredOffset;
 
   RangeFacetGrid(Kind kind, FieldType::Type type, TimeZone zone);
@@ -56,15 +58,23 @@ private:
   Cell dateFloor(int64_t value) const;
   Cell dateNext(Cell cell, int64_t limit) const;
   bool gapFence(int64_t transition, int64_t before, int64_t after) const;
+  int64_t unitsPerMillis() const { return 1000000 / dateUnitNanos(dateUnit); }
+  int64_t toMillis(int64_t key) const { return dateEpochMillis(key, dateUnit); }
+  int64_t toKey(int64_t millis, int64_t remainder = 0) const {
+    return clampDateUnits((__int128)millis * unitsPerMillis() + remainder);
+  }
+  int64_t dateFit(__int128 key) const;
 
 public:
   static RangeFacetGrid fixed(FieldType::Type type, int64_t gap, int64_t origin = 0,
-                             TimeZone zone = TimeZone::utc());
+                             TimeZone zone = TimeZone::utc(), DateUnit dateUnit = DateUnit::MILLIS,
+                             std::optional<int64_t> start = std::nullopt);
   static RangeFacetGrid floating(FieldType::Type type, double gap, double origin = 0);
   // EXPLICIT retains its from-start calendar grid and offset preference.
   // DATA uses the civil epoch (ISO Monday for weeks), resolving folds earlier.
   static RangeFacetGrid calendar(CalendarUnit unit, int64_t n, TimeZone zone,
-                                std::optional<int64_t> start = std::nullopt);
+                                std::optional<int64_t> start = std::nullopt,
+                                DateUnit dateUnit = DateUnit::MILLIS);
 
   Cell floor(int64_t encodedValue) const;
   Cell next(Cell cell, std::vector<int64_t>* skippedCivil = nullptr) const;
@@ -73,6 +83,8 @@ public:
   // Affine INT and UTC/fixed-offset DATE grids use the full encoded range.
   // Calendar and IANA resolution are limited by the civil representation.
   std::pair<int64_t, int64_t> valueBounds() const {
+    // MIN can be a clipped lower fence; MAX is exclusively an end fence.
+    if (dateUnit == DateUnit::NANOS) return {INT64_MIN, INT64_MAX - 1};
     if (kind == Kind::CALENDAR || (type == FieldType::Type::DATE && zone.isIana())) {
       return {datetime_detail::kMinEpochMs, datetime_detail::kMaxEpochMs};
     }

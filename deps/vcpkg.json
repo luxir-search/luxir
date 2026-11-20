@@ -3,6 +3,7 @@
   "version-string": "0.1",
   "builtin-baseline": "a1cae005c39be7b18ba319fced856b68d7276271",
   "dependencies": [
+    "abseil",
     "boost-core",
     "boost-sort",
     "boost-thread",
@@ -28,7 +29,8 @@
       "default-features": false,
       "features": [
         "dynamic-arch"
-      ]
+      ],
+      "platform": "!osx"
     }
   ],
   "features": {

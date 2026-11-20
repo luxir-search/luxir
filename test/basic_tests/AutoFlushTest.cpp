@@ -9,9 +9,11 @@
 // rejected because it splits a request's shared updateVersion across segments and
 // breaks version-gated overwrite deletes. See ProtoUpdateMessage.cpp.
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <latch>
 #include <span>
 #include <string>
 #include <thread>
@@ -21,6 +23,7 @@
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/server/Stats.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/store/Directory.h"
 #include "luxir/util/Signal.h"
@@ -61,6 +64,9 @@ struct BudgetTotalGuard {
   explicit BudgetTotalGuard(IndexRamBudget& b) : budget(b), saved(b.totalBytes()) {}
   ~BudgetTotalGuard() { budget.setTotalBytes(saved); }
 };
+
+// An uncapped budget runs no delete passes, so packets wait for a commit.
+void holdDeletePasses(LuxirNode& node) { node.getIndexRamBudget().setTotalBytes(0); }
 }  // namespace
 
 // A single update message never splits mid-request, even far past the cap: it lands
@@ -115,7 +121,7 @@ TEST_F(AutoFlushTest, accumulationAcrossMessagesFlushesAtBoundaries) {
       << "per-message flush should bound accumulation into multiple segments";
 
   int64_t totalDocs = 0;
-  for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
+  for (const auto& seg : reader->segments()) totalDocs += seg.maxDoc();
   EXPECT_EQ(totalDocs, nDocs);
 
   auto req = localReq(helper.getSearchEngine());
@@ -124,6 +130,299 @@ TEST_F(AutoFlushTest, accumulationAcrossMessagesFlushesAtBoundaries) {
   req->execute();
   ASSERT_OK(req);
   EXPECT_EQ(req->getMatchCount("q"), nDocs);
+}
+
+TEST_F(AutoFlushTest, deleteOnlyGrowthAccountsAndFlushes) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  holdDeletePasses(node);
+  iw->deleteOnlyFlushFloor = 1;
+  std::vector<Doc> base;
+  for (int i = 0; i < 1088; i++) base.push_back(flatdoc("id", std::to_string(i)));
+  ASSERT_TRUE(helper.indexAll(base, UpdateMessage::COMMIT).success);
+  EXPECT_EQ(34, iw->stats(false).deleteOnlyFlushCap);
+  ASSERT_TRUE(helper.deleteById("repeat").success);
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(1, iw->idleInverters.size());
+  auto* inverter = iw->idleInverters.begin()->first;
+  size_t initialSize = inverter->memSize();
+  int64_t initialReserved = budget.reservedBytes();
+  for (int i = 0; i < 32; i++) {
+    ASSERT_TRUE(helper.deleteByIds({"repeat", std::string(100, 'x') + std::to_string(i)}).success);
+  }
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(1, iw->idleInverters.size());
+  EXPECT_EQ(inverter, iw->idleInverters.begin()->first);
+  EXPECT_GT(inverter->memSize(), initialSize);
+  EXPECT_GT(budget.reservedBytes(), initialReserved);
+  ASSERT_TRUE(helper.deleteById(std::string(100, 'y')).success);
+  iw->updateGraph->wait_for_all();
+  EXPECT_FALSE(iw->pendingDeletes.empty());
+  EXPECT_EQ(1, iw->segInfos.size());
+  EXPECT_EQ(1, iw->stats(false).deleteOnlyKneeFlushes);
+}
+
+TEST_F(AutoFlushTest, retainedDeletesTransferWithoutDraining) {
+  for (int shape : {0, 1, 2, 3}) {
+    SCOPED_TRACE(shape); // overwrite-only, delete-only, allow_dups+delete, mixed
+    LuxirNode node;
+    CollectionHelper helper(node);
+    auto iw = helper.getIndexWriter();
+    auto& budget = node.getIndexRamBudget();
+    holdDeletePasses(node);
+    if (shape != 1) {
+      ASSERT_TRUE(helper.index(flatdoc("id", std::string(200, 'a')), UpdateMessage::NO_COMMIT, shape == 0).success);
+    }
+    if (shape == 3) {
+      ASSERT_TRUE(helper.index(flatdoc("id", std::string(100, 'x')), UpdateMessage::NO_COMMIT, true).success);
+    }
+    if (shape != 0) {
+      ASSERT_TRUE(helper.deleteById("absent").success);
+    }
+    iw->updateGraph->wait_for_all();
+    ASSERT_EQ(1, iw->idleInverters.size());
+    auto& inverter = iw->obtainInverter(iw->idleInverters.begin()->first->currVersion);
+    int64_t packetBytes = (int64_t)inverter.retainedDeleteBytes();
+    int64_t before = budget.reservedBytes();
+    std::latch started(1), release(1);
+    auto cleanup = scope_guard([&] {
+      if (!release.try_wait()) release.count_down();
+      iw->updateGraph->wait_for_all();
+      Signal::unlisten("segmentFlushBody");
+    });
+    Signal::listen("segmentFlushBody", [&](void* source, void*, void*) -> void* {
+      if (source == &inverter) { started.count_down(); release.wait(); }
+      return nullptr;
+    });
+    iw->releaseInverter(inverter, true);
+    started.wait();
+    EXPECT_EQ(before, budget.reservedBytes());
+    EXPECT_EQ(before - packetBytes, budget.drainingBytesCount());
+    release.count_down();
+    iw->updateGraph->wait_for_all();
+    Signal::unlisten("segmentFlushBody");
+    ASSERT_EQ(1, iw->pendingDeletes.size());
+    const auto& packet = **iw->pendingDeletes.deletes.begin();
+    ASSERT_EQ(1, packet.lists().size());
+    EXPECT_EQ(shape == 3 ? 2 : 1, packet.lists()[0].size());
+    EXPECT_GT(packet.getSmallestVersion(), 0);
+    EXPECT_EQ(packetBytes, packet.memSize());
+    EXPECT_EQ(packetBytes, budget.retainedDeleteBytesCount());
+    EXPECT_EQ(packetBytes, budget.reservedBytes());
+    EXPECT_EQ(packetBytes, iw->stats(false).retainedDeleteBytes);
+    helper.commit();
+    iw->updateGraph->wait_for_all();
+    EXPECT_EQ(0, budget.retainedDeleteBytesCount());
+    EXPECT_EQ(0, budget.reservedBytes());
+  }
+}
+
+TEST_F(AutoFlushTest, rollbackRetainedDeleteAccounting) {
+  for (bool overwrite : {false, true}) {
+    LuxirNode node;
+    CollectionHelper helper(node);
+    auto iw = helper.getIndexWriter();
+    auto& budget = node.getIndexRamBudget();
+    holdDeletePasses(node);
+    if (overwrite) {
+      ASSERT_TRUE(helper.index(flatdoc("id", "old"), UpdateMessage::NO_COMMIT, true).success);
+      ASSERT_TRUE(helper.deleteById("absent").success);
+    }
+    CollectionHelper::UpdateBuilder request;
+    request.add(flatdoc("id", "new")).add(flatdoc("id", "old"))
+        .add(flatdoc("id", "bad", "no_such_field", "fail"))
+        .overwrite().allOrNone();
+    if (overwrite) request.remove("absent").remove("rolled-back");
+    EXPECT_FALSE(helper.submit(request).success);
+    auto& inverter = iw->obtainInverter();
+    iw->releaseInverter(inverter, true);
+    iw->updateGraph->wait_for_all();
+    if (overwrite) {
+      ASSERT_EQ(1, iw->pendingDeletes.size());
+      EXPECT_EQ((*iw->pendingDeletes.deletes.begin())->memSize(), budget.retainedDeleteBytesCount());
+    } else {
+      EXPECT_TRUE(iw->pendingDeletes.empty());
+      EXPECT_EQ(0, budget.retainedDeleteBytesCount());
+      EXPECT_EQ(0, budget.reservedBytes());
+    }
+  }
+}
+
+TEST_F(AutoFlushTest, retainedDeleteStatsReachApi) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  holdDeletePasses(node);
+  iw->perInverterRamBytes = 1;
+  ASSERT_TRUE(helper.deleteById("absent").success);
+  iw->updateGraph->wait_for_all();
+  uint64_t bytes = (uint64_t)node.getIndexRamBudget().retainedDeleteBytesCount();
+  ASSERT_GT(bytes, 0);
+  api::StatsRequest request;
+  request.collections = true;
+  api::StatsResponse response;
+  std::pmr::monotonic_buffer_resource resource;
+  gatherStats(node, request, response, resource);
+  EXPECT_EQ(bytes, response.memory->indexing_budget.retained_delete_bytes);
+  EXPECT_EQ(bytes, response.collections[0].shards[0].index.retained_delete_bytes);
+}
+
+// The delete inverter is larger, but its flush frees RAM only once a pass retires
+// its packet. Shedding the docs inverter alone meets the target, so it stays.
+TEST_F(AutoFlushTest, pressurePrefersImmediateRelief) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  auto& deletes = iw->obtainInverter(1);
+  for (int i = 0; i < 1000; i++) deletes.deleteId(std::string(100, 'x') + std::to_string(i), 1);
+  auto& docs = iw->obtainInverter(1);
+  auto& text = docs.getIndexHandler("text_w");
+  docs.startDoc();
+  text.index(docs, "reclaimable text");
+  docs.finishDoc();
+  size_t relief = deletes.memSize() - deletes.retainedDeleteBytes();
+  docs.pool.alloc(relief + 16384);
+  iw->pressureFlushFloorBytes = relief + 1;
+  ASSERT_GT(docs.memSize(), iw->pressureFlushFloorBytes);
+  ASSERT_GT(deletes.memSize(), docs.memSize());
+  iw->releaseInverter(deletes);
+  iw->releaseInverter(docs);
+  budget.setTotalBytes(budget.reservedBytes() + budget.liveDeleteBytesCount() - (int64_t)docs.memSize() / 2);
+  iw->updateGraph->wait_for_all();
+  EXPECT_TRUE(iw->idleInverters.contains(&deletes));
+  EXPECT_TRUE(iw->pendingDeletes.empty());
+  EXPECT_EQ(1, iw->segInfos.size());
+  budget.setTotalBytes(0);
+}
+
+// An inverter's delete bytes outlive its flush as a packet while its successor
+// refills, so pressure sheds it once both would not fit, before reservations do.
+TEST_F(AutoFlushTest, pressureCountsPacketLeftBehind) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  iw->pressureFlushFloorBytes = 1;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 2000; i++) docs.push_back(flatdoc("id", std::string(100, 'x') + std::to_string(i)));
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::NO_COMMIT, true).success);
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(0, iw->segInfos.size());
+  int64_t deletes = budget.liveDeleteBytesCount();
+  ASSERT_GT(deletes, 0);
+  budget.setTotalBytes(budget.reservedBytes() + deletes / 2);
+  EXPECT_FALSE(budget.overBudget());
+  iw->updateGraph->wait_for_all();
+  EXPECT_EQ(1, iw->segInfos.size());
+  EXPECT_EQ(0, budget.liveDeleteBytesCount());
+  budget.setTotalBytes(0);
+}
+
+// Unique ids with overwrite on and no commit: no id collides, but every flush
+// leaves a packet holding the inverter's whole id hash. Delete passes retire
+// them, so the bytes held stay a small fraction of those fed.
+TEST_F(AutoFlushTest, uniqueOverwritesRetireWithoutCommit) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  iw->perInverterRamBytes = 1; // every batch flushes
+  int64_t peak = 0;
+  std::vector<Doc> batch(500, flatdoc("id", std::string()));
+  for (int64_t done = 0; done < scaleTestWork(25'000); done += (int64_t)batch.size()) {
+    for (size_t i = 0; i < batch.size(); i++) std::get<std::string>(batch[i][0].val) = std::to_string(done + (int64_t)i);
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::NO_COMMIT, true).success);
+    peak = std::max(peak, budget.retainedDeleteBytesCount());
+  }
+  iw->updateGraph->wait_for_all();
+  auto stats = iw->stats(false, false);
+  EXPECT_GT(stats.deletePassCount, 0);
+  EXPECT_GT((int64_t)stats.deletePassRetiredBytes, 8 * peak);
+  helper.commit();
+}
+
+// An inverter whose memory is nearly all overwrite ids frees almost nothing at its
+// flush, but the flush turns that hash into a packet the next delete pass retires.
+// With nothing else to shed, pressure flushes it.
+TEST_F(AutoFlushTest, pressureShedsIdHeavyInverter) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  std::vector<Doc> docs;
+  for (int i = 0; i < 2000; i++) docs.push_back(flatdoc("id", std::string(100, 'x') + std::to_string(i)));
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::NO_COMMIT, true).success);
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(1, iw->idleInverters.size());
+  auto* inverter = iw->idleInverters.begin()->first;
+  iw->pressureFlushFloorBytes = inverter->memSize() / 2;
+  ASSERT_LT(inverter->memSize() - inverter->retainedDeleteBytes(), iw->pressureFlushFloorBytes);
+  node.getIndexRamBudget().setTotalBytes(1);
+  iw->updateGraph->wait_for_all();
+  EXPECT_TRUE(iw->idleInverters.empty());
+  EXPECT_EQ(1, iw->segInfos.size());
+  node.getIndexRamBudget().setTotalBytes(0);
+}
+
+// Of two id-heavy inverters only the older one pins the delete frontier: the
+// younger one's packet would wait for it anyway. Pressure that one flush meets
+// sheds the older, though it is smaller.
+TEST_F(AutoFlushTest, pressureShedsOldestIdHeavyInverter) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  auto fill = [](Inverter& inverter, int docs, char c) {
+    inverter.overwrite = true;
+    for (int i = 0; i < docs; i++) {
+      inverter.startDoc();
+      inverter.getIndexHandler("id").index(inverter, std::string(100, c) + std::to_string(i));
+      inverter.finishDoc();
+    }
+  };
+  auto& older = iw->obtainInverter(1);
+  fill(older, 1000, 'a');
+  auto& younger = iw->obtainInverter(2);
+  fill(younger, 3000, 'b');
+  iw->releaseInverter(older);
+  iw->releaseInverter(younger);
+  // Above both inverters' immediate relief, so only the deferred tier can pick either.
+  iw->pressureFlushFloorBytes = std::max(older.memSize() - older.retainedDeleteBytes(),
+                                         younger.memSize() - younger.retainedDeleteBytes()) + 1;
+  ASSERT_LE(iw->pressureFlushFloorBytes, older.memSize());
+  ASSERT_GT(younger.memSize(), older.memSize());
+  budget.setTotalBytes(budget.reservedBytes() + budget.liveDeleteBytesCount() - (int64_t)older.memSize() / 2);
+  iw->updateGraph->wait_for_all();
+  EXPECT_EQ(1, iw->idleInverters.size());
+  EXPECT_TRUE(iw->idleInverters.contains(&younger));
+  EXPECT_EQ(1, iw->segInfos.size());
+  budget.setTotalBytes(0);
+}
+
+// With the inverter cap far above the budget, only pressure bounds an inverter whose
+// memory is nearly all overwrite ids. Retirable packets are left out, as pressure
+// leaves them out: the next pass frees them.
+TEST_F(AutoFlushTest, uniqueOverwritesAboveInverterCapStayInBudget) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  int64_t total = 512 << 10;
+  iw->perInverterRamBytes = 64 << 20;
+  iw->pressureFlushFloorBytes = total / 16; // the default floor is above this budget
+  budget.setTotalBytes(total);
+  int64_t peak = 0;
+  std::vector<Doc> batch(500, flatdoc("id", std::string()));
+  for (int64_t done = 0; done < scaleTestWork(100'000); done += (int64_t)batch.size()) {
+    for (size_t i = 0; i < batch.size(); i++) std::get<std::string>(batch[i][0].val) = std::to_string(done + (int64_t)i);
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::NO_COMMIT, true).success);
+    peak = std::max(peak, budget.liveDeleteBytesCount() + budget.retainedDeleteBytesCount()
+                              - budget.retirableDeleteBytesCount());
+  }
+  EXPECT_LE(peak, 2 * total);
+  helper.commit();
 }
 
 // Waits for the budget's reservations to drain back to at most `bound` (the
@@ -165,7 +464,7 @@ TEST_F(AutoFlushTest, overBudgetReleaseFlushesIdleInverter) {
       << "an over-budget release should flush an idle inverter into its own segment";
 
   int64_t totalDocs = 0;
-  for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
+  for (const auto& seg : reader->segments()) totalDocs += seg.maxDoc();
   EXPECT_EQ(totalDocs, nDocs);
 
   auto req = localReq(helper.getSearchEngine());
@@ -231,7 +530,7 @@ TEST(PressureShedDirectTest, concurrentShedsWithInFlightDiscount) {
   auto cleanup = luxir::scope_guard([]() { Signal::unlisten("segmentFlushBody"); });
 
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema, &budget);
     iw.pressureFlushFloorBytes = 1;  // every inverter is a valid victim
 
@@ -282,7 +581,7 @@ TEST(PressureShedDirectTest, concurrentShedsWithInFlightDiscount) {
     auto reader = iw.snapshots.readers.getReader();
     EXPECT_EQ(reader->segments().size(), 3u);  // A shed, B shed, C at commit
     int64_t totalDocs = 0;
-    for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
+    for (const auto& seg : reader->segments()) totalDocs += seg.maxDoc();
     EXPECT_EQ(totalDocs, 61);
   }
 }
@@ -306,7 +605,7 @@ TEST(PressureShedDirectTest, mergeDemandWakesIdleWriter) {
   auto cleanup = luxir::scope_guard([]() { Signal::unlisten("segmentFlushBody"); });
 
   {
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots, schema, &budget);
     iw.pressureFlushFloorBytes = 1;
     auto& inverter = iw.obtainInverter();
@@ -336,6 +635,57 @@ TEST(PressureShedDirectTest, mergeDemandWakesIdleWriter) {
   }
 }
 
+// A merge waiting on a whole pool of demand must not turn every batch of large
+// documents into its own segment: demand claims at most half the pool from
+// inverters, and only an inverter holding a fair share of that half is shed for
+// it.  (Uncapped demand flushed all 40 batches as 40 segments.)
+TEST(PressureShedDirectTest, mergeDemandDoesNotShedEveryBatch) {
+  RAMDir dir;
+  auto schema = std::make_shared<Schema>();
+  schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
+      "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
+
+  IndexRamBudget budget;
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
+  IndexWriter iw(iwSnapshots, schema, &budget);
+  iw.mergePolicy->setMergeFactor(1000);  // count flushed segments only
+  iw.pressureFlushFloorBytes = 1;
+
+  int docOrd = 0;
+  auto addBatch = [&]() {  // 20 docs of ~7 KB
+    auto& inverter = iw.obtainInverter();
+    for (int d = 0; d < 20; d++, docOrd++) {
+      std::string body;
+      for (int w = 0; w < 1000; w++) body += "w" + std::to_string((docOrd * 7919 + w * 104729) % 50000) + " ";
+      inverter.startDoc();
+      inverter.getIndexHandler("body").index(inverter, std::string_view(body));
+      inverter.finishDoc();
+    }
+    iw.releaseInverter(inverter);
+  };
+
+  addBatch();
+  int64_t first = budget.reservedBytes();
+  addBatch();
+  int64_t perBatch = budget.reservedBytes() - first;
+  ASSERT_GT(perBatch, 0);
+  // Inverters keep half of the pool: about five batches.
+  int64_t cap = 2 * (first + 4 * perBatch);
+  budget.setTotalBytes(cap);
+  auto demand = budget.registerMergeDemand([]() {});
+  demand.publish(cap);  // a merge that wants the whole pool
+
+  const int batches = 40;
+  for (int i = 2; i < batches; i++) addBatch();
+
+  demand.publish(0);
+  budget.setTotalBytes(0);
+  iw.commit();
+  auto segments = iw.snapshots.readers.getReader()->segments().size();
+  EXPECT_GT(segments, 1u) << "inverters past half the pool still yield to merge demand";
+  EXPECT_LE(segments, (size_t)batches / 3) << "merge demand shed small inverters";
+}
+
 // Hold the demand-triggered inverter flush.  Once it releases its reservation,
 // the budget callback must admit multiple field batches, which are then held at
 // segmentMergeBody.  This is the regression shape: without published demand the
@@ -351,7 +701,7 @@ TEST(PressureShedDirectTest, mergeDemandRestoresParallelAdmission) {
   }
 
   IndexRamBudget budget;
-  CommitSnapshotRegistry iwSnapshots(dir);
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots, schema, &budget);
   iw.mergePolicy->setMergeFactor(2);
   iw.termPartitionMinBytes = INT64_MAX;
@@ -483,7 +833,7 @@ TEST(FlushWorkspaceTest, flushGrowsDrainingReservation) {
   IndexRamBudget budget;
   RAMDir dir;
   {
-    Inverter inverter(dir, 1, Schema::createDefaultSchema(), &budget);
+    Inverter inverter(dir, 1, 1, Schema::createDefaultSchema(), &budget);
     auto& tags = inverter.getIndexHandler("tags_ss");
     for (int d = 0; d < 1000; d++) {
       inverter.startDoc();

@@ -114,7 +114,7 @@ int64_t runCount(CollectionHelper& helper, bool disableWindowPath,
   ProhibitedCacheGuard cacheGuard;
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
-  auto& top = req->topDocs("q").getNumber().limit(0);
+  auto& top = req->topDocs("q").countLimit().limit(0);
   std::vector<api::Query> prohibited;
   if (rejectedShape) {
     prohibited.push_back(

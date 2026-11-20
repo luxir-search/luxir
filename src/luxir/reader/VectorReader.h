@@ -98,7 +98,7 @@ public:
   }
 
   /// F32 columns only: the vector at a global value rank, without a copy.
-  std::span<const float> vectorAtRank(int64_t valueRank) const {
+  LUXIR_INLINE std::span<const float> vectorAtRank(int64_t valueRank) const {
     assert(encoding_ == VectorEncoding::F32);
     auto bytes = strCol_.valueAt(valueRank);
     return std::span<const float>((const float*)vcodec::rowPayload(bytes.data(), norms_),

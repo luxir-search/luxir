@@ -1,0 +1,101 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#include "luxir/util/automaton/CaseAlternates.h"
+
+#include <algorithm>
+#include <map>
+
+#include <uni_algo/case.h>
+#include <uni_algo/conv.h>
+
+#include "luxir/util/automaton/Automaton.h"
+#include "luxir/util/automaton/CodepointFolder.h"
+#include "luxir/util/screaming.h"
+
+namespace luxir::automaton {
+namespace {
+
+// Every cased scalar, sorted, with the slice of `members` holding its class.
+struct CaseClasses {
+  struct Entry {
+    int32_t codepoint;
+    uint32_t begin;
+    uint32_t end;
+  };
+  std::vector<Entry> entries;
+  std::vector<int32_t> members;
+
+  CaseClasses() {
+    // Inverting the fold needs one pass over all scalars; it runs once per
+    // process, on the first case-insensitive pattern.
+    std::map<int32_t, std::vector<int32_t>> byFold;
+    for (int32_t cp = 0; cp <= 0x10ffff; cp++) {
+      if (cp == 0xd800) cp = 0xe000;
+      int32_t folded = (int32_t)una::codepoint::to_simple_casefold((char32_t)cp);
+      if (folded != cp) byFold[folded].push_back(cp);
+    }
+    for (auto& [folded, cps] : byFold) {
+      cps.push_back(folded);
+      std::sort(cps.begin(), cps.end());
+      uint32_t begin = (uint32_t)members.size();
+      members.insert(members.end(), cps.begin(), cps.end());
+      uint32_t end = (uint32_t)members.size();
+      for (int32_t cp : cps) entries.push_back({cp, begin, end});
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry& a, const Entry& b) { return a.codepoint < b.codepoint; });
+  }
+
+  static const CaseClasses& get() {
+    static const CaseClasses classes;
+    return classes;
+  }
+};
+
+auto lowerBound(const CaseClasses& classes, int32_t cp) {
+  return std::lower_bound(classes.entries.begin(), classes.entries.end(), cp,
+                          [](const CaseClasses::Entry& e, int32_t v) { return e.codepoint < v; });
+}
+
+} // namespace
+
+std::span<const int32_t> caseAlternates(int32_t cp) {
+  const CaseClasses& classes = CaseClasses::get();
+  auto it = lowerBound(classes, cp);
+  if (it == classes.entries.end() || it->codepoint != cp) return {};
+  return {classes.members.data() + it->begin, (size_t)(it->end - it->begin)};
+}
+
+bool caseAlternatesFoldToSelf(std::string_view term, const CodepointFolder& folder) {
+  auto scalars = una::utf8to32(term);
+  if (una::utf32to8(scalars) != term) return false;
+  for (char32_t cp : scalars) {
+    for (int32_t alternate : caseAlternates((int32_t)cp)) {
+      int32_t folded[32];
+      if (folder.fold(alternate, folded, 32) != 1 || folded[0] != (int32_t)cp) return false;
+    }
+  }
+  return true;
+}
+
+void appendCaseAlternates(std::vector<std::pair<int32_t, int32_t>>& ranges, Budget& budget) {
+  const CaseClasses& classes = CaseClasses::get();
+  size_t explicitRanges = ranges.size();
+  int64_t cursor = 0;
+  for (size_t r = 0; r < explicitRanges; r++) {
+    auto [lo, hi] = ranges[r];
+    cursor = screaming::gallopLowerBound(cursor, (int64_t)classes.entries.size(), lo,
+        [&](int64_t i) { return classes.entries[(size_t)i].codepoint; });
+    while (cursor < (int64_t)classes.entries.size() && classes.entries[(size_t)cursor].codepoint <= hi) {
+      const auto& entry = classes.entries[(size_t)cursor++];
+      budget.consume(1 + (int64_t)(entry.end - entry.begin));
+      for (uint32_t i = entry.begin; i < entry.end; i++) {
+        int32_t alternate = classes.members[i];
+        if (alternate < lo || alternate > hi) ranges.emplace_back(alternate, alternate);
+      }
+    }
+  }
+}
+
+} // namespace luxir::automaton

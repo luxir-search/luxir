@@ -369,7 +369,7 @@ TEST_F(QueryFacetParserTest, ValidationPrecedesExecution) {
     helper->index(flatdoc("id", "1", "brand_s", "acme"),
                   UpdateMessage::COMMIT);
     auto request = localReq(luxirNode->getSearchEngine());
-    auto& cursor = request->topDocs("q").allQuery().getNumber()
+    auto& cursor = request->topDocs("q").allQuery().countLimit()
         .facet("prices", "brand_s");
     auto& facet = addValidFacet(cursor);
     setSelected(facet, cursor.mr(), {"cheap", "mid"});
@@ -421,7 +421,7 @@ TEST_F(QueryFacetParserTest, OrderedOverlappingBucketsRespectIncomingDomain) {
   }, UpdateMessage::COMMIT);
 
   auto request = localReq(helper.getSearchEngine());
-  auto& top = request->topDocs("q").allQuery().getNumber()
+  auto& top = request->topDocs("q").allQuery().countLimit()
       .matchFilter("scope_s", "keep");
   auto& cursor = top.facet("tiers", "brand_s");
   auto& facet = queryFacet(cursor);
@@ -568,7 +568,7 @@ TEST_F(QueryFacetParserTest, SelectedAnyIsSidewaysAndFiltersSiblings) {
   }, UpdateMessage::COMMIT);
 
   auto request = localReq(helper.getSearchEngine());
-  auto& top = request->topDocs("q").allQuery().getNumber();
+  auto& top = request->topDocs("q").allQuery().countLimit();
   auto& cursor = top.facet("tiers", "brand_s");
   auto& facet = queryFacet(cursor);
   auto* buckets = addBuckets(facet, cursor.mr(), 3);
@@ -609,7 +609,7 @@ TEST_F(QueryFacetParserTest, SelectedAllUsesStrictIncomingDomain) {
   }, UpdateMessage::COMMIT);
 
   auto request = localReq(helper.getSearchEngine());
-  auto& top = request->topDocs("q").allQuery().getNumber();
+  auto& top = request->topDocs("q").allQuery().countLimit();
   auto& cursor = top.facet("tiers", "brand_s");
   auto& facet = queryFacet(cursor);
   auto* buckets = addBuckets(facet, cursor.mr(), 3);
@@ -842,7 +842,7 @@ TEST_F(QueryFacetParserTest, SelectedPreparedAndStreamingBucketsWork) {
 
   for (bool selectPrepared : {false, true}) {
     auto request = localReq(helper.getSearchEngine());
-    auto& top = request->topDocs("q").allQuery().getNumber().limit(0);
+    auto& top = request->topDocs("q").allQuery().countLimit().limit(0);
     auto& cursor = top.facet("mixed", "brand_s");
     auto& facet = queryFacet(cursor);
     auto* buckets = addBuckets(facet, cursor.mr(), 2);

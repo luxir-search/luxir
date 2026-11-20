@@ -30,7 +30,7 @@ MergeableCollector* MergeableCollector::mergeDiversified(MergeableCollector* a, 
 void TopDocsReq::CalcBase::configureDiversify() {
   auto& op = thisOp();
   collectorMerger.creator = [&op]() {
-    auto* collector = new MergeableCollector(op.topCount, op.sortPlan, op.req.reader.get(),
+    auto* collector = new MergeableCollector(op.topCount, op.sortPlan, op.view.get(),
                                             op.requestNeedsScores, *op.diversify);
     if (collector->useFieldSort) collector->diverseFieldCollector->primaryValues = op.sortValues;
     return collector;
@@ -50,15 +50,16 @@ void TopDocsReq::fillDiversifyResponse(CalcBase& calc, MergeableCollector& data)
     auto docs = collector.sort();
     auto target = [&](SearchResponse* response) -> api::DocList& {
       auto& list = *calc.slotArm<api::DocList>(response);
-      if (topDocsProto.get_number) list.found_groups = collector.groups->totalGroups();
+      if (requirements.needsCount()) list.found_groups = collector.groups->totalGroups();
       return list;
     };
-    emitDocsResponse(req, target, (int64_t)docs.size(),
+    emitDocsResponse(req, *view, flags, target, (int64_t)docs.size(),
         [docs](int64_t i) { return docs[i].doc; },
         [docs](int64_t i) { return docs[i].score; }, collector.totalHits(),
         topDocsProto.fields, topDocsProto.batch_size, topDocsProto.offset,
-        topDocsProto.get_number, topDocsProto.get_scores, topDocsProto.document_format,
-        calc.underBucketSlot() ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM);
+        requirements.needsCount(), topDocsProto.get_scores, topDocsProto.document_format,
+        calc.underBucketSlot() ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM,
+        {}, false, false, {}, decorators);
   };
   if (data.useFieldSort) emit(*data.diverseFieldCollector);
   else emit(*data.diverseScoreCollector);

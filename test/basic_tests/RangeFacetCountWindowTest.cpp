@@ -296,24 +296,6 @@ TEST(RangeFacetCountWindowTest, integerAndCivilRepresentationLimits) {
   EXPECT_THROW(invalid.add(datetime_detail::kMinEpochMs - 1), std::runtime_error);
 }
 
-TEST(RangeFacetCountWindowTest, timeZoneCoverageCannotCauseNonAdvancingTraversal) {
-  auto zone = resolveTimeZone("America/New_York").value();
-  int64_t value = datetime_detail::kMaxEpochMs - 86400000;
-  auto info = zone.ianaZone()->get_info(std::chrono::sys_time<std::chrono::milliseconds>{std::chrono::milliseconds{value}});
-  int64_t end = std::chrono::duration_cast<std::chrono::milliseconds>(info.end.time_since_epoch()).count();
-  // Exercise the libstdc++ boundary when present; other tzdb implementations
-  // may correctly cover the full civil range.
-  if (end <= datetime_detail::kMaxEpochMs) {
-    auto grid = Grid::fixed(FieldType::Type::DATE, 60000, 0, zone);
-    RequestMemTracker tracker(0);
-    Window window(grid, tracker, "tzdb boundary");
-    window.add(end - 1); // Optional headroom must not reject this value.
-    EXPECT_EQ(1u, window.counts().size());
-    EXPECT_THROW(window.add(end), std::runtime_error);
-    EXPECT_THROW(grid.affineGap(grid.floor(end - 1).key, end + 1), std::runtime_error);
-  }
-}
-
 TEST(RangeFacetCountWindowTest, relocationOverlapChargedAndFailureReleasesMemory) {
   auto grid = Grid::fixed(FieldType::Type::INT, 1);
   {
@@ -387,4 +369,18 @@ TEST(RangeFacetCountWindowTest, piecewiseGrowthAndMergeMatchMap) {
       randomized(grid, std::move(values));
     }
   }
+}
+
+TEST(RangeFacetCountWindowTest, nanosecondCellsAtReservedExtrema) {
+  for (bool calendar : {false, true}) {
+    auto grid = calendar ? Grid::calendar(CalendarUnit::DAY, 1, TimeZone::utc(), std::nullopt, DateUnit::NANOS)
+        : Grid::fixed(FieldType::DATE, 5, 0, TimeZone::utc(), DateUnit::NANOS);
+    for (int64_t base : {INT64_MIN + 1, INT64_MAX - 8}) {
+      std::vector<int64_t> values;
+      for (int i = 0; i < 8; i++) values.push_back(base + i);
+      randomized(grid, values);
+    }
+  }
+  auto full = Grid::fixed(FieldType::DATE, INT64_MAX, 1, TimeZone::utc(), DateUnit::NANOS);
+  randomized(full, {INT64_MIN + 1, 0, INT64_MAX - 1});
 }

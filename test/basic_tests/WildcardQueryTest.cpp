@@ -94,3 +94,29 @@ TEST_F(WildcardQueryE2ETest, suffixScanPlanPlumbing) {
   ASSERT_NE(regex, nullptr);
   EXPECT_EQ(regex->getScanPlan().commonSuffix, "ization");
 }
+
+// A general pattern is not fitted to the indexed-term length, so its filter
+// key must encode lengths past one byte.
+TEST_F(WildcardQueryE2ETest, longGeneralPatternAsFilter) {
+  auto filteredCount = [&](api::Query (*make)(std::pmr::memory_resource&, std::string_view, std::string_view),
+                           const std::string& pattern) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.rawQuery() = qb::boolean(cur.mr(), {qb::match(cur.mr(), "body_w", "apple")}, {}, {},
+                                 {make(cur.mr(), "color_s", pattern)});
+    cur.withStats();
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req->getMatchCount();
+  };
+  auto alternation = [](std::string_view hit) {
+    std::string pattern = "(";
+    pattern += hit;
+    for (int i = 0; i < 60; i++) pattern += fmt::format("|zq{:03}", i);
+    return pattern + ")";
+  };
+  for (int pass = 0; pass < 2; pass++) {
+    EXPECT_EQ(1, filteredCount(qb::regex, alternation("foobar")));
+    EXPECT_EQ(0, filteredCount(qb::regex, alternation("fooqux")));
+  }
+}

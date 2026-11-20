@@ -8,13 +8,16 @@
 #include "luxir/reader/Postings.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/StrRef.h"
+#include "luxir/value/ValueTypes.h"
 
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -27,6 +30,9 @@ namespace api { struct Val; }  // the wire value oneof (api/luxir_types.hpp)
 struct CoerceContext {
   std::optional<int64_t> dateMathNowEpochMillis;
   TimeZone timeZone = TimeZone::utc();
+  // Omitted means the field's unit. Request modes may supply a different unit.
+  std::optional<DateUnit> dateInputUnit = std::nullopt;
+  bool decimalScaled = false;
 };
 
 
@@ -49,9 +55,61 @@ public:
     DOUBLE,
     ID,       // unique id field
     VECTOR,   // dense float vector; column-stored as fixed-size bytes
-    DATE,     // timestamp; column-stored as int64 milliseconds since the Unix epoch
-    GEO_POINT // latitude/longitude point; packed into one int64 column value
+    DATE,     // timestamp; column-stored as int64 epoch units (default ms)
+    GEO_POINT, // latitude/longitude point; packed into one int64 column value
+    BOOLEAN,  // true/false; column-stored as 0/1
+    DECIMAL,  // fixed-point number; scale in type flags
+    IP,       // 16-byte address term
+    NESTED,   // structural row-space declaration, never a physical field
+    // [min, max] interval (RangeFieldType); the column holds two encoded
+    // int64 values per document, min then max.
+    INTERVAL
   };
+
+  enum class Storage { NONE, TERMS, TEXT, BIN, INT64, VECTOR };
+
+  static constexpr Storage storage(Type type) {
+    switch (type) {
+      case NONE: case NESTED: return Storage::NONE;
+      case STRING: case ID: case IP: return Storage::TERMS;
+      case TEXT: return Storage::TEXT;
+      case BIN: return Storage::BIN;
+      case INT: case FLOAT: case DOUBLE: case DATE: case GEO_POINT: case BOOLEAN: case DECIMAL: case INTERVAL: return Storage::INT64;
+      case VECTOR: return Storage::VECTOR;
+    }
+    throw std::invalid_argument("Unknown field storage type");
+  }
+
+  // Ordered scalar values in the shared int64 column: numeric queries,
+  // field sorts and one-dimensional points all use this storage family.
+  static constexpr bool isNumericColumn(Type type) {
+    return storage(type) == Storage::INT64 && type != GEO_POINT && type != INTERVAL;
+  }
+
+  static constexpr bool usesGeoPoints(Type type) { return type == GEO_POINT; }
+
+  static std::string_view typeName(Type type);
+  // Decode parameters using the persisted type, independently of any schema.
+  // Unknown types and bits are invalid. DATE defines its unit in bit 0.
+  static uint32_t typeParameters(Type type, uint32_t typeFlags);
+  static std::string describeType(Type type, uint32_t typeFlags);
+  using SignatureProps = std::map<std::string, std::string>;
+  virtual void signatureProps(SignatureProps& out) const;
+
+  enum Capability : uint32_t {
+    MATCH = 1u << 0, ANY_OF = 1u << 1, PREFIX = 1u << 2,
+    PATTERN = 1u << 3, FUZZY = 1u << 4, FREE_TEXT = 1u << 5,
+    TERM_FILTER = 1u << 6, RANGE = 1u << 7, SORT = 1u << 8,
+    FIELD_FACET = 1u << 9, RANGE_FACET = 1u << 10,
+    COLLAPSE = 1u << 11, VALUE_EXPR = 1u << 12, RANGE_RELATION = 1u << 13
+  };
+
+  // Type support only; callers validate indexing and column configuration.
+  virtual uint32_t capabilities() const;
+  virtual std::string_view capabilityRemedy(uint32_t required) const { return {}; }
+  bool supports(uint32_t required) const { return (capabilities() & required) == required; }
+  void requireCapability(uint32_t required, std::string_view operation,
+                         std::string_view fieldName) const;
 
   using flag_type = int32_t;
 
@@ -77,13 +135,34 @@ public:
   // in this segment field is at least PackedTerm::MIN_FITTED_LEN bytes, so it
   // may be a truncated or hashed (fitted) form of a longer value.
   static constexpr flag_type MAY_HAVE_FITTED = (1 << 14);
+  // Multi-valued set is the default; arrays retain source order and repeats.
+  // This is a physical property persisted in each segment, not a format marker.
+  static constexpr flag_type MULTI_ARRAY = (1 << 15);
   // Every segment-format marker. A writer derives them from what it writes,
   // so merges never carry them over from source segments.
   static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED;
 
+  static_assert([] {
+    constexpr flag_type bits[] = {
+      INDEX_DOCS, INDEX_DOCS_FREQS ^ INDEX_DOCS,
+      INDEX_DOCS_FREQS_POSITIONS ^ INDEX_DOCS_FREQS,
+      NUM_TOKENS_APPROX, NUM_TOKENS_EXACT, MULTI_VALUED, FIELD_SPECIFIC_ANALYZER,
+      COLUMN_STORED, FIXED_SIZE, ABSTRACT, STORED, INDEX_RANGE, TERM_RANGES,
+      DERIVED, MAY_HAVE_FITTED, MULTI_ARRAY
+    };
+    flag_type used = 0;
+    for (auto bit : bits) {
+      if (bit == 0 || (bit & (bit - 1)) != 0 || (used & bit) != 0) return false;
+      used |= bit;
+    }
+    return true;
+  }(), "Field flags must use distinct single bits");
+
   const FieldType::Type type_;
   const std::string name_;
   flag_type flags_;
+  // String and bytes arms already contain term bytes, before normalization or fitting.
+  const bool rawTextTerms;
   // Determines indexed and query term bytes.
   TermPolicy longTerms = TermPolicy::HASH128;
   // When STORED is set, raw values are routed to the stored-fields resource
@@ -92,8 +171,9 @@ public:
   std::string storedResource_ = std::string(Postings::STORED_DEFAULT_RESOURCE);
 
   // constructor
-  FieldType(std::string_view name, FieldType::Type type, int flags) :
-     type_(type), name_(name), flags_(flags) {
+  FieldType(std::string_view name, FieldType::Type type, int flags, bool rawTextTerms = false) :
+     type_(type), name_(name), flags_(flags), rawTextTerms(rawTextTerms) {
+    if ((flags_ & MULTI_VALUED) && arrayOnly(type)) flags_ |= MULTI_ARRAY;
   }
 
   bool isSet(flag_type flag) {
@@ -116,7 +196,13 @@ public:
   bool isDerived() const { return (bool) (flags_ & DERIVED); }
 
   // Segment flags describe physical structures; schema roles stay in the schema.
-  flag_type segmentFlags() const { return flags_ & ~(ABSTRACT | DERIVED); }
+  flag_type segmentFlags() const {
+    flag_type flags = flags_ & ~(ABSTRACT | DERIVED);
+    // Intervals are logically single-valued; their endpoint column is a pair array.
+    if (type_ == INTERVAL) flags |= MULTI_VALUED | MULTI_ARRAY;
+    return flags;
+  }
+  virtual uint32_t segmentTypeFlags() const { return 0; }
 
   // TODO: check standard on cast of int to bool (check generated code too)
   bool indexed() { return (bool) (flags_ & INDEX_DOCS); }
@@ -136,15 +222,9 @@ public:
   bool hasNumTokens() { return (bool) (flags_ & (NUM_TOKENS_APPROX | NUM_TOKENS_EXACT)); }
 
   bool multiValued() { return (bool) (flags_ & MULTI_VALUED); }
-
-  // Whether a sort on a field of this type orders by its int64 column
-  // values: raw integers for INT, epoch millis for DATE, sortable bits for
-  // FLOAT and DOUBLE (SimpleNumericFieldComparator). Single-valued columns
-  // of these types are the ones field-sort planning reads, so only they
-  // persist a value sketch (NumColumnWriter).
-  static bool sortsByIntColumn(Type type) {
-    return type == INT || type == DATE || type == FLOAT || type == DOUBLE;
-  }
+  bool multiArray() const { return (flags_ & MULTI_ARRAY) != 0; }
+  bool multiSet() const { return (flags_ & MULTI_VALUED) && !multiArray(); }
+  static bool arrayOnly(Type type) { return type == TEXT || type == VECTOR || type == GEO_POINT; }
 
   bool isAnalyzerFieldSpecific() { return (bool) (flags_ & FIELD_SPECIFIC_ANALYZER); }
 
@@ -162,7 +242,7 @@ public:
 
   // The encoded int64 the standard int column stores for this field type:
   // the raw integer for INT, sortable bits for FLOAT/DOUBLE (NumericUtils),
-  // epoch millis for DATE (ISO-8601 strings parsed on the way in).  Throws on
+  // epoch units for DATE (ISO-8601 strings parsed on the way in). Throws on
   // impossible values (per-doc failure at ingest, request error at query
   // build).
   // context fixes NOW for the surrounding request/update. Other numeric types
@@ -170,6 +250,45 @@ public:
   virtual int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
+
+  // Integer-lattice gaps and origins, which must not use literal rounding.
+  virtual __int128 coerceGridValue(const api::Val& val, std::string_view fieldName,
+      std::string_view role, const CoerceContext& context) const;
+
+  // Fallback for point types without a cheaper non-throwing coercer.
+  virtual std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
+
+  virtual ValueNature valueNature() const { return ValueNature::NUMBER; }
+
+  enum class LiteralUse : uint8_t { MATCH, MEMBER, GTE, GT, LTE, LT };
+  struct IntWindow {
+    int64_t lo = INT64_MIN, hi = INT64_MAX;
+    bool granuleSkipped = false;
+    bool unroundedNow = false;
+    bool empty() const { return lo > hi; }
+  };
+
+  // Inclusive encoded values admitted by a query literal. MEMBER returns a
+  // point or empty; bounds return half-lines. Ingest still uses coerceColInt64.
+  virtual IntWindow coerceIntWindow(
+      const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
+
+  // Only invalid_value is an uncoercible literal; other errors still throw.
+  virtual std::optional<IntWindow> tryCoerceIntWindow(
+      const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
+
+  struct TermWindow {
+    std::string_view lo, hi;
+    bool point() const { return lo == hi; }
+  };
+  virtual TermWindow coerceTermWindow(const api::Val& val, std::string_view fieldName,
+      std::span<char> buf) const;
+  virtual std::optional<TermWindow> tryCoerceTermWindow(const api::Val& val,
+      std::string_view fieldName, std::span<char> buf) const;
 
   // Term/text bytes for term-backed fields (TEXT/STRING/ID).  Numeric and
   // bool arms render canonically into buf (>= coerce::TEXT_BUF_SIZE bytes)
@@ -180,20 +299,33 @@ public:
 };
 
 
+class NestedFieldType final : public FieldType {
+public:
+  bool reverseMap;
+
+  explicit NestedFieldType(std::string_view name, bool reverseMap = true)
+      : FieldType(name, NESTED, 0), reverseMap(reverseMap) {}
+};
+
 class TextFieldType : public FieldType {
 public:
-  // The compiled chain (analysis/Analyzer.h), shared with every field that
-  // resolves to the same authored definition.
+  // The compiled plan (analysis/Analyzer.h), shared by fields inheriting the same
+  // authored definition; equal inline definitions may have separate plans.
   std::shared_ptr<const Analyzer> analyzer_;
 
   TextFieldType(std::string_view name, int flags, std::shared_ptr<const Analyzer> analyzer)
-    : FieldType(name, FieldType::TEXT, flags), analyzer_(std::move(analyzer)) {}
+    : FieldType(name, FieldType::TEXT, flags, true), analyzer_(std::move(analyzer)) {}
 
   // Parameterless components by name (tests, benches, hand-built schemas);
   // throws like Analyzer::compile.  Defined in FieldType.cpp so this header
   // stays independent of the api types.
   TextFieldType(std::string_view name, int flags = INDEX_DOCS_FREQS_POSITIONS,
                 std::string_view tokenizer = "whitespace", std::vector<std::string> filters = {});
+  void signatureProps(SignatureProps& out) const override;
+
+  std::string_view capabilityRemedy(uint32_t required) const override {
+    return (required & (SORT | VALUE_EXPR | COLLAPSE | RANGE_FACET)) ? "use a string variant" : "";
+  }
 
   // Create a new non-thread-safe analyzer chain for this text field type
   std::unique_ptr<TokenChain> createAnalyzer(std::string_view fieldName) {
@@ -211,7 +343,8 @@ public:
 
   StrFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED,
                std::shared_ptr<const Analyzer> normalizer = {})
-    : FieldType(name, FieldType::STRING, flags), normalizer(std::move(normalizer)) {}
+    : FieldType(name, FieldType::STRING, flags, true), normalizer(std::move(normalizer)) {}
+  void signatureProps(SignatureProps& out) const override;
 
   // Hot paths (ingest and query literals) must retain a chain from normalizer->createChain().
   void normalize(std::string& value) const;
@@ -220,12 +353,75 @@ public:
                               std::span<char> buf) const override;
 };
 
+class IpFieldType : public FieldType {
+public:
+  IpFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED)
+    : FieldType(name, FieldType::IP, flags) {}
+  ValueNature valueNature() const override { return ValueNature::IP; }
+  uint32_t capabilities() const override {
+    return FieldType::capabilities() & ~(PREFIX | PATTERN | FUZZY | FREE_TEXT | TERM_FILTER);
+  }
+  std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
+      std::span<char> buf) const override;
+  TermWindow coerceTermWindow(const api::Val& val, std::string_view fieldName,
+      std::span<char> buf) const override;
+  std::optional<TermWindow> tryCoerceTermWindow(const api::Val& val,
+      std::string_view fieldName, std::span<char> buf) const override;
+};
+
 class IntFieldType : public FieldType {
 public:
   IntFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::INT, flags) {
   }
 
+  IntWindow coerceIntWindow(const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+  std::optional<IntWindow> tryCoerceIntWindow(const api::Val& val, LiteralUse use,
+      std::string_view fieldName, const CoerceContext& context = {}) const override;
+
   int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+};
+
+class DecimalFieldType : public FieldType {
+public:
+  static constexpr int MAX_SCALE = 18;
+  int scale;
+
+  DecimalFieldType(std::string_view name, int scale, int flags=COLUMN_STORED)
+    : FieldType(name, FieldType::DECIMAL, flags), scale(scale) { typeParameters(DECIMAL, scale); }
+
+  ValueNature valueNature() const override { return decimalValueNature(scale); }
+  uint32_t segmentTypeFlags() const override { return scale; }
+  void signatureProps(SignatureProps& out) const override;
+  int64_t coerceColInt64(const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+  IntWindow coerceIntWindow(const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+  std::optional<IntWindow> tryCoerceIntWindow(const api::Val& val, LiteralUse use,
+      std::string_view fieldName, const CoerceContext& context = {}) const override;
+  __int128 coerceGridValue(const api::Val& val, std::string_view fieldName,
+      std::string_view role, const CoerceContext& context) const override;
+};
+
+// BOOLEAN stores 0 (false) or 1 (true) in the standard int column.
+class BoolFieldType : public FieldType {
+public:
+  BoolFieldType(std::string_view name, int flags=COLUMN_STORED)
+    : FieldType(name, FieldType::BOOLEAN, flags) {}
+
+  ValueNature valueNature() const override { return ValueNature::BOOLEAN; }
+  uint32_t capabilities() const override { return FieldType::capabilities() & ~RANGE_FACET; }
+
+  int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+  std::optional<int64_t> tryCoerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 };
@@ -239,7 +435,13 @@ public:
   FloatFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::FLOAT, flags) {
   }
 
+  uint32_t capabilities() const override { return FieldType::capabilities() & ~COLLAPSE; }
+
   int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+
+  std::optional<int64_t> tryCoerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 };
@@ -249,53 +451,137 @@ public:
   DoubleFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DOUBLE, flags) {
   }
 
+  uint32_t capabilities() const override { return FieldType::capabilities() & ~COLLAPSE; }
+
   int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+
+  std::optional<int64_t> tryCoerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 };
 
-// DATE stores int64 milliseconds since the Unix epoch directly in the standard
-// int column.  Signed millis already sorts in chronological order, so sort,
-// range-facet, and min/max stats run on the raw column with no per-value
-// transform (unlike FLOAT/DOUBLE, which store sortable bits).  The DATE tag
-// drives string<->millis parsing on input and date-aware rendering on output.
+// DATE stores int64 epoch units directly in the standard int column. Signed
+// counts sort chronologically without a transform. Numeric ingest uses the
+// field's unit; ISO text is converted from milliseconds plus a sub-ms remainder.
 class DateFieldType : public FieldType {
 public:
-  DateFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DATE, flags) {
+  DateUnit unit;
+
+  DateFieldType(std::string_view name, int flags=COLUMN_STORED, DateUnit unit=DateUnit::MILLIS)
+    : FieldType(name, FieldType::DATE, flags), unit(unit) {
+    typeFlagsForUnit(unit);
   }
+
+  static uint32_t typeFlagsForUnit(DateUnit unit);
+  static DateUnit unitFromTypeFlags(uint32_t typeFlags);
+  // The unit of a field type whose type() is DATE.
+  static DateUnit unitOf(const FieldType& type) { return ((const DateFieldType&)type).unit; }
+  ValueNature valueNature() const override { return dateValueNature(unit); }
+  void signatureProps(SignatureProps& out) const override;
+  uint32_t segmentTypeFlags() const override { return typeFlagsForUnit(unit); }
+  __int128 coerceGridValue(const api::Val& val, std::string_view fieldName,
+      std::string_view role, const CoerceContext& context) const override;
 
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 
-  // The [lo, hiExclusive) epoch-millis window a query-side date literal
-  // denotes at its own granularity: "2024-06-25" is the whole day, "2024-06"
-  // the month, epoch millis a single instant.  Queries match/round by the
-  // window; ingest and sorting use coerceColInt64 (the window start).
-  DateRange coerceDateRange(
-      const api::Val& val, std::string_view fieldName,
-      const CoerceContext& context = {}) const;
+  IntWindow coerceIntWindow(
+      const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+
+  std::optional<IntWindow> tryCoerceIntWindow(
+      const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
 class GeoPointFieldType : public FieldType {
 public:
-  GeoPointFieldType(std::string_view name, int flags=COLUMN_STORED)
-    : FieldType(name, FieldType::GEO_POINT, flags) {
+  // Skip a value that is not a valid point instead of failing the document.
+  bool ignoreMalformed;
+  // Accept a third (z, altitude) coordinate and drop it; otherwise reject it.
+  bool ignoreZValue;
+
+  GeoPointFieldType(std::string_view name, int flags=COLUMN_STORED,
+                    bool ignoreMalformed = false, bool ignoreZValue = true)
+    : FieldType(name, FieldType::GEO_POINT, flags),
+      ignoreMalformed(ignoreMalformed), ignoreZValue(ignoreZValue) {
   }
+
+  ValueNature valueNature() const override { return ValueNature::GEO_POINT; }
+  uint32_t capabilities() const override { return VALUE_EXPR; }
+};
+
+// An interval of INT, DOUBLE or DATE endpoints. Each endpoint is stored with
+// its element type's column encoding (raw int64, sortable double bits, epoch
+// millis), so encoded order is value order and both [min, max] and query
+// bounds compare as plain int64. Open double ends store encoded infinities;
+// open long and date ends store the int64 extremes.
+//
+// The segment column is laid out like a multi-valued int column with two
+// values per document (min, max), so merges, deletes and the column scans
+// reuse that machinery. INDEX_RANGE adds a 2-D points index over (min, max)
+// (BasicBKDWriter<BKDInt64Traits>).
+class RangeFieldType : public FieldType {
+public:
+  static constexpr uint32_t ELEMENT_FLAGS_SHIFT = 2;
+  static constexpr uint32_t ELEMENT_KIND_MASK = (1u << ELEMENT_FLAGS_SHIFT) - 1;
+
+  // INT, DOUBLE or DATE: the type each endpoint coerces and renders as.
+  const std::shared_ptr<FieldType> element;
+
+  RangeFieldType(std::string_view name, FieldType::Type elementType, int flags=COLUMN_STORED);
+
+  static Type elementTypeFromFlags(uint32_t flags) {
+    switch (flags & ELEMENT_KIND_MASK) {
+      case 0: return INT;
+      case 1: return DOUBLE;
+      case 2: return DATE;
+      default: throw std::runtime_error("Unknown range element kind");
+    }
+  }
+
+  FieldType::Type elementType() const { return element->type(); }
+  uint32_t capabilities() const override { return MATCH | RANGE | RANGE_RELATION; }
+  // Low bits encode the element kind (long, double, date); upper bits carry
+  // the element's persisted parameters.
+  uint32_t segmentTypeFlags() const override {
+    uint32_t kind = elementType() == DOUBLE ? 1u : elementType() == DATE ? 2u : 0u;
+    return kind | (element->segmentTypeFlags() << ELEMENT_FLAGS_SHIFT);
+  }
+  void signatureProps(SignatureProps& out) const override {
+    element->signatureProps(out);
+    out["type"] = "\"" + std::string(typeName()) + "\"";
+  }
+
+  // The schema type name: long_range, double_range or date_range.
+  std::string_view typeName() const;
+
+  IntWindow domainBounds() const;
+  IntWindow coerceIntWindow(const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+  std::optional<IntWindow> tryCoerceIntWindow(const api::Val& val, LiteralUse use,
+      std::string_view fieldName, const CoerceContext& context = {}) const override;
+  IntWindow coerceIngestBound(const api::Val& val, LiteralUse use, std::string_view fieldName,
+      const CoerceContext& context) const;
+
 };
 
 // Unique id field
 class IdFieldType : public FieldType {
 public:
-  IdFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::ID, flags) {
+  IdFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::ID, flags, true) {
   }
+  void signatureProps(SignatureProps& out) const override;
 
   std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
                               std::span<char> buf) const override;
 };
 
 // Resolved ANN overlay settings of a vector field (api::VectorAnnDef with
-// defaults applied: PQ unless explicitly selected otherwise). Build-time
+// defaults applied: RaBitQ unless explicitly selected otherwise). Build-time
 // parameters are recorded in each overlay's VectorAuxMeta, so a change only
 // affects overlays built afterwards;
 // rabitqQueryBits is a search-time parameter read from the current schema.
@@ -304,16 +590,25 @@ struct VectorAnnConfig {
     RABITQ = 0,
     PQ = 1,
   };
-  static constexpr int32_t DEFAULT_RABITQ_BITS = 1;
+  static constexpr int32_t DEFAULT_RABITQ_BITS = 0;
   static constexpr int32_t DEFAULT_RABITQ_QUERY_BITS = 4;
   static constexpr int32_t DEFAULT_PQ_BITS = 8;
 
-  Codec codec = PQ;
+  Codec codec = RABITQ;
   int32_t nlist = 0;  // 0 = sqrt(segment vectors), capped
   int32_t rabitqBits = DEFAULT_RABITQ_BITS;
   int32_t rabitqQueryBits = DEFAULT_RABITQ_QUERY_BITS;
   int32_t pqM = 0;    // 0 = derived from dims
   int32_t pqBits = DEFAULT_PQ_BITS;
+
+  // A second bit narrows the estimate intervals, so fewer candidates need
+  // exact rescoring; the gain shrinks as dims grow. Measured k=100 latency
+  // gain of 2 bits: about 22% at 128-256 dims, 13% at 384, 9% at 512, ~1% at
+  // >= 768; at k=10 none from 384 up. Build CPU is 1.5-1.8x either way.
+  static constexpr int32_t RABITQ_ONE_BIT_MIN_DIMS = 384;
+  int32_t resolvedRabitqBits(int32_t dims) const {
+    return rabitqBits != 0 ? rabitqBits : (dims < RABITQ_ONE_BIT_MIN_DIMS ? 2 : 1);
+  }
 };
 
 // Dense float vector field.  Values are stored as fixed-size byte blobs
@@ -342,6 +637,10 @@ public:
 
   // Squared norm at or below which a cosine vector has no direction.
   static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
+  // Largest accepted element magnitude.  Squared norms stay below dims * 2^80,
+  // far enough under float32 range that every distance FAISS computes while
+  // training, assigning, and encoding, and every exact score, stays finite.
+  static constexpr float MAX_ELEMENT_MAGNITUDE = 0x1p40f;
 
   int32_t inputDims_;
   int32_t truncateDims_;
@@ -402,6 +701,7 @@ public:
 
   // Stored dimension (0 = inferred per segment).
   int32_t storedDims() const { return truncateDims_ > 0 ? truncateDims_ : inputDims_; }
+  void signatureProps(SignatureProps& out) const override;
   int32_t inputDims() const { return inputDims_; }
   int32_t truncateDims() const { return truncateDims_; }
   Metric metric() const { return metric_; }
@@ -409,11 +709,16 @@ public:
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
   VectorEncoding encoding() const { return encoding_; }
   bool keepOriginal() const { return keepOriginal_; }
+  // Whether column rows carry the |x|^2 norm prefix (see VectorCodec.h).
+  bool storesNorms() const {
+    return vcodec::needsNorms(encoding_, metric_ == METRIC_COSINE, normalized_ || normalizeOnWrite_);
+  }
   bool maxSim() const { return maxSim_; }
   const VectorAnnConfig& ann() const { return ann_; }
 
   // The contract for every indexed and query vector: inputDims() components
-  // (or truncateDims() for an already truncated vector), all finite.  Returns
+  // (or truncateDims() for an already truncated vector), all finite with
+  // magnitude at most MAX_ELEMENT_MAGNITUDE.  Returns
   // the error text, or empty when vec is valid.  A valid vec is stored and
   // searched as its first storedSize(vec.size()) components.
   std::string inputError(std::span<const float> vec) const;
@@ -431,9 +736,9 @@ public:
   }
 };
 
-// How a stored-fields resource compresses its chunks.  codec and the two chunk
-// limits are recorded in each segment's resource metadata; the level only
-// affects compression.
+// How a stored-fields resource compresses its chunks.  codec, the two chunk
+// limits are recorded in each segment's resource metadata. The level affects
+// compression, and dictionary capacity is schema training policy.
 struct StoredChunkFormat {
   // Recorded on disk as one byte.
   enum Codec : uint8_t { LZ4 = 0, ZSTD = 1 };
@@ -444,6 +749,7 @@ struct StoredChunkFormat {
   // cost for larger chunks.
   static constexpr uint32_t DEFAULT_ZSTD_CHUNK_TARGET = 64 * 1024;
   static constexpr uint32_t DEFAULT_ZSTD_MAX_DOCS_PER_CHUNK = 1024;
+  static constexpr uint32_t DEFAULT_DICTIONARY_BYTES = 64 * 1024;
 
   Codec codec = LZ4;
   int zstdLevel = DEFAULT_ZSTD_LEVEL;
@@ -452,9 +758,12 @@ struct StoredChunkFormat {
   // Hard cap on docs per chunk.  A chunk flushes when *either* the byte
   // target or this doc count is reached, whichever comes first.
   uint32_t maxDocsPerChunk = DEFAULT_MAX_DOCS_PER_CHUNK;
+  // ZSTD only: dictionary training capacity; 0 disables dictionaries.
+  uint32_t dictionaryBytes = 0;
 
   // Same chunk bytes and boundaries: compressed chunks of one format can be
-  // copied verbatim into a writer of the other.  The level is not part of it.
+  // copied verbatim into a writer of the other, provided both segments hold
+  // the same trained dictionary.  The level is not part of it.
   bool sameLayout(const StoredChunkFormat& o) const {
     return codec == o.codec && chunkTarget == o.chunkTarget && maxDocsPerChunk == o.maxDocsPerChunk;
   }

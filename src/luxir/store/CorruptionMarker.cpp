@@ -12,25 +12,26 @@ void CorruptionMarker::write(Directory& dir, std::span<const std::string> files,
   text += reason;
   text += '\n';
   for (const auto& file : files) { text += file; text += '\n'; }
-  auto name = std::string(kPrefix) + newUuid();
-  Directory::FileCreateOptions options; options.expectedSize = text.size();
-  auto file = dir.createFile(name, options);
-  OutputStream out(file.get());
-  out.write(text.data(), text.size()); out.close();
-  dir.finishFile(*file);
-  std::array<std::string, 2> synced{name, "."};
-  dir.sync(synced);
+  // Each report adds a marker; an existing one must not lose its suspects.
+  while (!dir.publishFile(std::string(kPrefix) + newUuid(), std::as_bytes(std::span(text)),
+                         Directory::PublishMode::CREATE_ONLY)) {}
 }
 
-std::vector<std::string> CorruptionMarker::read(Directory& dir) {
+CorruptionMarker::Observation CorruptionMarker::read(Directory& dir) {
   std::vector<Directory::FileInfo> listing;
   dir.listFiles(listing);
+  return read(dir, listing);
+}
+
+CorruptionMarker::Observation CorruptionMarker::read(Directory& dir, std::span<const Directory::FileInfo> listing) {
+  Observation observed;
   std::set<std::string> names;
   for (const auto& entry : listing) {
     if (!isMarker(entry.name)) continue;
     auto file = dir.openFile(entry.name);
     if (!file) continue;
     auto text = file->read();
+    observed.markers.push_back(entry.name);
     for (size_t start = 0; start < text.size();) {
       auto end = text.find('\n', start);
       if (end == std::string_view::npos) end = text.size();
@@ -40,23 +41,14 @@ std::vector<std::string> CorruptionMarker::read(Directory& dir) {
       names.emplace(line);
     }
   }
-  return {names.begin(), names.end()};
+  observed.suspects.assign(names.begin(), names.end());
+  return observed;
 }
 
 bool CorruptionMarker::present(Directory& dir) {
   std::vector<Directory::FileInfo> listing;
   dir.listFiles(listing);
   return std::ranges::any_of(listing, [](const auto& entry) { return isMarker(entry.name); });
-}
-
-void CorruptionMarker::clear(Directory& dir) {
-  std::vector<Directory::FileInfo> listing;
-  dir.listFiles(listing);
-  bool removed = false;
-  for (const auto& entry : listing) if (isMarker(entry.name)) removed = dir.deleteFile(entry.name) || removed;
-  if (!removed) return;
-  std::array<std::string, 1> directory{"."};
-  dir.sync(directory);
 }
 
 }

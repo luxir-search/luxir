@@ -105,7 +105,7 @@ AdmissionRun runShape(CollectionHelper& helper, const Shape& shape,
   auto& topDocs = req->topDocs("q");
   topDocs.getScores().limit(topK);
   if (exactCount) {
-    topDocs.getNumber();
+    topDocs.countLimit();
   }
   topDocs.rawQuery() = qb::boolean(
       topDocs.mr(),

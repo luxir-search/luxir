@@ -24,7 +24,7 @@
 namespace luxir {
 
 // Page-member traversal overrides affect work, never membership.
-enum class CollapseMemberStrategy { AUTO, KEYS, DOMAIN };
+enum class CollapseMemberStrategy { AUTO, KEYS, DOMAIN_WALK };
 inline CollapseMemberStrategy collapseMemberStrategy = CollapseMemberStrategy::AUTO;
 struct CollapseMemberStats {
   std::atomic<int64_t> keySegments{0}, domainSegments{0}, candidates{0}, members{0};
@@ -100,9 +100,23 @@ struct InlineFacetEntryStats {
   std::atomic<size_t> mixedMerges{0};
   std::atomic<size_t> denseFallbacks{0};
   std::atomic<size_t> entryStride{0};
+  // Ord batches accumulated through the keyed batch path.
+  std::atomic<size_t> keyedBatches{0};
 };
 inline InlineFacetEntryStats* inlineFacetEntryStatsForTests = nullptr;
 inline bool disableDenseFacetStateForTests = false;
+inline bool disableAggregateSharingForTests = false;
+struct AggregateExecutionStats {
+  std::atomic<size_t> followers{0}, producerStates{0}, finishedStateBytes{0}, retainedStateBytes{0};
+};
+inline AggregateExecutionStats* aggregateExecutionStatsForTests = nullptr;
+// A/B toggle: inline facet metrics take the per-document calculator calls
+// instead of keyed ord batches.
+inline bool disableKeyedInlineBatchesForTests = false;
+// A/B toggle: ordinal aggregate inputs use the per-document value evaluator.
+inline bool disableOrdinalAggregateBatchesForTests = false;
+// A/B toggle: ordinal batches go straight to HLL instead of exact ordinal storage.
+inline bool disableCardinalityOrdSetsForTests = false;
 
 enum class InlineFacetEntryMode {
   AUTO, FORCE_DENSE, FORCE_SPARSE
@@ -168,6 +182,12 @@ inline int32_t fieldSortSeedBudgetPerMilleForTests = []() {
 // query and per-segment density policy admit it.
 inline bool disableTopKCountComposition =
     std::getenv("LUXIR_DISABLE_TOPK_COUNT_COMPOSITION") != nullptr;
+
+// A/B baseline for bounded hit counts. The default counts a bounded total
+// with an unscored pass that stops once the total passes the limit, and ranks
+// with competitive pruning from the first page.
+inline bool disableBoundedCountSplit =
+    std::getenv("LUXIR_DISABLE_BOUNDED_COUNT_SPLIT") != nullptr;
 
 // Test/bench control (LUXIR_FACET_COUNTER). AUTO uses the selector; the rest
 // force a specific representation so the grid can compare reps head to head and

@@ -1,6 +1,8 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
+#include "test/TestUtils.h"
 #include "luxir/reader/FieldReader.h"
 #include <algorithm>
 #include <array>
@@ -165,10 +167,10 @@ protected:
                                    std::string_view term = "hot") {
     ASSERT_FALSE(tfs.empty());
     ASSERT_EQ(norms.size(), tfs.size());
-    PostingsWriter postingsWriter(dir, 0, (int32_t) tfs.size() + Postings::DOCS_BLOCK_SIZE + 100);
+    PostingsWriter postingsWriter(dir, 0, 1, (int32_t) tfs.size() + Postings::DOCS_BLOCK_SIZE + 100);
     {
       TextWriter writer(postingsWriter);
-      auto& finfo = postingsWriter.addField("f");
+      auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
       finfo.type = FieldType::TEXT;
       finfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
       writer.startField(&finfo);
@@ -182,6 +184,7 @@ protected:
       writer.endTerm(tref);
       writer.endField();
     }
+    luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
   }
 
@@ -369,10 +372,10 @@ protected:
     }
 
     std::vector<uint8_t> norms((size_t) maxDoc, 1);
-    PostingsWriter postingsWriter(dir, 0, maxDoc);
+    PostingsWriter postingsWriter(dir, 0, 1, maxDoc);
     {
       TextWriter writer(postingsWriter);
-      auto& finfo = postingsWriter.addField("f");
+      auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
       finfo.type = FieldType::TEXT;
       finfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
       writer.startField(&finfo);
@@ -391,6 +394,7 @@ protected:
       }
       writer.endField();
     }
+    luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
   }
 
@@ -446,10 +450,10 @@ protected:
   void writeRawSingleTerm(RAMDir& dir, MemPool& pool, std::string_view term,
                           const std::vector<int32_t>& docs) {
     ASSERT_FALSE(docs.empty());
-    PostingsWriter postingsWriter(dir, 0, docs.back() + Postings::DOCS_BLOCK_SIZE + 100);
+    PostingsWriter postingsWriter(dir, 0, 1, docs.back() + Postings::DOCS_BLOCK_SIZE + 100);
     {
       TextWriter writer(postingsWriter);
-      auto& finfo = postingsWriter.addField("f");
+      auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
       finfo.type = FieldType::TEXT;
       finfo.flags = FieldType::INDEX_DOCS_FREQS;
       writer.startField(&finfo);
@@ -462,6 +466,7 @@ protected:
       writer.endTerm(tref);
       writer.endField();
     }
+    luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
   }
 
@@ -548,10 +553,10 @@ protected:
                              const DocsEnumMeta::ImpactFrontiers* expectedGroupFrontiers = nullptr) {
     RAMDir dir;
     MemPool pool;
-    PostingsWriter postingsWriter(dir, 0, numDocs + Postings::DOCS_BLOCK_SIZE + 100);
+    PostingsWriter postingsWriter(dir, 0, 1, numDocs + Postings::DOCS_BLOCK_SIZE + 100);
     {
       TextWriter writer(postingsWriter);
-      auto& finfo = postingsWriter.addField("f");
+      auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
       finfo.type = FieldType::TEXT;
       finfo.flags = flags;
       writer.startField(&finfo);
@@ -571,9 +576,11 @@ protected:
       writer.endTerm(nextTerm);
       writer.endField();
     }
+    luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
 
-    PostingsReader reader(dir, 0);
+    SegmentCore readerCore(dir, 0, 1);
+    auto& reader = readerCore.rootReader();
     FieldReader fieldReader(reader);
     ASSERT_TRUE(fieldReader.readNextField()) << label;
     SegFieldInfo fieldInfo;
@@ -739,10 +746,10 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
   const int32_t N = DocsEnumMeta::L1_DOCS + Postings::DOCS_BLOCK_SIZE + 13;
   RAMDir dir;
   MemPool pool;
-  PostingsWriter postingsWriter(dir, 0, N + Postings::DOCS_BLOCK_SIZE + 100);
+  PostingsWriter postingsWriter(dir, 0, 1, N + Postings::DOCS_BLOCK_SIZE + 100);
   {
     TextWriter writer(postingsWriter);
-    auto& finfo = postingsWriter.addField("f");
+    auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
     finfo.type = FieldType::TEXT;
     finfo.flags = FieldType::INDEX_DOCS;
     writer.startField(&finfo);
@@ -762,9 +769,11 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
     writer.endTerm(zzz);
     writer.endField();
   }
+  luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -875,7 +884,8 @@ TEST_F(DocsEnumAdvanceTest, docsTierAdvanceProbesWordBlocksWithoutDecoding) {
   MemPool pool;
   writeRawSingleTerm(dir, pool, "wordprobe", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -912,7 +922,8 @@ TEST_F(DocsEnumAdvanceTest, docsTierNextDocWalksResidentWordBlock) {
   MemPool pool;
   writeRawSingleTerm(dir, pool, "wordprobe", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -949,7 +960,8 @@ TEST_F(DocsEnumAdvanceTest, docsTierBitsetBlockWithZeroPopcountTailByteDoesNotOv
   MemPool pool;
   writeRawSingleTerm(dir, pool, "tailzero", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -973,7 +985,8 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetUsesResidentWordBlockAndStopsInsideWindow)
   MemPool pool;
   writeRawSingleTerm(dir, pool, "wordprobe", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1013,7 +1026,8 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetPackedScatterClipsAndCrossesWords) {
   MemPool pool;
   writeRawSingleTerm(dir, pool, "packedscatter", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1057,7 +1071,8 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleWordBlockStaysResidentAcrossWindow
   MemPool pool;
   writeRawSingleTerm(dir, pool, "wordprobe", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1097,7 +1112,8 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetJumpsGapAfterResidentWordBlock) {
   MemPool pool;
   writeRawSingleTerm(dir, pool, "wordgap", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1137,7 +1153,8 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetFirstStraddleWithNoEmitDoesNotConsume) {
   MemPool pool;
   writeRawSingleTerm(dir, pool, "gapword", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1185,7 +1202,8 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetPackedStraddleWithNoEmitDoesNotConsume) {
   MemPool pool;
   writeRawSingleTerm(dir, pool, "packedgap", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1225,7 +1243,8 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleContiguousBlockReachesBlockBoundar
   MemPool pool;
   writeRawSingleTerm(dir, pool, "runprobe", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1261,7 +1280,8 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleKeepsFreqStreamAlignedForFollowing
   MemPool pool;
   writeRawSingleTerm(dir, pool, "mixedprobe", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1309,7 +1329,8 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetRandomPartitionsMatchNextDocOracle) {
   MemPool pool;
   writeRawSingleTerm(dir, pool, "mixedprobe", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1359,7 +1380,8 @@ TEST_F(DocsEnumAdvanceTest, advanceAndIntoBitSetProbeContiguousRuns) {
   MemPool pool;
   writeRawSingleTerm(dir, pool, "runprobe", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1399,7 +1421,8 @@ TEST_F(DocsEnumAdvanceTest, residentDocsBlockPeekAndConsumeMaterializeSpan) {
   MemPool pool;
   writeRawSingleTerm(dir, pool, "wordprobe", docs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1438,7 +1461,8 @@ TEST_F(DocsEnumAdvanceTest,
   RAMDir dir;
   MemPool pool;
   writeRawSingleTerm(dir, pool, "mixed", docs);
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   int32_t maxDoc = reader.maxDoc();
 
   RAMBitDocSet domain(maxDoc);
@@ -1488,7 +1512,8 @@ TEST_F(DocsEnumAdvanceTest,
   RAMDir dir;
   MemPool pool;
   writeRawSingleTerm(dir, pool, "mixed", docs);
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   int32_t maxDoc = reader.maxDoc();
 
   auto materialize = [&](DocSet* domain, bool identity = false) {
@@ -1677,7 +1702,8 @@ TEST_F(DocsEnumAdvanceTest, packedL1GroupFrontierRoundTripShapesAndWidths) {
     MemPool pool;
     writeRawPositionsImpactTerm(dir, pool, norms, tfs);
 
-    PostingsReader reader(dir, 0);
+    SegmentCore readerCore(dir, 0, 1);
+    auto& reader = readerCore.rootReader();
     FieldReader fieldReader(reader);
     ASSERT_TRUE(fieldReader.readNextField());
     SegFieldInfo fieldInfo;
@@ -1755,7 +1781,8 @@ TEST_F(DocsEnumAdvanceTest, packedL1SkipToBlockAcrossManyGroups) {
   MemPool pool;
   writeRawPositionsImpactTerm(dir, pool, norms, tfs);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1784,7 +1811,8 @@ TEST_F(DocsEnumAdvanceTest, l0CheckpointParityAndPositionTracking) {
   std::vector<CheckpointTermModel> models;
   writeCheckpointTerms(dir, pool, models);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -1923,7 +1951,8 @@ TEST_F(DocsEnumAdvanceTest, l0CheckpointEngagementAndKillSwitch) {
   std::vector<CheckpointTermModel> models;
   writeCheckpointTerms(dir, pool, models);
 
-  PostingsReader reader(dir, 0);
+  SegmentCore readerCore(dir, 0, 1);
+  auto& reader = readerCore.rootReader();
   FieldReader fieldReader(reader);
   ASSERT_TRUE(fieldReader.readNextField());
   SegFieldInfo fieldInfo;
@@ -2005,12 +2034,12 @@ TEST_F(DocsEnumAdvanceTest, wrongSegmentMagicIsRejected) {
   MemPool pool;
   writeRawSingleTerm(dir, pool, "hot", {0, 7, 19, 43});
 
-  std::string segName = Postings::getIndexFileName(Postings::getSortableString(0), 0);
+  std::string segName = Postings::getIndexFileName(Postings::segmentKey(0, 1), 0);
   auto input = dir.openFile(segName);
   ASSERT_NE(input, nullptr);
   std::string bytes(input->read());
   ASSERT_GE(bytes.size(), Postings::LUXIR_HEADER.size());
-  memcpy(bytes.data(), "LUXIR000", Postings::LUXIR_HEADER.size());
+  bytes[Postings::LUXIR_HEADER.size() - 1] ^= 1;
 
   ASSERT_TRUE(dir.deleteFile(segName));
   auto outFile = dir.createFile(segName);
@@ -2019,7 +2048,7 @@ TEST_F(DocsEnumAdvanceTest, wrongSegmentMagicIsRejected) {
   out.close();
   dir.finishFile(*outFile);
 
-  EXPECT_THROW({ PostingsReader reader(dir, 0); }, std::runtime_error);
+  EXPECT_THROW({ SegmentCore readerCore(dir, 0, 1); }, std::runtime_error);
 }
 
 // Position reads after far advances must land exactly where sequential decoding

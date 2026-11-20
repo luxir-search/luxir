@@ -74,7 +74,7 @@ void emitPage(const CollapsedPageSettings& settings,
       auto clauses = settings.headSort->clauses;
       if (clauses.empty()) clauses.emplace_back(SortClause::SCORE, SortField::DESC);
       headCollector = std::make_unique<FieldSortCollector>(
-          (int64_t)size, clauses, qr.req.reader.get(),
+          (int64_t)size, clauses, qr.view.get(),
           settings.getScores || settings.headSort->rankNeedsScores);
       heads.resize(size);
     }
@@ -87,7 +87,7 @@ void emitPage(const CollapsedPageSettings& settings,
     }
     auto produce = [&]<bool Identity>(size_t segnum, std::span<const CollapseKey> keys,
                        size_t begin, DocSet* eligibility, auto&& accept) {
-      auto& segment = qr.req.reader->segments()[segnum];
+      auto& segment = qr.view->segments()[segnum];
       auto release = scope_guard([&]() noexcept {
         if constexpr (!Identity) {
           if (settings.releaseSegment) settings.releaseSegment(qr, segment);
@@ -118,7 +118,7 @@ void emitPage(const CollapsedPageSettings& settings,
       }
     };
     if (settings.groupOps.empty()) {
-      if (ordinary) for (size_t segnum = 0; segnum < qr.req.reader->segments().size(); segnum++) {
+      if (ordinary) for (size_t segnum = 0; segnum < qr.view->segments().size(); segnum++) {
         produce.template operator()<false>(segnum, page->keys, 0,
             settings.domains[segnum].get(), [](size_t, int32_t) {});
       }
@@ -136,7 +136,7 @@ void emitPage(const CollapsedPageSettings& settings,
       // once per child/bucket. The executor bounds binding and domain state.
       auto domains = [&]<bool Identity>(size_t segnum, auto block,
                          const DomainHandle& eligibility, FacetBucketFeed feed) {
-        int32_t maxDoc = qr.req.reader->segments()[segnum].maxDoc();
+        int32_t maxDoc = qr.view->segments()[segnum].maxDoc();
         feedFacetBucketDomainChunks(maxDoc, block,
             FACET_BUCKET_DOMAIN_BYTES, feed, [&](auto chunk) {
               std::pmr::vector<std::pmr::vector<int32_t>> docs(&page->resource);
@@ -163,21 +163,21 @@ void emitPage(const CollapsedPageSettings& settings,
                 if constexpr (Identity) {
                   DocSetBuilder builder(maxDoc);
                   for (int32_t doc : members) builder.add(doc);
-                  result.emplace_back(builder.build());
+                  result.push_back(DomainHandle(builder.build()).scoped(qr.view->segments()[segnum]));
                 } else {
                   auto charge = std::make_shared<DomainVariantPlan::DomainCharge>(
                       qr.req.memoryTracker, sizeof(ArrDocSet) + members.size() * sizeof(int32_t),
                       "group bucket domain", "collapse member state");
                   result.push_back(DomainHandle(std::make_unique<ArrDocSet>(
                       std::vector<int32_t>(members.begin(), members.end())))
-                      .chargedWith(std::move(charge)));
+                      .scoped(qr.view->segments()[segnum]).chargedWith(std::move(charge)));
                 }
               }
               return result;
             });
       };
       FacetBucketBlockExecutor::execute<size_t>(calc, children, buckets,
-          *qr.req.reader, FacetBucketProducer::JOINT,
+          *qr.view, FacetBucketProducer::JOINT,
           [&](size_t segnum, auto block, FacetBucketFeed feed) {
             domains.template operator()<false>(segnum, block,
                 settings.domains[segnum], feed);
@@ -218,7 +218,7 @@ void emitPage(const CollapsedPageSettings& settings,
       }
     }
     auto* keys = build::allocArray(table.keys, (size_t)(end - begin), mr);
-    int64_t* counts = page && settings.spec.get_number
+    int64_t* counts = page && settings.spec.get_count
         ? build::allocArray(table.counts, (size_t)(end - begin), mr) : nullptr;
     luxir::api::ArrVal* ranks = settings.getScores
         && (metricOrder || settings.alwaysRank || (page && settings.headSort))
@@ -230,15 +230,20 @@ void emitPage(const CollapsedPageSettings& settings,
           keyAt((size_t)rank.slot), mr, pool);
       size_t slot = (size_t)(i - offset);
       if (counts) counts[i - begin] = page->counts[slot];
-      if constexpr (metricOrder) {
-        if (ranks) collector.emitRank(ranks[i - begin], rank.slot, mr);
-      } else if (ranks && (settings.alwaysRank || page->heads[slot] != rank.doc)) {
-        emitCollapseRank(ranks[i - begin], settings.sort,
-            *qr.req.reader, rank.doc, rank.score, mr);
+      if constexpr (!metricOrder) {
+        if (ranks && (settings.alwaysRank || page->heads[slot] != rank.doc)) {
+          emitCollapseRank(ranks[i - begin], settings.sort,
+              *qr.view, rank.doc, rank.score, mr);
+        }
       }
     }
+    settings.collapse.renderKeys(table.keys, qr.flags, mr);
+    if (ranks) {
+      if constexpr (metricOrder) collector.renderRanks(table.ranks, scoreDocs.subspan((size_t)begin, (size_t)(end - begin)), qr.flags, mr);
+      else renderSortRanks(table.ranks, settings.sort, qr.flags, mr);
+    }
   };
-  emitDocsResponse(qr.req, getDocList,
+  emitDocsResponse(qr.req, *qr.view, qr.flags, getDocList,
     (int64_t)scoreDocs.size(),
     [scoreDocs, page, offset](int64_t i) {
       return page ? page->heads[(size_t)(i - offset)] : scoreDocs[(size_t)i].doc;
@@ -248,13 +253,13 @@ void emitPage(const CollapsedPageSettings& settings,
     },
     groupCount, settings.fields,
     settings.batchSize, settings.offset,
-    settings.getNumber, settings.getScores,
-    settings.documentFormat, emission, std::move(metadata));
+    settings.emitCount, settings.getScores,
+    settings.documentFormat, emission, std::move(metadata), false, false, {}, qr.decorators);
 }
 CollapsedPageSettings pageSettings(TopDocsReq& op, TopDocsReq::CalcBase& calc) {
   return {op, *op.collapse, *op.topDocsProto.collapse, op.sortPlan,
       op.headSort, op.groupOps, op.topDocsProto.fields, op.topDocsProto.batch_size,
-      op.topDocsProto.offset, op.topDocsProto.get_number, op.topDocsProto.get_scores,
+      op.topDocsProto.offset, op.requirements.needsCount(), op.topDocsProto.get_scores,
       op.topDocsProto.document_format,
       calc.memberReplay ? (calc.preparedWeight
           ? static_cast<Query::SegmentSource*>(calc.preparedWeight.get()) : op.weight) : nullptr,
@@ -279,7 +284,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
       docListProto.offset = qr.topDocsProto.offset;
       // found is opt-in (see emitDocsResponse): only populate it when the
       // count was requested, so an empty index matches the non-empty contract.
-      if (qr.topDocsProto.get_number) {
+      if (qr.requirements.needsCount()) {
         docListProto.found = 0;
         if (qr.collapse != nullptr) docListProto.found_docs = 0;
         if (qr.diversify != nullptr) docListProto.found_groups = 0;
@@ -294,6 +299,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
     };
     DocEmission emission = calc.underBucketSlot()
         ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM;
+    auto extra = qr.rowColumns();
 
     if (qr.diversify != nullptr) {
       fillDiversifyResponse(calc, *mergeableCollector);
@@ -305,7 +311,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
     } else if (mergeableCollector->useFieldSort) {
       auto& collector = *mergeableCollector->fieldCollector;
       auto sortDocs = collector.sort();
-      emitDocsResponse(qr.req, getDocList,
+      emitDocsResponse(qr.req, *qr.view, qr.flags, getDocList,
         (int64_t)sortDocs.size(),
         [sortDocs](int64_t i) { return sortDocs[i].doc; },
         [sortDocs](int64_t i) { return sortDocs[i].score; },
@@ -313,25 +319,38 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.topDocsProto.fields,
         qr.topDocsProto.batch_size,
         qr.topDocsProto.offset,
-        qr.topDocsProto.get_number,
+        qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission);
+        emission, {}, false, false, extra, qr.decorators);
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();
-      emitDocsResponse(qr.req, getDocList,
+      // Opening the threshold alone does not invalidate an exhaustive count.
+      int64_t found = collector.totalHits();
+      bool foundGte = qr.boundedCount && collector.countIncomplete;
+      bool foundEstimated = false;
+      if (foundGte && qr.estimateCount) {
+        // Ranking pruned somewhere, so the segments' shares are the answer. All
+        // of them can still be exact, from metadata or a full count.
+        found = std::max(collector.estimatedHits, qr.requirements.countLimit);
+        foundEstimated = collector.countEstimated;
+        foundGte = !foundEstimated && collector.countFloored;
+      } else if (foundGte) {
+        found = qr.requirements.countLimit;
+      }
+      emitDocsResponse(qr.req, *qr.view, qr.flags, getDocList,
         (int64_t)scoreDocs.size(),
         [scoreDocs](int64_t i) { return scoreDocs[i].doc; },
         [scoreDocs](int64_t i) { return scoreDocs[i].score; },
-        collector.totalHits(),
+        found,
         qr.topDocsProto.fields,
         qr.topDocsProto.batch_size,
         qr.topDocsProto.offset,
-        qr.topDocsProto.get_number,
+        qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission);
+        emission, {}, foundGte, foundEstimated, extra, qr.decorators);
     }
   }
 
@@ -341,7 +360,7 @@ void TopDocsReq::fillMetricGroupResponse(CalcBase& calc) {
   else {
     auto& list = *calc.slotArm<api::DocList>(nullptr);
     list.offset = topDocsProto.offset;
-    if (topDocsProto.get_number) { list.found = 0; list.found_docs = 0; }
+    if (requirements.needsCount()) { list.found = 0; list.found_docs = 0; }
   }
 }
 }  // namespace luxir

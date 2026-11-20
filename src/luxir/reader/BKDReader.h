@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include "luxir/reader/SegmentCore.h"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -18,6 +20,7 @@
 #include "PostingsReader.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/index/BKDWriter.h"
+#include "luxir/util/MemPool.h"
 #include "luxir/util/geo.h"
 
 namespace luxir {
@@ -43,17 +46,27 @@ inline BKDLongitudeRelation compareBKDLongitudeInterval(
   return {insideUpper || insideLower, disjointUpper && disjointLower};
 }
 
+// One box matches() in the planner's point emissions (Query::Demand):
+// GeoBM's box test takes 0.43-0.54 ns per point (release, 2026-11-03), and a
+// forced BKD box emits a point in 0.69 ns (GeoPointSource.h, CROSSING_POINTS).
+inline constexpr double BOX_TEST_POINTS = 0.7;
+
+// What one point test costs beyond a box test, in point emissions: exact for
+// a point beside the boundary, as in a crossing BKD leaf, and average over
+// the relation's box. quoted says the price is measured, so a verifier may
+// quote it to the planner.
+struct BKDPointCost {
+  double exact = 0.0;
+  double average = 0.0;
+  bool quoted = true;
+};
+
 // Inclusive encoded-space box. Reversed longitude bounds describe one
 // wrapped interval and are evaluated as two arms inside one traversal.
-struct BKDBoxRelation {
-  int32_t latMin;
-  int32_t latMax;
-  int32_t lonMin;
-  int32_t lonMax;
-
+struct BKDBoxRelation : geo::EncodedBox {
   BKDBoxRelation(int32_t latMin, int32_t latMax, int32_t lonMin,
                  int32_t lonMax)
-      : latMin(latMin), latMax(latMax), lonMin(lonMin), lonMax(lonMax) {
+      : geo::EncodedBox(geo::EncodedBox::fromEncoded(latMin, latMax, lonMin, lonMax)) {
     if (latMax < latMin) {
       throw std::invalid_argument("BKDBoxRelation: latitude bounds are reversed");
     }
@@ -74,9 +87,11 @@ struct BKDBoxRelation {
   }
 
   bool matches(int32_t lat, int32_t lon) const {
-    return latMin <= lat && lat <= latMax
-        && geo::longitudeInRange(lon, lonMin, lonMax);
+    return contains(lat, lon);
   }
+
+  // The box test is the unit the other relations' tests are priced in.
+  BKDPointCost pointCost() const { return {}; }
 };
 
 struct BKDDistanceRelation {
@@ -177,29 +192,313 @@ public:
     return pointSortKey(geo::decodeLatitude(lat), geo::decodeLongitude(lon))
         <= sortKey;
   }
+
+  // Priced like a box test and not quoted: its verification is not measured.
+  BKDPointCost pointCost() const { return {0.0, 0.0, false}; }
 };
 
-class BKDReader {
+// A relation's answers precomputed on a grid of at most 64 x 64 cells over an
+// encoded box, as in Lucene's GeoEncodingUtils, so most point tests are one
+// lookup. Each cell holds the relation's own compare() of it, so a lookup
+// answers like the relation's exact test for any point of the cell, and only
+// CROSSES cells need that test.
+struct BKDRelationGrid {
+  static constexpr uint32_t ARITY = 64;
+
+  std::span<const BKDRelation> cells;  // row-major, rows by latitude
+  uint32_t latBase = 0;                // first row's biased latitude >> latShift
+  uint32_t lonBase = 0;
+  int32_t latShift = 0;
+  int32_t lonShift = 0;
+  uint32_t latCells = 0;
+  uint32_t lonCells = 0;
+
+  // The cell holding a point of the box the grid was built over.
+  BKDRelation at(int32_t lat, int32_t lon) const {
+    uint32_t row = (biased(lat) >> latShift) - latBase;
+    uint32_t column = (biased(lon) >> lonShift) - lonBase;
+    return cells[(size_t)row * lonCells + column];
+  }
+
+  // The share of cells that are CROSSES.
+  double crossShare() const {
+    if (cells.empty()) return 0.0;
+    auto crosses = std::ranges::count(cells, BKDRelation::CROSSES);
+    return (double)crosses / (double)cells.size();
+  }
+
+  // The encoded box {latMin, latMax, lonMin, lonMax} of the block of cells
+  // from (row, column) spanning rows x columns.
+  std::array<int32_t, 4> blockBox(uint32_t row, uint32_t column, uint32_t rows,
+                                  uint32_t columns) const {
+    uint64_t lat = (uint64_t)(latBase + row) << latShift;
+    uint64_t lon = (uint64_t)(lonBase + column) << lonShift;
+    return {unbiased(lat), unbiased(lat + ((uint64_t)rows << latShift) - 1),
+            unbiased(lon), unbiased(lon + ((uint64_t)columns << lonShift) - 1)};
+  }
+
+  // Grid over the inclusive encoded box, which must not be empty or wrap.
+  template <class Relation>
+  static BKDRelationGrid build(MemPool& pool, const Relation& relation,
+                               int32_t latMin, int32_t latMax,
+                               int32_t lonMin, int32_t lonMax) {
+    BKDRelationGrid grid;
+    grid.latShift = shiftFor(biased(latMin), biased(latMax));
+    grid.lonShift = shiftFor(biased(lonMin), biased(lonMax));
+    grid.latBase = biased(latMin) >> grid.latShift;
+    grid.lonBase = biased(lonMin) >> grid.lonShift;
+    grid.latCells = (biased(latMax) >> grid.latShift) - grid.latBase + 1;
+    grid.lonCells = (biased(lonMax) >> grid.lonShift) - grid.lonBase + 1;
+    auto cells = pool.make_span<BKDRelation>((size_t)grid.latCells * grid.lonCells);
+    grid.fill(relation, cells, 0, 0, ARITY);
+    grid.cells = cells;
+    return grid;
+  }
+
+private:
+  // Compares the aligned size x size block at (row, column), clipped to the
+  // grid, and fills it when that answer holds for each of its cells, else
+  // splits it in four. A cell of a block that a bounding box rejects, or
+  // that no edge touches, gets the same answer from its own compare(), so
+  // the cells equal per-cell compares at a fraction of the calls.
+  template <class Relation>
+  void fill(const Relation& relation, std::span<BKDRelation> out, uint32_t row,
+            uint32_t column, uint32_t size) const {
+    if (row >= latCells || column >= lonCells) return;
+    uint32_t rows = std::min(size, latCells - row);
+    uint32_t columns = std::min(size, lonCells - column);
+    auto [cellLatMin, cellLatMax, cellLonMin, cellLonMax] =
+        blockBox(row, column, rows, columns);
+    BKDRelation answer =
+        relation.compare(cellLatMin, cellLatMax, cellLonMin, cellLonMax);
+    if (answer != BKDRelation::CROSSES || size == 1) {
+      for (uint32_t r = row; r < row + rows; r++) {
+        std::fill_n(out.begin() + (ptrdiff_t)((size_t)r * lonCells + column), columns, answer);
+      }
+      return;
+    }
+    uint32_t half = size / 2;
+    fill(relation, out, row, column, half);
+    fill(relation, out, row, column + half, half);
+    fill(relation, out, row + half, column, half);
+    fill(relation, out, row + half, column + half, half);
+  }
+
+  // Encoded coordinates with the sign bit flipped, so unsigned order is
+  // coordinate order.
+  static uint32_t biased(int32_t value) { return (uint32_t)value ^ UINT32_C(0x80000000); }
+  static int32_t unbiased(uint64_t value) { return (int32_t)((uint32_t)value ^ UINT32_C(0x80000000)); }
+
+  // The smallest shift that maps [min, max] onto at most ARITY cells.
+  static int32_t shiftFor(uint32_t min, uint32_t max) {
+    int32_t shift = 0;
+    while ((max >> shift) - (min >> shift) >= ARITY) shift++;
+    return shift;
+  }
+};
+
+// A union of polygons over decoded point coordinates (see geo::Polygon). A
+// cell is INSIDE when one polygon holds all of it, OUTSIDE when every polygon
+// misses it, and CROSSES otherwise. Against one polygon, a cell outside its
+// bounding box is OUTSIDE; otherwise a cell that no ring edge touches lies
+// wholly inside or wholly outside the polygon, and one corner decides which.
+// The cell is widened by a tiny margin for the edge test so rounding cannot
+// call a cell INSIDE while a point in it tests outside. A point test looks up
+// the relation's grid first and runs the edge trees only in CROSSES cells.
+// build() makes the trees and the grid once per query, in flat pool arrays,
+// so copies of the relation share them.
+struct BKDPolygonRelation {
+  static constexpr double EDGE_MARGIN = 1e-9;
+
+  // One polygon and its bounding box in encoded space.
+  struct Part {
+    geo::Polygon polygon;
+    int32_t latMin;
+    int32_t latMax;
+    int32_t lonMin;
+    int32_t lonMax;
+
+    static Part of(const geo::Polygon& polygon) {
+      return {polygon,
+              geo::encodeLatitudeCeil(polygon.box.minLat),
+              geo::encodeLatitude(polygon.box.maxLat),
+              geo::encodeLongitudeCeil(polygon.box.minLon),
+              geo::encodeLongitude(polygon.box.maxLon)};
+    }
+
+    BKDRelation compare(int32_t cellLatMin, int32_t cellLatMax,
+                        int32_t cellLonMin, int32_t cellLonMax) const {
+      if (cellLatMax < latMin || latMax < cellLatMin
+          || cellLonMax < lonMin || lonMax < cellLonMin) {
+        return BKDRelation::OUTSIDE;
+      }
+      double minLat = geo::decodeLatitude(cellLatMin);
+      double maxLat = geo::decodeLatitude(cellLatMax);
+      double minLon = geo::decodeLongitude(cellLonMin);
+      double maxLon = geo::decodeLongitude(cellLonMax);
+      if (polygon.edgeTouches(minLat - EDGE_MARGIN, maxLat + EDGE_MARGIN,
+                              minLon - EDGE_MARGIN, maxLon + EDGE_MARGIN)) {
+        return BKDRelation::CROSSES;
+      }
+      return polygon.contains(minLat, minLon)
+          ? BKDRelation::INSIDE : BKDRelation::OUTSIDE;
+    }
+
+    bool matches(int32_t lat, int32_t lon) const {
+      return latMin <= lat && lat <= latMax && lonMin <= lon && lon <= lonMax
+          && polygon.contains(geo::decodeLatitude(lat),
+                              geo::decodeLongitude(lon));
+    }
+  };
+
+  std::span<const Part> parts;
+  // The encoded bounding box of every part.
+  int32_t latMin = std::numeric_limits<int32_t>::max();
+  int32_t latMax = std::numeric_limits<int32_t>::min();
+  int32_t lonMin = std::numeric_limits<int32_t>::max();
+  int32_t lonMax = std::numeric_limits<int32_t>::min();
+  BKDRelationGrid grid;
+  BKDPointCost cost;
+
+  // The trees and grid live in pool, which must outlive the relation and its
+  // copies; the rings may go once this returns.
+  static BKDPolygonRelation build(MemPool& pool,
+                                  std::span<const geo::PolygonRings> polygons) {
+    auto tree = [&pool](std::span<const geo::LatLon> ring) {
+      return geo::EdgeTree::build(ring, pool.make_span<geo::Edge>(ring.size()));
+    };
+    auto parts = pool.make_span<Part>(polygons.size());
+    for (size_t i = 0; i < polygons.size(); i++) {
+      auto holes = pool.make_span<geo::EdgeTree>(polygons[i].holes.size());
+      for (size_t h = 0; h < holes.size(); h++) holes[h] = tree(polygons[i].holes[h]);
+      parts[i] = Part::of(geo::Polygon::of(tree(polygons[i].outer), holes));
+    }
+    BKDPolygonRelation relation(parts);
+    if (relation.latMin <= relation.latMax && relation.lonMin <= relation.lonMax) {
+      relation.grid = BKDRelationGrid::build(pool, relation, relation.latMin,
+                                             relation.latMax, relation.lonMin,
+                                             relation.lonMax);
+    }
+    relation.cost = relation.pointCostOf(relation.grid.crossShare());
+    return relation;
+  }
+
+  BKDRelation compare(int32_t cellLatMin, int32_t cellLatMax,
+                      int32_t cellLonMin, int32_t cellLonMax) const {
+    if (cellLatMax < latMin || latMax < cellLatMin
+        || cellLonMax < lonMin || lonMax < cellLonMin) {
+      return BKDRelation::OUTSIDE;
+    }
+    bool crosses = false;
+    for (const Part& part : parts) {
+      BKDRelation relation =
+          part.compare(cellLatMin, cellLatMax, cellLonMin, cellLonMax);
+      if (relation == BKDRelation::INSIDE) return relation;
+      crosses |= relation == BKDRelation::CROSSES;
+    }
+    return crosses ? BKDRelation::CROSSES : BKDRelation::OUTSIDE;
+  }
+
+  bool matches(int32_t lat, int32_t lon) const {
+    if (lat < latMin || latMax < lat || lon < lonMin || lonMax < lon) {
+      return false;
+    }
+    BKDRelation cell = grid.at(lat, lon);
+    if (cell != BKDRelation::CROSSES) return cell == BKDRelation::INSIDE;
+    return std::ranges::any_of(parts, [lat, lon](const Part& part) {
+      return part.matches(lat, lon);
+    });
+  }
+
+  BKDPointCost pointCost() const { return cost; }
+
+private:
+  explicit BKDPolygonRelation(std::span<const Part> parts) : parts(parts) {
+    for (const Part& part : parts) {
+      latMin = std::min(latMin, part.latMin);
+      latMax = std::max(latMax, part.latMax);
+      lonMin = std::min(lonMin, part.lonMin);
+      lonMax = std::max(lonMax, part.lonMax);
+    }
+  }
+
+  // One ring walk: a root-to-leaf descent, about log2 V nodes, for each edge
+  // spanning the point's latitude, which averages the ring's summed edge
+  // latitude extents over its own. Lucene's EdgeTree bound is O(k log V).
+  static double walkNodes(const geo::EdgeTree& tree) {
+    double low = tree.edges.front().low;
+    double high = low;
+    double spans = 0.0;
+    for (const geo::Edge& edge : tree.edges) {
+      high = std::max({high, edge.lat1, edge.lat2});
+      spans += std::abs(edge.lat1 - edge.lat2);
+    }
+    double stabbed = high > low ? spans / (high - low) : 0.0;
+    return (1.0 + stabbed) * std::log2((double)tree.edges.size() + 1.0);
+  }
+
+  static double boxArea(int32_t latLow, int32_t latHigh, int32_t lonLow, int32_t lonHigh) {
+    if (latHigh < latLow || lonHigh < lonLow) return 0.0;
+    return ((double)latHigh - latLow + 1.0) * ((double)lonHigh - lonLow + 1.0);
+  }
+
+  // The model counts in half box tests: two box tests for the box and grid
+  // lookups, one per part's box check, and 3 per walked node. A point walks
+  // the parts whose box holds it, so each part's walks are weighted by its
+  // box's share of the union box; a point beside a boundary is in at least
+  // one part's box, so the weights scale up to sum to at least one. That
+  // point lands in a crossing grid cell and pays the walks in full; a point
+  // anywhere in the box pays them in the grid's crossing share. Fitted on
+  // noisy circles of 100 to 100k vertices to within 25% of GeoBM's measured
+  // ratio to a box test (release, 2026-11-03).
+  BKDPointCost pointCostOf(double crossShare) const {
+    double area = boxArea(latMin, latMax, lonMin, lonMax);
+    double checks = 0.0;
+    double shares = 0.0;
+    double walks = 0.0;
+    for (const Part& part : parts) {
+      double share = area > 0.0
+          ? boxArea(part.latMin, part.latMax, part.lonMin, part.lonMax) / area : 0.0;
+      double nodes = walkNodes(part.polygon.outer);
+      for (const geo::EdgeTree& hole : part.polygon.holes) nodes += walkNodes(hole);
+      checks += 2.0;
+      shares += share;
+      walks += share * 3.0 * nodes;
+    }
+    if (shares > 0.0 && shares < 1.0) walks /= shares;
+    double crossing = checks + walks;
+    auto extra = [](double halves) { return (halves / 2.0 - 1.0) * BOX_TEST_POINTS; };
+    return {extra(4.0 + crossing), extra(4.0 + crossShare * crossing), true};
+  }
+};
+
+template <class PointTraits>
+class BasicBKDReader {
 public:
-  using InnerNode = BKDWriter::InnerNode;
+  using Scalar = typename PointTraits::Scalar;
+  using Unsigned = typename PointTraits::Unsigned;
+  using CoordinateCodec = typename PointTraits::CoordinateCodec;
+  using Writer = BasicBKDWriter<PointTraits>;
+  using InnerNode = typename Writer::InnerNode;
+  using LeafHeader = typename Writer::LeafHeader;
 
   struct LeafInfo {
     uint16_t count;
     uint8_t docCodec;
     uint8_t docBits;
-    uint8_t latBits;
-    uint8_t lonBits;
+    uint8_t bits0;
+    uint8_t bits1;
     uint32_t docBase;
     uint32_t docBytes;
-    int32_t latMin;
-    int32_t lonMin;
-    uint32_t latBytes;
-    uint32_t lonBytes;
+    Scalar min0;
+    Scalar min1;
+    uint32_t bytes0;
+    uint32_t bytes1;
   };
 
   struct Point {
-    int32_t lat;
-    int32_t lon;
+    Scalar dim0;
+    Scalar dim1;
     int32_t docid;
 
     bool operator==(const Point&) const = default;
@@ -212,22 +511,24 @@ public:
   struct EstimateResult {
     uint64_t estimatedCount;
     uint64_t upperBound;
+    // Points of the crossing leaves, which an intersection tests one by one.
+    uint64_t crossingPoints = 0;
   };
 
   struct Scratch {
     std::span<uint32_t> docs;
-    std::span<uint32_t> lat;
-    std::span<uint32_t> lon;
+    std::span<Unsigned> dim0;
+    std::span<Unsigned> dim1;
   };
 
 private:
   const char* points = nullptr;
   const char* fileEnd = nullptr;
   const char* innerNodeData = nullptr;
-  const char* minLatData = nullptr;
-  const char* maxLatData = nullptr;
-  const char* minLonData = nullptr;
-  const char* maxLonData = nullptr;
+  const char* min0Data = nullptr;
+  const char* max0Data = nullptr;
+  const char* min1Data = nullptr;
+  const char* max1Data = nullptr;
   const char* leafPointerData = nullptr;
   uint64_t pointsFileOffset = 0;
   uint64_t metaOffset = 0;
@@ -263,23 +564,23 @@ private:
     points = input.ptr((int64_t)pointsOff);
     fileEnd = input.ptr(input.size());
     const char* meta = points + metaOffset;
-    if ((uint64_t)(fileEnd - meta) < BKDWriter::FIXED_HEADER_SIZE) {
+    if ((uint64_t)(fileEnd - meta) < Writer::FIXED_HEADER_SIZE) {
       invalid("truncated metadata header");
     }
-    BKDWriter::FixedHeader header = load<BKDWriter::FixedHeader>(meta);
-    if (header.magic != BKDWriter::MAGIC) invalid("bad magic");
-    if (header.version != BKDWriter::VERSION) invalid("unsupported version");
-    if (header.formatKind != BKDWriter::FORMAT_KIND) {
+    auto header = load<typename Writer::FixedHeader>(meta);
+    if (header.magic != Writer::MAGIC) invalid("bad magic");
+    if (header.version != Writer::VERSION) invalid("unsupported version");
+    if (header.formatKind != Writer::FORMAT_KIND) {
       invalid("unsupported format kind");
     }
     if (header.reserved != 0x11) invalid("bad metadata reserved byte");
-    if (header.flags != BKDWriter::FLAGS) invalid("unsupported metadata flags");
+    if (header.flags != Writer::FLAGS) invalid("unsupported metadata flags");
     if (header.maxPointsPerLeaf == 0) {
       invalid("maxPointsPerLeaf must be positive");
     }
-    if (header.bytesPerDim != BKDWriter::BYTES_PER_DIM
-        || header.numIndexDims != BKDWriter::NUM_INDEX_DIMS
-        || header.numDataDims != BKDWriter::NUM_DATA_DIMS) {
+    if (header.bytesPerDim != Writer::BYTES_PER_DIM
+        || header.numIndexDims != Writer::NUM_INDEX_DIMS
+        || header.numDataDims != Writer::NUM_DATA_DIMS) {
       invalid("unsupported dimensions");
     }
     if (header.padding[0] != 0x11 || header.padding[1] != 0x11
@@ -299,14 +600,14 @@ private:
     }
 
     uint64_t directoryFileOffset = pointsFileOffset + metaOffset
-                                 + BKDWriter::FIXED_HEADER_SIZE;
+                                 + Writer::FIXED_HEADER_SIZE;
     if (directoryFileOffset < pointsFileOffset) invalid("metadata overflow");
     directoryFileOffset = (directoryFileOffset + 7) & ~(uint64_t)7;
     if (directoryFileOffset < pointsFileOffset) invalid("metadata overflow");
     uint64_t directoryOff = directoryFileOffset - pointsFileOffset;
     uint64_t innerBytes = (uint64_t)(leavesCount - 1)
-                        * sizeof(BKDWriter::InnerNode);
-    uint64_t boundsBytes = (uint64_t)leavesCount * sizeof(int32_t) * 4;
+                        * sizeof(InnerNode);
+    uint64_t boundsBytes = (uint64_t)leavesCount * sizeof(Scalar) * 4;
     uint64_t pointerBytes = ((uint64_t)leavesCount + 1) * sizeof(uint64_t);
     uint64_t directoryBytes = innerBytes + boundsBytes + pointerBytes;
     if (directoryOff > (uint64_t)(fileEnd - points)
@@ -315,11 +616,11 @@ private:
     }
     byteSize = directoryOff + directoryBytes;
     innerNodeData = points + directoryOff;
-    minLatData = innerNodeData + innerBytes;
-    maxLatData = minLatData + (uint64_t)leavesCount * sizeof(int32_t);
-    minLonData = maxLatData + (uint64_t)leavesCount * sizeof(int32_t);
-    maxLonData = minLonData + (uint64_t)leavesCount * sizeof(int32_t);
-    leafPointerData = maxLonData + (uint64_t)leavesCount * sizeof(int32_t);
+    min0Data = innerNodeData + innerBytes;
+    max0Data = min0Data + (uint64_t)leavesCount * sizeof(Scalar);
+    min1Data = max0Data + (uint64_t)leavesCount * sizeof(Scalar);
+    max1Data = min1Data + (uint64_t)leavesCount * sizeof(Scalar);
+    leafPointerData = max1Data + (uint64_t)leavesCount * sizeof(Scalar);
 
     if (leafFP(0) != 0) invalid("first leaf pointer must be zero");
     if (leafFP(leavesCount) != metaOffset) {
@@ -335,39 +636,39 @@ private:
   }
 
   void validateTree(uint32_t nodeId, uint32_t leaves,
-                    int32_t cellLatMin, int32_t cellLatMax,
-                    int32_t cellLonMin, int32_t cellLonMax) const {
+                    Scalar cell0Min, Scalar cell0Max,
+                    Scalar cell1Min, Scalar cell1Max) const {
     if (leaves == 1) return;
     InnerNode node = innerNode(nodeId);
     if (node.splitDim == 0) {
-      if (node.splitValue < cellLatMin || node.splitValue > cellLatMax) {
-        invalid("latitude split is outside its cell");
+      if (node.splitValue < cell0Min || node.splitValue > cell0Max) {
+        invalid("dimension 0 split is outside its cell");
       }
     } else {
-      if (node.splitValue < cellLonMin || node.splitValue > cellLonMax) {
-        invalid("longitude split is outside its cell");
+      if (node.splitValue < cell1Min || node.splitValue > cell1Max) {
+        invalid("dimension 1 split is outside its cell");
       }
     }
     uint32_t leftLeaves = numLeftLeaves(leaves);
     if (node.splitDim == 0) {
-      validateTree(nodeId * 2, leftLeaves, cellLatMin, node.splitValue,
-                   cellLonMin, cellLonMax);
+      validateTree(nodeId * 2, leftLeaves, cell0Min, node.splitValue,
+                   cell1Min, cell1Max);
       validateTree(nodeId * 2 + 1, leaves - leftLeaves, node.splitValue,
-                   cellLatMax, cellLonMin, cellLonMax);
+                   cell0Max, cell1Min, cell1Max);
     } else {
-      validateTree(nodeId * 2, leftLeaves, cellLatMin, cellLatMax,
-                   cellLonMin, node.splitValue);
-      validateTree(nodeId * 2 + 1, leaves - leftLeaves, cellLatMin,
-                   cellLatMax, node.splitValue, cellLonMax);
+      validateTree(nodeId * 2, leftLeaves, cell0Min, cell0Max,
+                   cell1Min, node.splitValue);
+      validateTree(nodeId * 2 + 1, leaves - leftLeaves, cell0Min,
+                   cell0Max, node.splitValue, cell1Max);
     }
   }
 
   void decodeDocids(uint32_t leafIndex, const LeafInfo& info,
                     std::span<uint32_t> docs) const {
-    const char* payload = points + leafFP(leafIndex) + BKDWriter::LEAF_HEADER_SIZE;
-    if (info.docCodec == BKDWriter::DOC_CONTIG) {
+    const char* payload = points + leafFP(leafIndex) + Writer::LEAF_HEADER_SIZE;
+    if (info.docCodec == Writer::DOC_CONTIG) {
       for (uint32_t i = 0; i < info.count; i++) docs[i] = info.docBase + i;
-    } else if (info.docCodec == BKDWriter::DOC_FOR) {
+    } else if (info.docCodec == Writer::DOC_FOR) {
       uint32_t read = IndexCodec::numericCodec.decodeWithMeta(
           payload, docs.data(), info.count, info.docBits);
       if (read != info.docBytes) invalid("FOR decoder byte length mismatch");
@@ -378,7 +679,7 @@ private:
         }
         docs[i] = (uint32_t)doc;
       }
-    } else if (info.docCodec == BKDWriter::DOC_BITSET) {
+    } else if (info.docCodec == Writer::DOC_BITSET) {
       uint32_t size = 0;
       uint32_t wordBase = info.docBase >> 6;
       uint32_t wordCount = info.docBytes / sizeof(uint64_t);
@@ -399,16 +700,16 @@ private:
   }
 
   void decodeCoordinates(uint32_t leafIndex, const LeafInfo& info,
-                         std::span<uint32_t> latResiduals,
-                         std::span<uint32_t> lonResiduals) const {
-    const char* latPayload = points + leafFP(leafIndex)
-                           + BKDWriter::LEAF_HEADER_SIZE + info.docBytes;
-    const char* lonPayload = latPayload + info.latBytes;
-    uint32_t latRead = IndexCodec::numericCodec.decodeWithMeta(
-        latPayload, latResiduals.data(), info.count, info.latBits);
-    uint32_t lonRead = IndexCodec::numericCodec.decodeWithMeta(
-        lonPayload, lonResiduals.data(), info.count, info.lonBits);
-    if (latRead != info.latBytes || lonRead != info.lonBytes) {
+                         std::span<Unsigned> dim0Residuals,
+                         std::span<Unsigned> dim1Residuals) const {
+    const char* dim0Payload = points + leafFP(leafIndex)
+                           + Writer::LEAF_HEADER_SIZE + info.docBytes;
+    const char* dim1Payload = dim0Payload + info.bytes0;
+    uint32_t dim0Read = CoordinateCodec::decode(
+        dim0Payload, info.count, info.bits0, dim0Residuals);
+    uint32_t dim1Read = CoordinateCodec::decode(
+        dim1Payload, info.count, info.bits1, dim1Residuals);
+    if (dim0Read != info.bytes0 || dim1Read != info.bytes1) {
       invalid("coordinate decoder byte length mismatch");
     }
   }
@@ -417,12 +718,12 @@ private:
   void emitLeafDocids(uint32_t leafIndex, const LeafInfo& info,
                       std::span<uint32_t> docScratch, EmitDoc& emitDoc,
                       EmitRun& emitRun, EmitWord& emitWord) const {
-    const char* payload = points + leafFP(leafIndex) + BKDWriter::LEAF_HEADER_SIZE;
-    if (info.docCodec == BKDWriter::DOC_CONTIG) {
+    const char* payload = points + leafFP(leafIndex) + Writer::LEAF_HEADER_SIZE;
+    if (info.docCodec == Writer::DOC_CONTIG) {
       emitRun((int32_t)info.docBase, (int32_t)(info.docBase + info.count));
       return;
     }
-    if (info.docCodec == BKDWriter::DOC_BITSET) {
+    if (info.docCodec == Writer::DOC_BITSET) {
       int32_t wordBase = (int32_t)(info.docBase >> 6);
       uint32_t wordCount = info.docBytes / sizeof(uint64_t);
       for (uint32_t i = 0; i < wordCount; i++) {
@@ -436,13 +737,13 @@ private:
   }
 
 public:
-  BKDReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) {
+  BasicBKDReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) {
     if (fieldInfo.pointsMetaOff == 0) invalid("points index is absent");
-    InputStream input = postingsReader.getInputStream(fieldInfo.pointsLoc.filenum());
+    InputStream input = postingsReader.core().getInputStream(fieldInfo.pointsLoc.filenum());
     init(input, fieldInfo.pointsLoc.offset(), fieldInfo.pointsMetaOff);
   }
 
-  BKDReader(const InputStream& input, uint64_t pointsOff,
+  BasicBKDReader(const InputStream& input, uint64_t pointsOff,
             int64_t pointsMetaOff) {
     init(input, pointsOff, pointsMetaOff);
   }
@@ -451,6 +752,19 @@ public:
   uint32_t leafCount() const { return leavesCount; }
   uint16_t maxPointsPerLeaf() const { return leafSizeMax; }
   uint64_t sizeInBytes() const { return byteSize; }
+
+  // Points in leaves [firstLeaf, firstLeaf + leaves). Every leaf but the
+  // last is full (the writer's partition; validate() checks it), so the
+  // population follows from leaf positions without reading leaf headers.
+  uint64_t leafRangePoints(uint32_t firstLeaf, uint32_t leaves) const {
+    if ((uint64_t)firstLeaf + leaves > leavesCount) {
+      throw std::out_of_range("BKDReader: leaf range");
+    }
+    uint64_t begin = (uint64_t)firstLeaf * leafSizeMax;
+    uint64_t end = std::min(pointsCount,
+                            ((uint64_t)firstLeaf + leaves) * leafSizeMax);
+    return end - begin;
+  }
 
   InnerNode innerNode(uint32_t nodeId) const {
     if (nodeId == 0 || nodeId >= leavesCount) {
@@ -465,24 +779,24 @@ public:
     return node;
   }
 
-  int32_t leafMinLat(uint32_t leafIndex) const {
+  Scalar leafMin0(uint32_t leafIndex) const {
     if (leafIndex >= leavesCount) throw std::out_of_range("BKDReader: leaf index");
-    return load<int32_t>(minLatData + (uint64_t)leafIndex * sizeof(int32_t));
+    return load<Scalar>(min0Data + (uint64_t)leafIndex * sizeof(Scalar));
   }
 
-  int32_t leafMaxLat(uint32_t leafIndex) const {
+  Scalar leafMax0(uint32_t leafIndex) const {
     if (leafIndex >= leavesCount) throw std::out_of_range("BKDReader: leaf index");
-    return load<int32_t>(maxLatData + (uint64_t)leafIndex * sizeof(int32_t));
+    return load<Scalar>(max0Data + (uint64_t)leafIndex * sizeof(Scalar));
   }
 
-  int32_t leafMinLon(uint32_t leafIndex) const {
+  Scalar leafMin1(uint32_t leafIndex) const {
     if (leafIndex >= leavesCount) throw std::out_of_range("BKDReader: leaf index");
-    return load<int32_t>(minLonData + (uint64_t)leafIndex * sizeof(int32_t));
+    return load<Scalar>(min1Data + (uint64_t)leafIndex * sizeof(Scalar));
   }
 
-  int32_t leafMaxLon(uint32_t leafIndex) const {
+  Scalar leafMax1(uint32_t leafIndex) const {
     if (leafIndex >= leavesCount) throw std::out_of_range("BKDReader: leaf index");
-    return load<int32_t>(maxLonData + (uint64_t)leafIndex * sizeof(int32_t));
+    return load<Scalar>(max1Data + (uint64_t)leafIndex * sizeof(Scalar));
   }
 
   uint64_t leafFP(uint32_t leafIndex) const {
@@ -498,34 +812,36 @@ public:
     uint64_t start = leafFP(leafIndex);
     uint64_t end = leafFP(leafIndex + 1);
     if (start >= end || end > metaOffset
-        || end - start < BKDWriter::LEAF_HEADER_SIZE) {
+        || end - start < Writer::LEAF_HEADER_SIZE) {
       invalid("invalid leaf extent");
     }
-    BKDWriter::LeafHeader header = load<BKDWriter::LeafHeader>(points + start);
-    uint64_t fixedPayload = (uint64_t)BKDWriter::LEAF_HEADER_SIZE
-                          + header.docBytes + header.latBytes;
+    LeafHeader header = load<LeafHeader>(points + start);
+    uint64_t fixedPayload = (uint64_t)Writer::LEAF_HEADER_SIZE
+                          + header.docBytes + header.bytes0;
     if (fixedPayload > end - start) invalid("leaf payload lengths exceed extent");
-    uint64_t lonBytes = end - start - fixedPayload;
-    if (lonBytes > std::numeric_limits<uint32_t>::max()) {
-      invalid("longitude payload exceeds uint32");
+    uint64_t bytes1 = end - start - fixedPayload;
+    if (bytes1 > std::numeric_limits<uint32_t>::max()) {
+      invalid("dimension 1 payload exceeds uint32");
     }
-    return {header.count, header.docCodec, header.docBits, header.latBits,
-            header.lonBits, header.docBase, header.docBytes, header.latMin,
-            header.lonMin, header.latBytes, (uint32_t)lonBytes};
+    return {header.count, header.docCodec, header.docBits, header.bits0,
+            header.bits1, header.docBase, header.docBytes, header.min0,
+            header.min1, header.bytes0, (uint32_t)bytes1};
   }
 
   void validate() const {
-    validateTree(1, leavesCount, INT32_MIN, INT32_MAX, INT32_MIN, INT32_MAX);
+    validateTree(1, leavesCount,
+                 std::numeric_limits<Scalar>::min(), std::numeric_limits<Scalar>::max(),
+                 std::numeric_limits<Scalar>::min(), std::numeric_limits<Scalar>::max());
     uint64_t countedPoints = 0;
     std::vector<uint32_t> docs(leafSizeMax);
-    std::vector<uint32_t> lat(leafSizeMax);
-    std::vector<uint32_t> lon(leafSizeMax);
+    std::vector<Unsigned> dim0(leafSizeMax);
+    std::vector<Unsigned> dim1(leafSizeMax);
     for (uint32_t i = 0; i < leavesCount; i++) {
       uint64_t start = leafFP(i);
       uint64_t end = leafFP(i + 1);
       if (start >= end) invalid("leaf pointers must be strictly increasing");
       if (end > metaOffset) invalid("leaf overlaps metadata");
-      if (leafMinLat(i) > leafMaxLat(i) || leafMinLon(i) > leafMaxLon(i)) {
+      if (leafMin0(i) > leafMax0(i) || leafMin1(i) > leafMax1(i)) {
         invalid("invalid tight leaf bounds");
       }
       LeafInfo info = leafInfo(i);
@@ -538,17 +854,18 @@ public:
       if (info.docBase > (uint32_t)std::numeric_limits<int32_t>::max()) {
         invalid("docBase exceeds int32");
       }
-      BKDWriter::LeafHeader raw = load<BKDWriter::LeafHeader>(points + start);
+      LeafHeader raw = load<LeafHeader>(points + start);
       if (raw.reserved != 0x1111 || raw.reserved2 != 0x11111111) {
         invalid("bad leaf reserved bytes");
       }
-      if (info.latMin != leafMinLat(i) || info.lonMin != leafMinLon(i)) {
+      if (info.min0 != leafMin0(i) || info.min1 != leafMin1(i)) {
         invalid("leaf minima do not match directory");
       }
-      if (info.latBits > 32 || info.lonBits > 32) {
-        invalid("coordinate bit width exceeds 32");
+      if (info.bits0 > std::numeric_limits<Unsigned>::digits
+          || info.bits1 > std::numeric_limits<Unsigned>::digits) {
+        invalid("coordinate bit width exceeds scalar width");
       }
-      if (info.docCodec == BKDWriter::DOC_CONTIG) {
+      if (info.docCodec == Writer::DOC_CONTIG) {
         if (info.docBits != 0 || info.docBytes != 0) {
           invalid("invalid CONTIG metadata");
         }
@@ -556,17 +873,17 @@ public:
             > (uint64_t)std::numeric_limits<int32_t>::max()) {
           invalid("CONTIG docids exceed int32");
         }
-      } else if (info.docCodec == BKDWriter::DOC_FOR) {
+      } else if (info.docCodec == Writer::DOC_FOR) {
         if (info.docBits > 31) invalid("FOR docBits exceeds 31");
         if (info.docBytes != LuxirSIMDFor::byteSize(info.count, info.docBits)) {
           invalid("invalid FOR byte length");
         }
-      } else if (info.docCodec == BKDWriter::DOC_BITSET) {
+      } else if (info.docCodec == Writer::DOC_BITSET) {
         if (info.docBits != 0) invalid("BITSET docBits must be zero");
         if (info.docBytes == 0 || info.docBytes % sizeof(uint64_t) != 0) {
           invalid("invalid BITSET byte length");
         }
-        const char* payload = points + start + BKDWriter::LEAF_HEADER_SIZE;
+        const char* payload = points + start + Writer::LEAF_HEADER_SIZE;
         uint32_t wordCount = info.docBytes / sizeof(uint64_t);
         uint64_t firstWord = load<uint64_t>(payload);
         uint32_t baseBit = info.docBase & 63;
@@ -600,9 +917,9 @@ public:
         invalid("reserved docid codec");
       }
 
-      uint64_t expectedLatBytes = LuxirSIMDFor::byteSize(info.count, info.latBits);
-      uint64_t expectedLonBytes = LuxirSIMDFor::byteSize(info.count, info.lonBits);
-      if (info.latBytes != expectedLatBytes || info.lonBytes != expectedLonBytes) {
+      uint64_t expected0Bytes = CoordinateCodec::byteSize(info.count, info.bits0);
+      uint64_t expected1Bytes = CoordinateCodec::byteSize(info.count, info.bits1);
+      if (info.bytes0 != expected0Bytes || info.bytes1 != expected1Bytes) {
         invalid("invalid coordinate payload length");
       }
       decodeDocids(i, info, docs);
@@ -610,21 +927,21 @@ public:
         if (docs[j] < docs[j - 1]) invalid("leaf docids are not ascending");
       }
       if (docs[0] != info.docBase) invalid("docBase is not the minimum docid");
-      decodeCoordinates(i, info, lat, lon);
-      int32_t actualMinLat = INT32_MAX;
-      int32_t actualMaxLat = INT32_MIN;
-      int32_t actualMinLon = INT32_MAX;
-      int32_t actualMaxLon = INT32_MIN;
+      decodeCoordinates(i, info, dim0, dim1);
+      Scalar actualMin0 = std::numeric_limits<Scalar>::max();
+      Scalar actualMax0 = std::numeric_limits<Scalar>::min();
+      Scalar actualMin1 = std::numeric_limits<Scalar>::max();
+      Scalar actualMax1 = std::numeric_limits<Scalar>::min();
       for (uint16_t j = 0; j < info.count; j++) {
-        int32_t decodedLat = (int32_t)((uint32_t)info.latMin + lat[j]);
-        int32_t decodedLon = (int32_t)((uint32_t)info.lonMin + lon[j]);
-        actualMinLat = std::min(actualMinLat, decodedLat);
-        actualMaxLat = std::max(actualMaxLat, decodedLat);
-        actualMinLon = std::min(actualMinLon, decodedLon);
-        actualMaxLon = std::max(actualMaxLon, decodedLon);
+        Scalar decoded0 = (Scalar)((Unsigned)info.min0 + dim0[j]);
+        Scalar decoded1 = (Scalar)((Unsigned)info.min1 + dim1[j]);
+        actualMin0 = std::min(actualMin0, decoded0);
+        actualMax0 = std::max(actualMax0, decoded0);
+        actualMin1 = std::min(actualMin1, decoded1);
+        actualMax1 = std::max(actualMax1, decoded1);
       }
-      if (actualMinLat != leafMinLat(i) || actualMaxLat != leafMaxLat(i)
-          || actualMinLon != leafMinLon(i) || actualMaxLon != leafMaxLon(i)) {
+      if (actualMin0 != leafMin0(i) || actualMax0 != leafMax0(i)
+          || actualMin1 != leafMin1(i) || actualMax1 != leafMax1(i)) {
         invalid("decoded coordinates do not match tight bounds");
       }
       if (std::numeric_limits<uint64_t>::max() - countedPoints < info.count) {
@@ -640,14 +957,14 @@ public:
   std::vector<Point> decodeLeaf(uint32_t leafIndex) const {
     LeafInfo info = leafInfo(leafIndex);
     std::vector<uint32_t> docs(info.count);
-    std::vector<uint32_t> lat(info.count);
-    std::vector<uint32_t> lon(info.count);
+    std::vector<Unsigned> dim0(info.count);
+    std::vector<Unsigned> dim1(info.count);
     decodeDocids(leafIndex, info, docs);
-    decodeCoordinates(leafIndex, info, lat, lon);
+    decodeCoordinates(leafIndex, info, dim0, dim1);
     std::vector<Point> result(info.count);
     for (uint16_t i = 0; i < info.count; i++) {
-      result[i] = {(int32_t)((uint32_t)info.latMin + lat[i]),
-                   (int32_t)((uint32_t)info.lonMin + lon[i]),
+      result[i] = {(Scalar)((Unsigned)info.min0 + dim0[i]),
+                   (Scalar)((Unsigned)info.min1 + dim1[i]),
                    (int32_t)docs[i]};
     }
     return result;
@@ -666,17 +983,17 @@ public:
   template <class Relation, class EmitDoc, class EmitRun, class EmitWord>
   void intersect(Relation&& relation, Scratch scratch, EmitDoc emitDoc,
                  EmitRun emitRun, EmitWord emitWord) const {
-    if (scratch.docs.size() < leafSizeMax || scratch.lat.size() < leafSizeMax
-        || scratch.lon.size() < leafSizeMax) {
+    if (scratch.docs.size() < leafSizeMax || scratch.dim0.size() < leafSizeMax
+        || scratch.dim1.size() < leafSizeMax) {
       throw std::invalid_argument("BKDReader: intersect scratch is too small");
     }
 
     auto visit = [&](auto&& self, uint32_t nodeId, uint32_t leaves,
-                     uint32_t firstLeaf, int32_t cellLatMin,
-                     int32_t cellLatMax, int32_t cellLonMin,
-                     int32_t cellLonMax) -> void {
+                     uint32_t firstLeaf, Scalar cell0Min,
+                     Scalar cell0Max, Scalar cell1Min,
+                     Scalar cell1Max) -> void {
       BKDRelation relationToCell = relation.compare(
-          cellLatMin, cellLatMax, cellLonMin, cellLonMax);
+          cell0Min, cell0Max, cell1Min, cell1Max);
       if (relationToCell == BKDRelation::OUTSIDE) return;
       if (relationToCell == BKDRelation::INSIDE) {
         for (uint32_t leaf = firstLeaf; leaf < firstLeaf + leaves; leaf++) {
@@ -689,159 +1006,159 @@ public:
         InnerNode node = innerNode(nodeId);
         uint32_t leftLeaves = numLeftLeaves(leaves);
         if (node.splitDim == 0) {
-          self(self, nodeId * 2, leftLeaves, firstLeaf, cellLatMin,
-               node.splitValue, cellLonMin, cellLonMax);
+          self(self, nodeId * 2, leftLeaves, firstLeaf, cell0Min,
+               node.splitValue, cell1Min, cell1Max);
           self(self, nodeId * 2 + 1, leaves - leftLeaves,
-               firstLeaf + leftLeaves, node.splitValue, cellLatMax,
-               cellLonMin, cellLonMax);
+               firstLeaf + leftLeaves, node.splitValue, cell0Max,
+               cell1Min, cell1Max);
         } else {
-          self(self, nodeId * 2, leftLeaves, firstLeaf, cellLatMin,
-               cellLatMax, cellLonMin, node.splitValue);
+          self(self, nodeId * 2, leftLeaves, firstLeaf, cell0Min,
+               cell0Max, cell1Min, node.splitValue);
           self(self, nodeId * 2 + 1, leaves - leftLeaves,
-               firstLeaf + leftLeaves, cellLatMin, cellLatMax,
-               node.splitValue, cellLonMax);
+               firstLeaf + leftLeaves, cell0Min, cell0Max,
+               node.splitValue, cell1Max);
         }
         return;
       }
 
       LeafInfo info = leafInfo(firstLeaf);
       BKDRelation tight = relation.compare(
-          leafMinLat(firstLeaf), leafMaxLat(firstLeaf),
-          leafMinLon(firstLeaf), leafMaxLon(firstLeaf));
+          leafMin0(firstLeaf), leafMax0(firstLeaf),
+          leafMin1(firstLeaf), leafMax1(firstLeaf));
       if (tight == BKDRelation::OUTSIDE) return;
       if (tight == BKDRelation::INSIDE) {
         emitLeafDocids(firstLeaf, info, scratch.docs, emitDoc, emitRun, emitWord);
         return;
       }
       decodeDocids(firstLeaf, info, scratch.docs);
-      decodeCoordinates(firstLeaf, info, scratch.lat, scratch.lon);
+      decodeCoordinates(firstLeaf, info, scratch.dim0, scratch.dim1);
       for (uint16_t i = 0; i < info.count; i++) {
-        int32_t decodedLat = (int32_t)((uint32_t)info.latMin + scratch.lat[i]);
-        int32_t decodedLon = (int32_t)((uint32_t)info.lonMin + scratch.lon[i]);
-        if (relation.matches(decodedLat, decodedLon)) {
+        Scalar decoded0 = (Scalar)((Unsigned)info.min0 + scratch.dim0[i]);
+        Scalar decoded1 = (Scalar)((Unsigned)info.min1 + scratch.dim1[i]);
+        if (relation.matches(decoded0, decoded1)) {
           emitDoc((int32_t)scratch.docs[i]);
         }
       }
     };
-    visit(visit, 1, leavesCount, 0, INT32_MIN, INT32_MAX,
-          INT32_MIN, INT32_MAX);
+    visit(visit, 1, leavesCount, 0,
+          std::numeric_limits<Scalar>::min(), std::numeric_limits<Scalar>::max(),
+          std::numeric_limits<Scalar>::min(), std::numeric_limits<Scalar>::max());
   }
 
   template <class Relation>
   EstimateResult estimateIntersect(Relation&& relation) const {
     uint64_t estimated = 0;
     uint64_t upper = 0;
-    auto addLeaves = [&](uint32_t firstLeaf, uint32_t leaves) {
-      for (uint32_t leaf = firstLeaf; leaf < firstLeaf + leaves; leaf++) {
-        uint64_t count = leafInfo(leaf).count;
-        estimated += count;
-        upper += count;
-      }
-    };
+    uint64_t crossing = 0;
     auto visit = [&](auto&& self, uint32_t nodeId, uint32_t leaves,
-                     uint32_t firstLeaf, int32_t cellLatMin,
-                     int32_t cellLatMax, int32_t cellLonMin,
-                     int32_t cellLonMax) -> void {
+                     uint32_t firstLeaf, Scalar cell0Min,
+                     Scalar cell0Max, Scalar cell1Min,
+                     Scalar cell1Max) -> void {
       BKDRelation relationToCell = relation.compare(
-          cellLatMin, cellLatMax, cellLonMin, cellLonMax);
+          cell0Min, cell0Max, cell1Min, cell1Max);
       if (relationToCell == BKDRelation::OUTSIDE) return;
       if (relationToCell == BKDRelation::INSIDE) {
-        addLeaves(firstLeaf, leaves);
+        uint64_t points = leafRangePoints(firstLeaf, leaves);
+        estimated += points;
+        upper += points;
         return;
       }
       if (leaves != 1) {
         InnerNode node = innerNode(nodeId);
         uint32_t leftLeaves = numLeftLeaves(leaves);
         if (node.splitDim == 0) {
-          self(self, nodeId * 2, leftLeaves, firstLeaf, cellLatMin,
-               node.splitValue, cellLonMin, cellLonMax);
+          self(self, nodeId * 2, leftLeaves, firstLeaf, cell0Min,
+               node.splitValue, cell1Min, cell1Max);
           self(self, nodeId * 2 + 1, leaves - leftLeaves,
-               firstLeaf + leftLeaves, node.splitValue, cellLatMax,
-               cellLonMin, cellLonMax);
+               firstLeaf + leftLeaves, node.splitValue, cell0Max,
+               cell1Min, cell1Max);
         } else {
-          self(self, nodeId * 2, leftLeaves, firstLeaf, cellLatMin,
-               cellLatMax, cellLonMin, node.splitValue);
+          self(self, nodeId * 2, leftLeaves, firstLeaf, cell0Min,
+               cell0Max, cell1Min, node.splitValue);
           self(self, nodeId * 2 + 1, leaves - leftLeaves,
-               firstLeaf + leftLeaves, cellLatMin, cellLatMax,
-               node.splitValue, cellLonMax);
+               firstLeaf + leftLeaves, cell0Min, cell0Max,
+               node.splitValue, cell1Max);
         }
         return;
       }
 
       LeafInfo info = leafInfo(firstLeaf);
       BKDRelation tight = relation.compare(
-          leafMinLat(firstLeaf), leafMaxLat(firstLeaf),
-          leafMinLon(firstLeaf), leafMaxLon(firstLeaf));
+          leafMin0(firstLeaf), leafMax0(firstLeaf),
+          leafMin1(firstLeaf), leafMax1(firstLeaf));
       if (tight == BKDRelation::INSIDE) {
         estimated += info.count;
         upper += info.count;
       } else if (tight == BKDRelation::CROSSES) {
         estimated += ((uint64_t)info.count + 1) / 2;
         upper += info.count;
+        crossing += info.count;
       }
     };
-    visit(visit, 1, leavesCount, 0, INT32_MIN, INT32_MAX,
-          INT32_MIN, INT32_MAX);
-    return {estimated, upper};
+    visit(visit, 1, leavesCount, 0,
+          std::numeric_limits<Scalar>::min(), std::numeric_limits<Scalar>::max(),
+          std::numeric_limits<Scalar>::min(), std::numeric_limits<Scalar>::max());
+    return {estimated, upper, crossing};
   }
 
   template <class Relation>
   CountResult countIntersect(Relation&& relation, Scratch scratch) const {
-    if (scratch.lat.size() < leafSizeMax || scratch.lon.size() < leafSizeMax) {
+    if (scratch.dim0.size() < leafSizeMax || scratch.dim1.size() < leafSizeMax) {
       throw std::invalid_argument("BKDReader: count scratch is too small");
     }
     uint64_t count = 0;
     auto visit = [&](auto&& self, uint32_t nodeId, uint32_t leaves,
-                     uint32_t firstLeaf, int32_t cellLatMin,
-                     int32_t cellLatMax, int32_t cellLonMin,
-                     int32_t cellLonMax) -> void {
+                     uint32_t firstLeaf, Scalar cell0Min,
+                     Scalar cell0Max, Scalar cell1Min,
+                     Scalar cell1Max) -> void {
       BKDRelation relationToCell = relation.compare(
-          cellLatMin, cellLatMax, cellLonMin, cellLonMax);
+          cell0Min, cell0Max, cell1Min, cell1Max);
       if (relationToCell == BKDRelation::OUTSIDE) return;
       if (relationToCell == BKDRelation::INSIDE) {
-        for (uint32_t leaf = firstLeaf; leaf < firstLeaf + leaves; leaf++) {
-          count += leafInfo(leaf).count;
-        }
+        count += leafRangePoints(firstLeaf, leaves);
         return;
       }
       if (leaves != 1) {
         InnerNode node = innerNode(nodeId);
         uint32_t leftLeaves = numLeftLeaves(leaves);
         if (node.splitDim == 0) {
-          self(self, nodeId * 2, leftLeaves, firstLeaf, cellLatMin,
-               node.splitValue, cellLonMin, cellLonMax);
+          self(self, nodeId * 2, leftLeaves, firstLeaf, cell0Min,
+               node.splitValue, cell1Min, cell1Max);
           self(self, nodeId * 2 + 1, leaves - leftLeaves,
-               firstLeaf + leftLeaves, node.splitValue, cellLatMax,
-               cellLonMin, cellLonMax);
+               firstLeaf + leftLeaves, node.splitValue, cell0Max,
+               cell1Min, cell1Max);
         } else {
-          self(self, nodeId * 2, leftLeaves, firstLeaf, cellLatMin,
-               cellLatMax, cellLonMin, node.splitValue);
+          self(self, nodeId * 2, leftLeaves, firstLeaf, cell0Min,
+               cell0Max, cell1Min, node.splitValue);
           self(self, nodeId * 2 + 1, leaves - leftLeaves,
-               firstLeaf + leftLeaves, cellLatMin, cellLatMax,
-               node.splitValue, cellLonMax);
+               firstLeaf + leftLeaves, cell0Min, cell0Max,
+               node.splitValue, cell1Max);
         }
         return;
       }
       LeafInfo info = leafInfo(firstLeaf);
       BKDRelation tight = relation.compare(
-          leafMinLat(firstLeaf), leafMaxLat(firstLeaf),
-          leafMinLon(firstLeaf), leafMaxLon(firstLeaf));
+          leafMin0(firstLeaf), leafMax0(firstLeaf),
+          leafMin1(firstLeaf), leafMax1(firstLeaf));
       if (tight == BKDRelation::OUTSIDE) return;
       if (tight == BKDRelation::INSIDE) {
         count += info.count;
         return;
       }
-      decodeCoordinates(firstLeaf, info, scratch.lat, scratch.lon);
+      decodeCoordinates(firstLeaf, info, scratch.dim0, scratch.dim1);
       for (uint16_t i = 0; i < info.count; i++) {
-        int32_t decodedLat = (int32_t)((uint32_t)info.latMin + scratch.lat[i]);
-        int32_t decodedLon = (int32_t)((uint32_t)info.lonMin + scratch.lon[i]);
-        if (relation.matches(decodedLat, decodedLon)) count++;
+        Scalar decoded0 = (Scalar)((Unsigned)info.min0 + scratch.dim0[i]);
+        Scalar decoded1 = (Scalar)((Unsigned)info.min1 + scratch.dim1[i]);
+        if (relation.matches(decoded0, decoded1)) count++;
       }
     };
-    visit(visit, 1, leavesCount, 0, INT32_MIN, INT32_MAX,
-          INT32_MIN, INT32_MAX);
+    visit(visit, 1, leavesCount, 0,
+          std::numeric_limits<Scalar>::min(), std::numeric_limits<Scalar>::max(),
+          std::numeric_limits<Scalar>::min(), std::numeric_limits<Scalar>::max());
     return {count};
   }
 };
+
+using BKDReader = BasicBKDReader<BKDInt32Traits>;
 
 } // namespace luxir

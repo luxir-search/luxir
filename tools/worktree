@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Creates Luxir worktrees ready to build, and removes them with their builds.
+# Worktrees live under LUXIR_WORKTREE_ROOT (default: <main checkout>-wt). See
+# docs/dev/build-setup.md for sharing ccache objects between them.
+#
+# Usage:
+#   tools/worktree add NAME [START]    branch NAME, created from START (default HEAD) if new
+#   tools/worktree remove [-f] NAME    keeps the branch; refuses to lose work without -f
+#   tools/worktree list
+set -euo pipefail
+
+repo=$(git -C "$(dirname "$0")" rev-parse --path-format=absolute --git-common-dir)
+repo=${repo%/.git}
+root=${LUXIR_WORKTREE_ROOT:-$repo-wt}
+
+usage() {
+  sed -n 's/^#   //p' "$0" >&2
+  exit 1
+}
+
+# Prints the worktrees other than the main checkout at path $1 or ending in /$1,
+# so a worktree is still found after LUXIR_WORKTREE_ROOT changes.
+find_worktrees() {
+  local dir
+  git -C "$repo" worktree list --porcelain | sed -n 's/^worktree //p' | while IFS= read -r dir; do
+    if [[ $dir != "$repo" && ( $dir == "$1" || $dir == */"$1" ) ]]; then
+      echo "$dir"
+    fi
+  done
+}
+
+cmd=${1:-}
+(( $# )) && shift
+case $cmd in
+  add)
+    (( $# >= 1 && $# <= 2 )) || usage
+    name=$1
+    dir=$root/$name
+    mkdir -p "$root"
+    if (( $# == 1 )) && git -C "$repo" show-ref --verify --quiet "refs/heads/$name"; then
+      git -C "$repo" worktree add "$dir" "$name"
+    else
+      # Without START, git branches from the main checkout's HEAD.
+      git -C "$repo" worktree add -b "$name" "$dir" ${2:+"$2"}
+    fi
+    git -C "$dir" submodule update --init
+    "$dir/deps/fetch_sources.sh"
+    echo "Worktree ready: $dir"
+    ;;
+  remove)
+    force=0
+    if [[ ${1:-} == -f ]]; then
+      force=1
+      shift
+    fi
+    (( $# == 1 )) || usage
+    mapfile -t dirs < <(find_worktrees "$1")
+    case ${#dirs[@]} in
+      1) dir=${dirs[0]} ;;
+      0) echo "No worktree named $1" >&2; exit 1 ;;
+      *) echo "$1 names several worktrees; pass one as a full path:" >&2
+         printf '  %s\n' "${dirs[@]}" >&2
+         exit 1 ;;
+    esac
+    [[ -d $dir ]] || { echo "$dir is missing; git worktree prune drops it" >&2; exit 1; }
+    if (( !force )); then
+      if [[ -n $(git -C "$dir" status --porcelain) ]]; then
+        echo "$dir has uncommitted changes; commit them or pass -f" >&2
+        exit 1
+      fi
+      # The branch is kept, so removal loses only commits that no ref reaches: a
+      # detached HEAD's, or a submodule's, whose repository lives in the
+      # worktree's metadata and goes with it.
+      unreachable='git rev-list HEAD --not --branches --tags --remotes'
+      lost=$(cd "$dir" && $unreachable && git submodule foreach --quiet --recursive "$unreachable")
+      if [[ -n $lost ]]; then
+        echo "$dir has commits on no branch, tag, or remote (detached HEAD or a submodule); keep them on a branch or pass -f" >&2
+        exit 1
+      fi
+    fi
+    # --force: git refuses to remove any worktree with submodules otherwise.
+    # The checks above stand in for its own clean-tree check.
+    git -C "$repo" worktree remove --force "$dir"
+    echo "Removed $dir and its builds (branches are kept)"
+    ;;
+  list)
+    git -C "$repo" worktree list --porcelain | sed -n 's/^worktree //p' | while IFS= read -r dir; do
+      size=$(du -sh "$dir/build" 2>/dev/null | cut -f1) || true
+      branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=missing
+      printf '%-60s %s build=%s\n' "$dir" "$branch" "${size:-none}"
+    done
+    ;;
+  *)
+    usage
+    ;;
+esac

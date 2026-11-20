@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/search/HitDecorator.h"
 
 #include <algorithm>
 #include <chrono>
@@ -11,13 +12,16 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#if !defined(__APPLE__)
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
 #include "luxir/search/DocSet.h"
 #include "luxir/search/DomainVariantPlan.h"
+#include "luxir/search/RowRelation.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/util/BigBuffer.h"
@@ -50,10 +54,21 @@ inline size_t saturatingMultiply(size_t a, size_t b) {
       ? std::numeric_limits<size_t>::max() : a * b;
 }
 
+// Relative segment work from already-known domain facts. Never computes a
+// cardinality just to size a fan-out.
+inline uint64_t fanoutDomainUnits(IndexReader::Segment& segment, const DomainHandle& domain) {
+  DocSet* docs = domain.get();
+  int32_t card = docs ? docs->cachedCard() : segment.maxDoc();
+  return (uint64_t)(card >= 0 ? card : segment.numLive());
+}
+
 struct CollectionRequirements {
   bool needRankedDocs = false;
-  bool needExactCount = false;
+  int64_t countLimit = 0; // 0: none; -1: exact; positive: at least this many.
   bool needExactDomain = false;
+
+  bool needsCount() const { return countLimit != 0; }
+  bool isBounded() const { return countLimit > 0; }
 };
 
 // --- Response-side (owning) oneof / optional mutators ---
@@ -92,13 +107,14 @@ struct StructuralConstraint {
 
     using Feed = std::function_ref<void(size_t, DomainHandle)>;
     SearchRequest& req;
+    const std::shared_ptr<IndexReader>& view;
     const StructuralConstraint* ancestor;
     size_t bucketCount;
     std::pmr::vector<std::pmr::vector<DomainHandle>> memo;
     // 0 = not produced, 1 = retained, 2 = streaming segment released.
     std::pmr::vector<uint8_t> ready;
 
-    Producer(SearchRequest& req, const StructuralConstraint* ancestor, size_t bucketCount);
+    Producer(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const StructuralConstraint* ancestor, size_t bucketCount);
     void releaseSegment(int32_t segment);
 
     DomainVariantPlan::SegmentSources& segmentSources(const DomainVariantPlan& plan,
@@ -123,8 +139,15 @@ struct StructuralConstraint {
   Producer* producer;
   size_t bucket;
   Query::Weight* selection = nullptr;
+  const RowRelation::Mapping* mapping = nullptr;
 
   bool hasSelection() const;
+  bool hasBucket() const {
+    for (auto* node = this; node; node = node->parent) {
+      if (node->producer || node->selection) return true;
+    }
+    return false;
+  }
 
   DomainHandle prefix(int32_t segment, DomainHandle eligibility) const;
 
@@ -137,23 +160,34 @@ struct BucketDomainPlan {
   Query::PlanningContext* planning = nullptr;
 };
 
+struct InputDomainPlan {
+  RowRelation::Mapping mapping;
+  DomainVariantPlan variants;
+  Query::PlanningContext* planning = nullptr;
+  bool applyParentFilters = false;
+};
+
 class SearchOp {
   std::vector<uint32_t> segmentStateRetentions;
 
 public:
+  std::vector<std::shared_ptr<HitDecorator>> decorators;
   SearchRequest& req;
+  const std::shared_ptr<IndexReader>& view;
   std::string_view name;
+  uint64_t flags = 0; // effective packed options, set by the parser
   SearchOp* parent = nullptr;  // set by parser after construction.
   boost::unordered_flat_map<std::string_view, SearchOp*> subOps;  // set by parser after construction.
   ExecutionProfileOpState* executionProfile = nullptr;
   BucketDomainPlan* bucketDomain = nullptr;
+  InputDomainPlan* inputDomain = nullptr;
   bool needsStructuralScope = false;
 
   // We can't pass both the parent and children to constructors (and have them fully formed)
   // one has to come before the other.  The parser currently sets subOps and parent
   // after construction, so do not inspect these fields in the constructor.
-  SearchOp(SearchRequest& req, std::string_view name)
-    : segmentStateRetentions(req.reader->segments().size()), req(req), name(name) {
+  SearchOp(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view name)
+    : segmentStateRetentions(view->segments().size()), req(req), view(view), name(name) {
   }
 
   virtual void init() {
@@ -173,7 +207,8 @@ public:
 
   virtual void releaseSegmentState(IndexReader::Segment& segment) noexcept {
     if (segmentStateRetained(segment)) return;
-    for (auto& [name, child] : subOps) child->releaseSegmentState(segment);
+    if (inputDomain) inputDomain->variants.releaseSegmentState(view->segments()[(size_t)segment.ord]);
+    for (auto& [name, child] : subOps) child->releaseSegmentState(child->view->segments()[(size_t)segment.ord]);
   }
 
   class SegmentStateRetention {
@@ -193,7 +228,7 @@ public:
     ~SegmentStateRetention() {
       for (auto& segment : segments) {
         for (auto* op : ops) --op->segmentStateRetentions[(size_t)segment.ord];
-        for (auto* op : ops) op->releaseSegmentState(segment);
+        for (auto* op : ops) op->releaseSegmentState(op->view->segments()[(size_t)segment.ord]);
       }
     }
   };
@@ -210,7 +245,12 @@ public:
     return false;
   }
 
-  bool canInlineInBucket() { return bucketDomain == nullptr && canInline(); }
+  bool canInlineInBucket() { return inputDomain == nullptr && bucketDomain == nullptr && canInline(); }
+
+  // Whether this op's inline calculator accumulates keyed batches
+  // (InlineCalculator::updateKeyedBatch) from bare column reads alone, so a
+  // low-cardinality facet can fold it into its single ord pass.
+  virtual bool inlinesAsColumnBatch() const { return false; }
 
   // Packed state size belongs to the resolved plan, so scheduling can budget
   // inline buckets without constructing their runtime calculators.
@@ -242,6 +282,7 @@ public:
   // A descendant that gathers segment inputs may ask for earlier structural
   // prefixes only after the last feed. Ordinary streaming bindings do not.
   virtual bool needsCompleteBucketInput() const {
+    if (inputDomain && !inputDomain->variants.empty() && !inputDomain->variants.segmentLocal()) return true;
     if (bucketDomain && !bucketDomain->variants.segmentLocal()) return true;
     return std::ranges::any_of(subOps, [](const auto& entry) {
       return entry.second->needsCompleteBucketInput();
@@ -271,6 +312,17 @@ public:
 
   class Calculator {
   protected:
+    struct InputDomains {
+      RequestMemResource resource;
+      std::pmr::vector<DomainHandle> domains;
+      std::atomic<size_t> arrived{0};
+      InputDomains(RequestMemTracker& memory, size_t leaves)
+          : resource(memory, "mapped input domains", "domain variants"), domains(&resource) {
+        domains.resize(leaves);
+      }
+    };
+    std::unique_ptr<InputDomains> inputDomains;
+    std::optional<StructuralConstraint> mappedStructural;
     SearchOp& op;
     Calculator* parent;
     int64_t slot; // the slot this calculator is for, or -1 if not applicable
@@ -287,7 +339,13 @@ public:
         if (state == nullptr) return;
         state->wire.kind = "segment";
         state->wire.segment = segnum;
+#if defined(__APPLE__)
+        uint64_t threadId = 0;
+        (void)pthread_threadid_np(nullptr, &threadId);
+        state->wire.thread_id = (int64_t)threadId;
+#else
         state->wire.thread_id = (int64_t)::syscall(SYS_gettid);
+#endif
         started = std::chrono::steady_clock::now();
       }
       ExecutionProfileScope(const ExecutionProfileScope&) = delete;
@@ -311,15 +369,38 @@ public:
     Calculator(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
         const StructuralConstraint* structural = nullptr)
         : op(op), parent(parent), slot(slot), numSlots(numSlots),
-          structural(structural ? structural : parent ? parent->structural : nullptr) {}
+          structural(structural ? structural : parent ? parent->structural : nullptr) {
+      if (op.inputDomain) {
+        mappedStructural.emplace(StructuralConstraint{this->structural, nullptr, 0, nullptr,
+            &op.inputDomain->mapping});
+        this->structural = &*mappedStructural;
+        if (!op.inputDomain->variants.empty()
+            && !op.inputDomain->variants.segmentLocal(this->structural->hasSelection())) {
+          inputDomains = std::make_unique<InputDomains>(op.req.memoryTracker, op.view->segments().size());
+        }
+      }
+    }
+
+    // Delivery binds the input domain before the operation sees it. The
+    // calculators retain their ordinary per-leaf and whole-index contracts.
+    void accept(FanoutScope* tg, int32_t segment, DomainHandle domain);
+    void acceptAll(FanoutScope* tg, std::span<const DomainHandle> domains);
 
     const StructuralConstraint* structuralConstraint() const {
       return structural;
     }
 
+    const StructuralConstraint* inputConstraint() const {
+      return mappedStructural ? mappedStructural->parent : structural;
+    }
+
     std::vector<DomainHandle> structuralDomains() const;
+    std::vector<DomainHandle> structuralDomains(const std::shared_ptr<IndexReader>& view,
+        const StructuralConstraint* path) const;
 
     StructuralConstraint::Finish structuralFinish() const;
+    StructuralConstraint::Finish structuralFinish(const std::shared_ptr<IndexReader>& view,
+        const StructuralConstraint* path) const;
 
     virtual size_t facetBucketObservedBytes() const { return op.facetBucketResidentBytes(); }
 
@@ -389,12 +470,15 @@ public:
     //     encode's it and respondRaw(..., more=true), then it is dropped (per-emit
     //     eager-drop). The accumulating/final response is untouched; multiple intermediates
     //     may precede the final, which goes out more=false.
-    luxir::api::Val* getTarget(SearchResponse* resp, auto&& visitor) {
+    luxir::api::Val* getTarget(SearchResponse* resp, SearchOp& sub, auto&& visitor) {
       std::lock_guard<std::mutex> lock(op.req.mutex);
       resp = resp ? resp : op.req.lastResponse;
-      auto* val = parent->getTargetForSub(resp, this);
+      auto* val = parent->getTargetForSub(resp, sub);
       visitor(*val); // call the visitor with the target Val with mutex held.
       return val;
+    }
+    luxir::api::Val* getTarget(SearchResponse* resp, auto&& visitor) {
+      return getTarget(resp, op, std::forward<decltype(visitor)>(visitor));
     }
     luxir::api::Val* getTarget(SearchResponse* resp) {
       return getTarget(resp, [](luxir::api::Val&){});
@@ -414,10 +498,10 @@ public:
       return arm;
     }
 
-    // Called by a subCalculator on us to get the target for the subCalculator to set.
+    // Resolve a named child, including when another child emits its result.
     // `resp` is non-null (getTarget resolves it). Do not call this without op.req.mutex
     // held to protect the response from concurrent modifications.
-    virtual luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) = 0;
+    virtual luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) = 0;
 
     SearchOp& getOp() {
       return op;
@@ -440,8 +524,11 @@ public:
     // lifetime with them.
     // if segnum == -1, then this is called not for a specific segment, but for the whole index.
     // segnum=-1 is also used for an empty index reader (no segments).
-    virtual void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    virtual void calc(FanoutScope* tg, int32_t segnum,
                       DomainHandle domain) = 0;
+
+    // Extra cost, in documents, for a share's private accumulator and merge.
+    virtual uint64_t fanoutStealUnits(int32_t segnum, uint64_t docs) { return 0; }
 
     // Whole-index delivery. domains[i] is the domain for reader segment i;
     // an empty span represents an empty index. The default implementation
@@ -450,19 +537,23 @@ public:
     //
     // The span storage is borrowed only for this call. Async work copies the
     // individual handles, never the span.
-    virtual void calcAll(oneapi::tbb::task_group* tg,
+    virtual void calcAll(FanoutScope* tg,
                          std::span<const DomainHandle> domains) {
-      assert(structural == nullptr || tg == nullptr);
-      assert(domains.size() == op.req.reader->segments().size());
+      assert(structural == nullptr || !structural->hasBucket() || tg == nullptr);
+      assert(domains.size() == op.view->segments().size());
       if (domains.empty()) {
         calc(tg, -1, {});
         return;
       }
-      // Ascending submission leaves the last, typically smaller segment on
-      // this thread while earlier segments are available to steal.
-      task_group_fanout(tg, domains.size(), [&](size_t segnum) {
+      // Index-order children let the caller probe the last, typically smaller
+      // segment first, leaving larger segments available for front shares.
+      task_group_fanout(tg, domains.size(), FanoutKind::EXHAUSTIVE, [&](size_t segnum) {
+        uint64_t units = fanoutDomainUnits(op.req.reader->segments()[segnum], domains[segnum]);
+        return FanoutSize{units, fanoutStealUnits((int32_t)segnum, units)};
+      }, [&](size_t segnum) {
         return [this, tg, segnum, domain = domains[segnum]]() {
           assert(domain.isDeliverable());
+          domain.assertScope(op.view->segments()[segnum]);
           calc(tg, (int32_t)segnum, domain);
         };
       });
@@ -478,8 +569,8 @@ public:
       : Calculator(op, parent, slot, numSlots) {
     }
 
-    luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override { return nullptr; }
-    void calc(oneapi::tbb::task_group* tg, int32_t segnum,
+    luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override { return nullptr; }
+    void calc(FanoutScope* tg, int32_t segnum,
               DomainHandle domain) override {};
     virtual void startSeg(int32_t segnum) {};
     virtual void endSeg(int32_t segnum) {};
@@ -488,6 +579,22 @@ public:
     virtual void rewind() {}
     virtual void insert(void* entry, int32_t docid) = 0;
     virtual void update(void* entry, int32_t docid) = 0;
+    // Keyed batches: the caller holds one entry per key in a dense array,
+    // `states` pointing at key 0's state for this calculator and `stride`
+    // apart. It initializes a key's state (initEntry) before its first batch;
+    // updateKeyedBatch then adds docs[i] to key keys[i] for every i, in doc
+    // order, exactly as update() per document would.
+    virtual bool acceptsKeyedBatches() const { return false; }
+    virtual void initEntry(void* entry) { unused(entry); }
+    virtual void updateKeyedBatch(char* states, size_t stride,
+                                  std::span<const int64_t> keys,
+                                  std::span<const int32_t> docs) {
+      unused(states);
+      unused(stride);
+      unused(keys);
+      unused(docs);
+      assert(false);
+    }
     virtual void merge(void* target, void* from) = 0;
     // mergeNew is called when entry did not exist for target
     virtual void mergeNew(void* target, void* from) = 0;
@@ -542,9 +649,6 @@ class KeyedAggregateTable {
   BigFlatMap<Key, char*, Hash> sparseEntries;
   [[no_unique_address]] Payload payload;
   static constexpr size_t HEADER_BYTES = sizeof(int64_t) + Payload::BYTES;
-  // The entry header counts documents delivered to metrics. Repeated values
-  // add only facet occurrences, without changing compact metric denominators.
-  boost::unordered_flat_map<char*, int64_t> extraOccurrences;
   std::vector<int64_t> touchedKeys;
   std::vector<uint32_t> calcEntryBytes;
   MemPool entryPool;
@@ -833,26 +937,66 @@ public:
     }
   }
 
-  void addOccurrence(char* entry, int64_t count = 1) {
-    assert(loadUnaligned<int64_t>(entry) > 0);
-    auto it = extraOccurrences.find(entry);
-    if (it != extraOccurrences.end()) {
-      it->second += count;
+  // Whether addKeyedBatch applies: a dense table whose calculators all take
+  // keyed batches.
+  bool acceptsKeyedBatches() const {
+    if constexpr (!std::is_same_v<Key, int64_t> || Payload::BYTES != 0) {
+      return false;
     } else {
-      constexpr size_t bytes = 2 * (sizeof(std::pair<char*, int64_t>) + 1);
-      charge(bytes);
-      sparseBytesCharged += bytes;
-      extraOccurrences.emplace(entry, count);
+      return rep == Rep::DENSE && !disableKeyedInlineBatchesForTests
+          && std::ranges::all_of(calcs, [](auto* calc) {
+               return calc->acceptsKeyedBatches();
+             });
     }
   }
 
-  int64_t occurrenceCount(char* entry) const {
-    int64_t count = loadUnaligned<int64_t>(entry);
-    if (!extraOccurrences.empty()) {
-      auto it = extraOccurrences.find(entry);
-      if (it != extraOccurrences.end()) count += it->second;
+  LUXIR_NOINLINE void firstKeyedTouch(int64_t key, char* entry) {
+    ensureTouchedCapacity();
+    touchedKeys.push_back(key);
+    char* ptr = entry + HEADER_BYTES;
+    for (size_t c = 0; c < calcs.size(); c++) {
+      calcs[c]->initEntry(ptr);
+      ptr += calcEntryBytes[c];
     }
-    return count;
+  }
+
+  // add(keys[i], docs[i]) for every i, in doc order: entry counts first,
+  // then one keyed batch per calculator instead of a call per document.
+  void addKeyedBatch(std::span<const int64_t> keys,
+                     std::span<const int32_t> docs) {
+    assert(acceptsKeyedBatches());
+    assert(keys.size() == docs.size());
+    // Locals, not members: the unaligned entry stores below may alias any
+    // member, which would otherwise be reloaded for every document.
+    char* base = denseEntries.data();
+    size_t entryStride = stride;
+    // One update per run of equal keys when runs are long, else one per
+    // document (a run-detection branch mispredicts on interleaved keys).
+    size_t n = keys.size();
+    size_t changes = 0;
+    for (size_t i = 1; i < n; i++) changes += keys[i] != keys[i - 1];
+    bool runs = 4 * changes < n;
+    for (size_t i = 0; i < n;) {
+      int64_t key = keys[i];
+      assert(key >= 0 && key < keySpaceSize);
+      size_t j = i + 1;
+      if (runs) {
+        while (j < n && keys[j] == key) j++;
+      }
+      char* entry = base + (size_t)key * entryStride;
+      int64_t count = loadUnaligned<int64_t>(entry);
+      if (count == 0) [[unlikely]] firstKeyedTouch(key, entry);
+      storeUnaligned<int64_t>(entry, count + (int64_t)(j - i));
+      i = j;
+    }
+    char* states = denseEntries.data() + HEADER_BYTES;
+    for (size_t c = 0; c < calcs.size(); c++) {
+      calcs[c]->updateKeyedBatch(states, stride, keys, docs);
+      states += calcEntryBytes[c];
+    }
+    if (stats != nullptr) {
+      stats->keyedBatches.fetch_add(1, std::memory_order_relaxed);
+    }
   }
 
   template <typename RemapKey>
@@ -864,7 +1008,6 @@ public:
         stats->mixedMerges.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    const bool carryOccurrences = !other.extraOccurrences.empty();
     other.forEachEntry([&](KeyArg key, char* from) {
       decltype(auto) targetKey = remapKey(key);
       char* target = findEntry(targetKey);
@@ -873,10 +1016,6 @@ public:
         mergeNewEntry(target, from, other);
       } else {
         mergeEntry(target, from, other);
-      }
-      if (carryOccurrences) {
-        auto it = other.extraOccurrences.find(from);
-        if (it != other.extraOccurrences.end()) addOccurrence(target, it->second);
       }
     });
   }

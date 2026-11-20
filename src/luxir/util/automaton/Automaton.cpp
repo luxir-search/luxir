@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#include "luxir/util/automaton/CaseAlternates.h"
 #include "luxir/util/automaton/CodepointFolder.h"
 
 namespace luxir::automaton {
@@ -104,17 +105,30 @@ Automaton Automaton::anyString(Budget& budget) {
   return star(anyChar(budget), budget);
 }
 
-Automaton Automaton::literal(int32_t cp, const CodepointFolder* folder, Budget& budget) {
-  if (folder == nullptr) return codepoint(cp, budget);
+// One codepoint, or with `caseInsensitive` the set of its case alternates.
+static Automaton caseAtom(int32_t cp, bool caseInsensitive, Budget& budget) {
+  auto alternates = caseInsensitive ? caseAlternates(cp) : std::span<const int32_t>();
+  if (alternates.empty()) return Automaton::codepoint(cp, budget);
+  Automaton result;
+  result.addState(budget);
+  result.addState(budget, true);
+  for (int32_t alternate : alternates) result.addTransition(0, alternate, alternate, 1, budget);
+  result.freeze(budget);
+  return result;
+}
+
+Automaton Automaton::literal(int32_t cp, const CodepointFolder* folder, bool caseInsensitive,
+                             Budget& budget) {
+  if (folder == nullptr) return caseAtom(cp, caseInsensitive, budget);
   int32_t folded[32];
   int32_t count = folder->fold(cp, folded, (int32_t)std::size(folded));
   if (count < 0 || count > (int32_t)std::size(folded)) {
     throw std::runtime_error("literal fold returned an invalid codepoint count");
   }
   if (count == 0) return epsilon(budget);
-  Automaton result = codepoint(folded[0], budget);
+  Automaton result = caseAtom(folded[0], caseInsensitive, budget);
   for (int32_t i = 1; i < count; i++) {
-    result = concatenate(result, codepoint(folded[i], budget), budget);
+    result = concatenate(result, caseAtom(folded[i], caseInsensitive, budget), budget);
   }
   return result;
 }

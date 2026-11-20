@@ -80,12 +80,12 @@ public:
 
   void doFusion() override { doFusionImpl<true>(); }
 
-  api::Val* getTargetForSub(SearchResponse* response, Calculator* child) override {
+  api::Val* getTargetForSub(SearchResponse* response, SearchOp& child) override {
     auto& children = thisOp().groupOps;
-    auto found = children.find(child->getOp().name);
-    if (found != children.end() && found->second == &child->getOp()) {
+    auto found = children.find(child.name);
+    if (found != children.end() && found->second == &child) {
       assert(pageGroups != nullptr && response == op.req.lastResponse);
-      return build::opsSlot(pageGroups->ops, children.size(), child->getOp().name, response->mr);
+      return build::opsSlot(pageGroups->ops, children.size(), child.name, response->mr);
     }
     return FusionOp::Calc::getTargetForSub(response, child);
   }
@@ -97,7 +97,7 @@ public:
     members->hits.assign(fusedList.begin(), fusedList.end());
     std::sort(members->hits.begin(), members->hits.end(),
         [](const auto& a, const auto& b) { return a.first < b.first; });
-    const auto& segments = op.req.reader->segments();
+    const auto& segments = op.view->segments();
     auto cursor = members->hits.begin();
     for (int32_t segment = 0; segment < (int32_t)segments.size(); segment++) {
       auto begin = cursor;
@@ -112,18 +112,18 @@ public:
       auto domain = builder.build();
       auto charge = std::make_shared<DomainVariantPlan::DomainCharge>(
           op.req.memoryTracker, domain->ramBytesUsed(), "fused domain", "fusion collapse");
-      fusedDomains.push_back(DomainHandle(std::move(domain)).chargedWith(std::move(charge)));
+      fusedDomains.push_back(DomainHandle(std::move(domain)).scoped(segments[(size_t)segment]).chargedWith(std::move(charge)));
     }
     // Ordinary fusion children retain the entire evidence union, including
     // documents excluded from the returned groups by missing: drop.
     task_group_fanout(fusedDomains.empty() ? nullptr : taskGroup, subCalcs.size(), [&](size_t i) {
       auto* child = subCalcs[i].get();
-      return [this, child]() { child->calcAll(taskGroup, fusedDomains); };
+      return [this, child]() { child->acceptAll(taskGroup, fusedDomains); };
     });
-    bool enrich = op.fusionProto.collapse->get_number || op.headSort || !op.groupOps.empty();
+    bool enrich = op.fusionProto.collapse->get_count || op.headSort || !op.groupOps.empty();
     CollapsedPageSettings settings{op, *op.collapse, *op.fusionProto.collapse, rankSort,
         op.headSort, op.groupOps, op.fusionProto.fields, op.fusionProto.batch_size,
-        op.fusionProto.offset, op.fusionProto.get_number, op.fusionProto.get_scores,
+        op.fusionProto.offset, op.needsCount(), op.fusionProto.get_scores,
         op.fusionProto.document_format, enrich ? members.get() : nullptr,
         fusedDomains, pageGroups, true};
     emitCollapsedPage(settings, *this, *groups);
@@ -154,7 +154,7 @@ SearchOp::Calculator* FusionOp::createDiverseCalculator(
 size_t FusionOp::collapsedResidentBytes() const {
   size_t candidates = 0;
   for (auto* source : sources) candidates = saturatingAdd(candidates, (size_t)source->topCount);
-  candidates = std::min(candidates, (size_t)req.reader->maxDoc());
+  candidates = std::min(candidates, (size_t)view->maxDoc());
   size_t bytes = saturatingMultiply(candidates, sizeof(FusionMembers::Hit) + sizeof(int32_t));
   // The same bounded group heap as top_docs, plus exact candidate-union totals.
   bytes = saturatingAdd(bytes, saturatingMultiply(

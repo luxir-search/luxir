@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include <unordered_set>
 
 #include <array>
 #include <string>
@@ -71,7 +72,7 @@ TEST(ValueExprParserTest, infixPrecedenceParenthesesAndUnary) {
   ValueExprOptions options{schema.get(), {}};
   ValueExprParser parser(options, *memory.arena);
 
-  ValueProgram* precedence = parser.parse("price_i + 2 * 3");
+  ValueProgram* precedence = parser.parse("price_i + quantity_i * 3");
   EXPECT_EQ(ValueOpcode::ADD, precedence->root().opcode);
   EXPECT_EQ(ValueOpcode::MUL,
             precedence->nodes[precedence->root().children[1]].opcode);
@@ -141,16 +142,16 @@ TEST(ValueExprParserTest, logicalDateRules) {
   ValueExprOptions options{schema.get(), {}};
   ValueExprParser parser(options, *memory.arena);
 
-  EXPECT_EQ(ValueNature::DATE, parser.parse("when_dt")->root().nature);
-  EXPECT_EQ(ValueNature::DATE,
+  EXPECT_EQ(ValueNature::DATE_MS, parser.parse("when_dt")->root().nature);
+  EXPECT_EQ(ValueNature::DATE_MS,
             parser.parse("when_dt + 1000")->root().nature);
   EXPECT_EQ(ValueNature::NUMBER,
             parser.parse("when_dt - when_dt")->root().nature);
-  EXPECT_EQ(ValueNature::DATE,
+  EXPECT_EQ(ValueNature::DATE_MS,
             parser.parse("avg(stamps_dts)")->root().nature);
   EXPECT_EQ(ValueNature::NUMBER,
             parser.parse("count(stamps_dts)")->root().nature);
-  EXPECT_EQ(ValueNature::DATE,
+  EXPECT_EQ(ValueNature::DATE_MS,
             parser.parse("def(when_dt,0)")->root().nature);
   EXPECT_EQ(ValueNature::NUMBER,
             parser.parse("2 * when_dt")->root().nature);
@@ -264,7 +265,10 @@ TEST(ValueExprParserTest, rejectsNonFiniteVariablesAndExcessiveDepth) {
 TEST(ValueExprParserTest, registryEntriesAreComplete) {
   auto entries = ValueFunctionRegistry::entries();
   ASSERT_FALSE(entries.empty());
+  std::unordered_set<std::string_view> names;
   for (const ValueFunction& function : entries) {
+    EXPECT_TRUE(names.insert(function.name).second) << function.name;
+    EXPECT_EQ(&function, ValueFunctionRegistry::find(function.name));
     EXPECT_NE(nullptr, function.resolve) << function.name;
     EXPECT_NE(nullptr, function.evalPoint) << function.name;
     EXPECT_NE(nullptr, function.evalBatch) << function.name;
@@ -280,4 +284,122 @@ TEST(ValueExprParserTest, registryEntriesAreComplete) {
   EXPECT_NE(count->evalPoint, avg->evalPoint);
   EXPECT_NE(sum->evalPoint, count->evalPoint);
   EXPECT_NE(sum->evalElement, count->evalElement);
+}
+
+TEST(ValueExprParserTest, dateUnitsPreserveIdentityAndSameUnitTrees) {
+  TestArena memory;
+  auto base = Schema::createDefaultSchema();
+  ValueProgram* millisColumn = nullptr;
+  for (bool nanos : {false, true}) {
+    SchemaBuilder builder;
+    auto& field = builder.field("stamp");
+    field.type = api::FieldDef::FieldClass::DATE;
+    field.unit = nanos ? api::FieldDef::DateUnit::NS : api::FieldDef::DateUnit::MS;
+    auto& array = builder.field("stamps");
+    array.parent = "stamp";
+    array.multi = api::FieldDef::MultiMode::DEFAULT;
+    auto schema = builder.build(base.get());
+    ValueExprOptions options{schema.get(), {}};
+    ValueExprParser parser(options, *memory.arena);
+    ValueProgram* column = parser.parse("stamp");
+    ValueNature nature = dateValueNature(nanos ? DateUnit::NANOS : DateUnit::MILLIS);
+    EXPECT_EQ(nature, column->root().nature);
+    EXPECT_EQ(nanos ? DateUnit::NANOS : DateUnit::MILLIS, valueDateUnit(nature));
+    if (!nanos) millisColumn = column;
+    else EXPECT_FALSE(column->structurallyEqual(*millisColumn));
+
+    // Build the unconverted binary form independently, using just the column
+    // leaf and registry entry. Same-unit resolution must add no wrapper nodes.
+    for (auto name : {"sub", "def", "min", "max", "add"}) {
+      bool offset = std::string_view(name) == "add";
+      auto* expected = arenaCreate<ValueProgram>(*memory.arena, *memory.arena);
+      expected->addNode(column->root());
+      ValueNode rhs = column->root();
+      if (offset) {
+        rhs = ValueNode{};
+        rhs.intValue = 1;
+      }
+      expected->addNode(rhs);
+      ValueNode root;
+      root.kind = ValueNodeKind::FUNCTION;
+      root.function = ValueFunctionRegistry::find(name);
+      root.opcode = root.function->opcode;
+      root.children = {0, 1};
+      root.childCount = 2;
+      root.nature = std::string_view(name) == "sub" ? ValueNature::NUMBER : nature;
+      expected->addNode(root);
+      expected->retainRoot();
+      auto* parsed = parser.parse(std::string(name) + "(stamp," + (offset ? "1)" : "stamp)"));
+      EXPECT_EQ(offset ? 3u : 2u, parsed->nodes.size());
+      EXPECT_TRUE(parsed->structurallyEqual(*expected)) << name;
+    }
+    for (auto expression : {"stamp-1", "def(stamp,0)", "avg(stamps)", "min(stamps)"}) {
+      EXPECT_EQ(nature, parser.parse(expression)->root().nature) << expression;
+    }
+    expectParseError(parser, "sum(stamps)", "cannot reduce a DATE array");
+    expectParseError(parser, "stamp+when_dt", "cannot add two DATE");
+  }
+}
+
+TEST(ValueExprParserTest, resultCoercionUsesTheParserDepthBudget) {
+  SchemaBuilder builder;
+  auto& price = builder.field("price");
+  price.type = api::FieldDef::FieldClass::DECIMAL;
+  price.scale = 2;
+  price.column = true;
+  auto schema = builder.build();
+  TestArena memory;
+  int budget = 0;
+  ValueExprOptions options{schema.get(), {}, &budget};
+  ValueExprParser parser(options, *memory.arena);
+  EXPECT_NO_THROW(parser.parse("price"));
+  EXPECT_THROW(parser.parse("price", NaturePolicy::NUMBER), std::runtime_error);
+  EXPECT_EQ(0, budget);
+  budget = 1;
+  EXPECT_EQ(ValueType::DOUBLE, parser.parse("price", NaturePolicy::NUMBER)->root().type);
+  EXPECT_EQ(1, budget);
+}
+
+TEST(ValueExprParserTest, structuralEqualityIncludesPreparedFunctionState) {
+  auto schema = Schema::createDefaultSchema();
+  TestArena memory;
+  ValueExprOptions options{schema.get(), {}};
+  ValueExprParser parser(options, *memory.arena);
+  auto* left = parser.parse("random()");
+  auto* right = parser.parse("random()");
+  // Give the independently prepared functions known seeds for this comparison.
+  left->nodes[left->rootNode].intValue = 1;
+  right->nodes[right->rootNode].intValue = 1;
+  EXPECT_TRUE(left->structurallyEqual(*right));
+  right->nodes[right->rootNode].intValue = 2;
+  EXPECT_FALSE(left->structurallyEqual(*right));
+}
+
+TEST(ValueExprParserTest, foldingPreservesExactDecimalLiteralSpelling) {
+  SchemaBuilder builder;
+  auto& price = builder.field("price");
+  price.type = api::FieldDef::FieldClass::DECIMAL;
+  price.scale = 18;
+  price.column = true;
+  auto schema = builder.build();
+  TestArena memory;
+  ValueExprOptions options{schema.get(), {}};
+  ValueExprParser parser(options, *memory.arena);
+  auto* expected = parser.parse("price > -0.100000000000000001");
+  EXPECT_TRUE(expected->structurallyEqual(*parser.parse("price > -(0.100000000000000001)")));
+  EXPECT_TRUE(expected->structurallyEqual(*parser.parse("price > -(-(-0.100000000000000001))")));
+}
+
+TEST(ValueExprParserTest, hexComparisonsUseTheirIntegerValue) {
+  SchemaBuilder builder;
+  auto& price = builder.field("price");
+  price.type = api::FieldDef::FieldClass::DECIMAL;
+  price.scale = 2;
+  price.column = true;
+  auto schema = builder.build();
+  TestArena memory;
+  ValueExprOptions options{schema.get(), {}};
+  ValueExprParser parser(options, *memory.arena);
+  EXPECT_TRUE(parser.parse("price == 31")->structurallyEqual(*parser.parse("price == 0x1F")));
+  EXPECT_TRUE(parser.parse("price == -1")->structurallyEqual(*parser.parse("price == 0xffffffffffffffff")));
 }

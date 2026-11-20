@@ -135,10 +135,11 @@ TEST_F(OutputStreamTest, appendFileContinuesWriting) {
 TEST_F(OutputStreamTest, sizedRamOutputTransfersItsAllocation) {
   for (size_t size : {0, 7, 2 * 1024 * 1024}) {
     RAMDirFactory factory(size);
-    auto dir = factory.incarnation(CollectionId::of("main"), "first", true);
+    auto account = factory.memory()->child("tenant")->child("collection");
+    auto dir = factory.directory(StorageRoot::AUTHORITATIVE, "first", {account});
     Directory::FileCreateOptions options; options.expectedSize = size;
     auto file = dir->createFile("data", options);
-    EXPECT_EQ(size, factory.collectionBytes(CollectionId::of("main")));
+    EXPECT_EQ(size, account->bytes());
     OutputStream out(file.get());
     const char* buffer = nullptr;
     if (size) { out.reserve(1); buffer = out.ptr(); }
@@ -149,10 +150,10 @@ TEST_F(OutputStreamTest, sizedRamOutputTransfersItsAllocation) {
     if (size) { EXPECT_EQ(buffer, input->read().data()); }
     EXPECT_EQ(XXH3_64bits(bytes.data(), bytes.size()), file->digest());
     file.reset();
-    auto next = factory.incarnation(CollectionId::of("main"), "next", true); next->linkFile(*dir, "data");
+    auto next = factory.directory(StorageRoot::AUTHORITATIVE, "next", {account}); next->linkFile(*dir, "data");
     EXPECT_EQ(size, factory.storageBytes());
-    dir->clear(); next->clear(); factory.remove(CollectionId::of("main"));
-    EXPECT_EQ(size, factory.collectionBytes(CollectionId::of("main")));
+    dir->clear(); next->clear(); factory.removeTree(StorageRoot::AUTHORITATIVE, "first"); factory.removeTree(StorageRoot::AUTHORITATIVE, "next");
+    EXPECT_EQ(size, account->bytes());
     input.reset();
     EXPECT_EQ(0, factory.storageBytes());
   }
@@ -176,7 +177,8 @@ TEST_F(OutputStreamTest, sizedRamOutputRejectsIncompleteAndOverlongWrites) {
 
 TEST_F(OutputStreamTest, ramStorageAccountsForChunkedOutputAndLimitsAllocations) {
   RAMDirFactory factory(1030);
-  auto dir = factory.incarnation(CollectionId::of("main"), "first", true);
+  auto account = factory.memory()->child("tenant")->child("collection");
+  auto dir = factory.directory(StorageRoot::AUTHORITATIVE, "first", {account});
   auto file = dir->createFile("chunked");
   OutputStream out(file.get()); out.write("abc", 3); out.close();
   EXPECT_EQ(1024, factory.storageBytes());

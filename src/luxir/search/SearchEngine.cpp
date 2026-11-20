@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <limits>
+#include <optional>
+
 #include "luxir/api/padded_input.h"
 
 #include "SearchEngine.h"
 #include "luxir/server/CommitWaits.h"
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
+#include "luxir/reader/SkipStats.h"
 
 namespace luxir {
 
@@ -17,11 +20,10 @@ const SearchConfig& SearchEngine::searchConfig() const {
 
 RootOp* SearchEngine::prepare(SearchRequest& req) {
   if (!req.timeZone) throw RequestError(req.timeZoneError);
-  if (req.maxParallel > 1 || req.maxParallel < -1) {
+  if (req.maxParallel > 1 || req.maxParallel < -2) {
     throw RequestError(
-      "max_parallel must be 0 (serial on the receiving thread), 1 (serial "
-      "on the shared executor), or -1 (unlimited parallelism); values "
-      "above 1 are reserved for a parallelism budget and not implemented");
+      "max_parallel must be 0 (adaptive), 1 (serial on an arena worker), "
+      "-1 (publish every sibling), or -2 (serial inline)");
   }
   getResources(req);
   req.lastResponse = SearchResponse::create(req, true);
@@ -59,6 +61,9 @@ Metrics& SearchEngine::metrics() const { return *node.metrics; }
 
 void SearchEngine::submitBody(SearchRequest& req) {
   MetricScope execution(*node.metrics, metricActivity(MetricStage::SEARCH_EXECUTION));
+  LoadScope load(LoadKind::REQUEST);
+  std::optional<FanoutCreditScope> credit;
+  if (req.tg) credit.emplace(execution.startNs());
   // Until the calculators start, an unclassified failure is the request's
   // fault: parsers and planners reject authored input with bare exceptions.
   // Once execution is under way it is the engine's.  Throw sites that know
@@ -75,11 +80,22 @@ void SearchEngine::submitBody(SearchRequest& req) {
     auto* rootCalc = calc.get();
     req.rootCalc = std::move(calc);
     fallback = ErrorKind::INTERNAL;
+    auto wait = [&] {
+      bool published = req.tg->published();
+      uint64_t start = published ? TaskClock{}() : 0;
+      auto finish = scope_guard([&] {
+        if (published) {
+          fanoutShareWaitNsSum.fetch_add(TaskClock{}() - start, std::memory_order_relaxed);
+          fanoutShareWaitCount.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+      req.tg->join();
+    };
     rootCalc->start(req.tg);
 
     if (req.tg) {
       LOG_TRACE("SearchRequest: waiting for task group to finish for req={}", (void*)&req);
-      req.tg->wait();
+      wait();
       LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
     }
   } catch (std::exception& e) {
@@ -87,7 +103,7 @@ void SearchEngine::submitBody(SearchRequest& req) {
     // Swallow any parked task exception so the original error is preserved.
     if (req.tg) {
       req.tg->cancel();
-      try { req.tg->wait(); } catch (...) {}
+      try { req.tg->join(); } catch (...) {}
     }
     ErrorInfo info = classifyException(e, fallback);
     if (info.kind == ErrorKind::INTERNAL) {
@@ -119,11 +135,27 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // Send back the final response - or, if a flow-controlled emitter is still
   // paused with batches to produce, hand off: the last stream to end sends it.
   // Do not access req after this point as it may be asynchronously deleted.
+  // The request scope is stack-owned; emitters retain only configuration.
+  req.tg = nullptr;
   execution.finish();
   req.bodyDone();
 }
 
-void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
+void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
+  try {
+    // Isolation also covers waits outside the request's fan-out scope.
+    node.getTaskArena().enqueue([this, &req, maxParallel] {
+      oneapi::tbb::this_task_arena::isolate([&] { submit(req, maxParallel); });
+    });
+  } catch (const std::exception& e) {
+    // Nothing was queued: complete the request here so its transport still
+    // sees exactly one final reply.
+    req.setError(classifyException(e, ErrorKind::INTERNAL));
+    req.bodyDone();
+  }
+}
+
+void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver) {
   req.counting = true;
   req.submitted = std::chrono::steady_clock::now();
   metrics().start(metricActivity(MetricStage::SEARCH));
@@ -135,10 +167,19 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
       waits.awaitCommit(std::move(collection), std::move(floor),
           waits.deadlineAfter(req.proto.min_commit_timeout_ms.value_or(30000)), req.waitCancellation.get_token(),
           [this, &req, maxParallel](CommitWaits::CommitResult result) {
-            node.getTaskArena().enqueue([this, &req, maxParallel, result = std::move(result)] {
-              if (result.error) { req.setError(*result.error); req.bodyDone(); }
-              else { req.floorCollection = result.collection; submit(req, maxParallel); }
-            });
+            if (!result.error) {
+              req.floorCollection = result.collection;
+              enqueueSubmit(req, maxParallel);
+              return;
+            }
+            // CommitWaits swallows a throw from here, which would strand the
+            // request: if the enqueue fails, fail the request on this thread.
+            auto fail = [&req, error = *result.error] { req.setError(error); req.bodyDone(); };
+            try {
+              node.getTaskArena().enqueue(fail);  // copies; fail stays valid if this throws
+            } catch (...) {
+              fail();
+            }
           });
       return;
 
@@ -148,59 +189,50 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
       return;
     }
   }
-  if (maxParallel == 0) {
-    // Default lane: the whole query runs serially right here on the receiving
-    // transport thread.  No scheduler hop, and the arena's parked width never
-    // wakes - the transport accepts that this thread is occupied for the
-    // query's duration.
-    submit(req, maxParallel);
-  } else if (maxParallel == -1) {
-    // Parallel lane: the request starts right here, inside the arena, so it
-    // pays no handoff; arena workers steal the tasks it spawns and this thread
-    // helps in its own waits.  Entry takes a reserved slot (never queues
-    // behind arena backlog).  Like the default lane, this transport thread is
-    // occupied for the query's (now parallel) duration.
-    node.executeIsolated([&] { submit(req, maxParallel); });
+  bool runOnReceiver = receiver == Receiver::MAY_EXECUTE && maxParallel != 1;
+  if (!runOnReceiver) {
+    enqueueSubmit(req, maxParallel);
   } else {
-    // 1 = serial off the receiving thread: the escape hatch for a query
-    // expected to be expensive, so it does not occupy this transport thread.
-    // Other values are rejected in prepare(), on the arena like 1.
-    node.getTaskArena().enqueue([this, &req, maxParallel] { submit(req, maxParallel); });
+    submit(req, maxParallel);
   }
 }
 
 void SearchEngine::submit(SearchRequest& req, int32_t maxParallel) {
   // Ideas: we could keep track of executing requests here, and provide ways to list / cancel them?
   req.maxParallel = maxParallel;
-  std::optional<oneapi::tbb::task_group> stackTg;
-  if (maxParallel == -1 && req.tg == nullptr) {
-    req.tg = &stackTg.emplace();
+  std::optional<FanoutScope> stackTg;
+  // SkipStats counters are single-threaded; adaptive instrumented runs stay serial.
+  if (req.tg == nullptr && (maxParallel == -1 || (maxParallel == 0 && !SkipStats::enabled))) {
+    req.tg = &stackTg.emplace(&node.getTaskArena(),
+        maxParallel == -1 ? FanoutPolicy::EVERY : FanoutPolicy::ADAPTIVE);
   }
   submitBody(req);
 }
 
 void SearchEngine::getResources(SearchRequest& req) {
-  // look up the correct index reader and the associated schema
-  auto& request = req.proto;
-  auto& node = req.engine.node;
-  auto collection = req.floorCollection ? req.floorCollection : node.getCollection(LuxirNode::target(req.tenant, request.collection));
-  req.collectionMetrics = collection->sharedMetrics();
+  if (!req.reader) {
+    // look up the correct index reader and the associated schema
+    auto& request = req.proto;
+    auto& node = req.engine.node;
+    auto collection = req.floorCollection ? req.floorCollection : node.getCollection(LuxirNode::target(req.tenant, request.collection));
+    req.collectionMetrics = collection->sharedMetrics();
 
-  // get the index reader
-  // The API freshness tolerance is milliseconds; the reader clock domain is
-  // microseconds (commit times).  Saturate: an absurd tolerance means "any".
-  constexpr uint64_t maxUs = std::numeric_limits<uint64_t>::max();
-  uint64_t freshnessUs = request.freshness_ms > maxUs / 1000
-      ? maxUs : request.freshness_ms * 1000;
-  req.reader = collection->getReaderManager().getReader(freshnessUs);
-  if (!request.min_commit.empty()) {
-    auto floor = CommitId::parse(request.min_commit);
-    if (req.reader->incarnation() != floor.incarnation || req.reader->commitId() < floor.index_gen)
-      req.reader = collection->getReaderManager().getReader(0);
-    if (req.reader->incarnation() != floor.incarnation) throw ApiError(ErrorKind::FAILED_PRECONDITION,
-        "commit_incarnation_mismatch", "min_commit belongs to a different collection incarnation");
-    if (req.reader->commitId() < floor.index_gen) throw ApiError(ErrorKind::UNAVAILABLE,
-        "stale_replica", "reader is older than min_commit");
+    // get the index reader
+    // The API freshness tolerance is milliseconds; the reader clock domain is
+    // microseconds (commit times).  Saturate: an absurd tolerance means "any".
+    constexpr uint64_t maxUs = std::numeric_limits<uint64_t>::max();
+    uint64_t freshnessUs = request.freshness_ms > maxUs / 1000
+        ? maxUs : request.freshness_ms * 1000;
+    req.reader = collection->getReaderManager().getReader(freshnessUs);
+    if (!request.min_commit.empty()) {
+      auto floor = CommitId::parse(request.min_commit);
+      if (req.reader->incarnation() != floor.incarnation || req.reader->commitId() < floor.index_gen)
+        req.reader = collection->getReaderManager().getReader(0);
+      if (req.reader->incarnation() != floor.incarnation) throw ApiError(ErrorKind::FAILED_PRECONDITION,
+          "commit_incarnation_mismatch", "min_commit belongs to a different collection incarnation");
+      if (req.reader->commitId() < floor.index_gen) throw ApiError(ErrorKind::UNAVAILABLE,
+          "stale_replica", "reader is older than min_commit");
+    }
   }
   req.schema = req.reader->schema();
   auto* filterCache = req.reader->filterCache();

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <bit>
+#include <format>
 #include <type_traits>
 #include "luxir/schema/FieldType.h"
 #include "luxir/store/InputStream.h"
@@ -54,6 +55,7 @@ struct SegFieldInfo {
   PackedTerm fieldname;
   FieldType::Type type;
   int32_t flags;  // from FieldType
+  uint32_t typeFlags = 0;  // interpreted by the persisted type
   seg_location termBlockIndexLoc;  // location of index into the terms blocks
   seg_location termsLoc;
   seg_location docsLoc;
@@ -108,11 +110,45 @@ struct SegFieldInfo {
   seg_location valDocLoc;
   int64_t valDocMetaOff;
 
+  // Indexed STRING/ID fields declared without a column (column: false) keep
+  // only postings and the docs-with-field set. A schema cannot add the column
+  // back to an existing field, but a field dropped and declared again can
+  // still meet such segments, so column readers check per segment.
+  bool hasOrdColumn() const { return ordFormat != ORD_NONE; }
+
+  // `info` for column reads: null (no values in this segment) for an indexed
+  // TERMS field this segment holds without an ord column.
+  static const SegFieldInfo* column(const SegFieldInfo* info) {
+    if (info == nullptr || info->hasOrdColumn()) return info;
+    bool indexedTerms = FieldType::storage(info->type) == FieldType::Storage::TERMS
+        && (info->flags & FieldType::INDEX_DOCS) != 0;
+    return indexedTerms ? nullptr : info;
+  }
+
+  // Every indexed STRING/ID document contributes at least one distinct term.
+  // Equality makes different terms' postings disjoint, even for repeated ARRAY
+  // values. This does not imply one column value per document.
+  bool hasDisjointTermPostings() const {
+    return (flags & FieldType::INDEX_DOCS) != 0
+        && (type == FieldType::STRING || type == FieldType::ID)
+        && sumDocFreq == docsWithField;
+  }
+
   // VECTOR only: the column's VectorEncoding, as written for this segment.
   // Serialized only for VECTOR fields.
   int32_t vectorEncoding = 0;
   // VECTOR only: rows carry the |x|^2 prefix (see VectorCodec.h).
   bool vectorNorms = false;
+
+  void requireCompatibleType(const SegFieldInfo& other) const {
+    if (type != other.type || FieldType::typeParameters(type, typeFlags)
+        != FieldType::typeParameters(other.type, other.typeFlags)) {
+      throw std::runtime_error(std::format(
+          "Incompatible persisted types for field '{}': {} and {}",
+          (std::string_view)fieldname, FieldType::describeType(type, typeFlags),
+          FieldType::describeType(other.type, other.typeFlags)));
+    }
+  }
 
   // Within-file references are relative; these are the complete set of
   // segment-global bases.  Relocate them together before FieldInfo is

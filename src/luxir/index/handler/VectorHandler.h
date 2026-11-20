@@ -49,8 +49,8 @@ class VectorHandler final : public StrColHandler {
   class OriginalColumn final : public StrColHandler {
   public:
     OriginalColumn(Inverter& inverter, std::string_view name,
-                   const std::shared_ptr<FieldType>& fieldType)
-      : StrColHandler(inverter, name, fieldType, ValueStorage::STREAMED) {}
+                   const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+      : StrColHandler(inverter, name, fieldType, space, ValueStorage::STREAMED) {}
 
     void append(Inverter& inverter, std::span<const std::string_view> values, bool multi) {
       if (multi) {
@@ -81,8 +81,8 @@ class VectorHandler final : public StrColHandler {
 
 public:
   VectorHandler(Inverter& inverter, const std::string_view& fieldName,
-                const std::shared_ptr<FieldType>& fieldType)
-    : StrColHandler(inverter, fieldName, fieldType, ValueStorage::STREAMED) {
+                const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : StrColHandler(inverter, fieldName, fieldType, space, ValueStorage::STREAMED) {
     // Caller (Inverter::createPhysicalHandler) only constructs us for VECTOR-typed
     // fields, which fromProto always builds as VectorFieldType.
     auto* vft = (VectorFieldType*)(fieldType.get());
@@ -91,9 +91,7 @@ public:
     trustNormalized = vft->normalized_;
     normalizeOnWrite = vft->normalizeOnWrite_;
     encoding = vft->encoding_;
-    norms = vcodec::needsNorms(encoding, metric == VectorFieldType::METRIC_COSINE,
-                               metric == VectorFieldType::METRIC_L2,
-                               trustNormalized || normalizeOnWrite);
+    norms = vft->storesNorms();
     if (vft->keepOriginal_) {
       std::string name = VectorFieldType::originalColumnName(fieldName);
       int flags = FieldType::COLUMN_STORED | FieldType::FIXED_SIZE
@@ -101,7 +99,7 @@ public:
       // Same stored dims as the encoded column: with truncate_dims it keeps
       // the submitted prefix, before normalization.
       originalType = std::make_shared<VectorFieldType>(name, vft->storedDims(), flags);
-      original = std::make_unique<OriginalColumn>(inverter, name, originalType);
+      original = std::make_unique<OriginalColumn>(inverter, name, originalType, space);
     }
   }
 
@@ -206,8 +204,9 @@ private:
       throw DocumentError(fmt::format(
           "field '{}': {}empty vector", std::string_view(fieldName), prefix()));
     }
-    // The field's input contract (length, and every element finite whatever
-    // arm it arrived in: a double past float32 range has narrowed to inf).
+    // The field's input contract (length, and every element finite and within
+    // the magnitude limit whatever arm it arrived in: a double past float32
+    // range has narrowed to inf).
     const auto& vft = (const VectorFieldType&)*fieldType;
     if (std::string err = vft.inputError(vec); !err.empty()) {
       throw DocumentError(fmt::format("field '{}': {}{}", std::string_view(fieldName), prefix(), err));

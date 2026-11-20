@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "luxir/reader/SegmentCore.h"
 #include <string_view>
 #include <optional>
 #include "DocsReader.h"
@@ -27,9 +28,12 @@ private:
   DocsReader docs;
   InputStream valuesIS;                       // Stream for concatenated string values
   const char* valuesData;                     // Pointer to concatenated string data
+  InputFile* valuesInput;                     // File holding valuesData (for read-ahead)
+  size_t valuesFileOffset;                    // Offset of valuesData in valuesInput
   std::optional<MonoReader> endValueRankReader;    // per-doc -> end value rank (multi-valued only)
   std::optional<MonoReader> endOffsetReader;  // per-value -> end byte offset (variable-size only)
   std::optional<MonoReader> valDocReader;     // per-value rank -> owning docId (multi-valued reverse map; vectors only)
+  bool arrayMode = false;
   int32_t docsWithField = 0;
   int64_t nvals = 0;
   int32_t fixedSize = -1;                     // -1 for variable size, >= 0 for fixed size
@@ -38,8 +42,11 @@ public:
   /// The fieldInfo is only used in the constructor and can be discarded after.
   StrColReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) :
     docs(postingsReader, fieldInfo),
-    valuesIS(postingsReader.getInputStreamSeek(fieldInfo.columnLoc)),
+    valuesIS(postingsReader.core().getInputStreamSeek(fieldInfo.columnLoc)),
     valuesData(valuesIS.ptr()),
+    valuesInput(postingsReader.core().getFile(fieldInfo.columnLoc.filenum())),
+    valuesFileOffset((size_t)fieldInfo.columnLoc.offset()),
+    arrayMode((fieldInfo.flags & FieldType::MULTI_ARRAY) != 0),
     docsWithField(fieldInfo.docsWithField),
     nvals(fieldInfo.numValues)
   {
@@ -74,6 +81,22 @@ public:
     return endValueRankReader.has_value();
   }
 
+  bool multiSet() const { return isMultiValued() && !arrayMode; }
+
+  // Multi-valued string sort selection. A SET reads its edge; an ARRAY scans
+  // stored bytes. Callers keep single-valued reads on their existing path.
+  std::string_view selectedValue(int32_t docRank, bool maximum, auto& values) const {
+    auto [start, end] = getStartEndValueRank(docRank);
+    assert(start < end);
+    if (multiSet()) return values.valueAt(maximum ? end - 1 : start);
+    auto selected = values.valueAt(start);
+    for (int64_t rank = start + 1; rank < end; rank++) {
+      auto value = values.valueAt(rank);
+      if (maximum ? value > selected : value < selected) selected = value;
+    }
+    return selected;
+  }
+
   bool isFixedSize() const {
     return !endOffsetReader.has_value();
   }
@@ -102,6 +125,10 @@ public:
   MonoReader* getValDocReader() {
     return valDocReader ? &(*valDocReader) : nullptr;
   }
+
+  /// The file holding the value bytes and their offset in it, for read-ahead.
+  InputFile* valuesFile() const { return valuesInput; }
+  size_t valuesOffset() const { return valuesFileOffset; }
 
   /// Fixed value size for fixed-size fields; -1 for variable size.
   int32_t fixedValueSize() const {

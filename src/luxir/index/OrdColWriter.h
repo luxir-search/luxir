@@ -27,7 +27,7 @@ namespace luxir {
 // that the shared file pad covers LinearPack's wider bulk-decode overread.
 static_assert(SVB_OVERREAD_PAD >= LinearPack::TAIL_PAD);
 
-class OrdColWriter {
+class OrdColWriterSettings {
 public:
   enum class FormatOverride : uint8_t {
     AUTO,
@@ -35,16 +35,25 @@ public:
     PREDICTED
   };
 
-private:
+protected:
+  inline static std::atomic<FormatOverride> formatOverride = FormatOverride::AUTO;
+public:
+  static FormatOverride setFormatOverrideForTests(FormatOverride value) {
+    return formatOverride.exchange(value);
+  }
+};
+
+// The collector supplies doc runs; the disk codec supports arbitrary ord order.
+template <class Collector>
+class BasicOrdColWriter : public OrdColWriterSettings {
   using BlockPlan = OrdColumnFormat::PredictedBlockPlan;
 
   MemPool& pool;
   PostingsWriter& postingsWriter;
   PostingsWriter::IndexFieldInfo& fieldInfo;
-  OrdCollector& ords;
+  Collector& ords;
   u_ptr<MonoWriter> endValueRankWriter;
   PostingsWriter::OutputStreamPtr endValueRankOutput;
-  inline static std::atomic<FormatOverride> formatOverride = FormatOverride::AUTO;
 
   bool declaredMultiValued() const {
     return (fieldInfo.flags & FieldType::MULTI_VALUED) != 0;
@@ -66,7 +75,7 @@ private:
     }
 
     assert(indexing == SegFieldInfo::ORD_DOCID);
-    int32_t maxDoc = postingsWriter.getMaxDoc();
+    int32_t maxDoc = postingsWriter.getMaxDoc(fieldInfo.space);
     if (rankToDoc.empty()) {
       assert(ords.size() == maxDoc);
       for (int32_t doc = 0; doc < maxDoc; doc++) {
@@ -174,8 +183,8 @@ private:
   }
 
 public:
-  OrdColWriter(MemPool& pool, PostingsWriter& postingsWriter,
-               PostingsWriter::IndexFieldInfo& fieldInfo, OrdCollector& ords)
+  BasicOrdColWriter(MemPool& pool, PostingsWriter& postingsWriter,
+               PostingsWriter::IndexFieldInfo& fieldInfo, Collector& ords)
       : pool(pool), postingsWriter(postingsWriter), fieldInfo(fieldInfo), ords(ords) {
     assert(!ords.multiValued() || declaredMultiValued());
     if (ords.multiValued()) {
@@ -184,12 +193,8 @@ public:
     }
   }
 
-  static FormatOverride setFormatOverrideForTests(FormatOverride value) {
-    return formatOverride.exchange(value);
-  }
-
   void finish(std::span<const int32_t> rankToDoc = {}) {
-    int32_t maxDoc = postingsWriter.getMaxDoc();
+    int32_t maxDoc = postingsWriter.getMaxDoc(fieldInfo.space);
     int32_t nSlots = ords.size();
     assert(rankToDoc.empty() || (int32_t)rankToDoc.size() == nSlots);
     assert(fieldInfo.nTerms >= 0 && fieldInfo.nTerms <= INT32_MAX);
@@ -260,5 +265,7 @@ public:
     }
   }
 };
+
+using OrdColWriter = BasicOrdColWriter<OrdCollector>;
 
 } // namespace luxir

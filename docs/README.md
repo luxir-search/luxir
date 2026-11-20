@@ -47,25 +47,31 @@ state, and commits are crash-safe on immutable segments.
 6. [Query language](guide/query-language.md) - the developer's query string:
    real precedence, almost no escaping, functions, and injection-safe
    variables.
-7. [Schema and fields](guide/schema.md) - explicit fields, templates for dynamic
+7. [Value expressions](guide/value-expressions.md) - operators, math, date
+   parts, geo, hashing, local variables and loops for sort and score
+   expressions, and the Lucene expressions and Painless spellings.
+8. [Schema and fields](guide/schema.md) - explicit fields, templates for dynamic
    fields, variants and bindings, analyzers and normalizers, storage, and indexes.
-8. [Faceting](guide/faceting.md) - field, range, date, and query facets;
+9. [Nested documents](guide/nested.md) - lists of structured children:
+   matching within one child, scoring by the best child, and operations over
+   child rows.
+10. [Faceting](guide/faceting.md) - field, range, date, and query facets;
    nested facets, metrics, top documents per bucket, and multi-select.
-9. [Vector and hybrid search](guide/vector-search.md) - exact and approximate
-   kNN, filters inside the search, and rank or score fusion.
-10. [Geo search](guide/geo-search.md) - points, bounding boxes, distance
+11. [Vector and hybrid search](guide/vector-search.md) - exact and approximate
+    kNN, filters inside the search, and rank or score fusion.
+12. [Geo search](guide/geo-search.md) - points, bounding boxes, distance
     queries, and the dateline.
-11. [Dates and time zones](guide/dates.md) - date values, date math, civil
+13. [Dates and time zones](guide/dates.md) - date values, date math, civil
     time, and calendar buckets.
-12. [HTTP API conventions](guide/http-api.md) - endpoints, framing, strict
+14. [HTTP API conventions](guide/http-api.md) - endpoints, framing, strict
     JSON, explain modes, and errors.
-13. [gRPC API](guide/grpc.md) - services, streams, and how the typed surface
+15. [gRPC API](guide/grpc.md) - services, streams, and how the typed surface
     maps onto the JSON one.
-14. [Operating Luxir](guide/operations.md) - persistence, ports, memory
+16. [Operating Luxir](guide/operations.md) - persistence, ports, memory
     budgets, read-only nodes, and the current security and availability
     boundary.
 
-15. [Index replication](guide/replication.md) - following a source, discovery,
+17. [Index replication](guide/replication.md) - following a source, discovery,
     pinned snapshots, resumable downloads, and installation status.
 
 ## Reference
@@ -80,14 +86,21 @@ state, and commits are crash-safe on immutable segments.
   execution, and native vector integration.
 - [Vector search design](design/vector-search.md) covers segment overlays and
   the ANN execution model.
+- [Storage and object stores](design/storage.md) lays out the storage
+  roadmap: object-store durability, nodes reading from the store through a
+  local cache, and the publication contract both use.
 - [Codebase map](dev/codebase-map.md) traces source components and request
   flow.
 - [Build setup](dev/build-setup.md) covers toolchains, dependencies, presets,
   and runtime time-zone data.
 - [Container build](dev/container-build.md) provides the shared Ubuntu 22.04
   compiler and dependency environment, including ASan.
+- [Vector comparison](dev/vector-comparison.md) explains dependency images and
+  interleaved HTTP measurements across source refs.
 - [Building a release](dev/releases.md) covers branches, tags, CPU tiers,
   validation, and binary packaging.
+- [Plugins](dev/plugins.md) explains the compiled-in plugin model and how to
+  build an engine with out-of-tree plugins.
 - [Documentation](dev/documentation.md) covers editing the guides and
   regenerating the API reference.
 

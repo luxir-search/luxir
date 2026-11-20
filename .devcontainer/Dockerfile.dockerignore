@@ -8,3 +8,4 @@
 !deps/triplets/**
 !deps/ports/
 !deps/ports/**
+!test/blas_lapack_test.cpp

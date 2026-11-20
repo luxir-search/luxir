@@ -13,6 +13,8 @@
 #include "luxir/util/StrRef.h"
 #include "FieldType.h"
 #include "FieldSignature.h"
+#include "SchemaBinding.h"
+#include "luxir/store/OutputStream.h"
 
 namespace luxir {
 
@@ -33,7 +35,7 @@ enum class FieldRole { PRIMARY, VARIANT };
 // One input shape, with source storage on the primary and independent physical bundles.
 // Dynamic roots use the template's prototypes; their actual names live in handles.
 struct LogicalField {
-  enum class Shape { SCALAR, VECTOR, GEO };
+  enum class Shape { SCALAR, VECTOR, GEO, NESTED, RANGE };
   std::string name;
   std::shared_ptr<FieldType> primary;
   std::map<std::string, std::shared_ptr<FieldType>, std::less<>> variants;
@@ -54,6 +56,7 @@ struct ResolvedFieldHandle {
   FieldType* fieldType;
   FieldRole role;
   const LogicalField* owner;
+  std::string path;
 };
 
 // Schema lookup is immutable and never retains names supplied by a request.
@@ -62,10 +65,12 @@ public:
   using map_type = PhysicalFieldMap;
 
   map_type fieldTypeMap;
+  SchemaBinding binding;
+  FileDescriptor file;
   uint64_t gen_ = 0;          // schema generation, set when persisted
   std::string sourceDef_;     // serialized authored SchemaDef, before inheritance
   // Introduction generations for declared concrete and template representations.
-  std::map<std::string, uint64_t, std::less<>> introducedGen;
+  std::map<std::string, api::SchemaVersion, std::less<>> introducedGen;
 
 private:
   using logical_map = boost::unordered_flat_map<std::string, std::shared_ptr<const LogicalField>,
@@ -76,25 +81,39 @@ private:
     const LogicalField* owner = nullptr;
   };
 
+  RootField findComponent(std::string_view name) const;
   RootField findRoot(std::string_view root) const;
   const std::shared_ptr<FieldType>* findPhysical(std::string_view name) const;
+  static std::shared_ptr<Schema> compile(const api::SchemaDef& def, const Schema* base,
+                                         InvalidStopWords invalidStopWords);
 
 public:
   Schema() = default;
-  std::shared_ptr<Schema> withHistory(uint64_t gen, const Schema* previous) const;
+  std::shared_ptr<Schema> withHistory(SchemaBinding binding, const Schema* previous) const;
 
   // Ingest accepts logical document keys only. The returned primary handle
   // exposes the owner and its variants for the later ingest dispatcher.
   ResolvedFieldHandle resolveInput(std::string_view docKey) const;
   ResolvedFieldHandle resolveFor(std::string_view name, OpClass op) const;
+  bool isNestedPath(std::string_view path) const;
+  void requirePath(std::string_view path) const;
+  static std::string qualify(std::string_view path, std::string_view name);
   // Already-resolved physical access: no defaults or __self aliases.
   FieldType* physical(std::string_view name) const;
 
+  // Concrete declarations plus roots observed in reader metadata. Search
+  // bindings and variants must be indexed term-match fields. Names are sorted;
+  // absent declared fields and variants of observed roots are included.
+  std::vector<std::string> searchableFields(std::span<const std::string_view> physicalNames = {},
+                                             std::string_view path = {}) const;
+
   FieldSignatures signatures(bool includeTemplates = false) const;
   void inheritIntroductions(const Schema* previous);
-  uint64_t introduction(std::string_view physicalName) const;
+  api::SchemaVersion introductionVersion(std::string_view physicalName) const;
+  uint64_t introduction(std::string_view physicalName) const { return introductionVersion(physicalName).generation(); }
+  size_t estimatedBytes() const;
   api::SchemaInfo storedInfo(std::pmr::memory_resource& arena) const;
-  static std::shared_ptr<Schema> fromStored(const api::SchemaInfo& info, uint64_t gen);
+  static std::shared_ptr<Schema> fromStored(const api::SchemaInfo& info, SchemaBinding binding);
 
   // Physical lookup includes suffix-template prototypes, never bindings or
   // __self aliases. Copy a shared_ptr before the Schema's lifetime ends.
@@ -130,7 +149,8 @@ public:
   void toProto(luxir::api::SchemaDef* def, std::pmr::memory_resource& arena) const;
 
   // Name rules.  A concrete field name is id-like: an ASCII letter followed by
-  // ASCII letters, digits, or underscores, at most 127 bytes (field names
+  // ASCII letters, digits, or underscores. Dots separate nested path components.
+  // The full name is at most 127 bytes (field names
   // land in filenames).  The leading-underscore namespace is reserved for the
   // engine; "_version_" is the one reserved name accepted here.  A template
   // name is '_' followed by ASCII letters, digits, or underscores: a suffix

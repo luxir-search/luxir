@@ -127,7 +127,7 @@ TEST_F(CollapseMetricTest, exhaustiveOracle) {
     ASSERT_TRUE(helper.deleteByIds({"d2", "d41"}, UpdateMessage::COMMIT).success);
     for (const auto& shape : shapes) {
       std::string base = R"JSON({"query":"rescore(body_w:keep, score_i)","get_scores":true,
-        "get_number":true,"document_format":"rows","batch_size":1000,
+        "count_limit":-1,"document_format":"rows","batch_size":1000,
         "fields":["id","seq_i","sort_i","price_f","key_s","key_i"],"sort":)JSON"
           + std::string(shape.score ? R"("score desc")" : R"("sort_i asc")");
       auto full = run(collection, base + R"(,"limit":-1})");
@@ -138,7 +138,7 @@ TEST_F(CollapseMetricTest, exhaustiveOracle) {
         collapse += '"' + field + '"';
       }
       collapse += R"(],"missing":")" + shape.policy + R"JSON(","head_sort":"seq_i desc",
-        "get_number":true,"sort":["lo asc","hi desc"],
+        "get_count":true,"sort":["lo asc","hi desc"],
         "ops":{"lo":"min(price_f)","hi":"max(sort_i)"}})JSON";
       for (int parallel : {1, -1}) {
         auto actual = run(collection, base + collapse + R"(,"limit":-1})", parallel);
@@ -184,7 +184,7 @@ TEST_F(CollapseMetricTest, resetPageOpsPreparedSelectionAndValidation) {
       "unit":"groups","exact":true}},"collapse":{"field":"key_s","sort":"lo asc","ops":{
         "lo":"min(price_i)","all":{"top_docs":{"sort":"id asc","limit":-1,
         "fields":["id"],"document_format":"rows"},"domain":{"query":"*:*"}}}},
-      "fields":["id"],"document_format":"rows","get_number":true,"get_scores":true})JSON", parallel);
+      "fields":["id"],"document_format":"rows","count_limit":-1,"get_scores":true})JSON", parallel);
     const auto& list = *req->docList();
     ASSERT_EQ(2u, list.docs.size());
     EXPECT_EQ("c", list.docs[0].fields.at("id")->asString());
@@ -248,7 +248,7 @@ TEST_F(CollapseMetricTest, memoryFailureEmptyIndexAndDocsRendering) {
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "key_s", "x", "price_i", (int64_t)2)},
       UpdateMessage::COMMIT).success);
   std::string body = R"JSON({"collapse":{"field":"key_s","sort":"lo asc",
-    "ops":{"lo":"min(price_i)"}},"get_number":true,"get_scores":true,
+    "ops":{"lo":"min(price_i)"}},"count_limit":-1,"get_scores":true,
     "fields":["id"],"document_format":"rows"})JSON";
   auto req = run("main", body);
   auto runs = renderDocRuns(req->responses[0]->proto);
@@ -275,7 +275,7 @@ TEST_F(CollapseMetricTest, metricListsUnderBucketsAndFusion) {
       flatdoc("id", "b", "key_s", "y", "price_i", (int64_t)3),
       flatdoc("id", "c", "key_s", "x", "price_i", (int64_t)1)}, UpdateMessage::COMMIT).success);
   std::string child = R"JSON({"top_docs":{"collapse":{"field":"key_s","sort":"lo asc",
-    "ops":{"lo":"min(price_i)"}},"sort":"id asc","get_number":true,
+    "ops":{"lo":"min(price_i)"}},"sort":"id asc","count_limit":-1,
     "get_scores":true,"fields":["id"],"document_format":"rows"}})JSON";
   for (bool fusion : {false, true}) {
     auto body = fusion ? R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{"all":{"limit":-1}},
@@ -316,7 +316,7 @@ TEST_F(CollapseMetricTest, stringBestMembersAndWeightedMetricMerge) {
   add("e", "y", 4, std::string(6000, 'c'));
   for (auto field : {"sort_s", "raw"}) for (int parallel : {1, -1}) {
     auto req = run("main", R"JSON({"collapse":{"field":"key_s","sort":"average asc",
-      "get_number":true,"ops":{"average":"avg(price_i)","sum":"sum(price_i)"}},
+      "get_count":true,"ops":{"average":"avg(price_i)","sum":"sum(price_i)"}},
       "sort":")JSON" + std::string(field) + R"( asc","get_scores":true,
       "fields":["id"],"document_format":"rows"})", parallel);
     ASSERT_OK(req);
@@ -345,7 +345,7 @@ TEST_F(CollapseMetricTest, routedOrdinaryOpsKeepTheirOwnDomains) {
   for (int parallel : {1, -1}) {
     auto req = run("main", R"JSON({"collapse":{"field":"key_s","sort":"lo asc",
       "ops":{"lo":"min(price_i)"}},"filter":[{"query":"keep_s:yes","except_ops":["all"]}],
-      "sort":"id asc","get_scores":true,"get_number":true,"fields":["id"],"document_format":"rows",
+      "sort":"id asc","get_scores":true,"count_limit":-1,"fields":["id"],"document_format":"rows",
       "ops":{"all":{"field_facet":{"field":"key_s","count_unit":"docs","limit":-1}}}})JSON",
       parallel);
     ASSERT_OK(req);

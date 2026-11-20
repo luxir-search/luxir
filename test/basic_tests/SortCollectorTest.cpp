@@ -292,7 +292,7 @@ TEST_F(SortCollectorTest, unscoredDisjunctionBulkMatchesPull) {
     KeyGatherGuard gatherGuard(disableGather);
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& cursor = req->topDocs("q").getNumber().limit(limit)
+    auto& cursor = req->topDocs("q").countLimit().limit(limit)
         .fields({"id_s", "sort_i", "sort_s"});
     auto& mr = cursor.mr();
     switch (shape) {
@@ -781,7 +781,7 @@ TEST_F(SortCollectorTest, unscoredConjunctionBulkMatchesPull) {
     SortSkipStatsGuard statsGuard;
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& cursor = req->topDocs("q").getNumber().limit(97)
+    auto& cursor = req->topDocs("q").countLimit().limit(97)
         .fields({"id_s"});
     cursor.rawQuery() = buildQuery(cursor.mr(), shape);
     qb::sort(cursor, sortField, direction);
@@ -1316,7 +1316,7 @@ TEST_F(SortCollectorTest, SortByStringField) {
   // Create a search request that sorts by name ascending
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "name_s"});
+  auto& cur = req->topDocs("q").countLimit().limit(10).allQuery().fields({"id_s", "name_s"});
   qb::sort(cur, "name_s", qb::ASC);
   req->execute(true);
   ASSERT_OK(req);
@@ -1350,7 +1350,7 @@ TEST_F(SortCollectorTest, SortByStringField) {
   // Test descending sort as well
   auto req3 = localReq(luxirNode->getSearchEngine());
   req3->collection("main");
-  auto& cur3 = req3->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "name_s"});
+  auto& cur3 = req3->topDocs("q").countLimit().limit(10).allQuery().fields({"id_s", "name_s"});
   qb::sort(cur3, "name_s", qb::DESC);
   req3->execute(true);
   ASSERT_OK(req3);
@@ -1688,7 +1688,7 @@ TEST_F(SortCollectorTest, SortByPriceAscending) {
   // Create a search request that sorts by price ascending
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "price_i"});
+  auto& cur = req->topDocs("q").countLimit().limit(10).allQuery().fields({"id_s", "price_i"});
   qb::sort(cur, "price_i", qb::ASC);
   req->execute(true);
   ASSERT_OK(req);
@@ -1723,7 +1723,7 @@ TEST_F(SortCollectorTest, SortByPriceAscending) {
   // Now test string sorting with the same data - should give identical results
   auto req2 = localReq(luxirNode->getSearchEngine());
   req2->collection("main");
-  auto& cur2 = req2->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "price_s"});
+  auto& cur2 = req2->topDocs("q").countLimit().limit(10).allQuery().fields({"id_s", "price_s"});
   qb::sort(cur2, "price_s", qb::ASC);
   req2->execute(true);
   ASSERT_OK(req2);
@@ -1762,7 +1762,7 @@ TEST_F(SortCollectorTest, SortByMultipleFields) {
   // Create a search request that sorts by rating desc, then price asc
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  auto& cur = req->topDocs("q").getNumber().limit(10).allQuery()
+  auto& cur = req->topDocs("q").countLimit().limit(10).allQuery()
       .fields({"id_s", "price_i", "rating_i"});
 
   // Sort by rating descending, then price ascending
@@ -2097,7 +2097,7 @@ TEST_F(SortCollectorTest, SortWithBatchedResponses) {
   req->collection("main");
   auto& cur = req->topDocs("q").limit(10)
       .batchSize(3)  // Small batch size to get multiple responses
-      .getNumber().allQuery().fields({"id_s", "price_i"});
+      .countLimit().allQuery().fields({"id_s", "price_i"});
   qb::sort(cur, "price_i", qb::ASC);
   req->execute(true);
   ASSERT_OK(req);
@@ -2160,7 +2160,7 @@ TEST_F(SortCollectorTest, SortWithMissingValues) {
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   // Sort by price ascending (missing values should be last by default)
-  auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "price_i"});
+  auto& cur = req->topDocs("q").countLimit().limit(10).allQuery().fields({"id_s", "price_i"});
   qb::sort(cur, "price_i", qb::ASC);
   req->execute(true);
   ASSERT_OK(req);
@@ -2203,7 +2203,7 @@ TEST_F(SortCollectorTest, EmptyResults) {
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   // Search for a field value that doesn't exist
-  auto& cur = req->topDocs("q").getNumber().limit(10).matchQuery("id_s", "nonexistent");
+  auto& cur = req->topDocs("q").countLimit().limit(10).matchQuery("id_s", "nonexistent");
   // Sort by price
   qb::sort(cur, "price_i", qb::ASC);
   req->execute(true);
@@ -2225,7 +2225,7 @@ TEST_F(SortCollectorTest, SingleDocument) {
   // Create a search request
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "price_i"});
+  auto& cur = req->topDocs("q").countLimit().limit(10).allQuery().fields({"id_s", "price_i"});
   // Sort by price
   qb::sort(cur, "price_i", qb::ASC);
   req->execute(true);
@@ -2250,7 +2250,7 @@ TEST_F(SortCollectorTest, ResultsExceedingTopCount) {
   // Create a search request with limit of 5
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  auto& cur = req->topDocs("q").getNumber().limit(5).allQuery().fields({"id_s", "price_i"});  // Only get top 5
+  auto& cur = req->topDocs("q").countLimit().limit(5).allQuery().fields({"id_s", "price_i"});  // Only get top 5
   // Sort by price ascending
   qb::sort(cur, "price_i", qb::ASC);
   req->execute(true);
@@ -2281,7 +2281,7 @@ TEST_F(SortCollectorTest, LimitOne) {
   // Create a search request with limit=1
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  auto& cur = req->topDocs("q").getNumber().limit(1).allQuery().fields({"id_s", "price_i"});  // Only get the top 1
+  auto& cur = req->topDocs("q").countLimit().limit(1).allQuery().fields({"id_s", "price_i"});  // Only get the top 1
   // Sort by price ascending
   qb::sort(cur, "price_i", qb::ASC);
   req->execute(true);
@@ -2332,7 +2332,7 @@ TEST_F(SortCollectorTest, DeterministicParallelSort) {
   for (int run = 0; run < 2; run++) {  // Just 2 runs for debugging
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& cur = req->topDocs("q").getNumber().limit(50).allQuery().fields({"id_s", "price_i"});
+    auto& cur = req->topDocs("q").countLimit().limit(50).allQuery().fields({"id_s", "price_i"});
     // Sort by price ascending
     qb::sort(cur, "price_i", qb::ASC);
     // Run in parallel mode
@@ -2379,7 +2379,7 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     // Sort by indexed string field
-    auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "name_s"});
+    auto& cur = req->topDocs("q").countLimit().limit(10).allQuery().fields({"id_s", "name_s"});
     qb::sort(cur, "name_s", qb::ASC);
     req->execute(true);
     ASSERT_OK(req);
@@ -2402,7 +2402,7 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     // Sort by non-indexed string column
-    auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "description_sc"});
+    auto& cur = req->topDocs("q").countLimit().limit(10).allQuery().fields({"id_s", "description_sc"});
     qb::sort(cur, "description_sc", qb::ASC);
     req->execute(true);
     ASSERT_OK(req);
@@ -2435,7 +2435,7 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     // Sort by non-indexed string column descending
-    auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "description_sc"});
+    auto& cur = req->topDocs("q").countLimit().limit(10).allQuery().fields({"id_s", "description_sc"});
     qb::sort(cur, "description_sc", qb::DESC);
     req->execute(true);
     ASSERT_OK(req);
@@ -2462,6 +2462,55 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
     ASSERT_EQ("first duplicate", descCol.v[4]);
     ASSERT_EQ("doc5", idCol.v[4]);
   }
+}
+
+TEST_F(SortCollectorTest, fieldSortConstantCountWithoutCacheIsPerSegment) {
+  CollectionHelper helper;
+  auto writer = helper.getIndexWriter();
+  writer->snapshots.readers.filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0});
+  writer->mergePolicy->setMergeFactor(10);
+  constexpr int32_t kDocsPerSeg = 5000;
+  for (int32_t seg = 0; seg < 2; seg++) {
+    for (int32_t i = 0; i < kDocsPerSeg; i++) {
+      int32_t id = seg * kDocsPerSeg + i;
+      helper.index(flatdoc("id", std::to_string(id), "id_s", std::to_string(id),
+                           "body_w", (i & 1) == 0 ? "alpha" : "other",
+                           "sort_i", (int64_t)id), UpdateMessage::NO_COMMIT);
+    }
+    helper.commit();
+  }
+  ASSERT_TRUE(helper.deleteById("5000", UpdateMessage::COMMIT).success);
+  auto reader = writer->snapshots.readers.getReader();
+  ASSERT_EQ(2u, reader->segments().size());
+  ASSERT_EQ(nullptr, reader->segments()[0].liveDocs());
+  ASSERT_NE(nullptr, reader->segments()[1].liveDocs());
+
+  auto run = [&](bool disablePlan) {
+    WholeMembershipPlanGuard planGuard(disablePlan);
+    BestFirstGuard bestFirstGuard(true, false);
+    FieldSortBulkGuard bulkGuard(true);
+    SortSkipStatsGuard stats;
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->collection("main").topDocs("q").matchQuery("body_w", "alpha")
+        .countLimit().limit(9).fields({"id_s"});
+    qb::sort(top, "sort_i", qb::ASC);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(kDocsPerSeg - 1, req->getMatchCount());
+    EXPECT_EQ(disablePlan ? 0 : 1, SkipStats::wholeFieldSortConstant);
+    int64_t skipped = SkipStats::fieldSortBlocksSkipped + SkipStats::fieldSortLeavesSkipped;
+    if (disablePlan) EXPECT_EQ(0, skipped);
+    else EXPECT_GT(skipped, 0);
+    EXPECT_EQ(0, SkipStats::wholeFieldSortHits + SkipStats::wholeFieldSortBuilds
+                     + SkipStats::wholeFieldSortBypasses
+                     + SkipStats::wholeFieldSortFallbackSuppliers);
+    EXPECT_EQ(0, SkipStats::cacheFirstFieldSortWeightSkips
+                     + SkipStats::cacheFirstQueryContextsOmitted);
+    EXPECT_EQ(1, SkipStats::queryContextsCreated);
+    return resultIds(*req);
+  };
+  EXPECT_EQ(run(true), run(false));
 }
 
 // Zone-based competitive pruning must return exactly what exhaustive
@@ -2526,6 +2575,7 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
                  bool domainBuilder = false, bool forcePrepare = false) {
     SortPruningGuard pruningGuard(disablePruning);
     FieldSortBulkGuard bulkGuard(forcePull);
+    BestFirstGuard bestFirstGuard(forcePull, false);
     TopDocsFilterFoldGuard foldGuard(true);
     SortSkipStatsGuard statsGuard;
     auto req = localReq(luxirNode->getSearchEngine());
@@ -2548,7 +2598,7 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
     } else if (filterDomain == FilterDomain::ARRAY) {
       cur.matchFilter("sparse_s", "y");
     }
-    if (exactCount) cur.getNumber();
+    if (exactCount) cur.countLimit();
     if (domainBuilder) cur.facet("groups", "group_s").limit(-1);
     for (const auto& [field, dir] : sorts.clauses) qb::sort(cur, field, dir);
     req->execute(false);
@@ -2559,6 +2609,8 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
       int64_t blocksSkipped = 0;
       int64_t bulkCollections = 0;
       int64_t exactDomainRuns = 0;
+      int64_t wholeConstants = 0;
+      bool hasFound = false;
       int64_t externalActivations = 0;
       int64_t externalCandidates = 0;
       int64_t externalDomainRejects = 0;
@@ -2569,6 +2621,8 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
     result.ids = resultIds(*req);
     const auto* docs = req->docList("q");
     if (docs != nullptr && docs->found) result.found = *docs->found;
+    result.hasFound = docs != nullptr && docs->found.has_value();
+    result.wholeConstants = SkipStats::wholeFieldSortConstant;
     result.blocksSkipped = SkipStats::fieldSortBlocksSkipped
         + SkipStats::fieldSortLeavesSkipped;
     result.bulkCollections = SkipStats::fieldSortBulkCollections;
@@ -2647,12 +2701,84 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
   // proves nothing, so no blocks may be skipped.
   EXPECT_EQ(run(false, true, true, tiesThenRand, 5, false).blocksSkipped, 0);
 
-  // An exact hit count disables pruning and stays exact.
+  // An exact hit count disables pruning and stays exact without the plan.
   auto exactExhaustive = run(true, true, true, randAsc, 9, true);
   auto exactPruned = run(false, true, true, randAsc, 9, true);
   EXPECT_EQ(exactExhaustive.ids, exactPruned.ids);
   EXPECT_EQ(exactExhaustive.found, exactPruned.found);
   EXPECT_EQ(exactPruned.blocksSkipped, 0);
+
+  // The plan supplies match-all totals on both segments, and term metadata
+  // on the delete-free segment. Ranking can prune through either driver.
+  {
+    WholeMembershipPlanGuard planOn(false);
+    for (bool matchAll : {true, false}) {
+      for (bool forcePull : {false, true}) {
+        for (const Sorts& sorts : {monoAsc, revDesc, randAsc}) {
+          SCOPED_TRACE(std::format("matchAll={} pull={} sort={}",
+                                  matchAll, forcePull, sorts.clauses[0].first));
+          auto exhaustive = run(true, forcePull, matchAll, sorts, 9, true);
+          auto pruned = run(false, forcePull, matchAll, sorts, 9, true);
+          EXPECT_EQ(exhaustive.ids, pruned.ids);
+          EXPECT_EQ(exhaustive.found, pruned.found);
+          EXPECT_EQ(matchAll ? 2 : 1, pruned.wholeConstants);
+          if (matchAll) {
+            EXPECT_EQ(2 * kDocsPerSeg - (int64_t)deleted.size(), pruned.found);
+          }
+          if (forcePull) {
+            EXPECT_EQ(0, pruned.exactDomainRuns);
+            EXPECT_EQ(0, pruned.bulkCollections);
+          } else if (matchAll && sorts.clauses[0].first != "rand_i") {
+            EXPECT_EQ(2, pruned.exactDomainRuns);
+          }
+          if (sorts.clauses[0].first != "rand_i") {
+            EXPECT_GT(pruned.blocksSkipped, 0);
+          }
+        }
+      }
+    }
+    auto noCount = run(false, false, true, monoAsc, 9, false);
+    EXPECT_EQ(run(true, false, true, monoAsc, 9, false).ids, noCount.ids);
+    EXPECT_FALSE(noCount.hasFound);
+    EXPECT_EQ(2, noCount.wholeConstants);
+    EXPECT_GT(noCount.exactDomainRuns, 0);
+  }
+
+  // Ord-column bucket builders preserve cached cards for ARRAY and BITSET,
+  // including the deleted segment's effective domain.
+  {
+    SearchOverridesGuard guard(forcedFacetBucketDomainSource);
+    forcedFacetBucketDomainSource = FacetBucketDomainSource::ORD_COLUMN;
+    auto runBucket = [&](std::string_view field, bool disablePlan) {
+      WholeMembershipPlanGuard planGuard(disablePlan);
+      BestFirstGuard bestFirstGuard(false, true);
+      SortSkipStatsGuard stats;
+      auto req = localReq(helper.getSearchEngine());
+      auto& facet = req->collection("main").facet("f", field).limit(-1);
+      auto& hits = facet.topDocs("hits").allQuery().countLimit().limit(9).fields({"id_s"});
+      qb::sort(hits, "mono_i", qb::ASC);
+      req->execute(false);
+      EXPECT_TRUE(req->ok()) << req->errorMsg();
+      const auto& result = *req->responses[0]->proto.ops.at("f")->facetResult();
+      EXPECT_EQ(1u, result.counts.size());
+      const auto& docs = *std::get<api::ArrVal>(result.ops.at("hits")->kind).v[0].docList();
+      EXPECT_EQ(result.counts[0], docs.found.value_or(-1));
+      EXPECT_EQ(disablePlan ? 0 : 2, SkipStats::wholeFieldSortConstant);
+      if (disablePlan) {
+        EXPECT_EQ(0, SkipStats::fieldSortBestFirstActivations);
+      } else {
+        EXPECT_GT(SkipStats::fieldSortBestFirstActivations, 0);
+        EXPECT_GT(SkipStats::fieldSortLeavesSkipped, 0);
+      }
+      std::vector<std::string> ids;
+      for (auto id : std::get<api::ColStr>(docs.columns.at("id_s").kind).v) ids.emplace_back(id);
+      return std::pair{ids, docs.found};
+    };
+    for (auto field : {"dense_s", "sparse_s"}) {
+      SCOPED_TRACE(field);
+      EXPECT_EQ(runBucket(field, true), runBucket(field, false));
+    }
+  }
 
   // External two-phase collection must preserve the exhaustive result for
   // exact and sloppy phrases across all numeric bound/tie shapes and outer
@@ -2788,7 +2914,7 @@ TEST_F(SortCollectorTest, phraseFieldSortPruningMatchesExhaustive) {
     if (filterMode != 0) {
       cur.filter(qb::match(cur.mr(), "par_w", "even"));
     }
-    if (exactCount) cur.getNumber();
+    if (exactCount) cur.countLimit();
     for (const auto& [field, dir] : sorts.clauses) qb::sort(cur, field, dir);
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
@@ -3078,7 +3204,7 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
     cur.allQuery();
     if (!field.empty()) cur.matchFilter(field, value);
-    if (exactCount) cur.getNumber();
+    if (exactCount) cur.countLimit();
     for (const auto& [f, dir] : sorts.clauses) qb::sort(cur, f, dir);
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
@@ -4339,7 +4465,7 @@ TEST_F(SortCollectorTest, segmentVisitOrderKeepsTopKExact) {
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
     cur.allQuery();
     if (!filter.empty()) cur.matchFilter("body_w", filter);
-    if (exactCount) cur.getNumber();
+    if (exactCount) cur.countLimit();
     qb::sort(cur, field, dir);
     req->execute(parallel);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
@@ -4444,7 +4570,7 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
           cur.mr(), {qb::match(cur.mr(), "body_w", value)}, {},
           {qb::match(cur.mr(), "body_w", "excluded")});
     }
-    if (exactCount) cur.getNumber();
+    if (exactCount) cur.countLimit();
     for (const auto& [f, dir] : sorts.clauses) qb::sort(cur, f, dir);
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
@@ -5005,7 +5131,7 @@ TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
       int limit = rng.rint(1, docsPerSeg*3/2);  // Get all results
 
       // Sort by value (direction varies per iteration)
-      auto& cur = req->topDocs("q").getNumber().limit(limit).allQuery().fields({"id_s", "value_i"});
+      auto& cur = req->topDocs("q").countLimit().limit(limit).allQuery().fields({"id_s", "value_i"});
       qb::sort(cur, sortField, direction ? qb::DESC : qb::ASC);
 
       req->execute(true); // Run multi-threaded
@@ -5051,4 +5177,32 @@ TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
       }
     }
   }
+}
+
+// A non-indexed string column sorts by value; an empty string is a value and
+// must not tie with a missing one.
+TEST_F(SortCollectorTest, columnStringSortSeparatesEmptyFromMissing) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("col_s");
+  field.type = luxir::api::FieldDef::FieldClass::STRING;
+  field.index = luxir::api::FieldDef::IndexMode::NONE;
+  field.column = true;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "missing"),
+      flatdoc("id", "empty", "col_s", ""),
+      flatdoc("id", "x", "col_s", "x"),
+  }, UpdateMessage::COMMIT).success);
+  auto sortedIds = [&](qb::SortDir dir) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q").allQuery().fields({"id"}).limit(-1);
+    qb::sort(cur, "col_s", dir);
+    req->execute();
+    std::vector<std::string> ids;
+    for (const auto& doc : req->getDocs()) ids.push_back(std::get<std::string>(*find(doc, "id")));
+    return ids;
+  };
+  EXPECT_EQ((std::vector<std::string>{"empty", "x", "missing"}), sortedIds(qb::ASC));
+  EXPECT_EQ((std::vector<std::string>{"x", "empty", "missing"}), sortedIds(qb::DESC));
 }

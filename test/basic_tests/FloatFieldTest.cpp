@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include <array>
 #include <cmath>
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "test/TestUtils.h"
+#include "luxir/server/JsonRequest.h"
 #include "luxir/util/NumericUtils.h"
 
 using namespace luxir;
@@ -80,7 +83,8 @@ TEST_F(FloatFieldTest, roundTrip) {
   CollectionHelper helper;
 
   // multi-valued float input goes in as vector<double> (vector<float> is
-  // reserved for dense VECTOR fields); values come back as vector<float>.
+  // reserved for dense VECTOR fields); values come back as vector<float>,
+  // ascending per doc.
   helper.index(flatdoc("id_s", "d1", "price_f", -1.5f, "weight_d", -2.5,
                        "vals_ds", vec(0.5, -2.75), "vals_fs", vec(7.5, -0.25)),
                UpdateMessage::NO_COMMIT);
@@ -100,7 +104,7 @@ TEST_F(FloatFieldTest, roundTrip) {
   auto docs = req->getDocs();
   ASSERT_EQ(3u, docs.size());
   EXPECT_CONTAINS_DOC(docs, flatdoc("id_s", "d1", "price_f", -1.5f, "weight_d", -2.5,
-                                    "vals_fs", vec(7.5f, -0.25f), "vals_ds", vec(0.5, -2.75)));
+                                    "vals_fs", vec(-0.25f, 7.5f), "vals_ds", vec(-2.75, 0.5)));
   EXPECT_CONTAINS_DOC(docs, flatdoc("id_s", "d2", "price_f", 0.25f, "weight_d", 1e100,
                                     "vals_ds", vec(42.0)));
   EXPECT_CONTAINS_DOC(docs, flatdoc("id_s", "d3", "weight_d", std::numeric_limits<double>::infinity()));
@@ -217,4 +221,130 @@ TEST_F(FloatFieldTest, avg) {
 
   ASSERT_DOUBLE_EQ(3.0, req->scalar<double>("avgf"));
   ASSERT_DOUBLE_EQ(2.0, req->scalar<double>("avgd"));
+}
+
+// Facet buckets on float and double fields count documents per decoded value.
+TEST_F(FloatFieldTest, facetCountsOnFloatingFields) {
+  CollectionHelper helper;
+
+  helper.index(flatdoc("id_s", "a", "price_f", 1.5f, "weight_d", -1.5), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "b", "price_f", 1.5f, "weight_d", 2.5), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "c", "price_f", 6.0f, "weight_d", 2.5), UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().limit(10);
+  req->facet("ff", "price_f").limit(-1);
+  req->facet("fd", "weight_d").limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+
+  const auto* ff = req->responses[0]->proto.ops.at("ff")->facetResult();
+  ASSERT_NE(ff, nullptr);
+  auto& fids = std::get<luxir::api::ColFloat>(ff->bucket_ids->kind);
+  ASSERT_EQ(2u, fids.v.size());
+  ASSERT_FLOAT_EQ(1.5f, fids.v[0]);
+  ASSERT_FLOAT_EQ(6.0f, fids.v[1]);
+  ASSERT_EQ((std::vector<int64_t>{2, 1}), std::vector<int64_t>(ff->counts.begin(), ff->counts.end()));
+
+  const auto* fd = req->responses[0]->proto.ops.at("fd")->facetResult();
+  ASSERT_NE(fd, nullptr);
+  auto& dids = std::get<luxir::api::ColDouble>(fd->bucket_ids->kind);
+  ASSERT_EQ(2u, dids.v.size());
+  ASSERT_DOUBLE_EQ(2.5, dids.v[0]);
+  ASSERT_DOUBLE_EQ(-1.5, dids.v[1]);
+  ASSERT_EQ((std::vector<int64_t>{2, 1}), std::vector<int64_t>(fd->counts.begin(), fd->counts.end()));
+}
+
+TEST_F(FloatFieldTest, facetSelectionsUseEncodedValuesAndInputOrder) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "a", "price_f", 0.1f, "price_d", 0.1),
+    flatdoc("id", "b", "price_f", 0.1f, "price_d", 0.1),
+    flatdoc("id", "c", "price_f", 2.0f, "price_d", 2.0),
+    flatdoc("id", "d", "price_f", 3.0f, "price_d", 3.0),
+    flatdoc("id", "missing"),
+  }, UpdateMessage::COMMIT).success);
+
+  for (const char* field : {"price_f", "price_d"}) {
+    SCOPED_TRACE(field);
+    auto req = localReq(helper.getSearchEngine());
+    parseQueryRequest(std::string(R"({"query":"*:*","limit":0,"count_limit":-1,"ops":{
+        "f":{"field_facet":{"field":")") + field
+        + R"(","limit":1,"missing":true,"selected":[3,0.1,9,2]}}}})",
+        req->rawRequest(), req->mr);
+    req->collection("main");
+    req->execute(false);
+    ASSERT_OK(req);
+    EXPECT_EQ(4, req->getMatchCount());
+    const auto& facet = *req->docList()->ops.at("f")->facetResult();
+    EXPECT_EQ((std::vector<int64_t>{2, 1, 0, 1}),
+              std::vector<int64_t>(facet.counts.begin(), facet.counts.end()));
+    EXPECT_EQ(1, facet.missing.value_or(-1));
+    std::visit([](const auto& ids) {
+      using T = std::decay_t<decltype(ids)>;
+      if constexpr (std::is_same_v<T, api::ColFloat>) {
+        EXPECT_EQ((std::vector<float>{0.1f, 3.0f, 9.0f, 2.0f}),
+                  std::vector<float>(ids.v.begin(), ids.v.end()));
+      } else if constexpr (std::is_same_v<T, api::ColDouble>) {
+        EXPECT_EQ((std::vector<double>{0.1, 3.0, 9.0, 2.0}),
+                  std::vector<double>(ids.v.begin(), ids.v.end()));
+      } else FAIL() << "expected floating bucket IDs";
+    }, facet.bucket_ids->kind);
+  }
+}
+
+TEST_F(FloatFieldTest, facetChildrenAndMetricSort) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "a", "price_f", 0.1f, "q_i", 2, "cat_s", "x"),
+    flatdoc("id", "b", "price_f", 0.1f, "q_i", 3, "cat_s", "y"),
+    flatdoc("id", "c", "price_f", -2.0f, "q_i", 10, "cat_s", "z"),
+  }, UpdateMessage::COMMIT).success);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& facet = req->facet("f", "price_f").limit(2);
+  facet.sum("s", "q_i");
+  qb::sort(facet, "s", qb::DESC);
+  facet.facet("cats", "cat_s").limit(-1);
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& result = *req->responses[0]->proto.ops.at("f")->facetResult();
+  const auto& ids = std::get<api::ColFloat>(result.bucket_ids->kind).v;
+  EXPECT_EQ((std::vector<float>{-2.0f, 0.1f}), std::vector<float>(ids.begin(), ids.end()));
+  EXPECT_EQ((std::vector<int64_t>{1, 2}), std::vector<int64_t>(result.counts.begin(), result.counts.end()));
+  const auto& sums = std::get<api::ArrVal>(result.ops.at("s")->kind).v;
+  ASSERT_EQ(2u, sums.size());
+  EXPECT_EQ(10, sums[0].asInt());
+  EXPECT_EQ(5, sums[1].asInt());
+  const auto& children = std::get<api::ArrVal>(result.ops.at("cats")->kind).v;
+  ASSERT_EQ(2u, children.size());
+  for (size_t i = 0; i < children.size(); i++) {
+    const auto& child = *children[i].facetResult();
+    auto labels = std::get<api::ColStr>(child.bucket_ids->kind).v;
+    EXPECT_EQ(i == 0 ? (std::vector<std::string_view>{"z"}) : (std::vector<std::string_view>{"x", "y"}),
+              std::vector<std::string_view>(labels.begin(), labels.end()));
+    for (int64_t count : child.counts) EXPECT_EQ(1, count);
+  }
+}
+
+TEST_F(FloatFieldTest, facetCountsDistinctKeys) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "a", "price_f", 0.1f, "key_s", "x"),
+    flatdoc("id", "b", "price_f", 0.1f, "key_s", "x"),
+    flatdoc("id", "c", "price_f", 0.1f, "key_s", "y"),
+    flatdoc("id", "d", "price_f", -2.0f, "key_s", "x"),
+  }, UpdateMessage::COMMIT).success);
+
+  auto req = localReq(helper.getSearchEngine());
+  parseQueryRequest(R"({"ops":{"f":{"field_facet":{
+      "field":"price_f","limit":-1,"count_distinct":"key_s"}}}})", req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& result = *req->responses[0]->proto.ops.at("f")->facetResult();
+  const auto& ids = std::get<api::ColFloat>(result.bucket_ids->kind).v;
+  EXPECT_EQ((std::vector<float>{0.1f, -2.0f}), std::vector<float>(ids.begin(), ids.end()));
+  EXPECT_EQ((std::vector<int64_t>{2, 1}), std::vector<int64_t>(result.counts.begin(), result.counts.end()));
 }

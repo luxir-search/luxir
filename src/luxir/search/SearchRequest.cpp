@@ -6,31 +6,81 @@
 #include <cassert>
 
 #include "SearchEngine.h"
+#include "OwnershipRelation.h"
 #include "luxir/api/build.h"
 #include "luxir/search/SearchOverrides.h"
 
 namespace luxir {
 
+const std::shared_ptr<IndexReader>& SearchRequest::pinView(std::string_view path) {
+  if (path == reader->path()) return reader;
+  const std::lock_guard lock(mutex);
+  if (!scopedStates) scopedStates = std::make_unique<std::map<std::string, ScopedState, std::less<>>>();
+  auto found = scopedStates->find(path);
+  if (found != scopedStates->end()) return found->second.reader;
+  reader->schema()->requirePath(path);
+  auto scoped = reader->view(path);
+  auto uses = std::make_shared<FilterCache::UseRegistry>(scoped->filterCache(), *scoped);
+  return scopedStates->emplace(std::string(path), ScopedState{std::move(scoped), std::move(uses), {}}).first->second.reader;
+}
+
+const std::shared_ptr<FilterCache::UseRegistry>& SearchRequest::uses(IndexReader& scoped) {
+  if (&scoped == reader.get()) return filterUses;
+  pinView(scoped.path());
+  const std::lock_guard lock(mutex);
+  return scopedStates->find(scoped.path())->second.uses;
+}
+
+OwnershipRelation& SearchRequest::ownershipRelation(IndexReader& many, IndexReader& one) {
+  if (many.path() == one.path()) throw RequestError("domain transform requires different spaces");
+  if (pinView(many.path()).get() != &many || pinView(one.path()).get() != &one) {
+    throw RequestError("relation views must belong to this request");
+  }
+  const std::lock_guard lock(mutex);
+  auto& state = scopedStates->find(&many == reader.get() ? one.path() : many.path())->second;
+  auto key = std::pair{std::string(many.path()), std::string(one.path())};
+  auto found = state.relations.find(key);
+  if (found != state.relations.end()) return *found->second;
+  auto* relation = arenaCreate<OwnershipRelation>(arena, many, one, memoryTracker);
+  state.relations.emplace(std::move(key), relation);
+  return *relation;
+}
+
+Query::PlanningContext* SearchRequest::createPlanningContext(IndexReader& view) {
+  Query::PlanningContext::Limits limits;
+  limits.multiTermBudget = &multiTermBudget;
+  return arenaCreate<Query::PlanningContext>(arena, requestPool, view, limits, &warnings,
+      FilterKeyContext{.schemaGen = schema->gen_, .timeZone = proto.time_zone},
+      uses(view), &memoryTracker, proto.profile ? this : nullptr);
+}
+
 SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
-                             google::protobuf::Arena& arena)
+                             google::protobuf::Arena& arena,
+                             std::chrono::steady_clock::time_point startTime)
     : engine(engine), searchConfig(engine.searchConfig()),
       memoryTracker(forcedRequestMemoryMaxBytes != 0
                         ? forcedRequestMemoryMaxBytes
                         : searchConfig.request_memory_max_bytes),
+      multiTermBudget(MultiTermLimits{
+          .maxExpansions = searchConfig.multiterm_max_expansions,
+          .maxTermsExamined = searchConfig.multiterm_max_terms_examined,
+          .maxPostings = searchConfig.multiterm_max_postings,
+      }),
       proto(proto), arena(arena), dateMathNowEpochMillis(
           forcedDateMathNowEpochMillis.value_or(currentEpochMillis())),
+      startTime(startTime),
       timeZone(resolveTimeZone(proto.time_zone)) {
   if (!timeZone) timeZoneError = timeZoneResolutionError(proto.time_zone);
 }
 
 // A dispatched search that never sent its final response was abandoned.
 SearchRequest::~SearchRequest() {
-  if (counting && !finalSent) count(MetricOutcome::CANCELLED);
+  if (counting && !finalSent) count(MetricOutcome::CANCELLED, std::chrono::steady_clock::now());
 }
 
 // Counts the search for the node and, once resolved, for its collection.
-void SearchRequest::count(MetricOutcome outcome) {
-  auto nanos = nanosSince(submitted);
+void SearchRequest::count(MetricOutcome outcome, std::chrono::steady_clock::time_point end) {
+  auto nanos = nanosSince(submitted, end);
   engine.metrics().complete(metricActivity(MetricStage::SEARCH), outcome, nanos);
   if (collectionMetrics) collectionMetrics->search(outcome, nanos);
 }
@@ -75,8 +125,12 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
     }
   }
   if (send) {
+    // The only clock read at the end of a request: no other thread touches
+    // lastResponse once finalSent is decided.
+    auto end = std::chrono::steady_clock::now();
+    lastResponse->proto.took_us = microsSince(startTime, end);
     if (!warnings.empty()) engine.metrics().add(MetricCounter::SEARCH_WARNINGS);
-    if (counting) count(lastResponse->proto.error ? MetricOutcome::ERROR : MetricOutcome::OK);
+    if (counting) count(lastResponse->proto.error ? MetricOutcome::ERROR : MetricOutcome::OK, end);
     reply(*lastResponse);  // may delete *this*; nothing after this call
   }
 }

@@ -12,6 +12,12 @@ namespace luxir {
 
 class LuxirNode;
 
+// Only the node-wide counters and memory summary run on a transport thread.
+inline bool canGatherStatsInline(const api::StatsRequest& request) {
+  return request.collection.empty() && request.tenant.empty() && !request.collections &&
+         !request.system && !request.host && !request.files && !request.segments;
+}
+
 // Build one typed stats response. The response borrows all repeated/string
 // backing from `resource`, which must outlive serialization. Both the JSON and
 // the Prometheus renderings are produced from this one response.
@@ -26,9 +32,9 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
 void gatherSystemStats(api::SystemStats* system, api::HostStats* host, std::string_view dataDirectory,
                        std::pmr::memory_resource& resource);
 
-// Apply the requested filter-cache actions (flush / reset_admission /
-// reset_counters) and gather post-action stats plus an optional resident-entry
-// dump. Same borrowing contract as gatherStats.
+// Apply the requested filter-cache actions (max_bytes resize / flush /
+// reset_admission / reset_counters) and gather post-action stats plus an
+// optional resident-entry dump. Same borrowing contract as gatherStats.
 void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request,
                         api::CacheControlResponse& response,
                         std::pmr::memory_resource& resource);

@@ -114,6 +114,8 @@ public:
 /// written past the encoded bytes.
 class LuxirSIMDFor : public U32Codec {
 public:
+  static constexpr uint32_t BLOCK_SIZE = 128;
+
   ~LuxirSIMDFor() override = default;
 
   // encodeWithMeta: caller supplies minval + bits (from block metadata); stores no header.
@@ -121,8 +123,8 @@ public:
 
   static constexpr uint64_t byteSize(uint32_t count, uint8_t bits) {
     if (bits == 0) return 0;
-    uint64_t fullBlocks = count / 128;
-    uint32_t tail = count % 128;
+    uint64_t fullBlocks = count / BLOCK_SIZE;
+    uint32_t tail = count % BLOCK_SIZE;
     uint64_t bytes = fullBlocks * 4 * bits * sizeof(uint32_t);
     if (tail != 0) {
       uint64_t rows = (tail + 3) / 4;
@@ -137,7 +139,7 @@ public:
   inline uint32_t decodeWithMeta(const char* encoded, uint32_t* out, uint32_t outSz, uint8_t bits) {
     const uint32_t* in = (const uint32_t*) encoded;
     uint32_t k = 0;
-    for (; k + 128 <= outSz; k += 128) {
+    for (; k + BLOCK_SIZE <= outSz; k += BLOCK_SIZE) {
       FastPForLib::usimdunpack((const __m128i*) in, out + k, bits);  // bits 0 and 32 handled by the kernel
       in += 4 * bits;
     }
@@ -147,8 +149,8 @@ public:
 
   // decode a single block (128) or less.
   inline void decodeSingleBlock(const char* encoded, uint32_t* out, uint32_t outSz, uint8_t bits) {
-    assert(outSz <= 128);
-    if (outSz < 128) [[unlikely]] {
+    assert(outSz <= BLOCK_SIZE);
+    if (outSz < BLOCK_SIZE) [[unlikely]] {
       decodeTailMeta((const uint32_t*)encoded, outSz, out, bits);
     } else {
       FastPForLib::usimdunpack((const __m128i*) encoded, out, bits);
@@ -171,8 +173,8 @@ public:
     if (bits == 0) {
       return minval;  // all values equal minval, nothing encoded (hand-rolled, so guard the read).
     }
-    in += index / 128 * 4 * bits;
-    const uint32_t slot = index % 128;
+    in += index / BLOCK_SIZE * 4 * bits;
+    const uint32_t slot = index % BLOCK_SIZE;
     const uint32_t lane = slot % 4;                /* 4 interleaved lanes */
     const uint32_t bitsinlane = (slot / 4) * bits; /* bits already used in lane */
     const uint32_t firstwordinlane = bitsinlane / 32;

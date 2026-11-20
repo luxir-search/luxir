@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <stdexcept>
 #include "luxir/util/StrRef.h"
 #include "luxir/util/encoding.h"
 
@@ -169,6 +170,40 @@ public:
 
   template<class T> T readVal() {
     return T::read(*this);
+  }
+
+  // Bounds-checked reads for the metadata a reader decodes before trusting a
+  // file (segment info, field catalog). The reads above only assert, which a
+  // release build compiles out, so a truncated file or one in another format
+  // would read past the mapping.
+  void require(int64_t len) const {
+    if (len < 0 || len > left()) throw std::runtime_error("index data is truncated or in an unsupported format");
+  }
+
+  int32_t checkedInt() {
+    require(sizeof(uint32_t));
+    return readInt();
+  }
+
+  uint64_t checkedVlong(int maxBytes = 10) {
+    uint64_t val = 0;
+    for (int i = 0; i < maxBytes; i++) {
+      require(1);
+      char b = *pos++;
+      val |= uint64_t(b & 0x7f) << (7 * i);
+      if ((b & 0x80) == 0) return val;
+    }
+    throw std::runtime_error("index data has an invalid variable-length integer");
+  }
+
+  uint32_t checkedVint() {
+    return (uint32_t)checkedVlong(5);
+  }
+
+  PackedTerm checkedPackedTerm() {
+    require(1);
+    require(PackedTerm(const_cast<char *>(pos)).memorySize());
+    return readPackedTerm();
   }
 
   friend std::ostream &operator<<(std::ostream &out, const InputStream &is) {

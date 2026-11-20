@@ -6,12 +6,14 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
 
 #include "luxir/index/PointsWriter.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/reader/PostingsReader.h"
@@ -24,6 +26,7 @@
 
 using namespace luxir;
 using namespace luxir::test;
+
 
 namespace {
 
@@ -64,7 +67,7 @@ void setRangeSchema(CollectionHelper& helper, std::span<const RangeField> fields
     auto& f = b.field(fs.name);
     f.type = api::FieldDef::FieldClass::INT;
     f.index = api::FieldDef::IndexMode::RANGE;
-    f.multi = fs.multi;
+    f.multi = (fs.multi) ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
   }
   b.set(helper.collection());
 }
@@ -188,7 +191,9 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
                           const Query::Demand& demand,
                           ExpectedScorerKind expectedKind,
                           Query::MatchState expectedMatchState =
-                              Query::MatchState::NONEMPTY) {
+                              Query::MatchState::NONEMPTY,
+                          Query::MembershipConsumption consumption =
+                              Query::MembershipConsumption::WINDOWS) {
   MemPool pool;
   QueryState state(pool, reader, field, lo, hi);
   auto* supplier = state.weight->scorerSupplier(
@@ -197,9 +202,16 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
 
   Query::PlanContext buildContext;
   buildContext.demand = demand;
+  buildContext.membershipConsumption = consumption;
   Query::ScorerShape shape = supplier->describeScorer(buildContext);
-  bool expectedTwoPhase = expectedKind == ExpectedScorerKind::SPARSE_VERIFY
-      || expectedKind == ExpectedScorerKind::SCAN;
+  EXPECT_EQ(consumption == Query::MembershipConsumption::EITHER
+                ? expectedKind == ExpectedScorerKind::SPARSE_VERIFY
+                    ? Query::MembershipConsumption::CANDIDATES
+                    : Query::MembershipConsumption::WINDOWS
+                : consumption,
+            shape.membershipConsumption);
+  // A scan produces matches; only the sparse verifier defers its value test.
+  bool expectedTwoPhase = expectedKind == ExpectedScorerKind::SPARSE_VERIFY;
   EXPECT_EQ(expectedMatchState, shape.matchState);
   EXPECT_EQ(Query::DirectScorerKind::OTHER, shape.directKind);
   EXPECT_EQ(expectedTwoPhase ? Query::ReportedTwoPhase::YES
@@ -216,8 +228,13 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
   EXPECT_EQ(Query::UnresolvedSupplierCause::NONE,
             supplier->unresolvedScorerCause(buildContext));
 
-  Query::Scorer* scorer =
-      supplier->resolve(pool, buildContext)->build(pool);
+  auto* plan = supplier->resolve(pool, buildContext);
+  EXPECT_EQ(shape.membershipConsumption, plan->shape().membershipConsumption);
+  if (expectedKind == ExpectedScorerKind::POINTS_ARRAY
+      || expectedKind == ExpectedScorerKind::POINTS_BIT) {
+    EXPECT_EQ(nullptr, plan->buildMembershipProof(pool));
+  }
+  Query::Scorer* scorer = plan->build(pool);
   ASSERT_NE(nullptr, scorer);
   EXPECT_EQ(expectedKind == ExpectedScorerKind::SPARSE_VERIFY,
             dynamic_cast<NumericPredicateQuery::PredicateScorer<
@@ -250,6 +267,245 @@ void expectShapeAndScorer(IndexReader& reader, std::string_view field,
 } // namespace
 
 class NumericRangePointsTest : public LuxirTest {};
+
+TEST_F(NumericRangePointsTest, rejectedPointsBudgetDoesNotCacheTheLowerBound) {
+  constexpr int32_t N = 65536;
+  CollectionHelper helper;
+  const RangeField fields[] = {{"points"}};
+  setRangeSchema(helper, fields);
+  std::vector<int64_t> values(N);
+  std::iota(values.begin(), values.end(), 0);
+  SplitMix64 rng(0x5eed);
+  for (int32_t i = N; i > 1; i--) std::swap(values[(size_t)i - 1], values[(size_t)rng.rint(i)]);
+  auto writer = helper.getIndexWriter();
+  auto& inverter = writer->obtainInverter();
+  for (int64_t value : values) {
+    inverter.startDoc();
+    inverter.getIndexHandler("points").index(inverter, value);
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter, true);
+  helper.commit();
+  auto reader = writer->snapshots.readers.getReader();
+  MemPool pool;
+  QueryState state(pool, *reader, "points", N / 4, 3 * N / 4 - 1);
+  auto* supplier = state.weight->scorerSupplier(pool, reader->segments()[0]);
+  ASSERT_NE(nullptr, supplier);
+  // Tiny rejects by the lower bound. Medium needs the exact FOR price and
+  // still verifies. Large selects points; repeating exercises the exact cache.
+  for (int candidates : {100, N / 100, N / 10, N / 100}) {
+    auto context = supplier->makePlanContext(Query::Demand::fromLeadCost(candidates));
+    context.membershipConsumption = Query::MembershipConsumption::CANDIDATES;
+    auto shape = supplier->describeScorer(context);
+    EXPECT_EQ(candidates == N / 10 ? Query::ReportedTwoPhase::NO : Query::ReportedTwoPhase::YES,
+              shape.reportedTwoPhase);
+  }
+}
+
+TEST_F(NumericRangePointsTest, postingsWalkUsesTheZoneBudget) {
+  constexpr int32_t N = 8192;
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  for (auto name : {"sorted", "collisions", "shuffled", "multi"}) {
+    auto& field = schema.field(name);
+    field.type = api::FieldDef::FieldClass::INT;
+    field.index = api::FieldDef::IndexMode::MATCH;
+    field.multi = name == std::string_view("multi")
+        ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
+  }
+  schema.set(helper.collection());
+  std::vector<int64_t> shuffled(N);
+  std::iota(shuffled.begin(), shuffled.end(), 0);
+  SplitMix64 rng(0x5eed);
+  for (int32_t i = N; i > 1; i--) std::swap(shuffled[(size_t)i - 1], shuffled[(size_t)rng.rint(i)]);
+  auto writer = helper.getIndexWriter();
+  auto& inverter = writer->obtainInverter();
+  for (int32_t doc = 0; doc < N; doc++) {
+    inverter.startDoc();
+    inverter.getIndexHandler("sorted").index(inverter, (int64_t)doc);
+    int64_t collision = doc >= N / 4 && doc < N / 4 + 16 ? N / 4 : doc;
+    inverter.getIndexHandler("collisions").index(inverter, collision * 1000);
+    inverter.getIndexHandler("shuffled").index(inverter, shuffled[(size_t)doc]);
+    const int64_t multi[] = {doc, doc + N};
+    inverter.getIndexHandler("multi").index(inverter, std::span<const int64_t>(multi));
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter, true);
+  helper.commit();
+  auto reader = writer->snapshots.readers.getReader();
+  for (std::string_view name : {"sorted", "collisions", "shuffled", "multi"}) {
+    int64_t scale = name == "collisions" ? 1000 : 1;
+    int64_t lo = N / 4 * scale, hi = (3 * N / 4 - 1) * scale;
+    auto& segment = reader->segments()[0];
+    IntColReader column(segment.postingsReader(), *reader->field(name).at(segment.ord));
+    if (name == "shuffled") {
+      EXPECT_EQ(0, column.leafMeta().summarizeRange(lo, hi).insideLower);
+    }
+    EXPECT_EQ(name == "multi", column.multiValued());
+    for (bool forced : {false, true}) {
+      SkipStatsScope stats;
+      MemPool pool;
+      Query::Context context(pool, *reader);
+      NumericPredicateQuery query(name, lo, hi);
+      if (forced) query.forcedArm = NumericPredicateQuery::ScorerArm::POSTINGS;
+      auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, segment);
+      ASSERT_NE(nullptr, supplier);
+      if (forced) {
+        EXPECT_EQ(N / 2 - (name == "collisions" ? 15 : 0), SkipStats::numericPredicatePostingsTerms);
+      } else if (name == "multi") {
+        EXPECT_GT(SkipStats::numericPredicatePostingsTerms, 0);
+      } else {
+        EXPECT_EQ(0, SkipStats::numericPredicatePostingsTerms);
+      }
+      EXPECT_EQ(N / 2, collect(buildScorerForTests(pool, *supplier, INT64_MAX)).size());
+    }
+  }
+}
+
+TEST_F(NumericRangePointsTest, plansAndBuildsTheRequestedArm) {
+  using Arm = NumericPredicateQuery::ScorerArm;
+  constexpr int32_t N = 4096;
+  constexpr int32_t MATCHES = N * 9 / 10;
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  for (auto name : {"points", "postings", "column", "multi", "crossing", "constant"}) {
+    auto& f = schema.field(name);
+    f.type = api::FieldDef::FieldClass::INT;
+    f.index = name == std::string_view("points") || name == std::string_view("multi")
+        ? api::FieldDef::IndexMode::RANGE
+        : name == std::string_view("postings") || name == std::string_view("constant")
+            ? api::FieldDef::IndexMode::MATCH : api::FieldDef::IndexMode::NONE;
+    f.multi = name == std::string_view("multi")
+        ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
+  }
+  schema.set(helper.collection());
+  auto writer = helper.getIndexWriter();
+  auto& inverter = writer->obtainInverter();
+  for (int32_t doc = 0; doc < N; doc++) {
+    inverter.startDoc();
+    for (auto name : {"points", "postings", "column"}) {
+      inverter.getIndexHandler(name).index(inverter, (int64_t)(doc < MATCHES));
+    }
+    const int64_t values[] = {0, 1};
+    inverter.getIndexHandler("multi").index(inverter, std::span<const int64_t>(values));
+    inverter.getIndexHandler("crossing").index(inverter, (int64_t)(doc % 2));
+    inverter.getIndexHandler("constant").index(inverter, (int64_t)1);
+    inverter.getIndexHandler("body_w").index(
+        inverter, std::string_view(doc % 100 == 0 ? "lead" : "all"));
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter, true);
+  helper.commit();
+  auto reader = writer->snapshots.readers.getReader();
+  auto& segment = reader->segments()[0];
+
+  for (auto arm : {Arm::POINTS, Arm::COMPLEMENT, Arm::SPARSE_VERIFY,
+                   Arm::POSTINGS, Arm::ZONE_MAP, Arm::SCAN}) {
+    auto counter = [&] {
+      switch (arm) {
+        case Arm::POINTS: return SkipStats::numericPredicatePointsArms;
+        case Arm::COMPLEMENT: return SkipStats::numericPredicateComplementArms;
+        case Arm::SPARSE_VERIFY: return SkipStats::numericPredicateSparseVerifyArms;
+        case Arm::POSTINGS: return SkipStats::numericPredicatePostingsArms;
+        case Arm::ZONE_MAP: return SkipStats::numericPredicateZoneArms;
+        case Arm::SCAN: return SkipStats::numericPredicateScanArms;
+      }
+      std::unreachable();
+    };
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    NumericPredicateQuery query(arm == Arm::POSTINGS ? "postings" : "points", 1, 1);
+    query.forcedArm = arm;
+    auto* weight = query.createWeight(context, 0);
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    ASSERT_NE(nullptr, supplier);
+    EXPECT_EQ(Query::CountHow::ITERATE, weight->countShortcut(segment, nullptr).how);
+    for (auto consumption : {Query::MembershipConsumption::CANDIDATES,
+                             Query::MembershipConsumption::WINDOWS,
+                             Query::MembershipConsumption::EITHER}) {
+      for (int64_t candidates : {(int64_t)1, (int64_t)N}) {
+        auto planContext = supplier->makePlanContext(Query::Demand::fromLeadCost(candidates));
+        planContext.membershipConsumption = consumption;
+        SkipStatsScope stats;
+        auto* scorer = supplier->resolve(pool, planContext)->build(pool);
+        int32_t count = 0;
+        for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+          EXPECT_EQ(count++, doc);
+        }
+        EXPECT_EQ(MATCHES, count);
+        EXPECT_EQ(1, counter());
+      }
+    }
+    for (bool constantCount : {false, true}) {
+      SkipStatsScope stats;
+      Query::ScorerSupplier::BulkScorerContext bulkContext;
+      bulkContext.requireConstantCount = constantCount;
+      auto plan = supplier->planBulk(Query::ExecutionUse::COUNT_WINDOWS, bulkContext);
+      if (constantCount || arm == Arm::SCAN || arm == Arm::SPARSE_VERIFY) {
+        EXPECT_EQ(Query::ScorerSupplier::BulkAnswer::NO, plan.available);
+        EXPECT_EQ(0, counter());
+      } else {
+        ASSERT_EQ(Query::ScorerSupplier::BulkAnswer::YES, plan.available);
+        EXPECT_FALSE(plan.hasConstantCount());
+        auto* bulk = supplier->buildBulk(pool, plan);
+        int64_t count = 0;
+        for (int32_t cursor = 0; cursor < N;) {
+          cursor = bulk->countNextWindow(count, nullptr, nullptr, cursor, N);
+        }
+        EXPECT_EQ(MATCHES, count);
+        EXPECT_EQ(1, counter());
+      }
+    }
+    // Exercise the real parent planner, including its scalar-count probes.
+    TermQuery lead("body_w", "lead");
+    std::array<Query*, 1> required{&lead}, filters{&query};
+    BooleanQuery filtered(required, {}, {}, filters);
+    auto* parent = filtered.createWeight(context, 0)->scorerSupplier(pool, segment);
+    ASSERT_NE(nullptr, parent);
+    SkipStatsScope stats;
+    auto bulkPlan = parent->planBulk(Query::ExecutionUse::COUNT_WINDOWS, {});
+    int64_t count = 0;
+    if (bulkPlan.available == Query::ScorerSupplier::BulkAnswer::YES) {
+      auto* bulk = parent->buildBulk(pool, bulkPlan);
+      for (int32_t cursor = 0; cursor < N;) {
+        cursor = bulk->countNextWindow(count, nullptr, nullptr, cursor, N);
+      }
+    } else {
+      auto* scorer = buildScorerForTests(pool, *parent, INT64_MAX);
+      while (scorer->next() != PostingsReader::END) count++;
+    }
+    EXPECT_EQ((MATCHES + 99) / 100, count);
+    EXPECT_EQ(1, counter());
+  }
+
+  auto trySupplier = [&](std::string_view field, Arm arm) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    NumericPredicateQuery query(field, 1, 1);
+    query.forcedArm = arm;
+    query.createWeight(context, 0)->scorerSupplier(pool, segment);
+  };
+  for (auto [field, arm] : {std::pair{"column", Arm::POINTS}, {"points", Arm::POSTINGS},
+                           {"postings", Arm::POINTS}, {"multi", Arm::COMPLEMENT},
+                           {"crossing", Arm::ZONE_MAP}, {"missing", Arm::SCAN}}) {
+    EXPECT_THROW(trySupplier(field, arm), std::invalid_argument);
+  }
+  // All-match equality and a two-term union still execute postings.
+  for (auto field : {"constant", "postings"}) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    NumericPredicateQuery query(field, field == std::string_view("constant") ? 1 : 0, 1);
+    query.forcedArm = Arm::POSTINGS;
+    auto* supplier = query.createWeight(context, 0)->scorerSupplier(pool, segment);
+    ASSERT_NE(nullptr, supplier);
+    SkipStatsScope stats;
+    auto* scorer = buildScorerForTests(pool, *supplier, INT64_MAX);
+    int32_t count = 0;
+    while (scorer->next() != PostingsReader::END) count++;
+    EXPECT_EQ(N, count);
+    EXPECT_EQ(1, SkipStats::numericPredicatePostingsArms);
+  }
+}
 
 TEST_F(NumericRangePointsTest, exactSetUsesCoalescedPointRunsForCostAndShape) {
   constexpr int32_t N = 1400;
@@ -469,13 +725,14 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   constexpr int32_t N = 33'000;
   CollectionHelper helper;
   const RangeField fields[] = {
-    {"arm_sorted"}, {"arm_shuffled"}, {"arm_multi", true}};
+    {"arm_sorted"}, {"arm_shuffled"}, {"arm_sparse"}, {"arm_multi", true}};
   setRangeSchema(helper, fields);
 
   auto writer = helper.getIndexWriter();
   Inverter& inverter = writer->obtainInverter();
   auto& sorted = inverter.getIndexHandler("arm_sorted");
   auto& shuffled = inverter.getIndexHandler("arm_shuffled");
+  auto& optional = inverter.getIndexHandler("arm_sparse");
   auto& multi = inverter.getIndexHandler("arm_multi");
   auto& scanSorted = inverter.getIndexHandler("arm_scan_sorted_i");
   auto& scanShuffled = inverter.getIndexHandler("arm_scan_shuffled_i");
@@ -483,7 +740,8 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
     inverter.startDoc();
     sorted.index(inverter, doc);
     shuffled.index(inverter, (int64_t)((doc * 7919) % 33001));
-    const int64_t duplicateValues[] = {doc, doc};
+    if (doc % 4 != 0) optional.index(inverter, doc);
+    const int64_t duplicateValues[] = {doc, doc + 1, doc};
     multi.index(inverter, duplicateValues);
     scanSorted.index(inverter, doc);
     scanShuffled.index(inverter, (int64_t)((doc * 7919) % 33001));
@@ -494,6 +752,8 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   auto reader = writer->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
 
+  // Each range verifies below the lead cost where producing becomes
+  // cheaper and produces at and above it.
   auto sweepShape = [&](std::string_view field, int64_t lo, int64_t hi,
                         ExpectedScorerKind denseKind,
                         Query::MatchState matchState =
@@ -502,19 +762,33 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
     QueryState state(pool, *reader, field, lo, hi);
     auto* supplier = state.weight->scorerSupplier(pool, segment);
     ASSERT_NE(nullptr, supplier);
-    int64_t supplierCost = supplier->cost();
-    ASSERT_GT(supplierCost, 0);
-    expectShapeAndScorer(*reader, field, lo, hi, supplierCost - 1,
-                         ExpectedScorerKind::SPARSE_VERIFY, matchState);
+    auto verifies = [&](int64_t leadCost) {
+      Query::PlanContext context;
+      context.demand = Query::Demand::fromLeadCost(leadCost);
+      context.membershipConsumption = Query::MembershipConsumption::WINDOWS;
+      return supplier->describeScorer(context).reportedTwoPhase
+          == Query::ReportedTwoPhase::YES;
+    };
+    ASSERT_FALSE(verifies(N));
+    int64_t fence = 0;
+    for (int64_t high = N; fence < high;) {
+      int64_t mid = fence + (high - fence) / 2;
+      if (verifies(mid)) fence = mid + 1;
+      else high = mid;
+    }
+    if (fence > 0) {
+      expectShapeAndScorer(*reader, field, lo, hi, fence - 1,
+                           ExpectedScorerKind::SPARSE_VERIFY, matchState);
+      // A pull consumer prices its lead's span, not the candidates.
+      expectShapeAndScorer(
+          *reader, field, lo, hi,
+          Query::Demand::fromCandidatesAndSpan(fence - 1, fence),
+          denseKind, matchState);
+    }
     expectShapeAndScorer(
-        *reader, field, lo, hi,
-        Query::Demand::fromCandidatesAndSpan(
-            supplierCost - 1, supplierCost),
-        denseKind, matchState);
+        *reader, field, lo, hi, fence, denseKind, matchState);
     expectShapeAndScorer(
-        *reader, field, lo, hi, supplierCost, denseKind, matchState);
-    expectShapeAndScorer(
-        *reader, field, lo, hi, supplierCost + 1, denseKind, matchState);
+        *reader, field, lo, hi, fence + 1, denseKind, matchState);
     expectShapeAndScorer(*reader, field, lo, hi,
                          std::numeric_limits<int64_t>::max(), denseKind,
                          matchState);
@@ -522,18 +796,62 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
 
   sweepShape("arm_sorted", 100, 100,
              ExpectedScorerKind::POINTS_ARRAY);
-  sweepShape("arm_sorted", 0, IntColReader::BLOCK_SIZE - 1,
+  sweepShape("arm_shuffled", 0, 9'999,
              ExpectedScorerKind::POINTS_BIT);
-  sweepShape("arm_sorted", 0, 26'000,
+  sweepShape("arm_shuffled", 0, 26'000,
              ExpectedScorerKind::POINTS_BIT);  // complement
-  sweepShape("arm_sorted", 0, N - 1,
-             ExpectedScorerKind::POINTS_BIT);  // all-match complement
   sweepShape("arm_multi", 100, 200,
              ExpectedScorerKind::POINTS_ARRAY);  // dedup
   sweepShape("arm_scan_sorted_i", 0, IntColReader::BLOCK_SIZE - 1,
              ExpectedScorerKind::ZONE_MAP);
   sweepShape("arm_scan_shuffled_i", 0, 9'999,
              ExpectedScorerKind::SCAN, Query::MatchState::UNKNOWN);
+  sweepShape("arm_scan_shuffled_i", 0, 99,
+             ExpectedScorerKind::SCAN, Query::MatchState::UNKNOWN);
+
+  using Consumption = Query::MembershipConsumption;
+  for (int64_t hi : {4095, 26'000, N - 1}) {
+    expectShapeAndScorer(*reader, "arm_sorted", 0, hi, 0,
+                        ExpectedScorerKind::SPARSE_VERIFY);
+    // The aligned short prefix uses zones. Complements emit the remaining
+    // word runs without testing a crossing column leaf.
+    expectShapeAndScorer(*reader, "arm_sorted", 0, hi, N,
+                        hi == 4095 ? ExpectedScorerKind::ZONE_MAP
+                                   : ExpectedScorerKind::POINTS_BIT);
+  }
+  for (auto consumption : {Consumption::EITHER, Consumption::CANDIDATES}) {
+    expectShapeAndScorer(*reader, "arm_sorted", 0, 4095,
+        Query::Demand::fromCandidatesAndSpan(1, N, Query::ExecutionUse::COUNT_WINDOWS),
+        ExpectedScorerKind::SPARSE_VERIFY, Query::MatchState::NONEMPTY, consumption);
+    expectShapeAndScorer(*reader, "arm_sorted", 0, 4095,
+        Query::Demand::fromCandidatesAndSpan(N, N, Query::ExecutionUse::COUNT_WINDOWS),
+        consumption == Consumption::EITHER ? ExpectedScorerKind::ZONE_MAP
+                                          : ExpectedScorerKind::POINTS_BIT,
+        Query::MatchState::NONEMPTY, consumption);
+  }
+  // Sparse INSIDE runs map values to docs; multivalued runs visit documents.
+  // Neither has the dense single-valued word-mask production price.
+  IntColReader multiColumn(segment.postingsReader(), fieldInfo(segment, "arm_multi"));
+  ASSERT_TRUE(multiColumn.multiValued());
+  ASSERT_GT(multiColumn.numValues(), multiColumn.docsWithValue());
+  for (auto field : {"arm_sparse", "arm_multi", "arm_shuffled"}) {
+    expectShapeAndScorer(*reader, field, 0, 4095,
+        Query::Demand::fromCandidatesAndSpan(N, N, Query::ExecutionUse::COUNT_WINDOWS),
+        ExpectedScorerKind::POINTS_BIT, Query::MatchState::NONEMPTY, Consumption::EITHER);
+  }
+  {
+    MemPool pool;
+    QueryState state(pool, *reader, "arm_sorted", 0, 4095);
+    SkipStatsScope stats;
+    auto* supplier = state.weight->scorerSupplier(pool, segment);
+    ASSERT_NE(nullptr, supplier);
+    EXPECT_EQ(4096, supplier->cost());
+    EXPECT_EQ(4096, QueryPrep::supplierCount(supplier));
+    EXPECT_EQ(0, SkipStats::numericPredicateClassifiedBlocks);
+    EXPECT_EQ(0, SkipStats::numericPredicateProofIndexes);
+    EXPECT_EQ(0, SkipStats::numericPredicateZoneArms);
+    EXPECT_EQ(0, SkipStats::numericPredicatePointsArms);
+  }
 
   auto select = [&](std::string_view field, int64_t lo, int64_t hi,
                     int64_t leadCost) {
@@ -559,14 +877,14 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   auto points = select("arm_sorted", 100, 100,
                        std::numeric_limits<int64_t>::max());
   EXPECT_EQ(std::get<3>(points), 1);
-  auto complement = select("arm_sorted", 0, 26'000,
+  auto complement = select("arm_shuffled", 0, 26'000,
                            std::numeric_limits<int64_t>::max());
   EXPECT_EQ(std::get<2>(complement), 1);
-  auto midPoints = select("arm_sorted", 0,
+  auto indexedZone = select("arm_sorted", 0,
                           IntColReader::BLOCK_SIZE - 1,
                           std::numeric_limits<int64_t>::max());
-  EXPECT_EQ(std::get<3>(midPoints), 1);
-  EXPECT_EQ(std::get<4>(midPoints), 0);
+  EXPECT_EQ(std::get<3>(indexedZone), 0);
+  EXPECT_EQ(std::get<4>(indexedZone), 1);
   auto shuffledPoints = select("arm_shuffled", 0, 9'999,
                                std::numeric_limits<int64_t>::max());
   EXPECT_EQ(std::get<3>(shuffledPoints), 1);
@@ -584,8 +902,8 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   EXPECT_EQ(std::get<0>(sparse), fullScan(*reader, "arm_sorted", 100, 100));
   EXPECT_EQ(std::get<0>(points), std::get<0>(sparse));
   EXPECT_EQ(std::get<0>(complement),
-            fullScan(*reader, "arm_sorted", 0, 26'000));
-  EXPECT_EQ(std::get<0>(midPoints), fullScan(
+            fullScan(*reader, "arm_shuffled", 0, 26'000));
+  EXPECT_EQ(std::get<0>(indexedZone), fullScan(
       *reader, "arm_sorted", 0, IntColReader::BLOCK_SIZE - 1));
   EXPECT_EQ(std::get<0>(shuffledPoints),
             fullScan(*reader, "arm_shuffled", 0, 9'999));
@@ -630,8 +948,8 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   checkScoredArm("arm_sorted", 100, 100,
                  std::numeric_limits<int64_t>::max(), true);  // points array
   checkScoredArm("arm_sorted", 0, IntColReader::BLOCK_SIZE - 1,
-                 std::numeric_limits<int64_t>::max(), true);  // points bitset
-  checkScoredArm("arm_sorted", 0, 26'000,
+                 std::numeric_limits<int64_t>::max(), true);  // indexed column zones
+  checkScoredArm("arm_shuffled", 0, 26'000,
                  std::numeric_limits<int64_t>::max(), true);  // complement
   checkScoredArm("arm_scan_sorted_i", 0,
                  IntColReader::BLOCK_SIZE - 1,
@@ -988,7 +1306,7 @@ TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
   auto rebuilt = readPoints(freshReader->segments()[0], "merge_values_is");
   EXPECT_EQ(merged, rebuilt);
   EXPECT_EQ(std::count(merged.begin(), merged.end(),
-                       PointsReader::Point{6, 6}), 2);
+                       PointsReader::Point{6, 6}), 1); // Default set removes the repeated 6.
   EXPECT_EQ(std::count_if(merged.begin(), merged.end(), [](const auto& point) {
               return point.value == 12;
             }), 0);

@@ -41,8 +41,16 @@ public:
     std::vector<std::string> files;
   };
 
+  struct RowSpaceStats {
+    std::string path;
+    int32_t maxDoc = 0;
+    uint64_t endsBytes = 0;
+    uint64_t ownersBytes = 0;
+  };
+
   struct SegmentStats {
     uint64_t segId = 0;
+    uint64_t creatorEpoch = 0;
     uint64_t liveGen = 0;
     uint64_t minUpdateVersion = 0;
     uint64_t maxUpdateVersion = 0;
@@ -50,9 +58,12 @@ public:
     uint64_t schemaGen = 0;
     uint64_t bytes = 0;
     std::vector<AuxStats> overlays;
+    std::vector<RowSpaceStats> spaces;
     int32_t maxDoc = 0;
     int32_t liveDocs = 0;
     bool committed = false;
+
+    void readSpaces(const SegmentCore& core);
   };
 
   struct CacheStats {

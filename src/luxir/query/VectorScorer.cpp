@@ -55,10 +55,7 @@ VectorScorer::VectorScorer(const float* query, int32_t dims, int32_t metric,
       break;
     case VectorEncoding::INT8:
       kind = l2 ? Kind::I8_L2 : ip ? Kind::I8_DOT : Kind::I8_COS;
-      for (int32_t i = 0; i < dims; i++) {
-        querySum += (double)query[i];
-        queryNormSq += (double)query[i] * (double)query[i];
-      }
+      for (int32_t i = 0; i < dims; i++) querySum += (double)query[i];
       break;
     case VectorEncoding::F32:
     default:
@@ -107,15 +104,14 @@ inline float VectorScorer::scoreRow(const char* row) const {
     return 1.0f - (float)distance / (float)dims;
   } else {
     vcodec::Int8Header h = vcodec::readInt8Header(x);
-    double qc = (double)vkernel::dotU8(query, (const uint8_t*)(x + vcodec::INT8_HEADER_BYTES), dims);
-    double dot = (double)h.offset * querySum + (double)h.scale * qc;
-    if constexpr (K == Kind::I8_DOT) {
-      return finiteScore((float)dot);
-    } else if constexpr (K == Kind::I8_COS) {
-      return cosineScore(dot, normSq(row, VectorEncoding::INT8));
+    auto* codes = (const uint8_t*)(x + vcodec::INT8_HEADER_BYTES);
+    if constexpr (K == Kind::I8_L2) {
+      float dist = vkernel::l2sqU8(query, codes, h.offset, h.scale, dims);
+      return finiteScore(1.0f / (1.0f + dist));
     } else {
-      double distSq = std::max(0.0, queryNormSq - 2.0 * dot + normSq(row, VectorEncoding::INT8));
-      return finiteScore((float)(1.0 / (1.0 + distSq)));
+      double dot = (double)h.offset * querySum + (double)h.scale * (double)vkernel::dotU8(query, codes, dims);
+      if constexpr (K == Kind::I8_DOT) return finiteScore((float)dot);
+      else return cosineScore(dot, normSq(row, VectorEncoding::INT8));
     }
   }
 }
@@ -149,7 +145,6 @@ void VectorScorer::scoreRows(const char* const* rows, size_t n, float* out) cons
     case Kind::BIT_HAMMING: return scoreRowsAs<Kind::BIT_HAMMING>(rows, n, out);
     case Kind::NONE:
     default:
-      assert(false);
       std::fill(out, out + n, 0.0f);
       return;
   }

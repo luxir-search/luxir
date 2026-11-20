@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "luxir/reader/SegmentCore.h"
 #include <cstdint>
 #include <limits>
 
@@ -31,7 +32,7 @@ public:
     nbytes = fieldInfo.normsLen;
     maxdoc = postingsReader.maxDoc();
     if (format != SegFieldInfo::NORMS_NONE && nbytes > 0) {
-      normsIS = postingsReader.getInputStreamSeek(fieldInfo.normsLoc);
+      normsIS = postingsReader.core().getInputStreamSeek(fieldInfo.normsLoc);
       normsBytes = (const uint8_t*) normsIS.ptr();
     }
     if (format == SegFieldInfo::NORMS_FLAT) {
@@ -77,7 +78,7 @@ public:
       return normsBytes[doc];
     }
     screaming::BitSet::Iterator iter(docs.bitset());
-    int32_t found = iter.advance(doc);
+    [[maybe_unused]] int32_t found = iter.advance(doc);
     assert(found == doc);
     return normsBytes[iter.rank()];
   }

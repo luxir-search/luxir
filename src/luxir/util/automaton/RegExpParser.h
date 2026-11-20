@@ -14,8 +14,10 @@ namespace luxir::automaton {
 // byte DFA. Literal characters fold the way the field folds text; operator
 // constructs, character classes, and ranges are codepoint-exact. Caret and
 // dollar are ordinary literal codepoints. Bare braces are errors: escape `{`
-// or `}` to use them literally.
+// or `}` to use them literally. With `caseInsensitive`, literals also accept the
+// case alternates of their folded codepoints, and character classes and ranges
+// gain the case alternates of their members before any negation.
 ByteDfa compileRegex(std::string_view pattern, Budget& budget,
-                     const CodepointFolder* folder = nullptr);
+                     const CodepointFolder* folder = nullptr, bool caseInsensitive = false);
 
 } // namespace luxir::automaton

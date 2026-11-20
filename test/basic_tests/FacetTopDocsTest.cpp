@@ -110,7 +110,7 @@ TEST_F(FacetTopDocsTest, bucketPreparedTopDocsRetainsSegmentDomains) {
   req->testForcePrepare = true;
   auto& topDocs = req->collection("main").topDocs("q").allQuery().limit(0);
   auto& facet = topDocs.facet("f", "cat_s").limit(10);
-  facet.topDocs("bucket_docs").allQuery().fields({"id"}).getNumber().limit(-1);
+  facet.topDocs("bucket_docs").allQuery().fields({"id"}).countLimit().limit(-1);
   req->execute();
   ASSERT_OK(req);
 
@@ -140,7 +140,7 @@ TEST_F(FacetTopDocsTest, stringFacetBucketsRankIndependently) {
   auto req = localReq(luxirNode->getSearchEngine());
   auto& top = req->collection("main").topDocs("q").allQuery().limit(0);
   auto& facet = top.facet("f", "cat_s").limit(-1);
-  facet.topDocs("hits").matchQuery("body_w", "apple").limit(10).getNumber()
+  facet.topDocs("hits").matchQuery("body_w", "apple").limit(10).countLimit()
       .fields({"id"});
   auto& cheapest = facet.topDocs("cheapest").allQuery().limit(1).fields({"id"});
   sortBy(cheapest, "price_i", api::SortSpec::SortDir::ASC);
@@ -174,7 +174,7 @@ TEST_F(FacetTopDocsTest, bucketDocsAssembleIntoOneResponse) {
   auto req = localReq(luxirNode->getSearchEngine());
   auto& top = req->collection("main").topDocs("q").allQuery().limit(0);
   auto& hits = top.facet("f", "cat_s").limit(-1)
-      .topDocs("hits").allQuery().limit(-1).batchSize(1).getNumber()
+      .topDocs("hits").allQuery().limit(-1).batchSize(1).countLimit()
       .fields({"id"});
   sortBy(hits, "n_i", api::SortSpec::SortDir::ASC);
   req->execute();
@@ -207,9 +207,9 @@ TEST_F(FacetTopDocsTest, topDocsUnderBucketTopDocsAssemblesIntoOneResponse) {
   auto req = localReq(luxirNode->getSearchEngine());
   auto& top = req->collection("main").topDocs("q").allQuery().limit(0);
   auto& outer = top.facet("f", "cat_s").limit(-1)
-      .topDocs("outer").allQuery().limit(0).getNumber();
+      .topDocs("outer").allQuery().limit(0).countLimit();
   auto& inner = outer.topDocs("inner").allQuery().limit(-1).batchSize(1)
-      .getNumber().fields({"id"});
+      .countLimit().fields({"id"});
   sortBy(inner, "n_i", api::SortSpec::SortDir::ASC);
   req->execute();
   ASSERT_OK(req);
@@ -259,7 +259,7 @@ TEST_F(FacetTopDocsTest, rangeFacetBucketTopDocsAgreeAcrossBindingBlocks) {
     auto req = localReq(helper.getSearchEngine());
     auto& facet = req->collection("main").rangeFacet("f", "val_i")
         .range(0, 40, 10);  // [30,40) is empty
-    facet.topDocs("hits").matchQuery("body_w", "apple").limit(2).getNumber()
+    facet.topDocs("hits").matchQuery("body_w", "apple").limit(2).countLimit()
         .fields({"id"});
     auto& byPrice = facet.topDocs("by_price").allQuery().limit(2).fields({"id"});
     sortBy(byPrice, "price_i", api::SortSpec::SortDir::DESC);
@@ -307,10 +307,10 @@ TEST_F(FacetTopDocsTest, queryFacetBucketTopDocs) {
   }, UpdateMessage::COMMIT);
 
   auto req = localReq(helper.getSearchEngine());
-  parseQueryRequest(R"json({"limit":0,"get_number":true,"ops":{"tiers":{
+  parseQueryRequest(R"json({"limit":0,"count_limit":-1,"ops":{"tiers":{
     "query_facet":{
       "buckets":{"cheap":"price_i:[* TO 5]","dear":"price_i:[6 TO *]"},
-      "ops":{"hits":{"top_docs":{"limit":2,"get_number":true,"fields":["id"],
+      "ops":{"hits":{"top_docs":{"limit":2,"count_limit":-1,"fields":["id"],
         "sort":[{"field":"price_i","dir":"asc"}]}}}}}}})json",
       req->rawRequest(), req->mr);
   req->collection("main");
@@ -350,7 +350,7 @@ TEST_F(FacetTopDocsTest, fusionUnderStringFacet) {
     "ops":{"fused":{"fusion":{
       "sources":{"x":{"query":"body_w:x","limit":10},
                  "y":{"query":"body_w:y","limit":10}},
-      "rrf":{},"limit":10,"get_number":true,"fields":["id"],
+      "rrf":{},"limit":10,"count_limit":-1,"fields":["id"],
       "ops":{"total":{"expr_op":"sum(n_i)"}}}}}}}}})json",
       req->rawRequest(), req->mr);
   req->collection("main");
@@ -386,13 +386,13 @@ TEST_F(FacetTopDocsTest, facetUnderBucketTopDocsSeesBucketDomain) {
 
   auto req = localReq(helper.getSearchEngine());
   auto& facet = req->collection("main").facet("f", "cat_s").limit(-1);
-  auto& hits = facet.topDocs("hits").allQuery().limit(1).getNumber()
+  auto& hits = facet.topDocs("hits").allQuery().limit(1).countLimit()
       .fields({"id"});
   hits.facet("tags", "tag_s").limit(-1);
   // A descendant sees the bucket documents matching its TopDocs, not the
   // whole bucket.
   auto& t1 = facet.topDocs("hits_t1").matchQuery("tag_s", "t1").limit(1)
-      .getNumber().fields({"id"});
+      .countLimit().fields({"id"});
   t1.facet("tags", "tag_s").limit(-1);
   req->execute();
   ASSERT_OK(req);
@@ -486,7 +486,7 @@ TEST_F(FacetTopDocsTest, cachedMembershipComposesPerBucket) {
   };
 
   {
-    // limit 0 + get_number: whole-membership count of the keep query,
+    // limit 0 + count_limit: whole-membership count of the keep query,
     // composed with each bucket domain. Two live terms keep the count from
     // being constant per segment, which would bypass membership entirely. The
     // first bucket builds the value; every later bucket hits the request slot.
@@ -495,7 +495,7 @@ TEST_F(FacetTopDocsTest, cachedMembershipComposesPerBucket) {
     auto& top = req->collection("main").topDocs("q").allQuery().limit(0);
     top.facet("f", "cat_s").limit(-1)
         .topDocs("hits").exprQuery("keep_s:yes OR keep_s:no").limit(0)
-        .getNumber();
+        .countLimit();
     req->execute();
     ASSERT_OK(req);
     check(*req, bucketSize, false);
@@ -514,7 +514,7 @@ TEST_F(FacetTopDocsTest, cachedMembershipComposesPerBucket) {
     {
       auto warm = localReq(helper.getSearchEngine());
       warm->collection("main").topDocs("q").allQuery()
-          .matchFilter("keep_s", "yes").limit(0).getNumber();
+          .matchFilter("keep_s", "yes").limit(0).countLimit();
       warm->execute();
       ASSERT_OK(warm);
       EXPECT_EQ(totalKept, warm->getMatchCount());
@@ -525,7 +525,7 @@ TEST_F(FacetTopDocsTest, cachedMembershipComposesPerBucket) {
     auto& top = req->collection("main").topDocs("q").allQuery().limit(0);
     auto& hits = top.facet("f", "cat_s").limit(-1)
         .topDocs("hits").allQuery().matchFilter("keep_s", "yes").limit(-1)
-        .getNumber().fields({"id"});
+        .countLimit().fields({"id"});
     sortBy(hits, "n_i", api::SortSpec::SortDir::ASC);
     req->execute();
     ASSERT_OK(req);
@@ -544,10 +544,10 @@ TEST_F(FacetTopDocsTest, offsetBucketChildren) {
   parseQueryRequest(R"json({"ops":{"cats":{"field_facet":{
     "field":"cat_s","limit":-1,"ops":{
       "hits":{"top_docs":{"sort":[{"expr":"n_i","dir":"asc"}],
-        "offset":3,"limit":5,"batch_size":1,"get_number":true,"fields":["id"]}},
+        "offset":3,"limit":5,"batch_size":1,"count_limit":-1,"fields":["id"]}},
       "fused":{"fusion":{"sources":{"all":{"limit":10,
         "sort":[{"expr":"n_i","dir":"asc"}]}},"rrf":{},
-        "offset":3,"limit":5,"batch_size":1,"get_number":true,"fields":["id"]}}
+        "offset":3,"limit":5,"batch_size":1,"count_limit":-1,"fields":["id"]}}
     }}}}})json", req->rawRequest(), req->mr);
   req->collection("main");
   req->execute();
@@ -597,7 +597,7 @@ TEST_F(FacetTopDocsTest, multitermStateRetainedAcrossBucketBlock) {
         if constexpr (requires { value.ops; }) {
           auto* child = api::build::mapSlot<api::SearchOp>(value.ops, 1, "hits", req->mr);
           EXPECT_TRUE(api::read_json(*child,
-              R"({"top_docs":{"query":"body_s:q*","limit":1,"get_number":true,"fields":["id"]}})", req->mr));
+              R"({"top_docs":{"query":"body_s:q*","limit":1,"count_limit":-1,"fields":["id"]}})", req->mr));
         }
       }, op.kind);
       req->collection("main");
@@ -624,7 +624,7 @@ TEST_F(FacetTopDocsTest, multitermRefillsForSelectedQueryFacetChildren) {
   auto req = localReq(helper.getSearchEngine());
   parseQueryRequest(R"({"ops":{"cats":{"query_facet":{
     "buckets":{"q":"body_s:q*"},
-    "ops":{"hits":{"top_docs":{"limit":1,"get_number":true}}}}}}})",
+    "ops":{"hits":{"top_docs":{"limit":1,"count_limit":-1}}}}}}})",
     req->rawRequest(), req->mr);
   req->collection("main");
   uint64_t before = multitermExpansionRefills.load(std::memory_order_relaxed);
@@ -638,7 +638,7 @@ TEST_F(FacetTopDocsTest, multitermRefillsForSelectedQueryFacetChildren) {
   EXPECT_EQ(2, bucketDocs(result, "hits", 0)->found.value_or(-1));
 
   auto plain = localReq(helper.getSearchEngine());
-  parseQueryRequest(R"({"query":"body_s:q*","limit":1,"get_number":true,
+  parseQueryRequest(R"({"query":"body_s:q*","limit":1,"count_limit":-1,
     "ops":{"cats":{"field_facet":{"field":"cat_s","limit":-1}}}})",
     plain->rawRequest(), plain->mr);
   plain->collection("main");

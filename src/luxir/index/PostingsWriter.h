@@ -21,18 +21,21 @@
 #include <vector>
 #include "luxir/index/TrieBuilder.h"
 #include "luxir/index/IndexRamBudget.h"
+#include "luxir/index/IdRange.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/store/OutputStream.h"
 #include "luxir/store/Directory.h"
 #include "luxir/codec/StreamVByte.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/Space.h"
 #include "ScreamingBuilder.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/util/screaming.h"
 #include "luxir/util/Signal.h"
 #include "LiveDocsWriter.h"
+#include "VersionRunBuilder.h"
 
 
 namespace luxir {
@@ -58,12 +61,23 @@ public:
 
   // IndexFieldInfo adds extra info needed at index time to SegFieldInfo.
   struct IndexFieldInfo : public SegFieldInfo {
+    SpaceOrdinal space;
   };
+
+  // The id field's bounds, captured when its dictionary is finalized. Absent
+  // when no finalized dictionary was written for it; callers then derive them.
+  std::optional<IdRange> idRange;
+  std::optional<uint64_t> idDictionaryBlocks;
 
 private:
   Directory& directory;
-  int32_t maxDoc;  // set by caller
+  int32_t maxDoc;  // Root count, set by caller.
+  std::vector<SpaceDescriptor> spaceDescriptors{{}};
   int64_t sizeInBytes = 0; // total size of all files written
+  // Immutable request births, referenced from segment metadata rather than a field.
+  seg_location versionRunsLoc;
+  uint32_t versionRunCount = 0;
+  bool finished = false;
 
   // Files available for use, sorted so largest are at the back. Reusing the
   // largest keeps residual streams small enough to fold into file 0 at finish.
@@ -102,17 +116,18 @@ private:
 public:
   MemPool pool;  // during concurrent writing, access only under mutex (see copyTerm)
   uint64_t segId;
+  uint64_t creatorEpoch;
 
 public:
-  PostingsWriter(Directory& dir, uint64_t segId, int32_t maxDoc = -1,
+  PostingsWriter(Directory& dir, uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc = -1,
                  IndexRamBudget* ramBudget = nullptr,
                  bool ramDelegatingFiles = false)
       : directory(dir), maxDoc(maxDoc),
         delegatedRamGuard(ramBudget == nullptr
             ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)),
-        ramDelegatingFiles(ramDelegatingFiles), segId(segId)
+        ramDelegatingFiles(ramDelegatingFiles), segId(segId), creatorEpoch(creatorEpoch)
   {
-    segStr = Postings::getSortableString(segId);
+    segStr = Postings::segmentKey(segId, creatorEpoch);
   }
 
   void configureRamDelegation(bool enabled,
@@ -138,10 +153,12 @@ public:
   }
 
   // Thread-safe; fields may be registered concurrently and in any order
-  // (finish() sorts the field table by name).
-  IndexFieldInfo& addField(PackedTerm fieldName) {
+  // (finish() sorts each space's field table by name).
+  IndexFieldInfo& addField(SpaceOrdinal space, PackedTerm fieldName) {
     const std::lock_guard<std::mutex> lock(mutex);
+    if (!findSpace(space)) throw std::invalid_argument("field references an undeclared row space");
     fieldInfos.emplace_back(); // we should get default-initialization with this for the SegFieldInfo members
+    fieldInfos.back().space = space;
     fieldInfos.back().fieldname = fieldName;
     assert(fieldInfos.back().monoLoc.offset() == 0 && fieldInfos.back().monoMetaOff == 0 && fieldInfos.back().columnMetaOff == 0);
     assert(fieldInfos.back().pointsMetaOff == 0);
@@ -151,8 +168,8 @@ public:
   }
 
   // copies the fieldName into the pool associated with this PostingsWriter.
-  IndexFieldInfo& addField(std::string_view fieldName) {
-    return addField(copyTerm(fieldName));
+  IndexFieldInfo& addField(SpaceOrdinal space, std::string_view fieldName) {
+    return addField(space, copyTerm(fieldName));
   }
 
   // Thread-safe copy of a term into this writer's pool; the copy lives until the
@@ -214,6 +231,54 @@ public:
 
   typedef std::unique_ptr<OutputStream, OutputStreamDeleter> OutputStreamPtr;
 
+  void writeVersionRuns(const VersionRunBuilder& builder) {
+    if (!maxDoc) return;
+    auto stream = getOutputStream();
+    VersionRunsOutput output(*stream, (uint32_t)((builder.size() + VersionRuns::BLOCK_SIZE - 1) / VersionRuns::BLOCK_SIZE));
+    versionRunCount = builder.finish(output, (uint32_t)maxDoc);
+    versionRunsLoc = output.finish(versionRunCount);
+  }
+
+  class VersionRunsWriter {
+    PostingsWriter& writer;
+    OutputStreamPtr stream;
+    std::optional<VersionRunsOutput> output;
+    VersionRunBuilder builder;
+    uint32_t lastStart = 0;
+    bool added = false;
+
+    VersionRunsOutput& target() {
+      if (!output) {
+        stream = writer.getOutputStream();
+        output.emplace(*stream);
+      }
+      return *output;
+    }
+
+  public:
+    explicit VersionRunsWriter(PostingsWriter& writer) : writer(writer),
+        builder([this](std::span<const char> block, uint32_t first) { target().add(block, first); }) {}
+    VersionRunsWriter(VersionRunsWriter&&) = delete;
+
+    void add(uint32_t firstDocId, uint64_t version) {
+      if (added ? firstDocId <= lastStart : firstDocId != 0) {
+        throw std::runtime_error("Request-version runs must start at zero and increase");
+      }
+      builder.add(firstDocId, version);
+      lastStart = firstDocId;
+      added = true;
+    }
+
+    void finish() {
+      if (added) {
+        writer.versionRunCount = builder.finish(target(), (uint32_t)writer.maxDoc);
+        writer.versionRunsLoc = target().finish(writer.versionRunCount);
+      }
+      output.reset();
+      stream.reset();
+    }
+  };
+
   // Thread-safe.  A checked-out stream is exclusively owned until released.
   OutputStreamPtr getOutputStream() {
     return std::move(getOutputStreams<1>()[0]);
@@ -269,8 +334,23 @@ public:
   // If filenames is non-null, appends the names of files written (for fsync at commit time).
   bool finish(std::vector<std::string>* filenames = nullptr, std::vector<FileDescriptor>* descriptors = nullptr) {
 
-    if (fieldInfos.empty()) {
-      return false;  // already called, or no data added.
+    if (finished) return false; // already called
+    for (size_t index = 1; index < spaceDescriptors.size(); index++) {
+      const auto& space = spaceDescriptors[index];
+      if (!space.ownership || space.maxDoc <= 0) {
+        throw std::invalid_argument("unfinished row space: " + space.path);
+      }
+      auto parent = spaceParentPath(space.path);
+      auto entry = std::find_if(spaceDescriptors.begin(), spaceDescriptors.end(),
+          [&](const auto& candidate) { return candidate.path == parent; });
+      if (entry == spaceDescriptors.end() || (parent.empty() ? maxDoc : entry->maxDoc) <= 0) {
+        throw std::invalid_argument("row space has no parent rows: " + space.path);
+      }
+    }
+    if (fieldInfos.empty() && maxDoc <= 0) return false; // no data added
+
+    if (maxDoc > 0 && (versionRunsLoc.isNull() || versionRunCount == 0)) {
+      throw std::runtime_error("Segment has no request birth versions");
     }
 
     // make sure we have at least one file
@@ -281,8 +361,15 @@ public:
     assert(freeFiles.size() == files.size());
     Signal::emit("postingsBeforeCollapse", this);
     std::vector<uint32_t> survivorFileNums = collapseFiles();
-    writeFieldIndex();
-    writeSegmentInfo(survivorFileNums);
+    spaceDescriptors[0].maxDoc = maxDoc;
+    std::vector<SpaceOrdinal> order;
+    order.reserve(spaceDescriptors.size());
+    for (size_t i = 0; i < spaceDescriptors.size(); i++) order.push_back((SpaceOrdinal)i);
+    std::sort(order.begin(), order.end(), [&](auto a, auto b) {
+      return spaceDescriptors[(size_t)a].path < spaceDescriptors[(size_t)b].path;
+    });
+    writeFieldIndexes(order);
+    writeSegmentInfo(survivorFileNums, order);
 
     // The StreamVByte AVX tail decoder used by postings iteration, and the
     // LinearPack bulk decoder used by ord columns, may read up to
@@ -291,7 +378,7 @@ public:
     // of their own). File 0 ends with the field index and segment info just
     // written above, which already provide far more trailing slack, so it is
     // skipped. Padding past its segment-info size marker would also break the
-    // end-relative read in PostingsReader.
+    // end-relative read in SegmentCore.
     if (survivorFileNums.size() > 1) {
       static const char svbPad[SVB_OVERREAD_PAD] = {};
       for (uint32_t fileNum : survivorFileNums) {
@@ -313,6 +400,7 @@ public:
       }
     }
 
+    finished = true;
     freeFiles.clear();
     fieldInfos.resize(0);
     files.resize(0);
@@ -324,8 +412,47 @@ public:
     maxDoc = max;
   }
 
-  int32_t getMaxDoc() {
-    return maxDoc;
+  int32_t getMaxDoc(SpaceOrdinal space) const {
+    if (space == SpaceOrdinal::ROOT) return maxDoc;
+    const auto* descriptor = findSpace(space);
+    if (!descriptor) throw std::invalid_argument("unknown row space");
+    if (!descriptor->ownership) throw std::invalid_argument("row space count is not finalized");
+    return descriptor->maxDoc;
+  }
+
+  int32_t getMaxSpaceRows() const {
+    int32_t count = maxDoc;
+    for (const auto& space : spaceDescriptors) count = std::max(count, space.maxDoc);
+    return count;
+  }
+
+  // Declare a child space before its fields. Ownership streams use the same
+  // allocator as field data and are relocated by the same finalize pass.
+  SpaceOrdinal addSpace(std::string_view path) {
+    auto parent = spaceParentPath(path);
+    bool hasParent = false;
+    for (const auto& space : spaceDescriptors) {
+      if (space.path == path) throw std::invalid_argument("duplicate row space path");
+      if (space.path == parent) hasParent = true;
+    }
+    if (finished || path.empty() || !hasParent) {
+      throw std::invalid_argument("invalid row space declaration");
+    }
+    spaceDescriptors.push_back({std::string(path), 0, {}, 0, {}});
+    return (SpaceOrdinal)(spaceDescriptors.size() - 1);
+  }
+
+  // Attach the final row count and encoded ownership after indexing.
+  void finishSpace(SpaceOrdinal ordinal, int32_t count, OwnershipDescriptor ownership) {
+    if (finished || ordinal == SpaceOrdinal::ROOT || !findSpace(ordinal)
+        || count <= 0 || count >= PostingsReader::HARD_MAX_DOC || ownership.ends.isNull()
+        || ownership.endsMetaOff < 0 || ownership.ownersMetaOff < 0) {
+      throw std::invalid_argument("invalid row space finalization");
+    }
+    auto& space = spaceDescriptors[(size_t)ordinal];
+    if (space.ownership) throw std::invalid_argument("row space already finalized");
+    space.maxDoc = count;
+    space.ownership = ownership;
   }
 
   int64_t getSizeInBytes() {
@@ -337,6 +464,10 @@ public:
   uint64_t writeLiveDocs(const screaming::FixedBitSet& liveBits, int32_t numLiveDocs);
 
 private:
+  const SpaceDescriptor* findSpace(SpaceOrdinal ordinal) const {
+    return (size_t)ordinal < spaceDescriptors.size() ? &spaceDescriptors[(size_t)ordinal] : nullptr;
+  }
+
   void adjustDelegatedRam(int64_t delta) noexcept {
     const std::lock_guard<std::mutex> lock(delegatedRamMutex);
     assert(delta >= -delegatedRamBytes);
@@ -365,6 +496,7 @@ private:
     // appended like any other stream (the reader must be able to open the
     // location's file even to read zero bytes).
     std::vector<bool> referenced(files.size(), false);
+    if (!versionRunsLoc.isNull()) referenced[versionRunsLoc.filenum()] = true;
     for (auto& fieldInfo : fieldInfos) {
       fieldInfo.relocateLocations([&](seg_location location) {
         if (location.filenum() < referenced.size()) {
@@ -372,6 +504,13 @@ private:
         }
         return location;
       });
+    }
+
+    for (const auto& space : spaceDescriptors) {
+      if (!space.ownership) continue;
+      for (auto loc : {space.ownership->ends, space.ownership->owners}) {
+        if (!loc.isNull() && loc.filenum() < referenced.size()) referenced[loc.filenum()] = true;
+      }
     }
 
     OutputStream& target = files[0].out;
@@ -411,6 +550,13 @@ private:
     for (auto& fieldInfo : fieldInfos) {
       fieldInfo.relocateLocations(relocate);
     }
+    if (!versionRunsLoc.isNull()) versionRunsLoc = relocate(versionRunsLoc);
+    for (auto& space : spaceDescriptors) {
+      if (!space.ownership) continue;
+      auto& shape = *space.ownership;
+      shape.ends = relocate(shape.ends);
+      if (!shape.owners.isNull()) shape.owners = relocate(shape.owners);
+    }
 
     std::vector<uint32_t> survivors;
     survivors.reserve(files.size());
@@ -421,7 +567,7 @@ private:
     return survivors;
   }
 
-  void writeSegmentInfo(std::span<const uint32_t> survivorFileNums) {
+  void writeSegmentInfo(std::span<const uint32_t> survivorFileNums, std::span<const SpaceOrdinal> order) {
     // TODO: if maxDoc==0, does this cause issues elsewhere?
     // assert(maxDoc >= 1);
     OutputStream& out = files[0].out;
@@ -432,11 +578,59 @@ private:
     // object-store copy.  Readers keep a filenum-indexed table with holes.
     out.writeVint((uint32_t) survivorFileNums.size());
     for (uint32_t fileNum : survivorFileNums) out.writeVint(fileNum);
+    out.writeVal(versionRunsLoc);
+    out.writeVint(versionRunCount);
+    out.writeVint((uint32_t)spaceDescriptors.size());
+    for (auto ordinal : order) {
+      const auto& space = spaceDescriptors[(size_t)ordinal];
+      out.writeVint((uint32_t)space.path.size());
+      out.write(space.path.data(), space.path.size());
+      out.writeVint((uint32_t)space.maxDoc);
+      out.writeVal(space.fieldOffsets);
+      out.writeVint(space.fieldCount);
+      if (space.ownership) {
+        const auto& shape = *space.ownership;
+        out.writeVal(shape.ends);
+        out.writeVlong((uint64_t)shape.endsMetaOff);
+        out.writeVal(shape.owners);
+        out.writeVlong((uint64_t)shape.ownersMetaOff);
+      }
+    }
     auto segInfoSize = out.size() - outStart;
     out.writeInt(segInfoSize);
   }
 
-  void writeFieldIndex() {
+  void writeFieldIndexes(std::span<const SpaceOrdinal> order) {
+    // PostingsReader::findOrdinal does a binary search over the field offsets array, so
+    // fields must be written in sorted name order.  Callers that flush fields
+    // in sorted order already satisfy this, but some resources (like
+    // stored-fields) are appended at the very end of flush; sort defensively
+    // here to support arbitrary addField ordering.
+    std::vector<IndexFieldInfo*> sortedInfos;
+    sortedInfos.reserve(fieldInfos.size());
+    for (auto& field : fieldInfos) sortedInfos.push_back(&field);
+    std::sort(sortedInfos.begin(), sortedInfos.end(), [&](const auto* a, const auto* b) {
+      return a->space != b->space
+          ? spaceDescriptors[(size_t)a->space].path < spaceDescriptors[(size_t)b->space].path
+          : a->fieldname < b->fieldname;
+    });
+    for (size_t i = 1; i < sortedInfos.size(); i++) {
+      if (sortedInfos[i - 1]->space == sortedInfos[i]->space
+          && sortedInfos[i - 1]->fieldname == sortedInfos[i]->fieldname) {
+        throw std::invalid_argument("duplicate field in row space");
+      }
+    }
+    size_t first = 0;
+    for (auto ordinal : order) {
+      auto& space = spaceDescriptors[(size_t)ordinal];
+      size_t end = first;
+      while (end < sortedInfos.size() && sortedInfos[end]->space == ordinal) end++;
+      writeFieldIndex(space, std::span(sortedInfos).subspan(first, end - first));
+      first = end;
+    }
+  }
+
+  void writeFieldIndex(SpaceDescriptor& space, std::span<IndexFieldInfo* const> sortedInfos) {
     //
     // This format is position independent.  One just needs a pointer to the end of the final structure.
     //
@@ -448,22 +642,9 @@ private:
 
     OutputStream& fieldOutput = files[0].out;
     std::vector<uint32_t> fieldOffs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
-    fieldOffs.reserve(fieldInfos.size());
+    fieldOffs.reserve(sortedInfos.size());
 
     auto fieldsStart = fieldOutput.size();  // where this index starts
-
-    // PostingsReader::findOrdinal does a binary search over the field offsets array, so
-    // fields must be written in sorted name order.  Callers that flush fields
-    // in sorted order already satisfy this, but some resources (like
-    // stored-fields) are appended at the very end of flush; sort defensively
-    // here to support arbitrary addField ordering.
-    std::vector<IndexFieldInfo*> sortedInfos;
-    sortedInfos.reserve(fieldInfos.size());
-    for (auto& fi : fieldInfos) sortedInfos.push_back(&fi);
-    std::sort(sortedInfos.begin(), sortedInfos.end(),
-              [](const IndexFieldInfo* a, const IndexFieldInfo* b) {
-                return a->fieldname < b->fieldname;
-              });
 
     for (auto* finfoPtr : sortedInfos) {
       auto& finfo = *finfoPtr;
@@ -473,6 +654,7 @@ private:
       fieldOutput.writePackedTerm(finfo.fieldname);
       fieldOutput.writeVint(finfo.type);
       fieldOutput.writeVint(finfo.flags);
+      fieldOutput.writeVint(finfo.typeFlags);
       fieldOutput.writeVlong(finfo.docsWithField);
 
       //  nocommit     if ((finfo.flags & 0x01) != 0) {
@@ -531,6 +713,8 @@ private:
       loc = locationsOff - loc;
     }
 
+    space.fieldOffsets = fieldOutput.slocation();
+    space.fieldCount = (uint32_t)fieldOffs.size();
     if (fieldOffs.size() > 0) {
       fieldOutput.write(&(fieldOffs[0]), fieldOffs.size() * sizeof(fieldOffs[0]));
     }
@@ -582,6 +766,46 @@ public:
   }
 };
 
+
+// A (norm -> maxTf) surface that tracks which norms are set, so raising,
+// walking, and clearing it cost the norms present rather than all 256: most
+// terms touch a handful of norms.
+struct NormSurface {
+  std::array<uint32_t, 256> maxTf{};
+  std::array<uint64_t, 4> present{};
+
+  void raise(uint32_t norm, uint32_t tf) {
+    assert(norm <= 255);
+    present[norm >> 6] |= 1ull << (norm & 63);
+    maxTf[norm] = std::max(maxTf[norm], tf);
+  }
+
+  // Calls fn(norm, tf) for every point of the Pareto frontier: norms ascending
+  // where maxTf strictly rises.
+  template <class Fn>
+  void forEachFrontierPoint(Fn&& fn) const {
+    uint32_t runningMaxTf = 0;
+    for (uint32_t word = 0; word < present.size(); word++) {
+      for (uint64_t bits = present[word]; bits != 0; bits &= bits - 1) {
+        uint32_t norm = word * 64 + (uint32_t) std::countr_zero(bits);
+        uint32_t tf = maxTf[norm];
+        if (tf > runningMaxTf) {
+          fn(norm, tf);
+          runningMaxTf = tf;
+        }
+      }
+    }
+  }
+
+  void clear() {
+    for (uint32_t word = 0; word < present.size(); word++) {
+      for (uint64_t bits = present[word]; bits != 0; bits &= bits - 1) {
+        maxTf[word * 64 + (uint32_t) std::countr_zero(bits)] = 0;
+      }
+      present[word] = 0;
+    }
+  }
+};
 
 // TODO: we need a specialization of this for when positions are not required (indexed string fields)
 class TextWriter {
@@ -689,7 +913,7 @@ private:
   // each flushed block's frontier points.  The group header stores its Pareto
   // frontier (same staircase as L0 and the term dictionary) so group bounds
   // come from real (norm, tf) pairs, not a cross-doc (maxTf, minNorm) corner.
-  std::array<uint32_t, 256> l1GroupMaxTfPerNorm{};
+  NormSurface l1GroupSurface;
 
   // Index level for this field, decoded from the field flags in startField().  These gate
   // whether the freq stream and position stream are written at all.
@@ -715,13 +939,13 @@ private:
   std::vector<char> compressed_output;
   std::vector<char> header_output;
   std::vector<char> group_output;
-  std::array<uint32_t, 256> maxTfPerNorm;
+  NormSurface blockSurface;
   std::vector<uint32_t> frontierNorms;
   std::vector<uint32_t> frontierTfs;
   // Term-level (maxTf, norm) surface accumulated across the whole term, so the
   // term dictionary can store the term's impact frontier: a scorer's global
   // max score must come from stored data, never a walk of the postings.
-  std::array<uint32_t, 256> termMaxTfPerNorm;
+  NormSurface termSurface;
   std::vector<char> termImpactRun;  // per-term encoded frontiers for the current term block
   static inline bool disableL0CheckpointWrite =
       std::getenv("LUXIR_DISABLE_L0_CHECKPOINT_WRITE") != nullptr;
@@ -819,92 +1043,56 @@ private:  // some internal utility methods... not for use by indexers
       return minNorm;
     }
 
-    maxTfPerNorm.fill(0);
+    blockSurface.clear();
     for (uint32_t i = 0; i < docCount; i++) {
       uint32_t norm = normForDoc(docs[i]);
       assert(norm <= 255);
       uint32_t tf = (uint32_t) tfreqs[i];
       minNorm = std::min(minNorm, norm);
-      maxTfPerNorm[norm] = std::max(maxTfPerNorm[norm], tf);
-      termMaxTfPerNorm[norm] = std::max(termMaxTfPerNorm[norm], tf);
+      blockSurface.raise(norm, tf);
+      termSurface.raise(norm, tf);
     }
 
-    uint32_t runningMaxTf = 0;
-    for (uint32_t norm = 0; norm < maxTfPerNorm.size(); norm++) {
-      uint32_t tf = maxTfPerNorm[norm];
-      if (tf > runningMaxTf) {
-        frontierNorms.push_back(norm);
-        frontierTfs.push_back(tf);
-        runningMaxTf = tf;
-      }
-    }
+    blockSurface.forEachFrontierPoint([&](uint32_t norm, uint32_t tf) {
+      frontierNorms.push_back(norm);
+      frontierTfs.push_back(tf);
+    });
     return minNorm;
   }
 
   // Encode the Pareto frontier of a (norm -> maxTf) surface as
   // [count vint][(norm u8, tf-delta vint)*], the same staircase the L0
   // headers use.  count == 0 only for fields without freqs+norms.
-  static void appendImpactFrontier(std::vector<char>& out,
-                                   const std::array<uint32_t, 256>& surface) {
+  static void appendImpactFrontier(std::vector<char>& out, const NormSurface& surface) {
     uint32_t count = 0;
-    uint32_t runningMaxTf = 0;
-    for (uint32_t norm = 0; norm < surface.size(); norm++) {
-      if (surface[norm] > runningMaxTf) {
-        count++;
-        runningMaxTf = surface[norm];
-      }
-    }
+    surface.forEachFrontierPoint([&](uint32_t, uint32_t) { count++; });
     appendVint(out, count);
-    runningMaxTf = 0;
-    for (uint32_t norm = 0; norm < surface.size(); norm++) {
-      uint32_t tf = surface[norm];
-      if (tf > runningMaxTf) {
-        out.push_back((char) (uint8_t) norm);
-        appendVint(out, tf - runningMaxTf);
-        runningMaxTf = tf;
-      }
-    }
+    uint32_t runningMaxTf = 0;
+    surface.forEachFrontierPoint([&](uint32_t norm, uint32_t tf) {
+      out.push_back((char) (uint8_t) norm);
+      appendVint(out, tf - runningMaxTf);
+      runningMaxTf = tf;
+    });
   }
 
-  static void appendL1ImpactFrontier(std::vector<char>& out,
-                                     const std::array<uint32_t, 256>& surface,
+  static void appendL1ImpactFrontier(std::vector<char>& out, const NormSurface& surface,
                                      uint32_t maxTf) {
     uint32_t count = 0;
-    uint32_t runningMaxTf = 0;
-    for (uint32_t norm = 0; norm < surface.size(); norm++) {
-      uint32_t tf = surface[norm];
-      if (tf > runningMaxTf) {
-        count++;
-        runningMaxTf = tf;
-      }
-    }
+    surface.forEachFrontierPoint([&](uint32_t, uint32_t) { count++; });
     assert(count > 0);
     bool useU32 = maxTf > 65535u;
     appendVint(out, (count << 1) | (useU32 ? 1u : 0u));
-
-    runningMaxTf = 0;
-    for (uint32_t norm = 0; norm < surface.size(); norm++) {
-      uint32_t tf = surface[norm];
-      if (tf > runningMaxTf) {
-        assert(norm <= 255);
-        out.push_back((char) (uint8_t) norm);
-        runningMaxTf = tf;
+    surface.forEachFrontierPoint([&](uint32_t norm, uint32_t) {
+      out.push_back((char) (uint8_t) norm);
+    });
+    surface.forEachFrontierPoint([&](uint32_t, uint32_t tf) {
+      if (useU32) {
+        appendIntLE(out, tf);
+      } else {
+        assert(tf <= 65535u);
+        appendShortLE(out, (uint16_t) tf);
       }
-    }
-
-    runningMaxTf = 0;
-    for (uint32_t norm = 0; norm < surface.size(); norm++) {
-      uint32_t tf = surface[norm];
-      if (tf > runningMaxTf) {
-        if (useU32) {
-          appendIntLE(out, tf);
-        } else {
-          assert(tf <= 65535u);
-          appendShortLE(out, (uint16_t) tf);
-        }
-        runningMaxTf = tf;
-      }
-    }
+    });
   }
 
   void appendL0Header(std::vector<char>& out, uint32_t lastDoc, uint32_t base,
@@ -1074,8 +1262,7 @@ private:  // some internal utility methods... not for use by indexers
       // re-extracted at flush.
       assert(frontierTfs.size() == frontierNorms.size());
       for (size_t i = 0; i < frontierNorms.size(); i++) {
-        uint32_t norm = frontierNorms[i];
-        l1GroupMaxTfPerNorm[norm] = std::max(l1GroupMaxTfPerNorm[norm], frontierTfs[i]);
+        l1GroupSurface.raise(frontierNorms[i], frontierTfs[i]);
       }
     }
     if (l1GroupBlockCount == L1_PERIOD) {
@@ -1122,7 +1309,7 @@ private:  // some internal utility methods... not for use by indexers
     }
     if (hasFreqs && hasNorms) {
       assert(l1GroupMaxTf > 0);
-      appendL1ImpactFrontier(header_output, l1GroupMaxTfPerNorm, l1GroupMaxTf);
+      appendL1ImpactFrontier(header_output, l1GroupSurface, l1GroupMaxTf);
     } else if (hasFreqs) {
       assert(l1GroupMaxTf > 0);
       appendVint(header_output, l1GroupMaxTf);
@@ -1144,7 +1331,7 @@ private:  // some internal utility methods... not for use by indexers
     l1GroupMinNorm = 0;
     l1BlockLastDocs.fill(0);
     l1BlockBodyOffsets.fill(0);
-    l1GroupMaxTfPerNorm.fill(0);
+    l1GroupSurface.clear();
   }
 
   // number of docs for the current term
@@ -1178,8 +1365,8 @@ public:
   }
 
   // TODO: FIXME: this is for tests, but it doesn't set the flags / type properly!
-  void startField(const std::string& fieldName) {
-    PostingsWriter::IndexFieldInfo* finfo = &postingsWriter.addField(fieldName);
+  void startField(SpaceOrdinal space, const std::string& fieldName) {
+    PostingsWriter::IndexFieldInfo* finfo = &postingsWriter.addField(space, fieldName);
     finfo->type = FieldType::TEXT;
     finfo->flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
     startField(finfo);
@@ -1233,7 +1420,7 @@ public:
       return;
     }
 
-    assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided numDocs
+    assert(docs.back() < postingsWriter.getMaxDoc(fieldInfo->space)); // sanity check to ensure we didn't go over provided numDocs
     assert(docs.size() == Postings::DOCS_BLOCK_SIZE);
 
     // NOTE: LuxirPFORd (docCodec) applies the adjacent delta itself, in place,
@@ -1600,9 +1787,9 @@ public:
     l1GroupMinNorm = 0;
     l1BlockLastDocs.fill(0);
     l1BlockBodyOffsets.fill(0);
-    l1GroupMaxTfPerNorm.fill(0);
+    l1GroupSurface.clear();
     group_output.resize(0);
-    termMaxTfPerNorm.fill(0);
+    termSurface.clear();
     locOfPositionsForTerm = posOutput.size();
     pendingBlockPosByteOff = locOfPositionsForTerm;
     locOfDocsForTerm = docOutput.size();
@@ -1621,7 +1808,7 @@ public:
     auto totalTermFreq = hasFreqs ? ttfAcc : (int64_t) docfreq;
     sumTotalTermFreq += totalTermFreq;
     if (docs.size() > 0) {
-      assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided numDocs
+      assert(docs.back() < postingsWriter.getMaxDoc(fieldInfo->space)); // sanity check to ensure we didn't go over provided numDocs
     }
     if (totalTermFreq == 0) {
       // term with no documents, remove term we just added
@@ -1640,11 +1827,9 @@ public:
       sumDocFreq += 1;
       if (hasFreqs && hasNorms) {
         // single-doc term: exact one-point frontier from its norm
-        termMaxTfPerNorm.fill(0);
-        uint32_t norm = normForDoc(docs[0]);
-        assert(norm <= 255);
-        termMaxTfPerNorm[norm] = 1;
-        appendImpactFrontier(termImpactRun, termMaxTfPerNorm);
+        termSurface.clear();
+        termSurface.raise(normForDoc(docs[0]), 1);
+        appendImpactFrontier(termImpactRun, termSurface);
       }
       termPackedBlocks.push_back(0);
       termDocFreqs.push_back(1);
@@ -1741,7 +1926,7 @@ public:
         termPosOffsets.push_back(posOffset);
       }
       if (hasFreqs && hasNorms) {
-        appendImpactFrontier(termImpactRun, termMaxTfPerNorm);
+        appendImpactFrontier(termImpactRun, termSurface);
       }
       termPackedBlocks.push_back(termPackedBlockCount);
       termDocsEnd.push_back((uint64_t) (docOutput.size() - locOfDocsForTermBlock));
@@ -1775,6 +1960,11 @@ public:
 
   void finalizeField(RangeResult&& result) {
     assert(buildTrie);
+
+    if ((std::string_view)fieldInfo->fieldname == "id") {
+      postingsWriter.idDictionaryBlocks = result.nBlocks;
+      postingsWriter.idRange = IdRange{std::move(result.firstTerm), std::move(result.lastTerm), result.nTerms == 0};
+    }
 
     // write index into the blocks of the terms dict
     // TODO: use a more efficient encoding for this array
@@ -2009,6 +2199,25 @@ public:
   void finish() {
     fieldInfo.docsWithField = docsWriter.finish();
     fieldInfo.docsWithFieldEndLoc = idOutput->slocation();
+  }
+
+  // Writes the docs-with-field set of a field from its docs in increasing
+  // order: the bitset when some of the segment's docs lack the field, else
+  // just the dense count. For indexed fields without a column.
+  template <class ForEachDoc>
+  static void write(MemPool& pool, PostingsWriter& postingsWriter,
+                    PostingsWriter::IndexFieldInfo& fieldInfo, int32_t numDocs,
+                    ForEachDoc&& forEachDoc) {
+    if (numDocs == postingsWriter.getMaxDoc(fieldInfo.space)) {
+      fieldInfo.docsWithField = numDocs;
+      fieldInfo.docsWithFieldEndLoc = {0, 0};
+      return;
+    }
+    auto guard = pool.rewindScopeGuard();
+    DocsWithValWriter writer(pool, postingsWriter, fieldInfo);
+    forEachDoc([&](int32_t doc) { writer.startDoc(doc); });
+    assert(writer.numAdded() == numDocs);
+    writer.finish();
   }
 
   // Signal that the column has all docs present. No docs should be added in this case, but the count

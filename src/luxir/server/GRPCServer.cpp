@@ -20,6 +20,7 @@
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/support/byte_buffer.h>
 #include <hpp_proto/grpc/serialization.hpp>
+#include <oneapi/tbb/task_arena.h>
 #include <oneapi/tbb/task_group.h>
 
 #include "GRPCServer.h"
@@ -46,8 +47,7 @@ namespace luxir {
 // #define GRPC_DEBUG LOG_DEBUG
 
 GRPCServer::GRPCServer(LuxirNode& node, int nthreads, int port, int64_t streamBufferBytes)
-  : luxirNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads),
-    arenaEntrants(node, nthreads, "GRPCServer"), requestedPort(port),
+  : luxirNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads), requestedPort(port),
     // Clamp to >= 1: a non-positive high-water mark (misconfiguration) would
     // pause every reply while the drain check (queuedBytes <= low) never fires.
     streamBufferBytes_(std::max<int64_t>(1,
@@ -59,7 +59,7 @@ GRPCServer::GRPCServer(LuxirNode& node, int nthreads, int port, int64_t streamBu
 // interface that may help with integration with external event loops.
 
 void luxir::GRPCServer::run() {
-  pthread_setname_np(pthread_self(), "luxir_grpc_main");
+  nameThisThread("luxir_grpc_main");
 
   // Use requestedPort (default 0 for dynamic allocation, or a specific port
   // like 50051).  Dynamic test ports bind localhost; configured ports keep the
@@ -383,10 +383,15 @@ public:
 
   // mutex held; callable from any thread.  Schedules maybeSendFinish() on this
   // call's cq thread via an immediately-expiring alarm.
-  void kickFinish() {
+  void kickFinish() noexcept {
     if (finishSent || finishKick) return;
-    finishKick.emplace();
-    finishKick->Set(threadInfo.cq.get(), gpr_now(GPR_CLOCK_MONOTONIC), make_tag(KICK));
+    try {
+      finishKick.emplace();
+      finishKick->Set(threadInfo.cq.get(), gpr_now(GPR_CLOCK_MONOTONIC), make_tag(KICK));
+    } catch (...) {
+      finishKick.reset();
+      LOG_ERROR("gRPC finish notification failed");
+    }
   }
 
   /// Enqueue an owned response (one outstanding write at a time).
@@ -396,7 +401,7 @@ public:
   /// NOTE: with finishCount>0 this may eventually delete "this" on another thread,
   /// so make it the last use of "this" in the caller.
   int64_t respondRaw(grpc::ByteBuffer&& buf, int32_t finishCount = 1) {
-    const std::lock_guard<std::mutex> lock(mutex);
+    std::unique_lock lock(mutex);
     responsesExpected -= finishCount;
     if (finishCount > 0) requestCompleted();
     if (errored) {
@@ -406,13 +411,28 @@ public:
       kickFinish();
       return -1;
     }
-    server.getLuxirNode().metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::GRPC, buf.Length());
-    queuedBytes += (int64_t)buf.Length();
+    const int64_t length = (int64_t)buf.Length();
+    server.getLuxirNode().metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::GRPC, length);
     if (writeOutstanding) {
-      pending.emplace_back(std::move(buf));
+      try {
+        pending.emplace_back(std::move(buf));
+      } catch (...) {
+        finishStatus = grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, {});
+        metricError(ErrorKind::RESOURCE_EXHAUSTED);
+        errored = true;
+        readsDone = true;
+        auto waiters = std::move(drainWaiters);
+        auto& arena = server.getLuxirNode().getTaskArena();
+        // The outstanding WRITE evaluates Finish on the CQ thread. After
+        // unlock it can delete this call, so use only locals to wake waiters.
+        lock.unlock();
+        for (auto& w : waiters) enqueueResume(arena, std::move(w));
+        return -1;
+      }
     } else {
       doWrite(std::move(buf));
     }
+    queuedBytes += length;
     return queuedBytes;
   }
 
@@ -466,7 +486,7 @@ public:
       const std::lock_guard<std::mutex> lock(mutex);
       responsesExpected -= finishCount;
       readsDone = true;
-      finishStatus = status;
+      finishStatus = std::move(status);
       kickFinish();
       waiters = std::move(drainWaiters);
     }
@@ -509,8 +529,16 @@ public:
   // catch), and a lost resume strands its request forever - so an enqueue
   // allocation failure falls back to running the resume inline.
   void enqueueResume(std::function<void()> resume) {
+    enqueueResume(server.getLuxirNode().getTaskArena(), std::move(resume));
+  }
+
+  static void enqueueResume(oneapi::tbb::task_arena& arena, std::function<void()> resume) {
     try {
-      server.getLuxirNode().getTaskArena().enqueue(resume);  // copies; resume stays valid if this throws
+      // Isolated like the search itself (SearchEngine::enqueueSubmit): a
+      // parallel emitter's batch waits help only with its own tasks.
+      arena.enqueue([resume] {  // copies; resume stays valid if this throws
+        oneapi::tbb::this_task_arena::isolate(resume);
+      });
     } catch (...) {
       if (resume) resume();
     }
@@ -532,7 +560,7 @@ public:
     if (requestMetric.active()) {
       int kind = metricErrorKind.load(std::memory_order_relaxed);
       // A failed write means the client went away, as on HTTP.
-      auto outcome = genericCtx.IsCancelled() || errored ? MetricOutcome::CANCELLED
+      auto outcome = genericCtx.IsCancelled() || (errored && finishStatus.ok()) ? MetricOutcome::CANCELLED
           : kind >= 0 || !finishStatus.ok() ? MetricOutcome::ERROR : MetricOutcome::OK;
       if (outcome == MetricOutcome::ERROR) {
         server.getLuxirNode().metrics->requestError(MetricTransport::GRPC,
@@ -665,8 +693,9 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     // done() releases this request.
     std::unique_ptr<HppRequestState<SearchReqProto>> requestState;
 
-    GRPCSearchRequest(SearchEngine& engine, const SearchReqProto& proto, google::protobuf::Arena& arena)
-      : SearchRequest(engine, proto, arena) {}
+    GRPCSearchRequest(SearchEngine& engine, const SearchReqProto& proto, google::protobuf::Arena& arena,
+                      std::chrono::steady_clock::time_point startTime)
+      : SearchRequest(engine, proto, arena, startTime) {}
 
     ReplyStatus reply(SearchResponse& response) override {
       // Serialize eagerly into an OWNED ByteBuffer, then drop arenas (no post-write callback).
@@ -674,10 +703,24 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       grpc::ByteBuffer buf;
       try {
         buf = serializeToByteBuffer(response.proto);
-      } catch (const std::exception& e) {
-        // The response cannot be delivered: the call ends with the failure
-        // instead of a silently empty message.
-        parent->finishWithError(classifyException(e, ErrorKind::INTERNAL), response.last ? 1 : 0);
+      } catch (...) {
+        // Build the status before changing response accounting. If detailed
+        // reporting also fails, retain a nonallocating code-only fallback.
+        grpc::Status status(grpc::StatusCode::RESOURCE_EXHAUSTED, {});
+        try {
+          auto info = currentExceptionInfo(ErrorKind::INTERNAL);
+          status = grpcStatus(info);
+          parent->metricError(info.kind);
+        } catch (...) {
+          parent->metricError(ErrorKind::RESOURCE_EXHAUSTED);
+          LOG_ERROR("gRPC response serialization and error reporting failed");
+        }
+        try {
+          parent->finishWithError(std::move(status), response.last ? 1 : 0);
+        } catch (...) {
+          // Accounting may already have changed; do not decrement it again.
+          LOG_ERROR("gRPC response error completion failed");
+        }
         response.req.replyCallback(response);
         return ReplyStatus::CANCEL;
       }
@@ -687,7 +730,13 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       // Snapshot highWater first: once the final response is handed to
       // respondRaw, the call can Finish and delete parent at any moment.
       const int64_t highWater = parent->highWater;
-      int64_t buffered = parent->respondRaw(std::move(buf), response.last ? 1 : 0);
+      int64_t buffered = -1;
+      try {
+        buffered = parent->respondRaw(std::move(buf), response.last ? 1 : 0);
+      } catch (...) {
+        // Accounting may already have changed; release the response once.
+        LOG_ERROR("gRPC response delivery failed");
+      }
       auto status = ReplyStatus::OK;
       if (buffered < 0) status = ReplyStatus::CANCEL;
       else if (buffered > highWater) status = ReplyStatus::PAUSE;
@@ -702,6 +751,8 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     }
   };
 
+  // The message is fully read; took_us covers parsing onward.
+  auto startTime = std::chrono::steady_clock::now();
   auto* arena = createArena();
   auto requestState = std::make_unique<HppRequestState<SearchReqProto>>();
   if (!parseRequest(readBuf, *requestState, "Search")) {
@@ -718,29 +769,31 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     return;
   }
   auto& engine = call.server.getLuxirNode().getSearchEngine();
-  auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena);
+  auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena, startTime);
   req.requestState = std::move(requestState);
   req.parent = &call;
   if (!req.proto.min_commit.empty()) {
     call.enableWaitCancellation();
     req.waitCancellation = call.waitCancellation;
   }
-  // Route by max_parallel (via dispatch()): the default (0) runs the whole
-  // query serially right here on this completion-queue thread - the cheapest
-  // path, accepting that this cq's other calls wait for the query's duration
-  // (a paused streaming producer parks and returns, so flow control still
-  // advances).  -1 also runs here, entering the task arena so its workers
-  // parallelize the query; 1 runs on the task arena instead, keeping this
-  // cq thread free to process completions.  The call outlives the request
-  // because its outstanding-response count stays positive until the final
-  // reply, and requestActive keeps pipelined requests on this stream ordered.
+  // Every search leaves this completion-queue thread for the task arena (see
+  // SearchEngine::Receiver): gRPC offers a connection's new calls to its
+  // preferred cq first, so a query run here would serialize the concurrent
+  // calls on that connection. With max_parallel, 0 is adaptive, 1 and -2
+  // are serial on a worker, and -1 publishes every sibling. The
+  // reply and the final response come from that worker: respondRaw() is
+  // thread-safe and Finish is kicked back to this call's cq thread.  The call
+  // outlives the request because its outstanding-response count stays
+  // positive until the final reply, and requestActive keeps pipelined
+  // requests on this stream ordered.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
-  engine.dispatch(req, req.proto.max_parallel);
+  engine.dispatch(req, req.proto.max_parallel, SearchEngine::Receiver::OFFLOAD);
 }
 
 
 // Unary Update and streaming UpdateStream share asynchronous completion.
 static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto startTime = std::chrono::steady_clock::now();
   auto request = std::make_unique<HppRequestState<UpdateReqProto>>();
   if (!parseRequest(readBuf, *request, "Update")) {
     finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Update: malformed request"));
@@ -755,23 +808,27 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     std::unique_ptr<HppRequestState<UpdateReqProto>> request;
     GenericCallData* parent;
     const std::stop_token waitToken;
-    Update(std::unique_ptr<HppRequestState<UpdateReqProto>> requestState, GenericCallData* parent)
+    const std::chrono::steady_clock::time_point startTime;
+    Update(std::unique_ptr<HppRequestState<UpdateReqProto>> requestState, GenericCallData* parent,
+           std::chrono::steady_clock::time_point startTime)
       : ProtoUpdateMessage(&requestState->proto), request(std::move(requestState)), parent(parent),
         // Admission runs on the completion queue thread, as does enabling
         // cancellation. Worker completions never read the mutable stop source.
-        waitToken(parent->waitCancellation.get_token()) {}
+        waitToken(parent->waitCancellation.get_token()), startTime(startTime) {}
     virtual void done(IndexWriter& iw) override {
       unused(iw);
       auto completed = takeCompletion(parent->server.getLuxirNode());
       auto* call = parent;
       auto stop = waitToken;
+      auto start = startTime;
       delete this;
-      completed->await(call->server.getLuxirNode(), [call](auto result) {
-        call->server.getLuxirNode().getTaskArena().enqueue([call, result] {
+      completed->await(call->server.getLuxirNode(), [call, start](auto result) {
+        call->server.getLuxirNode().getTaskArena().enqueue([call, result, start] {
           try {
             // A unary update fails only when nothing was applied.
             if (!call->methodEntry->clientStream && result->response.status == api::UpdateResponse_::Status::ERROR)
               call->metricError(ProtoUpdateMessage::failureKind(result->response));
+            result->response.took_us = microsSince(start);
             call->respondRaw(serializeToByteBuffer(result->response), 1);
           } catch (const std::exception& e) {
             call->finishWithError(classifyException(e, ErrorKind::INTERNAL));
@@ -787,7 +844,7 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     auto iw = shard->requireIndexWriter();
 
     if (request->proto.commit && request->proto.commit->wait_for_replicas.has_value()) call.enableWaitCancellation();
-    Update* updateMessage = new Update(std::move(request), &call);
+    Update* updateMessage = new Update(std::move(request), &call, startTime);
     updateMessage->target = collection->getId();
     try {
       if (!iw->submitUpdate(updateMessage)) {
@@ -814,7 +871,7 @@ static void respondPublished(GenericCallData& call, std::shared_ptr<State> state
   waits.awaitReplicas(waits.prepareReplicas(std::move(name), commit, *requirement,
                                             waits.deadlineAfter(timeoutMs.value_or(30000)), members),
       stop, [&call, state](api::ReplicaResult replicas) {
-        call.server.getLuxirNode().getTaskArena().enqueue([&call, state, replicas] {
+        call.server.getLuxirNode().getControlExecutor().enqueue([&call, state, replicas] {
           try {
             state->response.replicas = replicas;
             call.respondRaw(serializeToByteBuffer(state->response), 1);
@@ -837,7 +894,7 @@ static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& read
       call.enableWaitCancellation();
     }
     { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call, stop = call.waitCancellation.get_token()] {
+    call.server.getLuxirNode().getControlExecutor().enqueue([request, &call, stop = call.waitCancellation.get_token()] {
       try {
         auto id = LuxirNode::adminTarget(request->proto.tenant, request->proto.name);
         auto created = call.server.getLuxirNode().createCollection(id,
@@ -869,7 +926,7 @@ static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& read
 
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   try {
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+    call.server.getLuxirNode().getControlExecutor().enqueue([request, &call] {
       try {
         call.server.getLuxirNode().deleteCollection(LuxirNode::adminTarget(request->proto.tenant, request->proto.name));
         DeleteCollectionRespProto response;
@@ -884,37 +941,73 @@ static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& read
   }
 }
 
+template <bool Swap>
+static void handleCollectionNames(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  using Request = std::conditional_t<Swap, api::SwapCollectionsRequest, api::RenameCollectionRequest>;
+  using Response = std::conditional_t<Swap, api::SwapCollectionsResponse, api::RenameCollectionResponse>;
+  auto request = std::make_shared<HppRequestState<Request>>();
+  constexpr auto method = Swap ? "SwapCollections" : "RenameCollection";
+  if (!parseRequest(readBuf, *request, method)) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, std::string(method) + ": malformed request"));
+    return;
+  }
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  try {
+    call.server.getLuxirNode().getControlExecutor().enqueue([request, &call] {
+      try {
+        auto& node = call.server.getLuxirNode();
+        auto& req = request->proto;
+        Response response;
+        if constexpr (Swap) {
+          node.swapCollections(LuxirNode::adminTarget(req.tenant, req.a), LuxirNode::adminTarget(req.tenant, req.b));
+          response = {req.a, req.b};
+        } else {
+          node.renameCollection(LuxirNode::adminTarget(req.tenant, req.from), LuxirNode::adminTarget(req.tenant, req.to));
+          response = {req.from, req.to};
+        }
+        call.respondRaw(serializeToByteBuffer(response), 1);
+      } catch (const std::exception& e) { finishWithException(call, e); }
+    });
+  } catch (const std::exception& e) { finishWithException(call, e); }
+}
+
 //   rpc SetSchema(SchemaRequest) returns (SchemaResponse)  [unary]
+// updateSchema persists (fsync) under the writer's publication mutex, and may
+// create the collection: control-executor work, off the completion queue.
 static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
-  HppRequestState<SchemaReqProto> request;
-  if (!parseRequest(readBuf, request, "SetSchema")) {
+  auto request = std::make_shared<HppRequestState<SchemaReqProto>>();
+  if (!parseRequest(readBuf, *request, "SetSchema")) {
     finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SetSchema: malformed request"));
     return;
   }
-  if (!request.proto.schema.has_value()) {
+  if (!request->proto.schema.has_value()) {
     finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SetSchema: schema is required"));
     return;
   }
   try {
-    struct State {
-      std::pmr::monotonic_buffer_resource arena;  // backs the non-owning response SchemaDef
-      SchemaRespProto response;
-    };
-    auto state = std::make_shared<State>();
-    if (request.proto.wait_for_replicas) {
-      ReplicationSource::validate(*request.proto.wait_for_replicas);
+    if (request->proto.wait_for_replicas) {
+      ReplicationSource::validate(*request->proto.wait_for_replicas);
       call.enableWaitCancellation();
-      const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true;
     }
-
-    auto collection = call.server.getLuxirNode().getOrCreateCollection(
-        LuxirNode::target(request.proto.tenant, request.proto.collection));
-    auto newSchema = collection->updateSchema(*request.proto.schema, request.proto.mode);
-    newSchema->schema->toProto(&state->response.schema.emplace(), state->arena);
-    state->response.commit = api::build::arenaStr(state->arena, newSchema->id.token());
-    respondPublished(call, state, collection->getId(), newSchema->id, request.proto.wait_for_replicas,
-                     request.proto.wait_for_replicas_timeout_ms, ReplicationSource::Members::SERVING,
-                     call.waitCancellation.get_token());
+    { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+    call.server.getLuxirNode().getControlExecutor().enqueue([request, &call, stop = call.waitCancellation.get_token()] {
+      try {
+        struct State {
+          std::pmr::monotonic_buffer_resource arena;  // backs the non-owning response SchemaDef
+          SchemaRespProto response;
+        };
+        auto state = std::make_shared<State>();
+        auto& proto = request->proto;
+        auto collection = call.server.getLuxirNode().getOrCreateCollection(LuxirNode::target(proto.tenant, proto.collection));
+        auto newSchema = collection->updateSchema(*proto.schema, proto.mode);
+        newSchema->schema->toProto(&state->response.schema.emplace(), state->arena);
+        state->response.commit = api::build::arenaStr(state->arena, newSchema->id.token());
+        respondPublished(call, state, collection->getId(), newSchema->id, proto.wait_for_replicas,
+                         proto.wait_for_replicas_timeout_ms, ReplicationSource::Members::SERVING, stop);
+      } catch (const std::exception& e) {
+        finishWithException(call, e);
+      }
+    });
   } catch (const std::exception& e) {
     finishWithException(call, e);
   }
@@ -950,22 +1043,25 @@ static void handleStats(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Stats: malformed request"));
     return;
   }
-
-  // Per-segment output is unbounded. Keep both collection sampling and
-  // serialization off the completion-queue thread; responsesExpected keeps
-  // the call alive and requestActive preserves per-call request ordering.
+  auto run = [request, &call] {
+    try {
+      StatsRespProto response;
+      std::pmr::monotonic_buffer_resource respArena;
+      gatherStats(call.server.getLuxirNode(), request->proto, response, respArena);
+      call.respondRaw(serializeToByteBuffer(response), 1);
+    } catch (const std::exception& e) {
+      finishWithException(call, e);
+    }
+  };
+  // Collection walks and system sampling run off the completion queue.
+  // responsesExpected keeps the call alive and requestActive preserves order.
+  if (canGatherStatsInline(request->proto)) {
+    run();
+    return;
+  }
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   try {
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
-      try {
-        StatsRespProto response;
-        std::pmr::monotonic_buffer_resource respArena;
-        gatherStats(call.server.getLuxirNode(), request->proto, response, respArena);
-        call.respondRaw(serializeToByteBuffer(response), 1);
-      } catch (const std::exception& e) {
-        finishWithException(call, e);
-      }
-    });
+    call.server.getLuxirNode().getControlExecutor().enqueue(std::move(run));
   } catch (const std::exception& e) {
     finishWithException(call, e);
   }
@@ -980,10 +1076,10 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
   }
 
   // A dump is unbounded like per-segment stats, and a flush walks the entry
-  // map; keep both off the completion-queue thread.
+  // map; keep both off the completion-queue thread, on the control executor.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   try {
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+    call.server.getLuxirNode().getControlExecutor().enqueue([request, &call] {
       try {
         CacheControlRespProto response;
         std::pmr::monotonic_buffer_resource respArena;
@@ -1009,6 +1105,8 @@ static const MethodEntry* lookupMethod(const std::string& method) {
     {"/luxir.Admin/SetSchema",          {handleSetSchema, true, MetricOperation::SCHEMA}},
     {"/luxir.Admin/GetSchema",          {handleGetSchema, false, MetricOperation::SCHEMA}},
     {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true, MetricOperation::COLLECTIONS}},
+    {"/luxir.Admin/RenameCollection", {handleCollectionNames<false>, true, MetricOperation::COLLECTIONS}},
+    {"/luxir.Admin/SwapCollections", {handleCollectionNames<true>, true, MetricOperation::COLLECTIONS}},
     {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true, MetricOperation::COLLECTIONS}},
     {"/luxir.Admin/Stats",              {handleStats, false, MetricOperation::STATS}},
     {"/luxir.Admin/CacheControl",       {handleCacheControl, false, MetricOperation::OTHER}},
@@ -1019,9 +1117,9 @@ static const MethodEntry* lookupMethod(const std::string& method) {
 
 
 void GRPCServer::runThread(ThreadInfo& threadInfo) {
-  // linux-only: give threads a nice name for debugging.
+  // Give threads a name for debugging.
   std::string tname = "luxir_grpc_" + std::to_string(threadInfo.threadno);
-  pthread_setname_np(pthread_self(), tname.c_str());
+  nameThisThread(tname.c_str());
 
   // wait for the server to start before trying to use it.
   startLatch.wait();

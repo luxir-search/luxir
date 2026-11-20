@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <string>
 #include <vector>
 #include <optional>
@@ -28,7 +29,8 @@ using tcp = net::ip::tcp;
 // Returns the full (de-chunked) response so NDJSON bodies arrive as one string.
 inline http::response<http::string_body>
 httpRequest(int port, http::verb method, std::string_view target, std::string body = {},
-            std::string_view contentType = "application/json") {
+            std::string_view contentType = "application/json",
+            std::chrono::steady_clock::duration responseTimeout = {}) {
   net::io_context ioc;
   tcp::resolver resolver(ioc);
   beast::tcp_stream stream(ioc);
@@ -45,7 +47,15 @@ httpRequest(int port, http::verb method, std::string_view target, std::string bo
   beast::flat_buffer buffer;
   http::response_parser<http::string_body> parser;
   parser.skip(method == http::verb::head);
-  http::read(stream, buffer, parser);
+  if (responseTimeout == std::chrono::steady_clock::duration::zero()) {
+    http::read(stream, buffer, parser);
+  } else {
+    stream.expires_after(responseTimeout);
+    beast::error_code error;
+    http::async_read(stream, buffer, parser, [&](beast::error_code ec, std::size_t) { error = ec; });
+    ioc.run();
+    if (error) throw boost::system::system_error(error);
+  }
   auto res = parser.release();
 
   beast::error_code ec;
@@ -77,7 +87,7 @@ public:
     if (limit_)  j += R"(,"limit":)"      + std::to_string(*limit_);
     if (offset_) j += R"(,"offset":)"     + std::to_string(*offset_);
     if (batch_)  j += R"(,"batch_size":)" + std::to_string(*batch_);
-    if (count_)  j += R"(,"get_number":true)";
+    if (count_)  j += R"(,"count_limit":-1)";
     if (scores_) j += R"(,"get_scores":true)";
     if (!fields_.empty()) {
       j += R"(,"fields":[)";
@@ -196,7 +206,20 @@ private:
     if (auto* d = el.get_if<double>())      { out = *d;          return true; }
     if (auto* b = el.get_if<bool>())        { out = *b;          return true; }
     if (auto* a = el.get_if<Json::array_t>()) {
-      // Best-effort: homogeneous string or numeric arrays.
+      // Best-effort: homogeneous string or numeric arrays, or arrays of
+      // numeric arrays (multi-valued GEO_POINT).
+      if (!a->empty() && (*a)[0].get_if<Json::array_t>() != nullptr) {
+        std::vector<std::vector<double>> nested;
+        for (const Json& e : *a) {
+          FieldVal inner;
+          if (!toFieldVal(e, inner)) return false;
+          if (auto* d = std::get_if<std::vector<double>>(&inner)) nested.push_back(std::move(*d));
+          else if (auto* i = std::get_if<std::vector<int64_t>>(&inner)) nested.emplace_back(i->begin(), i->end());
+          else return false;
+        }
+        out = std::move(nested);
+        return true;
+      }
       std::vector<std::string> svs;
       std::vector<int64_t> ivs;
       std::vector<double> dvs;

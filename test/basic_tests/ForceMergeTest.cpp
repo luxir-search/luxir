@@ -1,18 +1,22 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <filesystem>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "luxir/index/CommitSnapshotRegistry.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/Signal.h"
+#include "luxir/util/Uuid.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
@@ -187,31 +191,62 @@ TEST_F(ForceMergeTest, waitForMergesComposesWithMaxSegments) {
 }
 
 TEST_F(ForceMergeTest, mergeFailureReturnsErrorAndPreservesSources) {
-  CollectionHelper helper("main");
-  enableL2VectorSuffix(helper.collection());
-  auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
-  ASSERT_TRUE(addSegment(helper, "failure-a-", 2));
-  ASSERT_TRUE(addSegment(helper, "failure-b-", 2));
-  helper.commit({"vec.embedding_v"});
-  ASSERT_TRUE(writer->testActiveVectorOverlayName("vec.embedding_v"));
-
-  Signal::listen("mergedPostingsReader", [](void*, void*, void*) -> void* {
-    throw std::runtime_error("injected client merge failure");
-  });
-  IndexResult result;
+  auto path = std::filesystem::temp_directory_path() / ("luxir-aborted-nested-merge-" + newUuid());
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  LuxirConfig config;
+  config.store.backend = "fs";
+  config.store.data_dir = path.string();
+  config.store.checked_dir.sync = "throw";
+  auto check = [](CollectionHelper& helper) {
+    EXPECT_EQ((std::vector<std::string>{"failure-a-0", "failure-a-1", "failure-b-0", "failure-b-1", "nested"}),
+              allIds(helper));
+    auto req = localReq(helper.getSearchEngine());
+    req->topDocs().exprQuery("items_nested.parts_nested.tag_s:intact").countLimit().limit(0);
+    req->execute(1); EXPECT_OK(req); EXPECT_EQ(1, req->getMatchCount());
+  };
   {
-    ExpectLog quiet("injected client merge failure");
-    result = commit(helper, 1);
-  }
-  Signal::unlisten("mergedPostingsReader");
+    LuxirNode node(config);
+    CollectionHelper helper(node, "main");
+    enableL2VectorSuffix(helper.collection());
+    auto writer = helper.getIndexWriter();
+    writer->mergePolicy->setMergeFactor(100);
+    ASSERT_TRUE(addSegment(helper, "failure-a-", 2));
+    ASSERT_TRUE(addSegment(helper, "failure-b-", 2));
+    CollectionHelper::UpdateBuilder nested;
+    nested.addRaw([](auto& doc, auto& arena) {
+      ASSERT_TRUE(api::read_json(doc, R"({"id":"nested","items_nested":{"parts_nested":{"tag_s":"intact"}}})", arena));
+    });
+    nested.commit(); ASSERT_TRUE(helper.submit(nested).success);
+    helper.commit({"vec.embedding_v"});
+    ASSERT_TRUE(writer->testActiveVectorOverlayName("vec.embedding_v"));
 
-  EXPECT_FALSE(result.success);
-  EXPECT_EQ(IndexResult::Status::ERROR, result.status);
-  EXPECT_NE(std::string::npos, result.error_message.find("Data commit succeeded"));
-  EXPECT_EQ(2u, helper.durableSegmentCount());
-  EXPECT_EQ((std::vector<std::string>{"failure-a-0", "failure-a-1", "failure-b-0", "failure-b-1"}),
-            allIds(helper));
+    Signal::listen("mergedPostingsReader", [](void*, void*, void*) -> void* {
+      throw std::runtime_error("injected client merge failure");
+    });
+    IndexResult result;
+    {
+      ExpectLog quiet("injected client merge failure");
+      result = commit(helper, 1);
+    }
+    Signal::unlisten("mergedPostingsReader");
+
+    EXPECT_FALSE(result.success);
+    EXPECT_EQ(IndexResult::Status::ERROR, result.status);
+    EXPECT_NE(std::string::npos, result.error_message.find("Data commit succeeded"));
+    EXPECT_EQ(3u, helper.durableSegmentCount());
+    check(helper);
+    expectValidInventory(writer->dir, *readDurableIndexInfo(writer->dir));
+  }
+  {
+    LuxirNode node(config);
+    CollectionHelper helper(node, "main");
+    EXPECT_EQ(3u, helper.durableSegmentCount());
+    check(helper);
+    expectValidInventory(helper.getIndexWriter()->dir, *readDurableIndexInfo(helper.getIndexWriter()->dir));
+    EXPECT_TRUE(commit(helper, 1).success);
+    EXPECT_EQ(1u, helper.durableSegmentCount());
+    check(helper);
+  }
 }
 
 TEST_F(ForceMergeTest, targetAboveOneSelectsSmallestLiveSegmentsAndPolicyRecovers) {
@@ -235,6 +270,43 @@ TEST_F(ForceMergeTest, targetAboveOneSelectsSmallestLiveSegmentsAndPolicyRecover
   ASSERT_TRUE(addSegment(helper, "policy-", 1));
   EXPECT_TRUE(commit(helper, 0, /*waitForMerges=*/true).success);
   EXPECT_FALSE(writer->testMergeRunning());
+}
+
+// A max_segments commit rewrites its own flushes once: the policy merges those
+// flushes would start hold off until the force merge has run.
+TEST_F(ForceMergeTest, policyMergesYieldToPendingForceMerge) {
+  RAMDir dir;
+  auto schema = std::make_shared<Schema>();
+  schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
+      "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
+  std::atomic<int> merges{0};
+  Signal::listen("mergeStart", [&](void*, void*, void*) -> void* {
+    merges++;
+    return nullptr;
+  });
+  auto cleanup = luxir::scope_guard([]() { Signal::unlisten("mergeStart"); });
+
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
+  IndexWriter iw(snapshots, schema);
+  iw.mergePolicy->setMergeFactor(2);
+  // Three concurrently busy inverters, released idle: the commit flushes all
+  // three, and any two of them fill a merge level.
+  std::vector<Inverter*> inverters;
+  for (int i = 0; i < 3; i++) {
+    Inverter& inverter = iw.obtainInverter();
+    for (int doc = 0; doc < 10; doc++) {
+      inverter.startDoc();
+      inverter.getIndexHandler("body").index(inverter, std::string_view("force merge body"));
+      inverter.finishDoc();
+    }
+    inverters.push_back(&inverter);
+  }
+  for (Inverter* inverter : inverters) iw.releaseInverter(*inverter);
+
+  iw.mergeSegments();
+  EXPECT_EQ(1, merges.load());
+  EXPECT_EQ(1u, readDurableIndexInfo(dir)->segments.size());
+  EXPECT_FALSE(iw.testMergeRunning());
 }
 
 TEST_F(ForceMergeTest, dirtySingletonRewritesAndCleanSingletonStillPublishes) {

@@ -132,7 +132,7 @@ TEST_F(FusionCollapseTest, exhaustiveOracle) {
           });
         }
         std::string body = R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{)" + sourceJson
-            + R"JSON(},"get_number":true,"get_scores":true,"fields":["seq_i"],"document_format":"rows",
+            + R"JSON(},"count_limit":-1,"get_scores":true,"fields":["seq_i"],"document_format":"rows",
               "batch_size":2,"ops":{"evidence":"sum(seq_i)"})JSON";
         if (fusionCollapse) body += R"(,"collapse":)" + spec(shape, policy);
         for (int parallel : {1, -1}) {
@@ -187,13 +187,13 @@ TEST_F(FusionCollapseTest, pageOperationsAndReset) {
   for (int parallel : {1, -1}) {
     auto req = run("main", R"JSON({"ops":{"f":{"fusion":{"rrf":{},"sources":{
       "a":{"sort":"seq_i asc","limit":2},"b":{"sort":"seq_i desc","limit":2}},
-      "collapse":{"field":"key_s","head_sort":"seq_i desc","get_number":true,"ops":{
+      "collapse":{"field":"key_s","head_sort":"seq_i desc","get_count":true,"ops":{
         "low":"min(seq_i)","members":{"top_docs":{"sort":"seq_i asc","limit":-1,
           "fields":["seq_i"],"document_format":"rows"}},
         "swatches":{"field_facet":{"field":"color_s"}},
         "all":{"top_docs":{"sort":"seq_i asc","limit":-1,"fields":["seq_i"],
           "document_format":"rows"},"domain":{"query":"*:*"}}
-      }},"get_scores":true,"get_number":true,"batch_size":1,
+      }},"get_scores":true,"count_limit":-1,"batch_size":1,
       "fields":["seq_i"],"document_format":"rows"}}}})JSON", parallel);
     ASSERT_OK(req);
     EXPECT_EQ((std::vector<int64_t>{1, 7}), sequence(*req));
@@ -262,14 +262,14 @@ TEST_F(FusionCollapseTest, sourceKnnAndValidation) {
   for (int parallel : {1, -1}) {
     auto req = run("main", R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{"s":{
       "query":{"knn":{"field":"embedding_v","query":[0],"k":2,"exact":true,"unit":"groups"}},
-      "collapse":"key_s","limit":2}},"limit":-1,"get_number":true,
+      "collapse":"key_s","limit":2}},"limit":-1,"count_limit":-1,
       "fields":["seq_i"],"document_format":"rows"}}}})", parallel);
     ASSERT_OK(req);
     EXPECT_EQ((std::vector<int64_t>{0, 4}), sequence(*req));
     EXPECT_EQ(2, req->docList("f")->found.value_or(-1));
   }
   for (auto option : {R"("head_sort":"seq_i asc")", R"("sort":"m asc")",
-                      R"("get_number":true)", R"JSON("ops":{"m":"min(seq_i)"})JSON"}) {
+                      R"("get_count":true)", R"JSON("ops":{"m":"min(seq_i)"})JSON"}) {
     auto req = localReq(helper.getSearchEngine());
     parseQueryRequest(R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{"s":{
       "collapse":{"field":"key_s",)" + std::string(option) + "}}}}}}}", req->rawRequest(), req->mr);
@@ -321,12 +321,12 @@ TEST_F(FusionCollapseTest, structuralScopesAndParallelOrdinaryChildren) {
   }
   std::string fusion = R"JSON({"fusion":{"rrf":{},"sources":{"s":{
     "sort":"seq_i asc","limit":12}},"filter":["seq_i:<10"],
-    "collapse":{"field":"key_s","get_number":true,"ops":{
+    "collapse":{"field":"key_s","get_count":true,"ops":{
       "all":{"top_docs":{"sort":"seq_i asc","limit":-1,"fields":["seq_i"],
         "document_format":"rows"},"domain":{"query":"*:*"}},
       "filtered":{"top_docs":{"sort":"seq_i asc","limit":-1,"fields":["seq_i"],
         "document_format":"rows"},"domain":{"query":"*:*","apply_parent_filters":true}}
-    }},"limit":-1,"get_number":true,"fields":["seq_i"],"document_format":"rows",
+    }},"limit":-1,"count_limit":-1,"fields":["seq_i"],"document_format":"rows",
     "ops":{"ordinary":{"top_docs":{"query":"body_w:prefix*","limit":-1,
       "fields":["seq_i"],"document_format":"rows"}}}}})JSON";
   for (int parallel : {1, -1}) for (int placement : {0, 1, 2}) {

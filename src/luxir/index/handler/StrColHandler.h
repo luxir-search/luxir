@@ -17,7 +17,7 @@
 
 namespace luxir::handler {
 
-/// String field handler for column stored only (values are stored verbatim per-doc, values not deduped)
+/// Column-only strings: SET stores sorted unique normalized bytes; ARRAY keeps order and repeats.
 /// If the string is indexed and stored, see StrHandler.
 /// This class also handles binary values.
 ///
@@ -28,7 +28,9 @@ namespace luxir::handler {
 ///   - endValueRankReader (monoLoc): per-doc -> per-value rank boundary. Present only for multi-valued.
 class StrColHandler : public Inverter::IndexHandler {
   friend Inverter;
-  StringValue stringValue;
+  StringValue<false> stringValue;
+  std::vector<std::string_view> docValues;
+  size_t scratchBytes = 0;
 
 protected:
   enum class ValueStorage {
@@ -54,14 +56,14 @@ private:
   int32_t maxSize = std::numeric_limits<int32_t>::min();
 
 public:
-  StrColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
-    : StrColHandler(inverter, fieldName, fieldType, ValueStorage::BUFFERED) {
+  StrColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : StrColHandler(inverter, fieldName, fieldType, space, ValueStorage::BUFFERED) {
   }
 
 protected:
   StrColHandler(Inverter& inverter, const std::string_view& fieldName,
-                const std::shared_ptr<FieldType>& fieldType, ValueStorage valueStorage)
-    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
+                const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space, ValueStorage valueStorage)
+    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space),
       stringValue(*fieldType),
       docsWithVal(inverter.pool),
       valSizeStream(inverter.pool),
@@ -76,48 +78,15 @@ public:
   ~StrColHandler() override = default;
 
   void index(Inverter& inverter, const IndexVal& val) override {
-    if (std::holds_alternative<std::string_view>(val.kind)) {
-      indexSingle(inverter, std::get<std::string_view>(val.kind));
-    }
-    else if (std::holds_alternative<::hpp_proto::bytes_view>(val.kind)) {
-      // TODO: only OK if this is a binary type, otherwise we could accept non-unicode and then attempt
-      // to return that as a string later and cause gRPC or someone else up the line to choke.
-      const auto& b = std::get<::hpp_proto::bytes_view>(val.kind);
-      indexSingle(inverter, std::string_view((const char*)b.data(), b.size()));
-    }
-    else if (std::holds_alternative<luxir::api::ArrStr>(val.kind)) {
-      const auto& arr = std::get<luxir::api::ArrStr>(val.kind).v;
-      indexMulti(inverter, std::span<const std::string_view>(arr.data(), arr.size()));
-    }
-    else if (std::holds_alternative<luxir::api::ArrBin>(val.kind)) {
-      const auto& arr = std::get<luxir::api::ArrBin>(val.kind).v;
-      std::vector<std::string_view> views;
-      views.reserve(arr.size());
-      for (const auto& bin : arr) {
-        views.push_back(std::string_view((const char*)bin.data(), bin.size()));
-      }
-      indexMulti(inverter, std::span<const std::string_view>(views.data(), views.size()));
-    }
-    else if (coerce::isNull(val)) {
+    if (auto s = std::get_if<std::string_view>(&val.kind)) {
+      index(inverter, *s);
       return;
     }
-    else if (coerce::isArray(val)) {
-      // numeric / mixed arrays: the column stores each element's canonical
-      // rendering.  Materialize (buf is per-element transient) so indexMulti
-      // sees stable views and the multi-valued check runs before any append.
-      char buf[coerce::TEXT_BUF_SIZE];
-      std::vector<std::string> storage;
-      coerce::forEachElement(val, [&](const IndexVal& elem) {
-        storage.emplace_back(fieldType->coerceTerm(elem, std::string_view(fieldName), buf));
-      });
-      std::vector<std::string_view> views(storage.begin(), storage.end());
-      indexMulti(inverter, std::span<const std::string_view>(views.data(), views.size()));
-    }
-    else {
-      // numeric scalars: store the canonical rendering
-      char buf[coerce::TEXT_BUF_SIZE];
-      indexSingle(inverter, fieldType->coerceTerm(val, std::string_view(fieldName), buf));
-    }
+    if (coerce::isNull(val)) return;
+    if (coerce::isArray(val)) {
+      auto account = scope_guard([&] { accountScratch(inverter); });
+      appendPrepared(inverter, stringValue.prepareMany(val, std::string_view(fieldName)));
+    } else indexSingle(inverter, val);
   }
 
   void index(Inverter& inverter, std::string_view val) override {
@@ -125,36 +94,39 @@ public:
   }
 
   void index(Inverter& inverter, std::span<const std::string_view> vals) override {
-    indexMulti(inverter, vals);
+    auto account = scope_guard([&] { accountScratch(inverter); });
+    appendPrepared(inverter, stringValue.prepareMany(vals, std::string_view(fieldName)));
   }
 
-  void indexSingle(Inverter& inverter, std::string_view term) {
-    appendSingle(inverter, stringValue.normalize(term));
+private:
+  template <typename T>
+  void indexSingle(Inverter& inverter, const T& val) {
+    if (!stringValue.hasNormalizer()) {
+      appendSingle(inverter, stringValue.prepare(val, std::string_view(fieldName)));
+      return;
+    }
+    auto account = scope_guard([&] { accountScratch(inverter); });
+    appendSingle(inverter, stringValue.prepare(val, std::string_view(fieldName)));
   }
 
-  void indexMulti(Inverter& inverter, std::span<const std::string_view> vals) {
+  void appendPrepared(Inverter& inverter, std::span<const std::string_view> vals) {
     if (vals.empty()) return;
     if (!fieldType->multiValued()) {
-      if (vals.size() > 1) {
-        throw DocumentError(fmt::format("Field '{}' is single-valued but received multiple values",
-                                        std::string_view(fieldName)));
-      }
-      indexSingle(inverter, vals[0]);
-      return;
-    }
-    // Validate every value before starting a column row. A later failure must
-    // not leave the row's value count or end offsets incomplete.
-    if (!stringValue.hasNormalizer()) {
-      appendMulti(inverter, vals);
-      return;
-    }
-    std::vector<std::string> normalized;
-    normalized.reserve(vals.size());
-    for (auto val : vals) {
-      normalized.emplace_back(stringValue.normalize(val));
-    }
-    std::vector<std::string_view> views(normalized.begin(), normalized.end());
-    appendMulti(inverter, views);
+      if (vals.size() > 1) throw DocumentError(fmt::format(
+          "Field '{}' is single-valued but received multiple values", std::string_view(fieldName)));
+      appendSingle(inverter, vals[0]);
+    } else if (fieldType->multiSet()) {
+      docValues.assign(vals.begin(), vals.end());
+      std::ranges::sort(docValues);
+      docValues.erase(std::unique(docValues.begin(), docValues.end()), docValues.end());
+      appendMulti(inverter, docValues);
+    } else appendMulti(inverter, vals);
+  }
+
+  void accountScratch(Inverter& inverter) {
+    scratchBytes = docValues.capacity() * sizeof(std::string_view)
+        + stringValue.retainedBytes();
+    accountExtraRam(inverter, valuesFile.size() + scratchBytes);
   }
 
 protected:
@@ -169,7 +141,7 @@ protected:
     // Buffered column bytes accumulate outside inverter.pool. Streamed columns
     // leave valuesFile empty; their OutputStream storage is owned by Directory.
     if (valueStorage == ValueStorage::BUFFERED) {
-      accountExtraRam(inverter, valuesFile.size());
+      accountExtraRam(inverter, valuesFile.size() + scratchBytes);
     }
   }
 
@@ -187,7 +159,7 @@ protected:
     }
     valCountStream.addVal(inverter.pool, (int64_t)vals.size());
     if (valueStorage == ValueStorage::BUFFERED) {
-      accountExtraRam(inverter, valuesFile.size());
+      accountExtraRam(inverter, valuesFile.size() + scratchBytes);
     }
   }
 
@@ -244,13 +216,14 @@ public:
     auto& tmpPool = MemPool::threadLocal();
 
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(space, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
+    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
     fieldInfo.numValues = numValuesTotal;
     describeField(fieldInfo);
 
-    auto maxDoc = inverter.getMaxDoc();
+    auto maxDoc = inverter.getPostingsWriter().getMaxDoc(space);
     bool full = numDocs == maxDoc;
     bool multiValued = (fieldInfo.flags & FieldType::MULTI_VALUED) != 0;
     // When there are no values (e.g., multi-valued field with only empty arrays),

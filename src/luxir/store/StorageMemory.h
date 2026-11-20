@@ -4,22 +4,43 @@
 
 #include <atomic>
 #include <memory>
+#include <map>
+#include <mutex>
 #include <functional>
 #include <utility>
 #include "FileIOException.h"
 
 namespace luxir {
 
-// One node counter, with child counters shared by all incarnations of a collection.
+// One node counter, with child counters for tenants and their incarnations.
 // Buffers own their charges, so unlinking a file never releases a reader's bytes.
-class StorageMemory {
+class StorageMemory : public std::enable_shared_from_this<StorageMemory> {
   std::shared_ptr<StorageMemory> parent;
   std::atomic<uint64_t> used{0};
   uint64_t limit;
   std::function<bool()> reclaim;
+  std::mutex mutex;
+  std::map<std::string, std::weak_ptr<StorageMemory>, std::less<>> children;
+  size_t newChildren = 0;
 public:
   explicit StorageMemory(uint64_t limit = 0, std::shared_ptr<StorageMemory> parent = {}, std::function<bool()> reclaim = {})
       : parent(std::move(parent)), limit(limit), reclaim(std::move(reclaim)) {}
+  // Labels are opaque to storage. The engine chooses the accounting hierarchy.
+  std::shared_ptr<StorageMemory> child(std::string key) {
+    std::lock_guard lock(mutex);
+    auto& weak = children[std::move(key)];
+    auto result = weak.lock();
+    if (!result) {
+      result = std::make_shared<StorageMemory>(0, shared_from_this());
+      weak = result;
+      if (++newChildren >= std::max((size_t)64, children.size())) {
+        std::erase_if(children, [](const auto& entry) { return entry.second.expired(); });
+        newChildren = 0;
+      }
+    }
+    return result;
+  }
+  uint64_t limitBytes() const { return limit; }
   uint64_t bytes() const { return used.load(std::memory_order_relaxed); }
   void reserve(uint64_t bytes) {
     if (parent) parent->reserve(bytes);

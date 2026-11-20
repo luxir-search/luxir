@@ -32,7 +32,8 @@ TEST_F(SmokeTest, ConvertDocAllArmsRoundTrip) {
     "af", std::vector<float>{1, 2, 3, 4},           // dense vector arm
     "ad", std::vector<double>{1.1, 2.2},
     "as", std::vector<std::string>{"x", "y"},
-    "av", std::vector<std::vector<float>>{{1, 2}, {3, 4, 5}}  // multi-vector arm
+    "av", std::vector<std::vector<float>>{{1, 2}, {3, 4, 5}},  // multi-vector arm
+    "ap", std::vector<std::vector<double>>{{-74.0, 40.7}}     // multi-valued geo arm
   );
 
   std::pmr::monotonic_buffer_resource arena;
@@ -79,6 +80,12 @@ TEST_F(SmokeTest, ConvertDocAllArmsRoundTrip) {
   EXPECT_EQ(av[0].f32->v.size(), 2u);
   ASSERT_TRUE(av[1].f32.has_value());
   EXPECT_EQ(av[1].f32->v.size(), 3u);
+
+  const auto& ap = std::get<luxir::api::ArrVal>(arm("ap").kind).v;
+  ASSERT_EQ(ap.size(), 1u);
+  const auto& point = std::get<luxir::api::ArrDouble>(ap[0].kind).v;
+  ASSERT_EQ(point.size(), 2u);
+  EXPECT_DOUBLE_EQ(point[1], 40.7);
 }
 
 // Full data path: index (sync) -> commit -> search via fluent builder -> non-owning response.
@@ -120,7 +127,7 @@ TEST_F(SmokeTest, IndexSearchRoundTrip) {
     EXPECT_EQ(std::get<int64_t>(*find(*d3, "foo_i")), 5);
     EXPECT_EQ(std::get<std::string>(*find(*d3, "color_s")), "brown");
     ASSERT_NE(find(*d3, "colors_ss"), nullptr);
-    // Multi-valued string columns return sorted+deduped (SortedSet semantics), so the
+    // Default SET string columns return sorted unique values, so the
     // stored {"red","black"} comes back as {"black","red"}.
     EXPECT_EQ(std::get<std::vector<std::string>>(*find(*d3, "colors_ss")),
               (std::vector<std::string>{"black", "red"}));

@@ -24,7 +24,7 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool docPer
   double invertSecs = 0, flushSecs = 0;
   for (auto _ : state) {
     dir = RAMDir(); // clear files
-    Inverter inverter(dir, 0);
+    Inverter inverter(dir, 0, 1);
     Inverter::InputHandler& fieldHandler = inverter.getIndexHandler(field);
 
     auto t0 = std::chrono::steady_clock::now();

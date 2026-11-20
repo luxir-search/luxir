@@ -35,7 +35,7 @@ void installExistsSchema(CollectionHelper& helper, SchemaBuilder& b) {
   auto& multi = b.field("multi_w");
   multi.type = FieldClass::TEXT;
   multi.index = IndexMode::MATCH;
-  multi.multi = true;
+  multi.multi = api::FieldDef::MultiMode::DEFAULT;
   multi.column = false;
   b.analyzer(multi, "whitespace");
 
@@ -335,7 +335,7 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
 
   auto countReq = localReq(helper.getSearchEngine());
   countReq->collection("main").topDocs("q").existsQuery("body_w")
-      .getNumber().limit(0);
+      .countLimit().limit(0);
   countReq->execute();
   ASSERT_TRUE(countReq->ok()) << countReq->errorMsg();
   EXPECT_EQ(2, countReq->getMatchCount());
@@ -351,7 +351,7 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
 
   auto deletedReq = localReq(helper.getSearchEngine());
   deletedReq->collection("main").topDocs("q").existsQuery("body_w")
-      .getNumber().fields({"id"}).limit(-1);
+      .countLimit().fields({"id"}).limit(-1);
   deletedReq->execute();
   ASSERT_TRUE(deletedReq->ok()) << deletedReq->errorMsg();
   EXPECT_EQ(1, deletedReq->getMatchCount());

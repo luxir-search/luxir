@@ -1,7 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-// A segment's PostingsReader (its mapped files and the views cached on it) is
+// A segment's core (its mapped files and the space readers it owns) is
 // shared by every snapshot that holds the segment and by the writer. These
 // tests reopen file-backed indexes, where releasing the last holder unmaps
 // the files, so a view that outlived its mapping faults.
@@ -76,9 +76,9 @@ protected:
 
   std::shared_ptr<IndexReader> current() { return writer->snapshots.readers.getReader(); }
 
-  static std::vector<PostingsReader*> postings(IndexReader& reader) {
-    std::vector<PostingsReader*> out;
-    for (auto& segment : reader.segments()) out.push_back(&segment.postingsReader());
+  static std::vector<SegmentCore*> cores(IndexReader& reader) {
+    std::vector<SegmentCore*> out;
+    for (auto& segment : reader.segments()) out.push_back(&segment.segmentCore());
     return out;
   }
 
@@ -90,6 +90,9 @@ protected:
     int64_t live = 0;
     for (auto& segment : reader.segments()) {
       auto& postingsReader = segment.postingsReader();
+      EXPECT_EQ(&segment.segmentCore(), &postingsReader.core());
+      EXPECT_EQ(segment.segInfo.seg_id, segment.segmentCore().id());
+      EXPECT_EQ(segment.maxDoc(), postingsReader.maxDoc());
       MemPool pool;
       const PostingsReader::Field* idFields = nullptr;
       const PostingsReader::Field* valueFields = nullptr;
@@ -125,11 +128,11 @@ protected:
     return live;
   }
 
-  // The writer's open reader of each segment of the published snapshot, as it
-  // handed them over (CommitSnapshot::openReaders), by manifest order.
-  std::vector<PostingsReader*> writerSlots() {
-    std::vector<PostingsReader*> out;
-    for (const auto& open : writer->snapshots.snapshot()->openReaders) out.push_back(open.lock().get());
+  // The writer's open core of each segment of the published snapshot, as it
+  // handed them over (CommitSnapshot::openCores), by manifest order.
+  std::vector<SegmentCore*> writerSlots() {
+    std::vector<SegmentCore*> out;
+    for (const auto& open : writer->snapshots.snapshot()->openCores) out.push_back(open.lock().get());
     return out;
   }
 };
@@ -159,21 +162,22 @@ TEST_F(SegmentSharingTest, fieldNamesFollowSegmentSet) {
   EXPECT_EQ(2, deleted->liveDocs());
 
   // The same segment set can be opened through another publisher's reader.
-  auto independent = PostingsReader::create(writer->dir, before->segments()[0].segInfo.seg_id);
+  auto stored = readDurableIndexInfo(writer->dir);
+  auto independent = SegmentCore::create(writer->dir, stored->segments[0].seg_id, stored->segments[0].creator_epoch);
   auto snapshot = *writer->snapshots.snapshot();
-  snapshot.openReaders[0] = independent;
+  snapshot.openCores[0] = independent;
   auto separate = std::make_shared<IndexReader>(writer->dir, snapshot, before.get());
   auto separateField = separate->field("n_i");
-  EXPECT_EQ(independent, separate->segments()[0].postingsReaderShared());
+  EXPECT_EQ(independent, separate->segments()[0].segmentCoreShared());
   EXPECT_EQ(&field.stats(), &separateField.stats());
   EXPECT_NE(info, separateField.at(0));
-  EXPECT_EQ(independent->fieldInfo("n_i"), separateField.at(0));
+  EXPECT_EQ(independent->rootReader().fieldInfo("n_i"), separateField.at(0));
 
   addSegment(2);
   auto after = current();
   ASSERT_EQ(2u, after->segments().size());
-  EXPECT_EQ(before->segments()[0].postingsReaderShared(),
-            after->segments()[0].postingsReaderShared());
+  EXPECT_EQ(before->segments()[0].segmentCoreShared(),
+            after->segments()[0].segmentCoreShared());
   auto reopenedField = after->field("n_i");
   EXPECT_NE(field, reopenedField);
   EXPECT_EQ(info, reopenedField.at(0));
@@ -182,9 +186,9 @@ TEST_F(SegmentSharingTest, fieldNamesFollowSegmentSet) {
   EXPECT_FALSE(after->field("missing_i").exists());
 }
 
-// A delete-only commit changes one segment's live docs: every PostingsReader
+// A delete-only commit changes one segment's live docs: every segment core
 // and every other segment's live docs carry over. The writer applied the
-// deletes through the published reader's PostingsReaders.
+// deletes through the published reader's segment cores.
 TEST_F(SegmentSharingTest, deleteOnlyCommitSharesEverySegment) {
   for (int32_t docs : {1100, 700, 600}) addSegment(docs);
   ASSERT_TRUE(helper->deleteByIds({"5", "1500"}, UpdateMessage::COMMIT).success);
@@ -197,8 +201,8 @@ TEST_F(SegmentSharingTest, deleteOnlyCommitSharesEverySegment) {
   ASSERT_TRUE(helper->deleteById("2000", UpdateMessage::COMMIT).success);
   auto after = current();
   EXPECT_EQ(before->coreGen(), after->coreGen());
-  EXPECT_EQ(postings(*before), postings(*after));
-  EXPECT_EQ(postings(*after), writerSlots());
+  EXPECT_EQ(cores(*before), cores(*after));
+  EXPECT_EQ(cores(*after), writerSlots());
   EXPECT_EQ(before->segments()[0].liveDocs(), after->segments()[0].liveDocs());
   EXPECT_EQ(before->segments()[1].liveDocs(), after->segments()[1].liveDocs());
   ASSERT_NE(nullptr, after->segments()[2].liveDocs());
@@ -211,7 +215,7 @@ TEST_F(SegmentSharingTest, deleteOnlyCommitSharesEverySegment) {
 }
 
 // An overlay is an aux reader beside the base files, not part of them: an
-// overlay-only commit shares every PostingsReader and the live docs.
+// overlay-only commit shares every segment core and the live docs.
 TEST_F(SegmentSharingTest, overlayOnlyCommitSharesEverySegment) {
   for (int32_t docs : {600, 500}) addSegment(docs);
   ASSERT_TRUE(helper->deleteById("7", UpdateMessage::COMMIT).success);
@@ -222,7 +226,7 @@ TEST_F(SegmentSharingTest, overlayOnlyCommitSharesEverySegment) {
   ASSERT_FALSE(readDurableIndexInfo(writer->dir)->segments[0].overlays.empty());
   auto after = current();
   ASSERT_NE(before, after);
-  EXPECT_EQ(postings(*before), postings(*after));
+  EXPECT_EQ(cores(*before), cores(*after));
   for (size_t i = 0; i < after->segments().size(); i++) {
     EXPECT_EQ(before->segments()[i].liveDocs(), after->segments()[i].liveDocs());
     EXPECT_TRUE(before->segments()[i].auxReaders().empty());
@@ -256,7 +260,7 @@ TEST_F(SegmentSharingTest, newSegmentsShareTheWritersReaders) {
   ASSERT_EQ(3u, after->segments().size());
   EXPECT_EQ(&flushed->segments()[0].postingsReader(), &after->segments()[0].postingsReader());
   EXPECT_EQ(&flushed->segments()[1].postingsReader(), &after->segments()[1].postingsReader());
-  EXPECT_EQ(slots, postings(*after));
+  EXPECT_EQ(slots, cores(*after));
 
   EXPECT_EQ(800, readAll(*before));
   before.reset();
@@ -272,15 +276,15 @@ TEST_F(SegmentSharingTest, mergeReleasesItsSources) {
   ASSERT_TRUE(helper->deleteById("3", UpdateMessage::COMMIT).success);
   auto before = current();
   EXPECT_EQ(1799, readAll(*before));
-  std::vector<std::weak_ptr<PostingsReader>> sources;
-  for (auto& segment : before->segments()) sources.push_back(segment.postingsReaderShared());
+  std::vector<std::weak_ptr<SegmentCore>> sources;
+  for (auto& segment : before->segments()) sources.push_back(segment.segmentCoreShared());
 
   CollectionHelper::UpdateBuilder merge;
   merge.commit(true, 1);
   ASSERT_TRUE(helper->submit(merge).success);
   auto after = current();
   ASSERT_EQ(1u, after->segments().size());
-  for (auto& source : sources) EXPECT_NE(source.lock().get(), &after->segments()[0].postingsReader());
+  for (auto& source : sources) EXPECT_NE(source.lock().get(), &after->segments()[0].segmentCore());
   EXPECT_EQ(1799, readAll(*after));
   EXPECT_EQ(1799, readAll(*before));
 
@@ -290,6 +294,7 @@ TEST_F(SegmentSharingTest, mergeReleasesItsSources) {
   auto latest = current();
   EXPECT_EQ(&after->segments()[0].postingsReader(), &latest->segments()[0].postingsReader());
   after.reset();
+  writer->testDrain();  // retired readers are dropped in the background
   for (auto& source : sources) EXPECT_TRUE(source.expired());
   EXPECT_EQ(1798, readAll(*latest));
 }
@@ -308,15 +313,20 @@ TEST_F(SegmentSharingTest, newIncarnationSharesNothing) {
   root.info.index_gen++;
   std::vector<std::byte> bytes;
   ASSERT_TRUE(api::encode(root.info, bytes));
-  Manifest::write(writer->dir, root.info.index_gen, bytes);
+  Manifest::write(writer->dir, root.info.index_gen, bytes, root->writer_epoch);
+  IncarnationState::install(writer->dir, Manifest::tip(root->index_gen, root->writer_epoch));
   auto rerooted = std::make_shared<IndexReader>(writer->dir, before.get());
   ASSERT_EQ(root.info.incarnation, rerooted->incarnation());
   EXPECT_NE(&before->segments()[0].postingsReader(), &rerooted->segments()[0].postingsReader());
   EXPECT_EQ(900, readAll(*rerooted));
   rerooted.reset();
-  writer->dir.deleteFile(Manifest::name(root.info.index_gen));
+  writer->dir.deleteFile(Manifest::name(root.info.index_gen, root->writer_epoch));
 
-  helper->clear();
+  node->deleteCollection("share");
+  writer.reset();
+  helper = std::make_unique<CollectionHelper>(*node, "share");
+  writer = helper->getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
   nextId = 0;
   addSegment(900);
   auto snapshot = writer->snapshots.snapshot();

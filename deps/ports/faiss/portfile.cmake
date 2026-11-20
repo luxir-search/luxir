@@ -2,12 +2,12 @@ vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO facebookresearch/faiss
     REF "v${VERSION}"
-    SHA512 c1cbf92a96dfee0a27dc0cb8d719a451efec6ea44a73bd4a8b764593624bc0e074da5aa6bca19fbc904899416aab2a82aa5659d06bb07174624cb4449252ac07
+    SHA512 f653dafbf1750b8c1719f12c6fa63d3fe84093ba0c663c6fa787ab6e381dab5ce8606830c821df9ad8d5300dfea73d7cfb890437a9e006539c417bffa4f8e799
     HEAD_REF main
     PATCHES
-        msvc-template.diff
-        undef-small.diff
-        dispatch-features.diff
+        dispatch-features.diff  # AVX2/AVX-512 levels also need FMA, F16C and POPCNT
+        rabitq-negative-l2.diff  # keep negative 1-bit L2 estimates; see vector-search.md
+        rabitq-neon.diff  # 1-bit kernels measured faster than upstream on Neoverse N1
 )
 
 vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS
@@ -27,14 +27,21 @@ if ("gpu" IN_LIST FEATURES)
     endif()
 endif()
 
+# Apple silicon has NEON but no SVE, which the arm64 dd level also builds.
+set(opt_level dd)
+if(VCPKG_TARGET_IS_OSX AND VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+    set(opt_level generic)
+endif()
+
 vcpkg_cmake_configure(
     SOURCE_PATH "${SOURCE_PATH}"
     OPTIONS
         ${FEATURE_OPTIONS}
         -DFAISS_ENABLE_MKL=OFF
+        -DFAISS_ENABLE_METAL=OFF  # Apple GPU backend; needs Xcode's metal compiler
         -DFAISS_ENABLE_PYTHON=OFF  # Requires SWIG
         -DBUILD_TESTING=OFF
-        -DFAISS_OPT_LEVEL=dd
+        "-DFAISS_OPT_LEVEL=${opt_level}"
 )
 
 vcpkg_cmake_install()

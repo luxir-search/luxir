@@ -31,7 +31,7 @@ public:
     return lastDoc;
   }
 
-  void addDoc(MemPool &pool, int docid) {
+  LUXIR_INLINE void addDoc(MemPool &pool, int docid) {
     int delta = docid - lastDoc;
     assert(delta > 0);
     if (delta != 1) {
@@ -230,7 +230,7 @@ public:
     StreamReader dstream(docs, pool);
     StreamReader pstream(positions, pool);
     int docid = 0;  // pass in base or have external user add if needed?
-    int handledIds = 0;
+    [[maybe_unused]] int handledIds = 0;
     bool readLastId = false;
     do {
       int tf;

@@ -102,9 +102,13 @@ TEST(AnyOfQueryBuilderTest, canonicalTermShapes) {
   auto* singleton = dynamic_cast<ConstantScoreQuery*>(
       builder.createAnyOfQuery(oneCanonical));
   ASSERT_NE(nullptr, singleton);
+  EXPECT_EQ(Query::ScoreProfile::Kind::AUTO_UNIFORM, scoreProfile(*singleton).kind);
   auto* term = dynamic_cast<TermQuery*>(singleton->getChild());
   ASSERT_NE(nullptr, term);
   EXPECT_EQ("mixedcase", term->getTerm());
+  ConstantScoreQuery explicitScore(term);
+  EXPECT_FALSE(singleton->equals(explicitScore));
+  EXPECT_NE(singleton->hash(), explicitScore.hash());
 
   std::array<std::string_view, 2> two{"Beta", "Alpha"};
   api::Val twoValues;
@@ -116,6 +120,7 @@ TEST(AnyOfQueryBuilderTest, canonicalTermShapes) {
     auto* clause = dynamic_cast<ConstantScoreQuery*>(
         builder.createAnyOfQuery(twoCanonical.element(i)));
     ASSERT_NE(nullptr, clause);
+    EXPECT_EQ(Query::ScoreProfile::Kind::AUTO_UNIFORM, scoreProfile(*clause).kind);
     EXPECT_NE(nullptr, dynamic_cast<TermQuery*>(clause->getChild()));
   }
 
@@ -187,6 +192,47 @@ TEST_F(AnyOfQueryTest, indexedTermsSingleParityAndUnion) {
   EXPECT_EQ((std::vector<std::string>{"a", "b"}), resultIds(*multi));
 }
 
+TEST_F(AnyOfQueryTest, requiredTermSetsDoNotAddScores) {
+  auto run = [&](int members) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->topDocs("q").withStats().fields({"id"}).limit(-1);
+    auto term = qb::match(top.mr(), "body_un", "red");
+    auto values = members == 1
+        ? anyOfQuery(top.mr(), "brand_s", {strVal("acme")})
+        : anyOfQuery(top.mr(), "brand_s", {strVal("acme"), strVal("missing")});
+    top.rawQuery() = members == 0 ? term : qb::boolean(top.mr(), {term, values});
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto& ids = std::get<api::ColStr>(req->docList()->columns.at("id").kind).v;
+    const auto& scores = std::get<api::ColFloat>(req->docList()->columns.at("_score_").kind).v;
+    for (size_t i = 0; i < ids.size(); i++) {
+      if (ids[i] == "a") return scores[i];
+    }
+    ADD_FAILURE() << "missing document a";
+    return -1.0f;
+  };
+  float baseline = run(0);
+  EXPECT_FLOAT_EQ(baseline, run(1));
+  EXPECT_FLOAT_EQ(baseline, run(2));
+}
+
+TEST_F(AnyOfQueryTest, singletonKeepsMetadataCount) {
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  MemPool pool;
+  QueryBuilder builder(pool, *reader->schema(), CoerceContext{});
+  std::array<std::string_view, 1> members{"acme"};
+  api::Val values;
+  values.kind.emplace<api::ArrStr>().v = members;
+  auto* query = builder.createAnyOfQuery(builder.canonicalizeFieldValues(
+      "brand_s", ValueSequence(values, "AnyOfQuery values")));
+  EXPECT_TRUE(directCountAvailable(*query, *reader));
+  Query::Context context(pool, *reader);
+  auto* weight = query->createWeight(context, 0);
+  auto count = weight->countShortcut(reader->segments()[0], nullptr);
+  EXPECT_EQ(Query::CountHow::METADATA, count.how);
+  EXPECT_EQ(1, count.maxMatches);
+}
+
 TEST_F(AnyOfQueryTest, textFoldsButStringAndIdRemainVerbatim) {
   auto run = [&](std::string_view field, std::string_view value) {
     auto req = localReq(helper.getSearchEngine());
@@ -227,6 +273,32 @@ TEST_F(AnyOfQueryTest, dateIsOneIngestInstantNotAPartialRange) {
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ((std::vector<std::string>{"a"}), resultIds(*req));
+}
+
+TEST_F(AnyOfQueryTest, nanosecondMembersAreExactAndOutOfDomainMembersAreDropped) {
+  SchemaBuilder schema;
+  auto& field = schema.field("stamp");
+  field.type = api::FieldDef::FieldClass::DATE;
+  field.unit = api::FieldDef::DateUnit::NS;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "zero", "stamp", 0),
+      flatdoc("id", "tick", "stamp", 1), flatdoc("id", "ms", "stamp", 1000000),
+      flatdoc("id", "inside_ms", "stamp", 1000001)}, UpdateMessage::COMMIT).success);
+  for (bool hasMember : {false, true}) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->collection("main").topDocs("q").withStats().fields({"id"}).limit(-1);
+    top.rawQuery() = anyOfQuery(top.mr(), "stamp", {intVal(INT64_MIN), intVal(INT64_MAX),
+        strVal("1500-01-01"), strVal("3000-01-01"),
+        strVal(hasMember ? "1970-01-01T00:00:00.001Z" : "3000-01-01")});
+    req->execute();
+    ASSERT_OK(req);
+    EXPECT_EQ(hasMember ? (std::vector<std::string>{"ms"}) : std::vector<std::string>{}, resultIds(*req));
+  }
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").exprQuery("stamp:=(1, 1970-01-01)").fields({"id"}).limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ((std::vector<std::string>{"tick", "zero"}), resultIds(*req));
 }
 
 TEST_F(AnyOfQueryTest, rawStringColumnIsRejected) {

@@ -5,6 +5,8 @@
 
 namespace luxir {
 
+KnnQuery::Tuning KnnQuery::tuning;
+
 Query::Weight* KnnQuery::createWeight(Query::Context& context, int32_t flags,
                                       float multiplier) {
   return context.pool.make<KnnQuery::Weight>(context, *this, flags, multiplier);

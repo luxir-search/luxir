@@ -30,9 +30,14 @@ constinit const std::array<float, 256> SmallFloat::byteToLength{
   1610612760.0, 1744830488.0, 1879048216.0, 2013265944.0
 };
 
-Similarity::BM25Scorer::BM25Scorer(float boost, float k1, float b, float idf, float avgdl)
+Similarity::BM25Scorer::BM25Scorer(float boost, float k1, float b, float idf, float avgdl,
+                                 bool hasNorms)
   : weight(boost*idf), boost(boost), k1(k1), b(b), idf(idf), avgdl(avgdl)
 {
+  if (!hasNorms) {
+    invNorm.fill(1.0f / k1);
+    return;
+  }
   // OPT: If we know the max doc length, we only need to populate the norm cache up to that point (and it could be
   // sized down... so we'd want to pass in a pool to avoid heap allocation.)
   // But for any of that, we would need to track max length and update when docs are expunged.

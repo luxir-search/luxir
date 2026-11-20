@@ -4,6 +4,8 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 
+#include "luxir/plugin/Plugin.h"
+
 #include <new>
 
 namespace {
@@ -49,6 +51,7 @@ extern "C" void __wrap__ZdlPvm(void* ptr, size_t size) {
 }
 
 TEST(ResponseAllocationFailureTest, releasesFreshArenaOnEveryAllocationFailure) {
+  luxir::initPlugins(luxir::addConfiguredPlugins);
   luxir::LuxirNode node;
   luxir::test::CollectionHelper collection(node, "response_allocation_failure");
   auto request = luxir::test::localReq(node.getSearchEngine());

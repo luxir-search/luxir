@@ -6,12 +6,20 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
+#include <vector>
 #include <oneapi/tbb/info.h>
 
 namespace CLI { class App; }
 
 namespace luxir {
+
+struct NodeConfig {
+  std::string id; // empty: derive at LuxirNode construction
+  bool random = false; // id was derived without a stable hostname:port
+  void validate() const;
+};
 
 struct ServerConfig {
   // Cap on buffered (rendered/serialized) response bytes, per HTTP connection
@@ -29,6 +37,12 @@ struct ServerConfig {
   // machine (half of a 2-vCPU node) and the transport threads share instead.
   int workers = 0;
   static constexpr int kSmallNodeCores = 4;
+
+  // Threads of the node's control executor (ControlExecutor): administration,
+  // schema changes, collection lifecycle, replication transfers and timers,
+  // and detailed stats. Dedicated OS threads outside the worker pool.
+  // At least 1.
+  int control_threads = 2;
 
   int resolveWorkers() const {
     if (workers > 0) return workers;
@@ -73,10 +87,16 @@ struct CheckedDirConfig {
 };
 
 struct StoreConfig {
-  std::string backend = "ram";           // ram, fs
+  std::string backend = "ram";           // built in: ram, fs, shared_fs; plugins may add more
   std::string data_dir = "luxir_data";
+  // Layers wrapped around the backend, innermost first, inside checked_dir and read_only.
+  std::vector<std::string> layers;
+  // COMPONENT.KEY=VALUE settings, grouped by backend or layer name.
+  std::map<std::string, std::map<std::string, std::string>> options;
   uint64_t ram_limit_mb = 0; // RAM storage only; zero is unlimited.
   CheckedDirConfig checked_dir;
+  // Superseded commits, in milliseconds. -1: 0 on exclusive stores, 5 minutes on shared stores.
+  int64_t retention_ms = -1;
   // Before a collection serves at startup: none trusts the manifest footer and
   // file sizes; full also reads every file the committed snapshot lists and
   // checks its size and xxh3, failing only that collection on a mismatch.
@@ -143,10 +163,12 @@ struct IngestConfig {
   int64_t stream_batch_size = 1 * 1024 * 1024;
   int64_t stream_batch_docs = 10000;
 
-  // Maximum number of streaming NDJSON batches submitted by one connection at
-  // once.  0 derives the window from the node's workers (server.workers) plus
-  // two; 1 is strict serial batch submission.  Staging memory grows roughly
-  // with this window, and live inverter memory grows with min(window, workers).
+  // Maximum number of streaming NDJSON batches one connection has decoding or
+  // being indexed at once.  0 derives the window from the node's workers
+  // (server.workers) plus two; 1 indexes one batch at a time.  An indexed batch
+  // frees its slot without waiting for earlier batches to complete.  Staging
+  // memory grows roughly with this window, and live inverter memory grows with
+  // min(window, workers).
   int64_t max_inflight_batches = 0;
 
   // Effective per-record cap: max_record if set, else the buffered-body cap.
@@ -157,6 +179,9 @@ struct IngestConfig {
 };
 
 struct SearchConfig {
+  // Process-wide fan-out policy, installed by LuxirConfig::apply().
+  int64_t fanout_grain_us = 50;
+  int64_t fanout_sibling_grain_us = 1000;
   // Max nesting depth of search operations in one request (ops within ops).
   // A request-shape limit like the query parsers' nesting budget, but much
   // lower: every level is a full search operation, not just a query node.
@@ -169,6 +194,14 @@ struct SearchConfig {
   // reservation tails, is 158,536,389 bytes - so 160 MiB covers it.
   // Early-merge degradation is future work.
   size_t request_memory_max_bytes = 0;
+  // Term-dictionary expansion guards for prefix, wildcard, regex, string
+  // range, and fuzzy queries (see MultiTermLimits). Zero is unlimited; a
+  // request can never raise or disable them.
+  int32_t multiterm_max_expansions = 0;
+  int64_t multiterm_max_terms_examined = 0;
+  int64_t multiterm_max_postings = 0;
+  // Pattern-only minimum literal prefix for unbounded prefix/wildcard/regex.
+  int32_t multiterm_min_prefix_length = 0;
 };
 
 struct ReplicationConfig {
@@ -179,7 +212,6 @@ struct ReplicationConfig {
   // retry of a failed collection sync (doubling per consecutive failure, to 60 s).
   int64_t retry_ms = 1000;
   std::string source;
-  std::string follower_id; // empty: host:port of this node's listener
   std::string tenants; // comma-separated; empty subscribes to every tenant
   // Comma-separated http:// nodes that serve verified file copies, tried in
   // order before the source; they never decide which commit is current.
@@ -192,6 +224,7 @@ struct ReplicationConfig {
 };
 
 struct LuxirConfig {
+  NodeConfig node;
   ReplicationConfig replication;
   // Serve an existing data directory without owning it: the write lock is not taken,
   // nothing is written, and every mutating request is rejected.  Lets a second process

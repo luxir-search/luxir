@@ -25,8 +25,8 @@ class FullTextHandler : public Inverter::IndexHandler {
   DocStream normDocsWithField;
   int32_t numDocsWithField = 0;
 public:
-  FullTextHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
-    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
+  FullTextHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space),
       termsHash(inverter.pool, 4),
       normDocsWithField(inverter.pool) {
 
@@ -100,7 +100,7 @@ public:
     if (vals.empty()) return;
 
     TokenChain& tc = *tokenChain;
-    Token& tok = tc.head.getToken();
+    Token& tok = tc.getToken();
     TokenStream& tail = *tc.tail;
     int docid = inverter.getDoc();
 
@@ -113,7 +113,7 @@ public:
         pos += POSITION_INCREMENT_GAP;
       }
       first = false;
-      tc.head.setValue(val);
+      tc.setValue(val);
       tc.reset();
       for (;;) {
         bool hasNext = tail.incrementToken();
@@ -135,6 +135,7 @@ public:
           entry->val().addDoc(termsHash.getMemPool(), docid, pos);
         }
       }
+      pos += tc.end();
     }
 
     finishValues(inverter, numTokens);
@@ -170,9 +171,10 @@ public:
     // Sorting terms per field could run in parallel across fields.
     auto terms = sortForFlush(inverter, termsHash);
 
-    PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(space, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
+    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
 
     auto preparedNorms = NormsWriter::prepare(inverter.pool, inverter.getPostingsWriter(),
                                               fieldInfo, normBytes, normDocsWithField,

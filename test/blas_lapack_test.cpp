@@ -1,0 +1,151 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#include <algorithm>
+#include <array>
+#include <barrier>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <thread>
+#include <vector>
+
+// Standalone BLAS/LAPACK check against the OpenBLAS overlay: compiled by
+// test/CMakeLists.txt (blas_lapack_test) and directly by the dev-container
+// image and tools/build-arm64 before the full dependency set exists.  Links
+// only libopenblas, so it stays free of Luxir and gtest headers.
+
+// FAISS uses these ten entry points, all with 32-bit Fortran INTEGER ABI.
+extern "C" {
+void dsyev_(const char*, const char*, const int*, double*, const int*, double*, double*, const int*, int*);
+void dgesvd_(const char*, const char*, const int*, const int*, double*, const int*, double*, double*, const int*, double*, const int*, double*, const int*, int*);
+void sgesvd_(const char*, const char*, const int*, const int*, float*, const int*, float*, float*, const int*, float*, const int*, float*, const int*, int*);
+void dgetrf_(const int*, const int*, double*, const int*, int*, int*);
+void sgetrf_(const int*, const int*, float*, const int*, int*, int*);
+void dgetri_(const int*, double*, const int*, const int*, double*, const int*, int*);
+void sgetri_(const int*, float*, const int*, const int*, float*, const int*, int*);
+void sgeqrf_(const int*, const int*, float*, const int*, float*, float*, const int*, int*);
+void sorgqr_(const int*, const int*, const int*, float*, const int*, const float*, float*, const int*, int*);
+void sgelsd_(const int*, const int*, const int*, float*, const int*, float*, const int*, float*, const float*, int*, float*, const int*, int*, int*);
+void sgemm_(const char*, const char*, const int*, const int*, const int*, const float*, const float*, const int*, const float*, const int*, const float*, float*, const int*);
+const char* openblas_get_config();
+const char* openblas_get_corename();
+int openblas_get_parallel();
+int openblas_get_num_threads();
+}
+
+void check(bool ok) {
+  if (!ok) {
+    std::cerr << "BLAS/LAPACK numerical, ABI, or threading check failed\n";
+    std::exit(1);
+  }
+}
+
+// FAISS applies its rotation and coarse assignment with transposed SGEMM.
+// Luxir issues these from concurrent TBB tasks: distinct dense inputs and
+// independent caller buffers check both the layout and concurrent use of the
+// serial library's locked scratch buffers.
+void checkSgemm(int seed) {
+  const int m = 128, n = 96, k = 128;
+  std::vector<float> a(k * m), b(k * n), c(m * n), expected(m * n);
+  for (int i = 0; i < k * m; ++i) a[i] = (float)((i * 13 + seed) % 31 - 15) / 16;
+  for (int i = 0; i < k * n; ++i) b[i] = (float)((i * 7 + seed) % 23 - 11) / 16;
+  for (int col = 0; col < n; ++col) for (int row = 0; row < m; ++row) {
+    double sum = 0;
+    for (int j = 0; j < k; ++j) sum += (double)a[j + row * k] * b[j + col * k];
+    expected[row + col * m] = (float)sum;
+  }
+  const float alpha = 1, beta = 0;
+  for (int repeat = 0; repeat < 3; ++repeat) {
+    std::fill(c.begin(), c.end(), -123.0f);
+    sgemm_("T", "N", &m, &n, &k, &alpha, a.data(), &k, b.data(), &k,
+           &beta, c.data(), &m);
+    for (int i = 0; i < m * n; ++i) check(std::abs(c[i] - expected[i]) < 1e-5);
+  }
+}
+
+int main() {
+  // Luxir partitions its own GEMM-heavy build steps across TBB tasks and
+  // needs a serial BLAS: a threaded library holds a per-variant level-3 lock
+  // across every call and would queue query-time work behind builds.  Thread
+  // environment variables must have no effect on this build.
+  check(openblas_get_parallel() == 0);
+  check(openblas_get_num_threads() == 1);
+  check(std::strstr(openblas_get_config(), "USE64BITINT") == nullptr);
+  checkSgemm(1);
+  std::barrier start(4);
+  std::array<std::thread, 4> callers;
+  for (int i = 0; i < 4; ++i) callers[i] = std::thread([&, i] {
+    start.arrive_and_wait();
+    checkSgemm(i + 2);
+  });
+  for (auto& caller : callers) caller.join();
+
+  const int n = 2, lwork = 1024;
+  int info = -1;
+  double work[1024], a[] = {2, 1, 1, 2}, eigenvalues[2];
+  dsyev_("V", "U", &n, a, &n, eigenvalues, work, &lwork, &info);
+  check(info == 0 && std::abs(eigenvalues[0] - 1) < 1e-12 && std::abs(eigenvalues[1] - 3) < 1e-12);
+  for (int j = 0; j < n; j++) {
+    check(std::abs(2*a[2*j] + a[2*j+1] - eigenvalues[j]*a[2*j]) < 1e-12);
+    check(std::abs(a[2*j] + 2*a[2*j+1] - eigenvalues[j]*a[2*j+1]) < 1e-12);
+  }
+
+  // Reconstruct a non-symmetric matrix from both precisions' full SVD.
+  double input[] = {1, 3, 2, 5}, d[4], singular[2], u[4], vt[4];
+  std::copy_n(input, 4, d);
+  dgesvd_("A", "A", &n, &n, d, &n, singular, u, &n, vt, &n, work, &lwork, &info);
+  check(info == 0);
+  float f[4], fs[2], fu[4], fvt[4], fw[1024];
+  std::copy_n(input, 4, f);
+  sgesvd_("A", "A", &n, &n, f, &n, fs, fu, &n, fvt, &n, fw, &lwork, &info);
+  check(info == 0);
+  for (int col = 0; col < n; col++) for (int row = 0; row < n; row++) {
+    double rebuilt = 0, frebuilt = 0;
+    for (int k = 0; k < n; k++) {
+      rebuilt += u[row+2*k] * singular[k] * vt[k+2*col];
+      frebuilt += fu[row+2*k] * fs[k] * fvt[k+2*col];
+    }
+    check(std::abs(rebuilt - input[row+2*col]) < 1e-12);
+    check(std::abs(frebuilt - input[row+2*col]) < 1e-5);
+  }
+
+  // LU and inverse, including a pivot, checked against A * inverse(A) = I.
+  int pivots[2];
+  std::copy_n(input, 4, d);
+  dgetrf_(&n, &n, d, &n, pivots, &info); check(info == 0);
+  dgetri_(&n, d, &n, pivots, work, &lwork, &info); check(info == 0);
+  std::copy_n(input, 4, f);
+  sgetrf_(&n, &n, f, &n, pivots, &info); check(info == 0);
+  sgetri_(&n, f, &n, pivots, fw, &lwork, &info); check(info == 0);
+  for (int col = 0; col < n; col++) for (int row = 0; row < n; row++) {
+    double product = 0, fproduct = 0;
+    for (int k = 0; k < n; k++) {
+      product += input[row+2*k] * d[k+2*col];
+      fproduct += input[row+2*k] * f[k+2*col];
+    }
+    check(std::abs(product - (row == col)) < 1e-12);
+    check(std::abs(fproduct - (row == col)) < 1e-5);
+  }
+
+  // QR: generate Q, then reconstruct the rectangular input from Q * R.
+  const int m = 3, nrhs = 1;
+  float rect[] = {1, 0, 1, 0, 1, 1}, qr[6], tau[2];
+  std::copy_n(rect, 6, qr);
+  sgeqrf_(&m, &n, qr, &m, tau, fw, &lwork, &info); check(info == 0);
+  float r[] = {qr[0], 0, qr[3], qr[4]};
+  sorgqr_(&m, &n, &n, qr, &m, tau, fw, &lwork, &info); check(info == 0);
+  for (int col = 0; col < n; col++) for (int row = 0; row < m; row++) {
+    float rebuilt = 0;
+    for (int k = 0; k < n; k++) rebuilt += qr[row+3*k] * r[k+2*col];
+    check(std::abs(rebuilt - rect[row+3*col]) < 1e-5);
+  }
+
+  float rhs[] = {2, 3, 5}, rcond = -1;
+  int rank = 0, iwork[1024];
+  sgelsd_(&m, &n, &nrhs, rect, &m, rhs, &m, fs, &rcond, &rank, fw, &lwork, iwork, &info);
+  check(info == 0 && rank == 2 && std::abs(rhs[0] - 2) < 1e-5 && std::abs(rhs[1] - 3) < 1e-5);
+  std::cout << "Concurrent SGEMM and all ten LAPACK entry points passed: "
+            << openblas_get_config() << "; selected " << openblas_get_corename() << '\n';
+}

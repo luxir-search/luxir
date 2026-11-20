@@ -75,7 +75,6 @@ private:
   std::vector<std::thread> threads;
   std::vector<ThreadInfo> threadInfos;
   int nthreads;
-  LuxirNode::ArenaEntrants arenaEntrants;
   int serverPort = 0;
   int requestedPort = 0;
   int64_t streamBufferBytes_;

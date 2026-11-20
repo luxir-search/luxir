@@ -8,6 +8,7 @@
 #include <limits>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include "luxir/util/MemPool.h"
+#include "luxir/util/geo.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/schema/Schema.h"
 #include "IndexRamBudget.h"
@@ -20,11 +21,6 @@
 
 namespace luxir {
 
-struct GeoPoint {
-  double latitude;
-  double longitude;
-};
-
 // The indexing path reads field values straight out of the inbound UpdateRequest
 // bytes, which are kept alive for the duration of (synchronous) indexing, so the
 // indexing Val is a non-owning view (string_t = std::string_view, arrays = spans).
@@ -33,15 +29,24 @@ using IndexVal = luxir::api::Val;
 
 
 class CommitInfo;
+class NestedState;
 
 class Inverter {
 private:
   int currDoc = -1;  // the current document being indexed
+  SpaceOrdinal inputSpace = SpaceOrdinal::ROOT;
+  int32_t maxChildRows = 0;
   std::vector<int> deleted; // use a docstream for this?
   std::exception_ptr failure_;
 
 public:
   MemPool pool{&indexingArena()};
+
+private:
+  friend class NestedState;
+  std::unique_ptr<NestedState> nested;
+
+public:
 
   // Running total of RAM held OUTSIDE `pool` (heap hash tables, IdHandler's idPool,
   // string column RAMFiles). Handlers that hold such memory bump this via
@@ -58,6 +63,9 @@ public:
   PostingsWriter postingsWriter;
 
   const std::shared_ptr<Schema> schema;
+  using StoredDictionaryProvider = std::function<std::shared_ptr<const StoredCompressionDictionary>(
+      std::string_view, const StoredChunkFormat&)>;
+  StoredDictionaryProvider storedDictionaryProvider;
 
   // Fixed by ProtoUpdateMessage for the duration of one update so every NOW
   // in every document/value resolves identically. Direct test indexing leaves
@@ -74,6 +82,8 @@ public:
   // when the inverter is destroyed (after its flush completes, or at writer close), so
   // flushing inverters stay counted until their RAM is actually freed.
   IndexRamBudget::Guard ramGuard;
+  // Unversioned direct indexing starts at zero; acquisitions replace empty runs.
+  VersionRunBuilder versionRuns;
 
   // High-water mark of transient flush memory charged to ramGuard.
   size_t flushWorkspaceBytes = 0;
@@ -89,9 +99,12 @@ public:
   uint64_t currVersion = 0;
   uint64_t minVersion = std::numeric_limits<uint64_t>::max();
   uint64_t maxVersion = 0;
+  // Published at release under indexMutex; never inspect a busy builder.
+  uint64_t minDocVersion = UINT64_MAX;
+  int32_t acquisitionMaxDoc = 0;
 
   // When true, indexing an id field will automatically queue a delete for previous
-  // versions and index the _version_ field. Set via setOverwrite() before indexing docs.
+  // versions. Set before indexing docs.
   bool overwrite = false;
 
   // Populated by IdHandler::flush() with sorted delete lists.
@@ -101,15 +114,13 @@ public:
   uint64_t liveGen = 0;
   int32_t liveDocs = 0;
 
-  Inverter(luxir::Directory& dir, uint64_t segId,
+  Inverter(luxir::Directory& dir, uint64_t segId, uint64_t creatorEpoch,
            const std::function<std::shared_ptr<Schema>()>& schemaProvider = {},
-           IndexRamBudget* ramBudget = nullptr)
-      : Inverter(dir, segId, schemaProvider ? schemaProvider() : Schema::createDefaultSchema(), ramBudget) {}
+           IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {});
 
-  Inverter(luxir::Directory& dir, uint64_t segId, std::shared_ptr<Schema> schema,
-           IndexRamBudget* ramBudget = nullptr)
-      : postingsWriter(dir, segId, -1, ramBudget, true), schema(std::move(schema)),
-        ramGuard(ramBudget == nullptr ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)) {}
+  Inverter(luxir::Directory& dir, uint64_t segId, uint64_t creatorEpoch, std::shared_ptr<Schema> schema,
+           IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {});
+  ~Inverter();
 
   PostingsWriter& getPostingsWriter() { return postingsWriter; }
 
@@ -133,6 +144,7 @@ public:
   // for segmentVersions, adds, and deletes to be versioned correctly, this should be called after
   // obtaining the inverter
   void updateVersions(uint64_t version) {
+    versionRuns.add((uint32_t)getMaxDoc(), version);
     minVersion = std::min(minVersion, version);
     maxVersion = std::max(maxVersion, version);
     currVersion = version;
@@ -145,6 +157,8 @@ public:
   // Record an explicit delete-by-id. Routes through IdHandler's delete hash
   // so all deletes end up as sorted lists after flush.
   void deleteId(std::string_view id, uint64_t version);
+  size_t retainedDeleteBytes() const;
+  size_t deleteCount() const;
 
   /// This is what clients should call to index the fields of a document.
   class IndexHandler {
@@ -153,11 +167,12 @@ public:
 
     PackedTerm fieldName;
     std::shared_ptr<FieldType> fieldType;
+    const SpaceOrdinal space;
 
     IndexHandler(IndexHandler& other) = delete; // let's not move any of these
   public:
-    IndexHandler(PackedTerm fieldName, const std::shared_ptr<FieldType>& fieldType)
-    : fieldName(fieldName), fieldType(fieldType) {
+    IndexHandler(PackedTerm fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : fieldName(fieldName), fieldType(fieldType), space(space) {
     }
     virtual ~IndexHandler() = default;
 
@@ -191,23 +206,29 @@ public:
     // constrain later docs; see VectorHandler.
     virtual void index(Inverter& inverter, std::string_view val) {
       unused(inverter, val);
+      unsupportedValue("string");
     }
     // handles an array of strings without creating a new list. non_owning hpp arrays
     // are span<const string_view>, so this takes a const span.
     virtual void index(Inverter& inverter, std::span<const std::string_view> vals) {
       unused(inverter,vals);
+      unsupportedValue("string array");
     }
     virtual void index(Inverter& inverter, int64_t val) {
       unused(inverter, val);
+      unsupportedValue("integer");
     }
     virtual void index(Inverter& inverter, std::span<const int64_t> vals) {
       unused(inverter, vals);
+      unsupportedValue("integer array");
     }
     virtual void index(Inverter& inverter, double latitude, double longitude) {
       unused(inverter, latitude, longitude);
+      unsupportedValue("typed geo point");
     }
     virtual void index(Inverter& inverter, std::span<const GeoPoint> points) {
       unused(inverter, points);
+      unsupportedValue("typed geo point array");
     }
 
     virtual void index(Inverter& inverter, const IndexVal& val) {
@@ -216,7 +237,15 @@ public:
       } else if (std::holds_alternative<luxir::api::ArrStr>(val.kind)) {
         const auto& arr = std::get<luxir::api::ArrStr>(val.kind).v;
         index(inverter, std::span<const std::string_view>(arr.data(), arr.size()));
+      } else if (!std::holds_alternative<std::monostate>(val.kind)
+                 && !std::holds_alternative<google::protobuf::NullValue>(val.kind)) {
+        unsupportedValue("input");
       }
+    }
+
+    [[noreturn]] void unsupportedValue(std::string_view kind) const {
+      throw DocumentError(fmt::format("field '{}': unsupported {} value",
+          std::string_view(fieldName), kind));
     }
 
     // End the indexing phase before any field starts flushing. Handlers that
@@ -270,12 +299,15 @@ public:
     bool multi;
     StoredFieldsWriter* writer;
     std::vector<Branch> branches;
+    std::vector<GeoPoint> geoPoints;
+    size_t geoScratchBytes = 0;
     // The document that last claimed this field, and the slot it claimed (see claim).
     int32_t claimedDoc = -1;
     uint32_t claimedSlot = 0;
 
     void store(Inverter& inverter, const IndexVal& val);
     void checkShape(const IndexVal& val) const;
+    void indexPoints(Inverter& inverter, std::span<const GeoPoint> points);
 
     template<typename F>
     void forEachBranch(F&& index) {
@@ -327,7 +359,10 @@ public:
 
   InputHandler& getIndexHandler(std::string_view name) {
     auto iter = inputHandlers.find(name);
-    if (iter != inputHandlers.end()) return *iter->second;
+    if (iter != inputHandlers.end()) {
+      if (iter->second->branches.front().handler->space != inputSpace) rejectInputSpace(name);
+      return *iter->second;
+    }
     return createInputHandler(name);
   }
 
@@ -371,7 +406,7 @@ public:
 
   // Rollback support for failed documents / failed all_or_none requests.
   // A mark captures the undo state at a point in time; rollbackTo restores the
-  // id map (termsHash / deleteHash mutations are undone) and un-marks docs
+  // id map (occupancy and watermarks are restored) and un-marks docs
   // deleted after the mark (in-inverter overwrites mark superseded docs deleted;
   // a rolled-back update must resurrect them).  Postings and column data of
   // rolled-back docs stay in the segment; callers mark those docs deleted.
@@ -389,16 +424,22 @@ public:
   // hold outside it (extraRamBytes). O(1) - no walk. Over-estimates slightly (pool
   // capacity steps by chunk), so a size-based flush trips a touch early, never late.
   size_t memSize() {
-    return pool.size() + extraRamBytes;
+    return pool.size() + extraRamBytes + versionRuns.allocatedBytes();
   }
 
   // True when this inverter has grown past a size cap and should be flushed to a
   // segment. Checked once at the end of an update batch, never mid-request: a
   // whole message stays in one inverter so within-request id overwrites resolve
   // in memory (see ProtoUpdateMessage::handle).
-  bool shouldFlush(size_t ramCap, size_t docCap) {
-    return memSize() > ramCap || (size_t)getMaxDoc() > docCap;
+  bool shouldFlush(size_t ramCap, size_t docCap);
+
+  // Counts stay below the hard limit, including retained rows of failed roots.
+  static bool rowsFit(uint64_t current, uint64_t added) {
+    return current < (uint64_t)PostingsReader::HARD_MAX_DOC
+        && added < (uint64_t)PostingsReader::HARD_MAX_DOC - current;
   }
+  bool hasChildRows() const;
+
 
   /// finishes indexing this segment (also calls finish on the underlying postings writer)
   /// returns true on success if anything was written.
@@ -407,33 +448,65 @@ public:
 
 private:
   IndexHandler* idHandler_ = nullptr;  // cached pointer to the IdHandler, set in createPhysicalHandler
-  // Stored-fields writers, keyed by resource name.  Lazily populated when
-  // fields with the STORED flag are first indexed.  PackedTermHash/Equal
-  // give transparent lookup by string_view/PackedTerm/std::string.
-  boost::unordered_flat_map<std::string, std::unique_ptr<StoredFieldsWriter>,
-                            PackedTermHash, PackedTermEqual> storedFields_;
+  // Stored-fields writers, keyed by space and resource name. Lazily populated
+  // when fields with the STORED flag are first indexed. Transparent lookup
+  // avoids constructing a resource name on a hit.
+  struct StoredResourceKey {
+    SpaceOrdinal space;
+    std::string name;
+    struct View {
+      SpaceOrdinal space;
+      std::string_view name;
+      bool operator==(const View&) const = default;
+    };
+    operator View() const { return {space, name}; }
+  };
+  struct StoredResourceHash {
+    using is_transparent = void;
+    size_t operator()(StoredResourceKey::View key) const noexcept {
+      // Keep root resource hashing, and hence its iteration order, unchanged.
+      return PackedTermHash{}(key.name) ^ (size_t)key.space;
+    }
+  };
+  struct StoredResourceEqual {
+    using is_transparent = void;
+    bool operator()(StoredResourceKey::View a, StoredResourceKey::View b) const noexcept { return a == b; }
+  };
+  boost::unordered_flat_map<StoredResourceKey, std::unique_ptr<StoredFieldsWriter>,
+                            StoredResourceHash, StoredResourceEqual> storedFields_;
 
+public:
   // Get-or-create the StoredFieldsWriter for the named resource (column
-  // family).  config may be null to use defaults.  Called from
+  // family). config may be null to use defaults. Called from
   // createInputHandler for the logical storage owner.
-  StoredFieldsWriter& getOrCreateStoredFields(std::string_view resourceName,
-                                              const StoredFieldType* config) {
-    auto it = storedFields_.find(resourceName);
+  StoredFieldsWriter& getOrCreateStoredFields(SpaceOrdinal space, std::string_view resourceName,
+                                              const StoredFieldType* config = nullptr) {
+    auto it = storedFields_.find(StoredResourceKey::View{space, resourceName});
     if (it != storedFields_.end()) return *it->second;
-    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName,
-                                                       config ? config->format_ : StoredChunkFormat{});
-    auto [newIt, _] = storedFields_.emplace(std::string(resourceName), std::move(writer));
+    const auto& format = config ? config->format_ : StoredChunkFormat{};
+    // Four chunk buffers with growth headroom, doc offsets, and the codec context.
+    // This is a fixed estimate per child resource, independent of batch boundaries.
+    int64_t bytes = space == SpaceOrdinal::ROOT ? 0 : sizeof(StoredFieldsWriter)
+        + (int64_t)8 * format.chunkTarget + (int64_t)2 * format.maxDocsPerChunk * sizeof(int32_t)
+        + StoredChunkCompressor::contextBytes(format, format.chunkTarget);
+    auto dictionary = storedDictionaryProvider ? storedDictionaryProvider(resourceName, format) : nullptr;
+    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, space, resourceName, format, std::move(dictionary));
+    auto [newIt, _] = storedFields_.emplace(StoredResourceKey{space, std::string(resourceName)}, std::move(writer));
+    if (bytes) addExtraRam(bytes);
     return *newIt->second;
   }
 
+private:
+  void requireInputSpace(std::string_view name) const;
+  [[noreturn]] void rejectInputSpace(std::string_view name) const;
   InputHandler& createInputHandler(std::string_view name);
   IndexHandler& createPhysicalHandler(std::string_view name,
-                                      const std::shared_ptr<FieldType>& fieldType);
+                                      const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space);
 
 };
 
 inline std::string format_as(const Inverter& inverter) {
-  return fmt::format("(seg={} max={})",  Postings::getIndexFileNamePrefix(inverter.getSegId()), inverter.getMaxDoc());
+  return fmt::format("(seg=s{} max={})", Postings::segmentKey(inverter.getSegId(), inverter.postingsWriter.creatorEpoch), inverter.getMaxDoc());
 }
 
 } // end namespace

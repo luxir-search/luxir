@@ -11,6 +11,7 @@
 
 #include "luxir/analysis/KStemmer.h"
 #include "test/LuxirTest.h"
+#include "test/TestData.h"
 
 using namespace luxir;
 
@@ -18,7 +19,7 @@ class KStemTest : public LuxirTest {};
 
 TEST_F(KStemTest, luceneVocabulary) {
   // Lucene's TestKStemmer fixture, generated with the original Java stemmer.
-  std::ifstream in(std::filesystem::path(__FILE__).parent_path() / "data/kstem_examples.txt");
+  std::ifstream in(testDataPath("kstem_examples.txt"));
   ASSERT_TRUE(in.is_open());
   KStemmer stemmer;
   std::string word, expected;

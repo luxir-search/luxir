@@ -17,8 +17,9 @@ endif()
 set(CMAKE_SYSROOT "$ENV{LUXIR_ARM64_SYSROOT}")
 # Keep compiler runtimes in the executable, retaining the target's dynamic glibc.
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-static-libstdc++ -static-libgcc")
-set(CMAKE_C_FLAGS_INIT "-fPIC ${VCPKG_C_FLAGS}")
-set(CMAKE_CXX_FLAGS_INIT "-fPIC ${VCPKG_CXX_FLAGS}")
+# The triplet's flags apply to dependencies only; Luxir keeps the compiler's PIE default.
+set(CMAKE_C_FLAGS_INIT "${VCPKG_C_FLAGS}")
+set(CMAKE_CXX_FLAGS_INIT "${VCPKG_CXX_FLAGS}")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

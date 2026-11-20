@@ -6,13 +6,18 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <numeric>
+#include <tuple>
 #include <string>
 #include <vector>
 
 #include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
+#include "test/SchemaBuilder.h"
+#include "test/LocalReq.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -33,6 +38,93 @@ ValueProgram* parseValue(ArenaOwner& memory, Schema& schema, std::string_view ex
 } // namespace
 
 class ValueExprKernelTest : public LuxirTest {};
+
+TEST_F(ValueExprKernelTest, mixedDateUnitsUseExistingPointBatchAndArrayArithmetic) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  for (auto name : {"stamp", "absent", "whens"}) {
+    auto& field = schema.field(name);
+    field.type = api::FieldDef::FieldClass::DATE;
+    field.unit = std::string_view(name) == "whens" ? api::FieldDef::DateUnit::MS : api::FieldDef::DateUnit::NS;
+    field.multi = std::string_view(name) == "whens" ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
+  }
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("stamp", 2000001, "when_dt", 2,
+      "whens", vec_i(1, 2)), UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto definition = helper.collection().getSchema();
+  ArenaOwner memory;
+  MemPool pool;
+  for (auto [expression, expected] : {
+      std::pair{"stamp-when_dt", 1}, {"def(stamp,when_dt)", 2000001},
+      {"def(absent,when_dt)", 2000000}, {"min(stamp,when_dt)", 2000000},
+      {"max(when_dt,stamp)", 2000001}, {"min(stamp-whens)", 1}}) {
+    SCOPED_TRACE(expression);
+    auto* program = parseValue(memory, *definition, expression);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    auto result = bound->evalPoint(0, 0);
+    ASSERT_TRUE(result.valid);
+    EXPECT_EQ(expected, result.intValue);
+    std::array<int32_t, 1> docs{0};
+    std::array<ValueResult, 1> batch;
+    bound->evalBatch(docs, {}, batch);
+    ASSERT_TRUE(batch[0].valid);
+    EXPECT_EQ(expected, batch[0].intValue);
+  }
+}
+
+TEST_F(ValueExprKernelTest, comparisonsAndConditionalsNormalizeSharedDateOperands) {
+  CollectionHelper helper;
+  SchemaBuilder builder;
+  auto& stamp = builder.field("stamp");
+  stamp.type = api::FieldDef::FieldClass::DATE;
+  stamp.unit = api::FieldDef::DateUnit::NS;
+  builder.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("when_dt", 2, "stamp", 1000000),
+                           UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  MemPool pool;
+  struct Example {
+    const char* expression;
+    double expected;
+    ValueNature nature = ValueNature::NUMBER;
+  };
+  for (const auto& example : {
+      Example{"when_dt > stamp", 1}, {"when_dt >= stamp", 1},
+      {"when_dt < stamp", 0}, {"when_dt <= stamp", 0},
+      {"when_dt == stamp", 0}, {"when_dt != stamp", 1},
+      {"stamp < when_dt", 1}, {"stamp <= when_dt", 1},
+      {"stamp > when_dt", 0}, {"stamp >= when_dt", 0},
+      {"stamp == when_dt", 0}, {"stamp != when_dt", 1},
+      {"when_dt == stamp + 1000000", 1},
+      {"max(when_dt, stamp) == when_dt", 1},
+      {"if(1, when_dt, stamp)", 2000000, ValueNature::DATE_NS},
+      {"if(0, when_dt, stamp)", 1000000, ValueNature::DATE_NS},
+      {"1 ? stamp : when_dt", 1000000, ValueNature::DATE_NS},
+      {"0 ? stamp : when_dt", 2000000, ValueNature::DATE_NS},
+      {"if(stamp, when_dt, when_dt)", 2, ValueNature::DATE_MS},
+      {"if(when_dt, when_dt, stamp)", 2000000, ValueNature::DATE_NS},
+      {"when_dt * stamp", 2000000}, {"when_dt / stamp", 0.000002},
+      {"pow(stamp, when_dt)", 1e12}}) {
+    SCOPED_TRACE(example.expression);
+    auto* program = parseValue(memory, *schema, example.expression);
+    EXPECT_EQ(example.nature, program->root().nature);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    std::array<int32_t, 1> docs{0};
+    std::array<ValueResult, 1> batch;
+    bound->evalBatch(docs, {}, batch);
+    for (const auto& result : {bound->evalPoint(0, 0), batch[0]}) {
+      ASSERT_TRUE(result.valid);
+      EXPECT_DOUBLE_EQ(example.expected, result.type == ValueType::DOUBLE
+          ? result.doubleValue : (double)result.intValue);
+    }
+    if (std::string_view(example.expression) == "if(when_dt, when_dt, stamp)") {
+      EXPECT_EQ(ValueNature::DATE_MS, program->nodes[program->root().children[0]].nature);
+    }
+  }
+}
 
 TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   CollectionHelper helper;
@@ -315,6 +407,96 @@ TEST_F(ValueExprKernelTest, provenInvalidityIsRejectedAtBind) {
   }
 }
 
+TEST_F(ValueExprKernelTest, lazyInvaliditySurvivesUntilItsBranchIsSelected) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "x_i", 2, "c_i", 1),
+                               flatdoc("id", "b", "c_i", 0)}, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  MemPool pool;
+  for (auto expression : {"def(x_i, log(-1))", "if(c_i, x_i, log(-1))"}) {
+    SCOPED_TRACE(expression);
+    auto* program = parseValue(memory, *schema, expression);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    auto value = bound->evalPoint(0, 0);
+    ASSERT_TRUE(value.valid);
+    EXPECT_DOUBLE_EQ(2, value.doubleValue);
+    EXPECT_THROW(bound->evalPoint(1, 0), ValueEvaluationError);
+  }
+  for (auto [expression, expected] : {
+      std::pair{"if(0, log(-1), 7)", 7}, {"if(1, 7, log(-1))", 7},
+      {"def(7, log(-1))", 7}, {"0 && log(-1)", 0}, {"1 || log(-1)", 1}}) {
+    SCOPED_TRACE(expression);
+    auto* program = parseValue(memory, *schema, expression);
+    ASSERT_TRUE(program->constantScalar.has_value());
+    auto value = *program->constantScalar;
+    EXPECT_DOUBLE_EQ(expected, value.type == ValueType::DOUBLE ? value.doubleValue : (double)value.intValue);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    EXPECT_TRUE(bound->firstUnboundedNode().empty());
+  }
+  for (auto expression : {"if(0, log(-1), score)", "def(score, log(-1))",
+                          "if(1, score, log(-1))", "(0 && log(-1)) + score",
+                          "(1 || log(-1)) * score"}) {
+    SCOPED_TRACE(expression);
+    auto* program = parseValue(memory, *schema, expression);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    EXPECT_EQ("score", bound->firstUnboundedNode());
+    auto bounds = bound->boundsForScore(ValueBounds::floatingRange(2, 3));
+    EXPECT_EQ(BoundsCertainty::BOUNDED, bounds.certainty);
+    EXPECT_TRUE(bound->firstUnboundedNode().empty());
+    bound->boundsForScore(ValueBounds::unbounded(ValueType::DOUBLE));
+    EXPECT_EQ("score", bound->firstUnboundedNode());
+  }
+  auto* logarithm = parseValue(memory, *schema, "log(score)");
+  auto* bound = logarithm->bind(pool, reader->segments()[0], logarithm->resolveFields(pool, *reader));
+  EXPECT_EQ(BoundsCertainty::BOUNDED, bound->boundsForScore(ValueBounds::floatingRange(2, 3)).certainty);
+  EXPECT_THROW(bound->boundsForScore(ValueBounds::floatingValue(-1)), ValueEvaluationError);
+  EXPECT_EQ(BoundsCertainty::BOUNDED, bound->boundsForScore(ValueBounds::floatingRange(2, 3)).certainty);
+}
+
+TEST_F(ValueExprKernelTest, strictInvalidityKeepsTheOriginalDiagnostic) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.index(flatdoc("x_i", 2), UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  MemPool pool;
+  for (std::string operand : {"log(-1)", "sqrt(-1)", "log1p(-2)",
+                               "add(9223372036854775807, 1)", "mul(1e308, 1e308)"}) {
+    std::string expected;
+    for (auto expression : {operand, "count(" + operand + ")", "def(" + operand + ", 0)",
+                            "if(" + operand + ", 0, 1)", "pow(1, " + operand + ")",
+                            operand + " + score"}) {
+      SCOPED_TRACE(expression);
+      auto* program = parseValue(memory, *schema, expression);
+      EXPECT_FALSE(program->constantScalar.has_value());
+      try {
+        program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+        FAIL() << "expected invalid bounds";
+      } catch (const ValueEvaluationError& error) {
+        if (expected.empty()) expected = error.what();
+        EXPECT_EQ(expected, error.what());
+      }
+    }
+  }
+  for (const auto& function : ValueFunctionRegistry::entries()) {
+    for (uint8_t operand = 0; operand < function.maxArity; operand++) {
+      if (function.operands[operand].lazy) continue;
+      SCOPED_TRACE(function.name);
+      ValueNode node;
+      node.type = ValueType::DOUBLE;
+      std::array<ValueBounds, VALUE_MAX_ARITY> args;
+      args.fill(ValueBounds::floatingValue(1));
+      args[operand] = ValueBounds::invalid(ValueType::DOUBLE, BoundsInvalidity::DOMAIN_ERROR);
+      args[operand].invalidNode = 42;
+      auto result = function.bounds(node, {args.data(), function.maxArity});
+      EXPECT_EQ(BoundsCertainty::INVALID, result.certainty);
+      EXPECT_EQ(42, result.invalidNode);
+    }
+  }
+}
+
 TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "x_i", 2), UpdateMessage::COMMIT);
@@ -327,7 +509,7 @@ TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   ValueProgram* program = parseValue(memory, *schema, "add(score,x_i)");
   auto bound = program->bind(pool, segment, program->resolveFields(pool, *reader));
   EXPECT_EQ(BoundsCertainty::UNBOUNDED, bound->bounds(program->rootNode).certainty);
-  ValueBounds scoreInterval = ValueBounds::floating(-2.0, 3.0);
+  ValueBounds scoreInterval = ValueBounds::floatingRange(-2.0, 3.0);
   scoreInterval.minAttained = false;
   scoreInterval.maxAttained = false;
   const ValueBounds& composed = bound->boundsForScore(scoreInterval);
@@ -343,7 +525,7 @@ TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   auto squareRootBound = squareRoot->bind(pool, segment, squareRoot->resolveFields(pool, *reader));
   EXPECT_EQ(BoundsCertainty::UNBOUNDED,
             squareRootBound->bounds(squareRoot->rootNode).certainty);
-  ValueBounds nonNegativeScore = ValueBounds::floating(0.0, 4.0);
+  ValueBounds nonNegativeScore = ValueBounds::floatingRange(0.0, 4.0);
   nonNegativeScore.minAttained = false;
   nonNegativeScore.maxAttained = false;
   const ValueBounds& squareRootBounds =
@@ -351,7 +533,7 @@ TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   ASSERT_EQ(BoundsCertainty::BOUNDED, squareRootBounds.certainty);
   EXPECT_DOUBLE_EQ(0.0, squareRootBounds.doubleMin);
   EXPECT_DOUBLE_EQ(2.0, squareRootBounds.doubleMax);
-  ValueBounds negativeScore = ValueBounds::floating(-1.0, -1.0);
+  ValueBounds negativeScore = ValueBounds::floatingValue(-1.0);
   EXPECT_THROW(squareRootBound->boundsForScore(negativeScore),
                std::runtime_error);
   EXPECT_THROW(squareRootBound->evalPoint(0, -1.0f), std::runtime_error);
@@ -372,10 +554,10 @@ TEST_F(ValueExprKernelTest, boundsFlagsSeparateUnknownInvalidAndMissing) {
   logNode.type = ValueType::DOUBLE;
   logNode.opcode = ValueOpcode::LOG;
   logNode.text = "log";
-  std::array<ValueBounds, 1> logInput{ValueBounds::integer(0, 10)};
+  std::array<ValueBounds, 1> logInput{ValueBounds::observedInteger(0, 10)};
   ValueBounds invalid = logarithm->boundsPropagate(logNode, logInput);
   EXPECT_EQ(BoundsCertainty::INVALID, invalid.certainty);
-  EXPECT_EQ(BoundsInvalidity::DOMAIN, invalid.invalidity);
+  EXPECT_EQ(BoundsInvalidity::DOMAIN_ERROR, invalid.invalidity);
 
   logInput[0].minAttained = false;
   ValueBounds unknown = logarithm->boundsPropagate(logNode, logInput);
@@ -395,7 +577,7 @@ TEST_F(ValueExprKernelTest, boundsFlagsSeparateUnknownInvalidAndMissing) {
   multiplyNode.opcode = ValueOpcode::MUL;
   multiplyNode.text = "mul";
   std::array<ValueBounds, 2> factors{
-      ValueBounds::floating(1e308, 1e308), ValueBounds::floating(2.0, 2.0)};
+      ValueBounds::floatingValue(1e308), ValueBounds::floatingValue(2.0)};
   ValueBounds infinite = multiply->boundsPropagate(multiplyNode, factors);
   EXPECT_EQ(BoundsCertainty::INVALID, infinite.certainty);
   EXPECT_EQ(BoundsInvalidity::POSITIVE_INFINITY, infinite.invalidity);
@@ -440,4 +622,229 @@ TEST_F(ValueExprKernelTest, columnInfinityIsAValueAndNaNIsMissing) {
   EXPECT_EQ(std::numeric_limits<double>::infinity(),
             maximumBound->evalPoint(1, 0.0f).doubleValue);
   EXPECT_FALSE(maximumBound->evalPoint(2, 0.0f).valid);
+}
+
+// Check completed sums rather than partial sums, and retain ARRAY repeats.
+TEST_F(ValueExprKernelTest, wideArraySumAndAverage) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  for (auto name : {"ints", "doubles"}) {
+    auto& field = schema.field(name);
+    field.type = std::string_view(name) == "ints" ? api::FieldDef::FieldClass::INT
+                                                 : api::FieldDef::FieldClass::DOUBLE;
+    field.multi = api::FieldDef::MultiMode::ARRAY;
+  }
+  schema.set(helper.collection());
+  constexpr int64_t M = INT64_MAX;
+  helper.index(flatdoc("ints", vec_i(M, -M, -2),
+      "doubles", vec(-1e308, 1e308, -1e308)), UpdateMessage::COMMIT);
+  helper.index(flatdoc("ints", vec_i(M, 2, -M, -4),
+      "doubles", vec(1e308, -1e308, 1e308)), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("ints", vec_i(M, 1),
+      "doubles", vec(1e308, -5e307)), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("ints", vec_i(M, INT64_MIN, 1)), UpdateMessage::COMMIT);
+  struct Case { const char* expr; std::array<std::optional<double>, 4> expected; };
+  for (int merge = 0; merge < 2; merge++) {
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    auto currentSchema = helper.collection().getSchema();
+    ArenaOwner memory;
+    MemPool pool;
+    for (auto c : std::array{
+        Case{"sum(ints)", {-2, -2, std::nullopt, 0}},
+        Case{"sum(doubles)", {-1e308, 1e308, 5e307, std::nullopt}},
+        Case{"avg(ints)", {-2.0 / 3, -0.5, (double)((__int128)M + 1) / 2, 0}},
+        Case{"avg(doubles)", {-1e308 / 3, 1e308 / 3, 2.5e307, std::nullopt}}}) {
+      auto* program = parseValue(memory, *currentSchema, c.expr);
+      for (auto& segment : reader->segments()) {
+        auto* bound = program->bind(pool, segment, program->resolveFields(pool, *reader));
+        std::vector<int32_t> docs((size_t)segment.maxDoc());
+        std::iota(docs.begin(), docs.end(), 0);
+        std::vector<ValueResult> batch(docs.size());
+        bound->evalBatch(docs, {}, batch);
+        for (int32_t doc : docs) {
+          auto expected = c.expected[(size_t)(segment.base + doc)];
+          for (auto result : {bound->evalPoint(doc, 0), batch[(size_t)doc]}) {
+            ASSERT_EQ(expected.has_value(), result.valid) << c.expr;
+            if (expected) {
+              EXPECT_DOUBLE_EQ(*expected, result.type == ValueType::INT64
+                  ? (double)result.intValue : result.doubleValue) << c.expr;
+            }
+          }
+        }
+      }
+    }
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").expr("total", "sum(sum(ints))").expr("mean", "avg(sum(ints))");
+    req->execute(false);
+    ASSERT_OK(req);
+    EXPECT_EQ(-4, req->responses[0]->proto.ops.at("total")->asInt());
+    EXPECT_DOUBLE_EQ(-4.0 / 3, req->responses[0]->proto.ops.at("mean")->asDouble());
+    if (!merge) {
+      CollectionHelper::UpdateBuilder update;
+      update.commit(true, 1);
+      ASSERT_TRUE(helper.submit(update).success);
+    }
+  }
+}
+
+TEST_F(ValueExprKernelTest, sortedSetSumsKeepIntegersExactAndRejectFloatingOverflow) {
+  CollectionHelper helper;
+  helper.index(flatdoc("v_is", vec_i(INT64_MAX, -INT64_MAX, -2),
+      "v_ds", vec(1e308, -9e307, -1e308)), UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  MemPool pool;
+  auto bind = [&](const char* expr) {
+    auto* program = parseValue(memory, *schema, expr);
+    return program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+  };
+  for (auto [expr, expected] : {std::pair{"sum(v_is)", -2.0}, {"avg(v_is)", -2.0 / 3}}) {
+    auto result = bind(expr)->evalPoint(0, 0);
+    ASSERT_TRUE(result.valid) << expr;
+    EXPECT_DOUBLE_EQ(expected, result.type == ValueType::INT64
+        ? (double)result.intValue : result.doubleValue) << expr;
+  }
+  // Floating sums add in double, as aggregates do: the set's ascending order
+  // overflows at -1e308 + -9e307.
+  EXPECT_FALSE(bind("sum(v_ds)")->evalPoint(0, 0).valid);
+  EXPECT_THROW(bind("avg(v_ds)")->evalPoint(0, 0), ValueEvaluationError);
+}
+
+TEST_F(ValueExprKernelTest, nativeDateUnitUsesExistingScalarArrayBatchAndBoundsLanes) {
+  CollectionHelper helper;
+  SchemaBuilder builder;
+  for (auto name : {"stamp", "other", "stamps"}) {
+    auto& field = builder.field(name);
+    field.type = api::FieldDef::FieldClass::DATE;
+    field.unit = api::FieldDef::DateUnit::NS;
+    field.multi = std::string_view(name) == "stamps" ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
+  }
+  builder.set(helper.collection());
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "a", "stamp", 1000001, "other", 1000003, "stamps", vec_i(1, 4)),
+      flatdoc("id", "b", "stamp", -2, "other", -4, "stamps", vec_i(-4, -2)),
+      flatdoc("id", "c", "other", -7)}, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  MemPool pool;
+  auto& segment = reader->segments()[0];
+  auto* scalar = parseValue(memory, *schema, "def(min(stamp,other),0)+1");
+  EXPECT_EQ(ValueNature::DATE_NS, scalar->root().nature);
+  auto* bound = scalar->bind(pool, segment, scalar->resolveFields(pool, *reader));
+  std::array<int32_t, 3> docs{0, 1, 2};
+  std::array<int64_t, 3> expected{1000002, -3, 1};
+  std::array<ValueResult, 3> batch;
+  std::array<ScalarValueResult, 3> compact;
+  bound->evalBatch(docs, {}, batch);
+  bound->evalScalarBatch(docs, compact);
+  for (int32_t doc : docs) {
+    ASSERT_TRUE(batch[doc].valid);
+    EXPECT_EQ(expected[doc], batch[doc].intValue);
+    ASSERT_TRUE(compact[doc].valid);
+    EXPECT_EQ(expected[doc], compact[doc].intValue);
+    EXPECT_EQ(expected[doc], bound->evalPoint(doc, 0).intValue);
+  }
+  auto& bounds = bound->bounds(scalar->rootNode);
+  EXPECT_EQ(BoundsCertainty::BOUNDED, bounds.certainty);
+  EXPECT_LE(bounds.intMin, -3);
+  EXPECT_GE(bounds.intMax, 1000002);
+
+  auto* duration = parseValue(memory, *schema, "stamp-other");
+  EXPECT_EQ(ValueNature::NUMBER, duration->root().nature);
+  auto* difference = duration->bind(pool, segment, duration->resolveFields(pool, *reader));
+  EXPECT_EQ(-2, difference->evalPoint(0, 0).intValue);
+  EXPECT_EQ(2, difference->evalPoint(1, 0).intValue);
+  EXPECT_FALSE(difference->evalPoint(2, 0).valid);
+
+  auto* array = parseValue(memory, *schema, "stamps+1");
+  EXPECT_EQ(ValueNature::DATE_NS, array->root().nature);
+  auto* elements = array->bind(pool, segment, array->resolveFields(pool, *reader));
+  elements->evalBatch(docs, {}, batch);
+  std::array<std::vector<int64_t>, 3> values{{{2, 5}, {-3, -1}, {}}};
+  for (int32_t doc : docs) {
+    if (doc == 2) {
+      EXPECT_FALSE(batch[doc].valid);
+      continue;
+    }
+    ASSERT_TRUE(batch[doc].valid);
+    EXPECT_EQ(values[doc].size(), batch[doc].array.size);
+    for (int64_t i = 0; i < batch[doc].array.size; i++) {
+      EXPECT_EQ(values[doc][i], elements->evalArrayElement(batch[doc].array, i).intValue);
+    }
+  }
+  auto* average = parseValue(memory, *schema, "avg(stamps)");
+  EXPECT_EQ(ValueNature::DATE_NS, average->root().nature);
+  EXPECT_EQ(ValueType::DOUBLE, average->root().type);
+  auto* avg = average->bind(pool, segment, average->resolveFields(pool, *reader));
+  EXPECT_DOUBLE_EQ(2.5, avg->evalPoint(0, 0).doubleValue);
+}
+
+TEST(ValueBoundsTest, rangesRequireAnExplicitAttainmentProof) {
+  EXPECT_FALSE(ValueBounds::integerRange(0, 1).minAttained);
+  EXPECT_FALSE(ValueBounds::floatingRange(-90, 90).maxAttained);
+  EXPECT_TRUE(ValueBounds::integerValue(0).minAttained);
+  EXPECT_TRUE(ValueBounds::observedFloating(-1, 1, true).maxAttained);
+}
+
+TEST_F(ValueExprKernelTest, disjointOperandsDoNotProveOverflow) {
+  CollectionHelper helper;
+  helper.index(flatdoc("left_d", 1e308), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("right_d", 1e308), UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  MemPool pool;
+  for (auto expression : {"left_d * right_d", "pow(left_d, right_d)"}) {
+    auto* program = parseValue(memory, *schema, expression);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    EXPECT_FALSE(bound->evalPoint(0, 0).valid);
+    EXPECT_FALSE(bound->evalPoint(1, 0).valid);
+  }
+}
+
+TEST_F(ValueExprKernelTest, monotonicMathUsesIntervalBounds) {
+  for (auto name : {"sqrt", "log", "ln", "log1p", "floor", "exp", "ceil", "round", "rint", "trunc",
+                    "cbrt", "log2", "log10", "expm1", "to_radians", "to_degrees", "asin", "acos",
+                    "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "signum"}) {
+    const auto* fn = ValueFunctionRegistry::find(name);
+    ASSERT_NE(nullptr, fn);
+    ValueNode node;
+    node.type = ValueType::DOUBLE;
+    node.opcode = fn->opcode;
+    std::array<ValueBounds, 1> input{ValueBounds::observedFloating(0.1, 0.9)};
+    if (std::string_view(name) == "acosh") input[0] = ValueBounds::observedFloating(1.1, 1.9);
+    auto out = fn->bounds(node, input);
+    ASSERT_EQ(BoundsCertainty::BOUNDED, out.certainty) << name;
+    EXPECT_LE(out.doubleMin, out.doubleMax) << name;
+    EXPECT_TRUE(out.minAttained) << name;
+    EXPECT_TRUE(out.maxAttained) << name;
+  }
+  EXPECT_EQ(ValueFunctionRegistry::find("log"), ValueFunctionRegistry::find("ln"));
+  for (auto [name, low, high] : {std::tuple{"sqrt", -1.0, 1.0}, {"log", 0.0, 1.0},
+                                {"log2", 0.0, 1.0}, {"log10", 0.0, 1.0}, {"log1p", -1.0, 1.0},
+                                {"asin", -2.0, 0.0}, {"acos", 0.0, 2.0}, {"atanh", 0.0, 1.0},
+                                {"acosh", 0.0, 2.0}, {"exp", 0.0, 1000.0}, {"expm1", 0.0, 1000.0}}) {
+    const auto* fn = ValueFunctionRegistry::find(name);
+    ValueNode node; node.type = ValueType::DOUBLE; node.opcode = fn->opcode;
+    std::array<ValueBounds, 1> input{ValueBounds::floatingRange(low, high)};
+    EXPECT_EQ(BoundsCertainty::UNBOUNDED, fn->bounds(node, input).certainty) << name;
+    bool highFails = std::string_view(name) == "acos" || std::string_view(name) == "atanh"
+        || std::string_view(name) == "exp" || std::string_view(name) == "expm1";
+    input[0].minAttained = !highFails;
+    input[0].maxAttained = highFails;
+    EXPECT_EQ(BoundsCertainty::INVALID, fn->bounds(node, input).certainty) << name;
+    input[0].minAttained = highFails;
+    input[0].maxAttained = !highFails;
+    EXPECT_EQ(BoundsCertainty::UNBOUNDED, fn->bounds(node, input).certainty) << name;
+  }
+  ValueNode squareRoot;
+  squareRoot.type = ValueType::DOUBLE;
+  std::array<ValueBounds, 1> mixed{ValueBounds::floatingRange(-1, std::numeric_limits<double>::infinity())};
+  mixed[0].maxAttained = true;
+  auto out = ValueFunctionRegistry::find("sqrt")->bounds(squareRoot, mixed);
+  EXPECT_EQ(BoundsCertainty::INVALID, out.certainty);
+  EXPECT_EQ(BoundsInvalidity::POSITIVE_INFINITY, out.invalidity);
+
 }

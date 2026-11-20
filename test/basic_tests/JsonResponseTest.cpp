@@ -4,9 +4,12 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cmath>
+#include <limits>
 #include <string>
 
 #include "luxir/server/JsonResponse.h"
+#include "luxir/server/JsonRequest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -185,6 +188,49 @@ TEST_F(JsonResponseTest, integerFacetPreservesZeroBucketId) {
       renderOperations(req->responses[0]->proto));
 }
 
+TEST_F(JsonResponseTest, floatingFacetIdsPreserveSignedZeroAndSelection) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "negative", "price_f", -0.0f, "price_d", -0.0),
+    flatdoc("id", "positive", "price_f", 0.0f, "price_d", 0.0),
+    flatdoc("id", "infinite", "price_f", std::numeric_limits<float>::infinity(),
+            "price_d", std::numeric_limits<double>::infinity()),
+  }, UpdateMessage::COMMIT).success);
+
+  for (const char* field : {"price_f", "price_d"}) {
+    SCOPED_TRACE(field);
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").facet("f", field).limit(-1);
+    req->execute(false);
+    ASSERT_OK(req);
+    auto body = renderOperations(req->responses[0]->proto);
+    EXPECT_EQ(
+        R"({"ops":{"f":{"buckets":[{"val":-0.0,"count":1},{"val":0.0,"count":1},{"val":null,"count":1}]}}})",
+        body);
+
+    auto start = body.find("-0.0");
+    ASSERT_NE(std::string::npos, start);
+    auto selected = localReq(helper.getSearchEngine());
+    parseQueryRequest(std::string(R"({"query":"*:*","limit":10,"count_limit":-1,"fields":["id"],"ops":{
+        "f":{"field_facet":{"field":")") + field + R"(","selected":)"
+        + body.substr(start, 4) + "}}}}", selected->rawRequest(), selected->mr);
+    selected->collection("main");
+    selected->execute(false);
+    ASSERT_OK(selected);
+    EXPECT_EQ(1, selected->getMatchCount());
+    EXPECT_CONTAINS_DOC(selected->getDocs(), flatdoc("id", "negative"));
+    const auto& facet = *selected->docList()->ops.at("f")->facetResult();
+    std::visit([](const auto& ids) {
+      using T = std::decay_t<decltype(ids)>;
+      if constexpr (std::is_same_v<T, api::ColFloat> || std::is_same_v<T, api::ColDouble>) {
+        ASSERT_EQ(3u, ids.v.size());
+        EXPECT_TRUE(std::signbit(ids.v[0]));
+        EXPECT_FALSE(std::signbit(ids.v[1]));
+      } else FAIL() << "expected floating bucket IDs";
+    }, facet.bucket_ids->kind);
+  }
+}
+
 TEST_F(JsonResponseTest, rangeFacetRowsUseIntegerBounds) {
   CollectionHelper helper;
   helper.indexAll(std::array{
@@ -223,7 +269,7 @@ TEST_F(JsonResponseTest, rangeFacetRowsUseFloatingBounds) {
     ASSERT_OK(req);
 
     EXPECT_EQ(
-        R"({"ops":{"prices":{"buckets":[{"val":[-0.5,0],"count":1},{"val":[0,0.5],"count":2},{"val":[0.5,0.75],"count":0}]}}})",
+        R"({"ops":{"prices":{"buckets":[{"val":[-0.5,0.0],"count":1},{"val":[0.0,0.5],"count":2},{"val":[0.5,0.75],"count":0}]}}})",
         renderOperations(req->responses[0]->proto));
   }
 }
@@ -289,7 +335,7 @@ TEST_F(JsonResponseTest, wholeDomainStatsStayUnderOpsWithoutDocs) {
   req->execute(false);
   ASSERT_OK(req);
 
-  EXPECT_EQ(R"({"ops":{"average":20,"empty":null,"empty_sum":null,"total":40}})",
+  EXPECT_EQ(R"({"ops":{"average":20.0,"empty":null,"empty_sum":null,"total":40}})",
             renderOperations(req->responses[0]->proto));
 }
 
@@ -323,7 +369,7 @@ TEST_F(JsonResponseTest, namedDocListAndFacetRemainUnderOps) {
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
-  req->topDocs("hits").allQuery().fields({"id"}).limit(2).getNumber();
+  req->topDocs("hits").allQuery().fields({"id"}).limit(2).countLimit();
   req->facet("cats", "cat_s").limit(-1);
   req->execute(false);
   ASSERT_OK(req);
@@ -344,7 +390,7 @@ TEST_F(JsonResponseTest, shorthandUnwrapsImplicitQ) {
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
   auto& td = req->topDocs("q");
-  td.allQuery().fields({"id"}).limit(1).getNumber();
+  td.allQuery().fields({"id"}).limit(1).countLimit();
   td.facet("cats", "cat_s").limit(-1);
   req->execute(false);
   ASSERT_OK(req);
@@ -366,7 +412,7 @@ TEST_F(JsonResponseTest, secondDocListRendersItsNestedOps) {
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
-  req->topDocs("first").allQuery().fields({"id"}).limit(1).getNumber();
+  req->topDocs("first").allQuery().fields({"id"}).limit(1).countLimit();
   auto& second = req->topDocs("second");
   second.allQuery().fields({"id"}).limit(1);
   second.facet("cats", "cat_s").limit(-1);
@@ -388,7 +434,7 @@ TEST_F(JsonResponseTest, everyDocListRendersUnderOps) {
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
-  req->topDocs("first").allQuery().fields({"id"}).limit(1).getNumber();
+  req->topDocs("first").allQuery().fields({"id"}).limit(1).countLimit();
   req->topDocs("second").allQuery().fields({"id"}).limit(2);
   req->execute(false);
   ASSERT_OK(req);
@@ -396,6 +442,82 @@ TEST_F(JsonResponseTest, everyDocListRendersUnderOps) {
   EXPECT_EQ(
       R"({"ops":{"first":{"found":3,"docs":[{"id":"1"}]},"second":{"docs":[{"id":"1"},{"id":"2"}]}}})",
       renderOperations(req->responses[0]->proto));
+}
+
+TEST_F(JsonResponseTest, integerStringOptionUsesSafeBoundariesAndPreservesUnsignedValues) {
+  std::pmr::monotonic_buffer_resource mr;
+  constexpr int64_t safe = (int64_t{1} << 53) - 1;
+  const std::array<int64_t, 6> values{safe, safe + 1, -safe, -safe - 1, INT64_MIN, INT64_MAX};
+  api::SearchResponse response;
+  api::build::opsSlot(response.ops, 1, "values", mr)->kind = api::ArrInt{.v = values};
+  const std::string numbers = R"({"ops":{"values":[9007199254740991,9007199254740992,-9007199254740991,-9007199254740992,-9223372036854775808,9223372036854775807]}})";
+  EXPECT_EQ(numbers, renderSearchResponseBody(response));
+  EXPECT_EQ(numbers, renderSearchResponseBody(response, false, {}));
+  EXPECT_EQ(R"({"ops":{"values":[9007199254740991,"9007199254740992",-9007199254740991,"-9007199254740992","-9223372036854775808","9223372036854775807"]}})",
+      renderSearchResponseBody(response, false, {.int64Str = true}));
+
+  api::ExecutionProfilePiece piece;
+  piece.elapsed_us = UINT64_MAX;
+  api::ExecutionProfileOp profile;
+  profile.name = "timing";
+  profile.pieces = {&piece, 1};
+  response.profile.emplace().ops = {&profile, 1};
+  EXPECT_NE(std::string::npos, renderSearchResponseBody(response).find(R"("elapsed_us":18446744073709551615)"));
+  EXPECT_NE(std::string::npos, renderSearchResponseBody(response, false, {.int64Str = true}).find(
+      R"("elapsed_us":"18446744073709551615")"));
+}
+
+TEST_F(JsonResponseTest, integerStringOptionRecursesThroughMapsAndArrays) {
+  std::pmr::monotonic_buffer_resource mr;
+  api::SearchResponse response;
+  api::Map map;
+  api::build::opsSlot(map.fields, 1, "x", mr)->kind = INT64_MAX;
+  const std::array<api::Val, 2> values{api::Val{.kind = map}, api::Val{.kind = INT64_MIN}};
+  api::build::opsSlot(response.ops, 1, "nested", mr)->kind = api::ArrVal{.v = values};
+  EXPECT_EQ(R"({"ops":{"nested":[{"x":9223372036854775807},-9223372036854775808]}})",
+      renderSearchResponseBody(response));
+  EXPECT_EQ(R"({"ops":{"nested":[{"x":"9223372036854775807"},"-9223372036854775808"]}})",
+      renderSearchResponseBody(response, false, {.int64Str = true}));
+}
+
+TEST_F(JsonResponseTest, integerStringOptionCoversDocsHeadersAndScalarCounts) {
+  std::pmr::monotonic_buffer_resource mr;
+  api::SearchResponse response;
+  auto& docs = api::build::opsSlot(response.ops, 1, "q", mr)->kind.emplace<api::DocList>();
+  docs.found = INT64_MAX;
+  docs.found_docs = 1;
+  auto runs = renderDocRuns(response, {.int64Str = true});
+  ASSERT_EQ(1u, runs.size());
+  DocLinesState state;
+  std::string marker;
+  ASSERT_TRUE(frameDocRun(runs[0], state, {}, marker, {.int64Str = true}));
+  EXPECT_EQ(R"({"_header_":{"found":"9223372036854775807","found_docs":1}})" "\n", marker);
+}
+
+TEST_F(JsonResponseTest, integerStringOptionCoversFacetBoundsGroupKeysAndRanks) {
+  CollectionHelper helper;
+  constexpr int64_t big = int64_t{1} << 53;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "key_i", big),
+      flatdoc("id", "b", "key_i", big)}, UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  parseQueryRequest(R"json({"query":"*:*","fields":["id"],"get_scores":true,"sort":"key_i asc",
+    "collapse":{"field":["key_i"],"head_sort":"id desc"},"ops":{
+      "values":{"field_facet":{"field":"key_i"}},
+      "bounds":{"range_facet":{"field":"key_i","start":9007199254740992,"end":9007199254740994,"gap":1}},
+      "metric":"min(key_i)"}})json", req->rawRequest(), req->mr);
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& response = req->responses[0]->proto;
+  auto text = renderSearchResponseBody(response, true, {.int64Str = true});
+  for (auto part : {R"("_group_":{"val":"9007199254740992","rank":["9007199254740992"]})",
+                    R"("val":"9007199254740992","count":1)",
+                    R"("val":["9007199254740992","9007199254740993"],"count":1)",
+                    R"("metric":"9007199254740992")"}) {
+    EXPECT_NE(std::string::npos, text.find(part)) << text;
+  }
+  auto runs = renderDocRuns(response, {.int64Str = true});
+  ASSERT_EQ(1u, runs.size());
+  EXPECT_NE(std::string::npos, runs[0].body.find(R"("rank":["9007199254740992"])"));
 }
 
 } // namespace luxir::test

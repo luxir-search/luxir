@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "Inverter.h"
+#include "NestedInversion.h"
 
 #include <algorithm>
 #include <boost/sort/spreadsort/string_sort.hpp>
 #include "luxir/schema/Schema.h"
+#include "luxir/schema/GeoPointCoerce.h"
 
 // include the actual index handlers
 #include "handler/IdHandler.h"
@@ -18,6 +20,42 @@
 namespace luxir {
 
 
+Inverter::Inverter(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
+    const std::function<std::shared_ptr<Schema>()>& schemaProvider,
+    IndexRamBudget* ramBudget, StoredDictionaryProvider dictionaryProvider)
+    : Inverter(dir, segId, creatorEpoch, schemaProvider ? schemaProvider() : Schema::createDefaultSchema(),
+               ramBudget, std::move(dictionaryProvider)) {}
+
+Inverter::Inverter(Directory& dir, uint64_t segId, uint64_t creatorEpoch, std::shared_ptr<Schema> schema,
+    IndexRamBudget* ramBudget, StoredDictionaryProvider dictionaryProvider)
+    : postingsWriter(dir, segId, creatorEpoch, -1, ramBudget, true), schema(std::move(schema)),
+      storedDictionaryProvider(std::move(dictionaryProvider)),
+      ramGuard(ramBudget == nullptr ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)) {}
+
+Inverter::~Inverter() = default;
+
+void Inverter::requireInputSpace(std::string_view name) const {
+  auto path = spaceParentPath(name);
+  auto current = nested && nested->active ? std::string_view(nested->active->name) : std::string_view{};
+  if (path != current) rejectInputSpace(name);
+}
+
+void Inverter::rejectInputSpace(std::string_view name) const {
+  throw DocumentError("Field must be supplied inside nested path '" + std::string(spaceParentPath(name))
+      + "': " + std::string(name));
+}
+
+bool Inverter::hasChildRows() const { return maxChildRows > 0; }
+
+bool Inverter::shouldFlush(size_t ramCap, size_t docCap) {
+  auto rows = std::max(getMaxDoc(), maxChildRows);
+  if (maxChildRows > 0) {
+    docCap = std::min(docCap, (size_t)PostingsReader::MAX_SEGMENT_DOCS);
+  }
+  return memSize() > ramCap || (size_t)rows > docCap;
+}
+
+
 void Inverter::deleteId(std::string_view id, uint64_t version) {
   if (idHandler_ == nullptr) {
     // Bootstrap: create the id handler via schema lookup if no docs have been indexed yet.
@@ -25,7 +63,16 @@ void Inverter::deleteId(std::string_view id, uint64_t version) {
     getIndexHandler("id");
     assert(idHandler_ != nullptr);
   }
-  static_cast<handler::IdHandler&>(*idHandler_).addDelete(id, version);
+  static_cast<handler::IdHandler&>(*idHandler_).addDelete(*this, id, version);
+}
+
+size_t Inverter::retainedDeleteBytes() const {
+  if (failed() || idHandler_ == nullptr) return 0;
+  return static_cast<handler::IdHandler&>(*idHandler_).retainedDeleteBytes();
+}
+
+size_t Inverter::deleteCount() const {
+  return idHandler_ == nullptr ? 0 : static_cast<handler::IdHandler&>(*idHandler_).nonzeroWatermarks;
 }
 
 
@@ -40,7 +87,7 @@ Inverter::UndoMark Inverter::undoMark() const {
 
 void Inverter::rollbackTo(const UndoMark& mark) {
   if (idHandler_ != nullptr) {
-    static_cast<handler::IdHandler&>(*idHandler_).rollbackTo(mark.idUndoSize);
+    static_cast<handler::IdHandler&>(*idHandler_).rollbackTo(*this, mark.idUndoSize);
   }
   assert(deleted.size() >= mark.numDeleted);
   deleted.resize(mark.numDeleted);
@@ -55,6 +102,8 @@ void Inverter::clearUndoLog() {
 
 Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
   auto resolved = schema->resolveInput(name);
+  requireInputSpace(name);
+  auto space = inputSpace;
   auto fieldType = resolved.owner ? resolved.owner->primary : schema->getFieldTypeEx(resolved.physicalName);
   StoredFieldsWriter* writer = nullptr;
   if (fieldType->isStored()
@@ -76,14 +125,14 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
     // will use defaults.  fromProto registers "_stored_" and rejects
     // references to undeclared resources, so this only happens for schemas
     // assembled directly.
-    writer = &getOrCreateStoredFields(resourceName, resConfig);
+    writer = &getOrCreateStoredFields(space, resourceName, resConfig);
   }
 
   auto input = pool.make_unique<InputHandler>(*this, resolved, fieldType, writer);
-  input->branches.push_back({"self", &createPhysicalHandler(resolved.physicalName, fieldType)});
+  input->branches.push_back({"self", &createPhysicalHandler(resolved.physicalName, fieldType, space)});
   if (resolved.owner) {
     for (const auto& [label, type] : resolved.owner->variants) {
-      input->branches.push_back({label, &createPhysicalHandler(resolved.logicalName + "__" + label, type)});
+      input->branches.push_back({label, &createPhysicalHandler(resolved.logicalName + "__" + label, type, space)});
     }
   }
   auto [iter, inserted] = inputHandlers.try_emplace(std::string(name), std::move(input));
@@ -92,55 +141,62 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
 }
 
 Inverter::IndexHandler& Inverter::createPhysicalHandler(
-    std::string_view name, const std::shared_ptr<FieldType>& fieldType) {
+    std::string_view name, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space) {
   // An earlier dispatcher construction may have stopped after this handler.
   auto existing = indexHandlers.find(name);
   if (existing != indexHandlers.end()) return *existing->second;
   // Names are already resolved; dynamic FieldTypes can be template prototypes.
   u_ptr<IndexHandler> fieldHandler;
 
-  switch (fieldType->type()) {
-    case FieldType::Type::TEXT:
-      fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType);
-      break;
-    case FieldType::Type::ID:
-      fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType);
-      idHandler_ = fieldHandler.get();
-      break;
-    case FieldType::Type::STRING:
-      if (!fieldType->indexed() && fieldType->hasColumn()) {
-        // If the field is not indexed (column stored only), use StrColHandler
-        fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType);
-      } else {
-        // indexed and column stored (via ord)
-        fieldHandler = pool.make_unique<handler::StrHandler>(*this, name, fieldType);
-      }
-      break;
-    case FieldType::Type::INT:
-    case FieldType::Type::FLOAT:
-    case FieldType::Type::DOUBLE:
-    case FieldType::Type::DATE:
-      // One handler pair serves the whole int-column family: the stored
-      // encoding (raw ints, sortable bits, epoch millis) comes from
-      // FieldType::coerceColInt64, not the handler.
-      if (fieldType->multiValued()) {
-        fieldHandler = pool.make_unique<handler::MultiIntColHandler>(*this, name, fieldType);
-      } else {
-        fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType);
-      }
-      break;
-    case FieldType::Type::GEO_POINT:
-      if (fieldType->multiValued()) {
-        fieldHandler = pool.make_unique<handler::MultiGeoPointHandler>(*this, name, fieldType);
-      } else {
-        fieldHandler = pool.make_unique<handler::GeoPointHandler>(*this, name, fieldType);
-      }
-      break;
-    case FieldType::Type::VECTOR:
-      fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType);
-      break;
-    default:
-      throw std::runtime_error("Unknown field type: " + std::string(name));
+  if (fieldType->type() == FieldType::ID) {
+    fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType, space);
+    idHandler_ = fieldHandler.get();
+  } else if (fieldType->type() == FieldType::NESTED) {
+    if (!nested) nested = std::make_unique<NestedState>(*this);
+    fieldHandler = pool.make_unique<handler::NestedHandler>(*this, name, fieldType, space,
+                                                           *nested, nested->path(name));
+  } else if (fieldType->type() == FieldType::INTERVAL) {
+    fieldHandler = pool.make_unique<handler::RangeHandler>(*this, name, fieldType, space);
+  } else if (fieldType->type() == FieldType::GEO_POINT) {
+    if (fieldType->multiValued()) {
+      fieldHandler = pool.make_unique<handler::MultiGeoPointHandler>(*this, name, fieldType, space);
+    } else {
+      fieldHandler = pool.make_unique<handler::GeoPointHandler>(*this, name, fieldType, space);
+    }
+  } else {
+    switch (FieldType::storage(fieldType->type())) {
+      case FieldType::Storage::TEXT:
+        fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType, space);
+        break;
+      case FieldType::Storage::TERMS:
+        if (!fieldType->indexed() && fieldType->hasColumn()) {
+          // If the field is not indexed (column stored only), use StrColHandler
+          fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType, space);
+        } else {
+          // indexed and column stored (via ord)
+          if (fieldType->multiArray()) {
+            fieldHandler = pool.make_unique<handler::StrHandler<true>>(*this, name, fieldType, space);
+          } else {
+            fieldHandler = pool.make_unique<handler::StrHandler<>>(*this, name, fieldType, space);
+          }
+        }
+        break;
+      case FieldType::Storage::INT64:
+        // One handler pair serves the whole int-column family: the stored
+        // encoding (raw ints, sortable bits, epoch millis) comes from
+        // FieldType::coerceColInt64, not the handler.
+        if (fieldType->multiValued()) {
+          fieldHandler = pool.make_unique<handler::MultiIntColHandler>(*this, name, fieldType, space);
+        } else {
+          fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType, space);
+        }
+        break;
+      case FieldType::Storage::VECTOR:
+        fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType, space);
+        break;
+      default:
+        throw std::runtime_error("Unknown field type: " + std::string(name));
+    }
   }
 
 
@@ -156,6 +212,8 @@ Inverter::InputHandler::InputHandler(Inverter& inverter, const ResolvedFieldHand
       shape(resolved.owner ? resolved.owner->shape :
             resolved.fieldType->type() == FieldType::VECTOR ? LogicalField::Shape::VECTOR :
             resolved.fieldType->type() == FieldType::GEO_POINT ? LogicalField::Shape::GEO :
+            resolved.fieldType->type() == FieldType::NESTED ? LogicalField::Shape::NESTED :
+            resolved.fieldType->type() == FieldType::INTERVAL ? LogicalField::Shape::RANGE :
             LogicalField::Shape::SCALAR),
       multi(resolved.owner ? resolved.owner->multi : resolved.fieldType->multiValued()), writer(writer) {}
 
@@ -202,18 +260,32 @@ void Inverter::InputHandler::store(Inverter& inverter, const IndexVal& val) {
     char buf[coerce::TEXT_BUF_SIZE];
     std::vector<std::string> storage;
     coerce::forEachElement(val, [&](const IndexVal& elem) {
-      storage.emplace_back(fieldType->coerceTerm(elem, name, buf));
+      storage.emplace_back(coerce::toText(elem, name, buf));
     });
     std::vector<std::string_view> views(storage.begin(), storage.end());
     writer->addValues(doc, name, std::span<const std::string_view>(views.data(), views.size()));
   } else {
     // Numeric / bool scalars: store canonical text before normalization.
     char buf[coerce::TEXT_BUF_SIZE];
-    writer->addValue(doc, name, fieldType->coerceTerm(val, name, buf));
+    writer->addValue(doc, name, coerce::toText(val, name, buf));
   }
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, const IndexVal& val) {
+  if (shape == LogicalField::Shape::GEO) {
+    // Parse once for every branch, and fully before any branch indexes.
+    geoPoints.clear();
+    auto account = scope_guard([&] {
+      size_t bytes = geoPoints.capacity() * sizeof(GeoPoint);
+      inverter.addExtraRam((int64_t)bytes - (int64_t)geoScratchBytes);
+      geoScratchBytes = bytes;
+    });
+    const auto& geoType = static_cast<const GeoPointFieldType&>(*fieldType);
+    coerce::GeoPointInput{std::string_view(fieldName), geoType.ignoreMalformed, geoType.ignoreZValue}
+        .forEachPoint(val, [&](const GeoPoint& point) { geoPoints.push_back(point); });
+    indexPoints(inverter, geoPoints);
+    return;
+  }
   checkShape(val);
   // Capture the original value before any branch's analysis or normalization.
   if (writer) store(inverter, val);
@@ -239,10 +311,19 @@ void Inverter::InputHandler::index(Inverter& inverter, std::span<const int64_t> 
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, double latitude, double longitude) {
-  forEachBranch([&](IndexHandler& branch) { branch.index(inverter, latitude, longitude); });
+  GeoPoint point{latitude, longitude};
+  index(inverter, std::span<const GeoPoint>(&point, 1));
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, std::span<const GeoPoint> points) {
+  for (const auto& point : points) {
+    coerce::checkGeoPoint(point, std::string_view(fieldName), "typed geo point");
+  }
+  indexPoints(inverter, points);
+}
+
+// Points already range-checked.
+void Inverter::InputHandler::indexPoints(Inverter& inverter, std::span<const GeoPoint> points) {
   if (points.size() > 1 && !multi) {
     throw DocumentError(fmt::format("Field '{}' is single-valued but received multiple values",
                                     std::string_view(fieldName)));
@@ -253,6 +334,7 @@ void Inverter::InputHandler::index(Inverter& inverter, std::span<const GeoPoint>
 
 bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescriptor>* descriptors) {
   getPostingsWriter().setMaxDoc(getMaxDoc());  // TODO: this won't always be accurate currently?
+  if (nested) nested->finish();
   // Index-time stored/vector streams begin as candidates because their final
   // segment size is not known when they are checked out. Once flushing starts,
   // a large inverter spills every existing candidate before further output.
@@ -284,13 +366,16 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
   // Stored-fields chunk streams are also held through indexing. Finish all
   // resources now so their chunk and metadata streams are available for reuse
   // by normal field flushing.
-  for (auto& [_, writer] : storedFields_) {
-    writer->finish(getMaxDoc());
+  for (auto& [key, writer] : storedFields_) {
+    writer->finish(postingsWriter.getMaxDoc(key.space));
   }
 
   for (auto fieldHandler : fields) {
     fieldHandler->flush(*this);
   }
+
+  if (getMaxDoc()) noteFlushWorkspace(versionRuns.flushWorkspaceBytes());
+  postingsWriter.writeVersionRuns(versionRuns);
 
   // Handle deleted documents if any
   if (!deleted.empty()) {
@@ -312,14 +397,14 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
     int32_t numLiveDocs = maxDocId - numDeleted;
 
 
-    // Write the liveDocs file and get the liveGen
-    liveGen = 1;  // start with generation 1 for the first liveDocs file
-    liveDocs = numLiveDocs;
+    // Start with generation 1 for the first liveDocs file.
     if (filenames) {
-      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, liveGen, liveBits, maxDocId, numLiveDocs, *filenames, descriptors);
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, postingsWriter.creatorEpoch, 1, postingsWriter.creatorEpoch, liveBits, maxDocId, numLiveDocs, *filenames, descriptors);
     } else {
-      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, liveGen, liveBits, maxDocId, numLiveDocs);
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, postingsWriter.creatorEpoch, 1, postingsWriter.creatorEpoch, liveBits, maxDocId, numLiveDocs, nullptr);
     }
+    liveGen = 1;
+    liveDocs = numLiveDocs;
   } else {
     // No deletes
     liveGen = 0;

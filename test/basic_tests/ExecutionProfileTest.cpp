@@ -197,6 +197,10 @@ TEST_F(ExecutionProfileTest, reportsGlobalTopTermsPath) {
       flatdoc("id", "4", "cat_s", "c", "metric_i", 40),
   }, UpdateMessage::COMMIT);
 
+  // Keep the metric on the bucket-domain feed: AUTO folds a bare-column
+  // metric of so small a facet into its ord pass.
+  SearchOverridesGuard guard(forcedFacetSubOpInline);
+  forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
   auto req = localReq(helper.getSearchEngine());
   auto& facet = req->collection("profile_top_terms").profile()
       .facet("cats", "cat_s").limit(2);
@@ -391,7 +395,7 @@ TEST_F(ExecutionProfileTest, termLeadFirstFillLeapfrogMatchesKillSwitch) {
   auto count = [&] {
     auto req = localReq(helper.getSearchEngine());
     req->collection("profile_term_lead_leapfrog");
-    auto& top = req->topDocs("q").getNumber().limit(0);
+    auto& top = req->topDocs("q").countLimit().limit(0);
     top.rawQuery() = qb::boolean(
         top.mr(), {qb::match(top.mr(), "body_w", "lead"),
                    qb::match(top.mr(), "body_w", "tail")});
@@ -445,7 +449,7 @@ TEST_F(ExecutionProfileTest, maxParallelOutOfRangeIsRejected) {
   CollectionHelper helper("profile_reject");
   helper.indexAll(std::array{flatdoc("id", "1", "cat_s", "a")}, UpdateMessage::COMMIT);
 
-  for (int32_t maxParallel : {2, -2}) {
+  for (int32_t maxParallel : {2, -3}) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("profile_reject").facet("cats", "cat_s").limit(-1);
     req->execute(maxParallel);
@@ -455,7 +459,7 @@ TEST_F(ExecutionProfileTest, maxParallelOutOfRangeIsRejected) {
   }
 }
 
-TEST_F(ExecutionProfileTest, maxParallelZeroRunsInlineOnCallingThread) {
+TEST_F(ExecutionProfileTest, maxParallelMinusTwoRunsInlineOnCallingThread) {
   CollectionHelper helper("profile_inline");
   std::vector<Doc> docs;
   for (int i = 0; i < 32; i++) {
@@ -465,8 +469,8 @@ TEST_F(ExecutionProfileTest, maxParallelZeroRunsInlineOnCallingThread) {
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("profile_inline").profile().facet("cats", "cat_s").limit(-1);
-  helper.getSearchEngine().dispatch(*req.get(), 0);
-  // 0 (the default) = the calling thread: the whole request completed inside
+  helper.getSearchEngine().dispatch(*req.get(), -2, SearchEngine::Receiver::MAY_EXECUTE);
+  // Serial inline: the whole request completed inside
   // dispatch(), so the response is readable with no wait/synchronization.
   ASSERT_OK(req);
   const auto& pieces = profileOp(*req).pieces;
@@ -506,13 +510,37 @@ TEST_F(ExecutionProfileTest, maxParallelOneDispatchesOffCallingThread) {
       luxir::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
   auto repliedOn = static_cast<DispatchReq*>(req.get())->replied.get_future();
   req->collection("profile_pool").facet("cats", "cat_s").limit(-1);
-  helper.getSearchEngine().dispatch(*req.get(), 1);
+  helper.getSearchEngine().dispatch(*req.get(), 1, SearchEngine::Receiver::MAY_EXECUTE);
   ASSERT_EQ(std::future_status::ready, repliedOn.wait_for(std::chrono::seconds(60)));
   EXPECT_NE(std::this_thread::get_id(), repliedOn.get());
   ASSERT_OK(req);
 }
 
-TEST_F(ExecutionProfileTest, maxParallelMinusOneRunsOnCallingThreadInNodeArena) {
+// An offloading transport (gRPC) keeps every lane off its thread; -1 still
+// parallelizes, from a worker of the node arena.
+TEST_F(ExecutionProfileTest, offloadRunsEveryLaneOffCallingThread) {
+  CollectionHelper helper("profile_offload");
+  std::vector<Doc> docs;
+  for (int i = 0; i < 32; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "v" + std::to_string(i % 4)));
+    if (i % 16 == 15) helper.indexAll(docs, UpdateMessage::COMMIT), docs.clear();
+  }
+  for (int32_t maxParallel : {-2, -1, 0, 1}) {
+    auto* arena = createArena();
+    auto req = LocalReqHandle(
+        luxir::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
+    auto* dispatchReq = static_cast<DispatchReq*>(req.get());
+    auto repliedOn = dispatchReq->replied.get_future();
+    req->collection("profile_offload").facet("cats", "cat_s").limit(-1);
+    helper.getSearchEngine().dispatch(*req.get(), maxParallel, SearchEngine::Receiver::OFFLOAD);
+    ASSERT_EQ(std::future_status::ready, repliedOn.wait_for(std::chrono::seconds(60)));
+    EXPECT_NE(std::this_thread::get_id(), repliedOn.get()) << maxParallel;
+    EXPECT_EQ(helper.getNode().getTaskArena().max_concurrency(), dispatchReq->replyArenaConcurrency);
+    ASSERT_OK(req);
+  }
+}
+
+TEST_F(ExecutionProfileTest, maxParallelMinusOneRepliesOnCallingThread) {
   CollectionHelper helper("profile_parallel");
   std::vector<Doc> docs;
   for (int i = 0; i < 32; i++) {
@@ -525,13 +553,11 @@ TEST_F(ExecutionProfileTest, maxParallelMinusOneRunsOnCallingThreadInNodeArena) 
       luxir::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
   auto repliedOn = static_cast<DispatchReq*>(req.get())->replied.get_future();
   req->collection("profile_parallel").facet("cats", "cat_s").limit(-1);
-  helper.getSearchEngine().dispatch(*req.get(), -1);
-  // Completed inside dispatch(), on this thread, inside the (wider than
-  // default) node arena rather than this thread's implicit arena.
+  helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
+  // Completed inside dispatch(), on this thread. The node arena is entered
+  // only to publish and to join shares, so the reply runs outside it.
   ASSERT_EQ(std::future_status::ready, repliedOn.wait_for(std::chrono::seconds(0)));
   EXPECT_EQ(std::this_thread::get_id(), repliedOn.get());
-  EXPECT_EQ(helper.getNode().getTaskArena().max_concurrency(),
-            static_cast<DispatchReq*>(req.get())->replyArenaConcurrency);
   ASSERT_OK(req);
 }
 
@@ -563,7 +589,7 @@ TEST_F(ExecutionProfileTest, facetFanoutSpawnCounts) {
           int64_t spawns;
           {
             TaskSpawnCounter counter;
-            helper.getSearchEngine().dispatch(*req.get(), -1);
+            helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
             spawns = counter.count();
           }
           ASSERT_OK(req);
@@ -598,7 +624,7 @@ TEST_F(ExecutionProfileTest, currentPerColumnFieldLoadSpawnCounts) {
     int64_t spawns;
     {
       TaskSpawnCounter counter;
-      helper.getSearchEngine().dispatch(*req.get(), -1);
+      helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
       spawns = counter.count();
     }
     ASSERT_OK(req);
@@ -632,7 +658,9 @@ TEST_F(ExecutionProfileTest, topLevelOpsOverlap) {
   int64_t spawns;
   {
     TaskSpawnCounter counter;
-    std::thread search([&] { helper.getSearchEngine().dispatch(*req.get(), -1); });
+    std::thread search([&] {
+      helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
+    });
     // Timeouts bound a broken dispatch; both start signals must arrive while
     // the first op is still held by the latch.
     EXPECT_EQ(std::future_status::ready, first.wait_for(std::chrono::seconds(10)));
@@ -661,7 +689,7 @@ TEST_F(ExecutionProfileTest, rankedSubOpRunsOnCaller) {
   int64_t spawns;
   {
     TaskSpawnCounter counter;
-    helper.getSearchEngine().dispatch(*req.get(), -1);
+    helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
     spawns = counter.count();
   }
   Signal::unlisten("searchTopDocsChildStart");
@@ -684,7 +712,7 @@ TEST_F(ExecutionProfileTest, inlineFailureCancelsPublishedSiblings) {
     if (started.fetch_add(1) == 0) throw RequestError("inline failure", "invalid_request");
     return nullptr;
   });
-  helper.getSearchEngine().dispatch(*req.get(), -1);
+  helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
   Signal::unlisten("searchRootChildStart");
   EXPECT_FALSE(req->ok());
   EXPECT_EQ("invalid_request", req->errorCode());
@@ -705,7 +733,7 @@ TEST_F(ExecutionProfileTest, rankedFacetFanoutSpawnCounts) {
     }
     ASSERT_EQ((size_t)segments,
               helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
-    for (int profile : {0, -1}) {
+    for (int profile : {-2, -1}) {
       for (bool loadFields : {false, true}) {
         for (int64_t offset : {0, 1000}) {
           SCOPED_TRACE(::testing::Message() << segments << " segments, profile=" << profile
@@ -719,11 +747,11 @@ TEST_F(ExecutionProfileTest, rankedFacetFanoutSpawnCounts) {
           int64_t spawns;
           {
             TaskSpawnCounter counter;
-            helper.getSearchEngine().dispatch(*req.get(), profile);
+            helper.getSearchEngine().dispatch(*req.get(), profile, SearchEngine::Receiver::MAY_EXECUTE);
             spawns = counter.count();
           }
           ASSERT_OK(req);
-          int64_t expected = profile == 0 ? 0 : segments - 1;
+          int64_t expected = profile == -2 ? 0 : segments - 1;
           if (profile == -1 && loadFields && offset == 0) expected += segments - 1;
           EXPECT_EQ(expected, spawns);
           ASSERT_NE(nullptr, req->docList());

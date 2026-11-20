@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <boost/unordered/unordered_flat_set.hpp>
+#include <faiss/MetricType.h>
 #include "luxir/index/AuxInfo.h"
 #include "luxir/store/Directory.h"
 #include "luxir/schema/Schema.h"
@@ -18,10 +19,12 @@
 
 namespace luxir {
 
+class IndexRamBudget;
+
 /// Builds FAISS aux indexes for vector fields in one segment.
 ///
 /// Flat kNN is served directly from the vector column.  Aux builds produce an
-/// IVF ANN index (the field's "ann" codec: IVF+PQ by default, or opt-in IVF+RaBitQ)
+/// IVF ANN index (the field's "ann" codec: IVF+RaBitQ by default, or explicit IVF+PQ)
 /// when enough vectors are present and the segment is large enough to be
 /// worth indexing.
 ///
@@ -60,14 +63,30 @@ public:
   static int64_t ivfBuildThresholdScanCost;
   static std::atomic<int64_t> ivfBuildCountForTests;
   static std::atomic<int64_t> ivfMergeBuildCountForTests;
-  static size_t ivfTrainingSampleBytes;
-  // Per-buffer transform budget, capped by available vectors with a minimum
-  // of one vector. Training rotation uses one buffer; add uses up to two for
-  // raw cosine plus rotation. Untransformed PQ add passes column bytes directly to FAISS.
+  // Training sample size: this many vectors per trained centroid (IVF lists,
+  // or the PQ codebook entries when those are more), capped by the segment and
+  // by the memory ceiling for the sample's in-memory copy. The codec training
+  // floor still applies.
+  static int64_t ivfTrainingPointsPerCentroid;
+  static size_t ivfTrainingSampleMaxBytes;
+  static std::atomic<int64_t> ivfLastTrainingVectorsForTests;
+  // Add chunk input-byte target. Chunks also hold at least four row tasks
+  // per arena compute slot, capped by available vectors.
   static size_t ivfAddChunkBytes;
+  // Training coarse assignment, training rotation and the complete add
+  // pipeline split rows across TBB tasks. 0 derives the row floor from
+  // ceil(FAISS distance_compute_blas_threshold / dims) to retain BLAS.
+  // PQ codebooks train independently per sub-quantizer regardless of this floor.
+  static int64_t ivfBuildMinRowsPerTask;
+
+  // Completes a RaBitQ code FAISS encoded for x against its list centroid:
+  // writes the sign-bit factors for every vector, and returns the
+  // amplitude stored beside the code. x and centroid are in the rotated space.
+  static float finishRaBitQCode(const float* x, const float* centroid, uint8_t* code,
+                                int32_t dims, int32_t bits, faiss::MetricType metric);
 
   // Seed of the RaBitQ random rotation.  Fixed so every overlay of a given
-  // dims shares one matrix (deduplicated in RAM by internVectorRotation).
+  // dims shares one transform (deduplicated in RAM by internVectorRotation).
   static constexpr int RABITQ_ROTATION_SEED = 0x5ab17;
 
 
@@ -80,6 +99,10 @@ public:
   struct SegInput {
     uint64_t segId;
     PostingsReader* postingsReader;
+    uint64_t creatorEpoch;
+
+    SegInput(uint64_t segId, PostingsReader* postingsReader, uint64_t creatorEpoch)
+      : segId(segId), postingsReader(postingsReader), creatorEpoch(creatorEpoch) {}
   };
 
   /// overlayGen is the per-(segment, field) rebuild ordinal used in filenames
@@ -87,9 +110,10 @@ public:
   /// (getSegmentOverlayFileName), so gen only has to distinguish rebuilds for
   /// the same live segment and field.
   VectorIndexBuilder(Directory& dir, std::span<const SegInput> segments,
-                     const Schema& schema, uint64_t overlayGen)
+                     const Schema& schema, uint64_t overlayGen, uint64_t writerEpoch,
+                     IndexRamBudget* indexRamBudget = nullptr)
     : dir_(dir), segments_(segments), schema_(schema),
-      overlayGen_(overlayGen) {}
+      overlayGen_(overlayGen), writerEpoch_(writerEpoch), indexRamBudget(indexRamBudget) {}
 
   /// Expand selectors to concrete eligible overlay names present in this
   /// builder's segment inputs.  This applies schema and field eligibility but
@@ -115,6 +139,8 @@ private:
   std::span<const SegInput> segments_;
   const Schema& schema_;
   uint64_t overlayGen_;
+  uint64_t writerEpoch_;
+  IndexRamBudget* indexRamBudget;
 
   // Returns true if any selector matches name.
   static bool selectorMatches(const std::vector<std::string>& selectors, std::string_view name);

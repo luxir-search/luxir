@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "PostingsReader.h"
+#include "SegmentCore.h"
 
-#include <cstring>
-#include <filesystem>
-#include <format>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -13,24 +11,44 @@
 #include "FieldMetadataMemory.h"
 #include "IntColReader.h"
 #include "Postings.h"
-#include "luxir/util/MemPool.h"
 
 namespace luxir {
 
-namespace {
-
-void validateSegmentFileHeader(InputFile& file, std::string_view fileName) {
-  InputStream is = file.getInputStream();
-  std::string_view header = Postings::LUXIR_HEADER;
-  if (is.size() < (int64_t) header.size()
-      || std::memcmp(is.ptr(0), header.data(), header.size()) != 0) {
-    throw std::runtime_error(std::format(
-        "Segment file '{}' has invalid Luxir magic; expected '{}'",
-        fileName, header));
+// Metadata layout: see StoredFieldsWriter.
+StoredFieldsMetadata::StoredFieldsMetadata(PostingsReader& reader, const SegFieldInfo& field) {
+  auto input = reader.core().getInputStream(field.columnLoc.filenum());
+  const char* ptr = input.ptr((int64_t)field.columnLoc.offset() + field.columnMetaOff);
+  const char* end = input.ptr(input.size());
+  maxChunkBytes = (int64_t)InputStream::readVlong(ptr, end);
+  numDirtyChunks = (int32_t)InputStream::readVint(ptr, end);
+  uint8_t codec = (uint8_t)*ptr++;
+  if (codec != StoredChunkFormat::LZ4 && codec != StoredChunkFormat::ZSTD) {
+    throw std::runtime_error("stored fields: unknown codec " + std::to_string(codec));
+  }
+  format.codec = (StoredChunkFormat::Codec)codec;
+  format.chunkTarget = InputStream::readVint(ptr, end);
+  format.maxDocsPerChunk = InputStream::readVint(ptr, end);
+  uint32_t dictSize = InputStream::readVint(ptr, end);
+  if (dictSize > (size_t)(end - ptr)) {
+    throw std::runtime_error("stored fields: dictionary exceeds file end");
+  }
+  dictionary = std::string_view(ptr, dictSize);
+  ptr += dictSize;
+  uint32_t numFields = InputStream::readVint(ptr, end);
+  fieldNames.reserve(numFields);
+  for (uint32_t i = 0; i < numFields; i++) {
+    // The bytes live in the segment mapping for the PostingsReader's lifetime.
+    PackedTerm term(const_cast<char*>(ptr));
+    fieldNames.emplace_back(term.data(), term.size());
+    ptr += term.memorySize();
+  }
+  if (!dictionary.empty()) {
+    if (format.codec != StoredChunkFormat::ZSTD) {
+      throw std::runtime_error("stored fields: dictionary requires ZSTD");
+    }
+    ddict.emplace(dictionary);
   }
 }
-
-} // namespace
 
 
 struct PostingsReader::FieldPage {
@@ -41,71 +59,10 @@ struct PostingsReader::FieldPage {
   }
 };
 
-// Initialize from files, returns false if missing files and missingFileOK=true
-bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced) {
-  std::string segStr = Postings::getSortableString(segId);
-  auto segInfoFile = Postings::getIndexFileName(segStr, 0);
-  files.emplace_back(dir.openFile(segInfoFile, expectSynced));
-
-  if (files.back().get() == nullptr) {
-    if (missingFileOK) {
-      return false;
-    }
-    throw std::filesystem::filesystem_error(
-            std::format("Can't find/open first segment file '{}'", segInfoFile),
-            std::make_error_code(std::errc::no_such_file_or_directory));
-  }
-  validateSegmentFileHeader(*files.back(), segInfoFile);
-
-  inputStreams.emplace_back(files[0]->getInputStream());
-  InputStream firstIS = inputStreams[0];
-
-  // seek to the end of firstIs and read the size of the segmentInfo
-  // See PostingsWriter.writeSegmentInfo
-  firstIS.seek(firstIS.size() - sizeof(int32_t));
-  auto segInfoSize = firstIS.readInt();
-  segInfoOffset = firstIS.size() - sizeof(int32_t) - segInfoSize;
-  firstIS.seek(segInfoOffset);
-  maxdoc = firstIS.readVint();
-  uint32_t physicalFileCount = firstIS.readVint();
-  if (physicalFileCount == 0) {
-    throw std::runtime_error("Segment physical-file list is empty");
-  }
-  std::vector<uint32_t> physicalFileNums;
-  physicalFileNums.reserve(physicalFileCount);
-  uint32_t previous = 0;
-  for (uint32_t i = 0; i < physicalFileCount; i++) {
-    uint32_t fileNum = firstIS.readVint();
-    if ((i == 0 && fileNum != 0) || (i != 0 && fileNum <= previous)) {
-      throw std::runtime_error("Segment physical-file list is not strictly sorted from file 0");
-    }
-    physicalFileNums.push_back(fileNum);
-    previous = fileNum;
-  }
-
-  files.resize((size_t) physicalFileNums.back() + 1);
-  inputStreams.resize((size_t) physicalFileNums.back() + 1);
-
-  for (size_t i = 1; i < physicalFileNums.size(); i++) {
-    uint32_t fileNum = physicalFileNums[i];
-    std::string fileName = Postings::getIndexFileName(segStr, fileNum);
-    files[fileNum] = dir.openFile(fileName, expectSynced);
-    if (files[fileNum] == nullptr) {
-      if (missingFileOK) {
-        return false;
-      }
-      throw std::filesystem::filesystem_error(
-              std::format("Can't find/open segment file '{}'", fileName),
-              std::make_error_code(std::errc::no_such_file_or_directory));
-    }
-    validateSegmentFileHeader(*files[fileNum], fileName);
-    inputStreams[fileNum] = files[fileNum]->getInputStream();
-  }
-  auto fields = inputStreams[0];
-  fields.seek(segInfoOffset - sizeof(int32_t));
-  auto count = fields.readInt();
-  fieldOffsetsLoc = segInfoOffset - sizeof(int32_t) - (int64_t)count * sizeof(uint32_t);
-  fieldOffsets = (const uint32_t*)fields.ptr(fieldOffsetsLoc);
+void PostingsReader::initialize(int32_t maxDoc, int64_t fieldOffsetsLoc, const uint32_t* fieldOffsets, int32_t count) {
+  maxdoc = maxDoc;
+  this->fieldOffsetsLoc = fieldOffsetsLoc;
+  this->fieldOffsets = fieldOffsets;
   fieldPages = std::make_unique<std::atomic<FieldPage*>[]>(
       ((size_t)count + FIELDS_PER_PAGE - 1) / FIELDS_PER_PAGE);
   nFields = count;
@@ -115,21 +72,6 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
         ((size_t)nFields + FIELDS_PER_PAGE - 1) / FIELDS_PER_PAGE * sizeof(std::atomic<FieldPage*>),
         std::memory_order_relaxed);
   }
-  return true;
-}
-
-std::shared_ptr<PostingsReader> PostingsReader::create(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced) {
-  // Try to create the PostingsReader - use private constructor
-  auto reader = std::shared_ptr<PostingsReader>(new PostingsReader());
-  if (!reader->initializeFromFiles(dir, segId, missingFileOK, expectSynced)) {
-    return nullptr;  // Missing files and missingFileOK=true
-  }
-  return reader;
-}
-
-PostingsReader::PostingsReader(Directory& dir, uint64_t segId) {
-  // missingFileOK=false throws on a missing file rather than returning false
-  initializeFromFiles(dir, segId, false);
 }
 
 PostingsReader::~PostingsReader() {
@@ -140,19 +82,25 @@ PostingsReader::~PostingsReader() {
   fieldMetadataMemory.pages.fetch_sub(stats.pages, std::memory_order_relaxed);
   fieldMetadataMemory.pageBytes.fetch_sub(stats.pages * sizeof(FieldPage), std::memory_order_relaxed);
   fieldMetadataMemory.entries.fetch_sub(stats.entries, std::memory_order_relaxed);
-  fieldMetadataMemory.entryBytes.fetch_sub(stats.entries * sizeof(Field), std::memory_order_relaxed);
+  fieldMetadataMemory.entryBytes.fetch_sub(stats.entryBytes, std::memory_order_relaxed);
   for (size_t i = 0; i < ((size_t)nFields + FIELDS_PER_PAGE - 1) / FIELDS_PER_PAGE; ++i) {
     delete fieldPages[i].load(std::memory_order_relaxed);
   }
 }
 
 int32_t PostingsReader::findOrdinal(std::string_view name) const {
-  const auto& input = inputStreams[0];
+  const auto input = core().getInputStream(0);
   auto* end = fieldOffsets + nFields;
+  // Offsets were checked at open; a name must also end before the offsets table.
+  auto nameAt = [&](uint32_t offset) {
+    auto term = input.readPackedTerm(fieldOffsetsLoc - offset);
+    if (term.memorySize() > offset) throw std::runtime_error("Segment field name extends past the field metadata");
+    return term;
+  };
   auto* found = std::lower_bound(fieldOffsets, end, name, [&](uint32_t offset, std::string_view key) {
-    return input.readPackedTerm(fieldOffsetsLoc - offset) < key;
+    return nameAt(offset) < key;
   });
-  return found != end && input.readPackedTerm(fieldOffsetsLoc - *found) == name
+  return found != end && nameAt(*found) == name
       ? (int32_t)(found - fieldOffsets) : -1;
 }
 
@@ -180,7 +128,11 @@ const PostingsReader::Field* PostingsReader::fieldInfo(int32_t ordinal) {
     auto fresh = std::make_unique<Field>();
     FieldReader fields(*this, ordinal);
     fields.readFieldInfo(*fresh);
-    if (FieldType::sortsByIntColumn(fresh->type) && fresh->columnLoc.offset() > 0) {
+    core().checkFieldLocations(*fresh);
+    if (FieldType::storage(fresh->type) == FieldType::Storage::BIN && (fresh->flags & FieldType::STORED) != 0) {
+      fresh->stored = std::make_unique<const StoredFieldsMetadata>(*this, *fresh);
+    }
+    if (FieldType::isNumericColumn(fresh->type) && fresh->columnLoc.offset() > 0) {
       IntColReader column(*this, *fresh);
       fresh->columnBounds = Field::ColumnBounds{column.getMin(), column.getMax()};
       if (column.leafBounded()) fresh->leafMeta = column.leafMeta();
@@ -190,7 +142,7 @@ const PostingsReader::Field* PostingsReader::fieldInfo(int32_t ordinal) {
                                     std::memory_order_acquire)) {
       entry = fresh.release();
       fieldMetadataMemory.entries.fetch_add(1, std::memory_order_relaxed);
-      fieldMetadataMemory.entryBytes.fetch_add(sizeof(Field), std::memory_order_relaxed);
+      fieldMetadataMemory.entryBytes.fetch_add(entry->allocatedBytes(), std::memory_order_relaxed);
     }
   }
   return entry;
@@ -207,12 +159,13 @@ PostingsReader::FieldCacheStats PostingsReader::fieldCacheStats() const noexcept
     stats.pages++;
     stats.bytes += sizeof(FieldPage);
     for (auto& slot : page->slots) {
-      if (slot.load(std::memory_order_relaxed)) {
+      if (auto* entry = slot.load(std::memory_order_acquire)) {
         stats.entries++;
-        stats.bytes += sizeof(Field);
+        stats.entryBytes += entry->allocatedBytes();
       }
     }
   }
+  stats.bytes += stats.entryBytes;
   return stats;
 }
 

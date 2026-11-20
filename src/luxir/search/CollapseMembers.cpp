@@ -11,6 +11,33 @@ CollapseMembers::CollapseMembers(const CollapsePlan& plan,
     std::span<const CollapseKey> keys, RequestMemTracker& tracker)
     : plan(plan), keys(keys), tracker(tracker), resource(tracker, "page groups", "collapse member state") {}
 
+void renderSortRanks(std::span<const api::ArrVal> ranks, const SortPlan& sort,
+                     uint64_t flags, std::pmr::memory_resource& mr) {
+  auto natureOf = [](const SortClause& clause) {
+    if (clause.getKind() == SortClause::EXPR) return clause.getValueProgram().root().nature;
+    if (clause.getKind() == SortClause::COLUMN) return clause.getSortField().getFieldType().valueNature();
+    return ValueNature::NUMBER;
+  };
+  if (std::ranges::all_of(sort.clauses, [&](const auto& clause) {
+        return nativeValueOutput(natureOf(clause), flags);
+      })) return;
+  for (size_t i = 0; i < sort.clauses.size(); i++) {
+    const auto& clause = sort.clauses[i];
+    auto nature = natureOf(clause);
+    withNatureOutput(nature, flags, mr, [&] {
+      return clause.getKind() == SortClause::EXPR
+          ? clause.getValueProgram().describeDateSources(clause.getValueProgram().rootNode)
+          : clause.getSortField().getFieldName();
+    }, [&](auto output) {
+      if constexpr (!std::is_same_v<decltype(output), NativeValueOutput>) {
+        for (const auto& rank : ranks) {
+          if (!rank.v.empty()) renderValue(const_cast<api::Val&>(rank.v[i]), output);
+        }
+      }
+    });
+  }
+}
+
 void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
     IndexReader& reader, segdoc doc, float score, std::pmr::memory_resource& mr) {
   using namespace luxir::api;
@@ -38,16 +65,17 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
       }
       case SortClause::COLUMN: {
         const auto& field = clause.getSortField();
-        auto* found = reader.field(field.getFieldName()).at(segment);
+        auto* found = SegFieldInfo::column(reader.field(field.getFieldName()).at(segment));
         if (!found) break;
         const SegFieldInfo& info = *found;
         auto type = const_cast<FieldType&>(field.getFieldType()).type();
-        if (FieldType::sortsByIntColumn(type)) {
+        if (FieldType::isNumericColumn(type)) {
           IntColReader column(segment.postingsReader(), info);
           IntColReader::Iterator iter(column);
           if (iter.advance(doc.docId()) != doc.docId()) break;
           int64_t raw = column.multiValued()
-              ? iter.values().valueAt(column.getStartValueRank(iter.rank())) : iter.value();
+              ? column.selectedValue(iter.rank(), field.isReversed(), iter.values())
+              : iter.value();
           if (type == FieldType::FLOAT) value.kind = sortableInt32ToFloat((int32_t)raw);
           else if (type == FieldType::DOUBLE) value.kind = sortableInt64ToDouble(raw);
           else value.kind = raw;
@@ -60,7 +88,13 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
         } else {
           StrColReader column(segment.postingsReader(), info);
           StrColReader::DocIterator iter(column);
-          if (iter.advance(doc.docId()) == doc.docId()) value.kind = build::arenaStr(mr, iter.value());
+          if (iter.advance(doc.docId()) != doc.docId()) break;
+          if (column.isMultiValued()) {
+            StrColReader::DocValues values(column);
+            value.kind = build::arenaStr(mr, column.selectedValue(iter.rank(), field.isReversed(), values));
+          } else {
+            value.kind = build::arenaStr(mr, iter.value());
+          }
         }
         break;
       }

@@ -5,16 +5,16 @@
 
 namespace luxir {
 
-StructuralConstraint::Producer::Producer(SearchRequest& req, const StructuralConstraint* ancestor,
+StructuralConstraint::Producer::Producer(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const StructuralConstraint* ancestor,
                                          size_t bucketCount)
     : sourcesResource(req.memoryTracker, "structural sources", "domain variants"),
       sources(&sourcesResource),
-      req(req),
+      req(req), view(view),
       ancestor(ancestor),
       bucketCount(bucketCount),
       memo(&sourcesResource),
       ready(&sourcesResource) {
-  memo.resize(req.reader->segments().size());
+  memo.resize(view->segments().size());
   ready.resize(memo.size());
 }
 
@@ -56,6 +56,13 @@ bool StructuralConstraint::hasSelection() const {
 }
 
 DomainHandle StructuralConstraint::prefix(int32_t segment, DomainHandle eligibility) const {
+  if (mapping) {
+    auto& leaf = mapping->source().segments()[(size_t)segment];
+    DomainHandle source = DomainHandle::pinned(leaf.liveDocSet(), leaf.liveDocsShared()).scoped(leaf);
+    if (parent) source = parent->prefix(segment, std::move(source));
+    auto mapped = mapping->apply((size_t)segment, std::move(source));
+    return DomainVariantPlan::composeTracked({std::move(eligibility), std::move(mapped)}, mapping->relation->memory);
+  }
   if (hasSelection()) return parent ? parent->prefix(segment, std::move(eligibility)) : eligibility;
   return producer->prefix(segment, bucket);
 }
@@ -63,6 +70,20 @@ DomainHandle StructuralConstraint::prefix(int32_t segment, DomainHandle eligibil
 std::vector<DomainHandle> StructuralConstraint::finish(IndexReader& reader, std::vector<DomainHandle> domains,
                                                        ExecutionWarnings* warnings,
                                                        RequestMemTracker& tracker) const {
+  if (mapping) {
+    if (!hasSelection()) return domains;
+    std::vector<DomainHandle> source;
+    source.reserve(domains.size());
+    for (size_t segment = 0; segment < domains.size(); segment++) {
+      source.push_back(mapping->unapply(segment, domains[segment]));
+    }
+    if (parent) source = parent->finish(mapping->source(), std::move(source), warnings, tracker);
+    for (size_t segment = 0; segment < domains.size(); segment++) {
+      auto mapped = mapping->apply(segment, std::move(source[segment]));
+      domains[segment] = DomainVariantPlan::composeTracked({domains[segment], std::move(mapped)}, tracker);
+    }
+    return domains;
+  }
   if (parent) domains = parent->finish(reader, std::move(domains), warnings, tracker);
   if (!hasSelection()) return domains;  // The prefix is already applied.
   if (!selection) {
@@ -75,7 +96,7 @@ std::vector<DomainHandle> StructuralConstraint::finish(IndexReader& reader, std:
   // No FilterUse: the selected window is derived request-local state.
   std::vector<DocSet*> views;
   for (const auto& domain : domains) views.push_back(domain.get());
-  Query::Weight::PrepareContext context{reader, std::span<DocSet* const>(views.data(), views.size()), false,
+  Query::Weight::PrepareContext context{reader, std::span<DocSet* const>(views.data(), views.size()), nullptr,
                                         warnings};
   auto* weight = selection;
   auto prepared = weight->prepare(context);
@@ -92,27 +113,34 @@ std::vector<DomainHandle> StructuralConstraint::finish(IndexReader& reader, std:
         QueryPrep::materialize(*weight, prepared.get(), reader.segments()[segment], domains[segment].get());
     auto charge = std::make_shared<DomainVariantPlan::Reservation>(tracker, docs ? docs->ramBytesUsed() : 0,
                                                                    "structural selection domain");
-    selected.push_back(DomainHandle(std::move(docs)).chargedWith(std::move(charge)));
+    selected.push_back(DomainHandle(std::move(docs)).scoped(reader.segments()[segment]).chargedWith(std::move(charge)));
   }
   return selected;
 }
 
 std::vector<DomainHandle> SearchOp::Calculator::structuralDomains() const {
+  return structuralDomains(op.view, structuralConstraint());
+}
+
+std::vector<DomainHandle> SearchOp::Calculator::structuralDomains(
+    const std::shared_ptr<IndexReader>& view, const StructuralConstraint* path) const {
   std::vector<DomainHandle> domains;
-  auto path = structuralConstraint();
-  for (auto& segment : op.req.reader->segments()) {
-    DomainHandle live =
-        DomainHandle::pinned(segment.liveDocs() ? &segment.liveDocs()->docset() : nullptr, op.req.reader);
+  for (auto& segment : view->segments()) {
+    DomainHandle live = DomainHandle::pinned(segment.liveDocSet(), view).scoped(segment);
     domains.push_back(path ? path->prefix(segment.ord, std::move(live)) : std::move(live));
   }
   return domains;
 }
 
 StructuralConstraint::Finish SearchOp::Calculator::structuralFinish() const {
-  auto path = structuralConstraint();
+  return structuralFinish(op.view, structuralConstraint());
+}
+
+StructuralConstraint::Finish SearchOp::Calculator::structuralFinish(
+    const std::shared_ptr<IndexReader>& view, const StructuralConstraint* path) const {
   if (!path || !path->hasSelection()) return {};
-  return [this, path = std::move(path)](std::vector<DomainHandle> domains) {
-    return path->finish(*op.req.reader, std::move(domains), &op.req, op.req.memoryTracker);
+  return [this, view, path](std::vector<DomainHandle> domains) {
+    return path->finish(*view, std::move(domains), &op.req, op.req.memoryTracker);
   };
 }
 
@@ -128,9 +156,8 @@ DomainHandle StructuralConstraint::Producer::prefix(int32_t segnum, size_t bucke
     (*structuralPrefixRecomputations)++;
   }
   if (ready[(size_t)segnum] != 1) {
-    auto& seg = req.reader->segments()[(size_t)segnum];
-    DomainHandle base =
-        DomainHandle::pinned(seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr, req.reader);
+    auto& seg = view->segments()[(size_t)segnum];
+    DomainHandle base = DomainHandle::pinned(seg.liveDocSet(), view).scoped(seg);
     if (ancestor) base = ancestor->prefix(segnum, std::move(base));
     values.resize(bucketCount);
     if (base.get() && base.get()->card() == 0) {

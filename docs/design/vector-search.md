@@ -49,21 +49,22 @@ parameters:
   `(max - min) / 510`, per element.
 
 A merge of inputs with different encodings (a schema change between them)
-writes the most precise input encoding and transcodes only the less precise
-inputs, so a merge never loses precision; same-encoding merges are pure byte
-copies.
+writes the schema's current encoding and transcodes the other inputs, so a
+field converges to its declared encoding. Transcoding is lossy when it goes to
+a narrower encoding; it clamps to the f16 range and renormalizes unit-length
+cosine rows written as f32. Same-encoding merges are pure byte copies.
 
 ### Norm prefix
 
 Cosine needs `|x|` of every stored vector unless the column holds `f32` unit
-vectors, and `int8` L2 needs `|x|^2` (below). Recomputing it costs a second
+vectors. Recomputing it costs a second
 reduction over every row on every query, while it is a property of the stored
 value, so the writer stores it once: the segment field metadata records
 `vectorNorms`, and each row then starts with a 4-byte float `|x|^2` of the
 vector the payload decodes to (for `int8`, of the exact `offset + scale *
 code` reconstruction), followed by the encoding's payload. Fields that need it
-(`vcodec::needsNorms`): cosine over `f16` or `int8`, cosine over raw `f32`
-(`normalize_on_write: false`), and `int8` L2. At 768 dimensions that is 0.1%
+(`vcodec::needsNorms`): cosine over `f16` or `int8`, and cosine over raw `f32`
+(`normalize_on_write: false`). At 768 dimensions that is 0.1%
 of an `f32` row and 0.5% of an `int8` row.
 
 A prefix in the row rather than a companion column (like `keep_original`'s):
@@ -75,8 +76,9 @@ A prefix in the row rather than a companion column (like `keep_original`'s):
   rescore, which gathers scattered rows, does no extra random read.
 - `f32` payloads keep their 4-byte alignment relative to the row.
 
-A merge keeps the prefix when any input already in the output encoding has
-it, and computes it for the inputs that lack it. A segment written under
+A merge writes the prefix when the field's current settings need it, like
+its encoding: it computes it for the inputs that lack it and drops it from
+the inputs that no longer need it. A segment written under
 settings that did not need it (before a metric change, say) is still scored
 correctly: the scorer computes the same value per row until a merge adds it.
 
@@ -85,17 +87,19 @@ correctly: the scorer computes the same value per row until a merge adds it.
 Exact scoring means exact over the stored encoding. `VectorScorer` is the
 single place a float query is scored against a stored row, used by the flat
 column engine and the terminal candidate rescore. `int8` rows are scored
-without decoding to a float buffer, using per-query `sum(q)` and `|q|^2` and
-the stored `|x|^2`:
+without decoding to a float buffer. Inner product and cosine use a per-query
+`sum(q)`:
 
 ```text
 q.x   = offset * sum(q) + scale * dot(q, code)
-|q-x|^2 = |q|^2 - 2 q.x + |x|^2
 ```
 
-so the per-element work is a pure `dot(q, code)`. Cosine over `f16`, `bf16`
-and `int8` always divides by the stored vector's norm, since a quantized unit
-vector is not exactly unit length.
+so the per-element work is a pure `dot(q, code)`. L2 decodes
+`offset + scale * code` in registers and sums the squared differences
+directly: `|q|^2 - 2 q.x + |x|^2` cancels catastrophically when the offset is
+large. Cosine over `f16`, `bf16` and `int8`
+always divides by the stored vector's norm, since a quantized unit vector is
+not exactly unit length.
 
 `bf16` stores the high half of each float32, rounded to nearest even: the
 float32 exponent range with an 8-bit significand, so encoding needs no range
@@ -103,8 +107,6 @@ check, and decoding is a 16-bit shift. `bit` stores the sign of each element
 (`x > 0`) for binary embeddings and is scored only by `hamming`
 (`1 - popcount(q ^ x) / dims`, the query packed once per segment). Bit
 columns get no ANN overlay: at 1/32 of `f32` the exact scan is the index.
-A merge of `f16` and `bf16` inputs writes `f32`, since neither holds the
-other's values.
 
 The per-element loops are SIMD kernels (`codec/VectorKernels.cpp`): one pass
 over the stored bytes per row, with `f16` widened to float in registers
@@ -127,7 +129,8 @@ block.
 
 Floating-point sums are not associative, so determinism is designed in. Every
 kernel uses one lane layout, accumulator count, tail handling (a zero-padded
-final vector) and horizontal reduction order for a given `dims`, and the
+final vector; for `int8` L2 the query's padding lanes hold the offset, so they
+still contribute 0) and horizontal reduction order for a given `dims`, and the
 kernels live in one translation unit so contraction into FMAs cannot differ
 per call site. A row's score therefore depends only on the query and the row,
 never on its block, task, or thread: parallel and serial runs stay
@@ -172,11 +175,13 @@ time.
 
 Explicit vector selectors also activate those concrete overlay names in the
 writer. That activation is process-local unless it produced a durable overlay
-entry. A commit that fails mid-build has no side effects: staged overlay files
-are deleted, no overlay entries are published, and no names are activated -
-the caller sees the error and decides whether to retry. Startup seeds active
-names only from overlays already present in the commit manifest, so Luxir never treats
-intent-only state as a boot-time "must build" queue.
+entry. A commit whose vector build fails deletes its staged files, attaches
+nothing to its captured segments, and activates nothing itself. Attachment and
+activation on success precede data sync and manifest publication; the failure
+rule applies to the build. A selecting commit records its selectors when it
+captures its segments (see [Merging](#merging)). Startup seeds active names
+only from overlays already present in the commit manifest, so Luxir never
+treats intent-only state as a boot-time "must build" queue.
 
 Explicit commit-time vector builds stage overlay files and entries across the
 whole selected commit. If any requested vector build fails, staged overlay
@@ -192,7 +197,7 @@ future work.
 
 Every overlay is an IVF index: k-means centroids route a query to inverted
 lists, and the lists hold one compact code per vector. The field's schema
-`ann` settings pick the code (PQ by default, or opt-in RaBitQ; see
+`ann` settings pick the code (RaBitQ by default, or explicit PQ; see
 [guide/vector-search.md](../guide/vector-search.md#index-settings)); the
 builder reads them when it builds an overlay and records the codec and its
 build parameters in the overlay's `VectorAuxMeta`, so the reader and query
@@ -205,48 +210,77 @@ metric space for both (see rotation below). RaBitQ query quantization
 (`query_bits`) is not an index property; it is read from the current schema at
 search time.
 
-**IVF+RaBitQ** (opt-in, `ENGINE_IVFRABITQ`) uses FAISS `IndexIVFRaBitQ`.
+**IVF+RaBitQ** (default, `ENGINE_IVFRABITQ`) uses FAISS `IndexIVFRaBitQ`.
 RaBitQ (Gao and Long, SIGMOD 2024) stores, per vector, the sign bits of its
 residual from the list centroid plus two float factors, and estimates
-distances from the code with a proven error bound; extended RaBitQ adds
+distances with probabilistic error bounds under its random-rotation model;
+extended RaBitQ adds
 magnitude bits per dimension. There is no codebook to train: building trains
 only the IVF centroids, unlike PQ, which retrains per-subspace k-means
 codebooks on every segment build and merge.
 
 The error bound and unbiasedness assume the codes are taken in a randomly
 rotated space. FAISS does not rotate internally: `RaBitQuantizer.h` states "It
-is assumed that the Random Matrix Rotation is performed externally", and the
-FAISS RaBitQ benchmark and tests wrap the index in
-`IndexPreTransform(RandomRotationMatrix, ...)` themselves. Luxir therefore
-builds a `RandomRotationMatrix` (orthonormal, d x d, fixed seed), rotates the
-training sample and every added vector, and serializes the header as the
-standard `IndexPreTransform(rotation, IndexIVFRaBitQ)`. The reader takes the
-wrapper apart: it keeps the IVF index (whose lists it serves from the mmapped
-file as usual) and interns the rotation in a process-wide table keyed by
-content. Because every overlay of a given dims uses the same seed, all of them
-share one matrix in RAM (d^2 floats, 2.25 MiB at 768 dims), and a query is
-rotated once per distinct matrix rather than once per segment. The rotation is
-orthonormal, so L2, inner product, and cosine (unit vectors stay unit) are
-preserved, and centroid distances stay comparable across rotated and
-unrotated segments in the global list ranking. On one real embedding corpus
-the rotation made no measurable recall difference (the embeddings are close to
-isotropic already); it is kept because the guarantee, not that corpus, is what
-the codec is chosen for.
+is assumed that the Random Matrix Rotation is performed externally". Luxir
+rotates with a seeded FHT-Kac transform (the rotator of the RaBitQ authors'
+library) in `util/VectorRotation.h`, shared by the builder and the
+reader/query code. It uses exactly d coordinates, with no padding. Four
+rounds each apply random signs, then a normalized Walsh-Hadamard transform
+on the largest power-of-two block fitting in d, alternating head and tail.
+For non-power-of-two d, each round then pairs the first floor(d/2)
+coordinates with the last floor(d/2) coordinates in orthogonal
+sum/difference Kac steps. For odd d, the middle coordinate is covered by both
+Hadamard blocks. Power-of-two d skips Kac.
+
+The signs use SplitMix64 from the recorded seed, consuming each word low bit
+first continuously across rounds; a set bit negates the coordinate. The
+rotation kind fixes this algorithm and bit ordering. Every step is orthogonal,
+so norms, inner products, cosine and centroid distances remain comparable
+with unrotated PQ segments. Application costs O(d log d), with O(d) cached
+signs, replacing the dense d x d matrix and its quadratic work. FAISS's
+HadamardRotation pads to the next power of two, adding 33% code bytes at
+768, 1536 and 3072 dimensions; avoiding that padding preserves code density.
+
+Training samples and added vectors use the same transform. Headers are bare
+`IndexIVFRaBitQ`; metadata stores rotation kind and seed, with no matrix.
+Readers intern by (kind, dims, seed), and queries rotate once per distinct
+transform. A fixed seed shares the transform across overlays of one dimension.
+Confidence intervals remain empirical, rather than a deterministic guarantee.
+On five 1M corpora (128 to 1536 dims, L2, IP and cosine) it matched the dense
+rotation's recall and latency at 1 and 2 bits, within the run-to-run
+variation of the k-means partition, and cut 1-bit build CPU by up to 23% (NQ
+1536: vector build 12.0 to 8.2 s).
 
 Each IVF engine slot binds an immutable prepared query: the canonical query
 for PQ, or the cached rotated query for RaBitQ, plus the current schema's
 query quantization bits. Coarse assignment and both document and group scans
-use that same index-space query. Each scan call owns its selector and FAISS
-search parameters, including `query_bits`, so filtering, deeper rounds, and
-parallel list chunks share the same preparation policy without sharing
-mutable scanner state. Exact column scans and terminal rescoring retain the
-canonical query.
+use that same index-space query. Each scan call owns its selector and distance
+computer, with query quantization taken from the prepared query, so filtering,
+deeper rounds, and parallel list chunks share the same preparation policy
+without sharing mutable distance-computer state. Document and group scans share one traversal
+and result handler. PQ retains FAISS's optimized code kernel; RaBitQ evaluates
+its 1-bit estimate and gates extra-bit work in Luxir. Exact column scans and
+terminal rescoring retain the canonical query.
 
-RaBitQ's estimated squared L2 distance can be negative. Internal ordering
+Codes with one bit per dimension and a quantized query use `RaBitQScorer`.
+It owns its arithmetic: residuals are quantized by rounding half up and
+clamping, and estimates agree with FAISS within query-quantization error;
+last-bit float differences across builds and architectures are accepted.
+Tests check exact quantized values, bit planes and integer counts against a
+scalar reference, and factors and estimates against FAISS within a derived
+one-step tolerance. The scorer removes per-list allocation and bit-at-a-time
+packing, and the per-code virtual call. FAISS's computer remains for extended
+codes and query bits 0.
+
+RaBitQ's estimated squared L2 distance can be negative. Since 1.15, FAISS
+clamps its 1-bit L2 estimates at zero; the port patch
+`deps/ports/faiss/rabitq-negative-l2.diff` removes that clamp so negative
+estimates keep their order. Internal ordering
 scores use `1 / (1 + d)` for `d >= 0` and `1 - d` for `d < 0`, preserving
 ordering across segments and bounded cuts instead of tying negative estimates
-at 1. Group scanners invert this same map when setting their competitive
-distance threshold. These approximate scores may exceed the public L2 range
+at 1. The common bounded handler inverts this map outward when setting its
+competitive distance threshold, admitting equal scores for identity ties.
+These approximate scores may exceed the public L2 range
 `[0, 1]`; terminal rescoring from column vectors restores exact scores before
 the final cut, similarity filtering, and returning results. Exact column
 witnesses bypass the bounded approximate heap, so an inflated estimate cannot
@@ -256,28 +290,28 @@ FAISS also ships `IndexIVFRaBitQFastScan`, which block-packs codes 32 vectors
 at a time for SIMD lookups and measured about 1.5 to 2 times faster list scans
 in a standalone FAISS test. It is not used yet: its lists are
 `BlockInvertedLists` (padded 32-vector blocks with per-block factor regions),
-which needs a second mmapped list layout; its `search_preassigned` rejects
-the per-call stats sink the parallel scan uses; and the vendored FAISS 1.14.3
-install omits `faiss/utils/popcount.h`, which its header includes, so it does
-not compile against the installed headers without patching the port. The
-codec is recorded per overlay, so FastScan can arrive as another engine id.
+which needs a second mmapped list layout, and its `search_preassigned` rejects
+the per-call stats sink the parallel scan uses. The codec is recorded per
+overlay, so FastScan can arrive as another engine id.
 
-**IVF+PQ** (default, `ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
+**IVF+PQ** (explicit, `ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
 sub-quantizers of `pq.bits` bits each, unrotated. PQ's automatic `m` is the
-largest divisor of dims under a metric-dependent cap that leaves at least
-four dimensions per sub-quantizer. The cap is `max(32, dims / 8)` for the
-FAISS inner-product metric (IP and cosine), and 32 for L2. If no divisor
-leaves four dimensions, use the largest divisor under the same cap. Explicit
-`m` is unchanged. Automatic `m` depends only on dims and metric, so it is
-stable across merges. Up to 256 dims the choices are unchanged; IP/cosine
-selects 48 / 96 / 120 / 192 / 384 at 384 / 768 / 960 / 1536 / 3072 dims.
+largest divisor of dims under `max(32, dims / 8)` that leaves at least four
+dimensions per sub-quantizer, for every metric. If none does, use the largest
+divisor under the same cap. Explicit `m` is unchanged. Automatic `m` depends
+only on stored dims, including inferred dims, so it is stable across merges
+of the same dimension. It selects 48 / 96 / 120 / 192 / 384 at
+384 / 768 / 960 / 1536 / 3072 dims.
 
-L2 retains the cap because FAISS's L2 + `by_residual` path recomputes a
-precomputed table at open and keeps it resident: `nlist * m * 256` floats
-at 8 bits. At about 121k vectors (`nlist=348`), `m=96` would mean about
-34 MB of resident table against 11.6 MB of codes. IP/cosine instead builds
-its lookup table per query, with no such index-resident table.
-`IndexReaderAuxTest.cosineSkipsL2PrecomputedTable` pins that distinction.
+The reader skips FAISS precomputation during deserialization. For L2 with
+`by_residual`, it explicitly enables the `nlist * m * 2^bits`-float table
+only when its bytes are at most `ntotal * dims * 4`, the raw vector bytes.
+Otherwise it disables the table and FAISS computes tables per list. This
+bypasses FAISS's global 2 GB cap. With default sqrt(N) lists and m near d/8,
+the table is about 32/sqrt(N) of raw bytes; the bound primarily constrains
+explicit large nlist. IP/cosine has no resident L2 table.
+`IndexReaderAuxTest.cosineSkipsL2PrecomputedTable` pins both metric behavior
+and the size boundary.
 
 The basis is the Cohere-768 cosine [measurement below](#codec-measurements):
 `m=96` improves recall over `m=32`, with code bytes and per-code scan work
@@ -286,6 +320,31 @@ work per training vector per iteration, and encode work per vector, remain
 `256 * dims` at 8 bits: splitting the dimensions into more sub-quantizers
 does not multiply that arithmetic. This does not establish unchanged
 wall-clock build time; the build measurement below used `m=32`.
+
+### Default codec
+
+RaBitQ is the default, chosen on one-segment indexes at default probes plus
+16 to 256 lists, single client: SIFT-128 L2, MIRACL-768 cosine, GIST-960 L2,
+Cohere-1024 IP, NQ-1536 cosine, Jina v5-small MS MARCO embeddings truncated
+to 256 / 384 / 512 / 1024 dims (cosine), all at 1M vectors, and OpenAI
+text-embedding-3-large 3072 IP at 500k.
+
+From 384 dims up, 1-bit RaBitQ ran at about 0.5-0.8x PQ latency at equal or
+higher recall and built with equal or less CPU (0.39x at 3072 dims). Its
+intervals size the candidate pool per query, while PQ's bounded count,
+fitted on one 1024-d IP corpus, left recall behind elsewhere: at 256 lists
+PQ reached .872 recall@10 on MIRACL (.975 with 1000 candidates), .710 on
+GIST at m=32 (.954), .949 on Jina-384 and .960 on OpenAI-3072, against
+.981-.997 for 1-bit RaBitQ. At 128 dims 1-bit RaBitQ took 1.16x / 1.30x PQ
+latency at k=10 / k=100, and 2-bit 1.03x / 1.02x at 0.55x PQ's build CPU.
+
+Automatic bits (`0`) resolve to 2 below 384 stored dims and 1 at or above.
+On the same model truncated to 256 / 384 / 512 / 1024 dims, 2 bits cut k=100
+latency by 23% / 13% / 9% / 1% (21% on SIFT-128) but k=10 latency only
+below 384, while costing 1.5-1.8x the build CPU. 4 bits never beat 2.
+
+GIST L2 with PQ m=32 topped out at .71 recall@10 at 256 of 1000 lists;
+m=120, now the automatic choice, reaches .94-.98.
 
 ### Codec measurements
 
@@ -305,13 +364,15 @@ i7-14700KF, shared with other builds). Two corpora:
   (768 dims, cosine).
 - SIFT1M (1,000,000 x 128, L2).
 
-At 768 dims, recall with 1-bit RaBitQ is set by the probed lists alone: 1, 2,
+In this historical 768-dimension campaign, the tested 1-bit pools reached the
+same recall as the higher-bit codecs: 1, 2,
 and 4 bits all give 0.893 / 0.911 / 0.960 / 0.986 at nprobe default / 32 / 64
-/ 128, at any rescore pool. PQ at its then-automatic `m=32` (32 code bytes) never
+/ 128, at the tested rescore pools. PQ at its then-automatic `m=32` (32 code bytes) never
 passed 0.88, even with 500 rescored candidates; PQ with `m=96` (96 bytes,
-close to RaBitQ's 104) reached 0.886 / 0.902 / 0.950 / 0.970. FAISS's plain
-RaBitQ scanner is slower than its PQ scanner (default nprobe: 1.2 ms vs 0.66
-ms for `m=96`), which FastScan should largely close. At 128 dims (SIFT) the
+close to RaBitQ's 104) reached 0.886 / 0.902 / 0.950 / 0.970. The then-current bounded scans measured 1.2 ms for RaBitQ versus 0.66 ms for
+PQ `m=96` at default nprobe. Those measurements predate shared floors,
+interval selection and amplitude storage; they do not establish a universal
+codec ranking or that 1-bit recall is generally list-limited. At 128 dims (SIFT) the
 defaults are close in recall (0.953 vs 0.960 at the default nprobe; 0.989 vs
 0.999 at nprobe 128, where 2-bit RaBitQ or 500 candidates reach 0.9985 and
 0.9965) and PQ is again faster. Overlay builds, including training and
@@ -356,31 +417,115 @@ column when it is present and aligned, else decodes the encoded column, and
 normalizes vectors for FAISS when the field uses cosine and its input is raw
 (a raw column, the original column, or a quantized column).
 
-Raw-cosine training samples are normalized as they are sampled, in their
-owned buffer.
-RaBitQ training then uses the chunked transform helper for rotation only,
-copying each rotated chunk back into the sample; PQ needs no training
-transform call. There is no second full-size training allocation or swap.
-Each scratch buffer is limited by `ivfAddChunkBytes` (16 MiB by default),
-capped by the available vectors with a minimum of one vector. Training
-rotation needs one buffer, released before FAISS training. Add uses the same
-helper with up to two buffers for raw cosine plus rotation, keeping matrix
-multiply input and output disjoint. Untransformed PQ add passes f32 column
+The sample holds `ivfTrainingPointsPerCentroid` (100) vectors per trained
+centroid: the IVF lists for RaBitQ, and the larger of the lists and the 2^bits
+codebook entries for PQ, whose codebooks train on the same rows. It is capped
+by the segment and by `ivfTrainingSampleMaxBytes` (2.5 GiB); the codec's training
+floor still wins over that ceiling. FAISS asks for at least 39 points per
+centroid and subsamples above 256, so 100 sits between the two. A byte budget
+that ignores nlist starves large segments: 64 MiB at 768 dims is 21,845
+vectors, 10 per list at 5M vectors, which produces uneven lists and lower
+recall at every probe count. K-means work is proportional to sample size times
+nlist, so at `nlist = sqrt(N)` training stays linear in N. The default nlist
+cap of 4096 bounds the sample at 409,600 vectors: 1.2 GiB at 768 dims and
+2.4 GiB at 1536, so the ceiling does not bind either size. Each merge or commit
+build holds one sample copy until training finishes, charged softly to the
+index RAM budget without waiting for capacity. RaBitQ trains only the coarse
+quantizer, avoiding FAISS's unused residual copy and assignment pass. PQ still
+trains on at most 256 residuals per codebook entry; its residual and optional
+subsample copies are also charged during training. A field with a large
+explicit `nlist` or thousands of dimensions reaches the ceiling first and gets
+fewer points per centroid. Larger samples cost build time: at 1M x 768 with an
+explicit `nlist` of 4000, the 1-bit build went from 14.0 to 42.7 s.
+
+Raw-cosine training samples are normalized in place in their owned buffer.
+RaBitQ rotates the sample in place in row partitions; PQ needs no transform.
+Each add scratch buffer is limited by `ivfAddChunkBytes` (16 MiB by default),
+capped by available vectors with a minimum of one vector. Add uses up to two
+buffers for raw cosine plus rotation. Untransformed PQ add passes f32 column
 bytes directly to FAISS; f16 and int8 columns decode one chunk at a time into
-an owned buffer, normalized in place for cosine, before the optional rotation.
-The serialized header's `nprobe` is unused by Luxir: searches supply explicit
-probe parameters or selected lists.
+an owned buffer, normalized in place for cosine. The serialized header's `nprobe` is unused by Luxir:
+searches supply explicit probe parameters or selected lists.
+
+### Build parallelism
+
+OpenBLAS is built serial (with locking for concurrent callers), and a build
+gets its GEMM parallelism from TBB tasks in the indexing arena instead of a
+BLAS thread pool. A threaded BLAS would reach the query path: every level-3
+call holds a per-variant lock for its duration, so a query's rotation or
+coarse search would queue behind a build's GEMMs, and on x86 OpenBLAS a
+one-column SGEMM still asks for a thread team at 768 dims and up. Measured on
+whole builds, partitioning across tasks was also faster than the thread pool
+and used far less CPU.
+
+The arena observer pins FAISS OpenMP to one thread on every arena entry,
+including masters. All build and query parallelism comes from TBB tasks.
+The build partitions these steps in the indexing arena, isolating the caller
+so it cannot pick up an unrelated merge or flush while waiting:
+
+- Coarse assignment during training. The IVF's actual quantizer is an
+  `IndexFlat` subclass whose searches split rows, covering both k-means and
+  residual-training assignment.
+- Add work for every codec. Each row slice normalizes when needed, rotates
+  for RaBitQ, coarse-assigns with the base `IndexFlat::search`, and calls
+  `encode_vectors` with list numbers. One serial `add_sa_codes` per chunk
+  preserves input order within each inverted list.
+- RaBitQ training-sample rotation, in disjoint row slices in place.
+- PQ codebook training, one task per sub-quantizer with its own sub-vector
+  buffer, clustering instance and flat L2 index. This mirrors FAISS's default
+  training path; residual precomputation follows after all tasks finish.
+
+Row partitions have at least `ivfBuildMinRowsPerTask` rows (by default
+`ceil(distance_compute_blas_threshold / dims)` to retain FAISS's BLAS path),
+up to four tasks per compute slot. Add chunks hold the larger of 16 MiB of
+input vectors and four times the arena compute width times that row floor,
+capped by available vectors, so scratch capacity scales with core count.
+The build subclasses serialize through FAISS's `dynamic_cast` dispatch as
+plain `IndexFlat` and `IndexIVFPQ`; readers need no build-specific types.
 
 ## Memory-Mapped Index Layout
 
 Index data stays memory-mapped at query time. The aux file holds a small FAISS
-header (index parameters, IVF centroids, and the PQ codebooks or RaBitQ
-rotation) followed by the inverted-list payloads (codes and vector ids) in
-Luxir's own layout; the
+header (index parameters, IVF centroids, and the PQ codebooks) followed by
+the inverted-list payloads (codes and vector ids) in Luxir's own layout; the
 reader decodes only the header into memory and serves list scans directly from
 the mmapped file. Residency of the bulk index data is therefore managed by the
 OS page cache, like the vector column itself, rather than forced into process
 RAM.
+
+RaBitQ overlays also store upward-rounded float32 error amplitudes after the
+codes in inverted-list order: sigma1 for 1-bit, sigmaB for multi-bit
+(4 bytes/vector for every width). The multi-bit gate reads sigma1 from the
+code's own f_error; the side amplitude is read only after that gate. PQ has
+no amplitude section.
+The builder computes these in the encoding row pipeline from the rotated
+original, assigned centroid and actual code. SigmaB is the residual
+reconstruction error norm divided by sqrt(max(1, D-1)), with a factor of two
+for squared L2. Sigma1 is computed from the sign reconstruction error before
+the fixed 1.9 confidence multiplier. These amplitudes support empirical
+confidence intervals; they are not deterministic error bounds. The reader
+exposes a mmap view, validates finite, non-negative amplitudes once at open and
+exposes per-list spans for sequential, unchecked scan loads. Metadata and footer
+version 3 validate the component count and file size;
+older formats fail on open and must be rebuilt.
+
+`VectorIndexBuilder::finishRaBitQCode` writes the sign-bit factors for every
+code: `dp_multiplier = ||r||^2 * sqrt(D) / sum(|r_i|)` (zero when the sum is
+zero), sigma1, and upward-rounded `f_error = sigma1 * 1.9` for multi-bit codes.
+FAISS still writes the sign bits, `or_minus_c_l2sqr`, and extra-bit codes and
+factors. This avoids FAISS's small-norm guards (still present in 1.16.0): below
+a squared residual of `FLT_EPSILON`, its multiplier scores the residual as if it
+had unit length, and below `sum(|r_i|) = 2 * FLT_EPSILON` its error factor
+becomes zero. Such codes arise near centroids (duplicates, singleton lists,
+normalized-centroid rounding) and throughout small-magnitude L2 data. A
+false-high 1-bit interval can raise the witness floor and prune true neighbors
+at any probe count.
+The corrected factors preserve residual length and direction across scales,
+but the intervals remain empirical: for IP, float cancellation in FAISS's
+1-bit estimator leaves errors around 1e-7 even at zero amplitude, so they are
+not arithmetic-exact. The extra-bit factors have no such defect; in multi-bit
+search a bad 1-bit factor causes false gate rejections (a lost neighbor) or
+wasted extra-bit work, not false witnesses.
 
 Before taking apart a RaBitQ wrapper, the reader checks the header's bit
 count against the overlay metadata. Both codecs also check the header's list
@@ -397,20 +542,159 @@ publishes the merged segment publishes its overlay entries atomically with the
 segment. If a merge-time vector overlay build fails, Luxir deletes the staged
 overlay files, publishes the merged segment without vector overlays, and
 serves that field through the exact flat column fallback until a later
-explicit build succeeds.
+explicit build succeeds or the segment merges again.
+
+A merge finishing during a selecting commit's build builds the selected
+overlays on its private output without waiting. The `*` selector matches the
+output's own eligible fields. At swap, the merge prepares again only for an
+active name it has not attempted or an in-flight selector it has not matched.
+Failed names are not retried by that merge.
+
+Every vector overlay installed with a merge output makes its name active for
+later merges. Thus a merge may retain a valid overlay even if the selecting
+commit's build fails; that commit still attaches nothing and activates nothing
+itself. This agrees with startup seeding from materialized manifest overlays.
+A merge swapping before the commit captures its segments gets its overlay
+from the commit.
+
+Source segments that the commit captured still get overlays from it even when
+a merge is replacing them, because that commit publishes them. Those builds are
+discarded once the merged output publishes.
 
 ## Query Execution
 
 `KnnQuery` creates one vector engine per segment. A segment uses its
-`vec.<field>` FAISS overlay when present, or scans the vector column exactly
-when no overlay exists. FAISS ids are segment-local vector value ranks, so the
-query path maps each returned value rank back through that segment's vector
+`vec.<field>` FAISS overlay when the work model prefers IVF, or scans the
+vector column exactly. Segments without an overlay, and nonempty columns with
+an empty ANN index, use the exact engine. The engines search inside the
+per-segment prepare domain, which is live-filtered and already holds every
+enclosing restriction: a boolean folds its `filter` clauses and, when a
+`required` or `optional` clause selects inside that domain (kNN, directly or
+nested), its `prohibited` (must_not) clauses into the domain it hands its
+children (outer AND filters AND NOT prohibited). The folded domain then
+replaces the boolean's prohibited scorers as its required domain supplier, so
+each exclusion is materialized once, through the same filter cache uses as a
+filter clause.
+
+Which constraints reach a kNN is decided on the logical query, before Weight
+creation, by one effective-role projection that both normalization and
+membership keys use, so it never depends on score demand or on whether
+required-clause inlining applies. When a boolean has a domain consumer under
+`required` or `optional`, required leaves with an automatic uniform score
+profile (ranges, prefixes, automata, exists, geo, term sets including `any_of`)
+take the filter role, since they add no score. The projection also extracts,
+by reference, the necessary non-scoring constraints of booleans reached through
+chains of `required`/`filter` children (looking through boost, constant-score
+and force-prepare wrappers): their filter, prohibited, and promoted leaves.
+That makes eligibility closed under AND re-association. It never follows an
+optional group (even with min_match) or a prohibited branch, and never extracts
+a domain consumer; extracted exclusions stay prohibited. A nested copy is
+dropped only while its boolean keeps another required clause, so rank-only
+optionals never become requirements, and a retained copy shares the extracted
+one's query-owned filter use, which is request-owned when the shared cache
+rejects admission or is absent. Scoring siblings, including terms and
+constraints wrapped in `constant_score(...)`, intersect with the kNN's top-k
+afterwards. Required-clause inlining never moves a domain consumer to a
+different prepare stage.
+
+FAISS ids are segment-local vector value ranks, so the query path maps each
+returned value rank back through that segment's vector
 column metadata before liveDocs, filters, scoring, and multi-valued collapse.
 
 IndexReader opens and pins overlay files eagerly when it opens an index
 version, so cleanup can unlink old files without breaking existing readers.
 The FAISS index bytes are decoded lazily on first kNN use and then cached on
 the segment reader.
+
+Routing uses column and overlay metadata before loading FAISS or rank-liveness
+state. Single-valued eligibility counts are exact. Unfiltered multi-valued
+columns use upper bounds without a domain walk; IVF replaces their live-vector
+bound with the cached rank-liveness count. Filtered multi-valued counts sum
+value ranges for array domains or when the domain or its complement has at
+most 1024 docs. Larger bitset domains estimate vectors from eligible docs and
+average multiplicity. AUTO folds these domains in round one, obtaining the
+exact count before IVF sets selectivity and its stopping target. Cheap counts
+and rank-bitmap folds use the same doc-to-rank walk.
+
+`KnnPlanner` prices predicted work with one calibrated unit-cost table. Exact
+slots pay per scored dimension, per visited domain doc and per rank mapping.
+IVF slots pay per examined entry, with an extra term for PQ (its FAISS scanner
+tests the selector through a virtual call) and a branch-misprediction term
+proportional to `p(1-p)` for selector pass rate `p`, except on 1-bit RaBitQ, whose
+selector test does not branch; per codec score (PQ
+subcodes; RaBitQ one-bit and extra-bit scores, each a constant per code plus
+a term per dimension); per list setup; per coarse
+centroid dimension; per slot-round; and per terminal read plus per terminal
+dimension. RaBitQ re-quantizes the query residual for every list, so its list
+setup scales with dimensions; 1-bit and extended codes have separate unit costs
+for scoring and list setup, since only the former use `RaBitQScorer`. PQ list
+setup is zero for inner product and cosine. Under L2 it scales with subquantizers while the segment keeps FAISS's
+precomputed table; without it, FAISS computes a full distance table per list,
+priced as `2^bits * dims` distance dimensions with an unfitted seed equal to
+the exact-dimension cost. Interval terminal reads have a shared floor of
+`min(k, examined interval vectors)`, with dimensions scaled by the
+read-weighted average. Every query pays a request constant, and any query that
+runs IVF pays a second one. Units are nanoseconds divided by the cost of one exact
+dimension; counters expose the same units, and `KnnPlanner::Costs` records what
+they were fitted on.
+
+For a configuration of IVF slots, predicted coverage is the maximum of initial
+coverage, bounded fill and the remaining document-unit obligation, capped at
+one; explicit `nprobe` pins it to initial coverage. Each IVF slot's scan price
+is `coverage * A + B` plus a piecewise selector correction for resolving or
+folding the first round. Predicted rounds are one at initial coverage,
+otherwise `1 + ceil(log2(coverage / initial_coverage))`. The bounded terminal
+allowance is one shared pool capped by eligible vectors; interval terminal
+reads are a dimension-dependent fraction of examined vectors, fitted for
+independent filters (anti-correlated filters read far more, and completion
+bounds that error). Filter placement is assumed
+independent of centroid order, and group diversity is not predicted from doc
+counts. RaBitQ extra-bit survival is a fitted function of dimensions until a
+segment has scanned; completion then uses the observed rate.
+
+The planner compares all-IVF and all-exact with forward substitution sweeps
+from three seeds: all-IVF, every bounded segment exact, and every interval
+segment exact. The channel seeds handle the drop in bounded fill when the last
+bounded slot leaves. Only strict drops in total cost are accepted and ties
+retain IVF. Running sums, plus prefix sums over selector crossover fractions,
+keep the search O(segments log segments). Pinned effort is optimized exactly
+over the capped terminal terms. The adaptive search is a heuristic tested
+against exhaustive search, not a global optimizer. `exact:true` overrides
+routing. Exact slots contribute neither IVF fill nor its denominator.
+
+Predicted cost is not a latency or recall guarantee: filter correlation, cold
+pages and multiplicity skew are outside the model. `profile:true` reports
+per-segment choices, eligibility, modeled costs, reasons and executed work.
+`BM_VectorKnnFiltered` exposes AUTO, forced IVF and forced exact modes with the
+raw counters used for calibration.
+
+Filtered IVF round one chooses resolution or a rank-domain bitmap when
+`predicted_checks * (resolve_cost - bitmap_cost)` exceeds the fold cost;
+planning and execution share the rule. Dense single-valued bitset domains
+already are rank bitmaps and are borrowed without allocation. Other folds map
+doc IDs through forward column cursors: arrays walk members, bitsets the
+smaller of members and nonmembers, and multi-valued docs contribute their full
+vector ranges. Every deepen folds filtered domains, including interval-only
+breadth widening, and clears pooled ranks, so later scans use one bitmap probe
+without resolving IDs. Borrowed words are copied on the first pooled clear, and
+owned bitmaps are charged to the request memory tracker. The RaBitQ scan
+dispatches the selector kind once per scan and tests bitmaps inline; PQ uses
+FAISS's scanner and its selector interface.
+
+At each joined round boundary, the host previews the next allocation without
+advancing its cursors. If a slot's cumulative IVF cost plus its next-round cost
+exceeds its full-domain exact cost, the slot completes exactly. This is a cost
+rule, not a regret bound. Explicit probe pins disable completion, and idle
+slots never trigger it. Completion removes the slot from allocation,
+recomputes effort over the active IVF slots, and runs one exact top-k pass over
+the slot's full domain without pooled exclusions. Interval records and
+lower-bound witnesses stay valid. In document mode only the completed slot's
+approximate candidates are retracted: nominees never evict across slots, so the
+active pool continues and deepens only if it falls short. Group admission can
+evict another slot's members, so in group mode the active bounded pool starts
+a fresh epoch with covered lists rescanned and exclusions reopened. Profiles
+add the completion round, reason and costs; work counters include the
+abandoned IVF work and the exact pass.
 
 Internally, an `ivf.nprobe` request becomes a scan fraction
 `nprobe / sqrt(live_vector_count)` applied across the current per-segment
@@ -422,32 +706,114 @@ host-side knobs (`k`, `refine_candidates`, `exact`) stay at the top level.
 For per-segment IVF, Luxir ranks all segments' IVF lists by query-to-centroid
 distance, then probes the globally best lists until the requested scan
 fraction is reached. List cost is based on that list's live vector count
-divided by the field's live vector count. This handles uneven list sizes and
-avoids applying equal work to every segment. For an IVF segment with deletions
+divided by the live vector count of the IVF slots actually searched. Flat
+slots and empty filtered segments do not consume that budget. This handles
+uneven list sizes and avoids applying equal work to every segment. For an IVF segment with deletions
 the live count is exact: it rides along with the segment's cached
 rank-liveness bitmap, which is rebuilt per delete generation in time
 proportional to the deleted docs (for a dense single-valued field the bitmap
-simply borrows the liveDocs bits). Flat-scanned segments with deletions use a
-cheap upper bound instead (exact counting there would scan the field per
-query); the bound only errs toward slightly leaner initial effort, which
-auto-deepening recovers.
+simply borrows the liveDocs bits). Filtered flat-scanned segments with deletions use a
+cheap upper bound for their live count instead. It contributes only to the whole-index reference breadth; the IVF
+allocation denominator uses exact live counts.
+
+With default probes, the initial fraction expands by `s^(-1/4)`, where
+`s` is the eligible-vector fraction over the searched IVF slots. Default effort
+scans about `N^(-1/4)` of an index (`sqrt(N)` lists, `sqrt` of them probed), and
+the same rule applied to the `sN` eligible vectors gives the exponent. On SIFT
+1M and miracl 1M it keeps independent-filter recall at or above unfiltered
+recall at default effort; `s^(-1/2)` bought recall above that at about twice
+the latency for 10-30% filters. The fraction is floored by `min_scan_fraction` and capped
+at one. Explicit `nprobe` receives no selectivity expansion. All allocated lists
+are scanned before checking fill, even if exact slots already supply k units.
+Bounded document fill is capped by eligible docs in bounded IVF slots; document
+unit fill is capped by eligible docs across all slots. Default-probe queries also examine at least `P0 * eligibleVectors` selector-passing
+codes on newly scanned lists, where `P0` is the initial fraction. Depth rescans
+and exact slots do not contribute. This is the eligible yield expected from an
+independent filter at `P0`; unfiltered scans already satisfy it through coverage.
+It allows binomial sampling slack of `2 * sqrt(target)`, at most a quarter of the
+target, so a filter independent of the lists does not pay an extra round for noise.
+Exhaustion, a full candidate pool or explicit probe pins end widening even if
+obligations remain unmet.
+
+The host owns cumulative scan fractions and explicitly requests depth or breadth.
+For each unmet count obligation, it projects `covered * need / have * 1.25`, or
+`covered * 2` when yield is zero. The next target is the largest projection,
+floored at the next globally ranked list's fraction and capped at one. The
+allocator reports actual coverage, including whole-list overshoot. These remain
+effort heuristics: bounded selection and empirical interval pruning can miss
+neighbors even at full coverage.
+
+Scan tasks return work totals, reduced at each round barrier into per-segment
+query state: physical entries, selector passes (with new-list passes separate),
+PQ scores, RaBitQ one-bit and extra-bit scores, list setups, depth revisits,
+flat scores and domain visits. Terminal scoring adds its column reads after
+each read-stage barrier. These count scoring work, not physical page IO;
+allocator liveness probes are counted separately and priced as rank-bitmap
+work, including the next-list lookahead under deletes.
 
 Probed lists are always scanned in full. Entries within an IVF list are stored
 in insertion order, not relevance order, so a partial list scan would drop
-arbitrary candidates; `nprobe` (which selects lists by relevance) is the only
-work limiter.
+arbitrary candidates. `nprobe` selects lists; codec gates and terminal
+selection determine the work performed on their values.
 
-Candidates are unioned across deepen rounds using approximate scores for the
-widen decision. From the first deepen round on, already-pooled vectors are
-excluded from every engine's scan: the pooled set is folded into per-query
-copies of the segments' liveness bitmaps (all-ones where a segment has no
-deletions) and handed to the scanners as an eligibility filter, so each
-round's result heap is spent entirely on new candidates and each round
-requests only the projected shortfall rather than re-requesting the whole
-pool. The shared per-segment liveness cache itself is never modified by
-queries. Once widening finishes, the final candidate pool is rescanned from
-the stored column (exact over its encoding), sorted by exact score, and
-collapsed to one hit per document.
+Candidate selection has independent bounded, interval and exact channels.
+PQ defaults to `k + 24 + ceil(15 * k^0.8)`; explicit `refine_candidates`
+selects the bounded policy for every approximate codec. Default RaBitQ uses
+intervals for every bit width. Exact column slots supply distinct-unit top-k
+results outside the approximate quota.
+
+The bounded channel uses a shared R-th estimate floor. Its fresh DEPTH epochs
+exclude banked ranks and reset that floor. Its document budget, multiplicity
+inflation and group member caps apply only to bounded candidates. Interval
+selection is complete after traversing the selected lists, independent of
+retained count, and never requests DEPTH. BREADTH visits only newly allocated
+lists and preserves interval witnesses and retained identities. A mixed query
+must satisfy the bounded channel's own obligation; interval hits cannot fill
+its quota. The result contract reports bounded completion separately from
+remaining breadth. Insufficient distinct units can trigger more breadth:
+bounded Groups continue BREADTH when the document pool is full but holds
+fewer than k groups.
+
+For RaBitQ, the query-owned collector tracks each unit's best lower endpoint
+and the k-th highest of those endpoints. A unit is a (segment, document) pair
+or a canonical CollapsePlan group key, including missing-key policy. A value
+is retained only while its upper endpoint reaches both the global witness
+floor and its own unit's lower endpoint. Multiple values of one unit can
+remain competitive. PQ point estimates never witness the true k-th score.
+Exact column scores may witness it. Document units use a flat hash map from
+packed (segment, document) to reusable stable slots; only Groups copy and hash
+canonical CollapsePlan keys. Map, slot and key storage are request-accounted.
+
+One-bit uses its single estimate with `sigma1 * g_error * 1.9`. Multi-bit first
+tests the optimistic 1-bit endpoint with gate epsilon 1.9, then constructs the
+full-bit interval with `sigmaB * g_error * 1.9`. The gate uses the witness floor
+for intervals and the R-th estimate floor for bounded collection. For L2 the
+raw distance endpoints are mapped in reverse order through the score transform,
+with outward rounding and upper scores clamped to 1. Scans reject in distance
+space against a cached outward threshold, converting only when the floor
+changes. Only admitted records pay for score mapping and outward endpoints. Both constants are empirical confidence choices,
+validated on IP at 128 and 1024 dimensions; they are not containment guarantees.
+
+Terminal scoring starts with the best estimated value per unit, choosing k
+distinct units. All bounded candidates are mandatory in this stage too (bounded
+Groups nominations expand to their whole document). Exact scores are reused.
+Then `T = max(k-th exact seed score, pessimistic witness floor)` selects the
+remaining interval values by `upper >= T`. A value whose upper score is below
+its unit's best known exact score is also skipped. Both stages read in segment
+and value-rank order, with disjoint column reads and a shared exact-score cache.
+Final unit collapse and similarity filtering use exact scores, exact over the
+stored encoding.
+Before similarity filtering, a diagnostic reports an unsupported floor and
+its distinct-unit shortfall when fewer than k exact units reach the final
+witness floor; it changes no selection behavior and does not detect every
+invalid interval.
+
+There is no interval retention cap. `RequestMemResource` charges records,
+canonical unit keys, witness heaps, pending batches and terminal selection
+storage to the request's existing opt-in byte ceiling. Exceeding it throws
+`request_memory_exceeded`, including from scan tasks; cancellation and joining
+precede destruction of shared state. Bounded candidate limits and explicit
+probe pins remain separate policies.
 
 ### Late interaction (MaxSim)
 
@@ -460,8 +826,9 @@ sum. Like Elasticsearch's `rank_vectors`, Luxir scores it by brute force
 instead: each segment walks its doc-ordered value ranks, and for every
 eligible document batches the document's rows through the column's
 `VectorScorer` once per query vector, taking the max per query vector and
-summing in double. Segments run as parallel tasks into one bounded top-k
-under the same strict total order, so results are deterministic. The cost is
+summing in double. Segments run as parallel tasks, each into its own bounded
+top-k, merged under the same strict total order, so results are
+deterministic. The cost is
 `queries x vectors` kernel calls over the eligible set, which is meant for
 small collections or a candidate set narrowed by filters (the domain);
 commits build no overlay for such fields. Candidate generation from a
@@ -476,10 +843,22 @@ chunks sized by their actual vector counts, and each chunk (plus each
 column-scanned segment) is scanned as an independent task; the terminal
 column rescore runs one task per segment whose candidate bucket
 exceeds a small grain (smaller buckets, including the common small-`k`
-single-segment pool, fold inline on the calling thread). Task boundaries do
-not depend on the execution mode, and every bounded candidate cut uses a total
-order, so a parallel run returns bit-identical results to a serial run of the
-same query.
+single-segment pool, fold inline on the calling thread).
+
+All IVF chunks and segments share a bounded cut per fresh epoch and persistent
+interval witness state for the query. Task-local handlers batch admissions and
+canonical keys; group bounded handlers keep their local capped admission.
+Serialized updates publish monotone scalar floors. PQ uses its optimized
+kernel with floor refreshes between 256-code blocks. 1-bit RaBitQ scores a block
+and then admits its rows in order; extended RaBitQ uses its distance computer per
+code in the common traversal. Peak and terminal retained counts, seed and
+remaining reads, gate rejections and extra-bit evaluations accompany the
+selector-passing scan count in the benchmark stats seam.
+
+Task boundaries do not depend on execution mode, and bounded cuts use a total
+identity order. RaBitQ confidence pruning can nevertheless change work and rare
+approximate misses with scheduling, since the floor seen during a scan depends
+on which tasks have published results.
 
 ## What This Means for Users
 
@@ -490,5 +869,6 @@ same query.
 - Segments below the training threshold, and segments whose build failed,
   are searched exactly from the column. A failed build leaves no partial
   state.
-- Parallelism is purely a speed knob: results are bit-identical to serial
-  execution.
+- Exact results retain deterministic ordering across execution modes.
+  Approximate confidence pruning can produce different candidates as task
+  scheduling changes the shared floor.

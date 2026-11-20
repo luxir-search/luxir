@@ -38,7 +38,7 @@ namespace luxir {
 /// of the vector the payload decodes to (for INT8 the exact offset/scale
 /// reconstruction), followed by the encoding's payload above.  Scoring reads
 /// the norm instead of recomputing it per query: cosine over a column whose
-/// vectors are not unit length (raw f32, any f16 / int8) and int8 L2.  The
+/// vectors are not unit length (raw f32, any f16 / int8).  The
 /// prefix keeps f32 payloads 4-byte aligned relative to the row, travels with
 /// the row through merges (rows stay self-describing), and sits in the same
 /// cache line the scorer reads first.
@@ -90,27 +90,6 @@ inline int32_t dimsFromBytes(VectorEncoding e, int32_t bytes) {
     case VectorEncoding::F32:
     default: return bytes % (int32_t)sizeof(float) == 0 ? bytes / (int32_t)sizeof(float) : -1;
   }
-}
-
-/// Merge order: a merge of segments with different encodings writes the most
-/// precise one, so a merge never loses precision.  F16 and BF16 are not
-/// ordered (more significand vs more range), so together they merge to F32.
-inline int32_t precision(VectorEncoding e) {
-  switch (e) {
-    case VectorEncoding::BIT: return 0;
-    case VectorEncoding::INT8: return 1;
-    case VectorEncoding::BF16:
-    case VectorEncoding::F16: return 2;
-    case VectorEncoding::F32:
-    default: return 3;
-  }
-}
-
-/// The encoding a merge of an a-segment and a b-segment writes.
-inline VectorEncoding mergeEncoding(VectorEncoding a, VectorEncoding b) {
-  if (a == b) return a;
-  if (precision(a) == precision(b)) return VectorEncoding::F32;
-  return precision(a) > precision(b) ? a : b;
 }
 
 /// float32 -> bfloat16 bits, rounded to nearest even.  A finite value that
@@ -282,13 +261,10 @@ inline double payloadNormSq(VectorEncoding e, const char* in, int32_t dims) {
   }
 }
 
-/// Whether a field stores the norm prefix.  Cosine needs |x| unless the
-/// column holds f32 unit vectors (normalized on write, or trusted normalized);
-/// int8 L2 needs |x|^2 so its inner loop is a pure dot(q, codes).
-inline bool needsNorms(VectorEncoding e, bool cosine, bool l2, bool unitF32Column) {
-  if (e == VectorEncoding::BIT) return false;
-  if (cosine) return e != VectorEncoding::F32 || !unitF32Column;
-  return l2 && e == VectorEncoding::INT8;
+/// Whether a field stores the norm prefix: cosine needs |x| unless the
+/// column holds f32 unit vectors (normalized on write, or trusted normalized).
+inline bool needsNorms(VectorEncoding e, bool cosine, bool unitF32Column) {
+  return cosine && e != VectorEncoding::BIT && (e != VectorEncoding::F32 || !unitF32Column);
 }
 
 inline int32_t rowBytes(VectorEncoding e, int32_t dims, bool norms) {

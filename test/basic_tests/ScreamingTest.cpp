@@ -405,6 +405,26 @@ TEST_F(ScreamingTest, fixedRangeOr) {
   }
 }
 
+TEST_F(ScreamingTest, intersectionCardinalityAcrossBuckets) {
+  SStreamBuilder set;
+  std::vector<int32_t> members;
+  for (int doc = 0; doc < 4 * 65536; doc++) {
+    if ((doc / 65536 == 0 && doc % 97 == 0) || (doc / 65536 == 2 && doc % 3 != 0)
+        || doc == 3 * 65536 + 17) {
+      set.add(doc);
+      members.push_back(doc);
+    }
+  }
+  set.finishBuild();
+  for (int size : {0, 13, 65536, 2 * 65536 + 101, 4 * 65536 + 3}) {
+    screaming::RAMFixedBitSet bits(size);
+    for (int doc = 0; doc < size; doc += 7) bits.set(doc);
+    int expected = 0;
+    for (int doc : members) if (doc < size && bits.get(doc)) expected++;
+    EXPECT_EQ(expected, set.bitset->intersectionCardinality(bits));
+  }
+}
+
 TEST_F(ScreamingTest, debug) {
 }
 
@@ -599,6 +619,16 @@ TEST_F(ScreamingTest, randomSets) {
     // set.verifyIterator();
     set.verifyIteratorSkips();  // also round-trips select() against rank()
   }
+}
+
+TEST_F(ScreamingTest, advancePastLastBucketLeavesEnd) {
+  SStreamBuilder set;
+  set.add(7);
+  set.finishBuild();
+  screaming::BitSet::Iterator iter(*set.bitset);
+  EXPECT_EQ(7, iter.next());
+  EXPECT_EQ(screaming::BitSet::END, iter.advance(1 << 16));
+  EXPECT_EQ(screaming::BitSet::END, iter.val());
 }
 
 TEST_F(ScreamingTest, select) {

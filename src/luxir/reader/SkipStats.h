@@ -26,6 +26,11 @@ struct SkipStats {
   // Calls to TermsEnum::seek(), including unsuccessful seeks.
   static inline int64_t termDictionarySeeks = 0;
 
+  // Returned rows a row operation ran for, and scorers it planned for them
+  // (one per operation and segment run of a batch, not one per row).
+  static inline int64_t rowOperationRows = 0;
+  static inline int64_t rowOperationLeafPlans = 0;
+
   // Docs-block body decodes (full 128-doc blocks + the StreamVByte tail). This is
   // the real decode work; blocks_decoded(pruned) / blocks_decoded(exhaustive) is
   // the "% of blocks decoded vs total" headline.
@@ -33,6 +38,12 @@ struct SkipStats {
   // Documents pulled by collapsed bounded constant-score collection (added
   // per pull), and retained-group remap probes (per segment switch).
   static inline int64_t collapseDocsVisited = 0;
+  // Point reads of persisted child-to-owner columns, excluding family reuse.
+  static inline int64_t ownershipReverseReads = 0;
+  // Candidate-family boundary work, accumulated once per owner window.
+  static inline int64_t joinBoundaryPointFamilies = 0;
+  static inline int64_t joinBoundaryRuns = 0;
+  static inline int64_t joinCandidatesVisited = 0;
   static inline int64_t collapseRemapProbes = 0;
   // Full 128-value tfreq block decodes. StreamVByte tails are excluded because
   // their docs/freq streams have no independently skippable block boundary.
@@ -164,6 +175,9 @@ struct SkipStats {
   static inline int64_t conjDenseScoredFilterRejects = 0;
   static inline int64_t conjExactScoredBoundsBypasses = 0;
   static inline int64_t conjExactDirectApproxEngagements = 0;
+  // Verifiers a pull conjunction confirms inside its leading exact group
+  // (BooleanWeight sourceGroupVerifier), one per verifier per build.
+  static inline int64_t conjSourceGroupedVerifiers = 0;
   static inline int64_t conjDirectDenseEngagements = 0;
   static inline int64_t conjDisjGroupCountWindows = 0;
   static inline int64_t conjDisjGroupScoreWindows = 0;
@@ -202,6 +216,10 @@ struct SkipStats {
   static inline int64_t exactCountTopKProfitabilityRejects = 0;
   static inline int64_t exactCountTopKSparseFilterSinglePassRejects = 0;
   static inline int64_t exactCountTopKBulkFallbacks = 0;
+  // Bounded counts counted apart from ranking: segments whose count pass
+  // ran, and passes stopped by the limit before their segment's end.
+  static inline int64_t boundedCountSegments = 0;
+  static inline int64_t boundedCountStops = 0;
   static inline int64_t bulkBuiltThenRejected = 0;
   static inline int64_t bulkBuiltThenRejectedWrapperRoute = 0;
   static inline int64_t bulkBuiltThenRejectedMandOptTwoPhase = 0;
@@ -219,6 +237,7 @@ struct SkipStats {
   static inline int64_t conjPlanUnknownIslandNumericGeo = 0;
   static inline int64_t conjPlanUnknownIslandOther = 0;
   static inline int64_t multitermExpansions = 0;
+  static inline int64_t multitermUnionBuilds = 0;
   static inline int64_t sparseFilteredTopKReroutes = 0;
   static inline int64_t sparseFilteredTopKUnionReroutes = 0;
   static inline int64_t sparseFilteredTopKDensityRejects = 0;
@@ -234,6 +253,7 @@ struct SkipStats {
   static inline int64_t bulkDomainWindowsFed = 0;
   static inline int64_t constantPullDomainCollections = 0;
   static inline int64_t constantWindowCaptures = 0;
+  static inline int64_t constantLimitOnlyCollections = 0;
   static inline int64_t fieldSortBlocksSkipped = 0;
   static inline int64_t fieldSortCandidateActivations = 0;
   static inline int64_t fieldSortCandidateTerminations = 0;
@@ -332,12 +352,24 @@ struct SkipStats {
   static inline int64_t numericPredicateSparseVerifyArms = 0;
   static inline int64_t numericPredicateComplementArms = 0;
   static inline int64_t numericPredicatePointsArms = 0;
+  static inline int64_t numericPredicatePostingsArms = 0;
+  // Matching dictionary candidates examined, including the budget's rejecting term.
+  static inline int64_t numericPredicatePostingsTerms = 0;
   static inline int64_t numericPredicateZoneArms = 0;
   static inline int64_t numericPredicateScanArms = 0;
+  static inline int64_t numericPredicateClassifiedBlocks = 0;
+  static inline int64_t numericPredicateProofIndexes = 0;
   static inline int64_t rangeFacetPointsArms = 0;
+  // Range facet zones (blocks or leaves) counted whole, without a decode.
+  static inline int64_t rangeFacetZoneRuns = 0;
+  // Range facet zones added whole to sub-op bucket domains.
+  static inline int64_t rangeFacetZoneDomainRuns = 0;
   static inline int64_t geoBKDArms = 0;
   static inline int64_t geoScanArms = 0;
   static inline int64_t geoSparseVerifyArms = 0;
+  static inline int64_t rangeFieldBKDArms = 0;
+  static inline int64_t rangeFieldScanArms = 0;
+  static inline int64_t rangeFieldSparseVerifyArms = 0;
   // Codec skipBlock calls on landing-block traversal only: header-level
   // leaps (skipToBlock over whole blocks) bypass freq planes by byte length
   // without charging this counter, so it undercounts under jumped windows.
@@ -384,9 +416,14 @@ struct SkipStats {
   static inline std::array<int64_t, MAX_SWEEP_LEVELS> maxScoreCompactionKeptByLevel{};
 
   static void reset() {
+    rowOperationRows = rowOperationLeafPlans = 0;
     docBlocksDecoded = 0;
     termDictionarySeeks = 0;
     collapseDocsVisited = 0;
+    ownershipReverseReads = 0;
+    joinBoundaryPointFamilies = 0;
+    joinBoundaryRuns = 0;
+    joinCandidatesVisited = 0;
     collapseRemapProbes = 0;
     tfreqBlocksDecoded = 0;
     l0HeaderSteps = 0;
@@ -491,6 +528,7 @@ struct SkipStats {
     conjDenseScoredFilterRejects = 0;
     conjExactScoredBoundsBypasses = 0;
     conjExactDirectApproxEngagements = 0;
+    conjSourceGroupedVerifiers = 0;
     conjDirectDenseEngagements = 0;
     conjDisjGroupCountWindows = 0;
     conjDisjGroupScoreWindows = 0;
@@ -528,6 +566,8 @@ struct SkipStats {
     exactCountTopKProfitabilityRejects = 0;
     exactCountTopKSparseFilterSinglePassRejects = 0;
     exactCountTopKBulkFallbacks = 0;
+    boundedCountSegments = 0;
+    boundedCountStops = 0;
     bulkBuiltThenRejected = 0;
     bulkBuiltThenRejectedWrapperRoute = 0;
     bulkBuiltThenRejectedMandOptTwoPhase = 0;
@@ -545,6 +585,7 @@ struct SkipStats {
     conjPlanUnknownIslandNumericGeo = 0;
     conjPlanUnknownIslandOther = 0;
     multitermExpansions = 0;
+    multitermUnionBuilds = 0;
     sparseFilteredTopKReroutes = 0;
     sparseFilteredTopKUnionReroutes = 0;
     sparseFilteredTopKDensityRejects = 0;
@@ -560,6 +601,7 @@ struct SkipStats {
     bulkDomainWindowsFed = 0;
     constantPullDomainCollections = 0;
     constantWindowCaptures = 0;
+    constantLimitOnlyCollections = 0;
     fieldSortBlocksSkipped = 0;
     fieldSortCandidateActivations = 0;
     fieldSortCandidateTerminations = 0;
@@ -626,12 +668,21 @@ struct SkipStats {
     numericPredicateSparseVerifyArms = 0;
     numericPredicateComplementArms = 0;
     numericPredicatePointsArms = 0;
+    numericPredicatePostingsArms = 0;
+    numericPredicatePostingsTerms = 0;
     numericPredicateZoneArms = 0;
     numericPredicateScanArms = 0;
+    numericPredicateClassifiedBlocks = 0;
+    numericPredicateProofIndexes = 0;
     rangeFacetPointsArms = 0;
+    rangeFacetZoneRuns = 0;
+    rangeFacetZoneDomainRuns = 0;
     geoBKDArms = 0;
     geoScanArms = 0;
     geoSparseVerifyArms = 0;
+    rangeFieldBKDArms = 0;
+    rangeFieldScanArms = 0;
+    rangeFieldSparseVerifyArms = 0;
     docsOnlyFreqBlocksSkipped = 0;
     docsOnlyWordProbeAdvances = 0;
     scoredWordProbeAdvances = 0;

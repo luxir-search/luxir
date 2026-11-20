@@ -379,8 +379,8 @@ TEST_F(GrowingDistinctTupleTest, workerTupleIdsRemappedBothOrders) {
       flatdoc("id", "1", "key_s", "b", "key_i", INT64_MAX)}, UpdateMessage::COMMIT).success);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   CollapsePlan key(*reader, api::Collapse_::MissingPolicy::GROUP, false);
-  key.fields.push_back({"key_s", api::GroupComponent_::Type::STRING, reader->getOrdMap("key_s"), reader->field("key_s")});
-  key.fields.push_back({"key_i", api::GroupComponent_::Type::INT, {}, reader->field("key_i")});
+  key.fields.push_back({"key_s", api::GroupComponent_::Type::STRING, FieldType::Storage::TERMS, reader->getOrdMap("key_s"), reader->field("key_s")});
+  key.fields.push_back({"key_i", api::GroupComponent_::Type::INT, FieldType::Storage::INT64, {}, reader->field("key_i")});
   FacetGroupPlan plan(key);
   ASSERT_TRUE(plan.internTuples);
   CollapseKey first, second;
@@ -404,5 +404,14 @@ TEST_F(GrowingDistinctTupleTest, workerTupleIdsRemappedBothOrders) {
     EXPECT_EQ(2, merged->count(grid.floor(-10).key));
     EXPECT_EQ(2, merged->count(grid.floor(20).key));
     EXPECT_EQ(2, merged->missing());
+  }
+}
+
+TEST(GrowingDistinctFacetTest, nanosecondCellsAtReservedExtrema) {
+  auto grid = Grid::fixed(FieldType::DATE, 5, 0, TimeZone::utc(), DateUnit::NANOS);
+  for (int64_t base : {INT64_MIN + 1, INT64_MAX - 8}) {
+    std::vector<int64_t> values;
+    for (int i = 0; i < 8; i++) values.push_back(base + i);
+    randomized(grid, values);
   }
 }

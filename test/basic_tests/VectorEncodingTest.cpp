@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstring>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -57,8 +58,8 @@ struct Fields {
   api::VectorEncoding encoding = api::VectorEncoding::F32;
   bool keepOriginal = false;
   bool multi = false;
+  std::optional<api::VectorAnnDef> ann = std::nullopt;
   bool raw = false;  // cosine with normalize_on_write off
-  std::optional<api::VectorAnnDef> ann;
 };
 
 // ref_v is the f32 reference; enc_v stores the same values in the encoding.
@@ -70,7 +71,7 @@ void installFields(Collection& col, const Fields& f) {
     def.type = api::FieldDef::FieldClass::VECTOR;
     def.metric = f.metric;
     def.encoding = encoding;
-    def.multi = f.multi;
+    if (f.multi) def.multi = api::FieldDef::MultiMode::ARRAY;
     if (f.raw) def.normalize_on_write = false;
     if (encoding == f.encoding) def.keep_original = f.keepOriginal;
     if (f.ann) {
@@ -93,7 +94,7 @@ std::vector<std::string> knnIds(std::string_view field, int32_t k, bool exact = 
                                 int32_t refine = 0) {
   auto* req = LocalReq::create(LuxirTest::luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  cur.getScores().getNumber().fields({"id"});
+  cur.getScores().countLimit().fields({"id"});
   cur.rawQuery() = qb::knn(cur.mr(), field, QUERY, k, /*nprobe=*/0, exact, refine);
   req->execute();
   EXPECT_TRUE(req->ok()) << req->errorMsg();
@@ -122,7 +123,7 @@ std::vector<std::pair<std::string, float>> knnHits(std::string_view field, int32
                                                    int32_t refine, bool parallel) {
   auto* req = LocalReq::create(LuxirTest::luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  cur.getScores().getNumber().fields({"id"});
+  cur.getScores().countLimit().fields({"id"});
   cur.rawQuery() = qb::knn(cur.mr(), field, QUERY, k, /*nprobe=*/0, exact, refine);
   req->execute(parallel);
   return scoredHits(req);
@@ -221,9 +222,6 @@ TEST_F(VectorEncodingTest, codecRoundTrip) {
   EXPECT_EQ((Vec{0, 1, 1, 0, 1, 0, 1, 1}), out);
   EXPECT_EQ(1, vcodec::bytesPerVector(VectorEncoding::BIT, DIMS));
   EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::BIT, 1));
-
-  EXPECT_EQ(VectorEncoding::F32, vcodec::mergeEncoding(VectorEncoding::F16, VectorEncoding::BF16));
-  EXPECT_EQ(VectorEncoding::BF16, vcodec::mergeEncoding(VectorEncoding::INT8, VectorEncoding::BF16));
 }
 
 // The int8 decomposition (no decode buffer) agrees with scoring the decoded
@@ -245,6 +243,20 @@ TEST_F(VectorEncodingTest, int8ScorerMatchesDecodedScore) {
   }
 }
 
+// Large offsets must not degrade int8 L2 scoring (no decomposition cancellation).
+TEST_F(VectorEncodingTest, int8L2LargeOffset) {
+  Vec v = docVec(3);
+  for (auto& x : v) x += 1000.0f;
+  std::vector<char> row((size_t)vcodec::bytesPerVector(VectorEncoding::INT8, DIMS));
+  vcodec::encode(VectorEncoding::INT8, v.data(), DIMS, row.data());
+  Vec decoded(DIMS), query = QUERY;
+  for (auto& x : query) x += 1000.0f;
+  vcodec::decode(VectorEncoding::INT8, row.data(), DIMS, decoded.data());
+  VectorScorer q(query.data(), DIMS, (int32_t)api::VectorMetric::L2, true, VectorEncoding::INT8, false);
+  VectorScorer f(query.data(), DIMS, (int32_t)api::VectorMetric::L2, true, VectorEncoding::F32, false);
+  EXPECT_FLOAT_EQ(f.score((const char*)decoded.data()), q.score(row.data()));
+}
+
 // Each encoding is recorded per segment and reads back within its precision.
 TEST_F(VectorEncodingTest, storedRoundTripPerEncoding) {
   for (auto encoding : {api::VectorEncoding::F32, api::VectorEncoding::F16, api::VectorEncoding::INT8}) {
@@ -262,10 +274,9 @@ TEST_F(VectorEncodingTest, storedRoundTripPerEncoding) {
     VectorReader vr(seg.postingsReader(), fi);
     EXPECT_EQ((VectorEncoding)encoding, vr.encoding());
     EXPECT_EQ(DIMS, vr.dims());
-    // L2: only int8 stores the norm prefix.
-    bool norms = encoding == api::VectorEncoding::INT8;
-    EXPECT_EQ(norms, vr.hasNorms());
-    EXPECT_EQ(vcodec::rowBytes((VectorEncoding)encoding, DIMS, norms), vr.valueBytes());
+    // L2 stores no norm prefix (int8 L2 takes the difference directly).
+    EXPECT_FALSE(vr.hasNorms());
+    EXPECT_EQ(vcodec::bytesPerVector((VectorEncoding)encoding, DIMS), vr.valueBytes());
     Vec out(DIMS);
     vr.decodeAtRank(0, out.data());
     Vec expected = docVec(0);
@@ -311,14 +322,13 @@ TEST_F(VectorEncodingTest, mergeCopiesEncodedBytes) {
   EXPECT_EQ(idsBefore, knnIds("enc_v", 10));
 }
 
-// A schema change between segments: the merge writes the more precise
-// encoding and transcodes only the other input.
-TEST_F(VectorEncodingTest, mixedEncodingMergeKeepsPrecision) {
+// A schema change between segments: the merge converges to the schema's
+// current encoding, transcoding the older input.
+TEST_F(VectorEncodingTest, mixedEncodingMergeUsesSchemaEncoding) {
   CollectionHelper h("main");
   installFields(h.collection(), {.encoding = api::VectorEncoding::F16});
   indexDocs(h, 0, 15);
   h.commit();
-  auto f16Rows = rows(h, "enc_v");
   installFields(h.collection(), {.encoding = api::VectorEncoding::INT8});
   indexDocs(h, 15, 30);
   h.commit();
@@ -327,10 +337,35 @@ TEST_F(VectorEncodingTest, mixedEncodingMergeKeepsPrecision) {
 
   VectorEncoding encoding;
   auto merged = rows(h, "enc_v", &encoding);
-  EXPECT_EQ(VectorEncoding::F16, encoding);
+  EXPECT_EQ(VectorEncoding::INT8, encoding);
   EXPECT_EQ(30u, merged.size());
-  for (const auto& row : f16Rows) EXPECT_TRUE(std::ranges::binary_search(merged, row));
   EXPECT_EQ(knnIds("ref_v", 10), knnIds("enc_v", 10));
+}
+
+// Promoting quantized cosine rows to f32 in a merge restores unit length.
+TEST_F(VectorEncodingTest, promotionToF32RenormalizesCosine) {
+  CollectionHelper h("main");
+  installFields(h.collection(), {.metric = api::VectorMetric::COSINE, .encoding = api::VectorEncoding::INT8});
+  indexDocs(h, 0, 15);
+  h.commit();
+  installFields(h.collection(), {.metric = api::VectorMetric::COSINE, .encoding = api::VectorEncoding::F32});
+  indexDocs(h, 15, 30);
+  h.commit();
+  h.getIndexWriter()->mergeSegments();
+  h.commit();
+
+  VectorEncoding encoding;
+  auto merged = rows(h, "enc_v", &encoding);
+  EXPECT_EQ(VectorEncoding::F32, encoding);
+  for (const auto& row : merged) {
+    float norm = 0;
+    for (int32_t j = 0; j < DIMS; j++) {
+      float x;
+      std::memcpy(&x, row.data() + j * sizeof(float), sizeof(float));
+      norm += x * x;
+    }
+    EXPECT_NEAR(1.0f, norm, 1e-5);
+  }
 }
 
 // keep_original stores the submitted floats (before cosine normalization) in
@@ -562,8 +597,8 @@ TEST_F(VectorEncodingTest, bitVectorsScoreByHamming) {
   reject(api::VectorMetric::HAMMING, std::nullopt, 12);
 }
 
-// f16 and bf16 trade significand for range, so merging the two writes f32.
-TEST_F(VectorEncodingTest, f16AndBf16MergeToF32) {
+// An f16 segment merged after a switch to bf16 converges to bf16.
+TEST_F(VectorEncodingTest, f16MergesIntoBf16) {
   CollectionHelper h("main");
   installFields(h.collection(), {.encoding = api::VectorEncoding::F16});
   indexDocs(h, 0, 15);
@@ -576,7 +611,7 @@ TEST_F(VectorEncodingTest, f16AndBf16MergeToF32) {
   h.commit();
   VectorEncoding encoding;
   EXPECT_EQ(30u, rows(h, "enc_v", &encoding).size());
-  EXPECT_EQ(VectorEncoding::F32, encoding);
+  EXPECT_EQ(VectorEncoding::BF16, encoding);
   EXPECT_EQ(before, knnIds("enc_v", 10));
 }
 
@@ -659,8 +694,8 @@ TEST_F(VectorEncodingTest, parallelMatchesSerialPerEncoding) {
     for (auto metric : {api::VectorMetric::L2, api::VectorMetric::COSINE}) {
       CollectionHelper h("main");
       h.clear();
-      installFields(h.collection(), {.metric = metric, .encoding = encoding, .raw = true,
-                                     .ann = smallPqAnn()});
+      installFields(h.collection(), {.metric = metric, .encoding = encoding, .ann = smallPqAnn(),
+                                     .raw = true});
       for (int seg = 0; seg < 3; seg++) {
         for (int i = 0; i < 160; i++) {
           Vec v = docVec(i % 30);

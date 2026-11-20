@@ -17,7 +17,7 @@ namespace luxir {
 // either the live child Weight or its PreparedWeight at scorer creation time.
 class ConstantScoreQuery final : public luxir::Query {
   Query* child;
-  float constantScore;
+  ScoreProfile profile;
 
   // setMinCompetitiveScore is not forwarded to the child: it was built
   // scoreless, so the wrapper owns all score semantics. The exhaustion
@@ -95,6 +95,11 @@ class ConstantScoreQuery final : public luxir::Query {
     float constantScore;
     bool needsScores;
 
+    static Query::PlanContext childContext(Query::PlanContext context) {
+      context.membershipConsumption = Query::MembershipConsumption::WINDOWS;
+      return context;
+    }
+
     static Query::ScorerShape wrappedShape(
         const Query::ScorerShape& child) {
       return {
@@ -152,24 +157,24 @@ class ConstantScoreQuery final : public luxir::Query {
 
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
-      return wrappedShape(childSupplier->describeScorer(buildContext));
+      return wrappedShape(childSupplier->describeScorer(childContext(buildContext)));
     }
 
     Query::UnresolvedSupplierCause unresolvedScorerCause(
         const Query::PlanContext& buildContext) const override {
-      return childSupplier->unresolvedScorerCause(buildContext);
+      return childSupplier->unresolvedScorerCause(childContext(buildContext));
     }
 
     bool fillExpansionMemo(
         const Query::PlanContext& buildContext) override {
-      return childSupplier->fillExpansionMemo(buildContext);
+      return childSupplier->fillExpansionMemo(childContext(buildContext));
     }
 
     Query::ScorerPlan* resolve(
         MemPool& planPool,
         const Query::PlanContext& planContext) override {
       Query::ScorerPlan* childPlan =
-          childSupplier->resolve(planPool, planContext);
+          childSupplier->resolve(planPool, childContext(planContext));
       assert(childPlan != nullptr);
       return planPool.make<Plan>(
           *this, planContext, wrappedShape(childPlan->shape()),
@@ -195,8 +200,13 @@ class ConstantScoreQuery final : public luxir::Query {
 
 public:
   ConstantScoreQuery(Query* child, float constantScore = 1.0f)
+    : ConstantScoreQuery(child, ScoreProfile::explicitUniform(constantScore)) {}
+
+  ConstantScoreQuery(Query* child, ScoreProfile profile)
     : Query(QueryKind::CONSTANT_SCORE), child(child),
-      constantScore(constantScore) {}
+      profile(profile) {
+    assert(profile.kind != ScoreProfile::Kind::VARIABLE);
+  }
 
   bool recoverableAsPredicate() const noexcept override {
     return child->recoverableAsPredicate();
@@ -204,19 +214,22 @@ public:
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const ConstantScoreQuery&>(other);
-    return std::bit_cast<uint32_t>(constantScore)
-            == std::bit_cast<uint32_t>(rhs.constantScore)
+    return profile.kind == rhs.profile.kind
+        && std::bit_cast<uint32_t>(profile.value)
+            == std::bit_cast<uint32_t>(rhs.profile.value)
         && child->equals(*rhs.child);
   }
 
   uint64_t hashImpl() const override {
     uint64_t value = mixHash(
-        Query::hashImpl(), std::bit_cast<uint32_t>(constantScore));
+        Query::hashImpl(), std::bit_cast<uint32_t>(profile.value));
+    value = mixHash(value, (uint8_t) profile.kind);
     return mixHash(value, child->hash());
   }
 
   Query* getChild() const { return child; }
-  float getConstantScore() const { return constantScore; }
+  float getConstantScore() const { return profile.value; }
+  ScoreProfile getScoreProfile() const { return profile; }
   FieldSortConjunction fieldSortConjunction(
       PlanningContext& context) const override {
     return child->fieldSortConjunction(context);
@@ -227,10 +240,10 @@ public:
   }
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
-    if (!std::isfinite(constantScore)) {
+    if (!std::isfinite(profile.value)) {
       throw std::runtime_error("constant score must be finite");
     }
-    checkedBoostProduct(multiplier, constantScore);
+    checkedBoostProduct(multiplier, profile.value);
     child->validateLogical(context, 1.0f);
   }
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
@@ -239,6 +252,8 @@ public:
   }
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
+
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
 
   class Weight final : public Query::Weight {
     Query::Weight* childWeight = nullptr;
@@ -289,11 +304,12 @@ public:
   public:
     Weight(Context& context, ConstantScoreQuery& query, int32_t flags, float multiplier)
       : Query::Weight(context, query, flags),
-        constantScore(constantWhenScored(flags, multiplier, query.constantScore)) {
+        constantScore(constantWhenScored(flags, multiplier, query.getConstantScore())) {
       // The child constrains matches; this wrapper replaces its score.
       childWeight = query.child->createWeight(context, flags & ~NEED_SCORES, 1.0f);
       // The wrapper is constant-scoring; prepare still follows the child.
-      traits |= IS_CONSTANT_SCORING | (childWeight->getFlags() & NEEDS_PREPARE);
+      traits |= IS_CONSTANT_SCORING
+          | (childWeight->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN));
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
@@ -333,6 +349,7 @@ public:
         IndexReader::Segment& segment, DocSet* domain) override {
       return childWeight->countShortcut(segment, domain);
     }
+
   };
 };
 

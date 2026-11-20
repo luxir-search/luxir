@@ -2,18 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <future>
 #include <iostream>
+#include <latch>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <variant>
+#include <pthread.h>
 #include <gtest/gtest.h>
+#include "luxir/util/Signal.h"
 #include "test/CollectionHelper.h"
 #include "test/GrpcClient.h"
 #include "test/GrpcLuxirTest.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/TestUtils.h"
+#include "test/TaskSpawnCounter.h"
+#include "luxir/server/JsonResponse.h"
 #include "luxir/server/GRPCServer.h"
 
 using namespace luxir;
@@ -125,6 +134,8 @@ TEST_F(GrpcSearchTest, multiBatchStreaming) {
     responses++;
     EXPECT_FALSE(sawLast);  // nothing after the first response without more
     sawLast = !response.msg.more;
+    // took_us rides on the final response only.
+    EXPECT_EQ(sawLast, response.msg.took_us > 0);
     auto& rsp = *response.msg.ops.at("q");
     auto& docList = std::get<luxir::api::DocList>(rsp.kind);
     EXPECT_EQ(response.msg.more, docList.more);
@@ -142,55 +153,63 @@ TEST_F(GrpcSearchTest, multiBatchStreaming) {
 // server-side buffering.  A private server with a tiny stream buffer forces
 // the emitter to pause (observable via streamPauseCount) while the client
 // withholds reads; draining the stream resumes it and every doc arrives.
-TEST_F(GrpcSearchTest, backpressurePausesEmitter) {
+TEST_F(GrpcSearchTest, adaptiveZeroMatchesSerialAfterBackpressure) {
+  FanoutGrainGuard grain(1);
   LuxirTest::clearCollection("grpc_bp");
   CollectionHelper ch("grpc_bp");
+  ch.getIndexWriter()->mergePolicy->setMergeFactor(100);
   std::string pad(400, 'x');
-  std::vector<Doc> docs;
-  for (int i = 0; i < 1000; i++) {
-    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad));
+  for (int seg = 0; seg < 5; seg++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 200; i++) {
+      docs.push_back(flatdoc("id", "bp" + std::to_string(seg * 200 + i), "pad_s", pad,
+          "body_w", i % 3 ? "alpha beta" : "alpha alpha beta"));
+    }
+    ASSERT_TRUE(ch.indexAll(docs, UpdateMessage::COMMIT).success);
   }
-  ASSERT_TRUE(ch.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_EQ(5u, ch.getIndexWriter()->snapshots.readers.getReader()->segments().size());
 
   GRPCServer server(*luxirNode, 2, 0, /*streamBufferBytes=*/4096);
   std::thread serverThread([&] { server.run(); });
+  auto stop = scope_guard([&] { server.shutdown(); serverThread.join(); });
   ASSERT_TRUE(server.waitForStart());
   auto channel = grpc::CreateChannel("localhost:" + std::to_string(server.getPort()),
                                      grpc::InsecureChannelCredentials());
-
-  int64_t pausesBefore = streamPauseCount.load();
-
-  auto lreq = localReq(luxirNode->getSearchEngine());
-  lreq->collection("grpc_bp").topDocs("q").allQuery()
-      .fields({"id", "pad_s"}).batchSize(100).limit(-1);
-
-  grpc::ClientContext context;
-  HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
+  std::vector<std::string> serial;
+  for (int parallel : {-2, 0}) {
+    auto lreq = localReq(luxirNode->getSearchEngine());
+    lreq->collection("grpc_bp").topDocs("q").matchQuery("body_w", "alpha beta")
+        .getScores().fields({"id", "pad_s"}).batchSize(50).limit(-1);
+    lreq->rawRequest().max_parallel = parallel;
+    grpc::ClientContext context;
+    HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
       channel.get(), rpc::Search, &context);
-  ASSERT_TRUE(stream.Write(lreq->proto));
-  ASSERT_TRUE(stream.WritesDone());
+    int64_t pausesBefore = streamPauseCount.load();
+    ASSERT_TRUE(stream.Write(lreq->proto));
+    ASSERT_TRUE(stream.WritesDone());
+    bool paused = false;
+    for (int i = 0; i < 400 && !paused; i++) {
+      paused = streamPauseCount.load() > pausesBefore;
+      if (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    EXPECT_TRUE(paused);
 
-  // Withhold reads until the transport backs up and the emitter parks.
-  bool paused = false;
-  for (int i = 0; i < 400 && !paused; i++) {
-    paused = streamPauseCount.load() > pausesBefore;
-    if (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    int64_t totalDocs = 0;
+    std::vector<std::string> rows;
+    Reply<luxir::api::SearchResponse> response;
+    while (stream.Read(&response)) {
+      auto& docList = std::get<luxir::api::DocList>(response.msg.ops.at("q")->kind);
+      EXPECT_EQ(totalDocs, docList.offset);
+      totalDocs += docList.row_count;
+      auto proto = response.msg;
+      proto.took_us = 0;
+      rows.push_back(renderSearchResponseBody(proto));
+    }
+    ASSERT_TRUE(stream.Finish().ok());
+    EXPECT_EQ(1000, totalDocs);
+    if (parallel == -2) serial = std::move(rows);
+    else EXPECT_EQ(serial, rows);
   }
-  EXPECT_TRUE(paused);
-
-  int64_t totalDocs = 0;
-  Reply<luxir::api::SearchResponse> response;
-  while (stream.Read(&response)) {
-    auto& rsp = *response.msg.ops.at("q");
-    auto& docList = std::get<luxir::api::DocList>(rsp.kind);
-    EXPECT_EQ(totalDocs, docList.offset);
-    totalDocs += docList.row_count;
-  }
-  ASSERT_TRUE(stream.Finish().ok());
-  EXPECT_EQ(1000, totalDocs);
-
-  server.shutdown();
-  serverThread.join();
 }
 
 // Doc-line framing is an HTTP/NDJSON concept; gRPC rejects it explicitly
@@ -298,4 +317,156 @@ TEST_F(GrpcSearchTest, disconnectWhilePausedCancelsEmitter) {
 
   server.shutdown();  // hangs if the paused request was stranded
   serverThread.join();
+}
+
+namespace {
+
+// Holds every search that reaches searchRootChildStart until `expected` of
+// them are executing at once, recording the names of the threads they ran on
+// and how many gave up waiting for the others.
+struct SearchOverlap {
+  std::mutex mutex;
+  std::condition_variable cv;
+  int expected;
+  int entered = 0;
+  int timedOut = 0;
+  std::vector<std::string> threadNames;
+
+  explicit SearchOverlap(int expected) : expected(expected) {
+    Signal::listen("searchRootChildStart", [this](void*, void*, void*) -> void* {
+      char name[16] = {};
+      pthread_getname_np(pthread_self(), name, sizeof(name));
+      std::unique_lock lock(mutex);
+      threadNames.emplace_back(name);
+      entered++;
+      cv.notify_all();
+      if (!cv.wait_for(lock, std::chrono::seconds(10), [this] { return entered >= this->expected; })) {
+        timedOut++;
+      }
+      return nullptr;
+    });
+  }
+  ~SearchOverlap() { Signal::unlisten("searchRootChildStart"); }
+};
+
+grpc::Status searchToCompletion(grpc::Channel& channel, const luxir::api::SearchRequest& request,
+                                grpc::ClientContext& context) {
+  HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
+      &channel, rpc::Search, &context);
+  if (stream.Write(request)) stream.WritesDone();
+  Reply<luxir::api::SearchResponse> response;
+  while (stream.Read(&response)) {}
+  return stream.Finish();
+}
+
+} // namespace
+
+// One connection lands its calls on one completion queue.  Searches must not
+// execute on it, or concurrent calls on a connection run one at a time: here
+// every search on the single channel to a one-thread server must be executing
+// at once, each on a task-arena worker.
+TEST_F(GrpcSearchTest, concurrentSearchesOnOneChannelRunInParallel) {
+  const int n = std::min(4, luxirNode->getWorkers());
+  if (n < 2) GTEST_SKIP() << "needs at least two task-arena workers";
+  CollectionHelper ch("grpc_overlap");
+  ch.index(flatdoc("id", "1"), UpdateMessage::COMMIT);
+
+  GRPCServer server(*luxirNode, 1, 0);
+  std::thread serverThread([&] { server.run(); });
+  ASSERT_TRUE(server.waitForStart());
+  auto channel = grpc::CreateChannel("localhost:" + std::to_string(server.getPort()),
+                                     grpc::InsecureChannelCredentials());
+
+  std::vector<grpc::Status> statuses(n);
+  {
+    SearchOverlap overlap(n);
+    std::vector<std::thread> clients;
+    for (int i = 0; i < n; i++) {
+      clients.emplace_back([&, i] {
+        auto lreq = localReq(luxirNode->getSearchEngine());
+        lreq->collection("grpc_overlap").topDocs("q").allQuery();
+        lreq->rawRequest().max_parallel = i % 2;  // the default and the serial-on-arena lane
+        grpc::ClientContext context;
+        statuses[i] = searchToCompletion(*channel, lreq->proto, context);
+      });
+    }
+    for (auto& client : clients) client.join();
+    EXPECT_EQ(n, overlap.entered);
+    EXPECT_EQ(0, overlap.timedOut);
+    for (const auto& name : overlap.threadNames) EXPECT_EQ(0u, name.rfind("luxir_tbb_", 0)) << name;
+  }
+  for (const auto& status : statuses) EXPECT_TRUE(status.ok()) << status.error_message();
+
+  server.shutdown();
+  serverThread.join();
+}
+
+// A deadline that expires while the search runs on a worker completes the
+// call once, as DEADLINE_EXCEEDED; the worker's late reply is dropped and the
+// call is still released (a stranded call hangs server.shutdown()).
+TEST_F(GrpcSearchTest, deadlineWhileSearchRunsOnWorker) {
+  CollectionHelper ch("grpc_deadline");
+  ch.index(flatdoc("id", "1"), UpdateMessage::COMMIT);
+
+  GRPCServer server(*luxirNode, 1, 0);
+  std::thread serverThread([&] { server.run(); });
+  ASSERT_TRUE(server.waitForStart());
+  auto channel = grpc::CreateChannel("localhost:" + std::to_string(server.getPort()),
+                                     grpc::InsecureChannelCredentials());
+
+  // One-shot: only the abandoned search is held, and the hook stays installed
+  // until the server is down (removal does not synchronize with a callback).
+  std::atomic<bool> held{false};
+  std::promise<void> started;
+  auto startedFuture = started.get_future();
+  std::latch release(1);
+  Signal::listen("searchRootChildStart", [&](void*, void*, void*) -> void* {
+    if (!held.exchange(true)) {
+      started.set_value();
+      release.wait();
+    }
+    return nullptr;
+  });
+  auto lreq = localReq(luxirNode->getSearchEngine());
+  lreq->collection("grpc_deadline").topDocs("q").allQuery();
+  std::thread searcher([&] {
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(300));
+    auto status = searchToCompletion(*channel, lreq->proto, context);
+    EXPECT_EQ(grpc::StatusCode::DEADLINE_EXCEEDED, status.error_code());
+    release.count_down();
+  });
+  searcher.join();
+  EXPECT_EQ(std::future_status::ready, startedFuture.wait_for(std::chrono::seconds(10)));
+
+  // The channel still serves searches after the abandoned call.
+  grpc::ClientContext context;
+  EXPECT_TRUE(searchToCompletion(*channel, lreq->proto, context).ok());
+
+  server.shutdown();
+  serverThread.join();
+  Signal::unlisten("searchRootChildStart");
+}
+
+TEST_F(GrpcSearchTest, collectionRenameSwapUnary) {
+  auto a = luxirNode->createCollection("grpc_rename_a"), b = luxirNode->createCollection("grpc_rename_b");
+  api::RenameCollectionRequest rename{"grpc_rename_a", "grpc_renamed", {}};
+  Reply<api::RenameCollectionResponse> renamed;
+  grpc::ClientContext renameContext;
+  auto result = hppUnaryCall(channel.get(), rpc::RenameCollection, &renameContext, rename, &renamed);
+  ASSERT_TRUE(result.ok()) << result.error_message();
+  EXPECT_EQ("grpc_renamed", renamed.msg.to);
+  api::SwapCollectionsRequest swap{"grpc_renamed", "grpc_rename_b", {}};
+  Reply<api::SwapCollectionsResponse> swapped;
+  grpc::ClientContext swapContext;
+  result = hppUnaryCall(channel.get(), rpc::SwapCollections, &swapContext, swap, &swapped);
+  ASSERT_TRUE(result.ok()) << result.error_message();
+  EXPECT_EQ(a, luxirNode->getCollection("grpc_rename_b")); EXPECT_EQ(b, luxirNode->getCollection("grpc_renamed"));
+  rename = {"grpc_rename_b", "grpc_renamed", {}};
+  grpc::ClientContext duplicate;
+  EXPECT_EQ(grpc::StatusCode::ALREADY_EXISTS, hppUnaryCall(channel.get(), rpc::RenameCollection, &duplicate, rename, &renamed).error_code());
+  swap.b = "grpc_missing";
+  grpc::ClientContext missing;
+  EXPECT_EQ(grpc::StatusCode::NOT_FOUND, hppUnaryCall(channel.get(), rpc::SwapCollections, &missing, swap, &swapped).error_code());
+  luxirNode->deleteCollection("grpc_rename_b"); luxirNode->deleteCollection("grpc_renamed");
 }

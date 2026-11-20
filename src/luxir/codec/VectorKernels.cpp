@@ -40,24 +40,33 @@ using Vec = __m256;
 
 struct LoadF32 {
   static constexpr int32_t BYTES = 4;
-  static Vec load(const char* p) { return _mm256_loadu_ps((const float*)p); }
+  Vec load(const char* p) const { return _mm256_loadu_ps((const float*)p); }
 };
 struct LoadF16 {
   static constexpr int32_t BYTES = 2;
-  static Vec load(const char* p) { return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)p)); }
+  Vec load(const char* p) const { return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)p)); }
 };
 struct LoadBF16 {
   static constexpr int32_t BYTES = 2;
-  static Vec load(const char* p) {
+  Vec load(const char* p) const {
     __m256i wide = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)p));
     return _mm256_castsi256_ps(_mm256_slli_epi32(wide, 16));
   }
 };
 struct LoadU8 {
   static constexpr int32_t BYTES = 1;
-  static Vec load(const char* p) {
+  Vec load(const char* p) const {
     return _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)p)));
   }
+};
+
+// An int8 row decoded in registers: offset + scale * code, fused the way the
+// compiler contracts vcodec::decode, so it matches the decoded floats.
+struct LoadU8Affine {
+  static constexpr int32_t BYTES = 1;
+  Vec offset, scale;
+  LoadU8Affine(float o = 0.0f, float s = 0.0f) : offset(_mm256_set1_ps(o)), scale(_mm256_set1_ps(s)) {}
+  Vec load(const char* p) const { return _mm256_fmadd_ps(scale, LoadU8{}.load(p), offset); }
 };
 
 inline Vec zero() { return _mm256_setzero_ps(); }
@@ -87,28 +96,35 @@ using Vec = float32x4_t;
 
 struct LoadF32 {
   static constexpr int32_t BYTES = 4;
-  static Vec load(const char* p) { return vreinterpretq_f32_u8(vld1q_u8((const uint8_t*)p)); }
+  Vec load(const char* p) const { return vreinterpretq_f32_u8(vld1q_u8((const uint8_t*)p)); }
 };
 struct LoadF16 {
   static constexpr int32_t BYTES = 2;
-  static Vec load(const char* p) {
+  Vec load(const char* p) const {
     return vcvt_f32_f16(vreinterpret_f16_u8(vld1_u8((const uint8_t*)p)));
   }
 };
 struct LoadBF16 {
   static constexpr int32_t BYTES = 2;
-  static Vec load(const char* p) {
+  Vec load(const char* p) const {
     return vreinterpretq_f32_u32(vshll_n_u16(vreinterpret_u16_u8(vld1_u8((const uint8_t*)p)), 16));
   }
 };
 struct LoadU8 {
   static constexpr int32_t BYTES = 1;
-  static Vec load(const char* p) {
+  Vec load(const char* p) const {
     uint32_t bits;
     std::memcpy(&bits, p, sizeof(bits));
     uint16x8_t wide = vmovl_u8(vcreate_u8((uint64_t)bits));
     return vcvtq_f32_u32(vmovl_u16(vget_low_u16(wide)));
   }
+};
+
+struct LoadU8Affine {
+  static constexpr int32_t BYTES = 1;
+  Vec offset, scale;
+  LoadU8Affine(float o = 0.0f, float s = 0.0f) : offset(vdupq_n_f32(o)), scale(vdupq_n_f32(s)) {}
+  Vec load(const char* p) const { return vfmaq_f32(offset, scale, LoadU8{}.load(p)); }
 };
 
 inline Vec zero() { return vdupq_n_f32(0.0f); }
@@ -137,7 +153,7 @@ struct Vec {
 
 struct LoadF32 {
   static constexpr int32_t BYTES = 4;
-  static Vec load(const char* p) {
+  Vec load(const char* p) const {
     Vec r;
     std::memcpy(r.v, p, sizeof(r.v));
     return r;
@@ -145,7 +161,7 @@ struct LoadF32 {
 };
 struct LoadF16 {
   static constexpr int32_t BYTES = 2;
-  static Vec load(const char* p) {
+  Vec load(const char* p) const {
     std::float16_t h[W];
     std::memcpy(h, p, sizeof(h));
     Vec r;
@@ -155,7 +171,7 @@ struct LoadF16 {
 };
 struct LoadBF16 {
   static constexpr int32_t BYTES = 2;
-  static Vec load(const char* p) {
+  Vec load(const char* p) const {
     uint16_t h[W];
     std::memcpy(h, p, sizeof(h));
     Vec r;
@@ -165,9 +181,20 @@ struct LoadBF16 {
 };
 struct LoadU8 {
   static constexpr int32_t BYTES = 1;
-  static Vec load(const char* p) {
+  Vec load(const char* p) const {
     Vec r;
     for (int32_t j = 0; j < W; j++) r.v[j] = (float)(uint8_t)p[j];
+    return r;
+  }
+};
+
+struct LoadU8Affine {
+  static constexpr int32_t BYTES = 1;
+  float offset, scale;
+  LoadU8Affine(float o = 0.0f, float s = 0.0f) : offset(o), scale(s) {}
+  Vec load(const char* p) const {
+    Vec r;
+    for (int32_t j = 0; j < W; j++) r.v[j] = offset + scale * (float)(uint8_t)p[j];
     return r;
   }
 };
@@ -201,26 +228,30 @@ constexpr const char* ISA = "scalar";
 constexpr int32_t ACC = 8;
 constexpr int32_t PREFETCH_BYTES = 2048;
 
+// qPad fills the query's tail lanes: 0 for every load whose zero-padded
+// bytes decode to 0, and the offset for the affine int8 load (a zero code
+// decodes to the offset), so padding contributes exactly 0 to L2 too.
 template <class Load, bool L2>
-float kernel(const float* q, const char* x, int32_t n) {
+float kernel(const float* q, const char* x, int32_t n, Load load = {}, float qPad = 0.0f) {
   Vec a[ACC];
   for (int32_t j = 0; j < ACC; j++) a[j] = zero();
   int32_t i = 0;
   for (; i + ACC * W <= n; i += ACC * W) {
     __builtin_prefetch(x + i * Load::BYTES + PREFETCH_BYTES);
     for (int32_t j = 0; j < ACC; j++) {
-      a[j] = step<L2>(a[j], loadQ(q + i + j * W), Load::load(x + (i + j * W) * Load::BYTES));
+      a[j] = step<L2>(a[j], loadQ(q + i + j * W), load.load(x + (i + j * W) * Load::BYTES));
     }
   }
   for (; i + W <= n; i += W) {
-    a[0] = step<L2>(a[0], loadQ(q + i), Load::load(x + i * Load::BYTES));
+    a[0] = step<L2>(a[0], loadQ(q + i), load.load(x + i * Load::BYTES));
   }
   if (i < n) {
-    float qt[W] = {};
+    float qt[W];
+    for (int32_t j = 0; j < W; j++) qt[j] = qPad;
     char xt[W * Load::BYTES] = {};
     std::memcpy(qt, q + i, (size_t)(n - i) * sizeof(float));
     std::memcpy(xt, x + i * Load::BYTES, (size_t)(n - i) * Load::BYTES);
-    a[1] = step<L2>(a[1], loadQ(qt), Load::load(xt));
+    a[1] = step<L2>(a[1], loadQ(qt), load.load(xt));
   }
   Vec s01 = add(a[0], a[1]);
   Vec s23 = add(a[2], a[3]);
@@ -319,6 +350,10 @@ int32_t hamming(const uint8_t* a, const uint8_t* b, int32_t n) {
 
 float dotU8(const float* q, const uint8_t* c, int32_t n) {
   return kernel<LoadU8, false>(q, (const char*)c, n);
+}
+
+float l2sqU8(const float* q, const uint8_t* c, float offset, float scale, int32_t n) {
+  return kernel<LoadU8Affine, true>(q, (const char*)c, n, LoadU8Affine(offset, scale), offset);
 }
 
 const char* isa() { return ISA; }

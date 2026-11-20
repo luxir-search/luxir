@@ -6,18 +6,51 @@
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
 #include "Scrubber.h"
+#include "luxir/plugin/Plugin.h"
 #include "luxir/util/DateTime.h"
+#include "luxir/util/Uuid.h"
 #include "luxir/util/log.h"
 #include "oneapi/tbb/global_control.h"
 
+#include <omp.h>
+#include <unistd.h>
+
 namespace luxir {
 
+void PluginNodeStates::create(LuxirNode& node, const PluginRegistry& plugins) {
+  if (!states.empty()) throw std::logic_error("plugin node states have already been created");
+  states.reserve(plugins.plugins().size());
+  try {
+    for (const auto& plugin : plugins.plugins()) {
+      states.emplace_back(plugin->info().name, nullptr);
+      states.back().second = plugin->createNodeState(node);
+    }
+  } catch (...) {
+    clear();
+    throw;
+  }
+}
+
+void PluginNodeStates::clear() noexcept {
+  while (!states.empty()) {
+    states.back().second.reset();
+    states.pop_back();
+  }
+}
+
+PluginNodeState* PluginNodeStates::find(std::string_view name) const {
+  for (const auto& [key, state] : states) {
+    if (key == name) return state.get();
+  }
+  return nullptr;
+}
+
 // One arena slot per thread that enters the task arena from outside: each
-// HTTP shard and gRPC thread the configured servers run, plus the embedding
-// (main or test) thread.
+// HTTP shard the configured server runs, plus the embedding (main or test)
+// thread.  gRPC threads never enter: they enqueue their work.
 static int reservedArenaSlots(const LuxirConfig& config) {
   const auto& server = config.server;
-  return (server.http.enabled ? server.http.resolveThreads() : 0) + server.grpc.resolveThreads() + 1;
+  return (server.http.enabled ? server.http.resolveThreads() : 0) + 1;
 }
 
 // TBB's global pool lends at most max_allowed_parallelism - 1 workers to all
@@ -49,19 +82,50 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
   : node(node), n(n) {
   int total = node.arenaEntrants.fetch_add(n, std::memory_order_relaxed) + n;
   if (total > node.reservedSlots) {
-    LOG_WARN("{} with {} threads brings task arena entrants to {}, past the {} slots reserved from "
-             "server.http.threads and server.grpc.threads; excess entrants can block behind arena work",
+    LOG_WARN("{} with {} threads brings task arena entrants to {}, past the {} reserved slots; "
+             "excess entrants can block behind arena work",
              server, n, total, node.reservedSlots);
   }
 }
 
+void LuxirNode::ArenaThreadNamer::on_scheduler_entry(bool worker) {
+  omp_set_num_threads(1);
+  if (!worker) return;
+  if (loadActivity) loadActivity->begin(LoadRegistry::local());
+  char name[16];
+  snprintf(name, sizeof(name), "%s%d", prefix,
+           oneapi::tbb::this_task_arena::current_thread_index() - reservedSlots);
+  nameThisThread(name);
+}
+
+void LuxirNode::ArenaThreadNamer::on_scheduler_exit(bool worker) {
+  if (worker && loadActivity) loadActivity->end(LoadRegistry::local());
+}
+
+// host:port of the listener, so a restarted node keeps its identity (and a
+// follower its acknowledgment rows). Without a fixed port, a per-process id.
+static std::string defaultNodeId(const ServerConfig& server, bool& random) {
+  int port = server.http.enabled ? server.http.port : server.grpc.port;
+  char host[256] = {};
+  if (port <= 0 || ::gethostname(host, sizeof(host) - 1) != 0 || !*host) {
+    random = true;
+    return newUuid();
+  }
+  return std::string(host) + ":" + std::to_string(port);
+}
+
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
-  : config(std::move(config)), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
+  : config(std::move(config)), mode(mode), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
+    controlThreads(std::max(1, this->config.server.control_threads)),
     reservedSlots(reservedArenaSlots(this->config)),
     taskArena(workers + reservedSlots, reservedSlots,
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
-    indexArena(workers + 1, 1, oneapi::tbb::task_arena::priority::low) {
+    indexArena(workers + 1 + controlThreads, 1 + controlThreads, oneapi::tbb::task_arena::priority::low) {
+  if (this->config.node.id.empty()) this->config.node.id = defaultNodeId(this->config.server, this->config.node.random);
+  this->config.node.validate();
+  if (!this->config.read_only) lifetime = newUuid();
   ensureWorkerPool(workers + 1);
+  control = std::make_unique<ControlExecutor>(controlThreads);
   if (following() && this->config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers
@@ -81,20 +145,23 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   public:
     Events(std::shared_ptr<ReplicationSource> source, std::shared_ptr<CommitWaits> waits)
         : source(std::move(source)), waits(std::move(waits)) {}
-    void registered(const CollectionId& id, const std::shared_ptr<Collection>& collection) noexcept override {
-      waits->registered(id, collection); source->registered(id, collection);
+    void registered(const CollectionId& id, const std::shared_ptr<Collection>& collection, uint64_t revision) noexcept override {
+      waits->registered(id, collection, revision); source->registered(id, collection, revision);
+    }
+    void remapped(std::string_view tenant, uint64_t revision, std::span<const Binding> changes) noexcept override {
+      source->remapped(tenant, revision, changes); waits->remapped(tenant, revision, changes);
     }
     void updated(const CollectionId& id, const Collection& collection) noexcept override {
       waits->updated(id, collection); source->updated(id, collection);
     }
-    void removed(const CollectionId& id) noexcept override {
-      waits->removed(id); source->removed(id);
+    void removed(const CollectionId& id, uint64_t revision) noexcept override {
+      waits->removed(id, revision); source->removed(id, revision);
     }
   };
   events = std::make_shared<Events>(replication, commitWaits);
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
-  collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget, indexArena, metrics);
+  collections_ = std::make_unique<Collections>(this->config, lifetime, *events, indexRamBudget, indexArena, metrics);
 
   if (following()) {
     // The follower first checks that it owns the data directory.
@@ -103,9 +170,11 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   } else {
     // A follower directory becomes a writer only through offline promotion,
     // which completes for every collection before any writer opens one.
-    if (!this->config.read_only && this->config.store.backend == "fs"
-        && std::filesystem::exists(std::filesystem::path(this->config.store.data_dir) / "replication.json")) {
-      throw std::runtime_error("Follower data directory: run 'luxir promote " + this->config.store.data_dir + "' to make it a writer");
+    // Only durable node metadata can outlive a follower process.
+    auto nodeDir = collections_->storage().directory(StorageRoot::NODE_PRIVATE, "");
+    if (!this->config.read_only && nodeDir->openFile("replication.json")) {
+      throw std::runtime_error("Follower data directory (" + collections_->storage().describe()
+                               + "): run 'luxir promote' on it to make it a writer");
     }
     collections_->open(this->config.read_only ? Collections::Role::READ_ONLY : Collections::Role::WRITER);
   }
@@ -113,12 +182,18 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   scrubber = std::make_unique<Scrubber>(*this);
   if (mode == Mode::SERVE) scrubber->start();
   if (follower && mode == Mode::SERVE) follower->start();
+  pluginStates.create(*this, PluginRegistry::global());
 }
 
 LuxirNode::~LuxirNode() {
+  // Complete pending waits while they can still enqueue replies. A control
+  // task registering a wait during the drain gets an immediate cancellation.
+  commitWaits->close();
+  // Drain before tearing down the node state used by queued control work.
+  control->stop();
+  pluginStates.clear();
   scrubber->stop();
   if (follower) follower->stop();
-  commitWaits->close();
 }
 
 std::shared_ptr<Collection> LuxirNode::checkLoaded(std::shared_ptr<Collection> collection) {
@@ -155,9 +230,26 @@ std::shared_ptr<Collection> LuxirNode::createCollection(const CollectionId& id, 
   return collections_->create(id, schema);
 }
 
+void LuxirNode::renameCollection(const CollectionId& from, const CollectionId& to) {
+  if (following() || config.read_only) throw ReadOnlyError("cannot rename collections on a read-only node or follower");
+  collections_->rename(from, to);
+}
+void LuxirNode::swapCollections(const CollectionId& a, const CollectionId& b) {
+  if (following() || config.read_only) throw ReadOnlyError("cannot swap collections on a read-only node or follower");
+  collections_->swap(a, b);
+}
+
 void LuxirNode::deleteCollection(const CollectionId& id) {
   if (follower) follower->deleteOrphan(id);
   else collections_->remove(id);
+}
+
+void LuxirNode::detachCollection(const CollectionId& id, std::string_view target) {
+  collections_->detach(id, target);
+}
+
+std::shared_ptr<Collection> LuxirNode::attachCollection(const CollectionId& id, bool force) {
+  return collections_->attach(id, force);
 }
 
 } // namespace luxir

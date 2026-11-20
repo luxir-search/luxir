@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include "luxir/index/MergeCostModel.h"
+#include "luxir/index/SegmentMerger.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/server/LuxirNode.h"
 #include "test/CollectionHelper.h"
@@ -80,7 +81,7 @@ std::vector<Doc> allMergedDocs(CollectionHelper& helper) {
       .allQuery()
       .fields({"id", "title_t", "cat_s", "tags_ss", "price_i", "nums_is", "raw_sc"})
       .limit(-1)
-      .getNumber();
+      .countLimit();
   req->execute();
   EXPECT_TRUE(req->ok()) << req->toString();
   auto docs = req->getDocs();
@@ -90,7 +91,7 @@ std::vector<Doc> allMergedDocs(CollectionHelper& helper) {
 
 int64_t countTitleMatches(CollectionHelper& helper, std::string_view term) {
   auto req = localReq(helper.getSearchEngine());
-  req->collection("main").topDocs("q").matchQuery("title_t", term).getNumber();
+  req->collection("main").topDocs("q").matchQuery("title_t", term).countLimit();
   req->execute();
   EXPECT_TRUE(req->ok()) << req->toString();
   return req->getMatchCount();
@@ -109,7 +110,7 @@ int mergedSegmentFileCount(CollectionHelper& helper) {
   auto reader = iw->snapshots.readers.getReader();
   assert(reader->segments().size() == 1);
   uint64_t segId = reader->segments()[0].segInfo.seg_id;
-  std::string prefix = Postings::getIndexFileNamePrefix(segId);
+  std::string prefix = Postings::getIndexFileNamePrefix(segId, 1);
 
   std::vector<Directory::FileInfo> files;
   iw->dir.listFiles(files);
@@ -153,10 +154,70 @@ TEST(MergeParallelismTest, MergedSegmentFileCountStaysWithinStreamCap) {
 
   CollectionHelper helper("main");
   buildMergedIndex(helper);
+  CollectionHelper::UpdateBuilder nested;
+  nested.addRaw([](auto& doc, auto& arena) {
+    ASSERT_TRUE(api::read_json(doc, R"({"id":"nested","items_nested":[{"text_w":"alpha beta","parts_nested":{"n_i":2}},{}]})", arena));
+  });
+  nested.commit(); ASSERT_TRUE(helper.submit(nested).success);
+  helper.getIndexWriter()->mergeSegments();
 
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1, reader->segments().size());
   EXPECT_LE(mergedSegmentFileCount(helper), MergeCostModel::STREAM_BUDGET_FLOOR);
+}
+
+TEST(MergeParallelismTest, RowMapsShareOneReservationUntilMergerDestruction) {
+  for (bool nested : {false, true}) {
+    CollectionHelper helper(nested ? "maps_nested" : "maps_root");
+    helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+    CollectionHelper::UpdateBuilder input;
+    for (auto id : {"a", "b", "c"}) {
+      std::string json = "{\"id\":\"" + std::string(id) + "\"";
+      if (nested && *id != 'c') json += *id == 'a' ? R"(,"items_nested":[{},{}])" : R"(,"items_nested":[{},{},{}])";
+      json += '}';
+      input.addRaw([&](auto& doc, auto& arena) { ASSERT_TRUE(api::read_json(doc, json, arena)); });
+    }
+    input.commit(); ASSERT_TRUE(helper.submit(input).success);
+    for (bool deleted : {false, true}) {
+      if (deleted) {
+        ASSERT_TRUE(helper.deleteById("a", UpdateMessage::COMMIT).success);
+      }
+      auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+      std::vector<std::shared_ptr<SegmentCore>> cores{reader->segments()[0].segmentCoreShared()};
+      std::vector<LiveDocs*> live{reader->segments()[0].liveDocs()};
+      for (bool fail : {false, true}) {
+        if (fail && !deleted) continue;
+        SCOPED_TRACE(::testing::Message() << nested << '/' << deleted << '/' << fail);
+        RAMDir output;
+        IndexRamBudget budget(1);
+        StoredDictionaryRegistry dictionaries;
+        bool seen = false;
+        size_t bytes = deleted ? (size_t)(3 + (nested ? 5 : 0)) * sizeof(int32_t) : 0;
+        Signal::listen("mergeRowMaps", [&](void* value, void*, void*) -> void* {
+          seen = true;
+          EXPECT_EQ(bytes, ((SegmentMerger*)value)->rowMapBytes());
+          EXPECT_EQ((int64_t)bytes, budget.reservedBytes());
+          if (fail) throw std::runtime_error("row map failure");
+          return nullptr;
+        });
+        auto unlisten = scope_guard([] { Signal::unlisten("mergeRowMaps"); });
+        {
+          PostingsWriter writer(output, 100, 1);
+          SegmentMerger merger(cores, live, writer, budget, INT64_MAX, 1, 4, *reader->schema(), dictionaries);
+          writer.configureRamDelegation(false);
+          if (fail) {
+            EXPECT_THROW(merger.merge(), std::runtime_error);
+          } else {
+            merger.merge();
+            EXPECT_TRUE(writer.finish());
+          }
+          EXPECT_TRUE(seen);
+          EXPECT_EQ((int64_t)bytes, budget.reservedBytes());
+        }
+        EXPECT_EQ(0, budget.reservedBytes());
+      }
+    }
+  }
 }
 
 TEST(MergeCostModelTest, StreamBudgetAndRangeLimitScaleWithOutputBytes) {
@@ -176,9 +237,10 @@ TEST(MergeCostModelTest, StreamBudgetAndRangeLimitScaleWithOutputBytes) {
     previous = current;
   }
 
-  EXPECT_EQ(16, MergeCostModel::maxTermRangesForStreams(32));
-  EXPECT_EQ(16, MergeCostModel::maxTermRangesForStreams(33));
-  EXPECT_EQ(17, MergeCostModel::maxTermRangesForStreams(34));
-  EXPECT_EQ(64, MergeCostModel::maxTermRangesForStreams(128));
+  // Twice the ranges that can hold streams at once: the rest queue.
+  EXPECT_EQ(32, MergeCostModel::maxTermRangesForStreams(32));
+  EXPECT_EQ(33, MergeCostModel::maxTermRangesForStreams(33));
+  EXPECT_EQ(34, MergeCostModel::maxTermRangesForStreams(34));
+  EXPECT_EQ(64, MergeCostModel::maxTermRangesForStreams(64));
   EXPECT_EQ(64, MergeCostModel::maxTermRangesForStreams(256));
 }

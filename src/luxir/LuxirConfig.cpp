@@ -4,8 +4,13 @@
 #include "LuxirConfig.h"
 #include <CLI/CLI.hpp>
 #include "luxir/util/ProcessAllocator.h"
+#include "luxir/util/TaskWork.h"
+#include "luxir/util/LoadSignal.h"
 #include "luxir/server/Collections.h"
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <algorithm>
 #include <fstream>
 #include <limits>
@@ -13,6 +18,7 @@
 
 namespace luxir {
 
+#ifndef __APPLE__
 namespace {
 
 // Single integer from a one-line file; 0 if it is missing or not a number
@@ -25,8 +31,16 @@ int64_t readInt64File(const char* path) {
 }
 
 }  // namespace
+#endif
 
 int64_t systemRamBytes() {
+#ifdef __APPLE__
+  uint64_t bytes = 0;
+  size_t size = sizeof(bytes);
+  if (sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) != 0
+      || bytes > (uint64_t)std::numeric_limits<int64_t>::max()) return 0;
+  return (int64_t)bytes;
+#else
   long pages = sysconf(_SC_PHYS_PAGES);
   long pageSize = sysconf(_SC_PAGESIZE);
   if (pages <= 0 || pageSize <= 0) return 0;
@@ -41,6 +55,7 @@ int64_t systemRamBytes() {
     if (limit > 0 && limit < bytes) bytes = limit;
   }
   return bytes;
+#endif
 }
 
 /*
@@ -55,6 +70,16 @@ Rough hierarchy:
 [search]         # search defaults (hits, etc.)
 */
 
+void NodeConfig::validate() const {
+  if (id.empty()) throw std::invalid_argument("node.id must not be empty");
+  if (id.size() > 255) throw std::invalid_argument("node.id exceeds 255 bytes");
+  if (id == "." || id == "..") throw std::invalid_argument("node.id must not be '.' or '..'");
+  for (unsigned char c : id) {
+    if (c < 0x20 || c > 0x7e || c == '/' || c == '\\') {
+      throw std::invalid_argument("node.id must be printable ASCII without '/' or '\\\\'");
+    }
+  }
+}
 
 std::vector<std::string> ReplicationConfig::tenantFilter() const {
   std::vector<std::string> result;
@@ -90,7 +115,6 @@ std::vector<std::string> ReplicationConfig::peerList() const {
 void ReplicationConfig::validate() const {
   tenantFilter();
   if (!max_acknowledgments) throw std::invalid_argument("replication.max-acknowledgments must be positive");
-  if (follower_id.size() > 255) throw std::invalid_argument("replication.follower-id exceeds 255 bytes");
   if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
     throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
   }
@@ -98,12 +122,12 @@ void ReplicationConfig::validate() const {
 }
 
 void LuxirConfig::addOptions(CLI::App& app) {
+  app.add_option("--node.id", node.id, "Node identity (default host:port, otherwise a random UUID)");
   app.add_option("--replicate-from,--replication.source", replication.source, "Follow this HTTP source namespace");
   app.add_option("--replication.tenants", replication.tenants, "Comma-separated tenant subscription (empty follows all)");
   app.add_option("--replication.peers", replication.peers, "Comma-separated http:// nodes serving file copies, tried before the source");
   app.add_option("--replication.max-acknowledgments", replication.max_acknowledgments,
       "Node-wide follower/collection acknowledgment row budget")->default_val(replication.max_acknowledgments);
-  app.add_option("--replication.follower-id", replication.follower_id, "Name the source knows this follower by (default host:port)");
   app.add_option("--replication.downloads", replication.downloads, "Concurrent collection downloads per follower")->check(CLI::Range(1, 64));
   app.add_flag("--read-only", read_only,
                "Serve an existing data directory without the write lock; rejects all updates");
@@ -145,6 +169,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "(0 = auto: all CPUs on nodes of up to 4, else all but one)")
       ->default_val(server.workers)
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--server.control-threads", server.control_threads,
+                 "Control-plane threads for administration, schema changes, replication transfers "
+                 "and detailed stats, outside the search and indexing workers")
+      ->default_val(server.control_threads)
+      ->check(CLI::PositiveNumber);
   app.add_option("--server.stream_buffer_bytes", server.stream_buffer_bytes,
                  "Per-connection buffered response bytes before streaming producers pause")
       ->default_val(server.stream_buffer_bytes);
@@ -160,9 +189,31 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Follower reconnect and first sync retry delay in milliseconds (retries double, to 60 s)")
       ->default_val(replication.retry_ms);
 
-  app.add_option("--store.backend", store.backend, "Storage backend (ram, fs)")
-      ->default_val(store.backend)
-      ->check(CLI::IsMember({"ram", "fs"}));
+  // Names are validated against the registries when storage opens: options are added before plugins register.
+  app.add_option("--store.backend", store.backend, "Storage backend name (built in: ram, fs, shared_fs; plugins may add more)")
+      ->default_val(store.backend);
+  app.add_option("--store.layer", store.layers,
+                 "Storage layer wrapped around the backend (repeatable, innermost first; provided by plugins)")
+      ->expected(1)
+      ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll);
+  app.add_option_function<std::vector<std::string>>("--store.option",
+      [&options = store.options](const std::vector<std::string>& pairs) {
+        for (const auto& pair : pairs) {
+          auto eq = pair.find('=');
+          auto dot = pair.find('.');
+          if (eq == std::string::npos || dot == std::string::npos || dot == 0 || dot + 1 >= eq) {
+            throw CLI::ValidationError("--store.option", "expected COMPONENT.KEY=VALUE, got '" + pair + "'");
+          }
+          auto component = pair.substr(0, dot);
+          if (component.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos) {
+            throw CLI::ValidationError("--store.option", "component '" + component + "' must use [a-z0-9_]+");
+          }
+          options[component][pair.substr(dot + 1, eq - dot - 1)] = pair.substr(eq + 1);
+        }
+      },
+      "Backend or layer setting COMPONENT.KEY=VALUE (repeatable)")
+      ->expected(1)
+      ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll);
   app.add_option("--store.ram-limit-mb", store.ram_limit_mb, "RAM storage allocation limit in MiB (0 = unlimited)")->check(CLI::Range((uint64_t)0, UINT64_MAX / (1024 * 1024)));
   app.add_option("--store.data-dir", store.data_dir, "Base path for filesystem storage")
       ->default_val(store.data_dir);
@@ -173,6 +224,10 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Startup check of committed files: none, or full (size and xxh3 of every file)")
       ->default_val(store.verify_on_open)
       ->check(CLI::IsMember({"none", "full"}));
+  app.add_option("--store.retention-ms", store.retention_ms,
+                 "Keep superseded commits for this many milliseconds (0 disables retention)")
+      ->check(CLI::Range((int64_t)0, INT64_MAX / 1000))
+      ->default_str("0 on exclusive stores, 300000 on shared stores");
   app.add_option("--store.scrub-interval-s", store.scrub_interval_s,
                  "Seconds between background checksum scrubs of published snapshots (0 = off)")
       ->default_val(store.scrub_interval_s);
@@ -220,7 +275,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(ingest.stream_batch_docs)
       ->check(CLI::PositiveNumber);
   app.add_option("--indexing.max-inflight-batches", ingest.max_inflight_batches,
-                 "Streaming NDJSON: batches in flight per connection (0 = server.workers + 2)")
+                 "Streaming NDJSON: batches decoding or indexing at once per connection (0 = server.workers + 2)")
       ->default_val(ingest.max_inflight_batches)
       ->check(CLI::NonNegativeNumber);
   app.add_flag("--indexing.auto-create-collection,!--no-indexing.auto-create-collection",
@@ -231,10 +286,44 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Max nesting depth of search operations in one request")
       ->default_val(search.max_op_depth)
       ->check(CLI::PositiveNumber);
+  app.add_option("--search.fanout-grain-us", search.fanout_grain_us,
+                 "Adaptive fan-out grain and credit in microseconds (-1 = never publish)")
+      ->default_val(search.fanout_grain_us)
+      ->check(CLI::Range((int64_t)-1, (int64_t)60'000'000))
+      ->check(!CLI::Range((int64_t)0, (int64_t)0));
+  app.add_option("--search.fanout-sibling-grain-us", search.fanout_sibling_grain_us,
+                 "Fan-out grain with only idle SMT siblings in microseconds (-1 = never publish)")
+      ->default_val(search.fanout_sibling_grain_us)
+      ->check(CLI::Range((int64_t)-1, (int64_t)60'000'000))
+      ->check(!CLI::Range((int64_t)0, (int64_t)0));
   app.add_option("--search.request-memory-max-bytes",
                  search.request_memory_max_bytes,
                  "Per-request query-memory breaker ceiling (0 = unlimited)")
       ->default_val(search.request_memory_max_bytes)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-max-expansions",
+                 search.multiterm_max_expansions,
+                 "Operator opt-in term cap per segment for prefix/wildcard/regex/range; "
+                 "a merge can change acceptance (0 = off, default)")
+      ->default_val(search.multiterm_max_expansions)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-max-terms-examined",
+                 search.multiterm_max_terms_examined,
+                 "Dictionary terms all multi-term and fuzzy scans of one request "
+                 "may visit; operator opt-in (0 = off, default)")
+      ->default_val(search.multiterm_max_terms_examined)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-max-postings",
+                 search.multiterm_max_postings,
+                 "Operator opt-in postings estimate: summed selected docFreq, excluding "
+                 "fuzzy scored rewrites (0 = off, default)")
+      ->default_val(search.multiterm_max_postings)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-min-prefix-length",
+                 search.multiterm_min_prefix_length,
+                 "Pattern-only minimum literal prefix in bytes for unbounded prefix/wildcard/regex; "
+                 "type-ahead keystrokes shorter than N are rejected (0 = off, default)")
+      ->default_val(search.multiterm_min_prefix_length)
       ->check(CLI::NonNegativeNumber);
 }
 
@@ -267,6 +356,7 @@ void LuxirConfig::resolveRamBudgets() {
 }
 
 void LuxirConfig::normalize() {
+  if (!node.id.empty()) node.validate();
   replication.validate();
   resolveRamBudgets();
 
@@ -289,11 +379,6 @@ void LuxirConfig::normalize() {
     spdlog::warn("store.data-dir is ignored when store.backend=ram");
   }
 
-  if (read_only && store.backend != "fs") {
-    throw std::runtime_error("--read-only requires --store.backend=fs; there is no "
-                             "existing data directory to serve with backend=" + store.backend);
-  }
-
   // Only an explicit value can be over the pool's addressability; the derived
   // one is already clamped (MemPool itself throws at the hard ceiling if a
   // pathological batch overshoots even the headroom the clamp leaves).
@@ -306,6 +391,11 @@ void LuxirConfig::normalize() {
 
 void LuxirConfig::apply() const {
   configureIndexingArena(index.huge_pages);
+  fanoutGrainNs.store(search.fanout_grain_us < 0 ? FANOUT_GRAIN_NEVER
+      : (uint64_t)search.fanout_grain_us * 1000, std::memory_order_relaxed);
+  fanoutSiblingGrainNs.store(search.fanout_sibling_grain_us < 0 ? FANOUT_GRAIN_NEVER
+      : (uint64_t)search.fanout_sibling_grain_us * 1000, std::memory_order_relaxed);
+  LoadRegistry::enabled.store(search.fanout_grain_us >= 1, std::memory_order_relaxed);
   auto level = spdlog::level::from_str(log_level);
   spdlog::set_level(level);
 }

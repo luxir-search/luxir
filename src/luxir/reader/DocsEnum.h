@@ -1059,7 +1059,7 @@ private:
     }
     const int32_t idx = docOrd - residentBlockStartOrd;
     const uint32_t docBase = residentDocBase;
-    const uint32_t blockLast = residentBlockLast;
+    [[maybe_unused]] const uint32_t blockLast = residentBlockLast;
     const int32_t numWords = residentNumWords;
     const char* wordsPtr = residentWordsPtr;
     if (numWords == 0) {
@@ -1098,7 +1098,7 @@ private:
     const int32_t encodedBytes = tfreqBufEnd;
     assert(encodedBytes > 0);
     const char* freqPtr = docIS.ptr() - encodedBytes;
-    uint32_t bytesRead = decodeScoredProbeFreqs(
+    [[maybe_unused]] uint32_t bytesRead = decodeScoredProbeFreqs(
         freqPtr, (uint32_t) encodedBytes);
     assert(bytesRead == (uint32_t) encodedBytes);
   }
@@ -2663,8 +2663,10 @@ public:
   }
 
 private:
+  // Always inlined into its entry points below; the caller-facing advance()
+  // stays an ordinary inline candidate.
   template <bool DOCS_ONLY>
-  int32_t advanceImpl(int32_t target) {
+  LUXIR_INLINE int32_t advanceImpl(int32_t target) {
     assert(docid < target);
     if constexpr (DOCS_ONLY) {
       assert(!scoredProbeActive);
@@ -2749,6 +2751,13 @@ public:
   // the current doc.  Callers: ConjunctionScorer / MandOpt / MandNot, PhraseQuery,
   // ConstantScoreQuery, the column-join iterators.
   int32_t advance(int32_t target) {
+    return advanceImpl<false>(target);
+  }
+
+  // advance() for a caller's innermost loop: always inlined, whatever the
+  // including translation unit's inline budget (the exact phrase conjunction
+  // loses about 6% when its advance is called out of line).
+  LUXIR_INLINE int32_t advanceInline(int32_t target) {
     return advanceImpl<false>(target);
   }
 
@@ -3075,7 +3084,7 @@ class BasicDocsEnum<DocsEnumTier::DOCS> final : public DocsEnumMeta {
     }
     const int32_t idx = docOrd - residentBlockStartOrd;
     const uint32_t docBase = residentDocBase;
-    const uint32_t blockLast = residentBlockLast;
+    [[maybe_unused]] const uint32_t blockLast = residentBlockLast;
     const int32_t numWords = residentNumWords;
     const char* wordsPtr = residentWordsPtr;
     if (numWords == 0) {

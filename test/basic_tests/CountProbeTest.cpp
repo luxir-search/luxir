@@ -51,9 +51,9 @@ protected:
   void checkCached(MakeQuery makeQuery, int64_t found) {
     for (int repeat = 0; repeat < 4; repeat++) {
       auto req = localReq(helper.getSearchEngine());
-      req->topDocs("q").limit(0).getNumber().rawQuery() = makeQuery(req->mr);
+      req->topDocs("q").limit(0).countLimit().rawQuery() = makeQuery(req->mr);
       SkipStatsScope stats;
-      helper.getSearchEngine().dispatch(*req.get(), 0);
+      helper.getSearchEngine().dispatch(*req.get(), 0, SearchEngine::Receiver::MAY_EXECUTE);
       ASSERT_OK(req);
       EXPECT_EQ(found, req->getMatchCount());
       if (repeat >= 2) {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "CommitSnapshotRegistry.h"
+#include "luxir/store/CorruptionMarker.h"
 #include "luxir/store/VerifiedDirectory.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/util/Signal.h"
@@ -9,23 +10,67 @@
 
 namespace luxir {
 
+std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::resolve(CommitSnapshot::Bytes bytes, Directory& source) {
+  std::pmr::monotonic_buffer_resource arena;
+  auto info = Manifest::decode(bytes, arena);
+  auto schema = schemas->load(source, info);
+  return CommitSnapshot::fromBytes(std::move(bytes), std::move(schema));
+}
+
 void CommitSnapshotRegistry::publish(std::shared_ptr<const CommitSnapshot> snapshot,
                                      std::shared_ptr<IndexReader> opened) {
-  // No pin lock: a large acquire or slow file open cannot stall publication.
+  if (retention.count()) {
+    auto previous = this->snapshot();
+    if (previous && previous->manifestName() != snapshot->manifestName()) {
+      retain(*previous, retentionDeadline());
+    }
+  }
+  // With retention disabled, publication takes no pin lock.
   readers.publish(std::move(snapshot), std::move(opened));
   notifyChange();
+  // Publication also ends expired holds: the periodic expiry runs only with HTTP.
+  if (retention.count()) expire();
+}
+
+auto CommitSnapshotRegistry::retentionDeadline() -> Clock::time_point {
+  auto time = now();
+  auto maximum = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::time_point::max() - time);
+  return retention >= maximum ? Clock::time_point::max() : time + retention;
+}
+
+void CommitSnapshotRegistry::retain(const CommitSnapshot& snapshot, Clock::time_point until) {
+  std::lock_guard lock(mutex);
+  if (closed) return;
+  auto hold = [&](const std::string& name, uint64_t size) {
+    auto& ref = files.try_emplace(name, FileRef{size}).first->second;
+    if (!ref.until && ref.retired && ref.pins) counters.retainedBytes -= ref.size;
+    ref.until = std::max(ref.until.value_or(until), until);
+  };
+  for (const auto& file : snapshot.files) hold(file.name, file.size);
+  hold(snapshot.manifestName(), snapshot.bytes->size() + 16);
+}
+
+void CommitSnapshotRegistry::retainHistory(std::span<const Directory::FileInfo> listing, const CommitSnapshot& current) {
+  if (!retention.count()) return;
+  // Publication times are unknown after restart. Give all history a full window.
+  auto until = retentionDeadline();
+  for (const auto& file : listing) {
+    auto [generation, epoch] = Manifest::candidate(file.name);
+    if (!generation || generation >= current.id.index_gen) continue;
+    if (auto bytes = Manifest::read(dir, generation, epoch)) retain(*CommitSnapshot::fromBytes(std::move(bytes)), until);
+  }
 }
 
 void CommitSnapshotRegistry::commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened) {
   auto previous = this->snapshot();
-  Manifest::commit(dir, snapshot->id.index_gen, *snapshot->bytes);
+  Manifest::install(dir, snapshot->bytes);
   Signal::emit("snapshotRootDurable", this);
   publish(snapshot, std::move(opened));
   // Best-effort: obsolete names that reappear after a crash are unreferenced.
   try {
     if (previous) {
       auto names = obsoleteFiles(*previous, *snapshot);
-      if (previous->id.index_gen != snapshot->id.index_gen) names.push_back(Manifest::name(previous->id.index_gen));
+      if (previous->id.index_gen != snapshot->id.index_gen) names.push_back(previous->manifestName());
       retire(names);
     }
   } catch (const std::exception& e) { LOG_WARN("Snapshot retirement failed: {}", e.what()); }
@@ -40,7 +85,7 @@ void CommitSnapshotRegistry::fail() noexcept {
   notifyChange();
 }
 
-void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
+std::vector<std::string> CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
   auto manifest = Manifest::load(dir);
   auto changed = [&] {
     auto latest = Manifest::load(dir);
@@ -52,10 +97,13 @@ void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
     if (!manifest.bytes) throw ReadOnlyError("collection has no snapshot");
     auto snapshot = CommitSnapshot::fromBytes(manifest.bytes);
     std::shared_ptr<IndexReader> reader;
+    CorruptionMarker::Observation observed;
     {
       FileVerification verification;
-      try { verification.open(dir, snapshot->files, verify); }
-      catch (...) {
+      try {
+        observed = CorruptionMarker::read(dir, manifest.listingOf(dir));
+        verification.open(dir, snapshot->files, verify, observed.suspects);
+      } catch (...) {
         if (!changed()) throw;
         continue;
       }
@@ -64,6 +112,7 @@ void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
       verification.run();
       try {
         VerifiedDirectory source(dir, verification);
+        snapshot = resolve(snapshot->bytes, source);
         reader = readers.prepare(*snapshot, source);
       } catch (...) {
         // Full holds every file: a prepare failure is final. Under none an
@@ -73,18 +122,25 @@ void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
       }
     }
     publish(std::move(snapshot), std::move(reader));
-    return;
+    return std::move(observed.markers);
   }
 }
 
-void CommitSnapshotRegistry::sweepOrphans(const Manifest& manifest) {
+void CommitSnapshotRegistry::sweepOrphans(Manifest& manifest, uint64_t writerEpoch) {
   if (!manifest.bytes) return;
   if (manifest.generation != manifest.highestGeneration) {
     LOG_ERROR("Recovered snapshot {} below newest generation {}; skipping orphan cleanup",
               manifest.generation, manifest.highestGeneration);
     return;
   }
-  retireUnreferenced(manifest.listing);
+  // The open's listing supplies best-effort cleanup candidates. Late files
+  // from older epochs stay for a later sweep.
+  auto listing = manifest.listingOf(dir);
+  std::erase_if(listing, [&](const auto& file) {
+    auto epoch = Manifest::fileEpoch(file.name);
+    return !epoch || epoch >= writerEpoch;
+  });
+  retireUnreferenced(listing);
 }
 
 void CommitSnapshotRegistry::sweepOrphans() {
@@ -96,7 +152,8 @@ void CommitSnapshotRegistry::sweepOrphans() {
 void CommitSnapshotRegistry::retireUnreferenced(std::span<const Directory::FileInfo> listing) {
   boost::unordered_flat_set<std::string> retained;
   auto installed = snapshot();
-  retained.insert(Manifest::name(installed->id.index_gen));
+  retainHistory(listing, *installed);
+  retained.insert(installed->manifestName());
   for (const auto& file : installed->files) retained.insert(file.name);
   std::vector<std::string> obsolete;
   for (const auto& file : listing) {
@@ -147,7 +204,7 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::acquire(std::stop_
   } catch (...) {
     for (size_t i = 0; i < added; i++) {
       auto it = files.find(commit->files[i].name);
-      if (--it->second.pins == 0) files.erase(it);
+      if (--it->second.pins == 0 && !it->second.until) files.erase(it);
     }
     throw;
   }
@@ -232,6 +289,7 @@ void CommitSnapshotRegistry::releaseLocked(const CommitId& id, std::vector<std::
     auto it = files.find(file.name);
     auto& ref = it->second;
     if (--ref.pins == 0) {
+      if (ref.until) continue;
       if (ref.retired) {
         counters.retainedBytes -= ref.size;
         retired.push_back(std::move(files.extract(it).key()));
@@ -260,7 +318,7 @@ auto CommitSnapshotRegistry::oldestReclaimableLocked() -> decltype(pins)::iterat
     if (oldest != pins.end() && pin.created >= oldest->second.created) continue;
     for (const auto& file : pin.snapshot->files) {
       auto ref = files.find(file.name);
-      if (ref != files.end() && ref->second.retired && ref->second.size) {
+      if (ref != files.end() && ref->second.retired && !ref->second.until && ref->second.size) {
         oldest = it;
         break;
       }
@@ -304,8 +362,20 @@ bool CommitSnapshotRegistry::testEvictOldest() {
 }
 
 void CommitSnapshotRegistry::expireLocked(std::vector<std::string>& retired) {
-  if (closed || pins.empty()) return;
+  if (closed) return;
   auto time = now();
+  for (auto it = files.begin(); retention.count() && it != files.end();) {
+    auto& ref = it->second;
+    if (!ref.until || *ref.until > time) { ++it; continue; }
+    ref.until.reset();
+    if (ref.pins) {
+      if (ref.retired) counters.retainedBytes += ref.size;
+      ++it;
+    } else {
+      if (ref.retired) retired.push_back(it->first);
+      it = files.erase(it);
+    }
+  }
   for (auto it = pins.begin(); it != pins.end();) {
     auto pin = it++;
     if (time - pin->second.lastRead >= policy.idleTimeout) {
@@ -313,6 +383,7 @@ void CommitSnapshotRegistry::expireLocked(std::vector<std::string>& retired) {
       counters.idleDrops++;
     }
   }
+  if (retention.count()) enforceBudgetLocked(retired);
 }
 
 void CommitSnapshotRegistry::expire() {
@@ -363,7 +434,7 @@ void CommitSnapshotRegistry::retire(std::span<const std::string> names) {
       if (it == files.end()) retired.push_back(name);
       else if (!it->second.retired) {
         it->second.retired = true;
-        counters.retainedBytes += it->second.size;
+        if (!it->second.until && it->second.pins) counters.retainedBytes += it->second.size;
       }
     }
     enforceBudgetLocked(retired);
@@ -388,7 +459,7 @@ void CommitSnapshotRegistry::retirePrefix(std::string_view prefix) {
     {
       std::lock_guard lock(mutex);
       if (closed) return;
-      unpinned = pins.empty();
+      unpinned = pins.empty() && files.empty();
     }
     // New pins can only acquire current, which cannot contain this dead
     // segment. Preserve the backend's cheap prefix erase with no pins.
@@ -448,7 +519,7 @@ void CommitSnapshotRegistry::detach() noexcept {
     // Keep its immutable current snapshot until the owner is destroyed.
   }
   for (const auto& [name, ref] : retired) {
-    if (ref.retired) unlinkFiles({&name, 1});
+    if (ref.retired && !ref.until) unlinkFiles({&name, 1});
   }
 }
 
