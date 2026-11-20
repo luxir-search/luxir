@@ -3,6 +3,8 @@
 
 #include <gtest/gtest.h>
 
+#include <faiss/IndexFlat.h>
+#include <faiss/IndexIVFFlat.h>
 #include <faiss/IndexIVFRaBitQ.h>
 #include <faiss/impl/DistanceComputer.h>
 #include <faiss/impl/RaBitQuantizer.h>
@@ -5743,3 +5745,46 @@ TEST_F(KnnQueryTest, candidateCapStillAdmitsLaterExactHits) {
   EXPECT_FLOAT_EQ(1 + 1.0f / 101, resultScores(*req)[0]);
 }
 
+// The lazy coarse ranking must reproduce FAISS's full k = nlist quantizer
+// search exactly (distances and order, ties included), however far it has
+// been advanced.  Duplicate centroids force exact distance ties on both
+// FAISS result paths (heap below 100 lists, reservoir above).
+TEST(KnnCoarseRanking, lazyRankingMatchesFullQuantizerSearch) {
+  constexpr int d = 8;
+  std::mt19937 rng(7);
+  std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+  for (auto metric : {faiss::METRIC_L2, faiss::METRIC_INNER_PRODUCT}) {
+    for (int nlist : {1, 50, 300}) {
+      faiss::IndexFlat quantizer(d, metric);
+      std::vector<float> centroids;
+      for (int j = 0; j < nlist; j++) {
+        if (j % 3 == 2) {
+          std::vector<float> prev(centroids.end() - d, centroids.end());
+          centroids.insert(centroids.end(), prev.begin(), prev.end());
+        } else {
+          for (int c = 0; c < d; c++) centroids.push_back(uni(rng));
+        }
+      }
+      quantizer.add(nlist, centroids.data());
+      faiss::IndexIVFFlat ivf(&quantizer, d, (size_t)nlist, metric);
+      for (int q = 0; q < 5; q++) {
+        std::vector<float> query(d);
+        for (auto& x : query) x = uni(rng);
+        std::vector<faiss::idx_t> ids((size_t)nlist);
+        std::vector<float> dists((size_t)nlist);
+        quantizer.search(1, query.data(), nlist, dists.data(), ids.data());
+        auto ranking = KnnQuery::rankCentroids(ivf, query.data());
+        ASSERT_EQ(ranking.ranked, 0u) << "a flat quantizer ranks lazily";
+        ASSERT_EQ(ranking.entries.size(), (size_t)nlist);
+        for (size_t i = 0; i < (size_t)nlist; i++) {
+          ASSERT_TRUE(ranking.valid(i));
+          ASSERT_EQ(ranking.entries[i].listId, ids[i])
+              << "metric " << (int)metric << " nlist " << nlist << " rank " << i;
+          ASSERT_EQ(std::bit_cast<uint32_t>(ranking.entries[i].dist),
+                    std::bit_cast<uint32_t>(dists[i]));
+        }
+        EXPECT_FALSE(ranking.valid((size_t)nlist));
+      }
+    }
+  }
+}
