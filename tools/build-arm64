@@ -77,6 +77,7 @@ stage sources ./deps/fetch_sources.sh
 extra_features=()
 IFS=, read -ra _features <<< "${LUXIR_VCPKG_FEATURES:-}"
 for _f in ${_features[@]+"${_features[@]}"}; do
+    _f=${_f//[[:space:]]/}
     [[ -z $_f ]] || extra_features+=("--x-feature=$_f")
 done
 stage dependencies env -u CC -u CXX "$vcpkg/vcpkg" install --x-manifest-root="$repo_dir/deps" \
@@ -106,6 +107,11 @@ cmake_bin=${LUXIR_CMAKE:-"$VCPKG_DOWNLOADS/tools/cmake-4.4.3-linux/cmake-4.4.3-l
 configure_args=()
 if [[ -n ${LUXIR_BUILD_JOBS:-} ]]; then
     configure_args=(-DLUXIR_COMPILE_JOBS="$LUXIR_BUILD_JOBS")
+fi
+# The fresh configure drops cached options, so plugin directories come from
+# the environment (semicolon-separated, as for -DLUXIR_PLUGIN_DIRS).
+if [[ -n ${LUXIR_PLUGIN_DIRS:-} ]]; then
+    configure_args+=(-DLUXIR_PLUGIN_DIRS="$LUXIR_PLUGIN_DIRS")
 fi
 stage configure "$cmake_bin" --fresh --preset arm64-release "${configure_args[@]}"
 stage build "$cmake_bin" --build --preset arm64-release
