@@ -89,10 +89,15 @@ skips itself when a dependency is missing) fails the configure. Every compiled-i
 runtime plugin also embeds the string `luxir-plugin-compiled:<name>`, so
 `grep -a` on a binary shows which plugins it contains.
 
-For ARM64 builds, `tools/build-arm64` installs extra vcpkg manifest features named in
-`LUXIR_VCPKG_FEATURES` (comma-separated; for example `icu` for plugins that link ICU).
-`deps/make_deps.sh` reads the same variable for the native install, so plugins link ICU
-statically there too.
+A plugin's third-party dependencies come from optional features of `deps/vcpkg.json`
+(for example `icu` for plugins that link ICU). Name them in `LUXIR_VCPKG_FEATURES`
+(comma-separated) when running `deps/make_deps.sh`, which installs them for the normal
+and ASan builds, or `tools/build-arm64`. Set the variable on every run: an install
+without it removes those packages again, and the native installs are shared by all
+checkouts. The container image does not install extra features.
+
+`tools/build-arm64` configures from scratch each time, so it takes the plugin
+directories from the `LUXIR_PLUGIN_DIRS` environment variable.
 
 Plugin targets see the include directories `luxir_lib` keeps private (generated
 protos, hash maps) and link TBB, so a plugin can build on engine internals such as
