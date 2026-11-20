@@ -69,7 +69,9 @@ struct ValueCountFixture {
 };
 
 void BM_ValueCount(benchmark::State& state, std::string_view metric, bool terms) {
-  static ValueCountFixture fixture;
+  // A function-local static would outlive the node and hang process exit;
+  // each case reopens the corpus instead, which indexMatchesShape keeps.
+  ValueCountFixture fixture;
   std::string json = terms
       ? R"({"limit":0,"ops":{"f":{"field_facet":{"field":"cat_s","limit":-1,"ops":{"m":")"
           + std::string(metric) + R"("}}}}})"
