@@ -82,8 +82,8 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
   : node(node), n(n) {
   int total = node.arenaEntrants.fetch_add(n, std::memory_order_relaxed) + n;
   if (total > node.reservedSlots) {
-    LOG_WARN("{} with {} threads brings task arena entrants to {}, past the {} slots reserved from "
-             "server.http.threads; excess entrants can block behind arena work",
+    LOG_WARN("{} with {} threads brings task arena entrants to {}, past the {} reserved slots; "
+             "excess entrants can block behind arena work",
              server, n, total, node.reservedSlots);
   }
 }
@@ -116,14 +116,16 @@ static std::string defaultNodeId(const ServerConfig& server, bool& random) {
 
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   : config(std::move(config)), mode(mode), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
+    controlThreads(std::max(1, this->config.server.control_threads)),
     reservedSlots(reservedArenaSlots(this->config)),
     taskArena(workers + reservedSlots, reservedSlots,
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
-    indexArena(workers + 1, 1, oneapi::tbb::task_arena::priority::low) {
+    indexArena(workers + 1 + controlThreads, 1 + controlThreads, oneapi::tbb::task_arena::priority::low) {
   if (this->config.node.id.empty()) this->config.node.id = defaultNodeId(this->config.server, this->config.node.random);
   this->config.node.validate();
   if (!this->config.read_only) lifetime = newUuid();
   ensureWorkerPool(workers + 1);
+  control = std::make_unique<ControlExecutor>(controlThreads);
   if (following() && this->config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers
@@ -184,10 +186,14 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
 }
 
 LuxirNode::~LuxirNode() {
+  // Complete pending waits while they can still enqueue replies. A control
+  // task registering a wait during the drain gets an immediate cancellation.
+  commitWaits->close();
+  // Drain before tearing down the node state used by queued control work.
+  control->stop();
   pluginStates.clear();
   scrubber->stop();
   if (follower) follower->stop();
-  commitWaits->close();
 }
 
 std::shared_ptr<Collection> LuxirNode::checkLoaded(std::shared_ptr<Collection> collection) {

@@ -24,7 +24,7 @@ std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::str
   auto info = Manifest::decode(manifest.bytes, arena);
   auto files = filesOf(info);
   next->reuseFiles(*old, files, files);
-  auto suspects = CorruptionMarker::read(*old);
+  auto suspects = CorruptionMarker::read(*old).suspects;
   std::erase_if(suspects, [&](const auto& name) {
     return std::ranges::none_of(files, [&](const auto& file) { return file.name == name; });
   });
@@ -32,7 +32,7 @@ std::string copySnapshot(TenantCatalog& storage, std::string_view name, std::str
   // Under verify-on-open=full the linked files are read once, here, before
   // a writer builds on them. A mismatch names the file; the follower-bound
   // directory keeps the damaged copy for a repair.
-  if (verify) verifyFiles(*next, files);
+  if (verify) verifyFiles(*next, files, true, suspects);
   // The new root may reference only files that are present in full.
   std::vector<Directory::FileInfo> listing;
   next->listFiles(listing);

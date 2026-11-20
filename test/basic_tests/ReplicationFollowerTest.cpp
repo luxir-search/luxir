@@ -1907,6 +1907,25 @@ TEST_F(ReplicationFollowerTest, scrubHitIsRepairedByTheNextSync) {
   EXPECT_EQ(0u, follower->getScrubber().scrub());
 }
 
+TEST_F(ReplicationFollowerTest, installPreservesMarkerWrittenAfterStaging) {
+  startSource();
+  auto snapshot = source->getCollection("main")->getShard()->getSnapshots().snapshot();
+  followerConfig.replication.source = "http://127.0.0.1:" + std::to_string(sourcePort);
+  LuxirNode replica(followerConfig, LuxirNode::Mode::PULL);
+  auto& catalog = replica.collections().catalog();
+  auto dir = catalog.directory(catalog.reserve("main", snapshot->id.incarnation));
+  CorruptionMarker::write(*dir, std::array{std::string("s0_absent")}, "before staging");
+  std::vector<std::string> suspects{snapshot->files.at(0).name};
+  Signal::listen("snapshotRootDurable", [&](void*, void*, void*) -> void* {
+    CorruptionMarker::write(*dir, suspects, "after staging");
+    return nullptr;
+  });
+  auto cleanup = scope_guard([] { Signal::unlisten("snapshotRootDurable"); });
+  std::ostringstream output;
+  ASSERT_TRUE(replica.getFollower()->pull(output)) << output.str();
+  EXPECT_EQ(suspects, CorruptionMarker::read(*dir).suspects);
+}
+
 TEST_F(ReplicationFollowerTest, repairDownloadsIntactSuspectFile) {
   startSource(); startFollower();
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
@@ -2035,7 +2054,7 @@ TEST_F(ReplicationFollowerTest, promotionPreservesSuspectFiles) {
     auto selected = storage.current("main");
     ASSERT_TRUE(selected);
     EXPECT_NE(snapshot->id.incarnation, *selected);
-    EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.directory(*selected)));
+    EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.directory(*selected)).suspects);
   }
   auto writerConfig = followerConfig;
   writerConfig.replication.source.clear();

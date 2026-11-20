@@ -591,6 +591,10 @@ struct ServiceStats {
   ActivityStats merge;
   ActivityStats vector_build;
   ActivityStats reader_refresh;
+  uint64_t control_threads = 0;
+  uint64_t control_busy = 0;
+  uint64_t control_queued = 0;
+  uint64_t control_completed = 0;
   bool read_only = false;
 };
 struct ProcessStats {

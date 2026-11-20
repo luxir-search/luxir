@@ -166,3 +166,32 @@ TEST_F(StorageExampleTest, aWriterOpenListsItsIncarnationOnce) {
   auto dir = reopened.collections().catalog().directory(*reopened.collections().catalog().current("main"));
   EXPECT_FALSE(CorruptionMarker::present(*dir)) << "the verified marker was not cleared";
 }
+
+TEST_F(StorageExampleTest, aFollowerOpenListsItsIncarnationOnce) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  config.store.layers = {"counting"};
+  config.replication.source = "http://127.0.0.1:1";
+  LuxirNode node(config, LuxirNode::Mode::PULL);
+  auto& collections = node.collections();
+  auto& catalog = collections.catalog();
+  auto id = catalog.reserve("main");
+  auto dir = catalog.directory(id);
+  {
+    CommitSnapshotRegistry snapshots(*dir);
+    IndexWriter writer(snapshots, {}, nullptr, 10, id);
+    auto snapshot = snapshots.snapshot();
+    ASSERT_FALSE(snapshot->files.empty());
+    CorruptionMarker::write(*dir, std::array{snapshot->files.front().name}, "test suspect");
+  }
+  catalog.activate("main", id);
+
+  auto* layer = collections.storage().find<CountingLayer>();
+  ASSERT_NE(nullptr, layer);
+  auto lists = [&] { return layer->counters->count("list", "t/t0/i/" + id); };
+  auto before = lists();
+  collections.open(Collections::Role::FOLLOWER);
+  EXPECT_EQ(id, node.getCollection("main")->getShard()->getSnapshots().snapshot()->id.incarnation);
+  EXPECT_EQ(before + 1, lists());
+  EXPECT_FALSE(CorruptionMarker::present(*dir));
+}

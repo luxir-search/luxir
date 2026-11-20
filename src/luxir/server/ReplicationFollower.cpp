@@ -792,21 +792,22 @@ struct ReplicationFollower::Impl {
   }
 
   // Verifies every file of `snapshot` in the target directory, downloading what
-  // is missing or suspect, and makes them durable.
-  void stageFiles(Clients& clients, const Key& key, const CollectionId& name, Directory& dir, const std::shared_ptr<const CommitSnapshot>& previous,
-                  const CommitSnapshot& snapshot, const std::shared_ptr<Collection>& active) {
-    auto suspects = CorruptionMarker::read(dir);
+  // is missing or suspect, and makes them durable. Returns the target markers read.
+  std::vector<std::string> stageFiles(Clients& clients, const Key& key, const CollectionId& name, Directory& dir,
+                                      const std::shared_ptr<const CommitSnapshot>& previous,
+                                      const CommitSnapshot& snapshot, const std::shared_ptr<Collection>& active) {
+    auto observed = CorruptionMarker::read(dir);
     std::map<std::string, FileDescriptor> verified;
     { std::lock_guard lock(mutex); verified = states[key].verified; }
     if (!previous && active && !active->isFailed()) {
       if (auto shard = active->getShard()) {
         auto& source = shard->getSnapshots();
         if (auto serving = source.snapshot()) {
-          auto sourceSuspects = CorruptionMarker::read(source.dir);
+          auto sourceSuspects = CorruptionMarker::read(source.dir).suspects;
           std::vector<FileDescriptor> available;
           for (const auto& file : serving->files)
             if (!std::ranges::binary_search(sourceSuspects, file.name)
-                && !std::ranges::binary_search(suspects, file.name)) available.push_back(file);
+                && !std::ranges::binary_search(observed.suspects, file.name)) available.push_back(file);
           for (auto& file : dir.reuseFiles(source.dir, available, snapshot.files))
             verified.insert_or_assign(file.name, std::move(file));
         }
@@ -822,7 +823,7 @@ struct ReplicationFollower::Impl {
     for (const auto& file : snapshot.files) {
       if (file.name.empty() || file.name == "." || file.name == ".." || file.name.find_first_of("/\\") != std::string::npos
           || file.name.starts_with(Manifest::kPrefix) || file.name.ends_with(".tmp") || !unique.insert(file.name).second) throw std::runtime_error("invalid snapshot file name");
-      bool suspect = std::ranges::binary_search(suspects, file.name);
+      bool suspect = std::ranges::binary_search(observed.suspects, file.name);
       if (suspect && durableNames.contains(file.name))
         throw std::runtime_error("cannot replace suspect file in serving snapshot: " + file.name + "; unload and repair the collection");
       bool reuse = !suspect && verified.contains(file.name) && verified.at(file.name) == file;
@@ -860,6 +861,7 @@ struct ReplicationFollower::Impl {
       if (!durableNames.contains(file.name)) names.push_back(file.name);
     }
     dir.sync(names);
+    return std::move(observed.markers);
   }
 
   void sync(Clients& clients, const Key& key) {
@@ -898,11 +900,11 @@ struct ReplicationFollower::Impl {
         auto candidate = node.collections().stage(name, snapshot->id.incarnation);
         std::lock_guard lock(mutex); state.candidate = std::move(candidate);
       }
-      stageFiles(clients, key, name, state.candidate->dir(), state.candidate->committed(), *snapshot, decision.active);
+      auto markers = stageFiles(clients, key, name, state.candidate->dir(), state.candidate->committed(), *snapshot, decision.active);
       stillAdvertised();
       if (stopping.stop_requested()) return;
       // An unregistered candidate's publication is invisible until activation.
-      auto prepared = node.collections().prepare(*state.candidate, snapshot);
+      auto prepared = node.collections().prepare(*state.candidate, snapshot, markers);
       { std::lock_guard lock(mutex); state.candidate.reset(); }
       std::lock_guard lock(mutex);
       state.prepared = std::make_unique<Collections::Prepared>(std::move(prepared));

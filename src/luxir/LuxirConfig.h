@@ -38,6 +38,12 @@ struct ServerConfig {
   int workers = 0;
   static constexpr int kSmallNodeCores = 4;
 
+  // Threads of the node's control executor (ControlExecutor): administration,
+  // schema changes, collection lifecycle, replication transfers and timers,
+  // and detailed stats. Dedicated OS threads outside the worker pool.
+  // At least 1.
+  int control_threads = 2;
+
   int resolveWorkers() const {
     if (workers > 0) return workers;
     int cores = std::max(1, oneapi::tbb::info::default_concurrency());
