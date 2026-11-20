@@ -26,12 +26,16 @@
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/Query.h"
+#include "luxir/query/RangeFieldQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/TermInSetQuery.h"
+#include "luxir/query/TermPattern.h"
 #include "luxir/query/TermRangeQuery.h"
 #include "luxir/query/ValueSequence.h"
 #include "luxir/query/FieldResolver.h"
+#include "luxir/query/ParseView.h"
 #include "luxir/schema/ValCoerce.h"
+#include "luxir/schema/RangeBounds.h"
 #include "luxir/schema/FieldPattern.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/Clock.h"
@@ -124,6 +128,7 @@ class QueryBuilder {
   CoerceContext coerceContext;
   std::string_view opName;
   std::vector<api::Warning>* warnings;
+  int32_t minLiteralPrefix;
 
   // Per-codepoint approximation of field folding for automaton literals.
   // Combining-sequence patterns may not compose exactly like whole terms.
@@ -180,47 +185,70 @@ class QueryBuilder {
     }
   };
 
-public:
-  // The numeric field types stored in the shared int column (INT raw,
-  // FLOAT/DOUBLE sortable bits, DATE epoch units).  Match and range on these
-  // build a NumericPredicateQuery over the column. Public because schema-aware
-  // string parsers select arms by the same classification.
-  static bool isNumericColumnType(FieldType::Type t) {
-    return t == FieldType::Type::INT || t == FieldType::Type::FLOAT
-        || t == FieldType::Type::DOUBLE || t == FieldType::Type::DATE;
+private:
+  static void requireNumericColumn(const ResolvedFieldHandle& target) {
+    if (!target.fieldType->hasColumn()) {
+      throw std::runtime_error(std::format(
+          "Range query field '{}' is not column-stored", target.physicalName));
+    }
   }
 
-private:
+  void warnSkippedGranule(const ResolvedFieldHandle& target, const api::Val& value,
+                           const FieldType::IntWindow& window) {
+    if (window.granuleSkipped && warnings != nullptr) {
+      std::string_view text = std::get<std::string_view>(value.kind);
+      std::string message = opName.empty()
+          ? std::format(
+                "DATE field '{}': date granule '{}' skipped: no such local granule in {}",
+                target.physicalName, text, coerceContext.timeZone.name())
+          : std::format(
+                "op '{}', DATE field '{}': date granule '{}' skipped: "
+                "no such local granule in {}",
+                opName, target.physicalName, text, coerceContext.timeZone.name());
+      addWarning(*warnings, pool, "date_granule_skipped", message);
+    }
+  }
+
+  FieldType::IntWindow coerceIntWindow(const ResolvedFieldHandle& target,
+                                      const api::Val& value, FieldType::LiteralUse use) {
+    auto window = target.fieldType->coerceIntWindow(value, use, target.physicalName, coerceContext);
+    warnSkippedGranule(target, value, window);
+    return window;
+  }
+
+  Query* createNumericPredicate(std::string_view field, const FieldType::IntWindow& window,
+                                 float boost = 1.0f) {
+    Query* query = window.empty() ? matchNoDocs()
+        : pool.make<NumericPredicateQuery>(field, window.lo, window.hi,
+            window.unroundedNow ? FilterKeyScope::REQUEST_STABLE
+                                : FilterKeyScope::SEGMENT_STABLE);
+    return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
+  }
+
+  Query* createRangeFieldPredicate(std::string_view field, const FieldType::IntWindow& window,
+      RangeFieldQuery::Relation relation = RangeFieldQuery::Relation::INTERSECTS, float boost = 1.0f) {
+    Query* query = window.empty() ? matchNoDocs()
+        : pool.make<RangeFieldQuery>(field, relation, window.lo, window.hi,
+            window.unroundedNow ? FilterKeyScope::REQUEST_STABLE : FilterKeyScope::SEGMENT_STABLE);
+    return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
+  }
 
   template<typename T>
-  std::optional<int64_t> coerceAnyOfNumeric(FieldType& fieldType, std::string_view field,
-                             const T& value) {
-    if (fieldType.type() == FieldType::DATE) {
-      auto& date = (DateFieldType&)fieldType;
+  std::optional<int64_t> coerceMember(FieldType& fieldType, std::string_view field,
+                                      const T& value) {
+    auto window = [&] {
       if constexpr (std::is_same_v<T, api::Val>) {
-        return date.coerceDateInstant(value, field, coerceContext);
+        return fieldType.coerceIntWindow(value, FieldType::LiteralUse::MEMBER, field, coerceContext);
       } else {
-        return date.coerceDateInstant(coerce::scalarVal(value), field, coerceContext);
+        return fieldType.coerceIntWindow(coerce::scalarVal(value), FieldType::LiteralUse::MEMBER,
+                                         field, coerceContext);
       }
+    }();
+    if (window.empty()) return std::nullopt;
+    if (window.lo != window.hi) {
+      throw std::logic_error(std::format("Field '{}': MEMBER coercion must return a point or empty", field));
     }
-    if constexpr (std::is_same_v<T, api::Val>) {
-      return fieldType.coerceColInt64(value, field, coerceContext);
-    } else {
-      switch (fieldType.type()) {
-        case FieldType::Type::INT:
-          return coerce::toInt64Scalar(value, field);
-        case FieldType::Type::FLOAT:
-          return (int64_t)floatToSortableInt32(
-              coerce::toFloatScalar(value, field));
-        case FieldType::Type::DOUBLE:
-          return doubleToSortableInt64(
-              coerce::toDoubleScalar(value, field));
-        default:
-          break;
-      }
-      api::Val scalar = coerce::scalarVal(value);
-      return fieldType.coerceColInt64(scalar, field, coerceContext);
-    }
+    return window.lo;
   }
 
   template<typename T>
@@ -230,7 +258,7 @@ private:
     if constexpr (std::is_same_v<T, api::Val>) {
       return fieldType.coerceTerm(value, field, buf);
     } else {
-      return coerce::toTextScalar(value, field, buf);
+      return fieldType.coerceTerm(coerce::scalarVal(value), field, buf);
     }
   }
 
@@ -379,17 +407,17 @@ public:
   QueryBuilder(MemPool& pool, Schema& schema, const CoerceContext& coerceContext,
                std::string_view opName = {},
                std::vector<api::Warning>* warnings = nullptr, FieldResolver* fields = nullptr,
-               IndexReader* reader = nullptr)
-    : pool(pool), schema(schema), reader(reader), localFields(schema), fields(fields ? *fields : localFields),
+               IndexReader* reader = nullptr, int32_t minLiteralPrefix = 0)
+    : pool(pool), schema(schema), reader(reader), localFields(schema, nullptr, reader ? reader->path() : std::string_view{}), fields(fields ? *fields : localFields),
       coerceContext(coerceContext), opName(opName),
-      warnings(warnings) {}
+      warnings(warnings), minLiteralPrefix(minLiteralPrefix) {}
 
   Query* matchNoDocs() {
     return pool.make<MatchNoDocsQuery>();
   }
 
   Query* createExistsQuery(std::string_view field) {
-    return createExistsQuery(fields.resolve(field, OpClass::EXISTS, opName));
+    return createExistsQuery(fields.resolveLocal(field, OpClass::EXISTS, opName));
   }
 
   Query* createExistsQuery(const ResolvedFieldHandle& target) {
@@ -405,7 +433,7 @@ public:
   CanonicalValueSet canonicalizeFieldValues(
       std::string_view field, ValueSequence values,
       bool preserveInputOrder = false) {
-    return canonicalizeFieldValues(fields.resolve(field, OpClass::VALUE, opName), values, preserveInputOrder);
+    return canonicalizeFieldValues(fields.resolveLocal(field, OpClass::VALUE, opName), values, preserveInputOrder);
   }
 
   CanonicalValueSet canonicalizeFieldValues(
@@ -417,12 +445,13 @@ public:
     }
 
     FieldType& fieldType = *target.fieldType;
-    if (isNumericColumnType(fieldType.type())) {
+    fieldType.requireCapability(FieldType::ANY_OF, "any_of", field);
+    if (FieldType::isNumericColumn(fieldType.type())) {
       std::vector<int64_t> encoded;
       encoded.reserve(values.size());
       values.visit([&](const auto& viewed) {
         for (const auto& value : viewed) {
-          if (auto encodedValue = coerceAnyOfNumeric(fieldType, field, value)) {
+          if (auto encodedValue = coerceMember(fieldType, field, value)) {
             encoded.push_back(*encodedValue);
           }
         }
@@ -446,15 +475,6 @@ public:
       }
       return CanonicalValueSet(
           target, std::span<const int64_t>(stored));
-    }
-
-    bool termBacked = fieldType.type() == FieldType::Type::TEXT
-        || fieldType.type() == FieldType::Type::STRING
-        || fieldType.type() == FieldType::Type::ID;
-    if (!termBacked) {
-      throw std::runtime_error(std::format(
-          "Field '{}' does not support exact value canonicalization",
-          field));
     }
 
     auto* normalizer = fields.chain(target);
@@ -511,7 +531,7 @@ public:
     auto field = poolCopy(values.target.physicalName);
     FieldType& fieldType = *values.target.fieldType;
     if (values.numeric()) {
-      if (!isNumericColumnType(fieldType.type()) || !fieldType.hasColumn()) {
+      if (!fieldType.hasColumn()) {
         throw std::runtime_error(std::format(
             "AnyOf query field '{}' does not support exact equality through an index or column",
             field));
@@ -536,10 +556,8 @@ public:
           field, encoded, intervals.first(intervalCount));
     }
 
-    bool termBacked = fieldType.type() == FieldType::Type::TEXT
-        || fieldType.type() == FieldType::Type::STRING
-        || fieldType.type() == FieldType::Type::ID;
-    if (!values.termBacked() || !termBacked || !fieldType.indexed()) {
+    assert(values.termBacked());
+    if (!fieldType.indexed()) {
       throw std::runtime_error(std::format(
           "AnyOf query field '{}' does not support exact equality through an index or column",
           field));
@@ -547,7 +565,8 @@ public:
     auto terms = values.terms();
     if (terms.size() == 1) {
       Query* term = pool.make<TermQuery>(field, terms[0]);
-      return pool.make<ConstantScoreQuery>(term);
+      return pool.make<ConstantScoreQuery>(
+          term, Query::ScoreProfile::automatic(1.0f));
     }
     return pool.make<TermInSetQuery>(field, terms);
   }
@@ -564,90 +583,124 @@ public:
   // Build a prefix query over term-backed fields. The prefix is normalized
   // (not tokenized) for analyzed TEXT fields and normalized for STRING; ID is verbatim;
   // the field and prefix views must outlive the returned query.
+  // maxExpansions 0 expands every matching term; a positive value keeps the
+  // highest-docFreq terms per segment, including with caseInsensitive.
+  // There is no upper bound; operator expansion and memory limits still apply.
   Query* createPrefixQuery(std::string_view field, std::string_view prefix,
-                            bool caseInsensitive = false) {
-    return createPrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), prefix,
-                              caseInsensitive);
+                           int32_t maxExpansions = 0, bool caseInsensitive = false) {
+    return createPrefixQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), prefix,
+                             maxExpansions, caseInsensitive);
   }
 
   Query* createPrefixQuery(const ResolvedFieldHandle& target, std::string_view prefix,
-                            bool caseInsensitive = false) {
+                           int32_t maxExpansions = 0, bool caseInsensitive = false) {
+    if (maxExpansions < 0) {
+      throw std::runtime_error(std::format(
+          "Prefix query max_expansions must not be negative (got {})", maxExpansions));
+    }
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
-    switch (fieldType.type()) {
-      case FieldType::Type::TEXT:
-      case FieldType::Type::ID:
-      case FieldType::Type::STRING:
-        prefix = normalizeLiteral(target, prefix, false);
-        if (!fieldType.indexed()) {
-          throw std::runtime_error(std::format(
-              "Prefix query requires an indexed field: {}", field));
-        }
-        if (caseInsensitive) {
-          return makeCaseInsensitiveTerm(AutomatonQuery::Kind::PREFIX, target, field, prefix);
-        }
-        return pool.make<PrefixQuery>(field, PackedTerm::fitPrefix(fieldType.longTerms, prefix));
-      default:
-        throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
+    fieldType.requireCapability(FieldType::PREFIX | (caseInsensitive ? FieldType::PATTERN : 0u),
+                                "Prefix query", field);
+    if (!fieldType.indexed()) {
+      throw std::runtime_error(std::format(
+          "Prefix query requires an indexed field: {}", field));
     }
+    prefix = normalizeLiteral(target, prefix, false);
+    checkLiteralPrefix("Prefix", field, prefix, prefix.size());
+    if (caseInsensitive) {
+      return makeCaseInsensitiveTerm(AutomatonQuery::Kind::PREFIX, target, field,
+                                     prefix, 1.0f, maxExpansions);
+    }
+    return pool.make<PrefixQuery>(field, PackedTerm::fitPrefix(fieldType.longTerms, prefix), maxExpansions);
   }
 
   // With `caseInsensitive`, literals (after field folding) and, for regex,
   // character classes also accept their simple Unicode case alternates.
   Query* createWildcardQuery(std::string_view field, std::string_view pattern,
                              bool caseInsensitive = false) {
-    return createWildcardQuery(fields.resolve(field, OpClass::SEARCH, opName), pattern,
+    return createWildcardQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), pattern,
                                caseInsensitive);
   }
 
   Query* createWildcardQuery(const ResolvedFieldHandle& target, std::string_view pattern,
                              bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
-    checkAutomatonField("Wildcard", target);
-    if (auto* chain = fields.chain(target)) {
-      FieldCodepointFolder folder(chain);
-      return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", target, field, pattern,
-                                &folder, caseInsensitive, automaton::compileWildcard);
-    }
-    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Wildcard", target, field, pattern,
-                              nullptr, caseInsensitive, automaton::compileWildcard);
+    return makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, field, pattern, caseInsensitive,
+        compileQueryPattern("Wildcard", target, pattern, caseInsensitive, automaton::compileWildcard));
   }
 
   Query* createRegexQuery(std::string_view field, std::string_view pattern,
                           bool caseInsensitive = false) {
-    return createRegexQuery(fields.resolve(field, OpClass::SEARCH, opName), pattern,
+    return createRegexQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), pattern,
                             caseInsensitive);
   }
 
   Query* createRegexQuery(const ResolvedFieldHandle& target, std::string_view pattern,
                           bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
-    checkAutomatonField("Regex", target);
-    if (auto* chain = fields.chain(target)) {
-      FieldCodepointFolder folder(chain);
-      return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", target, field, pattern,
-                                &folder, caseInsensitive, automaton::compileRegex);
-    }
-    return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, "Regex", target, field, pattern,
-                              nullptr, caseInsensitive, automaton::compileRegex);
+    return makeAutomatonQuery(AutomatonQuery::Kind::REGEX, field, pattern, caseInsensitive,
+                              compileQueryPattern("Regex", target, pattern, caseInsensitive, automaton::compileRegex));
+  }
+
+  // A regex compiled as createRegexQuery compiles it, for callers that test
+  // terms themselves.
+  TermPattern compileRegexPattern(const ResolvedFieldHandle& target, std::string_view pattern,
+                                  bool caseInsensitive = false) {
+    return compileFieldPattern("Regex", target, pattern, caseInsensitive, automaton::compileRegex);
+  }
+
+  // A prefix normalized and fitted as createPrefixQuery matches it.
+  std::string_view normalizePrefix(const ResolvedFieldHandle& target, std::string_view prefix) {
+    return PackedTerm::fitPrefix(target.fieldType->longTerms,
+                                 normalizeLiteral(target, prefix, false));
   }
 
 private:
-  FieldType* checkAutomatonField(std::string_view label, const ResolvedFieldHandle& target) {
+  void checkLiteralPrefix(std::string_view kind, std::string_view field,
+                         std::string_view pattern, size_t length) const {
+    if (minLiteralPrefix <= 0 || length >= (size_t) minLiteralPrefix) return;
+    throw ResourceExhaustedError(std::format(
+        "{} query '{}' on field '{}' needs a literal prefix of at least {} bytes; use a longer literal prefix",
+        kind, pattern, field, minLiteralPrefix), "pattern_prefix_too_short");
+  }
+
+  TermPattern compileFieldPattern(std::string_view label, const ResolvedFieldHandle& target,
+      std::string_view pattern, bool caseInsensitive,
+      automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
+                                  const automaton::CodepointFolder*, bool)) {
+    target.fieldType->requireCapability(FieldType::PATTERN, std::format("{} query", label), target.physicalName);
+    checkIndexedField(label, target);
+    auto* chain = fields.chain(target);
+    FieldCodepointFolder folder(chain);
+    const automaton::CodepointFolder* folding = chain ? &folder : nullptr;
+    return compilePattern(label, target, pattern, folding, caseInsensitive, compile);
+  }
+
+  TermPattern compileQueryPattern(std::string_view label, const ResolvedFieldHandle& target,
+      std::string_view pattern, bool caseInsensitive,
+      automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
+                                  const automaton::CodepointFolder*, bool)) {
+    auto compiled = compileFieldPattern(label, target, pattern, caseInsensitive, compile);
+    if (minLiteralPrefix > 0
+        && compiled.dfa.maxAcceptedLength() == automaton::ByteDfaView::UNBOUNDED) {
+      auto* chain = fields.chain(target);
+      FieldCodepointFolder folder(chain);
+      auto length = caseInsensitive
+          ? compilePattern(label, target, pattern, chain ? &folder : nullptr, false, compile)
+                .dfa.commonPrefixAndState().first.size()
+          : compiled.dfa.commonPrefixAndState().first.size();
+      checkLiteralPrefix(label, target.physicalName, pattern, length);
+    }
+    return compiled;
+  }
+
+  void checkIndexedField(std::string_view label, const ResolvedFieldHandle& target) {
     const auto& field = target.physicalName;
     FieldType& fieldType = *target.fieldType;
-    switch (fieldType.type()) {
-      case FieldType::Type::TEXT:
-      case FieldType::Type::ID:
-      case FieldType::Type::STRING:
-        break;
-      default:
-        throw std::runtime_error(std::format("{} query on unsupported field type: {}", label, field));
-    }
     if (!fieldType.indexed()) {
       throw std::runtime_error(std::format("{} query requires an indexed field: {}", label, field));
     }
-    return &fieldType;
   }
 
   std::string_view poolCopy(std::string_view bytes) {
@@ -657,57 +710,60 @@ private:
     return {copy, bytes.size()};
   }
 
-  Query* makeAutomatonQuery(AutomatonQuery::Kind queryKind, std::string_view label,
-                            const ResolvedFieldHandle& target,
-                            std::string_view field, std::string_view pattern,
-                            const automaton::CodepointFolder* folder, bool caseInsensitive,
-                            automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
-                                                          const automaton::CodepointFolder*, bool)) {
-    automaton::ByteDfa compiled;
+  TermPattern compilePattern(std::string_view label, const ResolvedFieldHandle& target,
+                             std::string_view pattern, const automaton::CodepointFolder* folder,
+                             bool caseInsensitive,
+                             automaton::ByteDfa (*compile)(std::string_view, automaton::Budget&,
+                                                           const automaton::CodepointFolder*, bool)) {
+    TermPattern out;
     try {
       automaton::Budget budget;
-      compiled = compile(pattern, budget, folder, caseInsensitive);
+      out.dfa = compile(pattern, budget, folder, caseInsensitive);
     } catch (const std::runtime_error& e) {
       throw std::runtime_error(std::format("{} query for field '{}' pattern '{}': {}",
-                                           label, field, pattern, e.what()));
+                                           label, target.physicalName, pattern, e.what()));
     }
     // Do this before classify(), which treats languages requiring >255 bytes
     // as empty. The DFA prefix already accounts for escapes and field folding.
-    auto prefixAndState = compiled.commonPrefixAndState();
+    auto prefixAndState = out.dfa.commonPrefixAndState();
     auto kept = PackedTerm::fitPrefix(target.fieldType->longTerms, prefixAndState.first);
-    if (kept.size() < prefixAndState.first.size()) {
-      return pool.make<PrefixQuery>(field, poolCopy(kept));
-    }
-    std::string exactOrPrefix;
-    automaton::ByteDfaKind kind = compiled.classify(&exactOrPrefix);
-    if (kind == automaton::ByteDfaKind::NONE) return pool.make<MatchNoDocsQuery>();
-    std::string commonPrefix;
-    std::string commonSuffix;
-    automaton::ByteDfaView::State initialState = compiled.start();
-    std::optional<TermPolicy> fittedPolicy;
-    if (kind == automaton::ByteDfaKind::NORMAL) {
+    if (kept.size() < prefixAndState.first.size()) out.fittedPrefix = std::string(kept);
+    out.kind = out.dfa.classify(&out.literal);
+    if (out.kind == automaton::ByteDfaKind::NORMAL) {
       // Exact and prefix shapes see fitted terms correctly; a general pattern
       // may test hash or truncation bytes. Planning decides whether it can.
       TermPolicy policy = target.fieldType->longTerms;
-      if (policy != TermPolicy::REJECT) fittedPolicy = policy;
-      commonPrefix = std::move(prefixAndState.first);
-      auto state = prefixAndState.second;
-      commonSuffix = compiled.commonSuffix();
-      initialState = state;
-      exactOrPrefix.clear();
+      if (policy != TermPolicy::REJECT) out.fittedPolicy = policy;
+      out.literal = std::move(prefixAndState.first);
+      out.afterLiteral = prefixAndState.second;
+      // Only an automaton query scans with it, and a fitted prefix replaces that.
+      if (!out.fittedPrefix) out.commonSuffix = out.dfa.commonSuffix();
     }
+    return out;
+  }
+
+  Query* makeAutomatonQuery(AutomatonQuery::Kind queryKind, std::string_view field,
+                            std::string_view pattern, bool caseInsensitive, TermPattern compiled,
+                            int32_t maxExpansions = 0) {
+    if (compiled.fittedPrefix) return pool.make<PrefixQuery>(field, poolCopy(*compiled.fittedPrefix), maxExpansions);
+    if (compiled.kind == automaton::ByteDfaKind::NONE) return pool.make<MatchNoDocsQuery>();
+    bool normal = compiled.kind == automaton::ByteDfaKind::NORMAL;
     std::string_view patternCopy = poolCopy(pattern);
-    std::string_view exactOrPrefixCopy = poolCopy(exactOrPrefix);
-    DfaScanPlan scanPlan{poolCopy(commonPrefix), poolCopy(commonSuffix), initialState};
-    automaton::ByteDfaView frozen = compiled.freeze(pool);
-    return pool.make<AutomatonQuery>(field, queryKind, caseInsensitive, patternCopy, frozen, kind,
-                                    exactOrPrefixCopy, scanPlan, fittedPolicy);
+    std::string_view exactOrPrefixCopy = normal ? std::string_view() : poolCopy(compiled.literal);
+    DfaScanPlan scanPlan{normal ? poolCopy(compiled.literal) : std::string_view(),
+                         poolCopy(compiled.commonSuffix),
+                         normal ? compiled.afterLiteral : compiled.dfa.start()};
+    automaton::ByteDfaView frozen = compiled.dfa.freeze(pool);
+    return pool.make<AutomatonQuery>(field, queryKind, caseInsensitive, patternCopy, frozen,
+                                     compiled.kind, exactOrPrefixCopy, scanPlan,
+                                     compiled.fittedPolicy, maxExpansions);
   }
 
   // An already-normalized literal, escaped and compiled without a field folder
   // so non-idempotent normalizers run only once. Prefix adds the wildcard last.
   Query* makeCaseInsensitiveTerm(AutomatonQuery::Kind kind, const ResolvedFieldHandle& target,
-                                 std::string_view field, std::string_view term, float boost = 1.0f) {
+                                 std::string_view field, std::string_view term, float boost = 1.0f,
+                                 int32_t maxExpansions = 0) {
     std::string escaped;
     escaped.reserve(term.size());
     for (char c : term) {
@@ -716,8 +772,9 @@ private:
     }
     bool prefix = kind == AutomatonQuery::Kind::PREFIX;
     if (prefix) escaped.push_back('*');
-    Query* query = makeAutomatonQuery(kind, prefix ? "Prefix" : "Match",
-                                      target, field, escaped, nullptr, true, automaton::compileWildcard);
+    Query* query = makeAutomatonQuery(kind, field, escaped, true,
+        compilePattern(prefix ? "Prefix" : "Match", target, escaped, nullptr, true,
+                       automaton::compileWildcard), maxExpansions);
     return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
   }
 
@@ -738,7 +795,7 @@ public:
                           std::optional<int> maxEdits = std::nullopt,
                           std::optional<int> prefixLength = std::nullopt,
                           int maxExpansions = 0) {
-    return createFuzzyQuery(fields.resolve(field, OpClass::SEARCH, opName), term, maxEdits, prefixLength, maxExpansions);
+    return createFuzzyQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), term, maxEdits, prefixLength, maxExpansions);
   }
 
   Query* createFuzzyQuery(const ResolvedFieldHandle& target, std::string_view term,
@@ -747,15 +804,8 @@ public:
                           int maxExpansions = 0) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
-    switch (fieldType.type()) {
-      case FieldType::Type::TEXT:
-      case FieldType::Type::ID:
-      case FieldType::Type::STRING:
-        term = normalizeLiteral(target, term, false);
-        break;
-      default:
-        throw std::runtime_error(std::format("Fuzzy query on unsupported field type: {}", field));
-    }
+    fieldType.requireCapability(FieldType::FUZZY, "Fuzzy query", field);
+    term = normalizeLiteral(target, term, false);
     size_t sourceLen = term.size();
     term = fitTerm(target, term); // Edit distance is measured in indexed term bytes.
     int resolvedEdits;
@@ -809,16 +859,40 @@ public:
   Query* createMatchQuery(std::string_view field, std::string_view value,
                           Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
                           bool caseInsensitive = false) {
-    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), value, op, minMatch, boost, caseInsensitive);
+    return createMatchQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), value, op, minMatch, boost, caseInsensitive);
   }
 
   Query* createMatchQuery(const ResolvedFieldHandle& target, std::string_view value,
                           Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
                           bool caseInsensitive = false) {
+    if (value.empty() && FieldType::isNumericColumn(target.fieldType->type())) {
+      target.fieldType->requireCapability(FieldType::MATCH, "Match query", target.physicalName);
+      return matchNoDocs();
+    }
+    return createMatchQuery(target, coerce::scalarVal(value), op, minMatch, boost, caseInsensitive);
+  }
+
+private:
+  FieldType::TermWindow retainTermWindow(FieldType::TermWindow window, const char* buf) {
+    if (window.lo.data() == buf) {
+      bool point = window.point();
+      window.lo = poolCopy(window.lo);
+      window.hi = point ? window.lo : poolCopy(window.hi);
+    }
+    return window;
+  }
+
+  Query* createMatchQueryImpl(const ResolvedFieldHandle& target, FieldType::TermWindow window,
+                              Operator op, int minMatch, float boost, bool caseInsensitive) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
-    switch (fieldType.type()) {
-      case FieldType::Type::TEXT: {
+    if (!window.point()) {
+      Query* query = pool.make<TermRangeQuery>(field, window.lo, true, window.hi, true);
+      return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
+    }
+    auto value = window.lo;
+    switch (FieldType::storage(fieldType.type())) {
+      case FieldType::Storage::TEXT: {
         auto terms = caseInsensitive ? analyzeText<false>(target, value) : analyzeText(target, value);
         if (terms.empty()) return matchNoDocs();
         if (!caseInsensitive) {
@@ -835,7 +909,7 @@ public:
           // Character mappings can span scalars or be non-idempotent. In
           // that case use the analyzed bytes verbatim for case expansion.
           if (chain->hasCharFilters() || !automaton::caseAlternatesFoldToSelf(term, folder)) {
-            checkAutomatonField("Match", target);
+            checkIndexedField("Match", target);
             return makeCaseInsensitiveTerm(AutomatonQuery::Kind::MATCH, target, field, term, boost);
           }
           return pool.make<TermQuery>(field, fitTerm(target, term), boost);
@@ -845,31 +919,19 @@ public:
         for (size_t i = 0; i < terms.size(); i++) clauses[i] = makeTerm(terms[i]);
         return combineAnalyzedClauses(clauses, op, minMatch);
       }
-      case FieldType::Type::STRING:
-      case FieldType::Type::ID:
+      case FieldType::Storage::TERMS:
         if (caseInsensitive) {
-          checkAutomatonField("Match", target);
+          checkIndexedField("Match", target);
           return makeCaseInsensitiveTerm(AutomatonQuery::Kind::MATCH, target, field,
                                          normalizeLiteral(target, value, false), boost);
         }
         return pool.make<TermQuery>(field, normalizeLiteral(target, value, true), boost);
-      case FieldType::Type::INT:
-      case FieldType::Type::FLOAT:
-      case FieldType::Type::DOUBLE:
-      case FieldType::Type::DATE: {
-        // Exact numeric match == a degenerate inclusive [v, v] range; route
-        // through createRangeQuery so it shares the same column validation.
-        if (value.empty()) return matchNoDocs();
-        luxir::api::Val v;
-        v.kind = value;  // string arm; coerceColInt64 parses per the field type
-        Query* query = createRangeQuery(target, &v, nullptr, &v, nullptr);
-        return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
-      }
       default:
-        throw std::runtime_error(std::format("Match query on unsupported field type: {}", field));
+        throw std::logic_error("Unhandled match storage");
     }
   }
 
+public:
   // Match against a wire Val: coerce to term text per the field type (the
   // query-time half of the coercion contract; see schema/ValCoerce.h), then
   // build as usual.  A numeric Val against a text/string field matches its
@@ -879,36 +941,35 @@ public:
   Query* createMatchQuery(std::string_view field, const luxir::api::Val& val,
                           Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
                           bool caseInsensitive = false) {
-    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), val, op, minMatch,
+    return createMatchQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), val, op, minMatch,
                             boost, caseInsensitive);
   }
 
   Query* createMatchQuery(const ResolvedFieldHandle& target, const luxir::api::Val& val,
                           Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
                           bool caseInsensitive = false) {
+    target.fieldType->requireCapability(FieldType::MATCH
+        | (caseInsensitive && !FieldType::isNumericColumn(target.fieldType->type()) ? FieldType::PATTERN : 0u),
+        "Match query", target.physicalName);
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
-    if (isNumericColumnType(fieldType.type())) {
-      // Exact numeric match == a degenerate inclusive [v, v] range; route
-      // through createRangeQuery so it shares the same column validation.  An
-      // array/uncoercible Val throws there (multi-value Match semantics are
-      // undefined yet); op / min_match don't apply to a single numeric value.
+    if (fieldType.type() == FieldType::INTERVAL) {
+      // Exact match on a range field: the intervals containing the value.
       if (coerce::isNull(val)) return matchNoDocs();
-      Query* query = createRangeQuery(target, &val, nullptr, &val, nullptr);
-      return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
+      requireNumericColumn(target);
+      return createRangeFieldPredicate(field, coerceIntWindow(target, val, FieldType::LiteralUse::MATCH),
+          RangeFieldQuery::Relation::INTERSECTS, boost);
+    }
+    if (FieldType::isNumericColumn(fieldType.type())) {
+      if (coerce::isNull(val)) return matchNoDocs();
+      requireNumericColumn(target);
+      return createNumericPredicate(field,
+          coerceIntWindow(target, val, FieldType::LiteralUse::MATCH), boost);
     }
     char buf[coerce::TEXT_BUF_SIZE];
-    std::string_view text = coerce::isNull(val)
-        ? std::string_view{}
-        : fieldType.coerceTerm(val, field, buf);
-    // A rendered numeric lives in stack-local buf: TEXT analysis copies terms
-    // out anyway, but the STRING/ID pass-through keeps the view, so copy it
-    // into the pool.  String/bytes arms view the request bytes, which already
-    // outlive the query tree.
-    if (text.data() == buf) {
-      text = poolCopy(text);
-    }
-    return createMatchQuery(target, text, op, minMatch, boost, caseInsensitive);
+    auto window = fieldType.coerceTermWindow(coerce::isNull(val) ? coerce::scalarVal(std::string_view{}) : val,
+                                             field, buf);
+    return createMatchQueryImpl(target, retainTermWindow(window, buf), op, minMatch, boost, caseInsensitive);
   }
 
   struct WeightedField {
@@ -919,36 +980,43 @@ public:
   // Wildcard lists include explicit selectors in this physical-target budget.
   static constexpr size_t MAX_PATTERN_FIELDS = 64;
 
-private:
   struct ResolvedWeightedField {
     const ResolvedFieldHandle* target;
     float weight;
   };
 
+private:
   // Multi-field searches omit only values that cannot coerce to this field.
   // Keep all query construction on the strict match/range path.
   Query* tryCreateMatchQuery(const ResolvedFieldHandle& target, std::string_view text,
                              Operator op, int minMatch, float weight) {
     FieldType& type = *target.fieldType;
-    if (isNumericColumnType(type.type())) {
-      if (!type.hasColumn()) {
-        throw std::runtime_error(std::format(
-            "Range query field '{}' is not column-stored", target.physicalName));
-      }
+    if (FieldType::isNumericColumn(type.type()) || type.supports(FieldType::RANGE_RELATION)) {
+      type.requireCapability(FieldType::MATCH, "Match query", target.physicalName);
+      requireNumericColumn(target);
       api::Val value;
       value.kind = text;
-      if (type.type() == FieldType::DATE) {
-        if (!((DateFieldType&)type).tryCoerceDateRange(value, coerceContext)) return nullptr;
-      } else {
-        if (!type.tryCoerceColInt64(value, target.physicalName, coerceContext)) return nullptr;
+      auto window = type.tryCoerceIntWindow(value, FieldType::LiteralUse::MATCH,
+                                             target.physicalName, coerceContext);
+      if (!window) return nullptr;
+      warnSkippedGranule(target, value, *window);
+      if (type.supports(FieldType::RANGE_RELATION)) {
+        return createRangeFieldPredicate(poolCopy(target.physicalName), *window,
+            RangeFieldQuery::Relation::INTERSECTS, weight);
       }
+      return createNumericPredicate(poolCopy(target.physicalName), *window, weight);
     }
-    return createMatchQuery(target, text, op, minMatch, weight);
+    type.requireCapability(FieldType::MATCH, "Match query", target.physicalName);
+    char buf[coerce::TEXT_BUF_SIZE];
+    auto window = type.tryCoerceTermWindow(coerce::scalarVal(text), target.physicalName, buf);
+    if (!window) return nullptr;
+    return createMatchQueryImpl(target, retainTermWindow(*window, buf), op, minMatch, weight, false);
   }
 
+public:
   // Expand selectors, resolve search bindings, and keep the largest weight
   // per physical target. Sort before analysis so request order never matters.
-  std::span<ResolvedWeightedField> resolveWeightedFields(std::span<const WeightedField> requested) {
+  std::span<ResolvedWeightedField> resolveWeightedFields(std::span<const WeightedField> requested, ParseView& view) {
     bool patterns = std::ranges::any_of(requested, [](const auto& field) {
       return field.field.find('*') != std::string_view::npos;
     });
@@ -975,7 +1043,7 @@ private:
         assert(reader->schema().get() == &schema);
         catalog = reader->searchableFields();
       } else {
-        schemaNames = schema.searchableFields();
+        schemaNames = schema.searchableFields({}, fields.path());
         catalog = schemaNames;
       }
     }
@@ -983,7 +1051,26 @@ private:
       if (field.field.find('*') == std::string_view::npos) {
         add(field.field, field.weight);
       } else {
-        forEachFieldPattern(catalog, field.field,
+        auto pattern = field.field;
+        auto dot = pattern.rfind('.');
+        std::optional<ParseView::Scope> scope;
+        std::vector<std::string> nestedNames;
+        auto names = catalog;
+        if (dot != std::string_view::npos) {
+          auto prefix = pattern.substr(0, dot);
+          if (prefix.find('*') != std::string_view::npos) {
+            throw RequestError("Wildcard nested paths are not supported: " + std::string(pattern));
+          }
+          const auto& path = fields.resolvePath(prefix);
+          scope.emplace(view, path.physicalName);
+          pattern.remove_prefix(dot + 1);
+          if (view.get()) names = view.get()->searchableFields();
+          else {
+            nestedNames = schema.searchableFields({}, fields.path());
+            names = nestedNames;
+          }
+        }
+        forEachFieldPattern(names, pattern,
             [](const auto& name) { return std::string_view(name); },
             [](const auto& name) { return name.find("__") != std::string_view::npos; },
             [&](const auto& name) { add(name, field.weight); });
@@ -1013,10 +1100,10 @@ public:
     return pool.make<BooleanQuery>(none, clauses, none, none, k);
   }
 
-  // Fields with the same compiled analyzer and long-term policy share one
-  // analysis pass and one BM25F query per term. Group order follows physical
+  // Fields with the same expanded analyzer definition and long-term policy share
+  // one analysis pass and one BM25F query per term. Group order follows physical
   // field order, independent of request order and the query text.
-  Query* createMultiMatchCombined(std::span<const WeightedField> requested,
+  Query* createMultiMatchCombined(std::span<const ResolvedWeightedField> resolved,
                                   std::string_view text, Operator op, int minMatch,
                                   float tie = 1.0f) {
     struct Group {
@@ -1025,7 +1112,6 @@ public:
       std::span<float> weights;
       size_t count;
     };
-    auto resolved = resolveWeightedFields(requested);
     auto groups = pool.make_span<Group>(resolved.size());
     auto groupIndices = pool.make_span<size_t>(resolved.size());
     size_t numGroups = 0;
@@ -1037,7 +1123,7 @@ public:
         for (group = 0; group < numGroups; group++) {
           if (groups[group].target->fieldType->type() != FieldType::TEXT) continue;
           auto* other = (TextFieldType*)groups[group].target->fieldType;
-          if (type->analyzer_.get() == other->analyzer_.get()
+          if (type->analyzer_->sameDefinitionAs(*other->analyzer_)
               && type->longTerms == other->longTerms) break;
         }
       }
@@ -1088,81 +1174,55 @@ public:
   }
 
   // Each field contributes its own match or phrase score multiplied by its weight.
-  Query* createMultiMatchPerField(std::span<const WeightedField> requested,
-                                  std::string_view text, Operator op, int minMatch,
-                                  float tie = 1.0f, std::optional<int32_t> phraseSlop = {}) {
-    auto resolved = resolveWeightedFields(requested);
-    auto clauses = pool.make_span<Query*>(resolved.size());
-    size_t count = 0;
-    for (size_t i = 0; i < resolved.size(); i++) {
-      const auto& target = *resolved[i].target;
-      if (phraseSlop && target.fieldType->type() == FieldType::Type::TEXT) {
-        clauses[count++] = createPhraseQuery(
-            target, std::span<const std::string_view>(&text, 1), {}, *phraseSlop, resolved[i].weight);
-      } else if (auto* query = tryCreateMatchQuery(target, text, op, minMatch, resolved[i].weight)) {
-        clauses[count++] = query;
-      }
+  Query* createMultiMatchField(const ResolvedWeightedField& field,
+                              std::string_view text, Operator op, int minMatch,
+                              std::optional<int32_t> phraseSlop = {}) {
+    if (phraseSlop && field.target->fieldType->type() == FieldType::TEXT) {
+      return createPhraseQuery(*field.target, std::span<const std::string_view>(&text, 1),
+          {}, *phraseSlop, field.weight);
     }
-    if (count == 0) return matchNoDocs();
-    return DisMaxQuery::make(pool, clauses.first(count), tie);
+    return tryCreateMatchQuery(*field.target, text, op, minMatch, field.weight);
   }
 
   // Build a range query over `field` from raw bound Vals (any may be null for
   // an open-ended side).  At most one of gte/gt (lower) and one of lte/lt
   // (upper) may be set.
   //
-  // Numeric/date column fields build a NumericPredicateQuery: bounds coerce to
-  // the field's encoded int64 (FieldType::coerceColInt64) and fold to an
-  // inclusive [lo, hi] window; an empty range collapses to match-nothing.
-  //
-  // DATE bounds round by the granularity the literal names (the window from
-  // DateFieldType::coerceDateRange): gte/lt use the window start, lte/gt the
-  // window end, so [2024-01 TO 2024-06] covers January through June inclusive
-  // and {2024-01 TO 2024-06} excludes both whole months.  Match on a DATE
-  // field routes through here with gte == lte, so equality on a day matches
-  // the whole day.  A bound from unrounded NOW math restricts filter reuse
-  // to this request, keeping it out of shared-cache admission history.
+  // Numeric/date literals admit inclusive windows in encoded column space.
+  // Intersect the bounds and build a NumericPredicateQuery, or match nothing.
+  // Unrounded NOW bounds restrict filter reuse to the surrounding request.
   //
   // Term-backed fields (TEXT/STRING/ID) build a constant-scoring
   // TermRangeQuery over the terms dictionary in byte order: bounds coerce to
   // term bytes, TEXT bounds fold like the field folds (normalizeMultiterm),
   // and exact bounds obey the post-normalization length limit.
+  //
+  // Range fields build a RangeFieldQuery comparing each stored interval with
+  // the query interval by `relation`; other fields accept only INTERSECTS.
   Query* createRangeQuery(std::string_view field,
                           const luxir::api::Val* gte, const luxir::api::Val* gt,
-                          const luxir::api::Val* lte, const luxir::api::Val* lt) {
-    return createRangeQuery(fields.resolve(field, OpClass::VALUE, opName), gte, gt, lte, lt);
+                          const luxir::api::Val* lte, const luxir::api::Val* lt,
+                          RangeFieldQuery::Relation relation = RangeFieldQuery::Relation::INTERSECTS) {
+    return createRangeQuery(fields.resolveLocal(field, OpClass::VALUE, opName), gte, gt, lte, lt, relation);
   }
 
   Query* createRangeQuery(const ResolvedFieldHandle& target,
                           const luxir::api::Val* gte, const luxir::api::Val* gt,
-                          const luxir::api::Val* lte, const luxir::api::Val* lt) {
+                          const luxir::api::Val* lte, const luxir::api::Val* lt,
+                          RangeFieldQuery::Relation relation = RangeFieldQuery::Relation::INTERSECTS) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
-    bool numeric = isNumericColumnType(fieldType.type());
-    switch (fieldType.type()) {
-      case FieldType::Type::TEXT:
-      case FieldType::Type::ID:
-      case FieldType::Type::STRING:
-        break;
-      default:
-        if (!numeric) {
-          throw std::runtime_error(std::format("Range query on unsupported field type: {}", field));
-        }
-        if (!fieldType.hasColumn()) {
-          throw std::runtime_error(std::format("Range query field '{}' is not column-stored", field));
-        }
+    if (relation != RangeFieldQuery::Relation::INTERSECTS && !fieldType.supports(FieldType::RANGE_RELATION)) {
+      throw std::runtime_error(std::format(
+          "Range query relation applies only to range fields; '{}' is not one", field));
     }
-
-    bool hasGte = gte && !coerce::isNull(*gte);
-    bool hasGt  = gt  && !coerce::isNull(*gt);
-    bool hasLte = lte && !coerce::isNull(*lte);
-    bool hasLt  = lt  && !coerce::isNull(*lt);
-    if (hasGte && hasGt) {
-      throw std::runtime_error(std::format("Range query on '{}' sets both gte and gt", field));
-    }
-    if (hasLte && hasLt) {
-      throw std::runtime_error(std::format("Range query on '{}' sets both lte and lt", field));
-    }
+    fieldType.requireCapability(FieldType::RANGE, "Range query", field);
+    bool interval = fieldType.supports(FieldType::RANGE_RELATION);
+    bool numeric = FieldType::isNumericColumn(fieldType.type()) || interval;
+    if (numeric) requireNumericColumn(target);
+    auto bounds = rangeBoundLiterals(gte, gt, lte, lt, field);
+    bool hasGte = bounds[0] != nullptr, hasGt = bounds[1] != nullptr;
+    bool hasLte = bounds[2] != nullptr, hasLt = bounds[3] != nullptr;
 
     if (!numeric) {
       auto termBound = [&](const api::Val& v) -> std::string_view {
@@ -1177,67 +1237,10 @@ public:
       return pool.make<TermRangeQuery>(field, lower, hasGte, upper, hasLte);
     }
 
-    // Coerce every supplied bound first, so a malformed bound is always a
-    // request error regardless of whether the range would collapse to empty.
-    std::optional<int64_t> loEnc, hiEnc;
-    bool unroundedNow = false;
-    if (fieldType.type() == FieldType::Type::DATE) {
-      auto& dateType = (DateFieldType&)fieldType;
-      auto dateBound = [&](const api::Val& value) {
-        auto range = dateType.coerceDateRange(value, field, coerceContext);
-        if (range.granuleSkipped && warnings != nullptr) {
-          std::string_view text = std::get<std::string_view>(value.kind);
-          std::string message = opName.empty()
-              ? std::format(
-                    "DATE field '{}': date granule '{}' skipped: no such local granule in {}",
-                    field, text, coerceContext.timeZone.name())
-              : std::format(
-                    "op '{}', DATE field '{}': date granule '{}' skipped: "
-                    "no such local granule in {}",
-                    opName, field, text, coerceContext.timeZone.name());
-          addWarning(*warnings, pool, "date_granule_skipped", message);
-        }
-        unroundedNow |= range.unroundedNow;
-        return range;
-      };
-      // Query windows are inclusive in field units. Exact numeric literals
-      // use the same value at both edges; exclusive folding below is guarded.
-      if (hasGte) loEnc = dateBound(*gte).lo;
-      if (hasGt)  loEnc = dateBound(*gt).hi;
-      if (hasLte) hiEnc = dateBound(*lte).hi;
-      if (hasLt)  hiEnc = dateBound(*lt).lo;
-    } else {
-      if (hasGte || hasGt) {
-        loEnc = fieldType.coerceColInt64(
-            hasGte ? *gte : *gt, field, coerceContext);
-      }
-      if (hasLte || hasLt) {
-        hiEnc = fieldType.coerceColInt64(
-            hasLte ? *lte : *lt, field, coerceContext);
-      }
-    }
-
-    int64_t lo = std::numeric_limits<int64_t>::min();
-    int64_t hi = std::numeric_limits<int64_t>::max();
-    // Fold exclusive bounds to inclusive in encoded int64 space: since stored
-    // values are integers, v > k  <=>  v >= k+1 (and v < k  <=>  v <= k-1).
-    // Guard the extremes so the +/-1 never overflows.
-    if (hasGte) {
-      lo = *loEnc;
-    } else if (hasGt) {
-      if (*loEnc == std::numeric_limits<int64_t>::max()) return matchNoDocs();  // > max
-      lo = *loEnc + 1;
-    }
-    if (hasLte) {
-      hi = *hiEnc;
-    } else if (hasLt) {
-      if (*hiEnc == std::numeric_limits<int64_t>::min()) return matchNoDocs();  // < min
-      hi = *hiEnc - 1;
-    }
-    if (lo > hi) return matchNoDocs();  // empty range
-    return pool.make<NumericPredicateQuery>(field, lo, hi,
-        unroundedNow ? FilterKeyScope::REQUEST_STABLE
-                     : FilterKeyScope::SEGMENT_STABLE);
+    auto domain = interval ? ((RangeFieldType&)fieldType).domainBounds() : FieldType::IntWindow{};
+    auto window = foldRangeBounds(bounds, domain,
+        [&](const api::Val& value, FieldType::LiteralUse use) { return coerceIntWindow(target, value, use); });
+    return interval ? createRangeFieldPredicate(field, window, relation) : createNumericPredicate(field, window);
   }
 
   // Build a phrase query from un-analyzed input by running the field's analyzer.
@@ -1258,7 +1261,7 @@ public:
   Query* createPhraseQuery(std::string_view field, std::span<const std::string_view> values,
                            std::span<const int32_t> valuePositions = {}, int32_t slop = 0,
                            float boost = 1.0f) {
-    return createPhraseQuery(fields.resolve(field, OpClass::SEARCH, opName), values, valuePositions,
+    return createPhraseQuery(fields.resolveLocal(field, OpClass::SEARCH, opName), values, valuePositions,
                               slop, boost);
   }
 
@@ -1329,7 +1332,7 @@ public:
   // The provided span contents are not copied and thus should outlive the returned query.
   Query* createPhraseFromTerms(std::string_view field, std::span<std::string_view> terms,
                                std::span<const int32_t> positions, int32_t slop = 0) {
-    return createPhraseFromTerms(fields.resolve(field, OpClass::SEARCH, opName), terms, positions, slop);
+    return createPhraseFromTerms(fields.resolveLocal(field, OpClass::SEARCH, opName), terms, positions, slop);
   }
 
   Query* createPhraseFromTerms(const ResolvedFieldHandle& target, std::span<std::string_view> terms,

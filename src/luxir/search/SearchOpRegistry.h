@@ -26,12 +26,13 @@ class LuxirNode;
 class PluginOpContext {
 public:
   SearchRequest& req;
+  const std::shared_ptr<IndexReader>& view;
   std::string_view name;           // the op's key in its ops map
   const api::PluginOp& proto;
   ParamReader params;
 
-  PluginOpContext(SearchRequest& req, std::string_view name, const api::PluginOp& proto, ParamReader params)
-    : req(req), name(name), proto(proto), params(std::move(params)) {}
+  PluginOpContext(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view name, const api::PluginOp& proto, ParamReader params)
+    : req(req), view(view), name(name), proto(proto), params(std::move(params)) {}
   virtual ~PluginOpContext() = default;
 
   LuxirNode& node() const;

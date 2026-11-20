@@ -122,9 +122,9 @@ public:
         [&](float v) { val->kind = v; },
         [&](double v) { val->kind = v; },
         [&](const std::string& v) { val->kind = build::arenaStr(mr, v); },
-        [&](const std::vector<bool>&) {
-          // No bool-array wire encoding exists; fail loudly rather than silently drop the field.
-          throw std::runtime_error("convertDocToProto: bool-array field values are not supported");
+        [&](const std::vector<bool>& v) {
+          auto* a = build::allocArray(val->kind.emplace<ArrVal>().v, v.size(), mr);
+          for (size_t i = 0; i < v.size(); i++) a[i].kind = (bool)v[i];
         },
         [&](const std::vector<int64_t>& v) {
           auto& arr = val->kind.emplace<ArrInt>();
@@ -155,6 +155,15 @@ public:
             auto& f32 = a[i].f32.emplace();
             float* fa = build::allocArray(f32.v, v[i].size(), mr);
             std::copy(v[i].begin(), v[i].end(), fa);
+          }
+        },
+        [&](const std::vector<std::vector<double>>& v) {
+          // A list of double arrays, the multi-valued GEO_POINT form.
+          auto& arr = val->kind.emplace<ArrVal>();
+          Val* a = build::allocArray(arr.v, v.size(), mr);
+          for (std::size_t i = 0; i < v.size(); i++) {
+            double* da = build::allocArray(a[i].kind.emplace<ArrDouble>().v, v[i].size(), mr);
+            std::copy(v[i].begin(), v[i].end(), da);
           }
         }
       }, nv.val);
@@ -414,7 +423,7 @@ public:
     if (reuseIndex) {
       for (size_t i = 0; i < docsPerSeg.size(); i++) {
         auto& seg = reader->segments()[i];
-        if (seg.postingsReader().maxDoc() != docsPerSeg[i]) { reuseIndex = false; break; }
+        if (seg.maxDoc() != docsPerSeg[i]) { reuseIndex = false; break; }
       }
     }
     return reuseIndex;

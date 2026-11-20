@@ -20,6 +20,7 @@
 #include "luxir/util/ApiError.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/store/Directory.h"
+#include "luxir/store/Manifest.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/search/ReaderManager.h"
 #include "luxir/server/LuxirError.h"
@@ -49,8 +50,13 @@ public:
   class SegInfo {
   public:
     uint64_t segId;
+    uint64_t creatorEpoch;
+    uint64_t initialLiveGen = 0;
+    uint64_t initialLiveEpoch;
+    uint64_t liveEpoch;
     int32_t maxDoc;            // one-past-highest-doc (doesn't count deletes)
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
+    int32_t mergeRows;         // largest physical row space, for merge sizing
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
     int64_t mergedLiveGen = -1;  // source generation covered by the merge
@@ -64,19 +70,19 @@ public:
 
     bool merging = false;     // set to true when a merge is in progress with this segment as input.
 
-    // The segment's open PostingsReader once the writer needed one (deletes, a merge, an overlay
+    // The segment's open core once the writer needed one (deletes, a merge, an overlay
     // build); kept until the segment is retired. Shared both ways with readers: filled from the
     // published IndexReader when that holds the segment, and handed to readers that open a
-    // snapshot this writer published (CommitSnapshot::openReaders). Atomic: commit and merge
-    // threads fill it without a lock (IndexWriter::getSegmentPostingsReader).
-    std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
+    // snapshot this writer published (CommitSnapshot::openCores). Atomic: commit and merge
+    // threads fill it without a lock (IndexWriter::getSegmentCore).
+    std::atomic<std::shared_ptr<SegmentCore>> sharedSegmentCore = nullptr;
 
     // Null until known; once populated, the physical dictionary's bounds never change.
     std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
     std::atomic<uint64_t> idDictionaryBlocks = UINT64_MAX;
 
-    // Schema generation this segment was indexed under.
-    uint64_t schemaGen = 0;
+    // Oldest input schema binding; merging does not backfill fields.
+    SchemaBinding schema;
 
     // info about the min and max versions of documents in this segment, derived from the update message sequence number.
     // this can help us determine if we can skip applying deletes to this segment from another segment.
@@ -99,22 +105,28 @@ public:
     std::vector<AuxInfo> auxOverlays;
     uint64_t nextOverlayGen = 0; // high-water mark survives separately published drops
 
-    SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs), liveDocs(nDocs) {}
+    uint64_t liveEpochFor(uint64_t gen, uint64_t writerEpoch) const { return gen == initialLiveGen ? initialLiveEpoch : writerEpoch; }
 
-    // firendly name for logs that match the segment filenames for easier debugging.
-    static std::string name(uint64_t segId) {
-      return Postings::getIndexFileNamePrefix(segId);
+    SegInfo(uint64_t segId, uint64_t creatorEpoch, int nDocs)
+      : segId(segId), creatorEpoch(creatorEpoch), initialLiveEpoch(creatorEpoch), liveEpoch(creatorEpoch),
+        maxDoc(nDocs), liveDocs(nDocs), mergeRows(nDocs) {}
+
+    // Forced selection estimates child survival from the live root fraction.
+    int64_t estimatedLiveMergeRows() const {
+      if (mergeRows == maxDoc) return liveDocs;
+      return (int64_t)mergeRows * liveDocs / maxDoc;
     }
 
+    // Friendly name for logs that matches the segment filenames.
     std::string name() const {
-      return name(segId);
+      return "s" + Postings::segmentKey(segId, creatorEpoch);
     }
   };
 
 
 inline std::string format_as(const SegInfo& seg) {
   return fmt::format("(seg={} max={} live={} lgen={} mlevel={} merging={} mlgen={} mto={} ctime={} minV={} maxV={} sgen={} pdel={})", seg.name(), seg.maxDoc, seg.liveDocs, seg.liveGen, seg.mergeLevel, seg.merging,
-                     seg.mergedLiveGen, seg.mergedIntoSegId, seg.lastCommitTime, seg.minVersion, seg.maxVersion, seg.schemaGen, seg.personalDeletes.size());
+                     seg.mergedLiveGen, seg.mergedIntoSegId, seg.lastCommitTime, seg.minVersion, seg.maxVersion, seg.schema.generation(), seg.personalDeletes.size());
 }
 
 
@@ -132,11 +144,14 @@ class IndexWriter {
   std::vector<std::string> manifestNames;
   std::vector<std::string> pendingRetirement; // publicationMutex
   uint64_t completedUpdateVersion = 0; // indexMutex
+  IncarnationState writerState;
+  uint64_t writerEpoch = 0;
   uint64_t nextManifestGen = 0;
   std::string incarnation;
 
 public:
 
+  std::function<void()> onSuperseded; // Diagnostic only; failures cannot mask the fencing error.
   // The node's and the collection's counters; set by the collection that opens
   // this writer.
   std::shared_ptr<Metrics> metrics = Metrics::detached();
@@ -227,16 +242,16 @@ public:
       }
     }
 
-    // TODO: deletes are not considered.  The level comes from maxDoc and a merge
+    // TODO: deletes are not considered.  The level comes from physical rows and a merge
     // needs mergeFactor segments at one level, so a mostly-deleted segment keeps
     // its level and its dead docs are reclaimed only once that level fills;
     // overwrite-heavy loads grow the index until then.
     //
     // Integer arithmetic: a floating-point log ratio rounds exact powers of the
     // merge factor (e.g. 100 docs for factor 10) down a level.
-    int32_t _mergeLevelForMaxDoc(int32_t maxDoc) const {
+    int32_t _mergeLevelForRows(int32_t rows) const {
       int32_t level = 0;
-      for (int64_t bound = mergeFactor; maxDoc >= bound; bound *= mergeFactor) {
+      for (int64_t bound = mergeFactor; rows >= bound; bound *= mergeFactor) {
         level++;
       }
       return level;
@@ -245,7 +260,7 @@ public:
     // Reserve any merge-policy storage needed by _update(seg) before the
     // caller mutates segment ownership.  Call with indexMutex locked.
     void _prepareUpdate(SegInfo* seg) {
-      int32_t mergeLevel = _mergeLevelForMaxDoc(seg->maxDoc);
+      int32_t mergeLevel = _mergeLevelForRows(seg->mergeRows);
       if (mergeLevel >= (int)levelCounts.size()) {
         levelCounts.resize(mergeLevel + 1);
       }
@@ -261,8 +276,8 @@ public:
       if (seg != nullptr) {
         segCount++;
 
-        // For MERGE_FACTOR 10, docs 0-9 = level 0, 10-99 = level 1, etc.
-        seg->mergeLevel = _mergeLevelForMaxDoc(seg->maxDoc);
+        // For MERGE_FACTOR 10, rows 0-9 = level 0, 10-99 = level 1, etc.
+        seg->mergeLevel = _mergeLevelForRows(seg->mergeRows);
         if (seg->mergeLevel >= (int) levelCounts.size()) {
           levelCounts.resize(seg->mergeLevel + 1);
         }
@@ -411,6 +426,7 @@ public:
   // Schema generation read from IndexInfo on startup and advanced only after
   // a new commit is durable. Protected by indexMutex.
   uint64_t schemaGen_ = 0;
+  uint64_t nextSchemaVersion = 0;
 
   // Aux indexes (vector ANN, future autocomplete, ...) currently published in
   // manifest. Both commit and schema publication update these under
@@ -436,11 +452,15 @@ public:
   std::optional<MergeFailureInfo> lastMergeFailure;
 
   // Concrete vector overlay names ("vec.<field>") that have been explicitly
-  // activated in this writer lifetime or were seeded from durable manifest
+  // activated by commits or materialized merge outputs, or seeded from manifest
   // overlays at startup.  Intent-only activation is process-local; startup
   // seeds only from overlays that actually exist in the manifest.  Protected by
   // indexMutex.
   boost::unordered_flat_set<std::string> activeVectorOverlayNames;
+  // Vector selectors of the commit now in finishCommitBody, set under the same
+  // indexMutex hold that captures its segments.  A merge output swapped in after
+  // that capture misses the commit's build, so it must see this intent.
+  std::vector<std::string> inFlightVectorSelectors;
 
   // Registered atomically with flushed segments and snapshotted with them.
   // A batch survives until a covering commit or a delete pass retires it.
@@ -532,6 +552,10 @@ public:
   // use a multfunction node when there is no downstream consumer (i.e. the output is dropped or can be dropped)
   // using a normal function node would cause buffering.
 
+  // The graph outlives whatever task first uses it (a collection is built
+  // inside a shared lazy build's short-lived group), so its cancellation
+  // context must not bind to that task's context as a parent.
+  tbb::task_group_context updateContext{tbb::task_group_context::isolated};
   // A flow graph runs its tasks in the arena it is constructed in, so the ctor
   // emplaces it inside the writer's arena.
   std::optional<tbb::flow::graph> updateGraph;
@@ -572,10 +596,13 @@ public:
   // A nonnull schema is for creation only; reopening loads the manifest schema.
   // arena runs the writer's batches, flushes and merges (the node's index
   // arena, for a collection); null means the arena of the constructing thread.
+  // `opened` owns a claim established after checking the caller's catalog and
+  // the root loaded under it from this directory, including any listing. The
+  // writer consumes it; without one, it claims and loads the root itself.
   explicit IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
                        int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {},
-                       oneapi::tbb::task_arena* arena = nullptr);
+                       oneapi::tbb::task_arena* arena = nullptr, std::optional<WriterOpen> opened = {});
   ~IndexWriter();
   void close();
 
@@ -839,16 +866,21 @@ private:
                             std::vector<std::string>& outFilesToSync);
   // The published reader's copy of `seg`, or null; `reader` keeps it valid.
   const Segment* publishedSegment(const SegInfo& seg, std::shared_ptr<IndexReader>& reader);
-  // The segment's PostingsReader: its slot's, else the published reader's, else a new one; the
+  // The segment's core: its slot's, else the published reader's, else a new one; the
   // slot keeps it.
-  std::shared_ptr<PostingsReader> getSegmentPostingsReader(SegInfo& seg);
+  std::shared_ptr<SegmentCore> getSegmentCore(SegInfo& seg);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
-  std::vector<std::string> snapshotActiveVectorOverlayNames();
+  // Builds outstanding active names and matches new in-flight selectors on the
+  // private output. Failed names are attempted only once per merge.
+  void prepareMergedVectorOverlays(SegInfo& output,
+                                   boost::unordered_flat_set<std::string>& attempted,
+                                   boost::unordered_flat_set<std::string>& matchedSelectors,
+                                   const char*& phase);
   uint64_t nextSegmentOverlayGen(SegInfo& seg);
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,
-      PostingsReader& postingsReader,
+      SegmentCore& core,
       std::span<const std::string> overlayNames,
       const Schema& schema,
       VectorIndexBuilder::BuildSite buildSite,

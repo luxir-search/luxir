@@ -47,6 +47,18 @@ public:
     : CollectionResolutionError(ErrorKind::UNAVAILABLE, "collection_unavailable", message) {}
 };
 
+class CollectionServedByError : public CollectionUnavailableError {
+public:
+  explicit CollectionServedByError(std::string_view node)
+    : CollectionUnavailableError("served by " + std::string(node.empty() ? "(unassigned)" : node)) {}
+};
+
+class NodeSupersededError : public CollectionUnavailableError {
+public:
+  explicit NodeSupersededError(std::string_view node)
+    : CollectionUnavailableError("process for node '" + std::string(node) + "' was superseded") {}
+};
+
 class CollectionExistsError : public ApiError {
 public:
   explicit CollectionExistsError(const std::string& message)
@@ -102,6 +114,7 @@ namespace api::SchemaRequest_ { enum class Mode; }
 // consist of multiple shards.
 class Collection {
   CollectionId id;
+  mutable std::mutex idMutex;
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
   // Set once, by placeholder() or fail(): resolution then rejects the
@@ -112,13 +125,15 @@ class Collection {
   // Shared with the writer, whose work can outlive this object.
   std::shared_ptr<CollectionMetrics> metrics = std::make_shared<CollectionMetrics>();
 public:
-  const CollectionId& getId() const { return id; }
+  CollectionId getId() const { std::lock_guard lock(idMutex); return id; }
+  void setId(CollectionId next) { std::lock_guard lock(idMutex); id = std::move(next); }
   CollectionMetrics& getMetrics() const { return *metrics; }
   const std::shared_ptr<CollectionMetrics>& sharedMetrics() const { return metrics; }
   std::string getUnavailableReason() const;
   // The one way a collection becomes unavailable while registered: a
   // placeholder's reason, or a failure found while serving (a scrub mismatch).
-  // The first reason sticks. On a writer the IndexWriter fails too, so nothing
+  // A placeholder can update its reason after a failed open. On a writer the
+  // first reason sticks and the IndexWriter fails too, so nothing
   // more is read from or published over its files.
   void fail(const std::string& reason);
   bool isFailed() const { return failed.load(std::memory_order_acquire); }

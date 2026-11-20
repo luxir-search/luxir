@@ -7,7 +7,8 @@
 #include <stdexcept>
 #include <string_view>
 
-#include "luxir/query/GeoQuery.h"
+#include "luxir/query/BKDQueryWeight.h"
+#include "luxir/query/GeoPointSource.h"
 #include "luxir/query/Query.h"
 #include "luxir/reader/BKDReader.h"
 #include "luxir/util/geo.h"
@@ -19,84 +20,54 @@ namespace luxir {
 // LatLonPoint.newBoxQuery.
 class GeoBoxQuery final : public Query {
   std::string_view field;
-  int32_t minLatitude;
-  int32_t maxLatitude;
-  int32_t minLongitude;
-  int32_t maxLongitude;
-  bool empty = false;
+  geo::EncodedBox box;
 
 public:
   bool recoverableAsPredicate() const noexcept override { return true; }
 
   static constexpr std::string_view QUERY_NAME = "GeoBoxQuery";
-  using Weight = GeoQueryWeight<GeoBoxQuery, BKDBoxRelation>;
+  using PointSource = GeoPointSource;
+  using Weight = BKDQueryWeight<GeoBoxQuery, BKDBoxRelation>;
 
   GeoBoxQuery(std::string_view field, double minLat, double maxLat,
               double minLon, double maxLon)
-    : Query(QueryKind::GEO_BOX), field(field) {
-    geo::checkLatitude(minLat);
-    geo::checkLatitude(maxLat);
-    geo::checkLongitude(minLon);
-    geo::checkLongitude(maxLon);
-    if (minLat > maxLat) {
-      throw std::invalid_argument("minimum latitude exceeds maximum latitude");
-    }
-
-    // +90 and the non-wrapping singleton +180 are not representable after
-    // quantization. Lucene returns MatchNoDocs for the same cases.
-    if (minLat == 90.0 || (minLon == 180.0 && maxLon == 180.0)) {
-      empty = true;
-    }
-    // A wrapped interval starting at +180 is equivalent to starting at -180.
-    if (minLon == 180.0 && maxLon < minLon) minLon = -180.0;
-
-    minLatitude = geo::encodeLatitudeCeil(minLat);
-    maxLatitude = geo::encodeLatitude(maxLat);
-    minLongitude = geo::encodeLongitudeCeil(minLon);
-    maxLongitude = geo::encodeLongitude(maxLon);
-
-    if (maxLatitude < minLatitude) empty = true;
-    if (minLon <= maxLon && maxLongitude < minLongitude) empty = true;
-  }
+    : Query(QueryKind::GEO_BOX), field(field), box(minLat, maxLat, minLon, maxLon) {}
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const GeoBoxQuery&>(other);
-    return field == rhs.field && minLatitude == rhs.minLatitude
-        && maxLatitude == rhs.maxLatitude
-        && minLongitude == rhs.minLongitude
-        && maxLongitude == rhs.maxLongitude && empty == rhs.empty;
+    return field == rhs.field && box == rhs.box;
   }
 
   uint64_t hashImpl() const override {
     uint64_t value = mixHash(Query::hashImpl(), field);
-    value = mixHash(value, minLatitude);
-    value = mixHash(value, maxLatitude);
-    value = mixHash(value, minLongitude);
-    value = mixHash(value, maxLongitude);
-    return mixHash(value, empty);
+    value = mixHash(value, box.latMin);
+    value = mixHash(value, box.latMax);
+    value = mixHash(value, box.lonMin);
+    value = mixHash(value, box.lonMax);
+    return mixHash(value, box.empty());
   }
 
   std::string_view getField() const { return field; }
-  int32_t getMinLatitude() const { return minLatitude; }
-  int32_t getMaxLatitude() const { return maxLatitude; }
-  int32_t getMinLongitude() const { return minLongitude; }
-  int32_t getMaxLongitude() const { return maxLongitude; }
-  bool isEmpty() const { return empty; }
+  int32_t getMinLatitude() const { return box.latMin; }
+  int32_t getMaxLatitude() const { return box.latMax; }
+  int32_t getMinLongitude() const { return box.lonMin; }
+  int32_t getMaxLongitude() const { return box.lonMax; }
+  bool isEmpty() const { return box.empty(); }
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
     unused(ctx);
     out.appendString(field);
-    out.appendInt32(minLatitude);
-    out.appendInt32(maxLatitude);
-    out.appendInt32(minLongitude);
-    out.appendInt32(maxLongitude);
-    out.appendBool(empty);
+    out.appendInt32(box.latMin);
+    out.appendInt32(box.latMax);
+    out.appendInt32(box.lonMin);
+    out.appendInt32(box.lonMax);
+    out.appendBool(box.empty());
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
   BKDBoxRelation makeRelation() const {
-    return {minLatitude, maxLatitude, minLongitude, maxLongitude};
+    return {box.latMin, box.latMax, box.lonMin, box.lonMax};
   }
 
   Query::Weight* createWeight(Context& context, int32_t flags,

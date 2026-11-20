@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -144,6 +145,37 @@ TEST_F(AnalysisRegistryTest, unknownNamesListValidOnesSorted) {
   EXPECT_NE(std::string::npos, compileError(registry, R"({"filters":[{"params":{}}]})").find("has no name"));
 }
 
+TEST_F(AnalysisRegistryTest, duplicateStopParametersRejected) {
+  AnalysisRegistry registry;
+  std::string_view a[] = {"a"}, b[] = {"b"};
+  api::Val first{api::ArrStr{a}}, second{api::ArrStr{b}};
+  std::pair<std::string_view, hpp_proto::indirect_view<api::Val>> params[] = {
+      {"words", &first}, {"words", &second}};
+  auto stop = component("stop");
+  stop.params = params;
+  api::AnalyzerDef def;
+  def.filters = {&stop, 1};
+  try {
+    Analyzer::compile(def, registry);
+    FAIL() << "duplicate stop parameters accepted";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_STREQ("filter 'stop': duplicate parameter 'words'; parameter names must be unique", e.what());
+  }
+}
+
+TEST_F(AnalysisRegistryTest, duplicateNestedParametersRejected) {
+  AnalysisRegistry registry;
+  for (auto [definition, expected] : {
+      std::pair{R"({"tokenizer":{"name":"whitespace","params":{"nested":{"key":1,"key":2}}}})",
+                "tokenizer 'whitespace': duplicate parameter 'key'; parameter names must be unique"},
+      {R"({"filters":[{"name":"stop","params":{"words":[{"key":1,"key":2}]}}]})",
+       "filter 'stop': duplicate parameter 'key'; parameter names must be unique"},
+      {R"({"char_filters":[{"name":"mapping","params":{"mappings":[{"key":1,"key":2}]}}]})",
+       "char filter 'mapping': duplicate parameter 'key'; parameter names must be unique"}}) {
+    EXPECT_EQ(expected, compileError(registry, definition));
+  }
+}
+
 TEST_F(AnalysisRegistryTest, namedAnalyzerExpandsToTheAuthoredCanonicalForm) {
   AnalysisRegistry registry;
   auto named = compileWith(registry, R"({"name":"english"})");
@@ -163,10 +195,10 @@ TEST_F(AnalysisRegistryTest, namedAnalyzerExpandsToTheAuthoredCanonicalForm) {
             compileWith(registry, R"("standard")")->canonical);
   // the example plugin's preset carries a char filter in the canonical form
   auto example = compileWith(globalAnalysisRegistry(), R"("example")");
-  EXPECT_EQ(R"({"char_filters":["strip_x"],"filters":["lowercase","reverse"],"tokenizer":"whitespace"})",
+  EXPECT_EQ(R"({"char_filters":["strip_x"],"filters":["lowercase","example_reverse"],"tokenizer":"whitespace"})",
             example->canonical);
   EXPECT_EQ(example->canonical, compileWith(globalAnalysisRegistry(),
-      R"({"char_filters":["strip_x"],"tokenizer":"whitespace","filters":["lowercase","reverse"]})")->canonical);
+      R"({"char_filters":["strip_x"],"tokenizer":"whitespace","filters":["lowercase","example_reverse"]})")->canonical);
 }
 
 TEST_F(AnalysisRegistryTest, namedAnalyzerTakesOnlyCharFilters) {
@@ -179,7 +211,7 @@ TEST_F(AnalysisRegistryTest, namedAnalyzerTakesOnlyCharFilters) {
   EXPECT_EQ("english", withCharFilters->presetName);
   EXPECT_EQ(R"({"char_filters":["html_strip"],"filters":["nfkc_cf","fold","kstem"],"tokenizer":"unicode_word"})",
             withCharFilters->canonical);
-  EXPECT_EQ(R"({"char_filters":["nfkc_cf"],"filters":["lowercase","reverse"],"tokenizer":"whitespace"})",
+  EXPECT_EQ(R"({"char_filters":["nfkc_cf"],"filters":["lowercase","example_reverse"],"tokenizer":"whitespace"})",
             compileWith(globalAnalysisRegistry(), R"({"name":"example","char_filters":["nfkc_cf"]})")->canonical);
 }
 
@@ -229,12 +261,12 @@ TEST_F(AnalysisRegistryTest, examplePluginComponentsAreRegistered) {
   auto has = [](const std::vector<std::string>& names, std::string_view name) {
     return std::find(names.begin(), names.end(), name) != names.end();
   };
-  EXPECT_TRUE(has(analysis.filterNames(), "reverse"));
+  EXPECT_TRUE(has(analysis.filterNames(), "example_reverse"));
   EXPECT_TRUE(has(analysis.filterNames(), "stop"));  // built-ins stay alongside plugin components
   EXPECT_TRUE(has(analysis.charFilterNames(), "strip_x"));
   EXPECT_TRUE(has(analysis.analyzerNames(), "example"));
   EXPECT_TRUE(has(analysis.analyzerNames(), "english"));
-  api::AnalyzerComponent withParams = component("reverse");
+  api::AnalyzerComponent withParams = component("example_reverse");
   EXPECT_NO_THROW(analysis.makeFilter(withParams));
 }
 
@@ -244,7 +276,7 @@ TEST_F(AnalysisRegistryTest, pluginComponentsIndexAndMatchEndToEnd) {
   CollectionHelper helper;
   putSchema(helper.collection(), R"({"fields":{
     "ex":{"type":"text","analyzer":{"name":"example"}},
-    "rv":{"type":"text","analyzer":{"tokenizer":"whitespace","filters":["reverse"]}},
+    "rv":{"type":"text","analyzer":{"tokenizer":"whitespace","filters":["example_reverse"]}},
     "en":{"type":"text","analyzer":"english"}
   }})");
   ASSERT_TRUE(helper.index(flatdoc("id", "d1", "ex", "Hxello WORLD", "rv", "abc def", "en", "The Winter's Ponies"),
@@ -284,8 +316,7 @@ TEST_F(AnalysisRegistryTest, missingComponentAtOpenFailsTheCollectionOnly) {
     }
   }
   // Rewrite the committed schema of "bad" as if a plugin's filter were absent.
-  FSDirectory container(path / "t" / "t0" / "bad");
-  FSDirectory dir(path / "t" / "t0" / "bad" / *CollectionStorage::current(container));
+  FSDirectory dir(test::incarnationPath(path, "bad"));
   auto loaded = readDurableIndexInfo(dir);
   api::SchemaDef missing;
   std::string error;
@@ -294,9 +325,18 @@ TEST_F(AnalysisRegistryTest, missingComponentAtOpenFailsTheCollectionOnly) {
       << error;
   std::vector<std::byte> schemaBytes, manifest;
   ASSERT_TRUE(api::encode(missing, schemaBytes));
-  loaded.info.schema->source_def = std::span<const std::byte>(schemaBytes);
+  api::SchemaInfo stored;
+  stored.source_def = schemaBytes;
+  std::vector<std::byte> storedBytes;
+  ASSERT_TRUE(api::encode(stored, storedBytes));
+  auto contents = Manifest::withFooter(storedBytes);
+  auto& file = loaded.info.schema_file;
+  file.size = contents.size();
+  file.xxh3 = XXH3_64bits(contents.data(), contents.size());
+  dir.publishFile(file.name, contents, Directory::PublishMode::REPLACE);
   ASSERT_TRUE(api::encode(loaded.info, manifest));
-  Manifest::write(dir, loaded.info.index_gen, manifest);
+  dir.publishFile(Manifest::name(loaded->index_gen, loaded->writer_epoch),
+      Manifest::withFooter(manifest), Directory::PublishMode::REPLACE);
 
   LuxirNode node(config);
   CollectionHelper good(node, "good");

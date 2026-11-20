@@ -28,6 +28,7 @@
 #include "luxir/store/Directory.h"
 #include "luxir/codec/StreamVByte.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/Space.h"
 #include "ScreamingBuilder.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/schema/FieldType.h"
@@ -60,6 +61,7 @@ public:
 
   // IndexFieldInfo adds extra info needed at index time to SegFieldInfo.
   struct IndexFieldInfo : public SegFieldInfo {
+    SpaceOrdinal space;
   };
 
   // The id field's bounds, captured when its dictionary is finalized. Absent
@@ -69,7 +71,8 @@ public:
 
 private:
   Directory& directory;
-  int32_t maxDoc;  // set by caller
+  int32_t maxDoc;  // Root count, set by caller.
+  std::vector<SpaceDescriptor> spaceDescriptors{{}};
   int64_t sizeInBytes = 0; // total size of all files written
   // Immutable request births, referenced from segment metadata rather than a field.
   seg_location versionRunsLoc;
@@ -113,17 +116,18 @@ private:
 public:
   MemPool pool;  // during concurrent writing, access only under mutex (see copyTerm)
   uint64_t segId;
+  uint64_t creatorEpoch;
 
 public:
-  PostingsWriter(Directory& dir, uint64_t segId, int32_t maxDoc = -1,
+  PostingsWriter(Directory& dir, uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc = -1,
                  IndexRamBudget* ramBudget = nullptr,
                  bool ramDelegatingFiles = false)
       : directory(dir), maxDoc(maxDoc),
         delegatedRamGuard(ramBudget == nullptr
             ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)),
-        ramDelegatingFiles(ramDelegatingFiles), segId(segId)
+        ramDelegatingFiles(ramDelegatingFiles), segId(segId), creatorEpoch(creatorEpoch)
   {
-    segStr = Postings::getSortableString(segId);
+    segStr = Postings::segmentKey(segId, creatorEpoch);
   }
 
   void configureRamDelegation(bool enabled,
@@ -149,10 +153,12 @@ public:
   }
 
   // Thread-safe; fields may be registered concurrently and in any order
-  // (finish() sorts the field table by name).
-  IndexFieldInfo& addField(PackedTerm fieldName) {
+  // (finish() sorts each space's field table by name).
+  IndexFieldInfo& addField(SpaceOrdinal space, PackedTerm fieldName) {
     const std::lock_guard<std::mutex> lock(mutex);
+    if (!findSpace(space)) throw std::invalid_argument("field references an undeclared row space");
     fieldInfos.emplace_back(); // we should get default-initialization with this for the SegFieldInfo members
+    fieldInfos.back().space = space;
     fieldInfos.back().fieldname = fieldName;
     assert(fieldInfos.back().monoLoc.offset() == 0 && fieldInfos.back().monoMetaOff == 0 && fieldInfos.back().columnMetaOff == 0);
     assert(fieldInfos.back().pointsMetaOff == 0);
@@ -162,8 +168,8 @@ public:
   }
 
   // copies the fieldName into the pool associated with this PostingsWriter.
-  IndexFieldInfo& addField(std::string_view fieldName) {
-    return addField(copyTerm(fieldName));
+  IndexFieldInfo& addField(SpaceOrdinal space, std::string_view fieldName) {
+    return addField(space, copyTerm(fieldName));
   }
 
   // Thread-safe copy of a term into this writer's pool; the copy lives until the
@@ -328,9 +334,20 @@ public:
   // If filenames is non-null, appends the names of files written (for fsync at commit time).
   bool finish(std::vector<std::string>* filenames = nullptr, std::vector<FileDescriptor>* descriptors = nullptr) {
 
-    if (finished || (fieldInfos.empty() && maxDoc <= 0)) {
-      return false;  // already called, or no data added.
+    if (finished) return false; // already called
+    for (size_t index = 1; index < spaceDescriptors.size(); index++) {
+      const auto& space = spaceDescriptors[index];
+      if (!space.ownership || space.maxDoc <= 0) {
+        throw std::invalid_argument("unfinished row space: " + space.path);
+      }
+      auto parent = spaceParentPath(space.path);
+      auto entry = std::find_if(spaceDescriptors.begin(), spaceDescriptors.end(),
+          [&](const auto& candidate) { return candidate.path == parent; });
+      if (entry == spaceDescriptors.end() || (parent.empty() ? maxDoc : entry->maxDoc) <= 0) {
+        throw std::invalid_argument("row space has no parent rows: " + space.path);
+      }
     }
+    if (fieldInfos.empty() && maxDoc <= 0) return false; // no data added
 
     if (maxDoc > 0 && (versionRunsLoc.isNull() || versionRunCount == 0)) {
       throw std::runtime_error("Segment has no request birth versions");
@@ -344,8 +361,15 @@ public:
     assert(freeFiles.size() == files.size());
     Signal::emit("postingsBeforeCollapse", this);
     std::vector<uint32_t> survivorFileNums = collapseFiles();
-    writeFieldIndex();
-    writeSegmentInfo(survivorFileNums);
+    spaceDescriptors[0].maxDoc = maxDoc;
+    std::vector<SpaceOrdinal> order;
+    order.reserve(spaceDescriptors.size());
+    for (size_t i = 0; i < spaceDescriptors.size(); i++) order.push_back((SpaceOrdinal)i);
+    std::sort(order.begin(), order.end(), [&](auto a, auto b) {
+      return spaceDescriptors[(size_t)a].path < spaceDescriptors[(size_t)b].path;
+    });
+    writeFieldIndexes(order);
+    writeSegmentInfo(survivorFileNums, order);
 
     // The StreamVByte AVX tail decoder used by postings iteration, and the
     // LinearPack bulk decoder used by ord columns, may read up to
@@ -354,7 +378,7 @@ public:
     // of their own). File 0 ends with the field index and segment info just
     // written above, which already provide far more trailing slack, so it is
     // skipped. Padding past its segment-info size marker would also break the
-    // end-relative read in PostingsReader.
+    // end-relative read in SegmentCore.
     if (survivorFileNums.size() > 1) {
       static const char svbPad[SVB_OVERREAD_PAD] = {};
       for (uint32_t fileNum : survivorFileNums) {
@@ -388,8 +412,47 @@ public:
     maxDoc = max;
   }
 
-  int32_t getMaxDoc() {
-    return maxDoc;
+  int32_t getMaxDoc(SpaceOrdinal space) const {
+    if (space == SpaceOrdinal::ROOT) return maxDoc;
+    const auto* descriptor = findSpace(space);
+    if (!descriptor) throw std::invalid_argument("unknown row space");
+    if (!descriptor->ownership) throw std::invalid_argument("row space count is not finalized");
+    return descriptor->maxDoc;
+  }
+
+  int32_t getMaxSpaceRows() const {
+    int32_t count = maxDoc;
+    for (const auto& space : spaceDescriptors) count = std::max(count, space.maxDoc);
+    return count;
+  }
+
+  // Declare a child space before its fields. Ownership streams use the same
+  // allocator as field data and are relocated by the same finalize pass.
+  SpaceOrdinal addSpace(std::string_view path) {
+    auto parent = spaceParentPath(path);
+    bool hasParent = false;
+    for (const auto& space : spaceDescriptors) {
+      if (space.path == path) throw std::invalid_argument("duplicate row space path");
+      if (space.path == parent) hasParent = true;
+    }
+    if (finished || path.empty() || !hasParent) {
+      throw std::invalid_argument("invalid row space declaration");
+    }
+    spaceDescriptors.push_back({std::string(path), 0, {}, 0, {}});
+    return (SpaceOrdinal)(spaceDescriptors.size() - 1);
+  }
+
+  // Attach the final row count and encoded ownership after indexing.
+  void finishSpace(SpaceOrdinal ordinal, int32_t count, OwnershipDescriptor ownership) {
+    if (finished || ordinal == SpaceOrdinal::ROOT || !findSpace(ordinal)
+        || count <= 0 || count >= PostingsReader::HARD_MAX_DOC || ownership.ends.isNull()
+        || ownership.endsMetaOff < 0 || ownership.ownersMetaOff < 0) {
+      throw std::invalid_argument("invalid row space finalization");
+    }
+    auto& space = spaceDescriptors[(size_t)ordinal];
+    if (space.ownership) throw std::invalid_argument("row space already finalized");
+    space.maxDoc = count;
+    space.ownership = ownership;
   }
 
   int64_t getSizeInBytes() {
@@ -401,6 +464,10 @@ public:
   uint64_t writeLiveDocs(const screaming::FixedBitSet& liveBits, int32_t numLiveDocs);
 
 private:
+  const SpaceDescriptor* findSpace(SpaceOrdinal ordinal) const {
+    return (size_t)ordinal < spaceDescriptors.size() ? &spaceDescriptors[(size_t)ordinal] : nullptr;
+  }
+
   void adjustDelegatedRam(int64_t delta) noexcept {
     const std::lock_guard<std::mutex> lock(delegatedRamMutex);
     assert(delta >= -delegatedRamBytes);
@@ -437,6 +504,13 @@ private:
         }
         return location;
       });
+    }
+
+    for (const auto& space : spaceDescriptors) {
+      if (!space.ownership) continue;
+      for (auto loc : {space.ownership->ends, space.ownership->owners}) {
+        if (!loc.isNull() && loc.filenum() < referenced.size()) referenced[loc.filenum()] = true;
+      }
     }
 
     OutputStream& target = files[0].out;
@@ -477,6 +551,12 @@ private:
       fieldInfo.relocateLocations(relocate);
     }
     if (!versionRunsLoc.isNull()) versionRunsLoc = relocate(versionRunsLoc);
+    for (auto& space : spaceDescriptors) {
+      if (!space.ownership) continue;
+      auto& shape = *space.ownership;
+      shape.ends = relocate(shape.ends);
+      if (!shape.owners.isNull()) shape.owners = relocate(shape.owners);
+    }
 
     std::vector<uint32_t> survivors;
     survivors.reserve(files.size());
@@ -487,7 +567,7 @@ private:
     return survivors;
   }
 
-  void writeSegmentInfo(std::span<const uint32_t> survivorFileNums) {
+  void writeSegmentInfo(std::span<const uint32_t> survivorFileNums, std::span<const SpaceOrdinal> order) {
     // TODO: if maxDoc==0, does this cause issues elsewhere?
     // assert(maxDoc >= 1);
     OutputStream& out = files[0].out;
@@ -500,11 +580,57 @@ private:
     for (uint32_t fileNum : survivorFileNums) out.writeVint(fileNum);
     out.writeVal(versionRunsLoc);
     out.writeVint(versionRunCount);
+    out.writeVint((uint32_t)spaceDescriptors.size());
+    for (auto ordinal : order) {
+      const auto& space = spaceDescriptors[(size_t)ordinal];
+      out.writeVint((uint32_t)space.path.size());
+      out.write(space.path.data(), space.path.size());
+      out.writeVint((uint32_t)space.maxDoc);
+      out.writeVal(space.fieldOffsets);
+      out.writeVint(space.fieldCount);
+      if (space.ownership) {
+        const auto& shape = *space.ownership;
+        out.writeVal(shape.ends);
+        out.writeVlong((uint64_t)shape.endsMetaOff);
+        out.writeVal(shape.owners);
+        out.writeVlong((uint64_t)shape.ownersMetaOff);
+      }
+    }
     auto segInfoSize = out.size() - outStart;
     out.writeInt(segInfoSize);
   }
 
-  void writeFieldIndex() {
+  void writeFieldIndexes(std::span<const SpaceOrdinal> order) {
+    // PostingsReader::findOrdinal does a binary search over the field offsets array, so
+    // fields must be written in sorted name order.  Callers that flush fields
+    // in sorted order already satisfy this, but some resources (like
+    // stored-fields) are appended at the very end of flush; sort defensively
+    // here to support arbitrary addField ordering.
+    std::vector<IndexFieldInfo*> sortedInfos;
+    sortedInfos.reserve(fieldInfos.size());
+    for (auto& field : fieldInfos) sortedInfos.push_back(&field);
+    std::sort(sortedInfos.begin(), sortedInfos.end(), [&](const auto* a, const auto* b) {
+      return a->space != b->space
+          ? spaceDescriptors[(size_t)a->space].path < spaceDescriptors[(size_t)b->space].path
+          : a->fieldname < b->fieldname;
+    });
+    for (size_t i = 1; i < sortedInfos.size(); i++) {
+      if (sortedInfos[i - 1]->space == sortedInfos[i]->space
+          && sortedInfos[i - 1]->fieldname == sortedInfos[i]->fieldname) {
+        throw std::invalid_argument("duplicate field in row space");
+      }
+    }
+    size_t first = 0;
+    for (auto ordinal : order) {
+      auto& space = spaceDescriptors[(size_t)ordinal];
+      size_t end = first;
+      while (end < sortedInfos.size() && sortedInfos[end]->space == ordinal) end++;
+      writeFieldIndex(space, std::span(sortedInfos).subspan(first, end - first));
+      first = end;
+    }
+  }
+
+  void writeFieldIndex(SpaceDescriptor& space, std::span<IndexFieldInfo* const> sortedInfos) {
     //
     // This format is position independent.  One just needs a pointer to the end of the final structure.
     //
@@ -516,22 +642,9 @@ private:
 
     OutputStream& fieldOutput = files[0].out;
     std::vector<uint32_t> fieldOffs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
-    fieldOffs.reserve(fieldInfos.size());
+    fieldOffs.reserve(sortedInfos.size());
 
     auto fieldsStart = fieldOutput.size();  // where this index starts
-
-    // PostingsReader::findOrdinal does a binary search over the field offsets array, so
-    // fields must be written in sorted name order.  Callers that flush fields
-    // in sorted order already satisfy this, but some resources (like
-    // stored-fields) are appended at the very end of flush; sort defensively
-    // here to support arbitrary addField ordering.
-    std::vector<IndexFieldInfo*> sortedInfos;
-    sortedInfos.reserve(fieldInfos.size());
-    for (auto& fi : fieldInfos) sortedInfos.push_back(&fi);
-    std::sort(sortedInfos.begin(), sortedInfos.end(),
-              [](const IndexFieldInfo* a, const IndexFieldInfo* b) {
-                return a->fieldname < b->fieldname;
-              });
 
     for (auto* finfoPtr : sortedInfos) {
       auto& finfo = *finfoPtr;
@@ -596,6 +709,8 @@ private:
       loc = locationsOff - loc;
     }
 
+    space.fieldOffsets = fieldOutput.slocation();
+    space.fieldCount = (uint32_t)fieldOffs.size();
     if (fieldOffs.size() > 0) {
       fieldOutput.write(&(fieldOffs[0]), fieldOffs.size() * sizeof(fieldOffs[0]));
     }
@@ -1246,8 +1361,8 @@ public:
   }
 
   // TODO: FIXME: this is for tests, but it doesn't set the flags / type properly!
-  void startField(const std::string& fieldName) {
-    PostingsWriter::IndexFieldInfo* finfo = &postingsWriter.addField(fieldName);
+  void startField(SpaceOrdinal space, const std::string& fieldName) {
+    PostingsWriter::IndexFieldInfo* finfo = &postingsWriter.addField(space, fieldName);
     finfo->type = FieldType::TEXT;
     finfo->flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
     startField(finfo);
@@ -1301,7 +1416,7 @@ public:
       return;
     }
 
-    assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided numDocs
+    assert(docs.back() < postingsWriter.getMaxDoc(fieldInfo->space)); // sanity check to ensure we didn't go over provided numDocs
     assert(docs.size() == Postings::DOCS_BLOCK_SIZE);
 
     // NOTE: LuxirPFORd (docCodec) applies the adjacent delta itself, in place,
@@ -1689,7 +1804,7 @@ public:
     auto totalTermFreq = hasFreqs ? ttfAcc : (int64_t) docfreq;
     sumTotalTermFreq += totalTermFreq;
     if (docs.size() > 0) {
-      assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided numDocs
+      assert(docs.back() < postingsWriter.getMaxDoc(fieldInfo->space)); // sanity check to ensure we didn't go over provided numDocs
     }
     if (totalTermFreq == 0) {
       // term with no documents, remove term we just added
@@ -2080,6 +2195,25 @@ public:
   void finish() {
     fieldInfo.docsWithField = docsWriter.finish();
     fieldInfo.docsWithFieldEndLoc = idOutput->slocation();
+  }
+
+  // Writes the docs-with-field set of a field from its docs in increasing
+  // order: the bitset when some of the segment's docs lack the field, else
+  // just the dense count. For indexed fields without a column.
+  template <class ForEachDoc>
+  static void write(MemPool& pool, PostingsWriter& postingsWriter,
+                    PostingsWriter::IndexFieldInfo& fieldInfo, int32_t numDocs,
+                    ForEachDoc&& forEachDoc) {
+    if (numDocs == postingsWriter.getMaxDoc(fieldInfo.space)) {
+      fieldInfo.docsWithField = numDocs;
+      fieldInfo.docsWithFieldEndLoc = {0, 0};
+      return;
+    }
+    auto guard = pool.rewindScopeGuard();
+    DocsWithValWriter writer(pool, postingsWriter, fieldInfo);
+    forEachDoc([&](int32_t doc) { writer.startDoc(doc); });
+    assert(writer.numAdded() == numDocs);
+    writer.finish();
   }
 
   // Signal that the column has all docs present. No docs should be added in this case, but the count

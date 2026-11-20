@@ -10,6 +10,7 @@
 #include <stop_token>
 #include <unordered_map>
 #include "luxir/search/ReaderManager.h"
+#include "luxir/schema/SchemaCache.h"
 
 namespace luxir {
 
@@ -52,12 +53,16 @@ private:
     uint64_t size;
     uint64_t pins = 0;
     bool retired = false;
+    // Latest expiry among superseded snapshots referencing this name. These
+    // holds neither consume the follower-pin budget nor expire on pin idle.
+    std::optional<Clock::time_point> until = {};
   };
   std::mutex mutex;
   std::mutex retirementMutex; // joins directory access before close returns
   Policy policy;
   Stats counters;
   Now now;
+  const std::chrono::milliseconds retention;
   bool closed = false;
   std::map<CommitId, Pin> pins;
   // The current snapshot's descriptors by name, rebuilt once per publication
@@ -66,6 +71,8 @@ private:
   boost::unordered_flat_map<std::string_view, const FileDescriptor*> indexedFiles;
   std::unordered_map<std::string, FileRef> files;
 public:
+  std::shared_ptr<SchemaCache> schemas;
+  std::string schemaScope;
   Directory& dir;
   ReaderManager readers;
   // Set once by the collection owner before admitting requests. Runs after
@@ -80,16 +87,28 @@ private:
   void unlinkFiles(std::span<const std::string> names) noexcept;
   void notifyChange() noexcept;
   void retireUnreferenced(std::span<const Directory::FileInfo> listing);
+  Clock::time_point retentionDeadline();
+  void retain(const CommitSnapshot& snapshot, Clock::time_point until);
+  void retainHistory(std::span<const Directory::FileInfo> listing, const CommitSnapshot& current);
   void requireHeld(const FileDescriptor& descriptor);
 public:
-  explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now)
-      : now(std::move(now)), dir(dir), readers(dir, config) {}
+  explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now,
+                                  std::shared_ptr<SchemaCache> schemas = {}, std::string schemaScope = "t0",
+                                  std::chrono::milliseconds retention = {})
+      : now(std::move(now)), retention(retention),
+        schemas(schemas ? std::move(schemas) : std::make_shared<SchemaCache>()),
+        schemaScope(std::move(schemaScope)), dir(dir), readers(dir, config) {
+    if (retention.count() < 0 || retention.count() > INT64_MAX / 1000) throw std::invalid_argument("snapshot retention is out of range");
+  }
+  std::shared_ptr<const CommitSnapshot> resolve(CommitSnapshot::Bytes bytes, Directory& source);
+  std::shared_ptr<const CommitSnapshot> resolve(CommitSnapshot::Bytes bytes) { return resolve(std::move(bytes), dir); }
   ~CommitSnapshotRegistry() { close(); }
   void close() noexcept;
   // The owning writer failed after durable publication: close and notify.
   void fail() noexcept;
   // Stop pins and join retirement while admitted searches retain readers.
   void detach() noexcept;
+  // The snapshot's STATE tip must already be installed before publication.
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
   // Installers other than the writer: make `snapshot`'s root durable, publish it
   // with the prepared reader, then retire the previous root and the files only
@@ -100,8 +119,9 @@ public:
   // Verifies held files before mapping them into a reader, then publishes.
   // With verify, checks all files; otherwise only marker-named files.
   // Only opening failures retry against a newer root, never hash failures.
-  void openLocalSnapshot(bool verify = false);
-  void sweepOrphans(const Manifest& manifest);
+  // Returns the marker names read by the attempt that published the reader.
+  std::vector<std::string> openLocalSnapshot(bool verify = false);
+  void sweepOrphans(Manifest& manifest, uint64_t writerEpoch);
   void sweepOrphans();
   static std::vector<std::string> obsoleteFiles(const CommitSnapshot& previous,
       const CommitSnapshot& next, boost::unordered_flat_set<std::string> retained = {});

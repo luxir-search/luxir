@@ -31,16 +31,6 @@ class MinScoreQuery final : public Query {
   Query* child;
   float minScore;
 
-  static float childFloor(float floor, float minScore, float multiplier,
-                          bool scored) {
-    if (!scored || multiplier == 0.0f) return minScore;
-    float translated = multiplier == 1.0f
-        ? floor
-        : std::nextafter(floor / multiplier,
-                         -std::numeric_limits<float>::infinity());
-    return std::max(translated, minScore);
-  }
-
   class Scorer final : public Query::Scorer {
     Query::Scorer* child;
     float minScore;
@@ -432,6 +422,14 @@ class MinScoreQuery final : public Query {
   }
 
 public:
+  // Keep the membership cut-off when translating a competitive score floor.
+  static float childFloor(float floor, float minScore, float multiplier,
+                          bool scored) {
+    if (!scored || multiplier == 0.0f) return minScore;
+    float translated = Query::unscaleScoreFloor(floor, multiplier);
+    return std::max(translated, minScore);
+  }
+
   MinScoreQuery(Query* child, float minScore)
     : Query(QueryKind::MIN_SCORE), child(child), minScore(minScore) {
     if (!std::isfinite(minScore)) {
@@ -474,6 +472,8 @@ public:
 
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
+
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
 
   class Weight final : public Query::Weight {
     Query::Weight* childWeight;
@@ -527,10 +527,10 @@ public:
       childWeight = query.child->createWeight(
           context, (flags & ~EXCLUSION_WINDOW_FILL) | NEED_SCORES | ALLOW_PRUNING,
           1.0f);
-      // Only the prepare requirement carries over: match-all, constant
+      // Only preparation traits carry over: match-all, constant
       // counts, and count/top-k composition all describe the child's
       // unfiltered membership.
-      traits = childWeight->getFlags() & NEEDS_PREPARE;
+      traits = childWeight->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN);
       if (!scored) traits |= IS_CONSTANT_SCORING;
     }
 

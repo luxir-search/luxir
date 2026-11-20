@@ -6,6 +6,7 @@
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
+#include "test/KnnTestUtils.h"
 #include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/search/SearchOverrides.h"
@@ -37,6 +38,7 @@ std::vector<Witness> witnesses(const LocalReq& req) {
 // floor of 39*256. The small mode uses 1-bit PQ on 96 vectors per segment.
 void BM_GroupKnn(benchmark::State& state, bool adversarial, bool exact, int32_t probes, int32_t key = 0,
                  bool coarse = false, bool groups = true, int32_t memberCap = 0) {
+  ForceIvfGuard forceIvf;
   int32_t products = (int32_t)LuxirTest::scaleTestWork(unit_tests ? 48 : 6000);
   constexpr int32_t variants = 8, dims = 16, k = 10;
   std::string name = "group_knn_structured_" + std::to_string(products) + (adversarial ? "_hog" : "_catalog") + (coarse ? "_m4b4" : "_default8");
@@ -160,6 +162,13 @@ void BM_GroupKnn(benchmark::State& state, bool adversarial, bool exact, int32_t 
   state.counters["probes_requested"] = probes;
   state.counters["lists"] = (double)stats.lists.load() / (double)queryCount;
   state.counters["vectors"] = (double)stats.vectors.load() / (double)queryCount;
+  state.counters["scanned"] = (double)stats.scanned.load() / (double)queryCount;
+  state.counters["extra_bits"] = (double)stats.extraBitEvaluations.load() / (double)queryCount;
+  state.counters["gate_rejections"] = (double)stats.gateRejections.load() / (double)queryCount;
+  state.counters["retained_peak"] = (double)stats.retainedPeak.load() / (double)queryCount;
+  state.counters["retained_terminal"] = (double)stats.retainedTerminal.load() / (double)queryCount;
+  state.counters["seed_reads"] = (double)stats.seedReads.load() / (double)queryCount;
+  state.counters["remaining_reads"] = (double)stats.remainingReads.load() / (double)queryCount;
   state.counters["bytes_read"] = (double)stats.bytes.load() / (double)queryCount;
   state.counters["rounds"] = (double)stats.rounds.load() / (double)queryCount;
   state.counters["underfill"] = underfill / (double)queryCount;

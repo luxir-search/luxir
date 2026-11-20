@@ -438,6 +438,21 @@ TEST_F(ConjunctionMembershipPlanningTest, OpaqueDomainsScoredAndPullDoNotUseTheP
 }
 
 
+// Unscored required clauses alone plan membership windows like a filtered
+// count body (the planner observes both clauses).
+TEST_F(ConjunctionMembershipPlanningTest, RequiredOnlyClausesPlanMembership) {
+  TermQuery t40("body_w", "t40");
+  NumericPredicateQuery selective("a_i", 49995, 50004);
+  std::array<Query*, 2> clauses{&t40, &selective};
+  BooleanQuery query{std::span(clauses), {}, {}, {}};
+  auto expected = ids([](int32_t doc) { return term(doc, 40) && narrow(doc); });
+  for (auto use : {Use::COUNT_WINDOWS, Use::MATCH_WINDOWS}) {
+    auto result = run(query, use);
+    EXPECT_EQ(expected, result.docs);
+    EXPECT_EQ(2u, result.stages[0].size() + result.stages[1].size());
+  }
+}
+
 TEST_F(ConjunctionMembershipPlanningTest, VerifyingRangeLeadCostIsItsApproximation) {
   // A verifying column range estimates its matches but iterates every
   // document with a value; its plan costs the latter, which conjunctions

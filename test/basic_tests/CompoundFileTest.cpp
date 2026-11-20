@@ -1,6 +1,8 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 #include "test/TestUtils.h"
 #include "test/DurableIndexInfo.h"
@@ -80,10 +82,10 @@ SegFieldInfo fieldInfo(PostingsReader& reader, std::string_view field) {
   return info;
 }
 
-std::vector<std::string> baseSegmentFiles(Directory& directory, uint64_t segId) {
+std::vector<std::string> baseSegmentFiles(Directory& directory, uint64_t segId, uint64_t epoch = 1) {
   std::vector<Directory::FileInfo> files;
   directory.listFiles(files);
-  std::string prefix = Postings::getIndexFileNamePrefix(segId);
+  std::string prefix = "s" + Postings::segmentKey(segId, epoch);
   std::vector<std::string> matches;
   for (const auto& file : files) {
     if (file.name.starts_with(prefix + "_")
@@ -123,7 +125,7 @@ std::string wideTerm(int32_t ord) {
 
 void verifyTinySegment(Directory& directory, size_t largeTagBytes = 0) {
   auto schema = compoundSchema();
-  CommitSnapshotRegistry writerSnapshots(directory);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(directory));
   IndexWriter writer(writerSnapshots, schema);
   Inverter& inverter = writer.obtainInverter();
   std::string firstTag = largeTagBytes == 0
@@ -157,7 +159,7 @@ void verifyTinySegment(Directory& directory, size_t largeTagBytes = 0) {
   PostingsReader& postings = segment.postingsReader();
   auto physicalFile = directory.openFile(baseFiles[0], true);
   ASSERT_NE(nullptr, physicalFile);
-  EXPECT_EQ((uint64_t) physicalFile->size(), postings.sizeInBytes());
+  EXPECT_EQ((uint64_t) physicalFile->size(), postings.core().sizeInBytes());
   SegFieldInfo bodyInfo = fieldInfo(postings, "body");
   MemPool pool;
   TermsEnum terms(pool, postings, bodyInfo);
@@ -242,7 +244,7 @@ void addMergeSource(IndexWriter& writer, int32_t source,
 
 void verifyCollapsedMerge(Directory& directory, size_t tagBytes = 0) {
   auto schema = compoundSchema();
-  CommitSnapshotRegistry writerSnapshots(directory);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(directory));
   IndexWriter writer(writerSnapshots, schema);
   writer.mergePolicy->setMergeFactor(1000);
   for (int32_t source = 0; source < 3; source++) {
@@ -337,7 +339,7 @@ TEST(CompoundFileTest, MultiMiBFlushCollapsesOnFSDirectory) {
 TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
   constexpr uint32_t VALUE_COUNT = 33;
   RAMDir directory;
-  PostingsWriter writer(directory, 17, 1);
+  PostingsWriter writer(directory, 17, 1, 1);
   auto streams = writer.getOutputStreams<3>();
   ASSERT_EQ(0, streams[0]->streamNumber);
   ASSERT_EQ(1, streams[1]->streamNumber);
@@ -351,7 +353,7 @@ TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
       values.data(), encoded.data(), encoded.data() + keyBytes, VALUE_COUNT, 0);
   encoded.resize((size_t) (encodedEnd - encoded.data()));
 
-  auto& moved = writer.addField("moved");
+  auto& moved = writer.addField(SpaceOrdinal::ROOT, "moved");
   moved.type = FieldType::BIN;
   moved.flags = FieldType::COLUMN_STORED;
   moved.docsWithField = 1;
@@ -360,7 +362,7 @@ TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
   moved.columnMetaOff = (int64_t) encoded.size();
   streams[1]->write(encoded.data(), encoded.size());
 
-  auto& survivor = writer.addField("survivor");
+  auto& survivor = writer.addField(SpaceOrdinal::ROOT, "survivor");
   survivor.type = FieldType::BIN;
   survivor.flags = FieldType::COLUMN_STORED;
   survivor.docsWithField = 1;
@@ -383,21 +385,22 @@ TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
     EXPECT_EQ(descriptor.xxh3, XXH3_64bits(bytes.data(), bytes.size()));
   }
 
-  std::string seg = Postings::getSortableString(17);
+  std::string seg = Postings::segmentKey(17, 1);
   std::vector<Directory::FileInfo> files;
   directory.listFiles(files);
   ASSERT_EQ(2u, files.size());
   EXPECT_EQ(nullptr, directory.openFile(Postings::getIndexFileName(seg, 1)).get());
   EXPECT_NE(nullptr, directory.openFile(Postings::getIndexFileName(seg, 2)).get());
 
-  PostingsReader reader(directory, 17);
+  SegmentCore readerCore(directory, 17, 1);
+  auto& reader = readerCore.rootReader();
   SegFieldInfo movedInfo = fieldInfo(reader, "moved");
   SegFieldInfo survivorInfo = fieldInfo(reader, "survivor");
   EXPECT_EQ(0u, movedInfo.columnLoc.filenum());
   EXPECT_EQ(2u, survivorInfo.columnLoc.filenum());
   EXPECT_EQ((uint64_t) 0, movedInfo.columnLoc.offset() % 8);
 
-  InputStream movedInput = reader.getInputStreamSeek(movedInfo.columnLoc);
+  InputStream movedInput = reader.core().getInputStreamSeek(movedInfo.columnLoc);
   ASSERT_GE(movedInput.left(),
             (int64_t) encoded.size() + (int64_t) SVB_OVERREAD_PAD);
   std::array<uint32_t, VALUE_COUNT> decoded;
@@ -406,9 +409,9 @@ TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
                          VALUE_COUNT, 0);
   EXPECT_EQ(values, decoded);
 
-  InputStream survivorInput = reader.getInputStreamSeek(survivorInfo.columnLoc);
+  InputStream survivorInput = reader.core().getInputStreamSeek(survivorInfo.columnLoc);
   EXPECT_EQ((char) 0x5a, survivorInput.readByte());
-  EXPECT_EQ((uint64_t) files[0].size + files[1].size, reader.sizeInBytes());
+  EXPECT_EQ((uint64_t) files[0].size + files[1].size, reader.core().sizeInBytes());
 }
 
 TEST(CompoundFileTest, HeaderOnlyUnreferencedStreamIsDropped) {
@@ -416,13 +419,13 @@ TEST(CompoundFileTest, HeaderOnlyUnreferencedStreamIsDropped) {
   // reserves streams it never writes past their headers.  Dropped header-only
   // files must leave file 0 byte-identical, not appended as 8-byte stubs.
   auto build = [](Directory& directory, uint64_t segId, int32_t extraStreams) {
-    PostingsWriter writer(directory, segId, 1);
+    PostingsWriter writer(directory, segId, 1, 1);
     auto used = writer.getOutputStream();
     if (extraStreams != 0) {
       auto unused = writer.getOutputStreams<2>();
       for (auto& stream : unused) stream.reset();
     }
-    auto& field = writer.addField("f");
+    auto& field = writer.addField(SpaceOrdinal::ROOT, "f");
     field.type = FieldType::BIN;
     field.flags = FieldType::COLUMN_STORED;
     field.docsWithField = 1;
@@ -449,9 +452,10 @@ TEST(CompoundFileTest, HeaderOnlyUnreferencedStreamIsDropped) {
   EXPECT_EQ(plainFiles[0].size, extraFiles[0].size)
       << "dropped header-only streams must not grow file 0";
 
-  PostingsReader reader(withExtras, 22);
+  SegmentCore readerCore(withExtras, 22, 1);
+  auto& reader = readerCore.rootReader();
   SegFieldInfo info = fieldInfo(reader, "f");
-  InputStream in = reader.getInputStreamSeek(info.columnLoc);
+  InputStream in = reader.core().getInputStreamSeek(info.columnLoc);
   EXPECT_EQ((char) 0x7f, in.readByte());
 }
 
@@ -470,10 +474,10 @@ TEST(CompoundFileTest, SpillDisqualifiesRelocationAndKeepsStableName) {
   TempDirectory temp;
   FSDirectory directory(temp.path());
   IndexRamBudget budget;
-  PostingsWriter writer(directory, 18, 1, &budget, true);
+  PostingsWriter writer(directory, 18, 1, 1, &budget, true);
   auto streams = writer.getOutputStreams<2>();
   std::string payload = patternedBytes(PostingsWriter::RAM_SPILL_BYTES + 4096);
-  auto& field = writer.addField("spill");
+  auto& field = writer.addField(SpaceOrdinal::ROOT, "spill");
   initializeRawField(field, streams[1]->slocation(), (int64_t) payload.size());
   streams[1]->write(payload.data(), payload.size());
   EXPECT_FALSE(streams[1]->isRelocatable());
@@ -487,13 +491,14 @@ TEST(CompoundFileTest, SpillDisqualifiesRelocationAndKeepsStableName) {
   EXPECT_EQ(0, budget.reservedBytes());
 
   ASSERT_EQ(2u, baseSegmentFiles(directory, 18).size());
-  std::string seg = Postings::getSortableString(18);
+  std::string seg = Postings::segmentKey(18, 1);
   EXPECT_NE(nullptr, directory.openFile(
                          Postings::getIndexFileName(seg, 1), true).get());
-  PostingsReader reader(directory, 18);
+  SegmentCore readerCore(directory, 18, 1);
+  auto& reader = readerCore.rootReader();
   SegFieldInfo info = fieldInfo(reader, "spill");
   EXPECT_EQ(1u, info.columnLoc.filenum());
-  InputStream input = reader.getInputStreamSeek(info.columnLoc);
+  InputStream input = reader.core().getInputStreamSeek(info.columnLoc);
   ASSERT_GE(input.left(), (int64_t) payload.size());
   EXPECT_EQ(0, std::memcmp(input.ptr(), payload.data(), payload.size()));
 }
@@ -502,10 +507,10 @@ TEST(CompoundFileTest, ProtectedRamFileMaterializesAsSurvivor) {
   TempDirectory temp;
   FSDirectory directory(temp.path());
   IndexRamBudget budget;
-  PostingsWriter writer(directory, 19, 1, &budget, true);
+  PostingsWriter writer(directory, 19, 1, 1, &budget, true);
   auto streams = writer.getOutputStreams<2>();
   std::string payload = patternedBytes(64ULL << 10);
-  auto& field = writer.addField("protected");
+  auto& field = writer.addField(SpaceOrdinal::ROOT, "protected");
   initializeRawField(field, streams[1]->slocation(), (int64_t) payload.size());
   streams[1]->write(payload.data(), payload.size());
   ASSERT_TRUE(streams[1]->isRelocatable());
@@ -520,10 +525,11 @@ TEST(CompoundFileTest, ProtectedRamFileMaterializesAsSurvivor) {
   EXPECT_EQ(0, budget.reservedBytes());
   ASSERT_EQ(2u, baseSegmentFiles(directory, 19).size());
 
-  PostingsReader reader(directory, 19);
+  SegmentCore readerCore(directory, 19, 1);
+  auto& reader = readerCore.rootReader();
   SegFieldInfo info = fieldInfo(reader, "protected");
   EXPECT_EQ(1u, info.columnLoc.filenum());
-  InputStream input = reader.getInputStreamSeek(info.columnLoc);
+  InputStream input = reader.core().getInputStreamSeek(info.columnLoc);
   ASSERT_GE(input.left(), (int64_t) payload.size());
   EXPECT_EQ(0, std::memcmp(input.ptr(), payload.data(), payload.size()));
 }
@@ -549,7 +555,7 @@ TEST(CompoundFileTest, DelegatingFlushAndMergeChargeBudget) {
     Signal::unlisten("postingsBeforeCollapse");
   });
 
-  CommitSnapshotRegistry writerSnapshots(directory);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(directory));
 
   IndexWriter writer(writerSnapshots, schema, &budget);
   writer.mergePolicy->setMergeFactor(1000);
@@ -587,7 +593,7 @@ TEST(CompoundFileTest, PartitionRowsMaterializeDelegatingFiles) {
   TempDirectory temp;
   FSDirectory directory(temp.path());
   auto schema = compoundSchema();
-  CommitSnapshotRegistry writerSnapshots(directory);
+  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(directory));
   IndexWriter writer(writerSnapshots, schema);
   writer.mergePolicy->setMergeFactor(1000);
   writer.termPartitionMinBytes = 1;
@@ -619,14 +625,14 @@ TEST(CompoundFileTest, PartitionRowsMaterializeDelegatingFiles) {
   PostingsReader& postings = reader->segments()[0].postingsReader();
   SegFieldInfo info = fieldInfo(postings, "body");
   ASSERT_FALSE(info.rangeTableLoc.isNull());
-  InputStream table = postings.getInputStreamSeek(info.rangeTableLoc);
+  InputStream table = postings.core().getInputStreamSeek(info.rangeTableLoc);
   const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
   const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
   ASSERT_GT(header->nRanges, 1u);
   for (uint32_t i = 0; i < header->nRanges; i++) {
-    EXPECT_NE(nullptr, postings.getFile(rows[i].termsBase.filenum()));
-    EXPECT_NE(nullptr, postings.getFile(rows[i].docsBase.filenum()));
-    EXPECT_NE(nullptr, postings.getFile(rows[i].posBase.filenum()));
+    EXPECT_NE(nullptr, postings.core().getFile(rows[i].termsBase.filenum()));
+    EXPECT_NE(nullptr, postings.core().getFile(rows[i].docsBase.filenum()));
+    EXPECT_NE(nullptr, postings.core().getFile(rows[i].posBase.filenum()));
   }
 
   MemPool pool;

@@ -15,7 +15,7 @@
 #include "CollectionEvents.h"
 #include "luxir/LuxirConfig.h"
 #include "luxir/index/IndexRamBudget.h"
-#include "luxir/store/DirectoryFactory.h"
+#include "TenantCatalog.h"
 #include "luxir/util/SharedLazyMap.h"
 
 namespace luxir {
@@ -28,14 +28,17 @@ namespace api { struct SchemaDef; }
 //
 // Creation, removal and activation own their name for their whole duration
 // and announce their result before releasing it: a second transition of the
-// same name fails fast instead of waiting, and no lock is held across I/O.
-// Concurrent auto-creators wait on the map's creation slot instead.
+// same name fails fast instead of waiting. Lifecycle mutations serialize per
+// tenant through catalog publication and announcement; lookup locks never cover
+// I/O. Concurrent auto-creators wait on the map's creation slot instead.
 // Staged candidates hold leases on their incarnation directories, and
 // retirement removes only directories nothing selects, leases or retains.
 // Publications within an incarnation are not transitions; they reach the
 // events feed from the collection's registry.
 class Collections {
 public:
+  uint64_t schemaBytes() const { return schemas->bytes(); }
+  uint64_t schemaBytes(std::string_view tenant) { return schemas->tenantBytes(tenant); }
   static constexpr std::string_view kDefaultCollectionName = "main";
   enum class Role { WRITER, READ_ONLY, FOLLOWER };
 
@@ -44,12 +47,12 @@ public:
     std::shared_ptr<Collection> collection;
     std::string error;
   };
-  // A startup row. A follower collection without CURRENT has neither a
+  // A startup row. A follower collection without an active catalog entry has neither a
   // collection nor an error: its incarnations are retained download candidates.
   struct Opened {
     CollectionId id;
     std::shared_ptr<Collection> collection; // null for a staged-only follower collection
-    std::optional<std::string> incarnation; // CURRENT, when it could be read
+    std::optional<std::string> incarnation; // active incarnation, when it could be read
     std::string error;
   };
 
@@ -102,18 +105,24 @@ private:
   class Transition {
     Collections& owner;
     CollectionId name;
+    std::unique_lock<std::recursive_mutex> catalogLock;
+    friend class Collections;
   public:
     Transition(Collections& owner, CollectionId name);
     ~Transition();
   };
 
+  std::shared_ptr<SchemaCache> schemas = std::make_shared<SchemaCache>();
   std::shared_ptr<Metrics> metrics;
   const LuxirConfig& config;
+  const std::string lifetime;
   CollectionEvents& events;
   IndexRamBudget& indexRamBudget;
   oneapi::tbb::task_arena& arena;  // runs every writer's indexing (the node's index arena)
   bool verifyOnOpen; // store.verify-on-open=full
   std::unique_ptr<DirectoryFactory> factory;
+  std::mutex catalogsMutex;
+  std::map<std::string, std::unique_ptr<TenantCatalog>, std::less<>> catalogs;
   SharedLazyMap<CollectionId, Collection> map;
   std::mutex slotsMutex;
   std::map<CollectionId, Slot> slots;
@@ -124,14 +133,17 @@ private:
   // Announced collections by tenant and name, changed only with their
   // announcements, so a listing reads its tenant without visiting the others.
   std::mutex listingMutex;
-  std::map<std::string, std::map<std::string, std::shared_ptr<Collection>, std::less<>>, std::less<>> listing;
+  std::map<std::string, std::map<std::string, std::shared_ptr<Collection>>, std::less<>> listing;
 
   std::shared_ptr<Collection> makeCollection(const CollectionId& id, std::shared_ptr<Directory> directory);
-  std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<std::string>& selected);
-  std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {}, bool startup = false);
+  void openOne(Opened& row, Role role, const std::shared_ptr<Collection>& expected = {});
+  std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<TenantCatalog::Entry>& selected);
+  std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {}, bool startup = false,
+                                        std::optional<TenantCatalog::Entry> entry = {});
+  void unload(const Transition& transition, const std::shared_ptr<Collection>& expected, std::string reason);
   // A writer whose newest root is invalid continues from the newest valid one
-  // under a new incarnation. Returns the incarnation to open.
-  std::string recoverWriter(const CollectionId& id, CollectionStorage& storage, const std::string& selected);
+  // under a new incarnation. Updates opened to match the returned incarnation.
+  std::string recoverWriter(const CollectionId& id, TenantCatalog& storage, const std::string& selected, WriterOpen& opened);
   void observe(const CollectionId& id, Collection& collection);
   // The policy helpers require cachePolicyMutex. Listing locks nest inside it.
   size_t cacheBytes(const CollectionId& id) const;
@@ -140,6 +152,10 @@ private:
   // Lists and announces a registration, or a removal.
   void registered(const CollectionId& id, const std::shared_ptr<Collection>& collection);
   void removed(const CollectionId& id);
+  uint64_t revision(std::string_view tenant);
+  void publishMapping(std::string_view tenant, const std::map<std::string, std::shared_ptr<Collection>>& next,
+                      const std::function<uint64_t()>& publish);
+  void changeNames(const CollectionId& from, const CollectionId& to, bool exchange);
   bool reclaimStorage();
   void release(const CollectionId& id, const std::string& incarnation) noexcept;
   // Removes incarnation directories that nothing selects, leases or retains.
@@ -147,7 +163,7 @@ private:
   void retire(const CollectionId& id, const std::string& selected) noexcept;
 
 public:
-  Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget,
+  Collections(const LuxirConfig& config, std::string lifetime, CollectionEvents& events, IndexRamBudget& indexRamBudget,
               oneapi::tbb::task_arena& arena, std::shared_ptr<Metrics> metrics = Metrics::detached());
   ~Collections();
 
@@ -155,6 +171,10 @@ public:
   static void validateName(std::string_view name, std::string_view kind = "collection");
   static void validate(const CollectionId& id);
   DirectoryFactory& storage() { return *factory; }
+  TenantCatalog& catalog(std::string_view tenant = CollectionId::kDefaultTenant);
+  void expireRetirements();
+  uint64_t storageBytes(const CollectionId& id);
+  uint64_t storageBytes(const Collection& collection);
 
   // The single startup discovery path. Writers recover identities, remove
   // unselected leftovers and create the default collection; read-only nodes
@@ -181,21 +201,32 @@ public:
   // Removes the entry and all storage. Without `mustExist`, an absent entry
   // still removes leftover storage. Refused while a candidate is staged.
   void remove(const CollectionId& id, bool mustExist = true);
+  // Final commit (best effort), close, and hand off the existing incarnation.
+  // A commit failure is thrown after the handoff; assignment failures also unload.
+  void detach(const CollectionId& id, std::string_view target);
+  // Open an active catalog entry, optionally taking its assignment first.
+  std::shared_ptr<Collection> attach(const CollectionId& id, bool force = false);
+
+  void rename(const CollectionId& from, const CollectionId& to) { changeNames(from, to, false); }
+  void swap(const CollectionId& a, const CollectionId& b) { changeNames(a, b, true); }
+  // Empty incarnation ids leave unavailable names. Running installers retain
+  // their directories until they finish, even if the mapping removes them.
+  void applyMapping(std::string_view tenant, const std::map<std::string, std::string>& names,
+                    const std::map<std::string, std::string>& desired,
+                    std::vector<Prepared> prepared, std::span<const std::string> retained);
 
   Candidate stage(const CollectionId& id, std::string_view incarnation);
   // Makes `snapshot` durable in the candidate's directory, whose files the
-  // caller verified and synced, and opens its readers. On failure the
-  // candidate stays staged.
-  Prepared prepare(Candidate& candidate, std::shared_ptr<const CommitSnapshot> snapshot);
+  // caller verified and synced, and opens its readers. Clears the markers
+  // read for that verification. On failure the candidate stays staged.
+  Prepared prepare(Candidate& candidate, std::shared_ptr<const CommitSnapshot> snapshot, std::span<const std::string> markers);
   // Activates a prepared candidate in place of `expected` (null: absent):
-  // CURRENT durably selects it, the map points at it, the events feed
+  // the catalog durably selects it, the map points at it, the events feed
   // announces it, and incarnations nothing else needs are retired.
   std::shared_ptr<Collection> install(Prepared prepared, const std::shared_ptr<Collection>& expected);
   // Closes an abandoned candidate and removes its directory unless something
   // selects, leases or retains it.
   void discard(Candidate& candidate) noexcept;
-  // After a same-incarnation advance: retire leftover candidates of earlier runs.
-  void retainSelected(const CollectionId& id) noexcept;
   // Registers an unavailable placeholder unless something is already registered.
   std::shared_ptr<Collection> unavailable(const CollectionId& id, std::string reason);
 

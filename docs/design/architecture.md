@@ -40,10 +40,10 @@ Most of what follows depends on segments being immutable:
 - Writers never modify what readers are using. A search pins a consistent
   snapshot for its whole lifetime; new commits swap in atomically without
   pausing queries.
-- Crash safety comes from the write protocol: files are written to a
-  temporary name, synced, and atomically renamed, and a commit point is
-  published only after the files it names are durable. After a crash the
-  index reopens at the previous commit.
+- Crash safety comes from the write protocol: `Directory::sync` makes both
+  file bytes and names durable before `publishFile` atomically publishes a
+  durable commit point. `deleteDurably` persists removals. After a crash the
+  index reopens at a complete commit.
 - Compaction is concurrent merging: merges produce new segments in the
   background and never stall ingest or search.
 
@@ -63,6 +63,14 @@ every core busy even when work is skewed.
   Independent updates are automatically parallelized. A single HTTP NDJSON
   connection submits multiple internal batches for concurrent indexing, with
   a bounded number in flight and backpressure when that limit is reached.
+- **Blocking control work runs on dedicated threads.** Administration, schema
+  changes, replication transfer setup and expiry, and detailed stats run on a
+  node-owned pool (`--server.control-threads`, default 2). Fsync, catalog
+  writes, and writer drains can occupy those threads while search workers
+  remain available. Writer drains enter the index arena through reserved
+  seats. Bare node stats run on the connection or completion-queue thread.
+  The default `/metrics` includes collection and system stats and uses the
+  control pool.
 - **Merging** parallelizes inside a single merge, not just across merges:
   every field merges as its own task, because the segment format does not
   tie index structures to specific files - concurrent tasks write their own
@@ -84,24 +92,22 @@ response paths keep connection handling separate from long-running engine work.
   shard with the fewest live connections and the connection stays pinned to
   that shard; an idle shard parks independently and does no per-request work
   for active shards. The gRPC server runs on completion queues.
-- HTTP search work defaults to serial execution inline on the connection
-  thread that received it: cheap queries pay no scheduler handoff, and
-  request rate never wakes idle workers. A request can instead opt onto the
-  shared work-stealing scheduler (`max_parallel: 1`) so an expensive query
-  does not occupy its connection thread, or parallelize (`max_parallel:
-  -1`): it starts on the receiving thread, which enters the scheduler with
-  a slot reserved for transport threads, and idle workers steal its tasks.
-  gRPC hands every search to the scheduler instead: it offers a
-  connection's new calls to that connection's preferred completion queue
-  first, so inline execution would serialize the calls a client (a gateway,
-  say) multiplexes over one HTTP/2 connection.
+- HTTP searches with `max_parallel: 0` (the default) start inline on the
+  connection thread and adaptively publish work when credit and idle cores
+  permit. The task group and arena entry are lazy. `1` runs serially on an
+  arena worker to keep an expensive query off its connection thread. `-1`
+  publishes every sibling regardless of credit and load; `-2` runs serially
+  inline. The adaptive grain defaults to 50 us, with a 1000 us minimum share
+  when only SMT siblings are idle. `--search.fanout-grain-us=-1` pins `0` to
+  serial execution. gRPC and continuations after `min_commit` waits start on
+  arena workers for every value.
 - Ingest is streaming and incremental: NDJSON bodies are framed as bytes
   arrive and each document enters the indexing pipeline immediately - a
   document can be getting inverted while the request that carried it is
   still on the wire. The connection thread only splits records, recognizes
   control records, and cuts batches; JSON decoding of documents happens on
   the indexing workers, so one connection can keep several cores busy.
-  Buffered JSON update bodies are likewise decoded on the task arena.
+  Buffered JSON update bodies are likewise decoded on the indexing workers.
   Responses stream back the same way, a chunk at a time.
   For HTTP/JSON clients, there is no maximum stream size and no required
   user-visible bulk-request boundary.
@@ -165,12 +171,21 @@ inside the vector search rather than as a post-pass over a fixed unfiltered
 top-k, and hybrid ranking combines lexical and vector evidence in a single
 request.
 
-Filters are cached per collection as document sets. Entries are ranked by
-how expensive they are to rebuild per byte, so under pressure a cheap
-single-term filter is evicted before a compound boolean or a kNN membership
-set. Cached sets are consumed in
-bulk windows, which is faster than re-decoding postings even for a filter that
-is a single term.
+Filters are cached per collection as document sets. Their eviction rank is the
+clock at last use plus rebuild cost per effective byte weighted by a
+logarithmically scaled recent-use count. Under pressure, a cheap single-term
+filter goes before a compound boolean or kNN membership set of similar size.
+The count includes misses and is the maximum of the key's uses in the two
+admission windows. It survives value turnover from segment flush/merge and
+reader refresh, so all values of a key share that demand signal.
+
+The windows count lane uses, not requests or time. Requests with many filters
+shorten the horizon; a key outside both windows ranks as plain Greedy-Dual-Size
+(GDS). A sweep snapshots the windows and advances the inflation clock by the
+rank it sorted on. Hits only refresh the stored clock when it has moved;
+metadata eviction advances the clock using plain GDS. Cached sets are consumed
+in bulk windows, which is faster than re-decoding postings even for a filter
+that is a single term.
 
 ## Vector search, natively integrated
 

@@ -17,7 +17,6 @@
 #include "ScoreCompact.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/util/screaming.h"
-#include "luxir/util/thread.h"
 
 namespace luxir {
 
@@ -44,6 +43,7 @@ class BooleanQuery::MandOptScorer final : public Query::Scorer {
   int32_t id = -1;
   float minCompetitiveScore = 0.0f;
   float reqMaxScore = std::numeric_limits<float>::infinity();
+  std::span<ClauseFloorTarget> clauseFloors;
   int32_t windowUpTo = -1;
   float windowReqMaxScore = std::numeric_limits<float>::infinity();
   float windowMaxScore = std::numeric_limits<float>::infinity();
@@ -298,12 +298,24 @@ public:
   MandOptScorer(luxir::MemPool& targetPool,
                 Scorer* mandScorer, bool mandTwoPhase,
                 Scorer* optScorer, bool optTwoPhase,
-                bool enableTwoPhase)
+                bool enableTwoPhase, bool optionalFloorPays = false,
+                bool requiredFloorPays = false)
     : mand{mandScorer, enableTwoPhase && mandTwoPhase},
       opt{optScorer, enableTwoPhase && optTwoPhase} {
-    unused(targetPool);
     reqMaxScore = mand.scorer->getMaxScoreForSetup(luxir::PostingsReader::END);
+    if (optionalFloorPays || requiredFloorPays) {
+      Scorer* clauses[] = {mandScorer, optScorer};
+      float maxima[] = {optionalUpperBound(reqMaxScore), requiredFloorPays
+          ? optionalUpperBound(optScorer->getMaxScoreForSetup(PostingsReader::END))
+          : std::numeric_limits<float>::infinity()};
+      uint8_t pays[] = {(uint8_t)requiredFloorPays,
+          (uint8_t)(optionalFloorPays && reqMaxScore > 0.0f && std::isfinite(reqMaxScore))};
+      clauseFloors = makeClauseFloorTargets(targetPool, clauses, maxima, pays);
+    }
   }
+
+  Scorer* requiredScorerForTests() const { return mand.scorer; }
+  Scorer* optionalScorerForTests() const { return opt.scorer; }
 
   int32_t docId() override {
     return id;
@@ -446,9 +458,9 @@ public:
   }
 
   void setMinCompetitiveScore(float minScore) override {
-    // Keep theta at the MandOpt level. Forwarding (theta - optMax) into a
-    // term scorer switches its bulk fill from vectorized block scoring to
-    // scalar impact hopping, which can cost far more than the skips it adds.
+    // Term clauses keep theta at the MandOpt level: a derived floor switches
+    // their bulk fill from vectorized block scoring to scalar impact hopping,
+    // which can cost far more than the skips it adds.
     if (minScore > minCompetitiveScore) {
       minCompetitiveScore = minScore;
       windowUpTo = -1;
@@ -459,6 +471,7 @@ public:
         opt.scorer->setMinCompetitiveScore(minScore);
       }
     }
+    if (!clauseFloors.empty()) forwardClauseFloors(clauseFloors, minScore, 2);
   }
 
   float getMaxScore(int32_t upTo) override {
@@ -628,6 +641,7 @@ class BooleanQuery::MandOptBulkScorer final : public BulkScorer {
   double scoreBoundFactor = 1.0;
   float mandWindowMax = std::numeric_limits<float>::infinity();
   double optWindowMaxSum = 0.0;
+  std::span<ClauseFloorTarget> clauseFloors;
 
   static bool lessMaxScore(float a, float b) {
     bool finiteA = std::isfinite(a);
@@ -1002,7 +1016,8 @@ public:
 
   MandOptBulkScorer(luxir::MemPool& pool, Query::Scorer* mand,
                     std::span<Query::Scorer*> opts, std::span<int64_t> optCosts,
-                    int32_t maxDoc, int64_t mandCost)
+                    int32_t maxDoc, int64_t mandCost,
+                    std::span<const uint8_t> floorPays = {}, bool requiredFloorPays = false)
       : mand(mand),
         opts(opts),
         optCosts(optCosts),
@@ -1017,11 +1032,30 @@ public:
         mandCost(mandCost) {
     assert(mand != nullptr);
     assert(!opts.empty());
+    assert(floorPays.empty() || floorPays.size() == opts.size());
     scoreBoundFactor = 1.0 + (double) (opts.size() + 1) * 0x1p-24;
-    for (auto* opt : opts) {
-      assert(opt != nullptr);
+    bool optionalFloorPays = std::any_of(floorPays.begin(), floorPays.end(),
+                                         [](uint8_t pays) { return pays != 0; });
+    if (requiredFloorPays || optionalFloorPays) {
+      boost::container::small_vector<Query::Scorer*, 16> clauses(opts.size() + 1);
+      boost::container::small_vector<float, 16> maxima(clauses.size());
+      boost::container::small_vector<uint8_t, 16> pays(clauses.size());
+      clauses[0] = mand;
+      maxima[0] = optionalFloorPays
+          ? optionalUpperBound(mand->getMaxScoreForSetup(PostingsReader::END))
+          : std::numeric_limits<float>::infinity();
+      pays[0] = (uint8_t)requiredFloorPays;
+      for (size_t i = 0; i < opts.size(); i++) {
+        clauses[i + 1] = opts[i];
+        maxima[i + 1] = optionalUpperBound(opts[i]->getMaxScoreForSetup(PostingsReader::END));
+        pays[i + 1] = floorPays.empty() ? 0 : floorPays[i];
+      }
+      clauseFloors = makeClauseFloorTargets(pool, clauses, maxima, pays);
     }
   }
+
+  std::span<Query::Scorer*> optionalScorersForTests() const { return opts; }
+  Query::Scorer* requiredScorerForTests() const { return mand; }
 
   bool attachWindowFilter(WindowFilter* filter) override {
     assert(!filter->probes());
@@ -1048,6 +1082,9 @@ public:
     }
     if (minCompetitiveScore > this->minCompetitiveScore) {
       this->minCompetitiveScore = minCompetitiveScore;
+      if (!clauseFloors.empty()) {
+        forwardClauseFloors(clauseFloors, minCompetitiveScore, opts.size() + 1);
+      }
     }
 
     int32_t start = min;
@@ -1217,6 +1254,8 @@ class BooleanQuery::MandNotScorer final : public Query::Scorer {
   int32_t notid = -1;
   bool notTwoPhase;
 public:
+  Query::Scorer* requiredScorerForTests() const { return mandScorer; }
+
   int32_t advanceWindow(int32_t min, int32_t max) override {
     while (min < max) {
       id = mandScorer->advanceWindow(min, max);
@@ -1656,6 +1695,8 @@ class BooleanQuery::ConjunctionScorer final : public Query::Scorer {
   }
 
 public:
+  std::span<Query::Scorer*> scoringScorersForTests() const { return scorers; }
+
   [[gnu::cold]] void prepareMembership() override {
     for (auto* scorer : conjunctionClauses) scorer->prepareMembership();
   }
@@ -2321,6 +2362,8 @@ private:
   int32_t maxDoc;
   float minCompetitiveScore = std::numeric_limits<float>::lowest();
   double scoreBoundFactor = 1.0;
+  // At most two score addends: see boundBelowFloor.
+  bool exactScoreBound = false;
   int64_t skippedWindowCount = 0;
   int32_t candidateBatchSize;
   bool allTermScorers = false;
@@ -2637,8 +2680,7 @@ private:
   int32_t compactByRemainingBound(int32_t size, double remaining) {
     int32_t write = 0;
     for (int32_t i = 0; i < size; i++) {
-      if (((double) candScores[(size_t) i] + remaining) * scoreBoundFactor
-          < (double) minCompetitiveScore) {
+      if (boundBelowFloor((double) candScores[(size_t) i] + remaining)) {
         continue;
       }
       if (write != i) {
@@ -2650,17 +2692,27 @@ private:
     return write;
   }
 
+  // True when no match bounded by `bound` (a double sum of clause scores and
+  // their maxima) can reach the floor. One or two float addends round once,
+  // and fl(a + b) is order-free and monotone in each addend, so the bound
+  // rounded to float is exact: ties at a uniform score, whose floor sits one
+  // float above it, are rejected. More addends round per step and keep the
+  // relative slack.
+  bool boundBelowFloor(double bound) const LUXIR_INLINE {
+    if (exactScoreBound) return (float) bound < minCompetitiveScore;
+    return bound * scoreBoundFactor < (double) minCompetitiveScore;
+  }
+
   bool remainingBoundCanDrop(double remaining) const {
     return minCompetitiveScore > 0.0f
-        && remaining * scoreBoundFactor < (double) minCompetitiveScore;
+        && boundBelowFloor(remaining);
   }
 
   int32_t batchCompactByRemainingBound(
       int32_t size, double remaining) LUXIR_INLINE {
     for (int32_t i = 0; i < size; i++) {
       boundDrops[(size_t) i] =
-          (((double) candScores[(size_t) i] + remaining) * scoreBoundFactor
-           < (double) minCompetitiveScore);
+          boundBelowFloor((double) candScores[(size_t) i] + remaining);
     }
 
     int32_t write = 0;
@@ -2800,8 +2852,7 @@ private:
       int32_t doc = docs[(size_t) i];
       float sum = scores[(size_t) i];
       if constexpr (CheckBound) {
-        if (((double) sum + remaining) * scoreBoundFactor
-            < (double) minCompetitiveScore) {
+        if (boundBelowFloor((double) sum + remaining)) {
           continue;
         }
       }
@@ -2835,8 +2886,7 @@ private:
       int32_t doc = candDocs[(size_t) i];
       float sum = candScores[(size_t) i];
       if constexpr (CheckBound) {
-        if (((double) sum + remaining) * scoreBoundFactor
-            < (double) minCompetitiveScore) {
+        if (boundBelowFloor((double) sum + remaining)) {
           continue;
         }
       }
@@ -3054,8 +3104,7 @@ private:
         }
         // Keep all-term bulk bounds group-granular so candidate windows do
         // not pay for block-level refinement.
-        if (suffixMax[0] * scoreBoundFactor
-            < (double) this->minCompetitiveScore) {
+        if (boundBelowFloor(suffixMax[0])) {
           skippedWindowCount++;
           if (upTo >= max - 1) {
             out.max = max;
@@ -3229,8 +3278,7 @@ private:
         windowMax[c] = termClauseGetMaxScore(c, upTo);
         suffixMax[c] = suffixMax[c + 1] + (double) windowMax[c];
       }
-      if (suffixMax[0] * scoreBoundFactor
-          < (double) this->minCompetitiveScore) {
+      if (boundBelowFloor(suffixMax[0])) {
         skippedWindowCount++;
         if (upTo >= max - 1) {
           out.max = max;
@@ -3292,8 +3340,7 @@ private:
           for (int32_t i = 0; i < n; i++) {
             int32_t doc = candDocs[(size_t) i];
             float sum = candScores[(size_t) i];
-            if (((double) sum + remaining) * scoreBoundFactor
-                < (double) this->minCompetitiveScore) {
+            if (boundBelowFloor((double) sum + remaining)) {
               continue;
             }
             if (scorerDoc < doc) scorerDoc = scorer->advance(doc);
@@ -4098,6 +4145,7 @@ public:
     // Bounds cover the same number of float additions as final scoring,
     // including every member contribution inside decomposed unions.
     scoreBoundFactor = 1.0 + (double) scoreAddends * 0x1p-24;
+    exactScoreBound = scoreAddends <= 2;
     if (allTermClauses && termClauses[0].members.size() > 1) {
       size_t memberCount = termClauses[0].members.size();
       leadGroupTerms = pool.make_span<BufferedTerm>(memberCount);
@@ -4371,6 +4419,15 @@ struct BooleanQuery::DisjunctionTestFlags {
   static inline bool disableTwoWayForTests = false;
 };
 
+// At tie 0 the best disjunct is the score: a disjunct below theta either
+// cannot win or is irrelevant to the winning score. Every disjunct gets theta
+// unchanged. At positive tie every matched disjunct contributes, so forwarding
+// would need the others' maxima; deriving those floors showed no gain.
+// Floor setters retain the positioned doc; only subsequent navigation moves it.
+inline void forwardDisMaxFloor(std::span<Query::Scorer* const> clauses, float theta) {
+  for (auto* clause : clauses) clause->setMinCompetitiveScore(theta);
+}
+
 template<bool DISMAX>
 class BooleanQuery::DisjunctionScorerT final : public Query::Scorer,
                                                public DisjunctionTestFlags {
@@ -4414,6 +4471,7 @@ class BooleanQuery::DisjunctionScorerT final : public Query::Scorer,
   float verificationCost = 0.0f;
   bool anyTwoPhase = false;
   bool twoWay;
+  bool forwardDisMaxFloors;
   [[no_unique_address]] std::conditional_t<DISMAX, float, SumScorePolicy> tie;
 
   static std::span<ApproxSlot> makeMembers(
@@ -4458,6 +4516,8 @@ class BooleanQuery::DisjunctionScorerT final : public Query::Scorer,
   }
 
 public:
+  std::span<Query::Scorer*> clauseScorersForTests() const { return clauses; }
+
   int32_t advanceApproximationWindow(int32_t min, int32_t max) override {
     int32_t doc = PostingsReader::END;
     for (auto& member : members) {
@@ -4501,13 +4561,14 @@ public:
 
   DisjunctionScorerT(luxir::MemPool& pool, std::span<Scorer*> scorers,
                     std::span<const uint8_t> twoPhaseScorers,
-                    bool enableTwoPhase, float tie = 0.0f)
+                    bool enableTwoPhase, float tie = 0.0f, bool forwardFloors = true)
           : clauses(scorers),
             members(makeMembers(
                 pool, scorers, twoPhaseScorers, enableTwoPhase)),
             heap(makePointers(pool, members)),
             verificationOrder(makePointers(pool, members)), pq(heap),
-            twoWay(scorers.size() == 2 && !disableTwoWayForTests) {
+            twoWay(scorers.size() == 2 && !disableTwoWayForTests),
+            forwardDisMaxFloors(DISMAX && tie == 0.0f && forwardFloors) {
     if constexpr (DISMAX) this->tie = tie;
     for (auto& member : members) {
       if (member.twoPhase) {
@@ -4650,6 +4711,12 @@ public:
     }
   }
 
+  void setMinCompetitiveScore(float minScore) override {
+    if constexpr (DISMAX) {
+      if (forwardDisMaxFloors) forwardDisMaxFloor(clauses, minScore);
+    }
+  }
+
   bool usesTwoWayMergeForTests() const {
     return twoWay;
   }
@@ -4756,7 +4823,9 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
   int32_t maxDoc;
   int32_t windowSize;
   bool globalMode;
+  bool forwardDisMaxFloors;
   bool windowReady = false;
+  std::span<ClauseFloorTarget> clauseFloors;
   int32_t nextWindowStart = 0;
   int32_t windowStart = 0;
   int32_t windowEnd = 0;
@@ -5107,7 +5176,8 @@ public:
   // The passed in span of scorers will be modified (rearranged).
   MaxScoreDisjunctionScorerT(luxir::MemPool& pool, std::span<Scorer*> scorers,
                             int32_t maxDoc, int32_t windowSize = DocsEnumMeta::L1_DOCS,
-                            float tie = 0.0f)
+                            float tie = 0.0f, std::span<const uint8_t> floorPays = {},
+                            bool forwardFloors = true)
           : scorers(scorers),
             clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
             windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
@@ -5119,7 +5189,8 @@ public:
             pq(essentialPointers, (size_t) 0),
             maxDoc(maxDoc),
             windowSize(normalizeWindowSize(windowSize)),
-            globalMode(normalizeWindowSize(windowSize) >= maxDoc) {
+            globalMode(normalizeWindowSize(windowSize) >= maxDoc),
+            forwardDisMaxFloors(DISMAX && tie == 0.0f && forwardFloors) {
     // Float-summation error headroom for the double split bound (see member).
     scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
     if constexpr (DISMAX) {
@@ -5129,6 +5200,11 @@ public:
     for (size_t i = 0; i < scorers.size(); i++) {
       clauseMax[i] = optionalUpperBound(
           scorers[i]->getMaxScoreForSetup(PostingsReader::END));
+    }
+    if constexpr (!DISMAX) {
+      if (forwardFloors) {
+        clauseFloors = makeClauseFloorTargets(pool, scorers, clauseMax, floorPays);
+      }
     }
     sortByClauseMax();
     for (size_t i = 0; i < scorers.size(); i++) {
@@ -5153,6 +5229,11 @@ public:
   void setMinCompetitiveScore(float minScore) override {
     if (minScore > minCompetitiveScore) {
       minCompetitiveScore = minScore;
+      if constexpr (DISMAX) {
+        if (forwardDisMaxFloors) forwardDisMaxFloor(scorers, minScore);
+      } else if (!clauseFloors.empty()) {
+        forwardClauseFloors(clauseFloors, minScore, scorers.size() + 1);
+      }
       if (globalMode) {
         updateGlobalSplit();
       } else if (windowReady) {
@@ -5636,6 +5717,7 @@ private:
   float uniformConstant = 0.0f;
   bool exactUniformConstant = false;
   bool disjConjCountPath = false;
+  std::span<ClauseFloorTarget> clauseFloors;
 
   void configureDisjunctionCountIdentity(luxir::MemPool& pool,
                                          bool enabled,
@@ -6882,6 +6964,8 @@ public:
     }
   }
 
+  std::span<Query::Scorer*> clauseScorersForTests() const { return scorers; }
+
   // The passed in span of scorers will be modified (rearranged).
   MaxScoreBulkScorer(luxir::MemPool& pool, std::span<Query::Scorer*> scorers,
                      std::span<int64_t> clauseCosts,
@@ -6890,7 +6974,8 @@ public:
                      bool enableDisjConjCount,
                      bool enableDisjunctionCountIdentity,
                      size_t identityLargestIndex,
-                     bool uniformConstantCandidate)
+                     bool uniformConstantCandidate,
+                     std::span<const uint8_t> floorPays = {})
           : scorers(scorers),
             clauseCosts(clauseCosts),
             clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
@@ -6939,6 +7024,7 @@ public:
       clauseMax[i] = optionalUpperBound(
           scorers[i]->getMaxScoreForSetup(PostingsReader::END));
     }
+    clauseFloors = makeClauseFloorTargets(pool, scorers, clauseMax, floorPays);
     sortByClauseMax();
     for (size_t i = 0; i < scorers.size(); i++) {
       windowOrder[i] = (int32_t) i;
@@ -6950,6 +7036,24 @@ public:
 
   bool supportsMatchWindows() const override {
     return true;
+  }
+
+  // An exhaustive pure disjunction keeps every clause essential, so each
+  // window adds clause scores in `scorers` order. Rescoring in that order
+  // reproduces its sums exactly.
+  bool supportsExactCandidateScoring() const override {
+    return exclusionScorers.empty() && requiredScorers.empty();
+  }
+
+  void scoreCandidatesExact(std::span<int32_t> docs,
+                            std::span<float> scores) override {
+    assert(docs.size() == scores.size());
+    assert(supportsExactCandidateScoring());
+    std::fill(scores.begin(), scores.end(), 0.0f);
+    for (auto* scorer : scorers) {
+      scorer->applyToCandidates(
+          docs.data(), scores.data(), (int32_t) docs.size(), false);
+    }
   }
 
   bool attachWindowFilter(WindowFilter* filter) override {
@@ -6979,6 +7083,9 @@ public:
     }
     if (minCompetitiveScore > this->minCompetitiveScore) {
       this->minCompetitiveScore = minCompetitiveScore;
+      if (!clauseFloors.empty()) {
+        forwardClauseFloors(clauseFloors, minCompetitiveScore, scorers.size() + 1);
+      }
       bool insideOuterWindow = outerWindowReady && min >= outerWindowStart && min < outerWindowEnd;
       if (!insideOuterWindow || disablePartitionLatchForTests
           || minCompetitiveScore >= nextPartitionMcs) {
@@ -7735,6 +7842,13 @@ class BooleanQuery::Weight final : public Query::Weight {
   SparseFilteredTopKFamily sparseFilteredTopKFamilyKind =
       SparseFilteredTopKFamily::CONJUNCTION;
 
+  bool foldsProhibitedDomain() const {
+    return !prohibitedWeights.empty()
+        && !QueryPrep::disableProhibitedDomainFoldForTests
+        && (QueryPrep::anyConsumesDomain(mandatoryWeights)
+            || QueryPrep::anyConsumesDomain(optionalWeights));
+  }
+
   static bool sparseFilteredTopKMandatory(Query* query) {
     while (query->getKind() == QueryKind::BOOST) {
       query = static_cast<BoostQuery*>(query)->getChild();
@@ -7800,7 +7914,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       return {};
     }
     auto weights = targetPool.make_arr<Query::Weight*>(queries.size());
-    for (int i = 0; i < queries.size(); ++i) {
+    for (size_t i = 0; i < queries.size(); ++i) {
       weights[i] = queries[i]->createWeight(context, flags, multiplier);
     }
     return {weights, queries.size()};
@@ -7851,6 +7965,34 @@ class BooleanQuery::Weight final : public Query::Weight {
   static constexpr double PULL_LEAD_STEP_POINTS = 32;
   static constexpr double PULL_ADVANCE_POINTS = 75;
   static constexpr double WINDOW_ALIGN_POINTS = 4;
+  // Source grouping's split of a sibling term's pull work
+  // (Supplier::siblingWork): an advance call and a decoded posting block,
+  // in column checks (PointsMaterialize::VERIFY_POINTS each), from fitting
+  // flat and grouped request times to their measured counters on the
+  // two-filter boards (1,596 requests, hugin, 2026-10-29): an advance about
+  // 1.07 checks, a block about 8.4. The block price aggregates the
+  // postings encodings those boards hold; it is not a portable per-block
+  // cost.
+  static constexpr double PULL_STEP_POINTS = 21;
+  static constexpr double PULL_BLOCK_POINTS = 168;
+  // How many times the work it adds a verifier's spared sibling work must
+  // reach before it joins a source group: the robust spread (1.4826 MAD,
+  // e^0.475) of the log ratio of measured to modelled spared work over the
+  // requests that fit would group. Within it the flat schedule stays.
+  static constexpr double SOURCE_GROUP_MARGIN = 1.6;
+
+  // The required side's leading exact group a pull plan selected
+  // (Supplier::planSourceGroup), built by nestSourceGroup: its members by
+  // required-plan index, two or more single-phase unscored clauses or one
+  // with a verifier; what it emits, which places it; and how many of the
+  // other required clauses precede it.
+  struct SourceGroup {
+    std::span<const uint8_t> members;
+    int64_t cost = 0;
+    size_t position = 0;
+    // A two-phase verifier member confirms the source's documents inside.
+    bool verified = false;
+  };
 
   struct PullChildPlan {
     int64_t cost = 0;
@@ -7941,9 +8083,33 @@ class BooleanQuery::Weight final : public Query::Weight {
         allowsPruning, enableTwoPhase);
   }
 
+  // What a nested conjunction emits, which places it: the conjunction yield
+  // of its members' outputs, at most its lead's cost. Plans
+  // (planSourceGroup) and assembly (nestRequired) share it.
+  static int64_t nestedCost(int64_t leadCost, std::span<const int64_t> outputs, int32_t maxDoc) {
+    double universe = (double)std::max(1, maxDoc);
+    boost::container::small_vector<double, 16> selectivities;
+    for (int64_t output : outputs) selectivities.push_back((double)output / universe);
+    return std::min(leadCost, (int64_t)std::ceil(
+        universe * Supplier::conjunctionYield(selectivities)));
+  }
+
+  // The clauses (in cost order) a nested clause of this cost follows: those
+  // it is not sparser than.
+  static size_t nestedPosition(int64_t cost, std::span<const int64_t> others) {
+    return (size_t)(std::upper_bound(others.begin(), others.end(), cost) - others.begin());
+  }
+
+  // The required clauses (in cost order) a constraining optional group of
+  // this cost follows: those it does not undercut, required first on ties.
+  static size_t groupPosition(std::span<const int64_t> required, int64_t groupCost) {
+    size_t position = 0;
+    while (position < required.size() && required[position] <= groupCost) position++;
+    return position;
+  }
+
   // The required clauses composed as one clause led by the cheapest. A
-  // parent places it by what it emits, the conjunction yield of its
-  // clauses, not by its lead's cost.
+  // parent places it by what it emits (nestedCost), not by its lead's cost.
   static Required nestRequired(
       MemPool& targetPool, const Required& req, bool allowsPruning,
       bool enableTwoPhase, int32_t maxDoc) {
@@ -7952,71 +8118,105 @@ class BooleanQuery::Weight final : public Query::Weight {
     auto twoPhase = targetPool.make_span<uint8_t>(1);
     bool composedTwoPhase;
     all[0] = composeRequired(targetPool, req, allowsPruning, enableTwoPhase, composedTwoPhase);
-    double universe = (double)std::max(1, maxDoc);
-    boost::container::small_vector<double, 16> selectivities;
-    for (int64_t cost : req.costs) selectivities.push_back((double)cost / universe);
-    costs[0] = std::min(req.costs.front(), (int64_t)std::ceil(
-        universe * Supplier::conjunctionYield(selectivities)));
+    costs[0] = nestedCost(req.costs.front(), req.costs, maxDoc);
     twoPhase[0] = (uint8_t)composedTwoPhase;
     return {all, costs, twoPhase, req.scoring.empty() ? all.first(0) : all,
             false, req.cost};
   }
 
-  // The required clauses with their single-phase unscored ones, when two or
-  // more, nested as one clause placed by their intersection (nestRequired):
-  // filters, or any required clause that does not score, so their
-  // conjunction needs no pruning. Scoring and two-phase clauses stay beside
-  // it in cost order.
-  static Required nestUnscoredSinglePhase(
-      MemPool& targetPool, const Required& req, bool enableTwoPhase, int32_t maxDoc) {
-    auto unscored = [&](size_t i) {
-      return req.twoPhase[i] == 0
-          && std::find(req.scoring.begin(), req.scoring.end(), req.all[i]) == req.scoring.end();
-    };
+  // The required clauses with the plan's source group (planSourceGroup)
+  // nested as one exact clause at its planned place: its single-phase members
+  // as their intersection when two or more, and a selected verifier
+  // confirming the source's documents behind them, so the parent advances its
+  // other clauses only to confirmed ones. The other clauses keep their cost
+  // order.
+  static Required nestSourceGroup(
+      MemPool& targetPool, const Required& req, const SourceGroup& group,
+      bool enableTwoPhase) {
+    if (group.members.empty()) return req;
+    assert(group.members.size() == req.all.size());
     size_t count = 0;
-    for (size_t i = 0; i < req.all.size(); i++) count += unscored(i);
-    if (count < 2) return req;
-    auto innerAll = targetPool.make_span<Query::Scorer*>(count);
-    auto innerCosts = targetPool.make_span<int64_t>(count);
-    auto innerTwoPhase = targetPool.make_span<uint8_t>(count);
+    for (uint8_t member : group.members) count += member;
+    size_t sources = count - (group.verified ? 1 : 0);
+    auto sourceAll = targetPool.make_span<Query::Scorer*>(sources);
+    auto sourceCosts = targetPool.make_span<int64_t>(sources);
+    auto sourceTwoPhase = targetPool.make_span<uint8_t>(sources);
+    std::fill(sourceTwoPhase.begin(), sourceTwoPhase.end(), 0);
+    Query::Scorer* verifier = nullptr;
+    int64_t verifierCost = 0;
     for (size_t i = 0, j = 0; i < req.all.size(); i++) {
-      if (!unscored(i)) continue;
-      innerAll[j] = req.all[i];
-      innerCosts[j] = req.costs[i];
-      innerTwoPhase[j++] = 0;
+      if (!group.members[i]) continue;
+      if (req.twoPhase[i]) {
+        assert(group.verified && verifier == nullptr);
+        verifier = req.all[i];
+        verifierCost = req.costs[i];
+        continue;
+      }
+      sourceAll[j] = req.all[i];
+      sourceCosts[j++] = req.costs[i];
     }
-    Required inner{innerAll, innerCosts, innerTwoPhase, {}, false, innerCosts[0]};
-    Required nested = nestRequired(targetPool, inner, false, enableTwoPhase, maxDoc);
+    bool ignored;
+    Query::Scorer* scorer = sources == 1 ? sourceAll[0]
+        : composeRequired(targetPool, {sourceAll, sourceCosts, sourceTwoPhase, {}, false, sourceCosts[0]},
+                          false, enableTwoPhase, ignored);
+    if (verifier != nullptr) {
+      skipCount(SkipStats::conjSourceGroupedVerifiers);
+      auto all = targetPool.make_span<Query::Scorer*>(2);
+      auto costs = targetPool.make_span<int64_t>(2);
+      auto twoPhase = targetPool.make_span<uint8_t>(2);
+      all[0] = scorer;
+      costs[0] = sourceCosts[0];
+      twoPhase[0] = 0;
+      all[1] = verifier;
+      costs[1] = verifierCost;
+      twoPhase[1] = 1;
+      scorer = composeRequired(targetPool, {all, costs, twoPhase, {}, false, group.cost},
+                               false, enableTwoPhase, ignored);
+    }
     size_t size = req.all.size() - count + 1;
     auto all = targetPool.make_span<Query::Scorer*>(size);
     auto costs = targetPool.make_span<int64_t>(size);
     auto twoPhase = targetPool.make_span<uint8_t>(size);
-    bool placed = false;
-    for (size_t i = 0, j = 0; i <= req.all.size(); i++) {
-      bool rest = i < req.all.size() && !unscored(i);
-      if (!placed && (i == req.all.size() || (rest && nested.costs[0] < req.costs[i]))) {
-        all[j] = nested.all[0];
-        costs[j] = nested.costs[0];
-        twoPhase[j++] = nested.twoPhase[0];
-        placed = true;
-      }
-      if (!rest) continue;
+    size_t j = 0;
+    // A constructed conjunction is exact to its parent (composeRequired).
+    auto place = [&] {
+      all[j] = scorer;
+      costs[j] = group.cost;
+      twoPhase[j++] = 0;
+    };
+    for (size_t i = 0, rest = 0; i < req.all.size(); i++) {
+      if (group.members[i]) continue;
+      if (rest++ == group.position) place();
       all[j] = req.all[i];
       costs[j] = req.costs[i];
       twoPhase[j++] = req.twoPhase[i];
     }
+    if (j < size) place();
     return {all, costs, twoPhase, req.scoring, false, req.cost};
   }
 
-  template <template <bool> class Scorer, typename... Args>
   static Query::Scorer* makeDisjunctionScorer(
-      MemPool& targetPool, ScorePolicy policy, Args&&... args) {
+      MemPool& pool, ScorePolicy policy, std::span<Query::Scorer*> scorers,
+      std::span<const uint8_t> floorPays, int32_t maxDoc,
+      const Query::PlanContext& context) {
+    bool forward = !context.disableClauseFloorForwardingForTests;
     if (policy.kind == ScorePolicy::DISMAX) {
-      return targetPool.make<Scorer<true>>(
-          targetPool, std::forward<Args>(args)..., policy.tie);
+      return pool.make<MaxScoreDisjunctionScorerT<true>>(
+          pool, scorers, maxDoc, DocsEnumMeta::L1_DOCS, policy.tie, floorPays, forward);
     }
-    return targetPool.make<Scorer<false>>(
-        targetPool, std::forward<Args>(args)...);
+    return pool.make<MaxScoreDisjunctionScorerT<false>>(
+        pool, scorers, maxDoc, DocsEnumMeta::L1_DOCS, 0.0f, floorPays, forward);
+  }
+
+  static Query::Scorer* makeDisjunctionScorer(
+      MemPool& pool, ScorePolicy policy, std::span<Query::Scorer*> scorers,
+      std::span<const uint8_t> twoPhase, bool enableTwoPhase, bool forwardFloors) {
+    if (policy.kind == ScorePolicy::DISMAX) {
+      return pool.make<DisjunctionScorerT<true>>(
+          pool, scorers, twoPhase, enableTwoPhase, policy.tie, forwardFloors);
+    }
+    return pool.make<DisjunctionScorerT<false>>(
+        pool, scorers, twoPhase, enableTwoPhase);
   }
 
   // Keep clause wiring in one place so prepared and non-prepared execution
@@ -8028,6 +8228,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       std::span<PullChildPlan> optionalPlans,
       std::span<PullChildPlan> prohibitedPlans,
       int64_t requiredLeadCost,
+      const SourceGroup& sourceGroup,
       size_t mandatoryCount,
       size_t filterCount,
       size_t optionalSourceCount,
@@ -8061,11 +8262,13 @@ class BooleanQuery::Weight final : public Query::Weight {
     auto optionalCostsStorage = minShouldMatch >= 1
         ? targetPool.make_span<int64_t>(optionalPlans.size())
         : std::span<int64_t>{};
+    boost::container::small_vector<uint8_t, 16> optionalFloorPays;
     size_t optionalCount = 0;
     for (PullChildPlan& child : optionalPlans) {
       Query::Scorer* scorer = child.plan->build(targetPool);
       if (scorer == nullptr) continue;
       optionalScorersStorage[optionalCount] = scorer;
+      optionalFloorPays.push_back(child.plan->shape().competitiveFloorPays);
       assert(child.plan->shape().reportedTwoPhase
              != Query::ReportedTwoPhase::UNKNOWN);
       optionalTwoPhaseStorage[optionalCount] =
@@ -8089,6 +8292,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         : std::span<int64_t>{};
     Query::Scorer* optScorer = nullptr;
     bool optTwoPhase = false;
+    bool optFloorPays = false;
     if (!optionalScorers.empty()) {
       int optCount = (int)optionalScorers.size();
       bool directWindowFilters = false;
@@ -8127,19 +8331,21 @@ class BooleanQuery::Weight final : public Query::Weight {
       if (minShouldMatch <= 1) {
         if (optCount == 1) {
           optScorer = optionalScorers[0];
+          optFloorPays = optionalFloorPays[0];
           optTwoPhase = optionalTwoPhase[0] != 0;
         } else if (useFilteredUnionWand) {
           optScorer = targetPool.make<BooleanQuery::MinShouldMatchWandScorer>(
             targetPool, optionalScorers, 1);
         } else if (useMaxScoreDisjunction) {
-          optScorer = makeDisjunctionScorer<MaxScoreDisjunctionScorerT>(
-              targetPool, scorePolicy, optionalScorers, segment.maxDoc(),
-              DocsEnumMeta::L1_DOCS);
+          optScorer = makeDisjunctionScorer(
+              targetPool, scorePolicy, optionalScorers, optionalFloorPays,
+              segment.maxDoc(), planContext);
         } else {
-          optScorer = makeDisjunctionScorer<DisjunctionScorerT>(
+          optScorer = makeDisjunctionScorer(
               targetPool, scorePolicy, optionalScorers, optionalTwoPhase,
               !planContext.disableBooleanTwoPhaseForTests
-                  && !planContext.disableDisjunctionTwoPhaseForTests);
+                  && !planContext.disableDisjunctionTwoPhaseForTests,
+              !planContext.disableClauseFloorForwardingForTests);
           optTwoPhase = !planContext.disableBooleanTwoPhaseForTests
               && !planContext.disableDisjunctionTwoPhaseForTests
               && std::any_of(
@@ -8186,9 +8392,20 @@ class BooleanQuery::Weight final : public Query::Weight {
       bool reqTwoPhase;
       Query::Scorer* reqScorer = composeRequired(
           targetPool, req, allowsPruning, enableTwoPhase, reqTwoPhase);
+      const PullChildPlan* loneScoring = nullptr;
+      size_t scoringCount = 0;
+      for (const auto& child : requiredPlans) {
+        if (!child.scoring) continue;
+        scoringCount++;
+        loneScoring = &child;
+      }
+      bool reqFloorPays = scoringCount == 1
+          && loneScoring->plan->shape().competitiveFloorPays;
       boolScorer = targetPool.make<BooleanQuery::MandOptScorer>(
           targetPool, reqScorer, reqTwoPhase, optScorer, optTwoPhase,
-          enableTwoPhase);
+          enableTwoPhase,
+          optFloorPays && !planContext.disableClauseFloorForwardingForTests,
+          reqFloorPays && !planContext.disableClauseFloorForwardingForTests);
     } else {
       // min_match >= 1 alongside required/filter clauses: the optional
       // group is one more required clause, placed in cost order (required
@@ -8197,15 +8414,16 @@ class BooleanQuery::Weight final : public Query::Weight {
       // candidate; a nested required conjunction would confirm them inside
       // its advance and walk them doc by doc. Required clauses that run the
       // exact direct-approximation loop on their own, which the group would
-      // leave, stay one nested clause. Otherwise two or more single-phase
-      // unscored ones (filters, or any required clause under an unscored
-      // consumer) nest as one: their intersection, often far smaller than
-      // any one of them, faces the group and the other required clauses as
-      // a unit. Scores sum the scoring required clauses, then the group.
+      // leave, stay one nested clause. Otherwise the plan's source group
+      // (planSourceGroup) nests as one: two or more single-phase unscored
+      // clauses (filters, or any required clause under an unscored consumer)
+      // as their intersection, often far smaller than any one of them, or
+      // one with a verifier it confirms first. Scores sum the scoring
+      // required clauses, then the group.
       if (BooleanQuery::ConjunctionScorer::exactAlone(req.all, req.twoPhase, allowsPruning)) {
         req = nestRequired(targetPool, req, allowsPruning, enableTwoPhase, segment.maxDoc());
       } else {
-        req = nestUnscoredSinglePhase(targetPool, req, enableTwoPhase, segment.maxDoc());
+        req = nestSourceGroup(targetPool, req, sourceGroup, enableTwoPhase);
       }
       size_t count = req.all.size() + 1;
       auto all = targetPool.make_span<Query::Scorer*>(count);
@@ -8213,8 +8431,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       auto twoPhase = targetPool.make_span<uint8_t>(count);
       int64_t groupCost = optionalCost(
           optionalCosts, minShouldMatch, segment.maxDoc());
-      size_t group = 0;
-      while (group < req.all.size() && req.costs[group] <= groupCost) group++;
+      size_t group = groupPosition(req.costs, groupCost);
       for (size_t i = 0, j = 0; j < count; j++) {
         if (j == group) {
           all[j] = optScorer;
@@ -8629,6 +8846,16 @@ class BooleanQuery::Weight final : public Query::Weight {
             members.contextOf(mandatoryShapeSuppliers[0]));
       }
       Query::ScorerShape shape = opaqueShape(state);
+      // A conjunction hands its floor to a lone scoring clause unchanged.
+      Query::ScorerSupplier* loneScoring = nullptr;
+      size_t scoringCount = 0;
+      for (size_t i = 0; i < mandatoryShapeSuppliers.size(); i++) {
+        if (mandatoryScores[i] == 0) continue;
+        scoringCount++;
+        loneScoring = mandatoryShapeSuppliers[i];
+      }
+      shape.competitiveFloorPays = scoringCount == 1 && loneScoring != nullptr
+          && loneScoring->describeScorer(members.contextOf(loneScoring)).competitiveFloorPays;
       if (requiredCount >= 1) {
         bool allTerms = true;
         for (auto suppliers : {
@@ -8722,12 +8949,23 @@ class BooleanQuery::Weight final : public Query::Weight {
           && prohibitedSources.empty() && minShouldMatch <= 1
           && !plainExternalDisjunction;
       if (useFilteredUnionWand || useMaxScoreDisjunction) {
-        return opaqueShape(Query::MatchState::NONEMPTY);
+        Query::ScorerShape shape = opaqueShape(Query::MatchState::NONEMPTY);
+        shape.competitiveFloorPays = useMaxScoreDisjunction;
+        return shape;
       }
 
       Query::ScorerShape shape = opaqueShape(
           Query::MatchState::NONEMPTY,
           disjunctionTwoPhase(optionalShapeSuppliers, memberContext));
+      if (needsScores && scorePolicy.kind == ScorePolicy::DISMAX && scorePolicy.tie == 0.0f) {
+        // Heap children already use scalar iteration, so term floors do not
+        // replace a vectorized score fill here.
+        shape.competitiveFloorPays = termShape == Query::ClauseShape::FLAT_DISJUNCTION
+            || std::any_of(optionalShapeSuppliers.begin(), optionalShapeSuppliers.end(),
+                [&](auto* child) {
+                  return child != nullptr && child->describeScorer(memberContext).competitiveFloorPays;
+                });
+      }
       shape.windowFillClause = flatClauseShape(
           optionalShapeSuppliers, memberContext, true);
       shape.termDisjunctionClause = flatClauseShape(
@@ -8784,6 +9022,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       std::span<PullChildPlan> optional;
       std::span<PullChildPlan> prohibited;
       int64_t requiredLeadCost;
+      SourceGroup sourceGroup;
       bool requiredUnsatisfiable;
 
     protected:
@@ -8796,7 +9035,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         }
         return assembleScorer(
             targetPool, supplier.segment, required, optional, prohibited,
-            requiredLeadCost, supplier.mandatorySources.size(),
+            requiredLeadCost, sourceGroup, supplier.mandatorySources.size(),
             supplier.filterSuppliers.size(),
             supplier.optionalSources.size(),
             supplier.prohibitedSources.size(), supplier.minShouldMatch,
@@ -8823,11 +9062,12 @@ class BooleanQuery::Weight final : public Query::Weight {
           std::span<PullChildPlan> optional,
           std::span<PullChildPlan> prohibited,
           int64_t requiredLeadCost,
+          SourceGroup sourceGroup,
           bool requiredUnsatisfiable)
         : Query::ScorerPlan(planContext, shape, cost),
           supplier(supplier), required(required), optional(optional),
           prohibited(prohibited), requiredLeadCost(requiredLeadCost),
-          requiredUnsatisfiable(requiredUnsatisfiable) {}
+          sourceGroup(sourceGroup), requiredUnsatisfiable(requiredUnsatisfiable) {}
     };
 
   public:
@@ -8966,7 +9206,17 @@ class BooleanQuery::Weight final : public Query::Weight {
         return maskSupplierAccess(required);
       }
       if (hasUnknownElision(optionalShapeSuppliers, unboundedContext)) {
-        return maskSupplierAccess({});
+        auto shape = maskSupplierAccess({});
+        // A union of exact children stays exact even when resolving may
+        // elide some children or leave just one of them.
+        if ((!hasRequired || required.reportedTwoPhase == Query::ReportedTwoPhase::NO)
+            && std::all_of(optionalShapeSuppliers.begin(), optionalShapeSuppliers.end(), [&](auto* child) {
+              if (!child) return true;
+              auto member = child->describeScorer(unboundedContext);
+              return member.matchState == Query::MatchState::EMPTY
+                  || member.reportedTwoPhase == Query::ReportedTwoPhase::NO;
+            })) shape.reportedTwoPhase = Query::ReportedTwoPhase::NO;
+        return shape;
       }
 
       Query::ScorerShape optional =
@@ -8987,19 +9237,33 @@ class BooleanQuery::Weight final : public Query::Weight {
             state, mandOptTwoPhase(required, optional, buildContext));
       } else {
         positive = opaqueShape(required.matchState);
+        bool requiredScores = std::any_of(mandatoryScores.begin(), mandatoryScores.end(),
+                                          [](uint8_t scores) { return scores != 0; });
+        positive.competitiveFloorPays = !requiredScores && optional.competitiveFloorPays;
       }
       if (positive.matchState == Query::MatchState::EMPTY) {
         return maskSupplierAccess(positive);
       }
 
       if (hasUnknownElision(prohibitedShapeSuppliers, unboundedContext)) {
+        // Excluding is exact to its parent. If the positive side is already
+        // exact, eliding an empty exclusion cannot change that protocol.
+        if (positive.reportedTwoPhase == Query::ReportedTwoPhase::NO) {
+          auto shape = opaqueShape(positive.matchState);
+          shape.competitiveFloorPays = positive.competitiveFloorPays;
+          return maskSupplierAccess(shape);
+        }
         return maskSupplierAccess({});
       }
       if (nonemptyCount(prohibitedShapeSuppliers, unboundedContext) != 0) {
+        bool floorPays = positive.competitiveFloorPays;
         positive = opaqueShape(positive.matchState);
+        positive.competitiveFloorPays = floorPays;
       }
       if (scorePolicy.kind == ScorePolicy::DISMAX) {
+        bool floorPays = positive.competitiveFloorPays;
         positive = opaqueShape(positive.matchState, positive.reportedTwoPhase);
+        positive.competitiveFloorPays = floorPays;
       }
       return maskSupplierAccess(positive);
     }
@@ -9117,6 +9381,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       std::copy(optional.begin(), optional.end(), optionalPlans.begin());
       std::copy(prohibited.begin(), prohibited.end(), prohibitedPlans.begin());
 
+      SourceGroup sourceGroup;
       if (!requiredUnsatisfiable) {
         // Required clauses are advanced to the Boolean's candidates, so their
         // demand is its lead (see childPlans). requiredLeadCost stays the
@@ -9168,6 +9433,7 @@ class BooleanQuery::Weight final : public Query::Weight {
               planPool, unboundedContext);
           assert(child.plan != nullptr);
         }
+        if (groupConstrains) sourceGroup = planSourceGroup(planPool, requiredPlans, optionalPlans);
         resolvedCost = iteratedCost(requiredPlans, optionalPlans);
       }
 
@@ -9175,7 +9441,165 @@ class BooleanQuery::Weight final : public Query::Weight {
       return planPool.make<PullScorerPlan>(
           *this, planContext, shape, resolvedCost,
           requiredPlans, optionalPlans, prohibitedPlans,
-          requiredLeadCost, requiredUnsatisfiable);
+          requiredLeadCost, sourceGroup, requiredUnsatisfiable);
+    }
+
+    // A required clause a source group may hold as a source: single-phase
+    // and unscored.
+    static bool unscoredSource(const PullChildPlan& child) {
+      return !child.scoring
+          && child.plan->shape().reportedTwoPhase != Query::ReportedTwoPhase::YES;
+    }
+
+    // The source group nestSourceGroup builds facing a constraining optional
+    // group: the single-phase unscored required clauses, when two or more, as
+    // their intersection placed by what it emits; and, when that source leads,
+    // at most one verifier confirmed inside (sourceGroupVerifier). None when
+    // neither applies.
+    SourceGroup planSourceGroup(MemPool& planPool, std::span<const PullChildPlan> required,
+                                std::span<const PullChildPlan> optional) const {
+      boost::container::small_vector<int64_t, 16> sourceCosts, others;
+      for (const PullChildPlan& child : required) {
+        (unscoredSource(child) ? sourceCosts : others).push_back(child.cost);
+      }
+      if (sourceCosts.empty()) return {};
+      int64_t cost = sourceCosts.size() == 1 ? sourceCosts[0]
+          : nestedCost(sourceCosts[0], sourceCosts, segment.maxDoc());
+      auto members = planPool.make_span<uint8_t>(required.size());
+      for (size_t i = 0; i < required.size(); i++) members[i] = unscoredSource(required[i]);
+      SourceGroup group{members, cost, nestedPosition(cost, others), false};
+      if (group.position == 0) {
+        auto [verifier, matches] = sourceGroupVerifier(required, optional, cost);
+        if (verifier >= 0) {
+          members[(size_t)verifier] = 1;
+          std::array<int64_t, 2> outputs{cost, matches};
+          group.cost = nestedCost(cost, outputs, segment.maxDoc());
+          group.verified = true;
+        }
+      }
+      if (sourceCosts.size() < 2 && !group.verified) return {};
+      return group;
+    }
+
+    // The verifier worth confirming inside a leading source, and its
+    // estimated matches, or -1. Only shapes whose work is described: the one
+    // two-phase required clause, unscored, its arm quoting a check price
+    // (ScorerShape::verificationPoints); a source whose members each estimate
+    // their yield and their docid support (MembershipWork::knownHull), since
+    // grouped the source produces every document up to each confirmed one
+    // where flat it leaps the union's gaps, and an exact producer can hide
+    // other work (a nested Boolean's own verifiers); and siblings that walk
+    // term postings, scored required terms and a minimum-should-match-1 union
+    // of terms. Anything else keeps the flat schedule.
+    //
+    // Both schedules follow one leapfrog model, the source's E documents
+    // uniform in its hull: a sibling takes a target at each document of the
+    // stream reaching it that it holds (its density in the hull) and one per
+    // gap of its own the rest land in (siblingTargets). Flat, the stream is
+    // the source's documents and the verifier checks those every sibling
+    // holds; grouped, the stream is the confirmed ones and the group scans
+    // about 1/pass source documents per target its first sibling takes, at
+    // most E and never fewer than flat, and each document it hands the parent
+    // crosses one more conjunction. The verifier joins when the sibling work
+    // it spares (siblingWork, at PULL_STEP_POINTS and PULL_BLOCK_POINTS) is
+    // positive and exceeds SOURCE_GROUP_MARGIN times the work it adds.
+    std::pair<int, int64_t> sourceGroupVerifier(
+        std::span<const PullChildPlan> required, std::span<const PullChildPlan> optional,
+        int64_t sourceCost) const {
+      constexpr std::pair<int, int64_t> none{-1, 0};
+      if (disableSourceGroupingForTests || minShouldMatch != 1) return none;
+      auto term = [](const PullChildPlan& child) {
+        return child.plan->shape().directKind == Query::DirectScorerKind::TERM;
+      };
+      boost::container::small_vector<int64_t, 16> members;
+      for (const PullChildPlan& child : optional) {
+        if (!term(child)) return none;
+        members.push_back(child.cost);
+      }
+      int64_t groupCost = optionalCost(members, minShouldMatch, segment.maxDoc());
+      if (members.empty() || groupPosition(std::span<const int64_t>(&sourceCost, 1), groupCost) != 1) {
+        return none;
+      }
+      int verifier = -1;
+      boost::container::small_vector<int64_t, 8> terms;
+      for (size_t i = 0; i < required.size(); i++) {
+        const PullChildPlan& child = required[i];
+        if (unscoredSource(child)) continue;
+        if (child.plan->shape().reportedTwoPhase == Query::ReportedTwoPhase::YES) {
+          if (verifier >= 0 || child.scoring || !child.plan->shape().verificationPoints) return none;
+          verifier = (int)i;
+        } else if (term(child)) {
+          terms.push_back(child.cost);
+        } else {
+          return none;
+        }
+      }
+      if (verifier < 0) return none;
+      double maxDoc = (double)std::max(1, segment.maxDoc());
+      boost::container::small_vector<double, 8> yields;
+      double hull = 1;
+      for (const PullChildPlan& child : required) {
+        if (!unscoredSource(child)) continue;
+        auto work = child.supplier->membershipWork(segment.maxDoc());
+        if (!work.knownMatches || !work.knownHull) return none;
+        yields.push_back(std::clamp(work.matches / maxDoc, 0.0, 1.0));
+        hull = std::min(hull, std::clamp(work.hull, 0.0, 1.0));
+      }
+      const PullChildPlan& check = required[(size_t)verifier];
+      double matches = std::clamp(
+          check.supplier->membershipWork(segment.maxDoc()).matches, 0.0, (double)check.cost);
+      if (forceSourceGroupingForTests) return {verifier, (int64_t)std::ceil(matches)};
+      double emitted = maxDoc * conjunctionYield(yields);
+      double pass = matches / maxDoc;
+      // The siblings in the parent's order: by cost, the scored terms before
+      // the union on ties (groupPosition).
+      struct Sibling {
+        int64_t cost;
+        bool group;
+      };
+      boost::container::small_vector<Sibling, 8> siblings;
+      for (int64_t cost : terms) siblings.push_back({cost, false});
+      siblings.push_back({groupCost, true});
+      std::stable_sort(siblings.begin(), siblings.end(),
+          [](const Sibling& a, const Sibling& b) { return a.cost < b.cost; });
+      double flat = emitted, grouped = emitted * pass, together = 1, spared = 0, rounds = -1;
+      for (const Sibling& sibling : siblings) {
+        boost::container::small_vector<double, 8> postings;
+        if (sibling.group) {
+          for (int64_t member : members) postings.push_back((double)member);
+        } else {
+          postings.push_back((double)sibling.cost);
+        }
+        // Membership is the members' independent union, iteration their
+        // postings.
+        double total = 0;
+        double missed = 1;
+        for (double member : postings) {
+          total += member;
+          missed *= 1 - std::min(1.0, member / maxDoc);
+        }
+        double density = 1 - missed;
+        double flatTargets = siblingTargets(flat, density, total * hull);
+        double groupedTargets = siblingTargets(grouped, density, total * hull);
+        if (rounds < 0) rounds = groupedTargets;
+        for (double member : postings) {
+          SiblingWork before = siblingWork(member, flatTargets, hull, segment.maxDoc());
+          SiblingWork after = siblingWork(member, groupedTargets, hull, segment.maxDoc());
+          spared += (before.advances - after.advances) * PULL_STEP_POINTS
+              + (before.blocks - after.blocks) * PULL_BLOCK_POINTS;
+        }
+        together *= density;
+        flat *= density;
+        grouped *= density;
+      }
+      double checkedBeside = emitted * together;
+      double checkedInside = pass > 0 ? std::min(emitted, rounds / pass) : emitted;
+      // Each document the group hands its parent also crosses its exact
+      // conjunction, an advance call's worth.
+      double added = std::max(0.0, checkedInside - checkedBeside)
+          * *check.plan->shape().verificationPoints + rounds * PULL_STEP_POINTS;
+      if (spared <= 0 || spared <= SOURCE_GROUP_MARGIN * added) return none;
+      return {verifier, (int64_t)std::ceil(matches)};
     }
 
     // What the resolved Boolean iterates: its cheapest required clause, or
@@ -9210,6 +9634,45 @@ class BooleanQuery::Weight final : public Query::Weight {
         weight /= 2;
       }
       return yield;
+    }
+
+    // Distinct bins, of n equally likely, that t uniform draws land in.
+    static double occupancy(double t, double n) {
+      return n <= 0 ? 0 : n * (1 - std::exp(-std::max(t, 0.0) / n));
+    }
+
+    // Targets a leapfrogging sibling takes from a stream of `docs` documents
+    // spread over its candidates' hull: one at each it holds (`density` of
+    // the hull) and one per gap of its `inside` documents there the others
+    // land in.
+    static double siblingTargets(double docs, double density, double inside) {
+      return docs * density + occupancy(docs * (1 - density), inside);
+    }
+
+    struct SiblingWork {
+      double advances;
+      double blocks;
+    };
+
+    // What a sibling term of `postings` documents does advanced to `targets`
+    // targets spread over the candidates' hull: an advance call per gap of
+    // its documents inside the hull a target lands in, and a decoded block
+    // per posting block meeting the hull a target lands in. The hull is
+    // taken as numeric leaves of LEAF_ZONE_SIZE values (documents, for a
+    // dense single-valued column) scattered independently at density `hull`,
+    // which a block spanning S docids meets with probability
+    // 1 - (1 - hull)^(1 + S / LEAF_ZONE_SIZE). That models a scattered range;
+    // a contiguous docid window meets fewer blocks (its share plus the
+    // boundary ones), which a scalar hull cannot tell apart. Checked against
+    // measured advances and decoded blocks, flat and grouped, on the
+    // two-filter boards (hugin, 2026-10-29).
+    static SiblingWork siblingWork(double postings, double targets, double hull, int32_t maxDoc) {
+      double universe = (double)std::max(1, maxDoc);
+      double span = Postings::DOCS_BLOCK_SIZE * universe / std::max(1.0, postings);
+      double reach = 1 - std::pow(1 - std::clamp(hull, 0.0, 1.0),
+                                  1 + span / NumColumnFormat::LEAF_ZONE_SIZE);
+      return {occupancy(targets, postings * hull),
+              occupancy(targets, postings / Postings::DOCS_BLOCK_SIZE * reach)};
     }
 
     struct PullDemand {
@@ -9379,14 +9842,14 @@ class BooleanQuery::Weight final : public Query::Weight {
       bool docSetFilter;
       bool scoring;
       size_t order;
-      Query::PlanContext buildContext;
+      Query::PlanContext buildContext = {};
       Query::ScorerPlan* plan = nullptr;
     };
 
     struct PlannedSupplier {
       Query::ScorerSupplier* supplier;
       Query::ScorerShape shape;
-      Query::PlanContext buildContext;
+      Query::PlanContext buildContext = {};
       Query::ScorerPlan* plan = nullptr;
     };
 
@@ -9987,7 +10450,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         // for partial consumers until that comparison prices partial traversal.
         if (bulkContext.expectedConsumption.span >= segment.maxDoc()
             && !needsScores && !plan.hasOptionalGroup && prohibitedSources.empty()
-            && segment.numLive() == segment.maxDoc()
+            && !segment.mayHaveDeletes()
             && !candidateFilters.empty() && (entries.size() == 1 || candidateFilters.size() > 1)) {
           planMembershipOrder(entries, candidateFilters, use, control);
           plan.leadCost = entries[0].cost;
@@ -11032,13 +11495,16 @@ class BooleanQuery::Weight final : public Query::Weight {
       assert(mandatory != nullptr);
       auto optional = targetPool.make_span<Query::Scorer*>(
           plan.optional.size());
+      boost::container::small_vector<uint8_t, 16> floorPays;
       for (size_t i = 0; i < plan.optional.size(); i++) {
         optional[i] = plan.optional[i].plan->build(targetPool);
         assert(optional[i] != nullptr);
+        floorPays.push_back(plan.optional[i].plan->shape().competitiveFloorPays);
       }
       return targetPool.make<BooleanQuery::MandOptBulkScorer>(
           targetPool, mandatory, optional, plan.optionalCosts,
-          segment.maxDoc(), plan.mandatoryCost);
+          segment.maxDoc(), plan.mandatoryCost, floorPays,
+          plan.mandatory.plan->shape().competitiveFloorPays);
     }
 
     BulkPlan planMaxScoreBulk(BulkUse use,
@@ -11134,7 +11600,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
 
       if (!needsScores && !disableDisjunctionCountIdentityForTests) {
-        if (segment.liveDocs() != nullptr) {
+        if (segment.mayHaveDeletes()) {
           state->identityFallback =
               DisjunctionIdentityFallback::DELETES;
         } else {
@@ -11198,6 +11664,12 @@ class BooleanQuery::Weight final : public Query::Weight {
       BulkPlan plan = matchWindowBulkPlan();
       plan.buildState = state;
       plan.windowFilterConsumption = WindowFilterConsumption::FILL;
+      // A pure scored disjunction rescores candidates exactly, which the
+      // exact-count composition needs from its scoring bulk.
+      if (needsScores && use == BulkUse::EXACT_CANDIDATE_SCORING
+          && prohibited.empty() && mandatorySources.empty()) {
+        plan.supportsExactCandidateScoring = BulkAnswer::YES;
+      }
       return plan;
     }
 
@@ -11224,9 +11696,11 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
       auto optional = targetPool.make_span<Query::Scorer*>(
           plan.optional.size());
+      boost::container::small_vector<uint8_t, 16> floorPays;
       for (size_t i = 0; i < plan.optional.size(); i++) {
         optional[i] = plan.optional[i].plan->build(targetPool);
         assert(optional[i] != nullptr);
+        floorPays.push_back(plan.optional[i].plan->shape().competitiveFloorPays);
       }
       auto& exclusion = *targetPool.make_vec<Query::Scorer*>();
       for (const PlannedSupplier& child : plan.prohibited) {
@@ -11255,7 +11729,7 @@ class BooleanQuery::Weight final : public Query::Weight {
               == MaxScoreCountRoute::DISJUNCTION_OF_CONJUNCTIONS,
           plan.countRoute
               == MaxScoreCountRoute::DISJUNCTION_IDENTITY,
-          plan.identityLargestIndex, plan.uniformConstantCandidate);
+          plan.identityLargestIndex, plan.uniformConstantCandidate, floorPays);
     }
 
     int64_t minFilterCost() const {
@@ -11639,6 +12113,22 @@ class BooleanQuery::Weight final : public Query::Weight {
         if (!retryFill) break;
         probe = false;
       }
+      // The sparsest filter first: a fill stops at the first empty
+      // intersection and a probe at the first rejecting filter. A stable
+      // insertion sort over costs read once (cost() is not always a field
+      // read): a query carries few filters, and it allocates nothing.
+      if (filters.size() > 1) {
+        boost::container::small_vector<int64_t, 16> costs;
+        for (const auto& filter : filters) costs.push_back(filter.supplier->cost());
+        for (size_t i = 1; i < filters.size(); i++) {
+          size_t j = i;
+          while (j > 0 && costs[j - 1] > costs[i]) j--;
+          std::rotate(filters.begin() + j, filters.begin() + i,
+                      filters.begin() + i + 1);
+          std::rotate(costs.begin() + j, costs.begin() + i,
+                      costs.begin() + i + 1);
+        }
+      }
       auto* state = pool.make<FilteredBodyPlan>();
       state->owner = this;
       state->bodySupplier = bodySupplier;
@@ -11915,6 +12405,17 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
       if (optionalSources.empty() && prohibitedSources.empty()
           && filterSuppliers.empty() && mandatorySources.size() >= 2) {
+        // An unscored count or domain over required clauses alone is
+        // membership like a filtered count body: per-clause demand lets a
+        // verifying clause (a column check beside a term) take the lead's
+        // candidates in batches, and its proofs skip whole windows.
+        if (!needsScores && isMembershipWindowUse(use)
+            && !disableRequiredCountMembershipForTests) {
+          BulkPlan membership = planConjunctionBulk(
+              use, ConjunctionMode::EXHAUSTIVE,
+              countRouteMask(!disableFilterClauseCountForTests), {}, bulkContext);
+          if (membership.available == BulkAnswer::YES) return membership;
+        }
         return planConjunctionBulk(
             use, ConjunctionMode::SCORED_BODY,
             routeBit(ConjunctionRoute::GENERIC), {}, bulkContext);
@@ -12214,12 +12715,15 @@ class BooleanQuery::Weight final : public Query::Weight {
     std::vector<DomainHandle> filterDomains;
     std::span<const uint8_t> prohibitedCacheRoutes;
     bool hasFilters = false;
+    // The prohibited clauses are folded into filterDomains.
+    bool prohibitedFolded = false;
     bool prohibitedCacheEnabled = false;
     ScorePolicy scorePolicy;
     int minShouldMatch = 0;
     bool needsScores = false;
     bool allowsPruning = false;
     bool uniformConstantCandidate = false;
+    Query::SupplierExecutionMode preparedMode;
 
   public:
     BooleanPreparedWeight(std::span<Query::Weight*> filterWeights,
@@ -12230,11 +12734,12 @@ class BooleanQuery::Weight final : public Query::Weight {
                           std::vector<QueryPrep::PreparedSource>&& prohibitedSources,
                           std::vector<DomainHandle>&& filterDomains,
                           std::span<const uint8_t> prohibitedCacheRoutes,
-                          bool hasFilters, bool prohibitedCacheEnabled,
+                          bool hasFilters, bool prohibitedFolded,
+                          bool prohibitedCacheEnabled,
                           int minShouldMatch, bool needsScores,
                           bool allowsPruning,
                           bool uniformConstantCandidate,
-                          ScorePolicy scorePolicy)
+                          ScorePolicy scorePolicy, Query::SupplierExecutionMode preparedMode)
       : filterWeights(filterWeights), reader(reader),
         mandatorySources(std::move(mandatorySources)),
         mandatoryScores(mandatoryScores.begin(), mandatoryScores.end()),
@@ -12242,11 +12747,11 @@ class BooleanQuery::Weight final : public Query::Weight {
         prohibitedSources(std::move(prohibitedSources)),
         filterDomains(std::move(filterDomains)),
         prohibitedCacheRoutes(prohibitedCacheRoutes),
-        hasFilters(hasFilters),
+        hasFilters(hasFilters), prohibitedFolded(prohibitedFolded),
         prohibitedCacheEnabled(prohibitedCacheEnabled),
         scorePolicy(scorePolicy), minShouldMatch(minShouldMatch),
         needsScores(needsScores), allowsPruning(allowsPruning),
-        uniformConstantCandidate(uniformConstantCandidate) {}
+        uniformConstantCandidate(uniformConstantCandidate), preparedMode(preparedMode) {}
 
     size_t retainedBytes() const noexcept override {
       size_t bytes = sizeof(*this) + mandatoryScores.capacity() * sizeof(uint8_t)
@@ -12267,6 +12772,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         MemPool& targetPool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {
       if (hasFilters
+          && preparedMode != Query::SupplierExecutionMode::RAW_MEMBERSHIP
           && executionMode
               == Query::SupplierExecutionMode::RAW_MEMBERSHIP) {
         throw std::logic_error(
@@ -12278,12 +12784,16 @@ class BooleanQuery::Weight final : public Query::Weight {
         filterSuppliers = {targetPool.make_arr<Query::ScorerSupplier*>(1), 1};
         filterSuppliers[0] = targetPool.make<QueryPrep::DocSetSupplier>(filterDomain, segment);
       }
-      auto prohibitedSegmentSources = QueryPrep::segmentSources(
-          targetPool, QueryPrep::preparedSpan(prohibitedSources));
-      auto prohibitedSuppliers = targetPool.make_span<Query::ScorerSupplier*>(
-          prohibitedSources.size());
+      std::span<Query::SegmentSource*> prohibitedSegmentSources;
+      std::span<Query::ScorerSupplier*> prohibitedSuppliers;
+      if (!prohibitedFolded) {
+        prohibitedSegmentSources = QueryPrep::segmentSources(
+            targetPool, QueryPrep::preparedSpan(prohibitedSources));
+        prohibitedSuppliers = targetPool.make_span<Query::ScorerSupplier*>(
+            prohibitedSources.size());
+      }
       size_t segmentCount = reader.segments().size();
-      for (size_t i = 0; i < prohibitedSources.size(); i++) {
+      for (size_t i = 0; i < prohibitedSuppliers.size(); i++) {
         QueryPrep::ProhibitedCacheRoute route = prohibitedCacheRoute(
             prohibitedCacheRoutes, i, (size_t) segment.ord, segmentCount);
         prohibitedSuppliers[i] = QueryPrep::prohibitedSupplier(
@@ -12389,18 +12899,26 @@ public:
     auto* filterCache = context.topReader.filterCache();
     prohibitedCacheEnabled = !QueryPrep::disableProhibitedCacheForTests
         && filterCache != nullptr && filterCache->enabled();
-    if (prohibitedCacheEnabled && !prohibitedWeights.empty()) {
+    bool foldProhibited = foldsProhibitedDomain();
+    if ((prohibitedCacheEnabled || foldProhibited) && !prohibitedWeights.empty()) {
       size_t segmentCount = context.topReader.segments().size();
       prohibitedUses = context.pool.make_span<FilterCache::Use*>(
           prohibitedWeights.size());
       std::fill(prohibitedUses.begin(), prohibitedUses.end(), nullptr);
-      prohibitedCacheRoutes = context.pool.make_span<uint8_t>(
-          prohibitedWeights.size() * segmentCount);
-      std::fill(
-          prohibitedCacheRoutes.begin(), prohibitedCacheRoutes.end(), 0);
+      if (!foldProhibited) {
+        prohibitedCacheRoutes = context.pool.make_span<uint8_t>(
+            prohibitedWeights.size() * segmentCount);
+        std::fill(
+            prohibitedCacheRoutes.begin(), prohibitedCacheRoutes.end(), 0);
+      }
 
       MemPool routePool;
       for (size_t clause = 0; clause < prohibitedWeights.size(); clause++) {
+        if (foldProhibited) {
+          // Folding shares request-owned values even without a shared cache.
+          prohibitedUses[clause] = context.getFilterUse(*prohibitedClauses[clause]);
+          continue;
+        }
         Query::Weight* prohibitedWeight = prohibitedWeights[clause];
         if (prohibitedWeight->matchesAllDocs()) continue;
         Query::VerificationWork verificationWork =
@@ -12462,6 +12980,13 @@ public:
         QueryPrep::anyNeedsPrepare(filterWeights)) {
       traits |= NEEDS_PREPARE;
     }
+    // A consumer in either prepare stage makes this boolean one.
+    if (QueryPrep::anyConsumesDomain(mandatoryWeights) ||
+        QueryPrep::anyConsumesDomain(optionalWeights) ||
+        QueryPrep::anyConsumesDomain(prohibitedWeights) ||
+        QueryPrep::anyConsumesDomain(filterWeights)) {
+      traits |= CONSUMES_DOMAIN;
+    }
     // Boolean scoring is constant only when every match gets the same sum.
     // Optional clauses make the sum data-dependent; mandatory clauses are
     // safe only if each mandatory child is constant.
@@ -12480,13 +13005,21 @@ public:
         && query.filter[0]->getKind() == QueryKind::TERM) {
       traits |= PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN;
     }
-    bool directTermUnion = mandatoryClauses.empty()
+    // A match needs one optional clause. An unset minShouldMatch (0) means that
+    // only when no filter makes the optional clauses pure score adds.
+    bool pureDisjunction = minShouldMatch == 1
+        || (minShouldMatch == 0 && filterClauses.empty());
+    bool directUnion = mandatoryClauses.empty()
         && prohibitedClauses.empty() && optionalClauses.size() >= 2
-        && filterClauses.size() <= 1 && minShouldMatch == 1
+        && filterClauses.size() <= 1 && pureDisjunction
         && std::all_of(
             optionalClauses.begin(), optionalClauses.end(),
             [](Query* clause) {
-              return clause->getKind() == QueryKind::TERM;
+              // A repeated multi_match term arrives boosted (duplicate merge).
+              float boost = 1.0f;
+              return clause->getKind() == QueryKind::TERM
+                  || luxir::peelBoost(clause, boost)->getKind()
+                      == QueryKind::COMBINED_FIELDS;
             });
     bool unfilteredConstantComplement = constant
         && filterWeights.empty() && optionalWeights.empty()
@@ -12494,7 +13027,7 @@ public:
         && mandatoryWeights[0]->matchesAllDocs()
         && !prohibitedWeights.empty();
     if (scorePolicy.kind == ScorePolicy::SUM
-        && (directTermUnion || unfilteredConstantComplement)) {
+        && (directUnion || unfilteredConstantComplement)) {
       traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
     }
     bool sparseFilteredTopKConjunction = !filterWeights.empty()
@@ -12503,6 +13036,12 @@ public:
         && std::all_of(
             mandatoryClauses.begin(), mandatoryClauses.end(),
             sparseFilteredTopKMandatory);
+    bool directTermUnion = directUnion
+        && std::all_of(
+            optionalClauses.begin(), optionalClauses.end(),
+            [](Query* clause) {
+              return clause->getKind() == QueryKind::TERM;
+            });
     sparseFilteredTopKEligible = scorePolicy.kind == ScorePolicy::SUM
         && (sparseFilteredTopKConjunction
             || (directTermUnion && !filterWeights.empty()));
@@ -12575,31 +13114,37 @@ public:
   std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
     auto filterSources = QueryPrep::prepareFilterSources(
         filterWeights, filterUses, ctx);
+    auto prohibitedSources = QueryPrep::prepareFilterSources(
+        prohibitedWeights, prohibitedUses, ctx);
     std::vector<DomainHandle> filterDomains(
         ctx.reader.segments().size());
     std::vector<DocSet*> childDomainPtrs(ctx.reader.segments().size());
 
-    if (!filterSources.empty()) {
-      auto materializeSegment = [&](size_t segnum) {
+    // A domain-consuming child (kNN) selects its top-k inside the child
+    // domain, so an exclusion applied only to its output would act as a
+    // post-filter and return fewer than k hits. When a mandatory/optional
+    // child consumes the domain, fold the prohibited clauses into it: the
+    // domain becomes outer AND filters AND NOT prohibited, and it replaces
+    // the prohibited scorers as the required domain supplier, so each
+    // exclusion is evaluated once.
+    bool foldProhibited = foldsProhibitedDomain();
+    if (!filterSources.empty() || foldProhibited) {
+      for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
         auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
-        filterDomains[segnum] = QueryPrep::materializeEffectiveIntersection(
-          QueryPrep::preparedSpan(filterSources), ctx.reader,
-          ctx.reader.segments()[segnum], outerDomain);
-        filterDomains[segnum] = std::move(filterDomains[segnum])
-            .pinnedWith(context.filterUses);
+        auto& segment = ctx.reader.segments()[segnum];
+        DomainHandle domain = filterSources.empty()
+            ? DomainHandle::borrowed(outerDomain).scoped(segment)
+            : QueryPrep::materializeEffectiveIntersection(
+                QueryPrep::preparedSpan(filterSources), ctx.reader,
+                segment, outerDomain, ctx.executionMode);
+        if (foldProhibited) {
+          domain = QueryPrep::materializeEffectiveExclusion(
+              QueryPrep::preparedSpan(prohibitedSources), ctx.reader,
+              segment, std::move(domain));
+        }
+        filterDomains[segnum] = std::move(domain).pinnedWith(context.filterUses);
         childDomainPtrs[segnum] = filterDomains[segnum].get();
-      };
-      // Segments are independent and each task writes only its own slot,
-      // so a parallel request materializes them concurrently with results
-      // identical to the serial loop (the filter cache's per-segment
-      // request slots serialize same-segment work).
-      size_t numSegs = ctx.reader.segments().size();
-      TaskGroupRunner runner;
-      task_group_fanout(ctx.parallel && numSegs > 1 ? runner.group() : nullptr, numSegs,
-          [&](size_t segnum) {
-        return [&materializeSegment, segnum]() { materializeSegment(segnum); };
-      });
-      runner.join();
+      }
     } else {
       for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
         childDomainPtrs[segnum] = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
@@ -12609,19 +13154,26 @@ public:
     Query::Weight::PrepareContext childCtx{
       ctx.reader,
       std::span<DocSet* const>(childDomainPtrs.data(), childDomainPtrs.size()),
-      ctx.parallel, ctx.warnings};
+      ctx.fanout, ctx.warnings, ctx.executionMode};
     auto mandatorySources = QueryPrep::prepareSources(mandatoryWeights, childCtx);
     auto optionalSources = QueryPrep::prepareSources(optionalWeights, childCtx);
-    auto prohibitedSources = QueryPrep::prepareFilterSources(
-        prohibitedWeights, prohibitedUses, ctx);
+    // The folded domain supplier is required, which would demote an
+    // optional-only group to pure scoring; keep at least one optional
+    // clause required, as it was beside a prohibited clause alone.
+    int preparedMinShouldMatch = minShouldMatch;
+    if (foldProhibited && filterSources.empty() && mandatoryWeights.empty()
+        && !optionalWeights.empty()) {
+      preparedMinShouldMatch = std::max(1, minShouldMatch);
+    }
 
     return std::make_unique<BooleanPreparedWeight>(
       filterWeights, ctx.reader, std::move(mandatorySources), mandatoryScores,
       std::move(optionalSources),
       std::move(prohibitedSources), std::move(filterDomains),
-      prohibitedCacheRoutes, !filterSources.empty(),
-      prohibitedCacheEnabled, minShouldMatch, needsScores, allowsPruning,
-      uniformConstantCandidate, scorePolicy);
+      prohibitedCacheRoutes, !filterSources.empty() || foldProhibited,
+      foldProhibited, prohibitedCacheEnabled, preparedMinShouldMatch,
+      needsScores, allowsPruning,
+      uniformConstantCandidate, scorePolicy, ctx.executionMode);
   }
 
   Query::ScorerSupplier* scorerSupplierImpl(

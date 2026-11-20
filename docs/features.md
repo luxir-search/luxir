@@ -65,11 +65,11 @@ POST /collections/main/_search
     {
       "id": "2",
       "title_t": "Words of Radiance",
-      "price_f": 15
+      "price_f": 15.0
     }
   ],
   "ops": {
-    "average_price": 12,
+    "average_price": 12.0,
     "series": {
       "buckets": [
         {
@@ -130,8 +130,8 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - **Adaptive facet execution:** Dynamically selects counting strategies and
   counter representations to suit the matching documents and field
   cardinality, balancing speed and memory use.
-- **Cost-aware filter cache:** Favors filters that are expensive to rebuild
-  relative to their size, saving more computation per byte of cache.
+- **Cost-aware filter cache:** Ranks filters by rebuild cost per byte,
+  weighted by how often the filter has been used recently.
 - **Arena allocation:** Indexing runs on rollback-capable memory pools, and
   requests decode into arena-backed message objects with no per-field heap
   allocation on the way in.
@@ -155,6 +155,11 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - Fields and templates can inherit settings with `parent`. The built-in
   `_name` and `_names` templates support people and titles:
   word search plus a whole-value variant for facets and sorting.
+- [Nested documents](guide/nested.md): lists of structured children (items,
+  variants, chunks) kept as their own rows, to any depth.
+  `items:(color:red AND size:L)` requires one item with both, a document
+  scores by its best child, and facets and other operations can run over the
+  child rows of the matching documents.
 - Field variants: one input value indexed under several representations
   (`author` for word search, `author__s` for exact facets and sorts), with
   per-operation default bindings so a bare field name does the right thing.
@@ -234,12 +239,22 @@ Anywhere a query goes, it can be a structured object or an expression string.
   TEXT matching, prefer a folding variant (`_t`, `_un`, `_wl`); it is faster.
 - `constant_score`, `boost`, and `rescore`: keep a query's matches and replace
   each score with a value expression over columns and the original score
-  (`score * def(popularity_i, 1)`). `rescore` takes an optional `min_score`
-  cut-off (the `function_score` / `script_score` counterpart).
+  (`score * def(popularity_i, 1)`). Expressions cover arithmetic, `exp`,
+  `pow`, comparisons, `?:` conditionals, seeded `random`, `geo_distance`,
+  and Elasticsearch-style `gauss_decay`, `exp_decay`, and `linear_decay`
+  decay functions over numeric, date, and geo values. The same language has
+  bitwise operators and `%`, trigonometry and rounding, calendar parts of
+  dates, coordinates and distances between places, geohash and geotile keys,
+  hash functions for consistent sampling, `let` bindings, `$name` request
+  variables, `_score` as an alias of `score`, and typed field components such
+  as `loc.lat` and `ts.year` ([value expressions](guide/value-expressions.md)).
+  `rescore` takes an
+  optional `min_score` cut-off (the `function_score` / `script_score`
+  counterpart).
 - Request `min_score` (Elasticsearch-style): documents scoring below it are
   dropped from the returned list, the exact count, and facet and metric
   domains alike.
-- `knn` vector search, `geo_box`, and `geo_distance`.
+- `knn` vector search, `geo_box`, `geo_distance`, and `geo_polygon`.
 - `multi_match`: search one text across weighted fields. `combined`
   (default) scores TEXT fields sharing an analyzer and long-term policy as
   one field with BM25F; weights scale term frequency and length at every
@@ -339,8 +354,11 @@ Anywhere a query goes, it can be a structured object or an expression string.
   candidates are rescored at full precision straight from the column, so the
   recall recovery costs no extra storage.
 - Filtered kNN applies filters inside the vector search and adaptively deepens
-  ANN breadth instead of post-filtering. `exact: true` gives the exact
-  filtered top-k, which also serves as the ground truth for measuring recall.
+  ANN breadth instead of post-filtering. Each segment chooses between its index
+  and an exact scan of the filtered vectors by modeled cost, and switches to
+  exact mid-query when the index turns out more expensive. `exact: true` gives
+  the exact filtered top-k, which also serves as the ground truth for
+  measuring recall.
 - Multi-valued vector fields collapse to one hit per document at its best
   similarity, with adaptive over-fetch so `k` documents still come back.
 - ANN indexes are segment overlays: built at commit from the vector column and
@@ -361,8 +379,12 @@ Anywhere a query goes, it can be a structured object or an expression string.
   `Point` objects, `"lat,lon"` strings, WKT `POINT` strings, or geohashes.
   `_p` and `_ps` suffix templates; per-field `ignore_malformed` and
   `ignore_z_value`.
-- Bounding-box queries (dateline-aware) and great-circle distance queries,
-  usable as the main query, as a non-scoring filter, or as a boolean clause.
+- Bounding-box queries (dateline-aware), great-circle distance queries, and
+  polygon queries over a union of polygons with holes, usable as the main
+  query, as a non-scoring filter, or as a boolean clause.
+- Requested geo fields come back in their ingest shape, `[lon, lat]`, or
+  `[[lon, lat], ...]` for a multi-valued field, so results index back
+  unchanged.
 
 ## API surfaces
 

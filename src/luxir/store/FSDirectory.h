@@ -6,6 +6,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
+#include <limits>
+#include <mutex>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -14,6 +18,7 @@
 #include <xxhash.h>
 #include "Directory.h"
 #include "luxir/util/Signal.h"
+#include "luxir/util/Uuid.h"
 #include "luxir/util/luxir_util.h"
 
 namespace luxir {
@@ -224,7 +229,7 @@ class FSFile : public File {
   friend class RAMDelegatingFile;
 
   std::filesystem::path path_;
-  std::filesystem::path tmpPath_;  // write to temp, rename on finish
+  std::filesystem::path tmpPath_;  // write to temp, install create-only on finish
   int fd_ = -1;
   size_t fileSize_ = 0;
   XXH3_state_t hash;
@@ -489,31 +494,89 @@ public:
 
 /// Filesystem-backed Directory using mmap for reads and buffered writes.
 class FSDirectory : public Directory {
+public:
+  static constexpr std::string_view kPublicationLock = ".luxir-publish.lock";
+  // Per-path state shared by a factory's views of one directory.
+  struct ParentSync {
+    std::mutex mutex;
+    bool durable = false;
+    // Serializes this process's publications and deletions here: on NFS,
+    // flock is emulated by process-scoped POSIX locks, which do not exclude threads.
+    std::mutex publication;
+  };
+private:
   std::filesystem::path basePath_;
+  std::filesystem::path durabilityRoot;
+  std::shared_ptr<ParentSync> parents;
+  std::filesystem::path publishTemps;
+
+  static PublicationVersion versionOf(int fd, std::span<const std::byte> bytes) {
+    struct stat info;
+    if (::fstat(fd, &info) < 0) throw FileIOException("Publication fstat failed: " + std::string(strerror(errno)));
+#if defined(__APPLE__)
+    auto modified = info.st_mtimespec;
+#else
+    auto modified = info.st_mtim;
+#endif
+    // Reused metadata must also match the content hash. Identical CAS bytes
+    // are the same logical state: the engine includes its revision and op.
+    return std::format("{}:{}:{}:{}:{}:{:016x}", info.st_dev, info.st_ino,
+        modified.tv_sec, modified.tv_nsec, info.st_size, XXH3_64bits(bytes.data(), bytes.size()));
+  }
+
+  // Callers hold parents->publication: NFS-emulated flock is process-scoped.
+  // Deletion shares the lock with publication; fsyncs run outside it.
+  // A stall past the NFSv4 lease between Match and rename can lose the lock
+  // and overwrite a newer STATE. Files stay intact; acknowledged commits can
+  // drop out of STATE. Retention does not close this revocation window.
+  int lockDirectory() const {
+    auto path = basePath_ / kPublicationLock;
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) {
+      if (errno == ENOENT) return -1;
+      throw FileIOException("Cannot open publication lock: " + path.string() + ": " + strerror(errno));
+    }
+    while (::flock(fd, LOCK_EX) < 0) {
+      if (errno != EINTR) {
+        auto message = "Cannot lock publication directory: " + path.string() + ": " + strerror(errno);
+        ::close(fd);
+        throw FileIOException(message);
+      }
+    }
+    return fd;
+  }
 
   std::filesystem::path filePath(std::string_view name) const {
+    if (name.empty() || name == "." || name == ".." || name == kPublicationLock || name.find_first_of("/\\\0", 0, 3) != std::string_view::npos) {
+      throw std::invalid_argument("invalid directory file name");
+    }
     return basePath_ / name;
   }
 
 public:
+  Capabilities capabilities() const override { return HARD_LINK | ATOMIC_RENAME | DURABLE_SYNC | MEMORY_MAPPED; }
+
   void linkFile(Directory& source, std::string_view name) override {
+    std::filesystem::create_directories(basePath_);
     auto& fs = dynamic_cast<FSDirectory&>(source.underlying());
     std::filesystem::create_hard_link(fs.filePath(name), filePath(name));
   }
 
-  // Without `create`, the directory must already exist: opening never
-  // re-creates a directory removed concurrently.
-  explicit FSDirectory(const std::filesystem::path& path, bool create = true) : basePath_(path) {
-    if (create) std::filesystem::create_directories(basePath_);
-    else if (!std::filesystem::is_directory(basePath_)) {
-      throw std::filesystem::filesystem_error("directory does not exist", basePath_,
-          std::make_error_code(std::errc::no_such_file_or_directory));
-    }
+  explicit FSDirectory(const std::filesystem::path& path, std::filesystem::path root = {},
+                       std::shared_ptr<ParentSync> parents = std::make_shared<ParentSync>(),
+                       std::filesystem::path publishTemps = {})
+      : basePath_(std::filesystem::absolute(path).lexically_normal()),
+        durabilityRoot(root.empty() ? basePath_ : std::filesystem::absolute(root).lexically_normal()),
+        parents(std::move(parents)),
+        publishTemps(publishTemps.empty() ? durabilityRoot / "node/tmp" : std::move(publishTemps)) {
+    if (root.empty()) while (!std::filesystem::is_directory(durabilityRoot)) durabilityRoot = durabilityRoot.parent_path();
   }
 
   void listFiles(std::vector<FileInfo>& target) override {
+    if (!std::filesystem::exists(basePath_)) return;
     auto startIdx = target.size();
     for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
+      if (entry.path().filename() == kPublicationLock) continue;
       // A file may be deleted between readdir and stat; skip on any error.
       std::error_code ec;
       if (!entry.is_regular_file(ec) || ec) {
@@ -549,11 +612,13 @@ public:
   }
 
   std::unique_ptr<File> createFile(std::string_view name) override {
+    std::filesystem::create_directories(basePath_);
     return std::make_unique<FSFile>(name, filePath(name));
   }
 
   std::unique_ptr<File> createFile(
       std::string_view name, FileCreateOptions options) override {
+    std::filesystem::create_directories(basePath_);
     if (!options.ramDelegating) return createFile(name);
     if (options.ramSpillBytes == 0) {
       throw std::invalid_argument("RAM-delegating file requires a spill threshold");
@@ -565,14 +630,23 @@ public:
 
   bool deleteFile(std::string_view name) override {
     auto path = filePath(name);
+    std::lock_guard local(parents->publication);
+    int fd = lockDirectory();
+    if (fd < 0) return false;
+    auto unlock = scope_guard([&] { ::close(fd); });
     return std::filesystem::remove(path);
   }
 
   void deletePrefix(std::string_view prefix) override {
+    std::lock_guard local(parents->publication);
+    int fd = lockDirectory();
+    if (fd < 0) return;
+    auto unlock = scope_guard([&] { ::close(fd); });
     std::vector<std::string> toDelete;
     for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
       if (entry.is_regular_file()) {
         std::string name = entry.path().filename().string();
+        if (name == kPublicationLock) continue;
         if (name.starts_with(prefix)) {
           toDelete.push_back(std::move(name));
         }
@@ -596,25 +670,100 @@ public:
       fsFile.openFd();
     }
     fsFile.closeFd();
-    // Atomic rename from temp to final path. Existing mmap readers of the old
-    // inode are unaffected because the mapping keeps the old inode alive.
-    std::filesystem::rename(fsFile.tmpPath_, fsFile.path_);
+    if (::link(fsFile.tmpPath_.c_str(), fsFile.path_.c_str()) < 0) {
+      throw FileIOException("File install failed: " + fsFile.path_.string() + ": " + strerror(errno));
+    }
+    if (::unlink(fsFile.tmpPath_.c_str()) < 0) throw FileIOException("Cannot remove file temp: " + fsFile.tmpPath_.string());
   }
 
-  void renameFile(std::string_view from, std::string_view to) override {
-    std::filesystem::rename(filePath(from), filePath(to));
+  std::optional<Publication> readPublished(std::string_view name) override {
+    auto path = filePath(name);
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+      if (errno == ENOENT) return {};
+      throw FileIOException("Publication open failed: " + path.string() + ": " + strerror(errno));
+    }
+    auto close = scope_guard([&] { ::close(fd); });
+    auto file = MMapInputFile::map(fd, path);
+    auto bytes = file->read();
+    return Publication{std::string(bytes), versionOf(fd, std::as_bytes(std::span(bytes)))};
   }
 
-  // Fsync the given files.  Use "." to fsync the directory itself
-  // (to ensure renames/creates are durable).
+  std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) override {
+    auto target = filePath(name);
+    std::filesystem::create_directories(basePath_);
+    std::filesystem::create_directories(publishTemps);
+    auto temp = publishTemps / newUuid();
+    int fd = ::open(temp.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) throw FileIOException("Cannot create publication temp: " + temp.string() + ": " + strerror(errno));
+    auto cleanup = scope_guard([&] { ::close(fd); ::unlink(temp.c_str()); });
+    // The open hook exposes the fd for real I/O failure injection in tests.
+    Signal::emit("publishOpened", this, &name, &fd);
+    size_t written = 0;
+    while (written < bytes.size()) {
+      auto count = ::write(fd, bytes.data() + written,
+          std::min(bytes.size() - written, (size_t)std::numeric_limits<ssize_t>::max()));
+      if (count < 0 && errno == EINTR) continue;
+      if (count <= 0) throw FileIOException("Publication write failed: " + temp.string() + ": " + (count ? strerror(errno) : "zero write"));
+      written += (size_t)count;
+    }
+    Signal::emit("publishWritten", this, &name);
+    if (::fsync(fd) < 0) throw FileIOException("Publication fsync failed: " + temp.string() + ": " + strerror(errno));
+    std::string syncedName(name);
+    Signal::emit("fsSynced", &basePath_, &syncedName);
+    Signal::emit("publishSynced", this, &name);
+    auto version = versionOf(fd, bytes);
+    {
+      std::lock_guard local(parents->publication);
+      int directoryFd = lockDirectory();
+      if (directoryFd < 0) throw FileIOException("Publication directory was removed: " + basePath_.string());
+      auto unlock = scope_guard([&] { ::close(directoryFd); });
+      if (condition.version) {
+        auto current = readPublished(name);
+        if (!current || current->version != *condition.version) return {};
+        Signal::emit("publishMatched", this, &name);
+      }
+      if (condition.mode == PublishMode::CREATE_ONLY) {
+        if (::link(temp.c_str(), target.c_str()) < 0) {
+          if (errno == EEXIST) return {};
+          throw FileIOException("Publication link failed: " + target.string() + ": " + strerror(errno));
+        }
+      } else if (::rename(temp.c_str(), target.c_str()) < 0) {
+        throw FileIOException("Publication rename failed: " + target.string() + ": " + strerror(errno));
+      }
+    }
+    if (condition.mode == PublishMode::CREATE_ONLY) {
+      if (::unlink(temp.c_str()) < 0) throw FileIOException("Publication temp removal failed: " + temp.string() + ": " + strerror(errno));
+    }
+    syncDirectory();
+    return version;
+  }
+
+  // The factory shares parent durability across views of each path. A new
+  // owner re-syncs the chain: an earlier mkdir may have lacked its parent sync.
+  void syncDirectory() {
+    std::filesystem::create_directories(basePath_);
+    auto sync = [](const std::filesystem::path& path) {
+      int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (fd < 0) throw FileIOException("Cannot open directory for fsync: " + path.string() + ": " + strerror(errno));
+      auto close = scope_guard([&] { ::close(fd); });
+      if (::fsync(fd) < 0) throw FileIOException("Directory fsync failed: " + path.string() + ": " + strerror(errno));
+      Signal::emit("fsSynced", (void*)&path);
+    };
+    sync(basePath_);
+    std::lock_guard lock(parents->mutex);
+    if (!parents->durable) {
+      for (auto path = basePath_; path != durabilityRoot && path != path.root_path();) {
+        path = path.parent_path();
+        sync(path);
+      }
+      parents->durable = true;
+    }
+  }
+
   void sync(std::span<const std::string> filenames) override {
     for (auto& name : filenames) {
-      int fd;
-      if (name == ".") {
-        fd = ::open(basePath_.c_str(), O_RDONLY);
-      } else {
-        fd = ::open(filePath(name).c_str(), O_RDONLY);
-      }
+      int fd = ::open(filePath(name).c_str(), O_RDONLY | O_CLOEXEC);
       if (fd < 0) {
         throw std::runtime_error("FSDirectory::sync: failed to open " + name + ": " + strerror(errno));
       }
@@ -625,10 +774,31 @@ public:
       ::close(fd);
       Signal::emit("fsSynced", &basePath_, (void*)&name);
     }
+    syncDirectory();
+  }
+
+  void deleteDurably(std::span<const std::string> names) override {
+    {
+      std::lock_guard local(parents->publication);
+      int fd = lockDirectory();
+      if (fd < 0) return;
+      auto unlock = scope_guard([&] { ::close(fd); });
+      for (const auto& name : names) {
+        if (::unlink(filePath(name).c_str()) < 0 && errno != ENOENT) {
+          throw FileIOException("Cannot delete file: " + std::string(name) + ": " + strerror(errno));
+        }
+      }
+    }
+    syncDirectory();
   }
 
   void clear() override {
+    std::lock_guard local(parents->publication);
+    int fd = lockDirectory();
+    if (fd < 0) return;
+    auto unlock = scope_guard([&] { ::close(fd); });
     for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
+      if (entry.path().filename() == kPublicationLock) continue;
       if (entry.is_regular_file()) {
         std::filesystem::remove(entry.path());
       }

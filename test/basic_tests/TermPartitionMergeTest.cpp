@@ -1,6 +1,8 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 
 #include "luxir/index/SegmentMerger.h"
@@ -118,6 +120,7 @@ int32_t recomputePackedBlockCount(const std::vector<PostingSnapshot>& postings) 
 void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
                   bool partitioned, int32_t termBase = 0,
                   IndexRamBudget* budget = nullptr, int32_t maxRanges = 4) {
+  test::reserveIncarnation(index.dir);
   index.iw = std::make_unique<IndexWriter>(
       index.snapshots, schema, budget);
   index.iw->mergePolicy->setMergeFactor(1000);
@@ -153,6 +156,7 @@ void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
 
 void buildWideDictionarySources(TestIndex& index,
                                 const std::shared_ptr<Schema>& schema) {
+  test::reserveIncarnation(index.dir);
   index.iw = std::make_unique<IndexWriter>(
       index.snapshots, schema);
   index.iw->mergePolicy->setMergeFactor(1000);
@@ -184,7 +188,7 @@ SegFieldInfo readBodyInfo(MemPool& pool, Segment& segment) {
 size_t baseFileCount(Directory& directory, uint64_t segId) {
   std::vector<Directory::FileInfo> files;
   directory.listFiles(files);
-  std::string prefix = Postings::getIndexFileNamePrefix(segId);
+  std::string prefix = "s" + Postings::segmentKey(segId, 1);
   return (size_t) std::count_if(files.begin(), files.end(), [&](const auto& file) {
     return file.name.starts_with(prefix + "_")
         && !file.name.starts_with(prefix + "__");
@@ -249,7 +253,7 @@ void verifySeeks(MemPool& pool, PostingsReader& reader, const SegFieldInfo& info
   }
 
   if (!info.rangeTableLoc.isNull()) {
-    InputStream table = reader.getInputStreamSeek(info.rangeTableLoc);
+    InputStream table = reader.core().getInputStreamSeek(info.rangeTableLoc);
     const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
     const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
     for (uint32_t i = 1; i < header->nRanges; i++) {
@@ -270,7 +274,7 @@ void verifySeeks(MemPool& pool, PostingsReader& reader, const SegFieldInfo& info
   // still positioning within each block afterwards.
   std::vector<int64_t> rowStarts;
   if (!info.rangeTableLoc.isNull()) {
-    InputStream table = reader.getInputStreamSeek(info.rangeTableLoc);
+    InputStream table = reader.core().getInputStreamSeek(info.rangeTableLoc);
     const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
     const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
     for (uint32_t i = 1; i < header->nRanges; i++) {
@@ -306,12 +310,12 @@ void verifySeeks(MemPool& pool, PostingsReader& reader, const SegFieldInfo& info
 
 FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
                         bool& hasRangeTable, bool& hasMidFieldTail) {
-  std::array<PostingsReader*, 2> readers = {
-      &left.reader->segments()[0].postingsReader(),
-      &right.reader->segments()[0].postingsReader()};
+  std::array<std::shared_ptr<SegmentCore>, 2> readers = {
+      left.reader->segments()[0].segmentCoreShared(),
+      right.reader->segments()[0].segmentCoreShared()};
   std::array<LiveDocs*, 2> liveDocs = {nullptr, nullptr};
   RAMDir outputDir;
-  PostingsWriter writer(outputDir, 900, -1);
+  PostingsWriter writer(outputDir, 900, 1, -1);
   IndexRamBudget budget;
   Schema schema;
   StoredDictionaryRegistry dictionaries;
@@ -321,13 +325,15 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
   merger.merge();
   writer.finish();
 
-  PostingsReader outputReader(outputDir, 900);
-  VersionRuns::Cursor outputBirths(outputReader.versionRuns());
+  SegmentCore outputReaderCore(outputDir, 900, 1);
+  auto& outputReader = outputReaderCore.rootReader();
+  VersionRuns::Cursor outputBirths(outputReader.core().versionRuns());
   int32_t base = 0;
-  for (auto* reader : readers) {
-    VersionRuns::Cursor inputBirths(reader->versionRuns());
-    for (int32_t doc = 0; doc < reader->maxDoc(); doc++) EXPECT_EQ(inputBirths.birth(doc), outputBirths.birth(base + doc));
-    base += reader->maxDoc();
+  for (const auto& core : readers) {
+    VersionRuns::Cursor inputBirths(core->versionRuns());
+    int32_t count = core->rootReader().maxDoc();
+    for (int32_t doc = 0; doc < count; doc++) EXPECT_EQ(inputBirths.birth(doc), outputBirths.birth(base + doc));
+    base += count;
   }
   MemPool pool;
   auto* fields = outputReader.fieldInfo("body");
@@ -336,7 +342,7 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
   hasRangeTable = !info.rangeTableLoc.isNull();
   hasMidFieldTail = false;
   if (hasRangeTable) {
-    InputStream table = outputReader.getInputStreamSeek(info.rangeTableLoc);
+    InputStream table = outputReader.core().getInputStreamSeek(info.rangeTableLoc);
     const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
     const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
     for (uint32_t i = 0; i + 1 < header->nRanges; i++) {
@@ -375,6 +381,7 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
 
 SegFieldInfo buildSparseRanges(TestIndex& index, const std::shared_ptr<Schema>& schema,
                                bool keepOneRange) {
+  test::reserveIncarnation(index.dir);
   index.iw = std::make_unique<IndexWriter>(index.snapshots, schema);
   index.iw->mergePolicy->setMergeFactor(1000);
   index.iw->termPartitionMinBytes = 1;
@@ -442,7 +449,7 @@ TEST(TermPartitionMergeTest, RoundTripSeeksAndCascade) {
   EXPECT_EQ(0, partitionedInfo.flags & FieldType::MAY_HAVE_FITTED);
   ASSERT_EQ(4, checkedOut.load(std::memory_order_relaxed));
 
-  InputStream table = partitionedSegment.postingsReader()
+  InputStream table = partitionedSegment.segmentCore()
       .getInputStreamSeek(partitionedInfo.rangeTableLoc);
   const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
   const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
@@ -539,16 +546,16 @@ TEST(TermPartitionMergeTest, EmptyRangesAreOmitted) {
   }
   ASSERT_FALSE(oneInfo.rangeTableLoc.isNull());
   ASSERT_EQ(4, checkedOut.load(std::memory_order_relaxed));
-  InputStream table = oneRange.reader->segments()[0].postingsReader()
+  InputStream table = oneRange.reader->segments()[0].segmentCore()
       .getInputStreamSeek(oneInfo.rangeTableLoc);
   const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
   EXPECT_EQ(1u, header->nRanges);
   const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
-  EXPECT_NE(nullptr, oneRange.reader->segments()[0].postingsReader()
+  EXPECT_NE(nullptr, oneRange.reader->segments()[0].segmentCore()
                          .getFile(rows[0].termsBase.filenum()));
-  EXPECT_NE(nullptr, oneRange.reader->segments()[0].postingsReader()
+  EXPECT_NE(nullptr, oneRange.reader->segments()[0].segmentCore()
                          .getFile(rows[0].docsBase.filenum()));
-  EXPECT_NE(nullptr, oneRange.reader->segments()[0].postingsReader()
+  EXPECT_NE(nullptr, oneRange.reader->segments()[0].segmentCore()
                          .getFile(rows[0].posBase.filenum()));
   EXPECT_EQ(3u, baseFileCount(oneRange.dir,
                               oneRange.reader->segments()[0].segInfo.seg_id));
@@ -582,10 +589,10 @@ TEST(TermPartitionMergeTest, PartitionsUnderOccupiedBudget) {
   TestIndex sources;
   buildWideDictionarySources(sources, schema);
 
-  std::vector<PostingsReader*> readers;
+  std::vector<std::shared_ptr<SegmentCore>> readers;
   std::vector<LiveDocs*> liveDocs;
   for (auto& segment : sources.reader->segments()) {
-    readers.push_back(&segment.postingsReader());
+    readers.push_back(segment.segmentCoreShared());
     liveDocs.push_back(nullptr);
     SegFieldInfo info = readBodyInfo(sources.pool, segment);
     EXPECT_NE(0, info.flags & FieldType::MAY_HAVE_FITTED);
@@ -596,7 +603,7 @@ TEST(TermPartitionMergeTest, PartitionsUnderOccupiedBudget) {
   [[maybe_unused]] auto blocker = budget.forceAcquire(cap);
   ASSERT_EQ(cap, budget.reservedBytes());
   RAMDir outputDir;
-  PostingsWriter writer(outputDir, 901, -1);
+  PostingsWriter writer(outputDir, 901, 1, -1);
   StoredDictionaryRegistry dictionaries;
   dictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(*schema));
   std::atomic<int64_t> maxCharged = 0;
@@ -614,7 +621,8 @@ TEST(TermPartitionMergeTest, PartitionsUnderOccupiedBudget) {
   writer.finish();
   EXPECT_EQ(cap, budget.reservedBytes());
 
-  PostingsReader outputReader(outputDir, 901);
+  SegmentCore outputReaderCore(outputDir, 901, 1);
+  auto& outputReader = outputReaderCore.rootReader();
   auto* fields = outputReader.fieldInfo("body");
   ASSERT_NE(nullptr, fields);
   const auto& info = *fields;
@@ -635,7 +643,7 @@ TEST(TermPartitionMergeTest, DerivedRangeLimitExceedsEight) {
   Segment& segment = index.reader->segments()[0];
   SegFieldInfo info = readBodyInfo(index.pool, segment);
   ASSERT_FALSE(info.rangeTableLoc.isNull());
-  InputStream table = segment.postingsReader().getInputStreamSeek(info.rangeTableLoc);
+  InputStream table = segment.segmentCore().getInputStreamSeek(info.rangeTableLoc);
   const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
   EXPECT_GT(header->nRanges, 8u);
   EXPECT_LE(header->nRanges, (uint32_t) MergeCostModel::maxTermRangesForStreams(

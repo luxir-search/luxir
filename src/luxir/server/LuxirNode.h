@@ -14,6 +14,7 @@
 #include <string_view>
 #include <vector>
 #include "Collections.h"
+#include "ControlExecutor.h"
 #include "PluginNodeState.h"
 #include "luxir/index/IndexRamBudget.h"
 #include "oneapi/tbb/task_arena.h"
@@ -52,6 +53,8 @@ public:
   ~LuxirNode();
 
   const LuxirConfig& getConfig() const { return config; }
+  const std::string& nodeId() const { return config.node.id; }
+  const std::string& nodeLifetime() const { return lifetime; }
   Mode getMode() const { return mode; }
   // Null for a missing state or a different concrete state type.
   template <class T>
@@ -74,7 +77,7 @@ public:
   bool readOnly() const { return config.read_only; }
 
   uint64_t storageBytes() const { return collections_->storage().storageBytes(); }
-  uint64_t storageBytes(const CollectionId& id) const { return collections_->storage().collectionBytes(id); }
+  uint64_t storageBytes(const CollectionId& id) const { return collections_->storageBytes(id); }
 
   // A request's target: an empty tenant is the default tenant (the request
   // scope supplies it), and an empty name the default collection.
@@ -103,25 +106,24 @@ public:
     return createCollection(CollectionId::of(name), schema);
   }
   void deleteCollection(const CollectionId& id);
+  void renameCollection(const CollectionId& from, const CollectionId& to);
+  void swapCollections(const CollectionId& a, const CollectionId& b);
   void deleteCollection(std::string_view name) { deleteCollection(CollectionId::of(name)); }
+  void detachCollection(const CollectionId& id, std::string_view target);
+  void detachCollection(std::string_view name, std::string_view target) { detachCollection(CollectionId::of(name), target); }
+  std::shared_ptr<Collection> attachCollection(const CollectionId& id, bool force = false);
+  std::shared_ptr<Collection> attachCollection(std::string_view name, bool force = false) { return attachCollection(CollectionId::of(name), force); }
 
   oneapi::tbb::task_arena& getTaskArena() {
     return taskArena;
   }
   oneapi::tbb::task_arena& getIndexArena() { return indexArena; }
+  // Administration, collection lifecycle, schema changes, replication
+  // transfers and timers, and detailed stats run off the search arena.
+  ControlExecutor& getControlExecutor() { return *control; }
 
   // The task arena's worker threads (server.workers, resolved).
   int getWorkers() const { return workers; }
-
-  // Runs f on the calling thread inside the task arena, in one of the slots
-  // reserved for threads entering from outside.  Tasks f spawns are stealable
-  // by the arena's workers, and f's waits run only tasks spawned within f
-  // (isolation): a transport thread never picks up a merge or another
-  // request's work while its connections wait.
-  template <typename F>
-  void executeIsolated(const F& f) {
-    taskArena.execute([&] { oneapi::tbb::this_task_arena::isolate(f); });
-  }
 
   // Counts a transport server's threads against the task arena's reserved
   // slots for the holder's lifetime.  Warns when entrants outnumber the slots
@@ -151,14 +153,15 @@ private:
   static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
 
   LuxirConfig config;
+  std::string lifetime;
   const Mode mode;
   Now clock;
 
   // Query work.  Workers: server.workers (resolveWorkers(); at least
   // one, since an arena of only reserved slots never serves enqueued tasks).
   // Plus a reserved slot per thread that enters from outside (each configured
-  // HTTP shard and the embedding thread; gRPC threads only enqueue), so an execute()
-  // from a transport thread always finds a free slot instead of handing its
+  // HTTP shard and the embedding thread; gRPC threads only enqueue), so an
+  // execute() from a transport thread always finds a free slot instead of handing its
   // functor to the arena and blocking behind arena backlog.  Reserved slots
   // are seats, not threads: they add no workers.  Workers that run out of
   // work leave at once (leave_policy::fast) instead of yielding for up to a
@@ -166,6 +169,7 @@ private:
   // CPU than the work.  The arenas are declared ahead of the collections and
   // the search engine so they outlive the work those run in them.
   int workers;
+  int controlThreads;
   int reservedSlots;
   std::atomic<int> arenaEntrants{1};  // the embedding thread; see ArenaEntrants
   oneapi::tbb::task_arena taskArena;
@@ -178,24 +182,33 @@ private:
   class ArenaThreadNamer : public oneapi::tbb::task_scheduler_observer {
     const char* prefix;
     int reservedSlots;  // workers occupy the slots after these
+    // apply() installs startup flags before node construction. Capture enable
+    // for this observer's lifetime so its entries and exits always pair.
+    std::unique_ptr<LoadRegistry::ArenaActivity> loadActivity;
   public:
-    ArenaThreadNamer(oneapi::tbb::task_arena& arena, const char* prefix, int reservedSlots)
+    ArenaThreadNamer(oneapi::tbb::task_arena& arena, const char* prefix, int reservedSlots, bool trackLoad)
       : oneapi::tbb::task_scheduler_observer(arena), prefix(prefix), reservedSlots(reservedSlots) {
+      if (trackLoad && LoadRegistry::enabled.load(std::memory_order_relaxed)) {
+        loadActivity = std::make_unique<LoadRegistry::ArenaActivity>(LoadRegistry::global());
+      }
       observe(true);
     }
+    ~ArenaThreadNamer() override { observe(false); }
     void on_scheduler_entry(bool worker) override;
+    void on_scheduler_exit(bool worker) override;
   };
-  ArenaThreadNamer arenaThreadNamer{taskArena, "luxir_tbb_", reservedSlots};
+  ArenaThreadNamer arenaThreadNamer{taskArena, "luxir_tbb_", reservedSlots, false};
 
   // Every collection's indexing: update batches, flushes, merges (each
   // writer's update graph runs here; see Collections).  Its own arena at low
   // priority, so TBB lends workers to queries in taskArena first and recalls
   // them from indexing at task boundaries; the worker pool has one more thread
   // than either arena uses, so a query hop finds a free worker at once even
-  // while indexing holds all of its own.  One reserved seat for a thread
-  // waiting on a graph (close, tests).
+  // while indexing holds all of its own.  Reserved seats for threads waiting
+  // on a graph: one for the embedding thread (tests), one per control thread
+  // (a collection's close).
   oneapi::tbb::task_arena indexArena;
-  ArenaThreadNamer indexThreadNamer{indexArena, "luxir_idx_", 1};
+  ArenaThreadNamer indexThreadNamer{indexArena, "luxir_idx_", 1 + controlThreads, true};
 
   IndexRamBudget indexRamBudget;
   std::shared_ptr<ReplicationSource> replication;
@@ -205,6 +218,8 @@ private:
   std::unique_ptr<ReplicationFollower> follower;
   std::unique_ptr<Scrubber> scrubber;
   std::unique_ptr<SearchEngine> searchEngine;
+  // Drained before tearing down the node state used by its tasks.
+  std::unique_ptr<ControlExecutor> control;
   PluginNodeStates pluginStates;
 };
 

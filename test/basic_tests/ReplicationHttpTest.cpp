@@ -330,7 +330,7 @@ TEST_F(ReplicationHttpTest, snapshotJsonHeadAndEmptyFile) {
   OutputStream out(file.get());
   out.close();
   registry.dir.finishFile(*file);
-  std::array<std::string, 2> names{"zero", "."};
+  std::array<std::string, 1> names{"zero"};
   registry.dir.sync(names);
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(registry.snapshot()->bytes, arena);
@@ -341,7 +341,7 @@ TEST_F(ReplicationHttpTest, snapshotJsonHeadAndEmptyFile) {
   info.index_gen++;
   auto bytes = std::make_shared<std::vector<std::byte>>();
   ASSERT_TRUE(api::encode(info, *bytes));
-  registry.publish(CommitSnapshot::fromBytes(bytes));
+  registry.publish(registry.resolve(bytes));
   auto snap = snapshot();
   EXPECT_EQ(200, get(fileUrl(*snap, "zero")).result_int());
   EXPECT_TRUE(get(fileUrl(*snap, "zero")).body().empty());
@@ -381,7 +381,8 @@ TEST_F(ReplicationHttpTest, installedRejectsInvalidAcknowledgments) {
 TEST_F(ReplicationHttpTest, nameDeletionSurvivesIncarnationChange) {
   auto first = catalog();
   auto old = snapshot()->id;
-  h->getIndexWriter()->testDeleteAllData();
+  node->deleteCollection("main");
+  h = std::make_unique<CollectionHelper>(*node, "main");
   auto recreated = catalog();
   EXPECT_NE(old.incarnation, snapshot()->id.incarnation);
   node->deleteCollection("main");
@@ -406,8 +407,9 @@ TEST_F(ReplicationHttpTest, acknowledgmentsExpireAndWatchRenewsLiveness) {
   for (const auto& row : catalog.status()) EXPECT_TRUE(row.collection.name.empty());
   catalog.registered(CollectionId::of("main"), node->getCollection("main"));
   catalog.installed({"f0", "t0", "main", id.token()});
-  h->getIndexWriter()->testDeleteAllData();
-  catalog.updated(CollectionId::of("main"), h->collection());
+  node->deleteCollection("main");
+  h = std::make_unique<CollectionHelper>(*node, "main");
+  catalog.registered(CollectionId::of("main"), node->getCollection("main"));
   for (const auto& row : catalog.status()) EXPECT_TRUE(row.collection.name.empty());
   auto response = get("/_replication/watch?follower=watch-only&timeout_ms=0");
   EXPECT_EQ(200, response.result_int());

@@ -1,6 +1,8 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
+#include "test/StorageTestUtils.h"
 #include "luxir/reader/FieldReader.h"
 #include <algorithm>
 #include <array>
@@ -134,7 +136,7 @@ int64_t rootNodeSize(const char* node) {
 }
 
 int64_t trieRegionBytes(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) {
-  InputStream trieIS = postingsReader.getInputStreamSeek(fieldInfo.trieLoc);
+  InputStream trieIS = postingsReader.core().getInputStreamSeek(fieldInfo.trieLoc);
   const char* base = trieIS.ptr();
   const char* root = base + fieldInfo.trieRootOff;
   return fieldInfo.trieRootOff + rootNodeSize(root) + 8;
@@ -322,7 +324,7 @@ private:
   void writeIndex() {
     seg.initWriter();
     TextWriter writer(*seg.postingsWriter.get());
-    writer.startField(std::string(kFieldName));
+    writer.startField(SpaceOrdinal::ROOT, std::string(kFieldName));
     for (int32_t ord = 0; ord < nTerms; ord++) {
       TermRef term(seg.pool, terms[ord].data(), (uint32_t)terms[ord].size());
       writer.startTerm(term);
@@ -343,7 +345,7 @@ private:
   }
 
   void buildStatsReader() {
-    CommitSnapshotRegistry writerSnapshots(queryDir);
+    CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(queryDir));
     IndexWriter writer(writerSnapshots);
     Inverter& inverter = writer.obtainInverter();
     auto& handler = inverter.getIndexHandler(kStatsFieldName);
@@ -786,7 +788,7 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
 
   {
     TextWriter w(*seg.postingsWriter.get());
-    w.startField(fname);
+    w.startField(SpaceOrdinal::ROOT, fname);
     for (auto docid: sorted) {
       auto term = terms[docid];
       w.startTerm(term);

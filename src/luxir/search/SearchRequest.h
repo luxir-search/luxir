@@ -11,7 +11,6 @@
 #include <memory>
 #include <memory_resource>
 #include <mutex>
-#include <oneapi/tbb/task_group.h>
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/api/build.h"
@@ -21,7 +20,10 @@
 #include "luxir/index/CommitSnapshot.h"
 #include "FilterCache.h"
 #include "RequestMemTracker.h"
+#include "luxir/query/Query.h"
 #include "luxir/query/ExecutionWarnings.h"
+#include "luxir/query/MultiTermBudget.h"
+#include "luxir/query/ExecutionProfile.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
@@ -29,8 +31,10 @@
 
 namespace luxir {
 
+class FanoutScope;
 class SearchEngine;
 class SearchResponse;
+class OwnershipRelation;
 
 // Cumulative count of emitter pauses caused by reply() flow control.
 // Process-wide; read by tests and (eventually) server stats.
@@ -53,37 +57,17 @@ using RespProto = luxir::api::SearchResponse;
 // Short alias for the response build-by-backing helpers (luxir/api/build.h).
 namespace build = luxir::api::build;
 
-// Runtime backing for request profiling. Each calculator owns one run with a
-// fixed slot per segment; the response wire objects are built only after all
-// segment work has drained.
-struct ExecutionProfilePieceState {
-  luxir::api::ExecutionProfilePiece wire;
-  // Human-readable execution notes, one clause per entry; profiling is off
-  // the hot path by definition, so ops just push composed strings here and
-  // fillExecutionProfile builds the wire span over them.
-  std::vector<std::string> details;
-  bool complete = false;
-};
-
-struct ExecutionProfileRun {
-  std::vector<ExecutionProfilePieceState> pieces;
-
-  explicit ExecutionProfileRun(std::size_t numPieces) : pieces(numPieces) {}
-};
-
-struct ExecutionProfileOpState {
-  std::string_view name;
-  std::mutex mutex;
-  std::vector<std::unique_ptr<ExecutionProfileRun>> runs;
-
-  explicit ExecutionProfileOpState(std::string_view name) : name(name) {}
-};
-
 // The top-level request for the SearchEngine.
 class Collection;
-class SearchRequest : public ExecutionWarnings {
+class SearchRequest : public ExecutionWarnings, public ExecutionProfileSink {
+  struct ScopedState {
+    std::shared_ptr<IndexReader> reader;
+    std::shared_ptr<FilterCache::UseRegistry> uses;
+    // Request-arena owned; the pair of paths fixes the direction of reduction.
+    std::map<std::pair<std::string, std::string>, OwnershipRelation*> relations;
+  };
   friend class SearchEngine;
-  void count(MetricOutcome outcome);
+  void count(MetricOutcome outcome, std::chrono::steady_clock::time_point end);
 
 public:
   std::stop_source waitCancellation{std::nostopstate};
@@ -104,6 +88,9 @@ public:
   const SearchConfig searchConfig;
   RequestMemTracker memoryTracker;
   uint64_t flags = 0;             // effective packed options, resolved during parsing
+  // Shared by every query tree of the request: one allowance for all of its
+  // prefix/wildcard/regex/range/fuzzy dictionary work.
+  MultiTermBudget multiTermBudget;
   const ReqProto& proto;            // borrowed non-owning view over the request bytes
   google::protobuf::Arena& arena;   // engine object allocator (NOT proto storage)
   std::shared_ptr<IndexReader> reader;
@@ -120,12 +107,20 @@ public:
   // One clock snapshot for every query tree/op in this request. Parsers are
   // short-lived and numerous, so NOW belongs here rather than in a parser.
   const int64_t dateMathNowEpochMillis;
+  // When the transport received the request; the final response's took_us is
+  // measured from here (stamped in maybeSendFinal, just before reply()).
+  const std::chrono::steady_clock::time_point startTime;
   // Resolved eagerly from proto.time_zone. Invalid IANA/fixed specifications
   // retain an error for submitBody to surface as a whole-request failure.
   std::optional<TimeZone> timeZone;
   std::string timeZoneError;
   MemPool requestPool;
-  oneapi::tbb::task_group* tg = nullptr; // optional top-level task group for this request.
+private:
+  // Registries can retain request memory charges. Destroy them before the
+  // request pool and tracker, and before releasing their reader pins.
+  std::unique_ptr<std::map<std::string, ScopedState, std::less<>>> scopedStates;
+public:
+  FanoutScope* tg = nullptr; // optional top-level fan-out scope for this request.
   // Resolved parallelism for this submission (see SearchEngine::submit).
   int32_t maxParallel = 0;
   SearchResponse* lastResponse = nullptr;
@@ -144,6 +139,7 @@ public:
   // Empty, with no backing allocation, unless an instrumented op observes
   // proto.profile=true during parsing.
   std::vector<std::unique_ptr<ExecutionProfileOpState>> executionProfileOps;
+  std::mutex executionProfileMutex;
 
   // Transport default for DocList field placement when an op leaves
   // document_format at DEFAULT: gRPC serves COLUMNS; the HTTP/JSON layer sets
@@ -157,14 +153,25 @@ public:
   bool testForcePrepare = false;
 
   SearchRequest(SearchEngine& engine, const ReqProto& proto,
-                google::protobuf::Arena& arena);
+                google::protobuf::Arena& arena,
+                std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now());
 
   virtual ~SearchRequest();
+
+  // Parsing and returned fields pin each additional view once, under mutex.
+  // The map has no allocation until
+  // a request crosses a space boundary; registry identities never cross it.
+  const std::shared_ptr<IndexReader>& pinView(std::string_view path);
+  const std::shared_ptr<FilterCache::UseRegistry>& uses(IndexReader& view);
+  OwnershipRelation& ownershipRelation(IndexReader& many, IndexReader& one);
+  Query::PlanningContext* createPlanningContext(IndexReader& view);
+  size_t scopedViewCountForTests() const noexcept { return scopedStates ? scopedStates->size() : 0; }
 
   ExecutionProfileOpState* addExecutionProfileOp(std::string_view name) {
     if (!proto.profile) return nullptr;
     auto state = std::make_unique<ExecutionProfileOpState>(name);
     auto* result = state.get();
+    std::lock_guard<std::mutex> lock(executionProfileMutex);
     executionProfileOps.push_back(std::move(state));
     return result;
   }
@@ -176,6 +183,10 @@ public:
     std::lock_guard<std::mutex> lock(opState->mutex);
     opState->runs.push_back(std::move(run));
     return result;
+  }
+
+  ExecutionProfileRun* addQueryProfile(std::string_view name) override {
+    return addExecutionProfileRun(addExecutionProfileOp(name));
   }
 
   void fillExecutionProfile(SearchResponse& response);
@@ -192,15 +203,19 @@ public:
   };
 
   /// Call this to send a response back to the client (or cause it to be buffered).  This can be called multiple times for a single request.
-  /// replyComplete will be called when the response has actually been written and is no longer needed.
+  /// reply() takes ownership of `response` on every path and must not throw:
+  /// once it has run, the transport has called replyCallback(response), which
+  /// releases a non-final response's own arena and completes the request on
+  /// the last one. A producer cannot recover from an exception here because
+  /// it cannot tell whether that release already happened.
   virtual ReplyStatus reply(SearchResponse& response) = 0;
 
   /// Called by a streaming producer after reply() returned PAUSE.  The
   /// transport must invoke `resume` exactly once when the connection drains
   /// below its low-water mark (or immediately on error - the producer's next
   /// reply() then observes CANCEL).  Which thread fires it is the transport's
-  /// placement choice (the connection's io shard for default-lane HTTP
-  /// requests, a task-arena worker otherwise); producers must not assume one.
+  /// placement choice (HTTP uses its connection shard except for value 1;
+  /// gRPC uses an arena worker); producers must not assume one.
   /// The default is for transports without flow control: resume immediately.
   virtual void resumeWhenDrained(std::function<void()> resume) { resume(); }
 

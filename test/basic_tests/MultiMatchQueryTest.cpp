@@ -9,6 +9,8 @@
 #include <map>
 #include <optional>
 #include <typeindex>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -83,16 +85,32 @@ public:
     return query;
   }
 
+  // Scores without, then with, the two-field pair table.
+  auto runPairTable(const api::Query& query) {
+    auto& threshold = CombinedFieldQuery::pairTableMinEvaluationsForTests;
+    auto restore = scope_guard([&threshold, saved = threshold] { threshold = saved; });
+    threshold = std::numeric_limits<int64_t>::max();
+    auto summed = run(query);
+    threshold = 0;
+    return std::pair(summed, run(query));
+  }
+
   float score(const api::Query& query, const std::string& id) {
     auto hits = run(query);
     return hits && hits->contains(id) ? hits->at(id) : 0.0f;
   }
 
-  Query* parse(const api::Query& query, IndexReader* reader = nullptr) {
+  Query* parse(const api::Query& query, const std::shared_ptr<IndexReader>& reader = {}) {
     auto schema = reader ? reader->schema() : helper.collection().getSchema();
-    ParseContext context{parsePool, *schema, protoArena, CoerceContext{}, ""};
-    context.reader = reader;
+    ParseView view(*schema, nullptr, reader ? &reader : nullptr);
+    ParseContext context{parsePool, *schema, protoArena, CoerceContext{}, "", nullptr, &view};
     return ProtobufQueryParser(context).parse(query);
+  }
+
+  static api::FieldDef& textField(SchemaBuilder& schema, std::string_view name) {
+    auto& field = schema.field(name);
+    field.type = api::FieldDef::FieldClass::TEXT;
+    return field;
   }
 
   static FilterKey filterKey(const Query& query) {
@@ -121,6 +139,43 @@ TEST_F(MultiMatchQueryTest, scoresMatchBm25fFormula) {
   EXPECT_NEAR(bm25f(2.0f, 6.0f), hits->at("d1"), 1e-6);
   EXPECT_NEAR(bm25f(2.0f, 7.0f), hits->at("d2"), 1e-6);
   EXPECT_GT(hits->at("d1"), hits->at("d2"));
+}
+
+// The scorer's norm tables and fast rounding match std::round, clamping and
+// intToByte4 over the weighted lengths for every pair of field norms.
+TEST(CombinedFieldNormTest, normTablesMatchReference) {
+  auto reference = [](double length) {
+    double rounded = std::min(std::round(length), (double)std::numeric_limits<int32_t>::max());
+    return SmallFloat::intToByte4((int32_t)rounded);
+  };
+  std::vector<uint8_t> pairNorms(256 * 256);
+  std::pair<float, float> weights[] = {{1.0f, 1.0f}, {2.0f, 1.0f}, {0.3f, 1.7f},
+                                       {1.5f, 0.25f}, {1e-3f, 3e9f}};
+  for (auto [w0, w1] : weights) {
+    CombinedFieldQuery::fillPairNorms(pairNorms, w0, w1);
+    for (int c0 = 0; c0 < 256; c0++) {
+      for (int c1 = 0; c1 < 256; c1++) {
+        double length = (double)w0 * (double)SmallFloat::decodeLengthByte((uint8_t)c0)
+            + (double)w1 * (double)SmallFloat::decodeLengthByte((uint8_t)c1);
+        ASSERT_EQ(reference(length), pairNorms[c0 << 8 | c1]) << w0 << " " << w1 << " " << c0 << " " << c1;
+        ASSERT_EQ(reference(length), CombinedFieldQuery::encodeLength(length));
+      }
+    }
+  }
+  for (double length : {0.0, 0.49999999999999994, 0.5, 2.5, 23.5, 24.5, 1e9 + 0.5,
+                        2147483646.5, 2147483647.0, 1e300}) {
+    EXPECT_EQ(reference(length), CombinedFieldQuery::encodeLength(length)) << length;
+  }
+}
+
+// Both fields have flat norms here, so a lowered threshold scores through the
+// shared pair table instead of summing the weighted lengths.
+TEST_F(MultiMatchQueryTest, pairNormTableScoresMatchSummedLengths) {
+  auto [summed, tabled] = runPairTable(
+      qb::multiMatch(mr(), "dune desert", {{"title_un", 1.3f}, {"body_un", 0.7f}}));
+  ASSERT_TRUE(summed && tabled);
+  ASSERT_EQ(2u, summed->size());
+  EXPECT_EQ(*summed, *tabled);
 }
 
 // title_un in 1 of 3 docs is under half density, so its norms are sparse and
@@ -153,6 +208,50 @@ TEST_F(MultiMatchSparseNormsTest, missingFieldAddsNoLength) {
   EXPECT_NEAR(bm25f(1.0f, 3.0f), hits->at("s2"), 1e-6);
 }
 
+// The pair table reads s2's missing sparse title as code 0. s4's segment has no
+// titles, so it scores through body_un's single-field table instead.
+TEST_F(MultiMatchSparseNormsTest, normTablesReadMissingFieldsAsZero) {
+  helper.index(flatdoc("id", "s4", "body_un", "dune desert planet"), UpdateMessage::COMMIT);
+  auto [summed, tabled] = runPairTable(
+      qb::multiMatch(mr(), "dune", {{"title_un", 2.0f}, {"body_un", {}}}));
+  ASSERT_TRUE(summed && tabled);
+  ASSERT_EQ(3u, summed->size());
+  EXPECT_EQ(*summed, *tabled);
+  EXPECT_EQ(summed->at("s2"), summed->at("s4"));
+}
+
+// Three fields have no pair table and sum their weighted lengths before rounding.
+class MultiMatchThreeFieldsTest : public MultiMatchQueryTest {
+public:
+  void SetUp() override {
+    helper.index(flatdoc("id", "t1", "title_un", "dune", "body_un", "a desert planet",
+                         "note_un", "dune dune"), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "t2", "title_un", "sand", "body_un", "dune",
+                         "note_un", "empire of sand"), UpdateMessage::COMMIT);
+  }
+};
+
+TEST_F(MultiMatchThreeFieldsTest, scoresMatchBm25fFormula) {
+  auto [summed, tabled] = runPairTable(qb::multiMatch(mr(), "dune",
+      {{"title_un", 2.0f}, {"body_un", {}}, {"note_un", 0.5f}}));
+  ASSERT_TRUE(summed && tabled);
+  ASSERT_EQ(2u, summed->size());
+  EXPECT_EQ(*summed, *tabled);
+
+  // docCount = 2; weighted sumTotalTermFreq = 2*2 + 4 + 0.5*5; df = max(1, 1, 1)
+  Similarity sim;
+  float idf = sim.idf(1, 2);
+  float avgdl = (float)(10.5 / 2.0);
+  auto bm25f = [&](float freq, float length) {
+    return Similarity::BM25Scorer(1.0f, sim.k1, sim.b, idf, avgdl)
+        .score(freq, SmallFloat::intToByte4((int32_t)length));
+  };
+  // t1: freq 2*1 + 0.5*2, length 2*1 + 3 + 0.5*2
+  // t2: freq 1, length 2*1 + 1 + 0.5*3 = 4.5, rounded half up to 5
+  EXPECT_NEAR(bm25f(3.0f, 6.0f), summed->at("t1"), 1e-6);
+  EXPECT_NEAR(bm25f(1.0f, 5.0f), summed->at("t2"), 1e-6);
+}
+
 TEST_F(MultiMatchQueryTest, operatorAndFilterContext) {
   // AND: every term somewhere in the combined field
   auto both = run(qb::multiMatch(mr(), "dune desert",
@@ -173,7 +272,7 @@ TEST_F(MultiMatchQueryTest, operatorAndFilterContext) {
 }
 
 TEST_F(MultiMatchQueryTest, analysisGroups) {
-  // Analyzer identity determines groups even when the tokens coincide.
+  // The analysis definition determines groups even when the tokens coincide.
   std::string_view names[] = {"body_un", "title_un"};
   float weights[] = {1.0f, 1.0f};
   for (std::string_view text : {"dune", "Dune"}) {
@@ -216,6 +315,55 @@ TEST_F(MultiMatchQueryTest, longTermsPolicySplitsGroups) {
     auto* query = parse(qb::multiMatch(mr(), text, {{"b", {}}, {"a", {}}}));
     EXPECT_TRUE(query->equals(expected));
   }
+}
+
+TEST_F(MultiMatchQueryTest, inlineEquivalentAnalyzersShareGroup) {
+  SchemaBuilder schema;
+  schema.analyzer(textField(schema, "a"), "unicode_word", {"lowercase"});
+  schema.analyzer(textField(schema, "b"), "unicode_word", {"lowercase"});
+  schema.set(helper.collection());
+
+  std::string_view names[] = {"a", "b"};
+  float weights[] = {1.0f, 1.0f};
+  CombinedFieldQuery::Term terms[] = {{0, "dune"}, {1, "dune"}};
+  CombinedFieldQuery expected(names, weights, terms);
+  auto* query = parse(qb::multiMatch(mr(), "Dune", {{"b", {}}, {"a", {}}}));
+  EXPECT_TRUE(query->equals(expected));
+
+  helper.index(flatdoc("id", "x1", "a", "dune", "b", "dune sand"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "x2", "a", "sand", "b", "sand"), UpdateMessage::COMMIT);
+  // A term in both fields saturates once, unlike the per-field sum.
+  auto combined = run(multiMatch("dune", {{"a", {}}, {"b", {}}}, Mode::COMBINED));
+  auto perField = run(multiMatch("dune", {{"a", {}}, {"b", {}}}, Mode::PER_FIELD, 1.0f));
+  ASSERT_TRUE(combined && perField);
+  EXPECT_LT(combined->at("x1"), perField->at("x1"));
+}
+
+TEST_F(MultiMatchQueryTest, inlineDifferentAnalyzersSplitGroups) {
+  SchemaBuilder schema;
+  schema.analyzer(textField(schema, "a"), "unicode_word", {"lowercase"});
+  schema.analyzer(textField(schema, "b"), "unicode_word", {"lowercase", "kstem"});
+  auto compiled = schema.set(helper.collection());
+
+  TermQuery a("a", "dune");
+  TermQuery b("b", "dune");
+  Query* optional[] = {&a, &b};
+  BooleanQuery expected({}, optional, {}, {});
+  auto* query = parse(qb::multiMatch(mr(), "Dune", {{"a", {}}, {"b", {}}}));
+  EXPECT_TRUE(query->equals(expected));
+}
+
+TEST_F(MultiMatchQueryTest, presetAndInlineEquivalentShareGroup) {
+  SchemaBuilder schema;
+  textField(schema, "a").analyzer.emplace().name = "standard";
+  schema.analyzer(textField(schema, "b"), "unicode_word", {"nfkc_cf"});
+  schema.set(helper.collection());
+
+  std::string_view names[] = {"a", "b"};
+  float weights[] = {1.0f, 1.0f};
+  CombinedFieldQuery::Term terms[] = {{0, "dune"}, {1, "dune"}};
+  CombinedFieldQuery expected(names, weights, terms);
+  EXPECT_TRUE(parse(qb::multiMatch(mr(), "Dune", {{"a", {}}, {"b", {}}}))->equals(expected));
 }
 
 TEST_F(MultiMatchQueryTest, fieldOrderBindingsAndDuplicates) {
@@ -395,12 +543,14 @@ TEST_F(MultiMatchQueryTest, dateGroupsKeepRangeSemantics) {
   auto schema = Schema::createDefaultSchema();
   int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
   QueryBuilder builder(parsePool, *schema, CoerceContext{now});
+  ParseView view(*schema);
   QueryBuilder::WeightedField fields[] = {{"when_dt", 2.0f}};
+  auto resolved = builder.resolveWeightedFields(fields, view);
   for (auto text : {"2024-06", "NOW", "NOW/DAY"}) {
     auto* expected = builder.createMatchQuery("when_dt", text, QueryBuilder::Operator::OR, 0, 2.0f);
-    for (auto* actual : {builder.createMultiMatchCombined(fields, text, QueryBuilder::Operator::OR, 0),
-                        builder.createMultiMatchPerField(fields, text, QueryBuilder::Operator::OR, 0),
-                        builder.createMultiMatchPerField(fields, text, QueryBuilder::Operator::OR, 0, 1.0f, 0)}) {
+    for (auto* actual : {builder.createMultiMatchCombined(resolved, text, QueryBuilder::Operator::OR, 0),
+                        builder.createMultiMatchField(resolved[0], text, QueryBuilder::Operator::OR, 0),
+                        builder.createMultiMatchField(resolved[0], text, QueryBuilder::Operator::OR, 0, 0)}) {
       EXPECT_TRUE(expected->equals(*actual));
       EXPECT_EQ(filterKey(*expected), filterKey(*actual));
     }
@@ -694,20 +844,20 @@ TEST_F(MultiMatchQueryTest, wildcardRootsVariantsAndBindings) {
   for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
     auto wildcard = multiMatch("Dune Messiah", {{"author*", 2.0f}, {"author__words", 3.0f}}, mode);
     auto explicitField = multiMatch("Dune Messiah", {{"author__words", 3.0f}}, mode);
-    EXPECT_TRUE(parse(wildcard, reader.get())->equals(*parse(explicitField, reader.get())));
+    EXPECT_TRUE(parse(wildcard, reader)->equals(*parse(explicitField, reader)));
     EXPECT_EQ(run(explicitField), run(wildcard));
     auto variants = multiMatch("Dune Messiah", {{"author__*", {}}}, mode);
     auto listed = multiMatch("Dune Messiah", {{"author__exact", {}}, {"author__words", {}}}, mode);
-    EXPECT_TRUE(parse(variants, reader.get())->equals(*parse(listed, reader.get())));
+    EXPECT_TRUE(parse(variants, reader)->equals(*parse(listed, reader)));
     EXPECT_EQ(run(listed), run(variants));
-    EXPECT_TRUE(parse(multiMatch("Dune Messiah", {{"note_*", {}}}, mode), reader.get())->equals(
-        *parse(multiMatch("Dune Messiah", {{"note_entry", {}}}, mode), reader.get())));
+    EXPECT_TRUE(parse(multiMatch("Dune Messiah", {{"note_*", {}}}, mode), reader)->equals(
+        *parse(multiMatch("Dune Messiah", {{"note_entry", {}}}, mode), reader)));
   }
   auto id = run(multiMatch("d1", {{"i*", {}}}, Mode::COMBINED));
   ASSERT_TRUE(id);
   EXPECT_TRUE(id->contains("d1"));
   auto* absent = dynamic_cast<TermQuery*>(parse(
-      multiMatch("dune", {{"decl*", {}}}, Mode::PER_FIELD), reader.get()));
+      multiMatch("dune", {{"decl*", {}}}, Mode::PER_FIELD), reader));
   ASSERT_NE(nullptr, absent);
   EXPECT_EQ("declared", absent->getField());
   // Direct builders without a reader still expand concrete schema declarations.
@@ -749,7 +899,7 @@ TEST_F(MultiMatchQueryTest, wildcardFieldLimitCountsPhysicalTargets) {
   schema.set(helper.collection());
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
   auto query = multiMatch("dune", {{"many*", {}}, {"many*", 2.0f}, {"many0__self", 3.0f}}, Mode::PER_FIELD);
-  EXPECT_NO_THROW(parse(query, reader.get()));
+  EXPECT_NO_THROW(parse(query, reader));
   auto hits = run(query);
   ASSERT_TRUE(hits);
   EXPECT_TRUE(hits->empty());

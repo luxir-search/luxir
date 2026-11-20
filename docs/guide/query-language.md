@@ -395,7 +395,8 @@ beside it. The expression must produce a value for every matched document;
 `def(popularity_i, 0)` or an `exists()` clause in the child query makes it
 total. `$name` variables inside the expression bind from the surrounding
 expression's `vars`. The value-expression language is the one sorting uses;
-see [Searching](searching.md#sorting).
+see [Searching](searching.md#sorting) and
+[Value expressions](value-expressions.md).
 
 ## Functions
 
@@ -410,6 +411,7 @@ phrase(dune messiah, field=title_t)
 phrase(dune messiah, field=title_t, slop=2)
 fuzzy(smith, field=name_s, max_edits=2, prefix_length=0)
 prefix(mess, field=title_t)
+prefix(m, field=title_t, max_expansions=50)
 wildcard(du*, field=title_t)
 regex(dune|kings, field=title_t)
 exists(year_i)
@@ -563,10 +565,22 @@ level; use NOT or parentheses (context: "status_s:live AND <HERE>+tag_s:beta")
   distinct physical targets, including explicit fields.
 - `?` and mid-word `*` in a term are literal characters, and `/re/` is not a
   regex; use `wildcard(...)` and `regex(...)`.
-- `geo_box` and `geo_distance` have no function form; use their structured
-  JSON objects. New structured query arms are not automatically callable
-  until their expression behavior is declared.
+- `geo_box`, `geo_distance`, and `geo_polygon` have no function form; use
+  their structured JSON objects. New structured query arms are not
+  automatically callable until their expression behavior is declared.
 - `$variables` are values only: they cannot supply a score decoration, a
   field name, or a fragment of expression syntax.
 - Nesting depth is bounded per request, including expressions nested inside
   structured query nodes.
+
+
+## Groups on nested paths
+
+`items.color:red AND items.size:L` joins each clause separately (possibly
+matching different items). `items:(color:red AND size:L)` joins the group
+once, requiring the same item. Scalar-field groups still distribute their
+field over bare terms; a nested-path group establishes a view instead.
+`items:*` tests for at least one item row. Paths and field names are relative
+to the current view, so `items:(parts:(material:steel))` descends twice.
+See [Nested documents](nested.md) for structured equivalents, negation,
+filters, facets and Domain navigation.

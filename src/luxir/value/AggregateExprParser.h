@@ -33,6 +33,7 @@ struct AggregateExprOptions {
   int* nestingBudget = nullptr;
   FieldResolver* fieldResolver = nullptr;
   bool shareProducers = true;
+  ParseView* view = nullptr;
 };
 
 class AggregateExprParser {
@@ -76,14 +77,19 @@ public:
   uint32_t makeFunction(std::string_view name, size_t pos,
                         std::span<const uint32_t> args) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
-    assert(function != nullptr && function->evalBucketScalar != nullptr);
-    std::array<uint32_t, 2> indices{};
+    assert(function != nullptr);
+    if (function->evalBucketScalar == nullptr) {
+      fail(pos, fmt::format(
+          "{}() is a per-document value function and is not valid on bucket values",
+          name));
+    }
+    std::array<uint32_t, VALUE_MAX_ARITY> indices{};
     std::copy(args.begin(), args.end(), indices.begin());
     std::span<uint32_t> children(indices.data(), args.size());
     ResolvedValue resolved = resolveFunction(*function, pos, children);
     AggregateNode node;
-    node.kind = children.size() == 1
-        ? AggregateNodeKind::UNARY : AggregateNodeKind::BINARY;
+    node.kind = AggregateNodeKind::FUNCTION;
+    node.childCount = (uint8_t)children.size();
     node.type = valueDouble(resolved.type)
         ? BucketValueType::DOUBLE : BucketValueType::INT128;
     node.nature = resolved.nature;
@@ -118,7 +124,7 @@ public:
     }
     if (lookup.value != nullptr
         && lookup.value->evalBucketScalar != nullptr) {
-      std::array<uint32_t, 2> args{};
+      std::array<uint32_t, VALUE_MAX_ARITY> args{};
       uint8_t count = grammar.parseArguments(
           name, pos, lookup.value->minArity, lookup.value->maxArity,
           [&](uint8_t argument) {
@@ -145,7 +151,7 @@ public:
 private:
   ResolvedValue resolveFunction(const ValueFunction& function, size_t pos,
                                 std::span<uint32_t> children) {
-    std::array<ResolvedValue, 2> args{};
+    std::array<ResolvedValue, VALUE_MAX_ARITY> args{};
     for (size_t i = 0; i < children.size(); i++) {
       const AggregateNode& child = program->nodes[children[i]];
       args[i] = {
@@ -153,9 +159,32 @@ private:
               ? ValueType::DOUBLE : ValueType::INT64,
           child.nature};
     }
-    int convert = function.dateConversionOperand(
+    auto natureConversions = function.natureConversions({args.data(), children.size()});
+    for (size_t i = 0; i < children.size(); i++) {
+      if (!natureConversions[i]) continue;
+      AggregateNode child = program->nodes[children[i]];
+      if (valueDecimal(child.nature)) {
+        AggregateNode scale;
+        scale.intValue = valueDecimalScale(child.nature);
+        uint32_t scaleIndex = program->addNode(scale);
+        AggregateNode decode;
+        decode.kind = AggregateNodeKind::FUNCTION;
+        decode.type = BucketValueType::DOUBLE;
+        decode.children = {children[i], scaleIndex};
+        decode.childCount = 2;
+        decode.function = ValueFunctionRegistry::decimalDecoder();
+        children[i] = program->addNode(decode);
+      } else {
+        child.nature = ValueNature::NUMBER;
+        children[i] = program->addNode(child);
+      }
+      args[i] = {program->nodes[children[i]].type == BucketValueType::DOUBLE ? ValueType::DOUBLE : ValueType::INT64,
+                 ValueNature::NUMBER};
+    }
+    auto conversions = function.dateConversionOperands(
         std::span<const ResolvedValue>(args.data(), children.size()));
-    if (convert >= 0) {
+    for (size_t convert = 0; convert < children.size(); convert++) {
+      if (!conversions[convert]) continue;
       AggregateNode scale;
       scale.intValue = 1000000;
       scale.sourcePos = pos;
@@ -165,7 +194,7 @@ private:
       args[convert].nature = ValueNature::DATE_NS;
     }
     try {
-      return function.resolve(
+      return function.resolveOperands(
           std::span<const ResolvedValue>(args.data(), children.size()));
     } catch (const std::exception& error) {
       fail(pos, error.what());
@@ -193,6 +222,10 @@ private:
     size_t pos = cur->position();
     std::string_view name = value::lex::scanVariable(*cur);
     if (name.empty()) fail(pos, "'$' must be followed by a variable name");
+    return parseVariableNamed(name, pos);
+  }
+
+  uint32_t parseVariableNamed(std::string_view name, size_t pos) {
     const auto* view = opts.vars.find(name);
     if (view == nullptr) fail(pos, fmt::format("undefined variable ${}", name));
 
@@ -234,8 +267,9 @@ private:
           if (argument == 0) {
             argumentStart = cur->position();
             ValueExprOptions valueOptions{opts.schema, opts.vars, budget, false, opts.fieldResolver, opts.opName};
+            valueOptions.view = opts.view;
             try {
-              input = ValueExprParser(valueOptions, arena).parsePartial(*cur);
+              input = ValueExprParser(valueOptions, arena).parsePartial(*cur, function.natures);
             } catch (const std::runtime_error& error) {
               throw std::runtime_error(fmt::format(
                   "op '{}': {}", opts.opName, error.what()));

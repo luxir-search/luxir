@@ -228,6 +228,75 @@ TEST_F(DocSetTest, bitsetResultsHaveCardinality) {
   EXPECT_EQ(DocSet::intersect(sets)->card(), 2);
 }
 
+TEST_F(DocSetTest, andNotRepresentations) {
+  constexpr int32_t maxDoc = 130;
+  ArrDocSet baseArray({1, 3, 64, 65, 99});
+  ArrDocSet excludedArray({3, 64, 99, 120});
+  ArrDocSet emptyArray({});
+  RAMBitDocSet baseBits(maxDoc), excludedBits(maxDoc), emptyBits(maxDoc);
+  for (int32_t doc : baseArray.docs()) baseBits.mutableBits().set(doc);
+  for (int32_t doc : excludedArray.docs()) excludedBits.mutableBits().set(doc);
+  for (DocSet* base : std::array<DocSet*, 2>{&baseArray, &baseBits}) {
+    for (DocSet* excluded : std::array<DocSet*, 2>{&excludedArray, &excludedBits}) {
+      std::array<DocSet*, 1> exclusions{excluded};
+      auto result = DocSet::andNot(base, exclusions, maxDoc);
+      EXPECT_EQ(result->type, base->type);
+      EXPECT_EQ(result->card(), 2);
+      EXPECT_EQ(collect(*result, maxDoc), (std::vector<int32_t>{1, 65}));
+    }
+    for (DocSet* empty : std::array<DocSet*, 2>{&emptyArray, &emptyBits}) {
+      std::array<DocSet*, 1> exclusions{empty};
+      EXPECT_EQ(collect(*DocSet::andNot(base, exclusions, maxDoc), maxDoc),
+                collect(*base, maxDoc));
+    }
+    EXPECT_EQ(collect(*DocSet::andNot(base, {}, maxDoc), maxDoc),
+              collect(*base, maxDoc));
+    for (DocSet* all : std::array<DocSet*, 2>{&baseArray, &baseBits}) {
+      std::array<DocSet*, 1> exclusions{all};
+      EXPECT_EQ(DocSet::andNot(base, exclusions, maxDoc)->card(), 0);
+    }
+    ArrDocSet rest({1, 65});
+    std::array<DocSet*, 2> exclusions{&excludedBits, &rest};
+    EXPECT_EQ(DocSet::andNot(base, exclusions, maxDoc)->card(), 0);
+    EXPECT_EQ(base->card(), 5);  // Inputs remain unchanged.
+  }
+  std::array<DocSet*, 1> exclusions{&excludedBits};
+  EXPECT_EQ(DocSet::andNot(&emptyArray, exclusions, maxDoc)->card(), 0);
+}
+
+TEST_F(DocSetTest, andNotArrayDensityRule) {
+  ArrDocSet base({1, 2, 3, 4});
+  ArrDocSet excluded({4});
+  std::array<DocSet*, 1> exclusions{&excluded};
+  // At maxDoc 96 the array limit is three docs.
+  auto sparse = DocSet::andNot(&base, exclusions, 96);
+  EXPECT_EQ(sparse->type, DocSet::ARRAY);
+  EXPECT_EQ(collect(*sparse, 96), (std::vector<int32_t>{1, 2, 3}));
+  auto dense = DocSet::andNot(&base, {}, 96);
+  EXPECT_EQ(dense->type, DocSet::BITSET);
+  EXPECT_EQ(collect(*dense, 96), (std::vector<int32_t>{1, 2, 3, 4}));
+}
+
+TEST_F(DocSetTest, andNotNullBaseAndRanges) {
+  for (int32_t maxDoc : {0, 64, 130}) {
+    auto all = DocSet::andNot(nullptr, {}, maxDoc);
+    EXPECT_EQ(all->type, DocSet::BITSET);
+    EXPECT_EQ(all->card(), maxDoc);  // Includes masking the final partial word.
+    std::array<DocSet*, 1> exclusions{all.get()};
+    EXPECT_EQ(DocSet::andNot(nullptr, exclusions, maxDoc)->card(), 0);
+  }
+  ArrDocSet excluded({0, 64, 129});
+  std::array<DocSet*, 1> exclusions{&excluded};
+  auto result = DocSet::andNot(nullptr, exclusions, 130);
+  EXPECT_EQ(result->card(), 127);
+  for (int32_t doc = 0; doc < 130; doc++) {
+    EXPECT_EQ(result->get(doc), !excluded.get(doc));
+  }
+  RAMBitDocSet wrongSize(64);
+  EXPECT_THROW(DocSet::andNot(&wrongSize, exclusions, 130), std::invalid_argument);
+  EXPECT_THROW(DocSet::andNot(nullptr, exclusions, 64), std::invalid_argument);
+}
+
 TEST_F(DocSetTest, builderAddWindowWordsMasksFinalPartialWord) {
   DocSetBuilder builder(130);
   std::array<uint64_t, 2> words{};

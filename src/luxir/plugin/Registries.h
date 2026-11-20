@@ -4,6 +4,8 @@
 #pragma once
 #include "luxir/analysis/AnalysisRegistry.h"
 #include "luxir/plugin/Plugin.h"
+#include "luxir/search/HitDecorator.h"
+#include "luxir/store/StorageRegistry.h"
 #include "luxir/query/QueryRegistry.h"
 #include "luxir/search/SearchOpRegistry.h"
 #include "luxir/server/HttpRouteRegistry.h"
@@ -14,12 +16,15 @@ namespace luxir {
 struct Registries {
   PluginRegistry& plugins;
   AnalysisRegistry& analysis;
+  // Storage backends and layers.
+  StorageRegistry& storage;
   // Plugin query types (api::PluginQuery).
   QueryRegistry& query;
   // Plugin search operations (api::PluginOp).
   SearchOpRegistry& searchOps;
   // Plugin HTTP routes.
   HttpRouteRegistry& http;
+  HitDecoratorRegistry& hitDecorators;
 
   static Registries global();
   // Freezes every registry.

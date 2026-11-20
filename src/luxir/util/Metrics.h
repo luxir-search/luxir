@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "luxir/util/ApiError.h"
+#include "luxir/util/Clock.h"
 #include "luxir/util/Striped.h"
 
 namespace luxir {
@@ -103,11 +104,6 @@ inline void addCells(MetricCounts& dst, const MetricCells& src) {
   addCells(dst.transport, src.transport);
   addCells(dst.requestErrors, src.requestErrors);
   addCells(dst.documentErrors, src.documentErrors);
-}
-
-inline uint64_t nanosSince(std::chrono::steady_clock::time_point start) {
-  auto elapsed = std::chrono::steady_clock::now() - start;
-  return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
 }
 
 // Error kinds index counters; an unknown wire value counts as UNKNOWN.
@@ -242,6 +238,9 @@ public:
   ~MetricScope() { finish(MetricOutcome::CANCELLED); }
 
   bool active() const { return metrics != nullptr; }
+  uint64_t startNs() const {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count();
+  }
   void begin(Metrics& next, size_t nextActivity) noexcept {
     finish(MetricOutcome::CANCELLED);
     metrics = &next;

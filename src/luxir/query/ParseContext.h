@@ -3,14 +3,16 @@
 
 #pragma once
 
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
+#include <unordered_map>
 
 #include <google/protobuf/arena.h>
 
 #include "luxir/api/luxir_types.hpp"
-#include "luxir/query/FieldResolver.h"
+#include "luxir/query/ParseView.h"
 #include "luxir/query/Warnings.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/MemPool.h"
@@ -20,17 +22,28 @@ namespace luxir {
 class CollapsePlan;
 class IndexReader;
 class LuxirNode;
+class SearchRequest;
+class Query;
+
+struct NamedClause {
+  Query* query;
+  const api::TopDocs* list;
+  std::string path;
+  bool prohibited;
+};
+using NamedClauses = std::unordered_map<std::string_view, NamedClause>;
 
 // Request-scoped context threaded through query parsing and building: the
 // pool the query tree is built into, the schema, the warnings sink (declared
 // degradations, surfaced as SearchResponse.warnings), and the shared nesting
-// budget.  This is the request-scoped parse/build context from the
-// query-string design; the limits-config snapshot joins it later.
+// budget and operator rules. This is the request-scoped parse/build context
+// from the query-string design; the limits-config snapshot joins it later.
 struct ParseContext {
+  std::optional<NamedClauses> localNames;
+  NamedClauses* names = nullptr;
+  const api::TopDocs* list = nullptr;
+  bool prohibited = false;
   const CollapsePlan* collapse = nullptr;
-  // The searched reader, when there is one: wildcard field lists reuse its
-  // schema-specific search catalog.
-  IndexReader* reader = nullptr;
   // Null for offline parsing; request parsers pass their engine's node.
   LuxirNode* node = nullptr;
   MemPool& pool;
@@ -51,12 +64,15 @@ struct ParseContext {
   // limit: deterministic for a given request, so exceeding it errors freely.
   // The value is a generous default until the limits-config snapshot exists.
   int nestingBudget = 128;
+  // Operator rule for unbounded prefix, wildcard, and regex queries; zero is off.
+  int32_t minLiteralPrefix = 0;
 
   // Stable across every short-lived QueryBuilder participating in this parse.
   // Request-facing constructors require this explicitly so adding a parser
   // call site cannot silently fall back to UTC.
   CoerceContext coerceContext;
-  FieldResolver localFields;
+  std::optional<ParseView> localView;
+  ParseView& view;
   FieldResolver& fields;
   std::map<const api::Val*, std::pair<std::string_view, size_t>> exactSources;
 
@@ -64,10 +80,12 @@ struct ParseContext {
                const CoerceContext& coerceContext,
                std::string_view opName,
                std::vector<api::Warning>* warnings = nullptr,
-               FieldResolver* fields = nullptr, LuxirNode* node = nullptr)
+               ParseView* view = nullptr, LuxirNode* node = nullptr)
     : node(node), pool(pool), schema(schema), arena(arena), warnings(warnings), opName(opName),
-      coerceContext(coerceContext), localFields(schema),
-      fields(fields ? *fields : localFields) {}
+      coerceContext(coerceContext),
+      localView(view ? std::nullopt : std::optional<ParseView>(std::in_place, schema)),
+      view(view ? *view : *localView),
+      fields(this->view.fields) {}
 
   // code must be a string with static storage duration (a literal).
   // Repeats are dropped.

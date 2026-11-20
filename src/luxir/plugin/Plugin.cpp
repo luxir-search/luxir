@@ -40,16 +40,18 @@ PluginRegistry& PluginRegistry::global() {
 }
 
 Registries Registries::global() {
-  return {PluginRegistry::global(), AnalysisRegistry::global(), QueryRegistry::global(),
-          SearchOpRegistry::global(), HttpRouteRegistry::global()};
+  return {PluginRegistry::global(), AnalysisRegistry::global(), StorageRegistry::global(), QueryRegistry::global(),
+          SearchOpRegistry::global(), HttpRouteRegistry::global(), HitDecoratorRegistry::global()};
 }
 
 void Registries::freeze() {
   plugins.freeze();
   analysis.freeze();
+  storage.freeze();  // storage backends and layers
   query.freeze();
   searchOps.freeze();
   http.freeze();
+  hitDecorators.freeze();
 }
 
 void initPlugins(void (*addPlugins)(PluginRegistry&)) {
@@ -68,6 +70,9 @@ void initPlugins(void (*addPlugins)(PluginRegistry&)) {
     // The JSON dialect reads registered names as plugin arms (api/PluginArms.h).
     api::pluginArmNames.isQuery = [](std::string_view name) {
       return QueryRegistry::global().find(name) != nullptr;
+    };
+    api::pluginArmNames.isDecorator = [](std::string_view name) {
+      return HitDecoratorRegistry::global().contains(name);
     };
     api::pluginArmNames.isOp = [](std::string_view name) {
       return SearchOpRegistry::global().find(name) != nullptr;

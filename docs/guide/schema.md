@@ -11,15 +11,158 @@ Choose a type based on how you want to search and use the values:
 
 | Type | Description and typical uses |
 |---|---|
+| `nested` | Structural object path; see [Nested documents](nested.md). Accepts an object, an array of objects, null or an empty array. |
 | `text` | Analyzed text for full-text search: titles, descriptions, and article bodies. An analyzer splits each value into searchable tokens for word and phrase queries. |
 | `string` | A whole value for exact matching, filtering, sorting, and faceting: categories, tags, and product codes. Values are not split into words. |
 | `int` | Signed 64-bit integer: counts, quantities, and years. |
 | `float` | 32-bit floating-point number: measurements and other numeric values where single precision is sufficient. |
 | `double` | 64-bit floating-point number for greater precision than `float`. |
+| `decimal` | Fixed-point number with a required `scale` (0 to 18 digits after the point). See [Decimals](#decimals). |
+| `ip` | IPv4 or IPv6 address, stored as a 16-byte term. See [IP addresses](#ip-addresses). |
+| `boolean` | `true` or `false`: flags and on/off attributes. |
 | `date` | Timestamp with `ms` (default) or `ns` storage precision. Ingest accepts ISO-8601 text or numeric epoch values in the field's unit. See [Dates](dates.md). |
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
 | `geo_point` | Geographic location supplied as `[longitude, latitude]`, an object, a string, or a geohash, for distance and bounding-box queries. See [Geo search](geo-search.md). |
+| `long_range`, `double_range`, `date_range` | An interval of `int`, `double`, or `date` endpoints, such as a validity window, a price band, or an event's duration. See [Range types](#range-types). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
+
+### Decimals
+
+`decimal` stores `value * 10^scale` as a signed 64-bit integer. Set the
+required `scale` from 0 to 18; it is inherited from `parent` like other
+properties. A direct `scale` is invalid on other types; an inherited scale
+is ignored when a child changes type. There is no default decimal
+suffix. For example:
+
+```json
+{"fields":{"price":{"type":"decimal","scale":2,"index":"range"}}}
+```
+
+JSON integers, floating-point numbers and numeric strings are accepted.
+Excess fractional digits round half away from zero: `1.005` and `"1.005"`
+become 1.01 at scale 2, and -1.005 becomes -1.01. JSON floating-point inputs
+use their shortest round-trip text, rather than their binary expansion.
+Exponents and long fractions are accepted; overflow after rounding rejects
+an ingest value. Out-of-domain exact-match literals match nothing, and
+range bounds saturate to the field's value domain. Scale is persisted with the
+field type; reading or merging data under a different type or scale is rejected.
+
+Match and `any_of` literals round like ingest. Range bounds round in the
+requested direction: `gte: 10.005` starts at 10.01, while `lt: 10.005`
+includes values through 10.00. Integer field bounds also round directionally
+(`gte: 9.5` starts at 10); integer ingest and exact-match literals still
+reject non-integral values.
+
+Results are doubles by default, computed as raw divided by `10^scale`.
+This applies to documents, facet buckets and range bounds, sort values,
+collapse keys, and decimal statistics. The int64 storage is exact; doubles
+can lose distinctions at large magnitudes.
+
+The request or operation flag `decimal_scaled` instead returns raw integers
+and interprets decimal field literals as raw integers. Integral numeric
+strings, including `"1250.0"`, mean raw 1250 at every scale; non-integral
+match literals are rejected. Bounds still round directionally in raw units.
+Ingest always uses decimal values and is unaffected by the flag. Combine
+`decimal_scaled` with `int64_str` to round-trip large raw integers through
+JSON strings. Averages and percentiles remain doubles (in raw units under the flag).
+
+Range facet gaps and origins must be exact multiples of `10^-scale`; gaps
+must be positive. With `decimal_scaled` they use raw units. Selection,
+`min`, `max`, `sum`, and `avg` retain the scale when possible, aggregating
+raw values exactly (INT128 sums). Arithmetic and mixed-scale expressions
+decode to numeric values. Expression constants always mean values, independent
+of `decimal_scaled`. Same-scale comparisons use raw values; per-document
+comparisons against numeric constants use raw integer bounds when representable.
+A decimal sum wider than int64 renders as a double by default; scaled
+output emits null with an aggregate overflow warning, as integer sums do.
+
+### IP addresses
+
+`ip` accepts IPv4 and IPv6 text. IPv4 uses the IPv6 v4-mapped encoding, so
+`10.0.0.1` and `::ffff:10.0.0.1` are equal. Results use dotted IPv4 for mapped
+addresses and compressed lowercase IPv6 otherwise. Sorting follows address
+byte order. The default suffix templates are `_ip` and multi-valued `_ips`.
+
+IP fields require `index: "match"` (the default), and reject `stored: true`.
+There is no original source text to retain. Columns support retrieval, field
+facets, sorting, collapse, and column-only value expressions such as `count`.
+Facet selection and collapse identity use the encoded address.
+
+`match` accepts an address or CIDR: `10.1.2.3/8` matches the entire `10.0.0.0/8`
+network because host bits are ignored. IPv4 `/0` covers all mapped IPv4
+addresses; IPv6 `::/0` covers all addresses. `/32` for IPv4 and `/128` for
+IPv6 match one address. Range bounds and `any_of` members must be addresses;
+CIDR is rejected there. Numbers, zone ids, and text containing NUL reject.
+Prefix, wildcard/regexp, case-insensitive match, fuzzy matching, and facet
+`term_filter` are unsupported. IP fields cannot be bare-word fields in
+`simple_query`, but `addr:10.0.0.1` is an exact match. Wildcard `multi_match`
+field expansion probes each IP field and skips text it cannot parse.
+
+### Booleans
+
+`boolean` accepts JSON `true`/`false` and the strings `"true"`/`"false"`;
+other values, including numbers 0 and 1, reject the document. Query literals
+use the same rules: `flag:true`, `{"match": {"flag": false}}`.
+
+Values are stored as 0/1 in the integer column. Sorting puts `false` before
+`true`; field facet bucket values and collapse keys are JSON booleans.
+Range queries accept boolean bounds, but range facets are not supported.
+The default is `index: "none"`, as for `int`; `index: "range"` and
+`index: "match"` add the corresponding numeric indexes. For filtering on a
+boolean, `range` is the faster of the two, and the `_b`/`_bs` templates use it.
+
+Retrieved values are JSON booleans. Document columns have no boolean kind,
+so gRPC returns a `col_val` column holding one boolean value (or array) per
+document. Value expressions preserve booleans through selection (`min`,
+`max`, and choices between booleans); arithmetic, `sum`, and `avg` produce
+numbers. Summing a boolean counts true values.
+
+### Range types
+
+A range value is an object with an optional lower bound (`gte` or `gt`) and an
+optional upper bound (`lte` or `lt`); a missing side is an open end:
+
+```json
+{"id": "promo-7", "valid": {"gte": "2024-06-01", "lt": "2024-07-01"}, "price": {"gte": 10.5, "lte": 20}}
+```
+
+Ingest is strict about the endpoint type: `long_range` rejects fractional
+endpoints, and long or date endpoints outside the supported scalar domain
+fail the document. An exclusive bound moves one value inward (`{"gt": 5}` on
+`long_range` starts at 6). A lower bound above the upper bound, including an
+empty interval after exclusive bounds, fails the document.
+
+Luxir treats a partial date as its whole granule at ingest: `{"gte": "2024-06"}`
+starts at the first millisecond of June and `{"lte": "2024-06"}` ends at its
+last millisecond. `gt` excludes the whole named granule, as does `lt`.
+Elasticsearch and OpenSearch differ: when they ingest a range field, a
+partial-date `lte` such as `"2024-06"` does not extend to the end of the month. Dates without an explicit
+offset are evaluated in UTC at ingest. `date_range` uses millisecond precision;
+ISO strings, epoch milliseconds, `now`, and date math follow the scalar
+`date` rules. Query bounds follow the scalar range-query coercion rules.
+
+For `double_range`, an open lower end is `-Infinity` and an open upper end is
+`Infinity`; explicit infinities at those ends have the same meaning. NaN is
+rejected at ingest and in queries. `gt: "Infinity"` or `lt: "-Infinity"` makes
+an empty interval. Negative and positive zero remain distinct, with `-0.0`
+below `+0.0`. Long and date open ends extend to the int64 limits.
+
+Search results return `{"gte": lower, "lte": upper}`, omitting open ends.
+Date endpoints follow the request's date output mode: epoch milliseconds by
+default, ISO strings with `date_iso`, milliseconds with `date_ms`, or
+nanoseconds with `date_ns`. This applies to both ROWS and COLUMNS responses.
+
+Range fields require `column` (the default) and support `index: "none"`
+(the default) or `index: "range"` for an optional query index. They do not
+support `stored` or `index: "match"`. Multi-valued range fields are not
+supported yet.
+
+The [range query](query-reference.md#range-fields) supports `intersects`,
+`contains`, and `within`. `match` finds intervals containing a point value;
+a partial date matches intervals overlapping its granule. `multi_match`
+accepts explicitly named range fields and field weights;
+wildcard field selectors do not select range fields. Sort, facets, collapse,
+value expressions, and `any_of` are not supported on range fields.
 
 ### `text` versus `string`
 
@@ -116,13 +259,16 @@ The built-in templates are:
 
 | Suffix | Type and default behavior |
 |---|---|
+| `_nested` | Nested object path; structural, with no scalar value. |
 | `_s` | Indexed exact string with a column. |
 | `_sc` | Column-only exact string. |
 | `_ss`, `_ssc` | Multi-valued forms of `_s` and `_sc`. |
 | `_i`, `_is` | Integer column, single- or multi-valued. |
+| `_b`, `_bs` | Boolean column with a points index (`index: "range"`), single- or multi-valued. |
+| `_ip`, `_ips` | IP address terms, single- or multi-valued. |
 | `_f`, `_fs` | Float column, single- or multi-valued. |
 | `_d`, `_ds` | Double column, single- or multi-valued. |
-| `_dt`, `_dts` | Date column, single- or multi-valued. |
+| `_dt`, `_dts` | Date column with a points index (`index: "range"`), single- or multi-valued. |
 | `_p`, `_ps` | Geo point column with a points index (`index: "range"`), single- or multi-valued. |
 | `_t` | Unicode-word text with NFKC case folding, accent folding, English possessive removal, and KStem English stemming. The general-purpose text field. |
 | `_u` | Unicode-word text, case- and accent-sensitive. |
@@ -268,7 +414,8 @@ publication advances the schema generation.
 
 | Key | Meaning |
 |---|---|
-| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
+| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `decimal`, `boolean`, `ip`, `date`, `vector`, `geo_point`, `long_range`, `double_range`, `date_range`, `id` |
+| `scale` | `decimal` only, required from 0 to 18; inherited from `parent`. |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | `false`, `true`, `"set"`, or `"array"`; see [Multi-valued modes](#multi-valued-modes) |
@@ -283,7 +430,8 @@ publication advances the schema generation.
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
 | `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). |
-| `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
+| `reverse_map` | `nested` only; defaults to `true`. Store each child row's owner in segments written from now on; see [Declaring nested paths](nested.md#declaring-nested-paths). |
+| `ann` | `vector` only; approximate index codec and parameters. RaBitQ is the default; PQ requires explicit `codec:"pq"`. See [Index settings](vector-search.md#index-settings). |
 
 Every property is optional. Absent means "inherit from `parent`, else the
 type's default", and the schema you read back stays as sparse as the one you
@@ -312,7 +460,7 @@ Validation includes inherited ANN settings and variants.
 ### Multi-valued modes
 
 `multi` is inherited when omitted and defaults to `false` (one value).
-`true` selects the type's default: set for INT, FLOAT, DOUBLE, DATE, and
+`true` selects the type's default: set for INT, FLOAT, DOUBLE, DECIMAL, BOOLEAN, IP, DATE, and
 STRING; array for TEXT, VECTOR, and GEO_POINT. Explicit `"set"` and `"array"`
 select a mode. Array-only primary types reject `"set"`; ID is reserved for
 the single-valued `id` field.
@@ -328,7 +476,9 @@ the single-valued `id` field.
 Bare multi-valued numeric, date, and STRING fields sort by their minimum
 ascending and maximum descending in both modes. Per-document numeric reducers
 such as `min(f)`, `max(f)`, `count(f)`, `sum(f)`, and `avg(f)` consume the stored
-values. Default facets count each document once per bucket in either
+values; `count(f)` also counts STRING, ID and GEO_POINT values, so a set
+counts a repeated value once and an array counts each repeat. Default facets
+count each document once per bucket in either
 mode, even when several values fall in that bucket. Indexed STRING postings
 also contain each document once per term in both modes.
 
@@ -638,9 +788,10 @@ The primary and every variant must use types from the same group:
 
 | Group | Allowed types |
 |---|---|
-| Scalar | `text`, `string`, `int`, `float`, `double`, `date`. |
+| Scalar | `text`, `string`, `int`, `float`, `double`, `decimal`, `boolean`, `ip`, `date`. |
 | Vector | `vector`; every branch must resolve to the same positive `dims`. |
 | Geo | `geo_point`. |
+| Range | `long_range`, `double_range`, `date_range`. |
 
 ### Default bindings for variants
 
@@ -926,12 +1077,12 @@ field.) The resolved view is diagnostic, not a schema write body. It contains:
 
 | Property | Meaning |
 |---|---|
-| `generation` | Current schema generation; the initial default schema is generation `0`. |
+| `generation` | Current schema generation; the initial persisted schema is generation `1`. |
 | `fields` | Declared concrete fields and their variants; suffix-template instances are not listed. |
 | `fields.<f>.bindings` | `search` and `value`, each naming the effective physical field. |
 | `fields.<f>.representations` | Definitions keyed by `self` or variant label. |
 | Representation settings | `name`, `type`, `multi`, `index`, `column`, `stored`, `analyzer` (always the expanded definition; `analyzer_preset` adds the registered name when one was used), `normalizer`, effective `long_terms` for term-backed representations, plus `stored_resource` and vector settings when applicable. These describe the structures available to operations. |
-| `ann` (vector representations) | Effective ANN settings in the authored vocabulary, including defaults and inherited values. Contains `codec`, `nlist`, and only the selected codec's `pq` or `rabitq` object. Zero `nlist` and `pq.m` retain their automatic policies. ANN-only changes preserve introduction and coverage generations. |
+| `ann` (vector representations) | Effective ANN settings in the authored vocabulary, including defaults and inherited values. Contains `codec`, `nlist`, and only the selected codec's `pq` or `rabitq` object. Zero `nlist`, `pq.m` and `rabitq.bits` retain their automatic policies. ANN-only changes preserve introduction and coverage generations. |
 | `introduced_generation` | Start of this representation's current continuous availability. Redefining a representation or removing and re-adding its label starts a new introduction. |
 | `oldest_generation` | Minimum schema generation across all committed live segments, even those lacking this field; `null` for an empty index. |
 | `coverage_complete` | True for an empty index or when that minimum reaches the introduction generation. |
@@ -967,3 +1118,28 @@ Removing and reusing a name does not erase its old indexed values.
   or facet on whole values.
 - `english_possessive` and `kstem` are analyzer filters only; STRING
   normalizers accept `lowercase`, `nfkc_cf`, and `fold`.
+
+## Nested paths and qualified field names
+
+Declare nested paths and their fields by flat qualified names, for example
+`"items": "nested"` and `"items.color": "string"` in `fields`.
+Each intermediate component must be a nested path. Global suffix templates
+also work under paths: `lines_nested.color_s` needs no explicit declaration
+in the default schema. A nested path cannot declare scalar value settings,
+variants, indexing, columns or storage. Objects may contain nested paths
+recursively, up to 32 levels.
+
+A nested path's one setting is `reverse_map` (default `true`), described in
+[Declaring nested paths](nested.md#declaring-nested-paths). It can be changed
+on a live collection without reindexing.
+
+Dots separate path components. Each component starts with an ASCII letter
+and contains letters, digits or underscores. A physical name, including
+a generated `__variant` suffix, must fit in 127 bytes.
+
+Vector ANN overlays can be built on child fields using their qualified
+physical names, for example `vec.lines_nested.embedding_v`.
+
+Request field names are relative to their view: in the `items` view, `color`
+resolves to `items.color`. See [Nested documents](nested.md) for indexing,
+queries, operations on child rows, and limits.

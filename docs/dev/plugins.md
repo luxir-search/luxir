@@ -189,6 +189,8 @@ to `top_docs`, `fusion` and the facets. On the wire a plugin op is the `plugin` 
 The maker receives a `PluginOpContext` while the request is parsed and returns a
 `SearchOp` subclass allocated with `luxir::arenaCreate` in `ctx.req.arena`:
 
+- `view` is the operation's scoped reader pin. Pass it to `SearchOp(req, view, name)`
+  and to document emission; the request's primary reader can be in another space.
 - `node()` returns the request's node by reference. Its `pluginState<T>(name)`
   accesses the same state that query makers and HTTP handlers see.
 - `parseQuery(...)` lowers and validates a query against the op's `planning()`
@@ -199,7 +201,7 @@ The maker receives a `PluginOpContext` while the request is parsed and returns a
   create its calculator under the op's own, dispatch it per segment and receive
   the merged collector.
 - `addSubs(op)` parses the nested ops into `op.subOps`. They run over whatever
-  domain the op hands their calculators (`calcAll` with one `DomainHandle` per
+  domain the op hands their calculators (`acceptAll` with one `DomainHandle` per
   segment; an empty set, never null, for a segment with no documents), and may not
   declare their own `domain`.
 
@@ -313,20 +315,20 @@ Rules:
 - A collection whose persisted schema names a component this binary does not have fails to
   load with the "unknown ..." message; the node keeps serving its other collections.
 
-The example plugin registers a `reverse` filter (reverses token bytes, `normalizing`), a
+The example plugin registers an `example_reverse` filter (reverses token bytes, `normalizing`), a
 `strip_x` char filter (removes every `x` through `replace`) and the analyzer `example` =
-`whitespace` + char filter `strip_x` + filters `lowercase`, `reverse`:
+`whitespace` + char filter `strip_x` + filters `lowercase`, `example_reverse`:
 
 ```cpp
 void registerComponents(luxir::Registries& r) override {
-  r.analysis.addFilter("reverse", [](const luxir::api::AnalyzerComponent& def) {
+  r.analysis.addFilter("example_reverse", [](const luxir::api::AnalyzerComponent& def) {
     struct Factory : luxir::TokenFilterFactory {
       std::unique_ptr<luxir::TokenStream> create(std::unique_ptr<luxir::TokenStream> source) const override {
         return std::make_unique<ReverseFilter>(std::move(source));
       }
     };
     auto factory = std::make_unique<Factory>();
-    factory->name = "reverse";
+    factory->name = "example_reverse";
     factory->normalizing = true;
     return std::unique_ptr<luxir::TokenFilterFactory>(std::move(factory));
   });
@@ -346,6 +348,183 @@ void registerComponents(luxir::Registries& r) override {
 ```
 
 A schema then uses the plugin by name (`"analyzer": "example"`) or composes its components
-(`"analyzer": {"tokenizer": "whitespace", "filters": ["reverse"]}`).
+(`"analyzer": {"tokenizer": "whitespace", "filters": ["example_reverse"]}`).
 Text is fed to a chain with `TokenChain::setValue`, never `head.setValue`, so char filters
 always run.
+
+## Storage backends and layers
+
+`Registries::storage` (`src/luxir/store/StorageRegistry.h`) holds named storage
+backends and layers. `ram`, `fs` and `shared_fs` are built in and registered before plugins.
+
+- A **backend** builds the root `DirectoryFactory` from the node configuration. It
+  is selected by `--store.backend NAME`.
+- A **layer** wraps the factory built so far. Layers are selected by
+  `--store.layer NAME` (repeatable, innermost first) and sit between the backend and
+  the core wrappers: `checked_dir` and `read_only` stay outermost, so a mutation is
+  refused before any layer sees it.
+
+Both makers receive a `StorageContext`: the whole `LuxirConfig`, `params` (a
+`ParamReader` over only that component's options), and `reclaim`, the callback RAM
+backends call under memory pressure. The context's references are valid only for
+the maker call; copy any values the factory needs to retain.
+
+Pass options as `--store.option COMPONENT.KEY=VALUE`, where `COMPONENT` is the
+backend or layer name (`[a-z0-9_]+`) and `KEY` is non-empty. Missing components,
+keys, dots or equals signs fail parsing. Values that parse as JSON integers,
+doubles, booleans or quoted strings retain that type; everything else is a bare
+string. For example, `s3.bucket=logs` and `cache.bytes=10G` are strings,
+`cache.bytes=1048576` is an integer, and `--store.option 's3.bucket="123"'`
+preserves a numeric string (the shell quotes keep the JSON quotes intact).
+`getBytes()` accepts non-negative integers or strings using the same size syntax
+as CLI size options, with binary units (`KB` is 1024 bytes).
+
+After the makers return, `Collections` calls `rejectUnknown()` on their readers.
+An unknown key names its component and lists the keys the maker read; `ram` and
+`fs` take no parameters. Options for an unconfigured component fail startup and
+list the configured components. Repeated layers receive the same component's
+options, and each maker call validates them independently. Repeated assignments
+to a component key use the last value. Unknown backend or layer names list the
+registered names.
+
+```cpp
+void registerComponents(luxir::Registries& r) override {
+  r.storage.addBackend("s3", [](const luxir::StorageContext& ctx) {
+    return std::make_unique<S3DirFactory>(std::string(ctx.params.getString("bucket")), ctx.config.read_only);
+  });
+  r.storage.addLayer("cache", [](std::unique_ptr<luxir::DirectoryFactory> inner, const luxir::StorageContext& ctx) {
+    return std::make_unique<CacheLayer>(std::move(inner), ctx.params.getBytes("bytes", 1ULL << 30));
+  });
+}
+```
+
+A backend implements `DirectoryFactory` over two roots: `AUTHORITATIVE` for the
+portable `LAYOUT` and `t/` tree, and `NODE_PRIVATE` for local files such as
+`write.lock` and `replication.json`. `directory(root, path, options)` opens a
+relative path view without creating namespace entries; `children(root, path)`
+lists children, and `removeTree(root, path)` removes a subtree durably. Paths
+cannot escape their root. Collection names, catalogs and incarnations are engine
+logic over these views, not backend primitives.
+
+`memory()` exposes the backend's `StorageMemory` account when it has one. A view
+receives its opaque accounting scope in `ViewOptions::account`, and reopening
+must not charge the same bytes twice. `describe()` supplies one line for the
+startup log; `diskPath()` supplies a local path for disk statistics, or empty.
+FS reserves `node/` from authoritative views. The private root is `node/` for
+`fs` and `node/<id>/` for `shared_fs`.
+A backend must either honor `ctx.config.read_only` by opening without a lock,
+namespace creation or cleanup, or reject it. The read-only wrapper cannot undo
+side effects inside the maker; the built-in RAM maker rejects read-only.
+
+`exclusive()` defaults to false. Return true only while this process owns the
+whole authoritative store (private RAM, or FS with its store write lock). An
+exclusive startup adopts every catalog entry and cleans up abandoned trees.
+`DelegatingDirFactory` does not forward this method: a layer must explicitly
+forward it only if it preserves that guarantee. Incorrectly returning true can
+delete another node's data; returning false only costs availability. The core
+wrappers and the example `counting` layer forward it; `counting_ram` is exclusive.
+
+A layer derives from `DelegatingDirFactory` and overrides what it changes, usually
+`directory()` to hand out `DelegatingDirectory` subclasses. Both
+bases forward their other virtuals, including `createFile` with options, `expectSynced`,
+`publishFile`, `readPublished`, `deleteDurably`, `deletePrefix`, `sync`,
+`underlying`, `linkFile`, `openChecksum` and `capabilities`.
+Core wrappers that refuse or track mutations implement the bare interface;
+layers derive from the delegating bases. `ReadOnlyDirectory`, `ReadOnlyDirFactory`
+and `CheckedDirectory` therefore implement their interfaces explicitly. New pure
+virtuals require an implementation there; default methods call their own virtuals.
+`CheckedDirFactory` still delegates because it wraps views rather than policing
+namespace operations.
+
+Layers must be **byte-transparent**: the bytes at rest must be those the engine
+wrote, in a complete, durable namespace readable by the backend. FS `linkFile`
+reaches the source through `underlying()`, offline promotion opens `FSDirFactory`
+directly, and replication compares file digests. Observation, counting and caching
+fit this contract; encryption or compression at rest must be a backend, not a layer.
+
+Storage makers run before `PluginNodeState` is created. Keep storage state on the
+factory instance, shared with its views as needed. Once the node exists, its plugin
+state or routes can use `node.collections().storage().find<MyFactory>()` to reach
+that state through the core wrappers. `find<T>()` checks each factory with
+`dynamic_cast` and follows `inner()` to its delegate, returning null if absent.
+Repeated layers return the outermost matching type. The pointer is borrowed for
+the factory's lifetime; process-wide plugin objects must not retain it.
+
+Placement plugins call the engine hooks `LuxirNode::detachCollection(id, target)`
+and `LuxirNode::attachCollection(id, force)` to hand off writers or force a takeover.
+
+### Capabilities
+
+`Directory::capabilities()` reports what a backend can do: `HARD_LINK` (`linkFile`
+shares bytes), `ATOMIC_RENAME` (the backing store supports atomic name
+replacement), `DURABLE_SYNC` (`sync` persists bytes and names), `MEMORY_MAPPED`
+(`openFile` returns stable mapped bytes) and `REMOTE`. The default is none, which
+selects conservative paths: `reuseFiles` copies with `Directory::copyFile` instead of
+linking when `HARD_LINK` is absent. A wrapper that changes a property (for instance
+masks `HARD_LINK`) overrides `capabilities()`.
+
+### The example plugin
+
+`test/plugins/example` registers a `counting_ram` backend (RAM storage counting
+directory view opens by path) and a `counting` layer (counting file
+opens and creates). Each factory owns its counters; directory views share the
+layer's counters. `StorageExampleTest` reaches `CountingRamBackend` and
+`CountingLayer` through `find<T>()` and verifies that two nodes count independently.
+
+
+## Result decorators
+
+`Registries::hitDecorators` registers a maker receiving a `DecoratorContext`
+(request, query parse context, and original ranking queries with execution
+contexts) and a `ParamReader`. Return a shared `HitDecorator` with a unique output column name.
+Register during startup; the registry is frozen with the other registries.
+
+TopDocs and Fusion accept `decorate: {"registered_name": {params...}}` on the
+wire. JSON also accepts a registered name directly as a list key. Unknown names,
+non-object params, duplicate decorators and unknown params are request errors.
+Candidate Fusion sources cannot decorate; configure decoration on the Fusion.
+
+`HitDecorator::decorate(docs, rows, out, mr)` runs only over emitted rows, after
+paging. Each call receives a sorted segment run within a response batch, with
+`rows` mapping into the emission-order `docs` and `out` arrays. Calls for different
+runs may execute concurrently. Leave `out[row]` null when there is no value.
+Allocate response-owned strings and arrays using `mr`; do not retain stored-reader
+views past their callbacks. Columns flow through the ordinary ROWS, COLUMNS and
+ADAPTIVE placement and streaming paths.
+
+Keep mutable readers and forward-only iterators call-local: sorting is per batch,
+and a later ranked batch can contain lower document IDs. Immutable per-request
+plans may be shared with synchronization during initialization. Decorators cannot
+change membership, order or scores. The output name must not collide with another
+extra column. Decorators are also invoked for nested top-doc lists, collapsed
+heads, and diversified lists.
+
+### Inspecting the ranking queries
+
+In the maker, call `source.query->visit(visitor, source.context)` for each entry
+in `DecoratorContext::queries`; a null query means browse. `QueryVisitor`
+(`luxir/query/QueryVisitor.h`) reports indexed bytes through `term(field, text,
+boost)`. `sub(occur, parent)` chooses the visitor for a composite's children or
+returns null to skip them; the default skips MUST_NOT. Inspectors interested only
+in ranking terms should also skip FILTER. `leaf(query)` means the term picture
+is incomplete. Plugin queries can override the protected `Query::visitImpl`
+to participate without exposing their concrete tree.
+
+Inspection runs only during serial planning, in the maker. It may expand fuzzy
+terms, cache the expansion shared with execution, and throw the request's
+multi-term budget errors. Never call visit from concurrent `decorate()` calls.
+Term views borrow query/context storage; copy what decorate needs into the
+decorator. The example `ranking_terms` decorator does this (it lists request
+ranking terms, not the terms matched by each hit).
+
+Traversal preserves raw Boolean occurrences and authored dis_max disjuncts.
+Boosts mirror logical validation and execution: filter children reset the
+multiplier; rescore and min_score inspect their matching child at multiplier 1.
+Rescore value expressions are not term queries and are not inspected. Combined
+field weights multiply term frequency before BM25 saturation; the reported
+path/field/term product is not a linear final-score contribution. Phrase terms
+omit positions. Explicit TermInSet terms are enumerable in query-size time.
+ALL and NONE report no terms and no leaf. Other opaque queries report leaf.
+Case-insensitive MATCH shows execution's representation: leaf until a scored
+weight has populated the shared case-variant rewrite, then its variant terms.
+Inspection never forces that rewrite or changes later unscored execution.

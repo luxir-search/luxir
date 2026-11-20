@@ -37,9 +37,15 @@ Content-Type: application/json
   "request_id": "load-42",
   "update_version": 1,
   "status": "ok",
-  "ids": ["b1", "b2"]
+  "ids": ["b1", "b2"],
+  "took_us": 2140
 }
 ```
+
+`took_us` is the server-side wall time, in microseconds, from receipt of the
+complete request message until its response is ready to serialize, including
+parsing and any commit and replica wait. It excludes serializing, queueing,
+and sending the response.
 
 One request can add documents, delete by id, and commit. The request fields
 are:
@@ -130,8 +136,9 @@ Content-Type: application/x-ndjson
 {"request_id":"nonfiction","update_version":4,"status":"ok"}
 ```
 
-The response is NDJSON too, one update response per completed group. The URL
-collection is the default; a control object can set
+The response is NDJSON too, one update response per completed group. NDJSON
+stream acknowledgments do not carry `took_us`. The URL collection is the
+default; a control object can set
 `"collection":"archive"` for the following group, so one connection can feed
 several collections.
 
@@ -170,8 +177,8 @@ An empty commit object commits immediately and the response waits for
 publication. A request that fails as a whole (`status: "error"`) runs no
 immediate commit, though a positive `commit_within_ms` it set may still
 publish other updates. The response's optional `commit` field identifies the resulting
-snapshot as the token `"9f3c2a71d04be6a5:42"` (`incarnation:index_gen`, where the
-incarnation is 16 hex digits). The
+snapshot as the token `"19a38a9f000:42"` (`incarnation:index_gen`, where the
+incarnation is an 11-digit hexadecimal millisecond timestamp). The
 incarnation is part of the identity: deleting and recreating a collection changes its incarnation. Updates acknowledged before publication
 (including deferred commits) omit it. A forced merge returns the final merged
 snapshot's id. An NDJSON URL EOF commit always returns

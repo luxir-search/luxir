@@ -81,8 +81,8 @@ Host: localhost:9500
 }
 ```
 
-`follower` is the name the writer knows this follower by, its host and HTTP
-port. Set `--replication.follower-id` when hostnames are not unique.
+`follower` is the name the writer knows this follower by: its
+[node identity](operations.md#node-identity), configured with `--node.id`.
 
 The examples below use these two nodes.
 
@@ -224,6 +224,9 @@ Pull: 1 installed, 0 failed, transferred=263 reused=0
 
 Re-running it is incremental, and may use a different source. Each collection
 is a consistent snapshot, but the collections are not captured at one instant.
+A failed collection does not block installation of other ready collections.
+Names whose replacement is not ready keep their old binding only if the source
+has not assigned that incarnation elsewhere; otherwise they are unavailable.
 
 The copy is a follower directory. Start it as a follower to catch up with the
 source, or promote it to restore an independent writer:
@@ -305,6 +308,21 @@ files are dropped first; if space is still short, writes fail with
 Per-collection storage usage is in `_stats?collections=true`; node storage usage
 and its limit are in `_stats` under `memory.storage_ram`.
 
+Source discovery includes each tenant's catalog revision. A follower stages
+new incarnations and applies the largest safe subset of the mapping with one
+catalog CAS, then updates each name's lookup binding. A failed or running
+download does not block unrelated ready collections, renames, swaps or removals.
+A rename or swap reuses existing incarnations without downloading their files.
+A lagging name keeps its old incarnation only if the source has not assigned it
+to another name; otherwise the name is unavailable until its data is ready.
+During a swap, lookups may see either binding per name, and both names may briefly
+select the same collection.
+
+`node/replication.json` records transfer history by tenant and incarnation;
+names are a separate mapping. After a restart, the local CATALOG selects the
+last durable mapping, and reserved downloads can resume. Promotion uses that
+mapping, including any renames and swaps already applied.
+
 ## Reference
 
 All replication settings use `--replication.` (configuration keys use underscores).
@@ -312,7 +330,6 @@ All replication settings use `--replication.` (configuration keys use underscore
 | Setting | Default | Purpose |
 |---|---:|---|
 | `source` | empty | Source HTTP URL; `--replicate-from` is shorthand |
-| `follower-id` | host:port | Name the source knows this follower by |
 | `tenants` | empty (all) | Comma-separated tenant subscription |
 | `peers` | empty | Comma-separated nodes serving file copies, tried before the source |
 | `max-acknowledgments` | 262144 | Node-wide follower/collection acknowledgment budget |
@@ -335,7 +352,7 @@ A source tracks up to 4096 live followers and `max-acknowledgments`
 
 | Endpoint | Contract |
 |---|---|
-| `GET /_replication/watch?since=CURSOR&timeout_ms=30000&follower=ID` | Long-polls the catalog `{boot, cursor, collections}`, one `{tenant, collection, commit, manifest_xxh3, available}` entry per collection. Repeat `tenant=` to restrict it; pass the returned cursor back. |
+| `GET /_replication/watch?since=CURSOR&timeout_ms=30000&follower=ID` | Long-polls the catalog `{boot, cursor, tenants, collections}`, one `{tenant, collection, commit, manifest_xxh3, available}` entry per collection and `{tenant, revision}` per tenant. Repeat `tenant=` to restrict it; pass the returned cursor back. |
 | `GET /tenants/TENANT/collections/COLLECTION/_snapshot` | Pins the current snapshot; binary manifest and `X-Luxir-Commit`. Add `?format=json` to inspect files, sizes and digests. |
 | `GET /tenants/TENANT/collections/COLLECTION/_snapshot/files/NAME?commit=TOKEN` | A file from a pinned snapshot; single byte Range supported. 410 `snapshot_expired` when the pin is gone. |
 | `GET /tenants/TENANT/collections/COLLECTION/_snapshot/files/NAME?size=BYTES&xxh3=HEX16` | The file with that identity from the current or a pinned snapshot, without pinning; 404 `file_not_held` otherwise. Peers serve followers this way. |

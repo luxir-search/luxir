@@ -31,6 +31,8 @@ inline std::vector<FileDescriptor> filesOf(const api::IndexInfo& info) {
     for (const auto& aux : seg.overlays) append(aux.files);
   }
   for (const auto& aux : info.aux_indexes) append(aux.files);
+  const auto& schema = info.schema_file;
+  result.push_back({std::string(schema.name), schema.size, schema.xxh3});
   return result;
 }
 } // namespace luxir

@@ -131,7 +131,8 @@ void CommitWaits::awaitReplicas(ReplicaWait spec, std::stop_token stop, std::fun
   admit(std::move(wait), stop);
 }
 
-void CommitWaits::registered(const CollectionId& name, const std::shared_ptr<Collection>& collection) noexcept {
+void CommitWaits::registered(const CollectionId& name, const std::shared_ptr<Collection>& collection, uint64_t revision) noexcept {
+  unused(revision);
   try {
     Pending ready;
     {
@@ -143,6 +144,25 @@ void CommitWaits::registered(const CollectionId& name, const std::shared_ptr<Col
     }
     finish(ready);
   } catch (...) { LOG_ERROR("Commit wait registration notification failed"); }
+}
+
+void CommitWaits::remapped(std::string_view tenant, uint64_t revision, std::span<const Binding> changes) noexcept {
+  unused(tenant, revision);
+  try {
+    Pending ready;
+    {
+      std::lock_guard lock(mutex);
+      for (const auto& change : changes) {
+        if (change.collection) {
+          auto& state = collections[change.id];
+          state = {change.collection, {}, 0, {}};
+          state.refresh();
+        } else collections.erase(change.id);
+      }
+      for (const auto& change : changes) checkLocked(change.id, ready, !change.collection);
+    }
+    finish(ready);
+  } catch (...) { LOG_ERROR("Commit wait mapping notification failed"); }
 }
 
 void CommitWaits::updated(const CollectionId& name, const Collection& collection) noexcept {
@@ -159,7 +179,8 @@ void CommitWaits::updated(const CollectionId& name, const Collection& collection
   } catch (...) { LOG_ERROR("Commit wait publication notification failed"); }
 }
 
-void CommitWaits::removed(const CollectionId& name) noexcept {
+void CommitWaits::removed(const CollectionId& name, uint64_t revision) noexcept {
+  unused(revision);
   try {
     Pending ready;
     {

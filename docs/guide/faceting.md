@@ -227,10 +227,11 @@ Distinct counting uses the request memory budget. Exceeding the budget fails
 the request; counts never become estimates or document counts. Use
 `count_unit: "docs"` when document counts are the intended measure.
 
-Distinct counting supports STRING/ID and INT/DATE field facets, numeric/date
+Distinct counting supports STRING/ID and numeric/boolean/date field facets, numeric/date
 range facets, and query facets, including overlapping query buckets and nested
 operations. TEXT field facets and metric sorts with distinct counts remain
-unsupported.
+unsupported. FLOAT/DOUBLE can be facet fields, but cannot be distinct key fields;
+the key types are the same as for `collapse`.
 
 ## Field facets
 
@@ -292,6 +293,7 @@ the facet's `limit: 10` returns up to ten categories.
 | `ops` | Per-bucket sub-facets, metrics, or `top_docs` / `fusion` lists. |
 | `selected` | Values that refine the result set and stay visible as buckets. See [Multi-select navigation](#multi-select-navigation). |
 | `selection_mode` | `any` (default) or `all`: match any selected value, or require every one. |
+| `term_filter` | String and ID fields only. Restricts which terms can become buckets; counts stay exact. See [Filtering bucket terms](#filtering-bucket-terms). |
 
 String and ID facets return buckets in count-descending order, with bucket
 value ascending as a deterministic tie break. Default bucket counts are
@@ -300,16 +302,73 @@ document counts in either [multi-valued mode](schema.md#multi-valued-modes).
 matches in the current result set, which keeps a sidebar stable while the user
 narrows a search.
 
-Integer and date fields facet on each distinct column value. Text fields facet
-on analyzed terms, not on the stored text: a facet on `body_t` returns
-indexed words, while a facet on `category_s` returns whole category values.
-Text facets also accept `mincount: 0`, while integer and date facets require
-a positive value when set. Use a range facet when numbers should be bucketed
-rather than enumerated.
+Integer, floating-point, boolean, and date fields facet on each distinct column value.
+Boolean bucket ids are JSON `false` and `true`, also accepted in `selected`;
+boolean fields do not support range facets.
+FLOAT/DOUBLE keep `-0.0` and `0.0` in separate buckets, matching exact query
+equality; all NaNs share one bucket. HTTP JSON renders NaN and infinities as
+`null`, so those bucket labels cannot be sent back as selections.
+
+Text fields facet on analyzed terms, not on the stored text: a facet on
+`body_t` returns indexed words, while a facet on `category_s` returns whole
+category values. Text facets also accept `mincount: 0`, while numeric, boolean, and date
+field facets require a positive value when set. Use a range facet when numbers
+should be bucketed rather than enumerated.
 
 A string facet needs indexed terms and a column. Facets return the term as
 stored. For fields with multiple representations, see
 [Field variants](#field-variants).
+
+### Filtering bucket terms
+
+`term_filter` limits which terms of a string or ID field can become buckets,
+for example an autocomplete over category names or a facet over the values a
+caller is allowed to see. It is not a query filter: every term is still
+counted in the facet's domain, so the counts of the remaining buckets are
+exactly what they would be without the filter, and `limit` applies to the
+filtered terms (`limit: 1` with `"prefix": "b"` returns the best `b` term, not
+nothing because an `a` term ranked first).
+
+```json
+{
+  "field": "category_s",
+  "limit": 10,
+  "term_filter": {"prefix": "sci", "exclude": ["science-fiction-misc"]}
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `prefix` | Keep terms starting with this prefix. |
+| `regex` | Keep terms matching this regular expression in full, with [regex query](query-reference.md) syntax. |
+| `exclude_regex` | Drop terms matching this regular expression in full. |
+| `include` | Keep only these exact terms. An empty list is unset. |
+| `exclude` | Drop these exact terms. |
+| `partition`, `num_partitions` | Keep terms whose stable hash modulo `num_partitions` equals `partition`. Requests for partitions `0` to `num_partitions - 1` together return every term exactly once, so a client can page through a very large term set. The hash is 64-bit FNV-1a over the indexed term bytes. |
+
+Every condition that is set must hold. Literals are matched the way the field
+indexes terms: `prefix`, `include`, and `exclude` are normalized like the same
+values in a prefix or `any_of` query, `regex` and `exclude_regex` are compiled
+like a [regex query](query-reference.md) (field folding per character), and ID
+fields use them verbatim. A `regex` whose literal start is longer than a field
+keeps of a long value matches every term with the kept prefix, as the regex
+query does. Otherwise both regexes test a long value's indexed bytes (an
+`exclude_regex` never widens, since that would drop terms it does not match),
+and the response carries a `fitted_terms` warning when that can happen.
+
+A `prefix`, the literal start of a `regex`, and the `include` and `exclude`
+lists resolve to ranges of terms once per request, and bucket selection walks
+only those ranges. The rest of a regex, `exclude_regex`, and partitions read
+each candidate term, so they cost more on a high-cardinality field.
+
+The filter changes only the ordinary buckets:
+
+- `missing` still counts every document in the domain without a value.
+- `mincount: 0` pads with zero-count terms that pass the filter.
+- `selected` buckets are always returned, whether or not they pass the filter.
+- Sub-operations and nested facets run on the buckets that pass.
+
+`term_filter` is rejected on numeric, boolean, date, and text fields.
 
 ## Expression metrics
 
@@ -324,11 +383,18 @@ The aggregates are `avg`, `sum`, `min`, `max`, `cardinality`, `percentile`, and
 `percentile_rank`. Their value arguments use the same expression language as
 [sort expressions](searching.md#sorting):
 arithmetic, parentheses, `def`, unary math, and per-document array reducers.
+`sum(count(field))` counts values, like Elasticsearch `value_count`, for
+numeric, boolean, date, STRING, ID and GEO_POINT fields alike.
 A composite metric is a single expression:
 
 ```json
 "weighted_price": "sum(price_f * qty_i) / sum(qty_i)"
 ```
+
+Bucket expressions also support comparisons, `&&`, `||`, and `if`/`?:` with
+the same [conditional semantics](searching.md#sort-expressions-in-detail) as
+document expressions. For example, `sum(price_f) > 0 ? log(sum(price_f)) : 0`
+avoids a math-domain failure for a non-positive sum.
 
 Distinct counts, percentiles, and the percentage of prices at or below a bound
 are scalar metrics too:
@@ -388,7 +454,7 @@ evaluated independently for each bucket and returned beside the bucket:
       "val": "hardcover",
       "count": 8,
       "average_price": 24.50,
-      "lowest_price": 15.00
+      "lowest_price": 15.0
     }
   ]
 }
@@ -414,7 +480,7 @@ bucket whose metric is missing or failed sorts last either way. See
 
 The typing rules:
 
-- `cardinality` accepts numeric or date expressions and indexed STRING/ID
+- `cardinality` accepts numeric, boolean, or date expressions and indexed STRING/ID
   columns, and flattens multi-valued inputs.
 - Other aggregates require one scalar per document. Reduce multi-valued
   columns first: `avg(avg(prices_fs))` averages each document's prices,
@@ -436,6 +502,9 @@ The typing rules:
   `cardinality` and `percentile_rank` return plain numbers. `sum` requires numeric values.
   Multiplication, division, unary minus, and unary math turn a date into a
   plain number.
+- Decimal `avg` and `percentile` keep their scale, like `min`, `max`, and
+  `sum`. Their results are doubles, in raw units under `decimal_scaled`.
+  `percentile_rank` uses a value-unit bound and returns a percentage in either mode.
 - For a bare FLOAT column, `percentile_rank` rounds its bound to FLOAT,
   matching range queries. Expression inputs use a double bound.
 
@@ -443,7 +512,8 @@ The typing rules:
 
 `cardinality` is exact up to `threshold` distinct values, then switches to a
 HyperLogLog estimate with a standard error of about 1.6% at the default
-threshold (0.4% at 40000). A larger threshold extends the exact phase and uses
+threshold (0.4% at 40000). For indexed STRING/ID inputs, the result may be exact
+beyond the threshold. A larger threshold extends the sketch's exact phase and uses
 more memory; 0 estimates from the first value.
 
 `percentile` is exact for fewer than 5 x `compression` values (500 by
@@ -726,9 +796,11 @@ a span; one widening bound alone cannot define an empty histogram.
 
 The grid is independent of the matching minimum:
 
-- For INT, FLOAT and DOUBLE fixed gaps, fences are `origin + k * gap` for a
+- For INT, DECIMAL, FLOAT and DOUBLE fixed gaps, fences are `origin + k * gap` for a
   global integer `k`; default `origin` is 0. Floating fences use the field's
   encoded representation, so rounding does not shift the grid with the query.
+  Decimal gaps and origins must be exact at the field's scale; `decimal_scaled`
+  interprets them in raw integer units.
 - For DATE fixed gaps, `origin` is a wall-clock phase in the facet zone,
   expressed in integer field units (`ms` or `ns`). For an ms field,
   `gap: 86400000` and `origin: 21600000` start days at 06:00 local, including DST days. Luxir
@@ -946,7 +1018,7 @@ POST /collections/authors/_search
 The document list holds Asher's three books, while the facet still shows all
 three authors. Selection uses the facet's resolved representation for both
 normalization and refinement, so a returned bucket value can be sent back as
-a selection.
+a selection, except for non-finite floating values rendered as JSON `null`.
 
 `selection_mode: "all"` requires every selected value instead of any of them,
 and then the facet's own buckets are counted over that strict set too.

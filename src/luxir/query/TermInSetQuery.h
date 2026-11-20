@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <format>
 #include <span>
+#include <string>
 #include <string_view>
 
 #include "MultiTermQuery.h"
@@ -38,6 +40,13 @@ public:
 
   std::span<const std::string_view> getTerms() const { return terms; }
 
+  bool capsExpansions() const override { return false; }
+
+  std::string describe() const override {
+    return std::format("terms query of {} terms on field '{}'",
+                       terms.size(), field);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
@@ -50,6 +59,8 @@ public:
 
   FilteredTermsEnum* createFilteredEnum(MemPool& pool,
                                         TermsEnum& te) override;
+
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
 };
 
 } // namespace luxir

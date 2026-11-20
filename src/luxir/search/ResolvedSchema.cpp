@@ -10,11 +10,11 @@ namespace luxir {
 std::string ReaderManager::resolvedSchema() {
   auto current = snapshot();
   auto schema = current->schema;
-  std::optional<uint64_t> oldest;
+  std::optional<api::SchemaVersion> oldest;
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(current->bytes, arena);
   for (const auto& seg : info.segments) {
-    if (seg.live_docs > 0) oldest = oldest ? std::min(*oldest, seg.schema_gen) : seg.schema_gen;
+    if (seg.live_docs > 0) oldest = oldest ? std::min(*oldest, seg.schema.version) : seg.schema.version;
   }
   auto fields = schema->signatures();
   using Json = glz::generic_sorted_u64;
@@ -23,6 +23,13 @@ std::string ReaderManager::resolvedSchema() {
   result["fields"] = Json::object_t{};
   for (const auto& [name, signature] : fields) {
     auto& logical = result["fields"][signature.logicalName];
+    auto* structural = schema->physical(name);
+    if (structural->type() == FieldType::NESTED) {
+      logical["type"] = "nested";
+      logical["reverse_map"] = ((const NestedFieldType*)structural)->reverseMap;
+      logical["introduced_generation"] = schema->introduction(name);
+      continue;
+    }
     for (auto [name, op] : {std::pair{"search", OpClass::SEARCH}, {"value", OpClass::VALUE}}) {
       try {
         logical["bindings"][name] = schema->resolveFor(signature.logicalName, op).physicalName;
@@ -66,11 +73,11 @@ std::string ReaderManager::resolvedSchema() {
     }
     if (!signature.properties.contains("analyzer")) rep["analyzer"] = nullptr;
     if (!signature.properties.contains("normalizer")) rep["normalizer"] = nullptr;
-    uint64_t introduced = schema->introduction(name);
-    rep["introduced_generation"] = introduced;
+    auto introduced = schema->introductionVersion(name);
+    rep["introduced_generation"] = introduced.generation();
     // Include segments that LACK this physical name. Looking only at segments
     // containing it would hide exactly the coverage gap this view describes.
-    if (oldest) rep["oldest_generation"] = *oldest;
+    if (oldest) rep["oldest_generation"] = oldest->generation();
     else rep["oldest_generation"] = nullptr;
     rep["coverage_complete"] = !oldest || *oldest >= introduced;
   }

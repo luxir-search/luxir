@@ -36,6 +36,12 @@ run_options=(--rm --init -i --cap-add=SYS_PTRACE --user "$(id -u):$(id -g)"
   --env "HOME=/workspace/luxir/build/container-cache/$(id -u)/home"
   --env LUXIR_CACHE_DIR=/luxir-cache
   --env CCACHE_DIR=/luxir-cache/container-ccache)
+# A linked worktree's .git names its repository by absolute host path. Mount the
+# repository there so Git works in the container (build metadata, packaging).
+if git_dir=$(git -C "$repo_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) &&
+   [[ $git_dir != "$repo_dir"/* ]]; then
+  run_options+=(--mount "type=bind,source=$git_dir,target=$git_dir")
+fi
 if [[ -t 0 && -t 1 ]]; then
   run_options+=(-t)
 fi

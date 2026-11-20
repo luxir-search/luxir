@@ -8,7 +8,7 @@
 
 namespace luxir {
 namespace api { struct IndexInfo; }
-class PostingsReader;
+class SegmentCore;
 
 // Owning snapshot identity for asynchronous completion and synchronous commits.
 struct CommitId {
@@ -16,8 +16,8 @@ struct CommitId {
   uint64_t index_gen = 0;
   std::string token() const;
   static CommitId parse(std::string_view token);
-  // A collection identity: 64 random bits as 16 lowercase hex digits. It also
-  // names the incarnation's directory.
+  // Standalone writers use a process-monotonic timestamp. Managed collections
+  // allocate their 11-digit hex timestamp ids in the tenant catalog.
   static std::string newIncarnation();
   static bool validIncarnation(std::string_view value);
   auto operator<=>(const CommitId&) const = default;
@@ -28,19 +28,22 @@ struct CommitId {
 struct CommitSnapshot {
   using Bytes = std::shared_ptr<const std::vector<std::byte>>;
   Bytes bytes;
-  std::shared_ptr<Schema> schema;
+  std::shared_ptr<Schema> schema; // null only while a transport snapshot awaits its files
   CommitId id;
   uint64_t commitTime;
   std::vector<FileDescriptor> files;
   bool populated; // some segment has a live document
   uint64_t digest; // xxh3-64 of `bytes`: announcements bind a token to it
-  // The publisher's open PostingsReaders, by manifest segment order (null
+  // The publisher's open segment cores, by manifest segment order (null
   // where it has none): a reader opening this snapshot shares them rather
   // than mapping those segments again. Weak, so a pinned snapshot keeps no
   // segment mapped. Empty when the snapshot came from bytes (a replica's).
-  std::vector<std::weak_ptr<PostingsReader>> openReaders = {};
+  std::vector<std::weak_ptr<SegmentCore>> openCores = {};
 
-  static std::shared_ptr<const CommitSnapshot> fromBytes(Bytes bytes);
+  std::string manifestName() const;
+  // Transport can decode the inventory before the schema file has arrived.
+  // Local publishers resolve the schema before opening readers.
+  static std::shared_ptr<const CommitSnapshot> fromBytes(Bytes bytes, std::shared_ptr<Schema> schema = {});
   static uint64_t digestOf(const std::vector<std::byte>& bytes);
   // A digest's text form on the wire: 16 lowercase hex digits.
   static std::string digestText(uint64_t digest);

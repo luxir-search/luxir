@@ -11,18 +11,22 @@
 #include "luxir/index/IntColWriter.h"
 #include "luxir/index/PointsWriter.h"
 #include "luxir/schema/ValCoerce.h"
+#include "luxir/schema/RangeBounds.h"
 #include "luxir/util/geo.h"
+#include "luxir/util/NumericUtils.h"
 
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <array>
+#include <optional>
 #include <ranges>
 #include <vector>
 
 using namespace luxir;
 namespace luxir::handler {
 
-// RANGE flush adds this 16-byte-per-value peak outside inverter.pool, so the
+// Numeric indexing adds this 16-byte-per-value peak outside inverter.pool, so the
 // inverter autoflush cap must leave headroom for the transient sort array.
 struct FlushPoint {
   int64_t value;
@@ -30,6 +34,54 @@ struct FlushPoint {
 };
 
 static_assert(sizeof(FlushPoint) == 16);
+
+inline std::vector<FlushPoint> collectNumericPoints(
+    Inverter& inverter, LongStream& values, DocStream& docs, int64_t count,
+    IntStream* lengths = nullptr) {
+  std::vector<FlushPoint> points;
+  points.reserve((size_t)count);
+  inverter.noteFlushWorkspace(points.capacity() * sizeof(FlushPoint));
+  values.visitValues(inverter.pool, [&](int64_t value) { points.push_back({value, 0}); });
+  std::optional<IntStream::Reader> sizes;
+  if (lengths) sizes.emplace(*lengths, inverter.pool);
+  size_t index = 0;
+  docs.forEachDoc(inverter.pool, [&](int32_t docid) {
+    int32_t length = sizes ? sizes->next() : 1;
+    assert(length >= 0);
+    for (int32_t i = 0; i < length; i++) {
+      assert(index < points.size());
+      points[index++].docid = docid;
+    }
+  });
+  assert(index == points.size());
+  assert(!sizes || sizes->eof());
+  return points;
+}
+
+inline void writeNumericPostings(PostingsWriter& postingsWriter,
+                                 PostingsWriter::IndexFieldInfo& fieldInfo,
+                                 std::vector<FlushPoint>& points) {
+  sortPointsByValueDocid(std::span<FlushPoint>(points));
+  TextWriter writer(postingsWriter);
+  writer.startField(&fieldInfo);
+  size_t begin = 0;
+  while (begin < points.size()) {
+    auto term = encodeNumericTerm(points[begin].value);
+    char packed[PackedTerm::getMemSize(8)];
+    PackedTerm::write(packed, term.data(), (uint32_t)term.size());
+    writer.startTerm(PackedTerm(packed));
+    size_t end = begin;
+    int32_t previousDoc = -1;
+    while (end < points.size() && points[end].value == points[begin].value) {
+      int32_t doc = points[end++].docid;
+      if (doc != previousDoc) writer.addDoc(doc, 1);
+      previousDoc = doc;
+    }
+    writer.endTerm(PackedTerm(packed));
+    begin = end;
+  }
+  writer.endField();
+}
 
 inline void writePoints(PostingsWriter& postingsWriter,
                         PostingsWriter::IndexFieldInfo& fieldInfo,
@@ -39,6 +91,16 @@ inline void writePoints(PostingsWriter& postingsWriter,
   PointsWriter writer(*output, PointsWriter::Options{});
   for (const auto& point : points) writer.addPoint(point.value, point.docid);
   auto data = writer.finish();
+  fieldInfo.pointsLoc = data.pointsLoc;
+  fieldInfo.pointsMetaOff = data.pointsMetaOff;
+}
+
+inline void writeRangePoints(PostingsWriter& postingsWriter,
+                             PostingsWriter::IndexFieldInfo& fieldInfo,
+                             std::vector<BasicBKDWriter<BKDInt64Traits>::Point>& points) {
+  auto output = postingsWriter.getOutputStream();
+  BasicBKDWriter<BKDInt64Traits> writer(*output);
+  auto data = writer.write(points);
   fieldInfo.pointsLoc = data.pointsLoc;
   fieldInfo.pointsMetaOff = data.pointsMetaOff;
 }
@@ -69,15 +131,9 @@ class IntColHandler : public Inverter::IndexHandler {
   int32_t numVals = 0;
 
 public:
-  IntColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
-    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType), longStream(inverter.pool),
+  IntColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space), longStream(inverter.pool),
       docsWithVal(inverter.pool) {
-  }
-
-  IntColHandler(Inverter& inverter, PackedTerm fieldName, const std::shared_ptr<FieldType>& fieldType,
-                IndexHandler& parent)
-    : IndexHandler(fieldName, fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
-    unused(parent);
   }
 
   ~IntColHandler() override = default;
@@ -113,7 +169,7 @@ public:
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
     // TODO: move this to postingsWriter method
-    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(space, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
@@ -124,13 +180,18 @@ public:
   void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
     auto& tmpPool = MemPool::threadLocal();
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-    auto full = numVals >= postingsWriter.getMaxDoc();
+    auto full = numVals >= postingsWriter.getMaxDoc(space);
+
+    if (fieldType->indexed()) {
+      auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals);
+      writeNumericPostings(postingsWriter, fieldInfo, points);
+    }
 
     // push values
     {
       auto outputPtr = postingsWriter.getOutputStream();
       IntColWriter writer(*outputPtr,
-                          FieldType::sortsByIntColumn(fieldType->type()));
+                          FieldType::isNumericColumn(fieldType->type()));
       // When full, values are already in doc order and the column is written dense (no docs-with-field
       // bitset, see finishDense below); otherwise values are rank-addressed through the bitset.
       // TODO: a docid-indexed encoding for mostly-full columns would need a missing marker per doc.
@@ -149,7 +210,8 @@ public:
       if (fieldType->type() == FieldType::GEO_POINT) {
         std::vector<BKDWriter::Point> points;
         points.reserve((size_t)numVals);
-        inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point));
+        inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point)
+            + BKDWriter::workspaceBytes(points.capacity()));
         longStream.visitValues(inverter.pool, [&](int64_t value) {
           points.push_back({geo::unpackLatitude(value),
                             geo::unpackLongitude(value), 0});
@@ -162,18 +224,7 @@ public:
         assert(pointIndex == points.size());
         writeGeoPoints(postingsWriter, fieldInfo, points);
       } else {
-        std::vector<FlushPoint> points;
-        points.reserve((size_t)numVals);
-        inverter.noteFlushWorkspace(points.capacity() * sizeof(FlushPoint));
-        longStream.visitValues(inverter.pool, [&](int64_t value) {
-          points.push_back({value, 0});
-        });
-        size_t pointIndex = 0;
-        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
-          assert(pointIndex < points.size());
-          points[pointIndex++].docid = docid;
-        });
-        assert(pointIndex == points.size());
+        auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals);
         writePoints(postingsWriter, fieldInfo, points);
       }
     }
@@ -209,8 +260,8 @@ class MultiIntColHandler : public Inverter::IndexHandler {
 
 public:
   MultiIntColHandler(Inverter& inverter, const std::string_view& fieldName,
-                     const std::shared_ptr<FieldType>& fieldType)
-    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType), longStream(inverter.pool),
+                     const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space), longStream(inverter.pool),
       lengthStream(inverter.pool), docsWithVal(inverter.pool) {
   }
 
@@ -250,8 +301,7 @@ public:
   }
 
   void index(Inverter& inverter, std::span<const int64_t> vals) override {
-    // int64 -> any int-column type never throws, so the lazy transform is safe
-    // under the validate-before-mutate contract.
+    // indexMulti materializes every coerced value before appending any of them.
     indexMulti(inverter, vals | std::views::transform([this, &inverter](int64_t v) {
       return fieldType->coerceColInt64(coerce::scalarVal(v), std::string_view(fieldName),
                                        inverter.coerceContext);
@@ -291,7 +341,7 @@ public:
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
     // TODO: move this to postingsWriter method
-    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(space, fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
@@ -302,7 +352,12 @@ public:
   void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
     auto& pool = MemPool::threadLocal();
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-    auto full = numDocs >= postingsWriter.getMaxDoc();
+    auto full = numDocs >= postingsWriter.getMaxDoc(space);
+
+    if (fieldType->indexed()) {
+      auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals, &lengthStream);
+      writeNumericPostings(postingsWriter, fieldInfo, points);
+    }
 
     // push values
     {
@@ -313,10 +368,37 @@ public:
     }
 
     if (fieldType->rangeIndexed()) {
-      if (fieldType->type() == FieldType::GEO_POINT) {
+      if (fieldType->type() == FieldType::INTERVAL) {
+        // Values alternate min, max; each doc holds length / 2 points.
+        std::vector<BasicBKDWriter<BKDInt64Traits>::Point> points;
+        points.reserve((size_t)numVals / 2);
+        inverter.noteFlushWorkspace(points.capacity() * sizeof(BasicBKDWriter<BKDInt64Traits>::Point)
+            + BasicBKDWriter<BKDInt64Traits>::workspaceBytes(points.capacity()));
+        bool low = true;
+        int64_t min = 0;
+        longStream.visitValues(inverter.pool, [&](int64_t value) {
+          if (low) min = value;
+          else points.push_back({min, value, 0});
+          low = !low;
+        });
+        IntStream::Reader lengths(lengthStream, inverter.pool);
+        size_t pointIndex = 0;
+        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+          assert(!lengths.eof());
+          int32_t length = lengths.next();
+          assert(length % 2 == 0);
+          for (int32_t i = 0; i < length / 2; i++) {
+            assert(pointIndex < points.size());
+            points[pointIndex++].docid = docid;
+          }
+        });
+        assert(pointIndex == points.size());
+        writeRangePoints(postingsWriter, fieldInfo, points);
+      } else if (fieldType->type() == FieldType::GEO_POINT) {
         std::vector<BKDWriter::Point> points;
         points.reserve((size_t)numVals);
-        inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point));
+        inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point)
+            + BKDWriter::workspaceBytes(points.capacity()));
         longStream.visitValues(inverter.pool, [&](int64_t value) {
           points.push_back({geo::unpackLatitude(value),
                             geo::unpackLongitude(value), 0});
@@ -336,26 +418,7 @@ public:
         assert(pointIndex == points.size());
         writeGeoPoints(postingsWriter, fieldInfo, points);
       } else {
-        std::vector<FlushPoint> points;
-        points.reserve((size_t)numVals);
-        inverter.noteFlushWorkspace(points.capacity() * sizeof(FlushPoint));
-        longStream.visitValues(inverter.pool, [&](int64_t value) {
-          points.push_back({value, 0});
-        });
-
-        IntStream::Reader lengths(lengthStream, inverter.pool);
-        size_t pointIndex = 0;
-        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
-          assert(!lengths.eof());
-          int32_t length = lengths.next();
-          assert(length >= 0);
-          for (int32_t i = 0; i < length; i++) {
-            assert(pointIndex < points.size());
-            points[pointIndex++].docid = docid;
-          }
-        });
-        assert(lengths.eof());
-        assert(pointIndex == points.size());
+        auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals, &lengthStream);
         writePoints(postingsWriter, fieldInfo, points);
       }
     }
@@ -397,9 +460,10 @@ public:
 class GeoPointHandler final : public IntColHandler {
 public:
   GeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
-                  const std::shared_ptr<FieldType>& fieldType)
-    : IntColHandler(inverter, fieldName, fieldType) {}
+                  const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : IntColHandler(inverter, fieldName, fieldType, space) {}
 
+  using IntColHandler::index;
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
     if (points.empty()) return;
     if (points.size() != 1) {
@@ -414,13 +478,74 @@ public:
 class MultiGeoPointHandler final : public MultiIntColHandler {
 public:
   MultiGeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
-                       const std::shared_ptr<FieldType>& fieldType)
-    : MultiIntColHandler(inverter, fieldName, fieldType) {}
+                       const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : MultiIntColHandler(inverter, fieldName, fieldType, space) {}
 
+  using MultiIntColHandler::index;
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
     indexMulti(inverter, points | std::views::transform([](const GeoPoint& point) {
       return geo::encodePoint(point.latitude, point.longitude);
     }));
+  }
+};
+
+// A range field value: {"gte"|"gt": a, "lte"|"lt": b}, either side optional.
+// The column holds the encoded inclusive (min, max) pair (see RangeFieldType).
+class RangeHandler final : public MultiIntColHandler {
+  [[noreturn]] void invalid(std::string_view detail) const {
+    throw DocumentError(fmt::format("field '{}': cannot coerce value to a range: {}",
+                                    std::string_view(fieldName), detail));
+  }
+
+public:
+  RangeHandler(Inverter& inverter, const std::string_view& fieldName,
+               const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
+    : MultiIntColHandler(inverter, fieldName, fieldType, space) {}
+
+  void index(Inverter& inverter, int64_t int64) override {
+    unused(inverter, int64);
+    invalid("expected an object with gte/gt and lte/lt bounds");
+  }
+
+  void index(Inverter& inverter, std::span<const int64_t> vals) override {
+    unused(inverter, vals);
+    invalid("expected an object with gte/gt and lte/lt bounds");
+  }
+
+  void index(Inverter& inverter, const IndexVal& val) override {
+    if (coerce::isNull(val)) return;
+    if (const auto* arr = std::get_if<luxir::api::ArrVal>(&val.kind)) {
+      if (arr->v.empty()) return;
+      if (arr->v.size() != 1) invalid("multi-valued range fields are not supported yet");
+      index(inverter, arr->v[0]);
+      return;
+    }
+    const auto* map = std::get_if<luxir::api::Map>(&val.kind);
+    if (map == nullptr) {
+      invalid(fmt::format("expected an object with gte/gt and lte/lt bounds, got {}",
+                          coerce::describe(val)));
+    }
+    const IndexVal* gte = nullptr;
+    const IndexVal* gt = nullptr;
+    const IndexVal* lte = nullptr;
+    const IndexVal* lt = nullptr;
+    for (const auto& [key, value] : map->fields) {
+      const IndexVal* bound = &*value;
+      if (key == "gte") gte = bound;
+      else if (key == "gt") gt = bound;
+      else if (key == "lte") lte = bound;
+      else if (key == "lt") lt = bound;
+      else invalid(fmt::format("unknown key '{}' (expected gte, gt, lte or lt)", key));
+    }
+    auto& rangeType = (const RangeFieldType&)*fieldType;
+    auto name = std::string_view(fieldName);
+    auto bounds = foldRangeBounds(rangeBoundLiterals(gte, gt, lte, lt, name),
+        rangeType.domainBounds(), [&](const api::Val& value, FieldType::LiteralUse use) {
+          return rangeType.coerceIngestBound(value, use, name, inverter.coerceContext);
+        });
+    if (bounds.empty()) invalid("the lower bound is above the upper bound");
+    std::array<int64_t, 2> pair{bounds.lo, bounds.hi};
+    indexMulti(inverter, pair);
   }
 };
 

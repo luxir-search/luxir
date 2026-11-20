@@ -4,12 +4,14 @@
 #include "luxir/util/ParamReader.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
+#include <CLI/CLI.hpp>
 
 namespace luxir {
 
 void ParamReader::markSeen(std::string_view name) const {
-  if (std::ranges::find(seen, name) == seen.end()) seen.push_back(name);
+  if (std::ranges::find(seen, name) == seen.end()) seen.emplace_back(name);
 }
 
 void ParamReader::fail(std::string_view name, std::string_view what) const {
@@ -56,6 +58,26 @@ int64_t ParamReader::requireInt(std::string_view name) const {
   auto value = getInt(name);
   if (!value) fail(name, "is required");
   return *value;
+}
+
+uint64_t ParamReader::getBytes(std::string_view name, uint64_t fallback) const {
+  const api::Val* val = get(name);
+  if (val == nullptr) return fallback;
+  if (const auto* i = std::get_if<int64_t>(&val->kind)) {
+    if (*i >= 0) return (uint64_t)*i;
+  } else if (const auto* s = std::get_if<std::string_view>(&val->kind)) {
+    std::string text(*s);
+    try {
+      auto error = CLI::AsSizeValue(false)(text);
+      if (!error.empty()) fail(name, error);
+    } catch (const CLI::ValidationError& e) {
+      fail(name, e.what());
+    }
+    uint64_t bytes;
+    auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), bytes);
+    if (ec == std::errc() && end == text.data() + text.size()) return bytes;
+  }
+  fail(name, "must be a non-negative integer or a byte-size string");
 }
 
 std::optional<double> ParamReader::getDouble(std::string_view name) const {

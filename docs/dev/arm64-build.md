@@ -70,7 +70,8 @@ qemu-aarch64 -cpu cortex-a53 -L "$arm64_sysroot" \
 ```
 
 QEMU user-mode checks the executable against the target CPU and libraries.
-Kernel-specific tests still need a native ARM64 host: for example,
+Kernel-specific tests still need a native ARM64 host, where the regular
+[native workflow](build-setup.md) builds for the host CPU: for example,
 [QEMU 8.2 ignores huge-page advice](https://github.com/qemu/qemu/blob/v8.2.2/linux-user/mmap.c#L908-L971),
 so allocator tests that inspect `/proc/self/smaps` cannot validate those hints
 under that emulator.

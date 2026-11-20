@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include "gtest/gtest.h"
 
 #include <algorithm>
@@ -193,7 +194,7 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
 
   {
     FSDirectory dir(path);
-    CommitSnapshotRegistry iwSnapshots(dir);
+    CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots);
 
     auto submit = [&](bool commit) {
@@ -223,7 +224,7 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
       return message.result.ok();
     };
 
-    std::string firstFile = Postings::getIndexFileName(Postings::getSortableString(1), 0);
+    std::string firstFile = Postings::getIndexFileName(Postings::segmentKey(1, 1), 0);
     std::filesystem::path failingTmp = path / (firstFile + ".tmp");
     std::filesystem::create_symlink("/dev/full", failingTmp);
 
@@ -261,7 +262,7 @@ TEST_F(VectorColTest, indexingStreamsReuseAndCollapse) {
 
   std::vector<Directory::FileInfo> files;
   testIndex.dir.listFiles(files);
-  std::string dataPrefix = Postings::getIndexFileNamePrefix(segId) + "_";
+  std::string dataPrefix = Postings::getIndexFileNamePrefix(segId, 1);
   size_t dataFiles = std::count_if(files.begin(), files.end(), [&](const Directory::FileInfo& file) {
     return file.name.starts_with(dataPrefix);
   });
@@ -575,7 +576,7 @@ TEST_F(VectorColTest, strictDimsRejectsMismatch) {
   auto schema = std::make_shared<Schema>();
   auto strictType = std::make_shared<VectorFieldType>("strict_v", /*dims=*/4);
   schema->fieldTypeMap["strict_v"] = strictType;
-  Inverter inverter(dir, 1, schema);
+  Inverter inverter(dir, 1, 1, schema);
   auto& vh = inverter.getIndexHandler("strict_v");
 
   std::pmr::monotonic_buffer_resource mr;
@@ -809,7 +810,7 @@ TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
       "cos_v", /*dims=*/2, FieldType::COLUMN_STORED | FieldType::FIXED_SIZE,
       VectorFieldType::METRIC_COSINE, /*normalized=*/true);
   schema->fieldTypeMap["cos_v"] = cosineType;
-  Inverter inverter(dir, 1, schema);
+  Inverter inverter(dir, 1, 1, schema);
   auto& vh = inverter.getIndexHandler("cos_v");
 
   std::pmr::monotonic_buffer_resource mr;
@@ -829,7 +830,7 @@ TEST_F(VectorColTest, rejectsOutOfRangeElements) {
   schema->fieldTypeMap["cos_v"] = std::make_shared<VectorFieldType>(
       "cos_v", /*dims=*/3, FieldType::COLUMN_STORED | FieldType::FIXED_SIZE,
       VectorFieldType::METRIC_COSINE);
-  Inverter inverter(dir, 1, schema);
+  Inverter inverter(dir, 1, 1, schema);
   std::pmr::monotonic_buffer_resource mr;
 
   auto expectError = [&](const char* field, const luxir::api::Val& val, std::string_view msg) {

@@ -30,6 +30,8 @@ service Admin {
   rpc GetSchema(SchemaRequest) returns (SchemaResponse) {}
   rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse) {}
   rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse) {}
+  rpc RenameCollection(RenameCollectionRequest) returns (RenameCollectionResponse) {}
+  rpc SwapCollections(SwapCollectionsRequest) returns (SwapCollectionsResponse) {}
   rpc Stats(StatsRequest) returns (StatsResponse) {}
   rpc CacheControl(CacheControlRequest) returns (CacheControlResponse) {}
 }

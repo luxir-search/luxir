@@ -16,7 +16,7 @@ results, and links the protobuf definitions shared by JSON and gRPC.
 ```http
 POST /collections/books/_search
 
-{"query": {"match": {"title_t": "dune"}}, "fields": ["id"], "count_limit": -1}
+{"query": {"match": {"title_t": "dune"}}, "fields": ["id"], "count_limit": -2}
 ```
 
 ```json
@@ -41,6 +41,16 @@ the field's `search` binding, value operations (`any_of`, ranges, facets,
 sorts, metrics) use its `value` binding, and `f__label` or `f__self` selects
 one representation directly. See [default bindings for variants](schema.md#default-bindings-for-variants)
 and the [worked example](searching.md#field-bindings).
+
+## Clause names
+
+Any structured query object accepts an optional sibling `name`, unique within
+its request: `{"name":"recent","range":{"field":"answers.date","lte":"2012-04-08"}}`.
+A name references the subtree; it does not wrap it or change scores, equality,
+planning or cache keys. Expression strings have no name syntax, but the
+structured `expr` arm may be named. Row operations use `domain.from_match`
+to select a named clause's matching descendant rows. See
+[Per-row operations](searching.md#per-row-operations) for eligibility and errors.
 
 ## Match all and exists
 
@@ -92,6 +102,13 @@ their normalizer, if configured, and match as exact terms. Numeric and date
 values are coerced through the same rules as indexing and matched through
 their columns.
 
+IP `match` literals accept an address or CIDR. Host bits are masked, so
+`10.1.2.3/8` matches `10.0.0.0/8`; `2001:db8::/32` matches that IPv6 network.
+IP `any_of` members and range bounds require single addresses. Strict and
+inclusive range bounds follow address byte order. IP fields reject
+`case_insensitive`, prefix, wildcard/regexp, and fuzzy matching. See
+[IP addresses](schema.md#ip-addresses).
+
 With `case_insensitive`, each analyzed TEXT token or normalized STRING/ID
 value matches indexed terms that differ only in simple Unicode case: `FOO`
 matches `foo` and `Foo`, and `k` matches the Kelvin sign. All indexed variants
@@ -102,8 +119,7 @@ document before BM25 saturation, with shared statistics (maximum document
 frequency and summed total term frequency). A rare spelling gets no extra
 IDF. These term weights do not affect field lengths. `operator`, `min_match`, and
 boosts still apply over the analyzed query tokens. Filters match the same
-variants without computing scores. Scored matches reject more than 64 distinct
-indexed case variants per token; filters retain the complete match set.
+variants without computing scores.
 
 If analysis already erases the token's case, ordinary term lookup and scoring
 are retained. Case expansion is slower than using a folding TEXT variant such
@@ -161,7 +177,7 @@ POST /collections/authors/_search
 | `field` | Field to query through its value binding, or an explicit selector. Required. |
 | `values` | Exact values; any matching value admits the document. |
 
-STRING, TEXT, and ID exact membership requires indexed terms. Numeric/date
+STRING, TEXT, and ID exact membership requires indexed terms. Numeric, boolean, and date
 representations can use their columns. DATE members are exact instants in
 the field's unit: an ISO member uses its floored start, even for a partial
 date. Members outside the stored date domain are dropped. Match/range date
@@ -242,7 +258,7 @@ also set a `domain`:
 ```
 
 `domain.query` replaces the incoming document set with that query's matches
-across the collection. Without it, the operation inherits its incoming set.
+across the operation's view. Without it, the operation inherits its incoming set.
 `domain.filter` adds local constraints in either case. With a replacement
 query, `apply_parent_filters: true` reapplies the owning list's filters,
 including facet selections, while respecting `except_ops`. It defaults to
@@ -292,10 +308,21 @@ matches documents with at least one indexed term for the field.
 | `field` | Indexed term field. Required. |
 | `prefix` | Literal prefix, including any `*`, `?`, or backslashes. Required. |
 | `case_insensitive` | After normalization, also match other simple Unicode case forms. Default `false`. |
+| `max_expansions` | Unset or `0`: every term with the prefix. Any positive `N` (no upper bound): in each segment, only the `N` terms with the highest document frequency (ties keep the lower term). |
+
+A short prefix over a large dictionary can expand to hundreds of thousands of
+terms, and an unscored or exactly counted request then reads every one of their
+postings lists. `max_expansions` bounds the selected postings lists, while
+selection still scans every matching term. The terms are chosen per segment,
+so a term just outside the cut can match in one segment and not in another.
+Both capped and complete expansions are subject to any operator-configured limits in
+[Expansion limits](#expansion-limits). Selection memory counts toward the
+request memory ceiling.
 
 With `case_insensitive`, the entire prefix is normalized once, then matched
 through a case-alternating automaton. TEXT, STRING, and ID are supported, and
-queries are constant-scoring. The expression form is
+queries are constant-scoring. `max_expansions` selects by document frequency
+across the accepted case variants. The expression form is
 `prefix(err, field=body_w, case_insensitive=true)`.
 
 ## Wildcard
@@ -363,10 +390,9 @@ toward the pattern complexity budget.
 | `term` | Term to compare. TEXT normalizes/folds without tokenizing; STRING uses its normalizer if present; ID uses it verbatim. Required. |
 | `max_edits` | Byte-wise Levenshtein distance from `0` to `2`. Unset uses `0` for terms of at most 2 bytes, `1` through 5 bytes, then `2`. |
 | `prefix_length` | Leading bytes that must match exactly. Unset defaults to `1`; explicit `0` disables it. |
-| `max_expansions` | Maximum term expansions, closest first. Unset or `0` uses the default `50`; a positive value pins the requested cap. |
+| `max_expansions` | Maximum term expansions, closest first. Unset or `0` uses the default `50`; any positive value (no upper bound) pins the cap. |
 
-The engine also applies a current clause budget of `64` and may apply a lower
-operator limit. Truncation is not reported in the response. Scoring uses
+Terms past the cap are dropped without a response warning. Scoring uses
 blended BM25 statistics; filter context is constant-scoring, but both use the
 same expansion set and match set. Simple-query syntax still warns when it
 clamps an unsupported edit distance before constructing the fuzzy query.
@@ -387,6 +413,91 @@ numbers in the field's unit (`ms` or `ns`), ISO-8601, partial dates, and date ma
 terms in byte order with constant scores. Text bounds receive the field's
 normalization/folding but are not tokenized; STRING bounds use its normalizer.
 The bare field uses the value binding, including a range with no bounds.
+Term ranges are subject to any operator-configured [Expansion limits](#expansion-limits).
+
+## Expansion limits
+
+Prefix, wildcard, regex, term-range, fuzzy, and `case_insensitive` match queries
+expand against the field's term dictionary, so their cost grows with its cardinality. Every
+expansion limit is an operator opt-in, off by default. With limits off, a broad
+pattern on a high-cardinality field simply runs. Operators exposing a public
+endpoint can set these options to bound dictionary work and postings estimates.
+
+When a configured limit is exceeded, the request fails with
+`RESOURCE_EXHAUSTED`, naming the query and limit, never a truncated match set.
+A request cannot raise or disable an operator limit. The outcome depends only
+on the request's total, not timing, though work can run slightly past a limit
+before the request stops. A filter served from cache scans nothing and counts
+nothing.
+
+| Error code | Cause |
+|---|---|
+| `too_many_expansions` | A query expands more terms in one segment than the configured cap. A merge can change whether the query passes. |
+| `too_many_terms_examined` | Dictionary scans, matching or not, exceed the request-wide configured visit limit, including fuzzy scans and refills. |
+| `too_many_expansion_postings` | The summed docFreq of selected terms exceeds the configured request-wide estimate limit. This counts estimated postings, not postings decoded; fuzzy's scored rewrite does not count toward it. |
+| `pattern_prefix_too_short` | An unbounded prefix, wildcard, or regex query has fewer literal leading bytes than the configured minimum. This rule looks only at the normalized pattern, never the index or cache. A type-ahead endpoint using N rejects keystrokes shorter than N. |
+
+A prefix query with `max_expansions` keeps at most that many terms per segment.
+The selected count is subject to any configured `too_many_expansions` cap, and
+its scan counts toward any configured terms-examined budget. The sampling pass
+behind an estimated `found` reuses the search's expansions, so it adds nothing
+to the budget. `any_of` term
+lists are not capped by term count because the request already lists every
+term. Finite patterns such as `(dune|kings)` are exempt from the minimum literal
+prefix rule. Case-insensitive matching does not shorten the measured literal.
+Match, fuzzy, term ranges, and facet term filters are also exempt from that rule.
+See [Operations](operations.md) for the server settings.
+
+### Range fields
+
+On a `long_range`, `double_range`, or `date_range` field, the query compares
+each stored interval with the query interval. `relation` picks the test:
+
+| `relation` | A document matches when its interval |
+|---|---|
+| `intersects` (default) | overlaps the query interval |
+| `contains` | covers the whole query interval |
+| `within` | lies inside the query interval |
+
+```json
+{"range":{"field":"open_hours","gte":9,"lte":17,"relation":"contains"}}
+```
+
+Bounds follow the matching scalar type's range-query rules. For example,
+fractional long bounds round inward to integer endpoints; ingest requires
+integral long endpoints. Malformed bounds are errors even when another bound
+already makes the query empty. See [Range types](schema.md#range-types) for
+strict ingest validation and supported endpoint domains.
+
+A partial date names its whole granule: `gte: "2024-06"` includes June from
+its first millisecond and `lte: "2024-06"` through its last; `gt` and `lt`
+exclude the named granule. Luxir uses this rule at ingest too. Elasticsearch
+and OpenSearch differ: when they ingest a range field, a partial-date `lte`
+such as `"2024-06"` does not extend to the end of the month. Ingest uses UTC for dates without an explicit
+offset; query dates use the request's time zone and `now` follows the scalar
+`date` rules.
+
+An open query side and an open stored end are unbounded within the endpoint
+domain: `{"gte":50}` contains every value from 50 up. For doubles, open ends
+are `-Infinity` and `Infinity`, and explicit infinities at those ends are
+equivalent. NaN is an error. `gt: "Infinity"` and `lt: "-Infinity"` match
+nothing. Negative zero sorts below positive zero. Long and date open ends
+extend to the int64 limits.
+
+A `match` on a range field, and `field:[a TO b]` in the
+[query language](query-language.md), are `intersects` queries; `match` with
+one value finds intervals containing it. Explicit field literals also work
+in `simple_query`. `multi_match` accepts explicitly named range fields in
+both modes, applies field weights, and skips literals that cannot coerce to
+an endpoint, as for numeric fields. Wildcard field selectors do not select
+range fields. `relation` is rejected on other field types unless it is
+`intersects`.
+
+Returned intervals omit open ends. Date endpoints follow the request's
+`date_iso`, `date_ms`, or `date_ns` output mode in ROWS and COLUMNS responses,
+with epoch milliseconds as the default. Multi-valued range fields, sort,
+facets, collapse, value expressions, and `any_of` on range fields are not
+supported.
 
 ## Constant score and boost
 
@@ -441,7 +552,13 @@ expression:
 | `min_score` | Optional. Documents whose rescored value is below it do not match. |
 
 The expression uses the same value-expression language as sorting (arithmetic,
-`def`, unary math, and reducers; see [Searching](searching.md#sorting)) and
+`def`, math such as `exp` and `pow`, comparisons and `?:` conditionals,
+`random`, reducers, and the Elasticsearch-style `gauss_decay`, `exp_decay`,
+and `linear_decay` decay functions; see
+[Searching](searching.md#sort-expressions-in-detail),
+[Decay functions](searching.md#decay-functions), and
+[Value expressions](value-expressions.md) for the bitwise operators, trigonometry,
+date parts, geo functions, hashing, and `let`) and
 must produce a finite value for every matched document. Handle missing values
 with `def()` or exclude them with an `exists()` clause in the child query.
 The expression form is
@@ -523,19 +640,21 @@ allowed. Fields resolve through their `search` bindings, like `match`.
 Duplicate physical targets keep the larger weight, and field order does not
 affect the query.
 
-In `combined` mode, TEXT fields sharing an analyzer and `long_terms` policy
-form a group scored as one field with BM25F. Group membership is determined
-by the schema, independently of the query text. Each group analyzes the text
-once; a term found in several fields saturates once within that group.
-A weight scales its field's term frequency and document length, including
-in a group with just one field. For a term, frequency is the weighted sum of
-per-field frequencies, and length is the weighted sum of per-field lengths,
-rounded and encoded as a norm. Every field contributes length even when the
-term is absent from that field. Average length is the weighted sum of total
-term counts divided by the largest per-field document count; document
-frequency is the largest per-field document frequency. This is a BM25F
-weight, not a score multiplier; the scoring follows Lucene's
-`CombinedFieldQuery`.
+In `combined` mode, TEXT fields with the same expanded analyzer definition
+and `long_terms` policy form a group scored as one field with BM25F, whether
+the analyzer is inherited from a common parent or declared inline on each
+field.
+Group membership is determined by the schema, independently of the query text.
+Each group analyzes the text once; a term found in several fields saturates
+once within that group. A weight scales its field's term frequency and
+document length, including in a group with just one field. For a term,
+frequency is the weighted sum of per-field frequencies, and length is the
+weighted sum of per-field lengths, rounded and encoded as a norm. Every
+field contributes length even when the term is absent from that field.
+Average length is the weighted sum of total term counts divided by the
+largest per-field document count; document frequency is the largest
+per-field document frequency. This is a BM25F weight, not a score multiplier;
+the scoring follows Lucene's `CombinedFieldQuery`.
 
 STRING, ID, numeric, and date fields each form their own group with `match`
 semantics and a weight that multiplies the field's score. STRING/ID fields
@@ -725,17 +844,20 @@ grammar and the function-call subset.
 Vector and geographic queries use the same `Query` node and are documented
 in their own guides:
 
+- A child-field `knn` counts rows of the view where it is written; see
+  [Chunks and vectors](nested.md#chunks-and-vectors).
 - [`knn`](vector-search.md) covers `field`, `query`, `k`, `refine_candidates`,
   `exact`, `similarity`, and the per-engine `ivf` object (`nprobe`,
   `min_scan_fraction`).
-- [`geo_box` and `geo_distance`](geo-search.md) cover coordinate order,
-  inclusive boundaries, dateline crossing, and distance units.
+- [`geo_box`, `geo_distance`, and `geo_polygon`](geo-search.md) cover
+  coordinate order, inclusive boundaries, dateline crossing, distance units,
+  and unions of polygons with holes.
 
 ## Limits
 
-- `knn`, `geo_box`, and `geo_distance` are structured-only: expression
-  functions cannot currently represent vector or coordinate-list arguments,
-  so use the objects shown in the vector and geo guides.
+- `knn`, `geo_box`, `geo_distance`, and `geo_polygon` are structured-only:
+  expression functions cannot currently represent vector or coordinate-list
+  arguments, so use the objects shown in the vector and geo guides.
 - New structured arms are not automatically callable from the query language
   until their expression behavior is declared.
 - `except_ops` routing is not accepted on Fusion filters or Fusion source
@@ -747,5 +869,25 @@ in their own guides:
 - `multi_match.phrase` requires `per_field` mode and indexed positions on
   TEXT fields; it cannot be combined with an explicit `operator` or a
   positive `min_match`.
-- Fuzzy expansion truncation (the `64` clause budget and any lower operator
-  limit) is not reported in the response.
+- Fuzzy expansion truncation at `max_expansions` is not reported in the response.
+- Operators can opt in to request-wide limits on multi-term and fuzzy dictionary work; see
+  [Expansion limits](#expansion-limits).
+
+
+## Nested row queries and domains
+
+A single-field leaf naming a descendant field implicitly uses to_parent with
+score max; each leaf joins independently. Wrap a Boolean child in
+`{"to_parent":{"path":"items","query":{...}}}` for a same-item query.
+Its optional `score` is `max` (default), `min`, `sum`, `avg` or `none`
+(contributes zero), and optional `min_children` (default 1) and
+`max_children` (default unbounded) bound the number of matching children;
+see [Scoring](nested.md#scoring). An exists query on a nested
+path joins all rows of that path. Query strings additionally support nested
+field groups, such as `items:(color:red AND size:L)`.
+
+Operations move between views through `domain.to`: relative dotted descent,
+`..` or `../..` ascent, and `/` for root documents. Mixed upward/downward
+paths are reserved. Non-query field consumers must run in their field's own
+view. See [Nested documents](nested.md) for examples and the precise
+query/consumer distinction.

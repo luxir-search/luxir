@@ -22,10 +22,13 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
+#include "MultiTermBudget.h"
+#include "ExecutionProfile.h"
 #include "Warnings.h"
 #include "luxir/util/proto.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/search/IndexReader.h"
+#include "luxir/search/RequestMemTracker.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/reader/DocsEnum.h"
@@ -33,6 +36,8 @@
 #include "luxir/search/FilterCache.h"
 #include "luxir/search/FilterKey.h"
 #include "luxir/search/Similarity.h"
+#include "QueryVisitor.h"
+
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <boost/unordered/unordered_node_map.hpp>
@@ -40,9 +45,11 @@
 
 namespace luxir {
 
+class FanoutScope;
 class DocSet;
 class DocSetBuilder;
 class WindowFilter;
+struct CombinedNormTables;
 
 enum class QueryKind : uint8_t {
   TERM = 1,
@@ -61,15 +68,18 @@ enum class QueryKind : uint8_t {
   EXISTS,
   GEO_BOX,
   GEO_DISTANCE,
+  GEO_POLYGON,
   ALL,
   NONE,
   RESCORE,
+  RANGE_FIELD,
   MIN_SCORE,
   COMBINED_FIELDS,
   DIS_MAX,
   // Every query a plugin query type builds (QueryRegistry). Shape questions
   // get the conservative answers, as for TEST.
   PLUGIN,
+  TO_PARENT,
   TEST,
 };
 
@@ -101,8 +111,8 @@ struct ScoreWindow {
   int32_t min = 0;
   int32_t max = 0;
   int32_t size = 0;
-  std::span<int32_t> docs;
-  std::span<float> scores;
+  std::span<int32_t> docs = {};
+  std::span<float> scores = {};
 };
 
 // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
@@ -628,6 +638,7 @@ public:
     bool numericPredicateDisableShapesForTests = false;
     bool disableBooleanTwoPhaseForTests = false;
     bool disableDisjunctionTwoPhaseForTests = false;
+    bool disableClauseFloorForwardingForTests = false;
     bool disableMandNotTwoPhaseForTests = false;
     bool disableFilteredUnionWandForTests = false;
 
@@ -654,6 +665,13 @@ public:
     DocsOnlyAccess docsOnly = DocsOnlyAccess::UNKNOWN;
     DirectDocSetAccess directDocSet = DirectDocSetAccess::UNKNOWN;
     MembershipConsumption membershipConsumption = MembershipConsumption::WINDOWS;
+    // Point emissions (see Demand) of one two-phase check, when the arm knows
+    // it. A parent choosing where verification runs prices the checks a
+    // schedule adds with it.
+    std::optional<double> verificationPoints = {};
+    // Receiving a floor on this scorer's own score saves work, and a floor
+    // that skips nothing has negligible cost. False is always conservative.
+    bool competitiveFloorPays = false;
 
     bool hasUnknown() const noexcept {
       return matchState == MatchState::UNKNOWN
@@ -695,7 +713,20 @@ public:
   void validateLogical(
       PlanningContext& context, float multiplier = 1.0f) const;
 
+  // Serial planning only, like createWeight. May cache dictionary expansion,
+  // charged once to the request multi-term budget and shared with execution.
+  // Visitor views borrow query/context storage. Plugin queries may override
+  // visitImpl; the default reports an opaque leaf.
+  void visit(QueryVisitor& visitor, Context& context, float boost = 1.0f) const {
+    visitImpl(visitor, context, boost);
+  }
+
 protected:
+  virtual void visitImpl(QueryVisitor& visitor, Context& context, float boost) const {
+    unused(context, boost);
+    visitor.leaf(*this);
+  }
+
   virtual void validateLogicalImpl(
       PlanningContext& context, float multiplier) const {
     unused(context);
@@ -775,6 +806,23 @@ public:
     return product;
   }
 
+  // The floor a child score must reach for its scaled score to reach `floor`.
+  // The scaled score is child * multiplier rounded to float, which reaches a
+  // floor from up to half an ulp below it. For a zero or subnormal floor that
+  // half ulp is an absolute 2^-150, which division by a multiplier under 1 can
+  // stretch past the one-ulp margin, so it is taken off the floor before
+  // dividing. The subtraction is exact in double for floors below 2^-97 and
+  // absorbed above that, where the one-ulp step down already covers the half
+  // ulp.
+  static float unscaleScoreFloor(float floor, float multiplier) {
+    assert(multiplier > 0.0f);
+    return multiplier == 1.0f
+        ? floor
+        : std::nextafter(
+              (float)(((double)floor - 0x1p-150) / (double)multiplier),
+              -std::numeric_limits<float>::infinity());
+  }
+
   /// The constant a uniform-scoring weight contributes: its boost product
   /// when scores are requested, 0 otherwise (built unscored means score 0
   /// and zero bounds). The serial logical pass has already validated the
@@ -797,14 +845,15 @@ public:
   // Restrict header totals by cheap eligibility bounds; restrictions need iteration.
   static CountShortcut countBound(IndexReader::Segment& segment, DocSet* domain,
                                   int64_t docs, CountHow how = CountHow::ITERATE) {
-    int64_t bound = std::min<int64_t>(docs, segment.numLive());
+    auto [minLive, maxLive] = segment.liveCountBounds();
+    int64_t bound = std::min<int64_t>(docs, maxLive);
     if (domain && domain->cachedCard() >= 0) {
       bound = std::min<int64_t>(bound, domain->cachedCard());
     }
     if (bound == 0) return {0, CountHow::METADATA};
     int64_t minMatches = how == CountHow::METADATA && domain == nullptr
-        ? std::max<int64_t>(0, docs - (segment.maxDoc() - segment.numLive())) : 0;
-    if (domain || segment.liveDocs()) how = CountHow::ITERATE;
+        ? std::max<int64_t>(0, docs - (segment.maxDoc() - minLive)) : 0;
+    if (domain || minLive != segment.maxDoc()) how = CountHow::ITERATE;
     return {bound, how, nullptr, minMatches};
   }
 
@@ -875,6 +924,9 @@ public:
       // the owner hook. Stateless leaves record their complete answer here.
       // Neither route is consulted during ordinary forward iteration.
       BulkAnswer statelessReposition = BulkAnswer::NO;
+      // For EXACT_CANDIDATE_SCORING, with no bulk: one scorer produces every
+      // score, so a pruned ranking pass needs no rescoring of its survivors.
+      BulkAnswer rankingScoresExact = BulkAnswer::NO;
 
       [[gnu::cold]] BulkAnswer supportsReposition() const noexcept {
         if (buildState == nullptr) return statelessReposition;
@@ -929,6 +981,12 @@ public:
       // the docid runs that hold no match. A conjunction leapfrogging a
       // produced supplier skips its siblings' documents in those runs.
       double hull = 1;
+      // Whether hull estimates where the matches lie, which yield knowledge
+      // does not imply (an exact doc set knows its count, not its spread):
+      // for a dense single-valued numeric column, the share of documents in
+      // leaves that can match. Pricing that relies on the matches' support
+      // requires it.
+      bool knownHull = false;
 
       void addWork(const MembershipWork& child) {
         produce += child.produce;
@@ -1159,6 +1217,7 @@ public:
   // owns logical/key memos, validation tracking, and request cache Uses, but
   // deliberately does not initialize per-segment field readers.
   class PlanningContext {
+    RequestMemTracker standaloneMemoryTracker{0};
     struct CachedFilterIdentity {
       FilterKeyScope scope;
       std::optional<FilterKey> key;
@@ -1189,29 +1248,43 @@ public:
 
   public:
     struct Limits {
-      int32_t fuzzyMaxExpansions = 10000;
+      // Request-wide multi-term work allowance, shared by every planning
+      // context of one request. Null gives the context its own unlimited one.
+      MultiTermBudget* multiTermBudget = nullptr;
 
-      constexpr Limits(int32_t fuzzyMaxExpansions = 10000)
-        : fuzzyMaxExpansions(fuzzyMaxExpansions) {}
+      constexpr Limits(MultiTermBudget* multiTermBudget = nullptr)
+        : multiTermBudget(multiTermBudget) {}
     };
 
+  private:
+    std::unique_ptr<MultiTermBudget> ownedMultiTermBudget;
+
+  public:
+    RequestMemTracker& memoryTracker;
     MemPool& pool;
     IndexReader& topReader;
     std::shared_ptr<FilterCache::UseRegistry> filterUses;
     FilterKeyContext filterKeyContext;
     Limits limits;
     std::vector<api::Warning>* warnings = nullptr;
+    ExecutionProfileSink* profiles = nullptr;
 
     PlanningContext(
         MemPool& pool, IndexReader& topReader, Limits limits = {},
         std::vector<api::Warning>* warnings = nullptr,
         FilterKeyContext filterKeyContext = {},
-        std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
-      : pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
+        std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr,
+        RequestMemTracker* memoryTracker = nullptr, ExecutionProfileSink* profiles = nullptr)
+      : memoryTracker(memoryTracker ? *memoryTracker : standaloneMemoryTracker),
+        pool(pool), topReader(topReader), filterUses(std::move(filterUses)),
         filterKeyContext(filterKeyContext), limits(limits),
-        warnings(warnings) {
+        warnings(warnings), profiles(profiles) {
       this->filterKeyContext.coreGen = topReader.coreGen();
-      this->filterKeyContext.fuzzyMaxExpansions = limits.fuzzyMaxExpansions;
+      this->filterKeyContext.path = topReader.path();
+      if (this->limits.multiTermBudget == nullptr) {
+        ownedMultiTermBudget = std::make_unique<MultiTermBudget>();
+        this->limits.multiTermBudget = ownedMultiTermBudget.get();
+      }
       auto* filterCache = topReader.filterCache();
       if (this->filterUses == nullptr) {
         this->filterUses = std::make_shared<FilterCache::UseRegistry>(
@@ -1382,6 +1455,9 @@ public:
     FilterKeyContext& filterKeyContext;
     Limits& limits;
     FieldInfoMap fieldInfoMap;
+    // Pool-owned norm tables shared by the request's CombinedFieldQuery
+    // weights, one per field weight vector; defined in CombinedFieldQuery.h.
+    CombinedNormTables* combinedNormTables = nullptr;
 
     Context(google::protobuf::Arena& arena, PlanningContext& planning,
             FieldInfoMap&& fieldInfoMap)
@@ -1443,6 +1519,10 @@ public:
     }
 
     PlanningContext& planningContext() const noexcept { return planning; }
+
+    MultiTermBudget& multiTermBudget() const noexcept {
+      return *limits.multiTermBudget;
+    }
 
     google::protobuf::Arena& arena() const noexcept {
       return *allocationArena;
@@ -1529,7 +1609,7 @@ public:
       int foundInSegCount = 0;
       result.postingsStates = {
           pool.make_arr<const TermsEnum::PostingsState*>(numSegs), numSegs};
-      for (int i = 0; i < numSegs; ++i) {
+      for (size_t i = 0; i < numSegs; ++i) {
         auto* termsEnum = cachedFieldInfo.termsEnums[i];
         if (!termsEnum || !termsEnum->seek(term)) {
           result.postingsStates[i] = nullptr;
@@ -1589,6 +1669,10 @@ public:
     // Execution traits computed at construction. Default 0 is conservative:
     // no prepare pass and no constant-scoring fast path.
     int32_t traits = 0;
+#ifndef NDEBUG
+    const Query& owner;
+    void assertLogicalDomainConsumption() const;
+#endif
   public:
     enum class SparseFilteredTopKFamily {
       CONJUNCTION,
@@ -1596,7 +1680,11 @@ public:
     };
 
     Weight(Query::Context& context, const Query& query, int32_t inputFlags)
-      : context(context), inputFlags(inputFlags) {
+      : context(context), inputFlags(inputFlags)
+#ifndef NDEBUG
+      , owner(query)
+#endif
+    {
 #ifndef NDEBUG
       context.assertLogicalValidation(query);
 #else
@@ -1606,7 +1694,11 @@ public:
 
     /// Per-segment domains available during prepare(). An empty domain span
     /// means unrestricted aside from whatever the caller applies later.
+    /// Canonical predicate preparation may use RAW_MEMBERSHIP: its domains
+    /// contain only predicates from the query tree, and the destination owns
+    /// liveness. Domain-consuming queries require ordinary live eligibility.
     ///
+    /// The following live-domain contract applies to ORDINARY preparation.
     /// Domain contract: a segment's domain, when present, is LIVE-FILTERED -
     /// it is liveDocs intersected with any enclosing filter clauses, and is
     /// the complete eligibility predicate (consumers must not re-check
@@ -1614,19 +1706,20 @@ public:
     /// enclosing filters; all docs in the segment are eligible.  RootOp
     /// establishes this, and every domain-deriving path preserves it.
     ///
-    /// parallel is true when the request runs under a TBB task group; a
-    /// prepare() implementation may then spawn internal worker tasks, provided
-    /// they are joined before prepare() returns.  false means the request is
-    /// serial and prepare() must not spawn tasks.
+    /// fanout permits internal worker tasks, joined before prepare() returns.
+    /// A null scope requires synchronous execution on the calling thread.
     struct PrepareContext {
       IndexReader& reader;
       std::span<DocSet* const> domainPerSeg;
-      bool parallel;
+      FanoutScope* fanout;
       ExecutionWarnings* warnings;
+      SupplierExecutionMode executionMode;
 
       PrepareContext(IndexReader& reader, std::span<DocSet* const> domainPerSeg,
-                     bool parallel, ExecutionWarnings* warnings) noexcept
-        : reader(reader), domainPerSeg(domainPerSeg), parallel(parallel), warnings(warnings) {}
+                     FanoutScope* fanout, ExecutionWarnings* warnings,
+                     SupplierExecutionMode executionMode = SupplierExecutionMode::ORDINARY) noexcept
+        : reader(reader), domainPerSeg(domainPerSeg), fanout(fanout), warnings(warnings),
+          executionMode(executionMode) {}
     };
 
     /// Immutable result of prepare() for segment-scorer creation after
@@ -1660,6 +1753,10 @@ public:
     /// bit-space from createWeight() input flags: input flags say what the
     /// parent requested, traits say what is true of the built weight.
     static constexpr int32_t NEEDS_PREPARE = 1 << 0;        // needs a whole-index prepare() pass
+    // Selects matches inside the prepare domain, directly or through any
+    // descendant prepared in it (kNN top-k). Unlike ordinary predicates,
+    // exclusions applied after it can change that selection.
+    static constexpr int32_t CONSUMES_DOMAIN = 1 << 5;
     static constexpr int32_t IS_CONSTANT_SCORING = 1 << 1;  // every matching doc scores the same
     static constexpr int32_t PREFER_PULL_FOR_SPARSE_ARRAY_DOMAIN = 1 << 2;
     static constexpr int32_t MATCHES_ALL_DOCS = 1 << 3;     // matches every doc in the segment
@@ -1674,6 +1771,14 @@ public:
 
     /// True if this Weight needs prepare() before segment scorer creation.
     bool needsPrepare() const noexcept { return (traits & NEEDS_PREPARE) != 0; }
+
+    bool consumesDomain() const noexcept {
+      bool consumes = (traits & CONSUMES_DOMAIN) != 0;
+#ifndef NDEBUG
+      if (consumes) assertLogicalDomainConsumption();
+#endif
+      return consumes;
+    }
 
     /// True if every matching doc receives the same score. Leaf terms/phrases
     /// set this when built without NEED_SCORES; wrappers and compounds set it
@@ -1709,8 +1814,11 @@ public:
     bool needsScores() const noexcept { return (inputFlags & NEED_SCORES) != 0; }
 
     /// Metadata-only: no supplier, index walks, locks or cardinality counts.
-    /// METADATA is exact; SUPPLIER resolves at supplier construction;
-    /// INDEX_WALK may decode crossing index leaves; ITERATE is a bound.
+    /// Levels name the work a count still needs; within a request a level only
+    /// gets cheaper. METADATA is exact from header totals or facts the request
+    /// already computed; SUPPLIER resolves at supplier construction;
+    /// INDEX_WALK walks index structure (crossing leaves, term dictionaries),
+    /// so probes stop before it; ITERATE is a bound.
     /// Resolvable non-metadata shortcuts name the leaf that resolves them.
     /// Execution may resolve more than this metadata proves.
     virtual CountShortcut countShortcut(IndexReader::Segment& segment,
@@ -1901,6 +2009,10 @@ public:
       }
       return filled;
     }
+    /// OR this scorer's matches in [windowStart, windowEnd) into windowBits,
+    /// bit i for doc windowStart + i; no bit at or past windowEnd - windowStart
+    /// is set. Windows arrive forward only but need not be contiguous: a
+    /// consumer may skip windows, and the next fill resumes at its own start.
     virtual void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                                 int32_t windowEnd) {
       skipCount(SkipStats::countBulkFillCalls);
@@ -1913,6 +2025,8 @@ public:
         target = doc + 1;
       }
     }
+    /// A floor on this scorer's own output score. It may be ignored; honoring
+    /// it must preserve competitive documents. Profitability belongs to plans.
     virtual void setMinCompetitiveScore(float minScore) {
       unused(minScore);
     }
@@ -2001,12 +2115,16 @@ public:
     // This protocol composes with fillWindowBits. After prepareMembership it
     // can drain an exhaustive scored prefix; scoring resumes only after reset. A
     // composite retains ownership of externally driven aliases while draining.
-    // Verification-bearing scorers and composites override
-    // this single-phase default; ordinary next()/advance() remain unchanged.
+    // The default walks the private approximation and verifies only inside the
+    // span, which for a single-phase scorer is exact advance(). Composites
+    // with their own verification order override it; ordinary next()/advance()
+    // remain unchanged.
     virtual int32_t advanceWindow(int32_t min, int32_t max) {
       if (min >= max) return max;
-      int32_t doc = docId();
-      return doc < min ? advance(min) : doc;
+      int32_t doc = approximationDocId();
+      if (doc < min) doc = approximationAdvance(min);
+      while (doc < max && !matches()) doc = approximationNext();
+      return doc;
     }
 
     // Bounded private approximation for membership conjunctions. An exact
@@ -2214,11 +2332,68 @@ public:
   };
 };
 
+// The floor a clause must reach for a doc to make `theta` when the rest of
+// the doc's score is at most `othersMax`, out of `clauses` summed scores; -inf
+// when no floor is proven. A float sum of n terms can exceed the exact sum by
+// about n float ulps of the total, so theta is lowered by that much, as the
+// compound scorers' scoreBoundFactor does, and by a margin on top. A positive
+// floor implies othersMax < theta, so a doc missing the clause cannot compete
+// and dropping the clause's low-scoring matches only drops docs below theta.
+inline float clauseFloor(float theta, double othersMax, size_t clauses) {
+  if (!(theta > 0.0f) || !std::isfinite(othersMax) || !std::isfinite(theta)) {
+    return -std::numeric_limits<float>::infinity();
+  }
+  othersMax = std::max(0.0, othersMax);
+  double factor = 1.0 + (double)(clauses + 1) * 0x1p-24;
+  double floor = (double)theta / factor - othersMax
+      - ((double)std::abs(theta) + std::abs(othersMax)) * 1e-6;
+  return floor > 0.0 ? (float)floor : -std::numeric_limits<float>::infinity();
+}
+
+// A setup-time choice of a clause and the fixed bound on all other scores.
+struct ClauseFloorTarget {
+  Query::Scorer* scorer;
+  double othersMax;
+};
+
+inline std::span<ClauseFloorTarget> makeClauseFloorTargets(
+    MemPool& pool, std::span<Query::Scorer* const> clauses,
+    std::span<const float> clauseMax, std::span<const uint8_t> floorPays,
+    double extraMax = 0.0) {
+  if (floorPays.empty()) return {};
+  assert(clauses.size() == clauseMax.size());
+  assert(clauses.size() == floorPays.size());
+  size_t count = std::count_if(floorPays.begin(), floorPays.end(),
+                               [](uint8_t pays) { return pays != 0; });
+  if (count == 0) return {};
+  auto targets = pool.make_span<ClauseFloorTarget>(count);
+  size_t at = 0;
+  for (size_t i = 0; i < clauses.size(); i++) {
+    if (!floorPays[i]) continue;
+    // Clamp the extra contribution before summing to avoid cancellation.
+    double others = extraMax < 0.0 ? 0.0 : extraMax;
+    for (size_t j = 0; j < clauseMax.size(); j++) {
+      if (j != i) others += (double)clauseMax[j];
+    }
+    if (std::isfinite(others)) targets[at++] = {clauses[i], others};
+  }
+  return targets.first(at);
+}
+
+inline void forwardClauseFloors(std::span<const ClauseFloorTarget> targets,
+                                float theta, size_t clauses) {
+  for (const auto& target : targets) {
+    float floor = clauseFloor(theta, target.othersMax, clauses);
+    if (floor > 0.0f) target.scorer->setMinCompetitiveScore(floor);
+  }
+}
+
 const Query* peelBoost(const Query* query, float& boost);
 Query* peelBoost(Query* query, float& boost);
 bool sameScoringClause(const Query* a, const Query* b);
 uint64_t scoringClauseHash(const Query* query);
 Query::ScoreProfile scoreProfile(const Query& query);
+bool logicalConsumesDomain(const Query& query);
 bool canOmitWeightForCacheFirstMembership(const Query& query);
 bool exactDomainIdentity(const Query& query);
 bool directCountAvailable(const Query& query, IndexReader& reader);
@@ -2287,6 +2462,16 @@ private:
     std::fill(currentBits.begin(), currentBits.end(), 0);
     fill(scorers[0], currentBits);
     for (size_t i = 1; i < scorers.size(); i++) {
+      // A membership intersection stops at its first empty result; the
+      // skipped filters resume at a later window, and only the window's
+      // words hold bits (fillWindowBits). OR them without branching, so
+      // where the first set word lands steers no branch.
+      if constexpr (!scored) {
+        uint64_t live = 0;
+        size_t words = (size_t) (end - start + 63) >> 6;
+        for (size_t word = 0; word < words; word++) live |= currentBits[word];
+        if (live == 0) return 0;
+      }
       std::fill(scratchBits.begin(), scratchBits.end(), 0);
       fill(scorers[i], scratchBits);
       for (size_t word = 0; word < currentBits.size(); word++) {

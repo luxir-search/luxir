@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 
 #include "luxir/reader/Postings.h"
@@ -20,6 +21,7 @@ TEST(UnpartitionedByteIdentityTest, DefaultMergeCorpus) {
   schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
       "body", FieldType::INDEX_DOCS_FREQS_POSITIONS);
   TestIndex index;
+  test::reserveIncarnation(index.dir);
   index.iw = std::make_unique<IndexWriter>(index.snapshots, schema);
   index.iw->mergePolicy->setMergeFactor(1000);
   // This test's contract is the UNPARTITIONED byte format; keep it serial
@@ -43,7 +45,7 @@ TEST(UnpartitionedByteIdentityTest, DefaultMergeCorpus) {
   const char* dumpPath = std::getenv("LUXIR_BYTE_DUMP");
   if (dumpPath == nullptr) return;
   uint64_t segId = index.reader->segments()[0].segInfo.seg_id;
-  std::string prefix = Postings::getIndexFileNamePrefix(segId);
+  std::string prefix = Postings::getIndexFileNamePrefix(segId, 1);
   std::vector<Directory::FileInfo> infos;
   index.dir.listFiles(infos);
   std::vector<std::string> files;

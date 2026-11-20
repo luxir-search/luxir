@@ -41,7 +41,6 @@ protected:
   // the dictionary reports there is shared with a term this enum never saw.
   // Set when that happens; the next accept re-anchors instead of trusting it.
   bool chainBroken = false;
-  int64_t termsExaminedCount = 0;
   int64_t dpStepCount = 0;
   int64_t jumpCount = 0;
 
@@ -143,7 +142,7 @@ private:
   void store(const Scan& s) {
     previousLiveDepth = s.liveDepth;
     chainBroken = s.chainBroken;
-    termsExaminedCount = s.examined;
+    this->visitedTerms = s.examined;
     dpStepCount = s.steps;
     jumpCount = s.jumps;
   }
@@ -151,6 +150,11 @@ private:
   bool stop(const Scan& s) {
     store(s);
     return finish();
+  }
+
+  bool stopAtLimit(const Scan& s) {
+    store(s);
+    return this->finishAtLimit();
   }
 
 public:
@@ -179,9 +183,15 @@ public:
     // automaton on every step.
     const A a = automaton;
     Scan s{(int)prefix.size(), previousLiveDepth, chainBroken,
-           termsExaminedCount, dpStepCount, jumpCount};
+           this->visitedTerms, dpStepCount, jumpCount};
     if (advanceFirst && !advanceAutomaton(a, s)) return stop(s);
+    int64_t limit = this->sliceEnd;
     for (;;) {
+      if (s.examined >= limit) [[unlikely]] {
+        store(s);
+        if (!this->extendSlice()) return stopAtLimit(s);
+        limit = this->sliceEnd;
+      }
       Status status = acceptAutomaton(a, s);
       if (status != Status::REJECT) {
         if (status == Status::END) return stop(s);
@@ -193,7 +203,7 @@ public:
     }
   }
 
-  int64_t termsExamined() const { return termsExaminedCount; }
+  int64_t termsExamined() const { return this->visitedTerms; }
   int64_t dpSteps() const { return dpStepCount; }
   int64_t jumps() const { return jumpCount; }
 };

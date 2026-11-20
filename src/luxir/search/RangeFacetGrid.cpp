@@ -110,8 +110,8 @@ RangeFacetGrid::RangeFacetGrid(Kind kind, FieldType::Type type, TimeZone zone)
 
 RangeFacetGrid RangeFacetGrid::fixed(FieldType::Type type, int64_t gap, int64_t origin,
                                     TimeZone zone, DateUnit dateUnit, std::optional<int64_t> start) {
-  if (type != FieldType::Type::INT && type != FieldType::Type::DATE) {
-    throw RequestError("integer grid requires INT or DATE");
+  if (!FieldType::isNumericColumn(type) || type == FieldType::FLOAT || type == FieldType::DOUBLE) {
+    throw RequestError("integer grid requires an integer-lattice field");
   }
   if (gap <= 0) throw RequestError("range gap must be > 0");
   RangeFacetGrid result(Kind::FIXED, type, type == FieldType::Type::DATE ? zone : TimeZone::utc());
@@ -265,9 +265,9 @@ RangeFacetGrid::Cell RangeFacetGrid::floor(int64_t value) const {
     double decoded = type == FieldType::Type::FLOAT ? (double)sortableInt32ToFloat((int32_t)value)
                                         : sortableInt64ToDouble(value);
     if (!std::isfinite(decoded)) throw RequestError("cannot floor a non-finite value");
-    long double index = std::floor(((long double)decoded - floatingOrigin) / floatingGap);
+    double index = std::floor((decoded - floatingOrigin) / floatingGap);
     // At larger indices unit increments cannot yield distinct double fences.
-    if (index <= (long double)INT64_MIN || index >= (long double)INT64_MAX) {
+    if (!(index > -0x1p63 && index < 0x1p63)) {
       throw RequestError("floating grid index overflow");
     }
     Cell cell = floatingCell((int64_t)index);

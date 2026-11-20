@@ -3,6 +3,7 @@
 
 #pragma once
 #include <gtest/gtest.h>
+#include "test/StorageTestUtils.h"
 #include "luxir/util/random.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/index/IndexWriter.h"
@@ -166,6 +167,7 @@ namespace luxir::test {
 
     void initWriter() {
       if (iw.get() == nullptr) {
+        reserveIncarnation(dir);
         iw = std::make_unique<IndexWriter>(snapshots);
       }
       inverter = &iw->obtainInverter();

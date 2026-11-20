@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "luxir/store/Manifest.h"
@@ -149,14 +150,20 @@ public:
 
 IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema,
                          IndexRamBudget* sharedIndexRamBudget, int mergeFactor, std::string initialIncarnation,
-                         oneapi::tbb::task_arena* arena)
+                         oneapi::tbb::task_arena* arena, std::optional<WriterOpen> opened)
   : dir(snapshots.dir),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
     snapshots(snapshots) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   mergePolicy->setMergeFactor(mergeFactor);
-  auto manifest = Manifest::load(dir);
+  if (!opened) opened.emplace(dir, IncarnationState::claim(dir));
+  writerState = std::move(opened->state);
+  writerEpoch = writerState.value.epoch;
+  auto& manifest = opened->manifest;
+  if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
+    throw std::runtime_error("snapshot fallback requires recovery into a new incarnation");
+  }
   nextManifestGen = manifest.highestGeneration;
   manifestNames = std::move(manifest.names);
   if (!manifest.bytes) {
@@ -170,14 +177,12 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     incarnation = indexInfo.incarnation;
     lastSegId = indexInfo.last_seg_id;
     lastCommitTime = indexInfo.commit_time;
-    lastSnapshot.store(std::make_shared<const CommitSnapshot>(manifest.bytes,
-        Schema::fromStored(*indexInfo.schema, indexInfo.schema_gen),
-        CommitId{incarnation, indexInfo.index_gen}, indexInfo.commit_time, filesOf(indexInfo),
-        CommitSnapshot::populatedOf(indexInfo), CommitSnapshot::digestOf(*manifest.bytes)));
+    lastSnapshot.store(snapshots.resolve(manifest.bytes));
     snapshots.publish(lastSnapshot.load());
     indexGen = indexInfo.index_gen;
     coreGen = indexInfo.core_gen;
-    schemaGen_ = indexInfo.schema_gen;
+    schemaGen_ = indexInfo.schema->version.generation();
+    nextSchemaVersion = indexInfo.schema->version.local;
     updateNumber.store(indexInfo.update_version, std::memory_order_relaxed);
     completedUpdateVersion = indexInfo.update_version;
     durableUpdateVersion = indexInfo.update_version;
@@ -191,14 +196,16 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       int32_t nDocs = segment.max_doc;
       // having ndocs in the list of segments is redundant with info in the segment itself and may be removed later.
       // for now it makes it easy to populate nDocs for merge decisions.
-      auto [iter, success] = segInfos.emplace(segId, std::make_unique<SegInfo>(segId, nDocs));
+      auto [iter, success] = segInfos.emplace(segId, std::make_unique<SegInfo>(segId, segment.creator_epoch, nDocs));
       assert(success); // should be no repeated segments
       auto& seg = *iter->second;
-      seg.liveGen = seg.publishedLiveGen = segment.live_gen;
+      seg.liveGen = seg.publishedLiveGen = seg.initialLiveGen = segment.live_gen;
+      seg.liveEpoch = seg.initialLiveEpoch = segment.live_epoch;
       seg.minVersion = segment.min_version;
       seg.maxVersion = segment.max_version;
       seg.liveDocs = segment.live_docs;
-      seg.schemaGen = segment.schema_gen;
+      seg.mergeRows = segment.merge_rows.value_or(segment.max_doc);
+      seg.schema = SchemaBinding(segment.schema);
       seg.files = fromWire(segment.files);
       seg.firstCommitTime = segment.commit_time;  // firstCommitTime is stored in the segment meta.
       seg.lastCommitTime = indexInfo.commit_time; // not stored in the segment meta, so use index meta.
@@ -225,15 +232,8 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     api::IndexInfo initial;
     std::pmr::monotonic_buffer_resource arena;
     publish(initial, arena, schema ? schema : Schema::createDefaultSchema());
-  } else if (manifest.generation != manifest.highestGeneration) {
-    // A recovered older root must not advertise a regressed generation under
-    // the old identity. Collection storage also switches incarnation directories.
-    incarnation = CommitId::newIncarnation();
-    std::pmr::monotonic_buffer_resource arena;
-    auto recovered = Manifest::decode(manifest.bytes, arena);
-    publish(recovered, arena);
   }
-  snapshots.sweepOrphans(manifest);
+  snapshots.sweepOrphans(manifest, writerEpoch);
   storedDictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(*getSchema()));
   // Only manifest-live segments can seed a resource. Own the winning bytes;
   // later retirement of its segment must not affect inverter/merge writers.
@@ -244,14 +244,17 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     int64_t bestBytes = -1;
     uint64_t bestSegId = 0;
     for (const auto& [id, seg] : segInfos) {
-      auto reader = getSegmentPostingsReader(*seg);
-      const auto* field = reader->fieldInfo(name);
-      if (!field || !field->stored || field->stored->dictionary.empty()) continue;
-      auto bytes = field->columnMetaOff;
-      if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
-        bestBytes = bytes;
-        bestSegId = id;
-        bestDictionary = field->stored->dictionary;
+      auto readerCore = getSegmentCore(*seg);
+      for (const auto& space : readerCore->spaces()) {
+        auto* reader = readerCore->spaceReader(space.path);
+        const auto* field = reader->fieldInfo(name);
+        if (!field || !field->stored || field->stored->dictionary.empty()) continue;
+        auto bytes = field->columnMetaOff;
+        if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
+          bestBytes = bytes;
+          bestSegId = id;
+          bestDictionary = field->stored->dictionary;
+        }
       }
     }
     auto token = storedDictionaries.token(name, stored->format_);
@@ -265,8 +268,8 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     seedActiveVectorOverlayNamesFromManifestLocked();
   }
 
-  if (arena) arena->execute([this] { updateGraph.emplace(); });
-  else updateGraph.emplace();
+  if (arena) arena->execute([this] { updateGraph.emplace(updateContext); });
+  else updateGraph.emplace(updateContext);
 
   // Create the updateGraph.  Start with a serial node that assigns an order to each update command
   // This could be done in a quick synchronized block instead... and could then be safely inspected by the client
@@ -467,6 +470,7 @@ void IndexWriter::close() {
   // queued before reset is included in wait_for_all below.
   pressureRegistration.reset();
 
+  Signal::emit("writerCloseDrain", this);
   // without this, in gcc release mode we can get a crash when the IndexWriter is destroyed, even when
   // the graph wasn't used. Presumably because the test was so fast and there was some async initialization
   // of the graph still going on?
@@ -701,6 +705,17 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
       throw SchemaError(std::format("Cannot change unit of existing date field '{}': {} -> {}",
           name, oldUnit->second, newUnit->second));
     }
+    // Existing segments hold only the postings of an indexed string written
+    // without a column, and ARRAY sequences cannot be rebuilt from those.
+    auto* type = schema->getFieldTypePtr(name);
+    auto oldColumn = old->second.properties.find("column");
+    if (type && FieldType::storage(type->type()) == FieldType::Storage::TERMS && type->indexed()
+        && type->hasColumn() && oldColumn != old->second.properties.end()
+        && oldColumn->second == "false") {
+      throw SchemaError(std::format(
+          "Cannot add a column to existing indexed string field '{}'; reindex into a new field",
+          name));
+    }
   }
   std::pmr::monotonic_buffer_resource arena;
   api::IndexInfo info;
@@ -734,7 +749,7 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
   }
   if (!inverter) {
     auto newInverter = std::make_unique<Inverter>(
-        dir, ++lastSegId, pinned, indexRamBudget,
+        dir, ++lastSegId, writerEpoch, pinned, indexRamBudget,
         [this](std::string_view resource, const StoredChunkFormat& format) {
           return storedDictionaries.lookup(resource, format);
         });
@@ -824,9 +839,15 @@ bool IndexWriter::startIdleFlushLocked(Inverter& inverter, bool pressure) {
   return false;
 }
 
-// Caller holds indexMutex. Largest-relief-first avoids flushing retained RAM; the
-// budget-side claim prevents broadcasts to multiple writers from over-shedding
-// once the global pressure target is met.
+// Caller holds indexMutex. Largest-relief-first sheds inverters whose flush frees
+// RAM at once before any whose RAM is mostly delete bytes, which outlive the
+// flush as a packet. Pressure implies a finite budget, which runs delete passes,
+// so that packet is retired once the frontier passes it. When no inverter offers
+// immediate relief, the oldest at the floor is shed for that deferred relief: it
+// pins the frontier, so a younger one's packet would wait for it anyway. Without
+// this an id-heavy inverter grows to its own cap. The budget-side claim prevents
+// broadcasts to multiple writers from over-shedding once the global pressure
+// target is met.
 //
 // Pressure that only merge demand creates sheds an inverter only once it holds
 // a fair share of half the pool (budget / (2 * this writer's active
@@ -841,17 +862,27 @@ void IndexWriter::pressureShedIdleLocked() {
   }
   for (;;) {
     Inverter* victim = nullptr;
-    size_t largestRelief = 0;
+    Inverter* deferred = nullptr;
+    size_t largestRelief = 0, deferredSize = 0;
     for (auto& entry : idleInverters) {
-      size_t retained = entry.first->retainedDeleteBytes();
-      assert(entry.first->memSize() >= retained);
-      size_t relief = entry.first->memSize() - retained;
-      if (relief == 0 || relief < floor) continue;
-      if (relief > largestRelief) {
-        victim = entry.first;
-        largestRelief = relief;
+      Inverter* inverter = entry.first;
+      size_t size = inverter->memSize();
+      size_t retained = inverter->retainedDeleteBytes();
+      assert(size >= retained);
+      size_t relief = size - retained;
+      if (relief != 0 && relief >= floor) {
+        if (relief > largestRelief) {
+          victim = inverter;
+          largestRelief = relief;
+        }
+      } else if (retained != 0 && size >= floor
+                 && (!deferred || inverter->minDocVersion < deferred->minDocVersion
+                     || (inverter->minDocVersion == deferred->minDocVersion && size > deferredSize))) {
+        deferred = inverter;
+        deferredSize = size;
       }
     }
+    if (victim == nullptr) victim = deferred;
     if (victim == nullptr || !startIdleFlushLocked(*victim, true)) return;
     INDEX_DEBUG("indexing RAM pressure, flushing idle inverter={}", *victim);
   }
@@ -1134,74 +1165,86 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
     auto& commitInfo = *msg.commitInfo;
     commitInfo.updateMessage = &msg; // set the update message that triggered this commit
 
-    // Register with one hold for every merge already submitted but not tailed.
-    // A later merge submission adds its own hold before entering the graph.
-    if (msg.waitForMerges) {
-      waitingForMerges.push_back(&msg);
-      commitInfo.leftToFlush += (uint32_t)mergePolicy->outstandingMerges;
-    }
-
-    // first look at any flushing inverters that are not marked for a commit yet
-    // and mark them if necessary.
-    for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
-      if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
-        INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg,
-                    *it->second.get());
-        it->second->commitInfo = &commitInfo;
-        commitInfo.leftToFlush++;
+    // Everything below hands pointers into msg to inverters and to the merge
+    // waiter list.  The caller completes msg when this throws, which frees
+    // commitInfo, so a failure must take those pointers back first: an
+    // inverter already flushing then finishes as a plain flush, and the
+    // waiter list no longer names a freed message.
+    try {
+      // Register with one hold for every merge already submitted but not tailed.
+      // A later merge submission adds its own hold before entering the graph.
+      if (msg.waitForMerges) {
+        waitingForMerges.push_back(&msg);
+        commitInfo.leftToFlush += (uint32_t)mergePolicy->outstandingMerges;
       }
-    }
 
-    // now look at all idle inverters and initiate a flush if necessary.
-    for (auto it = idleInverters.begin(); it != idleInverters.end();) {
-      auto current = it++;
-      if (current->second->minVersion <= msg.updateVersion) {
-        if (current->second->commitInfo == nullptr) {
-          INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg,
-                      *current->second.get());
-          current->second->commitInfo = &commitInfo;
+      // first look at any flushing inverters that are not marked for a commit yet
+      // and mark them if necessary.
+      for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
+        if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
+          INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg,
+                      *it->second.get());
+          it->second->commitInfo = &commitInfo;
           commitInfo.leftToFlush++;
         }
-        else {
-          // this would be a bug since we should never have an idle inverter that is part of a commit.
-          LOG_ERROR("Idle inverter is part of another commit.");
-        }
+      }
 
-        if (!startIdleFlushLocked(*current->second, false)) {
-          throw std::runtime_error("Segment flush node rejected a commit inverter");
+      // now look at all idle inverters and initiate a flush if necessary.
+      for (auto it = idleInverters.begin(); it != idleInverters.end();) {
+        auto current = it++;
+        if (current->second->minVersion <= msg.updateVersion) {
+          if (current->second->commitInfo == nullptr) {
+            INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg,
+                        *current->second.get());
+            current->second->commitInfo = &commitInfo;
+            commitInfo.leftToFlush++;
+          }
+          else {
+            // this would be a bug since we should never have an idle inverter that is part of a commit.
+            LOG_ERROR("Idle inverter is part of another commit.");
+          }
+
+          if (!startIdleFlushLocked(*current->second, false)) {
+            throw std::runtime_error("Segment flush node rejected a commit inverter");
+          }
         }
       }
-    }
 
-    // Any inverters that are busy should be marked so that when they are released they can be flushed.
-    for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
-      if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
-        INDEX_DEBUG("\tinitiateCommit: msg={} marking busy inverter={} for commit", (void*)&msg,
-                    *it->second.get());
-        it->second->commitInfo = &commitInfo;
-        commitInfo.leftToFlush++;
+      // Any inverters that are busy should be marked so that when they are released they can be flushed.
+      for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
+        if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
+          INDEX_DEBUG("\tinitiateCommit: msg={} marking busy inverter={} for commit", (void*)&msg,
+                      *it->second.get());
+          it->second->commitInfo = &commitInfo;
+          commitInfo.leftToFlush++;
+        }
       }
-    }
 
-    INDEX_DEBUG("initiateCommit: msg={} leftToFlush={}", (void*)&msg, msg.commitInfo->leftToFlush);
+      INDEX_DEBUG("initiateCommit: msg={} leftToFlush={}", (void*)&msg, msg.commitInfo->leftToFlush);
 
-    // updateFinishNode is serial and segment-flush completion needs indexMutex,
-    // so this is the commit's single admission point.  No ordinal is consumed
-    // until all state above is installed.  An immediate commit increments the
-    // counter only after the sequencer accepts it.
-    msg.commitNum = commitNumber;
-    if (msg.waitForMerges) Signal::emit("commitWaitingForMerges", &msg);
-    // Normally a commit would be kicked off by the last segment flushing.  But if there are no segments to flush,
-    // we need to kick it off here.
-    if (commitInfo.leftToFlush == 0) {
-      try {
+      // updateFinishNode is serial and segment-flush completion needs indexMutex,
+      // so this is the commit's single admission point.  No ordinal is consumed
+      // until all state above is installed.  An immediate commit increments the
+      // counter only after the sequencer accepts it.
+      msg.commitNum = commitNumber;
+      if (msg.waitForMerges) Signal::emit("commitWaitingForMerges", &msg);
+      // Normally a commit would be kicked off by the last segment flushing.  But if there are no segments to flush,
+      // we need to kick it off here.
+      if (commitInfo.leftToFlush == 0) {
         _releaseToCommitSequencer(&msg);
-      } catch (...) {
-        if (msg.waitForMerges) {
-          std::erase(waitingForMerges, &msg);
-        }
-        throw;
       }
+    } catch (...) {
+      auto disown = [&](auto& inverters) {
+        for (auto& entry : inverters) {
+          if (entry.second->commitInfo == &commitInfo) entry.second->commitInfo = nullptr;
+        }
+      };
+      disown(flushingInverters);
+      disown(idleInverters);
+      disown(busyInverters);
+      std::erase(waitingForMerges, &msg);
+      msg.commitInfo.reset();
+      throw;
     }
     commitNumber++;
     // Flushes this commit started complete under indexMutex, so none can
@@ -1428,12 +1471,14 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   std::unique_ptr<SegInfo> segInfo;
   if (!aborted) {
     segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
-                                        inverter.getPostingsWriter().getMaxDoc());
+                                        inverter.getPostingsWriter().creatorEpoch,
+                                        inverter.getPostingsWriter().getMaxDoc(SpaceOrdinal::ROOT));
+    segInfo->mergeRows = inverter.getPostingsWriter().getMaxSpaceRows();
     segInfo->unsyncedFiles = std::move(flushedFiles);
     segInfo->files = std::move(descriptors);
     segInfo->minVersion = inverter.minVersion;
     segInfo->maxVersion = inverter.maxVersion;
-    segInfo->schemaGen = inverter.schema->gen_;
+    segInfo->schema = inverter.schema->binding;
     auto& postings = inverter.getPostingsWriter();
     if (auto& range = postings.idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
     segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
@@ -1487,9 +1532,8 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
       if (segInfo) deletes->sourceSegId = segInfo->segId;
       // An adopting commit retires the packet unless it holds a newer request,
       // and must not race a pass for it. No commit adopts the inverter once it
-      // leaves flushingInverters below. If initiateCommit throws after adopting
-      // inverters, nothing completes that commit, so their packets keep the
-      // claim until a later commit completes: a delay only.
+      // leaves flushingInverters below, and a commit that fails to start
+      // disowns its inverters before it completes.
       if (auto* commit = inverter.commitInfo) {
         uint64_t version = commit->updateMessage->updateVersion;
         if (deletes->getLargestVersion() <= version) deletes->commitClaim = version;
@@ -1551,9 +1595,9 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   inverterPtr.reset();
   if (aborted) {
     try {
-      dir.deletePrefix(Postings::getIndexFileNamePrefix(segId));
+      dir.deletePrefix(Postings::getIndexFileNamePrefix(segId, writerEpoch));
     } catch (const std::exception& e) {
-      LOG_ERROR("Failed to clean files for aborted segment {}: {}", segId, e.what());
+      LOG_ERROR("Failed to clean files for aborted segment s{}: {}", Postings::segmentKey(segId, writerEpoch), e.what());
     }
   }
 }
@@ -1633,6 +1677,19 @@ uint64_t IndexWriter::retirePendingLocked(const DeleteApplication& app) {
   return bytes;
 }
 
+static std::vector<std::string> collectVectorSelectors(const std::vector<std::string>& buildAuxIndexes) {
+  std::vector<std::string> selectors;
+  boost::unordered_flat_set<std::string> seen;
+  for (const auto& selector : buildAuxIndexes) {
+    if (selector == "*" || selector.starts_with(VectorIndexBuilder::NAME_PREFIX)) {
+      if (seen.emplace(selector).second) {
+        selectors.push_back(selector);
+      }
+    }
+  }
+  return selectors;
+}
+
 // This applies deletes and writes out the new segments file.
 // called from the commitFinishNode which has concurrency==1 (single-threaded)
 bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
@@ -1653,8 +1710,18 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // diffs source liveDocs before swapping; applications finishing after that
   // swap forward their packets to its output for the next application.
   DeleteApplication app(*this);
+  // Serial node: at most one commit holds this intent, and it ends on every path.
+  auto vectorSelectors = collectVectorSelectors(msg.buildAuxIndexes);
+  auto endVectorIntent = scope_guard([this, active = !vectorSelectors.empty()] {
+    if (!active) return;
+    const std::lock_guard lock(indexMutex);
+    inFlightVectorSelectors.clear();
+  });
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
+    if (!vectorSelectors.empty()) {
+      inFlightVectorSelectors = std::move(vectorSelectors);
+    }
     // A commit applies every pending batch and carried packet. publishOnly
     // commits retire nothing; their batches stay pending.
     for (const auto& batch : pendingDeletes.deletes) app.select(batch, true);
@@ -1750,8 +1817,6 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   Signal::emit("commitDataSync", this);
   if (!filesToSync.empty()) {
     dir.sync(filesToSync);
-    std::array<std::string, 1> syncDirectory = {"."};
-    dir.sync(syncDirectory);
   }
   // Only manifest assembly and publication serialize with schema changes.
   // The schema may have advanced while these segments/overlays were built.
@@ -1858,7 +1923,7 @@ void IndexWriter::collectObsoleteLiveDocsLocked(SegInfo& seg, std::vector<std::s
     if (gen == seg.liveGen || gen == seg.publishedLiveGen
         || (seg.mergedLiveGen > 0 && gen == (uint64_t)seg.mergedLiveGen)
         || (seg.mergeDiffLiveGen > 0 && gen == (uint64_t)seg.mergeDiffLiveGen)) return false;
-    names.push_back(Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), gen));
+    names.push_back(Postings::getLiveDocsFileName(Postings::segmentKey(seg.segId, seg.creatorEpoch), gen, seg.liveEpochFor(gen, writerEpoch)));
     return true;
   });
 }
@@ -1906,7 +1971,12 @@ void IndexWriter::retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments
   for (auto& seg : segments) {
     if (!seg) continue;
     INDEX_DEBUG("Deleting files {}", *seg);
-    snapshots.retirePrefix(Postings::getIndexFileNamePrefix(seg->segId));
+    std::vector<std::string> names;
+    for (const auto& file : seg->files) names.push_back(file.name);
+    for (const auto& overlay : seg->auxOverlays) for (const auto& file : overlay.files) names.push_back(file.name);
+    for (auto gen : seg->obsoleteLiveGens) names.push_back(Postings::getLiveDocsFileName(
+        Postings::segmentKey(seg->segId, seg->creatorEpoch), gen, seg->liveEpochFor(gen, writerEpoch)));
+    snapshots.retire(names);
   }
   releaseSegments(segments);
 }
@@ -1978,17 +2048,11 @@ std::vector<AuxInfo> IndexWriter::buildAuxIndexes(
 
 namespace {
 
-std::vector<std::string> collectVectorSelectors(const std::vector<std::string>& buildAuxIndexes) {
-  std::vector<std::string> selectors;
-  boost::unordered_flat_set<std::string> seen;
-  for (const auto& selector : buildAuxIndexes) {
-    if (selector == "*" || selector.starts_with(VectorIndexBuilder::NAME_PREFIX)) {
-      if (seen.emplace(selector).second) {
-        selectors.push_back(selector);
-      }
-    }
-  }
-  return selectors;
+std::vector<VectorIndexBuilder::SegInput> vectorInputs(SegInfo& seg, SegmentCore& core) {
+  std::vector<VectorIndexBuilder::SegInput> inputs;
+  inputs.reserve(core.spaces().size());
+  for (const auto& space : core.spaces()) inputs.emplace_back(seg.segId, core.spaceReader(space.path), seg.creatorEpoch);
+  return inputs;
 }
 
 bool eligibleVectorOverlayName(const Schema& schema, std::string_view overlayName) {
@@ -2022,25 +2086,26 @@ std::vector<std::string> collectValidatedExactVectorOverlayNames(
 } // namespace
 
 // Benign load-then-store race: the commit thread and a merge thread can both
-// miss and each create a PostingsReader for a source segment - both are valid,
+// miss and each create a SegmentCore for a source segment - both are valid,
 // one is wasted, last store wins.  Deliberately NOT a lock or CAS; do not
 // "fix" this into synchronization.
 //
-std::shared_ptr<PostingsReader> IndexWriter::getSegmentPostingsReader(SegInfo& seg) {
-  auto pr = seg.sharedPostingsReader.load();
-  if (!pr) {
+std::shared_ptr<SegmentCore> IndexWriter::getSegmentCore(SegInfo& seg) {
+  auto core = seg.sharedSegmentCore.load();
+  if (!core) {
     std::shared_ptr<IndexReader> reader;
-    if (const auto* published = publishedSegment(seg, reader)) pr = published->postingsReaderShared();
-    if (!pr) pr = std::make_shared<PostingsReader>(dir, seg.segId);
-    seg.sharedPostingsReader.store(pr);
+    if (const auto* published = publishedSegment(seg, reader)) core = published->segmentCoreShared();
+    if (!core) core = std::make_shared<SegmentCore>(dir, seg.segId, seg.creatorEpoch);
+    seg.sharedSegmentCore.store(core);
   }
+  auto& pr = core->rootReader();
   bool rangeKnown = seg.idRange.load() != nullptr;
   if (!rangeKnown || seg.idDictionaryBlocks.load() == UINT64_MAX) {
     IdRange range;
     uint64_t blocks = 0;
-    if (auto* info = pr->fieldInfo("id"); info && info->nTerms > 0) {
+    if (auto* info = pr.fieldInfo("id"); info && info->nTerms > 0) {
       auto guard = MemPool::threadLocalPoolGuard();
-      TermsEnum terms(guard.pool(), *pr, *info);
+      TermsEnum terms(guard.pool(), pr, *info);
       blocks = terms.numBlocks();
       if (!rangeKnown) {
         terms.seekOrd(0);
@@ -2054,7 +2119,7 @@ std::shared_ptr<PostingsReader> IndexWriter::getSegmentPostingsReader(SegInfo& s
     // A populated range is never replaced.
     if (!rangeKnown) seg.idRange.store(std::make_shared<const IdRange>(std::move(range)));
   }
-  return pr;
+  return core;
 }
 
 // The published reader's segment of the same id is the same physical segment:
@@ -2089,17 +2154,68 @@ void IndexWriter::activateVectorOverlayNames(std::span<const std::string> names)
   }
 }
 
-std::vector<std::string> IndexWriter::snapshotActiveVectorOverlayNames() {
-  std::vector<std::string> names;
+// Matching and building use the same schema snapshot. The output is private,
+// so attachment needs no writer lock and becomes visible with the swap.
+void IndexWriter::prepareMergedVectorOverlays(SegInfo& output,
+                                             boost::unordered_flat_set<std::string>& attempted,
+                                             boost::unordered_flat_set<std::string>& matchedSelectors,
+                                             const char*& phase) {
+  Signal::emit("mergeVectorOverlayPrepare", &output);
+  std::vector<std::string> selectors;
+  boost::unordered_flat_set<std::string> wanted;
   {
-    std::lock_guard<std::mutex> lock(indexMutex);
-    names.reserve(activeVectorOverlayNames.size());
+    std::lock_guard lock(indexMutex);
+    for (const auto& selector : inFlightVectorSelectors) {
+      if (!matchedSelectors.contains(selector)) selectors.push_back(selector);
+    }
     for (const auto& name : activeVectorOverlayNames) {
-      names.push_back(name);
+      if (!attempted.contains(name)) wanted.emplace(name);
     }
   }
+  if (wanted.empty() && selectors.empty()) return;
+  phase = "schema_snapshot";
+  auto schema = getSchema();
+  phase = "merged_postings_reader";
+  Signal::emit("mergedPostingsReader", &output);
+  auto prCore = getSegmentCore(output);
+  if (!selectors.empty()) {
+    auto inputs = vectorInputs(output, *prCore);
+    VectorIndexBuilder matcher(dir, inputs,
+                               *schema, 0, writerEpoch);
+    for (const auto& name : matcher.matchingOverlayNames(selectors)) {
+      if (!attempted.contains(name)) wanted.emplace(name);
+    }
+    matchedSelectors.insert(selectors.begin(), selectors.end());
+  }
+  if (wanted.empty()) return;
+  std::vector<std::string> names(wanted.begin(), wanted.end());
   std::sort(names.begin(), names.end());
-  return names;
+  // A failed name is not retried by this merge: the output falls back to flat.
+  attempted.insert(names.begin(), names.end());
+  std::vector<std::string> stagedOverlayFiles;
+  std::vector<AuxInfo> built;
+  try {
+    phase = "merge_vector_overlay";
+    built = buildConcreteVectorOverlays(output, *prCore, names, *schema,
+                                        VectorIndexBuilder::BuildSite::MERGE,
+                                        stagedOverlayFiles);
+    output.unsyncedFiles.reserve(output.unsyncedFiles.size() + stagedOverlayFiles.size());
+    output.auxOverlays.reserve(output.auxOverlays.size() + built.size());
+  } catch (const std::exception& e) {
+    deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
+    LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: {}",
+              output.name(), e.what());
+    return;
+  } catch (...) {
+    deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
+    LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: unknown exception",
+              output.name());
+    return;
+  }
+  // Reserved above, so attaching by move cannot throw: the output never holds
+  // names of deleted files or part of a build.
+  for (auto& file : stagedOverlayFiles) output.unsyncedFiles.push_back(std::move(file));
+  for (auto& info : built) output.auxOverlays.push_back(std::move(info));
 }
 
 uint64_t IndexWriter::nextSegmentOverlayGen(SegInfo& seg) {
@@ -2109,7 +2225,7 @@ uint64_t IndexWriter::nextSegmentOverlayGen(SegInfo& seg) {
 
 std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
     SegInfo& seg,
-    PostingsReader& postingsReader,
+    SegmentCore& core,
     std::span<const std::string> overlayNames,
     const Schema& schema,
     VectorIndexBuilder::BuildSite buildSite,
@@ -2124,15 +2240,18 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
     }
   }
 
-  VectorIndexBuilder::SegInput input{seg.segId, &postingsReader};
   for (const auto& overlayName : overlayNames) {
     if (existingNames.contains(overlayName)) {
       continue;
     }
 
+    auto fieldName = std::string_view(overlayName).substr(VectorIndexBuilder::NAME_PREFIX.size());
+    auto* reader = core.spaceReader(spaceParentPath(fieldName));
+    if (!reader) continue;
+    VectorIndexBuilder::SegInput input{seg.segId, reader, seg.creatorEpoch};
     uint64_t overlayGen = nextSegmentOverlayGen(seg);
     VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
-                          schema, overlayGen);
+                          schema, overlayGen, writerEpoch, indexRamBudget);
     std::vector<std::string> oneSelector{overlayName};
     MetricWork metric(*metrics, MetricStage::VECTOR_BUILD);
     auto newlyBuilt = vb.build(oneSelector, existingNames, outFiles, buildSite);
@@ -2208,7 +2327,7 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
 
         auto gen = nextSegmentOverlayGen(*seg);
         std::string fileName = Postings::getSegmentOverlayFileName(
-          seg->segId, TestOverlayAuxReader::NAME, gen, 0);
+          seg->segId, TestOverlayAuxReader::NAME, gen, 0, seg->creatorEpoch, writerEpoch);
         FileDescriptor descriptor;
         {
           auto file = dir.createFile(fileName);
@@ -2237,14 +2356,13 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
     if (!vectorSelectors.empty() && schema) {
       for (size_t i = 0; i < segsToKeep.size(); i++) {
         auto* seg = segsToKeep[i];
-        auto pr = getSegmentPostingsReader(*seg);
-        VectorIndexBuilder::SegInput input{seg->segId, pr.get()};
-        VectorIndexBuilder matcher(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
-                                   *schema, 0);
+        auto prCore = getSegmentCore(*seg);
+        auto inputs = vectorInputs(*seg, *prCore);
+        VectorIndexBuilder matcher(dir, inputs, *schema, 0, writerEpoch);
         auto overlayNames = matcher.matchingOverlayNames(vectorSelectors);
         stagedActiveOverlayNames.insert(stagedActiveOverlayNames.end(),
                                         overlayNames.begin(), overlayNames.end());
-        auto built = buildConcreteVectorOverlays(*seg, *pr, overlayNames, *schema,
+        auto built = buildConcreteVectorOverlays(*seg, *prCore, overlayNames, *schema,
                                                  VectorIndexBuilder::BuildSite::COMMIT, stagedFiles);
         for (auto& info : built) {
           stagedOverlays.push_back({seg, std::move(info)});
@@ -2276,14 +2394,21 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   if (failed.load(std::memory_order_acquire)) throw IndexWriterClosedError("index writer has failed");
   auto previous = lastSnapshot.load();
   auto previousSchema = previous ? previous->schema : nullptr;
-  schema = schema ? schema->withHistory(previousSchema ? previousSchema->gen_ + 1 : 1,
-      previousSchema.get()) : previousSchema;
+  if (schema) {
+    SchemaBinding binding = previousSchema ? previousSchema->binding : SchemaBinding{};
+    if (binding.scope.empty()) binding.scope = snapshots.schemaScope;
+    binding.version.local = ++nextSchemaVersion;
+    binding.version.epoch = writerEpoch;
+    schema = schema->withHistory(std::move(binding), previousSchema.get());
+  } else schema = previousSchema;
   std::optional<StoredDictionaryRegistry::SchemaState> dictionarySlots;
   if (schema != previousSchema) dictionarySlots = StoredDictionaryRegistry::prepareSchema(*schema);
-  info.version = 1;
+  info.version = IndexFormat::VERSION;
   info.index_gen = ++nextManifestGen;
-  info.schema_gen = schema->gen_;
-  info.schema = schema->storedInfo(arena);
+  info.writer_epoch = writerEpoch;
+  if (schema != previousSchema) schema = snapshots.schemas->publish(dir, incarnation, std::move(schema));
+  info.schema = schema->binding.wire();
+  info.schema_file = {schema->file.name, schema->file.size, schema->file.xxh3};
   info.incarnation = incarnation;
   info.last_seg_id = lastSegId.load(std::memory_order_relaxed);
   auto now = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2324,20 +2449,20 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   // The segments this writer owns, current or awaiting retirement, and the
   // ones of this snapshot it holds open, for the reader that opens it.
   boost::unordered_flat_map<uint64_t, SegInfo*> ownedSegments;
-  std::vector<std::weak_ptr<PostingsReader>> openReaders(info.segments.size());
+  std::vector<std::weak_ptr<SegmentCore>> openCores(info.segments.size());
   {
     std::lock_guard lock(indexMutex);
     for (const auto& [id, seg] : segInfos) ownedSegments.emplace(id, seg.get());
     for (const auto& seg : segmentsToDelete) ownedSegments.emplace(seg->segId, seg.get());
     for (size_t i = 0; i < info.segments.size(); i++) {
       auto owned = ownedSegments.find(info.segments[i].seg_id);
-      if (owned != ownedSegments.end()) openReaders[i] = owned->second->sharedPostingsReader.load();
+      if (owned != ownedSegments.end()) openCores[i] = owned->second->sharedSegmentCore.load();
     }
   }
   auto snapshot = std::make_shared<const CommitSnapshot>(
       std::make_shared<const std::vector<std::byte>>(std::move(serialized)), schema,
       CommitId{incarnation, info.index_gen}, info.commit_time, filesOf(info), CommitSnapshot::populatedOf(info), digest,
-      std::move(openReaders));
+      std::move(openCores));
   std::pmr::monotonic_buffer_resource retirementArena;
   api::IndexInfo obsolete;
   if (previous) obsolete = Manifest::decode(previous->bytes, retirementArena);
@@ -2350,11 +2475,15 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       if (ownedSegments.contains(segment.seg_id)) for (const auto& file : segment.files) retainedFiles.emplace(file.name);
     }
   }
-  manifestNames.push_back(Manifest::name(info.index_gen));
+  manifestNames.push_back(Manifest::name(info.index_gen, info.writer_epoch));
   auto failure = std::make_shared<const std::string>("snapshot publication failed");
+  auto superseded = std::make_shared<const std::string>("index writer was superseded");
   bool durable = false;
+  bool stateAttempted = false;
   try {
-    Manifest::commit(dir, info.index_gen, *snapshot->bytes, this);
+    Manifest::commit(dir, info.index_gen, *snapshot->bytes, info.writer_epoch);
+    stateAttempted = true;
+    writerState.advance(dir, Manifest::tip(info.index_gen, info.writer_epoch));
     durable = true;
     Signal::emit("manifestDurable", this);
     {
@@ -2382,7 +2511,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       }
       indexGen = info.index_gen;
       coreGen = info.core_gen;
-      schemaGen_ = info.schema_gen;
+      schemaGen_ = schema->gen_;
       durableUpdateVersion = info.update_version;
       lastCommittedSegIds.swap(segmentIds);
       currentAuxIndexes_.swap(auxIndexes);
@@ -2396,7 +2525,11 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
     lastSnapshot.store(snapshot);
     snapshots.publish(snapshot);
   } catch (...) {
-    if (durable) {
+    if (durable || stateAttempted) {
+      try { throw; } catch (const WriterSupersededError&) {
+        failure = std::move(superseded);
+        try { if (onSuperseded) onSuperseded(); } catch (...) {}
+      } catch (...) {}
       failureReason = std::move(failure);
       failed.store(true, std::memory_order_release);
       snapshots.fail();
@@ -2405,10 +2538,9 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       // are durable, so even a crash during cleanup is recoverable. Never reuse
       // its generation; a later successful publication also cleans its names.
       try {
-        dir.deleteFile(Manifest::name(info.index_gen));
-        dir.deleteFile(Manifest::name(info.index_gen) + ".tmp");
-        std::array<std::string, 1> syncDirectory = {"."};
-        dir.sync(syncDirectory);
+        std::array<std::string, 1> names{Manifest::name(info.index_gen, info.writer_epoch)};
+        auto state = IncarnationState::read(dir);
+        if (state && state->value.tip != Manifest::tip(info.index_gen, info.writer_epoch)) dir.deleteDurably(names);
       } catch (const std::exception& e) {
         LOG_WARN("Failed snapshot cleanup: {}", e.what());
       } catch (...) {
@@ -2454,13 +2586,16 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
     const auto& seg = *segs[i];
     auto& wire = segments[i];
     wire.seg_id = seg.segId;
+    wire.creator_epoch = seg.creatorEpoch;
+    wire.live_epoch = seg.liveEpoch;
     wire.max_doc = seg.maxDoc;
+    if (seg.mergeRows != seg.maxDoc) wire.merge_rows = seg.mergeRows;
     wire.live_gen = seg.liveGen;
     wire.min_version = seg.minVersion;
     wire.max_version = seg.maxVersion;
     wire.commit_time = seg.firstCommitTime;
     wire.live_docs = seg.liveDocs;
-    wire.schema_gen = seg.schemaGen;
+    wire.schema = seg.schema.wire();
     wire.next_overlay_gen = seg.nextOverlayGen;
     wire.files = toWire(seg.files, arena);
     auto* overlays = api::build::allocArray(wire.overlays, seg.auxOverlays.size(), arena);
@@ -2571,9 +2706,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         size_t target = (size_t)msg.maxSegments;
         if (segs.size() > target) {
           std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
-            if (a->liveDocs != b->liveDocs) {
-              return a->liveDocs < b->liveDocs;
-            }
+            auto aRows = a->estimatedLiveMergeRows(), bRows = b->estimatedLiveMergeRows();
+            if (aRows != bRows) return aRows < bRows;
             return a->segId < b->segId;
           });
           segs.resize(segs.size() - target + 1);
@@ -2604,41 +2738,56 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       // (the live docs the merger copies) must stay below MAX_SEGMENT_DOCS.
       int64_t mergedDocs = 0;
       boost::unordered_flat_map<std::string, int64_t> ordTermSums;
+      boost::unordered_flat_map<std::string, int64_t> pathRows;
       std::vector<SegInfo*> admitted;
       admitted.reserve(segs.size());
       for (SegInfo* seg : segs) {
         if (!MergeCostModel::docsFit(mergedDocs, seg->liveDocs)) {
           INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because the merged segment would exceed MAX_SEGMENT_DOCS",
-                      seg->segId);
+                      seg->name());
           continue;
         }
-        auto postingsReader = getSegmentPostingsReader(*seg);
+        auto postingsReaderCore = getSegmentCore(*seg);
         MemPool metadataPool;
-        FieldReader fields(*postingsReader);
         boost::unordered_flat_map<std::string, int64_t> additions;
-        bool fits = true;
-        while (fields.readNextField()) {
-          SegFieldInfo info;
-          fields.readFieldInfo(info);
-          if (info.type != FieldType::STRING ||
-              (info.flags & FieldType::INDEX_DOCS) == 0 ||
-              (info.flags & FieldType::MULTI_VALUED) == 0) {
-            continue;
+        auto ordsFit = [&](PostingsReader& reader) {
+          FieldReader fields(reader);
+          while (fields.readNextField()) {
+            SegFieldInfo info{};
+            fields.readFieldInfo(info);
+            if (FieldType::storage(info.type) != FieldType::Storage::TERMS ||
+                (info.flags & FieldType::INDEX_DOCS) == 0 ||
+                (info.flags & FieldType::MULTI_VALUED) == 0) {
+              continue;
+            }
+            std::string name((std::string_view)info.fieldname);
+            int64_t next = additions[name] + info.nTerms;
+            if (!MergeCostModel::ordTermsFit(ordTermSums[name], next)) {
+              return false;
+            }
+            additions[name] = next;
           }
-          std::string name((std::string_view)info.fieldname);
-          int64_t next = additions[name] + info.nTerms;
-          if (!MergeCostModel::ordTermsFit(ordTermSums[name], next)) {
-            fits = false;
-            break;
-          }
-          additions[name] = next;
+          return true;
+        };
+        bool fits = ordsFit(postingsReaderCore->rootReader());
+        std::vector<std::pair<std::string, int64_t>> nextRows;
+        for (size_t i = 1; fits && i < postingsReaderCore->spaces().size(); i++) {
+          const auto& space = postingsReaderCore->spaces()[i];
+          // Physical rows bound the merged space from above: rows of deleted
+          // roots still count, so a merge that would fit once they are dropped
+          // can be skipped.
+          int64_t next = pathRows[space.path] + space.maxDoc;
+          fits = MergeCostModel::docsFit(0, next)
+              && ordsFit(*postingsReaderCore->spaceReader(space.path));
+          nextRows.emplace_back(space.path, next);
         }
         if (!fits) {
-          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged ord dictionary would exceed the safety limit",
-                      seg->segId);
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged row space or ord dictionary would exceed the safety limit",
+                      seg->name());
           continue;
         }
         for (const auto& [field, terms] : additions) ordTermSums[field] += terms;
+        for (const auto& [path, rows] : nextRows) pathRows[path] = rows;
         mergedDocs += seg->liveDocs;
         admitted.push_back(seg);
       }
@@ -2700,11 +2849,11 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     });
 
     phase = "open_source_readers";
-    // grab or open all the postings readers
-    std::vector<std::shared_ptr<PostingsReader>> preaders;
-    preaders.reserve(segs.size());
+    // Pin the source cores for the merge.
+    std::vector<std::shared_ptr<SegmentCore>> sourceCores;
+    sourceCores.reserve(segs.size());
     for (auto segInfo : segs) {
-      preaders.emplace_back(getSegmentPostingsReader(*segInfo));
+      sourceCores.emplace_back(getSegmentCore(*segInfo));
     }
 
     phase = "load_live_docs";
@@ -2717,7 +2866,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     for (auto segInfo : segs) {
       if (segInfo->mergedLiveGen > 0) {
         // Load liveDocs for this segment
-        auto liveDocs = LiveDocs::create(dir, segInfo->segId, segInfo->mergedLiveGen, segInfo->maxDoc);
+        auto liveDocs = LiveDocs::create(dir, segInfo->segId, segInfo->creatorEpoch, segInfo->mergedLiveGen, segInfo->liveEpochFor(segInfo->mergedLiveGen, writerEpoch), segInfo->maxDoc, false, false);
         if (!liveDocs) {
           throw std::runtime_error("Failed to load liveDocs for segment " + std::to_string(segInfo->segId) +
                                    " gen=" + std::to_string(segInfo->mergedLiveGen));
@@ -2732,90 +2881,44 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     }
 
     phase = "prepare_merge_inputs";
-    // Copy the preaders to a vector of pointers for our underlying merge code.
-    std::vector<PostingsReader*> preaderPtrs;
-    preaderPtrs.reserve(preaders.size());
-    for (auto& preader : preaders) {
-      preaderPtrs.push_back(preader.get());
-    }
-
+    // Merge cursors borrow the space readers from the pinned cores.
     {
-      PostingsWriter pwriter(dir, outputSegId);
+      PostingsWriter pwriter(dir, outputSegId, writerEpoch);
 
       phase = "segment_merge";
       // Do the actual merge.  The current schema chooses each stored-fields
       // resource's output format.
       auto mergeSchema = getSchema();
-      SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget,
+      SegmentMerger merger(sourceCores, liveDocsPtrs, pwriter, *indexRamBudget,
                            termPartitionMinBytes, termPartitionMinRangeBytes,
                            termPartitionMaxRanges, *mergeSchema, storedDictionaries);
       merger.merge();
 
       phase = "new_segment_info";
       // Create the new SegInfo for the output segment.
-      auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc());
+      auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.creatorEpoch, pwriter.getMaxDoc(SpaceOrdinal::ROOT));
       newSegInfo->minVersion = segs.front()->minVersion;
       newSegInfo->maxVersion = segs.front()->maxVersion;
-      newSegInfo->schemaGen = segs.front()->schemaGen;
+      newSegInfo->schema = segs.front()->schema;
       for (size_t i = 1; i < segs.size(); i++) {
         newSegInfo->minVersion = std::min(newSegInfo->minVersion, segs[i]->minVersion);
         newSegInfo->maxVersion = std::max(newSegInfo->maxVersion, segs[i]->maxVersion);
-        newSegInfo->schemaGen = std::min(newSegInfo->schemaGen, segs[i]->schemaGen);
+        newSegInfo->schema = std::min(newSegInfo->schema, segs[i]->schema);
       }
       phase = "postings_finish";
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
+      newSegInfo->mergeRows = pwriter.getMaxSpaceRows();
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
-
-      phase = "active_overlay_snapshot";
-      auto activeOverlayNames = snapshotActiveVectorOverlayNames();
-      if (!activeOverlayNames.empty()) {
-        phase = "schema_snapshot";
-        auto schema = getSchema();
-        // The merged segment is private until the swap below.  Building here
-        // avoids reading live source overlays and publishes segment plus
-        // overlay entries atomically at the later commit.
-        phase = "merged_postings_reader";
-        // Test hook: a listener may throw to exercise containment of a
-        // post-merge, pre-swap failure.
-        Signal::emit("mergedPostingsReader", newSegInfo.get());
-        auto pr = getSegmentPostingsReader(*newSegInfo);
-        #ifndef NDEBUG
-        {
-          std::lock_guard<std::mutex> lock(indexMutex);
-          assert(!segInfos.contains(newSegInfo->segId));
-        }
-        #endif
-        std::vector<std::string> stagedOverlayFiles;
-        try {
-          phase = "merge_vector_overlay";
-          auto built = buildConcreteVectorOverlays(*newSegInfo, *pr, activeOverlayNames,
-                                                   *schema, VectorIndexBuilder::BuildSite::MERGE,
-                                                   stagedOverlayFiles);
-          for (auto& file : stagedOverlayFiles) {
-            newSegInfo->unsyncedFiles.push_back(file);
-          }
-          for (auto& info : built) {
-            newSegInfo->auxOverlays.push_back(std::move(info));
-          }
-        } catch (const std::exception& e) {
-          deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
-          LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: {}",
-                    newSegInfo->segId, e.what());
-        } catch (...) {
-          deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
-          LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: unknown exception",
-                    newSegInfo->segId);
-        }
-        phase = "after_merge_vector_overlay";
-      }
 
       std::vector<uint64_t> coveredGens;
       coveredGens.reserve(segs.size());
       for (auto* seg : segs) coveredGens.push_back(seg->mergedLiveGen);
       auto diffGuard = indexRamBudget->forceAcquire(0);
       std::unique_ptr<screaming::RAMFixedBitSet> outputLiveBits;
+      boost::unordered_flat_set<std::string> attemptedOverlays, matchedSelectors;
       for (;;) {
+        prepareMergedVectorOverlays(*newSegInfo, attemptedOverlays, matchedSelectors, phase);
         std::vector<uint64_t> currentGens;
         currentGens.reserve(segs.size());
         {
@@ -2834,7 +2937,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           // Rescan from the merged generation on every retry. Clearing an
           // already-clear output bit is a no-op, so only the generation the
           // diff covered needs to be remembered.
-          auto current = LiveDocs::create(dir, seg->segId, currentGens[i], seg->maxDoc, false);
+          auto current = LiveDocs::create(dir, seg->segId, seg->creatorEpoch, currentGens[i], seg->liveEpochFor(currentGens[i], writerEpoch), seg->maxDoc, false, false);
           const auto* merged = liveDocsVec[i] ? &liveDocsVec[i]->bitset() : nullptr;
           const auto& now = current->bitset();
           for (int32_t word = 0; word < (int32_t)screaming::FixedBitSet::sizeInWords(seg->maxDoc); word++) {
@@ -2858,17 +2961,17 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           coveredGens[i] = currentGens[i];
         }
         if (changed) {
-          // The output is private. Replace its first generation on a retry;
-          // no reader or manifest can observe an intermediate bitmap.
+          // Each retry writes a new immutable bitmap for this private output.
           newSegInfo->unsyncedFiles.reserve(newSegInfo->unsyncedFiles.size() + 1);
           newSegInfo->files.reserve(newSegInfo->files.size() + 1);
-          auto name = Postings::getLiveDocsFileName(Postings::getSortableString(outputSegId), 1);
+          auto name = Postings::getLiveDocsFileName(Postings::segmentKey(outputSegId, writerEpoch), newSegInfo->liveGen, writerEpoch);
+          if (newSegInfo->liveGen) dir.deleteFile(name);
           std::erase(newSegInfo->unsyncedFiles, name);
           std::erase_if(newSegInfo->files, [&](const auto& file) { return file.name == name; });
-          liveDocsBytesWritten += LiveDocsWriter::writeLiveDocs(dir, outputSegId, 1, *outputLiveBits,
-                                                                newSegInfo->maxDoc, newSegInfo->liveDocs,
-                                                                newSegInfo->unsyncedFiles, &newSegInfo->files);
-          newSegInfo->liveGen = 1;
+          liveDocsBytesWritten += LiveDocsWriter::writeLiveDocs(dir, outputSegId, writerEpoch,
+              newSegInfo->liveGen + 1, writerEpoch, *outputLiveBits, newSegInfo->maxDoc, newSegInfo->liveDocs,
+              newSegInfo->unsyncedFiles, &newSegInfo->files);
+          newSegInfo->liveGen++;
         }
         Signal::emit("mergeLiveDocsDiff", newSegInfo.get());
         phase = "publish_swap_prepare";
@@ -2877,11 +2980,25 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         for (size_t i = 0; i < segs.size(); i++) {
           if (segs[i]->liveGen != coveredGens[i]) retry = true;
         }
+        // Atomic with the swap: an output swapped from here on is covered, and
+        // one swapped before a commit's capture is in that commit's segments.
+        for (const auto& name : activeVectorOverlayNames) {
+          if (!attemptedOverlays.contains(name)) retry = true;
+        }
+        for (const auto& selector : inFlightVectorSelectors) {
+          if (!matchedSelectors.contains(selector)) retry = true;
+        }
         if (retry) continue;
         segmentsToDelete.reserve(segmentsToDelete.size() + segs.size());
         if (newSegInfo->liveDocs > 0) {
           segInfos.reserve(segInfos.size() + 1);
           mergePolicy->_prepareUpdate(newSegInfo.get());
+          // An overlay installed with the output keeps its name active for
+          // later merges, as startup seeding from the manifest would. Done
+          // here because it can allocate and the swap below must not throw.
+          for (const auto& overlay : newSegInfo->auxOverlays) {
+            if (overlay.kind == VectorIndexBuilder::KIND) activeVectorOverlayNames.emplace(overlay.name);
+          }
         }
 
         size_t personalDeleteCount = newSegInfo->personalDeletes.size();
@@ -2995,7 +3112,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
     if (!outputPublished) {
       try {
-        dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId));
+        dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId, writerEpoch));
       } catch (const std::exception& e) {
         LOG_ERROR("Failed to delete merged segment files for segId={} after merge failure: {}",
                   outputSegId, e.what());
@@ -3018,7 +3135,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     }
   } else if (!outputPublished) {
     try {
-      dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId));
+      dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId, writerEpoch));
     } catch (const std::exception& e) {
       LOG_ERROR("Failed to delete unused merged segment files for segId={}: {}",
                 outputSegId, e.what());
@@ -3168,13 +3285,17 @@ void IndexWriter::testDeleteAllData() {
     snapshots.testReset();
     pendingRetirement.clear();
     // drop all index files
-    dir.clear();
+    std::vector<Directory::FileInfo> files;
+    dir.listFiles(files);
+    for (const auto& file : files) if (file.name != "STATE" && file.name != getSchema()->file.name) dir.deleteFile(file.name);
+    writerState = IncarnationState::claim(dir);
+    writerEpoch = writerState.value.epoch;
 
     // Any operation that rewinds seg_id/coreGen/commitTime namespaces MUST
     // swap or epoch the filter cache before reusing those namespaces.
     lastSegId = 0;
-    indexGen = 0;
-    incarnation = CommitId::newIncarnation();
+    // Keep the directory identity and manifest generations: publication observers
+    // must never see a commit token reused. testReset revoked the old pins.
     coreGen = 0;
     lastCommittedSegIds.clear();
     currentAuxIndexes_.clear();
@@ -3190,7 +3311,6 @@ void IndexWriter::testDeleteAllData() {
     completedCommitVersion = 0;
     deletePassBackoff = {};
     deletePassHeld = false;
-    nextManifestGen = 0;
     manifestNames.clear();
 
     lastCommitTime = 0;
@@ -3263,6 +3383,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
   Stats out;
   std::vector<uint64_t> committedIds;
   std::vector<uint64_t> writerSegmentIds;
+  std::vector<std::shared_ptr<SegmentCore>> cores;
   auto copyAux = [](const AuxInfo& src) {
     AuxStats dst;
     dst.kind = src.kind;
@@ -3315,7 +3436,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
 
     committedIds = lastCommittedSegIds;
     if (!includeSegments) writerSegmentIds.reserve(segInfos.size());
-    if (includeSegments) out.segmentStats.reserve(segInfos.size());
+    if (includeSegments) { out.segmentStats.reserve(segInfos.size()); cores.reserve(segInfos.size()); }
     for (const auto& [segId, seg] : segInfos) {
       unused(segId);
       if (!includeSegments) writerSegmentIds.push_back(seg->segId);
@@ -3324,12 +3445,14 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
       if (!includeSegments) continue;
 
       auto& dst = out.segmentStats.emplace_back();
+      cores.push_back(seg->sharedSegmentCore.load());
       dst.segId = seg->segId;
+      dst.creatorEpoch = seg->creatorEpoch;
       dst.liveGen = seg->liveGen;
       dst.minUpdateVersion = seg->minVersion;
       dst.maxUpdateVersion = seg->maxVersion;
       dst.firstCommitTime = seg->firstCommitTime;
-      dst.schemaGen = seg->schemaGen;
+      dst.schemaGen = seg->schema.generation();
       dst.overlays.reserve(seg->auxOverlays.size());
       std::ranges::transform(seg->auxOverlays, std::back_inserter(dst.overlays), copyAux);
       dst.maxDoc = seg->maxDoc;
@@ -3338,6 +3461,13 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
       dst.merging = seg->merging;
     }
   }
+
+  for (size_t i = 0; i < cores.size(); i++) {
+    auto& segment = out.segmentStats[i];
+    if (!cores[i]) cores[i] = SegmentCore::create(dir, segment.segId, segment.creatorEpoch, true);
+    if (cores[i]) segment.readSpaces(*cores[i]);
+  }
+  cores.clear();
 
   boost::unordered_flat_set<uint64_t> committedSet(committedIds.begin(), committedIds.end());
   for (uint64_t segId : writerSegmentIds) {
@@ -3371,7 +3501,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
     // Prefix attribution is unambiguous: the length-prefixed base36 segId
     // encoding means no segId string is a prefix of another, and '_' is not
     // an id character.
-    auto prefix = Postings::getIndexFileNamePrefix(segment.segId);
+    auto prefix = Postings::getIndexFileNamePrefix(segment.segId, segment.creatorEpoch);
     auto it = std::lower_bound(files.begin(), files.end(), prefix,
                                [](const Directory::FileInfo& f, const std::string& p) { return f.name < p; });
     for (; it != files.end() && it->name.starts_with(prefix); ++it) {
@@ -3447,8 +3577,8 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
   }
 
   // Read the segment to find documents that should be deleted
-  auto sharedReader = getSegmentPostingsReader(seg);
-  PostingsReader& reader = *sharedReader;
+  auto core = getSegmentCore(seg);
+  PostingsReader& reader = core->rootReader();
   int32_t maxDocId = reader.maxDoc();
 
   if (!range) {
@@ -3465,7 +3595,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     if (published != nullptr && published->segInfo.live_gen == seg.liveGen) {
       existingLiveDocs = published->liveDocsShared();
     }
-    if (!existingLiveDocs) existingLiveDocs = LiveDocs::create(dir, seg.segId, seg.liveGen, maxDocId);
+    if (!existingLiveDocs) existingLiveDocs = LiveDocs::create(dir, seg.segId, seg.creatorEpoch, seg.liveGen, seg.liveEpoch, maxDocId, false, false);
   }
 
   // The new generation's bits: copied from the existing liveDocs at the first
@@ -3489,7 +3619,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
   // Read the "id" field using TermsEnum
   auto* idFieldInfo = reader.fieldInfo("id");
   if (!idFieldInfo) {
-    LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.segId);
+    LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.name());
     return 0;
   }
 
@@ -3509,7 +3639,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     scratch.forceResize((int64_t)(hits.capacity() * sizeof(DeleteCandidate)));
     std::sort(hits.begin(), hits.end(),
               [](const DeleteCandidate& a, const DeleteCandidate& b) { return a.docId < b.docId; });
-    VersionRuns::Cursor versions(reader.versionRuns());
+    VersionRuns::Cursor versions(reader.core().versionRuns());
     int32_t cleared = 0;
     for (const auto& hit : hits) {
       // A doc goes when any fact outranks its birth; ties survive.
@@ -3520,7 +3650,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       std::atomic_ref<uint64_t> word(liveBits->words[hit.docId >> 6]);
       uint64_t mask = (uint64_t)1 << (hit.docId & 63);
       if (word.fetch_and(~mask, std::memory_order_relaxed) & mask) {
-        INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}", hit.docId, seg.segId);
+        INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}", hit.docId, seg.name());
         cleared++;
       }
     }
@@ -3538,7 +3668,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       std::string_view deleteId = (std::string_view)entry;
 
       INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
-               deleteId, deleteVersion, seg.segId);
+               deleteId, deleteVersion, seg.name());
 
       if (termsEnum.seekForward(deleteId)) {
         // Found the ID term, now get documents containing this ID
@@ -3581,15 +3711,15 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     auto newLiveGen = seg.liveGen + 1;
     numLiveDocs -= deleted;
 
-    std::string oldLiveFile = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), seg.liveGen);
-    liveDocsBytesWritten += LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs,
-                                                          seg.unsyncedFiles, &seg.files);
+    std::string oldLiveFile = Postings::getLiveDocsFileName(Postings::segmentKey(seg.segId, seg.creatorEpoch), seg.liveGen, seg.liveEpoch);
+    liveDocsBytesWritten += LiveDocsWriter::writeLiveDocs(dir, seg.segId, seg.creatorEpoch, newLiveGen, writerEpoch,
+                                                        *liveBits, maxDocId, numLiveDocs, seg.unsyncedFiles, &seg.files);
     // The superseded generation needs no sync: it is published or never will be.
     std::erase_if(seg.files, [&](const auto& file) { return file.name == oldLiveFile; });
     std::erase(seg.unsyncedFiles, oldLiveFile);
 
     INDEX_DEBUG("Applied {} new deletes to segment {} (new delete generation: {}, total live docs: {})",
-                deleted, seg.segId, newLiveGen, numLiveDocs);
+                deleted, seg.name(), newLiveGen, numLiveDocs);
 
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
@@ -3597,6 +3727,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       assert(seg.liveGen + 1 == newLiveGen);
       if (seg.liveGen > 0) seg.obsoleteLiveGens.push_back(seg.liveGen);
       seg.liveGen = newLiveGen;
+      seg.liveEpoch = writerEpoch;
     }
   }
   return applied;

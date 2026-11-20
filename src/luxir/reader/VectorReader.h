@@ -39,7 +39,7 @@ public:
   bool isMultiValued() const { return strCol_.isMultiValued(); }
 
   /// Vector at a global value rank (0..numVectors()-1).
-  std::span<const float> vectorAtRank(int64_t valueRank) const {
+  LUXIR_INLINE std::span<const float> vectorAtRank(int64_t valueRank) const {
     auto bytes = strCol_.valueAt(valueRank);
     return std::span<const float>((const float*)bytes.data(), (size_t)dims_);
   }
