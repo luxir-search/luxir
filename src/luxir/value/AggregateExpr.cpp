@@ -427,7 +427,7 @@ std::vector<BoundAggregateInput> bindAggregateInputs(
         valueCounts->cursor.emplace(*valueCounts->shape);
       }
       // Repeats within an ARRAY terms column count once (see BoundValueCounts).
-      if (info != nullptr && strings && (info->flags & FieldType::MULTI_ARRAY) != 0
+      if (producer.resolved.state.distinctTerms && info != nullptr && strings && (info->flags & FieldType::MULTI_ARRAY) != 0
           && info->monoLoc.offset() > 0) {
         if (info->hasOrdColumn()) {
           valueCounts->ords = pool.make<OrdColReader::BulkOrds>(

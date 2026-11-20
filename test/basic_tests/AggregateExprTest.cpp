@@ -80,6 +80,13 @@ BucketScalar evaluate(AggregateProgram& program, IndexReader& reader, IndexReade
   int32_t maxDoc = segment.maxDoc();
   for (int32_t doc = 0; doc < maxDoc; doc++) {
     for (size_t producer = 0; producer < bindings.size(); producer++) {
+      // A value count (value_count, or sum(count(f)) of a bare column) adds
+      // each document's value count, as ExprStatsOp does.
+      if (BoundValueCounts* counts = bindings[producer].valueCounts) {
+        int64_t count = counts->count(doc);
+        accumulator.addRawBatch((uint32_t)producer, std::span<const int64_t>(&count, 1), FieldType::INT);
+        continue;
+      }
       accumulator.add((uint32_t)producer, bindings[producer].evalPoint(doc));
     }
   }
@@ -868,6 +875,111 @@ TEST_F(AggregateExprTest, valueCountMatchesElasticsearchOnEveryRoute) {
   auto parseSchema = Schema::createDefaultSchema();
   ArenaOwner memory;
   expectParseError(memory, *parseSchema, "value_count(n_i, 3)", "value_count");
+}
+
+// sum(count(f)) over a bare column counts every stored value, repeats
+// included, as a native value count: no count() per document, the fused
+// column batch under a terms facet, and 0 for an empty domain. A per-document
+// expression (count(f) * 1) is the reference.
+TEST_F(AggregateExprTest, sumOfCountsCountsEveryValueAsANativeValueCount) {
+  auto parseSchema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  auto* program = parseAggregate(memory, *parseSchema,
+      "sum(count(tags_ss)) + value_count(tags_ss) + sum(count(tags_ss)) + sum(count(n_is) * 2)");
+  ASSERT_EQ(3u, program->producers.size());
+  EXPECT_TRUE(program->producers[0].countsColumnValues());
+  EXPECT_FALSE(program->producers[0].resolved.state.distinctTerms);
+  EXPECT_TRUE(program->producers[1].countsColumnValues());
+  EXPECT_TRUE(program->producers[1].resolved.state.distinctTerms);
+  EXPECT_FALSE(program->producers[2].countsColumnValues());
+
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  SchemaBuilder schema;
+  using Class = api::FieldDef::FieldClass;
+  for (auto [name, type, indexed] : {std::tuple{"arr_s", Class::STRING, true}, {"arr_ip", Class::IP, true},
+                                     {"arr_i", Class::INT, true}, {"raw_arr", Class::STRING, false}}) {
+    auto& field = schema.field(name);
+    field.type = type;
+    field.multi = api::FieldDef::MultiMode::ARRAY;
+    if (!indexed) {
+      field.index = api::FieldDef::IndexMode::NONE;
+      field.column = true;
+    }
+  }
+  schema.set(helper.collection());
+  helper.indexAll({
+      flatdoc("id", "a", "cat_s", "x", "arr_s", vecs("p", "q", "p"), "arr_ip", vecs("10.0.0.1", "::1", "10.0.0.1"),
+              "arr_i", vec_i(1, 2, 2), "raw_arr", vecs("p", "p")),
+      flatdoc("id", "b", "cat_s", "y", "arr_s", vecs("r", "r", "r", "s"), "arr_ip", vecs("::1", "::1"),
+              "arr_i", vec_i(3)),
+      flatdoc("id", "c", "cat_s", "x", "arr_s", vecs("t"), "arr_i", vec_i(5, 5, 5, 5), "raw_arr", vecs("z")),
+      flatdoc("id", "d", "cat_s", "z")}, UpdateMessage::COMMIT);
+  helper.indexAll({
+      flatdoc("id", "e", "cat_s", "y", "arr_s", vecs("p", "p"), "arr_ip", vecs("10.0.0.2"),
+              "raw_arr", vecs("q", "q", "q")),
+      flatdoc("id", "f", "cat_s", "x", "arr_i", vec_i(7, 7))}, UpdateMessage::COMMIT);
+  // Every stored value, and the distinct values per document of value_count.
+  std::map<std::string, std::map<std::string, int64_t>> all{
+      {"arr_s", {{"", 10}, {"x", 4}, {"y", 6}, {"z", 0}}},
+      {"arr_ip", {{"", 6}, {"x", 3}, {"y", 3}, {"z", 0}}},
+      {"arr_i", {{"", 10}, {"x", 9}, {"y", 1}, {"z", 0}}},
+      {"raw_arr", {{"", 6}, {"x", 3}, {"y", 3}, {"z", 0}}}};
+  std::map<std::string, int64_t> distinct{{"arr_s", 6}, {"arr_ip", 4}, {"arr_i", 10}, {"raw_arr", 3}};
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  auto& none = root.topDocs("none").exprQuery("cat_s:nothing").limit(0);
+  for (const auto& [field, counts] : all) {
+    root.expr("sc_" + field, "sum(count(" + field + "))");
+    root.expr("ref_" + field, "sum(count(" + field + ") * 1)");
+    root.expr("vc_" + field, "value_count(" + field + ")");
+    none.expr("sc_" + field, "sum(count(" + field + "))");
+  }
+  req->execute(-1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  for (const auto& [field, counts] : all) {
+    SCOPED_TRACE(field);
+    EXPECT_EQ(counts.at(""), req->scalar<int64_t>("sc_" + field));
+    EXPECT_EQ(counts.at(""), req->scalar<int64_t>("ref_" + field));
+    EXPECT_EQ(distinct.at(field), req->scalar<int64_t>("vc_" + field));
+    EXPECT_EQ(0, req->docList("none")->ops.at("sc_" + field)->asInt());
+  }
+
+  auto facetValues = [&](std::string_view form, FacetSubOpInlineMode mode, FacetFeedStrategy feed,
+                         size_t* keyedBatches = nullptr) {
+    SearchOverridesGuard guard(forcedFacetSubOpInline, forcedFacetFeedStrategy, inlineFacetEntryStatsForTests);
+    forcedFacetSubOpInline = mode;
+    forcedFacetFeedStrategy = feed;
+    InlineFacetEntryStats stats;
+    inlineFacetEntryStatsForTests = &stats;
+    auto req = localReq(helper.getSearchEngine());
+    auto& facet = req->collection("main").facet("f", "cat_s").limit(-1);
+    for (const auto& [field, counts] : all) facet.expr(field, fmt::format(fmt::runtime(form), field));
+    req->execute(-1);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+    std::map<std::string, std::map<std::string, int64_t>> values;
+    const auto& ids = std::get<api::ColStr>(result->bucket_ids->kind).v;
+    for (const auto& [field, counts] : all) {
+      const auto& column = std::get<api::ArrVal>(result->ops.at(field)->kind).v;
+      for (size_t i = 0; i < ids.size(); i++) values[field][std::string(ids[i])] = column[i].asInt();
+    }
+    if (keyedBatches != nullptr) *keyedBatches = stats.keyedBatches.load();
+    return values;
+  };
+  auto expected = all;
+  for (auto& [field, counts] : expected) counts.erase("");
+  EXPECT_EQ(expected, facetValues("sum(count({}) * 1)", FacetSubOpInlineMode::SORT_KEY_ONLY,
+                                  FacetFeedStrategy::BUCKET_DOMAINS));
+  size_t fused = 0;
+  EXPECT_EQ(expected, facetValues("sum(count({}))", FacetSubOpInlineMode::AUTO, FacetFeedStrategy::AUTO, &fused));
+  EXPECT_GT(fused, 0u);
+  EXPECT_EQ(expected, facetValues("sum(count({}))", FacetSubOpInlineMode::ALL, FacetFeedStrategy::AUTO));
+  EXPECT_EQ(expected, facetValues("sum(count({}))", FacetSubOpInlineMode::SORT_KEY_ONLY,
+                                  FacetFeedStrategy::BUCKET_DOMAINS));
+  EXPECT_EQ(expected, facetValues("sum(count({}))", FacetSubOpInlineMode::SORT_KEY_ONLY,
+                                  FacetFeedStrategy::STRING_COLUMN_REPLAY));
 }
 
 TEST_F(AggregateExprTest, countAndCardinalitySeeNoValuesInAColumnEmptiedByMerge) {

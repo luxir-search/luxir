@@ -1367,7 +1367,8 @@ ResolvedAggregate resolvePercentile(
 // so its raw inputs are per-document value counts (BoundValueCounts): read
 // from the column shape, except that an ARRAY terms column counts each
 // document's distinct values, as Elasticsearch does. Any other input counts
-// each value it yields.
+// each value it yields. sum(count(f)) over a bare column f runs on the same
+// state but keeps every repeat (SUM_OF_COUNTS).
 void addValueCountBy(void* target, uint64_t count) {
   storeState(target, loadState<uint64_t>(target) + count);
 }
@@ -1417,15 +1418,27 @@ BucketScalar finishValueCount(const void* source,
   return BucketScalar::integer((__int128)loadState<uint64_t>(source));
 }
 
-ResolvedAggregate resolveValueCount(
-    const ValueNode* input, std::span<AggregateConstant> arguments) {
-  unused(input);
-  assert(arguments.empty());
+ResolvedAggregate resolveValueCount(bool distinctTerms) {
   AggregateStateOps ops{sizeof(uint64_t), initState<uint64_t>, addValueCount,
       addValueCountBatch, addValueCountRaw, addValueCountRawBatch, mergeValueCount,
       finishValueCount, addKeyedRaw<addValueCountRaw>};
   ops.countsValues = true;
+  ops.distinctTerms = distinctTerms;
   return {BucketValueType::INT128, ValueNature::NUMBER, ops};
+}
+
+ResolvedAggregate resolveValueCount(
+    const ValueNode* input, std::span<AggregateConstant> arguments) {
+  unused(input);
+  assert(arguments.empty());
+  return resolveValueCount(true);
+}
+
+ResolvedAggregate resolveSumOfCounts(
+    const ValueNode* input, std::span<AggregateConstant> arguments) {
+  unused(input);
+  assert(arguments.empty());
+  return resolveValueCount(false);
 }
 
 AggregateConstant canonicalCardinalityArgument(
@@ -1451,7 +1464,17 @@ constexpr AggregateFunction FUNCTIONS[] = {
     {"percentile", 2, 3, resolvePercentile, false, 1, canonicalPercentileArgument, NaturePolicy::DECIMAL},
 };
 
+// sum(count(f)) over a bare column f, as the parser lowers it: the value count
+// of every stored value, repeats included. It is no entry of FUNCTIONS, so no
+// request names it and it never shares a state with sum or value_count.
+constexpr AggregateFunction SUM_OF_COUNTS{
+    "sum", 1, 1, resolveSumOfCounts, true, 0, nullptr, NaturePolicy::RAW, true};
+
 } // namespace
+
+const AggregateFunction& AggregateFunctionRegistry::sumOfCounts() {
+  return SUM_OF_COUNTS;
+}
 
 bool AggregateFunction::sameStateArguments(
     std::span<const AggregateConstant> left,

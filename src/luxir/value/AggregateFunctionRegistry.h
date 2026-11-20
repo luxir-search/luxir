@@ -52,6 +52,8 @@ class AggregateFunctionRegistry {
 public:
   static const AggregateFunction* find(std::string_view name);
   static std::span<const AggregateFunction> entries();
+  // The value count that sum(count(f)) over a bare column f lowers to.
+  static const AggregateFunction& sumOfCounts();
 };
 
 } // namespace luxir

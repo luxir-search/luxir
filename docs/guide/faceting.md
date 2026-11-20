@@ -399,8 +399,13 @@ field other than a STRING or IP array it reads only how many values each
 document holds, never the values, so it costs about as much as the bucket
 count; either way it joins the fused per-facet column pass beside `avg`, `sum`,
 `min`, and `max`. Over any other expression it counts the present values the
-expression yields per document. `sum(count(field))` counts every stored value,
-repeats included.
+expression yields per document.
+
+`sum(count(field))` counts every stored value of a bare field, repeats
+included: `["a", "a"]` counts 2. It runs as the same native value count as
+`value_count`, reading only each document's value count, so it also joins the
+fused column pass and answers `0`, not null, when nothing matches. Any other
+`count()` argument (`sum(count(price_i * 2))`) is evaluated per document.
 A composite metric is a single expression:
 
 ```json
