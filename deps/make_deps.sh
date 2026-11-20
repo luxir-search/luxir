@@ -38,11 +38,14 @@ else
   jemalloc=(--x-feature=jemalloc)
 fi
 
-# Optional extra manifest features (comma-separated, e.g. "icu") for the normal
-# native install, from LUXIR_VCPKG_FEATURES.
-IFS=, read -ra extra <<< "${LUXIR_VCPKG_FEATURES:-}"
-for f in ${extra[@]+"${extra[@]}"}; do
-  [[ -z $f ]] || jemalloc+=("--x-feature=$f")
+# Optional extra manifest features (comma-separated, e.g. "icu"), from
+# LUXIR_VCPKG_FEATURES. Every variant installs them, so a plugin finds its
+# dependencies under each preset.
+extra=()
+IFS=, read -ra names <<< "${LUXIR_VCPKG_FEATURES:-}"
+for f in ${names[@]+"${names[@]}"}; do
+  f=${f//[[:space:]]/}
+  [[ -z $f ]] || extra+=("--x-feature=$f")
 done
 
 # Manifest reconciliation owns each prefix. Keep normal, ASan and legacy
@@ -56,12 +59,12 @@ jobs=${VCPKG_MAX_CONCURRENCY:-}
 for variant in native native-asan; do
   target_triplet=$triplet
   host_triplet=$triplet
-  features=(${jemalloc[@]+"${jemalloc[@]}"})
+  features=(${jemalloc[@]+"${jemalloc[@]}"} ${extra[@]+"${extra[@]}"})
   job_mb=2500
   if [[ $variant == native-asan ]]; then
     target_triplet=$triplet-asan
     host_triplet=$triplet-host
-    features=()
+    features=(${extra[@]+"${extra[@]}"})
     job_mb=3500
   fi
   # Guarded expansions keep empty arrays valid under set -u in bash 3.2.
