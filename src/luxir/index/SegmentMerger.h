@@ -873,8 +873,10 @@ private:
     return type == FieldType::INTERVAL && (flags & FieldType::INDEX_RANGE) != 0;
   }
 
-  static bool hasLiveIntValues(const MergeFieldInfo& field) {
+  static bool hasLiveFieldValues(const MergeFieldInfo& field) {
     const auto& seg = *field.seg;
+    // Indexed terms without a column also write row presence. Text records it
+    // with the norms, including rows whose analysis produced no terms.
     int32_t count = field.segFieldInfo.docsWithField;
     if (count == 0 || seg.numLive == 0) return false;
     // If there are more populated rows than deletes, at least one survives.
@@ -1872,24 +1874,23 @@ private:
                   MergeAdmissionDriver& admissionDriver,
                   MergeAdmissionDriver::BatchAdmission& admission) {
     auto& mergeFieldInfos = batch.fields;
-    int32_t nDocs = space.maxDoc;
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    auto& pool = poolGuard.pool();
 
     // Stored-fields resources are segment-wide rather than normal per-field
     // columns.  Route each one (default or named column family) to a
     // dedicated merger.  Recognize them by the combination of type=BIN and
     // flags=STORED set by StoredFieldsWriter::finish().
     const auto& firstInfo = mergeFieldInfos[0].segFieldInfo;
-    if (FieldType::storage(firstInfo.type) == FieldType::Storage::BIN
-        && (firstInfo.flags & FieldType::STORED) != 0) {
+    if (isStoredField(firstInfo)) {
       mergeStoredFields(space, mergeFieldInfos, batch.bootstrapStoredDictionary);
       return;
     }
 
-    // An int field and its indexes exist only if at least one populated row survives.
-    if (FieldType::storage(firstInfo.type) == FieldType::Storage::INT64
-        && std::ranges::none_of(mergeFieldInfos, hasLiveIntValues)) return;
+    // Drop the field before any route can register it or write its indexes.
+    if (std::ranges::none_of(mergeFieldInfos, hasLiveFieldValues)) return;
+
+    int32_t nDocs = space.maxDoc;
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    auto& pool = poolGuard.pool();
 
     // sort mergeFieldInfos so we can add docids low to high.
     // This is a simple O(n+m) sort where n=number of segments and m is number of segments with this specific field.
@@ -2376,12 +2377,7 @@ private:
       }
     }
 
-    if (docsWithField == 0) {
-      outputFieldInfo.docsWithField = 0;
-      outputFieldInfo.columnMetaOff = 0;
-      outputFieldInfo.numValues = 0;
-      return;
-    }
+    assert(docsWithField > 0);
 
     valuesOut->flush(true);
     outputFieldInfo.columnMetaOff = valuesOut->size() - outputFieldInfo.columnLoc.offset();
@@ -2395,7 +2391,7 @@ private:
     } else {
       // All values are the same size - store size in mono2MetaOff, leave mono2Loc zero.
       outputFieldInfo.mono2Loc = {0, 0};
-      outputFieldInfo.mono2MetaOff = (totalValues == 0) ? 0 : minSize;
+      outputFieldInfo.mono2MetaOff = minSize;
     }
 
     // endValueRankReader (mono)

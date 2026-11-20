@@ -19,6 +19,7 @@
 #include "luxir/util/Uuid.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
@@ -335,6 +336,72 @@ TEST_F(ForceMergeTest, dirtySingletonRewritesAndCleanSingletonStillPublishes) {
   ASSERT_EQ(1u, noOp.info.segments.size());
   EXPECT_EQ(cleanSegId, noOp.info.segments[0].seg_id);
   EXPECT_GT(noOp.info.index_gen, beforeNoOpGen);
+}
+
+TEST_F(ForceMergeTest, dropsFieldsWithNoSurvivingValues) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& terms = schema.field("postings_s");
+  terms.type = api::FieldDef::FieldClass::STRING;
+  terms.column = false;
+  terms.stored = true;
+  auto& vector = schema.field("gone_v");
+  vector.type = api::FieldDef::FieldClass::VECTOR;
+  vector.multi = api::FieldDef::MultiMode::ARRAY;
+  vector.metric = api::VectorMetric::L2;
+  schema.set(helper.collection());
+
+  const std::vector<std::string> fields{"raw_sc", "tag_s", "tags_ss", "postings_s", "body_w", "gone_v"};
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "dead", "raw_sc", "raw", "tag_s", "tag", "tags_ss", vecs("a", "b"),
+              "postings_s", "term", "body_w", "text", "gone_v",
+              std::vector<std::vector<float>>{{1, 0}, {0, 1}}),
+      flatdoc("id", "survivor", "blank_w", " ")}, UpdateMessage::COMMIT).success);
+  {
+    auto reader = writer->snapshots.readers.getReader();
+    ASSERT_EQ(1u, reader->segments().size());
+    auto& postings = reader->segments()[0].postingsReader();
+    for (const auto& field : fields) ASSERT_NE(nullptr, postings.fieldInfo(field)) << field;
+    EXPECT_TRUE(postings.fieldInfo("tag_s")->hasOrdColumn());
+    EXPECT_TRUE(postings.fieldInfo("tags_ss")->hasEndValueRanks());
+    EXPECT_FALSE(postings.fieldInfo("postings_s")->hasOrdColumn());
+    EXPECT_FALSE(postings.fieldInfo("gone_v")->valDocLoc.isNull());
+  }
+  ASSERT_TRUE(helper.deleteById("dead", UpdateMessage::COMMIT).success);
+
+  for (int pass = 0; pass < 2; pass++) {
+    if (pass == 1) {
+      ASSERT_TRUE(helper.index(flatdoc("id", "another"), UpdateMessage::COMMIT).success);
+    }
+    ASSERT_TRUE(commit(helper, 1).success);
+    auto reader = writer->snapshots.readers.getReader();
+    ASSERT_EQ(1u, reader->segments().size());
+    auto& postings = reader->segments()[0].postingsReader();
+    auto req = localReq(helper.getSearchEngine());
+    req->topDocs().allQuery().fields(fields).limit(-1);
+    for (const auto& field : fields) {
+      EXPECT_EQ(nullptr, postings.fieldInfo(field)) << field;
+      req->topDocs(field).existsQuery(field).countLimit().limit(0);
+    }
+    req->topDocs("blank").existsQuery("blank_w").countLimit().limit(0);
+    req->topDocs("knn").fields({"id"}).limit(1).rawQuery() = qb::knn(req->mr, "gone_v", {1.f, 0.f}, 1);
+    req->execute();
+    ASSERT_OK(req);
+    auto docs = req->getDocs();
+    ASSERT_EQ((size_t)pass + 1, docs.size());
+    for (const auto& doc : docs) {
+      for (const auto& field : fields) EXPECT_EQ(nullptr, find(doc, field)) << field;
+    }
+    for (const auto& field : fields) {
+      ASSERT_NE(nullptr, req->docList(field));
+      EXPECT_EQ(0, req->docList(field)->found) << field;
+    }
+    EXPECT_EQ(1, req->getMatchCount("blank"));
+    ASSERT_NE(nullptr, req->docList("knn"));
+    EXPECT_EQ(0, req->docList("knn")->row_count);
+  }
 }
 
 TEST_F(ForceMergeTest, emptyCommitIsResumeForm) {
