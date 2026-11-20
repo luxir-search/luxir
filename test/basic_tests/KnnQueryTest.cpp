@@ -2734,6 +2734,47 @@ TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
   req->done();
 }
 
+// A boolean filter around a kNN clause is materialized per segment during
+// prepare, concurrently for a request that publishes every task; the result
+// must match the serial run.
+TEST_F(KnnQueryTest, booleanFilterDomainsParallelMatchesSerial) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, std::nullopt, 4);
+  for (int seg = 0; seg < 4; seg++) {
+    for (int i = 0; i < 20; i++) {
+      int n = seg * 20 + i;
+      h.index(flatdoc("id", std::to_string(n), "foo_w", n == 39 ? "apple banana" : n % 3 == 0 ? "apple" : "pear",
+                      "embedding_v", std::vector<float>{(float)n, 0.0f, 0.0f, 0.0f}));
+    }
+    h.commit();
+  }
+  h.deleteByIds(std::vector<std::string>{"21", "42"}, UpdateMessage::COMMIT);
+  ASSERT_EQ(4u, h.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+
+  auto run = [&](bool parallel) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.getScores().limit(10).countLimit().fields({"id"});
+    cur.rawQuery() = qb::boolean(cur.mr(),
+        /*required=*/{qb::knn(cur.mr(), "embedding_v", {40.2f, 0.0f, 0.0f, 0.0f}, 6)},
+        /*optional=*/{}, /*prohibited=*/{qb::match(cur.mr(), "foo_w", "banana")},
+        /*filter=*/{qb::match(cur.mr(), "foo_w", "apple")});
+    req->execute(parallel);
+    auto out = std::make_pair(resultIds(*req), resultScores(*req));
+    req->done();
+    return out;
+  };
+  auto serial = run(false);
+  auto parallel = run(true);
+  ASSERT_EQ(serial.first.size(), 6u);
+  EXPECT_EQ(serial.first, parallel.first);
+  EXPECT_EQ(serial.second, parallel.second);
+  for (const auto& id : serial.first) {
+    EXPECT_EQ(std::stoi(id) % 3, 0) << id;
+    EXPECT_NE("39", id);
+  }
+}
+
 // Unfiltered queries on a segment with deletes use the rank-space liveness
 // bitmap as the whole FAISS selector, built ONCE per liveDocs generation and
 // cached on LiveDocs: a second query must not rebuild it, and a commit
@@ -5701,3 +5742,4 @@ TEST_F(KnnQueryTest, candidateCapStillAdmitsLaterExactHits) {
   ASSERT_EQ(1u, resultScores(*req).size());
   EXPECT_FLOAT_EQ(1 + 1.0f / 101, resultScores(*req)[0]);
 }
+

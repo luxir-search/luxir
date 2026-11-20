@@ -17,6 +17,7 @@
 #include "ScoreCompact.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/util/screaming.h"
+#include "luxir/util/thread.h"
 
 namespace luxir {
 
@@ -13129,7 +13130,7 @@ public:
     // exclusion is evaluated once.
     bool foldProhibited = foldsProhibitedDomain();
     if (!filterSources.empty() || foldProhibited) {
-      for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
+      auto materializeSegment = [&](size_t segnum) {
         auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
         auto& segment = ctx.reader.segments()[segnum];
         DomainHandle domain = filterSources.empty()
@@ -13144,7 +13145,19 @@ public:
         }
         filterDomains[segnum] = std::move(domain).pinnedWith(context.filterUses);
         childDomainPtrs[segnum] = filterDomains[segnum].get();
-      }
+      };
+      // Segments are independent and each task writes only its own slot, so
+      // a request that publishes every task (as the kNN scan and rescore
+      // require too) materializes them concurrently with results identical
+      // to the serial loop; the filter cache's per-segment request slots
+      // serialize same-segment work.
+      size_t numSegs = ctx.reader.segments().size();
+      bool spawnTasks = ctx.fanout && ctx.fanout->publishesEvery() && numSegs > 1;
+      FanoutScope runner = ctx.fanout ? ctx.fanout->child() : FanoutScope(nullptr, FanoutPolicy::EVERY);
+      task_group_fanout(spawnTasks ? &runner : nullptr, numSegs, [&](size_t segnum) {
+        return [&materializeSegment, segnum]() { materializeSegment(segnum); };
+      });
+      runner.join();
     } else {
       for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
         childDomainPtrs[segnum] = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
