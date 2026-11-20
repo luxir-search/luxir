@@ -35,56 +35,21 @@ int64_t countSegment(MemPool& pool, Query::ScorerSupplier* supplier,
   return scorer ? countMatchesInRange(scorer, domain, 0, maxDoc) : 0;
 }
 
-DomainHandle materializeEffectiveFilter(const PreparedSource& source, IndexReader& reader,
-                                        IndexReader::Segment& segment, DocSet* domain,
-                                        FilterCache::Probe probe) {
-  auto& weight = *source.weight;
-  auto* prepared = source.prepared.get();
-  auto* use = source.cacheUse;
-  if (source.domainDependence != PreparedDomainDependence::QUERY_CANONICAL && use != nullptr &&
-      use->scope() != FilterKeyScope::READER_STABLE) {
-    use = nullptr;
-  }
-  if (use == nullptr) {
-    return DomainHandle(materialize(weight, prepared, segment, domain)).scoped(segment);
-  }
+DocSet* populateRawFilter(Query::Weight& weight, Query::Weight::PreparedWeight* prepared,
+                          IndexReader::Segment& segment, FilterCache::Use& use,
+                          FilterCache::Probe& probe) {
+  using Kind = FilterCache::Probe::Kind;
+  assert(probe.kind() != Kind::HIT);
 
-  if (use->scope() == FilterKeyScope::READER_STABLE) {
-    if (auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared)) {
-      [[maybe_unused]] DocSet* canonical = segment.liveDocSet();
-      assert(domain == nullptr || domain == canonical);
-      return DomainHandle::borrowed(cached->docSet(segment)).scoped(segment);
-    }
-    return DomainHandle(materialize(weight, prepared, segment, domain)).scoped(segment);
-  }
-
-  if (probe.kind() == FilterCache::Probe::Kind::HIT) {
-    return use->effectiveDomain((size_t)segment.ord, reader, domain);
-  } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+  size_t ord = (size_t)segment.ord;
+  if (probe.kind() == Kind::BUILD) {
     auto buildStart = std::chrono::steady_clock::now();
     auto raw = materializeRawFilter(weight, prepared, segment);
-    uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
-    use->publishRawByproduct((size_t)segment.ord, probe, std::move(raw), buildCostNanos);
-  } else {
-    // A non-folded raw materialization is free by-product population. A
-    // domain-composed set must never enter the raw cache.
-    if (domain == nullptr && use->wasAdmitted() && !weight.needsScores() && !weight.allowsPruning()) {
-      auto buildStart = std::chrono::steady_clock::now();
-      auto raw = materializeRawFilter(weight, prepared, segment);
-      uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
-      use->offerRaw((size_t)segment.ord, std::move(raw), buildCostNanos);
-      DocSet* docs = use->effectiveDocSet((size_t)segment.ord, reader);
-      return DomainHandle::borrowed(docs).scoped(segment);
-    }
-    if (!disableFilterOwnForTests && !weight.needsScores() && !weight.allowsPruning()) {
-      auto raw = materializeRawFilter(weight, prepared, segment);
-      use->adoptOwnedRaw((size_t)segment.ord, probe, std::move(raw));
-      return use->effectiveDomain((size_t)segment.ord, reader, domain);
-    }
-    return DomainHandle(materialize(weight, prepared, segment, domain)).scoped(segment);
+    use.publishRawByproduct(ord, probe, std::move(raw), elapsedBuildNanos(buildStart));
+    return use.rawDocSet(ord);
   }
 
-  return use->effectiveDomain((size_t)segment.ord, reader, domain);
+  return use.adoptOwnedRaw(ord, probe, materializeRawFilter(weight, prepared, segment));
 }
 
 }  // namespace luxir::QueryPrep

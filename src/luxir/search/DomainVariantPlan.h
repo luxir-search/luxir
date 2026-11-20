@@ -634,41 +634,26 @@ public:
 
   static DomainHandle composeTracked(std::vector<DomainHandle> parts, RequestMemTracker& tracker);
 
-  // One active segment's primitive sources, shared by every bucket using
-  // this plan. Cache admission may build a primitive once; a bypass stays
-  // scoped to each structural input instead of forcing an index-wide scan.
+  // A view of one segment. Rentals and membership live on the request's Use.
   struct SegmentSources {
-    struct Source {
-      Query::Weight* weight = nullptr;
-      FilterCache::Use* use = nullptr;
-      std::optional<DomainHandle> stable;
-      bool bypassed = false;
-    };
     IndexReader& reader;
     Query::PlanningContext& planning;
-    int32_t segment;
+    IndexReader::Segment& segment;
     RequestMemTracker& tracker;
-    RequestMemResource resource;
-    std::pmr::vector<Source> values;
 
-    SegmentSources(const DomainVariantPlan& plan, IndexReader& reader,
-                   Query::PlanningContext& planning, int32_t segment, RequestMemTracker& tracker);
+    DomainHandle resolve(Query::Weight& weight, FilterCache::Use* use, DomainHandle base,
+                         const QueryPrep::PreparedSource* prepared = nullptr) const;
+    int64_t count(Query::Weight& weight, FilterCache::Use* use, const DomainHandle& base,
+                  const QueryPrep::PreparedSource* prepared = nullptr) const;
 
-    SegmentSources(std::span<Query::Weight* const> weights, std::span<FilterCache::Use* const> uses,
-                   IndexReader& reader, Query::PlanningContext& planning, int32_t segment,
-                   RequestMemTracker& tracker);
-
-    void init(size_t source, Query::Weight* weight, FilterCache::Use* use);
-
-    SegmentSources(const SegmentSources&) = delete;
-    SegmentSources& operator=(const SegmentSources&) = delete;
-
-    DomainHandle materialize(size_t source, DocSet* base);
-    DomainHandle materialize(size_t source, DocSet* base, FilterCache::Probe acquired);
-
-    DomainHandle resolve(size_t source, DomainHandle base,
-                         const QueryPrep::PreparedSource* prepared = nullptr);
+  private:
+    DocSet* membership(Query::Weight& weight, FilterCache::Use* use,
+                       const QueryPrep::PreparedSource* prepared) const;
   };
+
+  FilterCache::Use* segmentSourceUse(size_t source) const {
+    return querySources[source].query->recoverableAsPredicate() ? sourceUse(source) : nullptr;
+  }
 
   template <typename Resolve, typename Compose>
   std::vector<DomainHandle> composeVariants(DomainHandle inherited, DomainHandle resetBase,
@@ -716,8 +701,8 @@ public:
         prepared, ready, variantBases, onlyFrame);
   }
 
-  std::vector<DomainHandle> produceSegment(SegmentSources& sources,
-      DomainHandle inherited, DomainHandle resetBase, RequestMemTracker& tracker,
+  std::vector<DomainHandle> produceSegment(const SegmentSources& sources,
+      DomainHandle inherited, DomainHandle resetBase,
       std::span<const DomainHandle> variantBases = {}, std::optional<Frame> onlyFrame = {}) const;
 
   struct PreparedResetVariants {
@@ -936,12 +921,10 @@ public:
   // New bucket production borrows segment primitives and owns only scoped
   // results. Root and top-level TopDocs retain their existing production and
   // pre-composition reservations.
-  using Sources = std::function_ref<SegmentSources&(size_t)>;
   using Finish = std::function<std::vector<DomainHandle>(std::vector<DomainHandle>)>;
 
   struct BucketProduction {
     RequestMemTracker& tracker;
-    Sources sources;
     std::shared_ptr<Reservation> reserve(size_t, std::string detail) {
       return std::make_shared<Reservation>(tracker, 0, std::move(detail));
     }
@@ -959,17 +942,13 @@ public:
     DomainHandle composeResult(std::vector<DomainHandle> parts) {
       return composeTracked(std::move(parts), tracker);
     }
-    DomainHandle resolve(size_t source, const QueryPrep::PreparedSource& input,
-                         size_t segment, DomainHandle base, Reservation&) {
-      return sources(segment).resolve(source, std::move(base), &input);
-    }
   };
 
   std::vector<std::vector<DomainHandle>> produceBucketDomains(
       IndexReader& reader, Query::PlanningContext& planning,
       std::span<const DomainHandle> inherited, std::span<const DomainHandle> resetBase,
       FanoutScope* fanout, ExecutionWarnings* warnings, RequestMemTracker& tracker,
-      Sources sources, const Finish& finish = {}) const;
+      const Finish& finish = {}) const;
 
   std::vector<std::vector<DomainHandle>> producePreparedDomains(
       IndexReader& reader, Query::PlanningContext& planning,

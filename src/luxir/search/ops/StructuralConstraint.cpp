@@ -7,48 +7,14 @@ namespace luxir {
 
 StructuralConstraint::Producer::Producer(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const StructuralConstraint* ancestor,
                                          size_t bucketCount)
-    : sourcesResource(req.memoryTracker, "structural sources", "domain variants"),
-      sources(&sourcesResource),
+    : resource(req.memoryTracker, "structural bucket prefixes", "domain variants"),
       req(req), view(view),
       ancestor(ancestor),
       bucketCount(bucketCount),
-      memo(&sourcesResource),
-      ready(&sourcesResource) {
+      memo(&resource),
+      ready(&resource) {
   memo.resize(view->segments().size());
   ready.resize(memo.size());
-}
-
-DomainVariantPlan::SegmentSources& StructuralConstraint::Producer::segmentSources(
-    const DomainVariantPlan& plan, IndexReader& reader, Query::PlanningContext& planning, int32_t segment,
-    RequestMemTracker& tracker) {
-  auto found = std::ranges::find_if(
-      sources, [&](const auto& entry) { return entry.identity == &plan && entry.segment == segment; });
-  if (found == sources.end()) {
-    sources.push_back(
-        {&plan, segment,
-         std::make_unique<DomainVariantPlan::SegmentSources>(plan, reader, planning, segment, tracker)});
-    found = std::prev(sources.end());
-  }
-  return *found->values;
-}
-
-void StructuralConstraint::Producer::releaseSources(int32_t segment) {
-  std::erase_if(sources, [&](const auto& entry) { return entry.segment == segment; });
-}
-
-DomainVariantPlan::SegmentSources& StructuralConstraint::Producer::filterSources(
-    std::span<Query::Weight* const> weights, std::span<FilterCache::Use* const> uses, IndexReader& reader,
-    Query::PlanningContext& planning, int32_t segment, RequestMemTracker& tracker) {
-  auto found = std::ranges::find_if(sources, [&](const auto& entry) {
-    return entry.identity == weights.data() && entry.segment == segment;
-  });
-  if (found == sources.end()) {
-    sources.push_back({weights.data(), segment,
-                       std::make_unique<DomainVariantPlan::SegmentSources>(weights, uses, reader, planning,
-                                                                           segment, tracker)});
-    found = std::prev(sources.end());
-  }
-  return *found->values;
 }
 
 bool StructuralConstraint::hasSelection() const {
@@ -148,7 +114,6 @@ void StructuralConstraint::Producer::releaseSegment(int32_t segnum) {
   memo[(size_t)segnum].clear();
   memo[(size_t)segnum].shrink_to_fit();
   ready[(size_t)segnum] = 2;
-  releaseSources(segnum);
 }
 DomainHandle StructuralConstraint::Producer::prefix(int32_t segnum, size_t bucket) {
   auto& values = memo[(size_t)segnum];

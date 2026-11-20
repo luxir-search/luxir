@@ -1527,6 +1527,43 @@ TEST_F(CollapseTest, bucketFilterAdmissionProbesOncePerSegment) {
   }
 }
 
+TEST_F(CollapseTest, bucketQueryFacetReusesDeclinedMembership) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->snapshots.readers.filterCache =
+      std::make_shared<FilterCache>(FilterCacheConfig{.admissionThreshold = 100});
+  constexpr int groups = 8;
+  constexpr int segments = 2;
+  for (int segment = 0; segment < segments; segment++) {
+    std::vector<Doc> docs;
+    for (int group = 0; group < groups; group++) {
+      auto id = std::to_string(segment * groups + group);
+      auto key = "g" + std::to_string(group);
+      docs.push_back(flatdoc("id", id + "a", "key_s", key, "color_s", "red"));
+      docs.push_back(flatdoc("id", id + "b", "key_s", key, "color_s", "blue"));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+
+  DomainSourceStats stats;
+  SearchOverridesGuard guard(domainSourceStatsForTests);
+  domainSourceStatsForTests = &stats;
+  auto req = localReq(helper.getSearchEngine());
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","query":"*:*","limit":8,
+    "collapse":{"field":"key_s","ops":{"colors":{"query_facet":{"buckets":{"red":"color_s:red"}}}}}})", req->mr));
+  req->execute(1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  const auto& table = *req->docList()->groups;
+  ASSERT_EQ(groups, table.keys.size());
+  for (size_t row = 0; row < table.keys.size(); row++) {
+    const auto& colors = *groupOp(table, "colors", row).facetResult();
+    ASSERT_EQ(1u, colors.counts.size());
+    EXPECT_EQ(segments, colors.counts[0]);
+  }
+  EXPECT_EQ(segments, stats.rents.load());
+  EXPECT_EQ(segments, stats.buys.load());
+  EXPECT_EQ(segments * (groups - 2), stats.borrows.load());
+}
+
 TEST_F(CollapseTest, matchAllBucketResetWithoutDeletes) {
   CollectionHelper helper;
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "color_s", "red"),

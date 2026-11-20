@@ -942,13 +942,13 @@ multi-valued document can contribute to several value-derived counts.
 The `ops` map runs independently over each bucket's documents and accepts the
 same metrics, nested facets, and per-bucket `top_docs` as the other facets.
 
-A query facet nested under another facet's buckets (for example a filter
-aggregation under a date histogram) evaluates each bucket query once per
-segment and intersects that result with every parent bucket, so its cost no
-longer grows with the parent's bucket count. The per-segment result goes
-through the filter cache like a filter clause, so repeated requests reuse it.
-Parent buckets much sparser than the query's matches are instead evaluated
-one by one, until their total makes the shared result the cheaper choice.
+A query facet under facet buckets or collapse groups can reuse a bucket
+query's segment membership across parent buckets. It uses the filter cache
+when available. If the cache declines to build the membership, the first
+evaluation runs within its parent bucket. A second evaluation on the same
+segment can build membership for reuse across the rest of the request.
+Request-owned membership counts against the request memory limit. Queries
+that need preparation, such as kNN, run separately for each parent bucket.
 
 ## Multi-select navigation
 

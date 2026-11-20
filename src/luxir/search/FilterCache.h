@@ -292,6 +292,9 @@ public:
     ~Probe();
 
     Kind kind() const { return kind_; }
+    // True for the first BYPASS of this Use and segment in the request; later
+    // BYPASS probes return false and the caller buys request-owned membership.
+    bool rentDomainOnce();
     std::optional<int32_t> priorCardinality() const {
       return producedCardinality < 0 ? std::nullopt
           : std::optional<int32_t>(producedCardinality);
@@ -408,6 +411,9 @@ public:
       bool resolving = false;
       DocSet* raw = nullptr;
       bool rawOwned = false;
+      bool rentedDomain = false;
+      // Borrowers hold bare pointers for the lifetime of the Use. Releasing
+      // this earlier to lower peak memory would require per-consumer pins.
       std::unique_ptr<DocSet> ownedRaw;
       // Almost every slot pins exactly one value; keep it inline so a pure
       // hit allocates nothing. Further distinct values go to pins.
@@ -470,6 +476,7 @@ public:
 
     // This Use's remembered raw count while its segment slot identity holds.
     std::atomic<int32_t>* cardinalityFact(size_t segmentOrd) const;
+    bool matchesSegment(size_t segmentOrd, IndexReader& reader) const;
 
     Use(FilterCache* cache, FilterKey key, FilterKeyScope scope,
         std::shared_ptr<FilterEntry> entry,
@@ -552,10 +559,10 @@ public:
     DocSet* effectiveDocSet(size_t segmentOrd, IndexReader& reader);
     // Membership composed with an incoming domain. A null domain, or the
     // segment's canonical live set, borrows the request-stable value above.
-    // Any other domain yields a caller-owned intersection: nothing about that
-    // domain is retained, so short-lived domains (a facet bucket's per-segment
-    // DocSet) are safe here and cannot alias a later domain at the same
-    // address. A null view means the membership is unavailable.
+    // Any other domain must already carry liveness and yields a caller-owned
+    // intersection. Nothing about that domain is retained, so a facet bucket
+    // can release its per-segment DocSet and reuse the address. A null view
+    // means the membership is unavailable.
     DomainHandle effectiveDomain(size_t segmentOrd, IndexReader& reader,
                                  DocSet* domain);
     void enableRoutedAccounting(

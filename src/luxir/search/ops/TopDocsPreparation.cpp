@@ -266,9 +266,9 @@ void TopDocsReq::CalcBase::prepareDomainQueryVariants(std::span<DocSet* const> l
     for (size_t source : resetExtraSources) {
       DomainHandle set;
       if constexpr (Structural) {
-        auto& sources = structural->producer->segmentSources(op.domainVariants, *op.view, op.planning,
-                                                             (int32_t)segnum, op.req.memoryTracker);
-        set = sources.resolve(source, resetBaseHandle((int32_t)segnum), &preparedDomainSources[source]);
+        DomainVariantPlan::SegmentSources sources{*op.view, op.planning, segment, op.req.memoryTracker};
+        set = sources.resolve(*op.domainVariants.sourceWeight(source), op.domainVariants.segmentSourceUse(source),
+                              resetBaseHandle((int32_t)segnum), &preparedDomainSources[source]);
       } else {
         set = QueryPrep::materializeEffectiveFilter(preparedDomainSources[source], *op.view, segment,
                                                     liveDomains[segnum]);

@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
-#include <array>
 #include <atomic>
-#include <mutex>
 #include <string_view>
 #include <vector>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -1701,7 +1699,7 @@ public:
     }
 
     virtual void collectSegment(
-        Data& data, int32_t segnum, DocSet* domain) = 0;
+        Data& data, int32_t segnum, const DomainHandle& domain) = 0;
     // The FacetBucketBlockExecutor domain source for result children.
     virtual void feedBucketDomains(
         size_t segnum, std::span<const SelectedFacetBucket<size_t>> block,
@@ -1714,7 +1712,7 @@ public:
       unused(tg);
     }
 
-    void collectInputSegment(int32_t segnum, DocSet* domain) {
+    void collectInputSegment(int32_t segnum, const DomainHandle& domain) {
       driver.contribute([&](Data& data) {
         storage.initialize(fixedOp(), data);
         collectSegment(data, segnum, domain);
@@ -1728,7 +1726,7 @@ public:
         return FanoutSize{fanoutDomainUnits(fixedOp().reader.segments()[segnum], input[segnum]), 0};
       }, [&](size_t segnum) {
         return [this, segnum, domain = input[segnum]]() {
-          collectInputSegment((int32_t)segnum, domain.get());
+          collectInputSegment((int32_t)segnum, domain);
         };
       });
     }
@@ -1843,19 +1841,18 @@ public:
         return;
       }
       if (segnum >= 0) domainHandle.assertScope(op.view->segments()[(size_t)segnum]);
-      DocSet* domain = domainHandle.get();
       if (!input.empty()) {
         if constexpr (Storage::growing) {
           if (domainHandle.ownsStorage()) domainHandle = DomainVariantPlan::account(
               std::move(domainHandle), op.req.memoryTracker, "retained range bucket inputs");
-          domain = domainHandle.get(op.view->segments()[(size_t)segnum]);
+          auto* domain = domainHandle.get(op.view->segments()[(size_t)segnum]);
           if (domain && domainHandle.isCharged()) storage.retainedInputs.fetch_add(
               domain->ramBytesUsed(), std::memory_order_relaxed);
         }
         input[(size_t)segnum] = std::move(domainHandle);
       }
       if (!fixedOp().requiresWholeReaderDomain()) {
-        collectInputSegment(segnum, domain);
+        collectInputSegment(segnum, input.empty() ? domainHandle : input[(size_t)segnum]);
         return;
       }
       int32_t seen = gatheredDomainsSeen.fetch_add(
@@ -2191,8 +2188,8 @@ public:
     }
 
     void collectSegment(
-        typename Base::Data& data, int32_t segnum,
-        DocSet* domain) override {
+        typename Base::Data& data, int32_t segnum, const DomainHandle& base) override {
+      auto* domain = base.get();
       if constexpr (Distinct) {
         auto& range = rangeOp();
         int64_t missing = 0;
@@ -2304,151 +2301,36 @@ public:
   }
 };
 
-// Test override for how a nested bucket query meets a parent bucket domain.
-// AUTO is the production policy; PER_DOMAIN restores evaluating the query
-// against every domain (the pre-membership behavior).
-enum class QueryFacetDomainRoute : uint8_t {
-  AUTO,
-  PER_DOMAIN,
-  DOMAIN_DRIVEN,
-  MEMBERSHIP
-};
-inline QueryFacetDomainRoute queryFacetDomainRouteForTests = QueryFacetDomainRoute::AUTO;
-
 class QueryFacetReq : public FixedBucketFacetReq {
   const ReqQueryFacet& queryFacet;
   std::span<Query*> bucketQueries;
   std::span<Query::Weight*> bucketWeights;
-  // Filter-cache uses of the bucket queries of a nested (bucket child) query
-  // facet, null where a query has no cacheable identity. Empty at the top.
+  Query::PlanningContext& planning;
+  // Empty outside bucket placements. A query with no usable key has a null Use.
   std::span<FilterCache::Use*> bucketUses;
-  // Per (bucket query, segment): parent bucket docs already evaluated
-  // domain-driven while the query's segment membership was unresolved.
-  std::unique_ptr<std::atomic<int64_t>[]> deferredDocs;
-  // Per (bucket query, segment): a membership the filter cache did not take.
-  // It is charged to the request and dropped with the segment's state
-  // (releaseSegmentState); cached memberships are pinned by their use.
-  struct OwnedMembership {
-    std::unique_ptr<DocSet> docs;
-    std::unique_ptr<DomainVariantPlan::Reservation> charge;
-  };
-  std::mutex ownedMutex;
-  std::vector<OwnedMembership> owned;
   bool preparedBuckets;
 
 public:
-  // A domain-driven doc (a scorer advance) costs about this many bulk
-  // postings decodes into a raw membership.
-  static constexpr int64_t DOMAIN_DRIVEN_DOC_COST = 32;
-
   QueryFacetReq(
       SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqQueryFacet& queryFacet,
-      std::string_view facetName, std::span<Query*> bucketQueries,
-      std::span<Query::Weight*> bucketWeights,
-      std::span<FilterCache::Use*> bucketUses = {})
+      std::string_view facetName, std::span<Query*> bucketQueries, std::span<Query::Weight*> bucketWeights,
+      Query::PlanningContext& planning, std::span<FilterCache::Use*> bucketUses)
     : FixedBucketFacetReq(
           req, view, {}, facetName, 0, false, queryFacet.buckets.size(), {}),
-      queryFacet(queryFacet), bucketQueries(bucketQueries),
-      bucketWeights(bucketWeights), bucketUses(bucketUses),
-      preparedBuckets(QueryPrep::anyNeedsPrepare(bucketWeights)) {
+      queryFacet(queryFacet), bucketQueries(bucketQueries), bucketWeights(bucketWeights),
+      planning(planning), bucketUses(bucketUses), preparedBuckets(QueryPrep::anyNeedsPrepare(bucketWeights)) {
     assert(bucketQueries.size() == queryFacet.buckets.size());
     assert(bucketWeights.size() == queryFacet.buckets.size());
-    assert(bucketUses.empty() || bucketUses.size() == queryFacet.buckets.size());
-    if (!bucketUses.empty()) {
-      size_t slots = bucketUses.size() * view->segments().size();
-      deferredDocs = std::make_unique<std::atomic<int64_t>[]>(slots);
-      for (size_t i = 0; i < slots; i++) deferredDocs[i].store(0, std::memory_order_relaxed);
-      owned.resize(slots);
-    }
-  }
-
-  // How one bucket query meets one non-null parent bucket domain. A nested
-  // query facet sees a domain per parent bucket and segment, and evaluating
-  // the query against each one repeats its whole-segment work (a bulk term
-  // scorer decodes every posting before masking), so the cost grows with the
-  // parent's bucket count. MEMBERSHIP resolves the query's segment membership
-  // once through its filter-cache use (a hit, a cache build, or an owned set
-  // kept while the parent's buckets pass over the segment), and each domain
-  // then only intersects with it. A domain much sparser than the query's postings is
-  // cheaper to evaluate domain-driven; those domains accumulate per segment
-  // until their total would pay for the membership (ski rental: at most about
-  // twice the cheaper choice).
-  struct DomainEvaluation {
-    DocSet* membership = nullptr;
-    Query::ScorerSupplier* supplier = nullptr;
-    QueryPrep::MaterializeMode mode = QueryPrep::MaterializeMode::ORDINARY;
-    bool shared = false;  // false: the caller keeps its per-domain path
-  };
-
-  DomainEvaluation evaluateInDomain(size_t bucket, IndexReader::Segment& segment,
-                                    DocSet* domain, MemPool& pool) {
-    DomainEvaluation evaluation;
-    auto route = queryFacetDomainRouteForTests;
-    if (domain == nullptr || bucketUses.empty() || bucketUses[bucket] == nullptr
-        || route == QueryFacetDomainRoute::PER_DOMAIN) {
-      return evaluation;
-    }
-    auto& weight = *bucketWeights[bucket];
-    auto& use = *bucketUses[bucket];
-    assert(!weight.needsPrepare());
-    evaluation.shared = true;
-    // Domains carry liveness, so a match-all query's matches are the domain.
-    if (weight.matchesAllDocs()) {
-      evaluation.membership = domain;
-      return evaluation;
-    }
-    size_t slot = bucket * reader.segments().size() + (size_t)segment.ord;
-    if (route != QueryFacetDomainRoute::DOMAIN_DRIVEN) {
-      {
-        std::lock_guard lock(ownedMutex);
-        evaluation.membership = owned[slot].docs.get();
-      }
-      if (evaluation.membership == nullptr) {
-        evaluation.membership = use.effectiveDocSet((size_t)segment.ord, reader);
-      }
-      if (evaluation.membership != nullptr) return evaluation;
-    }
-    evaluation.supplier = weight.scorerSupplier(pool, segment);
-    if (evaluation.supplier == nullptr) return evaluation;
-    auto& deferred = deferredDocs[slot];
-    int64_t docs = deferred.load(std::memory_order_relaxed) + domain->card();
-    bool domainDriven = route == QueryFacetDomainRoute::DOMAIN_DRIVEN
-        || (route == QueryFacetDomainRoute::AUTO
-            && docs <= evaluation.supplier->cost() / DOMAIN_DRIVEN_DOC_COST);
-    if (domainDriven) {
-      deferred.store(docs, std::memory_order_relaxed);
-      evaluation.mode = QueryPrep::MaterializeMode::DOMAIN_DRIVEN;
-      return evaluation;
-    }
-    auto membership = QueryPrep::resolveFilterMembership(weight, use, reader, segment);
-    evaluation.membership = membership.docs;
-    if (membership.owned != nullptr) {
-      auto charge = std::make_unique<DomainVariantPlan::Reservation>(
-          req.memoryTracker, membership.owned->ramBytesUsed(), "query facet bucket membership");
-      std::lock_guard lock(ownedMutex);
-      owned[slot] = {std::move(membership.owned), std::move(charge)};
-    }
-    return evaluation;
+    assert(bucketUses.empty() || bucketUses.size() == bucketWeights.size());
   }
 
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;
     for (auto* weight : bucketWeights) weight->releaseSegmentState(segment);
-    if (!owned.empty()) {
-      std::lock_guard lock(ownedMutex);
-      for (size_t bucket = 0; bucket < bucketUses.size(); bucket++) {
-        owned[bucket * reader.segments().size() + (size_t)segment.ord] = {};
-      }
-    }
     SearchOp::releaseSegmentState(segment);
   }
 
-  // A segment membership is state every parent bucket of a block reuses, so
-  // wide blocks share it (a match-all query needs none).
   bool facetBucketSharesSegmentState() const override {
-    for (size_t bucket = 0; bucket < bucketUses.size(); bucket++) {
-      if (bucketUses[bucket] != nullptr && !bucketWeights[bucket]->matchesAllDocs()) return true;
-    }
     return std::ranges::any_of(bucketWeights, [](const auto* weight) {
              return weight->hasReleasableSegmentState();
            })
@@ -2505,22 +2387,23 @@ public:
       queryOp().bucketWeights[bucket]->releaseSegmentState(segment);
     }
 
-    DomainHandle materializeBucket(size_t segnum, size_t bucket, DocSet* domain) {
-      auto& segment = queryOp().reader.segments()[segnum];
-      auto guard = MemPool::threadLocalPoolGuard();
-      auto evaluation = queryOp().evaluateInDomain(bucket, segment, domain, guard.pool());
-      if (evaluation.shared) {
-        if (evaluation.membership != nullptr) {
-          std::array<DocSet*, 2> sets{evaluation.membership, domain};
-          return DomainHandle(DocSet::intersect(sets)).scoped(segment);
-        }
-        return DomainHandle(QueryPrep::materialize(evaluation.supplier, guard.pool(),
-            segment, domain, evaluation.mode)).scoped(segment);
+    const QueryPrep::PreparedSource* preparedBucket(size_t bucket) const {
+      return preparedSources.empty() ? nullptr : &preparedSources[bucket];
+    }
+
+    DomainVariantPlan::SegmentSources segmentSources(IndexReader::Segment& segment) {
+      auto& op = queryOp();
+      return {*op.view, op.planning, segment, op.req.memoryTracker};
+    }
+
+    DomainHandle materializeBucket(IndexReader::Segment& segment, size_t bucket,
+                                   const DomainHandle& domain) {
+      auto& op = queryOp();
+      if (!op.bucketUses.empty()) {
+        return segmentSources(segment).resolve(
+            *op.bucketWeights[bucket], op.bucketUses[bucket], domain, preparedBucket(bucket));
       }
-      return DomainHandle(QueryPrep::materialize(
-          bucketSource(bucket), segment, domain,
-          Query::SupplierExecutionMode::ORDINARY,
-          QueryPrep::MaterializeMode::ORDINARY)).scoped(segment);
+      return DomainHandle(QueryPrep::materialize(bucketSource(bucket), segment, domain.get())).scoped(segment);
     }
 
     void prepareGatheredDomains(FanoutScope* tg) override {
@@ -2555,7 +2438,7 @@ public:
           ? weight : nullptr;
     }
 
-    DomainHandle identityDomain(size_t segnum, size_t bucket, DocSet* eligibility) {
+    DomainHandle identityDomain(size_t segnum, size_t bucket, const DomainHandle& eligibility) {
       // A mixed block can memoize predicate rows beside staged rows. The
       // latter are applied by StructuralConstraint::finish, never replayed
       // from this placeholder or from the bucket's original selected window.
@@ -2563,70 +2446,61 @@ public:
           std::vector<int32_t>{})).scoped(queryOp().reader.segments()[segnum]);
       auto& segment = queryOp().reader.segments()[segnum];
       auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
-      return DomainHandle(QueryPrep::materialize(
-          *queryOp().bucketWeights[bucket], nullptr, segment, eligibility)).scoped(queryOp().reader.segments()[segnum]);
+      auto& op = queryOp();
+      if (!op.bucketUses.empty()) {
+        // The identity is recovered against this eligibility, independently
+        // of the incoming domain used by the bucket's count pass.
+        return segmentSources(segment).resolve(*op.bucketWeights[bucket], op.bucketUses[bucket], eligibility);
+      }
+      return DomainHandle(QueryPrep::materialize(*op.bucketWeights[bucket], nullptr,
+                                                segment, eligibility.get())).scoped(segment);
     }
 
     void collectSegment(
-        typename Base::Data& data, int32_t segnum,
-        DocSet* domain) override {
-      if constexpr (Distinct) {
-        auto& segment = queryOp().reader.segments()[(size_t)segnum];
-        for (size_t bucket = 0; bucket < queryOp().bucketCount(); bucket++) {
-          auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
-          DomainHandle matches = materializeBucket((size_t)segnum, bucket, domain);
-          queryOp().collectGroups(data, segnum, matches.get(), [&](auto group, auto add, auto) {
+        typename Base::Data& data, int32_t segnum, const DomainHandle& base) override {
+      auto& op = queryOp();
+      auto& segment = op.reader.segments()[(size_t)segnum];
+      for (size_t bucket = 0; bucket < op.bucketCount(); bucket++) {
+        auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
+        if constexpr (Distinct) {
+          DomainHandle matches = materializeBucket(segment, bucket, base);
+          op.collectGroups(data, segnum, matches.get(), [&](auto group, auto add, auto) {
             forEachDomainDoc(matches.get(), segment.maxDoc(), [&](int32_t doc) { add((int64_t)bucket, group(doc)); });
           });
-        }
-      } else {
-      auto& segment = queryOp().reader.segments()[(size_t)segnum];
-      // The count pass never retains matches (result children re-materialize
-      // their selected buckets), so the direct count is eligible whenever the
-      // whole segment is the domain.
-      bool countOnly = domain == nullptr;
-      for (size_t bucket = 0; bucket < queryOp().bucketCount(); bucket++) {
-        auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
-        auto guard = MemPool::threadLocalPoolGuard();
-        Query::ScorerSupplier* supplier = nullptr;
-        bool supplierBuilt = false;
-        auto obtainSupplier = [&]() {
-          if (!supplierBuilt) {
-            supplier = bucketSource(bucket).scorerSupplier(guard.pool(), segment);
-            supplierBuilt = true;
-          }
-          return supplier;
-        };
-        if (countOnly && !queryOp().bucketWeights[bucket]->needsPrepare()) {
-          auto* weight = queryOp().bucketWeights[bucket];
-          auto count = QueryPrep::resolveCount(weight->countShortcut(segment, domain),
-              [&](Query::Weight& resolver) {
-                return &resolver == weight ? obtainSupplier()
-                    : resolver.scorerSupplier(guard.pool(), segment);
-              }, Query::COUNT_EXECUTION_LIMIT);
-          if (!count) count = QueryPrep::supplierCount(obtainSupplier());
-          if (count) {
-            data.counts[bucket] += *count;
+        } else {
+          if (!op.bucketUses.empty()) {
+            data.counts[bucket] += segmentSources(segment).count(
+                *op.bucketWeights[bucket], op.bucketUses[bucket], base, preparedBucket(bucket));
             continue;
           }
-        }
-        if (!countOnly) {
-          auto evaluation = queryOp().evaluateInDomain(bucket, segment, domain, guard.pool());
-          if (evaluation.membership != nullptr) {
-            data.counts[bucket] += DocSet::intersectionCard(evaluation.membership, domain);
-            continue;
+
+          auto guard = MemPool::threadLocalPoolGuard();
+          auto* domain = base.get();
+          auto* weight = op.bucketWeights[bucket];
+          Query::ScorerSupplier* supplier = nullptr;
+          bool supplierBuilt = false;
+          auto obtainSupplier = [&]() {
+            if (!supplierBuilt) {
+              supplier = bucketSource(bucket).scorerSupplier(guard.pool(), segment);
+              supplierBuilt = true;
+            }
+            return supplier;
+          };
+          if (domain == nullptr && !weight->needsPrepare()) {
+            auto count = QueryPrep::resolveCount(weight->countShortcut(segment, domain),
+                [&](Query::Weight& resolver) {
+                  return &resolver == weight ? obtainSupplier() : resolver.scorerSupplier(guard.pool(), segment);
+                }, Query::COUNT_EXECUTION_LIMIT);
+            if (!count) count = QueryPrep::supplierCount(obtainSupplier());
+            if (count) {
+              data.counts[bucket] += *count;
+              continue;
+            }
           }
-          if (evaluation.shared) {
-            if (evaluation.supplier != nullptr) data.counts[bucket] += QueryPrep::materialize(
-                evaluation.supplier, guard.pool(), segment, domain, evaluation.mode)->card();
-            continue;
+          if (auto* scorerSupplier = obtainSupplier()) {
+            data.counts[bucket] += QueryPrep::materialize(scorerSupplier, guard.pool(), segment, domain)->card();
           }
         }
-        supplier = obtainSupplier();
-        if (supplier == nullptr) continue;
-        DomainHandle matches = DomainHandle(QueryPrep::materialize(supplier, guard.pool(), segment, domain)).scoped(segment);
-        data.counts[bucket] += matches.get()->card();
-      }
       }
     }
 
@@ -2642,8 +2516,7 @@ public:
           auto release = scope_guard([&]() noexcept {
             releaseBucketState(segment, block[i].key);
           });
-          domain = materializeBucket(
-              segnum, block[i].key, this->input[segnum].get());
+          domain = materializeBucket(segment, block[i].key, this->input[segnum]);
         }
         feed(i, std::move(domain));
       }
@@ -2654,7 +2527,7 @@ public:
         FacetBucketFeed feed) override {
       for (size_t i = 0; i < block.size(); i++) {
         if (queryOp().bucketWeights[block[i].key]->matchesAllDocs()) feed(i, eligibility);
-        else feed(i, identityDomain(segnum, block[i].key, eligibility.get()));
+        else feed(i, identityDomain(segnum, block[i].key, eligibility));
       }
     }
 

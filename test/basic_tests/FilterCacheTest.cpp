@@ -46,6 +46,7 @@
 #include "luxir/query/QueryPrep.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/TermRangeQuery.h"
+#include "luxir/search/DomainVariantPlan.h"
 #include "luxir/search/FilterCache.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/server/LuxirNode.h"
@@ -7080,6 +7081,96 @@ TEST(FilterCacheTest, domainCompositionsAreOwnedAndLiveCompositionIsMemoized) {
   EXPECT_TRUE(survivor.isDeliverable());
   EXPECT_EQ(1, survivor.get()->card());
   EXPECT_TRUE(survivor.get()->get(1));
+}
+
+namespace {
+
+class SegmentSourcesTest : public ::testing::Test {
+protected:
+  test::CollectionHelper helper{"segment_sources"};
+  std::shared_ptr<IndexReader> reader;
+  TermQuery query{"tag_s", "red"};
+
+  void SetUp() override {
+    helper.clear();
+    helper.getIndexWriter()->snapshots.readers.filterCache =
+        std::make_shared<FilterCache>(FilterCacheConfig{.admissionThreshold = 100});
+    ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "a", "tag_s", "red"),
+        test::flatdoc("id", "b", "tag_s", "red"), test::flatdoc("id", "c", "tag_s", "blue"),
+        test::flatdoc("id", "d", "tag_s", "red")}, UpdateMessage::COMMIT).success);
+    ASSERT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
+    reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(1u, reader->segments().size());
+    ASSERT_TRUE(reader->segments()[0].hasDeletes());
+  }
+};
+
+} // namespace
+
+TEST_F(SegmentSourcesTest, LoneDomainRentsAndRestrictedDomainRetainsOneSet) {
+  RequestMemTracker tracker(0);
+  DomainSourceStats stats;
+  test::SearchOverridesGuard guard(domainSourceStatsForTests);
+  domainSourceStatsForTests = &stats;
+  auto& segment = reader->segments()[0];
+  auto base = DomainHandle(docs(segment.maxDoc(), {0, 2})).scoped(segment);
+  {
+    MemPool pool;
+    Query::PlanningContext planning(pool, *reader);
+    google::protobuf::Arena arena;
+    auto* weight = query.createWeight(*Query::Context::create(&arena, planning), 0);
+    auto* use = planning.getFilterUse(query);
+    ASSERT_NE(nullptr, use);
+    DomainVariantPlan::SegmentSources sources{*reader, planning, segment, tracker};
+
+    EXPECT_EQ(1, sources.count(*weight, use, base));
+    EXPECT_EQ(1u, stats.rents.load());
+    EXPECT_EQ(0u, stats.buys.load() + stats.borrows.load());
+    EXPECT_EQ(nullptr, use->rawDocSet(0));
+    EXPECT_EQ(0u, tracker.bytes());
+
+    {
+      auto result = sources.resolve(*weight, use, base);
+      ASSERT_NE(nullptr, result.get());
+      EXPECT_EQ(1, result.get()->card());
+      EXPECT_TRUE(result.get()->get(0));
+      EXPECT_GT(tracker.bytes(), use->ownedBytesForTest());
+    }
+    EXPECT_EQ(1, sources.count(*weight, use, base));
+    EXPECT_EQ(1u, stats.rents.load());
+    EXPECT_EQ(1u, stats.buys.load());
+    EXPECT_EQ(1u, stats.borrows.load());
+    ASSERT_NE(nullptr, use->rawDocSet(0));
+    EXPECT_EQ(3, use->rawDocSet(0)->card());
+    ASSERT_GT(use->ownedBytesForTest(), 0u);
+    EXPECT_EQ(use->ownedBytesForTest(), tracker.bytes());
+  }
+  EXPECT_EQ(0u, tracker.bytes());
+}
+
+TEST_F(SegmentSourcesTest, LiveMembershipBreakerUnwindsWithDeletes) {
+  auto& segment = reader->segments()[0];
+  MemPool sizingPool;
+  Query::Context sizing(sizingPool, *reader);
+  auto raw = QueryPrep::materializeRawFilter(*query.createWeight(sizing, 0), nullptr, segment);
+  RequestMemTracker tracker(raw->ramBytesUsed());
+  {
+    MemPool pool;
+    Query::PlanningContext planning(pool, *reader);
+    google::protobuf::Arena arena;
+    auto* weight = query.createWeight(*Query::Context::create(&arena, planning), 0);
+    auto* use = planning.getFilterUse(query);
+    ASSERT_NE(nullptr, use);
+    DomainVariantPlan::SegmentSources sources{*reader, planning, segment, tracker};
+    auto live = DomainHandle::pinned(segment.liveDocSet(), segment.liveDocsShared()).scoped(segment);
+
+    EXPECT_EQ(2, sources.count(*weight, use, live));
+    EXPECT_THROW(sources.resolve(*weight, use, live), ResourceExhaustedError);
+    EXPECT_EQ(raw->ramBytesUsed(), tracker.bytes());
+    auto base = DomainHandle(docs(segment.maxDoc(), {0, 2})).scoped(segment);
+    EXPECT_EQ(1, sources.count(*weight, use, base));
+  }
+  EXPECT_EQ(0u, tracker.bytes());
 }
 
 TEST(FilterCacheTest, rawMaterializationEnforcesExhaustiveFlags) {
