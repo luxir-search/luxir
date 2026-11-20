@@ -134,6 +134,10 @@ struct SegFieldInfo {
         && sumDocFreq == docsWithField;
   }
 
+  // VECTOR only: the column's VectorEncoding, as written for this segment.
+  // Serialized only for VECTOR fields.
+  int32_t vectorEncoding = 0;
+
   void requireCompatibleType(const SegFieldInfo& other) const {
     if (type != other.type || FieldType::typeParameters(type, typeFlags)
         != FieldType::typeParameters(other.type, other.typeFlags)) {
