@@ -16,24 +16,13 @@ public:
   Query::Context* weightContext = nullptr;
   DomainVariantPlan domainVariants;
 
-  RootOp(SearchRequest& req) : SearchOp(req, "root") {
+  RootOp(SearchRequest& req) : SearchOp(req, req.reader, "root") {
   }
 
 
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     domainVariants.releaseSegmentState(segment);
     SearchOp::releaseSegmentState(segment);
-  }
-
-  // Lists price their own matches. Any other top-level op works over the
-  // whole collection.
-  size_t workEstimate() override {
-    size_t total = SearchOp::workEstimate();
-    for (auto& [name, subOp] : subOps) {
-      if (subOp->ownsMatchDomain()) continue;
-      total = saturatingAdd(total, (size_t) req.reader->maxDoc());
-    }
-    return total;
   }
 
   class Calc final : public SearchOp::Calculator {
@@ -52,7 +41,7 @@ public:
     }
 
     void calc(
-        oneapi::tbb::task_group* tg, int32_t segnum,
+        FanoutScope* tg, int32_t segnum,
         DomainHandle domain) override {
       unused(tg);
       unused(segnum);
@@ -62,7 +51,7 @@ public:
     }
 
     void calcAll(
-        oneapi::tbb::task_group* tg,
+        FanoutScope* tg,
         std::span<const DomainHandle> domains) override {
       unused(tg);
       unused(domains);
@@ -70,7 +59,7 @@ public:
       std::unreachable();
     }
 
-    void start(oneapi::tbb::task_group* tg) {
+    void start(FanoutScope* tg) {
       auto& root = static_cast<RootOp&>(op);
       assert(subCalcs.empty());
       subCalcs.reserve(op.subOps.size());
@@ -86,14 +75,14 @@ public:
         }
       }
 
-      const auto& segs = op.req.reader->segments();
+      const auto& segs = op.view->segments();
       domains.reserve(segs.size());
       for (auto& seg : segs) {
         // Start with live docs. This establishes the PrepareContext domain
         // contract (Query.h): a segment's domain, when present, is
         // live-filtered and is the complete eligibility predicate; null means
         // no deletes and no filters.
-        domains.push_back(DomainHandle::pinned(seg.liveDocSet(), op.req.reader));
+        domains.push_back(DomainHandle::pinned(seg.liveDocSet(), op.view).scoped(seg));
       }
 
       if (root.domainVariants.empty()) {
@@ -101,7 +90,7 @@ public:
           auto* subCalc = subCalcs[child].get();
           return [this, subCalc, tg]() {
             Signal::emit("searchRootChildStart", subCalc);
-            subCalc->calcAll(tg, domains);
+            subCalc->acceptAll(tg, domains);
           };
         });
         return;
@@ -118,12 +107,12 @@ public:
       liveViews.reserve(domains.size());
       for (const auto& domain : domains) liveViews.push_back(domain.get());
       Query::Weight::PrepareContext prepareContext{
-        *op.req.reader,
+        *op.view,
         std::span<DocSet* const>(liveViews.data(), liveViews.size()),
-        tg != nullptr, &op.req};
+        tg, &op.req};
       std::vector<QueryPrep::PreparedSource> prepared(weights.size());
       auto release = scope_guard([&]() noexcept {
-        for (auto& segment : op.req.reader->segments()) {
+        for (auto& segment : op.view->segments()) {
           for (const auto& source : prepared) source.releaseSegmentState(segment);
         }
       });
@@ -154,7 +143,7 @@ public:
       std::vector<std::vector<DomainHandle>> extraSets(
           domains.size(), std::vector<DomainHandle>(weights.size()));
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
-        auto& segment = op.req.reader->segments()[segnum];
+        auto& segment = op.view->segments()[segnum];
         std::string detail = "root segment " + std::to_string(segnum);
         reservations[segnum] = root.domainVariants.reserveProduction(
             op.req.memoryTracker, segment.maxDoc(), detail);
@@ -162,7 +151,7 @@ public:
             segnum, op.req.memoryTracker, detail);
         for (size_t source : resetExtraSources) {
           DomainHandle set = QueryPrep::materializeEffectiveFilter(
-              prepared[source], *op.req.reader, segment,
+              prepared[source], *op.view, segment,
               domains[segnum].get());
           if (set.get() != nullptr && set.isDeliverable()) {
             reservations[segnum]->grow(set.get()->ramBytesUsed());
@@ -194,9 +183,9 @@ public:
       auto preparedVariants = root.domainVariants.prepareResetVariants(
           prepared, eligibility,
           std::span<DocSet* const>(liveViews.data(), liveViews.size()),
-          *op.req.reader, tg != nullptr, &op.req,
+          *op.view, tg, &op.req,
           [&](size_t variant, size_t segnum) {
-            auto& segment = op.req.reader->segments()[segnum];
+            auto& segment = op.view->segments()[segnum];
             return root.domainVariants.reserveVariantPreparation(
                 op.req.memoryTracker, segment.maxDoc(),
                 "root variant " + std::to_string(variant)
@@ -206,7 +195,7 @@ public:
       std::vector<std::vector<DomainHandle>> produced;
       produced.reserve(domains.size());
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
-        auto& segment = op.req.reader->segments()[segnum];
+        auto& segment = op.view->segments()[segnum];
         auto releaseSegment = scope_guard([&]() noexcept {
           for (const auto& source : prepared) source.releaseSegmentState(segment);
         });
@@ -217,7 +206,7 @@ public:
             return extraSets[segnum][source];
           }
           DomainHandle set = QueryPrep::materializeEffectiveFilter(
-              prepared[source], *op.req.reader, segment,
+              prepared[source], *op.view, segment,
               domains[segnum].get());
           if (set.get() != nullptr && set.isDeliverable()) {
             reservation->grow(set.get()->ramBytesUsed());
@@ -262,7 +251,7 @@ public:
         auto* subCalc = subCalcs[child].get();
         return [subCalc, tg, childDomains = std::move(childDomains)]() {
           Signal::emit("searchRootChildStart", subCalc);
-          subCalc->calcAll(tg, childDomains);
+          subCalc->acceptAll(tg, childDomains);
         };
       });
     }

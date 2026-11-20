@@ -9,7 +9,6 @@
 #include "luxir/store/Manifest.h"
 #include "luxir/store/CorruptionMarker.h"
 #include "luxir/util/Signal.h"
-#include "luxir/util/Uuid.h"
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <glaze/glaze.hpp>
@@ -18,7 +17,6 @@
 #include <thread>
 #include <set>
 #include <ostream>
-#include <unistd.h>
 
 namespace luxir {
 namespace {
@@ -208,15 +206,6 @@ public:
 std::string errorMessage(const std::exception& error) {
   if (auto* system = dynamic_cast<const boost::system::system_error*>(&error)) return system->code().message();
   return error.what();
-}
-// The name the source knows this follower by: host:port of its listener, so a
-// restart resumes the same acknowledgment rows. Without a fixed port, a
-// per-process id.
-std::string defaultFollowerName(const LuxirConfig& config) {
-  int port = config.server.http.enabled ? config.server.http.port : config.server.grpc.port;
-  char host[256] = {};
-  if (port <= 0 || ::gethostname(host, sizeof(host) - 1) != 0 || !*host) return newUuid();
-  return std::string(host) + ":" + std::to_string(port);
 }
 struct PinGone : std::runtime_error { PinGone() : std::runtime_error("source snapshot pin expired") {} };
 struct PeerMismatch : std::runtime_error {
@@ -409,7 +398,12 @@ struct ReplicationFollower::Impl {
 
   void unloadCorrupt(const Key& key, const std::shared_ptr<const Repair>& repair) {
     std::shared_ptr<Collection> active;
-    { std::lock_guard lock(mutex); auto& state = states[key]; if (state.selectedName) active = state.local; }
+    {
+      std::lock_guard lock(mutex);
+      auto& state = states[key];
+      if (!state.selectedName && state.advertised) return; // an incoming copy keeps the report until it is selected
+      if (state.selectedName) active = state.local;
+    }
     auto shard = active ? active->getShard() : nullptr;
     auto snapshot = shard ? shard->getSnapshots().snapshot() : nullptr;
     auto failed = repair->collection.lock();
@@ -798,21 +792,22 @@ struct ReplicationFollower::Impl {
   }
 
   // Verifies every file of `snapshot` in the target directory, downloading what
-  // is missing or suspect, and makes them durable.
-  void stageFiles(Clients& clients, const Key& key, const CollectionId& name, Directory& dir, const std::shared_ptr<const CommitSnapshot>& previous,
-                  const CommitSnapshot& snapshot, const std::shared_ptr<Collection>& active) {
-    auto suspects = CorruptionMarker::read(dir);
+  // is missing or suspect, and makes them durable. Returns the target markers read.
+  std::vector<std::string> stageFiles(Clients& clients, const Key& key, const CollectionId& name, Directory& dir,
+                                      const std::shared_ptr<const CommitSnapshot>& previous,
+                                      const CommitSnapshot& snapshot, const std::shared_ptr<Collection>& active) {
+    auto observed = CorruptionMarker::read(dir);
     std::map<std::string, FileDescriptor> verified;
     { std::lock_guard lock(mutex); verified = states[key].verified; }
     if (!previous && active && !active->isFailed()) {
       if (auto shard = active->getShard()) {
         auto& source = shard->getSnapshots();
         if (auto serving = source.snapshot()) {
-          auto sourceSuspects = CorruptionMarker::read(source.dir);
+          auto sourceSuspects = CorruptionMarker::read(source.dir).suspects;
           std::vector<FileDescriptor> available;
           for (const auto& file : serving->files)
             if (!std::ranges::binary_search(sourceSuspects, file.name)
-                && !std::ranges::binary_search(suspects, file.name)) available.push_back(file);
+                && !std::ranges::binary_search(observed.suspects, file.name)) available.push_back(file);
           for (auto& file : dir.reuseFiles(source.dir, available, snapshot.files))
             verified.insert_or_assign(file.name, std::move(file));
         }
@@ -828,7 +823,7 @@ struct ReplicationFollower::Impl {
     for (const auto& file : snapshot.files) {
       if (file.name.empty() || file.name == "." || file.name == ".." || file.name.find_first_of("/\\") != std::string::npos
           || file.name.starts_with(Manifest::kPrefix) || file.name.ends_with(".tmp") || !unique.insert(file.name).second) throw std::runtime_error("invalid snapshot file name");
-      bool suspect = std::ranges::binary_search(suspects, file.name);
+      bool suspect = std::ranges::binary_search(observed.suspects, file.name);
       if (suspect && durableNames.contains(file.name))
         throw std::runtime_error("cannot replace suspect file in serving snapshot: " + file.name + "; unload and repair the collection");
       bool reuse = !suspect && verified.contains(file.name) && verified.at(file.name) == file;
@@ -866,6 +861,7 @@ struct ReplicationFollower::Impl {
       if (!durableNames.contains(file.name)) names.push_back(file.name);
     }
     dir.sync(names);
+    return std::move(observed.markers);
   }
 
   void sync(Clients& clients, const Key& key) {
@@ -904,11 +900,11 @@ struct ReplicationFollower::Impl {
         auto candidate = node.collections().stage(name, snapshot->id.incarnation);
         std::lock_guard lock(mutex); state.candidate = std::move(candidate);
       }
-      stageFiles(clients, key, name, state.candidate->dir(), state.candidate->committed(), *snapshot, decision.active);
+      auto markers = stageFiles(clients, key, name, state.candidate->dir(), state.candidate->committed(), *snapshot, decision.active);
       stillAdvertised();
       if (stopping.stop_requested()) return;
       // An unregistered candidate's publication is invisible until activation.
-      auto prepared = node.collections().prepare(*state.candidate, snapshot);
+      auto prepared = node.collections().prepare(*state.candidate, snapshot, markers);
       { std::lock_guard lock(mutex); state.candidate.reset(); }
       std::lock_guard lock(mutex);
       state.prepared = std::make_unique<Collections::Prepared>(std::move(prepared));
@@ -997,7 +993,7 @@ struct ReplicationFollower::Impl {
           for (auto& [candidate, state] : states) {
             if (!includes({candidate.tenant, ""}) || mappings[candidate.tenant].applying) continue;
             bool cleanup = state.retiring || (state.remove && !state.selectedName && !state.advertised);
-            bool work = cleanup || (connected && ((bool)state.corrupt || (state.advertised && ((state.advertised != state.serving && state.advertised != state.ready && !state.waiting)
+            bool work = cleanup || (connected && ((state.corrupt && (state.selectedName || !state.advertised)) || (state.advertised && ((state.advertised != state.serving && state.advertised != state.ready && !state.waiting)
                     || state.needsAck()))));
             if (!state.busy && (!state.unavailable || cleanup) && work && node.now() >= state.retry && (!selected || std::max(state.readySince, state.retry) < std::max(selected->readySince, selected->retry))) {
               key = candidate; selected = &state;
@@ -1086,9 +1082,8 @@ void ReplicationFollower::seed(const std::vector<Collections::Opened>& opened) {
 bool ReplicationFollower::pull(std::ostream& output) { return impl->pull(output); }
 void ReplicationFollower::start() {
   {
-    const auto& name = impl->node.getConfig().replication.follower_id;
     std::lock_guard lock(impl->mutex);
-    impl->follower = name.empty() ? defaultFollowerName(impl->node.getConfig()) : name;
+    impl->follower = impl->node.nodeId();
   }
   impl->threads.emplace_back([this] { impl->watch(); });
   for (int i = 0; i < impl->node.getConfig().replication.downloads; i++) impl->threads.emplace_back([this] { impl->worker(); });
@@ -1126,7 +1121,7 @@ void ReplicationFollower::repair(const CollectionId& id, const std::shared_ptr<C
   auto repair = std::make_shared<const Impl::Repair>(Impl::Repair{collection, {suspects.begin(), suspects.end()}, reason});
   {
     std::lock_guard lock(impl->mutex);
-    for (auto& [key, state] : impl->states) if (key.tenant == id.tenant && (state.local == collection || state.selectedName == id.name)) state.corrupt = repair;
+    for (auto& [key, state] : impl->states) if (key.tenant == id.tenant && (state.local == collection || state.selectedName == id.name || state.name == id)) state.corrupt = repair;
   }
   impl->changed.notify_all();
 }

@@ -246,7 +246,7 @@ void TermValHash<T,Hasher>::rehash() {
   auto oldTableSize = tableSize_;
   newTable(tableSize_ << 1);
 
-  for (auto i = 0; i < oldTableSize; i++) {
+  for (unsigned i = 0; i < oldTableSize; i++) {
     auto oldslot = oldTable + i;
     if (!oldslot->isNull()) {
       auto hash = Hasher()(*oldslot);

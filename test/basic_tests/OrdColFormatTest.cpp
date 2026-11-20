@@ -889,6 +889,116 @@ TEST_F(OrdColFormatTest, indexedStringMixedModesMergeKeepsSurvivingSequences) {
   EXPECT_NE(0, reader->segments()[0].postingsReader().fieldInfo("value")->flags & FieldType::MULTI_ARRAY);
 }
 
+// Multi-valued SET ord columns merge by replaying the source columns through
+// term ord maps, here across single- and multi-valued sources with a delete.
+TEST_F(OrdColFormatTest, setMergeReplaysSourceColumns) {
+  CollectionHelper helper;
+  helper.clear();
+  SchemaBuilder schema;
+  auto& field = schema.field("value");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.multi = api::FieldDef::MultiMode::SET;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "value", vecs("z", "b", "a")), UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "gone", "value", vecs("x", "b")), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "value", "y"), UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "c"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "d", "value", vecs("c", "y", "b")), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("gone", UpdateMessage::COMMIT).success);
+
+  CollectionHelper::UpdateBuilder update;
+  update.commit(true, 1);
+  ASSERT_TRUE(helper.submit(update).success);
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& top = req->collection("main").topDocs("q").allQuery().limit(-1).fields({"id", "value"});
+  qb::sort(top, "id", qb::ASC);
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& rows = std::get<api::ArrArrStr>(req->docList("q")->columns.at("value").kind).v;
+  std::vector<std::vector<std::string>> values;
+  for (const auto& row : rows) values.emplace_back(row.v.begin(), row.v.end());
+  EXPECT_EQ((std::vector<std::vector<std::string>>{{"a", "b", "z"}, {"y"}, {}, {"b", "c", "y"}}), values);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  EXPECT_EQ(0, reader->segments()[0].postingsReader().fieldInfo("value")->flags & FieldType::MULTI_ARRAY);
+}
+
+// column: false keeps an indexed string's postings and docs-with-field set
+// (exists, scoring) but writes no ord column, at flush or merge.
+TEST_F(OrdColFormatTest, indexedStringWithoutColumnKeepsPostingsOnly) {
+  CollectionHelper helper;
+  helper.clear();
+  SchemaBuilder schema;
+  auto& field = schema.field("cells");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.multi = api::FieldDef::MultiMode::SET;
+  field.column = false;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "cells", vecs("x", "y")), UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "none"), UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "gone", "cells", vecs("y")), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "cells", vecs("y", "z")), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("gone", UpdateMessage::COMMIT).success);
+  for (int merge = 0; merge < 2; merge++) {
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    int32_t withField = 0;
+    for (auto& segment : reader->segments()) if (auto* info = segment.postingsReader().fieldInfo("cells")) {
+      EXPECT_FALSE(info->hasOrdColumn());
+      EXPECT_EQ(0, info->flags & FieldType::COLUMN_STORED);
+      withField += info->docsWithField;
+    }
+    EXPECT_EQ(merge ? 2 : 3, withField);  // the deleted doc leaves at merge
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("y").matchQuery("cells", "y").countLimit();
+    req->topDocs("exists").existsQuery("cells").countLimit();
+    req->execute(false);
+    ASSERT_OK(req);
+    EXPECT_EQ(2, req->getMatchCount("y"));
+    EXPECT_EQ(2, req->getMatchCount("exists"));
+    auto facet = localReq(helper.getSearchEngine());
+    facet->collection("main").topDocs("q").allQuery().facet("f", "cells");
+    facet->execute(false);
+    EXPECT_FALSE(facet->ok());
+    if (!merge) {
+      CollectionHelper::UpdateBuilder update;
+      update.commit(true, 1);
+      ASSERT_TRUE(helper.submit(update).success);
+    }
+  }
+}
+
+// Dropping the column is a schema change merges can honor; adding one is not,
+// since segments written without it hold only the postings.
+TEST_F(OrdColFormatTest, indexedStringColumnCanBeDroppedButNotAdded) {
+  CollectionHelper helper;
+  helper.clear();
+  auto setColumn = [&](bool column) {
+    SchemaBuilder schema;
+    auto& field = schema.field("tag");
+    field.type = api::FieldDef::FieldClass::STRING;
+    field.column = column;
+    schema.set(helper.collection());
+  };
+  setColumn(true);
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "tag", "old"), UpdateMessage::COMMIT).success);
+  setColumn(false);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "tag", "new"), UpdateMessage::COMMIT).success);
+  EXPECT_THROW(setColumn(true), SchemaError);
+
+  CollectionHelper::UpdateBuilder update;
+  update.commit(true, 1);
+  ASSERT_TRUE(helper.submit(update).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  EXPECT_FALSE(reader->segments()[0].postingsReader().fieldInfo("tag")->hasOrdColumn());
+  auto exists = localReq(helper.getSearchEngine());
+  exists->collection("main").topDocs("q").existsQuery("tag").countLimit();
+  exists->execute(false);
+  ASSERT_OK(exists);
+  EXPECT_EQ(2, exists->getMatchCount("q"));
+}
+
 TEST_F(OrdColFormatTest, arrayDocumentDedupChargesReusesAndReleasesScratch) {
   CollectionHelper helper;
   SchemaBuilder schema;

@@ -166,7 +166,13 @@ TEST(KnnPlannerTest, sharedTerminalPoolAndCodecSetup) {
   EXPECT_EQ(plan.prices[0].linear[KnnPlanner::RABITQ_LIST_DIM], 0);
   segments[0].codec = KnnPlanner::Codec::RABITQ;
   auto price = KnnPlanner::price(segments[0], req, costs);
+  EXPECT_EQ(price.linear[KnnPlanner::SCORER_LIST_DIM], 256 * 128);
+  EXPECT_EQ(price.linear[KnnPlanner::RABITQ_LIST_DIM], 0);
+  segments[0].rabitqBits = 2;
+  price = KnnPlanner::price(segments[0], req, costs);
   EXPECT_EQ(price.linear[KnnPlanner::RABITQ_LIST_DIM], 256 * 128);
+  EXPECT_EQ(price.linear[KnnPlanner::SCORER_LIST_DIM], 0);
+  EXPECT_EQ(price.linear[KnnPlanner::SCORER_DIM], 0);
   EXPECT_EQ(price.exact[KnnPlanner::ROUND], 0);
   VectorSearchWork work;
   work.exactVectors = 10; work.seedReads = 3; work.remainingReads = 2; work.rounds = 1;
@@ -289,7 +295,7 @@ TEST(KnnPlannerTest, selectorMetricAndTerminalFeatures) {
       auto actual = KnnPlanner::actualWork(s, work);
       for (const auto& features : {price.linear, actual}) {
         EXPECT_EQ(codec == KnnPlanner::Codec::PQ && selector ? 100 : 0, features[KnnPlanner::ENTRY_PQ]);
-        EXPECT_DOUBLE_EQ(selector ? 9 : 0, features[KnnPlanner::ENTRY_MISPREDICT]);
+        EXPECT_DOUBLE_EQ(selector && !KnnPlanner::usesScorer(s) ? 9 : 0, features[KnnPlanner::ENTRY_MISPREDICT]);
         EXPECT_EQ(codec == KnnPlanner::Codec::PQ && l2 ? 12 : 0, features[KnnPlanner::PQ_LIST_SETUP]);
         EXPECT_EQ(0, features[KnnPlanner::IVF_REQUEST]); // Shared charge stays out of completion.
       }
@@ -297,6 +303,30 @@ TEST(KnnPlannerTest, selectorMetricAndTerminalFeatures) {
       EXPECT_EQ(5 * 128, actual[KnnPlanner::TERMINAL_DIM]);
       EXPECT_EQ(0, KnnPlanner::actualWork(s, {})[KnnPlanner::ENTRY_MISPREDICT]);
     }
+}
+
+TEST(KnnPlannerTest, rabitqKernelPricing) {
+  auto s = segment(10);
+  s.codec = KnnPlanner::Codec::RABITQ;
+  s.vectors = 100; s.nlist = 3;
+  VectorSearchWork work;
+  work.oneBitScores = 10; work.listSetups = 3;
+  work.physicalEntries = 100; work.selectorPasses = 10; work.selectorBitmap = 100;
+  for (int bits : {1, 2}) for (int qb = 0; qb <= 8; qb++) for (bool force : {false, true}) {
+    SCOPED_TRACE(::testing::Message() << bits << '/' << qb << '/' << force);
+    s.rabitqBits = bits; s.rabitqQueryBits = qb; s.forceFaissRaBitQ = force;
+    bool scorer = bits == 1 && qb > 0 && !force;
+    EXPECT_EQ(scorer, KnnPlanner::usesScorer(s));
+    auto price = KnnPlanner::price(s, {}, {});
+    auto actual = KnnPlanner::actualWork(s, work);
+    for (const auto& features : {price.linear, actual}) {
+      EXPECT_EQ(scorer ? 1280 : 0, features[KnnPlanner::SCORER_DIM]);
+      EXPECT_EQ(scorer ? 0 : 1280, features[KnnPlanner::ONE_BIT_DIM]);
+      EXPECT_EQ(scorer ? 384 : 0, features[KnnPlanner::SCORER_LIST_DIM]);
+      EXPECT_EQ(scorer ? 0 : 384, features[KnnPlanner::RABITQ_LIST_DIM]);
+      EXPECT_DOUBLE_EQ(scorer ? 0 : 9, features[KnnPlanner::ENTRY_MISPREDICT]);
+    }
+  }
 }
 
 TEST(KnnPlannerTest, pqPerListTablePricing) {
@@ -357,4 +387,20 @@ TEST(KnnPlannerTest, parallelScanWidthDiscountsExact) {
   EXPECT_DOUBLE_EQ(KnnPlanner::price(s, parallel, costs).exactCost, KnnPlanner::price(s, serial, costs).exactCost);
   // An undersized IVF scan is one task, so only its exact arm discounts.
   EXPECT_DOUBLE_EQ(wide.a, price.a);
+}
+
+TEST(KnnPlannerTest, unitTargetsDoNotReplaceSourceWorkPopulations) {
+  auto source = segment(1000), owned = source;
+  owned.unitsWithValue = 10000; owned.eligibleUnits = 100;
+  KnnPlanner::Request request{.k = 10, .boundedTarget = 100};
+  KnnPlanner::Costs costs;
+  auto native = KnnPlanner::price(source, request, costs);
+  auto mapped = KnnPlanner::price(owned, request, costs);
+  EXPECT_EQ(native.exact, mapped.exact); EXPECT_EQ(native.linear, mapped.linear);
+  std::array segments{owned}; std::array prices{mapped};
+  auto totals = KnnPlanner::exactTotals(segments, prices, request);
+  EXPECT_EQ(100, totals.exactDocs);
+  KnnPlanner::addIvf(totals, owned, mapped, 1);
+  EXPECT_EQ(0, totals.exactDocs); EXPECT_EQ(100, totals.eligibleDocs);
+  EXPECT_EQ(100, totals.boundedDocs); EXPECT_EQ(1000, totals.eligibleVectors);
 }

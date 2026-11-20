@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "Inverter.h"
+#include "NestedInversion.h"
 
 #include <algorithm>
 #include <boost/sort/spreadsort/string_sort.hpp>
@@ -17,6 +18,42 @@
 #include "luxir/index/handler/FullTextHandler.h"
 
 namespace luxir {
+
+
+Inverter::Inverter(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
+    const std::function<std::shared_ptr<Schema>()>& schemaProvider,
+    IndexRamBudget* ramBudget, StoredDictionaryProvider dictionaryProvider)
+    : Inverter(dir, segId, creatorEpoch, schemaProvider ? schemaProvider() : Schema::createDefaultSchema(),
+               ramBudget, std::move(dictionaryProvider)) {}
+
+Inverter::Inverter(Directory& dir, uint64_t segId, uint64_t creatorEpoch, std::shared_ptr<Schema> schema,
+    IndexRamBudget* ramBudget, StoredDictionaryProvider dictionaryProvider)
+    : postingsWriter(dir, segId, creatorEpoch, -1, ramBudget, true), schema(std::move(schema)),
+      storedDictionaryProvider(std::move(dictionaryProvider)),
+      ramGuard(ramBudget == nullptr ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)) {}
+
+Inverter::~Inverter() = default;
+
+void Inverter::requireInputSpace(std::string_view name) const {
+  auto path = spaceParentPath(name);
+  auto current = nested && nested->active ? std::string_view(nested->active->name) : std::string_view{};
+  if (path != current) rejectInputSpace(name);
+}
+
+void Inverter::rejectInputSpace(std::string_view name) const {
+  throw DocumentError("Field must be supplied inside nested path '" + std::string(spaceParentPath(name))
+      + "': " + std::string(name));
+}
+
+bool Inverter::hasChildRows() const { return maxChildRows > 0; }
+
+bool Inverter::shouldFlush(size_t ramCap, size_t docCap) {
+  auto rows = std::max(getMaxDoc(), maxChildRows);
+  if (maxChildRows > 0) {
+    docCap = std::min(docCap, (size_t)PostingsReader::MAX_SEGMENT_DOCS);
+  }
+  return memSize() > ramCap || (size_t)rows > docCap;
+}
 
 
 void Inverter::deleteId(std::string_view id, uint64_t version) {
@@ -65,6 +102,8 @@ void Inverter::clearUndoLog() {
 
 Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
   auto resolved = schema->resolveInput(name);
+  requireInputSpace(name);
+  auto space = inputSpace;
   auto fieldType = resolved.owner ? resolved.owner->primary : schema->getFieldTypeEx(resolved.physicalName);
   StoredFieldsWriter* writer = nullptr;
   if (fieldType->isStored()
@@ -86,14 +125,14 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
     // will use defaults.  fromProto registers "_stored_" and rejects
     // references to undeclared resources, so this only happens for schemas
     // assembled directly.
-    writer = &getOrCreateStoredFields(resourceName, resConfig);
+    writer = &getOrCreateStoredFields(space, resourceName, resConfig);
   }
 
   auto input = pool.make_unique<InputHandler>(*this, resolved, fieldType, writer);
-  input->branches.push_back({"self", &createPhysicalHandler(resolved.physicalName, fieldType)});
+  input->branches.push_back({"self", &createPhysicalHandler(resolved.physicalName, fieldType, space)});
   if (resolved.owner) {
     for (const auto& [label, type] : resolved.owner->variants) {
-      input->branches.push_back({label, &createPhysicalHandler(resolved.logicalName + "__" + label, type)});
+      input->branches.push_back({label, &createPhysicalHandler(resolved.logicalName + "__" + label, type, space)});
     }
   }
   auto [iter, inserted] = inputHandlers.try_emplace(std::string(name), std::move(input));
@@ -102,7 +141,7 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
 }
 
 Inverter::IndexHandler& Inverter::createPhysicalHandler(
-    std::string_view name, const std::shared_ptr<FieldType>& fieldType) {
+    std::string_view name, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space) {
   // An earlier dispatcher construction may have stopped after this handler.
   auto existing = indexHandlers.find(name);
   if (existing != indexHandlers.end()) return *existing->second;
@@ -110,29 +149,35 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
   u_ptr<IndexHandler> fieldHandler;
 
   if (fieldType->type() == FieldType::ID) {
-    fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType);
+    fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType, space);
     idHandler_ = fieldHandler.get();
+  } else if (fieldType->type() == FieldType::NESTED) {
+    if (!nested) nested = std::make_unique<NestedState>(*this);
+    fieldHandler = pool.make_unique<handler::NestedHandler>(*this, name, fieldType, space,
+                                                           *nested, nested->path(name));
+  } else if (fieldType->type() == FieldType::INTERVAL) {
+    fieldHandler = pool.make_unique<handler::RangeHandler>(*this, name, fieldType, space);
   } else if (fieldType->type() == FieldType::GEO_POINT) {
     if (fieldType->multiValued()) {
-      fieldHandler = pool.make_unique<handler::MultiGeoPointHandler>(*this, name, fieldType);
+      fieldHandler = pool.make_unique<handler::MultiGeoPointHandler>(*this, name, fieldType, space);
     } else {
-      fieldHandler = pool.make_unique<handler::GeoPointHandler>(*this, name, fieldType);
+      fieldHandler = pool.make_unique<handler::GeoPointHandler>(*this, name, fieldType, space);
     }
   } else {
     switch (FieldType::storage(fieldType->type())) {
       case FieldType::Storage::TEXT:
-        fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType);
+        fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType, space);
         break;
       case FieldType::Storage::TERMS:
         if (!fieldType->indexed() && fieldType->hasColumn()) {
           // If the field is not indexed (column stored only), use StrColHandler
-          fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType);
+          fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType, space);
         } else {
           // indexed and column stored (via ord)
           if (fieldType->multiArray()) {
-            fieldHandler = pool.make_unique<handler::StrHandler<true>>(*this, name, fieldType);
+            fieldHandler = pool.make_unique<handler::StrHandler<true>>(*this, name, fieldType, space);
           } else {
-            fieldHandler = pool.make_unique<handler::StrHandler<>>(*this, name, fieldType);
+            fieldHandler = pool.make_unique<handler::StrHandler<>>(*this, name, fieldType, space);
           }
         }
         break;
@@ -141,13 +186,13 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
         // encoding (raw ints, sortable bits, epoch millis) comes from
         // FieldType::coerceColInt64, not the handler.
         if (fieldType->multiValued()) {
-          fieldHandler = pool.make_unique<handler::MultiIntColHandler>(*this, name, fieldType);
+          fieldHandler = pool.make_unique<handler::MultiIntColHandler>(*this, name, fieldType, space);
         } else {
-          fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType);
+          fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType, space);
         }
         break;
       case FieldType::Storage::VECTOR:
-        fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType);
+        fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType, space);
         break;
       default:
         throw std::runtime_error("Unknown field type: " + std::string(name));
@@ -167,6 +212,8 @@ Inverter::InputHandler::InputHandler(Inverter& inverter, const ResolvedFieldHand
       shape(resolved.owner ? resolved.owner->shape :
             resolved.fieldType->type() == FieldType::VECTOR ? LogicalField::Shape::VECTOR :
             resolved.fieldType->type() == FieldType::GEO_POINT ? LogicalField::Shape::GEO :
+            resolved.fieldType->type() == FieldType::NESTED ? LogicalField::Shape::NESTED :
+            resolved.fieldType->type() == FieldType::INTERVAL ? LogicalField::Shape::RANGE :
             LogicalField::Shape::SCALAR),
       multi(resolved.owner ? resolved.owner->multi : resolved.fieldType->multiValued()), writer(writer) {}
 
@@ -213,14 +260,14 @@ void Inverter::InputHandler::store(Inverter& inverter, const IndexVal& val) {
     char buf[coerce::TEXT_BUF_SIZE];
     std::vector<std::string> storage;
     coerce::forEachElement(val, [&](const IndexVal& elem) {
-      storage.emplace_back(fieldType->coerceTerm(elem, name, buf));
+      storage.emplace_back(coerce::toText(elem, name, buf));
     });
     std::vector<std::string_view> views(storage.begin(), storage.end());
     writer->addValues(doc, name, std::span<const std::string_view>(views.data(), views.size()));
   } else {
     // Numeric / bool scalars: store canonical text before normalization.
     char buf[coerce::TEXT_BUF_SIZE];
-    writer->addValue(doc, name, fieldType->coerceTerm(val, name, buf));
+    writer->addValue(doc, name, coerce::toText(val, name, buf));
   }
 }
 
@@ -287,6 +334,7 @@ void Inverter::InputHandler::indexPoints(Inverter& inverter, std::span<const Geo
 
 bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescriptor>* descriptors) {
   getPostingsWriter().setMaxDoc(getMaxDoc());  // TODO: this won't always be accurate currently?
+  if (nested) nested->finish();
   // Index-time stored/vector streams begin as candidates because their final
   // segment size is not known when they are checked out. Once flushing starts,
   // a large inverter spills every existing candidate before further output.
@@ -318,8 +366,8 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
   // Stored-fields chunk streams are also held through indexing. Finish all
   // resources now so their chunk and metadata streams are available for reuse
   // by normal field flushing.
-  for (auto& [_, writer] : storedFields_) {
-    writer->finish(getMaxDoc());
+  for (auto& [key, writer] : storedFields_) {
+    writer->finish(postingsWriter.getMaxDoc(key.space));
   }
 
   for (auto fieldHandler : fields) {

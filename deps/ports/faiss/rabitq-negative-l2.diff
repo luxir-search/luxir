@@ -1,0 +1,35 @@
+diff --git a/faiss/impl/RaBitQuantizer.cpp b/faiss/impl/RaBitQuantizer.cpp
+index c50b965..fde8c56 100644
+--- a/faiss/impl/RaBitQuantizer.cpp
++++ b/faiss/impl/RaBitQuantizer.cpp
+@@ -314,8 +314,8 @@ struct RaBitQDistanceComputerNotQ final : RaBitQDistanceComputer {
+                 2 * base_fac->dp_multiplier * final_dot;
+ 
+         if (metric_type == MetricType::METRIC_L2) {
+-            // ||or - q||^ 2
+-            return std::max(0.0f, pre_dist);
++            // ||or - q||^ 2. Not clamped: negative estimates keep their order.
++            return pre_dist;
+         } else {
+             // metric == MetricType::METRIC_INNER_PRODUCT
+             // 2 * (or, q) = (||or - q||^2 - ||q||^2 - ||or||^2)
+@@ -538,8 +538,8 @@ struct RaBitQDistanceComputerQ final : RaBitQDistanceComputer {
+                 2 * base_fac->dp_multiplier * final_dot;
+ 
+         if (metric_type == MetricType::METRIC_L2) {
+-            // ||or - q||^ 2
+-            return std::max(0.0f, pre_dist);
++            // ||or - q||^ 2. Not clamped: negative estimates keep their order.
++            return pre_dist;
+         } else {
+             // metric == MetricType::METRIC_INNER_PRODUCT
+             // 2 * (or, q) = (||or - q||^2 - ||q||^2 - ||or||^2)
+@@ -592,7 +592,7 @@ struct RaBitQDistanceComputerQ final : RaBitQDistanceComputer {
+                     query_fac.qr_to_c_L2sqr -
+                     2 * factors->dp_multiplier * final_dot;
+             distances[i] = metric_type == METRIC_L2
+-                    ? std::max(0.0f, pre_dist)
++                    ? pre_dist
+                     : -0.5f * (pre_dist - query_fac.qr_norm_L2sqr);
+         }
+     }

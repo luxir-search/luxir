@@ -17,15 +17,21 @@ void CorruptionMarker::write(Directory& dir, std::span<const std::string> files,
                          Directory::PublishMode::CREATE_ONLY)) {}
 }
 
-std::vector<std::string> CorruptionMarker::read(Directory& dir) {
+CorruptionMarker::Observation CorruptionMarker::read(Directory& dir) {
   std::vector<Directory::FileInfo> listing;
   dir.listFiles(listing);
+  return read(dir, listing);
+}
+
+CorruptionMarker::Observation CorruptionMarker::read(Directory& dir, std::span<const Directory::FileInfo> listing) {
+  Observation observed;
   std::set<std::string> names;
   for (const auto& entry : listing) {
     if (!isMarker(entry.name)) continue;
     auto file = dir.openFile(entry.name);
     if (!file) continue;
     auto text = file->read();
+    observed.markers.push_back(entry.name);
     for (size_t start = 0; start < text.size();) {
       auto end = text.find('\n', start);
       if (end == std::string_view::npos) end = text.size();
@@ -35,21 +41,14 @@ std::vector<std::string> CorruptionMarker::read(Directory& dir) {
       names.emplace(line);
     }
   }
-  return {names.begin(), names.end()};
+  observed.suspects.assign(names.begin(), names.end());
+  return observed;
 }
 
 bool CorruptionMarker::present(Directory& dir) {
   std::vector<Directory::FileInfo> listing;
   dir.listFiles(listing);
   return std::ranges::any_of(listing, [](const auto& entry) { return isMarker(entry.name); });
-}
-
-void CorruptionMarker::clear(Directory& dir) {
-  std::vector<Directory::FileInfo> listing;
-  dir.listFiles(listing);
-  std::vector<std::string> names;
-  for (const auto& entry : listing) if (isMarker(entry.name)) names.push_back(entry.name);
-  dir.deleteDurably(names);
 }
 
 }

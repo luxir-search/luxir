@@ -183,6 +183,12 @@ inline int32_t fieldSortSeedBudgetPerMilleForTests = []() {
 inline bool disableTopKCountComposition =
     std::getenv("LUXIR_DISABLE_TOPK_COUNT_COMPOSITION") != nullptr;
 
+// A/B baseline for bounded hit counts. The default counts a bounded total
+// with an unscored pass that stops once the total passes the limit, and ranks
+// with competitive pruning from the first page.
+inline bool disableBoundedCountSplit =
+    std::getenv("LUXIR_DISABLE_BOUNDED_COUNT_SPLIT") != nullptr;
+
 // Test/bench control (LUXIR_FACET_COUNTER). AUTO uses the selector; the rest
 // force a specific representation so the grid can compare reps head to head and
 // measure the crossover thresholds. The FORCE_* modes reuse the selector's own

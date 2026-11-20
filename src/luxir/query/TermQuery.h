@@ -105,6 +105,8 @@ public:
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
 
+  void visitImpl(QueryVisitor& visitor, Context& context, float boost) const override;
+
   class Weight final : public Query::Weight {
   protected:
     TermQuery& query;
@@ -281,7 +283,7 @@ public:
       BulkPlan planBulk(
           BulkUse use, const BulkScorerContext& bulkContext) override {
         if (bulkContext.requireConstantCount) {
-          if (segment.hasDeletes()) {
+          if (segment.mayHaveDeletes()) {
             return {
               BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
               BulkAnswer::NO,
@@ -541,7 +543,7 @@ public:
         return flatNormsBase[doc];
       }
       if (normsIter) {
-        int32_t normDoc = normsIter->advance(doc);
+        [[maybe_unused]] int32_t normDoc = normsIter->advance(doc);
         assert(normDoc == doc);
         return normsIter->value();
       }
