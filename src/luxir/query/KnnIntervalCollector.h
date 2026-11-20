@@ -254,7 +254,11 @@ public:
     std::pmr::vector<std::pair<float, float>> top(&resource); // (score, interval half-width)
     for (size_t i = 0; i < records.size(); i++) {
       if (records[i].unit->seed != i) continue;
-      std::pair<float, float> entry{records[i].hit.score, records[i].exact ? 0.0f : records[i].upper - records[i].hit.score};
+      // An estimate can exceed its clamped upper bound (L2 similarity tops
+      // out at 1); the bound is the better stand-in then.
+      const auto& record = records[i];
+      float estimate = record.exact ? record.hit.score : std::min(record.hit.score, record.upper);
+      std::pair<float, float> entry{estimate, record.exact ? 0.0f : record.upper - estimate};
       if ((int64_t)top.size() < k) { top.push_back(entry); std::push_heap(top.begin(), top.end(), std::greater<>{}); }
       else if (entry > top.front()) {
         std::pop_heap(top.begin(), top.end(), std::greater<>{});
