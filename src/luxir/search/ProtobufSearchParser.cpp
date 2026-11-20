@@ -577,7 +577,9 @@ public:
               name, facetReq, placement, parser);
           validateQueryFacetQueries(plan);
         }
-        FacetReq* facet = createQueryFacetReq(name, facetReq, plan);
+        FacetReq* facet = createQueryFacetReq(
+            name, facetReq, plan,
+            placement == OpsPlacement::FACET_BUCKET || placement == OpsPlacement::GROUP_BUCKET);
         auto* oldMeasure = inheritedFacetMeasure;
         inheritedFacetMeasure = facet->countDistinct;
         auto restore = scope_guard([&]() noexcept { inheritedFacetMeasure = oldMeasure; });
@@ -1515,7 +1517,7 @@ public:
 
   FacetReq* createQueryFacetReq(
       std::string_view facetName, const api::QueryFacet& facetReq,
-      const FacetParsePlan& plan) {
+      const FacetParsePlan& plan, bool bucketChild) {
     assert(plan.planning != nullptr);
     Query::Context* context = Query::Context::create(
         &req.arena, *plan.planning);
@@ -1524,8 +1526,17 @@ public:
     for (size_t i = 0; i < weights.size(); i++) {
       weights[i] = plan.bucketQueries[i]->createWeight(*context, 0);
     }
+    std::span<FilterCache::Use*> uses;
+    if (bucketChild && &plan.planning->topReader == view().get()) {
+      uses = req.requestPool.make_span<FilterCache::Use*>(weights.size());
+      for (size_t i = 0; i < weights.size(); i++) {
+        uses[i] = !weights[i]->matchesAllDocs() && !weights[i]->needsPrepare()
+                && plan.bucketQueries[i]->recoverableAsPredicate()
+            ? plan.planning->getFilterUse(*plan.bucketQueries[i]) : nullptr;
+      }
+    }
     auto* facet = luxir::arenaCreate<QueryFacetReq>(
-        req.arena, req, view(), facetReq, facetName, plan.bucketQueries, weights);
+        req.arena, req, view(), facetReq, facetName, plan.bucketQueries, weights, *plan.planning, uses);
     configureMeasure(*facet, resolveMeasure(facetReq));
     return facet;
   }

@@ -71,8 +71,6 @@ void FacetBucketBlockExecutor::executeComplete(SearchOp::Calculator& parent,
       if (needInherited) inputs[bucket][segnum] = std::move(domain);
     });
   }
-  std::vector<std::vector<std::unique_ptr<DomainVariantPlan::SegmentSources>>> sourceSets(plans.size());
-  for (auto& sources : sourceSets) sources.resize(segments.size());
   auto releasePlans = scope_guard([&]() noexcept {
     // Complete-input selections need all segments until the block ends.
     for (auto& segment : segments) {
@@ -103,17 +101,9 @@ void FacetBucketBlockExecutor::executeComplete(SearchOp::Calculator& parent,
       if (found == routed.end()) {
         auto resetBase = base.empty() ? std::span<const DomainHandle>(inputs[bucket])
                                       : std::span<const DomainHandle>(base);
-        size_t planIndex = (size_t)(std::ranges::find(plans, plan) - plans.begin());
-        auto sourcesFor = [&](size_t segnum) -> DomainVariantPlan::SegmentSources& {
-          auto& sources = sourceSets[planIndex][segnum];
-          if (!sources)
-            sources = std::make_unique<DomainVariantPlan::SegmentSources>(
-                plan->variants, reader, *plan->planning, (int32_t)segnum, tracker);
-          return *sources;
-        };
         routed.emplace_back(plan, plan->variants.produceBucketDomains(
                                       reader, *plan->planning, inputs[bucket], resetBase, nullptr,
-                                      &parent.getOp().req, tracker, sourcesFor,
+                                      &parent.getOp().req, tracker,
                                       binding->structuralFinish(parent.getOp().view, binding->inputConstraint())));
         found = std::prev(routed.end());
       }
@@ -131,7 +121,7 @@ void FacetBucketBlockExecutor::executeComplete(SearchOp::Calculator& parent,
 void FacetBucketBlockExecutor::deliverStructural(SearchOp::Calculator& parent,
                                                  std::span<SearchOp* const> children, IndexReader& reader,
                                                  int32_t segnum, Bindings bindings,
-                                                 const DomainHandle& domain, SegmentSources& sources) {
+                                                 const DomainHandle& domain) {
   std::vector<std::pair<BucketDomainPlan*, std::vector<DomainHandle>>> routed;
   for (size_t child = 0; child < children.size(); child++) {
     auto& binding = bindings[child];
@@ -150,10 +140,9 @@ void FacetBucketBlockExecutor::deliverStructural(SearchOp::Calculator& parent,
           base = path->prefix((int32_t)segnum, std::move(base));
         }
       }
-      auto foundSources =
-          std::ranges::find_if(sources, [&](const auto& entry) { return entry.first == plan; });
-      routed.emplace_back(plan, plan->variants.produceSegment(*foundSources->second, domain, std::move(base),
-                                                              parent.getOp().req.memoryTracker));
+      DomainVariantPlan::SegmentSources sources{reader, *plan->planning, reader.segments()[(size_t)segnum],
+                                                parent.getOp().req.memoryTracker};
+      routed.emplace_back(plan, plan->variants.produceSegment(sources, domain, std::move(base)));
       found = std::prev(routed.end());
     }
     size_t variant = plan->variants.variantForChild(children[child]->name);

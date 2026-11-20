@@ -23,6 +23,15 @@
 
 namespace luxir {
 
+enum class DomainSourceRoute { AUTO, PER_DOMAIN, MEMBERSHIP };
+inline DomainSourceRoute domainSourceRouteForTests = DomainSourceRoute::AUTO;
+// Buys include shared builds, and borrows include request-local hits.
+struct DomainSourceStats {
+  std::atomic<size_t> rents{0}, buys{0}, borrows{0};
+};
+// Independent operations and segments can update these observations in parallel.
+inline DomainSourceStats* domainSourceStatsForTests = nullptr;
+
 // Page-member traversal overrides affect work, never membership.
 enum class CollapseMemberStrategy { AUTO, KEYS, DOMAIN_WALK };
 inline CollapseMemberStrategy collapseMemberStrategy = CollapseMemberStrategy::AUTO;

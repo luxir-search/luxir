@@ -1193,10 +1193,9 @@ public:
         size_t source = sourceOffset + i;
         DomainHandle docs;
         if constexpr (Structural) {
-          auto& sources = structural->producer->filterSources(op.filterWeights, op.filterUses,
-              *op.view, op.planning, seg.ord, op.req.memoryTracker);
+          DomainVariantPlan::SegmentSources sources{*op.view, op.planning, seg, op.req.memoryTracker};
           assert(owner && owner->get() == baseDomain);
-          docs = sources.resolve(source, *owner,
+          docs = sources.resolve(*op.filterWeights[source], op.filterUses[source], *owner,
               prepared ? &(*prepared)[source] : nullptr);
         } else {
           docs = prepared != nullptr
@@ -1407,10 +1406,10 @@ public:
         return set;
       }
       if constexpr (Structural) {
-        auto& sources = structural->producer->segmentSources(
-            op.domainVariants, *op.view, op.planning, segnum, op.req.memoryTracker);
+        DomainVariantPlan::SegmentSources sources{*op.view, op.planning, seg, op.req.memoryTracker};
         assert(owner && owner->get() == base);
-        return sources.resolve(source, *owner,
+        return sources.resolve(*op.domainVariants.sourceWeight(source), op.domainVariants.segmentSourceUse(source),
+            *owner,
             preparedDomainSources.empty() ? nullptr : &preparedDomainSources[source]);
       }
       DomainHandle result = preparedDomainSources.empty()
@@ -1473,10 +1472,9 @@ public:
         }
         std::vector<DomainHandle> domains;
         if (op.domainVariants.segmentLocal(structural->hasSelection())) {
-          auto& sources = structural->producer->segmentSources(
-              op.domainVariants, *op.view, op.planning, segnum, op.req.memoryTracker);
-          domains = op.domainVariants.produceSegment(sources, {}, base,
-              op.req.memoryTracker, bases, DomainVariantPlan::Frame::RESET);
+          DomainVariantPlan::SegmentSources sources{
+              *op.view, op.planning, op.view->segments()[(size_t)segnum], op.req.memoryTracker};
+          domains = op.domainVariants.produceSegment(sources, {}, base, bases, DomainVariantPlan::Frame::RESET);
         } else {
           auto resolve = [&](size_t source, DomainHandle eligibility, DomainVariantPlan::Frame) {
             return materializeDomainSource<Structural>(

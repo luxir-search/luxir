@@ -97,13 +97,7 @@ T& optMut(std::optional<T>& opt) {
 // descendants borrow the path until their synchronous calculations complete.
 struct StructuralConstraint {
   struct Producer {
-    struct Sources {
-      const void* identity;
-      int32_t segment;
-      std::unique_ptr<DomainVariantPlan::SegmentSources> values;
-    };
-    RequestMemResource sourcesResource;
-    std::pmr::vector<Sources> sources;
+    RequestMemResource resource;
 
     using Feed = std::function_ref<void(size_t, DomainHandle)>;
     SearchRequest& req;
@@ -116,16 +110,6 @@ struct StructuralConstraint {
 
     Producer(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const StructuralConstraint* ancestor, size_t bucketCount);
     void releaseSegment(int32_t segment);
-
-    DomainVariantPlan::SegmentSources& segmentSources(const DomainVariantPlan& plan,
-        IndexReader& reader, Query::PlanningContext& planning, int32_t segment,
-        RequestMemTracker& tracker);
-
-    void releaseSources(int32_t segment);
-
-    DomainVariantPlan::SegmentSources& filterSources(std::span<Query::Weight* const> weights,
-        std::span<FilterCache::Use* const> uses, IndexReader& reader, Query::PlanningContext& planning,
-        int32_t segment, RequestMemTracker& tracker);
 
     DomainHandle prefix(int32_t segment, size_t bucket);
     DomainHandle recover(int32_t segment, size_t bucket, DomainHandle eligibility);

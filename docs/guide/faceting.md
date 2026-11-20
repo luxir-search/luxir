@@ -942,6 +942,14 @@ multi-valued document can contribute to several value-derived counts.
 The `ops` map runs independently over each bucket's documents and accepts the
 same metrics, nested facets, and per-bucket `top_docs` as the other facets.
 
+A query facet under facet buckets or collapse groups can reuse a bucket
+query's segment membership across parent buckets. It uses the filter cache
+when available. If the cache declines to build the membership, the first
+evaluation runs within its parent bucket. A second evaluation on the same
+segment can build membership for reuse across the rest of the request.
+Request-owned membership counts against the request memory limit. Queries
+that need preparation, such as kNN, run separately for each parent bucket.
+
 ## Multi-select navigation
 
 A faceted UI usually lets a user pick a value and still see the sibling values

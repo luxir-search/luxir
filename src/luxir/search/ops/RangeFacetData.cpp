@@ -176,7 +176,8 @@ class IntFacetRangeReq::DataCalc : public FixedBucketFacetReq::Calc<Distinct, Gr
     return true;
   }
 
-  void collectSegment(Data& data, int32_t segnum, DocSet* domain) override {
+  void collectSegment(Data& data, int32_t segnum, const DomainHandle& base) override {
+    auto* domain = base.get();
     auto& range = rangeOp();
     if constexpr (Distinct) {
       int64_t missing = 0;

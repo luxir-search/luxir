@@ -28,10 +28,8 @@ void SearchOp::Calculator::accept(FanoutScope* tg, int32_t segment, DomainHandle
     DomainHandle reset = DomainHandle::pinned(leaf.liveDocSet(), op.view).scoped(leaf);
     if (input->applyParentFilters) reset = domain;
     else if (structural) reset = structural->prefix(segment, std::move(reset));
-    DomainVariantPlan::SegmentSources sources(input->variants, *op.view, *input->planning, segment,
-        op.req.memoryTracker);
-    auto variants = input->variants.produceSegment(sources, std::move(domain), std::move(reset),
-        op.req.memoryTracker);
+    DomainVariantPlan::SegmentSources sources{*op.view, *input->planning, leaf, op.req.memoryTracker};
+    auto variants = input->variants.produceSegment(sources, std::move(domain), std::move(reset));
     domain = std::move(variants[input->variants.variantForChild(op.name)]);
   }
   calc(tg, segment, std::move(domain));
@@ -53,15 +51,8 @@ void SearchOp::Calculator::acceptAll(FanoutScope* tg, std::span<const DomainHand
     return;
   }
   auto reset = input->applyParentFilters ? mapped : structuralDomains();
-  std::vector<std::unique_ptr<DomainVariantPlan::SegmentSources>> sources(mapped.size());
-  auto sourcesFor = [&](size_t segment) -> DomainVariantPlan::SegmentSources& {
-    auto& source = sources[segment];
-    if (!source) source = std::make_unique<DomainVariantPlan::SegmentSources>(input->variants, *op.view,
-        *input->planning, (int32_t)segment, op.req.memoryTracker);
-    return *source;
-  };
   auto variants = input->variants.produceBucketDomains(*op.view, *input->planning, mapped, reset,
-      tg, &op.req, op.req.memoryTracker, sourcesFor, structuralFinish());
+      tg, &op.req, op.req.memoryTracker, structuralFinish());
   size_t variant = input->variants.variantForChild(op.name);
   for (size_t segment = 0; segment < mapped.size(); segment++) mapped[segment] = std::move(variants[segment][variant]);
   calcAll(tg, mapped);

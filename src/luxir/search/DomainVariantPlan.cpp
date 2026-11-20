@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "DomainVariantPlan.h"
+#include "luxir/search/SearchOverrides.h"
 
 namespace luxir {
 
@@ -34,112 +35,109 @@ DomainHandle DomainVariantPlan::composeTracked(std::vector<DomainHandle> parts, 
   return account(compose(std::move(distinct)), tracker, "composed segment domain");
 }
 
-std::vector<DomainHandle> DomainVariantPlan::produceSegment(SegmentSources& sources, DomainHandle inherited,
-                                                            DomainHandle resetBase,
-                                                            RequestMemTracker& tracker,
+std::vector<DomainHandle> DomainVariantPlan::produceSegment(const SegmentSources& sources,
+                                                            DomainHandle inherited, DomainHandle resetBase,
                                                             std::span<const DomainHandle> variantBases,
                                                             std::optional<Frame> onlyFrame) const {
   assert(segmentLocal());
-  std::vector<std::optional<DomainHandle>> resolved(sourceCount() * 2);
-  auto resolve = [&](size_t source, DomainHandle base, Frame kind) {
-    auto& value = resolved[source * 2 + (kind == Frame::RESET)];
-    if (!value) value = sources.resolve(source, std::move(base));
-    return *value;
+  auto scoped = [&](size_t source, DomainHandle base, Frame) {
+    return sources.resolve(*sourceWeight(source), segmentSourceUse(source), std::move(base));
   };
   // A parent-filtered reset can have different bases per variant.
   if (!variantBases.empty()) {
-    auto scoped = [&](size_t source, DomainHandle base, Frame) {
-      return sources.resolve(source, std::move(base));
-    };
-    return produceSegment(std::move(inherited), std::move(resetBase), scoped, tracker, {}, {}, variantBases,
-                          onlyFrame);
+    return produceSegment(std::move(inherited), std::move(resetBase), scoped, sources.tracker,
+                          {}, {}, variantBases, onlyFrame);
   }
-  return produceSegment(std::move(inherited), std::move(resetBase), resolve, tracker, {}, {}, {}, onlyFrame);
+  std::vector<std::optional<DomainHandle>> resolved(sourceCount() * 2);
+  auto resolve = [&](size_t source, DomainHandle base, Frame kind) {
+    auto& value = resolved[source * 2 + (kind == Frame::RESET)];
+    if (!value) value = scoped(source, std::move(base), kind);
+    return *value;
+  };
+  return produceSegment(std::move(inherited), std::move(resetBase), resolve, sources.tracker, {}, {}, {}, onlyFrame);
 }
 
-DomainVariantPlan::SegmentSources::SegmentSources(const DomainVariantPlan& plan, IndexReader& reader,
-                                                  Query::PlanningContext& planning, int32_t segment,
-                                                  RequestMemTracker& tracker)
-    : reader(reader),
-      planning(planning),
-      segment(segment),
-      tracker(tracker),
-      resource(tracker, "segment domain sources", "domain variants"),
-      values(plan.sourceCount(), &resource) {
-  for (size_t source = 0; source < values.size(); source++) {
-    init(source, plan.sourceWeight(source),
-         plan.querySources[source].query->recoverableAsPredicate() ? plan.sourceUse(source) : nullptr);
+DocSet* DomainVariantPlan::SegmentSources::membership(
+    Query::Weight& weight, FilterCache::Use* use, const QueryPrep::PreparedSource* prepared) const {
+  auto route = domainSourceRouteForTests;
+  if (route == DomainSourceRoute::PER_DOMAIN || use == nullptr
+      || use->scope() == FilterKeyScope::READER_STABLE
+      || weight.needsPrepare() || weight.needsScores() || weight.allowsPruning()
+      || (prepared && prepared->prepared)) {
+    return nullptr;
   }
-}
 
-DomainVariantPlan::SegmentSources::SegmentSources(std::span<Query::Weight* const> weights,
-                                                  std::span<FilterCache::Use* const> uses,
-                                                  IndexReader& reader, Query::PlanningContext& planning,
-                                                  int32_t segment, RequestMemTracker& tracker)
-    : reader(reader),
-      planning(planning),
-      segment(segment),
-      tracker(tracker),
-      resource(tracker, "segment filter sources", "domain variants"),
-      values(weights.size(), &resource) {
-  assert(weights.size() == uses.size());
-  for (size_t source = 0; source < values.size(); source++) init(source, weights[source], uses[source]);
-}
-
-void DomainVariantPlan::SegmentSources::init(size_t source, Query::Weight* weight, FilterCache::Use* use) {
-  auto& value = values[source];
-  value.weight = weight;
-  value.use = use;
-  if (weight->matchesAllDocs() || weight->needsPrepare() || !use) return;
-  use->enableRoutedAccounting((size_t)segment, tracker, "segment domain source");
-  auto probe = use->probe((size_t)segment);
-  if (probe.kind() == FilterCache::Probe::Kind::BYPASS) {
-    value.bypassed = true;
-    return;
+  assert(&planning.topReader == &reader);
+  size_t ord = (size_t)segment.ord;
+  use->enableRoutedAccounting(ord, tracker, "segment domain source");
+  auto probe = use->probe(ord);
+  using Kind = FilterCache::Probe::Kind;
+  if (probe.kind() == Kind::HIT) {
+    if (domainSourceStatsForTests) domainSourceStatsForTests->borrows++;
+    return probe.docSet();
   }
-  auto& seg = reader.segments()[(size_t)segment];
-  value.stable = materialize(source, seg.liveDocSet(), std::move(probe));
-}
-
-DomainHandle DomainVariantPlan::SegmentSources::resolve(size_t source, DomainHandle base,
-                                                        const QueryPrep::PreparedSource* prepared) {
-  base.assertScope(reader.segments()[(size_t)segment]);
-  auto& value = values[source];
-  if (value.weight->matchesAllDocs()) return freeze(std::move(base));
-  DomainHandle result;
-  if ((prepared && prepared->prepared) || value.weight->needsPrepare() || value.bypassed) {
-    // Admission is per source/segment, never per bucket. A bypass stays
-    // scoped, while prepared selections remain request-local.
-    result = account(
-        DomainHandle(QueryPrep::materialize(*value.weight, prepared ? prepared->prepared.get() : nullptr,
-                                            reader.segments()[(size_t)segment], base.get())),
-        tracker, "scoped segment source").scopedLike(base);
-  } else if (!value.stable) {
-    result = materialize(source, base.get());
-  } else {
-    auto& domain = *value.stable;
-    domain.assertSameScope(base);
-    auto& seg = reader.segments()[(size_t)segment];
-    DocSet* live = seg.liveDocSet();
-    if (!domain.get())
-      result = base;
-    else if (!base.get() || base.get() == live || base.get() == domain.get())
-      result = domain;
-    else {
-      std::array<DocSet*, 2> parts{base.get(), domain.get()};
-      result = account(DomainHandle(DocSet::intersect(parts)), tracker, "scoped segment source").scopedLike(base);
+  if (probe.kind() == Kind::BYPASS) {
+    if (QueryPrep::disableFilterOwnForTests) return nullptr;
+    if (route == DomainSourceRoute::AUTO && probe.rentDomainOnce()) {
+      if (domainSourceStatsForTests) domainSourceStatsForTests->rents++;
+      return nullptr;
     }
   }
+
+  auto* raw = QueryPrep::populateRawFilter(weight, nullptr, segment, *use, probe);
+  assert(raw);
+  if (domainSourceStatsForTests) domainSourceStatsForTests->buys++;
+  return raw;
+}
+
+DomainHandle DomainVariantPlan::SegmentSources::resolve(
+    Query::Weight& weight, FilterCache::Use* use, DomainHandle base,
+    const QueryPrep::PreparedSource* prepared) const {
+  auto* domain = base.get(segment);
+  if ((domain && domain->card() == 0) || weight.matchesAllDocs()) return freeze(std::move(base));
+
+  DomainHandle result;
+  if (membership(weight, use, prepared)) {
+    result = use->effectiveDomain((size_t)segment.ord, reader, domain);
+    // Owned intersections are charged here. The Use accounts for its own sets.
+    if (result.isDeliverable()) result = account(std::move(result), tracker, "scoped segment source");
+    else result = std::move(result).pinnedWith(planning.filterUses);
+  } else {
+    auto docs = QueryPrep::materialize(weight, prepared ? prepared->prepared.get() : nullptr,
+                                      segment, domain ? domain : segment.liveDocSet());
+    result = account(DomainHandle(std::move(docs)).scoped(segment), tracker, "scoped segment source");
+  }
   assert(result.isDeliverable());
-  assert(!base.get() || result.get());
+  assert(!domain || result.get());
   return freeze(std::move(result));
+}
+
+int64_t DomainVariantPlan::SegmentSources::count(
+    Query::Weight& weight, FilterCache::Use* use, const DomainHandle& base,
+    const QueryPrep::PreparedSource* prepared) const {
+  auto* domain = base.get(segment);
+  if (domain && domain->card() == 0) return 0;
+  if (weight.matchesAllDocs()) return domain ? domain->card() : segment.numLive();
+  if (!domain) domain = segment.liveDocSet();
+
+  if (auto* raw = membership(weight, use, prepared)) {
+    // Domains carry liveness, so raw membership counts without a live-composed set.
+    assert(!domain || !segment.hasDeletes()
+           || DocSet::intersectionCard(domain, segment.liveDocSet()) == domain->card());
+    return domain ? DocSet::intersectionCard(raw, domain) : raw->card();
+  }
+
+  auto guard = MemPool::threadLocalPoolGuard();
+  auto& source = prepared ? prepared->segmentSource() : static_cast<Query::SegmentSource&>(weight);
+  auto* supplier = source.scorerSupplier(guard.pool(), segment);
+  return QueryPrep::countSegment(guard.pool(), supplier, domain, segment.maxDoc());
 }
 
 std::vector<std::vector<DomainHandle>> DomainVariantPlan::produceBucketDomains(
     IndexReader& reader, Query::PlanningContext& planning, std::span<const DomainHandle> inherited,
     std::span<const DomainHandle> resetBase, FanoutScope* fanout, ExecutionWarnings* warnings,
-    RequestMemTracker& tracker, Sources sources, const Finish& finish) const {
-  BucketProduction production{tracker, sources};
+    RequestMemTracker& tracker, const Finish& finish) const {
+  BucketProduction production{tracker};
   return producePreparedDomains(reader, planning, inherited, resetBase, fanout, warnings, production,
                                 finish);
 }
@@ -241,10 +239,11 @@ std::vector<std::vector<DomainHandle>> DomainVariantPlan::producePreparedDomains
     std::string detail = "reset segment " + std::to_string(segnum);
     reservations[segnum] = production.reserve(segnum, detail);
     planning.filterUses->enableRoutedAccounting(segnum, production.tracker, detail);
+    SegmentSources sources{reader, planning, reader.segments()[segnum], production.tracker};
     for (size_t source : resetExtraSources) {
       if (sourceWeight(source)->matchesAllDocs()) continue;
       DomainHandle set =
-          production.resolve(source, prepared[source], segnum, resetBase[segnum], *reservations[segnum]);
+          sources.resolve(*weights[source], segmentSourceUse(source), resetBase[segnum], &prepared[source]);
       extraSets[segnum][source] = std::move(set).pinnedWith(planning.filterUses);
     }
   }
@@ -285,6 +284,7 @@ std::vector<std::vector<DomainHandle>> DomainVariantPlan::producePreparedDomains
       for (const auto& source : prepared) production.release(source, segment);
     });
     auto reservation = reservations[segnum];
+    SegmentSources sources{reader, planning, segment, production.tracker};
 
     auto materialize = [&](size_t source, DomainHandle base, Frame frame) {
       if (this->sourceIsResetExtra(source) && base.get() == resetBase[segnum].get() &&
@@ -295,7 +295,7 @@ std::vector<std::vector<DomainHandle>> DomainVariantPlan::producePreparedDomains
           frame == Frame::INHERIT && !inheritedExtras.empty() && inheritedExtras[source].weight
               ? inheritedExtras[source]
               : prepared[source];
-      return production.resolve(source, inputSource, segnum, std::move(base), *reservation);
+      return sources.resolve(*weights[source], segmentSourceUse(source), std::move(base), &inputSource);
     };
 
     auto variants = composeVariants(
@@ -310,33 +310,6 @@ std::vector<std::vector<DomainHandle>> DomainVariantPlan::producePreparedDomains
   }
 
   return produced;
-}
-
-DomainHandle DomainVariantPlan::SegmentSources::materialize(size_t source, DocSet* base) {
-  auto& value = values[source];
-  QueryPrep::PreparedSource input;
-  input.weight = value.weight;
-  input.cacheUse = value.use;
-  auto domain =
-      QueryPrep::materializeEffectiveFilter(input, reader, reader.segments()[(size_t)segment], base);
-  bool borrowed =
-      value.use && domain.get() && domain.get() == value.use->effectiveDocSet((size_t)segment, reader);
-  domain = std::move(domain).pinnedWith(planning.filterUses);
-  return borrowed ? std::move(domain) : account(std::move(domain), tracker, "segment source domain");
-}
-
-DomainHandle DomainVariantPlan::SegmentSources::materialize(size_t source, DocSet* base,
-                                                            FilterCache::Probe acquired) {
-  auto& value = values[source];
-  QueryPrep::PreparedSource input;
-  input.weight = value.weight;
-  input.cacheUse = value.use;
-  auto domain = QueryPrep::materializeEffectiveFilter(input, reader, reader.segments()[(size_t)segment], base,
-                                                      std::move(acquired));
-  bool borrowed =
-      value.use && domain.get() && domain.get() == value.use->effectiveDocSet((size_t)segment, reader);
-  domain = std::move(domain).pinnedWith(planning.filterUses);
-  return borrowed ? std::move(domain) : account(std::move(domain), tracker, "segment source domain");
 }
 
 bool DomainVariantPlan::addChild(std::string_view key, std::function_ref<bool(size_t)> excluded,

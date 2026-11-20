@@ -1699,7 +1699,7 @@ public:
     }
 
     virtual void collectSegment(
-        Data& data, int32_t segnum, DocSet* domain) = 0;
+        Data& data, int32_t segnum, const DomainHandle& domain) = 0;
     // The FacetBucketBlockExecutor domain source for result children.
     virtual void feedBucketDomains(
         size_t segnum, std::span<const SelectedFacetBucket<size_t>> block,
@@ -1712,7 +1712,7 @@ public:
       unused(tg);
     }
 
-    void collectInputSegment(int32_t segnum, DocSet* domain) {
+    void collectInputSegment(int32_t segnum, const DomainHandle& domain) {
       driver.contribute([&](Data& data) {
         storage.initialize(fixedOp(), data);
         collectSegment(data, segnum, domain);
@@ -1726,7 +1726,7 @@ public:
         return FanoutSize{fanoutDomainUnits(fixedOp().reader.segments()[segnum], input[segnum]), 0};
       }, [&](size_t segnum) {
         return [this, segnum, domain = input[segnum]]() {
-          collectInputSegment((int32_t)segnum, domain.get());
+          collectInputSegment((int32_t)segnum, domain);
         };
       });
     }
@@ -1841,19 +1841,18 @@ public:
         return;
       }
       if (segnum >= 0) domainHandle.assertScope(op.view->segments()[(size_t)segnum]);
-      DocSet* domain = domainHandle.get();
       if (!input.empty()) {
         if constexpr (Storage::growing) {
           if (domainHandle.ownsStorage()) domainHandle = DomainVariantPlan::account(
               std::move(domainHandle), op.req.memoryTracker, "retained range bucket inputs");
-          domain = domainHandle.get(op.view->segments()[(size_t)segnum]);
+          auto* domain = domainHandle.get(op.view->segments()[(size_t)segnum]);
           if (domain && domainHandle.isCharged()) storage.retainedInputs.fetch_add(
               domain->ramBytesUsed(), std::memory_order_relaxed);
         }
         input[(size_t)segnum] = std::move(domainHandle);
       }
       if (!fixedOp().requiresWholeReaderDomain()) {
-        collectInputSegment(segnum, domain);
+        collectInputSegment(segnum, input.empty() ? domainHandle : input[(size_t)segnum]);
         return;
       }
       int32_t seen = gatheredDomainsSeen.fetch_add(
@@ -2189,8 +2188,8 @@ public:
     }
 
     void collectSegment(
-        typename Base::Data& data, int32_t segnum,
-        DocSet* domain) override {
+        typename Base::Data& data, int32_t segnum, const DomainHandle& base) override {
+      auto* domain = base.get();
       if constexpr (Distinct) {
         auto& range = rangeOp();
         int64_t missing = 0;
@@ -2306,20 +2305,23 @@ class QueryFacetReq : public FixedBucketFacetReq {
   const ReqQueryFacet& queryFacet;
   std::span<Query*> bucketQueries;
   std::span<Query::Weight*> bucketWeights;
+  Query::PlanningContext& planning;
+  // Empty outside bucket placements. A query with no usable key has a null Use.
+  std::span<FilterCache::Use*> bucketUses;
   bool preparedBuckets;
 
 public:
   QueryFacetReq(
       SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqQueryFacet& queryFacet,
-      std::string_view facetName, std::span<Query*> bucketQueries,
-      std::span<Query::Weight*> bucketWeights)
+      std::string_view facetName, std::span<Query*> bucketQueries, std::span<Query::Weight*> bucketWeights,
+      Query::PlanningContext& planning, std::span<FilterCache::Use*> bucketUses)
     : FixedBucketFacetReq(
           req, view, {}, facetName, 0, false, queryFacet.buckets.size(), {}),
-      queryFacet(queryFacet), bucketQueries(bucketQueries),
-      bucketWeights(bucketWeights),
-      preparedBuckets(QueryPrep::anyNeedsPrepare(bucketWeights)) {
+      queryFacet(queryFacet), bucketQueries(bucketQueries), bucketWeights(bucketWeights),
+      planning(planning), bucketUses(bucketUses), preparedBuckets(QueryPrep::anyNeedsPrepare(bucketWeights)) {
     assert(bucketQueries.size() == queryFacet.buckets.size());
     assert(bucketWeights.size() == queryFacet.buckets.size());
+    assert(bucketUses.empty() || bucketUses.size() == bucketWeights.size());
   }
 
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
@@ -2385,12 +2387,23 @@ public:
       queryOp().bucketWeights[bucket]->releaseSegmentState(segment);
     }
 
-    DomainHandle materializeBucket(size_t segnum, size_t bucket, DocSet* domain) {
-      auto& segment = queryOp().reader.segments()[segnum];
-      return DomainHandle(QueryPrep::materialize(
-          bucketSource(bucket), segment, domain,
-          Query::SupplierExecutionMode::ORDINARY,
-          QueryPrep::MaterializeMode::ORDINARY)).scoped(segment);
+    const QueryPrep::PreparedSource* preparedBucket(size_t bucket) const {
+      return preparedSources.empty() ? nullptr : &preparedSources[bucket];
+    }
+
+    DomainVariantPlan::SegmentSources segmentSources(IndexReader::Segment& segment) {
+      auto& op = queryOp();
+      return {*op.view, op.planning, segment, op.req.memoryTracker};
+    }
+
+    DomainHandle materializeBucket(IndexReader::Segment& segment, size_t bucket,
+                                   const DomainHandle& domain) {
+      auto& op = queryOp();
+      if (!op.bucketUses.empty()) {
+        return segmentSources(segment).resolve(
+            *op.bucketWeights[bucket], op.bucketUses[bucket], domain, preparedBucket(bucket));
+      }
+      return DomainHandle(QueryPrep::materialize(bucketSource(bucket), segment, domain.get())).scoped(segment);
     }
 
     void prepareGatheredDomains(FanoutScope* tg) override {
@@ -2425,7 +2438,7 @@ public:
           ? weight : nullptr;
     }
 
-    DomainHandle identityDomain(size_t segnum, size_t bucket, DocSet* eligibility) {
+    DomainHandle identityDomain(size_t segnum, size_t bucket, const DomainHandle& eligibility) {
       // A mixed block can memoize predicate rows beside staged rows. The
       // latter are applied by StructuralConstraint::finish, never replayed
       // from this placeholder or from the bucket's original selected window.
@@ -2433,58 +2446,61 @@ public:
           std::vector<int32_t>{})).scoped(queryOp().reader.segments()[segnum]);
       auto& segment = queryOp().reader.segments()[segnum];
       auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
-      return DomainHandle(QueryPrep::materialize(
-          *queryOp().bucketWeights[bucket], nullptr, segment, eligibility)).scoped(queryOp().reader.segments()[segnum]);
+      auto& op = queryOp();
+      if (!op.bucketUses.empty()) {
+        // The identity is recovered against this eligibility, independently
+        // of the incoming domain used by the bucket's count pass.
+        return segmentSources(segment).resolve(*op.bucketWeights[bucket], op.bucketUses[bucket], eligibility);
+      }
+      return DomainHandle(QueryPrep::materialize(*op.bucketWeights[bucket], nullptr,
+                                                segment, eligibility.get())).scoped(segment);
     }
 
     void collectSegment(
-        typename Base::Data& data, int32_t segnum,
-        DocSet* domain) override {
-      if constexpr (Distinct) {
-        auto& segment = queryOp().reader.segments()[(size_t)segnum];
-        for (size_t bucket = 0; bucket < queryOp().bucketCount(); bucket++) {
-          auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
-          DomainHandle matches = materializeBucket((size_t)segnum, bucket, domain);
-          queryOp().collectGroups(data, segnum, matches.get(), [&](auto group, auto add, auto) {
+        typename Base::Data& data, int32_t segnum, const DomainHandle& base) override {
+      auto& op = queryOp();
+      auto& segment = op.reader.segments()[(size_t)segnum];
+      for (size_t bucket = 0; bucket < op.bucketCount(); bucket++) {
+        auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
+        if constexpr (Distinct) {
+          DomainHandle matches = materializeBucket(segment, bucket, base);
+          op.collectGroups(data, segnum, matches.get(), [&](auto group, auto add, auto) {
             forEachDomainDoc(matches.get(), segment.maxDoc(), [&](int32_t doc) { add((int64_t)bucket, group(doc)); });
           });
-        }
-      } else {
-      auto& segment = queryOp().reader.segments()[(size_t)segnum];
-      // The count pass never retains matches (result children re-materialize
-      // their selected buckets), so the direct count is eligible whenever the
-      // whole segment is the domain.
-      bool countOnly = domain == nullptr;
-      for (size_t bucket = 0; bucket < queryOp().bucketCount(); bucket++) {
-        auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
-        auto guard = MemPool::threadLocalPoolGuard();
-        Query::ScorerSupplier* supplier = nullptr;
-        bool supplierBuilt = false;
-        auto obtainSupplier = [&]() {
-          if (!supplierBuilt) {
-            supplier = bucketSource(bucket).scorerSupplier(guard.pool(), segment);
-            supplierBuilt = true;
-          }
-          return supplier;
-        };
-        if (countOnly && !queryOp().bucketWeights[bucket]->needsPrepare()) {
-          auto* weight = queryOp().bucketWeights[bucket];
-          auto count = QueryPrep::resolveCount(weight->countShortcut(segment, domain),
-              [&](Query::Weight& resolver) {
-                return &resolver == weight ? obtainSupplier()
-                    : resolver.scorerSupplier(guard.pool(), segment);
-              }, Query::COUNT_EXECUTION_LIMIT);
-          if (!count) count = QueryPrep::supplierCount(obtainSupplier());
-          if (count) {
-            data.counts[bucket] += *count;
+        } else {
+          if (!op.bucketUses.empty()) {
+            data.counts[bucket] += segmentSources(segment).count(
+                *op.bucketWeights[bucket], op.bucketUses[bucket], base, preparedBucket(bucket));
             continue;
           }
+
+          auto guard = MemPool::threadLocalPoolGuard();
+          auto* domain = base.get();
+          auto* weight = op.bucketWeights[bucket];
+          Query::ScorerSupplier* supplier = nullptr;
+          bool supplierBuilt = false;
+          auto obtainSupplier = [&]() {
+            if (!supplierBuilt) {
+              supplier = bucketSource(bucket).scorerSupplier(guard.pool(), segment);
+              supplierBuilt = true;
+            }
+            return supplier;
+          };
+          if (domain == nullptr && !weight->needsPrepare()) {
+            auto count = QueryPrep::resolveCount(weight->countShortcut(segment, domain),
+                [&](Query::Weight& resolver) {
+                  return &resolver == weight ? obtainSupplier() : resolver.scorerSupplier(guard.pool(), segment);
+                }, Query::COUNT_EXECUTION_LIMIT);
+            if (!count) count = QueryPrep::supplierCount(obtainSupplier());
+            if (count) {
+              data.counts[bucket] += *count;
+              continue;
+            }
+          }
+          if (auto* scorerSupplier = obtainSupplier()) {
+            data.counts[bucket] += QueryPrep::materialize(scorerSupplier, guard.pool(), segment, domain)->card();
+          }
         }
-        supplier = obtainSupplier();
-        if (supplier == nullptr) continue;
-        DomainHandle matches = DomainHandle(QueryPrep::materialize(supplier, guard.pool(), segment, domain)).scoped(segment);
-        data.counts[bucket] += matches.get()->card();
-      }
       }
     }
 
@@ -2500,8 +2516,7 @@ public:
           auto release = scope_guard([&]() noexcept {
             releaseBucketState(segment, block[i].key);
           });
-          domain = materializeBucket(
-              segnum, block[i].key, this->input[segnum].get());
+          domain = materializeBucket(segment, block[i].key, this->input[segnum]);
         }
         feed(i, std::move(domain));
       }
@@ -2512,7 +2527,7 @@ public:
         FacetBucketFeed feed) override {
       for (size_t i = 0; i < block.size(); i++) {
         if (queryOp().bucketWeights[block[i].key]->matchesAllDocs()) feed(i, eligibility);
-        else feed(i, identityDomain(segnum, block[i].key, eligibility.get()));
+        else feed(i, identityDomain(segnum, block[i].key, eligibility));
       }
     }
 

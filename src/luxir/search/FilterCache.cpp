@@ -224,6 +224,15 @@ FilterCache::Probe::~Probe() {
   releaseClaims();
 }
 
+bool FilterCache::Probe::rentDomainOnce() {
+  assert(kind_ == Kind::BYPASS);
+  // No request slot (a segment outside the Use's reader): every domain rents.
+  if (!ownsRequestClaim) return true;
+  auto& slot = requestUse->requestSlots[requestSegmentOrd];
+  std::lock_guard lock(slot.mutex);
+  return !std::exchange(slot.rentedDomain, true);
+}
+
 FilterCache::ReaderProbe::ReaderProbe(
     Kind kind, std::shared_ptr<FilterEntry> entry,
     std::shared_ptr<const ReaderValue> value, bool ownsClaim, bool refresh)
@@ -1030,20 +1039,21 @@ void FilterCache::Use::enableRoutedAccounting(
   requestSlot.routedBytes = bytes;
 }
 
+bool FilterCache::Use::matchesSegment(size_t segmentOrd, IndexReader& reader) const {
+  if (segmentOrd >= readerSegments.size()
+      || segmentOrd >= reader.segments().size()) return false;
+  auto& segment = reader.segments()[segmentOrd];
+  const auto& identity = readerSegments[segmentOrd];
+  return segment.segInfo.seg_id == identity.segId && segment.maxDoc() == identity.maxDoc
+      && segment.spaceOrdinal() == identity.space;
+}
+
 DocSet* FilterCache::Use::effectiveDocSet(
     size_t segmentOrd, IndexReader& reader) {
   // Raw AND liveDocs, memoized only in this request's Use and never published
   // to the cache. Domain composition lives in effectiveDomain.
-  if (segmentOrd >= readerSegments.size()
-      || segmentOrd >= reader.segments().size()) {
-    return nullptr;
-  }
+  if (!matchesSegment(segmentOrd, reader)) return nullptr;
   auto& segment = reader.segments()[segmentOrd];
-  if (segment.segInfo.seg_id != readerSegments[segmentOrd].segId
-      || segment.maxDoc() != readerSegments[segmentOrd].maxDoc
-      || segment.spaceOrdinal() != readerSegments[segmentOrd].space) {
-    return nullptr;
-  }
   if (scope_ == FilterKeyScope::READER_STABLE) {
     std::shared_ptr<const ReaderValue> value;
     {
@@ -1076,24 +1086,21 @@ DocSet* FilterCache::Use::effectiveDocSet(
 
 DomainHandle FilterCache::Use::effectiveDomain(
     size_t segmentOrd, IndexReader& reader, DocSet* domain) {
-  // PrepareContext domains already carry liveness, so a composed set is raw
-  // AND domain. The canonical live set is the request-stable value itself.
-  if (domain != nullptr && segmentOrd < reader.segments().size()) {
-    auto& segment = reader.segments()[segmentOrd];
-    DocSet* canonical = segment.liveDocSet();
-    if (domain == canonical) domain = nullptr;
-  }
-  if (domain == nullptr) {
-    return DomainHandle::borrowed(effectiveDocSet(segmentOrd, reader)).scoped(reader.segments()[segmentOrd]);
+  if (segmentOrd >= reader.segments().size()) return {};
+  auto& segment = reader.segments()[segmentOrd];
+  if (domain == nullptr || domain == segment.liveDocSet()) {
+    return DomainHandle::borrowed(effectiveDocSet(segmentOrd, reader)).scoped(segment);
   }
   // A reader-stable value is live-exact for the canonical domain only.
-  if (scope_ == FilterKeyScope::READER_STABLE) return {};
-  DocSet* stable = effectiveDocSet(segmentOrd, reader);
-  if (stable == nullptr) return {};
-  std::array<DocSet*, 2> sets{stable, domain};
+  if (scope_ == FilterKeyScope::READER_STABLE || !matchesSegment(segmentOrd, reader)) return {};
+  // The domain already carries liveness.
+  DocSet* raw = rawDocSet(segmentOrd);
+  if (raw == nullptr) return {};
+  assert(!segment.hasDeletes() || DocSet::intersectionCard(domain, segment.liveDocSet()) == domain->card());
+  std::array<DocSet*, 2> sets{raw, domain};
   auto docs = DocSet::intersect(sets);
   docs->card();
-  return DomainHandle(std::move(docs)).scoped(reader.segments()[segmentOrd]);
+  return DomainHandle(std::move(docs)).scoped(segment);
 }
 
 size_t FilterCache::Use::ownedBytesForTest() {

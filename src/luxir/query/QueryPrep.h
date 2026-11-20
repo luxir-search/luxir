@@ -1537,6 +1537,12 @@ public:
   }
 };
 
+// Resolve a probe to raw membership. The caller has already chosen to
+// materialize on BYPASS and has enabled request accounting if needed.
+DocSet* populateRawFilter(Query::Weight& weight, Query::Weight::PreparedWeight* prepared,
+                          IndexReader::Segment& segment, FilterCache::Use& use,
+                          FilterCache::Probe& probe);
+
 inline DomainHandle materializeEffectiveFilter(
     const PreparedSource& source, IndexReader& reader,
     IndexReader::Segment& segment, DocSet* domain,
@@ -1574,44 +1580,25 @@ inline DomainHandle materializeEffectiveFilter(
     std::array<DocSet*, 2> sets{raw, domain};
     return DomainHandle(DocSet::intersect(sets)).scoped(segment);
   };
-  auto probe = use->probe((size_t) segment.ord);
-  if (probe.kind() == FilterCache::Probe::Kind::HIT) {
-    return effective();
-  } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
-    auto buildStart = std::chrono::steady_clock::now();
-    auto raw = materializeRawFilter(weight, prepared, segment);
-    uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
-    use->publishRawByproduct(
-        (size_t) segment.ord, probe, std::move(raw), buildCostNanos);
-  } else {
+  auto probe = use->probe((size_t)segment.ord);
+  if (probe.kind() == FilterCache::Probe::Kind::HIT) return effective();
+  if (probe.kind() == FilterCache::Probe::Kind::BYPASS) {
     // A non-folded raw materialization is free by-product population. A
     // domain-composed set must never enter the raw cache.
-    if (domain == nullptr
-        && use->wasAdmitted()
-        && !weight.needsScores() && !weight.allowsPruning()) {
+    if (domain == nullptr && use->wasAdmitted() && !weight.needsScores() && !weight.allowsPruning()) {
       auto buildStart = std::chrono::steady_clock::now();
       auto raw = materializeRawFilter(weight, prepared, segment);
-      uint64_t buildCostNanos = elapsedBuildNanos(buildStart);
-      use->offerRaw(
-          (size_t) segment.ord, std::move(raw), buildCostNanos);
+      use->offerRaw((size_t)segment.ord, std::move(raw), elapsedBuildNanos(buildStart));
       return effective();
     }
-    if (!disableFilterOwnForTests
-        && !weight.needsScores() && !weight.allowsPruning()) {
-      auto raw = materializeRawFilter(weight, prepared, segment);
-      use->adoptOwnedRaw((size_t) segment.ord, probe, std::move(raw));
-      return effective();
+    if (disableFilterOwnForTests || weight.needsScores() || weight.allowsPruning()) {
+      return DomainHandle(
+          materialize(weight, prepared, segment, domain, executionMode)).scoped(segment);
     }
-    return DomainHandle(
-        materialize(weight, prepared, segment, domain, executionMode)).scoped(segment);
   }
-
+  populateRawFilter(weight, prepared, segment, *use, probe);
   return effective();
 }
-
-DomainHandle materializeEffectiveFilter(
-    const PreparedSource& source, IndexReader& reader,
-    IndexReader::Segment& segment, DocSet* domain, FilterCache::Probe probe);
 
 inline DomainHandle materializeEffectiveFilter(
     Query::Weight& weight, FilterCache::Use* use, IndexReader& reader,
