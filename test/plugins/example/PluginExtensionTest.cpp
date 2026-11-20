@@ -389,6 +389,31 @@ TEST_F(PluginExtensionTest, httpRoutes) {
   EXPECT_NE(std::string::npos, badSample.body().find("unknown parameter 'idz'")) << badSample.body();
 }
 
+// The example's write route submits through the in-process update path,
+// which refuses it over the node's admission limit.
+TEST_F(PluginExtensionTest, writeRouteSubmitsThroughUpdatePath) {
+  auto written = post("/collections/main/_example_index", R"({"docs":[{"id":"w1","cat_s":"w"}],"commit":{}})");
+  EXPECT_EQ(200, written.result_int()) << written.body();
+  EXPECT_NE(std::string::npos, written.body().find(R"("status":"ok")")) << written.body();
+  EXPECT_EQ("1", found(R"({"match":{"cat_s":"w"}})"));
+
+  auto rejected = post("/collections/main/_example_index", R"({"docs":[{"id":"w2","_version_":1}]})");
+  EXPECT_EQ(200, rejected.result_int()) << rejected.body();
+  EXPECT_NE(std::string::npos, rejected.body().find(R"("status":"error")")) << rejected.body();
+  EXPECT_NE(std::string::npos, rejected.body().find(R"("total_errors":1)")) << rejected.body();
+
+  auto& admission = luxirNode->getUpdateAdmission();
+  admission.setLimits(1, 0);
+  auto restore = scope_guard([&]() {
+    admission.setLimits(luxirNode->getConfig().ingest.max_inflight_updates,
+                        luxirNode->getConfig().ingest.max_inflight_update_bytes);
+  });
+  auto held = admission.tryAdmit(1);
+  auto refused = post("/collections/main/_example_index", R"({"docs":[{"id":"w3"}]})");
+  EXPECT_EQ(429, refused.result_int()) << refused.body();
+  EXPECT_NE(std::string::npos, refused.body().find("too_many_updates")) << refused.body();
+}
+
 TEST(PluginQueryTest, makersReachTheirOwnNodeState) {
   LuxirNode first, second;
   auto* a = first.pluginState<example::NodeState>("example");

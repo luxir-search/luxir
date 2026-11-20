@@ -6,6 +6,7 @@
 #include <boost/asio/bind_cancellation_slot.hpp>
 #include "luxir/server/ReplicationFollower.h"
 #include "HttpServer.h"
+#include "UpdateSubmission.h"
 #include "luxir/BuildInfo.h"
 #include "luxir/KernelInfo.h"
 #include "Prometheus.h"
@@ -2035,20 +2036,14 @@ private:
   static void submitBufferedUpdate(const std::shared_ptr<HttpSession>& self, std::shared_ptr<HttpUpdateState> state,
                                    const std::string& tenant, const std::shared_ptr<ShardPin>& shardPin,
                                    std::chrono::steady_clock::time_point startTime) {
-    BufferedUpdate* msg = nullptr;
     ErrorKind fallback = ErrorKind::INVALID_REQUEST;  // the message validates its commit params
     try {
       auto ticket = std::move(state->admission);
-      auto admission = std::make_unique<BufferedUpdate>(self, std::move(state), shardPin, startTime);
-      admission->admission = std::move(ticket);
+      auto message = std::make_unique<BufferedUpdate>(self, std::move(state), shardPin, startTime);
+      message->admission = std::move(ticket);
       fallback = ErrorKind::INTERNAL;
-      auto collection = self->node_.getOrCreateCollection(LuxirNode::target(tenant, admission->req->collection));
-      admission->target = collection->getId();
-      auto iw = collection->getShard()->requireIndexWriter();
-      msg = admission.release();
-      if (!iw->submitUpdate(msg)) throw std::runtime_error("update was not admitted");
+      submitUpdateMessage(self->node_, tenant, std::move(message));
     } catch (...) {
-      delete msg;
       auto failure = currentExceptionInfo(fallback);
       net::post(self->stream_.get_executor(), [self, shardPin, failure] { self->respondError(failure); });
     }

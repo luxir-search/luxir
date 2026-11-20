@@ -26,6 +26,7 @@
 
 #include "GRPCServer.h"
 #include "LuxirNode.h"
+#include "UpdateSubmission.h"
 #include "luxir/api/padded_input.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/util/TaggedPtr.h"
@@ -742,11 +743,6 @@ public:
 // carry credentials. Administration requests may name a tenant.
 static constexpr std::string_view kCallerTenant = {};
 
-template <typename Request>
-static std::shared_ptr<Collection> resolveUpdateCollection(GRPCServer& server, const Request& request) {
-  return server.getLuxirNode().getOrCreateCollection(LuxirNode::target(kCallerTenant, request.collection));
-}
-
 static void finishWithError(GenericCallData& call, const ErrorInfo& info) {
   call.finishWithError(info);
 }
@@ -938,13 +934,8 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 
   bool counted = false;
   try {
-    auto collection = resolveUpdateCollection(call.server, request->proto);
-    auto shard = collection->getShard();
-    auto iw = shard->requireIndexWriter();
-
     if (request->proto.commit && request->proto.commit->wait_for_replicas.has_value()) call.enableWaitCancellation();
-    Update* updateMessage = new Update(std::move(request), &call, startTime);
-    updateMessage->target = collection->getId();
+    auto updateMessage = std::make_unique<Update>(std::move(request), &call, startTime);
     updateMessage->admission = std::move(ticket);
     if (stream) {
       // Counted before submission: the answer can arrive first.
@@ -952,14 +943,8 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       call.updatesInFlight++;
       counted = true;
     }
-    try {
-      if (!iw->submitUpdate(updateMessage)) {
-        throw std::runtime_error("update was not admitted");
-      }
-    } catch (...) {
-      delete updateMessage;  // releases its admission
-      throw;
-    }
+    // A failed submission destroys the message, releasing its admission.
+    submitUpdateMessage(call.server.getLuxirNode(), kCallerTenant, std::move(updateMessage));
   } catch (const std::exception& e) {
     if (counted) {
       const std::lock_guard<std::mutex> lock(call.mutex);

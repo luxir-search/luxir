@@ -6,6 +6,7 @@
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
 #include "Scrubber.h"
+#include "UpdateSubmission.h"
 #include "luxir/plugin/Plugin.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/Uuid.h"
@@ -161,6 +162,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   events = std::make_shared<Events>(replication, commitWaits);
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   updateAdmission.setLimits(this->config.ingest.max_inflight_updates, this->config.ingest.max_inflight_update_bytes);
+  submissionGate = std::make_shared<UpdateSubmissionGate>(this);
   preWarmTimeZoneDatabase();
   collections_ = std::make_unique<Collections>(this->config, lifetime, *events, indexRamBudget, indexArena, metrics);
 
@@ -193,6 +195,10 @@ LuxirNode::~LuxirNode() {
   // Drain before tearing down the node state used by queued control work.
   control->stop();
   pluginStates.clear();
+  {
+    const std::unique_lock lock(submissionGate->mutex);
+    submissionGate->node = nullptr;
+  }
   scrubber->stop();
   if (follower) follower->stop();
 }

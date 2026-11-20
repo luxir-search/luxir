@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <future>
 #include <stdexcept>
 #include <string>
 
@@ -10,6 +11,7 @@
 #include "ExampleQuery.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/server/LuxirNode.h"
+#include "luxir/server/UpdateSubmission.h"
 
 namespace luxir::example {
 
@@ -164,6 +166,30 @@ public:
       response.searchCollection = *request.pathParam("collection");
       response.searchBody = R"({"ops":{"sample":{"sample_docs":)" + std::string(request.body) + "}}}";
     });
+    // A mutating collection route that writes through the in-process update
+    // path: POST an /update body, get its UpdateResponse back.  A request
+    // handler holds a worker while it waits, so it refuses over the node's
+    // admission limit (429) rather than parking.
+    r.http.add("POST", "/collections/{collection}/_example_index",
+               [](HttpPluginRequest& request, HttpPluginResponse& response) {
+      auto submission = std::make_unique<UpdateSubmission>();
+      submission->parseJson(request.body);
+      submission->request.collection = api::build::arenaStr(submission->arena, *request.pathParam("collection"));
+      submission->tenant = request.tenant;
+      auto finished = std::make_shared<std::promise<std::shared_ptr<UpdateResult>>>();
+      auto result = finished->get_future();
+      submitUpdate(request.node, std::move(submission),
+                   [finished](std::shared_ptr<UpdateResult> done) { finished->set_value(std::move(done)); },
+                   UpdateAdmissionPolicy::REFUSE);
+      auto done = result.get();
+      if (!done) throw std::runtime_error("update failed");
+      // Refused before indexing: answer with that error's status.
+      if (done->response.error && done->response.status == api::UpdateResponse_::Status::ERROR) {
+        auto info = api::build::errorInfo(*done->response.error);
+        throw ApiError(info.kind, info.code, info.message);
+      }
+      if (!api::write_json(done->response, response.body)) throw std::runtime_error("failed to serialize update response");
+    }, true);
   }
   std::unique_ptr<luxir::PluginNodeState> createNodeState(luxir::LuxirNode& node) override {
     if (throwOnNodeStateCreation.load()) throw std::runtime_error("example node state creation failed");

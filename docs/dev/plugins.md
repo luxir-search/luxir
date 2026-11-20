@@ -256,6 +256,48 @@ r.http.add("POST", "/collections/{collection}/_sample",
 - A path with routes but not for the request's method answers 405 with `Allow`.
   Routes added with `mutating = true` are refused on a read-only node.
 
+## Writing documents
+
+Code in process - a plugin route, a node state's background job - writes to a
+collection with `luxir::submitUpdate` (`luxir/server/UpdateSubmission.h`). It takes
+the path a client `/update` takes: node-wide `UpdateAdmission`, the read-only and
+unavailable-collection checks, tenant and collection resolution (auto-creating as
+configured), and the collection's writer, whose handling counts the batch in the
+node and collection metrics. Do not subclass `ProtoUpdateMessage` and call
+`IndexWriter::submitUpdate` yourself: that skips all of the above.
+
+```cpp
+auto submission = std::make_unique<luxir::UpdateSubmission>();
+submission->parseJson(R"({"collection":"books","delete_ids":["b1"],"commit":{}})");
+// or build submission->request field by field, its strings and arrays in
+// submission->arena, and set submission->bytes to an estimate of its size
+luxir::submitUpdate(node, std::move(submission), [jobs](std::shared_ptr<luxir::UpdateResult> result) {
+  jobs->finished(result->response);  // status OK / PARTIAL / ERROR, errors, ids, commit
+});
+```
+
+- The submission owns the request until completion: `arena` backs what the request
+  views, `borrowed` keeps anything else alive, `tenant` names its tenant (empty is
+  the default). `parseJson` decodes an `/update` body into the arena and charges
+  its size to admission.
+- `done` runs exactly once for every outcome, with the `UpdateResponse` a client
+  would get. A refusal before indexing (over the admission limit with `REFUSE`, a
+  read-only node, a missing or unavailable collection, the node shutting down with
+  code `node_closing`) has status `ERROR` and `error` set; a closed writer, document
+  errors and success come from the writer. A commit with `wait_for_replicas`
+  completes after that wait.
+- `UpdateAdmissionPolicy::WAIT` (the default) parks an update over the admission
+  limit without holding a thread and submits it once a slot frees; use it for
+  background work. `REFUSE` completes at once with `too_many_updates`; use it where
+  the caller waits, such as an HTTP route handler.
+- `done` runs on whichever thread finished the update (often an indexing worker,
+  or the node's destructor at shutdown): keep it short, hand longer work to a task
+  arena, and capture shared ownership rather than the plugin's node state, which may
+  be gone by then.
+- Separate submissions are not ordered against each other (a parked one may reach
+  the writer after a later one), and interleave with client updates. When order
+  matters, submit the next one from the previous one's `done`.
+
 ## The example plugin
 
 `test/plugins/example` is a test-only plugin (always configured, linked into
@@ -264,7 +306,8 @@ r.http.add("POST", "/collections/{collection}/_sample",
 and `unscoped_value` to test rejection of a PLUGIN query without the base.
 It also registers a `sample_docs` search op
 (rank columns named by `rank_names`, defaulting to `_rank`, and nested ops over
-its documents), two HTTP routes and a per-node state with query, op and route
+its documents), three HTTP routes (one, `_example_index`, writes an `/update` body
+through `submitUpdate`) and a per-node state with query, op and route
 counters. The makers and handlers reach that state through their contexts.
 `PluginExtensionTest` and `PluginQueryTest` exercise the plugin end to end,
 including independent live nodes; `PluginTest` covers registry validation and

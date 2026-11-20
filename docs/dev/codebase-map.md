@@ -38,6 +38,9 @@ locations, browse `src/luxir/<area>/`.
      admission and `done()`; the ticket rides on the `ProtoUpdateMessage`. Unary gRPC and
      buffered HTTP are refused past it, gRPC `UpdateStream` and NDJSON park a resume and stop
      reading. Admitted bytes are transient `IndexRamBudget` reservations.
+   - `submitUpdate` / `UpdateSubmission` (`UpdateSubmission.h`): In-process updates (plugins,
+     background jobs) through admission, resolution and the writer, completing exactly once;
+     `submitUpdateMessage` is the resolve-and-submit step the transports share.
 
 2. **Search Engine** (`src/luxir/search/`)
    - `ReaderManager`: Per-collection snapshot publication, reader refresh, and filter cache;
