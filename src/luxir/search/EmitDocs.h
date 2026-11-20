@@ -44,6 +44,7 @@
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/StrColReader.h"
 #include "luxir/reader/TermsEnum.h"
+#include "luxir/reader/VectorReader.h"
 #include "luxir/search/Collector.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/search/ValueOutput.h"
@@ -600,15 +601,25 @@ inline void loadVersionRuns(SearchRequest& req, IndexReader& reader, std::span<c
   });
 }
 
-// Copy raw column bytes into a Vector.f32's arena float buffer.  memcpy
-// sidesteps alignment of the source bytes (column storage is byte-packed
-// and not guaranteed 4-byte aligned).
-inline void fillVectorF32(luxir::api::Vector& vec, std::string_view bytes, std::pmr::memory_resource& mr) {
-  assert(bytes.size() % sizeof(float) == 0);
-  int32_t nFloats = (int32_t)(bytes.size() / sizeof(float));
+// Decode one stored vector value (in its segment's encoding) into a
+// Vector.f32's arena float buffer.  Decoding copies, which sidesteps alignment
+// of the source bytes (column storage is byte-packed and not guaranteed
+// 4-byte aligned).
+inline void fillVectorF32(luxir::api::Vector& vec, std::string_view bytes, VectorEncoding encoding,
+                          bool norms, std::pmr::memory_resource& mr) {
+  int32_t dims = vcodec::dimsFromRowBytes(encoding, (int32_t)bytes.size(), norms);
+  assert(dims >= 0);
   vec.f32.emplace();
-  float* fs = build::allocArray(vec.f32->v, nFloats, mr);
-  std::memcpy(fs, bytes.data(), bytes.size());
+  float* fs = build::allocArray(vec.f32->v, dims, mr);
+  vcodec::decode(encoding, vcodec::rowPayload(bytes.data(), norms), dims, fs);
+}
+
+// Field info of the column to return for a vector field in one segment: the
+// keep_original column when it is present and aligned, else the encoded one.
+inline SegFieldInfo vectorReturnColumn(PostingsReader& postingsReader, const SegFieldInfo& info) {
+  SegFieldInfo original;
+  if (findOriginalColumn(postingsReader, info, original)) return original;
+  return info;
 }
 
 inline void loadVectorColForSegmentSingle(SearchRequest& req, IndexReader& reader, const SegFieldInfo* info,
@@ -623,12 +634,14 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, IndexReader& reade
   if (!info) return;
   auto& postingsReader = reader.segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  const auto& segFieldInfo = *info;
+  SegFieldInfo segFieldInfo = vectorReturnColumn(postingsReader, *info);
+  auto encoding = (VectorEncoding)segFieldInfo.vectorEncoding;
+  bool norms = segFieldInfo.vectorNorms;
 
   auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes) {
     assert(segDocs[idxSpan[idx]].docId() == doc);
     unused(doc);
-    fillVectorF32(target[idxSpan[idx]], bytes, mr);
+    fillVectorF32(target[idxSpan[idx]], bytes, encoding, norms, mr);
   };
   StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
 }
@@ -645,7 +658,9 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, IndexReader& reader
   if (!info) return;
   auto& postingsReader = reader.segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  const auto& segFieldInfo = *info;
+  SegFieldInfo segFieldInfo = vectorReturnColumn(postingsReader, *info);
+  auto encoding = (VectorEncoding)segFieldInfo.vectorEncoding;
+  bool norms = segFieldInfo.vectorNorms;
 
   // Multi-valued vectors: each doc's ArrVector holds numVals Vectors. numVals
   // is known at valIdx==0, so the inner Vector span is allocArray'd then filled
@@ -655,7 +670,8 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, IndexReader& reader
     unused(doc);
     luxir::api::ArrVector& outer = target[idxSpan[idx]];
     if (valIdx == 0) build::allocArray(outer.v, numVals, mr);
-    fillVectorF32(const_cast<luxir::api::Vector*>(outer.v.data())[valIdx], bytes, mr);
+    fillVectorF32(const_cast<luxir::api::Vector*>(outer.v.data())[valIdx], bytes, encoding, norms,
+                  mr);
   };
   StrColReader::getMultiValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
 }

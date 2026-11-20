@@ -64,6 +64,10 @@ struct ResolvedField {
   bool vectorNormalized = false;
   bool hasVectorNormalizeOnWrite = false;
   bool vectorNormalizeOnWrite = false;
+  bool hasVectorEncoding = false;
+  VectorEncoding vectorEncoding = VectorEncoding::F32;
+  bool hasVectorKeepOriginal = false;
+  bool vectorKeepOriginal = false;
   // Atomic: the nearest authored ann in the parent chain.
   const luxir::api::VectorAnnDef* ann = nullptr;
   std::optional<bool> geoIgnoreMalformed;
@@ -272,9 +276,10 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   // "none" = storage-only); otherwise inherit.  Range-checked like index.
   if (def.metric.has_value()) {
     if (*def.metric != VectorMetric::NONE && *def.metric != VectorMetric::L2 &&
-        *def.metric != VectorMetric::IP && *def.metric != VectorMetric::COSINE) {
+        *def.metric != VectorMetric::IP && *def.metric != VectorMetric::COSINE &&
+        *def.metric != VectorMetric::HAMMING) {
       throw SchemaError("unknown metric value " + std::to_string((int)*def.metric) +
-                        " (field: " + std::string(name) + "); valid: none, l2, ip, cosine");
+                        " (field: " + std::string(name) + "); valid: none, l2, ip, cosine, hamming");
     }
     r.hasVectorMetric = true;
     r.vectorMetric = (VectorFieldType::Metric)*def.metric;
@@ -299,6 +304,28 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   } else {
     r.hasVectorNormalizeOnWrite = parentResolved.hasVectorNormalizeOnWrite;
     r.vectorNormalizeOnWrite = parentResolved.vectorNormalizeOnWrite;
+  }
+
+  // encoding: explicit set on this field overrides; otherwise inherit.
+  if (def.encoding.has_value()) {
+    if (!vcodec::valid((int32_t)*def.encoding)) {
+      throw SchemaError("unknown encoding value " + std::to_string((int)*def.encoding) +
+                        " (field: " + std::string(name) + "); valid: f32, f16, bf16, int8, bit");
+    }
+    r.hasVectorEncoding = true;
+    r.vectorEncoding = (VectorEncoding)*def.encoding;
+  } else {
+    r.hasVectorEncoding = parentResolved.hasVectorEncoding;
+    r.vectorEncoding = parentResolved.vectorEncoding;
+  }
+
+  // keep_original: explicit set on this field overrides; otherwise inherit.
+  if (def.keep_original.has_value()) {
+    r.hasVectorKeepOriginal = true;
+    r.vectorKeepOriginal = *def.keep_original;
+  } else {
+    r.hasVectorKeepOriginal = parentResolved.hasVectorKeepOriginal;
+    r.vectorKeepOriginal = parentResolved.vectorKeepOriginal;
   }
 
   r.reverseMap = def.reverse_map.value_or(parentResolved.reverseMap);
@@ -465,11 +492,12 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   }
   bool vectorProp = def.dims.has_value() || def.truncate_dims.has_value() || def.metric.has_value() ||
                     def.normalized.has_value() || def.normalize_on_write.has_value() ||
+                    def.encoding.has_value() || def.keep_original.has_value() ||
                     def.ann.has_value();
   if (vectorProp && r.type != FieldClass::VECTOR) {
     throw SchemaError(
-      "dims/truncate_dims/metric/normalized/normalize_on_write/ann are only valid for vector fields (field: " +
-      name + ")");
+      "dims/truncate_dims/metric/normalized/normalize_on_write/encoding/keep_original/ann are only "
+      "valid for vector fields (field: " + name + ")");
   }
   if ((def.ignore_malformed || def.ignore_z_value) && r.type != FieldClass::GEO_POINT) {
     throw SchemaError("ignore_malformed/ignore_z_value are only valid for geo_point fields (field: " +
@@ -786,13 +814,33 @@ struct FieldCompiler {
         normalizeOnWrite = !r.vectorNormalized && (r.hasVectorNormalizeOnWrite
           ? r.vectorNormalizeOnWrite
           : (r.vectorMetric == VectorFieldType::METRIC_COSINE));
+        // Binary vectors: HAMMING defaults to the bit encoding, and the two
+        // only go together.
+        bool hamming = r.vectorMetric == VectorFieldType::METRIC_HAMMING;
+        VectorEncoding encoding = hamming && !r.hasVectorEncoding ? VectorEncoding::BIT
+                                                                  : r.vectorEncoding;
+        if (hamming && encoding != VectorEncoding::BIT) {
+          throw SchemaError("metric hamming requires encoding bit (field: " + std::string(name) + ")");
+        }
+        if (encoding == VectorEncoding::BIT) {
+          if (!hamming && r.vectorMetric != VectorFieldType::METRIC_NONE) {
+            throw SchemaError("encoding bit requires metric hamming or none (field: " +
+                              std::string(name) + ")");
+          }
+          int32_t storedDims = r.vectorTruncateDims > 0 ? r.vectorTruncateDims : r.vectorDims;
+          if (storedDims % 8 != 0) {
+            throw SchemaError(std::string(r.vectorTruncateDims > 0 ? "truncate_dims" : "dims") +
+                              " must be a multiple of 8 for encoding bit (field: " + std::string(name) + ")");
+          }
+        }
         // ANN overlays are built over the stored (truncated) column.
         bool truncated = r.vectorTruncateDims > 0;
         VectorAnnConfig ann = resolveAnnConfig(r.ann, truncated ? r.vectorTruncateDims : r.vectorDims,
                                                truncated ? "truncate_dims" : "dims", name);
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
                                                r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
-                                               ann, r.vectorTruncateDims);
+                                               encoding, r.vectorKeepOriginal, ann,
+                                               r.vectorTruncateDims);
         break;
       }
       default:
