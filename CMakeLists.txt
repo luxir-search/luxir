@@ -429,6 +429,12 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   # Virtual overrides retain base signatures. NDEBUG also creates unused
   # assert-only variables, so warnings are fatal only in debug builds.
   add_compile_options(-Wall -Wextra -Wno-unused-parameter "$<$<CONFIG:DEBUG>:-Werror>")
+  # At -O2 and above GCC reports these two from inlined paths that cannot run
+  # (a speculatively devirtualized destructor, a branch behind a null check).
+  # Test code turns them off in optimized builds. Debug builds keep them, and
+  # the engine keeps them in every build.
+  set(LUXIR_TEST_WARNING_OPTIONS
+      "$<$<AND:$<CXX_COMPILER_ID:GNU>,$<NOT:$<CONFIG:Debug>>>:-Wno-array-bounds;-Wno-stringop-overflow>")
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Intel")
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__SSSE3__ -arch:AVX")

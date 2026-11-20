@@ -31,6 +31,7 @@ add_executable(luxir_test ${Test_SOURCES})
 set_source_files_properties(test/LuxirTest.cpp PROPERTIES
   COMPILE_DEFINITIONS "LUXIR_TEST_BENCHMARKS=$<BOOL:${LUXIR_TEST_BENCHMARKS}>")
 target_include_directories(luxir_test PRIVATE .)
+target_compile_options(luxir_test PRIVATE ${LUXIR_TEST_WARNING_OPTIONS})
 target_link_libraries(luxir_test PRIVATE luxir_lib benchmark::benchmark GTest::gtest)
 # HttpApiTest's helper (test/HttpReq.h) parses NDJSON with glaze (via luxir_lib) and
 # drives the HTTP server with a header-only Boost.Beast client.
