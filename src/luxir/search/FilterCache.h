@@ -689,6 +689,8 @@ private:
     double recent = 0;
     uint64_t recentEpochs = 0;
     double creditSnapshot = 0;
+    // Demand threshold for this payload size and resident snapshot, using the
+    // same (possibly fractional) victim charge as the grant comparison.
     uint64_t refusedVersion = 0;
     double refusedWork = 0;
     size_t refusedBytes = 0;

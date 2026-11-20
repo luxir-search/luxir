@@ -2277,6 +2277,12 @@ FilterCacheConfig capacityConfig(size_t bytes, uint64_t window = 1024) {
   return config;
 }
 
+std::unique_ptr<DocSet> capacityDocs(int32_t maxDoc, int32_t card) {
+  DocSetBuilder builder(maxDoc);
+  for (int32_t i = 0; i < card; i++) builder.add(i);
+  return builder.build();
+}
+
 void seedCapacityValue(FilterCache& cache,
     std::span<const FilterCache::SegmentIdentity> segments, const FilterKey& key,
     double credit, uint64_t production = 1000, bool trainPrior = false,
@@ -2398,6 +2404,174 @@ TEST(FilterCacheTest, capacityRefusalMemoAvoidsListWorkUntilDemandOrRefresh) {
   FilterCache::UseRegistry request(cache, 1, segments);
   EXPECT_EQ(FilterCache::Probe::Kind::BUILD, request.get(candidate)->probe(0, FilterCache::Work::pending()).kind());
   EXPECT_EQ(3, checks.count);
+}
+
+TEST(FilterCacheTest, smallerCandidateBuysOnlyItsPartOfTheLastVictim) {
+  constexpr int32_t maxDoc = 629000 * 8, card = 275000 / 4;
+  std::array segments{FilterCache::SegmentIdentity{1, maxDoc}};
+  size_t big = bitDocs(maxDoc, 7)->ramBytesUsed();
+  auto config = capacityConfig(big);
+  config.maxEntryBytes = big;
+  FilterCache cache(config);
+  cache.onReaderPublished(1, segments);
+  FilterKey victim("the) sort_i"), candidate("275 KB"), remainder("255 KB");
+  seedCapacityValue(cache, segments, victim, 4'246'000, 3'079'000, true);
+  fundCapacityValue(cache, segments, candidate, 6'092'000);
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(candidate);
+  ASSERT_TRUE(use->recordCardinality(0, card));
+  CapacityChecks checks(cache);
+  auto grant = use->probe(0, FilterCache::Work::pending());
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, grant.kind());
+  use->publishRaw(0, grant, capacityDocs(maxDoc, card), 3'079'000);
+  EXPECT_FALSE(ledgerFor(cache, victim).resident);
+  EXPECT_EQ(1u, cache.counters().evictions);
+  EXPECT_EQ(3'079'000, ledgerFor(cache, candidate).debt);
+  fundCapacityValue(cache, segments, remainder, 6'092'000);
+  FilterCache::UseRegistry next(cache, 1, segments);
+  auto* smaller = next.get(remainder);
+  ASSERT_TRUE(smaller->recordCardinality(0, 255000 / 4));
+  auto freeGrant = smaller->probe(0, FilterCache::Work::pending());
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, freeGrant.kind());
+  smaller->publishRaw(0, freeGrant, capacityDocs(maxDoc, 255000 / 4), 3'079'000);
+  EXPECT_EQ(1, checks.count);
+  EXPECT_EQ(1u, cache.counters().evictions);
+  EXPECT_LE(cache.bytesUsed(), big);
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, smallerChargeMemoIncludesWholeVictimsAndCurrentFreeSpace) {
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  size_t small = docs(4096, {7})->ramBytesUsed();
+  size_t big = bitDocs(4096, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(big + 2 * small));
+  cache.onReaderPublished(1, segments);
+  seedCapacityValue(cache, segments, FilterKey("small-victim"), 100, 350, true, docs(4096, {7}));
+  seedCapacityValue(cache, segments, FilterKey("large-victim"), 650, 350);
+  FilterKey candidate("candidate");
+  fundCapacityValue(cache, segments, candidate, 1050);
+  CapacityChecks checks(cache);
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(candidate);
+    ASSERT_TRUE(use->recordCardinality(0, 100));
+    for (int i = 0; i < 3; i++) {
+      EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
+    }
+    EXPECT_EQ(1, checks.count);
+    use->charge(0, FilterCache::Work::nanoseconds(100));
+  }
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(candidate);
+  auto grant = use->probe(0, FilterCache::Work::pending());
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, grant.kind());
+  EXPECT_EQ(2, checks.count);
+  use->publishRaw(0, grant, capacityDocs(4096, 100), 350);
+  EXPECT_EQ(2u, cache.counters().evictions);
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, wholeEvictionInvalidatesTheOldFractionalRefusal) {
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  size_t big = bitDocs(4096, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(2 * big));
+  cache.onReaderPublished(1, segments);
+  seedCapacityValue(cache, segments, FilterKey("victim-a"), 1000, 250, true);
+  seedCapacityValue(cache, segments, FilterKey("victim-b"), 750, 250);
+  FilterKey candidate("candidate"), other("other-key");
+  fundCapacityValue(cache, segments, candidate, 1000);
+  FilterCache::UseRegistry request(cache, 1, segments);
+  auto* use = request.get(candidate);
+  ASSERT_TRUE(use->recordCardinality(0, 100));
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
+  fundCapacityValue(cache, segments, other, 1000);
+  FilterCache::UseRegistry next(cache, 1, segments);
+  auto* replacement = next.get(other);
+  ASSERT_TRUE(replacement->recordCardinality(0, 60));
+  auto grant = replacement->probe(0, FilterCache::Work::pending());
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, grant.kind());
+  replacement->publishRaw(0, grant, capacityDocs(4096, 60), 250);
+  // The candidate still needs a victim, but now pays only for the missing bytes.
+  ASSERT_GT(capacityDocs(4096, 100)->ramBytesUsed(), 2 * big - cache.bytesUsed());
+  auto reconsidered = use->probe(0, FilterCache::Work::pending());
+  ASSERT_EQ(FilterCache::Probe::Kind::BUILD, reconsidered.kind());
+  use->publishRaw(0, reconsidered, capacityDocs(4096, 100), 250);
+  EXPECT_EQ(2u, cache.counters().evictions);
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, equalValuesWithFractionalSlackDoNotChurn) {
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  size_t bytes = bitDocs(4096, 7)->ramBytesUsed();
+  FilterCache cache(capacityConfig(6 * bytes + bytes / 2, 64));
+  cache.onReaderPublished(1, segments);
+  std::vector<FilterKey> keys;
+  for (int i = 0; i < 7; i++) keys.emplace_back("equal-" + std::to_string(i));
+  // Assumed first builds contribute their 100 ns to demand, explicit zero does not.
+  for (int i = 0; i < 6; i++) seedCapacityValue(cache, segments, keys[i], i == 0 ? 10000 : 9900, 100, i == 0);
+  fundCapacityValue(cache, segments, keys[6], 10000);
+  cache.resetCounters();
+  for (int window = 0; window < 8; window++) {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, request.get(keys[6])->probe(0, FilterCache::Work::pending()).kind());
+    for (int i = 0; i < 7; i++) {
+      FilterCache::UseRegistry demand(cache, 1, segments);
+      auto* use = demand.get(keys[i]);
+      if (i < 6) EXPECT_EQ(FilterCache::Probe::Kind::HIT, use->probe(0, FilterCache::Work::nanoseconds(10000)).kind());
+      else use->charge(0, FilterCache::Work::nanoseconds(10000));
+    }
+    advanceCacheActivity(cache, segments, 64);
+    cache.sweep();
+  }
+  EXPECT_EQ(0u, cache.counters().buildAttempts);
+  EXPECT_EQ(0u, cache.counters().evictions);
+  EXPECT_EQ(0, ledgerFor(cache, keys[6]).debt);
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, slightlySmallerReplacementLeavesAnUnusedRemainderWithoutCycling) {
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  size_t big = bitDocs(4096, 7)->ramBytesUsed();
+  size_t small = capacityDocs(4096, 120)->ramBytesUsed();
+  ASSERT_LT(small, big);
+  ASSERT_GT(small, big * 9 / 10);
+  FilterCache cache(capacityConfig(big, 64));
+  cache.onReaderPublished(1, segments);
+  FilterKey victim("large"), candidate("small");
+  seedCapacityValue(cache, segments, victim, 10000, 100, true);
+  fundCapacityValue(cache, segments, candidate, 9950);
+  cache.resetCounters();
+  {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    auto* use = request.get(candidate);
+    ASSERT_TRUE(use->recordCardinality(0, 120));
+    auto grant = use->probe(0, FilterCache::Work::pending());
+    ASSERT_EQ(FilterCache::Probe::Kind::BUILD, grant.kind());
+    use->publishRaw(0, grant, capacityDocs(4096, 120), 100);
+  }
+  EXPECT_EQ(100, ledgerFor(cache, candidate).debt);
+  // Compare equal-duration windows after folding both keys' demand. The small
+  // value has higher effective density, but saves 50 ns less per window.
+  for (int window = 0; window < 8; window++) {
+    {
+      FilterCache::UseRegistry request(cache, 1, segments);
+      EXPECT_EQ(FilterCache::Probe::Kind::HIT, request.get(candidate)->probe(0, FilterCache::Work::nanoseconds(9950)).kind());
+      request.get(victim)->charge(0, FilterCache::Work::nanoseconds(10000));
+    }
+    advanceCacheActivity(cache, segments, 64);
+    cache.sweep();
+    FilterCache::UseRegistry request(cache, 1, segments);
+    EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, request.get(victim)->probe(0, FilterCache::Work::pending()).kind());
+    EXPECT_EQ(0, ledgerFor(cache, candidate).debt);
+    EXPECT_EQ(0, ledgerFor(cache, victim).debt);
+    EXPECT_EQ(1u, cache.counters().builds);
+    EXPECT_EQ(1u, cache.counters().evictions);
+    EXPECT_EQ(small, cache.bytesUsed());
+  }
+  EXPECT_EQ(100u, cache.counters().buildNanos);
+  EXPECT_EQ(8 * 9950u, cache.counters().estimatedSavedNanos);
+  EXPECT_EQ(0u, cache.counters().unrepaidEvictions);
+  cache.validateForTest();
 }
 
 TEST(FilterCacheTest, knownCardinalityFitsWithoutDisplacingPayloads) {
@@ -2746,7 +2920,7 @@ TEST(FilterCacheTest, capacityUsesOneWindowEvenAfterALateRoll) {
   }
 }
 
-TEST(FilterCacheTest, capacitySumsSmallVictimsAndCountsLargeVictimsWhole) {
+TEST(FilterCacheTest, capacitySumsSmallVictimsAndStillRequiresHigherDensity) {
   for (bool largeCandidate : {true, false}) {
     std::array segments{FilterCache::SegmentIdentity{1, 4096}};
     size_t small = docs(4096, {7})->ramBytesUsed();
@@ -2772,6 +2946,7 @@ TEST(FilterCacheTest, capacitySumsSmallVictimsAndCountsLargeVictimsWhole) {
     fundCapacityValue(cache, segments, candidate, largeCandidate ? 3000 : 2000);
     FilterCache::UseRegistry request(cache, 1, segments);
     auto* use = request.get(candidate);
+    // In the small-candidate arm, density still refuses the fractional purchase.
     EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, use->probe(0, FilterCache::Work::pending()).kind());
     if (largeCandidate) {
       use->charge(0, FilterCache::Work::nanoseconds(100000));

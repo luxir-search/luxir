@@ -2222,8 +2222,11 @@ bool FilterCache::capacityAllows(const FilterEntry& entry, Ledger& ledger, size_
           payload = value->ramBytesUsed();
         }
       }
+      // Only a smaller candidate buys a fraction of its final victim. Earlier
+      // victims and equal/larger candidates still pay for whole values.
+      double fraction = bytes < payload && required < payload ? required / payload : 1;
+      victims += end->priority * size * fraction;
       required -= payload;
-      victims += end->priority * size;
       if (payload) outranked = end->priority;
     }
     ++end;
@@ -2350,7 +2353,11 @@ void FilterCache::sweep() {
             ++it;
           }
           residents.erase(residents.begin(), it);
-          if (detached) continue;
+          if (detached) {
+            // Free remainder can lower a previously refused fractional charge.
+            residentsVersion.fetch_add(1, std::memory_order_release);
+            continue;
+          }
           // A list that no longer names what is resident is rebuilt once.
           if (rebuilt) break;
           residentsReady = false;
