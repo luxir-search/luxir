@@ -4463,16 +4463,16 @@ TEST_F(KnnQueryTest, identityIncludesQueryBitsButNotBuildSettings) {
     VectorAnnConfig ann;
     ann.codec = codec;
     VectorFieldType first("v", 4, FieldType::COLUMN_STORED, VectorFieldType::METRIC_IP, false, false,
-                          VectorEncoding::F32, false, ann);
+                          VectorEncoding::F32, false, /*maxSim=*/false, ann);
     ann.rabitqQueryBits = 0;
     VectorFieldType bits("v", 4, FieldType::COLUMN_STORED, VectorFieldType::METRIC_IP, false, false,
-                          VectorEncoding::F32, false, ann);
+                          VectorEncoding::F32, false, /*maxSim=*/false, ann);
     ann = first.ann();
     ann.nlist = 100;
     ann.pqM = 2;
     ann.rabitqBits = 4;
     VectorFieldType build("v", 4, FieldType::COLUMN_STORED, VectorFieldType::METRIC_IP, false, false,
-                          VectorEncoding::F32, false, ann);
+                          VectorEncoding::F32, false, /*maxSim=*/false, ann);
     KnnQuery a("v", first, vector, 3), b("v", bits, vector, 3), c("v", build, vector, 3);
     EXPECT_FALSE(a.equals(b));
     EXPECT_NE(a.hash(), b.hash());

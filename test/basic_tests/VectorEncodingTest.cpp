@@ -728,7 +728,7 @@ TEST_F(VectorEncodingTest, maxSimScoresLateInteraction) {
   auto& def = b.field("tok_vs");
   def.type = api::FieldDef::FieldClass::VECTOR;
   def.metric = api::VectorMetric::IP;
-  def.multi = true;
+  def.multi = api::FieldDef::MultiMode::ARRAY;
   def.multi_vector_scoring = api::FieldDef::MultiVectorScoring::MAXSIM;
   auto schema = b.set(h.collection());
   EXPECT_FALSE(((const VectorFieldType*)schema->getFieldTypePtr("tok_vs"))->annIndexable());
