@@ -141,6 +141,12 @@ locations, browse `src/luxir/<area>/`.
      serves range endpoints. The int64 coordinate codec splits wide residuals
      into low/high FOR streams. `SegmentMerger` carries 1-D points forward by
      run-merging and rebuilds 2-D BKDs from the merged column.
+   - `SummaryCollector` gathers each field's bounds while flush and merge
+     write it, and `PostingsWriter::finish` turns the field directory into one
+     summary record per field; `IndexWriter` writes the result as the segment's
+     `segment_summary` overlay. `SegmentSummary` is the decoded sidecar, loaded
+     with the segment by `IndexReader` (`Segment::summary()`). See
+     [segment summaries](../design/segment-summaries.md).
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)
    - `VectorReader`: reads column-stored vectors for exact flat KNN

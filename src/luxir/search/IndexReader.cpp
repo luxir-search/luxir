@@ -364,9 +364,53 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
         // If liveGen == 0, liveDocs remains nullptr (no deletes)
 
         std::vector<std::shared_ptr<AuxReader>> segmentAuxReaders;
+        std::shared_ptr<const SegmentSummary> summary;
         segmentAuxReaders.reserve(segment.overlays.size());
         for (int j = 0; j < (int)segment.overlays.size(); j++) {
           const auto& info = segment.overlays[j];
+
+          if (info.kind == SegmentSummary::OVERLAY_KIND) {
+            if (info.files.empty()) continue;
+            // A segment's summary is written once with it: reuse the previous
+            // snapshot's copy when the segment's files and the summary's own
+            // descriptor are unchanged.
+            if (prevSeg && prevSeg->summary && !files.files.empty() && prevFiles->files == files.files
+                && std::ranges::find(prevFiles->overlays, files.overlays[(size_t)j]) != prevFiles->overlays.end()) {
+              summary = prevSeg->summary;
+              continue;
+            }
+            // A file that cannot be opened counts as missing: retried like
+            // any segment file while missingFileOK, then skipped.
+            std::shared_ptr<InputFile> file;
+            try {
+              file = dir.openFile(info.files.front().name, true);
+            } catch (const std::exception& e) {
+              if (!missingFileOK) LOG_WARN("Segment summary not opened for seg={}: {}", segId, e.what());
+            }
+            if (!file) {
+              if (missingFileOK) {
+                IREADER_DEBUG("Segment summary file missing for seg={} - triggering retry", segId);
+                retry = true;
+                break;
+              }
+              continue;
+            }
+            try {
+              std::string_view image = file->read();
+              summary = SegmentSummary::fromBytes(
+                  std::span<const std::byte>((const std::byte*)image.data(), image.size()));
+            } catch (const std::exception& e) {
+              // Unreadable: the segment has no summary, which proves nothing.
+              LOG_WARN("Segment summary unreadable for seg={}: {}", segId, e.what());
+              continue;
+            }
+            if (summary->segId() != segId || summary->maxDoc() != nDocs) {
+              LOG_WARN("Segment summary for seg={} describes seg={} max_doc={} (expected max_doc={}); ignored",
+                       segId, summary->segId(), summary->maxDoc(), nDocs);
+              summary = nullptr;
+            }
+            continue;
+          }
 
           auto prevIt = prevSegAuxByKey.find(segmentAuxKey(segId, info.name));
           if (prevIt != prevSegAuxByKey.end()
@@ -405,7 +449,8 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
             ? prevSeg->childLives : liveDocs && segmentCore->spaces().size() > 1
                 ? std::make_shared<PhysicalCore::ChildLives>() : nullptr;
         segs.push_back({std::move(segmentCore), std::move(liveDocs),
-                        std::move(segmentAuxReaders), segmentInfo, i, std::move(childLives)});
+                        std::move(segmentAuxReaders), segmentInfo, i, std::move(childLives),
+                        std::move(summary)});
         assert(nDocs == segs.back().core->rootReader().maxDoc());
       }
 
@@ -467,7 +512,8 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
     assert(bundle.info.live_gen == 0 || bundle.info.live_docs < bundle.info.max_doc);
     assert(bundle.info.live_docs == (bundle.live ? bundle.live->numLive() : bundle.info.max_doc));
     core->root->segs.emplace_back(std::shared_ptr(bundle.core), std::shared_ptr(bundle.live),
-        std::vector(bundle.aux), bundle.info, totalMaxDoc, bundle.ord, &bundle.core->rootReader());
+        std::vector(bundle.aux), bundle.info, totalMaxDoc, bundle.ord, &bundle.core->rootReader(),
+        nullptr, bundle.summary);
     totalMaxDoc += bundle.info.max_doc;
     livedocs += bundle.info.live_docs;
   }

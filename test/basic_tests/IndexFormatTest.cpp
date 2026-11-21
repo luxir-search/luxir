@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "luxir/index/SegmentSummary.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/server/LuxirNode.h"
 #include "luxir/server/HttpServer.h"
@@ -40,8 +41,8 @@ namespace {
 // The digest of the reference index written by IndexFormat::VERSION. A byte
 // change requires reviewing the format version. Writer choices among layouts
 // already supported by that version can change the digest within the version.
-constexpr uint64_t kReferenceVersion = 14;
-constexpr uint64_t kReferenceDigest = 0x7402bdb4bff87b41;
+constexpr uint64_t kReferenceVersion = 15;
+constexpr uint64_t kReferenceDigest = 0xf5120ea4b3f70c06;
 
 // A small index over every default field template's kind, with three segments
 // and a delete. Each segment is one request flushed by a single inverter.
@@ -106,8 +107,15 @@ uint64_t referenceDigest(Directory& dir) {
   EXPECT_TRUE(info.aux_indexes.empty());
   std::vector<api::SegmentInfo> segments(info.segments.begin(), info.segments.end());
   std::vector<std::vector<api::FileDescriptor>> files;
+  std::vector<std::vector<api::AuxIndexInfo>> overlays;
   for (auto& segment : segments) {
-    EXPECT_TRUE(segment.overlays.empty());
+    // Only the segment summary, whose entry carries a commit time.
+    auto& summaries = overlays.emplace_back(segment.overlays.begin(), segment.overlays.end());
+    for (auto& overlay : summaries) {
+      EXPECT_EQ(SegmentSummary::OVERLAY_KIND, overlay.kind);
+      overlay.commit_time = 0;
+    }
+    segment.overlays = summaries;
     EXPECT_FALSE(segment.merge_rows.has_value());
     segment.commit_time = 0;
     segment.schema = {};
@@ -233,7 +241,7 @@ TEST_F(IndexFormatTest, referenceIndexBytesMatchFormatVersion) {
 TEST_F(IndexFormatTest, serialRootMergeBytesMatchReference) {
   auto digest = buildMergedReferenceDigest();
   ASSERT_EQ(digest, buildMergedReferenceDigest()) << "the serial merge is not deterministic";
-  EXPECT_EQ(0xdf4d58db5c9db038ULL, digest) << std::format("merged digest {:#x}", digest);
+  EXPECT_EQ(0xf8957a5a670f2d1dULL, digest) << std::format("merged digest {:#x}", digest);
 }
 
 TEST_F(IndexFormatTest, otherFormatVersionFailsToLoad) {

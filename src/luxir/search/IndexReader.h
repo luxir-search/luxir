@@ -14,6 +14,7 @@
 
 #include "DocSet.h"
 #include "Similarity.h"
+#include "luxir/index/SegmentSummary.h"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/RankLiveBitmap.h"
@@ -121,6 +122,7 @@ public:
     const std::shared_ptr<LiveDocs> sharedLiveDocs;
     const std::shared_ptr<ChildLiveDocs> childLiveDocs;
     const std::vector<std::shared_ptr<AuxReader>> sharedAuxReaders;
+    const std::shared_ptr<const SegmentSummary> sharedSummary;
   public:
     friend class IndexReader;
 
@@ -141,16 +143,22 @@ public:
     Segment(std::shared_ptr<SegmentCore>&& segmentCore, std::shared_ptr<LiveDocs>&& liveDocs,
               std::vector<std::shared_ptr<AuxReader>>&& auxReaders,
               SegmentInfo segInfo, int64_t base, int ord, PostingsReader* spaceReader,
-              std::shared_ptr<ChildLiveDocs> childLiveDocs = {})
+              std::shared_ptr<ChildLiveDocs> childLiveDocs = {},
+              std::shared_ptr<const SegmentSummary> summary = {})
             :  sharedSegmentCore(std::move(segmentCore)), spaceReader(spaceReader),
                 rowCount(spaceReader ? spaceReader->maxDoc() : 0),
                 liveCount(liveDocs ? liveDocs->numLive() : rowCount),
                 sharedLiveDocs(std::move(liveDocs)),
                 childLiveDocs(std::move(childLiveDocs)),
                 sharedAuxReaders(std::move(auxReaders)),
+                sharedSummary(std::move(summary)),
                 segInfo(segInfo), base(base), ord(ord) {
       assert(!sharedLiveDocs || sharedLiveDocs->size() == rowCount);
     }
+
+    // The segment's summary sidecar, loaded when the snapshot opened; null
+    // when the segment has none readable, which proves nothing about it.
+    const SegmentSummary* summary() const noexcept { return sharedSummary.get(); }
 
     PostingsReader& postingsReader() const noexcept {
       assert(spaceReader);
@@ -377,6 +385,8 @@ private:
       Segment::SegmentInfo info;
       int32_t ord;
       std::shared_ptr<ChildLives> childLives;
+      // The root space's summary sidecar; null when the segment has none.
+      std::shared_ptr<const SegmentSummary> summary;
     };
     std::vector<Bundle> bundles;
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;

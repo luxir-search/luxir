@@ -21,7 +21,7 @@ namespace luxir {
 // VERSION. A collection written by another version fails to load and has to
 // be reindexed.
 struct IndexFormat {
-  static constexpr uint64_t VERSION = 14;
+  static constexpr uint64_t VERSION = 15;
   static_assert(VERSION > 0 && VERSION < 36 * 36 * 36);
   static constexpr auto HEADER_BYTES = [] {
     std::array<char, 8> header{'L', 'U', 'X', 'I', 'R'};

@@ -1774,6 +1774,7 @@ private:
       int64_t sumDocFreq = 0;
       int64_t sumTotalTermFreq = 0;
       bool mayHaveFitted = false;
+      std::string firstTerm;
 
       for (auto& outputPtr : outputs) {
         RangeOutput& output = *outputPtr;
@@ -1782,6 +1783,7 @@ private:
           output.termsGuard.release();
           continue;
         }
+        if (termOrd == 0) firstTerm = result.firstTerm;
 
         seg_location termsBase = termsOut.slocation();
         if (blockOrd != 0) {
@@ -1814,6 +1816,9 @@ private:
         previousLastTerm = result.lastTerm;
       }
 
+      // Ranges are disjoint and ascending: the first range's first term and
+      // the last range's last term bound the field.
+      outputFieldInfo->summary.setTermBounds(firstTerm, previousLastTerm, (uint64_t)termOrd);
       outputFieldInfo->nTerms = termOrd;
       outputFieldInfo->sumDocFreq = sumDocFreq;
       outputFieldInfo->sumTotalTermFreq = sumTotalTermFreq;
@@ -2550,10 +2555,12 @@ private:
         if (endRanks) endRanks->addInt64(endOut);
 
         int64_t rangeMin = 0;
+        const bool isGeo = outputFieldInfo.type == FieldType::GEO_POINT;
         assert(!rangePoints || (endIn - startIn) % 2 == 0);
         for (int64_t rank = startIn; rank < endIn; rank++) {
           int64_t value = docs.values().valueAt(rank);
           valuesWriter.addInt64(value);
+          if (isGeo) outputFieldInfo.summary.addGeoPacked(value);
           if (geoPoints) {
             geoPoints->push_back({geo::unpackLatitude(value),
                                   geo::unpackLongitude(value), mappedDoc});
