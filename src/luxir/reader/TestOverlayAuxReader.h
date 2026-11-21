@@ -33,6 +33,9 @@ public:
   // Without this, any client commit naming "test.overlay" in
   // build_aux_indexes would write test overlay files into a real index.
   static inline bool enabledForTests = false;
+  // How readers open this kind, and whether opening it fails.
+  static inline SegmentOverlayPolicy policyForTests{};
+  static inline bool failOpenForTests = false;
 
   TestOverlayAuxReader(std::string name, uint64_t gen, uint64_t builtCoreGen,
                        std::shared_ptr<InputFile> file) noexcept
@@ -45,6 +48,7 @@ public:
   static std::shared_ptr<TestOverlayAuxReader> open(Directory& dir,
                                                     const luxir::api::AuxIndexInfo& info,
                                                     bool missingFileOK) {
+    if (failOpenForTests) throw std::runtime_error("test overlay: failing as asked");
     if (info.files.size() != 1) {
       throw std::runtime_error(std::format(
         "TestOverlayAuxReader: expected 1 file, got {} for overlay '{}'",

@@ -609,6 +609,8 @@ struct ServiceStats {
   uint64_t control_queued = 0;
   uint64_t control_completed = 0;
   SearchFanoutStats search_fanout;
+  uint64_t segments_opened = 0;
+  uint64_t segment_bytes_mapped = 0;
   bool read_only = false;
 };
 struct ProcessStats {

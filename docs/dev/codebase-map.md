@@ -40,8 +40,12 @@ locations, browse `src/luxir/<area>/`.
      searches do not require an `IndexWriter`. Schema-only snapshots share physical cores.
    - `ResolvedSchema.cpp`: Declared representations and segment-generation coverage
    - `IndexReader` is a view of one path in a snapshot, with a leaf per bundle;
-     a reopen shares each unchanged `SegmentCore` and live docs with the previous
-     snapshot, and the writer's open segments in both directions
+     opening secures every file by handle (`HeldFiles`) and reads only the manifest
+     (row counts per space) and summaries; each bundle's core, live docs and overlays
+     are lazy parts (`SegmentBase`, `SegmentLive`, `SegmentOverlay`) materialized by
+     `IndexReader::materialize` at the search's batched point (`SearchEngine::submitBody`)
+     or on first use. A reopen shares each unchanged part, opened or not, with the
+     previous snapshot, and the writer's open segments in both directions
      - Physical field catalog records available columns and stored resources;
        logical retrieval discovery is cached per reader and schema identity
    - `SearchEngine`: Coordinates query parsing, execution, and result collection

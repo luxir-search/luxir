@@ -2352,6 +2352,10 @@ public:
     assert(bucketUses.empty() || bucketUses.size() == bucketWeights.size());
   }
 
+  bool needsWholePreparation() const override {
+    return preparedBuckets || FixedBucketFacetReq::needsWholePreparation();
+  }
+
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;
     for (auto* weight : bucketWeights) weight->releaseSegmentState(segment);

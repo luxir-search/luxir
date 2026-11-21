@@ -28,6 +28,7 @@ const SegmentMask& QueryPruning::viable(const Query& query) {
   SegmentMask mask = membership(query);
   if (!disableForTests) {
     for (const auto& segment : reader.segments()) {
+      // Bounds rather than numLive(): a child count must not derive live rows here.
       if (segment.liveCountBounds().second == 0) mask.clear((size_t)segment.ord);
     }
   }

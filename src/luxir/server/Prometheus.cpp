@@ -85,6 +85,8 @@ void service(Renderer& r, const api::ServiceStats& s) {
                                 {"siblings_only", f.siblings_only}, {"saturated", f.saturated}})
     r.counter("luxir_search_fanout_decisions_total", fanoutDecisions, (double)count, PrometheusText::label("outcome", outcome));
   r.counter("luxir_search_fanout_shares_total", "Fan-out shares submitted by adaptive evaluations.", (double)f.shares);
+  r.counter("luxir_segments_opened_total", "Segments whose data a reader materialized; readers open segments lazily, so a segment nothing reads is not counted.", (double)s.segments_opened);
+  r.counter("luxir_segment_mapped_bytes_total", "Bytes of segment files (base, live docs, overlays) mapped when segments materialized.", (double)s.segment_bytes_mapped);
   r.activity("luxir_index_batches", "luxir_index_batch_duration_seconds", s.index_batches, s.request_duration_bounds);
   constexpr std::string_view docs = "Documents accepted into indexing or rejected/rolled back; acceptance is not durable acknowledgment.";
   r.counter("luxir_ingest_documents_total", docs, (double)s.documents_accepted, "outcome=\"accepted\"");

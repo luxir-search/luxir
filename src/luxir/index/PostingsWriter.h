@@ -435,6 +435,17 @@ public:
     return descriptor->maxDoc;
   }
 
+  // Every child row space and its row count, sorted by path; for the manifest.
+  std::vector<std::pair<std::string, int32_t>> getChildSpaceRows() const {
+    std::vector<std::pair<std::string, int32_t>> rows;
+    rows.reserve(spaceDescriptors.size() - 1);
+    for (size_t i = 1; i < spaceDescriptors.size(); i++) {
+      rows.emplace_back(spaceDescriptors[i].path, spaceDescriptors[i].maxDoc);
+    }
+    std::ranges::sort(rows);
+    return rows;
+  }
+
   int32_t getMaxSpaceRows() const {
     int32_t count = maxDoc;
     for (const auto& space : spaceDescriptors) count = std::max(count, space.maxDoc);

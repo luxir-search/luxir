@@ -2416,6 +2416,8 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.control_queued"></a>[`control_queued`](#field-luxir.servicestats.control_queued) | 62 | `uint64` | singular | tasks waiting for a thread |
 | <a id="field-luxir.servicestats.control_completed"></a>[`control_completed`](#field-luxir.servicestats.control_completed) | 63 | `uint64` | singular |  |
 | <a id="field-luxir.servicestats.search_fanout"></a>[`search_fanout`](#field-luxir.servicestats.search_fanout) | 26 | [`SearchFanoutStats`](#message-luxir.searchfanoutstats) | singular |  |
+| <a id="field-luxir.servicestats.segments_opened"></a>[`segments_opened`](#field-luxir.servicestats.segments_opened) | 27 | `uint64` | singular | Segments whose base data a reader materialized (mapped and decoded its segment files). Readers open segments lazily, so a segment nothing reads is not counted. A segment a search prunes can still be opened for term statistics (BM25 covers every segment) or whole-index preparation. |
+| <a id="field-luxir.servicestats.segment_bytes_mapped"></a>[`segment_bytes_mapped`](#field-luxir.servicestats.segment_bytes_mapped) | 28 | `uint64` | singular | Bytes of every file mapped for segments as their parts materialize: base files, live docs and overlays. A part that fails to build adds nothing. |
 
 <a id="message-luxir.shardcachecontrol"></a>
 

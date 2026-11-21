@@ -328,6 +328,11 @@ std::shared_ptr<Collection> Collections::makeCollection(const CollectionId& name
       FilterCacheConfig{.maxBytes = bytes}, CommitSnapshotRegistry::Clock::now, schemas, name.tenant,
       factory->retention);
   col->shard->getReaderManager().metrics = metrics;
+  col->shard->getReaderManager().onUnreadable = std::make_shared<const UnreadableHook>(
+      [relay = unreadableRelay, collection = std::weak_ptr(col), name](std::vector<std::string> files, std::string reason) {
+        std::lock_guard lock(relay->mutex);
+        if (relay->sink) relay->sink(name, collection, std::move(files), std::move(reason));
+      });
   const auto& policy = config.replication;
   col->shard->snapshots->setPolicy({std::chrono::milliseconds(policy.pin_idle_timeout_ms), policy.pin_retained_bytes});
   return col;
@@ -518,6 +523,11 @@ void Collections::fail(const CollectionId& name, const std::shared_ptr<Collectio
   }
   collection->fail(reason);
   events.updated(collection->getId(), *collection);
+}
+
+void Collections::onUnreadable(UnreadableSink sink) {
+  std::lock_guard lock(unreadableRelay->mutex);
+  unreadableRelay->sink = std::move(sink);
 }
 
 void Collections::unload(const CollectionId& name, const std::shared_ptr<Collection>& expected, std::string reason) {

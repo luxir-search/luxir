@@ -1768,6 +1768,14 @@ message ServiceStats {
   uint64 control_queued = 62;    // tasks waiting for a thread
   uint64 control_completed = 63;
   SearchFanoutStats search_fanout = 26;
+  // Segments whose base data a reader materialized (mapped and decoded its
+  // segment files). Readers open segments lazily, so a segment nothing reads
+  // is not counted. A segment a search prunes can still be opened for term
+  // statistics (BM25 covers every segment) or whole-index preparation.
+  uint64 segments_opened = 27;
+  // Bytes of every file mapped for segments as their parts materialize: base
+  // files, live docs and overlays. A part that fails to build adds nothing.
+  uint64 segment_bytes_mapped = 28;
 }
 
 // What the adaptive segment fan-out (max_parallel 0) decided, process-wide.

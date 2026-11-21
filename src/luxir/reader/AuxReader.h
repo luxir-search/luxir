@@ -5,9 +5,22 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace luxir {
+
+// How a segment's overlay of some kind is opened.
+struct SegmentOverlayPolicy {
+  // Opened by whatever consults it, not with the segment: materializing the
+  // segment neither opens the overlay nor waits for it. For an overlay that
+  // decides whether the segment is opened at all.
+  bool onDemand = false;
+  // An accelerator: an overlay that cannot be read answers nothing, and the
+  // segment stays in service. Transient failures (a failed fetch, a memory
+  // limit) still throw, and a later use retries.
+  bool advisory = false;
+};
 
 /// Read-side handle for one entry in IndexInfo.aux_indexes.  Subclasses own
 /// whatever the underlying aux kind needs to answer queries (e.g. a
@@ -39,6 +52,19 @@ public:
 protected:
   AuxReader(uint64_t gen, uint64_t builtCoreGen) noexcept
     : gen(gen), builtCoreGen(builtCoreGen) {}
+};
+
+/// Stands in for an advisory overlay that could not be opened: it answers
+/// nothing, and whatever consults the overlay does without it.
+class UnavailableAuxReader final : public AuxReader {
+  std::string kind;
+  std::string name;
+
+public:
+  UnavailableAuxReader(std::string_view kind, std::string_view name, uint64_t gen, uint64_t builtCoreGen)
+      : AuxReader(gen, builtCoreGen), kind(kind), name(name) {}
+  std::string_view getKind() const override { return kind; }
+  std::string_view getName() const override { return name; }
 };
 
 } // namespace luxir
