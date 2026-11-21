@@ -692,6 +692,7 @@ Partition matching documents by an exact, single-valued key.
 | <a id="field-luxir.collapse.get_count"></a>[`get_count`](#field-luxir.collapse.get_count) | 4 | `bool` | singular | Count members of each returned group in the finalized match set. |
 | <a id="field-luxir.collapse.ops"></a>[`ops`](#field-luxir.collapse.ops) | 5 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Per-group operations on matching members; facet count units start at docs. Explicit group units still resolve to this nearest enclosing collapse. |
 | <a id="field-luxir.collapse.sort"></a>[`sort`](#field-luxir.collapse.sort) | 6 | [`SortSpec`](#message-luxir.sortspec) | repeated | Exhaustive group order by metrics in ops; missing/failed values last. Ties use the best member under the list sort, then document order. |
+| <a id="field-luxir.collapse.owner"></a>[`owner`](#field-luxir.collapse.owner) | 7 | `string` | singular | In a nested child view (domain.to), "root" adds each row's owning root document as a structural key component. No field is named or decoded; field may then be empty. |
 
 <a id="message-luxir.collectionactivitystats"></a>
 
@@ -922,6 +923,7 @@ A document cap, applied before paging in the list's ordinary rank order.
 |---|---|---|---|---|
 | <a id="field-luxir.diversify.field"></a>[`field`](#field-luxir.diversify.field) | 1 | `string` | repeated | One field or an exact tuple, as in Collapse. |
 | <a id="field-luxir.diversify.missing"></a>[`missing`](#field-luxir.diversify.missing) | 3 | [`Collapse.MissingPolicy`](#enum-luxir.collapse.missingpolicy) | singular |  |
+| <a id="field-luxir.diversify.owner"></a>[`owner`](#field-luxir.diversify.owner) | 4 | `string` | singular | "root": cap child rows per root document, as in Collapse.owner. |
 | <a id="field-luxir.diversify.max_per_key"></a>[`max_per_key`](#field-luxir.diversify.max_per_key) | 2 | `int64` | oneof [`kind`](#oneof-luxir.diversify.kind) | Positive cap; keeps each key's best documents. |
 
 <a id="message-luxir.doclist"></a>
@@ -1231,6 +1233,7 @@ Required fusion method: exactly one.
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.fusion.row_ops"></a>[`row_ops`](#field-luxir.fusion.row_ops) | 28 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Operations evaluated on each returned fused row, as TopDocs.row\_ops. domain.from\_match may name a clause of any source. |
 | <a id="field-luxir.fusion.decorate"></a>[`decorate`](#field-luxir.fusion.decorate) | 27 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | Plugin result decorators, executed only for emitted rows. |
 | <a id="field-luxir.fusion.sources"></a>[`sources`](#field-luxir.fusion.sources) | 1 | map&lt;`string`, [`TopDocs`](#message-luxir.topdocs)&gt; | map | Named source queries. At least one source is required. |
 | <a id="field-luxir.fusion.filter"></a>[`filter`](#field-luxir.fusion.filter) | 2 | [`Filter`](#message-luxir.filter) | repeated | Filters applied to every source. except\_ops is not supported here or in source filters. |

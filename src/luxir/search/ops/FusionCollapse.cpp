@@ -126,6 +126,8 @@ public:
         op.fusionProto.offset, op.needsCount(), op.fusionProto.get_scores,
         op.fusionProto.document_format, enrich ? members.get() : nullptr,
         fusedDomains, pageGroups, true};
+    auto rows = op.rowColumns();
+    settings.rowColumns = rows;
     emitCollapsedPage(settings, *this, *groups);
   }
 };

@@ -16,6 +16,7 @@
 #include "luxir/api/RequestFlags.h"
 #include "luxir/search/SearchOpRegistry.h"
 #include "luxir/search/SearchRequest.h"
+#include "luxir/search/RowVectorReplay.h"
 #include "luxir/search/SearchEngine.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/query/ParseContext.h"
@@ -39,6 +40,7 @@
 
 #include "luxir/query/QueryBuilder.h"
 #include "luxir/query/QueryShape.h"
+#include "luxir/query/ExistsQuery.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/NumericUtils.h"
@@ -513,7 +515,8 @@ public:
         auto topDocsPlacement = depth == 1 && !searchOp.domain
             ? TopDocsPlacement::ROOT_OP : TopDocsPlacement::NESTED_OP;
         auto* qr = parseTopDocs(name, topDocs, topDocsPlacement);
-        parseRowOps(*qr, topDocs, depth);
+        const api::TopDocs* list = &topDocs;
+        parseRowOps(*qr, topDocs.row_ops, topDocs.fields, {&list, 1}, depth);
         if (topDocs.collapse) {
           addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
           // Keep the nearest collapse for explicit group units, while a
@@ -654,7 +657,13 @@ public:
     using Missing = luxir::api::Collapse_::MissingPolicy;
     if (spec.missing != Missing::EXPAND && spec.missing != Missing::GROUP
         && spec.missing != Missing::DROP) throw RequestError("invalid collapse.missing");
-    if (spec.field.empty()) throw RequestError("collapse.field must not be empty");
+    if (spec.field.empty() && spec.owner.empty()) throw RequestError("collapse.field must not be empty");
+    if (!spec.owner.empty()) {
+      if (spec.owner != "root") throw RequestError("owner must be \"root\"");
+      if (view()->path().empty()) {
+        throw RequestError("owner keys apply to the rows of a nested path (a domain.to child view)");
+      }
+    }
     auto* collapse = luxir::arenaCreate<CollapsePlan>(
         req.arena, *view(), spec.missing, getNumber);
     std::unordered_set<std::string> resolved;
@@ -689,6 +698,7 @@ public:
           ordinal ? view()->getOrdMap(field.physicalName) : nullptr,
           view()->field(field.physicalName), type.valueNature()});
     }
+    if (!spec.owner.empty()) collapse->addOwnerKey(*req.pinView(""));
     return collapse;
   }
 
@@ -1763,12 +1773,16 @@ public:
     return query;
   }
 
-  void parseRowOps(TopDocsReq& owner, const api::TopDocs& list, int depth) {
-    if (list.row_ops.empty()) return;
-    if (list.collapse || list.diversify) throw RequestError("row_ops on collapsed or diversified lists are not supported yet");
+  // Row operations of a list (owner), whose rows come from `lists`: the list
+  // itself, or the sources of a fusion. from_match may name a clause of any
+  // of them.
+  void parseRowOps(SearchOp& owner, const decltype(api::TopDocs::row_ops)& rowOps,
+                   std::span<const std::string_view> fields,
+                   std::span<const api::TopDocs* const> lists, int depth) {
+    if (rowOps.empty()) return;
     if (depth >= maxOpDepth) throw RequestError("row_ops exceeds the operation nesting limit");
-    auto returned = resolveReturnFields(req, *view(), list.fields);
-    for (auto& [name, wire] : lastWins(list.row_ops)) {
+    auto returned = resolveReturnFields(req, *view(), fields);
+    for (auto& [name, wire] : lastWins(rowOps)) {
       validateName(name, "row operation");
       if (name.starts_with('_')) throw RequestError("reserved row operation name '" + std::string(name) + "'");
       for (const auto& field : returned) if (field.outputKey == name) {
@@ -1788,6 +1802,7 @@ public:
       auto restore = scope_guard([&]() noexcept { options = inherited; });
       std::string path(view()->path());
       Query* selectedRows = nullptr;
+      RowVectorReplay* replay = nullptr;
       if (spec.domain) {
         const auto& domain = *spec.domain;
         if (domain.query) throw RequestError("row operation '" + std::string(name) + "': domain.query is not supported yet");
@@ -1801,7 +1816,9 @@ public:
           if (domain.to) fail("cannot be combined with domain.to");
           if (found == namedClauses.end()) fail("unknown clause name");
           const auto& clause = found->second;
-          if (clause.list != &list) fail("the clause is not part of this list's query or filters");
+          if (std::ranges::find(lists, clause.list) == lists.end()) {
+            fail("the clause is not part of this list's query or filters");
+          }
           if (clause.prohibited) fail("a prohibited clause has no matched rows");
           path = clause.path;
           selectedRows = descendantClause(clause.query, path);
@@ -1809,7 +1826,30 @@ public:
           if (path.empty() || path == base || (!base.empty() && !path.starts_with(std::string(base) + '.'))) {
             fail("the clause does not select descendant rows");
           }
-          if (logicalConsumesDomain(*selectedRows)) fail("kNN and other domain-consuming clauses cannot be replayed per row");
+          if (logicalConsumesDomain(*selectedRows)) {
+            // A kNN leaf, under boosts or a constant score, replays as the
+            // rows with a vector, scored exactly by RowVectorReplay.
+            float boost = 1.0f;
+            ConstantScoreQuery* constant = nullptr;
+            Query* leaf = selectedRows;
+            for (;;) {
+              if (leaf->getKind() == QueryKind::BOOST) {
+                boost *= ((BoostQuery*)leaf)->getBoost();
+                leaf = ((BoostQuery*)leaf)->getChild();
+              } else if (leaf->getKind() == QueryKind::CONSTANT_SCORE) {
+                constant = (ConstantScoreQuery*)leaf;
+                leaf = constant->getChild();
+              } else break;
+            }
+            if (leaf->getKind() != QueryKind::KNN) {
+              fail("a kNN inside a compound clause cannot be replayed per row; name the kNN clause itself");
+            }
+            replay = luxir::arenaCreate<RowVectorReplay>(req.arena, *(KnnQuery*)leaf, boost, constant == nullptr);
+            selectedRows = req.requestPool.make<ExistsQuery>(replay->field);
+            if (constant) {
+              selectedRows = req.requestPool.make<ConstantScoreQuery>(selectedRows, constant->getScoreProfile());
+            }
+          }
         } else if (domain.to) path = domainPath(*domain.to);
       }
       auto scope = parseView.scoped(path);
@@ -1827,6 +1867,7 @@ public:
       if (row->weight->needsPrepare() || !row->filterWeights.empty()) {
         throw RequestError("row operation '" + std::string(name) + "': prepared queries and routed filters are not supported yet");
       }
+      row->vectorReplay = replay;
       row->rowFields = resolveReturnFields(req, *row->view, top->fields);
       resolveReturnFieldMetadata(*row->view, row->rowFields);
       row->parent = &owner;
@@ -2784,6 +2825,11 @@ public:
       src->parent = fusion;
     }
 
+    std::vector<const api::TopDocs*> lists;
+    for (size_t i = 0; i < sourceEntries.size(); i++) {
+      if (weights[i] != 0) lists.push_back(&*sourceEntries[i].second);
+    }
+    parseRowOps(*fusion, fusionProto.row_ops, fusionProto.fields, lists, depth);
     addSubs(*fusion, fusionProto.ops, depth, OpsPlacement::FUSION);
     if (collapse) {
       inheritedFacetMeasure = nullptr;

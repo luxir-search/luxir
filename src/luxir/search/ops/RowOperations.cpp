@@ -3,10 +3,11 @@
 
 #include "TopDocsReq.h"
 #include "luxir/reader/OwnershipMapper.h"
+#include "luxir/search/RowVectorReplay.h"
 
 namespace luxir {
 
-std::vector<ExtraColumn> TopDocsReq::rowColumns() {
+std::vector<ExtraColumn> SearchOp::rowColumns() {
   std::vector<ExtraColumn> columns;
   for (auto* operation : rowOps) {
     columns.push_back({operation->name, {},
@@ -58,6 +59,9 @@ std::vector<ExtraColumn> TopDocsReq::rowColumns() {
         }
       }
       auto uniform = scorer ? scorer->constantContribution() : std::nullopt;
+      std::optional<RowVectorReplay::Segment> replay;
+      if (op.vectorReplay) replay.emplace(*op.vectorReplay, target, segment);
+      bool replayScores = replay && op.vectorReplay->scores && !op.topDocsProto.query;
       std::optional<FieldSortCollector::ExpressionBindings> expressions;
       if (sorted) {
         sorted->setSegment(segment, &pool);
@@ -83,11 +87,20 @@ std::vector<ExtraColumn> TopDocsReq::rowColumns() {
         scores.reset();
         if (sorted) sorted->reset();
         if (scorer && bounds.first < bounds.second) {
+          if (replay) replay->startFamily();
           auto collect = [&](int32_t doc) {
-            float score = uniform ? *uniform : op.weight->needsScores() ? scorer->score() : 0;
+            float score;
+            if (replay) {
+              // The replayed kNN restricts to rows it would score, and ranks
+              // them unless the operation brings its own query.
+              auto similarity = replay->score(doc);
+              if (!similarity) return true;
+              score = replayScores ? *similarity
+                  : uniform ? *uniform : op.weight->needsScores() ? scorer->score() : 0;
+            } else score = uniform ? *uniform : op.weight->needsScores() ? scorer->score() : 0;
             if (sorted) sorted->collect(segment.ord, doc, score);
             else scores.collect(segment.ord, doc, score);
-            if (!sorted && op.weight->isConstantScoring()
+            if (!sorted && op.weight->isConstantScoring() && !replayScores
                 && !op.requirements.needsCount()
                 && scores.hitCount >= op.topCount) {
               return false;

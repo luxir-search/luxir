@@ -1392,6 +1392,7 @@ struct from<JSON, luxir::api::Collapse> {
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
           if (key == "field") readFields(vit, vend);
+          else if (key == "owner") util::from_json<O>(value.owner, ctx, vit, vend);
           else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
           else if (key == "get_count") util::from_json<O>(value.get_count, ctx, vit, vend);
           else if (key == "ops") {
@@ -1432,6 +1433,7 @@ struct from<JSON, luxir::api::Diversify> {
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
           if (key == "field") readFields(vit, vend);
+          else if (key == "owner") util::from_json<O>(value.owner, ctx, vit, vend);
           else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
           else if (key == "max_per_key") util::from_json<O>(value.max_per_key, ctx, vit, vend);
           else { ctx.error = error_code::unknown_key; return true; }
@@ -1550,6 +1552,9 @@ struct from<JSON, luxir::api::Fusion> {
             util::from_json<O>(value.batch_size, ctx, vit, vend);
           } else if (key == "document_format") {
             util::from_json<O>(value.document_format, ctx, vit, vend);
+          } else if (key == "row_ops") {
+            decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.row_ops);
+            glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
           } else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);

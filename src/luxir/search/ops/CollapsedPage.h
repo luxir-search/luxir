@@ -5,6 +5,7 @@
 
 #include "SearchOp.h"
 #include "luxir/search/Collector.h"
+#include "luxir/search/EmitDocs.h"
 #include "luxir/search/SortField.h"
 
 namespace luxir {
@@ -31,6 +32,8 @@ struct CollapsedPageSettings {
   bool alwaysRank = false;
   void (*releaseSegment)(SearchOp&, IndexReader::Segment&) = nullptr;
   void (*releaseMembers)(SearchOp::Calculator&) = nullptr;
+  // Row operation columns, computed for each emitted group head.
+  std::span<const ExtraColumn> rowColumns = {};
 };
 
 void emitCollapsedPage(const CollapsedPageSettings& settings,

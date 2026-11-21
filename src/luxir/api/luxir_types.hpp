@@ -955,11 +955,13 @@ struct Collapse {
   std::span<const SortSpec> sort;
   bool get_count = false;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+  std::string_view owner;
 };
 struct Diversify {
   std::span<const std::string_view> field;
   Collapse_::MissingPolicy missing = Collapse_::MissingPolicy::EXPAND;
   std::optional<int64_t> max_per_key;
+  std::string_view owner;
 };
 struct TopDocs {                                                 // all indirect/span/opt-scalar
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> row_ops;
@@ -980,6 +982,7 @@ struct TopDocs {                                                 // all indirect
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> decorate;
 };
 struct Fusion {                                                  // needs TopDocs, RrfFusion, LinearFusion
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> row_ops;
   map_view<std::string_view, TopDocs> sources;
   std::span<const Filter> filter;
   std::optional<std::int64_t> limit;

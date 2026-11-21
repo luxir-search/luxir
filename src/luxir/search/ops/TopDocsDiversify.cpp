@@ -46,6 +46,7 @@ SearchOp::Calculator* TopDocsReq::createDiversifyCalculator(
 }
 
 void TopDocsReq::fillDiversifyResponse(CalcBase& calc, MergeableCollector& data) {
+  auto extra = rowColumns();
   auto emit = [&](auto& collector) {
     auto docs = collector.sort();
     auto target = [&](SearchResponse* response) -> api::DocList& {
@@ -59,7 +60,7 @@ void TopDocsReq::fillDiversifyResponse(CalcBase& calc, MergeableCollector& data)
         topDocsProto.fields, topDocsProto.batch_size, topDocsProto.offset,
         requirements.needsCount(), topDocsProto.get_scores, topDocsProto.document_format,
         calc.underBucketSlot() ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM,
-        {}, false, false, {}, decorators);
+        {}, false, false, extra, decorators);
   };
   if (data.useFieldSort) emit(*data.diverseFieldCollector);
   else emit(*data.diverseScoreCollector);

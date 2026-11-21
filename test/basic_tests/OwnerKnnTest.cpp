@@ -306,10 +306,13 @@ TEST_F(OwnerKnnTest, resultViewIsIdentityAndNamedKnnKeepsItsPreciseError) {
     return std::move(out).finishStructural(scope, context);
   };
   EXPECT_NE(key(*root), key(*child));
+  // A named kNN replays per row; only a kNN buried in a compound clause cannot.
+  auto replayed = request(R"({"query":{"name":"v","knn":{"field":"items.v","query":[0,0,0,0],"k":2}},"row_ops":{"x":{"domain":{"from_match":"v"},"top_docs":{"limit":2}}}})");
+  EXPECT_TRUE(replayed->ok());
   auto bad = localReq(helper.getSearchEngine());
-  ASSERT_TRUE(api::read_json(bad->rawRequest(), R"({"query":{"name":"v","knn":{"field":"items.v","query":[0,0,0,0],"k":2}},"row_ops":{"x":{"domain":{"from_match":"v"},"top_docs":{"limit":2}}}})", bad->mr));
+  ASSERT_TRUE(api::read_json(bad->rawRequest(), R"({"query":{"name":"v","to_parent":{"path":"items","query":{"boolean":{"required":[{"knn":{"field":"v","query":[0,0,0,0],"k":2}}],"filter":[{"exists":{"field":"v"}}]}}}},"row_ops":{"x":{"domain":{"from_match":"v"},"top_docs":{"limit":2}}}})", bad->mr));
   bad->execute(1); EXPECT_FALSE(bad->ok());
-  EXPECT_NE(std::string::npos, bad->errorMsg().find("kNN and other domain-consuming clauses cannot be replayed per row"));
+  EXPECT_NE(std::string::npos, bad->errorMsg().find("a kNN inside a compound clause cannot be replayed per row"));
 }
 TEST_F(OwnerKnnTest, singleValuedAndSparseChildColumnsAndMissingPathsUseTheSameUnit) {
   schema(true);

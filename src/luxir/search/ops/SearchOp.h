@@ -30,6 +30,8 @@
 
 namespace luxir {
 class DocSet;
+class TopDocsReq;
+struct ExtraColumn;
 struct FacetChildContext;
 class FacetChildExecutor;
 
@@ -156,6 +158,9 @@ class SearchOp {
 
 public:
   std::vector<std::shared_ptr<HitDecorator>> decorators;
+  // Operations run per emitted row (row_ops), and their result columns.
+  std::vector<TopDocsReq*> rowOps;
+  std::vector<ExtraColumn> rowColumns();
   SearchRequest& req;
   const std::shared_ptr<IndexReader>& view;
   std::string_view name;
