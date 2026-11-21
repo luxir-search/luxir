@@ -316,7 +316,10 @@ That is needed only for one very large collection that keeps taking writes
 needs:
 
 - a merge policy that leaves old, large segments alone, or merges that fetch
-  their inputs through the cache;
+  their inputs through the cache. A collection on remote storage defaults to
+  1 GiB / 10M-doc merge caps (`merge_policy.max_merged_segment_bytes` and
+  `max_merged_segment_docs`, set per collection), and its delete-reclaim
+  rewrites are off until the writer can tell which segments are local;
 - id lookups for updates and deletes that skip cold segments without
   fetching them. Append-only collections need no lookups. Otherwise the
   exact id bounds in each segment's catalog do the skipping, and the id

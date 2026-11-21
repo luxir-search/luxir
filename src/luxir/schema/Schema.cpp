@@ -982,6 +982,7 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
   std::optional<api::MergePolicyDef> mergePolicy = def.merge_policy ? def.merge_policy : baseSrc.merge_policy;
   if (mergePolicy) {
     try {
+      validateMergeLimits(*mergePolicy);
       MergePolicyRegistry::global().make(mergePolicy->name, mergePolicy->params,
                                          TieredMergePolicy::DEFAULT_MERGE_FACTOR);
     } catch (const std::invalid_argument& e) {

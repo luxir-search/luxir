@@ -293,11 +293,13 @@ merge policy makers. `tiered` (`TieredMergePolicy`) is built in and is the defau
 collection selects one in its schema, `"merge_policy": {"name": ..., "params": {...}}`;
 the schema request builds the policy once, so an unknown name or a param the maker
 refuses is an `invalid_schema` error. Each collection's writer builds its own instance
-and rebuilds it when the schema's `merge_policy` or the node merge factor changes.
+and rebuilds it when the collection's schema or the node merge factor changes.
 
 The maker receives a `MergePolicyContext`: `params` (a `ParamReader`; keys the maker
-does not read are refused afterwards) and `nodeMergeFactor` (the node's
-`--indexing.merge-factor`). It returns a `std::unique_ptr<MergePolicy>`.
+does not read are refused afterwards), `nodeMergeFactor` (the node's
+`--indexing.merge-factor`) and `limits`, the collection's resolved `MergeLimits`
+(merged-segment byte and doc caps, `deletesPctAllowed`). It returns a
+`std::unique_ptr<MergePolicy>`.
 
 A policy (`src/luxir/index/MergePolicy.h`) implements one call:
 
@@ -305,10 +307,12 @@ A policy (`src/luxir/index/MergePolicy.h`) implements one call:
 std::vector<MergeSpec> findMerges(std::span<const MergeSegment> segments) const;
 ```
 
-`segments` are the collection's live segments in segId order, each with `maxDoc`,
+`segments` are all of the collection's live segments in segId order, each with `maxDoc`,
 `liveDocs`, `rows` (the largest physical row space: `maxDoc`, or more for nested child
-rows), `bytes`, the update version range (`minVersion`/`maxVersion`, which follows
-ingest order), `firstCommitTime` and a `summary`. `summary->numericBounds(field)`
+rows), `bytes` (data files without the live docs file; `liveBytes()` and `liveRows()`
+prorate by live docs), the update version range (`minVersion`/`maxVersion`, which follows
+ingest order), `firstCommitTime`, `terminal` (over half of a cap, see
+`MergeLimits::terminal`) and a `summary`. `summary->numericBounds(field)`
 returns the inclusive bounds of a physical numeric field's column in its
 order-preserving int64 encoding, deleted documents included, or nullopt when the
 segment has no values for it. The first call per segment may open its metadata;
@@ -322,7 +326,11 @@ merge that failed is not retried on every flush; after a merge, the first spec),
 asks again when the scheduled merge starts so segments flushed in between can
 join, drops ids that are unknown, empty or
 already merging, skips a spec left with fewer than two segments, and applies merge
-admission (merged doc and ord-dictionary limits, the RAM budget). Calls hold the
+admission: it takes a spec's segments in order and stops at the first that would
+carry the output past the collection's `MergeLimits` (so give specs in segId order),
+and applies the merged doc and ord-dictionary limits, the merge working-set limit and
+the RAM budget. When no policy merge is due it may run a delete-reclaim merge of
+terminal segments past `deletesPctAllowed`, whatever the policy. Calls hold the
 writer's index lock: keep them to in-memory work beyond the summary reads. A policy
 that throws is logged and treated as choosing nothing. Names are `[a-z0-9_]+`;
 duplicates and built-in names cannot be registered. To extend the built-in, build it

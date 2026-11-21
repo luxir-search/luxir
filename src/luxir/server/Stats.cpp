@@ -275,6 +275,7 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
     dst.inverters_flushing = src.flushing;
     dst.commits = src.commits;
     dst.retained_delete_bytes = src.retainedDeleteBytes;
+    dst.reclaim_merges = src.reclaimMerges;
   }
 
   auto* aux = api::build::allocArray(dst.aux_indexes, src.auxIndexes.size(), resource);
@@ -300,6 +301,7 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
     if constexpr (requires { in.merging; }) {
       out.merging = in.merging;
       out.merge_level = (uint32_t)in.mergeLevel;
+      out.terminal = in.terminal;
     }
     out.bytes = in.bytes;
     auto* spaces = api::build::allocArray(out.spaces, in.spaces.size(), resource);

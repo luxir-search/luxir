@@ -99,6 +99,8 @@ public:
     };
     std::vector<Range> ranges;
     for (const auto& segment : segments) {
+      // A terminal segment is past half of a merge cap: leave it whole.
+      if (segment.terminal) continue;
       if (auto bounds = segment.summary->numericBounds(field)) ranges.push_back({bounds->min, bounds->max, segment.segId});
     }
     std::ranges::sort(ranges, {}, &Range::min);

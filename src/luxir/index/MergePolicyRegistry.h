@@ -24,6 +24,9 @@ struct MergePolicyContext {
   // The node's --indexing.merge-factor: the default for a policy with a
   // merge factor.
   int32_t nodeMergeFactor;
+  // The collection's resolved size limits (resolveMergeLimits). The writer
+  // enforces them; a policy may plan with them.
+  const MergeLimits& limits;
 };
 
 // A collection's merge policy selection (SchemaDef.merge_policy), owning its
@@ -64,10 +67,12 @@ public:
   // listing the registered names when `name` is unknown, and ParamError for a
   // bad or unread param (makers read through ctx.params; the registry rejects
   // the keys they did not read).
+  // An empty name selects the default policy.
   std::unique_ptr<MergePolicy> make(std::string_view name, const ParamReader::Entries& params,
-                                    int32_t nodeMergeFactor) const;
+                                    int32_t nodeMergeFactor, const MergeLimits& limits = {}) const;
   // The policy `spec` selects, or the default policy when it is null.
-  std::unique_ptr<MergePolicy> make(const MergePolicySpec* spec, int32_t nodeMergeFactor) const;
+  std::unique_ptr<MergePolicy> make(const MergePolicySpec* spec, int32_t nodeMergeFactor,
+                                    const MergeLimits& limits = {}) const;
 
   bool contains(std::string_view name) const { return makers.contains(name); }
   // Sorted.
@@ -76,6 +81,14 @@ public:
   bool frozen() const { return isFrozen; }
   void freeze() { isFrozen = true; }
 };
+
+// The limits a collection's merges respect: `def`'s explicit fields, else the
+// default for the collection's kind. A REMOTE directory takes the remote
+// defaults, else a schema with a vector field the vector defaults, else the
+// generic ones (MergeLimits). `def` may be null.
+MergeLimits resolveMergeLimits(const api::MergePolicyDef* def, bool remote, bool vectors);
+// Throws std::invalid_argument for out-of-range limit fields in `def`.
+void validateMergeLimits(const api::MergePolicyDef& def);
 
 // Registers the built-in policies: tiered. Called when the global registry is
 // built.

@@ -587,6 +587,7 @@ With `collections=true`:
 | `luxir_index_committed_bytes`, `luxir_index_last_commit_timestamp_seconds` | Current snapshot descriptor bytes and publication timestamp. An old timestamp alone does not indicate a problem on an idle collection. |
 | `luxir_index_directory_bytes` | Directory-listing bytes; only with `files=true`. See the two byte counts above. |
 | `luxir_index_commits_total` | Commits since the writer opened. |
+| `luxir_merge_reclaims_total` | Merges started to reclaim deletes of segments the merge policy no longer merges. |
 | `luxir_index_retained_delete_bytes` | Delete packets the writer retains for its pending set and merge catch-up, counted once per packet; part of `luxir_index_ram_reserved_bytes`. |
 | `luxir_collection_searches_total`, `luxir_collection_search_seconds_total` | Searches that reached the collection, by `outcome`, and their summed duration from submission to the final response. The mean is the ratio of the two rates. |
 | `luxir_collection_index_batches_total`, `luxir_collection_index_batch_seconds_total` | The collection's index batches by `outcome`, and their summed processing time. |
@@ -826,6 +827,13 @@ the node unlimited. The resolved values are logged at startup.
   inverter holding at least its share of the half (and at least
   `indexing.pressure-flush-floor-mb`, default 4). Without a waiting merge,
   inverters are flushed only once the whole budget is in use.
+- `indexing.max-merge-working-set-mb` (default `0`, meaning `indexing.max-ram-mb`)
+  bounds the estimated working set of a background merge's most expensive
+  field (ord column uninversion, term ord maps, geo and range point
+  rebuilds); sources that would push it past the limit wait for a later
+  merge. A force merge over the limit still runs, with a warning. The size of
+  the segments merges build is set per collection, in the schema's
+  `merge_policy` (see [Merge policy](schema.md#merge-policy)).
 
 ### Id filters
 

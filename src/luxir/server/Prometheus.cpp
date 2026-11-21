@@ -221,6 +221,7 @@ void collections(Renderer& r, const api::StatsResponse& stats) {
     r.gauge("luxir_inverters", "Indexing inverters by state.", (double)index.inverters_idle, labels + ",state=\"idle\"");
     r.gauge("luxir_inverters", "Indexing inverters by state.", (double)index.inverters_flushing, labels + ",state=\"flushing\"");
     r.counter("luxir_index_commits_total", "Commits since the writer opened.", (double)index.commits, labels);
+    r.counter("luxir_merge_reclaims_total", "Merges started to reclaim deletes of segments the merge policy no longer merges.", (double)index.reclaim_merges, labels);
     r.gauge("luxir_index_retained_delete_bytes", "Delete packets retained by the writer, counted once per packet.", (double)index.retained_delete_bytes, labels);
     if (c.activity) collectionActivity(r, *c.activity, labels);
     cache(r, index.query_cache, labels);

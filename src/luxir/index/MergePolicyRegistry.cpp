@@ -38,7 +38,8 @@ std::vector<std::string> MergePolicyRegistry::names() const {
 }
 
 std::unique_ptr<MergePolicy> MergePolicyRegistry::make(std::string_view name, const ParamReader::Entries& params,
-                                                       int32_t nodeMergeFactor) const {
+                                                       int32_t nodeMergeFactor, const MergeLimits& limits) const {
+  if (name.empty()) name = DEFAULT_POLICY;
   auto it = makers.find(name);
   if (it == makers.end()) {
     std::string valid;
@@ -46,22 +47,49 @@ std::unique_ptr<MergePolicy> MergePolicyRegistry::make(std::string_view name, co
     throw std::invalid_argument("unknown merge policy '" + std::string(name) + "'; valid policies: " + valid);
   }
   ParamReader reader("merge_policy '" + it->first + "'", params);
-  auto policy = it->second(MergePolicyContext{reader, nodeMergeFactor});
+  auto policy = it->second(MergePolicyContext{reader, nodeMergeFactor, limits});
   reader.rejectUnknown();
   if (!policy) throw std::logic_error("merge policy maker '" + it->first + "' returned null");
   return policy;
 }
 
-std::unique_ptr<MergePolicy> MergePolicyRegistry::make(const MergePolicySpec* spec, int32_t nodeMergeFactor) const {
-  if (!spec) return make(DEFAULT_POLICY, {}, nodeMergeFactor);
-  return make(spec->def.name, spec->def.params, nodeMergeFactor);
+std::unique_ptr<MergePolicy> MergePolicyRegistry::make(const MergePolicySpec* spec, int32_t nodeMergeFactor,
+                                                       const MergeLimits& limits) const {
+  if (!spec) return make(DEFAULT_POLICY, {}, nodeMergeFactor, limits);
+  return make(spec->def.name, spec->def.params, nodeMergeFactor, limits);
+}
+
+MergeLimits resolveMergeLimits(const api::MergePolicyDef* def, bool remote, bool vectors) {
+  MergeLimits limits;
+  if (remote) {
+    limits.maxMergedSegmentBytes = MergeLimits::REMOTE_MAX_BYTES;
+    limits.maxMergedSegmentDocs = MergeLimits::REMOTE_MAX_DOCS;
+  } else if (vectors) {
+    limits.maxMergedSegmentBytes = MergeLimits::VECTOR_MAX_BYTES;
+    limits.maxMergedSegmentDocs = MergeLimits::VECTOR_MAX_DOCS;
+  }
+  if (def) {
+    if (def->max_merged_segment_bytes) limits.maxMergedSegmentBytes = *def->max_merged_segment_bytes;
+    if (def->max_merged_segment_docs) limits.maxMergedSegmentDocs = (int64_t)*def->max_merged_segment_docs;
+    if (def->deletes_pct_allowed) limits.deletesPctAllowed = (int32_t)*def->deletes_pct_allowed;
+  }
+  return limits;
+}
+
+void validateMergeLimits(const api::MergePolicyDef& def) {
+  if (def.max_merged_segment_docs && *def.max_merged_segment_docs > (uint64_t)INT32_MAX) {
+    throw std::invalid_argument("max_merged_segment_docs must be at most 2147483647 (0 = unlimited)");
+  }
+  if (def.deletes_pct_allowed && (*def.deletes_pct_allowed < 1 || *def.deletes_pct_allowed > 100)) {
+    throw std::invalid_argument("deletes_pct_allowed must be from 1 to 100 (100 never rewrites for deletes)");
+  }
 }
 
 void registerBuiltinMergePolicies(MergePolicyRegistry& registry) {
   registry.add(std::string(TieredMergePolicy::NAME), [](const MergePolicyContext& ctx) {
     int64_t factor = ctx.params.getInt("merge_factor", ctx.nodeMergeFactor);
     if (factor < 2 || factor > INT32_MAX) ctx.params.fail("merge_factor", "must be an integer from 2 to 2147483647");
-    return std::make_unique<TieredMergePolicy>((int32_t)factor);
+    return std::make_unique<TieredMergePolicy>((int32_t)factor, ctx.limits);
   });
 }
 

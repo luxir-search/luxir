@@ -105,6 +105,9 @@ public:
   // Policy merges: the flushed segment whose arrival made the merge due, or 0
   // when any due merge may run (after a merge, or when policy merges resume).
   uint64_t triggerSegId = 0;
+  // A writer delete-reclaim merge (IndexWriter::_selectReclaimMergeLocked)
+  // rather than one the policy chose.
+  bool reclaim = false;
 };
 
 }

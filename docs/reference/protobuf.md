@@ -1528,6 +1528,7 @@ Indexing RAM budget: the configured limit and the bytes reserved against it.
 | <a id="field-luxir.indexstats.inverters_flushing"></a>[`inverters_flushing`](#field-luxir.indexstats.inverters_flushing) | 17 | `uint64` | singular |  |
 | <a id="field-luxir.indexstats.commits"></a>[`commits`](#field-luxir.indexstats.commits) | 18 | `uint64` | singular | writer only: commits since the writer opened |
 | <a id="field-luxir.indexstats.retained_delete_bytes"></a>[`retained_delete_bytes`](#field-luxir.indexstats.retained_delete_bytes) | 19 | `uint64` | singular | Writer only: resident delete packets held by its pending set or merge catch-up, deduplicated across owners. Included in the node indexing reservation. |
+| <a id="field-luxir.indexstats.reclaim_merges"></a>[`reclaim_merges`](#field-luxir.indexstats.reclaim_merges) | 20 | `uint64` | singular | Writer only: merges started to reclaim the deletes of segments the merge policy no longer merges (MergePolicyDef.deletes\_pct\_allowed). |
 
 <a id="message-luxir.jemallocstats"></a>
 
@@ -1668,14 +1669,17 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 
 ### luxir.MergePolicyDef
 
-A merge policy selection (SchemaDef.merge\_policy).
+A merge policy selection (SchemaDef.merge\_policy) and the size limits the collection's merges respect under any policy.
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.mergepolicydef.name"></a>[`name`](#field-luxir.mergepolicydef.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.mergepolicydef.name"></a>[`name`](#field-luxir.mergepolicydef.name) | 1 | `string` | singular | empty selects "tiered" |
 | <a id="field-luxir.mergepolicydef.params"></a>[`params`](#field-luxir.mergepolicydef.params) | 2 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | Typed params, read by the policy's maker. "tiered" takes merge\_factor: the number of same-level segments that merge into one (&gt;= 2). |
+| <a id="field-luxir.mergepolicydef.max_merged_segment_bytes"></a>[`max_merged_segment_bytes`](#field-luxir.mergepolicydef.max_merged_segment_bytes) | 3 | `uint64` | optional | Live bytes a background merge may produce (0 = unlimited). A segment over half of either cap takes no further part in tiered merges. Absent: 1 GiB on a remote directory, else 32 GiB when the schema has a vector field, else 5 GiB. Bytes are the segment's own data files prorated by its live docs; shared stored source files do not count. For multi-TB collections, raise it to about the collection's live bytes / 128 (a power of two, 5 to 64 GiB) to keep the segment count near a hundred. |
+| <a id="field-luxir.mergepolicydef.max_merged_segment_docs"></a>[`max_merged_segment_docs`](#field-luxir.mergepolicydef.max_merged_segment_docs) | 4 | `uint64` | optional | Live docs a background merge may produce (0 = unlimited, at most 2147483647). Absent: 10M on a remote directory, else 8M with a vector field, else 50M. |
+| <a id="field-luxir.mergepolicydef.deletes_pct_allowed"></a>[`deletes_pct_allowed`](#field-luxir.mergepolicydef.deletes_pct_allowed) | 5 | `uint32` | optional | A segment no longer merged by the policy is rewritten once more than this percent of its docs are deleted (1 to 100; 100 never rewrites). Absent: 20. Not applied on a remote directory yet. |
 
 <a id="message-luxir.multimatchquery"></a>
 
@@ -2397,6 +2401,7 @@ Ids and generations that appear in filenames are reported in their filesystem sp
 | <a id="field-luxir.segmentstats.overlays"></a>[`overlays`](#field-luxir.segmentstats.overlays) | 13 | [`AuxStats`](#message-luxir.auxstats) | repeated |  |
 | <a id="field-luxir.segmentstats.bytes"></a>[`bytes`](#field-luxir.segmentstats.bytes) | 14 | `uint64` | singular |  |
 | <a id="field-luxir.segmentstats.spaces"></a>[`spaces`](#field-luxir.segmentstats.spaces) | 15 | [`RowSpaceStats`](#message-luxir.rowspacestats) | repeated | non-root spaces; bytes already included in the segment |
+| <a id="field-luxir.segmentstats.terminal"></a>[`terminal`](#field-luxir.segmentstats.terminal) | 16 | `bool` | singular | Over half of a merge cap (MergePolicyDef): background merges no longer select it; deletes past deletes\_pct\_allowed rewrite it. |
 
 <a id="message-luxir.servicestats"></a>
 

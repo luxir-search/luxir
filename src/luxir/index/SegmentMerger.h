@@ -871,6 +871,11 @@ private:
     return total;
   }
 
+public:
+  static bool isStoredField(const DecodedFieldRecord& info) {
+    return FieldType::storage(info.type) == FieldType::Storage::BIN && (info.flags & FieldType::STORED) != 0;
+  }
+
   static bool hasOneDimensionalPoints(FieldType::Type type, int32_t flags) {
     return FieldType::isNumericColumn(type) && (flags & FieldType::INDEX_RANGE) != 0;
   }
@@ -901,16 +906,22 @@ private:
     return false;
   }
 
-  static void batchTypeAndFlags(std::span<const MergeFieldInfo> fields, FieldType::Type& type, int32_t& allFlags) {
+  static const DecodedFieldRecord& infoOf(const MergeFieldInfo& field) { return *field.record; }
+  static const DecodedFieldRecord& infoOf(const FieldRecordPtr& record) { return *record; }
+  static const DecodedFieldRecord& infoOf(const DecodedFieldRecord* record) { return *record; }
+
+  template <class Infos>
+  static void batchTypeAndFlags(const Infos& fields, FieldType::Type& type, int32_t& allFlags) {
     type = FieldType::Type::NONE;
     allFlags = 0;
     bool allIndexed = true;
-    for (const auto& field : fields) {
+    for (const auto& entry : fields) {
+      const DecodedFieldRecord& info = infoOf(entry);
       if (type == FieldType::Type::NONE) {
-        type = field.record->type;
+        type = info.type;
       }
-      allFlags |= field.record->flags;
-      if (field.record->numValues != 0 && !(field.record->flags & FieldType::INDEX_DOCS)) allIndexed = false;
+      allFlags |= info.flags;
+      if (info.numValues != 0 && !(info.flags & FieldType::INDEX_DOCS)) allIndexed = false;
     }
     // Numeric postings are an optional complete acceleration of the column.
     // A mode change can leave inputs without postings; their values must not
@@ -945,7 +956,23 @@ private:
       return MergeCostModel::storedFieldsBytes(maxChunkBytes)
           + StoredChunkCompressor::contextBytes(format, maxChunkBytes);
     }
+    return estimateFieldCost(fields, {space.maxDoc, ordMapSpillMinBytes, space.ordinal == SpaceOrdinal::ROOT,
+                                      postingsWriter.idFilterOptions});
+  }
 
+  // Merge-wide inputs to a field's cost, beside its sources' infos.
+  struct FieldCostContext {
+    int64_t mergedMaxDoc;
+    int64_t ordMapSpillMinBytes = MergeCostModel::ORD_MAP_SPILL_MIN_BYTES;
+    bool rootSpace = false;
+    IdFilter::Options idFilter;
+  };
+
+  // RAM a non-stored field's merge holds at its peak, from its sources' infos
+  // (MergeFieldInfo or FieldRecordPtr). Merge selection prices candidates with
+  // it before a merger exists.
+  template <class Infos>
+  static int64_t estimateFieldCost(const Infos& fields, const FieldCostContext& context) {
     FieldType::Type type;
     int32_t allFlags;
     batchTypeAndFlags(fields, type, allFlags);
@@ -957,14 +984,15 @@ private:
     int64_t sourceTerms = 0;
     bool ordColumn = true;
     bool replay = false;
-    for (const auto& field : fields) {
-      sourceTerms += field.record->indexedTotals().numTerms;
-      ordColumn = ordColumn && mergesOrdColumn(*field.record);
-      replay = replay || replaysOrdColumn(*field.record);
-      docsWithField += field.record->docsWithField;
-      auto values = field.record->numValues;
+    for (const auto& entry : fields) {
+      const DecodedFieldRecord& info = infoOf(entry);
+      sourceTerms += info.indexedTotals().numTerms;
+      ordColumn = ordColumn && mergesOrdColumn(info);
+      replay = replay || replaysOrdColumn(info);
+      docsWithField += info.docsWithField;
+      auto values = info.numValues;
       numValues += values;
-      if (!field.record->points()) synthesizedPointValues += values;
+      if (!info.points()) synthesizedPointValues += values;
     }
     // Indexes rebuilt beside the values: points, and a root id dictionary's
     // filter, which a staged charge covers again while it lives.
@@ -975,8 +1003,8 @@ private:
           ? MergeCostModel::geoPointsBytes(numValues)
           : hasRangePoints(type, allFlags)
             ? MergeCostModel::rangePointsBytes(numValues) : 0;
-    if (type == FieldType::ID && space.ordinal == SpaceOrdinal::ROOT) {
-      rebuiltBytes += (int64_t)IdFilter::buildBytes(postingsWriter.idFilterOptions, (uint64_t)space.maxDoc);
+    if (type == FieldType::ID && context.rootSpace) {
+      rebuiltBytes += (int64_t)IdFilter::buildBytes(context.idFilter, (uint64_t)context.mergedMaxDoc);
     }
     int64_t termIndexBytes = (allFlags & FieldType::INDEX_DOCS) != 0
         ? MergeCostModel::termIndexBytes(sourceTerms, Postings::TERMS_BLOCK_SIZE) : 0;
@@ -987,9 +1015,9 @@ private:
       // only per-source term ord maps.
       if (replay) {
         int64_t mapBytes = 0;
-        for (const auto& field : fields) mapBytes += (field.record->indexedTotals().numTerms + 1) * sizeof(uint32_t);
+        for (const auto& entry : fields) mapBytes += (infoOf(entry).indexedTotals().numTerms + 1) * (int64_t)sizeof(uint32_t);
         // Spilled maps are mapped page cache; the heap keeps a write buffer each.
-        if (mapBytes >= ordMapSpillMinBytes) {
+        if (mapBytes >= context.ordMapSpillMinBytes) {
           mapBytes = (int64_t)fields.size() * (int64_t)ScratchFile::DEFAULT_BUFFER_BYTES;
         }
         // Mapped source runs stream directly; only maps and codec plans grow.
@@ -1001,7 +1029,7 @@ private:
       // Single-valued columns hold the term-order -> doc-order transposition
       // in RAM until the postings pass finishes: OrdCollector's
       // ords[mergedMaxDoc] (int32).
-      return (int64_t)space.maxDoc * 4
+      return context.mergedMaxDoc * 4
           + MergeCostModel::LIGHT_BYTES + rebuiltBytes + termIndexBytes;
     }
     if (storage == FieldType::Storage::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
@@ -1012,6 +1040,8 @@ private:
     // Int/str/vector columns and stored fields stream through fixed block buffers.
     return MergeCostModel::LIGHT_BYTES + rebuiltBytes + termIndexBytes;
   }
+
+private:
 
   // In postings and values processed. A merged term is a heap step over the
   // sources plus per-term encoding, worth many postings.
