@@ -92,6 +92,7 @@ bool appendMappedSelector(SearchRequest& req, IndexReader& reader, std::string_v
     }
     if (name.find('.') != std::string_view::npos) selectorError(selector, "up then down is not supported; select the ancestor's own fields");
     if (name == "_score_") selectorError(selector, "an ancestor has no score in this result");
+    if (name == "_sort_") selectorError(selector, "an ancestor has no sort values in this result");
     auto& target = *req.pinView(path);
     std::vector<ReturnField> inner;
     std::string_view selectors[]{name};
@@ -135,6 +136,7 @@ bool appendMappedSelector(SearchRequest& req, IndexReader& reader, std::string_v
   if (dot != std::string_view::npos) {
     auto inner = name.substr(dot + 1);
     if (inner == "_score_") selectorError(selector, "a child row has no score in this result");
+    if (inner == "_sort_") selectorError(selector, "a child row has no sort values in this result");
     std::string_view selectors[]{inner};
     std::vector<ReturnField> additions;
     appendReturnFields(req, child, selectors, additions);
