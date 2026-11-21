@@ -1783,7 +1783,7 @@ public:
 
       FacetBucketBlockExecutor::execute<std::string_view>(
           *this, children, buckets, *op.view,
-          FacetBucketProducer::INDEPENDENT,
+          FacetBucketProducer::INDEPENDENT, FacetBucketConcurrency::BUCKETS,
           [&](size_t segnum, auto block, FacetBucketFeed feed) {
             for (size_t i = 0; i < block.size(); i++) {
               feed(i, ordColumnDomains

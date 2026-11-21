@@ -144,6 +144,18 @@ struct BucketDomainPlan {
   Query::PlanningContext* planning = nullptr;
 };
 
+// How a parallel facet bucket executor may feed result-stage bucket bindings
+// (FacetBucketBlockExecutor). Ordered from most to least restrictive.
+enum class FacetBucketConcurrency : uint8_t {
+  // One binding at a time, segments in order.
+  SERIAL,
+  // Distinct segments concurrently, but one binding of the op per segment at
+  // a time: the per-segment contract of a top-level calcAll fan-out.
+  SEGMENTS,
+  // Also distinct bindings on the same segment concurrently.
+  BUCKETS
+};
+
 struct InputDomainPlan {
   RowRelation::Mapping mapping;
   DomainVariantPlan variants;
@@ -180,8 +192,10 @@ public:
     }
   }
 
-  // Bucket blocks execute synchronously. Segment tasks otherwise own distinct
-  // slots; a retained ancestor also covers Fusion sources and nested children.
+  // Segment tasks own distinct slots. A parallel bucket block changes a
+  // segment's slot only from the coordinator around its fan-out, or from the
+  // one task that feeds that segment. A retained ancestor also covers Fusion
+  // sources and nested children.
   bool segmentStateRetained(IndexReader::Segment& segment) const noexcept {
     for (auto* owner = this; owner != nullptr; owner = owner->parent) {
       if (owner->segmentStateRetentions[(size_t)segment.ord] != 0) return true;
@@ -261,6 +275,25 @@ public:
     return std::ranges::any_of(subOps, [](const auto& entry) {
       return entry.second->facetBucketSharesSegmentState();
     });
+  }
+
+  // How bindings of this op tolerate parallel result-stage delivery. SERIAL
+  // is the safe default. An op with result children of its own runs nested
+  // bindings over every segment when a binding completes, so it stays
+  // SERIAL; so does one that gathers complete inputs. SEGMENTS needs the
+  // op's shared state (query weights, multiterm expansions, filter uses) to
+  // be safe for distinct segments at once, as at the top level. BUCKETS
+  // additionally needs bindings to touch only their own state and immutable
+  // op state on a segment another binding is reading.
+  virtual FacetBucketConcurrency facetBucketConcurrency() const {
+    return FacetBucketConcurrency::SERIAL;
+  }
+
+  // Whether a binding completes from its own segment feeds alone: no result
+  // children, no gathered complete input, no structural scope.
+  bool facetBucketSegmentLocal() const {
+    return subOps.empty() && bucketDomain == nullptr && !needsStructuralScope
+        && !needsCompleteBucketInput();
   }
 
   // A descendant that gathers segment inputs may ask for earlier structural
