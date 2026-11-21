@@ -40,7 +40,7 @@ protected:
       field.metric = api::VectorMetric::L2; field.dims = 4; field.ann = ann;
     }
     schema.set(helper.collection());
-    helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+    helper.getIndexWriter()->setMergeFactor(100);
   }
 
   void add(std::string_view json, bool commit = false) {

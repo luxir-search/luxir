@@ -510,7 +510,7 @@ public:
 
 TEST_F(GrpcIndexTest, maxSegmentsCommitDurablyPublishesMergedLayout) {
   CollectionHelper helper("main");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   for (int i = 0; i < 3; i++) {
     helper.index(flatdoc("id", "grpc-merge-" + std::to_string(i)), UpdateMessage::COMMIT);
   }

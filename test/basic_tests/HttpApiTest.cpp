@@ -1384,7 +1384,7 @@ TEST_F(HttpApiTest, updateResponseUsesSnakeCase) {
 }
 
 TEST_F(HttpApiTest, bufferedMaxSegmentsCommitDurablyPublishesMergedLayout) {
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   for (int i = 0; i < 3; i++) {
     helper.index(flatdoc("id", "http-buffered-merge-" + std::to_string(i)), UpdateMessage::COMMIT);
   }
@@ -1397,7 +1397,7 @@ TEST_F(HttpApiTest, bufferedMaxSegmentsCommitDurablyPublishesMergedLayout) {
 }
 
 TEST_F(HttpApiTest, ndjsonEndMaxSegmentsCommitDurablyPublishesMergedLayout) {
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   for (int i = 0; i < 3; i++) {
     helper.index(flatdoc("id", "http-ndjson-merge-" + std::to_string(i)), UpdateMessage::COMMIT);
   }
@@ -2610,7 +2610,7 @@ TEST_F(HttpApiTest, jsonUrlCommitOverridesDeferredBodyCommit) {
 }
 
 TEST_F(HttpApiTest, jsonUrlCommitKeepsBodyCommitOptions) {
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   for (int i = 0; i < 3; i++) {
     helper.index(flatdoc("id", "http-url-commit-merge-" + std::to_string(i)), UpdateMessage::COMMIT);
   }
@@ -4188,7 +4188,7 @@ TEST_F(HttpApiTest, adaptiveZeroMatchesSerialAfterBackpressure) {
   LuxirTest::clearCollection("http_bp");
   FanoutGrainGuard grain(1);
   CollectionHelper ch("http_bp");
-  ch.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  ch.getIndexWriter()->setMergeFactor(100);
   auto docs = backpressureDocs();
   for (size_t first = 0; first < docs.size(); first += 400) {
     ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs).subspan(first, 400),
