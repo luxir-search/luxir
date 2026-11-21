@@ -116,8 +116,10 @@ std::vector<ExtraColumn> TopDocsReq::rowColumns() {
         result.row_count = (int32_t)selected.size();
         auto placement = op.topDocsProto.document_format;
         if (placement == api::DocFormat::DEFAULT) placement = op.req.docFormatDefault;
+        DocSortValues sortValues;
+        if (sorted) sortValues = sortValuesUnder(op.sortPlan, target, op.flags);
         loadDocuments(response, target, selected, fields, result, memory,
-            {op.flags, {}, placement, fields.size() + 1, 0, op.topDocsProto.get_scores, &memory},
+            {op.flags, {}, placement, fields.size() + 1, 0, op.topDocsProto.get_scores, &memory, &sortValues},
             [&](int64_t i) { return selectedScores[(size_t)i]; }, scratch);
         previous = bounds;
         previousValue = values[row];
