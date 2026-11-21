@@ -3,6 +3,8 @@
 
 #include <gtest/gtest.h>
 
+#include <faiss/IndexFlat.h>
+#include <faiss/IndexIVFFlat.h>
 #include <faiss/IndexIVFRaBitQ.h>
 #include <faiss/impl/DistanceComputer.h>
 #include <faiss/impl/RaBitQuantizer.h>
@@ -2766,6 +2768,47 @@ TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
   req->done();
 }
 
+// A boolean filter around a kNN clause is materialized per segment during
+// prepare, concurrently for a request that publishes every task; the result
+// must match the serial run.
+TEST_F(KnnQueryTest, booleanFilterDomainsParallelMatchesSerial) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, std::nullopt, 4);
+  for (int seg = 0; seg < 4; seg++) {
+    for (int i = 0; i < 20; i++) {
+      int n = seg * 20 + i;
+      h.index(flatdoc("id", std::to_string(n), "foo_w", n == 39 ? "apple banana" : n % 3 == 0 ? "apple" : "pear",
+                      "embedding_v", std::vector<float>{(float)n, 0.0f, 0.0f, 0.0f}));
+    }
+    h.commit();
+  }
+  h.deleteByIds(std::vector<std::string>{"21", "42"}, UpdateMessage::COMMIT);
+  ASSERT_EQ(4u, h.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+
+  auto run = [&](bool parallel) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.getScores().limit(10).countLimit().fields({"id"});
+    cur.rawQuery() = qb::boolean(cur.mr(),
+        /*required=*/{qb::knn(cur.mr(), "embedding_v", {40.2f, 0.0f, 0.0f, 0.0f}, 6)},
+        /*optional=*/{}, /*prohibited=*/{qb::match(cur.mr(), "foo_w", "banana")},
+        /*filter=*/{qb::match(cur.mr(), "foo_w", "apple")});
+    req->execute(parallel);
+    auto out = std::make_pair(resultIds(*req), resultScores(*req));
+    req->done();
+    return out;
+  };
+  auto serial = run(false);
+  auto parallel = run(true);
+  ASSERT_EQ(serial.first.size(), 6u);
+  EXPECT_EQ(serial.first, parallel.first);
+  EXPECT_EQ(serial.second, parallel.second);
+  for (const auto& id : serial.first) {
+    EXPECT_EQ(std::stoi(id) % 3, 0) << id;
+    EXPECT_NE("39", id);
+  }
+}
+
 // Unfiltered queries on a segment with deletes use the rank-space liveness
 // bitmap as the whole FAISS selector, built ONCE per liveDocs generation and
 // cached on LiveDocs: a second query must not rebuild it, and a commit
@@ -2816,19 +2859,47 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
     for (const auto& id : ids) EXPECT_NE(id, deletedId);
   };
 
+  auto walks = [] { return KnnQuery::listLiveCountsForTests.load(std::memory_order_relaxed); };
   int64_t builds0 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  int64_t walks0 = walks();
   runAndCheck("d40");
   int64_t builds1 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  int64_t walks1 = walks();
   EXPECT_EQ(builds1, builds0 + 1) << "first query builds the bitmap";
+  EXPECT_GT(walks1, walks0) << "first query counts its lists' live sizes";
   runAndCheck("d40");
   int64_t builds2 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
   EXPECT_EQ(builds2, builds1) << "second query must reuse the cached bitmap";
+  EXPECT_EQ(walks(), walks1) << "second query must reuse the memoized list counts";
 
   std::vector<std::string> dels2{"d41"};
   h.deleteByIds(dels2, UpdateMessage::COMMIT);
   runAndCheck("d41");
   int64_t builds3 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
   EXPECT_EQ(builds3, builds2 + 1) << "new liveGen must rebuild the bitmap";
+  int64_t walks3 = walks();
+  EXPECT_GT(walks3, walks1) << "new liveGen must recount list sizes";
+
+  // A rebuilt overlay reassigns lists over the same live bits: its counts
+  // are keyed apart from the old overlay's.
+  auto overlay = [&] {
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    EXPECT_EQ(reader->segments().size(), 1u);
+    auto aux = reader->segments()[0].getAuxReader("vec.embedding_v");
+    EXPECT_NE(aux, nullptr);
+    return std::pair{aux ? aux->getGen() : 0, reader->segments()[0].liveDocsShared()};
+  };
+  auto [gen0, live0] = overlay();
+  ASSERT_TRUE(h.getIndexWriter()->testDropSegmentOverlay("vec.embedding_v", 0));
+  h.commit();
+  h.commit({"vec.embedding_v"});
+  auto [gen1, live1] = overlay();
+  ASSERT_NE(gen1, gen0);
+  ASSERT_EQ(live1, live0) << "rebuild must keep the live bits";
+  runAndCheck("d41");
+  EXPECT_EQ(KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed), builds3)
+      << "same live bits keep the bitmap";
+  EXPECT_GT(walks(), walks3) << "a rebuilt overlay must recount list sizes";
 }
 
 TEST_F(KnnQueryTest, deleteCommitReleasesSupersededLiveDocs) {
@@ -5389,7 +5460,10 @@ TEST_F(KnnQueryTest, completionPreviewPreservesAllocationAndPins) {
       } else {
         EXPECT_EQ(expected, resultIds(*req));
         ASSERT_EQ(baseline.size(), rounds.size());
-        EXPECT_EQ(allocatorEntries, stats.work.allocatorEntries);
+        // List live counts are memoized across queries, so this run walks
+        // no list ids: preview must not reach lists dispatch never did.
+        if (!nprobe) { EXPECT_GT(allocatorEntries, 0); }
+        EXPECT_EQ(0, stats.work.allocatorEntries);
         for (size_t r = 0; r < rounds.size(); r++) {
           EXPECT_EQ(baseline[r].kind, rounds[r].kind);
           EXPECT_EQ(baseline[r].target, rounds[r].target);
@@ -5704,4 +5778,48 @@ TEST_F(KnnQueryTest, candidateCapStillAdmitsLaterExactHits) {
   EXPECT_EQ((std::vector<std::string>{"flat"}), resultIds(*req));
   ASSERT_EQ(1u, resultScores(*req).size());
   EXPECT_FLOAT_EQ(1 + 1.0f / 101, resultScores(*req)[0]);
+}
+
+// The lazy coarse ranking must reproduce FAISS's full k = nlist quantizer
+// search exactly (distances and order, ties included), however far it has
+// been advanced.  Duplicate centroids force exact distance ties on both
+// FAISS result paths (heap below 100 lists, reservoir above).
+TEST(KnnCoarseRanking, lazyRankingMatchesFullQuantizerSearch) {
+  constexpr int d = 8;
+  std::mt19937 rng(7);
+  std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+  for (auto metric : {faiss::METRIC_L2, faiss::METRIC_INNER_PRODUCT}) {
+    for (int nlist : {1, 50, 300}) {
+      faiss::IndexFlat quantizer(d, metric);
+      std::vector<float> centroids;
+      for (int j = 0; j < nlist; j++) {
+        if (j % 3 == 2) {
+          std::vector<float> prev(centroids.end() - d, centroids.end());
+          centroids.insert(centroids.end(), prev.begin(), prev.end());
+        } else {
+          for (int c = 0; c < d; c++) centroids.push_back(uni(rng));
+        }
+      }
+      quantizer.add(nlist, centroids.data());
+      faiss::IndexIVFFlat ivf(&quantizer, d, (size_t)nlist, metric);
+      for (int q = 0; q < 5; q++) {
+        std::vector<float> query(d);
+        for (auto& x : query) x = uni(rng);
+        std::vector<faiss::idx_t> ids((size_t)nlist);
+        std::vector<float> dists((size_t)nlist);
+        quantizer.search(1, query.data(), nlist, dists.data(), ids.data());
+        auto ranking = KnnQuery::rankCentroids(ivf, query.data());
+        ASSERT_EQ(ranking.ranked, 0u) << "a flat quantizer ranks lazily";
+        ASSERT_EQ(ranking.entries.size(), (size_t)nlist);
+        for (size_t i = 0; i < (size_t)nlist; i++) {
+          ASSERT_TRUE(ranking.valid(i));
+          ASSERT_EQ(ranking.entries[i].listId, ids[i])
+              << "metric " << (int)metric << " nlist " << nlist << " rank " << i;
+          ASSERT_EQ(std::bit_cast<uint32_t>(ranking.entries[i].dist),
+                    std::bit_cast<uint32_t>(dists[i]));
+        }
+        EXPECT_FALSE(ranking.valid((size_t)nlist));
+      }
+    }
+  }
 }

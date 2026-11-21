@@ -569,11 +569,20 @@ distance, then probes the globally best lists until the requested scan
 fraction is reached. List cost is based on that list's live vector count
 divided by the live vector count of the IVF slots actually searched. Flat
 slots and empty filtered segments do not consume that budget. This handles
-uneven list sizes and avoids applying equal work to every segment. For an IVF segment with deletions
+uneven list sizes and avoids applying equal work to every segment. Each
+segment's centroid distances are computed in full but ordered lazily: the
+ranking is extended by partial selection only as far as the allocator's cursor
+reaches, in the same total order (distance, then list id) a full FAISS
+quantizer search produces. For an IVF segment with deletions
 the live count is exact: it rides along with the segment's cached
 rank-liveness bitmap, which is rebuilt per delete generation in time
 proportional to the deleted docs (for a dense single-valued field the bitmap
-simply borrows the liveDocs bits). Filtered flat-scanned segments with deletions use a
+simply borrows the liveDocs bits). Per-list live counts are memoized next to
+that bitmap, per ANN overlay: the first query to price a list under a delete
+generation reads the list's ids and counts them, later queries reuse the
+count. Without this every query under deletes would read the ids of every
+list it prices, which on a lazily fetched overlay means a remote read per
+list. Filtered flat-scanned segments with deletions use a
 cheap upper bound for their live count instead. It contributes only to the whole-index reference breadth; the IVF
 allocation denominator uses exact live counts.
 
