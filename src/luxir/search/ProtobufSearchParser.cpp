@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/search/ProtobufSearchParser.h"
+#include "luxir/query/QueryPruning.h"
 
 #include "luxir/util/proto.h"
 #include <algorithm>
@@ -130,6 +131,16 @@ struct SearchParserImpl {
   std::span<ParsedFilter>* owningList = nullptr;
   std::string_view owningListChild;
   std::vector<std::shared_ptr<const FacetGroupPlan>> facetGroupPlans;
+  // Summary evidence for the request, memoized per query.
+  // Segment pruning is per view: a child space's segments carry no summary,
+  // so its masks prove nothing, but they must be sized by its own segments.
+  std::map<const IndexReader*, std::unique_ptr<QueryPruning>> prunings;
+  QueryPruning& pruningOf() {
+    auto& slot = prunings[view().get()];
+    if (!slot) slot = std::make_unique<QueryPruning>(*view());
+    return *slot;
+  }
+  ExecutionProfileOpState* pruningProfile = nullptr;
   // Root-level ops are depth 1. Ops nested past the configured cap are rejected
   // in addSubs, the single funnel for op recursion.
   const int maxOpDepth;
@@ -228,6 +239,73 @@ public:
     : req(req), parseView(*req.schema, req.resolvedFields, &req.reader, &req), maxOpDepth(req.searchConfig.max_op_depth) {
   }
 
+  // The segments variant `variant` of `plan` may hold: an inheriting variant
+  // starts from `inherited` (the producing op's own matches), a resetting one
+  // from its reset query; both narrow by their routed parent filters and
+  // extra domain filters.
+  SegmentMask variantMask(const DomainVariantPlan& plan, size_t variant,
+                          const SegmentMask& inherited, std::span<const ParsedFilter> filters) {
+    SegmentMask mask = plan.frame(variant) == DomainVariantPlan::Frame::INHERIT
+        ? inherited : pruningOf().viable(*plan.sourceQuery(plan.resetSource(variant)));
+    for (size_t i = 0; i < filters.size(); i++) {
+      if (plan.includesFilter(variant, i)) mask &= pruningOf().viable(*filters[i].query);
+    }
+    for (size_t source : plan.extraSources(variant)) mask &= pruningOf().viable(*plan.sourceQuery(source));
+    return mask;
+  }
+
+  // A TopDocs op's root mask: its query and every filter for its own
+  // matches, widened by every domain variant it produces for its children,
+  // so a segment is pruned only when nothing the op computes can hold a
+  // document there.
+  SegmentMask topDocsMask(Query& query, std::span<const ParsedFilter> filters,
+                          const DomainVariantPlan& plan) {
+    SegmentMask own = pruningOf().viable(query);
+    SegmentMask mask = own;
+    for (const auto& filter : filters) mask &= pruningOf().viable(*filter.query);
+    for (size_t variant = 1; variant < plan.variantCount(); variant++) {
+      mask |= variantMask(plan, variant, own, filters);
+    }
+    return mask;
+  }
+
+  // Explain notes and the "pruning" profile op, only when `op` pruned a
+  // segment. `roots` are the queries whose proofs name the reason.
+  void reportPruning(const SearchOp& op, std::span<Query* const> roots) {
+    if (!op.viable.prunesAny()) return;
+    bool explain = req.resolvedFields != nullptr;
+    if (pruningProfile == nullptr) pruningProfile = req.addExecutionProfileOp("pruning");
+    if (!explain && pruningProfile == nullptr) return;
+    auto* run = req.addExecutionProfileRun(pruningProfile);
+    for (const auto& segment : view()->segments()) {
+      size_t ord = (size_t)segment.ord;
+      bool pruned = !op.viable.test(ord);
+      std::string why;
+      if (pruned) {
+        for (Query* root : roots) {
+          if (!pruningOf().viable(*root).test(ord)) {
+            why = pruningOf().reason(*root, ord);
+            break;
+          }
+        }
+        if (why.empty()) why = "no child domain may match";
+        if (explain) {
+          req.resolvedFields->push_back(fmt::format("op {}: pruned segment {} (ord {}): {}", op.name,
+                                                    segment.segInfo.seg_id, ord, why));
+        }
+      }
+      if (run != nullptr) {
+        auto& piece = run->pieces[ord];
+        piece.wire.kind = "segment";
+        piece.wire.segment = (int32_t)ord;
+        piece.wire.max_doc = segment.maxDoc();
+        piece.wire.strategy = pruned ? "pruned" : "viable";
+        if (pruned) piece.details.push_back(fmt::format("op {}: {}", op.name, why));
+        piece.complete = true;
+      }
+    }
+  }
+
   // Every planning context of the request draws on one multi-term budget.
   Query::PlanningContext* createPlanningContext() {
     return req.createPlanningContext(*view());
@@ -269,6 +347,10 @@ public:
             &req.arena, *rootOp.planning);
         rootOp.domainVariants.buildWeights(
             *rootOp.weightContext, *rootOp.planning, 0);
+        rootOp.variantViable.resize(rootOp.domainVariants.variantCount());
+        for (size_t variant = 1; variant < rootOp.variantViable.size(); variant++) {
+          rootOp.variantViable[variant] = variantMask(rootOp.domainVariants, variant, SegmentMask{}, {});
+        }
       }
     }
     addSubs(rootOp, req.proto.ops, 0, OpsPlacement::REQUEST_ROOT);
@@ -2484,10 +2566,22 @@ public:
     } else if (placement == TopDocsPlacement::FUSION_SOURCE && !topDocsReq.decorate.empty()) {
       throw RequestError("fusion sources cannot decorate; put decorate on fusion");
     }
+    qr->viable = topDocsMask(*query, filters, qr->domainVariants);
+    qr->membershipViable = pruningOf().membership(*query);
+    // A fusion source reports once the fusion's shared filters joined its mask.
+    if (placement != TopDocsPlacement::FUSION_SOURCE) reportPruning(*qr, pruningRoots(*query, filters, {}));
     if (firstQuery == nullptr) {
       firstQuery = qr;
     }
     return qr;
+  }
+
+  std::vector<Query*> pruningRoots(Query& query, std::span<const ParsedFilter> filters,
+                                   std::span<const ParsedFilter> sharedFilters) {
+    std::vector<Query*> roots{&query};
+    for (const auto& filter : filters) roots.push_back(filter.query);
+    for (const auto& filter : sharedFilters) roots.push_back(filter.query);
+    return roots;
   }
 
   std::span<ParsedFilter> parseFilters(
@@ -2783,6 +2877,17 @@ public:
     for (auto* src : fusion->sources) {
       src->parent = fusion;
     }
+    // The shared filters bound every source; the fusion itself needs a
+    // segment some source may match.
+    SegmentMask shared;
+    for (const auto& filter : sharedFilters) shared &= pruningOf().viable(*filter.query);
+    SegmentMask anySource(view()->segments().size(), false);
+    for (auto* src : fusion->sources) {
+      src->viable &= shared;
+      anySource |= src->viable;
+      reportPruning(*src, pruningRoots(*src->query, src->filters, sharedFilters));
+    }
+    fusion->viable = fusion->sources.empty() ? shared : anySource;
 
     addSubs(*fusion, fusionProto.ops, depth, OpsPlacement::FUSION);
     if (collapse) {

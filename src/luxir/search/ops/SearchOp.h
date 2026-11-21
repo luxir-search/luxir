@@ -19,6 +19,7 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
+#include "luxir/query/SegmentMask.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/DomainVariantPlan.h"
 #include "luxir/search/RowRelation.h"
@@ -166,12 +167,22 @@ public:
   BucketDomainPlan* bucketDomain = nullptr;
   InputDomainPlan* inputDomain = nullptr;
   bool needsStructuralScope = false;
+  // The op's root mask: the segments its own query and filters (and the
+  // domains of the children it produces) may match, from segment summaries.
+  // A pruned segment contributes exactly an empty match: the op builds no
+  // supplier, scorer or count there and feeds its children empty domains.
+  // Unrestricted (the default) for ops that consume no query.
+  SegmentMask viable;
 
   // We can't pass both the parent and children to constructors (and have them fully formed)
   // one has to come before the other.  The parser currently sets subOps and parent
   // after construction, so do not inspect these fields in the constructor.
   SearchOp(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view name)
     : segmentStateRetentions(view->segments().size()), req(req), view(view), name(name) {
+  }
+
+  bool segmentPruned(int32_t segment) const noexcept {
+    return segment >= 0 && !viable.test((size_t)segment);
   }
 
   virtual void init() {
@@ -260,6 +271,18 @@ public:
   virtual bool facetBucketSharesSegmentState() const {
     return std::ranges::any_of(subOps, [](const auto& entry) {
       return entry.second->facetBucketSharesSegmentState();
+    });
+  }
+
+  // Whether this subtree runs a weight that prepares over the whole index
+  // (Weight::needsPrepare, such as kNN's global top k). Preparation reads
+  // every segment's domain, so no op substitutes the empty domain for a
+  // pruned segment where a preparing weight could see it. Ops holding
+  // weights override this.
+  virtual bool needsWholePreparation() const {
+    if (bucketDomain && bucketDomain->variants.sourcesNeedPrepare()) return true;
+    return std::ranges::any_of(subOps, [](const auto& entry) {
+      return entry.second->needsWholePreparation();
     });
   }
 

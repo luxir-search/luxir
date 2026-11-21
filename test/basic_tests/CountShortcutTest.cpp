@@ -768,7 +768,9 @@ TEST_P(CountShortcutTest, multiTermWholeCountsProbeCacheBeforeExpansion) {
       req->execute(false);
       ASSERT_OK(req);
       EXPECT_EQ(111, req->getMatchCount());
-      EXPECT_EQ(GetParam() && repeat == 2 ? 0 : 3, SkipStats::multitermExpansions);
+      // Only two segments have matches; the summary proves the third empty, so
+      // it does not expand.
+      EXPECT_EQ(GetParam() && repeat == 2 ? 0 : 2, SkipStats::multitermExpansions);
       // First-K ids still build sets; plain COUNT remembers the empty segment too.
       EXPECT_EQ(GetParam() && limit > 0 && repeat == 1 ? 2 : 0, SkipStats::multitermUnionBuilds);
       auto bypasses = limit == 0 ? SkipStats::wholeCountBypasses : SkipStats::wholeTopKCountBypasses;

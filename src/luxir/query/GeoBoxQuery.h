@@ -12,6 +12,7 @@
 #include "luxir/query/Query.h"
 #include "luxir/reader/BKDReader.h"
 #include "luxir/util/geo.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -53,6 +54,14 @@ public:
   int32_t getMinLongitude() const { return box.lonMin; }
   int32_t getMaxLongitude() const { return box.lonMax; }
   bool isEmpty() const { return box.empty(); }
+
+  MatchState mayMatch(const SummaryView& view) const override {
+    if (box.empty()) {
+      view.prove("empty geo box");
+      return MatchState::EMPTY;
+    }
+    return summary::geoMatch(view, field, box.latMin, box.latMax, box.lonMin, box.lonMax);
+  }
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);

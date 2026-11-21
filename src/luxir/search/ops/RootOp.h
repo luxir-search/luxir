@@ -15,8 +15,15 @@ public:
   Query::PlanningContext* planning = nullptr;
   Query::Context* weightContext = nullptr;
   DomainVariantPlan domainVariants;
+  // Per domain variant, the segments its queries may match (index 0, the
+  // live documents, is unrestricted). Set by the parser.
+  std::vector<SegmentMask> variantViable;
 
   RootOp(SearchRequest& req) : SearchOp(req, req.reader, "root") {
+  }
+
+  bool needsWholePreparation() const override {
+    return domainVariants.sourcesNeedPrepare() || SearchOp::needsWholePreparation();
   }
 
 
@@ -66,18 +73,44 @@ public:
       if (!root.domainVariants.empty()) {
         subCalcVariants.reserve(op.subOps.size());
       }
+      std::vector<SearchOp*> childOps;
+      childOps.reserve(op.subOps.size());
       for (auto [key, subOp] : op.subOps) {
         auto* subCalc = subOp->createCalculator(this, -1);
         subCalcs.emplace_back(subCalc);
+        childOps.push_back(subOp);
         if (!root.domainVariants.empty()) {
           subCalcVariants.push_back(
               root.domainVariants.variantForChild(key));
         }
       }
 
+      // Root masks: a child receives the empty domain wherever its domain
+      // variant or its own query proves it cannot match, and a segment no
+      // child needs gets no live docs and no variant production at all.
+      // While some weight of the request prepares over the whole index,
+      // every segment keeps its domains: preparation must see what it sees
+      // unpruned, and pruning only skips each op's collection.
+      bool prunesDomains = !root.needsWholePreparation();
+      auto variantMayMatch = [&](size_t variant, size_t segnum) {
+        return !prunesDomains || variant >= root.variantViable.size() || root.variantViable[variant].test(segnum);
+      };
+      auto childNeeds = [&](size_t child, size_t segnum) {
+        size_t variant = subCalcVariants.empty() ? 0 : subCalcVariants[child];
+        return !prunesDomains
+            || (variantMayMatch(variant, segnum) && !childOps[child]->segmentPruned((int32_t)segnum));
+      };
       const auto& segs = op.view->segments();
+      std::vector<uint8_t> needed(segs.size(), 0);
       domains.reserve(segs.size());
       for (auto& seg : segs) {
+        for (size_t child = 0; child < childOps.size() && !needed[(size_t)seg.ord]; child++) {
+          needed[(size_t)seg.ord] = childNeeds(child, (size_t)seg.ord);
+        }
+        if (!needed[(size_t)seg.ord]) {
+          domains.push_back(DomainHandle::empty().scoped(seg));
+          continue;
+        }
         // Start with live docs. This establishes the PrepareContext domain
         // contract (Query.h): a segment's domain, when present, is
         // live-filtered and is the complete eligibility predicate; null means
@@ -143,6 +176,7 @@ public:
       std::vector<std::vector<DomainHandle>> extraSets(
           domains.size(), std::vector<DomainHandle>(weights.size()));
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
+        if (!needed[segnum]) continue;
         auto& segment = op.view->segments()[segnum];
         std::string detail = "root segment " + std::to_string(segnum);
         reservations[segnum] = root.domainVariants.reserveProduction(
@@ -170,6 +204,10 @@ public:
               != DomainVariantPlan::Frame::RESET) {
             continue;
           }
+          if (!needed[segnum] || !variantMayMatch(variant, segnum)) {
+            eligibility[segnum][variant] = DomainHandle::empty().scoped(op.view->segments()[segnum]);
+            continue;
+          }
           std::vector<DomainHandle> parts;
           parts.push_back(domains[segnum]);
           for (size_t source : root.domainVariants.extraSources(variant)) {
@@ -195,6 +233,11 @@ public:
       std::vector<std::vector<DomainHandle>> produced;
       produced.reserve(domains.size());
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
+        if (!needed[segnum]) {
+          produced.emplace_back(root.domainVariants.variantCount(),
+                                  DomainHandle::empty().scoped(op.view->segments()[segnum]));
+          continue;
+        }
         auto& segment = op.view->segments()[segnum];
         auto releaseSegment = scope_guard([&]() noexcept {
           for (const auto& source : prepared) source.releaseSegmentState(segment);
@@ -218,6 +261,10 @@ public:
             root.domainVariants.variantCount());
         variants[0] = domains[segnum];
         for (size_t variant = 1; variant < variants.size(); variant++) {
+          if (!variantMayMatch(variant, segnum)) {
+            variants[variant] = DomainHandle::empty().scoped(op.view->segments()[segnum]);
+            continue;
+          }
           if (preparedVariants.ready[variant] != 0) {
             variants[variant] =
                 preparedVariants.domains[segnum][variant];

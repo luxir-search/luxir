@@ -40,6 +40,14 @@ public:
 
   std::span<const std::string_view> getTerms() const { return terms; }
 
+  MatchState mayMatch(const SummaryView& view) const override {
+    if (terms.empty()) return MatchState::UNKNOWN;
+    for (std::string_view term : terms) {
+      if (summary::termMatch(view, field, term) != MatchState::EMPTY) return MatchState::UNKNOWN;
+    }
+    return MatchState::EMPTY;
+  }
+
   bool capsExpansions() const override { return false; }
 
   std::string describe() const override {
