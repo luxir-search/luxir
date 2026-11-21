@@ -197,7 +197,7 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
 
 TEST_F(StatsMetricsTest, SearchFanoutDecisions) {
   CollectionHelper helper("fanout_stats");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   for (int seg = 0; seg < 5; seg++) {
     std::vector<Doc> docs;
     for (int i = 0; i < 64; i++) docs.push_back(flatdoc("id", std::to_string(seg * 64 + i), "cat_s", "c" + std::to_string(i % 8)));

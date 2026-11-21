@@ -66,7 +66,7 @@ protected:
         .maxBytes = GetParam() ? 64u << 20 : 0, .minSegmentDocs = 0,
         .admissionThreshold = 2});
     writer->snapshots.readers.filterCache = cache;
-    writer->mergePolicy->setMergeFactor(100);
+    writer->setMergeFactor(100);
     for (int seg = 0; seg < 3; seg++) {
       auto& inverter = writer->obtainInverter();
       auto& id = inverter.getIndexHandler("id");
@@ -796,7 +796,7 @@ TEST_P(CountShortcutTest, multiTermStringEligibilityIsPerSegment) {
   }
   schema.set(strings.collection());
   auto writer = strings.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   for (bool overlap : {false, true}) {
     ASSERT_TRUE(strings.indexAll(std::array{
         flatdoc("single", "a", "set", overlap ? vecs("a", "b") : vecs("a"),
