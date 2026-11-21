@@ -269,7 +269,8 @@ private:
             ValueExprOptions valueOptions{opts.schema, opts.vars, budget, false, opts.fieldResolver, opts.opName};
             valueOptions.view = opts.view;
             try {
-              input = ValueExprParser(valueOptions, arena).parsePartial(*cur, function.natures);
+              input = ValueExprParser(valueOptions, arena).parsePartial(
+                  *cur, function.natures, function.acceptsGeoPoints);
             } catch (const std::runtime_error& error) {
               throw std::runtime_error(fmt::format(
                   "op '{}': {}", opts.opName, error.what()));
@@ -280,12 +281,27 @@ private:
           }
         });
 
+    // sum(count(f)) over a bare column f counts every value f stores. It runs
+    // as a value count that keeps repeats, reading each document's value
+    // count from the column shape instead of evaluating count() per document.
+    const AggregateFunction* resolvedFunction = &function;
+    if (input != nullptr && function.name == "sum") {
+      const ValueNode& root = input->root();
+      if (root.kind == ValueNodeKind::FUNCTION && root.function->name == "count"
+          && input->nodes[root.children[0]].kind == ValueNodeKind::COLUMN) {
+        input->rootNode = root.children[0];
+        input->constantScalar.reset();
+        input->retainRoot();
+        resolvedFunction = &AggregateFunctionRegistry::sumOfCounts();
+      }
+    }
+
     if (input != nullptr && input->needsScore) {
       throw std::runtime_error(fmt::format(
           "op '{}': scores are not available in aggregate expressions",
           opts.opName));
     }
-    if (input != nullptr && !function.acceptsValues && valueArray(input->root().type)) {
+    if (input != nullptr && !resolvedFunction->acceptsValues && valueArray(input->root().type)) {
       std::string_view argument = cur->slice(argumentStart, argumentEnd);
       fail(pos, fmt::format(
           "{}() requires one scalar per document; '{}' produces a {}; "
@@ -293,20 +309,20 @@ private:
           name, argument, valueTypeName(input->root().type),
           ValueFunctionRegistry::arrayReducerNames()));
     }
-    if (input != nullptr && !function.acceptsValues && input->root().type == ValueType::COLUMN_ONLY) {
+    if (input != nullptr && !resolvedFunction->acceptsValues && input->root().type == ValueType::COLUMN_ONLY) {
       fail(pos, fmt::format("{}() requires a numeric expression", name));
     }
 
     ResolvedAggregate resolved;
     try {
-      resolved = function.resolve(
+      resolved = resolvedFunction->resolve(
           input == nullptr ? nullptr : &input->root(), trailing);
     } catch (const std::exception& error) {
       fail(pos, error.what());
     }
 
     auto arguments = program->copyConstants(trailing);
-    AggregateLeaf leaf{program->addProducer({&function, input, resolved, arguments},
+    AggregateLeaf leaf{program->addProducer({resolvedFunction, input, resolved, arguments},
                                           opts.shareProducers),
                        arguments};
     uint32_t leafIndex = (uint32_t)program->leaves.size();

@@ -394,12 +394,33 @@ shortest form is a bare expression string in an operation position:
 "average_price": "avg(price_f)"
 ```
 
-The aggregates are `avg`, `sum`, `min`, `max`, `cardinality`, `percentile`, and
-`percentile_rank`. Their value arguments use the same expression language as
-[sort expressions](searching.md#sorting):
+The aggregates are `avg`, `sum`, `min`, `max`, `value_count`, `cardinality`,
+`percentile`, and `percentile_rank`. Their value arguments use the same expression
+language as [sort expressions](searching.md#sorting):
 arithmetic, parentheses, `def`, unary math, and per-document array reducers.
-`sum(count(field))` counts values, like Elasticsearch `value_count`, for
-numeric, boolean, date, STRING, ID and GEO_POINT fields alike.
+
+`value_count(field)` counts values like Elasticsearch `value_count`, for
+numeric, boolean, date, IP, decimal, STRING, ID and GEO_POINT fields alike: a
+multi-valued document adds each of its values and a document without the field
+adds nothing. Repeats within one document follow Elasticsearch too: a STRING,
+ID or IP field counts each distinct value of a document once (Elasticsearch
+keeps `keyword` and `ip` values as a sorted set), while numeric, boolean, date
+and GEO_POINT fields count every repeat (Elasticsearch keeps them as a sorted
+list). A [set](schema.md#multi-valued-modes) already holds a repeated value
+once; an array keeps repeats, so a STRING or IP array compares each document's
+values, and `["a", "a"]` counts 1. A nested row is its own document.
+The count is an int64 and is `0`, not null, when nothing matches. On a bare
+field other than a STRING or IP array it reads only how many values each
+document holds, never the values, so it costs about as much as the bucket
+count; either way it joins the fused per-facet column pass beside `avg`, `sum`,
+`min`, and `max`. Over any other expression it counts the present values the
+expression yields per document.
+
+`sum(count(field))` counts every stored value of a bare field, repeats
+included: `["a", "a"]` counts 2. It runs as the same native value count as
+`value_count`, reading only each document's value count, so it also joins the
+fused column pass and answers `0`, not null, when nothing matches. Any other
+`count()` argument (`sum(count(price_i * 2))`) is evaluated per document.
 A composite metric is a single expression:
 
 ```json

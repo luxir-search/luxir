@@ -237,6 +237,29 @@ public:
       if (count != 0) flush();
     }
 
+    // A value count over the domain from the column shape alone: no value is
+    // decoded, and a domain of every document needs no walk at all. An ARRAY
+    // terms column counts each document's distinct values, so it walks its
+    // documents and reads the values of those holding more than one.
+    void accumulateValueCounts(AggregateAccumulator& accumulator,
+                               BoundAggregateInput& binding, DocSet* domain,
+                               int32_t maxDoc) {
+      BoundValueCounts& counts = *binding.valueCounts;
+      if (counts.mapping == nullptr && counts.shape == nullptr) return;
+      int64_t total = 0;
+      if (counts.mapping == nullptr && domain == nullptr) {
+        total = counts.segmentValues();
+      } else if (counts.mapping == nullptr && counts.shape->oneValuePerDoc()) {
+        total = domain->card();
+      } else {
+        forEachDomainDoc(domain, maxDoc, [&](int32_t doc) { total += counts.count(doc); });
+      }
+      if (total != 0) {
+        accumulator.addRawBatch(binding.producerIndex,
+                                std::span<const int64_t>(&total, 1), FieldType::INT);
+      }
+    }
+
     void accumulateExpression(AggregateAccumulator& accumulator,
                               BoundAggregateInput& binding, DocSet* domain,
                               int32_t maxDoc) {
@@ -327,7 +350,10 @@ public:
 
           int32_t maxDoc = segment.maxDoc();
           for (BoundAggregateInput& binding : bindings) {
-            if (binding.columnScan
+            if (binding.valueCounts != nullptr) {
+              accumulateValueCounts(
+                  accumulator, binding, domainHandle.get(op.view->segments()[(size_t)segnum]), maxDoc);
+            } else if (binding.columnScan
                 && !(disableOrdinalAggregateBatchesForTests
                      && binding.producer->input->root().type == ValueType::COLUMN_ONLY)) {
               accumulateColumn(
@@ -749,6 +775,14 @@ public:
         if (docCount == 0) return;
         std::span<const int32_t> docBatch(docs.data(), docCount);
         for (BoundAggregateInput& binding : bindings) {
+          if (binding.valueCounts != nullptr) {
+            for (size_t i = 0; i < docCount; i++) {
+              for (size_t owner = ownerOffsets[i]; owner < ownerOffsets[i + 1]; owner++) {
+                binding.accumulatePoint(stateStorage(ownerIds[owner]), docs[i]);
+              }
+            }
+            continue;
+          }
           if (!binding.scalar()) {
             for (size_t i = 0; i < docCount; i++) {
               auto owners = std::span<const int32_t>(ownerIds).subspan(
@@ -997,20 +1031,23 @@ public:
     return !aggregate.hasIndirectStates
         && std::ranges::all_of(aggregate.producers, [](const AggregateProducer& producer) {
       return producer.resolved.state.inlineCapable
-          && producer.input->root().type != ValueType::COLUMN_ONLY
-          && !valueArray(producer.input->root().type);
+          && (producer.countsColumnValues()
+              || (producer.input->root().type != ValueType::COLUMN_ONLY
+                  && !valueArray(producer.input->root().type)));
     });
   }
 
-  // Every producer a bare scalar column with a keyed raw batch accumulator: the
-  // inline calculator then reads its values straight from the column per batch.
+  // Every producer a bare scalar column, or the value count of any bare
+  // column, with a keyed raw batch accumulator: the inline calculator then
+  // reads its values (or value counts) straight from the column per batch.
   bool inlinesAsColumnBatch() const override {
     return !aggregate.hasIndirectStates
         && std::ranges::all_of(aggregate.producers, [](const AggregateProducer& producer) {
       const ValueNode& input = producer.input->root();
       return producer.resolved.state.inlineCapable
-          && input.kind == ValueNodeKind::COLUMN && !valueArray(input.type)
-          && input.type != ValueType::COLUMN_ONLY
+          && (producer.countsColumnValues()
+              || (input.kind == ValueNodeKind::COLUMN && !valueArray(input.type)
+                  && input.type != ValueType::COLUMN_ONLY))
           && producer.resolved.state.accumulateKeyedRawBatch != nullptr;
     });
   }

@@ -331,8 +331,8 @@ Anywhere a query goes, it can be a structured object or an expression string.
   order with zero counts included, daylight-saving changes handled.
 - Nesting: sub-facets under buckets, metrics per bucket, and a ranked
   `top_docs` (or `fusion`) list per bucket, all in one request.
-- Expression metrics: `avg`, `sum`, `min`, `max`, distinct counts
-  (`cardinality`), `percentile`, and exact `percentile_rank` over value
+- Expression metrics: `avg`, `sum`, `min`, `max`, value counts
+  (`value_count`), distinct counts (`cardinality`), `percentile`, and exact `percentile_rank` over value
   expressions (`sum(price_f * qty_i) / sum(qty_i)`), at query level or per
   bucket; facets can sort by a named metric.
 - Easy [multi-select navigation](guide/faceting.md#easy-multi-select-with-selected):
