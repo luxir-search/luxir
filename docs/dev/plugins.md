@@ -327,6 +327,10 @@ Rules:
   when it next loads, for queries and new documents alike.
 - The fused `unicode_word` + `nfkc_cf` fast path applies only to exactly those built-in
   components; plugin stages always run as written.
+- `Token` carries more than its text, offsets and `positionIncrement`. The whole chain shares
+  one `Token`, so a filter that rewrites or drops tokens in place forwards every attribute;
+  one that buffers tokens past the current pull saves and restores what it needs. See
+  [Token attributes](#token-attributes).
 - A collection whose persisted schema names a component this binary does not have fails to
   load with the "unknown ..." message; the node keeps serving its other collections.
 
@@ -366,6 +370,35 @@ A schema then uses the plugin by name (`"analyzer": "example"`) or composes its 
 (`"analyzer": {"tokenizer": "whitespace", "filters": ["example_reverse"]}`).
 Text is fed to a chain with `TokenChain::setValue`, never `head.setValue`, so char filters
 always run.
+
+### Token attributes
+
+Besides `text`, `positionIncrement` and the offsets, a `Token` has three attributes, all
+reset by `Token::clear()` when a tokenizer starts a token:
+
+| Attribute | Default | Meaning |
+|---|---|---|
+| `positionLength` | 1 | Positions the token spans: its arc length in the token graph (Lucene's `PositionLengthAttribute`), 2 for a synonym covering two source words. `uint16_t`. |
+| `type` | `UNKNOWN` | `TokenType`: `ALPHA` (letters or ideographs), `NUMERIC`, `ALNUM`, `OTHER`. |
+| `script` | `UNKNOWN` | `Script` of the token's first letter: `LATIN`, `HAN`, `HIRAGANA`, `KATAKANA`, `HANGUL`, `THAI`, `ARABIC`, `CYRILLIC`, `GREEK`, `OTHER`; `COMMON` when it has no letter (digits). |
+
+`unicode_word`, and so the fused `unicode_word` + `nfkc_cf` tokenizer, sets `type` and
+`script` (the fused ASCII path from its byte classes, other words from their code points;
+both give the same answer). `whitespace`, `keyword` and a plugin tokenizer leave them
+`UNKNOWN` unless they set them; `scriptOf(char32_t)` is the per-code-point lookup. The
+attributes are read before any filter rewrites the text, so `type` and `script` describe the
+source word: a CJK bigram filter can branch on `token.script == Script::HAN` instead of
+guessing from the first byte. The three sit next to `positionIncrement`, so `clear()`
+resets all four with one 8-byte store (`Analyzer.h` has a `static_assert`).
+
+`positionLength` is carried and nothing reads it yet. Postings store only each term's start
+position (as Lucene's do), and phrase queries are built from position increments, so a
+token spanning several positions indexes and matches exactly like a one-position token.
+Honouring it needs a query-side graph (a phrase over alternative paths); a filter that
+produces graph tokens can set it today and a later query builder can consume it.
+
+`TokenAttributesExampleTest` shows a plugin filter (`describe`) reading all three, and the
+example `span2` filter setting `positionLength`.
 
 ## Storage backends and layers
 
