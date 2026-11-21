@@ -55,6 +55,16 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
   }
 }
 
+std::string failureMessage(const std::exception_ptr& failure) {
+  try {
+    std::rethrow_exception(failure);
+  } catch (const std::exception& e) {
+    return e.what();
+  } catch (...) {
+    return "unknown non-standard exception";
+  }
+}
+
 bool mayApplyDeletes(const SegInfo& seg, const SortedDeletes& packet) {
   if (seg.minVersion >= packet.getLargestVersion()) return false;
   auto range = seg.idRange.load();
@@ -1448,7 +1458,8 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   std::vector<std::string> flushedFiles;
   std::vector<FileDescriptor> descriptors;
   bool success = false;
-  bool aborted = inverter.failed();
+  bool requestFailed = inverter.failed();
+  bool aborted = requestFailed;
   if (!aborted) {
     try {
       // uncomment to serialize inverter flushing (for testing purposes)
@@ -1464,6 +1475,23 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
       inverter.fail(std::current_exception());
       aborted = true;
       success = false;
+    }
+  }
+
+  // An aborted inverter is never published, but other requests that shared it
+  // were already acknowledged. Fail the writer so no later commit can succeed
+  // without their updates. A request that failed on an inverter only it
+  // acquired (each acquisition records its unique version) loses nothing that
+  // was acknowledged, and its own error reports the loss. Fail before the
+  // commit below is released so it cannot publish either.
+  if (aborted) {
+    bool soleRequest = requestFailed && inverter.currVersion != 0
+                       && inverter.minVersion == inverter.currVersion
+                       && inverter.maxVersion == inverter.currVersion;
+    if (!soleRequest) {
+      fail(std::format("segment s{} was aborted with acknowledged updates: {}",
+                       Postings::segmentKey(inverter.getPostingsWriter().segId, writerEpoch),
+                       failureMessage(inverter.failure())));
     }
   }
 

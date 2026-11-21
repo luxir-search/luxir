@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <optional>
 #include <thread>
 #include "test/LuxirTest.h"
@@ -671,6 +672,32 @@ TEST_F(DateFieldTest, indexDateMathAndStableNowPerUpdate) {
   ASSERT_TRUE(now1.has_value());
   ASSERT_TRUE(now2.has_value());
   EXPECT_EQ(*now1, *now2);
+}
+
+// A supplied clock resolves NOW identically across updates; the default is the current time.
+TEST_F(DateFieldTest, suppliedDateMathClock) {
+  CollectionHelper helper;
+  int64_t clock = utcMs("2024-06-24T12:00:00Z");
+  for (std::string id : {"a", "b"}) {
+    CollectionHelper::UpdateBuilder update;
+    update.add(flatdoc("id", id, "when_dt", "NOW-1DAY"));
+    ASSERT_TRUE(helper.submit(update, clock).success);
+  }
+  int64_t before = currentEpochMillis();
+  ASSERT_TRUE(helper.index(flatdoc("id", "c", "when_dt", "NOW"), UpdateMessage::COMMIT).success);
+  int64_t after = currentEpochMillis();
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id", "when_dt"}).limit(10);
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  std::map<std::string, int64_t> when;
+  for (auto& doc : req->getDocs()) when[std::get<std::string>(*find(doc, "id"))] = std::get<int64_t>(*find(doc, "when_dt"));
+  ASSERT_EQ(3u, when.size());
+  EXPECT_EQ(utcMs("2024-06-23T12:00:00Z"), when["a"]);
+  EXPECT_EQ(when["a"], when["b"]);
+  EXPECT_GE(when["c"], before);
+  EXPECT_LE(when["c"], after);
 }
 
 // Sorting runs on the raw millis column (chronological order, no decode).
