@@ -89,11 +89,12 @@ PostingsReader::~PostingsReader() {
 }
 
 int32_t PostingsReader::findOrdinal(std::string_view name) const {
-  const auto input = core().getInputStream(0);
+  const auto& input = core().fieldCatalog();
+  const int64_t tableLoc = fieldOffsetsLoc - core().fieldCatalogStart();
   auto* end = fieldOffsets + nFields;
   // Offsets were checked at open; a name must also end before the offsets table.
   auto nameAt = [&](uint32_t offset) {
-    auto term = input.readPackedTerm(fieldOffsetsLoc - offset);
+    auto term = input.readPackedTerm(tableLoc - offset);
     if (term.memorySize() > offset) throw std::runtime_error("Segment field name extends past the field metadata");
     return term;
   };

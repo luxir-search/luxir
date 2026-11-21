@@ -71,6 +71,7 @@ struct Manifest {
     auto suffix = name.substr(underscore + 1);
     if (!suffix.starts_with('_')) return sortable(suffix);
     suffix.remove_prefix(1);
+    if (suffix == "hot") return true;  // the segment's hotcache (reader/Hotcache.h)
     if (suffix.starts_with('L') && suffix.find('_') == std::string_view::npos) suffix.remove_prefix(1);
     else {
       auto file = suffix.rfind('_');
@@ -160,6 +161,8 @@ struct Manifest {
         result.generation = gen;
         result.epoch = epoch;
         result.names.push_back(name(gen, epoch));
+        // The chosen root names every committed file with its size.
+        dir.knownFiles(files(result.bytes));
         return result;
       }
       const auto& listing = result.listingOf(dir);
@@ -190,6 +193,8 @@ struct Manifest {
         result.generation = oldGen;
         result.epoch = oldEpoch;
         result.names.push_back(name(oldGen, oldEpoch));
+        // The chosen root names every committed file with its size.
+        dir.knownFiles(files(result.bytes));
         return result;
       }
       throw std::runtime_error("No valid snapshot manifest");

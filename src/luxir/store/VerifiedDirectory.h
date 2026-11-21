@@ -31,6 +31,7 @@ public:
     return delegate.openChecksum(name, direct);
   }
   void expectSynced(std::span<const FileDescriptor> files) override { delegate.expectSynced(files); }
+  void knownFiles(std::span<const FileDescriptor> files) override { delegate.knownFiles(files); }
   std::unique_ptr<File> createFile(std::string_view name) override { return delegate.createFile(name); }
   std::unique_ptr<File> createFile(std::string_view name, FileCreateOptions options) override {
     return delegate.createFile(name, std::move(options));
