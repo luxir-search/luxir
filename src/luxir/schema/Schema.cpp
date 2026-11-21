@@ -3,6 +3,7 @@
 
 #include "Schema.h"
 #include "luxir/reader/Space.h"
+#include "FieldTypeRegistry.h"
 #include <algorithm>
 #include <memory_resource>
 #include "luxir/api/build.h"
@@ -12,6 +13,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <cstddef>
+#include <deque>
 #include <span>
 #include <set>
 #include <stdexcept>
@@ -53,6 +55,9 @@ struct ResolvedField {
   // null = the type default. Char-filter-only definitions keep the parent chain.
   const luxir::api::AnalyzerDef* analyzer = nullptr;
   const luxir::api::NormalizerDef* normalizer = nullptr;
+  // A plugin field type (FieldDef.plugin_type), inherited like type; set means
+  // `type` is meaningless.
+  const luxir::api::AnalyzerComponent* pluginType = nullptr;
   // 0 means "not set / infer from first indexed value"; > 0 means strict.
   int32_t vectorDims = 0;
   bool hasVectorDims = false;
@@ -194,13 +199,18 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
                                       const ResolvedField& parentResolved, AnalyzerDefinitions& analyzers) {
   ResolvedField r;
 
-  // type: use this field's if set, else parent's
+  // type: use this field's if set, else parent's. A plugin type is a type
+  // too: an authored one replaces the parent's, either way round.
   if (def.type.has_value()) {
     r.hasType = true;
     r.type = *def.type;
+  } else if (def.plugin_type.has_value()) {
+    r.hasType = true;
+    r.pluginType = &*def.plugin_type;
   } else {
     r.hasType = parentResolved.hasType;
     r.type = parentResolved.type;
+    r.pluginType = parentResolved.pluginType;
   }
 
   // index mode.  Enum reads accept bare integers (JSON) and unknown values
@@ -457,6 +467,36 @@ static void resolveOwnership(std::string_view name, const sv_entry_map& defMap,
 static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r) {
   const auto& def = entry.def;
   std::string name(entry.name);
+  if (def.type && def.plugin_type) {
+    throw SchemaError("type and plugin_type are exclusive (field: " + name + ")");
+  }
+  if (r.pluginType) {
+    // Everything else about the derived fields is the plugin's to declare.
+    std::vector<std::string_view> set;
+    auto check = [&](bool present, std::string_view property) { if (present) set.push_back(property); };
+    check(def.index.has_value(), "index");
+    check(def.column.has_value(), "column");
+    check(def.multi.has_value(), "multi");
+    check(analyzerSet(def), "analyzer");
+    check(def.stored.has_value(), "stored");
+    check(def.stored_resource && !def.stored_resource->empty(), "stored_resource");
+    check(def.dims || def.truncate_dims || def.metric || def.normalized || def.normalize_on_write || def.encoding || def.ann,
+          "vector settings");
+    check(def.variants.has_value(), "variants");
+    check(def.defaults.has_value(), "defaults");
+    check(def.normalizer.has_value(), "normalizer");
+    check(def.long_terms.has_value(), "long_terms");
+    check(def.unit.has_value(), "unit");
+    check(def.ignore_z_value.has_value(), "ignore_z_value");
+    check(def.scale.has_value(), "scale");
+    check(def.reverse_map.has_value(), "reverse_map");
+    if (!set.empty()) {
+      throw SchemaError("'" + std::string(set.front()) + "' is not valid for plugin field type '" +
+                        std::string(r.pluginType->name) + "', which takes its settings in params; "
+                        "only parent and ignore_malformed apply (field: " + name + ")");
+    }
+    return;
+  }
   if (r.type == FieldClass::NESTED && (def.index || def.column || def.multi || def.stored
       || def.stored_resource || def.variants || def.defaults || def.analyzer || def.normalizer
       || def.long_terms || def.unit || def.scale || def.dims || def.truncate_dims || def.metric
@@ -555,6 +595,66 @@ struct FieldCompiler {
   InvalidStopWords invalidStopWords;
   boost::unordered_flat_map<const api::AnalyzerDef*, std::shared_ptr<const Analyzer>> analyzers;
   boost::unordered_flat_map<const api::NormalizerDef*, std::shared_ptr<const Analyzer>> normalizers;
+  boost::unordered_flat_map<const api::AnalyzerComponent*, std::shared_ptr<const RegisteredFieldType>> pluginTypes;
+  // Named-analyzer definitions of derived TEXT fields (stable addresses: the
+  // analyzer cache is keyed by them).
+  std::deque<api::AnalyzerDef> derivedAnalyzers;
+
+  // A plugin-typed logical field: the composite primary plus one derived
+  // physical field per declared sub-field, compiled as hidden built-in fields.
+  void createPlugin(LogicalField& logical, const ResolvedField& r) {
+    const std::string& name = logical.name;
+    auto& compiled = pluginTypes[r.pluginType];
+    if (!compiled) {
+      try {
+        compiled = globalFieldTypeRegistry().make(*r.pluginType);
+      } catch (const std::invalid_argument& e) {
+        throw SchemaError(std::string(e.what()) + " (field: " + name + ")");
+      } catch (const RequestError& e) {
+        throw SchemaError(std::string(e.what()) + " (field: " + name + ")");
+      }
+    }
+    auto composite = std::make_shared<CompositeFieldType>(name, compiled, r.geoIgnoreMalformed.value_or(false));
+    if (r.isTemplate) composite->flags_ |= FieldType::ABSTRACT;
+    logical.primary = composite;
+    logical.shape = LogicalField::Shape::PLUGIN;
+    for (const auto& spec : compiled->type->fields) {
+      std::string physical = CompositeFieldType::derivedName(name, spec.suffix);
+      // checkFields caps the suffix, so the root keeps room.
+      static_assert(DerivedField::MAX_SUFFIX_LEN < 127 - 1);
+      logical.maxRootLength = std::min(logical.maxRootLength, 127 - 1 - spec.suffix.size());
+      if (!r.isTemplate && physical.size() > 127) {
+        throw SchemaError("generated physical field name exceeds 127 bytes: " + physical);
+      }
+      ResolvedField d;
+      d.isTemplate = r.isTemplate;
+      d.hasType = d.hasIndex = d.hasColumn = true;
+      d.column = spec.column;
+      bool terms = false;
+      switch (spec.kind) {
+        case DerivedField::Kind::INT: d.type = FieldClass::INT; break;
+        case DerivedField::Kind::DATE:
+          d.type = FieldClass::DATE;
+          d.dateUnit = spec.unit == DateUnit::NANOS ? ApiDateUnit::NS : ApiDateUnit::MS;
+          break;
+        case DerivedField::Kind::STRING: d.type = FieldClass::STRING; terms = true; break;
+        case DerivedField::Kind::TEXT:
+          d.type = FieldClass::TEXT;
+          terms = true;
+          if (!spec.analyzer.empty()) {
+            d.analyzer = &derivedAnalyzers.emplace_back();
+            derivedAnalyzers.back().name = spec.analyzer;
+          }
+          break;
+        case DerivedField::Kind::GEO_POINT: d.type = FieldClass::GEO_POINT; break;
+      }
+      d.index = !spec.index ? IndexMode::NONE : terms ? IndexMode::MATCH : IndexMode::RANGE;
+      ResolvedOwnership owned;
+      owned.hasMulti = owned.hasStored = true;
+      owned.multi = spec.multi ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
+      logical.derived.emplace_back(spec.suffix, create(physical, d, owned, true));
+    }
+  }
 
   std::shared_ptr<FieldType> create(std::string_view name, const ResolvedField& r,
                                    const ResolvedOwnership& logical, bool derived = false) {
@@ -1046,6 +1146,11 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
                           "': must be '_' followed by ASCII letters, digits, or underscores");
       }
     } else if (!validFieldName(e.name)) {
+      if (e.name.contains(CompositeFieldType::SEPARATOR)) {
+        throw SchemaError("invalid field name '" + std::string(e.name) +
+                          "': '$' names a plugin field type's derived field (<field>$<suffix>), which the "
+                          "type declares; it cannot be authored");
+      }
       throw SchemaError("invalid field name '" + std::string(e.name) +
                         "': ASCII letters, digits, and underscores, starting with a letter");
     }
@@ -1080,12 +1185,49 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
     }
   }
 
-  FieldCompiler compiler{invalidStopWords, {}, {}};
+  FieldCompiler compiler{invalidStopWords, {}, {}, {}, {}};
   for (const auto& e : entries) {
     const auto& r = resolved.at(e.name);
     const auto& owned = ownership.at(e.name);
     auto logical = std::make_unique<LogicalField>();
     logical->name = e.name;
+    if (r.pluginType) {
+      // Settings inherited from a built-in parent have nowhere to go: the
+      // derived fields are the plugin's to declare (direct ones were refused
+      // in validateDirectProps).
+      std::string_view inherited;
+      auto check = [&](bool present, std::string_view property) {
+        if (present && inherited.empty()) inherited = property;
+      };
+      check(r.hasIndex, "index");
+      check(r.hasColumn, "column");
+      check(owned.hasMulti, "multi");
+      check(r.analyzer != nullptr, "analyzer");
+      check(owned.hasStored, "stored");
+      check(owned.hasStoredResource, "stored_resource");
+      check(r.hasVectorDims || r.vectorTruncateDims || r.hasVectorMetric || r.hasVectorNormalized ||
+            r.hasVectorNormalizeOnWrite || r.hasVectorEncoding || r.ann, "vector settings");
+      check(owned.variants != nullptr, "variants");
+      check(owned.defaults != nullptr, "defaults");
+      check(r.normalizer != nullptr, "normalizer");
+      check(r.longTerms.has_value(), "long_terms");
+      check(r.dateUnit.has_value(), "unit");
+      check(r.geoIgnoreZValue.has_value(), "ignore_z_value");
+      check(r.scale.has_value(), "scale");
+      if (!inherited.empty()) {
+        throw SchemaError("field has plugin type '" + std::string(r.pluginType->name) + "' but inherits '" +
+                          std::string(inherited) + "' from its parent chain; a plugin type takes its settings "
+                          "in params, so give it a parent without built-in settings (field: " +
+                          std::string(e.name) + ")");
+      }
+      compiler.createPlugin(*logical, r);
+      schema->fieldTypeMap.emplace(e.name, logical->primary);
+      if (!e.isTemplate) {
+        for (const auto& [suffix, ft] : logical->derived) schema->fieldTypeMap.emplace(ft->name(), ft);
+      }
+      schema->logicalFields.emplace(e.name, std::move(logical));
+      continue;
+    }
     logical->primary = compiler.create(e.name, r, owned);
     logical->multi = logical->primary->multiValued();
     logical->shape = shapeFamily(r.type);
@@ -1121,6 +1263,7 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
           parent = it->second;
         }
         auto branch = physicalSettings(name, def, parent, analyzers);
+        if (branch.pluginType) throw SchemaError("variant cannot have a plugin type: " + name);
         validateDirectProps({name, def, false}, branch);
         if (branch.type == FieldClass::ID) throw SchemaError("variant cannot have type id: " + name);
         if (shapeFamily(branch.type) != logical->shape) {
@@ -1233,6 +1376,17 @@ const std::shared_ptr<FieldType>* Schema::findPhysical(std::string_view name) co
     return exact != fieldTypeMap.end() && dynamic_cast<StoredFieldType*>(exact->second.get())
         ? &exact->second : nullptr;
   }
+  auto exact = fieldTypeMap.find(name);
+  if (exact != fieldTypeMap.end()) return exact->second->isAbstract() ? nullptr : &exact->second;
+  // A plugin field's derived field, also of a template instance.
+  if (auto split = name.find(CompositeFieldType::SEPARATOR); split != std::string_view::npos) {
+    auto root = findRoot(name.substr(0, split));
+    if (!root.owner) return nullptr;
+    for (const auto& [suffix, type] : root.owner->derived) {
+      if (suffix == name.substr(split + 1)) return &type;
+    }
+    return nullptr;
+  }
   // Generated names are resolved root-first. Never suffix-match their tails.
   auto split = name.rfind("__");
   if (split == std::string_view::npos) return findRoot(name).primary;
@@ -1263,7 +1417,54 @@ ResolvedFieldHandle Schema::resolveInput(std::string_view docKey) const {
   return handle(docKey, "self", **root.primary, root.owner);
 }
 
+const DerivedField* Schema::derivedField(std::string_view name, const CompositeFieldType** owner) const {
+  auto split = name.find(CompositeFieldType::SEPARATOR);
+  if (split == std::string_view::npos) return nullptr;
+  auto root = findRoot(name.substr(0, split));
+  if (!root.owner || root.owner->shape != LogicalField::Shape::PLUGIN) return nullptr;
+  const auto& composite = static_cast<const CompositeFieldType&>(*root.owner->primary);
+  for (const auto& spec : composite.impl().fields) {
+    if (spec.suffix != name.substr(split + 1)) continue;
+    if (owner) *owner = &composite;
+    return &spec;
+  }
+  return nullptr;
+}
+
+// A derived field resolves as a standalone physical field (no owner), so every
+// operation treats it like an ordinary field of its built-in type.
+static ResolvedFieldHandle derivedHandle(std::string_view name, FieldType& type) {
+  // The derived field lives in the space of its plugin field.
+  std::string path(spaceParentPath(name.substr(0, name.find(CompositeFieldType::SEPARATOR))));
+  return {std::string(name), std::string(name), &type, FieldRole::PRIMARY, nullptr, std::move(path)};
+}
+
+// The derived field names of `root`, a field or template instance of owner.
+static std::string derivedNames(std::string_view root, const LogicalField& owner) {
+  std::string names;
+  for (const auto& [suffix, type] : owner.derived) {
+    if (!names.empty()) names += ", ";
+    names += CompositeFieldType::derivedName(root, suffix);
+  }
+  return names;
+}
+
 ResolvedFieldHandle Schema::resolveFor(std::string_view name, OpClass op) const {
+  if (auto dollar = name.find(CompositeFieldType::SEPARATOR); dollar != std::string_view::npos) {
+    auto rootName = name.substr(0, dollar);
+    if (!validFieldName(rootName)) {
+      throw RequestError("Invalid field or selector root: " + std::string(name), "invalid_field_name");
+    }
+    auto root = findRoot(rootName);
+    if (!root.primary) throw RequestError("Field not found: " + std::string(rootName), "unknown_field");
+    if (!root.owner || root.owner->shape != LogicalField::Shape::PLUGIN) {
+      throw RequestError("Field '" + std::string(rootName) + "' has no derived fields: " + std::string(name),
+                         "unknown_field");
+    }
+    if (auto* type = findPhysical(name)) return derivedHandle(name, **type);
+    throw RequestError("Unknown derived field '" + std::string(name) + "'; field '" + std::string(rootName) +
+                       "' has " + derivedNames(rootName, *root.owner), "unknown_field");
+  }
   auto split = name.rfind("__");
   auto rootName = split == std::string_view::npos ? name : name.substr(0, split);
   if (!validFieldName(rootName)) {
@@ -1274,6 +1475,14 @@ ResolvedFieldHandle Schema::resolveFor(std::string_view name, OpClass op) const 
   }
   auto root = findRoot(rootName);
   if (!root.primary) throw RequestError("Field not found: " + std::string(rootName), "unknown_field");
+  if (root.owner && root.owner->shape == LogicalField::Shape::PLUGIN && op != OpClass::RETRIEVE &&
+      op != OpClass::PRIMARY) {
+    // The authored value only exists as the plugin's derived fields.
+    auto& composite = static_cast<CompositeFieldType&>(**root.primary);
+    throw RequestError("Field '" + std::string(rootName) + "' has plugin type '" + composite.plugin->name +
+                       "' and is only retrievable; search, sort and facet its derived fields: " +
+                       derivedNames(rootName, *root.owner), "retrieval_only");
+  }
   if ((*root.primary)->type() == FieldType::NESTED
       && op != OpClass::PRIMARY && op != OpClass::SEARCH && op != OpClass::EXISTS
       && op != OpClass::RETRIEVE) {
@@ -1312,7 +1521,9 @@ std::vector<std::string> Schema::searchableFields(
     std::span<const std::string_view> physicalNames, std::string_view path) const {
   std::set<std::string_view> roots;
   auto addRoot = [&](std::string_view name) {
-    if (name.empty() || name[0] == '_' || spaceParentPath(name.substr(0, name.rfind("__"))) != path) return;
+    // Derived fields of plugin types are hidden from catalogs.
+    if (name.empty() || name[0] == '_' || name.contains(CompositeFieldType::SEPARATOR)
+        || spaceParentPath(name.substr(0, name.rfind("__"))) != path) return;
     roots.insert(name.substr(0, name.rfind("__")));
   };
   for (const auto& [name, type] : fieldTypeMap) addRoot(name);
