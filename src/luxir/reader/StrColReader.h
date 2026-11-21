@@ -28,6 +28,7 @@ private:
   const char* valuesData;                     // Pointer to concatenated string data
   InputFile* valuesInput;                     // File holding valuesData (for read-ahead)
   size_t valuesFileOffset;                    // Offset of valuesData in valuesInput
+  bool deferred = false;                      // valuesData is null: the values are acquired by range
   MonoReader endValueRanks;    // per-doc -> end value rank (multi-valued only)
   MonoReader endOffsetReader;  // per-value -> end byte offset (variable-size only)
   MonoReader owners;           // per-value rank -> owning docId (multi-valued reverse map; vectors only)
@@ -36,22 +37,33 @@ private:
   int32_t fixedSize = -1;                     // -1 for variable size, >= 0 for fixed size
 
 public:
-  StrColReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
+  /// deferValues: do not acquire the value bytes (valuesData stays null; callers
+  /// acquire ranges of valuesFile() themselves). It applies to a fixed-size column
+  /// on a file whose holds are not free; on a resident file the values are
+  /// mapped as usual and deferred() is false.
+  StrColReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo, bool deferValues = false)
       : docs(reader, fieldInfo),
         arrayMode((fieldInfo.flags & FieldType::MULTI_ARRAY) != 0),
         values(fieldInfo.numValues) {
     const auto* bytes = fieldInfo.bytesColumn();
     if (!bytes) missingColumn(fieldInfo, "bytes");
-    auto data = reader.core().slice(bytes->values);
-    valuesData = data.data();
     valuesInput = reader.core().getFile(bytes->values.location.filenum());
     valuesFileOffset = (size_t)bytes->values.location.offset();
+    deferred = deferValues && !bytes->endOffsets && !valuesInput->holdsFree();
+    std::span<const char> data;
+    if (deferred) {
+      valuesData = nullptr;
+    } else {
+      data = reader.core().slice(bytes->values);
+      valuesData = data.data();
+    }
+    size_t valuesBytes = (size_t)bytes->values.bytes;
 
     endValueRanks = MonoReader::openEndValueRanks(reader, fieldInfo);
     if (bytes->endOffsets) {
       auto context = segmentReadContext(reader.core(), fieldInfo, bytes->endOffsets.location.filenum());
       endOffsetReader = MonoReader(reader.core(), bytes->endOffsets, values, context.field);
-      endOffsetReader.requireLast((int64_t)data.size(), context, "last end offset differs from the bytes column length");
+      endOffsetReader.requireLast((int64_t)valuesBytes, context, "last end offset differs from the bytes column length");
     } else {
       fixedSize = fieldInfo.bytesStride();
     }
@@ -120,6 +132,9 @@ public:
     return owners ? &owners : nullptr;
   }
 
+  /// True when the value bytes were not acquired (see the constructor).
+  bool deferredValues() const { return deferred; }
+
   /// The file holding the value bytes and their offset in it, for read-ahead.
   InputFile* valuesFile() const { return valuesInput; }
   size_t valuesOffset() const { return valuesFileOffset; }
@@ -133,6 +148,7 @@ public:
   // Keep fixed-size column access in scan loops independent of the TU inline budget.
   LUXIR_INLINE std::string_view valueAt(int64_t valueRank) const {
     assert(valueRank >= 0 && valueRank < values);
+    assert(valuesData != nullptr || values == 0);
     if (endOffsetReader) {
       auto [startOffset, endOffset] = endOffsetReader.valuesAt(valueRank);
       return std::string_view(valuesData + startOffset, endOffset - startOffset);

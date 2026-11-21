@@ -111,6 +111,19 @@ Luxir's own `--store.checked-dir.sync` and `--read-only` wrappers always sit
 outside the layers. The effective stack is logged at startup as
 `storage: ...`. See [plugins](../dev/plugins.md#storage-backends-and-layers).
 
+An exact (flat) kNN scan never asks for a lazily fetched vector file whole.
+A scan that reads most of the vectors reads windows of
+`--knn.scan-window-bytes` (default `8MB`, rounded down to whole vectors) and
+keeps the windows of the next `--knn.scan-ahead-bytes` (default `64MB`)
+fetching while it scores, so their requests run together. The look-ahead in
+flight is the current window plus the ahead windows, per scanning thread per
+segment. A filtered scan that reads fewer than half of the vectors acquires
+the vectors it will read in batches and fetches only those, and the exact
+rescoring of approximate (IVF) candidates acquires its candidates' vectors in
+one batch per segment. This bounds each request and what a selective search
+fetches; how long fetched bytes stay in memory is up to the storage backend.
+Local files are scanned in place.
+
 `--store.retention-ms` keeps superseded commits and their files for that many
 milliseconds after their successor is published. After a restart, every older
 commit gets a full window. It defaults to 0 on exclusive stores and 300000

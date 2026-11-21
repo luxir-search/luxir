@@ -7,6 +7,7 @@
 #include "luxir/util/TaskWork.h"
 #include "luxir/util/LoadSignal.h"
 #include "luxir/server/Collections.h"
+#include "luxir/query/KnnTuning.h"
 #include <unistd.h>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -339,6 +340,18 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "type-ahead keystrokes shorter than N are rejected (0 = off, default)")
       ->default_val(search.multiterm_min_prefix_length)
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--knn.scan-window-bytes", knn.scan_window_bytes,
+                 "Flat kNN scans read a lazy (remote) vector file in windows of this size, "
+                 "whole vectors")
+      ->transform(CLI::AsSizeValue(false))
+      ->check(CLI::PositiveNumber)
+      ->default_str("8MB");
+  app.add_option("--knn.scan-ahead-bytes", knn.scan_ahead_bytes,
+                 "Flat kNN scans keep this many bytes of a lazy (remote) vector file "
+                 "fetching ahead of the window they score")
+      ->transform(CLI::AsSizeValue(false))
+      ->check(CLI::PositiveNumber)
+      ->default_str("64MB");
 }
 
 void LuxirConfig::resolveRamBudgets() {
@@ -412,6 +425,7 @@ void LuxirConfig::apply() const {
   LoadRegistry::enabled.store(search.fanout_grain_us >= 1, std::memory_order_relaxed);
   auto level = spdlog::level::from_str(log_level);
   spdlog::set_level(level);
+  setKnnScanWindows(knn.scan_window_bytes, knn.scan_ahead_bytes);
 }
 
 } // namespace luxir

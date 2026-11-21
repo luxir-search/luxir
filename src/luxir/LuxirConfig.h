@@ -210,6 +210,16 @@ struct SearchConfig {
   int32_t multiterm_min_prefix_length = 0;
 };
 
+struct KnnConfig {
+  // A flat (exact) kNN scan that reads most of a lazy (remote) vector file
+  // reads it in windows of scan_window_bytes, rounded down to whole vectors,
+  // and keeps the windows of the next scan_ahead_bytes fetching while it
+  // scores. Resident files are scanned in place. Applied to
+  // KnnQuery::tuning.scanWindowBytes and scanAheadBytes; they never change results.
+  int64_t scan_window_bytes = 8 * 1024 * 1024;
+  int64_t scan_ahead_bytes = 64 * 1024 * 1024;
+};
+
 struct ReplicationConfig {
   int64_t pin_idle_timeout_ms = 60'000;
   uint64_t pin_retained_bytes = 1024ULL * 1024 * 1024;
@@ -253,6 +263,7 @@ struct LuxirConfig {
   IndexConfig index;
   IngestConfig ingest;
   SearchConfig search;
+  KnnConfig knn;
 
   /// Register common CLI options on an app, bound to this config's fields.
   void addOptions(CLI::App& app);
@@ -266,7 +277,7 @@ struct LuxirConfig {
   /// Normalize and validate config after parsing.
   void normalize();
 
-  /// Apply non-node settings (e.g. spdlog level). Call after parse.
+  /// Apply non-node settings (e.g. spdlog level, process-wide kNN tuning). Call after parse.
   void apply() const;
 };
 

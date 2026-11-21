@@ -9,6 +9,9 @@
 #include <initializer_list>
 #include <limits>
 #include <type_traits>
+#include <functional>
+#include <span>
+#include <vector>
 #include <sys/resource.h>
 #include <unistd.h>
 #include "StrColReader.h"
@@ -45,6 +48,11 @@ namespace luxir {
 /// queues on demand, at most SPARSE_AHEAD_UNITS ahead.  Off, sparse checks
 /// wait for SPARSE_CHECK_UNITS units, which a shared gate gathers across
 /// short sequences; probes cover each sequence's start.
+///
+/// A column read by range from a lazy (remote) file has no page faults to
+/// observe, and every unread row is a blocking fetch.  declareAhead() keeps
+/// advice on for it and hands each batch's exact byte ranges to the file in
+/// one acquire batch (see declareAhead()), so the fetches of a batch run together.
 class RowReadAhead {
 public:
   /// Counter state of one thread, carried across consecutive uses on that
@@ -94,6 +102,9 @@ private:
   size_t runStart = 0;
   size_t runEnd = 0;
   size_t batchBytes = 0;
+  bool declare = false;               // declareAhead(): exact ranges, one sink call per batch
+  std::vector<ByteRange> declared;    // the batch being gathered
+  std::function<void(std::span<const ByteRange>)> sink;  // receives each batch (declareAhead())
 
   static size_t pageSize() {
     static const size_t size = (size_t)sysconf(_SC_PAGESIZE);
@@ -135,6 +146,10 @@ private:
     sample(faults, before);
     queue();
     flush();
+    if (!declared.empty()) {
+      sink(declared);
+      declared.clear();
+    }
     sample(faults, after);
     gate.faults = faults;
     gate.inblock = after;
@@ -149,7 +164,10 @@ private:
   }
 
   void flush() {
-    if (runEnd > runStart) file->prefetch(runStart, runEnd - runStart);
+    if (runEnd > runStart) {
+      if (declare) declared.push_back({runStart, runEnd - runStart});
+      else file->prefetch(runStart, runEnd - runStart);
+    }
     runStart = runEnd = 0;
   }
 
@@ -178,13 +196,28 @@ public:
 
   bool active() const { return gate.on; }
 
+  /// For rows read by range from a lazy file: advice stays on, and each
+  /// batch's rows are handed to `sink` as exact byte ranges in one call, which
+  /// acquires them (the caller keeps the holds).
+  /// The gate must be this sequence's own.
+  void declareAhead(std::function<void(std::span<const ByteRange>)> receive) {
+    if (file == nullptr || stride == 0 || rows <= 0) return;
+    declare = true;
+    sink = std::move(receive);
+    gate.on = gate.blind = true;
+    due = 0;
+  }
+
+  /// No advice from here on (the caller reads ahead by other means).
+  void disable() { due = NEVER; }
+
   /// Queues rows [first, end) for advice (clamped to the column).  Ranges in
   /// ascending order within mergeGap bytes coalesce into one prefetch.
   void queueRows(int64_t first, int64_t end, size_t mergeGap = 0) {
     first = std::max<int64_t>(first, 0);
     end = std::min(end, rows);
     if (first >= end) return;
-    size_t mask = pageSize() - 1;
+    size_t mask = declare ? 0 : pageSize() - 1;
     size_t start = (base + (size_t)first * stride) & ~mask;
     size_t stop = (base + (size_t)end * stride + mask) & ~mask;
     if (runEnd != 0 && start <= runEnd + mergeGap && stop >= runStart) {

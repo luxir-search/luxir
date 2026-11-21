@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstring>
+#include <vector>
 #include <format>
 #include <span>
 #include <stdexcept>
@@ -27,16 +29,57 @@ class VectorReader {
   StrColReader column;
   VectorEncoding vectorEncoding;
   int32_t dimensions;
+  // Deferred columns only: the ranges acquired ahead, sorted by file offset and
+  // disjoint, and the one-row hold of the last read that no range covered. A
+  // reader belongs to one thread, so this needs no lock.
+  struct Held {
+    uint64_t offset;
+    HeldRange hold;
+  };
+  mutable std::vector<Held> held;
+  mutable HeldRange single;
+  static constexpr size_t RELEASE_BEHIND = 16;
+
+  const char* heldRow(int64_t valueRank) const {
+    uint64_t offset = rowOffset(valueRank), length = (uint64_t)valueBytes();
+    auto it = std::upper_bound(held.begin(), held.end(), offset,
+        [](uint64_t value, const Held& entry) { return value < entry.offset; });
+    if (it != held.begin()) {
+      auto entry = std::prev(it);
+      if (offset + length <= entry->offset + entry->hold.getLength()) {
+        const char* row = entry->hold.getData() + (offset - entry->offset);
+        // Reads move forward: release the ranges behind this one, in steps.
+        if ((size_t)(entry - held.begin()) >= RELEASE_BEHIND) held.erase(held.begin(), entry);
+        return row;
+      }
+    }
+    // Not acquired ahead: one blocking range read. It is kept apart, so a row
+    // read this way never shadows a wider range that covers its neighbours.
+    single = column.valuesFile()->acquire(ByteRange{offset, length});
+    return single.getData();
+  }
+
+  uint64_t rowOffset(int64_t valueRank) const {
+    return (uint64_t)column.valuesOffset() + (uint64_t)valueRank * (uint64_t)valueBytes();
+  }
 
 public:
+  /// WHOLE acquires the column's value bytes at open. DEFERRED leaves them on
+  /// a file that fetches by range (an object store), where acquiring them would
+  /// download the whole column: planning, filter folds and rank-live bitmaps
+  /// read only the has-field bitset and the mono columns, and vectors are read
+  /// through acquire() and the windows the caller holds. On a resident file
+  /// (RAM, a mapping) the values are mapped either way and deferred() is false.
+  enum class Values { WHOLE, DEFERRED };
+
   /// The encoding recorded on a vector field's column descriptor.
   static VectorEncoding encodingOf(const DecodedFieldRecord& fieldInfo) {
     const auto* bytes = fieldInfo.bytesColumn();
     return (VectorEncoding)(bytes ? bytes->vectorEncoding : 0);
   }
 
-  VectorReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
-    : column(reader, fieldInfo),
+  VectorReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo, Values values = Values::WHOLE)
+    : column(reader, fieldInfo, values == Values::DEFERRED),
       vectorEncoding(encodingOf(fieldInfo)),
       dimensions(0) {
     if (!vcodec::valid((int32_t)vectorEncoding) || !column.isFixedSize()) {
@@ -61,6 +104,36 @@ public:
 
   int32_t docsWithField() const { return column.docsWithField(); }
 
+  /// True when the value bytes are acquired by range (see Values).
+  bool deferred() const { return column.deferredValues(); }
+
+  /// The file holding the values, and the range of vectors [from, to) in it.
+  InputFile* file() const { return column.valuesFile(); }
+  ByteRange windowRange(int64_t from, int64_t to) const {
+    return {rowOffset(from), (uint64_t)(to - from) * (uint64_t)valueBytes()};
+  }
+
+  /// Deferred columns: acquires the ranges together (one batch, so a backend
+  /// merges and issues them at once) and keeps the holds, so reads of the
+  /// vectors in them make no request. The ranges must not overlap each other
+  /// or ranges acquired before. Holds are released as reads move past them
+  /// (ascending ranks), so a walk that declares batches ahead of its reads
+  /// keeps the unread part of each; a read below the held ranges falls back
+  /// to a single blocking acquire.
+  ///
+  /// A view returned by rowAtRank() or vectorAtRank() of a
+  /// deferred column is valid only until the next read of this reader or the
+  /// next acquire(): use it at once.
+  void acquire(std::span<const ByteRange> ranges) {
+    if (ranges.empty()) return;
+    auto holds = column.valuesFile()->acquireAll(ranges);
+    for (size_t i = 0; i < ranges.size(); i++) {
+      auto it = std::upper_bound(held.begin(), held.end(), ranges[i].offset,
+          [](uint64_t value, const Held& entry) { return value < entry.offset; });
+      held.insert(it, Held{ranges[i].offset, std::move(holds[i])});
+    }
+  }
+
   int64_t numVectors() const { return column.numValues(); }
 
   bool multiValued() const { return column.multiValued(); }
@@ -68,6 +141,7 @@ public:
   /// Stored value (in this segment's encoding) at a global value rank
   /// (0..numVectors()-1).
   std::string_view rowAtRank(int64_t valueRank) const {
+    if (deferred()) return {heldRow(valueRank), (size_t)valueBytes()};
     return column.valueAt(valueRank);
   }
 
@@ -79,6 +153,7 @@ public:
   /// Decodes n consecutive vectors starting at valueRank into out (n * dims()).
   void decodeRange(int64_t valueRank, int64_t n, float* out) const {
     if (n <= 0) return;
+    assert(!deferred());  // reads consecutive rows through one view
     const char* base = rowAtRank(valueRank).data();
     int64_t stride = valueBytes();
     if (vectorEncoding == VectorEncoding::F32) {
@@ -95,7 +170,7 @@ public:
   /// bytes as floats would return garbage, so this is checked in every build.
   LUXIR_INLINE std::span<const float> vectorAtRank(int64_t valueRank) const {
     if (vectorEncoding != VectorEncoding::F32) [[unlikely]] notF32();
-    auto bytes = column.valueAt(valueRank);
+    auto bytes = rowAtRank(valueRank);
     return std::span<const float>((const float*)bytes.data(), (size_t)dimensions);
   }
 
