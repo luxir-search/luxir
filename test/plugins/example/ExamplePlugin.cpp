@@ -10,6 +10,7 @@
 
 #include "CountingStorage.h"
 #include "ExampleSearch.h"
+#include "ExampleSort.h"
 #include "luxir/api/build.h"
 #include "ExampleQuery.h"
 #include "luxir/plugin/Registries.h"
@@ -382,6 +383,7 @@ public:
       }
       return terms;
     });
+    r.sortKinds.add("abs_diff", ::example::makeAbsDiff);
     r.http.add("GET", "/_plugins/example/ping", [](HttpPluginRequest& request, HttpPluginResponse& response) {
       request.node.pluginState<::example::NodeState>("example")->routes++;
       const std::string* echo = request.queryParam("echo");
