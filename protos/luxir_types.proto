@@ -2769,6 +2769,20 @@ message SchemaDef {
   // the defaults without one. mode=set replaces the named entries and keeps
   // the others.
   map<string, StoredResourceDef> stored_resources = 4;
+
+  // Makes the collection append-only: documents carry no ids and nothing is
+  // deleted, so no write ever looks up existing documents. Absent in a SET
+  // request keeps the current setting; present with enabled=false clears it.
+  // Documents indexed before it was enabled keep their ids.
+  AppendOnly append_only = 8;
+  message AppendOnly {
+    bool enabled = 1;  // true makes the collection append-only; false clears it
+    enum IdPolicy {
+      REJECT_IDS = 0;  // a document with an id is rejected (a document error)
+      DROP_IDS = 1;    // the id is dropped and the document indexed without it
+    }
+    IdPolicy ids = 2;  // what happens to a document that carries an id
+  }
 }
 
 message SchemaRequest {

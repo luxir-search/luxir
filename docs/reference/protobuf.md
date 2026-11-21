@@ -186,6 +186,7 @@ defaults and constraints are described in the comments and guides.
 - [`RowSpaceStats`](#message-luxir.rowspacestats)
 - [`RrfFusion`](#message-luxir.rrffusion)
 - [`SchemaDef`](#message-luxir.schemadef)
+- [`SchemaDef.AppendOnly`](#message-luxir.schemadef.appendonly)
 - [`SchemaRequest`](#message-luxir.schemarequest)
 - [`SchemaResponse`](#message-luxir.schemaresponse)
 - [`ScrubStats`](#message-luxir.scrubstats)
@@ -2220,6 +2221,18 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 | <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. \_version\_ is fixed and retrieval-only: it returns the update version of the request that indexed each document, including allow\_dups and documents without an ID. |
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
 | <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. |
+| <a id="field-luxir.schemadef.append_only"></a>[`append_only`](#field-luxir.schemadef.append_only) | 8 | [`SchemaDef.AppendOnly`](#message-luxir.schemadef.appendonly) | singular | Makes the collection append-only: documents carry no ids and nothing is deleted, so no write ever looks up existing documents. Absent in a SET request keeps the current setting; present with enabled=false clears it. Documents indexed before it was enabled keep their ids. |
+
+<a id="message-luxir.schemadef.appendonly"></a>
+
+### luxir.SchemaDef.AppendOnly
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.schemadef.appendonly.enabled"></a>[`enabled`](#field-luxir.schemadef.appendonly.enabled) | 1 | `bool` | singular | true makes the collection append-only; false clears it |
+| <a id="field-luxir.schemadef.appendonly.ids"></a>[`ids`](#field-luxir.schemadef.appendonly.ids) | 2 | [`SchemaDef.AppendOnly.IdPolicy`](#enum-luxir.schemadef.appendonly.idpolicy) | singular | what happens to a document that carries an id |
 
 <a id="message-luxir.schemarequest"></a>
 
@@ -2888,6 +2901,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state)
 - [`RequestFlagBit`](#enum-luxir.requestflagbit)
 - [`ResponseFormat`](#enum-luxir.responseformat)
+- [`SchemaDef.AppendOnly.IdPolicy`](#enum-luxir.schemadef.appendonly.idpolicy)
 - [`SchemaRequest.Mode`](#enum-luxir.schemarequest.mode)
 - [`SelectionMode`](#enum-luxir.selectionmode)
 - [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir)
@@ -3174,6 +3188,17 @@ Bit positions in the packed request option word, not masks. The two date bits fo
 |---|---|---|
 | <a id="value-luxir.responseformat.envelope"></a>[`ENVELOPE`](#value-luxir.responseformat.envelope) | 0 |  |
 | <a id="value-luxir.responseformat.docs"></a>[`DOCS`](#value-luxir.responseformat.docs) | 1 |  |
+
+<a id="enum-luxir.schemadef.appendonly.idpolicy"></a>
+
+### luxir.SchemaDef.AppendOnly.IdPolicy
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.schemadef.appendonly.idpolicy.reject_ids"></a>[`REJECT_IDS`](#value-luxir.schemadef.appendonly.idpolicy.reject_ids) | 0 | a document with an id is rejected (a document error) |
+| <a id="value-luxir.schemadef.appendonly.idpolicy.drop_ids"></a>[`DROP_IDS`](#value-luxir.schemadef.appendonly.idpolicy.drop_ids) | 1 | the id is dropped and the document indexed without it |
 
 <a id="enum-luxir.schemarequest.mode"></a>
 
