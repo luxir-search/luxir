@@ -179,6 +179,9 @@ public:
     };
 
   private:
+    static constexpr int32_t BATCH = luxir::Postings::DOCS_BLOCK_SIZE;
+    static constexpr int32_t END = PostingsReader::END;
+
     std::span<Postings> postings;
     std::span<Norms> norms;
     Similarity::BM25Scorer* simScorer;
@@ -192,11 +195,16 @@ public:
     // TODO: OPT: settle() and next()/advance() visit every term's postings per
     // matching doc, so cost is linear in terms. A case_insensitive match has one
     // term per indexed case variant, with no cap; use a heap if that shows up.
-    int32_t settle() {
-      int32_t minDoc = PostingsReader::END;
+    LUXIR_INLINE int32_t settle() {
+      if (postings.size() == 1) {
+        doc = postings[0].docs->docId();
+        if (doc != END) freq = postings[0].weight * (float)postings[0].docs->termFreq();
+        return doc;
+      }
+      int32_t minDoc = END;
       for (auto& p : postings) minDoc = std::min(minDoc, p.docs->docId());
       doc = minDoc;
-      if (doc == PostingsReader::END) return doc;
+      if (doc == END) return doc;
       freq = 0.0f;
       for (auto& p : postings) {
         if (p.docs->docId() == doc) freq += p.weight * (float)p.docs->termFreq();
@@ -204,21 +212,72 @@ public:
       return doc;
     }
 
+    LUXIR_INLINE int32_t nextExact() {
+      if (doc == END) return doc;
+      for (auto& p : postings) {
+        if (p.docs->docId() <= doc) p.docs->next();
+      }
+      return settle();
+    }
+
+    LUXIR_INLINE int32_t advanceExact(int32_t target) {
+      for (auto& p : postings) {
+        if (p.docs->docId() < target) p.docs->advance(target);
+      }
+      return settle();
+    }
+
     // A document without the field reads as code 0, which decodes to length 0.
-    uint8_t code(Norms& n) {
-      if (n.flat != nullptr) return n.flat[doc];
-      if (n.sparse->docId() < doc) n.sparse->advance(doc);
-      return n.sparse->docId() == doc ? n.sparse->value() : 0;
+    static uint8_t codeAt(Norms& n, int32_t target) {
+      if (n.flat != nullptr) return n.flat[target];
+      if (n.sparse->docId() < target) n.sparse->advance(target);
+      return n.sparse->docId() == target ? n.sparse->value() : 0;
     }
 
     // Sums in field order, as the reference sum_f w_f * length_f(d) does. A
     // missing field adds +0.0, which leaves the non-negative sum unchanged.
     int64_t combinedNorm() {
-      if (pairNorms != nullptr) return pairNorms[(size_t)code(norms[0]) << 8 | code(norms[1])];
-      if (singleNorms != nullptr) return singleNorms[code(norms[0])];
+      if (pairNorms != nullptr) return pairNorms[(size_t)codeAt(norms[0], doc) << 8 | codeAt(norms[1], doc)];
+      if (singleNorms != nullptr) return singleNorms[codeAt(norms[0], doc)];
       double length = 0.0;
-      for (auto& n : norms) length += n.lengths[code(n)];
+      for (auto& n : norms) length += n.lengths[codeAt(n, doc)];
       return encodeLength(length);
+    }
+
+    // Field-major norm gather for ascending docs, then one vectorizable BM25
+    // pass. Each doc's length sums in field order, so every score is
+    // bit-identical to score().
+    LUXIR_NO_STACK_PROTECTOR
+    void scoreBatch(const int32_t* docs, const float* freqs, float* out, int32_t count) {
+      assert(count <= BATCH);
+      uint8_t normBuf[BATCH];
+      if (norms.empty()) {
+        std::fill(normBuf, normBuf + count, encodeLength(0.0));
+      } else if (pairNorms != nullptr) {
+        uint16_t pair[BATCH];
+        gatherCodes(norms[0], docs, count, [&](int32_t i, uint8_t c) { pair[i] = (uint16_t)(c << 8); });
+        gatherCodes(norms[1], docs, count, [&](int32_t i, uint8_t c) { pair[i] |= c; });
+        for (int32_t i = 0; i < count; i++) normBuf[i] = pairNorms[pair[i]];
+      } else if (singleNorms != nullptr) {
+        gatherCodes(norms[0], docs, count, [&](int32_t i, uint8_t c) { normBuf[i] = singleNorms[c]; });
+      } else {
+        double lengths[BATCH];
+        std::fill(lengths, lengths + count, 0.0);
+        for (auto& n : norms) {
+          gatherCodes(n, docs, count, [&](int32_t i, uint8_t c) { lengths[i] += n.lengths[c]; });
+        }
+        for (int32_t i = 0; i < count; i++) normBuf[i] = encodeLength(lengths[i]);
+      }
+      simScorer->scoreFreqBlock(freqs, normBuf, out, count);
+    }
+
+    template<class F>
+    LUXIR_INLINE static void gatherCodes(Norms& n, const int32_t* docs, int32_t count, F&& f) {
+      if (n.flat != nullptr) {
+        for (int32_t i = 0; i < count; i++) f(i, n.flat[docs[i]]);
+      } else {
+        for (int32_t i = 0; i < count; i++) f(i, codeAt(n, docs[i]));
+      }
     }
 
   public:
@@ -234,22 +293,70 @@ public:
     int32_t docId() override { return doc; }
 
     int32_t next() override {
-      for (auto& p : postings) {
-        if (p.docs->docId() <= doc) p.docs->next();
-      }
-      return settle();
+      return nextExact();
     }
 
     int32_t advance(int32_t target) override {
       assert(doc < target);
-      for (auto& p : postings) {
-        if (p.docs->docId() < target) p.docs->advance(target);
-      }
-      return settle();
+      return advanceExact(target);
     }
 
     float score() override {
       return simScorer->score(freq, combinedNorm());
+    }
+
+    LUXIR_NO_STACK_PROTECTOR
+    int32_t fillScoreBlock(int32_t* docs, float* scores, int32_t count, int32_t upTo) override {
+      assert(count >= 0);
+      if (doc < 0) next();
+      int32_t filled = 0;
+      float freqs[BATCH];
+      while (filled < count && doc < upTo) {
+        int32_t limit = std::min(count - filled, BATCH);
+        int32_t n = 0;
+        while (n < limit && doc < upTo) {
+          docs[filled + n] = doc;
+          freqs[n] = freq;
+          n++;
+          nextExact();
+        }
+        scoreBatch(docs + filled, freqs, scores + filled, n);
+        filled += n;
+      }
+      return filled;
+    }
+
+    LUXIR_NO_STACK_PROTECTOR
+    int32_t applyToCandidates(int32_t* docs, float* scores, int32_t size, bool required) override {
+      assert(size >= 0);
+      int32_t write = 0;
+      int32_t matchDocs[BATCH];
+      int32_t matchIdx[BATCH];
+      float freqs[BATCH];
+      float out[BATCH];
+      for (int32_t start = 0; start < size; start += BATCH) {
+        int32_t end = std::min(size, start + BATCH);
+        int32_t n = 0;
+        for (int32_t i = start; i < end; i++) {
+          int32_t target = docs[i];
+          if (doc < target) advanceExact(target);
+          if (doc == target) {
+            matchDocs[n] = target;
+            matchIdx[n] = i;
+            freqs[n] = freq;
+            n++;
+          }
+        }
+        scoreBatch(matchDocs, freqs, out, n);
+        for (int32_t j = 0; j < n; j++) scores[matchIdx[j]] += out[j];
+        if (!required) continue;
+        for (int32_t j = 0; j < n; j++) {
+          docs[write] = docs[matchIdx[j]];
+          scores[write] = scores[matchIdx[j]];
+          write++;
+        }
+      }
+      return required ? write : size;
     }
 
     // BM25 never reaches its idf weight, so it bounds every document.
@@ -264,6 +371,61 @@ public:
 
     ScoreBounds getScoreBounds(int32_t upTo) override {
       return ScoreBounds::nonNegative(getMaxScore(upTo));
+    }
+  };
+
+  // Top-level scored windows over the batch fill, as TermQuery's bulk
+  // scorer does for one term: no per-doc virtual calls between the collector
+  // and the postings merge.
+  class WindowBulkScorer final : public luxir::BulkScorer {
+    static constexpr int32_t kWindowSize = DocsEnumMeta::L1_DOCS;
+
+    Scorer* scorer;
+    std::span<int32_t> outDocs;
+    std::span<float> outScores;
+    int32_t maxDoc;
+    float minCompetitiveScore = std::numeric_limits<float>::lowest();
+
+  public:
+    WindowBulkScorer(MemPool& pool, Scorer* scorer, int32_t maxDoc)
+      : scorer(scorer), outDocs(pool.make_span<int32_t>(kWindowSize)),
+        outScores(pool.make_span<float>(kWindowSize)), maxDoc(maxDoc) {}
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
+                            float minScore) override {
+      max = std::min(max, maxDoc);
+      out.min = min;
+      out.max = min;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+      if (min >= max) return PostingsReader::END;
+      if (filter != nullptr && filter->card() == 0) return PostingsReader::END;
+      minCompetitiveScore = std::max(minCompetitiveScore, minScore);
+      int32_t doc = scorer->docId();
+      if (doc < min) doc = scorer->advance(min);
+      if (doc >= max) {
+        out.max = max;
+        return PostingsReader::END;
+      }
+      int32_t windowEnd = std::min(doc + kWindowSize, max);
+      out.min = doc;
+      out.max = windowEnd;
+      int32_t filled = scorer->fillScoreBlock(outDocs.data(), outScores.data(), kWindowSize, windowEnd);
+      if (filter != nullptr || minCompetitiveScore > std::numeric_limits<float>::lowest()) {
+        int32_t write = 0;
+        for (int32_t i = 0; i < filled; i++) {
+          if ((filter == nullptr || filter->get(outDocs[(size_t)i]))
+              && outScores[(size_t)i] >= minCompetitiveScore) {
+            outDocs[(size_t)write] = outDocs[(size_t)i];
+            outScores[(size_t)write] = outScores[(size_t)i];
+            write++;
+          }
+        }
+        filled = write;
+      }
+      out.size = filled;
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
   };
 
@@ -443,6 +605,24 @@ public:
       Query::ScorerPlan* resolve(
           MemPool& planPool, const Query::PlanContext& planContext) override {
         return planPool.make<Plan>(*this, planContext, describeScorer(planContext), cost());
+      }
+
+      // Scored windows only; counts and filters stay with the caller.
+      BulkPlan planBulk(BulkUse use, const BulkScorerContext& bulkContext) override {
+        unused(use);
+        if (bulkContext.requireConstantCount || bulkContext.requireFilterConsumption
+            || weight.simScorer == nullptr || cost() == 0) {
+          return {};
+        }
+        return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO};
+      }
+
+      luxir::BulkScorer* buildBulk(MemPool& targetPool, const BulkPlan& plan) override {
+        assert(plan.available == BulkAnswer::YES);
+        unused(plan);
+        auto* scorer = static_cast<Scorer*>(weight.createScorer(targetPool, segment));
+        if (scorer == nullptr) return nullptr;
+        return targetPool.make<WindowBulkScorer>(targetPool, scorer, segment.maxDoc());
       }
     };
 
