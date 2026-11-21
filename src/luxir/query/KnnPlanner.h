@@ -20,19 +20,21 @@ namespace luxir {
 // predicted microseconds. Features have the same units as actualWork below.
 struct KnnPlanner {
   enum class Routing { AUTO, FORCE_IVF, FORCE_EXACT };
-  enum class Codec { FLAT, PQ, RABITQ };
+  enum class Codec { FLAT, PQ, RABITQ, PQ4 };
   enum class Selector { AUTO, RESOLVE, FOLD }; // Round one only; deepen always folds.
   enum Unit { EXACT_DIM, TERMINAL_DIM, TERMINAL_READ, DOMAIN_DOC, RANK_VISIT, FLAT_PROBE, SPARSE_MAP, MULTI_MAP,
               ENTRY_NONE, ENTRY_BITMAP, ENTRY_PQ, ENTRY_MISPREDICT, RESOLVE_IDENTITY, RESOLVE_SELECT, RESOLVE_MONO,
               BIT_PROBE, ARRAY_STEP, PQ_SUBCODE, PQ_BIT, ONE_BIT_DIM, EXTRA_BIT_DIM,
               PQ_LIST_SETUP, PQ_TABLE_DIM, RABITQ_LIST_DIM, COARSE_DIM, ROUND, IVF_REQUEST, FOLD_DOC, FOLD_WORD,
-              SCORER_DIM, SCORER_LIST_DIM, ONE_BIT_CODE, EXTRA_BIT_CODE, SCORER_CODE, NUM_UNITS };
+              SCORER_DIM, SCORER_LIST_DIM, ONE_BIT_CODE, EXTRA_BIT_CODE, SCORER_CODE, PQ4_CODE, PQ4_SUBCODE, PQ4_LIST,
+              NUM_UNITS };
   static constexpr std::array<std::string_view, NUM_UNITS> unitNames{
     "exact_dims", "terminal_dims", "terminal_reads", "domain_docs", "rank_visits", "flat_probes", "sparse_maps", "multi_maps",
     "entry_none", "entry_bitmap", "entry_pq", "entry_mispredict", "resolve_identity", "resolve_select", "resolve_mono",
     "bit_probes", "array_steps", "pq_subcodes", "pq_bits", "one_bit_dims", "extra_bit_dims",
     "pq_list_setups", "pq_table_dims", "rabitq_list_dims", "coarse_dims", "ivf_slot_rounds", "ivf_request", "fold_docs", "fold_words",
-    "scorer_dims", "scorer_list_dims", "one_bit_codes", "extra_bit_codes", "scorer_codes"};
+    "scorer_dims", "scorer_list_dims", "one_bit_codes", "extra_bit_codes", "scorer_codes", "pq4_codes", "pq4_subcodes",
+    "pq4_lists"};
   using Work = std::array<double, NUM_UNITS>;
   struct Costs {
     // Forced-arm fit on munin at 3.3 GHz with FAISS 1.16.0 and AVX-512: SIFT 1M
@@ -52,6 +54,7 @@ struct KnnPlanner {
     // reaching the code, so per-dimension units alone overprice wide vectors.
     // The scorer's selector test does not branch, so it pays no ENTRY_MISPREDICT.
     static constexpr double NS_PER_DIM = 0.135;
+    static constexpr double PQ4_CODE_NS = 1, PQ4_SUBCODE_NS = 0.02, PQ4_LIST_NS = 100;
     Work units{1, 0.338 / NS_PER_DIM, 195 / NS_PER_DIM, 21.6 / NS_PER_DIM, 1, 4, 16, 24,
                1, 0.889 / NS_PER_DIM, 3.02 / NS_PER_DIM, 23.1 / NS_PER_DIM, 0, 16, 24,
                9.0 / NS_PER_DIM, 1.65 / NS_PER_DIM, 0.392 / NS_PER_DIM, 0,
@@ -59,7 +62,8 @@ struct KnnPlanner {
                0.0377 / NS_PER_DIM, 1690 / NS_PER_DIM, 144300 / NS_PER_DIM,
                5.49 / NS_PER_DIM, 0.5 / NS_PER_DIM,
                0.00868 / NS_PER_DIM, 0.340 / NS_PER_DIM,
-               7.50 / NS_PER_DIM, 17.7 / NS_PER_DIM, 7.50 / NS_PER_DIM};
+               7.50 / NS_PER_DIM, 17.7 / NS_PER_DIM, 7.50 / NS_PER_DIM,
+               PQ4_CODE_NS / NS_PER_DIM, PQ4_SUBCODE_NS / NS_PER_DIM, PQ4_LIST_NS / NS_PER_DIM};
     double requestCost = 18400 / NS_PER_DIM; // Common to both arms, once per query.
     // Fraction of one-bit RaBitQ candidates that pass the gate to the
     // extra-bit pass, for an independent filter at the selectivities where
@@ -154,6 +158,7 @@ struct KnnPlanner {
     return s.codec != Codec::FLAT && s.liveVectors > 0 && s.eligibleDocs > 0;
   }
   static double predictedChecks(const Segment& s, double fraction) { return fraction * s.vectors; }
+  static constexpr double PQ4_CHUNK_CODES = 256; // Pq4ListScan's chunk.
   static double mispredicts(double examined, double passes) {
     if (examined <= 0) return 0;
     double p = std::clamp(passes / examined, 0.0, 1.0);
@@ -214,7 +219,7 @@ struct KnnPlanner {
     // Both resolve and folded selectors pay these terms. They cancel in
     // the round-one selector crossover; allocator liveness probes do not.
     if (s.codec == Codec::PQ && (!s.unfiltered || s.deletes)) p.linear[ENTRY_PQ] = (double)s.vectors;
-    p.linear[ENTRY_MISPREDICT] = usesScorer(s) ? 0 : mispredicts((double)s.vectors, (double)s.eligibleVectors);
+    p.linear[ENTRY_MISPREDICT] = s.codec == Codec::PQ4 || usesScorer(s) ? 0 : mispredicts((double)s.vectors, (double)s.eligibleVectors);
     if (s.deletes) {
       // Allocation probes physical ids for liveness too. Allow one extra
       // head list for nextFraction's lookahead at the round boundary.
@@ -224,6 +229,12 @@ struct KnnPlanner {
     if (s.codec == Codec::PQ) {
       p.linear[PQ_SUBCODE] = (double)s.eligibleVectors * s.pqM;
       p.linear[PQ_BIT] = p.linear[PQ_SUBCODE] * s.pqBits;
+    } else if (s.codec == Codec::PQ4) {
+      // The kernel scores whole chunks, so the filter does not reduce its work
+      // until chunks start to hold no eligible code at all.
+      double pass = (double)s.eligibleVectors / std::max((int64_t)1, s.vectors);
+      p.linear[PQ4_CODE] = (double)s.vectors * (1 - std::pow(1 - pass, PQ4_CHUNK_CODES));
+      p.linear[PQ4_SUBCODE] = p.linear[PQ4_CODE] * s.pqM;
     } else {
       p.linear[usesScorer(s) ? SCORER_CODE : ONE_BIT_CODE] = (double)s.eligibleVectors;
       p.linear[usesScorer(s) ? SCORER_DIM : ONE_BIT_DIM] = (double)s.eligibleVectors * s.dims;
@@ -235,6 +246,9 @@ struct KnnPlanner {
     if (s.codec == Codec::PQ) {
       p.linear[PQ_LIST_SETUP] = s.l2 && !s.pqPerListTable ? (double)s.nlist * s.pqM : 0;
       p.linear[PQ_TABLE_DIM] = s.pqPerListTable ? (double)s.nlist * (1 << s.pqBits) * s.dims : 0;
+    } else if (s.codec == Codec::PQ4) {
+      p.linear[PQ4_LIST] = (double)s.nlist;
+      p.fixed[PQ_TABLE_DIM] = 16.0 * s.dims; // One table per query and segment.
     } else p.linear[usesScorer(s) ? SCORER_LIST_DIM : RABITQ_LIST_DIM] = (double)s.nlist * s.dims;
     p.fixed[COARSE_DIM] = (double)s.nlist * s.dims;
     p.a = costs.price(p.linear);
@@ -457,7 +471,7 @@ struct KnnPlanner {
     f[ENTRY_NONE] = (double)w.selectorNone; f[ENTRY_BITMAP] = (double)(w.selectorBitmap + w.allocatorEntries);
     if (s.codec == Codec::PQ)
       f[ENTRY_PQ] = (double)(w.selectorBitmap + w.resolveIdentity + w.resolveSelect + w.resolveMono);
-    f[ENTRY_MISPREDICT] = usesScorer(s) ? 0 : mispredicts((double)w.physicalEntries, (double)w.selectorPasses);
+    f[ENTRY_MISPREDICT] = s.codec == Codec::PQ4 || usesScorer(s) ? 0 : mispredicts((double)w.physicalEntries, (double)w.selectorPasses);
     f[RESOLVE_IDENTITY] = (double)w.resolveIdentity; f[RESOLVE_SELECT] = (double)w.resolveSelect;
     f[RESOLVE_MONO] = (double)w.resolveMono;
     f[BIT_PROBE] = (double)w.bitProbes; f[ARRAY_STEP] = (double)w.arraySteps;
@@ -468,6 +482,11 @@ struct KnnPlanner {
     f[EXTRA_BIT_DIM] = (double)w.extraBitScores * std::max(0, s.rabitqBits - 1) * s.dims;
     f[PQ_LIST_SETUP] = s.codec == Codec::PQ && s.l2 && !s.pqPerListTable ? (double)w.listSetups * s.pqM : 0;
     f[PQ_TABLE_DIM] = s.codec == Codec::PQ && s.pqPerListTable ? (double)w.listSetups * (1 << s.pqBits) * s.dims : 0;
+    if (s.codec == Codec::PQ4) {
+      f[PQ4_CODE] = (double)w.fastScanCodes; f[PQ4_SUBCODE] = f[PQ4_CODE] * s.pqM;
+      f[PQ4_LIST] = (double)w.listSetups;
+      f[PQ_TABLE_DIM] = w.listSetups > 0 ? 16.0 * s.dims : 0;
+    }
     if (s.codec == Codec::RABITQ) f[usesScorer(s) ? SCORER_LIST_DIM : RABITQ_LIST_DIM] = (double)w.listSetups * s.dims;
     f[FOLD_DOC] = (double)w.foldDocs; f[FOLD_WORD] = (double)w.foldWords;
     f[COARSE_DIM] = (double)w.coarseDims; f[ROUND] = (double)w.ivfRounds;

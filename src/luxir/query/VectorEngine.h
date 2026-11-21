@@ -19,6 +19,8 @@ struct VectorSearchWork {
   int64_t listSetups = 0, physicalEntries = 0, selectorPasses = 0;
   int64_t newListSelectorPasses = 0, newListLiveVectors = 0, depthEntries = 0;
   int64_t pqScores = 0, oneBitScores = 0, extraBitScores = 0, gateRejections = 0;
+  // Codes through the pq4 kernel, padding lanes included.
+  int64_t fastScanCodes = 0;
   int64_t exactVectors = 0, domainDocs = 0, domainProbes = 0;
   int64_t seedReads = 0, remainingReads = 0, scoreBytes = 0;
   // Logical scan mappings/probes exclude optional read-ahead metadata work.
@@ -39,6 +41,7 @@ struct VectorSearchWork {
     newListLiveVectors += other.newListLiveVectors;
     depthEntries += other.depthEntries;
     pqScores += other.pqScores;
+    fastScanCodes += other.fastScanCodes;
     oneBitScores += other.oneBitScores;
     extraBitScores += other.extraBitScores;
     gateRejections += other.gateRejections;

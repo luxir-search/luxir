@@ -714,14 +714,14 @@ POST /collections/books/_schema
 
 | Field | Meaning |
 |---|---|
-| `codec` | `rabitq` (default) or explicit `pq`. |
+| `codec` | `rabitq` (default), or explicit `pq` or `pq4`. |
 | `nlist` | IVF lists per segment overlay. Absent or `0`: `sqrt(segment vectors)`, capped at 4096. |
 | `rabitq.bits` | Bits per dimension, `0` to `9`. Absent or `0` (default): automatic from the stored dimension, 2 below 384 dims and 1 at or above. |
 | `rabitq.query_bits` | Bits the query is quantized to while scanning, `0` to `8`; `0` scans with the float query. Default `4`. |
-| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide the stored dimension (`truncate_dims` when set). Absent or `0`: automatic from the stored dimension, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, stored dims / 8)` for every metric. If none does, use the largest divisor under the same cap. |
-| `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. |
+| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide the stored dimension (`truncate_dims` when set). Absent or `0`: automatic from the stored dimension, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, stored dims / 8)` for every metric, doubled for `pq4`. If none does, use the largest divisor under the same cap. |
+| `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. Codec `pq4` is always 4-bit: `4` or absent. |
 
-`pq` settings require an explicit `"codec":"pq"`, for example
+`pq` settings require an explicit `"codec":"pq"` or `"codec":"pq4"`, for example
 `"ann":{"codec":"pq","pq":{"m":96}}`.
 Omitting the codec selects RaBitQ, including for `ann:{}`, `nlist` alone, or
 `rabitq` settings alone; a `pq` object does not infer the codec. A field
@@ -758,6 +758,38 @@ only if it fits within the overlay's raw vector bytes (`ntotal * dims * 4`);
 otherwise FAISS computes tables per list. IP/cosine has no resident L2 table.
 PQ codebooks are retrained for every segment build and merge; automatic `m`
 depends only on stored dimensions.
+
+**PQ4** (explicit, inner product and cosine only) stores 4-bit PQ codes packed
+in blocks of 32, and the scan looks codes up in SIMD registers instead of
+memory. Automatic `m` is twice PQ's, so above 256 dimensions a vector takes the
+same code bytes as automatic PQ (768 dimensions: `m=192`, 96 bytes). Below 256
+dimensions the limit of 4 dimensions per sub-quantizer gives fewer code bytes
+than PQ, for example 16 instead of 32 at 128 dimensions; that range has not been
+measured.
+
+Its estimates are noisier than PQ's at equal code bytes, so its default
+candidate pool has four times the headroom (486 candidates at `k=10` instead of
+129, 2588 at `k=100`). Each candidate is an exact read from the vector column,
+about three times RaBitQ's default reads at `k=10`, which matters when the
+column is not in the page cache. A smaller `refine_candidates` trades recall for
+latency. Raising `ivf.nprobe` without enough candidates gains little.
+
+Blocks add padding of about 16 codes per list on average, so about
+`16 / sqrt(vectors)` of the codes section at the default `nlist`: 1.6% at 1M
+vectors, 16% at 10k. Segments below 624 vectors (39 training points for each of
+the 16 centroids) get no overlay and are searched exactly.
+
+Every PQ codec ranks poorly on queries unlike the indexed data. With
+uniform-random queries on 1M 768-dimension Cohere embeddings, recall@10 at
+default effort was 0.29 for PQ4 and 0.19 for PQ, against 0.64 for RaBitQ (whose
+interval selection reads far more candidates on such queries, 9.6 ms against
+0.7 ms). Use RaBitQ if your queries may not resemble your data. Because PQ4 sums
+are 16-bit, many codes tie exactly; which tied codes stay in a very small pool
+depends on list order, which makes recall at tiny pools more order-sensitive
+than with PQ.
+
+ARM speed is unmeasured. FAISS's kernels run on NEON, with less advantage
+expected from their 256-bit emulation over two registers.
 
 Scan and rescore costs depend on codec, dimension, candidate policy and query.
 Higher RaBitQ bit counts generally narrow the intervals and reduce exact reads,

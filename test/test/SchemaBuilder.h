@@ -39,6 +39,14 @@ inline api::VectorAnnDef pqAnn(int32_t nlist = 0, int32_t m = 0, int32_t bits = 
   return ann;
 }
 
+inline api::VectorAnnDef pq4Ann(int32_t nlist = 0, int32_t m = 0) {
+  api::VectorAnnDef ann;
+  ann.codec = api::VectorAnnDef::Codec::PQ4;
+  ann.nlist = nlist;
+  ann.pq.emplace().m = m;
+  return ann;
+}
+
 inline api::VectorAnnDef rabitqAnn(int32_t nlist = 0, int32_t bits = 1, int32_t queryBits = 4) {
   api::VectorAnnDef ann;
   ann.codec = api::VectorAnnDef::Codec::RABITQ;
