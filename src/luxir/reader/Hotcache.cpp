@@ -143,6 +143,10 @@ public:
     for (const auto& range : ranges) owner.add(name, range);
     inner->prefetchRanges(ranges);
   }
+  void fetchRanges(std::span<const ByteRange> ranges, ReadDeadline deadline, FetchDone done) override {
+    for (const auto& range : ranges) owner.add(name, range);
+    inner->fetchRanges(ranges, deadline, std::move(done));
+  }
   void prefetch(size_t offset, size_t length) override {
     owner.add(name, {offset, length});
     inner->prefetch(offset, length);
