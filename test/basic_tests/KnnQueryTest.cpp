@@ -2249,6 +2249,48 @@ TEST_F(KnnQueryTest, defaultNProbeScalesWithDims) {
   EXPECT_LE(scaledDefault, plainDefault * 3) << plainDefault;
 }
 
+// Above the reference cap the default stops on the examined-code target,
+// not on the fraction rule's coverage. A small cap exercises the large-N path.
+TEST_F(KnnQueryTest, defaultEffortStopsOnExaminedTargetAboveCap) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::tuning.referenceCap);
+  CollectionHelper h("main");
+  constexpr int32_t dims = 32;
+  installVecSchema(h.collection(), api::VectorMetric::L2, rabitqAnn(64), dims);
+  std::mt19937 rng(11);
+  std::normal_distribution<float> gauss;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 4096; i++) {
+    std::vector<float> v(dims);
+    for (auto& x : v) x = gauss(rng);
+    docs.push_back(flatdoc("id", std::to_string(i), "embedding_v", v));
+  }
+  h.indexAll(docs);
+  h.commit({"*"});
+  std::vector<float> query(dims);
+  for (auto& x : query) x = gauss(rng);
+  auto run = [&](int32_t cap) {
+    KnnQuery::tuning.referenceCap = cap;
+    KnnQuery::Stats stats;
+    KnnQuery::statsForTests = &stats;
+    auto* req = makeKnnReq(*luxirNode, "embedding_v", query, 5);
+    req->execute();
+    EXPECT_EQ(5u, resultIds(*req).size());
+    req->done();
+    KnnQuery::statsForTests = nullptr;
+    return std::pair{stats.targetExamined.load(), stats.coveredFraction.load()};
+  };
+  // Reference sqrt(4096) = 64 lists. Under the default cap: 1/sqrt(64) floor.
+  auto [fractionTarget, fractionCoverage] = run(KnnPlanner::DEFAULT_REFERENCE_CAP);
+  EXPECT_DOUBLE_EQ(4096.0 / 8, fractionTarget);
+  EXPECT_GE(fractionCoverage + 1e-12, 1.0 / 8);
+  // Cap 16: 16^1.5 codes at 256 vectors, +25% per doubling: 64 * 2 = 128.
+  auto [examinedTarget, examinedCoverage] = run(16);
+  EXPECT_DOUBLE_EQ(128, examinedTarget);
+  EXPECT_LT(examinedCoverage, fractionCoverage);
+}
+
 TEST_F(KnnQueryTest, filteredCoverageBudgetAndCaps) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);

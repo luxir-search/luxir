@@ -840,10 +840,11 @@ still make the search approximate.
 
 `ivf.nprobe` is interpreted as the number of lists
 Luxir would probe if the field were a single IVF index built with
-`nlist = sqrt(live_vector_count)`, capped the same way as the builder's
-`nlist`. That total effort is spread across the current per-segment indexes,
-so a merge does not change the effort a request asks for. An explicit `nprobe`
-pins the effort cap; an adaptive one may deepen when filters or collapse
+`nlist = sqrt(live_vector_count)`. Unlike the builder's `nlist`, this
+reference is not capped at 4096, so `nprobe` means about `nprobe *
+sqrt(live_vector_count)` examined vectors at any size. That total effort is
+spread across the current per-segment indexes, so a merge does not change the
+effort a request asks for. An explicit `nprobe` pins the effort cap; an adaptive one may deepen when filters or collapse
 underfill the result. The adaptive default starts at `sqrt(nlist)` of that
 reference index for fields of up to 128 stored dimensions and scales by
 `sqrt(dims / 128)` above that (capped at 4x), where `dims` is the stored
@@ -854,11 +855,23 @@ measurements on GIST and Cohere embeddings showed recall@10 rising from
 them, multi-bit RaBitQ skips the extra-bit evaluation for vectors that cannot
 compete, and candidate selection decides which vectors are read exactly.
 
+The `sqrt(nlist)` rule uses a reference index of at most 4096 lists, so it
+applies up to about 16.7M live vectors. Above that, a fixed fraction would
+examine a constant share of the collection (3.8% at 768 dimensions, 38M
+vectors at 1B). Instead, the adaptive default targets a number of examined
+vectors: the rule's count at 16.7M vectors, raised by 25% for each doubling of
+the collection beyond it and for each doubling of `k` beyond 10. The query
+starts at that target's fraction and stops once it has examined that many
+filter-passing vectors and filled its candidate obligations; it has no
+minimum list coverage, except `ivf.min_scan_fraction` when set. These growth
+constants are a starting point and have not been calibrated on collections
+of that size.
+
 The reference size includes all live vectors; the scan fraction is charged
 only against segments searched through IVF. With default probes, a filter
 expands that fraction by `s^(-1/4)`, capped at one, where `s` is the eligible
 fraction of vectors in those IVF segments. The default fraction itself scales
-as `N^(-1/4)` with index size, so this treats the eligible vectors like an
+as `N^(-1/4)` with index size up to the cap, so this treats the eligible vectors like an
 index of their own and keeps filtered recall near unfiltered recall. Explicit
 `nprobe` keeps its pin and receives no filter expansion. Default-probe queries
 also keep widening until newly scanned lists have yielded the number of
