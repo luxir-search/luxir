@@ -151,6 +151,18 @@ present in its part mask. A separately placed extent has an absolute file
 number and offset. Adjacent pieces share that location and carry lengths
 where the reader cannot derive them from the record and row-space counts.
 
+The parts are the term dictionary and its postings, one column, points,
+norms, a stored-fields resource, a docs bitmap, end value ranks, vector
+owners, and the id filter. The id filter is a part of the root `id` field
+only: a split-block Bloom filter over the dictionary's terms, about 10 bits
+per term in 32-byte blocks, sized for the segment's document count. Its keys
+are the XXH3 of each term as the dictionary stores it (the fitted form, so a
+long id is never falsely absent), the same hash whose low byte the term
+blocks keep. Every flush and merge rebuilds it from the terms it writes, so
+it has exactly one key per term. The writer checks an id against the exact
+dictionary bounds in the record header and then the filter, and looks up
+only the segments and ids that pass. About 1% of absent ids pass.
+
 Each field record encodes the schema flags as an unsigned vint, excluding
 `ABSTRACT` and `DERIVED`. Bits 0-2 encode the cumulative postings level
 (0, 1, 3 or 7). Bits 3-7 are `COLUMN_STORED`, `MULTI_VALUED`, `STORED`,
@@ -195,9 +207,9 @@ needs:
 - a merge policy that leaves old, large segments alone, or merges that fetch
   their inputs through the cache;
 - id lookups for updates and deletes that skip cold segments without
-  fetching them. Append-only collections need no lookups. Otherwise
-  per-segment id ranges, which the writer already keeps, and per-segment id
-  filters do the skipping;
+  fetching them. Append-only collections need no lookups. Otherwise the
+  exact id bounds in each segment's catalog and its id filter part do the
+  skipping, from the catalog alone;
 - the syncer reporting which files are published, so that eviction knows
   what it may drop.
 

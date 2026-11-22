@@ -32,6 +32,7 @@
 #include "IndexFieldInfo.h"
 #include "luxir/reader/SegmentCatalog.h"
 #include "luxir/reader/CatalogRange.h"
+#include "luxir/reader/IdFilter.h"
 #include "luxir/reader/Space.h"
 #include "ScreamingBuilder.h"
 #include "luxir/codec/Codec.h"
@@ -542,6 +543,12 @@ public:
 
   const CatalogRange& catalogRange() const noexcept { return catalog; }
 
+  // Charges working memory held until a field finishes, such as an id filter
+  // builder, to the owner's budget along with staged streams.
+  void accountRam(int64_t delta) {
+    if (onStagedRamDelta && delta) onStagedRamDelta(delta);
+  }
+
   int64_t getSizeInBytes() {
     return sizeInBytes;
   }
@@ -902,6 +909,8 @@ private:
   int64_t sumDocFreq = 0; // updated in endTerm
   int64_t numTerms;  // Number of terms in completed dictionary blocks.
   uint8_t segFlags = 0;  // Data facts from the kept terms.
+  // A root ID dictionary's membership filter, fed with the hash each term block keeps.
+  std::optional<IdFilter::Builder> idFilter;
 
   // TODO: pool allocate this
   std::vector<char> compressed_output;
@@ -1332,6 +1341,9 @@ public:
     posOutput(posOutput), buildTrie(false) {
   }
 
+  TextWriter(const TextWriter&) = delete;
+  ~TextWriter() { dropIdFilter(); }
+
   void startField(SpaceOrdinal rowSpace, const PostingsWriter::IndexFieldInfo& field) {
     startField(rowSpace, field.header.name, field.header.flags, field.header.type);
   }
@@ -1351,6 +1363,14 @@ public:
     posLoc = posOutput.size();
     numTerms = 0;
     segFlags = 0;
+    dropIdFilter();
+    if (fieldType == FieldType::ID && rowSpace == SpaceOrdinal::ROOT) {
+      // Ranges of a partitioned merge would each see part of the keys.
+      if (!buildTrie) throw std::logic_error("a root id dictionary must be written by one writer");
+      // A segment holds at most one id term per root document.
+      idFilter.emplace((uint64_t)std::max(postingsWriter.getMaxDoc(SpaceOrdinal::ROOT), 1));
+      postingsWriter.accountRam((int64_t)idFilter->sizeInBytes());
+    }
 
     termBlockOffsets.resize(0);
     trieBuilder.reset();
@@ -1658,10 +1678,12 @@ public:
     termOutput.write(&termPulsedMask, sizeof(termPulsedMask));
     termOutput.writeVint((uint32_t) suffixBlob.size());
 
-    // now write hashes of the terms
+    // now write hashes of the terms; an id filter takes the whole hash
     for (int i=0; i<nTerms; i++) {
       auto term = termList[i];
-      termOutput.write((char)XXH3_64bits(term.data(), term.size()));
+      auto hash = IdFilter::hash({term.data(), term.size()});
+      termOutput.write((char)hash);
+      if (idFilter) idFilter->add(hash);
     }
 
     termOutput.write(prefixLens.data(), prefixLens.size());
@@ -1976,6 +1998,7 @@ public:
         postingsWriter.idRange = IdRange{};
         postingsWriter.idDictionaryBlocks = 0;
       }
+      dropIdFilter();
       return written;
     }
 
@@ -1993,9 +2016,31 @@ public:
              && bounds.upperMode == field_parts::DictionaryBounds::Upper::INCLUSIVE);
       postingsWriter.idRange = IdRange{std::string(std::string_view(bounds.lower)), std::string(std::string_view(bounds.upper)), false};
       postingsWriter.idDictionaryBlocks = result.nBlocks;
+      written.idFilter = finishIdFilter(result.nTerms);
     }
     return written;
   }
+
+private:
+  // Writes the filter as its own slice. Every dictionary term is exactly one key.
+  field_parts::Slice finishIdFilter(int64_t terms) {
+    assert(idFilter);
+    if (idFilter->numKeys() != (uint64_t)terms) throw std::logic_error("id filter keys differ from dictionary terms");
+    auto stream = postingsWriter.getOutputStream();
+    auto bytes = idFilter->encoded();
+    stream->write(bytes.data(), bytes.size());
+    auto slice = postingsWriter.finishStream(std::move(stream));
+    dropIdFilter();
+    return slice;
+  }
+
+  void dropIdFilter() noexcept {
+    if (!idFilter) return;
+    postingsWriter.accountRam(-(int64_t)idFilter->sizeInBytes());
+    idFilter.reset();
+  }
+
+public:
 
   void startDoc(int32_t doc) {
     unused(doc);
