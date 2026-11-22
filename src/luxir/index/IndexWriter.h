@@ -869,6 +869,10 @@ private:
                             std::vector<std::string>& outFilesToSync);
   // The published reader's copy of `seg`, or null; `reader` keeps it valid.
   const Segment* publishedSegment(const SegInfo& seg, std::shared_ptr<IndexReader>& reader);
+  // Live docs generation `gen` of `seg`: the published reader's when it holds that
+  // generation, else loaded from its file. A loaded sparse generation is a heap
+  // bitmap; its bytes are charged to `guard`, which the caller holds as long.
+  std::shared_ptr<LiveDocs> loadLiveDocs(const SegInfo& seg, uint64_t gen, uint64_t epoch, IndexRamBudget::Guard& guard);
   // The segment's core: its slot's, else the published reader's, else a new one; the
   // slot keeps it.
   std::shared_ptr<SegmentCore> getSegmentCore(SegInfo& seg);
