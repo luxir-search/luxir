@@ -4,6 +4,7 @@
 #include "FieldRecordCodec.h"
 
 #include "CatalogIO.h"
+#include "IdFilter.h"
 #include "Space.h"
 #include "luxir/index/IndexFieldInfo.h"
 
@@ -234,6 +235,9 @@ void checkHeader(const Errors& errors, const FieldRecordHeader& header, int32_t 
   }
   if (parts.has(FieldPart::OWNERS) && (!parts.has(FieldPart::COLUMN)
       || type != FieldType::VECTOR || !(flags & FieldType::MULTI_VALUED))) errors.invalid("reverse owners on non-multivalue vector");
+  if (parts.has(FieldPart::FILTER) && (type != FieldType::ID || !parts.has(FieldPart::TERMS))) {
+    errors.invalid("id filter without an id dictionary");
+  }
 
   auto storage = FieldType::storage(type);
   bool lexical = storage == FieldType::Storage::TERMS || storage == FieldType::Storage::TEXT;
@@ -472,6 +476,10 @@ public:
       case FieldPart::OWNERS:
         mono(io, slice, header.numValues, "reverse owners index layout");
         break;
+      case FieldPart::FILTER:
+        extents.add(io, slice);
+        if (!IdFilter::validSize(slice.bytes)) io.invalid("id filter size");
+        break;
       default: std::unreachable();
     }
   }
@@ -709,7 +717,8 @@ constexpr size_t descriptorBytes() {
 
 constexpr std::array partBytes{
     descriptorBytes<Terms>(), size_t(0), descriptorBytes<Points>(), descriptorBytes<Norms>(),
-    descriptorBytes<Stored>(), descriptorBytes<Slice>(), descriptorBytes<Slice>(), descriptorBytes<Slice>()
+    descriptorBytes<Stored>(), descriptorBytes<Slice>(), descriptorBytes<Slice>(), descriptorBytes<Slice>(),
+    descriptorBytes<Slice>()
 };
 static_assert(partBytes.size() == NUM_PARTS);
 
@@ -806,6 +815,7 @@ void outputParts(Writer& out, const IndexFieldInfo& field, PartChecks* checks) {
   if (parts.has(FieldPart::DOCS)) outputSlice(out, checks, FieldPart::DOCS, field.docs);
   if (parts.has(FieldPart::VALUE_RANKS)) outputSlice(out, checks, FieldPart::VALUE_RANKS, field.endValueRanks);
   if (parts.has(FieldPart::OWNERS)) outputSlice(out, checks, FieldPart::OWNERS, field.owners);
+  if (parts.has(FieldPart::FILTER)) outputSlice(out, checks, FieldPart::FILTER, field.idFilter);
 }
 
 } // namespace
@@ -939,6 +949,7 @@ FieldRecordPtr FieldRecordCodec::decode(std::span<const char> bytes, int32_t max
   if (parts.has(FieldPart::DOCS)) read(FieldPart::DOCS);
   if (parts.has(FieldPart::VALUE_RANKS)) read(FieldPart::VALUE_RANKS);
   if (parts.has(FieldPart::OWNERS)) read(FieldPart::OWNERS);
+  if (parts.has(FieldPart::FILTER)) read(FieldPart::FILTER);
   checks.finish(in);
   in.requireEnd();
   return record;

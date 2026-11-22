@@ -62,6 +62,7 @@ struct EncodedFieldRecord {
     field.docs = source.docsBitmap();
     field.endValueRanks = source.endValueRanks();
     field.owners = source.owners();
+    field.idFilter = source.idFilter();
     copyRuns();
     encode(maxDoc);
   }
