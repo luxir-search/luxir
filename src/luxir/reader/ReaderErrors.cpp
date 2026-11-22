@@ -16,7 +16,7 @@ void corruptSegment(std::string_view segment, std::string_view reason,
   auto context = std::format("Segment '{}'", segment);
   if (fileNumber != UINT32_MAX) context += std::format(", file '{}'", Postings::getIndexFileName(segment, fileNumber));
   if (!field.empty()) context += std::format(", field '{}'", field);
-  throw std::runtime_error(std::format("{} is corrupt or in an unsupported format: {}", context, reason));
+  throw SegmentCorruptError(std::format("{} is corrupt or in an unsupported format: {}", context, reason));
 }
 
 void SegmentReadContext::invalid(std::string_view reason, std::string_view prefix) const {
@@ -29,7 +29,7 @@ void SegmentReadContext::invalid(std::string_view reason, std::string_view prefi
     auto name = field.isNull() ? std::string_view() : std::string_view(field);
     corruptSegment(core->segmentName(), reason, name, file);
   }
-  throw std::runtime_error(std::string(reason));
+  throw SegmentCorruptError(std::string(reason));
 }
 
 SegmentReadContext segmentReadContext(const SegmentCore& core, const DecodedFieldRecord& fieldInfo,
