@@ -328,7 +328,15 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
   // means "adaptive default" for every knob it carries.
   int32_t nprobe = 0;
   float minScanFraction = 0.0f;
+  std::optional<float> ratioGate;
   if (knnQuery.ivf.has_value()) {
+    if (knnQuery.ivf->ratio_gate.has_value()) {
+      ratioGate = *knnQuery.ivf->ratio_gate;
+      if (!std::isfinite(*ratioGate) || *ratioGate < 0.0f) {
+        throw std::runtime_error(std::format(
+          "KnnQuery for field '{}' has ivf.ratio_gate {}; it must be finite and >= 0", field, *ratioGate));
+      }
+    }
     nprobe = knnQuery.ivf->nprobe;
     minScanFraction = knnQuery.ivf->min_scan_fraction;
     if (minScanFraction < 0.0f || minScanFraction > 1.0f) {
@@ -360,7 +368,7 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
     }
   }
 
-  return pool.make<luxir::KnnQuery>(
+  auto* knn = pool.make<luxir::KnnQuery>(
     field, vectorType, queryVec, k, nprobe, knnQuery.refine_candidates,
     minScanFraction, knnQuery.exact, groups ? context.collapse : nullptr,
     similarity, context.fields.path().empty() ? std::string_view{} : api::build::arenaStr(pool, context.fields.path()),
@@ -369,6 +377,8 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
       auto& req = *context.view.owner();
       return &req.ownershipRelation(*req.pinView(target.path), *context.view.get());
     }());
+  knn->setRatioGate(ratioGate);
+  return knn;
 }
 
 std::span<Query*> ProtobufQueryParser::parseQueryList(

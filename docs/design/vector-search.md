@@ -600,7 +600,38 @@ an absolute candidate count set by k and recall (a few hundred leaves per
 machine, or a few thousand postings at 1B in SPANN). `g` and the cap-continuity
 anchor are placeholders until a scale sweep above 16.7M vectors fits them.
 Profiles report the rule as `effort=fraction|examined|nprobe` with
-`target_examined`. On SIFT
+`target_examined`.
+
+Under examined effort two rules can end widening before the target, using
+evidence the scan already has. Both stop breadth only, never depth, and both
+are off for explicit `nprobe` and below the cap, where the fraction is still a
+coverage floor.
+
+- **Ratio gate.** The allocator stops at the first list whose query-to-centroid
+  distance exceeds `(1 + eps)` times that of the query's first allocated list
+  (SPANN's query-aware pruning; Vespa's HNSW-IF uses a distance threshold too).
+  Distances are L2 in the orthonormally rotated space, so they compare across
+  codecs and segments; inner-product quantizers recover them from squared
+  centroid norms computed once when the index loads. `eps` defaults to
+  `0.3 * sqrt(128 / dims)`, since centroid distances concentrate as the
+  dimension grows (`tuning.ratioGateScale`); a request overrides it with
+  `ivf.ratio_gate`, `0` turning it off.
+- **Patience.** Round one scans a quarter of the effort target
+  (`tuning.patienceStart`) and breadth then doubles toward it. A breadth round
+  that admitted no interval record above the witness floor, changed none of the
+  k witnesses, and moved no candidate into the bounded cut (no new pooled
+  document and no better k-th pooled score) ends the query (the termination
+  idea of DARTH and LAET: stop when more probes stop changing the top k).
+
+When either rule fires at coverage `c`, the examined-code obligation becomes
+`min(target, c * eligibleVectors)`: the yield an independent filter gives at
+`c`. Unfiltered scans meet it already; an anti-correlated filter, whose
+eligible vectors lie in lists the rule cut off, keeps widening until they have
+yielded that many, as do unmet fill and unit obligations. Profiles report the
+stop as `stop=effort|ratio_gate|patience|pool_full|exhausted|nprobe` with the
+`ratio_gate` eps in use. The planner does not model either rule; its coverage
+prediction is the effort target. The gate scale and patience start are
+placeholders until a scale sweep fits them. On SIFT
 1M and miracl 1M it keeps independent-filter recall at or above unfiltered
 recall at default effort; `s^(-1/2)` bought recall above that at about twice
 the latency for 10-30% filters. The fraction is floored by `min_scan_fraction` and capped

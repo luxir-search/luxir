@@ -115,6 +115,8 @@ class KnnQuery final : public luxir::Query {
   int32_t nprobe;
   int32_t refineCandidates;
   float minScanFraction;
+  // ivf.ratio_gate: unset = default eps, 0 = off.
+  std::optional<float> ratioGate;
   bool exact;
   const CollapsePlan* groups;
   std::string_view resultPath, sourcePath;
@@ -178,6 +180,7 @@ public:
     std::atomic<int64_t> newListSelectorPasses{0}, depthEntries{0}, pqScores{0}, oneBitScores{0}, terminalReads{0};
     std::atomic<double> initialBudget{0}, coveredFraction{0}, targetExamined{0};
     std::atomic<int64_t> plannedExact{0}, plannedIvf{0}, switches{0};
+    std::atomic<int64_t> ratioGateStops{0}, patienceStops{0};
     std::atomic<int64_t> foldedEligible{0}, foldedRemaining{0};
     std::atomic<double> predictedCost{0}, modeledActualCost{0};
     std::array<std::atomic<double>, KnnPlanner::NUM_UNITS> costWork{}, predictedExactWork{};
@@ -231,7 +234,20 @@ public:
     // that target's relative growth per doubling of N and of k.
     int32_t referenceCap = KnnPlanner::DEFAULT_REFERENCE_CAP;
     double examinedGrowth = KnnPlanner::DEFAULT_EXAMINED_GROWTH;
+    // Early stops under examined effort. Ratio gate: eps = ratioGateScale *
+    // sqrt(128 / dims) (centroid distances concentrate as dims grow); 0
+    // disables the default. Patience: round one scans this share of the
+    // effort target, and breadth then doubles while rounds still change the
+    // top k; 0 disables it.
+    double ratioGateScale = DEFAULT_RATIO_GATE_SCALE;
+    double patienceStart = 0.25;
   };
+  static constexpr double DEFAULT_RATIO_GATE_SCALE = 0.3;
+  // A request's ivf.ratio_gate replaces the default eps; 0 turns it off.
+  static double resolvedRatioGate(std::optional<float> requested, int32_t dims) {
+    if (requested) return std::max(0.0, (double)*requested);
+    return tuning.ratioGateScale * std::sqrt(128.0 / (double)std::max(1, dims));
+  }
   static Tuning tuning;
   static constexpr double FLAT_RANGE_POINT_DENSITY = 1.0 / 128.0;
 
@@ -765,6 +781,8 @@ public:
         && refineCandidates == rhs.refineCandidates
         && std::bit_cast<uint32_t>(minScanFraction)
             == std::bit_cast<uint32_t>(rhs.minScanFraction)
+        && ratioGate.has_value() == rhs.ratioGate.has_value()
+        && (!ratioGate || std::bit_cast<uint32_t>(*ratioGate) == std::bit_cast<uint32_t>(*rhs.ratioGate))
         && exact == rhs.exact
         && similarity.has_value() == rhs.similarity.has_value()
         && (!similarity.has_value()
@@ -790,6 +808,7 @@ public:
     value = mixHash(value, nprobe);
     value = mixHash(value, refineCandidates);
     value = mixHash(value, std::bit_cast<uint32_t>(minScanFraction));
+    if (ratioGate) value = mixHash(value, std::bit_cast<uint32_t>(*ratioGate));
     value = mixHash(value, exact);
     value = mixHash(value, groups != nullptr);
     if (groups != nullptr) {
@@ -823,6 +842,8 @@ public:
   int32_t getNProbe() const noexcept { return nprobe; }
   int32_t getRefineCandidates() const noexcept { return refineCandidates; }
   float getMinScanFraction() const noexcept { return minScanFraction; }
+  std::optional<float> getRatioGate() const noexcept { return ratioGate; }
+  void setRatioGate(std::optional<float> gate) noexcept { ratioGate = gate; }
   bool getExact() const noexcept { return exact; }
   const std::optional<float>& getSimilarity() const noexcept {
     return similarity;
@@ -864,6 +885,8 @@ public:
     out.appendInt32(nprobe);
     out.appendInt32(refineCandidates);
     out.appendFloat(minScanFraction);
+    out.appendBool(ratioGate.has_value());
+    if (ratioGate) out.appendFloat(*ratioGate);
     out.appendBool(exact);
     out.appendBool(groups != nullptr);
     if (groups != nullptr) {
@@ -894,6 +917,8 @@ public:
     out.appendDouble(tuning.breadthGrowth);
     out.appendInt32(tuning.referenceCap);
     out.appendDouble(tuning.examinedGrowth);
+    out.appendDouble(tuning.ratioGateScale);
+    out.appendDouble(tuning.patienceStart);
     out.appendInt32(defaultAnnBreadthReferenceDims);
     // Test wrappers may alter candidate selection without a keyable semantic
     // contract.
@@ -1332,7 +1357,7 @@ public:
             .ivfEngine = std::make_unique<SegmentIvfScanner<Groups, Owned>>(
                 *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
                 metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
-                vaux->getAmplitudes(), interval ? &intervals : nullptr),
+                vaux->getAmplitudes(), interval ? &intervals : nullptr, vaux->getCentroidNorms()),
           });
         } else {
           slots.push_back({
@@ -1471,7 +1496,20 @@ public:
       }
       double maxFraction = query.getNProbe() > 0 ? initialFraction : 1;
       double targetExamined = query.getNProbe() > 0 ? 0 : initialFraction * ivfEligibleVectors;
-      double scanFraction = initialFraction, coveredFraction = 0;
+      // Early stops apply where the initial fraction is no coverage floor:
+      // default effort above the reference cap. Explicit nprobe pins effort.
+      // Once a rule fires, the effort obligation shrinks to the eligible
+      // yield an independent filter gives at that coverage (stopCoverage),
+      // so anti-correlated filters still widen.
+      const bool earlyStop = KnnPlanner::examinedEffort(executionEffort);
+      const double gateEps = earlyStop ? resolvedRatioGate(query.getRatioGate(), dims) : 0;
+      const bool patience = earlyStop && tuning.patienceStart > 0;
+      double stopCoverage = -1;
+      std::string_view stopRule = query.getNProbe() > 0 ? "nprobe" : "effort";
+      int64_t breadthRounds = 0, lastPooled = 0, lastIntervalProgress = 0;
+      float lastKth = -INFINITY;
+      double scanFraction = patience ? std::max(coverageFloor, initialFraction * tuning.patienceStart) : initialFraction;
+      double coveredFraction = 0;
       int64_t eligibleExamined = 0;
       VectorSearchRound round = VectorSearchRound::BREADTH;
       auto baseEngine = std::make_unique<CompositeVectorEngine<Groups, Owned>>(std::move(slots), ivfLiveTotal, kDocs,
@@ -1653,6 +1691,7 @@ public:
           .round = round,
           .eligible = std::span<const std::span<const uint8_t>>(eligibleSpans),
           .perKey = perKey,
+          .ratioGate = round == VectorSearchRound::BREADTH && stopCoverage < 0 ? gateEps : 0,
         };
         VectorSearchResult result = engine->search(request);
         roundNumber++;
@@ -1714,6 +1753,25 @@ public:
           poolSize = groupPool->size();
         }
         bool boundedDone = !boundedEngine || pooled >= targetDocReq || poolSize >= maxVectorHits;
+        if (earlyStop && request.round == VectorSearchRound::BREADTH) {
+          // Patience: a widening round that admitted no interval record above
+          // the witness floor, changed no witness, and moved no candidate
+          // into the bounded cut did not change the top k.
+          float kth = -INFINITY;
+          if constexpr (!Groups) if (!docHits.empty() && (int64_t)docHits.size() >= targetDocReq) {
+            kth = INFINITY;
+            for (const auto& hit : docHits) kth = std::min(kth, hit.score);
+          }
+          bool progressed = (intervalEngine && intervals.progress() != lastIntervalProgress)
+              || (boundedEngine && (pooled > lastPooled || kth > lastKth));
+          lastIntervalProgress = intervals.progress(); lastPooled = pooled; lastKth = kth;
+          breadthRounds++;
+          if (stopCoverage < 0 && (result.ratioGated || (patience && breadthRounds > 1 && !progressed))) {
+            stopCoverage = coveredFraction;
+            stopRule = result.ratioGated ? "ratio_gate" : "patience";
+            if (statsForTests) (result.ratioGated ? statsForTests->ratioGateStops : statsForTests->patienceStops)++;
+          }
+        }
         intervals.resetBoundedUnits();
         UnitKeyReader<Groups> keyReader(query.groups);
         for (const auto& hit : candidateHits) {
@@ -1725,17 +1783,22 @@ public:
         bool unitsFilled = intervals.unitCount() >= (size_t)unitTarget;
         // Independent filters fluctuate around f*E. Two sqrt(target) is
         // conservative binomial slack; keep tiny/full-coverage targets exact.
-        double slack = targetExamined >= 64 && initialFraction < 1
-            ? std::min(2 * std::sqrt(targetExamined), targetExamined * 0.25) : 0;
-        bool examinedDone = (double)eligibleExamined >= targetExamined - slack;
+        double effortExamined = stopCoverage < 0 ? targetExamined
+            : std::min(targetExamined, stopCoverage * (double)ivfEligibleVectors);
+        double slack = effortExamined >= 64 && initialFraction < 1
+            ? std::min(2 * std::sqrt(effortExamined), effortExamined * 0.25) : 0;
+        bool examinedDone = (double)eligibleExamined >= effortExamined - slack;
         // FORCE exercises completion even when round one already filled or
         // exhausted the ANN arm. Production completion only prices more work.
         if (tuning.completion == Completion::FORCE && tryComplete(request)) continue;
-        bool coverageDone = coveredFraction + 1e-15 >= coverageFloor || result.breadthExhausted;
+        // Patience reaches the effort target in steps; until a rule fires it
+        // must cover it, as the single round it replaces would.
+        double floor = patience && stopCoverage < 0 ? std::max(coverageFloor, initialFraction) : coverageFloor;
+        bool coverageDone = coveredFraction + 1e-15 >= floor || result.breadthExhausted;
         if (boundedDone && unitsFilled && examinedDone && coverageDone) break;
         // A full candidate pool cannot take another hit, so wider scans would
         // be wasted work whatever the remaining obligations.
-        if (!intervalEngine && poolSize >= maxVectorHits) break;
+        if (!intervalEngine && poolSize >= maxVectorHits) { stopRule = "pool_full"; break; }
 
         // DEPTH: document mode projects the pool size needed for targetDocReq
         // docs from observed docs-per-candidate yield, then requests only
@@ -1774,13 +1837,23 @@ public:
         }
 
         if (!result.breadthExhausted && coveredFraction + 1e-15 < maxFraction) {
-          double target = std::max(result.nextFraction, initialFraction);
+          // Patience widens geometrically toward the target so a stalled
+          // round can end the query; a fired rule leaves only obligations.
+          bool gradual = patience && stopCoverage < 0;
+          double target = stopCoverage >= 0 || gradual ? result.nextFraction
+              : std::max(result.nextFraction, initialFraction);
           if (!boundedDone) target = std::max(target,
               projectedScanFraction(coveredFraction, (double)targetDocReq, (double)pooled));
           if (!unitsFilled) target = std::max(target,
               projectedScanFraction(coveredFraction, (double)unitTarget, (double)intervals.unitCount()));
-          if (!examinedDone) target = std::max(target,
-              projectedScanFraction(coveredFraction, targetExamined, (double)eligibleExamined));
+          if (!examinedDone) {
+            double projected = projectedScanFraction(coveredFraction, effortExamined, (double)eligibleExamined);
+            // Doubling stops at the effort target, as a single round would.
+            if (gradual) projected = std::min(projected, std::max(result.nextFraction,
+                coveredFraction < initialFraction ? std::min(coveredFraction * tuning.breadthGrowth, initialFraction)
+                                                  : coveredFraction * tuning.breadthGrowth));
+            target = std::max(target, projected);
+          }
           // The next whole list may overshoot the pin; allocation stops as
           // soon as the capped fraction is reached, just as in round one.
           scanFraction = std::min(target, maxFraction);
@@ -1792,6 +1865,7 @@ public:
           continue;
         }
 
+        if (result.breadthExhausted) stopRule = "exhausted";
         break;
       }
 
@@ -1884,10 +1958,10 @@ public:
                 plan.ivf[i] ? (double)work.newListLiveVectors / std::max((int64_t)1, segLiveVectorCounts[i]) : 1,
                 work.physicalEntries, work.selectorPasses, work.seedReads + work.remainingReads));
             if (firstIvfPiece)
-              piece.details.push_back(std::format("reference_nlist={:.0f}; initial_nprobe={:.6g}; effort={}; target_examined={:.0f}; eligible_examined={}",
+              piece.details.push_back(std::format("reference_nlist={:.0f}; initial_nprobe={:.6g}; effort={}; target_examined={:.0f}; eligible_examined={}; stop={}; ratio_gate={:.6g}",
                   referenceBreadth, initialNprobe, query.getNProbe() > 0 ? "nprobe"
                       : KnnPlanner::examinedEffort(executionEffort) ? "examined" : "fraction",
-                  targetExamined, eligibleExamined));
+                  targetExamined, eligibleExamined, stopRule, gateEps));
             if (work.ivfRounds > 0)
               piece.details.push_back(std::format("segment_nlist={}; lists_probed={}", input.nlist, listsProbed[i]));
             for (size_t f = 0; f < features.size(); f++)
@@ -1969,6 +2043,7 @@ public:
     template <bool Groups, bool Owned> class SegmentIvfScanner {
       const CollapsePlan* groupPlan;
       RaBitQAmplitudes amplitudes;
+      std::span<const float> centroidNorms;
       KnnIntervalCollector<Groups>* intervals;
 
       /// Resolve-based eligibility selector over the live-filtered query
@@ -2178,8 +2253,9 @@ public:
                         IndexReader::Segment& seg, const Binding<Owned>& v2d, DocSet* domain,
                         std::shared_ptr<const RankLiveBitmap> rankLive, int32_t metric,
                         const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
-                        RaBitQAmplitudes amplitudes, KnnIntervalCollector<Groups>* intervals)
-          : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
+                        RaBitQAmplitudes amplitudes, KnnIntervalCollector<Groups>* intervals,
+                        std::span<const float> centroidNorms = {})
+          : groupPlan(groupPlan), amplitudes(amplitudes), centroidNorms(centroidNorms), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
             segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
             domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
                                         && domain == &liveDocs->docset()),
@@ -2202,6 +2278,21 @@ public:
         // The rotation is orthonormal, so these distances compare directly
         // with other segments' (rotated or not) in the global list ranking.
         ivf.quantizer->search(1, preparedQuery.query, (faiss::idx_t)ivf.nlist, centroidDists.data(), listIds.data());
+      }
+      // Query-to-centroid L2 distances for the ratio gate, parallel to a
+      // coarse run. Inner-product quantizers recover them from the squared
+      // centroid norms; without those the run stays ungated (empty).
+      void gateDistances(int32_t dims, std::span<const faiss::idx_t> listIds,
+                         std::span<const float> centroidDists, std::vector<float>& out) const {
+        bool ip = ivf.metric_type == faiss::METRIC_INNER_PRODUCT;
+        if (ip && centroidNorms.size() != ivf.nlist) return;
+        float queryNorm = ip ? faiss::fvec_norm_L2sqr(preparedQuery.query, (size_t)dims) : 0.0f;
+        out.resize(listIds.size());
+        for (size_t i = 0; i < listIds.size(); i++) {
+          float squared = !ip ? centroidDists[i] : listIds[i] < 0 ? INFINITY
+              : queryNorm + centroidNorms[(size_t)listIds[i]] - 2 * centroidDists[i];
+          out[i] = std::sqrt(std::max(0.0f, squared));
+        }
       }
 
       /// Live vector count of one IVF list - the unit the global allocator
@@ -2768,6 +2859,7 @@ public:
         std::vector<faiss::idx_t> listIds;
         std::vector<float> centroidDists;
         std::vector<int64_t> liveSizes; // Lazy, shared by preview and dispatch.
+        std::vector<float> gateDists;   // Ratio gate only; empty = ungated.
       };
 
       struct CoarseHead {
@@ -2801,6 +2893,10 @@ public:
         std::vector<int32_t> heapIndexes;
         int32_t heapSize = 0;
         double cost = 0;
+        // Ratio gate: the first allocated list's centroid distance, and
+        // whether the last BREADTH allocation stopped at the gate.
+        float gateBase = NAN;
+        bool gated = false;
       };
       std::vector<CoarseRun> runs;
       Allocation allocation;
@@ -2843,6 +2939,8 @@ public:
           auto* ivf = slots[i].ivfEngine.get();
           if (ivf == nullptr || slots[i].liveVectorCount <= 0 || ivf->getNList() <= 0) continue;
           ivf->coarseRun(request.dims, runs[i].listIds, runs[i].centroidDists);
+          if (request.ratioGate > 0)
+            ivf->gateDistances(request.dims, runs[i].listIds, runs[i].centroidDists, runs[i].gateDists);
           runs[i].liveSizes.assign(runs[i].listIds.size(), -1);
           workBySeg[(size_t)slots[i].segOrd].coarseDims += (int64_t)ivf->getNList() * request.dims;
           while (allocation.cursors[i] < runs[i].listIds.size() && runs[i].listIds[allocation.cursors[i]] < 0)
@@ -2875,6 +2973,15 @@ public:
           advance = false;
           int32_t slot = pq.indexOfTop();
           size_t cursor = state.cursors[(size_t)slot];
+          // SPANN-style query-aware pruning: lists much farther than the
+          // nearest centroid rarely hold neighbors. It limits breadth only.
+          if (const auto& gate = runs[(size_t)slot].gateDists; request.ratioGate > 0 && !gate.empty()) {
+            if (std::isnan(state.gateBase)) state.gateBase = gate[cursor];
+            else if ((double)gate[cursor] > (1 + request.ratioGate) * (double)state.gateBase) {
+              state.gated = true;
+              break;
+            }
+          }
           int64_t live = liveSize((size_t)slot, cursor);
           append((size_t)slot, cursor, live);
           if (ivfLiveTotal > 0) state.cost += (double)live / ivfLiveTotal;
@@ -2890,6 +2997,7 @@ public:
 
       void allocateToBudget(const VectorSearchRequest& request) {
         ensureCoarseReady(request);
+        allocation.gated = false;
         allocate(allocation, request, [&](size_t slot, size_t cursor, int64_t live) {
           selectedListIds[slot].push_back(runs[slot].listIds[cursor]);
           selectedCentroidDists[slot].push_back(runs[slot].centroidDists[cursor]);
@@ -3085,6 +3193,7 @@ public:
         merged.coveredFraction = coveredFraction();
         merged.breadthExhausted = breadthExhausted();
         merged.nextFraction = nextFraction();
+        merged.ratioGated = allocation.gated;
         return merged;
       }
     };

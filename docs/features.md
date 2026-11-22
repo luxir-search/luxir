@@ -364,7 +364,7 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - ANN indexes are segment overlays: built at commit from the vector column and
   carried through merges automatically, without reindexing documents.
 - Effort knobs: `k`, `refine_candidates`, `exact`, and per-engine knobs under
-  `ivf` (`nprobe`, `min_scan_fraction`).
+  `ivf` (`nprobe`, `min_scan_fraction`, `ratio_gate`).
 - `similarity` threshold in the metric's own space (maximum L2 distance,
   minimum dot product or cosine), with Elasticsearch `knn.similarity`
   semantics: below-threshold neighbors leave results, counts, and facets.

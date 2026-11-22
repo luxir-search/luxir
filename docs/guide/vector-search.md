@@ -813,6 +813,7 @@ every index type.
 | `refine_candidates` | Select the bounded candidate policy for every approximate codec, with this document budget clamped up to `k`. Unset: RaBitQ uses intervals; PQ uses the count formula below. |
 | `ivf.nprobe` | IVF effort, merge-stable (see below). `0` or absent: adaptive, may deepen automatically. |
 | `ivf.min_scan_fraction` | A floor on the fraction of live vector values scanned in the searched IVF segments, in `[0,1]`; `0.001` means 0.1%. |
+| `ivf.ratio_gate` | Above about 16.7M live vectors, adaptive effort stops widening at the first list whose centroid is more than `1 + ratio_gate` times as far as the nearest probed one. Absent: a default that shrinks with dimension; `0`: off. Ignored with an explicit `nprobe`. |
 
 An explicit `refine_candidates` selects bounded collection for every approximate
 segment, including RaBitQ. Without it, PQ uses
@@ -863,9 +864,13 @@ vectors: the rule's count at 16.7M vectors, raised by 25% for each doubling of
 the collection beyond it and for each doubling of `k` beyond 10. The query
 starts at that target's fraction and stops once it has examined that many
 filter-passing vectors and filled its candidate obligations; it has no
-minimum list coverage, except `ivf.min_scan_fraction` when set. These growth
-constants are a starting point and have not been calibrated on collections
-of that size.
+minimum list coverage, except `ivf.min_scan_fraction` when set. Two rules can
+stop it sooner: the ratio gate (`ivf.ratio_gate`) skips lists whose centroids
+are much farther than the nearest one, and a patience rule ends widening after
+a round that did not change the top k. A filter whose matches lie away from
+the query still widens until it has examined the matches expected at the
+coverage reached. These constants are a starting point and have not been
+calibrated on collections of that size.
 
 The reference size includes all live vectors; the scan fraction is charged
 only against segments searched through IVF. With default probes, a filter

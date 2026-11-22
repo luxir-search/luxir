@@ -98,6 +98,9 @@ private:
   std::mutex mutex;
   std::atomic<float> publishedFloor{NO_FLOOR};
   size_t peak = 0, nextPrune = 64;
+  // Progress counters for early stopping: interval records admitted while a
+  // witness floor exists, and changes to the k witnesses.
+  int64_t admittedAboveFloor = 0, witnessChanges = 0;
 
   Unit& unitFor(const auto& key) {
     auto found = units.find(key);
@@ -134,8 +137,11 @@ private:
   void witness(Unit& unit, float lower) {
     if (lower <= unit.lower) return;
     unit.lower = lower;
-    if (unit.heapPos != NO_SLOT) siftDown(unit.heapPos);
-    else if ((int64_t)witnesses.size() < k) {
+    if (unit.heapPos != NO_SLOT) {
+      witnessChanges++;
+      siftDown(unit.heapPos);
+    } else if ((int64_t)witnesses.size() < k) {
+      witnessChanges++;
       size_t pos = witnesses.size();
       witnesses.push_back(&unit);
       while (pos > 0 && witnesses[(pos - 1) / 2]->lower > lower) {
@@ -146,6 +152,7 @@ private:
       witnesses[pos] = &unit;
       unit.heapPos = pos;
     } else if (lower > witnesses[0]->lower) {
+      witnessChanges++;
       witnesses[0]->heapPos = NO_SLOT;
       witnesses[0] = &unit;
       siftDown(0);
@@ -184,6 +191,8 @@ public:
   std::pmr::memory_resource* memoryResource() { return &resource; }
   float floorScore() const { return publishedFloor.load(std::memory_order_relaxed); }
   size_t peakRetained() const { return peak; }
+  // Only at a round barrier: advances once a breadth round improved either.
+  int64_t progress() const { return admittedAboveFloor + witnessChanges; }
   size_t unitCount() const { return units.size(); }
   std::pmr::vector<Record>& retained() { return records; }
 
@@ -205,6 +214,7 @@ public:
       Unit& unit = unitFor(pending.key);
       witness(unit, pending.lower);
       if (pending.upper >= std::max(floorScore(), unit.lower)) {
+        admittedAboveFloor += floorScore() != NO_FLOOR;
         records.push_back({pending.hit, pending.upper, &unit});
         unit.references++;
         peak = std::max(peak, records.size());

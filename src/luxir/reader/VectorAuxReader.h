@@ -4,6 +4,7 @@
 #pragma once
 
 #include <faiss/Index.h>
+#include <faiss/IndexFlat.h>
 #include <faiss/IndexIVF.h>
 #include <faiss/IndexIVFPQ.h>
 #include <faiss/IndexIVFRaBitQ.h>
@@ -21,6 +22,7 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -298,6 +300,9 @@ class VectorAuxReader : public AuxReader {
   // (shared across overlays by internVectorRotation); null otherwise.
   mutable std::shared_ptr<const VectorRotation> rotation;
   mutable RaBitQAmplitudes amplitudes;
+  // Squared centroid norms for inner-product quantizers (empty otherwise), so
+  // the coarse ranking can recover centroid distances.
+  mutable std::vector<float> centroidNorms;
   VectorAuxMeta meta;
   VectorAuxListsFooter footer;
   mutable std::mutex unitCountMutex;
@@ -376,6 +381,7 @@ public:
   /// (ENGINE_IVFRABITQ), or null.  Valid after getFaissIndex().
   const VectorRotation* getRotation() const noexcept { return rotation.get(); }
   const RaBitQAmplitudes& getAmplitudes() const { getFaissIndex(); return amplitudes; }
+  std::span<const float> getCentroidNorms() const { getFaissIndex(); return centroidNorms; }
 
   // Search-time entry point: the IVF index (for ENGINE_IVFRABITQ, the index
   // behind the rotation; see getRotation).  Decode is lazy and once-only;
@@ -463,6 +469,13 @@ public:
       // index does not own the mmap lists (this reader does, alongside the
       // file view they point into).
       ivf->replace_invlists(lists.get(), /*own=*/false);
+      if (ivf->metric_type == faiss::METRIC_INNER_PRODUCT) {
+        if (auto* flat = dynamic_cast<faiss::IndexFlat*>(ivf->quantizer);
+            flat != nullptr && flat->ntotal == (faiss::idx_t)ivf->nlist) {
+          centroidNorms.resize(ivf->nlist);
+          faiss::fvec_norms_L2sqr(centroidNorms.data(), flat->get_xb(), (size_t)ivf->d, ivf->nlist);
+        }
+      }
       mmapLists = std::move(lists);
       faissIndex = std::move(idx);
       rotation = std::move(rot);
