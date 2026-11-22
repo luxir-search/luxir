@@ -518,6 +518,11 @@ cached version to its schema tenant and released with its last user. This is
 separate from RAM backing-file bytes and allocator RSS; it excludes allocator
 overhead and analysis factories' private resources.
 
+`memory.live_docs_heap_bytes` is the heap held by live docs generations loaded
+from sparse files (segments with few deletes store the deleted doc ids, which
+are expanded to a bitmap of one bit per document when loaded). Generations with
+more deletes are memory-mapped bitmaps and appear as page cache instead.
+
 ### Prometheus scraping
 
 Prometheus scrapes `/metrics` by default, so a job needs only its targets.
