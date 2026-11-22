@@ -6,6 +6,7 @@
 #include "PostingsReader.h"
 #include "SegmentCatalog.h"
 #include "CatalogRange.h"
+#include "IdFilter.h"
 #include "VersionRuns.h"
 #include <map>
 #include <mutex>
@@ -107,6 +108,13 @@ public:
   PostingsReader& rootReader() noexcept { return root; }
   const PostingsReader& rootReader() const noexcept { return root; }
   const VersionRuns& versionRuns() const noexcept { return versions; }
+
+  // False when the root "id" dictionary cannot hold the term: the segment has
+  // no id terms, the term is outside the dictionary's exact bounds, or the id
+  // filter excludes it. The term is in the form the dictionary stores (fitted).
+  bool mayContainId(std::string_view term) { return mayContainId(term, IdFilter::hash(term)); }
+  // As above, with the term's IdFilter::hash computed once by the caller.
+  bool mayContainId(std::string_view term, uint64_t hash);
 
   void forEachBaseFile(auto&& visit) const {
     for (uint32_t number = 0; number < files.size(); ++number) {

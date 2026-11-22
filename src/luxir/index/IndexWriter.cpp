@@ -3546,8 +3546,8 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
 
 // This is where seg.liveGen can change. A snapshot segment's personal deletes
 // stay put meanwhile: a merge attaches them to a new output under indexMutex,
-// and the snapshot holds that output whole or not at all. Returns the clipped
-// facts applied, summed over segments.
+// and the snapshot holds that output whole or not at all. Returns the ids
+// looked up in segment dictionaries, summed over segments.
 uint64_t IndexWriter::applyDeletes(const DeleteApplication& app) {
   std::atomic<uint64_t> applications = 0;
   // Apply deletes to segments in parallel.  Each task writes new liveDocs
@@ -3613,6 +3613,23 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     if (clipped.empty()) return 0;
   }
 
+  // Read the "id" field using TermsEnum
+  auto* idFieldInfo = reader.fieldInfo("id");
+  if (!idFieldInfo) {
+    LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.name());
+    return 0;
+  }
+
+  // The id filter proves most absent ids absent: those skip the dictionary,
+  // and a segment that can hold none of them is not touched further.
+  std::optional<IdFilter> idFilter;
+  if (auto slice = idFieldInfo->idFilter()) idFilter.emplace(core->slice(slice));
+  auto mayHold = [&](const auto& entry) {
+    return entry.val().deleteWatermark != 0 && (!idFilter || idFilter->mayContain((std::string_view)entry));
+  };
+  if (std::ranges::none_of(clipped, [&](auto span) { return std::ranges::any_of(span, mayHold); })) return 0;
+  Signal::emit("deleteLookupInSegment", (void*)(int64_t)seg.segId);
+
   // Load existing LiveDocs if they exist: the published reader's when it
   // holds this generation
   std::shared_ptr<LiveDocs> existingLiveDocs;
@@ -3635,13 +3652,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
   const screaming::FixedBitSet* currLiveBits = existingLiveDocs ? &existingLiveDocs->bitset() : nullptr;
   int32_t numLiveDocs = existingLiveDocs ? existingLiveDocs->numLive() : maxDocId;
   std::atomic<int32_t> newDeletesCount = 0;
-
-  // Read the "id" field using TermsEnum
-  auto* idFieldInfo = reader.fieldInfo("id");
-  if (!idFieldInfo) {
-    LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.name());
-    return 0;
-  }
+  std::atomic<uint64_t> lookups = 0;
 
   // Each chunk walks its id-sorted piece with seekForward() and collects the
   // live doc for each hit, then gates hits in docId order against request
@@ -3682,9 +3693,11 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     TermsEnum termsEnum(guard.pool(), reader, *idFieldInfo);
     std::vector<DeleteCandidate> hits;
     auto scratch = indexRamBudget->forceAcquire(0);
+    uint64_t probed = 0;
     for (auto& entry : span) {
+      if (!mayHold(entry)) continue;
+      probed++;
       uint64_t deleteVersion = entry.val().deleteWatermark;
-      if (deleteVersion == 0) continue;
       std::string_view deleteId = (std::string_view)entry;
 
       INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
@@ -3704,13 +3717,12 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       } // end if termsEnum.seek()
     }
     drain(hits, scratch);
+    lookups.fetch_add(probed, std::memory_order_relaxed);
   };
   // Split large spans into id-ordered chunks so a few big segments still use every
   // worker; each chunk seeks forward from its own enum.
-  size_t applied = 0;
   boost::container::small_vector<SortedDeletes::EntrySpan, 8> pieces;
   for (auto span : clipped) {
-    applied += span.size();
     for (size_t at = 0; at < span.size(); at += chunk) {
       pieces.push_back(span.subspan(at, std::min(chunk, span.size() - at)));
     }
@@ -3751,7 +3763,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       seg.liveEpoch = writerEpoch;
     }
   }
-  return applied;
+  return lookups.load(std::memory_order_relaxed);
 }
 
 } // end namespace luxir

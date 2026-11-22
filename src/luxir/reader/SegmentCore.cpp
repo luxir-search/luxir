@@ -344,6 +344,17 @@ void SegmentCore::initializeSpaces() {
   }
 }
 
+bool SegmentCore::mayContainId(std::string_view term, uint64_t hash) {
+  const auto* info = root.fieldInfo("id");
+  if (!info || !info->terms()) return false;
+  if (const auto* bounds = info->dictionaryBounds()) {
+    // A root id dictionary always records exact inclusive bounds.
+    if (term < std::string_view(bounds->lower) || term > std::string_view(bounds->upper)) return false;
+  }
+  auto filter = info->idFilter();
+  return !filter || IdFilter(slice(filter)).mayContainHash(hash);
+}
+
 std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, const api::SegmentInfo& segment,
                                                  bool missingFileOK, bool expectSynced) {
   auto source = makeSource(segment.seg_id, segment.creator_epoch, catalogRangeFromManifest(segment.catalog), segment.max_doc, segment.files);
