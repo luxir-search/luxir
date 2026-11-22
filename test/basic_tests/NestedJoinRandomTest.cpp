@@ -426,7 +426,7 @@ TEST_F(NestedJoinRandomTest, seededModelAcrossUpdatesDomainsScoresAndCache) {
       setting(batch % 2 != 0);
       CollectionHelper::UpdateBuilder input;
       for (int id = batch * 64 / 3; id < (batch + 1) * 64 / 3; id++) add(input, model[id]);
-      input.overwrite().commit(); ASSERT_TRUE(helper.submit(input).success);
+      input.commit(); ASSERT_TRUE(helper.submit(input).success);
     }
     ASSERT_EQ(3u, helper.durableSegmentCount());
     std::vector<JoinCase> cases;
@@ -453,7 +453,7 @@ TEST_F(NestedJoinRandomTest, seededModelAcrossUpdatesDomainsScoresAndCache) {
         CollectionHelper::UpdateBuilder change;
         for (int id : {0, 7, 8}) { change.remove(model[id].id); model[id].live = false; }
         for (int id : {2, 11, 31, 11}) { model[id] = generate(id); add(change, model[id]); }
-        change.overwrite().commit(); ASSERT_TRUE(helper.submit(change).success);
+        change.commit(); ASSERT_TRUE(helper.submit(change).success);
       }
 
     }

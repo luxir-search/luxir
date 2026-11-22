@@ -51,6 +51,8 @@ struct TrivialSearchRequest {
 // RPC method paths (match GRPCServer.cpp lookupMethod()).
 namespace rpc {
 inline constexpr const char* Search            = "/luxir.Searcher/Search";
+inline constexpr const char* Get               = "/luxir.Searcher/Get";
+inline constexpr const char* Delete            = "/luxir.Indexer/Delete";
 inline constexpr const char* Update            = "/luxir.Indexer/Update";
 inline constexpr const char* UpdateStream      = "/luxir.Indexer/UpdateStream";
 inline constexpr const char* SetSchema         = "/luxir.Admin/SetSchema";
@@ -67,6 +69,8 @@ inline constexpr const char* Stats             = "/luxir.Admin/Stats";
 // are thin ByteBuffer<->bytes adapters. Return "" on success, else the error message.
 std::string grpcSerialize(const luxir::api::SearchRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const luxir::api::UpdateRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const luxir::api::GetRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const luxir::api::DeleteRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const luxir::api::StatsRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const luxir::api::CreateCollectionRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const luxir::api::RenameCollectionRequest& msg, grpc::ByteBuffer& out);

@@ -157,6 +157,9 @@ public:
   // Record an explicit delete-by-id. Routes through IdHandler's delete hash
   // so all deletes end up as sorted lists after flush.
   void deleteId(std::string_view id, uint64_t version);
+  // Indexes an engine-generated id for the current document. Generated ids are
+  // new by construction, so no older document is looked up or replaced.
+  void indexGeneratedId(std::string_view id);
   size_t retainedDeleteBytes() const;
   size_t deleteCount() const;
 

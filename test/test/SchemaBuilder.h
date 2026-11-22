@@ -59,6 +59,7 @@ class SchemaBuilder {
   std::vector<Pair> fieldsFlat_;
   std::vector<Pair> templatesFlat_;
   std::vector<std::pair<std::string_view, api::StoredResourceDef>> resources_;
+  std::optional<api::SchemaDef::IdMode> idMode_;
 
   api::FieldDef& add(std::deque<Pair>& out, std::string_view name) {
     auto* def = api::build::allocMessage<api::FieldDef>(arena_);
@@ -72,6 +73,8 @@ public:
   // Add a concrete field / a template (abstract suffix or parent) definition.
   api::FieldDef& field(std::string_view name) { return add(fields_, name); }
   api::FieldDef& templ(std::string_view name) { return add(templates_, name); }
+
+  SchemaBuilder& idMode(api::SchemaDef::IdMode mode) { idMode_ = mode; return *this; }
 
   // Add a stored_resources entry; the reference is valid until the next call.
   api::StoredResourceDef& storedResource(std::string_view name) {
@@ -119,6 +122,7 @@ public:
       std::span<const Pair>(templatesFlat_.data(), templatesFlat_.size()));
     d.stored_resources = api::map_view<std::string_view, api::StoredResourceDef>(
       std::span<const std::pair<std::string_view, api::StoredResourceDef>>(resources_.data(), resources_.size()));
+    d.id_mode = idMode_;
     return d;
   }
 

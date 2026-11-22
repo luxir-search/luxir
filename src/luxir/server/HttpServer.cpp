@@ -3,6 +3,7 @@
 
 #include "luxir/server/ReplicationSource.h"
 #include "luxir/server/CommitWaits.h"
+#include "luxir/server/DocRequests.h"
 #include <boost/asio/bind_cancellation_slot.hpp>
 #include "luxir/server/ReplicationFollower.h"
 #include "HttpServer.h"
@@ -25,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -292,7 +294,6 @@ struct HttpStreamGroup {
   std::optional<std::string> closeRequestId;
   bool open = false;
 
-  bool allowDups() const { return request && request->proto.allow_dups; }
   bool allOrNone() const { return request && request->proto.all_or_none; }
   bool returnIds() const { return request && request->proto.return_ids; }
   bool dropUnmapped() const { return request && request->proto.drop_unmapped; }
@@ -654,6 +655,7 @@ private:
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
     NONE, BUILD_INFO, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, COLLECTION_RENAME, COLLECTION_SWAP, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
+    DOC, MGET, DELETE_IDS,
     REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED,
     PLUGIN
   };
@@ -742,8 +744,12 @@ private:
     metricErrorKind.store(-1, std::memory_order_relaxed);
     MetricOperation operation = MetricOperation::OTHER;
     switch (route_.route) {
-      case Route::SEARCH: operation = MetricOperation::SEARCH; break;
-      case Route::UPDATE: operation = MetricOperation::UPDATE; break;
+      case Route::SEARCH: case Route::MGET: operation = MetricOperation::SEARCH; break;
+      case Route::UPDATE: case Route::DELETE_IDS: operation = MetricOperation::UPDATE; break;
+      case Route::DOC:
+        operation = parser_ && parser_->get().method() == http::verb::delete_ ? MetricOperation::UPDATE
+                                                                               : MetricOperation::SEARCH;
+        break;
       case Route::SCHEMA: operation = MetricOperation::SCHEMA; break;
       case Route::STATS: case Route::METRICS: operation = MetricOperation::STATS; break;
       case Route::HEALTH: operation = MetricOperation::HEALTH; break;
@@ -959,10 +965,17 @@ private:
     // /update URL options are validated at header admission for both encodings,
     // so an invalid value is refused before its body is read.
     bool postUpdate = parser_->get().method() == http::verb::post && route_.route == Route::UPDATE;
-    if (postUpdate) {
+    bool deleteIds = route_.route == Route::DELETE_IDS
+        || (route_.route == Route::DOC && parser_->get().method() == http::verb::delete_);
+    if (postUpdate || deleteIds) {
       std::string paramErr;
       if (!parseUpdateUrlParams(params, updateUrl_, paramErr)) {
         respondBeforeBodyError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, paramErr));
+        return;
+      }
+      if (deleteIds && (!updateUrl_.fieldMap.empty() || findParam(params, "drop_unmapped"))) {
+        respondBeforeBodyError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                                             "field_map and drop_unmapped do not apply to deletes"));
         return;
       }
     }
@@ -1074,9 +1087,10 @@ private:
       target = slash == std::string_view::npos ? std::string_view{} : target.substr(slash);
     }
     if (target == "/collections/_create" || target == "/collections/_delete" || target == "/collections/_rename" || target == "/collections/_swap") return true;
+    std::string coll, id;
+    if (method == http::verb::delete_) return parseDocPath(target, coll, id);
     if (method != http::verb::post) return false;
-    std::string coll;
-    return parseUpdatePath(target, coll) || parseSchemaPath(target, coll);
+    return parseUpdatePath(target, coll) || parseSchemaPath(target, coll) || parseDeleteIdsPath(target, coll);
   }
 
   static ErrorInfo readOnlyError(std::string_view target) {
@@ -1119,6 +1133,29 @@ private:
 
   static bool parseStatsPath(std::string_view target, std::string& coll) {
     return parseCollectionPath(target, "/_stats", coll);
+  }
+
+  static bool parseMgetPath(std::string_view target, std::string& coll) {
+    return parseCollectionPath(target, "/_mget", coll);
+  }
+
+  static bool parseDeleteIdsPath(std::string_view target, std::string& coll) {
+    // "/collections/_delete" deletes a collection; it is matched before this.
+    return target != "/collections/_delete" && parseCollectionPath(target, "/_delete", coll);
+  }
+
+  // /collections/{c}/_doc/{id}: the id is the percent-encoded remainder.
+  static bool parseDocPath(std::string_view target, std::string& coll, std::string& id) {
+    constexpr std::string_view pre = "/collections/", infix = "/_doc/";
+    if (!target.starts_with(pre)) return false;
+    auto rest = target.substr(pre.size());
+    auto slash = rest.find('/');
+    if (slash == std::string_view::npos || !rest.substr(slash).starts_with(infix)) return false;
+    auto encoded = rest.substr(slash + infix.size());
+    if (encoded.empty()) return false;
+    coll.assign(rest.substr(0, slash));
+    id = pathDecode(encoded);
+    return true;
   }
 
   static std::string_view trimHeaderValue(std::string_view v) {
@@ -1207,6 +1244,18 @@ private:
       return std::move(json);
     }
   };
+
+  // A path segment: %XX hex escapes only ('+' is literal in a path).
+  static std::string pathDecode(std::string_view s) {
+    std::string out;
+    size_t from = 0;
+    for (size_t plus; (plus = s.find('+', from)) != std::string_view::npos; from = plus + 1) {
+      out += urlDecode(s.substr(from, plus - from));
+      out += '+';
+    }
+    out += urlDecode(s.substr(from));
+    return out;
+  }
 
   // Standard form-decoding: %XX hex escapes and '+' as space. Malformed escapes
   // pass through literally (lenient - the URL is an open channel).
@@ -1493,6 +1542,9 @@ private:
       m.route = Route::COLLECTION_SWAP; m.allow = "POST";
     } else if (target == "/collections/_delete") {
       m.route = Route::COLLECTION_DELETE; m.allow = "POST";
+    } else if (parseDocPath(target, m.coll, m.file)) {
+      // Before the suffix routes: an id may end in "/_search" or "/_update".
+      m.route = Route::DOC; m.allow = "GET, DELETE";
     } else if (parseCollectionPath(target, "/_snapshot", m.coll)) {
       m.route = Route::REPLICATION_SNAPSHOT; m.allow = "GET, HEAD";
     } else if (parseSnapshotFilePath(target, m.coll, m.file)) {
@@ -1503,6 +1555,10 @@ private:
       m.route = Route::UPDATE; m.allow = "POST";
     } else if (target == "/_stats" || parseStatsPath(target, m.coll)) {
       m.route = Route::STATS; m.allow = "GET"; m.prettyDefault = true;
+    } else if (parseMgetPath(target, m.coll)) {
+      m.route = Route::MGET; m.allow = "POST";
+    } else if (parseDeleteIdsPath(target, m.coll)) {
+      m.route = Route::DELETE_IDS; m.allow = "POST";
     } else if (parseSchemaPath(target, m.coll)) {
       m.route = Route::SCHEMA; m.allow = "GET, POST"; m.prettyDefault = true;
       m.hint = "schema writes are POST (mode=set adds or replaces the named definitions, "
@@ -1528,6 +1584,7 @@ private:
       }
     }
     bool collectionRoute = m.route == Route::SEARCH || m.route == Route::UPDATE ||
+                           m.route == Route::DOC || m.route == Route::MGET || m.route == Route::DELETE_IDS ||
                            m.route == Route::STATS || m.route == Route::SCHEMA ||
                            m.route == Route::REPLICATION_SNAPSHOT || m.route == Route::REPLICATION_FILE;
     m.emptyCollection = collectionRoute && m.coll.empty() && target.starts_with("/collections/");
@@ -1681,6 +1738,12 @@ private:
       case Route::UPDATE:
         handleUpdate(std::move(req.body()), coll, updateUrl_);
         break;
+      case Route::DOC:
+        if (req.method() == http::verb::delete_) handleDeleteIds({}, coll, &match.file);
+        else handleGet({}, coll, &match.file, params);
+        break;
+      case Route::MGET: handleGet(req.body(), coll, nullptr, params); break;
+      case Route::DELETE_IDS: handleDeleteIds(req.body(), coll, nullptr); break;
       case Route::STATS:
       case Route::METRICS: {
         // /metrics is the Prometheus scrape of the node: the same stats, with
@@ -1951,6 +2014,82 @@ private:
     // onto the task arena so this io thread is not occupied for the query's
     // duration; reply() then posts results back here.
     engine.dispatch(*sreq, sreq->proto.max_parallel, SearchEngine::Receiver::MAY_EXECUTE);
+  }
+
+  // GET _doc/{id} (pathId set; ?fields=a,b, ?min_commit) or POST _mget (a GetRequest body):
+  // answered by a search, in the search response shape (?format=docs as for
+  // _search).
+  void handleGet(std::string_view body, const std::string& coll, const std::string* pathId,
+                 const std::vector<UrlParam>& params) {
+    auto format = HttpSearchFormat::ENVELOPE;
+    if (const std::string* f = findParam(params, "format")) {
+      if (*f != "docs") {
+        respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, "unknown format '" + *f + "' (valid: docs)"));
+        return;
+      }
+      format = HttpSearchFormat::DOCS;
+    }
+    std::string search;
+    try {
+      std::pmr::monotonic_buffer_resource mr;
+      api::GetRequest get;
+      std::vector<std::string_view> fields;
+      std::string_view id = pathId ? std::string_view(*pathId) : std::string_view();
+      if (pathId) {
+        get.ids = {&id, 1};
+        get.request_id = requestId_;
+        if (const std::string* token = findParam(params, "min_commit")) get.min_commit = *token;
+        if (const std::string* timeout = findParam(params, "min_commit_timeout_ms")) {
+          uint64_t ms = 0;
+          auto [end, error] = std::from_chars(timeout->data(), timeout->data() + timeout->size(), ms);
+          if (error != std::errc() || end != timeout->data() + timeout->size()) {
+            throw RequestError("invalid min_commit_timeout_ms");
+          }
+          get.min_commit_timeout_ms = ms;
+        }
+        if (const std::string* list = findParam(params, "fields")) {
+          for (auto part : std::views::split(std::string_view(*list), ',')) {
+            if (!part.empty()) fields.emplace_back(part.begin(), part.end());
+          }
+          get.fields = fields;
+        }
+      } else {
+        std::string err;
+        if (!api::read_json(get, body.empty() ? std::string_view("{}") : body, mr, &err)) throw RequestError(err);
+      }
+      api::SearchRequest proto;
+      getAsSearch(get, proto, mr);
+      if (!api::write_json(proto, search)) throw ApiError(ErrorKind::INTERNAL, "internal", "failed to serialize request");
+    } catch (const std::exception& e) {
+      respondException(e, ErrorKind::INVALID_REQUEST);
+      return;
+    }
+    handleSearch(search, coll, format, SearchUrlOverlay{});
+  }
+
+  // DELETE _doc/{id} (pathId set) or POST _delete (a DeleteRequest body): an
+  // update with only delete_ids, with the /update URL options (?commit=true).
+  void handleDeleteIds(std::string_view body, const std::string& coll, const std::string* pathId) {
+    std::string update;
+    try {
+      std::pmr::monotonic_buffer_resource mr;
+      api::DeleteRequest del;
+      std::string_view id = pathId ? std::string_view(*pathId) : std::string_view();
+      if (pathId) {
+        del.ids = {&id, 1};
+        del.request_id = requestId_;
+      } else {
+        std::string err;
+        if (!api::read_json(del, body.empty() ? std::string_view("{}") : body, mr, &err)) throw RequestError(err);
+      }
+      api::UpdateRequest proto;
+      deleteAsUpdate(del, proto);
+      if (!api::write_json(proto, update)) throw ApiError(ErrorKind::INTERNAL, "internal", "failed to serialize request");
+    } catch (const std::exception& e) {
+      respondException(e, ErrorKind::INVALID_REQUEST);
+      return;
+    }
+    handleUpdate(std::move(update), coll, updateUrl_);
   }
 
   // Decodes and normalizes a buffered /update body.  Runs on the index arena,
@@ -2858,7 +2997,7 @@ private:
     for (const auto& [name, val] : payload.fields) {
       unused(val);
       if (name == "request_id" || name == "commit") continue;
-      if (name == "collection" || name == "allow_dups" || name == "all_or_none" ||
+      if (name == "collection" || name == "all_or_none" ||
           name == "return_ids" || name == "docs" || name == "delete_ids" ||
           name == "field_map" || name == "drop_unmapped") {
         err = "_end_ control cannot carry submit-time field '" + std::string(name) + "'";
@@ -2873,7 +3012,7 @@ private:
   static bool validateUpdateControlPayload(const luxir::api::Map& payload, std::string& err) {
     for (const auto& [name, val] : payload.fields) {
       unused(val);
-      if (name == "collection" || name == "allow_dups" || name == "all_or_none" ||
+      if (name == "collection" || name == "all_or_none" ||
           name == "return_ids" || name == "request_id" || name == "commit" ||
           name == "docs" || name == "delete_ids" || name == "field_map" ||
           name == "drop_unmapped") {
@@ -3365,7 +3504,6 @@ private:
     assert(!state->batchReady);
 
     accountStreamSubmission(*state->batch, state->batch->recordCount(), 0);
-    state->batch->proto.allow_dups = state->group.allowDups();
     state->batch->proto.all_or_none = state->group.allOrNone();
     applyStreamBatchFieldMap(*state, *state->batch);
     state->batch->proto.request_id =
@@ -3404,7 +3542,6 @@ private:
     state->batch->proto = request->proto;
     state->batch->collectionName = state->group.collectionName;
     accountStreamSubmission(*state->batch, request->proto.docs.size(), request->proto.delete_ids.size());
-    state->batch->proto.allow_dups = state->group.allowDups();
     state->batch->proto.all_or_none = state->group.allOrNone();
     applyStreamBatchFieldMap(*state, *state->batch);
     state->batch->proto.return_ids =

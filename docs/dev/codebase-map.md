@@ -34,6 +34,8 @@ locations, browse `src/luxir/<area>/`.
      cancellation and captured follower expiry. Satisfied floors retain their exact collection.
    - `ProtoUpdateMessage::Completion`: Owning local result plus copied replica-wait specification;
      transports release indexing bodies before waiting for visibility.
+   - `DocRequests`: Get and delete by id for both transports: a get becomes a search
+     (an `any_of` lookup on `id`), a delete an update with only `delete_ids`.
 
 2. **Search Engine** (`src/luxir/search/`)
    - `ReaderManager`: Per-collection snapshot publication, reader refresh, and filter cache;
@@ -125,6 +127,10 @@ locations, browse `src/luxir/<area>/`.
      - Manages `Inverter` instances, flushing, merging, and commits.
      - Atomically pins schema at update admission; stale inverters flush at
        checkout or release, keeping one schema per segment
+   - `IdGenerator`: Snowflake ids for `id_mode` GENERATE; the worker bits are the
+     writer epoch (claimed in STATE on every open) and the clock floor is the
+     commit's `id_clock_ms`, so no coordination service is involved.
+     `ProtoUpdateMessage` applies the collection's `id_mode` per document.
    - `CommitSnapshotRegistry`: Shard-owned current snapshot and commit-ID pins,
      lazy idle expiry, and retained-byte eviction. Publishes into its ReaderManager;
      accepts retirement from a writer or installer independently. Retirement preserves

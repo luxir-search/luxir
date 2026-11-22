@@ -414,8 +414,8 @@ TEST_F(QueryAnalysisTest, oversizedStringValuesHaveDistinctHashes) {
 
 TEST_F(QueryAnalysisTest, oversizedIdHashesConsistently) {
   std::string longId(PackedTerm::MAX_LEN + 9, 'i');
-  helper.index(flatdoc("id", longId, "body_w", "first"), UpdateMessage::NO_COMMIT, true /*overwrite*/);
-  helper.index(flatdoc("id", longId, "body_w", "second"), UpdateMessage::COMMIT, true /*overwrite*/);
+  helper.index(flatdoc("id", longId, "body_w", "first"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", longId, "body_w", "second"), UpdateMessage::COMMIT);
   // The same oversized id overwrites, it does not duplicate.
   EXPECT_EQ(0, matchCount("body_w", "first"));
   EXPECT_EQ(1, matchCount("body_w", "second"));

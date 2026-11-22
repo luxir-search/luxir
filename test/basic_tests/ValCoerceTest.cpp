@@ -515,8 +515,8 @@ TEST_F(ValCoerceTest, numericIdIndexesItsRendering) {
   CollectionHelper helper("main");
 
   // a numeric id used to index NOTHING (doc had no id, so not overwritable)
-  helper.index(flatdoc("id", (int64_t)123, "body_w", "one"), UpdateMessage::COMMIT, true);
-  helper.index(flatdoc("id", "123", "body_w", "two"), UpdateMessage::COMMIT, true);
+  helper.index(flatdoc("id", (int64_t)123, "body_w", "one"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "123", "body_w", "two"), UpdateMessage::COMMIT);
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q").allQuery().fields({"id"}).limit(-1);

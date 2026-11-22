@@ -32,6 +32,7 @@
 #include "luxir/util/proto.h"
 #include "luxir/util/Signal.h"
 #include "luxir/server/CommitWaits.h"
+#include "luxir/server/DocRequests.h"
 #include "luxir/util/ApiError.h"
 #include "RpcStatus.h"
 #include "ProtoUpdateMessage.h"
@@ -681,8 +682,11 @@ static void finishWithException(GenericCallData& call, const std::exception& e,
 
 // ---- per-method handlers -------------------------------------------------
 
-//   rpc Search(stream SearchRequest) returns (stream SearchResponse)
-static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+// Runs one parsed search on `call`. `keepAlive` owns anything else the
+// request's views borrow (a get-by-id request's ids and fields).
+static void dispatchSearch(GenericCallData& call, google::protobuf::Arena* arena,
+                           std::unique_ptr<HppRequestState<SearchReqProto>> requestState,
+                           std::shared_ptr<void> keepAlive, std::chrono::steady_clock::time_point startTime) {
   // SearchRequest subclass whose reply() serializes to ByteBuffer and drops eagerly.
   class GRPCSearchRequest : public SearchRequest {
   public:
@@ -692,6 +696,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     // flow-controlled emitter can outlive it, so the views must live until
     // done() releases this request.
     std::unique_ptr<HppRequestState<SearchReqProto>> requestState;
+    std::shared_ptr<void> keepAlive;
 
     GRPCSearchRequest(SearchEngine& engine, const SearchReqProto& proto, google::protobuf::Arena& arena,
                       std::chrono::steady_clock::time_point startTime)
@@ -751,26 +756,10 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     }
   };
 
-  // The message is fully read; took_us covers parsing onward.
-  auto startTime = std::chrono::steady_clock::now();
-  auto* arena = createArena();
-  auto requestState = std::make_unique<HppRequestState<SearchReqProto>>();
-  if (!parseRequest(readBuf, *requestState, "Search")) {
-    releaseArena(arena);
-    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Search: malformed request"));
-    return;
-  }
-  if (requestState->proto.response_format == luxir::api::ResponseFormat::DOCS) {
-    releaseArena(arena);
-    // Doc-line framing is an HTTP/NDJSON concept; gRPC responses are already
-    // framed DocList messages.
-    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST,
-                                        "response_format=docs applies to the HTTP NDJSON layer only"));
-    return;
-  }
   auto& engine = call.server.getLuxirNode().getSearchEngine();
   auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena, startTime);
   req.requestState = std::move(requestState);
+  req.keepAlive = std::move(keepAlive);
   req.parent = &call;
   if (!req.proto.min_commit.empty()) {
     call.enableWaitCancellation();
@@ -790,15 +779,51 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   engine.dispatch(req, req.proto.max_parallel, SearchEngine::Receiver::OFFLOAD);
 }
 
-
-// Unary Update and streaming UpdateStream share asynchronous completion.
-static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+//   rpc Search(stream SearchRequest) returns (stream SearchResponse)
+static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  // The message is fully read; took_us covers parsing onward.
   auto startTime = std::chrono::steady_clock::now();
-  auto request = std::make_unique<HppRequestState<UpdateReqProto>>();
-  if (!parseRequest(readBuf, *request, "Update")) {
-    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Update: malformed request"));
+  auto* arena = createArena();
+  auto requestState = std::make_unique<HppRequestState<SearchReqProto>>();
+  if (!parseRequest(readBuf, *requestState, "Search")) {
+    releaseArena(arena);
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Search: malformed request"));
     return;
   }
+  if (requestState->proto.response_format == luxir::api::ResponseFormat::DOCS) {
+    releaseArena(arena);
+    // Doc-line framing is an HTTP/NDJSON concept; gRPC responses are already
+    // framed DocList messages.
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+                                        "response_format=docs applies to the HTTP NDJSON layer only"));
+    return;
+  }
+  dispatchSearch(call, arena, std::move(requestState), nullptr, startTime);
+}
+
+//   rpc Get(stream GetRequest) returns (stream SearchResponse)
+static void handleGet(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto startTime = std::chrono::steady_clock::now();
+  auto getState = std::make_shared<HppRequestState<luxir::api::GetRequest>>();
+  if (!parseRequest(readBuf, *getState, "Get")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Get: malformed request"));
+    return;
+  }
+  auto requestState = std::make_unique<HppRequestState<SearchReqProto>>();
+  try {
+    getAsSearch(getState->proto, requestState->proto, requestState->resource);
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+    return;
+  }
+  dispatchSearch(call, createArena(), std::move(requestState), std::move(getState), startTime);
+}
+
+
+// Submits one parsed update on `call`. `keepAlive` owns anything else the
+// request's views borrow (a delete-by-id request's ids).
+static void submitUpdate(GenericCallData& call, std::unique_ptr<HppRequestState<UpdateReqProto>> request,
+                         std::shared_ptr<void> keepAlive, std::chrono::steady_clock::time_point startTime) {
 
   // The update is async; its done() serializes the response into owned bytes, hands
   // them to the call, then deletes this message, freeing the borrowed request bytes
@@ -806,6 +831,7 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   class Update : public ProtoUpdateMessage {
   public:
     std::unique_ptr<HppRequestState<UpdateReqProto>> request;
+    std::shared_ptr<void> keepAlive;
     GenericCallData* parent;
     const std::stop_token waitToken;
     const std::chrono::steady_clock::time_point startTime;
@@ -845,6 +871,7 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 
     if (request->proto.commit && request->proto.commit->wait_for_replicas.has_value()) call.enableWaitCancellation();
     Update* updateMessage = new Update(std::move(request), &call, startTime);
+    updateMessage->keepAlive = std::move(keepAlive);
     updateMessage->target = collection->getId();
     try {
       if (!iw->submitUpdate(updateMessage)) {
@@ -857,6 +884,35 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   } catch (const std::exception& e) {
     finishWithException(call, e);
   }
+}
+
+// Unary Update and streaming UpdateStream share asynchronous completion.
+static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto startTime = std::chrono::steady_clock::now();
+  auto request = std::make_unique<HppRequestState<UpdateReqProto>>();
+  if (!parseRequest(readBuf, *request, "Update")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Update: malformed request"));
+    return;
+  }
+  submitUpdate(call, std::move(request), nullptr, startTime);
+}
+
+//   rpc Delete(DeleteRequest) returns (UpdateResponse)
+static void handleDelete(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto startTime = std::chrono::steady_clock::now();
+  auto deleteState = std::make_shared<HppRequestState<luxir::api::DeleteRequest>>();
+  if (!parseRequest(readBuf, *deleteState, "Delete")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Delete: malformed request"));
+    return;
+  }
+  auto request = std::make_unique<HppRequestState<UpdateReqProto>>();
+  try {
+    deleteAsUpdate(deleteState->proto, request->proto);
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+    return;
+  }
+  submitUpdate(call, std::move(request), std::move(deleteState), startTime);
 }
 
 // Responds with state->response once the publication `commit` satisfies the
@@ -1101,7 +1157,9 @@ static const MethodEntry* lookupMethod(const std::string& method) {
   static const std::unordered_map<std::string, MethodEntry> table = {
     {"/luxir.Searcher/Search",          {handleSearch, false, MetricOperation::SEARCH, true}},
     {"/luxir.Indexer/Update",           {handleUpdate, true, MetricOperation::UPDATE}},
+    {"/luxir.Searcher/Get",             {handleGet, false, MetricOperation::SEARCH, true}},
     {"/luxir.Indexer/UpdateStream",     {handleUpdate, true, MetricOperation::UPDATE, true}},
+    {"/luxir.Indexer/Delete",           {handleDelete, true, MetricOperation::UPDATE}},
     {"/luxir.Admin/SetSchema",          {handleSetSchema, true, MetricOperation::SCHEMA}},
     {"/luxir.Admin/GetSchema",          {handleGetSchema, false, MetricOperation::SCHEMA}},
     {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true, MetricOperation::COLLECTIONS}},

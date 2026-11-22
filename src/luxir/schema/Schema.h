@@ -71,6 +71,8 @@ public:
   std::string sourceDef_;     // serialized authored SchemaDef, before inheritance
   // Introduction generations for declared concrete and template representations.
   std::map<std::string, api::SchemaVersion, std::less<>> introducedGen;
+  // SchemaDef.id_mode: what a document without an id does.
+  api::SchemaDef::IdMode idMode = api::SchemaDef::IdMode::ALLOW_MISSING;
 
 private:
   using logical_map = boost::unordered_flat_map<std::string, std::shared_ptr<const LogicalField>,

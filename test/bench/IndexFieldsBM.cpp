@@ -3,6 +3,7 @@
 
 #include "bench/luxir_bench.h"
 #include "test/CollectionHelper.h"
+#include "test/SchemaBuilder.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -22,13 +23,12 @@ static void BM_IndexSmallFields(benchmark::State& state) {
                                                 "tools", "games", "sports", "food"};
   static constexpr const char* kColors[] = {"red", "green", "blue", "black", "white", "gray"};
 
-  // Every message resubmits the same docs; allow_dups keeps them from overwriting.
+  // Every message resubmits the same docs without ids; the collection generates
+  // them, so nothing is overwritten.
   CollectionHelper::UpdateBuilder batch;
-  batch.allowDups();
   for (int32_t d = 0; d < docsPerMessage; d++) {
     uint64_t h = (uint64_t)d * 0x9E3779B97F4A7C15ull;
     batch.add(flatdoc(
-        "id", std::to_string(d),
         "sku_s", "sku" + std::to_string(h >> 40),
         "category_s", kCategories[h % 8],
         "brand_s", "brand" + std::to_string((h >> 8) % 500),
@@ -41,12 +41,15 @@ static void BM_IndexSmallFields(benchmark::State& state) {
         "updated_i", (int64_t)1'700'000'000 + d,
         "sizes_is", vec_i(h % 13, 13 + (h >> 4) % 13)));
   }
-  const int64_t fieldsPerDoc = 12;
+  const int64_t fieldsPerDoc = 12;  // including the generated id
 
   CollectionHelper helper;
   double secs = 0;
   for (auto _ : state) {
     helper.clear();
+    SchemaBuilder schema;
+    schema.idMode(api::SchemaDef::IdMode::GENERATE);
+    schema.set(helper.collection());
     auto t0 = std::chrono::steady_clock::now();
     for (int32_t m = 0; m < messages; m++) {
       if (!helper.submit(batch).success) {

@@ -44,6 +44,7 @@ defaults and constraints are described in the comments and guides.
 |---|---|---|---|
 | <a id="method-luxir.indexer.update"></a>[`Update`](#method-luxir.indexer.update) | [`UpdateRequest`](#message-luxir.updaterequest) | [`UpdateResponse`](#message-luxir.updateresponse) | Index or delete documents, with an optional commit. |
 | <a id="method-luxir.indexer.updatestream"></a>[`UpdateStream`](#method-luxir.indexer.updatestream) | stream [`UpdateRequest`](#message-luxir.updaterequest) | stream [`UpdateResponse`](#message-luxir.updateresponse) | One response per request; request\_id correlates responses with requests. |
+| <a id="method-luxir.indexer.delete"></a>[`Delete`](#method-luxir.indexer.delete) | [`DeleteRequest`](#message-luxir.deleterequest) | [`UpdateResponse`](#message-luxir.updateresponse) | Delete documents by id, with an optional commit. |
 
 <a id="service-luxir.searcher"></a>
 
@@ -54,6 +55,7 @@ defaults and constraints are described in the comments and guides.
 | Method | Request | Response | Description |
 |---|---|---|---|
 | <a id="method-luxir.searcher.search"></a>[`Search`](#method-luxir.searcher.search) | stream [`SearchRequest`](#message-luxir.searchrequest) | stream [`SearchResponse`](#message-luxir.searchresponse) | Each request produces one or more responses, ending with more=false. Use request\_id to correlate responses when sending multiple requests. |
+| <a id="method-luxir.searcher.get"></a>[`Get`](#method-luxir.searcher.get) | stream [`GetRequest`](#message-luxir.getrequest) | stream [`SearchResponse`](#message-luxir.searchresponse) | Fetch documents by id. Runs as a search (see GetRequest) and answers like Search: one or more responses per request, ending with more=false. |
 
 ## Messages
 
@@ -105,6 +107,7 @@ defaults and constraints are described in the comments and guides.
 - [`CreateCollectionResponse`](#message-luxir.createcollectionresponse)
 - [`DeleteCollectionRequest`](#message-luxir.deletecollectionrequest)
 - [`DeleteCollectionResponse`](#message-luxir.deletecollectionresponse)
+- [`DeleteRequest`](#message-luxir.deleterequest)
 - [`DisMaxQuery`](#message-luxir.dismaxquery)
 - [`DiskStats`](#message-luxir.diskstats)
 - [`Diversify`](#message-luxir.diversify)
@@ -134,6 +137,7 @@ defaults and constraints are described in the comments and guides.
 - [`GeoPolygon`](#message-luxir.geopolygon)
 - [`GeoPolygonQuery`](#message-luxir.geopolygonquery)
 - [`GeoRing`](#message-luxir.georing)
+- [`GetRequest`](#message-luxir.getrequest)
 - [`GroupComponent`](#message-luxir.groupcomponent)
 - [`GroupKey`](#message-luxir.groupkey)
 - [`GroupTable`](#message-luxir.grouptable)
@@ -870,6 +874,21 @@ Parameters governing how a commit is performed. Presence of this message in an U
 |---|---|---|---|---|
 | <a id="field-luxir.deletecollectionresponse.name"></a>[`name`](#field-luxir.deletecollectionresponse.name) | 1 | `string` | singular |  |
 
+<a id="message-luxir.deleterequest"></a>
+
+### luxir.DeleteRequest
+
+Delete documents by id: an update with only delete\_ids.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.deleterequest.request_id"></a>[`request_id`](#field-luxir.deleterequest.request_id) | 1 | `string` | singular | Optional opaque identifier, echoed in the response for correlation. |
+| <a id="field-luxir.deleterequest.collection"></a>[`collection`](#field-luxir.deleterequest.collection) | 2 | `string` | singular | empty selects the default collection, "main" |
+| <a id="field-luxir.deleterequest.ids"></a>[`ids`](#field-luxir.deleterequest.ids) | 3 | `string` | repeated | Ids to delete, in their indexed form. Deleting an id with no document is a no-op. At least one. |
+| <a id="field-luxir.deleterequest.commit"></a>[`commit`](#field-luxir.deleterequest.commit) | 4 | [`CommitParams`](#message-luxir.commitparams) | singular | Commit parameters. If present, this request will commit. |
+
 <a id="message-luxir.dismaxquery"></a>
 
 ### luxir.DisMaxQuery
@@ -1344,6 +1363,23 @@ A ring lists its vertices in order; the last connects back to the first, and rep
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.georing.points"></a>[`points`](#field-luxir.georing.points) | 1 | [`GeoLatLon`](#message-luxir.geolatlon) | repeated |  |
+
+<a id="message-luxir.getrequest"></a>
+
+### luxir.GetRequest
+
+Fetch documents by id. Runs as a search with one top\_docs op, "docs", whose query is an any\_of term lookup on the id field, so it sees what searches see (documents become visible when committed) and returns the search response shape. Documents come back in index order; an id with no live document is absent from the results.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.getrequest.request_id"></a>[`request_id`](#field-luxir.getrequest.request_id) | 1 | `string` | singular | Optional opaque identifier, echoed in the response for correlation. |
+| <a id="field-luxir.getrequest.collection"></a>[`collection`](#field-luxir.getrequest.collection) | 2 | `string` | singular | empty selects the default collection, "main" |
+| <a id="field-luxir.getrequest.ids"></a>[`ids`](#field-luxir.getrequest.ids) | 3 | `string` | repeated | Ids to fetch, in their indexed form (a numeric id as its canonical string, "123"). At least one. |
+| <a id="field-luxir.getrequest.fields"></a>[`fields`](#field-luxir.getrequest.fields) | 4 | `string` | repeated | Returned fields, as TopDocs.fields; empty returns the default set, and a list without "id" gains it. |
+| <a id="field-luxir.getrequest.min_commit"></a>[`min_commit`](#field-luxir.getrequest.min_commit) | 5 | `string` | singular | As SearchRequest.min\_commit and min\_commit\_timeout\_ms: wait until the collection has published this commit token (from an UpdateResponse). |
+| <a id="field-luxir.getrequest.min_commit_timeout_ms"></a>[`min_commit_timeout_ms`](#field-luxir.getrequest.min_commit_timeout_ms) | 6 | `uint64` | optional |  |
 
 <a id="message-luxir.groupcomponent"></a>
 
@@ -2217,9 +2253,10 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. \_version\_ is fixed and retrieval-only: it returns the update version of the request that indexed each document, including allow\_dups and documents without an ID. |
+| <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. \_version\_ is fixed and retrieval-only: it returns the update version of the request that indexed each document, including documents without an ID. |
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
 | <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. |
+| <a id="field-luxir.schemadef.id_mode"></a>[`id_mode`](#field-luxir.schemadef.id_mode) | 9 | [`SchemaDef.IdMode`](#enum-luxir.schemadef.idmode) | optional |  |
 
 <a id="message-luxir.schemarequest"></a>
 
@@ -2701,7 +2738,6 @@ Index or delete documents, with an optional commit.
 | <a id="field-luxir.updaterequest.collection"></a>[`collection`](#field-luxir.updaterequest.collection) | 3 | `string` | singular | empty selects the default collection, "main" |
 | <a id="field-luxir.updaterequest.docs"></a>[`docs`](#field-luxir.updaterequest.docs) | 4 | [`Map`](#message-luxir.map) | repeated | Documents to index. Input fields named \_version\_ after field mapping are rejected with a document error: the field is assigned by the engine and optimistic concurrency is not supported. |
 | <a id="field-luxir.updaterequest.delete_ids"></a>[`delete_ids`](#field-luxir.updaterequest.delete_ids) | 6 | `string` | repeated | Document IDs to delete. Deletes never fail per-id; deleting a nonexistent id is a no-op. |
-| <a id="field-luxir.updaterequest.allow_dups"></a>[`allow_dups`](#field-luxir.updaterequest.allow_dups) | 7 | `bool` | singular | Skip overwrite/dedupe for faster indexing when incoming IDs are known to be unique and do not already exist in the collection. Default (false) overwrites any existing document with the same ID. |
 | <a id="field-luxir.updaterequest.all_or_none"></a>[`all_or_none`](#field-luxir.updaterequest.all_or_none) | 8 | `bool` | singular | If true, all documents in this request must be successfully indexed or none will be. Processing stops at the first failing document: documents already indexed by this request are rolled back, queued delete\_ids from this request are rolled back, and later documents are not attempted (and not listed in errors). Atomicity is per-request; it does not span multiple requests in a stream. |
 | <a id="field-luxir.updaterequest.return_ids"></a>[`return_ids`](#field-luxir.updaterequest.return_ids) | 9 | `bool` | singular | If true, return the ids of indexed documents in the response. |
 | <a id="field-luxir.updaterequest.commit"></a>[`commit`](#field-luxir.updaterequest.commit) | 10 | [`CommitParams`](#message-luxir.commitparams) | singular | Commit parameters. If present, this request will commit; if absent, no commit is performed. |
@@ -2721,7 +2757,7 @@ The response to an update request. In streaming mode the server sends exactly on
 | <a id="field-luxir.updateresponse.request_id"></a>[`request_id`](#field-luxir.updateresponse.request_id) | 1 | `string` | singular | This is the request\_id from the UpdateRequest, if it was set. |
 | <a id="field-luxir.updateresponse.update_version"></a>[`update_version`](#field-luxir.updateresponse.update_version) | 2 | `uint64` | singular | The update version assigned to the update request. |
 | <a id="field-luxir.updateresponse.status"></a>[`status`](#field-luxir.updateresponse.status) | 3 | [`UpdateResponse.Status`](#enum-luxir.updateresponse.status) | singular |  |
-| <a id="field-luxir.updateresponse.ids"></a>[`ids`](#field-luxir.updateresponse.ids) | 4 | `string` | repeated | ids of documents that were successfully indexed, if return\_ids was set to true in the request. In request order; failed documents are omitted (align against docs by skipping errors\[\].index). A successfully indexed doc without a string/bytes id contributes an empty string. Only meaningful when status is OK or PARTIAL; on a request-level ERROR the listed documents may have been rolled back. |
+| <a id="field-luxir.updateresponse.ids"></a>[`ids`](#field-luxir.updateresponse.ids) | 4 | `string` | repeated | ids of documents that were successfully indexed, if return\_ids was set to true in the request. In request order; failed documents are omitted (align against docs by skipping errors\[\].index). Numbers are in their canonical string form, and a document indexed without an id in a collection with SchemaDef.id\_mode GENERATE reports its generated id. A document indexed without an id (id\_mode ALLOW\_MISSING) contributes an empty string. An id over 255 bytes is reported as given; it is indexed and returned by searches in its long\_terms form unless the id field is stored. Only meaningful when status is OK or PARTIAL; on a request-level ERROR the listed documents may have been rolled back. |
 | <a id="field-luxir.updateresponse.errors"></a>[`errors`](#field-luxir.updateresponse.errors) | 5 | [`UpdateResponse.DocError`](#message-luxir.updateresponse.docerror) | repeated | Per-document failures. A failed document has no effect on search results; the previous version of the document, if any, is untouched. |
 | <a id="field-luxir.updateresponse.total_errors"></a>[`total_errors`](#field-luxir.updateresponse.total_errors) | 7 | `int64` | singular | Number of failed documents. Equals the length of errors unless the transport retained only a prefix (the NDJSON stream keeps the first 100 per group). |
 | <a id="field-luxir.updateresponse.error"></a>[`error`](#field-luxir.updateresponse.error) | 6 | [`Error`](#message-luxir.error) | singular | Request-level failure (not tied to a single document), e.g. a failure in the commit pipeline. Set exactly when status == ERROR for a non-document failure. |
@@ -2738,7 +2774,7 @@ The response to an update request. In streaming mode the server sends exactly on
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.updateresponse.docerror.id"></a>[`id`](#field-luxir.updateresponse.docerror.id) | 1 | `string` | singular | the id of the failed document as given in the request (empty if absent or not a string/bytes value) |
+| <a id="field-luxir.updateresponse.docerror.id"></a>[`id`](#field-luxir.updateresponse.docerror.id) | 1 | `string` | singular | the id of the failed document as given in the request, numbers in their canonical string form (empty if absent, null, or not a scalar) |
 | <a id="field-luxir.updateresponse.docerror.index"></a>[`index`](#field-luxir.updateresponse.docerror.index) | 2 | `int32` | singular | position of the failed document within the request's document list |
 | <a id="field-luxir.updateresponse.docerror.error"></a>[`error`](#field-luxir.updateresponse.docerror.error) | 3 | [`Error`](#message-luxir.error) | singular |  |
 
@@ -2888,6 +2924,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state)
 - [`RequestFlagBit`](#enum-luxir.requestflagbit)
 - [`ResponseFormat`](#enum-luxir.responseformat)
+- [`SchemaDef.IdMode`](#enum-luxir.schemadef.idmode)
 - [`SchemaRequest.Mode`](#enum-luxir.schemarequest.mode)
 - [`SelectionMode`](#enum-luxir.selectionmode)
 - [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir)
@@ -3174,6 +3211,20 @@ Bit positions in the packed request option word, not masks. The two date bits fo
 |---|---|---|
 | <a id="value-luxir.responseformat.envelope"></a>[`ENVELOPE`](#value-luxir.responseformat.envelope) | 0 |  |
 | <a id="value-luxir.responseformat.docs"></a>[`DOCS`](#value-luxir.responseformat.docs) | 1 |  |
+
+<a id="enum-luxir.schemadef.idmode"></a>
+
+### luxir.SchemaDef.IdMode
+
+What a document without an id (absent, JSON null, or the empty string) does. Explicit ids are used as given (numbers in their canonical string form) and a document with an id replaces the live document with that id. Absent in a SET request keeps the current setting.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.schemadef.idmode.allow_missing"></a>[`ALLOW_MISSING`](#value-luxir.schemadef.idmode.allow_missing) | 0 | The document is indexed without an id: it can be searched, but not fetched, overwritten or deleted by id. |
+| <a id="value-luxir.schemadef.idmode.generate"></a>[`GENERATE`](#value-luxir.schemadef.idmode.generate) | 1 | The engine assigns a unique id (13 characters, Crockford base32 of a 64-bit snowflake: 41 bits of milliseconds since 2026-01-01, 10 bits of writer lifetime, 12 bits of sequence; string order is creation order). Generated ids are returned by return\_ids. |
+| <a id="value-luxir.schemadef.idmode.require"></a>[`REQUIRE`](#value-luxir.schemadef.idmode.require) | 2 | The document is rejected with a document error. |
 
 <a id="enum-luxir.schemarequest.mode"></a>
 

@@ -9965,8 +9965,7 @@ TEST_F(FilterCacheConcurrencyTest, updateMergePurgeEvictFuzz) {
     for (int32_t id = base; id < std::min(base + 8, DOC_UNIVERSE); id++) {
       docs.push_back(docFor(id));
     }
-    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT,
-                                /*overwrite=*/true).success);
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   }
   ASSERT_TRUE(commitAndDrain(helper).success);
   ASSERT_NO_THROW(cache->validateForTest());
@@ -10017,7 +10016,6 @@ TEST_F(FilterCacheConcurrencyTest, updateMergePurgeEvictFuzz) {
               update.add(docFor(id));
             }
           }
-          update.overwrite(true);
           if (random.rint(100) < percentCommits) update.commit();
           auto result = helper.submit(update);
           if (!result.success) {

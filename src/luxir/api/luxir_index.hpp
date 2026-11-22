@@ -87,6 +87,7 @@ struct IndexInfo {
   uint64_t index_gen = 0;
   uint64_t core_gen = 0;
   uint64_t update_version = 0;
+  uint64_t id_clock_ms = 0;
   std::span<const SegmentInfo> segments;
   std::span<const AuxIndexInfo> aux_indexes;
 };

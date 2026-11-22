@@ -85,7 +85,7 @@ TEST_F(AutoFlushTest, singleMessageKeptWholeAndOverwritesResolve) {
     std::string id = (i == 1 || i == 17) ? "dup" : ("id" + std::to_string(i));
     docs.push_back(flatdoc("id", id, "foo_w", "brown fox jumped"));
   }
-  helper.indexAll(docs, UpdateMessage::COMMIT, /*overwrite=*/true);  // one message, overwrite mode
+  helper.indexAll(docs, UpdateMessage::COMMIT);  // one message, overwrite mode
 
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(reader->segments().size(), 1u)
@@ -166,17 +166,17 @@ TEST_F(AutoFlushTest, deleteOnlyGrowthAccountsAndFlushes) {
 
 TEST_F(AutoFlushTest, retainedDeletesTransferWithoutDraining) {
   for (int shape : {0, 1, 2, 3}) {
-    SCOPED_TRACE(shape); // overwrite-only, delete-only, allow_dups+delete, mixed
+    SCOPED_TRACE(shape); // overwrite-only, delete-only, overwrite+delete, mixed
     LuxirNode node;
     CollectionHelper helper(node);
     auto iw = helper.getIndexWriter();
     auto& budget = node.getIndexRamBudget();
     holdDeletePasses(node);
     if (shape != 1) {
-      ASSERT_TRUE(helper.index(flatdoc("id", std::string(200, 'a')), UpdateMessage::NO_COMMIT, shape == 0).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", std::string(200, 'a')), UpdateMessage::NO_COMMIT).success);
     }
     if (shape == 3) {
-      ASSERT_TRUE(helper.index(flatdoc("id", std::string(100, 'x')), UpdateMessage::NO_COMMIT, true).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", std::string(100, 'x')), UpdateMessage::NO_COMMIT).success);
     }
     if (shape != 0) {
       ASSERT_TRUE(helper.deleteById("absent").success);
@@ -206,7 +206,7 @@ TEST_F(AutoFlushTest, retainedDeletesTransferWithoutDraining) {
     ASSERT_EQ(1, iw->pendingDeletes.size());
     const auto& packet = **iw->pendingDeletes.deletes.begin();
     ASSERT_EQ(1, packet.lists().size());
-    EXPECT_EQ(shape == 3 ? 2 : 1, packet.lists()[0].size());
+    EXPECT_EQ(shape == 3 ? 3 : shape == 2 ? 2 : 1, packet.lists()[0].size());
     EXPECT_GT(packet.getSmallestVersion(), 0);
     EXPECT_EQ(packetBytes, packet.memSize());
     EXPECT_EQ(packetBytes, budget.retainedDeleteBytesCount());
@@ -220,26 +220,26 @@ TEST_F(AutoFlushTest, retainedDeletesTransferWithoutDraining) {
 }
 
 TEST_F(AutoFlushTest, rollbackRetainedDeleteAccounting) {
-  for (bool overwrite : {false, true}) {
+  for (bool priorWrites : {false, true}) {
     LuxirNode node;
     CollectionHelper helper(node);
     auto iw = helper.getIndexWriter();
     auto& budget = node.getIndexRamBudget();
     holdDeletePasses(node);
-    if (overwrite) {
-      ASSERT_TRUE(helper.index(flatdoc("id", "old"), UpdateMessage::NO_COMMIT, true).success);
+    if (priorWrites) {
+      ASSERT_TRUE(helper.index(flatdoc("id", "old"), UpdateMessage::NO_COMMIT).success);
       ASSERT_TRUE(helper.deleteById("absent").success);
     }
     CollectionHelper::UpdateBuilder request;
     request.add(flatdoc("id", "new")).add(flatdoc("id", "old"))
         .add(flatdoc("id", "bad", "no_such_field", "fail"))
-        .overwrite().allOrNone();
-    if (overwrite) request.remove("absent").remove("rolled-back");
+        .allOrNone();
+    if (priorWrites) request.remove("absent").remove("rolled-back");
     EXPECT_FALSE(helper.submit(request).success);
     auto& inverter = iw->obtainInverter();
     iw->releaseInverter(inverter, true);
     iw->updateGraph->wait_for_all();
-    if (overwrite) {
+    if (priorWrites) {
       ASSERT_EQ(1, iw->pendingDeletes.size());
       EXPECT_EQ((*iw->pendingDeletes.deletes.begin())->memSize(), budget.retainedDeleteBytesCount());
     } else {
@@ -308,7 +308,7 @@ TEST_F(AutoFlushTest, pressureCountsPacketLeftBehind) {
   iw->pressureFlushFloorBytes = 1;
   std::vector<Doc> docs;
   for (int i = 0; i < 2000; i++) docs.push_back(flatdoc("id", std::string(100, 'x') + std::to_string(i)));
-  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::NO_COMMIT, true).success);
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::NO_COMMIT).success);
   iw->updateGraph->wait_for_all();
   ASSERT_EQ(0, iw->segInfos.size());
   int64_t deletes = budget.liveDeleteBytesCount();
@@ -334,7 +334,7 @@ TEST_F(AutoFlushTest, uniqueOverwritesRetireWithoutCommit) {
   std::vector<Doc> batch(500, flatdoc("id", std::string()));
   for (int64_t done = 0; done < scaleTestWork(25'000); done += (int64_t)batch.size()) {
     for (size_t i = 0; i < batch.size(); i++) std::get<std::string>(batch[i][0].val) = std::to_string(done + (int64_t)i);
-    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::NO_COMMIT, true).success);
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::NO_COMMIT).success);
     peak = std::max(peak, budget.retainedDeleteBytesCount());
   }
   iw->updateGraph->wait_for_all();
@@ -353,7 +353,7 @@ TEST_F(AutoFlushTest, pressureShedsIdHeavyInverter) {
   auto iw = helper.getIndexWriter();
   std::vector<Doc> docs;
   for (int i = 0; i < 2000; i++) docs.push_back(flatdoc("id", std::string(100, 'x') + std::to_string(i)));
-  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::NO_COMMIT, true).success);
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::NO_COMMIT).success);
   iw->updateGraph->wait_for_all();
   ASSERT_EQ(1, iw->idleInverters.size());
   auto* inverter = iw->idleInverters.begin()->first;
@@ -417,7 +417,7 @@ TEST_F(AutoFlushTest, uniqueOverwritesAboveInverterCapStayInBudget) {
   std::vector<Doc> batch(500, flatdoc("id", std::string()));
   for (int64_t done = 0; done < scaleTestWork(100'000); done += (int64_t)batch.size()) {
     for (size_t i = 0; i < batch.size(); i++) std::get<std::string>(batch[i][0].val) = std::to_string(done + (int64_t)i);
-    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::NO_COMMIT, true).success);
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::NO_COMMIT).success);
     peak = std::max(peak, budget.liveDeleteBytesCount() + budget.retainedDeleteBytesCount()
                               - budget.retirableDeleteBytesCount());
   }

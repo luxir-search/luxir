@@ -1002,6 +1002,25 @@ or borrow it through their own `parent`; they do not inherit it from their
 logical primary. The policy applies only to ID, TEXT, and indexed STRING
 representations.
 
+## Document IDs
+
+`id_mode` is a top-level schema setting: what a document without an `id`
+(absent, `null`, or `""`) does. A `set` that does not name it keeps the current
+value; `replace_all` without it resets it to the default.
+
+| `id_mode` | A document without an ID |
+|---|---|
+| `allow_missing` (default) | Is indexed without one: searchable, but not fetchable, replaceable or deletable by ID. |
+| `generate` | Gets a unique 13-character ID from the engine, returned by `return_ids`. |
+| `require` | Is rejected with a `missing_id` document error. |
+
+```json
+{"id_mode":"generate"}
+```
+
+Changing the mode affects only later writes. See
+[IDs, overwrites, and deletes](indexing.md#ids-overwrites-and-deletes).
+
 ## The operations
 
 | Request | Meaning |

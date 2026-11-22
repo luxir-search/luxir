@@ -55,9 +55,8 @@ are:
 | `request_id` | Opaque correlation value echoed in the response. |
 | `docs` | Row-oriented JSON documents. |
 | `delete_ids` | IDs to delete; an absent ID is a successful no-op. |
-| `allow_dups` | Skip ID overwrite/deduplication for faster indexing when IDs are known to be unique. Default `false`. |
 | `all_or_none` | Roll back the whole request if one document fails. Default `false`. |
-| `return_ids` | Include successfully indexed IDs in request order. |
+| `return_ids` | Include successfully indexed IDs in request order, including generated ones (see [IDs](#ids-overwrites-and-deletes)). |
 | `commit` | Make changes visible, with optional commit controls. |
 | `field_map` | Rename input document keys onto schema fields for this request. |
 | `drop_unmapped` | Drop doc keys not present in `field_map` instead of indexing them. |
@@ -110,7 +109,7 @@ Three record forms make up a stream:
 - A normal JSON object is a document.
 - `{"_update_": {...}}` opens a group. The inner object is the HTTP JSON form
   of the protobuf [`UpdateRequest`](../reference/protobuf.md#message-luxir.updaterequest) message,
-  with options such as `request_id`, `allow_dups`, `all_or_none`, `return_ids`,
+  with options such as `request_id`, `all_or_none`, `return_ids`,
   `field_map`, `drop_unmapped`, or a collection override.
 - `{"_end_": {...}}` closes the group and may commit. An empty object is a
   checkpoint that closes and reports the current group without ending the
@@ -214,17 +213,84 @@ interval.
 
 ## IDs, overwrites, and deletes
 
-By default, indexing a document whose `id` already exists replaces the old
-document. Replacement is whole-document replacement, not a field patch: a
-field omitted by the new version is absent from the new document.
+Indexing a document whose `id` already exists replaces the old document.
+Replacement is whole-document replacement, not a field patch: a field omitted
+by the new version is absent from the new document. An ID is used as given;
+a numeric ID is stored and returned as its canonical string, so `123` and
+`"123"` are the same document.
 
-When you know the incoming IDs are unique and do not already exist in the
-collection, set `allow_dups: true` to improve indexing performance by skipping
-ID overwrite/deduplication. This disables overwrites for that request. If
-the IDs are not in fact unique, the outcome is unspecified: some duplicates
-remain as separate documents, and others replace each other.
+What a document without an ID (absent, `null`, or `""`) does is the collection's
+[`id_mode`](schema.md#document-ids):
 
-Delete by ID with no document body:
+| `id_mode` | A document without an ID |
+|---|---|
+| `allow_missing` (default) | Is indexed without one: searchable, but not fetchable, replaceable or deletable by ID. |
+| `generate` | Gets a unique ID from the engine, returned by `return_ids`. |
+| `require` | Is rejected with a `missing_id` document error. |
+
+Generated IDs are 13-character strings (Crockford base32 of a 64-bit
+snowflake: milliseconds since 2026-01-01, the writer lifetime, a sequence).
+They sort in creation order within one writer lifetime and are unique per
+collection without any coordination service. Each writer open claims the
+collection's writer state, which numbers the lifetime, and each commit
+records the generator's clock so a reopened writer never goes back in time.
+Because a generated ID is new by construction, those documents skip the
+overwrite bookkeeping, which makes `generate` the fastest way to bulk-load
+documents that have no natural key.
+
+```http
+POST /collections/events/_schema
+
+{"id_mode":"generate"}
+```
+
+```http
+POST /collections/events/_update
+
+{"docs":[{"msg":"started"},{"msg":"stopped"}],"return_ids":true,"commit":{}}
+```
+
+```json
+{"update_version":3,"status":"ok","ids":["0E4M2Z9K8C000","0E4M2Z9K8C001"]}
+```
+
+### Get by ID
+
+Fetch documents by ID. A get runs as a search for those IDs, so it sees what
+searches see: documents become visible when committed. The response has the
+search response shape, with the documents in op `docs` in index order; an ID
+with no live document is simply absent.
+
+```http
+GET /collections/books/_doc/b1
+GET /collections/books/_doc/b1?fields=title_t,year_i
+POST /collections/books/_mget
+
+{"ids":["b1","b2"],"fields":["title_t"]}
+```
+
+`_mget` also takes `min_commit` (with `min_commit_timeout_ms`), like a search,
+to wait for a commit token returned by an update. `?format=docs` returns bare
+document lines, as for `_search`. In a path, percent-encode an ID containing
+`/` or `%` (`/_doc/a%2Fb`).
+
+### Delete by ID
+
+```http
+DELETE /collections/books/_doc/b1?commit=true
+POST /collections/books/_delete?commit=true
+
+{"ids":["b1","b2"]}
+```
+
+```json
+{"update_version":2,"status":"ok"}
+```
+
+A delete is an update with only `delete_ids`; deleting an absent ID is a
+successful no-op. It takes the same URL options as `_update` (`commit`,
+`wait_for_replicas`), and the body may carry `commit` options instead. The
+same deletes can be sent in any update request:
 
 ```http
 POST /collections/books/_update
@@ -232,9 +298,9 @@ POST /collections/books/_update
 {"delete_ids":["b1","b2"],"commit":{}}
 ```
 
-```json
-{"update_version":2,"status":"ok"}
-```
+Over gRPC, `Searcher.Get` and `Indexer.Delete` take
+[`GetRequest`](../reference/protobuf.md#message-luxir.getrequest) and
+[`DeleteRequest`](../reference/protobuf.md#message-luxir.deleterequest).
 
 ## Field mapping
 

@@ -160,6 +160,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   if (!opened) opened.emplace(dir, IncarnationState::claim(dir));
   writerState = std::move(opened->state);
   writerEpoch = writerState.value.epoch;
+  idGenerator.reset(writerEpoch, 0);
   auto& manifest = opened->manifest;
   if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
     throw std::runtime_error("snapshot fallback requires recovery into a new incarnation");
@@ -184,6 +185,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     schemaGen_ = indexInfo.schema->version.generation();
     nextSchemaVersion = indexInfo.schema->version.local;
     updateNumber.store(indexInfo.update_version, std::memory_order_relaxed);
+    idGenerator.reset(writerEpoch, indexInfo.id_clock_ms);
     completedUpdateVersion = indexInfo.update_version;
     durableUpdateVersion = indexInfo.update_version;
     segInfos.reserve(indexInfo.segments.size());
@@ -2406,6 +2408,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   info.version = IndexFormat::VERSION;
   info.index_gen = ++nextManifestGen;
   info.writer_epoch = writerEpoch;
+  info.id_clock_ms = idGenerator.clockMs();
   if (schema != previousSchema) schema = snapshots.schemas->publish(dir, incarnation, std::move(schema));
   info.schema = schema->binding.wire();
   info.schema_file = {schema->file.name, schema->file.size, schema->file.xxh3};
@@ -3290,6 +3293,7 @@ void IndexWriter::testDeleteAllData() {
     for (const auto& file : files) if (file.name != "STATE" && file.name != getSchema()->file.name) dir.deleteFile(file.name);
     writerState = IncarnationState::claim(dir);
     writerEpoch = writerState.value.epoch;
+    idGenerator.reset(writerEpoch, idGenerator.clockMs());
 
     // Any operation that rewinds seg_id/coreGen/commitTime namespaces MUST
     // swap or epoch the filter cache before reusing those namespaces.

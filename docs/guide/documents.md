@@ -167,21 +167,21 @@ on explicitly named fields.
 ## IDs and replacement
 
 `id` is the reserved unique-ID field. String and numeric values are accepted;
-numeric IDs use their canonical string rendering, so `123` and `"123"` are
-the same ID.
+numeric IDs are stored and returned as their canonical string, so `123` and
+`"123"` are the same ID.
 
-With the default `allow_dups: false`, another document with the same ID
-replaces the old document. Replacement is whole-document replacement: fields
-omitted by the new version disappear. For faster indexing when incoming IDs
-are known to be new and unique, see
-[`allow_dups`](indexing.md#ids-overwrites-and-deletes).
+Another document with the same ID replaces the old document. Replacement is
+whole-document replacement: fields omitted by the new version disappear.
 
-An ID is not required. A document with an absent or null ID can be searched,
-but it cannot be overwritten or deleted by ID and has no useful external
-identity.
+Whether a document may lack an ID is the collection's
+[`id_mode`](schema.md#document-ids): by default it is indexed without one
+(searchable, but not fetchable, replaceable or deletable by ID); `generate`
+assigns a unique ID, and `require` rejects the document. See
+[IDs, overwrites, and deletes](indexing.md#ids-overwrites-and-deletes) for
+generated IDs and for getting and deleting documents by ID.
 
 `_version_` is the update version of the request that indexed the document,
-including `allow_dups` and documents without an ID. It is assigned by the engine
+including documents without an ID. It is assigned by the engine
 and is retrieval-only: name it explicitly in the returned fields (`fl`) to read
 it. Sorting, filtering, faceting, functions, collapse and value statistics on
 `_version_` are not supported. Default and wildcard projections exclude it.

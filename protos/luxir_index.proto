@@ -27,6 +27,10 @@ message IndexInfo {
   // Auxiliary indexes built at index scope. Segment-local overlays live on
   // SegmentInfo.overlays.
   repeated AuxIndexInfo aux_indexes = 16;
+
+  // Generated-id clock high-water mark (milliseconds since 2026-01-01): a
+  // reopened writer never generates an id timestamp below it.
+  uint64 id_clock_ms = 19;
 }
 
 // Shared minor and collection-local versions occupy separate components. The

@@ -195,14 +195,16 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - Streaming ingest on both surfaces: HTTP NDJSON with no stream-size limit,
   and a gRPC bidirectional update stream. Individual records and explicit
   atomic groups are bounded; the stream is not.
-- Stream grammar: `_update_` opens a group with options (`allow_dups`,
-  `all_or_none`, `return_ids`, a different `collection`), `_end_` closes it
+- Stream grammar: `_update_` opens a group with options (`all_or_none`,
+  `return_ids`, a different `collection`), `_end_` closes it
   and can commit. One connection can feed several collections.
 - Field mapping at ingest (`field_map`, `drop_unmapped`): index a foreign dump
   as-is, renaming or dropping keys per request, with no file editing and no
   schema change.
-- Update and overwrite by id, delete by id, a duplicate-allowed mode, and
+- Update and overwrite by id, get and delete by id (single and batched), and
   optional per-request atomicity (all-or-none with rollback).
+- Per-collection id policy (`id_mode`): allow documents without an id,
+  generate one (coordination-free 64-bit snowflakes), or require one.
 - Per-document failures are reported by id and index with the same error
   object used everywhere else; the other documents in the request are still
   indexed.

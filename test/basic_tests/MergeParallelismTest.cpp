@@ -68,7 +68,7 @@ void buildMergedIndex(CollectionHelper& helper) {
   iw->mergePolicy->setMergeFactor(1000);
   auto docs = mergeCorpus();
   for (const auto& doc : docs) {
-    auto result = helper.index(doc, UpdateMessage::COMMIT, true);
+    auto result = helper.index(doc, UpdateMessage::COMMIT);
     ASSERT_TRUE(result.success);
   }
   iw->mergeSegments();

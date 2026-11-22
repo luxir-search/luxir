@@ -212,7 +212,7 @@ TEST_F(DocFormatTest, defaultProjectionReturnsEveryRetrievableField) {
   // Every document has a request birth. The default projection leaves it out;
   // an explicit name retrieves it.
   ch.index(flatdoc("id", std::string("b4"), "title_t", std::string("versioned")),
-           UpdateMessage::COMMIT, /*overwrite=*/true);
+           UpdateMessage::COMMIT);
   auto req = localReq(ch.getSearchEngine());
   req->collection("main").topDocs("q").matchQuery("title_t", "versioned").limit(-1);
   req->execute();
@@ -322,7 +322,7 @@ TEST_F(DocFormatTest, wildcardFieldsFollowDocumentFormat) {
   indexBooks(ch);
   ch.index(flatdoc("id", std::string("b5"), "title_t", std::string("wildcards"),
                    "emb_v", std::vector<float>{1, 0}),
-           UpdateMessage::COMMIT, /*overwrite=*/true);
+           UpdateMessage::COMMIT);
 
   auto req = localReq(ch.getSearchEngine());
   req->collection("main").topDocs("q").allQuery()

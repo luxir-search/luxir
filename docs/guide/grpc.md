@@ -25,7 +25,9 @@ The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
 |---|---|---|
 | [`luxir.Indexer/Update`](../reference/protobuf.md#method-luxir.indexer.update) | unary | One bounded update request and response. |
 | [`luxir.Indexer/UpdateStream`](../reference/protobuf.md#method-luxir.indexer.updatestream) | bidirectional stream | A stream of independently acknowledged update requests. |
+| [`luxir.Indexer/Delete`](../reference/protobuf.md#method-luxir.indexer.delete) | unary | Delete documents by ID, with an optional commit. |
 | [`luxir.Searcher/Search`](../reference/protobuf.md#method-luxir.searcher.search) | bidirectional stream | Several search requests per call, with one or more response batches per request. |
+| [`luxir.Searcher/Get`](../reference/protobuf.md#method-luxir.searcher.get) | bidirectional stream | Fetch documents by ID; each request answers like a search, in op `docs`. |
 | [`luxir.Admin/SetSchema`](../reference/protobuf.md#method-luxir.admin.setschema) | unary | Set named definitions or replace a collection schema. |
 | [`luxir.Admin/GetSchema`](../reference/protobuf.md#method-luxir.admin.getschema) | unary | Read a collection schema. |
 | [`luxir.Admin/CreateCollection`](../reference/protobuf.md#method-luxir.admin.createcollection) | unary | Create a collection, optionally with a schema. |

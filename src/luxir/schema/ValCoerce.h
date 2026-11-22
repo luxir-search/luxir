@@ -253,6 +253,17 @@ inline std::string_view toText(const api::Val& val, std::string_view fieldName,
   throwCoerce(fieldName, val, "text");
 }
 
+// The indexed form of a document id: strings and bytes as given, numbers and
+// booleans in canonical text (so 123 and "123" are the same id). nullopt for no
+// value, null or the empty string; arrays and maps throw. Valid while val and
+// buf live.
+inline std::optional<std::string_view> idText(const api::Val& val, std::span<char> buf) {
+  if (isNull(val)) return std::nullopt;
+  auto text = toText(val, "id", buf);
+  if (text.empty()) return std::nullopt;
+  return text;
+}
+
 // Visit the elements of an array-arm Val as scalar Vals, for element-wise
 // coercion in multi-valued handlers.  Returns false if val is not an array.
 template <typename F>
