@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <stdexcept>
 #include <string_view>
 
 #include "luxir/util/StrRef.h"
@@ -12,6 +13,13 @@ namespace luxir {
 
 class DecodedFieldRecord;
 class SegmentCore;
+
+// Segment bytes that fail validation: a damaged or foreign file rather than a
+// bug in the caller.
+class SegmentCorruptError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 
 // Identifies the source of corrupt bytes. Standalone decoders have no segment.
 struct SegmentReadContext {
@@ -25,7 +33,7 @@ struct SegmentReadContext {
 SegmentReadContext segmentReadContext(const SegmentCore& core, const DecodedFieldRecord& fieldInfo,
                                       uint32_t file);
 
-// Reports invalid segment data with the context the caller has.
+// Throws SegmentCorruptError with the context the caller has.
 [[noreturn]] void corruptSegment(std::string_view segment, std::string_view reason,
                                  std::string_view field = std::string_view(),
                                  uint32_t fileNumber = UINT32_MAX);
