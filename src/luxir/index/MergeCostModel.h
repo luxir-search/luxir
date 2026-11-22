@@ -144,6 +144,44 @@ struct MergeCostModel {
         + synthesizedValues * SYNTHESIZED_POINT_BYTES;
   }
 
+  // Index sort reorder (SegmentMerger::indexSortOrder). The plan holds a
+  // 16-byte keyed entry and an 8-byte newToOld slot per merged doc; newToOld
+  // stays for the whole merge. The absolute int32 remap per source doc is
+  // charged with the row maps.
+  static constexpr int64_t SORT_KEY_ENTRY_BYTES = 16;
+  static int64_t indexSortPlanBytes(int64_t mergedDocs) {
+    return mergedDocs * (SORT_KEY_ENTRY_BYTES + 8);
+  }
+  // Per-field reorder scratch indexed by merged doc: a source value rank
+  // for columns, a norm for text.
+  static constexpr int64_t REORDER_RANK_BYTES = 4;
+  static constexpr int64_t REORDER_NORM_BYTES = 2;
+  // One term's postings wait in RAM to be re-sorted: doc, tf, position
+  // start, sort key and its radix buffer per doc, reserved from the term's
+  // document frequency, which docsWithField bounds. Positions go in windows
+  // of at most REORDER_POSITIONS_WINDOW_BYTES (a single document's positions
+  // can exceed it), fewer when the field's total term frequency is smaller.
+  static constexpr int64_t REORDER_POSTING_BYTES = 4 + 4 + 8 + 8 + 8;
+  static constexpr int64_t REORDER_POSITIONS_WINDOW_BYTES = 16LL << 20;
+  static int64_t reorderTermBytes(int64_t docsWithField, int64_t totalTermFreq, bool positions,
+                                  int64_t windowBytes = REORDER_POSITIONS_WINDOW_BYTES) {
+    int64_t bytes = docsWithField * REORDER_POSTING_BYTES;
+    if (positions) bytes += std::min(totalTermFreq * 4, windowBytes);
+    return bytes;
+  }
+  // Reordered stored fields: sources whose docs land out of order decode
+  // their docs once into scratch (ScratchBytes), held in RAM up to
+  // REORDER_STORED_RAM_BYTES and then spilled to a temp file behind a write
+  // buffer (the RAM is released first, so the larger of the two is held),
+  // found through an 8-byte offset per merged doc. A directory without a
+  // scratch path keeps every decoded byte in RAM; the merge charges that
+  // growth as it happens.
+  static constexpr int64_t REORDER_STORED_RAM_BYTES = 32LL << 20;
+  static constexpr int64_t REORDER_STORED_WRITE_BUFFER_BYTES = 1LL << 20;
+  static int64_t reorderStoredBytes(int64_t mergedDocs, int64_t ramBytes = REORDER_STORED_RAM_BYTES) {
+    return std::max(ramBytes, REORDER_STORED_WRITE_BUFFER_BYTES) + mergedDocs * 8;
+  }
+
   static int64_t geoPointsBytes(int64_t totalValues) {
     return totalValues * GEO_POINT_BYTES + (int64_t)BKDWriter::workspaceBytes(totalValues);
   }
