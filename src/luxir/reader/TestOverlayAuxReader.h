@@ -24,6 +24,7 @@ namespace luxir {
 class TestOverlayAuxReader : public AuxReader {
   std::string name;
   std::shared_ptr<InputFile> file;
+  HeldRange hold;
 
 public:
   static constexpr std::string_view KIND = "test_overlay";
@@ -35,12 +36,13 @@ public:
   static inline bool enabledForTests = false;
 
   TestOverlayAuxReader(std::string name, uint64_t gen, uint64_t builtCoreGen,
-                       std::shared_ptr<InputFile> file) noexcept
-    : AuxReader(gen, builtCoreGen), name(std::move(name)), file(std::move(file)) {}
+                       std::shared_ptr<InputFile> file)
+    : AuxReader(gen, builtCoreGen), name(std::move(name)), file(std::move(file)),
+      hold(this->file->acquire({0, this->file->size()})) {}
 
   std::string_view getKind() const override { return KIND; }
   std::string_view getName() const override { return name; }
-  size_t size() const noexcept { return file ? file->size() : 0; }
+  size_t size() const noexcept { return hold.getLength(); }
 
   static std::shared_ptr<TestOverlayAuxReader> open(Directory& dir,
                                                     const luxir::api::AuxIndexInfo& info,

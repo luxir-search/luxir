@@ -12,6 +12,7 @@
 #include <typeinfo>
 #include "LuxirTest.h"
 #include "GrpcLuxirTest.h"
+#include "StrictStorage.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/plugin/Plugin.h"
 #include "luxir/schema/Schema.h"
@@ -67,6 +68,12 @@ std::thread GrpcLuxirTest::serverThread;
 std::shared_ptr<grpc::Channel> GrpcLuxirTest::channel = nullptr;
 bool GrpcLuxirTest::serverStartFailed = false;
 bool unit_tests = true;
+
+std::shared_ptr<Directory> test::strictReadDirectory(Directory& dir) {
+  auto borrowed = std::shared_ptr<Directory>(std::shared_ptr<Directory>(), &dir);
+  auto* layer = LuxirTest::luxirNode->collections().storage().find<StrictLayer>();
+  return layer ? layer->wrapDirectory(std::move(borrowed)) : borrowed;
+}
 
 static bool fieldTypesEqual(const FieldType& lhs, const FieldType& rhs) {
   if (lhs.type_ != rhs.type_

@@ -51,7 +51,7 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
 } // namespace
 
 LiveDocs::LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive)
-    : docSet(FixedBitSet(words.get(), maxDoc), numLive), ownedWords(std::move(words)),
+    : ownedWords(std::move(words)), docSet(FixedBitSet(ownedWords.get(), maxDoc), numLive),
       derivedBytes(sizeof(*this) + FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t)) {
   fieldMetadataMemory.liveViews.fetch_add(1, std::memory_order_relaxed);
   fieldMetadataMemory.liveViewBytes.fetch_add(derivedBytes, std::memory_order_relaxed);
@@ -121,7 +121,8 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   }
   IREADER_DEBUG("Successfully opened delete file {} for segment s{}", deleteFileName, Postings::segmentKey(segId, creatorEpoch));
 
-  InputStream deleteStream = deleteFile->getInputStream();
+  auto hold = deleteFile->acquire({0, deleteFile->size()});
+  InputStream deleteStream = hold.stream();
 
   // Validate file format
   const char* data = deleteStream.ptr();
@@ -165,13 +166,13 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
               deleteFileName, dataSize, expectedSize));
   }
 
-  // FixedBitSet with live docs - memory map directly!
+  // The bitmap borrows the bytes from the hold.
   uint64_t* liveBitsMemory = (uint64_t*)deleteStream.ptr();
 
   IREADER_DEBUG("Loaded {} deleted documents from {} for segment s{}, {} live docs",
             maxDoc - numLiveDocs, deleteFileName, Postings::segmentKey(segId, creatorEpoch), numLiveDocs);
 
-  return std::make_shared<LiveDocs>(liveBitsMemory, maxDoc, std::move(deleteFile), numLiveDocs);
+  return std::make_shared<LiveDocs>(liveBitsMemory, maxDoc, std::move(deleteFile), std::move(hold), numLiveDocs);
 }
 
 

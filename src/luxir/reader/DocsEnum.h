@@ -716,10 +716,10 @@ class DocsEnumImpl : public DocsEnumMeta {
 
   InputStream positionInput;
 
-  int64_t posStartLoc = 0;  // absolute location of this term's positions (base for L0 posByteOff)
+  int64_t posStartLoc = 0;  // Offset of this term's positions in the run's positions stream.
   int32_t pulsedPosition = 0;
   int64_t pendingPosBlockOrd = 0;
-  int64_t pendingPosAbsoluteOffset = 0;
+  int64_t pendingPosStreamOffset = 0;
   bool pendingPosSeekValid = false;
 
 public:
@@ -1303,7 +1303,7 @@ public:
     residentDocBase = residentBlockLast = scoredProbeDocBase = scoredProbeBlockLast = 0;
     residentBlockStartOrd = residentNumWords = scoredProbeBlockStartOrd = 0;
     scoredProbeState = 0;
-    pendingPosBlockOrd = pendingPosAbsoluteOffset = 0;
+    pendingPosBlockOrd = pendingPosStreamOffset = 0;
     pendingPosSeekValid = false;
     nextL0Block = nextL1Group = 0;
     nextL0Base = nextL1Base = readyBlockBodyBytes = 0;
@@ -2488,7 +2488,7 @@ public:
               // without making the doc cursor mutate position decoder state.
               pendingPosBlockOrd =
                   cumTf - (cumTf % Postings::POSITIONS_BLOCK_SIZE);
-              pendingPosAbsoluteOffset =
+              pendingPosStreamOffset =
                   posStartLoc + (int64_t) blockPosByteOff;
               pendingPosSeekValid = true;
             }

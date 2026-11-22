@@ -246,7 +246,8 @@ void buildRawField(RAMDir& dir, MemPool& pool, FieldType::flag_type flags,
 }
 
 MetadataRunCodes readFirstBlockMetadataRunCodes(PostingsReader& reader, const DecodedFieldRecord& fieldInfo) {
-  InputStream termsIS = reader.core().getInputStreamSeek(fieldInfo.terms()->location);
+  auto bytes = reader.core().slice(fieldInfo.terms()->dictionaryBlocks());
+  InputStream termsIS(bytes.data(), bytes.data() + bytes.size());
   int32_t nTerms = (int32_t)std::min<int64_t>(Postings::TERMS_BLOCK_SIZE,
                                                fieldInfo.indexedTotals().numTerms);
   termsIS.readPackedTerm();

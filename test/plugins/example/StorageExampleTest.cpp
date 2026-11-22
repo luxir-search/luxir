@@ -7,12 +7,14 @@
 
 #include "CountingStorage.h"
 #include "luxir/plugin/Registries.h"
+#include "luxir/reader/OwnershipShape.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/store/CorruptionMarker.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "test/CollectionHelper.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/StrictStorage.h"
@@ -70,9 +72,106 @@ TEST_F(StorageExampleTest, nodeIndexesMergesAndSearchesOnStrictRam) {
   auto* layer = node.collections().storage().find<StrictLayer>();
   ASSERT_NE(nullptr, layer);
   auto snapshot = writer->snapshots.snapshot();
-  EXPECT_TRUE(std::ranges::any_of(snapshot->files, [&](const auto& file) {
+  EXPECT_FALSE(std::ranges::any_of(snapshot->files, [&](const auto& file) {
     return Manifest::segmentDataFile(file.name) && layer->counters->fileStats(file.name).wholeFileAccesses > 0;
   }));
+}
+
+TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
+  LuxirConfig config;
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  auto schema = Schema::createDefaultSchema();
+  schema->fieldTypeMap["freqs"] = std::make_shared<TextFieldType>("freqs", FieldType::INDEX_DOCS_FREQS, "whitespace");
+  schema->fieldTypeMap["blob"] = std::make_shared<StrFieldType>("blob", FieldType::COLUMN_STORED);
+  h.collection().setSchema(schema);
+  auto writer = h.getIndexWriter();
+  std::string blob(PostingsWriter::RAM_SPILL_BYTES + 1, 'x');
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_TRUE(h.indexAll({flatdoc("id", std::to_string(2 * i), "freqs", "needle needle", "body_w", "needle needle",
+                                    "blob", blob),
+                            flatdoc("id", std::to_string(2 * i + 1), "freqs", "needle", "body_w", "needle")},
+                           UpdateMessage::COMMIT).success);
+  }
+  ASSERT_EQ(2u, h.durableSegmentCount());
+  CollectionHelper::UpdateBuilder merge;
+  ASSERT_TRUE(h.submit(merge.commit(true, 1)).success);
+  auto info = readDurableIndexInfo(writer->dir);
+  ASSERT_EQ(1u, info->segments.size());
+  const auto& segment = info->segments.front();
+  ASSERT_GT(segment.files.size(), 1u);
+
+  auto snapshot = *writer->snapshots.snapshot();
+  snapshot.openCores.clear();
+  auto segmentName = Postings::segmentKey(segment.seg_id, segment.creator_epoch);
+  auto range = catalogRangeFromManifest(segment.catalog);
+  auto source = SegmentCore::source(segment.seg_id, segment.creator_epoch, range, segment.max_doc, snapshot.files);
+  auto primary = writer->dir.openFile(Postings::getIndexFileName(segmentName, 0));
+  auto catalogBytes = primary->acquire({range.offset, range.length});
+  auto catalog = SegmentCatalog::decode(
+      SegmentCatalog::readDirectory(catalogBytes.bytes(), range.offset, primary->size()), source.files, {});
+
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
+  auto reader = std::make_shared<IndexReader>(dir, snapshot);
+  auto& postings = reader->segments().front().postingsReader();
+  std::map<uint32_t, std::set<std::pair<uint64_t, uint64_t>>> expected;
+  auto expectPart = [&](field_parts::Slice slice) {
+    ASSERT_TRUE(slice);
+    expected[slice.location.filenum()].emplace(slice.location.offset(), slice.bytes);
+  };
+  auto check = [&] {
+    postings.core().forEachBaseFile([&](uint32_t number, uint64_t) {
+      auto name = Postings::getIndexFileName(segmentName, number);
+      auto stats = counters->fileStats(name);
+      EXPECT_EQ(0u, stats.wholeFileAccesses) << name;
+      EXPECT_EQ(expected[number].size(), stats.acquires) << name;
+      EXPECT_EQ(expected[number], stats.parts) << name;
+    });
+  };
+  postings.core().forEachBaseFile([&](uint32_t number, uint64_t) {
+    expected[number].emplace(0, Postings::LUXIR_HEADER.size());
+  });
+  expectPart({{0, range.offset}, range.length});
+  expectPart(catalog.versionRuns().slice);
+  check();
+
+  for (auto field : {"freqs", "body_w"}) {
+    const auto* record = postings.fieldInfo(field);
+    ASSERT_TRUE(record && record->terms());
+    const auto& terms = *record->terms();
+    ASSERT_EQ(1u, terms.runs.size());
+    expectPart({terms.location, record->termTrie().end().offset() - terms.location.offset()});
+    expectPart(terms.runs.front().docs);
+    expectPart(record->normsValues(postings.maxDoc()));
+    if (FieldType::hasPositions(record->flags)) expectPart(terms.runs.front().positions);
+    for (int i = 0; i < 2; ++i) {
+      auto req = localReq(h.getSearchEngine());
+      req->topDocs().matchQuery(field, "needle").fields({"_score_"}).withStats();
+      req->execute(reader);
+      ASSERT_TRUE(req->ok()) << req->errorMsg();
+      EXPECT_EQ(4, req->getMatchCount());
+      check();
+    }
+  }
+}
+
+TEST_F(StorageExampleTest, nestedReaderOpensWithWholeSegmentFilesDenied) {
+  LuxirConfig config;
+  config.store.layers = {"strict"};
+  config.store.options = {{"strict", {{"whole_segment_files", "deny"}}}};
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  CollectionHelper::UpdateBuilder input;
+  input.addRaw([](auto& doc, auto& arena) {
+    ASSERT_TRUE(api::read_json(doc, R"({"id":"a","items_nested":[{},{}]})", arena));
+  });
+  ASSERT_TRUE(h.submit(input.commit()).success);
+  auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
+  ASSERT_EQ(1u, reader->segments().size());
+  const auto* shape = reader->segments().front().postingsReader().core().ownership("items_nested");
+  ASSERT_TRUE(shape);
+  EXPECT_EQ(2, shape->childCount());
 }
 
 TEST_F(StorageExampleTest, strictRejectsInvalidWholeFileMode) {

@@ -35,9 +35,10 @@ struct CommitSnapshot;
 /// LiveDocs holds the live document bitmap for a segment
 class LiveDocs {
 private:
-  BitDocSet docSet;                                   // The actual bitset (memory mapped)
-  std::shared_ptr<InputFile> deleteFile;              // Keep file alive for memory mapping
+  std::shared_ptr<InputFile> deleteFile;
+  HeldRange deleteHold;
   std::unique_ptr<uint64_t[]> ownedWords;
+  BitDocSet docSet;
   size_t derivedBytes = 0;
   mutable std::mutex rankLiveMutex;
   mutable std::vector<std::pair<std::string, std::unique_ptr<const RankLiveBitmap>>> rankLiveViews;
@@ -45,10 +46,10 @@ private:
 public:
   LiveDocs() : docSet(FixedBitSet(nullptr, 0)) {}
 
-  LiveDocs(uint64_t* mappedMemory, int32_t maxDocCount, 
-           std::shared_ptr<InputFile>&& file, int32_t numLive)
-      : docSet(FixedBitSet(mappedMemory, maxDocCount), numLive),
-        deleteFile(std::move(file)) {}
+  LiveDocs(uint64_t* bits, int32_t maxDocCount, std::shared_ptr<InputFile> file,
+           HeldRange hold, int32_t numLive)
+      : deleteFile(std::move(file)), deleteHold(std::move(hold)),
+        docSet(FixedBitSet(bits, maxDocCount), numLive) {}
 
   LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive);
   ~LiveDocs();

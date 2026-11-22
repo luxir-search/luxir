@@ -34,7 +34,7 @@ class PosEnum {
     }
 
     int64_t candidateOrd = docsEnum.pendingPosBlockOrd;
-    int64_t candidateOffset = docsEnum.pendingPosAbsoluteOffset;
+    int64_t candidateOffset = docsEnum.pendingPosStreamOffset;
     docsEnum.pendingPosSeekValid = false;
     int64_t streamOrd = posOrd + (posBufEnd - posBufIdx);
     if (candidateOrd <= streamOrd) {

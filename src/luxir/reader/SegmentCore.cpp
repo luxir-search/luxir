@@ -11,17 +11,14 @@
 #include "ReaderErrors.h"
 #include "OwnershipShape.h"
 #include "luxir/api/luxir_index.hpp"
-#include <algorithm>
 
 namespace luxir {
 
 namespace {
 
-void validateSegmentFileHeader(InputFile& file, std::string_view segment, uint32_t fileNumber) {
-  InputStream is = file.getInputStream();
+void validateSegmentFileHeader(std::span<const char> bytes, std::string_view segment, uint32_t fileNumber) {
   std::string_view header = Postings::LUXIR_HEADER;
-  if (is.size() < (int64_t) header.size()
-      || std::memcmp(is.ptr(0), header.data(), header.size()) != 0) {
+  if (bytes.size() < header.size() || std::memcmp(bytes.data(), header.data(), header.size()) != 0) {
     corruptSegment(segment, std::format("invalid Luxir magic; expected '{}'", header), {}, fileNumber);
   }
 }
@@ -40,6 +37,15 @@ SegmentCore::SegmentCore(uint64_t segId, uint64_t creatorEpoch)
     : segId(segId), creatorEpoch(creatorEpoch), root(*this, SpaceOrdinal::ROOT) {}
 
 SegmentCore::~SegmentCore() = default;
+
+std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice part) {
+  std::lock_guard lock(holdsMutex);
+  auto key = std::pair(part.location.raw(), part.bytes);
+  auto found = holds.lower_bound(key);
+  if (found != holds.end() && found->first == key) return found->second.bytes();
+  auto hold = file.acquire({part.location.offset(), part.bytes});
+  return holds.emplace_hint(found, key, std::move(hold))->second.bytes();
+}
 
 std::optional<SpaceOrdinal> SegmentCore::spaceOrdinal(std::string_view path) const noexcept {
   return catalog.findSpace(path);
@@ -106,60 +112,71 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
           std::format("Can't find/open segment file '{}'", name),
           std::make_error_code(std::errc::no_such_file_or_directory));
     }
-    validateSegmentFileHeader(*file, segment, number);
-    auto input = file->getInputStream();
-    if (expected && (uint64_t)input.size() != expected) {
+    auto size = file->size();
+    if (expected && size != expected) {
       corruptSegment(segment, "file size differs from manifest", {}, number);
     }
-    files[number] = std::move(file);
-    inputStreams[number] = input;
+    if (source || number != primary) {
+      if (size <= Postings::LUXIR_HEADER.size()) {
+        corruptSegment(segment, "segment file is too short", {}, number);
+      }
+      auto header = file->acquire({0, Postings::LUXIR_HEADER.size()});
+      validateSegmentFileHeader(header.bytes(), segment, number);
+    }
+    bool holdsFree = file->holdsFree();
+    files[number] = {std::move(file), holdsFree};
     return true;
   };
 
   files.resize(1);
-  inputStreams.resize(1);
   if (source && (source->files.empty() || !source->files[primary])) {
     corruptSegment(segment, "missing primary file in manifest");
   }
   if (!open(primary, source ? source->files[primary] : 0)) return false;
-  auto first = inputStreams[primary];
-  std::span<const char> file0(first.ptr(), first.size());
+  auto primarySize = source ? source->files[primary] : getFile(primary)->size();
 
-  auto head = source ? SegmentCatalog::readDirectory(file0, source->range, primaryContext)
-                     : SegmentCatalog::readDirectory(file0, primaryContext);
   if (source) {
     range = source->range;
+    if (range.offset > seg_location::maxOffset() || range.offset > primarySize
+        || range.length > primarySize - range.offset) {
+      primaryContext.invalid("catalog range lies outside file 0", "invalid segment catalog");
+    }
+    if (range.offset < Postings::LUXIR_HEADER.size()) {
+      primaryContext.invalid("catalog starts inside file header", "invalid segment catalog");
+    }
+    auto bytes = slice({{primary, range.offset}, range.length});
+    auto head = SegmentCatalog::readDirectory(bytes, range.offset, primarySize, primaryContext);
     catalog = SegmentCatalog::decode(head, source->files, primaryContext);
     if (spaces().front().maxDoc != source->maxDoc) {
       corruptSegment(segment, "segment row count differs from manifest");
     }
     files.resize(source->files.size());
-    inputStreams.resize(source->files.size());
     for (uint32_t i = 1; i < files.size(); ++i) {
       if (source->files[i] && !open(i, source->files[i])) return false;
     }
   } else {
+    auto file0 = slice({{primary, 0}, primarySize});
+    validateSegmentFileHeader(file0, segment, primary);
+    auto head = SegmentCatalog::readDirectory(file0, primaryContext);
     auto offset = head.catalogOffset();
     range = {offset, file0.size() - offset, std::nullopt};
     auto numbers = head.fileNumbers();
     files.resize((size_t)numbers.back() + 1);
-    inputStreams.resize(files.size());
     std::vector<uint64_t> sizes(files.size());
-    sizes[Postings::PRIMARY_FILE] = file0.size();
+    sizes[primary] = primarySize;
     for (auto number : numbers.subspan(1)) {
       if (!open(number, 0)) return false;
-      sizes[number] = (uint64_t)inputStreams[number].size();
+      sizes[number] = getFile(number)->size();
     }
     catalog = SegmentCatalog::decode(head, sizes, primaryContext);
   }
 
   const auto& version = catalog.versionRuns();
   if (version.slice) {
-    const auto& slice = version.slice;
-    auto input = getInputStreamSeek(slice.location);
-    SegmentReadContext context{this, PackedTerm(nullptr), slice.location.filenum()};
-    versions = VersionRuns(input.ptr(), slice.bytes, version.trailerOffset, version.count, spaces()[0].maxDoc, context);
-    if (versions.byteSize() != slice.bytes) context.invalid("version runs slice does not match its header");
+    auto bytes = slice(version.slice);
+    SegmentReadContext context{this, PackedTerm(nullptr), version.slice.location.filenum()};
+    versions = VersionRuns(bytes.data(), bytes.size(), version.trailerOffset, version.count, spaces()[0].maxDoc, context);
+    if (versions.byteSize() != bytes.size()) context.invalid("version runs slice does not match its header");
   }
   root.initialize(spaces()[0].maxDoc, spaces()[0].fields.size());
   children.reserve(spaces().size() - 1);

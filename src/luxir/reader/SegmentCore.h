@@ -7,6 +7,8 @@
 #include "SegmentCatalog.h"
 #include "CatalogRange.h"
 #include "VersionRuns.h"
+#include <map>
+#include <mutex>
 #include <span>
 #include "luxir/store/Directory.h"
 
@@ -29,8 +31,14 @@ private:
   // Indexed by physical filenum and intentionally sparse. Segment finalize
   // folds buffered streams without renaming survivors, which keeps already
   // spilled filesystem/object-store keys stable.
-  std::vector<std::shared_ptr<InputFile>> files;
-  std::vector<InputStream> inputStreams;
+  struct BaseFile {
+    std::shared_ptr<InputFile> file;
+    bool holdsFree = false;
+  };
+  std::vector<BaseFile> files;
+  // Holds must outlive the views below and release before files.
+  std::mutex holdsMutex;
+  std::map<std::pair<uint64_t, uint64_t>, HeldRange> holds;
   SegmentCatalog catalog;
   CatalogRange range;
   VersionRuns versions;
@@ -43,6 +51,7 @@ private:
 
   SegmentCore(uint64_t segId, uint64_t creatorEpoch);
   bool initializeFromFiles(Directory& dir, const Source* source, bool missingFileOK, bool expectSynced);
+  std::span<const char> retain(InputFile& file, field_parts::Slice part);
 
 public:
   static Source source(uint64_t id, uint64_t epoch, CatalogRange range, int32_t maxDoc,
@@ -77,7 +86,7 @@ public:
 
   void forEachBaseFile(auto&& visit) const {
     for (uint32_t number = 0; number < files.size(); ++number) {
-      if (const auto& file = files[number]) visit(number, (uint64_t)file->size());
+      if (const auto& file = files[number].file) visit(number, (uint64_t)file->size());
     }
   }
 
@@ -93,31 +102,17 @@ public:
 
   InputFile* getFile(uint32_t fnum) {
     assert(fnum < files.size());
-    assert(files[fnum] != nullptr);
-    return files[fnum].get();
+    assert(files[fnum].file != nullptr);
+    return files[fnum].file.get();
   }
 
-  // We can't get & cache the InputStream here unless we create them all in the constructor (for thread safety)
-  // But if we're using mmap, that's probably fine?  Would not be fine if we need to read everything in the constructor.
-  // TODO: could also have a mode that opens on demand (and hence synchronizes)... that would be good for something like IndexWriter
-  // that needs to only read the ID field to handle overwrites / deletions.  That file *might* already be open by another IndexReader
-  // though?  How to coordinate?
-  InputStream getInputStream(uint32_t fnum) {
-    assert(fnum < inputStreams.size());
-    assert(files[fnum] != nullptr);
-    return inputStreams[fnum];
-  }
-
-  std::span<const char> slice(field_parts::Slice slice) {
-    auto input = getInputStream(slice.location.filenum());
-    return {input.ptr(slice.location.offset()), slice.bytes};
-  }
-
-  // return an InputStream positioned on the current location specified
-  InputStream getInputStreamSeek(seg_location sloc) {
-    InputStream is = getInputStream(sloc.filenum());
-    is.seek(sloc.offset());
-    return is;
+  std::span<const char> slice(field_parts::Slice part) {
+    auto number = part.location.filenum();
+    assert(number < files.size());
+    const auto& base = files[number];
+    assert(base.file);
+    if (base.holdsFree) return base.file->acquire({part.location.offset(), part.bytes}).bytes();
+    return retain(*base.file, part);
   }
 
 };

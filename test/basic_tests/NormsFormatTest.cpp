@@ -117,9 +117,9 @@ TEST_F(NormsFormatTest, denseFieldUsesFlatNoBitset) {
   EXPECT_EQ(field_parts::NormsMode::FLAT, info.norms()->mode);
   EXPECT_EQ(4, info.normsValues(postingsReader.maxDoc()).bytes);
   EXPECT_FALSE(info.docsBitmap());
-  auto raw = postingsReader.core().getInputStreamSeek(info.norms()->location);
+  auto raw = postingsReader.core().slice(info.normsValues(postingsReader.maxDoc()));
   const uint8_t expected[] = {2, 3, 2, 1};
-  for (uint8_t norm : expected) EXPECT_EQ(norm, (uint8_t)raw.readByte());
+  EXPECT_TRUE(std::ranges::equal(expected, raw));
 
   NormsReader reader(postingsReader, info);
   EXPECT_TRUE(reader.isFlat());

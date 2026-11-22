@@ -702,10 +702,13 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
   EXPECT_EQ(rebuilt.gen, 1u);
   EXPECT_NE(rebuilt.files[0].name, firstFile);
   EXPECT_TRUE(std::string(rebuilt.files[0].name).ends_with("_01." + Postings::epochString(info2->writer_epoch) + "_00")) << rebuilt.files[0].name;
-  auto bytes = h.getIndexWriter()->snapshots.openFile(pin->id, firstFile)->read();
   auto desc = std::ranges::find(pin->files, firstFile, &FileDescriptor::name);
   ASSERT_NE(desc, pin->files.end());
-  EXPECT_EQ(desc->xxh3, XXH3_64bits(bytes.data(), bytes.size()));
+  {
+    auto file = h.getIndexWriter()->snapshots.openFile(pin->id, firstFile);
+    auto hold = file->acquire({0, file->size()});
+    EXPECT_EQ(desc->xxh3, XXH3_64bits(hold.getData(), hold.getLength()));
+  }
   EXPECT_EQ(desc->size, h.getIndexWriter()->snapshots.stats().retainedBytes);
   h.getIndexWriter()->snapshots.testEvictOldest();
   EXPECT_EQ(h.getIndexWriter()->dir.openFile(firstFile), nullptr);

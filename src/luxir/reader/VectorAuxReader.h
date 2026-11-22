@@ -289,6 +289,7 @@ class VectorAuxReader : public AuxReader {
   std::string name;
   std::string field;
   std::shared_ptr<InputFile> file;
+  HeldRange hold;
   mutable OnceFlag loadOnce;
   // Declared before faissIndex so the index is destroyed first; the index
   // never owns the lists (replace_invlists own=false).
@@ -318,10 +319,9 @@ public:
                   const VectorAuxMeta& meta)
     : AuxReader(gen, builtCoreGen),
       name(std::move(name)), field(std::move(field)),
-      file(std::move(file)), meta(meta) {
-    InputStream is = this->file->getInputStream();
-    const char* base = is.ptr();
-    footer = VectorAuxListsFooter::fromFileTail(base, (size_t)is.left(), this->name);
+      file(std::move(file)), hold(this->file->acquire({0, this->file->size()})), meta(meta) {
+    const char* base = hold.getData();
+    footer = VectorAuxListsFooter::fromFileTail(base, hold.getLength(), this->name);
     if (footer.amplitudeCount != (isRaBitQ() ? 1 : 0)) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: aux '{}' amplitude layout does not match codec", this->name));
@@ -386,8 +386,7 @@ public:
   // MmapInvertedLists (see VectorAuxListsFooter).
   faiss::Index* getFaissIndex() const {
     callOnce(loadOnce, [this]() {
-      InputStream is = file->getInputStream();
-      const char* base = is.ptr();
+      const char* base = hold.getData();
 
       BufferIOReader io(base, (size_t)footer.faissHeaderBytes);
       std::unique_ptr<faiss::Index> idx(faiss::read_index(&io, faiss::IO_FLAG_SKIP_PRECOMPUTE_TABLE));

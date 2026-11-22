@@ -4,6 +4,7 @@
 #pragma once
 #include <gtest/gtest.h>
 #include "test/StorageTestUtils.h"
+#include "test/StrictStorage.h"
 #include "luxir/util/random.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/index/IndexWriter.h"
@@ -197,8 +198,7 @@ namespace luxir::test {
     }
 
     void initReader() {
-      // auto indexReader = iw->snapshots.readers.getReader();
-      reader = std::make_shared<IndexReader>(dir);
+      reader = std::make_shared<IndexReader>(*strictReadDirectory(dir));
     }
 
 

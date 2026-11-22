@@ -39,6 +39,7 @@ private:
 public:
   FileStats fileStats(std::string_view name) const;
   LiveStats liveStats() const;
+  void logSummary() const;
 
   void wholeFile(std::string_view name);
   uint8_t acquired(std::string_view name, ByteRange range);
@@ -67,12 +68,19 @@ public:
 
   StrictLayer(std::unique_ptr<DirectoryFactory> inner, StrictWholeFiles mode)
       : DelegatingDirFactory(std::move(inner)), mode(mode) {}
+  ~StrictLayer() override;
 
   bool exclusive() const override { return delegate->exclusive(); }
+  std::shared_ptr<Directory> wrapDirectory(std::shared_ptr<Directory> dir) const {
+    return std::make_shared<StrictDirectory>(std::move(dir), counters, mode);
+  }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
-    return std::make_shared<StrictDirectory>(delegate->directory(root, path, std::move(options)), counters, mode);
+    return wrapDirectory(delegate->directory(root, path, std::move(options)));
   }
   std::string describe() const override { return "strict(" + delegate->describe() + ")"; }
 };
+
+// Borrows dir for a reader open using the test run's configured storage layer.
+std::shared_ptr<Directory> strictReadDirectory(Directory& dir);
 
 } // namespace luxir::test

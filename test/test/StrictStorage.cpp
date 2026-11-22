@@ -29,6 +29,22 @@ StrictStorageCounters::LiveStats StrictStorageCounters::liveStats() const {
   return live;
 }
 
+void StrictStorageCounters::logSummary() const {
+  std::lock_guard lock(mutex);
+  uint64_t acquires = 0, uniqueParts = 0, wholeFiles = 0;
+  for (const auto& [name, file] : files) {
+    acquires += file.acquires;
+    uniqueParts += file.parts.size();
+    wholeFiles += file.wholeFileAccesses;
+  }
+  LOG_INFO("strict: acquires={}, unique parts={}, peak live holds={}, peak live bytes={}, whole-file accesses={}",
+           acquires, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles);
+}
+
+StrictLayer::~StrictLayer() {
+  counters->logSummary();
+}
+
 void StrictStorageCounters::wholeFile(std::string_view name) {
   std::lock_guard lock(mutex);
   ++files[std::string(name)].wholeFileAccesses;
