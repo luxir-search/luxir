@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <format>
 #include <future>
 #include <latch>
 #include <set>
@@ -110,24 +111,41 @@ TEST_F(LiveDocsTest, writerPicksSmallerKindAndReaderRestoresBits) {
     auto name = Postings::getLiveDocsFileName(Postings::segmentKey(1, 1), 1, 1);
     EXPECT_EQ(expected, dir.openFile(name)->size());
 
-    auto before = fieldMetadataMemory.liveViewBytes.load();
+    auto before = fieldMetadataMemory.liveDocsHeapBytes.load();
+    auto views = fieldMetadataMemory.liveViewBytes.load();
     auto live = LiveDocs::create(dir, 1, 1, 1, 1, 100, false);
     ASSERT_NE(nullptr, live);
-    // A sparse file is expanded into a heap bitmap, reported as a live view.
+    // A sparse file is expanded into a heap bitmap with its own counter; child
+    // live views keep theirs.
     uint64_t heap = deletes < 4 ? sizeof(LiveDocs) + 16 : 0;
-    EXPECT_EQ(before + heap, fieldMetadataMemory.liveViewBytes.load());
+    EXPECT_EQ(heap, live->heapBytes());
+    EXPECT_EQ(before + heap, fieldMetadataMemory.liveDocsHeapBytes.load());
+    EXPECT_EQ(views, fieldMetadataMemory.liveViewBytes.load());
     EXPECT_EQ(deletes, live->numDeletes());
     for (int32_t doc = 0; doc < 100; doc++) EXPECT_EQ(bits.get(doc), live->bitset().get(doc)) << doc;
     live.reset();
-    EXPECT_EQ(before, fieldMetadataMemory.liveViewBytes.load());
+    EXPECT_EQ(before, fieldMetadataMemory.liveDocsHeapBytes.load());
   }
 }
 
-TEST_F(LiveDocsTest, writerRejectsCountThatDisagreesWithBits) {
+TEST_F(LiveDocsTest, sparseRoundTripWhenMaxDocFillsWholeWords) {
   RAMDir dir;
+  RAMFixedBitSet bits(128, true);
+  bits.clear(0);
+  bits.clear(127);
+  EXPECT_EQ(24u + 8, LiveDocsWriter::writeLiveDocs(dir, 1, 1, 1, 1, bits, 128, 126));
+  auto live = LiveDocs::create(dir, 1, 1, 1, 1, 128, false);
+  EXPECT_EQ(126, live->numLive());
+  for (int32_t doc = 0; doc < 128; doc++) EXPECT_EQ(doc != 0 && doc != 127, live->bitset().get(doc)) << doc;
+}
+
+TEST_F(LiveDocsTest, writerRejectsCountThatDisagreesWithBits) {
+  RAMDir sparse, dense;
   RAMFixedBitSet bits(100, true);
   bits.clear(5);
-  EXPECT_THROW(LiveDocsWriter::writeLiveDocs(dir, 1, 1, 1, 1, bits, 100, 98), std::logic_error);
+  EXPECT_THROW(LiveDocsWriter::writeLiveDocs(sparse, 1, 1, 1, 1, bits, 100, 98), std::logic_error);
+  for (int32_t doc = 10; doc < 20; doc++) bits.clear(doc);
+  EXPECT_THROW(LiveDocsWriter::writeLiveDocs(dense, 1, 1, 1, 1, bits, 100, 90), std::logic_error);
 }
 
 TEST_F(LiveDocsTest, corruptSparseFilesThrow) {
@@ -144,6 +162,10 @@ TEST_F(LiveDocsTest, corruptSparseFilesThrow) {
   EXPECT_THROW(load(LiveDocsWriter::SPARSE, 100, 99, {3, 4}), std::runtime_error);    // too long
   EXPECT_THROW(load(LiveDocsWriter::SPARSE, 99, 98, {3}), std::runtime_error);        // maxDoc mismatch
   EXPECT_THROW(load(3, 100, 99, {3}), std::runtime_error);                            // unknown kind
+  // A DENSE body is exactly two words for 100 docs.
+  EXPECT_EQ(100, load(LiveDocsWriter::DENSE, 100, 100, {~0u, ~0u, ~0u, 0xFu})->numLive());
+  EXPECT_THROW(load(LiveDocsWriter::DENSE, 100, 100, {~0u, ~0u, ~0u}), std::runtime_error);
+  EXPECT_THROW(load(LiveDocsWriter::DENSE, 100, 100, {~0u, ~0u, ~0u, 0xFu, 0}), std::runtime_error);
 }
 
 TEST_F(LiveDocsTest, kindFollowsDeleteCountAcrossGenerationsAndMerges) {
@@ -206,6 +228,34 @@ TEST_F(LiveDocsTest, mergeDiffWritesEitherKind) {
     writer->commit();
     EXPECT_EQ(std::vector<uint64_t>{dense ? 24u + 40 : 24u + 4 * 3}, liveFileBytes(writer->dir));
     expectLive(ch, "live_merge", live, 300);
+  }
+}
+
+TEST_F(LiveDocsTest, nestedViewsDeriveFromSparseRoot) {
+  LuxirNode node;
+  CollectionHelper ch(node, "live_nested");
+  auto writer = ch.getIndexWriter();
+  CollectionHelper::UpdateBuilder input;
+  std::vector<std::string> json;
+  for (int i = 0; i < 100; i++) {
+    json.push_back(std::format(R"({{"id":"{}","items_nested":{{"parts_nested":{{"tag_s":"t{}"}}}}}})", i, i));
+  }
+  for (const auto& doc : json) {
+    input.addRaw([&doc](api::Map& map, std::pmr::memory_resource& mr) { ASSERT_TRUE(api::read_json(map, doc, mr)); });
+  }
+  input.commit();
+  ASSERT_TRUE(ch.submit(input).success);
+  ASSERT_TRUE(ch.deleteByIds({"5", "64"}, UpdateMessage::COMMIT).success);
+  EXPECT_EQ(std::vector<uint64_t>{24 + 8}, liveFileBytes(writer->dir));
+  auto view = writer->snapshots.readers.getReader()->view("items_nested.parts_nested");
+  EXPECT_EQ(100, view->maxDoc());
+  EXPECT_EQ(98, view->liveDocs());
+  for (int i : {4, 5, 63, 64, 99}) {
+    auto req = localReq(ch.getSearchEngine());
+    req->collection("live_nested").topDocs().exprQuery(std::format("items_nested.parts_nested.tag_s:t{}", i)).countLimit().limit(0);
+    req->execute(1);
+    ASSERT_OK(req);
+    EXPECT_EQ(i == 5 || i == 64 ? 0 : 1, req->getMatchCount()) << i;
   }
 }
 

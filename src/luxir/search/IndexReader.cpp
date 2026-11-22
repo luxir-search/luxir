@@ -52,17 +52,21 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
 
 } // namespace
 
-LiveDocs::LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive)
+LiveDocs::LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive, bool sparseFile)
     : ownedWords(std::move(words)), docSet(FixedBitSet(ownedWords.get(), maxDoc), numLive),
-      derivedBytes(sizeof(*this) + FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t)) {
-  fieldMetadataMemory.liveViews.fetch_add(1, std::memory_order_relaxed);
-  fieldMetadataMemory.liveViewBytes.fetch_add(derivedBytes, std::memory_order_relaxed);
+      derivedBytes(sizeof(*this) + FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t)), sparseFile(sparseFile) {
+  auto& count = sparseFile ? fieldMetadataMemory.liveDocsHeaps : fieldMetadataMemory.liveViews;
+  auto& bytes = sparseFile ? fieldMetadataMemory.liveDocsHeapBytes : fieldMetadataMemory.liveViewBytes;
+  count.fetch_add(1, std::memory_order_relaxed);
+  bytes.fetch_add(derivedBytes, std::memory_order_relaxed);
 }
 
 LiveDocs::~LiveDocs() {
   if (derivedBytes) {
-    fieldMetadataMemory.liveViews.fetch_sub(1, std::memory_order_relaxed);
-    fieldMetadataMemory.liveViewBytes.fetch_sub(derivedBytes, std::memory_order_relaxed);
+    auto& count = sparseFile ? fieldMetadataMemory.liveDocsHeaps : fieldMetadataMemory.liveViews;
+    auto& bytes = sparseFile ? fieldMetadataMemory.liveDocsHeapBytes : fieldMetadataMemory.liveViewBytes;
+    count.fetch_sub(1, std::memory_order_relaxed);
+    bytes.fetch_sub(derivedBytes, std::memory_order_relaxed);
   }
 }
 
@@ -189,7 +193,7 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
       words[doc >> 6] &= ~(1ULL << (doc & 63));
       prev = doc;
     }
-    return std::make_shared<LiveDocs>(std::move(words), maxDoc, numLiveDocs);
+    return std::make_shared<LiveDocs>(std::move(words), maxDoc, numLiveDocs, true);
   }
 
   // The bitmap borrows the bytes from the hold.
