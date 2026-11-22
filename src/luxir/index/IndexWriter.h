@@ -880,9 +880,10 @@ private:
   std::shared_ptr<SegmentCore> acquireSegmentCore(const SegInfo& seg);
   // acquireSegmentCore, and the slot keeps it.
   std::shared_ptr<SegmentCore> getSegmentCore(SegInfo& seg);
-  // Merge source order: segId, or ascending per-source minimum of the schema's
-  // index sort field (sources without values last, ties by segId).
-  void sortMergeSources(std::vector<SegInfo*>& segs, const std::string& indexSortField);
+  // Merge source order: segId, or the per-source minimum (ascending) or
+  // maximum (descending) of the schema's index sort field (sources without
+  // values last, ties by segId).
+  void sortMergeSources(std::vector<SegInfo*>& segs, const Schema& schema);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
   // Builds outstanding active names and matches new in-flight selectors on the

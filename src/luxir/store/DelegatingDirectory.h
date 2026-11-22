@@ -45,6 +45,7 @@ public:
     return delegate->openChecksum(name, direct);
   }
   Capabilities capabilities() const override { return delegate->capabilities(); }
+  std::string scratchPath() const override { return delegate->scratchPath(); }
 };
 
 
