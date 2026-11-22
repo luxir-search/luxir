@@ -4,6 +4,7 @@
 #include "IndexReader.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
+#include "luxir/index/LiveDocsWriter.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/OwnershipMapper.h"
@@ -17,6 +18,7 @@
 #include "luxir/api/luxir_index.hpp"
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <algorithm>
+#include <cstring>
 #include <bit>
 #include <map>
 #include <memory_resource>
@@ -145,7 +147,7 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   int32_t fileMaxDoc = deleteStream.readInt();
   int32_t numLiveDocs = deleteStream.readInt();
 
-  if (format != 1) {
+  if (format != LiveDocsWriter::DENSE && format != LiveDocsWriter::SPARSE) {
     throw std::runtime_error(std::format("Delete file {} has unsupported format: {}", deleteFileName, format));
   }
 
@@ -160,18 +162,38 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   }
 
   // Validate file size
-  int64_t expectedSize = deleteStream.offset() + screaming::FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t);
-  if (deleteStream.size() != expectedSize) {
+  int32_t numDeleted = maxDoc - numLiveDocs;
+  int64_t expectedSize = deleteStream.offset() + (format == LiveDocsWriter::SPARSE
+      ? (int64_t)numDeleted * (int64_t)sizeof(uint32_t)
+      : (int64_t)screaming::FixedBitSet::sizeInWords(maxDoc) * (int64_t)sizeof(uint64_t));
+  if ((int64_t)deleteStream.size() != expectedSize) {
     throw std::runtime_error(std::format("Delete file {} size mismatch: {} bytes (expected {})",
               deleteFileName, dataSize, expectedSize));
   }
 
+  IREADER_DEBUG("Loaded {} deleted documents from {} for segment s{}, {} live docs",
+            numDeleted, deleteFileName, Postings::segmentKey(segId, creatorEpoch), numLiveDocs);
+
+  if (format == LiveDocsWriter::SPARSE) {
+    // Expand the sorted deleted ids into an owned bitmap; the file is released.
+    auto words = FixedBitSet::allocate(maxDoc, true);
+    const char* ids = deleteStream.ptr();
+    int64_t prev = -1;
+    for (int32_t i = 0; i < numDeleted; i++) {
+      uint32_t doc;
+      std::memcpy(&doc, ids + (size_t)i * sizeof(uint32_t), sizeof(doc));
+      if ((int64_t)doc <= prev || doc >= (uint32_t)maxDoc) {
+        throw std::runtime_error(std::format("Delete file {} has invalid deleted doc {} at {} (previous {}, maxDoc={})",
+                  deleteFileName, doc, i, prev, maxDoc));
+      }
+      words[doc >> 6] &= ~(1ULL << (doc & 63));
+      prev = doc;
+    }
+    return std::make_shared<LiveDocs>(std::move(words), maxDoc, numLiveDocs);
+  }
+
   // The bitmap borrows the bytes from the hold.
   uint64_t* liveBitsMemory = (uint64_t*)deleteStream.ptr();
-
-  IREADER_DEBUG("Loaded {} deleted documents from {} for segment s{}, {} live docs",
-            maxDoc - numLiveDocs, deleteFileName, Postings::segmentKey(segId, creatorEpoch), numLiveDocs);
-
   return std::make_shared<LiveDocs>(liveBitsMemory, maxDoc, std::move(deleteFile), std::move(hold), numLiveDocs);
 }
 
