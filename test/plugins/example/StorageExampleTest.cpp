@@ -7,12 +7,15 @@
 
 #include "CountingStorage.h"
 #include "luxir/plugin/Registries.h"
+#include "luxir/store/Manifest.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/store/CorruptionMarker.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
 #include "test/LuxirTest.h"
+#include "test/StrictStorage.h"
 #include "test/TestUtils.h"
 
 using namespace luxir;
@@ -41,6 +44,43 @@ TEST_F(StorageExampleTest, nodeRunsOnPluginBackendAndLayer) {
   EXPECT_GT(layer->counters->count("create", label), 0u);
   EXPECT_GT(layer->counters->count("open"), 0u);
   EXPECT_NE(node.collections().storage().describe().find("counting(counting_ram)"), std::string::npos);
+}
+
+TEST_F(StorageExampleTest, nodeIndexesMergesAndSearchesOnStrictRam) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  config.store.layers = {"strict"};
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  auto writer = h.getIndexWriter();
+  ASSERT_TRUE(h.index(flatdoc("id", "a", "cat_s", "red"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(h.index(flatdoc("id", "b", "cat_s", "red"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(h.index(flatdoc("id", "c", "cat_s", "blue"), UpdateMessage::COMMIT).success);
+  ASSERT_GT(writer->snapshots.readers.getReader()->segments().size(), 1u);
+  CollectionHelper::UpdateBuilder merge;
+  ASSERT_TRUE(h.submit(merge.commit(true, 1)).success);
+  EXPECT_EQ(1u, writer->snapshots.readers.getReader()->segments().size());
+
+  auto req = localReq(h.getSearchEngine());
+  req->collection("main").topDocs().matchQuery("cat_s", "red").countLimit(-1);
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(2, req->getMatchCount());
+
+  auto* layer = node.collections().storage().find<StrictLayer>();
+  ASSERT_NE(nullptr, layer);
+  auto snapshot = writer->snapshots.snapshot();
+  EXPECT_TRUE(std::ranges::any_of(snapshot->files, [&](const auto& file) {
+    return Manifest::segmentDataFile(file.name) && layer->counters->fileStats(file.name).wholeFileAccesses > 0;
+  }));
+}
+
+TEST_F(StorageExampleTest, strictRejectsInvalidWholeFileMode) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  config.store.layers = {"strict"};
+  config.store.options = {{"strict", {{"whole_segment_files", "allow"}}}};
+  EXPECT_THROW(LuxirNode node(config), ParamError);
 }
 
 TEST_F(StorageExampleTest, unknownBackendAndLayerNamesListRegistered) {

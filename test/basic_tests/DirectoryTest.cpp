@@ -238,12 +238,55 @@ protected:
     }
     return tmpl;
   }
+
+  void checkAcquires(Directory& dir) {
+    const std::string data = "0123456789abcdefghijklmnopqrstuvwxyz";
+    addFile(dir, "data", data);
+    auto input = dir.openFile("data");
+    ASSERT_NE(nullptr, input);
+    EXPECT_TRUE(input->holdsFree());
+    auto part = input->acquire({3, 5});
+    EXPECT_EQ(input->read().data() + 3, part.getData());
+    EXPECT_EQ(3u, (uintptr_t)part.getData() % kHoldAlign);
+    EXPECT_EQ("34567", std::string_view(part.bytes().data(), part.bytes().size()));
+    auto stream = part.stream();
+    EXPECT_EQ(0, stream.offset());
+    EXPECT_EQ(5, stream.size());
+    EXPECT_EQ('3', stream.readByte());
+    EXPECT_EQ(data[3 + 5 + kReadSlack - 1], part.getData()[5 + kReadSlack - 1]);
+
+    auto nearEnd = input->acquire({data.size() - 2, 1});
+    EXPECT_EQ('z', nearEnd.getData()[1]);
+    auto atEnd = input->acquire({data.size(), 0});
+    EXPECT_TRUE(atEnd.bytes().empty());
+    EXPECT_EQ(input->read().data() + data.size(), atEnd.getData());
+    EXPECT_THROW(input->acquire({data.size(), 1}), std::out_of_range);
+    EXPECT_THROW(input->acquire({1, UINT64_MAX}), std::out_of_range);
+    EXPECT_THROW(input->acquire({UINT64_MAX, 2}), std::out_of_range);
+  }
+
+  void checkEmptyAcquire(InputFile& input) {
+    EXPECT_TRUE(input.holdsFree());
+    auto hold = input.acquire({});
+    EXPECT_EQ(nullptr, hold.getData());
+    EXPECT_TRUE(hold.bytes().empty());
+    EXPECT_EQ(0, hold.stream().size());
+    EXPECT_THROW(input.acquire({1, 0}), std::out_of_range);
+    EXPECT_THROW(input.acquire({0, 1}), std::out_of_range);
+  }
 };
 
 
 TEST_F(DirectoryTest, ramdir) {
   RAMDir dir;
   doDir(dir);
+}
+
+TEST_F(DirectoryTest, ramAcquires) {
+  RAMDir dir;
+  checkAcquires(dir);
+  RAMInputFile empty(nullptr, 0);
+  checkEmptyAcquire(empty);
 }
 
 TEST_F(DirectoryTest, ramdirThreads) {
@@ -290,6 +333,17 @@ TEST_F(DirectoryTest, fsdir) {
   FSDirectory dir(path);
   doDir(dir);
   std::filesystem::remove_all(path);
+}
+
+TEST_F(DirectoryTest, mmapAcquires) {
+  auto path = getTempDir();
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  FSDirectory dir(path);
+  checkAcquires(dir);
+  addFile(dir, "empty", "");
+  auto empty = dir.openFile("empty");
+  ASSERT_NE(nullptr, empty);
+  checkEmptyAcquire(*empty);
 }
 
 TEST_F(DirectoryTest, fsdirThreads) {

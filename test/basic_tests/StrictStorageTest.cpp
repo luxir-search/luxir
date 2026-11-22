@@ -1,0 +1,180 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#include <gtest/gtest.h>
+#include <thread>
+
+#include "luxir/store/Manifest.h"
+#include "luxir/store/VerifiedDirectory.h"
+#include "test/LuxirTest.h"
+#include "test/StrictStorage.h"
+
+#if defined(LUXIR_ASAN)
+#include <sanitizer/asan_interface.h>
+#endif
+
+using namespace luxir;
+using namespace luxir::test;
+
+namespace {
+
+constexpr std::string_view payload = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+FileDescriptor put(Directory& dir, std::string_view name) {
+  auto file = dir.createFile(name);
+  OutputStream out(file.get());
+  out.writeBytes(payload);
+  out.close();
+  dir.finishFile(*file);
+  return file->descriptor();
+}
+
+std::string_view contents(const HeldRange& hold) {
+  return {hold.bytes().data(), hold.bytes().size()};
+}
+
+} // namespace
+
+TEST(StrictStorageTest, copiesWithVaryingGarbageAndFileAlignment) {
+  auto ram = std::make_shared<RAMDir>();
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(ram, counters);
+  put(dir, "data");
+  auto file = dir.openFile("data");
+  ASSERT_NE(nullptr, file);
+  EXPECT_FALSE(file->holdsFree());
+  auto first = file->acquire({3, 5});
+  auto second = file->acquire({3, 5});
+  EXPECT_EQ("34567", contents(first));
+  EXPECT_EQ(contents(first), contents(second));
+  EXPECT_NE(ram->openFile("data")->read().data() + 3, first.getData());
+  EXPECT_NE(first.getData(), second.getData());
+  EXPECT_EQ(3u, (uintptr_t)first.getData() % kHoldAlign);
+  EXPECT_NE(first.getData()[5 + kReadSlack - 1], second.getData()[5 + kReadSlack - 1]);
+  EXPECT_EQ(payload, file->read());
+  EXPECT_EQ((int64_t)payload.size(), file->getInputStream().size());
+  EXPECT_THROW(file->acquire({1, UINT64_MAX}), std::out_of_range);
+  auto whole = file->acquire({0, file->size()});
+  EXPECT_EQ(payload, contents(whole));
+
+  auto stats = counters->fileStats("data");
+  EXPECT_EQ(3u, stats.acquires);
+  EXPECT_EQ(10 + payload.size(), stats.acquiredBytes);
+  EXPECT_EQ(3u, stats.wholeFileAccesses);
+  ASSERT_EQ(2u, stats.parts.size());
+  EXPECT_TRUE(stats.parts.contains({3, 5}));
+  EXPECT_TRUE(stats.parts.contains({0, payload.size()}));
+  EXPECT_EQ(0u, counters->fileStats("missing").acquires);
+  EXPECT_EQ(3u, counters->liveStats().peakHolds);
+  EXPECT_EQ(10 + payload.size(), counters->liveStats().peakBytes);
+}
+
+TEST(StrictStorageTest, slackStopsAtEof) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters);
+  put(dir, "data");
+  auto file = dir.openFile("data");
+  ASSERT_NE(nullptr, file);
+  for (size_t slack = 0; slack <= kReadSlack; ++slack) {
+    size_t offset = file->size() - slack - 1;
+    auto hold = file->acquire({offset, 1});
+    const char* data = hold.getData();
+    EXPECT_EQ(payload[offset], data[0]);
+    EXPECT_EQ(offset % kHoldAlign, (uintptr_t)data % kHoldAlign);
+#if defined(LUXIR_ASAN)
+    EXPECT_TRUE(__asan_address_is_poisoned(data - 8));
+    EXPECT_FALSE(__asan_address_is_poisoned(data + slack));
+    EXPECT_TRUE(__asan_address_is_poisoned(data + slack + 1));
+#endif
+  }
+  auto empty = file->acquire({file->size(), 0});
+  EXPECT_TRUE(empty.bytes().empty());
+  EXPECT_EQ(0, empty.stream().left());
+}
+
+TEST(StrictStorageTest, movesReleaseOnceAcrossThreads) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters);
+  put(dir, "data");
+  auto file = dir.openFile("data");
+  ASSERT_NE(nullptr, file);
+  auto kept = file->acquire({0, 2});
+  {
+    auto incoming = file->acquire({2, 3});
+    auto moved = std::move(incoming);
+    kept = std::move(moved);
+    EXPECT_EQ("234", contents(kept));
+    EXPECT_EQ(1u, counters->liveStats().holds);
+    EXPECT_EQ(3u, counters->liveStats().bytes);
+  }
+  EXPECT_EQ(1u, counters->liveStats().holds);
+  {
+    std::jthread thread([incoming = std::move(kept)]() mutable {
+      auto hold = std::move(incoming);
+      EXPECT_EQ("234", contents(hold));
+    });
+  }
+  EXPECT_EQ(0u, counters->liveStats().holds);
+  EXPECT_EQ(0u, counters->liveStats().bytes);
+  EXPECT_EQ(2u, counters->liveStats().peakHolds);
+  EXPECT_EQ(5u, counters->liveStats().peakBytes);
+}
+
+TEST(StrictStorageTest, deniesWholeBaseSegmentFiles) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters, StrictWholeFiles::DENY);
+  auto key = Postings::segmentKey(1, 1);
+  auto name = Postings::getIndexFileName(key, 0u);
+  put(dir, name);
+  auto file = dir.openFile(name);
+  ASSERT_NE(nullptr, file);
+  EXPECT_THROW(file->acquire({0, file->size()}), FileIOException);
+  EXPECT_THROW(file->read(), FileIOException);
+  EXPECT_THROW(file->getInputStream(), FileIOException);
+  auto part = file->acquire({0, 2});
+  EXPECT_EQ("01", contents(part));
+  EXPECT_EQ(3u, counters->fileStats(name).wholeFileAccesses);
+  EXPECT_EQ(1u, counters->fileStats(name).acquires);
+
+  for (const auto& allowed : {Manifest::name(1, 1), Postings::getLiveDocsFileName(key, 1, 1),
+                             Postings::getSegmentOverlayFileName(1, "vec.title", 1, 0, 1, 1), name + ".tmp"}) {
+    put(dir, allowed);
+    auto other = dir.openFile(allowed);
+    ASSERT_NE(nullptr, other);
+    auto whole = other->acquire({0, other->size()});
+    EXPECT_EQ(payload, contents(whole));
+  }
+}
+
+TEST(StrictStorageTest, wrapsVerifiedMappingAfterDirectoryCloses) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  std::shared_ptr<InputFile> file;
+  {
+    StrictDirectory dir(std::make_shared<RAMDir>(), counters);
+    auto desc = put(dir, "data");
+    FileVerification verification;
+    verification.open(dir, std::span(&desc, 1), true, {});
+    verification.run();
+    VerifiedDirectory verified(dir, verification);
+    ASSERT_TRUE(dir.deleteFile(desc.name));
+    file = verified.openFile(desc.name);
+  }
+  ASSERT_NE(nullptr, file);
+  EXPECT_FALSE(file->holdsFree());
+  auto hold = file->acquire({0, 2});
+  EXPECT_EQ("01", contents(hold));
+  EXPECT_EQ(1u, counters->fileStats("data").acquires);
+}
+
+TEST(StrictStorageTest, reuseCopiesWrappedRamFiles) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  auto ram = std::make_shared<RAMDir>();
+  StrictDirectory source(std::make_shared<RAMDir>(), counters), dest(ram, counters);
+  auto files = std::array{put(source, "data")};
+  EXPECT_EQ(ram->capabilities() & ~Directory::HARD_LINK, dest.capabilities());
+  ASSERT_EQ(std::vector<FileDescriptor>(files.begin(), files.end()), dest.reuseFiles(source, files, files));
+  auto copied = ram->openFile("data");
+  ASSERT_NE(nullptr, copied);
+  EXPECT_EQ(payload, copied->read());
+  EXPECT_EQ(1u, counters->fileStats("data").wholeFileAccesses);
+}

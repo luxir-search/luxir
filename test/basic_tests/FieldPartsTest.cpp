@@ -321,6 +321,11 @@ public:
   }
   ~ProtectedInputFile() override { munmap(data, bytes); }
   size_t size() override { return bytes; }
+  HeldRange acquire(ByteRange range) override {
+    checkRange(range, bytes);
+    return {data + range.offset, range.length};
+  }
+  bool holdsFree() const override { return true; }
   std::string_view read() override { return {data, bytes}; }
   InputStream getInputStream() override { return {data, data + bytes}; }
 

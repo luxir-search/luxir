@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <xxhash.h>
 
-#include "InputStream.h"
+#include "HeldRange.h"
 
 namespace luxir {
 
@@ -444,10 +444,21 @@ public:
 
 
 class InputFile {
+protected:
+  static void checkRange(ByteRange range, uint64_t size) {
+    if (range.offset > size || range.length > size - range.offset) {
+      throw std::out_of_range("InputFile range exceeds file size");
+    }
+  }
+
 public:
   virtual ~InputFile() = default;
 
   virtual size_t size() = 0;
+
+  virtual HeldRange acquire(ByteRange range) = 0;
+  // True when all acquisitions return null-owner views valid for the file's lifetime.
+  virtual bool holdsFree() const { return false; }
 
   // Reads all of the file and returns a pointer to the data, which should be valid as long as the InputFile is valid.
   virtual std::string_view read() = 0;
@@ -475,6 +486,12 @@ public:
   size_t size() override {
     return sz;
   }
+
+  HeldRange acquire(ByteRange range) override {
+    checkRange(range, sz);
+    return {data.get() + range.offset, range.length};
+  }
+  bool holdsFree() const override { return true; }
 
   std::string_view read() override {
     return std::string_view(data.get(), sz);

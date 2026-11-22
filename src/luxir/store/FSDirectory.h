@@ -75,6 +75,12 @@ public:
 
   size_t size() override { return sz_; }
 
+  HeldRange acquire(ByteRange range) override {
+    checkRange(range, sz_);
+    return {data_ + range.offset, range.length};
+  }
+  bool holdsFree() const override { return true; }
+
   void prefetch(size_t offset, size_t length) override {
     if (offset >= sz_ || length == 0) return;
     static const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);

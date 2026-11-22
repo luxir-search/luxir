@@ -60,15 +60,7 @@ struct Manifest {
   static bool indexFile(std::string_view name) {
     if (name.ends_with(".tmp")) return false;
     if (candidate(name).first || SchemaBinding::isFile(name)) return true;
-    if (!name.starts_with("s")) return false;
-    auto dot = name.find('.'), underscore = name.find('_');
-    if (dot == std::string_view::npos || underscore == std::string_view::npos || dot >= underscore) return false;
-    auto sortable = [](std::string_view text) {
-      return !text.empty() && Postings::getSortableString(Postings::parseSortableString(text)) == text;
-    };
-    auto seg = name.substr(1, dot - 1);
-    if (!sortable(seg) || !Postings::parseEpoch(name.substr(dot + 1, underscore - dot - 1))) return false;
-    auto suffix = name.substr(underscore + 1);
+    auto suffix = segmentFileSuffix(name);
     if (!suffix.starts_with('_')) return sortable(suffix);
     suffix.remove_prefix(1);
     if (suffix.starts_with('L') && suffix.find('_') == std::string_view::npos) suffix.remove_prefix(1);
@@ -80,11 +72,28 @@ struct Manifest {
       if (generation == std::string_view::npos || generation == 0) return false;
       suffix.remove_prefix(generation + 1);
     }
-    dot = suffix.find('.');
+    auto dot = suffix.find('.');
     return dot != std::string_view::npos && sortable(suffix.substr(0, dot))
         && Postings::parseEpoch(suffix.substr(dot + 1));
   }
 
+  static bool segmentDataFile(std::string_view name) { return sortable(segmentFileSuffix(name)); }
+
+private:
+  static bool sortable(std::string_view text) {
+    return !text.empty() && Postings::getSortableString(Postings::parseSortableString(text)) == text;
+  }
+
+  static std::string_view segmentFileSuffix(std::string_view name) {
+    if (!name.starts_with(Postings::PREFIX_FNAME)) return {};
+    auto dot = name.find('.'), underscore = name.find('_');
+    if (dot == std::string_view::npos || underscore == std::string_view::npos || dot >= underscore) return {};
+    auto seg = name.substr(Postings::PREFIX_FNAME.size(), dot - Postings::PREFIX_FNAME.size());
+    if (!sortable(seg) || !Postings::parseEpoch(name.substr(dot + 1, underscore - dot - 1))) return {};
+    return name.substr(underscore + 1);
+  }
+
+public:
   static api::IndexInfo decode(const Bytes& bytes, std::pmr::memory_resource& arena) {
     api::IndexInfo info;
     if (!bytes || !api::decode(info, api::copyToPaddedInput(*bytes, arena), arena)) {
