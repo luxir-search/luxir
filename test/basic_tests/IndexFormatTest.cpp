@@ -204,7 +204,7 @@ void expectCorrupt(Action action, std::string_view context, std::string_view rea
   try {
     action();
     ADD_FAILURE() << "Expected corruption: " << reason;
-  } catch (const std::runtime_error& e) {
+  } catch (const SegmentCorruptError& e) {
     auto message = std::string_view(e.what());
     EXPECT_TRUE(message.contains(context) && message.contains(reason)) << message;
   }
@@ -212,6 +212,11 @@ void expectCorrupt(Action action, std::string_view context, std::string_view rea
 
 void storeInt(std::string& bytes, size_t at, int32_t value) {
   std::memcpy(bytes.data() + at, &value, sizeof(value));
+}
+
+// Rehashes a deliberately changed catalog, so its decoder rather than the hash check sees it.
+void rehashCatalog(std::string_view file, api::CatalogRange& range) {
+  if (range.offset <= file.size()) range.xxh3 = XXH3_64bits(file.data() + range.offset, file.size() - range.offset);
 }
 
 } // namespace
@@ -456,6 +461,7 @@ TEST_F(IndexFormatTest, malformedSegmentMetadataThrows) {
     std::string changed(bytes);
     auto manifest = segment;
     corrupt(changed, manifest);
+    rehashCatalog(changed, manifest.catalog);
     writeFile(copy, file, changed);
     // An open reads every file the manifest lists, so the one the catalog
     // does not know exists, and the inventory check is what rejects it.
@@ -491,9 +497,10 @@ TEST_F(IndexFormatTest, invalidSpacePathAndRootCount) {
   std::memcpy(corrupt.data() + corrupt.size() - sizeof(length), &length, sizeof(length));
   auto range = writer.catalogRange();
   range.length = corrupt.size() - range.offset;
+  range.xxh3 = XXH3_64bits(corrupt.data() + range.offset, range.length);
   expectCorrupt([&] { SegmentCatalog::readDirectory(corrupt); }, "segment catalog", "root doc count out of range");
   expectCorrupt([&] {
-    SegmentCatalog::readDirectory(std::span(corrupt).subspan(range.offset), range.offset, corrupt.size());
+    SegmentCatalog::readDirectory(std::span(corrupt).subspan(range.offset), range, corrupt.size());
   }, "segment catalog", "root doc count out of range");
 }
 
@@ -518,7 +525,7 @@ TEST_F(IndexFormatTest, opensCatalogFromCopiedRange) {
     bytes.assign(hold.getData(), hold.getLength());
   }
 
-  auto head = SegmentCatalog::readDirectory(bytes, range.offset, source.files[0]);
+  auto head = SegmentCatalog::readDirectory(bytes, range, source.files[0]);
   auto catalog = SegmentCatalog::decode(head, source.files);
   auto ordinal = catalog.rowSpaces()[0].fields.find("tag_s");
   ASSERT_GE(ordinal, 0);
@@ -528,7 +535,46 @@ TEST_F(IndexFormatTest, opensCatalogFromCopiedRange) {
   auto record = catalog.field(SpaceOrdinal::ROOT, ordinal);
   ASSERT_TRUE(record->terms());
   EXPECT_EQ(1, record->indexedTotals().numTerms);
-  EXPECT_THROW(SegmentCatalog::readDirectory(bytes, range.offset, source.files[0] + 1), std::runtime_error);
+  EXPECT_THROW(SegmentCatalog::readDirectory(bytes, range, source.files[0] + 1), SegmentCorruptError);
+}
+
+// Any changed catalog byte fails the manifest hash before decoding, whether the
+// catalog is read in place or as copied range bytes.
+TEST_F(IndexFormatTest, catalogHashMismatchIsCorruption) {
+  LuxirNode node(LuxirConfig{});
+  CollectionHelper ch(node, "main");
+  ASSERT_TRUE(ch.index(flatdoc("id", "a", "tag_s", "red"), UpdateMessage::COMMIT).success);
+  auto& dir = ch.getIndexWriter()->dir;
+  auto durable = readDurableIndexInfo(dir);
+  const auto& segment = durable.info.segments.front();
+  auto range = catalogRangeFromManifest(segment.catalog);
+  auto name = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
+  std::string bytes(dir.openFile(name)->read());
+  bytes[range.offset + range.length / 2] ^= 1;
+  RAMDir copy;
+  writeFile(copy, name, bytes);
+  for (const auto& file : segment.files) {
+    if (file.name != name) writeFile(copy, file.name, dir.openFile(file.name)->read());
+  }
+  expectCorrupt([&] { SegmentCore::create(copy, segment); }, name, "catalog hash differs from manifest");
+  auto catalog = std::string_view(bytes).substr(range.offset);
+  expectCorrupt([&] { SegmentCatalog::readDirectory(catalog, range, bytes.size()); },
+                "segment catalog", "catalog hash differs from manifest");
+}
+
+TEST_F(IndexFormatTest, manifestRequiresCatalogRange) {
+  LuxirNode node(LuxirConfig{});
+  CollectionHelper ch(node, "main");
+  ASSERT_TRUE(ch.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  auto manifest = Manifest::load(ch.getIndexWriter()->dir);
+  std::pmr::monotonic_buffer_resource arena;
+  auto info = Manifest::decode(manifest.bytes, arena);
+  std::vector<api::SegmentInfo> segments(info.segments.begin(), info.segments.end());
+  segments[0].catalog = {};
+  info.segments = segments;
+  auto bytes = std::make_shared<std::vector<std::byte>>();
+  ASSERT_TRUE(api::encode(info, *bytes));
+  EXPECT_THROW(Manifest::decode(bytes, arena), std::runtime_error);
 }
 
 TEST_F(IndexFormatTest, corruptFieldPrefixRespectsVerificationPolicy) {
@@ -559,14 +605,12 @@ TEST_F(IndexFormatTest, corruptFieldPrefixRespectsVerificationPolicy) {
   {
     CommitSnapshotRegistry snapshot(copy);
     EXPECT_THROW(snapshot.openLocalSnapshot(true), ChecksumMismatchError);
-    ASSERT_NO_THROW(snapshot.openLocalSnapshot(false));
-    auto reader = snapshot.readers.getReader();
-    auto& postings = reader->segments().front().postingsReader();
-    expectCorrupt([&] { postings.fieldHeader(0); }, file, fieldContext);
-    expectCorrupt([&] { postings.fieldInfo(0); }, file, fieldContext);
+    // Without file verification the manifest's catalog hash still rejects the record.
+    expectCorrupt([&] { snapshot.openLocalSnapshot(false); }, file, "catalog hash differs from manifest");
     CorruptionMarker::write(copy, std::span(&file, 1), "bad field prefix");
     EXPECT_THROW(snapshot.openLocalSnapshot(false), ChecksumMismatchError);
   }
+  // A catalog found from the trailer has no hash; the record fails when it decodes.
   SegmentCore core(copy, segment.seg_id, segment.creator_epoch);
   EXPECT_FALSE(core.catalogRange().xxh3.has_value());
   EXPECT_THROW(catalogRangeToManifest(core.catalogRange()), std::logic_error);

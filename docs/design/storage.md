@@ -207,7 +207,12 @@ when a request ends comes with a bounded cache.
   the bytes returned. A part has one class whichever reader acquires it.
 
 The manifest identifies the segment catalog at the end of file 0 by offset,
-length and xxh3. The catalog holds a field table for each row space, then
+length and xxh3, and rejects a segment without that range. Every open from
+the manifest checks the catalog bytes against the hash before decoding them,
+whether the bytes are mapped locally or fetched as a range, so a damaged
+catalog fails the open as a segment corruption error instead of decoding
+wrong offsets. A catalog found from file 0's trailer alone has no manifest
+hash and is not checked. The catalog holds a field table for each row space, then
 the directory and its length. A field table contains name-sorted records
 and their offsets. Each record contains a header followed by the parts
 present in its part mask. A separately placed extent has an absolute file
@@ -279,11 +284,11 @@ for a range read. The catalog directory points to the separate version runs.
 Per-field bounds stay in the catalog so manifests do not repeat them for
 every segment.
 
-Each manifest also carries a collection-level summary: per-field bounds over
-all of its segments. It is per field, not per segment, so it stays small, and
-it changes only when the set of segments does. A search across many
-collections uses it to skip a whole collection from the manifest alone,
-without reading any segment's catalog or opening the collection.
+A collection-level summary in each manifest is planned: per-field bounds
+over all of its segments. It would be per field, not per segment, so it stays
+small, and it would change only when the set of segments does. A search
+across many collections could then skip a whole collection from the manifest
+alone, without reading any segment's catalog or opening the collection.
 
 Per-segment bounds prove "no match" when a query's range does not overlap
 them, and "every document matches" when the minimum and maximum equal the

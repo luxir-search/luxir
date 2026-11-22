@@ -14,7 +14,8 @@ namespace api { struct CatalogRange; }
 struct CatalogRange {
   uint64_t offset = 0;  // Offset from the start of the file.
   uint64_t length = 0;  // Length through the end of the file.
-  // Range opens verify this hash. Local opens follow the whole-file verification policy.
+  // XXH3 of the catalog bytes. Every open from a manifest range checks it before
+  // decoding, local or ranged. Unset for a catalog found from file 0's trailer.
   std::optional<uint64_t> xxh3;
 
   bool operator==(const CatalogRange&) const = default;

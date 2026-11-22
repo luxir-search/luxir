@@ -7,6 +7,8 @@
 #include "VersionRuns.h"
 #include "luxir/codec/NumColumnFormat.h"
 
+#include <xxhash.h>
+
 namespace luxir {
 namespace {
 
@@ -20,6 +22,13 @@ constexpr uint64_t HAS_OWNERS = 1;
 void checkCatalogTail(uint64_t offset, uint64_t length, uint64_t fileSize, const Errors& errors) {
   if (!length || offset > fileSize || length != fileSize - offset) {
     errors.invalid("catalog range must reach the end of file 0");
+  }
+}
+
+// A manifest range carries the catalog's hash. A catalog found from the trailer has none.
+void checkCatalogHash(std::span<const char> catalog, const CatalogRange& range, const Errors& errors) {
+  if (range.xxh3 && XXH3_64bits(catalog.data(), catalog.size()) != *range.xxh3) {
+    errors.invalid("catalog hash differs from manifest");
   }
 }
 
@@ -155,18 +164,22 @@ SegmentCatalog::DirectoryHead SegmentCatalog::readDirectory(std::span<const char
                                                             SegmentReadContext context) {
   Errors errors(CATALOG_ERROR, context);
   checkCatalogTail(range.offset, range.length, file.size(), errors);
-  auto head = readDirectoryRegion(file.subspan(range.offset), range.offset, errors);
+  auto catalog = file.subspan(range.offset);
+  checkCatalogHash(catalog, range, errors);
+  auto head = readDirectoryRegion(catalog, range.offset, errors);
   checkCatalogStart(head.offset, errors, range.offset);
   return head;
 }
 
 SegmentCatalog::DirectoryHead SegmentCatalog::readDirectory(std::span<const char> catalog,
-                                                            uint64_t offset, uint64_t fileSize,
+                                                            CatalogRange range, uint64_t fileSize,
                                                             SegmentReadContext context) {
   Errors errors(CATALOG_ERROR, context);
-  checkCatalogTail(offset, catalog.size(), fileSize, errors);
-  auto head = readDirectoryRegion(catalog, offset, errors);
-  checkCatalogStart(head.offset, errors, offset);
+  if (catalog.size() != range.length) errors.invalid("catalog bytes differ from catalog range");
+  checkCatalogTail(range.offset, range.length, fileSize, errors);
+  checkCatalogHash(catalog, range, errors);
+  auto head = readDirectoryRegion(catalog, range.offset, errors);
+  checkCatalogStart(head.offset, errors, range.offset);
   return head;
 }
 
