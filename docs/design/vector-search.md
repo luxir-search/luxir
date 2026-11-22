@@ -243,7 +243,8 @@ defaults are close in recall (0.953 vs 0.960 at the default nprobe; 0.989 vs
 coarse assignment, took 10.2 s (RaBitQ, 140 B/vector) vs 16.7 s (PQ m=32,
 55 B/vector) at 768 dims and 10.4 s vs 12.9 s at 128 dims. Bytes per vector
 include the 8-byte id and per-overlay headers (centroids, and for RaBitQ the
-stored d x d rotation).
+stored d x d rotation). Current overlays store list ids as 4-byte uint32
+value ranks, so their files are 4 bytes per vector smaller than these figures.
 
 The Cohere-768 cosine comparison motivating PQ's automatic `m=96` is:
 

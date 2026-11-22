@@ -1991,6 +1991,9 @@ public:
 
       faiss::IndexIVF& ivf;
       faiss::IndexIVFRaBitQ* rabitq;
+      // The overlay's file-backed lists (VectorAuxReader); ids are read as
+      // uint32 through ids32(), never through the widening get_ids().
+      const MmapInvertedLists& lists;
       int32_t segOrd;
       const Binding<Owned>& v2d;
       LiveDocs* liveDocs;
@@ -2161,6 +2164,12 @@ public:
         }
       };
 
+      static const MmapInvertedLists& mmapLists(const faiss::IndexIVF& ivf) {
+        auto* lists = dynamic_cast<const MmapInvertedLists*>(ivf.invlists);
+        if (lists == nullptr) throw std::runtime_error("KnnQuery: IVF lists are not file-backed");
+        return *lists;
+      }
+
     public:
       SegmentIvfScanner(faiss::IndexIVF& ivf, int32_t segOrd,
                         IndexReader::Segment& seg, const Binding<Owned>& v2d, DocSet* domain,
@@ -2168,7 +2177,7 @@ public:
                         const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
                         RaBitQAmplitudes amplitudes, KnnIntervalCollector<Groups>* intervals)
           : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
-            segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
+            lists(mmapLists(ivf)), segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
             domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
                                         && domain == &liveDocs->docset()),
             metric(metric), preparedQuery(preparedQuery) {
@@ -2208,12 +2217,11 @@ public:
         work.allocatorEntries += (int64_t)rawSize;
         const uint8_t* bits = rankLive->bits;
         int64_t liveSize = 0;
-        const faiss::idx_t* listIds = ivf.invlists->get_ids((size_t)listId);
+        const uint32_t* listIds = lists.ids32((size_t)listId);
         for (size_t i = 0; i < rawSize; i++) {
-          uint64_t r = (uint64_t)listIds[i];
+          uint32_t r = listIds[i];
           liveSize += (bits[r >> 3] >> (r & 7)) & 1;
         }
-        ivf.invlists->release_ids((size_t)listId, listIds);
         return liveSize;
       }
 
@@ -2270,7 +2278,7 @@ public:
         bool keepMax = metric != (int32_t)api::VectorMetric::L2;
         const float* listAmplitudes = nullptr;
         double selectionScale = 0;
-        const faiss::idx_t* rowIds = nullptr;
+        const uint32_t* rowIds = nullptr;
         // The candidate test after any scoring: the handler's threshold moves
         // as results arrive, so rows are admitted strictly in order.
         auto admit = [&](float distance, size_t row) LUXIR_INLINE {
@@ -2287,11 +2295,11 @@ public:
         for (size_t list = 0; list < listIds.size(); list++) {
           auto id = listIds[list];
           if (id < 0) continue;
-          faiss::InvertedLists::ScopedIds ids(ivf.invlists, (size_t)id);
+          const uint32_t* ids = lists.ids32((size_t)id);
           faiss::InvertedLists::ScopedCodes codes(ivf.invlists, (size_t)id);
           size_t count = ivf.invlists->list_size((size_t)id);
           visited += (int64_t)count;
-          rowIds = ids.get();
+          rowIds = ids;
           std::unique_ptr<faiss::FlatCodesDistanceComputer> distanceComputer;
           faiss::RaBitQDistanceComputer* dc = nullptr;
           float gError = 0;
@@ -2339,8 +2347,13 @@ public:
                 for (size_t k = 0; k < rows; k++) admit(distances[k], begin + selected[k]);
               }
             } else if (dc == nullptr) {
-              if constexpr (!Interval) pqScanner->scan_codes(end - begin, codes.get() + begin * ivf.code_size,
-                                    ids.get() + begin, handler);
+              if constexpr (!Interval) {
+                // FAISS's PQ scan_codes takes idx_t ids: widen one block.
+                faiss::idx_t wideIds[RaBitQScorer::BLOCK_ROWS];
+                std::copy(ids + begin, ids + end, wideIds);
+                pqScanner->scan_codes(end - begin, codes.get() + begin * ivf.code_size,
+                                      wideIds, handler);
+              }
             } else for (size_t i = begin; i < end; i++) {
               if constexpr (!std::is_same_v<Probe, std::nullptr_t>) {
                 if (!probe(ids[i])) continue;

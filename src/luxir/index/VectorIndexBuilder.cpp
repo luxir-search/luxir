@@ -453,6 +453,12 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     LOG_INFO("VectorIndexBuilder: field {} has no vectors; skipping", fieldName);
     return std::nullopt;
   }
+  // The overlay stores list ids (value ranks) as uint32.
+  if ((uint64_t)ntotal > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(fmt::format(
+      "VectorIndexBuilder: field {} has {} vectors, more than an overlay can address",
+      fieldName, ntotal));
+  }
 
   int32_t nlist = chooseIvfNList(ann.nlist, ntotal);
   // Training floor.  RaBitQ trains only the IVF centroids; PQ also trains
@@ -675,19 +681,31 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     }
 
     // List payloads in the layout VectorAuxListsFooter documents: sizes, ids,
-    // codes, amplitudes, footer. The ids section must land 8-aligned in the file so the
-    // reader's in-memory view can be indexed as idx_t directly.
+    // codes, amplitudes, footer. Sections land 8-aligned in the file so the
+    // reader's in-memory view can be indexed directly. Ids are value ranks
+    // below ntotal (checked <= UINT32_MAX above), narrowed to uint32.
     os.align(8);
     const faiss::InvertedLists& lists = *index->invlists;
     for (size_t i = 0; i < lists.nlist; i++) {
       os.writeLong((int64_t)lists.list_size(i));
     }
-    for (size_t i = 0; i < lists.nlist; i++) {
-      size_t sz = lists.list_size(i);
-      if (sz == 0) continue;
-      faiss::InvertedLists::ScopedIds ids(&lists, i);
-      os.write(ids.get(), sz * sizeof(faiss::idx_t));
+    {
+      std::array<uint32_t, 4096> buffer;
+      for (size_t i = 0; i < lists.nlist; i++) {
+        size_t sz = lists.list_size(i);
+        if (sz == 0) continue;
+        faiss::InvertedLists::ScopedIds ids(&lists, i);
+        for (size_t off = 0; off < sz; off += buffer.size()) {
+          size_t count = std::min(buffer.size(), sz - off);
+          for (size_t row = 0; row < count; row++) {
+            assert(ids[off + row] >= 0 && ids[off + row] < ntotal);
+            buffer[row] = (uint32_t)ids[off + row];
+          }
+          os.write(buffer.data(), count * sizeof(uint32_t));
+        }
+      }
     }
+    os.align(8);
     for (size_t i = 0; i < lists.nlist; i++) {
       size_t sz = lists.list_size(i);
       if (sz == 0) continue;
