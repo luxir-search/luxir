@@ -52,7 +52,6 @@ struct WrittenPoints {
 // An inverter owns its writer. Merge tasks use independent stream checkouts.
 class PostingsWriter {
 public:
-  static constexpr size_t DEFAULT_SPILL_FILE_LIMIT = 32;
   static constexpr size_t RAM_SPILL_BYTES = 4ULL << 20;
 
   using IndexFieldInfo = luxir::IndexFieldInfo;
@@ -95,7 +94,6 @@ private:
   std::optional<DataFile> primary;
   std::mutex spillMutex;
   std::vector<std::unique_ptr<DataFile>> spillFiles;  // Null slots are reserved for creation.
-  size_t spillFileLimit;
   std::deque<IndexFieldInfo> fieldInfos;
   std::mutex mutex;  // Field registry and its pool.
 public:
@@ -104,18 +102,15 @@ public:
   uint64_t creatorEpoch;
 
 public:
-  PostingsWriter(Directory& dir, uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc = -1,
-                 size_t spillFileLimit = DEFAULT_SPILL_FILE_LIMIT)
+  PostingsWriter(Directory& dir, uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc = -1)
       : directory(dir), spaces{{"", maxDoc, {}}}, segStr(Postings::segmentKey(segId, creatorEpoch)),
-        spillFileLimit(spillFileLimit), segId(segId), creatorEpoch(creatorEpoch) {}
+        segId(segId), creatorEpoch(creatorEpoch) {}
 
   // The owner installs its accounting before writing any checkouts. Merge
   // checkouts may call it concurrently.
   void setStagedRamAccounting(std::function<void(int64_t)> account) {
     onStagedRamDelta = std::move(account);
   }
-
-  void setSpillFileLimit(size_t limit) { spillFileLimit = limit; }
 
   Directory& getDirectory() {
     return directory;
@@ -208,22 +203,23 @@ private:
     return {file.fileNum, file.out.size()};
   }
 
+  // Hands out the shortest spill file no stream is writing; a new file is created only
+  // when every existing one is checked out, so a segment has at most as many spill
+  // files as streams that spilled at the same time.
   DataFile& claimSpillFile(size_t bytes) {
     uint32_t number;
     {
       const std::lock_guard lock(spillMutex);
-      if (spillFiles.size() >= spillFileLimit) {
-        DataFile* shortest = nullptr;
-        for (const auto& file : spillFiles) {
-          if (file && file->available && fits(alignedTail(file->out), bytes)
-              && (!shortest || file->out.size() < shortest->out.size())) {
-            shortest = file.get();
-          }
+      DataFile* shortest = nullptr;
+      for (const auto& file : spillFiles) {
+        if (file && file->available && fits(alignedTail(file->out), bytes)
+            && (!shortest || file->out.size() < shortest->out.size())) {
+          shortest = file.get();
         }
-        if (shortest) {
-          shortest->available = false;
-          return *shortest;
-        }
+      }
+      if (shortest) {
+        shortest->available = false;
+        return *shortest;
       }
       if (spillFiles.size() == seg_location::maxFilenum()) {
         throw std::length_error("too many segment files");

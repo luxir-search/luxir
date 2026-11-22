@@ -117,9 +117,9 @@ TEST_F(CompoundFileTest, ReservationCrossingCapacitySpills) {
   EXPECT_EQ(SVB_OVERREAD_PAD, input.left());
 }
 
-TEST_F(CompoundFileTest, FinishedSpillsAreReusedAtLimit) {
+TEST_F(CompoundFileTest, FinishedSpillsAreReused) {
   FSDirectory dir(path);
-  PostingsWriter writer(dir, 1, 1, 1, 1);
+  PostingsWriter writer(dir, 1, 1, 1);
   std::string payload(PostingsWriter::RAM_SPILL_BYTES + 1, 'x');
   auto firstOut = writer.getOutputStream();
   firstOut->writeBytes(payload);
@@ -145,9 +145,9 @@ TEST_F(CompoundFileTest, FinishedSpillsAreReusedAtLimit) {
   EXPECT_EQ(payload, std::string_view(core.getInputStreamSeek(second.location).ptr(), payload.size()));
 }
 
-TEST_F(CompoundFileTest, BusySpillsExtendLimitAndShortestFinishedFileIsReused) {
+TEST_F(CompoundFileTest, BusySpillsGetNewFilesAndShortestFinishedFileIsReused) {
   FSDirectory dir(path);
-  PostingsWriter writer(dir, 1, 1, 1, 1);
+  PostingsWriter writer(dir, 1, 1, 1);
   auto streams = writer.getOutputStreams<2>();
   std::string payload(PostingsWriter::RAM_SPILL_BYTES + 1, 'x');
   streams[0]->writeBytes(payload);
@@ -236,7 +236,7 @@ TEST_F(CompoundFileTest, FailedSegmentFileCreationAbortsAndCleansUp) {
   CommitSnapshotRegistry snapshots(test::reserveIncarnation(checked));
   IndexRamBudget budget;
   IndexWriter writer(snapshots, schema, &budget);
-  for (uint32_t failedFile : {0u, 2u}) {
+  for (uint32_t failedFile : {0u, 1u}) {
     auto& inverter = writer.obtainInverter();
     auto& postings = inverter.getPostingsWriter();
     auto postingsSegId = postings.segId;
@@ -245,10 +245,13 @@ TEST_F(CompoundFileTest, FailedSegmentFileCreationAbortsAndCleansUp) {
     auto spillName = Postings::getIndexFileName(key, 1);
     auto failedName = Postings::getIndexFileName(key, failedFile);
     std::string payload(PostingsWriter::RAM_SPILL_BYTES + 1, 'x');
-    auto first = postings.getOutputStream();
-    first->writeBytes(payload);
-    ASSERT_EQ(1u, postings.finishStream(std::move(first)).location.filenum());
-    ASSERT_TRUE(std::filesystem::exists(std::filesystem::path(path) / (spillName + ".tmp")));
+    if (failedFile == 0) {
+      // A spill file already exists when file 0 fails; otherwise the flush's own spill fails.
+      auto first = postings.getOutputStream();
+      first->writeBytes(payload);
+      ASSERT_EQ(1u, postings.finishStream(std::move(first)).location.filenum());
+      ASSERT_TRUE(std::filesystem::exists(std::filesystem::path(path) / (spillName + ".tmp")));
+    }
     inverter.startDoc();
     inverter.getIndexHandler("tag").index(inverter, std::string_view(payload));
     inverter.finishDoc();

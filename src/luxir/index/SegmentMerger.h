@@ -639,7 +639,6 @@ public:
       const std::lock_guard lock(stagedRamMutex);
       stagedRam.adjustSize(delta);
     });
-    postingsWriter.setSpillFileLimit((size_t)streamBudget);
   }
 
   ~SegmentMerger() {
