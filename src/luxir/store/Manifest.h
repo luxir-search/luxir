@@ -113,6 +113,8 @@ public:
       if (segment.merge_rows && *segment.merge_rows < segment.max_doc) {
         throw std::runtime_error("Invalid segment merge row count");
       }
+      // Opens verify the catalog against the range's hash, so every segment needs one.
+      if (!segment.catalog.length) throw std::runtime_error("Segment has no catalog range");
     }
     return info;
   }
