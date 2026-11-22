@@ -236,6 +236,34 @@ TEST_F(ReplicationFollowerTest, largeFileUsesLargeSocketReads) {
   EXPECT_GE(bytes / reads, 32 * 1024u);
 }
 
+TEST_F(ReplicationFollowerTest, fewDeletesShipASparseLiveDocsFile) {
+  startSource(); startFollower();
+  CollectionHelper h(*source, "main");
+  std::vector<Doc> docs;
+  for (int i = 0; i < 1000; i++) docs.push_back(flatdoc("id", std::to_string(i)));
+  ASSERT_TRUE(h.indexAll(std::span<const Doc>(docs), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(caughtUp());
+  auto col = follower->getCollection("main");
+  auto before = col->getShard()->getSnapshots().snapshot();
+  ASSERT_TRUE(h.deleteById("7", UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(caughtUp());
+  // One delete in 1000 docs ships a 28-byte file instead of a 152-byte bitmap.
+  std::vector<FileDescriptor> added;
+  for (const auto& file : col->getShard()->getSnapshots().snapshot()->files) {
+    if (std::ranges::find(before->files, file) == before->files.end()) added.push_back(file);
+  }
+  ASSERT_EQ(1u, added.size());
+  EXPECT_EQ(28u, added[0].size);
+  std::pmr::monotonic_buffer_resource arena;
+  api::ReplicationStatus stats;
+  follower->getFollower()->stats(stats, arena);
+  EXPECT_EQ(28u, stats.collections[0].bytes_downloaded);
+  EXPECT_EQ(999, col->getReaderManager().getReader()->liveDocs());
+  HttpReq search(followerServer->getPort());
+  search.matchQuery("id", "7").withStats().execute();
+  EXPECT_EQ(200, search.status()); EXPECT_EQ(0, search.found());
+}
+
 class ReplicationMatrixTest : public ReplicationFollowerTest,
                               public ::testing::WithParamInterface<std::pair<std::string, std::string>> {
   void SetUp() override {
