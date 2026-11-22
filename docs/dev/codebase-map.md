@@ -142,6 +142,12 @@ locations, browse `src/luxir/<area>/`.
      - `IndexHandler`: One physical representation, owned by `indexHandlers`;
        finish/flush visits each once in global physical-name order
    - `PostingsWriter`: used by an Inverter on flush to write a new segment.
+   - `LiveDocsWriter`: one immutable file per delete generation (indexing errors,
+     applied deletes, merge live docs diffs), with no deltas between generations.
+     A 24-byte header (data file header, kind, maxDoc, numLive) precedes a DENSE
+     body (the live bitmap, mapped in place by `LiveDocs::create`) or, when smaller,
+     a SPARSE body (sorted uint32 deleted doc ids, 4 bytes per delete, expanded
+     into a heap bitmap counted in `live_view_bytes`).
    - `PointsWriter` builds 1-D sorted leaves. `BasicBKDWriter<PointTraits>`
      shares 2-D tree construction, docid codecs, and the bounded parallel leaf
      pipeline: `BKDInt32Traits` serves geo (`BKDWriter`), and `BKDInt64Traits`
