@@ -13,7 +13,7 @@
 namespace luxir {
 
 // Admission prices for one field-merge batch: a conservative peak-RAM estimate
-// (computable up front from per-segment SegFieldInfo stats - merge memory is
+// (computable up front from per-segment DecodedFieldRecord stats - merge memory is
 // predictable in a way query memory is not) and the peak number of concurrently
 // held output streams.  The stream budget caps the sum of in-flight stream
 // counts per merge; since concurrently held streams cannot share a file, this
@@ -43,7 +43,6 @@ struct MergeCostModel {
   static constexpr int64_t STORED_CHUNK_BUFFER_MULTIPLIER = 5;
   static constexpr int64_t MIN_TERM_RANGE_BYTES = 64LL * 1024 * 1024;
   static constexpr int64_t MIN_TERM_PARTITION_BYTES = 2 * MIN_TERM_RANGE_BYTES;
-  static constexpr int32_t MAX_TERM_RANGES_CAP = 64;
   static constexpr int32_t DERIVED_TERM_RANGES = 0;
   static constexpr int64_t MAX_MERGED_ORD_TERMS =
       (int64_t)std::numeric_limits<int32_t>::max() - (1 << 20);
@@ -64,14 +63,15 @@ struct MergeCostModel {
         (uint64_t) STREAM_BUDGET_CAP);
   }
 
-  // A finished range returns its streams for the next range to append to, so
-  // ranges beyond the concurrently runnable ones add no files; they queue
-  // largest first and even out the uneven ranges a cut on block-leading terms
-  // leaves.
+  // Allow more ranges than can run at once. Queuing largest first evens out
+  // the skew left by cuts on block-leading terms. The stream budget controls
+  // simultaneous checkouts, while the writer assigns spill files as needed
+  // and can reuse them when a checkout finishes.
   static constexpr int32_t RANGE_QUEUE_FACTOR = 2;
+  static constexpr int32_t MAX_TERM_PARTITIONS = 64;  // Scheduler limit for one field.
 
   static constexpr int32_t maxTermRangesForStreams(int32_t streamBudget) {
-    return std::min(MAX_TERM_RANGES_CAP,
+    return std::min(MAX_TERM_PARTITIONS,
                     RANGE_QUEUE_FACTOR * streamBudget / TERM_RANGE_STREAMS);
   }
 
@@ -87,10 +87,10 @@ struct MergeCostModel {
   // Peak checked-out OutputStreams for each writer path.
   static constexpr int32_t TEXT_STREAMS = 3;      // TextWriter owns term/doc/pos streams together.
   static constexpr int32_t TERM_RANGE_STREAMS = 2;  // Range-local docs and positions.
-  static constexpr int32_t TERM_COORDINATOR_STREAMS = 1;  // Shared terms stream.
+  static constexpr int32_t TERM_COORDINATOR_STREAMS = 1;  // Shared dictionary, then norms.
   static constexpr int32_t ORD_COL_STREAMS = 3;   // TextWriter phase dominates OrdColWriter's peak of 2.
-  static constexpr int32_t INT_COL_STREAMS = 3;   // values + optional endValueRank + optional docsWithVal.
-  static constexpr int32_t STR_COL_STREAMS = 5;   // values + endValueRank + valDoc + endOffset + docsWithVal.
+  static constexpr int32_t INT_COL_STREAMS = 3;   // values + optional endValueRank + optional docs.
+  static constexpr int32_t STR_COL_STREAMS = 5;   // values + endValueRank + owners + endOffset + docs.
   static constexpr int32_t STORED_STREAMS = 1;    // chunk, mono, and mono2 streams are opened sequentially.
   static constexpr int32_t POINTS_STREAMS = 1;
   static constexpr int32_t GEO_POINTS_STREAMS = 1;

@@ -58,12 +58,12 @@ inline std::vector<FlushPoint> collectNumericPoints(
   return points;
 }
 
-inline void writeNumericPostings(PostingsWriter& postingsWriter,
-                                 PostingsWriter::IndexFieldInfo& fieldInfo,
+inline WrittenTerms writeNumericPostings(PostingsWriter& postingsWriter,
+                                         SpaceOrdinal space, const PostingsWriter::IndexFieldInfo& field,
                                  std::vector<FlushPoint>& points) {
   sortPointsByValueDocid(std::span<FlushPoint>(points));
   TextWriter writer(postingsWriter);
-  writer.startField(&fieldInfo);
+  writer.startField(space, field);
   size_t begin = 0;
   while (begin < points.size()) {
     auto term = encodeNumericTerm(points[begin].value);
@@ -80,39 +80,68 @@ inline void writeNumericPostings(PostingsWriter& postingsWriter,
     writer.endTerm(PackedTerm(packed));
     begin = end;
   }
-  writer.endField();
+  return writer.endField();
 }
 
-inline void writePoints(PostingsWriter& postingsWriter,
-                        PostingsWriter::IndexFieldInfo& fieldInfo,
+inline field_parts::Points writePoints(PostingsWriter& postingsWriter,
                         std::vector<FlushPoint>& points) {
   sortPointsByValueDocid(std::span<FlushPoint>(points));
   auto output = postingsWriter.getOutputStream();
   PointsWriter writer(*output, PointsWriter::Options{});
   for (const auto& point : points) writer.addPoint(point.value, point.docid);
-  auto data = writer.finish();
-  fieldInfo.pointsLoc = data.pointsLoc;
-  fieldInfo.pointsMetaOff = data.pointsMetaOff;
+  return writer.finish(postingsWriter, std::move(output));
 }
 
-inline void writeRangePoints(PostingsWriter& postingsWriter,
-                             PostingsWriter::IndexFieldInfo& fieldInfo,
+inline WrittenPoints writeRangePoints(PostingsWriter& postingsWriter,
                              std::vector<BasicBKDWriter<BKDInt64Traits>::Point>& points) {
   auto output = postingsWriter.getOutputStream();
   BasicBKDWriter<BKDInt64Traits> writer(*output);
-  auto data = writer.write(points);
-  fieldInfo.pointsLoc = data.pointsLoc;
-  fieldInfo.pointsMetaOff = data.pointsMetaOff;
+  return writer.write(points, postingsWriter, std::move(output));
 }
 
-inline void writeGeoPoints(PostingsWriter& postingsWriter,
-                           PostingsWriter::IndexFieldInfo& fieldInfo,
+inline WrittenPoints writeGeoPoints(PostingsWriter& postingsWriter,
                            std::vector<BKDWriter::Point>& points) {
   auto output = postingsWriter.getOutputStream();
   BKDWriter writer(*output);
-  auto data = writer.write(points);
-  fieldInfo.pointsLoc = data.pointsLoc;
-  fieldInfo.pointsMetaOff = data.pointsMetaOff;
+  return writer.write(points, postingsWriter, std::move(output));
+}
+
+inline WrittenNumberColumn writeNumberColumn(Inverter& inverter, LongStream& values,
+                                              PostingsWriter::IndexFieldInfo& fieldInfo, bool hasEndValueRanks) {
+  auto& postingsWriter = inverter.getPostingsWriter();
+  auto out = postingsWriter.getOutputStream();
+  bool numeric = FieldType::isNumericColumn(fieldInfo.header.type);
+  bool writesPoints = (fieldInfo.header.flags & FieldType::INDEX_RANGE) != 0;
+  IntColWriter writer(*out, IntColWriter::writesValueSketch(fieldInfo.header.type, hasEndValueRanks));
+  auto writeAndFold = [&](auto& bounds, auto fold) {
+    values.visitValues(inverter.pool, [&](int64_t value) {
+      writer.addInt64(value);
+      fold(value);
+    });
+    fieldInfo.setBounds(bounds);
+  };
+  if (!writesPoints && fieldInfo.header.type == FieldType::GEO_POINT) {
+    field_parts::GeoBounds bounds;
+    writeAndFold(bounds, [&](int64_t value) {
+      bounds.include(geo::unpackLatitude(value), geo::unpackLongitude(value));
+    });
+  } else if (!writesPoints && fieldInfo.header.type == FieldType::INTERVAL) {
+    field_parts::IntervalBounds bounds;
+    bool low = true;
+    writeAndFold(bounds, [&](int64_t value) {
+      auto& axis = low ? bounds.low : bounds.high;
+      axis.include(value, value);
+      low = !low;
+    });
+    assert(low);
+  } else {
+    values.pushValues(inverter.pool, writer);
+  }
+
+  auto written = writer.finish(postingsWriter, std::move(out));
+  // Packed geo and interval values have axis bounds, supplied by the fold or BKD writer.
+  if (numeric && !written.bounds.empty()) fieldInfo.setBounds(written.bounds);
+  return written;
 }
 
 //
@@ -127,13 +156,13 @@ inline void writeGeoPoints(PostingsWriter& postingsWriter,
 class IntColHandler : public Inverter::IndexHandler {
   friend class Inverter;
   LongStream longStream;
-  DocStream docsWithVal;
-  int32_t numVals = 0;
+  DocStream docs;
+  int32_t numValues = 0;
 
 public:
   IntColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space), longStream(inverter.pool),
-      docsWithVal(inverter.pool) {
+      docs(inverter.pool) {
   }
 
   ~IntColHandler() override = default;
@@ -153,8 +182,8 @@ public:
 
   void indexSingle(Inverter& inverter, int64_t val) {
     longStream.addVal(inverter.pool, val);
-    docsWithVal.addDoc(inverter.pool, inverter.getDoc());
-    numVals++;
+    docs.addDoc(inverter.pool, inverter.getDoc());
+    numValues++;
   }
 
   void flush(Inverter& inverter) override {
@@ -163,16 +192,16 @@ public:
 
   // TODO: make static and pass everything needed so it's composable
   void flushIntCol(Inverter& inverter) {
-    if (numVals == 0) {
+    if (numValues == 0) {
       return;  // drop the field.
     }
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
     // TODO: move this to postingsWriter method
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(space, fieldName);
-    fieldInfo.type = fieldType->type();
-    fieldInfo.flags = fieldType->segmentFlags();
-    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
+    fieldInfo.header.type = fieldType->type();
+    fieldInfo.header.flags = fieldType->segmentFlags();
+    fieldInfo.header.typeParameters = fieldType->segmentTypeParameters();
     flushIntCol(inverter, fieldInfo);
   }
 
@@ -180,36 +209,18 @@ public:
   void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
     auto& tmpPool = MemPool::threadLocal();
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-    auto full = numVals >= postingsWriter.getMaxDoc(space);
 
     if (fieldType->indexed()) {
-      auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals);
-      writeNumericPostings(postingsWriter, fieldInfo, points);
+      auto points = collectNumericPoints(inverter, longStream, docs, numValues);
+      fieldInfo.setPostings(writeNumericPostings(postingsWriter, space, fieldInfo, points));
     }
 
-    // push values
-    {
-      auto outputPtr = postingsWriter.getOutputStream();
-      IntColWriter writer(*outputPtr,
-                          FieldType::isNumericColumn(fieldType->type()));
-      // When full, values are already in doc order and the column is written dense (no docs-with-field
-      // bitset, see finishDense below); otherwise values are rank-addressed through the bitset.
-      // TODO: a docid-indexed encoding for mostly-full columns would need a missing marker per doc.
-      // For direct incremental columns, and for merging, we could have a IntColWriter method that accepts (docid,val)
-      // For that, we could have versions of push that take a number of values to push so we can have the best
-      // of both worlds.
-      // We could also be told it's a required field, in which case we would always chose a dense encoding unless
-      // all bits are somehow needed.  In that case, we would decode blocks of docs so we could feed doc/val
-      // pairs to the inverter.  A co-routine generator might be perfect for this (one that fills blocks, not
-      // individual values)
-      longStream.pushValues(inverter.pool, writer);
-      writer.finish(fieldInfo);
-    }
+    auto column = writeNumberColumn(inverter, longStream, fieldInfo, false);
 
     if (fieldType->rangeIndexed()) {
       if (fieldType->type() == FieldType::GEO_POINT) {
         std::vector<BKDWriter::Point> points;
-        points.reserve((size_t)numVals);
+        points.reserve((size_t)numValues);
         inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point)
             + BKDWriter::workspaceBytes(points.capacity()));
         longStream.visitValues(inverter.pool, [&](int64_t value) {
@@ -217,31 +228,23 @@ public:
                             geo::unpackLongitude(value), 0});
         });
         size_t pointIndex = 0;
-        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+        docs.forEachDoc(inverter.pool, [&](int32_t docid) {
           assert(pointIndex < points.size());
           points[pointIndex++].docid = docid;
         });
         assert(pointIndex == points.size());
-        writeGeoPoints(postingsWriter, fieldInfo, points);
+        auto written = writeGeoPoints(postingsWriter, points);
+        fieldInfo.setPoints(written.points);
+        fieldInfo.setBounds(written.bounds);
       } else {
-        auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals);
-        writePoints(postingsWriter, fieldInfo, points);
+        auto points = collectNumericPoints(inverter, longStream, docs, numValues);
+        fieldInfo.setPoints(writePoints(postingsWriter, points));
       }
     }
 
-    // push docs
-    {
-      auto guard = tmpPool.rewindScopeGuard();
-      // TODO: when things go parallel, we don't want to reserve an OutputStream if this is dense.
-      DocsWithValWriter docsWriter(tmpPool, postingsWriter, fieldInfo);
-      if (!full) {
-        docsWithVal.pushDocs(inverter.pool, docsWriter);
-        docsWriter.finish();
-      }
-      else {
-        docsWriter.finishDense(numVals);
-      }
-    }
+    auto presence = PresenceWriter::write(tmpPool, postingsWriter, space, numValues,
+        [&](auto&& accept) { docs.forEachDoc(inverter.pool, accept); });
+    fieldInfo.setColumn(WrittenColumn{column.column, column.numValues, presence, {}, {}, {}});
 
   }
 };
@@ -253,16 +256,16 @@ class MultiIntColHandler : public Inverter::IndexHandler {
   friend class Inverter;
   LongStream longStream;
   IntStream lengthStream;
-  DocStream docsWithVal;
+  DocStream docs;
   std::vector<int64_t> docValues;  // per-doc scratch, reused across docs
-  int64_t numVals = 0;
-  int32_t numDocs = 0;
+  int64_t numValues = 0;
+  int32_t docsWithField = 0;
 
 public:
   MultiIntColHandler(Inverter& inverter, const std::string_view& fieldName,
                      const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space), longStream(inverter.pool),
-      lengthStream(inverter.pool), docsWithVal(inverter.pool) {
+      lengthStream(inverter.pool), docs(inverter.pool) {
   }
 
   ~MultiIntColHandler() override = default;
@@ -323,10 +326,10 @@ public:
     }
     for (int64_t val : docValues) longStream.addVal(inverter.pool, val);
     int64_t n = (int64_t)docValues.size();
-    numVals += n;
-    docsWithVal.addDoc(inverter.pool, inverter.getDoc());
+    numValues += n;
+    docs.addDoc(inverter.pool, inverter.getDoc());
     lengthStream.addVal(inverter.pool, n);
-    numDocs++;
+    docsWithField++;
   }
 
   void flush(Inverter& inverter) override {
@@ -335,44 +338,36 @@ public:
 
   // TODO: make static and pass everything needed so it's composable
   void flushIntCol(Inverter& inverter) {
-    if (numVals == 0) {
+    if (numValues == 0) {
       return;  // drop the field.
     }
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
     // TODO: move this to postingsWriter method
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(space, fieldName);
-    fieldInfo.type = fieldType->type();
-    fieldInfo.flags = fieldType->segmentFlags();
-    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
+    fieldInfo.header.type = fieldType->type();
+    fieldInfo.header.flags = fieldType->segmentFlags();
+    fieldInfo.header.typeParameters = fieldType->segmentTypeParameters();
     flushIntCol(inverter, fieldInfo);
   }
 
   void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
     auto& pool = MemPool::threadLocal();
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-    bool full = numDocs == postingsWriter.getMaxDoc(space);
-    bool hasEndValueRanks = fieldInfo.type == FieldType::INTERVAL || numVals != numDocs;
+    bool hasEndValueRanks = fieldInfo.header.type == FieldType::INTERVAL || numValues != docsWithField;
 
     if (fieldType->indexed()) {
-      auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals, &lengthStream);
-      writeNumericPostings(postingsWriter, fieldInfo, points);
+      auto points = collectNumericPoints(inverter, longStream, docs, numValues, &lengthStream);
+      fieldInfo.setPostings(writeNumericPostings(postingsWriter, space, fieldInfo, points));
     }
 
-    // push values
-    {
-      auto outputPtr = postingsWriter.getOutputStream();
-      IntColWriter writer(*outputPtr,
-                          !hasEndValueRanks && FieldType::isNumericColumn(fieldInfo.type));
-      longStream.pushValues(inverter.pool, writer);
-      writer.finish(fieldInfo);
-    }
+    auto column = writeNumberColumn(inverter, longStream, fieldInfo, hasEndValueRanks);
 
     if (fieldType->rangeIndexed()) {
       if (fieldType->type() == FieldType::INTERVAL) {
         // Values alternate min, max; each doc holds length / 2 points.
         std::vector<BasicBKDWriter<BKDInt64Traits>::Point> points;
-        points.reserve((size_t)numVals / 2);
+        points.reserve((size_t)numValues / 2);
         inverter.noteFlushWorkspace(points.capacity() * sizeof(BasicBKDWriter<BKDInt64Traits>::Point)
             + BasicBKDWriter<BKDInt64Traits>::workspaceBytes(points.capacity()));
         bool low = true;
@@ -384,7 +379,7 @@ public:
         });
         IntStream::Reader lengths(lengthStream, inverter.pool);
         size_t pointIndex = 0;
-        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+        docs.forEachDoc(inverter.pool, [&](int32_t docid) {
           assert(!lengths.eof());
           int32_t length = lengths.next();
           assert(length % 2 == 0);
@@ -394,10 +389,12 @@ public:
           }
         });
         assert(pointIndex == points.size());
-        writeRangePoints(postingsWriter, fieldInfo, points);
+        auto written = writeRangePoints(postingsWriter, points);
+        fieldInfo.setPoints(written.points);
+        fieldInfo.setBounds(written.bounds);
       } else if (fieldType->type() == FieldType::GEO_POINT) {
         std::vector<BKDWriter::Point> points;
-        points.reserve((size_t)numVals);
+        points.reserve((size_t)numValues);
         inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point)
             + BKDWriter::workspaceBytes(points.capacity()));
         longStream.visitValues(inverter.pool, [&](int64_t value) {
@@ -406,7 +403,7 @@ public:
         });
         IntStream::Reader lengths(lengthStream, inverter.pool);
         size_t pointIndex = 0;
-        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+        docs.forEachDoc(inverter.pool, [&](int32_t docid) {
           assert(!lengths.eof());
           int32_t length = lengths.next();
           assert(length >= 0);
@@ -417,27 +414,19 @@ public:
         });
         assert(lengths.eof());
         assert(pointIndex == points.size());
-        writeGeoPoints(postingsWriter, fieldInfo, points);
+        auto written = writeGeoPoints(postingsWriter, points);
+        fieldInfo.setPoints(written.points);
+        fieldInfo.setBounds(written.bounds);
       } else {
-        auto points = collectNumericPoints(inverter, longStream, docsWithVal, numVals, &lengthStream);
-        writePoints(postingsWriter, fieldInfo, points);
+        auto points = collectNumericPoints(inverter, longStream, docs, numValues, &lengthStream);
+        fieldInfo.setPoints(writePoints(postingsWriter, points));
       }
     }
 
-    // push docs
-    {
-      auto guard = pool.rewindScopeGuard();
-      // TODO: when things go parallel, we don't want to reserve an OutputStream if this is dense.
-      DocsWithValWriter docsWriter(pool, postingsWriter, fieldInfo);
-      if (!full) {
-        docsWithVal.pushDocs(inverter.pool, docsWriter);
-        docsWriter.finish();
-      }
-      else {
-        docsWriter.finishDense(numDocs);
-      }
-    }
+    auto presence = PresenceWriter::write(pool, postingsWriter, space, docsWithField,
+        [&](auto&& accept) { docs.forEachDoc(inverter.pool, accept); });
 
+    field_parts::Slice endValueRanks;
     if (hasEndValueRanks) {
       auto guard = pool.rewindScopeGuard();
       OutputStreamPtr out = postingsWriter.getOutputStream();
@@ -449,11 +438,9 @@ public:
         endValueRankWriter.addInt64(endValueRank);
       });
 
-      endValueRankWriter.finish();
-      fieldInfo.monoLoc = endValueRankWriter.blockLoc;
-      fieldInfo.monoMetaOff = endValueRankWriter.metaOff;
+      endValueRanks = endValueRankWriter.finish(postingsWriter, std::move(out));
     }
-
+    fieldInfo.setColumn(WrittenColumn{column.column, column.numValues, presence, endValueRanks, {}, {}});
   }
 };
 

@@ -42,8 +42,8 @@ locations, browse `src/luxir/<area>/`.
    - `IndexReader` is a view of one path in a snapshot, with a leaf per bundle;
      a reopen shares each unchanged `SegmentCore` and live docs with the previous
      snapshot, and the writer's open segments in both directions
-     - Physical field catalog records available columns and stored resources;
-       logical retrieval discovery is cached per reader and schema identity
+     - Per-space field name lists identify available columns and stored resources.
+       Logical retrieval discovery is cached per reader and schema identity.
    - `SearchEngine`: Coordinates query parsing, execution, and result collection
      - Implements parallel segment searching using TBB
      - Ordinary preparation is shared with HTTP `?explain=resolved`;
@@ -53,25 +53,30 @@ locations, browse `src/luxir/<area>/`.
 
 3. **Segment Reading** (`src/luxir/reader/`)
    - `SegmentCore` owns a segment bundle's open files, streams and root VersionRuns, shared
-     across snapshots and with the writer. Its base footer catalogs row spaces and their
-     field tables, keyed by path name (root is the empty path). It owns a concrete `PostingsReader` per space, each with its own maxDoc,
-     field catalog and lazy immutable field metadata
-     (including numeric leaf bounds). Codec cursors borrow the space reader and mapped bytes
+     across snapshots and with the writer. File 0's catalog indexes field records
+     by row-space path (root is the empty path) and field name. Each space has a
+     `PostingsReader` with its own row count and immutable, on-demand record cache.
+     Records contain counts, bounds and data slices. Numeric leaf metadata
+     and stored metadata are opened and cached separately. Codec cursors borrow
+     the space reader and mapped bytes
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
      opening reads metadata and endpoints without scanning child rows.
-   - `FieldReader` finds metadata for a field in the segment (`SegFieldInfo`)
-   - `TermsEnum` enumerates or finds indexed terms for a field found by `FieldReader`
+   - `PostingsReader` caches decoded field records. `FieldCursor` walks field ordinals
+     in name order and lets merge decode temporary records without populating the cache.
+   - `TermsEnum` enumerates or finds indexed terms for a field's record.
    - `DocsEnum` returns the documents for a term found with the `TermsEnum`. Optionally returns term positions for each document.
-   - `IntColReader` reads the doc-order numeric column (all numeric field
-     classes store an order-preserving encoded int64)
+   - `IntColReader` reads the doc-order numeric column. Numeric field classes
+     store an order-preserving encoded int64. End-value ranks in the record
+     describe the column layout. A singleton column can omit them even when
+     the schema permits multiple values. Interval endpoints always carry ranks.
    - `PointsReader` reads the optional 1-D sorted-leaf points index of a
      `RANGE`-indexed numeric field (value-sorted leaves + fence directory;
      exact ordinal counts). `BasicBKDReader<PointTraits>` shares 2-D tree
      traversal and leaf decoding: `BKDInt32Traits` serves geo coordinates
      (`BKDReader`), and `BKDInt64Traits` serves range endpoints. Traits own
-     scalar types, format layouts, and coordinate codecs. Absence of any
-     points index = `SegFieldInfo.pointsMetaOff == 0`.
+     scalar types, format layouts, and coordinate codecs. The record
+     exposes a nullable points descriptor.
 
 4. **Query System** (`src/luxir/query/`)
 
@@ -152,8 +157,8 @@ locations, browse `src/luxir/<area>/`.
 7. **Storage** (`src/luxir/store/`)
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
      `FSDirectory` (on-disk, mmap reads), `CheckedDirectory` (validation wrapper)
-   - `InputStream` / `OutputStream`: segment I/O primitives; the `checked*` reads decode
-     segment info and the field catalog without trusting the file
+   - `InputStream` / `OutputStream`: segment I/O primitives. The catalog and record
+     codecs validate directory entries, field offsets and data slices within their input ranges
    - `IndexFormat`: the on-disk format version, recorded in each manifest and in every data
      file's header. Bump it when the change requires a different encoding or interpretation.
      `IndexFormatTest` also flags changed writer choices within a version. Manifests of another

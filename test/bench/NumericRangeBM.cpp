@@ -238,7 +238,7 @@ void BM_NumericRangePointsSize(benchmark::State& state, FieldShape shape) {
     Query::Context context(pool, *fixture.getIndex().reader);
     auto infos = context.topReader.field(field.name);
     auto& segment = fixture.getIndex().reader->segments()[0];
-    if (infos.at(0) == nullptr || infos.at(0)->pointsMetaOff == 0) {
+    if (infos.at(0) == nullptr || !infos.at(0)->points()) {
       state.SkipWithError("points index is absent");
       return;
     }

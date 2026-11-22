@@ -213,7 +213,9 @@ namespace luxir::test {
 
     // segment-level reading
     int currSeg = -1;
-    SegFieldInfo fieldInfo;
+    const DecodedFieldRecord* field = nullptr;
+
+    const DecodedFieldRecord& fieldInfo() const { return *field; }
     std::unique_ptr<IntColReader> colReader;
     std::unique_ptr<IntColReader::Iterator> iter;
     std::unique_ptr<OrdColReader> ordReader;
@@ -340,11 +342,11 @@ namespace luxir::test {
         currSeg++;
 
         Segment &seg = segments[currSeg];
-        auto* field = seg.postingsReader().fieldInfo(name);
+        field = seg.postingsReader().fieldInfo(name);
         auto found = (field != nullptr);
         if (!found) continue;
 
-        fieldInfo = *field;
+        const auto& fieldInfo = *field;
         if (fieldInfo.type == FieldType::TEXT) {
           normsReader = std::make_unique<NormsReader>(seg.postingsReader(), fieldInfo);
           normsIter = std::make_unique<NormsReader::Iterator>(*normsReader);
@@ -352,7 +354,7 @@ namespace luxir::test {
           iter.reset();
           ordReader.reset();
           ordIter.reset();
-        } else if (fieldInfo.ordFormat != SegFieldInfo::ORD_NONE) {
+        } else if (fieldInfo.ordColumn()) {
           ordReader = std::make_unique<OrdColReader>(seg.postingsReader(), fieldInfo);
           ordIter = std::make_unique<OrdColReader::Iterator>(*ordReader);
           colReader.reset();
@@ -383,7 +385,7 @@ namespace luxir::test {
 
     TermsEnum createTermsEnum() {
       if (currSeg < 0) { nextSegment(); }
-      return TermsEnum(testIndex.pool, currentSegment()->postingsReader(), fieldInfo);
+      return TermsEnum(testIndex.pool, currentSegment()->postingsReader(), fieldInfo());
     }
     DocsPosEnum createDocsEnum(TermsEnum& termsEnum) {
       if (currSeg < 0) { nextSegment(); }

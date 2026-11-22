@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "luxir/util/StrRef.h"
+#include "luxir/reader/Postings.h"
 
 namespace luxir {
 
@@ -72,8 +73,6 @@ public:
   static constexpr uint8_t STRATEGY_ARRAY = 1;
   static constexpr uint8_t STRATEGY_REVERSE_ARRAY = 2;
 
-  static constexpr uint32_t ORD_WIDTH = 3;
-  static constexpr uint32_t MAX_BLOCKS = 0xFFFFFF;
 
 private:
   struct FrontierNode {
@@ -123,8 +122,8 @@ private:
   }
 
   static void writeOrd(std::vector<char>& out, uint32_t ord) {
-    assert(ord < MAX_BLOCKS);
-    writeLE(out, ord, ORD_WIDTH);
+    assert(ord < Postings::MAX_TERM_BLOCKS);
+    writeLE(out, ord, Postings::TERM_BLOCK_ORD_BYTES);
   }
 
   static void resetNode(FrontierNode& node, uint32_t firstOrd, bool terminal) {
@@ -266,8 +265,8 @@ public:
     assert(!done);
     assert(!key.empty());
     assert(key.size() <= PackedTerm::MAX_LEN);
+    if (!Postings::fitsTermBlocks(ord, 1)) throw std::length_error(Postings::TERM_BLOCK_LIMIT_ERROR);
     assert(ord == nBlocks);
-    assert(ord < MAX_BLOCKS);
     if (hasPrev) {
       assert(compareBytes(key, prevKey.data(), prevLen) > 0);
     }
@@ -292,7 +291,7 @@ public:
 
   uint64_t finish() {
     assert(!done);
-    assert(nBlocks <= MAX_BLOCKS);
+    assert(nBlocks <= Postings::MAX_TERM_BLOCKS);
     if (hasPrev) {
       for (uint32_t depth = prevLen; depth > 0; depth--) {
         freezeDepth(depth);

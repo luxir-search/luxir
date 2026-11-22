@@ -405,11 +405,11 @@ public:
       size_t termCount = 0;
       int64_t sumDocFreq = 0;
       if (cachedFieldInfo != nullptr) {
-        auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord);
-        if (segFieldInfo != nullptr) {
+        auto* fieldInfo = cachedFieldInfo->segInfos.at(segment.ord);
+        if (fieldInfo != nullptr) {
           auto scratchGuard = scratchPool.rewindScopeGuard();
           auto* termsEnum = scratchPool.make<TermsEnum>(
-              scratchPool, segment.postingsReader(), *segFieldInfo);
+              scratchPool, segment.postingsReader(), *fieldInfo);
           FilteredTermsEnum* fenum =
               query.createFilteredEnum(scratchPool, *termsEnum);
           int64_t unchargedPostings = 0;
@@ -799,7 +799,7 @@ public:
                                 DocSet* domain) override {
       auto* info = cachedFieldInfo == nullptr ? nullptr
           : cachedFieldInfo->segInfos.at(segment.ord);
-      if (info == nullptr) return {0, CountHow::METADATA};
+      if (!info) return {0, CountHow::METADATA};
       if (info->hasDisjointTermPostings()) {
         if (auto* facts = countedFacts(expansionMemos[(size_t) segment.ord])) {
           return countBound(segment, domain, facts->sumDocFreq, CountHow::METADATA);
@@ -809,9 +809,9 @@ public:
         return shortcut;
       }
       int64_t bound = segment.maxDoc();
-      if ((info->flags & FieldType::INDEX_DOCS) != 0) {
+      if (info->flags & FieldType::INDEX_DOCS) {
         bound = info->type == FieldType::STRING || info->type == FieldType::ID
-            ? info->docsWithField : std::min<int64_t>(bound, info->sumDocFreq);
+            ? info->docsWithField : std::min<int64_t>(bound, info->indexedTotals().sumDocFreq);
       }
       return countBound(segment, domain, bound);
     }

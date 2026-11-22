@@ -19,9 +19,12 @@
 #include "luxir/server/LuxirNode.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/util/Uuid.h"
+#include "test/FieldRecordTest.h"
 #include "test/HttpReq.h"
 #include "test/StorageTestUtils.h"
 #include "luxir/store/IndexFormat.h"
+#include "luxir/store/CorruptionMarker.h"
+#include "luxir/store/FileVerifier.h"
 #include "luxir/store/Directory.h"
 #include "luxir/store/Manifest.h"
 #include "test/CollectionHelper.h"
@@ -40,8 +43,8 @@ namespace {
 // The digest of the reference index written by IndexFormat::VERSION. A byte
 // change requires reviewing the format version. Writer choices among layouts
 // already supported by that version can change the digest within the version.
-constexpr uint64_t kReferenceVersion = 14;
-constexpr uint64_t kReferenceDigest = 0x7402bdb4bff87b41;
+constexpr uint64_t kReferenceVersion = 16;
+constexpr uint64_t kReferenceDigest = 0x546d55a9c469d50d;
 
 // A small index over every default field template's kind, with three segments
 // and a delete. Each segment is one request flushed by a single inverter.
@@ -188,30 +191,23 @@ uint64_t buildMergedReferenceDigest() {
   return XXH3_64bits(fingerprints.data(), fingerprints.size() * sizeof(uint64_t));
 }
 
-// Copies every file of the reference index's first segment into a RAM
-// directory, letting `mutate` change file 0.
-std::unique_ptr<RAMDir> copySegment(Directory& source, const std::function<void(std::string&)>& mutate) {
-  auto durable = readDurableIndexInfo(source);
-  auto copy = std::make_unique<RAMDir>();
-  for (const auto& file : durable.info.segments[0].files) {
-    std::string name(file.name);
-    std::string bytes(source.openFile(name)->read());
-    if (name == Postings::getIndexFileName(Postings::segmentKey(durable.info.segments[0].seg_id, durable.info.segments[0].creator_epoch), 0)) {
-      mutate(bytes);
-    }
-    auto out = copy->createFile(name);
-    OutputStream stream(out.get());
-    stream.write(bytes.data(), bytes.size());
-    stream.close();
-    copy->finishFile(*out);
-  }
-  return copy;
+void writeFile(Directory& dir, std::string_view name, std::string_view bytes) {
+  auto file = dir.createFile(name);
+  OutputStream out(file.get());
+  out.write(bytes.data(), bytes.size());
+  out.close();
+  dir.finishFile(*file);
 }
 
-int32_t loadInt(const std::string& bytes, size_t at) {
-  int32_t value;
-  std::memcpy(&value, bytes.data() + at, sizeof(value));
-  return value;
+template <class Action>
+void expectCorrupt(Action action, std::string_view context, std::string_view reason) {
+  try {
+    action();
+    ADD_FAILURE() << "Expected corruption: " << reason;
+  } catch (const std::runtime_error& e) {
+    auto message = std::string_view(e.what());
+    EXPECT_TRUE(message.contains(context) && message.contains(reason)) << message;
+  }
 }
 
 void storeInt(std::string& bytes, size_t at, int32_t value) {
@@ -233,7 +229,7 @@ TEST_F(IndexFormatTest, referenceIndexBytesMatchFormatVersion) {
 TEST_F(IndexFormatTest, serialRootMergeBytesMatchReference) {
   auto digest = buildMergedReferenceDigest();
   ASSERT_EQ(digest, buildMergedReferenceDigest()) << "the serial merge is not deterministic";
-  EXPECT_EQ(0xdf4d58db5c9db038ULL, digest) << std::format("merged digest {:#x}", digest);
+  EXPECT_EQ(0xe402da4c8227236eULL, digest) << std::format("merged digest {:#x}", digest);
 }
 
 TEST_F(IndexFormatTest, otherFormatVersionFailsToLoad) {
@@ -295,43 +291,276 @@ TEST_F(IndexFormatTest, incompatibleCollectionFailsAloneAfterRestart) {
   EXPECT_NE(std::string::npos, result.body().find(R"("good")"));
 }
 
+TEST_F(IndexFormatTest, catalogSurvivesPublicationDeleteAndMerge) {
+  auto path = std::filesystem::temp_directory_path() / ("luxir-catalog-" + newUuid());
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  LuxirConfig config;
+  config.store.backend = "fs";
+  config.store.data_dir = path.string();
+  LuxirNode node(config);
+  CollectionHelper helper(node, "main");
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "n_i", 11), flatdoc("id", "b", "n_i", 22)},
+                              UpdateMessage::COMMIT).success);
+  auto before = writer->snapshots.readers.getReader();
+  ASSERT_EQ(1u, before->segments().size());
+  auto durable = readDurableIndexInfo(writer->dir);
+  auto range = durable->segments[0].catalog;
+  EXPECT_EQ(catalogRangeFromManifest(range), before->segments()[0].segmentCore().catalogRange());
+  expectValidInventory(writer->dir, *durable);
+
+  FSDirectory disk(incarnationPath(path, "main"));
+  IndexReader reopened(disk);
+  ASSERT_EQ(1u, reopened.segments().size());
+  auto& postings = reopened.segments()[0].postingsReader();
+  EXPECT_EQ(catalogRangeFromManifest(range), reopened.segments()[0].segmentCore().catalogRange());
+  for (int32_t ordinal = 0; ordinal < postings.numFields(); ++ordinal) {
+    auto fieldHeader = postings.fieldHeader(ordinal);
+    EXPECT_EQ(fieldHeader, recordHeader(*postings.fieldInfo(ordinal)));
+  }
+
+  ASSERT_TRUE(helper.deleteById("a", UpdateMessage::COMMIT).success);
+  durable = readDurableIndexInfo(writer->dir);
+  ASSERT_EQ(1u, durable->segments.size());
+  EXPECT_EQ(range, durable->segments[0].catalog);
+  EXPECT_NE(0u, durable->segments[0].live_gen);
+  auto after = writer->snapshots.readers.getReader();
+  EXPECT_EQ(&before->segments()[0].segmentCore(), &after->segments()[0].segmentCore());
+
+  ASSERT_TRUE(helper.index(flatdoc("id", "c", "n_i", 33), UpdateMessage::COMMIT).success);
+  durable = readDurableIndexInfo(writer->dir);
+  ASSERT_EQ(2u, durable->segments.size());
+  auto snapshot = writer->snapshots.snapshot();
+  ASSERT_TRUE(snapshot);
+  ASSERT_EQ(2u, snapshot->openCores.size());
+  ASSERT_TRUE(snapshot->openCores.back().expired());
+  // Merge admission must open this segment while holding the writer mutex.
+  auto published = writer->snapshots.readers.indexReader.load();
+  ASSERT_TRUE(published);
+  ASSERT_EQ(nullptr, published->findSegment(durable->segments.back().seg_id));
+  writer->mergeSegments();
+  durable = readDurableIndexInfo(writer->dir);
+  ASSERT_EQ(1u, durable->segments.size());
+  expectValidInventory(writer->dir, *durable);
+  IndexReader merged(disk);
+  auto& output = merged.segments()[0];
+  EXPECT_EQ(2, output.maxDoc());
+  EXPECT_EQ(catalogRangeFromManifest(durable->segments[0].catalog), output.segmentCore().catalogRange());
+  const auto* number = output.postingsReader().fieldInfo("n_i");
+  ASSERT_NE(nullptr, number);
+  EXPECT_EQ(22, number->scalarBounds()->min);
+}
+
 TEST_F(IndexFormatTest, malformedSegmentMetadataThrows) {
+  RAMDir original;
+  PostingsWriter writer(original, 1, 1, 1);
+  for (std::string_view name : {"aa", "bbb"}) {
+    auto& field = writer.addField(SpaceOrdinal::ROOT, name);
+    field.header.type = FieldType::INT;
+    field.setPresence({1, {}});
+  }
+  for (auto path : {"a", "a.b"}) {
+    auto child = writer.addSpace(path);
+    std::array<int64_t, 1> ends{1};
+    writer.finishSpace(child, 1, RowSpaceFixture::shape(writer, ends));
+  }
+  writeUnversionedRuns(writer);
+  std::vector<FileDescriptor> files;
+  ASSERT_TRUE(writer.finish(nullptr, &files));
+  ASSERT_EQ(1u, files.size());
+  const auto& file = files.front().name;
+  api::SegmentInfo segment;
+  segment.seg_id = 1;
+  segment.creator_epoch = 1;
+  segment.max_doc = 1;
+  segment.catalog = catalogRangeToManifest(writer.catalogRange());
+  std::pmr::monotonic_buffer_resource arena;
+  auto wireFiles = toWire(files, arena);
+  segment.files = wireFiles;
+  auto originalBytes = original.openFile(file);
+  std::string_view bytes = originalBytes->read();
+  auto footer = bytes.size() - sizeof(uint64_t);
+  auto length = loadUnaligned<uint64_t>(bytes.data() + footer);
+  InputStream in(bytes.data() + footer - length, bytes.data() + footer);
+  auto pos = [&] { return (size_t)(in.ptr() - bytes.data()); };
+  ASSERT_EQ(1u, in.checkedVint());
+  auto directoryStart = pos();
+  in.checkedVlong();
+  auto fileCount = pos();
+  ASSERT_EQ(1u, in.checkedVint());
+  ASSERT_EQ(0u, in.checkedVint());
+  for (int i = 0; i < 4; ++i) in.checkedVlong();
+  auto versionCount = pos();
+  ASSERT_EQ(1u, in.checkedVint());
+  ASSERT_EQ(3u, in.checkedVint());
+  ASSERT_EQ(0u, in.checkedVint());
+  ASSERT_EQ(1u, in.checkedVint());
+  ASSERT_EQ(0u, in.checkedVlong());
+  auto table = segment.catalog.offset + in.checkedVlong();
+  ASSERT_EQ(2u, in.checkedVint());
+  ASSERT_EQ(1u, in.checkedVint());
+  auto childPath = pos();
+  in.skip(1);
+  for (int i = 0; i < 6; ++i) in.checkedVlong();
+  auto ownershipBytes = pos();
+  in.checkedVlong();
+  ASSERT_EQ(0u, in.checkedVint());
+  ASSERT_EQ(3u, in.checkedVint());
+  auto grandchildPath = pos();
+
+  auto firstName = segment.catalog.offset + 1;
+  auto secondName = firstName + loadUnaligned<uint32_t>(bytes.data() + table + sizeof(uint32_t));
+  auto recordEnd = segment.catalog.offset + loadUnaligned<uint32_t>(bytes.data() + table + 2 * sizeof(uint32_t));
+  ASSERT_EQ(recordEnd, table);
+  ASSERT_NE(0u, table % alignof(FieldOffset));
+  std::array<api::FileDescriptor, 2> extraFiles{wireFiles.front(), wireFiles.front()};
+  auto unknownFile = Postings::getIndexFileName(Postings::segmentKey(1, 1), 1);
+  extraFiles[1].name = unknownFile;
+  struct Case {
+    std::string_view reason;
+    std::function<void(std::string&, api::SegmentInfo&)> corrupt;
+    bool namesFile = true;
+  };
+  const Case cases[] = {
+      {"directory length", [&](auto& b, auto&) { std::memset(b.data() + footer, 0xff, sizeof(uint64_t)); }},
+      {"directory start", [&](auto& b, auto&) { b[directoryStart] ^= 1; }},
+      {"invalid vint", [&](auto& b, auto&) { b[fileCount] = (char)VARINT_CONTINUATION; }},
+      {"inventory differs from segment files", [&](auto&, auto& s) { s.files = extraFiles; }},
+      {"version runs layout", [&](auto& b, auto&) { b[versionCount] = 0; }},
+      {"child row space", [&](auto& b, auto&) { b[childPath] = 'z'; }},
+      {"missing row space parent", [&](auto& b, auto&) { b[grandchildPath] = 'b'; }},
+      {"ownership index layout", [&](auto& b, auto&) { b[ownershipBytes] = 0; }},
+      {"record area length", [&](auto& b, auto&) { storeInt(b, table + 2 * sizeof(uint32_t), 0); }},
+      {"field area endpoints", [&](auto& b, auto&) { storeInt(b, table, 1); }},
+      {"field offset order", [&](auto& b, auto&) { storeInt(b, table + sizeof(uint32_t), INT32_MAX); }},
+      {"field name order", [&](auto& b, auto&) { b[firstName] = 'z'; }},
+      {"field name order", [&](auto& b, auto&) { b.replace(secondName, 3, "000"); }},
+      {"trailing catalog bytes", [&](auto& b, auto& s) {
+        b.insert(footer, 1, 0);
+        auto longer = length + 1;
+        std::memcpy(b.data() + footer + 1, &longer, sizeof(longer));
+        ++extraFiles[0].size;
+        ++s.catalog.length;
+        s.files = std::span(extraFiles).first(1);
+      }},
+      {"row count differs from manifest", [](auto&, auto& s) { ++s.max_doc; }, false},
+      {"catalog range must reach the end of file 0", [](auto&, auto& s) { --s.catalog.length; }},
+  };
+  ASSERT_NO_THROW(SegmentCore::create(original, segment));
+  auto segmentName = Postings::segmentKey(segment.seg_id, segment.creator_epoch);
+  for (size_t i = 0; const auto& [reason, corrupt, namesFile] : cases) {
+    SCOPED_TRACE(i++);
+    RAMDir copy;
+    std::string changed(bytes);
+    auto manifest = segment;
+    corrupt(changed, manifest);
+    writeFile(copy, file, changed);
+    expectCorrupt([&] { SegmentCore::create(copy, manifest); }, namesFile ? file : segmentName, reason);
+  }
+}
+
+TEST_F(IndexFormatTest, invalidSpacePathAndRootCount) {
+  RAMDir dir;
+  {
+    PostingsWriter paths(dir, 2, 1, 0);
+    paths.addSpace("a");
+    EXPECT_THROW(paths.addSpace("a."), std::invalid_argument);
+  }
+  PostingsWriter writer(dir, 1, 1, 1);
+  EXPECT_THROW(writer.setMaxDoc(HARD_MAX_ROW_COUNT), std::invalid_argument);
+  writeUnversionedRuns(writer);
+  ASSERT_TRUE(writer.finish());
+
+  auto file = dir.openFile(Postings::getIndexFileName(Postings::segmentKey(1, 1), Postings::PRIMARY_FILE));
+  auto original = file->read();
+  auto footer = original.size() - sizeof(uint64_t);
+  auto length = loadUnaligned<uint64_t>(original.data() + footer);
+  auto directoryStart = footer - length;
+  ASSERT_EQ(1, original[directoryStart]);
+  char count[MAX_VINT_SIZE];
+  auto countBytes = writeVInt(count, HARD_MAX_ROW_COUNT) - count;
+  std::string corrupt(original);
+  corrupt.replace(directoryStart, 1, count, countBytes);
+  length += countBytes - 1;
+  std::memcpy(corrupt.data() + corrupt.size() - sizeof(length), &length, sizeof(length));
+  auto range = writer.catalogRange();
+  range.length = corrupt.size() - range.offset;
+  expectCorrupt([&] { SegmentCatalog::readDirectory(corrupt); }, "segment catalog", "root doc count out of range");
+  expectCorrupt([&] {
+    SegmentCatalog::readDirectory(std::span(corrupt).subspan(range.offset), range.offset, corrupt.size());
+  }, "segment catalog", "root doc count out of range");
+}
+
+TEST_F(IndexFormatTest, opensCatalogFromCopiedRange) {
+  LuxirNode node(LuxirConfig{});
+  CollectionHelper ch(node, "main");
+  ASSERT_TRUE(ch.index(flatdoc("id", "a", "tag_s", "red"), UpdateMessage::COMMIT).success);
+  auto& dir = ch.getIndexWriter()->dir;
+  auto durable = readDurableIndexInfo(dir);
+  const auto& segment = durable.info.segments.front();
+  auto range = catalogRangeFromManifest(segment.catalog);
+  std::vector<FileDescriptor> files;
+  for (const auto& file : segment.files) files.push_back({std::string(file.name), file.size});
+  auto source = SegmentCore::source(segment.seg_id, segment.creator_epoch, range,
+                                     segment.max_doc, files);
+  auto name = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
+  auto file = dir.openFile(name);
+  ASSERT_GT(range.offset, 0u);
+  std::string bytes(file->read().substr(range.offset, range.length));
+  file.reset();
+
+  auto head = SegmentCatalog::readDirectory(bytes, range.offset, source.files[0]);
+  auto catalog = SegmentCatalog::decode(head, source.files);
+  auto ordinal = catalog.rowSpaces()[0].fields.find("tag_s");
+  ASSERT_GE(ordinal, 0);
+  auto header = catalog.fieldHeader(SpaceOrdinal::ROOT, ordinal);
+  EXPECT_EQ("tag_s", std::string_view(header.name));
+  EXPECT_EQ(1, header.docsWithField);
+  auto record = catalog.field(SpaceOrdinal::ROOT, ordinal);
+  ASSERT_TRUE(record->terms());
+  EXPECT_EQ(1, record->indexedTotals().numTerms);
+  EXPECT_THROW(SegmentCatalog::readDirectory(bytes, range.offset, source.files[0] + 1), std::runtime_error);
+}
+
+TEST_F(IndexFormatTest, corruptFieldPrefixRespectsVerificationPolicy) {
   LuxirNode node(LuxirConfig{});
   CollectionHelper ch(node, "main");
   buildReferenceIndex(ch);
   auto& dir = ch.getIndexWriter()->dir;
   auto durable = readDurableIndexInfo(dir);
-  auto segId = durable.info.segments[0].seg_id;
-  auto creatorEpoch = durable.info.segments[0].creator_epoch;
-
-  // File 0 ends with: field metadata, field offsets, field count, segment info, its size.
-  auto segInfoOffset = [](const std::string& b) { return b.size() - 4 - (size_t)loadInt(b, b.size() - 4); };
-  auto fieldCount = [&](const std::string& b) { return segInfoOffset(b) - 4; };
-  auto offsetsTable = [&](const std::string& b) { return fieldCount(b) - 4 * (size_t)loadInt(b, fieldCount(b)); };
-
-  std::vector<std::function<void(std::string&)>> corruptions = {
-      [](std::string& b) { storeInt(b, b.size() - 4, INT32_MAX); },
-      [](std::string& b) { storeInt(b, b.size() - 4, -1); },
-      [&](std::string& b) { std::memset(b.data() + segInfoOffset(b), 0xff, b.size() - 4 - segInfoOffset(b)); },
-      [&](std::string& b) { storeInt(b, fieldCount(b), INT32_MAX); },
-      [&](std::string& b) { storeInt(b, offsetsTable(b), INT32_MAX); },
-      [&](std::string& b) { storeInt(b, offsetsTable(b), 0); },
-  };
-  for (size_t i = 0; i < corruptions.size(); i++) {
-    auto copy = copySegment(dir, corruptions[i]);
-    EXPECT_THROW({ SegmentCore readerCore(*copy, segId, creatorEpoch); }, std::runtime_error) << "corruption " << i;
+  const auto& segment = durable.info.segments[0];
+  auto file = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
+  auto entry = segment.catalog.offset;
+  std::string field;
+  RAMDir copy;
+  std::vector<Directory::FileInfo> files;
+  dir.listFiles(files);
+  for (const auto& descriptor : files) {
+    std::string bytes(dir.openFile(descriptor.name)->read());
+    if (descriptor.name == file) {
+      field = bytes.substr(entry + 1, (uint8_t)bytes[entry]);
+      bytes[entry + 1 + field.size()] = 0x7f; // invalid field type, after the still-readable name
+    }
+    writeFile(copy, descriptor.name, bytes);
   }
-
-  // A field entry whose fields run on: the first value after its name never terminates.
-  auto copy = copySegment(dir, [&](std::string& b) {
-    size_t entry = offsetsTable(b) - (uint32_t)loadInt(b, offsetsTable(b));
-    size_t afterName = entry + 1 + (uint8_t)b[entry];
-    std::memset(b.data() + afterName, 0xff, std::min<size_t>(16, offsetsTable(b) - afterName));
-  });
-  SegmentCore readerCore(*copy, segId, creatorEpoch);
-  auto& reader = readerCore.rootReader();
-  ASSERT_GT(reader.numFields(), 0);
-  EXPECT_THROW(reader.fieldInfo(0), std::runtime_error);
+  ASSERT_FALSE(field.empty());
+  auto fieldContext = std::format("field '{}'", field);
+  {
+    CommitSnapshotRegistry snapshot(copy);
+    EXPECT_THROW(snapshot.openLocalSnapshot(true), ChecksumMismatchError);
+    ASSERT_NO_THROW(snapshot.openLocalSnapshot(false));
+    auto reader = snapshot.readers.getReader();
+    auto& postings = reader->segments().front().postingsReader();
+    expectCorrupt([&] { postings.fieldHeader(0); }, file, fieldContext);
+    expectCorrupt([&] { postings.fieldInfo(0); }, file, fieldContext);
+    CorruptionMarker::write(copy, std::span(&file, 1), "bad field prefix");
+    EXPECT_THROW(snapshot.openLocalSnapshot(false), ChecksumMismatchError);
+  }
+  SegmentCore core(copy, segment.seg_id, segment.creator_epoch);
+  EXPECT_FALSE(core.catalogRange().xxh3.has_value());
+  EXPECT_THROW(catalogRangeToManifest(core.catalogRange()), std::logic_error);
+  expectCorrupt([&] { core.rootReader().fieldInfo(0); }, file, fieldContext);
 }
 
 } // namespace luxir::test

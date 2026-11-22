@@ -154,25 +154,16 @@ std::optional<int64_t> weightConstantCount(IndexReader& reader,
   });
 }
 
-std::optional<SegFieldInfo> tryFieldInfo(IndexReader::Segment& segment,
-                                         std::string_view field) {
-  MemPool pool;
-  auto* fields = segment.postingsReader().fieldInfo(field);
-  if (!fields) return std::nullopt;
-  const auto& info = *fields;
-  return {info};
-}
-
-SegFieldInfo fieldInfo(IndexReader::Segment& segment, std::string_view field) {
-  auto info = tryFieldInfo(segment, field);
+const DecodedFieldRecord& fieldInfo(IndexReader::Segment& segment, std::string_view field) {
+  const auto* info = segment.postingsReader().fieldInfo(field);
   if (!info) throw std::runtime_error("missing test field");
   return *info;
 }
 
 std::vector<PointsReader::Point> readPoints(IndexReader::Segment& segment,
                                              std::string_view field) {
-  SegFieldInfo info = fieldInfo(segment, field);
-  if (info.pointsMetaOff == 0) return {};
+  const auto& info = fieldInfo(segment, field);
+  if (!info.points()) return {};
   PointsReader points(segment.postingsReader(), info);
   points.validate();
   return points.readAll();
@@ -337,7 +328,8 @@ TEST_F(NumericRangePointsTest, postingsWalkUsesTheZoneBudget) {
     int64_t scale = name == "collisions" ? 1000 : 1;
     int64_t lo = N / 4 * scale, hi = (3 * N / 4 - 1) * scale;
     auto& segment = reader->segments()[0];
-    IntColReader column(segment.postingsReader(), *reader->field(name).at(segment.ord));
+    const auto& columnInfo = *reader->field(name).at(segment.ord);
+    IntColReader column(segment.postingsReader(), columnInfo);
     if (name == "shuffled") {
       EXPECT_EQ(0, column.leafMeta().summarizeRange(lo, hi).insideLower);
     }
@@ -690,7 +682,7 @@ TEST_F(NumericRangePointsTest, bitsetLeavesMatchEveryQueryArm) {
   writer->commit();
   auto reader = writer->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
-  SegFieldInfo info = fieldInfo(segment, "bitset_point");
+  const auto& info = fieldInfo(segment, "bitset_point");
   PointsReader points(segment.postingsReader(), info);
   points.validate();
   ASSERT_EQ(2u, points.leafCount());
@@ -831,9 +823,10 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   }
   // Sparse INSIDE runs map values to docs; multivalued runs visit documents.
   // Neither has the dense single-valued word-mask production price.
-  IntColReader multiColumn(segment.postingsReader(), fieldInfo(segment, "arm_multi"));
+  const auto& columnInfo = fieldInfo(segment, "arm_multi");
+  IntColReader multiColumn(segment.postingsReader(), columnInfo);
   ASSERT_TRUE(multiColumn.multiValued());
-  ASSERT_GT(multiColumn.numValues(), multiColumn.docsWithValue());
+  ASSERT_GT(multiColumn.numValues(), multiColumn.docsWithField());
   for (auto field : {"arm_sparse", "arm_multi", "arm_shuffled"}) {
     expectShapeAndScorer(*reader, field, 0, 4095,
         Query::Demand::fromCandidatesAndSpan(N, N, Query::ExecutionUse::COUNT_WINDOWS),
@@ -1228,8 +1221,8 @@ TEST_F(NumericRangePointsTest, mergedSegmentRetainsPoints) {
   writer->mergeSegments();
   auto reader = writer->snapshots.readers.getReader();
   ASSERT_EQ(reader->segments().size(), 1);
-  SegFieldInfo info = fieldInfo(reader->segments()[0], "merged_range");
-  ASSERT_NE(info.pointsMetaOff, 0);
+  const auto& info = fieldInfo(reader->segments()[0], "merged_range");
+  ASSERT_NE(nullptr, info.points());
   PointsReader points(reader->segments()[0].postingsReader(), info);
   points.validate();
   EXPECT_EQ(points.leafCount(), 2);
@@ -1253,7 +1246,7 @@ TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
   auto firstReader = writer->snapshots.readers.getReader();
   ASSERT_EQ(firstReader->segments().size(), 1);
   EXPECT_NE(fieldInfo(firstReader->segments()[0],
-                      "merge_values_is").pointsMetaOff, 0);
+                      "merge_values_is").points(), nullptr);
   std::vector<Doc> source2 = {
       flatdoc("id", "s2-a", "merge_values_is", vec_i(4, 8)),
       flatdoc("id", "s2-delete", "merge_values_is", vec_i(12, 12)),
@@ -1275,9 +1268,9 @@ TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
   int32_t synthesizedSources = 0;
   int32_t absentSources = 0;
   for (auto& segment : sourceReader->segments()) {
-    auto info = tryFieldInfo(segment, "merge_values_is");
+    auto info = segment.postingsReader().fieldInfo("merge_values_is");
     if (!info) absentSources++;
-    else if (info->pointsMetaOff == 0) synthesizedSources++;
+    else if (!info->points()) synthesizedSources++;
     else pointSources++;
   }
   EXPECT_EQ(pointSources, 3);
@@ -1288,8 +1281,8 @@ TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
   auto mergedReader = writer->snapshots.readers.getReader();
   ASSERT_EQ(mergedReader->segments().size(), 1);
   auto& mergedSegment = mergedReader->segments()[0];
-  SegFieldInfo mergedInfo = fieldInfo(mergedSegment, "merge_values_is");
-  ASSERT_NE(mergedInfo.pointsMetaOff, 0);
+  const auto& mergedInfo = fieldInfo(mergedSegment, "merge_values_is");
+  ASSERT_NE(nullptr, mergedInfo.points());
   PointsReader mergedPoints(mergedSegment.postingsReader(), mergedInfo);
   mergedPoints.validate();
 

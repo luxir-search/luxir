@@ -44,7 +44,6 @@ void withPointsOptions(std::span<const Point> expected,
   RAMDir dir;
   auto file = dir.createFile("points");
   OutputStream out(file.get());
-  out.streamNumber = 0;
   out.writeBytes("pre");
   PointsWriter writer(out, options);
   for (const auto& point : expected) writer.addPoint(point.value, point.docid);
@@ -54,7 +53,7 @@ void withPointsOptions(std::span<const Point> expected,
 
   auto inputFile = dir.openFile("points");
   InputStream input = inputFile->getInputStream();
-  PointsReader reader(input, data.pointsLoc.offset(), data.pointsMetaOff);
+  PointsReader reader(input, data.pointsStart, data.pointsMetaOff, data.directoryBytes);
   reader.validate();
   EXPECT_EQ(expected.size(), reader.pointCount());
   EXPECT_EQ(std::vector<Point>(expected.begin(), expected.end()), reader.readAll());
@@ -94,7 +93,7 @@ std::vector<int32_t> emitOrdinals(const PointsReader& reader,
 }
 
 std::vector<Point> pointsFromColumn(PostingsReader& postingsReader,
-                                    const SegFieldInfo& fieldInfo) {
+                                    const DecodedFieldRecord& fieldInfo) {
   IntColReader column(postingsReader, fieldInfo);
   IntColReader::Iterator docs(column);
   std::vector<Point> points;
@@ -114,12 +113,10 @@ std::vector<Point> pointsFromColumn(PostingsReader& postingsReader,
   return points;
 }
 
-SegFieldInfo readFieldInfo(MemPool& pool, PostingsReader& postingsReader,
-                           std::string_view field) {
-  auto* fields = postingsReader.fieldInfo(field);
-  if (!fields) throw std::runtime_error("missing test field");
-  const auto& info = *fields;
-  return info;
+const DecodedFieldRecord& readFieldInfo(PostingsReader& postingsReader, std::string_view field) {
+  const auto* info = postingsReader.fieldInfo(field);
+  if (!info) throw std::runtime_error("missing test field");
+  return *info;
 }
 
 } // namespace
@@ -146,7 +143,7 @@ TEST_F(PointsIndexTest, leafBoundariesAndDirectory) {
     EXPECT_EQ(12, reader.leafMax(2));
     EXPECT_EQ((uint64_t)data.pointsMetaOff, reader.leafFP(reader.leafCount()));
 
-    const char* leaf = input.ptr((int64_t)data.pointsLoc.offset());
+    const char* leaf = input.ptr((int64_t)data.pointsStart);
     EXPECT_EQ(3, load<uint16_t>(leaf + 0));
     EXPECT_EQ(PointsWriter::DOC_CONTIG, (uint8_t)leaf[2]);
     EXPECT_EQ(0, (uint8_t)leaf[3]);
@@ -156,7 +153,7 @@ TEST_F(PointsIndexTest, leafBoundariesAndDirectory) {
     EXPECT_EQ(-5, load<int64_t>(leaf + 16));
     EXPECT_EQ(reader.leafInfo(0).valueGcd, load<uint64_t>(leaf + 24));
 
-    const char* meta = input.ptr((int64_t)(data.pointsLoc.offset() + data.pointsMetaOff));
+    const char* meta = input.ptr((int64_t)(data.pointsStart + data.pointsMetaOff));
     EXPECT_EQ(PointsWriter::MAGIC, load<uint32_t>(meta + 0));
     EXPECT_EQ(PointsWriter::VERSION, load<uint16_t>(meta + 4));
     EXPECT_EQ(PointsWriter::FORMAT_KIND, (uint8_t)meta[6]);
@@ -166,7 +163,7 @@ TEST_F(PointsIndexTest, leafBoundariesAndDirectory) {
     EXPECT_EQ(3, load<uint16_t>(meta + 16));
     EXPECT_EQ(0x1111, load<uint16_t>(meta + 18));
     EXPECT_EQ(points.size(), load<uint64_t>(meta + 20));
-    uint64_t headerEnd = data.pointsLoc.offset() + data.pointsMetaOff
+    uint64_t headerEnd = data.pointsStart + data.pointsMetaOff
                        + PointsWriter::FIXED_HEADER_SIZE;
     uint64_t directoryStart = (headerEnd + 7) & ~(uint64_t)7;
     EXPECT_EQ(0u, directoryStart % 8);
@@ -265,7 +262,7 @@ TEST_F(PointsIndexTest, docidCodecSelection) {
     EXPECT_EQ((1u << 2) | PointsWriter::DOC_BITSET, reader.leafEncoding(2));
     EXPECT_EQ((63u << 2) | PointsWriter::DOC_CONTIG, reader.leafEncoding(3));
     EXPECT_EQ((31u << 2) | PointsWriter::DOC_FOR, reader.leafEncoding(4));
-    EXPECT_EQ(input.size() - data.pointsLoc.offset(), reader.sizeInBytes());
+    EXPECT_EQ(input.size() - data.pointsStart, reader.sizeInBytes());
 
     auto work = reader.emissionWork(1, 8);
     EXPECT_EQ(3, work.leaves);
@@ -304,9 +301,9 @@ TEST_F(PointsIndexTest, docidCodecSelection) {
 
     std::vector<char> old(input.ptr(0), input.ptr(0) + input.size());
     uint16_t version = 1;
-    memcpy(old.data() + data.pointsLoc.offset() + data.pointsMetaOff + 4, &version, sizeof(version));
+    memcpy(old.data() + data.pointsStart + data.pointsMetaOff + 4, &version, sizeof(version));
     InputStream oldInput(old.data(), old.data() + old.size());
-    EXPECT_THROW(PointsReader(oldInput, data.pointsLoc.offset(), data.pointsMetaOff), std::runtime_error);
+    EXPECT_THROW(PointsReader(oldInput, data.pointsStart, data.pointsMetaOff, data.directoryBytes), std::runtime_error);
   });
 
   std::vector<Point> sameDocDuplicates = {{9, 17}, {9, 17}};
@@ -376,7 +373,6 @@ TEST_F(PointsIndexTest, emptyInputRejectedWithoutWriting) {
   RAMDir dir;
   auto file = dir.createFile("points");
   OutputStream out(file.get());
-  out.streamNumber = 0;
   out.writeBytes("prefix");
   size_t before = out.size();
   PointsWriter writer(out);
@@ -392,10 +388,10 @@ TEST_F(PointsIndexTest, deepValidationIsExplicit) {
                              const InputStream& input) {
     const char* start = input.ptr(0);
     std::vector<char> corrupt(start, start + input.size());
-    corrupt[data.pointsLoc.offset() + 5] = 0;
+    corrupt[data.pointsStart + 5] = 0;
     InputStream corruptInput(corrupt.data(), corrupt.data() + corrupt.size());
 
-    PointsReader reader(corruptInput, data.pointsLoc.offset(), data.pointsMetaOff);
+    PointsReader reader(corruptInput, data.pointsStart, data.pointsMetaOff, data.directoryBytes);
     EXPECT_THROW(reader.validate(), std::runtime_error);
   });
 }
@@ -454,10 +450,9 @@ TEST_F(PointsIndexTest, flushMatchesSingleAndMultiValuedColumns) {
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   auto& postingsReader = reader->segments()[0].postingsReader();
-  MemPool pool;
   for (std::string_view field : {"range_single", "range_multi"}) {
-    SegFieldInfo info = readFieldInfo(pool, postingsReader, field);
-    ASSERT_NE(0, info.pointsMetaOff);
+    const auto& info = readFieldInfo(postingsReader, field);
+    ASSERT_NE(nullptr, info.points());
     PointsReader points(postingsReader, info);
     points.validate();
     EXPECT_EQ(pointsFromColumn(postingsReader, info), points.readAll()) << field;

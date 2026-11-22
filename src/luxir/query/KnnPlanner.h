@@ -84,7 +84,7 @@ struct KnnPlanner {
     }
   };
   struct Segment {
-    int64_t vectors = 0, liveVectors = 0, docsWithValue = 0;
+    int64_t vectors = 0, liveVectors = 0, docsWithField = 0;
     int64_t eligibleDocs = 0, eligibleVectors = 0, domainSize = 0, maxDoc = 0;
     int64_t unitsWithValue = -1, eligibleUnits = -1;
     int32_t dims = 0, nlist = 0, pqM = 0, pqBits = 0, rabitqBits = 0, rabitqQueryBits = 4;
@@ -93,7 +93,7 @@ struct KnnPlanner {
     bool sparse = false, multi = false, bounded = false;
     bool vectorsEstimated = false, pqPerListTable = false, forceFaissRaBitQ = false;
 
-    int64_t physicalUnits() const { return unitsWithValue < 0 ? docsWithValue : unitsWithValue; }
+    int64_t physicalUnits() const { return unitsWithValue < 0 ? docsWithField : unitsWithValue; }
     int64_t selectedUnits() const { return eligibleUnits < 0 ? eligibleDocs : eligibleUnits; }
   };
   struct Request {
@@ -124,9 +124,9 @@ struct KnnPlanner {
   };
 
   static bool walkDomain(bool domain, bool sparse, bool multi, int64_t card,
-                         int64_t docsWithValue, double threshold) {
+                         int64_t docsWithField, double threshold) {
     return domain && threshold >= 0 && (sparse || multi
-        || (double)card / std::max((int64_t)1, docsWithValue) <= threshold);
+        || (double)card / std::max((int64_t)1, docsWithField) <= threshold);
   }
   static double initialScanFraction(const Request& request, double selectivity) {
     // Effort is a scan fraction of a hypothetical single IVF index of
@@ -171,7 +171,7 @@ struct KnnPlanner {
     double docs = (double)(foldComplement(s) ? s.maxDoc - s.domainSize : s.domainSize);
     w[FOLD_DOC] = docs; w[FOLD_WORD] = (double)((s.vectors + 63) / 64);
     if (s.sparse) w[SPARSE_MAP] = docs;
-    if (s.multi) w[MULTI_MAP] = (double)(foldComplement(s) ? s.docsWithValue - s.eligibleDocs : s.eligibleDocs);
+    if (s.multi) w[MULTI_MAP] = (double)(foldComplement(s) ? s.docsWithField - s.eligibleDocs : s.eligibleDocs);
     return w;
   }
   static double resolveCost(const Segment& s, const Costs& costs) {
@@ -193,11 +193,11 @@ struct KnnPlanner {
   static Price price(const Segment& s, const Request& request, const Costs& costs) {
     Price p;
     if (s.eligibleDocs <= 0 || s.liveVectors <= 0) return p;
-    bool walk = walkDomain(s.domain, s.sparse, s.multi, s.domainSize, s.docsWithValue, request.flatDensity);
+    bool walk = walkDomain(s.domain, s.sparse, s.multi, s.domainSize, s.docsWithField, request.flatDensity);
     p.exact[EXACT_DIM] = (double)s.eligibleVectors * s.dims;
     p.exact[DOMAIN_DOC] = walk ? (double)s.domainSize : 0;
     p.exact[RANK_VISIT] = walk ? 0 : (double)s.vectors;
-    p.exact[FLAT_PROBE] = !walk && s.domain ? (double)s.docsWithValue : 0;
+    p.exact[FLAT_PROBE] = !walk && s.domain ? (double)s.docsWithField : 0;
     p.exact[SPARSE_MAP] = s.sparse && (walk || !s.multi) ? (double)(walk ? s.domainSize : s.vectors) : 0;
     p.exact[MULTI_MAP] = s.multi ? (double)(walk ? s.eligibleDocs : s.vectors) : 0;
     p.exactCost = costs.price(p.exact);

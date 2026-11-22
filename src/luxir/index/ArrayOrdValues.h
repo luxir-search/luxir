@@ -50,7 +50,7 @@ public:
     Mapped(const ArrayOrdValues& source, const MemPool& pool,
            std::span<const uint32_t> mapping) : source(source), pool(pool), mapping(mapping) {}
     int32_t size() const { return source.docs; }
-    int32_t docsWithValue() const { return source.docs; }
+    int32_t docsWithField() const { return source.docs; }
     bool multiValued() const { return source.multi; }
     bool hasValues(int32_t) const { return true; }
     void pushValues(int32_t slot, auto&& acceptor) const {

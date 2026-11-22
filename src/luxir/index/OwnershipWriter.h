@@ -10,6 +10,7 @@ namespace luxir {
 
 // Writes both directions from the same parent-major family stream.
 class OwnershipWriter {
+  PostingsWriter& writer;
   PostingsWriter::OutputStreamPtr endsOutput;
   PostingsWriter::OutputStreamPtr ownersOutput;
   MonoWriter ends;
@@ -19,7 +20,7 @@ class OwnershipWriter {
 
 public:
   OwnershipWriter(PostingsWriter& writer, bool reverseMap)
-      : endsOutput(writer.getOutputStream()),
+      : writer(writer), endsOutput(writer.getOutputStream()),
         ownersOutput(reverseMap ? writer.getOutputStream() : PostingsWriter::OutputStreamPtr{}),
         ends(writer.pool, *endsOutput) {
     if (ownersOutput) owners.emplace(writer.pool, *ownersOutput);
@@ -45,17 +46,15 @@ public:
   }
 
   OwnershipDescriptor finish() {
-    auto count = ends.finish();
-    assert(count == (size_t)parentCount);
-    unused(count);
-    OwnershipDescriptor result{ends.blockLoc, ends.metaOff, {}, 0};
+    OwnershipDescriptor result{};
+    auto endsData = ends.finish();
+    assert(endsData.numValues == parentCount);
     if (owners) {
-      auto count = owners->finish();
-      assert(count == (size_t)childCount);
-      unused(count);
-      result.owners = owners->blockLoc;
-      result.ownersMetaOff = owners->metaOff;
+      auto ownersData = owners->finish();
+      assert(ownersData.numValues == childCount);
+      result.owners = MonoWriter::placeIndex(writer, std::move(ownersOutput), ownersData);
     }
+    result.ends = MonoWriter::placeIndex(writer, std::move(endsOutput), endsData);
     return result;
   }
 };

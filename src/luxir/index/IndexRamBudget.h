@@ -322,15 +322,17 @@ public:
       return retained;
     }
 
-    // Grows a draining reservation, e.g. by a flush's transient workspace.
-    // Admission counts it, but pressure discounts it with the rest of the
-    // flushing inverter: it is gone before shedding another inverter could
-    // help.  Pressure is unchanged, so nothing is notified.
-    void growDraining(int64_t delta) {
+    // Adjusts working bytes while preserving any delete reservation. When
+    // draining, move reserved and draining bytes together under the budget lock.
+    void adjustSize(int64_t delta) noexcept {
       assert(budget != nullptr);
+      if (kind == Kind::Work) {
+        forceResize(bytes + delta, deleteBytes);
+        return;
+      }
       assert(kind == Kind::Draining);
-      assert(delta >= 0);
-      budget->growDraining(delta);
+      assert(drainingBytes + delta >= 0);
+      budget->adjustDraining(delta);
       bytes += delta;
       drainingBytes += delta;
     }
@@ -542,10 +544,14 @@ private:
     return true;
   }
 
-  void growDraining(int64_t delta) {
-    const std::lock_guard<std::mutex> lock(registryMutex);
-    reserved.fetch_add(delta, std::memory_order_relaxed);
-    drainingBytes += delta;
+  void adjustDraining(int64_t delta) noexcept {
+    {
+      const std::lock_guard<std::mutex> lock(registryMutex);
+      assert(drainingBytes + delta >= 0);
+      reserved.fetch_add(delta, std::memory_order_relaxed);
+      drainingBytes += delta;
+    }
+    if (delta < 0) notifyCapacityReleased();
   }
 
   void clearDraining(int64_t bytes, int64_t deletes) noexcept {

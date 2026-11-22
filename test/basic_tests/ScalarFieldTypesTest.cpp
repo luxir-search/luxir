@@ -620,7 +620,7 @@ TEST_F(DecimalFieldTypesTest, scalePersistenceAndSchemaValidation) {
   changedType.parent = "base";
   changedType.type = FieldClass::INT;
   auto schema = inherited.build(helper.collection().getSchema().get());
-  EXPECT_EQ(3u, schema->getFieldTypeEx("child")->segmentTypeFlags());
+  EXPECT_EQ(3u, schema->getFieldTypeEx("child")->segmentTypeParameters());
   EXPECT_EQ(FieldType::INT, schema->getFieldTypeEx("integer")->type());
   FieldSignature signature("child", *schema->getFieldTypeEx("child"));
   EXPECT_EQ("3", signature.properties.at("scale"));
@@ -628,7 +628,7 @@ TEST_F(DecimalFieldTypesTest, scalePersistenceAndSchemaValidation) {
   api::SchemaDef definition;
   ASSERT_TRUE(api::read_json(definition, R"({"fields":{"money":{"type":"decimal","scale":2}}})", arena));
   auto jsonSchema = Schema::fromProto(definition, schema.get());
-  EXPECT_EQ(2u, jsonSchema->getFieldTypeEx("money")->segmentTypeFlags());
+  EXPECT_EQ(2u, jsonSchema->getFieldTypeEx("money")->segmentTypeParameters());
   for (int scale : {-1, 19}) {
     SchemaBuilder bad;
     auto& field = bad.field("bad");
@@ -647,7 +647,7 @@ TEST_F(DecimalFieldTypesTest, scalePersistenceAndSchemaValidation) {
   auto writer = helper.getIndexWriter();
   writer->mergePolicy->setMergeFactor(100);
   IndexReader reopened(writer->dir);
-  EXPECT_EQ(2u, reopened.field("price").at(0)->typeFlags);
+  EXPECT_EQ(2u, reopened.field("price").at(0)->typeParameters);
   EXPECT_EQ(FieldType::DECIMAL, reopened.field("price").at(0)->type);
   SchemaBuilder removed;
   removed.replaceAll(helper.collection());

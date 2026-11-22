@@ -15,7 +15,6 @@
 namespace luxir {
 
 class OutputStream;
-class RAMDelegatingFile;
 
 // A segment-global position (consists of a file number and a file offset)
 // It's made into its own type to enhance type safety so it won't accidentally
@@ -40,6 +39,14 @@ public:
   uint64_t offset() const noexcept { return x & OFFSET_MASK; }
   uint64_t raw() const noexcept { return x; }
   bool isNull() const noexcept { return x == 0; }
+  bool operator==(const seg_location&) const = default;
+
+  seg_location addOffset(uint64_t bytes) const {
+    if (bytes > maxOffset() - offset()) {
+      throw std::length_error("segment offset exceeds seg_location");
+    }
+    return {filenum(), offset() + bytes};
+  }
 
   static seg_location fromRaw(uint64_t raw) noexcept {
     seg_location location;
@@ -83,20 +90,16 @@ class File {
 protected:
   std::string name_;
 
-  virtual void flush(OutputStream &os, bool deferNewBuff) = 0;
+  virtual void flush(OutputStream& os, bool deferNewBuff, size_t minCapacity) = 0;
 
   virtual void close(OutputStream &os) = 0;
 
-  // A relocatable file can transfer its complete logical byte image into a
-  // target stream. The default covers an ordinary stream whose bytes have
-  // never left its active buffer; RAMDelegatingFile broadens this to all of
-  // its RAM-resident buffers.
-  virtual bool isRelocatable(const OutputStream& os) const;
-  virtual void appendRelocatableTo(OutputStream& source, OutputStream& target);
+  virtual void appendFile(OutputStream& out, RAMFile& file);
 
-  // Once a segment is known to be large, a delegating backend materializes
-  // immediately. Ordinary files have nothing to do.
-  virtual void disableRamBuffering(OutputStream& os) { unused(os); }
+  // Lend the unused part of dest's buffer to source. Source keeps its own
+  // byte count. Return the buffer before moving dest's cursor or refilling it.
+  static void borrowBuffer(OutputStream& source, OutputStream& dest, size_t appended = 0) noexcept;
+  static void returnBuffer(OutputStream& source, OutputStream& dest) noexcept;
 
 public:
   explicit File(const std::string_view &name) : name_(name) {}
@@ -122,22 +125,13 @@ class OutputStream {
   friend class RAMFile;
   friend class SizedRAMFile;
   friend class FSFile;
-  friend class RAMDelegatingFile;
 
   // the associated File object controls the lifetime of the buffer
   char *pos = nullptr;
   char *start = nullptr;
   char *end = nullptr;
   size_t flushedSize = 0; // number of bytes that have been flushed to the source
-private:
-  File *target;
-public:
-  // just used by postings writer to know what field number this stream is associated with.
-  uint16_t streamNumber;
-
-  seg_location slocation() const {
-    return seg_location(streamNumber, size());
-  }
+  File* target;
 
 public:
   // By not requiring the File target up-front, we can directly include OutputStream instances in other
@@ -146,22 +140,12 @@ public:
 
   size_t buffered() const noexcept { return start == nullptr ? 0 : (size_t)(pos - start); }
 
-  bool hasFlushedBytes() const noexcept { return flushedSize != 0; }
-
-  // Relocatability belongs to the File because a delegating backend may own
-  // earlier RAM buffers in addition to this stream's active buffer.
-  bool isRelocatable() const noexcept {
-    return target != nullptr && target->isRelocatable(*this);
-  }
-
-  void disableRamBuffering() { target->disableRamBuffering(*this); }
-
   size_t reserved() const noexcept {
     return pos == nullptr ? 0 : (size_t)(end - pos);
   }
   uint32_t reserve(uint32_t needed) {
     if (reserved() < needed) {
-      flush();  // TODO: pass down needed amount?
+      target->flush(*this, false, needed);
       if (reserved() < needed) throw FileIOException("output reservation exceeds stream buffer capacity");
     }
     return (uint32_t)std::min(reserved(), (size_t)UINT32_MAX);
@@ -173,7 +157,7 @@ public:
   File *getFile() const noexcept{ return target; }
 
   // don't call flush before close... it would needlessly create a new memory buffer
-  void flush(bool deferNewBuff = false) { target->flush(*this, deferNewBuff); }
+  void flush(bool deferNewBuff = false) { target->flush(*this, deferNewBuff, 0); }
 
   void close() {
     target->close(*this);
@@ -188,32 +172,6 @@ public:
   // Flushes both sides, destructively appends file, updates size accounting,
   // and leaves this stream ready for continued writes.
   void appendFile(RAMFile& file);
-
-  // Append a relocatable stream as one affine region.  The source starts at
-  // offset zero, so aligning its new base preserves every within-file
-  // alignment.  Returns false if the source has spilled or the combined file
-  // would exceed seg_location's 44-bit offset space.
-  bool tryAppendRelocatable(OutputStream& source, size_t alignment,
-                            uint64_t& baseOffset) {
-    assert(this != &source);
-    assert(alignment > 0);
-    if (!source.isRelocatable()) return false;
-
-    uint64_t current = (uint64_t) size();
-    uint64_t sourceBytes = (uint64_t) source.size();
-    uint64_t padding = (alignment - current % alignment) % alignment;
-    if (current > seg_location::maxOffset()
-        || padding > seg_location::maxOffset() - current
-        || sourceBytes > seg_location::maxOffset() - current - padding) {
-      return false;
-    }
-
-    align(alignment);
-    baseOffset = (uint64_t) size();
-    source.target->appendRelocatableTo(source, *this);
-    assert(source.size() == 0);
-    return true;
-  }
 
   // pretend that numBytes have been written and move ptr() that many bytes forward in the buffer.
   // requires reserved() >= numBytes as a prerequisite.
@@ -288,19 +246,19 @@ public:
     // TODO: optimize this.
 
     // Make sure val is unsigned here since high bit may be set.
-    while (val > 0x7f) {
-      write((char) (val | 0x80));
-      val >>= 7;
+    while (val > VARINT_PAYLOAD_MASK) {
+      write((char) (val | VARINT_CONTINUATION));
+      val >>= VARINT_PAYLOAD_BITS;
     }
     write((char) val);
   }
 
-  // Write a maximum of 9 bytes in vint format.  Note that this is inefficient for negative numbers.
+  // Write a uint64_t as a varint.
   void writeVlong(uint64_t val) {
     // TODO: optimize this
-    while (val > 0x7f) {
-      write((char) (val | 0x80));
-      val >>= 7;
+    while (val > VARINT_PAYLOAD_MASK) {
+      write((char) (val | VARINT_CONTINUATION));
+      val >>= VARINT_PAYLOAD_BITS;
     }
     write((char) val);
   }
@@ -339,14 +297,12 @@ inline void seg_location::write(OutputStream& os) const {
 }
 
 
-// In-memory file used directly by RAMDir and as the retained byte image inside
-// FSDirectory's RAMDelegatingFile.
+// Chunked in-memory output used by RAMDir and temporary writers.
 class RAMFile : public File {
   friend class OutputStream;
 
   friend class RAMInputFile;
   friend class FSFile;
-  friend class RAMDelegatingFile;
 
   struct BufferDeleter {
     std::pmr::memory_resource* resource;
@@ -375,7 +331,15 @@ class RAMFile : public File {
     allocatedSize += size;
   }
 
-  void flush(OutputStream &os, bool deferNewBuff) override {
+protected:
+  size_t nextBufferCapacity(const OutputStream& os, size_t minCapacity) const {
+    // Double up to 1 MiB unless a reservation needs a larger buffer.
+    size_t previousSize = os.start ? os.buffered()
+        : buffers.empty() ? START_BUFFER_SIZE / 2 : buffers.back().used;
+    return std::max({minCapacity, (size_t)START_BUFFER_SIZE, std::min(previousSize * 2, size_t{1} << 20)});
+  }
+
+  void flushBuffer(OutputStream& os, size_t capacity) {
     auto thisBufferSize = os.start == nullptr ? 0 : (size_t)(os.pos - os.start);
     fileSize += thisBufferSize;
     os.flushedSize = fileSize;
@@ -384,24 +348,23 @@ class RAMFile : public File {
       buffers.back().used = thisBufferSize;
     }
 
-    if (!deferNewBuff) {
-      // doubling strategy up to 1MiB
-      auto prevBufferSize = buffers.empty()
-          ? START_BUFFER_SIZE / 2 : (uint32_t)buffers.back().used;
-      auto bufSize = std::max(START_BUFFER_SIZE, std::min(prevBufferSize << 1, 0x100000u));
-      newBuffer(bufSize);
+    os.start = os.pos = os.end = nullptr;
+    if (capacity != 0) {
+      newBuffer(capacity);
       auto& buffer = buffers.back();
       os.start = buffer.data.get();
       os.pos = os.start;
       os.end = os.start + buffer.capacity;
-    } else {
-      os.start = os.pos = os.end = nullptr;
     }
+  }
+
+  void flush(OutputStream& out, bool deferNewBuff, size_t minCapacity) override {
+    flushBuffer(out, deferNewBuff ? 0 : nextBufferCapacity(out, minCapacity));
   }
 
   // TODO: this is currently redundant with Directory.finish
   void close(OutputStream &os) override {
-    flush(os, true);
+    flushBuffer(os, 0);
   }
 
 public:
@@ -479,12 +442,6 @@ public:
   }
 };
 
-inline void OutputStream::appendFile(RAMFile& file) {
-  flush(true);
-  target->destructiveAppend(file);
-  flushedSize = target->size();
-  target->flush(*this, false);
-}
 
 class InputFile {
 public:
@@ -537,7 +494,7 @@ class SizedRAMFile : public File {
   uint64_t hash = 0;
   bool closed = false;
 
-  void flush(OutputStream& out, bool defer) override {
+  void flush(OutputStream& out, bool defer, size_t /*minCapacity*/) override {
     written = out.size();
     out.flushedSize = written;
     out.start = out.pos = out.end = nullptr;
@@ -548,7 +505,7 @@ class SizedRAMFile : public File {
     }
   }
   void close(OutputStream& out) override {
-    flush(out, true);
+    flush(out, true, 0);
     if (written != expected) throw FileIOException("RAM output is shorter than expected size");
     hash = XXH3_64bits(data.get(), written);
     closed = true;

@@ -176,12 +176,10 @@ void setGeoSchema(CollectionHelper& helper, bool range = true) {
   b.set(helper.collection());
 }
 
-SegFieldInfo fieldInfo(IndexReader::Segment& segment, std::string_view field) {
-  MemPool pool;
-  auto* fields = segment.postingsReader().fieldInfo(field);
-  if (!fields) throw std::runtime_error("missing geo test field");
-  const auto& info = *fields;
-  return info;
+const DecodedFieldRecord& fieldInfo(IndexReader::Segment& segment, std::string_view field) {
+  const auto* info = segment.postingsReader().fieldInfo(field);
+  if (!info) throw std::runtime_error("missing geo test field");
+  return *info;
 }
 
 template <typename Fill>
@@ -499,12 +497,12 @@ TEST_F(GeoBoxQueryTest, randomizedQuantizedOracleSingleAndMulti) {
   auto reader = writer->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   auto& segment = reader->segments()[0];
-  SegFieldInfo singleInfo = fieldInfo(segment, "geo_single");
-  ASSERT_NE(0, singleInfo.pointsMetaOff);
+  const auto& singleInfo = fieldInfo(segment, "geo_single");
+  ASSERT_NE(nullptr, singleInfo.points());
   BKDReader singleBKD(segment.postingsReader(), singleInfo);
   EXPECT_NO_THROW(singleBKD.validate());
-  SegFieldInfo multiInfo = fieldInfo(segment, "geo_multi");
-  ASSERT_NE(0, multiInfo.pointsMetaOff);
+  const auto& multiInfo = fieldInfo(segment, "geo_multi");
+  ASSERT_NE(nullptr, multiInfo.points());
   BKDReader multiBKD(segment.postingsReader(), multiInfo);
   EXPECT_NO_THROW(multiBKD.validate());
   {
@@ -619,7 +617,7 @@ TEST_F(GeoBoxQueryTest, scanFallbackWithoutPointsUsesDenseColumnPath) {
   writer->commit();
   auto reader = writer->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
-  EXPECT_EQ(0, fieldInfo(segment, "geo_single").pointsMetaOff);
+  EXPECT_EQ(nullptr, fieldInfo(segment, "geo_single").points());
   Box box{-10.0, 10.0, 160.0, -170.0};
   SkipStats::reset();
   SkipStats::enabled = true;
@@ -776,6 +774,41 @@ TEST_F(GeoBoxQueryTest, boxUnderAUnionProducesItsBKD) {
   });
 }
 
+TEST_F(GeoBoxQueryTest, mergeMixedGeoColumnsAndRebuildBKD) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("location");
+  field.type = api::FieldDef::FieldClass::GEO_POINT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  field.multi = api::FieldDef::MultiMode::SINGLE;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "location", std::vector<double>{21, 11}), UpdateMessage::COMMIT).success);
+  field.multi = api::FieldDef::MultiMode::ARRAY;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "location", std::vector<std::vector<double>>{{22, 12}, {23, 13}}),
+                           UpdateMessage::COMMIT).success);
+  auto writer = helper.getIndexWriter();
+  writer->mergeSegments();
+
+  auto reader = writer->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto& postings = reader->segments()[0].postingsReader();
+  const auto& info = *postings.fieldInfo("location");
+  std::array<std::vector<int64_t>, 2> actual;
+  IntColReader::getValues(MemPool::threadLocal(), postings, info, std::array{0, 1},
+      [&](size_t i, int32_t, int64_t value, int64_t, int64_t) { actual[i].push_back(value); });
+  EXPECT_EQ(vec_i(geo::encodePoint(11, 21)), actual[0]);
+  EXPECT_EQ(vec_i(geo::encodePoint(12, 22), geo::encodePoint(13, 23)), actual[1]);
+  ASSERT_TRUE(info.points());
+  auto points = BKDReader(postings, info).readAll();
+  std::ranges::sort(points, {}, &BKDReader::Point::dim0);
+  const std::vector<BKDReader::Point> expected{
+      {geo::encodeLatitude(11), geo::encodeLongitude(21), 0},
+      {geo::encodeLatitude(12), geo::encodeLongitude(22), 1},
+      {geo::encodeLatitude(13), geo::encodeLongitude(23), 1}};
+  EXPECT_EQ(expected, points);
+}
+
 TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
   CollectionHelper helper;
   setGeoSchema(helper);
@@ -803,8 +836,8 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
   ASSERT_EQ(2u, beforeMerge->segments().size());
   for (auto& segment : beforeMerge->segments()) {
     for (std::string_view field : {"geo_single", "geo_multi"}) {
-      SegFieldInfo info = fieldInfo(segment, field);
-      ASSERT_NE(0, info.pointsMetaOff);
+      const auto& info = fieldInfo(segment, field);
+      ASSERT_NE(nullptr, info.points());
       BKDReader bkd(segment.postingsReader(), info);
       EXPECT_NO_THROW(bkd.validate());
     }
@@ -821,8 +854,8 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
   ASSERT_EQ(1u, afterMerge->segments().size());
   auto& merged = afterMerge->segments()[0];
   for (std::string_view field : {"geo_single", "geo_multi"}) {
-    SegFieldInfo info = fieldInfo(merged, field);
-    ASSERT_NE(0, info.pointsMetaOff);
+    const auto& info = fieldInfo(merged, field);
+    ASSERT_NE(nullptr, info.points());
     BKDReader bkd(merged.postingsReader(), info);
     EXPECT_NO_THROW(bkd.validate());
 
@@ -888,10 +921,10 @@ TEST_F(GeoBoxQueryTest, declaredMultiSingletonUsesSinglePointLayout) {
     QueryState state(pool, *reader, "home_ps", box);
     int64_t count = 0;
     for (auto& seg : reader->segments()) {
-      auto info = fieldInfo(seg, "home_ps");
+      const auto& info = fieldInfo(seg, "home_ps");
       EXPECT_NE(0, info.flags & FieldType::MULTI_ARRAY);
-      EXPECT_FALSE(info.hasEndValueRanks());
-      ASSERT_NE(0, info.pointsMetaOff);
+      EXPECT_FALSE(info.endValueRanks());
+      ASSERT_NE(nullptr, info.points());
       auto matches = countForTests(state.weight, seg);
       ASSERT_GE(matches, 0);
       count += matches;

@@ -253,9 +253,9 @@ TEST_F(InverterTest, intstream) {
     IntStream ints(pool);
     TestConsumer consumer1;
 
-    int nvals = rng.rint(1, maxvals);
+    int numValues = rng.rint(1, maxvals);
     int lastval = 0;
-    for (int j=0; j<nvals; j++) {
+    for (int j=0; j<numValues; j++) {
       int val;
       if (rng.rbool()) {
         val = lastval + rng.rint(-256,256);
@@ -286,9 +286,9 @@ TEST_F(InverterTest, longstream) {
     LongStream longs(pool);
     TestConsumer consumer1;
 
-    int nvals = rng.rint(1, maxvals);
+    int numValues = rng.rint(1, maxvals);
     int64_t lastval = 0;
-    for (int j=0; j<nvals; j++) {
+    for (int j=0; j<numValues; j++) {
       int64_t val;
       if (rng.rbool()) {
         val = lastval + rng.rint(-256,256);

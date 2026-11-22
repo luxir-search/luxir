@@ -65,11 +65,14 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
       }
       case SortClause::COLUMN: {
         const auto& field = clause.getSortField();
-        auto* found = SegFieldInfo::column(reader.field(field.getFieldName()).at(segment));
+        auto* found = reader.field(field.getFieldName()).at(segment);
         if (!found) break;
-        const SegFieldInfo& info = *found;
-        auto type = const_cast<FieldType&>(field.getFieldType()).type();
+        const auto& info = *found;
+        auto& fieldType = const_cast<FieldType&>(field.getFieldType());
+        auto type = fieldType.type();
         if (FieldType::isNumericColumn(type)) {
+          const auto* number = info.numberColumn();
+          if (!number) break;
           IntColReader column(segment.postingsReader(), info);
           IntColReader::Iterator iter(column);
           if (iter.advance(doc.docId()) != doc.docId()) break;
@@ -79,17 +82,21 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
           if (type == FieldType::FLOAT) value.kind = sortableInt32ToFloat((int32_t)raw);
           else if (type == FieldType::DOUBLE) value.kind = sortableInt64ToDouble(raw);
           else value.kind = raw;
-        } else if (const_cast<FieldType&>(field.getFieldType()).isSet(FieldType::INDEX_DOCS)) {
+        } else if (fieldType.indexed()) {
+          const auto* ords = info.ordColumn();
+          if (!ords) break;
           OrdColReader column(segment.postingsReader(), info);
           int32_t ord = selectedSortOrd(column, doc.docId(), field.isReversed());
           if (ord == 0) break;
           TermsEnum terms(pool, segment.postingsReader(), info); terms.seekOrd((int64_t)ord - 1);
           value.kind = build::arenaStr(mr, (std::string_view)terms.term());
         } else {
+          const auto* bytes = info.bytesColumn();
+          if (!bytes) break;
           StrColReader column(segment.postingsReader(), info);
           StrColReader::DocIterator iter(column);
           if (iter.advance(doc.docId()) != doc.docId()) break;
-          if (column.isMultiValued()) {
+          if (column.multiValued()) {
             StrColReader::DocValues values(column);
             value.kind = build::arenaStr(mr, column.selectedValue(iter.rank(), field.isReversed(), values));
           } else {

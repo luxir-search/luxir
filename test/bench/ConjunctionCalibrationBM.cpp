@@ -304,7 +304,8 @@ void calibration(benchmark::State& state, const char* namedQuery = nullptr) {
     if (clauses[i].field == Field::TERM) continue;
     std::string p = "e" + std::to_string(i) + "_";
     auto infos = index.reader->field(clauses[i].name);
-    IntColReader reader(segment.postingsReader(), *infos.at(0));
+    const auto& columnInfo = *infos.at(0);
+    IntColReader reader(segment.postingsReader(), columnInfo);
     auto& range = (NumericPredicateQuery&)*clauses[i].query;
     int64_t outside = 0, inside = 0, blocks = 0, runs = 0, lastOutside = -1;
     int64_t outsideBlockRuns = 0;
@@ -333,7 +334,7 @@ void calibration(benchmark::State& state, const char* namedQuery = nullptr) {
       if (rejected) outsideBlockRuns += blockRuns;
     }
     state.counters[p + "values"] = (double)reader.numValues();
-    state.counters[p + "present"] = (double)reader.docsWithValue();
+    state.counters[p + "present"] = (double)reader.docsWithField();
     state.counters[p + "outside"] = (double)outside;
     state.counters[p + "inside"] = (double)inside;
     state.counters[p + "cross"] = (double)(reader.numValues() - outside - inside);

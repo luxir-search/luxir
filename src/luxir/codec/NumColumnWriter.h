@@ -4,19 +4,23 @@
 #pragma once
 #include "luxir/codec/NumBlockCodec.h"
 #include "luxir/codec/StreamVByte.h"
+#include "luxir/reader/FieldStats.h"
 
 namespace luxir {
 
 static_assert(SVB_OVERREAD_PAD >= LinearPack::TAIL_PAD);
 
 // Shared physical writer for generic and monotonic numeric columns. Callers
-// choose whether to persist zone metadata and the column-wide bounds trailer.
+// choose whether to persist zone metadata. The finish result carries extrema.
 class NumColumnWriter {
 public:
   struct FinishData {
     int64_t columnLoc;
     int64_t columnMetaOff;
     int64_t numValues;
+    uint64_t blocksBytes;
+    uint64_t indexBytes;
+    field_parts::ScalarBounds bounds;
   };
 
 private:
@@ -81,25 +85,18 @@ public:
     }
   }
 
-  size_t columnStart() const {
-    return colStart;
-  }
-
-  seg_location columnLocation() const {
-    return seg_location(out.streamNumber, colStart);
-  }
-
-  FinishData finish(bool writeZones, bool writeBounds) {
+  FinishData finish(bool writeZones) {
     assert(!finished);
-    assert(!writeBounds || writeZones);
     assert(!writeZones || zonesEnabled);
     if (!values.empty()) {
       addBlock(values);
       values.clear();
     }
 
+    uint64_t blocksBytes = out.size() - colStart;
+    auto indexOffset = NumColumnFormat::indexOffset(out.size());
     out.align(MAX_ALIGN);
-    int64_t metaOff = out.size() - colStart;
+    int64_t metaOff = indexOffset - colStart;
     if (!blockInfo.empty()) {
       out.write(blockInfo.data(), blockInfo.size() * sizeof(NumBlockInfo));
     }
@@ -114,8 +111,7 @@ public:
       // max descending, then the value sketch (NumColumnFormat::
       // ValueSketcher) as a uint32 count (0 for a column written without
       // one) and that many (rank, value) int64 pairs. Readers locate all of
-      // them from the block count and ceil(numValues / LEAF_ZONE_SIZE), and
-      // the bounds trailer after them.
+      // them from the block count and ceil(numValues / LEAF_ZONE_SIZE).
       if (!leafZones.empty()) {
         assert((int64_t)leafZones.size()
                == (nAdded + NumColumnFormat::LEAF_ZONE_SIZE - 1)
@@ -136,16 +132,9 @@ public:
                   sketch.size() * sizeof(NumColumnFormat::SketchPoint));
       }
     }
-    if (writeBounds) {
-      if (nAdded == 0) {
-        overallMin = 0;
-        overallMax = 0;
-      }
-      out.writeVlong(overallMin);
-      out.writeVlong(overallMax);
-    }
+    uint64_t indexBytes = out.size() - colStart - metaOff;
     finished = true;
-    return {(int64_t)colStart, metaOff, nAdded};
+    return {(int64_t)colStart, metaOff, nAdded, blocksBytes, indexBytes, {overallMin, overallMax}};
   }
 };
 

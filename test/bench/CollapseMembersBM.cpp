@@ -7,7 +7,7 @@
 #include "test/SchemaBuilder.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/reader/SkipStats.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/FieldCursor.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -176,7 +176,7 @@ static void BM_CollapseMembers(benchmark::State& state, int mode) {
     if (numeric) for (auto& segment : reader->segments()) {
       auto* info = key.at(segment);
       ASSERT_NE(nullptr, info);
-      ASSERT_NE(0, info->pointsMetaOff);
+      ASSERT_NE(nullptr, info->points());
       state.counters["point_segments"] += 1;
     }
     auto* cache = reader->filterCache();

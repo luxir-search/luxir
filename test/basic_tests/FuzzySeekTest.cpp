@@ -127,7 +127,7 @@ std::vector<Match> collectBrute(TestField& field, std::string_view prefix,
                                 std::string_view suffix, int k, bool prefixMode) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
-  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
   FuzzyTermsEnum e(guard.pool(), te, prefix, suffix, k, prefixMode);
   std::vector<Match> out;
   while (e.next()) {
@@ -143,7 +143,7 @@ std::vector<Match> collectSeek(TestField& field, std::string_view prefix,
                                int64_t* jumps = nullptr) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
-  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
   FuzzySeekEnum e(guard.pool(), te, prefix, suffix, k, prefixMode);
   std::vector<Match> out;
   while (e.next()) {

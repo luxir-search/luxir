@@ -28,7 +28,6 @@
 #include <omp.h>
 
 #include "luxir/util/Signal.h"
-#include "luxir/reader/FieldReader.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/store/InputStream.h"
@@ -248,8 +247,8 @@ void appendTrainingVectors(std::vector<float>& sample, int64_t sampleCap,
                            int64_t segmentGlobalStart,
                            VectorReader& vr,
                            int32_t dims) {
-  int64_t numVals = vr.numVectors();
-  int64_t segmentGlobalEnd = segmentGlobalStart + numVals;
+  int64_t numVectors = vr.numVectors();
+  int64_t segmentGlobalEnd = segmentGlobalStart + numVectors;
   while (nextSampleOrd < sampleCap) {
     int64_t targetGlobal = (nextSampleOrd * ntotal) / sampleCap;
     if (targetGlobal >= segmentGlobalEnd) break;
@@ -272,11 +271,9 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
     auto& pr = *seg.postingsReader;
     MemPool pool;
     auto* info = pr.fieldInfo(fieldName);
-    if (!info) continue;
-    const auto& fi = *info;
-    if (FieldType::storage(fi.type) != FieldType::Storage::VECTOR) continue;
+    if (!info || !info->bytesColumn() || FieldType::storage(info->type) != FieldType::Storage::VECTOR) continue;
 
-    VectorReader vr(pr, fi);
+    VectorReader vr(pr, *info);
     int32_t segDims = vr.dims();
     if (segDims <= 0) continue;
     if (dims == 0) {
@@ -352,13 +349,11 @@ VectorIndexBuilder::collectEligibleFields() {
   // Collect field names typed VECTOR from every segment.
   std::unordered_set<std::string> seen;
   for (auto& seg : segments_) {
-    MemPool pool;
-    FieldReader fr(*seg.postingsReader);
-    while (fr.readNextField()) {
-      SegFieldInfo fi;
-      fr.readFieldInfo(fi);
-      if (FieldType::storage(fi.type) == FieldType::Storage::VECTOR) {
-        seen.emplace((std::string_view)fr.name());
+    auto& reader = *seg.postingsReader;
+    for (int32_t ordinal = 0; ordinal < reader.numFields(); ++ordinal) {
+      auto header = reader.fieldHeader(ordinal);
+      if (header.parts.has(FieldPart::COLUMN) && header.type == FieldType::VECTOR) {
+        seen.emplace(std::string_view(header.name));
       }
     }
   }
@@ -372,7 +367,7 @@ VectorIndexBuilder::collectEligibleFields() {
     if (!vft->knnSearchable()) continue;
     // Multi-valued vectors are indexed too: every value is added to FAISS, and the
     // query layer maps each FAISS id back to its owning doc via the valueRank->docId
-    // column (StrColReader::getValDocReader).
+    // column (StrColReader::ownerIndex).
     out.emplace_back(name, vft);
   }
   // Sort for stable AuxIndexInfo ordering across rebuilds (eases diffs/tests).

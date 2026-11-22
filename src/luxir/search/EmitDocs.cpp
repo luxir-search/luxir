@@ -147,7 +147,7 @@ bool appendMappedSelector(SearchRequest& req, IndexReader& reader, std::string_v
     std::set<std::string_view> paths;
     for (const auto& leaf : child.segments()) {
       for (const auto& space : leaf.segmentCore().spaces()) {
-        if (spaceParentPath(space.path) == child.path()) paths.insert(space.path);
+        if (spaceParentPath(space.path) == child.path()) paths.emplace(space.path);
       }
     }
     for (auto path : paths) {

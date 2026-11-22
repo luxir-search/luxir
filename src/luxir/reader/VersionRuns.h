@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "ReaderErrors.h"
 #include <ranges>
 #include <stdexcept>
 #include "luxir/codec/NumColumn.h"
@@ -96,27 +97,32 @@ struct VersionAffinePrefix {
 class VersionRuns {
   const char* data = nullptr;
   const VersionBlockDirectory* directory = nullptr;
-  uint32_t count_ = 0;
-  int32_t maxDoc_ = 0;
-  uint64_t bytes_ = 0;
+  uint32_t count = 0;
+  int32_t maxDoc = 0;
+  uint64_t bytes = 0;
   bool dense = true;
   VersionAffinePrefix affine;
 
-  static void invalid() { throw std::runtime_error("Invalid request-version run coverage or encoding"); }
-
 public:
+  static bool validSlice(uint64_t start, uint64_t bytes, uint64_t trailerOffset) noexcept {
+    return start % MAX_ALIGN == 0 && trailerOffset % MAX_ALIGN == 0
+        && trailerOffset <= bytes && bytes - trailerOffset == sizeof(VersionRunsHeader);
+  }
+
+
   static constexpr uint32_t ENCODING = 2;
   // Bound the uncompressed tail to 3 KiB per inverter while amortizing the
   // block descriptors on one-document requests.
   static constexpr uint32_t BLOCK_SIZE = 256;
   VersionRuns() = default;
-  VersionRuns(const char* file, size_t fileSize, size_t headerOffset, uint32_t count, int32_t maxDoc);
+  VersionRuns(const char* file, size_t fileSize, size_t headerOffset, uint32_t count, int32_t maxDoc,
+              SegmentReadContext context = SegmentReadContext());
 
-  size_t size() const { return count_; }
-  size_t byteSize() const { return bytes_; }
-  uint32_t numBlocks() const { return (count_ + BLOCK_SIZE - 1) / BLOCK_SIZE; }
+  size_t size() const { return count; }
+  size_t byteSize() const { return bytes; }
+  uint32_t numBlocks() const { return (count + BLOCK_SIZE - 1) / BLOCK_SIZE; }
   VersionBlock block(uint32_t index) const {
-    return {data + directory[index].offset, std::min(BLOCK_SIZE, count_ - index * BLOCK_SIZE)};
+    return {data + directory[index].offset, std::min(BLOCK_SIZE, count - index * BLOCK_SIZE)};
   }
   VersionRun run(size_t index) const {
     auto view = block((uint32_t)index / BLOCK_SIZE);
@@ -142,7 +148,7 @@ public:
   public:
     explicit Cursor(const VersionRuns& source) : source(source) {}
     LUXIR_INLINE uint64_t birth(int32_t docId) {
-      if (docId < 0 || docId >= source.maxDoc_) {
+      if (docId < 0 || docId >= source.maxDoc) {
         throw std::runtime_error("Document has no request birth version");
       }
       uint32_t doc = (uint32_t)docId;
@@ -153,7 +159,7 @@ public:
 
   private:
     LUXIR_NOINLINE uint64_t lookupBirth(uint32_t doc) {
-      if (source.dense && doc < source.count_) {
+      if (source.dense && doc < source.count) {
         if (doc < decodedFirst || doc >= decodedEnd) {
           uint32_t n;
           uint32_t block = doc / BLOCK_SIZE;
@@ -176,7 +182,7 @@ public:
       first = block.start(runIndex);
       end = runIndex + 1 < block.size() ? block.start(runIndex + 1)
           : blockIndex + 1 < source.numBlocks() ? source.directory[blockIndex + 1].firstDocId
-          : (uint32_t)source.maxDoc_;
+          : (uint32_t)source.maxDoc;
       if (frameBlock != blockIndex || runIndex < frameStart || runIndex >= frameEnd) {
         uint32_t n;
         frameStart = block.versions().decodeFrame(runIndex, values, n);
@@ -214,8 +220,9 @@ public:
 };
 
 inline VersionRuns::VersionRuns(const char* file, size_t fileSize, size_t headerOffset,
-                                uint32_t count, int32_t maxDoc)
-    : count_(count), maxDoc_(maxDoc) {
+                                uint32_t count, int32_t maxDoc, SegmentReadContext context)
+    : count(count), maxDoc(maxDoc) {
+  auto invalid = [&] { context.invalid("Invalid request-version run coverage or encoding"); };
   if (headerOffset > fileSize || fileSize - headerOffset < sizeof(VersionRunsHeader)
       || ((uintptr_t)(file + headerOffset) & 7) || maxDoc <= 0 || !count || count > (uint32_t)maxDoc) invalid();
   const auto& header = *(const VersionRunsHeader*)(file + headerOffset);
@@ -225,7 +232,7 @@ inline VersionRuns::VersionRuns(const char* file, size_t fileSize, size_t header
       || (header.directoryOffset & 7)
       || header.directoryOffset > header.bytes
       || (uint64_t)numBlocks() * sizeof(VersionBlockDirectory) + sizeof(header) != header.bytes - header.directoryOffset) invalid();
-  bytes_ = header.bytes;
+  bytes = header.bytes;
   directory = (const VersionBlockDirectory*)(data + header.directoryOffset);
   uint32_t previous = 0;
   for (uint32_t i = 0; i < numBlocks(); i++) {
@@ -244,10 +251,10 @@ inline VersionRuns::VersionRuns(const char* file, size_t fileSize, size_t header
       if ((!info.forPacked() && bits != NumBlockInfo::RAW_BITS) || !info.gcd
           || (monotonic && info.gcd != 1)) invalid();
       uint64_t payload = info.payloadOffset();
-      uint64_t bytes = info.forPacked() ? LinearPack::packedByteSize(view.size(), bits)
+      uint64_t payloadBytes = info.forPacked() ? LinearPack::packedByteSize(view.size(), bits)
           : (uint64_t)view.size() * 8;
       if (payload < metaSize || payload > limit - entry.offset
-          || bytes + LinearPack::TAIL_PAD > limit - entry.offset - payload) invalid();
+          || payloadBytes + LinearPack::TAIL_PAD > limit - entry.offset - payload) invalid();
     };
     check(bh.versions, false);
     if (bh.step) {

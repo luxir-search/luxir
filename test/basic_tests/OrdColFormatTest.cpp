@@ -90,9 +90,12 @@ void verifyPredictedShape(bool descending, bool jitter) {
     ASSERT_EQ(expected[doc], field.ord());
   }
   ASSERT_EQ(-1, field.nextDoc());
-  EXPECT_EQ(SegFieldInfo::ORD_PREDICTED, field.fieldInfo.ordFormat);
-  EXPECT_EQ(SegFieldInfo::ORD_DOCID, field.fieldInfo.ordIndexing);
-  EXPECT_EQ(13, field.fieldInfo.ordBits);
+  EXPECT_EQ(field_parts::OrdMode::PREDICTED, field.fieldInfo().ordColumn()->mode);
+  EXPECT_EQ(field_parts::OrdIndexing::DOC_ID, field.fieldInfo().ordColumn()->indexing);
+  EXPECT_EQ(13, OrdColumnFormat::width(field.fieldInfo().indexedTotals().numTerms));
+  if (!jitter) {
+    EXPECT_EQ(0u, field.fieldInfo().ordColumn()->valuesBytes);
+  }
 }
 
 std::vector<char> encodeDocOrds(int32_t count, uint8_t bits) {
@@ -121,8 +124,8 @@ TEST_F(OrdColFormatTest, directDocIdAndRankShapes) {
     index.flush();
     field.startReading();
     ASSERT_EQ(0, field.nextDoc());
-    EXPECT_EQ(SegFieldInfo::ORD_DIRECT, field.fieldInfo.ordFormat);
-    EXPECT_EQ(SegFieldInfo::ORD_DOCID, field.fieldInfo.ordIndexing);
+    EXPECT_EQ(field_parts::OrdMode::DIRECT, field.fieldInfo().ordColumn()->mode);
+    EXPECT_EQ(field_parts::OrdIndexing::DOC_ID, field.fieldInfo().ordColumn()->indexing);
   }
   {
     TestIndex index;
@@ -133,8 +136,8 @@ TEST_F(OrdColFormatTest, directDocIdAndRankShapes) {
     index.flush();
     field.startReading();
     ASSERT_EQ(1, field.nextDoc());
-    EXPECT_EQ(SegFieldInfo::ORD_DIRECT, field.fieldInfo.ordFormat);
-    EXPECT_EQ(SegFieldInfo::ORD_RANK, field.fieldInfo.ordIndexing);
+    EXPECT_EQ(field_parts::OrdMode::DIRECT, field.fieldInfo().ordColumn()->mode);
+    EXPECT_EQ(field_parts::OrdIndexing::RANK, field.fieldInfo().ordColumn()->indexing);
   }
 }
 
@@ -148,21 +151,21 @@ TEST_F(OrdColFormatTest, declaredMultiObservedSingleUsesDocIdWithoutMono) {
   index.flush();
   field.startReading();
   ASSERT_EQ(0, field.nextDoc());
-  EXPECT_EQ(SegFieldInfo::ORD_DOCID, field.fieldInfo.ordIndexing);
-  EXPECT_EQ(0u, field.fieldInfo.monoLoc.offset());
+  EXPECT_EQ(field_parts::OrdIndexing::DOC_ID, field.fieldInfo().ordColumn()->indexing);
+  EXPECT_FALSE(field.fieldInfo().endValueRanks());
   ASSERT_FALSE(field.ordReader->multiValued());
 
   std::vector<int32_t> sortedDocs = {0, 1};
   int32_t calls = 0;
-  OrdColReader::getValues(index.pool, field.currentSegment()->postingsReader(),
-                          field.fieldInfo, sortedDocs,
+  OrdColReader::getValues(field.currentSegment()->postingsReader(),
+                          field.fieldInfo(), sortedDocs,
       [&](size_t inputIndex, int32_t doc, int32_t ord,
-          int64_t valIdx, int64_t numVals) {
+          int64_t valIdx, int64_t numValues) {
         EXPECT_EQ((size_t)calls, inputIndex);
         EXPECT_EQ(calls, doc);
         EXPECT_EQ(calls + 1, ord);
         EXPECT_EQ(0, valIdx);
-        EXPECT_EQ(1, numVals);
+        EXPECT_EQ(1, numValues);
         calls++;
       });
   EXPECT_EQ(2, calls);
@@ -178,7 +181,7 @@ TEST_F(OrdColFormatTest, columnShapeSeeksInAnyOrder) {
   index.flush();
   field.startReading();
   ASSERT_EQ(1, field.nextDoc());
-  ColumnShape shape(field.currentSegment()->postingsReader(), field.fieldInfo);
+  ColumnShape shape(field.currentSegment()->postingsReader(), field.fieldInfo());
   ASSERT_TRUE(shape.multiValued());
   ColumnShape::Cursor cursor(shape);
   auto count = [&](int32_t doc) { return cursor.seek(doc) ? cursor.count() : -1; };
@@ -199,7 +202,7 @@ TEST_F(OrdColFormatTest, columnShapeSeeksInAnyOrder) {
   denseIndex.flush();
   dense.startReading();
   ASSERT_EQ(0, dense.nextDoc());
-  ColumnShape denseShape(dense.currentSegment()->postingsReader(), dense.fieldInfo);
+  ColumnShape denseShape(dense.currentSegment()->postingsReader(), dense.fieldInfo());
   ColumnShape::Cursor denseCursor(denseShape);
   EXPECT_TRUE(denseCursor.seek(2));
   EXPECT_TRUE(denseCursor.seek(0));
@@ -216,8 +219,8 @@ TEST_F(OrdColFormatTest, observedMultiUsesRankAndMono) {
   index.flush();
   field.startReading();
   ASSERT_EQ(0, field.nextDoc());
-  EXPECT_EQ(SegFieldInfo::ORD_RANK, field.fieldInfo.ordIndexing);
-  EXPECT_NE(0u, field.fieldInfo.monoLoc.offset());
+  EXPECT_EQ(field_parts::OrdIndexing::RANK, field.fieldInfo().ordColumn()->indexing);
+  EXPECT_TRUE(field.fieldInfo().endValueRanks());
   EXPECT_TRUE(field.ordReader->multiValued());
 }
 
@@ -232,7 +235,7 @@ TEST_F(OrdColFormatTest, bitWidthOneAndThirtyTwoDecode) {
     index.flush();
     field.startReading();
     ASSERT_EQ(0, field.nextDoc());
-    EXPECT_EQ(1, field.fieldInfo.ordBits);
+    EXPECT_EQ(1, OrdColumnFormat::width(field.fieldInfo().indexedTotals().numTerms));
     EXPECT_EQ(1, field.ord());
   }
 
@@ -348,7 +351,7 @@ TEST_F(OrdColFormatTest, rankIndexedArrayDomainAlwaysUsesPointOrds) {
   index.flush();
   field.startReading();
   ASSERT_EQ(0, field.nextDoc());
-  ASSERT_EQ(SegFieldInfo::ORD_RANK, field.fieldInfo.ordIndexing);
+  ASSERT_EQ(field_parts::OrdIndexing::RANK, field.fieldInfo().ordColumn()->indexing);
   ASSERT_TRUE(field.ordReader->multiValued());
 
   ArrDocSet domain(std::vector<int32_t>{0, 1, 2, 4, 5});
@@ -382,7 +385,7 @@ TEST_F(OrdColFormatTest, rankIndexedBitAndAllDomainsKeepFixedBulkOrds) {
   index.flush();
   field.startReading();
   ASSERT_EQ(0, field.nextDoc());
-  ASSERT_EQ(SegFieldInfo::ORD_RANK, field.fieldInfo.ordIndexing);
+  ASSERT_EQ(field_parts::OrdIndexing::RANK, field.fieldInfo().ordColumn()->indexing);
   ASSERT_TRUE(field.ordReader->multiValued());
 
   RAMBitDocSet domain(6);
@@ -465,12 +468,11 @@ TEST_F(OrdColFormatTest, batchedOrdWalkMatchesPerDocValues) {
       index.flush();
       field.startReading();
       ASSERT_GE(field.nextDoc(), 0);
-      ASSERT_EQ(shape == Shape::DOCID ? SegFieldInfo::ORD_DOCID
-                                      : SegFieldInfo::ORD_RANK,
-                field.fieldInfo.ordIndexing);
-      ASSERT_EQ(format == OrdColWriter::FormatOverride::PREDICTED
-                    ? SegFieldInfo::ORD_PREDICTED : SegFieldInfo::ORD_DIRECT,
-                field.fieldInfo.ordFormat);
+      ASSERT_EQ(shape == Shape::DOCID ? field_parts::OrdIndexing::DOC_ID
+                                      : field_parts::OrdIndexing::RANK,
+                field.fieldInfo().ordColumn()->indexing);
+      ASSERT_EQ(format == OrdColWriter::FormatOverride::PREDICTED,
+                field.fieldInfo().ordColumn()->mode == field_parts::OrdMode::PREDICTED);
       ASSERT_EQ(shape == Shape::MULTI, field.ordReader->multiValued());
       PostingsReader& postings = field.currentSegment()->postingsReader();
       int32_t maxDoc = postings.maxDoc();
@@ -481,7 +483,7 @@ TEST_F(OrdColFormatTest, batchedOrdWalkMatchesPerDocValues) {
         Values values;
         int32_t lastDoc = -1;
         int64_t withValue = 0;
-        OrdColReader::getValues(index.pool, postings, field.fieldInfo, docs,
+        OrdColReader::getValues(postings, field.fieldInfo(), docs,
             [&](size_t, int32_t doc, int32_t ord, int64_t, int64_t) {
               if (ord == 0) return;
               values.emplace_back(doc, (int64_t)ord - 1);
@@ -655,7 +657,7 @@ TEST_F(OrdColFormatTest, automaticSelectionRequiresBothSavingsGates) {
     index.flush();
     field.startReading();
     ASSERT_EQ(0, field.nextDoc());
-    EXPECT_EQ(SegFieldInfo::ORD_DIRECT, field.fieldInfo.ordFormat);
+    EXPECT_EQ(field_parts::OrdMode::DIRECT, field.fieldInfo().ordColumn()->mode);
   }
   {
     TestIndex index;
@@ -665,7 +667,7 @@ TEST_F(OrdColFormatTest, automaticSelectionRequiresBothSavingsGates) {
     index.flush();
     field.startReading();
     ASSERT_EQ(0, field.nextDoc());
-    EXPECT_EQ(SegFieldInfo::ORD_PREDICTED, field.fieldInfo.ordFormat);
+    EXPECT_EQ(field_parts::OrdMode::PREDICTED, field.fieldInfo().ordColumn()->mode);
   }
 }
 
@@ -834,8 +836,8 @@ TEST_F(OrdColFormatTest, indexedStringModesPreserveValuesAndSelectExtrema) {
         auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
         for (auto& segment : reader->segments()) if (auto* info = segment.postingsReader().fieldInfo("value")) {
           EXPECT_EQ(array, (info->flags & FieldType::MULTI_ARRAY) != 0);
-          EXPECT_EQ(format == OrdColWriter::FormatOverride::DIRECT ? SegFieldInfo::ORD_DIRECT : SegFieldInfo::ORD_PREDICTED,
-                    info->ordFormat);
+          EXPECT_EQ(format == OrdColWriter::FormatOverride::PREDICTED,
+                    info->ordColumn()->mode == field_parts::OrdMode::PREDICTED);
         }
         if (!merge) {
           CollectionHelper::UpdateBuilder update;
@@ -943,11 +945,15 @@ TEST_F(OrdColFormatTest, indexedStringWithoutColumnKeepsPostingsOnly) {
   for (int merge = 0; merge < 2; merge++) {
     auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     int32_t withField = 0;
+    int64_t postings = 0;
     for (auto& segment : reader->segments()) if (auto* info = segment.postingsReader().fieldInfo("cells")) {
-      EXPECT_FALSE(info->hasOrdColumn());
+      EXPECT_FALSE(info->hasColumn());
       EXPECT_EQ(0, info->flags & FieldType::COLUMN_STORED);
+      ASSERT_TRUE(info->terms());
+      postings += info->indexedTotals().sumDocFreq;
       withField += info->docsWithField;
     }
+    EXPECT_EQ(merge ? 4 : 5, postings);
     EXPECT_EQ(merge ? 2 : 3, withField);  // the deleted doc leaves at merge
     auto req = localReq(helper.getSearchEngine());
     req->collection("main").topDocs("y").matchQuery("cells", "y").countLimit();
@@ -991,7 +997,7 @@ TEST_F(OrdColFormatTest, indexedStringColumnCanBeDroppedButNotAdded) {
   ASSERT_TRUE(helper.submit(update).success);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
-  EXPECT_FALSE(reader->segments()[0].postingsReader().fieldInfo("tag")->hasOrdColumn());
+  EXPECT_FALSE(reader->segments()[0].postingsReader().fieldInfo("tag")->hasColumn());
   auto exists = localReq(helper.getSearchEngine());
   exists->collection("main").topDocs("q").existsQuery("tag").countLimit();
   exists->execute(false);
@@ -1013,7 +1019,8 @@ TEST_F(OrdColFormatTest, arrayDocumentDedupChargesReusesAndReleasesScratch) {
   ASSERT_TRUE(helper.indexAll({flatdoc("values", values), flatdoc("values", values)}, UpdateMessage::COMMIT).success);
   auto index = helper.getIndexWriter()->snapshots.readers.getReader();
   auto& segment = index->segments()[0];
-  OrdColReader column(segment.postingsReader(), *segment.postingsReader().fieldInfo("values"));
+  const auto& columnInfo = *segment.postingsReader().fieldInfo("values");
+  OrdColReader column(segment.postingsReader(), columnInfo);
   for (size_t ceiling : {SIZE_MAX, size_t{1}}) {
     RequestMemTracker tracker(ceiling);
     {

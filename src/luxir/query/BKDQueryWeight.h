@@ -67,7 +67,7 @@ public:
     float point = (float)(PointSource::BOX_MATCH_COST
         * (1.0 + relation.pointCost().average / PointSource::BOX_TEST_POINTS));
     if (PointSource::onePointPerDoc(reader)) return point;
-    int64_t docs = reader.docsWithValue();
+    int64_t docs = reader.docsWithField();
     return docs > 0 ? point * (float)PointSource::pointCount(reader) / (float)docs : point;
   }
 
@@ -99,9 +99,9 @@ class BKDQueryWeight final : public Query::Weight {
   IndexReader::FieldSegments segInfos;
   float constantScore;
 
-  bool segmentInfo(IndexReader::Segment& segment, const SegFieldInfo*& info) const {
+  bool segmentInfo(IndexReader::Segment& segment, const DecodedFieldRecord*& info) const {
     info = segInfos.at((size_t)segment.ord);
-    return info != nullptr && info->columnLoc.offset() > 0;
+    return info && info->numberColumn();
   }
 
 public:
@@ -116,11 +116,11 @@ public:
   // A BKD count can decode crossing leaves, so probes only report that level;
   // the walk belongs to execution after the supplier has been selected.
   Query::CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
-    const SegFieldInfo* info = nullptr;
+    const DecodedFieldRecord* info = nullptr;
     if (query.isEmpty() || !segmentInfo(segment, info) || PointSource::pointCount(*info) == 0) {
       return {0, Query::CountHow::METADATA};
     }
-    auto how = info->pointsMetaOff != 0 && PointSource::onePointPerDoc(*info)
+    auto how = info->points() && PointSource::onePointPerDoc(*info)
         ? Query::CountHow::INDEX_WALK : Query::CountHow::ITERATE;
     auto shortcut = Query::countBound(segment, domain, info->docsWithField, how);
     if (shortcut.how == Query::CountHow::INDEX_WALK) shortcut.resolver = this;
@@ -226,7 +226,7 @@ public:
       bool exposure = fillsExposedWindows(context);
       if (bkd != nullptr && (exposure || demand.expectedCandidates >= 0)) {
         double candidates = exposure ? (double)demand.candidates
-            : std::min(demand.expectedCandidates, (double)reader.docsWithValue());
+            : std::min(demand.expectedCandidates, (double)reader.docsWithField());
         return PointsMaterialize::verifyPrice(candidates, demand, verifyPoints())
                 <= bkdPrice()
             ? ScorerArm::SPARSE_VERIFY : ScorerArm::BKD;
@@ -307,7 +307,7 @@ public:
           reader(reader), bkd(bkd),
           relation(weight.query.makeRelation()),
           estimatedCost((int64_t)std::min<uint64_t>(
-              estimate.estimatedCount, (uint64_t)reader.docsWithValue())),
+              estimate.estimatedCount, (uint64_t)reader.docsWithField())),
           materializeUpperBound(estimate.upperBound),
           crossingPoints(estimate.crossingPoints) {}
 
@@ -337,7 +337,7 @@ public:
       ScorerArm arm = selectScorerArm(planContext);
       // Verifying and scanning arms iterate every document with a value.
       int64_t iterated = arm == ScorerArm::BKD ? cost()
-          : std::max(cost(), (int64_t)reader.docsWithValue());
+          : std::max(cost(), (int64_t)reader.docsWithField());
       return planPool.make<Plan>(
           *this, planContext, shapeFor(arm, checkPrice()), iterated, arm);
     }
@@ -398,15 +398,15 @@ public:
       Query::SupplierExecutionMode executionMode) override {
     unused(executionMode);
     if (query.isEmpty()) return nullptr;
-    const SegFieldInfo* info = nullptr;
+    const DecodedFieldRecord* info = nullptr;
     if (!segmentInfo(segment, info)) return nullptr;
     auto* reader = PointSource::openColumn(
         targetPool, segment.postingsReader(), *info, QueryType::QUERY_NAME);
     if (PointSource::pointCount(*reader) == 0) return nullptr;
     Reader* bkd = nullptr;
     typename Reader::EstimateResult estimate{
-        (uint64_t)reader->docsWithValue(), PointSource::pointCount(*reader)};
-    if (info->pointsMetaOff != 0) {
+        (uint64_t)reader->docsWithField(), PointSource::pointCount(*reader)};
+    if (info->points()) {
       bkd = targetPool.make<Reader>(segment.postingsReader(), *info);
       if (bkd->pointCount() != PointSource::pointCount(*reader)) {
         throw std::runtime_error(std::string(QueryType::QUERY_NAME)
@@ -434,7 +434,7 @@ public:
   Query::Scorer* createScanScorerForTests(
       MemPool& targetPool, IndexReader::Segment& segment) {
     if (query.isEmpty()) return nullptr;
-    const SegFieldInfo* info = nullptr;
+    const DecodedFieldRecord* info = nullptr;
     if (!segmentInfo(segment, info)) return nullptr;
     auto* reader = PointSource::openColumn(
         targetPool, segment.postingsReader(), *info, QueryType::QUERY_NAME);

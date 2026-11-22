@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
+#include <expected>
 #include <stdexcept>
+#include <utility>
 #include "luxir/util/StrRef.h"
 #include "luxir/util/encoding.h"
 
@@ -13,6 +16,13 @@ class InputStream {
   const char *pos = nullptr;  // these initializations just to suppress maybe-uninitialized warnings with -O3
   const char *start = nullptr;
   const char *end = nullptr;
+  [[noreturn]] static void invalidVlong(const char* reason) {
+    throw std::runtime_error(std::string("invalid index vint: ") + reason);
+  }
+  [[noreturn]] static void truncated() {
+    throw std::runtime_error("index data is truncated or in an unsupported format");
+  }
+
   // Future?
   // size_t offset; // the position of "start" in the file?
   //                // Or perhaps InputStream should always be a 0 based view, and reads should go back to the File?
@@ -69,10 +79,10 @@ public:
 
   inline static uint32_t readVint(const char *&pos, const char *end) {
     char b = *pos++;
-    uint32_t val = b & 0x7f;
-    for (int shift = 7; (b & 0x80) != 0; shift += 7) {
+    uint32_t val = b & VARINT_PAYLOAD_MASK;
+    for (int shift = VARINT_PAYLOAD_BITS; (b & VARINT_CONTINUATION) != 0; shift += VARINT_PAYLOAD_BITS) {
       b = *pos++;
-      val |= uint32_t(b & 0x7f) << shift;
+      val |= uint32_t(b & VARINT_PAYLOAD_MASK) << shift;
     }
     assert(pos <= end);
     return val;
@@ -80,10 +90,10 @@ public:
 
   inline static uint64_t readVlong(const char *&pos, const char *end) {
     char b = *pos++;
-    uint64_t val = b & 0x7f;
-    for (int shift = 7; (b & 0x80) != 0; shift += 7) {
+    uint64_t val = b & VARINT_PAYLOAD_MASK;
+    for (int shift = VARINT_PAYLOAD_BITS; (b & VARINT_CONTINUATION) != 0; shift += VARINT_PAYLOAD_BITS) {
       b = *pos++;
-      val |= uint64_t(b & 0x7f) << shift;
+      val |= uint64_t(b & VARINT_PAYLOAD_MASK) << shift;
     }
     assert(pos <= end);
     return val;
@@ -111,22 +121,22 @@ public:
 
   uint32_t readVint() {
     char b = readByte();
-    uint32_t val = b & 0x7f;
+    uint32_t val = b & VARINT_PAYLOAD_MASK;
     // TODO: try replacing with a loop to 4 (to avoid running long if data is bad)
-    for (int shift = 7; (b & 0x80) != 0; shift += 7) {
+    for (int shift = VARINT_PAYLOAD_BITS; (b & VARINT_CONTINUATION) != 0; shift += VARINT_PAYLOAD_BITS) {
       b = readByte();
-      val |= uint32_t(b & 0x7f) << shift;
+      val |= uint32_t(b & VARINT_PAYLOAD_MASK) << shift;
     }
     return val;
   }
 
   uint64_t readVlong() {
     char b = readByte();
-    uint64_t val = b & 0x7f;
+    uint64_t val = b & VARINT_PAYLOAD_MASK;
     // TODO: try a loop to 8 (to avoid running long if data is bad)
-    for (int shift = 7; (b & 0x80) != 0; shift += 7) {
+    for (int shift = VARINT_PAYLOAD_BITS; (b & VARINT_CONTINUATION) != 0; shift += VARINT_PAYLOAD_BITS) {
       b = readByte();
-      val |= uint64_t(b & 0x7f) << shift;
+      val |= uint64_t(b & VARINT_PAYLOAD_MASK) << shift;
     }
     return val;
   }
@@ -153,10 +163,8 @@ public:
     assert(pos <= end);
   }
 
-  // The returned PackedTerm points into this InputStream.
-  // NOTE: if we create other implementations that read chunk-at-a-time, then this PackedTerm
-  // could either be split or later invalidated by more reads on the InputStream.  This won't
-  // happen for memory-mapped files or for RAMDir.
+  // The returned PackedTerm borrows the bytes backing this stream. A chunked
+  // InputStream could split the term across chunks or invalidate it on a later read.
   PackedTerm readPackedTerm() {
     PackedTerm term(const_cast<char *>(pos));
     pos += term.memorySize();
@@ -172,12 +180,10 @@ public:
     return T::read(*this);
   }
 
-  // Bounds-checked reads for the metadata a reader decodes before trusting a
-  // file (segment info, field catalog). The reads above only assert, which a
-  // release build compiles out, so a truncated file or one in another format
-  // would read past the mapping.
+  // Check lengths before reading untrusted metadata. The fast reads above
+  // rely on a validated layout and use debug assertions.
   void require(int64_t len) const {
-    if (len < 0 || len > left()) throw std::runtime_error("index data is truncated or in an unsupported format");
+    if (len < 0 || len > left()) truncated();
   }
 
   int32_t checkedInt() {
@@ -185,25 +191,58 @@ public:
     return readInt();
   }
 
-  uint64_t checkedVlong(int maxBytes = 10) {
-    uint64_t val = 0;
-    for (int i = 0; i < maxBytes; i++) {
-      require(1);
-      char b = *pos++;
-      val |= uint64_t(b & 0x7f) << (7 * i);
-      if ((b & 0x80) == 0) return val;
+private:
+  enum class VintForm { PERMISSIVE, CANONICAL };
+
+  std::expected<uint64_t, const char*> tryVlong(int maxBytes, uint64_t limit, VintForm form) {
+    constexpr auto MAX_LAST_BYTE = UINT64_MAX >> ((MAX_VLONG_SIZE - 1) * VARINT_PAYLOAD_BITS);
+    uint64_t value = 0;
+    int bytes = std::min(maxBytes, MAX_VLONG_SIZE);
+    for (int i = 0; i < bytes; ++i) {
+      if (pos == end) return std::unexpected("truncated input");
+      auto next = (uint8_t)*pos++;
+      if (i == MAX_VLONG_SIZE - 1 && next > MAX_LAST_BYTE) return std::unexpected("vint overflow");
+      auto payload = next & VARINT_PAYLOAD_MASK;
+      value |= (uint64_t)payload << (i * VARINT_PAYLOAD_BITS);
+      if (!(next & VARINT_CONTINUATION)) {
+        if (value > limit) return std::unexpected("invalid vint: value exceeds limit");
+        if (form == VintForm::CANONICAL && i && !payload) return std::unexpected("invalid vint: noncanonical form");
+        return value;
+      }
     }
-    throw std::runtime_error("index data has an invalid variable-length integer");
+    return std::unexpected("overlong vint");
+  }
+
+public:
+  std::expected<uint64_t, const char*> readCanonicalVlong(uint64_t limit) {
+    return tryVlong(MAX_VLONG_SIZE, limit, VintForm::CANONICAL);
+  }
+
+  uint64_t checkedVlong(int maxBytes = MAX_VLONG_SIZE) {
+    auto value = tryVlong(maxBytes, UINT64_MAX, VintForm::PERMISSIVE);
+    if (!value) invalidVlong(value.error());
+    return *value;
+  }
+
+  std::expected<uint64_t, const char*> tryVint() {
+    return tryVlong(MAX_VINT_SIZE, UINT32_MAX, VintForm::PERMISSIVE);
   }
 
   uint32_t checkedVint() {
-    return (uint32_t)checkedVlong(5);
+    auto value = tryVint();
+    if (!value) invalidVlong(value.error());
+    return (uint32_t)*value;
+  }
+
+  PackedTerm tryPackedTerm() {
+    if (left() < 1 || PackedTerm(const_cast<char *>(pos)).memorySize() > left()) return PackedTerm(nullptr);
+    return readPackedTerm();
   }
 
   PackedTerm checkedPackedTerm() {
-    require(1);
-    require(PackedTerm(const_cast<char *>(pos)).memorySize());
-    return readPackedTerm();
+    auto term = tryPackedTerm();
+    if (term.isNull()) truncated();
+    return term;
   }
 
   friend std::ostream &operator<<(std::ostream &out, const InputStream &is) {

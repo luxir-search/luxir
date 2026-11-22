@@ -22,13 +22,13 @@ class FullTextHandler : public Inverter::IndexHandler {
   TermValHash<DocFreqPosStream> termsHash; // the set of terms contained in this field
   std::unique_ptr<TokenChain> tokenChain;
   Stream normBytes;
-  DocStream normDocsWithField;
-  int32_t numDocsWithField = 0;
+  DocStream docs;
+  int32_t docsWithField = 0;
 public:
   FullTextHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space),
       termsHash(inverter.pool, 4),
-      normDocsWithField(inverter.pool) {
+      docs(inverter.pool) {
 
     // Future optimization: cache the analyzer for the type if it isn't field-specific
     // This can help with memory consumption when the same analyzer can be used for many fields.
@@ -151,8 +151,8 @@ private:
     // mis-scores docs over 40 tokens and wraps mod 256 above 255.
     uint8_t encodedNorm = SmallFloat::intToByte4(numTokens);
     normBytes.writeByte(inverter.pool, encodedNorm);
-    normDocsWithField.addDoc(inverter.pool, inverter.getDoc());
-    numDocsWithField++;
+    docs.addDoc(inverter.pool, inverter.getDoc());
+    docsWithField++;
 
     // termsHash values (posting streams) live in inverter.pool; only its heap table
     // is outside-pool. Account the table growth (usually a no-op: it rehashes rarely).
@@ -166,23 +166,23 @@ public:
 
   void flushPositions(Inverter& inverter) {
     auto sz = termsHash.size();
-    if (numDocsWithField == 0) return;
+    if (docsWithField == 0) return;
 
     // Sorting terms per field could run in parallel across fields.
     auto terms = sortForFlush(inverter, termsHash);
 
     PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(space, fieldName);
-    fieldInfo.type = fieldType->type();
-    fieldInfo.flags = fieldType->segmentFlags();
-    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
+    fieldInfo.header.type = fieldType->type();
+    fieldInfo.header.flags = fieldType->segmentFlags();
+    fieldInfo.header.typeParameters = fieldType->segmentTypeParameters();
 
     auto preparedNorms = NormsWriter::prepare(inverter.pool, inverter.getPostingsWriter(),
-                                              fieldInfo, normBytes, normDocsWithField,
-                                              numDocsWithField);
+                                              space, normBytes, docs,
+                                              docsWithField);
     {
       // Either reduce the resource for these, or share across different fields (in the same thread)
       TextWriter textWriter(inverter.getPostingsWriter());
-      textWriter.startField(&fieldInfo);
+      textWriter.startField(space, fieldInfo);
       textWriter.setNorms(preparedNorms.textView());
       for (size_t tnum = 0; tnum < sz; tnum++) {
         auto term = terms[tnum];
@@ -191,12 +191,15 @@ public:
         term.val().pushDocs(inverter.pool, textWriter);
         textWriter.endTerm(term);
       }
-      textWriter.endField();
+      fieldInfo.setPostings(textWriter.endField());
     }
     termsHash.free();  // free up memory early.
 
-    NormsWriter::writeValues(inverter.pool, inverter.getPostingsWriter(), fieldInfo,
-                             preparedNorms, normDocsWithField);
+    fieldInfo.setPresence(preparedNorms.presence);
+    if (auto norms = NormsWriter::writeValues(inverter.pool, inverter.getPostingsWriter(),
+                                              preparedNorms, docs)) {
+      fieldInfo.setNorms(*norms);
+    }
   }
 
 };

@@ -20,20 +20,20 @@
 
 namespace luxir {
 
+// Reads one-dimensional point leaves and their value fences.
 class PointsReader {
-  const char* points = nullptr;
-  const char* fileEnd = nullptr;
-  const char* leafMins = nullptr;
-  const char* leafMaxes = nullptr;
-  const char* leafPointers = nullptr;
-  const char* leafEncodings = nullptr;
-  uint64_t pointsFileOffset = 0;
-  uint64_t metaOffset = 0;
+  const char* points = nullptr;  // Start of the encoded leaves.
+  const char* leafMins = nullptr;  // Least value per leaf.
+  const char* leafMaxes = nullptr;  // Greatest value per leaf.
+  const char* leafPointers = nullptr;  // Leaf offsets relative to the first leaf.
+  const char* leafEncodings = nullptr;  // Per-leaf encoding summaries.
+  uint64_t metaOffset = 0;  // Byte length of the leaves.
   uint64_t pointsCount = 0;
-  uint64_t byteSize = 0;
+  uint64_t byteSize = 0;  // Byte length of leaves and directory.
   uint32_t leavesCount = 0;
-  uint16_t leafSizeMax = 0;
+  uint16_t leafSizeMax = 0;  // Capacity of a full leaf.
   uint32_t metadataFlags = 0;
+  SegmentReadContext context;  // Source of the point data for corruption reports.
 
   template <class T>
   static T load(const char* ptr) {
@@ -42,55 +42,46 @@ class PointsReader {
     return value;
   }
 
-  [[noreturn]] static void invalid(const char* reason) {
-    throw std::runtime_error(std::string("PointsReader: ") + reason);
+  [[noreturn]] void invalid(const char* reason) const {
+    context.invalid(reason, "PointsReader");
   }
 
-  void init(const InputStream& input, uint64_t pointsOff, int64_t pointsMetaOff) {
+  void init(std::span<const char> leaves, std::span<const char> directory,
+            uint64_t directoryOffset) {
     static_assert(std::endian::native == std::endian::little);
-    if (pointsMetaOff <= 0) invalid("points index is absent");
-    if (pointsOff > (uint64_t)input.size()) invalid("points location is out of bounds");
-    if ((uint64_t)pointsMetaOff > (uint64_t)input.size() - pointsOff) invalid("metadata is out of bounds");
-
-    pointsFileOffset = pointsOff;
-    metaOffset = (uint64_t)pointsMetaOff;
-    points = input.ptr((int64_t)pointsOff);
-    fileEnd = input.ptr(input.size());
-    const char* meta = points + metaOffset;
-    if ((uint64_t)(fileEnd - meta) < PointsWriter::FIXED_HEADER_SIZE) invalid("truncated metadata header");
-
-    if (load<uint32_t>(meta) != PointsWriter::MAGIC) invalid("bad magic");
-    if (load<uint16_t>(meta + 4) != PointsWriter::VERSION) invalid("unsupported version");
-    if ((uint8_t)meta[6] != PointsWriter::FORMAT_KIND) invalid("unsupported format kind");
-    if ((uint8_t)meta[7] != 0x11) invalid("bad metadata reserved byte");
-    metadataFlags = load<uint32_t>(meta + 8);
+    if (leaves.empty()) invalid("points index is absent");
+    if (directory.size() < PointsWriter::FIXED_HEADER_SIZE) invalid("truncated metadata header");
+    points = leaves.data();
+    metaOffset = leaves.size();
+    const char* meta = directory.data();
+    auto header = load<PointsWriter::FixedHeader>(meta);
+    if (header.magic != PointsWriter::MAGIC) invalid("bad directory magic");
+    if (header.version != PointsWriter::VERSION) invalid("unsupported directory version");
+    if (header.formatKind != PointsWriter::FORMAT_KIND) invalid("unsupported directory format kind");
+    if (header.reservedByte != PointsWriter::METADATA_RESERVED_BYTE) invalid("bad metadata reserved byte");
+    if (header.reservedWord != PointsWriter::METADATA_RESERVED_WORD) invalid("bad metadata reserved word");
+    metadataFlags = header.flags;
     if (metadataFlags != PointsWriter::FLAG_LEAF_MAX) invalid("unsupported metadata flags");
-    leavesCount = load<uint32_t>(meta + 12);
-    leafSizeMax = load<uint16_t>(meta + 16);
-    if (load<uint16_t>(meta + 18) != 0x1111) invalid("bad metadata reserved word");
-    pointsCount = load<uint64_t>(meta + 20);
+    leavesCount = header.leafCount;
+    leafSizeMax = header.maxPointsPerLeaf;
+    pointsCount = header.pointCount;
     if (leavesCount == 0) invalid("leafCount must be positive");
     if (leafSizeMax == 0) invalid("maxPointsPerLeaf must be positive");
     if (pointsCount == 0) invalid("pointCount must be positive");
+    if (leavesCount != PointsWriter::leafCount(pointsCount, leafSizeMax)) invalid("leafCount does not match pointCount");
 
-    uint64_t directoryFileOffset = pointsFileOffset + metaOffset + PointsWriter::FIXED_HEADER_SIZE;
-    directoryFileOffset = (directoryFileOffset + 7) & ~(uint64_t)7;
-    uint64_t directoryOff = directoryFileOffset - pointsFileOffset;
-    uint64_t directoryBytes = (uint64_t)leavesCount * sizeof(int64_t) * 2
-                            + ((uint64_t)leavesCount + 1) * sizeof(uint64_t)
-                            + (uint64_t)leavesCount * sizeof(uint32_t);
-    if (directoryOff > (uint64_t)(fileEnd - points)
-        || directoryBytes > (uint64_t)(fileEnd - points) - directoryOff) {
+    auto directoryOff = PointsWriter::directoryOffset(directoryOffset);
+    if (PointsWriter::directoryBytes(directoryOffset, leavesCount) != directory.size()) {
       invalid("truncated leaf directory");
     }
-    byteSize = directoryOff + directoryBytes;
-    leafMins = points + directoryOff;
+    byteSize = leaves.size() + directory.size();
+    leafMins = meta + directoryOff;
     leafMaxes = leafMins + (uint64_t)leavesCount * sizeof(int64_t);
     leafPointers = leafMaxes + (uint64_t)leavesCount * sizeof(int64_t);
     leafEncodings = leafPointers + ((uint64_t)leavesCount + 1) * sizeof(uint64_t);
 
     if (leafFP(0) != 0) invalid("first leaf pointer must be zero");
-    if (leafFP(leavesCount) != metaOffset) invalid("final leaf pointer does not equal pointsMetaOff");
+    if (leafFP(leavesCount) != metaOffset) invalid("final leaf pointer does not match the leaves length");
   }
 
 public:
@@ -235,14 +226,24 @@ public:
     uint64_t valueGcd;
   };
 
-  PointsReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) {
-    if (fieldInfo.pointsMetaOff == 0) invalid("points index is absent");
-    InputStream input = postingsReader.core().getInputStream(fieldInfo.pointsLoc.filenum());
-    init(input, fieldInfo.pointsLoc.offset(), fieldInfo.pointsMetaOff);
+  PointsReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
+      : context(segmentReadContext(reader.core(), fieldInfo, UINT32_MAX)) {
+    const auto* part = fieldInfo.points();
+    if (!part) invalid("points index is absent");
+    context.file = part->location.filenum();
+    auto& core = reader.core();
+    auto directory = fieldInfo.pointsDirectory();
+    init(core.slice(part->leaves()), core.slice(directory), directory.location.offset());
+    if (leafCount() != fieldInfo.pointLeafCount() || maxPointsPerLeaf() != part->maxPointsPerLeaf
+        || pointCount() != fieldInfo.pointCount()) invalid("directory counts disagree with field record");
   }
 
-  PointsReader(const InputStream& input, uint64_t pointsOff, int64_t pointsMetaOff) {
-    init(input, pointsOff, pointsMetaOff);
+  PointsReader(const InputStream& input, uint64_t leavesOffset, uint64_t leavesBytes, uint64_t directoryBytes) {
+    auto size = (uint64_t)input.size();
+    if (leavesOffset > size || leavesBytes > size - leavesOffset
+        || directoryBytes > size - leavesOffset - leavesBytes) invalid("points slice is out of bounds");
+    auto directoryOffset = leavesOffset + leavesBytes;
+    init({input.ptr(leavesOffset), leavesBytes}, {input.ptr(directoryOffset), directoryBytes}, directoryOffset);
   }
 
   uint64_t pointCount() const { return pointsCount; }

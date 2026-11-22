@@ -98,48 +98,52 @@ void FieldType::requireCapability(uint32_t required, std::string_view operation,
   }
 }
 
-uint32_t FieldType::typeParameters(Type type, uint32_t typeFlags) {
+const char* FieldType::typeParametersError(Type type, uint32_t parameters) noexcept {
   switch (type) {
     case DECIMAL:
-      if (typeFlags <= DecimalFieldType::MAX_SCALE) return typeFlags;
-      throw std::runtime_error(std::format("Unknown decimal scale {}", typeFlags));
+      return parameters <= DecimalFieldType::MAX_SCALE ? nullptr : "unknown decimal scale";
     case DATE:
-      DateFieldType::unitFromTypeFlags(typeFlags);
-      return typeFlags;
+      return parameters <= 1 ? nullptr : "unknown date unit";
     case NESTED:
-      throw std::runtime_error("Nested paths cannot be persisted as fields");
-    case INTERVAL:
-      typeParameters(RangeFieldType::elementTypeFromFlags(typeFlags),
-                     typeFlags >> RangeFieldType::ELEMENT_FLAGS_SHIFT);
-      return typeFlags;
+      return "nested paths cannot be persisted as fields";
+    case INTERVAL: {
+      auto element = RangeFieldType::tryElementTypeFromParameters(parameters);
+      return element == NONE ? "unknown range element kind"
+          : typeParametersError(element, parameters >> RangeFieldType::ELEMENT_PARAMETERS_SHIFT);
+    }
     case NONE: case STRING: case TEXT: case BIN: case INT: case FLOAT:
     case DOUBLE: case ID: case VECTOR: case GEO_POINT: case BOOLEAN: case IP:
-      if (typeFlags == 0) return 0;
-      throw std::runtime_error(std::format(
-          "Unknown type flags 0x{:x} for persisted field type '{}'", typeFlags, typeName(type)));
+      return parameters == 0 ? nullptr : "unexpected parameters for persisted field type";
   }
-  throw std::runtime_error(std::format("Unknown persisted field type {}", (int)type));
+  return "unknown persisted field type";
 }
 
-std::string FieldType::describeType(Type type, uint32_t typeFlags) {
-  if (type == DATE) {
-    return std::format("type 'date' unit '{}'", dateUnitName(DateFieldType::unitFromTypeFlags(typeFlags)));
+uint32_t FieldType::typeParameters(Type type, uint32_t parameters) {
+  if (auto* reason = typeParametersError(type, parameters)) {
+    throw std::runtime_error(std::format("{}: type '{}', parameters 0x{:x}", reason, typeName(type), parameters));
   }
-  typeParameters(type, typeFlags);
-  if (type == DECIMAL) return std::format("type 'decimal' scale {}", typeFlags);
+  return parameters;
+}
+
+std::string FieldType::describeType(Type type, uint32_t parameters) {
+  if (type == DATE) {
+    return std::format("type 'date' unit '{}'", dateUnitName(DateFieldType::unitFromTypeParameters(parameters)));
+  }
+  typeParameters(type, parameters);
+  if (type == DECIMAL) return std::format("type 'decimal' scale {}", parameters);
   if (type == INTERVAL) {
     static constexpr std::string_view names[] = {"long_range", "double_range", "date_range"};
-    std::string description = std::format("type '{}'", names[typeFlags & RangeFieldType::ELEMENT_KIND_MASK]);
-    uint32_t elementFlags = typeFlags >> RangeFieldType::ELEMENT_FLAGS_SHIFT;
-    if (elementFlags != 0) {
-      description += " with element " + describeType(RangeFieldType::elementTypeFromFlags(typeFlags), elementFlags);
+    std::string description = std::format("type '{}'", names[parameters & RangeFieldType::ELEMENT_KIND_MASK]);
+    uint32_t elementParameters = parameters >> RangeFieldType::ELEMENT_PARAMETERS_SHIFT;
+    if (elementParameters != 0) {
+      description += " with element " + describeType(RangeFieldType::elementTypeFromParameters(parameters), elementParameters);
     }
     return description;
   }
   return std::format("type '{}'", typeName(type));
 }
 
-uint32_t DateFieldType::typeFlagsForUnit(DateUnit unit) {
+uint32_t DateFieldType::typeParametersForUnit(DateUnit unit) {
   switch (unit) {
     case DateUnit::MILLIS: return 0;
     case DateUnit::NANOS: return 1;
@@ -147,11 +151,9 @@ uint32_t DateFieldType::typeFlagsForUnit(DateUnit unit) {
   throw std::invalid_argument("Unknown date unit");
 }
 
-DateUnit DateFieldType::unitFromTypeFlags(uint32_t typeFlags) {
-  if (typeFlags & ~1u) {
-    throw std::runtime_error(std::format("Unknown type flags 0x{:x} for persisted field type 'date'", typeFlags));
-  }
-  return typeFlags & 1u ? DateUnit::NANOS : DateUnit::MILLIS;
+DateUnit DateFieldType::unitFromTypeParameters(uint32_t parameters) {
+  FieldType::typeParameters(FieldType::DATE, parameters);
+  return parameters & 1u ? DateUnit::NANOS : DateUnit::MILLIS;
 }
 
 void StrFieldType::normalize(std::string& value) const {

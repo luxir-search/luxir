@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <exception>
 #include <limits>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -51,11 +52,15 @@ public:
   // Running total of RAM held OUTSIDE `pool` (heap hash tables, IdHandler's idPool,
   // string column RAMFiles). Handlers that hold such memory bump this via
   // IndexHandler::accountExtraRam at their allocation sites, so memSize() is O(1) -
-  // no per-doc walk of indexHandlers. RAM-delegating postings output is not part
-  // of this estimate because PostingsWriter reserves its actual allocation
-  // separately against the same IndexRamBudget.
+  // no per-doc walk of indexHandlers.
   size_t extraRamBytes = 0;
   void addExtraRam(int64_t delta) { extraRamBytes = (size_t)((int64_t)extraRamBytes + delta); }
+
+  // Staging updates the reservation as buffers grow and are released.
+  // IndexWriter resyncs the rest at batch release. The guard is owned by the
+  // indexing task, then IndexWriter while idle, then the flush task.
+  IndexRamBudget::Guard ramGuard;
+  std::atomic<int64_t> stagedRamBytes = 0;
 
   // Having a handle to the postings writer means that we can start flushing whenever we want or
   // even directly write certain dense columns without uninverting first.
@@ -76,12 +81,6 @@ public:
   // It is set asynchronously and consumed by the IndexWriter and is not used by the Inverter itself.
   CommitInfo* commitInfo = nullptr;
 
-  // This inverter's share of the global indexing RAM budget, bound (at zero bytes) to the
-  // constructor's budget. IndexWriter::releaseInverter resyncs it to memSize() once per
-  // batch; a flush grows it by noteFlushWorkspace; the guard's destructor returns the bytes
-  // when the inverter is destroyed (after its flush completes, or at writer close), so
-  // flushing inverters stay counted until their RAM is actually freed.
-  IndexRamBudget::Guard ramGuard;
   // Unversioned direct indexing starts at zero; acquisitions replace empty runs.
   VersionRunBuilder versionRuns;
 
@@ -130,7 +129,7 @@ public:
   // destroyed, so it grows to the largest such peak, never shrinking per field.
   void noteFlushWorkspace(size_t bytes) {
     if (bytes <= flushWorkspaceBytes) return;
-    if (ramGuard) ramGuard.growDraining((int64_t)(bytes - flushWorkspaceBytes));
+    if (ramGuard) ramGuard.adjustSize((int64_t)(bytes - flushWorkspaceBytes));
     flushWorkspaceBytes = bytes;
   }
 
@@ -250,7 +249,7 @@ public:
 
     // End the indexing phase before any field starts flushing. Handlers that
     // stream large values directly to segment files use this hook to publish
-    // their extent and return the checked-out stream to PostingsWriter.
+    // their slice and return the checked-out stream to PostingsWriter.
     virtual void finishIndexing(Inverter& inverter) {
       unused(inverter);
     }
@@ -289,12 +288,14 @@ public:
   // a dispatcher never finishes or flushes them.
   class InputHandler {
     friend Inverter;
+    // A physical destination for one logical input.
     struct Branch {
       std::string label;
       IndexHandler* handler;
     };
     PackedTerm fieldName;
     std::shared_ptr<FieldType> fieldType;
+    SpaceOrdinal space;  // Row space of the input, including stored-only inputs.
     LogicalField::Shape shape;
     bool multi;
     StoredFieldsWriter* writer;
@@ -327,7 +328,7 @@ public:
 
   public:
     InputHandler(Inverter& inverter, const ResolvedFieldHandle& resolved,
-                 std::shared_ptr<FieldType> fieldType, StoredFieldsWriter* writer);
+                 std::shared_ptr<FieldType> fieldType, SpaceOrdinal space, StoredFieldsWriter* writer);
     bool operator==(std::string_view name) const { return fieldName == name; }
 
     // Last-wins dedup of a document's input fields by handler, which is one per input
@@ -360,7 +361,7 @@ public:
   InputHandler& getIndexHandler(std::string_view name) {
     auto iter = inputHandlers.find(name);
     if (iter != inputHandlers.end()) {
-      if (iter->second->branches.front().handler->space != inputSpace) rejectInputSpace(name);
+      if (iter->second->space != inputSpace) rejectInputSpace(name);
       return *iter->second;
     }
     return createInputHandler(name);
@@ -424,7 +425,8 @@ public:
   // hold outside it (extraRamBytes). O(1) - no walk. Over-estimates slightly (pool
   // capacity steps by chunk), so a size-based flush trips a touch early, never late.
   size_t memSize() {
-    return pool.size() + extraRamBytes + versionRuns.allocatedBytes();
+    return pool.size() + extraRamBytes + versionRuns.allocatedBytes()
+        + (size_t)stagedRamBytes.load(std::memory_order_relaxed);
   }
 
   // True when this inverter has grown past a size cap and should be flushed to a
@@ -490,7 +492,7 @@ public:
         + (int64_t)8 * format.chunkTarget + (int64_t)2 * format.maxDocsPerChunk * sizeof(int32_t)
         + StoredChunkCompressor::contextBytes(format, format.chunkTarget);
     auto dictionary = storedDictionaryProvider ? storedDictionaryProvider(resourceName, format) : nullptr;
-    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, space, resourceName, format, std::move(dictionary));
+    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, format, std::move(dictionary));
     auto [newIt, _] = storedFields_.emplace(StoredResourceKey{space, std::string(resourceName)}, std::move(writer));
     if (bytes) addExtraRam(bytes);
     return *newIt->second;
@@ -500,7 +502,7 @@ private:
   void requireInputSpace(std::string_view name) const;
   [[noreturn]] void rejectInputSpace(std::string_view name) const;
   InputHandler& createInputHandler(std::string_view name);
-  IndexHandler& createPhysicalHandler(std::string_view name,
+  IndexHandler* createPhysicalHandler(std::string_view name,
                                       const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space);
 
 };

@@ -97,7 +97,10 @@ public:
     // Filenames written for this segment that have not yet been fsynced.
     // Populated by PostingsWriter::finish() and drained at commit time.
     std::vector<std::string> unsyncedFiles;
-    std::vector<FileDescriptor> files;
+    // Base files and catalog are immutable once the segment is registered.
+    std::vector<FileDescriptor> baseFiles;
+    CatalogRange catalog;
+    std::optional<FileDescriptor> liveFile;
 
     // Segment-local aux overlays recorded in SegmentInfo.overlays.  Vector
     // ANN entries are carried by segment liveness; coreGen does not
@@ -635,7 +638,7 @@ public:
   // TEXT merge partitioning thresholds. Tests and constrained deployments may
   // lower these without changing the on-disk behavior of flushes or serial merges.
   // Debug builds default the byte floors to 1 so every text merge with enough
-  // source term blocks partitions: the whole suite then exercises range tables,
+  // source term blocks partitions: the whole suite then exercises term routing,
   // tail blocks, and empty-range edge cases, not just the dedicated tests.
   // (Splits land on source block-leading terms, so tiny fields still merge
   // serially for lack of candidates.)  Tests that need serial merges pin the

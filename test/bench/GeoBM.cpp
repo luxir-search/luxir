@@ -423,7 +423,7 @@ public:
   uint64_t pointCount() const { return points; }
   bool multiValued() const { return corpus.multi; }
 
-  SegFieldInfo fieldInfo() {
+  const DecodedFieldRecord& fieldInfo() {
     MemPool pool;
     auto& segment = index.reader->segments()[0];
     auto* fields = segment.postingsReader().fieldInfo(FIELD);
@@ -563,7 +563,7 @@ void BM_GeoEstimate(benchmark::State& state, CorpusShape shape) {
   BoxCase boxCase = (BoxCase)state.range(0);
   GeoFixture& data = fixture(shape);
   const BoxSpec& box = data.box(boxCase);
-  SegFieldInfo info = data.fieldInfo();
+  const auto& info = data.fieldInfo();
   auto& segment = data.testIndex().reader->segments()[0];
   BKDReader reader(segment.postingsReader(), info);
   GeoBoxQuery query(FIELD, box.minLat, box.maxLat, box.minLon, box.maxLon);
@@ -676,7 +676,7 @@ void BM_GeoDistanceEstimate(benchmark::State& state, CorpusShape shape) {
   DistanceCase distanceCase = (DistanceCase)state.range(0);
   GeoFixture& data = fixture(shape);
   const CircleSpec& circle = data.circle(distanceCase);
-  SegFieldInfo info = data.fieldInfo();
+  const auto& info = data.fieldInfo();
   auto& segment = data.testIndex().reader->segments()[0];
   BKDReader reader(segment.postingsReader(), info);
   GeoDistanceQuery query(FIELD, circle.lat, circle.lon,
@@ -698,7 +698,7 @@ void BM_GeoSize(benchmark::State& state, CorpusShape shape) {
     return;
   }
   GeoFixture& data = fixture(shape);
-  SegFieldInfo info = data.fieldInfo();
+  const auto& info = data.fieldInfo();
   auto& segment = data.testIndex().reader->segments()[0];
   BKDReader reader(segment.postingsReader(), info);
   for (auto _ : state) benchmark::DoNotOptimize(reader);

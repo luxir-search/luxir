@@ -94,19 +94,16 @@ protected:
       EXPECT_EQ(segment.segInfo.seg_id, segment.segmentCore().id());
       EXPECT_EQ(segment.maxDoc(), postingsReader.maxDoc());
       MemPool pool;
-      const PostingsReader::Field* idFields = nullptr;
-      const PostingsReader::Field* valueFields = nullptr;
-      SegFieldInfo idInfo;
-      SegFieldInfo valueInfo;
+      const DecodedFieldRecord* idFields = nullptr;
+      const DecodedFieldRecord* valueFields = nullptr;
       EXPECT_TRUE(((idFields = postingsReader.fieldInfo("id")) != nullptr));
       EXPECT_TRUE(((valueFields = postingsReader.fieldInfo("n_i")) != nullptr));
-      idInfo = *idFields;
-      valueInfo = *valueFields;
+      const auto& valueInfo = *valueFields;
       IntColReader column(postingsReader, valueInfo);
       IntColReader::SparseIterator values(column);
-      const auto* leaves = postingsReader.fieldInfo("n_i")->numericLeafMeta();
+      const auto* leaves = postingsReader.openNumericLeafMeta(*valueFields);
       EXPECT_NE(nullptr, leaves);
-      TermsEnum terms(pool, postingsReader, idInfo);
+      TermsEnum terms(pool, postingsReader, *idFields);
       while (terms.nextTerm()) {
         auto term = (std::string_view)terms.term();
         int64_t id = -1;
@@ -163,7 +160,7 @@ TEST_F(SegmentSharingTest, fieldNamesFollowSegmentSet) {
 
   // The same segment set can be opened through another publisher's reader.
   auto stored = readDurableIndexInfo(writer->dir);
-  auto independent = SegmentCore::create(writer->dir, stored->segments[0].seg_id, stored->segments[0].creator_epoch);
+  auto independent = SegmentCore::create(writer->dir, stored->segments[0]);
   auto snapshot = *writer->snapshots.snapshot();
   snapshot.openCores[0] = independent;
   auto separate = std::make_shared<IndexReader>(writer->dir, snapshot, before.get());

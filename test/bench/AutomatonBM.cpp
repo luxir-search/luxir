@@ -62,7 +62,7 @@ void BM_AutomatonEnum(benchmark::State& state, std::string_view pattern, bool re
   int32_t matched = 0;
   for (auto _ : state) {
     auto guard = fixture.getIndex().pool.rewindScopeGuard();
-    TermsEnum source(guard.pool(), segment->postingsReader(), fixture.getField().fieldInfo);
+    TermsEnum source(guard.pool(), segment->postingsReader(), fixture.getField().fieldInfo());
     if (brute) {
       BruteDfaTermsEnum terms(source, dfa.view());
       matched = count(terms);

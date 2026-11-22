@@ -13,6 +13,7 @@
 #include <type_traits>
 
 #include "LinearFit.h"
+#include "luxir/util/encoding.h"
 
 namespace luxir {
 
@@ -30,6 +31,19 @@ struct OrdColumnFormat {
     uint8_t padding[7] = {};
   };
   static_assert(sizeof(PredictedBlockInfo) == 32);
+
+  // Ordinal zero is reserved, so numTerms is the highest encoded ordinal.
+  static uint8_t width(uint64_t numTerms) noexcept { return (uint8_t)std::bit_width(numTerms); }
+
+  // DIRECT values and the maximum payload of PREDICTED values.
+  static __uint128_t directBytes(uint64_t count, uint8_t width) noexcept {
+    return ceilDiv((__uint128_t)count * width, (__uint128_t)CHAR_BIT);
+  }
+
+  // PREDICTED block descriptors start immediately after the payload.
+  static uint64_t metadataBytes(uint64_t count) noexcept {
+    return (count / BLOCK_SIZE + (count % BLOCK_SIZE != 0)) * sizeof(PredictedBlockInfo);
+  }
 
   struct PredictedBlockPlan {
     PredictedBlockInfo info{};

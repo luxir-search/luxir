@@ -117,11 +117,12 @@ int64_t StoredChunkCompressor::dictionaryTrainingBytes(const StoredChunkFormat& 
 
 StoredDecompressionDictionary::StoredDecompressionDictionary(std::string_view dictionary)
   : ddict(ZSTD_createDDict_byReference(dictionary.data(), dictionary.size())) {
-  if (!ddict) throw std::runtime_error("stored fields: invalid ZSTD dictionary");
+  // ZSTD reports both allocation and dictionary failures as nullptr here.
+  if (!ddict) throw std::runtime_error("stored fields: could not prepare ZSTD dictionary");
 }
 
 size_t StoredDecompressionDictionary::allocatedBytes() const {
-  return ZSTD_sizeof_DDict(ddict.get());
+  return sizeof(*this) + ZSTD_sizeof_DDict(ddict.get());
 }
 
 void StoredChunkDecompressor::decompress(StoredChunkFormat::Codec codec, const StoredDecompressionDictionary* dictionary,

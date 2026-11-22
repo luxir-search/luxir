@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <map>
+#include <ranges>
 #include <string>
 #include <tuple>
 #include "LuxirTest.h"
@@ -21,6 +22,25 @@ inline void writeUnversionedRuns(PostingsWriter& writer) {
   PostingsWriter::VersionRunsWriter versions(writer);
   if (writer.getMaxDoc(SpaceOrdinal::ROOT) > 0) versions.add(0, 0);
   versions.finish();
+}
+
+
+inline PostingsWriter::IndexFieldInfo& addTextField(PostingsWriter& writer, std::string_view name) {
+  auto& field = writer.addField(SpaceOrdinal::ROOT, name);
+  field.header.type = FieldType::TEXT;
+  field.header.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
+  return field;
+}
+
+template <class Docs>
+void writeFieldPresence(PostingsWriter& writer, PostingsWriter::IndexFieldInfo& field, const Docs& docs) {
+  field.setPresence(PresenceWriter::write(writer.pool, writer, field.space, (int32_t)docs.size(),
+      [&](auto&& accept) { for (int32_t doc : docs) accept(doc); }));
+}
+
+inline void writeFieldPresence(PostingsWriter& writer, PostingsWriter::IndexFieldInfo& field,
+                               std::initializer_list<int32_t> docs) {
+  writeFieldPresence(writer, field, std::span(docs.begin(), docs.size()));
 }
 
 

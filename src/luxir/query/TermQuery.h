@@ -170,10 +170,10 @@ public:
             (luxir::Similarity::BM25Scorer*)nullptr, boost);
       }
 
-      auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord); // this segFieldInfo can't be null at this point
+      auto* fieldInfo = cachedFieldInfo->segInfos.at(segment.ord); // this fieldInfo can't be null at this point
       luxir::NormsReader* normsReader = nullptr;
-      if (FieldType::storage(segFieldInfo->type) == FieldType::Storage::TEXT) {
-        normsReader = targetPool.make<luxir::NormsReader>(segment.postingsReader(), *segFieldInfo);
+      if (fieldInfo->norms()) {
+        normsReader = targetPool.make<luxir::NormsReader>(segment.postingsReader(), *fieldInfo);
       }
       return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader,
                                                 simScorer, boost,

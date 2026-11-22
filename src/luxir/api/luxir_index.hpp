@@ -59,7 +59,15 @@ struct AuxIndexInfo {
   uint64_t built_core_gen = 0;
 };
 
+struct CatalogRange {
+  uint64_t offset = 0;
+  uint64_t length = 0;
+  uint64_t xxh3 = 0;
+  bool operator==(const CatalogRange&) const = default;
+};
+
 struct SegmentInfo {
+  CatalogRange catalog;
   uint64_t creator_epoch = 0;
   uint64_t live_epoch = 0;
   uint64_t next_overlay_gen = 0;
@@ -92,7 +100,7 @@ struct IndexInfo {
 };
 
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
-LUXIR_TD(IndexInfo) LUXIR_TD(SegmentInfo) LUXIR_TD(AuxIndexInfo)
+LUXIR_TD(CatalogRange) LUXIR_TD(IndexInfo) LUXIR_TD(SegmentInfo) LUXIR_TD(AuxIndexInfo)
 LUXIR_TD(SchemaVersion) LUXIR_TD(SchemaReference) LUXIR_TD(SchemaInfo) LUXIR_TD(FileDescriptor)
 #undef LUXIR_TD
 
@@ -104,7 +112,7 @@ LUXIR_TD(SchemaVersion) LUXIR_TD(SchemaReference) LUXIR_TD(SchemaInfo) LUXIR_TD(
                  std::string *error = nullptr);                                          \
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,         \
                   std::string *error = nullptr);
-LUXIR_ENTRY(IndexInfo) LUXIR_ENTRY(SegmentInfo) LUXIR_ENTRY(AuxIndexInfo)
+LUXIR_ENTRY(CatalogRange) LUXIR_ENTRY(IndexInfo) LUXIR_ENTRY(SegmentInfo) LUXIR_ENTRY(AuxIndexInfo)
 LUXIR_ENTRY(SchemaVersion) LUXIR_ENTRY(SchemaReference) LUXIR_ENTRY(SchemaInfo) LUXIR_ENTRY(FileDescriptor)
 #undef LUXIR_ENTRY
 

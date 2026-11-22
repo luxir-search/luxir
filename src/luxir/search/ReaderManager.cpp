@@ -106,7 +106,7 @@ void ReaderManager::SegmentStats::readSpaces(const SegmentCore& core) {
   for (size_t i = 1; i < core.spaces().size(); i++) {
     const auto& space = core.spaces()[i];
     const auto& shape = *core.ownership((SpaceOrdinal)i);
-    spaces.push_back({space.path, space.maxDoc, shape.endsBytes(), shape.ownersBytes()});
+    spaces.push_back({std::string(space.path), space.maxDoc, shape.endsBytes(), shape.ownersBytes()});
   }
 }
 
@@ -162,7 +162,7 @@ ReaderManager::Stats ReaderManager::stats(bool includeSegments, bool includeFile
     if (reader) {
       if (auto* leaf = reader->findSegment(seg.seg_id)) core = leaf->segmentCoreShared();
     }
-    if (!core) core = SegmentCore::create(dir, seg.seg_id, seg.creator_epoch, true);
+    if (!core) core = SegmentCore::create(dir, seg, true);
     if (core) result.readSpaces(*core);
     out.segmentStats.push_back(std::move(result));
   }

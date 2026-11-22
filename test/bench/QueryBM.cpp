@@ -203,9 +203,9 @@ int64_t scanIntCol(std::string_view field, IndexReader& reader) {
     if (!hasField) {
       continue;
     }
-    // read the SegFieldInfo
-    const auto& fieldInfo = *fieldReader;
-    IntColReader colReader(seg.postingsReader(), fieldInfo);
+    const auto* number = fieldReader->numberColumn();
+    if (!number) continue;
+    IntColReader colReader(seg.postingsReader(), *fieldReader);
     IntColReader::Iterator iter(colReader);
     while (true) {
       int32_t doc = iter.next();

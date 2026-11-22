@@ -19,6 +19,7 @@
 #endif
 
 #include "luxir/util/BranchlessSearch.h"
+#include "luxir/util/encoding.h"
 
 
 namespace screaming {
@@ -481,6 +482,27 @@ public:
     uint32_t offset;    // location of the data for this bucket
   } BucketDescriptor;
 
+  static bool validSize(uint64_t start, uint64_t bytes, uint32_t docs, uint32_t maxDoc) {
+    constexpr auto footer = sizeof(uint16_t);
+    constexpr auto descriptor = sizeof(BucketDescriptor);
+    auto minBuckets = luxir::ceilDiv(docs, (uint32_t)BUCKET_SIZE);
+    auto maxBuckets = std::min(docs, luxir::ceilDiv(maxDoc, (uint32_t)BUCKET_SIZE));
+    // A bucket takes at least one aligned block. Full dense buckets minimize
+    // the number of payload bytes per represented doc.
+    auto minPayload = luxir::ceilDiv((uint64_t)docs * DENSE_CONTAINER_SIZE, (uint64_t)BUCKET_SIZE);
+    auto minBytes = footer + minBuckets * descriptor
+        + std::max(minPayload, (uint64_t)minBuckets * BLOCK_ALIGN);
+    auto maxBytes = footer + maxBuckets * descriptor
+        + std::min((uint64_t)maxBuckets * DENSE_CONTAINER_SIZE, (uint64_t)docs * BLOCK_ALIGN);
+    if (maxBuckets == 1) {
+      auto payload = docs <= BUCKET_SPARSE_MAX
+          ? luxir::alignUp(docs * sizeof(uint16_t), BLOCK_ALIGN) : DENSE_CONTAINER_SIZE;
+      minBytes = maxBytes = footer + descriptor + payload;
+    }
+    return start % BLOCK_ALIGN == 0 && bytes >= minBytes && bytes <= maxBytes
+        && (bytes - footer) % BLOCK_ALIGN == 0;
+  }
+
   const char* start;
   const BucketDescriptor* descriptors;
   uint16_t nBuckets;
@@ -514,6 +536,25 @@ public:
     auto sizeOfAllBuckets = lastDescriptor.offset + blockBytes(lastDescriptor);
     start = ((char*)descriptors) - sizeOfAllBuckets;
     assert((reinterpret_cast<uintptr_t>(start) & (BLOCK_ALIGN - 1)) == 0);
+  }
+
+  bool set(std::span<const char> bytes) {
+    if (bytes.size() < sizeof(uint16_t)) return false;
+    const auto* end = bytes.data() + bytes.size();
+    uint16_t count;
+    memcpy(&count, end - sizeof(count), sizeof(count));
+    size_t footer = sizeof(count) + count * sizeof(BucketDescriptor);
+    if (footer > bytes.size()) return false;
+    auto payload = bytes.size() - footer;
+    if (count) {
+      BucketDescriptor last;
+      memcpy(&last, bytes.data() + payload + (count - 1) * sizeof(last), sizeof(last));
+      if (last.offset > payload || (size_t)blockBytes(last) != payload - last.offset) return false;
+    } else if (payload != 0) {
+      return false;
+    }
+    set(end);
+    return true;
   }
 
   bool empty() const {

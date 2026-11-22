@@ -720,10 +720,10 @@ public:
       auto& segment = child.view->segments()[(size_t)segnum];
       int32_t maxDoc = segment.maxDoc();
 
-      auto* info = SegFieldInfo::column(source.segInfos.at((size_t)segnum));
-      if (!info) return;
-      const auto& parentInfo = *info;
-      OrdColReader parentColumn(segment.postingsReader(), parentInfo);
+      auto* info = source.segInfos.at((size_t)segnum);
+      const auto* ord = info ? info->ordColumn() : nullptr;
+      if (!ord) return;
+      OrdColReader parentColumn(segment.postingsReader(), *info);
       auto mapping = source.ordMap.getSegToGlobal(segnum);
       StrFacetSelectedOrdMap selected(mapping, selectedBuckets);
 

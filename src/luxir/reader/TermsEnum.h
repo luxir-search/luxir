@@ -9,6 +9,7 @@
 #include "Postings.h"
 #include "SkipStats.h"
 #include "TrieReader.h"
+#include "luxir/util/screaming.h"
 
 #include <algorithm>
 #include <array>
@@ -20,14 +21,17 @@
 #include <vector>
 
 namespace luxir {
+// Seeks and enumerates the terms of one field, loading postings metadata on demand.
 class TermsEnum {
   friend class DocsEnum;
+  friend class ScanTermsEnum;
 
-  InputStream termsIS;
-  MemPool& pool;
+  InputStream termsIS;  // Dictionary input, addressed by absolute file offset.
   SegmentCore& segmentCore;
 
-  const SegFieldInfo& fieldInfo;
+  const field_parts::Terms* termData;  // Null for a field without a dictionary.
+  const field_parts::IndexedTotals& totals;  // Field-wide indexed counts.
+  FieldType::flag_type flags;
 
   // currTerm's buffer holds a full PackedTerm plus COPY_SLACK, and the index
   // files are padded past every term block, so a short copy into currTerm may
@@ -43,24 +47,24 @@ class TermsEnum {
     else memcpy(dst, src, len);
   }
 
-  PackedTerm currTerm;
+  PackedTerm currTerm;  // Buffer for the reconstructed current term.
   int32_t ordInBlock = -1; // the term number local to the current block
   // Bytes currTerm shares with the term immediately before it, in full-term
   // coordinates.  Only an in-block advance can report a nonzero value; see
   // sharedPrefixLen().
   int32_t sharedLen = 0;
 
-  // block-level information
+  // Information for the current term block.
 
-  PackedTerm startingTerm;
+  PackedTerm startingTerm = PackedTerm(nullptr);  // First term in the loaded block.
   int32_t termBlockIndex = -1; // what term block are we currently in
-  int64_t startingOrd = 0;
-  int32_t maxOrdInBlock = -1;
-  int64_t locOfDocsForTermBlock;  // absolute location... field offset + block offset
-  int64_t locOfPositionsForTermBlock;  // absolute location... field offset + block offset
-  const char* termHashes;
+  int64_t startingOrd = 0;  // Ordinal of the block's first term.
+  int32_t maxOrdInBlock = -1;  // Local ordinal of the last term.
+  int64_t locOfDocsForTermBlock = 0;  // File offset of this block's docs.
+  int64_t locOfPositionsForTermBlock = 0;  // File offset of this block's positions.
+  const char* termHashes = nullptr;  // One hash byte per term in the block.
   uint8_t blockPrefixLen = 0;
-  uint32_t pulsedMask = 0;
+  uint32_t pulsedMask = 0;  // One bit per term with inline postings.
 
   const char* prefixLens = nullptr;
   const char* suffixLens = nullptr;
@@ -69,8 +73,8 @@ class TermsEnum {
   // stored back to back in dictionary order and every in-block movement steps
   // exactly one ord, so a running cursor replaces a prefix-summed start table.
   const char* suffixCursor = nullptr;
-  const char* metadataRuns = nullptr;
-  const char* blockEnd = nullptr;
+  const char* metadataRuns = nullptr;  // Start of the metadata run lengths.
+  const char* blockEnd = nullptr;  // End of the encoded block.
   uint32_t suffixBytesTotal = 0;
 
   const char* docsEndRun = nullptr;
@@ -102,23 +106,23 @@ class TermsEnum {
   bool postingsDecoded = false;
   bool metadataRunsParsed = false;
 
-  // term index level
-  const uint64_t* termBlockOffsets = nullptr;
-  InputStream trieIS;
-  const char* trieBase;
+  // Dictionary routing data.
+  const field_parts::Terms::BlockOffset* termBlockOffsets = nullptr;
+  const char* trieBase = nullptr;  // Start of the trie bytes.
   int32_t numTermBlocks = 0;
-  const TermRangeRow* rangeRows = nullptr;
-  const TermRangeRow* row = nullptr;
-  int32_t rangeCount = 0;
-  int64_t rowLastTermOrd = -1;
-  int32_t rowEndBlockOrd = 0;  // one past the current row's last block ord
-  // Current row's bases/filenums, cached as enum-local members by selectRow so
-  // the per-block and per-term hot paths never chase the row pointer.
-  int64_t rowTermsBase = 0;
-  int64_t rowDocsBase = 0;
-  int64_t rowPosBase = 0;
-  uint32_t rowDocsFile = 0;
-  uint32_t rowPosFile = 0;
+  const field_parts::TermRun* runs = nullptr;
+  const field_parts::TermRun* run = nullptr;  // The selected dictionary run.
+  int32_t runCount = 0;
+  int64_t runLastTermOrd = -1;  // Last term ordinal in the current run.
+  int32_t runEndBlockOrd = 0;  // one past the current run's last block ord
+  // Cached file offsets for the current run so
+  // the per-block and per-term hot paths never chase the run pointer.
+  int64_t runTermsBase = 0;
+  int64_t runTermsEnd = 0;
+  int64_t runDocsBase = 0;
+  int64_t runPosBase = 0;
+  InputStream runDocs;
+  InputStream runPositions;
 
 public:
   struct BlockEstimate {
@@ -151,59 +155,32 @@ public:
     bool hasPositions = false;
   };
 
-  // fieldInfo is not copied and should remain valid throughout the lifetime of this TermsEnum and any related classes such as DocsEnum
-  TermsEnum(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) : pool(pool), segmentCore(postingsReader.core()), fieldInfo(fieldInfo) {
-    unused(this->pool, this->segmentCore);
-    currTerm = PackedTerm(pool.alloc(TERM_BUFFER_BYTES), 0);
-    if (fieldInfo.nTerms == 0) return;
-    termsIS = segmentCore.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
-    // The writers pad the terms stream so this table starts 8-aligned (see
-    // PostingsWriter::finalizeField), which is what lets us read it in place.
-    assert((termsIS.offset() & 7) == 0);
-    termBlockOffsets = reinterpret_cast<const uint64_t*>(termsIS.ptr());
-    trieIS = segmentCore.getInputStreamSeek(fieldInfo.trieLoc);
-    trieBase = trieIS.ptr();
-
-    if (!fieldInfo.rangeTableLoc.isNull()) {
-      InputStream tableIS = segmentCore.getInputStreamSeek(fieldInfo.rangeTableLoc);
-      assert((tableIS.offset() & 7) == 0);
-      const auto* header = reinterpret_cast<const TermRangeTableHeader*>(tableIS.ptr());
-      rangeCount = (int32_t) header->nRanges;
-      numTermBlocks = (int32_t) header->totalBlocks;
-      assert(rangeCount > 0 && numTermBlocks > 0);
-      rangeRows = reinterpret_cast<const TermRangeRow*>(header + 1);
-    } else {
-      numTermBlocks = (int32_t) (((fieldInfo.nTerms - 1) / Postings::TERMS_BLOCK_SIZE) + 1);
-      rangeCount = 1;
-      // Pool-allocated (not a member) so the address survives moves of this
-      // enum; the hot paths read the cached row* members, not this struct.
-      rangeRows = pool.make<TermRangeRow>(TermRangeRow{
-          0, 0, 0, fieldInfo.docsLoc, fieldInfo.posLoc, fieldInfo.termsLoc, 0, 0});
-    }
-#ifndef NDEBUG
-    // readTermBlock reuses termsIS across rows: every row's terms region must
-    // share the block-index stream.
-    for (int32_t i = 0; i < rangeCount; i++) {
-      assert(rangeRows[i].termsBase.filenum() == fieldInfo.termBlockIndexLoc.filenum());
-    }
-#endif
-    selectRow(rangeRows);
+  // The decoded record and mapped bytes must outlive the enum.
+  TermsEnum(MemPool& pool, PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
+      : segmentCore(reader.core()), termData(fieldInfo.terms()), totals(fieldInfo.indexedTotals()),
+        flags(fieldInfo.flags), currTerm(pool.alloc(TERM_BUFFER_BYTES), 0) {
+    if (!termData) return;
+    termsIS = streamThrough(termData->dictionaryBlocks());
+    auto blockOffsets = fieldInfo.termBlockOffsets();
+    auto offsets = segmentCore.getInputStreamSeek(blockOffsets.location);
+    termBlockOffsets = reinterpret_cast<const field_parts::Terms::BlockOffset*>(offsets.ptr());
+    numTermBlocks = (int32_t)(blockOffsets.bytes / sizeof(field_parts::Terms::BlockOffset));
+    trieBase = segmentCore.getInputStreamSeek(fieldInfo.termTrie().location).ptr();
+    runCount = (int32_t)termData->runs.size();
+    runs = termData->runs.data();
+    selectRun(runs);
   }
 
   int64_t numTerms() const {
-    return fieldInfo.nTerms;
-  }
-
-  int32_t docsWithField() const {
-    return fieldInfo.docsWithField;
+    return totals.numTerms;
   }
 
   /// sumDocFreq is a field-level stat:
   /// The docFreq of a term is the number of documents it appears in. sumDocFreq is the sum across all terms in this field.
-  /// If sumDocFreq() == docsWithField() then every document contains only one term (or the same term repeated.)  May be
+  /// If sumDocFreq() equals the record's docsWithField, every doc contains only one term (possibly repeated). May be
   /// useful for detecting single-valued fields even if they were not marked as such.
   int64_t sumDocFreq() const {
-    return fieldInfo.sumDocFreq;
+    return totals.sumDocFreq;
   }
 
   /// sumTotalTermFreq is a field-level stat:
@@ -211,7 +188,7 @@ public:
   /// totalTermFreq is the number of times the term appears across all documents in this segment.
   /// sumTotalTermFreq is the sum of totalTermFreq for all terms in this field (i.e. number of tokens indexed)
   int64_t sumTotalTermFreq() const {
-    return fieldInfo.sumTotalTermFreq;
+    return totals.sumTotalTermFreq;
   }
 
   int32_t numBlocks() const {
@@ -239,87 +216,61 @@ public:
   }
 
   int64_t dictionaryBytes() const {
-    if (fieldInfo.nTerms == 0) return 0;
-    assert(fieldInfo.termBlockIndexLoc.filenum() == fieldInfo.termsLoc.filenum());
-    assert(fieldInfo.termBlockIndexLoc.offset() >= fieldInfo.termsLoc.offset());
-    uint64_t bytes = fieldInfo.termBlockIndexLoc.offset() - fieldInfo.termsLoc.offset();
-    assert(bytes <= INT64_MAX);
-    return (int64_t) bytes;
+    return termData ? (int64_t)termData->dictionaryBytes : 0;
   }
 
-  // One estimate per `stride` term blocks of each range row: the sampled
-  // block's leading term and the postings bytes up to the next sample.  The
-  // dictionary does not record where a row's last block ends, so the row's last
-  // sample is charged the row's average per block (an estimate from the field
-  // stats when the row has a single sample).
+  // The next run starts at this run's block end, or the field ends there.
+  static int32_t runEndBlock(std::span<const field_parts::TermRun> runs, int32_t run, int32_t blocks) noexcept {
+    return run + 1 < (int32_t)runs.size() ? runs[run + 1].firstBlockOrd : blocks;
+  }
+
+  // Each run contributes samples at its own stride, starting at its first block.
+  static int32_t sampleCount(std::span<const field_parts::TermRun> runs, int32_t blocks, int32_t stride) noexcept {
+    int32_t count = 0;
+    for (int32_t run = 0; run < (int32_t)runs.size(); ++run) {
+      count += 1 + (runEndBlock(runs, run, blocks) - runs[run].firstBlockOrd - 1) / stride;
+    }
+    return count;
+  }
+
+  // One estimate per stride of term blocks. The next sample's offsets, or
+  // the exact ends of this run's streams, delimit the sampled postings.
   std::vector<BlockEstimate> estimateTermBlocks(int32_t stride = 1) const {
     assert(stride >= 1);
     std::vector<BlockEstimate> blocks;
-    blocks.reserve((size_t) (numTermBlocks / stride + rangeCount));
-    for (int32_t rangeOrd = 0; rangeOrd < rangeCount; rangeOrd++) {
-      const TermRangeRow& sourceRow = rangeRows[rangeOrd];
-      int32_t firstBlock = (int32_t) sourceRow.firstBlockOrd;
-      int32_t endBlock = rangeOrd + 1 < rangeCount
-          ? (int32_t) rangeRows[rangeOrd + 1].firstBlockOrd : numTermBlocks;
+    if (!termData) return blocks;
+    blocks.reserve((size_t)sampleCount(termData->runs, numTermBlocks, stride));
+    for (int32_t runOrd = 0; runOrd < runCount; runOrd++) {
+      const auto& sourceRun = runs[runOrd];
+      int32_t firstBlock = sourceRun.firstBlockOrd;
+      int32_t endBlock = runEndBlock(termData->runs, runOrd, numTermBlocks);
+      auto sourceBase = (int64_t)(termData->location.offset() + sourceRun.dictionaryStart);
       int32_t count = endBlock - firstBlock;
       assert(count > 0);
       int32_t samples = (count - 1) / stride + 1;
 
       std::vector<uint64_t> docsOffsets((size_t) samples);
       std::vector<uint64_t> posOffsets((size_t) samples);
-      InputStream input = segmentCore.getInputStream(sourceRow.termsBase.filenum());
+      InputStream input = termsIS;
       size_t outputBase = blocks.size();
       for (int32_t i = 0; i < samples; i++) {
         int32_t blockOrd = firstBlock + i * stride;
-        input.seek(blockLocation(&sourceRow, blockOrd));
+        input.seek(sourceBase + termBlockOffsets[blockOrd]);
         PackedTerm first = input.readPackedTerm();
         blocks.push_back({std::string(first.data(), first.size()), 0});
         docsOffsets[(size_t) i] = input.readVlong();
         posOffsets[(size_t) i] = input.readVlong();
       }
 
-      uint64_t precedingBytes = 0;
-      for (int32_t i = 0; i + 1 < samples; i++) {
-        assert(docsOffsets[(size_t) i + 1] >= docsOffsets[(size_t) i]);
-        assert(posOffsets[(size_t) i + 1] >= posOffsets[(size_t) i]);
-        uint64_t bytes = docsOffsets[(size_t) i + 1] - docsOffsets[(size_t) i]
-            + posOffsets[(size_t) i + 1] - posOffsets[(size_t) i];
-        blocks[outputBase + (size_t) i].bytes = bytes;
-        precedingBytes += bytes;
+      for (int32_t i = 0; i < samples; i++) {
+        uint64_t docsEnd = i + 1 < samples ? docsOffsets[(size_t)i + 1]
+            : sourceRun.docs.bytes;
+        uint64_t posEnd = i + 1 < samples ? posOffsets[(size_t)i + 1]
+            : sourceRun.positions.bytes;
+        assert(docsEnd >= docsOffsets[(size_t)i] && posEnd >= posOffsets[(size_t)i]);
+        blocks[outputBase + (size_t)i].bytes = docsEnd - docsOffsets[(size_t)i]
+            + posEnd - posOffsets[(size_t)i];
       }
-      if (samples > 1) {
-        uint64_t precedingBlocks = (uint64_t) (samples - 1) * (uint64_t) stride;
-        uint64_t lastBlocks = (uint64_t) count - precedingBlocks;
-        blocks.back().bytes = (uint64_t) ((unsigned __int128) precedingBytes * lastBlocks
-                                          / precedingBlocks);
-        continue;
-      }
-      uint64_t lastDocsOffset = docsOffsets.back();
-      uint64_t lastPosOffset = posOffsets.back();
-      uint64_t finalBytes;
-      if (!fieldInfo.rangeTableLoc.isNull()) {
-        assert(sourceRow.docsBytes >= lastDocsOffset);
-        assert(sourceRow.posBytes >= lastPosOffset);
-        finalBytes = sourceRow.docsBytes - lastDocsOffset
-            + sourceRow.posBytes - lastPosOffset;
-      } else {
-        // A single untabled row is the whole field, which the stats size
-        // better than the file tail (later fields' postings follow it).
-        assert(fieldInfo.sumDocFreq >= 0 && fieldInfo.sumTotalTermFreq >= 0);
-        auto addEstimate = [&](uint64_t values, uint64_t bytesPerValue) {
-          uint64_t bytes = values > UINT64_MAX / bytesPerValue
-              ? UINT64_MAX : values * bytesPerValue;
-          finalBytes = UINT64_MAX - finalBytes < bytes
-              ? UINT64_MAX : finalBytes + bytes;
-        };
-        finalBytes = 0;
-        addEstimate((uint64_t) fieldInfo.sumDocFreq,
-                    FieldType::hasFreqs(fieldInfo.flags) ? 10 : 5);
-        if (FieldType::hasPositions(fieldInfo.flags)) {
-          addEstimate((uint64_t) fieldInfo.sumTotalTermFreq, 5);
-        }
-      }
-      blocks.back().bytes = finalBytes;
     }
     assert(stride > 1 || (int32_t) blocks.size() == numTermBlocks);
     return blocks;
@@ -381,7 +332,7 @@ public:
     assert(ordInBlock >= 0);
     decodeStats();
     uint64_t ttf = docFreqs[(size_t) ordInBlock];
-    if (FieldType::hasFreqs(fieldInfo.flags)) {
+    if (FieldType::hasFreqs(flags)) {
       ttf += ttfCodes[(size_t) ordInBlock];
     }
     assert(ttf <= INT64_MAX);
@@ -396,7 +347,7 @@ public:
   }
 
   // The whole-term (norm, maxTf) Pareto frontier stored in the term block
-  // metadata (see PostingsWriter.flushTerms): the source for a scorer's
+  // metadata (see TextWriter::flushTerms): the source for a scorer's
   // global max score - never derived by walking postings.  Returns the
   // number of frontier points appended to norms/tfs.
   int32_t readTermImpactFrontier(std::vector<int32_t>& norms, std::vector<int32_t>& tfs) {
@@ -423,7 +374,7 @@ public:
   }
 
   bool hasTermImpacts() const {
-    return FieldType::hasFreqs(fieldInfo.flags) && FieldType::hasPositions(fieldInfo.flags);
+    return FieldType::hasFreqs(flags) && FieldType::hasPositions(flags);
   }
 
   EncodedImpactFrontier currentTermImpactFrontierSpan() {
@@ -454,8 +405,8 @@ public:
     decodePostings();
 
     PostingsState state;
-    state.hasFreqs = FieldType::hasFreqs(fieldInfo.flags);
-    state.hasPositions = FieldType::hasPositions(fieldInfo.flags);
+    state.hasFreqs = FieldType::hasFreqs(flags);
+    state.hasPositions = FieldType::hasPositions(flags);
     state.termOrdinal = ord();
     state.docFreq = docFreq();
     state.packedBlockCount = packedBlockCount();
@@ -479,11 +430,11 @@ public:
         state.pulsedPos = (int32_t) pulsedValues[valueIndex + 1];
       }
     } else {
-      state.docIS = segmentCore.getInputStream(rowDocsFile);
+      state.docIS = runDocs;
       state.docIS.seek(state.docsStart);
       if (state.hasPositions) {
         state.posStart = locOfPositionsForTermBlock + (int64_t) posOffsets[(size_t) ordInBlock];
-        state.posIS = segmentCore.getInputStream(rowPosFile);
+        state.posIS = runPositions;
         state.posIS.seek(state.posStart);
       }
     }
@@ -521,7 +472,7 @@ protected:
     }
     // Metadata run lengths are parsed only when a stats or postings accessor
     // asks for them.  This keeps block entry and pure term scans on the
-    // hashes/lengths/suffix path.  See PostingsWriter.flushTerms for the
+    // hashes/lengths/suffix path.  See TextWriter::flushTerms for the
     // byte-length code and run order.  A zero byte length marks an all-default
     // run for docsEnd/packedBlocks/df/ttfCode/posOff; pulsedRun still uses
     // zero length only for the existing empty-payload case.
@@ -529,8 +480,8 @@ protected:
     docsEndRunLen = readMetadataRunLen(p, blockEnd);
     packedBlocksRunLen = readMetadataRunLen(p, blockEnd);
     dfRunLen = readMetadataRunLen(p, blockEnd);
-    ttfCodeRunLen = FieldType::hasFreqs(fieldInfo.flags) ? readMetadataRunLen(p, blockEnd) : 0;
-    posOffRunLen = FieldType::hasPositions(fieldInfo.flags) ? readMetadataRunLen(p, blockEnd) : 0;
+    ttfCodeRunLen = FieldType::hasFreqs(flags) ? readMetadataRunLen(p, blockEnd) : 0;
+    posOffRunLen = FieldType::hasPositions(flags) ? readMetadataRunLen(p, blockEnd) : 0;
     termImpactRunLen = hasTermImpacts() ? readMetadataRunLen(p, blockEnd) : 0;
     pulsedRunLen = readMetadataRunLen(p, blockEnd);
 
@@ -543,14 +494,14 @@ protected:
     dfRun = p;
     p += dfRunLen;
     assert(p <= blockEnd);
-    if (FieldType::hasFreqs(fieldInfo.flags)) {
+    if (FieldType::hasFreqs(flags)) {
       ttfCodeRun = p;
       p += ttfCodeRunLen;
       assert(p <= blockEnd);
     } else {
       ttfCodeRun = nullptr;
     }
-    if (FieldType::hasPositions(fieldInfo.flags)) {
+    if (FieldType::hasPositions(flags)) {
       posOffRun = p;
       p += posOffRunLen;
       assert(p <= blockEnd);
@@ -598,7 +549,7 @@ protected:
     } else {
       decodeSVBRun(dfRun, dfRunLen, docFreqs.data(), n);
     }
-    if (FieldType::hasFreqs(fieldInfo.flags)) {
+    if (FieldType::hasFreqs(flags)) {
       if (ttfCodeRunLen == 0) {
         std::fill_n(ttfCodes.begin(), n, 0);
       } else {
@@ -618,7 +569,7 @@ protected:
       return;
     }
     // Tier 2 metadata: data needed to construct DocsEnum.  docsEnd supplies
-    // trailer-free docs slices, packedBlocks describes their packed codec
+    // docs slices, packedBlocks describes their packed codec
     // blocks, posOff supplies positions starts, and pulsedRun supplies inline
     // doc/pos payloads for single-occurrence terms.
     parseMetadataRuns();
@@ -645,7 +596,7 @@ protected:
       decodeSVBRun(packedBlocksRun, packedBlocksRunLen, packedBlockCounts.data(), n);
     }
 
-    if (FieldType::hasPositions(fieldInfo.flags)) {
+    if (FieldType::hasPositions(flags)) {
       if (posOffRunLen == 0) {
         std::fill_n(posOffsets.begin(), n, 0);
       } else {
@@ -661,7 +612,7 @@ protected:
     }
 
     uint32_t pulsedTerms = std::popcount(pulsedMask & validPulsedMask());
-    uint32_t pulsedCount = pulsedTerms * (FieldType::hasPositions(fieldInfo.flags) ? 2u : 1u);
+    uint32_t pulsedCount = pulsedTerms * (FieldType::hasPositions(flags) ? 2u : 1u);
     decodeSVBRun(pulsedRun, pulsedRunLen, pulsedValues.data(), pulsedCount);
     postingsDecoded = true;
   }
@@ -702,14 +653,14 @@ protected:
   uint64_t posOffset() {
     assert(ordInBlock >= 0);
     decodePostings();
-    assert(FieldType::hasPositions(fieldInfo.flags));
+    assert(FieldType::hasPositions(flags));
     return posOffsets[(size_t) ordInBlock];
   }
 
   uint32_t pulsedValueIndex() {
     assert(isPulsed());
     uint32_t pulsedOrd = std::popcount(pulsedMask & ((1u << (uint32_t) ordInBlock) - 1));
-    return pulsedOrd * (FieldType::hasPositions(fieldInfo.flags) ? 2u : 1u);
+    return pulsedOrd * (FieldType::hasPositions(flags) ? 2u : 1u);
   }
 
   int32_t pulsedDoc() {
@@ -719,106 +670,80 @@ protected:
 
   int32_t pulsedPos() {
     decodePostings();
-    assert(FieldType::hasPositions(fieldInfo.flags));
+    assert(FieldType::hasPositions(flags));
     return (int32_t) pulsedValues[pulsedValueIndex() + 1];
   }
 
-  const TermRangeRow* rowForBlock(int32_t blockOrd) const {
-    assert(blockOrd >= 0 && blockOrd < numTermBlocks);
-    const TermRangeRow* end = rangeRows + rangeCount;
-    const TermRangeRow* found = std::upper_bound(
-        rangeRows, end, (uint32_t) blockOrd,
-        [](uint32_t value, const TermRangeRow& candidate) {
-          return value < candidate.firstBlockOrd;
-        });
-    assert(found != rangeRows);
-    return found - 1;
+  InputStream streamThrough(field_parts::Slice slice) const {
+    auto file = segmentCore.getInputStream(slice.location.filenum());
+    // Postings and position cursors use file-relative offsets.
+    return {file.ptr(0), file.ptr(slice.end().offset())};
   }
 
-  const TermRangeRow* rowForTerm(int64_t termOrd) const {
-    assert(termOrd >= 0 && termOrd < fieldInfo.nTerms);
-    const TermRangeRow* end = rangeRows + rangeCount;
-    const TermRangeRow* found = std::upper_bound(
-        rangeRows, end, (uint64_t) termOrd,
-        [](uint64_t value, const TermRangeRow& candidate) {
-          return value < candidate.firstTermOrd;
-        });
-    assert(found != rangeRows);
-    return found - 1;
+  // Kept out of line so switching runs adds nothing to the block decode path.
+  [[gnu::noinline]] void reselectRunForBlock(int32_t blockOrd) {
+    auto key = blockOrd + 1;
+    auto start = [](const auto& candidate) { return candidate.firstBlockOrd; };
+    selectRun(findRun(key, start));
   }
 
-  // Cold: rows change at most once per range (N <= 8) over a whole-field
-  // iteration, and never for untabled fields.  Kept out of line so the row
-  // bookkeeping adds nothing to readTermBlock's hot code footprint.
-  [[gnu::noinline]] void reselectRowForBlock(int32_t blockOrd) {
-    selectRow(rowForBlock(blockOrd));
+  template <class Key, class Start>
+  const field_parts::TermRun* findRun(Key key, Start start) const {
+    if (key <= start(*run)) {
+      // Random backward seek.
+      return std::lower_bound(runs, run, key,
+          [&](const auto& candidate, Key ordinal) { return start(candidate) < ordinal; }) - 1;
+    }
+    return runs + screaming::gallopLowerBound(
+        run - runs + 1, runCount, key, [&](int64_t i) { return start(runs[i]); }) - 1;
   }
 
-  void selectRow(const TermRangeRow* selected) {
-    row = selected;
-    int32_t rangeOrd = (int32_t) (row - rangeRows);
-    bool hasNext = rangeOrd + 1 < rangeCount;
-    rowLastTermOrd = hasNext
-        ? (int64_t) rangeRows[rangeOrd + 1].firstTermOrd - 1
-        : fieldInfo.nTerms - 1;
-    rowEndBlockOrd = hasNext
-        ? (int32_t) rangeRows[rangeOrd + 1].firstBlockOrd : numTermBlocks;
-    rowTermsBase = (int64_t) row->termsBase.offset();
-    rowDocsBase = (int64_t) row->docsBase.offset();
-    rowPosBase = (int64_t) row->posBase.offset();
-    rowDocsFile = row->docsBase.filenum();
-    rowPosFile = row->posBase.filenum();
+  void selectRun(const field_parts::TermRun* selected) {
+    run = selected;
+    bool hasNext = run + 1 != runs + runCount;
+    runLastTermOrd = hasNext ? (run + 1)->firstTermOrd - 1 : totals.numTerms - 1;
+    runEndBlockOrd = hasNext ? (run + 1)->firstBlockOrd : numTermBlocks;
+    auto base = termData->location.offset();
+    runTermsBase = (int64_t)(base + run->dictionaryStart);
+    runTermsEnd = (int64_t)(base + (hasNext ? (run + 1)->dictionaryStart : termData->dictionaryBytes));
+    runDocsBase = run->docs ? (int64_t)run->docs.location.offset() : 0;
+    runPosBase = run->positions ? (int64_t)run->positions.location.offset() : 0;
+    runDocs = run->docs ? streamThrough(run->docs) : InputStream();
+    runPositions = run->positions ? streamThrough(run->positions) : InputStream();
   }
 
-  int64_t blockLocation(const TermRangeRow* selected, int32_t blockOrd) const {
-    uint64_t offset = termBlockOffsets[blockOrd];
-    assert(offset <= INT64_MAX);
-    return (int64_t) selected->termsBase.offset() + (int64_t) offset;
-  }
-
-  PackedTerm firstTermForBlock(int32_t blockOrd) const {
-    const TermRangeRow* selected = rowForBlock(blockOrd);
-    InputStream input = segmentCore.getInputStream(selected->termsBase.filenum());
-    return input.readPackedTerm(blockLocation(selected, blockOrd));
+  PackedTerm firstTermForNextBlock(int32_t nextBlock) const {
+    auto base = nextBlock < runEndBlockOrd ? runTermsBase : runTermsEnd;
+    return termsIS.readPackedTerm(base + termBlockOffsets[nextBlock]);
   }
 
   // Seeks to termBlockIndex and reads the eager block-entry state from the
-  // format written by PostingsWriter.flushTerms: header values, hash pointer,
+  // format written by TextWriter::flushTerms: header values, hash pointer,
   // prefix/suffix length run pointers, suffix blob pointer, and metadata start.
   // It does not parse metadata run byte lengths or decode any stats/postings
   // metadata.  Those happen on demand in decodeStats and decodePostings.
   void readTermBlock() {
-    // Common case (and always, for a single row): the block stays on the
-    // current row; only re-resolve on a row boundary.  The whole dictionary
-    // (all ranges' terms, the block-offset array, the trie) lives in one
+    // Common case (and always, for a single run): the block stays on the
+    // current run; only re-resolve on a run boundary.  The whole dictionary
+    // (the runs, block offsets and trie) lives in one
     // stream, so termsIS never needs reopening - only seeking.
-    if (termBlockIndex < (int32_t) row->firstBlockOrd
-        || termBlockIndex >= rowEndBlockOrd) [[unlikely]] {
-      reselectRowForBlock(termBlockIndex);
+    if (termBlockIndex < run->firstBlockOrd
+        || termBlockIndex >= runEndBlockOrd) [[unlikely]] {
+      reselectRunForBlock(termBlockIndex);
     }
-    termsIS.seek(rowTermsBase + (int64_t) termBlockOffsets[termBlockIndex]);
-    startingOrd = (int64_t) row->firstTermOrd
-        + (int64_t) (termBlockIndex - (int32_t) row->firstBlockOrd) * Postings::TERMS_BLOCK_SIZE;
+    termsIS.seek(runTermsBase + (int64_t) termBlockOffsets[termBlockIndex]);
+    startingOrd = run->firstTermForBlock(termBlockIndex);
     ordInBlock = 0;
     maxOrdInBlock = (int32_t) std::min<int64_t>(Postings::TERMS_BLOCK_SIZE - 1,
-                                                rowLastTermOrd - startingOrd);
-    int64_t blockEndOffset;
-    if (termBlockIndex + 1 >= numTermBlocks) {
-      blockEndOffset = (int64_t) fieldInfo.termBlockIndexLoc.offset();
-    } else if (termBlockIndex + 1 < rowEndBlockOrd) {
-      blockEndOffset = rowTermsBase + (int64_t) termBlockOffsets[termBlockIndex + 1];
-    } else {
-      // Blocks are contiguous across rows, so the next block starts the
-      // immediately following row.
-      assert(row + 1 == rowForBlock(termBlockIndex + 1));
-      blockEndOffset = blockLocation(row + 1, termBlockIndex + 1);
-    }
+                                                runLastTermOrd - startingOrd);
+    int64_t blockEndOffset = termBlockIndex + 1 < runEndBlockOrd
+        ? runTermsBase + (int64_t)termBlockOffsets[termBlockIndex + 1] : runTermsEnd;
     blockEnd = termsIS.ptr(blockEndOffset);
 
-    // see PostingsWriter.flushTerms
+    // see TextWriter::flushTerms
     startingTerm = termsIS.readPackedTerm();
-    locOfDocsForTermBlock = rowDocsBase + (int64_t) termsIS.readVlong();
-    locOfPositionsForTermBlock = rowPosBase + (int64_t) termsIS.readVlong();
+    locOfDocsForTermBlock = runDocsBase + (int64_t) termsIS.readVlong();
+    locOfPositionsForTermBlock = runPosBase + (int64_t) termsIS.readVlong();
     blockPrefixLen = (uint8_t) termsIS.readByte();
     memcpy(&pulsedMask, termsIS.ptr(), sizeof(pulsedMask));
     termsIS.skip(sizeof(pulsedMask));
@@ -858,13 +783,11 @@ protected:
     metadataRunsParsed = false;
   }
 
-public:
-  /// If there is a next term, this advances to it and returns true.
-  /// Otherwise, no advance is done (i.e. ord() is not changed.)
-  bool nextTerm() {
-    if (fieldInfo.nTerms == 0) return false;
-    if (ordInBlock == maxOrdInBlock) {
-      if (ord() + 1 >= fieldInfo.nTerms) {  // could also compare number of blocks to detect end.
+private:
+  // The scan loop steps repeatedly on rejection.
+  LUXIR_INLINE bool nextTermInScan() {
+    if (ordInBlock == maxOrdInBlock) [[unlikely]] {
+      if (termBlockIndex + 1 >= numTermBlocks) {
         return false;
       }
       termBlockIndex++;
@@ -877,9 +800,13 @@ public:
   }
 
 
+public:
+  /// Advances to the next term, or returns false and leaves the ordinal alone.
+  bool nextTerm() { return nextTermInScan(); }
+
 protected:
   // reads the next term in the block with no checking if one runs off the end of the block.
-  void readNextTermInBlock() {
+  LUXIR_INLINE void readNextTermInBlock() {
     assert(ordInBlock < maxOrdInBlock);
     ordInBlock++;
     uint32_t prefixLen = (uint8_t) prefixLens[ordInBlock - 1];
@@ -897,17 +824,12 @@ protected:
     [[maybe_unused]] uint32_t factoredLen = len - blockPrefixLen;
     assert(prefixLen <= factoredLen);
     assert(blockPrefixLen + prefixLen + suffixLen <= PackedTerm::MAX_LEN);
-    // prefixLen is measured against the previous term after factoring out
-    // blockPrefixLen. The old "cannot extend by one more byte" assertion now
-    // compares at that factored boundary.
+    // The shared prefix ends at a differing byte or the end of the preceding term.
     assert(prefixLen == factoredLen || data[blockPrefixLen + prefixLen] != *suffix);
 
     copyIntoTerm(const_cast<char*>(data + blockPrefixLen + prefixLen), suffix, suffixLen);
     currTerm.setSize(blockPrefixLen + prefixLen + suffixLen);
-    // Never an over-estimate whatever the build: these bytes were not written
-    // just now, they are inherited from the previous term's reconstruction, so
-    // the two terms share at least that many.  The assert above upgrades that
-    // to exactly, by proving the next byte differs.
+    // These bytes come from the preceding term and form the shared prefix.
     sharedLen = (int32_t) (blockPrefixLen + prefixLen);
   }
 
@@ -917,7 +839,7 @@ protected:
   // cannot be existing terms, and seekCeil must be able to land on that block.
   // Shared by seek(), seekCeilForward(), and seekCeil().
   void seekBlock(std::string_view target, int32_t firstBlock) {
-    TrieReader trie(trieBase, (uint64_t)fieldInfo.trieRootOff, numTermBlocks);
+    TrieReader trie(trieBase, (uint64_t)termData->trieRootOffset, numTermBlocks);
     termBlockIndex = trie.floorBlock(target);
     assert(termBlockIndex >= firstBlock);
     readTermBlock();
@@ -930,7 +852,7 @@ public:
   // nonzero by advancing within a block, which an empty field never does.
   bool seek(std::string_view target) {
     skipCount(SkipStats::termDictionarySeeks);
-    if (fieldInfo.nTerms == 0) return false;
+    if (!termData) return false;
     seekBlock(target, 0);
     bool found = seekInBlock(target);
     sharedLen = 0;
@@ -942,7 +864,7 @@ public:
   /// returns false at dictionary exhaustion. Unlike seekCeil, this never
   /// restarts before the current block.
   bool seekCeilForward(std::string_view target) {
-    if (fieldInfo.nTerms == 0) return false;
+    if (!termData) return false;
     if (termBlockIndex < 0) {
       termBlockIndex = 0;
       readTermBlock();
@@ -952,7 +874,7 @@ public:
 
     int32_t nextBlock = termBlockIndex + 1;
     bool beyondCurrentBlock = (nextBlock < numTermBlocks) &&
-        !(target < firstTermForBlock(nextBlock));
+        !(target < firstTermForNextBlock(nextBlock));
 
     if (beyondCurrentBlock) {
       // Load the block that may contain target, positioning at ord 0.  We
@@ -990,7 +912,7 @@ public:
   /// if target sorts after every term.  To detect an exact match, compare
   /// term() to target after a true return.
   bool seekCeil(std::string_view target) {
-    if (fieldInfo.nTerms == 0) return false;
+    if (!termData) return false;
     // Start from the block whose first term is the greatest one <= target.
     seekBlock(target, 0);
     // nextTerm() can cross block boundaries, so this also handles a target
@@ -1039,13 +961,17 @@ protected:
     }
   }
 
-  // Loads the term block holding 0-based targetOrd, positioned on its first
-  // term.
-  void seekBlockOf(int64_t targetOrd) {
-    const TermRangeRow* selected = rowForTerm(targetOrd);
-    termBlockIndex = (int32_t) ((int64_t) selected->firstBlockOrd
-        + (targetOrd - (int64_t) selected->firstTermOrd) / Postings::TERMS_BLOCK_SIZE);
+  // Positions on the first term of the block containing the ordinal, if it exists.
+  bool seekBlockOf(int64_t targetOrd) {
+    if (targetOrd < 0 || targetOrd >= totals.numTerms) return false;
+    const auto* selected = run;
+    if (targetOrd < run->firstTermOrd || targetOrd > runLastTermOrd) {
+      selected = findRun(targetOrd + 1, [](const auto& run) { return run.firstTermOrd; });
+      selectRun(selected);
+    }
+    termBlockIndex = selected->blockForTerm(targetOrd);
     readTermBlock();
+    return true;
   }
 
 public:
@@ -1061,21 +987,19 @@ public:
   // seekOrd and nextTerm work as usual afterwards. The span is valid until
   // the enum moves to another block.
   DocFreqBlock docFreqBlock(int64_t targetOrd) {
-    assert(targetOrd >= 0 && targetOrd < fieldInfo.nTerms);
     if (targetOrd < startingOrd || targetOrd > startingOrd + maxOrdInBlock) {
-      seekBlockOf(targetOrd);
+      if (!seekBlockOf(targetOrd)) return {-1, {}};
     }
     decodeStats();
     return {startingOrd, std::span<const uint32_t>(
         docFreqs.data(), (size_t) maxOrdInBlock + 1)};
   }
 
-  // 0-based ords
+  // Positions at an existing zero-based term ordinal.
   void seekOrd(int64_t targetOrd) {
-    assert(targetOrd >= 0 && targetOrd < fieldInfo.nTerms);
     if (targetOrd < ord() || targetOrd > startingOrd + maxOrdInBlock) {
       // even if we were in the right block, we don't have the capability to go backwards or rewind
-      seekBlockOf(targetOrd);
+      if (!seekBlockOf(targetOrd)) return;
     }
     while (ord() < targetOrd) {
       // nextTerm();

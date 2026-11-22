@@ -77,14 +77,11 @@ std::vector<std::string> expectedIds(
   return ids;
 }
 
-SegFieldInfo readFieldInfo(IndexReader::Segment& segment,
+const DecodedFieldRecord& readFieldInfo(IndexReader::Segment& segment,
                            std::string_view field) {
-  MemPool pool;
-  auto* reader = segment.postingsReader().fieldInfo(field);
-  if (!(reader != nullptr)) throw std::runtime_error("missing test field");
-  SegFieldInfo info{};
-  info = *reader;
-  return info;
+  auto* info = segment.postingsReader().fieldInfo(field);
+  if (!info) throw std::runtime_error("missing test field");
+  return *info;
 }
 
 } // namespace
@@ -456,8 +453,11 @@ TEST_F(ExistsQueryTest, ZeroTermTextFlushReadsAndMergesInEitherOrder) {
 
     auto firstReader = helper.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ(1u, firstReader->segments().size());
-    SegFieldInfo firstInfo = readFieldInfo(firstReader->segments()[0], "zero_w");
-    EXPECT_EQ(zeroFirst ? 0 : 1, firstInfo.nTerms);
+    const auto& firstInfo = readFieldInfo(firstReader->segments()[0], "zero_w");
+    ASSERT_EQ(!zeroFirst, firstInfo.terms() != nullptr);
+    if (!zeroFirst) {
+      EXPECT_EQ(1, firstInfo.indexedTotals().numTerms);
+    }
     EXPECT_EQ(1, firstInfo.docsWithField);
     if (zeroFirst) {
       MemPool pool;
@@ -492,6 +492,6 @@ TEST_F(ExistsQueryTest, ZeroTermTextFlushReadsAndMergesInEitherOrder) {
   ASSERT_TRUE(helper.submit(merge).success);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
-  EXPECT_EQ(0, readFieldInfo(reader->segments()[0], "zero_w").nTerms);
+  EXPECT_EQ(nullptr, readFieldInfo(reader->segments()[0], "zero_w").terms());
   EXPECT_EQ(expectedIds({"z0", "z1"}), exprIds("zero_w:*"));
 }

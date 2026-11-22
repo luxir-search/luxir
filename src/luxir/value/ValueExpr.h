@@ -151,13 +151,13 @@ public:
 // A STRING or ID column node. count() reads only its shape; a consumer that
 // needs the stored ords (cardinality) attaches them.
 struct BoundStringColumn {
-  const SegFieldInfo& fieldInfo;
+  const DecodedFieldRecord& fieldInfo;
   ColumnShape shape;
   ColumnShape::Cursor cursor;
   OrdColReader* ords = nullptr;
   OrdColReader::BulkOrds* ordValues = nullptr;
 
-  BoundStringColumn(PostingsReader& postings, const SegFieldInfo& fieldInfo)
+  BoundStringColumn(PostingsReader& postings, const DecodedFieldRecord& fieldInfo)
       : fieldInfo(fieldInfo), shape(postings, fieldInfo), cursor(shape) {}
 
   // Only indexed STRING and ID columns store ords.

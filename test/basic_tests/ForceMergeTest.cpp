@@ -364,10 +364,10 @@ TEST_F(ForceMergeTest, dropsFieldsWithNoSurvivingValues) {
     ASSERT_EQ(1u, reader->segments().size());
     auto& postings = reader->segments()[0].postingsReader();
     for (const auto& field : fields) ASSERT_NE(nullptr, postings.fieldInfo(field)) << field;
-    EXPECT_TRUE(postings.fieldInfo("tag_s")->hasOrdColumn());
-    EXPECT_TRUE(postings.fieldInfo("tags_ss")->hasEndValueRanks());
-    EXPECT_FALSE(postings.fieldInfo("postings_s")->hasOrdColumn());
-    EXPECT_FALSE(postings.fieldInfo("gone_v")->valDocLoc.isNull());
+    EXPECT_TRUE(postings.fieldInfo("tag_s")->ordColumn());
+    EXPECT_TRUE(postings.fieldInfo("tags_ss")->endValueRanks());
+    EXPECT_FALSE(postings.fieldInfo("postings_s")->ordColumn());
+    EXPECT_TRUE(postings.fieldInfo("gone_v")->owners());
   }
   ASSERT_TRUE(helper.deleteById("dead", UpdateMessage::COMMIT).success);
 

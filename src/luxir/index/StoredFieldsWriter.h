@@ -42,16 +42,13 @@ namespace luxir {
 //   <chunk 0: [int32 uncompressedSize][compressed bytes]>
 //   <chunk 1: ...>
 //   ...
-//   <metadata: [vlong maxChunkBytes][varint numDirtyChunks][byte codec]
-//              [varint chunkTarget][varint maxDocsPerChunk]
-//              [varint dictSize][dictSize bytes]
-//              [varint numFields] then numFields PackedTerms (field names
-//              keyed by segment-local stored-field id)>
+//   <optional compression dictionary>
+//   <[varint numFields] then numFields PackedTerms (field names keyed by
+//    segment-local stored-field id)>
 //
-// Every chunk of a resource uses the codec recorded in its metadata; the chunk
-// limits are recorded so merges can tell whether chunks may be copied verbatim.
+// The field record carries the codec and chunk limits for merge admission.
 // The writer pins an optional prepared ZSTD dictionary and uses it from the
-// first chunk. Its bytes are stored once in metadata (dictSize 0 for none).
+// first chunk.
 // A dirty chunk was sealed before reaching either limit (a segment's last
 // chunk, or the chunk pending before a merge appended copied chunks); copied
 // chunks carry their source's count.  Merges recompress a source with too many
@@ -78,11 +75,8 @@ namespace luxir {
 class StoredFieldsWriter {
 private:
   PostingsWriter& postingsWriter;
-  SpaceOrdinal space;
-  std::string resourceName_;
   StoredChunkFormat format_;
   OutputStreamPtr chunkOutput;
-  int64_t chunksStart = 0;
 
   // field name -> segment-local stored-field id (transparent lookup avoids
   // materializing a std::string per addValue call).
@@ -106,7 +100,7 @@ private:
 
   // Completed chunk metadata.
   std::vector<int64_t> chunkFirstDocs;
-  std::vector<int64_t> chunkFileOffsets;  // relative to chunksStart
+  std::vector<int64_t> chunkFileOffsets;  // relative to the start of the chunks
   int64_t maxChunkBytes = 0;
   int32_t numDirtyChunks = 0;
 
@@ -116,27 +110,19 @@ private:
   StoredChunkCompressor compressor;
 
 public:
-  // Create a writer for the named resource.  resourceName is the field name
-  // under which the resource is registered in the segment's per-field index;
-  // the caller resolves the format from the schema's StoredFieldType.  See
-  // Postings::STORED_DEFAULT_RESOURCE for the canonical default.
-  explicit StoredFieldsWriter(PostingsWriter& pw, SpaceOrdinal space,
-                              std::string_view resourceName = Postings::STORED_DEFAULT_RESOURCE,
+  // The caller resolves the format from the schema's StoredFieldType.
+  explicit StoredFieldsWriter(PostingsWriter& pw,
                               const StoredChunkFormat& format = {},
                               std::shared_ptr<const StoredCompressionDictionary> dictionary = {})
-    : postingsWriter(pw), space(space),
-      resourceName_(resourceName),
-      format_(format),
+    : postingsWriter(pw), format_(format),
       compressor(dictionary)
   {
     if (dictionary && !dictionary->matches(format)) {
       throw std::invalid_argument("stored fields: dictionary compression parameters do not match format");
     }
     chunkOutput = postingsWriter.getOutputStream();
-    chunksStart = (int64_t)chunkOutput->size();
   }
 
-  std::string_view resourceName() const { return resourceName_; }
   const StoredChunkFormat& format() const { return format_; }
 
   // Append one value for (docID, fieldName).  docID must be non-decreasing
@@ -171,13 +157,13 @@ public:
 
   // Finalize: close the pending doc, pad any skipped docs up to maxDoc with
   // empty entries, flush the last chunk, write metadata and monotonic columns,
-  // and register the resource with the PostingsWriter.  No-op if no stored
-  // values were added.
-  void finish(int32_t maxDoc) {
+  // and return the stored resource. No resource is produced if no field was
+  // added or adopted.
+  [[nodiscard]] std::optional<field_parts::Stored> finish(int32_t maxDoc) {
     // No fields were added or adopted from a merge source.
     if (fieldNames.empty()) {
-      chunkOutput.reset();
-      return;
+      postingsWriter.finishStream(std::move(chunkOutput));
+      return {};
     }
     if (currentDoc >= 0) {
       finalizeCurrentDoc();
@@ -193,60 +179,33 @@ public:
     int32_t numChunks = (int32_t)chunkFirstDocs.size();
     assert(numChunks > 0);
 
-    // Chunks region end (offset relative to chunksStart) acts as mono2 sentinel.
-    int64_t chunksRegionEnd = (int64_t)chunkOutput->size() - chunksStart;
+    // The chunk offset index ends with the end of the chunks region.
+    int64_t chunksRegionEnd = (int64_t)chunkOutput.pos();
 
-    // Metadata block follows chunks in the same file.
-    chunkOutput->writeVlong((uint64_t)maxChunkBytes);
-    chunkOutput->writeVint((uint32_t)numDirtyChunks);
-    chunkOutput->write((char)format_.codec);
-    chunkOutput->writeVint(format_.chunkTarget);
-    chunkOutput->writeVint(format_.maxDocsPerChunk);
     auto dictionary = compressor.dictionary();
-    chunkOutput->writeVint((uint32_t)dictionary.size());
     chunkOutput->write(dictionary.data(), dictionary.size());
+    auto namesStart = chunkOutput.pos();
     chunkOutput->writeVint((uint32_t)fieldNames.size());
     for (const auto& name : fieldNames) {
       chunkOutput->writePackedTerm(name);
     }
 
-    auto& fi = postingsWriter.addField(space, resourceName_);
-    fi.type = FieldType::BIN;
-    fi.flags = FieldType::STORED;
-    fi.columnLoc = seg_location(chunkOutput->streamNumber, (uint64_t)chunksStart);
-    fi.columnMetaOff = chunksRegionEnd;
-    fi.numValues = numChunks;
-    fi.docsWithField = maxDoc;
-
-    // Drop the chunks output stream before opening new ones for the monotonic columns.
-    chunkOutput.reset();
-
-    {
-      auto& tmpPool = MemPool::threadLocal();
+    auto namesBytes = chunkOutput.pos() - namesStart;
+    auto slice = postingsWriter.finishStream(std::move(chunkOutput));
+    auto& tmpPool = MemPool::threadLocal();
+    auto writeIndex = [&](std::span<const int64_t> values, std::optional<int64_t> sentinel) {
       auto guard = tmpPool.rewindScopeGuard();
-      OutputStreamPtr monoOut = postingsWriter.getOutputStream();
-      MonoWriter mono(tmpPool, *monoOut);
-      for (int64_t v : chunkFirstDocs) {
-        mono.addInt64(v);
-      }
-      mono.finish();
-      fi.monoLoc = mono.blockLoc;
-      fi.monoMetaOff = mono.metaOff;
-    }
-
-    {
-      auto& tmpPool = MemPool::threadLocal();
-      auto guard = tmpPool.rewindScopeGuard();
-      OutputStreamPtr mono2Out = postingsWriter.getOutputStream();
-      MonoWriter mono2(tmpPool, *mono2Out);
-      for (int64_t v : chunkFileOffsets) {
-        mono2.addInt64(v);
-      }
-      mono2.addInt64(chunksRegionEnd);  // sentinel
-      mono2.finish();
-      fi.mono2Loc = mono2.blockLoc;
-      fi.mono2MetaOff = mono2.metaOff;
-    }
+      auto out = postingsWriter.getOutputStream();
+      MonoWriter mono(tmpPool, *out);
+      for (int64_t value : values) mono.addInt64(value);
+      if (sentinel) mono.addInt64(*sentinel);
+      return mono.finish(postingsWriter, std::move(out));
+    };
+    auto firstDocs = writeIndex(chunkFirstDocs, {});
+    auto chunkOffsets = writeIndex(chunkFileOffsets, chunksRegionEnd);
+    return field_parts::Stored{numChunks, numDirtyChunks, maxChunkBytes,
+        format_.codec, format_.chunkTarget, format_.maxDocsPerChunk, slice.location,
+        chunksRegionEnd, dictionary.size(), namesBytes, firstDocs, chunkOffsets};
   }
 
   int32_t numChunksWritten() const {
@@ -287,17 +246,18 @@ public:
   // Adopt the source's field-id table: every existing id must map to the same
   // name; names beyond our table extend it.  Returns false (table unchanged)
   // on any mismatch.
-  bool adoptFieldTable(std::span<const std::string_view> names) {
+  bool adoptFieldTable(std::span<const PackedTerm> names) {
     size_t common = (std::min)(names.size(), fieldNames.size());
     for (size_t i = 0; i < common; i++) {
-      if (std::string_view(fieldNames[i].data(), fieldNames[i].size()) != names[i]) {
+      if (fieldNames[i] != names[i]) {
         return false;
       }
     }
     for (size_t i = fieldNames.size(); i < names.size(); i++) {
       uint32_t id = (uint32_t)fieldNames.size();
-      fieldNames.emplace_back(postingsWriter.copyTerm(names[i]));
-      fieldNameToId.emplace(std::string(names[i]), id);
+      auto name = std::string_view(names[i]);
+      fieldNames.emplace_back(postingsWriter.copyTerm(name));
+      fieldNameToId.emplace(std::string(name), id);
     }
     return true;
   }
@@ -332,7 +292,7 @@ public:
     assert(currentDoc < 0 && chunkDocOffsets.empty());
     assert(lastFinalizedDoc == docBase - 1);
     assert(firstDocs.size() == offsets.size() && !firstDocs.empty());
-    int64_t outBase = (int64_t)chunkOutput->size() - chunksStart;
+    int64_t outBase = (int64_t)chunkOutput.pos();
     for (size_t i = 0; i < firstDocs.size(); i++) {
       chunkFirstDocs.push_back(docBase + firstDocs[i]);
       chunkFileOffsets.push_back(outBase + offsets[i]);
@@ -442,8 +402,7 @@ private:
   void writeChunk(int32_t firstDoc, std::string_view uncompressed) {
     size_t compressedSize = compressor.compress(format_, uncompressed, compressScratch);
 
-    // Record chunk position before writing (offsets are relative to chunksStart).
-    int64_t chunkFileOffset = (int64_t)chunkOutput->size() - chunksStart;
+    int64_t chunkFileOffset = (int64_t)chunkOutput.pos();
     chunkFirstDocs.push_back(firstDoc);
     chunkFileOffsets.push_back(chunkFileOffset);
 

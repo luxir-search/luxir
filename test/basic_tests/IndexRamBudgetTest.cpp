@@ -170,7 +170,7 @@ TEST(IndexRamBudgetTest, DrainingGrowthCountsForAdmissionNotPressure) {
   auto guard = budget.forceAcquire(8);
   guard.markDraining();
 
-  guard.growDraining(5);
+  guard.adjustSize(5);
   EXPECT_EQ(13, guard.size());
   EXPECT_EQ(13, budget.reservedBytes());
   EXPECT_EQ(13, budget.drainingBytesCount());
@@ -190,7 +190,7 @@ TEST(IndexRamBudgetTest, PartialDrainingTransfersRetainedDeletes) {
   IndexRamBudget budget(80);
   auto inverter = budget.forceAcquire(100);
   inverter.markDraining(60);
-  inverter.growDraining(20);
+  inverter.adjustSize(20);
   EXPECT_EQ(60, budget.drainingBytesCount());
   inverter.clearDraining();
   EXPECT_EQ(0, budget.drainingBytesCount());
@@ -217,7 +217,7 @@ TEST(IndexRamBudgetTest, RetainedDeleteTransferSizeMismatch) {
     IndexRamBudget budget(100);
     auto inverter = budget.forceAcquire(100);
     inverter.markDraining(60);
-    inverter.growDraining(20);
+    inverter.adjustSize(20);
     auto packet = inverter.transferToRetainedDeletes(actual);
     EXPECT_EQ(actual, packet.size());
     EXPECT_EQ(actual, budget.retainedDeleteBytesCount());

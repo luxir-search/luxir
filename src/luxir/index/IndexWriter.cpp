@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/reader/SegmentCore.h"
-#include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "luxir/store/Manifest.h"
 
@@ -206,7 +205,14 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       seg.liveDocs = segment.live_docs;
       seg.mergeRows = segment.merge_rows.value_or(segment.max_doc);
       seg.schema = SchemaBinding(segment.schema);
-      seg.files = fromWire(segment.files);
+      auto liveFileName = seg.liveGen ? Postings::getLiveDocsFileName(
+          Postings::segmentKey(seg.segId, seg.creatorEpoch), seg.liveGen, seg.liveEpoch) : std::string();
+      for (const auto& file : segment.files) {
+        FileDescriptor descriptor{std::string(file.name), file.size, file.xxh3};
+        if (file.name == liveFileName) seg.liveFile = std::move(descriptor);
+        else seg.baseFiles.push_back(std::move(descriptor));
+      }
+      seg.catalog = catalogRangeFromManifest(segment.catalog);
       seg.firstCommitTime = segment.commit_time;  // firstCommitTime is stored in the segment meta.
       seg.lastCommitTime = indexInfo.commit_time; // not stored in the segment meta, so use index meta.
       seg.nextOverlayGen = segment.next_overlay_gen;
@@ -248,12 +254,14 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       for (const auto& space : readerCore->spaces()) {
         auto* reader = readerCore->spaceReader(space.path);
         const auto* field = reader->fieldInfo(name);
-        if (!field || !field->stored || field->stored->dictionary.empty()) continue;
-        auto bytes = field->columnMetaOff;
+        const auto* part = field ? field->stored() : nullptr;
+        if (!part || !part->dictionaryBytes) continue;
+        auto dictionary = std::string_view(readerCore->slice(part->dictionary()));
+        auto bytes = part->chunksBytes;
         if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
           bestBytes = bytes;
           bestSegId = id;
-          bestDictionary = field->stored->dictionary;
+          bestDictionary = dictionary;
         }
       }
     }
@@ -893,13 +901,6 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
   // not outlive the release.
   inverter.clearUndoLog();
 
-  // This is the first quiescent point where the output size proxy is known.
-  // Spill candidates as soon as an inverter proves large, including when it
-  // returns idle without flushing, so only expected-small segments retain
-  // complete filesystem output in RAM.
-  inverter.postingsWriter.configureRamDelegation(
-      inverter.memSize() < PostingsWriter::SMALL_SEGMENT_BYTES);
-
   const std::lock_guard<std::mutex> lock(indexMutex);
   auto it = busyInverters.find(&inverter);
   if (it == busyInverters.end()) {
@@ -1448,12 +1449,22 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   std::vector<std::string> flushedFiles;
   std::vector<FileDescriptor> descriptors;
   bool success = false;
+  CatalogRange catalog;
+  std::optional<FileDescriptor> liveFile;
   bool aborted = inverter.failed();
   if (!aborted) {
     try {
       // uncomment to serialize inverter flushing (for testing purposes)
       // const std::lock_guard<std::mutex> lock(indexMutex);
       success = inverter.flush(&flushedFiles, &descriptors);
+      if (success) {
+        catalog = inverter.getPostingsWriter().catalogRange();
+        // The inverter writes any initial live-docs file before the base files.
+        if (inverter.liveGen) {
+          liveFile = std::move(descriptors.front());
+          descriptors.erase(descriptors.begin());
+        }
+      }
     } catch (const std::exception& e) {
       LOG_ERROR("Exception caught while flushing inverter: {}", e.what());
       inverter.fail(std::current_exception());
@@ -1475,7 +1486,9 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
                                         inverter.getPostingsWriter().getMaxDoc(SpaceOrdinal::ROOT));
     segInfo->mergeRows = inverter.getPostingsWriter().getMaxSpaceRows();
     segInfo->unsyncedFiles = std::move(flushedFiles);
-    segInfo->files = std::move(descriptors);
+    segInfo->baseFiles = std::move(descriptors);
+    segInfo->catalog = catalog;
+    segInfo->liveFile = std::move(liveFile);
     segInfo->minVersion = inverter.minVersion;
     segInfo->maxVersion = inverter.maxVersion;
     segInfo->schema = inverter.schema->binding;
@@ -1972,7 +1985,8 @@ void IndexWriter::retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments
     if (!seg) continue;
     INDEX_DEBUG("Deleting files {}", *seg);
     std::vector<std::string> names;
-    for (const auto& file : seg->files) names.push_back(file.name);
+    for (const auto& file : seg->baseFiles) names.push_back(file.name);
+    if (seg->liveFile) names.push_back(seg->liveFile->name);
     for (const auto& overlay : seg->auxOverlays) for (const auto& file : overlay.files) names.push_back(file.name);
     for (auto gen : seg->obsoleteLiveGens) names.push_back(Postings::getLiveDocsFileName(
         Postings::segmentKey(seg->segId, seg->creatorEpoch), gen, seg->liveEpochFor(gen, writerEpoch)));
@@ -2088,14 +2102,18 @@ std::vector<std::string> collectValidatedExactVectorOverlayNames(
 // Benign load-then-store race: the commit thread and a merge thread can both
 // miss and each create a SegmentCore for a source segment - both are valid,
 // one is wasted, last store wins.  Deliberately NOT a lock or CAS; do not
-// "fix" this into synchronization.
+// "fix" this into synchronization. Merge admission calls this with indexMutex
+// held, so nothing here may take it: the base file inventory is immutable.
 //
 std::shared_ptr<SegmentCore> IndexWriter::getSegmentCore(SegInfo& seg) {
   auto core = seg.sharedSegmentCore.load();
   if (!core) {
     std::shared_ptr<IndexReader> reader;
     if (const auto* published = publishedSegment(seg, reader)) core = published->segmentCoreShared();
-    if (!core) core = std::make_shared<SegmentCore>(dir, seg.segId, seg.creatorEpoch);
+    if (!core) {
+      auto source = SegmentCore::source(seg.segId, seg.creatorEpoch, seg.catalog, seg.maxDoc, seg.baseFiles);
+      core = SegmentCore::create(dir, seg.segId, seg.creatorEpoch, source);
+    }
     seg.sharedSegmentCore.store(core);
   }
   auto& pr = core->rootReader();
@@ -2103,16 +2121,12 @@ std::shared_ptr<SegmentCore> IndexWriter::getSegmentCore(SegInfo& seg) {
   if (!rangeKnown || seg.idDictionaryBlocks.load() == UINT64_MAX) {
     IdRange range;
     uint64_t blocks = 0;
-    if (auto* info = pr.fieldInfo("id"); info && info->nTerms > 0) {
-      auto guard = MemPool::threadLocalPoolGuard();
-      TermsEnum terms(guard.pool(), pr, *info);
-      blocks = terms.numBlocks();
+    if (auto* info = pr.fieldInfo("id"); info && info->terms()) {
+      assert(info->type == FieldType::ID);
+      blocks = info->termBlockCount();
       if (!rangeKnown) {
-        terms.seekOrd(0);
-        range.min = (std::string_view)terms.term();
-        terms.seekOrd(info->nTerms - 1);
-        range.max = (std::string_view)terms.term();
-        range.empty = false;
+        const auto& exact = *info->dictionaryBounds();
+        range = IdRange{std::string(std::string_view(exact.lower)), std::string(std::string_view(exact.upper)), false};
       }
     }
     seg.idDictionaryBlocks.store(blocks);
@@ -2597,7 +2611,10 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
     wire.live_docs = seg.liveDocs;
     wire.schema = seg.schema.wire();
     wire.next_overlay_gen = seg.nextOverlayGen;
-    wire.files = toWire(seg.files, arena);
+    auto* files = api::build::allocArray(wire.files, seg.baseFiles.size() + seg.liveFile.has_value(), arena);
+    for (const auto& file : seg.baseFiles) *files++ = {file.name, file.size, file.xxh3};
+    if (const auto& live = seg.liveFile) *files = {live->name, live->size, live->xxh3};
+    wire.catalog = catalogRangeToManifest(seg.catalog);
     auto* overlays = api::build::allocArray(wire.overlays, seg.auxOverlays.size(), arena);
     for (size_t j = 0; j < seg.auxOverlays.size(); j++) overlays[j] = toWire(seg.auxOverlays[j], arena);
   }
@@ -2751,17 +2768,14 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         MemPool metadataPool;
         boost::unordered_flat_map<std::string, int64_t> additions;
         auto ordsFit = [&](PostingsReader& reader) {
-          FieldReader fields(reader);
-          while (fields.readNextField()) {
-            SegFieldInfo info{};
-            fields.readFieldInfo(info);
-            if (FieldType::storage(info.type) != FieldType::Storage::TERMS ||
-                (info.flags & FieldType::INDEX_DOCS) == 0 ||
-                (info.flags & FieldType::MULTI_VALUED) == 0) {
+          for (int32_t ordinal = 0; ordinal < reader.numFields(); ++ordinal) {
+            auto header = reader.fieldHeader(ordinal);
+            if (FieldType::storage(header.type) != FieldType::Storage::TERMS || !(header.flags & FieldType::INDEX_DOCS)
+                || !(header.flags & FieldType::MULTI_VALUED)) {
               continue;
             }
-            std::string name((std::string_view)info.fieldname);
-            int64_t next = additions[name] + info.nTerms;
+            std::string name(std::string_view(header.name));
+            int64_t next = additions[name] + header.indexedTotals.numTerms;
             if (!MergeCostModel::ordTermsFit(ordTermSums[name], next)) {
               return false;
             }
@@ -2776,7 +2790,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           // Physical rows bound the merged space from above: rows of deleted
           // roots still count, so a merge that would fit once they are dropped
           // can be skipped.
-          int64_t next = pathRows[space.path] + space.maxDoc;
+          int64_t next = pathRows[std::string(space.path)] + space.maxDoc;
           fits = MergeCostModel::docsFit(0, next)
               && ordsFit(*postingsReaderCore->spaceReader(space.path));
           nextRows.emplace_back(space.path, next);
@@ -2906,7 +2920,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         newSegInfo->schema = std::min(newSegInfo->schema, segs[i]->schema);
       }
       phase = "postings_finish";
-      pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
+      pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->baseFiles);
+      newSegInfo->catalog = pwriter.catalogRange();
       newSegInfo->mergeRows = pwriter.getMaxSpaceRows();
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
@@ -2963,14 +2978,14 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         if (changed) {
           // Each retry writes a new immutable bitmap for this private output.
           newSegInfo->unsyncedFiles.reserve(newSegInfo->unsyncedFiles.size() + 1);
-          newSegInfo->files.reserve(newSegInfo->files.size() + 1);
           auto name = Postings::getLiveDocsFileName(Postings::segmentKey(outputSegId, writerEpoch), newSegInfo->liveGen, writerEpoch);
           if (newSegInfo->liveGen) dir.deleteFile(name);
           std::erase(newSegInfo->unsyncedFiles, name);
-          std::erase_if(newSegInfo->files, [&](const auto& file) { return file.name == name; });
+          std::vector<FileDescriptor> descriptors;
           liveDocsBytesWritten += LiveDocsWriter::writeLiveDocs(dir, outputSegId, writerEpoch,
               newSegInfo->liveGen + 1, writerEpoch, *outputLiveBits, newSegInfo->maxDoc, newSegInfo->liveDocs,
-              newSegInfo->unsyncedFiles, &newSegInfo->files);
+              newSegInfo->unsyncedFiles, &descriptors);
+          newSegInfo->liveFile = std::move(descriptors.front());
           newSegInfo->liveGen++;
         }
         Signal::emit("mergeLiveDocsDiff", newSegInfo.get());
@@ -3384,6 +3399,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
   std::vector<uint64_t> committedIds;
   std::vector<uint64_t> writerSegmentIds;
   std::vector<std::shared_ptr<SegmentCore>> cores;
+  std::vector<SegmentCore::Source> sources;
   auto copyAux = [](const AuxInfo& src) {
     AuxStats dst;
     dst.kind = src.kind;
@@ -3446,6 +3462,8 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
 
       auto& dst = out.segmentStats.emplace_back();
       cores.push_back(seg->sharedSegmentCore.load());
+      sources.push_back(cores.back() ? SegmentCore::Source{}
+          : SegmentCore::source(seg->segId, seg->creatorEpoch, seg->catalog, seg->maxDoc, seg->baseFiles));
       dst.segId = seg->segId;
       dst.creatorEpoch = seg->creatorEpoch;
       dst.liveGen = seg->liveGen;
@@ -3464,7 +3482,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
 
   for (size_t i = 0; i < cores.size(); i++) {
     auto& segment = out.segmentStats[i];
-    if (!cores[i]) cores[i] = SegmentCore::create(dir, segment.segId, segment.creatorEpoch, true);
+    if (!cores[i]) cores[i] = SegmentCore::create(dir, segment.segId, segment.creatorEpoch, sources[i], true);
     if (cores[i]) segment.readSpaces(*cores[i]);
   }
   cores.clear();
@@ -3712,10 +3730,10 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     numLiveDocs -= deleted;
 
     std::string oldLiveFile = Postings::getLiveDocsFileName(Postings::segmentKey(seg.segId, seg.creatorEpoch), seg.liveGen, seg.liveEpoch);
+    std::vector<FileDescriptor> descriptors;
     liveDocsBytesWritten += LiveDocsWriter::writeLiveDocs(dir, seg.segId, seg.creatorEpoch, newLiveGen, writerEpoch,
-                                                        *liveBits, maxDocId, numLiveDocs, seg.unsyncedFiles, &seg.files);
+                                                        *liveBits, maxDocId, numLiveDocs, seg.unsyncedFiles, &descriptors);
     // The superseded generation needs no sync: it is published or never will be.
-    std::erase_if(seg.files, [&](const auto& file) { return file.name == oldLiveFile; });
     std::erase(seg.unsyncedFiles, oldLiveFile);
 
     INDEX_DEBUG("Applied {} new deletes to segment {} (new delete generation: {}, total live docs: {})",
@@ -3723,6 +3741,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
 
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
+      seg.liveFile = std::move(descriptors.front());
       seg.liveDocs = numLiveDocs;
       assert(seg.liveGen + 1 == newLiveGen);
       if (seg.liveGen > 0) seg.obsoleteLiveGens.push_back(seg.liveGen);

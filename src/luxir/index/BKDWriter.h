@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <span>
+#include <type_traits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -46,6 +47,15 @@ public:
       PointsWriter::DEFAULT_MAX_POINTS_PER_LEAF;
   // pointCount is at offset 24, and the fixed bootstrap ends at offset 32.
   static constexpr uint32_t FIXED_HEADER_SIZE = 32;
+  // Padded header, inner nodes, four coordinate bounds per leaf and leaf pointers.
+  static uint64_t directoryBytes(uint64_t start, uint32_t leaves) noexcept {
+    return directoryOffset(start) + (uint64_t)(leaves - 1) * sizeof(InnerNode)
+        + (uint64_t)leaves * 4 * sizeof(Scalar) + ((uint64_t)leaves + 1) * sizeof(uint64_t);
+  }
+
+  static uint64_t directoryOffset(uint64_t start) noexcept {
+    return alignUp(start + FIXED_HEADER_SIZE, MAX_ALIGN) - start;
+  }
   static constexpr uint32_t LEAF_HEADER_SIZE = sizeof(LeafHeader);
   static constexpr uint8_t DOC_CONTIG = PointsWriter::DOC_CONTIG;
   static constexpr uint8_t DOC_FOR = PointsWriter::DOC_FOR;
@@ -65,11 +75,17 @@ public:
     bool bitsetDocids = true;
   };
 
+  using Bounds = std::conditional_t<std::is_same_v<Scalar, int32_t>,
+                                    field_parts::GeoBounds, field_parts::IntervalBounds>;
+
   struct Data {
-    seg_location pointsLoc;
+    size_t pointsStart;
     int64_t pointsMetaOff;
     uint64_t pointCount;
     uint32_t leafCount;
+    uint16_t maxPointsPerLeaf;
+    uint64_t directoryBytes;
+    Bounds bounds;
   };
 
   struct __attribute__((packed)) FixedHeader {
@@ -371,6 +387,14 @@ public:
     }
   }
 
+  [[nodiscard]] WrittenPoints write(std::span<Point> points, PostingsWriter& postings,
+                                           OutputStreamPtr&& output) {
+    auto data = write(points);
+    auto slice = postings.finishStream(std::move(output));
+    return {{slice.location.addOffset(data.pointsStart), (uint64_t)data.pointsMetaOff,
+             data.maxPointsPerLeaf}, data.bounds};
+  }
+
   Data write(std::span<Point> points) {
     if (finished) throw std::logic_error("BKDWriter: write called twice");
     if (points.empty()) throw std::invalid_argument("BKDWriter: empty input");
@@ -380,8 +404,7 @@ public:
       }
     }
     totalPoints = points.size();
-    uint64_t leafCount64 = totalPoints / options.maxPointsPerLeaf
-                         + (totalPoints % options.maxPointsPerLeaf != 0);
+    uint64_t leafCount64 = PointsWriter::leafCount(totalPoints, options.maxPointsPerLeaf);
     if (leafCount64 > std::numeric_limits<uint32_t>::max()) {
       throw std::overflow_error("BKDWriter: too many leaves");
     }
@@ -410,9 +433,17 @@ public:
     out.write(min1.data(), min1.size() * sizeof(Scalar));
     out.write(max1.data(), max1.size() * sizeof(Scalar));
     out.write(leafPointers.data(), leafPointers.size() * sizeof(uint64_t));
+    field_parts::AxisBounds<Scalar> first;
+    field_parts::AxisBounds<Scalar> second;
+    for (uint32_t leaf = 0; leaf < totalLeaves; ++leaf) {
+      first.include(min0[leaf], max0[leaf]);
+      second.include(min1[leaf], max1[leaf]);
+    }
     finished = true;
-    return {seg_location(out.streamNumber, pointsStart), (int64_t)metaOffset,
-            totalPoints, totalLeaves};
+    auto bytes = directoryBytes(pointsStart + metaOffset, totalLeaves);
+    assert(bytes == out.size() - pointsStart - metaOffset);
+    return {pointsStart, (int64_t)metaOffset,
+            totalPoints, totalLeaves, options.maxPointsPerLeaf, bytes, {first, second}};
   }
 };
 

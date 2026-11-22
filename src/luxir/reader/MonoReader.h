@@ -7,13 +7,16 @@
 #include <span>
 
 #include "luxir/codec/NumColumn.h"
+#include "FieldParts.h"
+#include "ReaderErrors.h"
 #include "luxir/store/InputStream.h"
 #include "luxir/store/OutputStream.h"
 
 namespace luxir {
+class SegmentCore;
 class PostingsReader;
 
-// Monotonic semantic facade over the shared numeric-column physical layer.
+// Reads monotonic offsets, ranks, and ownership indexes from numeric blocks.
 class MonoReader {
   MonoColumn values;
 
@@ -23,20 +26,30 @@ public:
   static constexpr int64_t ENDINDEX = MonoColumn::ENDINDEX;
   using BlockInfo = NumBlockInfo;
 
-  MonoReader(PostingsReader& postingsReader, seg_location loc, int64_t metaOff,
-             int64_t nValues);
+  MonoReader() = default;
+  MonoReader(SegmentCore& core, field_parts::Slice slice, int64_t numValues,
+             PackedTerm field = PackedTerm(nullptr));
 
-  MonoReader(InputStream& columnIS, int64_t loc, int64_t metaOff,
-             int64_t nValues) {
+  static MonoReader openEndValueRanks(PostingsReader& reader, const DecodedFieldRecord& fieldInfo);
+
+  // Checks the block used for an endpoint read before touching its payload.
+  int64_t checkedValueAt(int64_t rank, SegmentReadContext context) const;
+  void requireLast(int64_t expected, SegmentReadContext context, const char* reason) const;
+
+  bool has_value() const noexcept { return values.has_value(); }
+  explicit operator bool() const noexcept { return has_value(); }
+
+  // Opens a standalone buffer for numeric codec tests.
+  MonoReader(InputStream& columnIS, int64_t loc, int64_t metaOff, int64_t numValues) {
     const char* blocks = columnIS.ptr(loc);
-    values = MonoColumn(blocks, blocks + metaOff, nValues);
+    values = MonoColumn(blocks, blocks + metaOff, numValues);
   }
 
   [[nodiscard]] int64_t numValues() const {
     return values.numValues();
   }
 
-  uint64_t sizeInBytes() const { return values.blockBytes(); }
+  uint64_t sizeInBytes() const { return values.has_value() ? values.blockBytes() : 0; }
 
   [[nodiscard]] int64_t valueAt(int64_t index) const {
     return values.valueAt(index);

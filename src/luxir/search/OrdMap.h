@@ -13,7 +13,7 @@
 #include "TopTerms.h"
 #include "luxir/codec/LinearPack.h"
 #include "luxir/codec/OrdColumnFormat.h"
-#include "luxir/reader/IntColReader.h"
+#include "luxir/codec/NumColumn.h"
 
 namespace luxir {
 
@@ -216,8 +216,8 @@ private:
   int firstFull = -1; // first segment that has all the ords, or -1 if none
   TopTerms topTermList;
   std::vector<SegToGlobal> segToGlobal;    // per-segment mapping from segment ord to global ord
-  std::optional<IntColReader> firstSegs;  // for each global ord, what is the first segment it appeared in
-  std::optional<IntColReader> globDeltas; // for each global ord, what delta was applied to the segment ord to get the global ord
+  std::optional<NumColumn> firstSegs;  // for each global ord, what is the first segment it appeared in
+  std::optional<NumColumn> globDeltas; // for each global ord, what delta was applied to the segment ord to get the global ord
 
 public:
   // Constructor for single segment with values case (identity mapping)
@@ -313,14 +313,14 @@ public:
     if (nValues > 0 && firstFull == -1) {  // Create global columns if no segment has all terms
       auto loc = dataIS.readVlong();
       auto metaOff = dataIS.readVlong();
-      firstSegs.emplace(dataIS, start + loc, metaOff, nValues);
+      firstSegs.emplace(dataIS.ptr(start + loc), dataIS.ptr(start + loc + metaOff), nValues);
     }
 
     nValues = dataIS.readVlong();
     if (nValues > 0 && firstFull == -1) {  // Create global columns if no segment has all terms
       auto loc = dataIS.readVlong();
       auto metaOff = dataIS.readVlong();
-      globDeltas.emplace(dataIS, start + loc, metaOff, nValues);
+      globDeltas.emplace(dataIS.ptr(start + loc), dataIS.ptr(start + loc + metaOff), nValues);
     }
   }
 
@@ -352,13 +352,13 @@ public:
     return segToGlobal[seg];
   }
 
-  /// Returns the firstSegs IntColReader, or null if not present/needed since at least one segment had all the ords.
-  IntColReader* getFirstSegs() {
+  /// Returns the firstSegs NumColumn, or null if not present/needed since at least one segment had all the ords.
+  const NumColumn* getFirstSegs() const {
     return firstSegs ? &(*firstSegs) : nullptr;
   }
 
-  /// Returns the globDeltas IntColReader, or null if not present/needed since at least one segment had all the ords.
-  IntColReader* getGlobDeltas() {
+  /// Returns the globDeltas NumColumn, or null if not present/needed since at least one segment had all the ords.
+  const NumColumn* getGlobDeltas() const {
     return globDeltas ? &(*globDeltas) : nullptr;
   }
 

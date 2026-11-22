@@ -302,7 +302,7 @@ class OrdMapBuilder {
     std::optional<OrdColumnFormat::PredictedBlockInfo> singleFitPlan;
 
     TermsEnumIdx(size_t idx, MemPool& pool, PostingsReader& postingsReader,
-                 const SegFieldInfo& finfo, OrdMap::DeltaEncoding encoding)
+                 const DecodedFieldRecord& finfo, OrdMap::DeltaEncoding encoding)
         : idx(idx), tenum(pool, postingsReader, finfo), encoding(encoding) {
       if (encoding == OrdMap::DeltaEncoding::PREDICTED) {
         deltas.emplace<PredictedDeltaBlocks>();

@@ -626,8 +626,9 @@ TEST_F(NumericRangeZoneMapTest, linearFitBlocksResolveRankRuns) {
   constexpr int64_t MIN = std::numeric_limits<int64_t>::min();
   constexpr int64_t MAX = std::numeric_limits<int64_t>::max();
   for (const auto& field : fields) {
+    const auto& info = *segment.postingsReader().fieldInfo(field.name);
     IntColReader column(segment.postingsReader(),
-                        *segment.postingsReader().fieldInfo(field.name));
+                        info);
     for (int64_t block = 0; block < column.numBlocks(); block++) {
       EXPECT_TRUE(column.blockInfo(block).linearFit()) << field.name;
     }
@@ -712,8 +713,9 @@ TEST_F(NumericRangeZoneMapTest, leafZonesResolveCrossingBlocks) {
   index.flush();
   index.initReader();
   auto& segment = index.reader->segments()[0];
+  const auto& columnInfo = *segment.postingsReader().fieldInfo("leaf_bands_i");
   IntColReader column(segment.postingsReader(),
-                      *segment.postingsReader().fieldInfo("leaf_bands_i"));
+                      columnInfo);
   EXPECT_FALSE(column.blockInfo(0).linearFit());
 
   for (auto [lo, hi] : std::array<std::pair<int64_t, int64_t>, 5>{{
@@ -737,7 +739,7 @@ TEST_F(NumericRangeZoneMapTest, leafZonesResolveCrossingBlocks) {
 namespace {
 
 // Zone fills over sparse and multivalued columns, against values kept per
-// doc. 70,000 docs span two docsWithValue buckets: sparse_i's first is a
+// doc. 70,000 docs span two presence bitmap buckets: sparse_i's first is a
 // bitset and its second a sorted array; rare_i's are both arrays.
 class ZoneFillWindowTest : public LuxirTest {
 protected:
@@ -1009,8 +1011,9 @@ protected:
 TEST_P(CrossingMaskTest, masksMatchScalarOracle) {
   auto& segment = reader->segments()[0];
   auto everyBlock = [&](std::string_view name, auto&& expect) {
+    const auto& columnInfo = *segment.postingsReader().fieldInfo(name);
     IntColReader column(segment.postingsReader(),
-                        *segment.postingsReader().fieldInfo(name));
+                        columnInfo);
     for (int64_t block = 0; block < column.numBlocks(); block++) {
       EXPECT_TRUE(expect(column.blockInfo(block))) << name << " block " << block;
     }

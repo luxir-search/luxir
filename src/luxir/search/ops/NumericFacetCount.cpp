@@ -19,7 +19,7 @@ namespace {
 //   term:       each term's postings intersected with the domain.
 void LUXIR_NOINLINE countFromTerms(
     IntFacetReq& facet, IntFacetReq::MergeableIntFacet& data, int32_t segnum, DomainView& view,
-    const SegFieldInfo& info, FieldFacetCountKind strategy, size_t denseSlots,
+    const DecodedFieldRecord& info, FieldFacetCountKind strategy, size_t denseSlots,
     ExecutionProfilePieceState* profile, auto&& add) {
   auto& postingsReader = facet.reader.segments()[(size_t)segnum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -67,7 +67,7 @@ void LUXIR_NOINLINE countFromTerms(
   if (denseSlots) {
     detail("parent-count=column-complement", "inverted domain view, dense value staging");
     std::pmr::vector<int32_t> staged(denseSlots, &resource);
-    int64_t base = facet.segInfos.at((size_t)segnum)->columnBounds->min;
+    int64_t base = info.scalarBounds()->min;
     facet.facetSegIntDistinct(&complement, segnum, compMissing,
         [&](int32_t, int64_t value) LUXIR_INLINE { staged[(size_t)(value - base)]++; });
     emitCounts([&](int64_t value, int32_t docFreq) {
@@ -114,14 +114,16 @@ void IntFacetReq::Calc::countSegment(MergeableIntFacet& data, int32_t segnum, Do
     profile->wire.strategy =
         std::holds_alternative<MergeableIntFacet::CountVector>(data.counts) ? "vector" : "hash";
   }
-  auto* info = facet.fieldInfo(segnum);
-  if (info != nullptr && (info->flags & FieldType::INDEX_DOCS) && info->nTerms > 0) {
+  const auto* info = facet.numberFieldInfo(segnum);
+  const auto* terms = info ? info->terms() : nullptr;
+  if (terms) {
+    const auto& totals = info->indexedTotals();
     DomainView view(domain, maxDoc);
-    const auto& bounds = *facet.segInfos.at((size_t)segnum)->columnBounds;
+    const auto& bounds = *info->scalarBounds();
     uint64_t span = (uint64_t)bounds.max - (uint64_t)bounds.min;
-    size_t denseSlots = span < (uint64_t)std::max<int64_t>(4 * info->nTerms, 4096)
+    size_t denseSlots = span < (uint64_t)std::max<int64_t>(4 * totals.numTerms, 4096)
         ? (size_t)span + 1 : 0;
-    double pairsPerDoc = (double)info->sumDocFreq / maxDoc;
+    double pairsPerDoc = (double)totals.sumDocFreq / maxDoc;
     // Forced 2M-doc grid: 4 puts postings ahead of hash updates at 30% and
     // 70% on the 1K-value field, and complement ahead at 90% and 99%.
     constexpr double HASH_VALUE_COST = 4;
@@ -133,8 +135,8 @@ void IntFacetReq::Calc::countSegment(MergeableIntFacet& data, int32_t segnum, Do
         .maxDoc = maxDoc,
         .domainCardinality = view.card,
         .complementCardinality = view.compCard,
-        .segmentTerms = info->nTerms,
-        .sumDocFreq = info->sumDocFreq,
+        .segmentTerms = totals.numTerms,
+        .sumDocFreq = totals.sumDocFreq,
         .docsWithField = info->docsWithField,
         .domainHasBitset = view.bits != nullptr,
         .missingRequested = facet.missing,
@@ -147,7 +149,7 @@ void IntFacetReq::Calc::countSegment(MergeableIntFacet& data, int32_t segnum, Do
         .complementSetupWork = (double)FixedBitSet::sizeInWords(maxDoc) + (double)denseSlots / 2
     }, forcedFieldFacetStrategy);
     if (profile != nullptr) {
-      profile->wire.cardinality = info->nTerms;
+      profile->wire.cardinality = totals.numTerms;
       if (!plan.forcedFallback.empty()) profile->details.emplace_back(plan.forcedFallback);
     }
     if (plan.strategy != FieldFacetCountKind::COLUMN_DOMAIN) {

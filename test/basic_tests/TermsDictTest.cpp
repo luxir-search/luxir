@@ -1,7 +1,10 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <set>
+
 #include "luxir/reader/SegmentCore.h"
+#include "test/FieldRecordTest.h"
 #include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
 #include "test/TestUtils.h"
@@ -20,7 +23,7 @@
 #include "luxir/query/Query.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/PosEnum.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/FieldCursor.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/schema/Schema.h"
@@ -46,7 +49,7 @@ void indexTerms(TestIndex& ti, TestField& field, const std::vector<std::string>&
 std::vector<std::string> collectNext(TestField& field) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
-  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
   std::vector<std::string> got;
   while (te.nextTerm()) {
     got.push_back(std::string((std::string_view)te.term()));
@@ -57,7 +60,7 @@ std::vector<std::string> collectNext(TestField& field) {
 std::vector<std::string> collectSeekCeil(TestField& field) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
-  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
   std::vector<std::string> got;
   std::string target;
   while (te.seekCeil(target)) {
@@ -72,7 +75,7 @@ std::vector<std::string> collectSeekCeil(TestField& field) {
 void expectExactSeeks(TestField& field, const std::vector<std::string>& expected) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
-  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
   for (int i = (int)expected.size() - 1; i >= 0; i--) {
     ASSERT_TRUE(te.seek(expected[(size_t)i])) << i;
     EXPECT_EQ((std::string_view)te.term(), expected[(size_t)i]) << i;
@@ -82,7 +85,7 @@ void expectExactSeeks(TestField& field, const std::vector<std::string>& expected
 void expectCeil(TestField& field, std::string_view target, std::string_view expected) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
-  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
   ASSERT_TRUE(te.seekCeil(target));
   EXPECT_EQ((std::string_view)te.term(), expected);
 }
@@ -206,20 +209,21 @@ IteratedStats iterateStats(BasicDocsEnum<Tier>& docsEnum, PosEnum* posEnum = nul
 
 void buildRawField(RAMDir& dir, MemPool& pool, FieldType::flag_type flags,
                    const std::vector<RawTermSpec>& terms,
-                   std::unique_ptr<SegmentCore>& reader,
-                   SegFieldInfo& fieldInfo) {
+                   std::unique_ptr<SegmentCore>& reader) {
   PostingsWriter postingsWriter(dir, 0, 1, 1000000);
   {
     TextWriter writer(postingsWriter);
     auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
-    finfo.type = FieldType::TEXT;
-    finfo.flags = flags;
-    writer.startField(&finfo);
+    finfo.header.type = FieldType::TEXT;
+    finfo.header.flags = flags;
+    writer.startField(finfo.space, finfo);
 
+    std::set<int32_t> docs;
     for (const RawTermSpec& term : terms) {
       TermRef termRef(pool, term.name.data(), (uint32_t) term.name.size());
       writer.startTerm(termRef);
       for (const RawDocSpec& doc : term.docs) {
+        docs.insert(doc.docid);
         if (FieldType::hasPositions(flags)) {
           writer.startDoc(doc.docid);
           for (int32_t i = 0; i < doc.tf; i++) {
@@ -232,79 +236,19 @@ void buildRawField(RAMDir& dir, MemPool& pool, FieldType::flag_type flags,
       }
       writer.endTerm(termRef);
     }
-    writer.endField();
+    finfo.setPostings(writer.endField());
+    luxir::test::writeFieldPresence(postingsWriter, finfo, docs);
   }
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
   reader = std::make_unique<SegmentCore>(dir, 0, 1);
-  FieldReader fieldReader(reader->rootReader());
-  ASSERT_TRUE(fieldReader.readNextField());
-  fieldReader.readFieldInfo(fieldInfo);
 }
 
-constexpr uint64_t HIGH_RANGE_ORD = (uint64_t{1} << 32) + 17;
-
-class RangeInspectTermsEnum : public TermsEnum {
-public:
-  using TermsEnum::TermsEnum;
-  using TermsEnum::rowForTerm;
-  using TermsEnum::selectRow;
-};
-
-void buildRawHighOrdRangeField(RAMDir& dir, MemPool& pool,
-                               std::unique_ptr<SegmentCore>& reader,
-                               SegFieldInfo& fieldInfo) {
-  PostingsWriter postingsWriter(dir, 0, 1, 1);
-  auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
-  finfo.type = FieldType::TEXT;
-  finfo.flags = FieldType::INDEX_DOCS;
-  {
-    TextWriter writer(postingsWriter);
-    writer.startField(&finfo);
-    for (int32_t i = 0; i < 3 * Postings::TERMS_BLOCK_SIZE; i++) {
-      char term[16];
-      snprintf(term, sizeof(term), "t%03d", i);
-      TermRef termRef(pool, term, 4);
-      writer.startTerm(termRef);
-      writer.addDoc(0, 1);
-      writer.endTerm(termRef);
-    }
-    writer.endField();
-  }
-
-  {
-    auto tableOut = postingsWriter.getOutputStream();
-    tableOut->align(8);
-    finfo.flags |= FieldType::TERM_RANGES;
-    finfo.rangeTableLoc = tableOut->slocation();
-    finfo.nTerms = (int64_t) HIGH_RANGE_ORD + 2 * Postings::TERMS_BLOCK_SIZE;
-    finfo.sumDocFreq = finfo.nTerms;
-    finfo.sumTotalTermFreq = finfo.nTerms;
-
-    const TermRangeTableHeader header{3, 3};
-    const TermRangeRow rows[] = {
-      {0, 0, 0, finfo.docsLoc, finfo.posLoc, finfo.termsLoc, 0, 0},
-      {HIGH_RANGE_ORD, 1, 0, finfo.docsLoc, finfo.posLoc, finfo.termsLoc, 0, 0},
-      {HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE, 2, 0,
-       finfo.docsLoc, finfo.posLoc, finfo.termsLoc, 0, 0}
-    };
-    tableOut->write(&header, sizeof(header));
-    tableOut->write(rows, sizeof(rows));
-  }
-  luxir::test::writeUnversionedRuns(postingsWriter);
-  postingsWriter.finish();
-
-  reader = std::make_unique<SegmentCore>(dir, 0, 1);
-  FieldReader fieldReader(reader->rootReader());
-  ASSERT_TRUE(fieldReader.readNextField());
-  fieldReader.readFieldInfo(fieldInfo);
-}
-
-MetadataRunCodes readFirstBlockMetadataRunCodes(PostingsReader& reader, const SegFieldInfo& fieldInfo) {
-  InputStream termsIS = reader.core().getInputStreamSeek(fieldInfo.termsLoc);
+MetadataRunCodes readFirstBlockMetadataRunCodes(PostingsReader& reader, const DecodedFieldRecord& fieldInfo) {
+  InputStream termsIS = reader.core().getInputStreamSeek(fieldInfo.terms()->location);
   int32_t nTerms = (int32_t)std::min<int64_t>(Postings::TERMS_BLOCK_SIZE,
-                                               fieldInfo.nTerms);
+                                               fieldInfo.indexedTotals().numTerms);
   termsIS.readPackedTerm();
   termsIS.readVlong();
   termsIS.readVlong();
@@ -408,46 +352,53 @@ IteratedStats readQueryPostingsStats(MemPool& pool, IndexReader& reader,
 class TermsDictTest : public LuxirTest {
 };
 
-TEST_F(TermsDictTest, RangeTableSeeksAcross64BitTermOrdinals) {
-  RAMDir dir;
+TEST_F(TermsDictTest, ContiguousRoutingAtTrieLimit) {
+  using namespace field_parts;
+  constexpr uint32_t blocks = Postings::MAX_TERM_BLOCKS;
+  constexpr int64_t firstTerm = (int64_t)(blocks - 1) * Postings::TERMS_BLOCK_SIZE - 1;
+  constexpr int64_t termCount = firstTerm + Postings::TERMS_BLOCK_SIZE;
+  constexpr uint64_t firstBytes = UINT32_MAX;
+  constexpr uint64_t endOfDictionary = 8 + firstBytes + 512;
+  constexpr uint64_t endOfOffsets = alignUp(endOfDictionary, Terms::OFFSETS_ALIGN)
+      + (uint64_t)blocks * sizeof(Terms::BlockOffset);
+  constexpr int64_t sumDocFreq = int64_t{1} << 34;
+  constexpr uint64_t firstDocsBytes = uint64_t{1} << 35;
+  constexpr uint64_t trieBytes = (uint64_t)1 << 33;
+
+  const std::array runsOnWrite{
+      TermRun{0, 0, 0, {{1, 8}, firstDocsBytes}, {}},
+      TermRun{(int32_t)firstTerm, (int32_t)blocks - 1, firstBytes, {{1, 8 + firstDocsBytes}, 64}, {}}};
+  Terms terms{{0, 8}, endOfDictionary - 8, trieBytes, trieBytes - 16, runsOnWrite};
   MemPool pool;
-  std::unique_ptr<SegmentCore> reader;
-  SegFieldInfo fieldInfo;
-  buildRawHighOrdRangeField(dir, pool, reader, fieldInfo);
-
-  ASSERT_GT(fieldInfo.nTerms, (int64_t) UINT32_MAX);
-  RangeInspectTermsEnum terms(pool, reader->rootReader(), fieldInfo);
-  const TermRangeRow* first = terms.rowForTerm((int64_t) HIGH_RANGE_ORD - 1);
-  const TermRangeRow* second = terms.rowForTerm((int64_t) HIGH_RANGE_ORD);
-  const TermRangeRow* third = terms.rowForTerm(
-      (int64_t) HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE);
-  EXPECT_EQ(first->firstTermOrd, 0u);
-  EXPECT_EQ(second->firstTermOrd, HIGH_RANGE_ORD);
-  EXPECT_EQ(third->firstTermOrd, HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE);
-
-  terms.selectRow(second);
-  terms.seekOrd((int64_t) HIGH_RANGE_ORD + 5);
-  EXPECT_EQ(terms.ord(), (int64_t) HIGH_RANGE_ORD + 5);
-  EXPECT_EQ((std::string_view) terms.term(), "t037");
-
-  terms.seekOrd((int64_t) HIGH_RANGE_ORD + 2 * Postings::TERMS_BLOCK_SIZE - 1);
-  EXPECT_EQ(terms.ord(), (int64_t) HIGH_RANGE_ORD + 2 * Postings::TERMS_BLOCK_SIZE - 1);
-  EXPECT_EQ((std::string_view) terms.term(), "t095");
-
-  terms.seekOrd((int64_t) HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE - 1);
-  EXPECT_EQ(terms.ord(), (int64_t) HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE - 1);
-  EXPECT_EQ((std::string_view) terms.term(), "t063");
-
-  // Block docFreqs step down across the 64-bit row boundary.
-  TermsEnum blocks(pool, reader->rootReader(), fieldInfo);
-  auto last = blocks.docFreqBlock(fieldInfo.nTerms - 1);
-  EXPECT_EQ(last.firstOrd, (int64_t) HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE);
-  EXPECT_EQ(last.docFreqs.size(), (size_t) Postings::TERMS_BLOCK_SIZE);
-  auto previous = blocks.docFreqBlock(last.firstOrd - 1);
-  EXPECT_EQ(previous.firstOrd, (int64_t) HIGH_RANGE_ORD);
-  EXPECT_EQ(previous.docFreqs[5], 1u);
-  blocks.seekOrd((int64_t) HIGH_RANGE_ORD + 5);
-  EXPECT_EQ((std::string_view) blocks.term(), "t037");
+  FieldRecordHeader header{.name = PackedTerm(pool, "f"), .type = FieldType::TEXT,
+                           .flags = FieldType::INDEX_DOCS, .parts = {}, .docsWithField = 64,
+                           .indexedTotals = {termCount, sumDocFreq, sumDocFreq}, .bounds = {}};
+  RAMFile file("");
+  OutputStream out(&file);
+  IndexFieldInfo fieldOnWrite;
+  fieldOnWrite.header = header;
+  fieldOnWrite.setPostings({header.indexedTotals, terms, 0, {}});
+  FieldRecordCodec::encode(out, fieldOnWrite, header.docsWithField);
+  out.close();
+  std::vector<char> bytes(file.size());
+  file.copyTo(bytes.data());
+  std::array<uint64_t, 2> sizes{endOfOffsets + trieBytes, 8 + firstDocsBytes + 64};
+  auto field = FieldRecordCodec::decode(bytes, header.docsWithField, sizes, -1);
+  EXPECT_EQ(header.docsWithField, field->docsWithField);
+  EXPECT_EQ(0, field->numValues);
+  EXPECT_EQ(header.indexedTotals, field->indexedTotals());
+  auto runs = field->terms()->runs;
+  ASSERT_EQ(2u, runs.size());
+  EXPECT_EQ(blocks - 2, runs[0].blockForTerm(firstTerm - 1));
+  EXPECT_EQ(firstTerm, runs[1].firstTermOrd);
+  EXPECT_EQ(blocks - 1, runs[1].blockForTerm(firstTerm));
+  EXPECT_EQ(blocks - 1, runs[1].blockForTerm(termCount - 1));
+  EXPECT_EQ(firstTerm, runs[1].firstTermForBlock(blocks - 1));
+  EXPECT_EQ(firstBytes, runs[1].dictionaryStart);
+  EXPECT_EQ(endOfDictionary, field->terms()->dictionaryBlocks().end().offset());
+  EXPECT_EQ(trieBytes - 16, field->terms()->trieRootOffset);
+  ASSERT_TRUE(runs[1].docs);
+  EXPECT_EQ(8 + firstDocsBytes, runs[1].docs.location.offset());
 }
 
 TEST_F(TermsDictTest, DecodesEscapedPrefixAndSuffixLengths) {
@@ -508,7 +459,7 @@ TEST_F(TermsDictTest, DecodesBlockPrefixFactoredRunsAcrossBlocks) {
   {
     auto guard = field.testIndex.pool.rewindScopeGuard();
     auto* seg = field.currentSegment();
-    TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+    TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
     ASSERT_TRUE(te.seek(expected[Postings::TERMS_BLOCK_SIZE]));
     ASSERT_EQ(te.ord(), Postings::TERMS_BLOCK_SIZE);
     EXPECT_EQ(te.docFreq(), 1);
@@ -518,7 +469,7 @@ TEST_F(TermsDictTest, DecodesBlockPrefixFactoredRunsAcrossBlocks) {
   {
     auto guard = field.testIndex.pool.rewindScopeGuard();
     auto* seg = field.currentSegment();
-    TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+    TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
     ASSERT_TRUE(te.seek(expected[Postings::TERMS_BLOCK_SIZE]));
     ASSERT_TRUE(te.nextTerm());
     ASSERT_EQ((std::string_view) te.term(), expected[Postings::TERMS_BLOCK_SIZE + 1]);
@@ -563,7 +514,7 @@ TEST_F(TermsDictTest, PulsedMaskEdgesPreserveDocsOnlyPostingsAndStats) {
 
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
-  TermsEnum tenum(guard.pool(), seg->postingsReader(), field.fieldInfo);
+  TermsEnum tenum(guard.pool(), seg->postingsReader(), field.fieldInfo());
   for (size_t i = 0; i < terms.size(); i++) {
     ASSERT_TRUE(tenum.seek(terms[i])) << terms[i];
     EXPECT_EQ(tenum.docFreq(), dfs[i]) << terms[i];
@@ -585,8 +536,8 @@ TEST_F(TermsDictTest, AllDefaultMetadataRunsPreservePulsedMultiBlockPostings) {
   RAMDir dir;
   MemPool pool;
   std::unique_ptr<SegmentCore> reader;
-  SegFieldInfo fieldInfo;
-  buildRawField(dir, pool, FieldType::INDEX_DOCS_FREQS_POSITIONS, terms, reader, fieldInfo);
+  buildRawField(dir, pool, FieldType::INDEX_DOCS_FREQS_POSITIONS, terms, reader);
+  const auto& fieldInfo = *reader->rootReader().fieldInfo("f");
 
   MetadataRunCodes codes = readFirstBlockMetadataRunCodes(reader->rootReader(), fieldInfo);
   EXPECT_EQ(codes.docsEnd, 0u);
@@ -626,8 +577,8 @@ TEST_F(TermsDictTest, MixedMetadataRunsKeepNonUniformRowsExplicit) {
   RAMDir dir;
   MemPool pool;
   std::unique_ptr<SegmentCore> reader;
-  SegFieldInfo fieldInfo;
-  buildRawField(dir, pool, FieldType::INDEX_DOCS_FREQS_POSITIONS, terms, reader, fieldInfo);
+  buildRawField(dir, pool, FieldType::INDEX_DOCS_FREQS_POSITIONS, terms, reader);
+  const auto& fieldInfo = *reader->rootReader().fieldInfo("f");
 
   MetadataRunCodes codes = readFirstBlockMetadataRunCodes(reader->rootReader(), fieldInfo);
   EXPECT_NE(codes.docsEnd, 0u);
@@ -703,8 +654,8 @@ TEST_F(TermsDictTest, PackedBlockCountsRoundTripAcrossIndexLevels) {
     RAMDir dir;
     MemPool pool;
     std::unique_ptr<SegmentCore> reader;
-    SegFieldInfo fieldInfo;
-    buildRawField(dir, pool, flags, terms, reader, fieldInfo);
+    buildRawField(dir, pool, flags, terms, reader);
+    const auto& fieldInfo = *reader->rootReader().fieldInfo("f");
 
     TermsEnum tenum(pool, reader->rootReader(), fieldInfo);
     for (const RawTermSpec& term : terms) {
@@ -769,8 +720,8 @@ TEST_F(TermsDictTest, StatsAccessorsMatchDocsEnumAcrossIndexLevels) {
     RAMDir dir;
     MemPool pool;
     std::unique_ptr<SegmentCore> reader;
-    SegFieldInfo fieldInfo;
-    buildRawField(dir, pool, flags, terms, reader, fieldInfo);
+    buildRawField(dir, pool, flags, terms, reader);
+    const auto& fieldInfo = *reader->rootReader().fieldInfo("f");
 
     auto check = [&]<DocsEnumTier Tier>() {
       TermsEnum tenum(pool, reader->rootReader(), fieldInfo);
@@ -889,8 +840,8 @@ TEST_F(TermsDictTest, LastTermBlockMetadataRunsDecodeUnderAsan) {
   RAMDir dir;
   MemPool pool;
   std::unique_ptr<SegmentCore> reader;
-  SegFieldInfo fieldInfo;
-  buildRawField(dir, pool, FieldType::INDEX_DOCS_FREQS_POSITIONS, terms, reader, fieldInfo);
+  buildRawField(dir, pool, FieldType::INDEX_DOCS_FREQS_POSITIONS, terms, reader);
+  const auto& fieldInfo = *reader->rootReader().fieldInfo("f");
 
   TermsEnum tenum(pool, reader->rootReader(), fieldInfo);
   for (const RawTermSpec& term : terms) {
@@ -921,8 +872,8 @@ TEST_F(TermsDictTest, PulsedDocsEnumReadsDocOnlyAndPositions) {
     RAMDir dir;
     MemPool pool;
     std::unique_ptr<SegmentCore> reader;
-    SegFieldInfo fieldInfo;
-    buildRawField(dir, pool, flags, terms, reader, fieldInfo);
+    buildRawField(dir, pool, flags, terms, reader);
+    const auto& fieldInfo = *reader->rootReader().fieldInfo("f");
 
     auto check = [&]<DocsEnumTier Tier>() {
       TermsEnum tenum(pool, reader->rootReader(), fieldInfo);
@@ -949,6 +900,51 @@ TEST_F(TermsDictTest, PulsedDocsEnumReadsDocOnlyAndPositions) {
       check.template operator()<DocsEnumTier::FREQS>();
     }
   }
+}
+
+TEST_F(TermsDictTest, PulsedIdHasNoPostingsStreams) {
+  bool unalignedToEight = false;
+  for (std::string_view name : {"a", "abcde"}) {
+    RAMDir dir;
+    MemPool pool;
+    PostingsWriter postings(dir, 0, 1, 1);
+    auto& info = postings.addField(SpaceOrdinal::ROOT, "id");
+    info.header.type = FieldType::ID;
+    info.header.flags = FieldType::INDEX_DOCS;
+    TextWriter writer(postings);
+    writer.startField(info.space, info);
+    TermRef term(pool, name.data(), (uint32_t)name.size());
+    EXPECT_EQ(1, writer.startTerm(term));
+    writer.addDoc(0, 1);
+    writer.endTerm(term);
+    info.setPostings(writer.endField());
+    info.setPresence({1, {}});
+    ASSERT_TRUE(postings.idRange);
+    EXPECT_EQ(name, postings.idRange->min);
+    EXPECT_EQ(name, postings.idRange->max);
+    EXPECT_EQ(1, postings.idDictionaryBlocks);
+    writeUnversionedRuns(postings);
+    postings.finish();
+
+    SegmentCore core(dir, 0, 1);
+    const auto& fieldInfo = *core.rootReader().fieldInfo("id");
+    const auto& terms = *fieldInfo.terms();
+    ASSERT_EQ(1u, terms.runs.size());
+    EXPECT_FALSE(terms.runs[0].docs);
+    EXPECT_FALSE(terms.runs[0].positions);
+    auto offsets = fieldInfo.termBlockOffsets();
+    EXPECT_EQ(4u, offsets.bytes);
+    EXPECT_EQ(0u, offsets.location.offset() % 4);
+    unalignedToEight |= offsets.location.offset() % 8 == 4;
+    EXPECT_EQ(offsets.end(), fieldInfo.termTrie().location);
+    EXPECT_GE(offsets.bytes + terms.trieBytes, SVB_OVERREAD_PAD);
+    TermsEnum tenum(pool, core.rootReader(), fieldInfo);
+    ASSERT_TRUE(tenum.seek(name));
+    BasicDocsEnum<DocsEnumTier::DOCS> docs(tenum);
+    EXPECT_EQ(0, docs.nextDoc());
+    EXPECT_EQ(DocsEnumMeta::END, docs.nextDoc());
+  }
+  EXPECT_TRUE(unalignedToEight);
 }
 
 TEST_F(TermsDictTest, MergedSegmentsRoundTripAllIndexLevels) {

@@ -81,8 +81,7 @@ public:
   std::unique_ptr<File> createFile(
       std::string_view name, FileCreateOptions options) override {
     if (Signal::emit("checkedCreateFile", this, &name)) return nullptr;
-    if (verbose_) LOG_DEBUG("CheckedDirectory: createFile({}, ramDelegating={})",
-                            name, options.ramDelegating);
+    if (verbose_) LOG_DEBUG("CheckedDirectory: createFile({})", name);
     return delegate->createFile(name, std::move(options));
   }
 

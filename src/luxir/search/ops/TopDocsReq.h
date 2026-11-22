@@ -299,7 +299,7 @@ public:
     keys.reserve(reader.segments().size());
     for (auto& segment : reader.segments()) {
       auto* info = fields.at((size_t)segment.ord);
-      const auto* meta = info ? info->numericLeafMeta() : nullptr;
+      const auto* meta = info ? segment.postingsReader().openNumericLeafMeta(*info) : nullptr;
       if (meta) {
         keys.emplace_back(std::in_place, *meta, sortField.isReversed(), envelope);
       } else {

@@ -15,62 +15,61 @@ namespace luxir {
 /// column's fixedValueSize (dims = fixedValueSize / sizeof(float)); the
 /// schema does not need to declare dims.
 ///
-/// For single-valued fields, vectorAt(docRank) returns one span per doc.
+/// For single-valued fields, singleVectorAt(docRank) returns one span per doc.
 /// For multi-valued, valueRange(docRank) gives [startValueRank, endValueRank) and
 /// vectorAtRank(r) returns the r-th vector in the flat per-segment list.
 class VectorReader {
-  StrColReader strCol_;
-  int32_t dims_;
+  StrColReader column;
+  int32_t dimensions;
 
 public:
-  VectorReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo)
-    : strCol_(postingsReader, fieldInfo),
-      dims_(strCol_.fixedValueSize() / (int32_t)sizeof(float)) {
-    assert(strCol_.isFixedSize());
-    assert(strCol_.fixedValueSize() % (int32_t)sizeof(float) == 0);
+  VectorReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
+    : column(reader, fieldInfo),
+      dimensions(column.fixedValueSize() / (int32_t)sizeof(float)) {
+    assert(column.isFixedSize());
+    assert(column.fixedValueSize() % (int32_t)sizeof(float) == 0);
   }
 
-  int32_t dims() const { return dims_; }
+  int32_t dims() const { return dimensions; }
 
-  int32_t docsWithValue() const { return strCol_.docsWithValue(); }
+  int32_t docsWithField() const { return column.docsWithField(); }
 
-  int64_t numVectors() const { return strCol_.numValues(); }
+  int64_t numVectors() const { return column.numValues(); }
 
-  bool isMultiValued() const { return strCol_.isMultiValued(); }
+  bool multiValued() const { return column.multiValued(); }
 
   /// Vector at a global value rank (0..numVectors()-1).
   LUXIR_INLINE std::span<const float> vectorAtRank(int64_t valueRank) const {
-    auto bytes = strCol_.valueAt(valueRank);
-    return std::span<const float>((const float*)bytes.data(), (size_t)dims_);
+    auto bytes = column.valueAt(valueRank);
+    return std::span<const float>((const float*)bytes.data(), (size_t)dimensions);
   }
 
   /// Single-valued accessor: vector for the doc at the given doc rank.
   std::span<const float> singleVectorAt(int32_t docRank) const {
-    assert(!isMultiValued());
+    assert(!multiValued());
     return vectorAtRank((int64_t)docRank);
   }
 
   /// Multi-valued accessor: [startValueRank, endValueRank) of the given doc rank.
   /// Caller iterates with vectorAtRank to materialize each vector.
   std::pair<int64_t, int64_t> valueRange(int32_t docRank) const {
-    assert(isMultiValued());
-    return strCol_.getStartEndValueRank(docRank);
+    assert(multiValued());
+    return column.getStartEndValueRank(docRank);
   }
 
   /// Whether this segment carries the per-vector-rank -> docId reverse map.
-  /// True for multi-valued vector fields; false for single-valued (use identity /
-  /// the docs bitset) and for columns written before the map existed.
-  bool hasValDocMap() { return strCol_.getValDocReader() != nullptr; }
+  /// Single-valued fields use the identity map or the docs bitmap.
+  bool hasOwners() { return column.ownerIndex() != nullptr; }
 
   /// Multi-valued: map a global vector rank (0..numVectors()-1) to the segment-local
-  /// docId that owns it.  Requires hasValDocMap().
+  /// docId that owns it.  Requires hasOwners().
   int32_t docForVectorRank(int64_t valueRank) {
-    MonoReader* r = strCol_.getValDocReader();
-    assert(r != nullptr);
-    return (int32_t)r->valueAt(valueRank);
+    MonoReader* index = column.ownerIndex();
+    assert(index != nullptr);
+    return (int32_t)index->valueAt(valueRank);
   }
 
-  StrColReader& strColReader() { return strCol_; }
+  StrColReader& strColReader() { return column; }
 
   using Iterator = StrColReader::DocIterator;
 };

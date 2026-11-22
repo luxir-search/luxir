@@ -109,14 +109,16 @@ int mergedSegmentFileCount(CollectionHelper& helper) {
   auto iw = helper.getIndexWriter();
   auto reader = iw->snapshots.readers.getReader();
   assert(reader->segments().size() == 1);
-  uint64_t segId = reader->segments()[0].segInfo.seg_id;
-  std::string prefix = Postings::getIndexFileNamePrefix(segId, 1);
+  auto& segment = reader->segments()[0];
+  std::string prefix = Postings::getIndexFileNamePrefix(segment.segInfo.seg_id,
+                                                       segment.segmentCore().epoch());
+  std::string sidecarPrefix = prefix + '_';
 
   std::vector<Directory::FileInfo> files;
   iw->dir.listFiles(files);
   int count = 0;
   for (const auto& file : files) {
-    if (file.name.starts_with(prefix)) {
+    if (file.name.starts_with(prefix) && !file.name.starts_with(sidecarPrefix)) {
       count++;
     }
   }
@@ -147,7 +149,7 @@ TEST(MergeParallelismTest, SerialAndParallelMergedContentEquivalent) {
   EXPECT_EQ(serialEven, parallelEven);
 }
 
-TEST(MergeParallelismTest, MergedSegmentFileCountStaysWithinStreamCap) {
+TEST(MergeParallelismTest, SmallNestedMergeUsesOneDataFile) {
   auto& budget = LuxirTest::luxirNode->getIndexRamBudget();
   BudgetTotalGuard guard(budget);
   budget.setTotalBytes(0);
@@ -163,7 +165,7 @@ TEST(MergeParallelismTest, MergedSegmentFileCountStaysWithinStreamCap) {
 
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1, reader->segments().size());
-  EXPECT_LE(mergedSegmentFileCount(helper), MergeCostModel::STREAM_BUDGET_FLOOR);
+  EXPECT_EQ(1, mergedSegmentFileCount(helper));
 }
 
 TEST(MergeParallelismTest, RowMapsShareOneReservationUntilMergerDestruction) {
@@ -204,7 +206,6 @@ TEST(MergeParallelismTest, RowMapsShareOneReservationUntilMergerDestruction) {
         {
           PostingsWriter writer(output, 100, 1);
           SegmentMerger merger(cores, live, writer, budget, INT64_MAX, 1, 4, *reader->schema(), dictionaries);
-          writer.configureRamDelegation(false);
           if (fail) {
             EXPECT_THROW(merger.merge(), std::runtime_error);
           } else {

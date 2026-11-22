@@ -19,14 +19,12 @@ using namespace luxir::test;
 
 namespace {
 
-std::optional<IntColReader::EncodedBounds> readBounds(
+std::optional<field_parts::ScalarBounds> readBounds(
     IndexReader::Segment& segment, std::string_view field) {
-  MemPool pool;
-  auto* fields = segment.postingsReader().fieldInfo(field);
-  if (!fields) return std::nullopt;
-  const auto& info = *fields;
-  IntColReader column(segment.postingsReader(), info);
-  return column.encodedBounds();
+  const auto* info = segment.postingsReader().fieldInfo(field);
+  const auto* bounds = info ? info->scalarBounds() : nullptr;
+  if (!bounds) return std::nullopt;
+  return *bounds;
 }
 
 } // namespace
@@ -42,14 +40,13 @@ TEST_F(NumericColumnBoundsTest, emptyWriterHasNoBounds) {
   output.close();
   directory.finishFile(*file);
 
-  auto inputFile = directory.openFile("numeric");
-  InputStream input(inputFile->getInputStream());
-  IntColReader reader(input, data.columnLoc, data.columnMetaOff, data.numValues);
-  auto bounds = reader.encodedBounds();
-  EXPECT_FALSE(bounds.hasValues);
+  EXPECT_TRUE(data.bounds.empty());
+  EXPECT_EQ(0, data.numValues);
+  EXPECT_EQ(0u, data.indexBytes);
+  EXPECT_EQ(0, file->size());
 }
 
-TEST_F(NumericColumnBoundsTest, typedEndpointsDecodeFromTrailer) {
+TEST_F(NumericColumnBoundsTest, typedEndpointsDecodeFromRecord) {
   CollectionHelper helper;
   helper.index(flatdoc("id", "lo", "wide_i", std::numeric_limits<int64_t>::min(),
                        "when_dt", int64_t{1000}, "price_f", -9.5f,
@@ -62,22 +59,22 @@ TEST_F(NumericColumnBoundsTest, typedEndpointsDecodeFromTrailer) {
   auto& segment = reader->segments()[0];
 
   auto integers = readBounds(segment, "wide_i");
-  ASSERT_TRUE(integers && integers->hasValues);
+  ASSERT_TRUE(integers);
   EXPECT_EQ(std::numeric_limits<int64_t>::min(), integers->min);
   EXPECT_EQ(std::numeric_limits<int64_t>::max(), integers->max);
 
   auto dates = readBounds(segment, "when_dt");
-  ASSERT_TRUE(dates && dates->hasValues);
+  ASSERT_TRUE(dates);
   EXPECT_EQ(1000, dates->min);
   EXPECT_EQ(9000, dates->max);
 
   auto floats = readBounds(segment, "price_f");
-  ASSERT_TRUE(floats && floats->hasValues);
+  ASSERT_TRUE(floats);
   EXPECT_FLOAT_EQ(-9.5f, sortableInt32ToFloat((int32_t)floats->min));
   EXPECT_FLOAT_EQ(3.75f, sortableInt32ToFloat((int32_t)floats->max));
 
   auto doubles = readBounds(segment, "weight_d");
-  ASSERT_TRUE(doubles && doubles->hasValues);
+  ASSERT_TRUE(doubles);
   EXPECT_DOUBLE_EQ(-1.25, sortableInt64ToDouble(doubles->min));
   EXPECT_DOUBLE_EQ(8.5, sortableInt64ToDouble(doubles->max));
 }
@@ -112,7 +109,7 @@ TEST_F(NumericColumnBoundsTest, mergeRecomputesDeletedExtrema) {
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1, reader->segments().size());
   auto bounds = readBounds(reader->segments()[0], "price_i");
-  ASSERT_TRUE(bounds && bounds->hasValues);
+  ASSERT_TRUE(bounds);
   EXPECT_EQ(7, bounds->min);
   EXPECT_EQ(7, bounds->max);
 }

@@ -28,9 +28,15 @@ Inverter::Inverter(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
 
 Inverter::Inverter(Directory& dir, uint64_t segId, uint64_t creatorEpoch, std::shared_ptr<Schema> schema,
     IndexRamBudget* ramBudget, StoredDictionaryProvider dictionaryProvider)
-    : postingsWriter(dir, segId, creatorEpoch, -1, ramBudget, true), schema(std::move(schema)),
-      storedDictionaryProvider(std::move(dictionaryProvider)),
-      ramGuard(ramBudget == nullptr ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)) {}
+    : ramGuard(ramBudget == nullptr ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)),
+      postingsWriter(dir, segId, creatorEpoch), schema(std::move(schema)),
+      storedDictionaryProvider(std::move(dictionaryProvider)) {
+  postingsWriter.setStagedRamAccounting([this](int64_t delta) noexcept {
+    [[maybe_unused]] int64_t previous = stagedRamBytes.fetch_add(delta, std::memory_order_relaxed);
+    assert(previous + delta >= 0);
+    if (ramGuard) ramGuard.adjustSize(delta);
+  });
+}
 
 Inverter::~Inverter() = default;
 
@@ -128,11 +134,17 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
     writer = &getOrCreateStoredFields(space, resourceName, resConfig);
   }
 
-  auto input = pool.make_unique<InputHandler>(*this, resolved, fieldType, writer);
-  input->branches.push_back({"self", &createPhysicalHandler(resolved.physicalName, fieldType, space)});
+  auto input = pool.make_unique<InputHandler>(*this, resolved, fieldType, space, writer);
+  auto addBranch = [&](const std::string& label, std::string_view physicalName,
+                       const std::shared_ptr<FieldType>& type) {
+    if (auto* handler = createPhysicalHandler(physicalName, type, space)) {
+      input->branches.push_back({label, handler});
+    }
+  };
+  addBranch("self", resolved.physicalName, fieldType);
   if (resolved.owner) {
     for (const auto& [label, type] : resolved.owner->variants) {
-      input->branches.push_back({label, &createPhysicalHandler(resolved.logicalName + "__" + label, type, space)});
+      addBranch(label, resolved.logicalName + "__" + label, type);
     }
   }
   auto [iter, inserted] = inputHandlers.try_emplace(std::string(name), std::move(input));
@@ -140,11 +152,11 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
   return *iter->second;
 }
 
-Inverter::IndexHandler& Inverter::createPhysicalHandler(
+Inverter::IndexHandler* Inverter::createPhysicalHandler(
     std::string_view name, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space) {
   // An earlier dispatcher construction may have stopped after this handler.
   auto existing = indexHandlers.find(name);
-  if (existing != indexHandlers.end()) return *existing->second;
+  if (existing != indexHandlers.end()) return existing->second.get();
   // Names are already resolved; dynamic FieldTypes can be template prototypes.
   u_ptr<IndexHandler> fieldHandler;
 
@@ -169,11 +181,11 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
         fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType, space);
         break;
       case FieldType::Storage::TERMS:
-        if (!fieldType->indexed() && fieldType->hasColumn()) {
-          // If the field is not indexed (column stored only), use StrColHandler
+        if (!fieldType->indexed()) {
+          if (!fieldType->hasColumn()) return nullptr;
           fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType, space);
         } else {
-          // indexed and column stored (via ord)
+          // Indexed strings can share the dictionary with an ord column.
           if (fieldType->multiArray()) {
             fieldHandler = pool.make_unique<handler::StrHandler<true>>(*this, name, fieldType, space);
           } else {
@@ -202,13 +214,14 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
 
   auto [newIter, inserted] = indexHandlers.try_emplace(std::string(name), std::move(fieldHandler));
   assert(inserted);  // we should never (currently) be trying to overwrite an existing handler
-  return *(newIter->second);
+  return newIter->second.get();
 }
 
 
 Inverter::InputHandler::InputHandler(Inverter& inverter, const ResolvedFieldHandle& resolved,
-                                     std::shared_ptr<FieldType> fieldType, StoredFieldsWriter* writer)
-    : fieldName(inverter.pool, resolved.logicalName), fieldType(std::move(fieldType)),
+                                     std::shared_ptr<FieldType> fieldType, SpaceOrdinal space,
+                                     StoredFieldsWriter* writer)
+    : fieldName(inverter.pool, resolved.logicalName), fieldType(std::move(fieldType)), space(space),
       shape(resolved.owner ? resolved.owner->shape :
             resolved.fieldType->type() == FieldType::VECTOR ? LogicalField::Shape::VECTOR :
             resolved.fieldType->type() == FieldType::GEO_POINT ? LogicalField::Shape::GEO :
@@ -335,12 +348,6 @@ void Inverter::InputHandler::indexPoints(Inverter& inverter, std::span<const Geo
 bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescriptor>* descriptors) {
   getPostingsWriter().setMaxDoc(getMaxDoc());  // TODO: this won't always be accurate currently?
   if (nested) nested->finish();
-  // Index-time stored/vector streams begin as candidates because their final
-  // segment size is not known when they are checked out. Once flushing starts,
-  // a large inverter spills every existing candidate before further output.
-  postingsWriter.configureRamDelegation(
-      memSize() < PostingsWriter::SMALL_SEGMENT_BYTES);
-
   // We could either sort fields first, or after they have been indexed.  Merging segments will presumably
   // go in sorted field order, so lets do the same thing here and sort first.
   std::vector<IndexHandler*> fields;
@@ -356,18 +363,21 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
                                        [](const IndexHandler* x) {return x->fieldName.size();},
                                        [](const IndexHandler* x, const IndexHandler* y) {return *x < *y;});
 
-  // Relinquish outputs held through indexing before any field flush asks for
-  // its working set of streams. Vector columns publish their directly-written
-  // byte extent here.
+  // Finish checkouts held through indexing before starting the field flush.
+  // Vector columns record their final value slice here.
+  // Any spill files they used are now eligible for reuse.
   for (auto fieldHandler : fields) {
     fieldHandler->finishIndexing(*this);
   }
 
-  // Stored-fields chunk streams are also held through indexing. Finish all
-  // resources now so their chunk and metadata streams are available for reuse
-  // by normal field flushing.
+  // Stored fields also hold chunk checkouts through indexing. Finish those
+  // and their metadata now to release any staging before allocating more
+  // during field flush.
   for (auto& [key, writer] : storedFields_) {
-    writer->finish(postingsWriter.getMaxDoc(key.space));
+    int32_t maxDoc = postingsWriter.getMaxDoc(key.space);
+    if (auto stored = writer->finish(maxDoc)) {
+      postingsWriter.addStoredField(key.space, key.name, maxDoc, *stored);
+    }
   }
 
   for (auto fieldHandler : fields) {

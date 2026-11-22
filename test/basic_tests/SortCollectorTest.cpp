@@ -429,8 +429,10 @@ TEST_F(SortCollectorTest, numericKeyGatherMatchesFallbackAcrossColumnShapes) {
     for (auto& segment : reader->segments()) {
       comparator.setSegment(segment);
       auto keys = comparator.keyBatch()->segmentKeys(std::nullopt);
-      const auto* meta = segment.postingsReader().fieldInfo(field)->numericLeafMeta();
-      EXPECT_EQ(meta, segment.postingsReader().fieldInfo(field)->numericLeafMeta());
+      auto& postings = segment.postingsReader();
+      const auto* info = postings.fieldInfo(field);
+      const auto* meta = postings.openNumericLeafMeta(*info);
+      EXPECT_EQ(meta, postings.openNumericLeafMeta(*info));
       EXPECT_EQ(field == "dense_i", meta != nullptr) << field;
       ASSERT_EQ(keys.has_value(), meta != nullptr) << field;
       if (meta == nullptr) continue;
@@ -498,15 +500,15 @@ TEST_F(SortCollectorTest, fieldSortLeafMetaLivesWithItsSegment) {
     ASSERT_EQ(3u, old.lock()->segments().size());
     uint64_t coreGen = old.lock()->coreGen();
     EXPECT_EQ(expected, newest());  // reads each segment's leaf metadata
-    const auto* meta =
-        old.lock()->segments()[0].postingsReader().fieldInfo("time_i")->numericLeafMeta();
+    auto& postings = old.lock()->segments()[0].postingsReader();
+    const auto* meta = postings.openNumericLeafMeta(*postings.fieldInfo("time_i"));
     ASSERT_NE(nullptr, meta);
     commit();
     auto current = writer->snapshots.readers.getReader();
     EXPECT_EQ(coreGen, current->coreGen());
     EXPECT_TRUE(old.expired());
-    EXPECT_EQ(meta,
-              current->segments()[0].postingsReader().fieldInfo("time_i")->numericLeafMeta());
+    auto& reopened = current->segments()[0].postingsReader();
+    EXPECT_EQ(meta, reopened.openNumericLeafMeta(*reopened.fieldInfo("time_i")));
     current.reset();
     EXPECT_EQ(expected, newest());
   };

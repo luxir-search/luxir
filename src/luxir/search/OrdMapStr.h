@@ -26,16 +26,15 @@ public:
   IndexReader& index;
   std::span<TermsEnum*> enums;
   IndexReader::FieldSegments segInfos;
-  IntColReader::SparseValues* deltas = nullptr;
-  IntColReader::SparseValues* firstSegs = nullptr;
+  const NumColumn* deltas;
+  const NumColumn* firstSegs;
 
-  OrdMapStr(MemPool& pool, OrdMap* ordMap, IndexReader& index, IndexReader::FieldSegments segInfos) : pool(pool), ordMap(ordMap), index(index), segInfos(segInfos) {
+  OrdMapStr(MemPool& pool, OrdMap* ordMap, IndexReader& index, IndexReader::FieldSegments segInfos)
+      : pool(pool), ordMap(ordMap), index(index), segInfos(segInfos),
+        deltas(ordMap ? ordMap->getGlobDeltas() : nullptr),
+        firstSegs(ordMap ? ordMap->getFirstSegs() : nullptr) {
     // Lazy per-segment cache: null means not yet opened.
     enums = pool.make_span_zeroed<TermsEnum*>(index.segments().size());
-    if (ordMap && ordMap->getGlobDeltas()) {
-      deltas = pool.make<IntColReader::SparseValues>(*ordMap->getGlobDeltas());
-      firstSegs = pool.make<IntColReader::SparseValues>(*ordMap->getFirstSegs());
-    }
   }
 
   TermsEnum* getTermsEnum(int32_t segnum) {
@@ -43,10 +42,10 @@ public:
     auto* tenum = enums[segnum];
     if (!tenum) {
       PostingsReader& postingsReader = index.segments()[segnum].postingsReader();
-      auto* segFieldInfo = segInfos.at((size_t)segnum);
-      assert(segFieldInfo != nullptr);
+      auto* fieldInfo = segInfos.at((size_t)segnum);
+      assert(fieldInfo != nullptr);
       // Create a new TermsEnum in the pool for this segment
-      tenum = pool.make<TermsEnum>(pool, postingsReader, *segFieldInfo);
+      tenum = pool.make<TermsEnum>(pool, postingsReader, *fieldInfo);
       enums[segnum] = tenum;
     }
     return tenum;

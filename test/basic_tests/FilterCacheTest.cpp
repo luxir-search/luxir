@@ -9454,7 +9454,7 @@ TEST(FilterKeyTest, knnDiscriminatesMembershipAndExecutionPolicies) {
   } restore;
 
   VectorFieldType vectorType(
-      "vec", 2, FieldType::COLUMN_STORED | FieldType::FIXED_SIZE,
+      "vec", 2, FieldType::COLUMN_STORED,
       VectorFieldType::METRIC_L2);
   std::array<float, 2> vector{1.0f, 0.0f};
   KnnQuery base("vec", vectorType, vector, 7, 3, 11, 0.25f, false);
@@ -9552,7 +9552,7 @@ TEST(FilterKeyTest, everyConcreteQueryMakesAnExplicitScopeDecision) {
     EXPECT_TRUE(optionalKeyFor(*query).has_value());
   }
 
-  VectorFieldType vectorType("vec", 2, FieldType::COLUMN_STORED | FieldType::FIXED_SIZE,
+  VectorFieldType vectorType("vec", 2, FieldType::COLUMN_STORED,
                              VectorFieldType::METRIC_L2);
   std::array<float, 2> vector{1.0f, 2.0f};
   KnnQuery knn("vec", vectorType, vector, 1);

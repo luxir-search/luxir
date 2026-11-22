@@ -396,7 +396,7 @@ TEST_F(MultiTermLimitsTest, enumsContinueAndStopAcrossSlices) {
     int64_t total = 0;
     for (Run mode : {Run::UNLIMITED, Run::GENEROUS, Run::EXACT, Run::STOP, Run::THROW, Run::FINAL_STOP}) {
       SCOPED_TRACE((int) mode);
-      TermsEnum source(index.pool, segment->postingsReader(), field.fieldInfo);
+      TermsEnum source(index.pool, segment->postingsReader(), field.fieldInfo());
       auto* terms = make(source);
       SmallScanAllowance allowance(mode == Run::GENEROUS ? total + 10 : mode == Run::EXACT ? total : mode == Run::FINAL_STOP ? total - 1 : 30,
                                    mode == Run::THROW, mode == Run::FINAL_STOP);

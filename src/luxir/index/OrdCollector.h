@@ -13,16 +13,16 @@ namespace luxir {
 // Uninverts a field: collects ords for a given index during a term-major walk and
 // lets the ords for that index be read back in index order.  The index is a dense
 // 0-based key -- either a docid (dense/full fields) or a field-rank (the rank among
-// docs-with-value, for sparse fields; the caller resolves rank->docid via the
+// docs with the field, for sparse fields; the caller resolves rank->docid via the
 // docs-with-field set, see StrHandler).  Passing a rank keeps storage at one slot
-// per doc-with-value instead of one per doc, so sparse fields cost O(docsWithValue)
+// per doc-with-value instead of one per doc, so sparse fields cost O(docsWithField)
 // rather than O(maxDoc).  Ords are 1-based and, for any given index, must be added
 // in increasing order.
 class OrdCollector {
   MemPool& pool;
   std::vector<uint32_t> ords;
-  bool multiValued_ = false; // multiple values encountered for an index?
-  int32_t docsWithValue_ = 0;
+  bool multi = false; // multiple values encountered for an index?
+  int32_t docCount = 0;
 public:
   /// Ord collector adds ords to the pool over time, so be sure you don't rewind the pool
   /// before you are done with the OrdCollector.  Or more specifically, if X is the pool size
@@ -38,7 +38,7 @@ public:
     auto v = ords[docid];
     if (v == 0) {
       ords[docid] = ord;
-      docsWithValue_++;
+      docCount++;
       return;
     }
     IntDeltaStream* stream;
@@ -47,7 +47,7 @@ public:
       int streamAddr = (int)(v & 0x7fffffffu);
       stream = (IntDeltaStream*)pool.ptr(streamAddr);
     } else {
-      multiValued_ = true;
+      multi = true;
       // need to convert from a single value to a stream
       auto [ptr, streamAddr] = pool.allocateAddrs(sizeof(IntDeltaStream));  // IntDeltaStream is current 22 bytes, relatively heavyweight.
       // The tag bit halves the pool's 4 GiB address space. A stream placed
@@ -68,11 +68,11 @@ public:
   }
 
   bool multiValued() const {
-    return multiValued_;
+    return multi;
   }
 
-  int32_t docsWithValue() const {
-    return docsWithValue_;
+  int32_t docsWithField() const {
+    return docCount;
   }
 
   // heap bytes of the slots (multi-valued ords spill into the pool)
@@ -80,7 +80,7 @@ public:
     return ords.size() * sizeof(uint32_t);
   }
 
-  // number of index slots (maxDoc for docid-indexed, docsWithValue for rank-indexed)
+  // number of index slots (maxDoc for docid-indexed, docsWithField for rank-indexed)
   int32_t size() const {
     return (int32_t)ords.size();
   }

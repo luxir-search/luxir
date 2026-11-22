@@ -20,13 +20,12 @@ public:
   struct PreparedNorms {
     std::span<const uint8_t> ordinalNorms;
     screaming::BitSet docsBitset;
-    int32_t docsWithField = 0;
+    WrittenPresence presence;
     int32_t maxDoc = 0;
-    bool hasBitset = false;
     bool flat = false;
 
     TextNormsView textView() const {
-      return TextNormsView(ordinalNorms, hasBitset ? &docsBitset : nullptr);
+      return TextNormsView(ordinalNorms, presence.bitmap ? &docsBitset : nullptr);
     }
   };
 
@@ -53,15 +52,14 @@ private:
     return {bytes, (size_t)docsWithField};
   }
 
-  static void writePresenceBitset(MemPool& pool, PostingsWriter& postingsWriter,
-                                  PostingsWriter::IndexFieldInfo& fieldInfo,
-                                  DocStream& docsWithVal, int32_t docsWithField,
+  static WrittenPresence writePresenceBitset(MemPool& pool, PostingsWriter& postingsWriter,
+                                  DocStream& docs, int32_t docsWithField,
                                   PreparedNorms& prepared) {
     RAMFile tempFile("norm-docs");
     OutputStream tempOut(&tempFile);
     MemPool scratchPool;
     DocsWriter docsWriter(scratchPool, tempOut);
-    docsWithVal.pushDocs(pool, docsWriter);
+    docs.pushDocs(pool, docsWriter);
     [[maybe_unused]] int32_t added = docsWriter.finish();
     assert(added == docsWithField);
     tempOut.close();
@@ -74,7 +72,6 @@ private:
     char* bitsetBytes = pool.alloc(bitsetLen, screaming::BitSet::BLOCK_ALIGN);
     tempFile.copyTo(bitsetBytes);
     prepared.docsBitset.set(bitsetBytes + bitsetLen);
-    prepared.hasBitset = true;
 
     auto outputPtr = postingsWriter.getOutputStream();
     OutputStream& out = *outputPtr;
@@ -85,71 +82,53 @@ private:
     if (pad > 0) {
       out.write(zeros, pad);
     }
+    auto start = outputPtr.pos();
     out.write(bitsetBytes, bitsetLen);
-    fieldInfo.docsWithField = docsWithField;
-    fieldInfo.docsWithFieldEndLoc = out.slocation();
+    auto slice = postingsWriter.finishStream(std::move(outputPtr));
+    return {docsWithField, slice.subSlice(start, bitsetLen)};
   }
 
 public:
   static PreparedNorms prepare(MemPool& pool, PostingsWriter& postingsWriter,
-                               PostingsWriter::IndexFieldInfo& fieldInfo,
-                               const Stream& normBytes, DocStream& docsWithVal,
+                               SpaceOrdinal space,
+                               const Stream& normBytes, DocStream& docs,
                                int32_t docsWithField) {
-    int32_t maxDoc = postingsWriter.getMaxDoc(fieldInfo.space);
+    int32_t maxDoc = postingsWriter.getMaxDoc(space);
     assert(maxDoc >= docsWithField);
     assert(normBytes.size(pool) == docsWithField);
 
     PreparedNorms prepared;
-    prepared.docsWithField = docsWithField;
+    prepared.presence = {docsWithField, {}};
     prepared.maxDoc = maxDoc;
-    fieldInfo.numValues = docsWithField;
-    if (docsWithField == 0) {
-      fieldInfo.docsWithField = 0;
-      fieldInfo.docsWithFieldEndLoc = {0, 0};
-      fieldInfo.normsFormat = SegFieldInfo::NORMS_NONE;
-      fieldInfo.normsLoc = {0, 0};
-      fieldInfo.normsLen = 0;
-      return prepared;
-    }
+    if (docsWithField == 0) return prepared;
 
     prepared.flat = useDocIdIndexing(docsWithField, maxDoc);
     prepared.ordinalNorms = materializeOrdinalNorms(pool, normBytes, docsWithField);
 
     if (docsWithField < maxDoc) {
-      writePresenceBitset(pool, postingsWriter, fieldInfo, docsWithVal, docsWithField, prepared);
-    } else {
-      fieldInfo.docsWithField = docsWithField;
-      fieldInfo.docsWithFieldEndLoc = {0, 0};
+      prepared.presence = writePresenceBitset(pool, postingsWriter, docs, docsWithField, prepared);
     }
     return prepared;
   }
 
-  static void writeValues(MemPool& pool, PostingsWriter& postingsWriter,
-                          PostingsWriter::IndexFieldInfo& fieldInfo,
-                          const PreparedNorms& prepared, DocStream& docsWithVal) {
+  [[nodiscard]] static std::optional<field_parts::Norms> writeValues(
+      MemPool& pool, PostingsWriter& postingsWriter, const PreparedNorms& prepared, DocStream& docs) {
     int32_t maxDoc = prepared.maxDoc;
-    int32_t docsWithField = prepared.docsWithField;
-    assert(maxDoc == postingsWriter.getMaxDoc(fieldInfo.space));
+    int32_t docsWithField = prepared.presence.docsWithField;
     assert(maxDoc >= docsWithField);
 
-    if (docsWithField == 0) {
-      return;
-    }
+    if (docsWithField == 0) return {};
 
     auto outPtr = postingsWriter.getOutputStream();
     OutputStream& out = *outPtr;
-    size_t start = out.size();
-    fieldInfo.normsLoc = seg_location(out.streamNumber, start);
     if (prepared.flat) {
-      fieldInfo.normsFormat = SegFieldInfo::NORMS_FLAT;
-      fieldInfo.normsLen = maxDoc;
-      if (!prepared.hasBitset) {
+      if (!prepared.presence.bitmap) {
         assert((int32_t)prepared.ordinalNorms.size() == maxDoc);
         out.write(prepared.ordinalNorms.data(), (size_t)maxDoc);
       } else {
         int32_t nextDoc = 0;
         int32_t ord = 0;
-        docsWithVal.forEachDoc(pool, [&](int32_t docid) {
+        docs.forEachDoc(pool, [&](int32_t docid) {
           assert(docid >= nextDoc && docid < maxDoc);
           writeTrailingZeroes(out, (int64_t)docid - (int64_t)nextDoc);
           assert(ord < docsWithField);
@@ -160,20 +139,14 @@ public:
         writeTrailingZeroes(out, (int64_t)maxDoc - (int64_t)nextDoc);
       }
     } else {
-      fieldInfo.normsFormat = SegFieldInfo::NORMS_SPARSE;
-      fieldInfo.normsLen = docsWithField;
       out.write(prepared.ordinalNorms.data(), (size_t)docsWithField);
     }
+    auto mode = prepared.flat ? field_parts::NormsMode::FLAT : field_parts::NormsMode::SPARSE;
+    auto slice = postingsWriter.finishStream(std::move(outPtr));
+    assert(slice.bytes == field_parts::Norms::bytes(mode, maxDoc, docsWithField));
+    return field_parts::Norms{slice.location, mode};
   }
 
-  static void finish(MemPool& pool, PostingsWriter& postingsWriter,
-                     PostingsWriter::IndexFieldInfo& fieldInfo,
-                     const Stream& normBytes, DocStream& docsWithVal,
-                     int32_t docsWithField) {
-    PreparedNorms prepared = prepare(pool, postingsWriter, fieldInfo, normBytes, docsWithVal,
-                                     docsWithField);
-    writeValues(pool, postingsWriter, fieldInfo, prepared, docsWithVal);
-  }
 };
 
 } // namespace luxir

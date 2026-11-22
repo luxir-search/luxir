@@ -9,7 +9,7 @@ using namespace luxir;
 
 namespace {
 KnnPlanner::Segment segment(int64_t eligible = 1000) {
-  return {.vectors = 100000, .liveVectors = 100000, .docsWithValue = 100000,
+  return {.vectors = 100000, .liveVectors = 100000, .docsWithField = 100000,
       .eligibleDocs = eligible, .eligibleVectors = eligible, .domainSize = eligible, .maxDoc = 100000,
       .dims = 128, .nlist = 256, .pqM = 32, .pqBits = 8,
       .codec = KnnPlanner::Codec::PQ, .l2 = true, .domain = true, .unfiltered = false, .bounded = true};
@@ -24,7 +24,7 @@ double cost(std::span<const KnnPlanner::Segment> segments, const KnnPlanner::Req
     const auto& s = segments[i];
     auto p = KnnPlanner::price(s, req, costs);
     if (KnnPlanner::canIvf(s) && s.bounded) {
-      physicalDims += (double)s.vectors * s.dims; physicalReads += (double)s.vectors; physicalDocs += s.docsWithValue;
+      physicalDims += (double)s.vectors * s.dims; physicalReads += (double)s.vectors; physicalDocs += s.docsWithField;
     }
     if ((mask >> i & 1) && KnnPlanner::canIvf(s)) {
       linear += p.a; fixed += p.b; live += s.liveVectors; slots++;
@@ -107,7 +107,7 @@ TEST(KnnPlannerTest, exhaustiveAndBaselineBounds) {
         int64_t vectors = adversarial ? i < small ? 1000 + random() % 4000 : 100000 + random() % 900000
             : std::array<int64_t, 3>{1000, 10000, 100000}[random() % 3];
         auto s = segment(1 + random() % (adversarial && i < small ? std::min(vectors, target) : vectors));
-        s.vectors = s.liveVectors = s.docsWithValue = s.maxDoc = vectors;
+        s.vectors = s.liveVectors = s.docsWithField = s.maxDoc = vectors;
         s.domainSize = s.eligibleDocs;
         s.dims = dims; s.nlist = 16 << (random() % 5);
         s.arrayDomain = random() % 2; s.sparse = random() % 2;
@@ -209,7 +209,7 @@ TEST(KnnPlannerTest, pinnedSharedPoolWithUnequalMultiplicity) {
     for (int i = 0; i < 5; i++) {
       int mult = 1 + (int)(random() % 8);
       auto s = segment(1 + random() % (100000 / mult));
-      s.docsWithValue /= mult; s.multi = true; s.eligibleVectors = s.eligibleDocs * mult;
+      s.docsWithField /= mult; s.multi = true; s.eligibleVectors = s.eligibleDocs * mult;
       if (i % 2) { s.codec = KnnPlanner::Codec::RABITQ; s.bounded = false; s.rabitqBits = 2; }
       segments.push_back(s);
     }
@@ -251,7 +251,7 @@ TEST(KnnPlannerTest, selectorCrossoverAndDeepenCost) {
 
 TEST(KnnPlannerTest, sharedIvfRequestCanFavorExact) {
   auto s = segment(5000);
-  s.vectors = s.liveVectors = s.docsWithValue = s.maxDoc = 5000;
+  s.vectors = s.liveVectors = s.docsWithField = s.maxDoc = 5000;
   s.nlist = 16; s.domain = false; s.unfiltered = true;
   std::array segments{s};
   KnnPlanner::Costs costs;
@@ -282,7 +282,7 @@ TEST(KnnPlannerTest, selectorMetricAndTerminalFeatures) {
     for (bool l2 : {false, true}) for (int selector : {0, 1, 2}) {
       SCOPED_TRACE(::testing::Message() << (int)codec << '/' << l2 << '/' << selector);
       auto s = segment(selector ? 10 : 100);
-      s.vectors = s.liveVectors = s.docsWithValue = s.maxDoc = 100;
+      s.vectors = s.liveVectors = s.docsWithField = s.maxDoc = 100;
       s.nlist = 3; s.pqM = 4; s.codec = codec; s.l2 = l2;
       s.domain = selector != 0; s.unfiltered = selector == 0;
       auto price = KnnPlanner::price(s, {}, {});
@@ -351,7 +351,7 @@ TEST(KnnPlannerTest, pqPerListTablePricing) {
 
 TEST(KnnPlannerTest, intervalTerminalReadsHaveSharedKFloor) {
   auto s = segment(200);
-  s.vectors = s.liveVectors = s.docsWithValue = s.maxDoc = 200;
+  s.vectors = s.liveVectors = s.docsWithField = s.maxDoc = 200;
   s.codec = KnnPlanner::Codec::RABITQ; s.bounded = false; s.rabitqBits = 1;
   auto second = s;
   second.dims = 768;

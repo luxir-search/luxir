@@ -322,9 +322,8 @@ public:
     int64_t pairEvaluations(Context& context, int64_t limit) const {
       auto fieldHasNorms = [&](size_t field, const IndexReader::Segment& segment) {
         if (fieldInfos[field] == nullptr) return false;
-        const SegFieldInfo* segInfo = fieldInfos[field]->segInfos.at(segment);
-        return segInfo != nullptr && segInfo->normsFormat != SegFieldInfo::NORMS_NONE
-            && segInfo->normsLen > 0;
+        const DecodedFieldRecord* segInfo = fieldInfos[field]->segInfos.at(segment);
+        return segInfo && segInfo->norms();
       };
       int64_t evaluations = 0;
       for (auto& segment : context.topReader.segments()) {
@@ -471,12 +470,11 @@ public:
       size_t lastNormsField = 0;
       for (size_t i = 0; hasNorms && i < n; i++) {
         if (fieldInfos[i] == nullptr) continue;
-        const SegFieldInfo* segInfo = fieldInfos[i]->segInfos.at(segment);
+        const DecodedFieldRecord* segInfo = fieldInfos[i]->segInfos.at(segment);
         if (segInfo == nullptr) continue;
         assert(FieldType::storage(segInfo->type) == FieldType::Storage::TEXT);
-        if (segInfo->normsFormat == SegFieldInfo::NORMS_NONE) continue;
+        if (!segInfo->norms()) continue;
         auto* reader = targetPool.make<NormsReader>(segment.postingsReader(), *segInfo);
-        if (reader->numBytes() == 0) continue;
         lastNormsField = i;
         const double* lengths = normTables->lengths + i * 256;
         if (reader->isFlat()) {

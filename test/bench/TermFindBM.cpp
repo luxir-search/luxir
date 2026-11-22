@@ -3,7 +3,7 @@
 
 #include "luxir/reader/SegmentCore.h"
 #include "test/StorageTestUtils.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/FieldCursor.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -102,46 +102,6 @@ const std::vector<std::string>& dictWords() {
   return words;
 }
 
-int64_t rootNodeSize(const char* node) {
-  uint8_t header = (uint8_t)node[0];
-  uint8_t sign = header & 3;
-  if (sign == TrieBuilder::SIGN_LEAF) return 1;
-
-  int64_t deltaWidth = (int64_t)(((header >> 3) & 7) + 1);
-  if (sign == TrieBuilder::SIGN_SINGLE) {
-    return 2 + deltaWidth + TrieBuilder::ORD_WIDTH;
-  }
-
-  assert(sign == TrieBuilder::SIGN_MULTI);
-  int64_t strategyBytes = (int64_t)((uint8_t)node[2] + 1);
-  uint8_t minLabel = (uint8_t)node[1];
-  uint8_t strategy = header >> 6;
-  int64_t childCount = 0;
-
-  if (strategy == TrieBuilder::STRATEGY_BITS) {
-    const char* bitmap = node + 3;
-    for (int64_t i = 0; i < strategyBytes; i++) {
-      childCount += (int64_t)std::popcount((uint32_t)(uint8_t)bitmap[i]);
-    }
-  } else if (strategy == TrieBuilder::STRATEGY_ARRAY) {
-    childCount = strategyBytes + 1;
-  } else {
-    assert(strategy == TrieBuilder::STRATEGY_REVERSE_ARRAY);
-    uint8_t maxLabel = (uint8_t)node[3];
-    int64_t absentCount = strategyBytes - 1;
-    childCount = (int64_t)((uint32_t)maxLabel - (uint32_t)minLabel + 1) - absentCount;
-  }
-
-  return 3 + strategyBytes + childCount * (deltaWidth + TrieBuilder::ORD_WIDTH);
-}
-
-int64_t trieRegionBytes(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) {
-  InputStream trieIS = postingsReader.core().getInputStreamSeek(fieldInfo.trieLoc);
-  const char* base = trieIS.ptr();
-  const char* root = base + fieldInfo.trieRootOff;
-  return fieldInfo.trieRootOff + rootNodeSize(root) + 8;
-}
-
 void appendBenchToken(std::string& body, std::string_view term, int32_t count) {
   for (int32_t i = 0; i < count; i++) {
     if (!body.empty()) body.push_back(' ');
@@ -193,7 +153,7 @@ public:
   SegmentTest seg;
   RAMDir queryDir;
   std::unique_ptr<IndexReader> queryReader;
-  SegFieldInfo fieldInfo;
+  const DecodedFieldRecord* fieldInfo = nullptr;
   std::vector<std::string> terms;
   std::vector<int32_t> hitOrds;
   std::vector<int32_t> denseOrds;
@@ -324,7 +284,8 @@ private:
   void writeIndex() {
     seg.initWriter();
     TextWriter writer(*seg.postingsWriter.get());
-    writer.startField(SpaceOrdinal::ROOT, std::string(kFieldName));
+    auto& field = test::addTextField(*seg.postingsWriter, kFieldName);
+    writer.startField(field.space, field);
     for (int32_t ord = 0; ord < nTerms; ord++) {
       TermRef term(seg.pool, terms[ord].data(), (uint32_t)terms[ord].size());
       writer.startTerm(term);
@@ -333,15 +294,16 @@ private:
       writer.endDoc(ord);
       writer.endTerm(term);
     }
-    writer.endField();
+    field.setPostings(writer.endField());
+    test::writeFieldPresence(*seg.postingsWriter, field, std::views::iota(0, nTerms));
   }
 
   void readFieldInfo() {
     seg.initReader();
-    ASSERT_TRUE(seg.fieldReader->readNextField());
-    ASSERT_EQ((std::string_view)kFieldName, seg.fieldReader->name());
-    seg.fieldReader->readFieldInfo(fieldInfo);
-    ASSERT_EQ(nTerms, fieldInfo.nTerms);
+    ASSERT_TRUE(seg.fieldCursor->next());
+    ASSERT_EQ((std::string_view)kFieldName, seg.fieldCursor->name());
+    fieldInfo = seg.reader->fieldInfo(seg.fieldCursor->ordinal());
+    ASSERT_EQ(nTerms, fieldInfo->indexedTotals().numTerms);
   }
 
   void buildStatsReader() {
@@ -393,10 +355,10 @@ private:
     writeIndex();
     readFieldInfo();
 
-    nBlocks = ((fieldInfo.nTerms - 1) / Postings::TERMS_BLOCK_SIZE) + 1;
-    termsRegionBytes = fieldInfo.termBlockIndexLoc.offset() - fieldInfo.termsLoc.offset();
-    termBlockOffsetBytes = (int64_t)nBlocks * (int64_t)sizeof(int64_t);
-    trieBytes = trieRegionBytes(*seg.reader, fieldInfo);
+    nBlocks = fieldInfo->termBlockCount();
+    termsRegionBytes = fieldInfo->terms()->dictionaryBytes;
+    termBlockOffsetBytes = (int64_t)nBlocks * (int64_t)sizeof(field_parts::Terms::BlockOffset);
+    trieBytes = fieldInfo->terms()->trieBytes;
   }
 };
 
@@ -475,7 +437,7 @@ static void BM_TermSeekExact_hit(benchmark::State& state, TermSource source) {
   auto corpus = getTermSeekCorpus(source);
   if (skipBenchIfDataMissing(state, corpus != nullptr, kDictPath)) return;
   MemPool pool;
-  TermsEnum tenum(pool, *corpus->seg.reader, corpus->fieldInfo);
+  TermsEnum tenum(pool, *corpus->seg.reader, *corpus->fieldInfo);
 
   uint64_t fingerprint = 0;
   for (auto _ : state) {
@@ -500,7 +462,7 @@ static void BM_TermSeekExact_miss(benchmark::State& state, TermSource source) {
   auto corpus = getTermSeekCorpus(source);
   if (skipBenchIfDataMissing(state, corpus != nullptr, kDictPath)) return;
   MemPool pool;
-  TermsEnum tenum(pool, *corpus->seg.reader, corpus->fieldInfo);
+  TermsEnum tenum(pool, *corpus->seg.reader, *corpus->fieldInfo);
 
   uint64_t fingerprint = 0;
   for (auto _ : state) {
@@ -523,7 +485,7 @@ static void BM_TermSeekCeil_jump(benchmark::State& state, TermSource source) {
   auto corpus = getTermSeekCorpus(source);
   if (skipBenchIfDataMissing(state, corpus != nullptr, kDictPath)) return;
   MemPool pool;
-  TermsEnum tenum(pool, *corpus->seg.reader, corpus->fieldInfo);
+  TermsEnum tenum(pool, *corpus->seg.reader, *corpus->fieldInfo);
 
   uint64_t fingerprint = 0;
   for (auto _ : state) {
@@ -635,7 +597,7 @@ static void BM_FuzzyEnum(benchmark::State& state, TermSource source, int maxEdit
     jumps = 0;
     for (const std::string& q : queries) {
       MemPool pool;
-      TermsEnum tenum(pool, *corpus->seg.reader, corpus->fieldInfo);
+      TermsEnum tenum(pool, *corpus->seg.reader, *corpus->fieldInfo);
       FuzzySeekEnum fe(pool, tenum, "", q, maxEdits);
       while (fe.next()) {
         fp = fp * 31 + (uint64_t)fe.terms().ord();
@@ -788,7 +750,8 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
 
   {
     TextWriter w(*seg.postingsWriter.get());
-    w.startField(SpaceOrdinal::ROOT, fname);
+    auto& field = test::addTextField(*seg.postingsWriter, fname);
+    w.startField(field.space, field);
     for (auto docid: sorted) {
       auto term = terms[docid];
       w.startTerm(term);
@@ -803,16 +766,16 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
       w.endDoc(docid);
       w.endTerm(term);
     }
-    w.endField();
+    field.setPostings(w.endField());
+    test::writeFieldPresence(*seg.postingsWriter, field, std::views::iota(0, (int32_t)sorted.size()));
   }
 
   seg.initReader();
   PostingsReader& postingsReader = *seg.reader;
-  FieldReader& fieldReader = *seg.fieldReader;
-  ASSERT_EQ(true, fieldReader.readNextField());
-  ASSERT_EQ((std::string_view)fname, seg.fieldReader->name());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor& fieldCursor = *seg.fieldCursor;
+  ASSERT_EQ(true, fieldCursor.next());
+  ASSERT_EQ((std::string_view)fname, seg.fieldCursor->name());
+  const auto& fieldInfo = *postingsReader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, postingsReader, fieldInfo);
 
 

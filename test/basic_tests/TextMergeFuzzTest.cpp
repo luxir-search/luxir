@@ -6,7 +6,7 @@
 #include "gtest/gtest.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/PostingsWriter.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/FieldCursor.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/PosEnum.h"
 #include "luxir/schema/Schema.h"
@@ -87,12 +87,12 @@ protected:
     constexpr bool hasPositions = Tier == DocsEnumTier::POSITIONS;
     ASSERT_EQ(1u, index.reader->segments().size());
     Segment& segment = index.reader->segments()[0];
-    auto* fieldReader = segment.postingsReader().fieldInfo(field);
-    ASSERT_TRUE((fieldReader != nullptr));
-    const auto& fieldInfo = *fieldReader;
+    auto* fieldCursor = segment.postingsReader().fieldInfo(field);
+    ASSERT_TRUE((fieldCursor != nullptr));
+    const auto& fieldInfo = *fieldCursor;
     ASSERT_EQ(hasFreqs, FieldType::hasFreqs(fieldInfo.flags));
     ASSERT_EQ(hasPositions, FieldType::hasPositions(fieldInfo.flags));
-    ASSERT_FALSE(fieldInfo.rangeTableLoc.isNull());
+    ASSERT_TRUE(fieldInfo.terms()->runs.size() > 1);
 
     int64_t sumDf = 0;
     int64_t sumTtf = 0;
@@ -131,8 +131,8 @@ protected:
       sumTtf += ttf;
     }
     ASSERT_FALSE(terms.nextTerm()) << field;
-    ASSERT_EQ(sumDf, fieldInfo.sumDocFreq) << field;
-    ASSERT_EQ(sumTtf, fieldInfo.sumTotalTermFreq) << field;
+    ASSERT_EQ(sumDf, fieldInfo.indexedTotals().sumDocFreq) << field;
+    ASSERT_EQ(sumTtf, fieldInfo.indexedTotals().sumTotalTermFreq) << field;
   }
 
   void verifyField(TestIndex& index, std::string_view field, const Oracle& oracle,
@@ -155,9 +155,9 @@ protected:
     for (Segment* source : sources) {
       Segment& segment = *source;
       std::vector<int32_t> sourceIds((size_t) segment.maxDoc(), -1);
-      auto* fieldReader = segment.postingsReader().fieldInfo("pos");
-      ASSERT_TRUE((fieldReader != nullptr));
-      const auto& fieldInfo = *fieldReader;
+      auto* fieldCursor = segment.postingsReader().fieldInfo("pos");
+      ASSERT_TRUE((fieldCursor != nullptr));
+      const auto& fieldInfo = *fieldCursor;
       TermsEnum terms(index.pool, segment.postingsReader(), fieldInfo);
       while (terms.nextTerm()) {
         std::string_view term(terms.term());
@@ -363,9 +363,9 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   {
     TextWriter writer(sourcePostings);
     auto& fieldInfo = sourcePostings.addField(SpaceOrdinal::ROOT, "pos");
-    fieldInfo.type = FieldType::TEXT;
-    fieldInfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
-    writer.startField(&fieldInfo);
+    fieldInfo.header.type = FieldType::TEXT;
+    fieldInfo.header.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
+    writer.startField(fieldInfo.space, fieldInfo);
     TermRef term(pool, "term", 4);
     writer.startTerm(term);
     writer.startDoc(0);
@@ -374,17 +374,17 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
     writer.addPositionDelta(300);
     writer.endDoc(0);
     writer.endTerm(term);
-    writer.endField();
+    fieldInfo.setPostings(writer.endField());
+    fieldInfo.setPresence({1, {}});
   }
   writeUnversionedRuns(sourcePostings);
   sourcePostings.finish();
 
   SegmentCore sourceReaderCore(sourceDir, 0, 1);
   auto& sourceReader = sourceReaderCore.rootReader();
-  FieldReader sourceFields(sourceReader);
-  ASSERT_TRUE(sourceFields.readNextField());
-  SegFieldInfo sourceInfo;
-  sourceFields.readFieldInfo(sourceInfo);
+  FieldCursor sourceFields(sourceReader);
+  ASSERT_TRUE(sourceFields.next());
+  const auto& sourceInfo = *sourceReader.fieldInfo(sourceFields.ordinal());
   TermsEnum sourceTerms(pool, sourceReader, sourceInfo);
   ASSERT_TRUE(sourceTerms.nextTerm());
   DocsPosEnum sourceDocs(sourceTerms);
@@ -398,9 +398,9 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
   {
     TextWriter writer(targetPostings);
     auto& fieldInfo = targetPostings.addField(SpaceOrdinal::ROOT, "pos");
-    fieldInfo.type = FieldType::TEXT;
-    fieldInfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
-    writer.startField(&fieldInfo);
+    fieldInfo.header.type = FieldType::TEXT;
+    fieldInfo.header.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
+    writer.startField(fieldInfo.space, fieldInfo);
     TermRef term(pool, "term", 4);
     writer.startTerm(term);
     writer.startDoc(0);
@@ -414,17 +414,17 @@ TEST_F(TextMergeFuzzTest, rawZeroAndWideDeltas) {
     ASSERT_EQ((std::vector<int32_t>{1, 0, 300}), copied);
     writer.endDoc(0, sourceDocs.termFreq());
     writer.endTerm(term);
-    writer.endField();
+    fieldInfo.setPostings(writer.endField());
+    fieldInfo.setPresence({1, {}});
   }
   writeUnversionedRuns(targetPostings);
   targetPostings.finish();
 
   SegmentCore targetReaderCore(targetDir, 1, 1);
   auto& targetReader = targetReaderCore.rootReader();
-  FieldReader targetFields(targetReader);
-  ASSERT_TRUE(targetFields.readNextField());
-  SegFieldInfo targetInfo;
-  targetFields.readFieldInfo(targetInfo);
+  FieldCursor targetFields(targetReader);
+  ASSERT_TRUE(targetFields.next());
+  const auto& targetInfo = *targetReader.fieldInfo(targetFields.ordinal());
   TermsEnum targetTerms(pool, targetReader, targetInfo);
   ASSERT_TRUE(targetTerms.nextTerm());
   DocsPosEnum targetDocs(targetTerms);

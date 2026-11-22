@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <assert.h>
 #include <iostream>
 #include <mutex>
@@ -18,9 +19,9 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include "luxir/index/TrieBuilder.h"
-#include "luxir/index/IndexRamBudget.h"
 #include "luxir/index/IdRange.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/StrRef.h"
@@ -28,41 +29,33 @@
 #include "luxir/store/Directory.h"
 #include "luxir/codec/StreamVByte.h"
 #include "luxir/reader/PostingsReader.h"
+#include "IndexFieldInfo.h"
+#include "luxir/reader/SegmentCatalog.h"
+#include "luxir/reader/CatalogRange.h"
 #include "luxir/reader/Space.h"
 #include "ScreamingBuilder.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/util/screaming.h"
-#include "luxir/util/Signal.h"
 #include "LiveDocsWriter.h"
 #include "VersionRunBuilder.h"
 
 
 namespace luxir {
 
-/**
- * PostingsWriter is used to write the postings for a segment.
- * A single Inverter uses/owns a PostingsWriter.
- * PostingsWriter is currently single-threaded, but will be made multithreaded in the future for faster flushing.
- *
- * The high level strategy is to write the lowest levels first since higher level information needs/points to that info.
- *
- * For all terms in a field:
- *   For all documents containing that term:
- *     For all positions in that document:
- *       - Write all the positions and remember the number as termfreq
- *     - Write the termdoc info (doc,termfreq,pointer_to_positions) and remember the number as docfreq
- *   - Write the term info (term,docfreq,pointer_to_docs)
- */
+struct WrittenPoints {
+  field_parts::Points points;
+  field_parts::Bounds bounds;
+};
+
+// Writes a segment's postings, columns, row spaces and catalog.
+// An inverter owns its writer. Merge tasks use independent stream checkouts.
 class PostingsWriter {
 public:
-  static constexpr uint64_t SMALL_SEGMENT_BYTES = 64ULL << 20;
+  static constexpr size_t DEFAULT_SPILL_FILE_LIMIT = 32;
   static constexpr size_t RAM_SPILL_BYTES = 4ULL << 20;
 
-  // IndexFieldInfo adds extra info needed at index time to SegFieldInfo.
-  struct IndexFieldInfo : public SegFieldInfo {
-    SpaceOrdinal space;
-  };
+  using IndexFieldInfo = luxir::IndexFieldInfo;
 
   // The id field's bounds, captured when its dictionary is finalized. Absent
   // when no finalized dictionary was written for it; callers then derive them.
@@ -71,48 +64,40 @@ public:
 
 private:
   Directory& directory;
-  int32_t maxDoc;  // Root count, set by caller.
-  std::vector<SpaceDescriptor> spaceDescriptors{{}};
+  std::vector<RowSpace> spaces;
+  CatalogRange catalog;
   int64_t sizeInBytes = 0; // total size of all files written
   // Immutable request births, referenced from segment metadata rather than a field.
-  seg_location versionRunsLoc;
-  uint32_t versionRunCount = 0;
+  VersionRunsDescriptor versions;
   bool finished = false;
 
-  // Files available for use, sorted so largest are at the back. Reusing the
-  // largest keeps residual streams small enough to fold into file 0 at finish.
-  std::vector<OutputStream*> freeFiles;
   std::string segStr;
 
-  // Actual RAM retained by filesystem delegating files is a separate forced
-  // reservation from inverter or merge working memory. Writes never wait, but
-  // reservation growth still wakes the existing pressure machinery.
-  std::mutex delegatedRamMutex;
-  IndexRamBudget::Guard delegatedRamGuard;
-  int64_t delegatedRamBytes = 0;
-  bool ramDelegatingFiles = false;
+  std::function<void(int64_t)> onStagedRamDelta;
 
   struct DataFile {
-    OutputStream out;
     std::unique_ptr<File> file;
+    OutputStream out;
     uint32_t fileNum;
-    bool collapseProtected = false;
-    bool collapsed = false;
+    bool available = false;
+
+    DataFile(Directory& dir, std::string_view segStr, uint32_t fileNum)
+        : fileNum(fileNum) {
+      auto name = Postings::getIndexFileName(segStr, fileNum);
+      file = dir.createFile(name);
+      if (!file) throw FileIOException("Failed to create segment file: " + name);
+      out.setFile(file.get());
+      out.writeBytes(Postings::LUXIR_HEADER);
+    }
   };
 
-  struct FileRelocation {
-    uint32_t fileNum;
-    uint64_t baseOffset;
-  };
-  static constexpr uint32_t DROPPED_FILE = UINT32_MAX;
-  std::deque<DataFile> files;
-  // These are dequeues so elements don't move
-  // TODO: put these in the pool?
+  std::mutex primaryMutex;
+  std::optional<DataFile> primary;
+  std::mutex spillMutex;
+  std::vector<std::unique_ptr<DataFile>> spillFiles;  // Null slots are reserved for creation.
+  size_t spillFileLimit;
   std::deque<IndexFieldInfo> fieldInfos;
-  // Guards the shared writer state that concurrent field-merge tasks touch: the
-  // free-stream pool (freeFiles/files), the field registry (fieldInfos), and pool
-  // (via copyTerm).  Checked-out OutputStreams are exclusively owned and need no lock.
-  std::mutex mutex;
+  std::mutex mutex;  // Field registry and its pool.
 public:
   MemPool pool;  // during concurrent writing, access only under mutex (see copyTerm)
   uint64_t segId;
@@ -120,33 +105,17 @@ public:
 
 public:
   PostingsWriter(Directory& dir, uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc = -1,
-                 IndexRamBudget* ramBudget = nullptr,
-                 bool ramDelegatingFiles = false)
-      : directory(dir), maxDoc(maxDoc),
-        delegatedRamGuard(ramBudget == nullptr
-            ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)),
-        ramDelegatingFiles(ramDelegatingFiles), segId(segId), creatorEpoch(creatorEpoch)
-  {
-    segStr = Postings::segmentKey(segId, creatorEpoch);
+                 size_t spillFileLimit = DEFAULT_SPILL_FILE_LIMIT)
+      : directory(dir), spaces{{"", maxDoc, {}}}, segStr(Postings::segmentKey(segId, creatorEpoch)),
+        spillFileLimit(spillFileLimit), segId(segId), creatorEpoch(creatorEpoch) {}
+
+  // The owner installs its accounting before writing any checkouts. Merge
+  // checkouts may call it concurrently.
+  void setStagedRamAccounting(std::function<void(int64_t)> account) {
+    onStagedRamDelta = std::move(account);
   }
 
-  void configureRamDelegation(bool enabled,
-                              IndexRamBudget* ramBudget = nullptr) {
-    {
-      const std::lock_guard<std::mutex> lock(delegatedRamMutex);
-      if (ramBudget != nullptr && !delegatedRamGuard) {
-        assert(delegatedRamBytes == 0);
-        delegatedRamGuard = IndexRamBudget::Guard(*ramBudget, 0);
-      }
-      ramDelegatingFiles = enabled;
-    }
-    if (!enabled) {
-      // Called only after indexing has quiesced or before a merge starts.
-      // Existing candidate streams must spill too; changing only future file
-      // creation would retain threshold times stream-count RAM on a big flush.
-      for (auto& file : files) file.out.disableRamBuffering();
-    }
-  }
+  void setSpillFileLimit(size_t limit) { spillFileLimit = limit; }
 
   Directory& getDirectory() {
     return directory;
@@ -157,19 +126,24 @@ public:
   IndexFieldInfo& addField(SpaceOrdinal space, PackedTerm fieldName) {
     const std::lock_guard<std::mutex> lock(mutex);
     if (!findSpace(space)) throw std::invalid_argument("field references an undeclared row space");
-    fieldInfos.emplace_back(); // we should get default-initialization with this for the SegFieldInfo members
+    fieldInfos.emplace_back();
     fieldInfos.back().space = space;
-    fieldInfos.back().fieldname = fieldName;
-    assert(fieldInfos.back().monoLoc.offset() == 0 && fieldInfos.back().monoMetaOff == 0 && fieldInfos.back().columnMetaOff == 0);
-    assert(fieldInfos.back().pointsMetaOff == 0);
-    assert(fieldInfos.back().mono2Loc.offset() == 0 && fieldInfos.back().mono2MetaOff == 0);
-    assert(fieldInfos.back().valDocLoc.offset() == 0 && fieldInfos.back().valDocMetaOff == 0);
+    fieldInfos.back().header.name = fieldName;
     return fieldInfos.back();
   }
 
   // copies the fieldName into the pool associated with this PostingsWriter.
   IndexFieldInfo& addField(SpaceOrdinal space, std::string_view fieldName) {
     return addField(space, copyTerm(fieldName));
+  }
+
+  void addStoredField(SpaceOrdinal space, std::string_view name, int32_t maxDoc,
+                      const field_parts::Stored& stored) {
+    auto& field = addField(space, name);
+    field.header.type = FieldType::BIN;
+    field.header.flags = FieldType::STORED;
+    field.setPresence({maxDoc, {}});
+    field.setStored(stored);
   }
 
   // Thread-safe copy of a term into this writer's pool; the copy lives until the
@@ -179,64 +153,234 @@ public:
     return PackedTerm(pool, s);
   }
 
-
-  // make sure that numFiles can be obtained, and if not create more.
-  void reserveFiles(size_t numFiles) {
+  std::span<const field_parts::TermRun> copyTermRuns(std::span<const field_parts::TermRun> runs) {
+    using field_parts::TermRun;
     const std::lock_guard<std::mutex> lock(mutex);
-    _reserveFiles(numFiles);
+    auto* copy = (TermRun*)pool.alloc(runs.size_bytes(), alignof(TermRun));
+    std::uninitialized_copy(runs.begin(), runs.end(), copy);
+    return {copy, runs.size()};
   }
+
+  // Keep the endpoints in this writer's pool until the catalog is encoded.
+  field_parts::DictionaryBounds dictionaryBounds(std::string_view first, std::string_view last,
+                                                  FieldType::Type type) {
+    using field_parts::DictionaryBounds;
+    using Lower = DictionaryBounds::Lower;
+    using Upper = DictionaryBounds::Upper;
+    const auto cap = FieldType::dictionaryBoundsCap(type);
+    const std::lock_guard<std::mutex> lock(mutex);
+    PackedTerm lower(pool, first.substr(0, cap));
+    auto lowerMode = first.size() > cap ? Lower::ROUNDED : Lower::EXACT;
+    if (last.size() <= cap) return {lower, PackedTerm(pool, last), lowerMode, Upper::INCLUSIVE};
+
+    auto prefix = last.substr(0, cap);
+    while (!prefix.empty() && (unsigned char)prefix.back() == UCHAR_MAX) prefix.remove_suffix(1);
+    if (prefix.empty()) return {lower, PackedTerm(nullptr), lowerMode, Upper::UNBOUNDED};
+    PackedTerm::TermBuffer successor;
+    std::memcpy(successor.data(), prefix.data(), prefix.size());
+    successor[prefix.size() - 1] = (char)((unsigned char)prefix.back() + 1);
+    PackedTerm upper(pool, {successor.data(), prefix.size()});
+    return {lower, upper, lowerMode, Upper::EXCLUSIVE};
+  }
+
 
 private:
-  // caller holds mutex
-  void _reserveFiles(size_t numFiles) {
-    while (freeFiles.size() < numFiles) {
-      uint32_t fnum = (uint32_t)files.size();
-      // TODO: in the future, if this does IO, we may not want to lock?
-      Directory::FileCreateOptions options;
-      options.ramDelegating = ramDelegatingFiles;
-      options.ramSpillBytes = RAM_SPILL_BYTES;
-      options.ramBytesChanged = [this](int64_t delta) noexcept {
-        adjustDelegatedRam(delta);
-      };
-      std::unique_ptr<File> file = directory.createFile(
-          Postings::getIndexFileName(segStr, fnum), std::move(options));
-      files.emplace_back(DataFile{OutputStream{},std::move(file), fnum});
-      files.back().out.setFile( files.back().file.get());
-      files.back().out.streamNumber = fnum;
-      // writing something at the start of the file acts as a sanity check, and also makes file locations of 0
-      // invalid (and thus distinguishable from default-initialized).
-      // TODO: think about embedding other info such as the segment id and file number?
-      files.back().out.writeBytes(Postings::LUXIR_HEADER);
-      // insert at front of free list to maintain sorted order.
-      freeFiles.insert(freeFiles.begin(), &files.back().out);
-    }
+  DataFile& primaryFile() {
+    if (!primary) primary.emplace(directory, segStr, Postings::PRIMARY_FILE);
+    return *primary;
   }
 
-public:
-  // Custom deleter that holds a reference to the factory (PostingsWriter) that was used to obtain it.
-  class OutputStreamDeleter {
-  public:
-    explicit OutputStreamDeleter(PostingsWriter* factory) : factory(factory) {}
-    OutputStreamDeleter() : factory(nullptr) {}
+  static uint64_t alignedTail(const OutputStream& out) {
+    return alignUp(out.size(), MAX_ALIGN);
+  }
 
-    void operator()(OutputStream* os) const {
-      if (os != nullptr) {
-        factory->releaseOutputStream(os);
+  static bool fits(uint64_t base, uint64_t bytes) {
+    return base <= seg_location::maxOffset() && bytes <= seg_location::maxOffset() - base;
+  }
+
+  static void checkSliceSize(uint64_t base, uint64_t bytes) {
+    if (!fits(base, bytes)) throw std::length_error("segment offset exceeds seg_location");
+  }
+
+  static seg_location beginSlice(DataFile& file, size_t bytes) {
+    checkSliceSize(alignedTail(file.out), bytes);
+    file.out.align(MAX_ALIGN);
+    return {file.fileNum, file.out.size()};
+  }
+
+  DataFile& claimSpillFile(size_t bytes) {
+    uint32_t number;
+    {
+      const std::lock_guard lock(spillMutex);
+      if (spillFiles.size() >= spillFileLimit) {
+        DataFile* shortest = nullptr;
+        for (const auto& file : spillFiles) {
+          if (file && file->available && fits(alignedTail(file->out), bytes)
+              && (!shortest || file->out.size() < shortest->out.size())) {
+            shortest = file.get();
+          }
+        }
+        if (shortest) {
+          shortest->available = false;
+          return *shortest;
+        }
+      }
+      if (spillFiles.size() == seg_location::maxFilenum()) {
+        throw std::length_error("too many segment files");
+      }
+      spillFiles.emplace_back();
+      number = (uint32_t)spillFiles.size();
+    }
+
+    auto file = std::make_unique<DataFile>(directory, segStr, number);
+    const std::lock_guard lock(spillMutex);
+    return *(spillFiles[number - 1] = std::move(file));
+  }
+
+  class StagedStream : private RAMFile {
+    friend class PostingsWriter;
+    PostingsWriter& writer;
+    OutputStream out;
+    DataFile* spillFile = nullptr;
+    seg_location base;
+    size_t chargedBytes = 0;
+
+    void accountCapacity(size_t bytes) noexcept {
+      if (writer.onStagedRamDelta && bytes != chargedBytes) {
+        writer.onStagedRamDelta((int64_t)bytes - (int64_t)chargedBytes);
+      }
+      chargedBytes = bytes;
+    }
+
+    void spill(size_t additionalBytes) {
+      RAMFile::flushBuffer(out, 0);
+      checkSliceSize(size(), additionalBytes);
+      auto bytes = size() + additionalBytes;
+      spillFile = &writer.claimSpillFile(bytes);
+      base = beginSlice(*spillFile, bytes);
+      if (size() != 0) spillFile->out.appendFile(*this);
+      else clear();
+      accountCapacity(0);
+    }
+
+    void flush(OutputStream& stream, bool deferNewBuffer, size_t minCapacity) override {
+      if (spillFile) {
+        auto& physical = spillFile->out;
+        returnBuffer(stream, physical);
+        if (minCapacity != 0) physical.reserve((uint32_t)minCapacity);
+        else physical.flush(deferNewBuffer);
+        if (!deferNewBuffer) borrowBuffer(stream, physical);
+        return;
+      }
+
+      if (deferNewBuffer) {
+        RAMFile::flushBuffer(stream, 0);
+        return;
+      }
+      size_t needed = std::max(minCapacity, size_t{1});
+      size_t remaining = RAM_SPILL_BYTES - allocatedBytes();
+      if (needed > remaining) {
+        spill(needed);
+        auto& physical = spillFile->out;
+        physical.reserve((uint32_t)needed);
+        borrowBuffer(stream, physical);
+      } else {
+        RAMFile::flushBuffer(stream, std::min(nextBufferCapacity(stream, needed), remaining));
+        accountCapacity(allocatedBytes());
       }
     }
 
-  private:
-    PostingsWriter* factory;
+    void close(OutputStream& stream) override {
+      flush(stream, true, 0);
+    }
+
+    void appendFile(OutputStream& stream, RAMFile& file) override {
+      size_t bytes = file.size();
+      if (!spillFile && bytes > stream.reserved()) {
+        if (bytes > RAM_SPILL_BYTES - allocatedBytes()) spill(bytes);
+        else flush(stream, false, bytes);
+      }
+      if (spillFile) {
+        checkSliceSize(base.offset(), stream.size());
+        checkSliceSize(base.offset() + stream.size(), bytes);
+        auto& physical = spillFile->out;
+        returnBuffer(stream, physical);
+        physical.appendFile(file);
+        borrowBuffer(stream, physical, bytes);
+      } else {
+        file.appendTo(stream);
+        file.clear();
+      }
+    }
+
+    field_parts::Slice finish() {
+      uint64_t bytes = out.size();
+      if (spillFile) {
+        checkSliceSize(base.offset(), bytes);
+        returnBuffer(out, spillFile->out);
+        const std::lock_guard lock(writer.spillMutex);
+        spillFile->available = true;
+        return {base, bytes};
+      }
+      RAMFile::flushBuffer(out, 0);
+      assert(size() == bytes);
+      const std::lock_guard lock(writer.primaryMutex);
+      auto& primary = writer.primaryFile();
+      auto location = beginSlice(primary, bytes);
+      appendTo(primary.out);
+      return {location, bytes};
+    }
+
+  public:
+    explicit StagedStream(PostingsWriter& writer) : RAMFile(""), writer(writer), out(this) {}
+
+    // A spilled file stays unavailable on abandon. The failed segment is
+    // discarded without flushing any of its remaining buffered writes.
+    ~StagedStream() override {
+      clear();
+      accountCapacity(0);
+    }
+
+    OutputStream& output() noexcept { return out; }
   };
 
-  typedef std::unique_ptr<OutputStream, OutputStreamDeleter> OutputStreamPtr;
+public:
+  class OutputStreamPtr {
+    friend class PostingsWriter;
+    std::unique_ptr<StagedStream> stream;
+
+    explicit OutputStreamPtr(PostingsWriter& writer)
+        : stream(std::make_unique<StagedStream>(writer)) {}
+
+  public:
+    OutputStreamPtr() = default;
+    explicit operator bool() const noexcept { return stream != nullptr; }
+    OutputStream& operator*() const noexcept { return stream->output(); }
+    OutputStream* operator->() const noexcept { return &stream->output(); }
+    uint64_t pos() const noexcept { return stream->output().size(); }
+  };
+
+  field_parts::Slice finishStream(OutputStreamPtr&& checkout) {
+    assert(checkout.stream && &checkout.stream->writer == this);
+    auto stream = std::move(checkout.stream);
+    return stream->finish();
+  }
+
+  // A term or posting stream needs a file extent only if it contains bytes.
+  field_parts::Slice finishNonemptyStream(OutputStreamPtr&& checkout) {
+    assert(checkout.stream && &checkout.stream->writer == this);
+    if (checkout.pos()) return finishStream(std::move(checkout));
+    checkout.stream.reset();
+    return {};
+  }
 
   void writeVersionRuns(const VersionRunBuilder& builder) {
-    if (!maxDoc) return;
+    if (!spaces.front().maxDoc) return;
     auto stream = getOutputStream();
     VersionRunsOutput output(*stream, (uint32_t)((builder.size() + VersionRuns::BLOCK_SIZE - 1) / VersionRuns::BLOCK_SIZE));
-    versionRunCount = builder.finish(output, (uint32_t)maxDoc);
-    versionRunsLoc = output.finish(versionRunCount);
+    auto count = builder.finish(output, (uint32_t)spaces.front().maxDoc);
+    auto trailerOff = output.finish(count);
+    versions = VersionRunsDescriptor{finishStream(std::move(stream)), trailerOff, count};
   }
 
   class VersionRunsWriter {
@@ -271,60 +415,24 @@ public:
 
     void finish() {
       if (added) {
-        writer.versionRunCount = builder.finish(target(), (uint32_t)writer.maxDoc);
-        writer.versionRunsLoc = target().finish(writer.versionRunCount);
+        auto count = builder.finish(target(), (uint32_t)writer.spaces.front().maxDoc);
+        auto trailerOff = target().finish(count);
+        output.reset();
+        writer.versions = VersionRunsDescriptor{writer.finishStream(std::move(stream)), trailerOff, count};
       }
-      output.reset();
-      stream.reset();
     }
   };
 
-  // Thread-safe.  A checked-out stream is exclusively owned until released.
   OutputStreamPtr getOutputStream() {
-    return std::move(getOutputStreams<1>()[0]);
+    return OutputStreamPtr(*this);
   }
 
-  // Thread-safe.  Checked-out streams are exclusively owned until released.
   template <std::size_t N>
   std::array<OutputStreamPtr, N> getOutputStreams() {
-    const std::lock_guard<std::mutex> lock(mutex);
-    _reserveFiles(N);
-    std::array<OutputStreamPtr, N> os;
-    for (size_t i = 0; i < N; ++i) {
-      os[i] = OutputStreamPtr(freeFiles.back(), OutputStreamDeleter(this));
-      freeFiles.pop_back();
-    }
-    return os;
+    std::array<OutputStreamPtr, N> streams;
+    for (auto& stream : streams) stream = getOutputStream();
+    return streams;
   }
-
-  // Thread-safe (called by OutputStreamDeleter from whichever thread drops the stream).
-  void releaseOutputStream(OutputStream* os) {
-    const std::lock_guard<std::mutex> lock(mutex);
-    auto compareBySize = [](const OutputStream* a, const OutputStream* b) {
-      return a->size() < b->size();
-    };
-    auto it = std::upper_bound(freeFiles.begin(), freeFiles.end(), os, compareBySize);
-    freeFiles.insert(it, os);
-  }
-
-  void releaseOutputStreams(std::span<OutputStreamPtr> streams) {
-    for (auto& streamPtr : streams) {
-      releaseOutputStream(streamPtr.release());
-    }
-  }
-
-  // A TermRangeRow is already embedded in the shared terms stream by segment
-  // finalize.  Pin every file it names so collapse never has to patch an
-  // append-only row in place.  Survivor filenums remain stable because file 0
-  // stores a sparse physical-file list.
-  void protectOutputFiles(std::span<const uint32_t> fileNums) {
-    const std::lock_guard<std::mutex> lock(mutex);
-    for (uint32_t fileNum : fileNums) {
-      assert(fileNum < (uint32_t) files.size());
-      files[fileNum].collapseProtected = true;
-    }
-  }
-
 
   uint64_t getSegId() const {
     return segId;
@@ -335,125 +443,108 @@ public:
   bool finish(std::vector<std::string>* filenames = nullptr, std::vector<FileDescriptor>* descriptors = nullptr) {
 
     if (finished) return false; // already called
-    for (size_t index = 1; index < spaceDescriptors.size(); index++) {
-      const auto& space = spaceDescriptors[index];
-      if (!space.ownership || space.maxDoc <= 0) {
-        throw std::invalid_argument("unfinished row space: " + space.path);
+    auto maxDoc = spaces.front().maxDoc;
+    for (size_t index = 1; index < spaces.size(); index++) {
+      const auto& space = spaces[index];
+      if (!space.ownership.ends || space.maxDoc <= 0) {
+        throw std::invalid_argument("unfinished row space: " + std::string(space.path));
       }
       auto parent = spaceParentPath(space.path);
-      auto entry = std::find_if(spaceDescriptors.begin(), spaceDescriptors.end(),
+      auto entry = std::find_if(spaces.begin(), spaces.end(),
           [&](const auto& candidate) { return candidate.path == parent; });
-      if (entry == spaceDescriptors.end() || (parent.empty() ? maxDoc : entry->maxDoc) <= 0) {
-        throw std::invalid_argument("row space has no parent rows: " + space.path);
+      if (entry == spaces.end() || entry->maxDoc <= 0) {
+        throw std::invalid_argument("row space has no parent rows: " + std::string(space.path));
       }
     }
     if (fieldInfos.empty() && maxDoc <= 0) return false; // no data added
 
-    if (maxDoc > 0 && (versionRunsLoc.isNull() || versionRunCount == 0)) {
+    if (!validSpaceDocCount(maxDoc)) throw std::invalid_argument("root doc count out of range");
+    if (maxDoc > 0 && (!versions.slice || versions.count == 0)) {
       throw std::runtime_error("Segment has no request birth versions");
     }
 
-    // make sure we have at least one file
-    reserveFiles(1);
-
-    // Make sure that there are no outstanding files.
-    // Do this for non-debug mode as well?
-    assert(freeFiles.size() == files.size());
-    Signal::emit("postingsBeforeCollapse", this);
-    std::vector<uint32_t> survivorFileNums = collapseFiles();
-    spaceDescriptors[0].maxDoc = maxDoc;
-    std::vector<SpaceOrdinal> order;
-    order.reserve(spaceDescriptors.size());
-    for (size_t i = 0; i < spaceDescriptors.size(); i++) order.push_back((SpaceOrdinal)i);
-    std::sort(order.begin(), order.end(), [&](auto a, auto b) {
-      return spaceDescriptors[(size_t)a].path < spaceDescriptors[(size_t)b].path;
-    });
-    writeFieldIndexes(order);
-    writeSegmentInfo(survivorFileNums, order);
+    for (const auto& file : spillFiles) {
+      if (!file || !file->available) throw std::logic_error("unfinished spilled checkout");
+    }
+    primaryFile();
+    writeCatalog();
 
     // The StreamVByte AVX tail decoder used by postings iteration, and the
     // LinearPack bulk decoder used by ord columns, may read up to
     // SVB_OVERREAD_PAD bytes past the encoded data. Reserve that slack at the end of
     // every pure-data file so the read stays in bounds (ord columns write no pad
-    // of their own). File 0 ends with the field index and segment info just
-    // written above, which already provide far more trailing slack, so it is
-    // skipped. Padding past its segment-info size marker would also break the
-    // end-relative read in SegmentCore.
-    if (survivorFileNums.size() > 1) {
-      static const char svbPad[SVB_OVERREAD_PAD] = {};
-      for (uint32_t fileNum : survivorFileNums) {
-        if (fileNum != 0) files[fileNum].out.write(svbPad, SVB_OVERREAD_PAD);
-      }
-    }
+    // of their own). The catalog supplies this slack in file 0, and its
+    // directory length must be the last bytes of that file.
+    static const char svbPad[SVB_OVERREAD_PAD] = {};
+    for (auto& file : spillFiles) file->out.write(svbPad, SVB_OVERREAD_PAD);
 
-    if (filenames) {
-      filenames->reserve(filenames->size() + survivorFileNums.size());
-    }
-    for (uint32_t fileNum : survivorFileNums) {
-      auto& dataFile = files[fileNum];
+    if (filenames) filenames->reserve(filenames->size() + 1 + spillFiles.size());
+    auto finishFile = [&](DataFile& dataFile) {
       sizeInBytes += dataFile.out.size();
       dataFile.out.close();
       directory.finishFile(*dataFile.file);
       if (descriptors) descriptors->push_back(dataFile.file->descriptor());
-      if (filenames) {
-        filenames->emplace_back(dataFile.file->name());
-      }
-    }
+      if (filenames) filenames->emplace_back(dataFile.file->name());
+    };
+    finishFile(*primary);
+    for (auto& file : spillFiles) finishFile(*file);
 
     finished = true;
-    freeFiles.clear();
-    fieldInfos.resize(0);
-    files.resize(0);
-    assert(delegatedRamBytes == 0);
+    fieldInfos.clear();
+    spillFiles.clear();
+    primary.reset();
     return true;
   }
 
   void setMaxDoc(int max) {
-    maxDoc = max;
+    if (!validSpaceDocCount(max)) throw std::invalid_argument("root doc count out of range");
+    spaces.front().maxDoc = max;
   }
 
   int32_t getMaxDoc(SpaceOrdinal space) const {
-    if (space == SpaceOrdinal::ROOT) return maxDoc;
     const auto* descriptor = findSpace(space);
     if (!descriptor) throw std::invalid_argument("unknown row space");
-    if (!descriptor->ownership) throw std::invalid_argument("row space count is not finalized");
+    if (space != SpaceOrdinal::ROOT && !descriptor->ownership.ends) throw std::invalid_argument("row space count is not finalized");
     return descriptor->maxDoc;
   }
 
   int32_t getMaxSpaceRows() const {
-    int32_t count = maxDoc;
-    for (const auto& space : spaceDescriptors) count = std::max(count, space.maxDoc);
+    int32_t count = spaces.front().maxDoc;
+    for (const auto& space : spaces) count = std::max(count, space.maxDoc);
     return count;
   }
 
   // Declare a child space before its fields. Ownership streams use the same
-  // allocator as field data and are relocated by the same finalize pass.
+  // checkout mechanism as field data.
   SpaceOrdinal addSpace(std::string_view path) {
     auto parent = spaceParentPath(path);
     bool hasParent = false;
-    for (const auto& space : spaceDescriptors) {
+    for (const auto& space : spaces) {
       if (space.path == path) throw std::invalid_argument("duplicate row space path");
       if (space.path == parent) hasParent = true;
     }
-    if (finished || path.empty() || !hasParent) {
+    if (finished || !validChildSpacePath(path) || !hasParent) {
       throw std::invalid_argument("invalid row space declaration");
     }
-    spaceDescriptors.push_back({std::string(path), 0, {}, 0, {}});
-    return (SpaceOrdinal)(spaceDescriptors.size() - 1);
+    auto* data = (char*)pool.alloc(path.size());
+    std::memcpy(data, path.data(), path.size());
+    spaces.push_back({std::string_view(data, path.size()), 0, {}});
+    return (SpaceOrdinal)(spaces.size() - 1);
   }
 
   // Attach the final row count and encoded ownership after indexing.
   void finishSpace(SpaceOrdinal ordinal, int32_t count, OwnershipDescriptor ownership) {
     if (finished || ordinal == SpaceOrdinal::ROOT || !findSpace(ordinal)
-        || count <= 0 || count >= PostingsReader::HARD_MAX_DOC || ownership.ends.isNull()
-        || ownership.endsMetaOff < 0 || ownership.ownersMetaOff < 0) {
+        || count <= 0 || !validSpaceDocCount(count) || !ownership.ends) {
       throw std::invalid_argument("invalid row space finalization");
     }
-    auto& space = spaceDescriptors[(size_t)ordinal];
-    if (space.ownership) throw std::invalid_argument("row space already finalized");
+    auto& space = spaces[(size_t)ordinal];
+    if (space.ownership.ends) throw std::invalid_argument("row space already finalized");
     space.maxDoc = count;
     space.ownership = ownership;
   }
+
+  const CatalogRange& catalogRange() const noexcept { return catalog; }
 
   int64_t getSizeInBytes() {
     return sizeInBytes;
@@ -464,143 +555,35 @@ public:
   uint64_t writeLiveDocs(const screaming::FixedBitSet& liveBits, int32_t numLiveDocs);
 
 private:
-  const SpaceDescriptor* findSpace(SpaceOrdinal ordinal) const {
-    return (size_t)ordinal < spaceDescriptors.size() ? &spaceDescriptors[(size_t)ordinal] : nullptr;
+  const RowSpace* findSpace(SpaceOrdinal ordinal) const {
+    return (size_t)ordinal < spaces.size() ? &spaces[(size_t)ordinal] : nullptr;
   }
 
-  void adjustDelegatedRam(int64_t delta) noexcept {
-    const std::lock_guard<std::mutex> lock(delegatedRamMutex);
-    assert(delta >= -delegatedRamBytes);
-    delegatedRamBytes += delta;
-    assert(delegatedRamBytes >= 0);
-    if (delegatedRamGuard) delegatedRamGuard.forceResize(delegatedRamBytes);
+  void writeCatalog() {
+    RAMFile tail("");
+    OutputStream out(&tail);
+    SegmentCatalogWriter writer(out);
+    writeFieldTables(writer);
+    std::vector<uint32_t> files;
+    files.reserve(spillFiles.size() + 1);
+    files.push_back(Postings::PRIMARY_FILE);
+    for (const auto& file : spillFiles) files.push_back(file->fileNum);
+    writer.finish(files, versions);
+    out.close();
+    primary->out.align(MAX_ALIGN);
+    auto start = primary->out.size();
+    checkSliceSize(start, tail.size());
+    catalog = {start, tail.size(), tail.digest()};
+    primary->out.appendFile(tail);
   }
 
-  std::vector<uint32_t> collapseFiles() {
-    assert(!files.empty());
-    std::vector<FileRelocation> relocations;
-    relocations.reserve(files.size());
-    for (uint32_t fileNum = 0; fileNum < (uint32_t) files.size(); fileNum++) {
-      relocations.push_back({fileNum, 0});
-    }
-
-    // File 0 is mandatory for field and segment metadata, so it is the only
-    // target that guarantees a tiny segment becomes one physical file.  Keep
-    // survivor filenums sparse instead of densely renumbering them: a stream
-    // that already spilled can retain its storage key, avoiding rename/copy
-    // work on filesystems and future object stores.
-    // A stream holding only the file header carried no data.  If nothing
-    // references it, drop it outright instead of folding eight bytes plus
-    // alignment pad into file 0.  A zero-length structure can still park a
-    // FieldInfo base at a header-only file's tail, so referenced ones are
-    // appended like any other stream (the reader must be able to open the
-    // location's file even to read zero bytes).
-    std::vector<bool> referenced(files.size(), false);
-    if (!versionRunsLoc.isNull()) referenced[versionRunsLoc.filenum()] = true;
-    for (auto& fieldInfo : fieldInfos) {
-      fieldInfo.relocateLocations([&](seg_location location) {
-        if (location.filenum() < referenced.size()) {
-          referenced[location.filenum()] = true;
-        }
-        return location;
-      });
-    }
-
-    for (const auto& space : spaceDescriptors) {
-      if (!space.ownership) continue;
-      for (auto loc : {space.ownership->ends, space.ownership->owners}) {
-        if (!loc.isNull() && loc.filenum() < referenced.size()) referenced[loc.filenum()] = true;
-      }
-    }
-
-    OutputStream& target = files[0].out;
-    for (uint32_t fileNum = 1; fileNum < (uint32_t) files.size(); fileNum++) {
-      DataFile& source = files[fileNum];
-      if (source.collapseProtected) continue;
-      if (!referenced[fileNum] && source.out.isRelocatable()
-          && source.out.size() == Postings::LUXIR_HEADER.size()) {
-        // Buffered bytes are discarded at destruction (FSFile never flushes on
-        // destroy; a delegating file releases its RAM accounting there too).
-        source.collapsed = true;
-        relocations[fileNum] = {DROPPED_FILE, 0};
-        continue;
-      }
-      uint64_t baseOffset = 0;
-      if (target.tryAppendRelocatable(source.out, MAX_ALIGN, baseOffset)) {
-        source.collapsed = true;
-        relocations[fileNum] = {0, baseOffset};
-      }
-    }
-
-    auto relocate = [&](seg_location location) {
-      uint32_t fileNum = location.filenum();
-      if (fileNum >= relocations.size()) {
-        throw std::logic_error("FieldInfo references an unknown segment file");
-      }
-      const FileRelocation& relocation = relocations[fileNum];
-      if (relocation.fileNum == DROPPED_FILE) {
-        throw std::logic_error("FieldInfo references a dropped header-only segment file");
-      }
-      if (location.offset() > seg_location::maxOffset() - relocation.baseOffset) {
-        throw std::length_error("relocated segment offset exceeds seg_location");
-      }
-      return seg_location(relocation.fileNum,
-                          relocation.baseOffset + location.offset());
-    };
-    for (auto& fieldInfo : fieldInfos) {
-      fieldInfo.relocateLocations(relocate);
-    }
-    if (!versionRunsLoc.isNull()) versionRunsLoc = relocate(versionRunsLoc);
-    for (auto& space : spaceDescriptors) {
-      if (!space.ownership) continue;
-      auto& shape = *space.ownership;
-      shape.ends = relocate(shape.ends);
-      if (!shape.owners.isNull()) shape.owners = relocate(shape.owners);
-    }
-
-    std::vector<uint32_t> survivors;
-    survivors.reserve(files.size());
-    for (uint32_t fileNum = 0; fileNum < (uint32_t) files.size(); fileNum++) {
-      if (!files[fileNum].collapsed) survivors.push_back(fileNum);
-    }
-    assert(!survivors.empty() && survivors[0] == 0);
-    return survivors;
-  }
-
-  void writeSegmentInfo(std::span<const uint32_t> survivorFileNums, std::span<const SpaceOrdinal> order) {
-    // TODO: if maxDoc==0, does this cause issues elsewhere?
-    // assert(maxDoc >= 1);
-    OutputStream& out = files[0].out;
-    auto outStart = out.size();
-    out.writeVint(maxDoc);
-    // Physical filenums are intentionally sparse.  Dense renumbering would
-    // require renaming a file after it had started spilling, which becomes an
-    // object-store copy.  Readers keep a filenum-indexed table with holes.
-    out.writeVint((uint32_t) survivorFileNums.size());
-    for (uint32_t fileNum : survivorFileNums) out.writeVint(fileNum);
-    out.writeVal(versionRunsLoc);
-    out.writeVint(versionRunCount);
-    out.writeVint((uint32_t)spaceDescriptors.size());
-    for (auto ordinal : order) {
-      const auto& space = spaceDescriptors[(size_t)ordinal];
-      out.writeVint((uint32_t)space.path.size());
-      out.write(space.path.data(), space.path.size());
-      out.writeVint((uint32_t)space.maxDoc);
-      out.writeVal(space.fieldOffsets);
-      out.writeVint(space.fieldCount);
-      if (space.ownership) {
-        const auto& shape = *space.ownership;
-        out.writeVal(shape.ends);
-        out.writeVlong((uint64_t)shape.endsMetaOff);
-        out.writeVal(shape.owners);
-        out.writeVlong((uint64_t)shape.ownersMetaOff);
-      }
-    }
-    auto segInfoSize = out.size() - outStart;
-    out.writeInt(segInfoSize);
-  }
-
-  void writeFieldIndexes(std::span<const SpaceOrdinal> order) {
+  void writeFieldTables(SegmentCatalogWriter& writer) {
+    std::vector<SpaceOrdinal> order;
+    order.reserve(spaces.size());
+    for (size_t i = 0; i < spaces.size(); i++) order.push_back((SpaceOrdinal)i);
+    std::sort(order.begin(), order.end(), [&](auto a, auto b) {
+      return spaces[(size_t)a].path < spaces[(size_t)b].path;
+    });
     // PostingsReader::findOrdinal does a binary search over the field offsets array, so
     // fields must be written in sorted name order.  Callers that flush fields
     // in sorted order already satisfy this, but some resources (like
@@ -608,114 +591,33 @@ private:
     // here to support arbitrary addField ordering.
     std::vector<IndexFieldInfo*> sortedInfos;
     sortedInfos.reserve(fieldInfos.size());
-    for (auto& field : fieldInfos) sortedInfos.push_back(&field);
+    // A field is present in the catalog only if it has rows in this space.
+    for (auto& field : fieldInfos) {
+      if (field.header.docsWithField != 0) {
+        sortedInfos.push_back(&field);
+      } else if (field.header.parts.size() != 0) {
+        throw std::logic_error("field has parts but no docs");
+      }
+    }
     std::sort(sortedInfos.begin(), sortedInfos.end(), [&](const auto* a, const auto* b) {
       return a->space != b->space
-          ? spaceDescriptors[(size_t)a->space].path < spaceDescriptors[(size_t)b->space].path
-          : a->fieldname < b->fieldname;
+          ? spaces[(size_t)a->space].path < spaces[(size_t)b->space].path
+          : a->header.name < b->header.name;
     });
     for (size_t i = 1; i < sortedInfos.size(); i++) {
       if (sortedInfos[i - 1]->space == sortedInfos[i]->space
-          && sortedInfos[i - 1]->fieldname == sortedInfos[i]->fieldname) {
+          && sortedInfos[i - 1]->header.name == sortedInfos[i]->header.name) {
         throw std::invalid_argument("duplicate field in row space");
       }
     }
     size_t first = 0;
     for (auto ordinal : order) {
-      auto& space = spaceDescriptors[(size_t)ordinal];
-      size_t end = first;
-      while (end < sortedInfos.size() && sortedInfos[end]->space == ordinal) end++;
-      writeFieldIndex(space, std::span(sortedInfos).subspan(first, end - first));
-      first = end;
-    }
-  }
-
-  void writeFieldIndex(SpaceDescriptor& space, std::span<IndexFieldInfo* const> sortedInfos) {
-    //
-    // This format is position independent.  One just needs a pointer to the end of the final structure.
-    //
-    // Format:
-    // List of field metadata, followed by an array of offsets for each field, followed by the number of fields.
-    //
-
-    // IDEA: for few fields, we could just skip the compression and memcpy the whole struct.
-
-    OutputStream& fieldOutput = files[0].out;
-    std::vector<uint32_t> fieldOffs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
-    fieldOffs.reserve(sortedInfos.size());
-
-    auto fieldsStart = fieldOutput.size();  // where this index starts
-
-    for (auto* finfoPtr : sortedInfos) {
-      auto& finfo = *finfoPtr;
-      auto fieldLoc = fieldOutput.size();
-      fieldOffs.push_back(fieldLoc - fieldsStart);  // make the location relative so we can append this to a large file if necessary
-
-      fieldOutput.writePackedTerm(finfo.fieldname);
-      fieldOutput.writeVint(finfo.type);
-      fieldOutput.writeVint(finfo.flags);
-      fieldOutput.writeVint(finfo.typeFlags);
-      fieldOutput.writeVlong(finfo.docsWithField);
-
-      //  nocommit     if ((finfo.flags & 0x01) != 0) {
-      // TODO: we could perhaps also tell by something like nTerms > 0?
-      if ((finfo.flags & FieldType::INDEX_DOCS) != 0) {
-        fieldOutput.writeVal(finfo.termBlockIndexLoc);
-        fieldOutput.writeVal(finfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
-        fieldOutput.writeVal(finfo.docsLoc);
-        fieldOutput.writeVal(finfo.posLoc);
-        fieldOutput.writeVlong(finfo.nTerms);
-        fieldOutput.writeVlong(finfo.sumDocFreq - finfo.nTerms);            // sumDocFreq >= nTerms
-        fieldOutput.writeVlong(finfo.sumTotalTermFreq - finfo.sumDocFreq);  // sumTotalTermFreq >= sumDocFreq
-        fieldOutput.writeVal(finfo.trieLoc);
-        fieldOutput.writeVlong(finfo.trieRootOff);
-        if ((finfo.flags & FieldType::TERM_RANGES) != 0) {
-          fieldOutput.writeVal(finfo.rangeTableLoc);
-        }
+      writer.beginSpace(spaces[(size_t)ordinal]);
+      while (first < sortedInfos.size() && sortedInfos[first]->space == ordinal) {
+        const auto& field = *sortedInfos[first++];
+        writer.addField(field);
       }
-
-      // Things that have an int col: text fields (for norms), int col, float col, double col, string col (for ords)
-      // Things that would not have an int col in the future - index only non-text fields, or text fields w/o norms,
-      // or stored-only fields in a column family.  For now, just assume there is always a column.
-      // if ((finfo.flags & 0x02) != 0) {
-      fieldOutput.writeVal(finfo.docsWithFieldEndLoc);
-      fieldOutput.writeVal(finfo.columnLoc);
-      fieldOutput.writeVlong(finfo.columnMetaOff);
-      fieldOutput.writeVlong(finfo.numValues);
-      fieldOutput.writeVint((uint32_t)finfo.ordFormat);
-      fieldOutput.writeVint((uint32_t)finfo.ordIndexing);
-      fieldOutput.writeVint((uint32_t)finfo.ordBits);
-      fieldOutput.writeVal(finfo.pointsLoc);
-      fieldOutput.writeVlong(finfo.pointsMetaOff);
-      fieldOutput.writeVint((uint32_t)finfo.normsFormat);
-      fieldOutput.writeVal(finfo.normsLoc);
-      fieldOutput.writeVlong(finfo.normsLen);
-
-      // for now, always write mono col info.  If we want to make it optional, we need a flag for it.
-      fieldOutput.writeVal(finfo.monoLoc);
-      fieldOutput.writeVlong(finfo.monoMetaOff);
-      fieldOutput.writeVal(finfo.mono2Loc);
-      fieldOutput.writeVlong(finfo.mono2MetaOff);
-      fieldOutput.writeVal(finfo.valDocLoc);
-      fieldOutput.writeVlong(finfo.valDocMetaOff);
     }
-
-    // Now write the start of each fieldInfo
-    // Now make field offsets relative to the start of the locations array instead of the beginning of fields.
-    // It's minor, but allows us to remove another pointer (to the start of the fields)
-    fieldOutput.align(4);
-    auto locationsOff = fieldOutput.size() - fieldsStart;
-    for (auto& loc : fieldOffs) {
-      loc = locationsOff - loc;
-    }
-
-    space.fieldOffsets = fieldOutput.slocation();
-    space.fieldCount = (uint32_t)fieldOffs.size();
-    if (fieldOffs.size() > 0) {
-      fieldOutput.write(&(fieldOffs[0]), fieldOffs.size() * sizeof(fieldOffs[0]));
-    }
-    // write the size of the array at the end so we can use it to find the start when reading
-    fieldOutput.writeInt((int32_t)fieldOffs.size());
   }
 
 };
@@ -767,8 +669,9 @@ public:
 // walking, and clearing it cost the norms present rather than all 256: most
 // terms touch a handful of norms.
 struct NormSurface {
-  std::array<uint32_t, 256> maxTf{};
-  std::array<uint64_t, 4> present{};
+  static constexpr uint32_t NUM_NORMS = 256;
+  std::array<uint32_t, NUM_NORMS> maxTf{};
+  std::array<uint64_t, NUM_NORMS / 64> present{};
 
   void raise(uint32_t norm, uint32_t tf) {
     assert(norm <= 255);
@@ -803,25 +706,93 @@ struct NormSurface {
   }
 };
 
-// TODO: we need a specialization of this for when positions are not required (indexed string fields)
-class TextWriter {
+// Run size settings for the term dictionary writer.
+class TextWriterSettings {
+protected:
+  // Leave enough space in a run for one more block at a 32-bit offset.
+  // A block of 32 terms uses at most 8,285 bytes for the packed first term,
+  // two vlong bases, prefix length, pulse mask, suffix length vint, hashes,
+  // prefix/suffix lengths and 31 full suffixes. Seven run lengths take 35
+  // bytes. Docs ends, TTF and positions take 960 bytes (three vlongs per
+  // term). Packed-block counts and doc frequencies take 272 bytes (two SVB
+  // runs). Pulsed docs and positions take another 272 (64 SVB values).
+  // Each impact frontier has a two-byte count and up to 256 points of one
+  // norm byte and a five-byte TF delta, or 49,216 bytes for the block.
+  // The sum is at most 59,040 bytes, even charging all lanes at once.
+  static constexpr uint32_t MAX_TERM_BLOCK_BYTES = 64 * 1024;
+  static constexpr uint32_t RUN_SPLIT_BYTES =
+      std::numeric_limits<field_parts::Terms::BlockOffset>::max() - MAX_TERM_BLOCK_BYTES;
+
+private:
+  static constexpr uint32_t TERMS = Postings::TERMS_BLOCK_SIZE;
+  static constexpr uint32_t HEADER_BYTES = PackedTerm::MAX_BYTES + 2 * MAX_VLONG_SIZE
+      + 1 + sizeof(uint32_t) + MAX_VINT_SIZE;
+  static constexpr uint32_t TERM_BYTES = TERMS + (TERMS - 1) * (2 + PackedTerm::MAX_LEN);
+  static constexpr uint32_t MAX_BLOCK_BYTES = HEADER_BYTES + TERM_BYTES + 7 * MAX_VINT_SIZE
+      + 3 * TERMS * MAX_VLONG_SIZE + 2 * (svbKeyBytes(TERMS) + TERMS * sizeof(uint32_t))
+      + svbKeyBytes(2 * TERMS) + 2 * TERMS * sizeof(uint32_t)
+      + TERMS * (2 + NormSurface::NUM_NORMS * (1 + MAX_VINT_SIZE));
+  static_assert(NormSurface::NUM_NORMS >= 128 && NormSurface::NUM_NORMS < (1u << 14));
+  static_assert(TERMS == std::numeric_limits<uint32_t>::digits);
+  static_assert(MAX_BLOCK_BYTES == 59040 && MAX_BLOCK_BYTES < MAX_TERM_BLOCK_BYTES);
+
+protected:
+  inline static std::atomic<uint32_t> splitBytes = RUN_SPLIT_BYTES;  // Writer setting, sampled at construction.
+
+public:
+  static uint32_t setRunSplitBytesForTests(uint32_t bytes) {
+    return splitBytes.exchange(std::min(bytes, RUN_SPLIT_BYTES));
+  }
+};
+
+// Writes a field or partition of the term dictionary and postings.
+// TODO: Specialize the writer for fields without positions.
+class TextWriter : public TextWriterSettings {
 public:
   static constexpr int32_t L1_PERIOD = 32;
   static constexpr int32_t kCheckpointStride = 8;
   static inline int32_t checkpointStrideForTests = kCheckpointStride;
 
+  // A run's start in the partition's three streams, before file placement.
+  struct RunStart {
+    int32_t termOrd;  // First term ordinal in the partition.
+    int32_t blockOrd;  // First block ordinal in the partition.
+    uint64_t dictionaryStart;  // Byte offset relative to the partition's dictionary.
+    uint64_t docsStart;  // Byte offset relative to the partition's docs stream.
+    uint64_t positionsStart;  // Byte offset relative to the partition's positions stream.
+  };
+
+  // A finished serial field or partition before stitching its dictionary.
   struct RangeResult {
-    std::vector<uint64_t> termBlockOffsets;
+    std::vector<field_parts::Terms::BlockOffset> termBlockOffsets;  // Relative to each run.
+    std::vector<RunStart> runs;  // Cuts at term block boundaries.
     std::vector<std::string> separatorKeys;
     std::string firstTerm;
     std::string lastTerm;
     int64_t sumDocFreq = 0;
     int64_t sumTotalTermFreq = 0;
+    uint64_t dictionaryBytes = 0;
     uint64_t docsBytes = 0;
     uint64_t posBytes = 0;
     int64_t nTerms = 0;
     int32_t nBlocks = 0;
-    bool mayHaveFitted = false;  // some kept term could be a fitted long value
+    uint8_t segFlags = 0;  // Data facts collected while writing this partition.
+
+    void appendRuns(std::vector<field_parts::TermRun>& destination, int32_t termOrd, int32_t blockOrd,
+                    uint64_t dictionaryStart, field_parts::Slice docs, field_parts::Slice positions) const {
+      assert(docs.bytes == docsBytes && positions.bytes == posBytes);
+      auto slice = [](field_parts::Slice stream, uint64_t start, uint64_t end) {
+        return end == start ? field_parts::Slice{} : stream.subSlice(start, end - start);
+      };
+      for (size_t i = 0; i < runs.size(); ++i) {
+        const auto& run = runs[i];
+        const auto* next = i + 1 == runs.size() ? nullptr : &runs[i + 1];
+        destination.push_back({termOrd + run.termOrd, blockOrd + run.blockOrd,
+            dictionaryStart + run.dictionaryStart,
+            slice(docs, run.docsStart, next ? next->docsStart : docsBytes),
+            slice(positions, run.positionsStart, next ? next->positionsStart : posBytes)});
+      }
+    }
   };
 
   static std::string separatorKey(std::string_view previous, std::string_view first) {
@@ -840,7 +811,10 @@ public:
 
 private:
   PostingsWriter& postingsWriter;
-  PostingsWriter::IndexFieldInfo* fieldInfo;
+  SpaceOrdinal space;
+  PackedTerm name = PackedTerm(nullptr);
+  FieldType::Type type = FieldType::NONE;
+  FieldType::flag_type flags = 0;  // Schema flags for the field being written.
 
   std::array<OutputStreamPtr, 3> streams; // holders for the streams we are using.
   OutputStream& termOutput;    // output stream for termFile
@@ -860,7 +834,7 @@ private:
   // re-reads the block's terms for prefix encoding, so callers need not keep term
   // bytes alive past the startTerm() call.  Slot i backs termList[i].
   std::array<char, Postings::TERMS_BLOCK_SIZE * PackedTerm::MAX_BYTES> termBytes;
-  std::vector<uint64_t> termDocsEnd;  // cumulative trailer-free docs-region end offsets
+  std::vector<uint64_t> termDocsEnd;  // cumulative docs stream end offsets
   std::vector<uint32_t> termPackedBlocks;
   std::vector<uint32_t> termDocFreqs;
   std::vector<uint64_t> termTtfCodes;
@@ -918,18 +892,20 @@ private:
   bool hasNorms = false;
   TextNormsView norms;
 
-  std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
+  std::vector<field_parts::Terms::BlockOffset> termBlockOffsets;  // Block starts relative to their run.
+  std::vector<RunStart> runs;  // Nonempty runs in this field or partition.
+  const uint32_t runSplitBytes = splitBytes.load(std::memory_order_relaxed);
   TrieBuilder trieBuilder;
   std::vector<std::string> separatorKeys;
-  std::string firstTermInRun;
+  std::string firstTerm;
   bool buildTrie = true;
   std::array<char, PackedTerm::MAX_BYTES> lastTermOfPrevBlock{};
   uint32_t lastTermOfPrevBlockLen = 0;
   bool hasLastTermOfPrevBlock = false;
   int64_t sumTotalTermFreq = 0; // updated in endTerm
   int64_t sumDocFreq = 0; // updated in endTerm
-  int64_t numTerms; // currently only updated in flushTerms
-  bool mayHaveFitted = false; // set in endTerm for kept terms of MIN_FITTED_LEN bytes or more
+  int64_t numTerms;  // Number of terms in completed dictionary blocks.
+  uint8_t segFlags = 0;  // Data facts from the kept terms.
 
   // TODO: pool allocate this
   std::vector<char> compressed_output;
@@ -1360,37 +1336,34 @@ public:
     posOutput(posOutput), buildTrie(false) {
   }
 
-  // TODO: FIXME: this is for tests, but it doesn't set the flags / type properly!
-  void startField(SpaceOrdinal space, const std::string& fieldName) {
-    PostingsWriter::IndexFieldInfo* finfo = &postingsWriter.addField(space, fieldName);
-    finfo->type = FieldType::TEXT;
-    finfo->flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
-    startField(finfo);
+  void startField(SpaceOrdinal rowSpace, const PostingsWriter::IndexFieldInfo& field) {
+    startField(rowSpace, field.header.name, field.header.flags, field.header.type);
   }
 
-  void startField(PostingsWriter::IndexFieldInfo* finfo) {
-    if (termsLoc == -1) {
-      throw std::runtime_error("startField called twice!");
-    }
-    fieldInfo = finfo;
-    hasFreqs = FieldType::hasFreqs(finfo->flags);
-    hasPositions = FieldType::hasPositions(finfo->flags);
+  void startField(SpaceOrdinal rowSpace, PackedTerm fieldName, int32_t flags, FieldType::Type fieldType = FieldType::TEXT) {
+    if (!name.isNull()) throw std::runtime_error("startField called twice!");
+    assert(!fieldName.isNull());
+    space = rowSpace;
+    name = fieldName;
+    type = fieldType;
+    this->flags = flags;
+    hasFreqs = FieldType::hasFreqs(flags);
+    hasPositions = FieldType::hasPositions(flags);
     hasNorms = hasPositions;
     termsLoc = termOutput.size();
     docsLoc = docOutput.size();
     posLoc = posOutput.size();
     numTerms = 0;
-    mayHaveFitted = false;
-    // nocommit fieldInfo->flags |= 0x01;  // text field
+    segFlags = 0;
 
     termBlockOffsets.resize(0);
     trieBuilder.reset();
     separatorKeys.clear();
-    firstTermInRun.clear();
+    firstTerm.clear();
     lastTermOfPrevBlockLen = 0;
     hasLastTermOfPrevBlock = false;
 
-    _startTermBlock(false);
+    startTermBlock();
   }
 
   // Currently only called for a full block of positions.
@@ -1416,7 +1389,7 @@ public:
       return;
     }
 
-    assert(docs.back() < postingsWriter.getMaxDoc(fieldInfo->space)); // sanity check to ensure we didn't go over provided numDocs
+    assert(docs.back() < postingsWriter.getMaxDoc(space)); // sanity check to ensure we didn't go over provided maxDoc
     assert(docs.size() == Postings::DOCS_BLOCK_SIZE);
 
     // NOTE: LuxirPFORd (docCodec) applies the adjacent delta itself, in place,
@@ -1509,8 +1482,7 @@ public:
 
 
   // called starting a new field, or after flushing a term block.
-  void _startTermBlock(bool endingField) {
-    unused(endingField);
+  void startTermBlock() {
     termList.resize(0);
     termDocsEnd.resize(0);
     termPackedBlocks.resize(0);
@@ -1522,8 +1494,6 @@ public:
     termPulsedMask = 0;
     locOfPositionsForTermBlock = posOutput.size();
     locOfDocsForTermBlock = docOutput.size();
-
-    termBlockOffsets.push_back( termOutput.size() - termsLoc);
   }
 
   // Term block on-disk format.  This writer is the authority; see
@@ -1536,9 +1506,9 @@ public:
   //     [firstTerm: PackedTerm]
   //       The first term is stored whole.  Terms 1..n-1 are front-coded below.
   //     [docsLocDelta: vlong]
-  //       Offset of this block's docs region from the field docsLoc.
+  //       Offset of this block's docs region from the run's docs start.
   //     [posLocDelta: vlong]
-  //       Offset of this block's positions region from the field posLoc.
+  //       Offset of this block's positions region from the run's positions start.
   //     [blockPrefixLen: u8]
   //       lcp(first term, last term).  These bytes are factored out of every
   //       in-block suffix and restored from the previous materialized term.
@@ -1574,7 +1544,7 @@ public:
   //     [ttfCode lengths/code?]
   //     [posOff lengths/code?][termImpact lengths/code?][pulsed lengths/code]
   //     [docsEnd: cumulative vlong run]
-  //       Trailer-free slice ends within this block's docs region.  For term i,
+  //       Cumulative slice ends within this block's docs region. For term i,
   //       docsSize_i = docsEnd_i - docsEnd_(i-1), with docsEnd_(-1) = 0.
   //       Pulsed terms repeat the previous end, so their docsSize is 0.
   //       Default: every slice is zero-size, which is legal only when every
@@ -1612,12 +1582,21 @@ public:
   // scoring data block-encoded alongside doc ids in the docs stream and
   // remain part of the postings payload.
   void flushTerms(bool endingField) {
-    if (termList.empty()) {
-      termBlockOffsets.pop_back();  // last block has no terms in it.
-      return;
+    if (termList.empty()) return;
+    if (!Postings::fitsTermBlocks(termBlockOffsets.size(), 1)) {
+      throw std::length_error(Postings::TERM_BLOCK_LIMIT_ERROR);
     }
 
-    uint32_t blockOrd = (uint32_t)termBlockOffsets.size() - 1;
+    auto blockOrd = (uint32_t)termBlockOffsets.size();
+    auto blockStart = termOutput.size();
+    auto dictionaryStart = blockStart - termsLoc;
+    // The block is nonempty. Its postings bases were captured before its first term.
+    if (runs.empty() || dictionaryStart - runs.back().dictionaryStart > runSplitBytes) {
+      runs.push_back({(int32_t)numTerms, (int32_t)blockOrd, dictionaryStart,
+          (uint64_t)(locOfDocsForTermBlock - docsLoc), (uint64_t)(locOfPositionsForTermBlock - posLoc)});
+    }
+    const auto& run = runs.back();
+    termBlockOffsets.push_back((field_parts::Terms::BlockOffset)(dictionaryStart - run.dictionaryStart));
     addTrieSeparatorForCurrentBlock(blockOrd);
 
     numTerms += termList.size();
@@ -1632,10 +1611,9 @@ public:
     TermRef reference = termList[0];
     auto [firstData, firstLen] = reference.unpack();
     auto [lastData, lastLen] = termList.back().unpack();
-    // numTerms was just bumped by this block, so equality means this is the
-    // run's first non-empty block: capture the run's first term for stitching.
-    if (numTerms == nTerms) {
-      firstTermInRun.assign(firstData, firstLen);
+    // Stitch uses the partition's first term to build its separator.
+    if (blockOrd == 0) {
+      firstTerm.assign(firstData, firstLen);
     }
     uint32_t blockPrefixLen = commonPrefixLen(firstData, firstLen, lastData, lastLen);
     assert(blockPrefixLen <= UINT8_MAX);
@@ -1678,8 +1656,8 @@ public:
     // pulsed mask, and total suffix blob bytes.  The total lets the reader
     // locate metadata lazily without summing suffixLens on miss-only visits.
     termOutput.writePackedTerm(reference);
-    termOutput.writeVlong(locOfDocsForTermBlock - docsLoc);
-    termOutput.writeVlong(locOfPositionsForTermBlock - posLoc);
+    termOutput.writeVlong(locOfDocsForTermBlock - docsLoc - run.docsStart);
+    termOutput.writeVlong(locOfPositionsForTermBlock - posLoc - run.positionsStart);
     termOutput.write((char) blockPrefixLen);
     termOutput.write(&termPulsedMask, sizeof(termPulsedMask));
     termOutput.writeVint((uint32_t) suffixBlob.size());
@@ -1754,13 +1732,16 @@ public:
       termOutput.write(termImpactRun.data(), termImpactRun.size());
     }
     termOutput.write(pulsedRun.data(), pulsedRun.size());
+    if (termOutput.size() - blockStart > MAX_TERM_BLOCK_BYTES) {
+      throw std::length_error("encoded term block exceeds the run split allowance");
+    }
 
     [[maybe_unused]] uint32_t pulsedTerms = std::popcount(termPulsedMask);
     assert(pulsed.size() == (size_t)pulsedTerms * (hasPositions ? 2u : 1u));
     rememberLastTermOfCurrentBlock();
 
     if (!endingField) {
-      _startTermBlock(endingField);
+      startTermBlock();
     }
   }
 
@@ -1804,16 +1785,15 @@ public:
     auto totalTermFreq = hasFreqs ? ttfAcc : (int64_t) docfreq;
     sumTotalTermFreq += totalTermFreq;
     if (docs.size() > 0) {
-      assert(docs.back() < postingsWriter.getMaxDoc(fieldInfo->space)); // sanity check to ensure we didn't go over provided numDocs
+      assert(docs.back() < postingsWriter.getMaxDoc(space)); // sanity check to ensure we didn't go over provided maxDoc
     }
     if (totalTermFreq == 0) {
       // term with no documents, remove term we just added
       termList.pop_back();
       return;
     }
-    // Recorded from the terms actually written, so flush and merge (where
-    // deletes may drop the last long value) both derive the flag exactly.
-    if (PackedTerm::mayBeFitted(std::string_view(termList.back()))) mayHaveFitted = true;
+    // Only terms that reach the dictionary can stand in for long values.
+    if (PackedTerm::mayBeFitted(std::string_view(termList.back()))) segFlags = FieldSegmentFlags::MAY_HAVE_FITTED;
     if (totalTermFreq == 1) {
       assert(getDocFileSize()==0 && docs.size()==1 && tfreqs.size()==1);
       assert(posdeltas.size() == (hasPositions ? 1u : 0u));
@@ -1933,90 +1913,93 @@ public:
     }
   }
 
-  RangeResult finishTermRun() {
+  RangeResult finishRange() {
     flushTerms(true);
 
     RangeResult result;
     result.termBlockOffsets = std::move(termBlockOffsets);
+    result.runs = std::move(runs);
     result.separatorKeys = std::move(separatorKeys);
-    result.firstTerm = std::move(firstTermInRun);
+    result.firstTerm = std::move(firstTerm);
     if (numTerms != 0) {
       result.lastTerm.assign(lastTermOfPrevBlock.data(), lastTermOfPrevBlockLen);
     }
     result.sumDocFreq = sumDocFreq;
     result.sumTotalTermFreq = sumTotalTermFreq;
+    result.dictionaryBytes = termOutput.size() - termsLoc;
     result.docsBytes = (uint64_t) (docOutput.size() - docsLoc);
     result.posBytes = (uint64_t) (posOutput.size() - posLoc);
     result.nTerms = numTerms;
     result.nBlocks = (int32_t) result.termBlockOffsets.size();
-    result.mayHaveFitted = mayHaveFitted;
+    result.segFlags = segFlags;
     assert((result.nTerms == 0) == (result.nBlocks == 0));
     return result;
   }
 
-  void finalizeField(RangeResult&& result) {
-    assert(buildTrie);
+  // Appends the block offset table and trie. The trie extent includes the
+  // slack required by the final dictionary block's SIMD decoders.
+  static field_parts::Terms finishDictionary(
+      PostingsWriter& writer, OutputStreamPtr&& stream, uint64_t start,
+      std::span<const field_parts::Terms::BlockOffset> offsets, TrieBuilder& trie) {
+    auto& out = *stream;
+    auto dictionaryBytes = out.size() - start;
+    auto root = trie.finish();
+    const auto& bytes = trie.bytes();
+    out.align(field_parts::Terms::OFFSETS_ALIGN);
+    out.write(offsets.data(), offsets.size_bytes());
+    out.write(bytes.data(), bytes.size());
+    size_t suffixBytes = offsets.size_bytes() + bytes.size();
+    size_t pad = suffixBytes < SVB_OVERREAD_PAD ? SVB_OVERREAD_PAD - suffixBytes : 0;
+    static constexpr char zeros[SVB_OVERREAD_PAD] = {};
+    if (pad) out.write(zeros, pad);
+    assert(suffixBytes + pad >= SVB_OVERREAD_PAD);
+    auto slice = writer.finishStream(std::move(stream));
+    return {slice.location.addOffset(start), dictionaryBytes, bytes.size() + pad, root, {}};
+  }
 
-    if ((std::string_view)fieldInfo->fieldname == "id") {
-      postingsWriter.idDictionaryBlocks = result.nBlocks;
-      postingsWriter.idRange = IdRange{std::move(result.firstTerm), std::move(result.lastTerm), result.nTerms == 0};
+  // Stores the runs and dictionary bounds after the associated streams have locations.
+  static void finishTermRuns(PostingsWriter& writer, WrittenTerms& written,
+                             std::span<const field_parts::TermRun> runs, FieldType::Type type,
+                             FieldType::flag_type flags, std::string_view first, std::string_view last) {
+    written.terms.runs = writer.copyTermRuns(runs);
+    if (field_parts::boundsKind(type, flags) == field_parts::BoundsKind::DICTIONARY) {
+      written.bounds = writer.dictionaryBounds(first, last, type);
     }
+  }
 
-    // write index into the blocks of the terms dict
-    // TODO: use a more efficient encoding for this array
-    //   - make offsets be from the start of this index array... 32 bit normally fine, but not always for huge field?
-    //   - sequence will be monotonically increasing (or decreasing)... interpolate?
-    // Indexing RAM OPT: for fields with huge number of terms, we could stream this to separate file.  That would also facilitate alignment if it's important.
-    fieldInfo->nTerms = result.nTerms;
-    fieldInfo->sumDocFreq = result.sumDocFreq;
-    fieldInfo->sumTotalTermFreq = result.sumTotalTermFreq;
-    fieldInfo->flags &= ~FieldType::SEGMENT_MARKERS;
-    if (result.mayHaveFitted) fieldInfo->flags |= FieldType::MAY_HAVE_FITTED;
-    fieldInfo->rangeTableLoc = {0, 0};
+  // Finishes the serial field's dictionary and posting streams.
+  [[nodiscard]] WrittenTerms endField() {
+    assert(buildTrie);
+    auto result = finishRange();
 
+    WrittenTerms written{{result.nTerms, result.sumDocFreq, result.sumTotalTermFreq},
+                         {}, result.segFlags};
     if (result.nTerms == 0) {
       assert(result.termBlockOffsets.empty());
-      fieldInfo->termBlockIndexLoc = {0, 0};
-      fieldInfo->termsLoc = {0, 0};
-      fieldInfo->docsLoc = {0, 0};
-      fieldInfo->posLoc = {0, 0};
-      fieldInfo->trieLoc = {0, 0};
-      fieldInfo->trieRootOff = 0;
-      return;
+      if (type == FieldType::ID && space == SpaceOrdinal::ROOT) {
+        postingsWriter.idRange = IdRange{};
+        postingsWriter.idDictionaryBlocks = 0;
+      }
+      return written;
     }
 
-    // The reader addresses the block-offset table as a uint64_t array straight
-    // out of the mapping, so it has to start 8-aligned.
-    termOutput.align(MAX_ALIGN);
-    fieldInfo->termBlockIndexLoc = seg_location(termOutput.streamNumber, termOutput.size());
-    assert((int)result.termBlockOffsets.size()
-           == ((result.nTerms - 1) / Postings::TERMS_BLOCK_SIZE) + 1);
-    // Append the trie after the fixed block-offset array.  trieRootOff is
-    // relative to trieLoc, while child links inside the trie are backward
-    // deltas within this appended byte region.
-    fieldInfo->trieRootOff = (int64_t)trieBuilder.finish();
-    const std::vector<char>& trieBytes = trieBuilder.bytes();
-    // Dict metadata SVB runs are embedded in the terms stream.  The last run may
-    // be read with the AVX decoder's tail overread, so the block-offset table
-    // plus trie bytes that follow the final block must provide the same slack as
-    // pure postings files.
-    assert(result.termBlockOffsets.size() * sizeof(result.termBlockOffsets[0])
-           + trieBytes.size() >= SVB_OVERREAD_PAD);
-    termOutput.write(result.termBlockOffsets.data(),
-                     result.termBlockOffsets.size() * sizeof(result.termBlockOffsets[0]));
-    fieldInfo->trieLoc = seg_location(termOutput.streamNumber, termOutput.size());
-    termOutput.write(trieBytes.data(), trieBytes.size());
-
-    fieldInfo->termsLoc = seg_location(termOutput.streamNumber, termsLoc);
-    fieldInfo->docsLoc = seg_location(docOutput.streamNumber, docsLoc);
-    fieldInfo->posLoc = seg_location(posOutput.streamNumber, posLoc);
+    written.terms = finishDictionary(postingsWriter, std::move(streams[0]), termsLoc,
+                                     result.termBlockOffsets, trieBuilder);
+    auto docs = postingsWriter.finishNonemptyStream(std::move(streams[1]));
+    auto positions = postingsWriter.finishNonemptyStream(std::move(streams[2]));
+    std::vector<field_parts::TermRun> fieldRuns;
+    fieldRuns.reserve(result.runs.size());
+    result.appendRuns(fieldRuns, 0, 0, 0, docs, positions);
+    finishTermRuns(postingsWriter, written, fieldRuns, type, flags, result.firstTerm, result.lastTerm);
+    if (type == FieldType::ID && space == SpaceOrdinal::ROOT) {
+      const auto& bounds = std::get<field_parts::DictionaryBounds>(written.bounds);
+      assert(bounds.lowerMode == field_parts::DictionaryBounds::Lower::EXACT
+             && bounds.upperMode == field_parts::DictionaryBounds::Upper::INCLUSIVE);
+      postingsWriter.idRange = IdRange{std::string(std::string_view(bounds.lower)), std::string(std::string_view(bounds.upper)), false};
+      postingsWriter.idDictionaryBlocks = result.nBlocks;
+    }
+    return written;
   }
-
-  // This should only be called once. Multiple fields are not handled any longer.
-  void endField() {
-    finalizeField(finishTermRun());
-  }
-
 
   void startDoc(int32_t doc) {
     unused(doc);
@@ -2130,7 +2113,6 @@ public:
 
 
 class DocsWriter {
-  friend class DocsWithValWriter;
   ScreamingBuilder builder;
 public:
 
@@ -2140,15 +2122,11 @@ public:
   DocsWriter(MemPool& pool, OutputStream& output) : builder(pool, output) {
   }
 
-  // TODO: optionally use a different encoding for few numbers of docs or low maxdoc... ScreamingBitset is
-  // really only competitive when maxdoc is high.  That could be decided at finish(), or could even
-  // be built into the ScreamingBitset format as well...  The limit could also be a function of maxdoc, so
+  // TODO: choose a smaller encoding at finish() for a small doc set or a low maxDoc.
+  // The limit could depend on maxDoc, so
   // we could avoid using for small indexes / segments altogether.  DocsReader could encapsulate a bitset or
   // a list of decoded docs (and we could populate that from different formats such as the lowest-bit-is-tfreq)
   // used in termdoc postings.
-
-  // For direct column building we want something that waits for the first gap before starting to write.
-  // It's also a shame to use up an OutputStream if what we would have to buffer in memory is small.
 
   // Docs should be added in order!
   void addDoc(int32_t docid) {
@@ -2160,6 +2138,8 @@ public:
     builder.add(docid);
   }
 
+  uint64_t bitmapStart() const noexcept { return builder.bitmapStart(); }
+
   int32_t finish() {
     builder.flush();
     return builder.cardinality();
@@ -2167,62 +2147,60 @@ public:
 };
 
 
-class DocsWithValWriter {
-  OutputStreamPtr idOutput;
-  DocsWriter docsWriter;
+class PresenceWriter {
+  MemPool& pool;
   PostingsWriter& postingsWriter;
-  // int64_t startLoc;
-  PostingsWriter::IndexFieldInfo& fieldInfo; // don't have to store if we pass it to finish
+  SpaceOrdinal space;
+  OutputStreamPtr idOutput;
+  std::optional<DocsWriter> docsWriter;
+  int32_t count = 0;
+
+  void startBitmap() {
+    idOutput = postingsWriter.getOutputStream();
+    docsWriter.emplace(pool, *idOutput);
+    for (int32_t doc = 0; doc < count; doc++) docsWriter->addDoc(doc);
+  }
 
 public:
-  // TODO: fixme... this obtains an outputStream and hence should not be used if the field is dense.
-  DocsWithValWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
-  : idOutput(postingsWriter.getOutputStream()), docsWriter(pool,*idOutput), postingsWriter(postingsWriter), fieldInfo(fieldInfo)
-  {
-    unused(this->postingsWriter);
-    // startLoc = idOutput.size();
-  }
+  PresenceWriter(MemPool& pool, PostingsWriter& postingsWriter, SpaceOrdinal space)
+      : pool(pool), postingsWriter(postingsWriter), space(space) {}
 
-  // Same as addDoc... it's named startDoc target for DocStream.pushDocs.
+  // DocStream.pushDocs calls startDoc.
   void startDoc(int32_t docid) {
-    docsWriter.startDoc(docid);
+    if (!docsWriter && docid != count) startBitmap();
+    if (docsWriter) docsWriter->addDoc(docid);
+    count++;
   }
 
-  int32_t numAdded() const{
-    return docsWriter.builder.cardinality();
-  }
+  int32_t numAdded() const { return count; }
 
-  void finish() {
-    fieldInfo.docsWithField = docsWriter.finish();
-    fieldInfo.docsWithFieldEndLoc = idOutput->slocation();
-  }
-
-  // Writes the docs-with-field set of a field from its docs in increasing
-  // order: the bitset when some of the segment's docs lack the field, else
-  // just the dense count. For indexed fields without a column.
-  template <class ForEachDoc>
-  static void write(MemPool& pool, PostingsWriter& postingsWriter,
-                    PostingsWriter::IndexFieldInfo& fieldInfo, int32_t numDocs,
-                    ForEachDoc&& forEachDoc) {
-    if (numDocs == postingsWriter.getMaxDoc(fieldInfo.space)) {
-      fieldInfo.docsWithField = numDocs;
-      fieldInfo.docsWithFieldEndLoc = {0, 0};
-      return;
+  [[nodiscard]] WrittenPresence finish() {
+    if (count == 0 || count == postingsWriter.getMaxDoc(space)) {
+      assert(!docsWriter);
+      return {count, {}};
     }
-    auto guard = pool.rewindScopeGuard();
-    DocsWithValWriter writer(pool, postingsWriter, fieldInfo);
-    forEachDoc([&](int32_t doc) { writer.startDoc(doc); });
-    assert(writer.numAdded() == numDocs);
-    writer.finish();
+    // The gap may be at the end, after a dense prefix.
+    if (!docsWriter) startBitmap();
+    int32_t docsWithField = docsWriter->finish();
+    auto start = docsWriter->bitmapStart();
+    auto bytes = idOutput.pos() - start;
+    auto slice = postingsWriter.finishStream(std::move(idOutput));
+    return {docsWithField, slice.subSlice(start, bytes)};
   }
 
-  // Signal that the column has all docs present. No docs should be added in this case, but the count
-  // in fieldInfo should be filled in.
-  void finishDense(int32_t numDocs) {
-    fieldInfo.docsWithField = numDocs;
-    // this is a valid location, so use numDocs and see if it matches numDocs of segment to tell if there is data to read
-    fieldInfo.docsWithFieldEndLoc = {0,0};
+  // Writes the docs-with-field set from its docs in increasing order.
+  template <class ForEachDoc>
+  [[nodiscard]] static WrittenPresence write(MemPool& pool, PostingsWriter& postingsWriter,
+                                             SpaceOrdinal space, int32_t docsWithField,
+                                             ForEachDoc&& forEachDoc) {
+    if (docsWithField == 0 || docsWithField == postingsWriter.getMaxDoc(space)) return {docsWithField, {}};
+    auto guard = pool.rewindScopeGuard();
+    PresenceWriter writer(pool, postingsWriter, space);
+    forEachDoc([&](int32_t doc) { writer.startDoc(doc); });
+    assert(writer.numAdded() == docsWithField);
+    return writer.finish();
   }
+
 };
 
 

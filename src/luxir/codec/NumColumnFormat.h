@@ -8,14 +8,18 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <expected>
 #include <functional>
 #include <limits>
 #include <numeric>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "LinearFit.h"
+#include "Codec.h"
+#include "luxir/util/encoding.h"
 
 namespace luxir {
 
@@ -113,6 +117,36 @@ struct NumColumnFormat {
   static constexpr uint8_t MAX_PACKED_BITS = NumBlockInfo::MAX_PACKED_BITS;
   static constexpr uint8_t RAW_BITS = NumBlockInfo::RAW_BITS;
   static constexpr uint8_t MIN_LINEAR_BITS_SAVED = 1;
+
+  static int64_t blockCount(int64_t numValues) {
+    return numValues / BLOCK_SIZE + (numValues % BLOCK_SIZE != 0);
+  }
+
+  static bool validBlockBytes(uint64_t bytes, int64_t numValues) noexcept {
+    // Raw blocks use eight bytes per value plus alignment padding.
+    return bytes <= (__uint128_t)numValues * sizeof(int64_t)
+        + (__uint128_t)blockCount(numValues) * (MAX_ALIGN - 1);
+  }
+
+  // Absolute start of a numeric column's index, after any alignment padding.
+  static uint64_t indexOffset(uint64_t blocksEnd) noexcept {
+    return alignUp(blocksEnd, MAX_ALIGN);
+  }
+
+  // Length of the padded values extent before the monotonic metadata suffix.
+  static std::optional<uint64_t> monotonicSplit(uint64_t offset, uint64_t bytes, int64_t numValues) noexcept {
+    if (numValues < 0 || bytes > UINT64_MAX - offset) return {};
+    uint64_t metadataBytes = (uint64_t)blockCount(numValues) * sizeof(NumBlockInfo);
+    if (metadataBytes > bytes) return {};
+    auto valuesBytes = bytes - metadataBytes;
+    // The metadata start is aligned, including for a zero-value index.
+    if ((offset + valuesBytes) % MAX_ALIGN || !validBlockBytes(valuesBytes, numValues)) return {};
+    return valuesBytes;
+  }
+
+  static int64_t leafOffset(int64_t numBlocks) {
+    return numBlocks * (int64_t)(sizeof(NumBlockInfo) + sizeof(NumBlockZone));
+  }
 
   struct RankBounds {
     // Ranks outside [checkBegin, checkEnd) cannot match; those in
@@ -519,6 +553,31 @@ struct NumColumnFormat {
     }
 
   public:
+    static int64_t sketchOffset(int64_t leafCount) {
+      return leafCount * (int64_t)(sizeof(NumBlockZone) + 2 * sizeof(uint32_t));
+    }
+
+    static int64_t sketchPointsBytes(uint32_t points) {
+      return points * (int64_t)sizeof(SketchPoint);
+    }
+
+    static int64_t leafCount(int64_t numValues) {
+      return numValues / LEAF_ZONE_SIZE + (numValues % LEAF_ZONE_SIZE != 0);
+    }
+
+    static uint64_t minimumIndexBytes(int64_t numValues) {
+      // A nonempty index ends with a uint32 sketch count and its points.
+      return leafOffset(blockCount(numValues)) + sketchOffset(leafCount(numValues))
+          + (numValues ? sizeof(uint32_t) : 0);
+    }
+
+    static bool validIndexSize(uint64_t bytes, int64_t numValues) {
+      auto minimum = minimumIndexBytes(numValues);
+      if (bytes < minimum) return false;
+      auto sketchBytes = bytes - minimum;
+      return sketchBytes % sizeof(SketchPoint) == 0 && sketchBytes / sizeof(SketchPoint) <= (uint64_t)numValues;
+    }
+
     // Populations of value ranks, not documents. The OUTSIDE population is
     // exact at leaf granularity; bounded intervals can leave INSIDE uncertain.
     struct RangeSummary {
@@ -529,22 +588,8 @@ struct NumColumnFormat {
 
     LeafMeta() = default;
 
-    // `leafZones` points at the first leaf zone of a column of numValues
-    // values; `end` receives the first byte past the sketch.
-    LeafMeta(const char* leafZones, int64_t numValues, const char*& end)
-        : zones(leafZones),
-          count((numValues + LEAF_ZONE_SIZE - 1) / LEAF_ZONE_SIZE),
-          values(numValues) {
-      end = zones + count * (int64_t)(sizeof(NumBlockZone)
-                                      + 2 * sizeof(uint32_t));
-      if (count == 0) return;
-      uint32_t points;
-      memcpy(&points, end, sizeof(points));
-      if (points > 0) {
-        sketch = ValueSketch(end + sizeof(points), points, numValues);
-      }
-      end += sizeof(points) + points * (int64_t)sizeof(SketchPoint);
-    }
+    // The index contains block metadata, block zones and leaf metadata.
+    static std::expected<LeafMeta, const char*> decode(std::span<const char> index, int64_t numValues);
 
     int64_t numLeafZones() const { return count; }
 
@@ -692,5 +737,27 @@ struct NumColumnFormat {
     return {(uint32_t)lower, (uint32_t)upper};
   }
 };
+
+inline std::expected<NumColumnFormat::LeafMeta, const char*> NumColumnFormat::LeafMeta::decode(
+    std::span<const char> index, int64_t numValues) {
+  LeafMeta result;
+  result.count = leafCount(numValues);
+  result.values = numValues;
+  if (result.count == 0) return result;
+  auto leafStart = (uint64_t)leafOffset(blockCount(numValues));
+  auto sketchStart = leafStart + sketchOffset(result.count);
+  if (sketchStart > index.size() || index.size() - sketchStart < sizeof(uint32_t)) {
+    return std::unexpected("truncated numeric index");
+  }
+  uint32_t points;
+  memcpy(&points, index.data() + sketchStart, sizeof(points));
+  if ((uint64_t)points > (uint64_t)numValues
+      || index.size() - sketchStart - sizeof(points) != (uint64_t)sketchPointsBytes(points)) {
+    return std::unexpected("invalid numeric sketch size");
+  }
+  result.zones = index.data() + leafStart;
+  if (points) result.sketch = ValueSketch(index.data() + sketchStart + sizeof(points), points, numValues);
+  return result;
+}
 
 } // namespace luxir

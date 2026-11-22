@@ -14,7 +14,7 @@
 namespace luxir {
 
 // Matches documents that supplied at least one accepted value for a field.
-// Presence is read directly from SegFieldInfo, so indexed, column-only, and
+// Presence is read directly from DecodedFieldRecord, so indexed, column-only, and
 // indexed text fields with no terms share the same execution path.
 class ExistsQuery final : public Query {
   std::string_view field;
@@ -54,13 +54,13 @@ public:
     screaming::BitSet::Iterator iterator;
 
   public:
-    Scorer(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo,
+    Scorer(PostingsReader& postingsReader, const DecodedFieldRecord& fieldInfo,
            float constantScore)
         : Query::ConstantScorer(constantScore),
-          docs(postingsReader, fieldInfo), iterator(docs.bitset()) {
+          docs(postingsReader, fieldInfo), iterator(docs.bitmapIterator()) {
       assert(fieldInfo.docsWithField > 0);
       assert(fieldInfo.docsWithField < postingsReader.maxDoc());
-      assert(docs.hasBitset());
+      assert(docs.bitset());
     }
 
     [[gnu::cold]] void reset() override {
@@ -101,7 +101,7 @@ public:
     IndexReader::FieldSegments segInfos;
     float constantScore;
 
-    const SegFieldInfo* segmentInfo(IndexReader::Segment& segment) const {
+    const DecodedFieldRecord* segmentInfo(IndexReader::Segment& segment) const {
       return segInfos.at((size_t)segment.ord);
     }
 
@@ -123,7 +123,7 @@ public:
 
     class Supplier final : public Query::ScorerSupplier {
       IndexReader::Segment& segment;
-      const SegFieldInfo& fieldInfo;
+      const DecodedFieldRecord& fieldInfo;
       float constantScore;
       bool needsScores;
 
@@ -155,7 +155,7 @@ public:
       };
 
     public:
-      Supplier(IndexReader::Segment& segment, const SegFieldInfo& fieldInfo,
+      Supplier(IndexReader::Segment& segment, const DecodedFieldRecord& fieldInfo,
                float constantScore, bool needsScores)
           : segment(segment), fieldInfo(fieldInfo),
             constantScore(constantScore), needsScores(needsScores) {}
@@ -215,8 +215,8 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {
       unused(executionMode);
-      const SegFieldInfo* info = segmentInfo(segment);
-      if (info == nullptr || info->docsWithField == 0) return nullptr;
+      const DecodedFieldRecord* info = segmentInfo(segment);
+      if (!info) return nullptr;
       return targetPool.make<Supplier>(segment, *info, constantScore, needsScores());
     }
 

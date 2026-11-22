@@ -30,7 +30,7 @@ protected:
     uint32_t encodedSize = encoded.size();
     codec.encodeBlock((uint32_t*)values.data(), values.size(), encoded.data(), encodedSize);
     encoded.resize(encodedSize);
-    // LOG_INFO("native nvals={} encoded size={}", values.size(), encoded.size());
+    // LOG_INFO("native numValues={} encoded size={}", values.size(), encoded.size());
   }
 
   void test() {

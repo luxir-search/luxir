@@ -2075,33 +2075,32 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
                                                        segment.base + maxDoc - 1);
     } else if (node.kind == ValueNodeKind::COLUMN) {
       auto& source = node.source ? node.source->segments()[(size_t)segment.ord] : segment;
-      auto* fieldInfo = SegFieldInfo::column(fields[index].at(source));
-      if (!fieldInfo) {
-        bound.bounds = ValueBounds::unbounded(node.type, true, true);
-      } else if (node.type == ValueType::COLUMN_ONLY) {
+      auto* fieldInfo = fields[index].at(source);
+      const auto* number = fieldInfo ? fieldInfo->numberColumn() : nullptr;
+      if (node.type == ValueType::COLUMN_ONLY && fieldInfo && (fieldInfo->ordColumn() || fieldInfo->bytesColumn())) {
         bound.stringColumn = pool.make<BoundStringColumn>(source.postingsReader(), *fieldInfo);
         bound.bounds = ValueBounds::unbounded(node.type,
             node.source || fieldInfo->docsWithField < source.maxDoc());
-      } else {
+      } else if (node.type != ValueType::COLUMN_ONLY && number) {
         bound.column.emplace(source.postingsReader(), *fieldInfo);
         bound.iterator.emplace(*bound.column);
         bound.bulkIterator.emplace(*bound.column);
-        bool missing = node.source || bound.column->docsWithValue() < source.maxDoc();
-        auto encoded = bound.column->encodedBounds();
-        if (!encoded.hasValues) {
+        bool missing = node.source || bound.column->docsWithField() < source.maxDoc();
+        const auto* encoded = fieldInfo->scalarBounds();
+        if (!encoded) {
           bound.bounds = ValueBounds::unbounded(node.type, true, true);
         } else if (node.columnType == FieldType::FLOAT) {
-          double min = (double)sortableInt32ToFloat((int32_t)encoded.min);
-          double max = (double)sortableInt32ToFloat((int32_t)encoded.max);
+          double min = (double)sortableInt32ToFloat((int32_t)encoded->min);
+          double max = (double)sortableInt32ToFloat((int32_t)encoded->max);
           bound.bounds = ValueBounds::observedFloating(min, max, missing);
           bound.bounds.type = node.type;
         } else if (node.columnType == FieldType::DOUBLE) {
-          double min = sortableInt64ToDouble(encoded.min);
-          double max = sortableInt64ToDouble(encoded.max);
+          double min = sortableInt64ToDouble(encoded->min);
+          double max = sortableInt64ToDouble(encoded->max);
           bound.bounds = ValueBounds::observedFloating(min, max, missing);
           bound.bounds.type = node.type;
         } else {
-          bound.bounds = ValueBounds::observedInteger(encoded.min, encoded.max, missing);
+          bound.bounds = ValueBounds::observedInteger(encoded->min, encoded->max, missing);
           bound.bounds.type = node.type;
         }
         if (valueDouble(node.type) && bounded(bound.bounds)
@@ -2111,8 +2110,10 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
           // cannot exclude those values to recover the non-NaN interval.
           bound.bounds = ValueBounds::unbounded(node.type, true);
         }
+      } else {
+        bound.bounds = ValueBounds::unbounded(node.type, true, true);
       }
-      if (node.source && fieldInfo) {
+      if (node.source && (bound.stringColumn || bound.column)) {
         assert(&source.segmentCore() == &segment.segmentCore());
         OwnershipMapper mapper(segment.segmentCore(), node.ownerPath, node.source->path());
         auto* shape = bound.stringColumn ? &bound.stringColumn->shape

@@ -4209,7 +4209,8 @@ TEST_F(KnnQueryTest, filteredFlatWalkMatchesCosineOracle) {
           }
           expected.emplace_back(best, doc);
         }
-        VectorReader vr(seg.postingsReader(), *reader->field(field).at(0));
+        const auto& info = *reader->field(field).at(0);
+        VectorReader vr(seg.postingsReader(), info);
         auto unfiltered = KnnQuery::countEligible(vr, seg.liveDocSet(), seg.liveDocs(), seg.maxDoc());
         EXPECT_TRUE(unfiltered.unfiltered);
         int64_t liveDocs = 0, liveVectors = 0;
@@ -4254,7 +4255,7 @@ TEST_F(KnnQueryTest, filteredFlatWalkMatchesCosineOracle) {
             EXPECT_NEAR(score, actual[doc], 1e-6);
           }
           EXPECT_EQ(vectorCount, stats.vectorsScored.load());
-          bool walks = threshold >= 0 && (shape != 0 || (double)domain->card() / vr.docsWithValue() <= threshold);
+          bool walks = threshold >= 0 && (shape != 0 || (double)domain->card() / vr.docsWithField() <= threshold);
           if (walks) {
             EXPECT_EQ(domain->card(), stats.domainDocsVisited.load());
             EXPECT_EQ(0, stats.domainProbes.load());
@@ -4680,7 +4681,8 @@ TEST_F(KnnQueryTest, foldedDomainMatchesResolve) {
       auto& seg = reader->segments()[0];
       ASSERT_NE(nullptr, seg.getAuxReader("vec." + field));
       const auto& type = (const VectorFieldType&)*reader->schema()->getFieldTypePtr(field);
-      VectorReader vr(seg.postingsReader(), *reader->field(field).at(0));
+      const auto& info = *reader->field(field).at(0);
+      VectorReader vr(seg.postingsReader(), info);
       for (int representation : {0, 1, 2}) {
         std::vector<int32_t> members;
         for (int i = 0; i < 320; i++) {
@@ -4717,7 +4719,7 @@ TEST_F(KnnQueryTest, foldedDomainMatchesResolve) {
           ASSERT_FALSE(rounds.empty());
           auto* aux = (VectorAuxReader*)seg.getAuxReader("vec." + field).get();
           auto eligible = KnnQuery::countEligible(vr, domain, seg.liveDocs(), seg.maxDoc());
-          KnnPlanner::Segment input{.vectors = vr.numVectors(), .liveVectors = vr.numVectors(), .docsWithValue = vr.docsWithValue(),
+          KnnPlanner::Segment input{.vectors = vr.numVectors(), .liveVectors = vr.numVectors(), .docsWithField = vr.docsWithField(),
               .eligibleDocs = eligible.eligibleDocs, .eligibleVectors = eligible.eligibleVectors,
               .domainSize = domain->card(), .maxDoc = seg.maxDoc(), .dims = vr.dims(), .nlist = aux->getNList(), .pqM = aux->getPqM(),
               .rabitqBits = aux->isRaBitQ() ? aux->getRaBitQBits() : 0,
@@ -5512,7 +5514,8 @@ TEST_F(KnnQueryTest, lowMultiplicityBitsetHasExactCoverageTarget) {
   auto& seg = reader->segments()[0];
   RAMBitDocSet domain(4096);
   for (int i = 0; i < 4096; i += 3) domain.mutableBits().set(i);
-  VectorReader vr(seg.postingsReader(), *reader->field("emb_vs").at(0));
+  const auto& columnInfo = *reader->field("emb_vs").at(0);
+  VectorReader vr(seg.postingsReader(), columnInfo);
   auto counts = KnnQuery::countEligible(vr, &domain, nullptr, seg.maxDoc());
   ASSERT_GT(domain.card(), 1024);
   EXPECT_EQ(domain.card(), counts.eligibleDocs);
@@ -5528,7 +5531,7 @@ TEST_F(KnnQueryTest, lowMultiplicityBitsetHasExactCoverageTarget) {
   std::vector<float> q{0, 0, 0, 0};
   // The former average-multiplicity obligation at this floor was
   // unreachable, even after scanning every list.
-  EXPECT_GT(0.25 * (domain.card() * vr.numVectors() / vr.docsWithValue()), domain.card());
+  EXPECT_GT(0.25 * (domain.card() * vr.numVectors() / vr.docsWithField()), domain.card());
   KnnQuery query("emb_vs", type, q, 3, 0, 8, 0.25f);
   std::array<DocSet*, 1> domains{&domain};
   Query::Weight::PrepareContext prepare(*reader, domains, nullptr, nullptr);

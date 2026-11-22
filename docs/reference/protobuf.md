@@ -1156,6 +1156,10 @@ Cached field metadata payload, excluding allocator overhead and unused hash-tabl
 | <a id="field-luxir.fieldmetadatastats.page_bytes"></a>[`page_bytes`](#field-luxir.fieldmetadatastats.page_bytes) | 5 | `uint64` | singular |  |
 | <a id="field-luxir.fieldmetadatastats.entries"></a>[`entries`](#field-luxir.fieldmetadatastats.entries) | 6 | `uint64` | singular |  |
 | <a id="field-luxir.fieldmetadatastats.entry_bytes"></a>[`entry_bytes`](#field-luxir.fieldmetadatastats.entry_bytes) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.opened_pages"></a>[`opened_pages`](#field-luxir.fieldmetadatastats.opened_pages) | 12 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.opened_page_bytes"></a>[`opened_page_bytes`](#field-luxir.fieldmetadatastats.opened_page_bytes) | 13 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.opened_entries"></a>[`opened_entries`](#field-luxir.fieldmetadatastats.opened_entries) | 14 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.opened_entry_bytes"></a>[`opened_entry_bytes`](#field-luxir.fieldmetadatastats.opened_entry_bytes) | 15 | `uint64` | singular |  |
 | <a id="field-luxir.fieldmetadatastats.names"></a>[`names`](#field-luxir.fieldmetadatastats.names) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.fieldmetadatastats.name_bytes"></a>[`name_bytes`](#field-luxir.fieldmetadatastats.name_bytes) | 9 | `uint64` | singular |  |
 | <a id="field-luxir.fieldmetadatastats.live_views"></a>[`live_views`](#field-luxir.fieldmetadatastats.live_views) | 10 | `uint64` | singular |  |

@@ -150,6 +150,32 @@ TEST_F(StoredFieldsTest, basicSingleValued) {
   EXPECT_EQ(d3[0], (std::pair<std::string, std::string>{"title", "farewell"}));
 }
 
+TEST_F(StoredFieldsTest, storedOnlyStringWritesJustTheStoredResource) {
+  auto schema = std::make_shared<Schema>();
+  schema->fieldTypeMap["label"] = std::make_shared<StrFieldType>("label", FieldType::STORED);
+  RAMDir input, direct;
+  for (bool viaInput : {true, false}) {
+    Inverter inverter(viaInput ? input : direct, 1, 1, schema);
+    inverter.updateVersions(1);
+    for (std::string_view value : {"Raw value", "Another value"}) {
+      inverter.startDoc();
+      if (viaInput) {
+        inverter.getIndexHandler("label").index(inverter, value);
+      } else {
+        inverter.getOrCreateStoredFields(SpaceOrdinal::ROOT, Postings::STORED_DEFAULT_RESOURCE)
+            .addValue(inverter.getDoc(), "label", value);
+      }
+      inverter.finishDoc();
+    }
+    ASSERT_TRUE(inverter.flush());
+  }
+  auto file = Postings::getIndexFileName(Postings::segmentKey(1, 1), 0);
+  EXPECT_EQ(input.openFile(file)->read(), direct.openFile(file)->read());
+  SegmentCore core(input, 1, 1);
+  EXPECT_EQ(1, core.rootReader().numFields());
+  EXPECT_EQ(nullptr, core.rootReader().fieldInfo("label"));
+}
+
 TEST_F(StoredFieldsTest, multiValued) {
   RAMDir dir;
   auto schema = makeSchema();
@@ -1009,9 +1035,11 @@ static void writeStoredSegment(RAMDir& dir, const StoredChunkFormat& format,
                                std::shared_ptr<const StoredCompressionDictionary> dictionary,
                                std::span<const std::string> docs, uint64_t segId = 1) {
   PostingsWriter postings(dir, segId, 1, (int32_t)docs.size());
-  StoredFieldsWriter stored(postings, SpaceOrdinal::ROOT, Postings::STORED_DEFAULT_RESOURCE, format, std::move(dictionary));
+  StoredFieldsWriter stored(postings, format, std::move(dictionary));
   for (size_t doc = 0; doc < docs.size(); doc++) stored.addValue((int32_t)doc, "body", docs[doc]);
-  stored.finish((int32_t)docs.size());
+  if (auto part = stored.finish((int32_t)docs.size())) {
+    postings.addStoredField(SpaceOrdinal::ROOT, Postings::STORED_DEFAULT_RESOURCE, (int32_t)docs.size(), *part);
+  }
   postings.writeVersionRuns(VersionRunBuilder{});
   postings.finish();
 }
@@ -1568,7 +1596,7 @@ TEST_F(StoredFieldsTest, copyRequiresMatchingLayoutAndDictionaryBytes) {
   auto prepared = std::make_shared<const StoredCompressionDictionary>(bytes, DICT_FORMAT);
   RAMDir dir;
   PostingsWriter postings(dir, 1, 1);
-  StoredFieldsWriter stored(postings, SpaceOrdinal::ROOT, "_stored_", DICT_FORMAT, prepared);
+  StoredFieldsWriter stored(postings, DICT_FORMAT, prepared);
   auto other = DICT_FORMAT;
   other.dictionaryBytes = 0;
   other.zstdLevel = 7;
@@ -1604,27 +1632,35 @@ TEST_F(StoredFieldsTest, emptyDictionarySourcesCopyAcrossPolicyChanges) {
   expectBodies(*stored, 16);
 }
 
-TEST_F(StoredFieldsTest, corruptDictionarySizeRejected) {
-  RAMDir dir;
-  std::vector<std::string> docs{"log line status=200 path=/api/v1/items"};
-  writeStoredSegment(dir, DICT_FORMAT, {}, docs);
-  SegmentCore postingsCore(dir, 1, 1);
-  auto& postings = postingsCore.rootReader();
-  const auto* field = postings.fieldInfo("_stored_");
-  auto input = postings.core().getInputStream(field->columnLoc.filenum());
-  const char* ptr = input.ptr((int64_t)field->columnLoc.offset() + field->columnMetaOff);
-  const char* end = input.ptr(input.size());
-  InputStream::readVlong(ptr, end);  // max chunk bytes
-  InputStream::readVint(ptr, end);   // dirty count
-  ptr++;                           // codec
-  InputStream::readVint(ptr, end);  // chunk target
-  InputStream::readVint(ptr, end);  // max docs
-  ASSERT_GE(end - ptr, 5);
-  memcpy(const_cast<char*>(ptr), "\xff\xff\xff\xff\x0f", 5);  // UINT32_MAX
-  SegmentCore corruptCore(dir, 1, 1);
-  auto& corrupt = corruptCore.rootReader();
-  EXPECT_THROW(corrupt.fieldInfo("_stored_"), std::runtime_error);
-  EXPECT_EQ(0u, corrupt.fieldCacheStats().entries);
+TEST_F(StoredFieldsTest, corruptStoredNamesRejected) {
+  struct Case {
+    size_t offset;
+    char value;
+    const char* reason;
+  };
+  for (auto [offset, value, reason] : {Case{0, 127, "member count exceeds names bytes"},
+                                      Case{1, 0, "trailing name bytes"}}) {
+    SCOPED_TRACE(reason);
+    RAMDir dir;
+    std::vector<std::string> docs{"log line status=200 path=/api/v1/items"};
+    writeStoredSegment(dir, DICT_FORMAT, {}, docs);
+    SegmentCore core(dir, 1, 1);
+    auto& postings = core.rootReader();
+    const auto* record = postings.fieldInfo("_stored_");
+    ASSERT_NE(nullptr, record);
+    ASSERT_NE(nullptr, record->stored());
+    auto names = core.slice(record->stored()->names());
+    ASSERT_GT(names.size(), offset + 1);
+    const_cast<char*>(names.data())[offset] = value;
+    try {
+      postings.openStoredMetadata(*record);
+      ADD_FAILURE() << "Accepted corrupt stored names";
+    } catch (const std::runtime_error& e) {
+      EXPECT_TRUE(std::string_view(e.what()).contains(reason)) << e.what();
+    }
+    EXPECT_EQ(1u, postings.fieldCacheStats().entries);
+    EXPECT_EQ(0u, postings.fieldCacheStats().openedEntries);
+  }
 }
 
 TEST_F(StoredFieldsTest, storedMetadataCacheSharedAndAccounted) {
@@ -1634,31 +1670,53 @@ TEST_F(StoredFieldsTest, storedMetadataCacheSharedAndAccounted) {
   std::vector<std::string> docs{"log line status=200 path=/api/v1/items"};
   writeStoredSegment(dir, DICT_FORMAT, prepared, docs);
   auto before = fieldMetadataMemory.entryBytes.load();
+  auto beforeOpened = fieldMetadataMemory.openedEntryBytes.load();
+  auto beforePages = fieldMetadataMemory.pageBytes.load();
+  auto beforeOpenedPages = fieldMetadataMemory.openedPageBytes.load();
   {
     SegmentCore postingsCore(dir, 1, 1);
     auto& postings = postingsCore.rootReader();
     EXPECT_EQ(0u, postings.fieldCacheStats().entries);
-    std::array<const PostingsReader::Field*, 8> fields{};
+    const auto* field = postings.fieldInfo("_stored_");
+    ASSERT_NE(nullptr, field);
+    EXPECT_EQ(0u, postings.fieldCacheStats().openedPages);
+    std::array<const StoredFieldsMetadata*, 8> metadata{};
+    std::array<const StoredDecompressionDictionary*, 8> dictionaries{};
     std::barrier start(8);
     std::vector<std::jthread> threads;
-    for (size_t i = 0; i < fields.size(); i++) {
+    for (size_t i = 0; i < metadata.size(); i++) {
       threads.emplace_back([&, i] {
         start.arrive_and_wait();
-        fields[i] = postings.fieldInfo("_stored_");
+        metadata[i] = postings.openStoredMetadata(*field);
+        start.arrive_and_wait();
+        dictionaries[i] = postings.openStoredDictionary(*field->stored(), *metadata[i]);
       });
     }
     threads.clear();
-    ASSERT_NE(nullptr, fields[0]);
-    ASSERT_TRUE(fields[0]->stored->ddict.has_value());
-    for (auto* field : fields) EXPECT_EQ(fields[0], field);
+    ASSERT_NE(nullptr, metadata[0]);
+    ASSERT_NE(nullptr, dictionaries[0]);
+    for (auto* entry : metadata) EXPECT_EQ(metadata[0], entry);
+    for (auto* dictionary : dictionaries) EXPECT_EQ(dictionaries[0], dictionary);
     auto stats = postings.fieldCacheStats();
     EXPECT_EQ(1u, stats.entries);
-    EXPECT_GT(stats.entryBytes, sizeof(PostingsReader::Field) + sizeof(StoredFieldsMetadata)
-              + ZSTD_sizeof_DDict(fields[0]->stored->ddict->get()));
-    EXPECT_GT(stats.bytes, stats.entryBytes);
+    EXPECT_EQ(field->allocatedBytes(), stats.entryBytes);
+    EXPECT_EQ(0u, stats.openedPages);
+    EXPECT_EQ(2u, stats.openedEntries);
+    EXPECT_GT(stats.openedEntryBytes, metadata[0]->allocatedBytes() + dictionaries[0]->allocatedBytes());
+    EXPECT_GT(stats.bytes, stats.entryBytes + stats.openedEntryBytes);
     EXPECT_EQ(before + stats.entryBytes, fieldMetadataMemory.entryBytes.load());
+    EXPECT_EQ(beforeOpened + stats.openedEntryBytes, fieldMetadataMemory.openedEntryBytes.load());
+    EXPECT_EQ(beforePages + stats.pageBytes, fieldMetadataMemory.pageBytes.load());
+    EXPECT_EQ(beforeOpenedPages + stats.openedPageBytes, fieldMetadataMemory.openedPageBytes.load());
+    auto decoded = postings.decodeField(field->ordinal);
+    StoredFieldsReader reader(postings, *decoded);
+    decoded.reset();
+    EXPECT_EQ(1, reader.numChunks());
   }
   EXPECT_EQ(before, fieldMetadataMemory.entryBytes.load());
+  EXPECT_EQ(beforeOpened, fieldMetadataMemory.openedEntryBytes.load());
+  EXPECT_EQ(beforePages, fieldMetadataMemory.pageBytes.load());
+  EXPECT_EQ(beforeOpenedPages, fieldMetadataMemory.openedPageBytes.load());
 }
 
 // End-to-end: a STORED TEXT field should come back in search results when
@@ -1877,6 +1935,51 @@ TEST_F(StoredFieldsSearchTest, storedStringField) {
                                         "label", std::string("Second"))));
 
   ch.collection().setSchema(Schema::createDefaultSchema());
+}
+
+TEST_F(StoredFieldsSearchTest, storedOnlyStringAfterFlushAndMerge) {
+  using namespace luxir::test;
+  CollectionHelper ch;
+  SchemaBuilder builder;
+  auto& label = builder.field("label");
+  label.type = api::FieldDef::FieldClass::STRING;
+  label.index = IndexMode::NONE;
+  label.column = false;
+  label.stored = true;
+  auto& variant = builder.variant(label, "ignored");
+  variant.type = api::FieldDef::FieldClass::STRING;
+  variant.index = IndexMode::NONE;
+  variant.column = false;
+  builder.set(ch.collection());
+  auto restore = scope_guard([&] { ch.collection().setSchema(Schema::createDefaultSchema()); });
+  ASSERT_TRUE(ch.index(flatdoc("id", "a", "label", "Original A", "body_t", "common"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(ch.index(flatdoc("id", "b", "label", "Original B", "body_t", "common"), UpdateMessage::COMMIT).success);
+
+  for (size_t count : {2u, 1u}) {
+    if (count == 1) {
+      CollectionHelper::UpdateBuilder merge;
+      merge.commit(true, 1);
+      ASSERT_TRUE(ch.submit(merge).success);
+    }
+    auto reader = ch.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(count, reader->segments().size());
+    EXPECT_FALSE(reader->field("label").exists());
+    EXPECT_FALSE(reader->field("label__ignored").exists());
+    auto req = localReq(ch.getSearchEngine());
+    req->collection("main").topDocs("q").matchQuery("body_t", "common").fields({"id", "label"}).limit(-1);
+    req->execute();
+    ASSERT_OK(req);
+    auto docs = req->getDocs();
+    ASSERT_EQ(2u, docs.size());
+    EXPECT_TRUE(containsDoc(docs, flatdoc("id", "a", "label", "Original A")));
+    EXPECT_TRUE(containsDoc(docs, flatdoc("id", "b", "label", "Original B")));
+  }
+
+  auto exists = localReq(ch.getSearchEngine());
+  exists->collection("main").topDocs("q").existsQuery("label");
+  exists->execute(false);
+  EXPECT_FALSE(exists->ok());
+  EXPECT_NE(std::string::npos, exists->errorMsg().find("indexed or column-stored field: label"));
 }
 
 // A STRING field that is BOTH column-stored and STORED retrieves through the

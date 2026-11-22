@@ -14,20 +14,17 @@ namespace luxir {
 
 // Which documents of a segment have values in a column, and the range of value
 // ranks each one holds. Int, ord and raw string columns all lay this out the
-// same way (docs-with-field plus, when multi-valued, a column of end value
+// same way (a docs bitmap for sparse fields and, when multi-valued, end value
 // ranks), so it reads without decoding a value. Multiplicity is physical: ord
 // writers omit the end value ranks when no document holds more than one value.
 class ColumnShape {
   DocsReader docs;
-  std::optional<MonoReader> endValueRanks;
+  MonoReader endValueRanks;
 
 public:
-  ColumnShape(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo)
-      : docs(postingsReader, fieldInfo) {
-    if (fieldInfo.monoLoc.offset() > 0) {
-      endValueRanks.emplace(postingsReader, fieldInfo.monoLoc,
-                            fieldInfo.monoMetaOff, fieldInfo.docsWithField);
-    }
+  ColumnShape(PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
+      : docs(reader, fieldInfo) {
+    endValueRanks = MonoReader::openEndValueRanks(reader, fieldInfo);
   }
 
   bool multiValued() const noexcept { return endValueRanks.has_value(); }
@@ -46,7 +43,7 @@ public:
 
   public:
     explicit Cursor(const ColumnShape& shape)
-        : shape(&shape), docsIter(shape.docs.bitset()) {}
+        : shape(&shape), docsIter(shape.docs.bitmapIterator()) {}
 
     // Whether `docid` holds a value; when it does, rank(), begin() and end()
     // describe it.
@@ -57,9 +54,9 @@ public:
         found = -1;
       }
       target = docid;
-      if (!shape->docs.hasBitset()) {
-        // No bitset: every document, or none when a merge emptied the column.
-        present = docid < shape->docs.numDocs();
+      if (!shape->docs.bitset()) {
+        // Every doc has a value when there is no docs bitmap.
+        present = docid < shape->docs.docsWithField();
         if (!present) return false;
         docRank = docid;
       } else {
@@ -68,9 +65,8 @@ public:
         if (!present) return false;
         docRank = docsIter.rank();
       }
-      present = true;
       if (shape->endValueRanks) {
-        auto [start, end] = shape->endValueRanks->valuesAt(docRank);
+        auto [start, end] = shape->endValueRanks.valuesAt(docRank);
         first = start;
         last = end;
       } else {
@@ -80,22 +76,22 @@ public:
       return true;
     }
 
-    // Values held by all rows in [first, end), including sparse columns.
-    // A boundary is the start rank of the next row with a value.
-    std::pair<int64_t, int64_t> range(int32_t first, int32_t end) {
-      if (first >= end) return {0, 0};
-      if (!shape->docs.hasBitset() && !shape->endValueRanks) {
-        return {std::min(first, shape->docs.numDocs()), std::min(end, shape->docs.numDocs())};
+    // Values held by all docs in [firstDoc, endDoc), including sparse columns.
+    // A boundary is the start rank of the next doc with a value.
+    std::pair<int64_t, int64_t> range(int32_t firstDoc, int32_t endDoc) {
+      if (firstDoc >= endDoc) return {0, 0};
+      if (shape->docs.allRows() && !shape->endValueRanks) {
+        return {std::min(firstDoc, shape->docs.docsWithField()), std::min(endDoc, shape->docs.docsWithField())};
       }
-      auto boundary = [&](int32_t row) -> int64_t {
-        if (seek(row)) return begin();
-        int32_t rank = !shape->docs.hasBitset() || found == PostingsReader::END
-            ? shape->docs.numDocs() : docsIter.rank();
+      auto boundary = [&](int32_t doc) -> int64_t {
+        if (seek(doc)) return begin();
+        int32_t rank = shape->docs.allRows() || found == PostingsReader::END
+            ? shape->docs.docsWithField() : docsIter.rank();
         if (!shape->endValueRanks) return rank;
-        return rank == 0 ? 0 : shape->endValueRanks->valueAt(rank - 1);
+        return rank == 0 ? 0 : shape->endValueRanks.valueAt(rank - 1);
       };
-      int64_t begin = boundary(first);
-      return {begin, boundary(end)};
+      int64_t startRank = boundary(firstDoc);
+      return {startRank, boundary(endDoc)};
     }
 
     int32_t rank() const noexcept { return docRank; }

@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/reader/SegmentCore.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/FieldCursor.h"
+#include "luxir/reader/IntColReader.h"
 #include "luxir/index/PostingsWriter.h"
 #include "luxir/reader/PostingsReader.h"
 #include "gtest/gtest.h"
+#include "test/FieldRecordTest.h"
 #include "test/LuxirTest.h"
 #include "test/SegmentTest.h"
 #include "test/CollectionHelper.h"
@@ -206,20 +208,36 @@ protected:
   }
 };
 
+TEST_F(FieldMetadataTest, wrongColumnKindNamesField) {
+  test::CollectionHelper helper;
+  auto core = openFields(helper, 0);
+  auto& postings = core->rootReader();
+  const auto* info = postings.fieldInfo("id");
+  ASSERT_NE(nullptr, info);
+  try {
+    IntColReader column(postings, *info);
+    FAIL() << "expected a column kind error";
+  } catch (const std::invalid_argument& error) {
+    EXPECT_STREQ("Field 'id' has no number column", error.what());
+  }
+}
+
 TEST_F(FieldMetadataTest, firstUseRace) {
   test::CollectionHelper helper;
   auto core = openFields(helper, 130);
   auto* reader = &core->rootReader();
   constexpr int THREADS = 32;
   std::barrier start(THREADS);
-  std::array<const PostingsReader::Field*, THREADS> infos{};
+  std::array<const DecodedFieldRecord*, THREADS> infos{};
   std::array<const NumColumnFormat::LeafMeta*, THREADS> leaves{};
+  std::array<const field_parts::ScalarBounds*, THREADS> bounds{};
   std::vector<std::jthread> threads;
   for (int i = 0; i < THREADS; i++) {
     threads.emplace_back([&, i] {
       start.arrive_and_wait();
       infos[i] = reader->fieldInfo("f00064_i");
-      leaves[i] = infos[i]->numericLeafMeta();
+      leaves[i] = reader->openNumericLeafMeta(*infos[i]);
+      bounds[i] = infos[i]->scalarBounds();
     });
   }
   threads.clear();
@@ -228,18 +246,43 @@ TEST_F(FieldMetadataTest, firstUseRace) {
   for (int i = 0; i < THREADS; i++) {
     EXPECT_EQ(infos[0], infos[i]);
     EXPECT_EQ(leaves[0], leaves[i]);
-    EXPECT_EQ("f00064_i", (std::string_view)infos[i]->fieldname);
+    EXPECT_EQ("f00064_i", std::string_view(infos[i]->name));
     EXPECT_EQ(FieldType::INT, infos[i]->type);
     EXPECT_EQ(1, infos[i]->docsWithField);
     EXPECT_EQ(1, infos[i]->numValues);
-    ASSERT_TRUE(infos[i]->columnBounds);
-    EXPECT_EQ(64, infos[i]->columnBounds->min);
-    EXPECT_EQ(64, infos[i]->columnBounds->max);
+    ASSERT_NE(nullptr, bounds[i]);
+    EXPECT_EQ(bounds[0], bounds[i]);
+    EXPECT_EQ(64, bounds[i]->min);
+    EXPECT_EQ(64, bounds[i]->max);
   }
   auto stats = reader->fieldCacheStats();
   EXPECT_EQ(1u, stats.pages);
   EXPECT_EQ(1u, stats.entries);
-  RecordProperty("field_entry_bytes", (int)sizeof(PostingsReader::Field));
+  EXPECT_EQ(1u, stats.openedPages);
+  EXPECT_EQ(1u, stats.openedEntries);
+  RecordProperty("field_entry_bytes", (int)infos[0]->allocatedBytes());
+}
+
+TEST_F(FieldMetadataTest, acquireFromUncachedRecord) {
+  test::CollectionHelper helper;
+  auto core = openFields(helper, 1);
+  auto& reader = core->rootReader();
+  auto ordinal = reader.findOrdinal("f00000_i");
+  ASSERT_GE(ordinal, 0);
+  auto record = reader.decodeField(ordinal);
+  ASSERT_NE(nullptr, record);
+  EXPECT_EQ(0u, reader.fieldCacheStats().pages);
+  auto* leaves = reader.openNumericLeafMeta(*record);
+  ASSERT_NE(nullptr, leaves);
+  EXPECT_EQ(0, leaves->leafZone(0).max);
+  auto stats = reader.fieldCacheStats();
+  EXPECT_EQ(1u, stats.pages);
+  EXPECT_EQ(1u, stats.entries);
+  EXPECT_EQ(1u, stats.openedEntries);
+  record.reset();
+  const auto* published = reader.fieldInfo(ordinal);
+  ASSERT_NE(nullptr, published);
+  EXPECT_EQ(leaves, reader.openNumericLeafMeta(*published));
 }
 
 TEST_F(FieldMetadataTest, columnBoundsIncludeSparseAndMultipleValues) {
@@ -252,15 +295,16 @@ TEST_F(FieldMetadataTest, columnBoundsIncludeSparseAndMultipleValues) {
       "sparse_i", 9), UpdateMessage::COMMIT).success);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto& postings = reader->segments()[0].postingsReader();
-  ASSERT_FALSE(postings.fieldInfo("id")->columnBounds);
+  ASSERT_FALSE(postings.fieldInfo("id")->scalarBounds());
   for (auto [name, low, high] : {std::tuple{"dense_i", INT64_MIN + 5, INT64_MAX - 7},
                                 {"sparse_i", (int64_t)-4, (int64_t)9},
                                 {"multi_is", (int64_t)-100, (int64_t)300}}) {
     auto* field = postings.fieldInfo(name);
     ASSERT_NE(nullptr, field);
-    ASSERT_TRUE(field->columnBounds);
-    EXPECT_EQ(low, field->columnBounds->min);
-    EXPECT_EQ(high, field->columnBounds->max);
+    const auto* bounds = field->scalarBounds();
+    ASSERT_NE(nullptr, bounds);
+    EXPECT_EQ(low, bounds->min);
+    EXPECT_EQ(high, bounds->max);
   }
 }
 
@@ -275,27 +319,122 @@ TEST_F(FieldMetadataTest, ordinalsAndPageBoundaries) {
   EXPECT_EQ(nullptr, reader->fieldInfo(-1));
   EXPECT_EQ(nullptr, reader->fieldInfo(reader->numFields()));
   EXPECT_EQ(0u, reader->fieldCacheStats().pages);
-  FieldReader fields(*reader);
+  FieldCursor fields(*reader);
   int32_t current = -1;
   for (int32_t ordinal : {0, 63, 64, 65, reader->numFields() - 1}) {
     while (current < ordinal) {
-      ASSERT_TRUE(fields.readNextField());
+      ASSERT_TRUE(fields.next());
       current++;
     }
-    SegFieldInfo expected{};
-    fields.readFieldInfo(expected);
+    auto decoded = fields.decode();
     auto* info = reader->fieldInfo(ordinal);
     ASSERT_NE(nullptr, info);
-    EXPECT_EQ(info, reader->fieldInfo((std::string_view)expected.fieldname));
-    EXPECT_EQ((std::string_view)expected.fieldname, (std::string_view)info->fieldname);
-    EXPECT_EQ(expected.type, info->type);
-    EXPECT_EQ(expected.flags, info->flags);
-    EXPECT_EQ(expected.docsWithField, info->docsWithField);
-    EXPECT_EQ(expected.numValues, info->numValues);
-    EXPECT_EQ(expected.columnLoc.filenum(), info->columnLoc.filenum());
-    EXPECT_EQ(expected.columnLoc.offset(), info->columnLoc.offset());
+    EXPECT_EQ(info, reader->fieldInfo(std::string_view(decoded->name)));
+    EXPECT_EQ(test::recordHeader(*decoded), test::recordHeader(*info));
+    auto expectPart = [](const auto* expected, const auto* actual) {
+      ASSERT_EQ(expected != nullptr, actual != nullptr);
+      if (expected) {
+        EXPECT_EQ(*expected, *actual);
+      }
+    };
+    EXPECT_EQ(decoded->indexedTotals(), info->indexedTotals());
+    expectPart(decoded->terms(), info->terms());
+    expectPart(decoded->numberColumn(), info->numberColumn());
+    expectPart(decoded->ordColumn(), info->ordColumn());
+    expectPart(decoded->bytesColumn(), info->bytesColumn());
+    expectPart(decoded->points(), info->points());
+    expectPart(decoded->norms(), info->norms());
+    expectPart(decoded->stored(), info->stored());
+    EXPECT_EQ(decoded->docsBitmap(), info->docsBitmap());
+    EXPECT_EQ(decoded->endValueRanks(), info->endValueRanks());
+    EXPECT_EQ(decoded->owners(), info->owners());
   }
   EXPECT_EQ(3u, reader->fieldCacheStats().pages);
+}
+
+TEST_F(FieldMetadataTest, partialPresenceRequiresBitmap) {
+  RAMDir dir;
+  PostingsWriter writer(dir, 0, 1, 2);
+  auto& field = writer.addField(SpaceOrdinal::ROOT, "tag");
+  field.header.type = FieldType::STRING;
+  field.header.flags = FieldType::INDEX_DOCS;
+  field.setPostings({{}, {}, 0});
+  field.setPresence({2, {}});
+  test::EncodedFieldRecord record(field, 2);
+  field.setPresence({1, {}});
+  RAMFile encoded("");
+  OutputStream out(&encoded);
+  EXPECT_THROW(FieldRecordCodec::encode(out, field, 2), std::logic_error);
+  out.close();
+
+  InputStream input(record.bytes.data(), record.bytes.data() + record.bytes.size());
+  input.checkedPackedTerm();
+  input.checkedVint();  // Type.
+  input.checkedVint();  // Flags.
+  input.checkedVint();  // Part mask.
+  input.readByte();     // State.
+  ASSERT_EQ(2, record.bytes[input.offset()]);
+  record.bytes[input.offset()] = 1;  // One of two docs, with no DOCS part.
+  EXPECT_THROW(FieldRecordCodec::decode(record.bytes, 2, {}, 0), std::runtime_error);
+}
+
+TEST_F(FieldMetadataTest, corruptBitmapNamesItsSpillFile) {
+  RAMDir dir;
+  PostingsWriter writer(dir, 0, 1, 2);
+  auto output = writer.getOutputStream();
+  std::vector<char> padding(PostingsWriter::RAM_SPILL_BYTES + 1);
+  output->write(padding.data(), padding.size());
+  DocsWriter docs(writer.pool, *output);
+  docs.addDoc(1);
+  ASSERT_EQ(1, docs.finish());
+  auto start = docs.bitmapStart();
+  auto size = output.pos() - start;
+  auto bitmap = writer.finishStream(std::move(output)).subSlice(start, size);
+  ASSERT_NE(Postings::PRIMARY_FILE, bitmap.location.filenum());
+
+  auto& info = writer.addField(SpaceOrdinal::ROOT, "tag");
+  info.header.type = FieldType::STRING;
+  info.header.flags = FieldType::INDEX_DOCS;
+  info.setPostings({{}, {}, 0});
+  info.setPresence({1, bitmap});
+  test::writeUnversionedRuns(writer);
+  ASSERT_TRUE(writer.finish());
+
+  SegmentCore core(dir, 0, 1);
+  auto& reader = core.rootReader();
+  auto* fieldInfo = reader.fieldInfo("tag");
+  ASSERT_NE(nullptr, fieldInfo);
+  ASSERT_NO_THROW(DocsReader(reader, *fieldInfo));
+  auto bytes = core.slice(bitmap);
+  std::memset(const_cast<char*>(bytes.data()) + bytes.size() - sizeof(uint16_t), 0, sizeof(uint16_t));
+  auto expected = Postings::getIndexFileName(core.segmentName(), bitmap.location.filenum());
+  try {
+    DocsReader invalid(reader, *fieldInfo);
+    FAIL() << "Expected corrupt bitmap";
+  } catch (const std::runtime_error& e) {
+    std::string_view message(e.what());
+    EXPECT_TRUE(message.contains(expected) && message.contains("field 'tag'") && message.contains("invalid docs bitmap"))
+        << message;
+  }
+}
+
+TEST_F(FieldMetadataTest, indexedStringWithNoTermsKeepsIndexedTotals) {
+  RAMDir dir;
+  PostingsWriter writer(dir, 0, 1, 1);
+  auto& field = writer.addField(SpaceOrdinal::ROOT, "tag");
+  field.header.type = FieldType::STRING;
+  field.header.flags = FieldType::INDEX_DOCS;
+  field.setPostings({{}, {}, 0});
+  field.setPresence({1, {}});
+  test::writeUnversionedRuns(writer);
+  ASSERT_TRUE(writer.finish());
+
+  SegmentCore core(dir, 0, 1);
+  const auto* info = core.rootReader().fieldInfo("tag");
+  ASSERT_TRUE(info && (info->flags & FieldType::INDEX_DOCS));
+  EXPECT_EQ((field_parts::IndexedTotals{0, 0, 0}), info->indexedTotals());
+  EXPECT_EQ(nullptr, info->terms());
+  EXPECT_FALSE(info->hasDisjointTermPostings());
 }
 
 TEST_F(FieldMetadataTest, untouchedFieldsStayUnallocated) {
@@ -310,11 +449,10 @@ TEST_F(FieldMetadataTest, untouchedFieldsStayUnallocated) {
   ASSERT_NE(nullptr, reader->fieldInfo(4095));
   EXPECT_EQ(2u, reader->fieldCacheStats().pages);
   // Streaming discovery must not populate the untouched pages.
-  FieldReader fields(*reader);
+  FieldCursor fields(*reader);
   int count = 0;
-  while (fields.readNextField()) {
-    SegFieldInfo info{};
-    fields.readFieldInfo(info);
+  while (fields.next()) {
+    EXPECT_NE(nullptr, fields.decode());
     count++;
   }
   EXPECT_EQ(reader->numFields(), count);
@@ -350,7 +488,7 @@ TEST_F(FieldMetadataTest, coreNamesAreSharedAndLazy) {
   constexpr int THREADS = 16;
   std::barrier start(THREADS);
   std::array<IndexReader::FieldSegments, THREADS> views{};
-  std::array<const PostingsReader::Field*, THREADS> infos{};
+  std::array<const DecodedFieldRecord*, THREADS> infos{};
   std::array<const Similarity::FieldStats*, THREADS> stats{};
   std::vector<std::jthread> threads;
   for (int i = 0; i < THREADS; i++) {

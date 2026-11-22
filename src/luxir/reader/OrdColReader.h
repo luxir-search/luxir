@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "DocsReader.h"
+#include "ReaderErrors.h"
 #include "IntColReader.h"
 #include "PostingsReader.h"
 #include "luxir/codec/LinearPack.h"
@@ -29,6 +30,7 @@
 
 namespace luxir {
 
+// Reads a string or ID column as ordinals into the field's term dictionary.
 class OrdColReader {
 public:
   static constexpr uint32_t BLOCK_SIZE = OrdColumnFormat::BLOCK_SIZE;
@@ -49,19 +51,17 @@ public:
 
 private:
   inline static std::atomic<int32_t> bulkMinHitsOverride = -1;
-  DocsReader docs;
-  InputStream columnIS;
-  const char* blocks = nullptr;
-  const char* blockMeta = nullptr;
-  std::optional<MonoReader> endValueRanks;
-  int64_t nvalues = 0;
-  int32_t maxdoc = 0;
-  int32_t format = SegFieldInfo::ORD_NONE;
-  int32_t indexing = SegFieldInfo::ORD_INDEX_NONE;
-  uint8_t bits = 0;
-  uint32_t mask = 0;
-  bool multi = false;
-  bool array = false;
+  DocsReader docs;  // Maps sparse docs to ranks.
+  const char* blocks = nullptr;  // Packed ordinal values.
+  const char* blockMeta = nullptr;  // The prediction metadata, if present.
+  MonoReader endValueRanks;  // Maps each doc rank to its end value rank.
+  int64_t values = 0;  // Number of values in the column.
+  int32_t maxDoc = 0;
+  field_parts::OrdMode mode;
+  field_parts::OrdIndexing indexing;
+  uint8_t width = 0;  // Bits per ordinal in the direct layout.
+  uint32_t mask = 0;  // Extracts one ordinal from packed bits.
+  bool array = false;  // Values retain their input order and repeats.
 
   PredictedBlockInfo blockInfo(uint64_t block) const {
     PredictedBlockInfo info;
@@ -71,13 +71,13 @@ private:
 
   uint32_t directValueAt(int64_t index) const {
     assert(index >= 0 && index < encodedValues());
-    assert(format == SegFieldInfo::ORD_DIRECT);
-    return LinearPack::select32(blocks, (uint64_t)index, bits, mask);
+    assert(mode == field_parts::OrdMode::DIRECT);
+    return LinearPack::select32(blocks, (uint64_t)index, width, mask);
   }
 
   uint32_t predictedValueAt(int64_t index) const {
     assert(index >= 0 && index < encodedValues());
-    assert(format == SegFieldInfo::ORD_PREDICTED);
+    assert(mode == field_parts::OrdMode::PREDICTED);
     uint64_t block = (uint64_t)index / BLOCK_SIZE;
     uint32_t rankInBlock = (uint32_t)((uint64_t)index % BLOCK_SIZE);
     PredictedBlockInfo info = blockInfo(block);
@@ -90,19 +90,19 @@ private:
   }
 
   uint32_t valueAt(int64_t index) const {
-    return format == SegFieldInfo::ORD_DIRECT ? directValueAt(index)
+    return mode == field_parts::OrdMode::DIRECT ? directValueAt(index)
                                               : predictedValueAt(index);
   }
 
   // Point-decodes each doc `visitDocs` hands its visitor (ascending, in a
   // docid-indexed column) and keeps the docs with a value: docsOut and
   // ordsOut get the present pairs in order, and their count is returned. The
-  // format dispatch sits outside the visit, and the loads do not depend on
+  // mode dispatch sits outside the visit, and the loads do not depend on
   // each other, so a sparse domain's column misses overlap.
   template <class VisitDocs>
   int32_t presentOrds(VisitDocs&& visitDocs, int32_t* docsOut,
                       int32_t* ordsOut) const {
-    assert(indexing == SegFieldInfo::ORD_DOCID);
+    assert(indexing == field_parts::OrdIndexing::DOC_ID);
     int32_t present = 0;
     auto keep = [&](int32_t doc, uint32_t ord) LUXIR_INLINE {
       assert(ord <= INT32_MAX);
@@ -110,15 +110,15 @@ private:
       ordsOut[present] = (int32_t)ord;
       present += ord != 0;
     };
-    if (format == SegFieldInfo::ORD_DIRECT) {
+    if (mode == field_parts::OrdMode::DIRECT) {
       // Locals, not members: the output stores could alias the reader, which
       // would reload the mask on every doc.
       const char* base = blocks;
-      uint8_t width = bits;
+      uint8_t packedWidth = width;
       uint32_t valueMask = mask;
       visitDocs([&](int32_t doc) LUXIR_INLINE {
         assert(doc >= 0 && doc < encodedValues());
-        keep(doc, LinearPack::select32(base, (uint64_t)doc, width, valueMask));
+        keep(doc, LinearPack::select32(base, (uint64_t)doc, packedWidth, valueMask));
       });
     } else {
       visitDocs([&](int32_t doc) LUXIR_INLINE {
@@ -129,52 +129,44 @@ private:
   }
 
 public:
-  OrdColReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo)
-      : docs(postingsReader, fieldInfo) {
-    nvalues = fieldInfo.numValues;
-    maxdoc = postingsReader.maxDoc();
-    format = fieldInfo.ordFormat;
-    indexing = fieldInfo.ordIndexing;
-    bits = (uint8_t)fieldInfo.ordBits;
-    mask = LinearPack::mask32(bits);
-    multi = fieldInfo.monoLoc.offset() > 0;
-    array = (fieldInfo.flags & FieldType::MULTI_ARRAY) != 0;
-    assert(format == SegFieldInfo::ORD_DIRECT || format == SegFieldInfo::ORD_PREDICTED);
-    assert(indexing == SegFieldInfo::ORD_DOCID || indexing == SegFieldInfo::ORD_RANK);
-    assert(!multi || indexing == SegFieldInfo::ORD_RANK);
-    columnIS = postingsReader.core().getInputStreamSeek(fieldInfo.columnLoc);
-    blocks = columnIS.ptr();
-    if (format == SegFieldInfo::ORD_PREDICTED) {
-      blockMeta = blocks + fieldInfo.columnMetaOff;
+  OrdColReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
+      : docs(reader, fieldInfo), values(fieldInfo.numValues), maxDoc(reader.maxDoc()),
+        array((fieldInfo.flags & FieldType::MULTI_ARRAY) != 0) {
+    const auto* ord = fieldInfo.ordColumn();
+    if (!ord) missingColumn(fieldInfo, "ordinal");
+    mode = ord->mode;
+    indexing = ord->indexing;
+    width = OrdColumnFormat::width(fieldInfo.indexedTotals().numTerms);
+    mask = LinearPack::mask32(width);
+    blocks = reader.core().slice(ord->values()).data();
+    if (auto metadata = fieldInfo.ordBlockMetadata(maxDoc)) {
+      blockMeta = reader.core().slice(metadata).data();
     }
-    if (multi) {
-      endValueRanks.emplace(postingsReader, fieldInfo.monoLoc,
-                            fieldInfo.monoMetaOff, fieldInfo.docsWithField);
-    }
+    endValueRanks = MonoReader::openEndValueRanks(reader, fieldInfo);
   }
 
   // Raw direct view used by low-level codecs and format tests.
-  OrdColReader(const char* encoded, int32_t count, uint8_t bits)
-      : docs(count), blocks(encoded), nvalues(count), maxdoc(count),
-        format(SegFieldInfo::ORD_DIRECT), indexing(SegFieldInfo::ORD_DOCID),
-        bits(bits), mask(LinearPack::mask32(bits)) {}
+  OrdColReader(const char* encoded, int32_t numDocs, uint8_t width)
+      : docs(numDocs), blocks(encoded), values(numDocs), maxDoc(numDocs),
+        mode(field_parts::OrdMode::DIRECT), indexing(field_parts::OrdIndexing::DOC_ID),
+        width(width), mask(LinearPack::mask32(width)) {}
 
   int64_t numValues() const noexcept {
-    return nvalues;
+    return values;
   }
 
   int64_t encodedValues() const noexcept {
-    return indexing == SegFieldInfo::ORD_DOCID ? maxdoc : nvalues;
+    return field_parts::OrdColumn::encodedCount(indexing, maxDoc, values);
   }
 
   bool multiArray() const noexcept { return array; }
 
   bool multiValued() const noexcept {
-    return multi;
+    return endValueRanks.has_value();
   }
 
   bool docIdIndexed() const noexcept {
-    return indexing == SegFieldInfo::ORD_DOCID;
+    return indexing == field_parts::OrdIndexing::DOC_ID;
   }
 
   const DocsReader& docsReader() const noexcept {
@@ -183,21 +175,21 @@ public:
 
   std::pair<int64_t, int64_t> getStartEndValueRank(int32_t docRank) const {
     assert(endValueRanks);
-    return endValueRanks->valuesAt(docRank);
+    return endValueRanks.valuesAt(docRank);
   }
 
   int32_t ordAt(int32_t doc) const {
-    assert(doc >= 0 && doc < maxdoc);
-    assert(!multi);
+    assert(doc >= 0 && doc < maxDoc);
+    assert(!multiValued());
     uint32_t ord;
-    if (indexing == SegFieldInfo::ORD_DOCID) {
+    if (indexing == field_parts::OrdIndexing::DOC_ID) {
       ord = valueAt(doc);
-    } else if (!docs.hasBitset()) {
+    } else if (docs.allRows()) {
       ord = valueAt(doc);
     } else {
-      screaming::BitSet::Iterator iter(docs.bitset());
-      if (iter.advance(doc) != doc) return 0;
-      ord = valueAt(iter.rank());
+      int32_t rank = docs.rankOf(doc);
+      if (rank < 0) return 0;
+      ord = valueAt(rank);
     }
     assert(ord <= INT32_MAX);
     return (int32_t)ord;
@@ -205,23 +197,20 @@ public:
 
   // Minimum term ordinal, independent of the stored sequence order.
   int32_t minOrdAt(int32_t doc) const {
-    if (multi && array) return selectedArrayOrdAt(doc, false);
+    if (multiValued() && array) return selectedArrayOrdAt(doc, false);
     return firstOrdAt(doc);
   }
 
   // First stored ordinal: the minimum for single-valued and set columns.
   int32_t firstOrdAt(int32_t doc) const {
-    if (!multi) return ordAt(doc);
-    assert(doc >= 0 && doc < maxdoc);
-    assert(indexing == SegFieldInfo::ORD_RANK);
+    if (!multiValued()) return ordAt(doc);
+    assert(doc >= 0 && doc < maxDoc);
+    assert(indexing == field_parts::OrdIndexing::RANK);
 
-    int32_t docRank;
-    if (!docs.hasBitset()) {
-      docRank = doc;
-    } else {
-      screaming::BitSet::Iterator iter(docs.bitset());
-      if (iter.advance(doc) != doc) return 0;
-      docRank = iter.rank();
+    int32_t docRank = doc;
+    if (!docs.allRows()) {
+      docRank = docs.rankOf(doc);
+      if (docRank < 0) return 0;
     }
     auto [start, end] = getStartEndValueRank(docRank);
     assert(start < end);
@@ -248,8 +237,8 @@ public:
   void unpack(int64_t start, uint32_t count, uint32_t* out) const {
     assert(start >= 0 && start % BULK_SIZE == 0 && count <= BULK_SIZE);
     assert(start + count <= encodedValues());
-    if (format == SegFieldInfo::ORD_DIRECT) {
-      LinearPack::unpack128(blocks, (uint64_t)start, count, bits, mask, out);
+    if (mode == field_parts::OrdMode::DIRECT) {
+      LinearPack::unpack128(blocks, (uint64_t)start, count, width, mask, out);
       return;
     }
     uint64_t block = (uint64_t)start / BLOCK_SIZE;
@@ -346,12 +335,11 @@ public:
   }
 
   int32_t LUXIR_NOINLINE selectedArrayOrdAt(int32_t doc, bool descending) const {
-    assert(multi && array);
+    assert(multiValued() && array);
     int32_t rank = doc;
-    if (docs.hasBitset()) {
-      screaming::BitSet::Iterator iter(docs.bitset());
-      if (iter.advance(doc) != doc) return 0;
-      rank = iter.rank();
+    if (!docs.allRows()) {
+      rank = docs.rankOf(doc);
+      if (rank < 0) return 0;
     }
     auto [start, end] = getStartEndValueRank(rank);
     BulkOrds ords(*this);
@@ -374,9 +362,9 @@ public:
 
   public:
     explicit Iterator(const OrdColReader& col)
-        : col(col), docsIter(col.docs.bitset()), values_(col) {
-      maxRank = col.docs.numDocs();
-      dense = !col.docs.hasBitset();
+        : col(col), docsIter(col.docs.bitmapIterator()), values_(col) {
+      maxRank = col.docs.docsWithField();
+      dense = col.docs.allRows();
     }
 
     int32_t docId() const noexcept { return doc; }
@@ -384,8 +372,8 @@ public:
     BulkOrds& values() noexcept { return values_; }
 
     int32_t value() {
-      assert(!col.multi);
-      int64_t index = col.indexing == SegFieldInfo::ORD_DOCID ? doc : docRank;
+      assert(!col.multiValued());
+      int64_t index = col.indexing == field_parts::OrdIndexing::DOC_ID ? doc : docRank;
       return values_.valueAt(index);
     }
 
@@ -414,10 +402,9 @@ public:
     }
   };
 
-  static void getValues(MemPool& pool, PostingsReader& postingsReader,
-                        const SegFieldInfo& fieldInfo, std::ranges::input_range auto&& sortedIds,
+  static void getValues(PostingsReader& postingsReader,
+                        const DecodedFieldRecord& fieldInfo, std::ranges::input_range auto&& sortedIds,
                         auto&& callback) {
-    unused(pool);
     OrdColReader reader(postingsReader, fieldInfo);
     Iterator iter(reader);
     int32_t found = -1;
@@ -440,11 +427,10 @@ public:
     }
   }
 
-  static void getSingleValues(MemPool& pool, PostingsReader& postingsReader,
-                              const SegFieldInfo& fieldInfo,
+  static void getSingleValues(PostingsReader& postingsReader,
+                              const DecodedFieldRecord& fieldInfo,
                               std::ranges::input_range auto&& sortedIds,
                               auto&& callback) {
-    unused(pool);
     OrdColReader reader(postingsReader, fieldInfo);
     assert(!reader.multiValued());
     size_t inputIndex = 0;

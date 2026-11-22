@@ -35,18 +35,18 @@ class StrHandler final : public Inverter::IndexHandler {
   [[no_unique_address]] std::conditional_t<Array, ArrayOrdValues, NoArrayValues> arrayValues;
   TermValHash<std::conditional_t<Array, ArrayTerm, DocStream>> termsHash; // the set of terms contained in this field
 
-  // Postings store a field-rank (the doc's rank among docs-with-value) rather than a
+  // Postings store a field-rank (the doc's rank among docs with the field) rather than a
   // docid, so the ord collector at flush is sized to docsWithField, not maxDoc.
-  // docsWithField maps rank->docid, in doc order, and resolves the real docids back
+  // docs maps rank->docid, in doc order, and resolves the real docids back
   // for the inverted-index and the docs-with-field column.
-  DocStream docsWithField;
-  int32_t nDocsWithField = 0;   // next field-rank == count of docs with a value
+  DocStream docs;
+  int32_t docsWithField = 0;   // next field-rank == count of docs with a value
   int32_t lastFieldDoc = -1;    // last doc that contributed a value to this field
 
 public:
   StrHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space),
-      stringValue(*fieldType), arrayValues(inverter.pool), termsHash(inverter.pool, 4), docsWithField(inverter.pool) {
+      stringValue(*fieldType), arrayValues(inverter.pool), termsHash(inverter.pool, 4), docs(inverter.pool) {
   }
 
   ~StrHandler() override = default;
@@ -83,18 +83,18 @@ private:
 
   void appendPrepared(Inverter& inverter, std::string_view term) {
     // Assign this doc a field-rank the first time it contributes any value, recording
-    // rank->docid in docsWithField.  All of a doc's terms then share that rank.
+    // rank->docid in docs. All of a doc's terms then share that rank.
     int32_t doc = inverter.getDoc();
     if (lastFieldDoc != doc) {
       lastFieldDoc = doc;
       // Built and read back through termsHash's pool, like the per-term streams, so
       // both sides name the same pool explicitly rather than relying on it happening
       // to equal inverter.pool.
-      docsWithField.addDoc(termsHash.getMemPool(), doc);
-      nDocsWithField++;
+      docs.addDoc(termsHash.getMemPool(), doc);
+      docsWithField++;
       if constexpr (Array) arrayValues.startDoc(inverter.pool);
     }
-    int32_t rank = nDocsWithField - 1;
+    int32_t rank = docsWithField - 1;
     auto [entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool());
     if constexpr (Array) {
       if (inserted) entry->val().id = (uint32_t)termsHash.size();
@@ -144,25 +144,25 @@ public:
     // TODO: TextWriter should be refactored (or templated) to handle strings without positions.
     TextWriter textWriter(inverter.getPostingsWriter());
     PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(space, fieldName);
-    fieldInfo.type = fieldType->type();
-    fieldInfo.flags = fieldType->segmentFlags();
-    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
+    fieldInfo.header.type = fieldType->type();
+    fieldInfo.header.flags = fieldType->segmentFlags();
+    fieldInfo.header.typeParameters = fieldType->segmentTypeParameters();
 
     // Postings are keyed by field-rank, so the ord collector is sized to docsWithField
     // (not maxDoc).  For a full field rank == docid, so we skip the rank->docid table
     // and index directly; otherwise materialize it once for both the inverted-index
     // scatter and the docs-with-field column.
-    bool full = (nDocsWithField == nDocs);
+    bool full = (docsWithField == nDocs);
     std::vector<int32_t> rankToDoc;
     if (!full) {
-      rankToDoc.reserve((size_t)nDocsWithField);
-      docsWithField.forEachDoc(termsHash.getMemPool(), [&](int d) { rankToDoc.push_back(d); });
+      rankToDoc.reserve((size_t)docsWithField);
+      docs.forEachDoc(termsHash.getMemPool(), [&](int d) { rankToDoc.push_back(d); });
     }
 
     if (!fieldType->hasColumn()) {
       // column: false keeps the postings and the docs-with-field set (exists,
       // scoring) but no ord column.
-      textWriter.startField(&fieldInfo);
+      textWriter.startField(space, fieldInfo);
       for (int32_t tnum = 0; tnum < uniqueVals; tnum++) {
         auto term = terms[tnum];
         textWriter.startTerm(term);
@@ -171,12 +171,11 @@ public:
         });
         textWriter.endTerm(term);
       }
-      textWriter.endField();
+      fieldInfo.setPostings(textWriter.endField());
       termsHash.free();
       inverter.noteFlushWorkspace(rankToDoc.capacity() * sizeof(int32_t));
-      fieldInfo.numValues = fieldInfo.sumDocFreq;
-      DocsWithValWriter::write(guard.pool(), inverter.postingsWriter, fieldInfo, nDocsWithField,
-                               [&](auto&& accept) { for (int32_t doc : rankToDoc) accept(doc); });
+      fieldInfo.setPresence(PresenceWriter::write(guard.pool(), inverter.postingsWriter, space, docsWithField,
+          [&](auto&& accept) { for (int32_t doc : rankToDoc) accept(doc); }));
       return;
     }
 
@@ -187,11 +186,11 @@ public:
     }
     auto ords = [&]() {
       if constexpr (Array) return ArrayOrdValues::Mapped(arrayValues, inverter.pool, termToOrd);
-      else return OrdCollector(guard.pool(), nDocsWithField);
+      else return OrdCollector(guard.pool(), docsWithField);
     }();
     size_t poolStart = guard.pool().size();
 
-    textWriter.startField(&fieldInfo);
+    textWriter.startField(space, fieldInfo);
     for (int32_t tnum = 0; tnum < uniqueVals; tnum++) {
       auto term = terms[tnum];
       int64_t ord = textWriter.startTerm(term);
@@ -205,7 +204,8 @@ public:
       });
       textWriter.endTerm(term);
     }
-    textWriter.endField();
+    auto written = textWriter.endField();
+    fieldInfo.setPostings(written);
     termsHash.free();
     // Ord workspace at its peak; the pool's growth counts the spilled
     // multi-valued ords to within a block.
@@ -215,8 +215,9 @@ public:
     inverter.noteFlushWorkspace(collectorBytes + rankToDoc.capacity() * sizeof(int32_t)
                                 + (guard.pool().size() - poolStart));
 
-    BasicOrdColWriter<decltype(ords)> ordsWriter(guard.pool(), inverter.postingsWriter, fieldInfo, ords);
-    ordsWriter.finish(rankToDoc);
+    BasicOrdColWriter<decltype(ords)> ordsWriter(guard.pool(), inverter.postingsWriter, space, fieldInfo.header.flags, ords);
+    auto column = ordsWriter.finish(written.totals.numTerms, rankToDoc);
+    fieldInfo.setColumn(std::move(column));
   }
 
 };

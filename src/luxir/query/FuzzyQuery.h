@@ -126,7 +126,7 @@ public:
 
 private:
   std::vector<ExpansionCandidate> collectCandidates(Context& context, MemPool& scratch,
-                                                     CachedFieldInfo& fieldInfo) const {
+                                                     CachedFieldInfo& cachedFieldInfo) const {
     boost::unordered_flat_map<std::string_view, int32_t,
                               PackedTermHash, PackedTermEqual> termToIndex;
     std::vector<ExpansionCandidate> candidates;
@@ -136,10 +136,10 @@ private:
     MultiTermBudget& budget = context.multiTermBudget();
     size_t nSegs = context.numSegments();
     for (size_t s = 0; s < nSegs; s++) {
-      auto* segFieldInfo = fieldInfo.segInfos.at(s);
-      if (segFieldInfo == nullptr) continue;
+      auto* fieldInfo = cachedFieldInfo.segInfos.at(s);
+      if (fieldInfo == nullptr) continue;
       auto& postingsReader = context.topReader.segments()[s].postingsReader();
-      TermsEnum te(scratch, postingsReader, *segFieldInfo);
+      TermsEnum te(scratch, postingsReader, *fieldInfo);
       FuzzySeekEnum fte(scratch, te, prefix, suffix, maxEdits);
       fte.setAllowance(budget.scanAllowance());
       while (fte.next()) {

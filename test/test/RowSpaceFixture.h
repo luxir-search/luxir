@@ -29,34 +29,18 @@ struct RowSpaceFixture {
     std::optional<std::string> stored;
   };
 
-  static std::pair<seg_location, int64_t> mono(PostingsWriter& writer, std::span<const int64_t> values) {
+  static field_parts::Slice mono(PostingsWriter& writer, std::span<const int64_t> values) {
     auto out = writer.getOutputStream();
     MonoWriter mono(writer.pool, *out);
     for (int64_t value : values) mono.addInt64(value);
-    mono.finish();
-    return {mono.blockLoc, mono.metaOff};
+    return mono.finish(writer, std::move(out));
   }
 
   static OwnershipDescriptor shape(PostingsWriter& writer, std::span<const int64_t> ends,
                                    std::optional<std::span<const int64_t>> owners = {}) {
-    auto [loc, metaOff] = mono(writer, ends);
-    OwnershipDescriptor descriptor{loc, metaOff, {}, 0};
-    if (owners) {
-      auto reverse = mono(writer, *owners);
-      descriptor.owners = reverse.first;
-      descriptor.ownersMetaOff = reverse.second;
-    }
+    OwnershipDescriptor descriptor{mono(writer, ends), {}};
+    if (owners) descriptor.owners = mono(writer, *owners);
     return descriptor;
-  }
-
-  static void presence(PostingsWriter& writer, PostingsWriter::IndexFieldInfo& field,
-                       std::span<const int32_t> docs, int32_t maxDoc) {
-    DocsWithValWriter presence(writer.pool, writer, field);
-    if ((int32_t)docs.size() == maxDoc) presence.finishDense(maxDoc);
-    else {
-      for (int32_t doc : docs) presence.startDoc(doc);
-      presence.finish();
-    }
   }
 
   static void fields(PostingsWriter& writer, SpaceOrdinal space, std::string_view path, std::span<const Row> rows,
@@ -67,15 +51,18 @@ struct RowSpaceFixture {
     for (int32_t doc = 0; doc < count; doc++) if (rows[doc].number) docs.push_back(doc);
     if (!docs.empty()) {
       auto& field = writer.addField(space, Schema::qualify(path, "number"));
-      field.type = FieldType::INT;
-      field.flags = FieldType::COLUMN_STORED;
+      field.header.type = FieldType::INT;
+      field.header.flags = FieldType::COLUMN_STORED;
       {
         auto out = writer.getOutputStream();
         IntColWriter column(*out);
         for (int32_t doc : docs) column.addInt64(*rows[doc].number);
-        column.finish(field);
+        auto written = column.finish(writer, std::move(out));
+        auto presence = PresenceWriter::write(writer.pool, writer, space, (int32_t)docs.size(),
+            [&](auto&& accept) { for (auto doc : docs) accept(doc); });
+        field.setColumn(WrittenColumn{written.column, written.numValues, presence, {}, {},
+                         !written.bounds.empty() ? field_parts::Bounds(written.bounds) : field_parts::Bounds()});
       }
-      presence(writer, field, docs, count);
     }
 
     std::map<std::string, std::map<int32_t, int32_t>> terms;
@@ -86,8 +73,8 @@ struct RowSpaceFixture {
     }
     if (!terms.empty()) {
       auto& field = writer.addField(space, Schema::qualify(path, "body"));
-      field.type = FieldType::TEXT;
-      field.flags = FieldType::INDEX_DOCS_FREQS;
+      field.header.type = FieldType::TEXT;
+      field.header.flags = FieldType::INDEX_DOCS_FREQS;
       DocStream normDocs(writer.pool);
       Stream normBytes;
       NormsWriter::PreparedNorms prepared;
@@ -97,10 +84,10 @@ struct RowSpaceFixture {
           normDocs.addDoc(writer.pool, docs[i]);
           normBytes.writeByte(writer.pool, norms[i]);
         }
-        prepared = NormsWriter::prepare(writer.pool, writer, field, normBytes, normDocs, (int32_t)docs.size());
+        prepared = NormsWriter::prepare(writer.pool, writer, space, normBytes, normDocs, (int32_t)docs.size());
       }
       TextWriter text(writer);
-      text.startField(&field);
+      text.startField(space, field);
       if (!norms.empty()) text.setNorms(prepared.textView());
       for (const auto& [word, postings] : terms) {
         TermRef term(writer.pool, word.data(), word.size());
@@ -108,21 +95,24 @@ struct RowSpaceFixture {
         for (auto [doc, freq] : postings) text.addDoc(doc, freq);
         text.endTerm(term);
       }
-      text.endField();
-      if (norms.empty()) presence(writer, field, docs, count);
-      else NormsWriter::writeValues(writer.pool, writer, field, prepared, normDocs);
+      field.setPostings(text.endField());
+      if (norms.empty()) writeFieldPresence(writer, field, docs);
+      else {
+        field.setPresence(prepared.presence);
+        if (auto part = NormsWriter::writeValues(writer.pool, writer, prepared, normDocs)) field.setNorms(*part);
+      }
     }
 
     terms.clear();
     for (int32_t doc = 0; doc < count; doc++) if (rows[doc].label) terms[*rows[doc].label][doc] = 1;
     if (!terms.empty()) {
       auto& field = writer.addField(space, Schema::qualify(path, "label"));
-      field.type = FieldType::STRING;
-      field.flags = FieldType::INDEX_DOCS | FieldType::COLUMN_STORED;
+      field.header.type = FieldType::STRING;
+      field.header.flags = FieldType::INDEX_DOCS | FieldType::COLUMN_STORED;
       OrdCollector ords(writer.pool, count);
       {
         TextWriter text(writer);
-        text.startField(&field);
+        text.startField(space, field);
         for (const auto& [word, postings] : terms) {
           TermRef term(writer.pool, word.data(), word.size());
           auto ord = text.startTerm(term);
@@ -132,17 +122,20 @@ struct RowSpaceFixture {
           }
           text.endTerm(term);
         }
-        text.endField();
+        field.setPostings(text.endField());
       }
-      OrdColWriter column(writer.pool, writer, field, ords);
-      column.finish();
+      OrdColWriter columnWriter(writer.pool, writer, space, field.header.flags, ords);
+      auto column = columnWriter.finish(field.header.indexedTotals.numTerms);
+      field.setColumn(std::move(column));
     }
 
-    StoredFieldsWriter stored(writer, space);
+    StoredFieldsWriter stored(writer);
     for (int32_t doc = 0; doc < count; doc++) {
       if (rows[doc].stored) stored.addValue(doc, Schema::qualify(path, "payload"), *rows[doc].stored);
     }
-    stored.finish(count);
+    if (auto part = stored.finish(count)) {
+      writer.addStoredField(space, Postings::STORED_DEFAULT_RESOURCE, count, *part);
+    }
   }
 
   static std::vector<FileDescriptor> write(Directory& dir, uint64_t id,

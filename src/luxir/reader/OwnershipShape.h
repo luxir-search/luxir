@@ -19,11 +19,11 @@ class OwnershipShape {
   int32_t nParents;
   int32_t nChildren;
   MonoReader ends;
-  std::optional<MonoReader> owners;
+  MonoReader owners;
 
   int32_t reverseOwner(int32_t child) const {
     skipCount(SkipStats::ownershipReverseReads);
-    int32_t parent = (int32_t)owners->valueAt(child);
+    int32_t parent = (int32_t)owners.valueAt(child);
     assert(parent >= 0 && parent < nParents);
     return parent;
   }
@@ -42,7 +42,7 @@ public:
   int32_t childCount() const noexcept { return nChildren; }
   bool hasReverseMap() const noexcept { return owners.has_value(); }
   uint64_t endsBytes() const { return ends.sizeInBytes(); }
-  uint64_t ownersBytes() const { return owners ? owners->sizeInBytes() : 0; }
+  uint64_t ownersBytes() const { return owners.sizeInBytes(); }
   std::pair<int32_t, int32_t> range(int32_t parent) const {
     assert(parent >= 0 && parent < nParents);
     auto result = ends.valuesAt(parent);

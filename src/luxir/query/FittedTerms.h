@@ -29,7 +29,7 @@ void warnIfFittedTermsReachable(IndexReader& reader, std::vector<api::Warning>* 
                                 MemPool& pool, std::string_view field, TermPolicy policy,
                                 CanReach canReach) {
   if (warnings == nullptr) return;
-  if ((reader.field(field).flagsUnion() & FieldType::MAY_HAVE_FITTED) == 0) return;
+  if (!(reader.field(field).segFlags() & FieldSegmentFlags::MAY_HAVE_FITTED)) return;
   if (!canReach()) return;
   addWarning(*warnings, pool, FITTED_TERMS_WARNING, std::format(
       "field {}: values over {} bytes are indexed as {}; wildcard, regex and fuzzy queries "

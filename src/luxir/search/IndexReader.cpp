@@ -4,7 +4,6 @@
 #include "IndexReader.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
-#include "luxir/reader/FieldReader.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/OwnershipMapper.h"
@@ -291,6 +290,8 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
       for (const auto& segment : indexInfo.segments) {
         auto& files = core->segmentFiles.emplace_back();
         files.segId = segment.seg_id;
+        files.catalog = catalogRangeFromManifest(segment.catalog);
+        files.maxDoc = segment.max_doc;
         std::string liveName = segment.live_gen == 0 ? std::string()
             : Postings::getLiveDocsFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), segment.live_gen, segment.live_epoch);
         for (const auto& file : segment.files) {
@@ -337,12 +338,14 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
         std::shared_ptr<SegmentCore> segmentCore;
         if ((size_t)i < published.size()) {
           segmentCore = published[i].lock();
-          if (segmentCore && segmentCore->rootReader().maxDoc() != nDocs) segmentCore = nullptr;
+          if (segmentCore && (segmentCore->rootReader().maxDoc() != nDocs
+                              || segmentCore->catalogRange() != files.catalog)) segmentCore = nullptr;
         }
-        if (!segmentCore && prevSeg && !files.files.empty() && prevFiles->files == files.files) {
+        if (!segmentCore && prevSeg && !files.files.empty() && prevFiles->files == files.files
+            && prevFiles->catalog == files.catalog && prevFiles->maxDoc == nDocs) {
           segmentCore = prevSeg->core;
         }
-        if (!segmentCore) segmentCore = SegmentCore::create(dir, segId, segment.creator_epoch, missingFileOK, true);
+        if (!segmentCore) segmentCore = SegmentCore::create(dir, segment, missingFileOK, true);
         if (!segmentCore) {
           // Failed to create SegmentCore (segment files not found) - trigger retry
           retry = true;
@@ -458,7 +461,7 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
   if (previous && previous->coreGeneration == core->coreGeneration) {
     core->root->fields = previous->root->fields;
   } else {
-    core->root->fields = std::make_shared<FieldRecords>();
+    core->root->fields = std::make_shared<FieldCache>();
   }
 
   core->root->segs.reserve(segs.size());
@@ -491,7 +494,7 @@ std::shared_ptr<IndexReader::SpaceState> IndexReader::PhysicalCore::space(std::s
   if (found != spaces.end()) return found->second;
   auto state = std::make_shared<SpaceState>();
   state->path = path;
-  state->fields = std::make_shared<FieldRecords>();
+  state->fields = std::make_shared<FieldCache>();
   state->segs.reserve(bundles.size());
   for (const auto& bundle : bundles) {
     auto* postings = bundle.core->spaceReader(path);
@@ -513,7 +516,7 @@ std::shared_ptr<IndexReader::SpaceState> IndexReader::PhysicalCore::space(std::s
   return state;
 }
 
-IndexReader::FieldRecord::FieldRecord(std::string_view name, size_t hash, size_t numSegments,
+IndexReader::FieldNameEntry::FieldNameEntry(std::string_view name, size_t hash, size_t numSegments,
                                       size_t first, int32_t ordinal)
     : name(name), hash(hash), numSegments(numSegments),
       ordinals(std::make_unique<std::atomic<int32_t>[]>(numSegments)) {
@@ -521,55 +524,55 @@ IndexReader::FieldRecord::FieldRecord(std::string_view name, size_t hash, size_t
     ordinals[i].store(i < first ? -1 : UNRESOLVED, std::memory_order_relaxed);
   }
   ordinals[first].store(ordinal, std::memory_order_relaxed);
-  bytes = sizeof(FieldRecord) + numSegments * sizeof(std::atomic<int32_t>)
-      + FieldRecords::BYTES_PER_RECORD
+  bytes = sizeof(FieldNameEntry) + numSegments * sizeof(std::atomic<int32_t>)
+      + FieldCache::BYTES_PER_FIELD
       + (name.size() > std::string().capacity() ? name.size() + 1 : 0);
   fieldMetadataMemory.names.fetch_add(1, std::memory_order_relaxed);
   fieldMetadataMemory.nameBytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
-IndexReader::FieldRecord::~FieldRecord() {
+IndexReader::FieldNameEntry::~FieldNameEntry() {
   auto* resolved = totals.load(std::memory_order_relaxed);
   fieldMetadataMemory.names.fetch_sub(1, std::memory_order_relaxed);
   fieldMetadataMemory.nameBytes.fetch_sub(bytes + (resolved ? sizeof(*resolved) : 0), std::memory_order_relaxed);
   delete resolved;
 }
 
-IndexReader::FieldRecords::Table::Table(size_t capacity)
-    : mask(capacity - 1), slots(std::make_unique<std::atomic<const FieldRecord*>[]>(capacity)) {
+IndexReader::FieldCache::Table::Table(size_t capacity)
+    : mask(capacity - 1), slots(std::make_unique<std::atomic<const FieldNameEntry*>[]>(capacity)) {
   assert(std::has_single_bit(capacity));
 }
 
 // Linear probing; tables stay at most half full, so every probe ends.
-const IndexReader::FieldRecord* IndexReader::FieldRecords::Table::find(
+const IndexReader::FieldNameEntry* IndexReader::FieldCache::Table::find(
     std::string_view name, size_t hash) const noexcept {
   for (size_t i = hash & mask;; i = (i + 1) & mask) {
-    const FieldRecord* record = slots[i].load(std::memory_order_acquire);
-    if (!record) return nullptr;
-    if (record->hash == hash && record->name == name) return record;
+    const FieldNameEntry* entry = slots[i].load(std::memory_order_acquire);
+    if (!entry) return nullptr;
+    if (entry->hash == hash && entry->name == name) return entry;
   }
 }
 
-void IndexReader::FieldRecords::Table::place(const FieldRecord* record) noexcept {
-  size_t i = record->hash & mask;
+void IndexReader::FieldCache::Table::place(const FieldNameEntry* entry) noexcept {
+  size_t i = entry->hash & mask;
   while (slots[i].load(std::memory_order_relaxed)) i = (i + 1) & mask;
-  slots[i].store(record, std::memory_order_release);
+  slots[i].store(entry, std::memory_order_release);
 }
 
-const IndexReader::FieldRecord* IndexReader::FieldRecords::insert(std::unique_ptr<FieldRecord> record) {
+const IndexReader::FieldNameEntry* IndexReader::FieldCache::insert(std::unique_ptr<FieldNameEntry> entry) {
   std::lock_guard lock(insertMutex);
   Table* table = tables.empty() ? nullptr : tables.back().get();
   if (table) {
-    if (auto* existing = table->find(record->name, record->hash)) return existing;
+    if (auto* existing = table->find(entry->name, entry->hash)) return existing;
   }
-  size_t needed = 2 * (records.size() + 1);
+  size_t needed = 2 * (entries.size() + 1);
   if (!table || needed > table->mask + 1) {
     tables.push_back(std::make_unique<Table>(std::max<size_t>(16, std::bit_ceil(needed))));
     table = tables.back().get();
-    for (const auto& kept : records) table->place(kept.get());
+    for (const auto& kept : entries) table->place(kept.get());
   }
-  const FieldRecord* kept = record.get();
-  records.push_back(std::move(record));
+  const FieldNameEntry* kept = entry.get();
+  entries.push_back(std::move(entry));
   table->place(kept);
   current.store(table, std::memory_order_release);
   return kept;
@@ -577,28 +580,28 @@ const IndexReader::FieldRecord* IndexReader::FieldRecords::insert(std::unique_pt
 
 IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
   size_t hash = PackedTermHash{}(name);
-  const FieldRecord* record = space->fields->find(name, hash);
-  if (!record) {
+  const FieldNameEntry* entry = space->fields->find(name, hash);
+  if (!entry) {
     for (size_t i = 0; i < space->segs.size(); i++) {
       if (!space->segs[i].hasSpace()) continue;
       int32_t ordinal = space->segs[i].postingsReader().findOrdinal(name);
       if (ordinal < 0) continue;
-      record = space->fields->insert(
-          std::make_unique<FieldRecord>(name, hash, space->segs.size(), i, ordinal));
+      entry = space->fields->insert(
+          std::make_unique<FieldNameEntry>(name, hash, space->segs.size(), i, ordinal));
       break;
     }
   }
-  if (!record) return {};
-  FieldSegments result(record, space->segs.data());
+  if (!entry) return {};
+  FieldSegments result(entry, space->segs.data());
   if (snapshot->schema) {
     if (auto* expected = snapshot->schema->getFieldTypePtr(name)) {
       const auto& persisted = result.totals();
       if (expected->type() != persisted.type
-          || expected->segmentTypeFlags() != FieldType::typeParameters(persisted.type, persisted.typeFlags)) {
+          || expected->segmentTypeParameters() != persisted.typeParameters) {
         throw RequestError(std::format(
             "Field '{}': schema {} does not match persisted {}",
-            name, FieldType::describeType(expected->type(), expected->segmentTypeFlags()),
-            FieldType::describeType(persisted.type, persisted.typeFlags)),
+            name, FieldType::describeType(expected->type(), expected->segmentTypeParameters()),
+            FieldType::describeType(persisted.type, persisted.typeParameters)),
             "field_type_mismatch");
       }
     }
@@ -609,64 +612,62 @@ IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
 std::shared_ptr<OrdMap> IndexReader::getOrdMap(std::string_view name) {
   auto fields = field(name);
   if (!fields.exists()) return {};
-  return fields.record->ordMap.getOrCreate([&] { return OrdMap::build(fields, *this); });
+  return fields.entry->ordMap.getOrCreate([&] { return OrdMap::build(fields, *this); });
 }
 
 std::string_view IndexReader::FieldSegments::name() const noexcept {
-  return record ? std::string_view(record->name) : std::string_view{};
+  return entry ? std::string_view(entry->name) : std::string_view{};
 }
 
 int32_t IndexReader::FieldSegments::ordinalAt(size_t segment) const {
-  assert(record);
-  assert(segment < record->numSegments);
-  int32_t ordinal = record->ordinals[segment].load(std::memory_order_relaxed);
-  if (ordinal == FieldRecord::UNRESOLVED) {
+  assert(entry);
+  assert(segment < entry->numSegments);
+  int32_t ordinal = entry->ordinals[segment].load(std::memory_order_relaxed);
+  if (ordinal == FieldNameEntry::UNRESOLVED) {
     ordinal = segments[segment].hasSpace()
-        ? segments[segment].postingsReader().findOrdinal(record->name) : -1;
-    record->ordinals[segment].store(ordinal, std::memory_order_relaxed);
+        ? segments[segment].postingsReader().findOrdinal(entry->name) : -1;
+    entry->ordinals[segment].store(ordinal, std::memory_order_relaxed);
   }
   return ordinal;
 }
 
-const PostingsReader::Field* IndexReader::FieldSegments::at(size_t segment) const {
-  if (!record) return nullptr;
+const DecodedFieldRecord* IndexReader::FieldSegments::at(size_t segment) const {
+  if (!entry) return nullptr;
   int32_t ordinal = ordinalAt(segment);
   return ordinal < 0 ? nullptr : segments[segment].postingsReader().fieldInfo(ordinal);
 }
 
 bool IndexReader::FieldSegments::exists() const noexcept {
-  return record != nullptr;
+  return entry != nullptr;
 }
 
 size_t IndexReader::FieldSegments::size() const noexcept {
-  return record ? record->numSegments : 0;
+  return entry ? entry->numSegments : 0;
 }
 
-const IndexReader::HeaderTotals& IndexReader::FieldSegments::totals() const {
-  assert(record);
-  auto* totals = record->totals.load(std::memory_order_acquire);
+const IndexReader::FieldTotals& IndexReader::FieldSegments::totals() const {
+  assert(entry);
+  auto* totals = entry->totals.load(std::memory_order_acquire);
   if (!totals) {
-    auto fresh = std::make_unique<HeaderTotals>();
-    std::optional<SegFieldInfo> first;
+    auto fresh = std::make_unique<FieldTotals>();
+    std::optional<FieldRecordHeader> first;
     for (size_t i = 0; i < size(); i++) {
       fresh->stats.maxDoc += segments[i].maxDoc();
       int32_t ordinal = ordinalAt(i);
       if (ordinal < 0) continue;
-      SegFieldInfo info{};
-      FieldReader fields(segments[i].postingsReader(), ordinal);
-      fields.readFieldInfo(info);
-      if (first) first->requireCompatibleType(info);
+      auto header = segments[i].postingsReader().fieldHeader(ordinal);
+      if (first) requireCompatibleType(*first, header);
       else {
-        first = info;
-        fresh->type = info.type;
-        fresh->typeFlags = FieldType::typeParameters(info.type, info.typeFlags);
+        first = header;
+        fresh->type = header.type;
+        fresh->typeParameters = header.typeParameters;
       }
-      fresh->stats.docsWithField += info.docsWithField;
-      fresh->stats.sumDocFreq += info.sumDocFreq;
-      fresh->stats.sumTotalTermFreq += info.sumTotalTermFreq;
-      fresh->flags |= info.flags;
+      fresh->stats.docsWithField += header.docsWithField;
+      fresh->stats.sumDocFreq += header.indexedTotals.sumDocFreq;
+      fresh->stats.sumTotalTermFreq += header.indexedTotals.sumTotalTermFreq;
+      fresh->segFlags |= header.segFlags;
     }
-    if (record->totals.compare_exchange_strong(totals, fresh.get(),
+    if (entry->totals.compare_exchange_strong(totals, fresh.get(),
                                                std::memory_order_release,
                                                std::memory_order_acquire)) {
       totals = fresh.release();
@@ -680,39 +681,33 @@ const Similarity::FieldStats& IndexReader::FieldSegments::stats() const {
   return totals().stats;
 }
 
-FieldType::flag_type IndexReader::FieldSegments::flagsUnion() const {
-  return record ? totals().flags : 0;
+uint8_t IndexReader::FieldSegments::segFlags() const {
+  return entry ? totals().segFlags : 0;
 }
 
-void IndexReader::SpaceState::buildFieldCatalogs() {
-  callOnce(fieldCatalogsOnce, [this] {
+void IndexReader::SpaceState::buildFieldNameLists() {
+  callOnce(fieldNamesOnce, [this] {
     // Both name sources are views into segment files held open by the
-    // segment core's space reader: the field index (fi.fieldname) and the stored
+    // segment core's space reader: the field table and the stored
     // resource's cached metadata. No copies needed.
     std::map<std::string_view, ProjectableField> sources;
     for (auto& seg : segs) {
       if (!seg.hasSpace()) continue;
       auto& postingsReader = seg.postingsReader();
-      auto poolGuard = MemPool::threadLocalPoolGuard();
-      FieldReader fieldReader(postingsReader);
-      for (int32_t ordinal = 0; fieldReader.readNextField(); ordinal++) {
-        SegFieldInfo fi;
-        fieldReader.readFieldInfo(fi);
-        std::string_view physicalName(fi.fieldname.data(), fi.fieldname.size());
-        if (FieldType::storage(fi.type) == FieldType::Storage::BIN && (fi.flags & FieldType::STORED)) {
-          // A stored-fields resource: its metadata lists the fields it holds.
-          // An empty resource is never written, but guard the reader's
-          // precondition anyway.
-          if (fi.numValues <= 0) continue;
+      for (int32_t ordinal = 0; ordinal < postingsReader.numFields(); ++ordinal) {
+        auto header = postingsReader.fieldHeader(ordinal);
+        auto physicalName = std::string_view(header.name);
+        if (header.parts.has(FieldPart::STORED)) {
           const auto* field = postingsReader.fieldInfo(ordinal);
-          for (std::string_view name : field->stored->fieldNames) {
+          for (auto term : postingsReader.openStoredMetadata(*field)->fieldNames()) {
+            auto name = std::string_view(term);
             auto& resources = sources[name].storedResources;
             if (std::ranges::find(resources, physicalName) == resources.end()) {
               resources.push_back(physicalName);
             }
           }
-        } else if (FieldType::storage(fi.type) != FieldType::Storage::BIN) {
-          sources[physicalName].column |= (fi.flags & FieldType::COLUMN_STORED) != 0;
+        } else if (FieldType::storage(header.type) != FieldType::Storage::BIN) {
+          sources[physicalName].column |= (header.flags & FieldType::COLUMN_STORED) != 0;
         }
       }
     }

@@ -6,7 +6,7 @@
 
 namespace luxir {
 
-bool FacetReq::numericIdentitiesLead(size_t segment, const SegFieldInfo& info, DocSet* eligibility,
+bool FacetReq::numericIdentitiesLead(size_t segment, const DecodedFieldRecord& info, DocSet* eligibility,
                                     size_t count,
                                     std::function_ref<PointsReader::ValueRange(size_t)> bounds) {
   if (!eligibility) return true;

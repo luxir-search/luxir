@@ -125,7 +125,7 @@ void CollapseMembers::walk(int32_t segment, DocSet* eligibility,
       for (const auto& component : key.components) indexed &= component.present;
     }
   }
-  std::vector<const SegFieldInfo*> info(plan.fields.size());
+  std::vector<const DecodedFieldRecord*> info(plan.fields.size());
   for (size_t c = 0; c < info.size(); c++) {
     info[c] = plan.fields[c].segments.at(seg);
     if (!info[c]) {
@@ -133,7 +133,7 @@ void CollapseMembers::walk(int32_t segment, DocSet* eligibility,
       continue;
     }
     if constexpr (Replay) {
-      if (!plan.fields[c].ordinal() && info[c]->pointsMetaOff == 0) indexed = false;
+      if (!plan.fields[c].ordinal() && !info[c]->points()) indexed = false;
     }
   }
 
@@ -143,7 +143,7 @@ void CollapseMembers::walk(int32_t segment, DocSet* eligibility,
   std::pmr::vector<uint8_t> indexedKeys(&resource);
   auto recoverable = [&](size_t slot, size_t c) {
     return keys[slot].components[c].present && info[c] != nullptr && (plan.fields[c].ordinal()
-        ? (info[c]->flags & FieldType::INDEX_DOCS) != 0 : info[c]->pointsMetaOff != 0);
+        ? (info[c]->flags & FieldType::INDEX_DOCS) != 0 : info[c]->points() != nullptr);
   };
   if constexpr (!Replay) {
     indexedKeys.resize(keys.size());
@@ -180,7 +180,7 @@ void CollapseMembers::walk(int32_t segment, DocSet* eligibility,
     // expensive points plan before materializing any doc arrays.
     for (size_t c = 0; c < info.size() && estimated < (double)domainCost; c++) {
       if (plan.fields[c].ordinal()) continue;
-      if constexpr (!Replay) { if (!info[c] || !info[c]->pointsMetaOff) continue; }
+      if constexpr (!Replay) { if (!info[c] || !info[c]->points()) continue; }
       PointsReader points(seg.postingsReader(), *info[c]);
       for (const auto& key : keys) {
         if (key.singleton) continue;

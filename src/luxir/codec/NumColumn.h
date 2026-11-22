@@ -61,13 +61,18 @@ public:
     assert(((uintptr_t)blockMeta & (alignof(NumBlockInfo) - 1)) == 0);
   }
 
+  bool has_value() const noexcept { return blocks != nullptr; }
+
   int64_t numValues() const {
     return nValues;
   }
 
+  // Bytes before the block directory, including alignment padding.
+  uint64_t payloadBytes() const { return (uint64_t)(blockMeta - blocks); }
+
   // Packed payload, alignment and block directory; excludes optional zones.
   uint64_t blockBytes() const {
-    return (uint64_t)(blockMeta - blocks) + (uint64_t)numBlocks() * sizeof(NumBlockInfo);
+    return payloadBytes() + (uint64_t)numBlocks() * sizeof(NumBlockInfo);
   }
 
   int64_t numBlocks() const {

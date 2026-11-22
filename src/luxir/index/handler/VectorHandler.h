@@ -22,7 +22,7 @@ namespace luxir::handler {
 /// schema-directed numeric Val arrays are copied to an owned f32 buffer, then stored as
 /// fixed-size byte blobs through the binary-column path inherited from
 /// StrColHandler. The column's existing fixed-size fast path captures
-/// per-segment dims automatically (mono2MetaOff = dims*4).
+/// per-segment dims in the value stride.
 ///
 /// dims_ tracks the stored vector size observed so far in this segment.  If
 /// the owning VectorFieldType declares a non-zero dims, its stored dims seed
@@ -61,7 +61,7 @@ public:
 protected:
   // Persist the valueRank -> docId map for multi-valued vector fields so the kNN
   // engine can group per-vector hits back to their owning document.
-  bool writesValueDocMap() const override { return true; }
+  bool writesOwners() const override { return true; }
 
 public:
   void index(Inverter& inverter, const IndexVal& val) override {

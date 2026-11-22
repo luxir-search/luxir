@@ -42,7 +42,6 @@ void withBKD(std::span<const typename BasicBKDWriter<Traits>::Point> source,
   RAMDir dir;
   auto file = dir.createFile("bkd");
   OutputStream out(file.get());
-  out.streamNumber = 0;
   out.writeBytes("pre");
   std::vector<Point> working(source.begin(), source.end());
   Writer writer(out, options);
@@ -52,7 +51,7 @@ void withBKD(std::span<const typename BasicBKDWriter<Traits>::Point> source,
 
   auto inputFile = dir.openFile("bkd");
   InputStream input = inputFile->getInputStream();
-  Reader reader(input, data.pointsLoc.offset(), data.pointsMetaOff);
+  Reader reader(input, data.pointsStart, data.pointsMetaOff, data.directoryBytes);
   reader.validate();
   callback(reader, data, input);
 }
@@ -503,7 +502,7 @@ void withBKDBytes(const std::vector<char>& bytes, const Data& data, Callback&& c
   dir.finishFile(*file);
   auto inputFile = dir.openFile("copy");
   auto input = inputFile->getInputStream();
-  BasicBKDReader<Traits> reader(input, data.pointsLoc.offset(), data.pointsMetaOff);
+  BasicBKDReader<Traits> reader(input, data.pointsStart, data.pointsMetaOff, data.directoryBytes);
   callback(reader);
 }
 
@@ -562,7 +561,7 @@ TYPED_TEST(BKDIndexTraitsTest, coveredSubtreeCountsAndCorruption) {
         }
       });
     };
-    size_t leaf = data.pointsLoc.offset();
+    size_t leaf = data.pointsStart;
     corrupt(leaf + offsetof(Header, count), (uint16_t)0, true);
     corrupt(leaf + offsetof(Header, reserved), (uint16_t)0);
     corrupt(leaf + offsetof(Header, docCodec), (uint8_t)255);
@@ -579,7 +578,7 @@ TEST_F(BKDIndexTest, int64DimensionLengthsMustMatchBitWidths) {
   withBKD<BKDInt64Traits>(points, {}, [&](const auto&, const auto& data, const InputStream& input) {
     auto reject = [&](size_t offset, auto value) {
       std::vector<char> bytes(input.ptr(0), input.ptr(input.size()));
-      memcpy(bytes.data() + data.pointsLoc.offset() + offset, &value, sizeof(value));
+      memcpy(bytes.data() + data.pointsStart + offset, &value, sizeof(value));
       withBKDBytes<BKDInt64Traits>(bytes, data, [](const auto& reader) {
         EXPECT_THROW(reader.validate(), std::runtime_error);
       });

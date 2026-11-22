@@ -4,6 +4,7 @@
 #pragma once
 
 #include <charconv>
+#include <climits>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -17,6 +18,19 @@ namespace luxir {
 class Postings {
 public:
   static constexpr int32_t TERMS_BLOCK_SIZE = 32;
+  static constexpr uint64_t termBlockCount(uint64_t terms) noexcept {
+    return terms / TERMS_BLOCK_SIZE + (terms % TERMS_BLOCK_SIZE != 0);
+  }
+  // Trie child entries store a block ordinal in three bytes.
+  static constexpr uint32_t TERM_BLOCK_ORD_BYTES = 3;
+  static constexpr uint32_t MAX_TERM_BLOCKS = (1u << (TERM_BLOCK_ORD_BYTES * CHAR_BIT)) - 1;
+  static constexpr char TERM_BLOCK_LIMIT_ERROR[] = "term blocks exceed trie limit";
+
+  static constexpr bool fitsTermBlocks(uint64_t current, uint64_t added) noexcept {
+    return current <= MAX_TERM_BLOCKS && added <= MAX_TERM_BLOCKS - current;
+  }
+
+  static constexpr uint32_t PRIMARY_FILE = 0;
   static constexpr int32_t POSITIONS_BLOCK_SIZE = 128;
   static constexpr int32_t DOCS_BLOCK_SIZE =  128;
 
@@ -42,7 +56,7 @@ public:
   static constexpr std::string_view LUXIR_HEADER = IndexFormat::HEADER;  // every data file starts with this header
 
   // Reserved field name under which the default stored-fields resource is
-  // registered in a segment's per-field index.  Named column families live
+  // registered in a segment's field table.  Named column families live
   // in this namespace too (e.g. "_stored_paragraphs_").
   static constexpr std::string_view STORED_DEFAULT_RESOURCE = "_stored_";
 

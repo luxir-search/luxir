@@ -17,6 +17,7 @@ class ScreamingBuilder : public screaming::Builder<ScreamingBuilder> {
 
   MemPool& pool;
   OutputStream& out;
+  uint64_t start;
 
   // Serialized sets must start 8-aligned (screaming::BitSet::BLOCK_ALIGN):
   // dense-bucket word scans are compiled with alignment assumptions, so a
@@ -30,6 +31,7 @@ class ScreamingBuilder : public screaming::Builder<ScreamingBuilder> {
     if (pad > 0) {
       out.write(zeros, pad);
     }
+    start = out.size();
   }
 
 public:
@@ -48,6 +50,8 @@ public:
   : Builder(sparseContainer, denseContainer, scratchBuf, scratchSize), pool(pool), out(out) {
     alignOut();
   }
+
+  uint64_t bitmapStart() const noexcept { return start; }
 
 protected:
   // only for use by base class

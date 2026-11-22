@@ -725,9 +725,9 @@ static AggregateFacetRunStats measureFacetRuns(
   for (auto& segment : reader.segments()) {
     auto& postings = segment.postingsReader();
     auto* fieldReader = postings.fieldInfo(field);
-    if (!(fieldReader != nullptr)) continue;
-    const auto& info = *fieldReader;
-    OrdColReader column(postings, info);
+    const auto* ord = fieldReader ? fieldReader->ordColumn() : nullptr;
+    if (!ord) continue;
+    OrdColReader column(postings, *fieldReader);
     int64_t missing = 0;
     int64_t previous = -1;
     forEachOrdValue(nullptr, column, OrdMap::SegToGlobal::identity(),

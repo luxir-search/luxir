@@ -1344,12 +1344,12 @@ TEST_F(IndexWriterTest, requestBirthBlocksRejectCorruption) {
     builder.add(3, 8); // Irregular starts 0, 1, 3.
     VersionRunsOutput output(stream);
     auto count = builder.finish(output, 4);
-    auto location = output.finish(count);
+    auto trailerOff = output.finish(count);
     stream.close();
     dir.finishFile(*file);
     auto bytes = dir.openFile("runs")->read();
     std::vector<char> corrupt(bytes.begin(), bytes.end());
-    auto* header = (VersionRunsHeader*)(corrupt.data() + location.offset());
+    auto* header = (VersionRunsHeader*)(corrupt.data() + trailerOff);
     if (directoryDamage) {
       auto* directory = (VersionBlockDirectory*)(corrupt.data() + header->directoryOffset);
       directory->offset = header->directoryOffset;
@@ -1359,7 +1359,7 @@ TEST_F(IndexWriterTest, requestBirthBlocksRejectCorruption) {
       starts->scaledSlope = 0; // Decoded boundaries cease to increase.
       starts->setPayload(starts->payloadOffset(), 0);
     }
-    EXPECT_THROW(VersionRuns(corrupt.data(), corrupt.size(), location.offset(), count, 4), std::runtime_error);
+    EXPECT_THROW(VersionRuns(corrupt.data(), corrupt.size(), trailerOff, count, 4), std::runtime_error);
   }
 }
 
@@ -2570,6 +2570,8 @@ TEST_F(IndexWriterTest, idRangeTracksMergeAndReopen) {
   ASSERT_NE(nullptr, range);
   EXPECT_EQ("b", range->min);
   EXPECT_EQ("y", range->max);
+  uint64_t blocks = iw->segInfos.begin()->second->idDictionaryBlocks.load();
+  ASSERT_GT(blocks, 0u);
   iw->close();
   IndexWriter reopened(iw->snapshots);
   auto& seg = *reopened.segInfos.begin()->second;
@@ -2584,6 +2586,7 @@ TEST_F(IndexWriterTest, idRangeTracksMergeAndReopen) {
   EXPECT_FALSE(range->empty);
   EXPECT_EQ("b", range->min);
   EXPECT_EQ("y", range->max);
+  EXPECT_EQ(blocks, seg.idDictionaryBlocks.load());
 }
 
 
@@ -3382,7 +3385,7 @@ TEST_F(IndexWriterTest, initialSchemaIsForCreationOnlyAndResetKeepsIncarnation) 
   EXPECT_EQ(after->schema->version.generation(), reopened.getSchema()->gen_);
 }
 
-TEST_F(IndexWriterTest, filesystemCommitsSyncCollapsedSegmentsAndDeletes) {
+TEST_F(IndexWriterTest, filesystemCommitsSyncSegmentDataAndDeletes) {
   auto path = std::filesystem::temp_directory_path() / "luxir-checked-commits";
   std::filesystem::remove_all(path);
   auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
@@ -4064,9 +4067,9 @@ TEST_F(IndexWriterTest, storageLimitDiscardsPartialOutputBeforeRecovery) {
   std::string payload(512 * 1024, 'a');
   std::mt19937 random(7);
   for (auto& c : payload) c = (char)(' ' + random() % 95);
-  auto result = h.index(test::flatdoc("id", "large", "payload", payload));
-  // Stored fields can defer the large value until the following document.
-  if (result.success) result = h.index(test::flatdoc("id", "trigger", "payload", "trigger"));
+  // The staged chunk is charged to indexing RAM until the flush appends it
+  // to file 0, where it exceeds the RAM directory's storage limit.
+  auto result = h.index(test::flatdoc("id", "large", "payload", payload), UpdateMessage::COMMIT);
   EXPECT_FALSE(result.success);
   EXPECT_EQ(ErrorKind::RESOURCE_EXHAUSTED, result.error_kind);
   EXPECT_EQ("storage_memory_limit", result.error_code);

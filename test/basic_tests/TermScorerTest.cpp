@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/reader/SegmentCore.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/FieldCursor.h"
 #include <luxir/query/AllQuery.h>
 #include <algorithm>
 #include <array>
@@ -2363,8 +2363,7 @@ TEST_F(TermScorerTest, singleSeg) {
     // totalTermFreq = 3
 
     TermsEnum tenum = f.createTermsEnum();
-    ASSERT_EQ(f.fieldInfo.docsWithField, 4);
-    ASSERT_EQ(tenum.docsWithField(), 4);
+    ASSERT_EQ(f.fieldInfo().docsWithField, 4);
     ASSERT_EQ(tenum.numTerms(), 15);
     ASSERT_EQ(tenum.sumTotalTermFreq(), 19);
     ASSERT_EQ(tenum.sumDocFreq(), 18);
@@ -2378,7 +2377,7 @@ TEST_F(TermScorerTest, singleSeg) {
     Similarity::FieldStats fieldStats;
     fieldStats.sumTotalTermFreq = tenum.sumTotalTermFreq();
     fieldStats.sumDocFreq = tenum.sumDocFreq();
-    fieldStats.docsWithField = tenum.docsWithField();
+    fieldStats.docsWithField = f.fieldInfo().docsWithField;
     fieldStats.maxDoc = f.currentSegment()->maxDoc();
 
     Similarity::TermStats termStats;
@@ -2870,7 +2869,8 @@ TEST_F(TermScorerTest, nonTextTermScoresIgnoreSegmentOrdinals) {
   int64_t previousOrd = -1;
   for (int32_t seg = 0; seg < 2; seg++) {
     auto& segment = segments[(size_t)seg];
-    OrdColReader column(segment.postingsReader(), *segment.postingsReader().fieldInfo("value_s"));
+    const auto& columnInfo = *segment.postingsReader().fieldInfo("value_s");
+    OrdColReader column(segment.postingsReader(), columnInfo);
     int64_t ord = column.firstOrdAt(seg);
     if (seg > 0) {
       EXPECT_NE(ord, previousOrd);
@@ -4813,26 +4813,26 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   {
     TextWriter writer(postingsWriter);
     auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
-    finfo.type = FieldType::TEXT;
-    finfo.flags = FieldType::INDEX_DOCS_FREQS;
-    writer.startField(&finfo);
+    finfo.header.type = FieldType::TEXT;
+    finfo.header.flags = FieldType::INDEX_DOCS_FREQS;
+    writer.startField(finfo.space, finfo);
     TermRef hot(pool, "hot", 3);
     writer.startTerm(hot);
     for (int32_t doc = 0; doc < N; doc++) {
       writer.addDoc(doc, 1 + (doc % 9));
     }
     writer.endTerm(hot);
-    writer.endField();
+    finfo.setPostings(writer.endField());
+    luxir::test::writeFieldPresence(postingsWriter, finfo, std::views::iota(0, N));
   }
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("hot"));
   DocsFreqEnum denum(tenum);
@@ -4841,7 +4841,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   Similarity::FieldStats fieldStats;
   fieldStats.sumTotalTermFreq = tenum.sumTotalTermFreq();
   fieldStats.sumDocFreq = tenum.sumDocFreq();
-  fieldStats.docsWithField = tenum.docsWithField();
+  fieldStats.docsWithField = fieldInfo.docsWithField;
   fieldStats.maxDoc = reader.maxDoc();
   Similarity::TermStats termStats;
   termStats.docFreq = denum.numDocs();
@@ -6090,9 +6090,9 @@ TEST_F(TermScorerTest, intoBitSetWordBlocksMatchIteration) {
   auto poolFree = testIndex.pool.rewindScopeGuard();
   auto& segment = testIndex.reader->segments()[0];
   PostingsReader& postingsReader = segment.postingsReader();
-  auto* fieldReader = postingsReader.fieldInfo("body_w");
-  ASSERT_TRUE((fieldReader != nullptr));
-  const auto& fieldInfo = *fieldReader;
+  auto* fieldCursor = postingsReader.fieldInfo("body_w");
+  ASSERT_TRUE((fieldCursor != nullptr));
+  const auto& fieldInfo = *fieldCursor;
   TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordy"));
 
@@ -6173,9 +6173,9 @@ TEST_F(TermScorerTest, docsTierAdvanceCoversBlockEncodingsAndSkips) {
   auto poolFree = testIndex.pool.rewindScopeGuard();
   auto& segment = testIndex.reader->segments()[0];
   PostingsReader& postingsReader = segment.postingsReader();
-  auto* fieldReader = postingsReader.fieldInfo("body_w");
-  ASSERT_TRUE((fieldReader != nullptr));
-  const auto& fieldInfo = *fieldReader;
+  auto* fieldCursor = postingsReader.fieldInfo("body_w");
+  ASSERT_TRUE((fieldCursor != nullptr));
+  const auto& fieldInfo = *fieldCursor;
 
   auto checkAdvance = [&](std::string_view term, const std::vector<int32_t>& expected,
                           std::initializer_list<int32_t> targets) {

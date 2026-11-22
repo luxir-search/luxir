@@ -123,13 +123,13 @@ mostly partly resident.
 
 Range reads fit the segment format. A reader does not chase arbitrary
 pointers through a file. It reaches data through a fixed set of per-field
-regions recorded in the field catalog (term index, terms, doc postings,
+regions recorded in the segment catalog (term index, terms, doc postings,
 positions, column, points, norms), and within a region through offsets it
 has just decoded. Those are the points where a reader fetches and pins a
 range before using it:
 
 - IVF lists are already acquired and released per list during a scan.
-- A term's postings extent is known once the term dictionary seek returns.
+- A term's postings slice is known once the term dictionary seek returns.
 - A column or points region can be fetched whole for its field, or by block
   from the region's metadata.
 
@@ -138,8 +138,22 @@ the ranges it needs first, merge nearby ones, and issue them together.
 Object stores charge per request and each request has high latency, so
 faults served one at a time would be both slow and expensive.
 
-The catalog records where each region starts, but for most regions not its
-length, so range reads may add lengths.
+The manifest identifies the segment catalog at the end of file 0 by offset,
+length and xxh3. The catalog holds a field table for each row space, then
+the directory and its length. A field table contains name-sorted records
+and their offsets. Each record contains a header followed by the parts
+present in its part mask. A separately placed extent has an absolute file
+number and offset. Adjacent pieces share that location and carry lengths
+where the reader cannot derive them from the record and row-space counts.
+
+Each field record encodes the schema flags as an unsigned vint, excluding
+`ABSTRACT` and `DERIVED`. Bits 0-2 encode the cumulative postings level
+(0, 1, 3 or 7). Bits 3-7 are `COLUMN_STORED`, `MULTI_VALUED`, `STORED`,
+`INDEX_RANGE` and `MULTI_ARRAY`. Bits 8 and 9 are `NUM_TOKENS_APPROX` and
+`NUM_TOKENS_EXACT`. Intervals set the multi-valued and array bits for their
+physical endpoint pairs. The state byte carries the segment-specific
+`MAY_HAVE_FITTED` flag and records the presence of bounds and an explicit
+column value count. The field type determines the bounds kind.
 
 The first step-4 work is a prototype of range reads against MinIO or S3. It
 should show that eviction stays bounded with more data than the cache holds
@@ -161,7 +175,7 @@ field's postings are spread across all of a segment's files.
 Opening a snapshot builds and holds a reader for every segment, and a mapped
 file keeps its disk space until its reader goes away. Both pruning and
 eviction therefore need segments to open lazily. A segment starts with only
-its field catalog loaded and its data files closed. Planning and pruning work
+its catalog loaded and its data files closed. Planning and pruning work
 from the catalog, and a segment opens fully only when a query needs its
 data.
 
@@ -184,21 +198,18 @@ needs:
 
 ## Pruning metadata
 
-Per-segment bounds belong in the segment's field catalog (`SegFieldInfo`, at
-the tail of the segment's first file), which already records term counts,
-docs with the field, and value counts. Two bounds are added:
+Field record headers in the catalog hold per-segment bounds, counts, and
+type information. The bounds include encoded
+numeric extrema, dictionary endpoints, and geo and interval extrema.
+Dictionary endpoints can be rounded to a prefix lower bound or an
+exclusive prefix successor upper bound. Each endpoint uses one length byte
+followed by its bytes.
 
-- numeric minimum and maximum, moved from the column's own metadata;
-- first and last term for string and id fields, truncated so the bounds stay
-  correct: a prefix for the lower bound, and the next value after a prefix
-  for the upper bound.
-
-On a node with the data, the bounds come with the catalog decode, and a
-numeric range prunes a segment without touching column data. On a cold node,
-`SegmentInfo` records the length of the first file's tail, so one range read
-fetches the catalog, the segment info and the version runs together, with no
-extra files. The bounds stay out of `SegmentInfo` itself, because it is copied
-into every commit manifest.
+A planner can use the header without touching column or dictionary data.
+On a cold node the manifest's `SegmentInfo` identifies the catalog bytes
+for a range read. The catalog directory points to the separate version runs.
+Per-field bounds stay in the catalog so manifests do not repeat them for
+every segment.
 
 Each manifest also carries a collection-level summary: per-field bounds over
 all of its segments. It is per field, not per segment, so it stays small, and

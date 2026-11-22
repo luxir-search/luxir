@@ -7,6 +7,7 @@
 #include <string_view>
 #include <optional>
 #include "DocsReader.h"
+#include "ReaderErrors.h"
 #include "PostingsReader.h"
 #include "IntColReader.h"
 #include "luxir/codec/Codec.h"
@@ -19,69 +20,62 @@ namespace luxir {
 ///
 /// Layout:
 ///   - column bytes: concatenated raw value bytes.
-///   - endOffsetReader (optional): per-value -> byte offset. Absent when all values are
-///     the same size; in that case fixedSize holds the common value size.
-///   - endValueRankReader (optional): per-doc -> per-value rank boundary. Present only for
-///     multi-valued fields.  For single-valued, value rank == doc rank.
+/// End byte offsets delimit variable-size strings, and end value ranks delimit
+/// multi-valued docs. A single-valued doc holds the value at its doc rank.
 class StrColReader {
 private:
   DocsReader docs;
-  InputStream valuesIS;                       // Stream for concatenated string values
   const char* valuesData;                     // Pointer to concatenated string data
   InputFile* valuesInput;                     // File holding valuesData (for read-ahead)
   size_t valuesFileOffset;                    // Offset of valuesData in valuesInput
-  std::optional<MonoReader> endValueRankReader;    // per-doc -> end value rank (multi-valued only)
-  std::optional<MonoReader> endOffsetReader;  // per-value -> end byte offset (variable-size only)
-  std::optional<MonoReader> valDocReader;     // per-value rank -> owning docId (multi-valued reverse map; vectors only)
+  MonoReader endValueRanks;    // per-doc -> end value rank (multi-valued only)
+  MonoReader endOffsetReader;  // per-value -> end byte offset (variable-size only)
+  MonoReader owners;           // per-value rank -> owning docId (multi-valued reverse map; vectors only)
   bool arrayMode = false;
-  int32_t docsWithField = 0;
-  int64_t nvals = 0;
+  int64_t values = 0;  // Number of values in the column.
   int32_t fixedSize = -1;                     // -1 for variable size, >= 0 for fixed size
 
 public:
-  /// The fieldInfo is only used in the constructor and can be discarded after.
-  StrColReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) :
-    docs(postingsReader, fieldInfo),
-    valuesIS(postingsReader.core().getInputStreamSeek(fieldInfo.columnLoc)),
-    valuesData(valuesIS.ptr()),
-    valuesInput(postingsReader.core().getFile(fieldInfo.columnLoc.filenum())),
-    valuesFileOffset((size_t)fieldInfo.columnLoc.offset()),
-    arrayMode((fieldInfo.flags & FieldType::MULTI_ARRAY) != 0),
-    docsWithField(fieldInfo.docsWithField),
-    nvals(fieldInfo.numValues)
-  {
-    if (fieldInfo.flags & FieldType::MULTI_VALUED) {
-      endValueRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
-    }
-    if (fieldInfo.mono2Loc.offset() == 0 && fieldInfo.mono2Loc.filenum() == 0) {
-      fixedSize = (int32_t)fieldInfo.mono2MetaOff;
+  StrColReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
+      : docs(reader, fieldInfo),
+        arrayMode((fieldInfo.flags & FieldType::MULTI_ARRAY) != 0),
+        values(fieldInfo.numValues) {
+    const auto* bytes = fieldInfo.bytesColumn();
+    if (!bytes) missingColumn(fieldInfo, "bytes");
+    auto data = reader.core().slice(bytes->values);
+    valuesData = data.data();
+    valuesInput = reader.core().getFile(bytes->values.location.filenum());
+    valuesFileOffset = (size_t)bytes->values.location.offset();
+
+    endValueRanks = MonoReader::openEndValueRanks(reader, fieldInfo);
+    if (bytes->endOffsets) {
+      auto context = segmentReadContext(reader.core(), fieldInfo, bytes->endOffsets.location.filenum());
+      endOffsetReader = MonoReader(reader.core(), bytes->endOffsets, values, context.field);
+      endOffsetReader.requireLast((int64_t)data.size(), context, "last end offset differs from the bytes column length");
     } else {
-      endOffsetReader.emplace(postingsReader, fieldInfo.mono2Loc, fieldInfo.mono2MetaOff, fieldInfo.numValues);
+      fixedSize = fieldInfo.bytesStride();
     }
-    // valDoc map is optional (only multi-valued vector columns write it).
-    if (!(fieldInfo.valDocLoc.offset() == 0 && fieldInfo.valDocLoc.filenum() == 0)) {
-      valDocReader.emplace(postingsReader, fieldInfo.valDocLoc, fieldInfo.valDocMetaOff, fieldInfo.numValues);
-    }
+    owners = MonoReader(reader.core(), fieldInfo.owners(), values, fieldInfo.name);
   }
 
-  DocsReader& docsReader() {
+  const DocsReader& docsReader() const noexcept {
     return docs;
   }
 
-  int32_t docsWithValue() const {
-    return docsWithField;
+  int32_t docsWithField() const {
+    return docs.docsWithField();
   }
 
-  /// Total number of values across all docs (equals docsWithValue() for single-valued).
+  /// Total number of values across all docs (equals docsWithField() for single-valued).
   int64_t numValues() const {
-    return nvals;
+    return values;
   }
 
-  bool isMultiValued() const {
-    return endValueRankReader.has_value();
+  bool multiValued() const {
+    return endValueRanks.has_value();
   }
 
-  bool multiSet() const { return isMultiValued() && !arrayMode; }
+  bool multiSet() const { return multiValued() && !arrayMode; }
 
   // Multi-valued string sort selection. A SET reads its edge; an ARRAY scans
   // stored bytes. Callers keep single-valued reads on their existing path.
@@ -101,29 +95,29 @@ public:
     return !endOffsetReader.has_value();
   }
 
-  /// For multi-valued fields, returns the endValueRankReader which maps per-doc-rank ->
+  /// For multi-valued fields, returns the endValueRanks which maps per-doc-rank ->
   /// end value rank (cumulative count).  Use MonoReader::valuesAt(docRank) to get
   /// [startValueRank, endValueRank) for a doc.  Returns nullptr for single-valued fields.
   /// Binary-searching the returned reader gives the inverse mapping (valueRank -> docRank),
   /// needed e.g. for vector-index chunk -> doc resolution.
   /// Valid as long as this StrColReader is valid.
   MonoReader* getEndValueRankReader() {
-    return endValueRankReader ? &(*endValueRankReader) : nullptr;
+    return endValueRanks ? &endValueRanks : nullptr;
   }
 
   /// For variable-size fields, returns the endOffsetReader which maps per-value-rank ->
   /// end byte offset.  Returns nullptr for fixed-size fields; use fixedValueSize() instead.
   /// Valid as long as this StrColReader is valid.
   MonoReader* getEndOffsetReader() {
-    return endOffsetReader ? &(*endOffsetReader) : nullptr;
+    return endOffsetReader ? &endOffsetReader : nullptr;
   }
 
   /// Reverse map per-value rank -> owning segment-local docId.  Present only for
   /// multi-valued columns that opted in at write time (vector fields).  nullptr for
   /// single-valued fields (where valueRank == docRank) and non-vector columns.
   /// Valid as long as this StrColReader is valid.
-  MonoReader* getValDocReader() {
-    return valDocReader ? &(*valDocReader) : nullptr;
+  MonoReader* ownerIndex() {
+    return owners ? &owners : nullptr;
   }
 
   /// The file holding the value bytes and their offset in it, for read-ahead.
@@ -138,9 +132,9 @@ public:
   /// Get the value at a given global value rank (0..numValues()-1).
   // Keep fixed-size column access in scan loops independent of the TU inline budget.
   LUXIR_INLINE std::string_view valueAt(int64_t valueRank) const {
-    assert(valueRank >= 0 && valueRank < nvals);
+    assert(valueRank >= 0 && valueRank < values);
     if (endOffsetReader) {
-      auto [startOffset, endOffset] = endOffsetReader->valuesAt(valueRank);
+      auto [startOffset, endOffset] = endOffsetReader.valuesAt(valueRank);
       return std::string_view(valuesData + startOffset, endOffset - startOffset);
     }
     int64_t startOffset = valueRank * fixedSize;
@@ -149,14 +143,14 @@ public:
 
   /// For single-valued fields, get the value for the doc at a given doc rank.
   std::string_view singleValueAt(int32_t docRank) const {
-    assert(!isMultiValued());
+    assert(!multiValued());
     return valueAt(docRank);
   }
 
   /// For multi-valued fields, get the [startValueRank, endValueRank) range for a doc.
   std::pair<int64_t, int64_t> getStartEndValueRank(int32_t docRank) const {
-    assert(isMultiValued());
-    return endValueRankReader->valuesAt(docRank);
+    assert(multiValued());
+    return endValueRanks.valuesAt(docRank);
   }
 
   /// Per-doc value accessor for sparse doc access patterns (e.g. top-K hits).
@@ -170,27 +164,27 @@ public:
   /// where you retrieve all values for a document.
   ///
   /// For high-density access (iterating every doc in the segment) a future BulkValues
-  /// class that also bulks the endValueRankReader would be a better fit.
+  /// class that also bulks the endValueRanks would be a better fit.
   ///
   /// Valid as long as the parent StrColReader is valid.  Not thread-safe (one cache
   /// slot); callers that need concurrent access should construct one per thread.
   class DocValues {
     std::optional<MonoReader::BulkValues> offsets;  // absent for fixed-size
     const char* valuesData;
-    int64_t nvals;
+    int64_t values;  // Number of values in the column.
     int32_t fixedSize;
   public:
     DocValues(const StrColReader& reader)
-      : valuesData(reader.valuesData), nvals(reader.nvals), fixedSize(reader.fixedSize) {
+      : valuesData(reader.valuesData), values(reader.values), fixedSize(reader.fixedSize) {
       if (reader.endOffsetReader) {
-        offsets.emplace(*reader.endOffsetReader);
+        offsets.emplace(reader.endOffsetReader);
       }
     }
 
-    int64_t numValues() const { return nvals; }
+    int64_t numValues() const { return values; }
 
     std::string_view valueAt(int64_t valueRank) {
-      assert(valueRank >= 0 && valueRank < nvals);
+      assert(valueRank >= 0 && valueRank < values);
       if (!offsets) {
         int64_t startOffset = valueRank * fixedSize;
         return std::string_view(valuesData + startOffset, fixedSize);
@@ -219,9 +213,9 @@ public:
 
     DocIterator(const StrColReader& reader) :
       reader(reader),
-      docsIter(reader.docs.bitset()),
-      maxRank(reader.docsWithValue()),
-      dense(!reader.docs.hasBitset())
+      docsIter(reader.docs.bitmapIterator()),
+      maxRank(reader.docsWithField()),
+      dense(reader.docs.allRows())
     {
     }
 
@@ -281,9 +275,9 @@ public:
 
   /// Get string values for a sorted range of docids (single-valued fields).
   /// Calls callback(size_t input_index, int32_t docid, std::string_view value) for each docid that has a value.
-  static void getValues(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& segFieldInfo,
-                        std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
-    StrColReader strColReader(postingsReader, segFieldInfo);
+  static void getValues(MemPool& pool, PostingsReader& postingsReader,
+                        const DecodedFieldRecord& fieldInfo, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
+    StrColReader strColReader(postingsReader, fieldInfo);
     StrColReader::Iterator iter(strColReader);
 
     int32_t foundid = -1;
@@ -302,13 +296,13 @@ public:
   }
 
   /// Get multi-valued string values for a sorted range of docids.
-  /// Calls callback(size_t input_index, int32_t docid, std::string_view value, int64_t valIdx, int64_t numVals)
+  /// Calls callback(size_t input_index, int32_t docid, std::string_view value, int64_t valIdx, int64_t numValues)
   /// for each value of each docid that has values.  Within-doc value access goes through
-  /// DocValues so consecutive values share a block decode.  The endValueRankReader is still
+  /// DocValues so consecutive values share a block decode.  The endValueRanks is still
   /// accessed sparsely (once per matched doc), appropriate for top-K style callers.
-  static void getMultiValues(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& segFieldInfo,
-                             std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
-    StrColReader strColReader(postingsReader, segFieldInfo);
+  static void getMultiValues(MemPool& pool, PostingsReader& postingsReader,
+                        const DecodedFieldRecord& fieldInfo, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
+    StrColReader strColReader(postingsReader, fieldInfo);
     StrColReader::Iterator iter(strColReader);
     StrColReader::DocValues docValues(strColReader);
 
@@ -320,9 +314,9 @@ public:
       }
       if (foundid == docid) {
         auto [startValueRank, endValueRank] = iter.valueRange();
-        int64_t numVals = endValueRank - startValueRank;
-        for (int64_t v = 0; v < numVals; v++) {
-          callback(idx, docid, docValues.valueAt(startValueRank + v), v, numVals);
+        int64_t numValues = endValueRank - startValueRank;
+        for (int64_t v = 0; v < numValues; v++) {
+          callback(idx, docid, docValues.valueAt(startValueRank + v), v, numValues);
         }
       } else if (foundid == StrColReader::Iterator::ENDDOC) {
         break;

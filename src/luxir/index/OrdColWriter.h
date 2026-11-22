@@ -50,13 +50,14 @@ class BasicOrdColWriter : public OrdColWriterSettings {
 
   MemPool& pool;
   PostingsWriter& postingsWriter;
-  PostingsWriter::IndexFieldInfo& fieldInfo;
+  SpaceOrdinal space;
+  int32_t flags;
   Collector& ords;
   u_ptr<MonoWriter> endValueRankWriter;
   PostingsWriter::OutputStreamPtr endValueRankOutput;
 
   bool declaredMultiValued() const {
-    return (fieldInfo.flags & FieldType::MULTI_VALUED) != 0;
+    return (flags & FieldType::MULTI_VALUED) != 0;
   }
 
   template <class Acceptor>
@@ -67,15 +68,15 @@ class BasicOrdColWriter : public OrdColWriterSettings {
   }
 
   template <class Acceptor>
-  void forEachEncodedValue(int32_t indexing, std::span<const int32_t> rankToDoc,
+  void forEachEncodedValue(field_parts::OrdIndexing indexing, std::span<const int32_t> rankToDoc,
                            Acceptor&& acceptor) const {
-    if (indexing == SegFieldInfo::ORD_RANK) {
+    if (indexing == field_parts::OrdIndexing::RANK) {
       forEachRankValue(acceptor);
       return;
     }
 
-    assert(indexing == SegFieldInfo::ORD_DOCID);
-    int32_t maxDoc = postingsWriter.getMaxDoc(fieldInfo.space);
+    assert(indexing == field_parts::OrdIndexing::DOC_ID);
+    int32_t maxDoc = postingsWriter.getMaxDoc(space);
     if (rankToDoc.empty()) {
       assert(ords.size() == maxDoc);
       for (int32_t doc = 0; doc < maxDoc; doc++) {
@@ -111,7 +112,7 @@ class BasicOrdColWriter : public OrdColWriterSettings {
     assert(slot == ords.size());
   }
 
-  std::vector<BlockPlan> planPredicted(int32_t indexing,
+  std::vector<BlockPlan> planPredicted(field_parts::OrdIndexing indexing,
                                        std::span<const int32_t> rankToDoc,
                                        uint64_t& byteSize) const {
     std::vector<BlockPlan> plans;
@@ -136,7 +137,7 @@ class BasicOrdColWriter : public OrdColWriterSettings {
     return plans;
   }
 
-  void writeDirect(OutputStream& out, int32_t indexing,
+  void writeDirect(OutputStream& out, field_parts::OrdIndexing indexing,
                    std::span<const int32_t> rankToDoc, uint8_t bits) const {
     LinearPack::Writer writer(out, bits);
     forEachEncodedValue(indexing, rankToDoc,
@@ -144,7 +145,7 @@ class BasicOrdColWriter : public OrdColWriterSettings {
     writer.finish(false);  // segment data files reserve SVB_OVERREAD_PAD
   }
 
-  void writePredicted(OutputStream& out, int32_t indexing,
+  int64_t writePredicted(OutputStream& out, field_parts::OrdIndexing indexing,
                       std::span<const int32_t> rankToDoc,
                       std::vector<BlockPlan>& plans, uint64_t start) const {
     std::array<uint32_t, OrdColumnFormat::BLOCK_SIZE> block;
@@ -176,16 +177,17 @@ class BasicOrdColWriter : public OrdColWriterSettings {
     flush();
     assert(planIndex == plans.size());
 
-    fieldInfo.columnMetaOff = out.size() - start;
+    int64_t indexOffset = out.size() - start;
     for (const BlockPlan& plan : plans) {
       out.write(&plan.info, sizeof(plan.info));
     }
+    return indexOffset;
   }
 
 public:
   BasicOrdColWriter(MemPool& pool, PostingsWriter& postingsWriter,
-               PostingsWriter::IndexFieldInfo& fieldInfo, Collector& ords)
-      : pool(pool), postingsWriter(postingsWriter), fieldInfo(fieldInfo), ords(ords) {
+                    SpaceOrdinal space, int32_t flags, Collector& ords)
+      : pool(pool), postingsWriter(postingsWriter), space(space), flags(flags), ords(ords) {
     assert(!ords.multiValued() || declaredMultiValued());
     if (ords.multiValued()) {
       endValueRankOutput = postingsWriter.getOutputStream();
@@ -193,34 +195,34 @@ public:
     }
   }
 
-  void finish(std::span<const int32_t> rankToDoc = {}) {
-    int32_t maxDoc = postingsWriter.getMaxDoc(fieldInfo.space);
+  [[nodiscard]] WrittenColumn<field_parts::OrdColumn> finish(int64_t numTerms, std::span<const int32_t> rankToDoc = {}) {
+    int32_t maxDoc = postingsWriter.getMaxDoc(space);
     int32_t nSlots = ords.size();
     assert(rankToDoc.empty() || (int32_t)rankToDoc.size() == nSlots);
-    assert(fieldInfo.nTerms >= 0 && fieldInfo.nTerms <= INT32_MAX);
+    assert(numTerms >= 0 && numTerms <= INT32_MAX);
     bool multi = ords.multiValued();
     assert(!multi || declaredMultiValued());
     assert(multi == (endValueRankWriter != nullptr));
-    fieldInfo.docsWithField = ords.docsWithValue();
+    int32_t docsWithField = ords.docsWithField();
+    if (!docsWithField) return {};
 
-    int64_t nValues = 0;
+    int64_t numValues = 0;
     for (int32_t slot = 0; slot < nSlots; slot++) {
-      int64_t before = nValues;
+      int64_t before = numValues;
       ords.pushValues(slot, [&](uint32_t ord) {
         assert(ord <= INT32_MAX);
-        nValues++;
+        numValues++;
       });
-      if (nValues != before && endValueRankWriter) {
-        endValueRankWriter->addInt64(nValues);
+      if (numValues != before && endValueRankWriter) {
+        endValueRankWriter->addInt64(numValues);
       }
     }
-    fieldInfo.numValues = nValues;
 
-    int32_t indexing = !multi && useDocIdIndexing(fieldInfo.docsWithField, maxDoc)
-        ? SegFieldInfo::ORD_DOCID : SegFieldInfo::ORD_RANK;
-    uint8_t bits = (uint8_t)std::bit_width((uint64_t)fieldInfo.nTerms);
-    int64_t encodedValues = indexing == SegFieldInfo::ORD_DOCID ? maxDoc : nValues;
-    uint64_t directSize = LinearPack::packedByteSize((uint64_t)encodedValues, bits);
+    field_parts::OrdIndexing indexing = !multi && useDocIdIndexing(docsWithField, maxDoc)
+        ? field_parts::OrdIndexing::DOC_ID : field_parts::OrdIndexing::RANK;
+    uint8_t bits = OrdColumnFormat::width(numTerms);
+    auto encodedValues = field_parts::OrdColumn::encodedCount(indexing, maxDoc, numValues);
+    uint64_t directSize = (uint64_t)OrdColumnFormat::directBytes(encodedValues, bits);
     uint64_t predictedSize = 0;
     std::vector<BlockPlan> plans = planPredicted(indexing, rankToDoc, predictedSize);
 
@@ -233,36 +235,38 @@ public:
     auto output = postingsWriter.getOutputStream();
     OutputStream& out = *output;
     uint64_t start = out.size();
-    fieldInfo.columnLoc = out.slocation();
-    fieldInfo.columnMetaOff = 0;
-    fieldInfo.ordFormat = predicted ? SegFieldInfo::ORD_PREDICTED
-                                    : SegFieldInfo::ORD_DIRECT;
-    fieldInfo.ordIndexing = indexing;
-    fieldInfo.ordBits = bits;
+    std::optional<int64_t> predictedIndexOffset;
     if (predicted) {
-      writePredicted(out, indexing, rankToDoc, plans, start);
+      predictedIndexOffset = writePredicted(out, indexing, rankToDoc, plans, start);
     } else {
       writeDirect(out, indexing, rankToDoc, bits);
     }
 
+    field_parts::Slice endValueRanks;
     if (endValueRankWriter) {
-      endValueRankWriter->finish();
-      fieldInfo.monoLoc = endValueRankWriter->blockLoc;
-      fieldInfo.monoMetaOff = endValueRankWriter->metaOff;
-      endValueRankOutput.reset();
+      endValueRanks = endValueRankWriter->finish(postingsWriter, std::move(endValueRankOutput));
       endValueRankWriter.reset();
     }
 
-    if (fieldInfo.docsWithField != maxDoc) {
+    WrittenPresence presence{docsWithField, {}};
+    if (docsWithField != maxDoc) {
       auto guard = pool.rewindScopeGuard();
-      DocsWithValWriter docsWriter(pool, postingsWriter, fieldInfo);
+      PresenceWriter docsWriter(pool, postingsWriter, space);
       for (int32_t slot = 0; slot < nSlots; slot++) {
         if (ords.hasValues(slot)) {
           docsWriter.startDoc(rankToDoc.empty() ? slot : rankToDoc[slot]);
         }
       }
-      docsWriter.finish();
+      presence = docsWriter.finish();
     }
+    auto slice = postingsWriter.finishStream(std::move(output));
+    auto mode = predicted ? field_parts::OrdMode::PREDICTED : field_parts::OrdMode::DIRECT;
+    auto valuesBytes = predictedIndexOffset ? (uint64_t)*predictedIndexOffset : directSize;
+    if (predicted) {
+      assert(slice.bytes - start - valuesBytes == OrdColumnFormat::metadataBytes(encodedValues));
+    }
+    return {field_parts::OrdColumn{slice.location.addOffset(start), valuesBytes, mode, indexing},
+            numValues, presence, endValueRanks, {}, {}};
   }
 };
 

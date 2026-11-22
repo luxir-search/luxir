@@ -121,11 +121,11 @@ TEST_F(MultiValuedNumericTest, layoutFollowsValuesThroughMerges) {
     ASSERT_NE(nullptr, info);
     EXPECT_EQ(docs, info->docsWithField);
     EXPECT_EQ(values, info->numValues);
-    EXPECT_EQ(endRanks, info->hasEndValueRanks());
+    EXPECT_EQ(endRanks, info->endValueRanks().has_value());
     EXPECT_EQ(mode != Multi::SINGLE, (info->flags & FieldType::MULTI_VALUED) != 0);
     EXPECT_EQ(mode == Multi::ARRAY, (info->flags & FieldType::MULTI_ARRAY) != 0);
     IntColReader column(seg.postingsReader(), *info);
-    EXPECT_EQ(dense, column.denseDocsWithValue());
+    EXPECT_EQ(dense, column.docsReader().allRows());
     EXPECT_EQ(endRanks, column.leafMeta().valueSketch().empty());
   };
   auto reader = writer->snapshots.readers.getReader();
@@ -279,7 +279,8 @@ TEST_F(MultiValuedNumericTest, modeChangesUseSegmentModeBeforeAndAfterMerge) {
     ASSERT_EQ(pass == 0 ? 3u : 1u, reader->segments().size());
     for (size_t i = 0; i < reader->segments().size(); i++) {
       auto& segment = reader->segments()[i];
-      IntColReader column(segment.postingsReader(), *reader->field("n_is").at(segment));
+      const auto& columnInfo = *reader->field("n_is").at(segment);
+      IntColReader column(segment.postingsReader(), columnInfo);
       EXPECT_EQ(i != 0, column.multiSet()); // A mixed merge conservatively keeps ARRAY.
     }
     if (pass == 0) {
@@ -347,7 +348,8 @@ TEST_F(MultiValuedNumericTest, floatingAndDateModesThroughMerge) {
       auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
       for (auto name : {"d", "f", "date"}) {
         auto& segment = reader->segments()[0];
-        IntColReader column(segment.postingsReader(), *reader->field(name).at(segment));
+        const auto& columnInfo = *reader->field(name).at(segment);
+        IntColReader column(segment.postingsReader(), columnInfo);
         EXPECT_EQ(!array, column.multiSet());
         IntColReader::Iterator iter(column);
         ASSERT_EQ(0, iter.advance(0));

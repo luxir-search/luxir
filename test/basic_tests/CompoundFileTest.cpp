@@ -1,644 +1,371 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "luxir/reader/SegmentCore.h"
-#include "test/StorageTestUtils.h"
-#include <gtest/gtest.h>
-#include "test/TestUtils.h"
-#include "test/DurableIndexInfo.h"
-
-#include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
-#include <format>
-#include <memory>
-#include <span>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "luxir/codec/StreamVByte.h"
+#include <gtest/gtest.h>
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/PostingsWriter.h"
+#include "luxir/index/SegmentMerger.h"
 #include "luxir/reader/DocsEnum.h"
-#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/IntColReader.h"
-#include "luxir/reader/NormsReader.h"
-#include "luxir/reader/PointsReader.h"
-#include "luxir/reader/PosEnum.h"
-#include "luxir/reader/StoredFieldsReader.h"
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/StrColReader.h"
 #include "luxir/reader/TermsEnum.h"
-#include "luxir/schema/Schema.h"
+#include "luxir/store/CheckedDirFactory.h"
 #include "luxir/store/FSDirectory.h"
-#include "luxir/util/Signal.h"
-#include "luxir/util/luxir_util.h"
+#include "test/StorageTestUtils.h"
+#include "test/TestUtils.h"
 
 using namespace luxir;
 
 namespace {
 
-class TempDirectory {
-  std::filesystem::path path_;
+class CompoundFileTest : public ::testing::Test {
+protected:
+  std::string path = "/tmp/luxir-compound-XXXXXX";
 
-public:
-  TempDirectory() {
-    std::string pattern = "/tmp/luxir-compound-XXXXXX";
-    std::vector<char> writable(pattern.begin(), pattern.end());
-    writable.push_back('\0');
-    char* created = ::mkdtemp(writable.data());
-    if (created == nullptr) throw std::runtime_error("mkdtemp failed");
-    path_ = created;
-  }
+  void SetUp() override { ASSERT_NE(nullptr, ::mkdtemp(path.data())); }
 
-  ~TempDirectory() {
+  void TearDown() override {
     std::error_code error;
-    std::filesystem::remove_all(path_, error);
+    std::filesystem::remove_all(path, error);
   }
-
-  const std::filesystem::path& path() const { return path_; }
 };
-
-std::shared_ptr<Schema> compoundSchema() {
-  auto schema = std::make_shared<Schema>();
-  schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
-      "body", FieldType::INDEX_DOCS_FREQS_POSITIONS | FieldType::STORED,
-      "whitespace");
-  schema->fieldTypeMap["tag"] = std::make_shared<StrFieldType>(
-      "tag", FieldType::COLUMN_STORED);
-  schema->fieldTypeMap["score"] = std::make_shared<IntFieldType>(
-      "score", FieldType::COLUMN_STORED | FieldType::INDEX_RANGE);
-  return schema;
-}
-
-SegFieldInfo fieldInfo(PostingsReader& reader, std::string_view field) {
-  auto* fields = reader.fieldInfo(field);
-  EXPECT_NE(nullptr, fields);
-  const auto& info = *fields;
-  return info;
-}
-
-std::vector<std::string> baseSegmentFiles(Directory& directory, uint64_t segId, uint64_t epoch = 1) {
-  std::vector<Directory::FileInfo> files;
-  directory.listFiles(files);
-  std::string prefix = "s" + Postings::segmentKey(segId, epoch);
-  std::vector<std::string> matches;
-  for (const auto& file : files) {
-    if (file.name.starts_with(prefix + "_")
-        && !file.name.starts_with(prefix + "__")) {
-      matches.push_back(file.name);
-    }
-  }
-  return matches;
-}
-
-std::vector<std::pair<std::string, std::string>> storedValues(
-    StoredFieldsReader& reader, int32_t doc) {
-  std::vector<std::pair<std::string, std::string>> values;
-  reader.readDoc(doc, [&](std::string_view field,
-                          std::span<const std::string_view> fieldValues) {
-    for (std::string_view value : fieldValues) {
-      values.emplace_back(field, value);
-    }
-  });
-  return values;
-}
-
-std::string patternedBytes(size_t size, char base = 'a') {
-  std::string value(size, '\0');
-  for (size_t i = 0; i < size; i++) {
-    value[i] = (char) (base + i % 23);
-  }
-  return value;
-}
-
-std::string wideTerm(int32_t ord) {
-  std::string term(PackedTerm::MAX_LEN, 'x');
-  std::string prefix = std::format("t{:08}_", ord);
-  std::copy(prefix.begin(), prefix.end(), term.begin());
-  return term;
-}
-
-void verifyTinySegment(Directory& directory, size_t largeTagBytes = 0) {
-  auto schema = compoundSchema();
-  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(directory));
-  IndexWriter writer(writerSnapshots, schema);
-  Inverter& inverter = writer.obtainInverter();
-  std::string firstTag = largeTagBytes == 0
-      ? std::string("x") : patternedBytes(largeTagBytes);
-
-  inverter.startDoc();
-  inverter.getIndexHandler("body").index(inverter,
-                                           std::string_view("alpha beta"));
-  inverter.getIndexHandler("tag").index(inverter, std::string_view(firstTag));
-  inverter.getIndexHandler("score").index(inverter, (int64_t) 7);
-  inverter.finishDoc();
-
-  inverter.startDoc();
-  inverter.getIndexHandler("body").index(inverter, std::string_view("beta"));
-  inverter.getIndexHandler("score").index(inverter, (int64_t) -2);
-  inverter.finishDoc();
-
-  inverter.startDoc();
-  inverter.getIndexHandler("tag").index(inverter, std::string_view("y"));
-  inverter.finishDoc();
-
-  writer.releaseInverter(inverter, true);
-  writer.commit();
-  test::expectValidInventory(directory, *test::readDurableIndexInfo(directory));
-  auto reader = writer.snapshots.readers.getReader();
-  ASSERT_EQ(1u, reader->segments().size());
-  Segment& segment = reader->segments()[0];
-  auto baseFiles = baseSegmentFiles(directory, segment.segInfo.seg_id);
-  ASSERT_EQ(1u, baseFiles.size());
-
-  PostingsReader& postings = segment.postingsReader();
-  auto physicalFile = directory.openFile(baseFiles[0], true);
-  ASSERT_NE(nullptr, physicalFile);
-  EXPECT_EQ((uint64_t) physicalFile->size(), postings.core().sizeInBytes());
-  SegFieldInfo bodyInfo = fieldInfo(postings, "body");
-  MemPool pool;
-  TermsEnum terms(pool, postings, bodyInfo);
-  ASSERT_TRUE(terms.seek("beta"));
-  DocsPosEnum docs(terms);
-  PosEnum positions(docs);
-  ASSERT_EQ(0, docs.nextDoc());
-  EXPECT_EQ(1, docs.termFreq());
-  positions.startPositions();
-  EXPECT_EQ(1, positions.nextPosition());
-  ASSERT_EQ(1, docs.nextDoc());
-  EXPECT_EQ(1, docs.termFreq());
-  positions.startPositions();
-  EXPECT_EQ(0, positions.nextPosition());
-  EXPECT_EQ(DocsEnumMeta::END, docs.nextDoc());
-
-  NormsReader norms(postings, bodyInfo);
-  EXPECT_EQ(2, (int32_t) norms.value(0));
-  EXPECT_EQ(1, (int32_t) norms.value(1));
-
-  StrColReader tags(postings, fieldInfo(postings, "tag"));
-  StrColReader::Iterator tagIter(tags);
-  ASSERT_EQ(0, tagIter.next());
-  if (largeTagBytes == 0) {
-    EXPECT_EQ("x", tagIter.value());
-  } else {
-    EXPECT_EQ(largeTagBytes, tagIter.value().size());
-    EXPECT_TRUE(tagIter.value() == firstTag);
-  }
-  ASSERT_EQ(2, tagIter.next());
-  EXPECT_EQ("y", tagIter.value());
-  EXPECT_EQ(StrColReader::Iterator::ENDDOC, tagIter.next());
-
-  SegFieldInfo scoreInfo = fieldInfo(postings, "score");
-  IntColReader scores(postings, scoreInfo);
-  IntColReader::Iterator scoreIter(scores);
-  ASSERT_EQ(0, scoreIter.next());
-  EXPECT_EQ(7, scoreIter.value());
-  ASSERT_EQ(1, scoreIter.next());
-  EXPECT_EQ(-2, scoreIter.value());
-  EXPECT_EQ(IntColReader::ENDDOC, scoreIter.next());
-  PointsReader points(postings, scoreInfo);
-  std::vector<PointsReader::Point> expectedPoints = {{-2, 1}, {7, 0}};
-  EXPECT_EQ(expectedPoints, points.readAll());
-
-  auto* storedField = postings.fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
-
-  auto stored = storedField ? std::make_unique<StoredFieldsReader>(postings, *storedField) : nullptr;
-  ASSERT_NE(nullptr, stored);
-  EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{
-                {"body", "alpha beta"}}),
-            storedValues(*stored, 0));
-  EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{
-                {"body", "beta"}}),
-            storedValues(*stored, 1));
-  EXPECT_TRUE(storedValues(*stored, 2).empty());
-}
-
-void addMergeSource(IndexWriter& writer, int32_t source,
-                    size_t tagBytes = 0) {
-  Inverter& inverter = writer.obtainInverter();
-  inverter.startDoc();
-  inverter.getIndexHandler("body").index(inverter,
-                                           std::string_view("keep common"));
-  inverter.getIndexHandler("score").index(inverter, (int64_t) source);
-  std::string tag;
-  if (tagBytes != 0) {
-    tag = patternedBytes(tagBytes, (char) ('a' + source));
-    inverter.getIndexHandler("tag").index(inverter, std::string_view(tag));
-  }
-  inverter.finishDoc();
-  inverter.startDoc();
-  inverter.getIndexHandler("body").index(inverter,
-                                           std::string_view("gone common"));
-  inverter.getIndexHandler("score").index(inverter,
-                                            (int64_t) source + 100);
-  inverter.finishDoc();
-  inverter.deleteDoc(1);
-  writer.releaseInverter(inverter, true);
-  writer.commit();
-}
-
-void verifyCollapsedMerge(Directory& directory, size_t tagBytes = 0) {
-  auto schema = compoundSchema();
-  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(directory));
-  IndexWriter writer(writerSnapshots, schema);
-  writer.mergePolicy->setMergeFactor(1000);
-  for (int32_t source = 0; source < 3; source++) {
-    addMergeSource(writer, source, tagBytes);
-  }
-
-  auto sources = writer.snapshots.readers.getReader();
-  ASSERT_EQ(3u, sources->segments().size());
-  for (Segment& segment : sources->segments()) {
-    EXPECT_EQ(1u, baseSegmentFiles(directory, segment.segInfo.seg_id).size());
-    EXPECT_EQ(1, segment.numDeletes());
-  }
-
-  writer.mergeSegments();
-  writer.commit();
-  auto merged = writer.snapshots.readers.getReader();
-  ASSERT_EQ(1u, merged->segments().size());
-  Segment& segment = merged->segments()[0];
-  EXPECT_EQ(3, segment.maxDoc());
-  EXPECT_EQ(1u, baseSegmentFiles(directory, segment.segInfo.seg_id).size());
-
-  PostingsReader& postings = segment.postingsReader();
-  SegFieldInfo bodyInfo = fieldInfo(postings, "body");
-  MemPool pool;
-  TermsEnum terms(pool, postings, bodyInfo);
-  ASSERT_TRUE(terms.seek("keep"));
-  DocsPosEnum docs(terms);
-  EXPECT_EQ(0, docs.nextDoc());
-  EXPECT_EQ(1, docs.nextDoc());
-  EXPECT_EQ(2, docs.nextDoc());
-  EXPECT_EQ(DocsEnumMeta::END, docs.nextDoc());
-  EXPECT_FALSE(terms.seek("gone"));
-
-  IntColReader scores(postings, fieldInfo(postings, "score"));
-  IntColReader::Iterator scoreIter(scores);
-  for (int32_t doc = 0; doc < 3; doc++) {
-    ASSERT_EQ(doc, scoreIter.next());
-    EXPECT_EQ(doc, scoreIter.value());
-  }
-
-  if (tagBytes != 0) {
-    StrColReader tags(postings, fieldInfo(postings, "tag"));
-    StrColReader::Iterator tagIter(tags);
-    for (int32_t doc = 0; doc < 3; doc++) {
-      ASSERT_EQ(doc, tagIter.next());
-      std::string_view value = tagIter.value();
-      ASSERT_EQ(tagBytes, value.size());
-      EXPECT_EQ((char) ('a' + doc), value.front());
-    }
-  }
-
-  auto* storedField = postings.fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
-
-  auto stored = storedField ? std::make_unique<StoredFieldsReader>(postings, *storedField) : nullptr;
-  ASSERT_NE(nullptr, stored);
-  for (int32_t doc = 0; doc < 3; doc++) {
-    EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{
-                  {"body", "keep common"}}),
-              storedValues(*stored, doc));
-  }
-}
-
-void initializeRawField(PostingsWriter::IndexFieldInfo& info,
-                        seg_location location, int64_t bytes) {
-  info.type = FieldType::BIN;
-  info.flags = FieldType::COLUMN_STORED;
-  info.docsWithField = 1;
-  info.numValues = 1;
-  info.columnLoc = location;
-  info.columnMetaOff = bytes;
-}
 
 } // namespace
 
-TEST(CompoundFileTest, TinyFlushCollapsesOnRAMDirectory) {
-  RAMDir directory;
-  verifyTinySegment(directory);
-}
-
-TEST(CompoundFileTest, TinyFlushCollapsesOnFSDirectory) {
-  TempDirectory temp;
-  FSDirectory directory(temp.path());
-  verifyTinySegment(directory);
-}
-
-TEST(CompoundFileTest, MultiMiBFlushCollapsesOnFSDirectory) {
-  TempDirectory temp;
-  FSDirectory directory(temp.path());
-  verifyTinySegment(directory, 2ULL << 20);
-}
-
-TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
-  constexpr uint32_t VALUE_COUNT = 33;
-  RAMDir directory;
-  PostingsWriter writer(directory, 17, 1, 1);
+TEST_F(CompoundFileTest, SmallAndEmptyCheckoutsUseFileZero) {
+  FSDirectory dir(path);
+  PostingsWriter writer(dir, 1, 1, 1);
   auto streams = writer.getOutputStreams<3>();
-  ASSERT_EQ(0, streams[0]->streamNumber);
-  ASSERT_EQ(1, streams[1]->streamNumber);
-  ASSERT_EQ(2, streams[2]->streamNumber);
+  streams[0]->writeBytes("first");
+  streams[1]->writeBytes("second");
+  EXPECT_TRUE(std::filesystem::is_empty(path));
 
-  std::array<uint32_t, VALUE_COUNT> values;
-  for (uint32_t i = 0; i < VALUE_COUNT; i++) values[i] = i * i + 3;
-  uint32_t keyBytes = svbKeyBytes(VALUE_COUNT);
-  std::vector<uint8_t> encoded(keyBytes + VALUE_COUNT * sizeof(uint32_t));
-  uint8_t* encodedEnd = svb_encode_scalar_d1_init(
-      values.data(), encoded.data(), encoded.data() + keyBytes, VALUE_COUNT, 0);
-  encoded.resize((size_t) (encodedEnd - encoded.data()));
+  auto first = writer.finishStream(std::move(streams[0]));
+  auto empty = writer.finishStream(std::move(streams[2]));
+  auto second = writer.finishStream(std::move(streams[1]));
+  EXPECT_EQ(5u, first.bytes);
+  EXPECT_EQ(0u, empty.bytes);
+  EXPECT_EQ(empty, empty.subSlice(0, 0));
+  EXPECT_THROW(empty.subSlice(0, 1), std::out_of_range);
+  EXPECT_EQ(6u, second.bytes);
+  EXPECT_FALSE(empty.location.isNull());
+  EXPECT_EQ(empty.location, second.location);
+  EXPECT_LT(first.end().offset(), second.location.offset());
 
-  auto& moved = writer.addField(SpaceOrdinal::ROOT, "moved");
-  moved.type = FieldType::BIN;
-  moved.flags = FieldType::COLUMN_STORED;
-  moved.docsWithField = 1;
-  moved.numValues = 1;
-  moved.columnLoc = streams[1]->slocation();
-  moved.columnMetaOff = (int64_t) encoded.size();
-  streams[1]->write(encoded.data(), encoded.size());
-
-  auto& survivor = writer.addField(SpaceOrdinal::ROOT, "survivor");
-  survivor.type = FieldType::BIN;
-  survivor.flags = FieldType::COLUMN_STORED;
-  survivor.docsWithField = 1;
-  survivor.numValues = 1;
-  survivor.columnLoc = streams[2]->slocation();
-  survivor.columnMetaOff = 1;
-  streams[2]->write((char) 0x5a);
-  streams[2]->flush();
-
-  for (auto& stream : streams) stream.reset();
-  std::vector<FileDescriptor> descriptors;
-  luxir::test::writeUnversionedRuns(writer);
-  writer.finish(nullptr, &descriptors);
-  ASSERT_EQ(2u, descriptors.size());
-  for (const auto& descriptor : descriptors) {
-    auto file = directory.openFile(descriptor.name);
-    ASSERT_NE(nullptr, file);
-    auto bytes = file->read();
-    EXPECT_EQ(descriptor.size, bytes.size());
-    EXPECT_EQ(descriptor.xxh3, XXH3_64bits(bytes.data(), bytes.size()));
+  std::vector<std::string> files;
+  test::writeUnversionedRuns(writer);
+  ASSERT_TRUE(writer.finish(&files));
+  ASSERT_EQ(1u, files.size());
+  SegmentCore core(dir, 1, 1);
+  for (const auto& slice : {first, empty, second}) {
+    auto location = slice.location;
+    EXPECT_EQ(0u, location.filenum());
+    EXPECT_EQ(0u, location.offset() % MAX_ALIGN);
   }
+  EXPECT_EQ("first", std::string_view(core.getInputStreamSeek(first.location).ptr(), 5));
+  EXPECT_EQ("second", std::string_view(core.getInputStreamSeek(empty.location).ptr(), 6));
+}
 
-  std::string seg = Postings::segmentKey(17, 1);
-  std::vector<Directory::FileInfo> files;
-  directory.listFiles(files);
+TEST_F(CompoundFileTest, ReservationCrossingCapacitySpills) {
+  FSDirectory dir(path);
+  IndexRamBudget budget;
+  auto staged = budget.forceAcquire(0);
+  PostingsWriter writer(dir, 1, 1, 1);
+  writer.setStagedRamAccounting([&](int64_t delta) { staged.adjustSize(delta); });
+  auto out = writer.getOutputStream();
+  std::string payload(PostingsWriter::RAM_SPILL_BYTES - 1, 'x');
+  out->writeBytes(payload);
+  EXPECT_TRUE(std::filesystem::is_empty(path));
+  EXPECT_EQ((int64_t)PostingsWriter::RAM_SPILL_BYTES, budget.reservedBytes());
+
+  auto* target = out->getFile();
+  EXPECT_GE(out->reserve(2), 2u);
+  EXPECT_EQ(target, out->getFile());
+  EXPECT_EQ(payload.size(), out.pos());
+  EXPECT_EQ(0, budget.reservedBytes());
+  auto spillName = Postings::getIndexFileName(Postings::segmentKey(1, 1), 1);
+  EXPECT_TRUE(std::filesystem::exists(std::filesystem::path(path) / (spillName + ".tmp")));
+  out->unsafeWrite("yz", 2);
+  auto spill = writer.finishStream(std::move(out));
+
+  auto smallOut = writer.getOutputStream();
+  smallOut->writeBytes("small");
+  auto small = writer.finishStream(std::move(smallOut));
+  EXPECT_EQ(payload.size() + 2, spill.bytes);
+  EXPECT_EQ(5u, small.bytes);
+  EXPECT_EQ(1u, spill.location.filenum());
+  EXPECT_EQ(0u, small.location.filenum());
+
+  std::vector<std::string> files;
+  test::writeUnversionedRuns(writer);
+  ASSERT_TRUE(writer.finish(&files));
   ASSERT_EQ(2u, files.size());
-  EXPECT_EQ(nullptr, directory.openFile(Postings::getIndexFileName(seg, 1)).get());
-  EXPECT_NE(nullptr, directory.openFile(Postings::getIndexFileName(seg, 2)).get());
-
-  SegmentCore readerCore(directory, 17, 1);
-  auto& reader = readerCore.rootReader();
-  SegFieldInfo movedInfo = fieldInfo(reader, "moved");
-  SegFieldInfo survivorInfo = fieldInfo(reader, "survivor");
-  EXPECT_EQ(0u, movedInfo.columnLoc.filenum());
-  EXPECT_EQ(2u, survivorInfo.columnLoc.filenum());
-  EXPECT_EQ((uint64_t) 0, movedInfo.columnLoc.offset() % 8);
-
-  InputStream movedInput = reader.core().getInputStreamSeek(movedInfo.columnLoc);
-  ASSERT_GE(movedInput.left(),
-            (int64_t) encoded.size() + (int64_t) SVB_OVERREAD_PAD);
-  std::array<uint32_t, VALUE_COUNT> decoded;
-  uint8_t* keys = (uint8_t*) movedInput.ptr();
-  svb_decode_avx_d1_init(decoded.data(), keys, keys + keyBytes,
-                         VALUE_COUNT, 0);
-  EXPECT_EQ(values, decoded);
-
-  InputStream survivorInput = reader.core().getInputStreamSeek(survivorInfo.columnLoc);
-  EXPECT_EQ((char) 0x5a, survivorInput.readByte());
-  EXPECT_EQ((uint64_t) files[0].size + files[1].size, reader.core().sizeInBytes());
+  SegmentCore core(dir, 1, 1);
+  auto input = core.getInputStreamSeek(spill.location);
+  EXPECT_EQ(payload, std::string_view(input.ptr(), payload.size()));
+  input.skip(payload.size());
+  EXPECT_EQ('y', input.readByte());
+  EXPECT_EQ('z', input.readByte());
+  EXPECT_EQ(SVB_OVERREAD_PAD, input.left());
 }
 
-TEST(CompoundFileTest, HeaderOnlyUnreferencedStreamIsDropped) {
-  // Two writers producing the same one-field segment, except the second also
-  // reserves streams it never writes past their headers.  Dropped header-only
-  // files must leave file 0 byte-identical, not appended as 8-byte stubs.
-  auto build = [](Directory& directory, uint64_t segId, int32_t extraStreams) {
-    PostingsWriter writer(directory, segId, 1, 1);
-    auto used = writer.getOutputStream();
-    if (extraStreams != 0) {
-      auto unused = writer.getOutputStreams<2>();
-      for (auto& stream : unused) stream.reset();
-    }
-    auto& field = writer.addField(SpaceOrdinal::ROOT, "f");
-    field.type = FieldType::BIN;
-    field.flags = FieldType::COLUMN_STORED;
-    field.docsWithField = 1;
-    field.numValues = 1;
-    field.columnLoc = used->slocation();
-    field.columnMetaOff = 1;
-    used->write((char) 0x7f);
-    used.reset();
-    luxir::test::writeUnversionedRuns(writer);
-    writer.finish();
-  };
+TEST_F(CompoundFileTest, FinishedSpillsAreReusedAtLimit) {
+  FSDirectory dir(path);
+  PostingsWriter writer(dir, 1, 1, 1, 1);
+  std::string payload(PostingsWriter::RAM_SPILL_BYTES + 1, 'x');
+  auto firstOut = writer.getOutputStream();
+  firstOut->writeBytes(payload);
+  auto first = writer.finishStream(std::move(firstOut));
 
-  RAMDir plain;
-  RAMDir withExtras;
-  build(plain, 21, 0);
-  build(withExtras, 22, 2);
+  auto secondOut = writer.getOutputStream();
+  payload.front() = 'y';
+  secondOut->writeBytes(payload);
+  auto second = writer.finishStream(std::move(secondOut));
+  EXPECT_EQ(payload.size(), first.bytes);
+  EXPECT_EQ(payload.size(), second.bytes);
+  EXPECT_EQ(1u, first.location.filenum());
+  EXPECT_EQ(first.location.filenum(), second.location.filenum());
+  EXPECT_GE(second.location.offset(), first.end().offset());
+  EXPECT_EQ(0u, second.location.offset() % MAX_ALIGN);
 
-  std::vector<Directory::FileInfo> plainFiles;
-  std::vector<Directory::FileInfo> extraFiles;
-  plain.listFiles(plainFiles);
-  withExtras.listFiles(extraFiles);
-  ASSERT_EQ(1u, plainFiles.size());
-  ASSERT_EQ(1u, extraFiles.size());
-  EXPECT_EQ(plainFiles[0].size, extraFiles[0].size)
-      << "dropped header-only streams must not grow file 0";
-
-  SegmentCore readerCore(withExtras, 22, 1);
-  auto& reader = readerCore.rootReader();
-  SegFieldInfo info = fieldInfo(reader, "f");
-  InputStream in = reader.core().getInputStreamSeek(info.columnLoc);
-  EXPECT_EQ((char) 0x7f, in.readByte());
+  std::vector<std::string> files;
+  test::writeUnversionedRuns(writer);
+  ASSERT_TRUE(writer.finish(&files));
+  EXPECT_EQ(2u, files.size());
+  SegmentCore core(dir, 1, 1);
+  EXPECT_EQ('x', core.getInputStreamSeek(first.location).readByte());
+  EXPECT_EQ(payload, std::string_view(core.getInputStreamSeek(second.location).ptr(), payload.size()));
 }
 
-TEST(CompoundFileTest, MergeReadsCollapsedSourcesWithDeletes) {
-  RAMDir directory;
-  verifyCollapsedMerge(directory);
-}
-
-TEST(CompoundFileTest, MergeReadsMultiBufferCollapsedSourcesOnFSDirectory) {
-  TempDirectory temp;
-  FSDirectory directory(temp.path());
-  verifyCollapsedMerge(directory, 64ULL << 10);
-}
-
-TEST(CompoundFileTest, SpillDisqualifiesRelocationAndKeepsStableName) {
-  TempDirectory temp;
-  FSDirectory directory(temp.path());
-  IndexRamBudget budget;
-  PostingsWriter writer(directory, 18, 1, 1, &budget, true);
+TEST_F(CompoundFileTest, BusySpillsExtendLimitAndShortestFinishedFileIsReused) {
+  FSDirectory dir(path);
+  PostingsWriter writer(dir, 1, 1, 1, 1);
   auto streams = writer.getOutputStreams<2>();
-  std::string payload = patternedBytes(PostingsWriter::RAM_SPILL_BYTES + 4096);
-  auto& field = writer.addField(SpaceOrdinal::ROOT, "spill");
-  initializeRawField(field, streams[1]->slocation(), (int64_t) payload.size());
-  streams[1]->write(payload.data(), payload.size());
-  EXPECT_FALSE(streams[1]->isRelocatable());
-  EXPECT_LT(budget.reservedBytes(), (int64_t) PostingsWriter::RAM_SPILL_BYTES);
+  std::string payload(PostingsWriter::RAM_SPILL_BYTES + 1, 'x');
+  streams[0]->writeBytes(payload);
+  streams[0]->writeBytes(payload);
+  streams[1]->writeBytes(payload);
 
-  for (auto& stream : streams) stream.reset();
-  std::vector<std::string> filenames;
-  luxir::test::writeUnversionedRuns(writer);
-  writer.finish(&filenames);
-  directory.sync(filenames);
-  EXPECT_EQ(0, budget.reservedBytes());
-
-  ASSERT_EQ(2u, baseSegmentFiles(directory, 18).size());
-  std::string seg = Postings::segmentKey(18, 1);
-  EXPECT_NE(nullptr, directory.openFile(
-                         Postings::getIndexFileName(seg, 1), true).get());
-  SegmentCore readerCore(directory, 18, 1);
-  auto& reader = readerCore.rootReader();
-  SegFieldInfo info = fieldInfo(reader, "spill");
-  EXPECT_EQ(1u, info.columnLoc.filenum());
-  InputStream input = reader.core().getInputStreamSeek(info.columnLoc);
-  ASSERT_GE(input.left(), (int64_t) payload.size());
-  EXPECT_EQ(0, std::memcmp(input.ptr(), payload.data(), payload.size()));
+  EXPECT_EQ(1u, writer.finishStream(std::move(streams[0])).location.filenum());
+  EXPECT_EQ(2u, writer.finishStream(std::move(streams[1])).location.filenum());
+  auto third = writer.getOutputStream();
+  third->writeBytes(payload);
+  EXPECT_EQ(2u, writer.finishStream(std::move(third)).location.filenum());
+  std::vector<std::string> files;
+  test::writeUnversionedRuns(writer);
+  ASSERT_TRUE(writer.finish(&files));
+  EXPECT_EQ(3u, files.size());
 }
 
-TEST(CompoundFileTest, ProtectedRamFileMaterializesAsSurvivor) {
-  TempDirectory temp;
-  FSDirectory directory(temp.path());
+TEST_F(CompoundFileTest, StagedBudgetReleasedOnFinishAndAbandon) {
+  FSDirectory dir(path);
   IndexRamBudget budget;
-  PostingsWriter writer(directory, 19, 1, 1, &budget, true);
-  auto streams = writer.getOutputStreams<2>();
-  std::string payload = patternedBytes(64ULL << 10);
-  auto& field = writer.addField(SpaceOrdinal::ROOT, "protected");
-  initializeRawField(field, streams[1]->slocation(), (int64_t) payload.size());
-  streams[1]->write(payload.data(), payload.size());
-  ASSERT_TRUE(streams[1]->isRelocatable());
-  std::array<uint32_t, 1> protectedFiles = {1};
-  writer.protectOutputFiles(protectedFiles);
-
-  for (auto& stream : streams) stream.reset();
-  std::vector<std::string> filenames;
-  luxir::test::writeUnversionedRuns(writer);
-  writer.finish(&filenames);
-  directory.sync(filenames);
+  auto staged = budget.forceAcquire(0);
+  PostingsWriter writer(dir, 1, 1, 1);
+  writer.setStagedRamAccounting([&](int64_t delta) { staged.adjustSize(delta); });
+  {
+    auto abandoned = writer.getOutputStream();
+    abandoned->writeBytes("discard");
+    EXPECT_GT(budget.reservedBytes(), 0);
+  }
   EXPECT_EQ(0, budget.reservedBytes());
-  ASSERT_EQ(2u, baseSegmentFiles(directory, 19).size());
+  EXPECT_TRUE(std::filesystem::is_empty(path));
 
-  SegmentCore readerCore(directory, 19, 1);
-  auto& reader = readerCore.rootReader();
-  SegFieldInfo info = fieldInfo(reader, "protected");
-  EXPECT_EQ(1u, info.columnLoc.filenum());
-  InputStream input = reader.core().getInputStreamSeek(info.columnLoc);
-  ASSERT_GE(input.left(), (int64_t) payload.size());
-  EXPECT_EQ(0, std::memcmp(input.ptr(), payload.data(), payload.size()));
+  auto kept = writer.getOutputStream();
+  kept->writeBytes("keep");
+  EXPECT_GT(budget.reservedBytes(), 0);
+  writer.finishStream(std::move(kept));
+  EXPECT_EQ(0, budget.reservedBytes());
+  test::writeUnversionedRuns(writer);
+  EXPECT_TRUE(writer.finish());
 }
 
-TEST(CompoundFileTest, DelegatingFlushAndMergeChargeBudget) {
-  TempDirectory temp;
-  FSDirectory directory(temp.path());
+TEST_F(CompoundFileTest, AbandoningSpillLeavesSegmentUnfinishable) {
+  FSDirectory dir(path);
+  PostingsWriter writer(dir, 1, 1, 1);
+  auto spillName = Postings::getIndexFileName(Postings::segmentKey(1, 1), 1);
+  auto tmp = std::filesystem::path(path) / (spillName + ".tmp");
+  uint64_t flushedSize;
+  {
+    auto out = writer.getOutputStream();
+    out->writeBytes(std::string(PostingsWriter::RAM_SPILL_BYTES + 1, 'x'));
+    ASSERT_GT(out->buffered(), 0u);
+    flushedSize = std::filesystem::file_size(tmp);
+  }
+  EXPECT_EQ(flushedSize, std::filesystem::file_size(tmp));
+  test::writeUnversionedRuns(writer);
+  EXPECT_THROW(writer.finish(), std::logic_error);
+}
+
+TEST_F(CompoundFileTest, InverterStagingCountsTowardFlushAndDraining) {
+  FSDirectory dir(path);
+  IndexRamBudget budget(PostingsWriter::RAM_SPILL_BYTES - 1);
+  Inverter inverter(dir, 1, 1, std::make_shared<Schema>(), &budget);
+  inverter.ramGuard.forceResize((int64_t)inverter.memSize());
+  auto& writer = inverter.getPostingsWriter();
+  size_t cap = inverter.memSize() + PostingsWriter::RAM_SPILL_BYTES - 1;
+  EXPECT_FALSE(inverter.shouldFlush(cap, SIZE_MAX));
+  auto out = writer.getOutputStream();
+  out->writeBytes(std::string(PostingsWriter::RAM_SPILL_BYTES - 1, 'x'));
+  EXPECT_TRUE(inverter.shouldFlush(cap, SIZE_MAX));
+  ASSERT_TRUE(budget.pressureNeeded());
+  EXPECT_EQ(inverter.ramGuard.size(), budget.reservedBytes());
+
+  ASSERT_TRUE(inverter.ramGuard.tryMarkDrainingForPressure());
+  EXPECT_FALSE(budget.pressureNeeded());
+  EXPECT_EQ(budget.reservedBytes(), budget.drainingBytesCount());
+  int64_t reserved = budget.reservedBytes();
+  writer.finishStream(std::move(out));
+  EXPECT_EQ(reserved - (int64_t)PostingsWriter::RAM_SPILL_BYTES, budget.reservedBytes());
+  EXPECT_EQ(budget.reservedBytes(), budget.drainingBytesCount());
+}
+
+TEST_F(CompoundFileTest, FailedSegmentFileCreationAbortsAndCleansUp) {
+  auto dir = std::make_shared<FSDirectory>(path);
+  CheckedDirectory checked(dir, CheckedDirMode::THROW);
+  auto schema = std::make_shared<Schema>();
+  schema->fieldTypeMap["tag"] = std::make_shared<StrFieldType>("tag", FieldType::COLUMN_STORED);
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(checked));
   IndexRamBudget budget;
-  auto schema = compoundSchema();
-  std::atomic<int32_t> phase = 0;
-  std::atomic<int64_t> flushReserved = 0;
-  std::atomic<int64_t> mergeReserved = 0;
-  Signal::listen("postingsBeforeCollapse", [&](void*, void*, void*) -> void* {
-    int64_t reserved = budget.reservedBytes();
-    if (phase.load(std::memory_order_relaxed) == 0) {
-      flushReserved.store(reserved, std::memory_order_relaxed);
-    } else if (phase.load(std::memory_order_relaxed) == 1) {
-      mergeReserved.store(reserved, std::memory_order_relaxed);
+  IndexWriter writer(snapshots, schema, &budget);
+  for (uint32_t failedFile : {0u, 2u}) {
+    auto& inverter = writer.obtainInverter();
+    auto& postings = inverter.getPostingsWriter();
+    auto postingsSegId = postings.segId;
+    auto epoch = postings.creatorEpoch;
+    auto key = Postings::segmentKey(postingsSegId, epoch);
+    auto spillName = Postings::getIndexFileName(key, 1);
+    auto failedName = Postings::getIndexFileName(key, failedFile);
+    std::string payload(PostingsWriter::RAM_SPILL_BYTES + 1, 'x');
+    auto first = postings.getOutputStream();
+    first->writeBytes(payload);
+    ASSERT_EQ(1u, postings.finishStream(std::move(first)).location.filenum());
+    ASSERT_TRUE(std::filesystem::exists(std::filesystem::path(path) / (spillName + ".tmp")));
+    inverter.startDoc();
+    inverter.getIndexHandler("tag").index(inverter, std::string_view(payload));
+    inverter.finishDoc();
+    writer.releaseInverter(inverter);
+
+    Signal::listen("checkedCreateFile", [&](void* source, void* name, void*) -> void* {
+      return source == &checked && *(std::string_view*)name == failedName ? source : nullptr;
+    });
+    auto fault = scope_guard([] { Signal::unlisten("checkedCreateFile"); });
+    ExpectLog quiet("Failed to create segment file");
+    try {
+      writer.commit();
+      ADD_FAILURE() << "Expected FileIOException for " << failedName;
+    } catch (const FileIOException& error) {
+      EXPECT_NE(std::string_view::npos, std::string_view(error.what()).find(failedName));
     }
-    return nullptr;
-  });
-  auto signalCleanup = luxir::scope_guard([]() {
-    Signal::unlisten("postingsBeforeCollapse");
-  });
-
-  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(directory));
-
-  IndexWriter writer(writerSnapshots, schema, &budget);
-  writer.mergePolicy->setMergeFactor(1000);
-  Inverter& first = writer.obtainInverter();
-  first.startDoc();
-  first.getIndexHandler("body").index(first, std::string_view("first common"));
-  std::string firstTag = patternedBytes(256ULL << 10);
-  first.getIndexHandler("tag").index(first, std::string_view(firstTag));
-  first.finishDoc();
-  int64_t inverterBytes = (int64_t) first.memSize();
-  writer.releaseInverter(first, true);
-  writer.commit();
-  EXPECT_GT(flushReserved.load(std::memory_order_relaxed), inverterBytes);
-  EXPECT_EQ(0, budget.reservedBytes());
-
-  phase.store(-1, std::memory_order_relaxed);
-  Inverter& second = writer.obtainInverter();
-  second.startDoc();
-  second.getIndexHandler("body").index(second, std::string_view("second common"));
-  std::string secondTag = patternedBytes(256ULL << 10, 'b');
-  second.getIndexHandler("tag").index(second, std::string_view(secondTag));
-  second.finishDoc();
-  writer.releaseInverter(second, true);
-  writer.commit();
-  EXPECT_EQ(0, budget.reservedBytes());
-
-  phase.store(1, std::memory_order_relaxed);
-  writer.mergeSegments();
-  writer.commit();
-  EXPECT_GT(mergeReserved.load(std::memory_order_relaxed), 0);
-  EXPECT_EQ(0, budget.reservedBytes());
+    writer.updateGraph->wait_for_all();
+    EXPECT_EQ(0, budget.reservedBytes());
+    for (const auto& entry : std::filesystem::directory_iterator(path)) {
+      EXPECT_FALSE(entry.path().filename().string().starts_with(Postings::getIndexFileNamePrefix(postingsSegId, epoch)));
+    }
+  }
 }
 
-TEST(CompoundFileTest, PartitionRowsMaterializeDelegatingFiles) {
-  TempDirectory temp;
-  FSDirectory directory(temp.path());
-  auto schema = compoundSchema();
-  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(directory));
-  IndexWriter writer(writerSnapshots, schema);
-  writer.mergePolicy->setMergeFactor(1000);
-  writer.termPartitionMinBytes = 1;
-  writer.termPartitionMinRangeBytes = 1;
-  writer.termPartitionMaxRanges = 4;
+TEST_F(CompoundFileTest, MergeWithDeletesOmitsDensePresenceBitmap) {
+  auto schema = std::make_shared<Schema>();
+  schema->fieldTypeMap["score"] = std::make_shared<IntFieldType>("score", FieldType::COLUMN_STORED);
+  RAMDir sources, output;
+  IndexRamBudget budget;
+  StoredDictionaryRegistry dictionaries;
+  // An eager bitmap writer would emit a complete bucket before discovering all rows are present.
+  constexpr int32_t numDocs = screaming::BitSet::BUCKET_SIZE + 1;
+  constexpr int32_t missing = numDocs / 2;
+  auto words = screaming::FixedBitSet::allocate(numDocs + 1, true);
+  screaming::FixedBitSet(words.get(), numDocs + 1).clear(missing);
+  LiveDocs liveDocs(std::move(words), numDocs + 1, numDocs);
+  std::array<size_t, 2> sizes;
 
-  std::string body;
-  for (int32_t term = 0; term < 1600; term++) {
-    body += wideTerm(term);
-    body.push_back(' ');
-  }
-  for (int32_t source = 0; source < 4; source++) {
-    Inverter& inverter = writer.obtainInverter();
-    inverter.startDoc();
-    inverter.getIndexHandler("body").index(inverter, std::string_view(body));
-    inverter.finishDoc();
-    inverter.startDoc();
-    inverter.getIndexHandler("body").index(inverter, std::string_view(body));
-    inverter.finishDoc();
-    writer.releaseInverter(inverter, true);
-    writer.commit();
-  }
+  for (bool sparse : {false, true}) {
+    uint64_t segment = sparse ? 2 : 1;
+    Inverter inverter(sources, segment, 1, schema);
+    auto& score = inverter.getIndexHandler("score");
+    for (int32_t doc = 0; doc <= numDocs; doc++) {
+      if (doc == missing && !sparse) continue;
+      inverter.startDoc();
+      if (doc != missing) score.index(inverter, (int64_t)doc);
+      inverter.finishDoc();
+    }
+    ASSERT_TRUE(inverter.flush());
+    std::array cores{std::make_shared<SegmentCore>(sources, segment, 1)};
+    LiveDocs* live[] = {sparse ? &liveDocs : nullptr};
+    const auto* source = cores[0]->rootReader().fieldInfo("score");
+    ASSERT_NE(nullptr, source);
+    EXPECT_EQ(sparse, source->docsBitmap().has_value());
 
-  writer.mergeSegments();
+    PostingsWriter writer(output, segment, 1);
+    SegmentMerger merger(cores, live, writer, budget, INT64_MAX, 1, 4, *schema, dictionaries);
+    merger.merge();
+    std::vector<FileDescriptor> files;
+    ASSERT_TRUE(writer.finish(nullptr, &files));
+    ASSERT_EQ(1u, files.size());
+    sizes[sparse] = files.front().size;
+    SegmentCore merged(output, segment, 1);
+    const auto* field = merged.rootReader().fieldInfo("score");
+    ASSERT_NE(nullptr, field);
+    EXPECT_EQ(numDocs, field->docsWithField);
+    EXPECT_FALSE(field->docsBitmap());
+  }
+  EXPECT_EQ(sizes[0], sizes[1]);
+}
+
+TEST_F(CompoundFileTest, ReopensWithSpilledColumnAndSmallFields) {
+  FSDirectory dir(path);
+  auto schema = std::make_shared<Schema>();
+  schema->fieldTypeMap["tag"] = std::make_shared<StrFieldType>("tag", FieldType::COLUMN_STORED);
+  schema->fieldTypeMap["score"] = std::make_shared<IntFieldType>("score", FieldType::COLUMN_STORED);
+  schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
+      "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
+  IndexWriter writer(snapshots, schema);
+
+  auto& inverter = writer.obtainInverter();
+  auto segId = inverter.getSegId();
+  auto epoch = inverter.getPostingsWriter().creatorEpoch;
+  std::string payload(PostingsWriter::RAM_SPILL_BYTES + 1, 'x');
+  inverter.startDoc();
+  inverter.getIndexHandler("tag").index(inverter, std::string_view(payload));
+  inverter.getIndexHandler("score").index(inverter, (int64_t)17);
+  inverter.getIndexHandler("body").index(inverter, std::string_view("alpha beta"));
+  inverter.finishDoc();
+  writer.releaseInverter(inverter, true);
   writer.commit();
-  test::expectValidInventory(directory, *test::readDurableIndexInfo(directory));
-  auto reader = writer.snapshots.readers.getReader();
-  ASSERT_EQ(1u, reader->segments().size());
-  PostingsReader& postings = reader->segments()[0].postingsReader();
-  SegFieldInfo info = fieldInfo(postings, "body");
-  ASSERT_FALSE(info.rangeTableLoc.isNull());
-  InputStream table = postings.core().getInputStreamSeek(info.rangeTableLoc);
-  const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
-  const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
-  ASSERT_GT(header->nRanges, 1u);
-  for (uint32_t i = 0; i < header->nRanges; i++) {
-    EXPECT_NE(nullptr, postings.core().getFile(rows[i].termsBase.filenum()));
-    EXPECT_NE(nullptr, postings.core().getFile(rows[i].docsBase.filenum()));
-    EXPECT_NE(nullptr, postings.core().getFile(rows[i].posBase.filenum()));
-  }
+
+  SegmentCore core(dir, segId, epoch);
+  auto& postings = core.rootReader();
+  const auto* tag = postings.fieldInfo("tag");
+  const auto* score = postings.fieldInfo("score");
+  const auto* body = postings.fieldInfo("body");
+  ASSERT_TRUE(tag && score && body);
+  EXPECT_EQ(1u, tag->bytesColumn()->values.location.filenum());
+  EXPECT_EQ(0u, score->numberColumn()->location.filenum());
+  EXPECT_EQ(0u, body->terms()->location.filenum());
+
+  StrColReader tags(postings, *tag);
+  StrColReader::Iterator tagIter(tags);
+  ASSERT_EQ(0, tagIter.next());
+  EXPECT_TRUE(tagIter.value() == payload);
+
+  IntColReader scores(postings, *score);
+  IntColReader::Iterator scoreIter(scores);
+  ASSERT_EQ(0, scoreIter.next());
+  EXPECT_EQ(17, scoreIter.value());
 
   MemPool pool;
-  TermsEnum terms(pool, postings, info);
-  ASSERT_TRUE(terms.seek(wideTerm(800)));
+  TermsEnum terms(pool, postings, *body);
+  ASSERT_TRUE(terms.seek("beta"));
   DocsPosEnum docs(terms);
-  for (int32_t doc = 0; doc < 8; doc++) EXPECT_EQ(doc, docs.nextDoc());
-  EXPECT_EQ(DocsEnumMeta::END, docs.nextDoc());
+  ASSERT_EQ(0, docs.nextDoc());
+  EXPECT_EQ(1, docs.termFreq());
 }

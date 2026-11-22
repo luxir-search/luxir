@@ -3,15 +3,32 @@
 
 #pragma once
 
+#include <climits>
 #include <cstdint>
 
 namespace luxir {
 
+template <class T>
+constexpr T ceilDiv(T value, T divisor) noexcept {
+  return value / divisor + (value % divisor != 0);
+}
+
+// Alignment is a power of two; callers bound the input before rounding.
+constexpr uint64_t alignUp(uint64_t offset, uint64_t alignment) noexcept {
+  return (offset + alignment - 1) & ~(alignment - 1);
+}
+
+constexpr int VARINT_PAYLOAD_BITS = CHAR_BIT - 1;
+constexpr uint8_t VARINT_CONTINUATION = 1u << VARINT_PAYLOAD_BITS;
+constexpr uint8_t VARINT_PAYLOAD_MASK = VARINT_CONTINUATION - 1;
+constexpr int MAX_VINT_SIZE = ceilDiv((int)sizeof(uint32_t) * CHAR_BIT, VARINT_PAYLOAD_BITS);
+constexpr int MAX_VLONG_SIZE = ceilDiv((int)sizeof(uint64_t) * CHAR_BIT, VARINT_PAYLOAD_BITS);
+
 // Write a vint to a raw buffer. Returns pointer past the last byte written.
 inline char* writeVInt(char* p, uint32_t val) {
-  while (val > 0x7f) {
-    *p++ = (char)(val | 0x80);
-    val >>= 7;
+  while (val > VARINT_PAYLOAD_MASK) {
+    *p++ = (char)(val | VARINT_CONTINUATION);
+    val >>= VARINT_PAYLOAD_BITS;
   }
   *p++ = (char)val;
   return p;
@@ -19,9 +36,9 @@ inline char* writeVInt(char* p, uint32_t val) {
 
 // Write a vlong to a raw buffer. Returns pointer past the last byte written.
 inline char* writeVLong(char* p, uint64_t val) {
-  while (val > 0x7f) {
-    *p++ = (char)(val | 0x80);
-    val >>= 7;
+  while (val > VARINT_PAYLOAD_MASK) {
+    *p++ = (char)(val | VARINT_CONTINUATION);
+    val >>= VARINT_PAYLOAD_BITS;
   }
   *p++ = (char)val;
   return p;
@@ -30,10 +47,10 @@ inline char* writeVLong(char* p, uint64_t val) {
 // Read a vint from a raw buffer. Advances p past the last byte read.
 inline uint32_t readVInt(const char*& p) {
   char b = *p++;
-  uint32_t val = b & 0x7f;
-  for (int shift = 7; (b & 0x80) != 0; shift += 7) {
+  uint32_t val = b & VARINT_PAYLOAD_MASK;
+  for (int shift = VARINT_PAYLOAD_BITS; (b & VARINT_CONTINUATION) != 0; shift += VARINT_PAYLOAD_BITS) {
     b = *p++;
-    val |= (uint32_t)(b & 0x7f) << shift;
+    val |= (uint32_t)(b & VARINT_PAYLOAD_MASK) << shift;
   }
   return val;
 }
@@ -41,10 +58,10 @@ inline uint32_t readVInt(const char*& p) {
 // Read a vlong from a raw buffer. Advances p past the last byte read.
 inline uint64_t readVLong(const char*& p) {
   char b = *p++;
-  uint64_t val = b & 0x7f;
-  for (int shift = 7; (b & 0x80) != 0; shift += 7) {
+  uint64_t val = b & VARINT_PAYLOAD_MASK;
+  for (int shift = VARINT_PAYLOAD_BITS; (b & VARINT_CONTINUATION) != 0; shift += VARINT_PAYLOAD_BITS) {
     b = *p++;
-    val |= (uint64_t)(b & 0x7f) << shift;
+    val |= (uint64_t)(b & VARINT_PAYLOAD_MASK) << shift;
   }
   return val;
 }
@@ -69,11 +86,5 @@ inline char* writeZLong(char* p, int64_t val) {
 inline int64_t readZLong(const char*& p) {
   return zigzagDecode(readVLong(p));
 }
-
-// Max bytes needed to encode a uint32_t as a vint.
-constexpr int MAX_VINT_SIZE = 5;
-
-// Max bytes needed to encode a uint64_t as a vlong.
-constexpr int MAX_VLONG_SIZE = 10;
 
 } // namespace luxir

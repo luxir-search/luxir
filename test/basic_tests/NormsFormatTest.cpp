@@ -29,7 +29,7 @@ struct ScoreHit {
   int32_t length;
 };
 
-SegFieldInfo readFieldInfo(TestIndex& testIndex, std::string_view field) {
+const DecodedFieldRecord& readFieldInfo(TestIndex& testIndex, std::string_view field) {
   auto& seg = testIndex.reader->segments()[0];
   auto* fieldReader = seg.postingsReader().fieldInfo(field);
   EXPECT_TRUE((fieldReader != nullptr));
@@ -37,7 +37,7 @@ SegFieldInfo readFieldInfo(TestIndex& testIndex, std::string_view field) {
   return fieldInfo;
 }
 
-void assertNormDocs(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo,
+void assertNormDocs(PostingsReader& postingsReader, const DecodedFieldRecord& fieldInfo,
                     std::span<const NormDoc> expected) {
   NormsReader reader(postingsReader, fieldInfo);
   NormsReader::Iterator iter(reader);
@@ -65,7 +65,7 @@ void assertTermScores(TestIndex& testIndex, std::string_view field, std::string_
   Similarity::FieldStats fieldStats;
   fieldStats.sumTotalTermFreq = termsEnum.sumTotalTermFreq();
   fieldStats.sumDocFreq = termsEnum.sumDocFreq();
-  fieldStats.docsWithField = termsEnum.docsWithField();
+  fieldStats.docsWithField = fieldInfo.docsWithField;
   fieldStats.maxDoc = seg.maxDoc();
 
   Similarity::TermStats termStats;
@@ -109,19 +109,21 @@ TEST_F(NormsFormatTest, denseFieldUsesFlatNoBitset) {
   testIndex.flush();
   testIndex.initReader();
 
-  SegFieldInfo info = readFieldInfo(testIndex, "body_w");
+  const auto& info = readFieldInfo(testIndex, "body_w");
   auto& postingsReader = testIndex.reader->segments()[0].postingsReader();
   ASSERT_EQ(4, postingsReader.maxDoc());
   EXPECT_EQ(4, info.docsWithField);
-  EXPECT_EQ(SegFieldInfo::NORMS_FLAT, info.normsFormat);
-  EXPECT_EQ(4, info.normsLen);
-  EXPECT_EQ(0u, info.docsWithFieldEndLoc.offset());
-  EXPECT_EQ(0u, info.columnLoc.offset());
-  EXPECT_EQ(0, info.columnMetaOff);
+  ASSERT_TRUE(info.norms());
+  EXPECT_EQ(field_parts::NormsMode::FLAT, info.norms()->mode);
+  EXPECT_EQ(4, info.normsValues(postingsReader.maxDoc()).bytes);
+  EXPECT_FALSE(info.docsBitmap());
+  auto raw = postingsReader.core().getInputStreamSeek(info.norms()->location);
+  const uint8_t expected[] = {2, 3, 2, 1};
+  for (uint8_t norm : expected) EXPECT_EQ(norm, (uint8_t)raw.readByte());
 
   NormsReader reader(postingsReader, info);
   EXPECT_TRUE(reader.isFlat());
-  EXPECT_FALSE(reader.docsReader().hasBitset());
+  EXPECT_TRUE(reader.docsReader().allRows());
   const std::vector<NormDoc> norms = {{0, 2}, {1, 3}, {2, 2}, {3, 1}};
   assertNormDocs(postingsReader, info, norms);
 
@@ -141,17 +143,18 @@ TEST_F(NormsFormatTest, partialFlatStoresPresenceButReadsByDoc) {
   testIndex.flush();
   testIndex.initReader();
 
-  SegFieldInfo info = readFieldInfo(testIndex, "body_w");
+  const auto& info = readFieldInfo(testIndex, "body_w");
   auto& postingsReader = testIndex.reader->segments()[0].postingsReader();
   ASSERT_EQ(10, postingsReader.maxDoc());
   EXPECT_EQ(5, info.docsWithField);
-  EXPECT_EQ(SegFieldInfo::NORMS_FLAT, info.normsFormat);
-  EXPECT_EQ(10, info.normsLen);
-  EXPECT_NE(0u, info.docsWithFieldEndLoc.offset());
+  ASSERT_TRUE(info.norms());
+  EXPECT_EQ(field_parts::NormsMode::FLAT, info.norms()->mode);
+  EXPECT_EQ(10, info.normsValues(postingsReader.maxDoc()).bytes);
+  EXPECT_TRUE(info.docsBitmap());
 
   NormsReader reader(postingsReader, info);
   EXPECT_TRUE(reader.isFlat());
-  EXPECT_TRUE(reader.docsReader().hasBitset());
+  EXPECT_NE(nullptr, reader.docsReader().bitset());
   EXPECT_EQ(0, (int)reader.value(1));
   const std::vector<NormDoc> norms = {{0, 1}, {2, 3}, {4, 2}, {6, 4}, {9, 2}};
   assertNormDocs(postingsReader, info, norms);
@@ -171,17 +174,18 @@ TEST_F(NormsFormatTest, sparseFieldUsesBitsetRankOrdinal) {
   testIndex.flush();
   testIndex.initReader();
 
-  SegFieldInfo info = readFieldInfo(testIndex, "body_w");
+  const auto& info = readFieldInfo(testIndex, "body_w");
   auto& postingsReader = testIndex.reader->segments()[0].postingsReader();
   ASSERT_EQ(10, postingsReader.maxDoc());
   EXPECT_EQ(4, info.docsWithField);
-  EXPECT_EQ(SegFieldInfo::NORMS_SPARSE, info.normsFormat);
-  EXPECT_EQ(4, info.normsLen);
-  EXPECT_NE(0u, info.docsWithFieldEndLoc.offset());
+  ASSERT_TRUE(info.norms());
+  EXPECT_EQ(field_parts::NormsMode::SPARSE, info.norms()->mode);
+  EXPECT_EQ(4, info.normsValues(postingsReader.maxDoc()).bytes);
+  EXPECT_TRUE(info.docsBitmap());
 
   NormsReader reader(postingsReader, info);
   EXPECT_TRUE(reader.isSparse());
-  EXPECT_TRUE(reader.docsReader().hasBitset());
+  EXPECT_NE(nullptr, reader.docsReader().bitset());
   const std::vector<NormDoc> norms = {{1, 2}, {4, 4}, {7, 1}, {9, 3}};
   assertNormDocs(postingsReader, info, norms);
 
@@ -200,18 +204,19 @@ TEST_F(NormsFormatTest, sparseHighDocidsStayOrdinalSized) {
   testIndex.flush();
   testIndex.initReader();
 
-  SegFieldInfo info = readFieldInfo(testIndex, "body_w");
+  const auto& info = readFieldInfo(testIndex, "body_w");
   auto& postingsReader = testIndex.reader->segments()[0].postingsReader();
   ASSERT_EQ(100000, postingsReader.maxDoc());
   EXPECT_EQ(4, info.docsWithField);
-  EXPECT_EQ(SegFieldInfo::NORMS_SPARSE, info.normsFormat);
-  EXPECT_EQ(4, info.normsLen);
-  EXPECT_LT(info.normsLen * 1000, postingsReader.maxDoc());
-  EXPECT_NE(0u, info.docsWithFieldEndLoc.offset());
+  ASSERT_TRUE(info.norms());
+  EXPECT_EQ(field_parts::NormsMode::SPARSE, info.norms()->mode);
+  EXPECT_EQ(4, info.normsValues(postingsReader.maxDoc()).bytes);
+  EXPECT_LT(info.normsValues(postingsReader.maxDoc()).bytes * 1000, postingsReader.maxDoc());
+  EXPECT_TRUE(info.docsBitmap());
 
   NormsReader reader(postingsReader, info);
   EXPECT_TRUE(reader.isSparse());
-  EXPECT_TRUE(reader.docsReader().hasBitset());
+  EXPECT_NE(nullptr, reader.docsReader().bitset());
   const std::vector<NormDoc> norms = {
       {90000, 2}, {95000, 4}, {99000, 1}, {99999, 3}};
   assertNormDocs(postingsReader, info, norms);
@@ -241,20 +246,22 @@ TEST_F(NormsFormatTest, multiFieldNormsStayIndependent) {
   auto& postingsReader = testIndex.reader->segments()[0].postingsReader();
   ASSERT_EQ(6, postingsReader.maxDoc());
 
-  SegFieldInfo titleInfo = readFieldInfo(testIndex, "title_w");
+  const auto& titleInfo = readFieldInfo(testIndex, "title_w");
   EXPECT_EQ(6, titleInfo.docsWithField);
-  EXPECT_EQ(SegFieldInfo::NORMS_FLAT, titleInfo.normsFormat);
-  EXPECT_EQ(6, titleInfo.normsLen);
-  EXPECT_EQ(0u, titleInfo.docsWithFieldEndLoc.offset());
+  ASSERT_TRUE(titleInfo.norms());
+  EXPECT_EQ(field_parts::NormsMode::FLAT, titleInfo.norms()->mode);
+  EXPECT_EQ(6, titleInfo.normsValues(postingsReader.maxDoc()).bytes);
+  EXPECT_FALSE(titleInfo.docsBitmap());
   const std::vector<NormDoc> titleNorms = {
       {0, 2}, {1, 2}, {2, 2}, {3, 3}, {4, 2}, {5, 2}};
   assertNormDocs(postingsReader, titleInfo, titleNorms);
 
-  SegFieldInfo bodyInfo = readFieldInfo(testIndex, "body_w");
+  const auto& bodyInfo = readFieldInfo(testIndex, "body_w");
   EXPECT_EQ(2, bodyInfo.docsWithField);
-  EXPECT_EQ(SegFieldInfo::NORMS_SPARSE, bodyInfo.normsFormat);
-  EXPECT_EQ(2, bodyInfo.normsLen);
-  EXPECT_NE(0u, bodyInfo.docsWithFieldEndLoc.offset());
+  ASSERT_TRUE(bodyInfo.norms());
+  EXPECT_EQ(field_parts::NormsMode::SPARSE, bodyInfo.norms()->mode);
+  EXPECT_EQ(2, bodyInfo.normsValues(postingsReader.maxDoc()).bytes);
+  EXPECT_TRUE(bodyInfo.docsBitmap());
   const std::vector<NormDoc> bodyNorms = {{0, 3}, {5, 2}};
   assertNormDocs(postingsReader, bodyInfo, bodyNorms);
 

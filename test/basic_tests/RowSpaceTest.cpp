@@ -25,6 +25,7 @@
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/store/FSDirectory.h"
 #include "luxir/util/Uuid.h"
+#include "test/FieldRecordTest.h"
 
 namespace luxir::test {
 namespace {
@@ -95,7 +96,8 @@ TEST_F(RowSpaceTest, childNumericColumnPreservesSparseRowsAndRepeatedValues) {
   auto* number = child.fieldInfo("items.number");
   ASSERT_NE(nullptr, number);
   EXPECT_EQ(3, number->docsWithField);
-  IntColReader roots(core->rootReader(), *core->rootReader().fieldInfo("number"));
+  const auto& columnInfo = *core->rootReader().fieldInfo("number");
+  IntColReader roots(core->rootReader(), columnInfo);
   IntColReader::SparseIterator rootValues(roots);
   EXPECT_EQ(0, rootValues.advance(0)); EXPECT_EQ(101, rootValues.value());
   IntColReader ints(child, *number);
@@ -116,7 +118,7 @@ TEST_F(RowSpaceTest, childTermsAndPostingsUseTheirOwnFieldCatalog) {
   EXPECT_EQ(0, docs.nextDoc()); EXPECT_EQ(2, docs.termFreq());
   EXPECT_EQ(2, docs.nextDoc()); EXPECT_EQ(1, docs.termFreq());
   EXPECT_EQ(PostingsReader::END, docs.nextDoc());
-  EXPECT_EQ(5, child.fieldInfo("items.body")->sumTotalTermFreq);
+  EXPECT_EQ(5, child.fieldInfo("items.body")->indexedTotals().sumTotalTermFreq);
   TermsEnum rootTerms(pool, core->rootReader(), *core->rootReader().fieldInfo("body"));
   EXPECT_FALSE(rootTerms.seek("shared"));
 }
@@ -349,19 +351,38 @@ TEST_F(RowSpaceTest, pathLookupBindsFieldsAndImmediateOwnership) {
   auto earlier = writer.addSpace("a");
   writer.finishSpace(earlier, 3, Fixture::shape(writer, std::vector<int64_t>{1, 1, 3}));
   Fixture::fields(writer, earlier, "a", ROOTS);
+  for (auto [space, count, value] : {std::tuple{earlier, 3, 7}, {items, 4, 9}}) {
+    auto out = writer.getOutputStream();
+    IntColWriter values(*out);
+    for (int32_t row = 0; row < count; ++row) values.addInt64(value);
+    auto& field = writer.addField(space, "same_name");
+    field.header.type = FieldType::INT;
+    field.header.flags = FieldType::COLUMN_STORED;
+    auto written = values.finish(writer, std::move(out));
+    field.setColumn(WrittenColumn{written.column, written.numValues, {count, {}}, {}, {},
+                     !written.bounds.empty() ? field_parts::Bounds(written.bounds) : field_parts::Bounds()});
+  }
   writeUnversionedRuns(writer);
   ASSERT_TRUE(writer.finish());
   SegmentCore core(dir, 1, 1);
   std::vector<std::string> paths;
-  for (const auto& space : core.spaces()) paths.push_back(space.path);
+  for (const auto& space : core.spaces()) paths.emplace_back(space.path);
   EXPECT_EQ((std::vector<std::string>{"", "a", "z", "z.parts"}), paths);
   for (const auto& [path, expected] : std::vector<std::pair<std::string_view, int64_t>>{{"a", 101}, {"z", 11}}) {
     auto* reader = core.spaceReader(path);
     ASSERT_NE(nullptr, reader);
     EXPECT_EQ(reader, core.spaceReader(reader->spaceOrdinal()));
-    IntColReader column(*reader, *reader->fieldInfo(std::string(path) + ".number"));
+    const auto& columnInfo = *reader->fieldInfo(std::string(path) + ".number");
+    IntColReader column(*reader, columnInfo);
     IntColReader::SparseIterator values(column);
     EXPECT_EQ(0, values.advance(0)); EXPECT_EQ(expected, values.value());
+  }
+  EXPECT_EQ(nullptr, core.rootReader().fieldInfo("same_name"));
+  for (auto [path, count, value] : {std::tuple{"a", 3, 7}, {"z", 4, 9}}) {
+    const auto* field = core.spaceReader(path)->fieldInfo("same_name");
+    ASSERT_NE(nullptr, field);
+    EXPECT_EQ(count, field->docsWithField);
+    EXPECT_EQ(value, field->scalarBounds()->min);
   }
   EXPECT_EQ(4, core.ownership("z.parts")->parentCount());
   EXPECT_EQ(2, core.ownership("z.parts")->owner(1));
@@ -383,18 +404,14 @@ TEST_F(RowSpaceTest, invalidOwnershipEndpointsFailOpen) {
 
 TEST_F(RowSpaceTest, ownershipStreamsStayInTheSharedFileInventory) {
   PostingsWriter writer(dir, 1, 1, 3);
-  auto footer = writer.getOutputStream();
   auto shape = Fixture::shape(writer, ENDS, OWNERS);
-  footer.reset();
-  uint32_t pinned = shape.ends.filenum();
-  writer.protectOutputFiles(std::span(&pinned, 1));
   writer.finishSpace(writer.addSpace(Fixture::CHILD), 4, shape);
   writeUnversionedRuns(writer);
   std::vector<FileDescriptor> files;
   ASSERT_TRUE(writer.finish(nullptr, &files));
-  EXPECT_GT(files.size(), 1u);
+  ASSERT_EQ(1u, files.size());
   SegmentCore core(dir, 1, 1);
-  EXPECT_EQ(pinned, core.spaces()[1].ownership->ends.filenum());
+  EXPECT_EQ(shape.ends, core.spaces()[1].ownership.ends);
   EXPECT_EQ((std::pair<int32_t, int32_t>{2, 4}), core.ownership(Fixture::CHILD)->range(2));
   EXPECT_EQ(2, core.ownership(Fixture::CHILD)->owner(3));
   uint64_t bytes = 0;
@@ -509,12 +526,15 @@ TEST_F(RowSpaceTest, physicalHandlersFlushAgainstTheirBoundSpace) {
   auto& child = *core.spaceReader("items_nested");
   EXPECT_EQ(6, core.rootReader().maxDoc());
   EXPECT_EQ(3, child.maxDoc());
+  auto files = segmentFileSizes(dir, 1, 1);
   for (auto name : {"number_i", "many_is", "body_w", "label_s", "raw_sc", "embedding_v"}) {
     auto qualified = Schema::qualify("items_nested", name);
     EXPECT_EQ(nullptr, core.rootReader().fieldInfo(qualified));
     ASSERT_NE(nullptr, child.fieldInfo(qualified));
+    EncodedFieldRecord(*child.fieldInfo(qualified), child.maxDoc()).check(child.maxDoc(), files, true);
   }
-  IntColReader column(child, *child.fieldInfo("items_nested.number_i"));
+  const auto& number = *child.fieldInfo("items_nested.number_i");
+  IntColReader column(child, number);
   IntColReader::SparseIterator values(column);
   EXPECT_EQ(0, values.advance(0)); EXPECT_EQ(10, values.value());
   EXPECT_EQ(2, values.advance(1)); EXPECT_EQ(12, values.value());
@@ -523,12 +543,15 @@ TEST_F(RowSpaceTest, physicalHandlersFlushAgainstTheirBoundSpace) {
   EXPECT_EQ(3, body.docsWithField);
   NormsReader norms(child, body);
   EXPECT_TRUE(norms.isFlat());
-  EXPECT_EQ(3, norms.numBytes());
+  ASSERT_TRUE(body.norms());
+  EXPECT_EQ(3, body.normsValues(child.maxDoc()).bytes);
   EXPECT_EQ(2, norms.value(2));
-  OrdColReader ords(child, *child.fieldInfo("items_nested.label_s"));
+  const auto& label = *child.fieldInfo("items_nested.label_s");
+  OrdColReader ords(child, label);
   EXPECT_TRUE(ords.docIdIndexed());
   EXPECT_NE(0, ords.ordAt(2));
-  VectorReader vector(child, *child.fieldInfo("items_nested.embedding_v"));
+  const auto& embedding = *child.fieldInfo("items_nested.embedding_v");
+  VectorReader vector(child, embedding);
   EXPECT_EQ(2, vector.dims());
 }
 
@@ -576,7 +599,7 @@ protected:
     schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>("body", FieldType::INDEX_DOCS_FREQS, "whitespace");
     schema->fieldTypeMap["label"] = std::make_shared<StrFieldType>("label", FieldType::INDEX_DOCS | FieldType::COLUMN_STORED);
     schema->fieldTypeMap["embedding"] = std::make_shared<VectorFieldType>("embedding", 1,
-        FieldType::COLUMN_STORED | FieldType::FIXED_SIZE, VectorFieldType::METRIC_L2);
+        FieldType::COLUMN_STORED, VectorFieldType::METRIC_L2);
     schema->fieldTypeMap["payload"] = std::make_shared<TextFieldType>("payload", FieldType::STORED, "whitespace");
     for (auto name : {"number", "body", "label", "embedding", "payload"}) {
       schema->fieldTypeMap.emplace(Schema::qualify(Fixture::CHILD, name), schema->fieldTypeMap.at(name));
@@ -622,29 +645,28 @@ protected:
           writer.finishSpace(child, (int32_t)CHILDREN.size(), Fixture::shape(writer, ends));
           Fixture::fields(writer, child, Fixture::CHILD, CHILDREN, std::vector<uint8_t>{2, 2, 1});
           auto& vectors = writer.addField(child, "items.embedding");
-          vectors.type = FieldType::VECTOR;
-          vectors.flags = FieldType::COLUMN_STORED | FieldType::FIXED_SIZE;
-          vectors.numValues = 4;
-          vectors.mono2MetaOff = sizeof(float);
+          vectors.header.type = FieldType::VECTOR;
+          vectors.header.flags = FieldType::COLUMN_STORED;
           {
             auto output = writer.getOutputStream();
-            vectors.columnLoc = output->slocation();
             const float values[]{0, 1, 10, 11};
             output->write(values, sizeof(values));
-            vectors.columnMetaOff = sizeof(values);
+            auto slice = writer.finishStream(std::move(output));
+            vectors.setColumn(WrittenColumn{field_parts::BytesColumn{slice, {}}, 4, {4, {}}, {}, {}, {}});
           }
-          Fixture::presence(writer, vectors, std::vector<int32_t>{0, 1, 2, 3}, 4);
           writer.finishSpace(writer.addSpace("items.deep"), 4, Fixture::shape(writer, std::vector<int64_t>{1, 2, 3, 4}));
         }
         VersionRunBuilder versions;
         for (uint32_t row = 0; row < roots.size(); row++) versions.add(row, 100 + (uint64_t)i * 10 + row);
         writer.writeVersionRuns(versions);
         ASSERT_TRUE(writer.finish(nullptr, &files));
+        segment.catalog = catalogRangeToManifest(writer.catalogRange());
       } else {
         auto& old = previous[(size_t)i];
         for (const auto& file : old.files) {
           files.push_back({std::string(file.name), file.size, file.xxh3});
         }
+        segment.catalog = old.catalog;
         segment.live_gen = old.live_gen;
         segment.live_epoch = old.live_epoch;
         segment.live_docs = old.live_docs;
@@ -860,6 +882,7 @@ TEST_F(ScopedRowSpaceTest, openingViewsUsesCountsWithoutScanningChildRows) {
   std::copy(previous.begin(), previous.end(), segments);
   auto& segment = segments[3];
   segment.seg_id = 4;
+  segment.catalog = catalogRangeToManifest(writer.catalogRange());
   segment.creator_epoch = 1;
   segment.schema = *manifest.schema;
   segment.max_doc = segment.live_docs = 1;

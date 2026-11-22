@@ -31,7 +31,7 @@ void usimdunpack(const __m128i* __restrict__ in, uint32_t* __restrict__ out, uin
 namespace luxir {
 
 // The strictest alignment any on-disk structure requires for in-place mmap
-// access (u64 block-offset and range tables, LinearPack words, BKD/points and
+// access (u64 block-offset tables, LinearPack words, BKD/points and
 // ord-map payloads).  Segment-file collapse relocates whole streams by
 // appending them at a MAX_ALIGN-ed base, which preserves every internal
 // alignment up to this value; writers align in-place structures with it so a

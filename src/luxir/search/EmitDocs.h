@@ -238,7 +238,7 @@ inline uint8_t* allocStringColumn(luxir::api::Column& fieldCol, size_t columnSiz
 // No-op if the field isn't in the segment.  Extracted so the stored-fields
 // path can fall back here when a segment predates the STORED flag.
 template <typename Output>
-inline void loadStrColForSegment(SearchRequest& req, IndexReader& reader, const SegFieldInfo* info, FieldType& fieldType,
+inline void loadStrColForSegment(SearchRequest& req, IndexReader& reader, const DecodedFieldRecord* info, FieldType& fieldType,
                                  std::span<RowIndex> idxSpan, std::span<const segdoc> segDocs,
                                  std::span<std::string_view> starget, std::span<luxir::api::ArrStr> mtarget,
                                  uint8_t* present, std::pmr::memory_resource& mr, const Output& output)
@@ -247,56 +247,55 @@ inline void loadStrColForSegment(SearchRequest& req, IndexReader& reader, const 
   auto segNum = sortedSegDocs[0].segment();
   auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
-  info = SegFieldInfo::column(info);
   if (!info) return;
+  const auto* ord = info->ordColumn();
+  const auto* bytes = info->bytesColumn();
+  if (!ord && !bytes) return;
   auto& postingsReader = reader.segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  const auto& segFieldInfo = *info;
-
-  bool isIndexedString = (segFieldInfo.flags & FieldType::INDEX_DOCS) != 0;
 
   if (!fieldType.multiValued()) {
-    if (isIndexedString) {
-      TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+    if (ord) {
+      TermsEnum tenum(poolGuard.pool(), postingsReader, *info);
       auto valHandler = [&](size_t idx, int32_t doc, int32_t val) {
         assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
         tenum.seekOrd((int32_t) val - 1);
         starget[idxSpan[idx]] = outputTerm((std::string_view)tenum.term(), mr, output);
         if (present) present[idxSpan[idx]] = 1;
       };
-      OrdColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+      OrdColReader::getSingleValues(postingsReader, *info, sortedDocs, valHandler);
     } else {
       auto valHandler = [&](size_t idx, int32_t doc, std::string_view val) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
         starget[idxSpan[idx]] = outputTerm(val, mr, output);
         if (present) present[idxSpan[idx]] = 1;
       };
-      StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+      StrColReader::getValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
     }
   } else {
-    if (isIndexedString) {
-      TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-      auto valHandler = [&](size_t idx, int32_t doc, int32_t val, int64_t valIdx, int64_t numVals) {
+    if (ord) {
+      TermsEnum tenum(poolGuard.pool(), postingsReader, *info);
+      auto valHandler = [&](size_t idx, int32_t doc, int32_t val, int64_t valIdx, int64_t numValues) {
         assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
         luxir::api::ArrStr& target = mtarget[idxSpan[idx]];
-        if (valIdx == 0) build::allocArray(target.v, numVals, mr);
+        if (valIdx == 0) build::allocArray(target.v, numValues, mr);
         tenum.seekOrd((int32_t) val - 1);
         const_cast<std::string_view*>(target.v.data())[valIdx] = outputTerm((std::string_view)tenum.term(), mr, output);
       };
-      OrdColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+      OrdColReader::getValues(postingsReader, *info, sortedDocs, valHandler);
     } else {
-      auto valHandler = [&](size_t idx, int32_t doc, std::string_view val, int64_t valIdx, int64_t numVals) {
+      auto valHandler = [&](size_t idx, int32_t doc, std::string_view val, int64_t valIdx, int64_t numValues) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
         luxir::api::ArrStr& target = mtarget[idxSpan[idx]];
-        if (valIdx == 0) build::allocArray(target.v, numVals, mr);
+        if (valIdx == 0) build::allocArray(target.v, numValues, mr);
         const_cast<std::string_view*>(target.v.data())[valIdx] = outputTerm(val, mr, output);
       };
-      StrColReader::getMultiValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+      StrColReader::getMultiValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
     }
   }
 }
 
-inline void loadStrColForSegment(SearchRequest& req, IndexReader& reader, const SegFieldInfo* info, FieldType& fieldType,
+inline void loadStrColForSegment(SearchRequest& req, IndexReader& reader, const DecodedFieldRecord* info, FieldType& fieldType,
     std::span<RowIndex> idxSpan, std::span<const segdoc> segDocs,
     std::span<std::string_view> starget, std::span<api::ArrStr> mtarget,
     uint8_t* present, std::pmr::memory_resource& mr, uint64_t flags) {
@@ -447,10 +446,10 @@ inline void loadNumCol(SearchRequest& req, IndexReader& reader, IndexReader::Fie
     auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
     auto* info = infos.at(segNum);
-    if (!info) return;
+    const auto* number = info ? info->numberColumn() : nullptr;
+    if (!number) return;
     auto& postingsReader = reader.segments()[segNum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();
-    const auto& segFieldInfo = *info;
 
     if (!fieldType.multiValued()) {
       auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
@@ -462,9 +461,9 @@ inline void loadNumCol(SearchRequest& req, IndexReader& reader, IndexReader::Fie
           present[idxSpan[idx]] = 1;
         }
       };
-      IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+      IntColReader::getSingleValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
     } else {
-      auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
+      auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numValues) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
         typename Emit::arr_type& target = [&]() -> typename Emit::arr_type& {
           if constexpr (std::is_same_v<typename Emit::value_type, api::Val>) {
@@ -472,13 +471,13 @@ inline void loadNumCol(SearchRequest& req, IndexReader& reader, IndexReader::Fie
           } else return mtarget[idxSpan[idx]];
         }();
         if (valIdx == 0) {
-          build::allocArray(target.v, numVals, mr);
+          build::allocArray(target.v, numValues, mr);
         }
         auto& value = const_cast<typename Emit::value_type*>(target.v.data())[valIdx];
         if constexpr (std::is_same_v<typename Emit::value_type, api::Val>) value.kind = decode(val);
         else value = decode(val);
       };
-      IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+      IntColReader::getValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
     }
   });
 }
@@ -503,7 +502,8 @@ inline void loadRangeVals(SearchRequest& req, IndexReader& reader, IndexReader::
       auto segNum = sortedSegDocs[0].segment();
       auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
       auto* info = infos.at(segNum);
-      if (!info) return;
+      const auto* number = info ? info->numberColumn() : nullptr;
+      if (!number) return;
 
       auto& postingsReader = reader.segments()[segNum].postingsReader();
       auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -515,9 +515,9 @@ inline void loadRangeVals(SearchRequest& req, IndexReader& reader, IndexReader::
         renderValue(*bound, output);
       };
       int64_t min = 0;
-      auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
+      auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numValues) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
-        unused(doc, numVals);
+        unused(doc, numValues);
         if (valIdx == 0) {
           min = val;
         } else if (valIdx == 1) {
@@ -553,17 +553,18 @@ inline void loadGeoCol(SearchRequest& req, IndexReader& reader, IndexReader::Fie
     auto segNum = sortedSegDocs[0].segment();
     auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
     auto* info = infos.at(segNum);
-    if (!info) return;
+    const auto* number = info ? info->numberColumn() : nullptr;
+    if (!number) return;
     auto& postingsReader = reader.segments()[segNum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();
     luxir::api::Val* points = nullptr;
-    auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
+    auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numValues) {
       assert(segDocs[idxSpan[idx]].docId() == doc);
       unused(doc);
       luxir::api::Val* point = &target[idxSpan[idx]];
       if (multi) {
         if (valIdx == 0) {
-          points = build::allocArray(point->kind.emplace<luxir::api::ArrVal>().v, (size_t)numVals, mr);
+          points = build::allocArray(point->kind.emplace<luxir::api::ArrVal>().v, (size_t)numValues, mr);
         }
         point = points + valIdx;
       }
@@ -611,7 +612,7 @@ inline void fillVectorF32(luxir::api::Vector& vec, std::string_view bytes, std::
   std::memcpy(fs, bytes.data(), bytes.size());
 }
 
-inline void loadVectorColForSegmentSingle(SearchRequest& req, IndexReader& reader, const SegFieldInfo* info,
+inline void loadVectorColForSegmentSingle(SearchRequest& req, IndexReader& reader, const DecodedFieldRecord* info,
                                           std::span<RowIndex> idxSpan,
                                           std::span<const segdoc> segDocs,
                                           std::span<luxir::api::Vector> target, std::pmr::memory_resource& mr)
@@ -620,20 +621,20 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, IndexReader& reade
   auto segNum = sortedSegDocs[0].segment();
   auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
-  if (!info) return;
+  const auto* bytes = info ? info->bytesColumn() : nullptr;
+  if (!bytes) return;
   auto& postingsReader = reader.segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  const auto& segFieldInfo = *info;
 
   auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes) {
     assert(segDocs[idxSpan[idx]].docId() == doc);
     unused(doc);
     fillVectorF32(target[idxSpan[idx]], bytes, mr);
   };
-  StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+  StrColReader::getValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
 }
 
-inline void loadVectorColForSegmentMulti(SearchRequest& req, IndexReader& reader, const SegFieldInfo* info,
+inline void loadVectorColForSegmentMulti(SearchRequest& req, IndexReader& reader, const DecodedFieldRecord* info,
                                          std::span<RowIndex> idxSpan,
                                          std::span<const segdoc> segDocs,
                                          std::span<luxir::api::ArrVector> target, std::pmr::memory_resource& mr)
@@ -642,22 +643,22 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, IndexReader& reader
   auto segNum = sortedSegDocs[0].segment();
   auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
-  if (!info) return;
+  const auto* bytes = info ? info->bytesColumn() : nullptr;
+  if (!bytes) return;
   auto& postingsReader = reader.segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  const auto& segFieldInfo = *info;
 
-  // Multi-valued vectors: each doc's ArrVector holds numVals Vectors. numVals
+  // Multi-valued vectors: each doc's ArrVector holds numValues Vectors. numValues
   // is known at valIdx==0, so the inner Vector span is allocArray'd then filled
   // by index (recovered via the span's data() across valHandler calls).
-  auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes, int64_t valIdx, int64_t numVals) {
+  auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes, int64_t valIdx, int64_t numValues) {
     assert(segDocs[idxSpan[idx]].docId() == doc);
     unused(doc);
     luxir::api::ArrVector& outer = target[idxSpan[idx]];
-    if (valIdx == 0) build::allocArray(outer.v, numVals, mr);
+    if (valIdx == 0) build::allocArray(outer.v, numValues, mr);
     fillVectorF32(const_cast<luxir::api::Vector*>(outer.v.data())[valIdx], bytes, mr);
   };
-  StrColReader::getMultiValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+  StrColReader::getMultiValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
 }
 
 // Decode a VECTOR column's bytes back to floats in the response.
@@ -726,7 +727,7 @@ inline void loadStoredFields(SearchRequest& req, IndexReader& reader, IndexReade
   addFieldLoader(loaders, runs, [&req, &reader, infos, reqs = std::move(reqsOwned), segDocs, &mr, flags](std::span<RowIndex> idxSpan) {
     auto segNum = segDocs[idxSpan[0]].segment();
     auto* info = infos.at(segNum);
-    auto sfr = info ? std::make_unique<StoredFieldsReader>(reader.segments()[segNum].postingsReader(), *info)
+    auto sfr = info && info->stored() ? std::make_unique<StoredFieldsReader>(reader.segments()[segNum].postingsReader(), *info)
                     : nullptr;
 
     // Partition reqs: sfrReqs serve from SFR, colReqs fall back to

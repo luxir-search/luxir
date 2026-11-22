@@ -16,7 +16,7 @@
 // 16-byte SIMD load, which may read up to SVB_OVERREAD_PAD bytes past the encoded
 // data. Store files are exact-sized (RAMDir buffers; FSDirectory mmaps), so
 // PostingsWriter::finish() reserves that trailing slack on every pure-data file.
-// File 0 is covered by the field index and segment-info trailer that always follows
+// File 0 is covered by the segment catalog that always follows
 // its postings.
 extern "C" {
   uint8_t* svb_encode_scalar_d1_init(const uint32_t* in, uint8_t* keyPtr, uint8_t* dataPtr,
@@ -29,7 +29,7 @@ extern "C" {
 
 namespace luxir {
 // Number of control (key) bytes for `count` values: 2 bits each, packed 4 per byte.
-inline uint32_t svbKeyBytes(uint32_t count) { return (count + 3) / 4; }
+inline constexpr uint32_t svbKeyBytes(uint32_t count) { return (count + 3) / 4; }
 
 // Total encoded bytes for one StreamVByte run without decoding its values.
 // Each 2-bit control code stores the data width minus one.  The key stream is

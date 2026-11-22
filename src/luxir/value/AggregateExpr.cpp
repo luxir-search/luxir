@@ -337,10 +337,12 @@ std::vector<BoundAggregateInput> bindAggregateInputs(
     // reads remain numeric-only.
     bool strings = root.type == ValueType::COLUMN_ONLY;
     OrdMap::SegToGlobal ordMapping;
-    if (strings && rootBinding.stringColumn != nullptr && fields[index].ords != nullptr) {
+    auto* stringColumn = rootBinding.stringColumn;
+    const auto* ord = stringColumn ? stringColumn->fieldInfo.ordColumn() : nullptr;
+    if (strings && ord && fields[index].ords != nullptr) {
       assert(root.columnIndexed);
       auto& source = root.source ? root.source->segments()[(size_t)segment.ord] : segment;
-      rootBinding.stringColumn->attachOrds(pool, source.postingsReader());
+      stringColumn->attachOrds(pool, source.postingsReader());
       ordMapping = fields[index].ords->getSegToGlobal(segment.ord);
     }
     bool columnScan = root.kind == ValueNodeKind::COLUMN && !root.source && (!strings || root.columnIndexed);

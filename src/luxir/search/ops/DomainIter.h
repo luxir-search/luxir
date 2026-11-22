@@ -167,16 +167,16 @@ inline int32_t countTermInDomain(const DomainView& view, DocsOnlyEnum& postings,
 // the resolved domain representation answers O(1) probes.
 inline int32_t countMissingInDomain(const DomainView& view,
                                     const DocsReader& docsReader) {
-  if (!docsReader.hasBitset()) {
-    return 0;
-  }
+  if (docsReader.noRows()) return view.card;
+  if (docsReader.allRows()) return 0;
   if (view.domain == nullptr) {
-    return view.card - docsReader.numDocs();
+    return view.card - docsReader.docsWithField();
   }
 
+  const auto& bits = *docsReader.bitset();
   int32_t haveField = 0;
-  if (view.card <= docsReader.numDocs()) {
-    screaming::BitSet::Iterator it(docsReader.bitset());
+  if (view.card <= docsReader.docsWithField()) {
+    screaming::BitSet::Iterator it(bits);
     if (view.arr != nullptr) {
       for (int32_t doc : view.arr->docs()) {
         if (it.val() < doc && it.advance(doc) == screaming::BitSet::END) {
@@ -199,7 +199,7 @@ inline int32_t countMissingInDomain(const DomainView& view,
       }
     }
   } else {
-    screaming::BitSet::Iterator it(docsReader.bitset());
+    screaming::BitSet::Iterator it(bits);
     if (view.bits != nullptr) {
       for (int32_t doc = it.next(); doc != screaming::BitSet::END;
            doc = it.next()) {
@@ -382,7 +382,7 @@ bool forEachIntColZone(DocSet* domain, const IntColReader& col, int32_t maxDoc,
   if ((domain != nullptr || V::needsDocs()) && !col.leafBounded()) return false;
   // A dense column has a value for every doc, so only a null domain (any
   // shape) can see docs without one.
-  if (domain == nullptr) missing_num += maxDoc - col.docsWithValue();
+  if (domain == nullptr) missing_num += maxDoc - col.docsWithField();
 
   using Kind = IntZoneRun::Kind;
   Kind kind = domain == nullptr ? Kind::ALL

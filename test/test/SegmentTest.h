@@ -3,7 +3,8 @@
 
 #pragma once
 #include "luxir/reader/SegmentCore.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/FieldCursor.h"
+#include <set>
 #include <tuple>
 #include "luxir/index/PostingsWriter.h"
 #include "test/TestUtils.h"
@@ -24,6 +25,7 @@ public:
   MemPool::save_point save = pool.getSavePoint();
   std::unique_ptr<PostingsWriter> postingsWriter;
   std::unique_ptr<TextWriter> writer;
+  std::set<int32_t> docsWithField;
   std::string field;
   std::string term;
 
@@ -36,7 +38,7 @@ public:
 
   std::unique_ptr<SegmentCore> core;
   PostingsReader* reader = nullptr;
-  std::unique_ptr<FieldReader> fieldReader;
+  std::unique_ptr<FieldCursor> fieldCursor;
   std::unique_ptr<TermsEnum> tenum;
   std::unique_ptr<DocsPosEnum> docsEnum;
   std::unique_ptr<PosEnum> posEnum;
@@ -82,13 +84,15 @@ public:
     return indexSize;
   }
 
+  static constexpr int32_t MAX_DOC = HARD_MAX_ROW_COUNT - 1;
+
   void initWriter() {
     dir = RAMDir();  // remove all files?
 
     posEnum.reset();
     docsEnum.reset();
     tenum.reset();
-    fieldReader.reset();
+    fieldCursor.reset();
     writer.reset();
     reader = nullptr;
     core.reset();
@@ -98,8 +102,7 @@ public:
     fingerprint = 0;
 
     highestDoc = -1;
-    postingsWriter = std::make_unique<PostingsWriter>(dir, 0, 1, 0x7fffffff);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
-    // writer = std::make_unique<TextWriter>(*postingsWriter);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
+    postingsWriter = std::make_unique<PostingsWriter>(dir, 0, 1, MAX_DOC);
 
     // save the RNG state
     rng_snapshot = r;
@@ -113,7 +116,7 @@ public:
 
     core = std::make_unique<SegmentCore>(dir, 0, 1);
     reader = &core->rootReader();
-    fieldReader = std::make_unique<FieldReader>(*reader);
+    fieldCursor = std::make_unique<FieldCursor>(*reader);
 
     // restore the RNG state
     r = rng_snapshot;
@@ -126,14 +129,12 @@ public:
     // std::cout << "INDEX SIZE tif=" << tindexFile->size() << " tf=" << termFile->size() << " df=" << docFile->size() << " pf=" << posFile->size() << std::endl;
   }
 
-  // make a new terms enum .tenum from the current fieldReader... only call if fieldReader has changed states
-  SegFieldInfo fieldInfo;
+  // make a new terms enum .tenum from the current fieldCursor... only call if fieldCursor has changed states
   void makeTermsEnum() {
-    fieldReader->readFieldInfo(fieldInfo);
-    makeTermsEnum(fieldInfo);
+    makeTermsEnum(*reader->fieldInfo(fieldCursor->ordinal()));
   }
 
-  void makeTermsEnum(const SegFieldInfo& info) {
+  void makeTermsEnum(const DecodedFieldRecord& info) {
     tenum = std::make_unique<TermsEnum>(pool, *reader, info);
   }
 
@@ -144,7 +145,7 @@ public:
 
   uint32_t getDocDelta(int nDocs) {
     // TODO: do a better job at testing boundaries
-    return r.rint(1, (INT_MAX - 1) / nDocs);
+    return r.rint(1, (MAX_DOC - 1) / nDocs);
   }
 
   uint32_t getNumPositions(uint32_t numDocs) {
@@ -214,6 +215,7 @@ public:
       // undefined behavior reading positions past termFreq
     } else {
       writer->endDoc(docid);
+      if (actualPositions > 0) docsWithField.insert(docid);
     }
     numPositions = actualPositions;
   }
@@ -266,13 +268,16 @@ public:
   void addField(bool read, const std::string &fname, uint32_t numTerms, int64_t nDocs=-1, int64_t nPos=-1) {
     std::string term;
 
+    PostingsWriter::IndexFieldInfo* writtenField = nullptr;
     if (read) {
-      ASSERT_TRUE(fieldReader->readNextField());
-      ASSERT_EQ(fname, fieldReader->name());
+      ASSERT_TRUE(fieldCursor->next());
+      ASSERT_EQ(fname, fieldCursor->name());
       makeTermsEnum();
     } else {
       writer = std::make_unique<TextWriter>(*postingsWriter);
-      writer->startField(SpaceOrdinal::ROOT, fname);
+      writtenField = &test::addTextField(*postingsWriter, fname);
+      docsWithField.clear();
+      writer->startField(writtenField->space, *writtenField);
     }
     int realNumTerms = 0;
     for (uint32_t i = 0; i < numTerms; i++) {
@@ -284,7 +289,8 @@ public:
     if (read) {
       ASSERT_EQ(tenum->numTerms(), realNumTerms);
     } else {
-      writer->endField();
+      writtenField->setPostings(writer->endField());
+      test::writeFieldPresence(*postingsWriter, *writtenField, docsWithField);
       writer.reset();
     }
   }
@@ -307,11 +313,9 @@ public:
       int64_t totDocs = 0;
       int64_t totPositions = 0;
       int64_t ret = 0;
-      FieldReader fieldReader(*reader);
-      SegFieldInfo fieldInfo;
-      while (fieldReader.readNextField()) {
-        fieldReader.readFieldInfo(fieldInfo);
-        TermsEnum tenum(pool, *reader, fieldInfo);
+      FieldCursor fieldCursor(*reader);
+      while (fieldCursor.next()) {
+        TermsEnum tenum(pool, *reader, *reader->fieldInfo(fieldCursor.ordinal()));
         while (tenum.nextTerm()) {
           totTerms++;
           BasicDocsEnum<Tier> docsEnum(tenum);

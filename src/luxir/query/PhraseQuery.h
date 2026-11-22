@@ -474,8 +474,8 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         const EstimateMemo& estimate) {
       if (!estimate.nonempty) return nullptr;
-      auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord);
-      assert(segFieldInfo != nullptr);
+      auto* fieldInfo = cachedFieldInfo->segInfos.at(segment.ord);
+      assert(fieldInfo != nullptr);
 
       auto querySlotEnums = targetPool.make_span<DocsPosEnum*>(cachedTermInfos.size());
       auto querySlotPosEnums = targetPool.make_span<PosEnum*>(cachedTermInfos.size());
@@ -540,7 +540,7 @@ public:
 #endif
 
       NormsReader* normsReader = (inputFlags & NEED_SCORES) != 0
-          ? targetPool.make<NormsReader>(segment.postingsReader(), *segFieldInfo)
+          ? targetPool.make<NormsReader>(segment.postingsReader(), *fieldInfo)
           : nullptr;
 
       std::span<ImpactsIndex> impacts;

@@ -35,7 +35,8 @@ TEST_F(InverterMemSizeTest, textTermHashAccounted) {
 
   EXPECT_GT(inv.extraRamBytes, 0u) << "term-hash table not accounted";
   EXPECT_GT(inv.memSize(), inv.pool.size());
-  EXPECT_EQ(inv.pool.size() + inv.extraRamBytes + inv.versionRuns.allocatedBytes(), inv.memSize());
+  auto staged = (size_t)inv.stagedRamBytes.load(std::memory_order_relaxed);
+  EXPECT_EQ(inv.pool.size() + inv.extraRamBytes + inv.versionRuns.allocatedBytes() + staged, inv.memSize());
 }
 
 // IdHandler owns a private idPool (not inverter.pool); indexing many ids must

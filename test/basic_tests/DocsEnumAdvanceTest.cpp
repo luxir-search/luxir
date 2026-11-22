@@ -1,9 +1,11 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <set>
+
 #include "luxir/reader/SegmentCore.h"
 #include "test/TestUtils.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/FieldCursor.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -171,9 +173,9 @@ protected:
     {
       TextWriter writer(postingsWriter);
       auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
-      finfo.type = FieldType::TEXT;
-      finfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
-      writer.startField(&finfo);
+      finfo.header.type = FieldType::TEXT;
+      finfo.header.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
+      writer.startField(finfo.space, finfo);
       writer.setNorms(TextNormsView(norms, nullptr));
 
       TermRef tref(pool, term.data(), (uint32_t) term.size());
@@ -182,7 +184,8 @@ protected:
         writer.addDoc(doc, tfs[(size_t) doc]);
       }
       writer.endTerm(tref);
-      writer.endField();
+      finfo.setPostings(writer.endField());
+      luxir::test::writeFieldPresence(postingsWriter, finfo, std::views::iota(0, (int32_t)tfs.size()));
     }
     luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
@@ -376,9 +379,9 @@ protected:
     {
       TextWriter writer(postingsWriter);
       auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
-      finfo.type = FieldType::TEXT;
-      finfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
-      writer.startField(&finfo);
+      finfo.header.type = FieldType::TEXT;
+      finfo.header.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
+      writer.startField(finfo.space, finfo);
       writer.setNorms(TextNormsView(norms, nullptr));
       for (const CheckpointTermModel& model : models) {
         TermRef term(pool, model.term.data(), (uint32_t) model.term.size());
@@ -392,7 +395,12 @@ protected:
         }
         writer.endTerm(term);
       }
-      writer.endField();
+      finfo.setPostings(writer.endField());
+      std::set<int32_t> docs;
+      for (const auto& model : models) {
+        for (const auto& posting : model.postings) docs.insert(posting.docid);
+      }
+      luxir::test::writeFieldPresence(postingsWriter, finfo, docs);
     }
     luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
@@ -454,9 +462,9 @@ protected:
     {
       TextWriter writer(postingsWriter);
       auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
-      finfo.type = FieldType::TEXT;
-      finfo.flags = FieldType::INDEX_DOCS_FREQS;
-      writer.startField(&finfo);
+      finfo.header.type = FieldType::TEXT;
+      finfo.header.flags = FieldType::INDEX_DOCS_FREQS;
+      writer.startField(finfo.space, finfo);
 
       TermRef tref(pool, term.data(), (uint32_t) term.size());
       writer.startTerm(tref);
@@ -464,7 +472,8 @@ protected:
         writer.addDoc(doc, 1 + (doc % 5));
       }
       writer.endTerm(tref);
-      writer.endField();
+      finfo.setPostings(writer.endField());
+      luxir::test::writeFieldPresence(postingsWriter, finfo, docs);
     }
     luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
@@ -557,9 +566,9 @@ protected:
     {
       TextWriter writer(postingsWriter);
       auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
-      finfo.type = FieldType::TEXT;
-      finfo.flags = flags;
-      writer.startField(&finfo);
+      finfo.header.type = FieldType::TEXT;
+      finfo.header.flags = flags;
+      writer.startField(finfo.space, finfo);
 
       TermRef term(pool, "hot", 3);
       writer.startTerm(term);
@@ -574,17 +583,19 @@ protected:
         writer.addDoc(numDocs + 10 + doc, 31);
       }
       writer.endTerm(nextTerm);
-      writer.endField();
+      finfo.setPostings(writer.endField());
+      auto docs = std::views::iota(0, numDocs + Postings::DOCS_BLOCK_SIZE + 3)
+          | std::views::transform([&](int32_t doc) { return doc < numDocs ? doc : doc + 10; });
+      luxir::test::writeFieldPresence(postingsWriter, finfo, docs);
     }
     luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
 
     SegmentCore readerCore(dir, 0, 1);
     auto& reader = readerCore.rootReader();
-    FieldReader fieldReader(reader);
-    ASSERT_TRUE(fieldReader.readNextField()) << label;
-    SegFieldInfo fieldInfo;
-    fieldReader.readFieldInfo(fieldInfo);
+    FieldCursor fieldCursor(reader);
+    ASSERT_TRUE(fieldCursor.next()) << label;
+    const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
     TermsEnum tenum(pool, reader, fieldInfo);
     ASSERT_TRUE(tenum.seek("hot")) << label;
     DocsOnlyEnum denum(tenum);
@@ -750,9 +761,9 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
   {
     TextWriter writer(postingsWriter);
     auto& finfo = postingsWriter.addField(SpaceOrdinal::ROOT, "f");
-    finfo.type = FieldType::TEXT;
-    finfo.flags = FieldType::INDEX_DOCS;
-    writer.startField(&finfo);
+    finfo.header.type = FieldType::TEXT;
+    finfo.header.flags = FieldType::INDEX_DOCS;
+    writer.startField(finfo.space, finfo);
 
     TermRef hot(pool, "hot", 3);
     writer.startTerm(hot);
@@ -767,17 +778,19 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
       writer.addDoc(N + 10 + doc, 1);
     }
     writer.endTerm(zzz);
-    writer.endField();
+    finfo.setPostings(writer.endField());
+    auto docs = std::views::iota(0, N + Postings::DOCS_BLOCK_SIZE + 7)
+        | std::views::transform([&](int32_t doc) { return doc < N ? doc : doc + 10; });
+    luxir::test::writeFieldPresence(postingsWriter, finfo, docs);
   }
   luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("hot"));
   DocsFreqEnum denum(tenum);
@@ -886,10 +899,9 @@ TEST_F(DocsEnumAdvanceTest, docsTierAdvanceProbesWordBlocksWithoutDecoding) {
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
@@ -924,10 +936,9 @@ TEST_F(DocsEnumAdvanceTest, docsTierNextDocWalksResidentWordBlock) {
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
@@ -962,10 +973,9 @@ TEST_F(DocsEnumAdvanceTest, docsTierBitsetBlockWithZeroPopcountTailByteDoesNotOv
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("tailzero"));
 
@@ -987,10 +997,9 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetUsesResidentWordBlockAndStopsInsideWindow)
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
@@ -1028,10 +1037,9 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetPackedScatterClipsAndCrossesWords) {
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("packedscatter"));
 
@@ -1073,10 +1081,9 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleWordBlockStaysResidentAcrossWindow
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
@@ -1114,10 +1121,9 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetJumpsGapAfterResidentWordBlock) {
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordgap"));
 
@@ -1155,10 +1161,9 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetFirstStraddleWithNoEmitDoesNotConsume) {
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("gapword"));
 
@@ -1204,10 +1209,9 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetPackedStraddleWithNoEmitDoesNotConsume) {
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("packedgap"));
 
@@ -1245,10 +1249,9 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleContiguousBlockReachesBlockBoundar
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("runprobe"));
 
@@ -1282,10 +1285,9 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleKeepsFreqStreamAlignedForFollowing
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("mixedprobe"));
 
@@ -1331,10 +1333,9 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetRandomPartitionsMatchNextDocOracle) {
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("mixedprobe"));
 
@@ -1382,10 +1383,9 @@ TEST_F(DocsEnumAdvanceTest, advanceAndIntoBitSetProbeContiguousRuns) {
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("runprobe"));
 
@@ -1423,10 +1423,9 @@ TEST_F(DocsEnumAdvanceTest, residentDocsBlockPeekAndConsumeMaterializeSpan) {
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordprobe"));
 
@@ -1478,10 +1477,9 @@ TEST_F(DocsEnumAdvanceTest,
     }
   }
 
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum terms(pool, reader, fieldInfo);
   ASSERT_TRUE(terms.seek("mixed"));
   int32_t docFreq = terms.docFreq();
@@ -1517,10 +1515,9 @@ TEST_F(DocsEnumAdvanceTest,
   int32_t maxDoc = reader.maxDoc();
 
   auto materialize = [&](DocSet* domain, bool identity = false) {
-    FieldReader fieldReader(reader);
-    EXPECT_TRUE(fieldReader.readNextField());
-    SegFieldInfo fieldInfo;
-    fieldReader.readFieldInfo(fieldInfo);
+    FieldCursor fieldCursor(reader);
+    EXPECT_TRUE(fieldCursor.next());
+    const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
     TermsEnum terms(pool, reader, fieldInfo);
     EXPECT_TRUE(terms.seek("mixed"));
     int32_t docFreq = terms.docFreq();
@@ -1704,10 +1701,9 @@ TEST_F(DocsEnumAdvanceTest, packedL1GroupFrontierRoundTripShapesAndWidths) {
 
     SegmentCore readerCore(dir, 0, 1);
     auto& reader = readerCore.rootReader();
-    FieldReader fieldReader(reader);
-    ASSERT_TRUE(fieldReader.readNextField());
-    SegFieldInfo fieldInfo;
-    fieldReader.readFieldInfo(fieldInfo);
+    FieldCursor fieldCursor(reader);
+    ASSERT_TRUE(fieldCursor.next());
+    const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
     TermsEnum tenum(pool, reader, fieldInfo);
     ASSERT_TRUE(tenum.seek("hot"));
     DocsOnlyEnum denum(tenum);
@@ -1783,10 +1779,9 @@ TEST_F(DocsEnumAdvanceTest, packedL1SkipToBlockAcrossManyGroups) {
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("hot"));
   DocsFreqEnum denum(tenum);
@@ -1813,10 +1808,9 @@ TEST_F(DocsEnumAdvanceTest, l0CheckpointParityAndPositionTracking) {
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   CheckpointToggleGuard guard;
 
   auto runFreqs = [&](const CheckpointTermModel& model,
@@ -1953,10 +1947,9 @@ TEST_F(DocsEnumAdvanceTest, l0CheckpointEngagementAndKillSwitch) {
 
   SegmentCore readerCore(dir, 0, 1);
   auto& reader = readerCore.rootReader();
-  FieldReader fieldReader(reader);
-  ASSERT_TRUE(fieldReader.readNextField());
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  FieldCursor fieldCursor(reader);
+  ASSERT_TRUE(fieldCursor.next());
+  const auto& fieldInfo = *reader.fieldInfo(fieldCursor.ordinal());
   const CheckpointTermModel& dense = models.back();
   CheckpointToggleGuard guard;
   SkipStats::enabled = true;

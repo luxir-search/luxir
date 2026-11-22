@@ -3974,6 +3974,35 @@ TEST_F(FacetTest, bucketBlockExecutorBindingAndDomainLifetimes) {
   }
 }
 
+TEST_F(FacetTest, textFacetChildResetsDomainWithinEachTerm) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "a", "body_w", "alpha beta"),
+      flatdoc("id", "b", "body_w", "alpha"),
+      flatdoc("id", "c", "body_w", "beta"),
+      flatdoc("id", "d", "body_w", "gamma"),
+  }, UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","query":"id:a",
+    "limit":0,"ops":{"text":{"field_facet":{"field":"body_w","limit":-1,"ops":{
+      "rows":{"top_docs":{"sort":"id asc","limit":-1,"fields":["id"]},"domain":{"query":"*:*"}}
+    }}}}})", req->mr));
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& facet = topFacetResult(*req, "q", "text");
+  ASSERT_TRUE(facet.bucket_ids);
+  auto keys = std::get<api::ColStr>(facet.bucket_ids->kind).v;
+  ASSERT_EQ((vecs("alpha", "beta")), std::vector<std::string>(keys.begin(), keys.end()));
+  const auto& children = metricValues(facet, "rows");
+  ASSERT_EQ(2u, children.size());
+  auto ids = [&](size_t bucket) {
+    auto values = std::get<api::ColStr>(children[bucket].docList()->columns.at("id").kind).v;
+    return std::vector<std::string>(values.begin(), values.end());
+  };
+  EXPECT_EQ(vecs("a", "b"), ids(0));
+  EXPECT_EQ(vecs("a", "c"), ids(1));
+}
+
 TEST_F(FacetTest, textFacetSubOpsSortPinsAndDomains) {
   CollectionHelper helper;
   helper.indexAll(std::array{
@@ -4415,6 +4444,48 @@ TEST_F(FacetTest, avgNestedSparseArrayDomain) {
   ASSERT_EQ(3, docs->found.value_or(0));
   // avg over the 3 in-domain docs: (10+20+30)/3 = 20
   EXPECT_DOUBLE_EQ(20.0, std::get<double>(docs->ops.at("a")->kind));
+}
+
+TEST_F(FacetTest, mergedEmptyFieldsCountAsMissing) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "gone", "body_w", "alpha", "tag_s", "alpha", "tag_sc", "alpha",
+              "tag_ss", vecs("alpha", "beta"), "num_i", 1, "nums_is", vec_i(1, 2)),
+      flatdoc("id", "keep1"),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "keep2"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("gone", UpdateMessage::COMMIT).success);
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(helper.submit(merge).success);
+
+  const auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  EXPECT_EQ(2, reader->segments()[0].maxDoc());
+  for (auto name : {"body_w", "tag_s", "tag_sc", "tag_ss", "num_i", "nums_is"}) {
+    EXPECT_EQ(nullptr, reader->segments()[0].postingsReader().fieldInfo(name));
+    EXPECT_FALSE(reader->field(name).exists());
+  }
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& top = req->collection("main").topDocs("q").allQuery().limit(0);
+  for (auto name : {"body_w", "tag_s"}) {
+    auto& facet = top.facet(name, name);
+    std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
+  }
+  for (auto name : {"body_w", "tag_s", "tag_sc"}) {
+    req->topDocs(name).existsQuery(name).countLimit(-1);
+  }
+  req->execute(false);
+  ASSERT_OK(req);
+  for (auto name : {"body_w", "tag_s"}) {
+    const auto& facet = topFacetResult(*req, "q", name);
+    EXPECT_EQ(2, facet.missing.value_or(-1));
+    EXPECT_TRUE(facet.counts.empty());
+  }
+  for (auto name : {"body_w", "tag_s", "tag_sc"}) {
+    EXPECT_EQ(0, req->getMatchCount(name));
+  }
 }
 
 // Finding 4: full-text facet per-doc missing. A segment that has the field but

@@ -75,7 +75,7 @@ TEST_F(NestedValueExprTest, singletonChildColumnSupportsJoinAndElementCount) {
     ASSERT_NE(nullptr, child);
     auto* info = child->fieldInfo("items_nested.n_i");
     ASSERT_NE(nullptr, info);
-    EXPECT_FALSE(info->hasEndValueRanks());
+    EXPECT_FALSE(info->endValueRanks());
     EXPECT_NE(0, info->flags & FieldType::MULTI_ARRAY);
 
     auto req = localReq(helper.getSearchEngine());

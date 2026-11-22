@@ -1245,6 +1245,20 @@ TEST_F(SchemaTest, multiModeValidationAndHistory) {
   EXPECT_EQ(12u, after->introduction("f__d"));
 }
 
+TEST_F(SchemaTest, identicalDefinitionsKeepIntroductionHistory) {
+  constexpr auto def = R"({"fields":{"title":"text","tags":{"type":"string","multi":"array"}}})";
+  SchemaBinding firstVersion(api::SchemaReference{"t0", "", {0, 0, 10, 1}});
+  SchemaBinding nextVersion(api::SchemaReference{"t0", "", {0, 0, 11, 1}});
+  auto first = schemaJson(def)->withHistory(firstVersion, nullptr);
+  auto next = schemaJson(def)->withHistory(nextVersion, first.get());
+  EXPECT_EQ(10u, next->introduction("title"));
+  EXPECT_EQ(first->introducedGen, next->introducedGen);
+  EXPECT_EQ(first->sourceDef_, next->sourceDef_);
+  std::pmr::monotonic_buffer_resource arena;
+  auto reopened = Schema::fromStored(next->storedInfo(arena), nextVersion);
+  EXPECT_EQ(next->introducedGen, reopened->introducedGen);
+}
+
 TEST_F(SchemaTest, dateUnitsInheritanceAndWirePresence) {
   auto schema = schemaJson(R"({"templates":{
     "_ns":{"type":"date","unit":"ns"}, "_child":{"parent":"_ns"}

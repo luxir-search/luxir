@@ -123,14 +123,14 @@ int32_t lcp(std::string_view a, std::string_view b) {
   return (int32_t)i;
 }
 
-SegFieldInfo readFieldInfo(MemPool& pool, PostingsReader& postingsReader, std::string_view fieldName) {
+const DecodedFieldRecord& readFieldInfo(PostingsReader& postingsReader, std::string_view fieldName) {
   auto* fieldReader = postingsReader.fieldInfo(fieldName);
   EXPECT_TRUE((fieldReader != nullptr));
   const auto& fieldInfo = *fieldReader;
   return fieldInfo;
 }
 
-void expectSeekAndSeekCeil(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo,
+void expectSeekAndSeekCeil(PostingsReader& postingsReader, const DecodedFieldRecord& fieldInfo,
                            const std::vector<std::string>& terms,
                            const std::vector<std::string>& targets) {
   for (const std::string& target : targets) {
@@ -153,7 +153,7 @@ void expectSeekAndSeekCeil(PostingsReader& postingsReader, const SegFieldInfo& f
   }
 }
 
-void expectSeekForward(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo,
+void expectSeekForward(PostingsReader& postingsReader, const DecodedFieldRecord& fieldInfo,
                        const std::vector<std::string>& terms) {
   MemPool pool;
   TermsEnum te(pool, postingsReader, fieldInfo);
@@ -198,11 +198,11 @@ TEST_F(TermsEnumSeekFuzzTest, GapRoutingAcrossSeparatorBoundary) {
 
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
-  TermsEnum seekEnum(guard.pool(), seg->postingsReader(), field.fieldInfo);
+  TermsEnum seekEnum(guard.pool(), seg->postingsReader(), field.fieldInfo());
   ASSERT_FALSE(seekEnum.seek("azm"));
   EXPECT_EQ((std::string_view)seekEnum.term(), "azzz");
 
-  TermsEnum ceilEnum(guard.pool(), seg->postingsReader(), field.fieldInfo);
+  TermsEnum ceilEnum(guard.pool(), seg->postingsReader(), field.fieldInfo());
   ASSERT_TRUE(ceilEnum.seekCeil("azm"));
   EXPECT_EQ((std::string_view)ceilEnum.term(), "azzz");
 }
@@ -224,7 +224,7 @@ TEST_F(TermsEnumSeekFuzzTest, ExplicitTermsForwardMergeCrossesBlocksAndGaps) {
 
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
-  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
   ExplicitTermsEnum selected(te, views);
   std::vector<std::string> actual;
   while (selected.next()) actual.emplace_back(selected.termView());
@@ -249,7 +249,7 @@ TEST_F(TermsEnumSeekFuzzTest, SharedPrefixLenMatchesAdjacentTerms) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
   {
-    TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+    TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
     for (size_t i = 0; i < terms.size(); i++) {
       ASSERT_TRUE(te.nextTerm());
       ASSERT_EQ((std::string_view)te.term(), terms[i]);
@@ -266,17 +266,17 @@ TEST_F(TermsEnumSeekFuzzTest, SharedPrefixLenMatchesAdjacentTerms) {
   // the reset is ever dropped.
   for (const std::string& target : makeTargets(rng, terms)) {
     {
-      TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+      TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
       te.seek(target);
       EXPECT_EQ(te.sharedPrefixLen(), 0) << "seek " << target;
     }
     {
-      TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+      TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
       te.seekCeil(target);
       EXPECT_EQ(te.sharedPrefixLen(), 0) << "seekCeil " << target;
     }
     {
-      TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+      TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
       te.seekForward(target);
       EXPECT_EQ(te.sharedPrefixLen(), 0) << "seekForward " << target;
     }
@@ -287,7 +287,7 @@ TEST_F(TermsEnumSeekFuzzTest, SharedPrefixLenMatchesAdjacentTerms) {
   // right up until seekForward returns.
   {
     const std::string& lastOfBlock = terms[(size_t)Postings::TERMS_BLOCK_SIZE - 1];
-    TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+    TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
     EXPECT_TRUE(te.seekForward(lastOfBlock));
     EXPECT_EQ((std::string_view)te.term(), lastOfBlock);
     EXPECT_EQ(te.sharedPrefixLen(), 0);
@@ -316,8 +316,7 @@ TEST_F(TermsEnumSeekFuzzTest, RandomCollectionTermsMatchVectorReference) {
   ASSERT_EQ(reader->segments().size(), 1u);
   Segment& seg = reader->segments()[0];
 
-  MemPool pool;
-  SegFieldInfo fieldInfo = readFieldInfo(pool, seg.postingsReader(), "seek_s");
+  const auto& fieldInfo = readFieldInfo(seg.postingsReader(), "seek_s");
   std::vector<std::string> targets = makeTargets(rng, terms);
 
   expectSeekAndSeekCeil(seg.postingsReader(), fieldInfo, terms, targets);

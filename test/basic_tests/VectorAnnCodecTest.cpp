@@ -282,7 +282,8 @@ TEST_F(VectorAnnCodecTest, amplitudesFollowListOffsetsAcrossListsAndMerge) {
           const auto& amplitudes = aux[seg]->getAmplitudes();
           EXPECT_EQ(amplitudes.offsets.back(), (size_t)ivf->ntotal);
           auto& segment = reader->segments()[seg];
-          VectorReader column(segment.postingsReader(), *segment.postingsReader().fieldInfo("emb_v"));
+          const auto& columnInfo = *segment.postingsReader().fieldInfo("emb_v");
+          VectorReader column(segment.postingsReader(), columnInfo);
           std::vector<float> x((size_t)dims), rotated((size_t)dims), centroid((size_t)dims);
           for (size_t list = 0; list < ivf->nlist; list++) {
             ivf->quantizer->reconstruct((faiss::idx_t)list, centroid.data());
@@ -747,7 +748,8 @@ TEST_F(VectorAnnCodecTest, intervalSeedCanLoseToAnotherGroupMember) {
   std::shared_ptr<IndexReader> reader;
   auto aux = overlays(h, reader);
   auto& seg = reader->segments()[0];
-  VectorReader column(seg.postingsReader(), *seg.postingsReader().fieldInfo("emb_v"));
+  const auto& columnInfo = *seg.postingsReader().fieldInfo("emb_v");
+  VectorReader column(seg.postingsReader(), columnInfo);
   std::vector<float> query;
   for (int i = 0; i < 32; i++) {
     auto q = clustered(1000 + i, i % CLUSTERS);

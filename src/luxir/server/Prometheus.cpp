@@ -118,6 +118,8 @@ void memory(Renderer& r, const api::MemoryStats& m) {
   const auto& f = m.field_metadata;
   for (auto [part, count, bytes] : {std::tuple{"directory", f.directories, f.directory_bytes}, {"page", f.pages, f.page_bytes},
                                     {"entry", f.entries, f.entry_bytes}, {"name", f.names, f.name_bytes},
+                                    {"opened_page", f.opened_pages, f.opened_page_bytes},
+                                    {"opened_entry", f.opened_entries, f.opened_entry_bytes},
                                     {"live_view", f.live_views, f.live_view_bytes}}) {
     auto labels = PrometheusText::label("part", part);
     r.gauge("luxir_field_metadata_objects", "Cached field metadata objects.", (double)count, labels);

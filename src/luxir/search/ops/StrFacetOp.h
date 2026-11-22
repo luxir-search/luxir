@@ -59,7 +59,7 @@ inline void collectSparseCounts(
 
 //
 // expected vals = domain cardinality * field sparseness
-//   field sparseness = number of docs with the field / maxdoc of the segment
+//   field sparseness = docsWithField / maxDoc
 //   TODO: for a multi-valued field, use total number of values in the field instead of numbe of docs with the field.
 // 1) If expected vals is <<< unique vals: use hashmap for collector, collect global ords
 //    Size for hashmap entry would be 16 bytes.  So we might break even (vs #2) if expected vals
@@ -661,11 +661,10 @@ public:
           totalDomainSize += domainSize;
         }
         if (inlineOps.empty()) continue;
-        auto* field = thisOp().fieldInfo((int32_t)segnum);
+        auto* field = thisOp().ordFieldInfo((int32_t)segnum);
         if (!field) continue;
-        const auto& info = *field;
         int64_t expected = scaleExpectedValues(
-            domainSize, info.numValues, maxDoc);
+            domainSize, field->numValues, maxDoc);
         if (expected > std::numeric_limits<int64_t>::max()
                            - inlineExpectedValues) {
           inlineExpectedValues = std::numeric_limits<int64_t>::max();
@@ -681,10 +680,10 @@ public:
     }
 
     uint64_t fanoutStealUnits(int32_t segnum, uint64_t docs) override {
-      auto* info = thisOp().fieldInfo(segnum);
+      auto* info = thisOp().ordFieldInfo(segnum);
       if (!info) return 0;
       int32_t maxDoc = thisOp().reader.segments()[(size_t)segnum].maxDoc();
-      int64_t keys = thisOp().ordMap ? thisOp().ordMap->numOrds() : info->nTerms;
+      int64_t keys = thisOp().ordMap ? thisOp().ordMap->numOrds() : info->indexedTotals().numTerms;
       int64_t values = scaleExpectedValues((int64_t)docs, info->numValues, maxDoc);
       return (uint64_t)std::max<int64_t>(0, std::min(keys, values));
     }
@@ -782,11 +781,11 @@ public:
           profile->wire.strategy = "inline";
           profile->details.emplace_back(domainDesc(domain));
         }
-        auto* segFieldInfo = thisOp().fieldInfo(segnum);
-        bool found = segFieldInfo != nullptr;
+        auto* fieldInfo = thisOp().ordFieldInfo(segnum);
+        bool found = fieldInfo != nullptr;
         if (profile != nullptr) {
           profile->wire.cardinality = found
-              ? (thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo->nTerms)
+              ? (thisOp().ordMap ? thisOp().ordMap->numOrds() : fieldInfo->indexedTotals().numTerms)
               : 0;
         }
         // A null OrdMap means the field has no values in any segment, so the
@@ -801,7 +800,7 @@ public:
           int64_t expectedValues = inlineExpectedValues >= 0
               ? inlineExpectedValues
               : scaleExpectedValues(
-                    domainSize, segFieldInfo->numValues, maxDoc);
+                    domainSize, fieldInfo->numValues, maxDoc);
           data.counts.initialize(
               expectedValues,
               forcedInlineFacetEntryMode
@@ -811,12 +810,12 @@ public:
         }
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
-        if (found && !(segFieldInfo->flags & FieldType::MULTI_ARRAY)
+        if (found && !(fieldInfo->flags & FieldType::MULTI_ARRAY)
             && data.counts.acceptsKeyedBatches()) {
           // Each decoded ord batch goes to the calculators whole: they read
           // their columns for its docs and fold the values into the ords'
           // entries in one call.
-          OrdColReader ordColReader(segment.postingsReader(), *segFieldInfo);
+          OrdColReader ordColReader(segment.postingsReader(), *fieldInfo);
           OrdValueBatches values(domain, ordColReader, mapping, maxDoc,
                                  false, nullptr);
           OrdValueBatches::Batch batch;
@@ -865,7 +864,7 @@ public:
           profile->wire.domain_size = domainSize;
         }
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        auto* info = thisOp().fieldInfo(segnum);
+        auto* info = thisOp().ordFieldInfo(segnum);
         bool found = info != nullptr;
         if (!found) {
           data.missing_num += domainSize;
@@ -877,15 +876,17 @@ public:
           return; // field not found, but still a contribution (driver releases)
         }
         auto& postingsReader = segment.postingsReader();
-        const auto& segFieldInfo = *info;
+        const auto& fieldInfo = *info;
 
-        int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms;
+        const auto& totals = fieldInfo.indexedTotals();
+        int64_t segmentTerms = totals.numTerms;
+        int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segmentTerms;
         auto& facetReq = (FacetReq&)getOp();
         OrdMap::SegToGlobal mapping;
         if (thisOp().ordMap) {
           mapping = thisOp().ordMap->getSegToGlobal(segnum);
         } else {
-          mapping.numOrds = segFieldInfo.nTerms;
+          mapping.numOrds = segmentTerms;
         }
 
         auto forEachMappedOrd = [&](size_t size, auto&& accept) {
@@ -901,9 +902,9 @@ public:
                 .maxDoc = maxDoc,
                 .domainCardinality = domainView.card,
                 .complementCardinality = domainView.compCard,
-                .segmentTerms = segFieldInfo.nTerms,
-                .sumDocFreq = segFieldInfo.sumDocFreq,
-                .docsWithField = segFieldInfo.docsWithField,
+                .segmentTerms = segmentTerms,
+                .sumDocFreq = totals.sumDocFreq,
+                .docsWithField = fieldInfo.docsWithField,
                 .domainHasBitset = domainView.bits != nullptr,
                 .missingRequested = thisOp().missing,
                 .topTermsLegal = allowTopTerms && thisOp().termFilter == nullptr && thisOp().ordMap
@@ -911,7 +912,7 @@ public:
                     && thisOp().limit >= 0
                     && (int64_t)thisOp().ordMap->topTerms().entries.size() >= thisOp().limit,
                 // The all-docs column reads every stored ord, including multiple ords per doc.
-                .columnWork = (double)(domainView.compCard == 0 ? segFieldInfo.numValues : domainView.card),
+                .columnWork = (double)(domainView.compCard == 0 ? fieldInfo.numValues : domainView.card),
                 // Forced string all-docs walk/column at one term per doc (2M): 7.6/10.2 ms.
                 .walkTermCost = 0.75,
                 .complementTermCost = 2.25, // DocFreq + local-to-global drain, forced partial-domain grid.
@@ -924,7 +925,7 @@ public:
         if (strategy == FieldFacetCountKind::TOP_TERMS) {
           if (thisOp().missing) {
             data.topTermsMissing +=
-                (int64_t)maxDoc - segFieldInfo.docsWithField;
+                (int64_t)maxDoc - fieldInfo.docsWithField;
           }
           data.topTermsSegs++;
           topTermsSegments[(size_t)segnum] = 1;
@@ -1008,20 +1009,20 @@ public:
           profile->wire.cardinality = globVals;
           profile->wire.strategy = wantedRep;
           profile->details.emplace_back(
-              "seg maxOrd=" + std::to_string(segFieldInfo.nTerms)
+              "seg maxOrd=" + std::to_string(segmentTerms)
               + (mapping.bits == 0 ? " ords=identity" : " ords=remapped"));
           if (strategy == FieldFacetCountKind::COLUMN_DOMAIN) {
             profile->details.emplace_back("parent-count=column-domain");
             profile->details.emplace_back(domainDesc(
-                domain, segFieldInfo.ordIndexing == SegFieldInfo::ORD_DOCID));
+                domain, fieldInfo.ordColumn()->indexing == field_parts::OrdIndexing::DOC_ID));
           } else if (strategy == FieldFacetCountKind::COLUMN_COMPLEMENT) {
             profile->details.emplace_back("parent-count=column-complement");
             profile->details.emplace_back(domainView.compCard == 0
                 ? "all-docs domain, docFreq-only dictionary walk"
                 : ((int64_t)domainView.compCard >> 4)
-                        >= (int64_t)segFieldInfo.nTerms
+                        >= (int64_t)segmentTerms
                 ? "inverted domain view, int32 staging"
-                : ((int64_t)segFieldInfo.nTerms >> 5)
+                : ((int64_t)segmentTerms >> 5)
                         >= (int64_t)domainView.compCard
                 ? "inverted domain view, sorted-hit staging"
                 : "inverted domain view, u8 staging");
@@ -1057,8 +1058,8 @@ public:
         };
 
         if (strategy != FieldFacetCountKind::COLUMN_DOMAIN) {
-          TermsEnum terms(poolGuard.pool(), postingsReader, segFieldInfo);
-          int64_t nTerms = segFieldInfo.nTerms;
+          TermsEnum terms(poolGuard.pool(), postingsReader, fieldInfo);
+          int64_t nTerms = segmentTerms;
 
           // One fused pass shared by every postings-side strategy: stream
           // docFreqs in local-ord order, apply the strategy's per-ord count,
@@ -1083,11 +1084,11 @@ public:
             emitCounts([](int64_t, int32_t docFreq) { return docFreq; });
             if (thisOp().missing) {
               data.missing_num +=
-                  (int64_t)maxDoc - segFieldInfo.docsWithField;
+                  (int64_t)maxDoc - fieldInfo.docsWithField;
             }
           } else if (strategy == FieldFacetCountKind::COLUMN_COMPLEMENT) {
             int64_t compMissing = 0;
-            OrdColReader ordColReader(postingsReader, segFieldInfo);
+            OrdColReader ordColReader(postingsReader, fieldInfo);
             // Local staging is a SkinnyCounter, for skinny's reason: a u8
             // per term with per-ord overflow aggregated in its map, so
             // staging stays O(nTerms) no matter how many doc-value pairs
@@ -1201,7 +1202,7 @@ public:
               int64_t docsWithValueInComplement =
                   domainView.compCard - compMissing;
               int64_t docsWithValueInDomain =
-                  segFieldInfo.docsWithField - docsWithValueInComplement;
+                  fieldInfo.docsWithField - docsWithValueInComplement;
               assert(docsWithValueInDomain >= 0
                      && docsWithValueInDomain <= domainView.card);
               data.missing_num +=
@@ -1214,7 +1215,7 @@ public:
               return countTermInDomain(domainView, postings, docFreq);
             });
             if (thisOp().missing) {
-              DocsReader docsReader(postingsReader, segFieldInfo);
+              DocsReader docsReader(postingsReader, fieldInfo);
               data.missing_num +=
                   countMissingInDomain(domainView, docsReader);
             }
@@ -1233,7 +1234,7 @@ public:
                 countSpan->increment(ord);
               });
           } else {
-            std::vector<uint32_t> localCounts(segFieldInfo.nTerms);
+            std::vector<uint32_t> localCounts(segmentTerms);
             facetReq.facetSegOrdCol(domain, segnum, missing_num,
               OrdMap::SegToGlobal::identity(),
               [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
@@ -1264,7 +1265,7 @@ public:
           // TODO: we have a countVec, but if we wanted a map, that means we
           // should probably not do 2 pass.  Unclear how often this happens.
           // for single-valued, we could get away with int32_t
-          int64_t segTerms = segFieldInfo.nTerms;
+          int64_t segTerms = segmentTerms;
           int32_t laneMask =
               segTerms * COUNTER_LANES * (int64_t)sizeof(int64_t)
                       <= COUNTER_LANE_BYTES
@@ -1308,9 +1309,9 @@ public:
           bool useLocal =
               skinnyMode == FacetCounterMode::SKINNY_GLOBAL ? false
             : skinnyMode == FacetCounterMode::SKINNY_LOCAL  ? (mapping.bits != 0)
-            : (mapping.bits != 0 && (domainSize >> 1) >= segFieldInfo.nTerms);
+            : (mapping.bits != 0 && (domainSize >> 1) >= segmentTerms);
           if (useLocal) {
-            std::vector<uint8_t> localCounts(segFieldInfo.nTerms);
+            std::vector<uint8_t> localCounts(segmentTerms);
             facetReq.facetSegOrdCol(domain, segnum, missing_num,
               OrdMap::SegToGlobal::identity(),
               [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
@@ -1647,9 +1648,8 @@ public:
         builders.reserve(numBuckets);
         for (size_t i = 0; i < numBuckets; i++) builders.emplace_back(maxDoc);
 
-        if (auto* info = thisOp().fieldInfo((int32_t)segnum)) {
-          const auto& segFieldInfo = *info;
-          OrdColReader ordColReader(segment.postingsReader(), segFieldInfo);
+        if (auto* info = thisOp().ordFieldInfo((int32_t)segnum)) {
+          OrdColReader ordColReader(segment.postingsReader(), *info);
           auto mapping = thisOp().ordMap->getSegToGlobal((int32_t)segnum);
           StrFacetSelectedOrdMap selectedMap(mapping, selected);
           int64_t missing_num = 0;
@@ -1785,11 +1785,12 @@ public:
           *this, children, buckets, *op.view,
           FacetBucketProducer::INDEPENDENT,
           [&](size_t segnum, auto block, FacetBucketFeed feed) {
+            auto* info = thisOp().ordFieldInfo((int32_t)segnum);
             for (size_t i = 0; i < block.size(); i++) {
               feed(i, ordColumnDomains
                   ? std::move(built[segnum * buckets.size()
                                     + (size_t)block[i].owner.value])
-                  : materializeTermDomain((int32_t)segnum, block[i].key,
+                  : materializeTermDomain((int32_t)segnum, info, block[i].key,
                                           input[segnum].get()));
             }
           }, FacetBucketBlockExecutor::BINDING_BYTES, input,
@@ -1992,9 +1993,10 @@ public:
       int64_t routedDocs = 0;
       int64_t routedValues = 0;
 
-      auto* parentInfo = SegFieldInfo::column(source.segInfos.at((size_t)segnum));
-      if (!parentInfo) return;
-      auto* childFieldInfo = child.fieldInfo(segnum);
+      auto* parentInfo = source.segInfos.at((size_t)segnum);
+      const auto* parentOrds = parentInfo ? parentInfo->ordColumn() : nullptr;
+      if (!parentOrds) return;
+      auto* childFieldInfo = child.ordFieldInfo(segnum);
       bool childFieldFound = childFieldInfo != nullptr;
       std::optional<OrdColReader> childColumn;
       std::optional<OrdColReader::Iterator> childIterator;
@@ -2009,8 +2011,7 @@ public:
       }
 
       auto& postingsReader = segment.postingsReader();
-      const auto& parentFieldInfo = *parentInfo;
-      OrdColReader parentColumn(postingsReader, parentFieldInfo);
+      OrdColReader parentColumn(postingsReader, *parentInfo);
       auto parentMapping = source.ordMap.getSegToGlobal(segnum);
       StrFacetSelectedOrdMap selected(parentMapping, selectedBuckets);
       auto childMapping = child.ordMap->getSegToGlobal(segnum);
@@ -2077,10 +2078,9 @@ public:
         maxDocs += segmentMax;
         DocSet* domain = source.domains[segnum].get();
         domainDocs += domain != nullptr ? domain->card() : segmentMax;
-        auto* info = child.fieldInfo((int32_t)segnum);
+        auto* info = child.ordFieldInfo((int32_t)segnum);
         if (!info) continue;
-        const auto& fieldInfo = *info;
-        childValues += fieldInfo.numValues;
+        childValues += info->numValues;
       }
       __int128 estimate = maxDocs > 0
           ? (selectedRoutes * childValues + maxDocs - 1) / maxDocs

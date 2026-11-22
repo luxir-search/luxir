@@ -395,6 +395,10 @@ struct FieldMetadataStats {
   uint64_t page_bytes = 0;
   uint64_t entries = 0;
   uint64_t entry_bytes = 0;
+  uint64_t opened_pages = 0;
+  uint64_t opened_page_bytes = 0;
+  uint64_t opened_entries = 0;
+  uint64_t opened_entry_bytes = 0;
   uint64_t names = 0;
   uint64_t name_bytes = 0;
   uint64_t live_views = 0;

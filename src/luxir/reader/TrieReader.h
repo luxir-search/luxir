@@ -114,14 +114,14 @@ class TrieReader {
 
   static uint64_t childDelta(const char* node, uint8_t header, uint32_t pos) {
     uint32_t deltaWidth = dw(header);
-    const char* entry = entryBase(node, header) + pos * (deltaWidth + TrieBuilder::ORD_WIDTH);
+    const char* entry = entryBase(node, header) + pos * (deltaWidth + Postings::TERM_BLOCK_ORD_BYTES);
     return readLE(entry, deltaWidth);
   }
 
   static uint32_t childLo(const char* node, uint8_t header, uint32_t pos) {
     uint32_t deltaWidth = dw(header);
-    const char* entry = entryBase(node, header) + pos * (deltaWidth + TrieBuilder::ORD_WIDTH) + deltaWidth;
-    return (uint32_t)readLE(entry, TrieBuilder::ORD_WIDTH);
+    const char* entry = entryBase(node, header) + pos * (deltaWidth + Postings::TERM_BLOCK_ORD_BYTES) + deltaWidth;
+    return (uint32_t)readLE(entry, Postings::TERM_BLOCK_ORD_BYTES);
   }
 
   static Child ceilBits(const char* node, uint8_t minLabel, uint8_t b) {
@@ -253,7 +253,7 @@ public:
   TrieReader(const char* base, uint64_t rootOff, int32_t nBlocks) : base(base), rootOff(rootOff), nBlocks(nBlocks) {
     assert(base != nullptr);
     assert(nBlocks > 0);
-    assert(nBlocks <= (int32_t)TrieBuilder::MAX_BLOCKS);
+    assert(nBlocks <= (int32_t)Postings::MAX_TERM_BLOCKS);
   }
 
   int32_t floorBlock(std::string_view target) const {

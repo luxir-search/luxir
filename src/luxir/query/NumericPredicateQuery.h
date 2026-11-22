@@ -74,7 +74,7 @@ public:
   // Observe actual verification, not column decoding or metadata navigation.
   // Tests install this only after the product has been built.
   static inline thread_local void (*verificationObserver)(const NumericPredicateQuery&, int32_t) = nullptr;
-  // Rank-to-document selects on sparse docsWithValue in zone fills.
+  // Rank-to-document selects on sparse docsWithField in zone fills.
   static inline thread_local int64_t rankSelectsForTests = 0;
 #endif
 
@@ -294,7 +294,7 @@ public:
     float matchCost() override {
       if (allMatch) return 0.0f;
       if (!multi) return query.valueMatchCost();
-      int64_t docs = reader.docsWithValue();
+      int64_t docs = reader.docsWithField();
       float valuesPerDoc = docs > 0
           ? (float)reader.numValues() / (float)docs : 1.0f;
       return valuesPerDoc * query.valueMatchCost();
@@ -535,15 +535,14 @@ public:
     screaming::BitSet::Iterator* docs = nullptr;
 
     void ensureSelector() {
-      if (selector == nullptr && !reader.denseDocsWithValue()) {
-        const auto& bits = reader.docsWithValueBitSet();
+      if (const auto* bits = reader.docsReader().bitset(); selector == nullptr && bits) {
         selector = pool.make<screaming::BitSet::Selector>(
-            bits, pool.make_span<int32_t>((size_t)bits.nBuckets + 1));
+            *bits, pool.make_span<int32_t>((size_t)bits->nBuckets + 1));
       }
     }
 
     int32_t docForRank(int32_t rank) {
-      if (rank >= reader.docsWithValue()) return PostingsReader::END;
+      if (rank >= reader.docsWithField()) return PostingsReader::END;
       return selector == nullptr ? rank : selector->select(rank);
     }
 
@@ -552,7 +551,7 @@ public:
       int32_t rank = target;
       if (selector != nullptr) {
         if (docs == nullptr) {
-          docs = pool.make<screaming::BitSet::Iterator>(reader.docsWithValueBitSet());
+          docs = pool.make<screaming::BitSet::Iterator>(*reader.docsReader().bitset());
         } else if (target < docs->val()) {
           docs->reset();
         }
@@ -560,7 +559,7 @@ public:
         if (target == screaming::BitSet::END) return {PostingsReader::END, PostingsReader::END};
         rank = docs->rank();
       }
-      while (rank < reader.docsWithValue()) {
+      while (rank < reader.docsWithField()) {
         int64_t block = rank / IntColReader::BLOCK_SIZE;
         NumBlockZone zone = reader.blockZone(block);
         int64_t endRank = (block + 1) * IntColReader::BLOCK_SIZE;
@@ -609,7 +608,7 @@ public:
         ranges.back().end = PostingsReader::END;
       }
       int32_t afterLast = selector == nullptr ? (int32_t)reader.numValues()
-          : selector->select(reader.docsWithValue() - 1) + 1;
+          : selector->select(reader.docsWithField() - 1) + 1;
       if ((ranges.empty() || ranges.back().end != PostingsReader::END)
           && afterLast < PostingsReader::END) {
         ranges.push_back({afterLast, PostingsReader::END});
@@ -916,7 +915,7 @@ public:
     IntColReader& reader;
     BlockPlans& blockPlans;
     std::span<const BlockPlan> plans;
-    // Sparse docsWithValue only. docs sits on the first document with a
+    // Sparse docsWithField only. docs sits on the first document with a
     // value at or after docsTarget; fills step walk from rank to rank and
     // select only to jump past an OUTSIDE run.
     screaming::BitSet::Selector* selector = nullptr;
@@ -972,7 +971,7 @@ public:
     }
 
     // The first document with a value at or after target, and its rank; past
-    // the last one, {END, docsWithValue}. Sparse: from the docs cursor, which
+    // the last one, {END, docsWithField}. Sparse: from the docs cursor, which
     // a target below docsTarget rewinds.
     template <bool SPARSE>
     LUXIR_INLINE std::pair<int32_t, int32_t> firstDocRank(int32_t target) {
@@ -981,10 +980,10 @@ public:
         docsTarget = target;
         int32_t doc = target > docs->val() ? docs->advance(target) : docs->val();
         if (doc != screaming::BitSet::END) return {doc, docs->rank()};
-      } else if (target < reader.docsWithValue()) {
+      } else if (target < reader.docsWithField()) {
         return {target, target};
       }
-      return {PostingsReader::END, reader.docsWithValue()};
+      return {PostingsReader::END, reader.docsWithField()};
     }
 
     // Position walk on doc, a document with a value.
@@ -1041,7 +1040,7 @@ public:
       }
     }
 
-    // One source per loop, instantiated per docsWithValue density: dense
+    // One source per loop, instantiated per docsWithField density: dense
     // fills bound each run by the window once, then set INSIDE runs whole and
     // OR CROSSES runs in a mask per 64-value group; sparse fills step walk,
     // and in CROSSES runs read each value's bit from its group's mask.
@@ -1053,16 +1052,16 @@ public:
     template <bool SPARSE>
     [[gnu::aligned(64)]] LUXIR_NOINLINE void fillSingle(std::span<uint64_t> words, int32_t min,
                                    int32_t max, int32_t doc, int32_t rank) {
-      int64_t nvals = reader.numValues();
-      while (doc < max && rank < nvals) {
+      int64_t numValues = reader.numValues();
+      while (doc < max && rank < numValues) {
         int64_t blockNum = rank / IntColReader::BLOCK_SIZE;
         int64_t blockStart = blockNum * (int64_t)IntColReader::BLOCK_SIZE;
         const BlockPlan& plan = plans[(size_t)blockNum];
         BlockPlan::Run run = plan.runAt((uint32_t)(rank - blockStart));
-        int64_t runEnd = std::min<int64_t>(nvals, blockStart + run.end);
+        int64_t runEnd = std::min<int64_t>(numValues, blockStart + run.end);
         if (run.relation == BlockRelation::OUTSIDE) {
           rank = (int32_t)runEnd;
-          if (rank >= nvals) break;
+          if (rank >= numValues) break;
           doc = jumpDoc<SPARSE>(rank, max);
           continue;
         }
@@ -1103,7 +1102,7 @@ public:
     template <bool SPARSE>
     LUXIR_NOINLINE void fillMulti(std::span<uint64_t> words, int32_t min,
                                   int32_t max, int32_t doc, int32_t docRank) {
-      while (doc < max && docRank < reader.docsWithValue()) {
+      while (doc < max && docRank < reader.docsWithField()) {
         auto [start, end] = reader.getStartEndValueRank(docRank);
 #ifndef NDEBUG
         if (verificationObserver != nullptr) verificationObserver(query, doc);
@@ -1113,7 +1112,7 @@ public:
           setBit(words, min, doc);
         }
         docRank++;
-        if (docRank >= reader.docsWithValue()) break;
+        if (docRank >= reader.docsWithField()) break;
         doc = nextDoc<SPARSE>(docRank);
       }
     }
@@ -1213,12 +1212,11 @@ public:
           crossing(reader),
           iterBits(pool.make_arr<uint64_t>(ITER_WINDOW_WORDS), ITER_WINDOW_WORDS),
           query(query), maxDoc(maxDoc), initialMaxDoc(maxDoc), eager(eager) {
-      if (!reader.denseDocsWithValue()) {
-        const auto& bits = reader.docsWithValueBitSet();
+      if (const auto* bits = reader.docsReader().bitset()) {
         selector = pool.make<screaming::BitSet::Selector>(
-            bits, pool.make_span<int32_t>((size_t)bits.nBuckets + 1));
-        docs = pool.make<screaming::BitSet::Iterator>(bits);
-        walk = pool.make<screaming::BitSet::Iterator>(bits);
+            *bits, pool.make_span<int32_t>((size_t)bits->nBuckets + 1));
+        docs = pool.make<screaming::BitSet::Iterator>(*bits);
+        walk = pool.make<screaming::BitSet::Iterator>(*bits);
       }
       std::fill(iterBits.begin(), iterBits.end(), 0);
     }
@@ -1506,18 +1504,18 @@ public:
       // Only dense single-valued INSIDE runs can emit whole mask words.
       // Sparse columns map each rank to a doc; multivalued producers also
       // visit documents whose values are entirely outside the predicate.
-      double insideWords = single && reader.denseDocsWithValue()
+      double insideWords = single && reader.docsReader().allRows()
           ? (double)((summary.insideLower + 63) / 64) : -1;
       return {
         prunable >= reader.numValues() / denominator
             + (reader.numValues() % denominator != 0),
         summary.outside != 0,
-        reader.docsWithValue() - (single ? (int32_t)summary.outside : 0),
+        reader.docsWithField() - (single ? (int32_t)summary.outside : 0),
         single ? (int32_t)summary.insideLower : 0,
         (double)(reader.numValues() - prunable),
         insideWords >= 0 ? INSIDE_WORD_POINTS * insideWords
             : INSIDE_VALUE_POINTS * (double)summary.insideLower,
-        single ? 0.0 : (double)reader.docsWithValue(),
+        single ? 0.0 : (double)reader.docsWithField(),
       };
     }
 
@@ -1554,7 +1552,7 @@ public:
     };
 
     std::optional<PostingMatches> resolvePostings(
-        MemPool& pool, IndexReader::Segment& segment, const SegFieldInfo& info,
+        MemPool& pool, IndexReader::Segment& segment, const DecodedFieldRecord& info,
         double budget) {
       boost::container::small_vector<TermsEnum::PostingsState, 8> states;
       NumericIndexPrice::PostingsWork work;
@@ -1594,9 +1592,9 @@ public:
       return PostingMatches{retained, work};
     }
 
-    const PostingsReader::Field* segmentInfo(IndexReader::Segment& segment) const {
+    const DecodedFieldRecord* segmentInfo(IndexReader::Segment& segment) const {
       auto* info = segInfos.at(segment.ord);
-      return info && info->columnLoc.offset() > 0 ? info : nullptr;
+      return info && info->numberColumn() ? info : nullptr;
     }
 
   public:
@@ -1616,18 +1614,18 @@ public:
       if (query.getHi() < query.getLo()) return {0, CountHow::METADATA};
       const auto* info = segmentInfo(segment);
       if (!info) return {0, CountHow::METADATA};
-      if (!info->columnBounds) {
+      if (info->numValues == 0) return {0, CountHow::METADATA};
+      const auto* bounds = info->scalarBounds();
+      if (!bounds) {
         assert(false && "numeric column has no bounds");
         return {countBound(segment, domain, info->docsWithField).maxMatches, CountHow::ITERATE};
       }
-      if (info->numValues == 0
-          || !query.intersects(info->columnBounds->min, info->columnBounds->max)) {
+      if (!query.intersects(bounds->min, bounds->max)) {
         return {0, CountHow::METADATA};
       }
-      CountHow how = query.covers(info->columnBounds->min, info->columnBounds->max)
+      CountHow how = query.covers(bounds->min, bounds->max)
           ? CountHow::METADATA
-          : (info->pointsMetaOff != 0 || (info->flags & FieldType::INDEX_DOCS))
-                  && !info->hasEndValueRanks()
+          : (info->points() || (info->flags & FieldType::INDEX_DOCS)) && !info->endValueRanks()
               ? CountHow::SUPPLIER : CountHow::ITERATE;
       auto shortcut = countBound(segment, domain, info->docsWithField, how);
       if (shortcut.how == CountHow::SUPPLIER) shortcut.resolver = this;
@@ -1684,7 +1682,7 @@ public:
         if (!complement && !PointsMaterialize::useBitset(emitted, segment.maxDoc())) {
           return PointsMaterialize::price(emitted, segment.maxDoc());
         }
-        uint64_t baseDocs = complement && !reader.denseDocsWithValue() ? reader.docsWithValue() : 0;
+        uint64_t baseDocs = complement && !reader.docsReader().allRows() ? reader.docsWithField() : 0;
         if (!pointWork) {
           // A rejected lower bound never populates the exact work cache.
           if (pointLowerBound >= budget) return pointLowerBound;
@@ -1741,7 +1739,7 @@ public:
       double hull() const {
         const auto& costs = column();
         return !reader.multiValued() && costs.hasOutside
-            ? (double)costs.possibleDocs / std::max(1, reader.docsWithValue()) : 1.0;
+            ? (double)costs.possibleDocs / std::max(1, reader.docsWithField()) : 1.0;
       }
 
       // A window consumer fills `span` documents.
@@ -1797,7 +1795,7 @@ public:
                 : sketch.countBelow(range.hi + 1);
             matches += end - sketch.countBelow(range.lo);
           }
-          matches = std::min(matches, (double)reader.docsWithValue());
+          matches = std::min(matches, (double)reader.docsWithField());
         }
         return matches;
       }
@@ -1893,10 +1891,10 @@ public:
             FixedBitSet::sizeInWords(segment.maxDoc()));
         std::fill(words.begin(), words.end(), 0);
         FixedBitSet bits(words.data(), segment.maxDoc());
-        if (reader.denseDocsWithValue()) {
+        if (reader.docsReader().allRows()) {
           PointsMaterialize::setRun(bits, 0, segment.maxDoc());
-        } else {
-          screaming::BitSet::Iterator iter(reader.docsWithValueBitSet());
+        } else if (const auto* bitmap = reader.docsReader().bitset()) {
+          screaming::BitSet::Iterator iter(*bitmap);
           for (int32_t doc = iter.next(); doc != screaming::BitSet::END;
                doc = iter.next()) {
             bits.set(doc);
@@ -1956,7 +1954,7 @@ public:
           return *weight.query.forcedArm == ScorerArm::COMPLEMENT;
         }
         return points != nullptr && !reader.multiValued()
-            && exactCount > (uint64_t)reader.docsWithValue() * 3 / 4;
+            && exactCount > (uint64_t)reader.docsWithField() * 3 / 4;
       }
 
       // Candidates a single-valued verifier can face: no more than the docs
@@ -2015,7 +2013,7 @@ public:
           // documents with a value, lands on.
           double candidates = windows ? (double)demand.candidates
               : demand.expectedCandidates >= 0
-                  ? std::min(demand.expectedCandidates, (double)reader.docsWithValue())
+                  ? std::min(demand.expectedCandidates, (double)reader.docsWithField())
                   : (double)demand.span;
           double verify = PointsMaterialize::verifyPrice(candidates, demand);
           Production producer = cheapestProducer(
@@ -2184,7 +2182,7 @@ public:
 
         int64_t count = 0;
         for (int32_t docRank = 0;
-             docRank < reader.docsWithValue(); docRank++) {
+             docRank < reader.docsWithField(); docRank++) {
           auto [start, end] = reader.getStartEndValueRank(docRank);
           count += anyValueMatches(plans, crossing, weight.query, start, end);
         }
@@ -2208,7 +2206,7 @@ public:
         if (points) {
           bool complement = useComplement(pointValueCount);
           uint64_t emitted = complement ? points->pointCount() - pointValueCount : pointValueCount;
-          uint64_t baseDocs = complement && !reader.denseDocsWithValue() ? reader.docsWithValue() : 0;
+          uint64_t baseDocs = complement && !reader.docsReader().allRows() ? reader.docsWithField() : 0;
           // Once per supplier, O(intervals); every budget probe is O(1).
           pointLowerBound = NumericIndexPrice::pointsLowerBound(pointRanges, points->pointCount(),
               points->maxPointsPerLeaf(), emitted, segment.maxDoc(), complement, baseDocs);
@@ -2238,7 +2236,7 @@ public:
         // docids; sparse columns' value-less documents need not spread evenly.
         return {estimatedMatches(), production, 0, 64, 192, 0,
                 !postings || !reader.multiValued(), hull(),
-                !reader.multiValued() && reader.docsWithValue() == segment.maxDoc()};
+                !reader.multiValued() && reader.docsWithField() == segment.maxDoc()};
       }
 
       std::optional<MembershipQuote> quoteMembership(
@@ -2247,7 +2245,7 @@ public:
         if (!isMembershipWindowUse(context.demand.horizon)
             || context.numericPredicateDisableShapesForTests
             || points != nullptr || postings || reader.multiValued()
-            || !reader.denseDocsWithValue() || reader.docsWithValue() != segment.maxDoc()
+            || !reader.docsReader().allRows() || reader.docsWithField() != segment.maxDoc()
             || weight.query.isExactSet() || weight.query.intervals().size() != 1
             || reader.leafMeta().valueSketch().empty()) return std::nullopt;
         const auto& costs = column();
@@ -2302,7 +2300,7 @@ public:
             && useComplement(pointValueCount);
         // A verifier iterates every document with a value.
         int64_t iterated = arm == ScorerArm::SPARSE_VERIFY
-            ? std::max(cost(), (int64_t)reader.docsWithValue()) : cost();
+            ? std::max(cost(), (int64_t)reader.docsWithField()) : cost();
         return planPool.make<Plan>(
             *this, planContext, shapeFor(selection, matchState, pricedCheck()), iterated, arm,
             complement);
@@ -2403,23 +2401,23 @@ public:
     };
 
     std::optional<NumColumnFormat::LeafMeta::RangeSummary> validateForcedArm(
-        const SegFieldInfo* info, IntColReader* reader) const {
+        const DecodedFieldRecord* info, IntColReader* reader, const field_parts::ScalarBounds* bounds) const {
       bool available = info && reader;
       std::optional<NumColumnFormat::LeafMeta::RangeSummary> summary;
       if (available) {
         switch (*query.forcedArm) {
           case ScorerArm::POINTS:
-            available = info->pointsMetaOff != 0;
+            available = info->points() != nullptr;
             break;
           case ScorerArm::COMPLEMENT:
-            available = info->pointsMetaOff != 0 && !reader->multiValued();
+            available = info->points() != nullptr && !reader->multiValued();
             break;
           case ScorerArm::POSTINGS:
             available = (info->flags & FieldType::INDEX_DOCS) != 0;
             break;
           case ScorerArm::ZONE_MAP:
             summary = reader->leafMeta().summarizeRange(query.getLo(), query.getHi());
-            if (query.isExactSet() && !query.covers(reader->getMin(), reader->getMax())) {
+            if (query.isExactSet() && bounds && !query.covers(bounds->min, bounds->max)) {
               summary->insideLower = summary->insideUpper = 0;
             }
             available = summary->outside != 0 || summary->insideLower != 0;
@@ -2443,12 +2441,12 @@ public:
       const auto* segInfo = segmentInfo(segment);
       auto* reader = segInfo ? targetPool.make<IntColReader>(segment.postingsReader(), *segInfo)
           : nullptr;
-      auto summary = query.forcedArm ? validateForcedArm(segInfo, reader)
+      const auto* bounds = segInfo ? segInfo->scalarBounds() : nullptr;
+      auto summary = query.forcedArm ? validateForcedArm(segInfo, reader, bounds)
           : std::optional<NumColumnFormat::LeafMeta::RangeSummary>{};
-      if (query.getHi() < query.getLo() || !reader) return nullptr;
-      if (reader->numValues() == 0) return nullptr;
-      int64_t colMin = reader->getMin();
-      int64_t colMax = reader->getMax();
+      if (query.getHi() < query.getLo() || !bounds) return nullptr;
+      int64_t colMin = bounds->min;
+      int64_t colMax = bounds->max;
       if (colMax < query.getLo() || query.getHi() < colMin) return nullptr;
 
       bool allMatch = query.covers(colMin, colMax);
@@ -2458,8 +2456,7 @@ public:
       uint64_t pointValueCount = 0;
       Query::MatchState matchState = Query::MatchState::UNKNOWN;
       std::optional<PostingMatches> postings;
-      if ((!allMatch || query.forcedArm == ScorerArm::POSTINGS)
-          && (segInfo->flags & FieldType::INDEX_DOCS)) {
+      if (segInfo->terms() && (!allMatch || query.forcedArm == ScorerArm::POSTINGS)) {
         if (!summary) {
           summary = reader->leafMeta().summarizeRange(query.getLo(), query.getHi());
           if (query.isExactSet() && !allMatch) {
@@ -2473,10 +2470,10 @@ public:
         int64_t termsLower = 0;
         if (!reader->multiValued()) {
           termsLower = NumericIndexPrice::postingsTermLowerBound(
-              summary->insideLower, segInfo->sumDocFreq, segInfo->nTerms);
+              summary->insideLower, segInfo->indexedTotals().sumDocFreq, segInfo->indexedTotals().numTerms);
           if (!query.isExactSet()) {
             termsLower = std::max(termsLower, NumericIndexPrice::postingsDomainLowerBound(
-                segInfo->nTerms, colMin, colMax, query.getLo(), query.getHi()));
+                segInfo->indexedTotals().numTerms, colMin, colMax, query.getLo(), query.getHi()));
           }
         }
         if (NumericIndexPrice::TERM_POINTS * (double)termsLower <= budget) {
@@ -2484,9 +2481,9 @@ public:
         }
       }
       if (postings) {
-        cost = (int64_t)std::min<uint64_t>(postings->work.docs, reader->docsWithValue());
+        cost = (int64_t)std::min<uint64_t>(postings->work.docs, reader->docsWithField());
         matchState = postings->work.docs == 0 ? Query::MatchState::EMPTY : Query::MatchState::NONEMPTY;
-      } else if (segInfo->pointsMetaOff != 0) {
+      } else if (segInfo->points()) {
         points = targetPool.make<PointsReader>(segment.postingsReader(), *segInfo);
         if (points->pointCount() != (uint64_t)reader->numValues()) {
           throw std::runtime_error("NumericPredicateQuery: points/column value count mismatch");
@@ -2500,7 +2497,7 @@ public:
         if (reader->multiValued()) {
           // Repeated docids make this a safe upper bound, not an exact count
           // of unique matching documents.
-          docCost = std::min<uint64_t>(docCost, reader->docsWithValue());
+          docCost = std::min<uint64_t>(docCost, reader->docsWithField());
         }
         cost = (int64_t)docCost;
         matchState = pointValueCount == 0
@@ -2514,7 +2511,7 @@ public:
         int64_t possible = reader->numValues() - summary->outside;
         int64_t estimate = query.isExactSet() ? possible
             : summary->insideLower + (possible - summary->insideLower + 1) / 2;
-        cost = std::min<int64_t>(estimate, reader->docsWithValue());
+        cost = std::min<int64_t>(estimate, reader->docsWithField());
         matchState = possible == 0 ? Query::MatchState::EMPTY
             : summary->insideLower > 0 ? Query::MatchState::NONEMPTY
                                      : Query::MatchState::UNKNOWN;
@@ -2553,11 +2550,11 @@ public:
     Query::Scorer* createFullScanScorerForTests(MemPool& targetPool,
                                                 IndexReader::Segment& segment) {
       const auto* segInfo = segmentInfo(segment);
-      if (!segInfo) return nullptr;
+      const auto* bounds = segInfo ? segInfo->scalarBounds() : nullptr;
+      if (!bounds) return nullptr;
       auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
-      if (reader->numValues() == 0) return nullptr;
-      int64_t colMin = reader->getMin();
-      int64_t colMax = reader->getMax();
+      int64_t colMin = bounds->min;
+      int64_t colMax = bounds->max;
       if (query.getHi() < query.getLo() || colMax < query.getLo()
           || query.getHi() < colMin) {
         return nullptr;
@@ -2571,11 +2568,11 @@ public:
                                                IndexReader::Segment& segment,
                                                bool eager = true) {
       const auto* segInfo = segmentInfo(segment);
-      if (!segInfo) return nullptr;
+      const auto* bounds = segInfo ? segInfo->scalarBounds() : nullptr;
+      if (!bounds) return nullptr;
       auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
-      if (reader->numValues() == 0) return nullptr;
-      if (query.getHi() < query.getLo() || reader->getMax() < query.getLo()
-          || query.getHi() < reader->getMin()) {
+      if (query.getHi() < query.getLo() || bounds->max < query.getLo()
+          || query.getHi() < bounds->min) {
         return nullptr;
       }
       auto* plans = targetPool.make<BlockPlans>(targetPool, *reader, query);

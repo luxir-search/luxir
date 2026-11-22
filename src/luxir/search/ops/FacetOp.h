@@ -116,8 +116,14 @@ public:
     });
   }
 
-  const SegFieldInfo* fieldInfo(int32_t segnum) const {
-    return SegFieldInfo::column(segInfos.at((size_t)segnum));
+  const DecodedFieldRecord* numberFieldInfo(int32_t segnum) const {
+    const auto* info = segInfos.at((size_t)segnum);
+    return info && info->numberColumn() ? info : nullptr;
+  }
+
+  const DecodedFieldRecord* ordFieldInfo(int32_t segnum) const {
+    const auto* info = segInfos.at((size_t)segnum);
+    return info && info->ordColumn() ? info : nullptr;
   }
 
   FacetReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view fieldName, std::string_view facetName,
@@ -148,13 +154,16 @@ public:
 
   // Distinct missing counts need document identities, not a scalar missing
   // total. The column presence set is independent of bucket/range predicates.
-  void forEachMissing(DocSet* domain, int32_t segnum, auto&& accept) {
+  void forEachMissing(DocSet* domain, int32_t segnum, const DecodedFieldRecord* info, auto&& accept) {
     auto& segment = reader.segments()[(size_t)segnum];
-    auto* info = fieldInfo(segnum);
-    if (info == nullptr) { forEachDomainDoc(domain, segment.maxDoc(), accept); return; }
+    if (!info) {
+      forEachDomainDoc(domain, segment.maxDoc(), accept);
+      return;
+    }
     DocsReader docs(segment.postingsReader(), *info);
-    if (!docs.hasBitset()) return;
-    screaming::BitSet::Iterator values(docs.bitset());
+    const auto* bitmap = docs.bitset();
+    if (!bitmap) return;
+    screaming::BitSet::Iterator values(*bitmap);
     forEachDomainDoc(domain, segment.maxDoc(), [&](int32_t doc) {
       if (values.val() < doc) values.advance(doc);
       if (values.val() != doc) accept(doc);
@@ -174,19 +183,19 @@ public:
 
   // The points format here is the same one-dimensional numeric format used
   // by range counts. Other points shapes must use the column predicate.
-  static bool numericIdentityPoints(const SegFieldInfo& info) {
-    return info.pointsMetaOff != 0 && FieldType::isNumericColumn(info.type);
+  static bool numericIdentityPoints(const DecodedFieldRecord& info) {
+    return info.points() && FieldType::isNumericColumn(info.type);
   }
 
   // Value counts are document counts when every present doc has one value,
   // even if the segment uses the multi-valued column representation.
-  static bool valuesAreDocuments(const SegFieldInfo& info) {
+  static bool valuesAreDocuments(const DecodedFieldRecord& info) {
     return info.numValues == info.docsWithField;
   }
 
   // Compare a block's shared column pass with its points fences before
   // constructing one predicate supplier per bucket.
-  bool numericIdentitiesLead(size_t segment, const SegFieldInfo& info, DocSet* eligibility,
+  bool numericIdentitiesLead(size_t segment, const DecodedFieldRecord& info, DocSet* eligibility,
       size_t count, std::function_ref<PointsReader::ValueRange(size_t)> bounds);
 
   // Uncached predicate execution owns the indexed representation choice.
@@ -199,15 +208,13 @@ public:
                      auto&& visitColumn) {
     auto& segment = reader.segments()[segnum];
     int32_t maxDoc = segment.maxDoc();
-    auto* info = fieldInfo(segnum);
-    bool found = info != nullptr;
-    if (!found) {
+    auto* info = numberFieldInfo(segnum);
+    if (!info) {
       // field absent in this segment: every in-domain doc is missing.
       missing_num += domain ? domain->card() : maxDoc;
       return false;
     }
-    const auto& segFieldInfo = *info;
-    IntColReader intColReader(segment.postingsReader(), segFieldInfo);
+    IntColReader intColReader(segment.postingsReader(), *info);
     visitColumn(intColReader, maxDoc);
     return true;
   }
@@ -219,18 +226,16 @@ public:
   bool facetSegIntCol(DocSet* domain, int32_t segnum, int64_t& missing_num, auto&& callback) {
     auto& segment = reader.segments()[segnum];
     int32_t maxDoc = segment.maxDoc();
-    auto* info = fieldInfo(segnum);
-    bool found = info != nullptr;
-    if (!found) {
+    auto* info = numberFieldInfo(segnum);
+    if (!info) {
       // field absent in this segment: every in-domain doc is missing.
       missing_num += domain ? domain->card() : maxDoc;
       return false;
     }
-    const auto& segFieldInfo = *info;
     // Walk the domain over the int column.  forEachIntColValue owns the
     // domain-type x single/multi x dense/sparse dispatch (and the one
     // (BitDocSet*)/(ArrDocSet*) cast); callback is per value.
-    IntColReader intColReader(segment.postingsReader(), segFieldInfo);
+    IntColReader intColReader(segment.postingsReader(), *info);
     forEachIntColValue(domain, intColReader, maxDoc, missing_num, callback);
     return true;
   }
@@ -243,7 +248,7 @@ public:
   // callback to the plain walk unchanged.
   bool facetSegIntDistinct(DocSet* domain, int32_t segnum, int64_t& missing_num,
                            auto&& callback) {
-    auto* info = fieldInfo(segnum);
+    auto* info = numberFieldInfo(segnum);
     if (!info || valuesAreDocuments(*info) || !(info->flags & FieldType::MULTI_ARRAY)) {
       return facetSegIntCol(domain, segnum, missing_num,
                             std::forward<decltype(callback)>(callback));
@@ -258,7 +263,7 @@ public:
   // no dedup state; ARRAY scratch is reused per doc and charged to the request.
   bool facetSegIntBuckets(DocSet* domain, int32_t segnum, int64_t& missing_num,
                           auto&& bucketOf, auto&& callback) {
-    auto* info = fieldInfo(segnum);
+    auto* info = numberFieldInfo(segnum);
     if (!info || valuesAreDocuments(*info)) {
       return facetSegIntCol(domain, segnum, missing_num,
           [&](int32_t doc, int64_t value) LUXIR_INLINE {
@@ -310,13 +315,12 @@ public:
                       const OrdMap::SegToGlobal& ordSpace, auto&& callback) {
     auto& segment = reader.segments()[segnum];
     int32_t maxDoc = segment.maxDoc();
-    auto* info = fieldInfo(segnum);
+    auto* info = ordFieldInfo(segnum);
     if (!info) {
       missing_num += domain ? domain->card() : maxDoc;
       return false;
     }
-    const auto& segFieldInfo = *info;
-    OrdColReader ordColReader(segment.postingsReader(), segFieldInfo);
+    OrdColReader ordColReader(segment.postingsReader(), *info);
     forEachOrdDocument(domain, ordColReader, ordSpace, maxDoc, missing_num,
                     req.memoryTracker, facetName, callback);
     return true;
@@ -453,14 +457,13 @@ public:
 
     template <bool Identity = false>
     DomainHandle materializeTermDomain(
-        int32_t segnum, std::string_view term, DocSet* inputDomain) {
+        int32_t segnum, const DecodedFieldRecord* info, std::string_view term, DocSet* inputDomain) {
       auto& segment = fieldOp().reader.segments()[(size_t)segnum];
       int32_t maxDoc = segment.maxDoc();
       auto poolGuard = MemPool::threadLocalPoolGuard();
       std::unique_ptr<DocSet> domain;
-      if (auto* info = fieldOp().fieldInfo(segnum)) {
-        const auto& segFieldInfo = *info;
-        TermsEnum terms(poolGuard.pool(), segment.postingsReader(), segFieldInfo);
+      if (info && info->terms()) {
+        TermsEnum terms(poolGuard.pool(), segment.postingsReader(), *info);
         if (terms.seek(term)) {
           int32_t docFreq = terms.docFreq();
           DocsOnlyEnum postings(terms);
@@ -485,31 +488,27 @@ public:
                          const std::shared_ptr<OrdMap>& ordMap = {}) {
       auto& facet = fieldOp();
       int32_t maxDoc = facet.reader.segments()[segnum].maxDoc();
-      auto* info = facet.fieldInfo((int32_t)segnum);
-      bool identityLeads = false;
-      if (info) {
-        if constexpr (std::is_same_v<Key, std::string_view>) {
-          // materializePostingsIntersection chooses postings or its sparse
-          // eligibility as the lead, using docFreq and eligibility cardinality.
-          identityLeads = (info->flags & FieldType::INDEX_DOCS) != 0;
-        } else {
-          identityLeads = numericIdentityPoints(*info)
-              && facet.numericIdentitiesLead(segnum, *info, eligibility.get(), buckets.size(),
-                  [&](size_t i) -> PointsReader::ValueRange {
-                    return {buckets[i].key, buckets[i].key};
-                  });
+      if constexpr (std::is_same_v<Key, std::string_view>) {
+        // Text buckets and ordinal buckets both have a postings identity.
+        if (auto* info = facet.segInfos.at(segnum); info && info->terms()) {
+          for (size_t i = 0; i < buckets.size(); i++) {
+            feed(i, materializeTermDomain<true>((int32_t)segnum, info, buckets[i].key, eligibility.get()));
+          }
+          return;
         }
-      }
-      if (identityLeads) {
-        for (size_t i = 0; i < buckets.size(); i++) {
-          if constexpr (std::is_same_v<Key, std::string_view>) {
-            feed(i, materializeTermDomain<true>((int32_t)segnum, buckets[i].key, eligibility.get()));
-          } else {
+      } else {
+        const auto* info = facet.numberFieldInfo((int32_t)segnum);
+        if (info && numericIdentityPoints(*info)
+            && facet.numericIdentitiesLead(segnum, *info, eligibility.get(), buckets.size(),
+                [&](size_t i) -> PointsReader::ValueRange {
+                  return {buckets[i].key, buckets[i].key};
+                })) {
+          for (size_t i = 0; i < buckets.size(); i++) {
             feed(i, facet.numericPredicateIdentity(
                 segnum, buckets[i].key, buckets[i].key, eligibility.get()));
           }
+          return;
         }
-        return;
       }
       feedFacetBucketDomainChunks(maxDoc, buckets,
           forcedFacetBucketDomainByteBudget ? forcedFacetBucketDomainByteBudget
@@ -524,7 +523,6 @@ public:
             return buildFacetBucketDomains(facet.reader.segments()[segnum], chunk.size(), [&](auto&& accept) {
               int64_t missing = 0;
               if constexpr (std::is_same_v<Key, std::string_view>) {
-                assert(ordMap || !info);
                 if (ordMap) facet.facetSegOrdCol(eligibility.get(), (int32_t)segnum, missing,
                     ordMap->getSegToGlobal((int32_t)segnum), accept);
               } else facet.facetSegIntCol(eligibility.get(), (int32_t)segnum, missing, accept);
@@ -790,7 +788,7 @@ public:
       auto& facet = this->fieldOp();
       auto pool = MemPool::threadLocalPoolGuard();
       auto& segment = facet.reader.segments()[(size_t)segnum];
-      auto* info = facet.fieldInfo(segnum);
+      auto* info = Ordinal ? facet.ordFieldInfo(segnum) : facet.numberFieldInfo(segnum);
       int64_t missing = 0;
       facet.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
         if (!info) { missing = domain ? domain->card() : segment.maxDoc(); return; }
@@ -807,7 +805,7 @@ public:
       });
       if (facet.missing && missing != 0) {
         facet.collectGroups(data, segnum, domain, [&](auto group, auto, auto missingBucket) {
-          facet.forEachMissing(domain, segnum,
+          facet.forEachMissing(domain, segnum, info,
               [&](int32_t doc) { missingBucket(group(doc)); });
         });
       }
@@ -1030,13 +1028,10 @@ public:
     GlobalRange r;
     for (size_t segnum = 0; segnum < reader.segments().size(); segnum++) {
       auto* info = infos.at(segnum);
-      if (!info) continue;
-      const auto& segFieldInfo = *info;
-      if (segFieldInfo.numValues == 0) continue;
-
-      assert(info->columnBounds);
-      r.min = std::min(r.min, info->columnBounds->min);
-      r.max = std::max(r.max, info->columnBounds->max);
+      const auto* bounds = info ? info->scalarBounds() : nullptr;
+      if (!bounds) continue;
+      r.min = std::min(r.min, bounds->min);
+      r.max = std::max(r.max, bounds->max);
     }
     if (r.min <= r.max) {
       // width = (#distinct values) - 1, computed unsigned: max-min can exceed
@@ -1220,7 +1215,7 @@ public:
       if (forcedFacetBucketDomainSource == FacetBucketDomainSource::ORD_COLUMN) return false;
       int64_t domainDocs = 0, maxDocs = 0, selectedDocs = 0;
       for (size_t segnum = 0; segnum < input.size(); segnum++) {
-        auto* info = thisOp().fieldInfo((int32_t)segnum);
+        auto* info = thisOp().numberFieldInfo((int32_t)segnum);
         if (info != nullptr && !(info->flags & FieldType::INDEX_DOCS)) return false;
         int32_t segmentMax = thisOp().reader.segments()[segnum].maxDoc();
         maxDocs += segmentMax;
@@ -1245,9 +1240,10 @@ public:
       if (postings) {
         executeBucketChildren<int64_t>(buckets, FacetBucketProducer::INDEPENDENT, input,
             [this](size_t segnum, auto block, FacetBucketFeed feed) {
+              const auto* info = thisOp().numberFieldInfo((int32_t)segnum);
               for (size_t i = 0; i < block.size(); i++) {
                 auto term = encodeNumericTerm(block[i].key);
-                feed(i, materializeTermDomain((int32_t)segnum,
+                feed(i, materializeTermDomain((int32_t)segnum, info,
                     std::string_view(term.data(), term.size()), input[segnum].get()));
               }
             });
@@ -1429,18 +1425,18 @@ public:
         int32_t maxDoc = segment.maxDoc();
         DomainView domainView(domain, maxDoc);
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        auto* info = thisOp().fieldInfo(segnum);
+        auto* info = thisOp().segInfos.at((size_t)segnum);
         if (!info) {
           // field absent in this segment: all in-domain docs are missing
           data.missing_num += domainView.card;
           return;
         }
         auto& postingsReader = segment.postingsReader();
-        const auto& segFieldInfo = *info;
+        const auto& fieldInfo = *info;
         if (domainView.compCard != 0) {
           domainView.materializeBits(poolGuard.pool());
         }
-        TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+        TermsEnum tenum(poolGuard.pool(), postingsReader, fieldInfo);
         while (tenum.nextTerm()) {
           int32_t docFreq = tenum.docFreq();
           int64_t count;
@@ -1457,7 +1453,7 @@ public:
           }
         }
         if (thisOp().missing) {
-          DocsReader docsReader(postingsReader, segFieldInfo);
+          DocsReader docsReader(postingsReader, fieldInfo);
           data.missing_num += countMissingInDomain(domainView, docsReader);
         }
       });
@@ -1469,7 +1465,7 @@ public:
         data.counts.initialize(0, false, true);
         auto& segment = thisOp().reader.segments()[(size_t)segnum];
         DomainView view(domain, segment.maxDoc());
-        auto* field = thisOp().fieldInfo(segnum);
+        auto* field = thisOp().segInfos.at((size_t)segnum);
         if (!field) {
           data.missing_num += view.card;
           return;
@@ -1525,8 +1521,9 @@ public:
       executeBucketChildren<std::string_view>(buckets,
           FacetBucketProducer::INDEPENDENT, input,
           [this](size_t segnum, auto block, FacetBucketFeed feed) {
+            auto* info = thisOp().segInfos.at(segnum);
             for (size_t i = 0; i < block.size(); i++) {
-              feed(i, materializeTermDomain((int32_t)segnum, block[i].key,
+              feed(i, materializeTermDomain((int32_t)segnum, info, block[i].key,
                                             input[segnum].get()));
             }
           });
@@ -1994,7 +1991,7 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
 
   void feedRangeDomains(size_t segnum, std::span<const SelectedFacetBucket<size_t>> block,
       DomainHandle eligibility, FacetBucketFeed feed, BucketLayout layout, bool identity) {
-    if (identity) if (auto* info = fieldInfo((int32_t)segnum)) {
+    if (identity) if (auto* info = numberFieldInfo((int32_t)segnum)) {
       if (numericIdentityPoints(*info)
           && numericIdentitiesLead(segnum, *info, eligibility.get(), block.size(),
               [&](size_t i) -> PointsReader::ValueRange {
@@ -2026,7 +2023,7 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
   bool facetSegIntZones(DocSet* domain, int32_t segnum, int64_t& missing_num,
                         V& visitor) {
     if (disableZoneRangeFacetForTests) return false;
-    auto* info = fieldInfo(segnum);
+    auto* info = numberFieldInfo(segnum);
     if (info && !valuesAreDocuments(*info)) return false;
     bool walked = true;
     withIntColumn(domain, segnum, missing_num,
@@ -2230,7 +2227,7 @@ public:
         });
         if (range.missing && missing != 0) range.collectGroups(data, segnum, domain,
             [&](auto group, auto, auto missingBucket) {
-              range.forEachMissing(domain, segnum,
+              range.forEachMissing(domain, segnum, range.numberFieldInfo(segnum),
                   [&](int32_t doc) { missingBucket(group(doc)); });
             });
       } else {
@@ -2242,18 +2239,18 @@ public:
           && domain == nullptr && !segment.hasDeletes() && noSubOps
           && start < end) {
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        if (auto* info = rangeOp().fieldInfo(segnum)) {
-          const auto& segFieldInfo = *info;
-          bool oneDimensionalNumeric = FieldType::isNumericColumn(segFieldInfo.type);
-          if (segFieldInfo.pointsMetaOff != 0 && oneDimensionalNumeric
-              && valuesAreDocuments(segFieldInfo)) {
-            IntColReader column(segment.postingsReader(), segFieldInfo);
-            PointsReader points(segment.postingsReader(), segFieldInfo);
+        if (auto* info = rangeOp().numberFieldInfo(segnum)) {
+          const auto& fieldInfo = *info;
+          bool oneDimensionalNumeric = FieldType::isNumericColumn(fieldInfo.type);
+          if (fieldInfo.points() && oneDimensionalNumeric
+              && valuesAreDocuments(fieldInfo)) {
+            IntColReader column(segment.postingsReader(), fieldInfo);
+            PointsReader points(segment.postingsReader(), fieldInfo);
             if (points.pointCount() != (uint64_t)column.numValues()) {
               throw std::runtime_error(
                   "IntFacetRangeReq: points/column value count mismatch");
             }
-            data.missing_num += segment.maxDoc() - column.docsWithValue();
+            data.missing_num += segment.maxDoc() - column.docsWithField();
             auto residualScratch = poolGuard.pool().make_span<uint32_t>(
                 points.maxPointsPerLeaf());
             auto rawScratch = poolGuard.pool().make_span<int64_t>(

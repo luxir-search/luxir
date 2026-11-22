@@ -23,7 +23,7 @@ namespace luxir {
 /// See StoredFieldsWriter.h for the on-disk layout.
 ///
 /// Usage:
-///   StoredFieldsReader reader(postingsReader, segFieldInfo);
+///   StoredFieldsReader reader(postingsReader, record);
 ///   reader.readDoc(docID,
 ///     [](std::string_view name, std::span<const std::string_view> values) {
 ///       // receives one callback per field; values has one entry for
@@ -49,14 +49,14 @@ namespace luxir {
 ///
 class StoredFieldsReader {
 private:
+  PostingsReader& postings;  // Supplies the raw dictionary bytes on request.
   const StoredFieldsMetadata* metadata;
-  InputStream chunkIS;
-  int64_t chunksStart = 0;
-  int64_t chunksRegionEnd = 0;
-  int32_t numChunks_ = 0;
-  int32_t maxDoc_ = 0;
-  std::optional<MonoReader> firstDocCol;     // chunkN -> firstDocID
-  std::optional<MonoReader> chunkOffsetCol;  // chunkN -> file offset (numChunks+1 entries)
+  const field_parts::Stored* stored;  // Resource descriptor in the cached field record.
+  const StoredDecompressionDictionary* dictionaryDecoder;
+  const char* chunks = nullptr;
+  int32_t maxdoc = 0;
+  MonoReader firstDocCol;     // chunkN -> firstDocID
+  MonoReader chunkOffsetCol;  // chunkN -> file offset (numChunks+1 entries)
 
   std::vector<char> scratch;
   std::vector<std::string_view> valueSpanScratch;
@@ -69,21 +69,24 @@ private:
   };
 
 public:
-  StoredFieldsReader(PostingsReader& postingsReader, const PostingsReader::Field& fieldInfo)
-    : metadata(fieldInfo.stored.get()),
-      maxDoc_(postingsReader.maxDoc())
+  // COPY_CHUNKS opens the directories needed for verbatim chunk copying.
+  enum class Access { DECOMPRESS, COPY_CHUNKS };
+
+  StoredFieldsReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo,
+                     Access access = Access::DECOMPRESS)
+    : postings(reader), metadata(reader.openStoredMetadata(fieldInfo)),
+      stored(metadata ? reader.fieldInfo(fieldInfo.ordinal)->stored() : nullptr),
+      dictionaryDecoder(access == Access::DECOMPRESS && metadata
+          ? reader.openStoredDictionary(*stored, *metadata) : nullptr),
+      maxdoc(fieldInfo.docsWithField)
   {
-    assert(FieldType::storage(fieldInfo.type) == FieldType::Storage::BIN);
-    assert(fieldInfo.numValues > 0);
-    assert(metadata != nullptr);
+    assert(stored);
+    chunks = reader.core().slice(stored->chunks()).data();
 
-    chunkIS = postingsReader.core().getInputStream(fieldInfo.columnLoc.filenum());
-    chunksStart = (int64_t)fieldInfo.columnLoc.offset();
-    chunksRegionEnd = chunksStart + fieldInfo.columnMetaOff;
-    numChunks_ = (int32_t)fieldInfo.numValues;
-
-    firstDocCol.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, numChunks_);
-    chunkOffsetCol.emplace(postingsReader, fieldInfo.mono2Loc, fieldInfo.mono2MetaOff, numChunks_ + 1);
+    auto context = segmentReadContext(reader.core(), fieldInfo, stored->chunkOffsets.location.filenum());
+    firstDocCol = MonoReader(reader.core(), stored->firstDocs, stored->numChunks, context.field);
+    chunkOffsetCol = MonoReader(reader.core(), stored->chunkOffsets, (int64_t)stored->numChunks + 1, context.field);
+    chunkOffsetCol.requireLast(stored->chunksBytes, context, "last chunk offset differs from the chunks length");
   }
 
   // Invokes callback once for each stored-field entry on docID:
@@ -98,12 +101,12 @@ public:
   // contract).  Docs with nothing stored produce no callbacks.
   template <class Callback>
   void readDoc(int32_t docID, Callback&& callback) {
-    assert(docID >= 0 && docID < maxDoc_);
+    assert(docID >= 0 && docID < maxdoc);
 
     auto [chunkNum, firstDocInChunk] = findChunk(docID);
-    int32_t firstDocInNext = (chunkNum + 1 < numChunks_)
-        ? (int32_t)firstDocCol->valueAt(chunkNum + 1)
-        : maxDoc_;
+    int32_t firstDocInNext = (chunkNum + 1 < numChunks())
+        ? (int32_t)firstDocCol.valueAt(chunkNum + 1)
+        : maxdoc;
     int32_t numDocsInChunk = firstDocInNext - firstDocInChunk;
     int32_t docIndex = docID - firstDocInChunk;
     assert(docIndex >= 0 && docIndex < numDocsInChunk);
@@ -124,8 +127,8 @@ public:
     for (uint32_t i = 0; i < numFields; i++) {
       uint32_t fid = InputStream::readVint(p, pend);
       uint32_t numValues = InputStream::readVint(p, pend);
-      assert(fid < metadata->fieldNames.size());
-      std::string_view fieldName = metadata->fieldNames[fid];
+      assert(fid < metadata->fieldNames().size());
+      auto fieldName = std::string_view(metadata->fieldNames()[fid]);
       valueSpanScratch.resize(0);
       valueSpanScratch.reserve(numValues);
       for (uint32_t v = 0; v < numValues; v++) {
@@ -175,13 +178,13 @@ public:
   // value views - cheap to call even on docs with many stored fields.
   template <class Callback>
   bool readFieldById(int32_t docID, int32_t targetFid, Callback&& callback) {
-    assert(docID >= 0 && docID < maxDoc_);
-    assert(targetFid >= 0 && (size_t)targetFid < metadata->fieldNames.size());
+    assert(docID >= 0 && docID < maxdoc);
+    assert(targetFid >= 0 && (size_t)targetFid < metadata->fieldNames().size());
 
     auto [chunkNum, firstDocInChunk] = findChunk(docID);
-    int32_t firstDocInNext = (chunkNum + 1 < numChunks_)
-        ? (int32_t)firstDocCol->valueAt(chunkNum + 1)
-        : maxDoc_;
+    int32_t firstDocInNext = (chunkNum + 1 < numChunks())
+        ? (int32_t)firstDocCol.valueAt(chunkNum + 1)
+        : maxdoc;
     int32_t numDocsInChunk = firstDocInNext - firstDocInChunk;
     int32_t docIndex = docID - firstDocInChunk;
     assert(docIndex >= 0 && docIndex < numDocsInChunk);
@@ -223,15 +226,15 @@ public:
     return any;
   }
 
-  int32_t numChunks() const { return numChunks_; }
+  int32_t numChunks() const { return stored->numChunks; }
 
   // Encoded document views borrow the one decompressed chunk. Returning false
   // from the callback stops the visit; views expire on the next chunk read.
   template <class Callback>
   void readChunkDocs(int32_t chunkNum, Callback&& callback) {
-    assert(chunkNum >= 0 && chunkNum < numChunks_);
-    int32_t first = (int32_t)firstDocCol->valueAt(chunkNum);
-    int32_t end = chunkNum + 1 < numChunks_ ? (int32_t)firstDocCol->valueAt(chunkNum + 1) : maxDoc_;
+    assert(chunkNum >= 0 && chunkNum < numChunks());
+    int32_t first = (int32_t)firstDocCol.valueAt(chunkNum);
+    int32_t end = chunkNum + 1 < numChunks() ? (int32_t)firstDocCol.valueAt(chunkNum + 1) : maxdoc;
     decompressChunk(chunkNum);
     const int32_t* offsets = (const int32_t*)scratch.data();
     for (int32_t doc = first; doc < end; doc++) {
@@ -241,15 +244,18 @@ public:
     }
   }
 
-  int32_t maxDoc() const { return maxDoc_; }
-  int64_t maxChunkBytes() const { return metadata->maxChunkBytes; }
+  int32_t maxDoc() const { return maxdoc; }
+  int64_t maxChunkBytes() const { return stored->maxChunkBytes; }
   // Chunks sealed before reaching the chunk limits (see StoredFieldsWriter).
-  int32_t numDirtyChunks() const { return metadata->numDirtyChunks; }
+  int32_t numDirtyChunks() const { return stored->numDirtyChunks; }
   // Codec and chunk limits this resource was written with.
-  const StoredChunkFormat& format() const { return metadata->format; }
+  StoredChunkFormat format() const { return stored->format(); }
   // The trained ZSTD dictionary every chunk was compressed with, or empty.
   // The view stays valid for as long as the PostingsReader is alive.
-  std::string_view dictionary() const { return metadata->dictionary; }
+  std::string_view dictionary() const {
+    auto slice = stored->dictionary();
+    return slice ? std::string_view(postings.core().slice(slice)) : std::string_view();
+  }
 
   // Every field name this resource holds, in segment-local field-id order.
   // The views point into the resource's metadata in the segment file, so they
@@ -257,44 +263,34 @@ public:
   // alive - beyond this reader object itself.  Merges also use this table to
   // decide whether compressed chunk bodies (which reference these ids) can be
   // copied verbatim.
-  std::span<const std::string_view> fieldNames() const { return metadata->fieldNames; }
+  std::span<const PackedTerm> fieldNames() const { return metadata->fieldNames(); }
 
   // Raw access to the contiguous chunks region ([int32 uncompressedSize]
   // [compressed bytes] per chunk, metadata excluded), for verbatim copy by
   // merges.
-  const char* chunkRegionPtr() const { return chunkIS.ptr(chunksStart); }
-  int64_t chunkRegionBytes() const { return chunksRegionEnd - chunksStart; }
+  const char* chunkRegionPtr() const { return chunks; }
+  int64_t chunkRegionBytes() const { return stored->chunksBytes; }
 
   // Copy out the chunk directory: per-chunk first docID and file offset
-  // relative to the region start (the mono2 sentinel is not included).
+  // relative to the region start (the final chunk offset is not included).
   void readChunkDirectory(std::vector<int64_t>& firstDocs,
                           std::vector<int64_t>& fileOffsets) const {
-    firstDocs.resize((size_t)numChunks_);
-    fileOffsets.resize((size_t)numChunks_);
-    for (int32_t i = 0; i < numChunks_; i++) {
-      firstDocs[(size_t)i] = firstDocCol->valueAt(i);
-      fileOffsets[(size_t)i] = chunkOffsetCol->valueAt(i);
+    auto chunkCount = numChunks();
+    firstDocs.resize((size_t)chunkCount);
+    fileOffsets.resize((size_t)chunkCount);
+    for (int32_t i = 0; i < chunkCount; i++) {
+      firstDocs[(size_t)i] = firstDocCol.valueAt(i);
+      fileOffsets[(size_t)i] = chunkOffsetCol.valueAt(i);
     }
-  }
-
-  // Cheap metadata-only read for merge admission.  Does not allocate or build
-  // chunk offset readers; it only peeks at the stored-fields metadata header.
-  static int64_t peekMaxChunkBytes(PostingsReader& postingsReader,
-                                   const SegFieldInfo& fieldInfo) {
-    assert(FieldType::storage(fieldInfo.type) == FieldType::Storage::BIN);
-    InputStream chunkIS = postingsReader.core().getInputStream(fieldInfo.columnLoc.filenum());
-    int64_t metadataOffset = (int64_t)fieldInfo.columnLoc.offset() + fieldInfo.columnMetaOff;
-    const char* metaPtr = chunkIS.ptr(metadataOffset);
-    const char* end = chunkIS.ptr(chunkIS.size());
-    return (int64_t)InputStream::readVlong(metaPtr, end);
   }
 
 private:
   // Linear scan of the field table; typical segments have O(10) stored fields, so
   // a map isn't worth the overhead.
   int32_t findFieldId(std::string_view fieldName) const {
-    for (size_t i = 0; i < metadata->fieldNames.size(); i++) {
-      if (metadata->fieldNames[i] == fieldName) return (int32_t)i;
+    auto names = fieldNames();
+    for (size_t i = 0; i < names.size(); i++) {
+      if (names[i] == fieldName) return (int32_t)i;
     }
     return -1;
   }
@@ -312,18 +308,18 @@ private:
   // Returns both the chunk number and the chunk's first docID, which the
   // caller uses without a redundant valueAt().
   ChunkLookup findChunk(int32_t docID) const {
-    assert(numChunks_ > 0);
-    int32_t guess = (int32_t)((int64_t)docID * numChunks_ / maxDoc_);
-    if (guess >= numChunks_) guess = numChunks_ - 1;
+    const auto chunkCount = numChunks();
+    int32_t guess = (int32_t)((int64_t)docID * chunkCount / maxdoc);
+    if (guess >= chunkCount) guess = chunkCount - 1;
     if (guess < 0) guess = 0;
 
-    int32_t firstDoc = (int32_t)firstDocCol->valueAt(guess);
+    int32_t firstDoc = (int32_t)firstDocCol.valueAt(guess);
     if (firstDoc <= docID) {
       // Walk forward while the next chunk's first doc is also <= docID.
       // If we advance at all, the new position was already confirmed by
       // this very probe - no need to verify backward afterwards.
-      while (guess + 1 < numChunks_) {
-        int32_t nextFirst = (int32_t)firstDocCol->valueAt(guess + 1);
+      while (guess + 1 < chunkCount) {
+        int32_t nextFirst = (int32_t)firstDocCol.valueAt(guess + 1);
         if (nextFirst > docID) break;
         guess++;
         firstDoc = nextFirst;
@@ -333,7 +329,7 @@ private:
       do {
         assert(guess > 0);  // chunk 0's firstDoc is 0 <= any valid docID
         guess--;
-        firstDoc = (int32_t)firstDocCol->valueAt(guess);
+        firstDoc = (int32_t)firstDocCol.valueAt(guess);
       } while (firstDoc > docID);
     }
     return {guess, firstDoc};
@@ -343,17 +339,17 @@ private:
     if (chunkNum == cachedChunkNum) {
       return;
     }
-    int64_t off = chunkOffsetCol->valueAt(chunkNum);
-    int64_t nextOff = chunkOffsetCol->valueAt(chunkNum + 1);
+    int64_t off = chunkOffsetCol.valueAt(chunkNum);
+    int64_t nextOff = chunkOffsetCol.valueAt(chunkNum + 1);
 
-    const char* chunkPtr = chunkIS.ptr(chunksStart + off);
+    const char* chunkPtr = chunks + off;
     int32_t uncompressedSize;
     memcpy(&uncompressedSize, chunkPtr, sizeof(int32_t));
     chunkPtr += sizeof(int32_t);
     int32_t compressedSize = (int32_t)(nextOff - off) - (int32_t)sizeof(int32_t);
 
     scratch.resize((size_t)uncompressedSize);
-    decompressor.decompress(metadata->format.codec, metadata->ddict ? &*metadata->ddict : nullptr,
+    decompressor.decompress(stored->codec, dictionaryDecoder,
                             chunkPtr, (size_t)compressedSize,
                             scratch.data(), scratch.size());
     cachedChunkNum = chunkNum;

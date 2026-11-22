@@ -198,7 +198,8 @@ void rangeFilterBench(benchmark::State& state, const char* lead,
   auto infos = index.reader->field(field);
   int64_t outside = 0;
   for (auto& segment : index.reader->segments()) {
-    IntColReader column(segment.postingsReader(), *infos.at(segment.ord));
+    const auto& columnInfo = *infos.at(segment.ord);
+    IntColReader column(segment.postingsReader(), columnInfo);
     for (int64_t block = 0; block < column.numBlocks(); block++) {
       range.classifyBlock(column, block).forEachRun(column.valuesInBlock(block),
           [&](NumericPredicateQuery::BlockRelation relation, uint32_t begin, uint32_t end) {

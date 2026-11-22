@@ -199,8 +199,9 @@ TEST_F(IntColTest, minMaxValues) {
   f.startReading();
   f.nextSegment();
   
-  ASSERT_EQ(-100, f.colReader->getMin());
-  ASSERT_EQ(200, f.colReader->getMax());
+  const auto* bounds = f.fieldInfo().scalarBounds();
+  ASSERT_NE(nullptr, bounds);
+  EXPECT_EQ((field_parts::ScalarBounds{-100, 200}), *bounds);
   
   ASSERT_EQ(0, f.nextDoc());
   ASSERT_EQ(100, f.val());
@@ -231,8 +232,9 @@ TEST_F(IntColTest, minMaxSingleValue) {
   
   // Min and max should both be 42
   ASSERT_NE(f.colReader, nullptr);
-  ASSERT_EQ(42, f.colReader->getMin());
-  ASSERT_EQ(42, f.colReader->getMax());
+  const auto* bounds = f.fieldInfo().scalarBounds();
+  ASSERT_NE(nullptr, bounds);
+  EXPECT_EQ((field_parts::ScalarBounds{42, 42}), *bounds);
 }
 
 // Blocks whose value range crosses 2^31 (or the full int64 span) used to
@@ -425,8 +427,9 @@ TEST_F(IntColTest, linearPackFormatCorners) {
 
     auto in = dir.openFile("numeric");
     InputStream input(in->getInputStream());
-    IntColReader reader(
-        input, data.columnLoc, data.columnMetaOff, data.numValues);
+    IntColReader reader(input.ptr(data.columnLoc),
+                        std::span(input.ptr(data.columnLoc + data.columnMetaOff), data.indexBytes),
+                        data.numValues);
     EXPECT_EQ(reader.numValues(), (int64_t)expected.size());
     EXPECT_EQ(reader.numBlocks(),
               ((int64_t)expected.size() + IntColReader::BLOCK_SIZE - 1) /
@@ -462,10 +465,8 @@ TEST_F(IntColTest, linearPackFormatCorners) {
     }
     expectLeafVisitOrders(reader);
     expectValueSketch(reader, expected);
-    // The bounds trailer follows the leaf orders and the value sketch.
     auto [minIt, maxIt] = std::minmax_element(expected.begin(), expected.end());
-    EXPECT_EQ(reader.getMin(), *minIt);
-    EXPECT_EQ(reader.getMax(), *maxIt);
+    EXPECT_EQ((field_parts::ScalarBounds{*minIt, *maxIt}), data.bounds);
     return reader.blockInfo(0);
   };
 
@@ -561,7 +562,8 @@ TEST_F(IntColTest, leafVisitOrders) {
   dir.finishFile(*file);
   auto in = dir.openFile("numeric");
   InputStream input(in->getInputStream());
-  IntColReader reader(input, data.columnLoc, data.columnMetaOff,
+  IntColReader reader(input.ptr(data.columnLoc),
+                      std::span(input.ptr(data.columnLoc + data.columnMetaOff), data.indexBytes),
                       data.numValues);
 
   ASSERT_EQ((int64_t)zones.size(), reader.numLeafZones());
@@ -576,8 +578,7 @@ TEST_F(IntColTest, leafVisitOrders) {
   }
   EXPECT_EQ((std::vector<int64_t>{6, 4, 1, 3, 8, 0, 2, 5, 9, 7}), ascending);
   EXPECT_EQ((std::vector<int64_t>{3, 5, 8, 0, 1, 9, 7, 2, 4, 6}), descending);
-  EXPECT_EQ(-2, reader.getMin());
-  EXPECT_EQ(12, reader.getMax());
+  EXPECT_EQ((field_parts::ScalarBounds{-2, 12}), data.bounds);
 }
 
 // Merges rewrite columns through the writer, so a merged column carries
@@ -625,7 +626,8 @@ TEST_F(IntColTest, valueSketchEstimates) {
     dir.finishFile(*file);
     auto in = dir.openFile("numeric");
     InputStream input(in->getInputStream());
-    IntColReader reader(input, data.columnLoc, data.columnMetaOff,
+    IntColReader reader(input.ptr(data.columnLoc),
+                        std::span(input.ptr(data.columnLoc + data.columnMetaOff), data.indexBytes),
                         data.numValues);
     auto sorted = expectValueSketch(reader, values);
     auto sketch = reader.leafMeta().valueSketch();
@@ -700,7 +702,7 @@ TEST_F(IntColTest, valueSketchEstimates) {
 
 // Only the columns field-sort planning reads persist a value sketch: a
 // single-valued INT column, flushed or merged. A multi-valued one writes an
-// empty sketch, its bounds trailer still in place.
+// empty sketch and keeps its bounds in the field record.
 TEST_F(IntColTest, valueSketchOnlyForSortableColumns) {
   CollectionHelper helper("sketch_presence");
   auto writer = helper.getIndexWriter();
@@ -728,8 +730,9 @@ TEST_F(IntColTest, valueSketchOnlyForSortableColumns) {
         if (field == "one_i") {
           EXPECT_EQ(column.numValues(), sketch.values());
         } else {
-          EXPECT_EQ(-699, column.getMin());
-          EXPECT_EQ(699, column.getMax());
+          const auto* bounds = fieldInfo.scalarBounds();
+          ASSERT_NE(nullptr, bounds);
+          EXPECT_EQ((field_parts::ScalarBounds{-699, 699}), *bounds);
         }
       }
     }
@@ -929,15 +932,15 @@ TEST_F(IntColTest, testMono) {
     w.addInt64(28); // -2 over line
     w.addInt64(40);
     // total range of 7 for deltas from expected means bits should be 3.
-    int nVals = w.finish();
+    auto data = w.finish();
     out.close();
     dir.finishFile(*file);
 
     auto in = dir.openFile("mono");
     InputStream is(in->getInputStream());
-    MonoReader r(is, w.blockLoc.offset(), w.metaOff, nVals);
+    MonoReader r(is, data.columnLoc, data.columnMetaOff, data.numValues);
 
-    ASSERT_EQ(nVals, r.numValues());
+    ASSERT_EQ(data.numValues, r.numValues());
     ASSERT_EQ(10, r.valueAt(0));
     ASSERT_EQ(25, r.valueAt(1));
     ASSERT_EQ(28, r.valueAt(2));
@@ -953,7 +956,7 @@ TEST_F(IntColTest, testMono) {
     MonoWriter w(pool, out);
     w.addInt64(123);
     // total range of 7 for deltas from expected means bits should be 3.
-    int nVals = w.finish();
+    auto data = w.finish();
     out.close();
     dir.finishFile(*file);
 
@@ -961,9 +964,9 @@ TEST_F(IntColTest, testMono) {
     InputStream is(in->getInputStream());
     //   MonoReader(InputStream& columnIS, int64_t loc, int64_t metaOff, int64_t nValues) : nValues(nValues)
 
-    MonoReader r(is, w.blockLoc.offset(), w.metaOff, nVals);
+    MonoReader r(is, data.columnLoc, data.columnMetaOff, data.numValues);
 
-    ASSERT_EQ(nVals, r.numValues());
+    ASSERT_EQ(data.numValues, r.numValues());
     ASSERT_EQ(123, r.valueAt(0));
   }
 }
@@ -995,15 +998,15 @@ TEST_F(IntColTest, testMonoRepeatedValues) {
   w.addInt64(1);
   w.addInt64(3);
   
-  int nVals = w.finish();
+  auto data = w.finish();
   out.close();
   dir.finishFile(*file);
   
   auto in = dir.openFile("mono");
   InputStream is(in->getInputStream());
-  MonoReader r(is, w.blockLoc.offset(), w.metaOff, nVals);
+  MonoReader r(is, data.columnLoc, data.columnMetaOff, data.numValues);
   
-  ASSERT_EQ(nVals, r.numValues());
+  ASSERT_EQ(data.numValues, r.numValues());
   ASSERT_EQ(1, r.valueAt(0)) << "First value should be 1";
   ASSERT_EQ(1, r.valueAt(1)) << "Second value should be 1";
   ASSERT_EQ(3, r.valueAt(2)) << "Third value should be 3";
@@ -1027,13 +1030,13 @@ TEST_F(IntColTest, monoValuesAtSpansBlockBoundaries) {
     expected[(size_t)i] = acc;
     writer.addInt64(acc);
   }
-  int64_t count = (int64_t)writer.finish();
+  auto data = writer.finish();
   out.close();
   dir.finishFile(*file);
 
   auto in = dir.openFile("mono");
   InputStream input(in->getInputStream());
-  MonoReader reader(input, writer.blockLoc.offset(), writer.metaOff, count);
+  MonoReader reader(input, data.columnLoc, data.columnMetaOff, data.numValues);
 
   EXPECT_EQ(reader.valuesAt(0),
             std::make_pair((int64_t)0, expected[0]));
@@ -1056,7 +1059,7 @@ TEST_F(IntColTest, monoFractionalSlope) {
     expected[(size_t)i] = i * 15 / 2;
     writer.addInt64(expected[(size_t)i]);
   }
-  int64_t count = (int64_t)writer.finish();
+  auto data = writer.finish();
   out.close();
   dir.finishFile(*file);
 
@@ -1064,14 +1067,14 @@ TEST_F(IntColTest, monoFractionalSlope) {
   InputStream input(in->getInputStream());
   NumBlockInfo info;
   memcpy(&info,
-         input.ptr(writer.blockLoc.offset() + writer.metaOff), sizeof(info));
+         input.ptr(data.columnLoc + data.columnMetaOff), sizeof(info));
   EXPECT_GT(info.scaledSlope, 7 * (int64_t)(1LL << NumColumnFormat::SLOPE_SHIFT));
   EXPECT_LT(info.scaledSlope, 8 * (int64_t)(1LL << NumColumnFormat::SLOPE_SHIFT));
   EXPECT_LE(info.bits(), 1);
 
   MonoReader reader(
-      input, writer.blockLoc.offset(), writer.metaOff, count);
-  for (int64_t i = 0; i < count; i++) {
+      input, data.columnLoc, data.columnMetaOff, data.numValues);
+  for (int64_t i = 0; i < data.numValues; i++) {
     EXPECT_EQ(reader.valueAt(i), expected[(size_t)i]);
   }
 }
@@ -1106,14 +1109,14 @@ TEST_F(IntColTest, testMonoBig) {
       w.addInt64(val);
     }
 
-    int outVals = w.finish();
-    ASSERT_EQ(outVals, nVals);
+    auto data = w.finish();
+    ASSERT_EQ(data.numValues, nVals);
     out.close();
     dir.finishFile(*file);
 
     auto in = dir.openFile("mono");
     InputStream is(in->getInputStream());
-    MonoReader r(is, w.blockLoc.offset(), w.metaOff, nVals);
+    MonoReader r(is, data.columnLoc, data.columnMetaOff, data.numValues);
 
     // confirm stateless value retrieval
     for (auto i = 0u; i < nVals; i++) {
@@ -1163,14 +1166,15 @@ TEST_F(IntColTest, denseAfterFlushAndMerge) {
         auto* fieldInfo = segment.postingsReader().fieldInfo(field);
         ASSERT_TRUE(fieldInfo != nullptr);
         IntColReader column(segment.postingsReader(), *fieldInfo);
-        EXPECT_EQ(dense[s], column.denseDocsWithValue()) << field << " " << s;
-        EXPECT_EQ(dense[s], column.docsWithValue() == maxDoc) << field;
+        EXPECT_EQ(dense[s], column.docsReader().allRows()) << field << " " << s;
+        EXPECT_EQ(dense[s], column.docsWithField() == maxDoc) << field;
       }
     }
     if (dense.size() != 1) return;
     auto& segment = reader->segments()[0];
+    const auto& columnInfo = *segment.postingsReader().fieldInfo("x_i");
     IntColReader column(segment.postingsReader(),
-                        *segment.postingsReader().fieldInfo("x_i"));
+                        columnInfo);
     IntColReader::SparseValues values(column);
     int64_t total = 0;
     for (int64_t rank = 0; rank < column.numValues(); rank++) {

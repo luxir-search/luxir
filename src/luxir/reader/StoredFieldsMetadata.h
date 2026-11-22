@@ -3,31 +3,31 @@
 
 #pragma once
 
-#include <optional>
-#include <string_view>
+#include <atomic>
 #include <vector>
 
+#include "FieldParts.h"
 #include "StoredChunkCodec.h"
 
 namespace luxir {
 
 class PostingsReader;
-struct SegFieldInfo;
+class DecodedFieldRecord;
 
-// Immutable after Field publication. Views and the DDict borrow the segment
-// mapping; SegmentCore destroys its space readers before releasing the files.
-struct StoredFieldsMetadata {
-  StoredChunkFormat format;  // level and training capacity are not recorded
-  int64_t maxChunkBytes = 0;
-  int32_t numDirtyChunks = 0;
-  std::vector<std::string_view> fieldNames;
-  std::string_view dictionary;
-  std::optional<StoredDecompressionDictionary> ddict;
+// An opened stored resource. Member names borrow the segment mapping.
+class StoredFieldsMetadata {
+  friend class PostingsReader;
+  mutable std::atomic<const StoredDecompressionDictionary*> decoder = nullptr;  // Opened for decompression.
 
-  StoredFieldsMetadata(PostingsReader& reader, const SegFieldInfo& field);
+  std::vector<PackedTerm> names;  // Borrowed names in stored field ID order.
+
+public:
+  std::span<const PackedTerm> fieldNames() const noexcept { return names; }
+
+  StoredFieldsMetadata(PostingsReader& reader, const DecodedFieldRecord& fieldInfo);
+  ~StoredFieldsMetadata() { delete decoder.load(std::memory_order_relaxed); }
   size_t allocatedBytes() const {
-    return sizeof(*this) + fieldNames.capacity() * sizeof(fieldNames[0])
-        + (ddict ? ddict->allocatedBytes() : 0);
+    return sizeof(*this) + names.capacity() * sizeof(names[0]);
   }
 };
 

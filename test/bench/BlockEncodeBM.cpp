@@ -49,21 +49,21 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, uint3
   std::vector<std::vector<char>> encoded;
   std::vector<uint32_t> maxValues = {1<<3,1<<5,1<<7,1<<9,1<<11,1<<13,1<<15,1<<17,1<<19,1<<21};  // 10 diff sizes
 
-  uint32_t nvalues = blockSize;
+  uint32_t numValues = blockSize;
 
   values.resize(maxValues.size());
   encoded.resize(maxValues.size());
   decoded.resize(maxValues.size());
 
   for (auto i = 0u; i<maxValues.size(); i++) {
-    values[i].resize(nvalues);
-    decoded[i].resize(nvalues);
-    encoded[i].resize(nvalues*sizeof(uint32_t) * 2);  // must be large enough for the codec's worst-case output
-    fillBlock(rng, maxValues[i], &values[i][0], nvalues, sorted);
+    values[i].resize(numValues);
+    decoded[i].resize(numValues);
+    encoded[i].resize(numValues*sizeof(uint32_t) * 2);  // must be large enough for the codec's worst-case output
+    fillBlock(rng, maxValues[i], &values[i][0], numValues, sorted);
     // some codecs modify the input array (calculating deltas in place), so make a copy.
     std::vector<uint32_t> orig(values[i]);
     uint32_t encodedSz = encoded[i].size();
-    codec->encodeBlock(&orig[0], nvalues, &encoded[i][0], encodedSz);
+    codec->encodeBlock(&orig[0], numValues, &encoded[i][0], encodedSz);
     encoded[i].resize(encodedSz);
   }
 
@@ -83,11 +83,11 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, uint3
         // block decode
         uint32_t decodedSz = decoded[i].size();
         codec->decodeBlock(&encoded[i][0], encoded[i].size(), &decoded[i][0], decodedSz);
-        ASSERT_EQ(nvalues, decodedSz);
+        ASSERT_EQ(numValues, decodedSz);
 
         if (luxir::unit_tests) {
           // state.PauseTiming();
-          ASSERT_EQ(nvalues, decodedSz);
+          ASSERT_EQ(numValues, decodedSz);
           ASSERT_EQ(values[i], decoded[i]);
           // state.ResumeTiming();
         }

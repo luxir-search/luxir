@@ -690,7 +690,9 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   ASSERT_TRUE(metadataHelper.index(flatdoc("id", "one", "n_i", 7), UpdateMessage::COMMIT).success);
   auto metadataReader = metadataHelper.getIndexWriter()->snapshots.readers.getReader();
   auto metadataField = metadataReader->field("n_i");
-  ASSERT_NE(nullptr, metadataField.at(0));
+  const auto* record = metadataField.at(0);
+  ASSERT_NE(nullptr, record);
+  ASSERT_NE(nullptr, metadataReader->segments()[0].postingsReader().openNumericLeafMeta(*record));
 
   // The jemalloc block is present only on jemalloc.
   auto memoryStats = httpRequest(port(), http::verb::get, "/_stats");
@@ -708,10 +710,15 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   const auto& metadata = memoryJson["memory"]["field_metadata"];
   EXPECT_GT(metadata["entries"].get<int64_t>(), 0);
   EXPECT_GT(metadata["pages"].get<int64_t>(), 0);
+  EXPECT_GT(metadata["opened_entries"].get<int64_t>(), 0);
+  EXPECT_GT(metadata["opened_pages"].get<int64_t>(), 0);
   EXPECT_GE(metadata["names"].get<int64_t>(), 1);
+  int64_t liveViewBytes = metadata.contains("live_view_bytes") ? metadata["live_view_bytes"].get<int64_t>() : 0;
   EXPECT_EQ(metadata["bytes"].get<int64_t>(),
             metadata["directory_bytes"].get<int64_t>() + metadata["page_bytes"].get<int64_t>()
-                + metadata["entry_bytes"].get<int64_t>() + metadata["name_bytes"].get<int64_t>());
+                + metadata["entry_bytes"].get<int64_t>() + metadata["name_bytes"].get<int64_t>()
+                + metadata["opened_page_bytes"].get<int64_t>() + metadata["opened_entry_bytes"].get<int64_t>()
+                + liveViewBytes);
   for (int i = 0; i < 100; i++) {
     EXPECT_FALSE(metadataReader->field(std::format("absent_{}_i", i)).exists());
   }

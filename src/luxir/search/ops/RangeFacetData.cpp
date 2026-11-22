@@ -125,16 +125,18 @@ class IntFacetRangeReq::DataCalc : public FixedBucketFacetReq::Calc<Distinct, Gr
     auto& segment = range.reader.segments()[(size_t)segnum];
     const auto* info = range.segInfos.at((size_t)segnum);
     if (disablePointsRangeFacetForTests || domain || segment.hasDeletes() || !range.subOps.empty()
-        || !info || !info->columnBounds || !numericIdentityPoints(*info)
+        || !info || !numericIdentityPoints(*info)
         || !valuesAreDocuments(*info)) return false;
-    auto [lo, hi] = *info->columnBounds;
+    const auto* bounds = info->scalarBounds();
+    if (!bounds) return false;
+    auto [lo, hi] = *bounds;
     auto pool = MemPool::threadLocalPoolGuard();
     IntColReader column(segment.postingsReader(), *info);
     PointsReader points(segment.postingsReader(), *info);
     if (points.pointCount() != (uint64_t)column.numValues()) {
       throw std::runtime_error("IntFacetRangeReq: points/column value count mismatch");
     }
-    data.missing_num += segment.maxDoc() - column.docsWithValue();
+    data.missing_num += segment.maxDoc() - column.docsWithField();
     auto residual = pool.pool().make_span<uint32_t>(points.maxPointsPerLeaf());
     auto raw = pool.pool().make_span<int64_t>(points.maxPointsPerLeaf());
     if constexpr (Floating) if (!finite(lo) || !finite(hi)) {
@@ -190,7 +192,7 @@ class IntFacetRangeReq::DataCalc : public FixedBucketFacetReq::Calc<Distinct, Gr
       });
       if (range.missing && missing != 0) range.template collectGroups<true>(data, segnum, domain,
           [&](auto group, auto, auto missingBucket) {
-            range.forEachMissing(domain, segnum,
+            range.forEachMissing(domain, segnum, range.numberFieldInfo(segnum),
                 [&](int32_t doc) { missingBucket(group(doc)); });
           });
     } else {

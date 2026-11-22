@@ -25,10 +25,10 @@ class FacetGroupPlan {
     int64_t lo = INT64_MAX, hi = INT64_MIN;
     for (size_t segnum = 0; segnum < key.reader.segments().size(); segnum++) {
       auto* info = field.segments.at(segnum);
-      if (!info || info->numValues == 0) continue;
-      assert(info->columnBounds);
-      lo = std::min(lo, info->columnBounds->min);
-      hi = std::max(hi, info->columnBounds->max);
+      const auto* bounds = info ? info->scalarBounds() : nullptr;
+      if (!bounds) continue;
+      lo = std::min(lo, bounds->min);
+      hi = std::max(hi, bounds->max);
     }
     if (lo > hi) return {true, 0, 0};
     // Unsigned subtraction also covers ranges crossing zero without signed

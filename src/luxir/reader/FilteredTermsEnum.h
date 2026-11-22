@@ -102,9 +102,6 @@ protected:
   // Classify the term `te` is currently positioned on.
   virtual Status accept() = 0;
 
-  // Move the underlying enum to the next candidate term.
-  virtual bool advance() { return te.nextTerm(); }
-
 public:
   using FilteredTermsEnum::FilteredTermsEnum;
 
@@ -114,7 +111,7 @@ public:
       started = true;
       if (!seekStart()) return finish();
     } else {
-      if (!advance()) return finish();
+      if (!te.nextTermInScan()) return finish();
     }
     for (;;) {
       if (visitedTerms >= sliceEnd) [[unlikely]] {
@@ -126,7 +123,7 @@ public:
         case Status::END:    return finish();
         case Status::REJECT: break;
       }
-      if (!advance()) return finish();
+      if (!te.nextTermInScan()) return finish();
     }
   }
 };

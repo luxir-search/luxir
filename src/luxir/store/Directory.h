@@ -76,9 +76,6 @@ public:
   };
 
   struct FileCreateOptions {
-    std::function<void(int64_t)> ramBytesChanged;
-    size_t ramSpillBytes = 0;
-    bool ramDelegating = false;
     std::optional<uint64_t> expectedSize;
   };
 

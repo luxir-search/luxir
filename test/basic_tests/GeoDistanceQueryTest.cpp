@@ -70,12 +70,10 @@ double exactMeters(double lat1, double lon1, double lat2, double lon2) {
       * std::asin(std::min(1.0, std::sqrt(h * 0.5)));
 }
 
-SegFieldInfo fieldInfo(IndexReader::Segment& segment, std::string_view field) {
-  MemPool pool;
-  auto* fields = segment.postingsReader().fieldInfo(field);
-  if (!fields) throw std::runtime_error("missing geo test field");
-  const auto& info = *fields;
-  return info;
+const DecodedFieldRecord& fieldInfo(IndexReader::Segment& segment, std::string_view field) {
+  const auto* info = segment.postingsReader().fieldInfo(field);
+  if (!info) throw std::runtime_error("missing geo test field");
+  return *info;
 }
 
 void setGeoSchema(CollectionHelper& helper, bool range = true) {
@@ -118,7 +116,7 @@ struct DistanceState {
 std::vector<int32_t> bruteColumn(IndexReader::Segment& segment,
                                  std::string_view field,
                                  const GeoDistanceQuery& query) {
-  SegFieldInfo info = fieldInfo(segment, field);
+  const auto& info = fieldInfo(segment, field);
   IntColReader column(segment.postingsReader(), info);
   IntColReader::Iterator iter(column);
   double key = geo::distanceQuerySortKey(query.getRadiusMeters());
@@ -436,7 +434,7 @@ TEST_F(GeoDistanceQueryTest, bkdScanAndColumnOraclesAcrossCorpora) {
         EXPECT_EQ(field == "geo_single" ? (int64_t)expected.size() : -1,
                   countForTests(state.weight, segment));
 
-        SegFieldInfo info = fieldInfo(segment, field);
+        const auto& info = fieldInfo(segment, field);
         BKDReader bkd(segment.postingsReader(), info);
         auto estimate = bkd.estimateIntersect(state.query.makeRelation());
         EXPECT_GE(estimate.upperBound, expected.size());
@@ -468,7 +466,7 @@ TEST_F(GeoDistanceQueryTest, scanFallbackAndCountGating) {
   writer->commit();
   auto reader = writer->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
-  ASSERT_EQ(0, fieldInfo(segment, "geo_single").pointsMetaOff);
+  ASSERT_EQ(nullptr, fieldInfo(segment, "geo_single").points());
   MemPool pool;
   DistanceState state(pool, *reader, "geo_single", 0.0, 0.0, 1000000.0);
   auto expected = bruteColumn(segment, "geo_single", state.query);

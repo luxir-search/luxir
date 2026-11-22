@@ -35,7 +35,7 @@ struct RangePointSource {
   static constexpr int64_t& scanArms = SkipStats::rangeFieldScanArms;
 
   static IntColReader* openColumn(MemPool& pool, PostingsReader& postingsReader,
-                                  const SegFieldInfo& info, std::string_view queryName) {
+                                  const DecodedFieldRecord& info, std::string_view queryName) {
     if (info.type != FieldType::INTERVAL) {
       throw std::runtime_error(std::string(queryName) + " requires a range field");
     }
@@ -46,7 +46,7 @@ struct RangePointSource {
     return column;
   }
 
-  static uint64_t pointCount(const SegFieldInfo& info) {
+  static uint64_t pointCount(const DecodedFieldRecord& info) {
     return (uint64_t)info.numValues / 2;
   }
 
@@ -56,12 +56,12 @@ struct RangePointSource {
 
   // Every populated document holds at least one pair. Equality of the total
   // value count to twice the document count therefore means one pair each.
-  static bool onePointPerDoc(const SegFieldInfo& info) {
+  static bool onePointPerDoc(const DecodedFieldRecord& info) {
     return info.numValues == 2 * (int64_t)info.docsWithField;
   }
 
   static bool onePointPerDoc(const IntColReader& column) {
-    return column.numValues() == 2 * (int64_t)column.docsWithValue();
+    return column.numValues() == 2 * (int64_t)column.docsWithField();
   }
 
   // Used when documents can hold multiple points.

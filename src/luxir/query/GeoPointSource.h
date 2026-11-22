@@ -42,14 +42,14 @@ struct GeoPointSource {
   static constexpr int64_t& scanArms = SkipStats::geoScanArms;
 
   static IntColReader* openColumn(MemPool& pool, PostingsReader& postingsReader,
-                                  const SegFieldInfo& info, std::string_view queryName) {
+                                  const DecodedFieldRecord& info, std::string_view queryName) {
     if (info.type != FieldType::GEO_POINT) {
       throw std::runtime_error(std::string(queryName) + " requires a GEO_POINT field");
     }
     return pool.make<IntColReader>(postingsReader, info);
   }
 
-  static uint64_t pointCount(const SegFieldInfo& info) {
+  static uint64_t pointCount(const DecodedFieldRecord& info) {
     return (uint64_t)info.numValues;
   }
 
@@ -58,8 +58,8 @@ struct GeoPointSource {
   }
 
   // The column layout guarantees exactly one point per populated document.
-  static bool onePointPerDoc(const SegFieldInfo& info) {
-    return !info.hasEndValueRanks();
+  static bool onePointPerDoc(const DecodedFieldRecord& info) {
+    return !info.endValueRanks();
   }
 
   static bool onePointPerDoc(const IntColReader& column) {

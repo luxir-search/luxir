@@ -79,7 +79,7 @@ TEST_F(TextMergeTest, basicMerge) {
   // Make sure the original is still there...
   f.startReading();
   TermsEnum tenum_f1 = f.createTermsEnum();
-  ASSERT_EQ(tenum_f1.docsWithField(), 2);
+  ASSERT_EQ(f.fieldInfo().docsWithField, 2);
   ASSERT_EQ(tenum_f1.nextTerm(), true);
   ASSERT_EQ(std::string_view(tenum_f1.term()), "both");
   ASSERT_EQ(f.readDocsAndPositions(tenum_f1), (std::vector<int32_t>{0, 2, 1, 3,   1, 2, 0, 2}));

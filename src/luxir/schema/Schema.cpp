@@ -790,7 +790,7 @@ struct FieldCompiler {
         bool truncated = r.vectorTruncateDims > 0;
         VectorAnnConfig ann = resolveAnnConfig(r.ann, truncated ? r.vectorTruncateDims : r.vectorDims,
                                                truncated ? "truncate_dims" : "dims", name);
-        ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
+        ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags,
                                                r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
                                                ann, r.vectorTruncateDims);
         break;

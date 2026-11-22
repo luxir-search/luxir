@@ -356,7 +356,7 @@ public:
     // The anchored end: hi when descending, lo otherwise.
     bool descending = false;
     PostingsReader* postingsReader = nullptr;
-    const SegFieldInfo* fieldInfo = nullptr;
+    const DecodedFieldRecord* fieldInfo = nullptr;
   };
   virtual OrdIntervalStatus competitiveOrdInterval(
       CompetitiveOrdState& out, int32_t bottomSlot, segdoc bottomDoc,
@@ -506,13 +506,13 @@ public:
 
     if (auto* info = fields.at(segment)) {
       const auto& fieldInfo = *info;
-      if (fieldInfo.columnLoc.offset() > 0) {
+      if (fieldInfo.numberColumn()) {
         reader.emplace(segment.postingsReader(), fieldInfo);
         iter.emplace(*reader);
         pointValues.emplace(*reader);
         multiValued = reader->multiValued();
-        if (!reader->denseDocsWithValue()) {
-          docsIter.emplace(reader->docsWithValueBitSet());
+        if (const auto* bits = reader->docsReader().bitset()) {
+          docsIter.emplace(*bits);
         }
         if (keyBlockSize() != 0) {
           leaves.emplace(reader->leafMeta(), sortMultiplier < 0, std::nullopt);
@@ -753,13 +753,10 @@ LUXIR_INLINE inline int32_t selectedSortOrd(const OrdColReader& reader, int32_t 
   if (reader.multiArray()) return reader.selectedArrayOrdAt(docid, descending);
   if (!descending) return reader.firstOrdAt(docid);
   const DocsReader& docs = reader.docsReader();
-  int32_t docRank;
-  if (!docs.hasBitset()) {
-    docRank = docid;
-  } else {
-    screaming::BitSet::Iterator iter(docs.bitset());
-    if (iter.advance(docid) != docid) return 0;
-    docRank = iter.rank();
+  int32_t docRank = docid;
+  if (!docs.allRows()) {
+    docRank = docs.rankOf(docid);
+    if (docRank < 0) return 0;
   }
   auto [start, end] = reader.getStartEndValueRank(docRank);
   assert(start < end);
@@ -773,7 +770,7 @@ class GlobalOrdComparator : public FieldComparator {
   std::vector<int64_t> globalOrds; // Storage for global ordinals
   OrdMap::SegToGlobal segmentMapping;
   PostingsReader* postingsReader = nullptr;
-  const SegFieldInfo* fieldInfo = nullptr;
+  const DecodedFieldRecord* fieldInfo = nullptr;
   int64_t sortMultiplier; // 1 for ascending, -1 for descending
   int64_t missingOrd;
 
@@ -811,9 +808,9 @@ public:
     fieldInfo = fields.at(segment);
     if (fieldInfo) {
       if (!ordMap) {
-        segmentMapping.numOrds = fieldInfo->nTerms;
+        segmentMapping.numOrds = fieldInfo->indexedTotals().numTerms;
       }
-      if (fieldInfo->columnLoc.offset() > 0) {
+      if (fieldInfo->ordColumn()) {
         postingsReader = &segment.postingsReader();
         reader.emplace(*postingsReader, *fieldInfo);
       }
@@ -834,7 +831,7 @@ public:
       CompetitiveOrdState& out, int32_t bottomSlot, segdoc bottomDoc,
       int32_t segment, int32_t from, bool soleSort) override {
     if (!reader.has_value() || ordMap != nullptr || postingsReader == nullptr
-        || fieldInfo->nTerms == 0) {
+        || !fieldInfo->terms()) {
       return OrdIntervalStatus::UNSUPPORTED;
     }
     // Missing-first: docs without the field beat any real-valued bottom but
@@ -939,7 +936,7 @@ class SegmentOrdComparator : public FieldComparator {
   MemPool termPool;
   MemPool enumPool;
   MemPool::save_point enumPoolStart;
-  const SegFieldInfo* fieldInfo = nullptr;
+  const DecodedFieldRecord* fieldInfo = nullptr;
   std::optional<OrdColReader> reader;
   std::optional<TermsEnum> termsEnum;
   PostingsReader* postingsReader = nullptr;
@@ -1023,8 +1020,7 @@ public:
 
     fieldInfo = fields.at(segment);
     if (!fieldInfo) return;
-    if (fieldInfo->nTerms == 0 || fieldInfo->columnLoc.offset() == 0 ||
-        fieldInfo->ordFormat == SegFieldInfo::ORD_NONE) {
+    if (!fieldInfo->ordColumn() || !fieldInfo->terms()) {
       return;
     }
     postingsReader = &segment.postingsReader();
@@ -1051,7 +1047,7 @@ public:
     // Missing-first: docs without the field beat any real-valued bottom but
     // have no postings, so a term interval can never represent them.
     if (missingFirst || bottomMissing) return OrdIntervalStatus::PENDING;
-    int64_t nTerms = (int64_t)fieldInfo->nTerms;
+    int64_t nTerms = termsEnum->numTerms();
     bool closable = soleSort && bottomExact
         && segdoc(segment, from) >= bottomDoc;
     if (sortMultiplier > 0) {
@@ -1086,8 +1082,8 @@ public:
 
     std::string_view value = term(bottom);
     if (!termsEnum->seekCeil(value)) {
-      assert(fieldInfo->nTerms <= INT32_MAX);
-      bottomOrd = (int32_t)fieldInfo->nTerms;
+      assert(termsEnum->numTerms() <= INT32_MAX);
+      bottomOrd = (int32_t)termsEnum->numTerms();
       return;
     }
     if (termsEnum->term() == value) {
@@ -1215,10 +1211,10 @@ public:
 
     if (auto* info = fields.at(segment)) {
       const auto& fieldInfo = *info;
-      if (fieldInfo.columnLoc.offset() > 0) {
+      if (fieldInfo.bytesColumn()) {
         reader.emplace(segment.postingsReader(), fieldInfo);
         iter.emplace(*reader);
-        multiValued = reader->isMultiValued();
+        multiValued = reader->multiValued();
         if (multiValued) docValues.emplace(*reader);
       }
     }

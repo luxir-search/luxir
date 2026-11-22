@@ -240,7 +240,8 @@ static void BM_GroupIdentityRead(benchmark::State& state, bool narrow, int32_t w
       } else {
         auto& postings = reader->segments()[(size_t)segment].postingsReader();
         auto* info = key.fields[0].segments.at((size_t)segment);
-        if (!info) { state.SkipWithMessage("product column missing"); return; }
+        const auto* ord = info ? info->ordColumn() : nullptr;
+        if (!ord) { state.SkipWithMessage("product column missing"); return; }
         OrdColReader column(postings, *info);
         auto mapping = key.fields[0].ords->getSegToGlobal(segment);
         forEachDomainDoc(domain, maxDoc, [&](int32_t doc) LUXIR_INLINE {

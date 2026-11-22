@@ -233,30 +233,30 @@ public:
 
 /// Thread-safe scoped view of one space in an immutable snapshot.
 class IndexReader : public std::enable_shared_from_this<IndexReader> {
-  struct FieldRecord;
-  struct HeaderTotals;
+  struct FieldNameEntry;
+  struct FieldTotals;
 
 public:
   using Segment = ::luxir::Segment;
 
   // A borrowed view, valid while its reader lives. Null means absent.
-  // at() lazily resolves ordinals and headers in this core's segments.
-  // stats() and flagsUnion() resolve every segment for header totals,
+  // at() lazily resolves ordinals and field records in this core's segments.
+  // stats() and segFlags() resolve every segment for field totals,
   // including deleted docs.
   class FieldSegments {
     friend class IndexReader;
-    const FieldRecord* record = nullptr;
+    const FieldNameEntry* entry = nullptr;
     const Segment* segments = nullptr;
-    FieldSegments(const FieldRecord* record, const Segment* segments)
-        : record(record), segments(segments) {}
+    FieldSegments(const FieldNameEntry* entry, const Segment* segments)
+        : entry(entry), segments(segments) {}
     int32_t ordinalAt(size_t segment) const;
-    const HeaderTotals& totals() const;
+    const FieldTotals& totals() const;
 
   public:
     FieldSegments() = default;
-    const PostingsReader::Field* at(size_t segment) const;
-    const PostingsReader::Field* at(const Segment& segment) const {
-      assert(!record || (segment.ord >= 0 && (size_t)segment.ord < size()
+    const DecodedFieldRecord* at(size_t segment) const;
+    const DecodedFieldRecord* at(const Segment& segment) const {
+      assert(!entry || (segment.ord >= 0 && (size_t)segment.ord < size()
                          && &segments[segment.ord] == &segment));
       return at((size_t)segment.ord);
     }
@@ -264,8 +264,8 @@ public:
     bool exists() const noexcept;
     size_t size() const noexcept;
     const Similarity::FieldStats& stats() const;
-    // OR of the segment headers' flags, such as segment-format markers.
-    FieldType::flag_type flagsUnion() const;
+    // Union of the segment-specific flags over the field's segments.
+    uint8_t segFlags() const;
     bool operator==(const FieldSegments&) const = default;
   };
 
@@ -288,79 +288,79 @@ private:
   friend class ReaderManager;
   friend class FilterCache;
 
-  struct HeaderTotals {
+  struct FieldTotals {
     Similarity::FieldStats stats;
-    FieldType::flag_type flags = 0;
+    uint8_t segFlags = 0;  // See FieldSegmentFlags.
     FieldType::Type type = FieldType::NONE;
-    uint32_t typeFlags = 0;
+    uint32_t typeParameters = 0;
   };
 
-  // Positive names, header totals and OrdMaps shared by segment sets on one path
-  // with the same core generation. The record owns its name and lazily caches each ordinal;
+  // Positive names, field totals and OrdMaps shared by segment sets on one path
+  // with the same core generation. The entry owns its name and lazily caches each ordinal;
   // it holds no Segment or reader, so views can use different open readers.
-  struct FieldRecord {
+  struct FieldNameEntry {
     static constexpr int32_t UNRESOLVED = -2;
     std::string name;
     size_t hash;
     size_t numSegments;
     std::unique_ptr<std::atomic<int32_t>[]> ordinals;
-    mutable std::atomic<HeaderTotals*> totals{nullptr};
+    mutable std::atomic<FieldTotals*> totals{nullptr};
     mutable SharedLazyCell<OrdMap, true> ordMap;
     size_t bytes;
 
-    FieldRecord(std::string_view name, size_t hash, size_t numSegments, size_t first, int32_t ordinal);
-    ~FieldRecord();
+    FieldNameEntry(std::string_view name, size_t hash, size_t numSegments, size_t first, int32_t ordinal);
+    ~FieldNameEntry();
   };
 
-  // Records by name. Insert-only, so a lookup takes no lock and writes no
+  // Entries by name. Insert-only, so a lookup takes no lock and writes no
   // shared memory. Inserts serialize; one that grows the table publishes a
-  // doubled copy, and replaced tables live as long as the records because a
+  // doubled copy, and replaced tables live as long as the entries because a
   // lookup may still be probing one.
-  class FieldRecords {
+  class FieldCache {
     struct Table {
       size_t mask;
-      std::unique_ptr<std::atomic<const FieldRecord*>[]> slots;
+      std::unique_ptr<std::atomic<const FieldNameEntry*>[]> slots;
       explicit Table(size_t capacity);
-      const FieldRecord* find(std::string_view name, size_t hash) const noexcept;
-      void place(const FieldRecord* record) noexcept;
+      const FieldNameEntry* find(std::string_view name, size_t hash) const noexcept;
+      void place(const FieldNameEntry* entry) noexcept;
     };
     std::atomic<const Table*> current{nullptr};
     std::mutex insertMutex;
     std::vector<std::unique_ptr<Table>> tables;
-    std::vector<std::unique_ptr<FieldRecord>> records;
+    std::vector<std::unique_ptr<FieldNameEntry>> entries;
 
   public:
-    static constexpr size_t BYTES_PER_RECORD =
-        sizeof(std::unique_ptr<FieldRecord>) + sizeof(std::atomic<const FieldRecord*>);
+    static constexpr size_t BYTES_PER_FIELD =
+        sizeof(std::unique_ptr<FieldNameEntry>) + sizeof(std::atomic<const FieldNameEntry*>);
 
-    const FieldRecord* find(std::string_view name, size_t hash) const noexcept {
+    const FieldNameEntry* find(std::string_view name, size_t hash) const noexcept {
       const Table* table = current.load(std::memory_order_acquire);
       return table ? table->find(name, hash) : nullptr;
     }
-    // Returns the record kept for its name: this one, or one inserted first.
-    const FieldRecord* insert(std::unique_ptr<FieldRecord> record);
+    // Returns the entry kept for its name: this one, or one inserted first.
+    const FieldNameEntry* insert(std::unique_ptr<FieldNameEntry> entry);
   };
 
   // Per-space physical state can be shared by schema-only publications.
-  // Its lazy catalogs and maps never retain a reader or schema.
+  // Its lazy field name lists and maps never retain a reader or schema.
   struct SpaceState {
     std::string path;
     std::vector<Segment> segs;
-    OnceFlag fieldCatalogsOnce;
+    OnceFlag fieldNamesOnce;
     std::vector<std::string_view> physicalNames;
     std::vector<ProjectableField> projectable;
-    std::shared_ptr<FieldRecords> fields;
+    std::shared_ptr<FieldCache> fields;
     int64_t totalMaxDoc = 0;
     int64_t livedocs = 0;
     OnceFlag liveOnce;
 
-    void buildFieldCatalogs();
+    void buildFieldNameLists();
     std::span<const ProjectableField> projectableFields() {
-      buildFieldCatalogs();
+      buildFieldNameLists();
       return projectable;
     }
     std::span<const std::string_view> physicalFieldNames() {
-      buildFieldCatalogs();
+      buildFieldNameLists();
       return physicalNames;
     }
   };
@@ -396,6 +396,8 @@ private:
     // diverged history never matches.
     struct SegmentFiles {
       uint64_t segId;
+      CatalogRange catalog;
+      int32_t maxDoc;
       std::vector<FileDescriptor> files;
       std::vector<FileDescriptor> liveDocs;
       std::vector<std::vector<FileDescriptor>> overlays;

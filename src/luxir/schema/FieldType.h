@@ -41,9 +41,7 @@ struct CoerceContext {
 // before indexing any data.
 class FieldType {
 public:
-  // NOTE: these ordinals are persisted as-is in the segment (PostingsWriter
-  // writes IndexFieldInfo::type, FieldReader reads it back via static_cast).
-  // Append new types at the end; reordering silently misreads existing segments.
+  // Field records persist these ordinals. Append new types and update LAST_TYPE.
   enum Type {
     NONE=0,
     STRING,   // unanalyzed string field
@@ -62,7 +60,8 @@ public:
     NESTED,   // structural row-space declaration, never a physical field
     // [min, max] interval (RangeFieldType); the column holds two encoded
     // int64 values per document, min then max.
-    INTERVAL
+    INTERVAL,
+    LAST_TYPE = INTERVAL
   };
 
   enum class Storage { NONE, TERMS, TEXT, BIN, INT64, VECTOR };
@@ -85,13 +84,23 @@ public:
     return storage(type) == Storage::INT64 && type != GEO_POINT && type != INTERVAL;
   }
 
+  static constexpr uint32_t DICTIONARY_BOUNDS_CAP = 32;
+
+  static constexpr uint32_t dictionaryBoundsCap(Type type) noexcept {
+    return type == ID ? PackedTerm::MAX_LEN : DICTIONARY_BOUNDS_CAP;
+  }
+
   static constexpr bool usesGeoPoints(Type type) { return type == GEO_POINT; }
 
   static std::string_view typeName(Type type);
   // Decode parameters using the persisted type, independently of any schema.
   // Unknown types and bits are invalid. DATE defines its unit in bit 0.
-  static uint32_t typeParameters(Type type, uint32_t typeFlags);
-  static std::string describeType(Type type, uint32_t typeFlags);
+  static constexpr bool hasTypeParameters(Type type) noexcept {
+    return type == DECIMAL || type == DATE || type == INTERVAL;
+  }
+  static uint32_t typeParameters(Type type, uint32_t parameters);
+  static const char* typeParametersError(Type type, uint32_t parameters) noexcept;
+  static std::string describeType(Type type, uint32_t parameters);
   using SignatureProps = std::map<std::string, std::string>;
   virtual void signatureProps(SignatureProps& out) const;
 
@@ -112,50 +121,42 @@ public:
 
   using flag_type = int32_t;
 
+  // Persisted schema flags. The low seven bits fit in one byte on disk.
   static constexpr flag_type INDEX_DOCS = (1 << 0);
   static constexpr flag_type INDEX_DOCS_FREQS = INDEX_DOCS | (1 << 1);
   static constexpr flag_type INDEX_DOCS_FREQS_POSITIONS = INDEX_DOCS_FREQS | (1 << 2);
-  static constexpr flag_type NUM_TOKENS_APPROX = (1 << 3);
-  static constexpr flag_type NUM_TOKENS_EXACT = (1 << 4);
-  static constexpr flag_type MULTI_VALUED = (1 << 5);  // Set if the field can have multiple values per document
-  static constexpr flag_type FIELD_SPECIFIC_ANALYZER = (1 << 6);  // Set if different fields using the same type have different analyzers (i.e. don't cache across different fields)
-
-  static constexpr flag_type COLUMN_STORED = (1 << 7);  // Set if the field has values stored in a columnar format
-  static constexpr flag_type FIXED_SIZE = (1 << 8);     // if all values have the same size in bytes (for otherwise variable-length fields)
-  static constexpr flag_type ABSTRACT = (1 << 9);       // Abstract fields are only usable via suffix matching or inheritance
-  static constexpr flag_type STORED = (1 << 10);        // Set if the field's raw values are kept in the segment's stored-fields resource for per-doc retrieval
-  // RANGE query contract. Numeric fields use a 1-D points index. GEO_POINT
-  // flushes a 2-D BKD index; its query and merge consumers land in pass C.
-  static constexpr flag_type INDEX_RANGE = (1 << 11);
-  // Segment-format marker. It is never supplied by schema configuration.
-  static constexpr flag_type TERM_RANGES = (1 << 12);
-  static constexpr flag_type DERIVED = (1 << 13);  // named representation of a logical field
-  // Segment-format marker, never supplied by schema configuration: some term
-  // in this segment field is at least PackedTerm::MIN_FITTED_LEN bytes, so it
-  // may be a truncated or hashed (fitted) form of a longer value.
-  static constexpr flag_type MAY_HAVE_FITTED = (1 << 14);
+  static constexpr flag_type COLUMN_STORED = (1 << 3);  // Values are stored in a columnar format.
+  static constexpr flag_type MULTI_VALUED = (1 << 4);   // A document can have several values.
+  static constexpr flag_type STORED = (1 << 5);  // Raw values are kept in the stored-fields resource.
+  // RANGE query contract. Numeric fields use a 1-D points index; GEO_POINT and
+  // the range types use a 2-D BKD index.
+  static constexpr flag_type INDEX_RANGE = (1 << 6);
   // Multi-valued set is the default; arrays retain source order and repeats.
-  // This is a physical property persisted in each segment, not a format marker.
-  static constexpr flag_type MULTI_ARRAY = (1 << 15);
-  // Every segment-format marker. A writer derives them from what it writes,
-  // so merges never carry them over from source segments.
-  static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED;
+  // A physical property of the segment, not a format marker.
+  static constexpr flag_type MULTI_ARRAY = (1 << 7);
+  static constexpr flag_type NUM_TOKENS_APPROX = (1 << 8);
+  static constexpr flag_type NUM_TOKENS_EXACT = (1 << 9);
 
-  static_assert([] {
+  // Schema-only roles.
+  static constexpr flag_type ABSTRACT = (1 << 29);  // Usable via suffix matching or inheritance.
+  static constexpr flag_type DERIVED = (1 << 30);   // Named representation of a logical field.
+
+  static constexpr flag_type SCHEMA_ROLES = ABSTRACT | DERIVED;
+  // Every recognized flag, including the roles that stay in the schema.
+  static constexpr flag_type KNOWN_FLAGS = [] {
     constexpr flag_type bits[] = {
       INDEX_DOCS, INDEX_DOCS_FREQS ^ INDEX_DOCS,
       INDEX_DOCS_FREQS_POSITIONS ^ INDEX_DOCS_FREQS,
-      NUM_TOKENS_APPROX, NUM_TOKENS_EXACT, MULTI_VALUED, FIELD_SPECIFIC_ANALYZER,
-      COLUMN_STORED, FIXED_SIZE, ABSTRACT, STORED, INDEX_RANGE, TERM_RANGES,
-      DERIVED, MAY_HAVE_FITTED, MULTI_ARRAY
+      COLUMN_STORED, MULTI_VALUED, STORED, INDEX_RANGE, MULTI_ARRAY,
+      NUM_TOKENS_APPROX, NUM_TOKENS_EXACT
     };
-    flag_type used = 0;
+    flag_type used = SCHEMA_ROLES;
     for (auto bit : bits) {
-      if (bit == 0 || (bit & (bit - 1)) != 0 || (used & bit) != 0) return false;
+      if (bit == 0 || (bit & (bit - 1)) != 0 || (used & bit) != 0) throw "Field flags must use distinct single bits";
       used |= bit;
     }
-    return true;
-  }(), "Field flags must use distinct single bits");
+    return used;
+  }();
 
   const FieldType::Type type_;
   const std::string name_;
@@ -194,15 +195,15 @@ public:
   bool isAbstract() { return (bool) (flags_ & ABSTRACT); }
   bool isDerived() const { return (bool) (flags_ & DERIVED); }
 
-  // Segment flags describe physical structures and how field values were indexed.
-  // The multi flags describe value semantics. End ranks are optional for singleton columns.
+  // Segment flags record the schema's indexing and value semantics. End ranks
+  // are optional for singleton columns.
   flag_type segmentFlags() const {
-    flag_type flags = flags_ & ~(ABSTRACT | DERIVED);
+    flag_type flags = flags_ & ~SCHEMA_ROLES;
     // Intervals are logically single-valued; their endpoint column is a pair array.
     if (type_ == INTERVAL) flags |= MULTI_VALUED | MULTI_ARRAY;
     return flags;
   }
-  virtual uint32_t segmentTypeFlags() const { return 0; }
+  virtual uint32_t segmentTypeParameters() const { return 0; }
 
   // TODO: check standard on cast of int to bool (check generated code too)
   bool indexed() { return (bool) (flags_ & INDEX_DOCS); }
@@ -225,8 +226,6 @@ public:
   bool multiArray() const { return (flags_ & MULTI_ARRAY) != 0; }
   bool multiSet() const { return (flags_ & MULTI_VALUED) && !multiArray(); }
   static bool arrayOnly(Type type) { return type == TEXT || type == VECTOR || type == GEO_POINT; }
-
-  bool isAnalyzerFieldSpecific() { return (bool) (flags_ & FIELD_SPECIFIC_ANALYZER); }
 
   bool hasColumn() { return (bool) (flags_ & COLUMN_STORED); }
 
@@ -397,7 +396,7 @@ public:
     : FieldType(name, FieldType::DECIMAL, flags), scale(scale) { typeParameters(DECIMAL, scale); }
 
   ValueNature valueNature() const override { return decimalValueNature(scale); }
-  uint32_t segmentTypeFlags() const override { return scale; }
+  uint32_t segmentTypeParameters() const override { return scale; }
   void signatureProps(SignatureProps& out) const override;
   int64_t coerceColInt64(const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
@@ -471,16 +470,16 @@ public:
 
   DateFieldType(std::string_view name, int flags=COLUMN_STORED, DateUnit unit=DateUnit::MILLIS)
     : FieldType(name, FieldType::DATE, flags), unit(unit) {
-    typeFlagsForUnit(unit);
+    typeParametersForUnit(unit);
   }
 
-  static uint32_t typeFlagsForUnit(DateUnit unit);
-  static DateUnit unitFromTypeFlags(uint32_t typeFlags);
+  static uint32_t typeParametersForUnit(DateUnit unit);
+  static DateUnit unitFromTypeParameters(uint32_t parameters);
   // The unit of a field type whose type() is DATE.
   static DateUnit unitOf(const FieldType& type) { return ((const DateFieldType&)type).unit; }
   ValueNature valueNature() const override { return dateValueNature(unit); }
   void signatureProps(SignatureProps& out) const override;
-  uint32_t segmentTypeFlags() const override { return typeFlagsForUnit(unit); }
+  uint32_t segmentTypeParameters() const override { return typeParametersForUnit(unit); }
   __int128 coerceGridValue(const api::Val& val, std::string_view fieldName,
       std::string_view role, const CoerceContext& context) const override;
 
@@ -526,30 +525,36 @@ public:
 // (BasicBKDWriter<BKDInt64Traits>).
 class RangeFieldType : public FieldType {
 public:
-  static constexpr uint32_t ELEMENT_FLAGS_SHIFT = 2;
-  static constexpr uint32_t ELEMENT_KIND_MASK = (1u << ELEMENT_FLAGS_SHIFT) - 1;
+  static constexpr uint32_t ELEMENT_PARAMETERS_SHIFT = 2;
+  static constexpr uint32_t ELEMENT_KIND_MASK = (1u << ELEMENT_PARAMETERS_SHIFT) - 1;
 
   // INT, DOUBLE or DATE: the type each endpoint coerces and renders as.
   const std::shared_ptr<FieldType> element;
 
   RangeFieldType(std::string_view name, FieldType::Type elementType, int flags=COLUMN_STORED);
 
-  static Type elementTypeFromFlags(uint32_t flags) {
-    switch (flags & ELEMENT_KIND_MASK) {
+  static Type tryElementTypeFromParameters(uint32_t parameters) noexcept {
+    switch (parameters & ELEMENT_KIND_MASK) {
       case 0: return INT;
       case 1: return DOUBLE;
       case 2: return DATE;
-      default: throw std::runtime_error("Unknown range element kind");
+      default: return NONE;
     }
+  }
+
+  static Type elementTypeFromParameters(uint32_t parameters) {
+    auto type = tryElementTypeFromParameters(parameters);
+    if (type == NONE) throw std::runtime_error("Unknown range element kind");
+    return type;
   }
 
   FieldType::Type elementType() const { return element->type(); }
   uint32_t capabilities() const override { return MATCH | RANGE | RANGE_RELATION; }
   // Low bits encode the element kind (long, double, date); upper bits carry
   // the element's persisted parameters.
-  uint32_t segmentTypeFlags() const override {
+  uint32_t segmentTypeParameters() const override {
     uint32_t kind = elementType() == DOUBLE ? 1u : elementType() == DATE ? 2u : 0u;
-    return kind | (element->segmentTypeFlags() << ELEMENT_FLAGS_SHIFT);
+    return kind | (element->segmentTypeParameters() << ELEMENT_PARAMETERS_SHIFT);
   }
   void signatureProps(SignatureProps& out) const override {
     element->signatureProps(out);
@@ -653,7 +658,7 @@ public:
   VectorAnnConfig ann_;
 
   VectorFieldType(std::string_view name, int32_t dims = 0,
-                  int flags = COLUMN_STORED | FIXED_SIZE,
+                  int flags = COLUMN_STORED,
                   Metric metric = METRIC_NONE,
                   bool normalized = false,
                   bool normalizeOnWrite = true,
@@ -697,7 +702,7 @@ public:
 // compression, and dictionary capacity is schema training policy.
 struct StoredChunkFormat {
   // Recorded on disk as one byte.
-  enum Codec : uint8_t { LZ4 = 0, ZSTD = 1 };
+  enum Codec : uint8_t { LZ4 = 0, ZSTD = 1, LAST = ZSTD };
   static constexpr int DEFAULT_ZSTD_LEVEL = 3;
   static constexpr uint32_t DEFAULT_CHUNK_TARGET = 16 * 1024;
   static constexpr uint32_t DEFAULT_MAX_DOCS_PER_CHUNK = 128;

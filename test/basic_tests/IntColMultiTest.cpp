@@ -5,9 +5,12 @@
 #include "luxir/index/PostingsWriter.h"
 #include "luxir/reader/PostingsReader.h"
 #include "gtest/gtest.h"
+#include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
+#include <array>
 #include <vector>
 
 using namespace luxir;
@@ -99,4 +102,44 @@ TEST_F(IntColMultiTest, deleteAndMerge) {
   f.vals(vals);
   ASSERT_EQ(vals, vec_i(100,200));
   ASSERT_EQ(-1, f.nextDoc());
+}
+
+TEST_F(IntColMultiTest, mergeSingleAfterMultiWithDeletes) {
+  using FieldDef = api::FieldDef;
+  CollectionHelper helper;
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  for (bool multi : {true, false}) {
+    SchemaBuilder schema;
+    auto& number = schema.field("number");
+    number.type = FieldDef::FieldClass::INT;
+    number.multi = multi ? FieldDef::MultiMode::ARRAY : FieldDef::MultiMode::SINGLE;
+    number.index = multi ? FieldDef::IndexMode::RANGE : FieldDef::IndexMode::NONE;
+    schema.set(helper.collection());
+    Doc drop = multi ? flatdoc("id", "drop_multi", "number", vec_i(90, 91, 92))
+                     : flatdoc("id", "drop_single", "number", 99);
+    Doc keep = multi ? flatdoc("id", "multi", "number", vec_i(20, 30))
+                     : flatdoc("id", "single", "number", 10);
+    ASSERT_TRUE(helper.indexAll({drop, keep}, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteById("drop_single", UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("drop_multi", UpdateMessage::COMMIT).success);
+  auto before = writer->snapshots.readers.getReader();
+  ASSERT_EQ(2u, before->segments().size());
+  auto fields = before->field("number");
+  EXPECT_TRUE(fields.at(0)->endValueRanks());
+  EXPECT_FALSE(fields.at(1)->endValueRanks());
+
+  writer->mergeSegments();
+  auto reader = writer->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto& segment = reader->segments()[0];
+  ASSERT_EQ(2, segment.maxDoc());
+  const auto& info = *reader->field("number").at(0);
+  EXPECT_TRUE(info.points());
+  std::array<std::vector<int64_t>, 2> actual;
+  IntColReader::getValues(MemPool::threadLocal(), segment.postingsReader(), info, std::array{0, 1},
+      [&](size_t i, int32_t, int64_t value, int64_t, int64_t) { actual[i].push_back(value); });
+  EXPECT_EQ(vec_i(10), actual[1]);
+  EXPECT_EQ(vec_i(20, 30), actual[0]);
 }

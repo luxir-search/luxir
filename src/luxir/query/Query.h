@@ -298,10 +298,6 @@ public:
 template <typename KeyType, typename ValType>
 class PoolMapVec {
 public:
-  // Example:
-  // using SegFieldInfoMap = PoolMapVec<std::string_view, SegFieldInfo>;
-  // SegFieldInfoMap segFieldInfoMap;
-
   using key_type = KeyType;
   using value_type = ValType;
   using valptr = u_ptr<value_type>;

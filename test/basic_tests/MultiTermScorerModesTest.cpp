@@ -1095,7 +1095,7 @@ TEST_F(MultiTermScorerModesTest, firstDocLowerBound) {
 
   auto guard = ti.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
-  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
+  TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo());
   int32_t pulsed = 0, tails = 0, packed = 0;
   while (te.nextTerm()) {
     auto state = te.postingsState();

@@ -188,7 +188,6 @@ public:
       : shape(shape), count(pointCount()) {
     auto file = dir.createFile("points");
     OutputStream out(file.get());
-    out.streamNumber = 0;
     out.writeBytes("pre");
     PointsWriter writer(out, options);
     writePoints(writer);
@@ -198,8 +197,8 @@ public:
 
     inputFile = dir.openFile("points");
     input = inputFile->getInputStream();
-    points = std::make_unique<PointsReader>(input, data.pointsLoc.offset(),
-                                            data.pointsMetaOff);
+    points = std::make_unique<PointsReader>(input, data.pointsStart,
+                                            data.pointsMetaOff, data.directoryBytes);
     points->validate();
     if (points->pointCount() != count) {
       throw std::logic_error("points benchmark point count mismatch");

@@ -13,33 +13,26 @@
 
 namespace luxir {
 
+// Reads the length norm for each doc in a text field.
 class NormsReader {
 public:
   static constexpr int32_t ENDDOC = std::numeric_limits<int32_t>::max();
 
 private:
-  DocsReader docs;
-  InputStream normsIS;
-  const uint8_t* normsBytes = nullptr;
-  int32_t format = SegFieldInfo::NORMS_NONE;
-  int64_t nbytes = 0;
-  int32_t maxdoc = 0;
+  DocsReader docs;  // Maps sparse norms to doc IDs.
+  const uint8_t* values = nullptr;  // Mapped norm bytes, if written.
+  field_parts::NormsMode mode = field_parts::NormsMode::SPARSE;  // Whether norms are doc- or rank-indexed.
+  int32_t maxDoc = 0;
 
 public:
-  NormsReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo)
-      : docs(postingsReader, fieldInfo) {
-    format = fieldInfo.normsFormat;
-    nbytes = fieldInfo.normsLen;
-    maxdoc = postingsReader.maxDoc();
-    if (format != SegFieldInfo::NORMS_NONE && nbytes > 0) {
-      normsIS = postingsReader.core().getInputStreamSeek(fieldInfo.normsLoc);
-      normsBytes = (const uint8_t*) normsIS.ptr();
-    }
-    if (format == SegFieldInfo::NORMS_FLAT) {
-      assert(nbytes == maxdoc);
-    } else if (format == SegFieldInfo::NORMS_SPARSE) {
-      assert(nbytes == docs.numDocs());
-      assert(docs.hasBitset());
+  NormsReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
+      : docs(reader, fieldInfo) {
+    maxDoc = reader.maxDoc();
+    if (const auto* norms = fieldInfo.norms()) {
+      mode = norms->mode;
+      auto slice = reader.core().slice(fieldInfo.normsValues(maxDoc));
+      values = (const uint8_t*)slice.data();
+      assert(mode == field_parts::NormsMode::FLAT || docs.bitset());
     }
   }
 
@@ -47,40 +40,28 @@ public:
     return docs;
   }
 
-  int32_t normsFormat() const noexcept {
-    return format;
-  }
-
-  int64_t numBytes() const noexcept {
-    return nbytes;
-  }
-
-  int32_t maxDoc() const noexcept {
-    return maxdoc;
-  }
-
   bool isFlat() const noexcept {
-    return format == SegFieldInfo::NORMS_FLAT;
+    return mode == field_parts::NormsMode::FLAT;
   }
 
   const uint8_t* flatBase() const noexcept {
-    return isFlat() ? normsBytes : nullptr;
+    return isFlat() ? values : nullptr;
   }
 
   bool isSparse() const noexcept {
-    return format == SegFieldInfo::NORMS_SPARSE;
+    return values && mode == field_parts::NormsMode::SPARSE;
   }
 
   uint8_t value(int32_t doc) const {
-    assert(format != SegFieldInfo::NORMS_NONE);
-    assert(doc >= 0 && doc < maxdoc);
-    if (format == SegFieldInfo::NORMS_FLAT) {
-      return normsBytes[doc];
+    assert(values);
+    assert(doc >= 0 && doc < maxDoc);
+    if (mode == field_parts::NormsMode::FLAT) {
+      return values[doc];
     }
-    screaming::BitSet::Iterator iter(docs.bitset());
+    auto iter = docs.bitmapIterator();
     [[maybe_unused]] int32_t found = iter.advance(doc);
     assert(found == doc);
-    return normsBytes[iter.rank()];
+    return values[iter.rank()];
   }
 
   class Iterator {
@@ -94,9 +75,9 @@ public:
 
   public:
     Iterator(const NormsReader& reader)
-        : reader(reader), docsIter(reader.docs.bitset()) {
-      maxRank = reader.docs.numDocs();
-      densePresence = !reader.docs.hasBitset();
+        : reader(reader), docsIter(reader.docs.bitmapIterator()) {
+      maxRank = reader.docs.docsWithField();
+      densePresence = reader.docs.allRows();
     }
 
     int32_t docId() const {
@@ -108,18 +89,18 @@ public:
     }
 
     uint8_t value() const {
-      assert(reader.format != SegFieldInfo::NORMS_NONE);
+      assert(reader.values);
       assert(doc >= 0 && doc != ENDDOC);
-      if (reader.format == SegFieldInfo::NORMS_FLAT) {
-        return reader.normsBytes[doc];
+      if (reader.mode == field_parts::NormsMode::FLAT) {
+        return reader.values[doc];
       }
       assert(docRank >= 0 && docRank < maxRank);
-      return reader.normsBytes[docRank];
+      return reader.values[docRank];
     }
 
     int32_t advance(int32_t target) {
-      if (reader.format == SegFieldInfo::NORMS_FLAT) {
-        if (target >= reader.maxdoc) {
+      if (reader.mode == field_parts::NormsMode::FLAT) {
+        if (target >= reader.maxDoc) {
           doc = ENDDOC;
         } else {
           doc = target;
@@ -142,11 +123,11 @@ public:
     int32_t next() {
       if (flatDirectAdvance) {
         flatDirectAdvance = false;
-        if (doc == ENDDOC || doc + 1 >= reader.maxdoc) {
+        if (doc == ENDDOC || doc + 1 >= reader.maxDoc) {
           doc = ENDDOC;
           return doc;
         }
-        docsIter = screaming::BitSet::Iterator(reader.docs.bitset());
+        docsIter.reset();
         doc = docsIter.advance(doc + 1);
         docRank = doc == ENDDOC ? maxRank : docsIter.rank();
         return doc;

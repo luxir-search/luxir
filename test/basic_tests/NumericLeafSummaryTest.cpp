@@ -50,7 +50,8 @@ protected:
 
   IntColReader column(std::string_view field) {
     auto& postings = reader->segments()[0].postingsReader();
-    return IntColReader(postings, *postings.fieldInfo(field));
+    const auto& info = *postings.fieldInfo(field);
+    return IntColReader(postings, info);
   }
 
   static auto check(IntColReader& column, int64_t lo, int64_t hi) {
@@ -113,20 +114,20 @@ TEST_F(NumericLeafSummaryTest, multivaluedCountsAreValueRanks) {
   auto values = column("multi_is");
   ASSERT_TRUE(values.multiValued());
   ASSERT_EQ(1101, values.numValues());
-  ASSERT_EQ(2, values.docsWithValue());
+  ASSERT_EQ(2, values.docsWithField());
   auto broad = check(values, 0, 1099);
   EXPECT_EQ(2 * LEAF, broad.insideLower);
-  EXPECT_GT(broad.insideLower, values.docsWithValue());
+  EXPECT_GT(broad.insideLower, values.docsWithField());
 
   auto tail = check(values, 1024, 1099);
   EXPECT_EQ(2 * LEAF, tail.outside);
-  EXPECT_GT(tail.outside, values.docsWithValue());
+  EXPECT_GT(tail.outside, values.docsWithField());
   // Both ranges match one document. Neither value count can be used as a
-  // distinct-document lower bound, or subtracted from docsWithValue().
+  // distinct-document lower bound, or subtracted from docsWithField().
   IntColReader::SparseValues raw(values);
   for (int64_t lo : {0, 1024}) {
     int64_t matchedDocs = 0;
-    for (int32_t doc = 0; doc < values.docsWithValue(); doc++) {
+    for (int32_t doc = 0; doc < values.docsWithField(); doc++) {
       auto [begin, end] = values.getStartEndValueRank(doc);
       bool matches = false;
       for (int64_t rank = begin; rank < end; rank++) {

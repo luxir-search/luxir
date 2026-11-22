@@ -136,10 +136,10 @@ TEST_F(VectorColTest, singleValuedRoundTrip) {
 
   VectorReader vr(seg.postingsReader(), fi);
   ASSERT_EQ(4, vr.dims());
-  ASSERT_EQ((int32_t)expected.size(), vr.docsWithValue());
-  ASSERT_FALSE(vr.isMultiValued());
+  ASSERT_EQ((int32_t)expected.size(), vr.docsWithField());
+  ASSERT_FALSE(vr.multiValued());
   // Single-valued fields never get a valueRank->docId map (valueRank == docRank).
-  ASSERT_FALSE(vr.hasValDocMap());
+  ASSERT_FALSE(vr.hasOwners());
 
   for (int32_t docRank = 0; docRank < (int32_t)expected.size(); docRank++) {
     auto span = vr.singleVectorAt(docRank);
@@ -150,9 +150,9 @@ TEST_F(VectorColTest, singleValuedRoundTrip) {
   }
 }
 
-// Vector payloads go straight to a segment output; only their metadata streams
-// consume inverter.pool, and the raw float bytes do not inflate extraRamBytes.
-TEST_F(VectorColTest, payloadStreamsWithoutRamFile) {
+// Vector payloads use a staged checkout, separate from the inverter pool and
+// extraRamBytes.
+TEST_F(VectorColTest, payloadUsesStagedCheckout) {
   TestIndex testIndex;
   auto& inverter = testIndex.getInverter();
   auto& handler = inverter.getIndexHandler("vec_v");
@@ -201,8 +201,8 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
       std::pmr::monotonic_buffer_resource mr;
       luxir::api::UpdateRequest request;
       auto* docs = luxir::api::build::allocArray(request.docs, 1, mr);
-      // Cross the delegating-file safety threshold so the poisoned backing
-      // path is reached during the streamed write, before commit/finalize.
+      // Cross the spill threshold so the failing path is reached during
+      // the streamed write, before segment finish.
       CollectionHelper::convertDocToProto(
           flatdoc("vec_v", std::vector<float>(VECTOR_VALUES, 1.0f)), docs[0], mr);
       if (commit) request.commit.emplace();
@@ -224,7 +224,7 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
       return message.result.ok();
     };
 
-    std::string firstFile = Postings::getIndexFileName(Postings::segmentKey(1, 1), 0);
+    std::string firstFile = Postings::getIndexFileName(Postings::segmentKey(1, 1), 1);
     std::filesystem::path failingTmp = path / (firstFile + ".tmp");
     std::filesystem::create_symlink("/dev/full", failingTmp);
 
@@ -244,10 +244,7 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
   std::filesystem::remove_all(path);
 }
 
-// Stored fields and vectors release their indexing streams before the full-text
-// flush reuses them. None spills on this tiny segment, so finalize can fold the
-// three-stream high-water mark back into mandatory file 0.
-TEST_F(VectorColTest, indexingStreamsReuseAndCollapse) {
+TEST_F(VectorColTest, smallTextAndVectorShareFileZero) {
   TestIndex testIndex;
   auto& inverter = testIndex.getInverter();
   uint64_t segId = inverter.getSegId();
@@ -295,8 +292,8 @@ TEST_F(VectorColTest, multiValuedRoundTrip) {
 
   VectorReader vr(seg.postingsReader(), fi);
   ASSERT_EQ(3, vr.dims());
-  ASSERT_TRUE(vr.isMultiValued());
-  ASSERT_EQ((int32_t)expected.size(), vr.docsWithValue());
+  ASSERT_TRUE(vr.multiValued());
+  ASSERT_EQ((int32_t)expected.size(), vr.docsWithField());
 
   int64_t expectedTotal = 0;
   for (auto& doc : expected) expectedTotal += (int64_t)doc.size();
@@ -339,7 +336,7 @@ TEST_F(VectorColTest, coercesNumericArrayArms) {
   ASSERT_NE(nullptr, fields);
   const auto& info = *fields;
   VectorReader reader(seg.postingsReader(), info);
-  ASSERT_EQ(3, reader.docsWithValue());
+  ASSERT_EQ(3, reader.docsWithField());
   auto vec0 = reader.singleVectorAt(0);
   auto vec1 = reader.singleVectorAt(1);
   auto vec2 = reader.singleVectorAt(2);
@@ -372,7 +369,7 @@ TEST_F(VectorColTest, coercesMultiVectorJsonShapes) {
   ASSERT_NE(nullptr, fields);
   const auto& info = *fields;
   VectorReader reader(seg.postingsReader(), info);
-  EXPECT_EQ(2, reader.docsWithValue());
+  EXPECT_EQ(2, reader.docsWithField());
   EXPECT_EQ(3, reader.numVectors());
   auto [start, end] = reader.valueRange(1);
   ASSERT_EQ(1, end - start);
@@ -448,7 +445,7 @@ TEST_F(VectorColTest, coercedValidationPrecedesStreamingWrite) {
   ASSERT_NE(nullptr, fields);
   const auto& info = *fields;
   VectorReader reader(seg.postingsReader(), info);
-  EXPECT_EQ(1, reader.docsWithValue());
+  EXPECT_EQ(1, reader.docsWithField());
   EXPECT_EQ(2, reader.numVectors());
 }
 
@@ -480,8 +477,8 @@ TEST_F(VectorColTest, multiValuedValueRankToDoc) {
   const auto& fi = *fieldReader;
 
   VectorReader vr(seg.postingsReader(), fi);
-  ASSERT_TRUE(vr.isMultiValued());
-  ASSERT_TRUE(vr.hasValDocMap());
+  ASSERT_TRUE(vr.multiValued());
+  ASSERT_TRUE(vr.hasOwners());
   ASSERT_EQ(6, vr.numVectors());
 
   // Expected valueRank -> docId, in value-rank (doc) order.
@@ -498,7 +495,7 @@ TEST_F(VectorColTest, multiValuedValueRankToDoc) {
 // The valueRank -> docId map must survive a segment merge: mergeStrCol regenerates
 // it against the merged (remapped) doc ids.  Two multi-valued segments are merged
 // and every value rank is checked against its owning merged docId.
-TEST_F(VectorColTest, multiValuedValDocSurvivesMerge) {
+TEST_F(VectorColTest, multiValuedOwnersSurviveMerge) {
   TestIndex testIndex;
 
   // Segment 1: doc 0 has 2 vectors, doc 1 has 1 vector.
@@ -527,8 +524,8 @@ TEST_F(VectorColTest, multiValuedValDocSurvivesMerge) {
   const auto& fi = *fieldReader;
 
   VectorReader vr(seg.postingsReader(), fi);
-  ASSERT_TRUE(vr.isMultiValued());
-  ASSERT_TRUE(vr.hasValDocMap());
+  ASSERT_TRUE(vr.multiValued());
+  ASSERT_TRUE(vr.hasOwners());
   ASSERT_EQ(5, vr.numVectors());
 
   // merged docRanks: seg1 doc0->0, seg1 doc1->1, seg2 doc0->2.
@@ -807,7 +804,7 @@ TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
   RAMDir dir;
   auto schema = std::make_shared<Schema>();
   auto cosineType = std::make_shared<VectorFieldType>(
-      "cos_v", /*dims=*/2, FieldType::COLUMN_STORED | FieldType::FIXED_SIZE,
+      "cos_v", /*dims=*/2, FieldType::COLUMN_STORED,
       VectorFieldType::METRIC_COSINE, /*normalized=*/true);
   schema->fieldTypeMap["cos_v"] = cosineType;
   Inverter inverter(dir, 1, 1, schema);
@@ -828,7 +825,7 @@ TEST_F(VectorColTest, rejectsOutOfRangeElements) {
   auto schema = std::make_shared<Schema>();
   schema->fieldTypeMap["strict_v"] = std::make_shared<VectorFieldType>("strict_v", /*dims=*/3);
   schema->fieldTypeMap["cos_v"] = std::make_shared<VectorFieldType>(
-      "cos_v", /*dims=*/3, FieldType::COLUMN_STORED | FieldType::FIXED_SIZE,
+      "cos_v", /*dims=*/3, FieldType::COLUMN_STORED,
       VectorFieldType::METRIC_COSINE);
   Inverter inverter(dir, 1, 1, schema);
   std::pmr::monotonic_buffer_resource mr;
@@ -876,7 +873,6 @@ TEST_F(VectorColTest, schemaProtoRoundTrip) {
   EXPECT_EQ(VectorFieldType::METRIC_COSINE, vft->metric());
   EXPECT_TRUE(vft->normalizeOnWrite());
   EXPECT_TRUE(vft->hasColumn());
-  EXPECT_TRUE(vft->isSet(FieldType::FIXED_SIZE));
 
   luxir::api::SchemaDef outDef;
   std::pmr::monotonic_buffer_resource outMr;

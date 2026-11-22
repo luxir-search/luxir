@@ -233,10 +233,10 @@ TEST_F(RangeFieldTest, mergeDropsFieldsWithNoSurvivingValues) {
   auto writer = helper.getIndexWriter();
   auto reader = writer->snapshots.readers.getReader();
   auto& postings = reader->segments()[0].postingsReader();
-  ASSERT_TRUE(postings.fieldInfo("bkd")->hasEndValueRanks());
-  ASSERT_NE(0, postings.fieldInfo("bkd")->pointsMetaOff);
-  ASSERT_NE(0, postings.fieldInfo("gone_i")->nTerms);
-  ASSERT_NE(0, postings.fieldInfo("gone_ps")->pointsMetaOff);
+  ASSERT_TRUE(postings.fieldInfo("bkd")->endValueRanks());
+  ASSERT_NE(nullptr, postings.fieldInfo("bkd")->points());
+  ASSERT_NE(0, postings.fieldInfo("gone_i")->indexedTotals().numTerms);
+  ASSERT_NE(nullptr, postings.fieldInfo("gone_ps")->points());
   ASSERT_EQ((Ids{"dead"}), both(R"("gte":17,"lte":17)"));
   ASSERT_TRUE(helper.deleteById("dead", UpdateMessage::COMMIT).success);
 
@@ -336,36 +336,36 @@ TEST_F(RangeFieldTest, mergeIndexedAndColumnOnlyInputs) {
   auto writer = helper.getIndexWriter();
   auto before = writer->snapshots.readers.getReader();
   ASSERT_EQ(2u, before->segments().size());
-  EXPECT_GT(before->field("bkd").at(0)->pointsMetaOff, 0);
-  EXPECT_EQ(0, before->field("bkd").at(1)->pointsMetaOff);
+  EXPECT_NE(nullptr, before->field("bkd").at(0)->points());
+  EXPECT_EQ(nullptr, before->field("bkd").at(1)->points());
   EXPECT_EQ((Ids{"a", "b"}), both(R"("gte":18,"lte":22)"));
   CollectionHelper::UpdateBuilder merge;
   merge.commit(true, 1);
   ASSERT_TRUE(helper.submit(merge).success);
   auto merged = writer->snapshots.readers.getReader();
   ASSERT_EQ(1u, merged->segments().size());
-  EXPECT_GT(merged->field("bkd").at(0)->pointsMetaOff, 0);
+  EXPECT_NE(nullptr, merged->field("bkd").at(0)->points());
   EXPECT_EQ((Ids{"a", "b"}), both(R"("gte":18,"lte":22)"));
   EXPECT_EQ((Ids{"b"}), both(R"("gte":12,"lte":35)", "within"));
 }
 
-TEST_F(RangeFieldTest, elementTypeFlagsAndSignatures) {
+TEST_F(RangeFieldTest, elementTypeParametersAndSignatures) {
   constexpr uint32_t dateKind = 2;
-  uint32_t nanos = dateKind | (1u << RangeFieldType::ELEMENT_FLAGS_SHIFT);
+  uint32_t nanos = dateKind | (1u << RangeFieldType::ELEMENT_PARAMETERS_SHIFT);
   EXPECT_EQ(nanos, FieldType::typeParameters(FieldType::INTERVAL, nanos));
   EXPECT_EQ("type 'date_range'", FieldType::describeType(FieldType::INTERVAL, dateKind));
   EXPECT_EQ("type 'date_range' with element type 'date' unit 'ns'",
             FieldType::describeType(FieldType::INTERVAL, nanos));
   EXPECT_THROW(FieldType::typeParameters(FieldType::INTERVAL, RangeFieldType::ELEMENT_KIND_MASK), std::runtime_error);
-  EXPECT_THROW(FieldType::typeParameters(FieldType::INTERVAL, 1u << RangeFieldType::ELEMENT_FLAGS_SHIFT), std::runtime_error);
+  EXPECT_THROW(FieldType::typeParameters(FieldType::INTERVAL, 1u << RangeFieldType::ELEMENT_PARAMETERS_SHIFT), std::runtime_error);
   EXPECT_THROW(FieldType::typeParameters(FieldType::INTERVAL,
-      dateKind | (2u << RangeFieldType::ELEMENT_FLAGS_SHIFT)), std::runtime_error);
+      dateKind | (2u << RangeFieldType::ELEMENT_PARAMETERS_SHIFT)), std::runtime_error);
   RangeFieldType date("when", FieldType::DATE);
   FieldType::SignatureProps props;
   date.signatureProps(props);
   EXPECT_EQ("\"date_range\"", props.at("type"));
   EXPECT_EQ("\"ms\"", props.at("unit"));
-  EXPECT_EQ(dateKind, date.segmentTypeFlags());
+  EXPECT_EQ(dateKind, date.segmentTypeParameters());
   SchemaBuilder schema;
   auto& field = schema.field("spans");
   field.type = FieldClass::DATE_RANGE;

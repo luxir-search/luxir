@@ -44,7 +44,7 @@ std::vector<std::string> collectSmart(TestField& field, const ByteDfa& dfa, int6
                                       int64_t* jumps = nullptr, DfaStats* stats = nullptr) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* segment = field.currentSegment();
-  TermsEnum terms(guard.pool(), segment->postingsReader(), field.fieldInfo);
+  TermsEnum terms(guard.pool(), segment->postingsReader(), field.fieldInfo());
   auto view = dfa.view();
   auto [prefix, state] = view.commonPrefixAndState();
   std::string commonSuffix = dfa.commonSuffix();
@@ -66,7 +66,7 @@ std::vector<std::string> collectLegacy(TestField& field, const ByteDfa& dfa,
                                        DfaStats& stats) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* segment = field.currentSegment();
-  TermsEnum terms(guard.pool(), segment->postingsReader(), field.fieldInfo);
+  TermsEnum terms(guard.pool(), segment->postingsReader(), field.fieldInfo());
   auto view = dfa.view();
   auto [prefix, state] = view.commonPrefixAndState();
   AutomatonSeekEnum<ByteDfaView> e(guard.pool(), terms, prefix, view, state);
@@ -81,7 +81,7 @@ std::vector<std::string> collectLegacy(TestField& field, const ByteDfa& dfa,
 std::vector<std::string> collectBrute(TestField& field, const ByteDfa& dfa) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* segment = field.currentSegment();
-  TermsEnum terms(guard.pool(), segment->postingsReader(), field.fieldInfo);
+  TermsEnum terms(guard.pool(), segment->postingsReader(), field.fieldInfo());
   BruteDfaTermsEnum e(terms, dfa.view());
   std::vector<std::string> out;
   while (e.next()) out.emplace_back(e.termView());

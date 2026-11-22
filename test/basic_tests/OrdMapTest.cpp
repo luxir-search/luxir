@@ -526,8 +526,8 @@ TEST_F(OrdMapTest, GlobalToSegmentReverseMapping) {
   
   // Expected global order: apple=0, banana=1, cherry=2, date=3, elderberry=4, fig=5
   // Create dense value accessors for the global columns
-  IntColReader::SparseValues firstSegsValues(*ordMap->getFirstSegs());
-  IntColReader::SparseValues globDeltasValues(*ordMap->getGlobDeltas());
+  const auto& firstSegsValues = *ordMap->getFirstSegs();
+  const auto& globDeltasValues = *ordMap->getGlobDeltas();
 
   // Test reverse mapping for each global ordinal
   for (int globalOrd = 0; globalOrd < ordMap->numOrds(); globalOrd++) {
@@ -590,14 +590,10 @@ TEST_F(OrdMapTest, relocatedGlobalColumnsKeepMetadataAligned) {
   std::vector<char> relocated(payloadFile.size());
   payloadFile.copyTo(relocated.data());
   InputStream input(relocated.data(), relocated.data() + relocated.size());
-  IntColReader firstSegsReader(
-      input, firstSegsLoc, firstSegsInfo.columnMetaOff,
-      firstSegsInfo.numValues);
-  IntColReader globDeltasReader(
-      input, globDeltasLoc, globDeltasInfo.columnMetaOff,
-      globDeltasInfo.numValues);
-  IntColReader::SparseValues firstSegValues(firstSegsReader);
-  IntColReader::SparseValues globDeltaValues(globDeltasReader);
+  NumColumn firstSegValues(input.ptr(firstSegsLoc),
+      input.ptr(firstSegsLoc + firstSegsInfo.columnMetaOff), firstSegsInfo.numValues);
+  NumColumn globDeltaValues(input.ptr(globDeltasLoc),
+      input.ptr(globDeltasLoc + globDeltasInfo.columnMetaOff), globDeltasInfo.numValues);
   for (int64_t i = 0; i < (int64_t)expectedFirstSegs.size(); i++) {
     EXPECT_EQ(firstSegValues.valueAt(i), expectedFirstSegs[(size_t)i]);
     EXPECT_EQ(globDeltaValues.valueAt(i), expectedGlobDeltas[(size_t)i]);

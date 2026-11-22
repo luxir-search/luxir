@@ -2029,6 +2029,10 @@ message FieldMetadataStats {
   uint64 page_bytes = 5;
   uint64 entries = 6;
   uint64 entry_bytes = 7;
+  uint64 opened_pages = 12;
+  uint64 opened_page_bytes = 13;
+  uint64 opened_entries = 14;
+  uint64 opened_entry_bytes = 15;
   uint64 names = 8;
   uint64 name_bytes = 9;
   uint64 live_views = 10;

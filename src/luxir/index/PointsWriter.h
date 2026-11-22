@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "luxir/codec/Codec.h"
+#include "luxir/index/PostingsWriter.h"
 #include "luxir/store/OutputStream.h"
 #include "luxir/util/IntegerSort.h"
 
@@ -45,7 +46,37 @@ public:
   static constexpr uint8_t FORMAT_KIND = 1;
   static constexpr uint32_t FLAG_LEAF_MAX = 1;
   static constexpr uint16_t DEFAULT_MAX_POINTS_PER_LEAF = 512;
-  static constexpr uint32_t FIXED_HEADER_SIZE = 28;
+  static constexpr uint8_t METADATA_RESERVED_BYTE = 0x11;
+  static constexpr uint16_t METADATA_RESERVED_WORD = 0x1111;
+
+  // Fixed header preceding the aligned leaf directory arrays.
+  struct __attribute__((packed)) FixedHeader {
+    uint32_t magic = MAGIC;
+    uint16_t version = VERSION;
+    uint8_t formatKind = FORMAT_KIND;  // Identifies the one-dimensional directory.
+    uint8_t reservedByte = METADATA_RESERVED_BYTE;  // Format marker following the kind.
+    uint32_t flags = FLAG_LEAF_MAX;  // Indicates that the directory includes leaf maxima.
+    uint32_t leafCount;
+    uint16_t maxPointsPerLeaf;  // Capacity of each full leaf.
+    uint16_t reservedWord = METADATA_RESERVED_WORD;  // Format marker preceding the point count.
+    uint64_t pointCount;
+  };
+
+  static constexpr uint32_t FIXED_HEADER_SIZE = sizeof(FixedHeader);
+  static_assert(FIXED_HEADER_SIZE == 28);
+  // Leaf directories have one entry per full or partial leaf.
+  static uint64_t leafCount(uint64_t points, uint16_t capacity) noexcept {
+    return capacity ? points / capacity + (points % capacity != 0) : 0;
+  }
+
+  // Padded header, minima, maxima, leaf pointers and leaf encodings.
+  static uint64_t directoryBytes(uint64_t start, uint32_t leaves) noexcept {
+    return directoryOffset(start) + sizeof(uint64_t) + (uint64_t)leaves * 28;
+  }
+
+  static uint64_t directoryOffset(uint64_t start) noexcept {
+    return alignUp(start + FIXED_HEADER_SIZE, MAX_ALIGN) - start;
+  }
   static constexpr uint32_t LEAF_HEADER_SIZE = 32;
   static constexpr uint8_t DOC_CONTIG = 0;
   static constexpr uint8_t DOC_FOR = 1;
@@ -235,10 +266,12 @@ private:
 
 public:
   struct Data {
-    seg_location pointsLoc;
+    size_t pointsStart;
     int64_t pointsMetaOff;
     uint64_t pointCount;
     uint32_t leafCount;
+    uint16_t maxPointsPerLeaf;
+    uint64_t directoryBytes;
   };
 
   explicit PointsWriter(OutputStream& out) : PointsWriter(out, Options{}) {}
@@ -269,6 +302,14 @@ public:
     if (leaf.size() == options.maxPointsPerLeaf) flushLeaf();
   }
 
+  uint64_t numPoints() const noexcept { return pointCount; }
+
+  [[nodiscard]] field_parts::Points finish(PostingsWriter& postings, OutputStreamPtr&& output) {
+    auto data = finish();
+    auto slice = postings.finishStream(std::move(output));
+    return {slice.location.addOffset(data.pointsStart), (uint64_t)data.pointsMetaOff, data.maxPointsPerLeaf};
+  }
+
   Data finish() {
     if (finished) throw std::logic_error("PointsWriter: finish called twice");
     if (pointCount == 0) throw std::invalid_argument("PointsWriter: empty input");
@@ -279,19 +320,15 @@ public:
     leafFP.push_back(pointsMetaOff);
     assert(!leafMin.empty());
     assert(leafMin.size() == leafMax.size());
+    assert(leafMin.size() == leafCount(pointCount, options.maxPointsPerLeaf));
     assert(leafFP.size() == leafMin.size() + 1);
     assert(leafFP.back() == pointsMetaOff);
     assert(leafMin.size() <= std::numeric_limits<uint32_t>::max());
 
-    writeU32(out, MAGIC);
-    writeU16(out, VERSION);
-    out.write((char)FORMAT_KIND);
-    out.write((char)0x11);
-    writeU32(out, FLAG_LEAF_MAX);
-    writeU32(out, (uint32_t)leafMin.size());
-    writeU16(out, options.maxPointsPerLeaf);
-    writeU16(out, 0x1111);
-    writeU64(out, pointCount);
+    static_assert(std::endian::native == std::endian::little);
+    FixedHeader header{.leafCount = (uint32_t)leafMin.size(), .maxPointsPerLeaf = options.maxPointsPerLeaf,
+                       .pointCount = pointCount};
+    out.write(&header, sizeof(header));
     assert((uint64_t)(out.size() - pointsStart) == pointsMetaOff + FIXED_HEADER_SIZE);
     out.align(MAX_ALIGN);
     out.write(leafMin.data(), leafMin.size() * sizeof(int64_t));
@@ -299,8 +336,10 @@ public:
     out.write(leafFP.data(), leafFP.size() * sizeof(uint64_t));
     out.write(leafEncodings.data(), leafEncodings.size() * sizeof(uint32_t));
 
-    return {seg_location(out.streamNumber, pointsStart), (int64_t)pointsMetaOff,
-            pointCount, (uint32_t)leafMin.size()};
+    auto bytes = directoryBytes(pointsStart + pointsMetaOff, (uint32_t)leafMin.size());
+    assert(bytes == out.size() - pointsStart - pointsMetaOff);
+    return {pointsStart, (int64_t)pointsMetaOff,
+            pointCount, (uint32_t)leafMin.size(), options.maxPointsPerLeaf, bytes};
   }
 };
 

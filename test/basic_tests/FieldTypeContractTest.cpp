@@ -9,7 +9,7 @@
 #include "luxir/search/SortField.h"
 #include "luxir/value/ValueExprParser.h"
 #include "luxir/index/PostingsWriter.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/FieldCursor.h"
 #include "luxir/search/IndexReader.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -138,7 +138,7 @@ TEST_F(FieldTypeContractTest, textCapabilityRemedies) {
   EXPECT_TRUE(IntFieldType("int").capabilityRemedy(FieldType::PREFIX).empty());
 }
 
-TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
+TEST_F(FieldTypeContractTest, typeParametersSurviveFlushMergeAndReopen) {
   CollectionHelper helper;
   SchemaBuilder schema;
   for (auto name : {"nano", "nanos"}) {
@@ -159,18 +159,18 @@ TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
     for (const auto& segment : reopened->segments) {
       SegmentCore postingsCore(writer->dir, segment.seg_id, segment.creator_epoch);
       auto& postings = postingsCore.rootReader();
-      FieldReader fields(postings);
-      while (fields.readNextField()) {
-        SegFieldInfo info{};
-        fields.readFieldInfo(info);
-        auto name = (std::string_view)info.fieldname;
+      FieldCursor fields(postings);
+      while (fields.next()) {
+        auto record = fields.decode();
+        const auto& info = *record;
+        auto name = std::string_view(info.name);
         uint32_t expected = name == "nano" || name == "nanos" ? 1 : 0;
-        EXPECT_EQ(expected, info.typeFlags) << name;
-        EXPECT_EQ(expected, FieldType::typeParameters(info.type, info.typeFlags));
+        EXPECT_EQ(expected, info.typeParameters) << name;
+        EXPECT_EQ(expected, FieldType::typeParameters(info.type, info.typeParameters));
       }
       EXPECT_EQ(FieldType::ID, postings.fieldInfo("id")->type);
       EXPECT_EQ(FieldType::DATE, postings.fieldInfo("when_dt")->type);
-      EXPECT_EQ(0u, postings.fieldInfo("when_dt")->typeFlags);
+      EXPECT_EQ(0u, postings.fieldInfo("when_dt")->typeParameters);
     }
   };
   check();
@@ -179,23 +179,21 @@ TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
   check();
 }
 
-TEST_F(FieldTypeContractTest, unknownTypeFlagsAreRejectedWithoutSchema) {
+TEST_F(FieldTypeContractTest, unknownTypeParametersAreRejectedWithoutSchema) {
   for (int type = FieldType::NONE; type <= FieldType::IP; type++) {
     SCOPED_TRACE(FieldType::typeName((FieldType::Type)type));
     RAMDir dir;
-    PostingsWriter writer(dir, 1, 1, 0);
+    PostingsWriter writer(dir, 1, 1, 1);
     auto& info = writer.addField(SpaceOrdinal::ROOT, "value");
-    info.type = (FieldType::Type)type;
-    info.typeFlags = type == FieldType::DECIMAL ? 19 : type == FieldType::DATE ? 2 : 1; // deliberately invalid persisted metadata
-    writeUnversionedRuns(writer);
-    writer.finish();
-    SegmentCore readerCore(dir, 1, 1);
-    auto& reader = readerCore.rootReader();
-    FieldReader fields(reader);
-    ASSERT_TRUE(fields.readNextField());
-    SegFieldInfo decoded{};
-    EXPECT_THROW(fields.readFieldInfo(decoded), std::runtime_error);
-    EXPECT_THROW(reader.fieldInfo("value"), std::runtime_error);
+    info.header.type = (FieldType::Type)type;
+    info.header.typeParameters = type == FieldType::DECIMAL ? 19 : type == FieldType::DATE ? 2 : 1; // deliberately invalid persisted metadata
+    info.setPresence({1, {}});
+    test::writeUnversionedRuns(writer);
+    EXPECT_THROW(writer.finish(), std::logic_error);
+    if (FieldType::hasTypeParameters((FieldType::Type)type)) {
+      std::array bytes{(char)1, 'v', (char)type, (char)0, (char)info.header.typeParameters, (char)0, (char)0, (char)1};
+      EXPECT_THROW(FieldRecordCodec::fieldHeader(bytes, 1), std::runtime_error);
+    }
   }
 }
 
@@ -209,14 +207,14 @@ TEST_F(FieldTypeContractTest, changedDateUnitFailsOnlyFieldUsers) {
   ASSERT_TRUE(helper.index(flatdoc("id", "one", "value", 7), UpdateMessage::COMMIT).success);
   auto writer = helper.getIndexWriter();
   auto before = writer->snapshots.readers.getReader();
-  EXPECT_EQ(1u, before->field("value").at(0)->typeFlags);
+  EXPECT_EQ(1u, before->field("value").at(0)->typeParameters);
 
   SchemaBuilder removed;
   removed.replaceAll(helper.collection());
   setValueType(helper, api::FieldDef::FieldClass::DATE);
   IndexReader reopened(writer->dir);
   EXPECT_EQ((std::vector<std::string>{"one"}), allIds(helper));
-  EXPECT_EQ(1u, before->field("value").at(0)->typeFlags);
+  EXPECT_EQ(1u, before->field("value").at(0)->typeParameters);
   EXPECT_THROW(reopened.field("value"), RequestError);
   for (bool retrieve : {true, false}) {
     auto request = localReq(helper.getSearchEngine());

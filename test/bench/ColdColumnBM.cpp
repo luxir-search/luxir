@@ -129,7 +129,8 @@ std::vector<std::pair<char*, size_t>> columnSpans(ColdIndex& index) {
   size_t page = (size_t)sysconf(_SC_PAGESIZE);
   for (const auto& seg : reader->segments()) {
     auto* info = seg.postingsReader().fieldInfo("bench_v");
-    if (info == nullptr) continue;
+    const auto* bytes = info ? info->bytesColumn() : nullptr;
+    if (!bytes) continue;
     VectorReader vr(seg.postingsReader(), *info);
     auto begin = (uintptr_t)vr.vectorAtRank(0).data();
     auto end = begin + (uintptr_t)vr.numVectors() * (uintptr_t)vr.dims() * sizeof(float);

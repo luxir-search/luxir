@@ -48,17 +48,23 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   auto storageMemory = node.collections().storage().memory();
   memory.storage_ram.limit_bytes = storageMemory ? storageMemory->limitBytes() : 0;
   auto& fields = memory.field_metadata;
-  fields.directories = fieldMetadataMemory.directories.load(std::memory_order_relaxed);
-  fields.directory_bytes = fieldMetadataMemory.directoryBytes.load(std::memory_order_relaxed);
+  // Keep the exported API names for the field-cache page-pointer arrays.
+  fields.directories = fieldMetadataMemory.pagePointerArrays.load(std::memory_order_relaxed);
+  fields.directory_bytes = fieldMetadataMemory.pagePointerBytes.load(std::memory_order_relaxed);
   fields.pages = fieldMetadataMemory.pages.load(std::memory_order_relaxed);
   fields.page_bytes = fieldMetadataMemory.pageBytes.load(std::memory_order_relaxed);
   fields.entries = fieldMetadataMemory.entries.load(std::memory_order_relaxed);
   fields.entry_bytes = fieldMetadataMemory.entryBytes.load(std::memory_order_relaxed);
+  fields.opened_pages = fieldMetadataMemory.openedPages.load(std::memory_order_relaxed);
+  fields.opened_page_bytes = fieldMetadataMemory.openedPageBytes.load(std::memory_order_relaxed);
+  fields.opened_entries = fieldMetadataMemory.openedEntries.load(std::memory_order_relaxed);
+  fields.opened_entry_bytes = fieldMetadataMemory.openedEntryBytes.load(std::memory_order_relaxed);
   fields.names = fieldMetadataMemory.names.load(std::memory_order_relaxed);
   fields.name_bytes = fieldMetadataMemory.nameBytes.load(std::memory_order_relaxed);
   fields.live_views = fieldMetadataMemory.liveViews.load(std::memory_order_relaxed);
   fields.live_view_bytes = fieldMetadataMemory.liveViewBytes.load(std::memory_order_relaxed);
-  fields.bytes = fields.directory_bytes + fields.page_bytes + fields.entry_bytes + fields.name_bytes + fields.live_view_bytes;
+  fields.bytes = fields.directory_bytes + fields.page_bytes + fields.entry_bytes
+      + fields.opened_page_bytes + fields.opened_entry_bytes + fields.name_bytes + fields.live_view_bytes;
   auto process = processAllocatorStats();
   if (!process) return;
   auto& jemalloc = memory.jemalloc.emplace();

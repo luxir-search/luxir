@@ -14,6 +14,7 @@
 #include "luxir/api/padded_input.h"
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/reader/Postings.h"
+#include "luxir/reader/SegmentCatalog.h"
 #include "luxir/store/Manifest.h"
 
 namespace luxir::test {
@@ -65,13 +66,14 @@ inline void expectValidInventory(Directory& dir, const api::IndexInfo& info) {
     auto id = Postings::segmentKey(seg.seg_id, seg.creator_epoch);
     auto first = dir.openFile(Postings::getIndexFileName(id, 0));
     ASSERT_NE(nullptr, first);
-    auto input = first->getInputStream();
-    input.seek(input.size() - sizeof(int32_t));
-    auto footerSize = input.readInt();
-    input.seek(input.size() - sizeof(int32_t) - footerSize);
-    input.readVint(); // maxDoc
-    auto count = input.readVint();
-    for (uint32_t i = 0; i < count; i++) expected.insert(Postings::getIndexFileName(id, input.readVint()));
+    auto bytes = first->read();
+    ASSERT_LE(seg.catalog.offset, bytes.size());
+    ASSERT_EQ(seg.catalog.length, bytes.size() - seg.catalog.offset);
+    auto tail = std::span(bytes).subspan(seg.catalog.offset);
+    EXPECT_EQ(seg.catalog.xxh3, XXH3_64bits(tail.data(), tail.size()));
+    auto head = SegmentCatalog::readDirectory(std::span(bytes));
+    EXPECT_EQ(seg.catalog.offset, head.catalogOffset());
+    for (auto number : head.fileNumbers()) expected.insert(Postings::getIndexFileName(id, number));
     if (seg.live_gen) expected.insert(Postings::getLiveDocsFileName(id, seg.live_gen, seg.live_epoch));
     auto names = fileNames(seg.files);
     EXPECT_EQ(expected, std::set<std::string>(names.begin(), names.end()));

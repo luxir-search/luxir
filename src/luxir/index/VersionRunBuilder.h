@@ -14,27 +14,29 @@ namespace luxir {
 class VersionRunsOutput {
   OutputStream& out;
   size_t start;
+  size_t dataStart;
   std::vector<VersionBlockDirectory> directory;
 
 public:
-  explicit VersionRunsOutput(OutputStream& out, uint32_t blocks = 0) : out(out) {
+  explicit VersionRunsOutput(OutputStream& out, uint32_t blocks = 0)
+      : out(out), start(out.size()) {
     directory.reserve(blocks);
     out.align(8);
-    start = out.size();
+    dataStart = out.size();
   }
   void add(std::span<const char> block, uint32_t firstDoc) {
-    directory.push_back({firstDoc, 0, out.size() - start});
+    directory.push_back({firstDoc, 0, out.size() - dataStart});
     out.write(block.data(), block.size());
   }
-  seg_location finish(uint32_t count) {
-    if (!count) return {};
-    uint64_t directoryOffset = out.size() - start;
+  uint64_t finish(uint32_t count) {
+    if (!count) return 0;
+    uint64_t directoryOffset = out.size() - dataStart;
     out.write(directory.data(), directory.size() * sizeof(VersionBlockDirectory));
-    auto location = out.slocation();
+    auto trailerOff = out.size() - start;
     VersionRunsHeader header{VersionRuns::ENCODING, count, directoryOffset,
-        out.size() - start + sizeof(VersionRunsHeader)};
+        out.size() - dataStart + sizeof(VersionRunsHeader)};
     out.write(&header, sizeof(header));
-    return location;
+    return trailerOff;
   }
 };
 

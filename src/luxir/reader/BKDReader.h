@@ -523,14 +523,12 @@ public:
 
 private:
   const char* points = nullptr;
-  const char* fileEnd = nullptr;
   const char* innerNodeData = nullptr;
   const char* min0Data = nullptr;
   const char* max0Data = nullptr;
   const char* min1Data = nullptr;
   const char* max1Data = nullptr;
   const char* leafPointerData = nullptr;
-  uint64_t pointsFileOffset = 0;
   uint64_t metaOffset = 0;
   uint64_t pointsCount = 0;
   uint64_t byteSize = 0;
@@ -548,25 +546,14 @@ private:
     throw std::runtime_error(std::string("BKDReader: ") + reason);
   }
 
-  void init(const InputStream& input, uint64_t pointsOff,
-            int64_t pointsMetaOff) {
+  void init(std::span<const char> leaves, std::span<const char> directory,
+            uint64_t directoryOffset) {
     static_assert(std::endian::native == std::endian::little);
-    if (pointsMetaOff <= 0) invalid("points index is absent");
-    if (pointsOff > (uint64_t)input.size()) {
-      invalid("points location is out of bounds");
-    }
-    if ((uint64_t)pointsMetaOff > (uint64_t)input.size() - pointsOff) {
-      invalid("metadata is out of bounds");
-    }
-
-    pointsFileOffset = pointsOff;
-    metaOffset = (uint64_t)pointsMetaOff;
-    points = input.ptr((int64_t)pointsOff);
-    fileEnd = input.ptr(input.size());
-    const char* meta = points + metaOffset;
-    if ((uint64_t)(fileEnd - meta) < Writer::FIXED_HEADER_SIZE) {
-      invalid("truncated metadata header");
-    }
+    if (leaves.empty()) invalid("points index is absent");
+    if (directory.size() < Writer::FIXED_HEADER_SIZE) invalid("truncated metadata header");
+    points = leaves.data();
+    metaOffset = leaves.size();
+    const char* meta = directory.data();
     auto header = load<typename Writer::FixedHeader>(meta);
     if (header.magic != Writer::MAGIC) invalid("bad magic");
     if (header.version != Writer::VERSION) invalid("unsupported version");
@@ -593,29 +580,18 @@ private:
     leavesCount = header.leafCount;
     leafSizeMax = header.maxPointsPerLeaf;
     pointsCount = header.pointCount;
-    uint64_t expectedLeaves = pointsCount / leafSizeMax
-                            + (pointsCount % leafSizeMax != 0);
+    uint64_t expectedLeaves = PointsWriter::leafCount(pointsCount, leafSizeMax);
     if (expectedLeaves != leavesCount) {
       invalid("leafCount does not match pointCount");
     }
 
-    uint64_t directoryFileOffset = pointsFileOffset + metaOffset
-                                 + Writer::FIXED_HEADER_SIZE;
-    if (directoryFileOffset < pointsFileOffset) invalid("metadata overflow");
-    directoryFileOffset = (directoryFileOffset + 7) & ~(uint64_t)7;
-    if (directoryFileOffset < pointsFileOffset) invalid("metadata overflow");
-    uint64_t directoryOff = directoryFileOffset - pointsFileOffset;
-    uint64_t innerBytes = (uint64_t)(leavesCount - 1)
-                        * sizeof(InnerNode);
-    uint64_t boundsBytes = (uint64_t)leavesCount * sizeof(Scalar) * 4;
-    uint64_t pointerBytes = ((uint64_t)leavesCount + 1) * sizeof(uint64_t);
-    uint64_t directoryBytes = innerBytes + boundsBytes + pointerBytes;
-    if (directoryOff > (uint64_t)(fileEnd - points)
-        || directoryBytes > (uint64_t)(fileEnd - points) - directoryOff) {
+    auto directoryOff = Writer::directoryOffset(directoryOffset);
+    uint64_t innerBytes = (uint64_t)(leavesCount - 1) * sizeof(InnerNode);
+    if (Writer::directoryBytes(directoryOffset, leavesCount) != directory.size()) {
       invalid("truncated metadata arrays");
     }
-    byteSize = directoryOff + directoryBytes;
-    innerNodeData = points + directoryOff;
+    byteSize = leaves.size() + directory.size();
+    innerNodeData = meta + directoryOff;
     min0Data = innerNodeData + innerBytes;
     max0Data = min0Data + (uint64_t)leavesCount * sizeof(Scalar);
     min1Data = max0Data + (uint64_t)leavesCount * sizeof(Scalar);
@@ -737,15 +713,23 @@ private:
   }
 
 public:
-  BasicBKDReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) {
-    if (fieldInfo.pointsMetaOff == 0) invalid("points index is absent");
-    InputStream input = postingsReader.core().getInputStream(fieldInfo.pointsLoc.filenum());
-    init(input, fieldInfo.pointsLoc.offset(), fieldInfo.pointsMetaOff);
+  BasicBKDReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo) {
+    const auto* part = fieldInfo.points();
+    if (!part) invalid("points index is absent");
+    auto& core = reader.core();
+    auto directory = fieldInfo.pointsDirectory();
+    init(core.slice(part->leaves()), core.slice(directory), directory.location.offset());
+    auto count = fieldInfo.pointCount();
+    if (leafCount() != fieldInfo.pointLeafCount() || maxPointsPerLeaf() != part->maxPointsPerLeaf
+        || pointCount() != count) invalid("directory counts disagree with field record");
   }
 
-  BasicBKDReader(const InputStream& input, uint64_t pointsOff,
-            int64_t pointsMetaOff) {
-    init(input, pointsOff, pointsMetaOff);
+  BasicBKDReader(const InputStream& input, uint64_t leavesOffset, uint64_t leavesBytes, uint64_t directoryBytes) {
+    auto size = (uint64_t)input.size();
+    if (leavesOffset > size || leavesBytes > size - leavesOffset
+        || directoryBytes > size - leavesOffset - leavesBytes) invalid("points slice is out of bounds");
+    auto directoryOffset = leavesOffset + leavesBytes;
+    init({input.ptr(leavesOffset), leavesBytes}, {input.ptr(directoryOffset), directoryBytes}, directoryOffset);
   }
 
   uint64_t pointCount() const { return pointsCount; }
@@ -813,12 +797,12 @@ public:
     uint64_t end = leafFP(leafIndex + 1);
     if (start >= end || end > metaOffset
         || end - start < Writer::LEAF_HEADER_SIZE) {
-      invalid("invalid leaf extent");
+      invalid("invalid leaf slice");
     }
     LeafHeader header = load<LeafHeader>(points + start);
     uint64_t fixedPayload = (uint64_t)Writer::LEAF_HEADER_SIZE
                           + header.docBytes + header.bytes0;
-    if (fixedPayload > end - start) invalid("leaf payload lengths exceed extent");
+    if (fixedPayload > end - start) invalid("leaf payload lengths exceed slice");
     uint64_t bytes1 = end - start - fixedPayload;
     if (bytes1 > std::numeric_limits<uint32_t>::max()) {
       invalid("dimension 1 payload exceeds uint32");

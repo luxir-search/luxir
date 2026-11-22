@@ -6,8 +6,10 @@
 #include "luxir/reader/SegmentCore.h"
 #include <algorithm>
 #include <cstddef>
+#include <span>
 
 #include "DocsReader.h"
+#include "ReaderErrors.h"
 #include "MonoReader.h"
 #include "PostingsReader.h"
 #include "luxir/codec/NumColumn.h"
@@ -33,127 +35,61 @@ public:
 
   using NumericBlockInfo = NumBlockInfo;
 
-  // Segment-wide extrema trailer contract. Values are in the column's stored
-  // int64 representation: raw for INT/DATE, sortable-encoded for FLOAT/DOUBLE.
-  // Consumers doing interval math must decode floating endpoints first.
-  struct EncodedBounds {
-    int64_t min = 0;
-    int64_t max = 0;
-    bool hasValues = false;
-  };
-
-
 private:
   DocsReader docs;
-  InputStream columnIS;
   NumColumn values;
   const char* zoneMeta = nullptr;
   NumColumnFormat::LeafMeta leaves;
-  std::optional<MonoReader> endValueRankReader;  // exists if multi-valued.
-  int64_t nvals;
+  MonoReader endValueRanks;  // exists if multi-valued.
   bool arrayMode = false;
-  int32_t docsWithField = 0;
-  int64_t columnMin = 0;
-  int64_t columnMax = 0;
-
-  // Zone metadata follows the block descriptors: block zones, then the leaf
-  // metadata (NumColumnFormat::LeafMeta). Returns where the bounds trailer
-  // starts.
-  const char* locateZoneMeta(const char* blockMeta) {
-    zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
-    const char* trailer = nullptr;
-    leaves = NumColumnFormat::LeafMeta(
-        zoneMeta + numBlocks() * sizeof(NumBlockZone), nvals, trailer);
-    return trailer;
+  void open(const char* blocks, std::span<const char> index, int64_t numValues) {
+    values = NumColumn(blocks, index.data(), numValues);
+    zoneMeta = index.data() + numBlocks() * sizeof(NumBlockInfo);
   }
 
 public:
-  /// The fieldInfo is only used in the constructor and can be discarded after.
-  IntColReader(PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) :
-  docs(postingsReader, fieldInfo)
-  {
-    nvals = fieldInfo.numValues;
-    arrayMode = (fieldInfo.flags & FieldType::MULTI_ARRAY) != 0;
-    docsWithField = fieldInfo.docsWithField;
-    columnIS = postingsReader.core().getInputStreamSeek(fieldInfo.columnLoc);
-    const char* blocks = columnIS.ptr();
-    const char* blockMeta = blocks + fieldInfo.columnMetaOff;
-    values = NumColumn(blocks, blockMeta, nvals);
-    const char* minMaxPtr = locateZoneMeta(blockMeta);
-
-    // Read min/max values that come after the zone arrays
-    if (nvals > 0) {
-      const char* endPtr = columnIS.ptr(0) + columnIS.size();
-      columnMin = InputStream::readVlong(minMaxPtr, endPtr);
-      columnMax = InputStream::readVlong(minMaxPtr, endPtr);
-    }
-
-    if (fieldInfo.hasEndValueRanks()) {
-      endValueRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
-    }
+  IntColReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
+      : docs(reader, fieldInfo),
+        arrayMode((fieldInfo.flags & FieldType::MULTI_ARRAY) != 0) {
+    const auto* number = fieldInfo.numberColumn();
+    if (!number) missingColumn(fieldInfo, "number");
+    auto blocks = reader.core().slice(number->blocks());
+    auto indexSlice = number->index();
+    auto index = reader.core().slice(indexSlice);
+    leaves = readNumericLeafMeta(index, fieldInfo.numValues,
+        segmentReadContext(reader.core(), fieldInfo, indexSlice.location.filenum()));
+    open(blocks.data(), index, fieldInfo.numValues);
+    endValueRanks = MonoReader::openEndValueRanks(reader, fieldInfo);
   }
 
-  IntColReader(InputStream &is, int64_t columnOff, int64_t columnMetaOff) : docs(0), columnIS(is) {
-    columnIS.seek(columnOff);
-    nvals = 0;  // Initialize to 0 - caller should set this if needed
-    docsWithField = 0;
-    const char* blocks = columnIS.ptr();
-    const char* blockMeta = blocks + columnMetaOff;
-    values = NumColumn(blocks, blockMeta, nvals);
-    zoneMeta = blockMeta;
+  IntColReader(const char* blocks, std::span<const char> index, int64_t numValues)
+      : docs((int32_t)numValues) {
+    leaves = readNumericLeafMeta(index, numValues);
+    open(blocks, index, numValues);
   }
 
-  IntColReader(InputStream &is, int64_t columnOff, int64_t columnMetaOff, int64_t numValues) : docs(0), columnIS(is) {
-    columnIS.seek(columnOff);
-    nvals = numValues;
-    docsWithField = static_cast<int32_t>(numValues);
-    const char* blocks = columnIS.ptr();
-    const char* blockMeta = blocks + columnMetaOff;
-    values = NumColumn(blocks, blockMeta, nvals);
-    const char* minMaxPtr = locateZoneMeta(blockMeta);
-
-    // Read min/max values that come after the zone arrays
-    if (nvals > 0) {
-      const char* endPtr = columnIS.ptr(0) + columnIS.size();
-      columnMin = InputStream::readVlong(minMaxPtr, endPtr);
-      columnMax = InputStream::readVlong(minMaxPtr, endPtr);
-    }
-  }
-
-  DocsReader& docsReader() {
+  const DocsReader& docsReader() const noexcept {
     return docs;
   }
 
-  //get underlying endValueRankReader, null if not multi-valued. Valid as long as IntColReader is valid.
-   MonoReader* getEndValueRankReader() {
-    return endValueRankReader ? &(*endValueRankReader) : nullptr;
+  // Returns the end value ranks for a multi-valued column.
+  MonoReader* getEndValueRankReader() {
+    return endValueRanks ? &endValueRanks : nullptr;
   }
 
   // Number of values in the field, including repeats in arrays.
   int64_t numValues() const {
-    return nvals;
+    return values.numValues();
   }
 
-  int32_t docsWithValue() const {
-    return docsWithField;
+  int32_t docsWithField() const {
+    return docs.docsWithField();
   }
 
   bool multiValued() const {
-    return endValueRankReader.has_value();
+    return endValueRanks.has_value();
   }
   
-  int64_t getMin() const {
-    return columnMin;
-  }
-  
-  int64_t getMax() const {
-    return columnMax;
-  }
-
-  EncodedBounds encodedBounds() const {
-    return {columnMin, columnMax, nvals > 0};
-  }
-
   int64_t numBlocks() const {
     return values.numBlocks();
   }
@@ -187,19 +123,10 @@ public:
 
   // Whether the leaf zones bound docs' keys: a dense single-valued column,
   // where doc == value rank.
-  bool leafBounded() const { return !multiValued() && denseDocsWithValue(); }
+  bool leafBounded() const { return !multiValued() && docsReader().allRows(); }
 
   int32_t valuesInBlock(int64_t blockNum) const {
     return values.valuesInBlock(blockNum);
-  }
-
-  bool denseDocsWithValue() const {
-    return !docs.hasBitset();
-  }
-
-  const screaming::BitSet& docsWithValueBitSet() const {
-    assert(docs.hasBitset());
-    return docs.bitset();
   }
 
   // Decode the 128-value codec sub-block containing valueRank without restoring
@@ -220,20 +147,20 @@ public:
   /// Retrieves the [startValueRank, endValueRank) range for the given doc rank.
   /// only valid if multiValued() is true
   std::pair<int64_t, int64_t> getStartEndValueRank(int32_t docRank) {
-    return endValueRankReader->valuesAt(docRank);
+    return endValueRanks.valuesAt(docRank);
   }
 
   /// Retrieves the start value rank for the given doc rank.
   /// only valid if multiValued() is true
   int64_t getStartValueRank(int32_t docRank) {
-    return docRank == 0 ? 0 : endValueRankReader->valueAt(docRank - 1);
+    return docRank == 0 ? 0 : endValueRanks.valueAt(docRank - 1);
   }
 
   bool multiSet() const { return multiValued() && !arrayMode; }
 
   /// First or last stored value rank. Only valid for multi-valued columns.
   int64_t getEdgeValueRank(int32_t docRank, bool last) {
-    return last ? endValueRankReader->valueAt(docRank) - 1 : getStartValueRank(docRank);
+    return last ? endValueRanks.valueAt(docRank) - 1 : getStartValueRank(docRank);
   }
 
   // Numeric sort selection in encoded order. Set columns read an edge;
@@ -351,9 +278,9 @@ public:
     bool dense;
   public:
 
-    DocIterator(const IntColReader& col) : col(col), docsIter(col.docs.bitset()), valueIter(col) {
-      maxRank = col.docsWithValue();
-      dense = !col.docs.hasBitset();
+    DocIterator(const IntColReader& col) : col(col), docsIter(col.docs.bitmapIterator()), valueIter(col) {
+      maxRank = col.docsWithField();
+      dense = col.docs.allRows();
     }
 
     [[gnu::cold]] void reset() {
@@ -457,8 +384,9 @@ public:
   /// for each docid that has any values.
   /// For example, if docids[4]==1000, and docid 1000 has values {10, 11, 12}, then the callbacks would be:
   /// callback(4, 1000, 10, 0, 3), callback(4, 1000, 11, 1, 3), callback(4, 1000, 12, 2, 3).
-  static void getValues(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedIds, auto&& callback) {
-    IntColReader intColReader(postingsReader, segFieldInfo);
+  static void getValues(MemPool& pool, PostingsReader& postingsReader,
+                        const DecodedFieldRecord& fieldInfo, std::ranges::input_range auto&& sortedIds, auto&& callback) {
+    IntColReader intColReader(postingsReader, fieldInfo);
     IntColReader::Iterator iter(intColReader);
 
     int32_t foundid = -1;
@@ -488,8 +416,9 @@ public:
 
   /// docids is a sorted range of docids to load values for in a multi-valued field.
   /// calls callback(size_t input_index, int32_t docid, int64_t value) for each docid that has any values.
-  static void getSingleValues(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
-    IntColReader intColReader(postingsReader, segFieldInfo);
+  static void getSingleValues(MemPool& pool, PostingsReader& postingsReader,
+                        const DecodedFieldRecord& fieldInfo, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
+    IntColReader intColReader(postingsReader, fieldInfo);
     IntColReader::Iterator iter(intColReader);
     assert(!intColReader.multiValued());
     int32_t foundid = -1;

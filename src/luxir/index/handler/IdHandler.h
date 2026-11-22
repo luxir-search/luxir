@@ -160,13 +160,13 @@ public:
       auto guard = MemPool::threadLocalPoolGuard();
       TextWriter textWriter(postingsWriter);
       PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(space, fieldName);
-      fieldInfo.type = fieldType->type();
-      fieldInfo.flags = fieldType->segmentFlags();
-      fieldInfo.typeFlags = fieldType->segmentTypeFlags();
+      fieldInfo.header.type = fieldType->type();
+      fieldInfo.header.flags = fieldType->segmentFlags();
+      fieldInfo.header.typeParameters = fieldType->segmentTypeParameters();
       OrdCollector ords(guard.pool(), inverter.getPostingsWriter().getMaxDoc(space));
       inverter.noteFlushWorkspace(ords.slotBytes());
 
-      textWriter.startField(&fieldInfo);
+      textWriter.startField(space, fieldInfo);
       for (int32_t i = 0; i < count; i++) {
         auto term = terms[i];
         if (term.val().docId < 0) continue;
@@ -176,9 +176,11 @@ public:
         ords.add(term.val().docId, (uint32_t)ord);
         textWriter.endTerm(term);
       }
-      textWriter.endField();
-      OrdColWriter ordsWriter(guard.pool(), inverter.postingsWriter, fieldInfo, ords);
-      ordsWriter.finish();
+      auto written = textWriter.endField();
+      fieldInfo.setPostings(written);
+      OrdColWriter ordsWriter(guard.pool(), inverter.postingsWriter, space, fieldInfo.header.flags, ords);
+      auto column = ordsWriter.finish(written.totals.numTerms);
+      fieldInfo.setColumn(std::move(column));
     }
 
     if (!producesPacket()) {
