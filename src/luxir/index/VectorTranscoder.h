@@ -91,6 +91,11 @@ public:
 
   VectorEncoding outputEncoding() const { return output; }
 
+  /// Elements clamped so far, and a way to fold in those of a copy that
+  /// converted part of the values.
+  int64_t clampedCount() const { return clamped; }
+  void addClamped(int64_t count) { clamped += count; }
+
   /// Called once the field's values are written.
   void finish() const {
     if (clamped > 0) {

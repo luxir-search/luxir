@@ -172,6 +172,12 @@ locations, browse `src/luxir/<area>/`.
      serves range endpoints. The int64 coordinate codec splits wide residuals
      into low/high FOR streams. `SegmentMerger` carries 1-D points forward by
      run-merging and rebuilds 2-D BKDs from the merged column.
+   - `SegmentMerger` reorder: a producer (`indexSortOrder` for a schema
+     `index_sort`) returns the merged root doc order (`newToOld`);
+     `applyOrder` keeps the concatenating merge for an identity order, else
+     builds absolute per-source remaps, and every per-doc writer emits in that
+     order through its `reorder` path. Merges with child row spaces do not
+     reorder.
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)
    - `VectorReader`: reads column-stored vectors in the segment's `VectorEncoding`

@@ -71,6 +71,8 @@ public:
     }
   }
 
+  std::string scratchPath() const override { return delegate->scratchPath(); }
+
   std::unique_ptr<File> createFile(std::string_view name) override {
     // A non-null test listener result injects a file creation failure.
     if (Signal::emit("checkedCreateFile", this, &name)) return nullptr;
