@@ -158,16 +158,6 @@ public:
     return state->copy(source, range, slack);
   }
 
-  std::string_view read() override {
-    state->wholeFile();
-    return delegate->read();
-  }
-
-  InputStream getInputStream() override {
-    state->wholeFile();
-    return delegate->getInputStream();
-  }
-
   void prefetch(size_t offset, size_t length) override { delegate->prefetch(offset, length); }
 };
 

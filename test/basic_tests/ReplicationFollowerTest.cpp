@@ -426,7 +426,9 @@ TEST_P(ReplicationMatrixTest, corruptDownloadLeavesOldReaderServing) {
     std::lock_guard lock(mutex);
     if (!name.empty()) return nullptr;
     name = ((FileDescriptor*)descriptor)->name;
-    original = dir.openFile(name)->read();
+    auto file = dir.openFile(name);
+    auto hold = file->acquire({0, file->size()});
+    original.assign(hold.getData(), hold.getLength());
     auto corrupt = original;
     if (!corrupt.empty()) { corrupt[0] ^= 1; write(corrupt); }
     return nullptr;

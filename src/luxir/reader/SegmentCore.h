@@ -111,7 +111,10 @@ public:
     assert(number < files.size());
     const auto& base = files[number];
     assert(base.file);
-    if (base.holdsFree) return base.file->acquire({part.location.offset(), part.bytes}).bytes();
+    if (base.holdsFree) {
+      auto hold = base.file->acquire({part.location.offset(), part.bytes});
+      return hold.bytes(); // Free views stay valid while the core keeps the file.
+    }
     return retain(*base.file, part);
   }
 

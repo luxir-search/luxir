@@ -66,7 +66,9 @@ TEST_F(CollectionsTest, installPreservesAnUnreadableCatalog) {
   container->publishFile("CATALOG", std::as_bytes(std::span("{", 1)), Directory::PublishMode::REPLACE);
   EXPECT_THROW(storage.current("main"), std::runtime_error);
   EXPECT_THROW(collections.install(prepared(), collections.get(CollectionId::of("main"))), std::runtime_error);
-  EXPECT_EQ("{", container->openFile("CATALOG")->read());
+  auto file = container->openFile("CATALOG");
+  auto hold = file->acquire({0, file->size()});
+  EXPECT_EQ("{", std::string_view(hold.bytes()));
 }
 
 TEST_F(CollectionsTest, stagedCandidatesSurviveRetirementAndBlockRemoval) {

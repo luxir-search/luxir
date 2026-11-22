@@ -325,8 +325,6 @@ public:
     return {data + range.offset, range.length};
   }
   bool holdsFree() const override { return true; }
-  std::string_view read() override { return {data, bytes}; }
-  InputStream getInputStream() override { return {data, data + bytes}; }
 
   void protect() {
     if (mprotect(data, bytes, PROT_NONE) != 0) throw std::runtime_error("mprotect failed");
@@ -352,7 +350,8 @@ public:
     if (sealed) throw std::runtime_error("unexpected segment file open");
     auto source = delegate->openFile(name, expectSynced);
     if (!source) return nullptr;
-    auto file = std::make_shared<ProtectedInputFile>(source->read());
+    auto hold = source->acquire({0, source->size()});
+    auto file = std::make_shared<ProtectedInputFile>(std::string_view(hold.bytes()));
     inputs.emplace(name, file);
     return file;
   }

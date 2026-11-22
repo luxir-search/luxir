@@ -102,7 +102,8 @@ TEST_F(OutputStreamTest, randWrite) {
     EXPECT_EQ(f->digest(), XXH3_64bits(start, targetLen));
     auto input = dir.openFile("rdata");
     ASSERT_EQ(targetLen, input->size());
-    auto data = input->read();
+    auto hold = input->acquire({0, input->size()});
+    auto data = hold.bytes();
     ASSERT_EQ(targetLen, data.size());
     ASSERT_EQ(0, memcmp(start, data.data(), targetLen));
     dir.deleteFile("rdata");
@@ -129,7 +130,8 @@ TEST_F(OutputStreamTest, appendFileContinuesWriting) {
 
   auto input = dir.openFile("target");
   ASSERT_NE(nullptr, input);
-  EXPECT_EQ(std::string("before") + middle + "after", input->read());
+  auto hold = input->acquire({0, input->size()});
+  EXPECT_EQ(std::string("before") + middle + "after", std::string_view(hold.bytes()));
 }
 
 TEST_F(OutputStreamTest, sizedRamOutputTransfersItsAllocation) {
@@ -146,8 +148,13 @@ TEST_F(OutputStreamTest, sizedRamOutputTransfersItsAllocation) {
     std::string bytes(size, 'x'); out.write(bytes.data(), bytes.size()); out.close();
     dir->finishFile(*file); // Fits an exact-size limit only if there is no flatten copy.
     auto input = dir->openFile("data");
-    EXPECT_EQ(bytes, input->read());
-    if (size) { EXPECT_EQ(buffer, input->read().data()); }
+    {
+      auto hold = input->acquire({0, input->size()});
+      EXPECT_EQ(bytes, std::string_view(hold.bytes()));
+      if (size) {
+        EXPECT_EQ(buffer, hold.getData());
+      }
+    }
     EXPECT_EQ(XXH3_64bits(bytes.data(), bytes.size()), file->digest());
     file.reset();
     auto next = factory.directory(StorageRoot::AUTHORITATIVE, "next", {account}); next->linkFile(*dir, "data");

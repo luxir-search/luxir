@@ -87,16 +87,16 @@ for the next startup.
 
 ## Reading from the store
 
-Readers work directly on mapped files or owned buffers, and FAISS IVF lists
-are scanned in place. For step 4 that means:
+Readers acquire the byte ranges they use (see held ranges below); on RAM and
+mmap a hold is a plain view into the buffer or mapping, and FAISS IVF lists are
+scanned in place. For step 4 that means:
 
 - The cache is charged to the node's budgets and evicts: on local disk under
   the page cache, or in RAM charged to the memory budget on a node without
   disk.
-- A reader uses only bytes that are local. The first implementation fetches
-  a segment's files whole before the segment opens, so readers do not
-  change. Later ones fetch just the ranges a query needs, as described
-  below. Checking fetched bytes against their digests is optional, as
+- A reader uses only bytes that are local. A first implementation can fetch
+  a segment's files whole before the segment opens. Later ones fetch just the
+  ranges a query needs, as described below. Checking fetched bytes against their digests is optional, as
   `--store.verify-on-open` is for local files today.
 - A segment's set of files does not depend on the storage backend.
 - A required fetch that still fails after bounded retries within the request
@@ -137,6 +137,28 @@ Fetching at those points, rather than on a page fault, lets a query collect
 the ranges it needs first, merge nearby ones, and issue them together.
 Object stores charge per request and each request has high latency, so
 faults served one at a time would be both slow and expensive.
+
+### Held ranges
+
+`InputFile::acquire({offset, length})` checks the range against the file size
+and returns a move-only `HeldRange`. The bytes stay valid until the hold is
+released, and a hold must be released before its `InputFile`. RAM and mmap
+return null-owner views valid for the file's lifetime and report `holdsFree()`;
+other backends release through the hold's `HoldOwner`.
+
+- A hold also makes readable the next 16 bytes of the file, as far as the file
+  extends, with unspecified contents, because SIMD decoders over-read by up to
+  that much. The format guarantees those bytes exist wherever a decoder reads
+  past a part: the writer pads every data-only file by 16 bytes, and the
+  catalog follows the data in file 0.
+- The data address is congruent to the file offset modulo 16, so alignment the
+  writer gave a structure in the file holds in memory.
+
+A segment reads every part through `SegmentCore::slice()`. A manifest open
+acquires each file's header and the catalog range, never a whole segment
+file. For now the segment keeps the holds it hands out until it closes, so
+nothing held is evicted; releasing holds when a request ends comes with a
+bounded cache.
 
 The manifest identifies the segment catalog at the end of file 0 by offset,
 length and xxh3. The catalog holds a field table for each row space, then

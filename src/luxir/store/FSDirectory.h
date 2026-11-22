@@ -106,14 +106,6 @@ public:
     }
   }
 
-  std::string_view read() override {
-    return {data_, sz_};
-  }
-
-  InputStream getInputStream() override {
-    return {data_, data_ + sz_};
-  }
-
 private:
   static void advise(char* start, char* end) {
     for (; start < end; start += ADVISE_BYTES) {
@@ -509,8 +501,8 @@ public:
     }
     auto close = scope_guard([&] { ::close(fd); });
     auto file = MMapInputFile::map(fd, path);
-    auto bytes = file->read();
-    return Publication{std::string(bytes), versionOf(fd, std::as_bytes(std::span(bytes)))};
+    auto hold = file->acquire({0, file->size()});
+    return Publication{std::string(hold.getData(), hold.getLength()), versionOf(fd, std::as_bytes(hold.bytes()))};
   }
 
   std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) override {

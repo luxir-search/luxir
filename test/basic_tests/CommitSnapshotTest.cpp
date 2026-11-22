@@ -142,7 +142,8 @@ TEST_F(CommitSnapshotTest, slowTransferSurvivesDeletesAndMerge) {
   uint64_t bytes = 0;
   for (const auto& desc : pin->files) {
     auto file = w->snapshots.openFile(pin->id, desc.name);
-    auto data = file->read();
+    auto hold = file->acquire({0, file->size()});
+    auto data = hold.bytes();
     EXPECT_EQ(desc.xxh3, XXH3_64bits(data.data(), data.size()));
     EXPECT_TRUE(w->snapshots.touch(pin->id, data.size()));
     bytes += desc.size;
@@ -159,7 +160,8 @@ TEST_F(CommitSnapshotTest, slowTransferSurvivesDeletesAndMerge) {
     bool current = std::ranges::find(w->snapshots.snapshot()->files, file) != w->snapshots.snapshot()->files.end();
     EXPECT_EQ(current, w->dir.openFile(file.name) != nullptr);
   }
-  auto data = inFlight->read();
+  auto hold = inFlight->acquire({0, inFlight->size()});
+  auto data = hold.bytes();
   EXPECT_EQ(names.front().xxh3, XXH3_64bits(data.data(), data.size()));
   expectValidInventory(w->dir, *readDurableIndexInfo(w->dir));
 }
@@ -188,7 +190,8 @@ TEST_F(CommitSnapshotTest, budgetCountsUniqueRetiredBytesAndEvictsOldest) {
   EXPECT_EQ(1u, w->snapshots.stats().pins);
   EXPECT_FALSE(w->snapshots.touch(first->id, 1));
   EXPECT_THROW(w->snapshots.openFile(second->id, desc.name), SnapshotExpiredError);
-  auto data = inFlight->read(); // eviction never interrupts an already-open file
+  auto hold = inFlight->acquire({0, inFlight->size()}); // eviction never interrupts an already-open file
+  auto data = hold.bytes();
   EXPECT_EQ(desc.xxh3, XXH3_64bits(data.data(), data.size()));
   EXPECT_NE(nullptr, w->snapshots.openFile(current->id, current->files.front().name));
 }
@@ -256,7 +259,9 @@ TEST_F(CommitSnapshotTest, writerlessManagerInstallsExplicitSnapshots) {
   auto pin = w->snapshots.acquire();
   RAMDir follower;
   for (const auto& desc : pin->files) {
-    auto bytes = w->snapshots.openFile(pin->id, desc.name)->read();
+    auto input = w->snapshots.openFile(pin->id, desc.name);
+    auto hold = input->acquire({0, input->size()});
+    auto bytes = hold.bytes();
     auto file = follower.createFile(desc.name);
     OutputStream out(file.get());
     out.write(bytes.data(), bytes.size());
@@ -297,7 +302,8 @@ TEST_F(CommitSnapshotTest, restartReclaimsFilesOfLostPins) {
     w->dir.listFiles(files);
     for (const auto& info : files) {
       auto input = w->dir.openFile(info.name);
-      auto bytes = input->read();
+      auto hold = input->acquire({0, input->size()});
+      auto bytes = hold.bytes();
       auto file = persisted.createFile(info.name);
       OutputStream out(file.get());
       out.write(bytes.data(), bytes.size());

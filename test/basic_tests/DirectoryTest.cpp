@@ -48,11 +48,12 @@ protected:
     auto input = dir.openFile(name);
     ASSERT_TRUE(input.get() != nullptr);
     ASSERT_EQ(data.size(), input->size());
-    ASSERT_EQ(0, memcmp(data.data(), input->read().data(), data.size()));
+    auto hold = input->acquire({0, input->size()});
+    ASSERT_EQ(std::string_view(data), std::string_view(hold.bytes()));
 
     auto input2 = dir.openFile(name);  // open again... to test out shared_ptr + resource management
-    ASSERT_EQ(input->read().size(), input2->read().size());
-    ASSERT_EQ(input->read(), input2->read());
+    auto hold2 = input2->acquire({0, input2->size()});
+    ASSERT_EQ(std::string_view(hold.bytes()), std::string_view(hold2.bytes()));
   }
 
   void doDir(Directory& dir) {
@@ -137,7 +138,8 @@ protected:
       auto input = dir.openFile("aaa");
       found = dir.deleteFile("aaa");
       ASSERT_EQ(true, found);
-      auto data = input->read();
+      auto hold = input->acquire({0, input->size()});
+      auto data = hold.bytes();
       ASSERT_EQ(data.size(), aaa_data.size());
       ASSERT_EQ(0, memcmp(data.data(), aaa_data.data(), data.size()));
     }
@@ -190,7 +192,8 @@ protected:
     dir.finishFile(*f);
 
     auto input = dir.openFile("f1");
-    auto is = input->getInputStream();
+    auto hold = input->acquire({0, input->size()});
+    auto is = hold.stream();
 
     r = rng;  // replay same random numbers
     for (int iter=0; iter<iterations; iter++) {
@@ -228,7 +231,8 @@ protected:
 
     auto input = dir.openFile("append");
     ASSERT_NE(nullptr, input);
-    EXPECT_EQ(std::string("before") + middle + "after", input->read());
+    auto hold = input->acquire({0, input->size()});
+    EXPECT_EQ(std::string("before") + middle + "after", std::string_view(hold.bytes()));
   }
 
   std::filesystem::path getTempDir() {
@@ -245,8 +249,9 @@ protected:
     auto input = dir.openFile("data");
     ASSERT_NE(nullptr, input);
     EXPECT_TRUE(input->holdsFree());
+    auto whole = input->acquire({0, input->size()});
     auto part = input->acquire({3, 5});
-    EXPECT_EQ(input->read().data() + 3, part.getData());
+    EXPECT_EQ(whole.getData() + 3, part.getData());
     EXPECT_EQ(3u, (uintptr_t)part.getData() % kHoldAlign);
     EXPECT_EQ("34567", std::string_view(part.bytes().data(), part.bytes().size()));
     auto stream = part.stream();
@@ -259,7 +264,7 @@ protected:
     EXPECT_EQ('z', nearEnd.getData()[1]);
     auto atEnd = input->acquire({data.size(), 0});
     EXPECT_TRUE(atEnd.bytes().empty());
-    EXPECT_EQ(input->read().data() + data.size(), atEnd.getData());
+    EXPECT_EQ(whole.getData() + data.size(), atEnd.getData());
     EXPECT_THROW(input->acquire({data.size(), 1}), std::out_of_range);
     EXPECT_THROW(input->acquire({1, UINT64_MAX}), std::out_of_range);
     EXPECT_THROW(input->acquire({UINT64_MAX, 2}), std::out_of_range);
@@ -322,7 +327,8 @@ TEST_F(DirectoryTest, varintBoundaries) {
   dir.finishFile(*f);
 
   auto input = dir.openFile("varints");
-  auto is = input->getInputStream();
+  auto hold = input->acquire({0, input->size()});
+  auto is = hold.stream();
   for (uint32_t v : ints) EXPECT_EQ(is.readVint(), v);
   for (uint64_t v : longs) EXPECT_EQ(is.readVlong(), v);
   EXPECT_EQ(is.left(), 0);
@@ -383,13 +389,12 @@ TEST_F(DirectoryTest, fsdirPersistence) {
     ASSERT_EQ("persist1", files[0].name);
     ASSERT_EQ("persist2", files[1].name);
 
-    auto f = dir.openFile("persist1");
-    ASSERT_TRUE(f != nullptr);
-    ASSERT_EQ("hello world", f->read());
-
-    f = dir.openFile("persist2");
-    ASSERT_TRUE(f != nullptr);
-    ASSERT_EQ("goodbye world", f->read());
+    for (auto [name, expected] : {std::pair{"persist1", "hello world"}, std::pair{"persist2", "goodbye world"}}) {
+      auto file = dir.openFile(name);
+      ASSERT_NE(nullptr, file);
+      auto hold = file->acquire({0, file->size()});
+      ASSERT_EQ(expected, std::string_view(hold.bytes()));
+    }
   }
   std::filesystem::remove_all(path);
 }
@@ -570,8 +575,9 @@ TEST_F(DirectoryTest, manifestCommitKeepsAnExistingRootOnFailure) {
   Signal::listen("publishWritten", [](void*, void*, void*) -> void* { throw std::runtime_error("injected"); });
   EXPECT_THROW(Manifest::commit(dir, 3, replacement, 1), std::runtime_error);
   Signal::unlisten("publishWritten");
-  auto input = dir.openFile(Manifest::name(3, 1))->getInputStream();
-  EXPECT_EQ(std::byte{1}, *(const std::byte*)input.ptr());
+  auto input = dir.openFile(Manifest::name(3, 1));
+  auto hold = input->acquire({0, 1});
+  EXPECT_EQ(1, hold.bytes().front());
   std::vector<Directory::FileInfo> files;
   dir.listFiles(files);
   ASSERT_EQ(1, files.size());
@@ -604,7 +610,11 @@ TEST_F(DirectoryTest, publicationAndDurableDeletion) {
     EXPECT_NE(*changed, *repeated);
     EXPECT_FALSE(dir->publishFile("root", next, Directory::PublishCondition::match(published->version)));
     EXPECT_THROW(addFile(*dir, "root", "other"), FileIOException);
-    EXPECT_EQ("first", dir->openFile("root", true)->read());
+    {
+      auto file = dir->openFile("root", true);
+      auto hold = file->acquire({0, file->size()});
+      EXPECT_EQ("first", std::string_view(hold.bytes()));
+    }
     std::array<FileDescriptor, 1> expected{FileDescriptor{"root", 5, 0}};
     EXPECT_NO_THROW(dir->expectSynced(expected));
     dir->deleteFile("root");
@@ -613,7 +623,11 @@ TEST_F(DirectoryTest, publicationAndDurableDeletion) {
       EXPECT_THROW(dir->expectSynced(expected), std::runtime_error);
     }
     ASSERT_TRUE(dir->publishFile("root", next, Directory::PublishMode::REPLACE));
-    EXPECT_EQ("next", dir->openFile("root", true)->read());
+    {
+      auto file = dir->openFile("root", true);
+      auto hold = file->acquire({0, file->size()});
+      EXPECT_EQ("next", std::string_view(hold.bytes()));
+    }
     EXPECT_NO_THROW(dir->expectSynced(expected));
     dir->deleteFile("root");
     addFile(*dir, "root", "unsynced");
@@ -623,7 +637,9 @@ TEST_F(DirectoryTest, publicationAndDurableDeletion) {
     EXPECT_NO_THROW(dir->expectSynced(expected));
     EXPECT_NO_THROW(dir->deleteDurably(names));
     EXPECT_TRUE(dir->publishFile("root", {}, Directory::PublishMode::CREATE_ONLY));
-    EXPECT_TRUE(dir->openFile("root")->read().empty());
+    auto empty = dir->openFile("root");
+    auto hold = empty->acquire({0, empty->size()});
+    EXPECT_TRUE(hold.bytes().empty());
   }
 }
 
@@ -637,7 +653,9 @@ TEST_F(DirectoryTest, publicationFailureBeforeInstallKeepsOriginal) {
     Signal::listen(signal, [](void*, void*, void*) -> void* { throw FileIOException("injected"); });
     auto unlisten = scope_guard([&] { Signal::unlisten(signal); });
     EXPECT_THROW(dir.publishFile("root", {}, Directory::PublishMode::REPLACE), FileIOException);
-    EXPECT_EQ("original", dir.openFile("root")->read());
+    auto file = dir.openFile("root");
+    auto hold = file->acquire({0, file->size()});
+    EXPECT_EQ("original", std::string_view(hold.bytes()));
     std::vector<Directory::FileInfo> files;
     dir.listFiles(files);
     ASSERT_EQ(1u, files.size());
@@ -670,7 +688,9 @@ TEST_F(DirectoryTest, concurrentPublicationsHaveOneWinner) {
     auto b = std::async(std::launch::async, [&] { return publish(*second, "second"); });
     bool won = a.get().has_value();
     EXPECT_NE(won, b.get().has_value());
-    EXPECT_EQ(won ? "first" : "second", first->openFile("root")->read());
+    auto file = first->openFile("root");
+    auto hold = file->acquire({0, file->size()});
+    EXPECT_EQ(won ? "first" : "second", std::string_view(hold.bytes()));
     if (fs) {
       EXPECT_TRUE(std::filesystem::is_empty(path / "node/tmp"));
       std::vector<Directory::FileInfo> files;

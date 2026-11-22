@@ -52,13 +52,15 @@ locations, browse `src/luxir/<area>/`.
      read source; wildcard discovery returns logical primaries only
 
 3. **Segment Reading** (`src/luxir/reader/`)
-   - `SegmentCore` owns a segment bundle's open files, streams and root VersionRuns, shared
-     across snapshots and with the writer. File 0's catalog indexes field records
-     by row-space path (root is the empty path) and field name. Each space has a
+   - `SegmentCore` owns a segment bundle's open files, retained byte ranges and root
+     VersionRuns, shared across snapshots and with the writer. `slice()` acquires
+     parts from the files and retains holds that need release until the core
+     closes. File 0's catalog indexes field records by row-space path (root is
+     the empty path) and field name. Each space has a
      `PostingsReader` with its own row count and immutable, on-demand record cache.
      Records contain counts, bounds and data slices. Numeric leaf metadata
      and stored metadata are opened and cached separately. Codec cursors borrow
-     the space reader and mapped bytes
+     the space reader and its acquired bytes
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
      opening reads metadata and endpoints without scanning child rows.
@@ -157,7 +159,9 @@ locations, browse `src/luxir/<area>/`.
 7. **Storage** (`src/luxir/store/`)
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
      `FSDirectory` (on-disk, mmap reads), `CheckedDirectory` (validation wrapper)
-   - `InputStream` / `OutputStream`: segment I/O primitives. The catalog and record
+   - `InputFile`: acquires file ranges as `HeldRange` objects. RAM and mmap supply
+     views valid for the file's lifetime
+   - `InputStream` / `OutputStream`: codec I/O primitives. The catalog and record
      codecs validate directory entries, field offsets and data slices within their input ranges
    - `IndexFormat`: the on-disk format version, recorded in each manifest and in every data
      file's header. Bump it when the change requires a different encoding or interpretation.

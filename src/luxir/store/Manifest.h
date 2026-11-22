@@ -120,8 +120,10 @@ public:
   static Bytes read(Directory& dir, uint64_t gen, uint64_t epoch) {
     auto file = dir.openFile(name(gen, epoch));
     if (!file) return {};
-    auto input = file->getInputStream();
-    if (input.size() < 16) return {};
+    auto size = file->size();
+    if (size < 16) return {};
+    auto hold = file->acquire({0, size});
+    auto input = hold.stream();
     size_t length = input.size() - 16;
     auto data = (const std::byte*)input.ptr();
     input.seek(length);
@@ -217,7 +219,8 @@ public:
     auto contents = withFooter(bytes);
     if (dir.publishFile(root[0], contents, Directory::PublishMode::CREATE_ONLY)) return;
     auto existing = dir.openFile(root[0]);
-    auto body = existing ? existing->read() : std::string_view{};
+    auto hold = existing ? existing->acquire({0, existing->size()}) : HeldRange{};
+    auto body = hold.bytes();
     if (body.size() != contents.size() || memcmp(body.data(), contents.data(), contents.size())) {
       throw std::runtime_error("manifest candidate name already contains different bytes");
     }

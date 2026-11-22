@@ -216,7 +216,9 @@ TEST_F(ReplicationHttpTest, snapshotFilesRangeAndSharedPins) {
     ASSERT_EQ(200, response.result_int());
     EXPECT_EQ(file.size, response.body().size());
     EXPECT_EQ(file.xxh3, XXH3_64bits(response.body().data(), response.body().size()));
-    EXPECT_EQ(registry.dir.openFile(file.name)->read(), response.body());
+    auto input = registry.dir.openFile(file.name);
+    auto hold = input->acquire({0, input->size()});
+    EXPECT_EQ(std::string_view(hold.bytes()), response.body());
     auto partial = download(*first, file.name, "bytes=1-");
     ASSERT_EQ(206, partial.result_int());
     EXPECT_EQ(response.body().substr(1), partial.body());

@@ -460,19 +460,8 @@ public:
   // True when all acquisitions return null-owner views valid for the file's lifetime.
   virtual bool holdsFree() const { return false; }
 
-  // Reads all of the file and returns a pointer to the data, which should be valid as long as the InputFile is valid.
-  virtual std::string_view read() = 0;
-
   // Advisory asynchronous readahead; memory-backed inputs need no work.
   virtual void prefetch(size_t offset, size_t length) {}
-
-  virtual InputStream getInputStream() = 0;
-
-  friend std::ostream &operator<<(std::ostream &out, InputFile &inf) {
-    out << "InputFile: at" << &inf << " stream=" << inf.getInputStream();
-    return out;
-  }
-
 };
 
 class RAMInputFile : public InputFile {
@@ -492,15 +481,6 @@ public:
     return {data.get() + range.offset, range.length};
   }
   bool holdsFree() const override { return true; }
-
-  std::string_view read() override {
-    return std::string_view(data.get(), sz);
-  }
-
-  InputStream getInputStream() override {
-    return InputStream(data.get(), data.get() + sz);
-  }
-
 };
 
 

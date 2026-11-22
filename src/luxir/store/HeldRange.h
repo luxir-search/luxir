@@ -62,11 +62,13 @@ public:
 
   ~HeldRange() { if (owner) owner->release(*this); }
 
-  const char* getData() const noexcept { return data; }
+  const char* getData() const & noexcept { return data; }
+  const char* getData() const && = delete;
   uint64_t getLength() const noexcept { return length; }
   uintptr_t getToken() const noexcept { return token; }
 
-  std::span<const char> bytes() const noexcept { return {data, (size_t)length}; }
+  std::span<const char> bytes() const & noexcept { return {data, (size_t)length}; }
+  std::span<const char> bytes() const && = delete;
   InputStream stream() const & noexcept { return {data, data + length}; }
   InputStream stream() const && = delete;
 };

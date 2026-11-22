@@ -379,7 +379,8 @@ TEST_F(IndexFormatTest, malformedSegmentMetadataThrows) {
   auto wireFiles = toWire(files, arena);
   segment.files = wireFiles;
   auto originalBytes = original.openFile(file);
-  std::string_view bytes = originalBytes->read();
+  auto hold = originalBytes->acquire({0, originalBytes->size()});
+  std::string_view bytes(hold.bytes());
   auto footer = bytes.size() - sizeof(uint64_t);
   auto length = loadUnaligned<uint64_t>(bytes.data() + footer);
   InputStream in(bytes.data() + footer - length, bytes.data() + footer);
@@ -473,7 +474,8 @@ TEST_F(IndexFormatTest, invalidSpacePathAndRootCount) {
   ASSERT_TRUE(writer.finish());
 
   auto file = dir.openFile(Postings::getIndexFileName(Postings::segmentKey(1, 1), Postings::PRIMARY_FILE));
-  auto original = file->read();
+  auto hold = file->acquire({0, file->size()});
+  std::string_view original(hold.bytes());
   auto footer = original.size() - sizeof(uint64_t);
   auto length = loadUnaligned<uint64_t>(original.data() + footer);
   auto directoryStart = footer - length;
@@ -505,10 +507,13 @@ TEST_F(IndexFormatTest, opensCatalogFromCopiedRange) {
   auto source = SegmentCore::source(segment.seg_id, segment.creator_epoch, range,
                                      segment.max_doc, files);
   auto name = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
-  auto file = dir.openFile(name);
   ASSERT_GT(range.offset, 0u);
-  std::string bytes(file->read().substr(range.offset, range.length));
-  file.reset();
+  std::string bytes;
+  {
+    auto file = dir.openFile(name);
+    auto hold = file->acquire({range.offset, range.length});
+    bytes.assign(hold.getData(), hold.getLength());
+  }
 
   auto head = SegmentCatalog::readDirectory(bytes, range.offset, source.files[0]);
   auto catalog = SegmentCatalog::decode(head, source.files);
@@ -537,7 +542,9 @@ TEST_F(IndexFormatTest, corruptFieldPrefixRespectsVerificationPolicy) {
   std::vector<Directory::FileInfo> files;
   dir.listFiles(files);
   for (const auto& descriptor : files) {
-    std::string bytes(dir.openFile(descriptor.name)->read());
+    auto input = dir.openFile(descriptor.name);
+    auto hold = input->acquire({0, input->size()});
+    std::string bytes(hold.getData(), hold.getLength());
     if (descriptor.name == file) {
       field = bytes.substr(entry + 1, (uint8_t)bytes[entry]);
       bytes[entry + 1 + field.size()] = 0x7f; // invalid field type, after the still-readable name

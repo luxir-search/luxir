@@ -170,7 +170,11 @@ TEST_F(StoredFieldsTest, storedOnlyStringWritesJustTheStoredResource) {
     ASSERT_TRUE(inverter.flush());
   }
   auto file = Postings::getIndexFileName(Postings::segmentKey(1, 1), 0);
-  EXPECT_EQ(input.openFile(file)->read(), direct.openFile(file)->read());
+  auto indirect = input.openFile(file);
+  auto original = direct.openFile(file);
+  auto indirectHold = indirect->acquire({0, indirect->size()});
+  auto originalHold = original->acquire({0, original->size()});
+  EXPECT_EQ(std::string_view(indirectHold.bytes()), std::string_view(originalHold.bytes()));
   SegmentCore core(input, 1, 1);
   EXPECT_EQ(1, core.rootReader().numFields());
   EXPECT_EQ(nullptr, core.rootReader().fieldInfo("label"));

@@ -2030,7 +2030,8 @@ TEST_F(DocsEnumAdvanceTest, wrongSegmentMagicIsRejected) {
   std::string segName = Postings::getIndexFileName(Postings::segmentKey(0, 1), 0);
   auto input = dir.openFile(segName);
   ASSERT_NE(input, nullptr);
-  std::string bytes(input->read());
+  auto hold = input->acquire({0, input->size()});
+  std::string bytes(hold.getData(), hold.getLength());
   ASSERT_GE(bytes.size(), Postings::LUXIR_HEADER.size());
   bytes[Postings::LUXIR_HEADER.size() - 1] ^= 1;
 

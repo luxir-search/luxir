@@ -50,7 +50,8 @@ void withBKD(std::span<const typename BasicBKDWriter<Traits>::Point> source,
   dir.finishFile(*file);
 
   auto inputFile = dir.openFile("bkd");
-  InputStream input = inputFile->getInputStream();
+  auto hold = inputFile->acquire({0, inputFile->size()});
+  InputStream input = hold.stream();
   Reader reader(input, data.pointsStart, data.pointsMetaOff, data.directoryBytes);
   reader.validate();
   callback(reader, data, input);
@@ -501,7 +502,8 @@ void withBKDBytes(const std::vector<char>& bytes, const Data& data, Callback&& c
   out.close();
   dir.finishFile(*file);
   auto inputFile = dir.openFile("copy");
-  auto input = inputFile->getInputStream();
+  auto hold = inputFile->acquire({0, inputFile->size()});
+  auto input = hold.stream();
   BasicBKDReader<Traits> reader(input, data.pointsStart, data.pointsMetaOff, data.directoryBytes);
   callback(reader);
 }

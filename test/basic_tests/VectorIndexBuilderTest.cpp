@@ -97,7 +97,8 @@ IndexInfoHolder readIndexInfo(Directory& dir) {
 std::unique_ptr<faiss::Index> readFaissIndex(Directory& dir, std::string_view fname) {
   auto file = dir.openFile(fname);
   EXPECT_NE(file, nullptr);
-  auto bytes = file->read();
+  auto hold = file->acquire({0, file->size()});
+  auto bytes = hold.bytes();
   faiss::VectorIOReader r;
   r.data.assign((const uint8_t*)bytes.data(), (const uint8_t*)bytes.data() + bytes.size());
   return std::unique_ptr<faiss::Index>(faiss::read_index(&r));
@@ -387,7 +388,8 @@ TEST_F(VectorIndexBuilderTest, ivfListsServeIdenticallyFromFsDirectoryMmap) {
     FSDirectory fsDir(tmp);
     auto src = shardDir.openFile(aux.files[0].name);
     ASSERT_NE(src, nullptr);
-    auto bytes = src->read();
+    auto hold = src->acquire({0, src->size()});
+    auto bytes = hold.bytes();
     auto dst = fsDir.createFile(aux.files[0].name);
     OutputStream os;
     os.setFile(&*dst);

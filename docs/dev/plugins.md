@@ -439,6 +439,23 @@ forward it only if it preserves that guarantee. Incorrectly returning true can
 delete another node's data; returning false only costs availability. The core
 wrappers and the example `counting` layer forward it; `counting_ram` is exclusive.
 
+### Reading files
+
+`Directory::openFile` returns an `InputFile` with `size()`, advisory
+`prefetch(offset, length)`, and `acquire({offset, length})`. Reject ranges
+outside the file and return a move-only `HeldRange` for valid ranges. Its data
+address must be congruent to the file offset modulo 16. Make the next 16 bytes
+after the range readable up to EOF, with unspecified contents.
+
+Keep each range readable until its hold is released. If all holds are
+null-owner views valid for the lifetime of the file, as in RAM and mmap,
+return true from `holdsFree()`. Otherwise give the hold a `HoldOwner` and any
+token needed to release it. Destruction or replacement of the hold calls
+`HoldOwner::release(const HeldRange&)`, which must be thread-safe and
+`noexcept`. The caller releases the hold before destroying its `InputFile`.
+
+### Storage layers
+
 A layer derives from `DelegatingDirFactory` and overrides what it changes, usually
 `directory()` to hand out `DelegatingDirectory` subclasses. Both
 bases forward their other virtuals, including `createFile` with options, `expectSynced`,
@@ -452,10 +469,11 @@ virtuals require an implementation there; default methods call their own virtual
 namespace operations.
 
 Layers must be **byte-transparent**: the bytes at rest must be those the engine
-wrote, in a complete, durable namespace readable by the backend. FS `linkFile`
-reaches the source through `underlying()`, offline promotion opens `FSDirFactory`
-directly, and replication compares file digests. Observation, counting and caching
-fit this contract; encryption or compression at rest must be a backend, not a layer.
+wrote, in a complete, durable namespace readable by the backend. RAM and FS
+resolve the `linkFile` source through `underlying()`. Offline promotion opens
+`FSDirFactory` directly, and replication compares file digests. Observation,
+counting and caching fit this contract; encryption or compression at rest must
+be a backend, not a layer.
 
 Storage makers run before `PluginNodeState` is created. Keep storage state on the
 factory instance, shared with its views as needed. Once the node exists, its plugin
@@ -473,7 +491,7 @@ and `LuxirNode::attachCollection(id, force)` to hand off writers or force a take
 `Directory::capabilities()` reports what a backend can do: `HARD_LINK` (`linkFile`
 shares bytes), `ATOMIC_RENAME` (the backing store supports atomic name
 replacement), `DURABLE_SYNC` (`sync` persists bytes and names), `MEMORY_MAPPED`
-(`openFile` returns stable mapped bytes) and `REMOTE`. The default is none, which
+(the backing storage provides mapped bytes) and `REMOTE`. The default is none, which
 selects conservative paths: `reuseFiles` copies with `Directory::copyFile` instead of
 linking when `HARD_LINK` is absent. A wrapper that changes a property (for instance
 masks `HARD_LINK`) overrides `capabilities()`.
@@ -486,6 +504,12 @@ opens and creates). Each factory owns its counters; directory views share the
 layer's counters. `StorageExampleTest` reaches `CountingRamBackend` and
 `CountingLayer` through `find<T>()` and verifies that two nodes count independently.
 
+Run `luxir_test --store.layer=strict` to check readers against isolated range
+buffers with varying garbage in the slack. It reports acquisition counts and
+peak live holds and bytes. The default `strict.whole_segment_files=count`
+allows whole-file reads for tests that copy or replicate files. Use
+`--store.option strict.whole_segment_files=deny` in focused reader tests to
+reject whole-file reads of base segment data files.
 
 ## Result decorators
 

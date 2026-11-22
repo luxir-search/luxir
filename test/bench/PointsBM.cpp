@@ -139,6 +139,7 @@ std::vector<int32_t> shuffledDocs(uint64_t count, PointShape shape) {
 class PointsFixture {
   RAMDir dir;
   std::shared_ptr<InputFile> inputFile;
+  HeldRange hold;
   InputStream input;
   std::unique_ptr<PointsReader> points;
   PointShape shape;
@@ -196,7 +197,8 @@ public:
     dir.finishFile(*file);
 
     inputFile = dir.openFile("points");
-    input = inputFile->getInputStream();
+    hold = inputFile->acquire({0, inputFile->size()});
+    input = hold.stream();
     points = std::make_unique<PointsReader>(input, data.pointsStart,
                                             data.pointsMetaOff, data.directoryBytes);
     points->validate();

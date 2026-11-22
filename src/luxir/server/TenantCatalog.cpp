@@ -66,7 +66,8 @@ void TenantCatalog::initialize(DirectoryFactory& factory, bool writable) {
     root->publishFile("LAYOUT", std::as_bytes(std::span(layout)), Directory::PublishMode::CREATE_ONLY);
     marker = root->openFile("LAYOUT");
   }
-  auto found = marker ? marker->read() : std::string_view();
+  auto hold = marker ? marker->acquire({0, marker->size()}) : HeldRange{};
+  std::string_view found(hold.bytes());
   if (found != layout) {
     if (found.ends_with('\n')) found.remove_suffix(1);
     throw std::runtime_error(std::format("data directory {}: unsupported layout \"{}\" (this build reads \"{}\"); "

@@ -164,8 +164,8 @@ TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
     auto durable = readDurableIndexInfo(dir);
     auto info = onlyVectorOverlay(durable.info);
     auto file = dir.openFile(info.files[0].name, true);
-    auto stream = file->getInputStream();
-    std::string payload(stream.ptr(), (size_t)stream.left());
+    auto hold = file->acquire({0, file->size()});
+    std::string payload(hold.getData(), hold.getLength());
     auto footer = VectorAuxListsFooter::fromFileTail(payload.data(), payload.size(), info.name);
     EXPECT_EQ(footer.amplitudeCount, 1);
     EXPECT_THROW(VectorAuxListsFooter::fromFileTail(payload.data(), payload.size() - 4, info.name),
@@ -238,8 +238,8 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
     auto healthy = VectorAuxReader::open(dir, original, false);
     EXPECT_NE(healthy->getFaissIndex(), nullptr);
     auto file = dir.openFile(original.files[0].name, true);
-    auto stream = file->getInputStream();
-    std::string payload(stream.ptr(), (size_t)stream.left());
+    auto hold = file->acquire({0, file->size()});
+    std::string payload(hold.getData(), hold.getLength());
     auto footer = VectorAuxListsFooter::fromFileTail(payload.data(), payload.size(), original.name);
     EXPECT_EQ(footer.expectedFileBytes(), payload.size());
     for (int corrupt = 0; corrupt < 4; corrupt++) {

@@ -47,12 +47,12 @@ TEST(StrictStorageTest, copiesWithVaryingGarbageAndFileAlignment) {
   auto second = file->acquire({3, 5});
   EXPECT_EQ("34567", contents(first));
   EXPECT_EQ(contents(first), contents(second));
-  EXPECT_NE(ram->openFile("data")->read().data() + 3, first.getData());
+  auto original = ram->openFile("data");
+  auto originalPart = original->acquire({3, 5});
+  EXPECT_NE(originalPart.getData(), first.getData());
   EXPECT_NE(first.getData(), second.getData());
   EXPECT_EQ(3u, (uintptr_t)first.getData() % kHoldAlign);
   EXPECT_NE(first.getData()[5 + kReadSlack - 1], second.getData()[5 + kReadSlack - 1]);
-  EXPECT_EQ(payload, file->read());
-  EXPECT_EQ((int64_t)payload.size(), file->getInputStream().size());
   EXPECT_THROW(file->acquire({1, UINT64_MAX}), std::out_of_range);
   auto whole = file->acquire({0, file->size()});
   EXPECT_EQ(payload, contents(whole));
@@ -60,7 +60,7 @@ TEST(StrictStorageTest, copiesWithVaryingGarbageAndFileAlignment) {
   auto stats = counters->fileStats("data");
   EXPECT_EQ(3u, stats.acquires);
   EXPECT_EQ(10 + payload.size(), stats.acquiredBytes);
-  EXPECT_EQ(3u, stats.wholeFileAccesses);
+  EXPECT_EQ(1u, stats.wholeFileAccesses);
   ASSERT_EQ(2u, stats.parts.size());
   EXPECT_TRUE(stats.parts.contains({3, 5}));
   EXPECT_TRUE(stats.parts.contains({0, payload.size()}));
@@ -129,11 +129,9 @@ TEST(StrictStorageTest, deniesWholeBaseSegmentFiles) {
   auto file = dir.openFile(name);
   ASSERT_NE(nullptr, file);
   EXPECT_THROW(file->acquire({0, file->size()}), FileIOException);
-  EXPECT_THROW(file->read(), FileIOException);
-  EXPECT_THROW(file->getInputStream(), FileIOException);
   auto part = file->acquire({0, 2});
   EXPECT_EQ("01", contents(part));
-  EXPECT_EQ(3u, counters->fileStats(name).wholeFileAccesses);
+  EXPECT_EQ(1u, counters->fileStats(name).wholeFileAccesses);
   EXPECT_EQ(1u, counters->fileStats(name).acquires);
 
   for (const auto& allowed : {Manifest::name(1, 1), Postings::getLiveDocsFileName(key, 1, 1),
@@ -175,6 +173,20 @@ TEST(StrictStorageTest, reuseCopiesWrappedRamFiles) {
   ASSERT_EQ(std::vector<FileDescriptor>(files.begin(), files.end()), dest.reuseFiles(source, files, files));
   auto copied = ram->openFile("data");
   ASSERT_NE(nullptr, copied);
-  EXPECT_EQ(payload, copied->read());
+  auto hold = copied->acquire({0, copied->size()});
+  EXPECT_EQ(payload, contents(hold));
   EXPECT_EQ(1u, counters->fileStats("data").wholeFileAccesses);
+}
+
+TEST(StrictStorageTest, ramLinkSharesFileFromWrappedSource) {
+  auto ram = std::make_shared<RAMDir>();
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory source(ram, counters);
+  put(source, "data");
+  RAMDir dest;
+  dest.linkFile(source, "data");
+  auto linked = dest.openFile("data");
+  ASSERT_NE(nullptr, linked);
+  EXPECT_EQ(ram->openFile("data"), linked);
+  EXPECT_EQ(0u, counters->fileStats("data").acquires);
 }

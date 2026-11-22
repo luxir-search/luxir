@@ -176,7 +176,8 @@ public:
   void copyFile(Directory& source, std::string_view name) {
     auto input = source.openFile(name, true);
     if (!input) throw std::runtime_error("copy source missing: " + std::string(name));
-    auto data = input->read();
+    auto hold = input->acquire({0, input->size()});
+    auto data = hold.bytes();
     auto file = createFile(name);
     OutputStream out(file.get());
     out.write(data.data(), data.size());
@@ -294,7 +295,8 @@ public:
       uint64_t size() const override { return file->size(); }
       std::shared_ptr<InputFile> map() override { return file; }
       FileCheck checksum(const std::function<void(size_t)>& progress) override {
-        auto data = file->read();
+        auto hold = file->acquire({0, file->size()});
+        auto data = hold.bytes();
         XXH3_state_t state;
         XXH3_64bits_reset(&state);
         constexpr size_t kChunk = 1 << 20;
@@ -392,7 +394,9 @@ public:
     std::lock_guard lock(mutex);
     auto it = files.find(name);
     if (it == files.end()) return {};
-    return Publication{std::string(it->second.file->read()), std::to_string(files.find(name)->second.version)};
+    auto& file = it->second.file;
+    auto hold = file->acquire({0, file->size()});
+    return Publication{std::string(hold.getData(), hold.getLength()), std::to_string(it->second.version)};
   }
 
   void sync(std::span<const std::string> names) override { unused(names); }
@@ -403,8 +407,15 @@ public:
   }
 
   void linkFile(Directory& source, std::string_view name) override {
-    auto input = std::dynamic_pointer_cast<RAMInputFile>(source.openFile(name, true));
-    if (!input) throw std::runtime_error("RAM link source missing or incompatible");
+    auto* ram = dynamic_cast<RAMDir*>(&source.underlying());
+    if (!ram) throw std::runtime_error("RAM link source is incompatible");
+    InputReferenceType input;
+    {
+      std::lock_guard lock(ram->mutex);
+      auto it = ram->files.find(name);
+      if (it == ram->files.end()) throw std::runtime_error("RAM link source missing");
+      input = it->second.file;
+    }
     std::lock_guard lock(mutex);
     files[std::string(name)] = {std::move(input), ++nextVersion};
     materialized.store(true, std::memory_order_release);

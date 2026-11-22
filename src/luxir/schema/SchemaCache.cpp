@@ -54,17 +54,21 @@ std::shared_ptr<Schema> SchemaCache::load(Directory& dir, const api::IndexInfo& 
   }
   auto file = dir.openFile(desc.name);
   if (!file) throw std::runtime_error("Missing schema file: " + std::string(desc.name));
-  auto body = file->read();
-  if (body.size() != desc.size || body.size() < 16 || XXH3_64bits(body.data(), body.size()) != desc.xxh3)
+  auto size = file->size();
+  if (size != desc.size || size < 16)
     throw std::runtime_error("Invalid schema file: " + std::string(desc.name));
-  auto input = file->getInputStream();
-  auto length = body.size() - 16;
+  auto hold = file->acquire({0, size});
+  auto body = hold.bytes();
+  if (XXH3_64bits(body.data(), body.size()) != desc.xxh3)
+    throw std::runtime_error("Invalid schema file: " + std::string(desc.name));
+  auto input = hold.stream();
+  auto length = size - 16;
   input.seek(length);
   if ((uint64_t)input.readLong() != length || (uint64_t)input.readLong() != XXH3_64bits(body.data(), length))
     throw std::runtime_error("Invalid schema footer: " + std::string(desc.name));
   std::pmr::monotonic_buffer_resource arena;
   api::SchemaInfo stored;
-  if (!api::decode(stored, api::copyToPaddedInput(std::as_bytes(std::span(body.data(), length)), arena), arena))
+  if (!api::decode(stored, api::copyToPaddedInput(std::as_bytes(body.first(length)), arena), arena))
     throw std::runtime_error("Invalid stored schema");
   auto schema = Schema::fromStored(stored, std::move(binding));
   schema->file = {std::string(desc.name), desc.size, desc.xxh3};
@@ -79,7 +83,8 @@ std::shared_ptr<Schema> SchemaCache::publish(Directory& dir, std::string_view in
   auto name = SchemaBinding::fileName(schema->binding.version);
   if (!dir.publishFile(name, contents, Directory::PublishMode::CREATE_ONLY)) {
     auto existing = dir.openFile(name);
-    auto body = existing ? existing->read() : std::string_view{};
+    auto hold = existing ? existing->acquire({0, existing->size()}) : HeldRange{};
+    auto body = hold.bytes();
     if (body.size() != contents.size() || memcmp(body.data(), contents.data(), contents.size()))
       throw std::runtime_error("Schema version already contains different bytes");
     std::array<std::string, 1> names{name};

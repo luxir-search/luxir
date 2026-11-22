@@ -1347,7 +1347,9 @@ TEST_F(IndexWriterTest, requestBirthBlocksRejectCorruption) {
     auto trailerOff = output.finish(count);
     stream.close();
     dir.finishFile(*file);
-    auto bytes = dir.openFile("runs")->read();
+    auto input = dir.openFile("runs");
+    auto hold = input->acquire({0, input->size()});
+    auto bytes = hold.bytes();
     std::vector<char> corrupt(bytes.begin(), bytes.end());
     auto* header = (VersionRunsHeader*)(corrupt.data() + trailerOff);
     if (directoryDamage) {
@@ -3477,7 +3479,9 @@ TEST_F(IndexWriterTest, recoverySkipsTornCandidatesAndChecksFallbackPresence) {
     uint64_t candidate = before->index_gen + 1;
     std::vector<char> corrupt;
     if (damage == 1) {
-      auto bytes = dir.openFile(Manifest::name(before->index_gen, before->writer_epoch))->read();
+      auto input = dir.openFile(Manifest::name(before->index_gen, before->writer_epoch));
+      auto hold = input->acquire({0, input->size()});
+      auto bytes = hold.bytes();
       corrupt.assign(bytes.begin(), bytes.end());
       corrupt.back() ^= 1;
     }
