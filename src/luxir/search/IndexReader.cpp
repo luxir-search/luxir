@@ -202,6 +202,32 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
 }
 
 
+// Whether `schema` types every field `summary` records as the segments
+// persist it: the check field() makes on access.
+static bool schemaMatchesPersisted(const SegmentSummary& summary, const Schema* schema) {
+  if (!schema) return true;
+  for (const auto& record : summary.fields()) {
+    auto* expected = schema->getFieldTypePtr(record.fieldname);
+    if (!expected) continue;
+    auto type = (FieldType::Type)record.type;
+    // A bad record on a field nothing reads must not fail the open.
+    try {
+      if (expected->type() != type
+          || expected->segmentTypeFlags() != FieldType::typeParameters(type, record.type_flags)) {
+        return false;
+      }
+    } catch (const std::exception&) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const SegmentSummary* IndexReader::provingSummaryOf(const PhysicalCore& core, const Schema* schema) {
+  const auto& summary = core.collectionSummary;
+  return summary && schemaMatchesPersisted(*summary, schema) ? summary.get() : nullptr;
+}
+
 IndexReader::IndexReader(OpenedSnapshot opened, std::shared_ptr<FilterCache> filterCache)
   : snapshot(std::make_shared<Snapshot>(std::move(opened), std::move(filterCache))),
     space(snapshot->core->root) {}
@@ -512,6 +538,14 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
       commitTimeUs = indexInfo.commit_time;
       core->coreGeneration = indexInfo.core_gen;
       core->commitTime = commitTimeUs;
+      core->collectionSummary = nullptr;
+      if (indexInfo.summary_complete) {
+        try {
+          core->collectionSummary = SegmentSummary::fromAggregate(indexInfo.field_summaries, true);
+        } catch (const std::exception& e) {
+          LOG_WARN("Collection summary unreadable at gen={}: {}", indexInfo.index_gen, e.what());
+        }
+      }
       bool missingFileOK = !manifest; // Allow missing files on first attempt
       IREADER_DEBUG("\tOpening IndexReader, commitTime={} nSegs={} gen={}", indexInfo.commit_time,
                     indexInfo.segments.size(), indexInfo.index_gen);

@@ -669,6 +669,9 @@ protected:
         descriptors[f] = {build::arenaStr(arena, files[f].name), files[f].size, files[f].xxh3};
       }
     }
+    // Hand-built segments carry no collection summary: an empty one would prove every query empty.
+    manifest.summary_complete = false;
+    manifest.field_summaries = {};
     manifest.index_gen++;
     if (previous.empty()) manifest.core_gen++;
     manifest.commit_time++;

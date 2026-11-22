@@ -536,6 +536,8 @@ private:
     std::vector<Bundle> bundles;
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;
     uint64_t coreGeneration = 0;
+    // The manifest's collection summary when it is complete, else null.
+    std::shared_ptr<const SegmentSummary> collectionSummary;
     // Commit time of the publication that produced this physical state. A
     // later publication that reuses the core (a schema-only one) keeps it.
     uint64_t commitTime = 0;
@@ -582,11 +584,16 @@ private:
     uint64_t indexGen;
     std::mutex viewsMutex;
     std::map<std::string, std::weak_ptr<IndexReader>, std::less<>> views;
+    // The core's collection summary, unless a field it records persists a
+    // type this snapshot's schema does not match (see collectionSummary()).
+    const SegmentSummary* provingSummary = nullptr;
 
     Snapshot(OpenedSnapshot opened, std::shared_ptr<FilterCache> filterCache)
         : core(std::move(opened.core)), schema(std::move(opened.schema)),
-          filterCache(std::move(filterCache)), commitTime(opened.commitTime), indexGen(opened.indexGen) {}
+          filterCache(std::move(filterCache)), commitTime(opened.commitTime), indexGen(opened.indexGen),
+          provingSummary(provingSummaryOf(*core, schema.get())) {}
   };
+  static const SegmentSummary* provingSummaryOf(const PhysicalCore& core, const Schema* schema);
   const std::shared_ptr<Snapshot> snapshot;
   const std::shared_ptr<SpaceState> space;
   OnceFlag retrievableOnce;
@@ -686,6 +693,18 @@ public:
   // This can be used as a cache key for structures that depend on segments but don't care about deletes.
   uint64_t coreGen() const noexcept {
     return snapshot->core->coreGeneration;
+  }
+
+  // The collection summary of this snapshot's manifest (the union of every
+  // segment's summary), or null when the manifest has no complete one: an
+  // incomplete aggregate proves nothing. Also null when the schema types a
+  // recorded field differently from its persisted type: a proof answers
+  // without weights, so it would hide the field_type_mismatch that field()
+  // raises for requests using that field; those requests take the
+  // per-segment path instead.
+  // Null for a child view: summaries describe the root space.
+  const SegmentSummary* collectionSummary() const noexcept {
+    return space == snapshot->core->root ? snapshot->provingSummary : nullptr;
   }
 
   // Validate this schema's type against the field's persisted segment types
