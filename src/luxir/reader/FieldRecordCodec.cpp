@@ -422,6 +422,7 @@ public:
     extents.add(io, column.values);
     if (header.type == FieldType::VECTOR) {
       if (column.endOffsets) io.invalid("vector column must use fixed stride");
+      if (!vcodec::valid(column.vectorEncoding)) io.invalid("unknown vector encoding");
       auto stride = bytesStride(column, header.numValues);
       if (stride <= 0 || vcodec::dimsFromBytes((VectorEncoding)column.vectorEncoding, stride) <= 0) {
         io.invalid("vector stride is not a whole vector in the column's encoding");
@@ -660,8 +661,9 @@ void writePart(Writer& out, const BytesColumn& column) {
 void readPart(Reader& in, BytesColumn& column) {
   auto options = in.readOptions(HAS_END_OFFSETS | HAS_VECTOR_ENCODING);
   if (options & HAS_VECTOR_ENCODING) {
+    // f32 is recorded by leaving the byte out; the shared check validates the rest.
     column.vectorEncoding = in.readByte();
-    if (!column.vectorEncoding || !vcodec::valid(column.vectorEncoding)) in.invalid("unknown vector encoding");
+    if (!column.vectorEncoding) in.invalid("explicit f32 vector encoding");
   }
   column.values = readSlice(in);
   if (options & HAS_END_OFFSETS) column.endOffsets = readSlice(in);
