@@ -491,6 +491,29 @@ acquired on demand instead. A round still pending at the request's
 `waitDeadline()`, or when it is cancelled, fails the search; its batches may
 still complete afterwards, and their holds are kept.
 
+### Warming a snapshot
+
+`IndexReader::listParts(fields, allData)` lists the parts of every segment of
+a snapshot without reading anything: each file's header and the catalog
+(`CATALOG`), the navigation parts of every field in every row space
+(`NAVIGATION`: term routing data, column indexes, ordinal block metadata,
+points directories, stored field names, id filters, version runs and
+ownership columns), and the data extents of the named fields, or of all
+fields with `allData` (`DATA`: dictionaries, postings, norms, columns, points
+leaves, stored chunks). Each entry gives the file name, offset and length, the
+`ReadClass` the readers acquire it with, the row space and the field. These are
+exactly the ranges reads acquire, so a backend can warm metadata from the
+first two kinds, or a listed field's data from the third, and serve the reads
+that follow from its cache:
+
+```cpp
+// Metadata of every field, and the data of two fields.
+std::string_view fields[] = {"title", "body"};
+for (const auto& part : collection.getReaderManager().getReader()->listParts(fields)) {
+  warm(part.file, part.offset, part.length, part.readClass);
+}
+```
+
 ### Storage layers
 
 A layer derives from `DelegatingDirFactory` and overrides what it changes, usually

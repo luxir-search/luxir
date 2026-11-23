@@ -71,8 +71,9 @@ locations, browse `src/luxir/<area>/`.
      against the manifest's xxh3 first; invalid segment bytes throw `SegmentCorruptError`
    - A term lookup holds the routing data, then the block it lands in, then the found term's
      postings; a part of at most `WHOLE_READ_BYTES` or on a file with free holds is held whole.
-     `SegmentCore::acquireParts` batches parts of mixed read classes per file, and `held()` says
-     whether a slice needs no acquire
+     `SegmentCore::acquireParts` batches parts of mixed read classes per file, `held()` says
+     whether a slice needs no acquire, and `listParts()` lists catalog, navigation and data
+     parts for warming (`IndexReader::listParts`)
    - `IdFilter`: the root id field's FILTER part, a membership filter over its
      dictionary terms that names its own kind (split-block Bloom or binary fuse) and
      parameters. `IdFilter::Options` picks what a writer builds. `SegmentCore::mayContainId` checks the exact id bounds, then the

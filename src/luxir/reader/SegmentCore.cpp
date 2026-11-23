@@ -342,6 +342,79 @@ void SegmentCore::initializeSpaces() {
   }
 }
 
+void SegmentCore::listParts(const std::function<bool(std::string_view space, std::string_view field)>& data,
+                            const std::function<void(const ListedPart&)>& visit) {
+  using Kind = ListedPart::Kind;
+  auto emit = [&](Kind kind, ReadClass readClass, field_parts::Slice slice, std::string_view space,
+                  std::string_view field = {}) {
+    if (slice) visit({kind, readClass, slice, space, field});
+  };
+  forEachBaseFile([&](uint32_t number, uint64_t) {
+    // File 0's header sits at the null location, which emit() skips.
+    visit({Kind::CATALOG, ReadClass::METADATA, {{number, 0}, Postings::LUXIR_HEADER.size()}, {}, {}});
+  });
+  emit(Kind::CATALOG, ReadClass::METADATA, {{Postings::PRIMARY_FILE, range.offset}, range.length}, {});
+  emit(Kind::NAVIGATION, ReadClass::METADATA, catalog.versionRuns().slice, {});
+  std::vector<std::pair<SpaceOrdinal, std::vector<const DecodedFieldRecord*>>> listed;
+  for (size_t ordinal = 0; ordinal < spaces().size(); ++ordinal) {
+    const auto& space = spaces()[ordinal];
+    std::string_view path = space.path;
+    if (ordinal) {
+      emit(Kind::NAVIGATION, ReadClass::DATA, space.ownership.ends, path);
+      emit(Kind::NAVIGATION, ReadClass::DATA, space.ownership.owners, path);
+    }
+    auto* reader = spaceReader((SpaceOrdinal)ordinal);
+    auto& selected = listed.emplace_back((SpaceOrdinal)ordinal, std::vector<const DecodedFieldRecord*>()).second;
+    for (int32_t i = 0; i < reader->numFields(); ++i) {
+      const auto* record = reader->fieldInfo(i);
+      if (!record) continue;
+      std::string_view name(record->name);
+      auto navigation = [&](field_parts::Slice slice, ReadClass readClass = ReadClass::METADATA) {
+        emit(Kind::NAVIGATION, readClass, slice, path, name);
+      };
+      navigation(record->termNavigation());
+      if (const auto* number = record->numberColumn()) navigation(number->index());
+      navigation(record->ordBlockMetadata(space.maxDoc));
+      if (record->points()) navigation(record->pointsDirectory());
+      if (const auto* stored = record->stored()) navigation(stored->names());
+      navigation(record->idFilter(), ReadClass::DATA);
+      if (data(path, name)) selected.push_back(record);
+    }
+  }
+  for (auto& [ordinal, records] : listed) {
+    const auto& space = spaces()[(size_t)ordinal];
+    std::string_view path = space.path;
+    for (const auto* record : records) {
+      std::string_view name(record->name);
+      auto extent = [&](field_parts::Slice slice) { emit(Kind::DATA, ReadClass::DATA, slice, path, name); };
+      if (const auto* terms = record->terms()) {
+        extent(terms->dictionaryBlocks());
+        for (const auto& run : terms->runs) {
+          extent(run.docs);
+          extent(run.positions);
+        }
+      }
+      extent(record->docsBitmap());
+      extent(record->normsValues(space.maxDoc));
+      if (const auto* number = record->numberColumn()) extent(number->blocks());
+      if (const auto* ord = record->ordColumn()) extent(ord->values());
+      if (const auto* bytes = record->bytesColumn()) {
+        extent(bytes->values);
+        extent(bytes->endOffsets);
+      }
+      if (const auto* points = record->points()) extent(points->leaves());
+      if (const auto* stored = record->stored()) {
+        extent(stored->chunks());
+        extent(stored->dictionary());
+        extent(stored->firstDocs);
+        extent(stored->chunkOffsets);
+      }
+      extent(record->endValueRanks());
+      extent(record->owners());
+    }
+  }
+}
+
 bool SegmentCore::mayContainId(std::string_view term, uint64_t hash) {
   const auto* info = root.fieldInfo("id");
   if (!info || !info->terms()) return false;

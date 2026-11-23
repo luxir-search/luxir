@@ -630,6 +630,24 @@ public:
   // on access. Unused fields never prevent opening or using a reader.
   FieldSegments field(std::string_view name) const;
 
+  // A part of a segment file, as listParts() lists it.
+  struct ListedPart {
+    std::string file;  // The segment file's name.
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    ReadClass readClass = ReadClass::METADATA;  // The class the readers acquire it with.
+    SegmentCore::ListedPart::Kind kind = SegmentCore::ListedPart::Kind::CATALOG;
+    std::string space;  // Row space path, empty for the root.
+    std::string field;  // Physical field name, empty for a part of the segment.
+  };
+  // Lists, for each segment of the snapshot, its file headers and catalog,
+  // the navigation parts of every field in every row space (term routing
+  // data, column indexes, points directories, ...), and the data extents of
+  // the fields named in `dataFields` (physical names, in any row space), or
+  // of every field with allData. For a storage backend that warms metadata
+  // or listed fields: the parts are the ranges reads acquire. Reads nothing.
+  std::vector<ListedPart> listParts(std::span<const std::string_view> dataFields = {}, bool allData = false);
+
   std::shared_ptr<OrdMap> getOrdMap(std::string_view name);
 
   // This reader's segment `segId`, or null.

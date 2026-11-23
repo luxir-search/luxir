@@ -230,6 +230,9 @@ than one acquire per part per segment:
   it, parts are acquired on demand. Each batch and each on-demand acquire is
   counted (`io_acquire_batches`), and so is each round the request waits on
   in sequence (`io_acquire_rounds`).
+- `IndexReader::listParts()` lists each segment's catalog, every field's
+  navigation parts and, on request, fields' data extents, so a backend can
+  warm metadata or listed fields.
 
 Two more properties of the open path:
 

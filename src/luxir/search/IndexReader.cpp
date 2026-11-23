@@ -192,6 +192,24 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   return live ? live->shared() : nullptr;
 }
 
+std::vector<IndexReader::ListedPart> IndexReader::listParts(std::span<const std::string_view> dataFields,
+                                                            bool allData) {
+  std::vector<ListedPart> parts;
+  auto data = [&](std::string_view, std::string_view field) {
+    return allData || std::ranges::find(dataFields, field) != dataFields.end();
+  };
+  for (auto& segment : segments()) {
+    auto& core = segment.segmentCore();
+    auto name = core.segmentName();
+    core.listParts(data, [&](const SegmentCore::ListedPart& part) {
+      parts.push_back({Postings::getIndexFileName(name, part.slice.location.filenum()), part.slice.location.offset(),
+                       part.slice.bytes, part.readClass, part.kind, std::string(part.space),
+                       std::string(part.field)});
+    });
+  }
+  return parts;
+}
+
 std::shared_ptr<LiveDocs> SegmentLive::shared() {
   return value.getOrCreate([this] { return LiveDocs::decode(file, fileSize, name, segment, maxDoc, liveCount); });
 }

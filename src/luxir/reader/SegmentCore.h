@@ -9,6 +9,7 @@
 #include "IdFilter.h"
 #include "VersionRuns.h"
 #include <atomic>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <span>
@@ -203,6 +204,28 @@ public:
   // Whether slice() of `part` returns without an acquire: its file hands out
   // free views, or the segment holds the part.
   bool held(field_parts::Slice part);
+
+  // A part of the segment, as listParts() lists it for a storage backend
+  // that warms what reads will need.
+  struct ListedPart {
+    enum class Kind : uint8_t {
+      CATALOG,     // file headers and the catalog, which an open reads
+      NAVIGATION,  // what locates data: term routing data, column indexes, points directories, ...
+      DATA,        // a field's data extents
+    };
+    Kind kind;
+    ReadClass readClass;  // the class the readers acquire it with
+    field_parts::Slice slice;
+    std::string_view space;  // row space path, empty for the root
+    std::string_view field;  // empty for a part of the segment rather than of a field
+  };
+  // Visits the file headers and the catalog, then each row space's
+  // navigation (version runs, ownership columns) and its fields' navigation
+  // parts, then the data parts of the fields `data` accepts. The parts are
+  // the ranges the readers acquire, so a backend that holds them serves those
+  // acquires; they may overlap (a run's docs within a field's postings).
+  void listParts(const std::function<bool(std::string_view space, std::string_view field)>& data,
+                 const std::function<void(const ListedPart&)>& visit);
 
 };
 

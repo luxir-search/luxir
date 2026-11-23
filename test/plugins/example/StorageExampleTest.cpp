@@ -8,6 +8,7 @@
 #include "CountingStorage.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/reader/OwnershipShape.h"
+#include "luxir/store/AcquireJoin.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/store/CorruptionMarker.h"
@@ -316,6 +317,74 @@ TEST_F(StorageExampleTest, coldTermQueryWaitsOnRoundsNotSegments) {
     EXPECT_EQ(capped.singles, capped.rounds) << large;
     EXPECT_GE(capped.rounds, 5 * rounds) << large;
   }
+}
+
+// listParts() lists each segment's catalog and its fields' navigation parts,
+// and the data of the fields asked for. A segment that holds what it lists
+// serves a query on those fields without another acquire.
+TEST_F(StorageExampleTest, listedPartsServeAQueryOnTheirFields) {
+  LuxirConfig config;
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  auto writer = h.getIndexWriter();
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_TRUE(h.indexAll({flatdoc("id", std::to_string(i), "body_w", "needle hay", "c_s", "x", "n_i", (int64_t)i),
+                            flatdoc("id", "x" + std::to_string(i), "body_w", "needle", "c_s", "y")},
+                           UpdateMessage::COMMIT).success);
+  }
+  auto snapshot = *writer->snapshots.snapshot();
+  snapshot.openCores.clear();
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
+  auto reader = std::make_shared<IndexReader>(dir, snapshot);
+  ASSERT_EQ(2u, reader->segments().size());
+  using Kind = SegmentCore::ListedPart::Kind;
+
+  std::string_view fields[] = {"body_w"};
+  auto parts = reader->listParts(fields);
+  auto count = [&](Kind kind, std::string_view field, ReadClass readClass) {
+    return std::ranges::count_if(parts, [&](const auto& part) {
+      return part.kind == kind && part.field == field && part.readClass == readClass;
+    });
+  };
+  EXPECT_GE(count(Kind::CATALOG, "", ReadClass::METADATA), 4);         // a header and a catalog per segment
+  EXPECT_EQ(2, count(Kind::NAVIGATION, "body_w", ReadClass::METADATA));  // term routing data per segment
+  EXPECT_GE(count(Kind::NAVIGATION, "c_s", ReadClass::METADATA), 2);
+  EXPECT_GE(count(Kind::NAVIGATION, "n_i", ReadClass::METADATA), 2);     // the column index
+  EXPECT_GT(count(Kind::DATA, "body_w", ReadClass::DATA), 2);
+  EXPECT_EQ(0, count(Kind::DATA, "c_s", ReadClass::DATA));
+  EXPECT_GT(std::ranges::count_if(reader->listParts({}, true), [](const auto& part) {
+    return part.kind == Kind::DATA && part.field == "c_s";
+  }), 0);
+  for (const auto& part : parts) {
+    EXPECT_TRUE(std::ranges::any_of(snapshot.files, [&](const auto& file) { return file.name == part.file; }));
+    EXPECT_GT(part.length, 0u) << part.file;
+  }
+
+  // Hold what the segments list, as a warmed backend would serve it.
+  auto data = [](std::string_view, std::string_view field) { return field == "body_w"; };
+  for (auto& segment : reader->segments()) {
+    std::vector<SegmentCore::Part> held;
+    segment.segmentCore().listParts(data, [&](const SegmentCore::ListedPart& part) {
+      held.push_back({part.slice, part.readClass});
+    });
+    AcquireJoin join;
+    segment.segmentCore().acquireParts(held, join);
+    join.wait();
+  }
+  auto acquires = [&] {
+    uint64_t total = 0;
+    for (const auto& file : snapshot.files) total += counters->fileStats(file.name).acquires;
+    return total;
+  };
+  auto before = acquires();
+  auto req = localReq(h.getSearchEngine());
+  req->profile().topDocs().matchQuery("body_w", "needle").fields({"_score_"}).withStats();
+  req->execute(reader);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(4, req->getMatchCount());
+  EXPECT_EQ(before, acquires());
+  EXPECT_EQ(0u, req->responses.back()->proto.profile.value_or(api::ExecutionProfile{}).io_acquire_rounds);
 }
 
 // The canonical query shapes read parts, never whole segment files, and each
