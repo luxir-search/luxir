@@ -242,35 +242,56 @@ TEST_F(VectorEncodingTest, bf16RoundsToNearestEven) {
   EXPECT_EQ(1.5f, x);
 }
 
-// f16, bf16 and sq8 rows score exactly like f32 scoring of the decoded
-// vector, for every metric.
+// f16, bf16 and sq8 rows score like f32 scoring of the decoded vector, for
+// every metric, at widths that exercise SIMD blocks, partial tails and wide
+// accumulation, from an unaligned row.  sq8 decodes first, so it matches
+// exactly; FAISS's 16-bit computers sum in another order, within a few float
+// roundings of the terms.
 TEST_F(VectorEncodingTest, encodedScoreMatchesDecodedScore) {
-  Vec v = docVec(3);
-  for (auto e : {VectorEncoding::F16, VectorEncoding::BF16, VectorEncoding::SQ8}) {
-    std::vector<char> row((size_t)vcodec::bytesPerVector(e, DIMS));
-    vcodec::encode(e, v.data(), DIMS, row.data());
-    Vec decoded(DIMS);
-    vcodec::decode(e, row.data(), DIMS, decoded.data());
-    std::string_view rowView(row.data(), row.size());
-    std::string_view decodedView((const char*)decoded.data(), decoded.size() * sizeof(float));
-    for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
-      VectorScorer encoded(QUERY.data(), DIMS, (int32_t)metric, true, e);
-      VectorScorer f32(QUERY.data(), DIMS, (int32_t)metric, true, VectorEncoding::F32);
-      EXPECT_EQ(f32.score(decodedView, 0), encoded.score(rowView, 0))
-          << vcodec::name(e) << " " << (int)metric;
+  for (int32_t dims : {8, 40, 400}) {
+    Vec q((size_t)dims), v((size_t)dims);
+    double terms = 0;
+    for (int32_t i = 0; i < dims; i++) {
+      q[(size_t)i] = QUERY[(size_t)i % DIMS] * (1.0f + 0.01f * (float)i);
+      v[(size_t)i] = docVec(3)[(size_t)i % DIMS] - 0.003f * (float)i;
+      terms += std::fabs((double)q[(size_t)i] * v[(size_t)i]) + (double)v[(size_t)i] * v[(size_t)i];
+    }
+    for (auto e : {VectorEncoding::F16, VectorEncoding::BF16, VectorEncoding::SQ8}) {
+      std::vector<char> row(1 + (size_t)vcodec::bytesPerVector(e, dims));
+      vcodec::encode(e, v.data(), dims, row.data() + 1);
+      Vec decoded((size_t)dims);
+      vcodec::decode(e, row.data() + 1, dims, decoded.data());
+      std::string_view rowView(row.data() + 1, row.size() - 1);
+      std::string_view decodedView((const char*)decoded.data(), decoded.size() * sizeof(float));
+      for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
+        VectorScorer encoded(q.data(), dims, (int32_t)metric, true, e);
+        VectorScorer f32(q.data(), dims, (int32_t)metric, true, VectorEncoding::F32);
+        float expected = f32.score(decodedView, 0), actual = encoded.score(rowView, 0);
+        if (e == VectorEncoding::SQ8) {
+          EXPECT_EQ(expected, actual) << dims << " " << (int)metric;
+        } else {
+          EXPECT_NEAR(expected, actual, 1e-6 * terms) << vcodec::name(e) << " " << dims << " " << (int)metric;
+        }
+      }
     }
   }
 }
 
 // sq8 scores the decoded vector, so a query with a large dynamic range keeps
-// the sign of a dot product that per-vector offset and scale terms cancel away.
+// the sign of a dot product that per-vector offset and scale terms cancel
+// away.  [-254, 0, 256] stores exactly (offset -254, scale 2, codes 0, 127,
+// 255); against [1, 2^30, 1] the decoded products are -254, 0 and 256 and sum
+// to 2 in any order, while offset * sum(q) + scale * sum(q[i] * code[i]),
+// with the code sum in float, loses the 255 and gives -508, below a zero
+// vector.
 TEST_F(VectorEncodingTest, sq8ExtremeQueryRanksByDecodedScore) {
-  const Vec x = {-255, 255, 255};
-  const Vec query = {0x1p30f, 0x1p30f, 1.0f};
+  const Vec x = {-254, 0, 256};
+  const Vec query = {1.0f, 0x1p30f, 1.0f};
   std::vector<char> row((size_t)vcodec::bytesPerVector(VectorEncoding::SQ8, 3));
   vcodec::encode(VectorEncoding::SQ8, x.data(), 3, row.data());
+  EXPECT_EQ(x, stored(api::VectorEncoding::SQ8, x));
   VectorScorer scorer(query.data(), 3, (int32_t)api::VectorMetric::IP, true, VectorEncoding::SQ8);
-  EXPECT_EQ(255.0f, scorer.score(std::string_view(row.data(), row.size()), 0));
+  EXPECT_EQ(2.0f, scorer.score(std::string_view(row.data(), row.size()), 0));
 
   CollectionHelper h("main");
   SchemaBuilder b;
