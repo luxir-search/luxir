@@ -566,7 +566,9 @@ the exact-dimension cost. Interval terminal reads have a shared floor of
 `min(k, examined interval vectors)`, with dimensions scaled by the
 read-weighted average. Every query pays a request constant, and any query that
 runs IVF pays a second one. Exact and terminal dimensions are weighted by the
-segment column's encoding (`Costs::ENCODING_DIM_COST`, measured against f32).
+segment column's encoding (`Costs::ENCODING_DIM_COST`, measured against f32),
+with a higher weight for cosine on a non-f32 column, which pays a second pass
+for the stored norm.
 Units are nanoseconds divided by the cost of one exact
 dimension; counters expose the same units, and `KnnPlanner::Costs` records what
 they were fitted on.

@@ -1154,6 +1154,7 @@ public:
             input.eligibleVectors = eligible.eligibleVectors; input.vectorsEstimated = eligible.vectorsEstimated;
             input.maxDoc = seg.maxDoc();
             input.dims = dims; input.encoding = vr.encoding(); input.l2 = metric == (int32_t)api::VectorMetric::L2;
+            input.cosine = metric == (int32_t)api::VectorMetric::COSINE;
             input.unfiltered = eligible.unfiltered;
             input.sparse = vr.strColReader().docsReader().bitset() != nullptr; input.multi = vr.multiValued();
             if (auto* vaux = vauxPerSeg[i]) {

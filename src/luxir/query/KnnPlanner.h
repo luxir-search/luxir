@@ -62,13 +62,17 @@ struct KnnPlanner {
                0.00868 / NS_PER_DIM, 0.340 / NS_PER_DIM,
                7.50 / NS_PER_DIM, 17.7 / NS_PER_DIM, 7.50 / NS_PER_DIM};
     double requestCost = 18400 / NS_PER_DIM; // Common to both arms, once per query.
-    // EXACT_DIM and TERMINAL_DIM per stored encoding, relative to f32, in
-    // VectorEncoding order (f32, f16, bf16, sq8): BM_VectorEncodingExact's
-    // exact-scan time per query (warm cache, one thread, x86 with AVX-512,
-    // 768-d, 50k vectors) over f32's, averaged over L2, IP and cosine. f16 and
-    // bf16 cosine, which pays a second pass for the stored norm, measured 0.72
-    // against 0.46 for L2 and IP; sq8 0.67 against 0.53.
-    static constexpr std::array<double, 4> ENCODING_DIM_COST{1, 0.545, 0.543, 0.575};
+    // EXACT_DIM and TERMINAL_DIM per stored encoding, relative to f32, indexed
+    // [cosine on a non-f32 column][VectorEncoding] (f32, f16, bf16, sq8).
+    // Cosine over a non-f32 column pays a second pass over the row for the
+    // stored norm. BM_VectorEncodingExact's exact-scan time per query (warm
+    // cache, one thread, x86 with AVX-512) over f32's: row 0 is the mean of L2
+    // and IP, row 1 cosine. They fit memory-resident columns at 768-d and 50k
+    // vectors. f32 cosine over a raw column (normalize_on_write false) also
+    // pays a norm pass but stays at 1, as before encodings were priced.
+    static constexpr std::array<std::array<double, 4>, 2> ENCODING_DIM_COST{{
+        {1, 0.457, 0.459, 0.528},
+        {1, 0.722, 0.712, 0.668}}};
     // Fraction of one-bit RaBitQ candidates that pass the gate to the
     // extra-bit pass, for an independent filter at the selectivities where
     // IVF is chosen: 0.04-0.06 at 128-d (SIFT) and ~0.011 at 768-d (miracl),
@@ -98,7 +102,7 @@ struct KnnPlanner {
     int32_t dims = 0, nlist = 0, pqM = 0, pqBits = 0, rabitqBits = 0, rabitqQueryBits = 4;
     Codec codec = Codec::FLAT;
     VectorEncoding encoding = VectorEncoding::F32;  // of the column exact and terminal scores read
-    bool l2 = false, domain = false, arrayDomain = false, unfiltered = true, deletes = false;
+    bool l2 = false, cosine = false, domain = false, arrayDomain = false, unfiltered = true, deletes = false;
     bool sparse = false, multi = false, bounded = false;
     bool vectorsEstimated = false, pqPerListTable = false, forceFaissRaBitQ = false;
 
@@ -134,7 +138,8 @@ struct KnnPlanner {
 
   // Exact and terminal scoring dimensions of one vector, in f32 equivalents.
   static double scoreDims(const Segment& s) {
-    return s.dims * Costs::ENCODING_DIM_COST[(size_t)s.encoding];
+    bool normPass = s.cosine && s.encoding != VectorEncoding::F32;
+    return s.dims * Costs::ENCODING_DIM_COST[normPass][(size_t)s.encoding];
   }
   static bool walkDomain(bool domain, bool sparse, bool multi, int64_t card,
                          int64_t docsWithField, double threshold) {
