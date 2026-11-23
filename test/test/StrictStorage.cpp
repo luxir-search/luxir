@@ -136,6 +136,7 @@ public:
   void sizeRequested() {
     if (!sized) counters->sizeRequested(name);
   }
+  void round(bool batch) { counters->round(name, batch); }
 
   // A part's bytes are metadata or data whoever reads them, so a cache hint
   // must not depend on which reader acquires the part first.
@@ -157,7 +158,6 @@ public:
     if (range.offset == 0 && range.length > Postings::LUXIR_HEADER.size()) return true;
     return *segmentFile != Postings::PRIMARY_FILE && range.length && range.offset + range.length == size;
   }
-  void round(bool batch) { counters->round(name, batch); }
 
   void wholeFile() {
     counters->wholeFile(name);
@@ -230,34 +230,52 @@ public:
     return state->copy(source, range, slack(range, fileSize));
   }
 
-  // Forwards the batch whole, so the delegate sees it as one round.
+  // Forwards the batch whole, so the delegate sees it as one round. Every
+  // error, including a bad range, a denied whole file or a delegate that
+  // throws, goes to done, which runs exactly once.
   void acquire(std::span<const ByteRange> ranges, AcquireDone done) override {
-    auto fileSize = delegate->size();
-    for (auto range : ranges) {
-      checkRange(range, fileSize);
-      state->checkClass(range);
-      if (state->readsWholeFile(range, fileSize)) state->wholeFile();
-    }
-    state->round(true);
-    std::vector<ByteRange> requested(ranges.begin(), ranges.end());
-    delegate->acquire(ranges, [state = state, fileSize, requested = std::move(requested), done = std::move(done)](
-                                  std::vector<HeldRange>&& sources, std::exception_ptr failure) {
-      std::vector<HeldRange> holds;
-      if (!failure) {
-        try {
-          if (sources.size() != requested.size()) throw FileIOException("strict: batch returned the wrong number of holds");
-          holds.reserve(sources.size());
-          for (size_t i = 0; i < sources.size(); ++i) {
-            holds.push_back(state->copy(sources[i], requested[i], slack(requested[i], fileSize)));
-          }
-        } catch (...) {
-          holds.clear();
-          failure = std::current_exception();
-        }
+    auto once = std::make_shared<std::atomic<bool>>(false);
+    auto fail = [&](std::exception_ptr failure) {
+      if (!once->exchange(true)) done({}, std::move(failure));
+    };
+    uint64_t fileSize = 0;
+    std::vector<ByteRange> requested;
+    try {
+      fileSize = delegate->size();
+      for (auto range : ranges) {
+        checkRange(range, fileSize);
+        state->checkClass(range);
+        if (state->readsWholeFile(range, fileSize)) state->wholeFile();
       }
-      sources.clear();
-      done(std::move(holds), std::move(failure));
-    });
+      state->round(true);
+      requested.assign(ranges.begin(), ranges.end());
+    } catch (...) {
+      fail(std::current_exception());
+      return;
+    }
+    try {
+      delegate->acquire(ranges, [state = state, fileSize, once, requested = std::move(requested), done](
+                                    std::vector<HeldRange>&& sources, std::exception_ptr failure) {
+        if (once->exchange(true)) return;
+        std::vector<HeldRange> holds;
+        if (!failure) {
+          try {
+            if (sources.size() != requested.size()) throw FileIOException("strict: batch returned the wrong number of holds");
+            holds.reserve(sources.size());
+            for (size_t i = 0; i < sources.size(); ++i) {
+              holds.push_back(state->copy(sources[i], requested[i], slack(requested[i], fileSize)));
+            }
+          } catch (...) {
+            holds.clear();
+            failure = std::current_exception();
+          }
+        }
+        sources.clear();
+        done(std::move(holds), std::move(failure));
+      });
+    } catch (...) {
+      fail(std::current_exception());
+    }
   }
 
   void prefetch(size_t offset, size_t length) override { delegate->prefetch(offset, length); }
