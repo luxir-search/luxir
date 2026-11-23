@@ -172,16 +172,13 @@ blocking acquires and completes batches on the same threads would deadlock.
 A segment reads every part through `SegmentCore::slice()`. Its
 `acquireSlices()` acquires parts ahead in one batch per file, skipping parts
 already held, and keeps the holds the same way. A manifest open acquires
-each file's header, the catalog range, the version runs and, for segments
-with nested spaces, the ownership ends and owners columns; never a whole
+each file's header and the catalog range and nothing else, never a whole
 segment file. It opens every file the manifest lists, then issues one batch
 per file: file 0's header with the catalog, every other file's header
 alone. A snapshot open issues the batches of all its new segments before it
 waits on any, so a backend that completes batches asynchronously serves
 every header and catalog in one round. A header's hold is released once
-checked. The version runs and a nested segment's ownership columns are
-still acquired after that round, one blocking acquire at a time per
-segment. Each segment's batches report failure to that segment, and the
+checked. Each segment's batches report failure to that segment, and the
 segments fail in order as if opened one at a time: the lowest failing
 segment's error surfaces, naming the segment, whichever batch completed
 first. The open takes the same path on every backend; files with free
@@ -189,6 +186,20 @@ holds (RAM, mmap) differ only in that `slice()` retains nothing for them
 and `acquireSlices()` issues no batch. For now the segment keeps the holds
 it hands out until it closes, so nothing held is evicted; releasing holds
 when a request ends comes with a bounded cache.
+
+What a segment builds from its parts waits for first use:
+
+- The version runs are acquired and checked by the first reader that needs
+  them, such as a query returning `_version_`, a delete or a merge.
+- An ownership shape is built when a nested query, a mapping or a child live
+  view first uses it. Its first use acquires its columns together with those
+  of the unbuilt shapes above it, in one batch.
+- A build that fails publishes nothing. A failed read fails that use with the
+  backend's error and the next use reads again; bytes that fail validation
+  throw `SegmentCorruptError` on every use.
+- `segmentOpenCounters` counts the segments with a first hold beyond the
+  catalog and the bytes those holds cover (`segments_opened`,
+  `segment_bytes_mapped`). Free views (RAM, mmap) are not counted.
 
 - A manifest open passes each file's recorded size to `Directory::openFile`
   and checks it against `size()` once per file; after a sized open, `size()`
