@@ -199,6 +199,38 @@ use:
   catalog and the bytes those holds cover (`segments_opened`,
   `segment_bytes_mapped`). Free views (RAM, mmap) are not counted.
 
+A query declares what it will read in each segment before it reads it
+(`search/DeclaredReads.h`), so that its cold reads cost a few rounds rather
+than one acquire per part per segment:
+
+- A term lookup acquires the term routing data (block offsets and trie), then
+  only the block it lands in (`dictionaryStart + offsets[b]`), then the
+  postings of a term it found: that term's docs, and the run's positions. A
+  dictionary or a run's docs of at most 64 KiB (`WHOLE_READ_BYTES`) is
+  acquired whole instead, and so is anything on a file with free holds. A scan
+  (enumerating terms, or a forward seek past its block) holds the dictionary
+  whole.
+- Before parse, a search walks its request for the term lookups parsing will
+  make, in every segment, and acquires their parts in up to three rounds:
+  routing data and live docs, blocks, postings. A part already held, or
+  declared whole, merges rounds. After planning, the weights' registered reads
+  (the norms of a scored field where its term was found) go in one more round.
+  Each round is one batch per segment file (`SegmentCore::acquireParts`),
+  issued together across segments.
+- No search worker waits for a round on a dispatched request: the request
+  resumes on the node's arena when the last batch completes
+  (`AcquireRound`). A round that completes inline (RAM, mmap, the default
+  batch) goes on on the same thread. A synchronous `submit()` waits on its
+  rounds instead.
+- A round pending at the request's wait deadline fails the search with
+  `deadline_exceeded`, and a cancelled request fails with `cancelled`. Its
+  batches still complete, and the segment keeps their holds. Any other failed
+  round is no failed search: the parts are acquired on demand.
+- `search.read_ahead_max_bytes` (256 MiB) caps what a request declares; past
+  it, parts are acquired on demand. Each batch and each on-demand acquire is
+  counted (`io_acquire_batches`), and so is each round the request waits on
+  in sequence (`io_acquire_rounds`).
+
 Two more properties of the open path:
 
 - A manifest open passes each file's recorded size to `Directory::openFile`,

@@ -233,6 +233,91 @@ TEST_F(StorageExampleTest, manifestOpenAcquiresCatalogsInOneRound) {
   EXPECT_EQ(before.acquires + 2, after.acquires);
 }
 
+// A cold scored term query declares what it reads in every segment and waits
+// on a few rounds of batches, issued together across segments, however many
+// segments it reads: routing data (with the dictionary when it is small, or
+// alone, then the block the lookup lands in), the postings of the term found,
+// then the norms its scorer reads. With declares capped away, every part is a
+// round of its own.
+TEST_F(StorageExampleTest, coldTermQueryWaitsOnRoundsNotSegments) {
+  struct Cost {
+    uint64_t rounds = 0;   // the request's sequential acquire waits
+    uint64_t batches = 0;  // batches the storage saw
+    uint64_t singles = 0;  // single acquires the storage saw
+    uint64_t maxBatchesPerFile = 0;
+  };
+  auto measure = [](int segments, bool largeDictionary, uint64_t readAheadBytes) {
+    LuxirConfig config;
+    config.search.read_ahead_max_bytes = readAheadBytes;
+    LuxirNode node(config);
+    CollectionHelper h(node, "main");
+    auto writer = h.getIndexWriter();
+    for (int i = 0; i < segments; ++i) {
+      std::string body = "needle";
+      // About 100 KB of dictionary: past WHOLE_READ_BYTES, so it is held block by block.
+      for (int t = 0; largeDictionary && t < 8000; ++t) body += std::format(" term{:05}x{}", t, i);
+      // In two docs, so the term's postings are a part of their own, not inline.
+      EXPECT_TRUE(h.indexAll({flatdoc("id", std::to_string(i), "body_w", body),
+                              flatdoc("id", "x" + std::to_string(i), "body_w", "hay needle")},
+                             UpdateMessage::COMMIT).success);
+    }
+    auto snapshot = *writer->snapshots.snapshot();
+    snapshot.openCores.clear();
+    auto counters = std::make_shared<StrictStorageCounters>();
+    StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
+    auto reader = std::make_shared<IndexReader>(dir, snapshot);
+    EXPECT_EQ((size_t)segments, reader->segments().size());
+    auto totals = [&] {
+      Cost cost;
+      for (const auto& file : snapshot.files) {
+        auto stats = counters->fileStats(file.name);
+        cost.batches += stats.batches;
+        cost.singles += stats.rounds - stats.batches;
+      }
+      return cost;
+    };
+    auto before = totals();
+    std::map<std::string, uint64_t> batchesBefore;
+    for (const auto& file : snapshot.files) batchesBefore[file.name] = counters->fileStats(file.name).batches;
+    auto req = localReq(h.getSearchEngine());
+    req->profile().topDocs().matchQuery("body_w", "needle").fields({"_score_"}).withStats();
+    req->execute(reader);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(2 * segments, req->getMatchCount());
+    auto after = totals();
+    Cost cost;
+    cost.rounds = req->responses.back()->proto.profile.value_or(api::ExecutionProfile{}).io_acquire_rounds;
+    cost.batches = after.batches - before.batches;
+    cost.singles = after.singles - before.singles;
+    for (const auto& file : snapshot.files) {
+      auto stats = counters->fileStats(file.name);
+      EXPECT_EQ(0u, stats.wholeFileAccesses) << file.name;
+      cost.maxBatchesPerFile = std::max(cost.maxBatchesPerFile, stats.batches - batchesBefore[file.name]);
+    }
+    return cost;
+  };
+
+  for (bool large : {false, true}) {
+    auto few = measure(2, large, 256ULL << 20);
+    auto many = measure(5, large, 256ULL << 20);
+    // Small dictionary: routing data and dictionary, postings, norms.
+    // Large one: routing data, block, postings, norms.
+    uint64_t rounds = large ? 4 : 3;
+    EXPECT_EQ(rounds, few.rounds) << large;
+    EXPECT_EQ(rounds, many.rounds) << large;
+    EXPECT_EQ(0u, few.singles) << large;
+    EXPECT_EQ(0u, many.singles) << large;
+    EXPECT_LE(many.maxBatchesPerFile, rounds) << large;
+    EXPECT_GT(many.batches, few.batches) << large;
+
+    // Capped to nothing, every part is acquired on demand, one round each.
+    auto capped = measure(5, large, 1);
+    EXPECT_EQ(0u, capped.batches) << large;
+    EXPECT_EQ(capped.singles, capped.rounds) << large;
+    EXPECT_GE(capped.rounds, 5 * rounds) << large;
+  }
+}
+
 // The canonical query shapes read parts, never whole segment files, and each
 // segment acquires its catalog as metadata.
 TEST_F(StorageExampleTest, canonicalQueriesRunWithWholeSegmentFilesDenied) {
@@ -355,15 +440,18 @@ TEST_F(StorageExampleTest, liveDocsDecodeOnFirstUse) {
   EXPECT_EQ(0u, counters->fileStats(liveName).acquires);
   EXPECT_EQ(0u, counters->fileStats(liveName).sizeRequests);
 
-  // A failed read fails the request; the next one decodes the bitmap.
+  // A failed read fails the request; the next one decodes the bitmap. The
+  // request acquires the live docs ahead of parse, and a failure there only
+  // leaves them to the first use, so every read has to fail.
   auto search = [&] {
     auto req = localReq(h.getSearchEngine());
     req->topDocs().matchQuery("c_s", "x").countLimit(-1);
     req->execute(reader);
     return req;
   };
-  counters->failNextRounds(1);
+  counters->failNextRounds(1000);
   EXPECT_FALSE(search()->ok());
+  counters->failNextRounds(0);
   auto req = search();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ(2, req->getMatchCount());

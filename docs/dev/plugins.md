@@ -476,6 +476,21 @@ also counts as the batch failing. The ranges are valid only during the call,
 so copy what the completion needs. Wrappers forward the batch to their
 delegate rather than splitting it, so the backend sees it whole.
 
+A search over files that are not `holdsFree()` declares the parts it will
+read in each segment and acquires them in rounds of batches: the term routing
+data (block offsets and trie) and live docs, then the term blocks its lookups
+land in, then the postings of the terms found, then what its scorers read
+(norms). Each round is one batch per segment file, issued together across
+segments, so a backend that completes batches asynchronously serves a cold
+query in a few round trips however many segments it has. No search worker
+waits for a round: the search resumes on the node's arena when the last batch
+completes, so `done` may run on a thread of the backend's own. A part of at
+most 64 KiB (`field_parts::WHOLE_READ_BYTES`), such as a small dictionary, is
+acquired whole. Past `search.read-ahead-max-bytes` per request, parts are
+acquired on demand instead. A round still pending at the request's
+`waitDeadline()`, or when it is cancelled, fails the search; its batches may
+still complete afterwards, and their holds are kept.
+
 ### Storage layers
 
 A layer derives from `DelegatingDirFactory` and overrides what it changes, usually

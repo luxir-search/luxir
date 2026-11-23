@@ -1124,6 +1124,13 @@ message ExecutionProfile {
   uint64 io_rounds = 13;
   // Bytes those requests returned.
   uint64 io_fetched_bytes = 14;
+  // Calls that acquired io_acquires: a batch of ranges on one file counts
+  // once, and so does a single acquire.
+  uint64 io_acquire_batches = 15;
+  // Waits on those calls in sequence: the batches of one round, issued
+  // together across files and segments, count once, and so does each
+  // acquire a read makes on demand.
+  uint64 io_acquire_rounds = 16;
 }
 
 message ExecutionProfileOp {
@@ -1766,6 +1773,8 @@ message ServiceStats {
   uint64 search_io_requests = 29;
   uint64 search_io_rounds = 30; // requests awaited together count once
   uint64 search_io_fetched_bytes = 31;
+  uint64 search_io_acquire_batches = 32;
+  uint64 search_io_acquire_rounds = 33;
   ActivityStats index_batches = 10;
   // Accepted into indexing (not durably acknowledged) or rejected/rolled back.
   uint64 documents_accepted = 11;

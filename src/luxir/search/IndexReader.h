@@ -60,6 +60,9 @@ public:
   // negative, throw SegmentCorruptError.
   static std::shared_ptr<LiveDocs> decode(std::shared_ptr<InputFile> file, uint64_t size, std::string_view name,
                                           std::string_view segment, int32_t maxDoc, int32_t numLive);
+  // As above, from a hold of the whole file acquired ahead.
+  static std::shared_ptr<LiveDocs> decode(std::shared_ptr<InputFile> file, HeldRange hold, std::string_view name,
+                                          std::string_view segment, int32_t maxDoc, int32_t numLive);
   // Opens and decodes generation `liveGen` at once, for the writer. Null when
   // the file is missing and missingFileOK is set.
   static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
@@ -139,6 +142,12 @@ public:
   int32_t size() const noexcept { return maxDoc; }
   bool decoded() const noexcept { return value.peek() != nullptr; }
   std::shared_ptr<LiveDocs> shared();
+  // Starts acquiring the file on `batches` and decodes it once the hold
+  // arrives, unless it is decoded already or its file hands out free views.
+  // A failed acquire or decode publishes nothing: the first use retries.
+  // The caller keeps this alive until the batch completed. False when it
+  // issued nothing.
+  bool acquireAhead(AcquireBatches& batches);
   LiveDocs* get() {
     auto* decodedDocs = value.peek();
     return decodedDocs ? decodedDocs : shared().get();
@@ -244,6 +253,9 @@ public:
     }
 
     SegmentCore& segmentCore() const noexcept { return *sharedSegmentCore; }
+
+    // The root live docs generation, null without deletes.
+    const std::shared_ptr<SegmentLive>& rootLive() const noexcept { return sharedLiveDocs; }
 
     // Pins the immutable bundle and all of its space readers.
     std::shared_ptr<SegmentCore> segmentCoreShared() const noexcept {

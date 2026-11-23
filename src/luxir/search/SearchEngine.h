@@ -3,8 +3,13 @@
 
 #pragma once
 
+#include <exception>
+#include <functional>
+#include <optional>
+
 #include "SearchRequest.h"
 #include "luxir/server/LuxirNode.h"
+#include "luxir/util/thread.h"
 
 namespace luxir {
 
@@ -17,8 +22,37 @@ struct SearchConfig;
 class SearchEngine {
   LuxirNode& node;
 
-  void submitBody(SearchRequest& req);
-  // Runs submit() on an arena worker, isolating its waits.
+  // Runs the request: reads ahead of parse, parse and plan, reads ahead of
+  // execution, then execution. Reads ahead happen when the reader's files do
+  // not all hand out free views (DeclaredReads). With mayDefer, a round that
+  // does not complete inline resumes the request on an arena worker once it
+  // ends, and no thread waits for it. ownTg is the fan-out scope run() made on
+  // its stack, which a deferred request leaves behind.
+  void submitBody(SearchRequest& req, bool mayDefer, FanoutScope* ownTg);
+  void planBody(SearchRequest& req, bool mayDefer, FanoutScope* ownTg);
+  void executeBody(SearchRequest& req, RootOp* root);
+  // Records a failure on the request after draining its fan-out scope.
+  void failBody(SearchRequest& req, std::exception& e, ErrorKind fallback);
+  // Fails the request with `failure` after a round of reads, then finishBody().
+  void abandon(SearchRequest& req, std::exception_ptr failure, RootOp* root);
+  // Releases segment state, fills the profile and warnings, and sends the final response.
+  void finishBody(SearchRequest& req, RootOp* root);
+  // Goes on with the request after its rounds; with a failure, fails it.
+  using Resume = std::function<void(std::exception_ptr failure)>;
+  // Issues the request's declared rounds until it has nothing more to read
+  // ahead at this stage. False when they all ended inline (or blocking,
+  // without mayDefer): the caller goes on. True when the request was handed
+  // over: `resume` runs once the rounds end (on an arena worker, or here with
+  // a failure), and the caller must not touch the request again.
+  bool readAhead(SearchRequest& req, bool mayDefer, FanoutScope* ownTg, Resume resume);
+  // What fails a request after a round: a cancel or the deadline. Any other
+  // failure is no failed search: the reads acquire on demand.
+  static std::exception_ptr readFailure(const SearchRequest& req, const std::exception_ptr& error);
+  static std::optional<FanoutPolicy> fanoutPolicy(int32_t maxParallel);
+  // submit(), but with mayDefer the request may finish on an arena worker
+  // after this returns (dispatch's lanes, which complete through replies).
+  void run(SearchRequest& req, int32_t maxParallel, bool mayDefer);
+  // Runs run() on an arena worker, isolating its waits.
   void enqueueSubmit(SearchRequest& req, int32_t maxParallel);
   RootOp* prepare(SearchRequest& req);
 

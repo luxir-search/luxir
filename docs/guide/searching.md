@@ -1263,6 +1263,8 @@ threads and streamed batches:
 | `io_requests` | Store requests a storage backend or layer counted for the search, such as ranged GETs to an object store. |
 | `io_rounds` | Sequential waits on the store; requests awaited together count once. |
 | `io_fetched_bytes` | Bytes those requests returned. |
+| `io_acquire_batches` | Calls that acquired those ranges: a batch of ranges on one file counts once, and so does a single acquire. |
+| `io_acquire_rounds` | Waits on those calls in sequence. A search declares the parts it will read in each segment and acquires them in a few rounds, each issued together across segments, so this stays small however many segments it reads; each acquire made on demand adds one. |
 
 A segment keeps the ranges it acquires until it closes, so a search whose
 ranges are already held acquires nothing. Reads done to build state that later

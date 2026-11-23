@@ -554,7 +554,7 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_search_execution_duration_seconds` | Search-body execution, excluding scheduler/visibility waits and later streaming drains. |
 | `luxir_search_resource_exhausted_total`, `luxir_search_warnings_total` | Resource-limit failures (including the request memory breaker), and searches with declared degradation warnings. |
 | `luxir_search_fanout_parallel_searches_total`, `luxir_search_fanout_decisions_total`, `luxir_search_fanout_shares_total` | What the adaptive fan-out (`max_parallel: 0`) decided; see [Threads and streaming backpressure](#threads-and-streaming-backpressure). |
-| `luxir_search_io_acquires_total`, `luxir_search_io_acquired_bytes_total`, `luxir_search_io_requests_total`, `luxir_search_io_rounds_total`, `luxir_search_io_fetched_bytes_total` | Storage I/O of finished searches: ranges acquired from storage that hands out held copies (zero on RAM and mmap) and their bytes, then the store requests, sequential rounds and fetched bytes a storage backend counted (zero on a backend that counts none). A search's own counts are in its profile. |
+| `luxir_search_io_acquires_total`, `luxir_search_io_acquired_bytes_total`, `luxir_search_io_requests_total`, `luxir_search_io_rounds_total`, `luxir_search_io_fetched_bytes_total`, `luxir_search_io_acquire_batches_total`, `luxir_search_io_acquire_rounds_total` | Storage I/O of finished searches: ranges acquired from storage that hands out held copies (zero on RAM and mmap) and their bytes, then the store requests, sequential rounds and fetched bytes a storage backend counted (zero on a backend that counts none), and the batches and sequential rounds of those acquires. A search's own counts are in its profile. |
 | `luxir_index_batches_total`, `luxir_index_batches_in_flight`, `luxir_index_batch_duration_seconds` | Index-batch processing inside the engine, excluding queueing and commit work. HTTP NDJSON can produce many batches per request. A batch fails only when none of it applied. |
 | `luxir_ingest_documents_total`, `luxir_ingest_delete_ids_total` | Documents accepted into indexing or rejected/rolled back, and accepted delete IDs. Acceptance does not mean durability; commits can still fail. Deletes count submitted IDs, not matched documents. |
 | `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
@@ -897,6 +897,17 @@ Search has its own limits:
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state and prefix top-term selection; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
+- `search.read-ahead-max-bytes` caps what one search acquires ahead of its
+  reads on storage whose files do not hand out free views, such as a remote
+  backend (default `256MB`; `0` is unlimited). A search declares the parts it
+  will read in each segment (term routing data, the term blocks and postings
+  its lookups land in, live docs, the norms its scorers read) and acquires
+  them in a few rounds, each issued together across segments, without a
+  worker waiting on them. Past the cap, the rest is acquired on demand as the
+  search reads it. A round that has not ended by the request's deadline fails
+  the search with `UNAVAILABLE` and reason `deadline_exceeded`; a cancelled
+  request stops at the round it is waiting on. RAM and mmap storage declare
+  nothing.
 - Multi-term expansion limits are operator opt-ins, all off by default (`0`).
   With limits off, broad patterns on high-cardinality fields simply run. Operators
   exposing public endpoints can bound this work using the following options.

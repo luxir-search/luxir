@@ -603,6 +603,8 @@ struct ServiceStats {
   uint64_t search_io_requests = 0;
   uint64_t search_io_rounds = 0;
   uint64_t search_io_fetched_bytes = 0;
+  uint64_t search_io_acquire_batches = 0;
+  uint64_t search_io_acquire_rounds = 0;
   ActivityStats index_batches;
   uint64_t documents_accepted = 0;
   uint64_t documents_rejected = 0;
@@ -1174,6 +1176,8 @@ struct ExecutionProfile {
   std::uint64_t io_requests = 0;
   std::uint64_t io_rounds = 0;
   std::uint64_t io_fetched_bytes = 0;
+  std::uint64_t io_acquire_batches = 0;
+  std::uint64_t io_acquire_rounds = 0;
 };
 struct SearchResponse {
   std::string_view commit;

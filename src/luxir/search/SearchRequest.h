@@ -32,6 +32,8 @@
 
 namespace luxir {
 
+class DeclaredReads;
+
 class FanoutScope;
 class SearchEngine;
 class SearchResponse;
@@ -96,6 +98,12 @@ public:
   // A transport sets the deadline and fill hint before dispatch; queryId,
   // requestId and counters are set by the constructor and submitBody.
   IoContext io;
+  // The reads the request declares ahead of parse and of execution; null on
+  // a reader whose files all hand out free views.
+  std::unique_ptr<DeclaredReads> declaredReads;
+  // The request body's execution metric, which spans rounds the request
+  // resumes from on another thread.
+  MetricScope execution;
   uint64_t flags = 0;             // effective packed options, resolved during parsing
   // Shared by every query tree of the request: one allowance for all of its
   // prefix/wildcard/regex/range/fuzzy dictionary work.

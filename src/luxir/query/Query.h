@@ -11,6 +11,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -337,6 +338,43 @@ struct CachedTermInfo {
   int32_t docFreq(int32_t segmentOrd) const {
     auto* state = postingsStates[segmentOrd];
     return state == nullptr ? 0 : state->docFreq;
+  }
+};
+
+struct CachedFieldInfo;
+
+// A part a weight will read once it executes, registered while the weight is
+// built so that the search can acquire it ahead of execution, together with
+// the other segments' (DeclaredReads). Per segment it resolves to slices of
+// the field's record.
+struct PlannedRead {
+  enum class Kind : uint8_t {
+    NORMS,  // the norms a scorer reads, and the docs bitmap of sparse norms
+  };
+  Kind kind;
+  IndexReader* view;
+  CachedFieldInfo* field;
+  const CachedTermInfo* term;  // Only the segments holding the term; null for every segment.
+};
+
+// Where the weights of one request register their PlannedReads. Weights are
+// built while planning, but one built later, on any thread, is safe: what
+// arrives after the search read ahead is ignored and read on demand.
+class PlannedReads {
+  std::mutex mutex;
+  std::vector<PlannedRead> reads;
+  bool closed = false;
+
+public:
+  void add(const PlannedRead& read) {
+    std::lock_guard lock(mutex);
+    if (!closed) reads.push_back(read);
+  }
+  // What was registered; later registrations are ignored.
+  std::vector<PlannedRead> take() {
+    std::lock_guard lock(mutex);
+    closed = true;
+    return std::move(reads);
   }
 };
 
@@ -1262,6 +1300,9 @@ public:
     Limits limits;
     std::vector<api::Warning>* warnings = nullptr;
     ExecutionProfileSink* profiles = nullptr;
+    // Where weights register the parts they will read, when the search
+    // acquires them ahead (DeclaredReads); null otherwise.
+    PlannedReads* plannedReads = nullptr;
 
     PlanningContext(
         MemPool& pool, IndexReader& topReader, Limits limits = {},
@@ -1561,6 +1602,11 @@ public:
 
     void warn(std::string_view code, std::string_view message) {
       planning.warn(code, message);
+    }
+
+    // Registers a part the weight being built will read; see PlannedRead.
+    void planRead(PlannedRead::Kind kind, CachedFieldInfo& field, const CachedTermInfo* term = nullptr) {
+      if (planning.plannedReads) planning.plannedReads->add({kind, &topReader, &field, term});
     }
 
     // return number of segments

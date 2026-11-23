@@ -147,6 +147,7 @@ public:
                   hasNorms));
           if (!query.hasInjectedStats()) cachedTermInfo->simScorer = simScorer;
         }
+        context.planRead(PlannedRead::Kind::NORMS, *cachedFieldInfo, cachedTermInfo);
       }
     }
 

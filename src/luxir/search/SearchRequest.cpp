@@ -6,6 +6,7 @@
 #include <cassert>
 
 #include "SearchEngine.h"
+#include "DeclaredReads.h"
 #include "OwnershipRelation.h"
 #include "luxir/api/build.h"
 #include "luxir/search/SearchOverrides.h"
@@ -51,9 +52,11 @@ OwnershipRelation& SearchRequest::ownershipRelation(IndexReader& many, IndexRead
 Query::PlanningContext* SearchRequest::createPlanningContext(IndexReader& view) {
   Query::PlanningContext::Limits limits;
   limits.multiTermBudget = &multiTermBudget;
-  return arenaCreate<Query::PlanningContext>(arena, requestPool, view, limits, &warnings,
+  auto* planning = arenaCreate<Query::PlanningContext>(arena, requestPool, view, limits, &warnings,
       FilterKeyContext{.schemaGen = schema->gen_, .timeZone = proto.time_zone},
       uses(view), &memoryTracker, proto.profile ? this : nullptr);
+  if (declaredReads) planning->plannedReads = &declaredReads->plannedReads();
+  return planning;
 }
 
 SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
@@ -151,6 +154,8 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
       profile.io_requests = ioTotals.requests;
       profile.io_rounds = ioTotals.rounds;
       profile.io_fetched_bytes = ioTotals.fetchedBytes;
+      profile.io_acquire_batches = ioTotals.acquireBatches;
+      profile.io_acquire_rounds = ioTotals.acquireRounds;
     }
     if (!ioTotals.empty()) {
       auto& metrics = engine.metrics();
@@ -159,6 +164,8 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
       metrics.add(MetricCounter::SEARCH_IO_REQUESTS, ioTotals.requests);
       metrics.add(MetricCounter::SEARCH_IO_ROUNDS, ioTotals.rounds);
       metrics.add(MetricCounter::SEARCH_IO_FETCHED_BYTES, ioTotals.fetchedBytes);
+      metrics.add(MetricCounter::SEARCH_IO_ACQUIRE_BATCHES, ioTotals.acquireBatches);
+      metrics.add(MetricCounter::SEARCH_IO_ACQUIRE_ROUNDS, ioTotals.acquireRounds);
     }
     if (!warnings.empty()) engine.metrics().add(MetricCounter::SEARCH_WARNINGS);
     if (counting) count(lastResponse->proto.error ? MetricOutcome::ERROR : MetricOutcome::OK, end);
