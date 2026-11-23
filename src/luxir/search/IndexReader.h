@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "DocSet.h"
+#include "LiveDocsMemory.h"
 #include "Similarity.h"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/SegmentCore.h"
@@ -35,22 +36,26 @@ struct CommitSnapshot;
 /// LiveDocs holds the live document bitmap for a segment
 class LiveDocs {
 private:
-  BitDocSet docSet;                                   // The actual bitset (memory mapped)
-  std::shared_ptr<InputFile> deleteFile;              // Keep file alive for memory mapping
+  std::shared_ptr<InputFile> deleteFile;
+  HeldRange deleteHold;
   std::unique_ptr<uint64_t[]> ownedWords;
-  size_t derivedBytes = 0;
+  BitDocSet docSet;
+  // Charged with heapBytes() while this LiveDocs owns its bitmap; null when mapped.
+  LiveDocsMemory::Counter* memory = nullptr;
   mutable std::mutex rankLiveMutex;
   mutable std::vector<std::pair<std::string, std::unique_ptr<const RankLiveBitmap>>> rankLiveViews;
 
 public:
   LiveDocs() : docSet(FixedBitSet(nullptr, 0)) {}
 
-  LiveDocs(uint64_t* mappedMemory, int32_t maxDocCount, 
-           std::shared_ptr<InputFile>&& file, int32_t numLive)
-      : docSet(FixedBitSet(mappedMemory, maxDocCount), numLive),
-        deleteFile(std::move(file)) {}
+  LiveDocs(uint64_t* bits, int32_t maxDocCount, std::shared_ptr<InputFile> file,
+           HeldRange hold, int32_t numLive)
+      : deleteFile(std::move(file)), deleteHold(std::move(hold)),
+        docSet(FixedBitSet(bits, maxDocCount), numLive) {}
 
-  LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive);
+  // A heap bitmap, charged to `counter` until destroyed: a child view derived from
+  // root deletes, or a root generation expanded from a SPARSE live docs file.
+  LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive, LiveDocsMemory::Counter& counter);
   ~LiveDocs();
 
   // Static factory method to create LiveDocs from delete bitmap file.  Do not call this if liveGen is 0 (no
@@ -82,6 +87,11 @@ public:
   // Get the underlying BitDocSet for direct access
   BitDocSet& docset() {
     return docSet;
+  }
+
+  // Bytes this LiveDocs holds on the heap; 0 for a mapped DENSE file.
+  size_t heapBytes() const {
+    return ownedWords ? sizeof(*this) + FixedBitSet::sizeInWords(size()) * sizeof(uint64_t) : 0;
   }
 
   int32_t numDeletes() const {

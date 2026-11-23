@@ -97,7 +97,8 @@ IndexInfoHolder readIndexInfo(Directory& dir) {
 std::unique_ptr<faiss::Index> readFaissIndex(Directory& dir, std::string_view fname) {
   auto file = dir.openFile(fname);
   EXPECT_NE(file, nullptr);
-  auto bytes = file->read();
+  auto hold = file->acquire({0, file->size()});
+  auto bytes = hold.bytes();
   faiss::VectorIOReader r;
   r.data.assign((const uint8_t*)bytes.data(), (const uint8_t*)bytes.data() + bytes.size());
   return std::unique_ptr<faiss::Index>(faiss::read_index(&r));
@@ -387,7 +388,8 @@ TEST_F(VectorIndexBuilderTest, ivfListsServeIdenticallyFromFsDirectoryMmap) {
     FSDirectory fsDir(tmp);
     auto src = shardDir.openFile(aux.files[0].name);
     ASSERT_NE(src, nullptr);
-    auto bytes = src->read();
+    auto hold = src->acquire({0, src->size()});
+    auto bytes = hold.bytes();
     auto dst = fsDir.createFile(aux.files[0].name);
     OutputStream os;
     os.setFile(&*dst);
@@ -702,10 +704,13 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
   EXPECT_EQ(rebuilt.gen, 1u);
   EXPECT_NE(rebuilt.files[0].name, firstFile);
   EXPECT_TRUE(std::string(rebuilt.files[0].name).ends_with("_01." + Postings::epochString(info2->writer_epoch) + "_00")) << rebuilt.files[0].name;
-  auto bytes = h.getIndexWriter()->snapshots.openFile(pin->id, firstFile)->read();
   auto desc = std::ranges::find(pin->files, firstFile, &FileDescriptor::name);
   ASSERT_NE(desc, pin->files.end());
-  EXPECT_EQ(desc->xxh3, XXH3_64bits(bytes.data(), bytes.size()));
+  {
+    auto file = h.getIndexWriter()->snapshots.openFile(pin->id, firstFile);
+    auto hold = file->acquire({0, file->size()});
+    EXPECT_EQ(desc->xxh3, XXH3_64bits(hold.getData(), hold.getLength()));
+  }
   EXPECT_EQ(desc->size, h.getIndexWriter()->snapshots.stats().retainedBytes);
   h.getIndexWriter()->snapshots.testEvictOldest();
   EXPECT_EQ(h.getIndexWriter()->dir.openFile(firstFile), nullptr);

@@ -43,6 +43,8 @@
 
 namespace luxir {
 
+static_assert(kReadSlack == SVB_OVERREAD_PAD);
+
 struct WrittenPoints {
   field_parts::Points points;
   field_parts::Bounds bounds;

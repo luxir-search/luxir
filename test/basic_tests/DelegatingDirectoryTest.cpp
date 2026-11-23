@@ -47,7 +47,7 @@ TEST(DelegatingDirectoryTest, everyVirtualForwards) {
   ASSERT_EQ(3u, listing.size());
   EXPECT_EQ("a.bin", listing[0].name);
   EXPECT_EQ(5u, listing[0].size);
-  EXPECT_EQ(ram->openFile("a.bin"), dir.openFile("a.bin", true));
+  EXPECT_EQ(ram->openFile("a.bin"), dir.openFile("a.bin", {.expectSynced = true}));
   EXPECT_EQ(nullptr, dir.openFile("missing"));
   EXPECT_EQ(&*ram, &dir.underlying());
 
@@ -186,8 +186,11 @@ TEST(DelegatingDirectoryTest, reuseFilesLinksOrCopiesByCapability) {
   for (const auto& file : files) {
     auto copy = copied.openFile(file.name);
     ASSERT_NE(nullptr, copy);
-    EXPECT_NE(source.openFile(file.name), copy);  // a distinct buffer with the same bytes
-    EXPECT_EQ(source.openFile(file.name)->read(), copy->read());
+    auto original = source.openFile(file.name);
+    EXPECT_NE(original, copy);  // a distinct buffer with the same bytes
+    auto originalHold = original->acquire({0, original->size()});
+    auto copyHold = copy->acquire({0, copy->size()});
+    EXPECT_EQ(std::string_view(originalHold.bytes()), std::string_view(copyHold.bytes()));
     EXPECT_EQ(file, describe(copied, file.name));
   }
   // Present files are left to the caller to verify, as before.

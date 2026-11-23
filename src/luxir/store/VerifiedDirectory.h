@@ -18,11 +18,11 @@ public:
     for (const auto& item : verification.items) held.emplace(item.file.name, &item);
   }
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) override {
     auto it = held.find(name);
-    if (it == held.end()) return delegate.openFile(name, expectSynced);
+    if (it == held.end()) return delegate.openFile(name, options);
     const auto& item = *it->second;
-    if (expectSynced) delegate.expectSynced(std::span(&item.file, 1));
+    if (options.expectSynced) delegate.expectSynced(std::span(&item.file, 1));
     return item.reader->map();
   }
 

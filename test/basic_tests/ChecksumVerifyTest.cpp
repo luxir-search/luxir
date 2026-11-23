@@ -155,7 +155,8 @@ TEST_F(ChecksumVerifyTest, verifiedReaderSurvivesUnlinkAndViewLifetime) {
     std::vector<std::string> names;
     for (const auto& descriptor : snapshot->files) {
       auto input = registry.dir.openFile(descriptor.name);
-      auto bytes = input->read();
+      auto hold = input->acquire({0, input->size()});
+      auto bytes = hold.bytes();
       auto file = dir.createFile(descriptor.name);
       OutputStream out(file.get()); out.write(bytes.data(), bytes.size()); out.close();
       dir.finishFile(*file);
@@ -167,7 +168,7 @@ TEST_F(ChecksumVerifyTest, verifiedReaderSurvivesUnlinkAndViewLifetime) {
       verification.open(dir, snapshot->files, true, {});
       verification.run();
       VerifiedDirectory source(dir, verification);
-      EXPECT_THROW(source.openFile(names.front(), true), std::runtime_error);
+      EXPECT_THROW(source.openFile(names.front(), {.expectSynced = true}), std::runtime_error);
       dir.sync(names);
       for (const auto& name : names) ASSERT_TRUE(dir.deleteFile(name));
       ReaderManager readers(dir);
@@ -414,7 +415,9 @@ TEST_F(ChecksumVerifyTest, checksumPrimitiveAndVerification) {
     // The handle outlives the name.
     auto reader = dir->openChecksum("s0_a", true);
     dir->deleteFile("s0_a");
-    EXPECT_EQ(bytes, reader->map()->read()); // mmap also accepts the O_DIRECT descriptor
+    auto file = reader->map(); // mmap also accepts the O_DIRECT descriptor
+    auto hold = file->acquire({0, file->size()});
+    EXPECT_EQ(bytes, std::string_view(hold.bytes()));
     EXPECT_TRUE(reader->checksum().matches(good));
 
     FileDescriptor missing{"s0_none", 1, 1};

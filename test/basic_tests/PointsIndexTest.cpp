@@ -52,7 +52,8 @@ void withPointsOptions(std::span<const Point> expected,
   dir.finishFile(*file);
 
   auto inputFile = dir.openFile("points");
-  InputStream input = inputFile->getInputStream();
+  auto hold = inputFile->acquire({0, inputFile->size()});
+  InputStream input = hold.stream();
   PointsReader reader(input, data.pointsStart, data.pointsMetaOff, data.directoryBytes);
   reader.validate();
   EXPECT_EQ(expected.size(), reader.pointCount());

@@ -26,7 +26,7 @@ class TermsEnum {
   friend class DocsEnum;
   friend class ScanTermsEnum;
 
-  InputStream termsIS;  // Dictionary input, addressed by absolute file offset.
+  InputStream termsIS;  // Dictionary blocks for this field.
   SegmentCore& segmentCore;
 
   const field_parts::Terms* termData;  // Null for a field without a dictionary.
@@ -60,8 +60,8 @@ class TermsEnum {
   int32_t termBlockIndex = -1; // what term block are we currently in
   int64_t startingOrd = 0;  // Ordinal of the block's first term.
   int32_t maxOrdInBlock = -1;  // Local ordinal of the last term.
-  int64_t locOfDocsForTermBlock = 0;  // File offset of this block's docs.
-  int64_t locOfPositionsForTermBlock = 0;  // File offset of this block's positions.
+  int64_t locOfDocsForTermBlock = 0;  // Offset within the run's docs stream.
+  int64_t locOfPositionsForTermBlock = 0;  // Offset within the run's positions stream.
   const char* termHashes = nullptr;  // One hash byte per term in the block.
   uint8_t blockPrefixLen = 0;
   uint32_t pulsedMask = 0;  // One bit per term with inline postings.
@@ -115,12 +115,9 @@ class TermsEnum {
   int32_t runCount = 0;
   int64_t runLastTermOrd = -1;  // Last term ordinal in the current run.
   int32_t runEndBlockOrd = 0;  // one past the current run's last block ord
-  // Cached file offsets for the current run so
-  // the per-block and per-term hot paths never chase the run pointer.
+  // Cached offsets within termsIS for the current run.
   int64_t runTermsBase = 0;
   int64_t runTermsEnd = 0;
-  int64_t runDocsBase = 0;
-  int64_t runPosBase = 0;
   InputStream runDocs;
   InputStream runPositions;
 
@@ -142,6 +139,7 @@ public:
     InputStream docIS;
     InputStream posIS;
     EncodedImpactFrontier termImpactFrontier;
+    // Offsets are relative to docIS and posIS, respectively.
     int64_t docsStart = 0;
     int64_t docsEnd = 0;
     int64_t posStart = 0;
@@ -155,17 +153,22 @@ public:
     bool hasPositions = false;
   };
 
-  // The decoded record and mapped bytes must outlive the enum.
+  // The decoded record and segment core must outlive the enum.
   TermsEnum(MemPool& pool, PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
       : segmentCore(reader.core()), termData(fieldInfo.terms()), totals(fieldInfo.indexedTotals()),
         flags(fieldInfo.flags), currTerm(pool.alloc(TERM_BUFFER_BYTES), 0) {
     if (!termData) return;
-    termsIS = streamThrough(termData->dictionaryBlocks());
     auto blockOffsets = fieldInfo.termBlockOffsets();
-    auto offsets = segmentCore.getInputStreamSeek(blockOffsets.location);
-    termBlockOffsets = reinterpret_cast<const field_parts::Terms::BlockOffset*>(offsets.ptr());
+    auto trie = field_parts::termTrie(blockOffsets, termData->trieBytes);
+    // The blocks are data; the offsets and trie that route to them are
+    // metadata and follow the blocks, so the 16 bytes past a hold cover the
+    // decoders' over-read.
+    termsIS = streamThrough(termData->dictionaryBlocks());
+    auto navigation = segmentCore.slice(
+        {blockOffsets.location, trie.end().offset() - blockOffsets.location.offset()}, ReadClass::METADATA);
+    termBlockOffsets = reinterpret_cast<const field_parts::Terms::BlockOffset*>(navigation.data());
     numTermBlocks = (int32_t)(blockOffsets.bytes / sizeof(field_parts::Terms::BlockOffset));
-    trieBase = segmentCore.getInputStreamSeek(fieldInfo.termTrie().location).ptr();
+    trieBase = navigation.data() + blockOffsets.bytes;
     runCount = (int32_t)termData->runs.size();
     runs = termData->runs.data();
     selectRun(runs);
@@ -244,7 +247,7 @@ public:
       const auto& sourceRun = runs[runOrd];
       int32_t firstBlock = sourceRun.firstBlockOrd;
       int32_t endBlock = runEndBlock(termData->runs, runOrd, numTermBlocks);
-      auto sourceBase = (int64_t)(termData->location.offset() + sourceRun.dictionaryStart);
+      auto sourceBase = (int64_t)sourceRun.dictionaryStart;
       int32_t count = endBlock - firstBlock;
       assert(count > 0);
       int32_t samples = (count - 1) / stride + 1;
@@ -675,9 +678,8 @@ protected:
   }
 
   InputStream streamThrough(field_parts::Slice slice) const {
-    auto file = segmentCore.getInputStream(slice.location.filenum());
-    // Postings and position cursors use file-relative offsets.
-    return {file.ptr(0), file.ptr(slice.end().offset())};
+    auto bytes = segmentCore.slice(slice);
+    return {bytes.data(), bytes.data() + bytes.size()};
   }
 
   // Kept out of line so switching runs adds nothing to the block decode path.
@@ -703,11 +705,8 @@ protected:
     bool hasNext = run + 1 != runs + runCount;
     runLastTermOrd = hasNext ? (run + 1)->firstTermOrd - 1 : totals.numTerms - 1;
     runEndBlockOrd = hasNext ? (run + 1)->firstBlockOrd : numTermBlocks;
-    auto base = termData->location.offset();
-    runTermsBase = (int64_t)(base + run->dictionaryStart);
-    runTermsEnd = (int64_t)(base + (hasNext ? (run + 1)->dictionaryStart : termData->dictionaryBytes));
-    runDocsBase = run->docs ? (int64_t)run->docs.location.offset() : 0;
-    runPosBase = run->positions ? (int64_t)run->positions.location.offset() : 0;
+    runTermsBase = (int64_t)run->dictionaryStart;
+    runTermsEnd = (int64_t)(hasNext ? (run + 1)->dictionaryStart : termData->dictionaryBytes);
     runDocs = run->docs ? streamThrough(run->docs) : InputStream();
     runPositions = run->positions ? streamThrough(run->positions) : InputStream();
   }
@@ -724,9 +723,8 @@ protected:
   // metadata.  Those happen on demand in decodeStats and decodePostings.
   void readTermBlock() {
     // Common case (and always, for a single run): the block stays on the
-    // current run; only re-resolve on a run boundary.  The whole dictionary
-    // (the runs, block offsets and trie) lives in one
-    // stream, so termsIS never needs reopening - only seeking.
+    // current run; only re-resolve on a run boundary.  Every run's blocks
+    // live in one stream, so termsIS never needs reopening - only seeking.
     if (termBlockIndex < run->firstBlockOrd
         || termBlockIndex >= runEndBlockOrd) [[unlikely]] {
       reselectRunForBlock(termBlockIndex);
@@ -742,8 +740,8 @@ protected:
 
     // see TextWriter::flushTerms
     startingTerm = termsIS.readPackedTerm();
-    locOfDocsForTermBlock = runDocsBase + (int64_t) termsIS.readVlong();
-    locOfPositionsForTermBlock = runPosBase + (int64_t) termsIS.readVlong();
+    locOfDocsForTermBlock = (int64_t)termsIS.readVlong();
+    locOfPositionsForTermBlock = (int64_t)termsIS.readVlong();
     blockPrefixLen = (uint8_t) termsIS.readByte();
     memcpy(&pulsedMask, termsIS.ptr(), sizeof(pulsedMask));
     termsIS.skip(sizeof(pulsedMask));

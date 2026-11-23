@@ -16,7 +16,7 @@ enum class CheckedDirMode {
 
 /// Directory wrapper that validates fsync correctness and optionally logs operations.
 /// Tracks files that have been finished via finishFile() but not yet synced via sync().
-/// When openFile() is called with expectSynced=true on such a file, it reports the
+/// When openFile() is called with expectSynced set on such a file, it reports the
 /// gap - either as a log warning (production) or an exception (tests).
 ///
 /// Files that already existed in the directory before this wrapper was created
@@ -50,16 +50,16 @@ public:
     return delegate->openChecksum(name, direct);
   }
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
-    if (expectSynced) {
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) override {
+    if (options.expectSynced) {
       std::lock_guard lock(mu_);
       auto it = unsyncedFiles_.find(std::string(name));
       if (it != unsyncedFiles_.end()) {
         reportUnsynced("expectSynced openFile", *it);
       }
     }
-    if (verbose_) LOG_DEBUG("CheckedDirectory: openFile({}, expectSynced={})", name, expectSynced);
-    return delegate->openFile(name, expectSynced);
+    if (verbose_) LOG_DEBUG("CheckedDirectory: openFile({}, expectSynced={})", name, options.expectSynced);
+    return delegate->openFile(name, options);
   }
 
   // Readers share an open segment rather than reopening it, so most reads
@@ -163,7 +163,7 @@ public:
   }
 
   void linkFile(Directory& source, std::string_view name) override {
-    source.openFile(name, true);
+    source.openFile(name, {.expectSynced = true});
     delegate->linkFile(source, name);
   }
 };

@@ -1347,7 +1347,9 @@ TEST_F(IndexWriterTest, requestBirthBlocksRejectCorruption) {
     auto trailerOff = output.finish(count);
     stream.close();
     dir.finishFile(*file);
-    auto bytes = dir.openFile("runs")->read();
+    auto input = dir.openFile("runs");
+    auto hold = input->acquire({0, input->size()});
+    auto bytes = hold.bytes();
     std::vector<char> corrupt(bytes.begin(), bytes.end());
     auto* header = (VersionRunsHeader*)(corrupt.data() + trailerOff);
     if (directoryDamage) {
@@ -3344,7 +3346,7 @@ TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
   writerSnapshots.onChange = [&]() noexcept { changes++; };
   Signal::listen("manifestDurable", [&](void* source, void*, void*) -> void* {
     if (source != &writer) return nullptr; // another test's background merge
-    EXPECT_NE(nullptr, dir.openFile(Manifest::name(before->index_gen + 1, before->writer_epoch), true));
+    EXPECT_NE(nullptr, dir.openFile(Manifest::name(before->index_gen + 1, before->writer_epoch), {.expectSynced = true}));
     throw std::runtime_error("injected publication failure");
   });
   auto unlisten = scope_guard([] { Signal::unlisten("manifestDurable"); });
@@ -3401,7 +3403,7 @@ TEST_F(IndexWriterTest, filesystemCommitsSyncSegmentDataAndDeletes) {
     if (source == &writer->dir.underlying()) {
       auto manifest = test::readDurableIndexInfo(writer->dir);
       for (const auto& file : test::manifestFiles(*manifest)) {
-        EXPECT_NE(nullptr, writer->dir.openFile(file.name, true));
+        EXPECT_NE(nullptr, writer->dir.openFile(file.name, {.expectSynced = true}));
       }
     }
     return nullptr;
@@ -3420,7 +3422,7 @@ TEST_F(IndexWriterTest, filesystemCommitsSyncSegmentDataAndDeletes) {
     EXPECT_TRUE(deletes);
     test::expectValidInventory(writer->dir, *manifest);
     for (const auto& file : test::manifestFiles(*manifest)) {
-      EXPECT_NE(nullptr, writer->dir.openFile(file.name, true));
+      EXPECT_NE(nullptr, writer->dir.openFile(file.name, {.expectSynced = true}));
     }
   }
   ASSERT_TRUE(helper.deleteById("replace", UpdateMessage::COMMIT).success);
@@ -3477,7 +3479,9 @@ TEST_F(IndexWriterTest, recoverySkipsTornCandidatesAndChecksFallbackPresence) {
     uint64_t candidate = before->index_gen + 1;
     std::vector<char> corrupt;
     if (damage == 1) {
-      auto bytes = dir.openFile(Manifest::name(before->index_gen, before->writer_epoch))->read();
+      auto input = dir.openFile(Manifest::name(before->index_gen, before->writer_epoch));
+      auto hold = input->acquire({0, input->size()});
+      auto bytes = hold.bytes();
       corrupt.assign(bytes.begin(), bytes.end());
       corrupt.back() ^= 1;
     }

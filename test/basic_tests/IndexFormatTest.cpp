@@ -43,8 +43,8 @@ namespace {
 // The digest of the reference index written by IndexFormat::VERSION. A byte
 // change requires reviewing the format version. Writer choices among layouts
 // already supported by that version can change the digest within the version.
-constexpr uint64_t kReferenceVersion = 16;
-constexpr uint64_t kReferenceDigest = 0x546d55a9c469d50d;
+constexpr uint64_t kReferenceVersion = 17;
+constexpr uint64_t kReferenceDigest = 0x8df212bff9a64ad9;
 
 // A small index over every default field template's kind, with three segments
 // and a delete. Each segment is one request flushed by a single inverter.
@@ -229,7 +229,7 @@ TEST_F(IndexFormatTest, referenceIndexBytesMatchFormatVersion) {
 TEST_F(IndexFormatTest, serialRootMergeBytesMatchReference) {
   auto digest = buildMergedReferenceDigest();
   ASSERT_EQ(digest, buildMergedReferenceDigest()) << "the serial merge is not deterministic";
-  EXPECT_EQ(0xe402da4c8227236eULL, digest) << std::format("merged digest {:#x}", digest);
+  EXPECT_EQ(0x2ca76afa0391dcf9ULL, digest) << std::format("merged digest {:#x}", digest);
 }
 
 TEST_F(IndexFormatTest, otherFormatVersionFailsToLoad) {
@@ -379,7 +379,8 @@ TEST_F(IndexFormatTest, malformedSegmentMetadataThrows) {
   auto wireFiles = toWire(files, arena);
   segment.files = wireFiles;
   auto originalBytes = original.openFile(file);
-  std::string_view bytes = originalBytes->read();
+  auto hold = originalBytes->acquire({0, originalBytes->size()});
+  std::string_view bytes(hold.bytes());
   auto footer = bytes.size() - sizeof(uint64_t);
   auto length = loadUnaligned<uint64_t>(bytes.data() + footer);
   InputStream in(bytes.data() + footer - length, bytes.data() + footer);
@@ -456,6 +457,9 @@ TEST_F(IndexFormatTest, malformedSegmentMetadataThrows) {
     auto manifest = segment;
     corrupt(changed, manifest);
     writeFile(copy, file, changed);
+    // An open reads every file the manifest lists, so the one the catalog
+    // does not know exists, and the inventory check is what rejects it.
+    writeFile(copy, unknownFile, bytes);
     expectCorrupt([&] { SegmentCore::create(copy, manifest); }, namesFile ? file : segmentName, reason);
   }
 }
@@ -473,7 +477,8 @@ TEST_F(IndexFormatTest, invalidSpacePathAndRootCount) {
   ASSERT_TRUE(writer.finish());
 
   auto file = dir.openFile(Postings::getIndexFileName(Postings::segmentKey(1, 1), Postings::PRIMARY_FILE));
-  auto original = file->read();
+  auto hold = file->acquire({0, file->size()});
+  std::string_view original(hold.bytes());
   auto footer = original.size() - sizeof(uint64_t);
   auto length = loadUnaligned<uint64_t>(original.data() + footer);
   auto directoryStart = footer - length;
@@ -505,10 +510,13 @@ TEST_F(IndexFormatTest, opensCatalogFromCopiedRange) {
   auto source = SegmentCore::source(segment.seg_id, segment.creator_epoch, range,
                                      segment.max_doc, files);
   auto name = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
-  auto file = dir.openFile(name);
   ASSERT_GT(range.offset, 0u);
-  std::string bytes(file->read().substr(range.offset, range.length));
-  file.reset();
+  std::string bytes;
+  {
+    auto file = dir.openFile(name);
+    auto hold = file->acquire({range.offset, range.length});
+    bytes.assign(hold.getData(), hold.getLength());
+  }
 
   auto head = SegmentCatalog::readDirectory(bytes, range.offset, source.files[0]);
   auto catalog = SegmentCatalog::decode(head, source.files);
@@ -537,7 +545,9 @@ TEST_F(IndexFormatTest, corruptFieldPrefixRespectsVerificationPolicy) {
   std::vector<Directory::FileInfo> files;
   dir.listFiles(files);
   for (const auto& descriptor : files) {
-    std::string bytes(dir.openFile(descriptor.name)->read());
+    auto input = dir.openFile(descriptor.name);
+    auto hold = input->acquire({0, input->size()});
+    std::string bytes(hold.getData(), hold.getLength());
     if (descriptor.name == file) {
       field = bytes.substr(entry + 1, (uint8_t)bytes[entry]);
       bytes[entry + 1 + field.size()] = 0x7f; // invalid field type, after the still-readable name

@@ -60,15 +60,7 @@ struct Manifest {
   static bool indexFile(std::string_view name) {
     if (name.ends_with(".tmp")) return false;
     if (candidate(name).first || SchemaBinding::isFile(name)) return true;
-    if (!name.starts_with("s")) return false;
-    auto dot = name.find('.'), underscore = name.find('_');
-    if (dot == std::string_view::npos || underscore == std::string_view::npos || dot >= underscore) return false;
-    auto sortable = [](std::string_view text) {
-      return !text.empty() && Postings::getSortableString(Postings::parseSortableString(text)) == text;
-    };
-    auto seg = name.substr(1, dot - 1);
-    if (!sortable(seg) || !Postings::parseEpoch(name.substr(dot + 1, underscore - dot - 1))) return false;
-    auto suffix = name.substr(underscore + 1);
+    auto suffix = segmentFileSuffix(name);
     if (!suffix.starts_with('_')) return sortable(suffix);
     suffix.remove_prefix(1);
     if (suffix.starts_with('L') && suffix.find('_') == std::string_view::npos) suffix.remove_prefix(1);
@@ -80,11 +72,34 @@ struct Manifest {
       if (generation == std::string_view::npos || generation == 0) return false;
       suffix.remove_prefix(generation + 1);
     }
-    dot = suffix.find('.');
+    auto dot = suffix.find('.');
     return dot != std::string_view::npos && sortable(suffix.substr(0, dot))
         && Postings::parseEpoch(suffix.substr(dot + 1));
   }
 
+  // A base segment data file's number, or nullopt for any other name.
+  static std::optional<uint64_t> segmentDataFileNumber(std::string_view name) {
+    auto suffix = segmentFileSuffix(name);
+    if (!sortable(suffix)) return std::nullopt;
+    return Postings::parseSortableString(suffix);
+  }
+  static bool segmentDataFile(std::string_view name) { return segmentDataFileNumber(name).has_value(); }
+
+private:
+  static bool sortable(std::string_view text) {
+    return !text.empty() && Postings::getSortableString(Postings::parseSortableString(text)) == text;
+  }
+
+  static std::string_view segmentFileSuffix(std::string_view name) {
+    if (!name.starts_with(Postings::PREFIX_FNAME)) return {};
+    auto dot = name.find('.'), underscore = name.find('_');
+    if (dot == std::string_view::npos || underscore == std::string_view::npos || dot >= underscore) return {};
+    auto seg = name.substr(Postings::PREFIX_FNAME.size(), dot - Postings::PREFIX_FNAME.size());
+    if (!sortable(seg) || !Postings::parseEpoch(name.substr(dot + 1, underscore - dot - 1))) return {};
+    return name.substr(underscore + 1);
+  }
+
+public:
   static api::IndexInfo decode(const Bytes& bytes, std::pmr::memory_resource& arena) {
     api::IndexInfo info;
     if (!bytes || !api::decode(info, api::copyToPaddedInput(*bytes, arena), arena)) {
@@ -111,8 +126,10 @@ struct Manifest {
   static Bytes read(Directory& dir, uint64_t gen, uint64_t epoch) {
     auto file = dir.openFile(name(gen, epoch));
     if (!file) return {};
-    auto input = file->getInputStream();
-    if (input.size() < 16) return {};
+    auto size = file->size();
+    if (size < 16) return {};
+    auto hold = file->acquire({0, size});
+    auto input = hold.stream();
     size_t length = input.size() - 16;
     auto data = (const std::byte*)input.ptr();
     input.seek(length);
@@ -208,7 +225,8 @@ struct Manifest {
     auto contents = withFooter(bytes);
     if (dir.publishFile(root[0], contents, Directory::PublishMode::CREATE_ONLY)) return;
     auto existing = dir.openFile(root[0]);
-    auto body = existing ? existing->read() : std::string_view{};
+    auto hold = existing ? existing->acquire({0, existing->size()}) : HeldRange{};
+    auto body = hold.bytes();
     if (body.size() != contents.size() || memcmp(body.data(), contents.data(), contents.size())) {
       throw std::runtime_error("manifest candidate name already contains different bytes");
     }

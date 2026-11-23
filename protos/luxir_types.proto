@@ -2054,6 +2054,12 @@ message MemoryStats {
   uint64 search_request_limit_bytes = 6;
   // Estimated parsed schema payload held by snapshots/readers, not allocator RSS.
   uint64 schema_cache_bytes = 7;
+  // Live docs generations loaded from sparse files and expanded to heap bitmaps,
+  // held by readers and in-flight writer work. Dense generations are mapped and
+  // not counted.
+  uint64 live_docs_heaps = 8;
+  // Heap bytes of those generations.
+  uint64 live_docs_heap_bytes = 9;
 }
 
 // Full catalog for a discovery cursor, scoped to this source boot.

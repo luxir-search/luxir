@@ -87,16 +87,16 @@ for the next startup.
 
 ## Reading from the store
 
-Readers work directly on mapped files or owned buffers, and FAISS IVF lists
-are scanned in place. For step 4 that means:
+Readers acquire the byte ranges they use (see held ranges below); on RAM and
+mmap a hold is a plain view into the buffer or mapping, and FAISS IVF lists are
+scanned in place. For step 4 that means:
 
 - The cache is charged to the node's budgets and evicts: on local disk under
   the page cache, or in RAM charged to the memory budget on a node without
   disk.
-- A reader uses only bytes that are local. The first implementation fetches
-  a segment's files whole before the segment opens, so readers do not
-  change. Later ones fetch just the ranges a query needs, as described
-  below. Checking fetched bytes against their digests is optional, as
+- A reader uses only bytes that are local. A first implementation can fetch
+  a segment's files whole before the segment opens. Later ones fetch just the
+  ranges a query needs, as described below. Checking fetched bytes against their digests is optional, as
   `--store.verify-on-open` is for local files today.
 - A segment's set of files does not depend on the storage backend.
 - A required fetch that still fails after bounded retries within the request
@@ -137,6 +137,74 @@ Fetching at those points, rather than on a page fault, lets a query collect
 the ranges it needs first, merge nearby ones, and issue them together.
 Object stores charge per request and each request has high latency, so
 faults served one at a time would be both slow and expensive.
+
+### Held ranges
+
+`InputFile::acquire({offset, length})` checks the range against the file size
+and returns a move-only `HeldRange`. The bytes stay valid until the hold is
+released, and a hold must be released before its `InputFile`. RAM and mmap
+return null-owner views valid for the file's lifetime and report `holdsFree()`;
+other backends release through the hold's `HoldOwner`.
+
+- A hold also makes readable the next 16 bytes of the file, as far as the file
+  extends, with unspecified contents, because SIMD decoders over-read by up to
+  that much. The format guarantees those bytes exist wherever a decoder reads
+  past a part: the writer pads every data-only file by 16 bytes, and the
+  catalog follows the data in file 0.
+- The data address is congruent to the file offset modulo 16, so alignment the
+  writer gave a structure in the file holds in memory.
+
+`InputFile::acquireBatch(ranges, done)` acquires a batch of ranges together,
+so a backend can merge them and issue them at once. It never throws: it
+calls `done` exactly once, possibly inline, from any thread, with one hold
+per range in the order requested or with an error and no holds, and every
+failure, including one to issue the batch, arrives that way. The holds
+follow the single-acquire contract. The default acquires each range in turn
+and completes inline, and `acquireAll(ranges)` blocks on the batch and
+returns its holds.
+
+A completion runs on a backend thread and takes the locks of whatever keeps
+the holds, such as a segment's holds lock. A caller must not hold, across a
+backend call, any lock that a batch completion takes: a backend that serves
+blocking acquires and completes batches on the same threads would deadlock.
+`SegmentCore::retain()` therefore acquires outside its holds lock.
+
+A segment reads every part through `SegmentCore::slice()`. Its
+`acquireSlices()` acquires parts ahead in one batch per file, skipping parts
+already held, and keeps the holds the same way. A manifest open acquires
+each file's header, the catalog range, the version runs and, for segments
+with nested spaces, the ownership ends and owners columns; never a whole
+segment file. It opens every file the manifest lists, then issues one batch
+per file: file 0's header with the catalog, every other file's header
+alone. A snapshot open issues the batches of all its new segments before it
+waits on any, so a backend that completes batches asynchronously serves
+every header and catalog in one round. A header's hold is released once
+checked. The version runs and a nested segment's ownership columns are
+still acquired after that round, one blocking acquire at a time per
+segment. Each segment's batches report failure to that segment, and the
+segments fail in order as if opened one at a time: the lowest failing
+segment's error surfaces, naming the segment, whichever batch completed
+first. The open takes the same path on every backend; files with free
+holds (RAM, mmap) differ only in that `slice()` retains nothing for them
+and `acquireSlices()` issues no batch. For now the segment keeps the holds
+it hands out until it closes, so nothing held is evicted; releasing holds
+when a request ends comes with a bounded cache.
+
+- A manifest open passes each file's recorded size to `Directory::openFile`
+  and checks it against `size()` once per file; after a sized open, `size()`
+  makes no request. A remote directory can keep a cached listing of its
+  prefix (names, sizes, ETags), answer `openFile` and `size()` from it, and
+  list again when a name is missing, so neither existence nor size costs a
+  request per file. With a passed size it needs the listing only for
+  existence.
+- Each acquire carries a `ReadClass`. `METADATA` marks what a reader navigates
+  by: file headers, the catalog, version runs, term block offsets and tries,
+  the stored-field chunk index, and the directories and indexes over column
+  and point blocks. Everything else, term blocks included, is `DATA`.
+  Whoever keeps a hold decides how long it lives: the segment for what it
+  keeps, a request for what it uses. The class is a hint a cache or backend
+  may use for residency and scheduling after release, and it never changes
+  the bytes returned. A part has one class whichever reader acquires it.
 
 The manifest identifies the segment catalog at the end of file 0 by offset,
 length and xxh3. The catalog holds a field table for each row space, then

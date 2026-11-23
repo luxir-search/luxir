@@ -70,8 +70,8 @@ TEST_F(CompoundFileTest, SmallAndEmptyCheckoutsUseFileZero) {
     EXPECT_EQ(0u, location.filenum());
     EXPECT_EQ(0u, location.offset() % MAX_ALIGN);
   }
-  EXPECT_EQ("first", std::string_view(core.getInputStreamSeek(first.location).ptr(), 5));
-  EXPECT_EQ("second", std::string_view(core.getInputStreamSeek(empty.location).ptr(), 6));
+  EXPECT_EQ("first", std::string_view(core.slice(first).data(), first.bytes));
+  EXPECT_EQ("second", std::string_view(core.slice(second).data(), second.bytes));
 }
 
 TEST_F(CompoundFileTest, ReservationCrossingCapacitySpills) {
@@ -109,12 +109,11 @@ TEST_F(CompoundFileTest, ReservationCrossingCapacitySpills) {
   ASSERT_TRUE(writer.finish(&files));
   ASSERT_EQ(2u, files.size());
   SegmentCore core(dir, 1, 1);
-  auto input = core.getInputStreamSeek(spill.location);
-  EXPECT_EQ(payload, std::string_view(input.ptr(), payload.size()));
-  input.skip(payload.size());
-  EXPECT_EQ('y', input.readByte());
-  EXPECT_EQ('z', input.readByte());
-  EXPECT_EQ(SVB_OVERREAD_PAD, input.left());
+  auto bytes = core.slice(spill);
+  std::string_view contents(bytes.data(), bytes.size());
+  EXPECT_EQ(payload, contents.substr(0, payload.size()));
+  EXPECT_EQ("yz", contents.substr(payload.size()));
+  EXPECT_EQ(spill.end().offset() + SVB_OVERREAD_PAD, core.getFile(spill.location.filenum())->size());
 }
 
 TEST_F(CompoundFileTest, FinishedSpillsAreReused) {
@@ -141,8 +140,8 @@ TEST_F(CompoundFileTest, FinishedSpillsAreReused) {
   ASSERT_TRUE(writer.finish(&files));
   EXPECT_EQ(2u, files.size());
   SegmentCore core(dir, 1, 1);
-  EXPECT_EQ('x', core.getInputStreamSeek(first.location).readByte());
-  EXPECT_EQ(payload, std::string_view(core.getInputStreamSeek(second.location).ptr(), payload.size()));
+  EXPECT_EQ('x', core.slice(first).front());
+  EXPECT_EQ(payload, std::string_view(core.slice(second).data(), second.bytes));
 }
 
 TEST_F(CompoundFileTest, BusySpillsGetNewFilesAndShortestFinishedFileIsReused) {
@@ -287,7 +286,7 @@ TEST_F(CompoundFileTest, MergeWithDeletesOmitsDensePresenceBitmap) {
   constexpr int32_t missing = numDocs / 2;
   auto words = screaming::FixedBitSet::allocate(numDocs + 1, true);
   screaming::FixedBitSet(words.get(), numDocs + 1).clear(missing);
-  LiveDocs liveDocs(std::move(words), numDocs + 1, numDocs);
+  LiveDocs liveDocs(std::move(words), numDocs + 1, numDocs, liveDocsMemory.sparseRoots);
   std::array<size_t, 2> sizes;
 
   for (bool sparse : {false, true}) {

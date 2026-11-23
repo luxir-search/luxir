@@ -439,6 +439,52 @@ forward it only if it preserves that guarantee. Incorrectly returning true can
 delete another node's data; returning false only costs availability. The core
 wrappers and the example `counting` layer forward it; `counting_ram` is exclusive.
 
+### Reading files
+
+`Directory::openFile` returns an `InputFile` with `size()`, advisory
+`prefetch(offset, length)`, and `acquire({offset, length})`. Reject ranges
+outside the file and return a move-only `HeldRange` for valid ranges. Its data
+address must be congruent to the file offset modulo 16. Make the next 16 bytes
+after the range readable up to EOF, with unspecified contents.
+
+Keep each range readable until its hold is released. If all holds are
+null-owner views valid for the lifetime of the file, as in RAM and mmap,
+return true from `holdsFree()`. Otherwise give the hold a `HoldOwner` and any
+token needed to release it. Destruction or replacement of the hold calls
+`HoldOwner::release(const HeldRange&)`, which must be thread-safe and
+`noexcept`. The caller releases the hold before destroying its `InputFile`.
+
+`openFile(name, OpenOptions)` returns null when the file does not exist,
+whether or not a size was given. A nonzero `OpenOptions::size` is the size
+the manifest records; after such an open, `size()` must not make a request.
+Answer it from the given size or from a cached listing. Wrappers forward the
+options.
+
+A remote directory can keep a cached listing of its prefix (names, sizes,
+ETags) and answer `openFile` and `size()` from it, listing again when a name
+is missing, so neither existence nor size costs a request per file. With a
+passed size it needs the listing only for existence.
+
+Each `ByteRange` also carries a `ReadClass`, `METADATA` or `DATA`. Whoever
+keeps a hold decides how long it lives: the segment for what it keeps, a
+request for what it uses. The class is a hint a cache or backend may use for
+residency and scheduling after release, and it never changes the bytes
+returned.
+
+`acquireBatch(ranges, done)` takes a batch of ranges on one file. The
+default acquires each range in turn and calls `done` inline, so a local
+backend needs nothing more. A remote backend can override it to merge the
+ranges and issue them as one round of requests. It reports every outcome
+through `done`, which it calls exactly once, possibly before returning, from
+any thread: with one hold per range in the order requested and a null error,
+or with no holds and the error. `acquireBatch` is `noexcept`, so a failure to
+issue the batch (a bad range, an allocation) also goes to `done`, and `done`
+does not throw. The ranges are valid only during the call, so copy what the
+completion needs. Wrappers forward the batch to their delegate rather than
+splitting it, so the backend sees it whole.
+
+### Storage layers
+
 A layer derives from `DelegatingDirFactory` and overrides what it changes, usually
 `directory()` to hand out `DelegatingDirectory` subclasses. Both
 bases forward their other virtuals, including `createFile` with options, `expectSynced`,
@@ -452,10 +498,11 @@ virtuals require an implementation there; default methods call their own virtual
 namespace operations.
 
 Layers must be **byte-transparent**: the bytes at rest must be those the engine
-wrote, in a complete, durable namespace readable by the backend. FS `linkFile`
-reaches the source through `underlying()`, offline promotion opens `FSDirFactory`
-directly, and replication compares file digests. Observation, counting and caching
-fit this contract; encryption or compression at rest must be a backend, not a layer.
+wrote, in a complete, durable namespace readable by the backend. RAM and FS
+resolve the `linkFile` source through `underlying()`. Offline promotion opens
+`FSDirFactory` directly, and replication compares file digests. Observation,
+counting and caching fit this contract; encryption or compression at rest must
+be a backend, not a layer.
 
 Storage makers run before `PluginNodeState` is created. Keep storage state on the
 factory instance, shared with its views as needed. Once the node exists, its plugin
@@ -473,7 +520,7 @@ and `LuxirNode::attachCollection(id, force)` to hand off writers or force a take
 `Directory::capabilities()` reports what a backend can do: `HARD_LINK` (`linkFile`
 shares bytes), `ATOMIC_RENAME` (the backing store supports atomic name
 replacement), `DURABLE_SYNC` (`sync` persists bytes and names), `MEMORY_MAPPED`
-(`openFile` returns stable mapped bytes) and `REMOTE`. The default is none, which
+(the backing storage provides mapped bytes) and `REMOTE`. The default is none, which
 selects conservative paths: `reuseFiles` copies with `Directory::copyFile` instead of
 linking when `HARD_LINK` is absent. A wrapper that changes a property (for instance
 masks `HARD_LINK`) overrides `capabilities()`.
@@ -486,6 +533,18 @@ opens and creates). Each factory owns its counters; directory views share the
 layer's counters. `StorageExampleTest` reaches `CountingRamBackend` and
 `CountingLayer` through `find<T>()` and verifies that two nodes count independently.
 
+Run `luxir_test --store.layer=strict` to check readers against isolated range
+buffers with varying garbage in the slack. It reports acquisition counts
+(total and metadata), size requests on files opened without a size, and peak
+live holds and bytes. A part acquired from one open file under both read
+classes is an error in either mode. The default
+`strict.whole_segment_files=count` allows whole-file reads for tests that copy
+or replicate files. Use
+`--store.option strict.whole_segment_files=deny` in focused reader tests to
+reject whole-file reads of base segment data files. In those files a read no
+part makes also counts as whole-file: one from offset 0 past the header, or
+one to EOF outside file 0, since the writer pads every other file after its
+last part.
 
 ## Result decorators
 

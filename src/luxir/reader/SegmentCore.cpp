@@ -3,6 +3,7 @@
 
 #include "SegmentCore.h"
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -10,23 +11,56 @@
 #include "Postings.h"
 #include "ReaderErrors.h"
 #include "OwnershipShape.h"
+#include "luxir/store/AcquireJoin.h"
 #include "luxir/api/luxir_index.hpp"
-#include <algorithm>
+#include "luxir/util/ApiError.h"
 
 namespace luxir {
 
 namespace {
 
-void validateSegmentFileHeader(InputFile& file, std::string_view segment, uint32_t fileNumber) {
-  InputStream is = file.getInputStream();
+void validateSegmentFileHeader(std::span<const char> bytes, std::string_view segment, uint32_t fileNumber) {
   std::string_view header = Postings::LUXIR_HEADER;
-  if (is.size() < (int64_t) header.size()
-      || std::memcmp(is.ptr(0), header.data(), header.size()) != 0) {
+  if (bytes.size() < header.size() || std::memcmp(bytes.data(), header.data(), header.size()) != 0) {
     corruptSegment(segment, std::format("invalid Luxir magic; expected '{}'", header), {}, fileNumber);
   }
 }
 
+field_parts::Slice headerOf(uint32_t fileNumber) {
+  return {{fileNumber, 0}, Postings::LUXIR_HEADER.size()};
+}
+
+// A backend's error does not know the segment, so it is rethrown with the
+// segment named and the original nested. An ApiError keeps its kind and code.
+[[noreturn]] void rethrowForSegment(std::exception_ptr error, std::string_view segment) {
+  auto named = [&](const std::exception& e) {
+    return std::format("Segment '{}' failed to open: {}", segment, e.what());
+  };
+  try {
+    std::rethrow_exception(error);
+  } catch (const std::bad_alloc&) {
+    throw;
+  } catch (const ApiError& e) {
+    std::throw_with_nested(ApiError(e.kind, e.code, named(e)));
+  } catch (const std::exception& e) {
+    std::throw_with_nested(std::runtime_error(named(e)));
+  }
+}
+
 } // namespace
+
+// One segment of a manifest open, from beginOpen() to finishOpen().
+struct SegmentCore::PendingOpen {
+  std::shared_ptr<SegmentCore> core;
+  Source source;
+  std::string name;     // The segment's name, formatted once for file names and errors.
+  size_t slot;          // Where the caller stores the core.
+  std::exception_ptr error;  // The first failure its batches reported.
+
+  PendingOpen(uint64_t segId, uint64_t creatorEpoch, Source source, size_t slot = 0)
+      : core(new SegmentCore(segId, creatorEpoch)), source(std::move(source)), name(core->segmentName()),
+        slot(slot) {}
+};
 
 struct SegmentCore::ChildSpace {
   PostingsReader reader;
@@ -40,6 +74,69 @@ SegmentCore::SegmentCore(uint64_t segId, uint64_t creatorEpoch)
     : segId(segId), creatorEpoch(creatorEpoch), root(*this, SpaceOrdinal::ROOT) {}
 
 SegmentCore::~SegmentCore() = default;
+
+void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join,
+                                std::exception_ptr* error) {
+  using Key = std::pair<uint64_t, uint64_t>;
+  std::vector<Key> keys;
+  for (auto part : parts) {
+    auto number = part.location.filenum();
+    assert(number < files.size() && files[number].file);
+    if (!files[number].holdsFree) keys.emplace_back(part.location.raw(), part.bytes);  // See BaseFile.
+  }
+  if (keys.empty()) return;
+  // raw() keeps the file number in its high bits, so sorted keys run by file.
+  std::ranges::sort(keys);
+  keys.erase(std::ranges::unique(keys).begin(), keys.end());
+  {
+    std::lock_guard lock(holdsMutex);
+    std::erase_if(keys, [&](const Key& key) { return holds.contains(key); });
+  }
+  auto fileOf = [](const Key& key) { return seg_location::fromRaw(key.first).filenum(); };
+  for (auto begin = keys.begin(); begin != keys.end();) {
+    auto number = fileOf(*begin);
+    auto end = std::find_if(begin, keys.end(), [&](const Key& key) { return fileOf(key) != number; });
+    std::vector<ByteRange> ranges;
+    ranges.reserve((size_t)(end - begin));
+    for (auto key = begin; key != end; ++key) {
+      ranges.push_back({seg_location::fromRaw(key->first).offset(), key->second, readClass});
+    }
+    auto take = [this, batch = std::vector(begin, end)](std::vector<HeldRange>&& acquired) {
+      std::lock_guard lock(holdsMutex);
+      for (size_t i = 0; i < batch.size(); ++i) holds.try_emplace(batch[i], std::move(acquired[i]));
+    };
+    join.acquire(*files[number].file, ranges, std::move(take), error);
+    begin = end;
+  }
+}
+
+void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass) {
+  AcquireJoin join;
+  acquireSlices(parts, readClass, join);
+  join.wait();
+}
+
+std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice part, ReadClass readClass) {
+  auto key = std::pair(part.location.raw(), part.bytes);
+  {
+    std::lock_guard lock(holdsMutex);
+    auto found = holds.find(key);
+    if (found != holds.end()) return found->second.bytes();
+  }
+  // Acquire outside the lock: on a backend where an acquire is a request, a
+  // miss must not hold up other slices of the segment, hits included. Two
+  // threads missing the same part both acquire it; the first to store wins.
+  auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
+  // Declared after `hold`, so it unlocks before a duplicate hold releases.
+  std::lock_guard lock(holdsMutex);
+  return holds.try_emplace(key, std::move(hold)).first->second.bytes();
+}
+
+void SegmentCore::releaseHold(field_parts::Slice part) {
+  decltype(holds)::node_type node;  // Declared before the lock, so the hold releases after it.
+  std::lock_guard lock(holdsMutex);
+  node = holds.extract(std::pair(part.location.raw(), part.bytes));
+}
 
 std::optional<SpaceOrdinal> SegmentCore::spaceOrdinal(std::string_view path) const noexcept {
   return catalog.findSpace(path);
@@ -93,73 +190,147 @@ SegmentCore::Source SegmentCore::source(uint64_t id, uint64_t epoch, CatalogRang
   return makeSource(id, epoch, range, maxDoc, files);
 }
 
-bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool missingFileOK, bool expectSynced) {
+bool SegmentCore::openBaseFile(Directory& dir, std::string_view segment, uint32_t number, uint64_t expected,
+                               bool missingFileOK, bool expectSynced, bool checkHeader) {
+  auto name = Postings::getIndexFileName(segment, number);
+  // With the manifest's size, size() needs no request; see Directory::openFile.
+  auto file = dir.openFile(name, {.expectSynced = expectSynced, .size = expected});
+  if (!file) {
+    if (missingFileOK) return false;
+    throw std::filesystem::filesystem_error(
+        std::format("Can't find/open segment file '{}'", name),
+        std::make_error_code(std::errc::no_such_file_or_directory));
+  }
+  auto size = (uint64_t)file->size();
+  if (expected && size != expected) {
+    corruptSegment(segment, "file size differs from manifest", {}, number);
+  }
+  if ((expected || checkHeader) && size <= Postings::LUXIR_HEADER.size()) {
+    corruptSegment(segment, "segment file is too short", {}, number);
+  }
+  if (checkHeader) {
+    auto header = file->acquire({0, Postings::LUXIR_HEADER.size(), ReadClass::METADATA});
+    validateSegmentFileHeader(header.bytes(), segment, number);
+  }
+  bool holdsFree = file->holdsFree();
+  if (number >= files.size()) files.resize(number + 1);
+  files[number] = {std::move(file), size, holdsFree};
+  return true;
+}
+
+// Opens every file the manifest lists, so each file's header can go out with
+// file 0's catalog: one batch per file, issued on `join`.
+bool SegmentCore::beginOpen(Directory& dir, PendingOpen& pending, bool missingFileOK, bool expectSynced,
+                            AcquireJoin& join) {
+  constexpr uint32_t primary = Postings::PRIMARY_FILE;
+  const auto& source = pending.source;
+  if (source.files.empty() || !source.files[primary]) corruptSegment(pending.name, "missing primary file in manifest");
+  files.resize(source.files.size());
+  std::vector<field_parts::Slice> parts;
+  for (uint32_t number = 0; number < files.size(); ++number) {
+    if (!source.files[number]) continue;
+    if (!openBaseFile(dir, pending.name, number, source.files[number], missingFileOK, expectSynced, false)) {
+      return false;
+    }
+    parts.push_back(headerOf(number));
+  }
+  auto primarySize = files[primary].size;
+  range = source.range;
+  SegmentReadContext primaryContext{this, PackedTerm(nullptr), primary};
+  if (range.offset > seg_location::maxOffset() || range.offset > primarySize
+      || range.length > primarySize - range.offset) {
+    primaryContext.invalid("catalog range lies outside file 0", "invalid segment catalog");
+  }
+  if (range.offset < Postings::LUXIR_HEADER.size()) {
+    primaryContext.invalid("catalog starts inside file header", "invalid segment catalog");
+  }
+  parts.push_back({{primary, range.offset}, range.length});
+  acquireSlices(parts, ReadClass::METADATA, join, &pending.error);
+  return true;
+}
+
+void SegmentCore::finishOpen(const PendingOpen& pending) {
+  constexpr uint32_t primary = Postings::PRIMARY_FILE;
+  // A header is read only here, so its hold goes once checked.
+  for (uint32_t number = 0; number < files.size(); ++number) {
+    if (!files[number].file) continue;
+    validateSegmentFileHeader(slice(headerOf(number), ReadClass::METADATA), pending.name, number);
+    releaseHold(headerOf(number));
+  }
+  SegmentReadContext primaryContext{this, PackedTerm(nullptr), primary};
+  auto bytes = slice({{primary, range.offset}, range.length}, ReadClass::METADATA);
+  auto head = SegmentCatalog::readDirectory(bytes, range.offset, files[primary].size, primaryContext);
+  catalog = SegmentCatalog::decode(head, pending.source.files, primaryContext);
+  if (spaces().front().maxDoc != pending.source.maxDoc) {
+    corruptSegment(pending.name, "segment row count differs from manifest");
+  }
+  initializeSpaces();
+}
+
+// Segments fail in order, as if opened one at a time: issuing stops at the
+// first that cannot open (a throw, or a missing file the caller retries on),
+// and after the wait the lowest segment that failed decides, whichever batch
+// completed first.
+void SegmentCore::openPending(Directory& dir, std::span<PendingOpen> opens, bool missingFileOK, bool expectSynced) {
+  size_t stop = opens.size();
+  std::exception_ptr thrown;
+  {
+    // The caller owns the cores, so they outlive the join, and every batch
+    // lands in a live core even when an open throws.
+    AcquireJoin join;
+    for (size_t i = 0; i < opens.size(); ++i) {
+      try {
+        if (opens[i].core->beginOpen(dir, opens[i], missingFileOK, expectSynced, join)) continue;
+      } catch (...) {
+        thrown = std::current_exception();
+      }
+      stop = i;
+      break;
+    }
+    join.wait();
+  }
+  for (size_t i = 0; i < opens.size(); ++i) {
+    auto& pending = opens[i];
+    if (pending.error) rethrowForSegment(pending.error, pending.name);
+    if (i == stop) {
+      if (thrown) std::rethrow_exception(thrown);
+      for (; i < opens.size(); ++i) opens[i].core = nullptr;
+      return;
+    }
+    pending.core->finishOpen(pending);
+  }
+}
+
+bool SegmentCore::initializeFromFiles(Directory& dir, bool missingFileOK, bool expectSynced) {
   constexpr uint32_t primary = Postings::PRIMARY_FILE;
   auto segment = segmentName();
   SegmentReadContext primaryContext{this, PackedTerm(nullptr), primary};
-  auto open = [&](uint32_t number, uint64_t expected) {
-    auto name = Postings::getIndexFileName(segment, number);
-    auto file = dir.openFile(name, expectSynced);
-    if (!file) {
-      if (missingFileOK) return false;
-      throw std::filesystem::filesystem_error(
-          std::format("Can't find/open segment file '{}'", name),
-          std::make_error_code(std::errc::no_such_file_or_directory));
-    }
-    validateSegmentFileHeader(*file, segment, number);
-    auto input = file->getInputStream();
-    if (expected && (uint64_t)input.size() != expected) {
-      corruptSegment(segment, "file size differs from manifest", {}, number);
-    }
-    files[number] = std::move(file);
-    inputStreams[number] = input;
-    return true;
-  };
-
-  files.resize(1);
-  inputStreams.resize(1);
-  if (source && (source->files.empty() || !source->files[primary])) {
-    corruptSegment(segment, "missing primary file in manifest");
+  if (!openBaseFile(dir, segment, primary, 0, missingFileOK, expectSynced, false)) return false;
+  auto file0 = slice({{primary, 0}, files[primary].size});
+  validateSegmentFileHeader(file0, segment, primary);
+  auto head = SegmentCatalog::readDirectory(file0, primaryContext);
+  auto offset = head.catalogOffset();
+  range = {offset, file0.size() - offset, std::nullopt};
+  auto numbers = head.fileNumbers();
+  files.resize((size_t)numbers.back() + 1);
+  std::vector<uint64_t> sizes(files.size());
+  sizes[primary] = files[primary].size;
+  for (auto number : numbers.subspan(1)) {
+    if (!openBaseFile(dir, segment, number, 0, missingFileOK, expectSynced, true)) return false;
+    sizes[number] = files[number].size;
   }
-  if (!open(primary, source ? source->files[primary] : 0)) return false;
-  auto first = inputStreams[primary];
-  std::span<const char> file0(first.ptr(), first.size());
+  catalog = SegmentCatalog::decode(head, sizes, primaryContext);
+  initializeSpaces();
+  return true;
+}
 
-  auto head = source ? SegmentCatalog::readDirectory(file0, source->range, primaryContext)
-                     : SegmentCatalog::readDirectory(file0, primaryContext);
-  if (source) {
-    range = source->range;
-    catalog = SegmentCatalog::decode(head, source->files, primaryContext);
-    if (spaces().front().maxDoc != source->maxDoc) {
-      corruptSegment(segment, "segment row count differs from manifest");
-    }
-    files.resize(source->files.size());
-    inputStreams.resize(source->files.size());
-    for (uint32_t i = 1; i < files.size(); ++i) {
-      if (source->files[i] && !open(i, source->files[i])) return false;
-    }
-  } else {
-    auto offset = head.catalogOffset();
-    range = {offset, file0.size() - offset, std::nullopt};
-    auto numbers = head.fileNumbers();
-    files.resize((size_t)numbers.back() + 1);
-    inputStreams.resize(files.size());
-    std::vector<uint64_t> sizes(files.size());
-    sizes[Postings::PRIMARY_FILE] = file0.size();
-    for (auto number : numbers.subspan(1)) {
-      if (!open(number, 0)) return false;
-      sizes[number] = (uint64_t)inputStreams[number].size();
-    }
-    catalog = SegmentCatalog::decode(head, sizes, primaryContext);
-  }
-
+void SegmentCore::initializeSpaces() {
   const auto& version = catalog.versionRuns();
   if (version.slice) {
-    const auto& slice = version.slice;
-    auto input = getInputStreamSeek(slice.location);
-    SegmentReadContext context{this, PackedTerm(nullptr), slice.location.filenum()};
-    versions = VersionRuns(input.ptr(), slice.bytes, version.trailerOffset, version.count, spaces()[0].maxDoc, context);
-    if (versions.byteSize() != slice.bytes) context.invalid("version runs slice does not match its header");
+    auto bytes = slice(version.slice, ReadClass::METADATA);
+    SegmentReadContext context{this, PackedTerm(nullptr), version.slice.location.filenum()};
+    versions = VersionRuns(bytes.data(), bytes.size(), version.trailerOffset, version.count, spaces()[0].maxDoc, context);
+    if (versions.byteSize() != bytes.size()) context.invalid("version runs slice does not match its header");
   }
   root.initialize(spaces()[0].maxDoc, spaces()[0].fields.size());
   children.reserve(spaces().size() - 1);
@@ -171,7 +342,6 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
     child->reader.initialize(space.maxDoc, space.fields.size());
     children.push_back(std::move(child));
   }
-  return true;
 }
 
 std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, const api::SegmentInfo& segment,
@@ -182,21 +352,39 @@ std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, const api::Segm
 
 std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
                                                  const Source& source, bool missingFileOK, bool expectSynced) {
-  auto core = std::shared_ptr<SegmentCore>(new SegmentCore(segId, creatorEpoch));
-  if (!core->initializeFromFiles(dir, &source, missingFileOK, expectSynced)) return nullptr;
-  return core;
+  PendingOpen pending(segId, creatorEpoch, source);
+  openPending(dir, std::span(&pending, 1), missingFileOK, expectSynced);
+  return std::move(pending.core);
+}
+
+void SegmentCore::open(Directory& dir, std::span<const api::SegmentInfo> segments,
+                       std::span<std::shared_ptr<SegmentCore>> cores, bool missingFileOK, bool expectSynced) {
+  assert(segments.size() == cores.size());
+  auto missing = (size_t)std::ranges::count(cores, nullptr);
+  if (!missing) return;  // A reopen that carries every core over allocates nothing.
+  std::vector<PendingOpen> opens;
+  opens.reserve(missing);
+  for (size_t i = 0; i < segments.size(); ++i) {
+    if (cores[i]) continue;
+    const auto& segment = segments[i];
+    opens.emplace_back(segment.seg_id, segment.creator_epoch,
+                       makeSource(segment.seg_id, segment.creator_epoch, catalogRangeFromManifest(segment.catalog),
+                                  segment.max_doc, segment.files), i);
+  }
+  openPending(dir, opens, missingFileOK, expectSynced);
+  for (auto& pending : opens) cores[pending.slot] = std::move(pending.core);
 }
 
 std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
                                                  bool missingFileOK, bool expectSynced) {
   auto core = std::shared_ptr<SegmentCore>(new SegmentCore(segId, creatorEpoch));
-  if (!core->initializeFromFiles(dir, nullptr, missingFileOK, expectSynced)) return nullptr;
+  if (!core->initializeFromFiles(dir, missingFileOK, expectSynced)) return nullptr;
   return core;
 }
 
 SegmentCore::SegmentCore(Directory& dir, uint64_t segId, uint64_t creatorEpoch)
     : SegmentCore(segId, creatorEpoch) {
-  initializeFromFiles(dir, nullptr, false, false);
+  initializeFromFiles(dir, false, false);
 }
 
 } // namespace luxir

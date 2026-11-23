@@ -7,6 +7,7 @@
 #include <set>
 #include <tuple>
 #include "luxir/index/PostingsWriter.h"
+#include "test/StrictStorage.h"
 #include "test/TestUtils.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/PosEnum.h"
@@ -114,7 +115,7 @@ public:
     luxir::test::writeUnversionedRuns(*postingsWriter);
     postingsWriter->finish();
 
-    core = std::make_unique<SegmentCore>(dir, 0, 1);
+    core = std::make_unique<SegmentCore>(*test::strictReadDirectory(dir), 0, 1);
     reader = &core->rootReader();
     fieldCursor = std::make_unique<FieldCursor>(*reader);
 

@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <xxhash.h>
 
-#include "InputStream.h"
+#include "HeldRange.h"
 
 namespace luxir {
 
@@ -444,24 +444,48 @@ public:
 
 
 class InputFile {
+protected:
+  static void checkRange(ByteRange range, uint64_t size) {
+    if (range.offset > size || range.length > size - range.offset) {
+      throw std::out_of_range("InputFile range exceeds file size");
+    }
+  }
+
 public:
   virtual ~InputFile() = default;
 
   virtual size_t size() = 0;
 
-  // Reads all of the file and returns a pointer to the data, which should be valid as long as the InputFile is valid.
-  virtual std::string_view read() = 0;
+  virtual HeldRange acquire(ByteRange range) = 0;
+
+  // Acquires a batch of ranges together, so a backend can merge them and
+  // issue them at once. Reports every outcome through `done`, called exactly
+  // once, possibly before returning, from any thread: one hold per range in
+  // the order requested and a null error, or no holds and the error. Never
+  // throws; `done` must not throw either. The holds follow the contract of
+  // single acquires. `ranges` is valid only during the call. The default
+  // acquires each range in turn and completes inline.
+  virtual void acquireBatch(std::span<const ByteRange> ranges, AcquireDone done) noexcept {
+    std::vector<HeldRange> holds;
+    std::exception_ptr failure;
+    try {
+      holds.reserve(ranges.size());
+      for (const auto& range : ranges) holds.push_back(acquire(range));
+    } catch (...) {
+      holds.clear();
+      failure = std::current_exception();
+    }
+    done(std::move(holds), std::move(failure));
+  }
+
+  // Blocks until the batch completes; returns its holds in the order
+  // requested or throws its error.
+  std::vector<HeldRange> acquireAll(std::span<const ByteRange> ranges);
+  // True when all acquisitions return null-owner views valid for the file's lifetime.
+  virtual bool holdsFree() const { return false; }
 
   // Advisory asynchronous readahead; memory-backed inputs need no work.
   virtual void prefetch(size_t offset, size_t length) {}
-
-  virtual InputStream getInputStream() = 0;
-
-  friend std::ostream &operator<<(std::ostream &out, InputFile &inf) {
-    out << "InputFile: at" << &inf << " stream=" << inf.getInputStream();
-    return out;
-  }
-
 };
 
 class RAMInputFile : public InputFile {
@@ -476,14 +500,11 @@ public:
     return sz;
   }
 
-  std::string_view read() override {
-    return std::string_view(data.get(), sz);
+  HeldRange acquire(ByteRange range) override {
+    checkRange(range, sz);
+    return {data.get() + range.offset, range.length};
   }
-
-  InputStream getInputStream() override {
-    return InputStream(data.get(), data.get() + sz);
-  }
-
+  bool holdsFree() const override { return true; }
 };
 
 

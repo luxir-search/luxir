@@ -37,7 +37,7 @@ public:
   /// get a pointer to the current position
   const char *ptr() const noexcept { return pos; }
 
-  /// get a pointer at the given offset (from the start of the file)
+  /// get a pointer at the given offset from the start of the stream
   const char *ptr(int64_t offset) const {
     const char* p = start + offset;
     assert(offset >= 0 && p <= end);  // it's OK for p==end since positioning at end is fine, just not reading.

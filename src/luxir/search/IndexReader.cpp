@@ -4,6 +4,7 @@
 #include "IndexReader.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
+#include "luxir/index/LiveDocsWriter.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/OwnershipMapper.h"
@@ -17,6 +18,7 @@
 #include "luxir/api/luxir_index.hpp"
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <algorithm>
+#include <cstring>
 #include <bit>
 #include <map>
 #include <memory_resource>
@@ -50,18 +52,13 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
 
 } // namespace
 
-LiveDocs::LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive)
-    : docSet(FixedBitSet(words.get(), maxDoc), numLive), ownedWords(std::move(words)),
-      derivedBytes(sizeof(*this) + FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t)) {
-  fieldMetadataMemory.liveViews.fetch_add(1, std::memory_order_relaxed);
-  fieldMetadataMemory.liveViewBytes.fetch_add(derivedBytes, std::memory_order_relaxed);
+LiveDocs::LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive, LiveDocsMemory::Counter& counter)
+    : ownedWords(std::move(words)), docSet(FixedBitSet(ownedWords.get(), maxDoc), numLive), memory(&counter) {
+  counter.add(heapBytes());
 }
 
 LiveDocs::~LiveDocs() {
-  if (derivedBytes) {
-    fieldMetadataMemory.liveViews.fetch_sub(1, std::memory_order_relaxed);
-    fieldMetadataMemory.liveViewBytes.fetch_sub(derivedBytes, std::memory_order_relaxed);
-  }
+  if (memory) memory->remove(heapBytes());
 }
 
 std::shared_ptr<LiveDocs> ChildLiveDocs::get() {
@@ -94,7 +91,7 @@ std::shared_ptr<LiveDocs> ChildLiveDocs::get() {
         if (first < last) words[first >> 6] &= ~((1ULL << (last - first)) - 1);
       }
     }
-    auto result = live == count ? nullptr : std::make_shared<LiveDocs>(std::move(words), count, live);
+    auto result = live == count ? nullptr : std::make_shared<LiveDocs>(std::move(words), count, live, liveDocsMemory.views);
     knownCard.store(live, std::memory_order_release);
     return result;
   });
@@ -105,7 +102,7 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   std::string deleteFileName = Postings::getLiveDocsFileName(
     Postings::segmentKey(segId, creatorEpoch), liveGen, liveEpoch);
 
-  auto deleteFile = dir.openFile(deleteFileName, expectSynced);
+  auto deleteFile = dir.openFile(deleteFileName, {.expectSynced = expectSynced});
   if (deleteFile == nullptr) {
     if (missingFileOK) {
       // Delete file not found - return nullptr instead of throwing
@@ -121,7 +118,8 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   }
   IREADER_DEBUG("Successfully opened delete file {} for segment s{}", deleteFileName, Postings::segmentKey(segId, creatorEpoch));
 
-  InputStream deleteStream = deleteFile->getInputStream();
+  auto hold = deleteFile->acquire({0, deleteFile->size()});
+  InputStream deleteStream = hold.stream();
 
   // Validate file format
   const char* data = deleteStream.ptr();
@@ -144,7 +142,7 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   int32_t fileMaxDoc = deleteStream.readInt();
   int32_t numLiveDocs = deleteStream.readInt();
 
-  if (format != 1) {
+  if (format != LiveDocsWriter::DENSE && format != LiveDocsWriter::SPARSE) {
     throw std::runtime_error(std::format("Delete file {} has unsupported format: {}", deleteFileName, format));
   }
 
@@ -159,19 +157,39 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   }
 
   // Validate file size
-  int64_t expectedSize = deleteStream.offset() + screaming::FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t);
-  if (deleteStream.size() != expectedSize) {
+  int32_t numDeleted = maxDoc - numLiveDocs;
+  int64_t expectedSize = deleteStream.offset() + (format == LiveDocsWriter::SPARSE
+      ? (int64_t)numDeleted * (int64_t)sizeof(uint32_t)
+      : (int64_t)screaming::FixedBitSet::sizeInWords(maxDoc) * (int64_t)sizeof(uint64_t));
+  if ((int64_t)deleteStream.size() != expectedSize) {
     throw std::runtime_error(std::format("Delete file {} size mismatch: {} bytes (expected {})",
               deleteFileName, dataSize, expectedSize));
   }
 
-  // FixedBitSet with live docs - memory map directly!
-  uint64_t* liveBitsMemory = (uint64_t*)deleteStream.ptr();
-
   IREADER_DEBUG("Loaded {} deleted documents from {} for segment s{}, {} live docs",
-            maxDoc - numLiveDocs, deleteFileName, Postings::segmentKey(segId, creatorEpoch), numLiveDocs);
+            numDeleted, deleteFileName, Postings::segmentKey(segId, creatorEpoch), numLiveDocs);
 
-  return std::make_shared<LiveDocs>(liveBitsMemory, maxDoc, std::move(deleteFile), numLiveDocs);
+  if (format == LiveDocsWriter::SPARSE) {
+    // Expand the sorted deleted ids into an owned bitmap; the file is released.
+    auto words = FixedBitSet::allocate(maxDoc, true);
+    const char* ids = deleteStream.ptr();
+    int64_t prev = -1;
+    for (int32_t i = 0; i < numDeleted; i++) {
+      uint32_t doc;
+      std::memcpy(&doc, ids + (size_t)i * sizeof(uint32_t), sizeof(doc));
+      if ((int64_t)doc <= prev || doc >= (uint32_t)maxDoc) {
+        throw std::runtime_error(std::format("Delete file {} has invalid deleted doc {} at {} (previous {}, maxDoc={})",
+                  deleteFileName, doc, i, prev, maxDoc));
+      }
+      words[doc >> 6] &= ~(1ULL << (doc & 63));
+      prev = doc;
+    }
+    return std::make_shared<LiveDocs>(std::move(words), maxDoc, numLiveDocs, liveDocsMemory.sparseRoots);
+  }
+
+  // The bitmap borrows the bytes from the hold.
+  uint64_t* liveBitsMemory = (uint64_t*)deleteStream.ptr();
+  return std::make_shared<LiveDocs>(liveBitsMemory, maxDoc, std::move(deleteFile), std::move(hold), numLiveDocs);
 }
 
 
@@ -317,6 +335,34 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
       }
       lastCommitTime = commitTimeUs;
 
+      // Every holder of a physical segment shares one open SegmentCore.
+      // The publisher's (the writer's) comes first: it opened the segment for
+      // deletes, a merge or an overlay build, possibly while a reader opened
+      // it too, so preferring it converges all holders by the next reopen.
+      // Then the previous snapshot's, when the base files are identical (a
+      // delete or overlay commit leaves them unchanged); without descriptors
+      // the identity is unknown and nothing is shared. The rest open together,
+      // so their headers and catalogs are acquired in one round.
+      std::vector<std::shared_ptr<SegmentCore>> segmentCores(indexInfo.segments.size());
+      std::vector<const PhysicalCore::Bundle*> prevSegs(indexInfo.segments.size());
+      for (size_t i = 0; i < indexInfo.segments.size(); i++) {
+        const auto& segment = indexInfo.segments[i];
+        const auto& files = core->segmentFiles[i];
+        const auto* prevSeg = prevSegs[i] = previous ? previous->bundle(segment.seg_id) : nullptr;
+        const auto* prevFiles = prevSeg ? &previous->segmentFiles[(size_t)prevSeg->ord] : nullptr;
+        auto& segmentCore = segmentCores[i];
+        if (i < published.size()) {
+          segmentCore = published[i].lock();
+          if (segmentCore && (segmentCore->rootReader().maxDoc() != segment.max_doc
+                              || segmentCore->catalogRange() != files.catalog)) segmentCore = nullptr;
+        }
+        if (!segmentCore && prevSeg && !files.files.empty() && prevFiles->files == files.files
+            && prevFiles->catalog == files.catalog && prevFiles->maxDoc == segment.max_doc) {
+          segmentCore = prevSeg->core;
+        }
+      }
+      SegmentCore::open(dir, indexInfo.segments, segmentCores, missingFileOK, true);
+
       segs.reserve(indexInfo.segments.size());
       for (int i = 0; i < (int)indexInfo.segments.size(); i++) {
         const auto& segment = indexInfo.segments[i];
@@ -325,27 +371,10 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
         int32_t nDocs = segment.max_doc;
         const auto& files = core->segmentFiles[i];
 
-        // Every holder of a physical segment shares one open SegmentCore.
-        // The publisher's (the writer's) comes first: it opened the segment for
-        // deletes, a merge or an overlay build, possibly while a reader opened
-        // it too, so preferring it converges all holders by the next reopen.
-        // Then the previous snapshot's, when the base files are identical (a
-        // delete or overlay commit leaves them unchanged); without descriptors
-        // the identity is unknown and nothing is shared. Live docs carry over
-        // when the generation's file is unchanged.
-        const auto* prevSeg = previous ? previous->bundle(segId) : nullptr;
+        // Live docs carry over when the generation's file is unchanged.
+        const auto* prevSeg = prevSegs[(size_t)i];
         const auto* prevFiles = prevSeg ? &previous->segmentFiles[(size_t)prevSeg->ord] : nullptr;
-        std::shared_ptr<SegmentCore> segmentCore;
-        if ((size_t)i < published.size()) {
-          segmentCore = published[i].lock();
-          if (segmentCore && (segmentCore->rootReader().maxDoc() != nDocs
-                              || segmentCore->catalogRange() != files.catalog)) segmentCore = nullptr;
-        }
-        if (!segmentCore && prevSeg && !files.files.empty() && prevFiles->files == files.files
-            && prevFiles->catalog == files.catalog && prevFiles->maxDoc == nDocs) {
-          segmentCore = prevSeg->core;
-        }
-        if (!segmentCore) segmentCore = SegmentCore::create(dir, segment, missingFileOK, true);
+        auto segmentCore = std::move(segmentCores[i]);
         if (!segmentCore) {
           // Failed to create SegmentCore (segment files not found) - trigger retry
           retry = true;

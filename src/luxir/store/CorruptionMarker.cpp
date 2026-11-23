@@ -30,7 +30,8 @@ CorruptionMarker::Observation CorruptionMarker::read(Directory& dir, std::span<c
     if (!isMarker(entry.name)) continue;
     auto file = dir.openFile(entry.name);
     if (!file) continue;
-    auto text = file->read();
+    auto hold = file->acquire({0, file->size()});
+    std::string_view text(hold.bytes());
     observed.markers.push_back(entry.name);
     for (size_t start = 0; start < text.size();) {
       auto end = text.find('\n', start);

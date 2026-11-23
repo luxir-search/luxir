@@ -3,7 +3,17 @@
 
 #include "luxir/store/OutputStream.h"
 
+#include "luxir/store/AcquireJoin.h"
+
 namespace luxir {
+
+std::vector<HeldRange> InputFile::acquireAll(std::span<const ByteRange> ranges) {
+  std::vector<HeldRange> result;
+  AcquireJoin join;
+  join.acquire(*this, ranges, [&](std::vector<HeldRange>&& holds) { result = std::move(holds); });
+  join.wait();
+  return result;
+}
 
 void File::appendFile(OutputStream& out, RAMFile& file) {
   flush(out, true, 0);

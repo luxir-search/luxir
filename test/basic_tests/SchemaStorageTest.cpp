@@ -117,8 +117,10 @@ TEST(SchemaStorageTest, schemaFooterAndInventoryAreVerified) {
   IndexWriter writer(registry);
   auto snapshot = registry.snapshot();
   auto name = snapshot->schema->file.name;
-  auto body = dir.openFile(name)->read();
-  std::vector<std::byte> damaged((const std::byte*)body.data(), (const std::byte*)body.data() + body.size());
+  auto file = dir.openFile(name);
+  auto hold = file->acquire({0, file->size()});
+  auto body = std::as_bytes(hold.bytes());
+  std::vector<std::byte> damaged(body.begin(), body.end());
   damaged.back() ^= std::byte{1};
   dir.publishFile(name, damaged, Directory::PublishMode::REPLACE);
   SchemaCache cache;

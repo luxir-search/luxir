@@ -7,10 +7,13 @@
 #include "SegmentCatalog.h"
 #include "CatalogRange.h"
 #include "VersionRuns.h"
+#include <map>
+#include <mutex>
 #include <span>
 #include "luxir/store/Directory.h"
 
 namespace luxir {
+class AcquireJoin;
 class OwnershipShape;
 namespace api { struct SegmentInfo; }
 
@@ -29,8 +32,19 @@ private:
   // Indexed by physical filenum and intentionally sparse. Segment finalize
   // folds buffered streams without renaming survivors, which keeps already
   // spilled filesystem/object-store keys stable.
-  std::vector<std::shared_ptr<InputFile>> files;
-  std::vector<InputStream> inputStreams;
+  struct BaseFile {
+    std::shared_ptr<InputFile> file;
+    uint64_t size = 0;  // Read once at open; checked against the manifest when it records one.
+    // RAM and mmap hand out views valid for the file's lifetime, so slice()
+    // retains nothing for them and acquireSlices() requests nothing. Every
+    // other path, the open included, is the same for every backend.
+    bool holdsFree = false;
+  };
+  std::vector<BaseFile> files;
+  // Holds must outlive the views below and release before files. A part is
+  // held once; each part has one reader path, so its class does not vary.
+  std::mutex holdsMutex;
+  std::map<std::pair<uint64_t, uint64_t>, HeldRange> holds;
   SegmentCatalog catalog;
   CatalogRange range;
   VersionRuns versions;
@@ -41,8 +55,18 @@ private:
   std::vector<std::unique_ptr<ChildSpace>> children;
   PostingsReader root;
 
+  struct PendingOpen;
+
   SegmentCore(uint64_t segId, uint64_t creatorEpoch);
-  bool initializeFromFiles(Directory& dir, const Source* source, bool missingFileOK, bool expectSynced);
+  bool openBaseFile(Directory& dir, std::string_view segment, uint32_t number, uint64_t expected,
+                    bool missingFileOK, bool expectSynced, bool checkHeader);
+  static void openPending(Directory& dir, std::span<PendingOpen> opens, bool missingFileOK, bool expectSynced);
+  bool beginOpen(Directory& dir, PendingOpen& pending, bool missingFileOK, bool expectSynced, AcquireJoin& join);
+  void finishOpen(const PendingOpen& pending);
+  bool initializeFromFiles(Directory& dir, bool missingFileOK, bool expectSynced);
+  void initializeSpaces();
+  std::span<const char> retain(InputFile& file, field_parts::Slice part, ReadClass readClass);
+  void releaseHold(field_parts::Slice part);
 
 public:
   static Source source(uint64_t id, uint64_t epoch, CatalogRange range, int32_t maxDoc,
@@ -54,6 +78,15 @@ public:
                                             bool expectSynced = false);
   static std::shared_ptr<SegmentCore> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
                                             bool missingFileOK = false, bool expectSynced = false);
+  // Opens together each segment whose entry in `cores` is null, and stores
+  // its core there. Every file's header and every file 0's catalog go out in
+  // one round of batches before any catalog is decoded. The segments fail in
+  // order, as if opened one at a time: the first that fails throws, naming
+  // the segment, and from the first with a missing file (when missingFileOK
+  // is set) the entries stay null.
+  static void open(Directory& dir, std::span<const api::SegmentInfo> segments,
+                   std::span<std::shared_ptr<SegmentCore>> cores, bool missingFileOK = false,
+                   bool expectSynced = false);
   explicit SegmentCore(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
   ~SegmentCore();
   SegmentCore(const SegmentCore&) = delete;
@@ -77,7 +110,7 @@ public:
 
   void forEachBaseFile(auto&& visit) const {
     for (uint32_t number = 0; number < files.size(); ++number) {
-      if (const auto& file = files[number]) visit(number, (uint64_t)file->size());
+      if (files[number].file) visit(number, files[number].size);
     }
   }
 
@@ -93,32 +126,34 @@ public:
 
   InputFile* getFile(uint32_t fnum) {
     assert(fnum < files.size());
-    assert(files[fnum] != nullptr);
-    return files[fnum].get();
+    assert(files[fnum].file != nullptr);
+    return files[fnum].file.get();
   }
 
-  // We can't get & cache the InputStream here unless we create them all in the constructor (for thread safety)
-  // But if we're using mmap, that's probably fine?  Would not be fine if we need to read everything in the constructor.
-  // TODO: could also have a mode that opens on demand (and hence synchronizes)... that would be good for something like IndexWriter
-  // that needs to only read the ID field to handle overwrites / deletions.  That file *might* already be open by another IndexReader
-  // though?  How to coordinate?
-  InputStream getInputStream(uint32_t fnum) {
-    assert(fnum < inputStreams.size());
-    assert(files[fnum] != nullptr);
-    return inputStreams[fnum];
+  // `readClass` tells a cache or backend whether the part is navigation
+  // metadata or data; see ReadClass.
+  std::span<const char> slice(field_parts::Slice part, ReadClass readClass = ReadClass::DATA) {
+    auto number = part.location.filenum();
+    assert(number < files.size());
+    const auto& base = files[number];
+    assert(base.file);
+    if (base.holdsFree) {
+      auto hold = base.file->acquire({part.location.offset(), part.bytes, readClass});
+      return hold.bytes(); // Free views stay valid while the core keeps the file.
+    }
+    return retain(*base.file, part, readClass);
   }
 
-  std::span<const char> slice(field_parts::Slice slice) {
-    auto input = getInputStream(slice.location.filenum());
-    return {input.ptr(slice.location.offset()), slice.bytes};
-  }
-
-  // return an InputStream positioned on the current location specified
-  InputStream getInputStreamSeek(seg_location sloc) {
-    InputStream is = getInputStream(sloc.filenum());
-    is.seek(sloc.offset());
-    return is;
-  }
+  // Acquires the parts in one batch per file, skipping parts already held,
+  // keeps their holds as slice() does, and waits. Afterwards slice() of each
+  // part makes no backend request: it returns the held bytes, or a free view
+  // on a file with free holds, whose acquire costs nothing.
+  void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass = ReadClass::DATA);
+  // Issues the same batches on `join` without waiting, so batches of several
+  // segments go out together; slice() makes no request once join.wait()
+  // returns. A failure goes to `error` when given; see AcquireJoin::acquire.
+  void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join,
+                     std::exception_ptr* error = nullptr);
 
 };
 

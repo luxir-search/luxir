@@ -54,6 +54,17 @@ public:
   virtual FileCheck checksum(const std::function<void(size_t)>& progress = {}) = 0;
 };
 
+// How Directory::openFile opens a file. Namespace scope, not nested, so a
+// default argument can value-initialize it inside Directory.
+struct OpenOptions {
+  // The caller asserts that this file should have been fsynced (e.g. it was
+  // referenced from a committed index). CheckedDirectory uses this to detect
+  // missing fsyncs.
+  bool expectSynced = false;
+  // Nonzero: the file's size as a manifest records it.
+  uint64_t size = 0;
+};
+
 // Implementations of Directory are thread safe.
 class Directory {
 public:
@@ -101,10 +112,12 @@ public:
   // snapshot and entries vanishing mid-scan are skipped, never thrown.
   virtual void listFiles(std::vector<FileInfo> &target) = 0;
 
-  // Open a file for reading.  If expectSynced is true, the caller asserts that
-  // this file should have been fsynced (e.g. it was referenced from a committed
-  // index).  CheckedDirectory uses this flag to detect missing fsyncs.
-  virtual std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) = 0;
+  // Open a file for reading; null when it does not exist, sized or not. After
+  // an open with a nonzero options.size, InputFile::size() makes no request:
+  // a backend answers it from that size or from a cached listing. A backend
+  // that trusts the given size leaves a mismatch to surface at read time.
+  // Wrappers forward the options.
+  virtual std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) = 0;
 
   // The caller asserts that `files` were fsynced: a root about to be published
   // references them (Manifest::commit). CheckedDirectory verifies it.
@@ -174,9 +187,10 @@ public:
   // Installs a copy of `source`'s file `name` under the same name. The fallback
   // for backends that cannot link; the caller syncs it like any created file.
   void copyFile(Directory& source, std::string_view name) {
-    auto input = source.openFile(name, true);
+    auto input = source.openFile(name, {.expectSynced = true});
     if (!input) throw std::runtime_error("copy source missing: " + std::string(name));
-    auto data = input->read();
+    auto hold = input->acquire({0, input->size()});
+    auto data = hold.bytes();
     auto file = createFile(name);
     OutputStream out(file.get());
     out.write(data.data(), data.size());
@@ -266,8 +280,8 @@ public:
     }
   }
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
-    unused(expectSynced);
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) override {
+    unused(options);
     std::lock_guard<std::mutex> lock(mutex);
 
     auto find = files.find(name);
@@ -294,7 +308,8 @@ public:
       uint64_t size() const override { return file->size(); }
       std::shared_ptr<InputFile> map() override { return file; }
       FileCheck checksum(const std::function<void(size_t)>& progress) override {
-        auto data = file->read();
+        auto hold = file->acquire({0, file->size()});
+        auto data = hold.bytes();
         XXH3_state_t state;
         XXH3_64bits_reset(&state);
         constexpr size_t kChunk = 1 << 20;
@@ -392,7 +407,9 @@ public:
     std::lock_guard lock(mutex);
     auto it = files.find(name);
     if (it == files.end()) return {};
-    return Publication{std::string(it->second.file->read()), std::to_string(files.find(name)->second.version)};
+    auto& file = it->second.file;
+    auto hold = file->acquire({0, file->size()});
+    return Publication{std::string(hold.getData(), hold.getLength()), std::to_string(it->second.version)};
   }
 
   void sync(std::span<const std::string> names) override { unused(names); }
@@ -403,8 +420,15 @@ public:
   }
 
   void linkFile(Directory& source, std::string_view name) override {
-    auto input = std::dynamic_pointer_cast<RAMInputFile>(source.openFile(name, true));
-    if (!input) throw std::runtime_error("RAM link source missing or incompatible");
+    auto* ram = dynamic_cast<RAMDir*>(&source.underlying());
+    if (!ram) throw std::runtime_error("RAM link source is incompatible");
+    InputReferenceType input;
+    {
+      std::lock_guard lock(ram->mutex);
+      auto it = ram->files.find(name);
+      if (it == ram->files.end()) throw std::runtime_error("RAM link source missing");
+      input = it->second.file;
+    }
     std::lock_guard lock(mutex);
     files[std::string(name)] = {std::move(input), ++nextVersion};
     materialized.store(true, std::memory_order_release);

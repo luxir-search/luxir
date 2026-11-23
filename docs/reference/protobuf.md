@@ -1659,6 +1659,8 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.node_budget_bytes"></a>[`node_budget_bytes`](#field-luxir.memorystats.node_budget_bytes) | 5 | `uint64` | singular | Configured budget for managed memory (max\_ram\_mb); not an RSS ceiling. Zero is unlimited. |
 | <a id="field-luxir.memorystats.search_request_limit_bytes"></a>[`search_request_limit_bytes`](#field-luxir.memorystats.search_request_limit_bytes) | 6 | `uint64` | singular | Per-request tracked search memory ceiling; zero disables rejection. |
 | <a id="field-luxir.memorystats.schema_cache_bytes"></a>[`schema_cache_bytes`](#field-luxir.memorystats.schema_cache_bytes) | 7 | `uint64` | singular | Estimated parsed schema payload held by snapshots/readers, not allocator RSS. |
+| <a id="field-luxir.memorystats.live_docs_heaps"></a>[`live_docs_heaps`](#field-luxir.memorystats.live_docs_heaps) | 8 | `uint64` | singular | Live docs generations loaded from sparse files and expanded to heap bitmaps, held by readers and in-flight writer work. Dense generations are mapped and not counted. |
+| <a id="field-luxir.memorystats.live_docs_heap_bytes"></a>[`live_docs_heap_bytes`](#field-luxir.memorystats.live_docs_heap_bytes) | 9 | `uint64` | singular | Heap bytes of those generations. |
 
 <a id="message-luxir.multimatchquery"></a>
 

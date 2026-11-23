@@ -58,7 +58,11 @@ protected:
   }
   void startA() { a = std::make_unique<LuxirNode>(config("A")); }
   void startB() { b = std::make_unique<LuxirNode>(config("B")); }
-  std::string catalogBytes() { return std::string(shared.directory(StorageRoot::AUTHORITATIVE, "t/t0")->openFile("CATALOG")->read()); }
+  std::string catalogBytes() {
+    auto file = shared.directory(StorageRoot::AUTHORITATIVE, "t/t0")->openFile("CATALOG");
+    auto hold = file->acquire({0, file->size()});
+    return std::string(hold.getData(), hold.getLength());
+  }
   template <class F> void servedBy(F&& operation, std::string_view node = "A") {
     try { operation(); ADD_FAILURE() << "operation succeeded"; }
     catch (const CollectionUnavailableError& e) {

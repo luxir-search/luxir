@@ -8,7 +8,8 @@ namespace luxir {
 
 ReplicationState ReplicationState::read(InputFile& file) {
   ReplicationState state;
-  std::string text(file.read()); // the parser reads up to a terminator
+  auto hold = file.acquire({0, file.size()});
+  std::string text(hold.getData(), hold.getLength()); // the parser reads up to a terminator
   if (glz::read_json(state, text)) throw std::runtime_error("Invalid follower state");
   return state;
 }

@@ -684,6 +684,7 @@ private:
   struct ReplicationTransfer {
     std::shared_ptr<Collection> collection;
     std::shared_ptr<InputFile> file;
+    HeldRange hold;
     CommitSnapshot::Bytes manifest;
     std::string rendered;
     std::stop_token cancellation;
@@ -2585,16 +2586,17 @@ private:
             if (!api::write_json(info, transfer->rendered)) throw std::runtime_error("cannot render snapshot JSON");
             transfer->data = transfer->rendered;
           } else transfer->data = {(const char*)snapshot->bytes->data(), snapshot->bytes->size()};
-        } else if (identity) {
-          transfer->file = snapshots.openFile(*identity);
-          transfer->data = transfer->file->read();
-          Signal::emit("replicationFileOpenedByIdentity", &transfer->file);
         } else {
-          transfer->id = id;
-          transfer->pinned = true;
-          transfer->file = snapshots.openFile(id, name, &transfer->cancellation);
-          transfer->data = transfer->file->read();
-          Signal::emit("replicationFileOpened", &transfer->file);
+          if (identity) {
+            transfer->file = snapshots.openFile(*identity);
+          } else {
+            transfer->id = id;
+            transfer->pinned = true;
+            transfer->file = snapshots.openFile(id, name, &transfer->cancellation);
+          }
+          transfer->hold = transfer->file->acquire({0, transfer->file->size()});
+          transfer->data = std::string_view(transfer->hold.bytes());
+          Signal::emit(identity ? "replicationFileOpenedByIdentity" : "replicationFileOpened", &transfer->file);
         }
         transfer->end = transfer->data.size();
         if (!head && !range.empty() && !name.empty()) status = replicationRange(range, *transfer);

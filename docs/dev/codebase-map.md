@@ -52,13 +52,15 @@ locations, browse `src/luxir/<area>/`.
      read source; wildcard discovery returns logical primaries only
 
 3. **Segment Reading** (`src/luxir/reader/`)
-   - `SegmentCore` owns a segment bundle's open files, streams and root VersionRuns, shared
-     across snapshots and with the writer. File 0's catalog indexes field records
-     by row-space path (root is the empty path) and field name. Each space has a
-     `PostingsReader` with its own row count and immutable, on-demand record cache.
-     Records contain counts, bounds and data slices. Numeric leaf metadata
-     and stored metadata are opened and cached separately. Codec cursors borrow
-     the space reader and mapped bytes
+   - `SegmentCore` owns a segment bundle's open files, retained byte ranges and root
+     VersionRuns, shared across snapshots and with the writer. `slice()` acquires
+     parts from the files, `acquireSlices()` acquires them ahead in one batch per
+     file, and both retain holds that need release until the core closes. File 0's
+     catalog indexes field records by row-space path (root is the empty path) and
+     field name. Each space has a `PostingsReader` with its own row count and
+     immutable, on-demand record cache. Records contain counts, bounds and data
+     slices. Numeric leaf metadata and stored metadata are opened and cached
+     separately. Codec cursors borrow the space reader and its acquired bytes
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
      opening reads metadata and endpoints without scanning child rows.
@@ -140,6 +142,10 @@ locations, browse `src/luxir/<area>/`.
      - `IndexHandler`: One physical representation, owned by `indexHandlers`;
        finish/flush visits each once in global physical-name order
    - `PostingsWriter`: used by an Inverter on flush to write a new segment.
+   - `LiveDocsWriter`: one immutable file per delete generation (indexing errors,
+     applied deletes, merge live docs diffs): a DENSE live bitmap, mapped in place
+     by `LiveDocs::create`, or with few deletes a SPARSE list of deleted doc ids,
+     which readers expand into a heap bitmap (`memory.live_docs_heap_bytes`).
    - `PointsWriter` builds 1-D sorted leaves. `BasicBKDWriter<PointTraits>`
      shares 2-D tree construction, docid codecs, and the bounded parallel leaf
      pipeline: `BKDInt32Traits` serves geo (`BKDWriter`), and `BKDInt64Traits`
@@ -157,7 +163,12 @@ locations, browse `src/luxir/<area>/`.
 7. **Storage** (`src/luxir/store/`)
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
      `FSDirectory` (on-disk, mmap reads), `CheckedDirectory` (validation wrapper)
-   - `InputStream` / `OutputStream`: segment I/O primitives. The catalog and record
+   - `InputFile`: acquires file ranges as `HeldRange` objects, one at a time or in a
+     completion-based batch (`acquireBatch`; `AcquireJoin` waits on batches across
+     files). RAM and mmap supply views valid for the file's lifetime. Each `ByteRange`
+     carries a `ReadClass` (`METADATA` or `DATA`), and `Directory::openFile` takes
+     `OpenOptions` (`expectSynced`, and the size a manifest records)
+   - `InputStream` / `OutputStream`: codec I/O primitives. The catalog and record
      codecs validate directory entries, field offsets and data slices within their input ranges
    - `IndexFormat`: the on-disk format version, recorded in each manifest and in every data
      file's header. Bump it when the change requires a different encoding or interpretation.

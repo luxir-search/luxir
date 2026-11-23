@@ -75,6 +75,12 @@ public:
 
   size_t size() override { return sz_; }
 
+  HeldRange acquire(ByteRange range) override {
+    checkRange(range, sz_);
+    return {data_ + range.offset, range.length};
+  }
+  bool holdsFree() const override { return true; }
+
   void prefetch(size_t offset, size_t length) override {
     if (offset >= sz_ || length == 0) return;
     static const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
@@ -98,14 +104,6 @@ public:
       }
       start += pages * pageSize;
     }
-  }
-
-  std::string_view read() override {
-    return {data_, sz_};
-  }
-
-  InputStream getInputStream() override {
-    return {data_, data_ + sz_};
   }
 
 private:
@@ -426,8 +424,8 @@ public:
               [](const FileInfo& a, const FileInfo& b) { return a.name < b.name; });
   }
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
-    unused(expectSynced);
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) override {
+    unused(options);
     auto path = filePath(name);
     // Only absence is a null result; an unreadable file is an error, never
     // evidence that the file does not exist.
@@ -503,8 +501,8 @@ public:
     }
     auto close = scope_guard([&] { ::close(fd); });
     auto file = MMapInputFile::map(fd, path);
-    auto bytes = file->read();
-    return Publication{std::string(bytes), versionOf(fd, std::as_bytes(std::span(bytes)))};
+    auto hold = file->acquire({0, file->size()});
+    return Publication{std::string(hold.getData(), hold.getLength()), versionOf(fd, std::as_bytes(hold.bytes()))};
   }
 
   std::optional<PublicationVersion> publishFile(std::string_view name, std::span<const std::byte> bytes, PublishCondition condition) override {

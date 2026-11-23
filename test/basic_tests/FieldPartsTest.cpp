@@ -305,8 +305,7 @@ size_t mappingPageSize() {
   return (size_t)pageSize;
 }
 
-// The reader retains raw pointers from getInputStream(). Protect the actual
-// bytes so a dereference cannot bypass the check through a cached stream.
+// Protect the backing bytes so a dereference through a retained view is checked.
 class ProtectedInputFile : public InputFile {
   char* data;
   size_t bytes;
@@ -321,8 +320,11 @@ public:
   }
   ~ProtectedInputFile() override { munmap(data, bytes); }
   size_t size() override { return bytes; }
-  std::string_view read() override { return {data, bytes}; }
-  InputStream getInputStream() override { return {data, data + bytes}; }
+  HeldRange acquire(ByteRange range) override {
+    checkRange(range, bytes);
+    return {data + range.offset, range.length};
+  }
+  bool holdsFree() const override { return true; }
 
   void protect() {
     if (mprotect(data, bytes, PROT_NONE) != 0) throw std::runtime_error("mprotect failed");
@@ -344,11 +346,12 @@ class ProtectedDirectory : public DelegatingDirectory {
 public:
   using DelegatingDirectory::DelegatingDirectory;
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced) override {
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options) override {
     if (sealed) throw std::runtime_error("unexpected segment file open");
-    auto source = delegate->openFile(name, expectSynced);
+    auto source = delegate->openFile(name, options);
     if (!source) return nullptr;
-    auto file = std::make_shared<ProtectedInputFile>(source->read());
+    auto hold = source->acquire({0, source->size()});
+    auto file = std::make_shared<ProtectedInputFile>(std::string_view(hold.bytes()));
     inputs.emplace(name, file);
     return file;
   }
@@ -424,8 +427,7 @@ protected:
     Slice previous;
     for (auto slice : slices) {
       ASSERT_FALSE(slice.location.isNull());
-      auto input = core.getInputStream(slice.location.filenum());
-      ASSERT_LE(slice.end().offset(), input.size());
+      ASSERT_EQ(slice.bytes, core.slice(slice).size());
       if (previous) {
         EXPECT_EQ(previous.location.filenum(), slice.location.filenum());
         EXPECT_LE(previous.end().offset(), slice.location.offset());
@@ -442,9 +444,8 @@ protected:
   }
 
   static InputStream openSlice(SegmentCore& core, Slice slice) {
-    auto input = core.getInputStreamSeek(slice.location);
-    auto* start = input.ptr();
-    return {start, start + slice.bytes};
+    auto bytes = core.slice(slice);
+    return {bytes.data(), bytes.data() + bytes.size()};
   }
 
   template <class Reader>
@@ -456,8 +457,9 @@ protected:
     checkSlices(core, {leaves, directory});
     ASSERT_NE(nullptr, field.points());
     EXPECT_EQ(*field.points(), part);
-    auto input = core.getInputStream(part.location.filenum());
-    Reader sliced(input, part.location.offset(), leaves.bytes, directory.bytes);
+    ASSERT_EQ(0u, leaves.location.offset() % MAX_ALIGN);
+    auto input = openSlice(core, {leaves.location, leaves.bytes + directory.bytes});
+    Reader sliced(input, 0, leaves.bytes, directory.bytes);
     Reader current(core.rootReader(), field);
     EXPECT_EQ(count, sliced.leafCount());
     EXPECT_EQ(part.maxPointsPerLeaf, sliced.maxPointsPerLeaf());
@@ -777,8 +779,8 @@ TEST_P(FieldPartsTest, IndexAndColumnSlices) {
     ASSERT_TRUE(en.seek("word"));
     const auto state = en.postingsState();
     ASSERT_LT(state.docsStart, state.docsEnd);
-    EXPECT_EQ(run.docs.end().offset(), (uint64_t)state.docIS.size());
-    EXPECT_EQ(run.positions.end().offset(), (uint64_t)state.posIS.size());
+    EXPECT_EQ(run.docs.bytes, (uint64_t)state.docIS.size());
+    EXPECT_EQ(run.positions.bytes, (uint64_t)state.posIS.size());
     DocsPosEnum docs(en);
     PosEnum pos(docs);
     ASSERT_EQ(0, docs.nextDoc());
@@ -797,15 +799,14 @@ TEST_P(FieldPartsTest, IndexAndColumnSlices) {
   EXPECT_EQ(n.index().end().offset() - n.blocks().location.offset(), numericCheckoutBytes);
   ASSERT_TRUE(numInfo.numberColumn());
   EXPECT_EQ(*numInfo.numberColumn(), number.column);
-  auto blocks = core.getInputStreamSeek(n.blocks().location);
-  auto index = core.getInputStreamSeek(n.index().location);
-  std::span indexBytes(index.ptr(), n.index().bytes);
+  auto blocks = core.slice(n.blocks());
+  auto indexBytes = core.slice(n.index());
   EXPECT_FALSE(NumColumnFormat::LeafMeta::decode(indexBytes.first(indexBytes.size() - 1), NUM_DOCS));
   EXPECT_FALSE(numInfo.ordColumn());
   EXPECT_FALSE(numInfo.bytesColumn());
   IntColReader currentNumbers(postings, numInfo);
   IntColReader::Iterator numberDocs(currentNumbers);
-  IntColReader numberAtSlice(blocks.ptr(), indexBytes, NUM_DOCS);
+  IntColReader numberAtSlice(blocks.data(), indexBytes, NUM_DOCS);
   IntColReader::Iterator slicedNumbers(numberAtSlice);
   for (int32_t i = 0; i < NUM_DOCS; ++i) {
     ASSERT_EQ(i, slicedNumbers.next());

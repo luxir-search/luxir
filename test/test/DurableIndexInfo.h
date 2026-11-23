@@ -66,12 +66,13 @@ inline void expectValidInventory(Directory& dir, const api::IndexInfo& info) {
     auto id = Postings::segmentKey(seg.seg_id, seg.creator_epoch);
     auto first = dir.openFile(Postings::getIndexFileName(id, 0));
     ASSERT_NE(nullptr, first);
-    auto bytes = first->read();
+    auto hold = first->acquire({0, first->size()});
+    auto bytes = hold.bytes();
     ASSERT_LE(seg.catalog.offset, bytes.size());
     ASSERT_EQ(seg.catalog.length, bytes.size() - seg.catalog.offset);
-    auto tail = std::span(bytes).subspan(seg.catalog.offset);
+    auto tail = bytes.subspan(seg.catalog.offset);
     EXPECT_EQ(seg.catalog.xxh3, XXH3_64bits(tail.data(), tail.size()));
-    auto head = SegmentCatalog::readDirectory(std::span(bytes));
+    auto head = SegmentCatalog::readDirectory(bytes);
     EXPECT_EQ(seg.catalog.offset, head.catalogOffset());
     for (auto number : head.fileNumbers()) expected.insert(Postings::getIndexFileName(id, number));
     if (seg.live_gen) expected.insert(Postings::getLiveDocsFileName(id, seg.live_gen, seg.live_epoch));
@@ -83,7 +84,8 @@ inline void expectValidInventory(Directory& dir, const api::IndexInfo& info) {
     EXPECT_TRUE(actual.emplace(descriptor.name).second);
     auto file = dir.openFile(descriptor.name);
     ASSERT_NE(nullptr, file);
-    auto bytes = file->read();
+    auto hold = file->acquire({0, file->size()});
+    auto bytes = hold.bytes();
     EXPECT_EQ(descriptor.size, bytes.size());
     EXPECT_EQ(descriptor.xxh3, XXH3_64bits(bytes.data(), bytes.size()));
   }

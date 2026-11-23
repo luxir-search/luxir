@@ -62,7 +62,8 @@ struct ColdFile {
 #else
     std::vector<unsigned char> vec(length / PAGE);
 #endif
-    if (mincore((void*)(file->read().data() + offset), length, vec.data()) != 0) return 0;
+    auto hold = file->acquire({offset, length});
+    if (mincore((void*)hold.getData(), length, vec.data()) != 0) return 0;
     size_t n = 0;
     for (auto v : vec) n += v & 1;
     return n;
@@ -161,10 +162,11 @@ TEST(ReadAheadTest, faultsTurnSparseAdviceOnAndResidentBatchesOff) {
     // Four major faults in the first 256 units: 1/64, above the 1/128 bar.
     // Without read-around, each fault reads only its page: a read_ahead_kb
     // window (2 MiB on some cloud volumes) would cover the later pages.
-    void* base = (void*)cold.file->read().data();
+    auto hold = cold.file->acquire({0, cold.file->size()});
+    void* base = (void*)hold.getData();
     ASSERT_EQ(0, madvise(base, cold.file->size(), MADV_RANDOM));
     for (size_t at : {1u << 20, 2u << 20, 3u << 20, 7u << 19}) {
-      volatile char sink = cold.file->read()[at];
+      volatile char sink = hold.bytes()[at];
       unused(sink);
     }
     ASSERT_EQ(0, madvise(base, cold.file->size(), MADV_NORMAL));

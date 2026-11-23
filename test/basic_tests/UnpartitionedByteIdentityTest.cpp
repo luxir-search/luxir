@@ -56,7 +56,8 @@ TEST(UnpartitionedByteIdentityTest, DefaultMergeCorpus) {
   for (const auto& name : files) {
     if (!name.starts_with(prefix)) continue;
     auto input = index.dir.openFile(name);
-    std::string_view bytes = input->read();
+    auto hold = input->acquire({0, input->size()});
+    auto bytes = hold.bytes();
     uint64_t nameLen = name.size();
     uint64_t byteLen = bytes.size();
     dump.write((const char*) &nameLen, sizeof(nameLen));

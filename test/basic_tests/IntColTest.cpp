@@ -426,7 +426,8 @@ TEST_F(IntColTest, linearPackFormatCorners) {
     dir.finishFile(*file);
 
     auto in = dir.openFile("numeric");
-    InputStream input(in->getInputStream());
+    auto hold = in->acquire({0, in->size()});
+    InputStream input = hold.stream();
     IntColReader reader(input.ptr(data.columnLoc),
                         std::span(input.ptr(data.columnLoc + data.columnMetaOff), data.indexBytes),
                         data.numValues);
@@ -561,7 +562,8 @@ TEST_F(IntColTest, leafVisitOrders) {
   out.close();
   dir.finishFile(*file);
   auto in = dir.openFile("numeric");
-  InputStream input(in->getInputStream());
+  auto hold = in->acquire({0, in->size()});
+  InputStream input = hold.stream();
   IntColReader reader(input.ptr(data.columnLoc),
                       std::span(input.ptr(data.columnLoc + data.columnMetaOff), data.indexBytes),
                       data.numValues);
@@ -625,7 +627,8 @@ TEST_F(IntColTest, valueSketchEstimates) {
     out.close();
     dir.finishFile(*file);
     auto in = dir.openFile("numeric");
-    InputStream input(in->getInputStream());
+    auto hold = in->acquire({0, in->size()});
+    InputStream input = hold.stream();
     IntColReader reader(input.ptr(data.columnLoc),
                         std::span(input.ptr(data.columnLoc + data.columnMetaOff), data.indexBytes),
                         data.numValues);
@@ -937,7 +940,8 @@ TEST_F(IntColTest, testMono) {
     dir.finishFile(*file);
 
     auto in = dir.openFile("mono");
-    InputStream is(in->getInputStream());
+    auto hold = in->acquire({0, in->size()});
+    InputStream is = hold.stream();
     MonoReader r(is, data.columnLoc, data.columnMetaOff, data.numValues);
 
     ASSERT_EQ(data.numValues, r.numValues());
@@ -961,7 +965,8 @@ TEST_F(IntColTest, testMono) {
     dir.finishFile(*file);
 
     auto in = dir.openFile("mono");
-    InputStream is(in->getInputStream());
+    auto hold = in->acquire({0, in->size()});
+    InputStream is = hold.stream();
     //   MonoReader(InputStream& columnIS, int64_t loc, int64_t metaOff, int64_t nValues) : nValues(nValues)
 
     MonoReader r(is, data.columnLoc, data.columnMetaOff, data.numValues);
@@ -1003,7 +1008,8 @@ TEST_F(IntColTest, testMonoRepeatedValues) {
   dir.finishFile(*file);
   
   auto in = dir.openFile("mono");
-  InputStream is(in->getInputStream());
+  auto hold = in->acquire({0, in->size()});
+  InputStream is = hold.stream();
   MonoReader r(is, data.columnLoc, data.columnMetaOff, data.numValues);
   
   ASSERT_EQ(data.numValues, r.numValues());
@@ -1035,7 +1041,8 @@ TEST_F(IntColTest, monoValuesAtSpansBlockBoundaries) {
   dir.finishFile(*file);
 
   auto in = dir.openFile("mono");
-  InputStream input(in->getInputStream());
+  auto hold = in->acquire({0, in->size()});
+  InputStream input = hold.stream();
   MonoReader reader(input, data.columnLoc, data.columnMetaOff, data.numValues);
 
   EXPECT_EQ(reader.valuesAt(0),
@@ -1064,7 +1071,8 @@ TEST_F(IntColTest, monoFractionalSlope) {
   dir.finishFile(*file);
 
   auto in = dir.openFile("mono");
-  InputStream input(in->getInputStream());
+  auto hold = in->acquire({0, in->size()});
+  InputStream input = hold.stream();
   NumBlockInfo info;
   memcpy(&info,
          input.ptr(data.columnLoc + data.columnMetaOff), sizeof(info));
@@ -1115,7 +1123,8 @@ TEST_F(IntColTest, testMonoBig) {
     dir.finishFile(*file);
 
     auto in = dir.openFile("mono");
-    InputStream is(in->getInputStream());
+    auto hold = in->acquire({0, in->size()});
+    InputStream is = hold.stream();
     MonoReader r(is, data.columnLoc, data.columnMetaOff, data.numValues);
 
     // confirm stateless value retrieval
