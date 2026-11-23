@@ -1278,7 +1278,8 @@ TEST_F(IndexWriterTest, unrelatedDeleteDoesNotDeleteLaterAllowDups) {
   EXPECT_EQ(1, iw->snapshots.readers.getReader()->liveDocs());
 }
 
-TEST_F(IndexWriterTest, requestBirthsValidateOnOpen) {
+// The open reads no version runs; their first use validates them.
+TEST_F(IndexWriterTest, requestBirthsValidateOnFirstUse) {
   RAMDir dir;
   PostingsWriter writer(dir, 1, 1, 3);
   PostingsWriter::VersionRunsWriter versions(writer);
@@ -1286,7 +1287,9 @@ TEST_F(IndexWriterTest, requestBirthsValidateOnOpen) {
   versions.add(4, 7); // The last boundary is outside maxDoc.
   versions.finish();
   ASSERT_TRUE(writer.finish());
-  EXPECT_THROW(SegmentCore::create(dir, 1, 1), std::runtime_error);
+  auto core = SegmentCore::create(dir, 1, 1);
+  EXPECT_THROW(core->versionRuns(), SegmentCorruptError);
+  EXPECT_THROW(core->versionRuns(), SegmentCorruptError);
   PostingsWriter missing(dir, 2, 1, 1);
   EXPECT_THROW(missing.finish(), std::runtime_error);
 }

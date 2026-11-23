@@ -8,15 +8,26 @@
 #include "CatalogRange.h"
 #include "IdFilter.h"
 #include "VersionRuns.h"
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <span>
 #include "luxir/store/Directory.h"
+#include "luxir/util/SharedLazyCell.h"
 
 namespace luxir {
 class AcquireJoin;
 class OwnershipShape;
 namespace api { struct SegmentInfo; }
+
+// Reads segments make beyond their open, which acquires only file headers and
+// the catalog. Counted where a part is first held, so only on backends without
+// free holds: RAM and mmap hand out free views and count nothing.
+struct SegmentOpenCounters {
+  std::atomic<uint64_t> segmentsOpened{0};      // segments with a first read beyond the catalog
+  std::atomic<uint64_t> segmentBytesMapped{0};  // bytes of the parts those reads hold
+};
+inline SegmentOpenCounters segmentOpenCounters;
 
 // Immutable segment bundle. Shared across snapshots and with the writer;
 // liveness and overlays belong to the snapshot, not these base files.
@@ -48,7 +59,13 @@ private:
   std::map<std::pair<uint64_t, uint64_t>, HeldRange> holds;
   SegmentCatalog catalog;
   CatalogRange range;
-  VersionRuns versions;
+  // Built on first use. A build that throws publishes nothing, so the next
+  // use retries it.
+  mutable SharedLazyCell<VersionRuns> versions;
+  // Set when the open has read what it needs; later first holds are counted.
+  bool opened = false;
+  std::atomic<bool> readBeyondCatalog{false};
+  std::atomic<uint64_t> bytesBeyondCatalog{0};
 
   const uint64_t segId;
   const uint64_t creatorEpoch;
@@ -68,6 +85,9 @@ private:
   void initializeSpaces();
   std::span<const char> retain(InputFile& file, field_parts::Slice part, ReadClass readClass);
   void releaseHold(field_parts::Slice part);
+  void countFirstHold(uint64_t bytes) noexcept;
+  const VersionRuns& buildVersionRuns() const;
+  const OwnershipShape* buildOwnership(SpaceOrdinal child) const;
 
 public:
   static Source source(uint64_t id, uint64_t epoch, CatalogRange range, int32_t maxDoc,
@@ -98,8 +118,11 @@ public:
   std::optional<SpaceOrdinal> spaceOrdinal(std::string_view path) const noexcept;
   PostingsReader* spaceReader(SpaceOrdinal ordinal) noexcept;
   PostingsReader* spaceReader(std::string_view path) noexcept;
-  const OwnershipShape* ownership(SpaceOrdinal child) const noexcept;
-  const OwnershipShape* ownership(std::string_view path) const noexcept;
+  // The child space's ownership shape, null for the root or an absent space.
+  // Built on first use, which may acquire its columns and throws
+  // SegmentCorruptError when they are invalid.
+  const OwnershipShape* ownership(SpaceOrdinal child) const;
+  const OwnershipShape* ownership(std::string_view path) const;
 
   std::string segmentName() const { return Postings::segmentKey(segId, creatorEpoch); }
 
@@ -107,7 +130,16 @@ public:
   uint64_t epoch() const noexcept { return creatorEpoch; }
   PostingsReader& rootReader() noexcept { return root; }
   const PostingsReader& rootReader() const noexcept { return root; }
-  const VersionRuns& versionRuns() const noexcept { return versions; }
+  // Built on first use, which may acquire the version runs part.
+  const VersionRuns& versionRuns() const {
+    auto* built = versions.peek();
+    return built ? *built : buildVersionRuns();
+  }
+
+  // Whether this core has held a part beyond the open's headers and catalog,
+  // and the bytes of those parts; see SegmentOpenCounters.
+  bool readPastCatalog() const noexcept { return readBeyondCatalog.load(std::memory_order_relaxed); }
+  uint64_t bytesPastCatalog() const noexcept { return bytesBeyondCatalog.load(std::memory_order_relaxed); }
 
   // The root "id" field's membership filter, or none when the segment wrote no
   // filter part. Throws SegmentCorruptError when the part does not parse.

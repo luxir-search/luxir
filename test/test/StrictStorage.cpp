@@ -136,7 +136,10 @@ public:
   void sizeRequested() {
     if (!sized) counters->sizeRequested(name);
   }
-  void submitted(bool batch) { counters->submitted(name, batch); }
+  void submitted(bool batch) {
+    if (counters->takeInjectedFailure()) throw FileIOException("strict: injected acquire failure on " + name);
+    counters->submitted(name, batch);
+  }
 
   // A part's bytes are metadata or data whoever reads them, so a cache hint
   // must not depend on which reader acquires the part first.
