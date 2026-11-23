@@ -26,7 +26,10 @@ namespace luxir {
 /// leaves in the vector are released before the batch counts as complete. A
 /// batch that completes inline (memory, a mapping, the default batch) runs
 /// `take` before acquire() returns, and wait() then returns without blocking.
-/// wait() rethrows the first error a batch, or a `take`, reported.
+/// A batch's failure, or its `take` throwing, goes to the error slot the
+/// batch was issued with, so a caller joining batches for several owners can
+/// tell whose failed; wait() rethrows the first failure of a batch issued
+/// without one.
 ///
 /// The destructor waits for batches still in flight, so a caller that throws
 /// between acquire() and wait() leaves no completion running on freed state.
@@ -36,9 +39,10 @@ class AcquireJoin {
   size_t pending = 0;
   std::exception_ptr error;
 
-  void complete(std::exception_ptr failure) noexcept {
+  void complete(std::exception_ptr failure, std::exception_ptr* slot) noexcept {
     std::lock_guard lock(mutex);
-    if (failure && !error) error = std::move(failure);
+    auto& first = slot ? *slot : error;
+    if (failure && !first) first = std::move(failure);
     if (--pending == 0) finished.notify_all();
   }
 
@@ -55,11 +59,13 @@ public:
   AcquireJoin& operator=(const AcquireJoin&) = delete;
   ~AcquireJoin() { await(); }
 
-  /// Starts one batch on `file`, which must outlive wait(). A throw (only
-  /// allocation) leaves the batch unissued.
-  void acquire(InputFile& file, std::span<const ByteRange> ranges, Take take) {
+  /// Starts one batch on `file`, which must outlive wait(). A failure goes
+  /// to `slot` when given, unless it already holds one; the join writes it
+  /// under its lock, and it must outlive wait(). A throw (only allocation)
+  /// leaves the batch unissued.
+  void acquire(InputFile& file, std::span<const ByteRange> ranges, Take take, std::exception_ptr* slot = nullptr) {
     // Built before the batch counts as pending: the conversion can allocate.
-    AcquireDone done = [this, count = ranges.size(), take = std::move(take)](
+    AcquireDone done = [this, count = ranges.size(), take = std::move(take), slot](
                            std::vector<HeldRange>&& delivered, std::exception_ptr failure) noexcept {
       // Owned here, so what `take` leaves releases before the waiter wakes
       // and can destroy the file.
@@ -73,7 +79,7 @@ public:
         }
       }
       holds.clear();
-      complete(std::move(failure));
+      complete(std::move(failure), slot);
     };
     {
       std::lock_guard lock(mutex);
@@ -82,7 +88,8 @@ public:
     file.acquireBatch(ranges, std::move(done));
   }
 
-  /// Blocks until every batch completed, then rethrows the first error.
+  /// Blocks until every batch completed, then rethrows the first failure of
+  /// a batch issued without a slot.
   void wait() {
     await();
     std::lock_guard lock(mutex);

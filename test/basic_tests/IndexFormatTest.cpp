@@ -457,6 +457,9 @@ TEST_F(IndexFormatTest, malformedSegmentMetadataThrows) {
     auto manifest = segment;
     corrupt(changed, manifest);
     writeFile(copy, file, changed);
+    // An open reads every file the manifest lists, so the one the catalog
+    // does not know exists, and the inventory check is what rejects it.
+    writeFile(copy, unknownFile, bytes);
     expectCorrupt([&] { SegmentCore::create(copy, manifest); }, namesFile ? file : segmentName, reason);
   }
 }

@@ -163,11 +163,11 @@ locations, browse `src/luxir/<area>/`.
 7. **Storage** (`src/luxir/store/`)
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
      `FSDirectory` (on-disk, mmap reads), `CheckedDirectory` (validation wrapper)
-   - `InputFile`: acquires file ranges as `HeldRange` objects, one at a time or in
-     a completion-based batch (`AcquireJoin` waits on batches across files). RAM
-     and mmap supply views valid for the file's lifetime. Each `ByteRange` carries a `ReadClass`
-     (`METADATA` or `DATA`), and `Directory::openFile` takes `OpenOptions` (`expectSynced`, and
-     the size a manifest records)
+   - `InputFile`: acquires file ranges as `HeldRange` objects, one at a time or in a
+     completion-based batch (`acquireBatch`; `AcquireJoin` waits on batches across
+     files). RAM and mmap supply views valid for the file's lifetime. Each `ByteRange`
+     carries a `ReadClass` (`METADATA` or `DATA`), and `Directory::openFile` takes
+     `OpenOptions` (`expectSynced`, and the size a manifest records)
    - `InputStream` / `OutputStream`: codec I/O primitives. The catalog and record
      codecs validate directory entries, field offsets and data slices within their input ranges
    - `IndexFormat`: the on-disk format version, recorded in each manifest and in every data

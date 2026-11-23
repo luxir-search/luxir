@@ -35,6 +35,9 @@ private:
   struct BaseFile {
     std::shared_ptr<InputFile> file;
     uint64_t size = 0;  // Read once at open; checked against the manifest when it records one.
+    // RAM and mmap hand out views valid for the file's lifetime, so slice()
+    // retains nothing for them and acquireSlices() requests nothing. Every
+    // other path, the open included, is the same for every backend.
     bool holdsFree = false;
   };
   std::vector<BaseFile> files;
@@ -52,16 +55,18 @@ private:
   std::vector<std::unique_ptr<ChildSpace>> children;
   PostingsReader root;
 
+  struct PendingOpen;
+
   SegmentCore(uint64_t segId, uint64_t creatorEpoch);
   bool openBaseFile(Directory& dir, std::string_view segment, uint32_t number, uint64_t expected,
                     bool missingFileOK, bool expectSynced, bool checkHeader);
-  bool beginOpen(Directory& dir, std::string_view segment, const Source& source, bool missingFileOK,
-                 bool expectSynced, AcquireJoin& join);
-  bool finishOpen(Directory& dir, std::string_view segment, const Source& source, bool missingFileOK,
-                  bool expectSynced);
+  static void openPending(Directory& dir, std::span<PendingOpen> opens, bool missingFileOK, bool expectSynced);
+  bool beginOpen(Directory& dir, PendingOpen& pending, bool missingFileOK, bool expectSynced, AcquireJoin& join);
+  void finishOpen(const PendingOpen& pending);
   bool initializeFromFiles(Directory& dir, bool missingFileOK, bool expectSynced);
   void initializeSpaces();
   std::span<const char> retain(InputFile& file, field_parts::Slice part, ReadClass readClass);
+  void releaseHold(field_parts::Slice part);
 
 public:
   static Source source(uint64_t id, uint64_t epoch, CatalogRange range, int32_t maxDoc,
@@ -73,12 +78,15 @@ public:
                                             bool expectSynced = false);
   static std::shared_ptr<SegmentCore> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
                                             bool missingFileOK = false, bool expectSynced = false);
-  // Opens the segments together: every file 0 acquires its header and catalog
-  // in one batch, and all batches are issued before any catalog is decoded.
-  // An entry is null where a file is missing and missingFileOK is set.
-  static std::vector<std::shared_ptr<SegmentCore>> create(Directory& dir,
-                                                          std::span<const api::SegmentInfo* const> segments,
-                                                          bool missingFileOK = false, bool expectSynced = false);
+  // Opens together each segment whose entry in `cores` is null, and stores
+  // its core there. Every file's header and every file 0's catalog go out in
+  // one round of batches before any catalog is decoded. The segments fail in
+  // order, as if opened one at a time: the first that fails throws, naming
+  // the segment, and from the first with a missing file (when missingFileOK
+  // is set) the entries stay null.
+  static void open(Directory& dir, std::span<const api::SegmentInfo> segments,
+                   std::span<std::shared_ptr<SegmentCore>> cores, bool missingFileOK = false,
+                   bool expectSynced = false);
   explicit SegmentCore(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
   ~SegmentCore();
   SegmentCore(const SegmentCore&) = delete;
@@ -143,8 +151,9 @@ public:
   void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass = ReadClass::DATA);
   // Issues the same batches on `join` without waiting, so batches of several
   // segments go out together; slice() makes no request once join.wait()
-  // returns.
-  void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join);
+  // returns. A failure goes to `error` when given; see AcquireJoin::acquire.
+  void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join,
+                     std::exception_ptr* error = nullptr);
 
 };
 
