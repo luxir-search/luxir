@@ -23,6 +23,7 @@
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/search/LiveDocsMemory.h"
 
 namespace luxir {
 namespace {
@@ -44,7 +45,8 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   memory.node_budget_bytes = node.getConfig().max_ram_mb * 1024 * 1024;
   memory.search_request_limit_bytes = node.getConfig().search.request_memory_max_bytes;
   memory.schema_cache_bytes = node.collections().schemaBytes();
-  memory.live_docs_heap_bytes = fieldMetadataMemory.liveDocsHeapBytes.load(std::memory_order_relaxed);
+  memory.live_docs_heaps = liveDocsMemory.sparseRoots.count.load(std::memory_order_relaxed);
+  memory.live_docs_heap_bytes = liveDocsMemory.sparseRoots.bytes.load(std::memory_order_relaxed);
   memory.storage_ram.used_bytes = node.storageBytes();
   auto storageMemory = node.collections().storage().memory();
   memory.storage_ram.limit_bytes = storageMemory ? storageMemory->limitBytes() : 0;
@@ -62,8 +64,8 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   fields.opened_entry_bytes = fieldMetadataMemory.openedEntryBytes.load(std::memory_order_relaxed);
   fields.names = fieldMetadataMemory.names.load(std::memory_order_relaxed);
   fields.name_bytes = fieldMetadataMemory.nameBytes.load(std::memory_order_relaxed);
-  fields.live_views = fieldMetadataMemory.liveViews.load(std::memory_order_relaxed);
-  fields.live_view_bytes = fieldMetadataMemory.liveViewBytes.load(std::memory_order_relaxed);
+  fields.live_views = liveDocsMemory.views.count.load(std::memory_order_relaxed);
+  fields.live_view_bytes = liveDocsMemory.views.bytes.load(std::memory_order_relaxed);
   fields.bytes = fields.directory_bytes + fields.page_bytes + fields.entry_bytes
       + fields.opened_page_bytes + fields.opened_entry_bytes + fields.name_bytes + fields.live_view_bytes;
   auto process = processAllocatorStats();

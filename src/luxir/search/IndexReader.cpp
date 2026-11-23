@@ -52,22 +52,13 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
 
 } // namespace
 
-LiveDocs::LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive, bool sparseFile)
-    : ownedWords(std::move(words)), docSet(FixedBitSet(ownedWords.get(), maxDoc), numLive),
-      derivedBytes(sizeof(*this) + FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t)), sparseFile(sparseFile) {
-  auto& count = sparseFile ? fieldMetadataMemory.liveDocsHeaps : fieldMetadataMemory.liveViews;
-  auto& bytes = sparseFile ? fieldMetadataMemory.liveDocsHeapBytes : fieldMetadataMemory.liveViewBytes;
-  count.fetch_add(1, std::memory_order_relaxed);
-  bytes.fetch_add(derivedBytes, std::memory_order_relaxed);
+LiveDocs::LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive, LiveDocsMemory::Counter& counter)
+    : ownedWords(std::move(words)), docSet(FixedBitSet(ownedWords.get(), maxDoc), numLive), memory(&counter) {
+  counter.add(heapBytes());
 }
 
 LiveDocs::~LiveDocs() {
-  if (derivedBytes) {
-    auto& count = sparseFile ? fieldMetadataMemory.liveDocsHeaps : fieldMetadataMemory.liveViews;
-    auto& bytes = sparseFile ? fieldMetadataMemory.liveDocsHeapBytes : fieldMetadataMemory.liveViewBytes;
-    count.fetch_sub(1, std::memory_order_relaxed);
-    bytes.fetch_sub(derivedBytes, std::memory_order_relaxed);
-  }
+  if (memory) memory->remove(heapBytes());
 }
 
 std::shared_ptr<LiveDocs> ChildLiveDocs::get() {
@@ -100,7 +91,7 @@ std::shared_ptr<LiveDocs> ChildLiveDocs::get() {
         if (first < last) words[first >> 6] &= ~((1ULL << (last - first)) - 1);
       }
     }
-    auto result = live == count ? nullptr : std::make_shared<LiveDocs>(std::move(words), count, live);
+    auto result = live == count ? nullptr : std::make_shared<LiveDocs>(std::move(words), count, live, liveDocsMemory.views);
     knownCard.store(live, std::memory_order_release);
     return result;
   });
@@ -193,7 +184,7 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
       words[doc >> 6] &= ~(1ULL << (doc & 63));
       prev = doc;
     }
-    return std::make_shared<LiveDocs>(std::move(words), maxDoc, numLiveDocs, true);
+    return std::make_shared<LiveDocs>(std::move(words), maxDoc, numLiveDocs, liveDocsMemory.sparseRoots);
   }
 
   // The bitmap borrows the bytes from the hold.

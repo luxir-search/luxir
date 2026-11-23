@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "DocSet.h"
+#include "LiveDocsMemory.h"
 #include "Similarity.h"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/SegmentCore.h"
@@ -39,8 +40,8 @@ private:
   HeldRange deleteHold;
   std::unique_ptr<uint64_t[]> ownedWords;
   BitDocSet docSet;
-  size_t derivedBytes = 0;
-  bool sparseFile = false;
+  // Charged with heapBytes() while this LiveDocs owns its bitmap; null when mapped.
+  LiveDocsMemory::Counter* memory = nullptr;
   mutable std::mutex rankLiveMutex;
   mutable std::vector<std::pair<std::string, std::unique_ptr<const RankLiveBitmap>>> rankLiveViews;
 
@@ -52,10 +53,9 @@ public:
       : deleteFile(std::move(file)), deleteHold(std::move(hold)),
         docSet(FixedBitSet(bits, maxDocCount), numLive) {}
 
-  // A heap bitmap: a child view derived from root deletes, or (sparseFile) a
-  // root generation expanded from a SPARSE live docs file. Each kind has its
-  // own memory counter.
-  LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive, bool sparseFile = false);
+  // A heap bitmap, charged to `counter` until destroyed: a child view derived from
+  // root deletes, or a root generation expanded from a SPARSE live docs file.
+  LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive, LiveDocsMemory::Counter& counter);
   ~LiveDocs();
 
   // Static factory method to create LiveDocs from delete bitmap file.  Do not call this if liveGen is 0 (no
@@ -90,7 +90,9 @@ public:
   }
 
   // Bytes this LiveDocs holds on the heap; 0 for a mapped DENSE file.
-  size_t heapBytes() const { return derivedBytes; }
+  size_t heapBytes() const {
+    return ownedWords ? sizeof(*this) + FixedBitSet::sizeInWords(size()) * sizeof(uint64_t) : 0;
+  }
 
   int32_t numDeletes() const {
     return size() - numLive();
