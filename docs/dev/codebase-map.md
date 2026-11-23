@@ -143,16 +143,9 @@ locations, browse `src/luxir/<area>/`.
        finish/flush visits each once in global physical-name order
    - `PostingsWriter`: used by an Inverter on flush to write a new segment.
    - `LiveDocsWriter`: one immutable file per delete generation (indexing errors,
-     applied deletes, merge live docs diffs), with no deltas between generations.
-     A 24-byte header (data file header, kind, maxDoc, numLive) precedes a DENSE
-     body (the live bitmap, mapped in place by `LiveDocs::create`) or, when smaller,
-     a SPARSE body (sorted uint32 deleted doc ids, 4 bytes per delete). The trade-off
-     is resident memory: a loaded SPARSE generation is expanded into a pinned heap
-     bitmap of maxDoc / 8 bytes per loaded generation (reported as
-     `memory.live_docs_heap_bytes`; writer copies held by merges and delete
-     application are charged to the indexing budget), while a DENSE one is mapped
-     and lives in evictable page cache. `IndexWriter::loadLiveDocs` reuses the
-     published reader's generation when it matches, so the writer adds no copy then.
+     applied deletes, merge live docs diffs): a DENSE live bitmap, mapped in place
+     by `LiveDocs::create`, or with few deletes a SPARSE list of deleted doc ids,
+     which readers expand into a heap bitmap (`memory.live_docs_heap_bytes`).
    - `PointsWriter` builds 1-D sorted leaves. `BasicBKDWriter<PointTraits>`
      shares 2-D tree construction, docid codecs, and the bounded parallel leaf
      pipeline: `BKDInt32Traits` serves geo (`BKDWriter`), and `BKDInt64Traits`

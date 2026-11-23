@@ -14,8 +14,8 @@
 
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/LiveDocsWriter.h"
-#include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/search/IndexReader.h"
+#include "luxir/search/LiveDocsMemory.h"
 #include "luxir/server/LuxirNode.h"
 #include "luxir/util/Signal.h"
 #include "test/CollectionHelper.h"
@@ -106,20 +106,20 @@ TEST_F(LiveDocsTest, writerPicksSmallerKindAndReaderRestoresBits) {
     auto name = Postings::getLiveDocsFileName(Postings::segmentKey(1, 1), 1, 1);
     EXPECT_EQ(expected, dir.openFile(name)->size());
 
-    auto before = fieldMetadataMemory.liveDocsHeapBytes.load();
-    auto views = fieldMetadataMemory.liveViewBytes.load();
+    auto before = liveDocsMemory.sparseRoots.bytes.load();
+    auto views = liveDocsMemory.views.bytes.load();
     auto live = LiveDocs::create(dir, 1, 1, 1, 1, 100, false);
     ASSERT_NE(nullptr, live);
     // A sparse file is expanded into a heap bitmap with its own counter; child
     // live views keep theirs.
     uint64_t heap = deletes < 4 ? sizeof(LiveDocs) + 16 : 0;
     EXPECT_EQ(heap, live->heapBytes());
-    EXPECT_EQ(before + heap, fieldMetadataMemory.liveDocsHeapBytes.load());
-    EXPECT_EQ(views, fieldMetadataMemory.liveViewBytes.load());
+    EXPECT_EQ(before + heap, liveDocsMemory.sparseRoots.bytes.load());
+    EXPECT_EQ(views, liveDocsMemory.views.bytes.load());
     EXPECT_EQ(deletes, live->numDeletes());
     for (int32_t doc = 0; doc < 100; doc++) EXPECT_EQ(bits.get(doc), live->bitset().get(doc)) << doc;
     live.reset();
-    EXPECT_EQ(before, fieldMetadataMemory.liveDocsHeapBytes.load());
+    EXPECT_EQ(before, liveDocsMemory.sparseRoots.bytes.load());
   }
 }
 

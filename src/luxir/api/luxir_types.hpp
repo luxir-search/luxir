@@ -412,6 +412,7 @@ struct MemoryStats {
   uint64_t node_budget_bytes = 0;
   uint64_t search_request_limit_bytes = 0;
   uint64_t schema_cache_bytes = 0;
+  uint64_t live_docs_heaps = 0;
   uint64_t live_docs_heap_bytes = 0;
 };
 struct StatsTotals {
