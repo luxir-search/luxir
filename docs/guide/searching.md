@@ -1253,6 +1253,25 @@ number of distinct lists scanned in that segment. Rescans do not increase
 `initial_nprobe`, so they are not directly comparable to it. Pieces that never
 ran IVF carry none of these fields.
 
+The profile also counts the whole request's storage I/O, across all of its
+threads and streamed batches:
+
+| Field | Meaning |
+| --- | --- |
+| `io_acquires` | Ranges the search's segments acquired from storage that hands out held copies (any backend other than RAM and mmap, whose views cost nothing). |
+| `io_acquired_bytes` | Bytes those ranges cover. |
+| `io_requests` | Store requests a storage backend or layer counted for the search, such as ranged GETs to an object store. |
+| `io_rounds` | Sequential waits on the store; requests awaited together count once. |
+| `io_fetched_bytes` | Bytes those requests returned. |
+
+A segment keeps the ranges it acquires until it closes, so a search whose
+ranges are already held acquires nothing. Reads done to build state that later
+searches share count for the search that builds it. Core counts the acquires;
+the backend counts its own requests, so on local files, and on a backend that
+counts nothing, `io_requests`, `io_rounds` and `io_fetched_bytes` are zero.
+Node-wide totals are in `_stats` (`service.search_io_*`, see
+[operations](operations.md)).
+
 ## Streaming HTTP responses
 
 The normal HTTP response is chunked NDJSON. Each line is a complete response

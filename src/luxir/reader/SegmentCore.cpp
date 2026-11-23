@@ -14,6 +14,7 @@
 #include "luxir/store/AcquireJoin.h"
 #include "luxir/store/FileIOException.h"
 #include "luxir/api/luxir_index.hpp"
+#include "luxir/util/IoContext.h"
 
 namespace luxir {
 
@@ -60,7 +61,12 @@ void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadC
   for (auto& [number, batch] : batches) {
     std::vector<ByteRange> ranges;
     ranges.reserve(batch.size());
-    for (auto [raw, bytes] : batch) ranges.push_back({seg_location::fromRaw(raw).offset(), bytes, readClass});
+    uint64_t total = 0;
+    for (auto [raw, bytes] : batch) {
+      ranges.push_back({seg_location::fromRaw(raw).offset(), bytes, readClass});
+      total += bytes;
+    }
+    countAcquire(total, ranges.size());
     join.acquire(*files[number].file, ranges, [this, batch = std::move(batch)](std::vector<HeldRange>&& acquired) {
       if (acquired.size() != batch.size()) throw FileIOException("batched acquire returned the wrong number of holds");
       uint64_t added = 0;
@@ -95,6 +101,7 @@ std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice pa
     auto found = holds.lower_bound(key);
     if (found != holds.end() && found->first == key) return found->second.bytes();
     auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
+    countAcquire(part.bytes);
     bytes = holds.emplace_hint(found, key, std::move(hold))->second.bytes();
   }
   countFirstHold(part.bytes);
@@ -218,6 +225,7 @@ bool SegmentCore::openBaseFile(Directory& dir, std::string_view segment, uint32_
   }
   if (checkHeader) {
     auto header = file->acquire({0, Postings::LUXIR_HEADER.size(), ReadClass::METADATA});
+    if (!holdsFree) countAcquire(header.getLength());
     validateSegmentFileHeader(header.bytes(), segment, number);
   }
   if (number >= files.size()) files.resize(number + 1);

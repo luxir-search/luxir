@@ -772,10 +772,16 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena, startTime);
   req.requestState = std::move(requestState);
   req.parent = &call;
-  if (!req.proto.min_commit.empty()) {
-    call.enableWaitCancellation();
-    req.waitCancellation = call.waitCancellation;
+  // The client's deadline is the storage layer's hint for hedging (IoContext),
+  // and storage waits end a margin before it (IoContext::waitDeadline).
+  if (auto left = call.genericCtx.deadline() - std::chrono::system_clock::now();
+      left < std::chrono::hours(24 * 365)) {
+    req.io.setDeadline(startTime + std::chrono::duration_cast<std::chrono::steady_clock::duration>(left), startTime);
   }
+  // A client cancel (or a server stop) ends the request's waits: a min_commit
+  // wait, a storage layer's own fetch, a wait on a shared build (IoContext::stop).
+  call.enableWaitCancellation();
+  req.waitCancellation = call.waitCancellation;
   // Every search leaves this completion-queue thread for the task arena (see
   // SearchEngine::Receiver): gRPC offers a connection's new calls to its
   // preferred cq first, so a query run here would serialize the concurrent
