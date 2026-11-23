@@ -269,6 +269,29 @@ TEST(StrictStorageTest, batchesForwardAsOneRound) {
   EXPECT_EQ(2u, counters->totalRounds());
 }
 
+TEST(StrictStorageTest, batchReportsErrorsThroughDone) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters, StrictWholeFiles::DENY);
+  auto name = Postings::getIndexFileName(Postings::segmentKey(1, 1), 0u);
+  put(dir, name);
+  auto file = dir.openFile(name);
+  ASSERT_NE(nullptr, file);
+  ByteRange outside[] = {{0, 2}, {1, UINT64_MAX}};
+  ByteRange whole[] = {{0, 2}, {0, file->size()}};
+  for (auto ranges : {std::span<const ByteRange>(outside), std::span<const ByteRange>(whole)}) {
+    int calls = 0;
+    std::exception_ptr error;
+    EXPECT_NO_THROW(file->acquire(ranges, [&](std::vector<HeldRange>&& holds, std::exception_ptr failure) {
+      ++calls;
+      EXPECT_TRUE(holds.empty());
+      error = failure;
+    }));
+    EXPECT_EQ(1, calls);
+    EXPECT_NE(nullptr, error);
+  }
+  EXPECT_EQ(0u, counters->fileStats(name).batches);
+}
+
 TEST(StrictStorageTest, joinWaitsForBatchesCompletingElsewhere) {
   auto counters = std::make_shared<StrictStorageCounters>();
   StrictDirectory dir(std::make_shared<RAMDir>(), counters);
