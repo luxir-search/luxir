@@ -43,8 +43,8 @@ namespace {
 // The digest of the reference index written by IndexFormat::VERSION. A byte
 // change requires reviewing the format version. Writer choices among layouts
 // already supported by that version can change the digest within the version.
-constexpr uint64_t kReferenceVersion = 16;
-constexpr uint64_t kReferenceDigest = 0x546d55a9c469d50d;
+constexpr uint64_t kReferenceVersion = 17;
+constexpr uint64_t kReferenceDigest = 0x8df212bff9a64ad9;
 
 // A small index over every default field template's kind, with three segments
 // and a delete. Each segment is one request flushed by a single inverter.
@@ -229,7 +229,7 @@ TEST_F(IndexFormatTest, referenceIndexBytesMatchFormatVersion) {
 TEST_F(IndexFormatTest, serialRootMergeBytesMatchReference) {
   auto digest = buildMergedReferenceDigest();
   ASSERT_EQ(digest, buildMergedReferenceDigest()) << "the serial merge is not deterministic";
-  EXPECT_EQ(0xe402da4c8227236eULL, digest) << std::format("merged digest {:#x}", digest);
+  EXPECT_EQ(0x2ca76afa0391dcf9ULL, digest) << std::format("merged digest {:#x}", digest);
 }
 
 TEST_F(IndexFormatTest, otherFormatVersionFailsToLoad) {
