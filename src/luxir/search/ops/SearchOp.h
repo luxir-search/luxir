@@ -19,6 +19,8 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
+#include "luxir/query/QueryPruning.h"
+#include "luxir/query/SegmentMask.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/DomainVariantPlan.h"
 #include "luxir/search/RowRelation.h"
@@ -166,6 +168,21 @@ public:
   BucketDomainPlan* bucketDomain = nullptr;
   InputDomainPlan* inputDomain = nullptr;
   bool needsStructuralScope = false;
+  // The op's root mask: the segments its own query and filters (and the
+  // domains of the children it produces) may match, from the segments' field record headers.
+  // A pruned segment contributes exactly an empty match: the op builds no
+  // supplier, scorer or count there and feeds its children empty domains.
+  // Unrestricted (the default) for ops that consume no query.
+  SegmentMask viable;
+  // Cross-check mode (QueryPruning::crossCheck): unscored weights of the
+  // roots behind `viable`, each with the segments its proofs allow. A pruned
+  // segment still runs every check whose mask excludes it, and a match is an
+  // error (crossCheckPruned).
+  struct PruneCheck {
+    Query::Weight* weight;
+    SegmentMask membership;
+  };
+  std::vector<PruneCheck> pruneChecks;
 
   // We can't pass both the parent and children to constructors (and have them fully formed)
   // one has to come before the other.  The parser currently sets subOps and parent
@@ -173,6 +190,13 @@ public:
   SearchOp(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view name)
     : segmentStateRetentions(view->segments().size()), req(req), view(view), name(name) {
   }
+
+  bool segmentPruned(int32_t segment) const noexcept {
+    return segment >= 0 && !viable.test((size_t)segment);
+  }
+
+  // Runs the cross-check weights proven empty on pruned `segment`.
+  void crossCheckPruned(IndexReader::Segment& segment) const;
 
   virtual void init() {
     for (auto& [name, subOp] : subOps) {
@@ -260,6 +284,18 @@ public:
   virtual bool facetBucketSharesSegmentState() const {
     return std::ranges::any_of(subOps, [](const auto& entry) {
       return entry.second->facetBucketSharesSegmentState();
+    });
+  }
+
+  // Whether this subtree runs a weight that prepares over the whole index
+  // (Weight::needsPrepare, such as kNN's global top k). Preparation reads
+  // every segment's domain, so no op substitutes the empty domain for a
+  // pruned segment where a preparing weight could see it. Ops holding
+  // weights override this.
+  virtual bool needsWholePreparation() const {
+    if (bucketDomain && bucketDomain->variants.sourcesNeedPrepare()) return true;
+    return std::ranges::any_of(subOps, [](const auto& entry) {
+      return entry.second->needsWholePreparation();
     });
   }
 
@@ -1039,6 +1075,21 @@ public:
   bool empty() const { return size() == 0; }
   bool dense() const { return rep == Rep::DENSE; }
 };
+
+inline void SearchOp::crossCheckPruned(IndexReader::Segment& segment) const {
+  for (const auto& check : pruneChecks) {
+    // A weight preparing over the whole index has no scorer without its pass.
+    if (check.weight == nullptr || check.membership.test((size_t)segment.ord) || check.weight->needsPrepare()) continue;
+    MemPool pool;
+    auto* scorer = check.weight->createScorer(pool, segment);
+    bool hit = scorer != nullptr && scorer->next() != PostingsReader::END;
+    check.weight->releaseSegmentState(segment);
+    if (hit) {
+      QueryPruning::crossCheckFailed(std::format("op {} matched segment {} (ord {}) a proof pruned",
+                                                 name, segment.segInfo.seg_id, segment.ord));
+    }
+  }
+}
 
 using FacetEntryTable = KeyedAggregateTable<>;
 
