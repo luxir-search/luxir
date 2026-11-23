@@ -164,14 +164,27 @@ default acquires each range in turn and completes inline, and
 A segment reads every part through `SegmentCore::slice()`, or through
 `SegmentCore::slices()`, which issues one batch per file and keeps the holds
 the same way. A manifest open acquires each file's header and the catalog
-range, never a whole segment file. A snapshot open issues one batch per new
-segment's file 0, holding its header and catalog, issues all of them before
-it decodes any catalog, and waits on them together, so a backend that
-completes batches asynchronously serves every catalog in one round. The
-version runs, a nested segment's ownership columns and the other files'
-headers still follow one acquire at a time. For now the segment keeps the holds it hands out until it closes, so
-nothing held is evicted; releasing holds when a request ends comes with a
-bounded cache.
+range and nothing else, never a whole segment file. A snapshot open issues one
+batch per new segment's file 0, holding its header and catalog, issues all of
+them before it decodes any catalog, and waits on them together, so a backend
+that completes batches asynchronously serves every catalog in one round. The
+headers of the other files still follow, one acquire each. For now the segment
+keeps the holds it hands out until it closes, so nothing held is evicted;
+releasing holds when a request ends comes with a bounded cache.
+
+What a segment builds from its parts waits for first use:
+
+- The version runs are acquired and checked by the first reader that needs
+  them, such as a query returning `_version_`, a delete or a merge.
+- An ownership shape is built when a nested query, a mapping or a child live
+  view first uses it. Its first use acquires its columns together with those
+  of the unbuilt shapes above it, in one batch.
+- A build that fails publishes nothing. A failed read fails that use with the
+  backend's error and the next use reads again; bytes that fail validation
+  throw `SegmentCorruptError` on every use.
+- `segmentOpenCounters` counts the segments with a first hold beyond the
+  catalog and the bytes those holds cover (`segments_opened`,
+  `segment_bytes_mapped`). Free views (RAM, mmap) are not counted.
 
 - A manifest open passes each file's recorded size to `Directory::openFile`,
   so a backend can answer `size()` without a request. Files with free holds

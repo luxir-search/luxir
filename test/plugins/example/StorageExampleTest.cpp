@@ -11,6 +11,7 @@
 #include "luxir/store/Manifest.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/store/CorruptionMarker.h"
+#include "luxir/store/FileIOException.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "test/CollectionHelper.h"
@@ -136,9 +137,10 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
     expected[number].emplace(0, Postings::LUXIR_HEADER.size());
     metadata[number].emplace(0, Postings::LUXIR_HEADER.size());
   });
+  // The open acquires the headers and the catalog, nothing it can build later.
   expectPart({{0, range.offset}, range.length}, ReadClass::METADATA);
-  expectPart(catalog.versionRuns().slice, ReadClass::METADATA);
   check();
+  EXPECT_FALSE(postings.core().readPastCatalog());
 
   for (auto field : {"freqs", "body_w"}) {
     const auto* record = postings.fieldInfo(field);
@@ -160,10 +162,22 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
       check();
     }
   }
+  EXPECT_TRUE(postings.core().readPastCatalog());
+
+  // The first query that returns versions acquires the version runs, once.
+  expectPart(catalog.versionRuns().slice, ReadClass::METADATA);
+  for (int i = 0; i < 2; ++i) {
+    auto req = localReq(h.getSearchEngine());
+    req->topDocs().matchQuery("freqs", "needle").fields({"_version_"});
+    req->execute(reader);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    check();
+  }
 }
 
 // A manifest open issues one batch per segment's file 0, holding its header and
-// catalog, and issues all of them before it reads anything else.
+// catalog, issues all of them before it reads anything else, and reads nothing
+// more: version runs and ownership shapes wait for their first use.
 TEST_F(StorageExampleTest, manifestOpenAcquiresCatalogsInOneRound) {
   LuxirConfig config;
   LuxirNode node(config);
@@ -187,14 +201,23 @@ TEST_F(StorageExampleTest, manifestOpenAcquiresCatalogsInOneRound) {
     auto range = catalogRangeFromManifest(segment.catalog);
     auto stats = counters->fileStats(name);
     EXPECT_EQ(1u, stats.batches) << name;
-    EXPECT_EQ(2u, stats.rounds) << name;  // the catalog batch, then the version runs
+    EXPECT_EQ(1u, stats.rounds) << name;
     EXPECT_TRUE(stats.metadataParts.contains({0, Postings::LUXIR_HEADER.size()})) << name;
     EXPECT_TRUE(stats.metadataParts.contains({range.offset, range.length})) << name;
     firstRounds.push_back(stats.firstRound);
   }
   std::ranges::sort(firstRounds);
   EXPECT_EQ((std::vector<uint64_t>{1, 2, 3}), firstRounds);
-  EXPECT_EQ(6u, counters->totalRounds());
+  EXPECT_EQ(3u, counters->totalRounds());
+  auto opened = segmentOpenCounters.segmentsOpened.load();
+  for (auto& segment : reader->segments()) EXPECT_FALSE(segment.segmentCore().readPastCatalog());
+
+  // The first use of the version runs acquires them as one more round.
+  auto& first = reader->segments().front().segmentCore();
+  first.versionRuns();
+  EXPECT_EQ(4u, counters->totalRounds());
+  EXPECT_TRUE(first.readPastCatalog());
+  EXPECT_EQ(opened + 1, segmentOpenCounters.segmentsOpened.load());
 
   // A later batch acquires only the parts the segment does not hold yet.
   auto& core = reader->segments().front().postingsReader().core();
@@ -275,6 +298,34 @@ TEST_F(StorageExampleTest, nestedReaderOpensWithWholeSegmentFilesDenied) {
   const auto* shape = reader->segments().front().postingsReader().core().ownership("items_nested");
   ASSERT_TRUE(shape);
   EXPECT_EQ(2, shape->childCount());
+}
+
+// A first use whose read fails fails only that use: nothing is kept from it,
+// so the next use reads again and succeeds.
+TEST_F(StorageExampleTest, failedFirstUseIsRetried) {
+  LuxirConfig config;
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  CollectionHelper::UpdateBuilder input;
+  input.addRaw([](auto& doc, auto& arena) {
+    ASSERT_TRUE(api::read_json(doc, R"({"id":"a","items_nested":[{},{}]})", arena));
+  });
+  ASSERT_TRUE(h.submit(input.commit()).success);
+  auto writer = h.getIndexWriter();
+  auto snapshot = *writer->snapshots.snapshot();
+  snapshot.openCores.clear();
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
+  auto reader = std::make_shared<IndexReader>(dir, snapshot);
+  auto& core = reader->segments().front().segmentCore();
+
+  counters->failNextRounds(1);
+  EXPECT_THROW(core.versionRuns(), FileIOException);
+  EXPECT_EQ(1u, core.versionRuns().runs().size());
+  counters->failNextRounds(1);
+  EXPECT_THROW(core.ownership("items_nested"), FileIOException);
+  ASSERT_TRUE(core.ownership("items_nested"));
+  EXPECT_EQ(2, core.ownership("items_nested")->childCount());
 }
 
 TEST_F(StorageExampleTest, strictRejectsInvalidWholeFileMode) {

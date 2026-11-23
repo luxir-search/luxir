@@ -52,8 +52,10 @@ locations, browse `src/luxir/<area>/`.
      read source; wildcard discovery returns logical primaries only
 
 3. **Segment Reading** (`src/luxir/reader/`)
-   - `SegmentCore` owns a segment bundle's open files, retained byte ranges and root
-     VersionRuns, shared across snapshots and with the writer. `slice()` acquires
+   - `SegmentCore` owns a segment bundle's open files, retained byte ranges, root
+     VersionRuns and ownership shapes, shared across snapshots and with the writer.
+     A manifest open reads only file headers and the catalog; version runs and shapes
+     are built on first use and a failed build is retried by the next use. `slice()` acquires
      parts from the files, `slices()` acquires them in one batch per file, and
      both retain holds that need release until the core closes. File 0's catalog indexes field records by row-space path (root is
      the empty path) and field name. Each space has a
@@ -68,7 +70,7 @@ locations, browse `src/luxir/<area>/`.
      filter; the writer's delete application skips ids and segments it excludes
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
-     opening reads metadata and endpoints without scanning child rows.
+     its first use reads metadata and endpoints without scanning child rows.
    - `PostingsReader` caches decoded field records. `FieldCursor` walks field ordinals
      in name order and lets merge decode temporary records without populating the cache.
    - `TermsEnum` enumerates or finds indexed terms for a field's record.

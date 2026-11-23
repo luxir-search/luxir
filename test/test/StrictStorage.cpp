@@ -124,7 +124,10 @@ public:
   }
 
   void sizeRequested() { counters->sizeRequested(name); }
-  void round(bool batch) { counters->round(name, batch); }
+  void round(bool batch) {
+    if (counters->takeInjectedFailure()) throw FileIOException("strict: injected acquire failure on " + name);
+    counters->round(name, batch);
+  }
 
   void wholeFile() {
     counters->wholeFile(name);

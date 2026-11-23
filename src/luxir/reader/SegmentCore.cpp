@@ -30,10 +30,11 @@ void validateSegmentFileHeader(std::span<const char> bytes, std::string_view seg
 
 struct SegmentCore::ChildSpace {
   PostingsReader reader;
-  OwnershipShape shape;
+  SpaceOrdinal parent;
+  SharedLazyCell<OwnershipShape> shape;
 
-  ChildSpace(SegmentCore& core, SpaceOrdinal ordinal, OwnershipShape shape)
-      : reader(core, ordinal), shape(std::move(shape)) {}
+  ChildSpace(SegmentCore& core, SpaceOrdinal ordinal, SpaceOrdinal parent)
+      : reader(core, ordinal), parent(parent) {}
 };
 
 SegmentCore::SegmentCore(uint64_t segId, uint64_t creatorEpoch)
@@ -62,8 +63,14 @@ void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadC
     for (auto [raw, bytes] : batch) ranges.push_back({seg_location::fromRaw(raw).offset(), bytes, readClass});
     join.acquire(*files[number].file, ranges, [this, batch = std::move(batch)](std::vector<HeldRange>&& acquired) {
       if (acquired.size() != batch.size()) throw FileIOException("batched acquire returned the wrong number of holds");
-      std::lock_guard lock(holdsMutex);
-      for (size_t i = 0; i < batch.size(); ++i) holds.try_emplace(batch[i], std::move(acquired[i]));
+      uint64_t added = 0;
+      {
+        std::lock_guard lock(holdsMutex);
+        for (size_t i = 0; i < batch.size(); ++i) {
+          if (holds.try_emplace(batch[i], std::move(acquired[i])).second) added += batch[i].second;
+        }
+      }
+      if (added) countFirstHold(added);
     });
   }
 }
@@ -81,12 +88,39 @@ std::vector<std::span<const char>> SegmentCore::slices(std::span<const field_par
 }
 
 std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice part, ReadClass readClass) {
-  std::lock_guard lock(holdsMutex);
-  auto key = std::pair(part.location.raw(), part.bytes);
-  auto found = holds.lower_bound(key);
-  if (found != holds.end() && found->first == key) return found->second.bytes();
-  auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
-  return holds.emplace_hint(found, key, std::move(hold))->second.bytes();
+  std::span<const char> bytes;
+  {
+    std::lock_guard lock(holdsMutex);
+    auto key = std::pair(part.location.raw(), part.bytes);
+    auto found = holds.lower_bound(key);
+    if (found != holds.end() && found->first == key) return found->second.bytes();
+    auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
+    bytes = holds.emplace_hint(found, key, std::move(hold))->second.bytes();
+  }
+  countFirstHold(part.bytes);
+  return bytes;
+}
+
+void SegmentCore::countFirstHold(uint64_t bytes) noexcept {
+  if (!opened) return;  // the open's own headers and catalog
+  bytesBeyondCatalog.fetch_add(bytes, std::memory_order_relaxed);
+  segmentOpenCounters.segmentBytesMapped.fetch_add(bytes, std::memory_order_relaxed);
+  if (!readBeyondCatalog.exchange(true, std::memory_order_relaxed)) {
+    segmentOpenCounters.segmentsOpened.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+const VersionRuns& SegmentCore::buildVersionRuns() const {
+  return *versions.getOrCreate([this] {
+    const auto& version = catalog.versionRuns();
+    if (!version.slice) return std::make_shared<VersionRuns>();
+    auto bytes = const_cast<SegmentCore*>(this)->slice(version.slice, ReadClass::METADATA);
+    SegmentReadContext context{this, PackedTerm(nullptr), version.slice.location.filenum()};
+    auto runs = std::make_shared<VersionRuns>(bytes.data(), bytes.size(), version.trailerOffset, version.count,
+                                              spaces()[0].maxDoc, context);
+    if (runs->byteSize() != bytes.size()) context.invalid("version runs slice does not match its header");
+    return runs;
+  });
 }
 
 std::optional<SpaceOrdinal> SegmentCore::spaceOrdinal(std::string_view path) const noexcept {
@@ -103,12 +137,33 @@ PostingsReader* SegmentCore::spaceReader(std::string_view path) noexcept {
   return ordinal ? spaceReader(*ordinal) : nullptr;
 }
 
-const OwnershipShape* SegmentCore::ownership(SpaceOrdinal child) const noexcept {
-  if (child == SpaceOrdinal::ROOT) return nullptr;
-  return (size_t)child < spaces().size() ? &children[(size_t)child - 1]->shape : nullptr;
+const OwnershipShape* SegmentCore::ownership(SpaceOrdinal child) const {
+  if (child == SpaceOrdinal::ROOT || (size_t)child >= spaces().size()) return nullptr;
+  auto* built = children[(size_t)child - 1]->shape.peek();
+  return built ? built : buildOwnership(child);
 }
 
-const OwnershipShape* SegmentCore::ownership(std::string_view path) const noexcept {
+const OwnershipShape* SegmentCore::buildOwnership(SpaceOrdinal child) const {
+  auto& core = const_cast<SegmentCore&>(*this);
+  auto& space = *children[(size_t)child - 1];
+  // A mapping walks from the root, so the shapes above this one are likely
+  // next: acquire the columns of every unbuilt shape on the path in one batch.
+  std::vector<field_parts::Slice> parts;
+  for (auto ordinal = child; ordinal != SpaceOrdinal::ROOT; ordinal = children[(size_t)ordinal - 1]->parent) {
+    if (children[(size_t)ordinal - 1]->shape.peek()) continue;
+    const auto& descriptor = spaces()[(size_t)ordinal].ownership;
+    for (auto part : {descriptor.ends, descriptor.owners}) {
+      if (part) parts.push_back(part);
+    }
+  }
+  if (parts.size() > 1) core.slices(parts);
+  return space.shape.getOrCreate([&] {
+    return std::make_shared<OwnershipShape>(core, spaces()[(size_t)child].ownership,
+                                            spaces()[(size_t)space.parent].maxDoc, spaces()[(size_t)child].maxDoc);
+  }).get();
+}
+
+const OwnershipShape* SegmentCore::ownership(std::string_view path) const {
   auto ordinal = spaceOrdinal(path);
   return ordinal ? ownership(*ordinal) : nullptr;
 }
@@ -233,21 +288,15 @@ bool SegmentCore::initializeFromFiles(Directory& dir, bool missingFileOK, bool e
   return true;
 }
 
+// Reads nothing beyond the catalog: version runs and ownership shapes are
+// built on first use.
 void SegmentCore::initializeSpaces() {
-  const auto& version = catalog.versionRuns();
-  if (version.slice) {
-    auto bytes = slice(version.slice, ReadClass::METADATA);
-    SegmentReadContext context{this, PackedTerm(nullptr), version.slice.location.filenum()};
-    versions = VersionRuns(bytes.data(), bytes.size(), version.trailerOffset, version.count, spaces()[0].maxDoc, context);
-    if (versions.byteSize() != bytes.size()) context.invalid("version runs slice does not match its header");
-  }
   root.initialize(spaces()[0].maxDoc, spaces()[0].fields.size());
   children.reserve(spaces().size() - 1);
   for (size_t i = 1; i < spaces().size(); ++i) {
     const auto& space = spaces()[i];
     auto parent = spaceOrdinal(spaceParentPath(space.path));
-    OwnershipShape shape(*this, space.ownership, spaces()[(size_t)*parent].maxDoc, space.maxDoc);
-    auto child = std::make_unique<ChildSpace>(*this, (SpaceOrdinal)i, std::move(shape));
+    auto child = std::make_unique<ChildSpace>(*this, (SpaceOrdinal)i, *parent);
     child->reader.initialize(space.maxDoc, space.fields.size());
     children.push_back(std::move(child));
   }
@@ -283,6 +332,7 @@ std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, uint64_t segId,
     join.wait();
   }
   if (!core->finishOpen(dir, segment, source, missingFileOK, expectSynced)) return nullptr;
+  core->opened = true;
   return core;
 }
 
@@ -308,6 +358,7 @@ std::vector<std::shared_ptr<SegmentCore>> SegmentCore::create(Directory& dir,
   }
   for (size_t i = 0; i < cores.size(); ++i) {
     if (cores[i] && !cores[i]->finishOpen(dir, names[i], sources[i], missingFileOK, expectSynced)) cores[i] = nullptr;
+    if (cores[i]) cores[i]->opened = true;
   }
   return cores;
 }
@@ -316,12 +367,14 @@ std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, uint64_t segId,
                                                  bool missingFileOK, bool expectSynced) {
   auto core = std::shared_ptr<SegmentCore>(new SegmentCore(segId, creatorEpoch));
   if (!core->initializeFromFiles(dir, missingFileOK, expectSynced)) return nullptr;
+  core->opened = true;
   return core;
 }
 
 SegmentCore::SegmentCore(Directory& dir, uint64_t segId, uint64_t creatorEpoch)
     : SegmentCore(segId, creatorEpoch) {
   initializeFromFiles(dir, false, false);
+  opened = true;
 }
 
 } // namespace luxir
