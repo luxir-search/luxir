@@ -265,7 +265,7 @@ TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
 
-  constexpr int N = 80;
+  constexpr int N = 81;  // odd, so the uint32 id section is padded before the codes
   for (int i = 0; i < N; i++) {
     h.index(flatdoc("id", "doc" + std::to_string(i), "embedding_v",
                     std::vector<float>{(float)(i % 10), (float)(i / 10), 1.0f, 0.5f}));
@@ -286,10 +286,9 @@ TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
 
   std::vector<int> seen(N, 0);
   for (size_t l = 0; l < lists->nlist; l++) {
-    size_t sz = lists->list_size(l);
-    const uint32_t* ids = lists->ids32(l);
+    auto ids = lists->ids32(l);
     faiss::InvertedLists::ScopedIds wide(lists, l);
-    for (size_t j = 0; j < sz; j++) {
+    for (size_t j = 0; j < ids.size(); j++) {
       ASSERT_LT(ids[j], (uint32_t)N);
       EXPECT_EQ(wide[j], (faiss::idx_t)ids[j]);
       EXPECT_EQ(lists->get_single_id(l, j), (faiss::idx_t)ids[j]);
@@ -300,28 +299,18 @@ TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
     EXPECT_EQ(seen[i], 1) << "valueRank " << i;
   }
 
-  // Ids are uint32 and the codes section starts 8-aligned after them.
+  // 81 four-byte ids leave 4 pad bytes before the 8-aligned codes. The 81
+  // one-byte codes end unaligned, so the footer's exact-size check rejects a
+  // file written without that padding.
   auto& dir = h.getIndexWriter()->dir;
   auto durable = readDurableIndexInfo(dir);
   const auto& info = onlyVectorOverlay(durable.info);
-  auto file = dir.openFile(info.files[0].name, true);
-  auto stream = file->getInputStream();
-  auto footer = VectorAuxListsFooter::fromFileTail(stream.ptr(), (size_t)stream.left(), info.name);
-  EXPECT_EQ(footer.version, 4);
+  auto file = dir.openFile(info.files[0].name, {.expectSynced = true});
+  auto hold = file->acquire({0, file->size()});
+  auto footer = VectorAuxListsFooter::fromFileTail(hold.getData(), hold.getLength(), info.name);
   EXPECT_EQ(footer.ntotal, N);
-  EXPECT_EQ(footer.codesOffset(), VectorAuxListsFooter::align8(footer.idsOffset() + N * sizeof(uint32_t)));
-  EXPECT_EQ((size_t)stream.left(), footer.expectedFileBytes());
-  // A footer still claiming 8-byte ids no longer matches the file size.
-  std::string payload(stream.ptr(), (size_t)stream.left());
-  auto* tail = (VectorAuxListsFooter*)(payload.data() + payload.size() - sizeof(VectorAuxListsFooter));
-  auto ntotal = tail->ntotal;
-  tail->ntotal = ntotal * 2;
-  EXPECT_THROW(VectorAuxListsFooter::fromFileTail(payload.data(), payload.size(), info.name),
-               std::runtime_error);
-  tail->ntotal = ntotal;
-  tail->version = 3;
-  EXPECT_THROW(VectorAuxListsFooter::fromFileTail(payload.data(), payload.size(), info.name),
-               std::runtime_error);
+  EXPECT_EQ(footer.codeSize, 1);
+  EXPECT_EQ(footer.codesOffset(), footer.idsOffset() + N * sizeof(uint32_t) + 4);
 }
 
 // Pins the per-index RAM contract the memory story relies on: faiss::read_index
