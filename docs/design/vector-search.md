@@ -346,13 +346,20 @@ plain `IndexFlat` and `IndexIVFPQ`; readers need no build-specific types.
 
 ## Memory-Mapped Index Layout
 
-Index data stays memory-mapped at query time. The aux file holds a small FAISS
+Index data stays in the file at query time. The aux file holds a small FAISS
 header (index parameters, IVF centroids, and the PQ codebooks) followed by
 the inverted-list payloads (codes and vector ids) in Luxir's own layout; the
 reader decodes only the header into memory and serves list scans directly from
-the mmapped file. Residency of the bulk index data is therefore managed by the
-OS page cache, like the vector column itself, rather than forced into process
-RAM.
+the file. Residency of the bulk index data is therefore managed by the OS page
+cache (or the storage backend), like the vector column itself, rather than
+forced into process RAM.
+
+The overlay's metadata records the header's length, so opening the reader
+acquires the header, the list-size table and the fixed-size footer in one
+batch, and nothing else. On a mapped or RAM file lists point into the file's
+view. On other backends each list is held only while it is read: FAISS's `get_ids` /
+`get_codes` acquire the list's range and `release_ids` / `release_codes`
+release it.
 
 RaBitQ overlays also store upward-rounded float32 error amplitudes after the
 codes in inverted-list order: sigma1 for 1-bit, sigmaB for multi-bit
@@ -365,10 +372,11 @@ reconstruction error norm divided by sqrt(max(1, D-1)), with a factor of two
 for squared L2. Sigma1 is computed from the sign reconstruction error before
 the fixed 1.9 confidence multiplier. These amplitudes support empirical
 confidence intervals; they are not deterministic error bounds. The reader
-exposes a mmap view, validates finite, non-negative amplitudes once at open and
-exposes per-list spans for sequential, unchecked scan loads. Metadata and footer
-version 3 validate the component count and file size;
-older formats fail on open and must be rebuilt.
+validates a list's amplitudes (finite, non-negative) on the list's first scan,
+which reads those bytes anyway, and scans then load them unchecked. A corrupt
+amplitude fails the queries that reach its list. The footer validates the
+component count and file size; metadata version 5 and footer version 3 are
+current, and older formats fail on open and must be rebuilt.
 
 `VectorIndexBuilder::finishRaBitQCode` writes the sign-bit factors for every
 code: `dp_multiplier = ||r||^2 * sqrt(D) / sum(|r_i|)` (zero when the sum is

@@ -279,15 +279,16 @@ TEST_F(VectorAnnCodecTest, amplitudesFollowListOffsetsAcrossListsAndMerge) {
           ASSERT_NE(aux[seg], nullptr);
           auto* ivf = dynamic_cast<faiss::IndexIVFRaBitQ*>(aux[seg]->getFaissIndex());
           ASSERT_NE(ivf, nullptr);
-          const auto& amplitudes = aux[seg]->getAmplitudes();
-          EXPECT_EQ(amplitudes.offsets.back(), (size_t)ivf->ntotal);
+          const auto& lists = aux[seg]->getLists();
+          EXPECT_EQ(lists.totalSize(), (size_t)ivf->ntotal);
           auto& segment = reader->segments()[seg];
           const auto& columnInfo = *segment.postingsReader().fieldInfo("emb_v");
           VectorReader column(segment.postingsReader(), columnInfo);
           std::vector<float> x((size_t)dims), rotated((size_t)dims), centroid((size_t)dims);
           for (size_t list = 0; list < ivf->nlist; list++) {
             ivf->quantizer->reconstruct((faiss::idx_t)list, centroid.data());
-            auto span = amplitudes.list(list);
+            HeldInvertedLists::Amplitudes amplitudes(lists, list);
+            auto span = amplitudes.span();
             ASSERT_EQ(span.size(), ivf->invlists->list_size(list));
             std::unique_ptr<faiss::FlatCodesDistanceComputer> computer(
                 ivf->rabitq.get_distance_computer(0, centroid.data()));

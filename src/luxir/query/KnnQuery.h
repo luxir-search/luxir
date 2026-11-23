@@ -1326,7 +1326,7 @@ public:
             .ivfEngine = std::make_unique<SegmentIvfScanner<Groups, Owned>>(
                 *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
                 metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
-                vaux->getAmplitudes(), interval ? &intervals : nullptr),
+                vaux->getLists(), interval ? &intervals : nullptr),
           });
         } else {
           slots.push_back({
@@ -1957,7 +1957,7 @@ public:
     // task-local, while the bounded cut spans every chunk and segment.
     template <bool Groups, bool Owned> class SegmentIvfScanner {
       const CollapsePlan* groupPlan;
-      RaBitQAmplitudes amplitudes;
+      const HeldInvertedLists& lists;
       KnnIntervalCollector<Groups>* intervals;
 
       /// Resolve-based eligibility selector over the live-filtered query
@@ -2167,8 +2167,8 @@ public:
                         IndexReader::Segment& seg, const Binding<Owned>& v2d, DocSet* domain,
                         std::shared_ptr<const RankLiveBitmap> rankLive, int32_t metric,
                         const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
-                        RaBitQAmplitudes amplitudes, KnnIntervalCollector<Groups>* intervals)
-          : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
+                        const HeldInvertedLists& lists, KnnIntervalCollector<Groups>* intervals)
+          : groupPlan(groupPlan), lists(lists), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
             segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
             domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
                                         && domain == &liveDocs->docset()),
@@ -2288,9 +2288,10 @@ public:
         for (size_t list = 0; list < listIds.size(); list++) {
           auto id = listIds[list];
           if (id < 0) continue;
-          faiss::InvertedLists::ScopedIds ids(ivf.invlists, (size_t)id);
-          faiss::InvertedLists::ScopedCodes codes(ivf.invlists, (size_t)id);
-          size_t count = ivf.invlists->list_size((size_t)id);
+          size_t count = lists.list_size((size_t)id);
+          faiss::InvertedLists::ScopedIds ids(&lists, (size_t)id);
+          faiss::InvertedLists::ScopedCodes codes(&lists, (size_t)id);
+          std::optional<HeldInvertedLists::Amplitudes> heldAmplitudes;
           visited += (int64_t)count;
           rowIds = ids.get();
           std::unique_ptr<faiss::FlatCodesDistanceComputer> distanceComputer;
@@ -2310,7 +2311,7 @@ public:
               gError = dc->g_error;
             }
           } else pqScanner->set_list(id, centroidDists[list]);
-          if constexpr (Interval) listAmplitudes = amplitudes.list((size_t)id).data();
+          if constexpr (Interval) listAmplitudes = heldAmplitudes.emplace(lists, (size_t)id).data();
           double gateScale = (double)gError * (RABITQ_GATE_EPSILON / 1.9f);
           selectionScale = (double)gError * RABITQ_SELECTION_EPSILON;
 

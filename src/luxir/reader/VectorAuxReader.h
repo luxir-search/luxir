@@ -13,7 +13,12 @@
 #include <faiss/invlists/InvertedLists.h>
 #include <faiss/utils/distances.h>
 
+#include <boost/unordered/unordered_flat_map.hpp>
+
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +28,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -30,6 +36,7 @@
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/store/Directory.h"
+#include "luxir/store/HeldRange.h"
 #include "luxir/store/InputStream.h"
 #include "luxir/util/log.h"
 #include "luxir/util/luxir_util.h"
@@ -45,7 +52,7 @@ namespace luxir {
 /// segments they describe, never shipped between hosts.
 LUXIR_UNALIGNED_START
 struct VectorAuxMeta {
-  static constexpr int32_t VERSION = 4;
+  static constexpr int32_t VERSION = 5;
   int32_t version = VERSION;
   int32_t dims = 0;
   int32_t metric = 0;       // raw luxir::api::VectorMetric value
@@ -58,6 +65,10 @@ struct VectorAuxMeta {
 
   int32_t rotationKind = 0;  // ENGINE_IVFRABITQ only: VectorRotation kind
   uint64_t rotationSeed = 0; // ENGINE_IVFRABITQ only: VectorRotation seed
+  // Length of the file's FAISS header (VectorAuxListsFooter). With nlist and
+  // the file size it places the header, the list sizes and the footer, so a
+  // reader acquires all three in one batch.
+  int64_t faissHeaderBytes = 0;
 
   // IVF + product quantization; the FAISS header is a bare IndexIVFPQ.
   static constexpr int32_t ENGINE_IVFPQ = 1;
@@ -81,6 +92,11 @@ struct VectorAuxMeta {
       throw std::runtime_error(std::format(
         "VectorAuxMeta: aux '{}' has unsupported metadata version {}",
         auxName, (int32_t)meta.version));
+    }
+    if (meta.faissHeaderBytes <= 0 || meta.nlist <= 0) {
+      throw std::runtime_error(std::format(
+        "VectorAuxMeta: aux '{}' has invalid header length {} or nlist {}",
+        auxName, (int64_t)meta.faissHeaderBytes, (int32_t)meta.nlist));
     }
     if (meta.engine != ENGINE_IVFPQ && meta.engine != ENGINE_IVFRABITQ) {
       // (int32_t) copies: can't bind a reference to a packed field.
@@ -106,7 +122,7 @@ inline int32_t defaultIvfNList(int64_t n) {
   return (int32_t)std::min<int64_t>(derived, n);
 }
 
-static_assert(sizeof(VectorAuxMeta) == 10 * sizeof(int32_t) + sizeof(uint64_t),
+static_assert(sizeof(VectorAuxMeta) == 10 * sizeof(int32_t) + sizeof(uint64_t) + sizeof(int64_t),
               "VectorAuxMeta layout is an on-disk contract");
 
 // Intern by the disk parameters so each query rotates once per transform.
@@ -177,13 +193,23 @@ struct VectorAuxListsFooter {
   /// Decode + validate the footer at the tail of a fileBytes-long file.
   static VectorAuxListsFooter fromFileTail(const char* base, size_t fileBytes,
                                            std::string_view auxName) {
+    checkFits(fileBytes, auxName);
+    return decode(base + fileBytes - sizeof(VectorAuxListsFooter), fileBytes, auxName);
+  }
+
+  static void checkFits(size_t fileBytes, std::string_view auxName) {
     if (fileBytes < sizeof(VectorAuxListsFooter)) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: aux '{}' file is {} bytes, smaller than the lists footer",
         auxName, fileBytes));
     }
+  }
+
+  /// Decode + validate a footer read from the tail of a fileBytes-long file.
+  static VectorAuxListsFooter decode(const char* bytes, size_t fileBytes, std::string_view auxName) {
+    checkFits(fileBytes, auxName);
     VectorAuxListsFooter f;
-    std::memcpy(&f, base + fileBytes - sizeof(VectorAuxListsFooter), sizeof(f));
+    std::memcpy(&f, bytes, sizeof(f));
     if (f.magic != MAGIC) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: aux '{}' is not in the header+lists layout (bad magic)", auxName));
@@ -228,55 +254,154 @@ inline constexpr size_t RABITQ_F_ERROR_OFFSET = sizeof(faiss::rabitq_utils::Sign
 static_assert(RABITQ_F_ERROR_OFFSET == 2 * sizeof(float));
 static_assert(sizeof(faiss::rabitq_utils::SignBitFactorsWithError) == RABITQ_F_ERROR_OFFSET + sizeof(float));
 
-struct RaBitQAmplitudes {
-  const float* values = nullptr;
-  std::span<const size_t> offsets;
-
-  std::span<const float> list(size_t listNo) const noexcept {
-    return {values + offsets[listNo], offsets[listNo + 1] - offsets[listNo]};
-  }
-};
-
-/// Read-only faiss::InvertedLists serving codes + ids directly out of the aux
-/// file's memory view (mmap for FSDirectory, owned buffer for RAMDir): FAISS
-/// list scans read zero-copy through Directory instead of from a deserialized
-/// RAM copy.  The owning VectorAuxReader keeps the backing InputFile alive
-/// for the lifetime of the index.  ReadOnlyInvertedLists supplies throwing
+/// Read-only faiss::InvertedLists over the list sections of a vector overlay
+/// file (VectorAuxListsFooter). On a file whose holds are free (RAM, mmap),
+/// lists point into the file's view. Otherwise get_ids / get_codes hold the
+/// list's range until the matching release_ids / release_codes, so a scan
+/// holds only the lists it reads, and only while it reads them. Holds are
+/// shared and counted across concurrent scans. ReadOnlyInvertedLists supplies throwing
 /// add/update/resize.
-class MmapInvertedLists final : public faiss::ReadOnlyInvertedLists {
-  const faiss::idx_t* ids;      // all lists' ids, concatenated in list order
-  const uint8_t* codes;         // all lists' codes, same order
-  std::vector<size_t> offsets;  // prefix sums of list sizes, nlist+1 entries
+class HeldInvertedLists final : public faiss::ReadOnlyInvertedLists {
+  struct Held {
+    HeldRange range;
+    size_t refs = 0;
+  };
+
+  InputFile& file;
+  HeldRange view;                    // the whole file, when its holds are free
+  std::array<size_t, 3> sectionOffsets;
+  std::array<size_t, 3> rowBytes;    // 0: the codec has no such section
+  std::vector<size_t> offsets;       // prefix sums of list sizes, nlist+1 entries
+  std::unique_ptr<std::atomic<uint8_t>[]> amplitudesChecked;
+  mutable std::mutex mutex;
+  mutable boost::unordered_flat_map<uint64_t, Held> held;
 
 public:
-  MmapInvertedLists(size_t nlist, size_t codeSize, const int64_t* listSizes,
-                    const faiss::idx_t* ids, const uint8_t* codes)
-    : faiss::ReadOnlyInvertedLists(nlist, codeSize), ids(ids), codes(codes) {
+  enum Section : uint8_t { IDS, CODES, AMPLITUDES };
+
+  /// One list's amplitudes, held and validated, until destroyed.
+  class Amplitudes {
+    const HeldInvertedLists& lists;
+    size_t list;
+    std::span<const float> values;
+
+  public:
+    Amplitudes(const HeldInvertedLists& lists, size_t list) : lists(lists), list(list) {
+      values = {(const float*)lists.hold(list, AMPLITUDES), lists.list_size(list)};
+      try {
+        lists.validateAmplitudes(list, values);
+      } catch (...) {
+        lists.release(list, AMPLITUDES);
+        throw;
+      }
+    }
+    Amplitudes(const Amplitudes&) = delete;
+    Amplitudes& operator=(const Amplitudes&) = delete;
+    ~Amplitudes() { lists.release(list, AMPLITUDES); }
+    const float* data() const noexcept { return values.data(); }
+    std::span<const float> span() const noexcept { return values; }
+  };
+
+private:
+  static uint64_t keyOf(size_t list, Section section) noexcept { return (uint64_t)list * 4 + section; }
+
+  const char* find(uint64_t key) const {
+    auto it = held.find(key);
+    if (it == held.end()) return nullptr;
+    it->second.refs++;
+    return it->second.range.getData();
+  }
+
+  // Installs a hold acquired outside the lock, or counts the one another
+  // scan installed first; the caller drops `range` after unlocking.
+  const char* install(uint64_t key, HeldRange& range) const {
+    auto [it, inserted] = held.try_emplace(key);
+    if (inserted) it->second.range = std::move(range);
+    it->second.refs++;
+    return it->second.range.getData();
+  }
+
+  void release(uint64_t key) const noexcept {
+    HeldRange dropped;
+    {
+      std::lock_guard lock(mutex);
+      auto it = held.find(key);
+      assert(it != held.end() && it->second.refs > 0);
+      if (it == held.end() || --it->second.refs > 0) return;
+      dropped = std::move(it->second.range);
+      held.erase(it);
+    }
+  }
+
+  const char* hold(size_t list, Section section) const {
+    if (list_size(list) == 0) return nullptr;
+    ByteRange range = rangeOf(list, section);
+    if (holdsFree()) return view.getData() + range.offset;
+    uint64_t key = keyOf(list, section);
+    {
+      std::lock_guard lock(mutex);
+      if (const char* data = find(key)) return data;
+    }
+    HeldRange acquired = file.acquire(range);
+    std::lock_guard lock(mutex);
+    return install(key, acquired);
+  }
+
+  void release(size_t list, Section section) const noexcept {
+    if (holdsFree() || list_size(list) == 0) return;
+    release(keyOf(list, section));
+  }
+
+  void validateAmplitudes(size_t list, std::span<const float> values) const {
+    if (amplitudesChecked[list].load(std::memory_order_relaxed)) return;
+    for (float value : values) {
+      if (!std::isfinite(value) || value < 0) throw std::runtime_error("VectorAuxReader: invalid RaBitQ amplitude");
+    }
+    amplitudesChecked[list].store(1, std::memory_order_relaxed);
+  }
+
+public:
+  HeldInvertedLists(InputFile& file, size_t fileBytes, const VectorAuxListsFooter& footer, const int64_t* listSizes)
+      : faiss::ReadOnlyInvertedLists((size_t)footer.nlist, (size_t)footer.codeSize), file(file),
+        sectionOffsets{footer.idsOffset(), footer.codesOffset(), footer.amplitudesOffset()},
+        rowBytes{sizeof(faiss::idx_t), (size_t)footer.codeSize, (size_t)footer.amplitudeCount * sizeof(float)} {
+    if (file.holdsFree()) view = file.acquire({0, fileBytes});
     offsets.resize(nlist + 1);
     offsets[0] = 0;
     for (size_t i = 0; i < nlist; i++) {
       offsets[i + 1] = offsets[i] + (size_t)listSizes[i];
     }
+    if (rowBytes[AMPLITUDES]) amplitudesChecked = std::make_unique<std::atomic<uint8_t>[]>(nlist);
   }
 
+  /// True when lists point into the file's view: nothing to hold or batch.
+  bool holdsFree() const noexcept { return view.getData() != nullptr; }
+  bool hasAmplitudes() const noexcept { return rowBytes[AMPLITUDES] != 0; }
   size_t totalSize() const noexcept { return offsets.back(); }
-  std::span<const size_t> listOffsets() const noexcept { return offsets; }
+
+  ByteRange rangeOf(size_t list, Section section) const noexcept {
+    size_t width = rowBytes[section];
+    return {sectionOffsets[section] + offsets[list] * width, (offsets[list + 1] - offsets[list]) * width};
+  }
 
   size_t list_size(size_t listNo) const override {
     return offsets[listNo + 1] - offsets[listNo];
   }
   const uint8_t* get_codes(size_t listNo) const override {
-    return codes + offsets[listNo] * code_size;
+    return (const uint8_t*)hold(listNo, CODES);
   }
   const faiss::idx_t* get_ids(size_t listNo) const override {
-    return ids + offsets[listNo];
+    return (const faiss::idx_t*)hold(listNo, IDS);
   }
+  void release_codes(size_t listNo, const uint8_t*) const override { release(listNo, CODES); }
+  void release_ids(size_t listNo, const faiss::idx_t*) const override { release(listNo, IDS); }
+
 };
 
 /// AuxReader for kind == "vector_faiss".  Holds a deserialized faiss::Index
-/// lazily decoded from the single eagerly-opened file referenced by
+/// lazily decoded from the FAISS header of the file referenced by
 /// AuxIndexInfo.files(0), plus the VectorAuxMeta decoded out of
-/// AuxIndexInfo.opaque_meta.
+/// AuxIndexInfo.opaque_meta.  The inverted lists stay in the file.
 ///
 /// Contract (matches VectorIndexBuilder): one IVF file (IVF+RaBitQ or IVF+PQ) per segment
 /// overlay.
@@ -289,16 +414,16 @@ class VectorAuxReader : public AuxReader {
   std::string name;
   std::string field;
   std::shared_ptr<InputFile> file;
-  HeldRange hold;
+  // The FAISS header, until getFaissIndex decodes it.
+  mutable HeldRange header;
   mutable OnceFlag loadOnce;
   // Declared before faissIndex so the index is destroyed first; the index
   // never owns the lists (replace_invlists own=false).
-  mutable std::unique_ptr<MmapInvertedLists> mmapLists;
+  std::unique_ptr<HeldInvertedLists> lists;
   mutable std::unique_ptr<faiss::Index> faissIndex;
   // ENGINE_IVFRABITQ: the random rotation the IVF index was built behind
   // (shared across overlays by internVectorRotation); null otherwise.
   mutable std::shared_ptr<const VectorRotation> rotation;
-  mutable RaBitQAmplitudes amplitudes;
   VectorAuxMeta meta;
   VectorAuxListsFooter footer;
   mutable std::mutex unitCountMutex;
@@ -313,20 +438,42 @@ public:
     return metric == faiss::METRIC_L2 && byResidual && (double)nlist * m * ksub <= (double)ntotal * dims;
   }
 
+  /// Acquires the FAISS header, the list sizes and the footer in one batch:
+  /// the footer is fixed-size at the end of the fileBytes-long file, and the
+  /// metadata places the other two. Lists are held only while scans read
+  /// them (HeldInvertedLists).
   VectorAuxReader(std::string name, std::string field,
                   uint64_t gen, uint64_t builtCoreGen,
-                  std::shared_ptr<InputFile> file,
+                  std::shared_ptr<InputFile> file, size_t fileBytes,
                   const VectorAuxMeta& meta)
     : AuxReader(gen, builtCoreGen),
       name(std::move(name)), field(std::move(field)),
-      file(std::move(file)), hold(this->file->acquire({0, this->file->size()})), meta(meta) {
-    const char* base = hold.getData();
-    footer = VectorAuxListsFooter::fromFileTail(base, hold.getLength(), this->name);
+      file(std::move(file)), meta(meta) {
+    VectorAuxListsFooter::checkFits(fileBytes, this->name);
+    size_t footerAt = fileBytes - sizeof(VectorAuxListsFooter);
+    size_t sizesAt = VectorAuxListsFooter::align8((size_t)meta.faissHeaderBytes);
+    size_t sizesBytes = (size_t)meta.nlist * sizeof(int64_t);
+    if ((uint64_t)meta.faissHeaderBytes > footerAt || sizesAt > footerAt || sizesBytes > footerAt - sizesAt) {
+      throw std::runtime_error(std::format(
+        "VectorAuxReader: aux '{}' header of {} bytes and {} lists do not fit file size {}",
+        this->name, (int64_t)meta.faissHeaderBytes, (int32_t)meta.nlist, fileBytes));
+    }
+    ByteRange ranges[] = {{0, (uint64_t)meta.faissHeaderBytes, ReadClass::METADATA},
+                          {sizesAt, sizesBytes, ReadClass::METADATA},
+                          {footerAt, sizeof(VectorAuxListsFooter), ReadClass::METADATA}};
+    auto holds = this->file->acquireAll(ranges);
+    footer = VectorAuxListsFooter::decode(holds[2].getData(), fileBytes, this->name);
+    if (footer.faissHeaderBytes != meta.faissHeaderBytes || footer.nlist != meta.nlist) {
+      throw std::runtime_error(std::format(
+        "VectorAuxReader: aux '{}' lists footer (header {} bytes, nlist {}) does not match "
+        "opaque_meta (header {} bytes, nlist {})", this->name, (int64_t)footer.faissHeaderBytes,
+        (int64_t)footer.nlist, (int64_t)meta.faissHeaderBytes, (int32_t)meta.nlist));
+    }
     if (footer.amplitudeCount != (isRaBitQ() ? 1 : 0)) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: aux '{}' amplitude layout does not match codec", this->name));
     }
-    const int64_t* sizes = (const int64_t*)(base + footer.sizesOffset());
+    const int64_t* sizes = (const int64_t*)holds[1].getData();
     int64_t remaining = footer.ntotal;
     for (int64_t i = 0; i < footer.nlist; i++) {
       if (sizes[i] < 0 || sizes[i] > remaining) {
@@ -335,15 +482,9 @@ public:
       remaining -= sizes[i];
     }
     if (remaining != 0) throw std::runtime_error("VectorAuxReader: list sizes do not match ntotal");
-    // Validate once on open; list scans use unchecked, sequential float loads.
-    if (isRaBitQ()) {
-      const float* values = (const float*)(base + footer.amplitudesOffset());
-      for (int64_t i = 0; i < footer.ntotal; i++) {
-        if (!std::isfinite(values[i]) || values[i] < 0) {
-          throw std::runtime_error("VectorAuxReader: invalid RaBitQ amplitude");
-        }
-      }
-    }
+    // Amplitudes are validated per list, on its first scan (HeldInvertedLists).
+    lists = std::make_unique<HeldInvertedLists>(*this->file, fileBytes, footer, sizes);
+    header = std::move(holds[0]);
   }
 
   // Physical populations depend on the immutable source column and ownership,
@@ -375,20 +516,18 @@ public:
   /// The rotation queries must pass through before reaching getFaissIndex()
   /// (ENGINE_IVFRABITQ), or null.  Valid after getFaissIndex().
   const VectorRotation* getRotation() const noexcept { return rotation.get(); }
-  const RaBitQAmplitudes& getAmplitudes() const { getFaissIndex(); return amplitudes; }
+  /// The index's inverted lists.
+  const HeldInvertedLists& getLists() const noexcept { return *lists; }
 
   // Search-time entry point: the IVF index (for ENGINE_IVFRABITQ, the index
   // behind the rotation; see getRotation).  Decode is lazy and once-only;
   // faiss::Index::search is thread-safe for concurrent readers after
   // construction.  Only the FAISS header (params + coarse quantizer + PQ
-  // codebooks) is deserialized into RAM; the inverted-list
-  // payloads are served zero-copy from the file's memory view via
-  // MmapInvertedLists (see VectorAuxListsFooter).
+  // codebooks) is deserialized into RAM; scans read the inverted lists
+  // through HeldInvertedLists (see VectorAuxListsFooter).
   faiss::Index* getFaissIndex() const {
     callOnce(loadOnce, [this]() {
-      const char* base = hold.getData();
-
-      BufferIOReader io(base, (size_t)footer.faissHeaderBytes);
+      BufferIOReader io(header.getData(), (size_t)footer.faissHeaderBytes);
       std::unique_ptr<faiss::Index> idx(faiss::read_index(&io, faiss::IO_FLAG_SKIP_PRECOMPUTE_TABLE));
       if (!idx) {
         throw std::runtime_error(std::format(
@@ -447,26 +586,17 @@ public:
         }
       }
 
-      const int64_t* sizes = (const int64_t*)(base + footer.sizesOffset());
-      const faiss::idx_t* listIds = (const faiss::idx_t*)(base + footer.idsOffset());
-      const uint8_t* listCodes = (const uint8_t*)(base + footer.codesOffset());
-      assert(((uintptr_t)sizes % 8) == 0 && ((uintptr_t)listIds % 8) == 0);
-      auto lists = std::make_unique<MmapInvertedLists>(
-        (size_t)footer.nlist, (size_t)footer.codeSize, sizes, listIds, listCodes);
       if ((int64_t)lists->totalSize() != footer.ntotal) {
         throw std::runtime_error(std::format(
           "VectorAuxReader: aux '{}' list sizes sum to {}, expected ntotal {}",
           name, lists->totalSize(), (int64_t)footer.ntotal));
       }
       // Drops the empty ArrayInvertedLists the header deserialized with; the
-      // index does not own the mmap lists (this reader does, alongside the
-      // file view they point into).
+      // index does not own the held lists (this reader does).
       ivf->replace_invlists(lists.get(), /*own=*/false);
-      mmapLists = std::move(lists);
       faissIndex = std::move(idx);
       rotation = std::move(rot);
-      amplitudes = {(const float*)(base + footer.amplitudesOffset()),
-                    mmapLists->listOffsets()};
+      header = HeldRange();
     });
     return faissIndex.get();
   }
@@ -512,8 +642,8 @@ public:
     VectorAuxMeta meta = VectorAuxMeta::fromBytes(std::string_view((const char*)info.opaque_meta.data(), info.opaque_meta.size()), info.name);
 
     // Residency rule: index data must NOT be force-resident.  IVF/IVF+PQ list
-    // payloads are served zero-copy from the file's memory view via
-    // MmapInvertedLists (see VectorAuxListsFooter); only the small routing
+    // payloads are read from the file through HeldInvertedLists (zero-copy
+    // from a free view, per-list holds otherwise); only the small routing
     // model (centroids + PQ codebooks) is deserialized into RAM.
     //
     // Stay-on-disk story for other index types when we add them:
@@ -529,9 +659,11 @@ public:
     //
     // Likely tiering once past v1: brute-force-over-column for small segments,
     // HNSW for RAM-fit mid-size, IVF + mmap lists for large.
+    // The manifest records the size, so placing the footer reads nothing.
+    size_t fileBytes = info.files[0].size ? (size_t)info.files[0].size : file->size();
     return std::make_shared<VectorAuxReader>(
       std::string(info.name), std::string(info.field),
-      info.gen, info.built_core_gen, std::move(file), meta);
+      info.gen, info.built_core_gen, std::move(file), fileBytes, meta);
   }
 
 private:

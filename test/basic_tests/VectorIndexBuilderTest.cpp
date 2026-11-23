@@ -401,7 +401,7 @@ TEST_F(VectorIndexBuilderTest, ivfListsServeIdenticallyFromFsDirectoryMmap) {
     ASSERT_NE(fsAux, nullptr);
     auto* fsIvf = dynamic_cast<faiss::IndexIVF*>(fsAux->getFaissIndex());
     ASSERT_NE(fsIvf, nullptr);
-    ASSERT_NE(dynamic_cast<MmapInvertedLists*>(fsIvf->invlists), nullptr);
+    ASSERT_NE(dynamic_cast<HeldInvertedLists*>(fsIvf->invlists), nullptr);
 
     constexpr int K = 10;
     std::vector<float> query{3.0f, 4.0f, 1.0f, 0.5f};

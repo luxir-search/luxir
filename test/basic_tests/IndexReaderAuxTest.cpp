@@ -152,7 +152,7 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   EXPECT_EQ(idx->metric_type, faiss::METRIC_L2);
 }
 
-TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
+TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnFirstListUse) {
   IvfTestGuard guard;
   for (int bits : {1, 4}) {
     CollectionHelper h("main");
@@ -184,7 +184,15 @@ TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
       os.write(payload.data(), payload.size());
       os.close();
       dir.finishFile(*out);
-      EXPECT_THROW(VectorAuxReader::open(dir, info, false), std::runtime_error);
+      std::string synced[] = {"invalid-amplitude"};
+      dir.sync(synced);
+      // Opening reads no amplitudes; the first scan of the list rejects them.
+      auto aux = VectorAuxReader::open(dir, info, false);
+      const auto& lists = aux->getLists();
+      size_t list = 0;
+      while (lists.list_size(list) == 0) list++;
+      EXPECT_THROW(HeldInvertedLists::Amplitudes(lists, list), std::runtime_error);
+      aux.reset();
       dir.deleteFile("invalid-amplitude");
     }
   }
@@ -206,15 +214,17 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
     const auto& original = onlyVectorOverlay(durable.info);
     auto meta = VectorAuxMeta::fromBytes(std::string_view(
         (const char*)original.opaque_meta.data(), original.opaque_meta.size()), original.name);
-    for (bool bits : {false, true}) {
-      if (bits && ann.codec == api::VectorAnnDef::Codec::PQ) continue;
-      auto changed = meta;
-      if (bits) changed.rabitqBits++;
-      else changed.nlist++;
-      std::string bytes = changed.toBytes();
+    auto withMeta = [&](const VectorAuxMeta& changed, std::string& bytes) {
+      bytes = changed.toBytes();
       auto copied = original;
       copied.opaque_meta = std::as_bytes(std::span(bytes.data(), bytes.size()));
-      auto aux = VectorAuxReader::open(dir, copied, false);
+      return copied;
+    };
+    if (ann.codec == api::VectorAnnDef::Codec::RABITQ) {
+      auto changed = meta;
+      changed.rabitqBits++;
+      std::string bytes;
+      auto aux = VectorAuxReader::open(dir, withMeta(changed, bytes), false);
       // callOnce retries must leave the partially loaded index safe.
       for (int attempt = 0; attempt < 2; attempt++) {
         try {
@@ -222,20 +232,33 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
           FAIL() << "Accepted mismatched metadata";
         } catch (const std::runtime_error& e) {
           std::string message = e.what();
-          EXPECT_NE(message.find(bits ? "RaBitQ bits mismatch" : "nlist mismatch"), std::string::npos);
+          EXPECT_NE(message.find("RaBitQ bits mismatch"), std::string::npos);
           EXPECT_NE(message.find(original.name), std::string::npos);
-          EXPECT_NE(message.find("index has " + std::to_string(bits ? meta.rabitqBits : meta.nlist)), std::string::npos);
-          EXPECT_NE(message.find("opaque_meta says " + std::to_string(bits ? changed.rabitqBits : changed.nlist)), std::string::npos);
+          EXPECT_NE(message.find("index has " + std::to_string(meta.rabitqBits)), std::string::npos);
+          EXPECT_NE(message.find("opaque_meta says " + std::to_string(changed.rabitqBits)), std::string::npos);
         }
+      }
+    }
+    // The metadata places the header and the list sizes; the footer must agree.
+    for (bool header : {false, true}) {
+      auto changed = meta;
+      if (header) changed.faissHeaderBytes += 8;
+      else changed.nlist++;
+      std::string bytes;
+      try {
+        VectorAuxReader::open(dir, withMeta(changed, bytes), false);
+        FAIL() << "Accepted mismatched metadata";
+      } catch (const std::runtime_error& e) {
+        std::string message = e.what();
+        EXPECT_NE(message.find("does not match opaque_meta"), std::string::npos) << message;
+        EXPECT_NE(message.find(original.name), std::string::npos);
       }
     }
     if (ann.codec == api::VectorAnnDef::Codec::RABITQ) {
       auto changed = meta;
       changed.rotationKind = 99;
-      std::string bytes = changed.toBytes();
-      auto copied = original;
-      copied.opaque_meta = std::as_bytes(std::span(bytes.data(), bytes.size()));
-      auto aux = VectorAuxReader::open(dir, copied, false);
+      std::string bytes;
+      auto aux = VectorAuxReader::open(dir, withMeta(changed, bytes), false);
       EXPECT_THROW(aux->getFaissIndex(), std::runtime_error);
     }
     auto healthy = VectorAuxReader::open(dir, original, false);
@@ -257,9 +280,9 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
   }
 }
 
-// mmap residency: only the IVF header (coarse quantizer + PQ codebooks) is
-// deserialized into RAM; the list payloads are served zero-copy from the aux
-// file's memory view through MmapInvertedLists.  Guards against silently
+// Residency: only the IVF header (coarse quantizer + PQ codebooks) is
+// deserialized into RAM; the list payloads are read from the aux file
+// through HeldInvertedLists.  Guards against silently
 // falling back to a RAM-resident ArrayInvertedLists, and verifies the list
 // payloads written in Luxir's own layout round-trip (every segment-local
 // valueRank appears exactly once across the lists).
@@ -283,14 +306,14 @@ TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
 
   auto* ivf = dynamic_cast<faiss::IndexIVF*>(vaux->getFaissIndex());
   ASSERT_NE(ivf, nullptr);
-  auto* lists = dynamic_cast<MmapInvertedLists*>(ivf->invlists);
+  auto* lists = dynamic_cast<HeldInvertedLists*>(ivf->invlists);
   ASSERT_NE(lists, nullptr);  // ArrayInvertedLists here = deserialized copy
   EXPECT_EQ((int64_t)lists->compute_ntotal(), (int64_t)N);
 
   std::vector<int> seen(N, 0);
   for (size_t l = 0; l < lists->nlist; l++) {
     size_t sz = lists->list_size(l);
-    const faiss::idx_t* ids = lists->get_ids(l);
+    faiss::InvertedLists::ScopedIds ids(lists, l);
     for (size_t j = 0; j < sz; j++) {
       ASSERT_GE(ids[j], 0);
       ASSERT_LT(ids[j], N);
