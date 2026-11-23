@@ -164,7 +164,7 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
       primaryContext.invalid("catalog starts inside file header", "invalid segment catalog");
     }
     auto bytes = slice({{primary, range.offset}, range.length}, ReadClass::METADATA);
-    auto head = SegmentCatalog::readDirectory(bytes, range.offset, primarySize, primaryContext);
+    auto head = SegmentCatalog::readDirectory(bytes, range, primarySize, primaryContext);
     catalog = SegmentCatalog::decode(head, source->files, primaryContext);
     if (spaces().front().maxDoc != source->maxDoc) {
       corruptSegment(segment, "segment row count differs from manifest");
@@ -208,6 +208,17 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
     children.push_back(std::move(child));
   }
   return true;
+}
+
+bool SegmentCore::mayContainId(std::string_view term, uint64_t hash) {
+  const auto* info = root.fieldInfo("id");
+  if (!info || !info->terms()) return false;
+  if (const auto* bounds = info->dictionaryBounds()) {
+    // A root id dictionary always records exact inclusive bounds.
+    if (term < std::string_view(bounds->lower) || term > std::string_view(bounds->upper)) return false;
+  }
+  auto filter = info->idFilter();
+  return !filter || IdFilter(slice(filter)).mayContainHash(hash);
 }
 
 std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, const api::SegmentInfo& segment,

@@ -15,7 +15,8 @@ namespace catalog_io { class Errors; }
 // name order followed by their offsets and one offset for the end.
 // The directory lists the file numbers, version runs and each row space's
 // path, doc count, field table and ownership. The last eight bytes contain
-// the directory length. The manifest's CatalogRange locates the whole region.
+// the directory length. The manifest's CatalogRange locates the whole region
+// and carries its XXH3, which opens check before decoding.
 
 // Offset of a field record from the start of its table's records.
 using FieldOffset = uint32_t;
@@ -81,12 +82,15 @@ private:
                                            const catalog_io::Errors& errors);
 
 public:
-  // Discover the catalog from the trailer of file 0.
+  // Discover the catalog from the trailer of file 0. There is no hash to check.
   static DirectoryHead readDirectory(std::span<const char> file, SegmentReadContext context = SegmentReadContext());
+  // Open the catalog the range locates in the whole of file 0.
   static DirectoryHead readDirectory(std::span<const char> file, CatalogRange range, SegmentReadContext context);
   // Open the exact catalog bytes, which reach the end of file 0.
-  static DirectoryHead readDirectory(std::span<const char> catalog, uint64_t offset, uint64_t fileSize,
+  static DirectoryHead readDirectory(std::span<const char> catalog, CatalogRange range, uint64_t fileSize,
                                      SegmentReadContext context = SegmentReadContext());
+  // Both range overloads check the range's hash, when it has one, before decoding
+  // and throw SegmentCorruptError on a mismatch.
   static SegmentCatalog decode(const DirectoryHead& head, field_parts::FileSizes files,
                                SegmentReadContext context = SegmentReadContext());
   std::span<const SpaceDescriptor> rowSpaces() const noexcept { return spaces; }
