@@ -11,6 +11,7 @@
 #include <xxhash.h>
 
 #include "HeldRange.h"
+#include "RangeFetch.h"
 
 namespace luxir {
 
@@ -460,8 +461,33 @@ public:
   // True when all acquisitions return null-owner views valid for the file's lifetime.
   virtual bool holdsFree() const { return false; }
 
+  // True when bytes are fetched on first touch (a remote backend), so that an
+  // acquire may block on I/O and throw. Such a file is opened without reading
+  // anything; see SegmentCore for what that skips.
+  virtual bool lazy() const { return false; }
+
   // Advisory asynchronous readahead; memory-backed inputs need no work.
   virtual void prefetch(size_t offset, size_t length) {}
+
+  // Advisory: the caller acquires these ranges soon. A lazy file fetches them
+  // together; the default advises each one through prefetch.
+  virtual void prefetchRanges(std::span<const ByteRange> ranges) {
+    for (const auto& range : ranges) prefetch((size_t)range.offset, (size_t)range.length);
+  }
+
+  // Makes every range resident, then calls `done` exactly once: with null on
+  // success, otherwise with the error (FetchTimeoutError past `deadline`). A
+  // lazy file does this without holding the calling thread, and `done` may run
+  // on a fetch thread; the caller keeps the file alive until then. Memory-backed
+  // and mapped files call `done` inline, before this returns. A range outside
+  // the file is an error. This default fetches nothing and reports
+  // FetchNotResidentError: the caller then acquires as usual, which fetches
+  // (and blocks) on first touch.
+  virtual void fetchRanges(std::span<const ByteRange> ranges, ReadDeadline deadline, FetchDone done) {
+    (void)ranges;
+    (void)deadline;
+    done(std::make_exception_ptr(FetchNotResidentError()));
+  }
 };
 
 class RAMInputFile : public InputFile {
@@ -481,6 +507,10 @@ public:
     return {data.get() + range.offset, range.length};
   }
   bool holdsFree() const override { return true; }
+
+  void fetchRanges(std::span<const ByteRange> ranges, ReadDeadline, FetchDone done) override {
+    fetchResident(ranges, (uint64_t)sz, done);
+  }
 };
 
 

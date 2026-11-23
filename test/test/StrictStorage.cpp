@@ -159,6 +159,11 @@ public:
   }
 
   void prefetch(size_t offset, size_t length) override { delegate->prefetch(offset, length); }
+  bool lazy() const override { return delegate->lazy(); }
+  void prefetchRanges(std::span<const ByteRange> ranges) override { delegate->prefetchRanges(ranges); }
+  void fetchRanges(std::span<const ByteRange> ranges, ReadDeadline deadline, FetchDone done) override {
+    delegate->fetchRanges(ranges, deadline, std::move(done));
+  }
 };
 
 class StrictChecksumReader : public ChecksumReader {
