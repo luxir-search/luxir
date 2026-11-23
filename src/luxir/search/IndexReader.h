@@ -14,6 +14,7 @@
 
 #include "DocSet.h"
 #include "Similarity.h"
+#include "luxir/index/AuxInfo.h"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/RankLiveBitmap.h"
@@ -54,12 +55,17 @@ public:
   LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive);
   ~LiveDocs();
 
-  // Static factory method to create LiveDocs from delete bitmap file.  Do not call this if liveGen is 0 (no
-  // deletes for this segment).  A nullptr is returned in the case that there are deletions but we couldn't
-  // find the delete file (this is not necessarily an error, the index could have changed already).
-  // If missingFileOK is false, missing files will throw exceptions instead of returning nullptr.
-  static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK = true, bool expectSynced = false);
-  
+  // Decodes the live docs file `name` of `segment`, `size` bytes long. Bytes
+  // that fail validation, or a live count other than `numLive` when it is not
+  // negative, throw SegmentCorruptError.
+  static std::shared_ptr<LiveDocs> decode(std::shared_ptr<InputFile> file, uint64_t size, std::string_view name,
+                                          std::string_view segment, int32_t maxDoc, int32_t numLive);
+  // Opens and decodes generation `liveGen` at once, for the writer. Null when
+  // the file is missing and missingFileOK is set.
+  static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
+                                          uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK = true,
+                                          bool expectSynced = false);
+
   // Field names identify immutable physical columns across ANN overlay replacements.
   // Callers must retain this LiveDocs and alias its shared_ptr to the returned
   // record. The record must never own this LiveDocs, which would form a cycle.
@@ -98,17 +104,90 @@ public:
   }
 };
 
+// A root live-docs generation. The file is opened with the snapshot, which
+// keeps its bytes readable; the bitmap is decoded on first use. The live count
+// is the manifest's, so counting needs no read. A decode that fails publishes
+// nothing, so the next use retries it.
+class SegmentLive {
+  std::shared_ptr<InputFile> file;
+  std::string name;
+  std::string segment;
+  uint64_t fileSize;
+  int32_t maxDoc;
+  int32_t liveCount;
+  SharedLazyCell<LiveDocs> value;
+
+public:
+  SegmentLive(std::shared_ptr<InputFile> file, std::string name, std::string segment, uint64_t fileSize,
+              int32_t maxDoc, int32_t liveCount)
+      : file(std::move(file)), name(std::move(name)), segment(std::move(segment)), fileSize(fileSize),
+        maxDoc(maxDoc), liveCount(liveCount) {}
+  // A bitmap already decoded or built in memory.
+  explicit SegmentLive(std::shared_ptr<LiveDocs> decoded)
+      : fileSize(0), maxDoc(decoded->size()), liveCount(decoded->numLive()) {
+    value.getOrCreate([&] { return std::move(decoded); });
+  }
+
+  // Opens the file of generation `liveGen`, whose manifest records `size`
+  // bytes (zero when unknown) and `numLive` live rows. Null when the file is
+  // missing and missingFileOK is set, so the caller can reload the manifest.
+  static std::shared_ptr<SegmentLive> open(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
+                                           uint64_t liveEpoch, int32_t maxDoc, int32_t numLive, uint64_t size,
+                                           bool missingFileOK, bool expectSynced);
+
+  int32_t numLive() const noexcept { return liveCount; }
+  int32_t size() const noexcept { return maxDoc; }
+  bool decoded() const noexcept { return value.peek() != nullptr; }
+  std::shared_ptr<LiveDocs> shared();
+  LiveDocs* get() {
+    auto* decodedDocs = value.peek();
+    return decodedDocs ? decodedDocs : shared().get();
+  }
+};
+
+// A segment overlay of known kind. Its files are opened with the snapshot,
+// which keeps their bytes readable; its reader is opened on first use, under
+// the kind's OverlayPolicy. A failed open publishes nothing unless the policy
+// leaves an UnavailableAuxReader, so the next use retries it.
+class SegmentOverlay {
+  AuxInfo info;
+  OverlayPolicy policy;
+  std::string segment;
+  std::vector<std::shared_ptr<InputFile>> files;
+  SharedLazyCell<AuxReader> reader;
+
+public:
+  SegmentOverlay(AuxInfo info, OverlayPolicy policy, std::string segment,
+                 std::vector<std::shared_ptr<InputFile>> files)
+      : info(std::move(info)), policy(policy), segment(std::move(segment)), files(std::move(files)) {}
+
+  // Whether readers open overlays of this kind; others are left out.
+  static bool knownKind(std::string_view kind);
+  // Opens the entry's files. Null when one is missing and missingFileOK is
+  // set, so the caller can reload the manifest.
+  static std::shared_ptr<SegmentOverlay> open(Directory& dir, const luxir::api::AuxIndexInfo& entry,
+                                              std::string segment, bool missingFileOK);
+
+  std::string_view name() const noexcept { return info.name; }
+  std::string_view kind() const noexcept { return info.kind; }
+  uint64_t gen() const noexcept { return info.gen; }
+  uint64_t builtCoreGen() const noexcept { return info.built_core_gen; }
+  OverlayPolicy openPolicy() const noexcept { return policy; }
+  bool isOpen() const noexcept { return reader.peek() != nullptr; }
+  std::shared_ptr<AuxReader> get();
+};
+
 // One lazy value for a path, bundle and root live generation. Shared by leaves
 // of successive snapshots; constructing a view does not construct its bitmap.
 class ChildLiveDocs {
   std::shared_ptr<SegmentCore> core;
-  std::shared_ptr<LiveDocs> root;
+  std::shared_ptr<SegmentLive> root;
   std::string path;
   std::atomic<int32_t> knownCard{-1};
   SharedLazyCell<LiveDocs> value;
 
 public:
-  ChildLiveDocs(std::shared_ptr<SegmentCore> core, std::shared_ptr<LiveDocs> root,
+  ChildLiveDocs(std::shared_ptr<SegmentCore> core, std::shared_ptr<SegmentLive> root,
                 std::string path) : core(std::move(core)), root(std::move(root)), path(std::move(path)) {}
   std::shared_ptr<LiveDocs> get();
   int32_t knownCount() const noexcept { return knownCard.load(std::memory_order_acquire); }
@@ -119,9 +198,9 @@ public:
     PostingsReader* const spaceReader;
     const int32_t rowCount;
     const int32_t liveCount;
-    const std::shared_ptr<LiveDocs> sharedLiveDocs;
+    const std::shared_ptr<SegmentLive> sharedLiveDocs;
     const std::shared_ptr<ChildLiveDocs> childLiveDocs;
-    const std::vector<std::shared_ptr<AuxReader>> sharedAuxReaders;
+    const std::vector<std::shared_ptr<SegmentOverlay>> sharedOverlays;
   public:
     friend class IndexReader;
 
@@ -139,8 +218,8 @@ public:
     const int64_t base;           // global index (ordinal/rank) of the first document in this segment with respect to the list of segments
     const int32_t ord;            // index of this segment in the list of segments
 
-    Segment(std::shared_ptr<SegmentCore>&& segmentCore, std::shared_ptr<LiveDocs>&& liveDocs,
-              std::vector<std::shared_ptr<AuxReader>>&& auxReaders,
+    Segment(std::shared_ptr<SegmentCore>&& segmentCore, std::shared_ptr<SegmentLive>&& liveDocs,
+              std::vector<std::shared_ptr<SegmentOverlay>>&& overlays,
               SegmentInfo segInfo, int64_t base, int ord, PostingsReader* spaceReader,
               std::shared_ptr<ChildLiveDocs> childLiveDocs = {})
             :  sharedSegmentCore(std::move(segmentCore)), spaceReader(spaceReader),
@@ -148,7 +227,7 @@ public:
                 liveCount(liveDocs ? liveDocs->numLive() : rowCount),
                 sharedLiveDocs(std::move(liveDocs)),
                 childLiveDocs(std::move(childLiveDocs)),
-                sharedAuxReaders(std::move(auxReaders)),
+                sharedOverlays(std::move(overlays)),
                 segInfo(segInfo), base(base), ord(ord) {
       assert(!sharedLiveDocs || sharedLiveDocs->size() == rowCount);
     }
@@ -184,9 +263,10 @@ public:
 
     bool mayHaveDeletes() const noexcept { return liveCountBounds().first != rowCount; }
 
-    // returns null if all docs are live (no deletes)
+    // Null if all docs are live (no deletes). Decodes the bitmap on first use.
     LiveDocs* liveDocs() const {
-      return childLiveDocs ? childLiveDocs->get().get() : sharedLiveDocs.get();
+      if (childLiveDocs) return childLiveDocs->get().get();
+      return sharedLiveDocs ? sharedLiveDocs->get() : nullptr;
     }
 
     // The segment's live docset, or null when there are no deletes.
@@ -197,16 +277,21 @@ public:
 
     // shared form of liveDocs(), for callers that cache views into its mapped bits
     std::shared_ptr<LiveDocs> liveDocsShared() const {
-      return childLiveDocs ? childLiveDocs->get() : sharedLiveDocs;
+      if (childLiveDocs) return childLiveDocs->get();
+      return sharedLiveDocs ? sharedLiveDocs->shared() : nullptr;
     }
 
-    std::span<const std::shared_ptr<AuxReader>> auxReaders() const noexcept {
-      return sharedAuxReaders;
+    // The segment's overlays of known kinds, opened or not.
+    std::span<const std::shared_ptr<SegmentOverlay>> overlays() const noexcept {
+      return sharedOverlays;
     }
 
+    // The overlay `name`, opened on first use; null when the segment has none.
+    // Throws when its open fails, except where an advisory overlay leaves an
+    // UnavailableAuxReader.
     std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const {
-      for (const auto& r : sharedAuxReaders) {
-        if (r->getName() == name) return r;
+      for (const auto& overlay : sharedOverlays) {
+        if (overlay->name() == name) return overlay->get();
       }
       return nullptr;
     }
@@ -373,8 +458,8 @@ private:
     };
     struct Bundle {
       std::shared_ptr<SegmentCore> core;
-      std::shared_ptr<LiveDocs> live;
-      std::vector<std::shared_ptr<AuxReader>> aux;
+      std::shared_ptr<SegmentLive> live;
+      std::vector<std::shared_ptr<SegmentOverlay>> aux;
       Segment::SegmentInfo info;
       int32_t ord;
       std::shared_ptr<ChildLives> childLives;

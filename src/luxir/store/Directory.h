@@ -106,6 +106,9 @@ public:
   // index).  CheckedDirectory uses this flag to detect missing fsyncs.
   // A nonzero size is the file's size as a manifest records it; a backend may
   // answer size() from it instead of asking the store. Wrappers forward it.
+  // The open file keeps the file's bytes readable until it is released, even
+  // if the file is deleted: a snapshot opens its live docs and overlay files
+  // and reads them on first use, possibly after a newer commit retired them.
   virtual std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) = 0;
 
   // The caller asserts that `files` were fsynced: a root about to be published

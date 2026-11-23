@@ -464,7 +464,7 @@ TEST_F(RowSpaceTest, derivedLivenessClearsRangesAndWalksOwnerChains) {
   auto core = SegmentCore::create(dir, 1, 1);
   auto words = FixedBitSet::allocate(5, true);
   words[0] &= ~((1ULL << 1) | (1ULL << 2)); // Root 1 has no children.
-  auto roots = std::make_shared<LiveDocs>(std::move(words), 5, 3);
+  auto roots = std::make_shared<SegmentLive>(std::make_shared<LiveDocs>(std::move(words), 5, 3));
   ChildLiveDocs child(core, roots, "items");
   auto live = child.get();
   ASSERT_NE(nullptr, live);

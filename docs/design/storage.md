@@ -172,19 +172,34 @@ headers of the other files still follow, one acquire each. For now the segment
 keeps the holds it hands out until it closes, so nothing held is evicted;
 releasing holds when a request ends comes with a bounded cache.
 
-What a segment builds from its parts waits for first use:
+Everything else a reader needs from a segment or snapshot waits for its first
+use:
 
 - The version runs are acquired and checked by the first reader that needs
   them, such as a query returning `_version_`, a delete or a merge.
 - An ownership shape is built when a nested query, a mapping or a child live
   view first uses it. Its first use acquires its columns together with those
   of the unbuilt shapes above it, in one batch.
+- A snapshot opens each live docs file but decodes the bitmap on first use.
+  Live counts come from the manifest's `live_docs`, so counting rows reads
+  nothing; a decoded count that differs is a `SegmentCorruptError`.
+- A snapshot opens each segment overlay's files and opens the overlay's reader
+  (a vector index, for example) on first use. Overlay kinds choose a policy:
+  an on-demand overlay whose bytes are invalid fails its use as corruption,
+  and an advisory one is replaced by a reader that answers nothing, leaving
+  the segment in service.
+- The open `InputFile` keeps the bytes readable until it is released (see
+  `Directory::openFile`), so a later first use does not race the writer
+  retiring files of an older commit.
 - A build that fails publishes nothing. A failed read fails that use with the
   backend's error and the next use reads again; bytes that fail validation
-  throw `SegmentCorruptError` on every use.
+  throw `SegmentCorruptError` on every use. The scrubber still checks every
+  file of a snapshot, read or not.
 - `segmentOpenCounters` counts the segments with a first hold beyond the
   catalog and the bytes those holds cover (`segments_opened`,
   `segment_bytes_mapped`). Free views (RAM, mmap) are not counted.
+
+Two more properties of the open path:
 
 - A manifest open passes each file's recorded size to `Directory::openFile`,
   so a backend can answer `size()` without a request. Files with free holds

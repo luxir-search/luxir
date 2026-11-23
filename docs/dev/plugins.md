@@ -454,6 +454,12 @@ token needed to release it. Destruction or replacement of the hold calls
 `HoldOwner::release(const HeldRange&)`, which must be thread-safe and
 `noexcept`. The caller releases the hold before destroying its `InputFile`.
 
+Keep an open `InputFile` readable until it is destroyed, even after its file
+is deleted. A snapshot opens its live docs and overlay files and reads them on
+first use, which may come after the writer has retired them for a newer
+commit. Local files get this from the open descriptor or mapping; a remote
+backend can pin the object, for example with a count of open readers.
+
 A nonzero `size` passed to `openFile` is the size the manifest records; a
 remote backend can answer `size()` from it instead of asking the store, and
 wrappers forward it. Each `ByteRange` also carries a `ReadClass`, `METADATA`
