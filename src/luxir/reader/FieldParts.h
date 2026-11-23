@@ -133,6 +133,7 @@ struct BytesColumn {
   Slice values;      // All values in rank order.
   Slice endOffsets;  // Monotonic end byte offsets, null for fixed stride.
   uint8_t vectorEncoding = 0;  // VECTOR only: the values' VectorEncoding, as written for this segment.
+  bool vectorNorms = false;  // VECTOR only: each row starts with the vector's |x|^2.
 
   bool operator==(const BytesColumn&) const = default;
 };

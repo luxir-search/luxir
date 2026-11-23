@@ -381,7 +381,7 @@ VectorIndexBuilder::collectEligibleFields() {
     auto* ft = schema_.getFieldTypePtr(name);
     if (ft == nullptr || ft->type() != FieldType::VECTOR) continue;
     auto* vft = (const VectorFieldType*)ft;
-    if (!vft->knnSearchable()) continue;
+    if (!vft->annIndexable()) continue;
     // Multi-valued vectors are indexed too: every value is added to FAISS, and the
     // query layer maps each FAISS id back to its owning doc via the valueRank->docId
     // column (StrColReader::ownerIndex).
@@ -617,7 +617,8 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   forEachVectorSegment(segments_, fieldName, dims,
       [&](const VectorIndexBuilder::SegInput&, VectorReader& vr, bool fromOriginal) {
     bool normalize = normalizeSegmentForFaiss(ft, vr, fromOriginal);
-    bool decode = vr.encoding() != VectorEncoding::F32;
+    // Decode unless the rows are plain f32 (no norm prefix): zero copy.
+    bool decode = vr.encoding() != VectorEncoding::F32 || vr.hasNorms();
     int64_t capacity = std::min(chunkRows, vr.numVectors());
     if (decode) decoded.resize((size_t)capacity * dims);
     codes.resize((size_t)capacity * codeBytes);

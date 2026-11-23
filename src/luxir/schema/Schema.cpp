@@ -276,9 +276,10 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   // "none" = storage-only); otherwise inherit.  Range-checked like index.
   if (def.metric.has_value()) {
     if (*def.metric != VectorMetric::NONE && *def.metric != VectorMetric::L2 &&
-        *def.metric != VectorMetric::IP && *def.metric != VectorMetric::COSINE) {
+        *def.metric != VectorMetric::IP && *def.metric != VectorMetric::COSINE &&
+        *def.metric != VectorMetric::HAMMING) {
       throw SchemaError("unknown metric value " + std::to_string((int)*def.metric) +
-                        " (field: " + std::string(name) + "); valid: none, l2, ip, cosine");
+                        " (field: " + std::string(name) + "); valid: none, l2, ip, cosine, hamming");
     }
     r.hasVectorMetric = true;
     r.vectorMetric = (VectorFieldType::Metric)*def.metric;
@@ -309,7 +310,7 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   if (def.encoding.has_value()) {
     if (!vcodec::valid((int32_t)*def.encoding)) {
       throw SchemaError("unknown encoding value " + std::to_string((int)*def.encoding) +
-                        " (field: " + std::string(name) + "); valid: f32, f16, int8");
+                        " (field: " + std::string(name) + "); valid: f32, f16, bf16, int8, bit");
     }
     r.hasVectorEncoding = true;
     r.vectorEncoding = (VectorEncoding)*def.encoding;
@@ -813,13 +814,32 @@ struct FieldCompiler {
         normalizeOnWrite = !r.vectorNormalized && (r.hasVectorNormalizeOnWrite
           ? r.vectorNormalizeOnWrite
           : (r.vectorMetric == VectorFieldType::METRIC_COSINE));
+        // Binary vectors: HAMMING defaults to the bit encoding, and the two
+        // only go together.
+        bool hamming = r.vectorMetric == VectorFieldType::METRIC_HAMMING;
+        VectorEncoding encoding = hamming && !r.hasVectorEncoding ? VectorEncoding::BIT
+                                                                  : r.vectorEncoding;
+        if (hamming && encoding != VectorEncoding::BIT) {
+          throw SchemaError("metric hamming requires encoding bit (field: " + std::string(name) + ")");
+        }
+        if (encoding == VectorEncoding::BIT) {
+          if (!hamming && r.vectorMetric != VectorFieldType::METRIC_NONE) {
+            throw SchemaError("encoding bit requires metric hamming or none (field: " +
+                              std::string(name) + ")");
+          }
+          int32_t storedDims = r.vectorTruncateDims > 0 ? r.vectorTruncateDims : r.vectorDims;
+          if (storedDims % 8 != 0) {
+            throw SchemaError(std::string(r.vectorTruncateDims > 0 ? "truncate_dims" : "dims") +
+                              " must be a multiple of 8 for encoding bit (field: " + std::string(name) + ")");
+          }
+        }
         // ANN overlays are built over the stored (truncated) column.
         bool truncated = r.vectorTruncateDims > 0;
         VectorAnnConfig ann = resolveAnnConfig(r.ann, truncated ? r.vectorTruncateDims : r.vectorDims,
                                                truncated ? "truncate_dims" : "dims", name);
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags,
                                                r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
-                                               r.vectorEncoding, r.vectorKeepOriginal, ann,
+                                               encoding, r.vectorKeepOriginal, ann,
                                                r.vectorTruncateDims);
         break;
       }

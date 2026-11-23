@@ -71,6 +71,8 @@ struct OrdOptions {
 constexpr uint8_t HAS_END_OFFSETS = 1u << 0;
 // A vector column in an encoding other than f32 carries the encoding byte.
 constexpr uint8_t HAS_VECTOR_ENCODING = 1u << 1;
+// Each vector row starts with a 4-byte float |x|^2.
+constexpr uint8_t HAS_VECTOR_NORMS = 1u << 2;
 // Sparse norm bytes are indexed by docs-with-field rank.
 constexpr uint8_t SPARSE_NORMS = 1u << 0;
 
@@ -419,10 +421,10 @@ public:
     if (header.type == FieldType::VECTOR) {
       if (column.endOffsets) io.invalid("vector column must use fixed stride");
       auto stride = bytesStride(column, header.numValues);
-      if (stride <= 0 || vcodec::dimsFromBytes((VectorEncoding)column.vectorEncoding, stride) <= 0) {
+      if (stride <= 0 || vcodec::dimsFromRowBytes((VectorEncoding)column.vectorEncoding, stride, column.vectorNorms) <= 0) {
         io.invalid("vector stride is not a whole vector in the column's encoding");
       }
-    } else if (column.vectorEncoding) {
+    } else if (column.vectorEncoding || column.vectorNorms) {
       io.invalid("vector encoding on a non-vector column");
     } else if (column.endOffsets) {
       mono(io, column.endOffsets, header.numValues, "end offsets index layout");
@@ -643,14 +645,16 @@ void readOrdColumn(Reader& in, OrdColumn& column, const FieldRecordHeader& heade
 }
 
 void writePart(Writer& out, const BytesColumn& column) {
-  out.writeByte((column.endOffsets ? HAS_END_OFFSETS : 0) | (column.vectorEncoding ? HAS_VECTOR_ENCODING : 0));
+  out.writeByte((column.endOffsets ? HAS_END_OFFSETS : 0) | (column.vectorEncoding ? HAS_VECTOR_ENCODING : 0)
+                | (column.vectorNorms ? HAS_VECTOR_NORMS : 0));
   if (column.vectorEncoding) out.writeByte(column.vectorEncoding);
   writeSlice(out, column.values);
   if (column.endOffsets) writeSlice(out, column.endOffsets);
 }
 
 void readPart(Reader& in, BytesColumn& column) {
-  auto options = in.readOptions(HAS_END_OFFSETS | HAS_VECTOR_ENCODING);
+  auto options = in.readOptions(HAS_END_OFFSETS | HAS_VECTOR_ENCODING | HAS_VECTOR_NORMS);
+  column.vectorNorms = (options & HAS_VECTOR_NORMS) != 0;
   if (options & HAS_VECTOR_ENCODING) {
     column.vectorEncoding = in.readByte();
     if (!column.vectorEncoding || !vcodec::valid(column.vectorEncoding)) in.invalid("unknown vector encoding");

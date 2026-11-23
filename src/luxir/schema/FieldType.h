@@ -629,7 +629,8 @@ struct VectorAnnConfig {
 //
 // metric_ controls whether the field is searchable by kNN / ANN.  NONE means
 // storage-only; L2 / IP / COSINE pick the similarity metric for exact column
-// scan and future aux-backed ANN engines.
+// scan and future aux-backed ANN engines.  HAMMING scores BIT columns by
+// exact scan only.
 class VectorFieldType : public FieldType {
 public:
   enum Metric {
@@ -637,6 +638,7 @@ public:
     METRIC_L2 = 1,
     METRIC_IP = 2,
     METRIC_COSINE = 3,
+    METRIC_HAMMING = 4,
   };
 
   // Squared norm at or below which a cosine vector has no direction.
@@ -655,7 +657,7 @@ public:
   // COSINE fields normalize vectors before column storage by default.  Ignored
   // for non-COSINE metrics.
   bool normalizeOnWrite_;
-  // Column storage encoding (f32 / f16 / int8).  Recorded per segment, so a
+  // Column storage encoding (f32 / f16 / bf16 / int8 / bit).  Recorded per segment, so a
   // later schema change never reinterprets existing segments.
   VectorEncoding encoding_;
   // Also store the submitted float32 vectors in a cold companion column
@@ -708,6 +710,10 @@ public:
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
   VectorEncoding encoding() const { return encoding_; }
   bool keepOriginal() const { return keepOriginal_; }
+  // Whether column rows carry the |x|^2 norm prefix (see VectorCodec.h).
+  bool storesNorms() const {
+    return vcodec::needsNorms(encoding_, metric_ == METRIC_COSINE, normalized_ || normalizeOnWrite_);
+  }
   const VectorAnnConfig& ann() const { return ann_; }
 
   // The contract for every indexed and query vector: inputDims() components
@@ -721,6 +727,10 @@ public:
   // True iff this field supports kNN / ANN search.  Exact flat search can run
   // directly over the column; real ANN engines may also build aux artifacts.
   bool knnSearchable() const { return metric_ != METRIC_NONE; }
+
+  // True iff commits may build an ANN overlay for this field.  HAMMING has no
+  // ANN index: bit columns are small and scanned exactly.
+  bool annIndexable() const { return knnSearchable() && metric_ != METRIC_HAMMING; }
 };
 
 // How a stored-fields resource compresses its chunks.  codec, the two chunk

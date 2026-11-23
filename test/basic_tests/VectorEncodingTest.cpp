@@ -5,11 +5,20 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <cstring>
+#include <format>
+#include <limits>
+#include <numeric>
+#include <optional>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "luxir/codec/VectorCodec.h"
+#include "luxir/codec/VectorKernels.h"
+#include "luxir/query/KnnQuery.h"
 #include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/query/VectorScorer.h"
 #include "luxir/reader/VectorReader.h"
@@ -50,6 +59,7 @@ struct Fields {
   bool keepOriginal = false;
   bool multi = false;
   std::optional<api::VectorAnnDef> ann = std::nullopt;
+  bool raw = false;  // cosine with normalize_on_write off
 };
 
 // ref_v is the f32 reference; enc_v stores the same values in the encoding.
@@ -62,6 +72,7 @@ void installFields(Collection& col, const Fields& f) {
     def.metric = f.metric;
     def.encoding = encoding;
     if (f.multi) def.multi = api::FieldDef::MultiMode::ARRAY;
+    if (f.raw) def.normalize_on_write = false;
     if (encoding == f.encoding) def.keep_original = f.keepOriginal;
     if (f.ann) {
       def.dims = DIMS;
@@ -91,6 +102,31 @@ std::vector<std::string> knnIds(std::string_view field, int32_t k, bool exact = 
   for (const auto& doc : req->getDocs()) ids.push_back(std::get<std::string>(*find(doc, "id")));
   req->done();
   return ids;
+}
+
+// (id, score) of an executed request's "q" list; finishes the request.
+std::vector<std::pair<std::string, float>> scoredHits(LocalReq* req) {
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  std::vector<std::pair<std::string, float>> hits;
+  if (req->ok()) {
+    const auto* dl = req->docList("q");
+    const auto* ids = std::get_if<api::ColStr>(&dl->columns.find("id")->kind);
+    const auto* scores = std::get_if<api::ColFloat>(&dl->columns.find("_score_")->kind);
+    for (size_t i = 0; i < ids->v.size(); i++) hits.emplace_back(ids->v[i], scores->v[i]);
+  }
+  req->done();
+  return hits;
+}
+
+// (id, score) of a kNN request, serial or parallel.
+std::vector<std::pair<std::string, float>> knnHits(std::string_view field, int32_t k, bool exact,
+                                                   int32_t refine, bool parallel) {
+  auto* req = LocalReq::create(LuxirTest::luxirNode->getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  cur.getScores().countLimit().fields({"id"});
+  cur.rawQuery() = qb::knn(cur.mr(), field, QUERY, k, /*nprobe=*/0, exact, refine);
+  req->execute(parallel);
+  return scoredHits(req);
 }
 
 std::shared_ptr<IndexReader> reader(CollectionHelper& h) {
@@ -157,22 +193,38 @@ TEST_F(VectorEncodingTest, codecRoundTrip) {
   EXPECT_EQ(16, vcodec::bytesPerVector(VectorEncoding::INT8, DIMS));
   EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::INT8, 16));
   EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::F16, 16));
+
+  vcodec::encode(VectorEncoding::BF16, v.data(), DIMS, buf.data());
+  vcodec::decode(VectorEncoding::BF16, buf.data(), DIMS, out.data());
+  EXPECT_EQ(v, out);  // all exactly representable in bfloat16
+  EXPECT_EQ(1.0f, vcodec::fromBf16(vcodec::toBf16(1.0f + 0x1p-8f)));  // tie to even
+  EXPECT_EQ(1.0f + 0x1p-7f, vcodec::fromBf16(vcodec::toBf16(1.0f + 0x1.8p-8f)));
+  EXPECT_TRUE(std::isfinite(vcodec::fromBf16(vcodec::toBf16(std::numeric_limits<float>::max()))));
+
+  vcodec::encode(VectorEncoding::BIT, v.data(), DIMS, buf.data());
+  EXPECT_EQ(0x6b, (uint8_t)buf[0]);  // 0 1 1 0 1 0 1 1, most significant bit first
+  vcodec::decode(VectorEncoding::BIT, buf.data(), DIMS, out.data());
+  EXPECT_EQ((Vec{0, 1, 1, 0, 1, 0, 1, 1}), out);
+  EXPECT_EQ(1, vcodec::bytesPerVector(VectorEncoding::BIT, DIMS));
+  EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::BIT, 1));
 }
 
 // The int8 decomposition (no decode buffer) agrees with scoring the decoded
 // floats, for every metric.
 TEST_F(VectorEncodingTest, int8ScorerMatchesDecodedScore) {
   Vec v = docVec(3);
-  std::vector<char> row((size_t)vcodec::bytesPerVector(VectorEncoding::INT8, DIMS));
-  vcodec::encode(VectorEncoding::INT8, v.data(), DIMS, row.data());
+  std::vector<char> row((size_t)vcodec::rowBytes(VectorEncoding::INT8, DIMS, true));
+  vcodec::encodeRow(VectorEncoding::INT8, true, v.data(), DIMS, row.data());
   Vec decoded(DIMS);
-  vcodec::decode(VectorEncoding::INT8, row.data(), DIMS, decoded.data());
-  std::string_view rowView(row.data(), row.size());
-  std::string_view decodedView((const char*)decoded.data(), decoded.size() * sizeof(float));
+  vcodec::decode(VectorEncoding::INT8, vcodec::rowPayload(row.data(), true), DIMS, decoded.data());
   for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
-    VectorScorer q(QUERY.data(), DIMS, (int32_t)metric, true, VectorEncoding::INT8);
-    VectorScorer f(QUERY.data(), DIMS, (int32_t)metric, true, VectorEncoding::F32);
-    EXPECT_NEAR(f.score(decodedView, 0), q.score(rowView, 0), 1e-5) << (int)metric;
+    VectorScorer q(QUERY.data(), DIMS, (int32_t)metric, true, VectorEncoding::INT8, true);
+    VectorScorer f(QUERY.data(), DIMS, (int32_t)metric, false, VectorEncoding::F32, false);
+    float expected = f.score((const char*)decoded.data());
+    if (metric == api::VectorMetric::COSINE) {
+      expected /= std::sqrt(std::inner_product(decoded.begin(), decoded.end(), decoded.begin(), 0.0f));
+    }
+    EXPECT_NEAR(expected, q.score(row.data()), 1e-5) << (int)metric;
   }
 }
 
@@ -185,10 +237,9 @@ TEST_F(VectorEncodingTest, int8L2LargeOffset) {
   Vec decoded(DIMS), query = QUERY;
   for (auto& x : query) x += 1000.0f;
   vcodec::decode(VectorEncoding::INT8, row.data(), DIMS, decoded.data());
-  std::string_view decodedView((const char*)decoded.data(), decoded.size() * sizeof(float));
-  VectorScorer q(query.data(), DIMS, (int32_t)api::VectorMetric::L2, true, VectorEncoding::INT8);
-  VectorScorer f(query.data(), DIMS, (int32_t)api::VectorMetric::L2, true, VectorEncoding::F32);
-  EXPECT_FLOAT_EQ(f.score(decodedView, 0), q.score(std::string_view(row.data(), row.size()), 0));
+  VectorScorer q(query.data(), DIMS, (int32_t)api::VectorMetric::L2, true, VectorEncoding::INT8, false);
+  VectorScorer f(query.data(), DIMS, (int32_t)api::VectorMetric::L2, true, VectorEncoding::F32, false);
+  EXPECT_FLOAT_EQ(f.score((const char*)decoded.data()), q.score(row.data()));
 }
 
 // Each encoding is recorded per segment and reads back within its precision.
@@ -207,6 +258,8 @@ TEST_F(VectorEncodingTest, storedRoundTripPerEncoding) {
     VectorReader vr(seg.postingsReader(), *found);
     EXPECT_EQ((VectorEncoding)encoding, vr.encoding());
     EXPECT_EQ(DIMS, vr.dims());
+    // L2 stores no norm prefix (int8 L2 takes the difference directly).
+    EXPECT_FALSE(vr.hasNorms());
     EXPECT_EQ(vcodec::bytesPerVector((VectorEncoding)encoding, DIMS), vr.valueBytes());
     Vec out(DIMS);
     vr.decodeAtRank(0, out.data());
@@ -219,7 +272,8 @@ TEST_F(VectorEncodingTest, storedRoundTripPerEncoding) {
 // metric.
 TEST_F(VectorEncodingTest, exactKnnMatchesF32Ranking) {
   for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
-    for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::INT8}) {
+    for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::BF16,
+                          api::VectorEncoding::INT8}) {
       CollectionHelper h("main");
       h.clear();
       installFields(h.collection(), {.metric = metric, .encoding = encoding});
@@ -404,4 +458,247 @@ TEST_F(VectorEncodingTest, encodedFieldsValidateInput) {
   f.type = api::FieldDef::FieldClass::STRING;
   f.encoding = api::VectorEncoding::F16;
   EXPECT_THROW(Schema::fromProto(b.def()), SchemaError);
+}
+
+// The SIMD kernels behind VectorScorer match a double-precision reference over
+// the decoded vector for every encoding x metric, at odd dims and unaligned
+// row addresses, and a row scores bit-identically alone or inside a batch.
+TEST_F(VectorEncodingTest, kernelsMatchScalarReference) {
+  SCOPED_TRACE(vkernel::isa());
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
+  constexpr int ROWS = 5;
+  for (int32_t dims : {1, 3, 7, 15, 16, 17, 768, 1023}) {
+    Vec q((size_t)dims);
+    for (auto& x : q) x = uniform(rng);
+    for (auto encoding : {VectorEncoding::F32, VectorEncoding::F16, VectorEncoding::BF16,
+                          VectorEncoding::INT8}) {
+      int32_t bytes = vcodec::rowBytes(encoding, dims, true);
+      // Row r starts r bytes past an 8-byte boundary.
+      std::vector<std::vector<char>> bufs(ROWS, std::vector<char>((size_t)bytes + 16));
+      std::vector<const char*> rows;
+      std::vector<Vec> decoded;
+      for (int r = 0; r < ROWS; r++) {
+        Vec x((size_t)dims);
+        for (auto& v : x) v = uniform(rng);
+        char* row = (char*)(((uintptr_t)bufs[(size_t)r].data() + 7) & ~(uintptr_t)7) + r;
+        vcodec::encodeRow(encoding, true, x.data(), dims, row);
+        decoded.emplace_back((size_t)dims);
+        vcodec::decode(encoding, vcodec::rowPayload(row, true), dims, decoded.back().data());
+        rows.push_back(row);
+      }
+      for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
+        SCOPED_TRACE(std::format("dims {} encoding {} metric {}", dims, vcodec::name(encoding),
+                                 (int)metric));
+        VectorScorer scorer(q.data(), dims, (int32_t)metric, /*normalizeColumn=*/true, encoding,
+                            /*norms=*/true);
+        std::vector<float> batch(ROWS);
+        scorer.scoreRows(rows.data(), ROWS, batch.data());
+        for (int r = 0; r < ROWS; r++) {
+          const Vec& x = decoded[(size_t)r];
+          double dot = 0, dist = 0, xx = 0, mag = 0;
+          for (int32_t i = 0; i < dims; i++) {
+            double qi = (double)q[(size_t)i];
+            double xi = (double)x[(size_t)i];
+            dot += qi * xi;
+            dist += (qi - xi) * (qi - xi);
+            xx += xi * xi;
+            mag += std::fabs(qi * xi);
+          }
+          float got = batch[(size_t)r];
+          if (metric == api::VectorMetric::L2) {
+            EXPECT_NEAR(dist, 1.0 / got - 1.0, 1e-5 * (1.0 + dist));
+          } else if (metric == api::VectorMetric::IP) {
+            EXPECT_NEAR(dot, got, 1e-5 * (1.0 + mag));
+          } else {
+            EXPECT_NEAR(dot / std::sqrt(xx), got, 1e-5 * (1.0 + mag / std::sqrt(xx)));
+          }
+          EXPECT_EQ(scorer.score(rows[(size_t)r]), got);
+        }
+      }
+    }
+  }
+}
+
+// The Hamming kernel matches a bytewise popcount at every length around the
+// SIMD widths and at unaligned addresses.
+TEST_F(VectorEncodingTest, hammingKernelMatchesPopcount) {
+  std::mt19937 rng(7);
+  std::vector<uint8_t> a(300), b(300);
+  for (auto& x : a) x = (uint8_t)rng();
+  for (auto& x : b) x = (uint8_t)rng();
+  for (int32_t n = 0; n < 260; n++) {
+    int32_t expected = 0;
+    for (int32_t i = 0; i < n; i++) expected += std::popcount((uint8_t)(a[(size_t)i + 1] ^ b[(size_t)i + 3]));
+    EXPECT_EQ(expected, vkernel::hamming(a.data() + 1, b.data() + 3, n)) << n;
+  }
+}
+
+// metric hamming stores bit vectors (the default encoding) and scores
+// 1 - hamming / dims by exact scan; schemas that mix bit and float scoring are
+// rejected.
+TEST_F(VectorEncodingTest, bitVectorsScoreByHamming) {
+  CollectionHelper h("main");
+  SchemaBuilder b;
+  auto& def = b.field("bits_v");
+  def.type = api::FieldDef::FieldClass::VECTOR;
+  def.metric = api::VectorMetric::HAMMING;
+  def.dims = 16;
+  b.set(h.collection());
+  Vec q(16, -1.0f);
+  for (int i = 0; i < 4; i++) {
+    Vec v = q;
+    for (int j = 0; j < 3 * i; j++) v[(size_t)j] = 0.5f;  // 3 * i bits differ
+    h.index(flatdoc("id", "b" + std::to_string(i), "bits_v", v));
+  }
+  ExpectLog quiet({"expected dims", "Ignoring vector aux selector"});
+  EXPECT_EQ(1, h.index(flatdoc("id", std::string("short"), "bits_v", Vec(12, 1.0f))).total_errors);
+  h.commit({"vec.bits_v"});
+  EXPECT_EQ(nullptr, reader(h)->segments()[0].getAuxReader("vec.bits_v"));
+  VectorEncoding encoding;
+  EXPECT_EQ(2u, rows(h, "bits_v", &encoding)[0].size());
+  EXPECT_EQ(VectorEncoding::BIT, encoding);
+
+  auto* req = LocalReq::create(luxirNode->getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  cur.getScores().fields({"id"});
+  cur.rawQuery() = qb::knn(cur.mr(), "bits_v", q, 3);
+  req->execute();
+  EXPECT_EQ((std::vector<std::pair<std::string, float>>{
+                {"b0", 1.0f}, {"b1", 1.0f - 3.0f / 16}, {"b2", 1.0f - 6.0f / 16}}),
+            scoredHits(req));
+
+  auto reject = [](api::VectorMetric metric, std::optional<api::VectorEncoding> encoding, int32_t dims) {
+    SchemaBuilder sb;
+    auto& f = sb.field("x_v");
+    f.type = api::FieldDef::FieldClass::VECTOR;
+    f.metric = metric;
+    f.encoding = encoding;
+    f.dims = dims;
+    EXPECT_THROW(Schema::fromProto(sb.def()), SchemaError);
+  };
+  reject(api::VectorMetric::HAMMING, api::VectorEncoding::F32, 16);
+  reject(api::VectorMetric::COSINE, api::VectorEncoding::BIT, 16);
+  reject(api::VectorMetric::HAMMING, std::nullopt, 12);
+}
+
+// An f16 segment merged after a switch to bf16 converges to bf16.
+TEST_F(VectorEncodingTest, f16MergesIntoBf16) {
+  CollectionHelper h("main");
+  installFields(h.collection(), {.encoding = api::VectorEncoding::F16});
+  indexDocs(h, 0, 15);
+  h.commit();
+  installFields(h.collection(), {.encoding = api::VectorEncoding::BF16});
+  indexDocs(h, 15, 30);
+  h.commit();
+  auto before = knnIds("enc_v", 10);
+  h.getIndexWriter()->mergeSegments();
+  h.commit();
+  VectorEncoding encoding;
+  EXPECT_EQ(30u, rows(h, "enc_v", &encoding).size());
+  EXPECT_EQ(VectorEncoding::BF16, encoding);
+  EXPECT_EQ(before, knnIds("enc_v", 10));
+}
+
+// Cosine over a column that is not unit length stores |x|^2 once per vector
+// (the norm prefix), equal to the decoded vector's; merges carry it.  f32
+// normalized on write needs none.
+TEST_F(VectorEncodingTest, normPrefixStoredAndMerged) {
+  auto checkNorms = [](CollectionHelper& h, bool expected) {
+    auto r = reader(h);
+    for (auto& seg : r->segments()) {
+      const DecodedFieldRecord* found = seg.postingsReader().fieldInfo("enc_v");
+      ASSERT_NE(nullptr, found);
+      VectorReader vr(seg.postingsReader(), *found);
+      ASSERT_EQ(expected, vr.hasNorms());
+      for (int64_t i = 0; expected && i < vr.numVectors(); i++) {
+        const char* row = vr.rowAtRank(i).data();
+        EXPECT_EQ((float)vcodec::payloadNormSq(vr.encoding(), row + vcodec::NORM_BYTES, vr.dims()),
+                  vcodec::rowNormSq(row));
+      }
+    }
+  };
+  for (auto encoding : {api::VectorEncoding::F32, api::VectorEncoding::F16, api::VectorEncoding::INT8}) {
+    CollectionHelper h("main");
+    h.clear();
+    installFields(h.collection(), {.metric = api::VectorMetric::COSINE, .encoding = encoding,
+                                   .raw = true});
+    indexDocs(h, 0, 15);
+    h.commit();
+    indexDocs(h, 15, 30);
+    h.commit();
+    checkNorms(h, true);
+    auto before = knnHits("enc_v", 10, true, 0, false);
+    EXPECT_EQ("d0", before[0].first);
+    h.getIndexWriter()->mergeSegments();
+    h.commit();
+    ASSERT_EQ(1u, reader(h)->segments().size());
+    checkNorms(h, true);
+    EXPECT_EQ(before, knnHits("enc_v", 10, true, 0, false));
+  }
+
+  CollectionHelper h("main");
+  h.clear();
+  installFields(h.collection(), {.metric = api::VectorMetric::COSINE});
+  indexDocs(h, 0, 5);
+  h.commit();
+  checkNorms(h, false);
+}
+
+// A segment written before a metric change has no norm prefix: it scores
+// exactly as one with the prefix, and the merge adds the prefix.
+TEST_F(VectorEncodingTest, mergeAddsNormsAfterMetricChange) {
+  CollectionHelper h("main");
+  installFields(h.collection(), {.metric = api::VectorMetric::IP});
+  indexDocs(h, 0, 15);
+  h.commit();
+  installFields(h.collection(), {.metric = api::VectorMetric::COSINE, .raw = true});
+  indexDocs(h, 15, 30);
+  h.commit();
+  auto before = knnHits("enc_v", 10, true, 0, false);
+  EXPECT_EQ("d0", before[0].first);
+  h.getIndexWriter()->mergeSegments();
+  h.commit();
+  auto r = reader(h);
+  ASSERT_EQ(1u, r->segments().size());
+  const DecodedFieldRecord* found = r->segments()[0].postingsReader().fieldInfo("enc_v");
+  ASSERT_NE(nullptr, found);
+  ASSERT_NE(nullptr, found->bytesColumn());
+  EXPECT_TRUE(found->bytesColumn()->vectorNorms);
+  EXPECT_EQ(before, knnHits("enc_v", 10, true, 0, false));
+}
+
+// Batched scoring keeps parallel == serial bit-identical (ids and scores) for
+// every encoding, over flat scans and the ANN rescore.
+TEST_F(VectorEncodingTest, parallelMatchesSerialPerEncoding) {
+  IvfTestGuard guard(/*minTraining=*/16);
+  int64_t savedGrain = KnnQuery::rescoreTaskGrainCandidates;
+  KnnQuery::rescoreTaskGrainCandidates = 1;
+  for (auto encoding : {api::VectorEncoding::F32, api::VectorEncoding::F16, api::VectorEncoding::INT8}) {
+    for (auto metric : {api::VectorMetric::L2, api::VectorMetric::COSINE}) {
+      CollectionHelper h("main");
+      h.clear();
+      installFields(h.collection(), {.metric = metric, .encoding = encoding, .ann = smallPqAnn(),
+                                     .raw = true});
+      for (int seg = 0; seg < 3; seg++) {
+        for (int i = 0; i < 160; i++) {
+          Vec v = docVec(i % 30);
+          v[(size_t)(i % DIMS)] += 0.001f * (float)(i + seg);
+          h.index(flatdoc("id", std::format("s{}d{}", seg, i), "enc_v", v));
+        }
+        if (seg < 2) {
+          h.commit({"vec.enc_v"});
+        } else {
+          h.commit();
+        }
+      }
+      for (bool exact : {true, false}) {
+        auto serial = knnHits("enc_v", 10, exact, 64, false);
+        ASSERT_EQ(10u, serial.size());
+        EXPECT_EQ(serial, knnHits("enc_v", 10, exact, 64, true))
+            << (int)encoding << " " << (int)metric << " exact " << exact;
+      }
+    }
+  }
+  KnnQuery::rescoreTaskGrainCandidates = savedGrain;
 }

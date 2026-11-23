@@ -129,8 +129,8 @@ namespace CalendarGap_ {
 enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR = 5 };
 }
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
-enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
-enum class VectorEncoding { F32 = 0, F16 = 1, INT8 = 2 };
+enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3, HAMMING = 4 };
+enum class VectorEncoding { F32 = 0, F16 = 1, INT8 = 2, BF16 = 3, BIT = 4 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
 enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64_STR_BIT = 2, ESTIMATE_COUNT_BIT = 3, DECIMAL_SCALED_BIT = 4 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
