@@ -17,7 +17,7 @@ namespace luxir {
 
 StoredFieldsMetadata::StoredFieldsMetadata(PostingsReader& reader, const DecodedFieldRecord& fieldInfo) {
   const auto& stored = *fieldInfo.stored();
-  auto bytes = reader.core().slice(stored.names());
+  auto bytes = reader.core().slice(stored.names(), ReadClass::METADATA);
   InputStream input(bytes.data(), bytes.data() + bytes.size());
   auto invalid = [&](std::string_view reason) {
     corruptSegment(reader.core().segmentName(), reason, std::string_view(fieldInfo.name), stored.location.filenum());
@@ -222,7 +222,7 @@ const NumColumnFormat::LeafMeta* PostingsReader::openNumericLeafMeta(const Decod
       || fieldInfo.docsWithField != maxDoc() || fieldInfo.endValueRanks()) return nullptr;
   return acquire(openedField(fieldInfo), [&] {
     auto index = number->index();
-    auto metadata = readNumericLeafMeta(core().slice(index), fieldInfo.numValues,
+    auto metadata = readNumericLeafMeta(core().slice(index, ReadClass::METADATA), fieldInfo.numValues,
         segmentReadContext(core(), fieldInfo, index.location.filenum()));
     return std::make_unique<NumColumnFormat::LeafMeta>(metadata);
   }, [](const NumColumnFormat::LeafMeta& entry) { accountOpened(sizeof(entry)); });

@@ -233,7 +233,7 @@ public:
     context.file = part->location.filenum();
     auto& core = reader.core();
     auto directory = fieldInfo.pointsDirectory();
-    init(core.slice(part->leaves()), core.slice(directory), directory.location.offset());
+    init(core.slice(part->leaves()), core.slice(directory, ReadClass::METADATA), directory.location.offset());
     if (leafCount() != fieldInfo.pointLeafCount() || maxPointsPerLeaf() != part->maxPointsPerLeaf
         || pointCount() != fieldInfo.pointCount()) invalid("directory counts disagree with field record");
   }

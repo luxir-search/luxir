@@ -8,12 +8,14 @@
 #include "CountingStorage.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/reader/OwnershipShape.h"
+#include "luxir/reader/SegmentCore.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/store/CorruptionMarker.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "test/CollectionHelper.h"
+#include "test/ColdDirectory.h"
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -156,6 +158,62 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
   }
 }
 
+// A node on lazy files: opens read no headers, commits pass each segment's
+// catalog to knownFiles, and the canonical queries never slice a whole file.
+TEST_F(StorageExampleTest, canonicalQueriesOnColdStorageReadNoWholeFiles) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  config.store.layers = {"cold"};
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  for (int batch = 0; batch < 2; batch++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 200; i++) {
+      int n = batch * 200 + i;
+      docs.push_back(flatdoc("id", "d" + std::to_string(n), "body_t", "alpha beta w" + std::to_string(n % 13),
+                             "c_s", "c" + std::to_string(n % 5), "n_i", (int64_t)(n % 31)));
+    }
+    ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  auto* layer = node.collections().storage().find<ColdLayer>();
+  ASSERT_NE(nullptr, layer);
+  auto snapshot = h.getIndexWriter()->snapshots.snapshot();
+  ASSERT_GT(snapshot->files.size(), 0u);
+
+  auto before = SegmentCore::wholeFileMaterializations();
+  auto run = [&](auto&& build, int64_t expected) {
+    auto req = localReq(h.getSearchEngine());
+    build(req->collection("main"));
+    req->execute();
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    if (expected >= 0) {
+      EXPECT_EQ(expected, req->getMatchCount());
+    }
+  };
+  run([](auto& r) { r.topDocs().matchQuery("c_s", "c1").countLimit(); }, 80);
+  run([](auto& r) { r.topDocs().matchQuery("body_t", "alpha").withStats().fields({"id", "n_i", "c_s"}); }, 400);
+  run([](auto& r) { r.topDocs().phraseText("body_t", "alpha beta").countLimit(); }, 400);
+  run([](auto& r) { r.topDocs().prefixQuery("body_t", "w1").countLimit(); }, -1);
+  run([](auto& r) { r.topDocs().exprQuery("n_i:[3 TO 5]").countLimit(); }, -1);
+  run([](auto& r) { r.topDocs().existsQuery("n_i").countLimit(); }, 400);
+  run([](auto& r) { r.facet("f", "c_s"); r.avg("a", "n_i"); r.topDocs().allQuery().countLimit(); }, 400);
+  EXPECT_EQ(before, SegmentCore::wholeFileMaterializations());
+
+  size_t segments = 0;
+  for (const auto& file : snapshot->files) {
+    if (!Manifest::segmentDataFile(file.name)) continue;
+    auto stats = layer->stats->fileStats(file.name);
+    EXPECT_EQ(0u, stats.firstPageReads) << file.name;  // no header reads, no whole files
+    auto known = layer->stats->knownFile(file.name);
+    ASSERT_TRUE(known) << file.name;  // from the commit that published it
+    if (known->catalog) {
+      segments++;
+      EXPECT_GT(stats.metadataAcquires, 0u) << file.name;
+    }
+  }
+  EXPECT_GT(segments, 0u);
+}
+
 TEST_F(StorageExampleTest, nestedReaderOpensWithWholeSegmentFilesDenied) {
   LuxirConfig config;
   config.store.layers = {"strict"};
@@ -197,7 +255,7 @@ TEST_F(StorageExampleTest, unknownBackendAndLayerNamesListRegistered) {
     LuxirNode node(config);
     FAIL() << "expected an unknown layer error";
   } catch (const std::invalid_argument& e) {
-    EXPECT_NE(std::string(e.what()).find("valid layers: counting"), std::string::npos) << e.what();
+    EXPECT_NE(std::string(e.what()).find("valid layers: cold, counting"), std::string::npos) << e.what();
   }
 }
 

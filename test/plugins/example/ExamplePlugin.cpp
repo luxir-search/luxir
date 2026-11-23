@@ -10,6 +10,7 @@
 #include "ExampleQuery.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/server/LuxirNode.h"
+#include "test/ColdDirectory.h"
 #include "test/StrictStorage.h"
 
 namespace luxir::example {
@@ -108,6 +109,10 @@ public:
       if (mode != "count" && mode != "deny") ctx.params.fail("whole_segment_files", "must be count or deny");
       return std::make_unique<test::StrictLayer>(std::move(inner),
           mode == "deny" ? test::StrictWholeFiles::DENY : test::StrictWholeFiles::COUNT);
+    });
+    r.storage.addLayer("cold", [](std::unique_ptr<DirectoryFactory> inner, const StorageContext&)
+                                   -> std::unique_ptr<DirectoryFactory> {
+      return std::make_unique<test::ColdLayer>(std::move(inner));
     });
 
     r.query.add("doc_ids", ::example::docIdsDef());

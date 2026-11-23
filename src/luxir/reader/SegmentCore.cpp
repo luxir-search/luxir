@@ -38,13 +38,26 @@ SegmentCore::SegmentCore(uint64_t segId, uint64_t creatorEpoch)
 
 SegmentCore::~SegmentCore() = default;
 
-std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice part) {
+std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice part, ReadClass readClass) {
   std::lock_guard lock(holdsMutex);
   auto key = std::pair(part.location.raw(), part.bytes);
   auto found = holds.lower_bound(key);
   if (found != holds.end() && found->first == key) return found->second.bytes();
-  auto hold = file.acquire({part.location.offset(), part.bytes});
+  auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
   return holds.emplace_hint(found, key, std::move(hold))->second.bytes();
+}
+
+std::span<const char> SegmentCore::sliceFromStart(field_parts::Slice part, ReadClass readClass) {
+  auto number = part.location.filenum();
+  auto& base = files[number];
+  if (part.bytes == base.size) wholeFiles.fetch_add(1, std::memory_order_relaxed);
+  auto bytes = acquirePart(base, part, readClass);
+  // A slice shorter than the header cannot prove it; a later one will.
+  if (base.headerPending.load(std::memory_order_acquire) && bytes.size() >= Postings::LUXIR_HEADER.size()) {
+    validateSegmentFileHeader(bytes, segmentName(), number);
+    base.headerPending.store(false, std::memory_order_release);
+  }
+  return bytes;
 }
 
 std::optional<SpaceOrdinal> SegmentCore::spaceOrdinal(std::string_view path) const noexcept {
@@ -116,15 +129,21 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
     if (expected && size != expected) {
       corruptSegment(segment, "file size differs from manifest", {}, number);
     }
+    // A lazy file reads nothing at open: its header is checked by the first
+    // slice that covers it, and the manifest xxh3 (verify-on-open, scrub)
+    // keeps the rest of its integrity. Other files check it now.
+    bool lazy = file->lazy();
     if (source || number != primary) {
       if (size <= Postings::LUXIR_HEADER.size()) {
         corruptSegment(segment, "segment file is too short", {}, number);
       }
-      auto header = file->acquire({0, Postings::LUXIR_HEADER.size()});
-      validateSegmentFileHeader(header.bytes(), segment, number);
+      if (!lazy) {
+        auto header = file->acquire({0, Postings::LUXIR_HEADER.size(), ReadClass::METADATA});
+        validateSegmentFileHeader(header.bytes(), segment, number);
+      }
     }
     bool holdsFree = file->holdsFree();
-    files[number] = {std::move(file), holdsFree};
+    files[number] = BaseFile(std::move(file), size, holdsFree, lazy);
     return true;
   };
 
@@ -144,7 +163,7 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
     if (range.offset < Postings::LUXIR_HEADER.size()) {
       primaryContext.invalid("catalog starts inside file header", "invalid segment catalog");
     }
-    auto bytes = slice({{primary, range.offset}, range.length});
+    auto bytes = slice({{primary, range.offset}, range.length}, ReadClass::METADATA);
     auto head = SegmentCatalog::readDirectory(bytes, range.offset, primarySize, primaryContext);
     catalog = SegmentCatalog::decode(head, source->files, primaryContext);
     if (spaces().front().maxDoc != source->maxDoc) {
@@ -173,7 +192,7 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
 
   const auto& version = catalog.versionRuns();
   if (version.slice) {
-    auto bytes = slice(version.slice);
+    auto bytes = slice(version.slice, ReadClass::METADATA);
     SegmentReadContext context{this, PackedTerm(nullptr), version.slice.location.filenum()};
     versions = VersionRuns(bytes.data(), bytes.size(), version.trailerOffset, version.count, spaces()[0].maxDoc, context);
     if (versions.byteSize() != bytes.size()) context.invalid("version runs slice does not match its header");

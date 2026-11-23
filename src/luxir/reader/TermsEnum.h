@@ -161,7 +161,7 @@ public:
     auto blockOffsets = fieldInfo.termBlockOffsets();
     auto trie = field_parts::termTrie(blockOffsets, termData->trieBytes);
     auto start = termData->location.offset();
-    termsIS = streamThrough({termData->location, trie.end().offset() - start});
+    termsIS = streamThrough({termData->location, trie.end().offset() - start}, ReadClass::METADATA);
     termBlockOffsets = reinterpret_cast<const field_parts::Terms::BlockOffset*>(
         termsIS.ptr(blockOffsets.location.offset() - start));
     numTermBlocks = (int32_t)(blockOffsets.bytes / sizeof(field_parts::Terms::BlockOffset));
@@ -674,8 +674,8 @@ protected:
     return (int32_t) pulsedValues[pulsedValueIndex() + 1];
   }
 
-  InputStream streamThrough(field_parts::Slice slice) const {
-    auto bytes = segmentCore.slice(slice);
+  InputStream streamThrough(field_parts::Slice slice, ReadClass readClass = ReadClass::DATA) const {
+    auto bytes = segmentCore.slice(slice, readClass);
     return {bytes.data(), bytes.data() + bytes.size()};
   }
 

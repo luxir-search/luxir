@@ -55,7 +55,7 @@ public:
     if (!number) missingColumn(fieldInfo, "number");
     auto blocks = reader.core().slice(number->blocks());
     auto indexSlice = number->index();
-    auto index = reader.core().slice(indexSlice);
+    auto index = reader.core().slice(indexSlice, ReadClass::METADATA);
     leaves = readNumericLeafMeta(index, fieldInfo.numValues,
         segmentReadContext(reader.core(), fieldInfo, indexSlice.location.filenum()));
     open(blocks.data(), index, fieldInfo.numValues);

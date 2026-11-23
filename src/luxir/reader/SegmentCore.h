@@ -7,6 +7,7 @@
 #include "SegmentCatalog.h"
 #include "CatalogRange.h"
 #include "VersionRuns.h"
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <span>
@@ -33,9 +34,29 @@ private:
   // spilled filesystem/object-store keys stable.
   struct BaseFile {
     std::shared_ptr<InputFile> file;
+    uint64_t size = 0;
     bool holdsFree = false;
+    // A lazy file is opened without reading its header; the first slice that
+    // covers the header checks it (see slice()).
+    std::atomic<bool> headerPending{false};
+
+    BaseFile() = default;
+    BaseFile(std::shared_ptr<InputFile> file, uint64_t size, bool holdsFree, bool headerPending)
+        : file(std::move(file)), size(size), holdsFree(holdsFree), headerPending(headerPending) {}
+    BaseFile(BaseFile&& other) noexcept
+        : file(std::move(other.file)), size(other.size), holdsFree(other.holdsFree),
+          headerPending(other.headerPending.load(std::memory_order_relaxed)) {}
+    BaseFile& operator=(BaseFile&& other) noexcept {
+      file = std::move(other.file);
+      size = other.size;
+      holdsFree = other.holdsFree;
+      headerPending.store(other.headerPending.load(std::memory_order_relaxed), std::memory_order_relaxed);
+      return *this;
+    }
   };
   std::vector<BaseFile> files;
+  // Slices that span a whole base file, node-wide; see wholeFileMaterializations().
+  static inline std::atomic<uint64_t> wholeFiles{0};
   // Holds must outlive the views below and release before files.
   std::mutex holdsMutex;
   std::map<std::pair<uint64_t, uint64_t>, HeldRange> holds;
@@ -51,7 +72,16 @@ private:
 
   SegmentCore(uint64_t segId, uint64_t creatorEpoch);
   bool initializeFromFiles(Directory& dir, const Source* source, bool missingFileOK, bool expectSynced);
-  std::span<const char> retain(InputFile& file, field_parts::Slice part);
+  std::span<const char> retain(InputFile& file, field_parts::Slice part, ReadClass readClass);
+  std::span<const char> sliceFromStart(field_parts::Slice part, ReadClass readClass);
+
+  std::span<const char> acquirePart(const BaseFile& base, field_parts::Slice part, ReadClass readClass) {
+    if (base.holdsFree) {
+      auto hold = base.file->acquire({part.location.offset(), part.bytes, readClass});
+      return hold.bytes(); // Free views stay valid while the core keeps the file.
+    }
+    return retain(*base.file, part, readClass);
+  }
 
 public:
   static Source source(uint64_t id, uint64_t epoch, CatalogRange range, int32_t maxDoc,
@@ -106,17 +136,23 @@ public:
     return files[fnum].file.get();
   }
 
-  std::span<const char> slice(field_parts::Slice part) {
+  // Every read of a base file goes through here. `readClass` tells the
+  // backend whether the part is navigation metadata or data.
+  std::span<const char> slice(field_parts::Slice part, ReadClass readClass = ReadClass::DATA) {
     auto number = part.location.filenum();
     assert(number < files.size());
     const auto& base = files[number];
     assert(base.file);
-    if (base.holdsFree) {
-      auto hold = base.file->acquire({part.location.offset(), part.bytes});
-      return hold.bytes(); // Free views stay valid while the core keeps the file.
-    }
-    return retain(*base.file, part);
+    // Parts start after the file header: offset 0 is a header or whole-file read.
+    if (part.location.offset() == 0) [[unlikely]] return sliceFromStart(part, readClass);
+    return acquirePart(base, part, readClass);
   }
+
+  // Slices that spanned a whole base file since the process started. Parts
+  // start after the file header, so only an open without a manifest source
+  // takes one; a query never should, as it would fetch the whole file from a
+  // lazy backend.
+  static uint64_t wholeFileMaterializations() noexcept { return wholeFiles.load(std::memory_order_relaxed); }
 
 };
 
