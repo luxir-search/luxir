@@ -2824,6 +2824,32 @@ message SchemaDef {
     Order order = 2;  // unset selects ASC
   }
 
+  // Document reordering at merge by recursive graph bisection. Absent in a
+  // SET request keeps the current setting; present without enabled clears
+  // it. Not valid together with index_sort. Changes affect future merges
+  // only.
+  DocReorder doc_reorder = 5;
+
+  // A large enough merge writes its documents in an order that places
+  // documents sharing terms next to each other (recursive graph bisection
+  // over the terms of the chosen fields), instead of concatenating its
+  // sources. Postings get smaller doc id gaps, so they compress better and
+  // conjunctions and phrases skip more; stored fields of similar documents
+  // compress together. It costs merge CPU and RAM (a forward index of the
+  // chosen fields' terms), and loses arrival order inside merged segments,
+  // which makes request-version runs larger. Flushed segments keep arrival
+  // order. Merges whose sources hold nested child rows do not reorder.
+  message DocReorder {
+    bool enabled = 1;
+    // Indexed text or string fields (concrete or template instances) whose
+    // terms drive the order. Empty selects every indexed text and string
+    // field of the merged segments; id fields never take part.
+    repeated string fields = 2;
+    // Smallest merge, in live documents, that reorders; absent selects
+    // 262144. A forced merge reorders at any size.
+    optional uint64 min_merge_docs = 3;
+  }
+
   // Stored-field groups, keyed by the name fields use as stored_resource. A
   // name is '_', ASCII letters, digits, or underscores, and a closing '_' (for
   // example "_stored_body_"), so it never matches a field or suffix template.

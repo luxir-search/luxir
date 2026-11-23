@@ -58,6 +58,10 @@ std::shared_ptr<const CommitSnapshot> Collection::updateSchema(const luxir::api:
       schema->updateWarnings.emplace_back("index_sort_cleared",
           "REPLACE_ALL without index_sort cleared the index sort; future merges keep arrival order");
     }
+    if (replace && current != nullptr && current->docReorder && !def.doc_reorder) {
+      schema->updateWarnings.emplace_back("doc_reorder_cleared",
+          "REPLACE_ALL without doc_reorder cleared document reordering; future merges keep arrival order");
+    }
     return schema;
   });
 }

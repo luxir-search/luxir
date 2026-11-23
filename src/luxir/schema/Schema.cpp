@@ -1140,6 +1140,17 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
       schema->indexSortField = indexSort->field;
       schema->indexSortOrder = indexSort->order;
     }
+    // Same semantics: absent keeps the base setting, present without enabled
+    // clears it.
+    auto docReorder = def.doc_reorder ? def.doc_reorder : baseSrc.doc_reorder;
+    if (docReorder && docReorder->enabled) {
+      src.doc_reorder = docReorder;
+      schema->docReorder = true;
+      schema->docReorderFields.assign(docReorder->fields.begin(), docReorder->fields.end());
+      if (docReorder->min_merge_docs) {
+        schema->docReorderMinMergeDocs = (int64_t)std::min<uint64_t>(*docReorder->min_merge_docs, INT64_MAX);
+      }
+    }
     src.fields = luxir::api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(fieldPairs.data(), fieldPairs.size()));
     src.templates = luxir::api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
@@ -1317,6 +1328,28 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
     auto type = (*ft)->type();
     if ((type != FieldType::INT && type != FieldType::DATE) || !(*ft)->hasColumn()) {
       throw SchemaError("index_sort field must be an int or date field with a column: " + field);
+    }
+  }
+
+  if (schema->docReorder) {
+    // Both choose the merged document order.
+    if (!schema->indexSortField.empty()) {
+      throw SchemaError("doc_reorder cannot be combined with index_sort");
+    }
+    for (const auto& field : schema->docReorderFields) {
+      auto* ft = schema->findPhysical(field);
+      if (ft == nullptr) {
+        throw SchemaError("doc_reorder field is not defined by a field or template: " + field);
+      }
+      auto type = (*ft)->type();
+      if ((type != FieldType::TEXT && type != FieldType::STRING) || !(*ft)->indexed()) {
+        throw SchemaError("doc_reorder field must be an indexed text or string field: " + field);
+      }
+      // Reordering moves root docs only; a nested path's field lives in a
+      // child row space and would never take part.
+      if (auto dot = field.rfind('.'); dot != std::string::npos && schema->isNestedPath(field.substr(0, dot))) {
+        throw SchemaError("doc_reorder field must not be under a nested path: " + field);
+      }
     }
   }
 

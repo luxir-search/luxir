@@ -1998,6 +1998,9 @@ public:
   [[nodiscard]] WrittenTerms endField() {
     assert(buildTrie);
     auto result = finishRange();
+    // Test seam: a single-run field's docs/freqs and positions bytes.
+    auto fieldName = (std::string_view)name;
+    Signal::emit("textFieldWritten", &fieldName, &result.docsBytes, &result.posBytes);
 
     WrittenTerms written{{result.nTerms, result.sumDocFreq, result.sumTotalTermFreq},
                          {}, result.segFlags};

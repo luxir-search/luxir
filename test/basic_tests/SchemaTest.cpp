@@ -1471,6 +1471,84 @@ TEST_F(SchemaTest, indexSortSurvivesRestart) {
   EXPECT_EQ("ts_dt", reopened.getSchema()->indexSortField);
 }
 
+TEST_F(SchemaTest, docReorderValidationRoundTripAndSetSemantics) {
+  auto s = schemaJson(R"({"templates":{"_t":"text"},"fields":{"body":"text","tag":"string","n":"int"},
+    "doc_reorder":{"enabled":true,"fields":["body","tag"],"min_merge_docs":1000}})");
+  EXPECT_TRUE(s->docReorder);
+  EXPECT_EQ((std::vector<std::string>{"body", "tag"}), s->docReorderFields);
+  EXPECT_EQ(1000, s->docReorderMinMergeDocs);
+  auto json = authoredJson(*s);
+  EXPECT_NE(std::string::npos, json.find(R"("doc_reorder":{"enabled":true,"fields":["body","tag"],"min_merge_docs":1000})"))
+      << json;
+  EXPECT_EQ(s->sourceDef_, schemaJson(json)->sourceDef_);
+  std::pmr::monotonic_buffer_resource arena;
+  auto stored = Schema::fromStored(s->storedInfo(arena), s->binding);
+  EXPECT_TRUE(stored->docReorder);
+  EXPECT_EQ(s->docReorderFields, stored->docReorderFields);
+
+  // A SET without doc_reorder keeps it, a template instance is accepted,
+  // fields default to all and min_merge_docs to 262144, and a setting
+  // without enabled clears it.
+  EXPECT_TRUE(schemaJson(R"({"fields":{"m":"int"}})", s.get())->docReorder);
+  auto defaults = schemaJson(R"({"doc_reorder":{"enabled":true,"fields":["x_t"]}})", s.get());
+  EXPECT_EQ(std::vector<std::string>{"x_t"}, defaults->docReorderFields);
+  EXPECT_EQ(Schema::DEFAULT_DOC_REORDER_MIN_MERGE_DOCS, defaults->docReorderMinMergeDocs);
+  EXPECT_TRUE(schemaJson(R"({"doc_reorder":{"enabled":true}})", s.get())->docReorderFields.empty());
+  auto cleared = schemaJson(R"({"doc_reorder":{}})", s.get());
+  EXPECT_FALSE(cleared->docReorder);
+  EXPECT_EQ(std::string::npos, authoredJson(*cleared).find("doc_reorder"));
+
+  EXPECT_THROW(schemaJson(R"({"fields":{"items":"nested","items.color":"string"},
+    "doc_reorder":{"enabled":true,"fields":["items.color"]}})"), SchemaError);
+  for (auto field : {"missing", "_t", "n", "id"}) {
+    SCOPED_TRACE(field);
+    EXPECT_THROW(schemaJson(std::format(R"({{"doc_reorder":{{"enabled":true,"fields":["{}"]}}}})", field), s.get()),
+                 SchemaError);
+  }
+  EXPECT_THROW(schemaJson(R"({"fields":{"tag":{"type":"string","index":"none"}}})", s.get()), SchemaError);
+  // Both choose the merged document order.
+  EXPECT_THROW(schemaJson(R"({"index_sort":{"field":"n"}})", s.get()), SchemaError);
+  EXPECT_THROW(schemaJson(R"({"fields":{"ts":"int"},"index_sort":{"field":"ts"},"doc_reorder":{"enabled":true}})"),
+               SchemaError);
+  EXPECT_NO_THROW(schemaJson(R"({"index_sort":{"field":"n"},"doc_reorder":{}})", s.get()));
+}
+
+TEST_F(SchemaTest, docReorderSurvivesRestartAndReplaceAllWarns) {
+  auto update = [](CollectionHelper& helper, std::string_view json, api::SchemaRequest_::Mode mode) {
+    std::pmr::monotonic_buffer_resource arena;
+    api::SchemaDef def;
+    EXPECT_TRUE(api::read_json(def, json, arena));
+    auto snapshot = helper.collection().updateSchema(def, mode);
+    std::vector<std::string> codes;
+    for (const auto& warning : snapshot->schema->responseWarnings(arena)) codes.emplace_back(warning.code);
+    return codes;
+  };
+  {
+    LuxirConfig config;
+    config.store.backend = "ram";
+    LuxirNode node(config);
+    CollectionHelper ch(node);
+    update(ch, R"({"doc_reorder":{"enabled":true,"fields":["body_t"],"min_merge_docs":5}})",
+           api::SchemaRequest_::Mode::SET);
+    ch.index(flatdoc("id", "1", "body_t", "a b"));
+    ch.commit();
+    ch.getIndexWriter()->close();
+    CommitSnapshotRegistry reopenedSnapshots(*ch.collection().getShard()->getDirectory());
+    IndexWriter reopened(reopenedSnapshots);
+    auto schema = reopened.getSchema();
+    EXPECT_TRUE(schema->docReorder);
+    EXPECT_EQ(std::vector<std::string>{"body_t"}, schema->docReorderFields);
+    EXPECT_EQ(5, schema->docReorderMinMergeDocs);
+  }
+
+  CollectionHelper ch("schema_replace_reorder");
+  ch.clear();
+  auto replace = api::SchemaRequest_::Mode::REPLACE_ALL;
+  EXPECT_TRUE(update(ch, R"({"doc_reorder":{"enabled":true}})", replace).empty());
+  EXPECT_EQ((std::vector<std::string>{"doc_reorder_cleared"}), update(ch, R"({"fields":{"ts":"int"}})", replace));
+  EXPECT_FALSE(ch.collection().getSchema()->docReorder);
+}
+
 // REPLACE_ALL rebuilds the schema from the request: leaving index_sort out
 // clears it, and the update's response carries a warning saying so.
 TEST_F(SchemaTest, replaceAllWithoutIndexSortWarns) {

@@ -1,11 +1,12 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-// Index sort: merges write their documents in the schema's index_sort order.
-// One collection with the setting and one without index the same randomized
+// Merge reordering: with index_sort merges write their documents in the
+// schema's sort order, with doc_reorder in graph bisection order. One
+// collection with the setting and one without index the same randomized
 // documents, updates and deletes; every query, sort, facet, collapse, kNN and
-// retrieval must answer the same by id, and a merged segment must be in key
-// order.
+// retrieval must answer the same by id, and a sorted merged segment must be
+// in key order.
 
 #include <gtest/gtest.h>
 
@@ -299,8 +300,9 @@ void expectKeyOrder(const std::vector<Json>& docs, const char* field, bool desce
 }  // namespace
 
 // The equivalence run: ascending and descending on a single-valued field,
-// and descending on a multi-valued one (max key).
-enum class Mode { SINGLE_ASC, SINGLE_DESC, MULTI_DESC };
+// descending on a multi-valued one (max key), and document reordering by
+// graph bisection (doc_reorder) over every text and string field.
+enum class Mode { SINGLE_ASC, SINGLE_DESC, MULTI_DESC, BISECTION };
 
 class IndexSortEquivalenceTest : public IndexSortTest, public ::testing::WithParamInterface<Mode> {};
 
@@ -309,8 +311,10 @@ TEST_P(IndexSortEquivalenceTest, randomizedResultsMatchUnsortedCollection) {
   bool multi = mode == Mode::MULTI_DESC;
   bool descending = multi || mode == Mode::SINGLE_DESC;
   const char* field = multi ? "ns_is" : "ts_i";
+  bool bisection = mode == Mode::BISECTION;
   std::string spec = mode == Mode::MULTI_DESC ? R"j("index_sort":{"field":"ns_is","order":"desc"})j"
       : mode == Mode::SINGLE_DESC ? R"j("index_sort":{"field":"ts_i","order":"desc"})j"
+      : bisection ? R"j("doc_reorder":{"enabled":true})j"
       : R"j("index_sort":{"field":"ts_i"})j";
   auto plain = collection("isort_plain", "");
   auto sorted = collection("isort_sorted", spec);
@@ -366,7 +370,7 @@ TEST_P(IndexSortEquivalenceTest, randomizedResultsMatchUnsortedCollection) {
   compare("segments");
   forceMerge();
   EXPECT_EQ(1, reorders);
-  expectKeyOrder(indexOrder("isort_sorted"), field, descending);
+  if (!bisection) expectKeyOrder(indexOrder("isort_sorted"), field, descending);
   compare("merged");
 
   // Deletes and updates after the merge, then a merge of the sorted segment
@@ -376,15 +380,16 @@ TEST_P(IndexSortEquivalenceTest, randomizedResultsMatchUnsortedCollection) {
   compare("merged plus segment");
   forceMerge();
   EXPECT_EQ(2, reorders);
-  expectKeyOrder(indexOrder("isort_sorted"), field, descending);
+  if (!bisection) expectKeyOrder(indexOrder("isort_sorted"), field, descending);
   compare("merged again");
 }
 
 INSTANTIATE_TEST_SUITE_P(IndexSort, IndexSortEquivalenceTest,
-                         ::testing::Values(Mode::SINGLE_ASC, Mode::SINGLE_DESC, Mode::MULTI_DESC),
+                         ::testing::Values(Mode::SINGLE_ASC, Mode::SINGLE_DESC, Mode::MULTI_DESC, Mode::BISECTION),
                          [](const auto& info) {
                            return info.param == Mode::SINGLE_ASC ? "singleAsc"
-                               : info.param == Mode::SINGLE_DESC ? "singleDesc" : "multiDesc";
+                               : info.param == Mode::SINGLE_DESC ? "singleDesc"
+                               : info.param == Mode::MULTI_DESC ? "multiDesc" : "bisection";
                          });
 
 // Sources already in key order concatenate: the permutation is the identity.
@@ -801,4 +806,257 @@ TEST_F(IndexSortTest, mergeWithChildSpacesConcatenates) {
   std::vector<std::string> order;
   for (const Json& doc : indexOrder("main", R"j(["id"])j")) order.push_back(doc["id"].get<std::string>());
   EXPECT_EQ((std::vector<std::string>{"c", "d", "a", "b"}), order);
+}
+
+// ---- doc_reorder: graph bisection order ----
+
+namespace {
+
+// Doc i: `count` words of cluster i % clusters' own vocabulary.
+Doc clusteredDoc(Rng& rng, int i, int clusters, int vocabulary, int count) {
+  std::string body;
+  for (int n = 0; n < count; n++) {
+    body += std::format("c{}w{} ", i % clusters, rng.rint(vocabulary));
+  }
+  return flatdoc("id", "d" + std::to_string(i), "seq_i", (int64_t)i, "body_t", body);
+}
+
+// Adjacent docs (in index order) of different clusters.
+int clusterSwitches(const std::vector<Json>& docs, int clusters) {
+  int out = 0;
+  for (size_t i = 1; i < docs.size(); i++) {
+    out += docs[i]["seq_i"].get<int64_t>() % clusters != docs[i - 1]["seq_i"].get<int64_t>() % clusters;
+  }
+  return out;
+}
+
+}  // namespace
+
+// Two disjoint vocabularies interleaved A, B, A, B: concatenation spreads
+// every term's docs over both, the bisection puts each vocabulary's docs
+// together and halves the doc id gaps.
+TEST_F(IndexSortTest, bisectionGroupsClustersAndShrinksPostings) {
+  constexpr int DOCS = 20000, PER_SEGMENT = 5000;
+  auto plain = collection("bp_plain", "");
+  auto reordered = collection("bp_reordered", R"j("doc_reorder":{"enabled":true,"fields":["body_t"]})j");
+  // One term run per field, so the field's bytes are reported in one piece.
+  for (auto* helper : {plain.get(), reordered.get()}) helper->getIndexWriter()->termPartitionMinBytes = INT64_MAX;
+  uint64_t docsBytes = 0;
+  Signal::listen("textFieldWritten", [&](void* name, void* docs, void*) -> void* {
+    if (*(std::string_view*)name == "body_t") docsBytes = *(uint64_t*)docs;
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("textFieldWritten"); });
+  for (int s = 0; s < DOCS / PER_SEGMENT; s++) {
+    std::vector<Doc> batch;
+    for (int i = s * PER_SEGMENT; i < (s + 1) * PER_SEGMENT; i++) batch.push_back(clusteredDoc(rng, i, 2, 32, 12));
+    for (auto* helper : {plain.get(), reordered.get()}) {
+      ASSERT_TRUE(helper->indexAll(batch, UpdateMessage::COMMIT, true).success);
+    }
+  }
+  forceMerge(*plain);
+  uint64_t plainBytes = docsBytes;
+  forceMerge(*reordered);
+  EXPECT_EQ(1, reorders);
+  EXPECT_LE(docsBytes, plainBytes * 8 / 10) << docsBytes << " vs " << plainBytes;
+  EXPECT_EQ(DOCS - 1, clusterSwitches(indexOrder("bp_plain", R"j(["seq_i"])j"), 2));
+  EXPECT_LE(clusterSwitches(indexOrder("bp_reordered", R"j(["seq_i"])j"), 2), 3);
+  expectSame("bp_plain", "bp_reordered", {
+      {R"j({"query":"body_t:c0w3 AND body_t:c0w7","limit":-1,"count_limit":-1,"fields":["id"]})j", true},
+      {R"j({"query":"body_t:\"c1w2 c1w5\"","limit":-1,"count_limit":-1,"fields":["id"]})j", true},
+  });
+}
+
+// Merges below min_merge_docs keep arrival order; a forced merge reorders at
+// any size.
+TEST_F(IndexSortTest, bisectionSkipsMergesBelowMinMergeDocs) {
+  auto helper = collection("bp_small", R"j("doc_reorder":{"enabled":true,"min_merge_docs":1000})j");
+  helper->getIndexWriter()->mergePolicy->setMergeFactor(2);
+  std::vector<std::string> skipped;
+  Signal::listen("mergeReorderSkipped", [&](void* reason, void*, void*) -> void* {
+    skipped.emplace_back(*(std::string_view*)reason);
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("mergeReorderSkipped"); });
+  int next = 0;
+  auto ingest = [&] {
+    CollectionHelper::UpdateBuilder request;
+    for (int i = 0; i < 100; i++, next++) request.add(clusteredDoc(rng, next, 2, 16, 6));
+    request.commit(true);
+    ASSERT_TRUE(helper->submit(request).success);
+  };
+  ingest();
+  ingest();
+  EXPECT_EQ(1u, helper->durableSegmentCount());
+  EXPECT_EQ(0, reorders);
+  EXPECT_EQ(1, concatenations);
+  EXPECT_EQ(std::vector<std::string>{"min_merge_docs"}, skipped);
+  EXPECT_EQ(199, clusterSwitches(indexOrder("bp_small", R"j(["seq_i"])j"), 2));
+
+  helper->getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  ingest();
+  forceMerge(*helper);
+  EXPECT_EQ(1, reorders);
+  EXPECT_LE(clusterSwitches(indexOrder("bp_small", R"j(["seq_i"])j"), 2), 7);
+}
+
+// The forward index is reserved from the indexing RAM budget: a budget too
+// small for it raises the smallest kept doc frequency until the term lists
+// fit, and one too small for the per-doc arrays skips the reorder.
+TEST_F(IndexSortTest, bisectionFitsTheRamBudgetOrSkips) {
+  auto& budget = LuxirTest::luxirNode->getIndexRamBudget();
+  int64_t savedTotal = budget.totalBytes();
+  int64_t headroom = 0;  // set by each run, applied when its merge starts; 0: uncapped
+  Signal::listen("mergeStart", [&](void*, void*, void*) -> void* {
+    budget.setTotalBytes(headroom == 0 ? 0 : budget.reservedBytes() + headroom);
+    return nullptr;
+  });
+  std::vector<std::array<int64_t, 4>> plans;  // docs, terms, postings, minDocFreq
+  Signal::listen("mergeBisection", [&](void* stats, void*, void*) -> void* {
+    plans.push_back(*(std::array<int64_t, 4>*)stats);
+    return nullptr;
+  });
+  std::vector<std::string> skipped;
+  Signal::listen("mergeReorderSkipped", [&](void* reason, void*, void*) -> void* {
+    skipped.emplace_back(*(std::string_view*)reason);
+    return nullptr;
+  });
+  auto restore = scope_guard([&] {
+    Signal::unlisten("mergeStart");
+    Signal::unlisten("mergeBisection");
+    Signal::unlisten("mergeReorderSkipped");
+    budget.setTotalBytes(savedTotal);
+  });
+  constexpr int DOCS = 4000;
+  auto run = [&](const std::string& name, int64_t bytes) {
+    auto helper = collection(name, R"j("doc_reorder":{"enabled":true})j");
+    for (int s = 0; s < 2; s++) {
+      std::vector<Doc> batch;
+      // Zipf-like: cluster word i in about 1/(i+1) of the cluster's docs.
+      for (int i = s * DOCS / 2; i < (s + 1) * DOCS / 2; i++) {
+        std::string body;
+        for (int w = 0; w < 200; w++) if (rng.rint(w + 1) == 0) body += std::format("c{}w{} ", i % 2, w);
+        batch.push_back(flatdoc("id", "d" + std::to_string(i), "seq_i", (int64_t)i, "body_t", body));
+      }
+      ASSERT_TRUE(helper->indexAll(batch, UpdateMessage::COMMIT, true).success);
+    }
+    headroom = bytes;
+    forceMerge(*helper);
+    budget.setTotalBytes(savedTotal);
+  };
+  int64_t perDoc = MergeCostModel::bisectionPlanBytes(DOCS, 0, 0, 0);
+  run("bp_ram_free", 0);
+  ASSERT_EQ(1u, plans.size());
+  EXPECT_EQ(1, reorders);
+  auto unconstrained = plans[0];
+  EXPECT_EQ(2, unconstrained[3]);
+  // Room for the per-doc arrays and a quarter of the postings.
+  int64_t terms = unconstrained[1] * (4 + 8 * oneapi::tbb::this_task_arena::max_concurrency());
+  run("bp_ram_tight", perDoc + terms + unconstrained[2] * MergeCostModel::BISECTION_POSTING_BYTES / 4);
+  ASSERT_EQ(2u, plans.size());
+  EXPECT_EQ(2, reorders);
+  EXPECT_GT(plans[1][3], unconstrained[3]);
+  EXPECT_LT(plans[1][2], unconstrained[2]);
+  EXPECT_TRUE(skipped.empty());
+  // No room for the per-doc arrays.
+  run("bp_ram_none", 1);
+  EXPECT_EQ(2, reorders);
+  EXPECT_EQ(std::vector<std::string>{"ram"}, skipped);
+}
+
+// Docs deleted while a reordering merge runs map through the bisection's
+// permutation.
+TEST_F(IndexSortTest, deletesDuringBisectionMergeMapThroughPermutation) {
+  auto helper = collection("bp_late", R"j("doc_reorder":{"enabled":true})j");
+  auto writer = helper->getIndexWriter();
+  for (int s = 0; s < 2; s++) {
+    std::vector<Doc> batch;
+    for (int i = s * 100; i < (s + 1) * 100; i++) batch.push_back(clusteredDoc(rng, i, 2, 16, 6));
+    ASSERT_TRUE(helper->indexAll(batch, UpdateMessage::COMMIT, true).success);
+  }
+  std::latch diff(1), releaseMerge(1);
+  Signal::listen("mergeLiveDocsDiff", [&](void*, void*, void*) -> void* {
+    diff.count_down(); releaseMerge.wait(); return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("mergeLiveDocsDiff"); });
+  auto merge = std::async(std::launch::async, [&] { writer->mergeSegments(); });
+  diff.wait();
+  std::vector<std::string> gone = {"d0", "d1", "d77", "d150", "d199"};
+  auto commit = std::async(std::launch::async, [&] { return helper->deleteByIds(gone, UpdateMessage::COMMIT); });
+  releaseMerge.count_down();
+  EXPECT_TRUE(commit.get().success);
+  merge.get();
+  writer->updateGraph->wait_for_all();
+  EXPECT_EQ(1, reorders);
+  auto docs = indexOrder("bp_late", R"j(["id","seq_i"])j");
+  std::set<std::string> ids;
+  for (const Json& doc : docs) ids.insert(doc["id"].get<std::string>());
+  EXPECT_EQ(195u, ids.size());
+  for (const auto& id : gone) EXPECT_FALSE(ids.contains(id)) << id;
+  // The clusters come out (nearly) contiguous.
+  EXPECT_LE(clusterSwitches(docs, 2), 7);
+}
+
+// Nested merges concatenate under doc_reorder too.
+TEST_F(IndexSortTest, bisectionWithChildSpacesConcatenates) {
+  CollectionHelper helper;
+  helper.clear();
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  nested_test::setSchema(helper.collection());
+  setSchema(helper, R"j({"doc_reorder":{"enabled":true}})j");
+  std::vector<std::string> skipped;
+  Signal::listen("mergeReorderSkipped", [&](void* reason, void*, void*) -> void* {
+    skipped.emplace_back(*(std::string_view*)reason);
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("mergeReorderSkipped"); });
+  for (int batch = 0; batch < 2; batch++) {
+    CollectionHelper::UpdateBuilder input;
+    for (int i = batch * 2; i < batch * 2 + 2; i++) nested_test::add(input, nested_test::DOCS[i]);
+    input.commit();
+    ASSERT_TRUE(helper.submit(input).success);
+  }
+  forceMerge(helper);
+  EXPECT_EQ(0, reorders);
+  EXPECT_EQ(std::vector<std::string>{"child_spaces"}, skipped);
+  EXPECT_EQ(nested_test::INITIAL, nested_test::local(*LuxirTest::luxirNode));
+}
+
+// The forward index holds at most bisectionMaxPostings postings (uint32
+// offsets). Past the limit minDocFreq doubles like under RAM pressure, and
+// the term being added (k1, in both sources) drops out once it no longer
+// qualifies.
+TEST_F(IndexSortTest, bisectionPostingsLimitRaisesMinDocFreq) {
+  std::vector<std::array<int64_t, 4>> plans;  // docs, terms, postings, minDocFreq
+  Signal::listen("mergeBisection", [&](void* stats, void*, void*) -> void* {
+    plans.push_back(*(std::array<int64_t, 4>*)stats);
+    return nullptr;
+  });
+  auto saved = SegmentMerger::bisectionMaxPostings;
+  auto restore = scope_guard([&] {
+    Signal::unlisten("mergeBisection");
+    SegmentMerger::bisectionMaxPostings = saved;
+  });
+  auto plan = [&](const std::string& name, int64_t limit) {
+    SegmentMerger::bisectionMaxPostings = limit;
+    auto helper = collection(name, R"j("doc_reorder":{"enabled":true,"fields":["body_t"]})j");
+    for (int s = 0; s < 2; s++) {
+      std::vector<Doc> batch;
+      for (int i = 0; i < 32; i++) {
+        // k0 in 60 docs, k1 in 3 (two in the first source, one in the
+        // second), each doc's own z term in one.
+        std::string body = std::format("z{}{}", s, i);
+        if (i < 30) body += " k0";
+        if (i < 2 - s) body += " k1";
+        batch.push_back(flatdoc("id", std::format("d{}-{}", s, i), "body_t", body));
+      }
+      EXPECT_TRUE(helper->indexAll(batch, UpdateMessage::COMMIT, true).success);
+    }
+    forceMerge(*helper);
+    return plans.back();
+  };
+  EXPECT_EQ((std::array<int64_t, 4>{64, 2, 63, 2}), plan("bp_cap_free", UINT32_MAX));
+  EXPECT_EQ((std::array<int64_t, 4>{64, 1, 60, 4}), plan("bp_cap_tight", 62));
+  // No term fits: nothing to order.
+  EXPECT_EQ((std::array<int64_t, 4>{64, 0, 0, 64}), plan("bp_cap_none", 10));
 }
