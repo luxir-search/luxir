@@ -32,6 +32,13 @@ read from the schema, so a schema change never reinterprets an
 existing segment, and the column stays a plain fixed-size binary column
 (`dims` is derived from the value size and the encoding).
 
+`bf16` keeps the high 16 bits of each float32, rounded to nearest even with
+integer operations on the float bits, so the stored bytes do not depend on the
+compiler or CPU. It keeps the float32 exponent, and accepted elements are at
+most 2^40 in magnitude, so rounding never overflows and `bf16` needs no range
+check. `f16` keeps three more bits of precision but rejects elements above
+65504.
+
 `sq8` follows the per-vector scaling of LVQ (Aguerrebere et al., "Similarity
 search in the blink of an eye with compressed indices", VLDB 2023,
 arXiv:2304.04759): each value is `offset, scale, codes[dims]` with
@@ -41,29 +48,43 @@ before quantizing; Luxir does not, because any shared statistic would tie a
 stored value to the segment it was written in. With purely per-vector
 parameters:
 
-- Each value is self-describing. Merges copy the encoded bytes verbatim, and
-  never re-quantize already-quantized data.
+- Each value is self-describing, so a merge copies values that are already in
+  its output encoding verbatim.
 - No per-segment or per-dimension statistics exist, so nothing has to be
   recomputed or reconciled when immutable segments merge, and a vector's
   bytes do not change when its neighbors are deleted.
 - Quantization error is bounded by each vector's own range: half a step,
   `(max - min) / 510`, per element.
 
-A merge of inputs with different encodings (a schema change between them)
-writes the schema's current encoding and transcodes the other inputs, so a
-field converges to its declared encoding. Transcoding is lossy when it goes to
-a narrower encoding; it clamps to the f16 range and renormalizes unit-length
-cosine rows written as f32. Same-encoding merges are pure byte copies.
+A merge writes the schema's current encoding, so a field converges to its
+declared encoding as its segments merge; when the schema no longer has a
+vector type under the field's name, it keeps the first non-empty input's
+encoding. Inputs already in the output encoding are byte copies. Every other
+input is decoded and re-encoded, whether the inputs differ from each other or
+all share an out-of-date encoding. Re-encoding to a narrower encoding is
+lossy. `f16` clamps elements to its range and logs one warning per merged
+field with the clamped-element count; `bf16` and `sq8` never clamp. Cosine
+rows promoted to `f32` in a field that stores unit vectors are renormalized,
+since a decoded unit vector is only approximately unit length.
+`VectorTranscoder` owns this policy: `SegmentMerger` asks it for the output
+encoding and passes each value through it, as `VectorHandler` describes the
+column to `StrColHandler` at flush. Only segments that merge are re-encoded;
+a forced merge rewrites the segments it merges.
 
-Exact scoring means exact over the stored values. `VectorScorer` is the
-single place a float query is scored against a stored row, used by the flat
-column engine and the terminal candidate rescore. `f16`, `bf16` and `sq8` rows
-are decoded into a per-task buffer and scored with the float32 kernels, so a
-score is the f32 score of the stored vector. `sq8` decodes first rather than
-scoring its codes against per-vector offset and scale terms, which cancel
+Ingest validates the vector it will store. A cosine field that keeps raw
+vectors (`normalize_on_write: false`) checks the norm of the encoded vector
+after decoding, so a vector whose elements underflow in `f16` is skipped like
+a zero vector instead of being stored without a direction.
+
+Exact scoring means exact over the stored values. `VectorScorer` is the single
+place a float query is scored against a stored row, used by the flat column
+engine and the terminal candidate rescore. `f16`, `bf16` and `sq8` rows are
+decoded into a per-task buffer and scored with the float32 kernels, so a score
+is the f32 score of the stored vector. `sq8` decodes first rather than scoring
+its codes against per-vector offset and scale terms, which cancel
 catastrophically for a query with a large dynamic range. Cosine over a decoded
 row always divides by the stored vector's norm, since a quantized unit vector
-is not exactly unit length. Kernels that read the stored encoding directly
+is not exactly unit length. Distance kernels that read 16-bit values directly
 can replace the decode behind `VectorScorer` without changing the format
 contract.
 
@@ -710,7 +731,7 @@ remaining interval values by `upper >= T`. A value whose upper score is below
 its unit's best known exact score is also skipped. Both stages read in segment
 and value-rank order, with disjoint column reads and a shared exact-score cache.
 Final unit collapse and similarity filtering use exact scores, exact over the
-stored encoding.
+stored values.
 Before similarity filtering, a diagnostic reports an unsupported floor and
 its distinct-unit shortfall when fewer than k exact units reach the final
 witness floor; it changes no selection behavior and does not detect every

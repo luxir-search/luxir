@@ -189,30 +189,46 @@ At 768 dimensions that is 3072, 1536, 1536, and 776 bytes per vector.
 
 `sq8` quantizes each vector on its own, between its minimum and maximum
 element, so a stored vector never depends on other vectors, segments, or
-statistics. Merges copy stored vectors unchanged. Cosine vectors are
-normalized before they are quantized.
+statistics, and a constant vector is stored exactly. Cosine vectors are
+normalized before they are encoded, unless `normalize_on_write` is `false`.
 
-Encoded fields reject vectors with non-finite elements (NaN or infinity), and
-`f16` also rejects elements whose magnitude exceeds 65504. A constant vector
-is valid under `sq8`.
+`f16` rejects a vector with an element whose magnitude exceeds 65504; `bf16`
+and `sq8` accept every valid vector. A cosine field with
+`normalize_on_write: false` skips a vector that has no direction once encoded,
+as it skips a zero vector: under `f16`, elements below about 3e-8 are stored
+as zero.
 
-Search scores the query, which stays float32, against the stored encoding:
+Search scores the query, which stays float32, against the stored values:
 `exact: true`, the scan of segments without an overlay, and the rescore of
 approximate candidates are all exact over the stored vectors, not over the
-vectors you submitted. Cosine over `f16`, `bf16` and `sq8` divides by the norm of the
-stored vector, so scores remain cosines. Vectors read back in `fields` are the
-stored values decoded to float32.
+vectors you submitted, and a `similarity` threshold compares those scores.
+Cosine over `f16`, `bf16` and `sq8` divides by the norm of the stored vector,
+so scores remain cosines. Vectors read back in `fields` are the stored values
+decoded to float32.
 
-`encoding` applies to segments written after the change.
-Existing segments keep the encoding they were written with, and a merge of
-segments with different encodings rewrites them in the field's current
-encoding, so a field converges to its declared encoding over time. Moving to a
-narrower encoding is lossy. Under f16, bf16 or sq8 storage, `exact` and
-`similarity` cut-offs compare scores computed over the quantized values.
+`encoding` applies to segments written after the change. A merge writes the
+field's current encoding: it copies the vectors of inputs already in it and
+re-encodes the others, so the field converges to its declared encoding as its
+segments merge. A segment that is never merged keeps the encoding it was
+written with; a forced merge (`max_segments` on a
+[commit](indexing.md#visibility-and-commits)) re-encodes the segments it
+merges. Moving to a narrower encoding is lossy. Re-encoding to `f16` clamps
+elements beyond 65504 and logs a warning with their count; `bf16` and `sq8`
+never clamp.
 
-To keep more than one precision of the same input, such as a compact field
-for search beside an `f32` copy, declare a [variant](schema.md#field-variants)
-with its own `encoding`.
+To keep two precisions of one input, such as `sq8` for search beside an
+`f32` copy, declare a [variant](schema.md#field-variants). A variant may set
+its own `encoding` and `truncate_dims`, and must share the primary's input
+`dims`. Query the copy by its variant name, `embedding_v__full` here:
+
+```json
+"embedding_v": {
+  "type": "vector", "dims": 768, "metric": "cosine", "encoding": "sq8",
+  "variants": {
+    "full": { "type": "vector", "dims": 768, "metric": "cosine" }
+  }
+}
+```
 
 With
 [`truncate_dims`](#truncate-matryoshka-embeddings), `dims` in the table
@@ -951,10 +967,10 @@ space, not the score's:
 {"query": {"knn": {"field": "embedding_v", "query": [0.75, 0.15, 0.10], "k": 20, "similarity": 0.8}}}
 ```
 
-The threshold trims the `k` nearest documents after the full-precision
-rescore; it does not search past them, so a request can match fewer than `k`
-documents. The comparison uses each document's best vector, before any
-enclosing `boost`. Trimmed documents are not matches: they leave `found`,
+The threshold trims the `k` nearest documents after the exact rescore from
+the stored column; it does not search past them, so a request can match fewer
+than `k` documents. The comparison uses each document's best vector, before
+any enclosing `boost`. Trimmed documents are not matches: they leave `found`,
 facets, and metrics as well as the returned list, on exact and approximate
 segments and in parallel execution alike.
 
@@ -1035,5 +1051,5 @@ bit-identical results to a serial run of the same query.
   not in the update response.
 - Vector fields are returned only when named in `fields`; they are excluded
   from default projection.
-- Changing `encoding` does not re-encode existing segments; reindex to apply
-  it to existing documents.
+- Changing `encoding` re-encodes a segment only when it merges; a segment
+  that never merges keeps its old encoding.
