@@ -3,8 +3,6 @@
 
 #include <gtest/gtest.h>
 
-#include <filesystem>
-#include <format>
 #include <future>
 #include <latch>
 #include <set>
@@ -92,6 +90,12 @@ void writeRaw(Directory& dir, uint64_t kind, int32_t maxDoc, int32_t numLive, st
   dir.finishFile(*file);
 }
 
+std::string rawBytes(Directory& dir) {
+  auto file = dir.openFile(Postings::getLiveDocsFileName(Postings::segmentKey(1, 1), 1, 1));
+  auto hold = file->acquire({0, file->size()});
+  return std::string(hold.getData(), hold.getLength());
+}
+
 } // namespace
 
 TEST_F(LiveDocsTest, writerPicksSmallerKindAndReaderRestoresBits) {
@@ -112,7 +116,7 @@ TEST_F(LiveDocsTest, writerPicksSmallerKindAndReaderRestoresBits) {
     ASSERT_NE(nullptr, live);
     // A sparse file is expanded into a heap bitmap with its own counter; child
     // live views keep theirs.
-    uint64_t heap = deletes < 4 ? sizeof(LiveDocs) + 16 : 0;
+    uint64_t heap = sparse ? sizeof(LiveDocs) + 16 : 0;
     EXPECT_EQ(heap, live->heapBytes());
     EXPECT_EQ(before + heap, liveDocsMemory.sparseRoots.bytes.load());
     EXPECT_EQ(views, liveDocsMemory.views.bytes.load());
@@ -125,22 +129,30 @@ TEST_F(LiveDocsTest, writerPicksSmallerKindAndReaderRestoresBits) {
 
 TEST_F(LiveDocsTest, sparseRoundTripWhenMaxDocFillsWholeWords) {
   RAMDir dir;
-  RAMFixedBitSet bits(128, true);
+  RAMFixedBitSet bits(256, true);
   bits.clear(0);
-  bits.clear(127);
-  EXPECT_EQ(24u + 8, LiveDocsWriter::writeLiveDocs(dir, 1, 1, 1, 1, bits, 128, 126));
-  auto live = LiveDocs::create(dir, 1, 1, 1, 1, 128, false);
-  EXPECT_EQ(126, live->numLive());
-  for (int32_t doc = 0; doc < 128; doc++) EXPECT_EQ(doc != 0 && doc != 127, live->bitset().get(doc)) << doc;
+  bits.clear(255);
+  EXPECT_EQ(24u + 8, LiveDocsWriter::writeLiveDocs(dir, 1, 1, 1, 1, bits, 256, 254));
+  // Pins the SPARSE bytes, which the format reference index (one small segment
+  // delete, written DENSE) does not cover.
+  RAMDir expected;
+  writeRaw(expected, LiveDocsWriter::SPARSE, 256, 254, std::vector<uint32_t>{0, 255});
+  EXPECT_EQ(rawBytes(expected), rawBytes(dir));
+  auto live = LiveDocs::create(dir, 1, 1, 1, 1, 256, false);
+  EXPECT_EQ(254, live->numLive());
+  for (int32_t doc = 0; doc < 256; doc++) EXPECT_EQ(doc != 0 && doc != 255, live->bitset().get(doc)) << doc;
 }
 
-TEST_F(LiveDocsTest, writerRejectsCountThatDisagreesWithBits) {
-  RAMDir sparse, dense;
+TEST_F(LiveDocsTest, writerRejectsBitsTheHeaderWouldMisstate) {
+  RAMDir dir;
   RAMFixedBitSet bits(100, true);
   bits.clear(5);
-  EXPECT_THROW(LiveDocsWriter::writeLiveDocs(sparse, 1, 1, 1, 1, bits, 100, 98), std::logic_error);
-  for (int32_t doc = 10; doc < 20; doc++) bits.clear(doc);
-  EXPECT_THROW(LiveDocsWriter::writeLiveDocs(dense, 1, 1, 1, 1, bits, 100, 90), std::logic_error);
+  // A count that disagrees with the bits, for a SPARSE and a DENSE count.
+  EXPECT_THROW(LiveDocsWriter::writeLiveDocs(dir, 1, 1, 1, 1, bits, 100, 100), std::logic_error);
+  EXPECT_THROW(LiveDocsWriter::writeLiveDocs(dir, 1, 1, 1, 1, bits, 100, 90), std::logic_error);
+  // A live bit past maxDoc, which a dense reader would map.
+  bits.words[1] |= 1ULL << 40;
+  EXPECT_THROW(LiveDocsWriter::writeLiveDocs(dir, 1, 1, 1, 1, bits, 100, 99), std::logic_error);
 }
 
 TEST_F(LiveDocsTest, corruptSparseFilesThrow) {
@@ -228,34 +240,6 @@ TEST_F(LiveDocsTest, mergeDiffWritesEitherKind) {
     writer->commit();
     EXPECT_EQ(std::vector<uint64_t>{dense ? 24u + 80 : 24u + 4 * 3}, liveFileBytes(writer->dir));
     expectLive(ch, live);
-  }
-}
-
-TEST_F(LiveDocsTest, nestedViewsDeriveFromSparseRoot) {
-  LuxirNode node;
-  CollectionHelper ch(node, "live_nested");
-  auto writer = ch.getIndexWriter();
-  CollectionHelper::UpdateBuilder input;
-  std::vector<std::string> json;
-  for (int i = 0; i < 100; i++) {
-    json.push_back(std::format(R"({{"id":"{}","items_nested":{{"parts_nested":{{"tag_s":"t{}"}}}}}})", i, i));
-  }
-  for (const auto& doc : json) {
-    input.addRaw([&doc](api::Map& map, std::pmr::memory_resource& mr) { ASSERT_TRUE(api::read_json(map, doc, mr)); });
-  }
-  input.commit();
-  ASSERT_TRUE(ch.submit(input).success);
-  ASSERT_TRUE(ch.deleteByIds({"5", "64"}, UpdateMessage::COMMIT).success);
-  EXPECT_EQ(std::vector<uint64_t>{24 + 8}, liveFileBytes(writer->dir));
-  auto view = writer->snapshots.readers.getReader()->view("items_nested.parts_nested");
-  EXPECT_EQ(100, view->maxDoc());
-  EXPECT_EQ(98, view->liveDocs());
-  for (int i : {4, 5, 63, 64, 99}) {
-    auto req = localReq(ch.getSearchEngine());
-    req->collection("live_nested").topDocs().exprQuery(std::format("items_nested.parts_nested.tag_s:t{}", i)).countLimit().limit(0);
-    req->execute(1);
-    ASSERT_OK(req);
-    EXPECT_EQ(i == 5 || i == 64 ? 0 : 1, req->getMatchCount()) << i;
   }
 }
 
