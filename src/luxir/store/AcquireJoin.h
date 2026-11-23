@@ -18,6 +18,23 @@
 
 namespace luxir {
 
+/// Where batched acquires go: a caller issues one batch per file and each
+/// batch's holds reach its `take`, on the thread that completed the batch.
+/// AcquireJoin waits for them on the caller's thread; AcquireRound resumes a
+/// request once they complete, without a thread waiting.
+class AcquireBatches {
+public:
+  using Take = std::function<void(std::vector<HeldRange>&&)>;
+
+  /// Starts one batch on `file`, which must stay open until the batch
+  /// completed. A batch acquire that throws instead of completing counts as
+  /// that batch failing.
+  virtual void acquire(InputFile& file, std::span<const ByteRange> ranges, Take take) = 0;
+
+protected:
+  ~AcquireBatches() = default;
+};
+
 /// Joins batched acquires across files, so a caller issues them together and
 /// waits once for all of them.
 ///
@@ -30,7 +47,7 @@ namespace luxir {
 ///
 /// The destructor waits for batches still in flight, so a caller that throws
 /// between acquire() and wait() leaves no completion running on freed state.
-class AcquireJoin {
+class AcquireJoin final : public AcquireBatches {
   std::mutex mutex;
   std::condition_variable finished;
   size_t pending = 0;
@@ -48,8 +65,6 @@ class AcquireJoin {
   }
 
 public:
-  using Take = std::function<void(std::vector<HeldRange>&&)>;
-
   AcquireJoin() = default;
   AcquireJoin(const AcquireJoin&) = delete;
   AcquireJoin& operator=(const AcquireJoin&) = delete;
@@ -57,7 +72,7 @@ public:
 
   /// Starts one batch on `file`. A batch acquire that throws instead of
   /// completing counts as that batch failing. `file` must outlive wait().
-  void acquire(InputFile& file, std::span<const ByteRange> ranges, Take take) {
+  void acquire(InputFile& file, std::span<const ByteRange> ranges, Take take) override {
     {
       std::lock_guard lock(mutex);
       ++pending;

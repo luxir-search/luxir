@@ -31,6 +31,13 @@ struct IoCounters {
   std::atomic<uint64_t> acquires{0};
   // Bytes those ranges cover.
   std::atomic<uint64_t> acquiredBytes{0};
+  // Calls that acquired them: a batch of ranges on one file counts once, and
+  // so does a single acquire.
+  std::atomic<uint64_t> acquireBatches{0};
+  // Waits on those calls in sequence: the batches of one round, issued
+  // together across files and segments, count once, and so does each
+  // acquire a read makes on demand.
+  std::atomic<uint64_t> acquireRounds{0};
   // Store requests a backend issued (one ranged GET each).
   std::atomic<uint64_t> requests{0};
   // Sequential waits on the store: requests issued together and awaited
@@ -42,13 +49,17 @@ struct IoCounters {
 
   struct Snapshot {
     uint64_t acquires = 0, acquiredBytes = 0, requests = 0, rounds = 0, fetchedBytes = 0;
-    bool empty() const { return (acquires | acquiredBytes | requests | rounds | fetchedBytes) == 0; }
+    uint64_t acquireBatches = 0, acquireRounds = 0;
+    bool empty() const {
+      return (acquires | acquiredBytes | requests | rounds | fetchedBytes | acquireBatches | acquireRounds) == 0;
+    }
   };
 
   Snapshot snapshot() const {
     return {acquires.load(std::memory_order_relaxed), acquiredBytes.load(std::memory_order_relaxed),
             requests.load(std::memory_order_relaxed), rounds.load(std::memory_order_relaxed),
-            fetchedBytes.load(std::memory_order_relaxed)};
+            fetchedBytes.load(std::memory_order_relaxed), acquireBatches.load(std::memory_order_relaxed),
+            acquireRounds.load(std::memory_order_relaxed)};
   }
 };
 
@@ -146,14 +157,18 @@ struct IoContext {
     return hasDeadline() ? deadline - now : Clock::duration::max();
   }
 
-  /// `ranges` held ranges of `bytes` in all, acquired in one call. Today
-  /// every acquire takes one range; an acquire that takes a batch of ranges
-  /// calls this once per batch, which is where a count of batches (the
-  /// rounds a request waits on in sequence) belongs.
+  /// `ranges` held ranges of `bytes` in all, acquired in one call: a single
+  /// acquire, or a batch on one file.
   void countAcquire(uint64_t bytes, uint64_t ranges = 1) const {
     if (!counters) return;
     counters->acquires.fetch_add(ranges, std::memory_order_relaxed);
     counters->acquiredBytes.fetch_add(bytes, std::memory_order_relaxed);
+    counters->acquireBatches.fetch_add(1, std::memory_order_relaxed);
+  }
+  /// One wait on acquires: a round of batches issued together, or an
+  /// acquire made on demand.
+  void countAcquireRound() const {
+    if (counters) counters->acquireRounds.fetch_add(1, std::memory_order_relaxed);
   }
   /// One wave of `requests` concurrent store requests that returned `bytes`.
   void countFetch(uint64_t bytes, uint64_t requests = 1, uint64_t rounds = 1) const {
@@ -181,6 +196,11 @@ struct IoContext {
 /// if there is one.
 inline void countAcquire(uint64_t bytes, uint64_t ranges = 1) {
   if (const IoContext* io = IoContext::current()) io->countAcquire(bytes, ranges);
+}
+
+/// Counts a wait on acquires (IoContext::countAcquireRound) likewise.
+inline void countAcquireRound() {
+  if (const IoContext* io = IoContext::current()) io->countAcquireRound();
 }
 
 /// The request was cancelled (IoContext::stop) before it finished.

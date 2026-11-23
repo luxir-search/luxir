@@ -16,7 +16,7 @@
 #include "luxir/util/SharedLazyCell.h"
 
 namespace luxir {
-class AcquireJoin;
+class AcquireBatches;
 class OwnershipShape;
 namespace api { struct SegmentInfo; }
 
@@ -61,6 +61,7 @@ private:
   mutable SharedLazyCell<VersionRuns> versions;
   // Set when the open has read what it needs; later first holds are counted.
   bool opened = false;
+  bool everyHoldFree = true;  // every file hands out free views
   std::atomic<bool> readBeyondCatalog{false};
   std::atomic<uint64_t> bytesBeyondCatalog{0};
 
@@ -74,7 +75,7 @@ private:
   bool openBaseFile(Directory& dir, std::string_view segment, uint32_t number, uint64_t expected,
                     bool missingFileOK, bool expectSynced, bool checkHeader);
   bool beginOpen(Directory& dir, std::string_view segment, const Source& source, bool missingFileOK,
-                 bool expectSynced, AcquireJoin& join);
+                 bool expectSynced, AcquireBatches& join);
   bool finishOpen(Directory& dir, std::string_view segment, const Source& source, bool missingFileOK,
                   bool expectSynced);
   bool initializeFromFiles(Directory& dir, bool missingFileOK, bool expectSynced);
@@ -156,6 +157,15 @@ public:
     return total;
   }
 
+  // Whether file `fnum` hands out free views (RAM, mmap): an acquire there
+  // costs nothing, so its parts are read whole and never declared ahead.
+  bool holdsFree(uint32_t fnum) const noexcept {
+    assert(fnum < files.size() && files[fnum].file);
+    return files[fnum].holdsFree;
+  }
+  // Whether every file of the segment does.
+  bool holdsFree() const noexcept { return everyHoldFree; }
+
   InputFile* getFile(uint32_t fnum) {
     assert(fnum < files.size());
     assert(files[fnum].file != nullptr);
@@ -183,7 +193,16 @@ public:
   // Starts those batches on `join` without waiting, so batches of several
   // segments go out together. Once join.wait() returns, slice() of each part
   // returns its held bytes without an acquire.
-  void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join);
+  void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireBatches& join);
+  // As acquireSlices(), with a read class per part: still one batch per file.
+  struct Part {
+    field_parts::Slice slice;
+    ReadClass readClass = ReadClass::DATA;
+  };
+  void acquireParts(std::span<const Part> parts, AcquireBatches& join);
+  // Whether slice() of `part` returns without an acquire: its file hands out
+  // free views, or the segment holds the part.
+  bool held(field_parts::Slice part);
 
 };
 

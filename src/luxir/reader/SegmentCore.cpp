@@ -43,11 +43,18 @@ SegmentCore::SegmentCore(uint64_t segId, uint64_t creatorEpoch)
 
 SegmentCore::~SegmentCore() = default;
 
-void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join) {
+void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireBatches& join) {
+  std::vector<Part> classed;
+  classed.reserve(parts.size());
+  for (auto part : parts) classed.push_back({part, readClass});
+  acquireParts(classed, join);
+}
+
+void SegmentCore::acquireParts(std::span<const Part> parts, AcquireBatches& join) {
   using Key = std::pair<uint64_t, uint64_t>;
-  std::map<uint32_t, std::vector<Key>> batches;
+  std::map<uint32_t, std::vector<std::pair<Key, ReadClass>>> batches;
   std::unique_lock lock(holdsMutex, std::defer_lock);
-  for (auto part : parts) {
+  for (auto [part, readClass] : parts) {
     auto number = part.location.filenum();
     assert(number < files.size() && files[number].file);
     if (files[number].holdsFree) continue;  // slice() hands out a free view without a request
@@ -55,25 +62,29 @@ void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadC
     Key key(part.location.raw(), part.bytes);
     if (holds.contains(key)) continue;
     auto& batch = batches[number];
-    if (std::ranges::find(batch, key) == batch.end()) batch.push_back(key);
+    if (std::ranges::find(batch, key, &std::pair<Key, ReadClass>::first) == batch.end()) batch.emplace_back(key, readClass);
   }
   if (lock.owns_lock()) lock.unlock();
   for (auto& [number, batch] : batches) {
     std::vector<ByteRange> ranges;
+    std::vector<Key> keys;
     ranges.reserve(batch.size());
+    keys.reserve(batch.size());
     uint64_t total = 0;
-    for (auto [raw, bytes] : batch) {
-      ranges.push_back({seg_location::fromRaw(raw).offset(), bytes, readClass});
-      total += bytes;
+    for (auto [key, readClass] : batch) {
+      ranges.push_back({seg_location::fromRaw(key.first).offset(), key.second, readClass});
+      keys.push_back(key);
+      total += key.second;
     }
+    // One batch: the request counts its ranges and one round trip.
     countAcquire(total, ranges.size());
-    join.acquire(*files[number].file, ranges, [this, batch = std::move(batch)](std::vector<HeldRange>&& acquired) {
-      if (acquired.size() != batch.size()) throw FileIOException("batched acquire returned the wrong number of holds");
+    join.acquire(*files[number].file, ranges, [this, keys = std::move(keys)](std::vector<HeldRange>&& acquired) {
+      if (acquired.size() != keys.size()) throw FileIOException("batched acquire returned the wrong number of holds");
       uint64_t added = 0;
       {
         std::lock_guard lock(holdsMutex);
-        for (size_t i = 0; i < batch.size(); ++i) {
-          if (holds.try_emplace(batch[i], std::move(acquired[i])).second) added += batch[i].second;
+        for (size_t i = 0; i < keys.size(); ++i) {
+          if (holds.try_emplace(keys[i], std::move(acquired[i])).second) added += keys[i].second;
         }
       }
       if (added) countFirstHold(added);
@@ -81,10 +92,19 @@ void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadC
   }
 }
 
+bool SegmentCore::held(field_parts::Slice part) {
+  auto number = part.location.filenum();
+  assert(number < files.size() && files[number].file);
+  if (files[number].holdsFree) return true;
+  std::lock_guard lock(holdsMutex);
+  return holds.contains({part.location.raw(), part.bytes});
+}
+
 std::vector<std::span<const char>> SegmentCore::slices(std::span<const field_parts::Slice> parts, ReadClass readClass) {
   {
     AcquireJoin join;
     acquireSlices(parts, readClass, join);
+    countAcquireRound();
     join.wait();
   }
   std::vector<std::span<const char>> result;
@@ -105,6 +125,7 @@ std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice pa
   // threads missing the same part both acquire it; the first to store wins.
   auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
   countAcquire(part.bytes);
+  countAcquireRound();
   std::span<const char> bytes;
   bool inserted;
   {
@@ -244,7 +265,7 @@ bool SegmentCore::openBaseFile(Directory& dir, std::string_view segment, uint32_
 }
 
 bool SegmentCore::beginOpen(Directory& dir, std::string_view segment, const Source& source, bool missingFileOK,
-                            bool expectSynced, AcquireJoin& join) {
+                            bool expectSynced, AcquireBatches& join) {
   constexpr uint32_t primary = Postings::PRIMARY_FILE;
   if (source.files.empty() || !source.files[primary]) corruptSegment(segment, "missing primary file in manifest");
   if (!openBaseFile(dir, segment, primary, source.files[primary], missingFileOK, expectSynced, false)) return false;
@@ -309,6 +330,7 @@ bool SegmentCore::initializeFromFiles(Directory& dir, bool missingFileOK, bool e
 // Reads nothing beyond the catalog: version runs and ownership shapes are
 // built on first use.
 void SegmentCore::initializeSpaces() {
+  everyHoldFree = std::ranges::all_of(files, [](const BaseFile& base) { return !base.file || base.holdsFree; });
   root.initialize(spaces()[0].maxDoc, spaces()[0].fields.size());
   children.reserve(spaces().size() - 1);
   for (size_t i = 1; i < spaces().size(); ++i) {
