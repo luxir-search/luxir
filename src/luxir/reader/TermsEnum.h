@@ -128,6 +128,11 @@ class TermsEnum {
   bool runDocsHeld = false;
   bool runPositionsHeld = false;
   bool runDocsWhole = true;  // see termDocsPart()
+  // Blocks and term docs held one at a time so far. Past POINT_READS the
+  // enum is looking up many terms, and holds the dictionary and each run's
+  // docs whole instead, so its acquires stay bounded.
+  int32_t pointReads = 0;
+  bool wholeReads = false;
 
 public:
   struct BlockEstimate {
@@ -190,6 +195,17 @@ public:
     return fieldInfo.termNavigation();
   }
 
+  /// Point reads (blocks, term docs) an enum holds one at a time before it
+  /// holds the dictionary and run docs whole.
+  static constexpr int32_t POINT_READS = 8;
+
+  /// From now on, hold the dictionary and each run's docs whole, as an enum
+  /// does past POINT_READS: for a reader ahead of many lookups.
+  void readWhole() noexcept {
+    wholeReads = true;
+    if (run) runDocsWhole = true;
+  }
+
   /// Whether the enum holds `part` whole rather than in pieces: a file with
   /// free holds costs nothing per byte, and a small part costs less whole
   /// than a round of its own (field_parts::WHOLE_READ_BYTES). Holds are
@@ -204,7 +220,7 @@ public:
   /// routing data, which the enum already holds.
   field_parts::Slice seekPart(std::string_view target) {
     if (!termData) return {};
-    if (dictionary) return termData->dictionaryBlocks();
+    if (dictionary || wholeReads) return termData->dictionaryBlocks();
     TrieReader trie(trieBase, (uint64_t)termData->trieRootOffset, numTermBlocks);
     int32_t blockOrd = trie.floorBlock(target);
     if (blockOrd < run->firstBlockOrd || blockOrd >= runEndBlockOrd) reselectRunForBlock(blockOrd);
@@ -482,6 +498,7 @@ public:
         state.pulsedPos = (int32_t) pulsedValues[valueIndex + 1];
       }
     } else {
+      if (!runDocsWhole && pointRead(run->docs)) runDocsWhole = true;
       if (runDocsWhole) {
         if (!runDocsHeld) {
           runDocs = streamThrough(run->docs);
@@ -750,6 +767,18 @@ protected:
     dictionary = segmentCore.slice(termData->dictionaryBlocks()).data();
   }
 
+  // Before holding a piece of `whole`: true when the enum should hold
+  // `whole` instead, because the enum is past POINT_READS or `whole` is held
+  // already (a reader ahead of the enum acquired it).
+  bool pointRead(field_parts::Slice whole) {
+    if (wholeReads) return true;
+    if (++pointReads > POINT_READS) {
+      readWhole();
+      return true;
+    }
+    return segmentCore.held(whole);
+  }
+
   InputStream wholeDictionary() const {
     if (!dictionary) holdDictionary();
     return {dictionary, dictionary + termData->dictionaryBytes};
@@ -797,7 +826,7 @@ protected:
     runTermsEnd = (int64_t)(hasNext ? (run + 1)->dictionaryStart : termData->dictionaryBytes);
     runDocsHeld = false;
     runPositionsHeld = false;
-    runDocsWhole = !run->docs || readsWhole(segmentCore, run->docs);
+    runDocsWhole = wholeReads || !run->docs || readsWhole(segmentCore, run->docs);
   }
 
   PackedTerm firstTermForNextBlock(int32_t nextBlock) const {
@@ -818,6 +847,7 @@ protected:
       reselectRunForBlock(termBlockIndex);
     }
     auto [start, end] = blockExtent(termBlockIndex);
+    if (!dictionary && pointRead(termData->dictionaryBlocks())) [[unlikely]] holdDictionary();
     if (dictionary) [[likely]] {
       termsIS = InputStream(dictionary + start, dictionary + end);
     } else {

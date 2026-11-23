@@ -8,6 +8,7 @@
 #include "CountingStorage.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/reader/OwnershipShape.h"
+#include "luxir/reader/TermsEnum.h"
 #include "luxir/store/AcquireJoin.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/store/ReadOnlyDirectory.h"
@@ -232,6 +233,58 @@ TEST_F(StorageExampleTest, manifestOpenAcquiresCatalogsInOneRound) {
   auto after = counters->fileStats(name);
   EXPECT_EQ(before.batches + 1, after.batches);
   EXPECT_EQ(before.acquires + 2, after.acquires);
+}
+
+// A term lookup in a large dictionary holds its routing data, the block it
+// lands in and the found term's docs, not the dictionary or the run's docs.
+// An enum past POINT_READS point reads holds them whole.
+TEST_F(StorageExampleTest, termLookupHoldsItsBlockAndPostings) {
+  LuxirConfig config;
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  auto writer = h.getIndexWriter();
+  std::vector<Doc> docs;
+  // Each term in two docs, so its postings are not inline.
+  auto tag = [](int i) { return std::format("tag{:05}x{:04x}", i, (i * 7919) % 65536); };
+  for (int i = 0; i < 40000; ++i) docs.push_back(flatdoc("id", std::to_string(i), "tag_s", tag(i % 20000)));
+  ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto snapshot = *writer->snapshots.snapshot();
+  snapshot.openCores.clear();
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
+  auto reader = std::make_shared<IndexReader>(dir, snapshot);
+  auto& postings = reader->segments().front().postingsReader();
+  const auto* record = postings.fieldInfo("tag_s");
+  ASSERT_TRUE(record && record->terms());
+  const auto& terms = *record->terms();
+  ASSERT_GT(terms.dictionaryBytes, field_parts::WHOLE_READ_BYTES);
+  ASSERT_GT(terms.runs.front().docs.bytes, field_parts::WHOLE_READ_BYTES);
+  auto& core = postings.core();
+  MemPool pool;
+  TermsEnum lookup(pool, postings, *record);
+  ASSERT_TRUE(lookup.seek(tag(1234)));
+  auto state = lookup.postingsState();
+  EXPECT_EQ(2, state.docFreq);
+  EXPECT_TRUE(core.held(record->termNavigation()));
+  EXPECT_FALSE(core.held(terms.dictionaryBlocks()));
+  EXPECT_FALSE(core.held(terms.runs.front().docs));
+  auto name = Postings::getIndexFileName(core.segmentName(), terms.location.filenum());
+  auto stats = counters->fileStats(name);
+  uint64_t blockBytes = 0;
+  for (auto [offset, length] : stats.parts) {
+    if (offset >= terms.location.offset() && offset + length <= terms.dictionaryBlocks().end().offset()) {
+      blockBytes += length;
+    }
+  }
+  EXPECT_GT(blockBytes, 0u);
+  EXPECT_LT(blockBytes, terms.dictionaryBytes / 10);
+
+  for (int i = 0; i < TermsEnum::POINT_READS; ++i) {
+    ASSERT_TRUE(lookup.seek(tag(1000 * i)));
+    lookup.postingsState();
+  }
+  EXPECT_TRUE(core.held(terms.dictionaryBlocks()));
+  EXPECT_TRUE(core.held(terms.runs.front().docs));
 }
 
 // A cold scored term query declares what it reads in every segment and waits

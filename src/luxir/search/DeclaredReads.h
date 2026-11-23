@@ -58,6 +58,7 @@ public:
     Mode mode;
     std::string term;
     TermsEnum* terms = nullptr;  // built once the routing data is held
+    bool many = false;  // one of many lookups on the field: holds it whole, as TermsEnum does
     bool done = false;
   };
 

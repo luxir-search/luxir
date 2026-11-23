@@ -3,6 +3,7 @@
 
 #include "DeclaredReads.h"
 
+#include <map>
 #include <set>
 #include <tuple>
 
@@ -183,6 +184,13 @@ DeclaredReads::DeclaredReads(IndexReader& reader, const Schema& schema, const ap
       lookups.push_back({&segments[i], record, mode, term});
     }
   }
+  // A lookup reads a block and a term's docs: an enum that seeks more terms
+  // than POINT_READS allows holds the dictionary and run docs whole.
+  std::map<const DecodedFieldRecord*, int32_t> terms;
+  for (const auto& lookup : lookups) {
+    if (lookup.mode == Mode::TERM) ++terms[lookup.record];
+  }
+  for (auto& lookup : lookups) lookup.many = 2 * terms[lookup.record] > TermsEnum::POINT_READS;
 }
 
 DeclaredReads::~DeclaredReads() = default;
@@ -200,7 +208,7 @@ void DeclaredReads::advance(Lookup& lookup, Round& round) {
     // Round 1: the routing data, and the dictionary when it is read whole.
     auto dictionary = lookup.record->terms()->dictionaryBlocks();
     bool whole = lookup.mode == Mode::SCAN
-        || (lookup.mode == Mode::TERM && TermsEnum::readsWhole(segment.segmentCore(), dictionary));
+        || (lookup.mode == Mode::TERM && (lookup.many || TermsEnum::readsWhole(segment.segmentCore(), dictionary)));
     auto routing = round.add(segment, TermsEnum::navigationPart(*lookup.record), ReadClass::METADATA);
     auto blocks = whole ? round.add(segment, dictionary, ReadClass::DATA) : Round::Added::HELD;
     if (routing == Round::Added::DROPPED || blocks == Round::Added::DROPPED || lookup.mode != Mode::TERM) {
@@ -209,6 +217,7 @@ void DeclaredReads::advance(Lookup& lookup, Round& round) {
     }
     if (routing == Round::Added::DECLARED || blocks == Round::Added::DECLARED) return;
     lookup.terms = pool.make<TermsEnum>(pool, segment.postingsReader(), *lookup.record);
+    if (lookup.many) lookup.terms->readWhole();
   }
   // Round 2: the block the term lands in.
   switch (round.add(segment, lookup.terms->seekPart(lookup.term), ReadClass::DATA)) {

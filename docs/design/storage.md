@@ -209,7 +209,9 @@ than one acquire per part per segment:
   dictionary or a run's docs of at most 64 KiB (`WHOLE_READ_BYTES`) is
   acquired whole instead, and so is anything on a file with free holds. A scan
   (enumerating terms, or a forward seek past its block) holds the dictionary
-  whole.
+  whole, and so does an enum past eight point reads (`POINT_READS`: blocks
+  and term docs), which then holds each run's docs whole too, so looking up
+  many terms (an id batch, a term set) stays a bounded number of acquires.
 - Before parse, a search walks its request for the term lookups parsing will
   make, in every segment, and acquires their parts in up to three rounds:
   routing data and live docs, blocks, postings. A part already held, or
