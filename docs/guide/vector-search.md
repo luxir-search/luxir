@@ -168,10 +168,11 @@ it. `encoding` chooses how each vector is stored:
 | `encoding` | Bytes per vector | Stored value |
 |---|---|---|
 | `f32` (default) | `4 * dims` | the float32 values |
-| `f16` | `2 * dims` | IEEE half precision per element |
-| `int8` | `8 + dims` | per-vector scalar quantization: a float offset and scale, plus one byte per dimension |
+| `f16` | `2 * dims` | IEEE half precision per element: 11 significant bits, magnitudes up to 65504 |
+| `bf16` | `2 * dims` | bfloat16 per element: 8 significant bits, the float32 range |
+| `sq8` | `8 + dims` | per-vector scalar quantization: a float offset and scale, plus one byte per dimension |
 
-At 768 dimensions that is 3072, 1536, and 776 bytes per vector.
+At 768 dimensions that is 3072, 1536, 1536, and 776 bytes per vector.
 
 ```json
 {
@@ -180,25 +181,25 @@ At 768 dimensions that is 3072, 1536, and 776 bytes per vector.
       "type": "vector",
       "dims": 768,
       "metric": "cosine",
-      "encoding": "int8"
+      "encoding": "sq8"
     }
   }
 }
 ```
 
-`int8` quantizes each vector on its own, between its minimum and maximum
+`sq8` quantizes each vector on its own, between its minimum and maximum
 element, so a stored vector never depends on other vectors, segments, or
 statistics. Merges copy stored vectors unchanged. Cosine vectors are
 normalized before they are quantized.
 
 Encoded fields reject vectors with non-finite elements (NaN or infinity), and
 `f16` also rejects elements whose magnitude exceeds 65504. A constant vector
-is valid under `int8`.
+is valid under `sq8`.
 
 Search scores the query, which stays float32, against the stored encoding:
 `exact: true`, the scan of segments without an overlay, and the rescore of
 approximate candidates are all exact over the stored vectors, not over the
-vectors you submitted. Cosine over `f16` and `int8` divides by the norm of the
+vectors you submitted. Cosine over `f16`, `bf16` and `sq8` divides by the norm of the
 stored vector, so scores remain cosines. Vectors read back in `fields` are the
 stored values decoded to float32.
 
@@ -206,7 +207,7 @@ stored values decoded to float32.
 Existing segments keep the encoding they were written with, and a merge of
 segments with different encodings rewrites them in the field's current
 encoding, so a field converges to its declared encoding over time. Moving to a
-narrower encoding is lossy. Under f16 or int8 storage, `exact` and
+narrower encoding is lossy. Under f16, bf16 or sq8 storage, `exact` and
 `similarity` cut-offs compare scores computed over the quantized values.
 
 To keep more than one precision of the same input, such as a compact field
@@ -1010,7 +1011,7 @@ vectors and does not consult overlays. Everything else about
 the query is identical (filters, multi-valued collapse, score scale), which
 makes it the built-in ground truth for measuring your ANN settings. Run the
 same query twice, once with `exact: true`, and compare the two lists. With
-an `f16` or `int8` encoding this measures the approximate index against the
+an `f16`, `bf16` or `sq8` encoding this measures the approximate index against the
 encoding; to measure the encoding itself, compare against the same vectors
 in an `f32` field.
 

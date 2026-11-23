@@ -878,7 +878,7 @@ void BM_VectorIvfIncrementalBuild(benchmark::State& state) {
 // Column encoding benchmark.
 //
 // Exact search (KnnQuery.exact: a full scan of the stored column) over one
-// field stored as f32, f16, or int8, on a clustered corpus at a typical
+// field stored as f32, f16, bf16, or sq8, on a clustered corpus at a typical
 // embedding width.  Reports the stored column bytes per vector, recall@k of
 // exact search over the encoding against brute-force float32 ground truth
 // (computed here from the generated vectors in double precision), and the
@@ -1537,9 +1537,9 @@ LUXIR_BENCHMARK(BM_VectorKnnRecallParallel)->Apply(forceIvfBenchmark)->ArgNames(
     ->Args({0, 0, 10, RABITQ1})->Args({16, 0, 10, RABITQ1})->Args({1 << 20, 0, 10, RABITQ1})
     ->Args({0, 0, 1000, RABITQ1});
 
-// encoding: 0 = f32, 1 = f16, 2 = int8; metric: 1 = l2, 2 = ip, 3 = cosine.
+// encoding: 0 = f32, 1 = f16, 2 = bf16, 3 = sq8; metric: 1 = l2, 2 = ip, 3 = cosine.
 LUXIR_BENCHMARK(BM_VectorEncodingExact)->ArgNames({"encoding", "metric"})
-    ->ArgsProduct({{0, 1, 2}, {1, 2, 3}});
+    ->ArgsProduct({{0, 1, 2, 3}, {1, 2, 3}});
 
 LUXIR_BENCHMARK(BM_VectorKnnRecallThreads)->Apply(forceIvfBenchmark)->ArgNames({"nprobe", "cand", "k", "codec"})
     ->Args({0, 0, 10, RABITQ1})->ThreadRange(1, 32);

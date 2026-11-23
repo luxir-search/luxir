@@ -1305,16 +1305,16 @@ TEST_F(HttpApiTest, vectorDocumentsRoundTripOverJson) {
   EXPECT_NE(partial.body().find("embedding"), std::string::npos) << partial.body();
 }
 
-// An int8 field scores against its quantized column and returns the stored
+// An sq8 field scores against its quantized column and returns the stored
 // values decoded; the schema echoes the setting.  These vectors quantize
 // exactly: a range of 255 is a scale of 1, and a constant vector is its offset.
 TEST_F(HttpApiTest, encodedVectorFieldOverJson) {
   auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
-    "fields": {"embedding": {"type":"vector", "metric":"l2", "encoding":"int8"}}
+    "fields": {"embedding": {"type":"vector", "metric":"l2", "encoding":"sq8"}}
   })");
   ASSERT_EQ(200, schema.result_int()) << schema.body();
   auto get = httpRequest(port(), http::verb::get, "/collections/main/_schema", "");
-  EXPECT_NE(get.body().find(R"("encoding": "int8")"), std::string::npos) << get.body();
+  EXPECT_NE(get.body().find(R"("encoding": "sq8")"), std::string::npos) << get.body();
 
   auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"id":"a","embedding":[1,256,52]},{"id":"b","embedding":[300,300,300]}],"commit":{}})");

@@ -2525,9 +2525,10 @@ enum VectorMetric {
 enum VectorEncoding {
   F32 = 0;   // float32 per element (4 bytes per dimension)
   F16 = 1;   // IEEE half precision per element (2 bytes per dimension)
+  BF16 = 2;  // bfloat16 per element (2 bytes per dimension)
   // Per-vector scalar quantization: a float offset and scale per vector plus
   // one uint8 code per dimension (8 + dims bytes).
-  INT8 = 2;
+  SQ8 = 3;
 }
 
 // Approximate nearest-neighbor index settings for a VECTOR field: the codec
@@ -2696,8 +2697,8 @@ message FieldDef {
   optional int32 truncate_dims = 19;
 
   // VECTOR only. Column storage encoding. Unset inherits, falling back to
-  // F32. F16 and INT8 reject non-finite elements; F16 also rejects
-  // magnitudes above 65504. Applies to newly written segments.
+  // F32. F16 rejects elements with a magnitude above 65504. Applies to newly
+  // written segments; merges rewrite older segments in it.
   optional VectorEncoding encoding = 20;
 
   // VECTOR only: ANN overlay settings. Absent inherits the parent's whole

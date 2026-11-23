@@ -307,7 +307,7 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   if (def.encoding.has_value()) {
     if (!vcodec::valid((int32_t)*def.encoding)) {
       throw SchemaError("unknown encoding value " + std::to_string((int)*def.encoding) +
-                        " (field: " + std::string(name) + "); valid: f32, f16, int8");
+                        " (field: " + std::string(name) + "); valid: f32, f16, bf16, sq8");
     }
     r.hasVectorEncoding = true;
     r.vectorEncoding = (VectorEncoding)*def.encoding;
@@ -460,7 +460,8 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   if (r.type == FieldClass::NESTED && (def.index || def.column || def.multi || def.stored
       || def.stored_resource || def.variants || def.defaults || def.analyzer || def.normalizer
       || def.long_terms || def.unit || def.scale || def.dims || def.truncate_dims || def.metric
-      || def.normalized || def.normalize_on_write || def.ann || def.ignore_malformed || def.ignore_z_value)) {
+      || def.normalized || def.normalize_on_write || def.encoding || def.ann || def.ignore_malformed
+      || def.ignore_z_value)) {
     throw SchemaError("Nested path cannot have value settings: " + name);
   }
   if (def.reverse_map && r.type != FieldClass::NESTED) {
@@ -566,7 +567,7 @@ struct FieldCompiler {
           || logical.hasStoredResource || logical.variants || logical.defaults
           || r.analyzer || r.normalizer || r.longTerms || r.scale || r.dateUnit
           || r.hasVectorDims || r.vectorTruncateDims || r.hasVectorMetric
-          || r.hasVectorNormalized || r.hasVectorNormalizeOnWrite || r.ann
+          || r.hasVectorNormalized || r.hasVectorNormalizeOnWrite || r.hasVectorEncoding || r.ann
           || r.geoIgnoreMalformed || r.geoIgnoreZValue || derived) {
         throw SchemaError("Nested path cannot have value settings: " + std::string(name));
       }

@@ -28,7 +28,7 @@ namespace luxir {
 /// COSINE -> dot / |x|.  The query is already unit length for COSINE; an F32
 /// column of unit vectors skips the division (normalizeColumn false).
 ///
-/// INT8 rows (x[i] = offset + scale * code[i]) are scored without
+/// SQ8 rows (x[i] = offset + scale * code[i]) are scored without
 /// reconstructing x:
 ///   q.x  = offset * sum(q) + scale * sum(q[i] * code[i])
 ///   |x|^2 = dims * offset^2 + 2 * offset * scale * sum(code) + scale^2 * sum(code^2)
@@ -54,7 +54,7 @@ public:
       encoding(encoding) {
     assert(query != nullptr);
     if (encoding != VectorEncoding::F32) scratch.resize((size_t)dims);
-    if (encoding == VectorEncoding::INT8) {
+    if (encoding == VectorEncoding::SQ8) {
       for (int32_t i = 0; i < dims; i++) {
         querySum += (double)query[i];
         queryNormSq += (double)query[i] * (double)query[i];
@@ -66,8 +66,9 @@ public:
   /// fallbackScore is returned for a metric without a column score.
   float score(std::string_view row, float fallbackScore) const {
     switch (encoding) {
-      case VectorEncoding::F16: return scoreF16(row.data(), fallbackScore);
-      case VectorEncoding::INT8: return scoreInt8(row.data(), fallbackScore);
+      case VectorEncoding::F16:
+      case VectorEncoding::BF16: return score16(row.data(), fallbackScore);
+      case VectorEncoding::SQ8: return scoreSq8(row.data(), fallbackScore);
       case VectorEncoding::F32:
       default: return scoreF32((const float*)row.data(), fallbackScore);
     }
@@ -93,7 +94,7 @@ private:
         return finiteScore((float)dot);
       case (int32_t)luxir::api::VectorMetric::COSINE:
         // A quantized unit vector is not exactly unit length, and its norm
-        // falls out of the same pass, so f16 / int8 cosine always divides by
+        // falls out of the same pass, so f16 / bf16 / sq8 cosine always divides by
         // the stored vector's norm: the exact cosine over the stored encoding.
         if (!std::isfinite(normSq) || normSq <= MIN_COSINE_NORM_SQ) return 0.0f;
         return finiteScore((float)(dot / std::sqrt(normSq)));
@@ -122,15 +123,11 @@ private:
     }
   }
 
-  // F16: widen into scratch (a plain conversion loop the compiler
+  // F16 / BF16: widen into scratch (a plain conversion loop the compiler
   // vectorizes), then the float32 kernels.
-  float scoreF16(const char* row, float fallbackScore) const {
+  float score16(const char* row, float fallbackScore) const {
     float* x = scratch.data();
-    for (int32_t i = 0; i < dims; i++) {
-      std::float16_t h;
-      std::memcpy(&h, row + 2 * i, 2);
-      x[i] = (float)h;
-    }
+    vcodec::decode(encoding, row, dims, x);
     // One kernel pass per metric.
     if (metric == (int32_t)luxir::api::VectorMetric::L2) {
       return fromParts(0, (double)faiss::fvec_L2sqr(query, x, (size_t)dims), 0, fallbackScore);
@@ -140,12 +137,12 @@ private:
     return fromParts(dot, 0, (double)faiss::fvec_norm_L2sqr(x, (size_t)dims), fallbackScore);
   }
 
-  // INT8: the codes (not the decoded values) are widened to float for
+  // SQ8: the codes (not the decoded values) are widened to float for
   // sum(q[i] * code[i]); the code sums stay integer.  Offset and scale are
   // applied once per vector by the decomposition above.
-  float scoreInt8(const char* row, float fallbackScore) const {
-    vcodec::Int8Header h = vcodec::readInt8Header(row);
-    auto* codes = (const uint8_t*)(row + vcodec::INT8_HEADER_BYTES);
+  float scoreSq8(const char* row, float fallbackScore) const {
+    vcodec::Sq8Header h = vcodec::readSq8Header(row);
+    auto* codes = (const uint8_t*)(row + vcodec::SQ8_HEADER_BYTES);
     float* c = scratch.data();
     if (metric == (int32_t)luxir::api::VectorMetric::L2) {
       // Decode and take the difference directly: the |q|^2 - 2 q.x + |x|^2

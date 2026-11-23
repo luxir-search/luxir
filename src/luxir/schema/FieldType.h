@@ -655,7 +655,7 @@ public:
   // COSINE fields normalize vectors before column storage by default.  Ignored
   // for non-COSINE metrics.
   bool normalizeOnWrite_;
-  // Column storage encoding (f32 / f16 / int8).  Recorded per segment, so a
+  // Column storage encoding (f32 / f16 / bf16 / sq8).  Recorded per segment, so a
   // later schema change never reinterprets existing segments.
   VectorEncoding encoding_;
   // ANN overlay codec and parameters (schema "ann").

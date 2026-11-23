@@ -32,7 +32,7 @@ constexpr int32_t DIMS = 8;
 using Vec = std::vector<float>;
 
 // Doc i lies at a monotonically worse L2 distance, inner product, and cosine
-// from QUERY as i grows, with gaps far above int8 quantization error.
+// from QUERY as i grows, with gaps far above sq8 quantization error.
 const Vec QUERY = {0.9f, -0.4f, 0.3f, 0.8f, -0.7f, 0.2f, 0.5f, -0.1f};
 const Vec SIDE = {0.1f, 0.6f, 0.4f, -0.2f, 0.1f, 0.7f, -0.3f, 0.2f};
 
@@ -140,58 +140,59 @@ TEST_F(VectorEncodingTest, codecRoundTrip) {
   vcodec::decode(VectorEncoding::F16, buf.data(), DIMS, out.data());
   EXPECT_EQ(v, out);  // all exactly representable in binary16
 
-  vcodec::encode(VectorEncoding::INT8, v.data(), DIMS, buf.data());
-  vcodec::decode(VectorEncoding::INT8, buf.data(), DIMS, out.data());
+  vcodec::encode(VectorEncoding::SQ8, v.data(), DIMS, buf.data());
+  vcodec::decode(VectorEncoding::SQ8, buf.data(), DIMS, out.data());
   float halfStep = (3.0f - -1.5f) / 255.0f / 2.0f;
   for (size_t i = 0; i < v.size(); i++) EXPECT_NEAR(v[i], out[i], halfStep * 1.001f);
   EXPECT_EQ(-1.5f, out[0]);  // the minimum is the offset itself
 
   Vec constant(DIMS, 0.75f);
-  vcodec::encode(VectorEncoding::INT8, constant.data(), DIMS, buf.data());
-  EXPECT_EQ(0.0f, vcodec::readInt8Header(buf.data()).scale);
-  vcodec::decode(VectorEncoding::INT8, buf.data(), DIMS, out.data());
+  vcodec::encode(VectorEncoding::SQ8, constant.data(), DIMS, buf.data());
+  EXPECT_EQ(0.0f, vcodec::readSq8Header(buf.data()).scale);
+  vcodec::decode(VectorEncoding::SQ8, buf.data(), DIMS, out.data());
   EXPECT_EQ(constant, out);
 
-  EXPECT_EQ(16, vcodec::bytesPerVector(VectorEncoding::INT8, DIMS));
-  EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::INT8, 16));
+  EXPECT_EQ(16, vcodec::bytesPerVector(VectorEncoding::SQ8, DIMS));
+  EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::SQ8, 16));
   EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::F16, 16));
 }
 
-// The int8 decomposition (no decode buffer) agrees with scoring the decoded
+// The sq8 decomposition (no decode buffer) agrees with scoring the decoded
 // floats, for every metric.
-TEST_F(VectorEncodingTest, int8ScorerMatchesDecodedScore) {
+TEST_F(VectorEncodingTest, sq8ScorerMatchesDecodedScore) {
   Vec v = docVec(3);
-  std::vector<char> row((size_t)vcodec::bytesPerVector(VectorEncoding::INT8, DIMS));
-  vcodec::encode(VectorEncoding::INT8, v.data(), DIMS, row.data());
+  std::vector<char> row((size_t)vcodec::bytesPerVector(VectorEncoding::SQ8, DIMS));
+  vcodec::encode(VectorEncoding::SQ8, v.data(), DIMS, row.data());
   Vec decoded(DIMS);
-  vcodec::decode(VectorEncoding::INT8, row.data(), DIMS, decoded.data());
+  vcodec::decode(VectorEncoding::SQ8, row.data(), DIMS, decoded.data());
   std::string_view rowView(row.data(), row.size());
   std::string_view decodedView((const char*)decoded.data(), decoded.size() * sizeof(float));
   for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
-    VectorScorer q(QUERY.data(), DIMS, (int32_t)metric, true, VectorEncoding::INT8);
+    VectorScorer q(QUERY.data(), DIMS, (int32_t)metric, true, VectorEncoding::SQ8);
     VectorScorer f(QUERY.data(), DIMS, (int32_t)metric, true, VectorEncoding::F32);
     EXPECT_NEAR(f.score(decodedView, 0), q.score(rowView, 0), 1e-5) << (int)metric;
   }
 }
 
-// Large offsets must not degrade int8 L2 scoring (no decomposition cancellation).
-TEST_F(VectorEncodingTest, int8L2LargeOffset) {
+// Large offsets must not degrade sq8 L2 scoring (no decomposition cancellation).
+TEST_F(VectorEncodingTest, sq8L2LargeOffset) {
   Vec v = docVec(3);
   for (auto& x : v) x += 1000.0f;
-  std::vector<char> row((size_t)vcodec::bytesPerVector(VectorEncoding::INT8, DIMS));
-  vcodec::encode(VectorEncoding::INT8, v.data(), DIMS, row.data());
+  std::vector<char> row((size_t)vcodec::bytesPerVector(VectorEncoding::SQ8, DIMS));
+  vcodec::encode(VectorEncoding::SQ8, v.data(), DIMS, row.data());
   Vec decoded(DIMS), query = QUERY;
   for (auto& x : query) x += 1000.0f;
-  vcodec::decode(VectorEncoding::INT8, row.data(), DIMS, decoded.data());
+  vcodec::decode(VectorEncoding::SQ8, row.data(), DIMS, decoded.data());
   std::string_view decodedView((const char*)decoded.data(), decoded.size() * sizeof(float));
-  VectorScorer q(query.data(), DIMS, (int32_t)api::VectorMetric::L2, true, VectorEncoding::INT8);
+  VectorScorer q(query.data(), DIMS, (int32_t)api::VectorMetric::L2, true, VectorEncoding::SQ8);
   VectorScorer f(query.data(), DIMS, (int32_t)api::VectorMetric::L2, true, VectorEncoding::F32);
   EXPECT_FLOAT_EQ(f.score(decodedView, 0), q.score(std::string_view(row.data(), row.size()), 0));
 }
 
 // Each encoding is recorded per segment and reads back within its precision.
 TEST_F(VectorEncodingTest, storedRoundTripPerEncoding) {
-  for (auto encoding : {api::VectorEncoding::F32, api::VectorEncoding::F16, api::VectorEncoding::INT8}) {
+  for (auto encoding : {api::VectorEncoding::F32, api::VectorEncoding::F16, api::VectorEncoding::BF16,
+                        api::VectorEncoding::SQ8}) {
     CollectionHelper h("main");
     h.clear();
     installFields(h.collection(), {.encoding = encoding});
@@ -213,11 +214,11 @@ TEST_F(VectorEncodingTest, storedRoundTripPerEncoding) {
   }
 }
 
-// Exact kNN over f16 / int8 ranks like f32 on well-separated data, for every
-// metric.
+// Exact kNN over f16 / bf16 / sq8 ranks like f32 on well-separated data, for
+// every metric.
 TEST_F(VectorEncodingTest, exactKnnMatchesF32Ranking) {
   for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
-    for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::INT8}) {
+    for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::BF16, api::VectorEncoding::SQ8}) {
       CollectionHelper h("main");
       h.clear();
       installFields(h.collection(), {.metric = metric, .encoding = encoding});
@@ -234,7 +235,7 @@ TEST_F(VectorEncodingTest, exactKnnMatchesF32Ranking) {
 // Merging same-encoding segments copies the encoded bytes verbatim.
 TEST_F(VectorEncodingTest, mergeCopiesEncodedBytes) {
   CollectionHelper h("main");
-  installFields(h.collection(), {.encoding = api::VectorEncoding::INT8, .multi = true});
+  installFields(h.collection(), {.encoding = api::VectorEncoding::SQ8, .multi = true});
   for (int k = 0; k < 3; k++) {
     indexDocs(h, k * 10, k * 10 + 10);
     h.commit();
@@ -246,7 +247,7 @@ TEST_F(VectorEncodingTest, mergeCopiesEncodedBytes) {
   ASSERT_EQ(1u, reader(h)->segments().size());
   VectorEncoding encoding;
   EXPECT_EQ(before, rows(h, "enc_v", &encoding));
-  EXPECT_EQ(VectorEncoding::INT8, encoding);
+  EXPECT_EQ(VectorEncoding::SQ8, encoding);
   EXPECT_EQ(idsBefore, knnIds("enc_v", 10));
 }
 
@@ -257,7 +258,7 @@ TEST_F(VectorEncodingTest, mixedEncodingMergeUsesSchemaEncoding) {
   installFields(h.collection(), {.encoding = api::VectorEncoding::F16});
   indexDocs(h, 0, 15);
   h.commit();
-  installFields(h.collection(), {.encoding = api::VectorEncoding::INT8});
+  installFields(h.collection(), {.encoding = api::VectorEncoding::SQ8});
   indexDocs(h, 15, 30);
   h.commit();
   h.getIndexWriter()->mergeSegments();
@@ -265,7 +266,7 @@ TEST_F(VectorEncodingTest, mixedEncodingMergeUsesSchemaEncoding) {
 
   VectorEncoding encoding;
   auto merged = rows(h, "enc_v", &encoding);
-  EXPECT_EQ(VectorEncoding::INT8, encoding);
+  EXPECT_EQ(VectorEncoding::SQ8, encoding);
   EXPECT_EQ(30u, merged.size());
   EXPECT_EQ(knnIds("ref_v", 10), knnIds("enc_v", 10));
 }
@@ -273,7 +274,7 @@ TEST_F(VectorEncodingTest, mixedEncodingMergeUsesSchemaEncoding) {
 // Promoting quantized cosine rows to f32 in a merge restores unit length.
 TEST_F(VectorEncodingTest, promotionToF32RenormalizesCosine) {
   CollectionHelper h("main");
-  installFields(h.collection(), {.metric = api::VectorMetric::COSINE, .encoding = api::VectorEncoding::INT8});
+  installFields(h.collection(), {.metric = api::VectorMetric::COSINE, .encoding = api::VectorEncoding::SQ8});
   indexDocs(h, 0, 15);
   h.commit();
   installFields(h.collection(), {.metric = api::VectorMetric::COSINE, .encoding = api::VectorEncoding::F32});
@@ -296,11 +297,11 @@ TEST_F(VectorEncodingTest, promotionToF32RenormalizesCosine) {
   }
 }
 
-// IVF+PQ overlays build from f16 / int8 columns; rescored ANN results match
+// IVF+PQ overlays build from f16 / bf16 / sq8 columns; rescored ANN results match
 // exact search.
 TEST_F(VectorEncodingTest, annOverlayBuildsFromEncodedColumn) {
   IvfTestGuard guard(/*minTraining=*/16);
-  for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::INT8}) {
+  for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::BF16, api::VectorEncoding::SQ8}) {
     CollectionHelper h("main");
     h.clear();
     installFields(h.collection(), {.metric = api::VectorMetric::COSINE, .encoding = encoding,
@@ -326,7 +327,7 @@ TEST_F(VectorEncodingTest, encodedFieldsValidateInput) {
   big[2] = 1.0e5f;
   EXPECT_EQ(1, h.index(flatdoc("id", std::string("big"), "enc_v", big)).total_errors);
 
-  installFields(h.collection(), {.encoding = api::VectorEncoding::INT8});
+  installFields(h.collection(), {.encoding = api::VectorEncoding::SQ8});
   Vec nan(DIMS, 1.0f);
   nan[1] = std::nanf("");
   EXPECT_EQ(1, h.index(flatdoc("id", std::string("nan"), "enc_v", nan)).total_errors);

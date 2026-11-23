@@ -25,14 +25,14 @@ same.
 ## Column Encoding
 
 A vector field's column stores one fixed-size value per vector in the field's
-`encoding`: `f32` (4 bytes per dimension), `f16` (2), or `int8` (8 + dims
-bytes per vector). The encoding is recorded on each segment's column
+`encoding`: `f32` (4 bytes per dimension), `f16` or `bf16` (2), or `sq8`
+(8 + dims bytes per vector). The encoding is recorded on each segment's column
 descriptor in the field catalog (an f32 column records nothing) rather than
 read from the schema, so a schema change never reinterprets an
 existing segment, and the column stays a plain fixed-size binary column
 (`dims` is derived from the value size and the encoding).
 
-`int8` follows the per-vector scaling of LVQ (Aguerrebere et al., "Similarity
+`sq8` follows the per-vector scaling of LVQ (Aguerrebere et al., "Similarity
 search in the blink of an eye with compressed indices", VLDB 2023,
 arXiv:2304.04759): each value is `offset, scale, codes[dims]` with
 `x[i] ~= offset + scale * code[i]`, where offset is the vector's minimum and
@@ -57,7 +57,7 @@ cosine rows written as f32. Same-encoding merges are pure byte copies.
 
 Exact scoring means exact over the stored encoding. `VectorScorer` is the
 single place a float query is scored against a stored row, used by the flat
-column engine and the terminal candidate rescore. `int8` rows are scored
+column engine and the terminal candidate rescore. `sq8` rows are scored
 without decoding to a float buffer, using per-query `sum(q)` and `|q|^2`:
 
 ```text
@@ -66,7 +66,7 @@ q.x   = offset * sum(q) + scale * sum(q[i] * code[i])
 |q-x|^2 = |q|^2 - 2 q.x + |x|^2
 ```
 
-The integer sums come out of the same pass. Cosine over `f16` and `int8`
+The integer sums come out of the same pass. Cosine over `f16`, `bf16` and `sq8`
 always divides by the stored vector's norm (also from the same pass), since a
 quantized unit vector is not exactly unit length. The scoring loops are
 scalar today; SIMD kernels and a per-vector norm sidecar can replace them
@@ -356,7 +356,7 @@ RaBitQ rotates the sample in place in row partitions; PQ needs no transform.
 Each add scratch buffer is limited by `ivfAddChunkBytes` (16 MiB by default),
 capped by available vectors with a minimum of one vector. Add uses up to two
 buffers for raw cosine plus rotation. Untransformed PQ add passes f32 column
-bytes directly to FAISS; f16 and int8 columns decode one chunk at a time into
+bytes directly to FAISS; f16, bf16 and sq8 columns decode one chunk at a time into
 an owned buffer, normalized in place for cosine. The serialized header's `nprobe` is unused by Luxir:
 searches supply explicit probe parameters or selected lists.
 
