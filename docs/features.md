@@ -115,6 +115,11 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - **SIMD codecs** for postings and numeric data (FastPFOR-based bit-packing,
   StreamVByte), roaring-style two-level bitsets for document sets, and BM25
   hot loops written to auto-vectorize.
+- **Segment pruning:** Per-field bounds and presence in each segment's
+  catalog prove that a query cannot match a segment, which is then skipped
+  without building scorers; merged over all segments, they answer a query
+  that cannot match anything before any term is looked up. Scores are
+  unchanged.
 - **Block-max pruning:** Skips whole blocks of documents that cannot enter
   the top k. Pareto frontiers provide score bounds that eliminate scoring
   work while preserving exact top-k results.
