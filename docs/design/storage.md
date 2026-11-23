@@ -345,6 +345,85 @@ small, and it would change only when the set of segments does. A search
 across many collections could then skip a whole collection from the manifest
 alone, without reading any segment's catalog or opening the collection.
 
+A collection-level summary (per-field bounds over all segments) is derived
+in memory from the headers when a query first needs it; the manifest does
+not persist one. Persisting it waits for a consumer that cannot open the
+collection, such as a search across closed collections.
+
+### Query-time pruning
+
+`Query::mayMatch(const CatalogSummaryView&)` answers, from field record
+headers alone, whether a query can match a segment: `EMPTY` is a proof that
+no document does (live or deleted), `UNKNOWN` is always legal. Headers
+describe the segment as written, so they prove "no match", never a count.
+The view reads `IndexReader::field(name)`, whose per-segment headers are
+memoized with the field totals (per row space and field, for the reader's
+segments), and decodes no part. Proofs name the physical field the query's
+weights read (a derived variant, each field of a combined-field query), not
+the logical name.
+
+| Query | Proof of absence |
+| --- | --- |
+| term, term set, phrase, combined fields | no record, no values or no terms; the term outside the dictionary bounds (a phrase needs every term, a set or combined-field query every entry proven absent) |
+| prefix, term range | no record, no values or no terms; the prefix or range outside the dictionary bounds |
+| fuzzy and other expansions | no record, no values or no terms |
+| numeric range or value set | no record or no values; no admitted value inside the scalar bounds |
+| exists | no record or no values |
+| geo box, distance, polygon | no record or no values; the query's bounding box disjoint from the geo bounds |
+| range field | no record or no values; the relation's box disjoint from the interval bounds over low or high endpoints |
+| to_parent | the segment has no rows in the child space, or the child query is proven empty over them |
+| match-no-docs | always |
+
+Term proofs compare the bytes execution seeks (analyzed and fitted, as the
+query holds them) with the dictionary bounds and their modes: a `ROUNDED`
+lower is a strict prefix of the smallest term, so that prefix itself is
+absent; an `EXCLUSIVE` upper is above every term; an `UNBOUNDED` upper proves
+nothing. Composites combine their children: one empty required or filter
+clause empties a boolean; an optional group needs `min_match` (or, without
+required clauses, one) members not proven empty, duplicates counted once as
+the plan executes them; a disjunction max needs every disjunct empty;
+wrappers pass their child's answer through. Prohibited clauses, kNN and any
+query without a rule prove nothing.
+
+`QueryPruning` evaluates the trees an op is masked by and memoizes the
+verdicts per request as `SegmentMask`s. The parser computes each op's root
+mask (`SearchOp::viable`) from its query and filters, widened by the domain
+variants it produces, and the request root masks its domain variants. A
+TopDocs op skips a pruned segment: no supplier, scorer, filter or count is
+built, children receive the empty domain, and the collector counts the
+segment as visited, so the response is that of an empty match. The
+exact-count planning loop skips segments the key query cannot match, as a
+zero metadata count. Masks never change what whole-index preparation sees:
+while some weight prepares over the whole index (kNN's global top k), every
+segment keeps its domains and pruning only skips each op's collection. A
+cache-backed whole-membership plan records an empty membership only where
+the key query itself is proven empty.
+
+Scoring does not depend on pruning. Field totals come from every segment's
+header. A term's statistics skip a segment only where its header proves the
+term absent (df = 0); a segment pruned by another clause or a filter is still
+seeked, so scores are identical with and without pruning.
+
+The collection proof runs first, per reader and lazily per field: the
+segments' headers merged (counts summed, bounds unioned; a segment with
+values but no bounds leaves the field unbounded). When it proves a TopDocs
+op's own matches empty and no domain variant widens its mask, the op plans a
+`MatchNoDocsQuery` before any weight exists, so no dictionary is seeked for
+statistics. A query that may prepare over the whole index keeps its weights.
+Because this proof answers before weights exist, it must not hide an error
+their creation raises: it looks up every field the query uses, prohibited
+clauses included (a type mismatch with the persisted segments then fails the
+request as before), and stands aside for any query part without a rule.
+
+Explain notes (`op <name>: pruned segment <id> (ord <n>): <reason>`, or `op
+<name>: proven empty for the collection: <reason>`) and a `pruning` profile
+op appear only when an op prunes. `QueryPruning::disableForTests` turns every
+proof off. Cross-check mode (`QueryPruning::crossCheck`, the hidden
+`--search.pruning-cross-check` flag) keeps responses unchanged but still runs
+the proven queries on every segment an op prunes and seeks every term a
+header proves absent; a match fails the request. The pruning tests run under
+it and compare every response, scores included, with pruning disabled.
+
 Per-segment bounds prove "no match" when a query's range does not overlap
 them, and "every document matches" when the minimum and maximum equal the
 queried value and every document has the field. Declared partition
