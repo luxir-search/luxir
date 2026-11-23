@@ -47,6 +47,10 @@ public:
     return child->requiredValueEnvelope(field);
   }
 
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return child->mayMatch(view);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);

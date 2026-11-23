@@ -26,6 +26,18 @@ public:
   const RowReduction& getReduction() const { return reduction; }
   bool recoverableAsPredicate() const noexcept override { return child->recoverableAsPredicate(); }
 
+  // A parent matches only through at least one matching child row
+  // (min_children >= 1), so a segment without the child space, or whose
+  // child rows the child query cannot match, holds no match.
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    auto rows = view.inSpace(source.topReader);
+    if (!rows) {
+      view.prove("nested space absent");
+      return MatchState::EMPTY;
+    }
+    return child->mayMatch(*rows) == MatchState::EMPTY ? MatchState::EMPTY : MatchState::UNKNOWN;
+  }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = (const ToParentQuery&)other;
     return reduction == rhs.reduction && source.topReader.path() == rhs.source.topReader.path()
@@ -36,8 +48,9 @@ public:
         mixHash(Hash::hash(source.topReader.path().data(), source.topReader.path().size()),
             mixHash((int)reduction.kind, mixHash(reduction.min, reduction.max))));
   }
-  void validateLogicalImpl(PlanningContext&, float multiplier) const override {
+  void validateLogicalImpl(PlanningContext& context, float multiplier) const override {
     child->validateLogical(source, reduction.kind != RowReduction::NONE ? multiplier : 1.0f);
+    if (source.mayPrepare) context.mayPrepare = true;
   }
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out, const FilterKeyContext& context) const override {
     out.appendKind(getKind());
