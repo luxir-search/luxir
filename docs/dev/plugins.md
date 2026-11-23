@@ -454,11 +454,19 @@ token needed to release it. Destruction or replacement of the hold calls
 `HoldOwner::release(const HeldRange&)`, which must be thread-safe and
 `noexcept`. The caller releases the hold before destroying its `InputFile`.
 
+A backend that fetches on first touch (an object store) sets `REMOTE`, returns
+true from `lazy()`, and overrides `prefetchRanges` and `fetchRanges` to fetch
+declared ranges together; `fetchRanges` must call its `done` exactly once,
+possibly on a fetch thread. Each `ByteRange` says whether it is `METADATA` or
+`DATA`. `knownFiles` passes the committed files of every manifest loaded,
+committed or installed, with each segment's catalog range and hash on its
+file 0. See [storage](../design/storage.md#range-read-extension-points).
+
 ### Storage layers
 
 A layer derives from `DelegatingDirFactory` and overrides what it changes, usually
 `directory()` to hand out `DelegatingDirectory` subclasses. Both
-bases forward their other virtuals, including `createFile` with options, `expectSynced`,
+bases forward their other virtuals, including `createFile` with options, `expectSynced`, `knownFiles`,
 `publishFile`, `readPublished`, `deleteDurably`, `deletePrefix`, `sync`,
 `underlying`, `linkFile`, `openChecksum` and `capabilities`.
 Core wrappers that refuse or track mutations implement the bare interface;
@@ -503,6 +511,10 @@ directory view opens by path) and a `counting` layer (counting file
 opens and creates). Each factory owns its counters; directory views share the
 layer's counters. `StorageExampleTest` reaches `CountingRamBackend` and
 `CountingLayer` through `find<T>()` and verifies that two nodes count independently.
+
+The `cold` layer wraps every directory in `test::ColdDirectory`: files are lazy,
+fetch 4 KiB pages on first touch and count what was fetched and how
+(`ColdLayer::stats`).
 
 Run `luxir_test --store.layer=strict` to check readers against isolated range
 buffers with varying garbage in the slack. It reports acquisition counts and

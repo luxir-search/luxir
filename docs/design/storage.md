@@ -158,7 +158,47 @@ A segment reads every part through `SegmentCore::slice()`. A manifest open
 acquires each file's header and the catalog range, never a whole segment
 file. For now the segment keeps the holds it hands out until it closes, so
 nothing held is evicted; releasing holds when a request ends comes with a
-bounded cache.
+bounded cache. `SegmentCore::wholeFileMaterializations()` counts slices that
+span a whole base file; only an open without a manifest takes one, and a test
+runs a canonical query set over lazy files and asserts it stays at zero.
+
+### Range-read extension points
+
+A backend that fetches bytes over a network (an object store) needs to know
+which ranges a reader is about to use and what they are. Core provides that
+much and no more; the store client, coalescing, concurrency, caching and
+eviction belong to the backend.
+
+- `InputFile::lazy()` is true when bytes are fetched on first touch, so an
+  acquire may block and throw. A segment opens a lazy file without reading
+  anything: the magic is checked by the first slice that covers the file
+  header, and integrity otherwise rests on the manifest xxh3 (verify-on-open,
+  scrub). Opening a segment from its manifest is then one read of the
+  catalog range, whatever the file count.
+- `ByteRange::readClass` marks a range `METADATA` or `DATA`. The catalog,
+  version runs, term dictionaries and the offset tables and directories of
+  columns, points and stored fields are metadata; a backend can keep them in
+  a tier of their own without decoding the format.
+- `prefetchRanges(ranges)` is advisory: the caller acquires these ranges
+  soon. The default advises each through `prefetch`.
+- `fetchRanges(ranges, deadline, done)` makes the ranges resident and calls
+  `done` exactly once, without holding the calling thread on a lazy file.
+  RAM and mmap files complete inline before it returns; the default reports
+  `FetchNotResidentError` and the reader acquires as usual. `ReadSet` lists a
+  round's ranges file by file (and can cut it to a byte budget), and
+  `FetchCountdown` joins the fetches of a round and resumes the request on a
+  task arena when the last one finishes, or lets the caller go on in place
+  when all finished inline (`store/FetchCountdown.h`).
+- `Directory::knownFiles(files)` receives the committed files whenever a
+  manifest is loaded, committed or installed. Each segment's file 0 carries
+  its catalog range and the catalog xxh3 from the manifest, so a backend can
+  open committed files without a size request and fetch or cache every
+  catalog of a commit together, checking each against its hash.
+
+`test::ColdDirectory` (and the example plugin's `cold` layer, which runs a
+whole node on it) is a lazy directory for tests: it fetches 4 KiB pages from
+the inner directory on first touch, leaves unfetched bytes as garbage, and
+counts fetched bytes, acquires by read class and reads at offset 0.
 
 The manifest identifies the segment catalog at the end of file 0 by offset,
 length and xxh3. The catalog holds a field table for each row space, then

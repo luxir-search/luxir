@@ -160,7 +160,11 @@ locations, browse `src/luxir/<area>/`.
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
      `FSDirectory` (on-disk, mmap reads), `CheckedDirectory` (validation wrapper)
    - `InputFile`: acquires file ranges as `HeldRange` objects. RAM and mmap supply
-     views valid for the file's lifetime
+     views valid for the file's lifetime. The range-read extension points for lazy (remote)
+     backends: `lazy()`, `prefetchRanges`, `fetchRanges` (`RangeFetch.h`), a `ByteRange`'s
+     `ReadClass` (metadata or data), `ReadSet` / `FetchCountdown` (`FetchCountdown.h`), and
+     `Directory::knownFiles` (committed files, each segment's catalog range and hash). See
+     [../design/storage.md](../design/storage.md#range-read-extension-points)
    - `InputStream` / `OutputStream`: codec I/O primitives. The catalog and record
      codecs validate directory entries, field offsets and data slices within their input ranges
    - `IndexFormat`: the on-disk format version, recorded in each manifest and in every data
