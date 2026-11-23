@@ -97,9 +97,12 @@ struct KnnPlanner {
     int64_t selectedUnits() const { return eligibleUnits < 0 ? eligibleDocs : eligibleUnits; }
   };
   struct Request {
-    int64_t k = 0, boundedTarget = 0;
-    int32_t nprobe = 0, referenceBreadth = 1;
+    // liveVectors counts every live vector of the field; it alone sets the
+    // reference index, so effort is merge-stable.
+    int64_t k = 0, boundedTarget = 0, liveVectors = 1;
+    int32_t nprobe = 0, referenceCap = DEFAULT_REFERENCE_CAP;
     double minScanFraction = 0, dimFactor = 1, alpha = 0.25, flatDensity = 0.6;
+    double examinedGrowth = DEFAULT_EXAMINED_GROWTH;
     Selector selector = Selector::AUTO;
   };
   struct Price {
@@ -128,20 +131,54 @@ struct KnnPlanner {
     return domain && threshold >= 0 && (sparse || multi
         || (double)card / std::max((int64_t)1, docsWithField) <= threshold);
   }
+  // Default effort keeps the fraction rule of a reference index while that
+  // index would have at most referenceCap lists (the builder's nlist cap).
+  // Above it the fraction rule would scan a constant share of the collection,
+  // so default effort becomes an examined-code target instead: the rule's
+  // count at the cap, growing by examinedGrowth per doubling of N and with k.
+  static constexpr int32_t DEFAULT_REFERENCE_CAP = 4096;
+  static constexpr double DEFAULT_EXAMINED_GROWTH = 0.25;
+  static constexpr int64_t EXAMINED_REFERENCE_K = 10;
+  static double referenceBreadth(const Request& request) {
+    // sqrt(N) lists with no cap: explicit nprobe of it is about nprobe * sqrt(N)
+    // examined codes at any N. Equal to defaultIvfNList below the cap.
+    return std::max(1.0, std::floor(std::sqrt((double)std::max((int64_t)1, request.liveVectors))));
+  }
+  static bool examinedEffort(const Request& request) {
+    return request.nprobe == 0 && referenceBreadth(request) > (double)std::max(1, request.referenceCap);
+  }
+  static double defaultExamined(const Request& request) {
+    double cap = (double)std::max(1, request.referenceCap);
+    double atCap = request.dimFactor * cap * std::sqrt(cap);
+    double live = (double)std::max((int64_t)1, request.liveVectors);
+    double doublings = std::max(0.0, std::log2(live / (cap * cap)));
+    double kDoublings = std::max(0.0, std::log2((double)request.k / EXAMINED_REFERENCE_K));
+    return atCap * (1 + request.examinedGrowth * doublings) * (1 + request.examinedGrowth * kDoublings);
+  }
   static double initialScanFraction(const Request& request, double selectivity) {
-    // Effort is a scan fraction of a hypothetical single IVF index of
-    // nlist = referenceBreadth = defaultIvfNList(all live vectors): nprobe
-    // lists of it, or by default sqrt(nlist) lists (times the dimension factor).
-    // Depending only on the total live count makes it MERGE-STABLE: a raw
-    // per-segment list count would scan ~sqrt(2)x more before a merge than
-    // after. A per-segment sum of defaults was rejected for the same reason
-    // (sum_s sqrt(N_s) / sqrt(N) = sqrt(numSegments) >= 1).
-    double reference = (double)std::max(1, request.referenceBreadth);
+    // Effort is a scan fraction of a hypothetical single IVF index over all
+    // live vectors: nprobe of its sqrt(N) lists, or by default sqrt of its
+    // lists (times the dimension factor), with the list count capped at
+    // referenceCap. Depending only on the total live count makes it
+    // MERGE-STABLE: a raw per-segment list count would scan ~sqrt(2)x more
+    // before a merge than after. A per-segment sum of defaults was rejected
+    // for the same reason (sum_s sqrt(N_s) / sqrt(N) = sqrt(numSegments) >= 1).
+    // Above the cap the fraction rule is only a ceiling on the examined target.
+    double reference = referenceBreadth(request);
     double fraction = request.nprobe > 0 ? (double)request.nprobe / reference
-        : request.dimFactor / std::sqrt(reference);
+        : request.dimFactor / std::sqrt(std::min(reference, (double)std::max(1, request.referenceCap)));
+    if (examinedEffort(request))
+      fraction = std::min(fraction, defaultExamined(request) / (double)std::max((int64_t)1, request.liveVectors));
     if (request.nprobe == 0 && selectivity < 1)
       fraction *= std::pow(std::max(selectivity, std::numeric_limits<double>::min()), -request.alpha);
     return std::clamp(std::max(fraction, request.minScanFraction), 0.0, 1.0);
+  }
+  // Coverage a query must reach before it may stop. Under examined effort the
+  // initial fraction is only where the scan starts; the examined target and
+  // the other obligations decide when it stops.
+  static double coverageFloor(const Request& request, double selectivity) {
+    return examinedEffort(request) ? std::clamp(request.minScanFraction, 0.0, 1.0)
+                                   : initialScanFraction(request, selectivity);
   }
   static double arraySteps(int64_t card) { return (double)std::bit_width((uint64_t)std::max((int64_t)1, card)); }
   static bool usesScorer(int32_t codeBits, int32_t queryBits, bool forceFaiss) {

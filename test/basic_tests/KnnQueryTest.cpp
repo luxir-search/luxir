@@ -2249,6 +2249,163 @@ TEST_F(KnnQueryTest, defaultNProbeScalesWithDims) {
   EXPECT_LE(scaledDefault, plainDefault * 3) << plainDefault;
 }
 
+// Above the reference cap the default stops on the examined-code target,
+// not on the fraction rule's coverage. A small cap exercises the large-N path.
+TEST_F(KnnQueryTest, defaultEffortStopsOnExaminedTargetAboveCap) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::tuning.referenceCap);
+  CollectionHelper h("main");
+  constexpr int32_t dims = 32;
+  installVecSchema(h.collection(), api::VectorMetric::L2, rabitqAnn(64), dims);
+  std::mt19937 rng(11);
+  std::normal_distribution<float> gauss;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 4096; i++) {
+    std::vector<float> v(dims);
+    for (auto& x : v) x = gauss(rng);
+    docs.push_back(flatdoc("id", std::to_string(i), "embedding_v", v));
+  }
+  h.indexAll(docs);
+  h.commit({"*"});
+  std::vector<float> query(dims);
+  for (auto& x : query) x = gauss(rng);
+  auto run = [&](int32_t cap) {
+    KnnQuery::tuning.referenceCap = cap;
+    KnnQuery::Stats stats;
+    KnnQuery::statsForTests = &stats;
+    auto* req = makeKnnReq(*luxirNode, "embedding_v", query, 5);
+    req->execute();
+    EXPECT_EQ(5u, resultIds(*req).size());
+    req->done();
+    KnnQuery::statsForTests = nullptr;
+    return std::pair{stats.targetExamined.load(), stats.coveredFraction.load()};
+  };
+  // Reference sqrt(4096) = 64 lists. Under the default cap: 1/sqrt(64) floor.
+  auto [fractionTarget, fractionCoverage] = run(KnnPlanner::DEFAULT_REFERENCE_CAP);
+  EXPECT_DOUBLE_EQ(4096.0 / 8, fractionTarget);
+  EXPECT_GE(fractionCoverage + 1e-12, 1.0 / 8);
+  // Cap 16: 16^1.5 codes at 256 vectors, +25% per doubling: 64 * 2 = 128.
+  auto [examinedTarget, examinedCoverage] = run(16);
+  EXPECT_DOUBLE_EQ(128, examinedTarget);
+  EXPECT_LT(examinedCoverage, fractionCoverage);
+}
+
+// Early stops under examined effort (a small reference cap stands in for a
+// large collection). 32 well-separated clusters; queries sit at a cluster.
+// Cap 64 over 8192 vectors: a target of 640 codes, about 2.5 lists.
+class KnnEarlyStopTest : public KnnQueryTest {
+protected:
+  static constexpr int32_t dims = 32, clusters = 32, perCluster = 256;
+  std::vector<std::vector<float>> centers, vectors;
+  void index(CollectionHelper& h, api::VectorMetric metric) {
+    // One list per cluster, so a query's neighbors sit in one list.
+    installVecSchema(h.collection(), metric, rabitqAnn(clusters), dims);
+    std::mt19937 rng(5);
+    std::normal_distribution<float> gauss;
+    centers.assign(clusters, std::vector<float>(dims));
+    for (auto& c : centers) for (auto& x : c) x = 20 * gauss(rng);
+    std::vector<Doc> docs;
+    for (int c = 0; c < clusters; c++) for (int i = 0; i < perCluster; i++) {
+      std::vector<float> v(dims);
+      for (int d = 0; d < dims; d++) v[d] = centers[c][d] + gauss(rng);
+      vectors.push_back(v);
+      docs.push_back(flatdoc("id", std::to_string(vectors.size() - 1), "tag_s", c == 0 ? "near" : "far",
+                             "embedding_v", v));
+    }
+    h.indexAll(docs);
+    h.commit({"*"});
+  }
+  struct Run {
+    std::vector<std::string> ids;
+    int64_t gateStops = 0, patienceStops = 0, rounds = 0;
+    double coverage = 0;
+  };
+  Run search(const std::vector<float>& query, int32_t k, std::optional<float> gate,
+             int32_t nprobe = 0, bool exact = false, const char* tag = nullptr) {
+    KnnQuery::Stats stats;
+    KnnQuery::statsForTests = &stats;
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    configKnn(cur, "embedding_v", query, k, nprobe, 0, exact);
+    auto& knn = std::get<api::KnnQuery>(cur.rawQuery().kind);
+    if (gate) knn.ivf.emplace().ratio_gate = gate;
+    if (tag) addMatchFilter(cur, "tag_s", tag);
+    req->execute();
+    Run run{resultIds(*req), stats.ratioGateStops.load(), stats.patienceStops.load(),
+            stats.rounds.load(), stats.coveredFraction.load()};
+    req->done();
+    KnnQuery::statsForTests = nullptr;
+    return run;
+  }
+  static double recall(const std::vector<std::string>& got, const std::vector<std::string>& want) {
+    std::set<std::string> truth(want.begin(), want.end());
+    return (double)std::ranges::count_if(got, [&](const auto& id) { return truth.contains(id); }) / want.size();
+  }
+};
+
+TEST_F(KnnEarlyStopTest, ratioGateAndPatienceStopEasyQueries) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::tuning.referenceCap, KnnQuery::tuning.patienceStart);
+  KnnQuery::tuning.referenceCap = 64;
+  CollectionHelper h("main");
+  index(h, api::VectorMetric::L2);
+  const auto& query = vectors[3];
+  auto truth = search(query, 10, std::nullopt, 0, /*exact=*/true).ids;
+  KnnQuery::tuning.patienceStart = 0;
+  auto full = search(query, 10, 0.0f);
+  auto gated = search(query, 10, std::nullopt);
+  EXPECT_EQ(0, full.gateStops);
+  EXPECT_EQ(1, gated.gateStops);
+  EXPECT_LT(gated.coverage, full.coverage);
+  EXPECT_GE(recall(gated.ids, truth), 0.9);
+  KnnQuery::tuning.patienceStart = 0.25;
+  auto patient = search(query, 10, 0.0f);
+  EXPECT_EQ(1, patient.patienceStops);
+  EXPECT_LT(patient.coverage, full.coverage);
+  EXPECT_GE(recall(patient.ids, truth), 0.9);
+  // Explicit nprobe pins effort: neither rule applies.
+  auto pinned = search(query, 10, std::nullopt, 4);
+  EXPECT_EQ(0, pinned.gateStops + pinned.patienceStops);
+}
+
+// Eligible vectors all lie away from the query: a rule fires on the query's
+// own list, which holds no eligible vector, and the eligible-yield obligation
+// still widens past it to the k nearest eligible lists.
+TEST_F(KnnEarlyStopTest, antiCorrelatedFilterKeepsYieldObligation) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::tuning.referenceCap);
+  KnnQuery::tuning.referenceCap = 64;
+  CollectionHelper h("main");
+  index(h, api::VectorMetric::L2);
+  const auto& query = vectors[3];
+  auto unfiltered = search(query, 10, std::nullopt);
+  auto filtered = search(query, 10, std::nullopt, 0, false, "far");
+  EXPECT_EQ(1, unfiltered.gateStops);
+  EXPECT_EQ(1, filtered.gateStops + filtered.patienceStops);
+  ASSERT_EQ(10u, filtered.ids.size());
+  // 256 eligible codes per list: the yield at the gated coverage needs a
+  // whole eligible list beyond the query's own.
+  EXPECT_GE(filtered.coverage, unfiltered.coverage + 1.0 / clusters - 1e-9);
+}
+
+TEST_F(KnnEarlyStopTest, ratioGateOnInnerProduct) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::tuning.referenceCap, KnnQuery::tuning.patienceStart);
+  KnnQuery::tuning.referenceCap = 64;
+  KnnQuery::tuning.patienceStart = 0;
+  CollectionHelper h("main");
+  index(h, api::VectorMetric::COSINE);
+  const auto& query = vectors[3];
+  auto truth = search(query, 10, std::nullopt, 0, /*exact=*/true).ids;
+  auto gated = search(query, 10, std::nullopt);
+  EXPECT_EQ(1, gated.gateStops);
+  EXPECT_GE(recall(gated.ids, truth), 0.9);
+}
+
 TEST_F(KnnQueryTest, filteredCoverageBudgetAndCaps) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);

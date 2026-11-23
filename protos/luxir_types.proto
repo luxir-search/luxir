@@ -449,6 +449,11 @@ message KnnQuery {
     int32 nprobe = 1;
     // Minimum fraction of live vectors to scan, in [0,1]. 0 = no floor.
     float min_scan_fraction = 2;
+    // Stop widening at the first list whose centroid is farther than
+    // (1 + ratio_gate) times the nearest probed centroid. Applies only to the
+    // adaptive default above about 16.7M live vectors. Unset = a default
+    // that shrinks with dimension; 0 = off. Must be >= 0.
+    optional float ratio_gate = 3;
   }
 }
 

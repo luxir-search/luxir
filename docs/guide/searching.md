@@ -1231,7 +1231,7 @@ and list counts:
   "details": [
     "reason=lowest modeled configuration; eligible_vectors=20000; exact_cost=...; ivf_scan_cost_at_predicted_coverage=...; ivf_linear=...; ivf_fixed=...",
     "predicted_coverage=0.238; predicted_total=...; predicted_ivf_rounds=1; predicted_terminal_dims=...; predicted_terminal_reads=...; rounds=1; coverage=0.241; entries=4830; selector_passes=1; terminal_reads=212",
-    "reference_nlist=141; initial_nprobe=33.6",
+    "reference_nlist=141; initial_nprobe=33.6; effort=fraction; target_examined=4760; eligible_examined=4830; stop=effort; ratio_gate=0",
     "segment_nlist=141; lists_probed=34"
   ]
 }
@@ -1246,6 +1246,15 @@ executed IVF, including one that later completes exactly. `initial_nprobe`
 is the round-one budget in units of the reference index (`reference_nlist`),
 before whole-list allocation, widening, and completion. `ivf.min_scan_fraction`
 can raise a pinned `ivf.nprobe`; budgets are also capped at `reference_nlist`.
+`effort` names the rule that sized the query: `nprobe` (pinned),
+`fraction` (default, reference index of up to 4096 lists) or `examined`
+(default above that). `target_examined` is the filter-passing vector count
+default effort must examine (0 when pinned) and `eligible_examined` is what
+newly scanned lists yielded. `stop` names what ended widening: `effort` (its
+obligations were met), `ratio_gate` or `patience` (an early-stop rule of
+examined effort, after which only fill and filter-yield obligations widen),
+`pool_full`, `exhausted` (every list scanned) or `nprobe` (the pin).
+`ratio_gate` is the gate's eps, `0` when it does not apply.
 
 Every piece that executed IVF reports `segment_nlist` and `lists_probed`, the
 number of distinct lists scanned in that segment. Rescans do not increase

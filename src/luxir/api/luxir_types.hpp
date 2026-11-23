@@ -878,7 +878,7 @@ struct ArrArrInt { std::span<const ArrInt> v; };
 struct ArrArrFloat { std::span<const ArrFloat> v; };
 struct ArrArrDouble { std::span<const ArrDouble> v; };
 namespace KnnQuery_ {
-struct Ivf { int32_t nprobe = 0; float min_scan_fraction = 0.0f; };
+struct Ivf { int32_t nprobe = 0; float min_scan_fraction = 0.0f; std::optional<float> ratio_gate; };
 } // namespace KnnQuery_
 struct KnnQuery {                                                // needs Vector
   using Ivf = luxir::api::KnnQuery_::Ivf;

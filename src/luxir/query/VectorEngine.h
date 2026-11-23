@@ -88,6 +88,9 @@ struct VectorSearchRequest {
   std::span<const std::span<const uint8_t>> eligible;
   // Bounded group policy only; interval collectors have no member cap.
   int64_t perKey = 1;
+  // BREADTH only: stop allocating at the first list whose centroid distance
+  // exceeds (1 + ratioGate) times the query's first allocated list's. 0 = off.
+  double ratioGate = 0.0;
 };
 
 /// Candidate from the vector engine seam. score is exact for flat engines;
@@ -132,6 +135,8 @@ struct VectorSearchResult {
   // and coverage after the next globally-best list. A zero-live list can
   // leave nextFraction equal to coveredFraction; BREADTH must still advance.
   double coveredFraction = 0.0, nextFraction = 0.0;
+  // This round's allocation stopped at the ratio gate.
+  bool ratioGated = false;
   VectorSearchWork work;
 };
 

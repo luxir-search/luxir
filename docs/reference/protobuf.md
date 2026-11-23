@@ -1579,6 +1579,7 @@ Search effort for IVF indexes.
 |---|---|---|---|---|
 | <a id="field-luxir.knnquery.ivf.nprobe"></a>[`nprobe`](#field-luxir.knnquery.ivf.nprobe) | 1 | `int32` | singular | Merge-stable IVF effort: lists to probe if this field were one IVF index with nlist=sqrt(live vectors). 0 = adaptive default; positive values cap search effort. |
 | <a id="field-luxir.knnquery.ivf.min_scan_fraction"></a>[`min_scan_fraction`](#field-luxir.knnquery.ivf.min_scan_fraction) | 2 | `float` | singular | Minimum fraction of live vectors to scan, in \[0,1\]. 0 = no floor. |
+| <a id="field-luxir.knnquery.ivf.ratio_gate"></a>[`ratio_gate`](#field-luxir.knnquery.ivf.ratio_gate) | 3 | `float` | optional | Stop widening at the first list whose centroid is farther than (1 + ratio\_gate) times the nearest probed centroid. Applies only to the adaptive default above about 16.7M live vectors. Unset = a default that shrinks with dimension; 0 = off. Must be &gt;= 0. |
 
 <a id="message-luxir.linearfusion"></a>
 

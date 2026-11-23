@@ -848,7 +848,7 @@ in their own guides:
   [Chunks and vectors](nested.md#chunks-and-vectors).
 - [`knn`](vector-search.md) covers `field`, `query`, `k`, `refine_candidates`,
   `exact`, `similarity`, and the per-engine `ivf` object (`nprobe`,
-  `min_scan_fraction`).
+  `min_scan_fraction`, `ratio_gate`).
 - [`geo_box`, `geo_distance`, and `geo_polygon`](geo-search.md) cover
   coordinate order, inclusive boundaries, dateline crossing, distance units,
   and unions of polygons with holes.
