@@ -351,8 +351,11 @@ bool SegmentCore::mayContainId(std::string_view term, uint64_t hash) {
     // A root id dictionary always records exact inclusive bounds.
     if (term < std::string_view(bounds->lower) || term > std::string_view(bounds->upper)) return false;
   }
-  auto filter = info->idFilter();
-  return !filter || IdFilter(slice(filter)).mayContainHash(hash);
+  auto part = info->idFilter();
+  if (!part) return true;
+  // A filter this build cannot read proves nothing.
+  auto filter = IdFilter::parse(slice(part));
+  return !filter || filter->mayContainHash(hash);
 }
 
 std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, const api::SegmentInfo& segment,

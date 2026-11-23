@@ -62,8 +62,9 @@ locations, browse `src/luxir/<area>/`.
      slices. Numeric leaf metadata and stored metadata are opened and cached
      separately. Codec cursors borrow the space reader and its acquired bytes. Opens from a manifest check the catalog
      against the manifest's xxh3 first; invalid segment bytes throw `SegmentCorruptError`
-   - `IdFilter`: the root id field's FILTER part, a split-block Bloom filter over its
-     dictionary terms. `SegmentCore::mayContainId` checks the exact id bounds, then the
+   - `IdFilter`: the root id field's FILTER part, a membership filter over its
+     dictionary terms that names its own kind (split-block Bloom or binary fuse) and
+     parameters. `IdFilter::Options` picks what a writer builds. `SegmentCore::mayContainId` checks the exact id bounds, then the
      filter; the writer's delete application skips ids and segments it excludes
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;

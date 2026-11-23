@@ -259,6 +259,20 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(index.pressure_flush_floor_mb)
       ->check(CLI::PositiveNumber);
 
+  app.add_option("--indexing.id-filter", index.id_filter,
+                 "Membership filter over each segment's ids, used to skip segments when "
+                 "applying deletes and updates: bloom, fuse8, fuse16 or none")
+      ->default_val(index.id_filter)
+      ->check(CLI::IsMember({"bloom", "fuse8", "fuse16", "none"}));
+  app.add_option("--indexing.id-filter-bits-per-key", index.id_filter_bits_per_key,
+                 "Bits per id of a bloom id filter")
+      ->default_val(index.id_filter_bits_per_key)
+      ->check(CLI::Range(1, 64));
+  app.add_option("--indexing.id-filter-min-kb", index.id_filter_min_kb,
+                 "Smallest bloom id filter per segment (KiB, 0 = sized by bits per id only)")
+      ->default_val(index.id_filter_min_kb)
+      ->check(CLI::Range(0, 1024));
+
   app.add_option("--indexing.max-request-body", ingest.max_request_body,
                  "Max buffered (non-streaming) request body; oversized -> 413 (e.g. 32MB)")
       ->transform(CLI::AsSizeValue(false))

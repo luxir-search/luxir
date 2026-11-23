@@ -761,6 +761,7 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
         [this](std::string_view resource, const StoredChunkFormat& format) {
           return storedDictionaries.lookup(resource, format);
         });
+    newInverter->getPostingsWriter().idFilterOptions = idFilterOptions;
     inverter = newInverter.get();
     inverter->updateVersions(updateVersion);
     busyInverters.emplace(inverter, std::move(newInverter));
@@ -2907,6 +2908,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     // Merge cursors borrow the space readers from the pinned cores.
     {
       PostingsWriter pwriter(dir, outputSegId, writerEpoch);
+      pwriter.idFilterOptions = idFilterOptions;
 
       phase = "segment_merge";
       // Do the actual merge.  The current schema chooses each stored-fields
@@ -3622,8 +3624,9 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
 
   // The id filter proves most absent ids absent: those skip the dictionary,
   // and a segment that can hold none of them is not touched further.
+  // A filter this build cannot read proves nothing.
   std::optional<IdFilter> idFilter;
-  if (auto slice = idFieldInfo->idFilter()) idFilter.emplace(core->slice(slice));
+  if (auto slice = idFieldInfo->idFilter()) idFilter = IdFilter::parse(core->slice(slice));
   auto mayHold = [&](const auto& entry) {
     return entry.val().deleteWatermark != 0 && (!idFilter || idFilter->mayContain((std::string_view)entry));
   };
