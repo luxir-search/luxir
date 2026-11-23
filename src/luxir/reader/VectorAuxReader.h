@@ -24,6 +24,7 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -35,6 +36,7 @@
 #include "AuxReader.h"
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/store/AcquireJoin.h"
 #include "luxir/store/Directory.h"
 #include "luxir/store/HeldRange.h"
 #include "luxir/store/InputStream.h"
@@ -258,8 +260,10 @@ static_assert(sizeof(faiss::rabitq_utils::SignBitFactorsWithError) == RABITQ_F_E
 /// file (VectorAuxListsFooter). On a file whose holds are free (RAM, mmap),
 /// lists point into the file's view. Otherwise get_ids / get_codes hold the
 /// list's range until the matching release_ids / release_codes, so a scan
-/// holds only the lists it reads, and only while it reads them. Holds are
-/// shared and counted across concurrent scans. ReadOnlyInvertedLists supplies throwing
+/// holds only the lists it reads, and only while it reads them. A scan that
+/// knows its lists holds them first with retain(), one batch per file; the
+/// gets inside the batch then find them held. Holds are shared and counted
+/// across concurrent scans. ReadOnlyInvertedLists supplies throwing
 /// add/update/resize.
 class HeldInvertedLists final : public faiss::ReadOnlyInvertedLists {
   struct Held {
@@ -278,6 +282,21 @@ class HeldInvertedLists final : public faiss::ReadOnlyInvertedLists {
 
 public:
   enum Section : uint8_t { IDS, CODES, AMPLITUDES };
+
+  /// Lists a scan holds, released when it is destroyed.
+  class Batch {
+    friend class HeldInvertedLists;
+    const HeldInvertedLists* lists = nullptr;
+    std::vector<uint64_t> keys;
+
+  public:
+    Batch() = default;
+    Batch(const Batch&) = delete;
+    Batch& operator=(const Batch&) = delete;
+    ~Batch() {
+      for (uint64_t key : keys) lists->release(key);
+    }
+  };
 
   /// One list's amplitudes, held and validated, until destroyed.
   class Amplitudes {
@@ -396,6 +415,42 @@ public:
   void release_codes(size_t listNo, const uint8_t*) const override { release(listNo, CODES); }
   void release_ids(size_t listNo, const faiss::idx_t*) const override { release(listNo, IDS); }
 
+  /// Holds `sections` of `lists` into `into`. Ranges not yet held are
+  /// acquired as one batch on `join`, which the caller waits on; `into` must
+  /// outlive that wait. Empty lists and lists of a free view need nothing.
+  void retain(std::span<const faiss::idx_t> lists, std::initializer_list<Section> sections, Batch& into,
+              AcquireJoin& join) const {
+    into.lists = this;
+    if (holdsFree()) return;
+    std::vector<uint64_t> missing;
+    std::vector<ByteRange> ranges;
+    {
+      std::lock_guard lock(mutex);
+      for (auto list : lists) {
+        if (list < 0 || list_size((size_t)list) == 0) continue;
+        for (auto section : sections) {
+          if (!rowBytes[section]) continue;
+          uint64_t key = keyOf((size_t)list, section);
+          if (find(key)) into.keys.push_back(key);
+          else {
+            missing.push_back(key);
+            ranges.push_back(rangeOf((size_t)list, section));
+          }
+        }
+      }
+    }
+    if (missing.empty()) return;
+    join.acquire(file, ranges, [this, missing = std::move(missing), &into](std::vector<HeldRange>&& holds) {
+      {
+        std::lock_guard lock(mutex);
+        for (size_t i = 0; i < missing.size(); i++) {
+          install(missing[i], holds[i]);
+          into.keys.push_back(missing[i]);
+        }
+      }
+      holds.clear();
+    });
+  }
 };
 
 /// AuxReader for kind == "vector_faiss".  Holds a deserialized faiss::Index

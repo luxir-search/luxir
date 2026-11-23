@@ -195,6 +195,11 @@ use:
   backend's error and the next use reads again; bytes that fail validation
   throw `SegmentCorruptError` on every use. The scrubber still checks every
   file of a snapshot, read or not.
+- A vector overlay's first use acquires its FAISS header, list sizes and
+  footer in one batch. A kNN query then holds only the IVF lists it probes,
+  one batch per overlay per search round, and releases them when it
+  finishes; it never holds the whole file (see
+  [vector-search.md](vector-search.md)).
 - `segmentOpenCounters` counts the segments with a first hold beyond the
   catalog and the bytes those holds cover (`segments_opened`,
   `segment_bytes_mapped`). Free views (RAM, mmap) are not counted.

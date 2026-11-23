@@ -30,7 +30,9 @@
 #include "luxir/store/FileIOException.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
+#include "test/KnnTestUtils.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "test/StrictStorage.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
@@ -322,6 +324,50 @@ TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
   }
   for (int i = 0; i < N; i++) {
     EXPECT_EQ(seen[i], 1) << "valueRank " << i;
+  }
+}
+
+// A cold kNN query on lazily read storage: the overlay's open acquires its
+// footer, FAISS header and list sizes in one round, the scan acquires the
+// probed lists in one more, and no whole file is read. Lists are held only
+// while the query searches. Under deletes, the round that reads the ids for
+// live list sizes also holds the codes, so the count stays the same.
+TEST_F(IndexReaderAuxTest, coldKnnHoldsOnlyProbedListsWhileSearching) {
+  IvfTestGuard guard;
+  ForceIvfGuard ivf;
+  CollectionHelper h("main");
+  enableL2OnVecSuffix(h.collection(), rabitqAnn(16), 4);
+  for (int i = 0; i < 400; i++) {
+    h.index(flatdoc("id", std::to_string(i), "embedding_v",
+                    std::vector<float>{(float)(i % 20), (float)(i / 20), 1.0f, 0.5f}));
+  }
+  h.commit({"*"});
+  auto writer = h.getIndexWriter();
+  auto durable = readDurableIndexInfo(writer->dir);
+  const auto& file = onlyVectorOverlay(durable.info).files[0];
+  for (bool deletes : {false, true}) {
+    if (deletes) {
+      ASSERT_TRUE(h.deleteByIds({"7", "8", "9"}, UpdateMessage::COMMIT).success);
+    }
+    auto counters = std::make_shared<StrictStorageCounters>();
+    StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
+    auto reader = std::make_shared<IndexReader>(dir);
+    auto req = localReq(h.getSearchEngine());
+    auto& cur = req->topDocs();
+    cur.limit(5).fields({"id"});
+    cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", {3, 7, 1, 0.5f}, 5, /*nprobe=*/2);
+    req->execute(reader);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(5u, req->getDocs().size());
+    auto stats = counters->fileStats(file.name);
+    EXPECT_EQ(0u, stats.wholeFileAccesses);
+    EXPECT_EQ(2u, stats.rounds);
+    EXPECT_EQ(stats.rounds, stats.batches);
+    uint64_t bytes = 0;
+    for (auto [offset, length] : stats.parts) bytes += length;
+    EXPECT_LT(bytes, file.size / 2);
+    EXPECT_GT(stats.peakLiveHolds, 0u);
+    EXPECT_EQ(0u, stats.liveHolds);
   }
 }
 

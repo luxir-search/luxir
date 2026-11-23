@@ -359,7 +359,12 @@ acquires the header, the list-size table and the fixed-size footer in one
 batch, and nothing else. On a mapped or RAM file lists point into the file's
 view. On other backends each list is held only while it is read: FAISS's `get_ids` /
 `get_codes` acquire the list's range and `release_ids` / `release_codes`
-release it.
+release it. A kNN round holds the lists it is about to scan first, one batch
+per segment, issued for all segments before waiting on any. Under deletes the
+allocator prices lists by their live ids; it projects the allocation with
+physical sizes and holds the projected lists the same way, so live sizes are
+not read one list at a time. A query keeps its lists held until it finishes,
+so a later round does not read them again.
 
 RaBitQ overlays also store upward-rounded float32 error amplitudes after the
 codes in inverted-list order: sigma1 for 1-bit, sigmaB for multi-bit
