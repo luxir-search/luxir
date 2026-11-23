@@ -126,6 +126,7 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
       auto name = Postings::getIndexFileName(segmentName, number);
       auto stats = counters->fileStats(name);
       EXPECT_EQ(0u, stats.wholeFileAccesses) << name;
+      EXPECT_EQ(0u, stats.sizeRequests) << name;  // the manifest records every size
       EXPECT_EQ(expected[number].size(), stats.acquires) << name;
       EXPECT_EQ(expected[number], stats.parts) << name;
       EXPECT_EQ(metadata[number], stats.metadataParts) << name;

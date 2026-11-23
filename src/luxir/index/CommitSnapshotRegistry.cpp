@@ -260,7 +260,7 @@ std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const FileDescriptor
   // the check and the open; once open, its bytes outlive an unlink.
   std::lock_guard retirementLock(retirementMutex);
   requireHeld(descriptor);
-  auto file = dir.openFile(descriptor.name, true);
+  auto file = dir.openFile(descriptor.name, true, descriptor.size);
   if (!file) throw std::runtime_error("held snapshot file is missing");
   return file;
 }

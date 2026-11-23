@@ -18,9 +18,9 @@ public:
     for (const auto& item : verification.items) held.emplace(item.file.name, &item);
   }
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
+  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) override {
     auto it = held.find(name);
-    if (it == held.end()) return delegate.openFile(name, expectSynced);
+    if (it == held.end()) return delegate.openFile(name, expectSynced, size);
     const auto& item = *it->second;
     if (expectSynced) delegate.expectSynced(std::span(&item.file, 1));
     return item.reader->map();

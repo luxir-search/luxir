@@ -33,6 +33,7 @@ private:
   // spilled filesystem/object-store keys stable.
   struct BaseFile {
     std::shared_ptr<InputFile> file;
+    uint64_t size = 0;  // The manifest's size when it records one, so reads need no size request.
     bool holdsFree = false;
   };
   std::vector<BaseFile> files;
@@ -87,7 +88,7 @@ public:
 
   void forEachBaseFile(auto&& visit) const {
     for (uint32_t number = 0; number < files.size(); ++number) {
-      if (const auto& file = files[number].file) visit(number, (uint64_t)file->size());
+      if (files[number].file) visit(number, files[number].size);
     }
   }
 

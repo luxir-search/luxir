@@ -104,7 +104,9 @@ public:
   // Open a file for reading.  If expectSynced is true, the caller asserts that
   // this file should have been fsynced (e.g. it was referenced from a committed
   // index).  CheckedDirectory uses this flag to detect missing fsyncs.
-  virtual std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) = 0;
+  // A nonzero size is the file's size as a manifest records it; a backend may
+  // answer size() from it instead of asking the store. Wrappers forward it.
+  virtual std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) = 0;
 
   // The caller asserts that `files` were fsynced: a root about to be published
   // references them (Manifest::commit). CheckedDirectory verifies it.
@@ -267,8 +269,8 @@ public:
     }
   }
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
-    unused(expectSynced);
+  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) override {
+    unused(expectSynced, size);
     std::lock_guard<std::mutex> lock(mutex);
 
     auto find = files.find(name);

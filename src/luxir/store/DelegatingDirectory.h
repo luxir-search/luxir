@@ -21,8 +21,8 @@ public:
   explicit DelegatingDirectory(std::shared_ptr<Directory> inner) : delegate(std::move(inner)) {}
 
   void listFiles(std::vector<FileInfo>& target) override { delegate->listFiles(target); }
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
-    return delegate->openFile(name, expectSynced);
+  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) override {
+    return delegate->openFile(name, expectSynced, size);
   }
   void expectSynced(std::span<const FileDescriptor> files) override { delegate->expectSynced(files); }
   std::unique_ptr<File> createFile(std::string_view name) override { return delegate->createFile(name); }
