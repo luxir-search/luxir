@@ -161,12 +161,18 @@ error and no holds. The holds follow the single-acquire contract. The
 default acquires each range in turn and completes inline, and
 `acquireAll(ranges)` blocks on the batch and returns its holds.
 
-A segment reads every part through `SegmentCore::slice()`. A manifest open
-acquires each file's header, the catalog range, the version runs and, for
-segments with nested spaces, the ownership ends and owners columns; never a
-whole segment file. For now the segment keeps the holds it hands out until it
-closes, so nothing held is evicted; releasing holds when a request ends comes
-with a bounded cache.
+A segment reads every part through `SegmentCore::slice()`, or through
+`SegmentCore::slices()`, which issues one batch per file and keeps the holds
+the same way. A manifest open acquires each file's header, the catalog range,
+the version runs and, for segments with nested spaces, the ownership ends and
+owners columns; never a whole segment file. A snapshot open issues one batch
+per new segment's file 0, holding its header and catalog, issues all of them
+before it decodes any catalog, and waits on them together, so a backend that
+completes batches asynchronously serves every catalog in one round. The
+version runs, a nested segment's ownership columns and the other files'
+headers still follow one acquire at a time. For now the segment keeps the
+holds it hands out until it closes, so nothing held is evicted; releasing
+holds when a request ends comes with a bounded cache.
 
 - A manifest open passes each file's recorded size to `Directory::openFile`
   and checks it against `size()` once per file; after a sized open, `size()`
