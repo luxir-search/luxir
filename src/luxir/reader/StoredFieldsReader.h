@@ -84,8 +84,10 @@ public:
     chunks = reader.core().slice(stored->chunks()).data();
 
     auto context = segmentReadContext(reader.core(), fieldInfo, stored->chunkOffsets.location.filenum());
-    firstDocCol = MonoReader(reader.core(), stored->firstDocs, stored->numChunks, context.field);
-    chunkOffsetCol = MonoReader(reader.core(), stored->chunkOffsets, (int64_t)stored->numChunks + 1, context.field);
+    // The chunk index routes a doc to its chunk, so it is metadata.
+    firstDocCol = MonoReader(reader.core(), stored->firstDocs, stored->numChunks, context.field, ReadClass::METADATA);
+    chunkOffsetCol = MonoReader(reader.core(), stored->chunkOffsets, (int64_t)stored->numChunks + 1, context.field,
+                                ReadClass::METADATA);
     chunkOffsetCol.requireLast(stored->chunksBytes, context, "last chunk offset differs from the chunks length");
   }
 
