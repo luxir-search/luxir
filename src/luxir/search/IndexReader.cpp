@@ -335,6 +335,42 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
       }
       lastCommitTime = commitTimeUs;
 
+      // Every holder of a physical segment shares one open SegmentCore.
+      // The publisher's (the writer's) comes first: it opened the segment for
+      // deletes, a merge or an overlay build, possibly while a reader opened
+      // it too, so preferring it converges all holders by the next reopen.
+      // Then the previous snapshot's, when the base files are identical (a
+      // delete or overlay commit leaves them unchanged); without descriptors
+      // the identity is unknown and nothing is shared. The rest open together,
+      // so their catalogs are acquired in one round.
+      std::vector<std::shared_ptr<SegmentCore>> segmentCores(indexInfo.segments.size());
+      std::vector<const luxir::api::SegmentInfo*> opening;
+      std::vector<const PhysicalCore::Bundle*> prevSegs(indexInfo.segments.size());
+      for (size_t i = 0; i < indexInfo.segments.size(); i++) {
+        const auto& segment = indexInfo.segments[i];
+        const auto& files = core->segmentFiles[i];
+        const auto* prevSeg = prevSegs[i] = previous ? previous->bundle(segment.seg_id) : nullptr;
+        const auto* prevFiles = prevSeg ? &previous->segmentFiles[(size_t)prevSeg->ord] : nullptr;
+        auto& segmentCore = segmentCores[i];
+        if (i < published.size()) {
+          segmentCore = published[i].lock();
+          if (segmentCore && (segmentCore->rootReader().maxDoc() != segment.max_doc
+                              || segmentCore->catalogRange() != files.catalog)) segmentCore = nullptr;
+        }
+        if (!segmentCore && prevSeg && !files.files.empty() && prevFiles->files == files.files
+            && prevFiles->catalog == files.catalog && prevFiles->maxDoc == segment.max_doc) {
+          segmentCore = prevSeg->core;
+        }
+        if (!segmentCore) opening.push_back(&segment);
+      }
+      if (!opening.empty()) {
+        auto opened = SegmentCore::create(dir, opening, missingFileOK, true);
+        auto next = opened.begin();
+        for (auto& segmentCore : segmentCores) {
+          if (!segmentCore) segmentCore = std::move(*next++);
+        }
+      }
+
       segs.reserve(indexInfo.segments.size());
       for (int i = 0; i < (int)indexInfo.segments.size(); i++) {
         const auto& segment = indexInfo.segments[i];
@@ -343,27 +379,10 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
         int32_t nDocs = segment.max_doc;
         const auto& files = core->segmentFiles[i];
 
-        // Every holder of a physical segment shares one open SegmentCore.
-        // The publisher's (the writer's) comes first: it opened the segment for
-        // deletes, a merge or an overlay build, possibly while a reader opened
-        // it too, so preferring it converges all holders by the next reopen.
-        // Then the previous snapshot's, when the base files are identical (a
-        // delete or overlay commit leaves them unchanged); without descriptors
-        // the identity is unknown and nothing is shared. Live docs carry over
-        // when the generation's file is unchanged.
-        const auto* prevSeg = previous ? previous->bundle(segId) : nullptr;
+        // Live docs carry over when the generation's file is unchanged.
+        const auto* prevSeg = prevSegs[(size_t)i];
         const auto* prevFiles = prevSeg ? &previous->segmentFiles[(size_t)prevSeg->ord] : nullptr;
-        std::shared_ptr<SegmentCore> segmentCore;
-        if ((size_t)i < published.size()) {
-          segmentCore = published[i].lock();
-          if (segmentCore && (segmentCore->rootReader().maxDoc() != nDocs
-                              || segmentCore->catalogRange() != files.catalog)) segmentCore = nullptr;
-        }
-        if (!segmentCore && prevSeg && !files.files.empty() && prevFiles->files == files.files
-            && prevFiles->catalog == files.catalog && prevFiles->maxDoc == nDocs) {
-          segmentCore = prevSeg->core;
-        }
-        if (!segmentCore) segmentCore = SegmentCore::create(dir, segment, missingFileOK, true);
+        auto segmentCore = std::move(segmentCores[i]);
         if (!segmentCore) {
           // Failed to create SegmentCore (segment files not found) - trigger retry
           retry = true;
