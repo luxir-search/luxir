@@ -2700,11 +2700,6 @@ message FieldDef {
   // magnitudes above 65504. Applies to newly written segments.
   optional VectorEncoding encoding = 20;
 
-  // VECTOR only. Also keep the submitted float32 vectors in a separate cold
-  // column that searches never read, so the field can be re-encoded later.
-  // Unset inherits, falling back to false.
-  optional bool keep_original = 21;
-
   // VECTOR only: ANN overlay settings. Absent inherits the parent's whole
   // definition (no per-property merge), else every VectorAnnDef default.
   VectorAnnDef ann = 22;

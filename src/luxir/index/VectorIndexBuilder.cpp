@@ -164,13 +164,11 @@ bool shouldNormalizeForFaiss(const VectorFieldType& ft) {
 }
 
 // Whether the vectors a segment feeds to FAISS need L2 normalization: cosine
-// over a raw column, over the raw keep_original column, or over a quantized
-// column (a quantized unit vector is only approximately unit length).
-bool normalizeSegmentForFaiss(const VectorFieldType& ft, const VectorReader& source,
-                              bool fromOriginal) {
-  if (ft.metric_ != VectorFieldType::METRIC_COSINE) return false;
-  if (source.encoding() != VectorEncoding::F32) return true;
-  return !ft.normalized_ && (fromOriginal || !ft.normalizeOnWrite_);
+// over a raw column, or over a quantized column (a quantized unit vector is
+// only approximately unit length).
+bool normalizeSegmentForFaiss(const VectorFieldType& ft, const VectorReader& source) {
+  return shouldNormalizeForFaiss(ft)
+      || (ft.metric_ == VectorFieldType::METRIC_COSINE && source.encoding() != VectorEncoding::F32);
 }
 
 // Minimum rows per build task: FAISS routes a batch to BLAS only from
@@ -284,11 +282,7 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
     auto* info = pr.fieldInfo(fieldName);
     if (!info || !info->bytesColumn() || FieldType::storage(info->type) != FieldType::Storage::VECTOR) continue;
 
-    // The keep_original column, when aligned with the encoded one, is the
-    // full-precision input for training and adds.
-    const DecodedFieldRecord* original = findOriginalColumn(pr, *info);
-    bool fromOriginal = original != nullptr;
-    VectorReader vr(pr, fromOriginal ? *original : *info);
+    VectorReader vr(pr, *info);
     int32_t segDims = vr.dims();
     if (segDims <= 0) continue;
     if (dims == 0) {
@@ -299,7 +293,7 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
         fieldName, dims, Postings::segmentKey(seg.segId, seg.creatorEpoch), segDims));
     }
 
-    if (!fn(seg, vr, fromOriginal)) return false;
+    if (!fn(seg, vr)) return false;
   }
   return true;
 }
@@ -367,9 +361,7 @@ VectorIndexBuilder::collectEligibleFields() {
     auto& reader = *seg.postingsReader;
     for (int32_t ordinal = 0; ordinal < reader.numFields(); ++ordinal) {
       auto header = reader.fieldHeader(ordinal);
-      // keep_original companions are inputs to their field's build, not fields.
-      if (header.parts.has(FieldPart::COLUMN) && header.type == FieldType::VECTOR
-          && !VectorFieldType::isOriginalColumnName(std::string_view(header.name))) {
+      if (header.parts.has(FieldPart::COLUMN) && header.type == FieldType::VECTOR) {
         seen.emplace(std::string_view(header.name));
       }
     }
@@ -461,7 +453,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   int64_t ntotal = 0;
 
   forEachVectorSegment(segments_, fieldName, dims,
-      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr, bool) {
+      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
     ntotal += vr.numVectors();
     return true;
   });
@@ -516,9 +508,9 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   int64_t globalStart = 0;
   int64_t nextSampleOrd = 0;
   forEachVectorSegment(segments_, fieldName, dims,
-      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr, bool fromOriginal) {
+      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
     appendTrainingVectors(training, sampleCap, nextSampleOrd, ntotal,
-                          globalStart, vr, dims, normalizeSegmentForFaiss(ft, vr, fromOriginal));
+                          globalStart, vr, dims, normalizeSegmentForFaiss(ft, vr));
     globalStart += vr.numVectors();
     return nextSampleOrd < sampleCap;
   });
@@ -615,8 +607,8 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   std::vector<float> amplitudes((size_t)ntotal * amplitudeCount);
   auto* flat = static_cast<faiss::IndexFlat*>(index->quantizer);
   forEachVectorSegment(segments_, fieldName, dims,
-      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr, bool fromOriginal) {
-    bool normalize = normalizeSegmentForFaiss(ft, vr, fromOriginal);
+      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
+    bool normalize = normalizeSegmentForFaiss(ft, vr);
     bool decode = vr.encoding() != VectorEncoding::F32;
     int64_t capacity = std::min(chunkRows, vr.numVectors());
     if (decode) decoded.resize((size_t)capacity * dims);

@@ -72,15 +72,6 @@ quantized unit vector is not exactly unit length. The scoring loops are
 scalar today; SIMD kernels and a per-vector norm sidecar can replace them
 behind `VectorScorer` without changing the format contract.
 
-`keep_original` writes the submitted float32 vectors, before cosine
-normalization, to a companion column named `<field>__#orig` (an invalid
-variant label, so schema lookups and field discovery never resolve it). It is
-written in lockstep with the encoded column and merged like any column, so the
-two stay aligned rank for rank. The query path never reads it. Readers use it
-only when its value and document counts equal the encoded column's: enabling
-`keep_original` on an existing field leaves older segments without it, and a
-merge that mixes them produces a partial companion, which is ignored.
-
 ## Overlay Lifecycle
 
 Vector aux indexes are recorded as segment overlays in the commit
@@ -335,10 +326,9 @@ PQ floor, and the exact path keeps small segments exact.
 
 The training set is a strided sample across the segment's vector values, not
 a prefix sample. This avoids training only on the oldest values when data
-inside a segment is time ordered. The builder reads the `keep_original`
-column when it is present and aligned, else decodes the encoded column, and
+inside a segment is time ordered. The builder decodes the column and
 normalizes vectors for FAISS when the field uses cosine and its input is raw
-(a raw column, the original column, or a quantized column).
+(a raw column or a quantized column).
 
 The sample holds `ivfTrainingPointsPerCentroid` (100) vectors per trained
 centroid: the IVF lists for RaBitQ, and the larger of the lists and the 2^bits

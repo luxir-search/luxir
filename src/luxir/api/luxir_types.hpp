@@ -322,7 +322,6 @@ struct FieldDef {
   std::optional<bool> stored;
   std::optional<bool> normalized;
   std::optional<bool> normalize_on_write;
-  std::optional<bool> keep_original;
   std::optional<bool> ignore_malformed;
   std::optional<bool> ignore_z_value;
   std::optional<bool> reverse_map;

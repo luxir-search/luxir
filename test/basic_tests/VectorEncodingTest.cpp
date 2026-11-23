@@ -47,7 +47,6 @@ Vec docVec(int i) {
 struct Fields {
   api::VectorMetric metric = api::VectorMetric::L2;
   api::VectorEncoding encoding = api::VectorEncoding::F32;
-  bool keepOriginal = false;
   bool multi = false;
   std::optional<api::VectorAnnDef> ann = std::nullopt;
 };
@@ -62,7 +61,6 @@ void installFields(Collection& col, const Fields& f) {
     def.metric = f.metric;
     def.encoding = encoding;
     if (f.multi) def.multi = api::FieldDef::MultiMode::ARRAY;
-    if (encoding == f.encoding) def.keep_original = f.keepOriginal;
     if (f.ann) {
       def.dims = DIMS;
       def.ann = f.ann;
@@ -298,88 +296,25 @@ TEST_F(VectorEncodingTest, promotionToF32RenormalizesCosine) {
   }
 }
 
-// keep_original stores the submitted floats (before cosine normalization) in
-// a cold column, carried by merges; retrieval returns them.
-TEST_F(VectorEncodingTest, keepOriginalSurvivesMerge) {
-  CollectionHelper h("main");
-  installFields(h.collection(), {.metric = api::VectorMetric::COSINE,
-                                 .encoding = api::VectorEncoding::INT8, .keepOriginal = true});
-  Vec raw = {3, 4, 0, 0, 0, 0, 0, 0};
-  h.index(flatdoc("id", std::string("raw"), "ref_v", raw, "enc_v", raw));
-  h.commit();
-  indexDocs(h, 0, 10);
-  h.commit();
-  h.getIndexWriter()->mergeSegments();
-  h.commit();
-
-  std::string original = VectorFieldType::originalColumnName("enc_v");
-  auto originals = rows(h, original);
-  ASSERT_EQ(11u, originals.size());
-  EXPECT_TRUE(std::ranges::binary_search(
-      originals, std::string((const char*)raw.data(), raw.size() * sizeof(float))));
-  EXPECT_EQ(rows(h, "ref_v").size(), originals.size());
-
-  auto* req = LocalReq::create(luxirNode->getSearchEngine());
-  req->collection("main").topDocs("q").allQuery().fields({"id", "enc_v"}).limit(-1);
-  req->execute();
-  ASSERT_TRUE(req->ok()) << req->errorMsg();
-  bool found = false;
-  for (const auto& doc : req->getDocs()) {
-    if (std::get<std::string>(*find(doc, "id")) != "raw") continue;
-    found = true;
-    EXPECT_EQ(raw, std::get<Vec>(*find(doc, "enc_v")));
-  }
-  EXPECT_TRUE(found);
-  req->done();
-  EXPECT_EQ(knnIds("ref_v", 5), knnIds("enc_v", 5));
-}
-
-// Enabling keep_original later leaves a partial companion after a merge; it
-// is not aligned, so readers ignore it.
-TEST_F(VectorEncodingTest, partialOriginalColumnIsIgnored) {
-  CollectionHelper h("main");
-  installFields(h.collection(), {.encoding = api::VectorEncoding::INT8});
-  indexDocs(h, 0, 10);
-  h.commit();
-  installFields(h.collection(), {.encoding = api::VectorEncoding::INT8, .keepOriginal = true});
-  indexDocs(h, 10, 20);
-  h.commit();
-  h.getIndexWriter()->mergeSegments();
-  h.commit();
-
-  auto r = reader(h);
-  ASSERT_EQ(1u, r->segments().size());
-  auto& pr = r->segments()[0].postingsReader();
-  const DecodedFieldRecord* found = pr.fieldInfo("enc_v");
-  ASSERT_NE(nullptr, found);
-  EXPECT_EQ(nullptr, findOriginalColumn(pr, *found));
-  const DecodedFieldRecord* original = pr.fieldInfo(VectorFieldType::originalColumnName("enc_v"));
-  ASSERT_NE(nullptr, original);
-  EXPECT_EQ(10, original->numValues);
-}
-
-// IVF+PQ overlays build from f16 / int8 columns (and from the original
-// column when kept); rescored ANN results match exact search.
+// IVF+PQ overlays build from f16 / int8 columns; rescored ANN results match
+// exact search.
 TEST_F(VectorEncodingTest, annOverlayBuildsFromEncodedColumn) {
   IvfTestGuard guard(/*minTraining=*/16);
   for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::INT8}) {
-    for (bool keep : {false, true}) {
-      CollectionHelper h("main");
-      h.clear();
-      installFields(h.collection(), {.metric = api::VectorMetric::COSINE,
-                                     .encoding = encoding, .keepOriginal = keep,
-                                     .ann = smallPqAnn()});
-      for (int i = 0; i < 160; i++) {
-        Vec v = docVec(i % 30);
-        v[(size_t)(i % DIMS)] += 0.001f * (float)i;
-        h.index(flatdoc("id", "d" + std::to_string(i), "enc_v", v));
-      }
-      h.commit({"vec.enc_v"});
-      auto r = reader(h);
-      ASSERT_EQ(1u, r->segments().size());
-      EXPECT_NE(nullptr, r->segments()[0].getAuxReader("vec.enc_v"));
-      EXPECT_EQ(knnIds("enc_v", 5, true), knnIds("enc_v", 5, false, /*refine=*/320));
+    CollectionHelper h("main");
+    h.clear();
+    installFields(h.collection(), {.metric = api::VectorMetric::COSINE, .encoding = encoding,
+                                   .ann = smallPqAnn()});
+    for (int i = 0; i < 160; i++) {
+      Vec v = docVec(i % 30);
+      v[(size_t)(i % DIMS)] += 0.001f * (float)i;
+      h.index(flatdoc("id", "d" + std::to_string(i), "enc_v", v));
     }
+    h.commit({"vec.enc_v"});
+    auto r = reader(h);
+    ASSERT_EQ(1u, r->segments().size());
+    EXPECT_NE(nullptr, r->segments()[0].getAuxReader("vec.enc_v"));
+    EXPECT_EQ(knnIds("enc_v", 5, true), knnIds("enc_v", 5, false, /*refine=*/320));
   }
 }
 

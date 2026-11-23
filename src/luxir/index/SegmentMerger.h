@@ -2211,8 +2211,8 @@ private:
   // them) are written in the schema's current encoding, transcoding the
   // others, so a field converges to its declared encoding.  Transcoding clamps
   // to the F16 range and renormalizes unit-length cosine rows written as F32.
-  // Columns without a vector field type (the keep_original companion) keep
-  // the first input's encoding.
+  // A field the schema no longer types as a vector keeps the first input's
+  // encoding.
   std::optional<WrittenColumn<field_parts::BytesColumn>> mergeStrCol(const Space& space, std::span<MergeFieldInfo*> sortedFields,
                                                                      int32_t flags, std::string_view fieldName) {
     assert(sortedFields.size() == space.segs.size());

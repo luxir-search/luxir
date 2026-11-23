@@ -1305,27 +1305,27 @@ TEST_F(HttpApiTest, vectorDocumentsRoundTripOverJson) {
   EXPECT_NE(partial.body().find("embedding"), std::string::npos) << partial.body();
 }
 
-// An int8 field scores against its quantized column, while keep_original
-// returns the submitted floats; the schema echoes both settings.
+// An int8 field scores against its quantized column and returns the stored
+// values decoded; the schema echoes the setting.  These vectors quantize
+// exactly: a range of 255 is a scale of 1, and a constant vector is its offset.
 TEST_F(HttpApiTest, encodedVectorFieldOverJson) {
   auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
-    "fields": {"embedding": {"type":"vector", "metric":"l2", "encoding":"int8", "keep_original":true}}
+    "fields": {"embedding": {"type":"vector", "metric":"l2", "encoding":"int8"}}
   })");
   ASSERT_EQ(200, schema.result_int()) << schema.body();
   auto get = httpRequest(port(), http::verb::get, "/collections/main/_schema", "");
   EXPECT_NE(get.body().find(R"("encoding": "int8")"), std::string::npos) << get.body();
-  EXPECT_NE(get.body().find(R"("keep_original": true)"), std::string::npos) << get.body();
 
   auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
-      R"({"docs":[{"id":"a","embedding":[0.1,0.7,0.3]},{"id":"b","embedding":[5,5,5]}],"commit":{}})");
+      R"({"docs":[{"id":"a","embedding":[1,256,52]},{"id":"b","embedding":[300,300,300]}],"commit":{}})");
   ASSERT_EQ(200, update.result_int()) << update.body();
 
   auto search = httpRequest(port(), http::verb::post, "/collections/main/_search",
-      R"({"query":{"knn":{"field":"embedding","query":[0,1,0],"k":1,"exact":true}},)"
+      R"({"query":{"knn":{"field":"embedding","query":[0,255,50],"k":1,"exact":true}},)"
       R"("fields":["id","embedding"]})");
   ASSERT_EQ(200, search.result_int()) << search.body();
   EXPECT_NE(search.body().find(R"("id":"a")"), std::string::npos) << search.body();
-  EXPECT_NE(search.body().find(R"("embedding":[0.1,0.7,0.3])"), std::string::npos)
+  EXPECT_NE(search.body().find(R"("embedding":[1,256,52])"), std::string::npos)
       << search.body();
 
   auto bad = httpRequest(port(), http::verb::post, "/collections/main/_schema",

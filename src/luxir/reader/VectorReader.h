@@ -9,7 +9,6 @@
 #include <stdexcept>
 #include "StrColReader.h"
 #include "luxir/codec/VectorCodec.h"
-#include "luxir/schema/FieldType.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/screaming.h"
 
@@ -143,25 +142,6 @@ inline screaming::BitSet::Selector* makeValueDocSelector(MemPool& pool,
                                                          const screaming::BitSet& bitset) {
   return pool.make<screaming::BitSet::Selector>(
       bitset, pool.make_span<int32_t>((size_t)bitset.nBuckets + 1));
-}
-
-/// Finds a vector field's keep_original companion column in one segment, or
-/// null when it is missing or not aligned value-for-value with the encoded
-/// column.  The two are written in lockstep, so equal value and doc counts
-/// mean every encoded value has its original at the same rank; a segment
-/// merged from inputs written before keep_original was enabled holds a
-/// partial companion, which is ignored.
-inline const DecodedFieldRecord* findOriginalColumn(PostingsReader& postingsReader,
-                                                    const DecodedFieldRecord& encoded) {
-  std::string name = VectorFieldType::originalColumnName((std::string_view)encoded.name);
-  const DecodedFieldRecord* original = postingsReader.fieldInfo(name);
-  if (original == nullptr || original->type != FieldType::VECTOR) return nullptr;
-  const auto* bytes = original->bytesColumn();
-  if (bytes == nullptr || bytes->vectorEncoding != (uint8_t)VectorEncoding::F32) return nullptr;
-  if (original->numValues != encoded.numValues || original->docsWithField != encoded.docsWithField) {
-    return nullptr;
-  }
-  return original;
 }
 
 } // namespace luxir

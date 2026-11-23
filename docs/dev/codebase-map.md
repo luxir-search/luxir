@@ -165,7 +165,7 @@ locations, browse `src/luxir/<area>/`.
      (`codec/VectorCodec.h`: f32, f16, per-vector int8) for exact flat KNN
    - `VectorScorer` (`query/`): the one place a float query is scored against a stored row
      per encoding, shared by the flat column scan and candidate rescore
-   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (RaBitQ by default, or explicit PQ) aux overlays for ANN, built from the decoded column or the `keep_original` companion column
+   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (RaBitQ by default, or explicit PQ) aux overlays for ANN, built from the decoded column
    - `util/VectorRotation.h`: seeded orthogonal FHT-Kac transform shared by ANN builders, readers and queries; parameters define the rotation disk contract.
    - Reuses column storage for exact search, cosine raw-column normalization, and candidate rescoring
    - See [../guide/vector-search.md](../guide/vector-search.md) for the user contract (query knobs, scoring, recall) and [../design/vector-search.md](../design/vector-search.md) for the overlay/build/query internals

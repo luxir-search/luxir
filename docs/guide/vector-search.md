@@ -202,26 +202,20 @@ vectors you submitted. Cosine over `f16` and `int8` divides by the norm of the
 stored vector, so scores remain cosines. Vectors read back in `fields` are the
 stored values decoded to float32.
 
-Set `keep_original: true` to also keep the submitted float32 vectors in a
-separate column. Searches never read it; it costs `4 * dims` bytes per vector
-of disk but no page cache in normal operation. Approximate indexes are built
-from it when it is present, reading a field back returns the submitted values
-(before cosine normalization), and it lets you re-encode the field later from
-the exact input.
-
-`encoding` and `keep_original` apply to segments written after the change.
+`encoding` applies to segments written after the change.
 Existing segments keep the encoding they were written with, and a merge of
 segments with different encodings rewrites them in the field's current
 encoding, so a field converges to its declared encoding over time. Moving to a
-narrower encoding is lossy and cannot be undone without the original input
-(see `keep_original`). Under f16 or int8 storage, `exact` and `similarity`
-cut-offs compare scores computed over the quantized values.
+narrower encoding is lossy. Under f16 or int8 storage, `exact` and
+`similarity` cut-offs compare scores computed over the quantized values.
+
+To keep more than one precision of the same input, such as a compact field
+for search beside an `f32` copy, declare a [variant](schema.md#field-variants)
+with its own `encoding`.
 
 With
 [`truncate_dims`](#truncate-matryoshka-embeddings), `dims` in the table
-above is the truncated dimension: the encoded column and the `keep_original`
-column both store the truncated vector (the latter before cosine
-normalization).
+above is the truncated dimension.
 
 ### Truncate Matryoshka embeddings
 
@@ -720,10 +714,10 @@ Exact search costs one pass over the column per query. For large collections,
 a commit can build approximate nearest-neighbor indexes as segment overlays:
 an inverted-file (IVF) index whose lists hold RaBitQ codes by default, or
 explicit product-quantization (PQ) codes, built with FAISS. An overlay is built
-from the vector column (decoded from its encoding, or from the `keep_original`
-column when present), follows its segment through later commits and
-merges, and its candidates are always rescored from the stored column
-before they are returned. Building an overlay does not reindex documents.
+from the vector column (decoded from its encoding), follows its segment
+through later commits and merges, and its candidates are always rescored from
+the stored column before they are returned. Building an overlay does not
+reindex documents.
 
 ### Build at commit
 
