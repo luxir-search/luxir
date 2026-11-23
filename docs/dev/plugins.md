@@ -523,10 +523,14 @@ layer's counters. `StorageExampleTest` reaches `CountingRamBackend` and
 
 Run `luxir_test --store.layer=strict` to check readers against isolated range
 buffers with varying garbage in the slack. It reports acquisition counts
-(total and metadata), size requests, and peak live holds and bytes. The default
-`strict.whole_segment_files=count` allows whole-file reads for tests that copy
-or replicate files. Use `--store.option strict.whole_segment_files=deny` in
-focused reader tests to reject whole-file reads of base segment data files.
+(total and metadata), size requests on files opened without a size, and peak
+live holds and bytes. The default `strict.whole_segment_files=count` allows
+whole-file reads for tests that copy or replicate files. Use
+`--store.option strict.whole_segment_files=deny` in focused reader tests to
+reject whole-file reads of base segment data files. In those files a read no
+part makes also counts as whole-file: one from offset 0 past the header, or
+one to EOF outside file 0, since the writer pads every other file after its
+last part.
 
 ## Result decorators
 

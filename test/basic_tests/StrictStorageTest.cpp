@@ -144,6 +144,25 @@ TEST(StrictStorageTest, deniesWholeBaseSegmentFiles) {
   }
 }
 
+// Reads no part makes count as whole-file reads: from offset 0 past the
+// header, and to EOF outside file 0, whose catalog runs to EOF.
+TEST(StrictStorageTest, deniesReadsNoSegmentPartMakes) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters, StrictWholeFiles::DENY);
+  auto header = Postings::LUXIR_HEADER.size();
+  for (uint32_t number : {0u, 1u}) {
+    auto name = Postings::getIndexFileName(Postings::segmentKey(1, 1), number);
+    put(dir, name);
+    auto file = dir.openFile(name);
+    auto size = file->size();
+    EXPECT_NO_THROW(file->acquire({0, header}));
+    EXPECT_THROW(file->acquire({0, header + 1}), FileIOException);
+    EXPECT_NO_THROW(file->acquire({header, size - header - 1}));
+    if (number == 0) EXPECT_NO_THROW(file->acquire({header, size - header}));
+    else EXPECT_THROW(file->acquire({header, size - header}), FileIOException);
+  }
+}
+
 TEST(StrictStorageTest, wrapsVerifiedMappingAfterDirectoryCloses) {
   auto counters = std::make_shared<StrictStorageCounters>();
   std::shared_ptr<InputFile> file;
