@@ -1,10 +1,10 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#include <cstring>
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <cfloat>
 #include <cmath>
 #include <map>
@@ -17,6 +17,7 @@
 #include "luxir/reader/VectorReader.h"
 #include "luxir/schema/Schema.h"
 #include "test/CollectionHelper.h"
+#include "test/KnnTestUtils.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/QueryBuild.h"
@@ -31,6 +32,8 @@ namespace api = luxir::api;
 namespace {
 
 constexpr int32_t DIMS = 8;
+// More lists than any overlay below has: probes every list.
+constexpr int32_t ALL_LISTS = 1 << 16;
 using Vec = std::vector<float>;
 using Vecs = std::vector<Vec>;
 
@@ -92,12 +95,34 @@ void indexDocs(CollectionHelper& h, int begin, int end) {
   }
 }
 
+// Doc i's vectors for a multi-valued field: none for every fourth doc, else
+// two or three.
+Vecs docVecs(int i) {
+  Vecs out;
+  if (i % 4 == 0) return out;
+  for (int j = 0; j < 2 + i % 2; j++) out.push_back(docVec((i + 11 * j) % 30));
+  return out;
+}
+
+// Indexes docs [begin, end) into a multi-valued enc_v, recording each doc's
+// vectors as a column of encoding e stores them.
+void indexMulti(CollectionHelper& h, int begin, int end, api::VectorEncoding e,
+                std::map<std::string, Vecs>& expected) {
+  for (int i = begin; i < end; i++) {
+    std::string id = "m" + std::to_string(i);
+    Vecs vecs = docVecs(i);
+    h.index(vecs.empty() ? flatdoc("id", id) : flatdoc("id", id, "enc_v", vecs));
+    auto& out = expected[id];
+    for (const auto& v : vecs) out.push_back(stored(e, v));
+  }
+}
+
 std::vector<std::string> knnIds(std::string_view field, int32_t k, bool exact = true,
                                 int32_t refine = 0, const Vec& query = QUERY) {
   auto* req = LocalReq::create(LuxirTest::luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.getScores().countLimit().fields({"id"});
-  cur.rawQuery() = qb::knn(cur.mr(), field, query, k, /*nprobe=*/0, exact, refine);
+  cur.rawQuery() = qb::knn(cur.mr(), field, query, k, ALL_LISTS, exact, refine);
   req->execute();
   EXPECT_TRUE(req->ok()) << req->errorMsg();
   std::vector<std::string> ids;
@@ -146,22 +171,6 @@ void mergeAll(CollectionHelper& h) {
   ASSERT_EQ(1u, reader(h)->segments().size());
 }
 
-// Every stored row of a column across segments, sorted (merge-order free).
-std::vector<std::string> rows(CollectionHelper& h, std::string_view field,
-                              VectorEncoding* encoding = nullptr) {
-  std::vector<std::string> out;
-  auto r = reader(h);
-  for (auto& seg : r->segments()) {
-    const DecodedFieldRecord* found = seg.postingsReader().fieldInfo(field);
-    if (!found) continue;
-    VectorReader vr(seg.postingsReader(), *found);
-    if (encoding) *encoding = vr.encoding();
-    for (int64_t i = 0; i < vr.numVectors(); i++) out.emplace_back(vr.rowAtRank(i));
-  }
-  std::sort(out.begin(), out.end());
-  return out;
-}
-
 // Small IVF+PQ overlay settings for the tiny test corpus.
 api::VectorAnnDef smallPqAnn() {
   api::VectorAnnDef ann;
@@ -187,9 +196,9 @@ TEST_F(VectorEncodingTest, codecRoundTrip) {
   std::vector<char> buf(64);
   Vec out(v.size());
 
-  vcodec::encode(VectorEncoding::F16, v.data(), DIMS, buf.data());
-  vcodec::decode(VectorEncoding::F16, buf.data(), DIMS, out.data());
-  EXPECT_EQ(v, out);  // all exactly representable in binary16
+  // All exactly representable in binary16 and bfloat16.
+  EXPECT_EQ(v, stored(api::VectorEncoding::F16, v));
+  EXPECT_EQ(v, stored(api::VectorEncoding::BF16, v));
 
   vcodec::encode(VectorEncoding::SQ8, v.data(), DIMS, buf.data());
   vcodec::decode(VectorEncoding::SQ8, buf.data(), DIMS, out.data());
@@ -204,8 +213,33 @@ TEST_F(VectorEncodingTest, codecRoundTrip) {
   EXPECT_EQ(constant, out);
 
   EXPECT_EQ(16, vcodec::bytesPerVector(VectorEncoding::SQ8, DIMS));
+  EXPECT_EQ(16, vcodec::bytesPerVector(VectorEncoding::BF16, DIMS));
   EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::SQ8, 16));
   EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::F16, 16));
+  EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::BF16, 16));
+  EXPECT_EQ(-1, vcodec::dimsFromBytes(VectorEncoding::BF16, 15));
+  EXPECT_EQ(-1, vcodec::dimsFromBytes(VectorEncoding::SQ8, vcodec::SQ8_HEADER_BYTES));
+  EXPECT_FALSE(vcodec::valid((int32_t)VectorEncoding::SQ8 + 1));
+}
+
+// bf16 keeps the high half of the float bits, rounded to nearest even.
+TEST_F(VectorEncodingTest, bf16RoundsToNearestEven) {
+  auto bf16 = [](uint32_t bits) {
+    float x = std::bit_cast<float>(bits);
+    uint16_t out;
+    vcodec::encode(VectorEncoding::BF16, &x, 1, (char*)&out);
+    return out;
+  };
+  EXPECT_EQ(0x3F80, bf16(0x3F808000));  // tie, even: down
+  EXPECT_EQ(0x3F82, bf16(0x3F818000));  // tie, odd: up to even
+  EXPECT_EQ(0x3F81, bf16(0x3F808001));  // above the tie: up
+  EXPECT_EQ(0x3F80, bf16(0x3F807FFF));  // below the tie: down
+  EXPECT_EQ(0xBF82, bf16(0xBF818000));  // the sign does not change rounding
+  EXPECT_EQ(0x3F80, bf16(0x3F7FFFFF));  // rounding up carries into the exponent
+  uint16_t h = 0x3FC0;
+  float x;
+  vcodec::decode(VectorEncoding::BF16, (const char*)&h, 1, &x);
+  EXPECT_EQ(1.5f, x);
 }
 
 // f16, bf16 and sq8 rows score exactly like f32 scoring of the decoded
@@ -295,43 +329,48 @@ TEST_F(VectorEncodingTest, exactKnnMatchesF32Ranking) {
   }
 }
 
-// Merging same-encoding segments copies the encoded bytes verbatim.
+// Merging same-encoding segments copies the stored values: multi-valued,
+// sparse, with deletes, every live doc keeps its vectors in order.
 TEST_F(VectorEncodingTest, mergeCopiesEncodedBytes) {
   CollectionHelper h("main");
   installFields(h.collection(), {.encoding = api::VectorEncoding::SQ8, .multi = true});
-  for (int k = 0; k < 3; k++) {
-    indexDocs(h, k * 10, k * 10 + 10);
+  std::map<std::string, Vecs> expected;
+  for (int seg = 0; seg < 3; seg++) {
+    indexMulti(h, seg * 12, seg * 12 + 12, api::VectorEncoding::SQ8, expected);
     h.commit();
   }
-  auto before = rows(h, "enc_v");
-  auto idsBefore = knnIds("enc_v", 10);
-  h.getIndexWriter()->mergeSegments();
-  h.commit();
-  ASSERT_EQ(1u, reader(h)->segments().size());
-  VectorEncoding encoding;
-  EXPECT_EQ(before, rows(h, "enc_v", &encoding));
-  EXPECT_EQ(VectorEncoding::SQ8, encoding);
-  EXPECT_EQ(idsBefore, knnIds("enc_v", 10));
+  h.deleteByIds({"m5", "m14", "m30"}, UpdateMessage::COMMIT);
+  for (auto id : {"m5", "m14", "m30"}) expected.erase(id);
+  EXPECT_EQ(expected, retrieved());
+  mergeAll(h);
+  EXPECT_EQ(std::vector{VectorEncoding::SQ8}, segmentEncodings(h));
+  EXPECT_EQ(expected, retrieved());
 }
 
 // A schema change between segments: the merge converges to the schema's
-// current encoding, transcoding the older input.
+// current encoding, copying the input already in it and re-encoding the
+// others (multi-valued, sparse, with deletes).
 TEST_F(VectorEncodingTest, mixedEncodingMergeUsesSchemaEncoding) {
   CollectionHelper h("main");
-  installFields(h.collection(), {.encoding = api::VectorEncoding::F16});
-  indexDocs(h, 0, 15);
-  h.commit();
-  installFields(h.collection(), {.encoding = api::VectorEncoding::SQ8});
-  indexDocs(h, 15, 30);
-  h.commit();
-  h.getIndexWriter()->mergeSegments();
-  h.commit();
-
-  VectorEncoding encoding;
-  auto merged = rows(h, "enc_v", &encoding);
-  EXPECT_EQ(VectorEncoding::SQ8, encoding);
-  EXPECT_EQ(30u, merged.size());
-  EXPECT_EQ(knnIds("ref_v", 10), knnIds("enc_v", 10));
+  std::map<std::string, Vecs> written;
+  int next = 0;
+  for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::SQ8, api::VectorEncoding::F32,
+                        api::VectorEncoding::BF16}) {
+    installFields(h.collection(), {.encoding = encoding, .multi = true});
+    indexMulti(h, next, next + 10, encoding, written);
+    next += 10;
+    h.commit();
+  }
+  h.deleteByIds({"m3", "m17", "m38"}, UpdateMessage::COMMIT);
+  for (auto id : {"m3", "m17", "m38"}) written.erase(id);
+  EXPECT_EQ(written, retrieved());
+  mergeAll(h);
+  EXPECT_EQ(std::vector{VectorEncoding::BF16}, segmentEncodings(h));
+  auto expected = written;
+  for (auto& [id, vecs] : expected) {
+    for (auto& v : vecs) v = stored(api::VectorEncoding::BF16, v);
+  }
+  EXPECT_EQ(expected, retrieved());
 }
 
 // Promoting quantized cosine rows to f32 in a merge restores unit length.
@@ -343,20 +382,16 @@ TEST_F(VectorEncodingTest, promotionToF32RenormalizesCosine) {
   installFields(h.collection(), {.metric = api::VectorMetric::COSINE, .encoding = api::VectorEncoding::F32});
   indexDocs(h, 15, 30);
   h.commit();
-  h.getIndexWriter()->mergeSegments();
-  h.commit();
+  mergeAll(h);
 
-  VectorEncoding encoding;
-  auto merged = rows(h, "enc_v", &encoding);
-  EXPECT_EQ(VectorEncoding::F32, encoding);
-  for (const auto& row : merged) {
+  EXPECT_EQ(std::vector{VectorEncoding::F32}, segmentEncodings(h));
+  auto docs = retrieved();
+  EXPECT_EQ(30u, docs.size());
+  for (const auto& [id, vecs] : docs) {
+    ASSERT_EQ(1u, vecs.size()) << id;
     float norm = 0;
-    for (int32_t j = 0; j < DIMS; j++) {
-      float x;
-      std::memcpy(&x, row.data() + j * sizeof(float), sizeof(float));
-      norm += x * x;
-    }
-    EXPECT_NEAR(1.0f, norm, 1e-5);
+    for (float x : vecs[0]) norm += x * x;
+    EXPECT_NEAR(1.0f, norm, 1e-5) << id;
   }
 }
 
@@ -384,11 +419,14 @@ TEST_F(VectorEncodingTest, mergeToF16Clamps) {
   EXPECT_EQ(Vecs{stored(api::VectorEncoding::F16, docVec(2))}, docs["small"]);
 }
 
-// IVF+PQ overlays build from f16 / bf16 / sq8 columns; rescored ANN results match
-// exact search.
+// IVF+PQ overlays build from f16, bf16 and sq8 columns.  The IVF path scans
+// PQ codes and rescores candidates from the encoded column; with every list
+// probed and every candidate refined, it returns the exact top-k.
 TEST_F(VectorEncodingTest, annOverlayBuildsFromEncodedColumn) {
+  ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
   for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::BF16, api::VectorEncoding::SQ8}) {
+    SCOPED_TRACE(vcodec::name((VectorEncoding)encoding));
     CollectionHelper h("main");
     h.clear();
     installFields(h.collection(), {.metric = api::VectorMetric::COSINE, .encoding = encoding,
@@ -402,7 +440,15 @@ TEST_F(VectorEncodingTest, annOverlayBuildsFromEncodedColumn) {
     auto r = reader(h);
     ASSERT_EQ(1u, r->segments().size());
     EXPECT_NE(nullptr, r->segments()[0].getAuxReader("vec.enc_v"));
-    EXPECT_EQ(knnIds("enc_v", 5, true), knnIds("enc_v", 5, false, /*refine=*/320));
+
+    auto exact = knnIds("enc_v", 5, true);
+    KnnQuery::Stats stats;
+    SearchOverridesGuard counters(KnnQuery::statsForTests);
+    KnnQuery::statsForTests = &stats;
+    EXPECT_EQ(exact, knnIds("enc_v", 5, false, /*refine=*/320));
+    EXPECT_GT(stats.pqScores.load(), 0);
+    EXPECT_GT(stats.terminalReads.load(), 0);
+    EXPECT_EQ(0, stats.vectorsScored.load());
   }
 }
 
@@ -410,9 +456,15 @@ TEST_F(VectorEncodingTest, encodedFieldsValidateInput) {
   CollectionHelper h("main");
   installFields(h.collection(), {.encoding = api::VectorEncoding::F16});
   ExpectLog quiet({"f16 range", "non-finite"});
+  Vec edge(DIMS, 1.0f);
+  edge[0] = 65504.0f;
+  edge[1] = -65504.0f;
+  EXPECT_EQ(0, h.index(flatdoc("id", std::string("edge"), "enc_v", edge)).total_errors);
   Vec big(DIMS, 1.0f);
-  big[2] = 1.0e5f;
+  big[2] = -65505.0f;
   EXPECT_EQ(1, h.index(flatdoc("id", std::string("big"), "enc_v", big)).total_errors);
+  h.commit();
+  EXPECT_EQ(Vecs{edge}, retrieved()["edge"]);
 
   installFields(h.collection(), {.encoding = api::VectorEncoding::SQ8});
   Vec nan(DIMS, 1.0f);
@@ -420,7 +472,7 @@ TEST_F(VectorEncodingTest, encodedFieldsValidateInput) {
   EXPECT_EQ(1, h.index(flatdoc("id", std::string("nan"), "enc_v", nan)).total_errors);
   EXPECT_EQ(0, h.index(flatdoc("id", std::string("flat"), "enc_v", Vec(DIMS, 2.0f))).total_errors);
   h.commit();
-  EXPECT_EQ(std::vector<std::string>{"flat"}, knnIds("enc_v", 3));
+  EXPECT_EQ((std::vector<std::string>{"flat", "edge"}), knnIds("enc_v", 3));
 
   SchemaBuilder b;
   auto& f = b.field("title_s2");
