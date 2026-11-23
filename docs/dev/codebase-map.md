@@ -54,13 +54,13 @@ locations, browse `src/luxir/<area>/`.
 3. **Segment Reading** (`src/luxir/reader/`)
    - `SegmentCore` owns a segment bundle's open files, retained byte ranges and root
      VersionRuns, shared across snapshots and with the writer. `slice()` acquires
-     parts from the files, `slices()` acquires them in one batch per file, and
-     both retain holds that need release until the core closes. File 0's catalog indexes field records by row-space path (root is
-     the empty path) and field name. Each space has a
-     `PostingsReader` with its own row count and immutable, on-demand record cache.
-     Records contain counts, bounds and data slices. Numeric leaf metadata
-     and stored metadata are opened and cached separately. Codec cursors borrow
-     the space reader and its acquired bytes
+     parts from the files, `acquireSlices()` acquires them ahead in one batch per
+     file, and both retain holds that need release until the core closes. File 0's
+     catalog indexes field records by row-space path (root is the empty path) and
+     field name. Each space has a `PostingsReader` with its own row count and
+     immutable, on-demand record cache. Records contain counts, bounds and data
+     slices. Numeric leaf metadata and stored metadata are opened and cached
+     separately. Codec cursors borrow the space reader and its acquired bytes
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
      opening reads metadata and endpoints without scanning child rows.

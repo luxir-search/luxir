@@ -169,9 +169,9 @@ backend call, any lock that a batch completion takes: a backend that serves
 blocking acquires and completes batches on the same threads would deadlock.
 `SegmentCore::retain()` therefore acquires outside its holds lock.
 
-A segment reads every part through `SegmentCore::slice()`, or through
-`SegmentCore::slices()`, which issues one batch per file and keeps the holds
-the same way. A manifest open acquires each file's header, the catalog range,
+A segment reads every part through `SegmentCore::slice()`. Its
+`acquireSlices()` acquires parts ahead in one batch per file, skipping parts
+already held, and keeps the holds the same way. A manifest open acquires each file's header, the catalog range,
 the version runs and, for segments with nested spaces, the ownership ends and
 owners columns; never a whole segment file. A snapshot open issues one batch
 per new segment's file 0, holding its header and catalog, issues all of them
