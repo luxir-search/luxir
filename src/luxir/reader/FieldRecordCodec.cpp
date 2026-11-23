@@ -478,7 +478,7 @@ public:
         break;
       case FieldPart::FILTER:
         extents.add(io, slice);
-        if (!IdFilter::validSize(slice.bytes)) io.invalid("id filter size");
+        if (slice.bytes < IdFilter::HEADER_BYTES) io.invalid("id filter size");
         break;
       default: std::unreachable();
     }
