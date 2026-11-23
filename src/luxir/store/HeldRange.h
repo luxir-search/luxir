@@ -11,11 +11,12 @@
 
 namespace luxir {
 
-// What a range holds, so a cache or backend can treat the two differently.
-// METADATA is what a reader navigates by before it reads data: file headers,
-// the catalog, version runs, term block offsets and tries, and directories and
-// indexes over column and point blocks. Everything else is DATA. A backend
-// cannot tell them apart from the bytes.
+// What a range holds. METADATA is what a reader navigates by before it reads
+// data: file headers, the catalog, version runs, term block offsets and tries,
+// the stored-field chunk index, and directories and indexes over column and
+// point blocks. Everything else is DATA. Whoever keeps a hold decides how long
+// it lives; the class is a hint a cache or backend may use for residency and
+// scheduling after release. It never changes the bytes returned.
 enum class ReadClass : uint8_t { DATA, METADATA };
 
 struct ByteRange {

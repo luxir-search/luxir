@@ -38,9 +38,13 @@ private:
   };
   std::vector<BaseFile> files;
   // Holds must outlive the views below and release before files. A part is
-  // held once, under the read class of its first slice.
+  // held once; each part has one reader path, so its class does not vary.
+  struct Kept {
+    HeldRange hold;
+    ReadClass readClass;
+  };
   std::mutex holdsMutex;
-  std::map<std::pair<uint64_t, uint64_t>, HeldRange> holds;
+  std::map<std::pair<uint64_t, uint64_t>, Kept> holds;
   SegmentCatalog catalog;
   CatalogRange range;
   VersionRuns versions;

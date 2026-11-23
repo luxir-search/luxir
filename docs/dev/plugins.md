@@ -465,9 +465,11 @@ ETags) and answer `openFile` and `size()` from it, listing again when a name
 is missing, so neither existence nor size costs a request per file. With a
 passed size it needs the listing only for existence.
 
-Each `ByteRange` also carries a `ReadClass`, `METADATA`
-or `DATA`, which a backend may use to cache or schedule reads; it does not
-change what the range returns.
+Each `ByteRange` also carries a `ReadClass`, `METADATA` or `DATA`. Whoever
+keeps a hold decides how long it lives: the segment for what it keeps, a
+request for what it uses. The class is a hint a cache or backend may use for
+residency and scheduling after release, and it never changes the bytes
+returned.
 
 ### Storage layers
 

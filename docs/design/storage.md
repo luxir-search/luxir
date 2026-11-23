@@ -170,11 +170,13 @@ with a bounded cache.
   existence.
 - Each acquire carries a `ReadClass`. `METADATA` marks what a reader navigates
   by: file headers, the catalog, version runs, term block offsets and tries,
-  and the directories and indexes over column and point blocks. Everything
-  else, term blocks included, is `DATA`. A bounded cache can then keep
-  metadata for a segment's life and release data when a request ends. A part
-  is held once, under the class of its first slice; each part has one reader
-  path, so the class does not vary.
+  the stored-field chunk index, and the directories and indexes over column
+  and point blocks. Everything else, term blocks included, is `DATA`.
+  Whoever keeps a hold decides how long it lives: the segment for what it
+  keeps, a request for what it uses. The class is a hint a cache or backend
+  may use for residency and scheduling after release, and it never changes
+  the bytes returned. A part is held once; each part has one reader path, so
+  its class does not vary.
 
 The manifest identifies the segment catalog at the end of file 0 by offset,
 length and xxh3. The catalog holds a field table for each row space, then
