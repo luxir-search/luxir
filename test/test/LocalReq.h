@@ -262,6 +262,18 @@ public:
     const auto* dl = docList(opName);
     return dl ? convertResultsToDocs(*dl) : std::vector<Doc>{};
   }
+  // The op's documents from every streamed batch; getDocs() has only the first.
+  std::vector<Doc> getAllDocs(std::string_view opName = "q") const {
+    std::vector<Doc> docs;
+    for (const auto* response : responses) {
+      const auto* op = response->proto.ops.find(opName);
+      const auto* dl = op ? (**op).docList() : nullptr;
+      if (!dl) continue;
+      auto batch = convertResultsToDocs(*dl);
+      docs.insert(docs.end(), std::make_move_iterator(batch.begin()), std::make_move_iterator(batch.end()));
+    }
+    return docs;
+  }
   int64_t getMatchCount(std::string_view opName = "q") const {
     const auto* dl = docList(opName);
     return (dl && dl->found) ? *dl->found : 0;

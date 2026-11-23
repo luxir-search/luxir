@@ -435,7 +435,7 @@ inline std::vector<std::string> allIds(CollectionHelper& helper) {
   request->collection("main").topDocs("q").allQuery().fields({"id"}).limit(-1);
   request->execute();
   std::vector<std::string> ids;
-  for (const auto& doc : request->getDocs()) {
+  for (const auto& doc : request->getAllDocs()) {
     if (auto* value = find(doc, "id")) {
       ids.push_back(std::get<std::string>(*value));
     }

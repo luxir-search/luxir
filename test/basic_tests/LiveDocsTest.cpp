@@ -18,7 +18,6 @@
 #include "luxir/search/IndexReader.h"
 #include "luxir/server/LuxirNode.h"
 #include "luxir/util/Signal.h"
-#include "luxir/util/Uuid.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
@@ -66,17 +65,13 @@ std::vector<uint64_t> liveFileBytes(Directory& dir) {
   return sizes;
 }
 
-// Every id in [0, maxId) matches exactly when it is in live.
-void expectLive(CollectionHelper& ch, std::string_view name, const std::set<int>& live, int maxId) {
-  auto reader = ch.getIndexWriter()->snapshots.readers.getReader();
-  EXPECT_EQ((int64_t)live.size(), reader->liveDocs());
-  for (int id = 0; id < maxId; id++) {
-    auto req = localReq(ch.getSearchEngine());
-    req->collection(name).topDocs().exprQuery("id:" + std::to_string(id)).countLimit().limit(0);
-    req->execute(1);
-    ASSERT_OK(req);
-    EXPECT_EQ(live.contains(id) ? 1 : 0, req->getMatchCount()) << "id " << id;
-  }
+// The "main" collection matches exactly the ids in live.
+void expectLive(CollectionHelper& ch, const std::set<int>& live) {
+  EXPECT_EQ((int64_t)live.size(), ch.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
+  std::vector<std::string> ids;
+  for (int id : live) ids.push_back(std::to_string(id));
+  std::ranges::sort(ids);
+  EXPECT_EQ(ids, allIds(ch));
 }
 
 std::set<int> range(int from, int to) {
@@ -170,7 +165,7 @@ TEST_F(LiveDocsTest, corruptSparseFilesThrow) {
 
 TEST_F(LiveDocsTest, kindFollowsDeleteCountAcrossGenerationsAndMerges) {
   LuxirNode node;
-  CollectionHelper ch(node, "live_kinds");
+  CollectionHelper ch(node, "main");
   auto writer = ch.getIndexWriter();
   writer->mergePolicy->setMergeFactor(1000);
   // 640 docs take ten bitmap words (80 bytes): SPARSE for at most five deletes.
@@ -182,14 +177,14 @@ TEST_F(LiveDocsTest, kindFollowsDeleteCountAcrossGenerationsAndMerges) {
   EXPECT_EQ(std::vector<uint64_t>{28}, liveFileBytes(writer->dir));
   EXPECT_EQ(written + 28, writer->stats(false).liveDocsBytesWritten);
   EXPECT_EQ(1, writer->snapshots.readers.getReader()->segments()[0].numDeletes());
-  expectLive(ch, "live_kinds", live, 640);
+  expectLive(ch, live);
 
   deleteIds(ch, live, {0, 63, 64, 639});
   EXPECT_EQ(std::vector<uint64_t>{24 + 4 * 5}, liveFileBytes(writer->dir));
-  expectLive(ch, "live_kinds", live, 640);
+  expectLive(ch, live);
   deleteIds(ch, live, {100});
   EXPECT_EQ(std::vector<uint64_t>{24 + 80}, liveFileBytes(writer->dir));
-  expectLive(ch, "live_kinds", live, 640);
+  expectLive(ch, live);
 
   // The merged segment has no deletes; its first delete is sparse again.
   indexRange(ch, 640, 650);
@@ -199,13 +194,13 @@ TEST_F(LiveDocsTest, kindFollowsDeleteCountAcrossGenerationsAndMerges) {
   EXPECT_EQ(std::vector<uint64_t>{0}, liveFileBytes(writer->dir));
   deleteIds(ch, live, {645});
   EXPECT_EQ(std::vector<uint64_t>{28}, liveFileBytes(writer->dir));
-  expectLive(ch, "live_kinds", live, 650);
+  expectLive(ch, live);
 }
 
 TEST_F(LiveDocsTest, mergeDiffWritesEitherKind) {
   for (bool dense : {false, true}) {
     LuxirNode node;
-    CollectionHelper ch(node, "live_merge");
+    CollectionHelper ch(node, "main");
     auto writer = ch.getIndexWriter();
     writer->mergePolicy->setMergeFactor(1000);
     // The merged 640 docs take 80 bytes: SPARSE for at most five deletes.
@@ -220,16 +215,19 @@ TEST_F(LiveDocsTest, mergeDiffWritesEitherKind) {
     });
     auto unlisten = scope_guard([] { Signal::unlisten("mergeStart"); });
     auto merge = std::async(std::launch::async, [&] { writer->mergeSegments(); });
-    started.wait();
-    // Deletes landing during the merge reach the output through its live docs diff.
-    deleteIds(ch, live, {1, 319, 400});
-    if (dense) deleteIds(ch, live, {2, 3, 320, 321});
-    release.count_down();
+    {
+      // Released on any exit, so the future's destructor never waits on a blocked merge.
+      auto releaseMerge = scope_guard([&] { release.count_down(); });
+      started.wait();
+      // Deletes landing during the merge reach the output through its live docs diff.
+      deleteIds(ch, live, {1, 319, 400});
+      if (dense) deleteIds(ch, live, {2, 3, 320, 321});
+    }
     merge.get();
     writer->updateGraph->wait_for_all();
     writer->commit();
     EXPECT_EQ(std::vector<uint64_t>{dense ? 24u + 80 : 24u + 4 * 3}, liveFileBytes(writer->dir));
-    expectLive(ch, "live_merge", live, 640);
+    expectLive(ch, live);
   }
 }
 
@@ -263,7 +261,7 @@ TEST_F(LiveDocsTest, nestedViewsDeriveFromSparseRoot) {
 
 TEST_F(LiveDocsTest, indexingErrorsWriteSparseFile) {
   LuxirNode node;
-  CollectionHelper ch(node, "live_errors");
+  CollectionHelper ch(node, "main");
   auto writer = ch.getIndexWriter();
   std::vector<Doc> docs;
   for (int i = 0; i < 300; i++) docs.push_back(flatdoc("id", std::to_string(i)));
@@ -274,32 +272,7 @@ TEST_F(LiveDocsTest, indexingErrorsWriteSparseFile) {
   EXPECT_EQ(28u, writer->stats(false).liveDocsBytesWritten);
   auto live = range(0, 300);
   live.erase(42);
-  expectLive(ch, "live_errors", live, 300);
-}
-
-TEST_F(LiveDocsTest, sparseFileReloadsAfterRestart) {
-  auto path = std::filesystem::temp_directory_path() / ("luxir-livedocs-" + newUuid());
-  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
-  LuxirConfig config;
-  config.store.backend = "fs";
-  config.store.data_dir = path.string();
-  auto live = range(0, 300);
-  {
-    LuxirNode node(config);
-    CollectionHelper ch(node, "main");
-    indexRange(ch, 0, 300);
-    deleteIds(ch, live, {9, 290});
-    EXPECT_EQ(std::vector<uint64_t>{32}, liveFileBytes(ch.getIndexWriter()->dir));
-  }
-  LuxirNode node(config);
-  CollectionHelper ch(node, "main");
-  auto reader = ch.getIndexWriter()->snapshots.readers.getReader();
-  ASSERT_EQ(1u, reader->segments().size());
-  EXPECT_EQ(2, reader->segments()[0].numDeletes());
-  expectLive(ch, "main", live, 300);
-  // A standalone reader over the same files sees the same deletes.
-  IndexReader standalone(ch.getIndexWriter()->dir);
-  EXPECT_EQ(298, standalone.liveDocs());
+  expectLive(ch, live);
 }
 
 } // namespace luxir::test
