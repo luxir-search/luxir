@@ -42,12 +42,9 @@ std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice pa
   std::lock_guard lock(holdsMutex);
   auto key = std::pair(part.location.raw(), part.bytes);
   auto found = holds.lower_bound(key);
-  if (found != holds.end() && found->first == key) {
-    assert(found->second.readClass == readClass);
-    return found->second.hold.bytes();
-  }
+  if (found != holds.end() && found->first == key) return found->second.bytes();
   auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
-  return holds.emplace_hint(found, key, Kept{std::move(hold), readClass})->second.hold.bytes();
+  return holds.emplace_hint(found, key, std::move(hold))->second.bytes();
 }
 
 std::optional<SpaceOrdinal> SegmentCore::spaceOrdinal(std::string_view path) const noexcept {
