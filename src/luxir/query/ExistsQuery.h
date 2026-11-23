@@ -10,6 +10,7 @@
 #include "AllQuery.h"
 #include "Query.h"
 #include "luxir/reader/DocsReader.h"
+#include "CatalogPredicates.h"
 
 namespace luxir {
 
@@ -35,6 +36,10 @@ public:
   }
 
   std::string_view getField() const { return field; }
+
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return proof::existsMatch(view, field);
+  }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {

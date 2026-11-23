@@ -46,6 +46,10 @@ public:
 
   std::string_view getPrefix() const { return prefix; }
 
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return proof::prefixMatch(view, field, prefix);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
