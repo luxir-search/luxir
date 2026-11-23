@@ -12,7 +12,6 @@
 #include "ReaderErrors.h"
 #include "OwnershipShape.h"
 #include "luxir/store/AcquireJoin.h"
-#include "luxir/store/FileIOException.h"
 #include "luxir/api/luxir_index.hpp"
 
 namespace luxir {
@@ -61,7 +60,6 @@ void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadC
     ranges.reserve(batch.size());
     for (auto [raw, bytes] : batch) ranges.push_back({seg_location::fromRaw(raw).offset(), bytes, readClass});
     join.acquire(*files[number].file, ranges, [this, batch = std::move(batch)](std::vector<HeldRange>&& acquired) {
-      if (acquired.size() != batch.size()) throw FileIOException("batched acquire returned the wrong number of holds");
       std::lock_guard lock(holdsMutex);
       for (size_t i = 0; i < batch.size(); ++i) holds.try_emplace(batch[i], std::move(acquired[i]));
     });

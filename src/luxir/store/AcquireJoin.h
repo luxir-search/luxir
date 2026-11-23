@@ -3,17 +3,16 @@
 
 #pragma once
 
-#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <exception>
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <span>
 #include <utility>
 #include <vector>
 
+#include "FileIOException.h"
 #include "OutputStream.h"
 
 namespace luxir {
@@ -23,10 +22,11 @@ namespace luxir {
 ///
 /// Call acquire() for each file's batch, then wait(). Each batch's holds go
 /// to its `take`, on the thread that completed the batch, before wait()
-/// returns. A batch that completes inline (memory, a mapping, the default
-/// InputFile batch) runs `take` before acquire() returns, and wait() then
-/// returns without blocking. wait() rethrows the first error a batch, or a
-/// `take`, reported.
+/// returns; `take` gets exactly one hold per range requested. Holds `take`
+/// leaves in the vector are released before the batch counts as complete. A
+/// batch that completes inline (memory, a mapping, the default batch) runs
+/// `take` before acquire() returns, and wait() then returns without blocking.
+/// wait() rethrows the first error a batch, or a `take`, reported.
 ///
 /// The destructor waits for batches still in flight, so a caller that throws
 /// between acquire() and wait() leaves no completion running on freed state.
@@ -55,30 +55,31 @@ public:
   AcquireJoin& operator=(const AcquireJoin&) = delete;
   ~AcquireJoin() { await(); }
 
-  /// Starts one batch on `file`. A batch acquire that throws instead of
-  /// completing counts as that batch failing. `file` must outlive wait().
+  /// Starts one batch on `file`, which must outlive wait(). A throw (only
+  /// allocation) leaves the batch unissued.
   void acquire(InputFile& file, std::span<const ByteRange> ranges, Take take) {
+    // Built before the batch counts as pending: the conversion can allocate.
+    AcquireDone done = [this, count = ranges.size(), take = std::move(take)](
+                           std::vector<HeldRange>&& delivered, std::exception_ptr failure) noexcept {
+      // Owned here, so what `take` leaves releases before the waiter wakes
+      // and can destroy the file.
+      auto holds = std::move(delivered);
+      if (!failure) {
+        try {
+          if (holds.size() != count) throw FileIOException("batched acquire returned the wrong number of holds");
+          take(std::move(holds));
+        } catch (...) {
+          failure = std::current_exception();
+        }
+      }
+      holds.clear();
+      complete(std::move(failure));
+    };
     {
       std::lock_guard lock(mutex);
       ++pending;
     }
-    auto once = std::make_shared<std::atomic<bool>>(false);
-    try {
-      file.acquire(ranges, [this, once, take = std::move(take)](std::vector<HeldRange>&& holds,
-                                                                 std::exception_ptr failure) {
-        if (once->exchange(true)) return;
-        if (!failure) {
-          try {
-            take(std::move(holds));
-          } catch (...) {
-            failure = std::current_exception();
-          }
-        }
-        complete(std::move(failure));
-      });
-    } catch (...) {
-      if (!once->exchange(true)) complete(std::current_exception());
-    }
+    file.acquireBatch(ranges, std::move(done));
   }
 
   /// Blocks until every batch completed, then rethrows the first error.

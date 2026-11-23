@@ -43,16 +43,15 @@ public:
   explicit ThreadedInputFile(std::shared_ptr<InputFile> delegate) : delegate(std::move(delegate)) {}
   ~ThreadedInputFile() override { threads.clear(); }
   size_t size() override { return delegate->size(); }
-  using InputFile::acquire;
   HeldRange acquire(ByteRange range) override { return delegate->acquire(range); }
-  void acquire(std::span<const ByteRange> ranges, AcquireDone done) override {
-    threads.emplace_back([this, requested = std::vector<ByteRange>(ranges.begin(), ranges.end()), done] {
-      try {
-        delegate->acquire(requested, done);
-      } catch (...) {
-        done({}, std::current_exception());
-      }
-    });
+  void acquireBatch(std::span<const ByteRange> ranges, AcquireDone done) noexcept override {
+    try {
+      threads.emplace_back([this, requested = std::vector(ranges.begin(), ranges.end()), done] {
+        delegate->acquireBatch(requested, done);
+      });
+    } catch (...) {
+      done({}, std::current_exception());
+    }
   }
 };
 
@@ -281,11 +280,11 @@ TEST(StrictStorageTest, batchReportsErrorsThroughDone) {
   for (auto ranges : {std::span<const ByteRange>(outside), std::span<const ByteRange>(whole)}) {
     int calls = 0;
     std::exception_ptr error;
-    EXPECT_NO_THROW(file->acquire(ranges, [&](std::vector<HeldRange>&& holds, std::exception_ptr failure) {
+    file->acquireBatch(ranges, [&](std::vector<HeldRange>&& holds, std::exception_ptr failure) {
       ++calls;
       EXPECT_TRUE(holds.empty());
       error = failure;
-    }));
+    });
     EXPECT_EQ(1, calls);
     EXPECT_NE(nullptr, error);
   }
@@ -318,6 +317,7 @@ TEST(StrictStorageTest, joinWaitsForBatchesCompletingElsewhere) {
   failing.acquire(a, outside, [](auto&&) { FAIL(); });
   failing.acquire(b, ranges, [](auto&&) { throw FileIOException("take failed"); });
   EXPECT_ANY_THROW(failing.wait());
+  EXPECT_EQ(3u, counters->liveStats().holds);  // the failed take's holds released before wait() returned
   fromA.clear();
   fromB.clear();
 }
