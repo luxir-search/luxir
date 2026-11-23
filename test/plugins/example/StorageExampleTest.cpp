@@ -162,8 +162,9 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
   }
 }
 
-// The canonical query shapes read parts, never whole segment files, and each
-// segment acquires its catalog as metadata.
+// The canonical query shapes read parts, never whole segment files, need no
+// size requests, and acquire the catalog, points directories and numeric
+// column indexes as metadata.
 TEST_F(StorageExampleTest, canonicalQueriesRunWithWholeSegmentFilesDenied) {
   LuxirConfig config;
   config.store.layers = {"strict"};
@@ -175,7 +176,7 @@ TEST_F(StorageExampleTest, canonicalQueriesRunWithWholeSegmentFilesDenied) {
     for (int i = 0; i < 100; i++) {
       int n = batch * 100 + i;
       docs.push_back(flatdoc("id", "d" + std::to_string(n), "body_t", "alpha beta w" + std::to_string(n % 13),
-                             "c_s", "c" + std::to_string(n % 5), "n_i", (int64_t)(n % 31)));
+                             "c_s", "c" + std::to_string(n % 5), "n_i", (int64_t)(n % 31), "t_dt", (int64_t)n * 1000));
     }
     ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT).success);
   }
@@ -194,6 +195,9 @@ TEST_F(StorageExampleTest, canonicalQueriesRunWithWholeSegmentFilesDenied) {
   run([](auto& r) { r.topDocs().prefixQuery("body_t", "w1").countLimit(); }, -1);
   run([](auto& r) { r.topDocs().exprQuery("n_i:[3 TO 5]").countLimit(); }, -1);
   run([](auto& r) { r.topDocs().existsQuery("n_i").countLimit(); }, 200);
+  for (auto when : {"1970-01-01T00:00:05Z", "1970-01-01T00:02:30Z"}) {  // one per segment
+    run([&](auto& r) { r.topDocs().matchQuery("t_dt", when).countLimit(); }, 1);
+  }
   run([](auto& r) { r.facet("f", "c_s"); r.avg("a", "n_i"); r.topDocs().allQuery().countLimit(); }, 200);
 
   auto* layer = node.collections().storage().find<StrictLayer>();
@@ -201,13 +205,30 @@ TEST_F(StorageExampleTest, canonicalQueriesRunWithWholeSegmentFilesDenied) {
   for (const auto& file : h.getIndexWriter()->snapshots.snapshot()->files) {
     if (Manifest::segmentDataFile(file.name)) {
       EXPECT_EQ(0u, layer->counters->fileStats(file.name).wholeFileAccesses) << file.name;
+      EXPECT_EQ(0u, layer->counters->fileStats(file.name).sizeRequests) << file.name;
     }
   }
   auto info = readDurableIndexInfo(h.getIndexWriter()->dir);
   ASSERT_EQ(2u, info->segments.size());
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
   for (const auto& segment : info->segments) {
-    auto primary = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
-    EXPECT_GT(layer->counters->fileStats(primary).metadataAcquires, 0u) << primary;
+    auto key = Postings::segmentKey(segment.seg_id, segment.creator_epoch);
+    auto expectMetadata = [&](field_parts::Slice part) {
+      ASSERT_TRUE(part);
+      auto name = Postings::getIndexFileName(key, part.location.filenum());
+      EXPECT_TRUE(layer->counters->fileStats(name).metadataParts.contains({part.location.offset(), part.bytes}))
+          << name << " @" << part.location.offset();
+    };
+    expectMetadata({{Postings::PRIMARY_FILE, segment.catalog.offset}, segment.catalog.length});
+    auto found = std::ranges::find_if(reader->segments(), [&](const auto& open) {
+      return open.postingsReader().core().id() == segment.seg_id;
+    });
+    ASSERT_NE(reader->segments().end(), found);
+    const auto* number = found->postingsReader().fieldInfo("n_i");
+    const auto* date = found->postingsReader().fieldInfo("t_dt");
+    ASSERT_TRUE(number && number->numberColumn() && date);
+    expectMetadata(number->numberColumn()->index());
+    expectMetadata(date->pointsDirectory());
   }
 }
 

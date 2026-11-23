@@ -89,6 +89,7 @@ class StrictFileState : public HoldOwner {
   static constexpr size_t overhead = 3 * kHoldAlign + kReadSlack;
   std::shared_ptr<StrictStorageCounters> counters;
   std::string name;
+  std::optional<uint64_t> segmentFile;  // The number of a base segment data file.
   bool denyWhole;
   bool sized;  // Opened with a size, so size() makes no request.
   std::atomic<uint64_t> liveHolds{0};
@@ -100,8 +101,8 @@ class StrictFileState : public HoldOwner {
 public:
   StrictFileState(std::shared_ptr<StrictStorageCounters> counters, std::string_view name, StrictWholeFiles mode,
                   bool sized)
-      : counters(std::move(counters)), name(name),
-        denyWhole(mode == StrictWholeFiles::DENY && Manifest::segmentDataFile(name)), sized(sized) {}
+      : counters(std::move(counters)), name(name), segmentFile(Manifest::segmentDataFileNumber(name)),
+        denyWhole(mode == StrictWholeFiles::DENY && segmentFile), sized(sized) {}
 
   // A hold must not outlive its InputFile: its release would run on freed state.
   ~StrictFileState() {
@@ -113,6 +114,16 @@ public:
 
   void sizeRequested() {
     if (!sized) counters->sizeRequested(name);
+  }
+
+  // A whole-file read, or in a segment data file a read no part makes: one
+  // from offset 0 past the header (no part starts at 0), or one to EOF outside
+  // file 0 (the writer pads every other file after its last part).
+  bool readsWholeFile(ByteRange range, uint64_t size) const {
+    if (range.offset == 0 && range.length == size) return true;
+    if (!segmentFile) return false;
+    if (range.offset == 0 && range.length > Postings::LUXIR_HEADER.size()) return true;
+    return *segmentFile != Postings::PRIMARY_FILE && range.length && range.offset + range.length == size;
   }
 
   void wholeFile() {
@@ -173,7 +184,7 @@ public:
   HeldRange acquire(ByteRange range) override {
     auto fileSize = delegate->size();
     checkRange(range, fileSize);
-    if (range.offset == 0 && range.length == fileSize) state->wholeFile();
+    if (state->readsWholeFile(range, fileSize)) state->wholeFile();
     auto source = delegate->acquire(range);
     size_t slack = std::min<uint64_t>(kReadSlack, fileSize - range.offset - range.length);
     return state->copy(source, range, slack);
