@@ -117,6 +117,37 @@ public:
     return filesOf(decode(bytes, arena));
   }
 
+  // The committed files of a manifest; file 0 of each segment carries its catalog.
+  static std::vector<KnownFile> knownFilesOf(const api::IndexInfo& info) {
+    std::map<std::string, const api::CatalogRange*, std::less<>> catalogs;
+    for (const auto& segment : info.segments) {
+      if (!segment.catalog.length) continue;
+      auto key = Postings::segmentKey(segment.seg_id, segment.creator_epoch);
+      catalogs.emplace(Postings::getIndexFileName(key, Postings::PRIMARY_FILE), &segment.catalog);
+    }
+    std::vector<KnownFile> result;
+    for (auto& file : filesOf(info)) {
+      KnownFile known;
+      known.file = std::move(file);
+      if (auto it = catalogs.find(known.file.name); it != catalogs.end()) {
+        known.catalog = ByteRange{it->second->offset, it->second->length, ReadClass::METADATA};
+        known.catalogXxh3 = it->second->xxh3;
+      }
+      result.push_back(std::move(known));
+    }
+    return result;
+  }
+
+  static void announceKnownFiles(Directory& dir, const api::IndexInfo& info) {
+    auto known = knownFilesOf(info);
+    dir.knownFiles(known);
+  }
+
+  static void announceKnownFiles(Directory& dir, const Bytes& bytes) {
+    std::pmr::monotonic_buffer_resource arena;
+    announceKnownFiles(dir, decode(bytes, arena));
+  }
+
   static Bytes read(Directory& dir, uint64_t gen, uint64_t epoch) {
     auto file = dir.openFile(name(gen, epoch));
     if (!file) return {};
@@ -171,6 +202,7 @@ public:
         result.generation = gen;
         result.epoch = epoch;
         result.names.push_back(name(gen, epoch));
+        announceKnownFiles(dir, result.bytes);
         return result;
       }
       const auto& listing = result.listingOf(dir);
@@ -201,6 +233,7 @@ public:
         result.generation = oldGen;
         result.epoch = oldEpoch;
         result.names.push_back(name(oldGen, oldEpoch));
+        announceKnownFiles(dir, result.bytes);
         return result;
       }
       throw std::runtime_error("No valid snapshot manifest");
@@ -210,21 +243,22 @@ public:
   // A candidate is immutable. An identical retry re-establishes durability;
   // it becomes authoritative only when the caller advances STATE.
   static void commit(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes, uint64_t epoch) {
-    {
-      std::pmr::monotonic_buffer_resource arena;
-      api::IndexInfo info;
-      if (api::decode(info, api::copyToPaddedInput(bytes, arena), arena)) dir.expectSynced(filesOf(info));
-    }
+    std::pmr::monotonic_buffer_resource arena;
+    api::IndexInfo info;
+    bool decoded = api::decode(info, api::copyToPaddedInput(bytes, arena), arena);
+    if (decoded) dir.expectSynced(filesOf(info));
     std::array<std::string, 1> root{name(gen, epoch)};
     auto contents = withFooter(bytes);
-    if (dir.publishFile(root[0], contents, Directory::PublishMode::CREATE_ONLY)) return;
-    auto existing = dir.openFile(root[0]);
-    auto hold = existing ? existing->acquire({0, existing->size()}) : HeldRange{};
-    auto body = hold.bytes();
-    if (body.size() != contents.size() || memcmp(body.data(), contents.data(), contents.size())) {
-      throw std::runtime_error("manifest candidate name already contains different bytes");
+    if (!dir.publishFile(root[0], contents, Directory::PublishMode::CREATE_ONLY)) {
+      auto existing = dir.openFile(root[0]);
+      auto hold = existing ? existing->acquire({0, existing->size()}) : HeldRange{};
+      auto body = hold.bytes();
+      if (body.size() != contents.size() || memcmp(body.data(), contents.data(), contents.size())) {
+        throw std::runtime_error("manifest candidate name already contains different bytes");
+      }
+      dir.sync(root);
     }
-    dir.sync(root);
+    if (decoded) announceKnownFiles(dir, info);
   }
 
   // A follower can repair a corrupt local copy from the authoritative bytes.
@@ -236,6 +270,7 @@ public:
     if (!state) throw WriterSupersededError();
     dir.publishFile(name(info.index_gen, info.writer_epoch), withFooter(*bytes), Directory::PublishMode::REPLACE);
     IncarnationState::install(dir, tip(info.index_gen, info.writer_epoch));
+    announceKnownFiles(dir, info);
   }
 
   static std::vector<std::byte> withFooter(const std::vector<std::byte>& bytes) {

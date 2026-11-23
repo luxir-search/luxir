@@ -43,6 +43,16 @@ struct FileCheck {
   bool matches(const FileDescriptor& expected) const { return size == expected.size && xxh3 == expected.xxh3; }
 };
 
+// A committed file as a published manifest lists it. A segment's file 0 also
+// carries where its catalog lies (read class METADATA) and the catalog's xxh3
+// from the manifest, so a backend can serve, cache or check that range without
+// decoding the segment format.
+struct KnownFile {
+  FileDescriptor file;
+  std::optional<ByteRange> catalog;
+  uint64_t catalogXxh3 = 0;
+};
+
 // One file open for a sequential checksum pass; see Directory::openChecksum.
 class ChecksumReader {
 public:
@@ -109,6 +119,15 @@ public:
   // The caller asserts that `files` were fsynced: a root about to be published
   // references them (Manifest::commit). CheckedDirectory verifies it.
   virtual void expectSynced(std::span<const FileDescriptor> files) { unused(files); }
+
+  // `files` are committed: the manifest a reader loads or a writer publishes
+  // from this directory lists them (Manifest::load, commit, install). A
+  // directory may use them in place of asking its backend (a remote one skips a
+  // size request per openFile) and may treat each segment's catalog range as
+  // metadata. A hint, not an assertion: the default ignores it. Committed names
+  // are never rewritten with other bytes; a directory that remembers them
+  // forgets a name it deletes, writes, publishes or links over.
+  virtual void knownFiles(std::span<const KnownFile> files) { unused(files); }
 
   virtual std::unique_ptr<File> createFile(const std::string_view name) = 0;
 
