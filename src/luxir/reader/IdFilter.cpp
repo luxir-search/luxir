@@ -274,11 +274,16 @@ uint64_t IdFilter::bloomBlocksFor(const Options& options, uint64_t keys) noexcep
 }
 
 std::optional<IdFilter> IdFilter::parse(std::span<const char> bytes) noexcept {
-  if (bytes.size() < HEADER_BYTES) return std::nullopt;
-  const char* h = bytes.data();
+  auto filter = parseHeader(bytes, bytes.size());
+  if (filter) filter->body = bytes.data() + HEADER_BYTES;
+  return filter;
+}
+
+std::optional<IdFilter> IdFilter::parseHeader(std::span<const char> header, uint64_t partBytes) noexcept {
+  if (header.size() < HEADER_BYTES || partBytes < HEADER_BYTES) return std::nullopt;
+  const char* h = header.data();
   IdFilter filter;
-  filter.body = h + HEADER_BYTES;
-  filter.bodyBytes = bytes.size() - HEADER_BYTES;
+  filter.bodyBytes = partBytes - HEADER_BYTES;
   filter.kind = (Kind)(uint8_t)h[0];
   auto param = (uint32_t)(uint8_t)h[1];
   if (h[2] || h[3] || load<uint32_t>(h + 12)) return std::nullopt;
@@ -308,16 +313,20 @@ std::optional<IdFilter> IdFilter::parse(std::span<const char> bytes) noexcept {
   }
 }
 
+uint64_t IdFilter::bloomBlockOffset(uint64_t hash, uint64_t partBytes) noexcept {
+  return HEADER_BYTES + blockOf(hash, (partBytes - HEADER_BYTES) / BLOCK_BYTES) * BLOCK_BYTES;
+}
+
+bool IdFilter::bloomBlockMayContain(const char* block, uint64_t hash) noexcept {
+  for (size_t w = 0; w < BLOCK_WORDS; w++) {
+    if (!(load<uint32_t>(block + w * sizeof(uint32_t)) & bitOf(hash, w))) return false;
+  }
+  return true;
+}
+
 bool IdFilter::mayContainHash(uint64_t hash) const noexcept {
   switch (kind) {
-    case Kind::BLOOM: {
-      auto blocks = bodyBytes / BLOCK_BYTES;
-      const char* block = body + blockOf(hash, blocks) * BLOCK_BYTES;
-      for (size_t w = 0; w < BLOCK_WORDS; w++) {
-        if (!(load<uint32_t>(block + w * sizeof(uint32_t)) & bitOf(hash, w))) return false;
-      }
-      return true;
-    }
+    case Kind::BLOOM: return bloomBlockMayContain(body + bloomBlockOffset(hash, sizeInBytes()) - HEADER_BYTES, hash);
     case Kind::FUSE: {
       fuse::Shape shape{segmentLength, segmentCount};
       return fingerprintBits == 8 ? fuse::contains<uint8_t>(body, shape, seed, hash)

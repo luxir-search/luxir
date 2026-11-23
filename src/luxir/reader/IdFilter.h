@@ -78,6 +78,10 @@ public:
   // The filter in `bytes`, or none when they are not a valid filter.
   static std::optional<IdFilter> parse(std::span<const char> bytes) noexcept;
   static bool valid(std::span<const char> bytes) noexcept { return parse(bytes).has_value(); }
+  // The filter a part of `partBytes` bytes starting with `header` describes,
+  // without its body: for probing a BLOOM filter block by block, through
+  // bloomBlockOffset() and bloomBlockMayContain(). mayContain() needs parse().
+  static std::optional<IdFilter> parseHeader(std::span<const char> header, uint64_t partBytes) noexcept;
   // BLOOM body blocks for `keys` keys under `options`.
   static uint64_t bloomBlocksFor(const Options& options, uint64_t keys) noexcept;
 
@@ -88,6 +92,11 @@ public:
 
   bool mayContain(std::string_view term) const noexcept { return mayContainHash(hash(term)); }
   bool mayContainHash(uint64_t hash) const noexcept;
+
+  // BLOOM: a probe of `hash` reads one BLOCK_BYTES block, at this offset
+  // within a part of `partBytes` bytes, and tests it alone.
+  static uint64_t bloomBlockOffset(uint64_t hash, uint64_t partBytes) noexcept;
+  static bool bloomBlockMayContain(const char* block, uint64_t hash) noexcept;
 
   // Collects one dictionary's keys. Sized for an upper bound on the keys;
   // fewer keys only lower a BLOOM filter's false positive rate.

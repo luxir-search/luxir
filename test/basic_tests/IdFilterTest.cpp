@@ -124,6 +124,26 @@ TEST_F(IdFilterTest, fuseBuildsOverAnyKeyCount) {
   }
 }
 
+TEST_F(IdFilterTest, bloomProbesOneBlockFromItsHeader) {
+  auto bytes = buildFilter(bloom(), 5000);
+  std::span<const char> header(bytes.data(), IdFilter::HEADER_BYTES);
+  auto described = IdFilter::parseHeader(header, bytes.size());
+  ASSERT_TRUE(described);
+  EXPECT_EQ(IdFilter::Kind::BLOOM, described->filterKind());
+  auto filter = IdFilter::parse(bytes);
+  for (int i = 0; i < 2000; i++) {
+    auto hash = IdFilter::hash(std::format("{}{}", i % 2 ? "present" : "absent", i));
+    auto offset = IdFilter::bloomBlockOffset(hash, bytes.size());
+    ASSERT_LE(offset + IdFilter::BLOCK_BYTES, bytes.size());
+    EXPECT_EQ(filter->mayContainHash(hash), IdFilter::bloomBlockMayContain(bytes.data() + offset, hash));
+  }
+  auto fused = buildFilter(fuse(16), 5000);
+  auto fuseHeader = IdFilter::parseHeader({fused.data(), IdFilter::HEADER_BYTES}, fused.size());
+  ASSERT_TRUE(fuseHeader);
+  EXPECT_EQ(IdFilter::Kind::FUSE, fuseHeader->filterKind());
+  EXPECT_FALSE(IdFilter::parseHeader(header, bytes.size() + 1));  // not whole blocks
+}
+
 TEST_F(IdFilterTest, bloomHasAFloorAndInvalidBytesAreNoFilter) {
   // A small segment's filter is the floor, so it is near-certain to exclude.
   EXPECT_EQ(IdFilter::HEADER_BYTES + 16 * 1024, buildFilter(bloom(16, 16 * 1024), 10).size());
