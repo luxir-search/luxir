@@ -104,9 +104,9 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
 
 void ReaderManager::SegmentStats::readSpaces(const SegmentCore& core) {
   for (size_t i = 1; i < core.spaces().size(); i++) {
+    // From the catalog, so stats never build a shape.
     const auto& space = core.spaces()[i];
-    const auto& shape = *core.ownership((SpaceOrdinal)i);
-    spaces.push_back({std::string(space.path), space.maxDoc, shape.endsBytes(), shape.ownersBytes()});
+    spaces.push_back({std::string(space.path), space.maxDoc, space.ownership.ends.bytes, space.ownership.owners.bytes});
   }
 }
 

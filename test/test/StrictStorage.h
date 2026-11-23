@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <set>
@@ -46,12 +47,22 @@ private:
   LiveStats live;
   uint64_t submissions = 0;
   uint8_t pattern = 0;
+  std::atomic<uint64_t> injectedFailures{0};
 
 public:
   FileStats fileStats(std::string_view name) const;
   LiveStats liveStats() const;
   uint64_t totalSubmissions() const;
   void logSummary() const;
+
+  // The next `count` rounds (single acquires or batches) throw
+  // FileIOException instead of reaching the delegate, as a failed request would.
+  void failNextRounds(uint64_t count) { injectedFailures.store(count); }
+  bool takeInjectedFailure() noexcept {
+    auto left = injectedFailures.load();
+    while (left && !injectedFailures.compare_exchange_weak(left, left - 1)) {}
+    return left != 0;
+  }
 
   void wholeFile(std::string_view name);
   void sizeRequested(std::string_view name);

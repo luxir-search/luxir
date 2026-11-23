@@ -277,8 +277,9 @@ TEST_F(RowSpaceTest, ownershipSeeksSkipEmptyFamiliesAndRestart) {
     writeUnversionedRuns(writer);
     ASSERT_TRUE(writer.finish());
     SegmentCore core(dir, 1, 1);
+    const auto& shape = *core.ownership(Fixture::CHILD);  // built on first use, before counting
     memtrack::AllocScope construction;
-    OwnershipShape::Cursor cursor(*core.ownership(Fixture::CHILD));
+    OwnershipShape::Cursor cursor(shape);
     auto constructionBytes = construction.bytes();
     if (memtrack::counting_enabled) { EXPECT_EQ(0, constructionBytes); }
     for (int32_t child : children) {
@@ -388,7 +389,8 @@ TEST_F(RowSpaceTest, pathLookupBindsFieldsAndImmediateOwnership) {
   EXPECT_EQ(2, core.ownership("z.parts")->owner(1));
 }
 
-TEST_F(RowSpaceTest, invalidOwnershipEndpointsFailOpen) {
+// The open reads no shape; the first use validates it, and fails again when retried.
+TEST_F(RowSpaceTest, invalidOwnershipEndpointsFailFirstUse) {
   auto write = [&](std::span<const int64_t> ends, std::optional<std::span<const int64_t>> owners) {
     dir.clear();
     PostingsWriter writer(dir, 1, 1, 3);
@@ -396,10 +398,13 @@ TEST_F(RowSpaceTest, invalidOwnershipEndpointsFailOpen) {
     writeUnversionedRuns(writer);
     ASSERT_TRUE(writer.finish());
   };
-  write(std::vector<int64_t>{2, 2, 5}, {});
-  EXPECT_THROW(SegmentCore(dir, 1, 1), std::runtime_error);
-  write(ENDS, std::span<const int64_t>(std::vector<int64_t>{0, 0, 2, 3}));
-  EXPECT_THROW(SegmentCore(dir, 1, 1), std::runtime_error);
+  for (auto owners : {std::optional<std::vector<int64_t>>(), std::optional<std::vector<int64_t>>({0, 0, 2, 3})}) {
+    if (owners) write(ENDS, std::span<const int64_t>(*owners));
+    else write(std::vector<int64_t>{2, 2, 5}, {});
+    SegmentCore core(dir, 1, 1);
+    EXPECT_THROW(core.ownership(Fixture::CHILD), SegmentCorruptError);
+    EXPECT_THROW(core.ownership(Fixture::CHILD), SegmentCorruptError);
+  }
 }
 
 TEST_F(RowSpaceTest, ownershipStreamsStayInTheSharedFileInventory) {
