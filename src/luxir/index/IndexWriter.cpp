@@ -2075,7 +2075,7 @@ bool eligibleVectorOverlayName(const Schema& schema, std::string_view overlayNam
   auto* ft = schema.getFieldTypePtr(overlayName);
   if (ft == nullptr || ft->type() != FieldType::VECTOR) return false;
   auto* vft = (const VectorFieldType*)ft;
-  return vft->knnSearchable();
+  return vft->annIndexable();
 }
 
 std::vector<std::string> collectValidatedExactVectorOverlayNames(

@@ -165,6 +165,12 @@ protected:
   /// single-valued fields valueRank == docRank, so no map is ever written.
   virtual bool writesOwners() const { return false; }
 
+  /// Lets a subclass record type-specific column metadata (the vector
+  /// encoding) on the descriptor written at flush.
+  virtual void describeColumn(field_parts::BytesColumn& column) const {
+    unused(column);
+  }
+
 private:
   void addValue(Inverter& inverter, std::string_view val) {
     int32_t valSize = (int32_t)val.size();
@@ -203,6 +209,7 @@ public:
     fieldInfo.header.flags = fieldType->segmentFlags();
     fieldInfo.header.typeParameters = fieldType->segmentTypeParameters();
     auto column = writeColumn(inverter);
+    describeColumn(column.column);
     fieldInfo.setColumn(std::move(column));
   }
 

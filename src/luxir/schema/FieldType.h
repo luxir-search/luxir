@@ -4,6 +4,7 @@
 #pragma once
 
 #include "luxir/analysis/Analyzer.h"
+#include "luxir/codec/VectorCodec.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/StrRef.h"
@@ -628,7 +629,8 @@ struct VectorAnnConfig {
 //
 // metric_ controls whether the field is searchable by kNN / ANN.  NONE means
 // storage-only; L2 / IP / COSINE pick the similarity metric for exact column
-// scan and future aux-backed ANN engines.
+// scan and future aux-backed ANN engines.  HAMMING scores BIT columns by
+// exact scan only.
 class VectorFieldType : public FieldType {
 public:
   enum Metric {
@@ -636,6 +638,7 @@ public:
     METRIC_L2 = 1,
     METRIC_IP = 2,
     METRIC_COSINE = 3,
+    METRIC_HAMMING = 4,
   };
 
   // Squared norm at or below which a cosine vector has no direction.
@@ -654,6 +657,12 @@ public:
   // COSINE fields normalize vectors before column storage by default.  Ignored
   // for non-COSINE metrics.
   bool normalizeOnWrite_;
+  // Column storage encoding (f32 / f16 / bf16 / int8 / bit).  Recorded per segment, so a
+  // later schema change never reinterprets existing segments.
+  VectorEncoding encoding_;
+  // Also store the submitted float32 vectors in a cold companion column
+  // (originalColumnName) that the query path never reads.
+  bool keepOriginal_;
   // ANN overlay codec and parameters (schema "ann").
   VectorAnnConfig ann_;
 
@@ -662,6 +671,8 @@ public:
                   Metric metric = METRIC_NONE,
                   bool normalized = false,
                   bool normalizeOnWrite = true,
+                  VectorEncoding encoding = VectorEncoding::F32,
+                  bool keepOriginal = false,
                   VectorAnnConfig ann = {},
                   int32_t truncateDims = 0)
     : FieldType(name, FieldType::VECTOR, flags),
@@ -670,8 +681,23 @@ public:
       metric_(metric),
       normalized_(normalized),
       normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized),
+      encoding_(encoding),
+      keepOriginal_(keepOriginal),
       ann_(ann) {
     assert(truncateDims == 0 || (truncateDims > 0 && truncateDims < dims));
+  }
+
+  // Physical name of the keep_original companion column.  The '#' makes it an
+  // invalid variant label, so schema lookups and field discovery never
+  // resolve it as a user field.
+  static constexpr std::string_view ORIGINAL_SUFFIX = "__#orig";
+  static std::string originalColumnName(std::string_view physicalName) {
+    std::string name(physicalName);
+    name.append(ORIGINAL_SUFFIX);
+    return name;
+  }
+  static bool isOriginalColumnName(std::string_view physicalName) {
+    return physicalName.ends_with(ORIGINAL_SUFFIX);
   }
 
   // Stored dimension (0 = inferred per segment).
@@ -682,6 +708,12 @@ public:
   Metric metric() const { return metric_; }
   bool normalized() const { return normalized_; }
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
+  VectorEncoding encoding() const { return encoding_; }
+  bool keepOriginal() const { return keepOriginal_; }
+  // Whether column rows carry the |x|^2 norm prefix (see VectorCodec.h).
+  bool storesNorms() const {
+    return vcodec::needsNorms(encoding_, metric_ == METRIC_COSINE, normalized_ || normalizeOnWrite_);
+  }
   const VectorAnnConfig& ann() const { return ann_; }
 
   // The contract for every indexed and query vector: inputDims() components
@@ -695,6 +727,10 @@ public:
   // True iff this field supports kNN / ANN search.  Exact flat search can run
   // directly over the column; real ANN engines may also build aux artifacts.
   bool knnSearchable() const { return metric_ != METRIC_NONE; }
+
+  // True iff commits may build an ANN overlay for this field.  HAMMING has no
+  // ANN index: bit columns are small and scanned exactly.
+  bool annIndexable() const { return knnSearchable() && metric_ != METRIC_HAMMING; }
 };
 
 // How a stored-fields resource compresses its chunks.  codec, the two chunk
