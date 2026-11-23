@@ -27,8 +27,11 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/server/LuxirNode.h"
+#include "luxir/store/FileIOException.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
+#include "test/LocalReq.h"
+#include "test/StrictStorage.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
@@ -615,8 +618,8 @@ TEST_F(IndexReaderAuxTest, schemaOnlyReaderSharesPhysicalState) {
     auto& next = after->segments()[i];
     EXPECT_EQ(&old.postingsReader(), &next.postingsReader());
     EXPECT_EQ(old.liveDocs(), next.liveDocs());
-    ASSERT_FALSE(old.auxReaders().empty());
-    EXPECT_EQ(old.auxReaders().data(), next.auxReaders().data());
+    ASSERT_FALSE(old.overlays().empty());
+    EXPECT_EQ(old.overlays().data(), next.overlays().data());
   }
   // Populate lazily through the replacement, then observe the same objects
   // through the old reader. This checks sharing of the caches themselves.
@@ -758,4 +761,95 @@ TEST_F(IndexReaderAuxTest, inventoryReopensWithOverlaysAndDeletes) {
   auto after = readDurableIndexInfo(writer->dir);
   expectValidInventory(writer->dir, *after);
   EXPECT_EQ(fileInventory(*before), fileInventory(*after));
+}
+
+namespace {
+
+// The test overlay's policy and open failure for one test.
+class OverlayPolicyGuard {
+public:
+  OverlayPolicyGuard(OverlayPolicy policy, bool failOpen) {
+    TestOverlayAuxReader::policyForTests = policy;
+    TestOverlayAuxReader::failOpenForTests = failOpen;
+  }
+  ~OverlayPolicyGuard() {
+    TestOverlayAuxReader::policyForTests = OverlayPolicy::ON_DEMAND;
+    TestOverlayAuxReader::failOpenForTests = false;
+  }
+};
+
+void commitWithTestOverlay(CollectionHelper& h) {
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+  h.commit({std::string(TestOverlayAuxReader::NAME)});
+}
+
+}  // namespace
+
+// The snapshot opens the overlay's file; its reader opens on first use, and a
+// reopen shares the overlay as it is, opened or not.
+TEST_F(IndexReaderAuxTest, overlayOpensOnFirstUse) {
+  CollectionHelper h("main");
+  commitWithTestOverlay(h);
+  auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
+  const auto& segment = reader->segments()[0];
+  ASSERT_EQ(1u, segment.overlays().size());
+  const auto& overlay = segment.overlays()[0];
+  EXPECT_EQ(TestOverlayAuxReader::NAME, overlay->name());
+  EXPECT_FALSE(overlay->isOpen());
+  auto aux = segment.getAuxReader(TestOverlayAuxReader::NAME);
+  ASSERT_NE(nullptr, dynamic_cast<TestOverlayAuxReader*>(aux.get()));
+  EXPECT_TRUE(overlay->isOpen());
+  EXPECT_EQ(aux, segment.getAuxReader(TestOverlayAuxReader::NAME));
+  IndexReader reopened(h.getIndexWriter()->dir, reader.get());
+  EXPECT_EQ(overlay, reopened.segments()[0].overlays()[0]);
+}
+
+TEST_F(IndexReaderAuxTest, advisoryOverlayFailureLeavesTheSegmentInService) {
+  CollectionHelper h("main");
+  commitWithTestOverlay(h);
+  OverlayPolicyGuard guard(OverlayPolicy::ADVISORY, /*failOpen=*/true);
+  auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
+  const auto& segment = reader->segments()[0];
+  auto aux = segment.getAuxReader(TestOverlayAuxReader::NAME);
+  ASSERT_NE(nullptr, dynamic_cast<UnavailableAuxReader*>(aux.get()));
+  EXPECT_EQ(TestOverlayAuxReader::KIND, aux->getKind());
+  EXPECT_EQ(2, segment.postingsReader().maxDoc());
+  auto req = localReq(h.getSearchEngine());
+  req->topDocs().allQuery().countLimit(-1);
+  req->execute(reader);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(2, req->getMatchCount());
+}
+
+// An on-demand overlay with invalid bytes fails every use as corruption, and
+// opens once its bytes read again.
+TEST_F(IndexReaderAuxTest, onDemandOverlayFailureIsCorruption) {
+  CollectionHelper h("main");
+  commitWithTestOverlay(h);
+  auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
+  const auto& segment = reader->segments()[0];
+  {
+    OverlayPolicyGuard guard(OverlayPolicy::ON_DEMAND, /*failOpen=*/true);
+    EXPECT_THROW(segment.getAuxReader(TestOverlayAuxReader::NAME), SegmentCorruptError);
+    EXPECT_THROW(segment.getAuxReader(TestOverlayAuxReader::NAME), SegmentCorruptError);
+  }
+  EXPECT_NE(nullptr, dynamic_cast<TestOverlayAuxReader*>(segment.getAuxReader(TestOverlayAuxReader::NAME).get()));
+}
+
+// A failed read fails the use under either policy, and the next use retries.
+TEST_F(IndexReaderAuxTest, overlayReadFailureIsRetried) {
+  CollectionHelper h("main");
+  commitWithTestOverlay(h);
+  auto writer = h.getIndexWriter();
+  for (auto policy : {OverlayPolicy::ON_DEMAND, OverlayPolicy::ADVISORY}) {
+    OverlayPolicyGuard guard(policy, /*failOpen=*/false);
+    auto counters = std::make_shared<StrictStorageCounters>();
+    StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters);
+    auto reader = std::make_shared<IndexReader>(dir);
+    const auto& segment = reader->segments()[0];
+    counters->failNextRounds(1);
+    EXPECT_THROW(segment.getAuxReader(TestOverlayAuxReader::NAME), FileIOException);
+    EXPECT_FALSE(segment.overlays()[0]->isOpen());
+    EXPECT_NE(nullptr, dynamic_cast<TestOverlayAuxReader*>(segment.getAuxReader(TestOverlayAuxReader::NAME).get()));
+  }
 }
