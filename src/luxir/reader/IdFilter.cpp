@@ -258,6 +258,12 @@ std::vector<char> encodeBloom(const std::vector<uint32_t>& words, uint32_t bitsP
   return out;
 }
 
+// Extra memory a FUSE finish() over `keys` keys holds: scratch and the output.
+uint64_t fuseFinishBytes(uint64_t keys, uint32_t fingerprintBits) noexcept {
+  auto shape = fuse::shapeFor(keys);
+  return fuse::scratchBytes(keys, shape) + IdFilter::HEADER_BYTES + shape.arrayLength() * (fingerprintBits / 8);
+}
+
 void bloomAdd(std::vector<uint32_t>& words, uint64_t hash) noexcept {
   auto* block = words.data() + blockOf(hash, words.size() / IdFilter::BLOCK_WORDS) * IdFilter::BLOCK_WORDS;
   for (size_t w = 0; w < IdFilter::BLOCK_WORDS; w++) block[w] |= bitOf(hash, w);
@@ -271,6 +277,14 @@ uint64_t IdFilter::bloomBlocksFor(const Options& options, uint64_t keys) noexcep
   auto bits = std::max<uint64_t>(keys, 1) * options.bitsPerKey;
   bits = std::max<uint64_t>(bits, (uint64_t)options.minBytes * 8);
   return std::clamp<uint64_t>((bits + BLOCK_BYTES * 8 - 1) / (BLOCK_BYTES * 8), 1, MAX_BLOCKS);
+}
+
+uint64_t IdFilter::buildBytes(const Options& options, uint64_t keys) noexcept {
+  switch (options.kind) {
+    case Kind::BLOOM: return bloomBlocksFor(options, keys) * BLOCK_BYTES;
+    case Kind::FUSE: return keys * sizeof(uint64_t) + fuseFinishBytes(keys, options.fingerprintBits);
+    default: return 0;
+  }
 }
 
 std::optional<IdFilter> IdFilter::parse(std::span<const char> bytes) noexcept {
@@ -347,9 +361,7 @@ void IdFilter::Builder::add(uint64_t hash) {
 }
 
 size_t IdFilter::Builder::finishBytes() const noexcept {
-  if (options.kind != Kind::FUSE) return 0;
-  auto shape = fuse::shapeFor(keys.size());
-  return fuse::scratchBytes(keys.size(), shape) + HEADER_BYTES + shape.arrayLength() * (options.fingerprintBits / 8);
+  return options.kind == Kind::FUSE ? fuseFinishBytes(keys.size(), options.fingerprintBits) : 0;
 }
 
 std::vector<char> IdFilter::Builder::finish() {

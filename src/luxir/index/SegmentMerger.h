@@ -957,13 +957,18 @@ private:
       numValues += values;
       if (!field.record->points()) synthesizedPointValues += values;
     }
-    int64_t pointsBytes = hasOneDimensionalPoints(type, allFlags)
+    // Indexes rebuilt beside the values: points, and a root id dictionary's
+    // filter, which a staged charge covers again while it lives.
+    int64_t rebuiltBytes = hasOneDimensionalPoints(type, allFlags)
         ? MergeCostModel::pointsBytes((int64_t)fields.size(), numValues,
                                       synthesizedPointValues)
         : hasGeoPoints(type, allFlags)
           ? MergeCostModel::geoPointsBytes(numValues)
           : hasRangePoints(type, allFlags)
             ? MergeCostModel::rangePointsBytes(numValues) : 0;
+    if (type == FieldType::ID && space.ordinal == SpaceOrdinal::ROOT) {
+      rebuiltBytes += (int64_t)IdFilter::buildBytes(postingsWriter.idFilterOptions, (uint64_t)space.maxDoc);
+    }
 
     if (storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS) != 0
         && ordColumn) {
@@ -978,21 +983,21 @@ private:
         int64_t blocks = (numValues + OrdColumnFormat::BLOCK_SIZE - 1) / OrdColumnFormat::BLOCK_SIZE;
         return mapBytes + (int64_t)fields.size() * sizeof(std::vector<uint32_t>)
             + blocks * (2 * sizeof(OrdColumnFormat::PredictedBlockPlan))
-            + MergeCostModel::LIGHT_BYTES + pointsBytes;
+            + MergeCostModel::LIGHT_BYTES + rebuiltBytes;
       }
       // Single-valued columns hold the term-order -> doc-order transposition
       // in RAM until the postings pass finishes: OrdCollector's
       // ords[mergedMaxDoc] (int32).
       return (int64_t)space.maxDoc * 4
-          + MergeCostModel::LIGHT_BYTES + pointsBytes;
+          + MergeCostModel::LIGHT_BYTES + rebuiltBytes;
     }
     if (storage == FieldType::Storage::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Text postings stream. What accumulates is the norms build (roughly one
       // byte per doc-with-field plus its DocStream).
-      return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + pointsBytes;
+      return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + rebuiltBytes;
     }
     // Int/str/vector columns and stored fields stream through fixed block buffers.
-    return MergeCostModel::LIGHT_BYTES + pointsBytes;
+    return MergeCostModel::LIGHT_BYTES + rebuiltBytes;
   }
 
   // In postings and values processed. A merged term is a heap step over the
