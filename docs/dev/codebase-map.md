@@ -186,6 +186,11 @@ locations, browse `src/luxir/<area>/`.
      delegates. `DirectoryFactory::find<T>()` reaches per-node storage state through the wrappers;
      `Directory::capabilities()` (`HARD_LINK`, `ATOMIC_RENAME`, `DURABLE_SYNC`, `MEMORY_MAPPED`,
      `REMOTE`) lets callers fall back (`reuseFiles` copies when links are unavailable)
+   - `IoContext` / `IoScope` / `IoCounters` (`util/IoContext.h`): the thread-local request I/O
+     context (query id, deadline, cancellation, fill hint, per-request I/O counters) that storage
+     layers and backends read and count into; `SearchRequest::io` is installed by `submitBody`,
+     carried into tasks by `FanoutScope` (`bindIoContext`), counted by `SegmentCore` acquires and
+     reported in the profile
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)

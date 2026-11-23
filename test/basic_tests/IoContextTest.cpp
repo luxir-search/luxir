@@ -9,12 +9,69 @@
 #include <thread>
 #include <vector>
 
+#include "luxir/store/DelegatingDirectory.h"
+#include "luxir/store/StorageRegistry.h"
 #include "luxir/util/IoContext.h"
 #include "luxir/util/thread.h"
+#include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
+#include "test/TestUtils.h"
 
 using namespace luxir;
 
 namespace {
+
+// Acquires the io_held layer saw while a request context was installed.
+struct AcquireTotals {
+  std::atomic<uint64_t> ranges{0};
+  std::atomic<uint64_t> bytes{0};
+};
+AcquireTotals acquireTotals;
+
+// Hands out the inner file's views but reports them as held, as a backend
+// that copies ranges does, so segments acquire and retain each part.
+class HeldInputFile : public InputFile {
+  std::shared_ptr<InputFile> inner;
+
+public:
+  explicit HeldInputFile(std::shared_ptr<InputFile> inner) : inner(std::move(inner)) {}
+  size_t size() override { return inner->size(); }
+  bool holdsFree() const override { return false; }
+  HeldRange acquire(ByteRange range) override {
+    if (IoContext::current()) {
+      acquireTotals.ranges.fetch_add(1, std::memory_order_relaxed);
+      acquireTotals.bytes.fetch_add(range.length, std::memory_order_relaxed);
+    }
+    return inner->acquire(range);
+  }
+};
+
+class HeldDirectory : public DelegatingDirectory {
+public:
+  using DelegatingDirectory::DelegatingDirectory;
+  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
+    auto file = delegate->openFile(name, expectSynced);
+    return file ? std::make_shared<HeldInputFile>(std::move(file)) : file;
+  }
+};
+
+class HeldLayer : public DelegatingDirFactory {
+public:
+  using DelegatingDirFactory::DelegatingDirFactory;
+  std::shared_ptr<Directory> directory(StorageRoot root, std::string_view path, ViewOptions options = {}) override {
+    return std::make_shared<HeldDirectory>(delegate->directory(root, path, std::move(options)));
+  }
+  std::string describe() const override { return "io_held(" + delegate->describe() + ")"; }
+};
+
+// Registered before the registries freeze at test startup.
+const bool heldLayerRegistered = [] {
+  StorageRegistry::global().addLayer(
+      "io_held", [](std::unique_ptr<DirectoryFactory> inner, const StorageContext&) -> std::unique_ptr<DirectoryFactory> {
+        return std::make_unique<HeldLayer>(std::move(inner));
+      });
+  return true;
+}();
 
 IoContext context(uint64_t queryId, IoCounters* counters = nullptr) {
   IoContext io;
@@ -134,4 +191,42 @@ TEST(IoContextTest, waitsEndAMarginBeforeTheDeadline) {
   EXPECT_EQ(now - 1s, io.waitDeadline());
   io.setDeadline(now + 30s, now);
   EXPECT_EQ(IoContext::Clock::time_point::max(), io.shared().waitDeadline());
+}
+
+// A search over storage that hands out held ranges reports the ranges its
+// segments acquired, exactly as the storage saw them under its context. A
+// repeat finds every range held and acquires none.
+TEST(IoContextTest, searchProfileCountsAcquires) {
+  using namespace luxir::test;
+  LuxirConfig config;
+  config.store.backend = "ram";
+  config.store.layers = {"io_held"};
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  std::vector<Doc> docs;
+  for (int i = 0; i < 100; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i), "text_un", (i == 50 ? "needle hay " : "hay ") + std::to_string(i)));
+  }
+  ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto search = [&] {
+    auto req = localReq(h.getSearchEngine());
+    req->collection("main").profile().topDocs("q").matchQuery("text_un", "needle").fields({"id", "text_un"});
+    req->execute(true);
+    EXPECT_OK(req);
+    return req->responses.back()->proto.profile.value_or(api::ExecutionProfile{});
+  };
+  auto metric = [&] { return node.metrics->counts().counters[(size_t)MetricCounter::SEARCH_IO_ACQUIRES]; };
+  auto ranges = acquireTotals.ranges.load();
+  auto bytes = acquireTotals.bytes.load();
+  auto metricBefore = metric();
+  auto cold = search();
+  EXPECT_GT(cold.io_acquires, 0u);
+  EXPECT_EQ(acquireTotals.ranges.load() - ranges, cold.io_acquires);
+  EXPECT_EQ(acquireTotals.bytes.load() - bytes, cold.io_acquired_bytes);
+  EXPECT_EQ(0u, cold.io_requests);  // this storage issues no store requests
+  EXPECT_EQ(metricBefore + cold.io_acquires, metric());
+
+  auto warm = search();
+  EXPECT_EQ(0u, warm.io_acquires);
+  EXPECT_EQ(0u, warm.io_acquired_bytes);
 }

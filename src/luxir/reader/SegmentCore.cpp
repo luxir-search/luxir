@@ -11,6 +11,7 @@
 #include "ReaderErrors.h"
 #include "OwnershipShape.h"
 #include "luxir/api/luxir_index.hpp"
+#include "luxir/util/IoContext.h"
 
 namespace luxir {
 
@@ -44,6 +45,7 @@ std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice pa
   auto found = holds.lower_bound(key);
   if (found != holds.end() && found->first == key) return found->second.bytes();
   auto hold = file.acquire({part.location.offset(), part.bytes});
+  countAcquire(part.bytes);
   return holds.emplace_hint(found, key, std::move(hold))->second.bytes();
 }
 
@@ -121,6 +123,7 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
         corruptSegment(segment, "segment file is too short", {}, number);
       }
       auto header = file->acquire({0, Postings::LUXIR_HEADER.size()});
+      if (!file->holdsFree()) countAcquire(header.getLength());
       validateSegmentFileHeader(header.bytes(), segment, number);
     }
     bool holdsFree = file->holdsFree();

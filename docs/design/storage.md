@@ -177,6 +177,14 @@ physical endpoint pairs. The state byte carries the segment-specific
 `MAY_HAVE_FITTED` flag and records the presence of bounds and an explicit
 column value count. The field type determines the bounds kind.
 
+A search counts the holds its segments take while it runs: every range a
+segment acquires from a file that is not `holdsFree()` adds to the request's
+`IoCounters` (`src/luxir/util/IoContext.h`), and the totals appear in the
+search profile as `io_acquires` and `io_acquired_bytes`. The search installs
+its `IoContext` on the threads that work for it, so storage code also sees the
+request's deadline, stop token and fill hint, and a backend counts its own
+store requests and rounds there.
+
 The first step-4 work is a prototype of range reads against MinIO or S3. It
 should show that eviction stays bounded with more data than the cache holds
 and that fetch failures propagate correctly. Its measurements set chunk
