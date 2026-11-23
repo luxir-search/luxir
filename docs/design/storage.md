@@ -154,14 +154,32 @@ where the reader cannot derive them from the record and row-space counts.
 The parts are the term dictionary and its postings, one column, points,
 norms, a stored-fields resource, a docs bitmap, end value ranks, vector
 owners, and the id filter. The id filter is a part of the root `id` field
-only: a split-block Bloom filter over the dictionary's terms, about 10 bits
-per term in 32-byte blocks, sized for the segment's document count. Its keys
-are the XXH3 of each term as the dictionary stores it (the fitted form, so a
-long id is never falsely absent), the same hash whose low byte the term
-blocks keep. Every flush and merge rebuilds it from the terms it writes, so
-it has exactly one key per term. The writer checks an id against the exact
-dictionary bounds in the record header and then the filter, and looks up
-only the segments and ids that pass. About 1% of absent ids pass.
+only: a membership filter over the dictionary's terms. Its keys are the XXH3
+of each term as the dictionary stores it (the fitted form, so a long id is
+never falsely absent), the same hash whose low byte the term blocks keep.
+Every flush and merge rebuilds it from the terms it writes, so it has exactly
+one key per term. The writer checks an id against the exact dictionary bounds
+in the record header and then the filter, and looks up only the segments and
+ids that pass.
+
+The part starts with a 24-byte header that names its kind and parameters, so
+a reader needs nothing else and the writer may change them freely
+(`--indexing.id-filter`, see the operations guide). Two kinds exist:
+
+- `bloom`: a split-block Bloom filter in 32-byte blocks, sized for the
+  segment's document count at 16 bits per id by default (about 0.13% of
+  absent ids pass), and at least 16 KiB so a small segment almost always
+  excludes an absent id. Built in one pass.
+- `fuse8` and `fuse16`: a 3-wise binary fuse filter with 8- or 16-bit
+  fingerprints, 1.13 (millions of ids) to about 1.25 (thousands) fingerprints
+  per id. 0.39% or 0.0015% of absent
+  ids pass. It is static: the writer holds every key's hash until the
+  dictionary ends and then builds it.
+
+A batch of ids skips a segment only when every id misses, so the false
+positive rate that matters is per batch: at 2,000 ids per commit, a 16-bit
+Bloom filter skips about 7% of segments and `fuse16` about 97%. Which kind
+to ship as the default is to be settled by benchmarking both.
 
 Each field record encodes the schema flags as an unsigned vint, excluding
 `ABSTRACT` and `DERIVED`. Bits 0-2 encode the cumulative postings level

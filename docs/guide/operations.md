@@ -821,6 +821,30 @@ the node unlimited. The resolved values are logged at startup.
   `indexing.pressure-flush-floor-mb`, default 4). Without a waiting merge,
   inverters are flushed only once the whole budget is in use.
 
+### Id filters
+
+Applying a delete or an update by id looks up the id in every segment that
+could hold it. Each segment's id filter rules most segments out without
+reading their id dictionaries, which matters most when those segments are on
+remote storage.
+
+```bash
+./luxir --indexing.id-filter=fuse16
+```
+
+- `indexing.id-filter` picks what new segments get: `bloom` (default),
+  `fuse8`, `fuse16` or `none`. Each segment records its own filter, so a
+  change needs no reindex; merged segments move to the current choice.
+- `indexing.id-filter-bits-per-key` (default 16) and `indexing.id-filter-min-kb`
+  (default 16) size a `bloom` filter. More bits per id lower its false
+  positive rate (about 1.3% at 10, 0.13% at 16, 0.004% at 32) at that many
+  bits of RAM and disk per document.
+- `fuse16` costs about 18-20 bits per id and lets 0.0015% of absent ids through,
+  so even a large batch of ids usually skips a segment. Building it holds
+  about 35 bytes per id while a segment's id dictionary is written.
+- `none` writes no filter; deletes then look up every segment whose id range
+  overlaps the batch.
+
 `--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
 transparent huge pages for whole-huge-page indexing allocations; disable it
 with `--no-indexing.huge-pages` (or `--indexing.huge-pages=false`). This is a
