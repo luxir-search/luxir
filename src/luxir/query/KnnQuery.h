@@ -2245,6 +2245,8 @@ public:
         return selector.withProbe(ivf.ntotal, scan);
       }
 
+      static constexpr uint32_t MAX_PROBE_BACKOFF = 6;
+
       template <bool Interval, class Probe>
       LUXIR_NOINLINE VectorSearchWork scanListsWithProbe(const VectorSearchRequest& request,
                                std::span<const faiss::idx_t> listIds,
@@ -2276,6 +2278,30 @@ public:
         const float* listAmplitudes = nullptr;
         double selectionScale = 0;
         const faiss::idx_t* rowIds = nullptr;
+        // Cold lists on a mapped file fault page by page, each a blocking
+        // device read, so a round reads its lists ahead. A round is shorter
+        // than the gate's fault checks, so a sampled page of the unit's first
+        // list turns advice on. The gate is the thread's, so short units add
+        // up to its checks. A probe costs two getrusage calls, so after n
+        // warm probes in a row a thread probes every 2^n units (at most 64).
+        // Held lists were acquired before the round.
+        thread_local RowReadAhead::Gate gate;
+        thread_local uint32_t warmProbes = 0, unitsSinceProbe = 0;
+        InputFile* viewFile = lists.viewFile();
+        RowReadAhead ahead(gate, viewFile, 0, 1, viewFile ? (int64_t)viewFile->size() : 0);
+        bool probeCold = viewFile != nullptr && !ahead.active()
+            && ++unitsSinceProbe >= (1u << std::min(warmProbes, MAX_PROBE_BACKOFF));
+        auto queueList = [&](int64_t k) {
+          auto id = listIds[(size_t)k];
+          if (id < 0) return;
+          auto section = [&](HeldInvertedLists::Section part) {
+            ByteRange range = lists.rangeOf((size_t)id, part);
+            ahead.queueRows((int64_t)range.offset, (int64_t)(range.offset + range.length));
+          };
+          section(HeldInvertedLists::IDS);
+          section(HeldInvertedLists::CODES);
+          if constexpr (Interval) section(HeldInvertedLists::AMPLITUDES);
+        };
         // The candidate test after any scoring: the handler's threshold moves
         // as results arrive, so rows are admitted strictly in order.
         auto admit = [&](float distance, size_t row) LUXIR_INLINE {
@@ -2293,6 +2319,14 @@ public:
           auto id = listIds[list];
           if (id < 0) continue;
           size_t count = lists.list_size((size_t)id);
+          if (probeCold && count > 0) {
+            probeCold = false;
+            ByteRange codeRange = lists.rangeOf((size_t)id, HeldInvertedLists::CODES);
+            ahead.probe({(int64_t)(codeRange.offset + codeRange.length / 2)});
+            unitsSinceProbe = 0;
+            warmProbes = ahead.active() ? 0 : warmProbes + 1;
+          }
+          ahead.sparseAt((int64_t)list, (int64_t)listIds.size(), queueList);
           faiss::InvertedLists::ScopedIds ids(&lists, (size_t)id);
           faiss::InvertedLists::ScopedCodes codes(&lists, (size_t)id);
           std::optional<HeldInvertedLists::Amplitudes> heldAmplitudes;

@@ -395,6 +395,8 @@ public:
 
   /// True when lists point into the file's view: nothing to hold or batch.
   bool holdsFree() const noexcept { return view.getData() != nullptr; }
+  /// The file, for read-ahead advice on a free view; null otherwise.
+  InputFile* viewFile() const noexcept { return holdsFree() ? &file : nullptr; }
   bool hasAmplitudes() const noexcept { return rowBytes[AMPLITUDES] != 0; }
   size_t totalSize() const noexcept { return offsets.back(); }
 

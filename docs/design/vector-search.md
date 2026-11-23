@@ -357,7 +357,8 @@ forced into process RAM.
 The overlay's metadata records the header's length, so opening the reader
 acquires the header, the list-size table and the fixed-size footer in one
 batch, and nothing else. On a mapped or RAM file lists point into the file's
-view. On other backends each list is held only while it is read: FAISS's `get_ids` /
+view, and a scan reads cold lists ahead through `RowReadAhead`. On other
+backends each list is held only while it is read: FAISS's `get_ids` /
 `get_codes` acquire the list's range and `release_ids` / `release_codes`
 release it. A kNN round holds the lists it is about to scan first, one batch
 per segment, issued for all segments before waiting on any. Under deletes the
