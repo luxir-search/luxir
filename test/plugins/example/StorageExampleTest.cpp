@@ -111,7 +111,7 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
   auto primary = writer->dir.openFile(Postings::getIndexFileName(segmentName, 0));
   auto catalogBytes = primary->acquire({range.offset, range.length});
   auto catalog = SegmentCatalog::decode(
-      SegmentCatalog::readDirectory(catalogBytes.bytes(), range.offset, primary->size()), source.files, {});
+      SegmentCatalog::readDirectory(catalogBytes.bytes(), range, primary->size()), source.files, {});
 
   auto counters = std::make_shared<StrictStorageCounters>();
   StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
