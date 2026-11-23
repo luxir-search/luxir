@@ -3,34 +3,61 @@
 
 #pragma once
 
+#include <cstring>
+#include <format>
 #include <span>
+#include <stdexcept>
 #include "StrColReader.h"
+#include "luxir/codec/VectorCodec.h"
+#include "luxir/schema/FieldType.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/screaming.h"
 
 namespace luxir {
 
-/// Thin wrapper around StrColReader that reinterprets the column's
-/// fixed-size byte blobs as float vectors.  Dimensions are derived from the
-/// column's fixedValueSize (dims = fixedValueSize / sizeof(float)); the
-/// schema does not need to declare dims.
+/// Thin wrapper around StrColReader that interprets the column's fixed-size
+/// byte blobs as vectors in the segment's VectorEncoding (recorded on the
+/// column descriptor, not taken from the schema).  Dimensions are derived from
+/// the column's fixedValueSize and the encoding; the schema does not need to
+/// declare dims.
 ///
-/// For single-valued fields, singleVectorAt(docRank) returns one span per doc.
-/// For multi-valued, valueRange(docRank) gives [startValueRank, endValueRank) and
-/// vectorAtRank(r) returns the r-th vector in the flat per-segment list.
+/// rowAtRank(r) returns the r-th stored value in its encoding (score it with a
+/// VectorScorer), decodeAtRank(r) materializes it as floats.  For multi-valued
+/// fields, valueRange(docRank) gives [startValueRank, endValueRank).
 class VectorReader {
   StrColReader column;
+  VectorEncoding vectorEncoding;
   int32_t dimensions;
+
+  static VectorEncoding columnEncoding(const DecodedFieldRecord& fieldInfo) {
+    const auto* bytes = fieldInfo.bytesColumn();
+    return (VectorEncoding)(bytes ? bytes->vectorEncoding : 0);
+  }
 
 public:
   VectorReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
     : column(reader, fieldInfo),
-      dimensions(column.fixedValueSize() / (int32_t)sizeof(float)) {
-    assert(column.isFixedSize());
-    assert(column.fixedValueSize() % (int32_t)sizeof(float) == 0);
+      vectorEncoding(columnEncoding(fieldInfo)),
+      dimensions(0) {
+    if (!vcodec::valid((int32_t)vectorEncoding) || !column.isFixedSize()) {
+      throw std::runtime_error(std::format(
+        "vector field '{}' has an unsupported column layout (encoding {})",
+        (std::string_view)fieldInfo.name, (int32_t)vectorEncoding));
+    }
+    dimensions = vcodec::dimsFromBytes(vectorEncoding, column.fixedValueSize());
+    if (dimensions < 0) {
+      throw std::runtime_error(std::format(
+        "vector field '{}' value size {} is invalid for encoding {}",
+        (std::string_view)fieldInfo.name, column.fixedValueSize(), vcodec::name(vectorEncoding)));
+    }
   }
 
   int32_t dims() const { return dimensions; }
+
+  VectorEncoding encoding() const { return vectorEncoding; }
+
+  /// Stored bytes per vector.
+  int32_t valueBytes() const { return column.fixedValueSize(); }
 
   int32_t docsWithField() const { return column.docsWithField(); }
 
@@ -38,20 +65,47 @@ public:
 
   bool multiValued() const { return column.multiValued(); }
 
-  /// Vector at a global value rank (0..numVectors()-1).
+  /// Stored value (in this segment's encoding) at a global value rank
+  /// (0..numVectors()-1).
+  std::string_view rowAtRank(int64_t valueRank) const {
+    return column.valueAt(valueRank);
+  }
+
+  /// Decodes the vector at a global value rank into out[0..dims()).
+  void decodeAtRank(int64_t valueRank, float* out) const {
+    vcodec::decode(vectorEncoding, rowAtRank(valueRank).data(), dimensions, out);
+  }
+
+  /// Decodes n consecutive vectors starting at valueRank into out (n * dims()).
+  void decodeRange(int64_t valueRank, int64_t n, float* out) const {
+    if (n <= 0) return;
+    const char* base = rowAtRank(valueRank).data();
+    int64_t stride = valueBytes();
+    if (vectorEncoding == VectorEncoding::F32) {
+      std::memcpy(out, base, (size_t)(n * stride));
+      return;
+    }
+    for (int64_t i = 0; i < n; i++) {
+      vcodec::decode(vectorEncoding, base + i * stride, dimensions, out + i * dimensions);
+    }
+  }
+
+  /// F32 columns only: the vector at a global value rank, without a copy.
+  /// Other encodings must go through rowAtRank or decodeAtRank; reading their
+  /// bytes as floats would return garbage, so this is checked in every build.
   LUXIR_INLINE std::span<const float> vectorAtRank(int64_t valueRank) const {
+    if (vectorEncoding != VectorEncoding::F32) [[unlikely]] notF32();
     auto bytes = column.valueAt(valueRank);
     return std::span<const float>((const float*)bytes.data(), (size_t)dimensions);
   }
 
-  /// Single-valued accessor: vector for the doc at the given doc rank.
+  /// F32 columns only, single-valued: the vector for the doc at a doc rank.
   std::span<const float> singleVectorAt(int32_t docRank) const {
     assert(!multiValued());
     return vectorAtRank((int64_t)docRank);
   }
 
   /// Multi-valued accessor: [startValueRank, endValueRank) of the given doc rank.
-  /// Caller iterates with vectorAtRank to materialize each vector.
   std::pair<int64_t, int64_t> valueRange(int32_t docRank) const {
     assert(multiValued());
     return column.getStartEndValueRank(docRank);
@@ -72,6 +126,12 @@ public:
   StrColReader& strColReader() { return column; }
 
   using Iterator = StrColReader::DocIterator;
+
+private:
+  [[noreturn]] void notF32() const {
+    throw std::logic_error(std::format(
+      "f32 vector accessor used on a {} column", vcodec::name(vectorEncoding)));
+  }
 };
 
 /// Build a pool-backed valueRank -> docId resolver for a sparse single-valued vector
@@ -83,6 +143,25 @@ inline screaming::BitSet::Selector* makeValueDocSelector(MemPool& pool,
                                                          const screaming::BitSet& bitset) {
   return pool.make<screaming::BitSet::Selector>(
       bitset, pool.make_span<int32_t>((size_t)bitset.nBuckets + 1));
+}
+
+/// Finds a vector field's keep_original companion column in one segment, or
+/// null when it is missing or not aligned value-for-value with the encoded
+/// column.  The two are written in lockstep, so equal value and doc counts
+/// mean every encoded value has its original at the same rank; a segment
+/// merged from inputs written before keep_original was enabled holds a
+/// partial companion, which is ignored.
+inline const DecodedFieldRecord* findOriginalColumn(PostingsReader& postingsReader,
+                                                    const DecodedFieldRecord& encoded) {
+  std::string name = VectorFieldType::originalColumnName((std::string_view)encoded.name);
+  const DecodedFieldRecord* original = postingsReader.fieldInfo(name);
+  if (original == nullptr || original->type != FieldType::VECTOR) return nullptr;
+  const auto* bytes = original->bytesColumn();
+  if (bytes == nullptr || bytes->vectorEncoding != (uint8_t)VectorEncoding::F32) return nullptr;
+  if (original->numValues != encoded.numValues || original->docsWithField != encoded.docsWithField) {
+    return nullptr;
+  }
+  return original;
 }
 
 } // namespace luxir

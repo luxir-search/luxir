@@ -44,6 +44,7 @@
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/StrColReader.h"
 #include "luxir/reader/TermsEnum.h"
+#include "luxir/reader/VectorReader.h"
 #include "luxir/search/Collector.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/search/ValueOutput.h"
@@ -601,15 +602,30 @@ inline void loadVersionRuns(SearchRequest& req, IndexReader& reader, std::span<c
   });
 }
 
-// Copy raw column bytes into a Vector.f32's arena float buffer.  memcpy
-// sidesteps alignment of the source bytes (column storage is byte-packed
-// and not guaranteed 4-byte aligned).
-inline void fillVectorF32(luxir::api::Vector& vec, std::string_view bytes, std::pmr::memory_resource& mr) {
-  assert(bytes.size() % sizeof(float) == 0);
-  int32_t nFloats = (int32_t)(bytes.size() / sizeof(float));
+// Decode one stored vector value (in its segment's encoding) into a
+// Vector.f32's arena float buffer.  Decoding copies, which sidesteps alignment
+// of the source bytes (column storage is byte-packed and not guaranteed
+// 4-byte aligned).
+inline void fillVectorF32(luxir::api::Vector& vec, std::string_view bytes, VectorEncoding encoding,
+                          std::pmr::memory_resource& mr) {
+  int32_t dims = vcodec::dimsFromBytes(encoding, (int32_t)bytes.size());
+  assert(dims >= 0);
   vec.f32.emplace();
-  float* fs = build::allocArray(vec.f32->v, nFloats, mr);
-  std::memcpy(fs, bytes.data(), bytes.size());
+  float* fs = build::allocArray(vec.f32->v, dims, mr);
+  vcodec::decode(encoding, bytes.data(), dims, fs);
+}
+
+// Field info of the column to return for a vector field in one segment: the
+// keep_original column when it is present and aligned, else the encoded one.
+inline const DecodedFieldRecord& vectorReturnColumn(PostingsReader& postingsReader,
+                                                    const DecodedFieldRecord& info) {
+  const DecodedFieldRecord* original = findOriginalColumn(postingsReader, info);
+  return original ? *original : info;
+}
+
+inline VectorEncoding vectorColumnEncoding(const DecodedFieldRecord& info) {
+  const auto* bytes = info.bytesColumn();
+  return (VectorEncoding)(bytes ? bytes->vectorEncoding : 0);
 }
 
 inline void loadVectorColForSegmentSingle(SearchRequest& req, IndexReader& reader, const DecodedFieldRecord* info,
@@ -625,13 +641,15 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, IndexReader& reade
   if (!bytes) return;
   auto& postingsReader = reader.segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
+  const DecodedFieldRecord& returned = vectorReturnColumn(postingsReader, *info);
+  auto encoding = vectorColumnEncoding(returned);
 
   auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes) {
     assert(segDocs[idxSpan[idx]].docId() == doc);
     unused(doc);
-    fillVectorF32(target[idxSpan[idx]], bytes, mr);
+    fillVectorF32(target[idxSpan[idx]], bytes, encoding, mr);
   };
-  StrColReader::getValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
+  StrColReader::getValues(poolGuard.pool(), postingsReader, returned, sortedDocs, valHandler);
 }
 
 inline void loadVectorColForSegmentMulti(SearchRequest& req, IndexReader& reader, const DecodedFieldRecord* info,
@@ -647,6 +665,8 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, IndexReader& reader
   if (!bytes) return;
   auto& postingsReader = reader.segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
+  const DecodedFieldRecord& returned = vectorReturnColumn(postingsReader, *info);
+  auto encoding = vectorColumnEncoding(returned);
 
   // Multi-valued vectors: each doc's ArrVector holds numValues Vectors. numValues
   // is known at valIdx==0, so the inner Vector span is allocArray'd then filled
@@ -656,9 +676,9 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, IndexReader& reader
     unused(doc);
     luxir::api::ArrVector& outer = target[idxSpan[idx]];
     if (valIdx == 0) build::allocArray(outer.v, numValues, mr);
-    fillVectorF32(const_cast<luxir::api::Vector*>(outer.v.data())[valIdx], bytes, mr);
+    fillVectorF32(const_cast<luxir::api::Vector*>(outer.v.data())[valIdx], bytes, encoding, mr);
   };
-  StrColReader::getMultiValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
+  StrColReader::getMultiValues(poolGuard.pool(), postingsReader, returned, sortedDocs, valHandler);
 }
 
 // Decode a VECTOR column's bytes back to floats in the response.

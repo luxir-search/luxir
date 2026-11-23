@@ -43,7 +43,7 @@ namespace {
 // The digest of the reference index written by IndexFormat::VERSION. A byte
 // change requires reviewing the format version. Writer choices among layouts
 // already supported by that version can change the digest within the version.
-constexpr uint64_t kReferenceVersion = 18;
+constexpr uint64_t kReferenceVersion = 19;
 constexpr uint64_t kReferenceDigest = 0x55b9af943d4c4000;
 
 constexpr IdFilter::Options REFERENCE_ID_FILTER = {.kind = IdFilter::Kind::BLOOM};
