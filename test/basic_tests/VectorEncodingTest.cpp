@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,7 @@ namespace {
 
 constexpr int32_t DIMS = 8;
 using Vec = std::vector<float>;
+using Vecs = std::vector<Vec>;
 
 // Doc i lies at a monotonically worse L2 distance, inner product, and cosine
 // from QUERY as i grows, with gaps far above sq8 quantization error.
@@ -42,6 +44,16 @@ Vec docVec(int i) {
     v[(size_t)j] = QUERY[(size_t)j] * (1.0f - 0.05f * (float)i) + SIDE[(size_t)j] * 0.1f * (float)i;
   }
   return v;
+}
+
+// x as a column of encoding e stores it, decoded.
+Vec stored(api::VectorEncoding e, const Vec& x) {
+  auto encoding = (VectorEncoding)e;
+  std::vector<char> bytes((size_t)vcodec::bytesPerVector(encoding, (int32_t)x.size()));
+  vcodec::encode(encoding, x.data(), (int32_t)x.size(), bytes.data());
+  Vec out(x.size());
+  vcodec::decode(encoding, bytes.data(), (int32_t)x.size(), out.data());
+  return out;
 }
 
 struct Fields {
@@ -91,8 +103,44 @@ std::vector<std::string> knnIds(std::string_view field, int32_t k, bool exact = 
   return ids;
 }
 
+// Every live doc's enc_v vectors by id, as retrieval decodes them.
+std::map<std::string, Vecs> retrieved() {
+  auto* req = LocalReq::create(LuxirTest::luxirNode->getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id", "enc_v"}).limit(-1);
+  req->execute();
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  std::map<std::string, Vecs> out;
+  for (const auto& doc : req->getDocs()) {
+    auto& vecs = out[std::get<std::string>(*find(doc, "id"))];
+    if (const auto* val = find(doc, "enc_v")) {
+      if (const auto* one = std::get_if<Vec>(val)) vecs.push_back(*one);
+      else vecs = std::get<Vecs>(*val);
+    }
+  }
+  req->done();
+  return out;
+}
+
 std::shared_ptr<IndexReader> reader(CollectionHelper& h) {
   return h.getIndexWriter()->snapshots.readers.getReader();
+}
+
+// enc_v's encoding in each segment that has it.
+std::vector<VectorEncoding> segmentEncodings(CollectionHelper& h) {
+  std::vector<VectorEncoding> out;
+  auto r = reader(h);
+  for (auto& seg : r->segments()) {
+    if (const DecodedFieldRecord* found = seg.postingsReader().fieldInfo("enc_v")) {
+      out.push_back(VectorReader::encodingOf(*found));
+    }
+  }
+  return out;
+}
+
+void mergeAll(CollectionHelper& h) {
+  h.getIndexWriter()->mergeSegments();
+  h.commit();
+  ASSERT_EQ(1u, reader(h)->segments().size());
 }
 
 // Every stored row of a column across segments, sorted (merge-order free).
@@ -307,6 +355,30 @@ TEST_F(VectorEncodingTest, promotionToF32RenormalizesCosine) {
     }
     EXPECT_NEAR(1.0f, norm, 1e-5);
   }
+}
+
+// Re-encoding to f16 in a merge clamps elements beyond its range and logs the
+// clamped count once for the field.  Every input is in an out-of-date
+// encoding here.
+TEST_F(VectorEncodingTest, mergeToF16Clamps) {
+  CollectionHelper h("main");
+  installFields(h.collection(), {});
+  Vec big = docVec(1);
+  big[2] = 100000.0f;
+  h.index(flatdoc("id", std::string("big"), "enc_v", big));
+  h.commit();
+  h.index(flatdoc("id", std::string("small"), "enc_v", docVec(2)));
+  h.commit();
+  installFields(h.collection(), {.encoding = api::VectorEncoding::F16});
+  ExpectLog warn("field 'enc_v': clamped 1 element(s)");
+  mergeAll(h);
+  EXPECT_EQ(1u, warn.suppressed());
+  EXPECT_EQ(std::vector{VectorEncoding::F16}, segmentEncodings(h));
+  Vec clamped = big;
+  clamped[2] = 65504.0f;
+  auto docs = retrieved();
+  EXPECT_EQ(Vecs{stored(api::VectorEncoding::F16, clamped)}, docs["big"]);
+  EXPECT_EQ(Vecs{stored(api::VectorEncoding::F16, docVec(2))}, docs["small"]);
 }
 
 // IVF+PQ overlays build from f16 / bf16 / sq8 columns; rescored ANN results match

@@ -615,11 +615,6 @@ inline void fillVectorF32(luxir::api::Vector& vec, std::string_view bytes, Vecto
   vcodec::decode(encoding, bytes.data(), dims, fs);
 }
 
-inline VectorEncoding vectorColumnEncoding(const DecodedFieldRecord& info) {
-  const auto* bytes = info.bytesColumn();
-  return (VectorEncoding)(bytes ? bytes->vectorEncoding : 0);
-}
-
 inline void loadVectorColForSegmentSingle(SearchRequest& req, IndexReader& reader, const DecodedFieldRecord* info,
                                           std::span<RowIndex> idxSpan,
                                           std::span<const segdoc> segDocs,
@@ -633,7 +628,7 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, IndexReader& reade
   if (!bytes) return;
   auto& postingsReader = reader.segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  auto encoding = vectorColumnEncoding(*info);
+  auto encoding = VectorReader::encodingOf(*info);
 
   auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes) {
     assert(segDocs[idxSpan[idx]].docId() == doc);
@@ -656,7 +651,7 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, IndexReader& reader
   if (!bytes) return;
   auto& postingsReader = reader.segments()[segNum].postingsReader();
   auto poolGuard = MemPool::threadLocalPoolGuard();
-  auto encoding = vectorColumnEncoding(*info);
+  auto encoding = VectorReader::encodingOf(*info);
 
   // Multi-valued vectors: each doc's ArrVector holds numValues Vectors. numValues
   // is known at valIdx==0, so the inner Vector span is allocArray'd then filled

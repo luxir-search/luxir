@@ -28,15 +28,16 @@ class VectorReader {
   VectorEncoding vectorEncoding;
   int32_t dimensions;
 
-  static VectorEncoding columnEncoding(const DecodedFieldRecord& fieldInfo) {
+public:
+  /// The encoding recorded on a vector field's column descriptor.
+  static VectorEncoding encodingOf(const DecodedFieldRecord& fieldInfo) {
     const auto* bytes = fieldInfo.bytesColumn();
     return (VectorEncoding)(bytes ? bytes->vectorEncoding : 0);
   }
 
-public:
   VectorReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
     : column(reader, fieldInfo),
-      vectorEncoding(columnEncoding(fieldInfo)),
+      vectorEncoding(encodingOf(fieldInfo)),
       dimensions(0) {
     if (!vcodec::valid((int32_t)vectorEncoding) || !column.isFixedSize()) {
       throw std::runtime_error(std::format(

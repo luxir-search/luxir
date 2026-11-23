@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
-#include <cmath>
-#include "luxir/codec/VectorCodec.h"
 #include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/OwnershipShape.h"
 #include <map>
@@ -19,6 +17,7 @@
 #include "PointsWriter.h"
 #include "StoredFieldsWriter.h"
 #include "StoredDictionaryRegistry.h"
+#include "VectorTranscoder.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/PosEnum.h"
 #include "luxir/reader/NormsReader.h"
@@ -1968,8 +1967,14 @@ private:
     } else if ((storage == FieldType::Storage::TERMS || storage == FieldType::Storage::VECTOR)
                && !(allFlags & FieldType::INDEX_DOCS)) {
       // Non-indexed string/binary column (column-only storage).  Vector columns use
-      // the same fixed-size binary blob format (VectorHandler extends StrColHandler).
-      if (auto column = mergeStrCol(space, sortedFields, allFlags, (std::string_view)compactFields[0]->record->name)) {
+      // the same fixed-size binary blob format (VectorHandler extends StrColHandler),
+      // with values in the encoding VectorTranscoder chooses.
+      std::optional<VectorTranscoder> vectors;
+      if (storage == FieldType::Storage::VECTOR) {
+        auto name = (std::string_view)compactFields[0]->record->name;
+        vectors.emplace(name, schema.getFieldTypePtr(name));
+      }
+      if (auto column = mergeStrCol(space, sortedFields, allFlags, vectors ? &*vectors : nullptr)) {
         outputFieldInfo.setColumn(*column);
       }
     } else {
@@ -2203,18 +2208,10 @@ private:
 
   // Merges non-indexed string/binary columns written by StrColHandler.
   // Rebuilds the value bytes, end offsets for variable-size values and end value
-  // ranks for multi-valued docs.
-  //
-  // Vector columns: values are self-describing in their segment's encoding, so
-  // when every input shares one encoding the bytes are copied verbatim (never
-  // re-quantized).  Inputs with different encodings (a schema change between
-  // them) are written in the schema's current encoding, transcoding the
-  // others, so a field converges to its declared encoding.  Transcoding clamps
-  // to the F16 range and renormalizes unit-length cosine rows written as F32.
-  // A field the schema no longer types as a vector keeps the first input's
-  // encoding.
+  // ranks for multi-valued docs.  A vector column's values pass through
+  // vectors, which also chooses the column's encoding.
   std::optional<WrittenColumn<field_parts::BytesColumn>> mergeStrCol(const Space& space, std::span<MergeFieldInfo*> sortedFields,
-                                                                     int32_t flags, std::string_view fieldName) {
+                                                                     int32_t flags, VectorTranscoder* vectors) {
     assert(sortedFields.size() == space.segs.size());
 
     auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -2258,37 +2255,6 @@ private:
       ownerOut = postingsWriter.getOutputStream();
       ownerWriter = pool.make_unique_align<MonoWriter>(8, pool, *ownerOut);
     }
-
-    auto inputEncoding = [](const MergeFieldInfo& field) {
-      const auto* bytes = field.record->bytesColumn();
-      return (VectorEncoding)(bytes ? bytes->vectorEncoding : 0);
-    };
-    bool isVector = false;
-    for (auto* f : sortedFields) {
-      if (f) {
-        isVector = f->record->type == FieldType::VECTOR;
-        break;
-      }
-    }
-    VectorEncoding outEncoding = VectorEncoding::F32;
-    bool renormalize = false;
-    if (isVector) {
-      auto* vtype = dynamic_cast<const VectorFieldType*>(schema.getFieldTypePtr(fieldName));
-      if (vtype != nullptr) {
-        outEncoding = vtype->encoding();
-        renormalize = outEncoding == VectorEncoding::F32
-            && vtype->metric() == VectorFieldType::METRIC_COSINE
-            && (vtype->normalizeOnWrite() || vtype->normalized());
-      } else {
-        for (auto* f : sortedFields) {
-          if (f == nullptr) continue;
-          outEncoding = inputEncoding(*f);
-          break;
-        }
-      }
-    }
-    std::vector<float> transcodeFloats;
-    std::vector<char> transcodeBytes;
 
     int64_t totalValues = 0;
     int32_t minSize = std::numeric_limits<int32_t>::max();
@@ -2335,34 +2301,8 @@ private:
       StrColReader::Iterator iter(reader);
       bool sourceMultiValued = reader.multiValued();
 
-      // Identity unless this input's vector encoding differs from the output's.
-      auto inEncoding = inputEncoding(*field);
-      bool transcode = isVector && inEncoding != outEncoding && reader.numValues() > 0;
-      int32_t transcodeDims = 0;
-      if (transcode) {
-        transcodeDims = vcodec::dimsFromBytes(inEncoding, reader.fixedValueSize());
-        if (!reader.isFixedSize() || transcodeDims <= 0) {
-          throw std::runtime_error("SegmentMerger: invalid vector column in field " + std::string(fieldName));
-        }
-        transcodeFloats.resize((size_t)transcodeDims);
-        transcodeBytes.resize((size_t)vcodec::bytesPerVector(outEncoding, transcodeDims));
-      }
-      auto convert = [&](std::string_view value) {
-        if (!transcode) return value;
-        vcodec::decode(inEncoding, value.data(), transcodeDims, transcodeFloats.data());
-        if (outEncoding == VectorEncoding::F16) {
-          for (auto& x : transcodeFloats) x = std::clamp(x, -vcodec::F16_MAX, vcodec::F16_MAX);
-        } else if (renormalize) {
-          double normSq = 0.0;
-          for (float x : transcodeFloats) normSq += (double)x * (double)x;
-          if (normSq > VectorFieldType::MIN_COSINE_NORM_SQ) {
-            float inv = (float)(1.0 / std::sqrt(normSq));
-            for (auto& x : transcodeFloats) x *= inv;
-          }
-        }
-        vcodec::encode(outEncoding, transcodeFloats.data(), transcodeDims, transcodeBytes.data());
-        return std::string_view(transcodeBytes.data(), transcodeBytes.size());
-      };
+      if (vectors) vectors->startInput(*field->seg->postingsReader, *field->record);
+      auto convert = [&](std::string_view value) { return vectors ? (*vectors)(value) : value; };
 
       for (int32_t localId = iter.advance(0); localId != StrColReader::Iterator::ENDDOC; localId = iter.next()) {
         auto [mappedDoc, isDeleted] = seg.remapDocId(localId);
@@ -2386,6 +2326,7 @@ private:
       }
     }
 
+    if (vectors) vectors->finish();
     if (docsWriter.numAdded() == 0) return {};
 
     valuesOut->flush(true);
@@ -2406,7 +2347,7 @@ private:
 
     auto presence = docsWriter.finish();
     field_parts::BytesColumn bytes{postingsWriter.finishStream(std::move(valuesOut)), endOffsets,
-                                   isVector ? (uint8_t)outEncoding : (uint8_t)0};
+                                   vectors ? (uint8_t)vectors->outputEncoding() : (uint8_t)0};
     return WrittenColumn{bytes, totalValues, presence, endValueRanks, owners, {}};
   }
 
