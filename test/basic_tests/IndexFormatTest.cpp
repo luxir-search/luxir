@@ -549,12 +549,17 @@ TEST_F(IndexFormatTest, catalogHashMismatchIsCorruption) {
   const auto& segment = durable.info.segments.front();
   auto range = catalogRangeFromManifest(segment.catalog);
   auto name = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
-  std::string bytes(dir.openFile(name)->read());
+  auto readWhole = [&](const std::string& file) {
+    auto input = dir.openFile(file);
+    auto hold = input->acquire({0, input->size()});
+    return std::string(hold.getData(), hold.getLength());
+  };
+  std::string bytes = readWhole(name);
   bytes[range.offset + range.length / 2] ^= 1;
   RAMDir copy;
   writeFile(copy, name, bytes);
   for (const auto& file : segment.files) {
-    if (file.name != name) writeFile(copy, file.name, dir.openFile(file.name)->read());
+    if (file.name != name) writeFile(copy, file.name, readWhole(std::string(file.name)));
   }
   expectCorrupt([&] { SegmentCore::create(copy, segment); }, name, "catalog hash differs from manifest");
   auto catalog = std::string_view(bytes).substr(range.offset);

@@ -259,7 +259,7 @@ void SegmentCore::finishOpen(const PendingOpen& pending) {
   }
   SegmentReadContext primaryContext{this, PackedTerm(nullptr), primary};
   auto bytes = slice({{primary, range.offset}, range.length}, ReadClass::METADATA);
-  auto head = SegmentCatalog::readDirectory(bytes, range.offset, files[primary].size, primaryContext);
+  auto head = SegmentCatalog::readDirectory(bytes, range, files[primary].size, primaryContext);
   catalog = SegmentCatalog::decode(head, pending.source.files, primaryContext);
   if (spaces().front().maxDoc != pending.source.maxDoc) {
     corruptSegment(pending.name, "segment row count differs from manifest");
