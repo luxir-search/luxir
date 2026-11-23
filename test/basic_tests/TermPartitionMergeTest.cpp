@@ -543,6 +543,56 @@ TEST(TermPartitionMergeTest, SerialFlushWithMoreThan64Runs) {
   EXPECT_EQ(70u, terms.estimateTermBlocks(7).size());
 }
 
+// A partitioned merge stitches each range's block offsets into one table with
+// more than one anchor group, so lookups cross anchors and range boundaries.
+TEST(TermPartitionMergeTest, PartitionedMergeAcrossOffsetAnchors) {
+  constexpr int32_t perSegment = 600;
+  auto build = [](TestIndex& index, bool partitioned) {
+    test::reserveIncarnation(index.dir);
+    index.iw = std::make_unique<IndexWriter>(index.snapshots, textSchema());
+    index.iw->mergePolicy->setMergeFactor(1000);
+    if (partitioned) {
+      index.iw->termPartitionMinBytes = 1;
+      index.iw->termPartitionMinRangeBytes = 1;
+      index.iw->termPartitionMaxRanges = 4;
+    } else {
+      index.iw->termPartitionMinBytes = INT64_MAX;
+    }
+    TestField body(index, "body");
+    for (int32_t segment = 0; segment < 4; segment++) {
+      body.startIndexing();
+      // Even terms are in one doc (pulsed), odd terms in two.
+      std::string all, odd;
+      for (int32_t i = 0; i < perSegment; i++) {
+        auto term = std::format("t{:05}", i * 4 + segment);
+        all += term + " ";
+        if (i % 2) odd += term + " ";
+      }
+      body.add(0, all);
+      body.add(1, odd);
+      index.flush();
+    }
+    index.iw->mergeSegments();
+    index.initReader();
+    ASSERT_EQ(1u, index.reader->segments().size());
+  };
+  TestIndex serial;
+  TestIndex partitioned;
+  build(serial, false);
+  build(partitioned, true);
+  Segment& serialSegment = serial.reader->segments()[0];
+  Segment& partitionedSegment = partitioned.reader->segments()[0];
+  const auto& info = readBodyInfo(partitionedSegment);
+  EXPECT_GT(info.terms()->runs.size(), 1u);
+  EXPECT_GT(info.termBlockCount(), (int32_t) BlockOffsetTable::GROUP);
+  EXPECT_GT(info.terms()->blockOffsetBits, 0);
+  FieldSnapshot oracle = snapshotField(serial.pool, serialSegment);
+  FieldSnapshot actual = snapshotField(partitioned.pool, partitionedSegment);
+  ASSERT_EQ((size_t) 4 * perSegment, actual.terms.size());
+  EXPECT_EQ(oracle, actual);
+  verifySeeks(partitioned.pool, partitionedSegment.postingsReader(), info, actual);
+}
+
 // Planning may sample every stride-th block: a sample keeps that block's
 // leading term and the bytes up to the next sample, so cuts land on the same
 // terms with the weights of the blocks they cover.
@@ -596,7 +646,8 @@ TEST(TermPartitionMergeTest, RoutingExpansionValidatesTotals) {
   // The first run ends in a partial block, and the second has a docs stream.
   const auto start = IndexFormat::HEADER.size();
   const std::array runs{TermRun{0, 0, 0, {}, {}}, TermRun{33, 2, 5, {{1, start}, 1}, {}}};
-  Terms terms{{0, start}, 9, 4, 0, runs};
+  // Three blocks at 4 bits: a 9-byte offset table, then the trie and its padding.
+  Terms terms{{0, start}, 9, 7, 0, runs, 4};
   MemPool pool;
   FieldRecordHeader header{.name = PackedTerm(pool, "f"), .type = FieldType::TEXT,
                            .flags = FieldType::INDEX_DOCS, .parts = {},

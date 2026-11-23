@@ -790,7 +790,7 @@ TEST_P(FieldPartsTest, IndexAndColumnSlices) {
     checkSlices(core, {dictionaryBlocks, offsets, trie, run.docs, run.positions});
   }
   EXPECT_LE(offsets.location.offset() - dictionaryBlocks.end().offset(), field_parts::Terms::OFFSETS_ALIGN - 1);
-  EXPECT_EQ(sizeof(field_parts::Terms::BlockOffset), offsets.bytes);
+  EXPECT_EQ(0u, offsets.bytes);
   EXPECT_LT(t.trieRootOffset, trie.bytes);
   EXPECT_EQ(t, *textInfo.terms());
   {

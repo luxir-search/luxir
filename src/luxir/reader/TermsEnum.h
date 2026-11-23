@@ -77,26 +77,29 @@ class TermsEnum {
   const char* blockEnd = nullptr;  // End of the encoded block.
   uint32_t suffixBytesTotal = 0;
 
-  const char* docsEndRun = nullptr;
+  const char* docsSizeRun = nullptr;
   const char* packedBlocksRun = nullptr;
   const char* dfRun = nullptr;
   const char* ttfCodeRun = nullptr;
   const char* posOffRun = nullptr;
   const char* termImpactRun = nullptr;
   const char* pulsedRun = nullptr;
-  uint32_t docsEndRunLen = 0;
+  uint32_t docsSizeRunLen = 0;
   uint32_t packedBlocksRunLen = 0;
   uint32_t dfRunLen = 0;
   uint32_t ttfCodeRunLen = 0;
   uint32_t posOffRunLen = 0;
   uint32_t termImpactRunLen = 0;
   uint32_t pulsedRunLen = 0;
+  bool docsSizesWide = false;  // docsSize run holds vlongs, not StreamVByte.
+  bool pulsedDeltas = false;  // Pulsed docs after the first are zigzag deltas.
   // Start of term impactCursorOrd's frontier in termImpactRun, so in-order
   // access skips one frontier per term instead of all earlier ones.
   const char* impactCursor = nullptr;
   int32_t impactCursorOrd = 0;
 
-  std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> docsEnds{};
+  std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> docsEnds{};  // Prefix sums of the docs sizes.
+  std::array<uint32_t, Postings::TERMS_BLOCK_SIZE> docsSizes{};
   std::array<uint32_t, Postings::TERMS_BLOCK_SIZE> packedBlockCounts{};
   std::array<uint32_t, Postings::TERMS_BLOCK_SIZE> docFreqs{};
   std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> ttfCodes{};
@@ -107,7 +110,8 @@ class TermsEnum {
   bool metadataRunsParsed = false;
 
   // Dictionary routing data.
-  const field_parts::Terms::BlockOffset* termBlockOffsets = nullptr;
+  BlockOffsetTable blockOffsets;  // Block starts within termsIS.
+  int64_t dictionaryEnd = 0;  // Offset within termsIS just past the last block.
   const char* trieBase = nullptr;  // Start of the trie bytes.
   int32_t numTermBlocks = 0;
   const field_parts::TermRun* runs = nullptr;
@@ -115,9 +119,6 @@ class TermsEnum {
   int32_t runCount = 0;
   int64_t runLastTermOrd = -1;  // Last term ordinal in the current run.
   int32_t runEndBlockOrd = 0;  // one past the current run's last block ord
-  // Cached offsets within termsIS for the current run.
-  int64_t runTermsBase = 0;
-  int64_t runTermsEnd = 0;
   InputStream runDocs;
   InputStream runPositions;
 
@@ -158,17 +159,18 @@ public:
       : segmentCore(reader.core()), termData(fieldInfo.terms()), totals(fieldInfo.indexedTotals()),
         flags(fieldInfo.flags), currTerm(pool.alloc(TERM_BUFFER_BYTES), 0) {
     if (!termData) return;
-    auto blockOffsets = fieldInfo.termBlockOffsets();
-    auto trie = field_parts::termTrie(blockOffsets, termData->trieBytes);
+    auto table = fieldInfo.termBlockOffsets();
+    auto trie = field_parts::termTrie(table, termData->trieBytes);
     // The blocks are data; the offsets and trie that route to them are
     // metadata and follow the blocks, so the 16 bytes past a hold cover the
     // decoders' over-read.
     termsIS = streamThrough(termData->dictionaryBlocks());
     auto navigation = segmentCore.slice(
-        {blockOffsets.location, trie.end().offset() - blockOffsets.location.offset()}, ReadClass::METADATA);
-    termBlockOffsets = reinterpret_cast<const field_parts::Terms::BlockOffset*>(navigation.data());
-    numTermBlocks = (int32_t)(blockOffsets.bytes / sizeof(field_parts::Terms::BlockOffset));
-    trieBase = navigation.data() + blockOffsets.bytes;
+        {table.location, trie.end().offset() - table.location.offset()}, ReadClass::METADATA);
+    numTermBlocks = fieldInfo.termBlockCount();
+    blockOffsets = BlockOffsetTable(navigation.data(), (uint64_t)numTermBlocks, termData->blockOffsetBits);
+    dictionaryEnd = (int64_t)termData->dictionaryBytes;
+    trieBase = navigation.data() + table.bytes;
     runCount = (int32_t)termData->runs.size();
     runs = termData->runs.data();
     selectRun(runs);
@@ -247,7 +249,6 @@ public:
       const auto& sourceRun = runs[runOrd];
       int32_t firstBlock = sourceRun.firstBlockOrd;
       int32_t endBlock = runEndBlock(termData->runs, runOrd, numTermBlocks);
-      auto sourceBase = (int64_t)sourceRun.dictionaryStart;
       int32_t count = endBlock - firstBlock;
       assert(count > 0);
       int32_t samples = (count - 1) / stride + 1;
@@ -258,7 +259,7 @@ public:
       size_t outputBase = blocks.size();
       for (int32_t i = 0; i < samples; i++) {
         int32_t blockOrd = firstBlock + i * stride;
-        input.seek(sourceBase + termBlockOffsets[blockOrd]);
+        input.seek(blockOffset(blockOrd));
         PackedTerm first = input.readPackedTerm();
         blocks.push_back({std::string(first.data(), first.size()), 0});
         docsOffsets[(size_t) i] = input.readVlong();
@@ -461,9 +462,15 @@ protected:
     }
   }
 
-  uint32_t readMetadataRunLen(const char*& p, const char* end) {
+  // Byte length of a metadata run. Its alternate encoding flag goes to
+  // `alternate`; runs without one never set it.
+  uint32_t readMetadataRunLen(const char*& p, const char* end, bool* alternate = nullptr) {
     uint32_t code = InputStream::readVint(p, end);
-    assert((code & 1u) == 0);
+    if (alternate) {
+      *alternate = (code & 1u) != 0;
+    } else {
+      assert((code & 1u) == 0);
+    }
     return code >> 1u;
   }
 
@@ -484,19 +491,19 @@ protected:
     // asks for them.  This keeps block entry and pure term scans on the
     // hashes/lengths/suffix path.  See TextWriter::flushTerms for the
     // byte-length code and run order.  A zero byte length marks an all-default
-    // run for docsEnd/packedBlocks/df/ttfCode/posOff; pulsedRun still uses
+    // run for docsSize/packedBlocks/df/ttfCode/posOff; pulsedRun still uses
     // zero length only for the existing empty-payload case.
     const char* p = metadataRuns;
-    docsEndRunLen = readMetadataRunLen(p, blockEnd);
+    docsSizeRunLen = readMetadataRunLen(p, blockEnd, &docsSizesWide);
     packedBlocksRunLen = readMetadataRunLen(p, blockEnd);
     dfRunLen = readMetadataRunLen(p, blockEnd);
     ttfCodeRunLen = FieldType::hasFreqs(flags) ? readMetadataRunLen(p, blockEnd) : 0;
     posOffRunLen = FieldType::hasPositions(flags) ? readMetadataRunLen(p, blockEnd) : 0;
     termImpactRunLen = hasTermImpacts() ? readMetadataRunLen(p, blockEnd) : 0;
-    pulsedRunLen = readMetadataRunLen(p, blockEnd);
+    pulsedRunLen = readMetadataRunLen(p, blockEnd, &pulsedDeltas);
 
-    docsEndRun = p;
-    p += docsEndRunLen;
+    docsSizeRun = p;
+    p += docsSizeRunLen;
     assert(p <= blockEnd);
     packedBlocksRun = p;
     p += packedBlocksRunLen;
@@ -549,7 +556,7 @@ protected:
       return;
     }
     // Tier 1 metadata: term statistics only.  This decodes df and, for fields
-    // with freqs, ttfCode.  It deliberately does not touch docsEnd,
+    // with freqs, ttfCode.  It deliberately does not touch docsSize,
     // packedBlocks, posOff, or pulsed values, so stats-only callers do not pay
     // to open postings.
     parseMetadataRuns();
@@ -578,26 +585,31 @@ protected:
     if (postingsDecoded) {
       return;
     }
-    // Tier 2 metadata: data needed to construct DocsEnum.  docsEnd supplies
+    // Tier 2 metadata: data needed to construct DocsEnum.  docsSize supplies
     // docs slices, packedBlocks describes their packed codec
     // blocks, posOff supplies positions starts, and pulsedRun supplies inline
     // doc/pos payloads for single-occurrence terms.
     parseMetadataRuns();
     uint32_t n = blockTermCount();
-    if (docsEndRunLen == 0) {
+    if (docsSizeRunLen == 0) {
       assert((pulsedMask & validPulsedMask()) == validPulsedMask());
       std::fill_n(docsEnds.begin(), n, 0);
-    } else {
-      const char* p = docsEndRun;
-      const char* end = docsEndRun + docsEndRunLen;
-      [[maybe_unused]] uint64_t prevDocsEnd = 0;
+    } else if (docsSizesWide) [[unlikely]] {
+      const char* p = docsSizeRun;
+      const char* end = docsSizeRun + docsSizeRunLen;
+      uint64_t docsEnd = 0;
       for (uint32_t i = 0; i < n; i++) {
-        uint64_t docsEnd = InputStream::readVlong(p, end);
-        assert(docsEnd >= prevDocsEnd);
+        docsEnd += InputStream::readVlong(p, end);
         docsEnds[i] = docsEnd;
-        prevDocsEnd = docsEnd;
       }
       assert(p == end);
+    } else {
+      decodeSVBRun(docsSizeRun, docsSizeRunLen, docsSizes.data(), n);
+      uint64_t docsEnd = 0;
+      for (uint32_t i = 0; i < n; i++) {
+        docsEnd += docsSizes[i];
+        docsEnds[i] = docsEnd;
+      }
     }
 
     if (packedBlocksRunLen == 0) {
@@ -624,6 +636,15 @@ protected:
     uint32_t pulsedTerms = std::popcount(pulsedMask & validPulsedMask());
     uint32_t pulsedCount = pulsedTerms * (FieldType::hasPositions(flags) ? 2u : 1u);
     decodeSVBRun(pulsedRun, pulsedRunLen, pulsedValues.data(), pulsedCount);
+    if (pulsedDeltas) {
+      uint32_t stride = FieldType::hasPositions(flags) ? 2u : 1u;
+      uint32_t doc = pulsedValues[0];
+      for (uint32_t i = stride; i < pulsedCount; i += stride) {
+        uint32_t zigzag = pulsedValues[i];
+        doc += (zigzag >> 1) ^ (0u - (zigzag & 1u));
+        pulsedValues[i] = doc;
+      }
+    }
     postingsDecoded = true;
   }
 
@@ -712,15 +733,18 @@ protected:
     bool hasNext = run + 1 != runs + runCount;
     runLastTermOrd = hasNext ? (run + 1)->firstTermOrd - 1 : totals.numTerms - 1;
     runEndBlockOrd = hasNext ? (run + 1)->firstBlockOrd : numTermBlocks;
-    runTermsBase = (int64_t)run->dictionaryStart;
-    runTermsEnd = (int64_t)(hasNext ? (run + 1)->dictionaryStart : termData->dictionaryBytes);
     runDocs = run->docs ? streamThrough(run->docs) : InputStream();
     runPositions = run->positions ? streamThrough(run->positions) : InputStream();
   }
 
+  // Offset of a term block within termsIS. Blocks are contiguous across runs.
+  int64_t blockOffset(int32_t block) const {
+    assert(block >= 0 && block < numTermBlocks);
+    return (int64_t)blockOffsets[(uint32_t)block];
+  }
+
   PackedTerm firstTermForNextBlock(int32_t nextBlock) const {
-    auto base = nextBlock < runEndBlockOrd ? runTermsBase : runTermsEnd;
-    return termsIS.readPackedTerm(base + termBlockOffsets[nextBlock]);
+    return termsIS.readPackedTerm(blockOffset(nextBlock));
   }
 
   // Seeks to termBlockIndex and reads the eager block-entry state from the
@@ -736,13 +760,13 @@ protected:
         || termBlockIndex >= runEndBlockOrd) [[unlikely]] {
       reselectRunForBlock(termBlockIndex);
     }
-    termsIS.seek(runTermsBase + (int64_t) termBlockOffsets[termBlockIndex]);
+    termsIS.seek(blockOffset(termBlockIndex));
     startingOrd = run->firstTermForBlock(termBlockIndex);
     ordInBlock = 0;
     maxOrdInBlock = (int32_t) std::min<int64_t>(Postings::TERMS_BLOCK_SIZE - 1,
                                                 runLastTermOrd - startingOrd);
-    int64_t blockEndOffset = termBlockIndex + 1 < runEndBlockOrd
-        ? runTermsBase + (int64_t)termBlockOffsets[termBlockIndex + 1] : runTermsEnd;
+    int64_t blockEndOffset = termBlockIndex + 1 < numTermBlocks
+        ? blockOffset(termBlockIndex + 1) : dictionaryEnd;
     blockEnd = termsIS.ptr(blockEndOffset);
 
     // see TextWriter::flushTerms

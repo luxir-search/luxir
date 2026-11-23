@@ -15,6 +15,7 @@
 #include <assert.h>
 #include <iostream>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -716,10 +717,11 @@ struct NormSurface {
   }
 };
 
-// Run size settings for the term dictionary writer.
+// Block size bound and the run split test setting for the term dictionary writer.
 class TextWriterSettings {
 protected:
-  // Leave enough space in a run for one more block at a 32-bit offset.
+  // Bound on one encoded term block, which keeps a block offset table group
+  // (BlockOffsetTable::GROUP blocks) within BlockOffsetTable::MAX_BITS.
   // A block of 32 terms uses at most 8,286 bytes for the packed first term,
   // two vlong bases, prefix length, pulse mask code and mask, suffix length vint, hashes,
   // prefix/suffix lengths and 31 full suffixes. Seven run lengths take 35
@@ -730,8 +732,7 @@ protected:
   // norm byte and a five-byte TF delta, or 49,216 bytes for the block.
   // The sum is at most 59,041 bytes, even charging all lanes at once.
   static constexpr uint32_t MAX_TERM_BLOCK_BYTES = 64 * 1024;
-  static constexpr uint32_t RUN_SPLIT_BYTES =
-      std::numeric_limits<field_parts::Terms::BlockOffset>::max() - MAX_TERM_BLOCK_BYTES;
+  static_assert((uint64_t)MAX_TERM_BLOCK_BYTES * BlockOffsetTable::GROUP < (uint64_t{1} << BlockOffsetTable::MAX_BITS));
 
 private:
   static constexpr uint32_t TERMS = Postings::TERMS_BLOCK_SIZE;
@@ -747,11 +748,13 @@ private:
   static_assert(MAX_BLOCK_BYTES == 59041 && MAX_BLOCK_BYTES < MAX_TERM_BLOCK_BYTES);
 
 protected:
-  inline static std::atomic<uint32_t> splitBytes = RUN_SPLIT_BYTES;  // Writer setting, sampled at construction.
+  // A serial writer starts a new run once the current one passes this many
+  // dictionary bytes. Offsets do not depend on runs, so only tests split.
+  inline static std::atomic<uint64_t> splitBytes = UINT64_MAX;  // Sampled at construction.
 
 public:
-  static uint32_t setRunSplitBytesForTests(uint32_t bytes) {
-    return splitBytes.exchange(std::min(bytes, RUN_SPLIT_BYTES));
+  static uint64_t setRunSplitBytesForTests(uint64_t bytes) {
+    return splitBytes.exchange(bytes);
   }
 };
 
@@ -774,7 +777,7 @@ public:
 
   // A finished serial field or partition before stitching its dictionary.
   struct RangeResult {
-    std::vector<field_parts::Terms::BlockOffset> termBlockOffsets;  // Relative to each run.
+    std::vector<uint64_t> termBlockOffsets;  // Relative to the partition's dictionary.
     std::vector<RunStart> runs;  // Cuts at term block boundaries.
     std::vector<std::string> separatorKeys;
     std::string firstTerm;
@@ -839,6 +842,8 @@ public:
   };
 
   static inline std::atomic<bool> collectDocsFileBytes{false};
+  // Writes every docs size run as vlongs, as for a size above 32 bits.
+  static inline std::atomic<bool> wideDocsSizesForTests{false};
 
   // Per-field totals collected while collectDocsFileBytes is set, keyed by
   // field name (ranged merge writers have none and report under "").
@@ -891,7 +896,7 @@ private:
   // re-reads the block's terms for prefix encoding, so callers need not keep term
   // bytes alive past the startTerm() call.  Slot i backs termList[i].
   std::array<char, Postings::TERMS_BLOCK_SIZE * PackedTerm::MAX_BYTES> termBytes;
-  std::vector<uint64_t> termDocsEnd;  // cumulative docs stream end offsets
+  std::vector<uint64_t> termDocsSizes;  // docs stream bytes per term, 0 when pulsed
   std::vector<uint32_t> termPackedBlocks;
   std::vector<uint32_t> termDocFreqs;
   std::vector<uint64_t> termTtfCodes;
@@ -949,9 +954,9 @@ private:
   bool hasNorms = false;
   TextNormsView norms;
 
-  std::vector<field_parts::Terms::BlockOffset> termBlockOffsets;  // Block starts relative to their run.
+  std::vector<uint64_t> termBlockOffsets;  // Block starts relative to the partition's dictionary.
   std::vector<RunStart> runs;  // Nonempty runs in this field or partition.
-  const uint32_t runSplitBytes = splitBytes.load(std::memory_order_relaxed);
+  const uint64_t runSplitBytes = splitBytes.load(std::memory_order_relaxed);
   TrieBuilder trieBuilder;
   std::vector<std::string> separatorKeys;
   std::string firstTerm;
@@ -971,6 +976,9 @@ private:
   std::vector<char> compressed_output;
   std::vector<char> header_output;
   std::vector<char> group_output;
+  std::vector<uint32_t> narrowSizes;  // appendDocsSizeRun scratch
+  std::vector<uint32_t> pulsedDeltaValues;  // appendPulsedRun scratch
+  std::vector<char> pulsedDeltaRun;  // appendPulsedRun scratch
   NormSurface blockSurface;
   std::vector<uint32_t> frontierNorms;
   std::vector<uint32_t> frontierTfs;
@@ -1217,16 +1225,50 @@ private:  // some internal utility methods... not for use by indexers
     }
     uint32_t count = (uint32_t) values.size();
     uint32_t keyBytes = svbKeyBytes(count);
-    std::vector<uint8_t> keys(keyBytes);
-    std::vector<uint8_t> data((size_t) count * sizeof(uint32_t));
-    uint8_t* dataEnd = svb_encode_scalar(values.data(), keys.data(), data.data(), count);
-    appendBytes(out, keys.data(), keys.size());
-    appendBytes(out, data.data(), (size_t) (dataEnd - data.data()));
+    size_t start = out.size();
+    out.resize(start + keyBytes + (size_t) count * sizeof(uint32_t));
+    uint8_t* keys = (uint8_t*) out.data() + start;
+    uint8_t* dataEnd = svb_encode_scalar(values.data(), keys, keys + keyBytes, count);
+    out.resize((size_t) ((char*) dataEnd - out.data()));
   }
 
-  void writeMetadataRunLen(size_t byteLen) {
+  // The flag selects a run's alternate encoding, so its run is never empty.
+  void writeMetadataRunLen(size_t byteLen, bool alternate = false) {
     assert(byteLen <= (size_t) (UINT32_MAX >> 1));
-    termOutput.writeVint(((uint32_t) byteLen) << 1u);
+    assert(!alternate || byteLen != 0);
+    termOutput.writeVint((((uint32_t) byteLen) << 1u) | (uint32_t) alternate);
+  }
+
+  // Per-term docs sizes as a StreamVByte run, or as vlongs (returns true)
+  // when a size does not fit 32 bits.
+  bool appendDocsSizeRun(std::vector<char>& out, const std::vector<uint64_t>& sizes) {
+    if (wideDocsSizesForTests.load(std::memory_order_relaxed)
+        || !std::ranges::all_of(sizes, [](uint64_t size) { return size <= UINT32_MAX; })) {
+      appendVlongRun(out, sizes);
+      return true;
+    }
+    narrowSizes.assign(sizes.begin(), sizes.end());
+    appendSVBRun(out, narrowSizes);
+    return false;
+  }
+
+  // The pulsed values as a StreamVByte run, with each doc after the first
+  // stored as the zigzag delta from the previous pulsed doc when that is
+  // smaller (returns true).  Position slots stay raw.
+  bool appendPulsedRun(std::vector<char>& out, const std::vector<uint32_t>& values, uint32_t stride) {
+    assert(out.empty());
+    appendSVBRun(out, values);
+    if (values.size() <= stride) return false;
+    pulsedDeltaValues.assign(values.begin(), values.end());
+    for (size_t i = stride; i < values.size(); i += stride) {
+      int64_t delta = (int64_t) values[i] - (int64_t) values[i - stride];
+      pulsedDeltaValues[i] = (uint32_t) ((uint64_t) (delta << 1) ^ (uint64_t) (delta >> 63));
+    }
+    pulsedDeltaRun.clear();
+    appendSVBRun(pulsedDeltaRun, pulsedDeltaValues);
+    if (pulsedDeltaRun.size() >= out.size()) return false;
+    out.swap(pulsedDeltaRun);
+    return true;
   }
 
   static uint32_t termMaskForCount(int nTerms) {
@@ -1592,7 +1634,7 @@ public:
   // called starting a new field, or after flushing a term block.
   void startTermBlock() {
     termList.resize(0);
-    termDocsEnd.resize(0);
+    termDocsSizes.resize(0);
     termPackedBlocks.resize(0);
     termDocFreqs.resize(0);
     termTtfCodes.resize(0);
@@ -1645,19 +1687,20 @@ public:
   //
   //   metadata section:
   //     Each sub-run begins with a vint code: (byteLen << 1) | encodingFlag.
-  //     The normal v1 encoding writes encodingFlag 0 and a nonzero byteLen.
-  //     Code 0 (byteLen 0, flag 0) is claimed as an all-default run marker;
-  //     otherwise the low flag bit remains reserved for a future alternate
-  //     encoding.  The byte-length vints are written first for every run,
-  //     followed by the non-default run bytes in the same order:
+  //     Code 0 (byteLen 0, flag 0) is claimed as an all-default run marker.
+  //     Flag 1 selects a run's alternate encoding (docsSize and pulsed only)
+  //     and always comes with a nonzero byteLen.  The byte-length vints are
+  //     written first for every run, followed by the non-default run bytes in
+  //     the same order:
   //
-  //     [docsEnd lengths/code][packedBlocks lengths/code][df lengths/code]
+  //     [docsSize lengths/code][packedBlocks lengths/code][df lengths/code]
   //     [ttfCode lengths/code?]
   //     [posOff lengths/code?][termImpact lengths/code?][pulsed lengths/code]
-  //     [docsEnd: cumulative vlong run]
-  //       Cumulative slice ends within this block's docs region. For term i,
-  //       docsSize_i = docsEnd_i - docsEnd_(i-1), with docsEnd_(-1) = 0.
-  //       Pulsed terms repeat the previous end, so their docsSize is 0.
+  //     [docsSize: StreamVByte run, or vlong run with flag 1]
+  //       Bytes of each term's slice of this block's docs region, in term
+  //       order; term i starts at the sum of the sizes before it.  Pulsed
+  //       terms have size 0.  Flag 1 (vlongs) is used only when a size does
+  //       not fit 32 bits.
   //       Default: every slice is zero-size, which is legal only when every
   //       term in the block is pulsed.
   //     [packedBlocks: StreamVByte run]
@@ -1686,11 +1729,14 @@ public:
   //       position delta when ttf == 1, else 0 (its positions are in the
   //       positions stream).  The value index for term i is
   //       popcount(pulsedMask below bit i), scaled by the per-term value count.
+  //       With flag 1, every doc but the first is the zigzag delta from the
+  //       previous pulsed doc (pos slots stay raw): the writer keeps the
+  //       smaller of the two encodings, so time-ordered ids take deltas.
   //
   // The layout is column-stride on purpose.  Term scans, seekCeil, fuzzy
   // enumeration, and most miss paths need only hashes, lengths, and suffix
   // bytes.  Term stats decode as tier 1 (df/ttfCode), and postings-open
-  // metadata decodes as tier 2 (docsEnd/packedBlocks/posOff/pulsed), both
+  // metadata decodes as tier 2 (docsSize/packedBlocks/posOff/pulsed), both
   // lazily in TermsEnum.  Per-doc tf values are not stored here: they are
   // scoring data block-encoded alongside doc ids in the docs stream and
   // remain part of the postings payload.
@@ -1709,13 +1755,13 @@ public:
           (uint64_t)(locOfDocsForTermBlock - docsLoc), (uint64_t)(locOfPositionsForTermBlock - posLoc)});
     }
     const auto& run = runs.back();
-    termBlockOffsets.push_back((field_parts::Terms::BlockOffset)(dictionaryStart - run.dictionaryStart));
+    termBlockOffsets.push_back(dictionaryStart);
     addTrieSeparatorForCurrentBlock(blockOrd);
 
     numTerms += termList.size();
 
     int nTerms = termList.size();
-    assert((int)termDocsEnd.size() == nTerms);
+    assert((int)termDocsSizes.size() == nTerms);
     assert((int)termPackedBlocks.size() == nTerms);
     assert((int)termDocFreqs.size() == nTerms);
     assert((int)termTtfCodes.size() == nTerms);
@@ -1796,13 +1842,15 @@ public:
     termOutput.write(suffixLens.data(), suffixLens.size());
     termOutput.write(suffixBlob.data(), suffixBlob.size());
 
-    std::vector<char> docsEndRun;
+    std::vector<char> docsSizeRun;
     std::vector<char> packedBlocksRun;
     std::vector<char> dfRun;
     std::vector<char> ttfRun;
     std::vector<char> posOffRun;
     std::vector<char> pulsedRun;
-    appendVlongRun(docsEndRun, termDocsEnd);
+    assert(std::accumulate(termDocsSizes.begin(), termDocsSizes.end(), uint64_t{0})
+           == (uint64_t) (docOutput.size() - locOfDocsForTermBlock));
+    bool docsSizesWide = appendDocsSizeRun(docsSizeRun, termDocsSizes);
     appendSVBRun(packedBlocksRun, termPackedBlocks);
     appendSVBRun(dfRun, termDocFreqs);
     if (hasFreqs) {
@@ -1811,11 +1859,11 @@ public:
     if (hasPositions) {
       appendVlongDeltaRun(posOffRun, termPosOffsets);
     }
-    appendSVBRun(pulsedRun, pulsed);
+    bool pulsedDeltas = appendPulsedRun(pulsedRun, pulsed, hasPositions ? 2u : 1u);
     bool hasTermImpacts = hasFreqs && hasNorms;
 
-    bool docsEndDefault = allUInt64Equal(termDocsEnd, 0);
-    if (docsEndDefault) {
+    bool docsSizeDefault = allUInt64Equal(termDocsSizes, 0);
+    if (docsSizeDefault) {
       assert(termPulsedMask == termMaskForCount(nTerms));
     }
     bool packedBlocksDefault = allUInt32Equal(termPackedBlocks, 0);
@@ -1823,7 +1871,7 @@ public:
     bool ttfDefault = allUInt64Equal(termTtfCodes, 0);
     bool posOffDefault = hasPositions && allUInt64Equal(termPosOffsets, 0);
 
-    writeMetadataRunLen(docsEndDefault ? 0 : docsEndRun.size());
+    writeMetadataRunLen(docsSizeDefault ? 0 : docsSizeRun.size(), !docsSizeDefault && docsSizesWide);
     writeMetadataRunLen(packedBlocksDefault ? 0 : packedBlocksRun.size());
     writeMetadataRunLen(dfDefault ? 0 : dfRun.size());
     if (hasFreqs) {
@@ -1835,10 +1883,10 @@ public:
     if (hasTermImpacts) {
       writeMetadataRunLen(termImpactRun.size());
     }
-    writeMetadataRunLen(pulsedRun.size());
+    writeMetadataRunLen(pulsedRun.size(), pulsedDeltas);
 
-    if (!docsEndDefault) {
-      termOutput.write(docsEndRun.data(), docsEndRun.size());
+    if (!docsSizeDefault) {
+      termOutput.write(docsSizeRun.data(), docsSizeRun.size());
     }
     if (!packedBlocksDefault) {
       termOutput.write(packedBlocksRun.data(), packedBlocksRun.size());
@@ -1857,7 +1905,7 @@ public:
     }
     termOutput.write(pulsedRun.data(), pulsedRun.size());
     if (termOutput.size() - blockStart > MAX_TERM_BLOCK_BYTES) {
-      throw std::length_error("encoded term block exceeds the run split allowance");
+      throw std::length_error("encoded term block exceeds the block size bound");
     }
 
     [[maybe_unused]] uint32_t pulsedTerms = std::popcount(termPulsedMask);
@@ -1994,7 +2042,7 @@ public:
         if (docsFlushed == 0) {
           // A term without a full block writes its tail body alone: no L1
           // or L0 header.  Every header field is derivable from the term
-          // dictionary (the body length from docsEnd, the tf sum from ttf,
+          // dictionary (the body length from docsSize, the tf sum from ttf,
           // the positions offset is 0, the impacts are the term frontier),
           // and with a single block there is nothing to skip to.
           docOutput.write(compressed_output.data(), compressed_output.size());
@@ -2031,7 +2079,7 @@ public:
       appendImpactFrontier(termImpactRun, termSurface);
     }
     termPackedBlocks.push_back(termPackedBlockCount);
-    termDocsEnd.push_back((uint64_t) (docOutput.size() - locOfDocsForTermBlock));
+    termDocsSizes.push_back((uint64_t) (docOutput.size() - locOfDocsForTerm));
 
     if (termList.size() == Postings::TERMS_BLOCK_SIZE) {
       flushTerms(false);
@@ -2067,25 +2115,29 @@ public:
     return result;
   }
 
-  // Appends the block offset table and trie. The trie extent includes the
-  // slack required by the final dictionary block's SIMD decoders.
+  // Appends the block offset table (see BlockOffsetTable) and trie. The trie
+  // extent includes the slack required by the final dictionary block's SIMD
+  // decoders. Offsets are relative to the first block, at `start`.
   static field_parts::Terms finishDictionary(
       PostingsWriter& writer, OutputStreamPtr&& stream, uint64_t start,
-      std::span<const field_parts::Terms::BlockOffset> offsets, TrieBuilder& trie) {
+      std::span<const uint64_t> offsets, TrieBuilder& trie) {
     auto& out = *stream;
     auto dictionaryBytes = out.size() - start;
     auto root = trie.finish();
     const auto& bytes = trie.bytes();
-    out.align(field_parts::Terms::OFFSETS_ALIGN);
-    out.write(offsets.data(), offsets.size_bytes());
+    auto bits = BlockOffsetTable::bitsFor(offsets);
+    std::vector<char> table;
+    BlockOffsetTable::encode(offsets, bits, table);
+    if (!table.empty()) out.align(field_parts::Terms::OFFSETS_ALIGN);
+    out.write(table.data(), table.size());
     out.write(bytes.data(), bytes.size());
-    size_t suffixBytes = offsets.size_bytes() + bytes.size();
+    size_t suffixBytes = table.size() + bytes.size();
     size_t pad = suffixBytes < SVB_OVERREAD_PAD ? SVB_OVERREAD_PAD - suffixBytes : 0;
     static constexpr char zeros[SVB_OVERREAD_PAD] = {};
     if (pad) out.write(zeros, pad);
     assert(suffixBytes + pad >= SVB_OVERREAD_PAD);
     auto slice = writer.finishStream(std::move(stream));
-    return {slice.location.addOffset(start), dictionaryBytes, bytes.size() + pad, root, {}};
+    return {slice.location.addOffset(start), dictionaryBytes, bytes.size() + pad, root, {}, (uint8_t) bits};
   }
 
   // Stores the runs and dictionary bounds after the associated streams have locations.
