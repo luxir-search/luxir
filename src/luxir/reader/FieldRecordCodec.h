@@ -30,12 +30,13 @@ namespace luxir {
 //   Norms have options and a location.
 //   Stored resources have chunk counts and maximum size, codec and chunk limits,
 //   location and three lengths, then first-doc and chunk-offset slices.
-//   The docs bitmap, end value ranks and owners are standalone slices.
+//   The docs bitmap, end value ranks, owners and id filter are standalone slices.
 // Counts and locations are unsigned varints. Slice locations give a file number
 // and absolute offset, followed by a byte length for a standalone slice.
 
 // The kinds of data a field can have. A record lists which are present.
-enum class FieldPart : uint8_t { TERMS, COLUMN, POINTS, NORMS, STORED, DOCS, VALUE_RANKS, OWNERS, COUNT };
+// FILTER is the id dictionary's membership filter (IdFilter.h).
+enum class FieldPart : uint8_t { TERMS, COLUMN, POINTS, NORMS, STORED, DOCS, VALUE_RANKS, OWNERS, FILTER, COUNT };
 
 // Tracks which parts a record has.
 class FieldPartSet {
@@ -242,6 +243,9 @@ public:
 
   // Monotonic owner doc IDs by vector value rank.
   field_parts::Slice owners() const noexcept { return partSlice(FieldPart::OWNERS); }
+
+  // Blocks of an ID field's membership filter over its dictionary terms (IdFilter.h).
+  field_parts::Slice idFilter() const noexcept { return partSlice(FieldPart::FILTER); }
 
   // Each accessor returns null unless the field has bounds of that kind.
   const field_parts::ScalarBounds* scalarBounds() const noexcept {

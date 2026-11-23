@@ -624,6 +624,9 @@ public:
   // orders of magnitude sooner; tests lower it to flush at exact doc boundaries.
   size_t perInverterRamBytes = 64 * 1024 * 1024;
   size_t perInverterMaxDocs = PostingsReader::MAX_SEGMENT_DOCS;
+  // The id filter that flushes and merges write (IdFilter.h). Set before the
+  // first write; a merge moves its output to the current choice.
+  IdFilter::Options idFilterOptions;
   // Delete ids per application task within one segment.
   size_t deleteApplyChunkEntries = 64 * 1024;
   // Small indexes still batch delete-only buffers: per-id cost was about 2x the

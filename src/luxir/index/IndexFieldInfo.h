@@ -16,6 +16,7 @@ struct WrittenTerms {
   field_parts::Terms terms;
   uint8_t segFlags;  // See FieldSegmentFlags.
   field_parts::Bounds bounds = {};
+  field_parts::Slice idFilter = {};  // Root ID dictionaries only.
 };
 
 // Presence recorded by a finished bitmap writer.
@@ -59,6 +60,7 @@ struct IndexFieldInfo {
   field_parts::Slice docs;  // Docs-with-field bitmap.
   field_parts::Slice endValueRanks;  // Monotonic end rank per doc with the field.
   field_parts::Slice owners;  // Monotonic owner doc per vector value.
+  field_parts::Slice idFilter;  // Membership filter over a root ID dictionary.
 
   void setBounds(field_parts::Bounds value) {
     if (std::holds_alternative<std::monostate>(value)) return;
@@ -75,6 +77,8 @@ struct IndexFieldInfo {
     header.indexedTotals = written.totals;
     terms = written.terms;
     header.parts.set(FieldPart::TERMS, !terms.location.isNull());
+    idFilter = written.idFilter;
+    header.parts.set(FieldPart::FILTER, bool(idFilter));
     setBounds(std::move(written.bounds));
   }
 

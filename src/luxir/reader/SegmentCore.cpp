@@ -197,7 +197,7 @@ bool SegmentCore::finishOpen(Directory& dir, std::string_view segment, const Sou
   SegmentReadContext primaryContext{this, PackedTerm(nullptr), primary};
   validateSegmentFileHeader(slice({{primary, 0}, Postings::LUXIR_HEADER.size()}, ReadClass::METADATA), segment, primary);
   auto bytes = slice({{primary, range.offset}, range.length}, ReadClass::METADATA);
-  auto head = SegmentCatalog::readDirectory(bytes, range.offset, files[primary].size, primaryContext);
+  auto head = SegmentCatalog::readDirectory(bytes, range, files[primary].size, primaryContext);
   catalog = SegmentCatalog::decode(head, source.files, primaryContext);
   if (spaces().front().maxDoc != source.maxDoc) {
     corruptSegment(segment, "segment row count differs from manifest");
@@ -251,6 +251,20 @@ void SegmentCore::initializeSpaces() {
     child->reader.initialize(space.maxDoc, space.fields.size());
     children.push_back(std::move(child));
   }
+}
+
+bool SegmentCore::mayContainId(std::string_view term, uint64_t hash) {
+  const auto* info = root.fieldInfo("id");
+  if (!info || !info->terms()) return false;
+  if (const auto* bounds = info->dictionaryBounds()) {
+    // A root id dictionary always records exact inclusive bounds.
+    if (term < std::string_view(bounds->lower) || term > std::string_view(bounds->upper)) return false;
+  }
+  auto part = info->idFilter();
+  if (!part) return true;
+  // A filter this build cannot read proves nothing.
+  auto filter = IdFilter::parse(slice(part));
+  return !filter || filter->mayContainHash(hash);
 }
 
 std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, const api::SegmentInfo& segment,
