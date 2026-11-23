@@ -27,6 +27,7 @@
 #include "luxir/query/NumericIndexPrice.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/PointsReader.h"
+#include "CatalogPredicates.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/util/NumericUtils.h"
 
@@ -192,6 +193,15 @@ public:
       std::string_view target) const override {
     if (target != field) return std::nullopt;
     return ValueEnvelope{envelope.lo, envelope.hi};
+  }
+
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    if (envelope.lo > envelope.hi) {
+      proof::touch(view, field);
+      view.prove("empty numeric range");
+      return MatchState::EMPTY;
+    }
+    return proof::numericMatch(view, field, [this](int64_t min, int64_t max) { return intersects(min, max); });
   }
 
   float valueMatchCost() const {

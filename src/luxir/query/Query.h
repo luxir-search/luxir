@@ -23,6 +23,8 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
+#include "QueryPruning.h"
+#include "CatalogSummaryView.h"
 #include "MultiTermBudget.h"
 #include "ExecutionProfile.h"
 #include "Warnings.h"
@@ -684,6 +686,20 @@ public:
     return std::nullopt;
   }
 
+  // Whether this query can match any document of the segment (or, for the
+  // collection view, any segment) `view` describes: EMPTY is a proof that
+  // none does (over live and deleted documents alike), UNKNOWN is always
+  // legal, NONEMPTY says only that the headers offer no proof of absence. A
+  // pure function of the logical tree and the field record headers of the
+  // physical fields its weights read; it never reads segment data.
+  // Composites combine their children's answers (QueryPruning evaluates
+  // them once per segment). The default proves nothing and marks the view
+  // opaque, as such a query may read fields the view never looked up.
+  virtual MatchState mayMatch(const CatalogSummaryView& view) const {
+    view.opaque();
+    return MatchState::UNKNOWN;
+  }
+
   // Validate the complete logical tree once during serial request planning,
   // before cache lookup or Weight construction. Every concrete query must
   // make an explicit validation decision. A composite MUST override
@@ -1261,6 +1277,10 @@ public:
     FilterKeyContext filterKeyContext;
     Limits limits;
     std::vector<api::Warning>* warnings = nullptr;
+    // Logical validation visited a query whose weight may prepare over the
+    // whole index (kNN, the test-only force-prepare wrapper): the only
+    // sources of Weight::NEEDS_PREPARE, known before any weight exists.
+    bool mayPrepare = false;
     ExecutionProfileSink* profiles = nullptr;
 
     PlanningContext(
@@ -1595,6 +1615,21 @@ public:
       return terms;
     }
 
+    // Whether segment `segnum`'s header proves `term` absent from the field,
+    // so its statistics are zero there without a seek. Cross-check mode
+    // seeks anyway and fails on a hit.
+    bool termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term) {
+      if (!QueryPruning::termAbsent(field.segInfos, segnum, term)) return false;
+      if (QueryPruning::crossCheck) {
+        auto* terms = getTermsEnum(field, segnum);
+        if (terms && terms->seek(term)) {
+          QueryPruning::crossCheckFailed(std::format("term '{}' of field '{}' found in segment {} proven to lack it",
+                                                     term, field.segInfos.name(), segnum));
+        }
+      }
+      return true;
+    }
+
   public:
     CachedTermInfo* getCachedTerminfo(CachedFieldInfo& cachedFieldInfo, std::string_view term) {
       auto [iter, inserted] = cachedFieldInfo.termInfos.try_emplace(term);
@@ -1606,14 +1641,20 @@ public:
       auto numSegs = numSegments();
       // TermsEnums survive missing-term lookups; allocate them before the
       // temporary postings states that can be rewound below.
-      for (size_t i = 0; i < numSegs; i++) getTermsEnum(cachedFieldInfo, i);
+      for (size_t i = 0; i < numSegs; i++) {
+        if (!termAbsent(cachedFieldInfo, i, term)) getTermsEnum(cachedFieldInfo, i);
+      }
       auto savepoint = pool.getSavePoint();
       int foundInSegCount = 0;
       result.postingsStates = {
           pool.make_arr<const TermsEnum::PostingsState*>(numSegs), numSegs};
       for (size_t i = 0; i < numSegs; ++i) {
+        // A segment whose header proves the term absent holds zero
+        // frequency for it, exactly what a seek would find, so it is not
+        // seeked. Every other segment is, pruned by other predicates or not:
+        // statistics always cover the whole reader.
         auto* termsEnum = cachedFieldInfo.termsEnums[i];
-        if (!termsEnum || !termsEnum->seek(term)) {
+        if (!termsEnum || termAbsent(cachedFieldInfo, i, term) || !termsEnum->seek(term)) {
           result.postingsStates[i] = nullptr;
           continue;
         }
@@ -1637,6 +1678,7 @@ public:
       result = {};
       bool found = false;
       for (int i = 0; i < (int)numSegments(); ++i) {
+        if (termAbsent(cachedFieldInfo, (size_t)i, term)) continue;
         auto* termsEnum = getTermsEnum(cachedFieldInfo, (size_t)i);
         if (!termsEnum || !termsEnum->seek(term)) {
           continue;
@@ -2414,6 +2456,7 @@ Query::VerificationWork membershipVerificationWork(const Query& query);
 
 inline void Query::validateLogical(
     PlanningContext& context, float multiplier) const {
+  if (kind == QueryKind::KNN || kind == QueryKind::FORCE_PREPARE) context.mayPrepare = true;
   validateLogicalImpl(context, multiplier);
 #ifndef NDEBUG
   context.recordLogicalValidation(*this);
