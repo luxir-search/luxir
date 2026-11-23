@@ -78,15 +78,17 @@ a zero vector instead of being stored without a direction.
 
 Exact scoring means exact over the stored values. `VectorScorer` is the single
 place a float query is scored against a stored row, used by the flat column
-engine and the terminal candidate rescore. `f16`, `bf16` and `sq8` rows are
-decoded into a per-task buffer and scored with the float32 kernels, so a score
-is the f32 score of the stored vector. `sq8` decodes first rather than scoring
-its codes against per-vector offset and scale terms, which cancel
-catastrophically for a query with a large dynamic range. Cosine over a decoded
-row always divides by the stored vector's norm, since a quantized unit vector
-is not exactly unit length. Distance kernels that read 16-bit values directly
-can replace the decode behind `VectorScorer` without changing the format
-contract.
+engine and the terminal candidate rescore. `f16` and `bf16` rows are scored in
+place by FAISS's `ScalarQuantizer` distance computers (`QT_fp16` and
+`QT_bf16` read the layouts written here and need no training); cosine takes
+the dot from an inner-product computer and `|x|^2` from an L2 computer against
+an all-zero query, a second pass over the row. `sq8` rows are decoded into a
+per-task buffer and scored with the float32 kernels, rather than scoring the
+codes against per-vector offset and scale terms, which cancel catastrophically
+for a query with a large dynamic range. Either way a score is the f32 score of
+the stored vector up to summation order. Cosine over a non-f32 row always
+divides by the stored vector's norm, since a quantized unit vector is not
+exactly unit length.
 
 ## Overlay Lifecycle
 
@@ -563,7 +565,9 @@ priced as `2^bits * dims` distance dimensions with an unfitted seed equal to
 the exact-dimension cost. Interval terminal reads have a shared floor of
 `min(k, examined interval vectors)`, with dimensions scaled by the
 read-weighted average. Every query pays a request constant, and any query that
-runs IVF pays a second one. Units are nanoseconds divided by the cost of one exact
+runs IVF pays a second one. Exact and terminal dimensions are weighted by the
+segment column's encoding (`Costs::ENCODING_DIM_COST`, measured against f32).
+Units are nanoseconds divided by the cost of one exact
 dimension; counters expose the same units, and `KnnPlanner::Costs` records what
 they were fitted on.
 
