@@ -65,6 +65,11 @@ locations, browse `src/luxir/<area>/`.
    - `IdFilter`: the root id field's FILTER part, a split-block Bloom filter over its
      dictionary terms. `SegmentCore::mayContainId` checks the exact id bounds, then the
      filter; the writer's delete application skips ids and segments it excludes
+   - `TermProbe`: exact lookups of known terms in a lazy segment, in batched fetch
+     rounds (block offsets and trie, then the term blocks the targets route to, then
+     postings not inlined in their block), read through a sparse `TermsEnum` that
+     holds only those ranges. The writer's delete application uses it on lazy id
+     dictionaries, and reads a large id filter only at the blocks the ids hash to
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
      opening reads metadata and endpoints without scanning child rows.

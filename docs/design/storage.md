@@ -271,7 +271,12 @@ needs:
 - id lookups for updates and deletes that skip cold segments without
   fetching them. Append-only collections need no lookups. Otherwise the
   exact id bounds in each segment's catalog and its id filter part do the
-  skipping, from the catalog alone;
+  skipping, from the catalog alone. A lookup that gets past them reads only
+  the filter blocks the ids hash to (the whole filter when it is small), the
+  id dictionary's block offsets and trie, the term blocks the ids route to,
+  and postings not inlined in their block, each round as one batched fetch
+  per file (`TermProbe`). It never reads a whole dictionary. A write that
+  only adds documents (no ids, or no overwrite) reads no old segment;
 - the syncer reporting which files are published, so that eviction knows
   what it may drop.
 

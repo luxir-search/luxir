@@ -122,6 +122,24 @@ class TermsEnum {
   InputStream runPositions;
 
 public:
+  // Keeps the ranges a sparse enum reads alive (the enum lives in a MemPool and
+  // owns nothing). The owner outlives the enum and may be shared by enums on
+  // other threads.
+  class SparseHolds {
+  public:
+    virtual std::span<const char> hold(field_parts::Slice slice, ReadClass readClass) = 0;
+
+  protected:
+    ~SparseHolds() = default;
+  };
+
+private:
+  // Sparse mode (see the sparse constructor): the enum reads only the routing
+  // data, the blocks it seeks to and the postings it asks for, never the whole
+  // dictionary or a run's postings stream.
+  SparseHolds* sparse = nullptr;
+
+public:
   struct BlockEstimate {
     std::string firstTerm;
     uint64_t bytes;
@@ -166,6 +184,29 @@ public:
         termsIS.ptr(blockOffsets.location.offset() - start));
     numTermBlocks = (int32_t)(blockOffsets.bytes / sizeof(field_parts::Terms::BlockOffset));
     trieBase = termsIS.ptr(trie.location.offset() - start);
+    runCount = (int32_t)termData->runs.size();
+    runs = termData->runs.data();
+    selectRun(runs);
+  }
+
+  // An enum that reads only what its seeks touch, for exact lookups of known
+  // terms in a lazy file (TermProbe): the block offsets and trie, the block
+  // each seek routes to, and the postings each postingsState() asks for, each
+  // acquired as its own range and kept by `holds`. Only seek(), the current
+  // term's accessors and postingsState() are supported, on a field without
+  // positions.
+  TermsEnum(MemPool& pool, PostingsReader& reader, const DecodedFieldRecord& fieldInfo, SparseHolds& holds)
+      : segmentCore(reader.core()), termData(fieldInfo.terms()), totals(fieldInfo.indexedTotals()),
+        flags(fieldInfo.flags), currTerm(pool.alloc(TERM_BUFFER_BYTES), 0), sparse(&holds) {
+    if (!termData) return;
+    if (FieldType::hasPositions(flags)) throw std::logic_error("a sparse TermsEnum reads no positions");
+    auto blockOffsets = fieldInfo.termBlockOffsets();
+    auto trie = field_parts::termTrie(blockOffsets, termData->trieBytes);
+    auto routing = sparse->hold(
+        {blockOffsets.location, trie.end().offset() - blockOffsets.location.offset()}, ReadClass::METADATA);
+    termBlockOffsets = reinterpret_cast<const field_parts::Terms::BlockOffset*>(routing.data());
+    numTermBlocks = (int32_t)(blockOffsets.bytes / sizeof(field_parts::Terms::BlockOffset));
+    trieBase = routing.data() + (trie.location.offset() - blockOffsets.location.offset());
     runCount = (int32_t)termData->runs.size();
     runs = termData->runs.data();
     selectRun(runs);
@@ -237,6 +278,7 @@ public:
   // the exact ends of this run's streams, delimit the sampled postings.
   std::vector<BlockEstimate> estimateTermBlocks(int32_t stride = 1) const {
     assert(stride >= 1);
+    assert(!sparse);
     std::vector<BlockEstimate> blocks;
     if (!termData) return blocks;
     blocks.reserve((size_t)sampleCount(termData->runs, numTermBlocks, stride));
@@ -429,6 +471,13 @@ public:
       if (state.hasPositions) {
         state.pulsedPos = (int32_t) pulsedValues[valueIndex + 1];
       }
+    } else if (sparse) [[unlikely]] {
+      // Just this term's postings, rebased so they start the stream.
+      auto postings = sparse->hold(run->docs.subSlice((uint64_t)state.docsStart,
+                                       (uint64_t)(state.docsEnd - state.docsStart)), ReadClass::DATA);
+      state.docIS = InputStream(postings.data(), postings.data() + postings.size());
+      state.docsEnd -= state.docsStart;
+      state.docsStart = 0;
     } else {
       state.docIS = runDocs;
       state.docIS.seek(state.docsStart);
@@ -439,6 +488,17 @@ public:
       }
     }
     return state;
+  }
+
+  // Where the current term's postings are, without reading them: a null
+  // slice when they are inlined in the block (a term of one document).
+  field_parts::Slice postingsSlice() {
+    assert(ordInBlock >= 0);
+    decodePostings();
+    uint64_t startOffset = ordInBlock == 0 ? 0 : docsEnds[(size_t) ordInBlock - 1];
+    uint64_t endOffset = docsEnds[(size_t) ordInBlock];
+    if (startOffset == endOffset) return {};
+    return run->docs.subSlice((uint64_t)locOfDocsForTermBlock + startOffset, endOffset - startOffset);
   }
 
 protected:
@@ -704,11 +764,13 @@ protected:
     runEndBlockOrd = hasNext ? (run + 1)->firstBlockOrd : numTermBlocks;
     runTermsBase = (int64_t)run->dictionaryStart;
     runTermsEnd = (int64_t)(hasNext ? (run + 1)->dictionaryStart : termData->dictionaryBytes);
+    if (sparse) [[unlikely]] return;  // Postings are acquired per term.
     runDocs = run->docs ? streamThrough(run->docs) : InputStream();
     runPositions = run->positions ? streamThrough(run->positions) : InputStream();
   }
 
   PackedTerm firstTermForNextBlock(int32_t nextBlock) const {
+    assert(!sparse);
     auto base = nextBlock < runEndBlockOrd ? runTermsBase : runTermsEnd;
     return termsIS.readPackedTerm(base + termBlockOffsets[nextBlock]);
   }
@@ -727,13 +789,24 @@ protected:
         || termBlockIndex >= runEndBlockOrd) [[unlikely]] {
       reselectRunForBlock(termBlockIndex);
     }
-    termsIS.seek(runTermsBase + (int64_t) termBlockOffsets[termBlockIndex]);
+    int64_t blockStartOffset = runTermsBase + (int64_t) termBlockOffsets[termBlockIndex];
+    int64_t blockEndOffset = termBlockIndex + 1 < runEndBlockOrd
+        ? runTermsBase + (int64_t)termBlockOffsets[termBlockIndex + 1] : runTermsEnd;
+    if (sparse) [[unlikely]] {
+      // The block alone; holds keep kReadSlack readable bytes past their end,
+      // which covers copyIntoTerm's COPY_SLACK.
+      static_assert(COPY_SLACK <= kReadSlack);
+      auto block = sparse->hold(termData->dictionaryBlocks().subSlice((uint64_t)blockStartOffset,
+                                    (uint64_t)(blockEndOffset - blockStartOffset)), ReadClass::METADATA);
+      termsIS = InputStream(block.data(), block.data() + block.size());
+      blockEndOffset -= blockStartOffset;
+      blockStartOffset = 0;
+    }
+    termsIS.seek(blockStartOffset);
     startingOrd = run->firstTermForBlock(termBlockIndex);
     ordInBlock = 0;
     maxOrdInBlock = (int32_t) std::min<int64_t>(Postings::TERMS_BLOCK_SIZE - 1,
                                                 runLastTermOrd - startingOrd);
-    int64_t blockEndOffset = termBlockIndex + 1 < runEndBlockOrd
-        ? runTermsBase + (int64_t)termBlockOffsets[termBlockIndex + 1] : runTermsEnd;
     blockEnd = termsIS.ptr(blockEndOffset);
 
     // see TextWriter::flushTerms
@@ -842,6 +915,24 @@ protected:
   }
 
 public:
+  // The dictionary bytes of the block a seek for `target` loads, found from the
+  // trie and block offsets alone (the block is not read); null for a field
+  // without a dictionary.
+  field_parts::Slice blockSlice(std::string_view target) const {
+    if (!termData) return {};
+    TrieReader trie(trieBase, (uint64_t)termData->trieRootOffset, numTermBlocks);
+    int32_t block = trie.floorBlock(target);
+    const auto* owner = block >= run->firstBlockOrd && block < runEndBlockOrd
+        ? run : findRun(block + 1, [](const auto& candidate) { return candidate.firstBlockOrd; });
+    bool hasNext = owner + 1 != runs + runCount;
+    int32_t endBlock = hasNext ? (owner + 1)->firstBlockOrd : numTermBlocks;
+    auto base = (uint64_t)owner->dictionaryStart;
+    auto end = hasNext ? (owner + 1)->dictionaryStart : termData->dictionaryBytes;
+    auto start = base + termBlockOffsets[block];
+    if (block + 1 < endBlock) end = base + termBlockOffsets[block + 1];
+    return termData->dictionaryBlocks().subSlice(start, end - start);
+  }
+
   // A seek can land arbitrarily far from where the enum was, so every seek ends
   // by dropping the shared prefix back to 0 (see sharedPrefixLen).  The
   // nTerms == 0 early returns need no such reset: sharedLen can only become

@@ -43,6 +43,12 @@ public:
   bool mayContain(std::string_view term) const noexcept { return mayContainHash(hash(term)); }
   bool mayContainHash(uint64_t hash) const noexcept;
 
+  // A probe reads one block: the byte offset of the block `hash` routes to in a
+  // filter part of `filterBytes`, and the test against that block alone. A
+  // filter on a lazy file can be probed by fetching only these blocks.
+  static uint64_t blockOffset(uint64_t hash, uint64_t filterBytes) noexcept;
+  static bool blockMayContain(const char* block, uint64_t hash) noexcept;
+
   // Collects one dictionary's keys. Sized up front for an upper bound on the
   // keys; fewer keys only lower the false positive rate.
   class Builder {

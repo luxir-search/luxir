@@ -30,15 +30,21 @@ uint64_t IdFilter::blocksFor(uint64_t keys) noexcept {
   return std::min((bits + BLOCK_BYTES * 8 - 1) / (BLOCK_BYTES * 8), MAX_BLOCKS);
 }
 
-bool IdFilter::mayContainHash(uint64_t hash) const noexcept {
-  auto blocks = bytes.size() / BLOCK_BYTES;
-  const char* block = bytes.data() + blockOf(hash, blocks) * BLOCK_BYTES;
+uint64_t IdFilter::blockOffset(uint64_t hash, uint64_t filterBytes) noexcept {
+  return blockOf(hash, filterBytes / BLOCK_BYTES) * BLOCK_BYTES;
+}
+
+bool IdFilter::blockMayContain(const char* block, uint64_t hash) noexcept {
   for (size_t w = 0; w < BLOCK_WORDS; w++) {
     uint32_t word;
     std::memcpy(&word, block + w * sizeof(uint32_t), sizeof(word));
     if (!(word & bitOf(hash, w))) return false;
   }
   return true;
+}
+
+bool IdFilter::mayContainHash(uint64_t hash) const noexcept {
+  return blockMayContain(bytes.data() + blockOffset(hash, bytes.size()), hash);
 }
 
 IdFilter::Builder::Builder(uint64_t maxKeys) : words(blocksFor(maxKeys) * BLOCK_WORDS) {}

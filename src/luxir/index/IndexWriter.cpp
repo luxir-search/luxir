@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/reader/SegmentCore.h"
+#include "luxir/reader/TermProbe.h"
 #include "IndexWriter.h"
 #include "luxir/store/Manifest.h"
 
@@ -53,6 +54,11 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
     result.setException(error);
   }
 }
+
+// A lazy segment's id filter up to this size is fetched whole for a delete
+// pass (about 52,000 ids at 10 bits per id); a larger one only at the blocks
+// the ids hash to.
+constexpr uint64_t PROBE_WHOLE_ID_FILTER_BYTES = 64 * 1024;
 
 bool mayApplyDeletes(const SegInfo& seg, const SortedDeletes& packet) {
   if (seg.minVersion >= packet.getLargestVersion()) return false;
@@ -243,27 +249,36 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   storedDictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(*getSchema()));
   // Only manifest-live segments can seed a resource. Own the winning bytes;
   // later retirement of its segment must not affect inverter/merge writers.
+  // The largest segment (by manifest bytes) holding a dictionary wins, so
+  // usually one segment is opened (its catalog) and one dictionary read:
+  // opening every segment of a remote collection would delay the first write.
+  std::vector<SegInfo*> bySize;
+  for (const auto& [id, seg] : segInfos) bySize.push_back(seg.get());
+  auto bytesOf = [](const SegInfo* seg) {
+    uint64_t total = 0;
+    for (const auto& file : seg->baseFiles) total += file.size;
+    return total;
+  };
+  std::ranges::sort(bySize, [&](const SegInfo* a, const SegInfo* b) {
+    auto ba = bytesOf(a), bb = bytesOf(b);
+    return ba != bb ? ba > bb : a->segId < b->segId;
+  });
   for (const auto& [name, type] : getSchema()->fieldTypeMap) {
     auto* stored = dynamic_cast<const StoredFieldType*>(type.get());
     if (!stored || !stored->format_.dictionaryBytes) continue;
     std::string_view bestDictionary;
-    int64_t bestBytes = -1;
-    uint64_t bestSegId = 0;
-    for (const auto& [id, seg] : segInfos) {
+    for (SegInfo* seg : bySize) {
       auto readerCore = getSegmentCore(*seg);
+      int64_t bestBytes = -1;
       for (const auto& space : readerCore->spaces()) {
         auto* reader = readerCore->spaceReader(space.path);
         const auto* field = reader->fieldInfo(name);
         const auto* part = field ? field->stored() : nullptr;
-        if (!part || !part->dictionaryBytes) continue;
-        auto dictionary = std::string_view(readerCore->slice(part->dictionary()));
-        auto bytes = part->chunksBytes;
-        if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
-          bestBytes = bytes;
-          bestSegId = id;
-          bestDictionary = dictionary;
-        }
+        if (!part || !part->dictionaryBytes || part->chunksBytes <= bestBytes) continue;
+        bestBytes = part->chunksBytes;
+        bestDictionary = std::string_view(readerCore->slice(part->dictionary()));
       }
+      if (!bestDictionary.empty()) break;
     }
     auto token = storedDictionaries.token(name, stored->format_);
     if (!bestDictionary.empty() && token) {
@@ -3611,15 +3626,67 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     return 0;
   }
 
+  // A lazy id dictionary (a segment on a remote store) is probed by range: only
+  // the filter blocks, block offsets and trie, the term blocks the ids route to
+  // and postings not inlined in their block are fetched, never the dictionary.
+  bool probing = TermProbe::saves(*core, *idFieldInfo);
+
   // The id filter proves most absent ids absent: those skip the dictionary,
-  // and a segment that can hold none of them is not touched further.
+  // and a segment that can hold none of them is not touched further. On a lazy
+  // file a large filter is read only at the blocks the ids hash to.
   std::optional<IdFilter> idFilter;
-  if (auto slice = idFieldInfo->idFilter()) idFilter.emplace(core->slice(slice));
+  boost::unordered_flat_set<const char*> filterPassed;  // ids (by their bytes) a probed filter keeps
+  bool filterProbed = false;
+  if (auto slice = idFieldInfo->idFilter()) {
+    if (!probing || slice.bytes <= PROBE_WHOLE_ID_FILTER_BYTES) {
+      idFilter.emplace(core->slice(slice, ReadClass::METADATA));
+    } else {
+      filterProbed = true;
+      TermProbe::Round round;
+      auto blockOf = [&](uint64_t hash) {
+        return slice.subSlice(IdFilter::blockOffset(hash, slice.bytes), IdFilter::BLOCK_BYTES);
+      };
+      for (auto span : clipped) {
+        for (auto& entry : span) {
+          if (entry.val().deleteWatermark != 0) round.add(blockOf(IdFilter::hash((std::string_view)entry)), ReadClass::METADATA);
+        }
+      }
+      round.fetch(*core, kNoReadDeadline);
+      auto* file = core->getFile(slice.location.filenum());
+      for (auto span : clipped) {
+        for (auto& entry : span) {
+          if (entry.val().deleteWatermark == 0) continue;
+          auto id = (std::string_view)entry;
+          auto hash = IdFilter::hash(id);
+          auto block = blockOf(hash);
+          auto hold = file->acquire({block.location.offset(), block.bytes, ReadClass::METADATA});
+          if (IdFilter::blockMayContain(hold.getData(), hash)) filterPassed.insert(id.data());
+        }
+      }
+    }
+  }
   auto mayHold = [&](const auto& entry) {
-    return entry.val().deleteWatermark != 0 && (!idFilter || idFilter->mayContain((std::string_view)entry));
+    if (entry.val().deleteWatermark == 0) return false;
+    auto id = (std::string_view)entry;
+    if (filterProbed) return filterPassed.contains(id.data());
+    return !idFilter || idFilter->mayContain(id);
   };
   if (std::ranges::none_of(clipped, [&](auto span) { return std::ranges::any_of(span, mayHold); })) return 0;
   Signal::emit("deleteLookupInSegment", (void*)(int64_t)seg.segId);
+
+  std::optional<TermProbe> probe;
+  if (probing) {
+    probe.emplace(reader, *idFieldInfo, kNoReadDeadline);
+    std::vector<std::string_view> targets;
+    for (auto span : clipped) {
+      for (auto& entry : span) {
+        if (mayHold(entry)) targets.push_back((std::string_view)entry);
+      }
+    }
+    auto guard = MemPool::threadLocalPoolGuard();
+    auto terms = probe->enumFor(guard.pool());
+    probe->fetchBlocks(terms, targets);
+  }
 
   // Load existing LiveDocs if they exist: the published reader's when it
   // holds this generation
@@ -3686,7 +3753,52 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
     newDeletesCount.fetch_add(cleared, std::memory_order_relaxed);
     hits.clear();
   };
+  auto collect = [&](TermsEnum& termsEnum, uint64_t deleteVersion, std::vector<DeleteCandidate>& hits,
+                     IndexRamBudget::Guard& scratch) {
+    DocsOnlyEnum docsEnum(termsEnum);
+    for (int32_t docId = docsEnum.next(); docId != DocsEnumMeta::END; docId = docsEnum.next()) {
+      if (currLiveBits && !currLiveBits->get(docId)) continue;
+      hits.push_back({docId, deleteVersion});
+      if (hits.size() >= chunk) drain(hits, scratch);
+    }
+  };
+  // Probed lookups: the blocks are resident, so seeks read nothing new. Ids
+  // whose postings are not inlined are sought again once their postings
+  // arrive, in one round for the piece.
+  auto applyProbed = [&](SortedDeletes::EntrySpan span) {
+    auto guard = MemPool::threadLocalPoolGuard();
+    auto termsEnum = probe->enumFor(guard.pool());
+    std::vector<DeleteCandidate> hits;
+    auto scratch = indexRamBudget->forceAcquire(0);
+    uint64_t probed = 0;
+    std::vector<std::pair<std::string_view, uint64_t>> later;
+    std::vector<field_parts::Slice> postings;
+    for (auto& entry : span) {
+      if (!mayHold(entry)) continue;
+      probed++;
+      auto deleteId = (std::string_view)entry;
+      uint64_t deleteVersion = entry.val().deleteWatermark;
+      if (!termsEnum.seek(deleteId)) continue;
+      if (auto slice = termsEnum.postingsSlice()) {
+        later.emplace_back(deleteId, deleteVersion);
+        postings.push_back(slice);
+        continue;
+      }
+      collect(termsEnum, deleteVersion, hits, scratch);
+    }
+    if (!later.empty()) {
+      probe->fetchPostings(postings);
+      for (auto [deleteId, deleteVersion] : later) {
+        [[maybe_unused]] bool found = termsEnum.seek(deleteId);
+        assert(found);
+        collect(termsEnum, deleteVersion, hits, scratch);
+      }
+    }
+    drain(hits, scratch);
+    lookups.fetch_add(probed, std::memory_order_relaxed);
+  };
   auto apply = [&](SortedDeletes::EntrySpan span) {
+    if (probe) return applyProbed(span);
     auto guard = MemPool::threadLocalPoolGuard();
     TermsEnum termsEnum(guard.pool(), reader, *idFieldInfo);
     std::vector<DeleteCandidate> hits;
