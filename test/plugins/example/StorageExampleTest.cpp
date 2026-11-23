@@ -372,6 +372,114 @@ TEST_F(StorageExampleTest, coldTermQueryWaitsOnRoundsNotSegments) {
   }
 }
 
+// An upsert batch over cold segments acquires its id lookups in rounds across
+// segments and ids: the filters' header and blocks, the routing data, then
+// the blocks the ids land in with the version runs. A segment holds one doc
+// per id, whose postings are pulsed into its block, so no postings are read. A segment its bounds exclude reads nothing,
+// one its filter excludes reads its filter header and one block, and no
+// segment holds its dictionary or filter whole.
+TEST_F(StorageExampleTest, coldUpsertWaitsOnRoundsNotIdsOrSegments) {
+  constexpr int perSegment = 6000;
+  // Segment s holds ids "s" + 15 hex digits, so bounds tell segments apart.
+  auto id = [](int segment, int i) { return std::format("{}{:015x}", segment, (uint64_t)i * 0x9e3779b97f4a7c15ULL >> 4); };
+  struct Cost {
+    uint64_t rounds = 0, batches = 0, singles = 0, maxBatchesPerFile = 0;
+  };
+  auto measure = [&](int segments, int upserts) {
+    LuxirConfig config;
+    config.store.backend = "ram";
+    config.store.layers = {"strict"};
+    config.store.options = {{"strict", {{"whole_segment_files", "deny"}}}};
+    config.index.id_filter_min_kb = 128;  // past WHOLE_READ_BYTES: probed block by block
+    LuxirNode node(config);
+    CollectionHelper h(node, "main");
+    auto writer = h.getIndexWriter();
+    for (int s = 0; s < segments; ++s) {
+      std::vector<Doc> docs;
+      for (int i = 0; i < perSegment; ++i) docs.push_back(flatdoc("id", id(s, i)));
+      EXPECT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT).success);
+    }
+    auto reader = writer->snapshots.readers.getReader();
+    EXPECT_EQ((size_t)segments, reader->segments().size());
+    auto* layer = node.collections().storage().find<StrictLayer>();
+    EXPECT_NE(nullptr, layer);
+    auto& counters = *layer->counters;
+    auto old = writer->snapshots.snapshot()->files;
+    std::map<std::string, StrictStorageCounters::FileStats> before;
+    for (const auto& file : old) before[file.name] = counters.fileStats(file.name);
+    for (const auto& segment : reader->segments()) {
+      const auto* record = segment.postingsReader().fieldInfo("id");
+      EXPECT_FALSE(segment.segmentCore().held(record->termNavigation()));
+      EXPECT_GT(record->terms()->dictionaryBytes, field_parts::WHOLE_READ_BYTES);
+      EXPECT_GT(record->idFilter().bytes, field_parts::WHOLE_READ_BYTES);
+    }
+    auto roundsBefore = writer->stats(false, false).idLookupRounds;
+
+    // Upserts into the first half of the segments, round robin, and one id
+    // absent from the last segment but within its bounds.
+    std::vector<Doc> docs;
+    int targets = std::max(1, segments / 2);
+    for (int u = 0; u < upserts; ++u) docs.push_back(flatdoc("id", id(u % targets, u * 7 % (perSegment / 2))));
+    auto absent = std::format("{}{:015x}", segments - 1, 1);
+    docs.push_back(flatdoc("id", absent));
+    EXPECT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT, true).success);
+    EXPECT_EQ((int64_t)segments * perSegment - upserts + (int64_t)docs.size(),
+              (int64_t)writer->snapshots.readers.getReader()->liveDocs());
+
+    Cost cost;
+    cost.rounds = writer->stats(false, false).idLookupRounds - roundsBefore;
+    for (const auto& file : old) {
+      auto stats = counters.fileStats(file.name);
+      auto& was = before[file.name];
+      auto batches = stats.batches - was.batches;
+      cost.batches += batches;
+      cost.singles += stats.rounds - was.rounds - batches;
+      cost.maxBatchesPerFile = std::max(cost.maxBatchesPerFile, batches);
+      EXPECT_EQ(0u, stats.wholeFileAccesses) << file.name;
+    }
+    for (const auto& segment : reader->segments()) {
+      auto& core = segment.segmentCore();
+      const auto* record = segment.postingsReader().fieldInfo("id");
+      auto name = Postings::getIndexFileName(core.segmentName(), record->terms()->location.filenum());
+      auto acquired = counters.fileStats(name).acquires - before[name].acquires;
+      EXPECT_FALSE(core.held(record->terms()->dictionaryBlocks())) << name;
+      EXPECT_FALSE(core.held(record->idFilter())) << name;
+      int s = std::string_view(record->dictionaryBounds()->lower)[0] - '0';
+      if (s < targets) continue;
+      // Bounds exclude the upserts; the filter excludes the absent id, read
+      // at its header and one block.
+      EXPECT_EQ(s == segments - 1 ? 2u : 0u, acquired) << name;
+      EXPECT_FALSE(core.held(record->termNavigation())) << name;
+    }
+
+    // A second batch holds the routing data already, and reads the live docs
+    // the first wrote with its blocks: filter blocks, then term blocks.
+    docs.clear();
+    for (int u = 0; u < upserts; ++u) docs.push_back(flatdoc("id", id(u % targets, perSegment / 2 + u)));
+    roundsBefore = writer->stats(false, false).idLookupRounds;
+    auto totalBefore = counters.totalRounds();
+    EXPECT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT, true).success);
+    EXPECT_EQ(2u, writer->stats(false, false).idLookupRounds - roundsBefore);
+    EXPECT_EQ((int64_t)segments * perSegment + 1, (int64_t)writer->snapshots.readers.getReader()->liveDocs());
+    uint64_t oldSingles = 0;
+    for (const auto& file : old) {
+      auto stats = counters.fileStats(file.name);
+      if (stats.lastRound > totalBefore) oldSingles += stats.rounds - stats.batches - (before[file.name].rounds - before[file.name].batches);
+    }
+    EXPECT_EQ(cost.singles, oldSingles);
+    return cost;
+  };
+
+  auto few = measure(2, 1);
+  auto many = measure(6, 60);
+  for (const auto& cost : {few, many}) {
+    EXPECT_EQ(3u, cost.rounds);  // filters, routing data, blocks
+    EXPECT_EQ(0u, cost.singles);
+    EXPECT_LE(cost.maxBatchesPerFile, cost.rounds);
+  }
+  EXPECT_GT(many.batches, few.batches);
+}
+
 // listParts() lists each segment's catalog and its fields' navigation parts,
 // and the data of the fields asked for. A segment that holds what it lists
 // serves a query on those fields without another acquire.

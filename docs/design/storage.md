@@ -347,7 +347,18 @@ needs:
 - id lookups for updates and deletes that skip cold segments without
   fetching them. Append-only collections need no lookups. Otherwise the
   exact id bounds in each segment's catalog and its id filter part do the
-  skipping, from the catalog alone;
+  skipping, from the catalog alone. On segments without free views, a delete
+  application acquires what its lookups read ahead of them, in rounds that
+  each wait once on one batch per segment file, across every segment and id
+  of the batch (`acquireIdLookups`): the filter (whole up to 64 KiB, else its
+  header and the 32-byte block each id hashes to), then the term routing data
+  of the segments with an id the filter keeps, then the block each such id
+  lands in with the version runs and live docs, then the postings of found
+  ids that are not inlined (an id with one document is pulsed into its
+  block, so most upserts skip this round). The commit thread waits on each
+  round without the index lock; the per-segment tasks that follow read held
+  parts only. So a batch waits on three or four rounds however many ids and
+  segments it looks up, and never holds a whole dictionary;
 - the syncer reporting which files are published, so that eviction knows
   what it may drop.
 

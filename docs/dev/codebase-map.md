@@ -78,6 +78,10 @@ locations, browse `src/luxir/<area>/`.
      dictionary terms that names its own kind (split-block Bloom or binary fuse) and
      parameters. `IdFilter::Options` picks what a writer builds. `SegmentCore::mayContainId` checks the exact id bounds, then the
      filter; the writer's delete application skips ids and segments it excludes
+   - `IdLookups` (index/): on segments without free views, `acquireIdLookups` acquires what a
+     delete application's id lookups read, in rounds across its segments and ids (filter
+     header and blocks through `IdFilterProbe`, routing data, term blocks, postings); the
+     lookups then seek through enums in `TermsEnum::readAhead()` mode
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
      its first use reads metadata and endpoints without scanning child rows.

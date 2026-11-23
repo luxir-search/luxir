@@ -3,6 +3,7 @@
 
 #include "luxir/reader/SegmentCore.h"
 #include "IndexWriter.h"
+#include "IdLookups.h"
 #include "luxir/store/Manifest.h"
 
 #include <algorithm>
@@ -3427,6 +3428,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
     out.minInverterDocVersion = minInverterDocVersion;
     uint64_t frontier = deleteFrontierLocked();
     out.liveDocsBytesWritten = liveDocsBytesWritten.load(std::memory_order_relaxed);
+    out.idLookupRounds = idLookupRounds.load(std::memory_order_relaxed);
     out.pinningInverterFlushes = pinningInverterFlushes;
     out.deleteOnlyKneeFlushes = deleteOnlyKneeFlushes;
     out.deleteOnlyFlushCap = deleteOnlyFlushCapLocked();
@@ -3537,13 +3539,63 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
   return out;
 }
 
+// One segment's share of a delete application: its spans, clipped to its id
+// bounds, and what its lookups read.
+struct IndexWriter::SegmentDeletes {
+  SegInfo& seg;
+  boost::container::small_vector<SortedDeletes::EntrySpan, 8> spans;
+  std::shared_ptr<SegmentCore> core;
+  const DecodedFieldRecord* idField = nullptr;
+  // Set when a file of the segment does not hand out free views: its lookups
+  // read what acquireIdLookups() acquired ahead, for every segment at once.
+  std::optional<SegmentIdLookups> ahead;
+
+  explicit SegmentDeletes(SegInfo& seg) : seg(seg) {}
+
+  // Keeps the parts of the spans within `range`; false when nothing is left.
+  bool clip(const IdRange& range) {
+    boost::container::small_vector<SortedDeletes::EntrySpan, 8> clipped;
+    for (auto span : spans) {
+      span = clipDeletes(span, range);
+      if (!span.empty()) clipped.push_back(span);
+    }
+    spans = std::move(clipped);
+    return !spans.empty();
+  }
+};
+
 // This is where seg.liveGen can change. A snapshot segment's personal deletes
 // stay put meanwhile: a merge attaches them to a new output under indexMutex,
 // and the snapshot holds that output whole or not at all. Returns the ids
 // looked up in segment dictionaries, summed over segments.
+//
+// Segments whose files do not all hand out free views (a remote store) read
+// in rounds across all of them (acquireIdLookups): this thread waits on each
+// round once, without indexMutex, and the per-segment tasks that follow read
+// held parts only. Local segments read as they look up.
 uint64_t IndexWriter::applyDeletes(const DeleteApplication& app) {
+  std::vector<std::unique_ptr<SegmentDeletes>> work;
+  for (SegInfo* seg : app.targets) {
+    // Packets apply span by span, unmerged: a document goes when any fact for
+    // its id outranks its birth, which is what a merged maximum would decide.
+    auto target = std::make_unique<SegmentDeletes>(*seg);
+    auto add = [&](const SortedDeletes& packet) {
+      if (packet.sourceSegId == seg->segId || !mayApplyDeletes(*seg, packet)) return;
+      for (auto& span : packet.lists()) target->spans.push_back(span);
+    };
+    for (const auto& packet : app.pending.deletes) add(*packet);
+    for (const auto& packet : seg->personalDeletes.deletes) {
+      if (!app.pending.deletes.contains(packet) && app.selected.deletes.contains(packet)) add(*packet);
+    }
+    if (target->spans.empty()) continue;
+    // Test hook: reports each segment selected for delete application this commit.
+    luxir::Signal::emit("deleteAppliedToSegment", (void*)(int64_t)seg->segId);
+    auto range = seg->idRange.load();
+    if (range && !target->clip(*range)) continue;
+    work.push_back(std::move(target));
+  }
   std::atomic<uint64_t> applications = 0;
-  // Apply deletes to segments in parallel.  Each task writes new liveDocs
+  // Applying deletes runs in parallel per segment. Each task writes new liveDocs
   // filenames into its own segment's unsyncedFiles (single owner per task, no
   // synchronization needed); the commit body drains unsyncedFiles into the
   // pre-manifest fsync set and clears them only after sync succeeds, so
@@ -3551,21 +3603,17 @@ uint64_t IndexWriter::applyDeletes(const DeleteApplication& app) {
   // data and overlay files.
   // The waiting commit thread must not execute an unrelated merge or flush.
   oneapi::tbb::this_task_arena::isolate([&] {
+    openSegmentCores(work);
+    std::vector<SegmentIdLookups*> ahead;
+    for (auto& target : work) {
+      if (prepareDeletes(*target) && target->ahead) ahead.push_back(&*target->ahead);
+    }
+    idLookupRounds.fetch_add(acquireIdLookups(ahead), std::memory_order_relaxed);
     oneapi::tbb::task_group tg;
-    for (SegInfo* seg : app.targets) {
-      tg.run([this, seg, &app, &applications]() {
-        // Packets apply span by span, unmerged: a document goes when any fact for
-        // its id outranks its birth, which is what a merged maximum would decide.
-        boost::container::small_vector<SortedDeletes::EntrySpan, 8> spans;
-        auto add = [&](const SortedDeletes& packet) {
-          if (packet.sourceSegId == seg->segId || !mayApplyDeletes(*seg, packet)) return;
-          for (auto& span : packet.lists()) spans.push_back(span);
-        };
-        for (const auto& packet : app.pending.deletes) add(*packet);
-        for (const auto& packet : seg->personalDeletes.deletes) {
-          if (!app.pending.deletes.contains(packet) && app.selected.deletes.contains(packet)) add(*packet);
-        }
-        applications.fetch_add(applyDeletes(*seg, spans), std::memory_order_relaxed);
+    for (auto& target : work) {
+      if (!target->core) continue;
+      tg.run([this, &target, &applications]() {
+        applications.fetch_add(applyDeletes(*target), std::memory_order_relaxed);
       });
     }
     tg.wait();
@@ -3573,53 +3621,85 @@ uint64_t IndexWriter::applyDeletes(const DeleteApplication& app) {
   return applications.load(std::memory_order_relaxed);
 }
 
-uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans) {
-  if (spans.empty()) {
-    return 0;
+// Opens the cores the targets need and the writer has not opened yet together,
+// so their catalogs cost one round between them.
+void IndexWriter::openSegmentCores(std::span<const std::unique_ptr<SegmentDeletes>> targets) {
+  std::vector<SegInfo*> closed;
+  std::vector<SegmentCore::Opening> openings;
+  for (const auto& target : targets) {
+    auto& seg = target->seg;
+    if (seg.sharedSegmentCore.load()) continue;
+    std::shared_ptr<IndexReader> reader;
+    if (publishedSegment(seg, reader)) continue;  // getSegmentCore takes the published core
+    openings.push_back({seg.segId, seg.creatorEpoch,
+                        SegmentCore::source(seg.segId, seg.creatorEpoch, seg.catalog, seg.maxDoc, seg.baseFiles)});
+    closed.push_back(&seg);
   }
+  if (openings.size() < 2) return;  // getSegmentCore opens one alone
+  auto cores = SegmentCore::create(dir, openings);
+  for (size_t i = 0; i < cores.size(); ++i) {
+    if (cores[i] && !closed[i]->sharedSegmentCore.load()) closed[i]->sharedSegmentCore.store(std::move(cores[i]));
+  }
+}
 
-  // Test hook: reports each segment selected for delete application this commit.
-  // Called in parallel for different segments, so consumers should synchronize when applicable.
-  luxir::Signal::emit("deleteAppliedToSegment", (void*)(int64_t)seg.segId);
-
-  boost::container::small_vector<SortedDeletes::EntrySpan, 8> clipped;
-  auto clip = [&](const IdRange& range) {
-    clipped.clear();
-    for (auto span : spans) {
-      span = clipDeletes(span, range);
-      if (!span.empty()) clipped.push_back(span);
+// Opens the segment and finds its id field. False when nothing in it can
+// match: no id field, or no id within its bounds.
+bool IndexWriter::prepareDeletes(SegmentDeletes& target) {
+  auto& seg = target.seg;
+  bool rangeKnown = seg.idRange.load() != nullptr;
+  auto opened = getSegmentCore(seg);
+  if (!rangeKnown && !target.clip(*seg.idRange.load())) return false;
+  const auto* idField = opened->rootReader().fieldInfo("id");
+  if (!idField) {
+    LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.name());
+    return false;
+  }
+  target.core = std::move(opened);
+  target.idField = idField;
+  if (target.core->holdsFree() || !idField->terms()) return true;
+  std::vector<std::string_view> ids;
+  for (auto span : target.spans) {
+    for (auto& entry : span) {
+      if (entry.val().deleteWatermark != 0) ids.push_back((std::string_view)entry);
     }
-  };
-  auto range = seg.idRange.load();
-  if (range) {
-    clip(*range);
-    if (clipped.empty()) return 0;
   }
+  std::shared_ptr<SegmentLive> live;
+  if (seg.liveGen > 0) {
+    std::shared_ptr<IndexReader> publishedReader;
+    const auto* published = publishedSegment(seg, publishedReader);
+    if (published != nullptr && published->segInfo.live_gen == seg.liveGen) live = published->rootLive();
+    if (!live) {
+      live = SegmentLive::open(dir, seg.segId, seg.creatorEpoch, seg.liveGen, seg.liveEpoch,
+                               target.core->rootReader().maxDoc(), -1, seg.liveFile ? seg.liveFile->size : 0,
+                               false, false);
+    }
+  }
+  auto& core = *target.core;
+  target.ahead.emplace(SegmentIdLookups{core, *idField, IdFilterProbe(core, *idField, ids.size()), std::move(ids),
+                                        std::move(live)});
+  return true;
+}
 
-  // Read the segment to find documents that should be deleted
-  auto core = getSegmentCore(seg);
+uint64_t IndexWriter::applyDeletes(SegmentDeletes& target) {
+  auto& seg = target.seg;
+  auto& core = target.core;
   PostingsReader& reader = core->rootReader();
   int32_t maxDocId = reader.maxDoc();
-
-  if (!range) {
-    clip(*seg.idRange.load());
-    if (clipped.empty()) return 0;
-  }
-
-  // Read the "id" field using TermsEnum
-  auto* idFieldInfo = reader.fieldInfo("id");
-  if (!idFieldInfo) {
-    LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.name());
-    return 0;
-  }
+  const auto* idFieldInfo = target.idField;
+  const auto& clipped = target.spans;
+  bool readAhead = target.ahead.has_value();
 
   // The id filter proves most absent ids absent: those skip the dictionary,
   // and a segment that can hold none of them is not touched further.
   // A filter this build cannot read proves nothing.
-  std::optional<IdFilter> idFilter;
-  if (auto slice = idFieldInfo->idFilter()) idFilter = IdFilter::parse(core->slice(slice));
+  IdFilterProbe local;
+  if (!readAhead) {
+    local = IdFilterProbe(*core, *idFieldInfo, 0);  // on free views: read whole
+    local.load();
+  }
+  const IdFilterProbe& idFilter = readAhead ? target.ahead->filter : local;
   auto mayHold = [&](const auto& entry) {
-    return entry.val().deleteWatermark != 0 && (!idFilter || idFilter->mayContain((std::string_view)entry));
+    return entry.val().deleteWatermark != 0 && idFilter.mayContain((std::string_view)entry);
   };
   if (std::ranges::none_of(clipped, [&](auto span) { return std::ranges::any_of(span, mayHold); })) return 0;
   Signal::emit("deleteLookupInSegment", (void*)(int64_t)seg.segId);
@@ -3627,7 +3707,9 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
   // Load existing LiveDocs if they exist: the published reader's when it
   // holds this generation
   std::shared_ptr<LiveDocs> existingLiveDocs;
-  if (seg.liveGen > 0) {
+  if (readAhead) {
+    if (target.ahead->live) existingLiveDocs = target.ahead->live->shared();
+  } else if (seg.liveGen > 0) {
     std::shared_ptr<IndexReader> publishedReader;
     const auto* published = publishedSegment(seg, publishedReader);
     if (published != nullptr && published->segInfo.live_gen == seg.liveGen) {
@@ -3692,6 +3774,8 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
   auto apply = [&](SortedDeletes::EntrySpan span) {
     auto guard = MemPool::threadLocalPoolGuard();
     TermsEnum termsEnum(guard.pool(), reader, *idFieldInfo);
+    // Held parts serve exact seeks; a forward seek would hold the dictionary.
+    if (readAhead) termsEnum.readAhead();
     std::vector<DeleteCandidate> hits;
     auto scratch = indexRamBudget->forceAcquire(0);
     uint64_t probed = 0;
@@ -3704,7 +3788,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
       INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
                deleteId, deleteVersion, seg.name());
 
-      if (termsEnum.seekForward(deleteId)) {
+      if (readAhead ? termsEnum.probe(deleteId) : termsEnum.seekForward(deleteId)) {
         // Found the ID term, now get documents containing this ID
         DocsOnlyEnum docsEnum(termsEnum);
 

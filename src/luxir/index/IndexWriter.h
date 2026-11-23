@@ -192,6 +192,9 @@ public:
     uint64_t pendingRetirableDeleteBytes = 0, pendingHeldDeleteBytes = 0, mergeCarryDeleteBytes = 0;
     // liveDocs files written by commits, passes, merges and flushes.
     uint64_t liveDocsBytesWritten = 0;
+    // Rounds of acquires id lookups waited on, ahead of their lookups in
+    // segments without free views (acquireIdLookups), one per wait.
+    uint64_t idLookupRounds = 0;
     uint64_t pinningInverterFlushes = 0, deleteOnlyKneeFlushes = 0;
     uint64_t deleteOnlyFlushCap = 0;
   };
@@ -500,6 +503,7 @@ public:
   uint64_t pinningInverterFlushes = 0, deleteOnlyKneeFlushes = 0; // indexMutex
   DeletePassStats deletePassStats; // counters only, protected by indexMutex
   std::atomic<uint64_t> liveDocsBytesWritten = 0;
+  std::atomic<uint64_t> idLookupRounds = 0;
   class DeletePassMessage;
 
   // One delete application: every registered segment, pinned against
@@ -899,7 +903,10 @@ private:
   void retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void releaseSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void moveSegmentToDelete(uint64_t segId);
-  uint64_t applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
+  struct SegmentDeletes;
+  void openSegmentCores(std::span<const std::unique_ptr<SegmentDeletes>> targets);
+  bool prepareDeletes(SegmentDeletes& target);
+  uint64_t applyDeletes(SegmentDeletes& target);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
   bool mergeSegmentsBody(MergeMessage& msg);
 
