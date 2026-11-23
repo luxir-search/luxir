@@ -44,7 +44,7 @@ namespace {
 // change requires reviewing the format version. Writer choices among layouts
 // already supported by that version can change the digest within the version.
 constexpr uint64_t kReferenceVersion = 17;
-constexpr uint64_t kReferenceDigest = 0x9f4d0c9229a33b1c;
+constexpr uint64_t kReferenceDigest = 0x8df212bff9a64ad9;
 
 // A small index over every default field template's kind, with three segments
 // and a delete. Each segment is one request flushed by a single inverter.

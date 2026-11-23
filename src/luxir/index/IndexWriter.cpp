@@ -1497,7 +1497,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
     // Set liveDocs + liveGen for deleted docs from errors during indexing
     if (inverter.liveGen > 0) {
-      liveDocsBytesWritten += LiveDocsWriter::fileBytes(segInfo->maxDoc, inverter.liveDocs);
+      liveDocsBytesWritten += inverter.liveDocsBytes;
       segInfo->liveGen = inverter.liveGen;
       segInfo->liveDocs = inverter.liveDocs;
       assert(segInfo->liveDocs <= segInfo->maxDoc);
