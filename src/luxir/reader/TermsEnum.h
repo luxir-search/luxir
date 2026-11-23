@@ -26,7 +26,7 @@ class TermsEnum {
   friend class DocsEnum;
   friend class ScanTermsEnum;
 
-  InputStream termsIS;  // Dictionary blocks, offsets and trie for this field.
+  InputStream termsIS;  // Dictionary blocks for this field.
   SegmentCore& segmentCore;
 
   const field_parts::Terms* termData;  // Null for a field without a dictionary.
@@ -160,12 +160,15 @@ public:
     if (!termData) return;
     auto blockOffsets = fieldInfo.termBlockOffsets();
     auto trie = field_parts::termTrie(blockOffsets, termData->trieBytes);
-    auto start = termData->location.offset();
-    termsIS = streamThrough({termData->location, trie.end().offset() - start});
-    termBlockOffsets = reinterpret_cast<const field_parts::Terms::BlockOffset*>(
-        termsIS.ptr(blockOffsets.location.offset() - start));
+    // The blocks are data; the offsets and trie that route to them are
+    // metadata and follow the blocks, so the 16 bytes past a hold cover the
+    // decoders' over-read.
+    termsIS = streamThrough(termData->dictionaryBlocks());
+    auto navigation = segmentCore.slice(
+        {blockOffsets.location, trie.end().offset() - blockOffsets.location.offset()}, ReadClass::METADATA);
+    termBlockOffsets = reinterpret_cast<const field_parts::Terms::BlockOffset*>(navigation.data());
     numTermBlocks = (int32_t)(blockOffsets.bytes / sizeof(field_parts::Terms::BlockOffset));
-    trieBase = termsIS.ptr(trie.location.offset() - start);
+    trieBase = navigation.data() + blockOffsets.bytes;
     runCount = (int32_t)termData->runs.size();
     runs = termData->runs.data();
     selectRun(runs);
@@ -720,9 +723,8 @@ protected:
   // metadata.  Those happen on demand in decodeStats and decodePostings.
   void readTermBlock() {
     // Common case (and always, for a single run): the block stays on the
-    // current run; only re-resolve on a run boundary.  The whole dictionary
-    // (the runs, block offsets and trie) lives in one
-    // stream, so termsIS never needs reopening - only seeking.
+    // current run; only re-resolve on a run boundary.  Every run's blocks
+    // live in one stream, so termsIS never needs reopening - only seeking.
     if (termBlockIndex < run->firstBlockOrd
         || termBlockIndex >= runEndBlockOrd) [[unlikely]] {
       reselectRunForBlock(termBlockIndex);

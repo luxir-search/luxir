@@ -454,6 +454,10 @@ token needed to release it. Destruction or replacement of the hold calls
 `HoldOwner::release(const HeldRange&)`, which must be thread-safe and
 `noexcept`. The caller releases the hold before destroying its `InputFile`.
 
+Each `ByteRange` carries a `ReadClass`, `METADATA` or `DATA`, which a backend
+may use to cache or schedule reads; it does not change what the range
+returns.
+
 ### Storage layers
 
 A layer derives from `DelegatingDirFactory` and overrides what it changes, usually
@@ -505,11 +509,11 @@ layer's counters. `StorageExampleTest` reaches `CountingRamBackend` and
 `CountingLayer` through `find<T>()` and verifies that two nodes count independently.
 
 Run `luxir_test --store.layer=strict` to check readers against isolated range
-buffers with varying garbage in the slack. It reports acquisition counts and
-peak live holds and bytes. The default `strict.whole_segment_files=count`
-allows whole-file reads for tests that copy or replicate files. Use
-`--store.option strict.whole_segment_files=deny` in focused reader tests to
-reject whole-file reads of base segment data files.
+buffers with varying garbage in the slack. It reports acquisition counts
+(total and metadata) and peak live holds and bytes. The default
+`strict.whole_segment_files=count` allows whole-file reads for tests that copy
+or replicate files. Use `--store.option strict.whole_segment_files=deny` in
+focused reader tests to reject whole-file reads of base segment data files.
 
 ## Result decorators
 

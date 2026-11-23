@@ -38,12 +38,12 @@ SegmentCore::SegmentCore(uint64_t segId, uint64_t creatorEpoch)
 
 SegmentCore::~SegmentCore() = default;
 
-std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice part) {
+std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice part, ReadClass readClass) {
   std::lock_guard lock(holdsMutex);
   auto key = std::pair(part.location.raw(), part.bytes);
   auto found = holds.lower_bound(key);
   if (found != holds.end() && found->first == key) return found->second.bytes();
-  auto hold = file.acquire({part.location.offset(), part.bytes});
+  auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
   return holds.emplace_hint(found, key, std::move(hold))->second.bytes();
 }
 
@@ -120,7 +120,7 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
       if (size <= Postings::LUXIR_HEADER.size()) {
         corruptSegment(segment, "segment file is too short", {}, number);
       }
-      auto header = file->acquire({0, Postings::LUXIR_HEADER.size()});
+      auto header = file->acquire({0, Postings::LUXIR_HEADER.size(), ReadClass::METADATA});
       validateSegmentFileHeader(header.bytes(), segment, number);
     }
     bool holdsFree = file->holdsFree();
@@ -144,7 +144,7 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
     if (range.offset < Postings::LUXIR_HEADER.size()) {
       primaryContext.invalid("catalog starts inside file header", "invalid segment catalog");
     }
-    auto bytes = slice({{primary, range.offset}, range.length});
+    auto bytes = slice({{primary, range.offset}, range.length}, ReadClass::METADATA);
     auto head = SegmentCatalog::readDirectory(bytes, range.offset, primarySize, primaryContext);
     catalog = SegmentCatalog::decode(head, source->files, primaryContext);
     if (spaces().front().maxDoc != source->maxDoc) {
@@ -173,7 +173,7 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
 
   const auto& version = catalog.versionRuns();
   if (version.slice) {
-    auto bytes = slice(version.slice);
+    auto bytes = slice(version.slice, ReadClass::METADATA);
     SegmentReadContext context{this, PackedTerm(nullptr), version.slice.location.filenum()};
     versions = VersionRuns(bytes.data(), bytes.size(), version.trailerOffset, version.count, spaces()[0].maxDoc, context);
     if (versions.byteSize() != bytes.size()) context.invalid("version runs slice does not match its header");
