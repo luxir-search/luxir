@@ -1094,6 +1094,68 @@ public:
            SkipStats::wholeFieldSortFallbackSuppliers);
   }
 
+  // A segment the op's root mask pruned matches nothing. A cache-backed plan
+  // records that empty membership as resolve() records a zero count, without
+  // building anything from the segment, so the cached membership can still
+  // become complete and later requests may omit the Weight.
+  void recordProvenEmpty(IndexReader::Segment& segment) const {
+    size_t ord = (size_t) segment.ord;
+    if (source == Source::ACCEPTED_EXISTING) {
+      if (cacheUse->acceptedCardinality(ord)) {
+        skipCount(SkipStats::wholeMembershipCardinalityCounts);
+        skipCount(SkipStats::canonicalCountFactsRead);
+      } else {
+        record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits,
+               SkipStats::wholeFieldSortHits);
+      }
+      return;
+    }
+    if (source != Source::WEIGHT || weight->needsPrepare()) return;
+    auto recordConstant = [&] {
+      record(SkipStats::wholeCountConstant, SkipStats::wholeTopKCountConstant,
+             SkipStats::wholeFieldSortConstant);
+    };
+    if (cacheUse == nullptr) {
+      recordConstant();
+      return;
+    }
+    // Follows resolve() for a segment whose count is known to be zero.
+    bool canonical = !weight->consumesDomain()
+        && domainDependence == PreparedDomainDependence::QUERY_CANONICAL
+        && !segment.hasDeletes();
+    // The collection of an ordinary segment records its count afterwards.
+    auto learn = scope_guard([&]() noexcept {
+      if (canonical && !isFieldSort()) recordCount(segment, 0);
+    });
+    bool scalar = scalarCount(segment, canonical);
+    auto cardinality = scalar ? cacheUse->cardinality(ord) : std::nullopt;
+    auto probe = scalar ? FilterCache::Probe{} : cacheUse->probe(ord,
+        observedFieldSort ? cacheUse->work(ord).observedOnly().forWholeQuery(canonical)
+                          : FilterCache::Work::assumed());
+    if (probe.kind() == FilterCache::Probe::Kind::HIT) {
+      record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits,
+             SkipStats::wholeFieldSortHits);
+      return;
+    }
+    if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+      cacheUse->publishRaw(ord, probe, std::make_unique<ArrDocSet>(std::vector<int32_t>{}), 0);
+      record(SkipStats::wholeCountBuilds, SkipStats::wholeTopKCountBuilds,
+             SkipStats::wholeFieldSortBuilds);
+      return;
+    }
+    if (!scalar) cardinality = probe.priorCardinality();
+    record(SkipStats::wholeCountBypasses, SkipStats::wholeTopKCountBypasses,
+           SkipStats::wholeFieldSortBypasses);
+    bool reuse = canonical && cardinality
+        && (scalar || !disableWholeMembershipBypassReuseForTests);
+    if (reuse && !isFieldSort() && !segment.hasDeletes()) {
+      skipCount(SkipStats::wholeMembershipCardinalityCounts);
+      if (scalar) skipCount(SkipStats::canonicalCountFactsRead);
+      return;
+    }
+    recordConstant();
+  }
+
   template <typename SupplierFor>
   WholeMembershipResult resolve(
       IndexReader& reader, IndexReader::Segment& segment,
