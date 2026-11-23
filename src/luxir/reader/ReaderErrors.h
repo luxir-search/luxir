@@ -4,9 +4,10 @@
 #pragma once
 
 #include <cstdint>
-#include <stdexcept>
+#include <string>
 #include <string_view>
 
+#include "luxir/util/ApiError.h"
 #include "luxir/util/StrRef.h"
 
 namespace luxir {
@@ -15,10 +16,12 @@ class DecodedFieldRecord;
 class SegmentCore;
 
 // Segment bytes that fail validation: a damaged or foreign file rather than a
-// bug in the caller.
-class SegmentCorruptError : public std::runtime_error {
+// bug in the caller or a fault in the request. The message names the segment,
+// file and field when the thrower knows them.
+class SegmentCorruptError : public ApiError {
 public:
-  using std::runtime_error::runtime_error;
+  explicit SegmentCorruptError(const std::string& message)
+    : ApiError(ErrorKind::INTERNAL, "segment_corrupt", message) {}
 };
 
 // Identifies the source of corrupt bytes. Standalone decoders have no segment.
