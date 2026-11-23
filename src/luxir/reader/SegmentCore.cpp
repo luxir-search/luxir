@@ -79,12 +79,19 @@ std::vector<std::span<const char>> SegmentCore::slices(std::span<const field_par
 }
 
 std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice part, ReadClass readClass) {
-  std::lock_guard lock(holdsMutex);
   auto key = std::pair(part.location.raw(), part.bytes);
-  auto found = holds.lower_bound(key);
-  if (found != holds.end() && found->first == key) return found->second.bytes();
+  {
+    std::lock_guard lock(holdsMutex);
+    auto found = holds.find(key);
+    if (found != holds.end()) return found->second.bytes();
+  }
+  // Acquire outside the lock: on a backend where an acquire is a request, a
+  // miss must not hold up other slices of the segment, hits included. Two
+  // threads missing the same part both acquire it; the first to store wins.
   auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
-  return holds.emplace_hint(found, key, std::move(hold))->second.bytes();
+  // Declared after `hold`, so it unlocks before a duplicate hold releases.
+  std::lock_guard lock(holdsMutex);
+  return holds.try_emplace(key, std::move(hold)).first->second.bytes();
 }
 
 std::optional<SpaceOrdinal> SegmentCore::spaceOrdinal(std::string_view path) const noexcept {
