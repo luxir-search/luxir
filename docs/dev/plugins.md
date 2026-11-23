@@ -512,6 +512,12 @@ the manifest records; after such an open, `size()` must not make a request.
 Answer it from the given size or from a cached listing. Wrappers forward the
 options.
 
+Keep an open `InputFile` readable until it is destroyed, even after its file
+is deleted. A snapshot opens its live docs and overlay files and reads them on
+first use, which may come after the writer has retired them for a newer
+commit. Local files get this from the open descriptor or mapping; a remote
+backend can pin the object, for example with a count of open readers.
+
 A remote directory can keep a cached listing of its prefix (names, sizes,
 ETags) and answer `openFile` and `size()` from it, listing again when a name
 is missing, so neither existence nor size costs a request per file. With a

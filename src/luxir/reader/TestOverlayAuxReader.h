@@ -34,6 +34,9 @@ public:
   // Without this, any client commit naming "test.overlay" in
   // build_aux_indexes would write test overlay files into a real index.
   static inline bool enabledForTests = false;
+  // How readers open this kind, and whether opening it fails as invalid bytes would.
+  static inline OverlayPolicy policyForTests = OverlayPolicy::ON_DEMAND;
+  static inline bool failOpenForTests = false;
 
   TestOverlayAuxReader(std::string name, uint64_t gen, uint64_t builtCoreGen,
                        std::shared_ptr<InputFile> file)
@@ -53,7 +56,7 @@ public:
         info.files.size(), info.name));
     }
     std::string_view fname = info.files[0].name;
-    auto file = dir.openFile(fname, {.expectSynced = true});
+    auto file = dir.openFile(fname, {.expectSynced = true, .size = info.files[0].size});
     if (file == nullptr) {
       if (missingFileOK) {
         LOG_TRACE("TestOverlayAuxReader::open: file {} missing for overlay '{}', will retry",
@@ -64,6 +67,13 @@ public:
         std::format("Missing test overlay file '{}' for overlay '{}'", fname, info.name),
         std::make_error_code(std::errc::no_such_file_or_directory));
     }
+    return open(std::move(file), info);
+  }
+
+  // Opens the reader over the overlay's file, already open.
+  static std::shared_ptr<TestOverlayAuxReader> open(std::shared_ptr<InputFile> file,
+                                                    const luxir::api::AuxIndexInfo& info) {
+    if (failOpenForTests) throw std::runtime_error("test overlay: failing as asked");
     return std::make_shared<TestOverlayAuxReader>(
       std::string(info.name), info.gen, info.built_core_gen, std::move(file));
   }

@@ -117,6 +117,9 @@ public:
   // a backend answers it from that size or from a cached listing. A backend
   // that trusts the given size leaves a mismatch to surface at read time.
   // Wrappers forward the options.
+  // The open file keeps the file's bytes readable until it is released, even
+  // if the file is deleted: a snapshot opens its live docs and overlay files
+  // and reads them on first use, possibly after a newer commit retired them.
   virtual std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) = 0;
 
   // The caller asserts that `files` were fsynced: a root about to be published

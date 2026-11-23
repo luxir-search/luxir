@@ -596,6 +596,36 @@ TEST_F(IndexFormatTest, manifestRequiresCatalogRange) {
   EXPECT_THROW(Manifest::decode(bytes, arena), std::runtime_error);
 }
 
+// A live docs file is decoded on first use, so a live count that differs from
+// the manifest's fails that use as corruption, not the open.
+TEST_F(IndexFormatTest, liveDocsCountDifferingFromManifestIsCorruption) {
+  LuxirNode node(LuxirConfig{});
+  CollectionHelper ch(node, "main");
+  ASSERT_TRUE(ch.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(ch.deleteById("a", UpdateMessage::COMMIT).success);
+  auto& dir = ch.getIndexWriter()->dir;
+  auto durable = readDurableIndexInfo(dir);
+  const auto& segment = durable.info.segments.front();
+  auto live = Postings::getLiveDocsFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch),
+                                            segment.live_gen, segment.live_epoch);
+  RAMDir copy;
+  std::vector<Directory::FileInfo> files;
+  dir.listFiles(files);
+  for (const auto& descriptor : files) {
+    auto input = dir.openFile(descriptor.name);
+    auto hold = input->acquire({0, input->size()});
+    std::string bytes(hold.getData(), hold.getLength());
+    // The live count follows the magic, the format and maxDoc.
+    if (descriptor.name == live) storeInt(bytes, Postings::LUXIR_HEADER.size() + sizeof(uint64_t) + sizeof(int32_t), 2);
+    writeFile(copy, descriptor.name, bytes);
+  }
+  IndexReader reader(copy);
+  const auto& leaf = reader.segments().front();
+  EXPECT_EQ(1, leaf.numLive());
+  expectCorrupt([&] { leaf.liveDocs(); }, live, "live count 2 differs from the manifest's 1");
+  expectCorrupt([&] { leaf.liveDocs(); }, live, "live count 2 differs from the manifest's 1");
+}
+
 TEST_F(IndexFormatTest, corruptFieldPrefixRespectsVerificationPolicy) {
   LuxirNode node(LuxirConfig{});
   CollectionHelper ch(node, "main");
