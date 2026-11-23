@@ -78,11 +78,11 @@ void indexDocs(CollectionHelper& h, int begin, int end) {
 }
 
 std::vector<std::string> knnIds(std::string_view field, int32_t k, bool exact = true,
-                                int32_t refine = 0) {
+                                int32_t refine = 0, const Vec& query = QUERY) {
   auto* req = LocalReq::create(LuxirTest::luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.getScores().countLimit().fields({"id"});
-  cur.rawQuery() = qb::knn(cur.mr(), field, QUERY, k, /*nprobe=*/0, exact, refine);
+  cur.rawQuery() = qb::knn(cur.mr(), field, query, k, /*nprobe=*/0, exact, refine);
   req->execute();
   EXPECT_TRUE(req->ok()) << req->errorMsg();
   std::vector<std::string> ids;
@@ -157,36 +157,48 @@ TEST_F(VectorEncodingTest, codecRoundTrip) {
   EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::F16, 16));
 }
 
-// The sq8 decomposition (no decode buffer) agrees with scoring the decoded
-// floats, for every metric.
-TEST_F(VectorEncodingTest, sq8ScorerMatchesDecodedScore) {
+// f16, bf16 and sq8 rows score exactly like f32 scoring of the decoded
+// vector, for every metric.
+TEST_F(VectorEncodingTest, encodedScoreMatchesDecodedScore) {
   Vec v = docVec(3);
-  std::vector<char> row((size_t)vcodec::bytesPerVector(VectorEncoding::SQ8, DIMS));
-  vcodec::encode(VectorEncoding::SQ8, v.data(), DIMS, row.data());
-  Vec decoded(DIMS);
-  vcodec::decode(VectorEncoding::SQ8, row.data(), DIMS, decoded.data());
-  std::string_view rowView(row.data(), row.size());
-  std::string_view decodedView((const char*)decoded.data(), decoded.size() * sizeof(float));
-  for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
-    VectorScorer q(QUERY.data(), DIMS, (int32_t)metric, true, VectorEncoding::SQ8);
-    VectorScorer f(QUERY.data(), DIMS, (int32_t)metric, true, VectorEncoding::F32);
-    EXPECT_NEAR(f.score(decodedView, 0), q.score(rowView, 0), 1e-5) << (int)metric;
+  for (auto e : {VectorEncoding::F16, VectorEncoding::BF16, VectorEncoding::SQ8}) {
+    std::vector<char> row((size_t)vcodec::bytesPerVector(e, DIMS));
+    vcodec::encode(e, v.data(), DIMS, row.data());
+    Vec decoded(DIMS);
+    vcodec::decode(e, row.data(), DIMS, decoded.data());
+    std::string_view rowView(row.data(), row.size());
+    std::string_view decodedView((const char*)decoded.data(), decoded.size() * sizeof(float));
+    for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
+      VectorScorer encoded(QUERY.data(), DIMS, (int32_t)metric, true, e);
+      VectorScorer f32(QUERY.data(), DIMS, (int32_t)metric, true, VectorEncoding::F32);
+      EXPECT_EQ(f32.score(decodedView, 0), encoded.score(rowView, 0))
+          << vcodec::name(e) << " " << (int)metric;
+    }
   }
 }
 
-// Large offsets must not degrade sq8 L2 scoring (no decomposition cancellation).
-TEST_F(VectorEncodingTest, sq8L2LargeOffset) {
-  Vec v = docVec(3);
-  for (auto& x : v) x += 1000.0f;
-  std::vector<char> row((size_t)vcodec::bytesPerVector(VectorEncoding::SQ8, DIMS));
-  vcodec::encode(VectorEncoding::SQ8, v.data(), DIMS, row.data());
-  Vec decoded(DIMS), query = QUERY;
-  for (auto& x : query) x += 1000.0f;
-  vcodec::decode(VectorEncoding::SQ8, row.data(), DIMS, decoded.data());
-  std::string_view decodedView((const char*)decoded.data(), decoded.size() * sizeof(float));
-  VectorScorer q(query.data(), DIMS, (int32_t)api::VectorMetric::L2, true, VectorEncoding::SQ8);
-  VectorScorer f(query.data(), DIMS, (int32_t)api::VectorMetric::L2, true, VectorEncoding::F32);
-  EXPECT_FLOAT_EQ(f.score(decodedView, 0), q.score(std::string_view(row.data(), row.size()), 0));
+// sq8 scores the decoded vector, so a query with a large dynamic range keeps
+// the sign of a dot product that per-vector offset and scale terms cancel away.
+TEST_F(VectorEncodingTest, sq8ExtremeQueryRanksByDecodedScore) {
+  const Vec x = {-255, 255, 255};
+  const Vec query = {0x1p30f, 0x1p30f, 1.0f};
+  std::vector<char> row((size_t)vcodec::bytesPerVector(VectorEncoding::SQ8, 3));
+  vcodec::encode(VectorEncoding::SQ8, x.data(), 3, row.data());
+  VectorScorer scorer(query.data(), 3, (int32_t)api::VectorMetric::IP, true, VectorEncoding::SQ8);
+  EXPECT_EQ(255.0f, scorer.score(std::string_view(row.data(), row.size()), 0));
+
+  CollectionHelper h("main");
+  SchemaBuilder b;
+  auto& f = b.field("enc_v");
+  f.type = api::FieldDef::FieldClass::VECTOR;
+  f.dims = 3;
+  f.metric = api::VectorMetric::IP;
+  f.encoding = api::VectorEncoding::SQ8;
+  b.set(h.collection());
+  h.index(flatdoc("id", std::string("zero"), "enc_v", Vec{0, 0, 0}));
+  h.index(flatdoc("id", std::string("x"), "enc_v", x));
+  h.commit();
+  EXPECT_EQ((std::vector<std::string>{"x", "zero"}), knnIds("enc_v", 2, true, 0, query));
 }
 
 // Each encoding is recorded per segment and reads back within its precision.

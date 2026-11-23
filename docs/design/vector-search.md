@@ -55,22 +55,17 @@ field converges to its declared encoding. Transcoding is lossy when it goes to
 a narrower encoding; it clamps to the f16 range and renormalizes unit-length
 cosine rows written as f32. Same-encoding merges are pure byte copies.
 
-Exact scoring means exact over the stored encoding. `VectorScorer` is the
+Exact scoring means exact over the stored values. `VectorScorer` is the
 single place a float query is scored against a stored row, used by the flat
-column engine and the terminal candidate rescore. `sq8` rows are scored
-without decoding to a float buffer, using per-query `sum(q)` and `|q|^2`:
-
-```text
-q.x   = offset * sum(q) + scale * sum(q[i] * code[i])
-|x|^2 = dims * offset^2 + 2 * offset * scale * sum(code) + scale^2 * sum(code^2)
-|q-x|^2 = |q|^2 - 2 q.x + |x|^2
-```
-
-The integer sums come out of the same pass. Cosine over `f16`, `bf16` and `sq8`
-always divides by the stored vector's norm (also from the same pass), since a
-quantized unit vector is not exactly unit length. The scoring loops are
-scalar today; SIMD kernels and a per-vector norm sidecar can replace them
-behind `VectorScorer` without changing the format contract.
+column engine and the terminal candidate rescore. `f16`, `bf16` and `sq8` rows
+are decoded into a per-task buffer and scored with the float32 kernels, so a
+score is the f32 score of the stored vector. `sq8` decodes first rather than
+scoring its codes against per-vector offset and scale terms, which cancel
+catastrophically for a query with a large dynamic range. Cosine over a decoded
+row always divides by the stored vector's norm, since a quantized unit vector
+is not exactly unit length. Kernels that read the stored encoding directly
+can replace the decode behind `VectorScorer` without changing the format
+contract.
 
 ## Overlay Lifecycle
 
