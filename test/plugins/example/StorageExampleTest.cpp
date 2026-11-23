@@ -162,6 +162,54 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
   }
 }
 
+// A manifest open issues one batch per segment's file 0, holding its header and
+// catalog, and issues all of them before it reads anything else.
+TEST_F(StorageExampleTest, manifestOpenAcquiresCatalogsInOneRound) {
+  LuxirConfig config;
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  auto writer = h.getIndexWriter();
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(h.indexAll({flatdoc("id", std::to_string(i), "body_w", "needle")}, UpdateMessage::COMMIT).success);
+  }
+  auto info = readDurableIndexInfo(writer->dir);
+  ASSERT_EQ(3u, info->segments.size());
+  auto snapshot = *writer->snapshots.snapshot();
+  snapshot.openCores.clear();
+
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
+  auto reader = std::make_shared<IndexReader>(dir, snapshot);
+  ASSERT_EQ(3u, reader->segments().size());
+  std::vector<uint64_t> firstRounds;
+  for (const auto& segment : info->segments) {
+    auto name = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
+    auto range = catalogRangeFromManifest(segment.catalog);
+    auto stats = counters->fileStats(name);
+    EXPECT_EQ(1u, stats.batches) << name;
+    EXPECT_EQ(2u, stats.rounds) << name;  // the catalog batch, then the version runs
+    EXPECT_TRUE(stats.metadataParts.contains({0, Postings::LUXIR_HEADER.size()})) << name;
+    EXPECT_TRUE(stats.metadataParts.contains({range.offset, range.length})) << name;
+    firstRounds.push_back(stats.firstRound);
+  }
+  std::ranges::sort(firstRounds);
+  EXPECT_EQ((std::vector<uint64_t>{1, 2, 3}), firstRounds);
+  EXPECT_EQ(6u, counters->totalRounds());
+
+  // A later batch acquires only the parts the segment does not hold yet.
+  auto& core = reader->segments().front().postingsReader().core();
+  auto name = Postings::getIndexFileName(core.segmentName(), 0);
+  auto before = counters->fileStats(name);
+  field_parts::Slice parts[] = {{{0, 0}, 2}, {{0, 2}, 3}, {{0, 0}, 2}, {{0, 0}, Postings::LUXIR_HEADER.size()}};
+  auto bytes = core.slices(parts);
+  ASSERT_EQ(4u, bytes.size());
+  EXPECT_EQ(Postings::LUXIR_HEADER.substr(2, 3), std::string_view(bytes[1].data(), bytes[1].size()));
+  EXPECT_EQ(bytes[0].data(), bytes[2].data());
+  auto after = counters->fileStats(name);
+  EXPECT_EQ(before.batches + 1, after.batches);
+  EXPECT_EQ(before.acquires + 2, after.acquires);
+}
+
 // The canonical query shapes read parts, never whole segment files, and each
 // segment acquires its catalog as metadata.
 TEST_F(StorageExampleTest, canonicalQueriesRunWithWholeSegmentFilesDenied) {

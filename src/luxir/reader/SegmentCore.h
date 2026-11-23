@@ -13,6 +13,7 @@
 #include "luxir/store/Directory.h"
 
 namespace luxir {
+class AcquireJoin;
 class OwnershipShape;
 namespace api { struct SegmentInfo; }
 
@@ -52,7 +53,14 @@ private:
   PostingsReader root;
 
   SegmentCore(uint64_t segId, uint64_t creatorEpoch);
-  bool initializeFromFiles(Directory& dir, const Source* source, bool missingFileOK, bool expectSynced);
+  bool openBaseFile(Directory& dir, std::string_view segment, uint32_t number, uint64_t expected,
+                    bool missingFileOK, bool expectSynced, bool checkHeader);
+  bool beginOpen(Directory& dir, std::string_view segment, const Source& source, bool missingFileOK,
+                 bool expectSynced, AcquireJoin& join);
+  bool finishOpen(Directory& dir, std::string_view segment, const Source& source, bool missingFileOK,
+                  bool expectSynced);
+  bool initializeFromFiles(Directory& dir, bool missingFileOK, bool expectSynced);
+  void initializeSpaces();
   std::span<const char> retain(InputFile& file, field_parts::Slice part, ReadClass readClass);
 
 public:
@@ -65,6 +73,12 @@ public:
                                             bool expectSynced = false);
   static std::shared_ptr<SegmentCore> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
                                             bool missingFileOK = false, bool expectSynced = false);
+  // Opens the segments together: every file 0 acquires its header and catalog
+  // in one batch, and all batches are issued before any catalog is decoded.
+  // An entry is null where a file is missing and missingFileOK is set.
+  static std::vector<std::shared_ptr<SegmentCore>> create(Directory& dir,
+                                                          std::span<const api::SegmentInfo* const> segments,
+                                                          bool missingFileOK = false, bool expectSynced = false);
   explicit SegmentCore(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
   ~SegmentCore();
   SegmentCore(const SegmentCore&) = delete;
@@ -121,6 +135,15 @@ public:
     }
     return retain(*base.file, part, readClass);
   }
+
+  // Acquires the parts in one batch per file, keeps their holds as slice()
+  // does, and returns their bytes in order.
+  std::vector<std::span<const char>> slices(std::span<const field_parts::Slice> parts,
+                                            ReadClass readClass = ReadClass::DATA);
+  // Starts those batches on `join` without waiting, so batches of several
+  // segments go out together. Once join.wait() returns, slice() of each part
+  // returns its held bytes without an acquire.
+  void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join);
 
 };
 
