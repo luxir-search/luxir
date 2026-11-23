@@ -163,6 +163,12 @@ follow the single-acquire contract. The default acquires each range in turn
 and completes inline, and `acquireAll(ranges)` blocks on the batch and
 returns its holds.
 
+A completion runs on a backend thread and takes the locks of whatever keeps
+the holds, such as a segment's holds lock. A caller must not hold, across a
+backend call, any lock that a batch completion takes: a backend that serves
+blocking acquires and completes batches on the same threads would deadlock.
+`SegmentCore::retain()` therefore acquires outside its holds lock.
+
 A segment reads every part through `SegmentCore::slice()`, or through
 `SegmentCore::slices()`, which issues one batch per file and keeps the holds
 the same way. A manifest open acquires each file's header, the catalog range,
