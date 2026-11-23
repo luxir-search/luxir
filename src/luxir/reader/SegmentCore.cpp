@@ -61,11 +61,14 @@ void SegmentCore::acquireParts(std::span<const Part> parts, AcquireBatches& join
     if (!lock.owns_lock()) lock.lock();
     Key key(part.location.raw(), part.bytes);
     if (holds.contains(key)) continue;
-    auto& batch = batches[number];
-    if (std::ranges::find(batch, key, &std::pair<Key, ReadClass>::first) == batch.end()) batch.emplace_back(key, readClass);
+    batches[number].emplace_back(key, readClass);
   }
   if (lock.owns_lock()) lock.unlock();
   for (auto& [number, batch] : batches) {
+    // A part asked for twice goes once, under its first read class.
+    std::ranges::stable_sort(batch, {}, &std::pair<Key, ReadClass>::first);
+    auto [first, last] = std::ranges::unique(batch, {}, &std::pair<Key, ReadClass>::first);
+    batch.erase(first, last);
     std::vector<ByteRange> ranges;
     std::vector<Key> keys;
     ranges.reserve(batch.size());
@@ -452,25 +455,35 @@ std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, uint64_t segId,
 std::vector<std::shared_ptr<SegmentCore>> SegmentCore::create(Directory& dir,
                                                               std::span<const api::SegmentInfo* const> segments,
                                                               bool missingFileOK, bool expectSynced) {
+  std::vector<Opening> openings;
+  openings.reserve(segments.size());
+  for (const auto* segment : segments) {
+    openings.push_back({segment->seg_id, segment->creator_epoch,
+                        makeSource(segment->seg_id, segment->creator_epoch, catalogRangeFromManifest(segment->catalog),
+                                   segment->max_doc, segment->files)});
+  }
+  return create(dir, openings, missingFileOK, expectSynced);
+}
+
+std::vector<std::shared_ptr<SegmentCore>> SegmentCore::create(Directory& dir, std::span<const Opening> segments,
+                                                              bool missingFileOK, bool expectSynced) {
   std::vector<std::shared_ptr<SegmentCore>> cores;
-  std::vector<Source> sources;
   std::vector<std::string> names;
   cores.reserve(segments.size());
-  sources.reserve(segments.size());
   names.reserve(segments.size());
   {
     AcquireJoin join;
-    for (const auto* segment : segments) {
-      sources.push_back(makeSource(segment->seg_id, segment->creator_epoch, catalogRangeFromManifest(segment->catalog),
-                                   segment->max_doc, segment->files));
-      auto& core = cores.emplace_back(new SegmentCore(segment->seg_id, segment->creator_epoch));
+    for (const auto& segment : segments) {
+      auto& core = cores.emplace_back(new SegmentCore(segment.segId, segment.creatorEpoch));
       names.push_back(core->segmentName());
-      if (!core->beginOpen(dir, names.back(), sources.back(), missingFileOK, expectSynced, join)) core = nullptr;
+      if (!core->beginOpen(dir, names.back(), segment.source, missingFileOK, expectSynced, join)) core = nullptr;
     }
     join.wait();
   }
   for (size_t i = 0; i < cores.size(); ++i) {
-    if (cores[i] && !cores[i]->finishOpen(dir, names[i], sources[i], missingFileOK, expectSynced)) cores[i] = nullptr;
+    if (cores[i] && !cores[i]->finishOpen(dir, names[i], segments[i].source, missingFileOK, expectSynced)) {
+      cores[i] = nullptr;
+    }
     if (cores[i]) cores[i]->opened = true;
   }
   return cores;

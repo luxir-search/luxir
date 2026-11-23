@@ -102,6 +102,13 @@ public:
   static std::vector<std::shared_ptr<SegmentCore>> create(Directory& dir,
                                                           std::span<const api::SegmentInfo* const> segments,
                                                           bool missingFileOK = false, bool expectSynced = false);
+  struct Opening {
+    uint64_t segId = 0;
+    uint64_t creatorEpoch = 0;
+    Source source;
+  };
+  static std::vector<std::shared_ptr<SegmentCore>> create(Directory& dir, std::span<const Opening> segments,
+                                                          bool missingFileOK = false, bool expectSynced = false);
   explicit SegmentCore(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
   ~SegmentCore();
   SegmentCore(const SegmentCore&) = delete;
@@ -128,6 +135,11 @@ public:
   const VersionRuns& versionRuns() const {
     auto* built = versions.peek();
     return built ? *built : buildVersionRuns();
+  }
+  // What versionRuns() acquires when it is not built yet: the version runs
+  // part, or none when it is built or the segment has no runs.
+  field_parts::Slice versionRunsPart() const noexcept {
+    return versions.peek() ? field_parts::Slice{} : catalog.versionRuns().slice;
   }
 
   // Whether this core has held a part beyond the open's headers and catalog,
