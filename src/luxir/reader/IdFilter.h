@@ -81,6 +81,8 @@ public:
   static bool valid(std::span<const char> bytes) noexcept { return parse(bytes).has_value(); }
   // BLOOM body blocks for `keys` keys under `options`.
   static uint64_t bloomBlocksFor(const Options& options, uint64_t keys) noexcept;
+  // Most memory a Builder over at most `keys` keys holds, finish() included.
+  static uint64_t buildBytes(const Options& options, uint64_t keys) noexcept;
 
   Kind filterKind() const noexcept { return kind; }
   // Fingerprint bits of a FUSE filter, zero for BLOOM.
