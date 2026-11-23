@@ -7,6 +7,7 @@
 #include "luxir/store/AcquireJoin.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/store/VerifiedDirectory.h"
+#include "test/GatedStorage.h"
 #include "test/LuxirTest.h"
 #include "test/StrictStorage.h"
 
@@ -242,7 +243,7 @@ TEST(StrictStorageTest, ramLinkSharesFileFromWrappedSource) {
   EXPECT_EQ(0u, counters->fileStats("data").acquires);
 }
 
-TEST(StrictStorageTest, batchesForwardAsOneRound) {
+TEST(StrictStorageTest, batchesForwardAsOneSubmission) {
   auto counters = std::make_shared<StrictStorageCounters>();
   StrictDirectory dir(std::make_shared<RAMDir>(), counters);
   put(dir, "data");
@@ -262,10 +263,10 @@ TEST(StrictStorageTest, batchesForwardAsOneRound) {
   EXPECT_EQ(3u, stats.acquires);
   EXPECT_EQ(1u, stats.metadataAcquires);
   EXPECT_EQ(1u, stats.batches);  // the rejected batch never went out
-  EXPECT_EQ(2u, stats.rounds);
-  EXPECT_EQ(1u, stats.firstRound);
-  EXPECT_EQ(2u, stats.lastRound);
-  EXPECT_EQ(2u, counters->totalRounds());
+  EXPECT_EQ(2u, stats.submissions);
+  EXPECT_EQ(1u, stats.firstSubmission);
+  EXPECT_EQ(2u, stats.lastSubmission);
+  EXPECT_EQ(2u, counters->totalSubmissions());
 }
 
 TEST(StrictStorageTest, batchReportsErrorsThroughDone) {
@@ -320,4 +321,20 @@ TEST(StrictStorageTest, joinWaitsForBatchesCompletingElsewhere) {
   EXPECT_EQ(3u, counters->liveStats().holds);  // the failed take's holds released before wait() returned
   fromA.clear();
   fromB.clear();
+}
+
+TEST(StrictStorageTest, joinDestroyedWithoutWaitWaitsForItsBatches) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  auto strict = std::make_shared<StrictDirectory>(std::make_shared<RAMDir>(), counters);
+  put(*strict, "a");
+  GatedDirectory dir(strict, 2, std::chrono::milliseconds(50));  // Holds the batch for one that never comes.
+  auto file = dir.openFile("a");
+  std::vector<HeldRange> taken;
+  ByteRange ranges[] = {{0, 2}};
+  {
+    AcquireJoin join;
+    join.acquire(*file, ranges, [&](auto&& holds) { taken = std::move(holds); });
+  }
+  EXPECT_EQ(1u, taken.size());
+  EXPECT_TRUE(dir.gate.timedOut());
 }

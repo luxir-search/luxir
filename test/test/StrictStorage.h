@@ -22,13 +22,13 @@ public:
     uint64_t acquiredBytes = 0;
     uint64_t wholeFileAccesses = 0;
     uint64_t sizeRequests = 0;  // InputFile::size() calls on files opened without a size.
-    // A round is one single acquire or one batch, whatever its size. Rounds
-    // are numbered across all files, so a test can tell batches issued
-    // together (consecutive numbers) from rounds that waited on each other.
+    // A submission is one single acquire or one batch, whatever its size,
+    // numbered in issue order across all files. The layer completes inline,
+    // so the numbers show order only, never which requests waited on others.
     uint64_t batches = 0;
-    uint64_t rounds = 0;
-    uint64_t firstRound = 0;
-    uint64_t lastRound = 0;
+    uint64_t submissions = 0;
+    uint64_t firstSubmission = 0;
+    uint64_t lastSubmission = 0;
     std::set<std::pair<uint64_t, uint64_t>> parts;
     std::set<std::pair<uint64_t, uint64_t>> metadataParts;
   };
@@ -44,18 +44,18 @@ private:
   mutable std::mutex mutex;
   std::map<std::string, FileStats, std::less<>> files;
   LiveStats live;
-  uint64_t rounds = 0;
+  uint64_t submissions = 0;
   uint8_t pattern = 0;
 
 public:
   FileStats fileStats(std::string_view name) const;
   LiveStats liveStats() const;
-  uint64_t totalRounds() const;
+  uint64_t totalSubmissions() const;
   void logSummary() const;
 
   void wholeFile(std::string_view name);
   void sizeRequested(std::string_view name);
-  void round(std::string_view name, bool batch);
+  void submitted(std::string_view name, bool batch);
   uint8_t acquired(std::string_view name, ByteRange range);
   void released(uint64_t length) noexcept;
 };
