@@ -160,6 +160,10 @@ file. For now the segment keeps the holds it hands out until it closes, so
 nothing held is evicted; releasing holds when a request ends comes with a
 bounded cache.
 
+- A manifest open passes each file's recorded size to `Directory::openFile`,
+  so a backend can answer `size()` without a request. Files with free holds
+  (RAM, mmap) are local, and the open still checks their size against the
+  manifest.
 - Each acquire carries a `ReadClass`. `METADATA` marks what a reader navigates
   by: file headers, the catalog, version runs, term block offsets and tries,
   and the directories and indexes over column and point blocks. Everything

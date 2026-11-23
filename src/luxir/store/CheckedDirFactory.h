@@ -50,7 +50,7 @@ public:
     return delegate->openChecksum(name, direct);
   }
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
+  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) override {
     if (expectSynced) {
       std::lock_guard lock(mu_);
       auto it = unsyncedFiles_.find(std::string(name));
@@ -59,7 +59,7 @@ public:
       }
     }
     if (verbose_) LOG_DEBUG("CheckedDirectory: openFile({}, expectSynced={})", name, expectSynced);
-    return delegate->openFile(name, expectSynced);
+    return delegate->openFile(name, expectSynced, size);
   }
 
   // Readers share an open segment rather than reopening it, so most reads

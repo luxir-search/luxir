@@ -31,16 +31,17 @@ StrictStorageCounters::LiveStats StrictStorageCounters::liveStats() const {
 
 void StrictStorageCounters::logSummary() const {
   std::lock_guard lock(mutex);
-  uint64_t acquires = 0, metadata = 0, uniqueParts = 0, wholeFiles = 0;
+  uint64_t acquires = 0, metadata = 0, uniqueParts = 0, wholeFiles = 0, sizes = 0;
   for (const auto& [name, file] : files) {
     acquires += file.acquires;
     metadata += file.metadataAcquires;
     uniqueParts += file.parts.size();
     wholeFiles += file.wholeFileAccesses;
+    sizes += file.sizeRequests;
   }
   LOG_INFO("strict: acquires={} (metadata={}), unique parts={}, peak live holds={}, peak live bytes={}, "
-           "whole-file accesses={}",
-           acquires, metadata, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles);
+           "whole-file accesses={}, size requests={}",
+           acquires, metadata, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles, sizes);
 }
 
 StrictLayer::~StrictLayer() {
@@ -50,6 +51,11 @@ StrictLayer::~StrictLayer() {
 void StrictStorageCounters::wholeFile(std::string_view name) {
   std::lock_guard lock(mutex);
   ++files[std::string(name)].wholeFileAccesses;
+}
+
+void StrictStorageCounters::sizeRequested(std::string_view name) {
+  std::lock_guard lock(mutex);
+  ++files[std::string(name)].sizeRequests;
 }
 
 uint8_t StrictStorageCounters::acquired(std::string_view name, ByteRange range) {
@@ -103,6 +109,8 @@ public:
     }
   }
 
+  void sizeRequested() { counters->sizeRequested(name); }
+
   void wholeFile() {
     counters->wholeFile(name);
     if (denyWhole) throw FileIOException("strict: whole-file access to segment data file " + name);
@@ -152,11 +160,14 @@ public:
   StrictInputFile(std::shared_ptr<InputFile> inner, std::shared_ptr<StrictFileState> state)
       : delegate(std::move(inner)), state(std::move(state)) {}
 
-  size_t size() override { return delegate->size(); }
+  size_t size() override {
+    state->sizeRequested();
+    return delegate->size();
+  }
   bool holdsFree() const override { return false; }
 
   HeldRange acquire(ByteRange range) override {
-    auto fileSize = size();
+    auto fileSize = delegate->size();
     checkRange(range, fileSize);
     if (range.offset == 0 && range.length == fileSize) state->wholeFile();
     auto source = delegate->acquire(range);
@@ -190,9 +201,10 @@ public:
 
 } // namespace
 
-std::shared_ptr<InputFile> StrictDirectory::openFile(std::string_view name, bool expectSynced) {
-  auto file = delegate->openFile(name, expectSynced);
+std::shared_ptr<InputFile> StrictDirectory::openFile(std::string_view name, bool expectSynced, uint64_t size) {
+  auto file = delegate->openFile(name, expectSynced, size);
   if (!file) return {};
+  if (size && size != file->size()) throw FileIOException("strict: open size differs from file " + std::string(name));
   return std::make_shared<StrictInputFile>(std::move(file), std::make_shared<StrictFileState>(counters, name, mode));
 }
 

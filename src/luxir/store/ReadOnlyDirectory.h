@@ -35,8 +35,8 @@ public:
       : delegate(std::move(inner)), name_(std::move(name)) {}
 
   void listFiles(std::vector<FileInfo>& target) override { delegate->listFiles(target); }
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
-    return delegate->openFile(name, expectSynced);
+  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) override {
+    return delegate->openFile(name, expectSynced, size);
   }
   void expectSynced(std::span<const FileDescriptor> files) override { delegate->expectSynced(files); }
   std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {

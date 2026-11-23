@@ -346,9 +346,9 @@ class ProtectedDirectory : public DelegatingDirectory {
 public:
   using DelegatingDirectory::DelegatingDirectory;
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced) override {
+  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced, uint64_t size) override {
     if (sealed) throw std::runtime_error("unexpected segment file open");
-    auto source = delegate->openFile(name, expectSynced);
+    auto source = delegate->openFile(name, expectSynced, size);
     if (!source) return nullptr;
     auto hold = source->acquire({0, source->size()});
     auto file = std::make_shared<ProtectedInputFile>(std::string_view(hold.bytes()));
