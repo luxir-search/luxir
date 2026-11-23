@@ -42,40 +42,43 @@ SegmentCore::~SegmentCore() = default;
 
 void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join) {
   using Key = std::pair<uint64_t, uint64_t>;
-  std::map<uint32_t, std::vector<Key>> batches;
-  std::unique_lock lock(holdsMutex, std::defer_lock);
+  std::vector<Key> keys;
   for (auto part : parts) {
     auto number = part.location.filenum();
     assert(number < files.size() && files[number].file);
-    if (files[number].holdsFree) continue;  // slice() hands out a free view without a request
-    if (!lock.owns_lock()) lock.lock();
-    Key key(part.location.raw(), part.bytes);
-    if (holds.contains(key)) continue;
-    auto& batch = batches[number];
-    if (std::ranges::find(batch, key) == batch.end()) batch.push_back(key);
+    // slice() hands out a free view without a request.
+    if (!files[number].holdsFree) keys.emplace_back(part.location.raw(), part.bytes);
   }
-  if (lock.owns_lock()) lock.unlock();
-  for (auto& [number, batch] : batches) {
+  if (keys.empty()) return;
+  // raw() keeps the file number in its high bits, so sorted keys run by file.
+  std::ranges::sort(keys);
+  keys.erase(std::ranges::unique(keys).begin(), keys.end());
+  {
+    std::lock_guard lock(holdsMutex);
+    std::erase_if(keys, [&](const Key& key) { return holds.contains(key); });
+  }
+  auto fileOf = [](const Key& key) { return seg_location::fromRaw(key.first).filenum(); };
+  for (auto begin = keys.begin(); begin != keys.end();) {
+    auto number = fileOf(*begin);
+    auto end = std::find_if(begin, keys.end(), [&](const Key& key) { return fileOf(key) != number; });
     std::vector<ByteRange> ranges;
-    ranges.reserve(batch.size());
-    for (auto [raw, bytes] : batch) ranges.push_back({seg_location::fromRaw(raw).offset(), bytes, readClass});
-    join.acquire(*files[number].file, ranges, [this, batch = std::move(batch)](std::vector<HeldRange>&& acquired) {
+    ranges.reserve((size_t)(end - begin));
+    for (auto key = begin; key != end; ++key) {
+      ranges.push_back({seg_location::fromRaw(key->first).offset(), key->second, readClass});
+    }
+    auto take = [this, batch = std::vector(begin, end)](std::vector<HeldRange>&& acquired) {
       std::lock_guard lock(holdsMutex);
       for (size_t i = 0; i < batch.size(); ++i) holds.try_emplace(batch[i], std::move(acquired[i]));
-    });
+    };
+    join.acquire(*files[number].file, ranges, std::move(take));
+    begin = end;
   }
 }
 
-std::vector<std::span<const char>> SegmentCore::slices(std::span<const field_parts::Slice> parts, ReadClass readClass) {
-  {
-    AcquireJoin join;
-    acquireSlices(parts, readClass, join);
-    join.wait();
-  }
-  std::vector<std::span<const char>> result;
-  result.reserve(parts.size());
-  for (auto part : parts) result.push_back(slice(part, readClass));
-  return result;
+void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass) {
+  AcquireJoin join;
+  acquireSlices(parts, readClass, join);
+  join.wait();
 }
 
 std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice part, ReadClass readClass) {
