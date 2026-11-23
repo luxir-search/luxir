@@ -133,6 +133,7 @@ class TermsEnum {
   // docs whole instead, so its acquires stay bounded.
   int32_t pointReads = 0;
   bool wholeReads = false;
+  bool pointReadsBounded = true;  // see readAhead()
 
 public:
   struct BlockEstimate {
@@ -205,6 +206,12 @@ public:
     wholeReads = true;
     if (run) runDocsWhole = true;
   }
+
+  /// The parts this enum reads were acquired ahead of it, through seekPart()
+  /// and postingsParts() of an enum over the same field: it keeps holding
+  /// blocks and term docs one at a time however many terms it looks up, so
+  /// it reads what was acquired instead of the dictionary whole.
+  void readAhead() noexcept { pointReadsBounded = false; }
 
   /// Whether the enum holds `part` whole rather than in pieces: a file with
   /// free holds costs nothing per byte, and a small part costs less whole
@@ -772,7 +779,7 @@ protected:
   // already (a reader ahead of the enum acquired it).
   bool pointRead(field_parts::Slice whole) {
     if (wholeReads) return true;
-    if (++pointReads > POINT_READS) {
+    if (pointReadsBounded && ++pointReads > POINT_READS) {
       readWhole();
       return true;
     }
