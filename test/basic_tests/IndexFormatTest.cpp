@@ -46,6 +46,8 @@ namespace {
 constexpr uint64_t kReferenceVersion = 18;
 constexpr uint64_t kReferenceDigest = 0x8df212bff9a64ad9;
 
+constexpr IdFilter::Options REFERENCE_ID_FILTER = {.kind = IdFilter::Kind::BLOOM};
+
 // A small index over every default field template's kind, with three segments
 // and a delete. Each segment is one request flushed by a single inverter.
 // Merges are left out: fields merge as parallel tasks, so a merged segment's
@@ -66,6 +68,8 @@ void buildReferenceIndex(CollectionHelper& ch) {
   interval.type = api::FieldDef::FieldClass::LONG_RANGE;
   interval.index = api::FieldDef::IndexMode::RANGE;
   schema.set(ch.collection());
+  // Writers leave the id filter out by default; the reference covers it.
+  ch.getIndexWriter()->idFilterOptions = REFERENCE_ID_FILTER;
   ASSERT_TRUE(ch.indexAll({
       flatdoc("id", "a", "numeric_match", (int64_t)-7, "numeric_array", vec_i(2, 1, 2), "title_t", "the quick brown fox", "tag_s", "red", "tags_ss", vecs("x", "y"),
               "n_i", (int64_t)7, "ns_is", std::vector<int64_t>{1, 2}, "on_b", true,
@@ -178,6 +182,7 @@ uint64_t buildMergedReferenceDigest() {
   budget.setTotalBytes(1);
   StoredDictionaryRegistry dictionaries;
   PostingsWriter writer(output, 3, 1);
+  writer.idFilterOptions = REFERENCE_ID_FILTER;
   SegmentMerger merger(inputs, live, writer, budget, INT64_MAX, 1, 4, *reader->schema(), dictionaries);
   oneapi::tbb::task_arena serial(1);
   serial.execute([&] { merger.merge(); });
