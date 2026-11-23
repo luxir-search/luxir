@@ -66,6 +66,7 @@ void VectorFieldType::signatureProps(SignatureProps& out) const {
   out["metric"] = "\"" + std::string(metrics[metric()]) + "\"";
   out["normalize_on_write"] = normalizeOnWrite() ? "true" : "false";
   out["normalized"] = metric() == METRIC_COSINE && normalized() ? "true" : "false";
+  out["multi_vector_scoring"] = maxSim() ? "\"maxsim\"" : "\"max\"";
 }
 
 std::string_view FieldType::typeName(Type type) {
