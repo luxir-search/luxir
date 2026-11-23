@@ -154,6 +154,13 @@ other backends release through the hold's `HoldOwner`.
 - The data address is congruent to the file offset modulo 16, so alignment the
   writer gave a structure in the file holds in memory.
 
+`InputFile::acquire(ranges, done)` acquires a batch of ranges together, so a
+backend can merge them and issue them at once. It calls `done` exactly once,
+on any thread, with one hold per range in the order requested or with an
+error and no holds. The holds follow the single-acquire contract. The
+default acquires each range in turn and completes inline, and
+`acquireAll(ranges)` blocks on the batch and returns its holds.
+
 A segment reads every part through `SegmentCore::slice()`. A manifest open
 acquires each file's header, the catalog range, the version runs and, for
 segments with nested spaces, the ownership ends and owners columns; never a

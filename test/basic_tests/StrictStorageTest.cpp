@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <thread>
 
+#include "luxir/store/AcquireJoin.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/store/VerifiedDirectory.h"
 #include "test/LuxirTest.h"
@@ -32,6 +33,28 @@ FileDescriptor put(Directory& dir, std::string_view name) {
 std::string_view contents(const HeldRange& hold) {
   return {hold.bytes().data(), hold.bytes().size()};
 }
+
+// Completes each batch on its own thread, as a remote backend would.
+class ThreadedInputFile : public InputFile {
+  std::shared_ptr<InputFile> delegate;
+  std::vector<std::jthread> threads;
+
+public:
+  explicit ThreadedInputFile(std::shared_ptr<InputFile> delegate) : delegate(std::move(delegate)) {}
+  ~ThreadedInputFile() override { threads.clear(); }
+  size_t size() override { return delegate->size(); }
+  using InputFile::acquire;
+  HeldRange acquire(ByteRange range) override { return delegate->acquire(range); }
+  void acquire(std::span<const ByteRange> ranges, AcquireDone done) override {
+    threads.emplace_back([this, requested = std::vector<ByteRange>(ranges.begin(), ranges.end()), done] {
+      try {
+        delegate->acquire(requested, done);
+      } catch (...) {
+        done({}, std::current_exception());
+      }
+    });
+  }
+};
 
 } // namespace
 
@@ -218,4 +241,60 @@ TEST(StrictStorageTest, ramLinkSharesFileFromWrappedSource) {
   ASSERT_NE(nullptr, linked);
   EXPECT_EQ(ram->openFile("data"), linked);
   EXPECT_EQ(0u, counters->fileStats("data").acquires);
+}
+
+TEST(StrictStorageTest, batchesForwardAsOneRound) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters);
+  put(dir, "data");
+  auto file = dir.openFile("data");
+  ASSERT_NE(nullptr, file);
+  ByteRange ranges[] = {{3, 5}, {20, 4, ReadClass::METADATA}};
+  auto holds = file->acquireAll(ranges);
+  ASSERT_EQ(2u, holds.size());
+  EXPECT_EQ("34567", contents(holds[0]));
+  EXPECT_EQ("klmn", contents(holds[1]));
+  EXPECT_EQ(20u % kHoldAlign, (uintptr_t)holds[1].getData() % kHoldAlign);
+  auto single = file->acquire({0, 2});
+  ByteRange outside[] = {{0, 2}, {1, UINT64_MAX}};
+  EXPECT_THROW(file->acquireAll(outside), std::out_of_range);
+
+  auto stats = counters->fileStats("data");
+  EXPECT_EQ(3u, stats.acquires);
+  EXPECT_EQ(1u, stats.metadataAcquires);
+  EXPECT_EQ(1u, stats.batches);  // the rejected batch never went out
+  EXPECT_EQ(2u, stats.rounds);
+  EXPECT_EQ(1u, stats.firstRound);
+  EXPECT_EQ(2u, stats.lastRound);
+  EXPECT_EQ(2u, counters->totalRounds());
+}
+
+TEST(StrictStorageTest, joinWaitsForBatchesCompletingElsewhere) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters);
+  put(dir, "a");
+  put(dir, "b");
+  ThreadedInputFile a(dir.openFile("a")), b(dir.openFile("b"));
+  std::vector<HeldRange> fromA, fromB;
+  ByteRange ranges[] = {{0, 2}, {10, 1}};
+  {
+    AcquireJoin join;
+    join.acquire(a, ranges, [&](auto&& holds) { fromA = std::move(holds); });
+    join.acquire(b, std::span(ranges, 1), [&](auto&& holds) { fromB = std::move(holds); });
+    join.wait();
+  }
+  ASSERT_EQ(2u, fromA.size());
+  ASSERT_EQ(1u, fromB.size());
+  EXPECT_EQ("a", contents(fromA[1]));
+  EXPECT_EQ("01", contents(fromB[0]));
+  EXPECT_EQ(1u, counters->fileStats("a").batches);
+  EXPECT_EQ(1u, counters->fileStats("b").batches);
+
+  AcquireJoin failing;
+  ByteRange outside[] = {{1, UINT64_MAX}};
+  failing.acquire(a, outside, [](auto&&) { FAIL(); });
+  failing.acquire(b, ranges, [](auto&&) { throw FileIOException("take failed"); });
+  EXPECT_ANY_THROW(failing.wait());
+  fromA.clear();
+  fromB.clear();
 }
