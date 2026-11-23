@@ -115,10 +115,11 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
   StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
   auto reader = std::make_shared<IndexReader>(dir, snapshot);
   auto& postings = reader->segments().front().postingsReader();
-  std::map<uint32_t, std::set<std::pair<uint64_t, uint64_t>>> expected;
-  auto expectPart = [&](field_parts::Slice slice) {
+  std::map<uint32_t, std::set<std::pair<uint64_t, uint64_t>>> expected, metadata;
+  auto expectPart = [&](field_parts::Slice slice, ReadClass readClass = ReadClass::DATA) {
     ASSERT_TRUE(slice);
     expected[slice.location.filenum()].emplace(slice.location.offset(), slice.bytes);
+    if (readClass == ReadClass::METADATA) metadata[slice.location.filenum()].emplace(slice.location.offset(), slice.bytes);
   };
   auto check = [&] {
     postings.core().forEachBaseFile([&](uint32_t number, uint64_t) {
@@ -127,13 +128,15 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
       EXPECT_EQ(0u, stats.wholeFileAccesses) << name;
       EXPECT_EQ(expected[number].size(), stats.acquires) << name;
       EXPECT_EQ(expected[number], stats.parts) << name;
+      EXPECT_EQ(metadata[number], stats.metadataParts) << name;
     });
   };
   postings.core().forEachBaseFile([&](uint32_t number, uint64_t) {
     expected[number].emplace(0, Postings::LUXIR_HEADER.size());
+    metadata[number].emplace(0, Postings::LUXIR_HEADER.size());
   });
-  expectPart({{0, range.offset}, range.length});
-  expectPart(catalog.versionRuns().slice);
+  expectPart({{0, range.offset}, range.length}, ReadClass::METADATA);
+  expectPart(catalog.versionRuns().slice, ReadClass::METADATA);
   check();
 
   for (auto field : {"freqs", "body_w"}) {
@@ -141,7 +144,9 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
     ASSERT_TRUE(record && record->terms());
     const auto& terms = *record->terms();
     ASSERT_EQ(1u, terms.runs.size());
-    expectPart({terms.location, record->termTrie().end().offset() - terms.location.offset()});
+    auto offsets = record->termBlockOffsets();
+    expectPart(terms.dictionaryBlocks());
+    expectPart({offsets.location, record->termTrie().end().offset() - offsets.location.offset()}, ReadClass::METADATA);
     expectPart(terms.runs.front().docs);
     expectPart(record->normsValues(postings.maxDoc()));
     if (FieldType::hasPositions(record->flags)) expectPart(terms.runs.front().positions);

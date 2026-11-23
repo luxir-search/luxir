@@ -18,9 +18,11 @@ class StrictStorageCounters {
 public:
   struct FileStats {
     uint64_t acquires = 0;
+    uint64_t metadataAcquires = 0;
     uint64_t acquiredBytes = 0;
     uint64_t wholeFileAccesses = 0;
     std::set<std::pair<uint64_t, uint64_t>> parts;
+    std::set<std::pair<uint64_t, uint64_t>> metadataParts;
   };
 
   struct LiveStats {

@@ -160,6 +160,14 @@ file. For now the segment keeps the holds it hands out until it closes, so
 nothing held is evicted; releasing holds when a request ends comes with a
 bounded cache.
 
+- Each acquire carries a `ReadClass`. `METADATA` marks what a reader navigates
+  by: file headers, the catalog, version runs, term block offsets and tries,
+  and the directories and indexes over column and point blocks. Everything
+  else, term blocks included, is `DATA`. A bounded cache can then keep
+  metadata for a segment's life and release data when a request ends. A part
+  is held once, under the class of its first slice; each part has one reader
+  path, so the class does not vary.
+
 The manifest identifies the segment catalog at the end of file 0 by offset,
 length and xxh3. The catalog holds a field table for each row space, then
 the directory and its length. A field table contains name-sorted records

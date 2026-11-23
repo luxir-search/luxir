@@ -718,7 +718,7 @@ public:
     if (!part) invalid("points index is absent");
     auto& core = reader.core();
     auto directory = fieldInfo.pointsDirectory();
-    init(core.slice(part->leaves()), core.slice(directory), directory.location.offset());
+    init(core.slice(part->leaves()), core.slice(directory, ReadClass::METADATA), directory.location.offset());
     auto count = fieldInfo.pointCount();
     if (leafCount() != fieldInfo.pointLeafCount() || maxPointsPerLeaf() != part->maxPointsPerLeaf
         || pointCount() != count) invalid("directory counts disagree with field record");

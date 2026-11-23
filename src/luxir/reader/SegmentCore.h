@@ -36,7 +36,8 @@ private:
     bool holdsFree = false;
   };
   std::vector<BaseFile> files;
-  // Holds must outlive the views below and release before files.
+  // Holds must outlive the views below and release before files. A part is
+  // held once, under the read class of its first slice.
   std::mutex holdsMutex;
   std::map<std::pair<uint64_t, uint64_t>, HeldRange> holds;
   SegmentCatalog catalog;
@@ -51,7 +52,7 @@ private:
 
   SegmentCore(uint64_t segId, uint64_t creatorEpoch);
   bool initializeFromFiles(Directory& dir, const Source* source, bool missingFileOK, bool expectSynced);
-  std::span<const char> retain(InputFile& file, field_parts::Slice part);
+  std::span<const char> retain(InputFile& file, field_parts::Slice part, ReadClass readClass);
 
 public:
   static Source source(uint64_t id, uint64_t epoch, CatalogRange range, int32_t maxDoc,
@@ -106,16 +107,18 @@ public:
     return files[fnum].file.get();
   }
 
-  std::span<const char> slice(field_parts::Slice part) {
+  // `readClass` tells a cache or backend whether the part is navigation
+  // metadata or data; see ReadClass.
+  std::span<const char> slice(field_parts::Slice part, ReadClass readClass = ReadClass::DATA) {
     auto number = part.location.filenum();
     assert(number < files.size());
     const auto& base = files[number];
     assert(base.file);
     if (base.holdsFree) {
-      auto hold = base.file->acquire({part.location.offset(), part.bytes});
+      auto hold = base.file->acquire({part.location.offset(), part.bytes, readClass});
       return hold.bytes(); // Free views stay valid while the core keeps the file.
     }
-    return retain(*base.file, part);
+    return retain(*base.file, part, readClass);
   }
 
 };

@@ -31,14 +31,16 @@ StrictStorageCounters::LiveStats StrictStorageCounters::liveStats() const {
 
 void StrictStorageCounters::logSummary() const {
   std::lock_guard lock(mutex);
-  uint64_t acquires = 0, uniqueParts = 0, wholeFiles = 0;
+  uint64_t acquires = 0, metadata = 0, uniqueParts = 0, wholeFiles = 0;
   for (const auto& [name, file] : files) {
     acquires += file.acquires;
+    metadata += file.metadataAcquires;
     uniqueParts += file.parts.size();
     wholeFiles += file.wholeFileAccesses;
   }
-  LOG_INFO("strict: acquires={}, unique parts={}, peak live holds={}, peak live bytes={}, whole-file accesses={}",
-           acquires, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles);
+  LOG_INFO("strict: acquires={} (metadata={}), unique parts={}, peak live holds={}, peak live bytes={}, "
+           "whole-file accesses={}",
+           acquires, metadata, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles);
 }
 
 StrictLayer::~StrictLayer() {
@@ -55,6 +57,10 @@ uint8_t StrictStorageCounters::acquired(std::string_view name, ByteRange range) 
   auto& file = files[std::string(name)];
   file.parts.emplace(range.offset, range.length);
   ++file.acquires;
+  if (range.readClass == ReadClass::METADATA) {
+    file.metadataParts.emplace(range.offset, range.length);
+    ++file.metadataAcquires;
+  }
   file.acquiredBytes += range.length;
   ++live.holds;
   live.bytes += range.length;

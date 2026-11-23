@@ -11,9 +11,17 @@
 
 namespace luxir {
 
+// What a range holds, so a cache or backend can treat the two differently.
+// METADATA is what a reader navigates by before it reads data: file headers,
+// the catalog, version runs, term block offsets and tries, and directories and
+// indexes over column and point blocks. Everything else is DATA. A backend
+// cannot tell them apart from the bytes.
+enum class ReadClass : uint8_t { DATA, METADATA };
+
 struct ByteRange {
   uint64_t offset = 0;
   uint64_t length = 0;
+  ReadClass readClass = ReadClass::DATA;
 };
 
 inline constexpr size_t kReadSlack = 16;
