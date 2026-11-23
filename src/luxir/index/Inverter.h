@@ -112,6 +112,8 @@ public:
   // Populated after flush() if there were deleted documents
   uint64_t liveGen = 0;
   int32_t liveDocs = 0;
+  // Size of the live docs file written for liveGen; 0 when there is none.
+  uint64_t liveDocsBytes = 0;
 
   Inverter(luxir::Directory& dir, uint64_t segId, uint64_t creatorEpoch,
            const std::function<std::shared_ptr<Schema>()>& schemaProvider = {},

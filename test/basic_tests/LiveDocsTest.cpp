@@ -100,13 +100,13 @@ void writeRaw(Directory& dir, uint64_t kind, int32_t maxDoc, int32_t numLive, st
 } // namespace
 
 TEST_F(LiveDocsTest, writerPicksSmallerKindAndReaderRestoresBits) {
-  for (int32_t deletes : {0, 1, 3, 4, 10}) {
+  for (int32_t deletes : {0, 1, 4, 10}) {
     RAMDir dir;
     RAMFixedBitSet bits(100, true);
     for (int32_t i = 0; i < deletes; i++) bits.clear(i * 9 + 1);
-    // 100 docs take two bitmap words: SPARSE below four deletes.
-    uint64_t expected = deletes < 4 ? 24 + 4 * (uint64_t)deletes : 24 + 16;
-    EXPECT_EQ(expected, LiveDocsWriter::fileBytes(100, 100 - deletes));
+    // 100 docs take two bitmap words (16 bytes): SPARSE for at most one delete.
+    bool sparse = deletes <= 1;
+    uint64_t expected = sparse ? 24 + 4 * (uint64_t)deletes : 24 + 16;
     EXPECT_EQ(expected, LiveDocsWriter::writeLiveDocs(dir, 1, 1, 1, 1, bits, 100, 100 - deletes));
     auto name = Postings::getLiveDocsFileName(Postings::segmentKey(1, 1), 1, 1);
     EXPECT_EQ(expected, dir.openFile(name)->size());
@@ -173,32 +173,33 @@ TEST_F(LiveDocsTest, kindFollowsDeleteCountAcrossGenerationsAndMerges) {
   CollectionHelper ch(node, "live_kinds");
   auto writer = ch.getIndexWriter();
   writer->mergePolicy->setMergeFactor(1000);
-  // 300 docs take five bitmap words (40 bytes): SPARSE below ten deletes.
-  indexRange(ch, 0, 300);
-  auto live = range(0, 300);
+  // 640 docs take ten bitmap words (80 bytes): SPARSE for at most five deletes.
+  indexRange(ch, 0, 640);
+  auto live = range(0, 640);
   auto written = writer->stats(false).liveDocsBytesWritten;
 
   deleteIds(ch, live, {7});
   EXPECT_EQ(std::vector<uint64_t>{28}, liveFileBytes(writer->dir));
   EXPECT_EQ(written + 28, writer->stats(false).liveDocsBytesWritten);
   EXPECT_EQ(1, writer->snapshots.readers.getReader()->segments()[0].numDeletes());
-  expectLive(ch, "live_kinds", live, 300);
+  expectLive(ch, "live_kinds", live, 640);
 
-  deleteIds(ch, live, {0, 63, 64, 299});
+  deleteIds(ch, live, {0, 63, 64, 639});
   EXPECT_EQ(std::vector<uint64_t>{24 + 4 * 5}, liveFileBytes(writer->dir));
-  deleteIds(ch, live, {100, 101, 102, 103, 104});
-  EXPECT_EQ(std::vector<uint64_t>{24 + 40}, liveFileBytes(writer->dir));
-  expectLive(ch, "live_kinds", live, 300);
+  expectLive(ch, "live_kinds", live, 640);
+  deleteIds(ch, live, {100});
+  EXPECT_EQ(std::vector<uint64_t>{24 + 80}, liveFileBytes(writer->dir));
+  expectLive(ch, "live_kinds", live, 640);
 
   // The merged segment has no deletes; its first delete is sparse again.
-  indexRange(ch, 300, 310);
-  for (int id = 300; id < 310; id++) live.insert(id);
+  indexRange(ch, 640, 650);
+  for (int id = 640; id < 650; id++) live.insert(id);
   writer->mergeSegments();
   writer->commit();
   EXPECT_EQ(std::vector<uint64_t>{0}, liveFileBytes(writer->dir));
-  deleteIds(ch, live, {305});
+  deleteIds(ch, live, {645});
   EXPECT_EQ(std::vector<uint64_t>{28}, liveFileBytes(writer->dir));
-  expectLive(ch, "live_kinds", live, 310);
+  expectLive(ch, "live_kinds", live, 650);
 }
 
 TEST_F(LiveDocsTest, mergeDiffWritesEitherKind) {
@@ -207,9 +208,10 @@ TEST_F(LiveDocsTest, mergeDiffWritesEitherKind) {
     CollectionHelper ch(node, "live_merge");
     auto writer = ch.getIndexWriter();
     writer->mergePolicy->setMergeFactor(1000);
-    indexRange(ch, 0, 150);
-    indexRange(ch, 150, 300);
-    auto live = range(0, 300);
+    // The merged 640 docs take 80 bytes: SPARSE for at most five deletes.
+    indexRange(ch, 0, 320);
+    indexRange(ch, 320, 640);
+    auto live = range(0, 640);
     std::latch started(1), release(1);
     Signal::listen("mergeStart", [&](void*, void*, void*) -> void* {
       started.count_down();
@@ -220,14 +222,14 @@ TEST_F(LiveDocsTest, mergeDiffWritesEitherKind) {
     auto merge = std::async(std::launch::async, [&] { writer->mergeSegments(); });
     started.wait();
     // Deletes landing during the merge reach the output through its live docs diff.
-    deleteIds(ch, live, {1, 149, 200});
-    if (dense) deleteIds(ch, live, {2, 3, 4, 5, 6, 7, 8, 150, 151, 152});
+    deleteIds(ch, live, {1, 319, 400});
+    if (dense) deleteIds(ch, live, {2, 3, 320, 321});
     release.count_down();
     merge.get();
     writer->updateGraph->wait_for_all();
     writer->commit();
-    EXPECT_EQ(std::vector<uint64_t>{dense ? 24u + 40 : 24u + 4 * 3}, liveFileBytes(writer->dir));
-    expectLive(ch, "live_merge", live, 300);
+    EXPECT_EQ(std::vector<uint64_t>{dense ? 24u + 80 : 24u + 4 * 3}, liveFileBytes(writer->dir));
+    expectLive(ch, "live_merge", live, 640);
   }
 }
 
