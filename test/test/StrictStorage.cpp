@@ -218,8 +218,6 @@ public:
   }
   bool holdsFree() const override { return false; }
 
-  using InputFile::acquire;
-
   HeldRange acquire(ByteRange range) override {
     auto fileSize = delegate->size();
     checkRange(range, fileSize);
@@ -230,37 +228,28 @@ public:
     return state->copy(source, range, slack(range, fileSize));
   }
 
-  // Forwards the batch whole, so the delegate sees it as one round. Every
-  // error, including a bad range, a denied whole file or a delegate that
-  // throws, goes to done, which runs exactly once.
-  void acquire(std::span<const ByteRange> ranges, AcquireDone done) override {
-    auto once = std::make_shared<std::atomic<bool>>(false);
-    auto fail = [&](std::exception_ptr failure) {
-      if (!once->exchange(true)) done({}, std::move(failure));
-    };
-    uint64_t fileSize = 0;
-    std::vector<ByteRange> requested;
+  // Checks every range as a single acquire would, then forwards the batch
+  // whole, so the delegate sees it as one round. Each hold is copied under
+  // the strict rules and the delegate's holds release before `done` runs.
+  void acquireBatch(std::span<const ByteRange> ranges, AcquireDone done) noexcept override {
+    AcquireDone forward;
     try {
-      fileSize = delegate->size();
+      auto fileSize = delegate->size();
       for (auto range : ranges) {
         checkRange(range, fileSize);
         state->checkClass(range);
         if (state->readsWholeFile(range, fileSize)) state->wholeFile();
       }
-      state->round(true);
-      requested.assign(ranges.begin(), ranges.end());
-    } catch (...) {
-      fail(std::current_exception());
-      return;
-    }
-    try {
-      delegate->acquire(ranges, [state = state, fileSize, once, requested = std::move(requested), done](
-                                    std::vector<HeldRange>&& sources, std::exception_ptr failure) {
-        if (once->exchange(true)) return;
+      // Copies `done`, so it is still ours to fail if building `forward` throws.
+      forward = [state = state, fileSize, requested = std::vector(ranges.begin(), ranges.end()), done](
+                    std::vector<HeldRange>&& delivered, std::exception_ptr failure) noexcept {
+        auto sources = std::move(delivered);
         std::vector<HeldRange> holds;
         if (!failure) {
           try {
-            if (sources.size() != requested.size()) throw FileIOException("strict: batch returned the wrong number of holds");
+            if (sources.size() != requested.size()) {
+              throw FileIOException("strict: batch returned the wrong number of holds");
+            }
             holds.reserve(sources.size());
             for (size_t i = 0; i < sources.size(); ++i) {
               holds.push_back(state->copy(sources[i], requested[i], slack(requested[i], fileSize)));
@@ -272,10 +261,13 @@ public:
         }
         sources.clear();
         done(std::move(holds), std::move(failure));
-      });
+      };
+      state->round(true);
     } catch (...) {
-      fail(std::current_exception());
+      done({}, std::current_exception());
+      return;
     }
+    delegate->acquireBatch(ranges, std::move(forward));
   }
 
   void prefetch(size_t offset, size_t length) override { delegate->prefetch(offset, length); }
