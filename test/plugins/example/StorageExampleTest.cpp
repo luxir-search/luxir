@@ -162,6 +162,55 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
   }
 }
 
+// The canonical query shapes read parts, never whole segment files, and each
+// segment acquires its catalog as metadata.
+TEST_F(StorageExampleTest, canonicalQueriesRunWithWholeSegmentFilesDenied) {
+  LuxirConfig config;
+  config.store.layers = {"strict"};
+  config.store.options = {{"strict", {{"whole_segment_files", "deny"}}}};
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  for (int batch = 0; batch < 2; batch++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 100; i++) {
+      int n = batch * 100 + i;
+      docs.push_back(flatdoc("id", "d" + std::to_string(n), "body_t", "alpha beta w" + std::to_string(n % 13),
+                             "c_s", "c" + std::to_string(n % 5), "n_i", (int64_t)(n % 31)));
+    }
+    ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  auto run = [&](auto&& build, int64_t expected) {
+    auto req = localReq(h.getSearchEngine());
+    build(req->collection("main"));
+    req->execute();
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    if (expected >= 0) {
+      EXPECT_EQ(expected, req->getMatchCount());
+    }
+  };
+  run([](auto& r) { r.topDocs().matchQuery("c_s", "c1").countLimit(); }, 40);
+  run([](auto& r) { r.topDocs().matchQuery("body_t", "alpha").withStats().fields({"id", "n_i", "c_s"}); }, 200);
+  run([](auto& r) { r.topDocs().phraseText("body_t", "alpha beta").countLimit(); }, 200);
+  run([](auto& r) { r.topDocs().prefixQuery("body_t", "w1").countLimit(); }, -1);
+  run([](auto& r) { r.topDocs().exprQuery("n_i:[3 TO 5]").countLimit(); }, -1);
+  run([](auto& r) { r.topDocs().existsQuery("n_i").countLimit(); }, 200);
+  run([](auto& r) { r.facet("f", "c_s"); r.avg("a", "n_i"); r.topDocs().allQuery().countLimit(); }, 200);
+
+  auto* layer = node.collections().storage().find<StrictLayer>();
+  ASSERT_NE(nullptr, layer);
+  for (const auto& file : h.getIndexWriter()->snapshots.snapshot()->files) {
+    if (Manifest::segmentDataFile(file.name)) {
+      EXPECT_EQ(0u, layer->counters->fileStats(file.name).wholeFileAccesses) << file.name;
+    }
+  }
+  auto info = readDurableIndexInfo(h.getIndexWriter()->dir);
+  ASSERT_EQ(2u, info->segments.size());
+  for (const auto& segment : info->segments) {
+    auto primary = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
+    EXPECT_GT(layer->counters->fileStats(primary).metadataAcquires, 0u) << primary;
+  }
+}
+
 TEST_F(StorageExampleTest, nestedReaderOpensWithWholeSegmentFilesDenied) {
   LuxirConfig config;
   config.store.layers = {"strict"};
