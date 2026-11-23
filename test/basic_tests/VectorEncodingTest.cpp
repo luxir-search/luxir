@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <map>
 #include <string>
@@ -60,6 +61,7 @@ struct Fields {
   api::VectorMetric metric = api::VectorMetric::L2;
   api::VectorEncoding encoding = api::VectorEncoding::F32;
   bool multi = false;
+  std::optional<bool> normalizeOnWrite = std::nullopt;
   std::optional<api::VectorAnnDef> ann = std::nullopt;
 };
 
@@ -72,6 +74,7 @@ void installFields(Collection& col, const Fields& f) {
     def.type = api::FieldDef::FieldClass::VECTOR;
     def.metric = f.metric;
     def.encoding = encoding;
+    def.normalize_on_write = f.normalizeOnWrite;
     if (f.multi) def.multi = api::FieldDef::MultiMode::ARRAY;
     if (f.ann) {
       def.dims = DIMS;
@@ -424,4 +427,26 @@ TEST_F(VectorEncodingTest, encodedFieldsValidateInput) {
   f.type = api::FieldDef::FieldClass::STRING;
   f.encoding = api::VectorEncoding::F16;
   EXPECT_THROW(Schema::fromProto(b.def()), SchemaError);
+}
+
+// A raw cosine vector whose stored value has no direction is skipped like a
+// zero vector: tiny elements underflow to zero in f16, and an sq8 vector in
+// the subnormal range loses its scale.
+TEST_F(VectorEncodingTest, zeroDirectionAfterEncodingIsSkipped) {
+  for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::SQ8}) {
+    SCOPED_TRACE(vcodec::name((VectorEncoding)encoding));
+    CollectionHelper h("main");
+    h.clear();
+    installFields(h.collection(), {.metric = api::VectorMetric::COSINE, .encoding = encoding,
+                                   .normalizeOnWrite = false});
+    Vec tiny(DIMS, 0.0f);
+    tiny[1] = encoding == api::VectorEncoding::F16 ? 1e-8f : FLT_TRUE_MIN;
+    ExpectLog skipped("skipping zero / near-zero vector");
+    EXPECT_EQ(0, h.index(flatdoc("id", std::string("tiny"), "enc_v", tiny)).total_errors);
+    EXPECT_EQ(1u, skipped.suppressed());
+    h.index(flatdoc("id", std::string("ok"), "enc_v", docVec(1)));
+    h.commit();
+    EXPECT_EQ(std::vector<std::string>{"ok"}, knnIds("enc_v", 2));
+    EXPECT_EQ(Vecs{}, retrieved()["tiny"]);
+  }
 }

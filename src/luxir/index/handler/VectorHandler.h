@@ -10,6 +10,7 @@
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/log.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -42,10 +43,12 @@ class VectorHandler final : public StrColHandler {
   bool trustNormalized = false;
   bool normalizeOnWrite = false;
   VectorEncoding encoding = VectorEncoding::F32;
+  // Raw cosine vectors in a non-f32 encoding: check the stored direction.
+  bool checkStoredDirection = false;
   std::vector<float> floats;
   std::vector<int32_t> lens;
-  std::vector<std::span<float>> accepted;
   std::vector<char> encoded;
+  std::vector<float> decoded;
   std::vector<std::string_view> views;
 
 public:
@@ -60,6 +63,8 @@ public:
     trustNormalized = vft->normalized_;
     normalizeOnWrite = vft->normalizeOnWrite_;
     encoding = vft->encoding_;
+    checkStoredDirection = metric == VectorFieldType::METRIC_COSINE && !trustNormalized
+        && !normalizeOnWrite && encoding != VectorEncoding::F32;
   }
 
   int32_t dims() const { return dims_; }
@@ -80,7 +85,6 @@ public:
 
     bool multi = (fieldType->flags_ & FieldType::MULTI_VALUED) != 0;
     views.clear();
-    accepted.clear();
     bool isList = coerce::toVectors(val, std::string_view(fieldName), floats, lens);
     if (isList && !multi && !lens.empty()) {
       throw DocumentError(fmt::format(
@@ -95,15 +99,19 @@ public:
       return;
     }
 
+    if (encoding != VectorEncoding::F32) {
+      // Room for every vector of the value, so views into it stay valid.
+      int32_t maxLen = *std::max_element(lens.begin(), lens.end());
+      encoded.resize(lens.size() * (size_t)vcodec::bytesPerVector(encoding, maxLen));
+    }
     size_t offset = 0;
     for (size_t i = 0; i < lens.size(); i++) {
       auto vec = std::span<float>(floats).subspan(offset, (size_t)lens[i]);
       offset += (size_t)lens[i];
-      if (validate(vec, isList ? (int32_t)i : -1)) accepted.push_back(vec);
+      if (validate(vec, isList ? (int32_t)i : -1)) store(vec);
     }
-    if (accepted.empty()) return;
+    if (views.empty()) return;
 
-    encodeAccepted();
     commitDims();
     if (multi) {
       appendMulti(inverter, std::span<const std::string_view>(views));
@@ -155,20 +163,10 @@ private:
           std::string_view(fieldName), prefix(), expected, n));
     }
     if (metric == VectorFieldType::METRIC_COSINE && !trustNormalized) {
-      // Finite elements: the double sum of squares cannot overflow.
-      double normSq = 0.0;
-      for (float x : vec) {
-        double d = (double)x;
-        normSq += d * d;
-      }
-      if (normSq <= VectorFieldType::MIN_COSINE_NORM_SQ) {
-        // No cosine direction - skip this value rather than abort the update.
-        LOG_WARN("VectorHandler: cosine field '{}' skipping zero / near-zero vector",
-                 std::string_view(fieldName));
-        return false;
-      }
+      double sq = normSq(vec);
+      if (!hasDirection(sq)) return false;
       if (normalizeOnWrite) {
-        float invNorm = (float)(1.0 / std::sqrt(normSq));
+        float invNorm = (float)(1.0 / std::sqrt(sq));
         for (float& x : vec) x *= invNorm;
       }
     }
@@ -184,23 +182,43 @@ private:
     return true;
   }
 
-  // Fill views with the accepted vectors in the field's encoding.  F32 views
-  // point at the float buffer itself; other encodings encode into one
-  // buffer sized up front so the views stay valid.
-  void encodeAccepted() {
-    views.clear();
+  // Appends the view of an accepted vector as stored.  F32 views point at the
+  // float buffer itself; other encodings encode into the next slot of
+  // `encoded` (every vector of a value has the stored dims).  A raw cosine
+  // vector checks the direction of its stored value, since tiny elements can
+  // underflow to zero in f16, and is skipped like a zero vector without one.
+  // A normalized vector cannot lose its direction to any encoding.
+  void store(std::span<const float> vec) {
     if (encoding == VectorEncoding::F32) {
-      for (auto vec : accepted) views.push_back(bytesOf(vec));
+      views.push_back(bytesOf(vec));
       return;
     }
-    int32_t dims = (int32_t)accepted[0].size();
-    size_t valueBytes = (size_t)vcodec::bytesPerVector(encoding, dims);
-    encoded.resize(valueBytes * accepted.size());
-    for (size_t i = 0; i < accepted.size(); i++) {
-      char* out = encoded.data() + i * valueBytes;
-      vcodec::encode(encoding, accepted[i].data(), dims, out);
-      views.push_back(std::string_view(out, valueBytes));
+    int32_t n = (int32_t)vec.size();
+    size_t valueBytes = (size_t)vcodec::bytesPerVector(encoding, n);
+    char* out = encoded.data() + views.size() * valueBytes;
+    vcodec::encode(encoding, vec.data(), n, out);
+    if (checkStoredDirection) {
+      decoded.resize((size_t)n);
+      vcodec::decode(encoding, out, n, decoded.data());
+      if (!hasDirection(normSq(decoded))) return;
     }
+    views.push_back(std::string_view(out, valueBytes));
+  }
+
+  // Finite elements: the double sum of squares cannot overflow.
+  static double normSq(std::span<const float> vec) {
+    double sum = 0.0;
+    for (float x : vec) sum += (double)x * (double)x;
+    return sum;
+  }
+
+  // A cosine vector without a direction is skipped rather than aborting the
+  // update.
+  bool hasDirection(double sq) const {
+    if (sq > VectorFieldType::MIN_COSINE_NORM_SQ) return true;
+    LOG_WARN("VectorHandler: cosine field '{}' skipping zero / near-zero vector",
+             std::string_view(fieldName));
+    return false;
   }
 
   static std::string_view bytesOf(std::span<const float> vec) {
