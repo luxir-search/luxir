@@ -20,7 +20,8 @@ namespace luxir {
 // term count is the key count.
 //
 // The part names its own kind and parameters, so the writer may choose them
-// freely and a reader needs nothing else. It starts with a HEADER_BYTES header:
+// per segment and a reader needs nothing else. A part that does not parse is
+// damaged. It starts with a HEADER_BYTES header:
 //   [0]       u8  kind (Kind)
 //   [1]       u8  BLOOM: bits per key the writer asked for (informational)
 //                 FUSE: fingerprint bits, 8 or 16
@@ -46,9 +47,9 @@ class IdFilter {
 public:
   enum class Kind : uint8_t { NONE = 0, BLOOM = 1, FUSE = 2 };
 
-  // What a writer builds.
+  // What a writer builds. Writers build no filter unless configured to.
   struct Options {
-    Kind kind = Kind::BLOOM;
+    Kind kind = Kind::NONE;
     uint32_t bitsPerKey = 16;  // BLOOM
     // BLOOM: smallest body. The part is read whole, so small segments get a
     // lower false positive rate for RAM only.

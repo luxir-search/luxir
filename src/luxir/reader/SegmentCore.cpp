@@ -344,18 +344,14 @@ void SegmentCore::initializeSpaces() {
   }
 }
 
-bool SegmentCore::mayContainId(std::string_view term, uint64_t hash) {
+std::optional<IdFilter> SegmentCore::idFilter() {
   const auto* info = root.fieldInfo("id");
-  if (!info || !info->terms()) return false;
-  if (const auto* bounds = info->dictionaryBounds()) {
-    // A root id dictionary always records exact inclusive bounds.
-    if (term < std::string_view(bounds->lower) || term > std::string_view(bounds->upper)) return false;
-  }
-  auto part = info->idFilter();
-  if (!part) return true;
-  // A filter this build cannot read proves nothing.
-  auto filter = IdFilter::parse(slice(part));
-  return !filter || filter->mayContainHash(hash);
+  auto part = info ? info->idFilter() : field_parts::Slice();
+  if (!part) return std::nullopt;
+  // Writers only write filters that parse, so one that does not is damaged.
+  auto filter = IdFilter::parse(slice(part, ReadClass::METADATA));
+  if (!filter) segmentReadContext(*this, *info, part.location.filenum()).invalid("id filter does not parse");
+  return filter;
 }
 
 std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, const api::SegmentInfo& segment,

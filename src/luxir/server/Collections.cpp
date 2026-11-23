@@ -355,7 +355,6 @@ std::string Collections::recoverWriter(const CollectionId& name, TenantCatalog& 
   return recovered;
 }
 
-// Best-effort marker cleanup after snapshot verification.
 static IdFilter::Options idFilterOptions(const IndexConfig& config) {
   IdFilter::Options options;
   options.kind = config.id_filter == "none" ? IdFilter::Kind::NONE
@@ -367,6 +366,7 @@ static IdFilter::Options idFilterOptions(const IndexConfig& config) {
   return options;
 }
 
+// Best-effort marker cleanup after snapshot verification.
 static void clearMarkers(const CollectionId& name, Directory& dir, std::span<const std::string> markers) {
   if (markers.empty()) return;
   try { dir.deleteDurably(markers); }

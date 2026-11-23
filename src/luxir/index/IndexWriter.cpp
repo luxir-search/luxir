@@ -3624,9 +3624,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
 
   // The id filter proves most absent ids absent: those skip the dictionary,
   // and a segment that can hold none of them is not touched further.
-  // A filter this build cannot read proves nothing.
-  std::optional<IdFilter> idFilter;
-  if (auto slice = idFieldInfo->idFilter()) idFilter = IdFilter::parse(core->slice(slice));
+  auto idFilter = core->idFilter();
   auto mayHold = [&](const auto& entry) {
     return entry.val().deleteWatermark != 0 && (!idFilter || idFilter->mayContain((std::string_view)entry));
   };
