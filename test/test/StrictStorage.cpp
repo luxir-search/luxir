@@ -26,9 +26,9 @@ StrictStorageCounters::FileStats StrictStorageCounters::fileStats(std::string_vi
   return it == files.end() ? FileStats{} : it->second;
 }
 
-uint64_t StrictStorageCounters::totalRounds() const {
+uint64_t StrictStorageCounters::totalSubmissions() const {
   std::lock_guard lock(mutex);
-  return rounds;
+  return submissions;
 }
 
 StrictStorageCounters::LiveStats StrictStorageCounters::liveStats() const {
@@ -47,9 +47,9 @@ void StrictStorageCounters::logSummary() const {
     wholeFiles += file.wholeFileAccesses;
     sizes += file.sizeRequests;
   }
-  LOG_INFO("strict: acquires={} (metadata={}), rounds={} (batches={}), unique parts={}, peak live holds={}, "
+  LOG_INFO("strict: acquires={} (metadata={}), submissions={} (batches={}), unique parts={}, peak live holds={}, "
            "peak live bytes={}, whole-file accesses={}, size requests={}",
-           acquires, metadata, rounds, batches, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles, sizes);
+           acquires, metadata, submissions, batches, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles, sizes);
 }
 
 StrictLayer::~StrictLayer() {
@@ -66,11 +66,11 @@ void StrictStorageCounters::sizeRequested(std::string_view name) {
   ++files[std::string(name)].sizeRequests;
 }
 
-void StrictStorageCounters::round(std::string_view name, bool batch) {
+void StrictStorageCounters::submitted(std::string_view name, bool batch) {
   std::lock_guard lock(mutex);
   auto& file = files[std::string(name)];
-  file.lastRound = ++rounds;
-  if (!file.rounds++) file.firstRound = rounds;
+  file.lastSubmission = ++submissions;
+  if (!file.submissions++) file.firstSubmission = submissions;
   if (batch) ++file.batches;
 }
 
@@ -136,7 +136,7 @@ public:
   void sizeRequested() {
     if (!sized) counters->sizeRequested(name);
   }
-  void round(bool batch) { counters->round(name, batch); }
+  void submitted(bool batch) { counters->submitted(name, batch); }
 
   // A part's bytes are metadata or data whoever reads them, so a cache hint
   // must not depend on which reader acquires the part first.
@@ -223,13 +223,13 @@ public:
     checkRange(range, fileSize);
     state->checkClass(range);
     if (state->readsWholeFile(range, fileSize)) state->wholeFile();
-    state->round(false);
+    state->submitted(false);
     auto source = delegate->acquire(range);
     return state->copy(source, range, slack(range, fileSize));
   }
 
   // Checks every range as a single acquire would, then forwards the batch
-  // whole, so the delegate sees it as one round. Each hold is copied under
+  // whole, so the delegate sees it as one submission. Each hold is copied under
   // the strict rules and the delegate's holds release before `done` runs.
   void acquireBatch(std::span<const ByteRange> ranges, AcquireDone done) noexcept override {
     AcquireDone forward;
@@ -262,7 +262,7 @@ public:
         sources.clear();
         done(std::move(holds), std::move(failure));
       };
-      state->round(true);
+      state->submitted(true);
     } catch (...) {
       done({}, std::current_exception());
       return;
