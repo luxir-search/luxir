@@ -84,6 +84,18 @@ struct MergeCostModel {
                              - currentDocs;
   }
 
+  // IVF overlays store list ids (a field's segment-local value ranks) as
+  // uint32, so one vector field may hold at most this many values per segment.
+  // Multi-valued fields are not bounded by the doc cap.  Flushed segments stay
+  // far below it (an inverter pool addresses at most 4 GiB and a vector takes
+  // at least 4 bytes), so merge admission is the only gate.
+  static constexpr int64_t MAX_SEGMENT_VECTORS = std::numeric_limits<uint32_t>::max();
+
+  static bool vectorsFit(int64_t currentVectors, int64_t sourceVectors) {
+    return currentVectors >= 0 && sourceVectors >= 0 &&
+           sourceVectors <= MAX_SEGMENT_VECTORS - currentVectors;
+  }
+
   // Peak checked-out OutputStreams for each writer path.
   static constexpr int32_t TEXT_STREAMS = 3;      // TextWriter owns term/doc/pos streams together.
   static constexpr int32_t TERM_RANGE_STREAMS = 2;  // Range-local docs and positions.
