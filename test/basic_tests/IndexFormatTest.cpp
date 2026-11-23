@@ -207,6 +207,9 @@ void expectCorrupt(Action action, std::string_view context, std::string_view rea
   } catch (const SegmentCorruptError& e) {
     auto message = std::string_view(e.what());
     EXPECT_TRUE(message.contains(context) && message.contains(reason)) << message;
+    // A request that meets corruption reports a server fault, whatever its phase.
+    EXPECT_EQ(ErrorKind::INTERNAL, classifyException(e, ErrorKind::INVALID_REQUEST).kind);
+    EXPECT_EQ("segment_corrupt", e.code);
   }
 }
 
