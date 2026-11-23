@@ -1099,6 +1099,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix; normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits; 0 means no truncation. |
 | <a id="field-luxir.fielddef.encoding"></a>[`encoding`](#field-luxir.fielddef.encoding) | 20 | [`VectorEncoding`](#enum-luxir.vectorencoding) | optional | VECTOR only. Column storage encoding. Unset inherits, falling back to BIT for metric HAMMING and F32 otherwise. F16 and INT8 reject non-finite elements; F16 also rejects magnitudes above 65504. Applies to newly written segments. |
 | <a id="field-luxir.fielddef.keep_original"></a>[`keep_original`](#field-luxir.fielddef.keep_original) | 21 | `bool` | optional | VECTOR only. Also keep the submitted float32 vectors in a separate cold column that searches never read, so the field can be re-encoded later. Unset inherits, falling back to false. |
+| <a id="field-luxir.fielddef.multi_vector_scoring"></a>[`multi_vector_scoring`](#field-luxir.fielddef.multi_vector_scoring) | 27 | [`FieldDef.MultiVectorScoring`](#enum-luxir.fielddef.multivectorscoring) | optional | VECTOR only, multi-valued: see MultiVectorScoring. |
 | <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
 | <a id="field-luxir.fielddef.scale"></a>[`scale`](#field-luxir.fielddef.scale) | 25 | `int32` | optional | DECIMAL only, and required there: digits after the decimal point, 0 to 18. Excess fractional digits round half away from zero. |
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
@@ -1554,7 +1555,7 @@ jemalloc's process-wide statistics (stats.\*), read at one statistics epoch per 
 
 ### luxir.KnnQuery
 
-Nearest-neighbor query against a searchable vector field. Search is exact when no ANN index is available; an ANN index may produce approximate results. The query vector must be non-empty and match the field's dimensions. Deleted documents and documents outside the enclosing domain are excluded. Multi-valued fields return one hit per document using its highest similarity.
+Nearest-neighbor query against a searchable vector field. Search is exact when no ANN index is available; an ANN index may produce approximate results. The query vector must be non-empty and match the field's dimensions. Deleted documents and documents outside the enclosing domain are excluded. Multi-valued fields return one hit per document using its highest similarity, or with queries on a MAXSIM field its late-interaction score.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1567,6 +1568,7 @@ Nearest-neighbor query against a searchable vector field. Search is exact when n
 | <a id="field-luxir.knnquery.refine_candidates"></a>[`refine_candidates`](#field-luxir.knnquery.refine_candidates) | 5 | `int32` | singular | Candidate-document pool size for full-precision rescoring of ANN results, in both units. Group search caps the number of candidates per group so repeated keys cannot consume the whole pool. Clamped up to k; 0 selects an adaptive default. Larger pools can improve recall at a cost in memory and latency. Fewer candidates may be available. |
 | <a id="field-luxir.knnquery.ivf"></a>[`ivf`](#field-luxir.knnquery.ivf) | 6 | [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf) | singular | ignored for exact search and segments without an IVF index |
 | <a id="field-luxir.knnquery.unit"></a>[`unit`](#field-luxir.knnquery.unit) | 7 | `string` | singular | docs (default): k counts documents. groups: k counts nearest groups under the enclosing top\_docs collapse key and missing policy; requires collapse. The match set contains one best scored witness per selected group. |
+| <a id="field-luxir.knnquery.queries"></a>[`queries`](#field-luxir.knnquery.queries) | 17 | [`Vector`](#message-luxir.vector) | repeated | Late-interaction query vectors (one per query token), in place of query, for a field with multi\_vector\_scoring MAXSIM. A document scores the sum over these vectors of each one's best similarity among the document's vectors (MaxSim). Scored exactly over every eligible document (filters and deletes apply first), so exact, refine\_candidates and ivf are ignored; unit groups and similarity are not supported. Each vector must match the field's dims; at most 1024 vectors. |
 | <a id="field-luxir.knnquery.similarity"></a>[`similarity`](#field-luxir.knnquery.similarity) | 8 | `float` | optional | Minimum vector similarity for a hit, in the metric's own space (not the transformed score): for l2 the maximum L2 distance (not squared), for ip the minimum dot product, for cosine the minimum cosine similarity. Hits beyond it are dropped from the k nearest, so fewer than k may match. Compared before any enclosing boost. Must be finite; l2 requires &gt;= 0. |
 
 <a id="message-luxir.knnquery.ivf"></a>
@@ -2883,6 +2885,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode)
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
 - [`FieldDef.MultiMode`](#enum-luxir.fielddef.multimode)
+- [`FieldDef.MultiVectorScoring`](#enum-luxir.fielddef.multivectorscoring)
 - [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit)
 - [`GroupComponent.Type`](#enum-luxir.groupcomponent.type)
 - [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
@@ -3042,6 +3045,19 @@ SINGLE is one value; DEFAULT enables the type's default multi mode. SET sorts an
 | <a id="value-luxir.fielddef.multimode.default"></a>[`DEFAULT`](#value-luxir.fielddef.multimode.default) | 1 |  |
 | <a id="value-luxir.fielddef.multimode.set"></a>[`SET`](#value-luxir.fielddef.multimode.set) | 2 |  |
 | <a id="value-luxir.fielddef.multimode.array"></a>[`ARRAY`](#value-luxir.fielddef.multimode.array) | 3 |  |
+
+<a id="enum-luxir.fielddef.multivectorscoring"></a>
+
+### luxir.FieldDef.MultiVectorScoring
+
+VECTOR only, multi-valued. How KnnQuery.queries (several query vectors) scores a document's vectors. Unset inherits, falling back to MAX.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.fielddef.multivectorscoring.max"></a>[`MAX`](#value-luxir.fielddef.multivectorscoring.max) | 0 | queries is rejected; a document scores by its best single vector |
+| <a id="value-luxir.fielddef.multivectorscoring.maxsim"></a>[`MAXSIM`](#value-luxir.fielddef.multivectorscoring.maxsim) | 1 | Late interaction (ColBERT, ColPali): the sum over the query vectors of each one's best similarity among the document's vectors. Exact search only: commits build no ANN index for the field. |
 
 <a id="enum-luxir.fieldfacet.countunit"></a>
 
