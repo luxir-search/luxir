@@ -136,13 +136,14 @@ public:
     return retain(*base.file, part, readClass);
   }
 
-  // Acquires the parts in one batch per file, keeps their holds as slice()
-  // does, and returns their bytes in order.
-  std::vector<std::span<const char>> slices(std::span<const field_parts::Slice> parts,
-                                            ReadClass readClass = ReadClass::DATA);
-  // Starts those batches on `join` without waiting, so batches of several
-  // segments go out together. Once join.wait() returns, slice() of each part
-  // returns its held bytes without an acquire.
+  // Acquires the parts in one batch per file, skipping parts already held,
+  // keeps their holds as slice() does, and waits. Afterwards slice() of each
+  // part makes no backend request: it returns the held bytes, or a free view
+  // on a file with free holds, whose acquire costs nothing.
+  void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass = ReadClass::DATA);
+  // Issues the same batches on `join` without waiting, so batches of several
+  // segments go out together; slice() makes no request once join.wait()
+  // returns.
   void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join);
 
 };

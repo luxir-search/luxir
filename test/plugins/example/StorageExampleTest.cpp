@@ -196,18 +196,21 @@ TEST_F(StorageExampleTest, manifestOpenAcquiresCatalogsInOneRound) {
   EXPECT_EQ((std::vector<uint64_t>{1, 2, 3}), firstRounds);
   EXPECT_EQ(6u, counters->totalRounds());
 
-  // A later batch acquires only the parts the segment does not hold yet.
+  // A later batch acquires only the parts the segment does not hold yet,
+  // and slice() of them then makes no request.
   auto& core = reader->segments().front().postingsReader().core();
   auto name = Postings::getIndexFileName(core.segmentName(), 0);
   auto before = counters->fileStats(name);
-  field_parts::Slice parts[] = {{{0, 0}, 2}, {{0, 2}, 3}, {{0, 0}, 2}, {{0, 0}, Postings::LUXIR_HEADER.size()}};
-  auto bytes = core.slices(parts);
-  ASSERT_EQ(4u, bytes.size());
-  EXPECT_EQ(Postings::LUXIR_HEADER.substr(2, 3), std::string_view(bytes[1].data(), bytes[1].size()));
-  EXPECT_EQ(bytes[0].data(), bytes[2].data());
+  auto catalog = core.catalogRange();
+  field_parts::Slice parts[] = {{{0, 0}, 2}, {{0, 2}, 3}, {{0, 0}, 2}, {{0, catalog.offset}, catalog.length}};
+  core.acquireSlices(parts, ReadClass::METADATA);
   auto after = counters->fileStats(name);
   EXPECT_EQ(before.batches + 1, after.batches);
   EXPECT_EQ(before.acquires + 2, after.acquires);
+  auto bytes = core.slice(parts[1], ReadClass::METADATA);
+  EXPECT_EQ(Postings::LUXIR_HEADER.substr(2, 3), std::string_view(bytes.data(), bytes.size()));
+  EXPECT_EQ(core.slice(parts[0], ReadClass::METADATA).data(), core.slice(parts[2], ReadClass::METADATA).data());
+  EXPECT_EQ(after.acquires, counters->fileStats(name).acquires);
 }
 
 // The canonical query shapes read parts, never whole segment files, need no
