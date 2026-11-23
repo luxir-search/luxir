@@ -1325,7 +1325,7 @@ public:
             .ivfEngine = std::make_unique<SegmentIvfScanner<Groups, Owned>>(
                 *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
                 metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
-                vaux->getAmplitudes(), interval ? &intervals : nullptr),
+                vaux->getLists(), vaux->getAmplitudes(), interval ? &intervals : nullptr),
           });
         } else {
           slots.push_back({
@@ -1991,8 +1991,8 @@ public:
 
       faiss::IndexIVF& ivf;
       faiss::IndexIVFRaBitQ* rabitq;
-      // The overlay's file-backed lists (VectorAuxReader); ids are read as
-      // uint32 through ids32(), never through the widening get_ids().
+      // The overlay's file-backed lists (VectorAuxReader::getLists); ids are
+      // read as uint32 through ids32(), never through the widening get_ids().
       const MmapInvertedLists& lists;
       int32_t segOrd;
       const Binding<Owned>& v2d;
@@ -2164,30 +2164,26 @@ public:
         }
       };
 
-      static const MmapInvertedLists& mmapLists(const faiss::IndexIVF& ivf) {
-        auto* lists = dynamic_cast<const MmapInvertedLists*>(ivf.invlists);
-        if (lists == nullptr) throw std::runtime_error("KnnQuery: IVF lists are not file-backed");
-        return *lists;
-      }
-
     public:
       SegmentIvfScanner(faiss::IndexIVF& ivf, int32_t segOrd,
                         IndexReader::Segment& seg, const Binding<Owned>& v2d, DocSet* domain,
                         std::shared_ptr<const RankLiveBitmap> rankLive, int32_t metric,
                         const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
-                        RaBitQAmplitudes amplitudes, KnnIntervalCollector<Groups>* intervals)
+                        const MmapInvertedLists& lists, RaBitQAmplitudes amplitudes,
+                        KnnIntervalCollector<Groups>* intervals)
           : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
-            lists(mmapLists(ivf)), segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
+            lists(lists), segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
             domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
                                         && domain == &liveDocs->docset()),
             metric(metric), preparedQuery(preparedQuery) {
         assert(preparedQuery.query != nullptr);
         assert((liveDocs != nullptr) == (this->rankLive != nullptr));
+        assert(ivf.invlists == &lists);
       }
 
       bool usesIntervals() const { return intervals != nullptr; }
       int32_t getNList() const noexcept { return (int32_t)ivf.nlist; }
-      int64_t physicalListSize(faiss::idx_t id) const { return (int64_t)ivf.invlists->list_size((size_t)id); }
+      int64_t physicalListSize(faiss::idx_t id) const { return (int64_t)lists.list_size((size_t)id); }
 
       void coarseRun(int32_t dims,
                      std::vector<faiss::idx_t>& listIds,
@@ -2210,18 +2206,14 @@ public:
       /// denominator.
       int64_t liveListSize(faiss::idx_t listId, VectorSearchWork& work) const {
         if (listId < 0 || (size_t)listId >= ivf.nlist) return 0;
-        size_t rawSize = ivf.invlists->list_size((size_t)listId);
-        if (rawSize == 0) return 0;
-        if (liveDocs == nullptr) return (int64_t)rawSize;
+        auto listIds = lists.ids32((size_t)listId);
+        if (listIds.empty()) return 0;
+        if (liveDocs == nullptr) return (int64_t)listIds.size();
 
-        work.allocatorEntries += (int64_t)rawSize;
+        work.allocatorEntries += (int64_t)listIds.size();
         const uint8_t* bits = rankLive->bits;
         int64_t liveSize = 0;
-        const uint32_t* listIds = lists.ids32((size_t)listId);
-        for (size_t i = 0; i < rawSize; i++) {
-          uint32_t r = listIds[i];
-          liveSize += (bits[r >> 3] >> (r & 7)) & 1;
-        }
+        for (uint32_t r : listIds) liveSize += (bits[r >> 3] >> (r & 7)) & 1;
         return liveSize;
       }
 
@@ -2295,9 +2287,10 @@ public:
         for (size_t list = 0; list < listIds.size(); list++) {
           auto id = listIds[list];
           if (id < 0) continue;
-          const uint32_t* ids = lists.ids32((size_t)id);
-          faiss::InvertedLists::ScopedCodes codes(ivf.invlists, (size_t)id);
-          size_t count = ivf.invlists->list_size((size_t)id);
+          auto listRows = lists.ids32((size_t)id);
+          const uint32_t* ids = listRows.data();
+          const uint8_t* codes = lists.get_codes((size_t)id);
+          size_t count = listRows.size();
           visited += (int64_t)count;
           rowIds = ids;
           std::unique_ptr<faiss::FlatCodesDistanceComputer> distanceComputer;
@@ -2329,7 +2322,7 @@ public:
             handler.updateThreshold();
             if (oneBitScorer) {
               alignas(64) float distances[RaBitQScorer::BLOCK_ROWS];
-              const uint8_t* block = codes.get() + begin * ivf.code_size;
+              const uint8_t* block = codes + begin * ivf.code_size;
               if constexpr (std::is_same_v<Probe, std::nullptr_t>) {
                 size_t rows = end - begin;
                 oneBitScorer->score(block, ivf.code_size, rows, distances);
@@ -2351,14 +2344,14 @@ public:
                 // FAISS's PQ scan_codes takes idx_t ids: widen one block.
                 faiss::idx_t wideIds[RaBitQScorer::BLOCK_ROWS];
                 std::copy(ids + begin, ids + end, wideIds);
-                pqScanner->scan_codes(end - begin, codes.get() + begin * ivf.code_size,
+                pqScanner->scan_codes(end - begin, codes + begin * ivf.code_size,
                                       wideIds, handler);
               }
             } else for (size_t i = begin; i < end; i++) {
               if constexpr (!std::is_same_v<Probe, std::nullptr_t>) {
                 if (!probe(ids[i])) continue;
               }
-              const uint8_t* code = codes.get() + i * ivf.code_size;
+              const uint8_t* code = codes + i * ivf.code_size;
               scanned++;
               float distance = dc->distance_to_code_1bit(code);
               if (multiBit) {

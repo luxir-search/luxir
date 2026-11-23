@@ -21,6 +21,7 @@
 #include <format>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -276,11 +277,13 @@ public:
   const uint8_t* get_codes(size_t listNo) const override {
     return codes + offsets[listNo] * code_size;
   }
-  const uint32_t* ids32(size_t listNo) const noexcept { return ids + offsets[listNo]; }
+  std::span<const uint32_t> ids32(size_t listNo) const noexcept {
+    return {ids + offsets[listNo], list_size(listNo)};
+  }
   const faiss::idx_t* get_ids(size_t listNo) const override {
-    size_t n = list_size(listNo);
-    auto* wide = new faiss::idx_t[n];
-    std::copy_n(ids32(listNo), n, wide);
+    auto narrow = ids32(listNo);
+    auto* wide = new faiss::idx_t[narrow.size()];
+    std::copy(narrow.begin(), narrow.end(), wide);
     return wide;
   }
   void release_ids(size_t, const faiss::idx_t* wide) const override { delete[] wide; }
@@ -393,6 +396,8 @@ public:
   /// (ENGINE_IVFRABITQ), or null.  Valid after getFaissIndex().
   const VectorRotation* getRotation() const noexcept { return rotation.get(); }
   const RaBitQAmplitudes& getAmplitudes() const { getFaissIndex(); return amplitudes; }
+  /// The file-backed inverted lists behind getFaissIndex().
+  const MmapInvertedLists& getLists() const { getFaissIndex(); return *mmapLists; }
 
   // Search-time entry point: the IVF index (for ENGINE_IVFRABITQ, the index
   // behind the rotation; see getRotation).  Decode is lazy and once-only;
