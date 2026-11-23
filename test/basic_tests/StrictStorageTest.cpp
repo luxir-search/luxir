@@ -144,6 +144,16 @@ TEST(StrictStorageTest, deniesWholeBaseSegmentFiles) {
   }
 }
 
+TEST(StrictStorageTest, rejectsAPartAcquiredUnderBothClasses) {
+  StrictDirectory dir(std::make_shared<RAMDir>(), std::make_shared<StrictStorageCounters>());
+  put(dir, "data");
+  auto file = dir.openFile("data");
+  EXPECT_NO_THROW(file->acquire({4, 8, ReadClass::METADATA}));
+  EXPECT_NO_THROW(file->acquire({4, 8, ReadClass::METADATA}));
+  EXPECT_NO_THROW(file->acquire({4, 9}));
+  EXPECT_THROW(file->acquire({4, 8}), std::logic_error);
+}
+
 // Reads no part makes count as whole-file reads: from offset 0 past the
 // header, and to EOF outside file 0, whose catalog runs to EOF.
 TEST(StrictStorageTest, deniesReadsNoSegmentPartMakes) {

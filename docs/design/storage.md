@@ -175,8 +175,7 @@ with a bounded cache.
   Whoever keeps a hold decides how long it lives: the segment for what it
   keeps, a request for what it uses. The class is a hint a cache or backend
   may use for residency and scheduling after release, and it never changes
-  the bytes returned. A part is held once; each part has one reader path, so
-  its class does not vary.
+  the bytes returned. A part has one class whichever reader acquires it.
 
 The manifest identifies the segment catalog at the end of file 0 by offset,
 length and xxh3. The catalog holds a field table for each row space, then

@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <new>
+#include <stdexcept>
 
 #include "LuxirTest.h"
 #include "luxir/store/Manifest.h"
@@ -93,6 +95,11 @@ class StrictFileState : public HoldOwner {
   bool denyWhole;
   bool sized;  // Opened with a size, so size() makes no request.
   std::atomic<uint64_t> liveHolds{0};
+  // Each part's class in this open file. Keyed per open file, not by name:
+  // names repeat across incarnations, and every reader of one segment shares
+  // its open files.
+  std::mutex classesMutex;
+  std::map<std::pair<uint64_t, uint64_t>, ReadClass> classes;
 
   static size_t allocationSize(size_t length) {
     return (length + overhead + kHoldAlign - 1) & ~(kHoldAlign - 1);
@@ -114,6 +121,17 @@ public:
 
   void sizeRequested() {
     if (!sized) counters->sizeRequested(name);
+  }
+
+  // A part's bytes are metadata or data whoever reads them, so a cache hint
+  // must not depend on which reader acquires the part first.
+  void checkClass(ByteRange range) {
+    std::lock_guard lock(classesMutex);
+    auto [found, added] = classes.try_emplace({range.offset, range.length}, range.readClass);
+    if (!added && found->second != range.readClass) {
+      throw std::logic_error(std::format("strict: {} [{}, +{}) acquired as both METADATA and DATA", name,
+                                         range.offset, range.length));
+    }
   }
 
   // A whole-file read, or in a segment data file a read no part makes: one
@@ -184,6 +202,7 @@ public:
   HeldRange acquire(ByteRange range) override {
     auto fileSize = delegate->size();
     checkRange(range, fileSize);
+    state->checkClass(range);
     if (state->readsWholeFile(range, fileSize)) state->wholeFile();
     auto source = delegate->acquire(range);
     size_t slack = std::min<uint64_t>(kReadSlack, fileSize - range.offset - range.length);
