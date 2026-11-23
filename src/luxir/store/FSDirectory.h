@@ -75,6 +75,7 @@ public:
 
   size_t size() override { return sz_; }
 
+  using InputFile::acquire;
   HeldRange acquire(ByteRange range) override {
     checkRange(range, sz_);
     return {data_ + range.offset, range.length};
