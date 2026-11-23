@@ -65,8 +65,9 @@ locations, browse `src/luxir/<area>/`.
      invalid segment bytes throw `SegmentCorruptError`, an internal `ApiError`
    - `IdFilter`: the root id field's FILTER part, a membership filter over its
      dictionary terms that names its own kind (split-block Bloom or binary fuse) and
-     parameters. `IdFilter::Options` picks what a writer builds. `SegmentCore::mayContainId` checks the exact id bounds, then the
-     filter; the writer's delete application skips ids and segments it excludes
+     parameters. `IdFilter::Options` picks what a writer builds (none by default).
+     `SegmentCore::idFilter` reads it; the writer's delete application skips ids
+     and segments it excludes
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
      opening reads metadata and endpoints without scanning child rows.

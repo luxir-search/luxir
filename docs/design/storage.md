@@ -199,8 +199,9 @@ when a request ends comes with a bounded cache.
   existence.
 - Each acquire carries a `ReadClass`. `METADATA` marks what a reader navigates
   by: file headers, the catalog, version runs, term block offsets and tries,
-  the stored-field chunk index, and the directories and indexes over column
-  and point blocks. Everything else, term blocks included, is `DATA`.
+  the id filter, the stored-field chunk index, and the directories and
+  indexes over column and point blocks. Everything else, term blocks
+  included, is `DATA`.
   Whoever keeps a hold decides how long it lives: the segment for what it
   keeps, a request for what it uses. The class is a hint a cache or backend
   may use for residency and scheduling after release, and it never changes
@@ -227,27 +228,27 @@ of each term as the dictionary stores it (the fitted form, so a long id is
 never falsely absent), the same hash whose low byte the term blocks keep.
 Every flush and merge rebuilds it from the terms it writes, so it has exactly
 one key per term. The writer checks an id against the exact dictionary bounds
-in the record header and then the filter, and looks up only the segments and
-ids that pass.
+and then the filter, and looks up only the segments and ids that pass.
+Writers build no filter unless `--indexing.id-filter` names a kind (see the
+operations guide).
 
 The part starts with a 24-byte header that names its kind and parameters, so
-a reader needs nothing else and the writer may change them freely
-(`--indexing.id-filter`, see the operations guide). Two kinds exist:
+a reader needs nothing else and the writer may choose them per segment. A
+part that does not parse is a corrupt segment. Two kinds exist:
 
 - `bloom`: a split-block Bloom filter in 32-byte blocks, sized for the
-  segment's document count at 16 bits per id by default (about 0.13% of
-  absent ids pass), and at least 16 KiB so a small segment almost always
-  excludes an absent id. Built in one pass.
+  segment's document count at 16 bits per id unless configured otherwise
+  (about 0.13% of absent ids pass), and at least 16 KiB so a small segment
+  almost always excludes an absent id. Built in one pass.
 - `fuse8` and `fuse16`: a 3-wise binary fuse filter with 8- or 16-bit
   fingerprints, 1.13 (millions of ids) to about 1.25 (thousands) fingerprints
-  per id. 0.39% or 0.0015% of absent
-  ids pass. It is static: the writer holds every key's hash until the
-  dictionary ends and then builds it.
+  per id. 0.39% or 0.0015% of absent ids pass. It is static: the writer holds
+  every key's hash until the dictionary ends and then builds it.
 
 A batch of ids skips a segment only when every id misses, so the false
 positive rate that matters is per batch: at 2,000 ids per commit, a 16-bit
-Bloom filter skips about 7% of segments and `fuse16` about 97%. Which kind
-to ship as the default is to be settled by benchmarking both.
+Bloom filter skips about 7% of segments and `fuse16` about 97%. Whether a
+kind should be on by default, and which, is to be settled by benchmarking.
 
 Each field record encodes the schema flags as an unsigned vint, excluding
 `ABSTRACT` and `DERIVED`. Bits 0-2 encode the cumulative postings level
@@ -294,8 +295,8 @@ needs:
   their inputs through the cache;
 - id lookups for updates and deletes that skip cold segments without
   fetching them. Append-only collections need no lookups. Otherwise the
-  exact id bounds in each segment's catalog and its id filter part do the
-  skipping, from the catalog alone;
+  exact id bounds in each segment's catalog do the skipping, and the id
+  filter part, a small metadata read, skips most of what the bounds keep;
 - the syncer reporting which files are published, so that eviction knows
   what it may drop.
 
