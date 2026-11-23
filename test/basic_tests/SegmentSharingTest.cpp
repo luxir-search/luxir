@@ -226,8 +226,8 @@ TEST_F(SegmentSharingTest, overlayOnlyCommitSharesEverySegment) {
   EXPECT_EQ(cores(*before), cores(*after));
   for (size_t i = 0; i < after->segments().size(); i++) {
     EXPECT_EQ(before->segments()[i].liveDocs(), after->segments()[i].liveDocs());
-    EXPECT_TRUE(before->segments()[i].auxReaders().empty());
-    EXPECT_FALSE(after->segments()[i].auxReaders().empty());
+    EXPECT_TRUE(before->segments()[i].overlays().empty());
+    EXPECT_FALSE(after->segments()[i].overlays().empty());
   }
   before.reset();
   EXPECT_EQ(1099, readAll(*after));

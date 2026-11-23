@@ -10,7 +10,9 @@
 #include "luxir/store/FileVerifier.h"
 #include "luxir/store/VerifiedDirectory.h"
 #include "luxir/store/CheckedDirFactory.h"
+#include "luxir/reader/Postings.h"
 #include "luxir/reader/VectorAuxReader.h"
+#include "luxir/store/Manifest.h"
 #include "luxir/util/Uuid.h"
 #include <filesystem>
 #include <fstream>
@@ -176,8 +178,9 @@ TEST_F(ChecksumVerifyTest, verifiedReaderSurvivesUnlinkAndViewLifetime) {
       reader = readers.prepare(*snapshot, source);
     }
     EXPECT_EQ(1, reader->liveDocs());
-    for (const auto& segment : reader->segments()) for (const auto& aux : segment.auxReaders()) {
-      if (auto vector = std::dynamic_pointer_cast<VectorAuxReader>(aux)) {
+    // Live docs and overlays read on first use, after their files were unlinked.
+    for (const auto& segment : reader->segments()) for (const auto& overlay : segment.overlays()) {
+      if (auto vector = std::dynamic_pointer_cast<VectorAuxReader>(overlay->get())) {
         EXPECT_NE(nullptr, vector->getFaissIndex());
       }
     }
@@ -242,6 +245,29 @@ TEST_F(ChecksumVerifyTest, scrubFailsTheWriterAndTheFailureSurvivesRestart) {
   LuxirNode node(config);
   EXPECT_EQ(1, node.getCollection("main")->getReaderManager().getReader()->liveDocs());
   EXPECT_EQ(0u, count(dir, CorruptionMarker::kPrefix));
+}
+
+// A snapshot open no longer reads live docs; the scrubber still checks the
+// file and fails the collection on a mismatch.
+TEST_F(ChecksumVerifyTest, scrubFlagsLiveDocsReadOnlyOnFirstUse) {
+  populate();
+  config.store.scrub_max_bytes_per_sec = 0;
+  LuxirNode node(config);
+  auto snapshot = node.getCollection("main")->getShard()->getSnapshots().snapshot();
+  std::pmr::monotonic_buffer_resource arena;
+  auto info = Manifest::decode(snapshot->bytes, arena);
+  const auto& segment = info.segments.front();
+  ASSERT_GT(segment.live_gen, 0u);
+  auto name = Postings::getLiveDocsFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch),
+                                            segment.live_gen, segment.live_epoch);
+  auto file = std::ranges::find(snapshot->files, name, &FileDescriptor::name);
+  ASSERT_NE(file, snapshot->files.end());
+  auto damaged = flip(dirOf(node, "main"), *file);
+  // Counting live rows reads the manifest, not the damaged file.
+  EXPECT_EQ(1, node.getCollection("main")->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(1u, node.getScrubber().scrub());
+  expectUnavailable(node, "main", damaged);
+  EXPECT_NO_THROW(node.getCollection("other"));
 }
 
 TEST_F(ChecksumVerifyTest, writerRecoveryPreservesSuspectFiles) {

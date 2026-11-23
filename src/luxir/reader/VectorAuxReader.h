@@ -510,7 +510,7 @@ public:
 
     // expectSynced=true: aux files were fsynced before the IndexInfo that
     // references them was published, same contract as segment files.
-    auto file = dir.openFile(fname, {.expectSynced = true});
+    auto file = dir.openFile(fname, {.expectSynced = true, .size = info.files[0].size});
     if (file == nullptr) {
       if (missingFileOK) {
         LOG_TRACE("VectorAuxReader::open: file {} missing for aux '{}', will retry",
@@ -521,7 +521,17 @@ public:
         std::format("Missing aux index file '{}' for aux '{}'", fname, info.name),
         std::make_error_code(std::errc::no_such_file_or_directory));
     }
+    return open(std::move(file), info);
+  }
 
+  /// Opens the reader over the entry's file, already open.
+  static std::shared_ptr<VectorAuxReader> open(std::shared_ptr<InputFile> file,
+                                               const luxir::api::AuxIndexInfo& info) {
+    if (info.files.size() != 1) {
+      throw std::runtime_error(std::format(
+        "VectorAuxReader: expected 1 file, got {} for aux '{}'",
+        info.files.size(), info.name));
+    }
     VectorAuxMeta meta = VectorAuxMeta::fromBytes(std::string_view((const char*)info.opaque_meta.data(), info.opaque_meta.size()), info.name);
 
     // Residency rule: index data must NOT be force-resident.  IVF/IVF+PQ list

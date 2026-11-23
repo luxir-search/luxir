@@ -424,6 +424,50 @@ TEST_F(StorageExampleTest, failedFirstUseIsRetried) {
   EXPECT_EQ(2, core.ownership("items_nested")->childCount());
 }
 
+// A snapshot open opens the live docs file without reading it and counts
+// live rows from the manifest; the first use decodes the bitmap.
+TEST_F(StorageExampleTest, liveDocsDecodeOnFirstUse) {
+  LuxirConfig config;
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "a", "c_s", "x"), flatdoc("id", "b", "c_s", "x"),
+                          flatdoc("id", "c", "c_s", "x")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(h.deleteById("b", UpdateMessage::COMMIT).success);
+  auto writer = h.getIndexWriter();
+  auto info = readDurableIndexInfo(writer->dir);
+  ASSERT_EQ(1u, info->segments.size());
+  const auto& segment = info->segments.front();
+  auto liveName = Postings::getLiveDocsFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch),
+                                                segment.live_gen, segment.live_epoch);
+  auto snapshot = *writer->snapshots.snapshot();
+  snapshot.openCores.clear();
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
+  auto reader = std::make_shared<IndexReader>(dir, snapshot);
+  const auto& leaf = reader->segments().front();
+  EXPECT_EQ(2, reader->liveDocs());
+  EXPECT_EQ(2, leaf.numLive());
+  EXPECT_TRUE(leaf.hasDeletes());
+  EXPECT_EQ(0u, counters->fileStats(liveName).acquires);
+  EXPECT_EQ(0u, counters->fileStats(liveName).sizeRequests);
+
+  // A failed read fails the request; the next one decodes the bitmap.
+  auto search = [&] {
+    auto req = localReq(h.getSearchEngine());
+    req->topDocs().matchQuery("c_s", "x").countLimit(-1);
+    req->execute(reader);
+    return req;
+  };
+  counters->failNextRounds(1);
+  EXPECT_FALSE(search()->ok());
+  auto req = search();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(2, req->getMatchCount());
+  EXPECT_EQ(1u, counters->fileStats(liveName).acquires);
+  ASSERT_TRUE(leaf.liveDocs());
+  EXPECT_EQ(2, leaf.liveDocs()->numLive());
+}
+
 TEST_F(StorageExampleTest, strictRejectsInvalidWholeFileMode) {
   LuxirConfig config;
   config.store.backend = "ram";
