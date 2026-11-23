@@ -136,6 +136,7 @@ private:
   std::map<std::string, std::map<std::string, std::shared_ptr<Collection>>, std::less<>> listing;
 
   std::shared_ptr<Collection> makeCollection(const CollectionId& id, std::shared_ptr<Directory> directory);
+  std::shared_ptr<Schema> newCollectionSchema(const api::SchemaDef* requested) const;
   void openOne(Opened& row, Role role, const std::shared_ptr<Collection>& expected = {});
   std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<TenantCatalog::Entry>& selected);
   std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {}, bool startup = false,

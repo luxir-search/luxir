@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <format>
 #include <functional>
 #include <memory>
 #include <memory_resource>
@@ -39,6 +40,7 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/SourceReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/StoredFieldsReader.h"
@@ -49,6 +51,7 @@
 #include "luxir/search/ValueOutput.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/NumericUtils.h"
+#include "luxir/util/log.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/Signal.h"
@@ -331,6 +334,52 @@ inline void loadStrCol(SearchRequest& req, IndexReader& reader, IndexReader::Fie
   uint8_t* present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
                                        starget, mtarget, pendingCols, mr);
   loadStrColWithTargets(req, reader, infos, fieldType, starget, mtarget, present, segDocs, runs, loaders, mr, flags);
+}
+
+// The _source pseudo-field: each document as it was submitted, from the
+// segment's source store. A string column holding raw JSON text (the JSON
+// response splices it in unquoted); docs without a stored source stay missing,
+// or fail the request when it requires every hit's source (an export).
+inline void loadSource(SearchRequest& req, IndexReader& reader, std::span<const segdoc> segDocs, SegmentRuns runs,
+                       luxir::api::Column& fieldCol, FieldLoaders* loaders, PendingCols& pendingCols,
+                       std::pmr::memory_resource& mr)
+{
+  auto columnSize = segDocs.size();
+  if (columnSize == 0) return;
+  std::span<std::string_view> starget;
+  std::span<luxir::api::ArrStr> mtarget;
+  uint8_t* present = allocStringColumn(fieldCol, columnSize, false, starget, mtarget, pendingCols, mr);
+  addFieldLoader(loaders, runs, [&req, &reader, segDocs, starget, present, &mr](std::span<RowIndex> idxSpan) {
+    const auto& segment = reader.segments()[segDocs[idxSpan[0]].segment()];
+    auto* source = segment.source();
+    auto missing = [&](RowIndex idx, const char* why) {
+      if (!req.requireSource) return;
+      throw RequestError(std::format("document {} of segment {} has {} stored source; source=true needs every "
+                                     "hit stored (fetch _source without it to get null for such documents)",
+                                     segDocs[idx].docId(), segment.segInfo.seg_id, why), "missing_source");
+    };
+    if (!source) {
+      missing(idxSpan[0], "no");
+      return;
+    }
+    SourceReader::Cursor cursor;
+    source::Record record;
+    std::string json;
+    // idxSpan is in doc order, so consecutive docs share a decompressed block.
+    for (RowIndex idx : idxSpan) {
+      auto status = source->fetch(segDocs[idx].docId(), cursor, record);
+      if (status != SourceReader::Status::OK) {
+        missing(idx, status == SourceReader::Status::NONE ? "no" : "an unreadable");
+        continue;
+      }
+      if (!SourceReader::renderJson(record, json)) {
+        missing(idx, "an undecodable");
+        continue;
+      }
+      starget[idx] = build::arenaStr(mr, json);
+      present[idx] = 1;
+    }
+  });
 }
 
 // Per-type policies for emitting numeric columns.  INT columns hold the
@@ -708,6 +757,44 @@ inline void storeValuesInReq(const StoredReq& r, size_t slot, std::span<const st
   }
 }
 
+inline bool hasStoredValue(const StoredReq& r, size_t slot) {
+  if (r.multi) return !r.mtarget[slot].v.empty();
+  return r.present ? r.present[slot] != 0 : r.starget[slot].data() != nullptr;
+}
+
+// Source-backed fields a doc's stored fields lack: its _source_ record holds
+// them when it holds its field values at all (source::holdsFieldValues), and
+// they are read back out of it as ingest stored them.  A doc whose record does
+// not hold them had them stored, so it has none.
+inline void loadSourceBackedValues(SourceReader* source, std::span<const StoredReq* const> reqs,
+                                   std::span<RowIndex> idxSpan, std::span<const segdoc> segDocs,
+                                   std::pmr::memory_resource& mr) {
+  if (!source) return;
+  SourceReader::Cursor cursor;
+  SourceReader::Fields fields;
+  source::Record record;
+  for (RowIndex idx : idxSpan) {
+    bool parsed = false;
+    for (auto* r : reqs) {
+      if (hasStoredValue(*r, idx)) continue;
+      if (!parsed) {
+        // idxSpan is in doc order, so consecutive docs share a decompressed block.
+        auto status = source->fetch(segDocs[idx].docId(), cursor, record);
+        if (status == SourceReader::Status::UNREADABLE) {
+          LOG_WARN("stored field {} of doc {} lives in source {}, which cannot be read", r->fieldName,
+                   segDocs[idx].docId(), source->name());
+        }
+        if (status != SourceReader::Status::OK) break;
+        if (!fields.parse(record)) break;
+        parsed = true;
+      }
+      fields.values(r->fieldName, [&](std::span<const std::string_view> values) {
+        storeValuesInReq(*r, idx, values, mr);
+      });
+    }
+  }
+}
+
 // Dispatch stored-fields retrieval for all fields that share one
 // resource.  Each segment run launches a single task that opens one
 // StoredFieldsReader and decodes every field in the group from the
@@ -757,6 +844,11 @@ inline void loadStoredFields(SearchRequest& req, IndexReader& reader, IndexReade
     }
 
     if (sfrReqs.empty()) return;
+    // Fields this segment may have left to the docs' source (FieldDef.stored_copy).
+    std::vector<const StoredReq*> sourceReqs;
+    for (auto* r : sfrReqs) {
+      if (sfr->sourceBacked(sfr->fieldId(r->fieldName))) sourceReqs.push_back(r);
+    }
 
     if (sfrReqs.size() == 1) {
       // Single-field fast path: readFieldById skips other stored
@@ -785,6 +877,9 @@ inline void loadStoredFields(SearchRequest& req, IndexReader& reader, IndexReade
           }
         });
       }
+    }
+    if (!sourceReqs.empty()) {
+      loadSourceBackedValues(reader.segments()[segNum].source(), sourceReqs, idxSpan, segDocs, mr);
     }
   });
 }
@@ -855,7 +950,8 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 // retains the request spelling; physicalName + fieldType identify the source.
 // fieldType is resolved from the request schema at selector resolution, so explicit-name
 // errors surface before any batch is assembled and the emit loop does no
-// per-batch schema lookups; kind selects the physical, synthetic, or extra source.
+// per-batch schema lookups; kind selects the physical, score, version, extra, or _source
+// (the document as submitted, as raw JSON) source.
 // discovered: from an empty or wildcard selector (COLUMNS leaves such a column
 // out of a batch where it has no value).  infos and storedInfos are bound with the
 // first rows (see resolveReturnFieldMetadata), so a count-only response never
@@ -874,7 +970,7 @@ struct ExtraColumn {
 struct MappedReturnFields;
 
 struct ReturnField {
-  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA, MAPPED };
+  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA, MAPPED, SOURCE };
 
   std::string_view outputKey;
   std::string_view physicalName;
@@ -991,7 +1087,10 @@ inline size_t missingSlotBytes(const luxir::api::Column& col) {
 // Settle one batch's placement after finishPendingCols.  columnFields[i] is
 // the ReturnField behind response column i and columnPresent[i] its slot
 // tracker (null when untracked, see forEachPresent); later columns (_score_)
-// always stay.  ROWS moves every column to docs.  COLUMNS leaves out a
+// always stay.  ROWS moves every column to docs, _source included, so a
+// document without a stored source has no _source key in its row.  Under
+// ADAPTIVE and COLUMNS a requested _source is never dropped or moved: it stays
+// a column and a missing one renders as null.  COLUMNS leaves out a
 // discovered column with no present value; a named one is always present.
 // ADAPTIVE leaves out every column with no present value and moves a column
 // to docs when its missing slots cost more than per-document entries for its
@@ -1020,6 +1119,9 @@ inline void placeBatchColumns(luxir::api::DocFormat placement,
     const ReturnField& rf = *columnFields[i];
     if (placement == luxir::api::DocFormat::ROWS) {
       fate[i] = MOVE;
+    } else if (rf.kind == ReturnField::Kind::SOURCE) {
+      // A requested _source stays a column under ADAPTIVE and COLUMNS, so a
+      // missing one renders as null; only ROWS moves it into docs with the rest.
     } else if (placement == luxir::api::DocFormat::ADAPTIVE || rf.discovered) {
       size_t p = 0;
       forEachPresent(arr[i].second, columnPresent[i], [&p](size_t) { p++; });
@@ -1204,6 +1306,10 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
         continue;
       case ReturnField::Kind::VERSION:
         loadVersionRuns(req, sourceReader, sourceDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+        registerColumn();
+        continue;
+      case ReturnField::Kind::SOURCE:
+        loadSource(req, sourceReader, sourceDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
         registerColumn();
         continue;
       case ReturnField::Kind::EXTRA: {
@@ -1673,6 +1779,17 @@ inline void appendReturnFields(SearchRequest& req, IndexReader& reader,
     }
     if (f == "_score_") {
       picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
+      return;
+    }
+    if (f == "_source") {
+      // Segments written while the store was on keep serving it after it is turned off.
+      bool stored = req.schema->source.enabled || std::ranges::any_of(reader.segments(),
+          [](const Segment& segment) { return segment.source() != nullptr; });
+      if (!stored) {
+        throw RequestError("_source is not stored: declare the _source_ stored resource in the collection's schema",
+                           "invalid_field");
+      }
+      picked.push_back({f, {}, nullptr, ReturnField::Kind::SOURCE, false});
       return;
     }
     if (f.starts_with('/') || f.starts_with("..")) { pushMapped(f); return; }

@@ -423,6 +423,7 @@ publication advances the schema generation.
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | `false`, `true`, `"set"`, or `"array"`; see [Multi-valued modes](#multi-valued-modes) |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
+| `stored_copy` | with `_source_` on, keep a TEXT/STRING field's stored copy instead of serving it from each document's source; default `false`; see [The `_source_` resource](#the-_source_-resource-experimental) |
 | `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_`; see [Stored resources](#stored-resources) |
 | `analyzer` | `text` only: `{"char_filters": [...], "tokenizer": <component>, "filters": [...]}`, or the name of a registered analyzer such as `"english"`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
@@ -502,7 +503,7 @@ newly indexed data; reindex original values to convert existing documents.
 Stored values are grouped by `stored_resource`, and each group is compressed
 in chunks of whole documents. The top-level `stored_resources` map declares
 the groups; the default `_stored_` always exists, and without an entry it uses
-LZ4 with 16KB chunks of at most 128 documents. A field may name only `_stored_`
+zstd with a trained dictionary and 16KB chunks of at most 128 documents. A field may name only `_stored_`
 or a declared group, and a group name starts and ends with `_` (for example
 `_stored_logs_`), so it never collides with a field or template name.
 
@@ -512,19 +513,19 @@ POST /collections/logs/_schema
 {
   "fields": {"message": {"type": "text", "stored_resource": "_stored_logs_"}},
   "stored_resources": {
-    "_stored_logs_": {"codec": "zstd"}
+    "_stored_logs_": {"chunk_size_bytes": 65536, "max_docs_per_chunk": 1024}
   }
 }
 ```
 
 | Key | Meaning |
 |---|---|
-| `codec` | `lz4` (default): fast to write and read. `zstd`: much smaller for repetitive text such as logs, at more CPU per chunk |
+| `codec` | `zstd` (default): with its dictionary, about 40% smaller than `lz4` on text. `lz4`: about 4 times faster to decompress a chunk, at about 1.7 times the bytes |
 | `zstd_level` | `zstd` only: 1 (fastest) to 22 (smallest); default 3 |
-| `chunk_size_bytes` | target uncompressed bytes per chunk, 1024 to 4194304; default 16384, or 65536 with `zstd` |
-| `max_docs_per_chunk` | most documents per chunk, 1 to 65536; default 128, or 1024 with `zstd` |
-| `zstd_dictionary` | `zstd` only: enable one dictionary per resource, shared by its segments; trained by a merge |
-| `zstd_dictionary_bytes` | dictionary capacity upper bound, 1024 to 262144; default 65536. Requires `zstd_dictionary` |
+| `chunk_size_bytes` | target uncompressed bytes per chunk, 1024 to 4194304; default 16384 |
+| `max_docs_per_chunk` | most documents per chunk, 1 to 65536; default 128 |
+| `zstd_dictionary` | `zstd` only: one dictionary per resource, shared by its segments and trained by a merge; default `true`, `false` turns it off |
+| `zstd_dictionary_bytes` | dictionary capacity upper bound, 1024 to 262144; default 65536. Requires the dictionary |
 
 Larger chunks compress better, but returning one stored document decompresses
 its whole chunk. Chunks are compressed as documents are indexed, so the codec
@@ -541,13 +542,14 @@ entries and keeps the others.
 A dictionary holds text shared by documents of a resource, such as common
 values and log templates, so chunks can refer to it. That matters most for
 small chunks, which compress poorly on their own.
-For retrieval-heavy workloads (many single-document fetches), prefer small
-chunks plus a dictionary over large chunks:
+Small chunks with a dictionary compress about as well as 64KB chunks without
+one (on 2KB article documents, 733 against 778 bytes per document) at a third
+of the cost of decompressing a chunk, which is why they are the default. For
+retrieval-heavy workloads (many single-document fetches), go smaller still:
 
 ```json
 "stored_resources": {
-  "_stored_": {"codec": "zstd", "zstd_dictionary": true,
-               "chunk_size_bytes": 4096, "max_docs_per_chunk": 32}
+  "_stored_": {"chunk_size_bytes": 4096, "max_docs_per_chunk": 32}
 }
 ```
 
@@ -561,6 +563,57 @@ There is no automatic retraining. Changing `zstd_dictionary`,
 `zstd_dictionary_bytes` or the codec clears the current dictionary so a later
 merge can train another. After a restart, the dictionary from the largest
 live segment carrying one is used.
+
+### The `_source_` resource (experimental)
+
+The reserved stored resource `_source_` keeps every document exactly as
+submitted, in files apart from the index (the `separated` layout); see
+[Documents](documents.md#keeping-documents-as-submitted-_source). Declaring it
+turns the store on for documents indexed from then on. No field may name it as
+its `stored_resource`, and only `_source_` may use the separated layout in this
+release. Every key is optional.
+
+```json
+"stored_resources": {
+  "_source_": {"codec": "zstd", "excludes": ["password_s"]}
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `enabled` | `false` keeps the entry but stops storing sources for new documents. **It also deletes existing sources: the next merge of a segment drops that segment's sources and their files for good, and switching the store on again does not bring them back.** Absent means `true` |
+| `layout` | `separated`, the only layout `_source_` takes (absent selects it) |
+| `codec` | `zstd` (default) or `lz4` |
+| `zstd_level` | `zstd` only: 1 to 22; default 3 |
+| `chunk_size_bytes` | target uncompressed bytes per block, 1024 to 4194304; default 16384. One document larger than this gets a block of its own |
+| `max_docs_per_chunk` | most documents per block, 1 to 65536; absent lets the bytes alone close a block |
+| `min_live_ratio` | a merge keeps referencing a source file while at least this fraction of its documents is live, and rewrites the live ones otherwise; above 0 up to 1, default 0.5 |
+| `min_file_bytes` | a merge also rewrites a source file smaller than this so small files fold together; default 4194304 |
+| `max_files` | a merged segment references at most this many source files plus the one it writes (more only when a file it would rewrite cannot be read and is kept as it is); files holding less than `1/max_files` of its live source bytes are rewritten together; default 32 |
+| `includes` | keep only these paths of each document's source; see [Documents](documents.md#keeping-only-part-of-the-source) |
+| `excludes` | keep all but these paths; at most one of `includes` and `excludes` |
+
+| `zstd_dictionary` | `zstd` only: one dictionary for the store, trained by the first merge holding enough source and used by every file written after it; default `true` |
+| `zstd_dictionary_bytes` | dictionary capacity upper bound, 1024 to 262144; default 65536 |
+
+With `_source_` on, a stored TEXT or STRING field is not written to stored
+fields a second time: a fetch reads its value out of the document's source,
+which holds it under the field's name. A document whose source cannot give the
+value back (the source was narrowed by `includes`/`excludes`, or the request
+renamed keys with `field_map`) stores it as before. This halves the bytes of
+text-heavy documents. Set `"stored_copy": true` on a field to keep the stored
+copy as well, for faster fetches of that field at the cost of the bytes; set
+`"stored": false` to keep neither copy. Turning `_source_` off moves the values
+back into stored fields as merges drop the sources, so stored fields stay
+retrievable. To keep neither the source nor stored values, turn `_source_` off
+and set `"stored": false` on the fields.
+
+`mode=set` adds or
+replaces the entry like any other resource. `mode=replace_all` keeps the current
+`_source_` entry unless the replacement names it, because dropping it would make
+the next merges discard every stored source; turn the store off explicitly with
+`"_source_": {"enabled": false}`. The store is experimental: the file format is
+meant to freeze, but carries no compatibility promise yet.
 
 ## Text analysis
 
@@ -782,7 +835,7 @@ Physical names are limited to 127 bytes. With variants, a template's maximum
 instance name length is `127 - 2 - longest label length`. The `__self`
 selector is not a physical name and does not consume that budget.
 
-`multi`, `stored`, and `stored_resource` belong to the logical field. A variant
+`multi`, `stored`, `stored_copy`, and `stored_resource` belong to the logical field. A variant
 may not set them or declare nested `variants` or `defaults`. There is one stored
 source on the primary when storage is enabled. Neither `id` nor `_version_`
 may have variants, including inherited ones, and a variant cannot have type `id`.

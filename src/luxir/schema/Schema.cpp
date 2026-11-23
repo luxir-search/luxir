@@ -76,6 +76,8 @@ struct ResolvedOwnership {
   api::FieldDef::MultiMode multi = api::FieldDef::MultiMode::SINGLE;
   bool hasStored = false;
   bool stored = false;
+  bool hasStoredCopy = false;
+  bool storedCopy = false;
   // storedResource: empty string means "inherit from parent or use the
   // default".  hasStoredResource tracks whether any field in the chain set
   // it explicitly (even to a value that equals the default).
@@ -421,6 +423,14 @@ static void resolveOwnership(std::string_view name, const sv_entry_map& defMap,
     r.stored = parentResolved.stored;
   }
 
+  if (def.stored_copy.has_value()) {
+    r.hasStoredCopy = true;
+    r.storedCopy = *def.stored_copy;
+  } else {
+    r.hasStoredCopy = parentResolved.hasStoredCopy;
+    r.storedCopy = parentResolved.storedCopy;
+  }
+
   // stored_resource
   if (def.stored_resource && !def.stored_resource->empty()) {
     r.hasStoredResource = true;
@@ -442,7 +452,7 @@ static void resolveOwnership(std::string_view name, const sv_entry_map& defMap,
 static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r) {
   const auto& def = entry.def;
   std::string name(entry.name);
-  if (r.type == FieldClass::NESTED && (def.index || def.column || def.multi || def.stored
+  if (r.type == FieldClass::NESTED && (def.index || def.column || def.multi || def.stored || def.stored_copy
       || def.stored_resource || def.variants || def.defaults || def.analyzer || def.normalizer
       || def.long_terms || def.unit || def.scale || def.dims || def.truncate_dims || def.metric
       || def.normalized || def.normalize_on_write || def.ann || def.ignore_malformed || def.ignore_z_value)) {
@@ -505,7 +515,7 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
       }
       if (logical.hasMulti && logical.multi != api::FieldDef::MultiMode::SINGLE) throw SchemaError("reserved field '_version_' cannot be multi-valued");
       if ((r.hasColumn && r.column) || (r.hasIndex && r.index != IndexMode::NONE)
-          || logical.stored || logical.hasStoredResource || r.analyzer || r.normalizer
+          || logical.stored || logical.hasStoredCopy || logical.hasStoredResource || r.analyzer || r.normalizer
           || r.longTerms || logical.defaults) {
         throw SchemaError("reserved field '_version_' is retrieval-only and cannot be configured");
       }
@@ -547,7 +557,7 @@ struct FieldCompiler {
     }
 
     if (r.type == FieldClass::NESTED) {
-      if (r.hasIndex || r.hasColumn || logical.hasMulti || logical.hasStored
+      if (r.hasIndex || r.hasColumn || logical.hasMulti || logical.hasStored || logical.hasStoredCopy
           || logical.hasStoredResource || logical.variants || logical.defaults
           || r.analyzer || r.normalizer || r.longTerms || r.scale || r.dateUnit
           || r.hasVectorDims || r.vectorTruncateDims || r.hasVectorMetric
@@ -807,6 +817,7 @@ struct FieldCompiler {
     if (r.isTemplate) ft->flags_ |= FieldType::ABSTRACT;
     // Apply any resolved storedResource_ override; empty means "keep default".
     if (!derived && !logical.storedResource.empty()) ft->storedResource_ = logical.storedResource;
+    if (!derived) ft->storedCopy_ = logical.storedCopy;
     return ft;
   }
 };
@@ -868,7 +879,15 @@ static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name
   if (name.size() < 3 || name.back() != '_' || !Schema::validTemplateName(name)) {
     fail("invalid stored resource name: '_', ASCII letters, digits, or underscores, and a closing '_'");
   }
-  StoredCodec codec = def.codec.value_or(StoredCodec::LZ4);
+  if (def.layout.value_or(api::StoredResourceDef_::Layout::INLINE) != api::StoredResourceDef_::Layout::INLINE) {
+    fail("the separated layout is only available to " + std::string(Postings::SOURCE_RESOURCE) + " in this release");
+  }
+  if (def.enabled || def.min_live_ratio || def.min_file_bytes || def.max_files || !def.includes.empty() ||
+      !def.excludes.empty()) {
+    fail("enabled, min_live_ratio, min_file_bytes, max_files, includes and excludes apply only to " +
+         std::string(Postings::SOURCE_RESOURCE));
+  }
+  StoredCodec codec = def.codec.value_or(StoredCodec::ZSTD);
   if (codec != StoredCodec::LZ4 && codec != StoredCodec::ZSTD) {
     fail("unknown codec value " + std::to_string((int)codec) + "; valid: lz4, zstd");
   }
@@ -891,18 +910,84 @@ static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name
     }
     format.maxDocsPerChunk = (uint32_t)*def.max_docs_per_chunk;
   }
-  if (def.zstd_dictionary.value_or(false)) {
-    if (codec != StoredCodec::ZSTD) fail("zstd_dictionary requires codec zstd");
-    format.dictionaryBytes = StoredChunkFormat::DEFAULT_DICTIONARY_BYTES;
+  // zstd trains a dictionary unless the entry turns it off.
+  if (def.zstd_dictionary) {
+    if (*def.zstd_dictionary && codec != StoredCodec::ZSTD) fail("zstd_dictionary requires codec zstd");
+    if (!*def.zstd_dictionary) format.dictionaryBytes = 0;
   }
   if (def.zstd_dictionary_bytes) {
-    if (!format.dictionaryBytes) fail("zstd_dictionary_bytes requires zstd_dictionary: true");
+    if (!format.dictionaryBytes) fail("zstd_dictionary_bytes requires codec zstd with zstd_dictionary on");
     if (*def.zstd_dictionary_bytes < 1024 || *def.zstd_dictionary_bytes > 262144) {
       fail("zstd_dictionary_bytes must be 1024 to 262144");
     }
     format.dictionaryBytes = (uint32_t)*def.zstd_dictionary_bytes;
   }
   return std::make_shared<StoredFieldType>(name, format);
+}
+
+// The "_source_" entry: the separated layout with the source format's codecs.
+SourceSettings SourceSettings::resolve(const api::StoredResourceDef& def) {
+  auto fail = [](const std::string& msg) {
+    throw SchemaError(msg + " (stored resource: " + std::string(Postings::SOURCE_RESOURCE) + ")");
+  };
+  SourceSettings out;
+  out.enabled = def.enabled.value_or(true);
+  if (def.layout.value_or(api::StoredResourceDef_::Layout::SEPARATED) != api::StoredResourceDef_::Layout::SEPARATED) {
+    fail("layout must be separated");
+  }
+  StoredCodec codec = def.codec.value_or(StoredCodec::ZSTD);
+  switch (codec) {
+    case StoredCodec::ZSTD: out.codec = source::Codec::ZSTD; break;
+    case StoredCodec::LZ4: out.codec = source::Codec::LZ4; break;
+    default: fail("unknown codec value " + std::to_string((int)codec) + "; valid: lz4, zstd");
+  }
+  if (def.zstd_level) {
+    if (codec != StoredCodec::ZSTD) fail("zstd_level requires codec zstd");
+    if (*def.zstd_level < 1 || *def.zstd_level > 22) fail("zstd_level must be 1 to 22");
+    out.zstdLevel = *def.zstd_level;
+  }
+  if (def.chunk_size_bytes) {
+    if (*def.chunk_size_bytes < 1024 || *def.chunk_size_bytes > 4 * 1024 * 1024) {
+      fail("chunk_size_bytes must be 1024 to 4194304");
+    }
+    out.blockBytes = (uint32_t)*def.chunk_size_bytes;
+  }
+  if (def.max_docs_per_chunk) {
+    if (*def.max_docs_per_chunk < 1 || *def.max_docs_per_chunk > 65536) {
+      fail("max_docs_per_chunk must be 1 to 65536");
+    }
+    out.maxDocsPerBlock = (uint32_t)*def.max_docs_per_chunk;
+  }
+  if (codec != StoredCodec::ZSTD) out.dictionaryBytes = 0;
+  if (def.zstd_dictionary) {
+    if (*def.zstd_dictionary && codec != StoredCodec::ZSTD) fail("zstd_dictionary requires codec zstd");
+    if (!*def.zstd_dictionary) out.dictionaryBytes = 0;
+  }
+  if (def.zstd_dictionary_bytes) {
+    if (!out.dictionaryBytes) fail("zstd_dictionary_bytes requires codec zstd with zstd_dictionary on");
+    if (*def.zstd_dictionary_bytes < 1024 || *def.zstd_dictionary_bytes > 262144) {
+      fail("zstd_dictionary_bytes must be 1024 to 262144");
+    }
+    out.dictionaryBytes = (uint32_t)*def.zstd_dictionary_bytes;
+  }
+  if (def.min_live_ratio) {
+    if (!(*def.min_live_ratio > 0.0 && *def.min_live_ratio <= 1.0)) fail("min_live_ratio must be above 0 and at most 1");
+    out.minLiveRatio = *def.min_live_ratio;
+  }
+  if (def.min_file_bytes) {
+    if (*def.min_file_bytes < 0) fail("min_file_bytes must not be negative");
+    out.minFileBytes = (uint64_t)*def.min_file_bytes;
+  }
+  if (def.max_files) {
+    if (*def.max_files < 1) fail("max_files must be at least 1");
+    out.maxFiles = (uint32_t)*def.max_files;
+  }
+  try {
+    out.filter = source::SourceFilter(def.includes, def.excludes);
+  } catch (const std::invalid_argument& e) {
+    fail(e.what());
+  }
+  return out;
 }
 
 std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, const Schema* base) {
@@ -955,6 +1040,12 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
     resources.push_back({name, rd});
   }
   std::ranges::sort(resources, {}, &ResourcePair::first);
+
+  // The document source store is a reserved resource with its own layout; it is
+  // resolved here and never registered as a stored-fields type.
+  for (const auto& [name, rd] : resources) {
+    if (name == Postings::SOURCE_RESOURCE) schema->source = SourceSettings::resolve(rd);
+  }
 
   // Materialize the reserved fields when absent: a REPLACE_ALL that omits them gets
   // working defaults instead of a silently broken collection.
@@ -1057,6 +1148,10 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
   // separate resource with default settings.
   for (const auto& e : entries) {
     const auto& name = ownership.at(e.name).storedResource;
+    if (name == Postings::SOURCE_RESOURCE) {
+      throw SchemaError("stored_resource '" + name + "' is the document source store and holds no fields (field: " +
+                        std::string(e.name) + ")");
+    }
     if (!name.empty() && name != Postings::STORED_DEFAULT_RESOURCE
         && !std::ranges::binary_search(resources, std::string_view(name), {}, &ResourcePair::first)) {
       throw SchemaError("stored_resource '" + name + "' is not declared in stored_resources (field: " +
@@ -1134,7 +1229,15 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
 
   // Stored-fields resources share the field registry (a segment registers
   // each under its own name), so they cannot reuse a field or template name.
+  // The source store is not a stored-fields type (its settings were resolved
+  // above), but its name is reserved all the same.
   for (const auto& [name, rd] : resources) {
+    if (name == Postings::SOURCE_RESOURCE) {
+      if (schema->fieldTypeMap.contains(std::string(name))) {
+        throw SchemaError("stored resource '" + std::string(name) + "' collides with a field or template name");
+      }
+      continue;
+    }
     auto type = storedResourceType(name, rd);
     if (!schema->fieldTypeMap.emplace(std::string(name), std::move(type)).second) {
       throw SchemaError("stored resource '" + std::string(name) + "' collides with a field or template name");

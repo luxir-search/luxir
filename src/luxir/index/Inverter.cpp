@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "Inverter.h"
+#include "StoredValues.h"
 #include "NestedInversion.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <boost/sort/spreadsort/string_sort.hpp>
 #include "luxir/schema/Schema.h"
 #include "luxir/schema/GeoPointCoerce.h"
@@ -141,6 +143,12 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
       input->branches.push_back({label, handler});
     }
   };
+  // A root document's source record holds its top-level keys; nested rows have
+  // no record of their own, so their fields keep a stored copy.
+  auto type = fieldType->type();
+  input->sourceBacked = writer && space == SpaceOrdinal::ROOT && schema->source.enabled && !fieldType->storedCopy_ &&
+                        (type == FieldType::Type::TEXT || type == FieldType::Type::STRING);
+  if (input->sourceBacked) writer->markSourceBacked(resolved.logicalName);
   addBranch("self", resolved.physicalName, fieldType);
   if (resolved.owner) {
     for (const auto& [label, type] : resolved.owner->variants) {
@@ -247,41 +255,11 @@ void Inverter::InputHandler::checkShape(const IndexVal& val) const {
 }
 
 void Inverter::InputHandler::store(Inverter& inverter, const IndexVal& val) {
+  // The document's source holds this value as indexed: a fetch reads it there.
+  if (sourceBacked && inverter.sourceHoldsFields_) return;
   int32_t doc = inverter.getDoc();
   std::string_view name(fieldName);
-  if (std::holds_alternative<std::string_view>(val.kind)) {
-    writer->addValue(doc, name, std::get<std::string_view>(val.kind));
-  } else if (std::holds_alternative<::hpp_proto::bytes_view>(val.kind)) {
-    const auto& b = std::get<::hpp_proto::bytes_view>(val.kind);
-    writer->addValue(doc, name, std::string_view((const char*)b.data(), b.size()));
-  } else if (std::holds_alternative<luxir::api::ArrStr>(val.kind)) {
-    const auto& arr = std::get<luxir::api::ArrStr>(val.kind).v;
-    writer->addValues(doc, name, std::span<const std::string_view>(arr.data(), arr.size()));
-  } else if (std::holds_alternative<luxir::api::ArrBin>(val.kind)) {
-    const auto& arr = std::get<luxir::api::ArrBin>(val.kind).v;
-    std::vector<std::string_view> views;
-    views.reserve(arr.size());
-    for (const auto& bin : arr) {
-      views.push_back(std::string_view((const char*)bin.data(), bin.size()));
-    }
-    writer->addValues(doc, name, std::span<const std::string_view>(views.data(), views.size()));
-  } else if (coerce::isNull(val)) {
-    // no value: nothing stored
-  } else if (coerce::isArray(val)) {
-    // numeric / mixed arrays: store each element's canonical rendering
-    // (materialized - buf is per-element transient)
-    char buf[coerce::TEXT_BUF_SIZE];
-    std::vector<std::string> storage;
-    coerce::forEachElement(val, [&](const IndexVal& elem) {
-      storage.emplace_back(coerce::toText(elem, name, buf));
-    });
-    std::vector<std::string_view> views(storage.begin(), storage.end());
-    writer->addValues(doc, name, std::span<const std::string_view>(views.data(), views.size()));
-  } else {
-    // Numeric / bool scalars: store canonical text before normalization.
-    char buf[coerce::TEXT_BUF_SIZE];
-    writer->addValue(doc, name, coerce::toText(val, name, buf));
-  }
+  storedValues(val, name, [&](std::span<const std::string_view> values) { writer->addValues(doc, name, values); });
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, const IndexVal& val) {
@@ -421,7 +399,63 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
     liveDocs = getMaxDoc();
   }
 
-  return getPostingsWriter().finish(filenames, descriptors);
+  bool written = getPostingsWriter().finish(filenames, descriptors);
+  if (written && sourceWriter_) flushSource(filenames, descriptors);
+  return written;
+}
+
+void Inverter::addSource(std::string_view id, std::string_view body, uint64_t version, uint8_t flags) {
+  if (!schema->source.enabled) return;
+  sourceHoldsFields_ = source::holdsFieldValues(flags);
+  if (!sourceWriter_) {
+    auto format = schema->source.dictionaryFormat();
+    auto dictionary = storedDictionaryProvider && format.dictionaryBytes
+        ? storedDictionaryProvider(Postings::SOURCE_RESOURCE, format) : nullptr;
+    sourceWriter_ = std::make_unique<SourceWriter>(
+        schema->source, Postings::getIndexFileNamePrefix(getSegId(), postingsWriter.creatorEpoch),
+        std::move(dictionary));
+  }
+  // Record i is doc i: docs started without a source before this one get placeholders.
+  // A second call for one doc, or a call before startDoc(), would shift every later
+  // record onto the wrong document, so it fails instead.
+  if (currDoc < 0) throw std::logic_error("Inverter::addSource called before startDoc");
+  sourceWriter_->padTo((uint32_t)currDoc);
+  if (sourceWriter_->docCount() != (uint32_t)currDoc) {
+    throw std::logic_error("Inverter::addSource: source record " + std::to_string(sourceWriter_->docCount()) +
+                           " would not be doc " + std::to_string(currDoc));
+  }
+  sourceWriter_->add(id, body, version, flags);
+  size_t ram = sourceWriter_->ramBytes();
+  addExtraRam((int64_t)ram - (int64_t)sourceRamAccounted_);
+  sourceRamAccounted_ = ram;
+}
+
+// Writes the source file holding this segment's documents and the map that
+// points the segment's doc IDs at it. Both are listed with the segment's files.
+void Inverter::flushSource(std::vector<std::string>* filenames, std::vector<FileDescriptor>* descriptors) {
+  if (!sourceSeq) throw std::logic_error("Inverter::sourceSeq must be set before a segment with sources is flushed");
+  auto& dir = postingsWriter.getDirectory();
+  int32_t docs = getMaxDoc();
+  sourceWriter_->padTo((uint32_t)docs);
+  std::string name = Postings::getSourceFileName(sourceSeq->fetch_add(1), postingsWriter.creatorEpoch);
+  std::string mapName = Postings::getSourceMapFileName(Postings::segmentKey(getSegId(), postingsWriter.creatorEpoch), 1);
+  FileDescriptor file;
+  try {
+    sourceWriter_->flush(dir, name, file);
+    SourceMap map;
+    map.addRun(0, docs, map.fileIndex({name, (uint32_t)docs, file.size}), 0);
+    map.write(dir, mapName, filenames, descriptors);
+  } catch (...) {
+    try { dir.deleteFile(name); } catch (...) {}
+    try { dir.deleteFile(mapName); } catch (...) {}
+    throw;
+  }
+  if (filenames) filenames->push_back(name);
+  if (descriptors) descriptors->push_back(file);
+  sourceGen = 1;
+  addExtraRam(-(int64_t)sourceRamAccounted_);
+  sourceRamAccounted_ = 0;
+  sourceWriter_.reset();
 }
 
 

@@ -31,6 +31,15 @@ StoredFieldsMetadata::StoredFieldsMetadata(PostingsReader& reader, const Decoded
     if (term.isNull()) invalid("stored fields: truncated member name");
     names.push_back(term);
   }
+  backed.assign(names.size(), false);
+  auto numBacked = input.tryVint();
+  if (!numBacked) invalid(numBacked.error());
+  for (uint64_t i = 0; i < *numBacked; i++) {
+    auto id = input.tryVint();
+    if (!id) invalid(id.error());
+    if (*id >= names.size()) invalid("stored fields: source-backed field id out of range");
+    backed[*id] = true;
+  }
   if (input.left() != 0) invalid("stored fields: trailing name bytes");
 }
 

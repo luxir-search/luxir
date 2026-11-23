@@ -6,8 +6,10 @@
 
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <string>
+#include <map>
 #include <mutex>
 #include <span>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -26,6 +28,7 @@
 #include "luxir/server/LuxirError.h"
 #include "luxir/util/DeadlineScheduler.h"
 #include "Inverter.h"
+#include "SourceMerge.h"
 #include "StoredDictionaryRegistry.h"
 #include "UpdateMessage.h"
 #include "VectorIndexBuilder.h"
@@ -59,6 +62,7 @@ public:
     int32_t mergeRows;         // largest physical row space, for merge sizing
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
+    uint64_t sourceGen = 0;  // generation of the segment's source map, or 0 if its documents keep no source.
     int64_t mergedLiveGen = -1;  // source generation covered by the merge
     int64_t mergeDiffLiveGen = -1; // generation pinned while loading a swap diff, protected by indexMutex
     uint32_t preparationPins = 0; // protected by indexMutex
@@ -101,6 +105,15 @@ public:
     std::vector<FileDescriptor> baseFiles;
     CatalogRange catalog;
     std::optional<FileDescriptor> liveFile;
+    // The files in `baseFiles` that are not under this segment's name prefix:
+    // files held by reference (today the source files, "v<seq>.<epoch>"), which a
+    // merge output inherits from its inputs instead of copying. Their lifetime
+    // follows the segments listing them, not a name: a committed one is retired
+    // when no segment of the next snapshot lists it (the commit's set
+    // difference), and one a never-committed segment held is retired when that
+    // segment dies without passing it on (unreferencedSharedFilesLocked). Set
+    // once, when the segment is flushed, loaded or merged, and never changed after.
+    std::vector<FileDescriptor> sharedFiles;
 
     // Segment-local aux overlays recorded in SegmentInfo.overlays.  Vector
     // ANN entries are carried by segment liveness; coreGen does not
@@ -348,6 +361,7 @@ public:
 
   // the last segId generated. Atomic since we don't grab any lock in the merge code to generate a new segment id.
   std::atomic_uint64_t lastSegId;
+  std::atomic_uint64_t nextSourceSeq{0};  // sequence number of the next source file ("v<seq>.<epoch>")
 
   CommitSnapshotRegistry& snapshots;
   CommitId openingCommit; // Captured before this writer becomes externally visible.
@@ -899,8 +913,18 @@ private:
   uint64_t applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
   bool mergeSegmentsBody(MergeMessage& msg);
+  std::once_flag dictionariesSeeded;
+  std::map<std::string, StoredDictionaryRegistry::Token, std::less<>> seedTokens;  // set at open, then read-only
+  void seedDictionariesOnce();
+  void seedSourceDictionary(const Schema& schema, IndexReader& reader);
+  void mergeSourceFiles(const std::vector<SegInfo*>& segs, SourceDocMap docMap,
+                        const Schema& schema, SegInfo& out, std::string& relocatedFile);
+  std::vector<std::string> unreferencedSharedFilesLocked(const std::vector<std::unique_ptr<SegInfo>>& dead);
 
 public:
+  // Recovers the dictionaries trained before the writer opened (once; every
+  // merge calls it first). Opening does not, so that it reads no segment data.
+  void seedDictionaries();
   /// THIS SECTION ONLY FOR TEST CODE!
 
 

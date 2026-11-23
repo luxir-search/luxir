@@ -26,11 +26,26 @@
 #include "luxir/util/Uuid.h"
 #include "luxir/util/thread.h"
 #include "SegmentMerger.h"
+#include "SourceMerge.h"
+#include "luxir/reader/SourceReader.h"
+#include "luxir/store/SourceFiles.h"
 #include "VectorIndexBuilder.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 
 
 namespace luxir {
+
+// The files a segment lists that are not under its own name prefix: held by
+// reference, so a merge output may list them too (see SegInfo::sharedFiles).
+static std::vector<FileDescriptor> sharedFilesOf(uint64_t segId, uint64_t creatorEpoch, const std::vector<FileDescriptor>& files) {
+  std::string prefix = Postings::getIndexFileNamePrefix(segId, creatorEpoch);
+  std::vector<FileDescriptor> out;
+  for (const auto& file : files) {
+    if (!file.name.starts_with(prefix)) out.push_back(file);
+  }
+  return out;
+}
+
 
 namespace {
 
@@ -175,6 +190,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     if (schema) throw std::invalid_argument("Initial schema supplied when reopening an index");
     incarnation = indexInfo.incarnation;
     lastSegId = indexInfo.last_seg_id;
+    nextSourceSeq = indexInfo.next_source_seq;
     lastCommitTime = indexInfo.commit_time;
     lastSnapshot.store(snapshots.resolve(manifest.bytes));
     snapshots.publish(lastSnapshot.load());
@@ -200,6 +216,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       auto& seg = *iter->second;
       seg.liveGen = seg.publishedLiveGen = seg.initialLiveGen = segment.live_gen;
       seg.liveEpoch = seg.initialLiveEpoch = segment.live_epoch;
+      seg.sourceGen = segment.source_gen;
       seg.minVersion = segment.min_version;
       seg.maxVersion = segment.max_version;
       seg.liveDocs = segment.live_docs;
@@ -213,6 +230,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
         else seg.baseFiles.push_back(std::move(descriptor));
       }
       seg.catalog = catalogRangeFromManifest(segment.catalog);
+      seg.sharedFiles = sharedFilesOf(seg.segId, seg.creatorEpoch, seg.baseFiles);
       seg.firstCommitTime = segment.commit_time;  // firstCommitTime is stored in the segment meta.
       seg.lastCommitTime = indexInfo.commit_time; // not stored in the segment meta, so use index meta.
       seg.nextOverlayGen = segment.next_overlay_gen;
@@ -241,35 +259,16 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   }
   snapshots.sweepOrphans(manifest, writerEpoch);
   storedDictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(*getSchema()));
-  // Only manifest-live segments can seed a resource. Own the winning bytes;
-  // later retirement of its segment must not affect inverter/merge writers.
+  // The policies the existing segments were written under: recovery (before
+  // the first merge, seedDictionaries) publishes through these tokens, so a
+  // policy change in between, which clears a dictionary, also voids them.
   for (const auto& [name, type] : getSchema()->fieldTypeMap) {
     auto* stored = dynamic_cast<const StoredFieldType*>(type.get());
-    if (!stored || !stored->format_.dictionaryBytes) continue;
-    std::string_view bestDictionary;
-    int64_t bestBytes = -1;
-    uint64_t bestSegId = 0;
-    for (const auto& [id, seg] : segInfos) {
-      auto readerCore = getSegmentCore(*seg);
-      for (const auto& space : readerCore->spaces()) {
-        auto* reader = readerCore->spaceReader(space.path);
-        const auto* field = reader->fieldInfo(name);
-        const auto* part = field ? field->stored() : nullptr;
-        if (!part || !part->dictionaryBytes) continue;
-        auto dictionary = std::string_view(readerCore->slice(part->dictionary()));
-        auto bytes = part->chunksBytes;
-        if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
-          bestBytes = bytes;
-          bestSegId = id;
-          bestDictionary = dictionary;
-        }
-      }
-    }
-    auto token = storedDictionaries.token(name, stored->format_);
-    if (!bestDictionary.empty() && token) {
-      storedDictionaries.publish(name, *token,
-          std::make_shared<const StoredDictionary>(std::string(bestDictionary)));
-    }
+    if (!stored) continue;
+    if (auto token = storedDictionaries.token(name, stored->format_)) seedTokens.emplace(name, *token);
+  }
+  if (auto token = storedDictionaries.token(Postings::SOURCE_RESOURCE, getSchema()->source.dictionaryFormat())) {
+    seedTokens.emplace(std::string(Postings::SOURCE_RESOURCE), *token);
   }
   {
     std::lock_guard<std::mutex> lock(indexMutex);
@@ -761,6 +760,7 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
         [this](std::string_view resource, const StoredChunkFormat& format) {
           return storedDictionaries.lookup(resource, format);
         });
+    newInverter->sourceSeq = &nextSourceSeq;
     inverter = newInverter.get();
     inverter->updateVersions(updateVersion);
     busyInverters.emplace(inverter, std::move(newInverter));
@@ -1489,9 +1489,11 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segInfo->baseFiles = std::move(descriptors);
     segInfo->catalog = catalog;
     segInfo->liveFile = std::move(liveFile);
+    segInfo->sharedFiles = sharedFilesOf(segInfo->segId, segInfo->creatorEpoch, segInfo->baseFiles);
     segInfo->minVersion = inverter.minVersion;
     segInfo->maxVersion = inverter.maxVersion;
     segInfo->schema = inverter.schema->binding;
+    segInfo->sourceGen = inverter.sourceGen;
     auto& postings = inverter.getPostingsWriter();
     if (auto& range = postings.idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
     segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
@@ -1950,21 +1952,54 @@ void IndexWriter::tryDeleteSegments() {
     // Do not delete any segments that are being merged.
     std::vector<std::unique_ptr<SegInfo>> localDeleteList;
     std::vector<std::string> liveDocsToDelete;
+    std::vector<std::string> unreferencedSharedFiles;
     {
       std::lock_guard publicationLock(publicationMutex);
       const std::lock_guard<std::mutex> lock(indexMutex);
       liveDocsToDelete.swap(pendingRetirement);
       localDeleteList = takeDeletableSegmentsLocked();
+      unreferencedSharedFiles = unreferencedSharedFilesLocked(localDeleteList);
       for (auto& [id, seg] : segInfos) collectObsoleteLiveDocsLocked(*seg, liveDocsToDelete);
       for (auto& seg : segmentsToDelete) collectObsoleteLiveDocsLocked(*seg, liveDocsToDelete);
     }
 
     // No publication or index lock is held during filesystem cleanup.
     snapshots.retire(liveDocsToDelete);
+    snapshots.retire(unreferencedSharedFiles);
     retireSegments(localDeleteList);
   } catch (std::exception& e) {
     LOG_ERROR("Exception caught while deleting segments: {}", e.what());
   }
+}
+
+// A file held by reference (SegInfo::sharedFiles) is not under a segment's
+// name, so retiring a dead segment by prefix leaves it. It goes with the last
+// segment that lists it: of the shared files `dead` lists, those no live or
+// pending segment lists and the published snapshot does not. (A file an older
+// snapshot still holds is retained by the registry until the snapshot goes;
+// one the published snapshot lists is retired by the next commit's set
+// difference once nothing lists it.) Call with indexMutex held.
+std::vector<std::string> IndexWriter::unreferencedSharedFilesLocked(const std::vector<std::unique_ptr<SegInfo>>& dead) {
+  std::vector<std::string> candidates;
+  for (const auto& seg : dead) {
+    if (!seg) continue;
+    for (const auto& file : seg->sharedFiles) candidates.push_back(file.name);
+  }
+  if (candidates.empty()) return candidates;
+  boost::unordered_flat_set<std::string_view> referenced;
+  for (const auto& [id, seg] : segInfos) {
+    for (const auto& file : seg->sharedFiles) referenced.insert(file.name);
+  }
+  for (const auto& seg : segmentsToDelete) {
+    for (const auto& file : seg->sharedFiles) referenced.insert(file.name);
+  }
+  if (auto published = lastSnapshot.load()) {
+    for (const auto& file : published->files) referenced.insert(file.name);
+  }
+  std::erase_if(candidates, [&](const std::string& name) { return referenced.contains(name); });
+  std::ranges::sort(candidates);
+  candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+  return candidates;
 }
 
 std::vector<std::unique_ptr<SegInfo>> IndexWriter::takeDeletableSegmentsLocked() {
@@ -1985,7 +2020,13 @@ void IndexWriter::retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments
     if (!seg) continue;
     INDEX_DEBUG("Deleting files {}", *seg);
     std::vector<std::string> names;
-    for (const auto& file : seg->baseFiles) names.push_back(file.name);
+    // Files held by reference may still be listed by a live segment; they go
+    // with the last one that lists them (unreferencedSharedFilesLocked).
+    for (const auto& file : seg->baseFiles) {
+      if (std::ranges::find(seg->sharedFiles, file.name, &FileDescriptor::name) == seg->sharedFiles.end()) {
+        names.push_back(file.name);
+      }
+    }
     if (seg->liveFile) names.push_back(seg->liveFile->name);
     for (const auto& overlay : seg->auxOverlays) for (const auto& file : overlay.files) names.push_back(file.name);
     for (auto gen : seg->obsoleteLiveGens) names.push_back(Postings::getLiveDocsFileName(
@@ -2425,6 +2466,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   info.schema_file = {schema->file.name, schema->file.size, schema->file.xxh3};
   info.incarnation = incarnation;
   info.last_seg_id = lastSegId.load(std::memory_order_relaxed);
+  info.next_source_seq = nextSourceSeq.load(std::memory_order_relaxed);
   auto now = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::system_clock::now().time_since_epoch()).count();
   info.commit_time = std::max(now, lastCommitTime.load() + 1);
@@ -2605,6 +2647,7 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
     wire.max_doc = seg.maxDoc;
     if (seg.mergeRows != seg.maxDoc) wire.merge_rows = seg.mergeRows;
     wire.live_gen = seg.liveGen;
+    wire.source_gen = seg.sourceGen;
     wire.min_version = seg.minVersion;
     wire.max_version = seg.maxVersion;
     wire.commit_time = seg.firstCommitTime;
@@ -2673,7 +2716,174 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
 // So we don't delete segments that the commit code is about to use, the commit code marks
 // those segments.
 // We also mark segments that are going to be merged, so the commit code knows about them.
+// Dictionaries trained before a restart, recovered once, before the first
+// merge plans its work (a merge that found none would train a new one). Startup
+// does not do it so that opening a writer reads no segment data. Only segments
+// of the published snapshot seed a resource, which pins them while they are
+// read; the winning bytes are owned, so retiring a segment later cannot affect
+// writers. Flushes before the first merge compress without a dictionary.
+void IndexWriter::seedDictionaries() {
+  // A failure leaves the flag unset, so the next merge tries again; this one
+  // proceeds without the old dictionaries.
+  try {
+    std::call_once(dictionariesSeeded, [this] { seedDictionariesOnce(); });
+  } catch (const std::exception& e) {
+    LOG_WARN("stored dictionaries could not be recovered yet: {}", e.what());
+  }
+}
+
+void IndexWriter::seedDictionariesOnce() {
+  {
+    auto schema = getSchema();
+    auto reader = snapshots.readers.getReader();
+    if (!reader) return;
+    for (const auto& [name, type] : schema->fieldTypeMap) {
+      auto* stored = dynamic_cast<const StoredFieldType*>(type.get());
+      if (!stored || !stored->format_.dictionaryBytes) continue;
+      auto token = seedTokens.find(name);
+      if (token == seedTokens.end()) continue;
+      std::string_view bestDictionary;
+      int64_t bestBytes = -1;
+      uint64_t bestSegId = 0;
+      for (const auto& segment : reader->segments()) {
+        if (!segment.hasSpace()) continue;
+        auto& postings = segment.postingsReader();
+        const auto* field = postings.fieldInfo(name);
+        const auto* part = field ? field->stored() : nullptr;
+        if (!part || !part->dictionaryBytes) continue;
+        auto bytes = part->chunksBytes;
+        uint64_t id = segment.segInfo.seg_id;
+        if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
+          bestBytes = bytes;
+          bestSegId = id;
+          bestDictionary = std::string_view(postings.core().slice(part->dictionary()));
+        }
+      }
+      if (!bestDictionary.empty()) {
+        storedDictionaries.publish(name, token->second, std::make_shared<const StoredDictionary>(std::string(bestDictionary)));
+      }
+    }
+    seedSourceDictionary(*schema, *reader);
+  }
+}
+
+// The source store's dictionary: the latest one in the largest source file
+// of the snapshot carrying one (a file holds the dictionary its blocks were
+// last compressed with).
+void IndexWriter::seedSourceDictionary(const Schema& schema, IndexReader& reader) {
+  auto token = seedTokens.find(Postings::SOURCE_RESOURCE);
+  if (token == seedTokens.end()) return;
+  std::vector<SourceFileRef> files;
+  for (const auto& segment : reader.segments()) {
+    const auto* map = segment.source() ? segment.source()->sourceMap() : nullptr;
+    if (!map) continue;
+    for (const auto& file : map->files) {
+      if (!std::ranges::contains(files, file.name, &SourceFileRef::name)) files.push_back(file);
+    }
+  }
+  std::ranges::sort(files, [](const SourceFileRef& a, const SourceFileRef& b) {
+    return a.bytes != b.bytes ? a.bytes > b.bytes : a.name < b.name;
+  });
+  for (const auto& file : files) {
+    try {
+      auto input = dir.openFile(file.name);
+      if (!input) continue;
+      auto hold = input->acquire({0, input->size()});
+      auto source = source::FileReader::open(std::string_view(hold.getData(), hold.getLength()));
+      if (!source || source->dictionaries().empty()) continue;
+      storedDictionaries.publish(Postings::SOURCE_RESOURCE, token->second,
+                                 std::make_shared<const StoredDictionary>(source->dictionaries().back().second));
+      return;
+    } catch (const std::exception& e) {
+      LOG_WARN("source file {} could not be read for its dictionary: {}", file.name, e.what());
+    }
+  }
+}
+
+// Gives the merged segment its source map. Source files of the inputs are
+// referenced rather than copied, except for the ones the merge relocates (see
+// mergeSources); the segment lists every source file its map names, so commit
+// pinning, retirement and replication follow the files. docMap is the merge's
+// own doc mapping.
+void IndexWriter::mergeSourceFiles(const std::vector<SegInfo*>& segs,
+                                   SourceDocMap docMap,
+                                   const Schema& schema, SegInfo& out, std::string& relocatedFile) {
+  // No input keeps sources: nothing to carry and nothing to spend. With the
+  // store turned off the inputs' maps are left behind, which lets their files go.
+  if (std::ranges::none_of(segs, [](const SegInfo* seg) { return seg->sourceGen != 0; })) return;
+  if (!schema.source.enabled) return;
+  std::vector<SourceMap> maps(segs.size());
+  std::vector<const SourceMap*> inputs(segs.size(), nullptr);
+  for (size_t i = 0; i < segs.size(); i++) {
+    if (segs[i]->sourceGen == 0) continue;
+    // Unreadable must not mean garbage: without its map the merge cannot carry
+    // the segment's file references, so it fails here and is retried later.
+    maps[i] = SourceMap::read(dir, Postings::getSourceMapFileName(Postings::segmentKey(segs[i]->segId, segs[i]->creatorEpoch),
+                                                                  segs[i]->sourceGen), segs[i]->maxDoc);
+    inputs[i] = &maps[i];
+  }
+  // The first merge holding enough source trains the store's dictionary; it
+  // compresses what this merge relocates and every later flush.
+  auto format = schema.source.dictionaryFormat();
+  auto dictionary = storedDictionaries.lookup(Postings::SOURCE_RESOURCE, format);
+  if (!dictionary && format.dictionaryBytes) {
+    if (auto token = storedDictionaries.token(Postings::SOURCE_RESOURCE, format)) {
+      auto trained = trainSourceDictionary(dir, schema.source, inputs);
+      if (!trained.empty()) {
+        storedDictionaries.publish(Postings::SOURCE_RESOURCE, *token,
+                                   std::make_shared<const StoredDictionary>(std::move(trained)));
+        dictionary = storedDictionaries.lookup(Postings::SOURCE_RESOURCE, format);
+      }
+    }
+  }
+  auto relocation = sourceFormatRelocation(dir, schema.source, [&] {
+    relocatedFile = Postings::getSourceFileName(nextSourceSeq.fetch_add(1), writerEpoch);
+    return relocatedFile;
+  }, std::move(dictionary));
+  auto merged = mergeSources(schema.source, inputs, docMap, *relocation);
+  for (const auto& name : merged.unreadable) {
+    LOG_WARN("source file {} could not be verified; segment {} keeps referencing it as it is", name, out.segId);
+  }
+  if (merged.map.runs.empty()) {
+    relocatedFile.clear();
+    return;
+  }
+  merged.map.write(dir, Postings::getSourceMapFileName(Postings::segmentKey(out.segId, out.creatorEpoch), 1),
+                   &out.unsyncedFiles, &out.baseFiles);
+  out.sourceGen = 1;
+  for (const auto& ref : merged.map.files) {
+    if (merged.written && ref.name == merged.written->name) {
+      out.baseFiles.push_back(*merged.written);
+      out.unsyncedFiles.push_back(ref.name);
+      continue;
+    }
+    bool found = false;
+    for (const SegInfo* seg : segs) {
+      auto file = std::ranges::find(seg->sharedFiles, ref.name, &FileDescriptor::name);
+      if (file == seg->sharedFiles.end()) continue;
+      out.baseFiles.push_back(*file);
+      // A source file of a segment that has not committed yet is not durable; syncing
+      // one that is costs a call, and the inputs' sync lists are not safe to read here.
+      // A missing file stays referenced (its docs are lost already) but cannot be
+      // synced, and must not fail every later commit.
+      bool missing = std::ranges::contains(merged.unreadable, ref.name) && [&] {
+        try { return !dir.openFile(ref.name); } catch (const std::exception&) { return true; }
+      }();
+      if (!missing) out.unsyncedFiles.push_back(ref.name);
+      found = true;
+      break;
+    }
+    // A map naming a file no input lists would leave the merged segment pointing at
+    // a file that retirement deletes while it is still referenced: fail the merge.
+    if (!found) {
+      throw std::runtime_error("merged source map names " + ref.name + ", which no input segment lists");
+    }
+  }
+  out.sharedFiles = sharedFilesOf(out.segId, out.creatorEpoch, out.baseFiles);
+}
+
 bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
+  seedDictionaries();
   // Started once there are sources to merge (or on a failure), so a pass that
   // finds nothing to merge does not count as a merge.
   std::optional<MetricWork> metric;
@@ -2691,6 +2901,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   bool mergeFailed = false;
   size_t markedSegmentCount = 0;
   uint64_t outputSegId = 0;
+  std::string relocatedSourceFile;  // written by this merge, deleted if it does not publish
   MergeFailureInfo failure;
   const char* phase = "select_sources";
 
@@ -2906,6 +3117,24 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       SegmentMerger merger(sourceCores, liveDocsPtrs, pwriter, *indexRamBudget,
                            termPartitionMinBytes, termPartitionMinRangeBytes,
                            termPartitionMaxRanges, *mergeSchema, storedDictionaries);
+      if (!mergeSchema->source.enabled) {
+        // The store is off, so this merge drops the inputs' sources: the
+        // stored-field values they hold move into stored fields first.
+        // Unreadable must not mean garbage: a map that does not load fails the
+        // merge, which is retried.
+        std::vector<std::shared_ptr<SourceReader>> sources(segs.size());
+        bool any = false;
+        for (size_t i = 0; i < segs.size(); i++) {
+          if (segs[i]->sourceGen == 0) continue;
+          sources[i] = std::make_shared<SourceReader>(
+              dir, Postings::getSourceMapFileName(Postings::segmentKey(segs[i]->segId, segs[i]->creatorEpoch),
+                                                  segs[i]->sourceGen),
+              segs[i]->maxDoc);
+          if (!sources[i]->mapLoaded()) throw std::runtime_error("source map " + sources[i]->name() + " is unreadable");
+          any = true;
+        }
+        if (any) merger.droppedSources = std::move(sources);
+      }
       merger.merge();
 
       phase = "new_segment_info";
@@ -2925,6 +3154,14 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       newSegInfo->mergeRows = pwriter.getMaxSpaceRows();
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
+
+      phase = "merge_source";
+      std::vector<SourceDocMapping> sourceDocMaps(segs.size());
+      for (size_t i = 0; i < segs.size(); i++) {
+        auto [remap, base] = merger.docMapping(i);
+        sourceDocMaps[i] = {remap, base};
+      }
+      mergeSourceFiles(segs, sourceDocMaps, *mergeSchema, *newSegInfo, relocatedSourceFile);
 
       std::vector<uint64_t> coveredGens;
       coveredGens.reserve(segs.size());
@@ -3128,6 +3365,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     if (!outputPublished) {
       try {
         dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId, writerEpoch));
+        if (!relocatedSourceFile.empty()) dir.deleteFile(relocatedSourceFile);
       } catch (const std::exception& e) {
         LOG_ERROR("Failed to delete merged segment files for segId={} after merge failure: {}",
                   outputSegId, e.what());
@@ -3150,7 +3388,9 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     }
   } else if (!outputPublished) {
     try {
+      // No segment lists a relocated source file of an output that did not survive.
       dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId, writerEpoch));
+      if (!relocatedSourceFile.empty()) dir.deleteFile(relocatedSourceFile);
     } catch (const std::exception& e) {
       LOG_ERROR("Failed to delete unused merged segment files for segId={}: {}",
                 outputSegId, e.what());
@@ -3311,6 +3551,7 @@ void IndexWriter::testDeleteAllData() {
     lastSegId = 0;
     // Keep the directory identity and manifest generations: publication observers
     // must never see a commit token reused. testReset revoked the old pins.
+    // nextSourceSeq keeps counting too, and the new epoch makes source names fresh.
     coreGen = 0;
     lastCommittedSegIds.clear();
     currentAuxIndexes_.clear();

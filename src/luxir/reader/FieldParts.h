@@ -207,7 +207,7 @@ struct Stored {
 
   // Persisted chunk layout. Compression level and training policy are schema settings.
   StoredChunkFormat format() const {
-    return {.codec = codec, .chunkTarget = chunkTarget, .maxDocsPerChunk = maxDocsPerChunk};
+    return {.codec = codec, .chunkTarget = chunkTarget, .maxDocsPerChunk = maxDocsPerChunk, .dictionaryBytes = 0};
   }
   Slice chunks() const { return {location, (uint64_t)chunksBytes}; }
   Slice dictionary() const {

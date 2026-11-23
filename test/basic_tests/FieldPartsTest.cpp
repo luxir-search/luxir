@@ -907,6 +907,7 @@ TEST_P(FieldPartsTest, IndexAndColumnSlices) {
   auto names = openSlice(core, s.names());
   EXPECT_EQ(1u, names.checkedVint());
   EXPECT_EQ("original", std::string_view(names.checkedPackedTerm()));
+  EXPECT_EQ(0u, names.checkedVint());  // no source-backed fields
   EXPECT_EQ(0u, names.left());
   const std::array<int64_t, 1> firstDocs{0};
   const std::array<int64_t, 2> chunkOffsets{0, (int64_t)s.chunksBytes};

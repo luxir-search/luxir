@@ -14,6 +14,7 @@
 #include "luxir/schema/Schema.h"
 #include "IndexRamBudget.h"
 #include "PostingsWriter.h"
+#include "SourceWriter.h"
 #include "StoredFieldsWriter.h"
 
 // so IndexHandler can consume protobuf types
@@ -112,6 +113,19 @@ public:
   // Populated after flush() if there were deleted documents
   uint64_t liveGen = 0;
   int32_t liveDocs = 0;
+
+  // Allocates sequence numbers for source files ("v<seq>.<epoch>"): the
+  // IndexWriter's durable counter. Required before a segment with sources flushes.
+  std::atomic<uint64_t>* sourceSeq = nullptr;
+
+  // The generation of the source map written by flush(), 0 if the segment has none.
+  uint64_t sourceGen = 0;
+
+  // Keeps the document being indexed as submitted, when the pinned schema keeps
+  // sources. `flags` are source::kFlag* bits. Call once per started document,
+  // after startDoc(); a document that never calls it gets a placeholder.
+  // Throws if the call would put the record anywhere but at the document's ID.
+  void addSource(std::string_view id, std::string_view body, uint64_t version, uint8_t flags);
 
   Inverter(luxir::Directory& dir, uint64_t segId, uint64_t creatorEpoch,
            const std::function<std::shared_ptr<Schema>()>& schemaProvider = {},
@@ -299,6 +313,9 @@ public:
     LogicalField::Shape shape;
     bool multi;
     StoredFieldsWriter* writer;
+    // Stored values come from the document's source when it holds them (see
+    // FieldType::storedCopy_); the writer lists the field as source-backed.
+    bool sourceBacked = false;
     std::vector<Branch> branches;
     std::vector<GeoPoint> geoPoints;
     size_t geoScratchBytes = 0;
@@ -375,11 +392,13 @@ public:
   void setDoc(int32_t docid) {
     assert (docid >= currDoc);
     assert (docid < PostingsReader::HARD_MAX_DOC);
+    if (docid != currDoc) sourceHoldsFields_ = false;
     currDoc = docid;
   }
 
   void startDoc() {
     currDoc++;
+    sourceHoldsFields_ = false;
     assert (currDoc < PostingsReader::HARD_MAX_DOC);
   }
 
@@ -449,6 +468,13 @@ public:
   bool flush(std::vector<std::string>* filenames = nullptr, std::vector<FileDescriptor>* descriptors = nullptr);
 
 private:
+  std::unique_ptr<SourceWriter> sourceWriter_;
+  // The current doc's source record holds its field values as indexed
+  // (source::holdsFieldValues), so source-backed fields skip their stored copy.
+  bool sourceHoldsFields_ = false;
+  size_t sourceRamAccounted_ = 0;
+  void flushSource(std::vector<std::string>* filenames, std::vector<FileDescriptor>* descriptors);
+
   IndexHandler* idHandler_ = nullptr;  // cached pointer to the IdHandler, set in createPhysicalHandler
   // Stored-fields writers, keyed by space and resource name. Lazily populated
   // when fields with the STORED flag are first indexed. Transparent lookup

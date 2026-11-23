@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "Collections.h"
+#include "luxir/reader/Postings.h"
 #include "Promotion.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/schema/Schema.h"
@@ -49,7 +50,23 @@ std::shared_ptr<const CommitSnapshot> Collection::updateSchema(const luxir::api:
                                                  luxir::api::SchemaRequest_::Mode mode) {
   if (!shard->iw) throw ReadOnlyError("collection has no writer");
   return shard->iw->updateSchema([&](const Schema* current) {
-    return Schema::fromProto(def, mode == api::SchemaRequest_::Mode::SET ? current : nullptr);
+    if (mode == api::SchemaRequest_::Mode::SET) return Schema::fromProto(def, current);
+    // A replacement that does not name the source store keeps the current entry:
+    // dropping it would make the next merges discard every stored source, so that
+    // has to be said ("_source_": {"enabled": false}) rather than omitted.
+    if (!current || def.stored_resources.contains(Postings::SOURCE_RESOURCE)) return Schema::fromProto(def, nullptr);
+    std::pmr::monotonic_buffer_resource arena;
+    api::SchemaDef existing;
+    current->toProto(&existing, arena);
+    const api::StoredResourceDef* kept = existing.stored_resources.find(Postings::SOURCE_RESOURCE);
+    if (!kept) return Schema::fromProto(def, nullptr);
+    std::vector<std::pair<std::string_view, api::StoredResourceDef>> resources(def.stored_resources.begin(),
+                                                                               def.stored_resources.end());
+    resources.push_back({Postings::SOURCE_RESOURCE, *kept});
+    api::SchemaDef replacement = def;
+    replacement.stored_resources = api::map_view<std::string_view, api::StoredResourceDef>(
+        std::span<const std::pair<std::string_view, api::StoredResourceDef>>(resources.data(), resources.size()));
+    return Schema::fromProto(replacement, nullptr);
   });
 }
 
@@ -362,6 +379,25 @@ static void clearMarkers(const CollectionId& name, Directory& dir, std::span<con
   catch (const std::exception& e) { LOG_WARN("Cannot clear corruption markers of '{}': {}", name.label(), e.what()); }
 }
 
+// The schema a new collection starts with: the default schema plus the request's
+// definition. The node's source default adds a "_source_" entry only when the
+// request has none, and it lands in the schema, so later changes to the node
+// setting never reach an existing collection.
+std::shared_ptr<Schema> Collections::newCollectionSchema(const api::SchemaDef* requested) const {
+  auto base = Schema::createDefaultSchema();
+  api::SchemaDef def = requested ? *requested : api::SchemaDef{};
+  std::vector<std::pair<std::string_view, api::StoredResourceDef>> resources;
+  if (config.index.source_default && !def.stored_resources.contains(Postings::SOURCE_RESOURCE)) {
+    resources.assign(def.stored_resources.begin(), def.stored_resources.end());
+    resources.push_back({Postings::SOURCE_RESOURCE, api::StoredResourceDef{}});
+    def.stored_resources = api::map_view<std::string_view, api::StoredResourceDef>(
+        std::span<const std::pair<std::string_view, api::StoredResourceDef>>(resources.data(), resources.size()));
+  }
+  if (!requested && resources.empty()) return base;
+  return Schema::fromProto(def, base.get());
+}
+
+
 std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, std::shared_ptr<Schema> initialSchema, bool startup,
                                                    std::optional<TenantCatalog::Entry> entry) {
   auto& storage = catalog(name.tenant);
@@ -381,6 +417,7 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   if (entry->node != config.node.id) throw CollectionServedByError(entry->node);
   bool creating = entry->state == "reserved";
   if (creating && !reserved) throw CollectionUnavailableError("collection is being created");
+  if (creating && !initialSchema) initialSchema = newCollectionSchema(nullptr);
   auto selected = entry->id;
   // A healthy reopen shares one root read and one listing. Copying a fallback
   // snapshot requires additional listings of the source and destination.
@@ -571,8 +608,7 @@ std::shared_ptr<Collection> Collections::create(const CollectionId& key, const a
     Transition transition(*this, key);
     std::string reserved;
     try {
-      auto initialSchema = Schema::createDefaultSchema();
-      if (schema) initialSchema = Schema::fromProto(*schema, initialSchema.get());
+      auto initialSchema = newCollectionSchema(schema);
       reserved = catalog(key.tenant).reserve(key.name, {}, true);
       created = initWriter(key, std::move(initialSchema), false, catalog(key.tenant).owned(reserved));
       LOG_INFO("Created collection: {}", key.label());
