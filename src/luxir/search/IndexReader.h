@@ -6,6 +6,7 @@
 #include <memory>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -352,6 +353,7 @@ public:
         : entry(entry), segments(segments) {}
     int32_t ordinalAt(size_t segment) const;
     const FieldTotals& totals() const;
+    static FieldRecordHeader mergeHeaders(std::span<const std::optional<FieldRecordHeader>> headers);
 
   public:
     FieldSegments() = default;
@@ -367,6 +369,13 @@ public:
     const Similarity::FieldStats& stats() const;
     // Union of the segment-specific flags over the field's segments.
     uint8_t segFlags() const;
+    // The field's record header in `segment`, or null when the segment has
+    // no record for it. Memoized with the field totals; never decodes a part.
+    const FieldRecordHeader* header(size_t segment) const;
+    // The headers of every segment with a record, merged: summed counts and
+    // the union of their bounds (none when some segment with values has
+    // none). Describes the segments as written, deletes included.
+    const FieldRecordHeader& mergedHeader() const;
     bool operator==(const FieldSegments&) const = default;
   };
 
@@ -394,6 +403,12 @@ private:
     uint8_t segFlags = 0;  // See FieldSegmentFlags.
     FieldType::Type type = FieldType::NONE;
     uint32_t typeParameters = 0;
+    // Each segment's record header, empty where it has no record. Names and
+    // dictionary bounds borrow the segments' mapped catalogs.
+    std::vector<std::optional<FieldRecordHeader>> headers;
+    FieldRecordHeader merged;  // See FieldSegments::mergedHeader().
+
+    size_t bytes() const noexcept { return sizeof(*this) + headers.capacity() * sizeof(headers[0]); }
   };
 
   // Positive names, field totals and OrdMaps shared by segment sets on one path
