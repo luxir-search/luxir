@@ -26,6 +26,11 @@ StrictStorageCounters::FileStats StrictStorageCounters::fileStats(std::string_vi
   return it == files.end() ? FileStats{} : it->second;
 }
 
+uint64_t StrictStorageCounters::totalRounds() const {
+  std::lock_guard lock(mutex);
+  return rounds;
+}
+
 StrictStorageCounters::LiveStats StrictStorageCounters::liveStats() const {
   std::lock_guard lock(mutex);
   return live;
@@ -33,17 +38,18 @@ StrictStorageCounters::LiveStats StrictStorageCounters::liveStats() const {
 
 void StrictStorageCounters::logSummary() const {
   std::lock_guard lock(mutex);
-  uint64_t acquires = 0, metadata = 0, uniqueParts = 0, wholeFiles = 0, sizes = 0;
+  uint64_t acquires = 0, metadata = 0, uniqueParts = 0, wholeFiles = 0, sizes = 0, batches = 0;
   for (const auto& [name, file] : files) {
     acquires += file.acquires;
+    batches += file.batches;
     metadata += file.metadataAcquires;
     uniqueParts += file.parts.size();
     wholeFiles += file.wholeFileAccesses;
     sizes += file.sizeRequests;
   }
-  LOG_INFO("strict: acquires={} (metadata={}), unique parts={}, peak live holds={}, peak live bytes={}, "
-           "whole-file accesses={}, size requests={}",
-           acquires, metadata, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles, sizes);
+  LOG_INFO("strict: acquires={} (metadata={}), rounds={} (batches={}), unique parts={}, peak live holds={}, "
+           "peak live bytes={}, whole-file accesses={}, size requests={}",
+           acquires, metadata, rounds, batches, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles, sizes);
 }
 
 StrictLayer::~StrictLayer() {
@@ -58,6 +64,14 @@ void StrictStorageCounters::wholeFile(std::string_view name) {
 void StrictStorageCounters::sizeRequested(std::string_view name) {
   std::lock_guard lock(mutex);
   ++files[std::string(name)].sizeRequests;
+}
+
+void StrictStorageCounters::round(std::string_view name, bool batch) {
+  std::lock_guard lock(mutex);
+  auto& file = files[std::string(name)];
+  file.lastRound = ++rounds;
+  if (!file.rounds++) file.firstRound = rounds;
+  if (batch) ++file.batches;
 }
 
 uint8_t StrictStorageCounters::acquired(std::string_view name, ByteRange range) {
@@ -143,6 +157,7 @@ public:
     if (range.offset == 0 && range.length > Postings::LUXIR_HEADER.size()) return true;
     return *segmentFile != Postings::PRIMARY_FILE && range.length && range.offset + range.length == size;
   }
+  void round(bool batch) { counters->round(name, batch); }
 
   void wholeFile() {
     counters->wholeFile(name);
@@ -189,6 +204,10 @@ class StrictInputFile : public InputFile {
   std::shared_ptr<InputFile> delegate;
   std::shared_ptr<StrictFileState> state;
 
+  static size_t slack(ByteRange range, uint64_t fileSize) {
+    return std::min<uint64_t>(kReadSlack, fileSize - range.offset - range.length);
+  }
+
 public:
   StrictInputFile(std::shared_ptr<InputFile> inner, std::shared_ptr<StrictFileState> state)
       : delegate(std::move(inner)), state(std::move(state)) {}
@@ -199,14 +218,46 @@ public:
   }
   bool holdsFree() const override { return false; }
 
+  using InputFile::acquire;
+
   HeldRange acquire(ByteRange range) override {
     auto fileSize = delegate->size();
     checkRange(range, fileSize);
     state->checkClass(range);
     if (state->readsWholeFile(range, fileSize)) state->wholeFile();
+    state->round(false);
     auto source = delegate->acquire(range);
-    size_t slack = std::min<uint64_t>(kReadSlack, fileSize - range.offset - range.length);
-    return state->copy(source, range, slack);
+    return state->copy(source, range, slack(range, fileSize));
+  }
+
+  // Forwards the batch whole, so the delegate sees it as one round.
+  void acquire(std::span<const ByteRange> ranges, AcquireDone done) override {
+    auto fileSize = delegate->size();
+    for (auto range : ranges) {
+      checkRange(range, fileSize);
+      state->checkClass(range);
+      if (state->readsWholeFile(range, fileSize)) state->wholeFile();
+    }
+    state->round(true);
+    std::vector<ByteRange> requested(ranges.begin(), ranges.end());
+    delegate->acquire(ranges, [state = state, fileSize, requested = std::move(requested), done = std::move(done)](
+                                  std::vector<HeldRange>&& sources, std::exception_ptr failure) {
+      std::vector<HeldRange> holds;
+      if (!failure) {
+        try {
+          if (sources.size() != requested.size()) throw FileIOException("strict: batch returned the wrong number of holds");
+          holds.reserve(sources.size());
+          for (size_t i = 0; i < sources.size(); ++i) {
+            holds.push_back(state->copy(sources[i], requested[i], slack(requested[i], fileSize)));
+          }
+        } catch (...) {
+          holds.clear();
+          failure = std::current_exception();
+        }
+      }
+      sources.clear();
+      done(std::move(holds), std::move(failure));
+    });
   }
 
   void prefetch(size_t offset, size_t length) override { delegate->prefetch(offset, length); }

@@ -471,6 +471,16 @@ request for what it uses. The class is a hint a cache or backend may use for
 residency and scheduling after release, and it never changes the bytes
 returned.
 
+`acquire(ranges, done)` takes a batch of ranges on one file. The default
+acquires each range in turn and calls `done` inline, so a local backend needs
+nothing more. A remote backend can override it to merge the ranges and issue
+them as one round of requests. Call `done` exactly once, from any thread,
+with one hold per range in the order requested and a null error, or with no
+holds and the error; `done` does not throw. Throwing from `acquire` instead
+also counts as the batch failing. The ranges are valid only during the call,
+so copy what the completion needs. Wrappers forward the batch to their
+delegate rather than splitting it, so the backend sees it whole.
+
 ### Storage layers
 
 A layer derives from `DelegatingDirFactory` and overrides what it changes, usually

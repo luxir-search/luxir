@@ -4,8 +4,11 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <span>
 #include <utility>
+#include <vector>
 
 #include "InputStream.h"
 
@@ -81,5 +84,9 @@ public:
   InputStream stream() const & noexcept { return {data, data + length}; }
   InputStream stream() const && = delete;
 };
+
+// Completes a batched acquire exactly once: with one hold per range in the
+// order requested and a null error, or with no holds and the error.
+using AcquireDone = std::function<void(std::vector<HeldRange>&&, std::exception_ptr)>;
 
 } // namespace luxir
