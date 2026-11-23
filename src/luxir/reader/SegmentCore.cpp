@@ -105,17 +105,15 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
   SegmentReadContext primaryContext{this, PackedTerm(nullptr), primary};
   auto open = [&](uint32_t number, uint64_t expected) {
     auto name = Postings::getIndexFileName(segment, number);
-    auto file = dir.openFile(name, expectSynced, expected);
+    // With the manifest's size, size() needs no request; see Directory::openFile.
+    auto file = dir.openFile(name, {.expectSynced = expectSynced, .size = expected});
     if (!file) {
       if (missingFileOK) return false;
       throw std::filesystem::filesystem_error(
           std::format("Can't find/open segment file '{}'", name),
           std::make_error_code(std::errc::no_such_file_or_directory));
     }
-    // Trust the manifest's size so a remote open needs no size request. A
-    // file with free holds is local and knows its size, so check it there.
-    bool holdsFree = file->holdsFree();
-    auto size = expected && !holdsFree ? expected : (uint64_t)file->size();
+    auto size = (uint64_t)file->size();
     if (expected && size != expected) {
       corruptSegment(segment, "file size differs from manifest", {}, number);
     }
@@ -126,6 +124,7 @@ bool SegmentCore::initializeFromFiles(Directory& dir, const Source* source, bool
       auto header = file->acquire({0, Postings::LUXIR_HEADER.size(), ReadClass::METADATA});
       validateSegmentFileHeader(header.bytes(), segment, number);
     }
+    bool holdsFree = file->holdsFree();
     files[number] = {std::move(file), size, holdsFree};
     return true;
   };

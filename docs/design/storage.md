@@ -155,15 +155,19 @@ other backends release through the hold's `HoldOwner`.
   writer gave a structure in the file holds in memory.
 
 A segment reads every part through `SegmentCore::slice()`. A manifest open
-acquires each file's header and the catalog range, never a whole segment
-file. For now the segment keeps the holds it hands out until it closes, so
-nothing held is evicted; releasing holds when a request ends comes with a
-bounded cache.
+acquires each file's header, the catalog range, the version runs and, for
+segments with nested spaces, the ownership ends and owners columns; never a
+whole segment file. For now the segment keeps the holds it hands out until it
+closes, so nothing held is evicted; releasing holds when a request ends comes
+with a bounded cache.
 
-- A manifest open passes each file's recorded size to `Directory::openFile`,
-  so a backend can answer `size()` without a request. Files with free holds
-  (RAM, mmap) are local, and the open still checks their size against the
-  manifest.
+- A manifest open passes each file's recorded size to `Directory::openFile`
+  and checks it against `size()` once per file; after a sized open, `size()`
+  makes no request. A remote directory can keep a cached listing of its
+  prefix (names, sizes, ETags), answer `openFile` and `size()` from it, and
+  list again when a name is missing, so neither existence nor size costs a
+  request per file. With a passed size it needs the listing only for
+  existence.
 - Each acquire carries a `ReadClass`. `METADATA` marks what a reader navigates
   by: file headers, the catalog, version runs, term block offsets and tries,
   and the directories and indexes over column and point blocks. Everything

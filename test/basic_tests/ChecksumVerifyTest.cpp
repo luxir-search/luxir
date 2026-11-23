@@ -168,7 +168,7 @@ TEST_F(ChecksumVerifyTest, verifiedReaderSurvivesUnlinkAndViewLifetime) {
       verification.open(dir, snapshot->files, true, {});
       verification.run();
       VerifiedDirectory source(dir, verification);
-      EXPECT_THROW(source.openFile(names.front(), true), std::runtime_error);
+      EXPECT_THROW(source.openFile(names.front(), {.expectSynced = true}), std::runtime_error);
       dir.sync(names);
       for (const auto& name : names) ASSERT_TRUE(dir.deleteFile(name));
       ReaderManager readers(dir);

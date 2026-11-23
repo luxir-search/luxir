@@ -33,7 +33,7 @@ private:
   // spilled filesystem/object-store keys stable.
   struct BaseFile {
     std::shared_ptr<InputFile> file;
-    uint64_t size = 0;  // The manifest's size when it records one, so reads need no size request.
+    uint64_t size = 0;  // Read once at open; checked against the manifest when it records one.
     bool holdsFree = false;
   };
   std::vector<BaseFile> files;

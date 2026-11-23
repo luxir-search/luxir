@@ -454,9 +454,18 @@ token needed to release it. Destruction or replacement of the hold calls
 `HoldOwner::release(const HeldRange&)`, which must be thread-safe and
 `noexcept`. The caller releases the hold before destroying its `InputFile`.
 
-A nonzero `size` passed to `openFile` is the size the manifest records; a
-remote backend can answer `size()` from it instead of asking the store, and
-wrappers forward it. Each `ByteRange` also carries a `ReadClass`, `METADATA`
+`openFile(name, OpenOptions)` returns null when the file does not exist,
+whether or not a size was given. A nonzero `OpenOptions::size` is the size
+the manifest records; after such an open, `size()` must not make a request.
+Answer it from the given size or from a cached listing. Wrappers forward the
+options.
+
+A remote directory can keep a cached listing of its prefix (names, sizes,
+ETags) and answer `openFile` and `size()` from it, listing again when a name
+is missing, so neither existence nor size costs a request per file. With a
+passed size it needs the listing only for existence.
+
+Each `ByteRange` also carries a `ReadClass`, `METADATA`
 or `DATA`, which a backend may use to cache or schedule reads; it does not
 change what the range returns.
 

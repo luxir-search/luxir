@@ -487,7 +487,7 @@ public:
 
     // expectSynced=true: aux files were fsynced before the IndexInfo that
     // references them was published, same contract as segment files.
-    auto file = dir.openFile(fname, /*expectSynced=*/true);
+    auto file = dir.openFile(fname, {.expectSynced = true});
     if (file == nullptr) {
       if (missingFileOK) {
         LOG_TRACE("VectorAuxReader::open: file {} missing for aux '{}', will retry",

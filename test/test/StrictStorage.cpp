@@ -90,6 +90,7 @@ class StrictFileState : public HoldOwner {
   std::shared_ptr<StrictStorageCounters> counters;
   std::string name;
   bool denyWhole;
+  bool sized;  // Opened with a size, so size() makes no request.
   std::atomic<uint64_t> liveHolds{0};
 
   static size_t allocationSize(size_t length) {
@@ -97,9 +98,10 @@ class StrictFileState : public HoldOwner {
   }
 
 public:
-  StrictFileState(std::shared_ptr<StrictStorageCounters> counters, std::string_view name, StrictWholeFiles mode)
+  StrictFileState(std::shared_ptr<StrictStorageCounters> counters, std::string_view name, StrictWholeFiles mode,
+                  bool sized)
       : counters(std::move(counters)), name(name),
-        denyWhole(mode == StrictWholeFiles::DENY && Manifest::segmentDataFile(name)) {}
+        denyWhole(mode == StrictWholeFiles::DENY && Manifest::segmentDataFile(name)), sized(sized) {}
 
   // A hold must not outlive its InputFile: its release would run on freed state.
   ~StrictFileState() {
@@ -109,7 +111,9 @@ public:
     }
   }
 
-  void sizeRequested() { counters->sizeRequested(name); }
+  void sizeRequested() {
+    if (!sized) counters->sizeRequested(name);
+  }
 
   void wholeFile() {
     counters->wholeFile(name);
@@ -201,17 +205,21 @@ public:
 
 } // namespace
 
-std::shared_ptr<InputFile> StrictDirectory::openFile(std::string_view name, bool expectSynced, uint64_t size) {
-  auto file = delegate->openFile(name, expectSynced, size);
+std::shared_ptr<InputFile> StrictDirectory::openFile(std::string_view name, OpenOptions options) {
+  auto file = delegate->openFile(name, options);
   if (!file) return {};
-  if (size && size != file->size()) throw FileIOException("strict: open size differs from file " + std::string(name));
-  return std::make_shared<StrictInputFile>(std::move(file), std::make_shared<StrictFileState>(counters, name, mode));
+  if (options.size && options.size != file->size()) {
+    throw FileIOException("strict: open size differs from file " + std::string(name));
+  }
+  auto state = std::make_shared<StrictFileState>(counters, name, mode, options.size != 0);
+  return std::make_shared<StrictInputFile>(std::move(file), std::move(state));
 }
 
 std::shared_ptr<ChecksumReader> StrictDirectory::openChecksum(std::string_view name, bool direct) {
   auto reader = delegate->openChecksum(name, direct);
   if (!reader) return {};
-  return std::make_shared<StrictChecksumReader>(std::move(reader), std::make_shared<StrictFileState>(counters, name, mode));
+  auto state = std::make_shared<StrictFileState>(counters, name, mode, false);
+  return std::make_shared<StrictChecksumReader>(std::move(reader), std::move(state));
 }
 
 } // namespace luxir::test
