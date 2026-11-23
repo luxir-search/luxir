@@ -94,17 +94,27 @@ std::vector<std::span<const char>> SegmentCore::slices(std::span<const field_par
 }
 
 std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice part, ReadClass readClass) {
-  std::span<const char> bytes;
+  auto key = std::pair(part.location.raw(), part.bytes);
   {
     std::lock_guard lock(holdsMutex);
-    auto key = std::pair(part.location.raw(), part.bytes);
-    auto found = holds.lower_bound(key);
-    if (found != holds.end() && found->first == key) return found->second.bytes();
-    auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
-    countAcquire(part.bytes);
-    bytes = holds.emplace_hint(found, key, std::move(hold))->second.bytes();
+    auto found = holds.find(key);
+    if (found != holds.end()) return found->second.bytes();
   }
-  countFirstHold(part.bytes);
+  // Acquire outside the lock: on a backend where an acquire is a request, a
+  // miss must not hold up other slices of the segment, hits included. Two
+  // threads missing the same part both acquire it; the first to store wins.
+  auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
+  countAcquire(part.bytes);
+  std::span<const char> bytes;
+  bool inserted;
+  {
+    std::lock_guard lock(holdsMutex);
+    auto [stored, added] = holds.try_emplace(key, std::move(hold));
+    bytes = stored->second.bytes();
+    inserted = added;
+  }
+  // A duplicate releases here, outside the lock.
+  if (inserted) countFirstHold(part.bytes);
   return bytes;
 }
 
