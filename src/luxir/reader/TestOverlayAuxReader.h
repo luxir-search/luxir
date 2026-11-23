@@ -53,7 +53,7 @@ public:
         info.files.size(), info.name));
     }
     std::string_view fname = info.files[0].name;
-    auto file = dir.openFile(fname, /*expectSynced=*/true);
+    auto file = dir.openFile(fname, {.expectSynced = true});
     if (file == nullptr) {
       if (missingFileOK) {
         LOG_TRACE("TestOverlayAuxReader::open: file {} missing for overlay '{}', will retry",

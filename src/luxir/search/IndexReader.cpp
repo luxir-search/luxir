@@ -105,7 +105,7 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   std::string deleteFileName = Postings::getLiveDocsFileName(
     Postings::segmentKey(segId, creatorEpoch), liveGen, liveEpoch);
 
-  auto deleteFile = dir.openFile(deleteFileName, expectSynced);
+  auto deleteFile = dir.openFile(deleteFileName, {.expectSynced = expectSynced});
   if (deleteFile == nullptr) {
     if (missingFileOK) {
       // Delete file not found - return nullptr instead of throwing

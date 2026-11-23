@@ -43,9 +43,9 @@ public:
     counters->add("list", path);
     delegate->listFiles(target);
   }
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) override {
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) override {
     counters->add("open", path);
-    return delegate->openFile(name, expectSynced, size);
+    return delegate->openFile(name, options);
   }
   std::unique_ptr<File> createFile(std::string_view name) override {
     counters->add("create", path);

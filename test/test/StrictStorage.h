@@ -21,7 +21,7 @@ public:
     uint64_t metadataAcquires = 0;
     uint64_t acquiredBytes = 0;
     uint64_t wholeFileAccesses = 0;
-    uint64_t sizeRequests = 0;  // InputFile::size() calls from readers.
+    uint64_t sizeRequests = 0;  // InputFile::size() calls on files opened without a size.
     std::set<std::pair<uint64_t, uint64_t>> parts;
     std::set<std::pair<uint64_t, uint64_t>> metadataParts;
   };
@@ -59,7 +59,7 @@ public:
                   StrictWholeFiles mode = StrictWholeFiles::COUNT)
       : DelegatingDirectory(std::move(inner)), counters(std::move(counters)), mode(mode) {}
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) override;
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) override;
   std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override;
   Capabilities capabilities() const override { return delegate->capabilities() & ~HARD_LINK; }
 };
