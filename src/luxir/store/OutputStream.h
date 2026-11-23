@@ -459,26 +459,27 @@ public:
   virtual HeldRange acquire(ByteRange range) = 0;
 
   // Acquires a batch of ranges together, so a backend can merge them and
-  // issue them at once. Calls done exactly once, on any thread, possibly
-  // before returning; done must not throw. The holds follow the contract of
+  // issue them at once. Reports every outcome through `done`, called exactly
+  // once, possibly before returning, from any thread: one hold per range in
+  // the order requested and a null error, or no holds and the error. Never
+  // throws; `done` must not throw either. The holds follow the contract of
   // single acquires. `ranges` is valid only during the call. The default
   // acquires each range in turn and completes inline.
-  virtual void acquire(std::span<const ByteRange> ranges, AcquireDone done) {
+  virtual void acquireBatch(std::span<const ByteRange> ranges, AcquireDone done) noexcept {
     std::vector<HeldRange> holds;
+    std::exception_ptr failure;
     try {
       holds.reserve(ranges.size());
       for (const auto& range : ranges) holds.push_back(acquire(range));
     } catch (...) {
       holds.clear();
-      done({}, std::current_exception());
-      return;
+      failure = std::current_exception();
     }
-    done(std::move(holds), nullptr);
+    done(std::move(holds), std::move(failure));
   }
 
   // Blocks until the batch completes; returns its holds in the order
-  // requested or throws its error. Named apart from acquire(ByteRange) so a
-  // braced range never resolves to a batch.
+  // requested or throws its error.
   std::vector<HeldRange> acquireAll(std::span<const ByteRange> ranges);
   // True when all acquisitions return null-owner views valid for the file's lifetime.
   virtual bool holdsFree() const { return false; }
@@ -499,7 +500,6 @@ public:
     return sz;
   }
 
-  using InputFile::acquire;
   HeldRange acquire(ByteRange range) override {
     checkRange(range, sz);
     return {data.get() + range.offset, range.length};
