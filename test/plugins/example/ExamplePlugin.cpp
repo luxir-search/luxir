@@ -50,8 +50,10 @@ public:
   }
 };
 
-// Filter: rewrites every token to "text|type|script|positionLength", what a
-// downstream plugin filter can read of the attributes upstream stages set.
+// Filter: rewrites every token to "text|wordClass|script|positionLength", what
+// a downstream plugin filter can read of a token's attributes. wordClass() and
+// script() classify the input word on the first read unless the tokenizer
+// already stored them.
 class DescribeFilter : public TokenFilter {
   std::string buf;
 
@@ -62,9 +64,9 @@ public:
     if (!source().incrementToken()) return false;
     buf.assign(token.text);
     buf += '|';
-    buf += tokenTypeName(token.type);
+    buf += wordClassName(token.wordClass());
     buf += '|';
-    buf += scriptName(token.script);
+    buf += scriptName(token.script());
     buf += '|';
     buf += std::to_string(token.positionLength);
     token.text = buf;

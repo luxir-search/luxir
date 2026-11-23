@@ -81,21 +81,18 @@ const char* scriptName(Script script) {
   return names[(size_t) script];
 }
 
-const char* tokenTypeName(TokenType type) {
+const char* wordClassName(WordClass wordClass) {
   static constexpr const char* names[] = {"unknown", "alpha", "numeric", "alnum", "other"};
-  return names[(size_t) type];
+  return names[(size_t) wordClass];
 }
 
-namespace {
-
-static_assert(UNI_ALGO_UNICODE_VERSION == nfkc_cf_data::unicodeVersion,
-              "Regenerate NFKC_CF tables when upgrading uni-algo's Unicode data");
-
-// Sets type and script from the code points of a UAX#29 word. The ASCII fast
-// path of StandardTokenizer classifies from its byte classes instead.
-void classifyWord(std::string_view word, Token& token) {
+WordClassification classifyWord(std::string_view word) {
   bool alpha = false, numeric = false;
   Script script = Script::COMMON;
+  auto letter = [&](Script s) {
+    alpha = true;
+    if (script == Script::COMMON) script = s;  // the first letter that has a script
+  };
   // Most words are ASCII or start with an ASCII run; only decode from the first high byte.
   size_t ascii = 0;
   for (; ascii < word.size() && (unsigned char) word[ascii] < 0x80; ascii++) {
@@ -103,29 +100,39 @@ void classifyWord(std::string_view word, Token& token) {
     if (c >= '0' && c <= '9') {
       numeric = true;
     } else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'z') {
-      if (!alpha) script = Script::LATIN;
-      alpha = true;
+      letter(Script::LATIN);
     }
   }
   if (ascii < word.size()) {
     for (char32_t cp : una::views::utf8(word.substr(ascii))) {
-      Script s = letterScript(cp);
-      if (s == Script::UNKNOWN) {
-        if (cp < 0x80 ? (cp >= '0' && cp <= '9') : una::codepoint::is_numeric(cp)) {
-          numeric = true;
-          continue;
-        }
-        s = scriptOf(cp);
-        if (s == Script::COMMON) continue;  // '_', combining marks, symbols
+      if (Script s = letterScript(cp); s != Script::UNKNOWN) {
+        letter(s);
+        continue;
       }
-      if (!alpha) script = s;
-      alpha = true;
+      una::codepoint::prop p(cp);
+      if (p.General_Category_L()) {
+        letter(scriptOf(cp));
+      } else if (p.Numeric()) {
+        numeric = true;
+      }
+      // anything else (marks, symbols, '_') is neither, whatever its script
     }
   }
-  token.type = alpha ? (numeric ? TokenType::ALNUM : TokenType::ALPHA)
-                     : (numeric ? TokenType::NUMERIC : TokenType::OTHER);
-  token.script = script;
+  WordClass wordClass = alpha ? (numeric ? WordClass::ALNUM : WordClass::ALPHA)
+                              : (numeric ? WordClass::NUMERIC : WordClass::OTHER);
+  return {wordClass, script};
 }
+
+void Token::classify() {
+  WordClassification c = classifyWord(inputText());
+  knownClass = c.wordClass;
+  knownScript = c.script;
+}
+
+namespace {
+
+static_assert(UNI_ALGO_UNICODE_VERSION == nfkc_cf_data::unicodeVersion,
+              "Regenerate NFKC_CF tables when upgrading uni-algo's Unicode data");
 
 // UAX#29 word-boundary tokenizer straight over uni-algo, codepoint by
 // codepoint. Emits word-like segments only (letters, numbers, ideographs, ...);
@@ -152,7 +159,6 @@ public:
     std::string_view w = *it;  // word_only yields a view into the source value
     token.text = w;
     token.setOffset((int) (w.data() - base_), (int) (w.data() + w.size() - base_));
-    classifyWord(w, token);
     ++it;
     return true;
   }
@@ -282,8 +288,10 @@ struct AsciiWbTable {
 };
 constexpr AsciiWbTable wbTable;
 
-static_assert(offsetof(Token, script) == offsetof(Token, type) + 1);
-constexpr uint16_t asciiClass(TokenType type, Script script) { return (uint16_t) ((unsigned) type | ((unsigned) script << 8)); }
+static_assert(offsetof(Token, knownScript) == offsetof(Token, knownClass) + 1);
+constexpr uint16_t asciiClass(WordClass wordClass, Script script) {
+  return (uint16_t) ((unsigned) wordClass | ((unsigned) script << 8));
+}
 
 inline bool isWbWord(unsigned char cls) { return (unsigned) (cls - 1) < 4u; }  // LET, NUM or ENL
 
@@ -398,11 +406,13 @@ private:
     while (it != view->end()) {
       // Capture the source span before the case filter repoints token.text
       // at `buf`. `lowered` is a length-preserving ASCII-lowercased copy, so
-      // byte offsets into it equal byte offsets into the original value.
+      // byte offsets into it equal byte offsets into the original value, and
+      // Token::inputText() reads the word back from there. The class stays
+      // unknown: classifying here would be a second pass over every word, and
+      // Token::wordClass() does it only for a filter that asks.
       std::string_view w = *it;
       token.setOffset((int) (w.data() - textBase),
                       (int) (w.data() + w.size() - textBase));
-      classifyWord(w, token);
       ++it;
       if (fold == WordFold::NONE) {
         token.text = w;
@@ -509,12 +519,13 @@ private:
       if (kinds & (WB_LET | WB_NUM)) {
         token.text = std::string_view(w, (size_t) (s - w));
         token.setOffset((int) (w - textBase), (int) (s - textBase));
-        // ASCII letters are Latin; a digits-only word has no script.
-        // type and script in one 16-bit store (adjacent, little-endian: see Token).
-        static constexpr uint16_t classes[4] = {0, asciiClass(TokenType::ALPHA, Script::LATIN),
-                                                asciiClass(TokenType::NUMERIC, Script::COMMON),
-                                                asciiClass(TokenType::ALNUM, Script::LATIN)};
-        std::memcpy(&token.type, &classes[kinds & 3], sizeof(uint16_t));
+        // The scan already knows the class, so store it, after setOffset (which
+        // resets it). ASCII letters are Latin; a digits-only word has no script.
+        // Class and script in one 16-bit store (adjacent, little-endian: see Token).
+        static constexpr uint16_t classes[4] = {0, asciiClass(WordClass::ALPHA, Script::LATIN),
+                                                asciiClass(WordClass::NUMERIC, Script::COMMON),
+                                                asciiClass(WordClass::ALNUM, Script::LATIN)};
+        std::memcpy(&token.knownClass, &classes[kinds & 3], sizeof(uint16_t));
         dfaCur = s;
         return true;
       }
