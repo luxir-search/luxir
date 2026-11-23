@@ -342,9 +342,8 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
       // Then the previous snapshot's, when the base files are identical (a
       // delete or overlay commit leaves them unchanged); without descriptors
       // the identity is unknown and nothing is shared. The rest open together,
-      // so their catalogs are acquired in one round.
+      // so their headers and catalogs are acquired in one round.
       std::vector<std::shared_ptr<SegmentCore>> segmentCores(indexInfo.segments.size());
-      std::vector<const luxir::api::SegmentInfo*> opening;
       std::vector<const PhysicalCore::Bundle*> prevSegs(indexInfo.segments.size());
       for (size_t i = 0; i < indexInfo.segments.size(); i++) {
         const auto& segment = indexInfo.segments[i];
@@ -361,15 +360,8 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
             && prevFiles->catalog == files.catalog && prevFiles->maxDoc == segment.max_doc) {
           segmentCore = prevSeg->core;
         }
-        if (!segmentCore) opening.push_back(&segment);
       }
-      if (!opening.empty()) {
-        auto opened = SegmentCore::create(dir, opening, missingFileOK, true);
-        auto next = opened.begin();
-        for (auto& segmentCore : segmentCores) {
-          if (!segmentCore) segmentCore = std::move(*next++);
-        }
-      }
+      SegmentCore::open(dir, indexInfo.segments, segmentCores, missingFileOK, true);
 
       segs.reserve(indexInfo.segments.size());
       for (int i = 0; i < (int)indexInfo.segments.size(); i++) {
