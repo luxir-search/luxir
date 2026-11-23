@@ -63,6 +63,8 @@ public:
   // when no finalized dictionary was written for it; callers then derive them.
   std::optional<IdRange> idRange;
   std::optional<uint64_t> idDictionaryBlocks;
+  // The root id dictionary's membership filter. Set before writing.
+  IdFilter::Options idFilterOptions;
 
 private:
   Directory& directory;
@@ -913,6 +915,7 @@ private:
   uint8_t segFlags = 0;  // Data facts from the kept terms.
   // A root ID dictionary's membership filter, fed with the hash each term block keeps.
   std::optional<IdFilter::Builder> idFilter;
+  int64_t idFilterRam = 0;  // Charged for idFilter.
 
   // TODO: pool allocate this
   std::vector<char> compressed_output;
@@ -1370,8 +1373,11 @@ public:
       // Ranges of a partitioned merge would each see part of the keys.
       if (!buildTrie) throw std::logic_error("a root id dictionary must be written by one writer");
       // A segment holds at most one id term per root document.
-      idFilter.emplace((uint64_t)std::max(postingsWriter.getMaxDoc(SpaceOrdinal::ROOT), 1));
-      postingsWriter.accountRam((int64_t)idFilter->sizeInBytes());
+      if (postingsWriter.idFilterOptions.kind != IdFilter::Kind::NONE) {
+        idFilter.emplace(postingsWriter.idFilterOptions, (uint64_t)std::max(postingsWriter.getMaxDoc(SpaceOrdinal::ROOT), 1));
+        idFilterRam = (int64_t)idFilter->sizeInBytes();
+        postingsWriter.accountRam(idFilterRam);
+      }
     }
 
     termBlockOffsets.resize(0);
@@ -2018,7 +2024,7 @@ public:
              && bounds.upperMode == field_parts::DictionaryBounds::Upper::INCLUSIVE);
       postingsWriter.idRange = IdRange{std::string(std::string_view(bounds.lower)), std::string(std::string_view(bounds.upper)), false};
       postingsWriter.idDictionaryBlocks = result.nBlocks;
-      written.idFilter = finishIdFilter(result.nTerms);
+      if (idFilter) written.idFilter = finishIdFilter(result.nTerms);
     }
     return written;
   }
@@ -2028,8 +2034,12 @@ private:
   field_parts::Slice finishIdFilter(int64_t terms) {
     assert(idFilter);
     if (idFilter->numKeys() != (uint64_t)terms) throw std::logic_error("id filter keys differ from dictionary terms");
+    // A static filter builds only now; charge what it holds meanwhile.
+    auto building = (int64_t)idFilter->finishBytes();
+    postingsWriter.accountRam(building);
+    idFilterRam += building;
+    auto bytes = idFilter->finish();
     auto stream = postingsWriter.getOutputStream();
-    auto bytes = idFilter->encoded();
     stream->write(bytes.data(), bytes.size());
     auto slice = postingsWriter.finishStream(std::move(stream));
     dropIdFilter();
@@ -2038,7 +2048,8 @@ private:
 
   void dropIdFilter() noexcept {
     if (!idFilter) return;
-    postingsWriter.accountRam(-(int64_t)idFilter->sizeInBytes());
+    postingsWriter.accountRam(-idFilterRam);
+    idFilterRam = 0;
     idFilter.reset();
   }
 
