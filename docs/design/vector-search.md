@@ -311,7 +311,9 @@ defaults are close in recall (0.953 vs 0.960 at the default nprobe; 0.989 vs
 coarse assignment, took 10.2 s (RaBitQ, 140 B/vector) vs 16.7 s (PQ m=32,
 55 B/vector) at 768 dims and 10.4 s vs 12.9 s at 128 dims. Bytes per vector
 include the 8-byte id and per-overlay headers (centroids, and for RaBitQ the
-stored d x d rotation).
+stored d x d rotation), as the overlay was laid out at the time; the
+[guide](../guide/vector-search.md#index-settings) gives the current per-vector
+layout.
 
 The Cohere-768 cosine comparison motivating PQ's automatic `m=96` is:
 
@@ -437,7 +439,7 @@ the fixed 1.9 confidence multiplier. These amplitudes support empirical
 confidence intervals; they are not deterministic error bounds. The reader
 exposes a mmap view, validates finite, non-negative amplitudes once at open and
 exposes per-list spans for sequential, unchecked scan loads. Metadata and footer
-version 3 validate the component count and file size;
+version 4 validate the component count and file size;
 older formats fail on open and must be rebuilt.
 
 `VectorIndexBuilder::finishRaBitQCode` writes the sign-bit factors for every
