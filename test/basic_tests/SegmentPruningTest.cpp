@@ -283,6 +283,27 @@ TEST_F(SegmentPruningTest, childrenOfPrunedOpsSeeEmptyMatches) {
   expectSameWithAndWithoutPruning(fusion);
 }
 
+TEST_F(SegmentPruningTest, collectionEmptyListKeepsFiltersForBucketReset) {
+  indexThreeSegments();
+  // The named bucket exists even when the list is empty. Its children reset
+  // inside the bucket, so the list itself needs no routed domain.
+  auto req = localReq(helper->getSearchEngine());
+  parseQueryRequest(R"({"query":"price_i:>100","filter":["tag_s:a"],"limit":0,"count_limit":-1,
+    "ops":{"all":{"query_facet":{"buckets":{"rows":"*:*"},"ops":{
+      "filtered":{"domain":{"query":"*:*","apply_parent_filters":true},"top_docs":{"limit":0,"count_limit":-1}},
+      "unfiltered":{"domain":{"query":"*:*","apply_parent_filters":false},"top_docs":{"limit":0,"count_limit":-1}}
+    }}}}})", req->rawRequest(), req->mr);
+  req->collection("prune").execute();
+  ASSERT_OK(req);
+  EXPECT_EQ(0, req->getMatchCount());
+  const auto& bucket = *req->docList()->ops.at("all")->facetResult();
+  auto count = [&](std::string_view child) {
+    return *std::get<api::ArrVal>(bucket.ops.at(child)->kind).v[0].docList()->found;
+  };
+  EXPECT_EQ(3, count("filtered"));
+  EXPECT_EQ(9, count("unfiltered"));
+}
+
 TEST_F(SegmentPruningTest, reportsPruningInProfileAndExplain) {
   indexThreeSegments();
   std::string json = topDocs(R"({"range":{"field":"price_i","gte":11,"lte":13}})");
