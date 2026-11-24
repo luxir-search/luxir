@@ -385,6 +385,53 @@ TEST_F(VectorAnnCodecTest, mergeRebuildsWithFieldCodecAndSharesRotation) {
   EXPECT_GE(recallVsExact(h), 0.9);
 }
 
+// 1-bit lists also carry their block layout, rebuilt by merges: each block
+// packs the list's row codes, and the block kernel returns the row kernel's results.
+TEST_F(VectorAnnCodecTest, oneBitListBlocksFollowMerges) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard;
+  CollectionHelper h("main");
+  installAnn(h.collection(), api::VectorMetric::L2, rabitqAnn(0, 1));
+  indexSegment(h, 0, 1000);
+  indexSegment(h, 1000, 1000);
+  auto check = [&](size_t segments) {
+    std::shared_ptr<IndexReader> reader;
+    auto aux = overlays(h, reader);
+    ASSERT_EQ(aux.size(), segments);
+    RaBitQBlockLayout layout(DIMS);
+    std::vector<uint8_t> expected(layout.bytes);
+    for (const auto* overlay : aux) {
+      ASSERT_NE(overlay, nullptr);
+      auto* ivf = dynamic_cast<faiss::IndexIVF*>(overlay->getFaissIndex());
+      const auto* blocks = overlay->getBlockLists();
+      ASSERT_NE(blocks, nullptr);
+      ASSERT_EQ(blocks->blockBytes, layout.bytes);
+      for (size_t list = 0; list < ivf->nlist; list++) {
+        size_t size = ivf->invlists->list_size(list);
+        ASSERT_EQ(blocks->offsets[list + 1] - blocks->offsets[list], RaBitQBlockLayout::blocks(size));
+        faiss::InvertedLists::ScopedCodes codes(ivf->invlists, list);
+        for (size_t off = 0; off < size; off += RaBitQBlockLayout::ROWS) {
+          layout.pack(codes.get() + off * ivf->code_size, ivf->code_size,
+                      std::min(RaBitQBlockLayout::ROWS, size - off), expected.data());
+          ASSERT_EQ(0, std::memcmp(expected.data(), blocks->list(list) + off / RaBitQBlockLayout::ROWS * layout.bytes,
+                                   layout.bytes));
+        }
+      }
+    }
+    SearchOverridesGuard saved(KnnQuery::rowRaBitQKernel);
+    for (int32_t q = 0; q < 4; q++) {
+      auto query = clustered(2'000'000 + q, q % CLUSTERS);
+      KnnQuery::rowRaBitQKernel = false;
+      auto blocked = knnIds(h, query, false, 0);
+      KnnQuery::rowRaBitQKernel = true;
+      EXPECT_EQ(knnIds(h, query, false, 0), blocked);
+    }
+  };
+  check(2);
+  h.getIndexWriter()->mergeSegments();
+  check(1);
+}
+
 // A codec change applies to overlays built afterwards; existing segments keep
 // theirs, and one query serves each segment by its own overlay metadata.
 TEST_F(VectorAnnCodecTest, codecChangeLeavesMixedSegmentsQueryable) {

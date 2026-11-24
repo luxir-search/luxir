@@ -811,7 +811,9 @@ positive `m` requires dimensions pinned in the schema.
 
 **RaBitQ** (default) stores sign bits of randomly rotated residuals from IVF
 centroids, plus correction factors. A 768-dimension 1-bit vector uses 104 code
-bytes plus a 4-byte error amplitude (108 bytes). Multi-bit codes use
+bytes plus a 4-byte error amplitude (108 bytes). 1-bit overlays also store
+their lists a second time in 32-row blocks for the SIMD scan, another
+`D/8 + 10` bytes per vector (106 at 768 dimensions). Multi-bit codes use
 `ceil(D/8) + 12 + ceil(D*(bits-1)/8) + 8` bytes, plus one float32 amplitude
 (4 bytes), stored in list order. Every overlay vector, for either codec, also
 stores a 4-byte list id. Only the IVF centroids are trained.
@@ -828,7 +830,7 @@ intended corpus when changed.
 **PQ** (explicit) splits each vector into `m` sub-vectors and stores one learned
 codebook entry per sub-vector. PQ's automatic `m` scales with stored
 dimensions above 256: for example, 768 dimensions selects `m=96`, or 96 code
-bytes at 8 bits, close to 1-bit RaBitQ's 108 including its amplitude. This improves high-dimensional recall
+bytes at 8 bits, close to 1-bit RaBitQ's 108 including its amplitude (before its block copy). This improves high-dimensional recall
 over `m=32` at the cost of larger codes and more scan work; see the
 [codec measurements](../design/vector-search.md#codec-measurements).
 For L2, the reader retains the `nlist * m * 2^bits`-float precomputed table

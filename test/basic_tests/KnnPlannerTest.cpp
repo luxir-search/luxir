@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <gtest/gtest.h>
 #include <random>
+#include <cmath>
 #include <format>
 #include "luxir/query/KnnPlanner.h"
 
@@ -361,6 +362,82 @@ TEST(KnnPlannerTest, rabitqKernelPricing) {
       EXPECT_DOUBLE_EQ(scorer ? 0 : 9, features[KnnPlanner::ENTRY_MISPREDICT]);
     }
   }
+}
+
+// The filtered block threshold falls with the dimensions, stays within a
+// block, and the test override replaces it everywhere it is read.
+TEST(KnnPlannerTest, rabitqBlockMinRows) {
+  struct Restore {
+    size_t saved = RaBitQScorer::blockMinRowsOverride;
+    ~Restore() { RaBitQScorer::blockMinRowsOverride = saved; }
+  } restore;
+  size_t previous = RaBitQBlockLayout::ROWS;
+  for (int32_t dims : {7, 64, 128, 192, 384, 768, 960, 1024, 1536, 4096}) {
+    size_t minRows = RaBitQScorer::blockMinRows(dims);
+    EXPECT_GE(minRows, 2u) << dims;
+    EXPECT_LE(minRows, previous) << dims;
+    previous = minRows;
+  }
+  EXPECT_EQ(16u, RaBitQScorer::blockMinRows(128));
+  EXPECT_EQ(12u, RaBitQScorer::blockMinRows(768));
+  EXPECT_EQ(12u, RaBitQScorer::blockMinRows(960));
+  // Out of reach: the planner then expects no block rows below a full selection.
+  RaBitQScorer::blockMinRowsOverride = RaBitQBlockLayout::ROWS + 1;
+  EXPECT_EQ(RaBitQBlockLayout::ROWS + 1, RaBitQScorer::blockMinRows(128));
+  EXPECT_EQ(0, KnnPlanner::blockShare(128, 0.9).rows);
+  EXPECT_EQ(1, KnnPlanner::blockShare(128, 1).rows);
+  RaBitQScorer::blockMinRowsOverride = 1;
+  EXPECT_NEAR(1 - std::pow(0.9, 32), KnnPlanner::blockShare(128, 0.1).rows, 1e-12);
+}
+
+// Block lists price whole blocks for dense selections and the row kernel for
+// sparse ones; work reports the same split.
+TEST(KnnPlannerTest, rabitqBlockPricing) {
+  auto s = segment(10);
+  s.codec = KnnPlanner::Codec::RABITQ;
+  s.rabitqBits = 1; s.vectors = 3200; s.nlist = 3; s.dims = 128;
+  s.rabitqBlocks = true;
+  auto dense = KnnPlanner::blockShare(128, 1);
+  EXPECT_EQ(1, dense.rows);
+  EXPECT_EQ(1, dense.scores);
+  EXPECT_EQ(0, KnnPlanner::blockShare(128, 0).rows);
+  double previous = 0;
+  for (double rate : {0.01, 0.05, 0.1, 0.2, 0.3, 0.6, 0.9}) {
+    auto share = KnnPlanner::blockShare(128, rate);
+    EXPECT_GE(share.rows, previous);
+    EXPECT_LE(share.scores, rate);
+    EXPECT_LE(share.scores, share.rows);
+    previous = share.rows;
+  }
+  EXPECT_LT(KnnPlanner::blockShare(128, 0.01).rows, 1e-4);
+  EXPECT_GT(KnnPlanner::blockShare(128, 0.8).rows, 0.99);
+  // The block kernel's advantage per row grows with the dimensions, so wide
+  // codes take sparser blocks than narrow ones.
+  EXPECT_GT(KnnPlanner::blockShare(768, 0.4).rows, KnnPlanner::blockShare(128, 0.4).rows);
+  EXPECT_GE(KnnPlanner::blockShare(1536, 0.4).rows, KnnPlanner::blockShare(768, 0.4).rows);
+  for (int64_t eligible : {3200, 1600, 32}) for (int qb : {4, 5}) {
+    SCOPED_TRACE(::testing::Message() << eligible << '/' << qb);
+    s.eligibleVectors = eligible; s.rabitqQueryBits = qb;
+    EXPECT_EQ(qb == 4 && RaBitQScorer::SIMD_BLOCK_KERNEL, KnnPlanner::usesBlocks(s));
+    auto share = KnnPlanner::usesBlocks(s) ? KnnPlanner::blockShare(128, eligible / 3200.0) : KnnPlanner::BlockShare{};
+    auto price = KnnPlanner::price(s, {}, {});
+    EXPECT_DOUBLE_EQ(share.rows * 3200, price.linear[KnnPlanner::SCORER_BLOCK_ROW]);
+    EXPECT_DOUBLE_EQ(share.rows * 3200 * 128, price.linear[KnnPlanner::SCORER_BLOCK_DIM]);
+    EXPECT_NEAR(eligible - share.scores * 3200, price.linear[KnnPlanner::SCORER_CODE], 1e-9);
+  }
+  VectorSearchWork work;
+  work.oneBitScores = 50; work.blockScores = 40; work.blockRows = 64;
+  auto actual = KnnPlanner::actualWork(s, work);
+  EXPECT_EQ(10, actual[KnnPlanner::SCORER_CODE]);
+  EXPECT_EQ(10 * 128, actual[KnnPlanner::SCORER_DIM]);
+  EXPECT_EQ(64, actual[KnnPlanner::SCORER_BLOCK_ROW]);
+  EXPECT_EQ(64 * 128, actual[KnnPlanner::SCORER_BLOCK_DIM]);
+  // A full block scan costs less than the row kernel on the same codes.
+  KnnPlanner::Costs costs;
+  s.eligibleVectors = 3200; s.rabitqQueryBits = 4;
+  double blocks = KnnPlanner::price(s, {}, costs).a;
+  s.rabitqBlocks = false;
+  EXPECT_LT(blocks, KnnPlanner::price(s, {}, costs).a);
 }
 
 TEST(KnnPlannerTest, pqPerListTablePricing) {

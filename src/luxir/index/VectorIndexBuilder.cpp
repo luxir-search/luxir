@@ -684,6 +684,8 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   outFilesToSync.push_back(faissFile);
 
   FileDescriptor descriptor;
+  const bool blocked = rabitq && rabitqBits == 1 && RaBitQBlockLayout::supports(dims)
+      && (size_t)index->code_size == RaBitQBlockLayout((size_t)dims).codeBytes + 2 * sizeof(float);
   {
     auto file = dir_.createFile(faissFile);
     OutputStream os;
@@ -741,12 +743,33 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
         }
       }
     }
+    // 1-bit codes again in 32-row blocks for the block kernel. The row codes
+    // stay for the row kernel (sparse filtered blocks, query bits above 4)
+    // and FAISS's distance computer (query bits 0).
+    int64_t blockBytes = 0;
+    if (blocked) {
+      os.align(VectorAuxListsFooter::BLOCK_ALIGN);
+      RaBitQBlockLayout layout((size_t)dims);
+      std::vector<uint8_t> block(layout.bytes);
+      for (size_t i = 0; i < lists.nlist; i++) {
+        size_t sz = lists.list_size(i);
+        if (sz == 0) continue;
+        faiss::InvertedLists::ScopedCodes codes(&lists, i);
+        for (size_t off = 0; off < sz; off += RaBitQBlockLayout::ROWS) {
+          layout.pack(codes.get() + off * lists.code_size, lists.code_size,
+                      std::min(RaBitQBlockLayout::ROWS, sz - off), block.data());
+          os.write(block.data(), block.size());
+          blockBytes += (int64_t)block.size();
+        }
+      }
+    }
     os.align(8);
     VectorAuxListsFooter footer;
     footer.faissHeaderBytes = faissHeaderBytes;
     footer.nlist = (int64_t)lists.nlist;
     footer.codeSize = (int64_t)lists.code_size;
     footer.ntotal = ntotal;
+    footer.blockBytes = blockBytes;
     footer.amplitudeCount = amplitudeCount;
     footer.version = VectorAuxListsFooter::VERSION;
     footer.magic = VectorAuxListsFooter::MAGIC;
@@ -774,6 +797,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     meta.rabitqBits = rabitq ? rabitqBits : 0;
     meta.rotationKind = rabitq ? VectorRotation::FHT_KAC : 0;
     meta.rotationSeed = rabitq ? RABITQ_ROTATION_SEED : 0;
+    meta.listLayout = blocked ? VectorAuxMeta::LIST_ROWS_AND_BLOCKS : VectorAuxMeta::LIST_ROWS;
     std::string bytes = meta.toBytes();
     info.opaque_meta.assign((const std::byte*)bytes.data(),
                             (const std::byte*)bytes.data() + bytes.size());

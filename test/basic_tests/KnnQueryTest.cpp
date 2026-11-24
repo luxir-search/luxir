@@ -5039,6 +5039,235 @@ TEST_F(KnnQueryTest, rabitqScorerMatchesFaissOnRealOverlays) {
   EXPECT_NEAR(-7, estimate, 1e-5); // Negative L2 estimates must retain their order.
 }
 
+// The block kernel reads the overlay's blocks and returns the row kernel's
+// integer dots and estimates bit for bit; filtered blocks at every density too.
+TEST_F(KnnQueryTest, rabitqBlockKernelMatchesRowKernel) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf(16);
+  for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP}) {
+    for (int32_t dims : {7, 64, 100, 128, 384, 768, 1536}) {
+      SCOPED_TRACE(::testing::Message() << (int)metric << '/' << dims);
+      CollectionHelper h("main");
+      h.clear();
+      installVecSchema(h.collection(), metric, rabitqAnn(4), dims);
+      std::mt19937 rng((uint32_t)dims);
+      for (int i = 0; i < 300; i++)
+        h.index(flatdoc("id", std::to_string(i), "emb_v", rabitqTestVector(rng, dims, (float)(i % 4))));
+      h.commit({"*"});
+      auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+      ASSERT_EQ(1u, reader->segments().size());
+      auto* aux = (VectorAuxReader*)reader->segments()[0].getAuxReader("vec.emb_v").get();
+      ASSERT_NE(nullptr, aux);
+      auto* index = dynamic_cast<faiss::IndexIVFRaBitQ*>(aux->getFaissIndex());
+      ASSERT_NE(nullptr, index);
+      const RaBitQBlockLists* blocks = aux->getBlockLists();
+      ASSERT_NE(nullptr, blocks);
+      RaBitQBlockLayout layout((size_t)dims);
+      ASSERT_EQ(layout.bytes, blocks->blockBytes);
+      bool ip = metric == api::VectorMetric::IP;
+      auto query = rabitqTestVector(rng, dims, 0.5f);
+      std::vector<float> centroid((size_t)dims);
+      size_t codeSize = index->code_size;
+      for (int32_t qb = 1; qb <= 4; qb++) {
+        SCOPED_TRACE(qb);
+        RaBitQScorer rowScorer(dims, qb, ip, query.data()), blockScorer(dims, qb, ip, query.data(), true);
+        RaBitQScorer lazyScorer(dims, qb, ip, query.data(), true);
+        for (size_t list = 0; list < index->nlist; list++) {
+          size_t count = index->invlists->list_size(list);
+          if (count == 0) continue;
+          index->quantizer->reconstruct((faiss::idx_t)list, centroid.data());
+          rowScorer.setList(centroid.data());
+          blockScorer.setList(centroid.data());
+          faiss::InvertedLists::ScopedCodes codes(index->invlists, list);
+          const uint8_t* listBlocks = blocks->list(list);
+          auto block = [&](size_t row) { return listBlocks + row / RaBitQBlockLayout::ROWS * layout.bytes; };
+          for (size_t row = 0; row < count; row++) {
+            const uint8_t* code = codes.get() + row * codeSize;
+            if (qb == 1) {
+              for (size_t i = 0; i < (size_t)dims; i++)
+                ASSERT_EQ((code[i / 8] >> (i % 8)) & 1, layout.bit(block(row), row % RaBitQBlockLayout::ROWS, i)) << row << '/' << i;
+            }
+            uint32_t dots[RaBitQBlockLayout::ROWS];
+            blockScorer.blockDots(block(row), dots);
+            ASSERT_EQ(rowScorer.counts(code).dot, dots[row % RaBitQBlockLayout::ROWS]) << row;
+          }
+          std::mt19937 pick((uint32_t)list);
+          for (size_t begin = 0; begin < count; begin += RaBitQScorer::BLOCK_ROWS) {
+            size_t rows = std::min(count - begin, RaBitQScorer::BLOCK_ROWS);
+            const uint8_t* rowCodes = codes.get() + begin * codeSize;
+            std::vector<float> expected(RaBitQScorer::BLOCK_ROWS), actual(RaBitQScorer::BLOCK_ROWS);
+            rowScorer.score(rowCodes, codeSize, rows, expected.data());
+            blockScorer.scoreBlocks(block(begin), rows, actual.data());
+            for (size_t k = 0; k < rows; k++)
+              ASSERT_EQ(std::bit_cast<uint32_t>(expected[k]), std::bit_cast<uint32_t>(actual[k])) << begin + k;
+            // From one row per block to all of them: sparse blocks take the row kernel.
+            for (uint32_t keep : {1u, 3u, 8u, 16u, 31u, 32u}) {
+              std::vector<uint16_t> selected;
+              for (size_t k = 0; k < rows; k++) if (pick() % 32 < keep) selected.push_back((uint16_t)k);
+              rowScorer.score(rowCodes, codeSize, selected.data(), selected.size(), expected.data());
+              auto work = blockScorer.score(rowCodes, codeSize, block(begin), selected.data(), selected.size(), actual.data());
+              size_t blockRows = 0, blocksScored = 0;
+              for (size_t i = 0; i < selected.size();) {
+                size_t j = i;
+                while (j < selected.size() && selected[j] / 32 == selected[i] / 32) j++;
+                if (j - i >= RaBitQScorer::blockMinRows(dims)) { blocksScored++; blockRows += j - i; }
+                i = j;
+              }
+              EXPECT_EQ(blocksScored, work.blocks);
+              EXPECT_EQ(blockRows, work.rows);
+              for (size_t k = 0; k < selected.size(); k++)
+                ASSERT_EQ(std::bit_cast<uint32_t>(expected[k]), std::bit_cast<uint32_t>(actual[k])) << keep << '/' << selected[k];
+              // A lazily prepared list builds only the tables of the kernels it uses.
+              lazyScorer.setList(centroid.data(), RaBitQScorer::LAZY);
+              EXPECT_EQ(0, lazyScorer.preparedKernels());
+              auto lazyWork = lazyScorer.score(rowCodes, codeSize, block(begin), selected.data(), selected.size(), actual.data());
+              EXPECT_EQ(work.blocks, lazyWork.blocks);
+              int kernels = (blockRows < selected.size() ? RaBitQScorer::ROW_KERNEL : 0)
+                  | (blocksScored ? RaBitQScorer::BLOCK_KERNEL : 0);
+              EXPECT_EQ(kernels, lazyScorer.preparedKernels()) << keep;
+              for (size_t k = 0; k < selected.size(); k++)
+                ASSERT_EQ(std::bit_cast<uint32_t>(expected[k]), std::bit_cast<uint32_t>(actual[k])) << keep << '/' << selected[k];
+            }
+          }
+        }
+      }
+      EXPECT_FALSE(RaBitQScorer::blockKernel(5));
+      EXPECT_EQ(RaBitQScorer::SIMD_BLOCK_KERNEL, RaBitQScorer::blockKernel(4));
+    }
+  }
+}
+
+// At the widest block layout every bit of every code set: the uint16 popcount
+// and the u16 row sums of the block kernel reach their largest values and
+// still equal the row kernel's counts and estimates.
+TEST(RaBitQBlockLayoutTest, widestCodes) {
+  constexpr int32_t DIMS = RaBitQBlockLayout::MAX_DIMS;
+  EXPECT_TRUE(RaBitQBlockLayout::supports(DIMS));
+  EXPECT_FALSE(RaBitQBlockLayout::supports(DIMS + 1));
+  EXPECT_FALSE(RaBitQBlockLayout::supports(65535));
+  constexpr size_t ROWS = RaBitQBlockLayout::ROWS;
+  RaBitQBlockLayout layout(DIMS);
+  ASSERT_EQ((size_t)DIMS, layout.codeBytes * 8);
+  size_t codeSize = layout.codeBytes + 2 * sizeof(float);
+  std::vector<uint8_t> codes(ROWS * codeSize, 0xff), block(layout.bytes);
+  for (size_t row = 0; row < ROWS; row++) {
+    float factors[2] = {1.0f + (float)row, 0.25f};
+    std::memcpy(codes.data() + row * codeSize + layout.codeBytes, factors, sizeof(factors));
+  }
+  layout.pack(codes.data(), codeSize, ROWS, block.data());
+  for (size_t row = 0; row < ROWS; row++) {
+    uint16_t popcount;
+    std::memcpy(&popcount, block.data() + layout.popcountOffset() + row * sizeof(uint16_t), sizeof(popcount));
+    EXPECT_EQ((uint16_t)DIMS, popcount) << row;
+  }
+  // Every residual but the first quantizes to the top code.
+  std::vector<float> query((size_t)DIMS, 1.0f), zero((size_t)DIMS, 0.0f);
+  query[0] = 0;
+  for (int32_t qb = 1; qb <= 4; qb++) {
+    SCOPED_TRACE(qb);
+    RaBitQScorer row(DIMS, qb, false, query.data()), blocked(DIMS, qb, false, query.data(), true);
+    row.setList(zero.data());
+    blocked.setList(zero.data(), RaBitQScorer::LAZY);
+    uint32_t dots[ROWS];
+    blocked.blockDots(block.data(), dots);
+    auto counts = row.counts(codes.data());
+    EXPECT_EQ((uint64_t)(DIMS - 1) * ((1u << qb) - 1), counts.dot);
+    EXPECT_EQ((uint64_t)DIMS, counts.popcount);
+    alignas(64) float expected[ROWS], actual[ROWS];
+    row.score(codes.data(), codeSize, ROWS, expected);
+    blocked.scoreBlocks(block.data(), ROWS, actual);
+    for (size_t k = 0; k < ROWS; k++) {
+      EXPECT_EQ(counts.dot, dots[k]) << k;
+      ASSERT_EQ(std::bit_cast<uint32_t>(expected[k]), std::bit_cast<uint32_t>(actual[k])) << k;
+    }
+  }
+}
+
+// counts() prepares the row kernel's planes of the current list, which a lazy
+// setList() leaves unbuilt.
+TEST(RaBitQBlockLayoutTest, countsAfterLazyList) {
+  constexpr int32_t DIMS = 100;
+  std::mt19937 rng(7);
+  std::normal_distribution<float> normal(0, 1);
+  std::vector<float> query(DIMS), first(DIMS), second(DIMS);
+  for (auto* v : {&query, &first, &second}) for (auto& x : *v) x = normal(rng);
+  std::vector<uint8_t> code((DIMS + 7) / 8 + 2 * sizeof(float));
+  for (auto& b : code) b = (uint8_t)rng();
+  for (int32_t qb : {1, 4, 6}) {
+    SCOPED_TRACE(qb);
+    RaBitQScorer fresh(DIMS, qb, false, query.data(), true), reused(DIMS, qb, false, query.data(), true);
+    fresh.setList(second.data());
+    reused.setList(first.data());
+    reused.setList(second.data(), RaBitQScorer::LAZY);
+    EXPECT_EQ(fresh.counts(code.data()).dot, reused.counts(code.data()).dot);
+    EXPECT_EQ(fresh.planeByte(0, 0), reused.planeByte(0, 0));
+  }
+}
+
+// The block layout changes no result: ids, scores and selector work equal the
+// row kernel's, unfiltered and filtered, from dense to sparse selections.
+TEST_F(KnnQueryTest, rabitqBlockScanMatchesRowKernel) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf(16);
+  SearchOverridesGuard saved(KnnQuery::statsForTests, KnnQuery::rowRaBitQKernel, KnnQuery::tuning.selector,
+                             RaBitQScorer::blockMinRowsOverride);
+  for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP}) for (int32_t dims : {100, 768}) {
+    CollectionHelper h("main");
+    h.clear();
+    installVecSchema(h.collection(), metric, rabitqAnn(4), dims);
+    std::mt19937 rng((uint32_t)dims);
+    for (int i = 0; i < 1200; i++)
+      h.index(flatdoc("id", std::to_string(i), "keep_s", i % 3 == 0 ? "yes" : "no", "rare_s", i % 37 == 0 ? "yes" : "no",
+                      "emb_v", rabitqTestVector(rng, dims, (float)(i % 4))));
+    h.commit({"*"});
+    auto query = rabitqTestVector(rng, dims, 1.0f);
+    for (bool deletes : {false, true}) {
+      if (deletes) h.deleteByIds({"0", "6", "900"}, UpdateMessage::COMMIT);
+      // The measured threshold, and one low enough that filtered lists mix both kernels.
+      for (size_t minRows : {(size_t)0, (size_t)11}) for (int mode : {0, 1, 2, 3}) for (int refine : {0, 40}) {
+        SCOPED_TRACE(::testing::Message() << (int)metric << '/' << dims << '/' << deletes << '/' << minRows << '/' << mode << '/' << refine);
+        RaBitQScorer::blockMinRowsOverride = minRows;
+        KnnQuery::tuning.selector = mode == 2 ? KnnPlanner::Selector::FOLD : KnnPlanner::Selector::RESOLVE;
+        std::vector<std::string> ids[2];
+        std::vector<uint32_t> scores[2];
+        KnnQuery::Stats stats[2];
+        for (int kernel : {0, 1}) {
+          KnnQuery::rowRaBitQKernel = kernel == 1;
+          KnnQuery::statsForTests = &stats[kernel];
+          auto req = localReq(h.getSearchEngine());
+          auto& cur = req->collection("main").topDocs("q");
+          configKnn(cur, "emb_v", query, 10, 16, refine);
+          if (mode == 1 || mode == 2) addMatchFilter(cur, "keep_s", "yes");
+          if (mode == 3) addMatchFilter(cur, "rare_s", "yes");
+          req->execute(false);
+          ASSERT_OK(req);
+          ids[kernel] = resultIds(*req);
+          for (float score : resultScores(*req)) scores[kernel].push_back(std::bit_cast<uint32_t>(score));
+        }
+        EXPECT_FALSE(ids[0].empty());
+        EXPECT_EQ(ids[1], ids[0]);
+        EXPECT_EQ(scores[1], scores[0]);
+        for (auto field : {&VectorSearchWork::oneBitScores, &VectorSearchWork::physicalEntries, &VectorSearchWork::selectorPasses,
+                           &VectorSearchWork::listSetups, &VectorSearchWork::seedReads, &VectorSearchWork::remainingReads})
+          EXPECT_EQ(stats[1].work.*field, stats[0].work.*field);
+        EXPECT_EQ(0, stats[1].work.blockRows);
+        EXPECT_LE(stats[0].work.blockScores, stats[0].work.oneBitScores);
+        EXPECT_GE(stats[0].work.blockRows, stats[0].work.blockScores);
+        // Unfiltered lists take the block kernel; one row in 37 mostly the row kernel.
+        if (mode == 0) {
+          EXPECT_GT(stats[0].work.blockScores, stats[0].work.oneBitScores / 2);
+        } else if (mode == 3) {
+          EXPECT_LT(stats[0].work.blockScores, stats[0].work.oneBitScores / 2);
+        } else if (minRows != 0) {
+          // One row in 3 puts about 11 rows in a block: some reach 11, some not.
+          EXPECT_GT(stats[0].work.blockScores, 0);
+          EXPECT_LT(stats[0].work.blockScores, stats[0].work.oneBitScores);
+        }
+      }
+    }
+  }
+}
+
 // One request through both kernels, on every selector and result path.
 TEST_F(KnnQueryTest, rabitqScorerScanMatchesFaissComputer) {
   ForceIvfGuard forceIvf;

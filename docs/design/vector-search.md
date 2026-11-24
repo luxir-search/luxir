@@ -212,6 +212,40 @@ one-step tolerance. The scorer removes per-list allocation and bit-at-a-time
 packing, and the per-code virtual call. FAISS's computer remains for extended
 codes and query bits 0.
 
+1-bit overlays also store their lists in 32-row blocks
+(`VectorAuxMeta::LIST_ROWS_AND_BLOCKS`, `RaBitQBlockLayout`): per code byte,
+32 bytes holding the two 4-dimension nibbles of every row, then the rows'
+`or_minus_c`, `dp_multiplier` and a uint16 code popcount. With query bits 1-4
+the scorer builds a 16-entry table of quantized-query subset sums per
+4-dimension group for each list and scores a block with byte shuffles (`pshufb`
+on AVX2 and SSSE3, so x86-64-v2 builds too, `tbl` on AArch64 NEON). Builds
+without either keep a scalar reference of the block kernel for tests only:
+`RaBitQScorer::blockKernel`, which both the planner and the scan read, then
+leaves 1-bit lists on the row kernel. A table entry is at most 4 * 15, so
+four add up in a byte before widening to 16-bit row sums. This is the row
+kernel's integer dot, not FAISS FastScan's quantized tables, and the float
+combine runs in the same order, so both kernels give bit-identical estimates.
+The scorer's file is built with `-ffp-contract=off` and spells out its fused
+operations, so neither kernel depends on the compiler's contraction choices.
+In a standalone test the block kernel scored 2-4.7x faster than the row kernel
+streaming codes from DRAM (128-1536 dimensions). The row codes stay beside the
+blocks: query bits 5-8 and filtered blocks with fewer than
+`RaBitQScorer::blockMinRows` selected rows use the row kernel, which reads only
+the selected rows, and query bits 0 use FAISS's computer. The threshold is
+where a whole block costs no more than its selected rows on the row kernel,
+measured with `Tuning/BM_RaBitQBlockDensity` over codes far beyond the
+last-level cache: 16 rows up to 192 dimensions, 12 up to 1024 and 10 above
+(codes in cache cross over at about 8). A filtered list builds the block
+kernel's tables, and the row kernel's bit planes, only when a selected row
+first needs them, and the scan notes where each block's selected rows start
+while it selects them, so finding dense blocks costs no pass over the rows;
+without dense blocks a filtered list costs what it did on row lists.
+Blocks add the sign bytes again (dims / 8 per vector) plus 10 bytes of factors
+and popcount, about doubling the 1-bit list bytes. Dropping the row codes
+would put every sparse block on the block kernel, which costs 2-3.7x a single
+row from DRAM (4-7x in cache) at 128-1536 dimensions, and would leave query
+bits 0 and 5-8 without a kernel, so both stay.
+
 RaBitQ's estimated squared L2 distance can be negative. Since 1.15, FAISS
 clamps its 1-bit L2 estimates at zero; the port patch
 `deps/ports/faiss/rabitq-negative-l2.diff` removes that clamp so negative
@@ -227,12 +261,9 @@ witnesses bypass the bounded approximate heap, so an inflated estimate cannot
 evict an exact candidate. Public L2 scoring remains `1 / (1 + squared_distance)`.
 
 FAISS also ships `IndexIVFRaBitQFastScan`, which block-packs codes 32 vectors
-at a time for SIMD lookups and measured about 1.5 to 2 times faster list scans
-in a standalone FAISS test. It is not used yet: its lists are
-`BlockInvertedLists` (padded 32-vector blocks with per-block factor regions),
-which needs a second mmapped list layout, and its `search_preassigned` rejects
-the per-call stats sink the parallel scan uses. The codec is recorded per
-overlay, so FastScan can arrive as another engine id.
+at a time like the block layout above, but quantizes its lookup tables, so its
+estimates differ from the row kernel's; Luxir's block kernel keeps exact tables
+instead.
 
 **IVF+PQ** (explicit, `ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
 sub-quantizers of `pq.bits` bits each, unrotated. PQ's automatic `m` is the
@@ -446,9 +477,10 @@ for squared L2. Sigma1 is computed from the sign reconstruction error before
 the fixed 1.9 confidence multiplier. These amplitudes support empirical
 confidence intervals; they are not deterministic error bounds. The reader
 exposes a mmap view, validates finite, non-negative amplitudes once at open and
-exposes per-list spans for sequential, unchecked scan loads. Metadata and footer
-version 4 validate the component count and file size;
-older formats fail on open and must be rebuilt.
+exposes per-list spans for sequential, unchecked scan loads. Metadata version
+5 and footer version 5 validate the component count, the list layout and the
+file size; the 1-bit block section follows the amplitudes, 64-byte aligned,
+each list starting a new block. Older formats fail on open and must be rebuilt.
 
 `VectorIndexBuilder::finishRaBitQCode` writes the sign-bit factors for every
 code: `dp_multiplier = ||r||^2 * sqrt(D) / sum(|r_i|)` (zero when the sum is
@@ -568,7 +600,12 @@ a term per dimension); per list setup; per coarse
 centroid dimension; per slot-round; and per terminal read plus per terminal
 dimension. RaBitQ re-quantizes the query residual for every list, so its list
 setup scales with dimensions; 1-bit and extended codes have separate unit costs
-for scoring and list setup, since only the former use `RaBitQScorer`. PQ list
+for scoring and list setup, since only the former use `RaBitQScorer`. On block
+lists, the block kernel is priced per row of each block it scores, selected or
+not, plus a term per dimension; the expected split between blocks and the row
+kernel follows from the eligible fraction, treated as an independent selection
+per row (binomial over 32 rows against `blockMinRows`). These two units are
+seeded from the standalone kernel measurement, not yet fitted. PQ list
 setup is zero for inner product and cosine. Under L2 it scales with subquantizers while the segment keeps FAISS's
 precomputed table; without it, FAISS computes a full distance table per list,
 priced as `2^bits * dims` distance dimensions with an unfitted seed equal to
@@ -775,7 +812,7 @@ interval witness state for the query. Task-local handlers batch admissions and
 canonical keys; group bounded handlers keep their local capped admission.
 Serialized updates publish monotone scalar floors. PQ uses its optimized
 kernel with floor refreshes between 256-code blocks. 1-bit RaBitQ scores a block
-and then admits its rows in order; extended RaBitQ uses its distance computer per
+(eight 32-row blocks on block lists) and then admits its rows in order; extended RaBitQ uses its distance computer per
 code in the common traversal. Peak and terminal retained counts, seed and
 remaining reads, gate rejections and extra-bit evaluations accompany the
 selector-passing scan count in the benchmark stats seam.

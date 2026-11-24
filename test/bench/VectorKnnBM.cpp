@@ -2,15 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1007,7 +1010,9 @@ void BM_VectorEncodingExact(benchmark::State& state) {
 // rest) leading rows are indexed into LUXIR_VECTOR_SEGMENTS (default 4)
 // segments under LUXIR_VECTOR_METRIC (l2, ip, cosine; default cosine).
 // LUXIR_FORCE_FAISS_RABITQ, when set, uses FAISS's RaBitQ distance computer
-// instead of RaBitQScorer, to compare both kernels with one binary. Per
+// instead of RaBitQScorer, to compare both kernels with one binary.
+// LUXIR_RABITQ_ROW_KERNEL, when set, scores 1-bit lists with RaBitQScorer's
+// row kernel only, ignoring their block layout; results must not change. Per
 // codec it reports the aux build time (train + encode + write over every
 // segment), overlay bytes per vector, recall@10 against the exact path, and
 // serial single-query latency.  Instances are grouped by codec so the built
@@ -1170,8 +1175,12 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
     builtCodec = codec;
   }
   SearchOverridesGuard saved(KnnQuery::tuning.filteredCoverageAlpha, KnnQuery::statsForTests, KnnQuery::tuning.routing, KnnQuery::tuning.selector, KnnQuery::tuning.completion,
-                             KnnQuery::forceFaissRaBitQ);
+                             KnnQuery::forceFaissRaBitQ, KnnQuery::rowRaBitQKernel,
+                             RaBitQScorer::blockMinRowsOverride);
   KnnQuery::forceFaissRaBitQ = std::getenv("LUXIR_FORCE_FAISS_RABITQ") != nullptr;
+  KnnQuery::rowRaBitQKernel = std::getenv("LUXIR_RABITQ_ROW_KERNEL") != nullptr;
+  if (const char* minRows = std::getenv("LUXIR_RABITQ_BLOCK_MIN_ROWS"))
+    RaBitQScorer::blockMinRowsOverride = (size_t)std::max(0, std::atoi(minRows));
   KnnQuery::tuning.routing = (KnnQuery::Routing)state.range(4);
   KnnQuery::tuning.selector = (KnnPlanner::Selector)state.range(5);
   KnnQuery::tuning.completion = (KnnQuery::Completion)state.range(6);
@@ -1241,6 +1250,8 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
   state.counters["work_depthEntries"] = stats.work.depthEntries / queries;
   state.counters["work_pqScores"] = stats.work.pqScores / queries;
   state.counters["work_oneBitScores"] = stats.work.oneBitScores / queries;
+  state.counters["work_blockRows"] = stats.work.blockRows / queries;
+  state.counters["work_blockScores"] = stats.work.blockScores / queries;
   state.counters["work_extraBitScores"] = stats.work.extraBitScores / queries;
   state.counters["work_gateRejections"] = stats.work.gateRejections / queries;
   state.counters["work_exactVectors"] = stats.work.exactVectors / queries;
@@ -1292,10 +1303,102 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
   state.counters["dims"] = data.dims;
 }
 
+// The filtered-scan cost of one 32-row block with `rows` selected rows,
+// scored by the row kernel from the row codes (arm 0) or whole by the block
+// kernel (arm 1), through the block lists' entry point, by the row kernel
+// called directly as on row lists (arm 2), or as the threshold of
+// RaBitQScorer::blockMinRows picks (arm 3), at `dims` dimensions. The scan walks lists of 704 rows in
+// random order, 256 rows (8 blocks) per call as the IVF scan does, over
+// `megabytes` of row codes (and as many of blocks): 512 is far beyond the
+// last-level cache, 1 stays in L2. The crossover per dimension count sets
+// RaBitQScorer::blockMinRows.
+void BM_RaBitQBlockDensity(benchmark::State& state) {
+  const auto dims = (int32_t)state.range(0);
+  const auto selectedRows = (size_t)state.range(1);
+  const bool blockArm = state.range(2) == 1, directArm = state.range(2) == 2, measuredArm = state.range(2) == 3;
+  const auto megabytes = (size_t)state.range(3);
+  constexpr size_t ROWS = RaBitQBlockLayout::ROWS, CHUNK = RaBitQScorer::BLOCK_ROWS, LIST_ROWS = 704;
+  RaBitQBlockLayout layout((size_t)dims);
+  const size_t codeSize = layout.codeBytes + 2 * sizeof(float);
+  // Instances are grouped by corpus, so consecutive ones reuse it.
+  static struct Corpus {
+    int32_t dims = 0;
+    size_t megabytes = 0, lists = 0;
+    std::vector<uint8_t> codes, packed;
+  } corpus;
+  std::mt19937_64 rng(42);
+  if (corpus.dims != dims || corpus.megabytes != megabytes) {
+    corpus = {};
+    corpus.dims = dims;
+    corpus.megabytes = megabytes;
+    corpus.lists = std::max<size_t>(1, (megabytes << 20) / (LIST_ROWS * codeSize));
+    const size_t n = corpus.lists * LIST_ROWS, blocks = n / ROWS;
+    corpus.codes.resize(n * codeSize);
+    for (size_t r = 0; r < n; r++) {
+      uint8_t* code = corpus.codes.data() + r * codeSize;
+      for (size_t b = 0; b < layout.codeBytes; b += 8) {
+        uint64_t bits = rng();
+        std::memcpy(code + b, &bits, std::min<size_t>(8, layout.codeBytes - b));
+      }
+      float factors[2] = {1.0f + (float)(r % 1000) / 1000, 0.5f + (float)(r % 997) / 2000};
+      std::memcpy(code + layout.codeBytes, factors, sizeof(factors));
+    }
+    corpus.packed.resize(blocks * layout.bytes);
+    for (size_t b = 0; b < blocks; b++)
+      layout.pack(corpus.codes.data() + b * ROWS * codeSize, codeSize, ROWS, corpus.packed.data() + b * layout.bytes);
+  }
+  const size_t lists = corpus.lists;
+  const uint8_t* codes = corpus.codes.data();
+  const uint8_t* packed = corpus.packed.data();
+  std::vector<float> query((size_t)dims), centroid((size_t)dims);
+  for (auto& v : query) v = (float)(rng() % 2001) / 1000 - 1;
+  RaBitQScorer scorer(dims, 4, false, query.data(), true);
+  scorer.setList(centroid.data(), RaBitQScorer::LAZY);
+  SearchOverridesGuard saved(RaBitQScorer::blockMinRowsOverride);
+  RaBitQScorer::blockMinRowsOverride = measuredArm ? 0 : blockArm ? 1 : ROWS + 1;
+  // Selection patterns: `selectedRows` distinct rows per block.
+  constexpr size_t PATTERNS = 64;
+  std::vector<std::array<uint16_t, CHUNK>> patterns(PATTERNS);
+  for (auto& pattern : patterns) {
+    size_t at = 0;
+    for (size_t b = 0; b < CHUNK / ROWS; b++) {
+      std::array<uint16_t, ROWS> order;
+      for (size_t j = 0; j < ROWS; j++) order[j] = (uint16_t)j;
+      std::shuffle(order.begin(), order.end(), rng);
+      std::sort(order.begin(), order.begin() + (long)selectedRows);
+      for (size_t j = 0; j < selectedRows; j++) pattern[at++] = (uint16_t)(b * ROWS + order[j]);
+    }
+  }
+  std::array<uint16_t, CHUNK / ROWS + 1> starts;
+  for (size_t b = 0; b < starts.size(); b++) starts[b] = (uint16_t)(b * selectedRows);
+  std::vector<uint32_t> listOrder(lists);
+  for (size_t i = 0; i < lists; i++) listOrder[i] = (uint32_t)i;
+  std::shuffle(listOrder.begin(), listOrder.end(), rng);
+  alignas(64) float out[CHUNK];
+  size_t list = 0, begin = 0, pattern = 0, chunks = 0;
+  float sink = 0;
+  for (auto _ : state) {
+    size_t row = (size_t)listOrder[list] * LIST_ROWS + begin;
+    size_t count = std::min(CHUNK, LIST_ROWS - begin) / ROWS * selectedRows;
+    if (directArm) scorer.score(codes + row * codeSize, codeSize, patterns[pattern].data(), count, out);
+    else scorer.score(codes + row * codeSize, codeSize, packed + row / ROWS * layout.bytes,
+                      patterns[pattern].data(), starts.data(), count / selectedRows, out);
+    sink += out[0];
+    chunks += count / selectedRows;
+    pattern = (pattern + 1) % PATTERNS;
+    if ((begin += CHUNK) >= LIST_ROWS) { begin = 0; list = (list + 1) % lists; }
+  }
+  benchmark::DoNotOptimize(sink);
+  // real_time / blocks is the cost of one block.
+  state.counters["blocks"] = (double)chunks / (double)std::max<int64_t>(1, state.iterations());
+  state.counters["working_set_mb"] = (double)(corpus.codes.size() + (blockArm ? corpus.packed.size() : 0)) / (1 << 20);
+}
+
 void BM_VectorAnnDataset(benchmark::State& state) {
   ForceIvfGuard forceIvf;
-  SearchOverridesGuard savedKernel(KnnQuery::forceFaissRaBitQ);
+  SearchOverridesGuard savedKernel(KnnQuery::forceFaissRaBitQ, KnnQuery::rowRaBitQKernel);
   KnnQuery::forceFaissRaBitQ = std::getenv("LUXIR_FORCE_FAISS_RABITQ") != nullptr;
+  KnnQuery::rowRaBitQKernel = std::getenv("LUXIR_RABITQ_ROW_KERNEL") != nullptr;
   const VectorDataset* ds = VectorDataset::get();
   if (skipBenchIfDataMissing(state, ds != nullptr, "LUXIR_VECTOR_DATASET")) return;
   int32_t codec = (int32_t)state.range(0);
@@ -1414,6 +1517,7 @@ void BM_VectorAnnDataset(benchmark::State& state) {
   double queryCount = (double)ds->nQueries;
   state.counters["list_setups"] = stats.lists.load() / queryCount;
   state.counters["one_bit_scores"] = stats.oneBitScores.load() / queryCount;
+  state.counters["block_rows"] = (double)stats.work.blockRows / queryCount;
   state.counters["terminal_reads"] = stats.terminalReads.load() / queryCount;
   state.counters["results_digest"] = (double)(resultsDigest & (((uint64_t)1 << 48) - 1));
   state.counters["recall"] = recallSum / (double)ds->nQueries;
@@ -1447,6 +1551,13 @@ TUNING_BENCHMARK(BM_VectorAnnDataset)->ArgNames({"codec", "nprobe", "cand"})
       datasetSweep(b, PQ);
       datasetSweep(b, PQ_D8);
     })->UseRealTime()->MinTime(2.0);
+
+TUNING_BENCHMARK(BM_RaBitQBlockDensity)->ArgNames({"dims", "rows", "arm", "mb"})
+    ->Apply([](benchmark::Benchmark* b) {
+      for (int64_t mb : {512, 1}) for (int64_t dims : {128, 384, 768, 960, 1536})
+        for (int64_t rows : {1, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32})
+          for (int64_t arm : {0, 1, 2, 3}) b->Args({dims, rows, arm, mb});
+    })->UseRealTime();
 
 // Plain BENCHMARK: manual time is incompatible with the UseRealTime() that
 // LUXIR_BENCHMARK appends.

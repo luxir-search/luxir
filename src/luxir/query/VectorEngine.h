@@ -19,6 +19,9 @@ struct VectorSearchWork {
   int64_t listSetups = 0, physicalEntries = 0, selectorPasses = 0;
   int64_t newListSelectorPasses = 0, newListLiveVectors = 0, depthEntries = 0;
   int64_t pqScores = 0, oneBitScores = 0, extraBitScores = 0, gateRejections = 0;
+  // RaBitQ block kernel: rows of the blocks it scored, selected or not, and
+  // the selected rows among them (also counted in oneBitScores).
+  int64_t blockRows = 0, blockScores = 0;
   int64_t exactVectors = 0, domainDocs = 0, domainProbes = 0;
   int64_t seedReads = 0, remainingReads = 0, scoreBytes = 0;
   // Logical scan mappings/probes exclude optional read-ahead metadata work.
@@ -40,6 +43,8 @@ struct VectorSearchWork {
     depthEntries += other.depthEntries;
     pqScores += other.pqScores;
     oneBitScores += other.oneBitScores;
+    blockRows += other.blockRows;
+    blockScores += other.blockScores;
     extraBitScores += other.extraBitScores;
     gateRejections += other.gateRejections;
     exactVectors += other.exactVectors;

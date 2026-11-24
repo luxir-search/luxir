@@ -474,6 +474,13 @@ target_compile_definitions(luxir_lib PUBLIC
 
 add_executable(luxir src/luxir/main.cpp)
 target_link_libraries(luxir PRIVATE luxir_lib)
+# The scorer's row and block kernels must round alike; it spells out its fused
+# operations instead (see RaBitQScorer.h). Precompiled headers are built
+# without this option.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_source_files_properties(src/luxir/query/RaBitQScorer.cpp PROPERTIES
+    COMPILE_OPTIONS "-ffp-contract=off" SKIP_PRECOMPILE_HEADERS ON)
+endif()
 # Declare the executable's baseline, without marking optional dependency kernels
 # as unconditional requirements. The loader can reject an unsupported CPU early.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_NAME STREQUAL "Linux"

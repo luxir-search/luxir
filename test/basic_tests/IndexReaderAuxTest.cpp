@@ -249,12 +249,16 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
     std::string payload(hold.getData(), hold.getLength());
     auto footer = VectorAuxListsFooter::fromFileTail(payload.data(), payload.size(), original.name);
     EXPECT_EQ(footer.expectedFileBytes(), payload.size());
-    for (int corrupt = 0; corrupt < 4; corrupt++) {
+    EXPECT_EQ(footer.blockBytes > 0, meta.listLayout == VectorAuxMeta::LIST_ROWS_AND_BLOCKS);
+    EXPECT_EQ(meta.listLayout == VectorAuxMeta::LIST_ROWS_AND_BLOCKS, meta.engine == VectorAuxMeta::ENGINE_IVFRABITQ && meta.rabitqBits == 1);
+    for (int corrupt = 0; corrupt < 6; corrupt++) {
       auto bad = footer;
       if (corrupt == 0) bad.version--;
       if (corrupt == 1) bad.amplitudeCount = 3;
       if (corrupt == 2) bad.ntotal = INT64_MAX;
       if (corrupt == 3) bad.codeSize = INT64_MAX;
+      if (corrupt == 4) bad.blockBytes += 64;
+      if (corrupt == 5) bad.blockBytes = INT64_MAX;
       std::memcpy(payload.data() + payload.size() - sizeof(bad), &bad, sizeof(bad));
       EXPECT_THROW(VectorAuxListsFooter::fromFileTail(payload.data(), payload.size(), original.name), std::runtime_error);
     }

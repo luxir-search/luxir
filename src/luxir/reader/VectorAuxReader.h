@@ -37,6 +37,7 @@
 #include "luxir/util/luxir_util.h"
 #include "luxir/util/Once.h"
 #include "luxir/util/VectorRotation.h"
+#include "luxir/query/RaBitQScorer.h"
 
 namespace luxir {
 
@@ -47,7 +48,7 @@ namespace luxir {
 /// segments they describe, never shipped between hosts.
 LUXIR_UNALIGNED_START
 struct VectorAuxMeta {
-  static constexpr int32_t VERSION = 4;
+  static constexpr int32_t VERSION = 5;
   int32_t version = VERSION;
   int32_t dims = 0;
   int32_t metric = 0;       // raw luxir::api::VectorMetric value
@@ -60,6 +61,13 @@ struct VectorAuxMeta {
 
   int32_t rotationKind = 0;  // ENGINE_IVFRABITQ only: VectorRotation kind
   uint64_t rotationSeed = 0; // ENGINE_IVFRABITQ only: VectorRotation seed
+  int32_t listLayout = LIST_ROWS;
+
+  // List codes row by row, the FAISS layout.
+  static constexpr int32_t LIST_ROWS = 0;
+  // 1-bit RaBitQ only: the row codes, and the same lists again in
+  // RaBitQBlockLayout for the block kernel.
+  static constexpr int32_t LIST_ROWS_AND_BLOCKS = 1;
 
   // IVF + product quantization; the FAISS header is a bare IndexIVFPQ.
   static constexpr int32_t ENGINE_IVFPQ = 1;
@@ -90,6 +98,13 @@ struct VectorAuxMeta {
         "VectorAuxMeta: aux '{}' has unsupported vector engine {}",
         auxName, (int32_t)meta.engine));
     }
+    // The reader checks the code bits against the index header.
+    if (meta.listLayout != LIST_ROWS && (meta.listLayout != LIST_ROWS_AND_BLOCKS
+        || meta.engine != ENGINE_IVFRABITQ || !RaBitQBlockLayout::supports(meta.dims))) {
+      throw std::runtime_error(std::format(
+        "VectorAuxMeta: aux '{}' has unsupported list layout {}",
+        auxName, (int32_t)meta.listLayout));
+    }
     return meta;
   }
 } LUXIR_UNALIGNED_END;
@@ -108,7 +123,7 @@ inline int32_t defaultIvfNList(int64_t n) {
   return (int32_t)std::min<int64_t>(derived, n);
 }
 
-static_assert(sizeof(VectorAuxMeta) == 10 * sizeof(int32_t) + sizeof(uint64_t),
+static_assert(sizeof(VectorAuxMeta) == 11 * sizeof(int32_t) + sizeof(uint64_t),
               "VectorAuxMeta layout is an on-disk contract");
 
 // Intern by the disk parameters so each query rotates once per transform.
@@ -141,6 +156,8 @@ internVectorRotation(int32_t kind, int32_t dims, uint64_t seed) {
 ///   [S, I)    ids, uint32[ntotal], concatenated in list order
 ///   [I8, C)   codes, uint8[ntotal * codeSize], same order (I8 = I padded to 8)
 ///   [C8, A)   amplitudes, float[ntotal * amplitudeCount], in list order
+///   [A64, B)  blockBytes of RaBitQBlockLayout blocks, each list's rows from
+///             a new block (VectorAuxMeta::LIST_ROWS_AND_BLOCKS; else empty)
 ///   [.., end) this footer (8-aligned)
 ///
 /// Ids are segment-local value ranks (the builder assigns them 0..ntotal-1),
@@ -154,15 +171,18 @@ struct VectorAuxListsFooter {
   int64_t nlist = 0;
   int64_t codeSize = 0;
   int64_t ntotal = 0;
+  int64_t blockBytes = 0;
   int32_t amplitudeCount = 0;  // PQ: 0; RaBitQ 1-bit: sigma1; multi-bit: sigmaB
   int32_t reserved = 0;
   int32_t version = 0;
   int32_t magic = 0;
 
   static constexpr int32_t MAGIC = 0x4C495853;  // "SXIL"
-  static constexpr int32_t VERSION = 4;
+  static constexpr int32_t VERSION = 5;
+  static constexpr size_t BLOCK_ALIGN = 64;
 
   static constexpr size_t align8(size_t n) noexcept { return (n + 7) & ~(size_t)7; }
+  static constexpr size_t align64(size_t n) noexcept { return (n + 63) & ~(size_t)63; }
 
   /// Section offsets within the file, derived from the footer fields.
   size_t sizesOffset() const noexcept { return align8((size_t)faissHeaderBytes); }
@@ -171,11 +191,15 @@ struct VectorAuxListsFooter {
   size_t amplitudesOffset() const noexcept {
     return align8(codesOffset() + (uint64_t)ntotal * (uint64_t)codeSize);
   }
-  size_t expectedFileBytes() const noexcept {
+  size_t amplitudesEnd() const noexcept {
     // Unsigned multiply: ntotal/codeSize are file-controlled (read from the
     // footer before validation), so a corrupt footer could overflow a signed
     // int64 product (UB) inside the very check meant to reject it.
-    return align8(amplitudesOffset() + (uint64_t)ntotal * (uint32_t)amplitudeCount * sizeof(float))
+    return amplitudesOffset() + (uint64_t)ntotal * (uint32_t)amplitudeCount * sizeof(float);
+  }
+  size_t blocksOffset() const noexcept { return align64(amplitudesEnd()); }
+  size_t expectedFileBytes() const noexcept {
+    return align8(blockBytes ? blocksOffset() + (uint64_t)blockBytes : amplitudesEnd())
          + sizeof(VectorAuxListsFooter);
   }
 
@@ -205,15 +229,16 @@ struct VectorAuxListsFooter {
       offset += count * width;
       return true;
     };
-    auto align = [&]() { return section((8 - offset % 8) % 8, 1); };
+    auto align = [&](size_t to = 8) { return section((to - offset % to) % to, 1); };
     // Consume the available bytes before multiplying or adding file-controlled
     // values. This also rejects overlapping sections and alignment overflow.
     if (f.faissHeaderBytes <= 0 || f.nlist <= 0 || f.codeSize <= 0 || f.ntotal < 0
-        || f.amplitudeCount < 0 || f.amplitudeCount > 1 || f.reserved != 0
+        || f.amplitudeCount < 0 || f.amplitudeCount > 1 || f.reserved != 0 || f.blockBytes < 0
         || !section(f.faissHeaderBytes, 1) || !align()
         || !section(f.nlist, 8) || !section(f.ntotal, sizeof(uint32_t)) || !align()
         || !section(f.ntotal, f.codeSize) || !align()
-        || !section(f.ntotal, (uint32_t)f.amplitudeCount * sizeof(float)) || !align()
+        || !section(f.ntotal, (uint32_t)f.amplitudeCount * sizeof(float))
+        || (f.blockBytes > 0 && (!align(BLOCK_ALIGN) || !section(f.blockBytes, 1))) || !align()
         || offset != payload) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: aux '{}' lists footer does not match file size {}",
@@ -223,7 +248,7 @@ struct VectorAuxListsFooter {
   }
 } LUXIR_UNALIGNED_END;
 
-static_assert(sizeof(VectorAuxListsFooter) == 4 * sizeof(int64_t) + 4 * sizeof(int32_t),
+static_assert(sizeof(VectorAuxListsFooter) == 5 * sizeof(int64_t) + 4 * sizeof(int32_t),
               "VectorAuxListsFooter layout is an on-disk contract");
 
 // Relative to the factors following the sign bytes. The derived FAISS type
@@ -240,6 +265,15 @@ struct RaBitQAmplitudes {
   std::span<const float> list(size_t listNo) const noexcept {
     return {values + offsets[listNo], offsets[listNo + 1] - offsets[listNo]};
   }
+};
+
+// The lists of a LIST_ROWS_AND_BLOCKS overlay in RaBitQBlockLayout.
+struct RaBitQBlockLists {
+  const uint8_t* base = nullptr;  // null: no blocks
+  size_t blockBytes = 0;
+  std::vector<size_t> offsets;    // first block of each list, nlist + 1 entries
+
+  const uint8_t* list(size_t listNo) const noexcept { return base + offsets[listNo] * blockBytes; }
 };
 
 /// Read-only faiss::InvertedLists serving codes + ids directly out of the aux
@@ -320,6 +354,7 @@ class VectorAuxReader : public AuxReader {
   // (shared across overlays by internVectorRotation); null otherwise.
   mutable std::shared_ptr<const VectorRotation> rotation;
   mutable RaBitQAmplitudes amplitudes;
+  RaBitQBlockLists blockLists;
   VectorAuxMeta meta;
   VectorAuxListsFooter footer;
   mutable std::mutex unitCountMutex;
@@ -350,15 +385,36 @@ class VectorAuxReader : public AuxReader {
       throw std::runtime_error(std::format(
         "VectorAuxReader: aux '{}' amplitude layout does not match codec", this->name));
     }
+    bool blocked = meta.listLayout == VectorAuxMeta::LIST_ROWS_AND_BLOCKS;
+    if (blocked != (footer.blockBytes > 0)) {
+      throw std::runtime_error(std::format(
+        "VectorAuxReader: aux '{}' list blocks do not match its list layout", this->name));
+    }
     const int64_t* sizes = (const int64_t*)(base + footer.sizesOffset());
     int64_t remaining = footer.ntotal;
+    if (blocked) {
+      blockLists.blockBytes = RaBitQBlockLayout((size_t)meta.dims).bytes;
+      blockLists.offsets.resize((size_t)footer.nlist + 1);
+    }
     for (int64_t i = 0; i < footer.nlist; i++) {
       if (sizes[i] < 0 || sizes[i] > remaining) {
         throw std::runtime_error("VectorAuxReader: invalid list size");
       }
       remaining -= sizes[i];
+      if (blocked) {
+        blockLists.offsets[(size_t)i + 1] = blockLists.offsets[(size_t)i] + RaBitQBlockLayout::blocks((size_t)sizes[i]);
+      }
     }
     if (remaining != 0) throw std::runtime_error("VectorAuxReader: list sizes do not match ntotal");
+    if (blocked) {
+      if ((uint64_t)footer.blockBytes / blockLists.blockBytes != blockLists.offsets.back()
+          || (uint64_t)footer.blockBytes % blockLists.blockBytes != 0
+          || (size_t)footer.codeSize != RaBitQBlockLayout((size_t)meta.dims).codeBytes + 2 * sizeof(float)) {
+        throw std::runtime_error(std::format(
+          "VectorAuxReader: aux '{}' list blocks do not match its lists", this->name));
+      }
+      blockLists.base = (const uint8_t*)base + footer.blocksOffset();
+    }
     // Validate once on open; list scans use unchecked, sequential float loads.
     if (isRaBitQ()) {
       const float* values = (const float*)(base + footer.amplitudesOffset());
@@ -420,6 +476,10 @@ public:
   const RaBitQAmplitudes& getAmplitudes() const { getFaissIndex(); return amplitudes; }
   /// The file-backed inverted lists behind getFaissIndex().
   const MmapInvertedLists& getLists() const { getFaissIndex(); return *mmapLists; }
+  /// The lists in RaBitQBlockLayout, or null when the overlay has none.
+  const RaBitQBlockLists* getBlockLists() const noexcept {
+    return blockLists.base != nullptr ? &blockLists : nullptr;
+  }
 
   // Search-time entry point: the IVF index (for ENGINE_IVFRABITQ, the index
   // behind the rotation; see getRotation).  Decode is lazy and once-only;
@@ -454,6 +514,10 @@ public:
           throw std::runtime_error(std::format(
             "VectorAuxReader: RaBitQ bits mismatch for aux '{}': index has {}, opaque_meta says {}",
             name, rq->rabitq.nb_bits, (int32_t)meta.rabitqBits));
+        }
+        if (blockLists.base != nullptr && rq->rabitq.nb_bits != 1) {
+          throw std::runtime_error(std::format(
+            "VectorAuxReader: aux '{}' has list blocks for {}-bit codes", name, rq->rabitq.nb_bits));
         }
         if (meta.rotationKind != VectorRotation::FHT_KAC) {
           throw std::runtime_error(std::format(

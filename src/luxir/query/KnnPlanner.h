@@ -12,6 +12,7 @@
 #include <span>
 #include <string_view>
 #include <vector>
+#include "RaBitQScorer.h"
 #include "VectorEngine.h"
 #include "luxir/codec/VectorCodec.h"
 
@@ -27,13 +28,15 @@ struct KnnPlanner {
               ENTRY_NONE, ENTRY_BITMAP, ENTRY_PQ, ENTRY_MISPREDICT, RESOLVE_IDENTITY, RESOLVE_SELECT, RESOLVE_MONO,
               BIT_PROBE, ARRAY_STEP, PQ_SUBCODE, PQ_BIT, ONE_BIT_DIM, EXTRA_BIT_DIM,
               PQ_LIST_SETUP, PQ_TABLE_DIM, RABITQ_LIST_DIM, COARSE_DIM, ROUND, IVF_REQUEST, FOLD_DOC, FOLD_WORD,
-              SCORER_DIM, SCORER_LIST_DIM, ONE_BIT_CODE, EXTRA_BIT_CODE, SCORER_CODE, NUM_UNITS };
+              SCORER_DIM, SCORER_LIST_DIM, ONE_BIT_CODE, EXTRA_BIT_CODE, SCORER_CODE,
+              SCORER_BLOCK_ROW, SCORER_BLOCK_DIM, NUM_UNITS };
   static constexpr std::array<std::string_view, NUM_UNITS> unitNames{
     "exact_dims", "terminal_dims", "terminal_reads", "domain_docs", "rank_visits", "flat_probes", "sparse_maps", "multi_maps",
     "entry_none", "entry_bitmap", "entry_pq", "entry_mispredict", "resolve_identity", "resolve_select", "resolve_mono",
     "bit_probes", "array_steps", "pq_subcodes", "pq_bits", "one_bit_dims", "extra_bit_dims",
     "pq_list_setups", "pq_table_dims", "rabitq_list_dims", "coarse_dims", "ivf_slot_rounds", "ivf_request", "fold_docs", "fold_words",
-    "scorer_dims", "scorer_list_dims", "one_bit_codes", "extra_bit_codes", "scorer_codes"};
+    "scorer_dims", "scorer_list_dims", "one_bit_codes", "extra_bit_codes", "scorer_codes",
+    "scorer_block_rows", "scorer_block_dims"};
   using Work = std::array<double, NUM_UNITS>;
   struct Costs {
     // Forced-arm fit on munin at 3.3 GHz with FAISS 1.16.0 and AVX-512: SIFT 1M
@@ -52,6 +55,12 @@ struct KnnPlanner {
     // code costs a constant plus its dimensions: popcounts are cheap beside
     // reaching the code, so per-dimension units alone overprice wide vectors.
     // The scorer's selector test does not branch, so it pays no ENTRY_MISPREDICT.
+    // SCORER_BLOCK_* price the block kernel per row of each block it scores,
+    // selected or not; SCORER_CODE and SCORER_DIM then price only the rows the
+    // row kernel scores. Seeded, not fitted: the row kernel's per-code
+    // overhead outside the kernel (about 4 ns), and the block kernel's
+    // per-dimension cost streaming 128-1536-d codes from DRAM (0.77-9.8 ns
+    // per row on AVX2, 2-4.7x below the row kernel).
     static constexpr double NS_PER_DIM = 0.135;
     Work units{1, 0.338 / NS_PER_DIM, 195 / NS_PER_DIM, 21.6 / NS_PER_DIM, 1, 4, 16, 24,
                1, 0.889 / NS_PER_DIM, 3.02 / NS_PER_DIM, 23.1 / NS_PER_DIM, 0, 16, 24,
@@ -60,7 +69,8 @@ struct KnnPlanner {
                0.0377 / NS_PER_DIM, 1690 / NS_PER_DIM, 144300 / NS_PER_DIM,
                5.49 / NS_PER_DIM, 0.5 / NS_PER_DIM,
                0.00868 / NS_PER_DIM, 0.340 / NS_PER_DIM,
-               7.50 / NS_PER_DIM, 17.7 / NS_PER_DIM, 7.50 / NS_PER_DIM};
+               7.50 / NS_PER_DIM, 17.7 / NS_PER_DIM, 7.50 / NS_PER_DIM,
+               4.0 / NS_PER_DIM, 0.0062 / NS_PER_DIM};
     double requestCost = 18400 / NS_PER_DIM; // Common to both arms, once per query.
     // EXACT_DIM and TERMINAL_DIM per stored encoding, relative to f32, indexed
     // [cosine on a non-f32 column][VectorEncoding] (f32, f16, bf16, sq8).
@@ -105,6 +115,7 @@ struct KnnPlanner {
     bool l2 = false, cosine = false, domain = false, arrayDomain = false, unfiltered = true, deletes = false;
     bool sparse = false, multi = false, bounded = false;
     bool vectorsEstimated = false, pqPerListTable = false, forceFaissRaBitQ = false;
+    bool rabitqBlocks = false;  // The overlay has its 1-bit lists in RaBitQBlockLayout.
 
     int64_t physicalUnits() const { return unitsWithValue < 0 ? docsWithField : unitsWithValue; }
     int64_t selectedUnits() const { return eligibleUnits < 0 ? eligibleDocs : eligibleUnits; }
@@ -167,6 +178,31 @@ struct KnnPlanner {
   }
   static bool usesScorer(const Segment& s) {
     return s.codec == Codec::RABITQ && usesScorer(s.rabitqBits, s.rabitqQueryBits, s.forceFaissRaBitQ);
+  }
+  static bool usesBlocks(const Segment& s) {
+    return usesScorer(s) && s.rabitqBlocks && RaBitQScorer::blockKernel(s.rabitqQueryBits);
+  }
+  // Expected block kernel work per scanned row when each row is selected
+  // independently with probability `rate`: the rows of blocks with at least
+  // RaBitQScorer::blockMinRows selected rows, and the selected rows among them.
+  struct BlockShare { double rows = 0, scores = 0; };
+  static BlockShare blockShare(int32_t dims, double rate) {
+    constexpr int ROWS = (int)RaBitQBlockLayout::ROWS;
+    if (rate >= 1) return {1, 1};
+    if (!(rate > 0)) return {};
+    static const std::array<double, ROWS + 1> logChoose = [] {
+      std::array<double, ROWS + 1> c{};
+      for (int k = 0; k <= ROWS; k++) c[k] = std::lgamma(ROWS + 1.0) - std::lgamma(k + 1.0) - std::lgamma(ROWS - k + 1.0);
+      return c;
+    }();
+    double logRate = std::log(rate), logRest = std::log1p(-rate);
+    BlockShare share;
+    for (int k = (int)RaBitQScorer::blockMinRows(dims); k <= ROWS; k++) {
+      double p = std::exp(logChoose[k] + k * logRate + (ROWS - k) * logRest);
+      share.rows += p;
+      share.scores += p * k / ROWS;
+    }
+    return share;
   }
   static bool canIvf(const Segment& s) {
     return s.codec != Codec::FLAT && s.liveVectors > 0 && s.eligibleDocs > 0;
@@ -243,8 +279,15 @@ struct KnnPlanner {
       p.linear[PQ_SUBCODE] = (double)s.eligibleVectors * s.pqM;
       p.linear[PQ_BIT] = p.linear[PQ_SUBCODE] * s.pqBits;
     } else {
-      p.linear[usesScorer(s) ? SCORER_CODE : ONE_BIT_CODE] = (double)s.eligibleVectors;
-      p.linear[usesScorer(s) ? SCORER_DIM : ONE_BIT_DIM] = (double)s.eligibleVectors * s.dims;
+      double rowScores = (double)s.eligibleVectors;
+      if (usesBlocks(s)) {
+        auto share = blockShare(s.dims, (double)s.eligibleVectors / std::max((int64_t)1, s.vectors));
+        rowScores = std::max(0.0, rowScores - share.scores * (double)s.vectors);
+        p.linear[SCORER_BLOCK_ROW] = share.rows * (double)s.vectors;
+        p.linear[SCORER_BLOCK_DIM] = p.linear[SCORER_BLOCK_ROW] * s.dims;
+      }
+      p.linear[usesScorer(s) ? SCORER_CODE : ONE_BIT_CODE] = rowScores;
+      p.linear[usesScorer(s) ? SCORER_DIM : ONE_BIT_DIM] = rowScores * s.dims;
       if (s.rabitqBits > 1) {
         p.linear[EXTRA_BIT_CODE] = (double)s.eligibleVectors * costs.extraBitSurvival(s.dims);
         p.linear[EXTRA_BIT_DIM] = p.linear[EXTRA_BIT_CODE] * (s.rabitqBits - 1) * s.dims;
@@ -480,8 +523,10 @@ struct KnnPlanner {
     f[RESOLVE_MONO] = (double)w.resolveMono;
     f[BIT_PROBE] = (double)w.bitProbes; f[ARRAY_STEP] = (double)w.arraySteps;
     f[PQ_SUBCODE] = (double)w.pqScores * s.pqM; f[PQ_BIT] = f[PQ_SUBCODE] * s.pqBits;
-    f[usesScorer(s) ? SCORER_CODE : ONE_BIT_CODE] = (double)w.oneBitScores;
-    f[usesScorer(s) ? SCORER_DIM : ONE_BIT_DIM] = (double)w.oneBitScores * s.dims;
+    f[usesScorer(s) ? SCORER_CODE : ONE_BIT_CODE] = (double)(w.oneBitScores - w.blockScores);
+    f[usesScorer(s) ? SCORER_DIM : ONE_BIT_DIM] = (double)(w.oneBitScores - w.blockScores) * s.dims;
+    f[SCORER_BLOCK_ROW] = (double)w.blockRows;
+    f[SCORER_BLOCK_DIM] = (double)w.blockRows * s.dims;
     f[EXTRA_BIT_CODE] = (double)w.extraBitScores;
     f[EXTRA_BIT_DIM] = (double)w.extraBitScores * std::max(0, s.rabitqBits - 1) * s.dims;
     f[PQ_LIST_SETUP] = s.codec == Codec::PQ && s.l2 && !s.pqPerListTable ? (double)w.listSetups * s.pqM : 0;

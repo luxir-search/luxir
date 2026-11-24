@@ -291,6 +291,9 @@ public:
   // Scores 1-bit RaBitQ through FAISS's distance computer instead of
   // RaBitQScorer; tests compare the two.
   static inline bool forceFaissRaBitQ = false;
+  // Scores 1-bit RaBitQ lists with the row kernel only, ignoring the block
+  // layout; tests and benchmarks compare the two.
+  static inline bool rowRaBitQKernel = false;
 
   static constexpr float RABITQ_GATE_EPSILON = 1.9f;
   static constexpr float RABITQ_SELECTION_EPSILON = 1.9f;
@@ -1169,6 +1172,7 @@ public:
               input.rabitqBits = vaux->getRaBitQBits();
               input.rabitqQueryBits = query.getFieldType().ann().rabitqQueryBits;
               input.forceFaissRaBitQ = forceFaissRaBitQ;
+              input.rabitqBlocks = !rowRaBitQKernel && vaux->getBlockLists() != nullptr;
               input.pqPerListTable = input.codec == KnnPlanner::Codec::PQ && input.l2
                   && !VectorAuxReader::usePrecomputedTable(faiss::METRIC_L2, true,
                       input.nlist, input.pqM, 1 << input.pqBits, segCount, dims);
@@ -1327,7 +1331,8 @@ public:
             .ivfEngine = std::make_unique<SegmentIvfScanner<Groups, Owned>>(
                 *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
                 metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
-                vaux->getLists(), vaux->getAmplitudes(), interval ? &intervals : nullptr),
+                vaux->getLists(), vaux->getAmplitudes(), rowRaBitQKernel ? nullptr : vaux->getBlockLists(),
+                interval ? &intervals : nullptr),
           });
         } else {
           slots.push_back({
@@ -1553,6 +1558,11 @@ public:
           if (input.codec == KnnPlanner::Codec::PQ) w.pqScores = w.selectorPasses;
           else {
             w.oneBitScores = w.selectorPasses;
+            if (KnnPlanner::usesBlocks(input)) {
+              auto share = KnnPlanner::blockShare(input.dims, rate);
+              w.blockRows = (int64_t)std::ceil(w.physicalEntries * share.rows);
+              w.blockScores = std::min(w.oneBitScores, (int64_t)std::ceil(w.physicalEntries * share.scores));
+            }
             double survival = spent.oneBitScores ? (double)spent.extraBitScores / spent.oneBitScores : tuning.plannerCosts.extraBitSurvival(input.dims);
             if (input.rabitqBits > 1) w.extraBitScores = (int64_t)std::ceil(w.oneBitScores * survival);
           }
@@ -1959,6 +1969,7 @@ public:
     template <bool Groups, bool Owned> class SegmentIvfScanner {
       const CollapsePlan* groupPlan;
       RaBitQAmplitudes amplitudes;
+      const RaBitQBlockLists* blockLists;  // null: score rows only
       KnnIntervalCollector<Groups>* intervals;
 
       /// Resolve-based eligibility selector over the live-filtered query
@@ -2172,8 +2183,9 @@ public:
                         std::shared_ptr<const RankLiveBitmap> rankLive, int32_t metric,
                         const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
                         const MmapInvertedLists& lists, RaBitQAmplitudes amplitudes,
-                        KnnIntervalCollector<Groups>* intervals)
-          : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
+                        const RaBitQBlockLists* blockLists, KnnIntervalCollector<Groups>* intervals)
+          : groupPlan(groupPlan), amplitudes(amplitudes), blockLists(blockLists), intervals(intervals), ivf(ivf),
+            rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
             lists(lists), segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
             domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
                                         && domain == &liveDocs->docset()),
@@ -2256,14 +2268,23 @@ public:
         std::unique_ptr<faiss::InvertedListScanner> pqScanner;
         std::vector<float> centroid;
         std::optional<RaBitQScorer> oneBitScorer;
+        bool blocked = false;
+        constexpr bool unfiltered = std::is_same_v<Probe, std::nullptr_t>;
+        int kernels = RaBitQScorer::ROW_KERNEL;
+        int64_t blockRows = 0, blockScores = 0;
         bool multiBit = rabitq != nullptr && rabitq->rabitq.nb_bits > 1;
         if (rabitq != nullptr) {
           centroid.resize((size_t)ivf.d);
           // FAISS's distance computer remains for extended codes and for the
           // unquantized query (query bits 0).
-          if (KnnPlanner::usesScorer((int32_t)rabitq->rabitq.nb_bits, preparedQuery.queryBits, forceFaissRaBitQ))
+          if (KnnPlanner::usesScorer((int32_t)rabitq->rabitq.nb_bits, preparedQuery.queryBits, forceFaissRaBitQ)) {
+            blocked = blockLists != nullptr && RaBitQScorer::blockKernel(preparedQuery.queryBits);
             oneBitScorer.emplace(ivf.d, preparedQuery.queryBits,
-                                 rabitq->rabitq.metric_type == faiss::METRIC_INNER_PRODUCT, preparedQuery.query);
+                                 rabitq->rabitq.metric_type == faiss::METRIC_INNER_PRODUCT, preparedQuery.query, blocked);
+            // Unfiltered lists need no row kernel tables. A filtered list
+            // builds the tables of the kernels its selected rows reach.
+            if (blocked) kernels = unfiltered ? RaBitQScorer::BLOCK_KERNEL : RaBitQScorer::LAZY;
+          }
         } else {
           pqScanner.reset(ivf.get_InvertedListScanner(false, selector.get()));
           pqScanner->set_query(preparedQuery.query);
@@ -2301,7 +2322,7 @@ public:
           if (rabitq != nullptr) {
             ivf.quantizer->reconstruct(id, centroid.data());
             if (oneBitScorer) {
-              oneBitScorer->setList(centroid.data());
+              oneBitScorer->setList(centroid.data(), kernels);
               gError = oneBitScorer->queryToCentroid();
             } else {
               distanceComputer.reset(rabitq->rabitq.get_distance_computer(
@@ -2313,6 +2334,7 @@ public:
             }
           } else pqScanner->set_list(id, centroidDists[list]);
           if constexpr (Interval) listAmplitudes = amplitudes.list((size_t)id).data();
+          const uint8_t* listBlocks = blocked ? blockLists->list((size_t)id) : nullptr;
           double gateScale = (double)gError * (RABITQ_GATE_EPSILON / 1.9f);
           selectionScale = (double)gError * RABITQ_SELECTION_EPSILON;
 
@@ -2325,19 +2347,54 @@ public:
             if (oneBitScorer) {
               alignas(64) float distances[RaBitQScorer::BLOCK_ROWS];
               const uint8_t* block = codes + begin * ivf.code_size;
-              if constexpr (std::is_same_v<Probe, std::nullptr_t>) {
+              // begin is a multiple of the block rows.
+              const uint8_t* blocks = blocked
+                  ? listBlocks + begin / RaBitQBlockLayout::ROWS * blockLists->blockBytes : nullptr;
+              if constexpr (unfiltered) {
                 size_t rows = end - begin;
-                oneBitScorer->score(block, ivf.code_size, rows, distances);
+                if (blocked) {
+                  oneBitScorer->scoreBlocks(blocks, rows, distances);
+                  blockRows += (int64_t)(RaBitQBlockLayout::blocks(rows) * RaBitQBlockLayout::ROWS);
+                  blockScores += (int64_t)rows;
+                } else oneBitScorer->score(block, ivf.code_size, rows, distances);
                 scanned += (int64_t)rows;
                 for (size_t k = 0; k < rows; k++) admit(distances[k], begin + k);
               } else {
                 uint16_t selected[RaBitQScorer::BLOCK_ROWS];
                 size_t rows = 0;
-                for (size_t k = 0; k < end - begin; k++) {
-                  selected[rows] = (uint16_t)k;
-                  rows += probe(ids[begin + k]) ? 1 : 0;
+                if (blocked) {
+                  // Note where each block's selected rows start, so the scorer
+                  // finds dense blocks without another pass over the rows.
+                  constexpr size_t ROWS = RaBitQBlockLayout::ROWS;
+                  uint16_t starts[RaBitQScorer::BLOCK_ROWS / ROWS + 1];
+                  size_t n = end - begin, blockCount = RaBitQBlockLayout::blocks(n);
+                  for (size_t b = 0; b < blockCount; b++) {
+                    starts[b] = (uint16_t)rows;
+                    size_t first = b * ROWS;
+                    if (first + ROWS <= n) {
+#pragma GCC unroll 32
+                      for (size_t j = 0; j < ROWS; j++) {
+                        selected[rows] = (uint16_t)(first + j);
+                        rows += probe(ids[begin + first + j]) ? 1 : 0;
+                      }
+                    } else {
+                      for (size_t k = first; k < n; k++) {
+                        selected[rows] = (uint16_t)k;
+                        rows += probe(ids[begin + k]) ? 1 : 0;
+                      }
+                    }
+                  }
+                  starts[blockCount] = (uint16_t)rows;
+                  auto blockWork = oneBitScorer->score(block, ivf.code_size, blocks, selected, starts, blockCount, distances);
+                  blockRows += (int64_t)(blockWork.blocks * RaBitQBlockLayout::ROWS);
+                  blockScores += (int64_t)blockWork.rows;
+                } else {
+                  for (size_t k = 0; k < end - begin; k++) {
+                    selected[rows] = (uint16_t)k;
+                    rows += probe(ids[begin + k]) ? 1 : 0;
+                  }
+                  oneBitScorer->score(block, ivf.code_size, selected, rows, distances);
                 }
-                oneBitScorer->score(block, ivf.code_size, selected, rows, distances);
                 scanned += (int64_t)rows;
                 for (size_t k = 0; k < rows; k++) admit(distances[k], begin + selected[k]);
               }
@@ -2388,9 +2445,12 @@ public:
         } else work.depthEntries = visited;
         work.pqScores = rabitq == nullptr ? scanned : 0;
         work.oneBitScores = rabitq != nullptr ? scanned : 0;
+        work.blockRows = blockRows;
+        work.blockScores = blockScores;
         work.extraBitScores = extra;
         work.gateRejections = rejected;
-        work.scoreBytes = (multiBit ? extra : scanned) * (int64_t)ivf.code_size;
+        work.scoreBytes = (multiBit ? extra : scanned - blockScores) * (int64_t)ivf.code_size
+            + (blocked ? blockRows / (int64_t)RaBitQBlockLayout::ROWS * (int64_t)blockLists->blockBytes : 0);
         return work;
       }
     };
