@@ -2471,7 +2471,8 @@ public:
         // limit would only duplicate the held ranking pass.
         auto bound = weight->countShortcut(segment, nullptr).maxMatches;
         if (bound > remaining) {
-          qr->boundedCountWeight = qcontext->createRootWeight(*query, requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING));
+          qr->boundedCountWeight = qcontext->createRootWeight(
+              *query, requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING));
           break;
         }
         remaining -= bound;
@@ -2788,6 +2789,7 @@ public:
     for (auto* src : fusion->sources) {
       src->parent = fusion;
     }
+
     addSubs(*fusion, fusionProto.ops, depth, OpsPlacement::FUSION);
     if (collapse) {
       inheritedFacetMeasure = nullptr;

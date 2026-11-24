@@ -1762,6 +1762,42 @@ public:
       return accumulator;
     }
 
+    bool canRecordSegmentCount(IndexReader::Segment& seg, DocSet* domain) {
+      auto& op = thisOp();
+      return !op.sortPlan.useFieldSort && op.requirements.countLimit < 0 && op.filterWeights.empty()
+          && !requiresWholeIndexPrepare && op.wholeMembershipPlan.canRecordCount(seg, domain);
+    }
+
+    template <bool Collapsed, bool MetricGroups>
+    auto* skipSegment(IndexReader::Segment& seg, DomainHandle& domain, std::vector<std::string> details) {
+      auto& op = thisOp();
+      auto release = scope_guard([&]() noexcept { releaseSegmentState(seg); });
+      size_t ord = (size_t)seg.ord;
+      // Drop the inputs that prepareRoutedProduction would consume for this segment.
+      if (!preparedRoutedReservations.empty()) {
+        for (auto* inputs : {&preparedRoutedFilters, &preparedResetRoutedFilters, &preparedVariantInheritBases}) {
+          if (!inputs->empty()) (*inputs)[ord] = std::vector<DomainHandle>{};
+        }
+        preparedRoutedReservations[ord].reset();
+      }
+
+      // Only a proof for the key can publish raw empty membership.
+      if (op.weight && op.weight->provenEmpty(seg) && !op.wholeMembershipPlan.empty()) {
+        FilterCache::UseRegistry::SegmentScope cacheTiming(*op.planning.filterUses, ord);
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        op.wholeMembershipPlan.resolve(*op.view, seg, domain.get(), preparedWeight.get(),
+            [&](Query::Weight& resolver) { return resolver.scorerSupplier(poolGuard.pool(), seg); });
+        if (!Collapsed && canRecordSegmentCount(seg, domain.get())) op.wholeMembershipPlan.recordCount(seg, 0);
+      }
+      domain = DomainHandle::empty().scoped(seg);
+      if (!output.empty()) output[ord] = domain;
+      if (memberReplay) memberReplay->domains[ord] = domain;
+      Signal::emit("searchTopDocsSegmentPruned", this);
+      if (op.req.proto.profile) op.req.recordPrunedSegment(pruningRun, seg, std::move(details));
+      if constexpr (MetricGroups) return metricGroups->merger.obtain();
+      else return collectorMerger.obtain();
+    }
+
     // One collection ladder, specialized once per segment. Document requests
     // instantiate their original admission loop without per-hit group checks.
     template <bool Structural, bool Collapsed, bool MetricGroups = false,
@@ -1791,14 +1827,14 @@ public:
       int64_t numSegs = (int64_t)op.view->segments().size();
 
       auto& seg = op.planning.topReader.segments()[segnum];
-      std::optional<int64_t> countBefore;
-      bool skipped = false;
-      auto collectSegment = [&] {
+      std::vector<std::string> details;
+      bool skipped = op.outputsEmpty(seg, domain, op.req.proto.profile ? &details : nullptr);
+      if (skipped) {
+        data.reset(skipSegment<Collapsed, MetricGroups>(seg, domainHandle, std::move(details)));
+      } else {
         auto release = scope_guard([&]() noexcept { releaseSegmentState(seg); });
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        std::vector<std::string> details;
-        skipped = op.outputsEmpty(seg, domain, op.req.proto.profile ? &details : nullptr);
-        if (!skipped && !op.domainVariants.empty()) {
+        if (!op.domainVariants.empty()) {
           routedBaseDomain = domain;
           routedProduction.emplace(prepareRoutedProduction<Structural>(
               poolGuard.pool(), segnum, domainHandle));
@@ -1807,51 +1843,29 @@ public:
         }
 
         if constexpr (Collapsed) {
-          // Retain the eligibility collection uses for member replay.
-          if (memberReplay && !skipped && !requiresWholeIndexPrepare
-              && op.domainVariants.empty() && !op.filterWeights.empty()) {
-            std::vector<DomainHandle> parts{domainHandle};
-            for (size_t i = 0; i < op.filterWeights.size(); i++) {
-              parts.push_back(QueryPrep::materializeEffectiveFilter(
-                  *op.filterWeights[i], op.filterUses[i], *op.view, seg, nullptr));
+          if (memberReplay) {
+            // Retain precisely the eligibility used by collection. Prepared
+            // sources (notably kNN) outlive this pass and are replayed as-is.
+            if (!requiresWholeIndexPrepare && op.domainVariants.empty()
+                && !op.filterWeights.empty()) {
+              std::vector<DomainHandle> parts{domainHandle};
+              for (size_t i = 0; i < op.filterWeights.size(); i++) {
+                parts.push_back(QueryPrep::materializeEffectiveFilter(
+                    *op.filterWeights[i], op.filterUses[i], *op.view, seg, nullptr));
+              }
+              domainHandle = memberReplay->compose(std::move(parts),
+                  op.domainVariants.estimatedSetBytes(seg.maxDoc()));
+              domain = domainHandle.get();
             }
-            domainHandle = memberReplay->compose(std::move(parts),
-                op.domainVariants.estimatedSetBytes(seg.maxDoc()));
-            domain = domainHandle.get();
+            memberReplay->domains[(size_t)segnum] = domainHandle;
           }
         }
 
-        // Obtain as late as possible so concurrent segments can reuse a collector.
-        if constexpr (MetricGroups) data.reset(metricGroups->merger.obtain());
-        else data.reset(collectorMerger.obtain());
-        bool keyEmpty = skipped && op.weight && op.weight->provenEmpty(seg);
-        if constexpr (!Collapsed) {
-          if ((!skipped || keyEmpty) && !data->useFieldSort && op.requirements.countLimit < 0
-              && op.filterWeights.empty() && !requiresWholeIndexPrepare
-              && op.wholeMembershipPlan.canRecordCount(seg, domain)) {
-            countBefore = data->template scores<Collapsed, Admission>()->totalHits();
-          }
-        }
-        // An empty input or filter supplies no raw fact about the key. Keep
-        // the original domain pinned through the resolver's canonicality check.
-        if (keyEmpty && !op.wholeMembershipPlan.empty()) {
-          op.wholeMembershipPlan.resolve(*op.view, seg, domain, preparedWeight.get(),
-              [&](Query::Weight& resolver) { return resolver.scorerSupplier(poolGuard.pool(), seg); });
-        }
-        if (skipped) {
-          domainHandle = DomainHandle::empty().scoped(seg);
-          if (!output.empty()) output[(size_t)segnum] = domainHandle;
-        }
-        if (memberReplay) memberReplay->domains[(size_t)segnum] = domainHandle;
-        if (skipped) {
-          Signal::emit("searchTopDocsSegmentPruned", this);
-          if (op.req.proto.profile) op.req.recordPrunedSegment(pruningRun, seg, std::move(details));
-          return;
-        }
         std::optional<DocSetBuilder> builder;
         bool captureSharedRaw = routedProduction.has_value()
             && routedProduction->captureSharedRaw;
         if constexpr (MetricGroups) {
+          data.reset(metricGroups->merger.obtain());
           if (captureSharedRaw || !output.empty()) builder.emplace(seg.maxDoc());
           std::vector<DomainHandle> parts{domainHandle};
           if (!requiresWholeIndexPrepare && op.domainVariants.empty() && !memberReplay) {
@@ -1868,13 +1882,18 @@ public:
               captureSharedRaw ? DomainBuildMode::RAW_QUERY_MATCHES : DomainBuildMode::FILTERED_MATCHES,
               routedBaseDomain);
         } else {
+          // Wait until last moment to obtain collector in hopes of reusing an existing one.
+          // Keep ownership until release so a scoring error cannot orphan it.
+          data.reset(collectorMerger.obtain());
           auto* scoreCollector = data->template scores<Collapsed, Admission>();
           auto* fieldCollector = data->template fields<Collapsed, Admission>();
           using ActiveFieldCollector = FieldCollector<Collapsed, Admission>;
 
+          bool recordCount = !Collapsed && canRecordSegmentCount(seg, domain);
+
           // A segment ranking never pruned has its exact count already. Track
           // pruning per segment, restoring the collector's own flag afterward.
-          int64_t hitsBeforeSegment = countBefore.value_or(0);
+          int64_t hitsBeforeSegment = recordCount ? scoreCollector->totalHits() : 0;
           bool prunedBeforeSegment = false;
           DocSet* estimateFilter = nullptr;
           bool estimatorReady = false;
@@ -2647,6 +2666,9 @@ public:
               }
             }
           }
+          if (recordCount) {
+            op.wholeMembershipPlan.recordCount(seg, scoreCollector->totalHits() - hitsBeforeSegment);
+          }
           if constexpr (!Collapsed) {
             if (op.estimateCount) {
               int64_t seen = scoreCollector->totalHits() - hitsBeforeSegment;
@@ -2680,11 +2702,6 @@ public:
             output[(size_t)segnum] = std::move(built);
           }
         }
-      };
-      collectSegment();
-      if constexpr (!Collapsed) {
-        if (countBefore) op.wholeMembershipPlan.recordCount(seg,
-            data->template scores<Collapsed, Admission>()->totalHits() - *countBefore);
       }
       auto childDomain = [&](size_t child) {
         DomainHandle newDomain;

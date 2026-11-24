@@ -77,9 +77,8 @@ inline bool boundsExcludeTermRange(const DictionaryBounds& bounds,
   return false;
 }
 
-// Field absence and a record without documents prove every value-requiring
-// predicate empty. Returns the record to consult for bounds, or null with
-// `out` set.
+// Field absence proves a value-requiring predicate empty. A present record
+// has at least one document. Returns null with `out` set if there is no usable record.
 inline const DecodedFieldRecord* requireField(const CatalogSummaryView& view, std::string_view field,
                                              MatchState& out) {
   out = MatchState::UNKNOWN;
@@ -89,12 +88,6 @@ inline const DecodedFieldRecord* requireField(const CatalogSummaryView& view, st
   if (record == nullptr) {
     view.prove("field absent");
     out = MatchState::EMPTY;
-    return nullptr;
-  }
-  if (record->docsWithField == 0) {
-    view.prove("field has no values");
-    out = MatchState::EMPTY;
-    return nullptr;
   }
   return record;
 }
@@ -102,7 +95,7 @@ inline const DecodedFieldRecord* requireField(const CatalogSummaryView& view, st
 // Whether the record proves `term` absent from the field's dictionary: no
 // terms, or term bounds that exclude it. Null (no record) is absence too.
 inline bool recordExcludesTerm(const DecodedFieldRecord* record, std::string_view term) noexcept {
-  if (record == nullptr || record->docsWithField == 0) return true;
+  if (record == nullptr) return true;
   if ((record->flags & FieldType::INDEX_DOCS) && record->indexedTotals().numTerms == 0) return true;
   const auto* bounds = record->dictionaryBounds();
   return bounds != nullptr && boundsExcludeTerm(*bounds, term);

@@ -1558,7 +1558,6 @@ inline DomainHandle materializeEffectiveFilter(
     use = nullptr;
   }
   if (use == nullptr) {
-    if (weight.provenEmpty(segment)) return DomainHandle::empty().scoped(segment);
     return DomainHandle(materialize(weight, prepared, segment, domain, executionMode)).scoped(segment);
   }
 

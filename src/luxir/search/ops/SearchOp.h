@@ -166,6 +166,7 @@ public:
   BucketDomainPlan* bucketDomain = nullptr;
   InputDomainPlan* inputDomain = nullptr;
   bool needsStructuralScope = false;
+
   // We can't pass both the parent and children to constructors (and have them fully formed)
   // one has to come before the other.  The parser currently sets subOps and parent
   // after construction, so do not inspect these fields in the constructor.
