@@ -197,7 +197,6 @@ public:
 
   MatchState mayMatch(const CatalogSummaryView& view) const override {
     if (envelope.lo > envelope.hi) {
-      proof::touch(view, field);
       view.prove("empty numeric range");
       return MatchState::EMPTY;
     }

@@ -142,10 +142,8 @@ struct SearchParserImpl {
     return *slot;
   }
   ExecutionProfileOpState* pruningProfile = nullptr;
-  // TopDocs ops proven empty for the collection before planning, with the
-  // queries (as written, before the op planned a match-nothing query
-  // instead) whose proofs name the reason.
-  std::unordered_map<const SearchOp*, std::vector<Query*>> collectionProven;
+  // The authored query before a collection proof substituted MatchNoDocs.
+  std::unordered_map<const SearchOp*, Query*> collectionProven;
   // Root-level ops are depth 1. Ops nested past the configured cap are rejected
   // in addSubs, the single funnel for op recursion.
   const int maxOpDepth;
@@ -265,9 +263,6 @@ public:
   // document there.
   SegmentMask topDocsMask(Query& query, std::span<const ParsedFilter> filters,
                           const DomainVariantPlan& plan) {
-    if (plan.empty() && collectionProof(query, filters) != nullptr) {
-      return SegmentMask(view()->segments().size(), false);  // no proof per segment
-    }
     SegmentMask own = pruningOf().viable(query);
     SegmentMask mask = own;
     for (const auto& filter : filters) mask &= pruningOf().viable(*filter.query);
@@ -277,7 +272,7 @@ public:
     return mask;
   }
 
-  // The first of `query` and `filters` the merged headers prove empty for
+  // The first of `query` and `filters` the segment proofs exclude for
   // the collection, or null. Every one of them bounds the op's own matches.
   Query* collectionProof(Query& query, std::span<const ParsedFilter> filters) {
     if (pruningOf().collectionEmpty(query)) return &query;
@@ -294,29 +289,25 @@ public:
     bool explain = req.resolvedFields != nullptr;
     if (pruningProfile == nullptr) pruningProfile = req.addExecutionProfileOp("pruning");
     if (!explain && pruningProfile == nullptr) return;
-    if (auto proven = collectionProven.find(&op); proven != collectionProven.end()) roots = proven->second;
-    // A collection proof prunes every segment for one reason, found without
-    // a proof per segment.
-    if (op.viable.none()) {
-      for (Query* root : roots) {
-        std::string why = pruningOf().collectionReason(*root);
-        if (why.empty()) continue;
-        if (explain) {
-          req.resolvedFields->push_back(fmt::format("op {}: proven empty for the collection: {}", op.name, why));
-        }
-        if (auto* run = pruningProfile ? req.addExecutionProfileRun(pruningProfile) : nullptr) {
-          for (const auto& segment : view()->segments()) {
-            auto& piece = run->pieces[(size_t)segment.ord];
-            piece.wire.kind = "segment";
-            piece.wire.segment = segment.ord;
-            piece.wire.max_doc = segment.maxDoc();
-            piece.wire.strategy = "pruned";
-            piece.details.push_back(fmt::format("op {}: collection: {}", op.name, why));
-            piece.complete = true;
-          }
-        }
-        return;
+    // Explain gives one witness. Each profile piece describes its own segment.
+    if (auto proven = collectionProven.find(&op); proven != collectionProven.end()) {
+      Query* root = proven->second;
+      if (explain) {
+        req.resolvedFields->push_back(fmt::format("op {}: proven empty for the collection (segment 0: {})",
+                                                  op.name, pruningOf().reason(*root, 0)));
       }
+      if (auto* run = pruningProfile ? req.addExecutionProfileRun(pruningProfile) : nullptr) {
+        for (const auto& segment : view()->segments()) {
+          auto& piece = run->pieces[(size_t)segment.ord];
+          piece.wire.kind = "segment";
+          piece.wire.segment = segment.ord;
+          piece.wire.max_doc = segment.maxDoc();
+          piece.wire.strategy = "pruned";
+          piece.details.push_back(fmt::format("op {}: collection: {}", op.name, pruningOf().reason(*root, segment.ord)));
+          piece.complete = true;
+        }
+      }
+      return;
     }
     auto* run = req.addExecutionProfileRun(pruningProfile);
     for (const auto& segment : view()->segments()) {
@@ -2150,18 +2141,16 @@ public:
       routedFilters = !domainVariants.empty();
     }
 
-    // The collection proof, before any weight exists: the merged headers
+    // The collection proof, before any weight exists: the segment masks
     // prove the op's own matches empty and no domain variant widens its root
     // mask. Its weights would still seek terms in every segment for
     // statistics, so the op plans a query that matches nothing instead and
     // answers as an empty match, reading no segment's data. A query that may
     // prepare over the whole index (kNN) keeps its weights: preparation sees
     // every segment's domain, and the op is left to its (empty) root mask.
-    std::vector<Query*> provenRoots;
     Query* provenQuery = nullptr;
     if (domainVariants.empty() && !routedFilters && (foldFilters || filters.empty())
         && !planningContext->mayPrepare && pruningOf().collectionEmpty(*query)) {
-      provenRoots = pruningRoots(*query, filters, {});
       provenQuery = query;
       query = domainQuery = req.requestPool.make<MatchNoDocsQuery>();
       query->validateLogical(*planningContext);
@@ -2632,7 +2621,7 @@ public:
             && collectionProof(*query, filters) != nullptr
         ? SegmentMask(view()->segments().size(), true)
         : pruningOf().membership(*query);
-    if (!provenRoots.empty()) collectionProven.emplace(qr, std::move(provenRoots));
+    if (provenQuery) collectionProven.emplace(qr, provenQuery);
     if (QueryPruning::crossCheck) {
       addPruneChecks(*qr, qcontext, *planningContext, provenQuery ? *provenQuery : *query,
                      filters, foldFilters);

@@ -1076,30 +1076,17 @@ public:
   // group needs enough possible members (UNKNOWN counts as possible);
   // prohibited clauses never prove anything. A query with no positive
   // clause is the planner's match-all and stays unknown. Duplicate optional
-  // clauses count once, against the min_match logicalPlan executes. An
-  // exhaustive view visits every clause, prohibited ones included.
+  // clauses count once, against the min_match logicalPlan executes.
   MatchState mayMatch(const CatalogSummaryView& view) const override {
-    bool empty = false;
     for (auto clauses : {mandatory, filter}) {
       for (Query* clause : clauses) {
-        if (clause->mayMatch(view) != MatchState::EMPTY) continue;
-        if (!view.exhaustive()) return MatchState::EMPTY;
-        empty = true;
+        if (clause->mayMatch(view) == MatchState::EMPTY) return MatchState::EMPTY;
       }
     }
-    if (view.exhaustive()) {
-      for (Query* clause : prohibited) clause->mayMatch(view);
-    }
-    if (empty) return MatchState::EMPTY;
     if (optional.empty()) return MatchState::UNKNOWN;
     bool optionalRequired = mandatory.empty() && filter.empty();
     int64_t needed = minShouldMatch > 0 ? minShouldMatch : (optionalRequired ? 1 : 0);
-    if (needed == 0) {
-      if (view.exhaustive()) {
-        for (Query* clause : optional) clause->mayMatch(view);
-      }
-      return MatchState::UNKNOWN;
-    }
+    if (needed == 0) return MatchState::UNKNOWN;
     int64_t possible = 0;
     if (minShouldMatch > 1) {
       auto guard = MemPool::threadLocalPoolGuard();

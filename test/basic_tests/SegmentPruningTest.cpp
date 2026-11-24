@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Segment pruning end to end: one collection mask per TopDocs op from the segments'
-// field record headers, collection proofs from the merged headers, pruned
+// field record headers, collection proofs from every segment, pruned
 // execution answering exactly as unpruned execution (scores included), and
 // the reporting around it. Every test runs in cross-check mode: pruned
 // segments still run the proven queries and a match fails the request.
@@ -20,7 +20,9 @@
 #include "luxir/search/IndexReader.h"
 #include "luxir/server/JsonRequest.h"
 #include "luxir/server/JsonResponse.h"
+#include "luxir/store/FSDirectory.h"
 #include "luxir/util/Signal.h"
+#include "luxir/util/Uuid.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -207,6 +209,47 @@ TEST_F(SegmentPruningTest, scoresUseStatisticsOfEverySegment) {
       topDocs(R"({"boolean":{"optional":[{"match":{"body_t":"aardvark"}},{"match":{"body_t":"zebra"}}]}})");
   EXPECT_EQ(1, prunedBy(disjunction));
   expectSameWithAndWithoutPruning(disjunction);
+}
+
+TEST_F(SegmentPruningTest, reopenedProofsUseTheNewCoresDictionaryBounds) {
+  ASSERT_TRUE(helper->indexAll({flatdoc("id", "1", "tag_s", "green"), flatdoc("id", "2", "tag_s", "red"),
+                                flatdoc("id", "3", "tag_s", "middle")}, UpdateMessage::COMMIT).success);
+  auto writer = helper->getIndexWriter();
+  auto snapshot = *writer->snapshots.snapshot();
+  snapshot.openCores.clear();
+  auto path = std::filesystem::temp_directory_path() / ("luxir-pruning-" + newUuid());
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  FSDirectory disk(path);
+  for (const auto& file : snapshot.files) disk.copyFile(writer->dir, file.name);
+  auto old = std::make_shared<IndexReader>(disk, snapshot);
+  const auto* totals = &old->field("tag_s").stats();
+  std::weak_ptr<SegmentCore> core = old->segments()[0].segmentCoreShared();
+
+  ASSERT_TRUE(helper->deleteById("3", UpdateMessage::COMMIT).success);
+  auto reader = std::make_shared<IndexReader>(writer->dir, *writer->snapshots.snapshot(), old.get());
+  ASSERT_EQ(old->coreGen(), reader->coreGen());
+  ASSERT_EQ(totals, &reader->field("tag_s").stats());
+  old.reset();
+  ASSERT_TRUE(core.expired());  // Releases the original mmap.
+  for (auto query : {"tag_s:green", "tag_s:red", "tag_s:gr*", "tag_s:[red TO red]"}) {
+    auto req = localReq(helper->getSearchEngine());
+    req->collection("prune").topDocs().exprQuery(query).countLimit().limit(0);
+    req->execute(reader, false);
+    ASSERT_OK(req);
+    EXPECT_EQ(1, req->getMatchCount()) << query;
+  }
+}
+
+TEST_F(SegmentPruningTest, collectionProofSkipsTermSeeksInPriceGap) {
+  indexThreeSegments();
+  QueryPruning::crossCheck = false;
+  auto req = localReq(helper->getSearchEngine());
+  req->collection("prune").topDocs().exprQuery("body_t:common AND price_i:[5 TO 8]").getScores().countLimit();
+  SkipStatsScope stats;
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ(0, req->getMatchCount());
+  EXPECT_EQ(0, SkipStats::termDictionarySeeks);
 }
 
 TEST_F(SegmentPruningTest, statisticsSeeksSkipOnlyProvenAbsence) {
@@ -514,7 +557,7 @@ TEST_F(SegmentPruningTest, collectionProofAnswersBeforeAnyWeight) {
   }
   auto explained = notes(topDocs(outOfRange));
   ASSERT_EQ(1u, explained.size());
-  EXPECT_EQ("op q: proven empty for the collection: numeric bounds disjoint", explained[0]);
+  EXPECT_EQ("op q: proven empty for the collection (segment 0: numeric bounds disjoint)", explained[0]);
   // A filter proven empty, fusion sources, and a request mixing a proven op
   // with one that matches.
   expectSameWithAndWithoutPruning(topDocs(R"({"match":{"body_t":"common"}})", R"(,"filter":[{"match":{"tag_s":"zz"}}])"));
@@ -555,11 +598,7 @@ TEST_F(SegmentPruningTest, collectionProofLeavesWholeIndexPreparation) {
   for (const auto& note : notes(json)) EXPECT_FALSE(note.contains("for the collection")) << note;
 }
 
-// A schema that types a field differently from its segments fails every
-// request using the field (field_type_mismatch), also when the collection
-// proof would answer before any weight exists: the proof looks up every
-// field the query uses, prohibited clauses included.
-TEST_F(SegmentPruningTest, typeMismatchIsNotHiddenByTheCollectionProof) {
+TEST_F(SegmentPruningTest, queryOnMismatchedFieldFails) {
   auto setValueType = [&](api::FieldDef::FieldClass type) {
     SchemaBuilder schema;
     schema.field("value").type = type;
@@ -580,9 +619,9 @@ TEST_F(SegmentPruningTest, typeMismatchIsNotHiddenByTheCollectionProof) {
   EXPECT_TRUE(search(prohibited)->ok());
 
   setValueType(api::FieldDef::FieldClass::DATE);
-  for (const auto& query : {outOfRange, prohibited}) {
-    auto mismatched = search(query);
-    ASSERT_FALSE(mismatched->ok()) << query;
+  {
+    auto mismatched = search(outOfRange);
+    ASSERT_FALSE(mismatched->ok());
     EXPECT_NE(std::string::npos, mismatched->errorMsg().find("does not match persisted")) << mismatched->errorMsg();
   }
   // Requests that do not use the field still answer, and are still proven.

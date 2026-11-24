@@ -117,8 +117,8 @@ whole machine. Designed from the start for parallelism on modern hardware.
   hot loops written to auto-vectorize.
 - **Segment pruning:** Per-field bounds and presence in each segment's
   catalog prove that a query cannot match a segment, which is then skipped
-  without building scorers; merged over all segments, they answer a query
-  that cannot match anything before any term is looked up. Scores are
+  without building scorers. When every segment proves the query empty, the
+  planner can answer before any term is looked up. Scores are
   unchanged.
 - **Block-max pruning:** Skips whole blocks of documents that cannot enter
   the top k. Pareto frontiers provide score bounds that eliminate scoring

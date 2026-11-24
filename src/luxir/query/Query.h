@@ -686,15 +686,10 @@ public:
     return std::nullopt;
   }
 
-  // Whether this query can match any document of the segment (or, for the
-  // collection view, any segment) `view` describes: EMPTY is a proof that
-  // none does (over live and deleted documents alike), UNKNOWN is always
-  // legal, NONEMPTY says only that the headers offer no proof of absence. A
-  // pure function of the logical tree and the field record headers of the
-  // physical fields its weights read; it never reads segment data.
-  // Composites combine their children's answers (QueryPruning evaluates
-  // them once per segment). The default proves nothing and marks the view
-  // opaque, as such a query may read fields the view never looked up.
+  // Whether this query can match any document in the segment. EMPTY proves
+  // absence over live and deleted rows alike. UNKNOWN is always legal;
+  // NONEMPTY gives no proof of absence. Proofs read the physical fields'
+  // catalog records. Queries without a rule return UNKNOWN.
   //
   // Only absence is proven today. The opposite proof, that every row of the
   // segment matches (ALL_ROWS: exists on a field every row has, a range that
@@ -703,8 +698,7 @@ public:
   // dropping a filter that excludes nothing. Like EMPTY it would describe
   // rows as written, deleted ones included. A wrapper may forward EMPTY from
   // its child but not ALL_ROWS when it can reject rows itself (min_score).
-  virtual MatchState mayMatch(const CatalogSummaryView& view) const {
-    view.opaque();
+  virtual MatchState mayMatch(const CatalogSummaryView&) const {
     return MatchState::UNKNOWN;
   }
 

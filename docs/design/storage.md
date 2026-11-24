@@ -345,20 +345,14 @@ small, and it would change only when the set of segments does. A search
 across many collections could then skip a whole collection from the manifest
 alone, without reading any segment's catalog or opening the collection.
 
-A collection-level summary (per-field bounds over all segments) is derived
-in memory from the headers when a query first needs it; the manifest does
-not persist one. Persisting it waits for a consumer that cannot open the
-collection, such as a search across closed collections.
-
 ### Query-time pruning
 
 `Query::mayMatch(const CatalogSummaryView&)` answers, from field record
 headers alone, whether a query can match a segment: `EMPTY` is a proof that
 no document does (live or deleted), `UNKNOWN` is always legal. Headers
 describe the segment as written, so they prove "no match", never a count.
-The view reads `IndexReader::field(name)`, whose per-segment headers are
-memoized with the field totals (per row space and field, for the reader's
-segments), and decodes no part. Proofs name the physical field the query's
+The view reads the decoded catalog record through `FieldSegments::at`. Its
+segment core owns the record and the mapping behind its bounds. Proofs name the physical field the query's
 weights read (a derived variant, each field of a combined-field query), not
 the logical name.
 
@@ -404,19 +398,14 @@ header. A term's statistics skip a segment only where its header proves the
 term absent (df = 0); a segment pruned by another clause or a filter is still
 seeked, so scores are identical with and without pruning.
 
-The collection proof runs first, per reader and lazily per field: the
-segments' headers merged (counts summed, bounds unioned; a segment with
-values but no bounds leaves the field unbounded). When it proves a TopDocs
-op's own matches empty and no domain variant widens its mask, the op plans a
-`MatchNoDocsQuery` before any weight exists, so no dictionary is seeked for
-statistics. A query that may prepare over the whole index keeps its weights.
-Because this proof answers before weights exist, it must not hide an error
-their creation raises: it looks up every field the query uses, prohibited
-clauses included (a type mismatch with the persisted segments then fails the
-request as before), and stands aside for any query part without a rule.
+A query is proven empty for a nonempty collection when every segment proves
+its raw membership empty. This includes gaps between segments' bounds. When
+no domain variant widens a TopDocs op's mask, it can plan a
+`MatchNoDocsQuery` before building weights or seeking terms for statistics.
+A query that may prepare over the whole index keeps its weights.
 
 Explain notes (`op <name>: pruned segment <id> (ord <n>): <reason>`, or `op
-<name>: proven empty for the collection: <reason>`) and a `pruning` profile
+<name>: proven empty for the collection (segment 0: <reason>)`) and a `pruning` profile
 op appear only when an op prunes. `QueryPruning::disableForTests` turns every
 proof off. Cross-check mode (`QueryPruning::crossCheck`, the hidden
 `--search.pruning-cross-check` flag) keeps responses unchanged but still runs
