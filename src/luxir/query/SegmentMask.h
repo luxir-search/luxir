@@ -3,70 +3,38 @@
 
 #pragma once
 
-#include <bit>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace luxir {
 
-// A set of segment ordinals of one reader: the segments a query or an op may
-// match. A default-constructed mask has no size and means "every segment",
-// so an op that never computed one prunes nothing.
+// Raw membership of one root in its validation context.
 class SegmentMask {
-  std::vector<uint64_t> words;
-  size_t count = 0;
+  std::vector<uint64_t> excluded;
+  size_t segments;
+  size_t excludedCount = 0;
 
 public:
-  SegmentMask() = default;
-  SegmentMask(size_t n, bool initial) : words((n + 63) / 64, initial ? ~0ULL : 0ULL), count(n) {
-    if (initial && n % 64 != 0) words.back() &= (1ULL << (n % 64)) - 1;
-  }
+  // Populated during planning only for explain or profiling.
+  std::vector<std::string> reasons;
 
-  size_t size() const noexcept { return count; }
-  // True for the default mask, which prunes nothing.
-  bool unrestricted() const noexcept { return count == 0; }
+  explicit SegmentMask(size_t segments) : excluded((segments + 63) / 64), segments(segments) {}
 
-  // Whether segment `ord` may match; every ordinal does on an unrestricted mask.
   bool test(size_t ord) const noexcept {
-    if (count == 0) return true;
-    assert(ord < count);
-    return (words[ord / 64] >> (ord % 64)) & 1;
+    assert(ord < segments);
+    return !(excluded[ord / 64] & (1ULL << (ord % 64)));
   }
-  void set(size_t ord) noexcept {
-    assert(ord < count);
-    words[ord / 64] |= 1ULL << (ord % 64);
-  }
-  void clear(size_t ord) noexcept {
-    assert(ord < count);
-    words[ord / 64] &= ~(1ULL << (ord % 64));
+  void exclude(size_t ord) noexcept {
+    assert(test(ord));
+    excluded[ord / 64] |= 1ULL << (ord % 64);
+    ++excludedCount;
   }
 
-  size_t popcount() const noexcept {
-    size_t n = 0;
-    for (uint64_t w : words) n += (size_t)std::popcount(w);
-    return n;
-  }
-  // Whether some segment is excluded.
-  bool prunesAny() const noexcept { return count != 0 && popcount() != count; }
-  // Whether every segment is excluded (false for a reader without segments).
-  bool none() const noexcept { return count != 0 && popcount() == 0; }
-
-  SegmentMask& operator&=(const SegmentMask& other) {
-    if (other.unrestricted()) return *this;
-    if (unrestricted()) return *this = other;
-    assert(other.count == count);
-    for (size_t i = 0; i < words.size(); i++) words[i] &= other.words[i];
-    return *this;
-  }
-  SegmentMask& operator|=(const SegmentMask& other) {
-    if (unrestricted()) return *this;
-    if (other.unrestricted()) return *this = other;
-    assert(other.count == count);
-    for (size_t i = 0; i < words.size(); i++) words[i] |= other.words[i];
-    return *this;
-  }
+  bool prunesAny() const noexcept { return excludedCount != 0; }
+  bool none() const noexcept { return segments != 0 && excludedCount == segments; }
 };
 
 } // namespace luxir

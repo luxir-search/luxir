@@ -341,7 +341,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(search.multiterm_min_prefix_length)
       ->check(CLI::NonNegativeNumber);
   app.add_flag("--search.pruning-cross-check", search.pruning_cross_check,
-               "Diagnostic: verify that segments pruned by header proofs match nothing")
+               "Diagnostic: verify term statistics seeks skipped by catalog proofs")
       ->group("");
 }
 

@@ -1,11 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-// Segment pruning end to end: one collection mask per TopDocs op from the segments'
-// field record headers, collection proofs from every segment, pruned
-// execution answering exactly as unpruned execution (scores included), and
-// the reporting around it. Every test runs in cross-check mode: pruned
-// segments still run the proven queries and a match fails the request.
+// End-to-end checks for weight proofs, segment completion and reporting.
 
 #include <algorithm>
 #include <atomic>
@@ -131,8 +127,6 @@ protected:
     auto req = localReq(helper->getSearchEngine());
     parseQueryRequest(json, req->rawRequest(), req->mr);
     req->collection("prune");
-    req->execute();
-    EXPECT_TRUE(req->ok()) << req->errorMsg();
     return helper->getSearchEngine().explain(req->rawRequest(), "");
   }
 
@@ -409,6 +403,39 @@ TEST_F(SegmentPruningTest, collectionEmptyListKeepsFiltersForBucketReset) {
   EXPECT_EQ(9, count("unfiltered"));
 }
 
+TEST_F(SegmentPruningTest, emptyInputSkipsChildPrefixExpansion) {
+  indexThreeSegments();
+  // The child's prefix has a match in every segment. Its parent supplies
+  // three empty inputs, so even the first expansion is unnecessary.
+  auto json = topDocs(R"({"range":{"field":"price_i","gte":100}})", R"(,"ops":{"nested":{
+      "top_docs":{"query":{"prefix":{"field":"body_t","prefix":"comm"}},"limit":1}}})");
+  auto req = localReq(helper->getSearchEngine());
+  parseQueryRequest(json, req->rawRequest(), req->mr);
+  SkipStatsScope stats;
+  req->collection("prune").execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ(6, prunedSegments.load());
+  EXPECT_EQ(0, SkipStats::multitermExpansions);
+}
+
+TEST_F(SegmentPruningTest, cacheHitWithoutAWeightReportsNoProof) {
+  indexThreeSegments();
+  auto json = R"({"ops":{"q":{"top_docs":{"query":"body_t:common AND price_i:[5 TO 8]",
+                                         "count_limit":-1,"limit":0}}}})";
+  render(json);
+  render(json);
+  prunedSegments = 0;
+  auto req = localReq(helper->getSearchEngine());
+  parseQueryRequest(json, req->rawRequest(), req->mr);
+  SkipStatsScope stats;
+  req->collection("prune").profile(true).execute(false);
+  ASSERT_OK(req);
+  ASSERT_EQ(1, SkipStats::cacheFirstMembershipWeightSkips);
+  EXPECT_EQ(0, prunedSegments.load());
+  for (const auto& op : req->responses.back()->proto.profile->ops) EXPECT_NE("pruning", op.name);
+  EXPECT_TRUE(helper->getSearchEngine().explain(req->rawRequest(), "").empty());
+}
+
 TEST_F(SegmentPruningTest, reportsPruningInProfileAndExplain) {
   indexThreeSegments();
   std::string json = topDocs(R"({"range":{"field":"price_i","gte":11,"lte":13}})");
@@ -430,7 +457,7 @@ TEST_F(SegmentPruningTest, reportsPruningInProfileAndExplain) {
     if (piece.strategy != "pruned") continue;
     prunedPieces++;
     ASSERT_FALSE(piece.details.empty());
-    EXPECT_EQ("op q: numeric bounds disjoint", piece.details[0]);
+    EXPECT_EQ("op q: root 1: numeric bounds disjoint", piece.details[0]);
   }
   EXPECT_EQ(2u, prunedPieces);
   auto notes = helper->getSearchEngine().explain(req->rawRequest(), "");
@@ -638,7 +665,7 @@ TEST_F(SegmentPruningTest, collectionProofAnswersBeforeAnyWeight) {
   }
   auto explained = notes(topDocs(outOfRange));
   ASSERT_EQ(1u, explained.size());
-  EXPECT_EQ("op q: proven empty for the collection (segment 0: numeric bounds disjoint)", explained[0]);
+  EXPECT_EQ("op q: empty weight for the collection (segment 0, root 1: numeric bounds disjoint)", explained[0]);
   // A filter proven empty, fusion sources, and a request mixing a proven op
   // with one that matches.
   expectSameWithAndWithoutPruning(topDocs(R"({"match":{"body_t":"common"}})", R"(,"filter":[{"match":{"tag_s":"zz"}}])"));
@@ -803,8 +830,8 @@ TEST_F(SegmentPruningTest, nestedClausesPrunePerRowSpace) {
   indexJson({R"({"id":"c","tag_s":"x"})", R"({"id":"d","tag_s":"y"})"});
   indexJson({R"({"id":"e","tag_s":"y","items":{"color":"yellow"}})"});
   std::string red = R"({"to_parent":{"path":"items","score":"none","query":{"boolean":{"required":["color:red"]}}}})";
-  EXPECT_EQ(2, prunedBy(topDocs(red)));
   auto explained = notes(topDocs(red));
+  EXPECT_EQ(2, prunedBy(topDocs(red)));
   EXPECT_TRUE(std::ranges::any_of(explained, [](const auto& note) { return note.ends_with("nested space absent"); }));
   for (std::string_view query : {
          std::string_view(red),

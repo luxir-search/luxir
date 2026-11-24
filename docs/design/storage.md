@@ -380,24 +380,23 @@ clause empties a boolean; an optional group needs `min_match` (or, without
 required clauses, one) members not proven empty, duplicates counted once as
 the plan executes them. A Boolean reads the compiled clauses in its validation
 context. Without a compiled plan it answers `UNKNOWN`. A routed ANY filter
-unions the masks of its independently weighted sources. A disjunction max
+is empty only when all its independently weighted sources are empty. A disjunction max
 needs every disjunct empty;
 wrappers pass their child's answer through. Prohibited clauses, kNN and any
 query without a rule prove nothing.
 
 `QueryPruning` memoizes query verdicts per request as `SegmentMask`s.
-The parser computes each TopDocs op's collection mask (`SearchOp::viable`)
-from its query and filters, widened by the domain variants it produces.
-Fusion's shared filters also narrow each source's mask. The request root
-produces its normal input domains for every segment, and Fusion applies
-its shared filters before dispatching to its sources. A mapped kNN filter
-therefore selects its global top k before the consuming op skips collection.
-On a pruned segment the TopDocs collector records a visit and feeds empty
-domains to its children without building a supplier, scorer or count. The
-exact-count planning loop skips segments the key query cannot match, as a
-zero metadata count. A
-cache-backed whole-membership plan records an empty membership only where
-the key query itself is proven empty.
+A root weight carries its query's mask when the proof excludes segments. In
+those segments it supplies a null scorer and a zero metadata count. Prepared
+weights receive the mask after whole-index preparation, so mapped kNN still
+selects its global top k. Fusion produces its shared filter domain before
+dispatching to each source.
+
+TopDocs completes a segment early when its own result and every domain
+variant it owes are empty. A reset variant can still produce rows from an
+empty input. Empty completion feeds children, merges collectors and preserves
+zero buckets. Whole-membership resolution uses the key weight's own count
+and supplier for cache publication.
 
 Scoring does not depend on pruning. Field totals come from every segment's
 header. A term's statistics skip a segment only where its header proves the
@@ -406,20 +405,17 @@ seeked, so scores are identical with and without pruning.
 
 A query is proven empty for a nonempty collection when every segment proves
 its raw membership empty. This includes gaps between segments' bounds. When
-no domain variant widens a TopDocs op's mask, it can plan a
-`MatchNoDocsQuery` before building weights or seeking terms for statistics.
-A type error that only the replaced weights would have discovered can
-therefore go unreported. A query that may prepare over the whole index keeps
-its weights.
+the planning context has no whole-index preparation obligation, the planner
+selects the empty weight for that root before seeking terms for statistics.
+The authored query and cache key stay intact. A type error that only the
+elided weight would have discovered can therefore go unreported.
 
-Explain notes (`op <name>: pruned segment <id> (ord <n>): <reason>`, or `op
-<name>: proven empty for the collection (segment 0: <reason>)`) and a `pruning` profile
-op appear only when an op prunes. `QueryPruning::disableForTests` turns every
-proof off. Cross-check mode (`QueryPruning::crossCheck`, the hidden
-`--search.pruning-cross-check` flag) keeps responses unchanged but still runs
-the proven queries on every segment an op prunes and seeks every term a
-header proves absent; a match fails the request. The pruning tests run under
-it and compare every response, scores included, with pruning disabled.
+Explain identifies each selected root with an exclusion, using a representative
+segment for a collection-empty weight. A cache hit may omit a weight entirely.
+The `pruning` profile op contains the segment skips taken during collection
+and the evidence for each. `QueryPruning::disableForTests` turns off catalog
+proofs for differential tests. Cross-check mode (`--search.pruning-cross-check`)
+verifies skipped statistics seeks against the term dictionary.
 
 Per-segment bounds prove "no match" when a query's range does not overlap
 them, and "every document matches" when the minimum and maximum equal the

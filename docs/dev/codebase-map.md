@@ -123,9 +123,9 @@ locations, browse `src/luxir/<area>/`.
      `CatalogSummaryView` of one segment, that a query cannot match.
      `CatalogPredicates.h` reads the core-owned catalog records through
      `IndexReader::FieldSegments::at`. `QueryPruning` evaluates and
-     memoizes verdicts per request as `SegmentMask`s, which the parser turns
-     into each TopDocs op's collection mask (`SearchOp::viable`) or, for a collection proof,
-     a `MatchNoDocsQuery`. See
+     memoizes membership masks per root and validation context. Root weights
+     use them for suppliers and counts. TopDocs completes a segment early
+     when all its outputs are empty. See
      [storage design](../design/storage.md#query-time-pruning).
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
