@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "AuxReader.h"
+#include "ReaderErrors.h"
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/store/Directory.h"
@@ -323,23 +324,26 @@ class VectorAuxReader : public AuxReader {
   VectorAuxListsFooter footer;
   mutable std::mutex unitCountMutex;
   mutable std::vector<std::pair<std::string, int64_t>> unitCounts;
+  std::string segment;  // The owning segment, named when the bytes are invalid; empty outside a segment.
 
-public:
-  static constexpr std::string_view KIND = "vector_faiss";
-
-  static bool usePrecomputedTable(faiss::MetricType metric, bool byResidual,
-                                  int64_t nlist, int64_t m, int64_t ksub, int64_t ntotal, int32_t dims) {
-    // Bound the L2 residual table by the raw vector size, in floats.
-    return metric == faiss::METRIC_L2 && byResidual && (double)nlist * m * ksub <= (double)ntotal * dims;
+  // Runs a step that only decodes bytes already held, so what it rejects is
+  // invalid bytes: SegmentCorruptError naming the segment, when there is one.
+  template <class Step>
+  void decoding(Step&& step) const {
+    if (segment.empty()) return step();
+    try {
+      step();
+    } catch (const std::bad_alloc&) {
+      throw;
+    } catch (const ApiError&) {
+      throw;
+    } catch (const std::exception& e) {
+      corruptSegment(segment, std::format("overlay '{}': {}", name, e.what()));
+    }
   }
 
-  VectorAuxReader(std::string name, std::string field,
-                  uint64_t gen, uint64_t builtCoreGen,
-                  std::shared_ptr<InputFile> file,
-                  const VectorAuxMeta& meta)
-    : AuxReader(gen, builtCoreGen),
-      name(std::move(name)), field(std::move(field)),
-      file(std::move(file)), hold(this->file->acquire({0, this->file->size()})), meta(meta) {
+  // Checks the footer, the list sizes and the amplitudes, once on open.
+  void checkLayout() {
     const char* base = hold.getData();
     footer = VectorAuxListsFooter::fromFileTail(base, hold.getLength(), this->name);
     if (footer.amplitudeCount != (isRaBitQ() ? 1 : 0)) {
@@ -366,6 +370,24 @@ public:
     }
   }
 
+public:
+  static constexpr std::string_view KIND = "vector_faiss";
+
+  static bool usePrecomputedTable(faiss::MetricType metric, bool byResidual,
+                                  int64_t nlist, int64_t m, int64_t ksub, int64_t ntotal, int32_t dims) {
+    // Bound the L2 residual table by the raw vector size, in floats.
+    return metric == faiss::METRIC_L2 && byResidual && (double)nlist * m * ksub <= (double)ntotal * dims;
+  }
+
+  VectorAuxReader(std::string name, std::string field,
+                  uint64_t gen, uint64_t builtCoreGen,
+                  std::shared_ptr<InputFile> file,
+                  const VectorAuxMeta& meta, std::string_view segment = {})
+    : AuxReader(gen, builtCoreGen),
+      name(std::move(name)), field(std::move(field)),
+      file(std::move(file)), hold(this->file->acquire({0, this->file->size()})), meta(meta), segment(segment) {
+    decoding([this] { checkLayout(); });
+  }
   // Physical populations depend on the immutable source column and ownership,
   // not on a query domain or a live-docs generation. One scalar per ancestor.
   template <class Count> int64_t unitsWithValue(std::string_view ancestor, Count count) const {
@@ -407,7 +429,7 @@ public:
   // payloads are served zero-copy from the file's memory view via
   // MmapInvertedLists (see VectorAuxListsFooter).
   faiss::Index* getFaissIndex() const {
-    callOnce(loadOnce, [this]() {
+    auto load = [this]() {
       const char* base = hold.getData();
 
       BufferIOReader io(base, (size_t)footer.faissHeaderBytes);
@@ -490,7 +512,8 @@ public:
       rotation = std::move(rot);
       amplitudes = {(const float*)(base + footer.amplitudesOffset()),
                     mmapLists->listOffsets()};
-    });
+    };
+    callOnce(loadOnce, [&] { decoding(load); });
     return faissIndex.get();
   }
 
@@ -524,9 +547,12 @@ public:
     return open(std::move(file), info);
   }
 
-  /// Opens the reader over the entry's file, already open.
+  /// Opens the reader over the entry's file, already open. With `segment`,
+  /// invalid bytes are reported as that segment's SegmentCorruptError, now or
+  /// when the FAISS header is decoded.
   static std::shared_ptr<VectorAuxReader> open(std::shared_ptr<InputFile> file,
-                                               const luxir::api::AuxIndexInfo& info) {
+                                               const luxir::api::AuxIndexInfo& info,
+                                               std::string_view segment = {}) {
     if (info.files.size() != 1) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: expected 1 file, got {} for aux '{}'",
@@ -554,7 +580,7 @@ public:
     // HNSW for RAM-fit mid-size, IVF + mmap lists for large.
     return std::make_shared<VectorAuxReader>(
       std::string(info.name), std::string(info.field),
-      info.gen, info.built_core_gen, std::move(file), meta);
+      info.gen, info.built_core_gen, std::move(file), meta, segment);
   }
 
 private:

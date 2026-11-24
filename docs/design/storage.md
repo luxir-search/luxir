@@ -199,10 +199,11 @@ use:
   Live counts come from the manifest's `live_docs`, so counting rows reads
   nothing; a decoded count that differs is a `SegmentCorruptError`.
 - A snapshot opens each segment overlay's files and opens the overlay's reader
-  (a vector index, for example) on first use. Overlay kinds choose a policy:
-  an on-demand overlay whose bytes are invalid fails its use as corruption,
-  and an advisory one is replaced by a reader that answers nothing, leaving
-  the segment in service.
+  (a vector index, for example) on first use, from those files. A kind's
+  open reports invalid bytes as `SegmentCorruptError`, and the kind's policy
+  decides what that means: a required overlay fails its use, and an advisory
+  one, an accelerator with an exact fallback, reads as absent from then on,
+  as on a segment that never had one. Vector indexes are required.
 - The open `InputFile` keeps the bytes readable until it is released (see
   `Directory::openFile`), so a later first use does not race the writer
   retiring files of an older commit.
