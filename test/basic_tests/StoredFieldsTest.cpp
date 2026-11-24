@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/analysis/PositionCheckpoints.h"
 #include "luxir/reader/SegmentCore.h"
 #include "test/StorageTestUtils.h"
 #include <gtest/gtest.h>
@@ -76,6 +77,8 @@ protected:
     StoredDoc out;
     r.readDoc(docID,
         [&](std::string_view n, std::span<const std::string_view> values) {
+      // Position checkpoints of long text values ride along; PositionCheckpointsTest covers them.
+      if (PositionCheckpoints::isEntry(n)) return;
       auto& entry = out.vals.emplace_back();
       entry.first = std::string(n);
       entry.second.reserve(values.size());

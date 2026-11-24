@@ -153,6 +153,10 @@ public:
     it = view->begin();
   }
 
+  // UAX#29 rules look back across at most one non-space character, so a word
+  // that follows a space starts the same words when segmentation begins there.
+  bool resumable() override { return afterSpace(); }
+
   bool incrementToken() override {
     token.clear();
     if (!view || it == view->end()) return false;
@@ -351,6 +355,10 @@ class StandardTokenizer : public Tokenizer {
 
 public:
   explicit StandardTokenizer(WordFold fold) : fold(fold) {}
+
+  // As ReferenceWordTokenizer: its regions split only where segmentation
+  // does not depend on what precedes them.
+  bool resumable() override { return afterSpace(); }
 
   void reset() override {
     size_t n = (size_t) (end_ - start_);
@@ -646,6 +654,12 @@ namespace {
 class NfkcCfCharFilter : public CharFilter {
   std::string scratch;
 
+  // An ASCII character never composes with what precedes it, so it starts a
+  // normalization segment whatever precedes or follows it.
+  bool scanPosition(size_t offset) const override {
+    return offset == input.size() || (unsigned char) input[offset] < 0x80;
+  }
+
   void filter() override {
     if (isAscii(input)) {
       if (std::none_of(input.begin(), input.end(), [](char c) { return c >= 'A' && c <= 'Z'; })) return;
@@ -689,8 +703,23 @@ std::unique_ptr<CharFilter> makeNfkcCfCharFilter() {
 }
 
 TokenChain::TokenChain(Tokenizer& head, std::unique_ptr<TokenStream> tail, bool stateful,
-                       std::vector<CharStage> cleanups)
-    : charStages(std::move(cleanups)), head(head), tail(std::move(tail)), stateful(stateful) {}
+                       std::vector<CharStage> cleanups, bool resumable)
+    : charStages(std::move(cleanups)), head(head), tail(std::move(tail)), stateful(stateful),
+      resumable(resumable) {}
+
+int TokenChain::resumeOffset() {
+  if (!resumable || !tail->resumable()) return -1;
+  const Token& token = head.getToken();
+  int source = sourceOffset(token.startOffset, false);
+  // Each char filter must resume where the previous one's output resumes,
+  // and the last must land exactly on the token's start.
+  size_t offset = (size_t) source;
+  for (auto& stage : charStages) {
+    if (!stage.filter->resumesAt(offset)) return -1;
+    offset = stage.filter->outputOffset(offset);
+  }
+  return offset == (size_t) token.startOffset ? source : -1;
+}
 
 void TokenChain::setFilteredValue(std::string_view value) {
   if (value.size() > (size_t) std::numeric_limits<int>::max())
@@ -803,6 +832,7 @@ std::unique_ptr<const TokenizerFactory> plainTokenizer(const api::AnalyzerCompon
   auto factory = std::make_unique<Factory>();
   factory->name = std::string(def.name);
   factory->stateful = Stateful;
+  factory->resumable = true;  // every built-in tokenizer implements resumable()
   return factory;
 }
 
@@ -890,6 +920,9 @@ std::unique_ptr<TokenFilterFactory> stopFilter(const api::AnalyzerComponent& def
   auto factory = std::make_unique<Factory>();
   factory->name = def.name;
   factory->stateful = true;
+  // Its only cross-token state is the holes it folds into the next token's
+  // increment, and a resumed stream pins that token's position.
+  factory->resumable = true;
   auto add = [&](std::string_view word) {
     factory->authored.emplace_back(word);
   };
@@ -1031,7 +1064,10 @@ Analyzer::Analyzer(std::unique_ptr<const TokenizerFactory> tok,
       fusedFold(fusedHead && filters.size() > 1 && filters[1]->name == "fold"),
       fusedLowercase(tokenizer->name == "unicode_word" && !filters.empty() && filters[0]->name == "lowercase"),
       stateful(tokenizer->stateful ||
-               std::any_of(filters.begin(), filters.end(), [](const auto& f) { return f->stateful; })) {}
+               std::any_of(filters.begin(), filters.end(), [](const auto& f) { return f->stateful; })),
+      resumable(tokenizer->resumable &&
+                std::all_of(filters.begin(), filters.end(), [](const auto& f) { return !f->stateful || f->resumable; }) &&
+                std::all_of(charFilters.begin(), charFilters.end(), [](const auto& c) { return c->resumable; })) {}
 
 std::unique_ptr<TokenChain> Analyzer::createChain() const {
   std::unique_ptr<Tokenizer> head =
@@ -1045,7 +1081,7 @@ std::unique_ptr<TokenChain> Analyzer::createChain() const {
   }
   std::vector<TokenChain::CharStage> cleanups;
   for (const auto& factory : charFilters) cleanups.push_back({factory->create(), factory->normalizing});
-  return std::make_unique<TokenChain>(headRef, std::move(tail), stateful, std::move(cleanups));
+  return std::make_unique<TokenChain>(headRef, std::move(tail), stateful, std::move(cleanups), resumable);
 }
 
 }  // namespace luxir

@@ -317,6 +317,17 @@ Rules:
   unchanged input is borrowed and the base class records the edits, so
   `TokenChain::sourceOffset` maps token offsets back to the original text. A
   `normalizing` char filter also runs on multiterm literals.
+- Position checkpoints (see [Position checkpoints](#position-checkpoints)) are recorded
+  inside a value only when every stage can say where analysis may resume. A stateless
+  filter needs nothing. A tokenizer, or a stateful filter, opts in by overriding
+  `TokenStream::resumable()` and setting `resumable = true` on its factory: it returns true
+  only when analysis started fresh at the current token's start offset would emit this
+  token first and then the same later tokens. A buffering filter answers for the token it
+  is emitting (for example, a synonym filter: the token starts a new match attempt and no
+  earlier output is pending, and its source was resumable when it read the token). A char
+  filter opts in with `CharFilterFactory::resumable` and `CharFilter::scanPosition`, and
+  calls `consumed(start, end)` for input it skips over without editing. Without these, a
+  chain still records a checkpoint at each value's start.
 - `addAnalyzer` deep-copies the definition into registry-owned storage, so the
   `AnalyzerDef` and its arena views may die right after the call. A definition may not
   itself be a named analyzer. Its components are checked when the registries freeze, so
@@ -630,6 +641,50 @@ plans may be shared with synchronization during initialization. Decorators canno
 change membership, order or scores. The output name must not collide with another
 extra column. Decorators are also invoked for nested top-doc lists, collapsed
 heads, and diversified lists.
+
+### Position checkpoints
+
+A decorator that maps postings positions back to stored text (a highlighter) can
+start analysis near a position instead of at the start of the value
+(`src/luxir/analysis/PositionCheckpoints.h`). For every stored text field, and
+each of its text variants, indexing records per document a checkpoint at the
+first resumable token at least 128 tokens after the previous one (a value's
+first token always resumes):
+`PositionCheckpoint{value, offset, position}` says that analysis of stored value
+`value` from byte `offset` yields first the token at `position`. A document
+whose field has at most 128 tokens records nothing. The checkpoints are one stored-field entry,
+`PositionCheckpoints::storedName(physicalField)` (`<field>$checkpoints`), in the
+document's stored resource next to the field's value, in the same stored chunk
+(a `StoredFieldsReader` decodes a chunk once for consecutive reads of it).
+Walkers of every entry (`readDoc`) can recognize them with
+`PositionCheckpoints::isEntry`. Mid-value checkpoints need resume points; with
+the built-in tokenizers that is a token right after an ASCII space, tab or line
+break, so text without spaces (CJK, Thai) gets checkpoints at value starts only.
+
+```cpp
+StoredFieldsReader stored(postings, *info);              // the field's stored resource
+int32_t valuesId = stored.fieldId("body");               // the logical field's values
+int32_t id = stored.fieldId(PositionCheckpoints::storedName("body__stem"));  // per segment
+auto chain = stemAnalyzer.createChain();                 // the physical field's analyzer
+std::vector<PositionCheckpoint> checkpoints;
+PositionCheckpoints::read(stored, doc, id, checkpoints); // a copy; empty when none
+stored.readFieldById(doc, valuesId, [&](std::span<const std::string_view> values) {
+  FieldTokenStream stream(*chain, values);               // views valid in this callback
+  if (auto* from = PositionCheckpoints::atOrBefore(checkpoints, firstMatch)) stream.start(*from);
+  else stream.start();
+  if (auto* until = PositionCheckpoints::after(checkpoints, lastMatch)) stream.stopAt(*until);
+  while (stream.next()) {
+    // stream.value, stream.position, stream.startOffset, stream.endOffset, stream.token()
+  }
+});
+```
+
+`FieldTokenStream` counts positions exactly as the indexer does (position
+increments, trailing holes, 100 between values), so a stream started at a
+checkpoint, or started at the beginning, yields the same tokens, positions and
+source offsets. `stopAt` ends before a later checkpoint's token, so analysis
+covers one span between checkpoints and does not filter or scan the rest of the
+value.
 
 ### Inspecting the ranking queries
 

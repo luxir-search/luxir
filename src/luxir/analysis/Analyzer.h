@@ -208,6 +208,18 @@ public:
   // with a fused fold) override.  See TokenFilter::normalizeTerm for
   // forwarding.  Cold path: per-call std::string allocation is fine.
   virtual void normalizeTerm(std::string& term) { unused(term); }
+
+  // Whether analysis started fresh at the current token's tokenizer-input
+  // start offset would emit this token first and then every later token
+  // exactly as this stream does (text and offsets; the resumed first token's
+  // position increment may differ, so callers pin its position), and whether
+  // analysis of the input cut at that offset would emit exactly the tokens
+  // before it (FieldTokenStream::stopAt cuts there). Position
+  // checkpoints are recorded only where the whole chain says yes. Default
+  // no: a stage that buffers or looks behind must prove it. Stateless
+  // filters forward to their source (TokenFilter), and a stateful filter
+  // that implements this sets TokenStreamFactory::resumable.
+  virtual bool resumable() { return false; }
 };
 
 class Tokenizer : public TokenStream {
@@ -231,6 +243,17 @@ public:
     base_ = start_;
     token.input = start_;
   }
+
+protected:
+  // The current token starts the value or follows an ASCII space, tab or
+  // line break. A word segmenter whose rules look back at most past
+  // non-space characters starts the same words afresh there.
+  bool afterSpace() const {
+    int start = token.startOffset;
+    if (start <= 0) return start == 0;
+    char c = base_[start - 1];
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+  }
 };
 
 
@@ -251,6 +274,10 @@ public:
   // order. A rewriting filter overrides, calls this first, then applies its
   // own fold.
   void normalizeTerm(std::string& term) override { tokSource->normalizeTerm(term); }
+
+  // A stateless filter emits the source's current token, so the source
+  // answers. Stateful filters override (see TokenStream::resumable).
+  bool resumable() override { return tokSource->resumable(); }
 };
 
 // Splits the source on ASCII whitespace, viewing the source bytes directly (no
@@ -280,6 +307,9 @@ class WhitespaceTokenizer : public Tokenizer {
 public:
   WhitespaceTokenizer() : Tokenizer() {
   }
+
+  // Tokens are maximal non-space runs: each starts fresh after a space.
+  bool resumable() override { return true; }
 
   virtual bool incrementToken() override {
     // first reset the token state
@@ -340,6 +370,8 @@ public:
 class KeywordTokenizer : public Tokenizer {
 public:
   KeywordTokenizer() : Tokenizer() {}
+
+  bool resumable() override { return true; }
 
   virtual bool incrementToken() override {
     // setValue repositions start_ at the value, so start_ >= end_ both signals
@@ -424,6 +456,10 @@ class TokenStreamFactory {
 public:
   std::string name;       // registry name, e.g. "unicode_word", "lowercase"
   bool stateful = false;  // the stage buffers state across tokens; a chain containing one must reset() per value
+  // The stage answers TokenStream::resumable() truthfully. Required of every
+  // tokenizer and every stateful filter in a chain that records position
+  // checkpoints; a stateless filter always forwards correctly.
+  bool resumable = false;
   virtual ~TokenStreamFactory() = default;
 };
 
@@ -474,9 +510,10 @@ private:
 public:
   std::unique_ptr<TokenStream> tail; // the top of the chain; pull from here
   bool stateful;                     // true iff any stage buffers state across tokens/values
+  bool resumable;                    // every stage supports resumeOffset() (see Analyzer::resumable)
 
   TokenChain(Tokenizer &head, std::unique_ptr<TokenStream> tail, bool stateful = false,
-             std::vector<CharStage> cleanups = {});
+             std::vector<CharStage> cleanups = {}, bool resumable = false);
 
   TokenChain(const TokenChain&) = delete;
   TokenChain& operator=(const TokenChain&) = delete;
@@ -513,6 +550,15 @@ public:
   bool hasCharFilters() const noexcept { return !charStages.empty(); }
   // Token ends exclude trailing deletions; this is not the source value's length.
   int sourceOffset(int offset, bool isEnd);
+
+  // Where analysis of the current value can resume and reproduce the current
+  // token and everything after it: the offset in the value given to
+  // setValue(), or -1 when the chain cannot resume here. Analyzing
+  // value.substr(offset) yields the current token first (with its position
+  // increment possibly differing) and then the same later tokens, with
+  // source offsets shifted by `offset`. Cold path: called only at checkpoint
+  // candidates while indexing.
+  int resumeOffset();
 private:
   void normalizeCharFilters(std::string& term);
   void setFilteredValue(std::string_view value);
@@ -551,6 +597,10 @@ public:
   // pass, and only non-ASCII tokens pay for Unicode lowercase.
   const bool fusedLowercase;
   const bool stateful;  // some stage buffers state across tokens: chains reset() per value
+  // Every stage can tell where analysis may resume (TokenChain::resumeOffset):
+  // the tokenizer and char filters are resumable, and so is every stateful
+  // filter. Chains of this analyzer record mid-value position checkpoints.
+  const bool resumable;
 
   // An absent tokenizer means "whitespace".  Throws std::invalid_argument with a
   // teaching message for an unknown or unnamed component or a parameter it

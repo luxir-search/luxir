@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <limits>
+
 #include "luxir/util/ApiError.h"
 
+#include "luxir/analysis/PositionCheckpoints.h"
 #include "luxir/index/DocStream.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/index/NormsWriter.h"
@@ -24,6 +27,13 @@ class FullTextHandler : public Inverter::IndexHandler {
   Stream normBytes;
   DocStream docs;
   int32_t docsWithField = 0;
+  // Position checkpoints of the current document, when the field's value is
+  // stored (see PositionCheckpoints.h).
+  bool recordingCheckpoints = false;
+  int32_t checkpointDoc = -1;
+  std::vector<PositionCheckpoint> checkpoints;
+  std::string checkpointBytes;
+  std::string checkpointName;
 public:
   FullTextHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType, SpaceOrdinal space)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType, space),
@@ -43,7 +53,20 @@ public:
   // Positions jump by this between values of a multi-valued text field. The
   // gap discourages ordinary phrase matches but does not isolate values:
   // slop >= 100 can cross the boundary (adjacent raw positions differ by 101).
-  static constexpr int POSITION_INCREMENT_GAP = 100;
+  static constexpr int POSITION_INCREMENT_GAP = FieldTokenStream::POSITION_INCREMENT_GAP;
+  // Tokens tried as a checkpoint before giving up for an interval.
+  static constexpr int MAX_CHECKPOINT_CANDIDATES = 16;
+
+  void recordCheckpoints() override {
+    recordingCheckpoints = true;
+    checkpointName = PositionCheckpoints::storedName(std::string_view(fieldName));
+  }
+
+  void storeCheckpoints(Inverter& inverter, StoredFieldsWriter& writer) override {
+    if (checkpointDoc != inverter.getDoc() || checkpoints.empty()) return;
+    PositionCheckpoints::encode(checkpoints, checkpointBytes);
+    writer.addValue(checkpointDoc, checkpointName, checkpointBytes);
+  }
 
   void index(Inverter& inverter, const IndexVal& val) override {
     // expected kinds first, coercions last
@@ -108,6 +131,16 @@ public:
     int pos = -1;
     bool first = true;
     PackedTerm::TermBuffer scratch;
+    // A checkpoint is due at the first resumable token once this many tokens
+    // follow the previous one (or the start): tokens, not positions, so the
+    // gaps between short values do not add checkpoints.
+    int untilCheckpoint = recordingCheckpoints ? PositionCheckpoints::INTERVAL : std::numeric_limits<int>::max();
+    int candidates = 0;  // failed candidates since the checkpoint fell due
+    if (recordingCheckpoints) {
+      checkpoints.clear();
+      checkpointDoc = docid;
+    }
+    uint32_t valueIndex = 0;
     for (std::string_view val : vals) {
       if (!first) {
         pos += POSITION_INCREMENT_GAP;
@@ -115,6 +148,7 @@ public:
       first = false;
       tc.setValue(val);
       tc.reset();
+      bool valueStart = true;
       for (;;) {
         bool hasNext = tail.incrementToken();
         if (!hasNext) break;
@@ -130,12 +164,29 @@ public:
         }
         ++numTokens;
         pos += tok.positionIncrement;
+        if (--untilCheckpoint < 0) [[unlikely]] {
+          // A value's first token always resumes: analysis of the value from
+          // its start. Inside a value, only where the chain can resume.
+          int offset = valueStart ? 0 : tok.positionIncrement > 0 ? tc.resumeOffset() : -1;
+          if (offset >= 0) {
+            checkpoints.push_back({valueIndex, (uint32_t) offset, (int32_t) pos});
+            untilCheckpoint = PositionCheckpoints::INTERVAL - 1;
+            candidates = 0;
+          } else if (++candidates == MAX_CHECKPOINT_CANDIDATES) {
+            // Text with few resume points (no spaces, as in CJK): try again
+            // an interval later rather than at every token.
+            untilCheckpoint = PositionCheckpoints::INTERVAL - 1;
+            candidates = 0;
+          }
+        }
+        valueStart = false;
         auto [entry, inserted] = termsHash.try_emplace(*term, termsHash.getMemPool(), docid, pos);
         if (!inserted) {
           entry->val().addDoc(termsHash.getMemPool(), docid, pos);
         }
       }
       pos += tc.end();
+      ++valueIndex;
     }
 
     finishValues(inverter, numTokens);
@@ -156,7 +207,8 @@ private:
 
     // termsHash values (posting streams) live in inverter.pool; only its heap table
     // is outside-pool. Account the table growth (usually a no-op: it rehashes rarely).
-    accountExtraRam(inverter, termsHash.memSize());
+    accountExtraRam(inverter, termsHash.memSize() + checkpointBytes.capacity()
+                    + checkpoints.capacity() * sizeof(PositionCheckpoint));
   }
 
 public:

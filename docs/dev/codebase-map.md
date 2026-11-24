@@ -243,7 +243,11 @@ locations, browse `src/luxir/<area>/`.
      its definition (the canonical JSON, and so segment metadata, never names the preset)
      and builds an immutable plan; `createChain` instantiates a per-thread `TokenChain`
      (char filters, tokenizer, token filters). All callers feed text through
-     `TokenChain::setValue`, which runs the char filters; `sourceOffset` maps token offsets back
+     `TokenChain::setValue`, which runs the char filters; `sourceOffset` maps token offsets back.
+     `PositionCheckpoints` / `FieldTokenStream`: per-document resume points of stored text
+     fields (written by `FullTextHandler` as a `<field>$checkpoints` stored entry where
+     `TokenChain::resumeOffset` allows) and a token stream that resumes at one with the
+     indexer's positions and offsets
 
 9. **Plugins** (`src/luxir/plugin/`, `cmake/LuxirPlugins.cmake`)
    - `Plugin` / `PluginRegistry` / `Registries`: compiled-in extensions registered once by

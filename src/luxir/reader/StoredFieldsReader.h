@@ -31,6 +31,9 @@ namespace luxir {
 ///     });
 ///
 /// Callback-lifetime contract (applies to readDoc, readField, readFieldById):
+///   - readDoc also reports engine entries whose names contain '$' (never a
+///     field name), such as text fields' position checkpoints
+///     (PositionCheckpoints::isEntry); callers that copy every entry keep them.
 ///   - The fieldName string_view passed to readDoc points into the reader's
 ///     PostingsReader's cached metadata and is valid for the reader's lifetime. It is
 ///     safe to keep a copy of the string_view for as long as the reader
