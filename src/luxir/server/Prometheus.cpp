@@ -72,6 +72,18 @@ void service(Renderer& r, const api::ServiceStats& s) {
   }
   r.gauge("luxir_http_connections", "Live HTTP sessions, including idle keep-alive connections.", (double)s.http.connections);
   r.gauge("luxir_http_io_threads", "Running HTTP connection shard threads (excludes the accept thread).", (double)s.http.io_threads);
+  r.counter("luxir_http_rejected_connections_total", "HTTP connections closed on accept past server.http.max-connections.",
+            (double)s.http.rejected_connections);
+  r.counter("luxir_http_accept_errors_total", "Failed HTTP accepts (such as EMFILE), each retried after a backoff.",
+            (double)s.http.accept_errors);
+  for (auto [kind, count] : {std::pair{"header", s.http.header_timeouts}, {"body", s.http.body_timeouts},
+                             {"idle", s.http.idle_timeouts}})
+    r.counter("luxir_http_timeouts_total", "HTTP connections closed waiting on the client, by what they waited for.",
+              (double)count, PrometheusText::label("kind", kind));
+  r.gauge("luxir_http_buffered_body_bytes", "Bytes reserved by buffered HTTP request bodies being read or served.",
+          (double)s.http.buffered_body_bytes);
+  r.counter("luxir_http_buffered_body_rejections_total", "HTTP requests refused with 503 at server.http.max-buffered-body-bytes.",
+            (double)s.http.buffered_body_rejections);
   r.activity("luxir_searches", "luxir_search_duration_seconds", s.search, s.request_duration_bounds);
   r.histogram("luxir_search_execution_duration_seconds", "Search body execution, excluding scheduler waits and later streaming drains.",
               s.request_duration_bounds, s.search_execution);

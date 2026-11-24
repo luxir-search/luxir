@@ -578,6 +578,13 @@ struct TransportStats {
   uint64_t stream_pauses = 0;
   uint64_t connections = 0;
   int64_t io_threads = 0;
+  uint64_t rejected_connections = 0;
+  uint64_t accept_errors = 0;
+  uint64_t header_timeouts = 0;
+  uint64_t body_timeouts = 0;
+  uint64_t idle_timeouts = 0;
+  uint64_t buffered_body_bytes = 0;
+  uint64_t buffered_body_rejections = 0;
 };
 struct SearchFanoutStats {
   uint64_t parallel_searches = 0;

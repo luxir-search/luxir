@@ -19,6 +19,17 @@ namespace luxir {
 class HttpSessionRegistry;  // tracks live sessions for graceful shutdown (defined in the .cpp)
 class HttpIoShard;
 
+// server.http connection limits with the auto values resolved.
+struct HttpLimits {
+  std::chrono::milliseconds headerTimeout{0};  // 0 = never
+  std::chrono::milliseconds bodyTimeout{0};
+  std::chrono::milliseconds idleTimeout{0};
+  int64_t maxConnections = -1;                  // -1 = unlimited
+  int64_t maxBufferedBodyBytes = 0;
+
+  static HttpLimits resolve(const LuxirConfig& config);
+};
+
 // A hand-written async HTTP/JSON front end (Boost.Beast) beside the gRPC server.
 // Endpoints: /collections/{c}/_search, /_update, /_schema, /_stats, plus
 // node-wide GET /_stats and GET /health.
@@ -80,8 +91,18 @@ private:
   // safe on any thread after HttpServer has joined the shard runner.
   std::vector<std::shared_ptr<HttpIoShard>> shards;
   std::shared_ptr<HttpSessionRegistry> registry;
+  HttpLimits limits;
+  // Accept-thread only: the backoff after a failed accept (EMFILE and the
+  // like leave the connection queued, so retrying at once would spin), and
+  // the rate limit on logging refused connections.
+  std::optional<boost::asio::steady_timer> acceptRetryTimer;
+  std::chrono::milliseconds acceptBackoff{0};
+  std::chrono::steady_clock::time_point nextAcceptLog{};
+  uint64_t unloggedAcceptEvents = 0;
 
   void doAccept();
+  void retryAccept(const boost::system::error_code& ec);
+  void logAcceptEvent(const std::string& message);
   void armReplicationExpiry();
   void armShardIdle(std::size_t idx);
   void spawnShard(std::size_t idx);

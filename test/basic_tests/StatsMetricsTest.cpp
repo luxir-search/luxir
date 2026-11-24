@@ -164,7 +164,9 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
       // A count beside its rendered bytes gauge.
       "memory.live_docs_heaps",
       // HTTP only.
-      "service.grpc.connections", "service.grpc.io_threads",
+      "service.grpc.connections", "service.grpc.io_threads", "service.grpc.rejected_connections",
+      "service.grpc.accept_errors", "service.grpc.header_timeouts", "service.grpc.body_timeouts",
+      "service.grpc.idle_timeouts", "service.grpc.buffered_body_bytes", "service.grpc.buffered_body_rejections",
   };
   std::pmr::monotonic_buffer_resource resource;
   api::StatsResponse response;

@@ -300,6 +300,51 @@ Defaults:
 A configured nonzero port binds `0.0.0.0`; there is no listen-address option
 yet. Disable HTTP with `--no-http`. The gRPC server always starts.
 
+### HTTP connection limits
+
+The HTTP server bounds what slow, idle or numerous clients can hold:
+
+```bash
+./luxir \
+  --server.http.header-timeout-ms=10000 \
+  --server.http.body-timeout-ms=30000 \
+  --server.http.idle-timeout-ms=60000 \
+  --server.http.max-connections=0 \
+  --server.http.max-buffered-body-bytes=0
+```
+
+| Option | Default | Effect |
+|---|---|---|
+| `header-timeout-ms` | 10000 | A new connection must send its first bytes, and a request its complete headers from their first byte, within this time. |
+| `body-timeout-ms` | 30000 | The longest a request body (buffered JSON or streaming NDJSON) may go without delivering bytes. It times inactivity, not duration: an NDJSON stream that keeps sending runs as long as it likes. |
+| `idle-timeout-ms` | 60000 | How long a keep-alive connection may wait for its next request. |
+| `max-connections` | `0` | Open HTTP connections. Past it, a new connection is closed as soon as it is accepted. `0` is half the process's soft `RLIMIT_NOFILE` (logged at startup); `-1` is unlimited. |
+| `max-buffered-body-bytes` | `0` | Node-wide bytes of buffered (non-streaming) request bodies being read or served. `0` is 8 x `--indexing.max-request-body` (256 MiB by default). |
+
+A timeout closes the connection; `0` disables one. A request whose headers
+have begun but not finished is first answered `408` (`request_timeout`); the
+other timeouts close without a response. The
+timeouts only count time the server spends waiting on the client: a request
+the server is executing, a commit or replica wait, and an NDJSON stream whose
+reads are paused for backpressure (`--indexing.max-inflight-batches`, a
+checkpoint, a commit) are never timed out, however long they take. Response
+delivery to a slow reader is bounded separately by flow control (see
+[Threads and streaming backpressure](#threads-and-streaming-backpressure)).
+
+A buffered body with a `Content-Length` reserves its whole length before any of
+it is read; a chunked body reserves as it arrives. A request that would take
+the node past `max-buffered-body-bytes` is answered `503` with error code
+`buffered_body_limit` and `Retry-After: 1` without reading its body, and the
+connection closes. A request is always admitted while no other request holds
+buffered bytes, so a cap below `--indexing.max-request-body` limits concurrency,
+not size. Reservations are held until the response completes. NDJSON streams
+do not reserve: their memory is bounded per connection by
+`--indexing.max-inflight-batches` and the stream batch sizes.
+
+A failed accept (for example `EMFILE`, out of descriptors) is retried after an
+exponential backoff from 10 ms to 1 s instead of immediately. Refused
+connections and accept failures log at most one warning per 10 s.
+
 Luxir does **not** provide TLS, authentication, authorization, per-tenant
 quotas, or a permission model. Do not expose either port directly to an
 untrusted network. Network policy is mandatory: place the
@@ -565,6 +610,9 @@ and shares the search's final-response endpoint with `took_us`.
 | `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
 | `luxir_stream_pauses_total` | Response backpressure events by transport. |
 | `luxir_http_connections`, `luxir_http_io_threads` | Live HTTP sessions and running connection-shard threads; the thread gauge excludes the accept thread. gRPC active calls are in `luxir_requests_in_flight`. |
+| `luxir_http_rejected_connections_total`, `luxir_http_accept_errors_total` | HTTP connections closed on accept past `--server.http.max-connections`, and failed accepts (each followed by a backoff). See [HTTP connection limits](#http-connection-limits). |
+| `luxir_http_timeouts_total` | HTTP connections closed waiting on the client, by `kind`: `header` (a new connection's first bytes or a request's headers), `body`, `idle` (between keep-alive requests). |
+| `luxir_http_buffered_body_bytes`, `luxir_http_buffered_body_rejections_total` | Bytes reserved by buffered HTTP request bodies, and requests refused with 503 at `--server.http.max-buffered-body-bytes`. |
 | `luxir_control_threads`, `luxir_control_busy`, `luxir_control_queued`, `luxir_control_tasks_total` | Control executor thread count, tasks running, tasks queued, and tasks completed. |
 | `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, merge, vector-build, and reader-refresh stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
 | `luxir_node_memory_budget_bytes`, `luxir_search_request_memory_limit_bytes` | Configured managed-memory budget and tracked per-search ceiling. Neither is a process RSS limit. |

@@ -163,6 +163,13 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   fillTransport(dst.http, counts, MetricTransport::HTTP, resource);
   dst.http.connections = (uint64_t)metrics.httpConnections.load(std::memory_order_relaxed);
   dst.http.io_threads = metrics.httpThreads.load(std::memory_order_relaxed);
+  dst.http.rejected_connections = metrics.count(MetricHttpEvent::CONNECTION_REJECTED);
+  dst.http.accept_errors = metrics.count(MetricHttpEvent::ACCEPT_ERROR);
+  dst.http.header_timeouts = metrics.count(MetricHttpEvent::HEADER_TIMEOUT);
+  dst.http.body_timeouts = metrics.count(MetricHttpEvent::BODY_TIMEOUT);
+  dst.http.idle_timeouts = metrics.count(MetricHttpEvent::IDLE_TIMEOUT);
+  dst.http.buffered_body_bytes = (uint64_t)std::max<int64_t>(0, metrics.httpBufferedBodyBytes.load(std::memory_order_relaxed));
+  dst.http.buffered_body_rejections = metrics.count(MetricHttpEvent::BODY_REJECTED);
   fillTransport(dst.grpc, counts, MetricTransport::GRPC, resource);
   fillActivity(dst.search, counts, metricActivity(MetricStage::SEARCH), resource);
   fillHistogram(dst.search_execution, counts.activities[metricActivity(MetricStage::SEARCH_EXECUTION)],

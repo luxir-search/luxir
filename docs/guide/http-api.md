@@ -258,12 +258,12 @@ when supplied in the body or as a URL parameter.
 
 | `kind` | HTTP status | Meaning |
 |---|---|---|
-| `invalid_request` | 400 (405 for `method_not_allowed`) | The request as written cannot be served. |
+| `invalid_request` | 400 (405 for `method_not_allowed`, 408 for `request_timeout`) | The request as written cannot be served. |
 | `not_found` | 404 | The route or the collection does not exist. |
 | `already_exists` | 409 | Creating a collection that already exists. |
 | `failed_precondition` | 403 (409 for `commit_incarnation_mismatch`) | The node's state forbids the operation, such as `--read-only`. |
 | `resource_exhausted` | 429 (413 for `request_too_large`) | A size or memory ceiling was exceeded. |
-| `unavailable` | 503 | The collection exists but cannot serve: it is being deleted or failed to load. |
+| `unavailable` | 503 | The collection exists but cannot serve: it is being deleted or failed to load, or the node is buffering too many request bodies (`buffered_body_limit`, with `Retry-After`). |
 | `internal` | 500 | A server-side failure the request did not cause. |
 
 A failure detected before output returns the kind's HTTP status and this
@@ -299,7 +299,19 @@ warnings declared before a failure ride along with the error.
 
 ## Connection and security boundary
 
-HTTP/1.1 keep-alive and request streaming are supported. A configured nonzero
+HTTP/1.1 keep-alive and request streaming are supported. The server closes a
+connection that waits too long on its client: 10 s for request headers (or a
+new connection's first bytes), 30 s without body bytes, and 60 s idle between
+keep-alive requests. Time the server spends executing a request, waiting for a
+commit, or pausing an NDJSON stream for backpressure never counts, so a long
+stream that keeps sending is not cut. A client that holds a stream open while
+it prepares more records should send them at least every 30 s. Past
+`--server.http.max-connections` new connections are closed on accept; a
+buffered body that would exceed the node's buffered body budget gets `503` and
+`Retry-After` before it is read. See
+[HTTP connection limits](operations.md#http-connection-limits).
+
+A configured nonzero
 HTTP port currently binds all interfaces, and the server has no TLS,
 authentication, authorization, CORS policy, or tenant permission layer. Do not
 expose it directly to an untrusted network. See
