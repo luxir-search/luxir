@@ -204,6 +204,10 @@ public:
   void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t& outSz) override;
   uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t& outSz) override;
 
+  // decodeBlock, then add 1 to every value: the term-frequency blocks store
+  // tf - 1 (PostingsWriter::flushDocs).
+  uint32_t decodeBlockPlusOne(const char* in, uint32_t inSz, uint32_t* out, uint32_t& outSz);
+
   // Advance over one encoded block without unpacking it: the 2-3 byte block
   // header fully determines every section's size. Returns the encoded byte
   // length (the same value decodeBlock would return).

@@ -60,13 +60,15 @@ public:
   // Serialize a single lane's values. Unlike the multi-block FastPFOR original,
   // single-block PFor uses exactly one lane, and its identity (maxb-bestb-1) and
   // count (cexcept) are already in the block header -- so this writes NO bitmap
-  // word and NO per-lane size word, just the packed residuals.
-  uint32_t* writeLane(uint32_t* out, uint32_t lane) {
+  // word and NO per-lane size word, just the packed residuals. `out` need not
+  // be word-aligned: the SIMD packer stores unaligned, and the scalar packer
+  // packs into the word-aligned scratch buffer, which is then copied out.
+  char* writeLane(char* out, uint32_t lane) {
     const uint32_t k = lane;
     uint32_t j = 0;
     for (; j + 128 <= sizes[k]; j += 128) {
       FastPForLib::usimdpackwithoutmask(&data[k][j], reinterpret_cast<__m128i*>(out), k + 1);
-      out += 4 * (k + 1);
+      out += 4 * (k + 1) * sizeof(uint32_t);
     }
     // scalar fallback for the remainder. The final partial group packs its
     // padding slots unmasked into the last kept word, so zero them or that
@@ -74,39 +76,43 @@ public:
     // below.
     std::fill(&data[k][sizes[k]], &data[k][(sizes[k] + 31u) / 32 * 32], 0u);
     for (; j < sizes[k]; j += 32) {
-      FastPForLib::fastpackwithoutmask(&data[k][j], out, k + 1);
-      out += k + 1;
+      FastPForLib::fastpackwithoutmask(&data[k][j], buffer, k + 1);
+      memcpy(out, buffer, (k + 1) * sizeof(uint32_t));
+      out += (k + 1) * sizeof(uint32_t);
     }
-    out -= (j - sizes[k]) * (k + 1) / 32;
+    out -= (j - sizes[k]) * (k + 1) / 32 * sizeof(uint32_t);
     return out;
   }
 
   // Inverse of writeLane: unpack `count` values into `lane`. The caller supplies
-  // lane + count from the block header (not read from the stream).
-  const uint32_t* readLane(const uint32_t* in, uint32_t lane, uint32_t count) {
+  // lane + count from the block header (not read from the stream). `in` need
+  // not be word-aligned: the SIMD unpacker loads unaligned, and every scalar
+  // group is first copied into the word-aligned scratch buffer.
+  const char* readLane(const char* in, uint32_t lane, uint32_t count) {
     const uint32_t k = lane;
     assert(count <= SIZE);
     sizes[k] = count;
     uint32_t j = 0;
     for (; j + 128 <= count; j += 128) {
       FastPForLib::usimdunpack(reinterpret_cast<const __m128i*>(in), &data[k][j], k + 1);
-      in += 4 * (k + 1);
+      in += 4 * (k + 1) * sizeof(uint32_t);
     }
     for (; j + 31 < count; j += 32) {
-      FastPForLib::fastunpack(in, &data[k][j], k + 1);
-      in += k + 1;
+      memcpy(buffer, in, (k + 1) * sizeof(uint32_t));
+      FastPForLib::fastunpack(buffer, &data[k][j], k + 1);
+      in += (k + 1) * sizeof(uint32_t);
     }
-    // final partial group: copy just its words into a scratch buffer so the
+    // final partial group: copy just its words into the scratch buffer so the
     // scalar unpack (which consumes 32 values worth of input) can't over-read.
     uint32_t remaining = count - j;
     memcpy(buffer, in, (remaining * (k + 1) + 31) / 32 * sizeof(uint32_t));
     uint32_t* bpointer = buffer;
-    in += ((count + 31) / 32 * 32 - j) / 32 * (k + 1);
+    in += ((count + 31) / 32 * 32 - j) / 32 * (k + 1) * sizeof(uint32_t);
     for (; j < count; j += 32) {
       FastPForLib::fastunpack(bpointer, &data[k][j], k + 1);
       bpointer += k + 1;
     }
-    in -= (j - count) * (k + 1) / 32;
+    in -= (j - count) * (k + 1) / 32 * sizeof(uint32_t);
     return in;
   }
 };
@@ -215,11 +221,13 @@ void getBestBFromData(const uint32_t* in, uint8_t& bestb, uint8_t& bestcexcept, 
 // Single-block PForDelta encode (NoDelta). Lean layout, no multi-block
 // scaffolding:
 //   [bestb:1][cexcept:1]  [maxb:1, positions:cexcept B  -- only if cexcept>0]
-//   (padded to a word) [SIMD-packed base: 4*bestb words]
+//   [SIMD-packed base: 4*bestb words]
 //   [residuals: cexcept values @ (maxb-bestb) bits  -- only if cexcept>1 over base]
 // Every section's size is derivable from the 2-3 header bytes, so no offset,
-// byte-container-size, or bitpacker bitmap/lane-size words are stored. outSz is
-// the encoded size in bytes.
+// byte-container-size, or bitpacker bitmap/lane-size words are stored. The
+// packed words follow the header directly, with no pad to a word boundary:
+// every reader of them loads unaligned (the block's absolute alignment in the
+// file is arbitrary anyway). outSz is the encoded size in bytes.
 void encodeBlockPFor(uint32_t* in, char* outc, uint32_t& outSz) {
   uint8_t bestb, bestcexcept, maxb = 0;
   getBestBFromData(in, bestb, bestcexcept, maxb);
@@ -264,22 +272,19 @@ void encodeBlockPFor(uint32_t* in, char* outc, uint32_t& outSz) {
     }
 #endif
   }
-  // Word-align the base so the SIMD/scalar bit-packing kernels stay word-granular
-  // (zero the pad bytes for a deterministic encoding).
-  while ((reinterpret_cast<char*>(bc) - outc) % sizeof(uint32_t) != 0) *bc++ = 0;
-  uint32_t* out = reinterpret_cast<uint32_t*>(bc);
+  char* out = reinterpret_cast<char*>(bc);
 
   // SIMD-packed base (masked: exception values keep only their low bestb bits
-  // here). bestb==0 packs nothing.
+  // here). bestb==0 packs nothing. The kernel stores unaligned.
   FastPForLib::simdpack(in, reinterpret_cast<__m128i*>(out), bestb);
-  out += 4 * bestb;
+  out += 4 * bestb * sizeof(uint32_t);
 
   // Exception residuals: one lane of (maxb-bestb)-bit values. Width 1 stores
   // nothing (the high bit is implicitly 1, reconstructed on decode).
   if (bestcexcept > 0 && (uint32_t) (maxb - bestb) > 1) {
     out = bpacker.writeLane(out, maxb - bestb - 1);
   }
-  outSz = (uint32_t) (reinterpret_cast<char*>(out) - outc);
+  outSz = (uint32_t) (out - outc);
 }
 
 // Single-block PForDelta decode (hand-rolled, stack bit packer). Returns bytes read.
@@ -295,11 +300,11 @@ uint32_t decodeBlockPFor(const char* inc, uint32_t* out) {
     positions = h + 3;
     headerBytes = 3 + cexcept;
   }
-  const uint32_t headerWords = (headerBytes + sizeof(uint32_t) - 1) / sizeof(uint32_t);
-  const uint32_t* in = reinterpret_cast<const uint32_t*>(inc) + headerWords;
+  const char* in = inc + headerBytes;
 
+  // The kernel loads unaligned; the base starts right after the header.
   FastPForLib::simdunpack(reinterpret_cast<const __m128i*>(in), out, bestb);
-  in += 4 * bestb;
+  in += 4 * bestb * sizeof(uint32_t);
 
   if (cexcept > 0) {
     const uint32_t width = (uint32_t) maxb - bestb;
@@ -316,12 +321,12 @@ uint32_t decodeBlockPFor(const char* inc, uint32_t* out) {
       }
     }
   }
-  return (uint32_t) (reinterpret_cast<const char*>(in) - inc);
+  return (uint32_t) (in - inc);
 }
 
 // Byte length of one encoded PFor block, from its header alone - no unpack.
 // Section walk MUST stay in lockstep with decodeBlockPFor / readLane above:
-// [header, word-padded][simd base: 4*bestb words][exception lane, width > 1].
+// [header][simd base: 4*bestb words][exception lane, width > 1].
 uint32_t skipBlockPFor(const char* inc) {
   const uint8_t* h = reinterpret_cast<const uint8_t*>(inc);
   const uint8_t bestb = h[0];
@@ -332,10 +337,8 @@ uint32_t skipBlockPFor(const char* inc) {
     maxb = h[2];
     headerBytes = 3 + cexcept;
   }
-  const uint32_t headerWords = (headerBytes + sizeof(uint32_t) - 1) / sizeof(uint32_t);
-  const uint32_t* in = reinterpret_cast<const uint32_t*>(inc) + headerWords;
-
-  in += 4 * bestb;
+  // Word counts below; converted to bytes at the end.
+  uint32_t words = 4 * (uint32_t) bestb;
 
   if (cexcept > 0 && (uint32_t) (maxb - bestb) > 1) {
     // Mirror LuxirBitPacker::readLane's pointer arithmetic for lane
@@ -346,16 +349,16 @@ uint32_t skipBlockPFor(const char* inc) {
     const uint32_t count = cexcept;
     uint32_t j = 0;
     for (; j + 128 <= count; j += 128) {
-      in += 4 * (k + 1);
+      words += 4 * (k + 1);
     }
     for (; j + 31 < count; j += 32) {
-      in += k + 1;
+      words += k + 1;
     }
     const uint32_t jPadded = (count + 31) / 32 * 32;
-    in += (jPadded - j) / 32 * (k + 1);
-    in -= (jPadded - count) * (k + 1) / 32;
+    words += (jPadded - j) / 32 * (k + 1);
+    words -= (jPadded - count) * (k + 1) / 32;
   }
-  return (uint32_t) (reinterpret_cast<const char*>(in) - inc);
+  return headerBytes + words * (uint32_t) sizeof(uint32_t);
 }
 
 // Compact 4-lane bit layout for partial (tail) blocks, matching the addressing
@@ -579,6 +582,13 @@ uint32_t LuxirPFOR::decodeBlock(const char* in, uint32_t inSz, uint32_t* out, ui
   assert(outSz == BLOCK_SIZE);
   unused(outSz);
   return decodeBlockPFor(in, out);
+}
+
+uint32_t LuxirPFOR::decodeBlockPlusOne(const char* in, uint32_t inSz, uint32_t* out, uint32_t& outSz) {
+  uint32_t bytesRead = decodeBlock(in, inSz, out, outSz);
+  assert(outSz == BLOCK_SIZE);
+  for (uint32_t k = 0; k < BLOCK_SIZE; ++k) out[k] += 1;
+  return bytesRead;
 }
 
 uint32_t LuxirPFOR::skipBlock(const char* in, uint32_t inSz) {

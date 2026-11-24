@@ -49,6 +49,22 @@ public:
   static constexpr int8_t DOC_BLOCK_PACKED = 1;
   static constexpr int8_t DOC_BLOCK_CONTIGUOUS = 0;
 
+  // Pulsing: a term with a single doc lives entirely in the term dictionary
+  // (PostingsWriter::endTerm, TermsEnum::postingsState) and writes nothing to
+  // the docs stream, whatever its tf: the tf is the term's ttf, which the
+  // dictionary stores anyway.  Its position is inlined too when it has only
+  // one; otherwise its positions stay in the positions stream, which has no
+  // per-term headers to save.
+  static bool pulses(int64_t docFreq) {
+    return docFreq == 1;
+  }
+
+  // Term block header code for the pulsed-term mask
+  // (PostingsWriter::flushTerms): only an explicit mask spends 4 bytes.
+  static constexpr uint8_t PULSED_MASK_NONE = 0;
+  static constexpr uint8_t PULSED_MASK_ALL = 1;
+  static constexpr uint8_t PULSED_MASK_EXPLICIT = 2;
+
   // Filename related utilities.  We try to keep filenames short for many reasons, including
   // being able to fit in short-string optimization.
 

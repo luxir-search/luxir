@@ -275,6 +275,27 @@ ConstantTopKRun runPrefixDisjunctionTopK(
   return run;
 }
 
+ConstantTopKRun runQueryTopK(TestIndex& ti, Query& query, bool allowPruning,
+                             int32_t topK) {
+  auto poolGuard = ti.pool.rewindScopeGuard();
+  Query::Context context(ti.pool, *ti.reader);
+  auto* weight = query.createWeight(
+      context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  auto* supplier = weight->scorerSupplier(
+      ti.pool, context.topReader.segments()[0]);
+  ConstantTopKRun run;
+  if (supplier == nullptr) {
+    return run;
+  }
+  TopDocsCollector collector(topK);
+  collectTopKWindowed(0, supplier->bulkScorer(ti.pool), nullptr, collector, nullptr,
+                      context.topReader.segments()[0].maxDoc(), allowPruning);
+  auto sorted = collector.sort();
+  run.docs.assign(sorted.begin(), sorted.end());
+  return run;
+}
+
+
 std::vector<int32_t> collectDocs(TestIndex& ti, ScorerMode mode,
                                  DrivePattern pattern) {
   ScorerModeGuard guard(mode);
@@ -390,6 +411,60 @@ TEST_F(MultiTermScorerModesTest, pulsedSparseParity) {
   EXPECT_EQ(6000u, collectDocs(ti, ScorerMode::FORCE_EAGER, {0, 0}).size());
   expectModeParity(ti);
   expectSelectionAndEarlyExit(ti);
+}
+
+// Scored terms of every postings shape (pulsed, headerless tail-only, one
+// full block, full blocks plus a tail), with varied tfs and doc lengths:
+// block-max pruned top-k, alone and in a disjunction, equals exhaustive.
+TEST_F(MultiTermScorerModesTest, prunedTopKMatchesExhaustiveAcrossPostingsShapes) {
+  constexpr int32_t maxDoc = 3000;
+  const std::vector<int32_t> dfs = {1, 2, 60, 127, 128, 129, 300, 1000};
+  std::map<int32_t, std::string> docs;
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    for (int32_t i = 0; i < doc % 13; i++) append(docs, doc, "filler");
+  }
+  for (int32_t df : dfs) {
+    std::string term = "s" + std::to_string(df);
+    for (int32_t k = 0; k < df; k++) {
+      int32_t doc = (k * (maxDoc / df) + df) % maxDoc;
+      for (int32_t tf = 0; tf < 1 + (doc * 7 + k) % 4; tf++) append(docs, doc, term);
+    }
+  }
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, docs);
+
+  // TermQuery keeps a view of its term, so the names outlive the queries.
+  std::vector<std::string> termNames;
+  termNames.reserve(dfs.size());
+  std::vector<std::unique_ptr<TermQuery>> termQueries;
+  std::vector<Query*> optional;
+  for (int32_t df : dfs) {
+    SCOPED_TRACE(df);
+    termNames.push_back("s" + std::to_string(df));
+    termQueries.push_back(std::make_unique<TermQuery>("body_w", termNames.back()));
+    optional.push_back(termQueries.back().get());
+    for (int32_t topK : {1, 5}) {
+      auto exhaustive = runQueryTopK(ti, *termQueries.back(), false, topK);
+      auto pruned = runQueryTopK(ti, *termQueries.back(), true, topK);
+      EXPECT_EQ(exhaustive.docs.size(), (size_t) std::min(df, topK));
+      expectSameScoreDocs(exhaustive, pruned);
+    }
+  }
+  // A pruned disjunction may add clause scores in another order, so scores
+  // can differ in the last bits; the docs must not.
+  BooleanQuery query({}, optional, {}, {});
+  for (int32_t topK : {3, 10, 50}) {
+    SCOPED_TRACE(topK);
+    auto exhaustive = runQueryTopK(ti, query, false, topK);
+    auto pruned = runQueryTopK(ti, query, true, topK);
+    ASSERT_EQ(exhaustive.docs.size(), (size_t) topK);
+    ASSERT_EQ(exhaustive.docs.size(), pruned.docs.size());
+    for (size_t i = 0; i < exhaustive.docs.size(); i++) {
+      EXPECT_EQ(exhaustive.docs[i].doc, pruned.docs[i].doc) << "i=" << i;
+      EXPECT_FLOAT_EQ(exhaustive.docs[i].score, pruned.docs[i].score) << "i=" << i;
+    }
+  }
 }
 
 TEST_F(MultiTermScorerModesTest, mixedShapeParity) {

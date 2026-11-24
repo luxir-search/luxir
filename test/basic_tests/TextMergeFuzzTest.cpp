@@ -108,10 +108,9 @@ protected:
       ASSERT_EQ((int32_t) postings.size(), docs.numDocs()) << field << " " << term;
       int64_t ttf = expectedTtf(postings, hasFreqs);
       ASSERT_EQ(ttf, docs.totalTermFreq()) << field << " " << term;
-      if (hasPositions && ttf == 1) {
-        const auto& state = terms.postingsState();
-        ASSERT_EQ(state.docsStart, state.docsEnd) << term;
-      }
+      const auto& state = terms.postingsState();
+      ASSERT_EQ(Postings::pulses((int64_t) postings.size()),
+                state.docsStart == state.docsEnd) << field << " " << term;
 
       for (const auto& posting : postings) {
         ASSERT_EQ(posting.doc, docs.nextDoc()) << field << " " << term;
@@ -262,7 +261,7 @@ TEST_F(TextMergeFuzzTest, bulkPositionDeltaShapes) {
   }
   {
     std::vector<DocSpec> segment(1);
-    append(segment[0].body, "single_doc_nonpulse", 2);
+    append(segment[0].body, "single_doc_tf2_pulse", 2);
     addSegment(index, pos, freq, docs, std::move(segment), bodies);
   }
 
@@ -351,6 +350,85 @@ TEST_F(TextMergeFuzzTest, bulkPositionDeltaShapes) {
   ASSERT_EQ(nextDoc, index.reader->maxDoc());
   ASSERT_EQ(oracle.end(), oracle.find("pulse_1_to_0"));
   ASSERT_EQ(oracle.end(), oracle.find("delete_all"));
+  verifyField(index, "pos", oracle, true, true);
+  verifyField(index, "freq", oracle, true, false);
+  verifyField(index, "docs", oracle, false, false);
+}
+
+// Low-df terms around every postings shape boundary, merged across deletes:
+// docFreqs that cross 1 (pulsed), DOCS_BLOCK_SIZE - 1 (headerless tail-only)
+// and DOCS_BLOCK_SIZE once deletes and the merge combine sources, single-doc
+// terms with tf > 1 (pulsed, positions kept in the positions stream,
+// including more than one positions block), and all-1 tails.
+TEST_F(TextMergeFuzzTest, lowDfShapesAcrossDeletesAndMerge) {
+  auto schema = mixedSchema();
+  TestIndex index;
+  test::reserveIncarnation(index.dir);
+  index.iw = std::make_unique<IndexWriter>(index.snapshots, schema);
+  index.iw->termPartitionMinBytes = 1;
+  index.iw->termPartitionMinRangeBytes = 1;
+  index.iw->termPartitionMaxRanges = 4;
+  TestField pos(index, "pos");
+  TestField freq(index, "freq");
+  TestField docs(index, "docs");
+  Oracle oracle;
+  std::vector<std::string> bodies;
+
+  const std::vector<int32_t> dfs = {1, 2, 3, 63, 64, 126, 127, 128, 129, 130};
+  for (int32_t source = 0; source < 3; source++) {
+    std::vector<DocSpec> segment(300);
+    for (int32_t df : dfs) {
+      // Spread the docs so some gaps need more bits than others.
+      std::string term = "df" + std::to_string(df);
+      for (int32_t i = 0; i < df; i++) {
+        append(segment[(size_t) ((i * 37 + df) % 300)].body, term, 1 + (i == df / 2 ? source : 0));
+      }
+    }
+    for (int32_t tf : {2, 3, 130}) {
+      append(segment[(size_t) (200 + source * 10 + tf % 7)].body,
+             "solo" + std::to_string(source) + "_tf" + std::to_string(tf), tf);
+    }
+    for (int32_t doc = 0; doc < 50; doc++) {
+      append(segment[(size_t) (doc * 5)].body, "tail_ones");
+      append(segment[(size_t) (doc * 5 + 1)].body, "tail_mixed", doc == 17 ? 2 : 1);
+    }
+    for (int32_t doc = 0; doc < 300; doc++) {
+      append(segment[(size_t) doc].body, "blocks_and_tail_ones");
+    }
+    // Source 0 loses the first doc of df2, df64 and df128 (and whatever else
+    // those docs hold), and 4 of the 10 docs of "shrink", which only it
+    // holds: a headerless source term that merges into a smaller one, and
+    // "pair", whose two docs merge into a pulsed term.  Source 1 loses one of
+    // its tf > 1 single-doc terms entirely.
+    if (source == 0) {
+      for (int32_t df : {2, 64, 128}) {
+        segment[(size_t) df].deleted = true;
+      }
+      for (int32_t doc = 100; doc < 110; doc++) {
+        append(segment[(size_t) doc].body, "shrink");
+        segment[(size_t) doc].deleted = doc < 104;
+      }
+      append(segment[110].body, "pair");
+      append(segment[111].body, "pair");
+      segment[111].deleted = true;
+    }
+    if (source == 1) {
+      segment[(size_t) (200 + 10 + 3 % 7)].deleted = true;
+    }
+    addSegment(index, pos, freq, docs, std::move(segment), bodies);
+  }
+
+  index.initReader();
+  ASSERT_EQ(3u, index.reader->segments().size());
+  index.iw->mergeSegments();
+  index.initReader();
+  int32_t nextDoc;
+  buildOracle(index, bodies, oracle, nextDoc);
+  ASSERT_EQ(nextDoc, index.reader->maxDoc());
+  ASSERT_EQ(oracle.end(), oracle.find("solo1_tf3"));
+  ASSERT_EQ(1u, oracle.at("solo0_tf130").size());
+  ASSERT_EQ(6u, oracle.at("shrink").size());
+  ASSERT_EQ(1u, oracle.at("pair").size());
   verifyField(index, "pos", oracle, true, true);
   verifyField(index, "freq", oracle, true, false);
   verifyField(index, "docs", oracle, false, false);
