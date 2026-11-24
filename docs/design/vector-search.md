@@ -88,15 +88,16 @@ registers (`query/Sq8Kernel.h`): each code is widened and decoded as
 distance or dot product, and cosine sums `|x|^2` in the same pass. This scores
 the decoded vector rather than the codes against per-vector offset and scale
 terms (`scale * dot(q, codes) + offset * sum(q)`), which cancel
-catastrophically for a query with a large dynamic range. The kernels need AVX2
-and FMA, chosen at compile time from the CPU target like the RaBitQ kernels.
-Other targets (x86-64-v2, AArch64) decode the row into a per-task buffer and
-call the FAISS float32 kernels: those dispatch at run time, and on x86-64-v2
-a portable lane loop was about 2x slower than they are. Either way a score is
-the f32 score of the stored vector up to summation order, and a build scores a
-row identically in the flat scan and the rescore. Cosine over a non-f32 row
-always divides by the stored vector's norm, since a quantized unit vector is
-not exactly unit length.
+catastrophically for a query with a large dynamic range. GCC x86-64 builds
+include 8-lane and 16-lane kernels. Both require AVX2 and FMA, and the
+16-lane kernel also requires AVX-512F, AVX-512BW and AVX-512VL. Both score
+the remainder in one masked vector step. The process selects the fastest
+supported kernel. With no supported kernel, including on AArch64, scoring
+decodes the row into a per-task buffer and calls the FAISS float32 kernels.
+Scores may round differently across kernel levels. Within a process, the
+flat scan and rescore score a row identically. Cosine over a non-f32 row always
+divides by the stored vector's norm, since a quantized unit vector is not
+exactly unit length.
 
 ## Overlay Lifecycle
 

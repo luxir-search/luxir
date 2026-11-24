@@ -41,9 +41,9 @@ namespace luxir {
 /// element as offset + scale * code inside the distance or dot product (and,
 /// for COSINE, sum |x|^2 in the same pass).  Scoring the codes against
 /// per-vector offset and scale terms instead would cancel catastrophically
-/// for a query with a large dynamic range.  A build whose CPU target lacks
-/// AVX2 and FMA decodes the row into a scratch buffer for the float32
-/// kernels.
+/// for a query with a large dynamic range.  GCC x86-64 builds select AVX2
+/// or AVX-512 at run time.  With no supported kernel, SQ8 decodes into a
+/// scratch buffer for the FAISS float32 kernels.
 ///
 /// The computers and the scratch buffer make a scorer single-threaded: one per
 /// scanning task.
@@ -55,6 +55,8 @@ class VectorScorer {
   int32_t metric;
   bool normalizeColumn;
   VectorEncoding encoding;
+  // The selected register kernels for SQ8, if available.
+  const sq8::Kernels* sq8Kernels;
   // SQ8 without the sq8 kernels: the decoded row.
   mutable std::vector<float> scratch;
   // F16 / BF16: computers built from quantizer, which owns any trained state
@@ -70,9 +72,9 @@ public:
   VectorScorer(const float* query, int32_t dims, int32_t metric, bool normalizeColumn,
                VectorEncoding encoding)
     : query(query), dims(dims), metric(metric), normalizeColumn(normalizeColumn),
-      encoding(encoding) {
+      encoding(encoding), sq8Kernels(encoding == VectorEncoding::SQ8 ? sq8::best() : nullptr) {
     assert(query != nullptr);
-    if (encoding == VectorEncoding::SQ8 && !sq8::KERNEL) scratch.resize((size_t)dims);
+    if (encoding == VectorEncoding::SQ8 && !sq8Kernels) scratch.resize((size_t)dims);
     bool sixteenBit = encoding == VectorEncoding::F16 || encoding == VectorEncoding::BF16;
     bool scored = metric == (int32_t)api::VectorMetric::L2 || metric == (int32_t)api::VectorMetric::IP
         || metric == (int32_t)api::VectorMetric::COSINE;
@@ -105,7 +107,7 @@ public:
       case VectorEncoding::BF16:
         return score16((const uint8_t*)row.data(), fallbackScore);
       case VectorEncoding::SQ8:
-        if constexpr (sq8::KERNEL) return scoreSq8(row.data(), fallbackScore);
+        if (sq8Kernels) return scoreSq8(row.data(), fallbackScore);
         [[fallthrough]];
       default:
         vcodec::decode(encoding, row.data(), dims, scratch.data());
@@ -153,12 +155,12 @@ private:
     auto* codes = (const uint8_t*)(row + vcodec::SQ8_HEADER_BYTES);
     switch (metric) {
       case (int32_t)luxir::api::VectorMetric::L2:
-        return finiteScore(1.0f / (1.0f + sq8::l2sq(query, codes, h.offset, h.scale, dims)));
+        return finiteScore(1.0f / (1.0f + sq8Kernels->l2sq(query, codes, h.offset, h.scale, dims)));
       case (int32_t)luxir::api::VectorMetric::IP:
-        return finiteScore(sq8::dot(query, codes, h.offset, h.scale, dims));
+        return finiteScore(sq8Kernels->dot(query, codes, h.offset, h.scale, dims));
       case (int32_t)luxir::api::VectorMetric::COSINE: {
         float normSq;
-        float sum = sq8::dotNorm(query, codes, h.offset, h.scale, dims, normSq);
+        float sum = sq8Kernels->dotNorm(query, codes, h.offset, h.scale, dims, normSq);
         return cosine(sum, normSq);
       }
       default:

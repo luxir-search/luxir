@@ -16,6 +16,7 @@
 
 #include "luxir/codec/VectorCodec.h"
 #include "luxir/index/VectorIndexBuilder.h"
+#include "luxir/query/Sq8Kernel.h"
 #include "luxir/query/VectorScorer.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/schema/Schema.h"
@@ -284,36 +285,55 @@ TEST_F(VectorEncodingTest, encodedScoreMatchesDecodedScore) {
 // with the code sum in float, loses the 255 and gives -508, below a zero
 // vector.
 TEST_F(VectorEncodingTest, sq8ExtremeQueryRanksByDecodedScore) {
-  const Vec x = {-254, 0, 256};
-  const Vec query = {1.0f, 0x1p30f, 1.0f};
-  std::vector<char> row((size_t)vcodec::bytesPerVector(VectorEncoding::SQ8, 3));
-  vcodec::encode(VectorEncoding::SQ8, x.data(), 3, row.data());
+  constexpr int32_t wide = 87;  // A block, single steps and a tail at both levels.
+  const float values[] = {-254, 0, 256};
+  const float terms[] = {1.0f, 0x1p30f, 1.0f};
+  Vec x(wide), query(wide);
+  for (int32_t i = 0; i < wide; i++) {
+    x[(size_t)i] = values[i % 3];
+    query[(size_t)i] = terms[i % 3];
+  }
   EXPECT_EQ(x, stored(api::VectorEncoding::SQ8, x));
-  VectorScorer scorer(query.data(), 3, (int32_t)api::VectorMetric::IP, true, VectorEncoding::SQ8);
-  EXPECT_EQ(2.0f, scorer.score(std::string_view(row.data(), row.size()), 0));
+  for (int32_t dims : {3, 45, wide}) {
+    SCOPED_TRACE(dims);
+    std::vector<char> row((size_t)vcodec::bytesPerVector(VectorEncoding::SQ8, dims));
+    vcodec::encode(VectorEncoding::SQ8, x.data(), dims, row.data());
+    auto h = vcodec::readSq8Header(row.data());
+    auto* codes = (const uint8_t*)(row.data() + vcodec::SQ8_HEADER_BYTES);
+    float expected = 2.0f * (float)(dims / 3);
+    for (const auto& kernels : sq8::supported()) {
+      SCOPED_TRACE(kernels.name);
+      EXPECT_EQ(expected, kernels.dot(query.data(), codes, h.offset, h.scale, dims));
+      float normSq;
+      EXPECT_EQ(expected, kernels.dotNorm(query.data(), codes, h.offset, h.scale, dims, normSq));
+    }
+    VectorScorer scorer(query.data(), dims, (int32_t)api::VectorMetric::IP, true, VectorEncoding::SQ8);
+    EXPECT_EQ(expected, scorer.score(std::string_view(row.data(), row.size()), 0));
+  }
 
   CollectionHelper h("main");
   SchemaBuilder b;
   auto& f = b.field("enc_v");
   f.type = api::FieldDef::FieldClass::VECTOR;
-  f.dims = 3;
+  f.dims = wide;
   f.metric = api::VectorMetric::IP;
   f.encoding = api::VectorEncoding::SQ8;
   b.set(h.collection());
-  h.index(flatdoc("id", std::string("zero"), "enc_v", Vec{0, 0, 0}));
+  h.index(flatdoc("id", std::string("zero"), "enc_v", Vec(wide, 0.0f)));
   h.index(flatdoc("id", std::string("x"), "enc_v", x));
   h.commit();
   EXPECT_EQ((std::vector<std::string>{"x", "zero"}), knnIds("enc_v", 2, true, 0, query));
 }
 
-// VectorScorer's sq8 scores match a double-precision reference over the
-// decoded vector for every metric, at dims that exercise the block loop, the
-// single steps and the tail, from unaligned row addresses; a row scores
-// bit-identically wherever it sits in memory.
+// Each SQ8 kernel level and VectorScorer agree with a double-precision
+// reference. Moving the row to unaligned addresses preserves the score.
 TEST_F(VectorEncodingTest, sq8KernelMatchesScalarReference) {
   std::mt19937 rng(42);
   std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
-  for (int32_t dims : {1, 3, 7, 8, 15, 17, 31, 32, 33, 768, 1023}) {
+  // 1 to 40 reaches every tail length of both levels, alone and after steps.
+  std::vector<int32_t> widths = {63, 64, 65, 768, 1023};
+  for (int32_t dims = 1; dims <= 40; dims++) widths.push_back(dims);
+  for (int32_t dims : widths) {
     Vec q((size_t)dims);
     for (auto& v : q) v = uniform(rng);
     auto bytes = (size_t)vcodec::bytesPerVector(VectorEncoding::SQ8, dims);
@@ -331,6 +351,16 @@ TEST_F(VectorEncodingTest, sq8KernelMatchesScalarReference) {
       dist += (qi - xi) * (qi - xi);
       xx += xi * xi;
       mag += std::fabs(qi * xi);
+    }
+    auto h = vcodec::readSq8Header(buf.data());
+    auto* codes = (const uint8_t*)(buf.data() + vcodec::SQ8_HEADER_BYTES);
+    for (const auto& kernels : sq8::supported()) {
+      SCOPED_TRACE(std::format("dims {} level {}", dims, kernels.name));
+      EXPECT_NEAR(dist, kernels.l2sq(q.data(), codes, h.offset, h.scale, dims), 1e-5 * (1.0 + dist));
+      EXPECT_NEAR(dot, kernels.dot(q.data(), codes, h.offset, h.scale, dims), 1e-5 * (1.0 + mag));
+      float normSq;
+      EXPECT_NEAR(dot, kernels.dotNorm(q.data(), codes, h.offset, h.scale, dims, normSq), 1e-5 * (1.0 + mag));
+      EXPECT_NEAR(xx, normSq, 1e-5 * (1.0 + xx));
     }
     for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
       SCOPED_TRACE(std::format("dims {} metric {}", dims, (int)metric));
