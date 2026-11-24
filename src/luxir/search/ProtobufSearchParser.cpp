@@ -260,12 +260,7 @@ public:
       addDomainVariants(
           req.proto.ops, {}, domains, rootOp.planning,
           rootOp.domainVariants);
-      if (!rootOp.domainVariants.empty()) {
-        rootOp.weightContext = Query::Context::create(
-            &req.arena, *rootOp.planning);
-        rootOp.domainVariants.buildWeights(
-            *rootOp.weightContext, *rootOp.planning, 0);
-      }
+      rootOp.materialize();
     }
     addSubs(rootOp, req.proto.ops, 0, OpsPlacement::REQUEST_ROOT);
     return &rootOp;
@@ -359,13 +354,12 @@ public:
           }
           domain.applyParentFilters = false;
         }
-        bucketPlan = luxir::arenaCreate<BucketDomainPlan>(req.arena);
+        bucketPlan = luxir::arenaCreate<BucketDomainPlan>(req.arena, req.arena);
         bucketPlan->planning = createPlanningContext(currOp.name);
         validateDomainQueries(domains, *bucketPlan->planning);
         bucketPlan->variants.begin(0);
         addDomainVariants(ops, {}, domains, bucketPlan->planning, bucketPlan->variants);
-        auto* weights = Query::Context::create(&req.arena, *bucketPlan->planning);
-        bucketPlan->variants.buildWeights(*weights, *bucketPlan->planning, 0);
+        bucketPlan->materialize();
       }
     }
     for (auto& [name, searchOp] : lastWins(ops)) {
@@ -465,7 +459,7 @@ public:
       const auto& domain = *searchOp.domain;
       const auto& destination = req.pinView(domainPath(*domain.to));
       bool descending = destination->path().size() > view()->path().size();
-      input = arenaCreate<InputDomainPlan>(req.arena);
+      input = arenaCreate<InputDomainPlan>(req.arena, req.arena);
       input->mapping = {&req.ownershipRelation(descending ? *destination : *view(),
           descending ? *view() : *destination),
           descending ? RowRelation::Direction::EXPAND : RowRelation::Direction::PROJECT};
@@ -486,8 +480,7 @@ public:
         input->variants.begin(0);
         addDomainRoute(name, &domains.at(name), [](size_t) { return false; },
             input->planning, input->variants);
-        auto* weights = Query::Context::create(&req.arena, *input->planning);
-        input->variants.buildWeights(*weights, *input->planning, 0);
+        input->materialize();
       }
     }
     if (searchOp.domain && placement == OpsPlacement::FUSION) {
@@ -1489,24 +1482,10 @@ public:
       std::string_view facetName, const api::QueryFacet& facetReq,
       const FacetParsePlan& plan, bool bucketChild) {
     assert(plan.planning != nullptr);
-    Query::Context* context = Query::Context::create(
-        &req.arena, *plan.planning);
-    auto weights = req.requestPool.make_span<Query::Weight*>(
-        plan.bucketQueries.size());
-    for (size_t i = 0; i < weights.size(); i++) {
-      weights[i] = context->createRootWeight(*plan.bucketQueries[i], 0);
-    }
-    std::span<FilterCache::Use*> uses;
-    if (bucketChild && &plan.planning->topReader == view().get()) {
-      uses = req.requestPool.make_span<FilterCache::Use*>(weights.size());
-      for (size_t i = 0; i < weights.size(); i++) {
-        uses[i] = !weights[i]->matchesAllDocs() && !weights[i]->needsPrepare()
-                && plan.bucketQueries[i]->recoverableAsPredicate()
-            ? plan.planning->getFilterUse(*plan.bucketQueries[i]) : nullptr;
-      }
-    }
     auto* facet = luxir::arenaCreate<QueryFacetReq>(
-        req.arena, req, view(), facetReq, facetName, plan.bucketQueries, weights, *plan.planning, uses);
+        req.arena, req, view(), facetReq, facetName, plan.bucketQueries,
+        *plan.planning, bucketChild);
+    facet->materialize();
     configureMeasure(*facet, resolveMeasure(facetReq));
     return facet;
   }
@@ -2317,26 +2296,8 @@ public:
     ProtobufQueryParser parser(parseContext);
     auto sharedFilters = parseFilters(
         parser, fusionProto.filter, nullptr, "fusion.filter");
-    // Reuse the first source's execution Context when it has one. A fully
-    // resident source may be Context-free, in which case shared filter
-    // Weights are unresolved execution and create the Context here.
-    // Shared filters use the same request flag path as TopDocs filters.
     for (const auto& filter : sharedFilters) {
       filter.query->validateLogical(sources.front()->planning);
-    }
-    std::span<Query::Weight*> sharedFilterWeights;
-    if (!sharedFilters.empty()) {
-      Query::Context* sharedContext = sources.front()->weightContext;
-      if (sharedContext == nullptr) {
-        sharedContext = Query::Context::create(
-            &req.arena, sources.front()->planning);
-        skipCount(SkipStats::queryContextsCreated);
-      }
-      auto& opName = sources.front()->planning.opName;
-      auto savedName = std::exchange(opName, name);
-      auto restoreName = scope_guard([&]() noexcept { opName = savedName; });
-      sharedFilterWeights = buildFilterWeights(
-          sharedFilters, *sharedContext, Query::NEED_SCORES);
     }
 
     int64_t specifiedLimit = fusionProto.limit.has_value() ? *fusionProto.limit : 10;
@@ -2347,8 +2308,9 @@ public:
 
     auto* fusion = luxir::arenaCreate<FusionOp>(
       req.arena, req, view(), name, fusionProto, std::move(sources),
-      std::move(sourceWeights), topCount, sharedFilters, sharedFilterWeights,
+      std::move(sourceWeights), topCount, sharedFilters,
       method, rrfK);
+    fusion->materialize();
 
     fusion->collapse = collapse;
     if (collapse && !fusionProto.collapse->head_sort.empty()) {

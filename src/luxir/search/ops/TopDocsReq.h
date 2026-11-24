@@ -67,6 +67,7 @@ enum class TopDocsPlacement : uint8_t {
 
 class TopDocsReq : public SearchOp {
 public:
+  // Carries parsed inputs used only while materializing the TopDocs execution plan.
   struct Preparation {
     // Query before op-level filters fold in, for exact-domain construction.
     Query* domainQuery;
@@ -151,6 +152,7 @@ public:
   // must handle that case.
   std::function<void(CalcBase&, MergeableCollector*)> rankingSink;
 
+  // Takes parsed, validated inputs only.
   TopDocsReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view,
              std::string_view name, const ReqTopDocs& topDocsProto,
              Query::PlanningContext& planning, Query* query, Query* resultQuery,
@@ -160,6 +162,7 @@ public:
              std::optional<SortPlan>&& headSort, Query::ScoreProfile scoreProfile,
              bool requestNeedsScores, Preparation preparation);
 
+  // Runs once after construction to build the contexts, weights, filter uses and execution routes.
   void materialize();
 
   std::vector<ExtraColumn> rowColumns();
