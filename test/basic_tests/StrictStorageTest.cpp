@@ -216,6 +216,31 @@ TEST(StrictStorageTest, countsNearWholeReadsOfAnyFile) {
   EXPECT_EQ(4u, counters->fileStats(name).wholeFileAccesses);
 }
 
+TEST(StrictStorageTest, copyHoldsBoundedChunksOfItsSource) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory source(std::make_shared<RAMDir>(), counters);
+  RAMDir dest;
+  std::string bytes(2 * Directory::kCopyChunk + 100, '\0');
+  for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (char)(i * 31 % 251);
+  {
+    auto file = source.createFile("data");
+    OutputStream out(file.get());
+    out.write(bytes.data(), bytes.size());
+    out.close();
+    source.finishFile(*file);
+  }
+  dest.copyFile(source, "data");
+  auto copied = dest.openFile("data");
+  ASSERT_NE(nullptr, copied);
+  auto hold = copied->acquire({0, copied->size()});
+  EXPECT_EQ(bytes, contents(hold));
+  auto stats = counters->fileStats("data");
+  EXPECT_EQ(3u, stats.acquires);
+  EXPECT_EQ(0u, stats.wholeFileAccesses);
+  EXPECT_EQ(Directory::kCopyChunk, counters->liveStats().peakBytes);
+  EXPECT_EQ(1u, counters->liveStats().peakHolds);
+}
+
 TEST(StrictStorageTest, wrapsVerifiedMappingAfterDirectoryCloses) {
   auto counters = std::make_shared<StrictStorageCounters>();
   std::shared_ptr<InputFile> file;
