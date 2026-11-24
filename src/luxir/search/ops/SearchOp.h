@@ -168,11 +168,8 @@ public:
   BucketDomainPlan* bucketDomain = nullptr;
   InputDomainPlan* inputDomain = nullptr;
   bool needsStructuralScope = false;
-  // The op's root mask: the segments its own query and filters (and the
-  // domains of the children it produces) may match, from the segments' field record headers.
-  // A pruned segment contributes exactly an empty match: the op builds no
-  // supplier, scorer or count there and feeds its children empty domains.
-  // Unrestricted (the default) for ops that consume no query.
+  // A TopDocs op uses this mask at collection, after preparation. It covers
+  // its own matches and any domain variants it produces for its children.
   SegmentMask viable;
   // Cross-check mode (QueryPruning::crossCheck): unscored weights of the
   // roots behind `viable`, each with the segments its proofs allow. A pruned
@@ -284,18 +281,6 @@ public:
   virtual bool facetBucketSharesSegmentState() const {
     return std::ranges::any_of(subOps, [](const auto& entry) {
       return entry.second->facetBucketSharesSegmentState();
-    });
-  }
-
-  // Whether this subtree runs a weight that prepares over the whole index
-  // (Weight::needsPrepare, such as kNN's global top k). Preparation reads
-  // every segment's domain, so no op substitutes the empty domain for a
-  // pruned segment where a preparing weight could see it. Ops holding
-  // weights override this.
-  virtual bool needsWholePreparation() const {
-    if (bucketDomain && bucketDomain->variants.sourcesNeedPrepare()) return true;
-    return std::ranges::any_of(subOps, [](const auto& entry) {
-      return entry.second->needsWholePreparation();
     });
   }
 

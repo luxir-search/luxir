@@ -125,7 +125,7 @@ locations, browse `src/luxir/<area>/`.
      leaf proofs. `IndexReader::FieldSegments::header` / `mergedHeader`
      memoize the headers with the field totals. `QueryPruning` evaluates and
      memoizes verdicts per request as `SegmentMask`s, which the parser turns
-     into each op's root mask (`SearchOp::viable`) or, for a collection proof,
+     into each TopDocs op's collection mask (`SearchOp::viable`) or, for a collection proof,
      a `MatchNoDocsQuery`. See
      [storage design](../design/storage.md#query-time-pruning).
    - `NumericRangeQuery` executes through the points index when present
