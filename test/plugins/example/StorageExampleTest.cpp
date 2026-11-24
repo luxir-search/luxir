@@ -142,7 +142,6 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
   // The open acquires the headers and the catalog, nothing it can build later.
   expectPart({{0, range.offset}, range.length}, ReadClass::METADATA);
   check();
-  EXPECT_FALSE(postings.core().readPastCatalog());
 
   for (auto field : {"freqs", "body_w"}) {
     const auto* record = postings.fieldInfo(field);
@@ -164,7 +163,6 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
       check();
     }
   }
-  EXPECT_TRUE(postings.core().readPastCatalog());
 
   // The first query that returns versions acquires the version runs, once.
   expectPart(catalog.versionRuns().slice, ReadClass::METADATA);
@@ -223,16 +221,11 @@ TEST_F(StorageExampleTest, snapshotOpenIssuesEveryHeaderAndCatalogTogether) {
     auto range = catalogRangeFromManifest(segment.catalog);
     EXPECT_TRUE(counters->fileStats(name).metadataParts.contains({range.offset, range.length})) << name;
   }
-  auto submissions = counters->totalSubmissions();
-  auto opened = segmentOpenCounters.segmentsOpened.load();
-  for (auto& segment : reader->segments()) EXPECT_FALSE(segment.segmentCore().readPastCatalog());
-
-  // The first use of the version runs acquires them as one more round.
-  auto& first = reader->segments().front().segmentCore();
-  first.versionRuns();
-  EXPECT_EQ(submissions + 1, counters->totalSubmissions());
-  EXPECT_TRUE(first.readPastCatalog());
-  EXPECT_EQ(opened + 1, segmentOpenCounters.segmentsOpened.load());
+  // The open submitted those batches and nothing else; the first use of the
+  // version runs acquires them as one more round.
+  EXPECT_EQ(dataFiles.size(), counters->totalSubmissions());
+  reader->segments().front().segmentCore().versionRuns();
+  EXPECT_EQ(dataFiles.size() + 1, counters->totalSubmissions());
 
   // A later batch acquires only the parts the segment does not hold yet,
   // and slice() of them then makes no request. The catalog stays held; the

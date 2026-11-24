@@ -103,14 +103,8 @@ void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadC
       ranges.push_back({seg_location::fromRaw(key->first).offset(), key->second, readClass});
     }
     auto take = [this, batch = std::vector(begin, end)](std::vector<HeldRange>&& acquired) {
-      uint64_t added = 0;
-      {
-        std::lock_guard lock(holdsMutex);
-        for (size_t i = 0; i < batch.size(); ++i) {
-          if (holds.try_emplace(batch[i], std::move(acquired[i])).second) added += batch[i].second;
-        }
-      }
-      if (added) countFirstHold(added);
+      std::lock_guard lock(holdsMutex);
+      for (size_t i = 0; i < batch.size(); ++i) holds.try_emplace(batch[i], std::move(acquired[i]));
     };
     join.acquire(*files[number].file, ranges, std::move(take), error);
     begin = end;
@@ -134,32 +128,15 @@ std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice pa
   // miss must not hold up other slices of the segment, hits included. Two
   // threads missing the same part both acquire it; the first to store wins.
   auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
-  std::span<const char> bytes;
-  bool added;
-  {
-    // Scoped inside `hold`'s lifetime, so it unlocks before a duplicate hold releases.
-    std::lock_guard lock(holdsMutex);
-    auto [stored, inserted] = holds.try_emplace(key, std::move(hold));
-    bytes = stored->second.bytes();
-    added = inserted;
-  }
-  if (added) countFirstHold(part.bytes);
-  return bytes;
+  // Declared after `hold`, so it unlocks before a duplicate hold releases.
+  std::lock_guard lock(holdsMutex);
+  return holds.try_emplace(key, std::move(hold)).first->second.bytes();
 }
 
 void SegmentCore::releaseHold(field_parts::Slice part) {
   decltype(holds)::node_type node;  // Declared before the lock, so the hold releases after it.
   std::lock_guard lock(holdsMutex);
   node = holds.extract(std::pair(part.location.raw(), part.bytes));
-}
-
-void SegmentCore::countFirstHold(uint64_t bytes) noexcept {
-  if (!opened) return;  // the open's own headers and catalog
-  bytesBeyondCatalog.fetch_add(bytes, std::memory_order_relaxed);
-  segmentOpenCounters.segmentBytesMapped.fetch_add(bytes, std::memory_order_relaxed);
-  if (!readBeyondCatalog.exchange(true, std::memory_order_relaxed)) {
-    segmentOpenCounters.segmentsOpened.fetch_add(1, std::memory_order_relaxed);
-  }
 }
 
 const VersionRuns& SegmentCore::buildVersionRuns() const {
@@ -356,7 +333,6 @@ void SegmentCore::openPending(Directory& dir, std::span<PendingOpen> opens, bool
       return;
     }
     pending.core->finishOpen(pending);
-    pending.core->opened = true;
   }
 }
 
@@ -442,14 +418,12 @@ std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, uint64_t segId,
                                                  bool missingFileOK, bool expectSynced) {
   auto core = std::shared_ptr<SegmentCore>(new SegmentCore(segId, creatorEpoch));
   if (!core->initializeFromFiles(dir, missingFileOK, expectSynced)) return nullptr;
-  core->opened = true;
   return core;
 }
 
 SegmentCore::SegmentCore(Directory& dir, uint64_t segId, uint64_t creatorEpoch)
     : SegmentCore(segId, creatorEpoch) {
   initializeFromFiles(dir, false, false);
-  opened = true;
 }
 
 } // namespace luxir

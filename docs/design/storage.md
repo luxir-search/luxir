@@ -210,9 +210,6 @@ use:
   backend's error and the next use reads again; bytes that fail validation
   throw `SegmentCorruptError` on every use. The scrubber still checks every
   file of a snapshot, read or not.
-- `segmentOpenCounters` counts the segments with a first hold beyond the
-  catalog and the bytes those holds cover (`segments_opened`,
-  `segment_bytes_mapped`). Free views (RAM, mmap) are not counted.
 
 Two more properties of the open path:
 
