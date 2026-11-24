@@ -896,7 +896,7 @@ TEST_P(FieldPartsTest, IndexAndColumnSlices) {
   const auto& normInfo = textInfo;
   EXPECT_EQ(*normInfo.norms(), *norms);
   EXPECT_EQ((uint64_t)normCount, textInfo.normsValues(NUM_DOCS).bytes);
-  EXPECT_EQ(alternate ? field_parts::NormsMode::SPARSE : field_parts::NormsMode::FLAT, norms->mode);
+  EXPECT_EQ(alternate ? field_parts::NormsMode::CONSTANT : field_parts::NormsMode::FLAT, norms->mode);
   EXPECT_EQ(2u, NormsReader(postings, normInfo).value(0));
   EXPECT_EQ(alternate, prepared.presence.bitmap.has_value());
   if (prepared.presence.bitmap) {

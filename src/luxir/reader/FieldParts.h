@@ -169,23 +169,33 @@ uint64_t pointCount(FieldType::Type type, int64_t numValues) noexcept;
 uint64_t pointLeafCount(const Points& points, FieldType::Type type, int64_t numValues) noexcept;
 Slice pointsDirectory(const Points& points, FieldType::Type type, int64_t numValues);
 
-// FLAT stores a byte per doc ID. SPARSE stores a byte per doc with the field in rank order.
-enum class NormsMode : uint8_t { FLAT, SPARSE, LAST = SPARSE };
+// FLAT stores a byte per doc ID. SPARSE stores a byte per doc with the field in
+// rank order. CONSTANT stores the one byte every doc with the field has. PACKED
+// stores bit-packed codes (see NormsLayout) in packedBytes.
+enum class NormsMode : uint8_t { FLAT, SPARSE, CONSTANT, PACKED, LAST = PACKED };
 
 // Length norms of a text field, one byte per document.
 struct Norms {
-  seg_location location;             // One byte per doc selected by the mode.
-  NormsMode mode = NormsMode::FLAT;  // Whether entries follow doc IDs or docs-with-field ranks.
+  seg_location location;             // Norm bytes in the layout the mode selects.
+  NormsMode mode = NormsMode::FLAT;  // Layout of the bytes at location.
+  uint64_t packedBytes = 0;          // Region size of a PACKED layout, 0 otherwise.
 
-  static uint64_t bytes(NormsMode mode, int32_t maxDoc, int32_t docsWithField) noexcept {
-    return mode == NormsMode::FLAT ? maxDoc : docsWithField;
+  static uint64_t bytes(NormsMode mode, int32_t maxDoc, int32_t docsWithField,
+                        uint64_t packedBytes) noexcept {
+    switch (mode) {
+      case NormsMode::FLAT: return (uint64_t)maxDoc;
+      case NormsMode::SPARSE: return (uint64_t)docsWithField;
+      case NormsMode::CONSTANT: return 1;
+      case NormsMode::PACKED: return packedBytes;
+    }
+    return 0;
   }
   bool operator==(const Norms&) const = default;
 };
 
 // Extent of the norm bytes in the selected layout.
 inline Slice normsValues(const Norms& norms, int32_t maxDoc, int32_t docsWithField) {
-  return {norms.location, Norms::bytes(norms.mode, maxDoc, docsWithField)};
+  return {norms.location, Norms::bytes(norms.mode, maxDoc, docsWithField, norms.packedBytes)};
 }
 
 // A stored-fields resource: the retrievable values of every field assigned to it,

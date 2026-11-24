@@ -1,15 +1,26 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <bit>
+#include <format>
+#include <limits>
+#include <map>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "luxir/index/NormsWriter.h"
+#include "luxir/query/CombinedFieldQuery.h"
 #include "luxir/query/TermQuery.h"
+#include "luxir/reader/FieldRecordCodec.h"
+#include "test/CollectionHelper.h"
+#include "test/FieldRecordTest.h"
+#include "test/LocalReq.h"
 #include "test/LuxirTest.h"
+#include "test/QueryBuild.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
 
@@ -17,6 +28,8 @@ using namespace luxir;
 using namespace luxir::test;
 
 namespace {
+
+using Mode = field_parts::NormsMode;
 
 struct NormDoc {
   int32_t doc;
@@ -93,6 +106,77 @@ void assertTermScores(TestIndex& testIndex, std::string_view field, std::string_
   EXPECT_EQ(PostingsReader::END, scorer->next());
 }
 
+// "needle" followed by length - 1 filler tokens.
+std::string textOfLength(int32_t length) {
+  std::string text = "needle";
+  for (int32_t i = 1; i < length; i++) text += " filler";
+  return text;
+}
+
+// Adds one segment of docs "<prefix><i>-<length>" with body_w of that length.
+void addSegment(CollectionHelper& helper, std::string_view prefix,
+                std::span<const int32_t> lengths) {
+  CollectionHelper::UpdateBuilder request;
+  for (size_t i = 0; i < lengths.size(); i++) {
+    request.add(flatdoc("id", std::string(prefix) + std::to_string(i) + "-"
+                              + std::to_string(lengths[i]),
+                        "body_w", textOfLength(lengths[i])));
+  }
+  request.commit();
+  ASSERT_TRUE(helper.submit(request).success);
+}
+
+void forceMerge(CollectionHelper& helper) {
+  CollectionHelper::UpdateBuilder request;
+  request.commit(true, 1);
+  ASSERT_TRUE(helper.submit(request).success);
+  ASSERT_EQ(1u, helper.durableSegmentCount());
+}
+
+// The body_w norms format of each segment, sorted.
+std::vector<Mode> segmentNormsFormats(CollectionHelper& helper) {
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  std::vector<Mode> formats;
+  for (auto& segment : reader->segments()) {
+    auto* info = segment.postingsReader().fieldInfo("body_w");
+    EXPECT_TRUE(info != nullptr && info->norms());
+    if (info != nullptr && info->norms()) formats.push_back(info->norms()->mode);
+  }
+  std::sort(formats.begin(), formats.end());
+  return formats;
+}
+
+// Every doc has tf 1 for "needle", so with index-wide BM25 stats a doc's
+// score depends only on its length: equal lengths score equally and longer
+// docs score strictly lower. Returns the number of hits.
+size_t checkScoresFollowLengths(CollectionHelper& helper) {
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("body_w", "needle")
+      .getScores().fields({"id"}).limit(-1);
+  req->execute(false);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  const auto* docs = req->docList("q");
+  if (docs == nullptr) {
+    ADD_FAILURE() << "no doc list";
+    return 0;
+  }
+  const auto& ids = std::get<api::ColStr>(docs->columns.find("id")->kind).v;
+  const auto& scores = std::get<api::ColFloat>(docs->columns.find("_score_")->kind).v;
+  std::map<int32_t, float> scoreByLength;
+  for (size_t i = 0; i < ids.size(); i++) {
+    std::string_view id = ids[i];
+    int32_t length = std::stoi(std::string(id.substr(id.rfind('-') + 1)));
+    auto [it, inserted] = scoreByLength.emplace(length, scores[i]);
+    EXPECT_EQ(it->second, scores[i]) << "id=" << id;
+  }
+  float previous = std::numeric_limits<float>::infinity();
+  for (auto [length, score] : scoreByLength) {
+    EXPECT_LT(score, previous) << "length=" << length;
+    previous = score;
+  }
+  return ids.size();
+}
+
 } // namespace
 
 class NormsFormatTest : public LuxirTest {
@@ -114,7 +198,7 @@ TEST_F(NormsFormatTest, denseFieldUsesFlatNoBitset) {
   ASSERT_EQ(4, postingsReader.maxDoc());
   EXPECT_EQ(4, info.docsWithField);
   ASSERT_TRUE(info.norms());
-  EXPECT_EQ(field_parts::NormsMode::FLAT, info.norms()->mode);
+  EXPECT_EQ(Mode::FLAT, info.norms()->mode);
   EXPECT_EQ(4, info.normsValues(postingsReader.maxDoc()).bytes);
   EXPECT_FALSE(info.docsBitmap());
   auto raw = postingsReader.core().slice(info.normsValues(postingsReader.maxDoc()));
@@ -131,7 +215,7 @@ TEST_F(NormsFormatTest, denseFieldUsesFlatNoBitset) {
   assertTermScores(testIndex, "body_w", "needle", hits);
 }
 
-TEST_F(NormsFormatTest, partialFlatStoresPresenceButReadsByDoc) {
+TEST_F(NormsFormatTest, partialPackedStoresPresenceButReadsByDoc) {
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -148,14 +232,17 @@ TEST_F(NormsFormatTest, partialFlatStoresPresenceButReadsByDoc) {
   ASSERT_EQ(10, postingsReader.maxDoc());
   EXPECT_EQ(5, info.docsWithField);
   ASSERT_TRUE(info.norms());
-  EXPECT_EQ(field_parts::NormsMode::FLAT, info.norms()->mode);
-  EXPECT_EQ(10, info.normsValues(postingsReader.maxDoc()).bytes);
+  // Norm bytes 1..4 plus 0 for the docs without the field: frame of
+  // reference at 4 bits, one code per docid.
+  EXPECT_EQ(Mode::PACKED, info.norms()->mode);
+  EXPECT_EQ(4 + 5, info.normsValues(postingsReader.maxDoc()).bytes);
   EXPECT_TRUE(info.docsBitmap());
 
   NormsReader reader(postingsReader, info);
-  EXPECT_TRUE(reader.isFlat());
+  EXPECT_TRUE(reader.isPackedByDoc());
+  EXPECT_TRUE(reader.isByDoc());
   EXPECT_NE(nullptr, reader.docsReader().bitset());
-  EXPECT_EQ(0, (int)reader.value(1));
+  EXPECT_EQ(0, (int)reader.byDocValue(1));
   const std::vector<NormDoc> norms = {{0, 1}, {2, 3}, {4, 2}, {6, 4}, {9, 2}};
   assertNormDocs(postingsReader, info, norms);
 
@@ -179,7 +266,7 @@ TEST_F(NormsFormatTest, sparseFieldUsesBitsetRankOrdinal) {
   ASSERT_EQ(10, postingsReader.maxDoc());
   EXPECT_EQ(4, info.docsWithField);
   ASSERT_TRUE(info.norms());
-  EXPECT_EQ(field_parts::NormsMode::SPARSE, info.norms()->mode);
+  EXPECT_EQ(Mode::SPARSE, info.norms()->mode);
   EXPECT_EQ(4, info.normsValues(postingsReader.maxDoc()).bytes);
   EXPECT_TRUE(info.docsBitmap());
 
@@ -209,7 +296,7 @@ TEST_F(NormsFormatTest, sparseHighDocidsStayOrdinalSized) {
   ASSERT_EQ(100000, postingsReader.maxDoc());
   EXPECT_EQ(4, info.docsWithField);
   ASSERT_TRUE(info.norms());
-  EXPECT_EQ(field_parts::NormsMode::SPARSE, info.norms()->mode);
+  EXPECT_EQ(Mode::SPARSE, info.norms()->mode);
   EXPECT_EQ(4, info.normsValues(postingsReader.maxDoc()).bytes);
   EXPECT_LT(info.normsValues(postingsReader.maxDoc()).bytes * 1000, postingsReader.maxDoc());
   EXPECT_TRUE(info.docsBitmap());
@@ -249,8 +336,9 @@ TEST_F(NormsFormatTest, multiFieldNormsStayIndependent) {
   const auto& titleInfo = readFieldInfo(testIndex, "title_w");
   EXPECT_EQ(6, titleInfo.docsWithField);
   ASSERT_TRUE(titleInfo.norms());
-  EXPECT_EQ(field_parts::NormsMode::FLAT, titleInfo.norms()->mode);
-  EXPECT_EQ(6, titleInfo.normsValues(postingsReader.maxDoc()).bytes);
+  // Two lengths: frame of reference at 1 bit.
+  EXPECT_EQ(Mode::PACKED, titleInfo.norms()->mode);
+  EXPECT_EQ(4 + 1, titleInfo.normsValues(postingsReader.maxDoc()).bytes);
   EXPECT_FALSE(titleInfo.docsBitmap());
   const std::vector<NormDoc> titleNorms = {
       {0, 2}, {1, 2}, {2, 2}, {3, 3}, {4, 2}, {5, 2}};
@@ -259,7 +347,7 @@ TEST_F(NormsFormatTest, multiFieldNormsStayIndependent) {
   const auto& bodyInfo = readFieldInfo(testIndex, "body_w");
   EXPECT_EQ(2, bodyInfo.docsWithField);
   ASSERT_TRUE(bodyInfo.norms());
-  EXPECT_EQ(field_parts::NormsMode::SPARSE, bodyInfo.norms()->mode);
+  EXPECT_EQ(Mode::SPARSE, bodyInfo.norms()->mode);
   EXPECT_EQ(2, bodyInfo.normsValues(postingsReader.maxDoc()).bytes);
   EXPECT_TRUE(bodyInfo.docsBitmap());
   const std::vector<NormDoc> bodyNorms = {{0, 3}, {5, 2}};
@@ -270,4 +358,428 @@ TEST_F(NormsFormatTest, multiFieldNormsStayIndependent) {
   assertTermScores(testIndex, "title_w", "needle", titleHits);
   const std::vector<ScoreHit> bodyHits = {{0, 1, 3}, {5, 1, 2}};
   assertTermScores(testIndex, "body_w", "needle", bodyHits);
+}
+
+TEST_F(NormsFormatTest, constantFieldStoresOneByte) {
+  TestIndex testIndex;
+  TestField body(testIndex, "body_w");
+  TestField tag(testIndex, "tag_w");
+  body.startIndexing();
+  tag.startIndexing();
+  for (int32_t doc = 0; doc < 8; doc++) {
+    body.add(doc, doc % 3 == 0 ? "needle filler" : "filler filler");
+    if (doc == 3 || doc == 7) tag.add(doc, "needle");
+  }
+  testIndex.flush();
+  testIndex.initReader();
+  auto& postingsReader = testIndex.reader->segments()[0].postingsReader();
+
+  const auto& bodyInfo = readFieldInfo(testIndex, "body_w");
+  EXPECT_EQ(Mode::CONSTANT, bodyInfo.norms()->mode);
+  EXPECT_EQ(1, bodyInfo.normsValues(postingsReader.maxDoc()).bytes);
+  NormsReader bodyReader(postingsReader, bodyInfo);
+  EXPECT_TRUE(bodyReader.isConstant());
+  EXPECT_TRUE(bodyReader.isByDoc());
+  const std::vector<NormDoc> bodyNorms = {
+      {0, 2}, {1, 2}, {2, 2}, {3, 2}, {4, 2}, {5, 2}, {6, 2}, {7, 2}};
+  assertNormDocs(postingsReader, bodyInfo, bodyNorms);
+  const std::vector<ScoreHit> bodyHits = {{0, 1, 2}, {3, 1, 2}, {6, 1, 2}};
+  assertTermScores(testIndex, "body_w", "needle", bodyHits);
+
+  // A sparse constant field keeps its presence set but still one norm byte.
+  const auto& tagInfo = readFieldInfo(testIndex, "tag_w");
+  EXPECT_EQ(Mode::CONSTANT, tagInfo.norms()->mode);
+  EXPECT_EQ(1, tagInfo.normsValues(postingsReader.maxDoc()).bytes);
+  EXPECT_TRUE(tagInfo.docsBitmap());
+  const std::vector<NormDoc> tagNorms = {{3, 1}, {7, 1}};
+  assertNormDocs(postingsReader, tagInfo, tagNorms);
+  const std::vector<ScoreHit> tagHits = {{3, 1, 1}, {7, 1, 1}};
+  assertTermScores(testIndex, "tag_w", "needle", tagHits);
+}
+
+TEST_F(NormsFormatTest, sparseWideRangePacksDictionaryByRank) {
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  const int32_t lengths[] = {1, 2, 60};
+  std::vector<NormDoc> norms;
+  std::vector<ScoreHit> hits;
+  for (int32_t i = 0; i < 20; i++) {
+    int32_t doc = i * 50;
+    int32_t length = lengths[i % 3];
+    f.add(doc, textOfLength(length));
+    norms.push_back({doc, length});
+    hits.push_back({doc, 1, length});
+  }
+  f.add(999, "filler");
+  norms.push_back({999, 1});
+  testIndex.flush();
+  testIndex.initReader();
+
+  const auto& info = readFieldInfo(testIndex, "body_w");
+  auto& postingsReader = testIndex.reader->segments()[0].postingsReader();
+  ASSERT_EQ(1000, postingsReader.maxDoc());
+  // Three distinct bytes too far apart for frame of reference: a 3-entry
+  // dictionary at 2 bits, one code per doc with the field.
+  EXPECT_EQ(Mode::PACKED, info.norms()->mode);
+  EXPECT_EQ(3 + 3 + 6, info.normsValues(postingsReader.maxDoc()).bytes);
+  NormsReader reader(postingsReader, info);
+  EXPECT_TRUE(reader.isPacked());
+  EXPECT_FALSE(reader.isByDoc());
+  EXPECT_TRUE(reader.docsReader().bitset() != nullptr);
+  assertNormDocs(postingsReader, info, norms);
+  assertTermScores(testIndex, "body_w", "needle", hits);
+}
+
+TEST_F(NormsFormatTest, manyDistinctNormsStayRawFlat) {
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  std::vector<NormDoc> norms;
+  std::vector<ScoreHit> hits;
+  for (int32_t length = 1; length <= 20; length++) {
+    int32_t doc = (length - 1) * 2;
+    f.add(doc, textOfLength(length));
+    norms.push_back({doc, length});
+    hits.push_back({doc, 1, length});
+  }
+  testIndex.flush();
+  testIndex.initReader();
+
+  const auto& info = readFieldInfo(testIndex, "body_w");
+  auto& postingsReader = testIndex.reader->segments()[0].postingsReader();
+  ASSERT_EQ(39, postingsReader.maxDoc());
+  // 20 distinct bytes need more than 4 bits, so the bytes stay raw.
+  EXPECT_EQ(Mode::FLAT, info.norms()->mode);
+  EXPECT_EQ(39, info.normsValues(postingsReader.maxDoc()).bytes);
+  NormsReader reader(postingsReader, info);
+  EXPECT_TRUE(reader.isFlat());
+  EXPECT_TRUE(reader.docsReader().bitset() != nullptr);
+  EXPECT_EQ(0, (int)reader.value(1));
+  assertNormDocs(postingsReader, info, norms);
+  assertTermScores(testIndex, "body_w", "needle", hits);
+}
+
+// Each layout is chosen again at merge, from the live docs only.
+TEST_F(NormsFormatTest, mergeRechoosesLayoutAfterDeletes) {
+  CollectionHelper helper("main");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  std::vector<int32_t> constant(30, 3);
+  std::vector<int32_t> cycling;
+  for (int32_t i = 0; i < 32; i++) cycling.push_back(1 + i % 4);
+  addSegment(helper, "c", constant);
+  addSegment(helper, "p", cycling);
+  EXPECT_EQ((std::vector<Mode>{Mode::CONSTANT, Mode::PACKED}),
+            segmentNormsFormats(helper));
+  EXPECT_EQ(62u, checkScoresFollowLengths(helper));
+
+  forceMerge(helper);
+  EXPECT_EQ((std::vector<Mode>{Mode::PACKED}), segmentNormsFormats(helper));
+  EXPECT_EQ(62u, checkScoresFollowLengths(helper));
+
+  // Delete every doc whose length is not 3; the merged output is constant.
+  std::vector<std::string> deletes;
+  for (size_t i = 0; i < cycling.size(); i++) {
+    if (cycling[i] != 3) deletes.push_back("p" + std::to_string(i) + "-" + std::to_string(cycling[i]));
+  }
+  ASSERT_TRUE(helper.deleteByIds(deletes, UpdateMessage::COMMIT).success);
+  addSegment(helper, "k", std::vector<int32_t>(4, 3));
+  forceMerge(helper);
+  EXPECT_EQ((std::vector<Mode>{Mode::CONSTANT}), segmentNormsFormats(helper));
+  EXPECT_EQ(42u, checkScoresFollowLengths(helper));
+
+  // A segment with many distinct lengths stays raw and merges back to raw.
+  std::vector<int32_t> distinct;
+  for (int32_t length = 1; length <= 20; length++) distinct.push_back(length);
+  addSegment(helper, "f", distinct);
+  EXPECT_EQ((std::vector<Mode>{Mode::FLAT, Mode::CONSTANT}),
+            segmentNormsFormats(helper));
+  EXPECT_EQ(62u, checkScoresFollowLengths(helper));
+  forceMerge(helper);
+  EXPECT_EQ((std::vector<Mode>{Mode::FLAT}), segmentNormsFormats(helper));
+  EXPECT_EQ(62u, checkScoresFollowLengths(helper));
+}
+
+namespace {
+
+using Scores = std::map<std::string, float>;
+
+// id -> score for every hit of query.
+Scores scoresById(CollectionHelper& helper, std::string_view collection, const api::Query& query) {
+  auto req = localReq(helper.getSearchEngine());
+  req->collection(collection).topDocs("q").rawQuery() = query;
+  req->collection(collection).topDocs("q").getScores().fields({"id"}).limit(-1);
+  req->execute(false);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  Scores out;
+  const auto* docs = req->docList("q");
+  if (docs == nullptr || docs->row_count == 0) return out;
+  const auto& ids = std::get<api::ColStr>(docs->columns.find("id")->kind).v;
+  const auto& scores = std::get<api::ColFloat>(docs->columns.find("_score_")->kind).v;
+  for (size_t i = 0; i < ids.size(); i++) out[std::string(ids[i])] = scores[i];
+  return out;
+}
+
+// The field's norms format in each segment, in segment order.
+std::vector<Mode> fieldNormsFormats(CollectionHelper& helper, std::string_view field) {
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  std::vector<Mode> formats;
+  for (auto& segment : reader->segments()) {
+    auto* info = segment.postingsReader().fieldInfo(field);
+    EXPECT_TRUE(info != nullptr && info->norms());
+    if (info != nullptr && info->norms()) formats.push_back(info->norms()->mode);
+  }
+  return formats;
+}
+
+// Runs scenario once with the raw FLAT/SPARSE layouts forced and once with
+// the layouts the writer picks; returns {raw, chosen} score lists.
+template <typename Scenario>
+std::pair<std::vector<Scores>, std::vector<Scores>> rawAndChosen(Scenario scenario) {
+  auto restore = scope_guard([] { NormsWriter::rawLayoutsForTests = false; });
+  std::vector<Scores> raw, chosen;
+  for (bool forceRaw : {true, false}) {
+    NormsWriter::rawLayoutsForTests = forceRaw;
+    std::string_view name = forceRaw ? "raw" : "chosen";
+    auto drop = scope_guard([name] { LuxirTest::luxirNode->deleteCollection(name); });
+    CollectionHelper helper(name);
+    scenario(helper, name, forceRaw ? raw : chosen);
+  }
+  return {std::move(raw), std::move(chosen)};
+}
+
+void expectSameScores(const std::vector<Scores>& raw, const std::vector<Scores>& chosen) {
+  ASSERT_EQ(raw.size(), chosen.size());
+  for (size_t i = 0; i < raw.size(); i++) {
+    EXPECT_FALSE(raw[i].empty()) << "query " << i;
+    EXPECT_EQ(raw[i].size(), chosen[i].size()) << "query " << i;
+    int32_t reported = 0;
+    for (const auto& [id, score] : raw[i]) {
+      auto found = chosen[i].find(id);
+      float other = found == chosen[i].end() ? -1.0f : found->second;
+      if (other != score && reported++ < 5) {
+        ADD_FAILURE() << std::format("query {} id {}: raw {} chosen {}", i, id, score, other);
+      }
+    }
+  }
+}
+
+// 64 docs in one segment: title_w on 3 of every 4 docs with 3 lengths
+// (docid-addressed PACKED with gaps), body_w on every doc with one length
+// (CONSTANT, no bitset), tag_w on 1 of every 8 docs with one length (CONSTANT
+// with a bitset, rank addressed).
+void indexMixedLayouts(CollectionHelper& helper) {
+  CollectionHelper::UpdateBuilder request;
+  for (int32_t i = 0; i < 64; i++) {
+    auto doc = flatdoc("id", "d" + std::to_string(i), "body_w", "needle filler filler");
+    if (i % 4 != 3) appendFlat(doc, "title_w", textOfLength(1 + i % 3));
+    if (i % 8 == 0) appendFlat(doc, "tag_w", "needle");
+    request.add(std::move(doc));
+  }
+  request.commit();
+  ASSERT_TRUE(helper.submit(request).success);
+}
+
+class NormsLayoutScoresTest : public LuxirTest {
+public:
+  google::protobuf::Arena protoArena;
+  ArenaResource mr{&protoArena};
+};
+
+} // namespace
+
+// Docid-addressed PACKED decodes a doc without the field to 0, like FLAT, so
+// combined-field scoring reads it by docid; scores match the raw layouts.
+TEST_F(NormsLayoutScoresTest, combinedFieldMatchesRawLayouts) {
+  auto& pairThreshold = CombinedFieldQuery::pairTableMinEvaluationsForTests;
+  auto restore = scope_guard([&pairThreshold, saved = pairThreshold] { pairThreshold = saved; });
+  auto [raw, chosen] = rawAndChosen([&](CollectionHelper& helper, std::string_view name, std::vector<Scores>& out) {
+    indexMixedLayouts(helper);
+    if (!NormsWriter::rawLayoutsForTests) {
+      EXPECT_EQ(std::vector<Mode>{Mode::PACKED}, fieldNormsFormats(helper, "title_w"));
+      EXPECT_EQ(std::vector<Mode>{Mode::CONSTANT}, fieldNormsFormats(helper, "body_w"));
+      EXPECT_EQ(std::vector<Mode>{Mode::CONSTANT}, fieldNormsFormats(helper, "tag_w"));
+    }
+    for (int64_t threshold : {std::numeric_limits<int64_t>::max(), (int64_t)0}) {
+      pairThreshold = threshold;
+      out.push_back(scoresById(helper, name, qb::multiMatch(mr, "needle", {{"title_w", 2.0f}, {"body_w", {}}})));
+      out.push_back(scoresById(helper, name, qb::multiMatch(mr, "needle", {{"tag_w", 3.0f}, {"title_w", {}}})));
+    }
+    out.push_back(scoresById(
+        helper, name, qb::multiMatch(mr, "needle", {{"title_w", 2.0f}, {"body_w", {}}, {"tag_w", 0.5f}})));
+  });
+  expectSameScores(raw, chosen);
+}
+
+TEST_F(NormsLayoutScoresTest, phraseMatchesRawLayouts) {
+  auto [raw, chosen] = rawAndChosen([&](CollectionHelper& helper, std::string_view name, std::vector<Scores>& out) {
+    indexMixedLayouts(helper);
+    out.push_back(scoresById(helper, name, qb::phraseText(mr, "title_w", "needle filler")));
+    out.push_back(scoresById(helper, name, qb::phraseText(mr, "body_w", "needle filler")));
+  });
+  expectSameScores(raw, chosen);
+}
+
+// Rank-addressed CONSTANT and PACKED segments merge with a SPARSE one and
+// with deletes; every step scores like the raw layouts.
+TEST_F(NormsLayoutScoresTest, rankAddressedMergesWithDeletesMatchRawLayouts) {
+  std::vector<std::vector<Mode>> formats;
+  auto [raw, chosen] = rawAndChosen([&](CollectionHelper& helper, std::string_view name, std::vector<Scores>& out) {
+    helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+    // body_w on 1 of every 5 docs, so its norms are addressed by rank.
+    auto addSparseSegment = [&](std::string_view prefix, std::span<const int32_t> lengths) {
+      CollectionHelper::UpdateBuilder request;
+      for (size_t i = 0; i < lengths.size() * 5; i++) {
+        auto doc = flatdoc("id", std::string(prefix) + std::to_string(i), "other_w", "needle other");
+        if (i % 5 == 0) appendFlat(doc, "body_w", textOfLength(lengths[i / 5]));
+        request.add(std::move(doc));
+      }
+      request.commit();
+      ASSERT_TRUE(helper.submit(request).success);
+    };
+    auto query = [&] {
+      out.push_back(scoresById(helper, name, qb::multiMatch(mr, "needle", {{"body_w", 2.0f}, {"other_w", {}}})));
+      out.push_back(scoresById(helper, name, qb::phraseText(mr, "body_w", "needle filler")));
+      out.push_back(scoresById(helper, name, qb::multiMatch(mr, "needle", {{"body_w", {}}})));
+    };
+    std::vector<int32_t> constant(20, 2), packed, distinct;
+    for (int32_t i = 0; i < 24; i++) packed.push_back(i % 3 == 0 ? 60 : 1 + i % 3);
+    for (int32_t length = 1; length <= 20; length++) distinct.push_back(length);
+    addSparseSegment("c", constant);
+    addSparseSegment("p", packed);
+    addSparseSegment("s", distinct);
+    formats.push_back(fieldNormsFormats(helper, "body_w"));
+    query();
+
+    // Deletes in every segment, then one merged segment.
+    std::vector<std::string> deletes = {"c0", "c5", "p10", "p15", "s0", "s95"};
+    ASSERT_TRUE(helper.deleteByIds(deletes, UpdateMessage::COMMIT).success);
+    query();
+    forceMerge(helper);
+    formats.push_back(fieldNormsFormats(helper, "body_w"));
+    query();
+
+    // Deleting every doc of the distinct segment leaves CONSTANT and PACKED
+    // values; then only the constant ones.
+    deletes.clear();
+    for (int32_t i = 0; i < 100; i++) deletes.push_back("s" + std::to_string(i));
+    ASSERT_TRUE(helper.deleteByIds(deletes, UpdateMessage::COMMIT).success);
+    addSparseSegment("k", std::vector<int32_t>(4, 2));
+    forceMerge(helper);
+    formats.push_back(fieldNormsFormats(helper, "body_w"));
+    query();
+    deletes.clear();
+    for (int32_t i = 0; i < 120; i++) deletes.push_back("p" + std::to_string(i));
+    ASSERT_TRUE(helper.deleteByIds(deletes, UpdateMessage::COMMIT).success);
+    forceMerge(helper);
+    formats.push_back(fieldNormsFormats(helper, "body_w"));
+    query();
+  });
+  expectSameScores(raw, chosen);
+  ASSERT_EQ(8u, formats.size());
+  using F = std::vector<Mode>;
+  EXPECT_EQ((F{Mode::SPARSE, Mode::SPARSE, Mode::SPARSE}), formats[0]);
+  EXPECT_EQ((F{Mode::SPARSE}), formats[1]);
+  EXPECT_EQ((F{Mode::SPARSE}), formats[2]);
+  EXPECT_EQ((F{Mode::SPARSE}), formats[3]);
+  EXPECT_EQ((F{Mode::CONSTANT, Mode::PACKED, Mode::SPARSE}),
+            formats[4]);
+  EXPECT_EQ((F{Mode::SPARSE}), formats[5]);
+  EXPECT_EQ((F{Mode::PACKED}), formats[6]);
+  EXPECT_EQ((F{Mode::CONSTANT}), formats[7]);
+}
+
+
+TEST_F(NormsFormatTest, corruptPackedNormsAreRejected) {
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  TestField dense(testIndex, "title_w");
+  f.startIndexing();
+  dense.startIndexing();
+  for (int32_t doc = 0; doc < 19; doc++) {
+    if (doc % 2 == 0) f.add(doc, textOfLength(1 + doc / 2 % 4));
+    dense.add(doc, textOfLength(1 + doc % 2));
+  }
+  testIndex.flush();
+  testIndex.initReader();
+  auto& postingsReader = testIndex.reader->segments()[0].postingsReader();
+  const auto& info = readFieldInfo(testIndex, "body_w");
+  ASSERT_TRUE(info.norms());
+  ASSERT_EQ(Mode::PACKED, info.norms()->mode);
+  int32_t maxDoc = postingsReader.maxDoc();
+  auto& core = postingsReader.core();
+  auto files = segmentFileSizes(testIndex.dir, core.id(), core.epoch());
+
+  // Re-encodes the field with mutated norms and opens them.
+  auto open = [&](auto mutate) {
+    EncodedFieldRecord record(info, maxDoc);
+    mutate(record.field.norms);
+    RAMFile encoded("");
+    OutputStream out(&encoded);
+    FieldRecordCodec::encode(out, record.field, maxDoc);
+    out.close();
+    std::vector<char> bytes(encoded.size());
+    encoded.copyTo(bytes.data());
+    auto decoded = FieldRecordCodec::decode(bytes, maxDoc, files, -1);
+    NormsReader reader(postingsReader, *decoded);
+    return reader.isPackedByDoc();
+  };
+  auto expectRejected = [&](auto mutate, std::string_view reason) {
+    try {
+      open(mutate);
+      ADD_FAILURE() << "Expected corruption: " << reason;
+    } catch (const std::exception& e) {
+      EXPECT_TRUE(std::string_view(e.what()).contains(reason)) << e.what();
+    }
+  };
+  EXPECT_TRUE(open([](field_parts::Norms&) {}));
+  expectRejected([](field_parts::Norms& norms) { norms.packedBytes--; }, "packed norms size");
+  expectRejected([](field_parts::Norms& norms) { norms.packedBytes++; }, "packed norms size");
+  // The catalog checks this one, on encode as on decode.
+  expectRejected([](field_parts::Norms& norms) { norms.packedBytes = NormsLayout::PACKED_HEADER_BYTES; },
+                 "packed norms shorter than their header");
+  // Starting one byte in reads the addressing byte (0) as the bit width.
+  expectRejected([](field_parts::Norms& norms) {
+    norms.location = seg_location(norms.location.filenum(), norms.location.offset() + 1);
+    norms.packedBytes--;
+  }, "packed norms header");
+
+  // Header bytes patched in a copy of the segment files.
+  auto openPatched = [&](std::string_view field, size_t at, char value) {
+    const auto& patchedInfo = readFieldInfo(testIndex, field);
+    auto location = patchedInfo.norms()->location;
+    auto normsFile = Postings::getIndexFileName(core.segmentName(), location.filenum());
+    RAMDir copy;
+    std::vector<Directory::FileInfo> names;
+    testIndex.dir.listFiles(names);
+    for (const auto& name : names) {
+      auto source = testIndex.dir.openFile(name.name);
+      auto held = source->acquire({0, source->size()});
+      std::string bytes(held.getData(), held.getLength());
+      if (name.name == normsFile) bytes[location.offset() + at] = value;
+      auto file = copy.createFile(name.name);
+      OutputStream out(file.get());
+      out.write(bytes.data(), bytes.size());
+      out.close();
+      copy.finishFile(*file);
+    }
+    SegmentCore patched(copy, core.id(), core.epoch());
+    NormsReader reader(patched.rootReader(), *patched.rootReader().fieldInfo(field));
+  };
+  auto expectPatchRejected = [&](std::string_view field, size_t at, char value, std::string_view reason) {
+    try {
+      openPatched(field, at, value);
+      ADD_FAILURE() << "Expected corruption: " << reason;
+    } catch (const std::exception& e) {
+      EXPECT_TRUE(std::string_view(e.what()).contains(reason)) << e.what();
+    }
+  };
+  ASSERT_EQ(Mode::PACKED, readFieldInfo(testIndex, "title_w").norms()->mode);
+  EXPECT_NO_THROW(openPatched("body_w", 0, 4));  // the bit width it has
+  expectPatchRejected("body_w", 0, 3, "packed norms header");   // bit width
+  expectPatchRejected("body_w", 1, 2, "packed norms header");   // addressing
+  expectPatchRejected("body_w", 2, 17, "packed norms header");  // table longer than 2^bits
+  // title_w has every doc, so no bitmap to rank by.
+  expectPatchRejected("title_w", 1, (char)NormsLayout::BY_RANK,
+                      "rank-addressed packed norms require a docs bitmap");
 }

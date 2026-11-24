@@ -1245,6 +1245,10 @@ public:
     int64_t approximationCost;
     bool exclusionWindowFill;
     const uint8_t* flatNormsBase = nullptr;
+    // Docid-addressed PACKED norms, decoded without the iterator.
+    const NormsReader* packedNorms = nullptr;
+    // CONSTANT norms: the one byte, or -1.
+    int32_t constantNorm = -1;
     int32_t cachedNormDoc = -1;
     uint8_t cachedNorm = 0;
 #ifndef NDEBUG
@@ -1411,6 +1415,8 @@ public:
 
     int64_t lookupNorm(int32_t doc) {
       if (flatNormsBase != nullptr) return flatNormsBase[doc];
+      if (constantNorm >= 0) return constantNorm;
+      if (packedNorms != nullptr) return packedNorms->packedByDocValue(doc);
       if (doc != cachedNormDoc) {
         int32_t normDoc = normsIter->advance(doc);
         assert(normDoc == doc);
@@ -1491,6 +1497,8 @@ public:
       if (normsReader != nullptr) {
         normsIter.emplace(*normsReader);
         flatNormsBase = normsReader->flatBase();
+        if (normsReader->isConstant()) constantNorm = normsReader->constantValue();
+        if (normsReader->isPackedByDoc()) packedNorms = normsReader;
       }
       if (!MatcherPolicy::IS_SLOPPY && !impacts.empty()) {
         competitiveBound = 0.0f;

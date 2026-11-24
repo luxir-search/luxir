@@ -547,9 +547,9 @@ TEST_F(RowSpaceTest, physicalHandlersFlushAgainstTheirBoundSpace) {
   auto& body = *child.fieldInfo("items_nested.body_w");
   EXPECT_EQ(3, body.docsWithField);
   NormsReader norms(child, body);
-  EXPECT_TRUE(norms.isFlat());
+  EXPECT_TRUE(norms.isConstant());
   ASSERT_TRUE(body.norms());
-  EXPECT_EQ(3, body.normsValues(child.maxDoc()).bytes);
+  EXPECT_EQ(1, body.normsValues(child.maxDoc()).bytes);
   EXPECT_EQ(2, norms.value(2));
   const auto& label = *child.fieldInfo("items_nested.label_s");
   OrdColReader ords(child, label);
@@ -558,6 +558,47 @@ TEST_F(RowSpaceTest, physicalHandlersFlushAgainstTheirBoundSpace) {
   const auto& embedding = *child.fieldInfo("items_nested.embedding_v");
   VectorReader vector(child, embedding);
   EXPECT_EQ(2, vector.dims());
+}
+
+// A child text field with gaps packs its norms by child row, and a row
+// without the field decodes to 0.
+TEST_F(RowSpaceTest, childTextFieldPacksNormsByChildRow) {
+  Inverter inverter(dir, 1, 1);
+  auto& writer = inverter.getPostingsWriter();
+  auto space = writer.addSpace("items_nested");
+  auto name = Schema::qualify("items_nested", "body_w");
+  auto field = inverter.pool.make_unique<handler::FullTextHandler>(
+      inverter, name, inverter.schema->getFieldTypeEx(name), space);
+  auto& text = *field;
+  inverter.indexHandlers.emplace(std::move(name), std::move(field));
+  const std::string_view bodies[] = {"one", "one two", "one two three"};
+  constexpr int32_t ROWS = 40;
+  for (int32_t row = 0; row < ROWS; row++) {
+    inverter.startDoc();
+    if (row % 4 != 3) text.index(inverter, bodies[row % 3]);
+  }
+  // One root per child row.
+  std::vector<int64_t> ends;
+  for (int32_t row = 0; row < ROWS; row++) ends.push_back(row + 1);
+  writer.finishSpace(space, ROWS, Fixture::shape(writer, ends));
+  ASSERT_TRUE(inverter.flush());
+  SegmentCore core(dir, 1, 1);
+  auto& child = *core.spaceReader("items_nested");
+  ASSERT_EQ(ROWS, child.maxDoc());
+  auto& body = *child.fieldInfo("items_nested.body_w");
+  EXPECT_EQ(30, body.docsWithField);
+  NormsReader norms(child, body);
+  EXPECT_TRUE(norms.isPackedByDoc());
+  EXPECT_NE(nullptr, norms.docsReader().bitset());
+  NormsReader::Iterator iter(norms);
+  for (int32_t row = 0; row < ROWS; row++) {
+    uint8_t expected = row % 4 == 3 ? 0 : SmallFloat::intToByte4(1 + row % 3);
+    EXPECT_EQ(expected, norms.byDocValue(row)) << "row=" << row;
+    if (row % 4 == 3) continue;
+    EXPECT_EQ(row, iter.next());
+    EXPECT_EQ(expected, iter.value()) << "row=" << row;
+  }
+  EXPECT_EQ(NormsReader::ENDDOC, iter.next());
 }
 
 TEST_F(RowSpaceTest, inverterStoredResourcesAreLocalToTheirBoundSpace) {

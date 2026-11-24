@@ -187,6 +187,8 @@ public:
     struct Norms {
       const double* lengths;
       const uint8_t* flat = nullptr;
+      // Docid-addressed CONSTANT or PACKED (NormsReader::isByDoc).
+      const NormsReader* byDoc = nullptr;
       NormsReader::Iterator* sparse = nullptr;
     };
 
@@ -219,6 +221,7 @@ public:
     // A document without the field reads as code 0, which decodes to length 0.
     uint8_t code(Norms& n) {
       if (n.flat != nullptr) return n.flat[doc];
+      if (n.byDoc != nullptr) return n.byDoc->byDocValue(doc);
       if (n.sparse->docId() < doc) n.sparse->advance(doc);
       return n.sparse->docId() == doc ? n.sparse->value() : 0;
     }
@@ -491,6 +494,8 @@ public:
         const double* lengths = normTables->lengths + i * 256;
         if (reader->isFlat()) {
           norms[numNorms++] = {.lengths = lengths, .flat = reader->flatBase()};
+        } else if (reader->isByDoc()) {
+          norms[numNorms++] = {.lengths = lengths, .byDoc = reader};
         } else {
           norms[numNorms++] = {.lengths = lengths, .sparse = targetPool.make<NormsReader::Iterator>(*reader)};
         }

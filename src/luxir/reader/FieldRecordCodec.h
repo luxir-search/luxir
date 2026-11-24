@@ -27,7 +27,7 @@ namespace luxir {
 //   have options, a location and the predicted payload length when needed.
 //   Bytes columns have options, a values slice and optional end offsets.
 //   Points have a location, leaves length and leaf capacity.
-//   Norms have options and a location.
+//   Norms have a mode and a location, then the region size of a packed layout.
 //   Stored resources have chunk counts and maximum size, codec and chunk limits,
 //   location and three lengths, then first-doc and chunk-offset slices.
 //   The docs bitmap, end value ranks, owners and id filter are standalone slices.
