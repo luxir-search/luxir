@@ -82,21 +82,13 @@ engine and the terminal candidate rescore. `f16` and `bf16` rows are scored in
 place by FAISS's `ScalarQuantizer` distance computers (`QT_fp16` and
 `QT_bf16` read the layouts written here and need no training); cosine takes
 the dot from an inner-product computer and `|x|^2` from an L2 computer against
-an all-zero query, a second pass over the row. `sq8` rows are scored in
-registers (`query/Sq8Kernel.h`): each code is widened and decoded as
-`offset + scale * code` with one FMA and fed straight into the squared
-distance or dot product, and cosine sums `|x|^2` in the same pass. This scores
-the decoded vector rather than the codes against per-vector offset and scale
-terms (`scale * dot(q, codes) + offset * sum(q)`), which cancel
-catastrophically for a query with a large dynamic range. The kernels need AVX2
-and FMA, chosen at compile time from the CPU target like the RaBitQ kernels.
-Other targets (x86-64-v2, AArch64) decode the row into a per-task buffer and
-call the FAISS float32 kernels: those dispatch at run time, and on x86-64-v2
-a portable lane loop was about 2x slower than they are. Either way a score is
-the f32 score of the stored vector up to summation order, and a build scores a
-row identically in the flat scan and the rescore. Cosine over a non-f32 row
-always divides by the stored vector's norm, since a quantized unit vector is
-not exactly unit length.
+an all-zero query, a second pass over the row. `sq8` rows are decoded into a
+per-task buffer and scored with the float32 kernels, rather than scoring the
+codes against per-vector offset and scale terms, which cancel catastrophically
+for a query with a large dynamic range. Either way a score is the f32 score of
+the stored vector up to summation order. Cosine over a non-f32 row always
+divides by the stored vector's norm, since a quantized unit vector is not
+exactly unit length.
 
 ## Overlay Lifecycle
 
@@ -202,15 +194,36 @@ and result handler. PQ retains FAISS's optimized code kernel; RaBitQ evaluates
 its 1-bit estimate and gates extra-bit work in Luxir. Exact column scans and
 terminal rescoring retain the canonical query.
 
-Codes with one bit per dimension and a quantized query use `RaBitQScorer`.
+Every code width with a quantized query uses `RaBitQScorer`.
 It owns its arithmetic: residuals are quantized by rounding half up and
 clamping, and estimates agree with FAISS within query-quantization error;
 last-bit float differences across builds and architectures are accepted.
 Tests check exact quantized values, bit planes and integer counts against a
 scalar reference, and factors and estimates against FAISS within a derived
 one-step tolerance. The scorer removes per-list allocation and bit-at-a-time
-packing, and the per-code virtual call. FAISS's computer remains for extended
-codes and query bits 0.
+packing, and the per-code virtual call. FAISS's computer remains for query
+bits 0 (and the `forceFaissRaBitQ` test switch).
+
+For extended codes (2 to 9 bits) the scorer also replaces FAISS's
+`distance_to_code_full`. FAISS multiplies the float residual by each
+dimension's code value; the scorer instead quantizes the residual once more
+per list, to 8 bits whatever `query_bits` says (sharing the 1-bit pass's
+quantization when that is already 8 bits), and takes the integer inner
+product of every code bit plane, sign plane included, with the query's 8
+bit planes. That is the same AND-and-popcount kernel the 1-bit pass runs
+(AVX-512 VPOPCNTDQ, AVX2, NEON or 64-bit popcount), once per code plane.
+9-bit codes keep FAISS's byte per dimension for their 8 extra bits and
+multiply it with the query bytes (AVX2 `madd`, NEON `umull`), since 8
+plane passes would cost more than FAISS's own byte kernel. The
+estimate expands `sum_i r_i * (code_i - (2^B - 1) / 2)` with `r_i = low +
+delta * q_i` into two exact integer terms and two float products. It agrees
+with FAISS within the 8-bit rounding of the residual (half a step per
+dimension, weighted by the code value), not bit for bit; tests check the
+integer counts exactly against code values read back from FAISS's own
+packing, the estimate against a double evaluation, and FAISS within that
+derived bound, for every width, all query bits and both metrics. The 1-bit
+gate in front of it is unchanged. Unlike FAISS, the full L2 estimate is not
+clamped at zero, like the 1-bit one.
 
 RaBitQ's estimated squared L2 distance can be negative. Since 1.15, FAISS
 clamps its 1-bit L2 estimates at zero; the port patch
@@ -283,8 +296,57 @@ On the same model truncated to 256 / 384 / 512 / 1024 dims, 2 bits cut k=100
 latency by 23% / 13% / 9% / 1% (21% on SIFT-128) but k=10 latency only
 below 384, while costing 1.5-1.8x the build CPU. 4 bits never beat 2.
 
+That comparison predates the extended `RaBitQScorer`, which scores an extended
+code 2.7x (2 bits) to 3.3x (4 and 8 bits) faster than FAISS's per-row
+computer at 768 dims and 9-bit codes at parity (FAISS has a byte kernel for
+that width); see [extended scorer measurements](#extended-scorer-measurements).
+Re-checked with it on one-segment 100k x 768 synthetic clustered cosine
+corpora, 200 held-out queries, default interval selection (`refine` 0):
+
+| Corpus | Bits | Recall@10 | Terminal reads | Overlay bytes/vector | Build |
+|---|---|---|---|---|---|
+| 256 clusters, noise 0.6 | 1 | 1.000 | 144.4 | 126 | 0.5 s |
+| | 4 | .998 | 15.4 | 426 | 1.4 s |
+| 1024 clusters, noise 1.5 | 1 | .8835 | 91.6 | 126 | 0.4 s |
+| | 2 | .8835 | 41.4 | 234 | 1.0 s |
+| | 4 | .8820 | 16.2 | 426 | 1.4 s |
+
+Recall is bounded by the probed lists, not the codec: at 32 / 64 / 128 of
+316 lists the harder corpus gives .855 / .913 / .962 for every width (4 bits
+.001-.0015 lower), while 4 bits read 5.6-6.7x fewer full-precision vectors
+than 1 bit (2 bits 2.2-2.4x). Latency did not separate beyond the noise of a
+shared machine (p50 203 / 222 / 217 us for 1 / 2 / 4 bits at 32 lists).
+The automatic default therefore stays at 1 bit from 384 dims: with the column
+resident, fewer terminal reads did not buy measurable latency, and 4 bits
+cost 3.4x the overlay bytes and 3.5x the overlay build time at slightly lower
+recall. Where terminal reads are expensive (a column not resident in memory),
+an explicit `rabitq.bits` of 2 or 4 trades overlay bytes for 2-6x fewer
+reads. These are small synthetic corpora on one host; the 1M real-corpus
+sweeps above were not repeated.
+
 GIST L2 with PQ m=32 topped out at .71 recall@10 at 256 of 1000 lists;
 m=120, now the automatic choice, reaches .94-.98.
+
+### Extended scorer measurements
+
+`Tuning/BM_VectorRaBitQExtendedKernel` scores 1024 cache-resident gate
+survivors of one list (L2, query bits 4) on an i7-14700KF (AVX2, no AVX-512),
+GCC 16 `gcc-release`, pinned to one performance core. Nanoseconds per code:
+
+| Dims | Bits | RaBitQScorer | FAISS `distance_to_code_full` | Speedup |
+|---|---|---|---|---|
+| 128 | 2 / 4 | 11.8 / 24.0 | 18.4 / 49.4 | 1.6x / 2.1x |
+| 384 | 2 / 4 | 23.8 / 39.1 | 54.6 / 121.4 | 2.3x / 3.1x |
+| 768 | 2 / 4 / 8 / 9 | 35.4 / 66.9 / 131.5 / 49.6 | 96.5 / 219.2 / 434.5 / 51.7 | 2.7x / 3.3x / 3.3x / 1.04x |
+| 1536 | 2 / 4 / 8 / 9 | 65.6 / 126.5 / 251.2 / 95.3 | 183.6 / 428.4 / 859.0 / 99.2 | 2.8x / 3.4x / 3.4x / 1.04x |
+
+The scorer's cost is about 6.7 ns plus 0.020 ns per code plane and
+dimension (9-bit codes about three planes); FAISS's is about 0.05 ns per
+dimension plus 0.075 ns per extra bit and dimension. Its list setup adds
+0.23 ns per dimension for the 8-bit quantization (423 against 249 ns at 768
+dims), paid only by lists with a gate survivor; FAISS's setup is 332 ns.
+The planner's `SCORER_EXTRA_*` units are seeded from these, scaled to the
+fitted table, and are not yet refitted from forced-arm runs.
 
 ### Codec measurements
 
@@ -434,6 +496,18 @@ the mmapped file. Residency of the bulk index data is therefore managed by the
 OS page cache, like the vector column itself, rather than forced into process
 RAM.
 
+Extended RaBitQ lists are stored split (`RaBitQLayout`): first every row's
+sign bits and gate factors (`SignBitFactorsWithError`), then every row's
+extra-bit planes and `ExtraBitsFactors`. Plane `p` holds bit `p` of each
+dimension's extra code in the sign bits' order, padded to whole bytes, so a
+row is up to `bits - 2` bytes larger than FAISS's `code_size` when dims is
+not a multiple of 8; the footer records the stored row size. 9-bit codes
+keep one extra byte per dimension. The 1-bit pass
+streams only the sign region, and the extra-bit region is read only for gate
+survivors. FAISS's distance computer reads its own interleaved codes, so its
+fallback path rebuilds a FAISS code per extended row. 1-bit lists keep
+FAISS's rows unchanged.
+
 RaBitQ overlays also store upward-rounded float32 error amplitudes after the
 codes in inverted-list order: sigma1 for 1-bit, sigmaB for multi-bit
 (4 bytes/vector for every width). The multi-bit gate reads sigma1 from the
@@ -446,9 +520,9 @@ for squared L2. Sigma1 is computed from the sign reconstruction error before
 the fixed 1.9 confidence multiplier. These amplitudes support empirical
 confidence intervals; they are not deterministic error bounds. The reader
 exposes a mmap view, validates finite, non-negative amplitudes once at open and
-exposes per-list spans for sequential, unchecked scan loads. Metadata and footer
-version 4 validate the component count and file size;
-older formats fail on open and must be rebuilt.
+exposes per-list spans for sequential, unchecked scan loads. Metadata version 4
+and footer version 5 validate the component count, stored row size and file
+size; older formats fail on open and must be rebuilt.
 
 `VectorIndexBuilder::finishRaBitQCode` writes the sign-bit factors for every
 code: `dp_multiplier = ||r||^2 * sqrt(D) / sum(|r_i|)` (zero when the sum is
@@ -561,14 +635,17 @@ and rank-bitmap folds use the same doc-to-rank walk.
 slots pay per scored dimension, per visited domain doc and per rank mapping.
 IVF slots pay per examined entry, with an extra term for PQ (its FAISS scanner
 tests the selector through a virtual call) and a branch-misprediction term
-proportional to `p(1-p)` for selector pass rate `p`, except on 1-bit RaBitQ, whose
-selector test does not branch; per codec score (PQ
+proportional to `p(1-p)` for selector pass rate `p`, except under `RaBitQScorer`,
+whose selector test does not branch; per codec score (PQ
 subcodes; RaBitQ one-bit and extra-bit scores, each a constant per code plus
 a term per dimension); per list setup; per coarse
 centroid dimension; per slot-round; and per terminal read plus per terminal
 dimension. RaBitQ re-quantizes the query residual for every list, so its list
-setup scales with dimensions; 1-bit and extended codes have separate unit costs
-for scoring and list setup, since only the former use `RaBitQScorer`. PQ list
+setup scales with dimensions. FAISS's computer (query bits 0) and
+`RaBitQScorer` have separate unit costs for 1-bit scoring, extended scoring
+and list setup; the scorer's extended work is priced per scored code plus per
+code bit-dimension (sign plane included), and its separate 8-bit list
+quantization per list dimension when query bits are not 8. PQ list
 setup is zero for inner product and cosine. Under L2 it scales with subquantizers while the segment keeps FAISS's
 precomputed table; without it, FAISS computes a full distance table per list,
 priced as `2^bits * dims` distance dimensions with an unfitted seed equal to
@@ -774,9 +851,10 @@ All IVF chunks and segments share a bounded cut per fresh epoch and persistent
 interval witness state for the query. Task-local handlers batch admissions and
 canonical keys; group bounded handlers keep their local capped admission.
 Serialized updates publish monotone scalar floors. PQ uses its optimized
-kernel with floor refreshes between 256-code blocks. 1-bit RaBitQ scores a block
-and then admits its rows in order; extended RaBitQ uses its distance computer per
-code in the common traversal. Peak and terminal retained counts, seed and
+kernel with floor refreshes between 256-code blocks. RaBitQ scores a block
+of 1-bit estimates and then admits its rows in order; extended codes pass each
+row through the gate and score survivors one at a time, since the threshold
+moves as results arrive. Peak and terminal retained counts, seed and
 remaining reads, gate rejections and extra-bit evaluations accompany the
 selector-passing scan count in the benchmark stats seam.
 

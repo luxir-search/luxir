@@ -1554,7 +1554,10 @@ public:
           else {
             w.oneBitScores = w.selectorPasses;
             double survival = spent.oneBitScores ? (double)spent.extraBitScores / spent.oneBitScores : tuning.plannerCosts.extraBitSurvival(input.dims);
-            if (input.rabitqBits > 1) w.extraBitScores = (int64_t)std::ceil(w.oneBitScores * survival);
+            if (input.rabitqBits > 1) {
+              w.extraBitScores = (int64_t)std::ceil(w.oneBitScores * survival);
+              w.extendedListSetups = std::min(w.listSetups, w.extraBitScores);
+            }
           }
           double marginal = tuning.plannerCosts.price(KnnPlanner::actualWork(input, w));
           // The first deepen folds a still-resolving domain before scanning.
@@ -2255,24 +2258,40 @@ public:
         }();
         std::unique_ptr<faiss::InvertedListScanner> pqScanner;
         std::vector<float> centroid;
-        std::optional<RaBitQScorer> oneBitScorer;
+        std::optional<RaBitQScorer> scorer;
         bool multiBit = rabitq != nullptr && rabitq->rabitq.nb_bits > 1;
+        RaBitQLayout layout((size_t)ivf.d, rabitq != nullptr ? rabitq->rabitq.nb_bits : 1);
+        // FAISS's computer reads whole FAISS codes: rebuilt per extended row.
+        std::vector<uint8_t> faissCode;
         if (rabitq != nullptr) {
           centroid.resize((size_t)ivf.d);
-          // FAISS's distance computer remains for extended codes and for the
-          // unquantized query (query bits 0).
-          if (KnnPlanner::usesScorer((int32_t)rabitq->rabitq.nb_bits, preparedQuery.queryBits, forceFaissRaBitQ))
-            oneBitScorer.emplace(ivf.d, preparedQuery.queryBits,
-                                 rabitq->rabitq.metric_type == faiss::METRIC_INNER_PRODUCT, preparedQuery.query);
+          // FAISS's distance computer remains for the unquantized query (query bits 0).
+          if (KnnPlanner::usesScorer(preparedQuery.queryBits, forceFaissRaBitQ))
+            scorer.emplace(ivf.d, preparedQuery.queryBits, rabitq->rabitq.metric_type == faiss::METRIC_INNER_PRODUCT,
+                           preparedQuery.query, (int32_t)rabitq->rabitq.nb_bits);
+          else if (multiBit) faissCode.resize(layout.faissCodeSize());
         } else {
           pqScanner.reset(ivf.get_InvertedListScanner(false, selector.get()));
           pqScanner->set_query(preparedQuery.query);
         }
-        int64_t scanned = 0, extra = 0, rejected = 0, visited = 0;
+        int64_t scanned = 0, extra = 0, rejected = 0, visited = 0, extendedLists = 0;
         bool keepMax = metric != (int32_t)api::VectorMetric::L2;
         const float* listAmplitudes = nullptr;
         double selectionScale = 0;
         const uint32_t* rowIds = nullptr;
+        // Extended codes: the 1-bit estimate's error bound gates the extra
+        // bits. f_error is beside the sign factors, already touched by the
+        // 1-bit kernel. It includes FAISS's 1.9 and the L2 factor.
+        double gateScale = 0;
+        auto gate = [&](float distance, const uint8_t* sign) LUXIR_INLINE {
+          float fError;
+          std::memcpy(&fError, sign + layout.signBytes + RABITQ_F_ERROR_OFFSET, sizeof(fError));
+          double error = fError * gateScale;
+          double optimistic = keepMax ? (double)distance + error : (double)distance - error;
+          bool reject = keepMax ? optimistic <= handler.threshold : optimistic >= handler.threshold;
+          rejected += reject ? 1 : 0;
+          return !reject;
+        };
         // The candidate test after any scoring: the handler's threshold moves
         // as results arrive, so rows are admitted strictly in order.
         auto admit = [&](float distance, size_t row) LUXIR_INLINE {
@@ -2300,9 +2319,9 @@ public:
           float gError = 0;
           if (rabitq != nullptr) {
             ivf.quantizer->reconstruct(id, centroid.data());
-            if (oneBitScorer) {
-              oneBitScorer->setList(centroid.data());
-              gError = oneBitScorer->queryToCentroid();
+            if (scorer) {
+              scorer->setList(centroid.data());
+              gError = scorer->queryToCentroid();
             } else {
               distanceComputer.reset(rabitq->rabitq.get_distance_computer(
                   preparedQuery.queryBits, centroid.data()));
@@ -2313,7 +2332,8 @@ public:
             }
           } else pqScanner->set_list(id, centroidDists[list]);
           if constexpr (Interval) listAmplitudes = amplitudes.list((size_t)id).data();
-          double gateScale = (double)gError * (RABITQ_GATE_EPSILON / 1.9f);
+          gateScale = (double)gError * (RABITQ_GATE_EPSILON / 1.9f);
+          bool extendedList = false;
           selectionScale = (double)gError * RABITQ_SELECTION_EPSILON;
 
           // Keep the PQ kernel, refreshing the shared floor between blocks
@@ -2322,14 +2342,26 @@ public:
           for (size_t begin = 0; begin < count; begin += RaBitQScorer::BLOCK_ROWS) {
             size_t end = std::min(count, begin + RaBitQScorer::BLOCK_ROWS);
             handler.updateThreshold();
-            if (oneBitScorer) {
+            if (scorer) {
               alignas(64) float distances[RaBitQScorer::BLOCK_ROWS];
-              const uint8_t* block = codes + begin * ivf.code_size;
+              const uint8_t* block = codes + begin * layout.signStride;
+              // Rows are admitted in order: the threshold moves as results arrive.
+              auto finish = [&](float distance, size_t row) LUXIR_INLINE {
+                if (multiBit) {
+                  const uint8_t* sign = layout.signRow(codes, row);
+                  if (!gate(distance, sign)) return;
+                  extendedLists += extendedList ? 0 : 1;
+                  extendedList = true;
+                  distance = scorer->extended(sign, layout.extraRow(codes, count, row));
+                  extra++;
+                }
+                admit(distance, row);
+              };
               if constexpr (std::is_same_v<Probe, std::nullptr_t>) {
                 size_t rows = end - begin;
-                oneBitScorer->score(block, ivf.code_size, rows, distances);
+                scorer->score(block, layout.signStride, rows, distances);
                 scanned += (int64_t)rows;
-                for (size_t k = 0; k < rows; k++) admit(distances[k], begin + k);
+                for (size_t k = 0; k < rows; k++) finish(distances[k], begin + k);
               } else {
                 uint16_t selected[RaBitQScorer::BLOCK_ROWS];
                 size_t rows = 0;
@@ -2337,9 +2369,9 @@ public:
                   selected[rows] = (uint16_t)k;
                   rows += probe(ids[begin + k]) ? 1 : 0;
                 }
-                oneBitScorer->score(block, ivf.code_size, selected, rows, distances);
+                scorer->score(block, layout.signStride, selected, rows, distances);
                 scanned += (int64_t)rows;
-                for (size_t k = 0; k < rows; k++) admit(distances[k], begin + selected[k]);
+                for (size_t k = 0; k < rows; k++) finish(distances[k], begin + selected[k]);
               }
             } else if (dc == nullptr) {
               if constexpr (!Interval) {
@@ -2353,19 +2385,13 @@ public:
               if constexpr (!std::is_same_v<Probe, std::nullptr_t>) {
                 if (!probe(ids[i])) continue;
               }
-              const uint8_t* code = codes + i * ivf.code_size;
+              const uint8_t* sign = layout.signRow(codes, i);
               scanned++;
-              float distance = dc->distance_to_code_1bit(code);
+              float distance = dc->distance_to_code_1bit(sign);
               if (multiBit) {
-                // f_error is beside the sign factors, already touched by the
-                // 1-bit kernel. It includes FAISS's 1.9 and the L2 factor.
-                float fError;
-                std::memcpy(&fError, code + (ivf.d + 7) / 8 + RABITQ_F_ERROR_OFFSET, sizeof(fError));
-                double error = fError * gateScale;
-                double optimistic = keepMax ? (double)distance + error : (double)distance - error;
-                bool reject = keepMax ? optimistic <= handler.threshold : optimistic >= handler.threshold;
-                if (reject) { rejected++; continue; }
-                distance = dc->distance_to_code_full(code);
+                if (!gate(distance, sign)) continue;
+                layout.faissCode(codes, count, i, faissCode.data());
+                distance = dc->distance_to_code_full(faissCode.data());
                 extra++;
               }
               admit(distance, i);
@@ -2390,7 +2416,9 @@ public:
         work.oneBitScores = rabitq != nullptr ? scanned : 0;
         work.extraBitScores = extra;
         work.gateRejections = rejected;
-        work.scoreBytes = (multiBit ? extra : scanned) * (int64_t)ivf.code_size;
+        work.extendedListSetups = scorer && preparedQuery.queryBits != RaBitQScorer::EXTENDED_QUERY_BITS ? extendedLists : 0;
+        work.scoreBytes = rabitq == nullptr ? scanned * (int64_t)ivf.code_size
+            : scanned * (int64_t)layout.signStride + extra * (int64_t)layout.extraStride;
         return work;
       }
     };

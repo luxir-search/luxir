@@ -7,10 +7,7 @@
 #include <bit>
 #include <cfloat>
 #include <cmath>
-#include <cstring>
-#include <format>
 #include <map>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -247,8 +244,8 @@ TEST_F(VectorEncodingTest, bf16RoundsToNearestEven) {
 
 // f16, bf16 and sq8 rows score like f32 scoring of the decoded vector, for
 // every metric, at widths that exercise SIMD blocks, partial tails and wide
-// accumulation, from an unaligned row.  FAISS's 16-bit computers and the sq8
-// kernels sum in another order than the f32 kernels, within a few float
+// accumulation, from an unaligned row.  sq8 decodes first, so it matches
+// exactly; FAISS's 16-bit computers sum in another order, within a few float
 // roundings of the terms.
 TEST_F(VectorEncodingTest, encodedScoreMatchesDecodedScore) {
   for (int32_t dims : {8, 40, 400}) {
@@ -270,7 +267,11 @@ TEST_F(VectorEncodingTest, encodedScoreMatchesDecodedScore) {
         VectorScorer encoded(q.data(), dims, (int32_t)metric, true, e);
         VectorScorer f32(q.data(), dims, (int32_t)metric, true, VectorEncoding::F32);
         float expected = f32.score(decodedView, 0), actual = encoded.score(rowView, 0);
-        EXPECT_NEAR(expected, actual, 1e-6 * terms) << vcodec::name(e) << " " << dims << " " << (int)metric;
+        if (e == VectorEncoding::SQ8) {
+          EXPECT_EQ(expected, actual) << dims << " " << (int)metric;
+        } else {
+          EXPECT_NEAR(expected, actual, 1e-6 * terms) << vcodec::name(e) << " " << dims << " " << (int)metric;
+        }
       }
     }
   }
@@ -304,52 +305,6 @@ TEST_F(VectorEncodingTest, sq8ExtremeQueryRanksByDecodedScore) {
   h.index(flatdoc("id", std::string("x"), "enc_v", x));
   h.commit();
   EXPECT_EQ((std::vector<std::string>{"x", "zero"}), knnIds("enc_v", 2, true, 0, query));
-}
-
-// VectorScorer's sq8 scores match a double-precision reference over the
-// decoded vector for every metric, at dims that exercise the block loop, the
-// single steps and the tail, from unaligned row addresses; a row scores
-// bit-identically wherever it sits in memory.
-TEST_F(VectorEncodingTest, sq8KernelMatchesScalarReference) {
-  std::mt19937 rng(42);
-  std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
-  for (int32_t dims : {1, 3, 7, 8, 15, 17, 31, 32, 33, 768, 1023}) {
-    Vec q((size_t)dims);
-    for (auto& v : q) v = uniform(rng);
-    auto bytes = (size_t)vcodec::bytesPerVector(VectorEncoding::SQ8, dims);
-    Vec x((size_t)dims);
-    for (auto& v : x) v = 3.0f * uniform(rng) + 0.5f;
-    std::vector<char> buf(bytes + 16);
-    vcodec::encode(VectorEncoding::SQ8, x.data(), dims, buf.data());
-    Vec decoded((size_t)dims);
-    vcodec::decode(VectorEncoding::SQ8, buf.data(), dims, decoded.data());
-    double dot = 0, dist = 0, xx = 0, mag = 0;
-    for (int32_t i = 0; i < dims; i++) {
-      double qi = (double)q[(size_t)i];
-      double xi = (double)decoded[(size_t)i];
-      dot += qi * xi;
-      dist += (qi - xi) * (qi - xi);
-      xx += xi * xi;
-      mag += std::fabs(qi * xi);
-    }
-    for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
-      SCOPED_TRACE(std::format("dims {} metric {}", dims, (int)metric));
-      VectorScorer scorer(q.data(), dims, (int32_t)metric, true, VectorEncoding::SQ8);
-      float got = scorer.score(std::string_view(buf.data(), bytes), 0);
-      if (metric == api::VectorMetric::L2) {
-        EXPECT_NEAR(dist, 1.0 / got - 1.0, 1e-5 * (1.0 + dist));
-      } else if (metric == api::VectorMetric::IP) {
-        EXPECT_NEAR(dot, got, 1e-5 * (1.0 + mag));
-      } else {
-        EXPECT_NEAR(dot / std::sqrt(xx), got, 1e-5 * (1.0 + mag / std::sqrt(xx)));
-      }
-      for (size_t shift = 1; shift < 16; shift += 5) {
-        std::vector<char> moved(bytes + 16);
-        std::memcpy(moved.data() + shift, buf.data(), bytes);
-        EXPECT_EQ(got, scorer.score(std::string_view(moved.data() + shift, bytes), 0));
-      }
-    }
-  }
 }
 
 // Each encoding is recorded per segment and reads back within its precision.

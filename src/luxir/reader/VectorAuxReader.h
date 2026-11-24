@@ -139,7 +139,9 @@ internVectorRotation(int32_t kind, int32_t dims, uint64_t seed) {
 ///   [0, H)    FAISS index blob (faiss::write_index with lists swapped empty)
 ///   [H8, S)   per-list sizes, int64[nlist]           (H8 = H padded to 8)
 ///   [S, I)    ids, uint32[ntotal], concatenated in list order
-///   [I8, C)   codes, uint8[ntotal * codeSize], same order (I8 = I padded to 8)
+///   [I8, C)   codes, uint8[ntotal * codeSize], same order (I8 = I padded to 8);
+///             codeSize is the stored row size, which RaBitQLayout splits for
+///             extended codes
 ///   [C8, A)   amplitudes, float[ntotal * amplitudeCount], in list order
 ///   [.., end) this footer (8-aligned)
 ///
@@ -160,7 +162,7 @@ struct VectorAuxListsFooter {
   int32_t magic = 0;
 
   static constexpr int32_t MAGIC = 0x4C495853;  // "SXIL"
-  static constexpr int32_t VERSION = 4;
+  static constexpr int32_t VERSION = 5;
 
   static constexpr size_t align8(size_t n) noexcept { return (n + 7) & ~(size_t)7; }
 
@@ -233,6 +235,86 @@ inline constexpr size_t RABITQ_F_ERROR_OFFSET = sizeof(faiss::rabitq_utils::Sign
 static_assert(RABITQ_F_ERROR_OFFSET == 2 * sizeof(float));
 static_assert(sizeof(faiss::rabitq_utils::SignBitFactorsWithError) == RABITQ_F_ERROR_OFFSET + sizeof(float));
 
+/// Stored row layout of one IVF list of RaBitQ codes. 1-bit codes keep FAISS's
+/// rows. Extended codes (bits 2-9) split a list of n rows in two regions, so
+/// the 1-bit pass reads only sign bits and the gate's factors:
+///
+///   [0, n * signStride)      per row: sign bits, then SignBitFactorsWithError
+///   [.., + n * extraStride)  per row: bits - 1 planes of signBytes each (plane
+///                            p holds bit p of every dimension's extra code, in
+///                            the sign bits' order), then ExtraBitsFactors
+///
+/// Planes are padded to whole bytes, so a row can exceed FAISS's code_size by
+/// up to bits - 2 bytes when dims is not a multiple of 8. 9-bit codes keep
+/// FAISS's byte per dimension for the extra bits instead of 8 planes.
+struct RaBitQLayout {
+  using SignFactors = faiss::rabitq_utils::SignBitFactors;
+  using GateFactors = faiss::rabitq_utils::SignBitFactorsWithError;
+  using ExtraFactors = faiss::rabitq_utils::ExtraBitsFactors;
+  size_t dims = 0, bits = 1, signBytes = 0, signStride = 0, extraStride = 0;
+
+  RaBitQLayout(size_t dims, size_t bits)
+      : dims(dims), bits(bits), signBytes((dims + 7) / 8),
+        signStride(signBytes + (bits > 1 ? sizeof(GateFactors) : sizeof(SignFactors))),
+        extraStride(bits > 1 ? (bytePlane() ? dims : (bits - 1) * signBytes) + sizeof(ExtraFactors) : 0) {}
+
+  bool split() const noexcept { return bits > 1; }
+  bool bytePlane() const noexcept { return bits == 9; }
+  size_t rowBytes() const noexcept { return signStride + extraStride; }
+  size_t faissCodeSize() const noexcept {
+    return signStride + (bits > 1 ? (dims * (bits - 1) + 7) / 8 + sizeof(ExtraFactors) : 0);
+  }
+  const uint8_t* signRow(const uint8_t* list, size_t row) const noexcept { return list + row * signStride; }
+  const uint8_t* extraRow(const uint8_t* list, size_t rows, size_t row) const noexcept {
+    return list + rows * signStride + row * extraStride;
+  }
+
+  /// Writes `rows` FAISS codes as one stored list of rows * rowBytes() bytes.
+  void store(const uint8_t* codes, size_t rows, uint8_t* out) const {
+    if (!split()) {
+      std::memcpy(out, codes, rows * signStride);
+      return;
+    }
+    size_t exBits = bits - 1, faissSize = faissCodeSize(), packed = faissSize - signStride - sizeof(ExtraFactors);
+    for (size_t row = 0; row < rows; row++) {
+      const uint8_t* code = codes + row * faissSize;
+      const uint8_t* ex = code + signStride;
+      std::memcpy(out + row * signStride, code, signStride);
+      uint8_t* extra = out + rows * signStride + row * extraStride;
+      if (bytePlane()) {
+        std::memcpy(extra, ex, extraStride);
+        continue;
+      }
+      std::memset(extra, 0, exBits * signBytes);
+      for (size_t i = 0; i < dims; i++) for (size_t p = 0; p < exBits; p++) {
+        size_t bit = i * exBits + p;
+        extra[p * signBytes + i / 8] |= (uint8_t)(((ex[bit / 8] >> (bit % 8)) & 1) << (i % 8));
+      }
+      std::memcpy(extra + exBits * signBytes, ex + packed, sizeof(ExtraFactors));
+    }
+  }
+
+  /// Rebuilds row `row` of a stored list of `rows` rows as a FAISS code of
+  /// faissCodeSize() bytes, for FAISS's distance computer.
+  void faissCode(const uint8_t* list, size_t rows, size_t row, uint8_t* out) const {
+    std::memcpy(out, signRow(list, row), signStride);
+    if (!split()) return;
+    size_t exBits = bits - 1, packed = faissCodeSize() - signStride - sizeof(ExtraFactors);
+    const uint8_t* extra = extraRow(list, rows, row);
+    uint8_t* ex = out + signStride;
+    if (bytePlane()) {
+      std::memcpy(ex, extra, extraStride);
+      return;
+    }
+    std::memset(ex, 0, packed);
+    for (size_t i = 0; i < dims; i++) for (size_t p = 0; p < exBits; p++) {
+      size_t bit = i * exBits + p;
+      ex[bit / 8] |= (uint8_t)(((extra[p * signBytes + i / 8] >> (i % 8)) & 1) << (bit % 8));
+    }
+    std::memcpy(ex + packed, extra + exBits * signBytes, sizeof(ExtraFactors));
+  }
+};
+
 struct RaBitQAmplitudes {
   const float* values = nullptr;
   std::span<const size_t> offsets;
@@ -256,12 +338,13 @@ struct RaBitQAmplitudes {
 class MmapInvertedLists final : public faiss::ReadOnlyInvertedLists {
   const uint32_t* ids;          // all lists' ids, concatenated in list order
   const uint8_t* codes;         // all lists' codes, same order
+  size_t rowBytes;              // stored bytes per row (RaBitQLayout::rowBytes)
   std::vector<size_t> offsets;  // prefix sums of list sizes, nlist+1 entries
 
 public:
-  MmapInvertedLists(size_t nlist, size_t codeSize, const int64_t* listSizes,
+  MmapInvertedLists(size_t nlist, size_t codeSize, size_t rowBytes, const int64_t* listSizes,
                     const uint32_t* ids, const uint8_t* codes)
-    : faiss::ReadOnlyInvertedLists(nlist, codeSize), ids(ids), codes(codes) {
+    : faiss::ReadOnlyInvertedLists(nlist, codeSize), ids(ids), codes(codes), rowBytes(rowBytes) {
     offsets.resize(nlist + 1);
     offsets[0] = 0;
     for (size_t i = 0; i < nlist; i++) {
@@ -276,7 +359,7 @@ public:
     return offsets[listNo + 1] - offsets[listNo];
   }
   const uint8_t* get_codes(size_t listNo) const override {
-    return codes + offsets[listNo] * code_size;
+    return codes + offsets[listNo] * rowBytes;
   }
   std::span<const uint32_t> ids32(size_t listNo) const noexcept {
     return {ids + offsets[listNo], list_size(listNo)};
@@ -472,14 +555,17 @@ public:
           "VectorAuxReader: nlist mismatch for aux '{}': index has {}, opaque_meta says {}",
           name, ivf->nlist, (int32_t)meta.nlist));
       }
+      auto* rabitqIndex = dynamic_cast<faiss::IndexIVFRaBitQ*>(idx.get());
+      size_t rowBytes = rabitqIndex ? RaBitQLayout((size_t)ivf->d, rabitqIndex->rabitq.nb_bits).rowBytes()
+                                    : ivf->code_size;
       if ((int64_t)ivf->nlist != footer.nlist
-          || (int64_t)ivf->code_size != footer.codeSize
+          || (int64_t)rowBytes != footer.codeSize
           || ivf->ntotal != footer.ntotal) {
         throw std::runtime_error(std::format(
           "VectorAuxReader: aux '{}' lists footer (nlist={} codeSize={} ntotal={}) "
           "does not match index header (nlist={} codeSize={} ntotal={})",
           name, (int64_t)footer.nlist, (int64_t)footer.codeSize, (int64_t)footer.ntotal,
-          ivf->nlist, ivf->code_size, ivf->ntotal));
+          ivf->nlist, rowBytes, ivf->ntotal));
       }
 
       if (auto* pq = dynamic_cast<faiss::IndexIVFPQ*>(idx.get())) {
@@ -497,7 +583,7 @@ public:
       assert(((uintptr_t)sizes % 8) == 0 && ((uintptr_t)listIds % 8) == 0
              && ((uintptr_t)listCodes % 8) == 0);
       auto lists = std::make_unique<MmapInvertedLists>(
-        (size_t)footer.nlist, (size_t)footer.codeSize, sizes, listIds, listCodes);
+        (size_t)footer.nlist, ivf->code_size, rowBytes, sizes, listIds, listCodes);
       if ((int64_t)lists->totalSize() != footer.ntotal) {
         throw std::runtime_error(std::format(
           "VectorAuxReader: aux '{}' list sizes sum to {}, expected ntotal {}",

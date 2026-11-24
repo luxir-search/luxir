@@ -177,8 +177,11 @@ std::vector<float> rabitqDistances(const VectorAuxReader& aux, const std::vector
   dc->set_query(rotated.data());
   faiss::InvertedLists::ScopedCodes codes(index->invlists, 0);
   faiss::InvertedLists::ScopedIds ids(index->invlists, 0);
+  RaBitQLayout layout((size_t)index->d, index->rabitq.nb_bits);
+  std::vector<uint8_t> faissCode(layout.faissCodeSize());
+  const auto* code = faissCode.data();
   for (size_t i = 0; i < index->invlists->list_size(0); i++) {
-    const auto* code = codes.get() + i * index->code_size;
+    layout.faissCode(codes.get(), index->invlists->list_size(0), i, faissCode.data());
     result[(size_t)ids.get()[i]] = base ? dynamic_cast<faiss::RaBitQDistanceComputer&>(*dc).distance_to_code_1bit(code)
                                      : scanner->distance_to_code(code);
   }
@@ -302,7 +305,10 @@ TEST_F(VectorAnnCodecTest, amplitudesFollowListOffsetsAcrossListsAndMerge) {
               aux[seg]->getRotation()->apply(x.data(), rotated.data());
               EXPECT_TRUE(std::isfinite(span[row]));
               EXPECT_GE(span[row], 0);
-              const uint8_t* code = codes.get() + row * ivf->code_size;
+              RaBitQLayout layout((size_t)dims, (size_t)bits);
+              std::vector<uint8_t> faissCode(layout.faissCodeSize());
+              layout.faissCode(codes.get(), ivf->invlists->list_size(list), row, faissCode.data());
+              const uint8_t* code = faissCode.data();
               if (bits == 1) {
                 ivf->rabitq.decode_core(code, x.data(), 1, nullptr);
                 double error2 = 0;

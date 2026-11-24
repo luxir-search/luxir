@@ -3,6 +3,7 @@
 #include "RaBitQScorer.h"
 
 #include "luxir/util/luxir_util.h"
+#include <faiss/impl/RaBitQUtils.h>
 #include <faiss/utils/distances.h>
 
 #include <algorithm>
@@ -240,35 +241,93 @@ struct ChunkOps {
 };
 #endif
 
+// Sum of query[i] * code[i] and of code[i] over n bytes: the byte plane of
+// 9-bit codes, whose 8 extra bits are one byte per dimension.
+LUXIR_NOINLINE void byteDot(const uint8_t* LUXIR_RESTRICT query, const uint8_t* LUXIR_RESTRICT code, size_t n,
+                            uint64_t& dot, uint64_t& sum) {
+  size_t i = 0;
+  dot = 0;
+  sum = 0;
+#if defined(__AVX2__)
+  // 16-bit products, pairwise summed into 32-bit lanes: at most 4 * 255^2
+  // per lane and step, so the lanes are widened every 4096 steps.
+  __m256i dots = _mm256_setzero_si256(), sums = _mm256_setzero_si256();
+  while (i + 32 <= n) {
+    __m256i acc = _mm256_setzero_si256();
+    for (size_t steps = 0; steps < 4096 && i + 32 <= n; steps++, i += 32) {
+      __m256i q = _mm256_loadu_si256((const __m256i*)(query + i));
+      __m256i c = _mm256_loadu_si256((const __m256i*)(code + i));
+      __m256i lo = _mm256_madd_epi16(_mm256_cvtepu8_epi16(_mm256_castsi256_si128(q)),
+                                     _mm256_cvtepu8_epi16(_mm256_castsi256_si128(c)));
+      __m256i hi = _mm256_madd_epi16(_mm256_cvtepu8_epi16(_mm256_extracti128_si256(q, 1)),
+                                     _mm256_cvtepu8_epi16(_mm256_extracti128_si256(c, 1)));
+      acc = _mm256_add_epi32(acc, _mm256_add_epi32(lo, hi));
+      sums = _mm256_add_epi64(sums, _mm256_sad_epu8(c, _mm256_setzero_si256()));
+    }
+    dots = _mm256_add_epi64(dots, _mm256_add_epi64(_mm256_cvtepu32_epi64(_mm256_castsi256_si128(acc)),
+                                                   _mm256_cvtepu32_epi64(_mm256_extracti128_si256(acc, 1))));
+  }
+  auto reduce = [](__m256i x) {
+    __m128i r = _mm_add_epi64(_mm256_castsi256_si128(x), _mm256_extracti128_si256(x, 1));
+    return (uint64_t)_mm_cvtsi128_si64(_mm_add_epi64(r, _mm_unpackhi_epi64(r, r)));
+  };
+  dot = reduce(dots);
+  sum = reduce(sums);
+#elif defined(__ARM_NEON)
+  uint64x2_t dots = vdupq_n_u64(0), sums = vdupq_n_u64(0);
+  while (i + 16 <= n) {
+    // The 16-bit code sums take 2 * 255 per lane and step: widen every 128.
+    uint32x4_t acc = vdupq_n_u32(0);
+    uint16x8_t codeSum = vdupq_n_u16(0);
+    for (size_t steps = 0; steps < 128 && i + 16 <= n; steps++, i += 16) {
+      uint8x16_t q = vld1q_u8(query + i), c = vld1q_u8(code + i);
+      acc = vpadalq_u16(acc, vmull_u8(vget_low_u8(q), vget_low_u8(c)));
+      acc = vpadalq_u16(acc, vmull_high_u8(q, c));
+      codeSum = vpadalq_u8(codeSum, c);
+    }
+    dots = vpadalq_u32(dots, acc);
+    sums = vpadalq_u32(sums, vpaddlq_u16(codeSum));
+  }
+  dot = vaddvq_u64(dots);
+  sum = vaddvq_u64(sums);
+#endif
+  for (; i < n; i++) {
+    dot += (uint64_t)query[i] * code[i];
+    sum += code[i];
+  }
+}
+
 }  // namespace
 
-RaBitQScorer::RaBitQScorer(int32_t dims, int32_t queryBits, bool innerProduct, const float* query)
+RaBitQScorer::RaBitQScorer(int32_t dims, int32_t queryBits, bool innerProduct, const float* query, int32_t codeBits)
     : query(query), dims((size_t)dims), codeBytes(((size_t)dims + 7) / 8),
       chunks(CHUNK_BYTES == 0 ? 0 : (codeBytes + (MASKED_CHUNKS ? CHUNK_BYTES - 1 : 0))
           / std::max(CHUNK_BYTES, (size_t)1)),
       tailWords(MASKED_CHUNKS ? 0 : (codeBytes - chunks * CHUNK_BYTES + 7) / 8),
-      queryBits(queryBits), innerProduct(innerProduct),
+      queryBits(queryBits), codeBits(codeBits), innerProduct(innerProduct),
       invSqrtDims(1.0f / std::sqrt((float)dims)), maxCode((float)((1 << queryBits) - 1)) {
-  assert(dims > 0 && queryBits >= 1 && queryBits <= 8);
+  assert(dims > 0 && queryBits >= 1 && queryBits <= 8 && codeBits >= 1 && codeBits <= 9);
   constexpr size_t ALIGN = 64;
   size_t residualBytes = (this->dims * sizeof(float) + ALIGN - 1) & ~(ALIGN - 1);
   // Whole 64-bit groups, so packPlanes can load past the last dimension.
   size_t quantizedBytes = (this->dims + 7 + ALIGN - 1) & ~(ALIGN - 1);
-  size_t planeBytes = ((chunks * CHUNK_BYTES + tailWords * 8) * (size_t)queryBits + ALIGN - 1) & ~(ALIGN - 1);
-  storage = std::make_unique_for_overwrite<uint8_t[]>(residualBytes + quantizedBytes + planeBytes + ALIGN);
+  size_t positionBytes = chunks * CHUNK_BYTES + tailWords * 8;
+  size_t planeBytes = (positionBytes * (size_t)queryBits + ALIGN - 1) & ~(ALIGN - 1);
+  bool ownExtended = codeBits > 1 && queryBits != EXTENDED_QUERY_BITS;
+  size_t extendedBytes = ownExtended ? quantizedBytes + positionBytes * EXTENDED_QUERY_BITS : 0;
+  storage = std::make_unique_for_overwrite<uint8_t[]>(residualBytes + quantizedBytes + planeBytes + extendedBytes + ALIGN);
   uint8_t* base = storage.get() + (ALIGN - (uintptr_t)storage.get() % ALIGN) % ALIGN;
   residual = (float*)base;
   quantized = base + residualBytes;
   planes = quantized + quantizedBytes;
-  std::memset(quantized, 0, quantizedBytes + planeBytes);
+  extendedQuantized = ownExtended ? planes + planeBytes : quantized;
+  extendedPlanes = ownExtended ? extendedQuantized + quantizedBytes : planes;
+  std::memset(quantized, 0, quantizedBytes + planeBytes + extendedBytes);
   if (innerProduct) factors.queryNormSqr = faiss::fvec_norm_L2sqr(query, this->dims);
 }
 
 // FAISS packs one bit at a time; this takes 8, 32 or 64 dimensions at once.
-void RaBitQScorer::packPlanes() {
-  const uint8_t* in = quantized;
-  uint8_t* out = planes;
-  size_t qb = (size_t)queryBits;
+void RaBitQScorer::packPlanes(const uint8_t* in, uint8_t* out, size_t qb) const {
   auto packUnit = [&](size_t unit, size_t dimsLeft) {
     for (size_t byte = 0; byte < unit; byte++, in += 8) {
       if (byte * 8 >= dimsLeft) {
@@ -331,22 +390,43 @@ void RaBitQScorer::setList(const float* centroid) {
   minMax(residual, dims, low, high);
   float delta = (high - low) / maxCode;
   uint32_t sum = quantize(residual, dims, low, 1.0f / delta, maxCode, quantized);
-  packPlanes();
+  packPlanes(quantized, planes, (size_t)queryBits);
   factors.c1 = 2 * delta * invSqrtDims;
   factors.c2 = 2 * low * invSqrtDims;
   factors.c34 = invSqrtDims * (delta * (float)sum + (float)dims * low);
+  if (codeBits > 1) {
+    auto& e = extendedFactors;
+    e.low = low;
+    e.base = innerProduct ? faiss::fvec_inner_product(query, centroid, dims) : factors.queryToCentroidSqr;
+    extendedReady = queryBits == EXTENDED_QUERY_BITS;
+    if (extendedReady) {
+      e.delta = delta;
+      e.sum = sum;
+    } else extendedHigh = high;
+  }
+}
+
+void RaBitQScorer::prepareExtended() {
+  if (extendedReady) return;
+  constexpr float MAX_EXTENDED = (float)((1 << EXTENDED_QUERY_BITS) - 1);
+  auto& e = extendedFactors;
+  e.delta = (extendedHigh - e.low) / MAX_EXTENDED;
+  e.sum = quantize(residual, dims, e.low, 1.0f / e.delta, MAX_EXTENDED, extendedQuantized);
+  packPlanes(extendedQuantized, extendedPlanes, EXTENDED_QUERY_BITS);
+  extendedReady = true;
 }
 
 template <int QB, class Ops>
-inline LUXIR_INLINE RaBitQScorer::Counts RaBitQScorer::countCode(const uint8_t* code, const Ops& ops) const {
+inline LUXIR_INLINE RaBitQScorer::Counts RaBitQScorer::countCode(const uint8_t* code, const uint8_t* queryPlanes,
+                                                                  const Ops& ops) const {
   uint64_t dot = 0, sum = 0;
   if constexpr (CHUNK_BYTES != 0) {
-    if (chunks != 0) ops.template score<QB>(code, planes, chunks, dot, sum);
+    if (chunks != 0) ops.template score<QB>(code, queryPlanes, chunks, dot, sum);
   }
   if constexpr (!MASKED_CHUNKS) {
     // Only the last word can overlap the factor bytes. Planes are zero there.
     const uint64_t lastMask = codeBytes % 8 == 0 ? ~(uint64_t)0 : ((uint64_t)1 << (codeBytes % 8 * 8)) - 1;
-    const uint8_t* plane = planes + chunks * CHUNK_BYTES * QB;
+    const uint8_t* plane = queryPlanes + chunks * CHUNK_BYTES * QB;
     for (size_t w = 0; w < tailWords; w++, plane += QB * sizeof(uint64_t)) {
       uint64_t row = load64(code + chunks * CHUNK_BYTES + w * sizeof(uint64_t));
       for (int p = 0; p < QB; p++)
@@ -360,15 +440,53 @@ inline LUXIR_INLINE RaBitQScorer::Counts RaBitQScorer::countCode(const uint8_t* 
 RaBitQScorer::Counts RaBitQScorer::counts(const uint8_t* code) const {
   const ChunkOps ops(codeBytes);
   switch (queryBits) {
-    case 1: return countCode<1>(code, ops);
-    case 2: return countCode<2>(code, ops);
-    case 3: return countCode<3>(code, ops);
-    case 4: return countCode<4>(code, ops);
-    case 5: return countCode<5>(code, ops);
-    case 6: return countCode<6>(code, ops);
-    case 7: return countCode<7>(code, ops);
-    default: return countCode<8>(code, ops);
+    case 1: return countCode<1>(code, planes, ops);
+    case 2: return countCode<2>(code, planes, ops);
+    case 3: return countCode<3>(code, planes, ops);
+    case 4: return countCode<4>(code, planes, ops);
+    case 5: return countCode<5>(code, planes, ops);
+    case 6: return countCode<6>(code, planes, ops);
+    case 7: return countCode<7>(code, planes, ops);
+    default: return countCode<8>(code, planes, ops);
   }
+}
+
+RaBitQScorer::Counts RaBitQScorer::extendedCounts(const uint8_t* sign, const uint8_t* extra) {
+  assert(codeBits > 1);
+  prepareExtended();
+  const ChunkOps ops(codeBytes);
+  // The sign bit is the top bit of the code value, plane p its bit p.
+  auto [dot, sum] = countCode<EXTENDED_QUERY_BITS>(sign, extendedPlanes, ops);
+  int32_t extraBits = codeBits - 1;
+  dot <<= extraBits;
+  sum <<= extraBits;
+  if (extraBits == 8) {
+    uint64_t byteDots, byteSums;
+    byteDot(extendedQuantized, extra, dims, byteDots, byteSums);
+    return {dot + byteDots, sum + byteSums};
+  }
+  for (int32_t p = 0; p < extraBits; p++) {
+    auto plane = countCode<EXTENDED_QUERY_BITS>(extra + (size_t)p * codeBytes, extendedPlanes, ops);
+    dot += plane.dot << p;
+    sum += plane.popcount << p;
+  }
+  return {dot, sum};
+}
+
+// FAISS: base + f_add_ex + f_rescale_ex * sum_i r_i * (code_i - top / 2), with
+// top = 2^codeBits - 1. Here r_i = low + delta * q_i, which expands to half of
+// delta * (2 * dot - top * sum q) + low * (2 * sum code - top * dims), exact
+// in integers up to each product's float rounding.
+float RaBitQScorer::extended(const uint8_t* sign, const uint8_t* extra) {
+  auto [dot, sum] = extendedCounts(sign, extra);
+  const auto& e = extendedFactors;
+  int64_t top = ((int64_t)1 << codeBits) - 1;
+  int64_t queryTerm = 2 * (int64_t)dot - top * (int64_t)e.sum;
+  int64_t codeTerm = 2 * (int64_t)sum - top * (int64_t)dims;
+  float ip = 0.5f * (e.delta * (float)queryTerm + e.low * (float)codeTerm);
+  faiss::rabitq_utils::ExtraBitsFactors f;
+  std::memcpy(&f, extra + (codeBits == 9 ? dims : (size_t)(codeBits - 1) * codeBytes), sizeof(f));
+  return e.base + f.f_add_ex + f.f_rescale_ex * ip;
 }
 
 template <int QB, bool IP, bool Selected>
@@ -388,7 +506,7 @@ LUXIR_NOINLINE void RaBitQScorer::scoreBlock(const uint8_t* codes, size_t codeSi
         __builtin_prefetch(next + codeSize - 1);
       }
     }
-    auto [dot, sum] = countCode<QB>(code, ops);
+    auto [dot, sum] = countCode<QB>(code, planes, ops);
     float orMinusC, dpMultiplier;
     std::memcpy(&orMinusC, code + binary, sizeof(float));
     std::memcpy(&dpMultiplier, code + binary + sizeof(float), sizeof(float));

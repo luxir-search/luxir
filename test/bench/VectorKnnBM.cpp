@@ -15,9 +15,12 @@
 #include <string_view>
 #include <vector>
 
+#include <faiss/impl/RaBitQuantizer.h>
+
 #include "bench/luxir_bench.h"
 #include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/query/KnnQuery.h"
+#include "luxir/query/RaBitQScorer.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/util/random.h"
@@ -1429,7 +1432,66 @@ void BM_VectorAnnDataset(benchmark::State& state) {
   state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
 }
 
+// Extended RaBitQ scoring of one list of gate survivors, per code: kernel 0
+// is RaBitQScorer::extended on the split layout, 1 is FAISS's
+// distance_to_code_full on FAISS codes. Kernels 2 and 3 time one list setup
+// (setList against FAISS's get_distance_computer + set_query). Codes stay
+// cache-resident, so this prices arithmetic, not reaching a cold code.
+void BM_VectorRaBitQExtendedKernel(benchmark::State& state) {
+  int32_t kernel = (int32_t)state.range(0), dims = (int32_t)state.range(1), bits = (int32_t)state.range(2);
+  int32_t queryBits = (int32_t)state.range(3);
+  constexpr size_t rows = 1024;
+  SplitMix64 rng(17);
+  std::vector<float> x((size_t)dims * rows), query((size_t)dims), centroid((size_t)dims, 0.0f);
+  for (auto& v : x) v = nextFloat(rng);
+  for (auto& v : query) v = nextFloat(rng);
+  faiss::RaBitQuantizer quantizer((size_t)dims, faiss::METRIC_L2, (size_t)bits);
+  RaBitQLayout layout((size_t)dims, (size_t)bits);
+  std::vector<uint8_t> codes(rows * quantizer.code_size), stored(rows * layout.rowBytes());
+  quantizer.compute_codes_core(x.data(), codes.data(), rows, centroid.data());
+  layout.store(codes.data(), rows, stored.data());
+  RaBitQScorer scorer(dims, queryBits, false, query.data(), bits);
+  scorer.setList(centroid.data());
+  if (bits == 1 && kernel != 2) {
+    state.SkipWithMessage("1-bit codes have no extended stage");
+    return;
+  }
+  std::unique_ptr<faiss::FlatCodesDistanceComputer> computer(
+      quantizer.get_distance_computer((uint8_t)queryBits, centroid.data()));
+  computer->set_query(query.data());
+  auto* dc = dynamic_cast<faiss::RaBitQDistanceComputer*>(computer.get());
+  float total = 0;
+  for (auto _ : state) {
+    if (kernel == 0) {
+      for (size_t row = 0; row < rows; row++)
+        total += scorer.extended(layout.signRow(stored.data(), row), layout.extraRow(stored.data(), rows, row));
+    } else if (kernel == 1) {
+      for (size_t row = 0; row < rows; row++) total += dc->distance_to_code_full(codes.data() + row * quantizer.code_size);
+    } else if (kernel == 2) {
+      scorer.setList(centroid.data());
+      if (bits > 1) scorer.prepareExtended();
+      total += scorer.queryToCentroid();
+    } else {
+      std::unique_ptr<faiss::FlatCodesDistanceComputer> list(
+          quantizer.get_distance_computer((uint8_t)queryBits, centroid.data()));
+      list->set_query(query.data());
+      total += dynamic_cast<faiss::RaBitQDistanceComputer&>(*list).g_error;
+    }
+    benchmark::DoNotOptimize(total);
+  }
+  state.SetItemsProcessed((int64_t)state.iterations() * (kernel < 2 ? (int64_t)rows : 1));
+  state.SetLabel(kernel == 0 ? "scorer" : kernel == 1 ? "faiss" : kernel == 2 ? "scorer_list" : "faiss_list");
+}
+
 }  // namespace
+
+TUNING_BENCHMARK(BM_VectorRaBitQExtendedKernel)->ArgNames({"kernel", "dims", "bits", "qb"})
+    ->Apply([](benchmark::Benchmark* b) {
+      for (int64_t kernel : {0, 1, 2, 3}) for (int64_t dims : {128, 384, 768, 1536})
+        for (int64_t bits : {2, 4, 8, 9}) b->Args({kernel, dims, bits, 4});
+      for (int64_t kernel : {0, 2}) b->Args({kernel, 768, 4, 8});
+      for (int64_t dims : {768, 1536}) b->Args({2, dims, 1, 4}); // 1-bit setup alone
+    });
 
 // Real-corpus codec comparison (see BM_VectorAnnDataset); needs
 // LUXIR_VECTOR_DATASET, so it is a measurement-only benchmark.
