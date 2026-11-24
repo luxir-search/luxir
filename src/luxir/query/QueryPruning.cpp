@@ -12,48 +12,70 @@
 
 namespace luxir {
 
-bool QueryPruning::collectionEmpty(const Query& query) {
-  return membership(query).none();
+bool QueryPruning::collectionEmpty(const Query& query, const Query::PlanningContext& planning) {
+  return membership(query, planning).none();
 }
 
-const SegmentMask& QueryPruning::membership(const Query& query) {
-  auto found = membershipMemo.find(&query);
+const SegmentMask& QueryPruning::membership(const Query& query, const Query::PlanningContext& planning) {
+  auto found = membershipMemo.find({&planning, &query});
   if (found != membershipMemo.end()) return found->second;
-  auto segments = reader.segments();
+  auto segments = planning.topReader.segments();
   SegmentMask mask(segments.size(), true);
   if (!disableForTests) {
     for (const auto& segment : segments) {
-      CatalogSummaryView view(reader, segment.ord);
+      CatalogSummaryView view(*this, planning, segment.ord);
       if (query.mayMatch(view) == Query::MatchState::EMPTY) mask.clear((size_t)segment.ord);
     }
   }
-  return membershipMemo.emplace(&query, std::move(mask)).first->second;
+  return membershipMemo.emplace(PlanKey{&planning, &query}, std::move(mask)).first->second;
 }
 
-const SegmentMask& QueryPruning::viable(const Query& query) {
-  auto found = memo.find(&query);
+const SegmentMask& QueryPruning::viable(const Query& query, const Query::PlanningContext& planning) {
+  auto found = memo.find({&planning, &query});
   if (found != memo.end()) return found->second;
-  SegmentMask mask = membership(query);
+  SegmentMask mask = membership(query, planning);
   if (!disableForTests) {
-    for (const auto& segment : reader.segments()) {
+    for (const auto& segment : planning.topReader.segments()) {
       if (segment.liveCountBounds().second == 0) mask.clear((size_t)segment.ord);
     }
   }
-  return memo.emplace(&query, std::move(mask)).first->second;
+  return memo.emplace(PlanKey{&planning, &query}, std::move(mask)).first->second;
 }
 
-std::string QueryPruning::reason(const Query& query, size_t ord) {
-  const auto& segment = reader.segments()[ord];
+std::string QueryPruning::reason(const Query& query, const Query::PlanningContext& planning, size_t ord) {
+  const auto& segment = planning.topReader.segments()[ord];
   std::string why;
-  CatalogSummaryView view(reader, (int32_t)ord, &why);
+  CatalogSummaryView view(*this, planning, (int32_t)ord, &why);
   if (query.mayMatch(view) != Query::MatchState::EMPTY) {
     return segment.liveCountBounds().second == 0 ? "live_docs=0" : "";
   }
   return why.empty() ? std::string("proven empty") : why;
 }
 
-bool QueryPruning::termAbsent(const IndexReader::FieldSegments& field, size_t segment, std::string_view term) {
-  return !disableForTests && field.exists() && proof::recordExcludesTerm(field.at(segment), term);
+std::optional<const DecodedFieldRecord*> CatalogSummaryView::record(std::string_view field) const {
+  auto [entry, inserted] = fields.try_emplace(field);
+  try {
+    if (inserted) {
+      auto lookup = planning.topReader.lookupField(field);
+      if (!lookup.mismatchedSchemaType) entry->second = lookup.segments;
+    }
+    if (entry->second) return entry->second->at((size_t)ord);
+  } catch (const std::runtime_error&) {
+    // An unreadable catalog offers no proof. Execution reports its own errors.
+  }
+  return std::nullopt;
+}
+
+bool Query::Context::termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term) {
+  if (QueryPruning::disableForTests || !proof::recordExcludesTerm(field.segInfos.at(segnum), term)) return false;
+  if (QueryPruning::crossCheck) {
+    auto* terms = getTermsEnum(field, segnum);
+    if (terms && terms->seek(term)) {
+      QueryPruning::crossCheckFailed(std::format("term '{}' of field '{}' found in segment {} proven to lack it",
+                                                 term, field.segInfos.name(), segnum));
+    }
+  }
+  return true;
 }
 
 void QueryPruning::crossCheckFailed(std::string_view what) {

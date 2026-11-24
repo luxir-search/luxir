@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "CatalogSummaryView.h"
 #include "Query.h"
 
 namespace luxir {

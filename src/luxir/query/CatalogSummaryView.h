@@ -8,28 +8,30 @@
 #include <string>
 #include <string_view>
 
-#include "luxir/reader/FieldRecordCodec.h"
-#include "luxir/search/IndexReader.h"
+#include "QueryPruning.h"
 
 namespace luxir {
 
 // Catalog evidence for one segment in a reader's row space, including deleted rows.
 class CatalogSummaryView {
-  IndexReader& reader;
+  QueryPruning& pruning;
+  QueryPruning::FieldMemo& fields;
   int32_t ord;
   std::string* reason;
 
 public:
-  CatalogSummaryView(IndexReader& reader, int32_t ord, std::string* reason = nullptr)
-      : reader(reader), ord(ord), reason(reason) {}
+  const Query::PlanningContext& planning;
 
-  const DecodedFieldRecord* record(std::string_view field) const {
-    return reader.field(field).at((size_t)ord);
-  }
+  CatalogSummaryView(QueryPruning& pruning, const Query::PlanningContext& planning, int32_t ord,
+                     std::string* reason = nullptr)
+      : pruning(pruning), fields(pruning.fields[&planning.topReader]), ord(ord), reason(reason), planning(planning) {}
 
-  std::optional<CatalogSummaryView> inSpace(IndexReader& space) const {
-    if (space.segments()[(size_t)ord].maxDoc() == 0) return std::nullopt;
-    return CatalogSummaryView(space, ord, reason);
+  // nullopt means unusable evidence. A null record is proven field absence.
+  std::optional<const DecodedFieldRecord*> record(std::string_view field) const;
+
+  std::optional<CatalogSummaryView> inSpace(const Query::PlanningContext& space) const {
+    if (space.topReader.segments()[(size_t)ord].maxDoc() == 0) return std::nullopt;
+    return CatalogSummaryView(pruning, space, ord, reason);
   }
 
   // Records why a leaf proved the view empty; the first reason wins.

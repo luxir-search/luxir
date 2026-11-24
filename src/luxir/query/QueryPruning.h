@@ -4,26 +4,30 @@
 #pragma once
 // Segment pruning: evaluates logical query trees against the segments' field
 // record headers (Query::mayMatch over a CatalogSummaryView) and turns the
-// verdicts into the segments an op may match. Evidence is evaluated
-// bottom-up, once per query and segment of a request; nothing here reads a
-// segment's data. See docs/design/storage.md (Pruning).
+// verdicts into the segments an op may match. Masks belong to the query
+// and its validation context. See docs/design/storage.md (Pruning).
 
+#include <map>
 #include <string>
 #include <string_view>
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
 #include "SegmentMask.h"
-#include "luxir/search/IndexReader.h"
+#include "Query.h"
 
 namespace luxir {
 
-class Query;
-
 class QueryPruning {
-  IndexReader& reader;
-  boost::unordered_flat_map<const Query*, SegmentMask> memo;
-  boost::unordered_flat_map<const Query*, SegmentMask> membershipMemo;
+  friend class CatalogSummaryView;
+  using PlanKey = std::pair<const Query::PlanningContext*, const Query*>;
+  boost::unordered_flat_map<PlanKey, SegmentMask> memo;
+  boost::unordered_flat_map<PlanKey, SegmentMask> membershipMemo;
+
+  // All plans on a reader share its positive, absent and unusable fields.
+  using FieldMemo = boost::unordered_flat_map<std::string, std::optional<IndexReader::FieldSegments>,
+                                               PackedTermHash, PackedTermEqual>;
+  std::map<const IndexReader*, FieldMemo> fields;
 
 public:
   // Disables every proof, including the skipped statistics seeks, so pruned
@@ -34,28 +38,21 @@ public:
   // Responses are unchanged.
   static inline bool crossCheck = false;
 
-  explicit QueryPruning(IndexReader& reader) : reader(reader) {}
-
   // True when the reader has segments and every segment proves raw membership empty.
-  bool collectionEmpty(const Query& query);
+  bool collectionEmpty(const Query& query, const Query::PlanningContext& planning);
 
   // The segments where `query`'s header proofs allow a match, deletes
   // ignored, by ordinal, memoized for the request. A segment outside it holds
   // no document matching `query`, deleted or not, so its cached membership
   // is exactly empty.
-  const SegmentMask& membership(const Query& query);
+  const SegmentMask& membership(const Query& query, const Query::PlanningContext& planning);
 
   // The segments `query` may match: membership() without the segments that
   // have no live documents. Memoized for the request.
-  const SegmentMask& viable(const Query& query);
+  const SegmentMask& viable(const Query& query, const Query::PlanningContext& planning);
 
   // Why `query` cannot match segment `ord`, for explain and profile notes.
-  std::string reason(const Query& query, size_t ord);
-
-  // Whether segment `segment`'s header of `field` proves `term` absent from
-  // the field's dictionary, so its statistics are exactly zero there and
-  // need no seek.
-  static bool termAbsent(const IndexReader::FieldSegments& field, size_t segment, std::string_view term);
+  std::string reason(const Query& query, const Query::PlanningContext& planning, size_t ord);
 
   // Thrown by cross-check mode when pruned work finds a match.
   [[noreturn]] static void crossCheckFailed(std::string_view what);
