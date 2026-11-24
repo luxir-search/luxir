@@ -1593,12 +1593,28 @@ TEST_F(VectorIndexBuilderTest, cosineTransformChunkBoundaries) {
     ASSERT_NE(aux->getRotation(), nullptr);
     std::vector<float> query(4, 0.5f), rotated(4);
     aux->getRotation()->apply(query.data(), rotated.data());
-    faiss::IVFRaBitQSearchParameters params;
-    params.nprobe = aux->getNList();
-    params.qb = 0;
-    float distance;
-    faiss::idx_t id;
-    index->search(1, rotated.data(), 1, &distance, &id, &params);
+    // FAISS's full estimate over every list, on codes rebuilt from the split layout.
+    auto* ivf = dynamic_cast<faiss::IndexIVFRaBitQ*>(index);
+    ASSERT_NE(ivf, nullptr);
+    RaBitQLayout layout(4, 4);
+    std::vector<uint8_t> code(layout.faissCodeSize());
+    std::vector<float> centroid(4);
+    float distance = -std::numeric_limits<float>::infinity();
+    faiss::idx_t id = -1;
+    for (size_t list = 0; list < ivf->nlist; list++) {
+      ivf->quantizer->reconstruct((faiss::idx_t)list, centroid.data());
+      std::unique_ptr<faiss::FlatCodesDistanceComputer> computer(ivf->rabitq.get_distance_computer(0, centroid.data()));
+      computer->set_query(rotated.data());
+      auto& dc = dynamic_cast<faiss::RaBitQDistanceComputer&>(*computer);
+      faiss::InvertedLists::ScopedCodes codes(ivf->invlists, list);
+      faiss::InvertedLists::ScopedIds ids(ivf->invlists, list);
+      size_t rows = ivf->invlists->list_size(list);
+      for (size_t row = 0; row < rows; row++) {
+        layout.faissCode(codes.get(), rows, row, code.data());
+        float estimate = dc.distance_to_code_full(code.data());
+        if (estimate > distance) { distance = estimate; id = ids.get()[row]; }
+      }
+    }
     EXPECT_EQ(id, 79);
     EXPECT_NEAR(distance, 1.0f, 0.1f);
     auto approx = runKnnIds(h.getSearchEngine(), "v_v", query, 1, 1024, 1);

@@ -27,13 +27,15 @@ struct KnnPlanner {
               ENTRY_NONE, ENTRY_BITMAP, ENTRY_PQ, ENTRY_MISPREDICT, RESOLVE_IDENTITY, RESOLVE_SELECT, RESOLVE_MONO,
               BIT_PROBE, ARRAY_STEP, PQ_SUBCODE, PQ_BIT, ONE_BIT_DIM, EXTRA_BIT_DIM,
               PQ_LIST_SETUP, PQ_TABLE_DIM, RABITQ_LIST_DIM, COARSE_DIM, ROUND, IVF_REQUEST, FOLD_DOC, FOLD_WORD,
-              SCORER_DIM, SCORER_LIST_DIM, ONE_BIT_CODE, EXTRA_BIT_CODE, SCORER_CODE, NUM_UNITS };
+              SCORER_DIM, SCORER_LIST_DIM, ONE_BIT_CODE, EXTRA_BIT_CODE, SCORER_CODE,
+              SCORER_EXTRA_CODE, SCORER_EXTRA_DIM, SCORER_EXTRA_LIST_DIM, NUM_UNITS };
   static constexpr std::array<std::string_view, NUM_UNITS> unitNames{
     "exact_dims", "terminal_dims", "terminal_reads", "domain_docs", "rank_visits", "flat_probes", "sparse_maps", "multi_maps",
     "entry_none", "entry_bitmap", "entry_pq", "entry_mispredict", "resolve_identity", "resolve_select", "resolve_mono",
     "bit_probes", "array_steps", "pq_subcodes", "pq_bits", "one_bit_dims", "extra_bit_dims",
     "pq_list_setups", "pq_table_dims", "rabitq_list_dims", "coarse_dims", "ivf_slot_rounds", "ivf_request", "fold_docs", "fold_words",
-    "scorer_dims", "scorer_list_dims", "one_bit_codes", "extra_bit_codes", "scorer_codes"};
+    "scorer_dims", "scorer_list_dims", "one_bit_codes", "extra_bit_codes", "scorer_codes",
+    "scorer_extra_codes", "scorer_extra_dims", "scorer_extra_list_dims"};
   using Work = std::array<double, NUM_UNITS>;
   struct Costs {
     // Forced-arm fit on munin at 3.3 GHz with FAISS 1.16.0 and AVX-512: SIFT 1M
@@ -47,12 +49,21 @@ struct KnnPlanner {
     // fold words and entry-none. PQ_LIST_SETUP counts precomputed L2 lists x subquantizers.
     // PQ_TABLE_DIM is seeded at EXACT_DIM cost, not fitted.
     // Open: IVF_REQUEST's shared 144 us remains unexplained by profiles.
-    // ONE_BIT_* and RABITQ_LIST_DIM price FAISS's distance computer, which
-    // extended codes keep. SCORER_* price RaBitQScorer on 1-bit codes. A scored
+    // ONE_BIT_*, EXTRA_BIT_* and RABITQ_LIST_DIM price FAISS's distance
+    // computer, which query bits 0 keep. SCORER_* price RaBitQScorer. A scored
     // code costs a constant plus its dimensions: popcounts are cheap beside
     // reaching the code, so per-dimension units alone overprice wide vectors.
     // The scorer's selector test does not branch, so it pays no ENTRY_MISPREDICT.
+    // SCORER_EXTRA_DIM counts code planes (sign plane included; 9-bit codes
+    // count 3, see extendedPlanes) times dims; SCORER_EXTRA_LIST_DIM is the
+    // extended stage's own 8-bit query packing, paid by lists with a survivor.
+    // The SCORER_EXTRA_* units are seeds, not fitted: cache-resident kernel
+    // timings on an i7-14700KF (AVX2, BM_VectorRaBitQExtendedKernel) of 6.7 ns
+    // + 0.020 ns per plane-dimension a code and 0.227 ns per list dimension,
+    // scaled to this table by the fitted/measured ratio of FAISS's extended
+    // computer at 768-d, 4 bits (409 / 219 ns) and of SCORER_LIST_DIM (1.05).
     static constexpr double NS_PER_DIM = 0.135;
+    static constexpr double SCORER_EXTRA_CODE_NS = 12.5, SCORER_EXTRA_DIM_NS = 0.037, SCORER_EXTRA_LIST_DIM_NS = 0.24;
     Work units{1, 0.338 / NS_PER_DIM, 195 / NS_PER_DIM, 21.6 / NS_PER_DIM, 1, 4, 16, 24,
                1, 0.889 / NS_PER_DIM, 3.02 / NS_PER_DIM, 23.1 / NS_PER_DIM, 0, 16, 24,
                9.0 / NS_PER_DIM, 1.65 / NS_PER_DIM, 0.392 / NS_PER_DIM, 0,
@@ -60,7 +71,9 @@ struct KnnPlanner {
                0.0377 / NS_PER_DIM, 1690 / NS_PER_DIM, 144300 / NS_PER_DIM,
                5.49 / NS_PER_DIM, 0.5 / NS_PER_DIM,
                0.00868 / NS_PER_DIM, 0.340 / NS_PER_DIM,
-               7.50 / NS_PER_DIM, 17.7 / NS_PER_DIM, 7.50 / NS_PER_DIM};
+               7.50 / NS_PER_DIM, 17.7 / NS_PER_DIM, 7.50 / NS_PER_DIM,
+               SCORER_EXTRA_CODE_NS / NS_PER_DIM, SCORER_EXTRA_DIM_NS / NS_PER_DIM,
+               SCORER_EXTRA_LIST_DIM_NS / NS_PER_DIM};
     double requestCost = 18400 / NS_PER_DIM; // Common to both arms, once per query.
     // EXACT_DIM and TERMINAL_DIM per stored encoding, relative to f32, indexed
     // [cosine on a non-f32 column][VectorEncoding] (f32, f16, bf16, sq8).
@@ -162,11 +175,25 @@ struct KnnPlanner {
     return std::clamp(std::max(fraction, request.minScanFraction), 0.0, 1.0);
   }
   static double arraySteps(int64_t card) { return (double)std::bit_width((uint64_t)std::max((int64_t)1, card)); }
-  static bool usesScorer(int32_t codeBits, int32_t queryBits, bool forceFaiss) {
-    return codeBits <= 1 && queryBits > 0 && !forceFaiss;
-  }
+  static bool usesScorer(int32_t queryBits, bool forceFaiss) { return queryBits > 0 && !forceFaiss; }
   static bool usesScorer(const Segment& s) {
-    return s.codec == Codec::RABITQ && usesScorer(s.rabitqBits, s.rabitqQueryBits, s.forceFaissRaBitQ);
+    return s.codec == Codec::RABITQ && usesScorer(s.rabitqQueryBits, s.forceFaissRaBitQ);
+  }
+  // Extended scoring work of `codes` scored codes, and of `lists` list setups.
+  // RaBitQScorer's plane passes per extended code. 9-bit codes multiply one
+  // extra byte per dimension, which costs about two plane passes.
+  static int32_t extendedPlanes(int32_t bits) { return bits == 9 ? 3 : bits; }
+  // `lists` counts list setups that pay the 8-bit query packing.
+  static void extendedWork(const Segment& s, double codes, double lists, Work& w) {
+    if (s.codec != Codec::RABITQ || s.rabitqBits <= 1) return;
+    if (usesScorer(s)) {
+      w[SCORER_EXTRA_CODE] = codes;
+      w[SCORER_EXTRA_DIM] = codes * extendedPlanes(s.rabitqBits) * s.dims;
+      w[SCORER_EXTRA_LIST_DIM] = s.rabitqQueryBits == 8 ? 0 : lists * s.dims;
+    } else {
+      w[EXTRA_BIT_CODE] = codes;
+      w[EXTRA_BIT_DIM] = codes * (s.rabitqBits - 1) * s.dims;
+    }
   }
   static bool canIvf(const Segment& s) {
     return s.codec != Codec::FLAT && s.liveVectors > 0 && s.eligibleDocs > 0;
@@ -245,10 +272,8 @@ struct KnnPlanner {
     } else {
       p.linear[usesScorer(s) ? SCORER_CODE : ONE_BIT_CODE] = (double)s.eligibleVectors;
       p.linear[usesScorer(s) ? SCORER_DIM : ONE_BIT_DIM] = (double)s.eligibleVectors * s.dims;
-      if (s.rabitqBits > 1) {
-        p.linear[EXTRA_BIT_CODE] = (double)s.eligibleVectors * costs.extraBitSurvival(s.dims);
-        p.linear[EXTRA_BIT_DIM] = p.linear[EXTRA_BIT_CODE] * (s.rabitqBits - 1) * s.dims;
-      }
+      double extended = (double)s.eligibleVectors * costs.extraBitSurvival(s.dims);
+      extendedWork(s, extended, std::min((double)s.nlist, extended), p.linear);
     }
     if (s.codec == Codec::PQ) {
       p.linear[PQ_LIST_SETUP] = s.l2 && !s.pqPerListTable ? (double)s.nlist * s.pqM : 0;
@@ -482,8 +507,7 @@ struct KnnPlanner {
     f[PQ_SUBCODE] = (double)w.pqScores * s.pqM; f[PQ_BIT] = f[PQ_SUBCODE] * s.pqBits;
     f[usesScorer(s) ? SCORER_CODE : ONE_BIT_CODE] = (double)w.oneBitScores;
     f[usesScorer(s) ? SCORER_DIM : ONE_BIT_DIM] = (double)w.oneBitScores * s.dims;
-    f[EXTRA_BIT_CODE] = (double)w.extraBitScores;
-    f[EXTRA_BIT_DIM] = (double)w.extraBitScores * std::max(0, s.rabitqBits - 1) * s.dims;
+    extendedWork(s, (double)w.extraBitScores, (double)w.extendedListSetups, f);
     f[PQ_LIST_SETUP] = s.codec == Codec::PQ && s.l2 && !s.pqPerListTable ? (double)w.listSetups * s.pqM : 0;
     f[PQ_TABLE_DIM] = s.codec == Codec::PQ && s.pqPerListTable ? (double)w.listSetups * (1 << s.pqBits) * s.dims : 0;
     if (s.codec == Codec::RABITQ) f[usesScorer(s) ? SCORER_LIST_DIM : RABITQ_LIST_DIM] = (double)w.listSetups * s.dims;

@@ -811,16 +811,19 @@ positive `m` requires dimensions pinned in the schema.
 
 **RaBitQ** (default) stores sign bits of randomly rotated residuals from IVF
 centroids, plus correction factors. A 768-dimension 1-bit vector uses 104 code
-bytes plus a 4-byte error amplitude (108 bytes). Multi-bit codes use
-`ceil(D/8) + 12 + ceil(D*(bits-1)/8) + 8` bytes, plus one float32 amplitude
-(4 bytes), stored in list order. Every overlay vector, for either codec, also
+bytes plus a 4-byte error amplitude (108 bytes, excluding its id). Multi-bit
+codes use `ceil(D/8) + 12 + (bits-1)*ceil(D/8) + 8` bytes (`ceil(D/8) + 12 + D
++ 8` at 9 bits), plus one float32 amplitude (4 bytes), stored in list order;
+the sign bits of a list are stored apart from its extra bits, so the first
+pass reads only the former. Every overlay vector, for either codec, also
 stores a 4-byte list id. Only the IVF centroids are trained.
 
 The default candidate selection uses empirical confidence intervals. It keeps
 values whose optimistic score can still beat the k-th distinct-unit witness,
 then reads exact seed witnesses and narrows the set before the remaining exact
 reads. Multi-bit scans first use a 1-bit interval to decide whether to evaluate
-the extra bits. Gate and selection confidence constants are both 1.9; these
+the extra bits, which are scored against an 8-bit quantization of the query
+whatever `query_bits` is (unless it is `0`). Gate and selection confidence constants are both 1.9; these
 are empirical choices, not recall guarantees. `query_bits: 4` is the default;
 query quantization also affects estimation error and should be checked on the
 intended corpus when changed.

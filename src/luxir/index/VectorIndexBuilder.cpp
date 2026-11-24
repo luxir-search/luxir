@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -702,6 +703,10 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     // below ntotal (checked against MAX_SEGMENT_VECTORS above), narrowed to uint32.
     os.align(8);
     const faiss::InvertedLists& lists = *index->invlists;
+    auto* rabitqIndex = dynamic_cast<const faiss::IndexIVFRaBitQ*>(index.get());
+    std::optional<RaBitQLayout> layout;
+    if (rabitqIndex) layout.emplace((size_t)dims, rabitqIndex->rabitq.nb_bits);
+    size_t rowBytes = layout ? layout->rowBytes() : lists.code_size;
     for (size_t i = 0; i < lists.nlist; i++) {
       os.writeLong((int64_t)lists.list_size(i));
     }
@@ -726,7 +731,11 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
       size_t sz = lists.list_size(i);
       if (sz == 0) continue;
       faiss::InvertedLists::ScopedCodes codes(&lists, i);
-      os.write(codes.get(), sz * lists.code_size);
+      if (layout && layout->split()) {
+        std::vector<uint8_t> stored(sz * rowBytes);
+        layout->store(codes.get(), sz, stored.data());
+        os.write(stored.data(), stored.size());
+      } else os.write(codes.get(), sz * lists.code_size);
     }
     os.align(8);
     if (!amplitudes.empty()) {
@@ -745,7 +754,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     VectorAuxListsFooter footer;
     footer.faissHeaderBytes = faissHeaderBytes;
     footer.nlist = (int64_t)lists.nlist;
-    footer.codeSize = (int64_t)lists.code_size;
+    footer.codeSize = (int64_t)rowBytes;
     footer.ntotal = ntotal;
     footer.amplitudeCount = amplitudeCount;
     footer.version = VectorAuxListsFooter::VERSION;
