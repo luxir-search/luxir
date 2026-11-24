@@ -15,22 +15,37 @@ namespace luxir {
 
 Query::Weight* Query::Context::createRootWeight(Query& query, int32_t flags, float multiplier) {
   if (!planning.pruning) planning.pruning = std::make_shared<QueryPruning>();
-  const auto& mask = planning.pruning->membership(query, planning);
-  auto* weight = !planning.mayPrepare && mask.none()
-      ? pool.make<MatchNoDocsQuery::Weight>(*this, query, flags)
-      : query.createWeight(*this, flags, multiplier);
-  if (mask.prunesAny()) weight->membership = &mask;
+  auto [mask, inserted] = planning.pruning->membership(query, planning);
+  bool emptyWeight = !planning.mayPrepare && mask.none();
+  auto* weight = emptyWeight ? pool.make<MatchNoDocsQuery::Weight>(*this, query, flags)
+                             : query.createWeight(*this, flags, multiplier);
+  assert(!weight->needsPrepare() || planning.mayPrepare);
+  if (mask.prunesAny()) {
+    weight->membership = &mask;
+    if (inserted && planning.proofNotes) {
+      auto segments = planning.topReader.segments();
+      if (emptyWeight) {
+        planning.proofNotes->push_back(std::format("op {}: empty weight for the collection (segment 0, {})",
+            planning.opName, weight->proofReason(segments.front())));
+      } else {
+        for (const auto& segment : segments) {
+          if (weight->provenEmpty(segment)) planning.proofNotes->push_back(std::format(
+              "op {}: pruned segment {} (ord {}): {}", planning.opName, segment.segInfo.seg_id,
+              segment.ord, weight->proofReason(segment)));
+        }
+      }
+    }
+  }
   return weight;
 }
 
-const SegmentMask& QueryPruning::membership(const Query& query, const Query::PlanningContext& planning) {
+QueryPruning::Membership QueryPruning::membership(const Query& query, const Query::PlanningContext& planning) {
   auto found = membershipMemo.find({&planning, &query});
-  if (found != membershipMemo.end()) return found->second;
+  if (found != membershipMemo.end()) return {found->second, false};
   auto segments = planning.topReader.segments();
   SegmentMask mask(segments.size());
   if (!disableForTests) {
     bool describe = planning.proofNotes || planning.profiles;
-    size_t root = membershipMemo.size() + 1;
     std::string reason;
     for (const auto& segment : segments) {
       reason.clear();
@@ -40,23 +55,11 @@ const SegmentMask& QueryPruning::membership(const Query& query, const Query::Pla
       mask.exclude(ord);
       if (describe) {
         if (mask.reasons.empty()) mask.reasons.resize(segments.size());
-        mask.reasons[ord] = std::format("root {}: {}", root, reason.empty() ? "proven empty" : reason);
-      }
-    }
-    if (planning.proofNotes && !mask.reasons.empty()) {
-      if (!planning.mayPrepare && mask.none()) {
-        planning.proofNotes->push_back(std::format("op {}: empty weight for the collection (segment 0, {})",
-            planning.opName, mask.reasons.front()));
-      } else {
-        for (const auto& segment : segments) {
-          size_t ord = (size_t)segment.ord;
-          if (!mask.test(ord)) planning.proofNotes->push_back(std::format(
-              "op {}: pruned segment {} (ord {}): {}", planning.opName, segment.segInfo.seg_id, ord, mask.reasons[ord]));
-        }
+        mask.reasons[ord] = reason;
       }
     }
   }
-  return membershipMemo.emplace(PlanKey{&planning, &query}, std::move(mask)).first->second;
+  return {membershipMemo.emplace(PlanKey{&planning, &query}, std::move(mask)).first->second, true};
 }
 
 std::optional<const DecodedFieldRecord*> CatalogSummaryView::record(std::string_view field) const {

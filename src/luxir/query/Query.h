@@ -1204,10 +1204,14 @@ public:
     bool provenEmpty(const IndexReader::Segment& segment) const noexcept {
       return membership && !membership->test((size_t)segment.ord);
     }
-    // For a segment this source excludes, when profiling requested proof details.
+    // For a segment this source excludes. Detailed reasons are optional.
     std::string_view proofReason(const IndexReader::Segment& segment) const {
-      assert(provenEmpty(segment) && !membership->reasons.empty());
-      return membership->reasons[(size_t)segment.ord];
+      assert(provenEmpty(segment));
+      if (membership && !membership->reasons.empty()) {
+        const auto& reason = membership->reasons[(size_t)segment.ord];
+        if (!reason.empty()) return reason;
+      }
+      return "proven empty";
     }
 
     /// Drop refillable transient state only; preserve semantics and prepared

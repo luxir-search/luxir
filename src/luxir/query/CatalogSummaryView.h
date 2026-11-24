@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -30,6 +31,7 @@ public:
   std::optional<const DecodedFieldRecord*> record(std::string_view field) const;
 
   std::optional<CatalogSummaryView> inSpace(const Query::PlanningContext& space) const {
+    assert(space.topReader.segments().size() == planning.topReader.segments().size());
     if (space.topReader.segments()[(size_t)ord].maxDoc() == 0) return std::nullopt;
     return CatalogSummaryView(pruning, space, ord, reason);
   }
