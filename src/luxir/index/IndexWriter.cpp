@@ -2763,8 +2763,12 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       // dictionaries are exempt because they do not produce an ord column.
       // Doc ids carry the same shape of limit: the merged segment's maxDoc
       // (the live docs the merger copies) must stay below MAX_SEGMENT_DOCS.
+      // Vector fields are summed by values (deleted ones included) against
+      // MAX_SEGMENT_VECTORS, which multi-valued fields can reach before the
+      // doc cap.
       int64_t mergedDocs = 0;
       boost::unordered_flat_map<std::string, int64_t> ordTermSums;
+      boost::unordered_flat_map<std::string, int64_t> vectorSums;
       boost::unordered_flat_map<std::string, int64_t> pathRows;
       std::vector<SegInfo*> admitted;
       admitted.reserve(segs.size());
@@ -2777,9 +2781,19 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         auto postingsReaderCore = getSegmentCore(*seg);
         MemPool metadataPool;
         boost::unordered_flat_map<std::string, int64_t> additions;
-        auto ordsFit = [&](PostingsReader& reader) {
+        boost::unordered_flat_map<std::string, int64_t> vectorAdditions;
+        auto fieldsFit = [&](PostingsReader& reader) {
           for (int32_t ordinal = 0; ordinal < reader.numFields(); ++ordinal) {
             auto header = reader.fieldHeader(ordinal);
+            if (FieldType::storage(header.type) == FieldType::Storage::VECTOR) {
+              std::string name(std::string_view(header.name));
+              int64_t next = vectorAdditions[name] + header.numValues;
+              if (!MergeCostModel::vectorsFit(vectorSums[name], next)) {
+                return false;
+              }
+              vectorAdditions[name] = next;
+              continue;
+            }
             if (FieldType::storage(header.type) != FieldType::Storage::TERMS || !(header.flags & FieldType::INDEX_DOCS)
                 || !(header.flags & FieldType::MULTI_VALUED)) {
               continue;
@@ -2793,7 +2807,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           }
           return true;
         };
-        bool fits = ordsFit(postingsReaderCore->rootReader());
+        bool fits = fieldsFit(postingsReaderCore->rootReader());
         std::vector<std::pair<std::string, int64_t>> nextRows;
         for (size_t i = 1; fits && i < postingsReaderCore->spaces().size(); i++) {
           const auto& space = postingsReaderCore->spaces()[i];
@@ -2802,15 +2816,16 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           // can be skipped.
           int64_t next = pathRows[std::string(space.path)] + space.maxDoc;
           fits = MergeCostModel::docsFit(0, next)
-              && ordsFit(*postingsReaderCore->spaceReader(space.path));
+              && fieldsFit(*postingsReaderCore->spaceReader(space.path));
           nextRows.emplace_back(space.path, next);
         }
         if (!fits) {
-          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged row space or ord dictionary would exceed the safety limit",
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged row space, ord dictionary or vector field would exceed the safety limit",
                       seg->name());
           continue;
         }
         for (const auto& [field, terms] : additions) ordTermSums[field] += terms;
+        for (const auto& [field, vectors] : vectorAdditions) vectorSums[field] += vectors;
         for (const auto& [path, rows] : nextRows) pathRows[path] = rows;
         mergedDocs += seg->liveDocs;
         admitted.push_back(seg);

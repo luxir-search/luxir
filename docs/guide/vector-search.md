@@ -811,9 +811,10 @@ positive `m` requires dimensions pinned in the schema.
 
 **RaBitQ** (default) stores sign bits of randomly rotated residuals from IVF
 centroids, plus correction factors. A 768-dimension 1-bit vector uses 104 code
-bytes plus a 4-byte error amplitude (108 bytes, excluding its id). Multi-bit
-codes use `ceil(D/8) + 12 + ceil(D*(bits-1)/8) + 8` bytes, plus one float32
-amplitude (4 bytes), stored in list order. Only the IVF centroids are trained.
+bytes plus a 4-byte error amplitude (108 bytes). Multi-bit codes use
+`ceil(D/8) + 12 + ceil(D*(bits-1)/8) + 8` bytes, plus one float32 amplitude
+(4 bytes), stored in list order. Every overlay vector, for either codec, also
+stores a 4-byte list id. Only the IVF centroids are trained.
 
 The default candidate selection uses empirical confidence intervals. It keeps
 values whose optimistic score can still beat the k-th distinct-unit witness,
