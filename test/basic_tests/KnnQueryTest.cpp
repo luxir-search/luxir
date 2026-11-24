@@ -4885,13 +4885,14 @@ static void expectRaBitQFloat(double expected, float actual, double scale) {
 // Check each list against our definition exactly, and FAISS within the error
 // induced by its SIMD-dependent rounding. Override centroids for degenerate cases.
 static void compareRaBitQLists(faiss::IndexIVFRaBitQ& index, const std::vector<float>& query, int32_t qb,
+                               RaBitQScorer::Level level,
                                const std::vector<float>* fixedCentroid = nullptr, bool checkFaiss = true) {
   size_t d = (size_t)index.d;
   std::vector<float> centroid(d), rotated;
   std::vector<uint8_t> quantized;
   auto metric = index.rabitq.metric_type;
   bool ip = metric == faiss::METRIC_INNER_PRODUCT;
-  RaBitQScorer scorer(index.d, qb, ip, query.data());
+  RaBitQScorer scorer(index.d, qb, ip, query.data(), level);
   for (size_t list = 0; list < index.nlist; list++) {
     SCOPED_TRACE(list);
     size_t count = std::min(index.invlists->list_size(list), RaBitQScorer::BLOCK_ROWS);
@@ -5014,29 +5015,36 @@ TEST_F(KnnQueryTest, rabitqScorerMatchesFaissOnRealOverlays) {
       std::vector<float> zero((size_t)dims, 0.0f);
       for (int32_t qb = 1; qb <= 8; qb++) {
         SCOPED_TRACE(qb);
-        compareRaBitQLists(*index, query, qb);
-        compareRaBitQLists(*index, constant, qb, &zero);
         auto halfStep = zero;
         halfStep[0] = 0.5f;
         if (dims > 1) halfStep[1] = (float)((1 << qb) - 1); // delta = 1.
-        compareRaBitQLists(*index, halfStep, qb, &zero);
-        // Almost constant residuals amplify FAISS's SIMD cancellation beyond a
-        // one-step difference. Keep this coverage against our scalar definition.
-        compareRaBitQLists(*index, query, qb, &nearConstant, false);
-        compareRaBitQLists(*index, query, qb, &query);
-        compareRaBitQLists(*index, zero, qb, &zero);
+        for (auto level : RaBitQScorer::supported()) {
+          SCOPED_TRACE((int)level);
+          compareRaBitQLists(*index, query, qb, level);
+          compareRaBitQLists(*index, constant, qb, level, &zero);
+          compareRaBitQLists(*index, halfStep, qb, level, &zero);
+          // Almost constant residuals amplify FAISS's SIMD cancellation beyond a
+          // one-step difference. Check them against our scalar definition.
+          compareRaBitQLists(*index, query, qb, level, &nearConstant, false);
+          compareRaBitQLists(*index, query, qb, level, &query);
+          compareRaBitQLists(*index, zero, qb, level, &zero);
+        }
       }
     }
   }
   std::vector<float> ones(8, 1), zeros(8, 0);
-  RaBitQScorer scorer(8, 4, false, ones.data());
-  scorer.setList(zeros.data());
   std::array<uint8_t, 9> code{0xff};
-  float base = 1, multiplier = std::sqrt(8.0f), estimate;
+  float base = 1, multiplier = std::sqrt(8.0f);
   std::memcpy(code.data() + 1, &base, sizeof(float));
   std::memcpy(code.data() + 5, &multiplier, sizeof(float));
-  scorer.score(code.data(), code.size(), 1, &estimate);
-  EXPECT_NEAR(-7, estimate, 1e-5); // Negative L2 estimates must retain their order.
+  for (auto level : RaBitQScorer::supported()) {
+    SCOPED_TRACE((int)level);
+    RaBitQScorer scorer(8, 4, false, ones.data(), level);
+    scorer.setList(zeros.data());
+    float estimate;
+    scorer.score(code.data(), code.size(), 1, &estimate);
+    EXPECT_NEAR(-7, estimate, 1e-5); // Negative L2 estimates must retain their order.
+  }
 }
 
 // One request through both kernels, on every selector and result path.

@@ -183,6 +183,7 @@ locations, browse `src/luxir/<area>/`.
    - `VectorTranscoder`: a vector column's encoding in a merge (the schema's current one),
      re-encoding inputs in another; `SegmentMerger` passes each value through it
    - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (RaBitQ by default, or explicit PQ) aux overlays for ANN, built from the decoded column
+   - `RaBitQScorer` (`query/`): scores blocks of one-bit IVF codes and packs query planes for its kernel level, selected at run time on GCC x86-64
    - `util/VectorRotation.h`: seeded orthogonal FHT-Kac transform shared by ANN builders, readers and queries; parameters define the rotation disk contract.
    - Reuses column storage for exact search, cosine raw-column normalization, and candidate rescoring
    - See [../guide/vector-search.md](../guide/vector-search.md) for the user contract (query knobs, scoring, recall) and [../design/vector-search.md](../design/vector-search.md) for the overlay/build/query internals

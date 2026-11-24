@@ -213,6 +213,16 @@ one-step tolerance. The scorer removes per-list allocation and bit-at-a-time
 packing, and the per-code virtual call. FAISS's computer remains for extended
 codes and query bits 0.
 
+GCC x86-64 builds select a RaBitQ kernel once per process. The baseline uses
+64-bit popcount words, and the AVX2 + POPCNT level uses 32-byte chunks and
+word tails. The AVX-512 level uses AVX-512F, BW and VPOPCNTDQ for 64-byte
+chunks with a masked final load, and AVX2 for min/max and part of its
+reduction. AArch64 NEON builds use 16-byte chunks and word tails.
+A scorer takes the widest level its CPU supports, except that codes of at most
+128 dimensions use the popcount words, which beat one masked chunk there. Each
+scorer packs its query planes for the chosen kernel and dispatches once per
+block of rows.
+
 RaBitQ's estimated squared L2 distance can be negative. Since 1.15, FAISS
 clamps its 1-bit L2 estimates at zero; the port patch
 `deps/ports/faiss/rabitq-negative-l2.diff` removes that clamp so negative
