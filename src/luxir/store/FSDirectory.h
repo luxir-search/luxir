@@ -228,6 +228,7 @@ class FSFile : public File {
   int fd_ = -1;
   size_t fileSize_ = 0;
   XXH3_state_t hash;
+  ByteRateLimiter* rateLimiter_;  // null = unpaced
 
   // Single reusable write buffer
   std::unique_ptr<char[]> buf_;
@@ -246,8 +247,15 @@ class FSFile : public File {
 
   void writeToFd(const char* data, size_t len) {
     XXH3_64bits_update(&hash, data, len);
+    // A paced write charges one chunk at a time, so no single wait is long.
+    size_t chunk = rateLimiter_ ? rateLimiter_->chunk() : len;
+    size_t paid = 0;
     while (len > 0) {
-      auto n = ::write(fd_, data, len);
+      if (rateLimiter_ && paid == 0) {
+        paid = std::min(chunk, len);
+        rateLimiter_->pace(paid);
+      }
+      auto n = ::write(fd_, data, rateLimiter_ ? paid : len);
       if (n < 0) {
         throw FileIOException("FSFile: write failed for: " + path_.string() + ": " + strerror(errno));
       }
@@ -256,6 +264,7 @@ class FSFile : public File {
       }
       data += n;
       len -= (size_t)n;
+      if (rateLimiter_) paid -= (size_t)n;
     }
   }
 
@@ -288,8 +297,8 @@ class FSFile : public File {
   }
 
 public:
-  FSFile(std::string_view name, const std::filesystem::path& path)
-      : File(name), path_(path), tmpPath_(path.string() + ".tmp") {
+  FSFile(std::string_view name, const std::filesystem::path& path, ByteRateLimiter* rateLimiter = nullptr)
+      : File(name), path_(path), tmpPath_(path.string() + ".tmp"), rateLimiter_(rateLimiter) {
     XXH3_64bits_reset(&hash);
   }
 
@@ -446,8 +455,12 @@ public:
   using Directory::createFile;
 
   std::unique_ptr<File> createFile(std::string_view name) override {
+    return createFile(name, FileCreateOptions{});
+  }
+
+  std::unique_ptr<File> createFile(std::string_view name, FileCreateOptions options) override {
     std::filesystem::create_directories(basePath_);
-    return std::make_unique<FSFile>(name, filePath(name));
+    return std::make_unique<FSFile>(name, filePath(name), options.rateLimiter);
   }
 
   bool deleteFile(std::string_view name) override {

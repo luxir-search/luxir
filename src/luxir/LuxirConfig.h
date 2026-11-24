@@ -29,9 +29,13 @@ struct ServerConfig {
   // clamped to 1 by the servers.
   int64_t stream_buffer_bytes = 1 << 20;
 
-  // Worker threads of the node's task arena: indexing, merges, and parallel or
-  // dispatched search.  Transport threads (HTTP shards, gRPC) enter the arena
-  // through reserved slots and are not counted.  0 = auto: the affinity width
+  // Worker threads of the node's query arena (dispatched and parallel search,
+  // normal priority).  The low-priority indexing arena (update batches,
+  // flushes, merges, vector builds) shares the same pool with index.threads of
+  // them.  The pool has one more thread than the query arena may use, which
+  // indexing keeps under any search load (LuxirNode::kBackgroundFloor).
+  // Transport threads (HTTP shards, gRPC) enter the query
+  // arena through reserved slots and are not counted.  0 = auto: the affinity width
   // less one, leaving a core for the transport threads, except on nodes of at
   // most kSmallNodeCores, where holding a core back idles too much of the
   // machine (half of a 2-vCPU node) and the transport threads share instead.
@@ -131,6 +135,28 @@ struct IndexConfig {
   int64_t max_ram_mb = -1;
   int64_t pressure_flush_floor_mb = 4;           // min idle-inverter size to shed when over the shared cap
   int merge_factor = 10;
+
+  // Pool workers the indexing arena may use at once, capped at server.workers.
+  // 0 = auto (backgroundThreads): all but a quarter of the workers, at least
+  // one held back, so a 2-worker node indexes on 1.  The workers held back
+  // keep CPU free for searches, including inline HTTP searches, which never
+  // use the pool and so gain nothing from the arena's low priority.
+  int threads = 0;
+  // Policy merges running at once across every collection of the node (each
+  // collection runs at most one).  Merges past it wait in a queue, as data.
+  // Merges a client waits for take a slot at once.  0 = auto: half of the
+  // resolved index.threads, at least one.
+  int max_concurrent_merges = 0;
+  // Nice increment for pool workers while they run indexing work.  Workers move
+  // between the arenas, so the increment is undone on leaving, and undoing it
+  // needs CAP_SYS_NICE or RLIMIT_NICE >= 20 - the base nice.  -1 = auto: 5 when
+  // the node can undo it, else off.  0 = off.  An explicit value the node
+  // cannot undo is logged and ignored.
+  int nice = -1;
+  static constexpr int AUTO_NICE = 5;
+  // Byte rate of segment data written by background merges, node-wide.  Forced
+  // merges (max_segments) are not paced: a client waits for them.  0 = unlimited.
+  uint64_t merge_max_bytes_per_sec = 0;
   // The membership filter flushes and merges write over each segment's ids
   // (reader/IdFilter.h): none, bloom, fuse8 or fuse16. Each segment records its
   // own choice, so changing it needs no reindex and merges move segments to it.
@@ -253,6 +279,26 @@ struct LuxirConfig {
   IndexConfig index;
   IngestConfig ingest;
   SearchConfig search;
+
+  /// The width of a background (low-priority) arena sharing the pool with
+  /// `workers` query workers: `configured` capped at the workers, or for 0
+  /// all but a quarter of them, at least one held back and one used (1 of 2,
+  /// 3 of 4, 6 of 8, 12 of 16).  Shared by every background arena.
+  static int backgroundThreads(int configured, int workers) {
+    workers = std::max(1, workers);
+    if (configured > 0) return std::min(configured, workers);
+    return std::max(1, workers - (workers + 3) / 4);
+  }
+
+  /// Indexing arena width: index.threads, see backgroundThreads.
+  int resolveIndexThreads() const { return backgroundThreads(index.threads, server.resolveWorkers()); }
+
+  /// Node-wide policy merge limit: index.max_concurrent_merges, or half the
+  /// indexing threads (at least one).
+  int resolveMaxConcurrentMerges() const {
+    if (index.max_concurrent_merges > 0) return index.max_concurrent_merges;
+    return std::max(1, resolveIndexThreads() / 2);
+  }
 
   /// Register common CLI options on an app, bound to this config's fields.
   void addOptions(CLI::App& app);

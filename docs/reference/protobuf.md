@@ -2418,6 +2418,13 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.merge"></a>[`merge`](#field-luxir.servicestats.merge) | 16 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.vector_build"></a>[`vector_build`](#field-luxir.servicestats.vector_build) | 17 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.reader_refresh"></a>[`reader_refresh`](#field-luxir.servicestats.reader_refresh) | 18 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.query_workers"></a>[`query_workers`](#field-luxir.servicestats.query_workers) | 40 | `int64` | singular | Pool workers now in the query arena and in the low-priority indexing arena. Indexing keeps at least one worker whenever it has work, however busy the query arena is. |
+| <a id="field-luxir.servicestats.indexing_workers"></a>[`indexing_workers`](#field-luxir.servicestats.indexing_workers) | 41 | `int64` | singular |  |
+| <a id="field-luxir.servicestats.merges_running"></a>[`merges_running`](#field-luxir.servicestats.merges_running) | 42 | `int64` | singular | Policy merges holding a node-wide merge slot (indexing.max-concurrent-merges; merges a client waits for count too and may exceed it), and collections queued for one. |
+| <a id="field-luxir.servicestats.merges_waiting"></a>[`merges_waiting`](#field-luxir.servicestats.merges_waiting) | 43 | `int64` | singular |  |
+| <a id="field-luxir.servicestats.merge_slot_waits"></a>[`merge_slot_waits`](#field-luxir.servicestats.merge_slot_waits) | 44 | `uint64` | singular | Merges that waited for a slot, and their summed wait. |
+| <a id="field-luxir.servicestats.merge_slot_wait_seconds"></a>[`merge_slot_wait_seconds`](#field-luxir.servicestats.merge_slot_wait_seconds) | 45 | `double` | singular |  |
+| <a id="field-luxir.servicestats.merge_paced_seconds"></a>[`merge_paced_seconds`](#field-luxir.servicestats.merge_paced_seconds) | 46 | `double` | singular | Time merge writes waited on indexing.merge-max-bytes-per-sec. |
 | <a id="field-luxir.servicestats.control_threads"></a>[`control_threads`](#field-luxir.servicestats.control_threads) | 60 | `uint64` | singular | The control executor (server.control\_threads): administration, schema changes, collection lifecycle, replication transfers and timers, and detailed stats. |
 | <a id="field-luxir.servicestats.control_busy"></a>[`control_busy`](#field-luxir.servicestats.control_busy) | 61 | `uint64` | singular | tasks running now |
 | <a id="field-luxir.servicestats.control_queued"></a>[`control_queued`](#field-luxir.servicestats.control_queued) | 62 | `uint64` | singular | tasks waiting for a thread |
