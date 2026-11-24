@@ -162,6 +162,7 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
     lastResponse->proto.took_us = microsSince(startTime, end);
     if (!warnings.empty()) engine.metrics().add(MetricCounter::SEARCH_WARNINGS);
     if (counting) count(lastResponse->proto.error ? MetricOutcome::ERROR : MetricOutcome::OK, end);
+    inflight.phase(InflightPhase::REPLYING);
     reply(*lastResponse);  // may delete *this*; nothing after this call
   }
 }

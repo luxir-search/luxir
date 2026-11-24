@@ -302,7 +302,8 @@ struct ReplicationFollower::Impl {
       auto& storage = node.collections().storage();
       if (!TenantCatalog::empty(storage)) throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
       for (const auto& entry : storage.children(StorageRoot::NODE_PRIVATE, "")) {
-        if (entry.name != "write.lock") throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
+        if (entry.name != "write.lock" && entry.name != InflightRegistry::kFileName
+            && entry.name != InflightRegistry::kCrashFileName) throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
       }
       binding.write(*metadata);
     }

@@ -772,6 +772,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena, startTime);
   req.requestState = std::move(requestState);
   req.parent = &call;
+  req.transport = InflightTransport::GRPC;
   if (!req.proto.min_commit.empty()) {
     call.enableWaitCancellation();
     req.waitCancellation = call.waitCancellation;
@@ -846,6 +847,7 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     if (request->proto.commit && request->proto.commit->wait_for_replicas.has_value()) call.enableWaitCancellation();
     Update* updateMessage = new Update(std::move(request), &call, startTime);
     updateMessage->target = collection->getId();
+    updateMessage->track(call.server.getLuxirNode(), InflightTransport::GRPC);
     try {
       if (!iw->submitUpdate(updateMessage)) {
         throw std::runtime_error("update was not admitted");
@@ -857,6 +859,14 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   } catch (const std::exception& e) {
     finishWithException(call, e);
   }
+}
+
+// An administration call's in-flight slot, held while its handler runs.
+static InflightRegistry::Entry trackAdmin(GenericCallData& call, std::string_view tenant, std::string_view collection,
+                                          const char* operation) {
+  return call.server.getLuxirNode().inflight().track({
+      .tenant = tenant.empty() ? CollectionId::kDefaultTenant : tenant, .collection = collection,
+      .operation = operation, .kind = InflightKind::ADMIN, .transport = InflightTransport::GRPC});
 }
 
 // Responds with state->response once the publication `commit` satisfies the
@@ -896,6 +906,7 @@ static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& read
     { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
     call.server.getLuxirNode().getControlExecutor().enqueue([request, &call, stop = call.waitCancellation.get_token()] {
       try {
+        auto running = trackAdmin(call, request->proto.tenant, request->proto.name, "create_collection");
         auto id = LuxirNode::adminTarget(request->proto.tenant, request->proto.name);
         auto created = call.server.getLuxirNode().createCollection(id,
             request->proto.schema ? &*request->proto.schema : nullptr);
@@ -928,6 +939,7 @@ static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& read
   try {
     call.server.getLuxirNode().getControlExecutor().enqueue([request, &call] {
       try {
+        auto running = trackAdmin(call, request->proto.tenant, request->proto.name, "delete_collection");
         call.server.getLuxirNode().deleteCollection(LuxirNode::adminTarget(request->proto.tenant, request->proto.name));
         DeleteCollectionRespProto response;
         response.name = request->proto.name;
@@ -959,9 +971,11 @@ static void handleCollectionNames(GenericCallData& call, grpc::ByteBuffer& readB
         auto& req = request->proto;
         Response response;
         if constexpr (Swap) {
+          auto running = trackAdmin(call, req.tenant, req.a, "swap_collections");
           node.swapCollections(LuxirNode::adminTarget(req.tenant, req.a), LuxirNode::adminTarget(req.tenant, req.b));
           response = {req.a, req.b};
         } else {
+          auto running = trackAdmin(call, req.tenant, req.from, "rename_collection");
           node.renameCollection(LuxirNode::adminTarget(req.tenant, req.from), LuxirNode::adminTarget(req.tenant, req.to));
           response = {req.from, req.to};
         }
@@ -992,6 +1006,7 @@ static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
     call.server.getLuxirNode().getControlExecutor().enqueue([request, &call, stop = call.waitCancellation.get_token()] {
       try {
+        auto running = trackAdmin(call, request->proto.tenant, request->proto.collection, "set_schema");
         struct State {
           std::pmr::monotonic_buffer_resource arena;  // backs the non-owning response SchemaDef
           SchemaRespProto response;
@@ -1045,6 +1060,7 @@ static void handleStats(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   }
   auto run = [request, &call] {
     try {
+      auto running = trackAdmin(call, request->proto.tenant, request->proto.collection, "stats");
       StatsRespProto response;
       std::pmr::monotonic_buffer_resource respArena;
       gatherStats(call.server.getLuxirNode(), request->proto, response, respArena);
@@ -1081,6 +1097,7 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
   try {
     call.server.getLuxirNode().getControlExecutor().enqueue([request, &call] {
       try {
+        auto running = trackAdmin(call, request->proto.tenant, request->proto.collection, "cache_control");
         CacheControlRespProto response;
         std::pmr::monotonic_buffer_resource respArena;
         gatherCacheControl(call.server.getLuxirNode(), request->proto, response,

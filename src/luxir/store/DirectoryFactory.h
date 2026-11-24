@@ -184,6 +184,8 @@ public:
   std::string describe() const override { return (mode == Mode::SHARED ? "shared_fs:" : "fs:") + basePath.string(); }
   bool exclusive() const override { return mode == Mode::EXCLUSIVE && lock.has_value(); }
   std::string diskPath() const override { return basePath.string(); }
+  // This node's private root, or empty when the factory does not own it.
+  std::string nodePrivatePath() const { return unowned ? std::string() : privatePath.string(); }
   std::shared_ptr<Directory> directory(StorageRoot root, std::string_view relative, ViewOptions options = {}) override {
     auto path = pathOf(root, relative);
     return std::make_shared<FSDirectory>(path, basePath, parentsOf(path), publishTemps);

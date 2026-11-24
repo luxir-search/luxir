@@ -86,7 +86,7 @@ struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct RowSpaceStats; struct AuxStats;
-struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats;
+struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats; struct InflightRequestStats; struct UncleanExitStats;
 struct HistogramStats; struct ActivityStats; struct TransportStats; struct ServiceStats; struct SystemStats;
 struct HostStats; struct SearchFanoutStats; struct OutcomeStats; struct CollectionActivityStats; struct ProcessIoStats;
 struct ProcessStats; struct CpuTimes; struct HostCpuStats; struct HostMemoryStats; struct NetworkInterfaceStats;
@@ -802,6 +802,32 @@ struct ScrubStats {
   uint64_t errors = 0;
   uint64_t last_pass_end = 0;
 };
+struct InflightRequestStats {
+  uint64_t started = 0;
+  std::string_view kind;
+  std::string_view transport;
+  std::string_view phase;
+  std::string_view tenant;
+  std::string_view collection;
+  std::string_view request_id;
+  std::string_view operation;
+  int32_t max_parallel = 0;
+};
+struct UncleanExitStats {
+  uint64_t started = 0;
+  uint64_t last_sample = 0;
+  uint64_t resident_bytes = 0;
+  uint64_t resident_peak_bytes = 0;
+  int64_t cgroup_bytes = 0;
+  int64_t cgroup_max_bytes = 0;
+  uint64_t detected = 0;
+  uint64_t untracked = 0;
+  std::string_view cause;
+  std::string_view detail;
+  std::string_view version;
+  std::span<const InflightRequestStats> requests;
+  uint32_t pid = 0;
+};
 struct StatsResponse {
   std::optional<StatsTotals> totals;
   std::span<const CollectionStats> collections;
@@ -812,6 +838,7 @@ struct StatsResponse {
   std::optional<HostStats> host;
   double duration_seconds = 0;
   std::optional<ScrubStats> scrub;
+  std::optional<UncleanExitStats> unclean_exit;
 };
 struct CacheControlRequest {
   std::string_view collection;
@@ -1336,7 +1363,7 @@ LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(Li
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(OutcomeStats) LUXIR_TD(CollectionActivityStats) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(RowSpaceStats) LUXIR_TD(AuxStats)
 LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
-LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats) LUXIR_TD(ScrubStats)
+LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats) LUXIR_TD(ScrubStats) LUXIR_TD(InflightRequestStats) LUXIR_TD(UncleanExitStats)
 LUXIR_TD(HistogramStats) LUXIR_TD(ActivityStats) LUXIR_TD(TransportStats) LUXIR_TD(ServiceStats) LUXIR_TD(HostStats) LUXIR_TD(SystemStats) LUXIR_TD(ProcessIoStats) LUXIR_TD(ProcessStats) LUXIR_TD(CpuTimes) LUXIR_TD(HostCpuStats) LUXIR_TD(HostMemoryStats) LUXIR_TD(NetworkInterfaceStats) LUXIR_TD(TcpStats) LUXIR_TD(DiskStats) LUXIR_TD(FilesystemStats) LUXIR_TD(PressureStats) LUXIR_TD(CgroupStats) LUXIR_TD(CgroupMemoryStats) LUXIR_TD(CgroupCpuStats) LUXIR_TD(CgroupTaskStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump) LUXIR_TD(CacheValueDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
@@ -1387,7 +1414,7 @@ LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_EN
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(RowSpaceStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
 LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(ArenaStats)
-LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(FieldMetadataStats) LUXIR_ENTRY(MemoryStats) LUXIR_ENTRY(ScrubStats)
+LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(FieldMetadataStats) LUXIR_ENTRY(MemoryStats) LUXIR_ENTRY(ScrubStats) LUXIR_ENTRY(InflightRequestStats) LUXIR_ENTRY(UncleanExitStats)
 LUXIR_ENTRY(HistogramStats) LUXIR_ENTRY(ActivityStats) LUXIR_ENTRY(TransportStats) LUXIR_ENTRY(ServiceStats) LUXIR_ENTRY(HostStats) LUXIR_ENTRY(SystemStats) LUXIR_ENTRY(ProcessIoStats) LUXIR_ENTRY(ProcessStats) LUXIR_ENTRY(CpuTimes) LUXIR_ENTRY(HostCpuStats) LUXIR_ENTRY(HostMemoryStats) LUXIR_ENTRY(NetworkInterfaceStats) LUXIR_ENTRY(TcpStats) LUXIR_ENTRY(DiskStats) LUXIR_ENTRY(FilesystemStats) LUXIR_ENTRY(PressureStats) LUXIR_ENTRY(CgroupStats) LUXIR_ENTRY(CgroupMemoryStats) LUXIR_ENTRY(CgroupCpuStats) LUXIR_ENTRY(CgroupTaskStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump) LUXIR_ENTRY(CacheValueDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
