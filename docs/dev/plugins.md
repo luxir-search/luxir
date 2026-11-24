@@ -327,6 +327,10 @@ Rules:
   when it next loads, for queries and new documents alike.
 - The fused `unicode_word` + `nfkc_cf` fast path applies only to exactly those built-in
   components; plugin stages always run as written.
+- `Token` carries more than its text, offsets and `positionIncrement`. The whole chain shares
+  one `Token`, so a filter that rewrites or drops tokens in place forwards every attribute;
+  one that buffers tokens past the current pull saves and restores what it needs. See
+  [Token attributes](#token-attributes).
 - A collection whose persisted schema names a component this binary does not have fails to
   load with the "unknown ..." message; the node keeps serving its other collections.
 
@@ -366,6 +370,54 @@ A schema then uses the plugin by name (`"analyzer": "example"`) or composes its 
 (`"analyzer": {"tokenizer": "whitespace", "filters": ["example_reverse"]}`).
 Text is fed to a chain with `TokenChain::setValue`, never `head.setValue`, so char filters
 always run.
+
+### Token attributes
+
+Besides `text`, `positionIncrement` and the offsets, a `Token` carries `positionLength` and
+the class and script of its input word:
+
+| Attribute | Default | Meaning |
+|---|---|---|
+| `positionLength` | 1 | Positions the token spans: its arc length in the token graph (Lucene's `PositionLengthAttribute`), 2 for a synonym covering two source words. `uint16_t`, reset by `Token::clear()` when a tokenizer starts a token. |
+| `wordClass()` | | `WordClass`: `ALPHA` (letters, ideographs included), `NUMERIC` (digits), `ALNUM` (both), `OTHER` (neither, such as emoji). |
+| `script()` | | `Script` of the first letter that has one: `LATIN`, `HAN`, `HIRAGANA`, `KATAKANA`, `HANGUL`, `THAI`, `ARABIC`, `CYRILLIC`, `GREEK`, `OTHER`; `COMMON` when there is no letter (digits) or no letter belongs to a script. |
+
+Letters are the code points of general category L*, numbers those of N* (so U+2163 ROMAN
+NUMERAL FOUR is numeric); marks, symbols and punctuation inside a word are neither.
+`scriptOf(char32_t)` is the per-code-point script lookup.
+
+`wordClass()` and `script()` describe the token's input word: the tokenizer input bytes in
+`[startOffset, endOffset)`, which `Token::inputText()` returns (after char filters, before any
+token filter). A filter that rewrites `text` does not change them: U+2163 folded to `iv` by
+`nfkc_cf` is still `NUMERIC`. A filter that wants the class of some other bytes, such as the
+text it produced, calls `classifyWord(std::string_view)`, which returns both. A CJK bigram
+filter can branch on `token.script() == Script::HAN` instead of guessing from the first byte.
+
+Both are computed on the first read and cached in `knownClass` and `knownScript` (`UNKNOWN`
+until then), so a chain whose filters never ask pays nothing. `unicode_word` stores them for the
+words its ASCII scan already classified; every other word, and every token of `whitespace`,
+`keyword` or a plugin tokenizer, is classified from its input bytes when a filter first asks.
+A plugin tokenizer that knows a token's class can store both fields itself, after
+`setOffset`.
+
+`Token::setOffset` resets the cache: a new span is a new input word. A filter that splits or
+merges tokens gives each its span with `setOffset` (never by assigning the offsets), and
+readers then see the class of the new span. A buffering filter that restores a saved token restores its
+offsets with `setOffset` and gets the class recomputed on read, unless it also saved and
+restores `knownClass` and `knownScript` after the call.
+
+`positionLength`, `knownClass` and `knownScript` sit next to `positionIncrement`, so `clear()`
+resets all four with one 8-byte store (`Analyzer.h` has a `static_assert`).
+
+`positionLength` is carried and nothing reads it yet. Postings store only each term's start
+position (as Lucene's do), and phrase queries are built from position increments, so a
+token spanning several positions indexes and matches exactly like a one-position token.
+Honouring it needs a query-side graph (a phrase over alternative paths); a filter that
+produces graph tokens can set it today and a later query builder can consume it.
+
+`TokenAttributesExampleTest` shows a plugin filter (`describe`) reading all three, through
+`wordClass()` and `script()`, on fused and unfused chains, and the example `span2` filter
+setting `positionLength`.
 
 ## Storage backends and layers
 
