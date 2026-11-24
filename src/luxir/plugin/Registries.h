@@ -9,6 +9,7 @@
 #include "luxir/query/QueryRegistry.h"
 #include "luxir/schema/FieldTypeRegistry.h"
 #include "luxir/search/SearchOpRegistry.h"
+#include "luxir/search/SortKindRegistry.h"
 #include "luxir/server/HttpRouteRegistry.h"
 
 namespace luxir {
@@ -25,6 +26,8 @@ struct Registries {
   QueryRegistry& query;
   // Plugin search operations (api::PluginOp).
   SearchOpRegistry& searchOps;
+  // Plugin sort kinds: name(args...) claimed at the root of a sort expression.
+  SortKindRegistry& sortKinds;
   // Plugin HTTP routes.
   HttpRouteRegistry& http;
   HitDecoratorRegistry& hitDecorators;

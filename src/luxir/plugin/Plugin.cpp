@@ -41,8 +41,11 @@ PluginRegistry& PluginRegistry::global() {
 
 Registries Registries::global() {
   return {PluginRegistry::global(), AnalysisRegistry::global(), StorageRegistry::global(), FieldTypeRegistry::global(),
-          QueryRegistry::global(), SearchOpRegistry::global(), HttpRouteRegistry::global(), HitDecoratorRegistry::global()};
+          QueryRegistry::global(), SearchOpRegistry::global(), SortKindRegistry::global(), HttpRouteRegistry::global(),
+          HitDecoratorRegistry::global()};
 }
+
+const SortKindRegistry& globalSortKindRegistry() { return SortKindRegistry::global(); }
 
 const FieldTypeRegistry& globalFieldTypeRegistry() { return FieldTypeRegistry::global(); }
 
@@ -53,6 +56,7 @@ void Registries::freeze() {
   fieldTypes.freeze();
   query.freeze();
   searchOps.freeze();
+  sortKinds.freeze();
   http.freeze();
   hitDecorators.freeze();
 }

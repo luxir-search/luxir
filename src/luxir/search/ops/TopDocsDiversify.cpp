@@ -59,7 +59,8 @@ void TopDocsReq::fillDiversifyResponse(CalcBase& calc, MergeableCollector& data)
         topDocsProto.fields, topDocsProto.batch_size, topDocsProto.offset,
         requirements.needsCount(), topDocsProto.get_scores, topDocsProto.document_format,
         calc.underBucketSlot() ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM,
-        {}, false, false, {}, decorators);
+        {}, false, false, {}, decorators,
+        data.useFieldSort ? sortValuesUnder(sortPlan, *view, flags) : DocSortValues{});
   };
   if (data.useFieldSort) emit(*data.diverseFieldCollector);
   else emit(*data.diverseScoreCollector);
