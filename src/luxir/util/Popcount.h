@@ -78,18 +78,23 @@ inline LUXIR_INLINE uint64_t hamming(const uint8_t* a, const uint8_t* b, size_t 
   uint64_t count = 0;
   size_t i = 0;
 #if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512BW__)
-  __m512i acc = _mm512_setzero_si512();
-  for (; i + CHUNK_BYTES <= n; i += CHUNK_BYTES) {
-    acc = _mm512_add_epi64(acc, lanes(_mm512_xor_si512(_mm512_loadu_si512(a + i), _mm512_loadu_si512(b + i))));
+  // Zen 5, VPOPCNTDQ vs scalar in ns/row: 1.70 vs 0.94 at 8 bytes,
+  // 1.78 vs 1.27 at 16, 1.88 vs 1.60 at 24, 1.73 vs 1.96 at 32,
+  // and 2.25 vs 4.75 at 96. Use scalar below 32 bytes.
+  if (n >= 32) {
+    __m512i acc = _mm512_setzero_si512();
+    for (; i + CHUNK_BYTES <= n; i += CHUNK_BYTES) {
+      acc = _mm512_add_epi64(acc, lanes(_mm512_xor_si512(_mm512_loadu_si512(a + i), _mm512_loadu_si512(b + i))));
+    }
+    if (i < n) {
+      // Masked loads read only the remaining bytes, never past the row.
+      __mmask64 mask = ((uint64_t)1 << (n - i)) - 1;
+      acc = _mm512_add_epi64(acc, lanes(_mm512_xor_si512(_mm512_maskz_loadu_epi8(mask, a + i),
+                                                         _mm512_maskz_loadu_epi8(mask, b + i))));
+      i = n;
+    }
+    count = (uint64_t)_mm512_reduce_add_epi64(acc);
   }
-  if (i < n) {
-    // Masked loads read only the remaining bytes, never past the row.
-    __mmask64 mask = ((uint64_t)1 << (n - i)) - 1;
-    acc = _mm512_add_epi64(acc, lanes(_mm512_xor_si512(_mm512_maskz_loadu_epi8(mask, a + i),
-                                                       _mm512_maskz_loadu_epi8(mask, b + i))));
-    i = n;
-  }
-  count = (uint64_t)_mm512_reduce_add_epi64(acc);
 #elif defined(__AVX2__)
   // The nibble table pays for its setup and reduction from two chunks on:
   // below 64 bytes the 64-bit popcount loop is faster (25% at 32 bytes),
