@@ -2771,6 +2771,49 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         }
       }
 
+      // Pick a side for each vector field before admission, so an early
+      // minority segment cannot keep the majority from merging.
+      struct EncodingVote {
+        VectorEncoding first;
+        size_t bit = 0;
+        size_t floating = 0;
+        VectorEncoding selected = first;
+      };
+      struct Candidate {
+        std::shared_ptr<SegmentCore> core;
+        std::vector<std::pair<std::string_view, VectorEncoding>> encodings;
+      };
+      boost::unordered_flat_map<std::string_view, EncodingVote> votes;
+      std::vector<Candidate> candidates;
+      candidates.reserve(segs.size());
+      for (auto* seg : segs) {
+        auto& candidate = candidates.emplace_back(getSegmentCore(*seg));
+        for (const auto& space : candidate.core->spaces()) {
+          auto& reader = *candidate.core->spaceReader(space.path);
+          for (int32_t ordinal = 0; ordinal < reader.numFields(); ++ordinal) {
+            auto header = reader.fieldHeader(ordinal);
+            if (FieldType::storage(header.type) != FieldType::Storage::VECTOR) continue;
+            const auto* record = reader.fieldInfo(ordinal);
+            if (!record->bytesColumn()) continue;
+            auto encoding = VectorReader::encodingOf(*record);
+            std::string_view name(record->name);
+            candidate.encodings.emplace_back(name, encoding);
+            auto& vote = votes.try_emplace(name, EncodingVote{encoding}).first->second;
+            if (encoding == VectorEncoding::BIT) ++vote.bit;
+            else ++vote.floating;
+          }
+        }
+      }
+      auto schema = getSchema();
+      for (auto& [name, vote] : votes) {
+        if (vote.bit == 0 || vote.floating == 0) continue;
+        if (vote.bit != vote.floating) {
+          vote.selected = vote.bit > vote.floating ? VectorEncoding::BIT : VectorEncoding::F32;
+        } else if (auto* type = dynamic_cast<const VectorFieldType*>(schema->getFieldTypePtr(name))) {
+          vote.selected = type->encoding();
+        }
+      }
+
       // Segment-local ords are signed int32. Admit only sources whose summed
       // per-field term dictionaries remain below the flush-side limit. Text
       // dictionaries are exempt because they do not produce an ord column.
@@ -2785,14 +2828,23 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       boost::unordered_flat_map<std::string, int64_t> pathRows;
       std::vector<SegInfo*> admitted;
       admitted.reserve(segs.size());
-      for (SegInfo* seg : segs) {
+      for (size_t i = 0; i < segs.size(); ++i) {
+        auto* seg = segs[i];
+        const auto& candidate = candidates[i];
+        auto incompatible = std::ranges::find_if(candidate.encodings, [&](const auto& column) {
+          return !vcodec::convertible(column.second, votes.at(column.first).selected);
+        });
+        if (incompatible != candidate.encodings.end()) {
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because vector field '{}' is outside the selected encoding group",
+                      seg->name(), incompatible->first);
+          continue;
+        }
         if (!MergeCostModel::docsFit(mergedDocs, seg->liveDocs)) {
           INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because the merged segment would exceed MAX_SEGMENT_DOCS",
                       seg->name());
           continue;
         }
-        auto postingsReaderCore = getSegmentCore(*seg);
-        MemPool metadataPool;
+        const auto& postingsReaderCore = candidate.core;
         boost::unordered_flat_map<std::string, int64_t> additions;
         boost::unordered_flat_map<std::string, int64_t> vectorAdditions;
         auto fieldsFit = [&](PostingsReader& reader) {
@@ -2822,8 +2874,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         };
         bool fits = fieldsFit(postingsReaderCore->rootReader());
         std::vector<std::pair<std::string, int64_t>> nextRows;
-        for (size_t i = 1; fits && i < postingsReaderCore->spaces().size(); i++) {
-          const auto& space = postingsReaderCore->spaces()[i];
+        for (size_t j = 1; fits && j < postingsReaderCore->spaces().size(); j++) {
+          const auto& space = postingsReaderCore->spaces()[j];
           // Physical rows bound the merged space from above: rows of deleted
           // roots still count, so a merge that would fit once they are dropped
           // can be skipped.
