@@ -153,35 +153,67 @@ std::shared_ptr<LiveDocs> ChildLiveDocs::get() {
   });
 }
 
+namespace {
+
+struct LiveFile {
+  std::shared_ptr<InputFile> file;  // Null when the file is missing.
+  std::string name;
+  std::string segment;
+  uint64_t size = 0;
+};
+
+// Opens the live docs file of generation `liveGen`. `size` is the manifest's,
+// zero when unknown; a file of another size is corrupt.
+LiveFile openLiveFile(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch,
+                      uint64_t size, bool missingFileOK, bool expectSynced) {
+  LiveFile live;
+  live.segment = Postings::segmentKey(segId, creatorEpoch);
+  live.name = Postings::getLiveDocsFileName(live.segment, liveGen, liveEpoch);
+  // With the manifest's size, size() needs no request; see Directory::openFile.
+  live.file = dir.openFile(live.name, {.expectSynced = expectSynced, .size = size});
+  if (!live.file) {
+    if (missingFileOK) {
+      IREADER_DEBUG("Delete file {} not found for segment s{} (liveGen={})", live.name, live.segment, liveGen);
+      return live;
+    }
+    throw std::filesystem::filesystem_error(
+        std::format("Delete file {} not found for segment s{} (liveGen={})", live.name, live.segment, liveGen),
+        std::make_error_code(std::errc::no_such_file_or_directory));
+  }
+  live.size = live.file->size();
+  if (size && live.size != size) {
+    corruptSegment(live.segment, std::format("live docs file '{}': size {} differs from the manifest's {}",
+                                             live.name, live.size, size));
+  }
+  return live;
+}
+
+} // namespace
+
 std::shared_ptr<SegmentLive> SegmentLive::open(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
                                                uint64_t liveEpoch, int32_t maxDoc, int32_t numLive, uint64_t size,
                                                bool missingFileOK, bool expectSynced) {
-  assert(liveGen > 0 && maxDoc > 0);
-  auto segment = Postings::segmentKey(segId, creatorEpoch);
-  auto name = Postings::getLiveDocsFileName(segment, liveGen, liveEpoch);
-  auto file = dir.openFile(name, {.expectSynced = expectSynced, .size = size});
-  if (!file) {
-    if (missingFileOK) {
-      IREADER_DEBUG("Delete file {} not found for segment s{} (liveGen={})", name, segment, liveGen);
-      return nullptr;
-    }
-    throw std::filesystem::filesystem_error(
-        std::format("Delete file {} not found for segment s{} (liveGen={})", name, segment, liveGen),
-        std::make_error_code(std::errc::no_such_file_or_directory));
-  }
-  // As for segment files: trust the manifest's size unless the file is local.
-  if (!size || file->holdsFree()) size = file->size();
-  return std::make_shared<SegmentLive>(std::move(file), std::move(name), std::move(segment), size, maxDoc, numLive);
+  assert(liveGen > 0 && maxDoc > 0 && numLive >= 0);
+  auto live = openLiveFile(dir, segId, creatorEpoch, liveGen, liveEpoch, size, missingFileOK, expectSynced);
+  if (!live.file) return nullptr;
+  return std::make_shared<SegmentLive>(std::move(live.file), std::move(live.name), std::move(live.segment),
+                                       live.size, maxDoc, numLive);
 }
 
 std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
                                            uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
-  auto live = SegmentLive::open(dir, segId, creatorEpoch, liveGen, liveEpoch, maxDoc, -1, 0, missingFileOK, expectSynced);
-  return live ? live->shared() : nullptr;
+  assert(liveGen > 0 && maxDoc > 0);
+  auto live = openLiveFile(dir, segId, creatorEpoch, liveGen, liveEpoch, 0, missingFileOK, expectSynced);
+  return live.file ? decode(std::move(live.file), live.size, live.name, live.segment, maxDoc, -1) : nullptr;
 }
 
 std::shared_ptr<LiveDocs> SegmentLive::shared() {
-  return value.getOrCreate([this] { return LiveDocs::decode(file, fileSize, name, segment, maxDoc, liveCount); });
+  return value.getOrCreate([this] {
+    auto docs = LiveDocs::decode(file, fileSize, name, segment, maxDoc, liveCount);
+    // A mapped bitmap keeps its own reference, and an expanded one is done with the file.
+    file.reset();
+    return docs;
+  });
 }
 
 std::shared_ptr<LiveDocs> LiveDocs::decode(std::shared_ptr<InputFile> file, uint64_t size, std::string_view name,
@@ -427,6 +459,14 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
           // Failed to create SegmentCore (segment files not found) - trigger retry
           retry = true;
           break; // Break out of the segments loop to retry
+        }
+
+        // Counts come from the manifest before any live docs file is read, so
+        // a count the generation cannot have is rejected here.
+        if (liveGen > 0 ? segment.live_docs < 0 || segment.live_docs >= nDocs : segment.live_docs != nDocs) {
+          corruptSegment(Postings::segmentKey(segId, segment.creator_epoch),
+                         std::format("manifest records {} live of {} rows at live generation {}",
+                                     (int32_t)segment.live_docs, nDocs, liveGen));
         }
 
         // Opened here and decoded on first use; the live count is the manifest's.
