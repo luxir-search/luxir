@@ -15,6 +15,9 @@
 #include <string_view>
 #include <vector>
 
+#include <faiss/IndexFlat.h>
+#include <sys/resource.h>
+
 #include "bench/luxir_bench.h"
 #include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/query/KnnQuery.h"
@@ -128,6 +131,35 @@ struct IvfBenchGuard {
     // thread for A/B comparison. PQ codebooks still train per sub-quantizer.
     if (const char* rows = std::getenv("LUXIR_BENCH_IVF_MIN_ROWS")) {
       VectorIndexBuilder::ivfBuildMinRowsPerTask = std::atoll(rows);
+    }
+  }
+};
+
+// IVF training knobs for A/B runs from one binary: LUXIR_IVF_TRAINER (lloyd
+// or emeans), LUXIR_IVF_EPOCHS (e-means passes), LUXIR_IVF_POINTS (training
+// vectors per centroid) and LUXIR_IVF_SEED (clustering seed).
+struct IvfTrainingBenchGuard {
+  SearchOverridesGuard<VectorIndexBuilder::Trainer, double, int64_t, int32_t> saved{
+    VectorIndexBuilder::ivfTrainer, VectorIndexBuilder::ivfEMeansEpochs,
+    VectorIndexBuilder::ivfTrainingPointsPerCentroid, VectorIndexBuilder::ivfTrainingSeed};
+
+  IvfTrainingBenchGuard() {
+    if (const char* trainer = std::getenv("LUXIR_IVF_TRAINER"); trainer && *trainer) {
+      std::string_view name(trainer);
+      if (name != "lloyd" && name != "emeans") {
+        throw std::invalid_argument("LUXIR_IVF_TRAINER must be lloyd or emeans");
+      }
+      VectorIndexBuilder::ivfTrainer = name == "lloyd"
+          ? VectorIndexBuilder::Trainer::LLOYD : VectorIndexBuilder::Trainer::EMEANS;
+    }
+    if (const char* epochs = std::getenv("LUXIR_IVF_EPOCHS"); epochs && *epochs) {
+      VectorIndexBuilder::ivfEMeansEpochs = std::atof(epochs);
+    }
+    if (const char* points = std::getenv("LUXIR_IVF_POINTS"); points && *points) {
+      VectorIndexBuilder::ivfTrainingPointsPerCentroid = std::atoll(points);
+    }
+    if (const char* seed = std::getenv("LUXIR_IVF_SEED"); seed && *seed) {
+      VectorIndexBuilder::ivfTrainingSeed = std::atoi(seed);
     }
   }
 };
@@ -1306,6 +1338,7 @@ void BM_VectorAnnDataset(benchmark::State& state) {
   CollectionHelper helper("main");
   static int32_t builtCodec = -1;
   static double buildSecs = 0;
+  static double trainSecs = 0;
   static double overlayBytes = 0;
   static int32_t overlaySegments = 0;
   static std::vector<std::vector<std::string>> truth;
@@ -1323,9 +1356,12 @@ void BM_VectorAnnDataset(benchmark::State& state) {
       if ((i + 1) % perSeg == 0 || i + 1 == ds->nBase) helper.commit();
     }
     // Production build policy and schema settings; only the aux commit is timed.
+    IvfTrainingBenchGuard training;
+    int64_t trainMicros = VectorIndexBuilder::ivfTrainingMicrosForTests.load();
     auto start = std::chrono::steady_clock::now();
     helper.commit({"vec.bench_v"});
     buildSecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    trainSecs = (double)(VectorIndexBuilder::ivfTrainingMicrosForTests.load() - trainMicros) / 1e6;
     overlayBytes = 0;
     overlaySegments = 0;
     for (const auto& seg : helper.getIndexWriter()->stats(true).segmentStats) {
@@ -1420,6 +1456,7 @@ void BM_VectorAnnDataset(benchmark::State& state) {
   state.counters["unsupported_floors"] = (double)stats.unsupportedFloors.load();
   state.counters["unsupported_floor_shortfall"] = (double)stats.unsupportedFloorShortfall.load();
   state.counters["buildSecs"] = buildSecs;
+  state.counters["trainSecs"] = trainSecs;
   state.counters["bytesPerVec"] = overlayBytes / (double)ds->nBase;
   state.counters["overlaySegs"] = (double)overlaySegments;
   state.counters["nBase"] = (double)ds->nBase;
@@ -1427,6 +1464,81 @@ void BM_VectorAnnDataset(benchmark::State& state) {
   state.counters["nprobe"] = (double)nprobe;
   state.counters["cand"] = (double)cand;
   state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
+double processCpuSeconds() {
+  rusage usage{};
+  getrusage(RUSAGE_SELF, &usage);
+  auto secs = [](const timeval& t) { return (double)t.tv_sec + (double)t.tv_usec / 1e6; };
+  return secs(usage.ru_utime) + secs(usage.ru_stime);
+}
+
+// IVF centroid training alone on LUXIR_VECTOR_DATASET (see BM_VectorAnnDataset):
+// the builder's strided sample of `points` rows per list (nlist from
+// LUXIR_VECTOR_NLIST or the sqrt(N) default), trained by `trainer` (0 Lloyd,
+// 1 e-means at epochs10 / 10 passes).  Reports wall and process CPU seconds (CPU time is
+// robust to other load on the machine) and, over every base row, the
+// clustering loss (mean squared L2 distance, or mean 1 - cosine) and the list
+// imbalance nlist * sum(n_j^2) / N^2: the mean size, relative to an even
+// split, of the list a row falls in.  Probes budget vectors, so oversized
+// lists crowd others out of a query's probe set.
+void BM_VectorIvfTraining(benchmark::State& state) {
+  const VectorDataset* ds = VectorDataset::get();
+  if (skipBenchIfDataMissing(state, ds != nullptr, "LUXIR_VECTOR_DATASET")) return;
+  SearchOverridesGuard saved(VectorIndexBuilder::ivfTrainer, VectorIndexBuilder::ivfEMeansEpochs);
+  VectorIndexBuilder::ivfTrainer = state.range(0) == 0 ? VectorIndexBuilder::Trainer::LLOYD
+                                                       : VectorIndexBuilder::Trainer::EMEANS;
+  VectorIndexBuilder::ivfEMeansEpochs = (double)state.range(1) / 10;
+  int64_t points = state.range(2);
+  const char* nlistEnv = std::getenv("LUXIR_VECTOR_NLIST");
+  int32_t nlist = nlistEnv ? std::atoi(nlistEnv) : defaultIvfNList(ds->nBase);
+  int32_t dims = ds->dims;
+  bool cosine = ds->metric == api::VectorMetric::COSINE;
+  faiss::MetricType metric = ds->metric == api::VectorMetric::L2 ? faiss::METRIC_L2
+                                                                  : faiss::METRIC_INNER_PRODUCT;
+  static std::vector<float> base;  // the corpus in index space, shared across instances
+  if (base.empty()) {
+    base.assign(ds->data.begin(), ds->data.begin() + ds->nBase * dims);
+    if (cosine) faiss::fvec_renorm_L2((size_t)dims, (size_t)ds->nBase, base.data());
+  }
+  int64_t ntrain = std::min<int64_t>(ds->nBase, points * nlist);
+  std::vector<float> sample((size_t)ntrain * dims);
+  for (int64_t i = 0; i < ntrain; i++) {
+    std::copy_n(base.data() + (i * ds->nBase / ntrain) * dims, dims, sample.data() + i * dims);
+  }
+
+  auto quantizer = VectorIndexBuilder::newCoarseQuantizer(dims, metric);
+  double wall = 0, cpu = 0;
+  for (auto _ : state) {
+    auto wallStart = std::chrono::steady_clock::now();
+    double cpuStart = processCpuSeconds();
+    VectorIndexBuilder::trainCoarseQuantizer(ntrain, sample.data(), nlist, *quantizer,
+                                             VectorIndexBuilder::ivfTrainer);
+    cpu += processCpuSeconds() - cpuStart;
+    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - wallStart).count();
+    wall += elapsed;
+    state.SetIterationTime(elapsed);
+  }
+
+  std::vector<float> distances((size_t)ds->nBase);
+  std::vector<faiss::idx_t> labels((size_t)ds->nBase);
+  quantizer->search(ds->nBase, base.data(), 1, distances.data(), labels.data());
+  double loss = 0;
+  std::vector<double> sizes((size_t)nlist);
+  for (int64_t i = 0; i < ds->nBase; i++) {
+    loss += metric == faiss::METRIC_L2 ? (double)distances[(size_t)i] : 1.0 - (double)distances[(size_t)i];
+    sizes[(size_t)labels[(size_t)i]] += 1;
+  }
+  double squares = 0;
+  for (double size : sizes) squares += size * size;
+  double iterations = (double)state.iterations();
+  state.counters["wallSecs"] = wall / iterations;
+  state.counters["cpuSecs"] = cpu / iterations;
+  state.counters["loss"] = loss / (double)ds->nBase;
+  state.counters["imbalance"] = (double)nlist * squares / ((double)ds->nBase * (double)ds->nBase);
+  state.counters["nlist"] = nlist;
+  state.counters["ntrain"] = (double)ntrain;
+  state.counters["dims"] = dims;
 }
 
 }  // namespace
@@ -1447,6 +1559,14 @@ TUNING_BENCHMARK(BM_VectorAnnDataset)->ArgNames({"codec", "nprobe", "cand"})
       datasetSweep(b, PQ);
       datasetSweep(b, PQ_D8);
     })->UseRealTime()->MinTime(2.0);
+
+// Lloyd (IndexIVF's 10 iterations) against e-means at 2, 3 and 5 passes over
+// the default sample, and 2 passes over the 2.5x larger sample that the
+// cheaper passes afford.
+BENCHMARK(BM_VectorIvfTraining)->Name("Tuning/BM_VectorIvfTraining")
+    ->ArgNames({"trainer", "epochs10", "points"})
+    ->Args({0, 0, 100})->Args({1, 20, 100})->Args({1, 30, 100})->Args({1, 50, 100})
+    ->Args({1, 20, 250})->UseManualTime()->Iterations(1);
 
 // Plain BENCHMARK: manual time is incompatible with the UseRealTime() that
 // LUXIR_BENCHMARK appends.

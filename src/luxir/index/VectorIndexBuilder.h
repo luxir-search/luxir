@@ -17,6 +17,10 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/reader/PostingsReader.h"
 
+namespace faiss {
+struct IndexFlat;
+}
+
 namespace luxir {
 
 class IndexRamBudget;
@@ -69,7 +73,18 @@ public:
   // floor still applies.
   static int64_t ivfTrainingPointsPerCentroid;
   static size_t ivfTrainingSampleMaxBytes;
+  // Clustering for the lists of RaBitQ overlays: EMEANS (EMeans.h), or
+  // LLOYD, the 10-iteration FAISS k-means IndexIVF trains with.  PQ overlays
+  // train their lists and codebooks with LLOYD.
+  enum class Trainer { LLOYD, EMEANS };
+  static Trainer ivfTrainer;
+  // Passes e-means makes over the training sample.
+  static double ivfEMeansEpochs;
+  // Seed of the coarse quantizer's clustering (either trainer).
+  static int32_t ivfTrainingSeed;
   static std::atomic<int64_t> ivfLastTrainingVectorsForTests;
+  // Cumulative wall time spent training (IVF lists, and PQ codebooks).
+  static std::atomic<int64_t> ivfTrainingMicrosForTests;
   // Add chunk input-byte target. Chunks also hold at least four row tasks
   // per arena compute slot, capped by available vectors.
   static size_t ivfAddChunkBytes;
@@ -84,6 +99,14 @@ public:
   // amplitude stored beside the code. x and centroid are in the rotated space.
   static float finishRaBitQCode(const float* x, const float* centroid, uint8_t* code,
                                 int32_t dims, int32_t bits, faiss::MetricType metric);
+
+  // An empty coarse quantizer whose batch searches split rows across TBB
+  // tasks, and its training on n rows of x (in the index's space): nlist
+  // centroids by trainer, spherical for inner product.
+  static std::unique_ptr<faiss::IndexFlat> newCoarseQuantizer(int32_t dims,
+                                                              faiss::MetricType metric);
+  static void trainCoarseQuantizer(int64_t n, const float* x, int32_t nlist,
+                                   faiss::IndexFlat& quantizer, Trainer trainer);
 
   // Seed of the RaBitQ random rotation.  Fixed so every overlay of a given
   // dims shares one transform (deduplicated in RAM by internVectorRotation).

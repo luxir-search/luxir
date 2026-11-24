@@ -399,6 +399,78 @@ bytes directly to FAISS; f16, bf16 and sq8 columns decode one chunk at a time in
 an owned buffer, normalized in place for cosine. The serialized header's `nprobe` is unused by Luxir:
 searches supply explicit probe parameters or selected lists.
 
+### Clustering
+
+The IVF lists of RaBitQ overlays are trained with e-means
+(`index/EMeans.h`; Bessa et al., "e-means: outperforming k-means (in one-tenth
+the epochs)", arXiv:2611.09501), ported from the FAISS reference in
+`contrib/e_means`. It is mini-batch k-means whose centroids are exponential
+moving averages of per-batch cluster sums and counts. The step follows a
+cosine schedule, and clusters whose mass falls below 0.1 of the mean are
+revived by splitting a donor drawn in proportion to mass. The closing
+centroids are the means of the last pass's assignments. The batch size and
+initial step come from the reference's fitted scaling laws, so there is
+nothing to tune per corpus. One pass costs about one Lloyd iteration, since
+both are dominated by assigning every sample row. The default is the
+reference's 5 passes (`ivfEMeansEpochs`), against the 10 Lloyd iterations
+`IndexIVF` training runs. Batch assignment uses the row-parallel coarse
+quantizer. Grouping rows by cluster makes the sums and EMA updates parallel
+across clusters without changing their order, so a seed gives the same
+centroids for a given thread count, as with Lloyd (the batch-distance
+kernels FAISS picks can vary with the row partition). Inner-product fields
+train spherically, as FAISS does: assignment uses unit centroid directions,
+and the closing centroids are unit.
+
+PQ overlays keep FAISS k-means for their lists and codebooks, unchanged. With
+e-means lists, PQ recall on Cohere-1024 was 0.0013 to 0.0024 lower than
+Lloyd's at every probe level in the mean over three seeds (nprobe 32: 0.9589
+against 0.9565). That is within Lloyd's seed-to-seed spread, driven mostly by
+one strong Lloyd seed, but larger than the RaBitQ gap on the same corpus. Training the codebooks with
+e-means as well changed neither PQ recall nor training time measurably: each
+codebook is 256 entries over at most 65,536 short residual slices, a small
+part of a PQ build.
+
+`Tuning/BM_VectorIvfTraining` trains the lists alone on a corpus sample
+(`LUXIR_VECTOR_DATASET`). It reports process CPU time, which is robust to
+other load, and the loss and the list imbalance `nlist * sum(n_j^2) / N^2`
+over every corpus row. With the default 100 sample rows per list, one run
+each:
+
+| Corpus | Trainer | CPU s | Loss | Imbalance |
+|---|---|---:|---:|---:|
+| Deep 2M, 96 d, L2 (1414 lists) | Lloyd, 10 iterations | 9.5 | 0.4640 | 1.180 |
+| | e-means, 5 passes | 3.7 | 0.4603 | 1.140 |
+| Cohere 1M, 1024 d, cosine (1000 lists) | Lloyd | 28.9 | 0.3430 | 1.185 |
+| | e-means | 16.1 | 0.3403 | 1.239 |
+| DBpedia 1M, 1536 d, cosine (999 lists) | Lloyd | 50.4 | 0.4456 | 1.244 |
+| | e-means | 26.7 | 0.4412 | 1.291 |
+
+e-means takes 1.8 to 2.6x less CPU for a lower loss. On the text embeddings
+its lists are less even than Lloyd's. The probe budget counts vectors, so
+oversized lists could crowd others out of a query's probe set, but recall at
+equal scan work holds (below).
+
+End to end, `BM_VectorAnnDataset` builds one segment with 1-bit RaBitQ and
+measures recall@10 against the exact path on 1000 held-out corpus rows.
+Recall is the mean over training seeds; both trainers score the same number
+of codes per query at each probe level, within 0.3%. Times are median wall
+seconds on a 28-thread machine that other jobs were loading. The Lloyd and
+e-means runs saw different load, so the time columns do not compare; the
+CPU table above does:
+
+| Corpus | Trainer | Default | nprobe 32 | 64 | 128 | Train s | Build s |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Deep 2M (3 seeds) | Lloyd | 0.9816 | 0.9754 | 0.9931 | 0.9985 | 0.87 | 2.54 |
+| | e-means | 0.9830 | 0.9780 | 0.9939 | 0.9987 | 0.71 | 1.65 |
+| Cohere 1M (3 seeds) | Lloyd | 0.9863 | 0.9590 | 0.9799 | 0.9912 | 2.61 | 7.96 |
+| | e-means | 0.9859 | 0.9574 | 0.9792 | 0.9905 | 1.65 | 6.07 |
+| DBpedia 500k (2 seeds) | Lloyd | 0.9767 | 0.9348 | 0.9667 | 0.9855 | 1.94 | 4.19 |
+| | e-means | 0.9786 | 0.9359 | 0.9674 | 0.9871 | 1.13 | 3.42 |
+
+e-means is ahead on Deep and DBpedia at every level and behind on Cohere by
+at most 0.0016. Lloyd's recall alone moves by up to 0.0063 between seeds
+(Cohere, nprobe 32).
+
 ### Build parallelism
 
 OpenBLAS is built serial (with locking for concurrent callers), and a build
