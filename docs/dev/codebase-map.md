@@ -179,9 +179,9 @@ locations, browse `src/luxir/<area>/`.
    - `VectorScorer` (`query/`): the one place a float query is scored against a stored row
      per encoding, shared by the flat column scan and candidate rescore. Uses FAISS
      scalar-quantizer computers for f16 and bf16, CPU-selected register kernels
-     (`query/Sq8Kernel.h`) for sq8, with a decode-first fallback, and popcount for
-     bit / hamming
-   - `util/Popcount.h`: population counts for hamming
+     (`query/Sq8Kernel.h`) for sq8, with a decode-first fallback, and a Hamming
+     kernel selected for the CPU and row size
+   - `query/HammingKernel.h`: runtime dispatch for bit / hamming popcount
    - `VectorTranscoder`: a vector column's encoding in a merge (the schema's current one),
      re-encoding inputs in another; `SegmentMerger` passes each value through it
    - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (RaBitQ by default, or explicit PQ) aux overlays for ANN, built from the decoded column

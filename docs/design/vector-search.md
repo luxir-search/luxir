@@ -123,17 +123,14 @@ flat scan and rescore score a row identically. Cosine over a non-f32 row always
 divides by the stored vector's norm, since a quantized unit vector is not
 exactly unit length.
 
-`hamming` scores a `bit` row as `1 - popcount(q ^ x) / dims`, where `q` is the
-query packed like a stored row once per scorer, in integers, so it is exact.
-`util/Popcount.h` holds the population counts `hamming` and `RaBitQScorer`
-share, chosen at compile time from the build's CPU target like the rest of the
-scoring code. VPOPCNTDQ counts 64-bit lanes directly, and NEON counts bytes.
-On AVX2 without VPOPCNTDQ both use the nibble shuffle table (Mula et al.).
-`hamming` uses scalar popcount below 32-byte rows with VPOPCNTDQ and below
-64-byte rows with AVX2. The AVX2 table is 1.5x to 1.8x faster in cache from
-128 bytes. Commits and merges build no ANN overlay for a `hamming` field
-(`VectorFieldType::annIndexable`): the column is a thirty-second of `f32`
-and is always scanned exactly.
+`hamming` scores a `bit` row as `1 - popcount(q ^ x) / dims`. The scorer
+packs the query once and selects an exact integer kernel for the CPU and row
+size (`query/HammingKernel.h`). Short rows use 64-bit word popcount. GCC
+x86-64 builds can select an AVX2 nibble shuffle table (Mula et al.) or
+AVX-512 VPOPCNTDQ with masked tail loads at run time. AArch64 builds with
+NEON can count bytes in 16-byte chunks. Commits and merges build no ANN
+overlay for a `hamming` field (`VectorFieldType::annIndexable`). The column
+is a thirty-second of `f32` and is always scanned exactly.
 
 ## Overlay Lifecycle
 
