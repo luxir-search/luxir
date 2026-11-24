@@ -802,7 +802,7 @@ public:
     // Disjoint postings make the expansion's docFreq sum exact. A cold sum
     // needs a dictionary walk; a resident sum needs only metadata. Deletes
     // and domains still need iteration.
-    CountShortcut countShortcut(IndexReader::Segment& segment,
+    CountShortcut countShortcutImpl(IndexReader::Segment& segment,
                                 DocSet* domain) override {
       auto* info = cachedFieldInfo == nullptr ? nullptr
           : cachedFieldInfo->segInfos.at(segment.ord);
@@ -830,7 +830,7 @@ public:
       return targetPool.make<Supplier>(*this, segment, targetPool);
     }
 
-    Query::Scorer* createScorer(
+    Query::Scorer* createScorerImpl(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       auto* supplier = scorerSupplier(targetPool, segment);
       Query::PlanContext planContext = scorerBuildContext(

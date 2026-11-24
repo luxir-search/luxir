@@ -70,7 +70,7 @@ public:
     public:
       explicit Prepared(QueryPrep::PreparedSource&& child) : child(std::move(child)) {}
 
-      Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+      Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) override {
         return QueryPrep::createScorer(targetPool, segment, child.segmentSource());
       }
 
@@ -109,7 +109,7 @@ public:
           | (childWeight->getFlags() & (IS_CONSTANT_SCORING | CONSUMES_DOMAIN));
     }
 
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& ctx) override {
       prepareCallsForTests.fetch_add(1, std::memory_order_relaxed);
       QueryPrep::PreparedSource source;
       source.weight = childWeight;
@@ -119,7 +119,7 @@ public:
       return std::make_unique<Prepared>(std::move(source));
     }
 
-    Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) override {
       return QueryPrep::createScorer(targetPool, segment, *childWeight);
     }
 
@@ -138,7 +138,7 @@ public:
       return childWeight->hasReleasableSegmentState();
     }
 
-    CountShortcut countShortcut(
+    CountShortcut countShortcutImpl(
         IndexReader::Segment& segment, DocSet* domain) override {
       return childWeight->countShortcut(segment, domain);
     }

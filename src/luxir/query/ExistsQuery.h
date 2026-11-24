@@ -120,7 +120,7 @@ public:
     }
 
     // Header totals include deleted docs, so a restricted segment needs iteration.
-    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+    CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
       const auto* info = segmentInfo(segment);
       return countBound(segment, domain, info ? info->docsWithField : 0,
                         CountHow::METADATA);
@@ -225,7 +225,7 @@ public:
       return targetPool.make<Supplier>(segment, *info, constantScore, needsScores());
     }
 
-    Query::Scorer* createScorer(
+    Query::Scorer* createScorerImpl(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
       if (supplier == nullptr) return nullptr;

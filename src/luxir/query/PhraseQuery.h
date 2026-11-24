@@ -744,7 +744,7 @@ public:
 
     };
 
-    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+    CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
       if (cachedFieldInfo == nullptr) return {0, CountHow::METADATA};
       int64_t ceiling = segment.maxDoc();
       for (auto* info : cachedTermInfos) {
@@ -760,7 +760,7 @@ public:
       return targetPool.make<Supplier>(*this, segment);
     }
 
-    Query::Scorer* createScorer(
+    Query::Scorer* createScorerImpl(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       auto* supplier = scorerSupplier(targetPool, segment);
       Query::PlanContext planContext = scorerBuildContext(

@@ -24,6 +24,7 @@
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
 #include "MultiTermBudget.h"
+#include "SegmentMask.h"
 #include "ExecutionProfile.h"
 #include "Warnings.h"
 #include "luxir/util/proto.h"
@@ -47,6 +48,7 @@
 namespace luxir {
 
 class CatalogSummaryView;
+class QueryPruning;
 
 class FanoutScope;
 class DocSet;
@@ -1193,7 +1195,16 @@ public:
 
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
   class SegmentSource {
+    friend class Context;
+    friend class Weight;
+    const SegmentMask* membership = nullptr;
+
   public:
+    bool provenEmpty(const IndexReader::Segment& segment) const noexcept {
+      return membership && !membership->test((size_t)segment.ord);
+    }
+    bool provenEmptyForCollection() const noexcept { return membership && membership->none(); }
+
     /// Drop refillable transient state only; preserve semantics and prepared
     /// results. Idempotent. No plan or scorer from this source for the segment
     /// may still be in use, including plans abandoned during route selection.
@@ -1206,6 +1217,7 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         SupplierExecutionMode executionMode =
             SupplierExecutionMode::ORDINARY) {
+      if (provenEmpty(segment)) return nullptr;
       return scorerSupplierImpl(targetPool, segment, executionMode);
     }
 
@@ -1213,9 +1225,12 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         SupplierExecutionMode executionMode) = 0;
 
-    /// Direct scorer construction implemented by SegmentSources whose supplier
-    /// delegates its build to the source.
-    virtual Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) = 0;
+    /// Direct segment scoring can run concurrently on workers. Allocate
+    /// scorer state from targetPool and leave request planning state alone.
+    Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) {
+      return provenEmpty(segment) ? nullptr : createScorerImpl(targetPool, segment);
+    }
+    virtual Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) = 0;
 
     /// Advisory flag for callers that can optimize domain filtering. Return
     /// true only when every emitted doc is already within this SegmentSource's
@@ -1283,6 +1298,7 @@ public:
     // whole index (kNN, the test-only force-prepare wrapper): the only
     // sources of Weight::NEEDS_PREPARE, known before any weight exists.
     bool mayPrepare = false;
+    std::shared_ptr<QueryPruning> pruning;
     ExecutionProfileSink* profiles = nullptr;
 
     PlanningContext(
@@ -1548,6 +1564,8 @@ public:
           limits, warnings, filterKeyContext, std::move(filterUses));
     }
 
+    Weight* createRootWeight(Query& query, int32_t flags, float multiplier = 1.0f);
+
     PlanningContext& planningContext() const noexcept { return planning; }
 
     MultiTermBudget& multiTermBudget() const noexcept {
@@ -1768,10 +1786,6 @@ public:
     /// whole-index work has completed.
     class PreparedWeight : public Query::SegmentSource {
     public:
-      /// Create a scorer from prepared state. Follows the same threading and
-      /// allocation rules as Weight::createScorer().
-      virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
-
       /// Advisory flag for callers that can optimize domain filtering. Return
       /// true only when every emitted doc is already within this
       /// PreparedWeight's PrepareContext construction domain; false is always
@@ -1873,7 +1887,12 @@ public:
     /// so probes stop before it; ITERATE is a bound.
     /// Resolvable non-metadata shortcuts name the leaf that resolves them.
     /// Execution may resolve more than this metadata proves.
-    virtual CountShortcut countShortcut(IndexReader::Segment& segment,
+    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) {
+      if (provenEmpty(segment)) return {0, CountHow::METADATA};
+      return countShortcutImpl(segment, domain);
+    }
+
+    virtual CountShortcut countShortcutImpl(IndexReader::Segment& segment,
                                          DocSet* domain) {
       return countBound(segment, domain, segment.maxDoc());
     }
@@ -1910,16 +1929,16 @@ public:
     /// The returned PreparedWeight may later be asked to create per-segment
     /// scorers from segment tasks, so createScorer() should treat its stored
     /// prepared state as read-only.
-    virtual std::unique_ptr<PreparedWeight> prepare(PrepareContext& ctx) {
+    std::unique_ptr<PreparedWeight> prepare(PrepareContext& ctx) {
+      auto prepared = prepareImpl(ctx);
+      if (prepared) prepared->membership = membership;
+      return prepared;
+    }
+
+    virtual std::unique_ptr<PreparedWeight> prepareImpl(PrepareContext& ctx) {
       unused(ctx);
       return nullptr;
     }
-
-    /// Create a scorer for a specific segment in the specific MemPool. Can
-    /// return null if no docs match. This may run concurrently on worker tasks:
-    /// allocate scorer state from target, and do not allocate from context.pool
-    /// or populate/mutate Query::Context caches.
-    virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };

@@ -486,7 +486,7 @@ public:
         : child(std::move(child)), program(program), fieldInfos(fieldInfos), multiplier(multiplier),
           scored(scored), needsChildScore(needsChildScore), pruning(pruning) {}
 
-      Query::Scorer* createScorer(
+      Query::Scorer* createScorerImpl(
           MemPool& targetPool, IndexReader::Segment& segment) override {
         Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
         if (supplier == nullptr) return nullptr;
@@ -540,7 +540,7 @@ public:
       }
     }
 
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(
         Query::Weight::PrepareContext& ctx) override {
       QueryPrep::PreparedSource source;
       source.weight = childWeight;
@@ -552,7 +552,7 @@ public:
           allowsPruning());
     }
 
-    Query::Scorer* createScorer(
+    Query::Scorer* createScorerImpl(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
       if (supplier == nullptr) return nullptr;
@@ -582,7 +582,7 @@ public:
       return childWeight->hasReleasableSegmentState();
     }
 
-    CountShortcut countShortcut(
+    CountShortcut countShortcutImpl(
         IndexReader::Segment& segment, DocSet* domain) override {
       return childWeight->countShortcut(segment, domain);
     }

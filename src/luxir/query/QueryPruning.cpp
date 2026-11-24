@@ -7,10 +7,21 @@
 #include <stdexcept>
 
 #include "luxir/query/CatalogPredicates.h"
+#include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/CatalogSummaryView.h"
 #include "luxir/query/Query.h"
 
 namespace luxir {
+
+Query::Weight* Query::Context::createRootWeight(Query& query, int32_t flags, float multiplier) {
+  if (!planning.pruning) planning.pruning = std::make_shared<QueryPruning>();
+  const auto& mask = planning.pruning->membership(query, planning);
+  auto* weight = !planning.mayPrepare && mask.none()
+      ? pool.make<MatchNoDocsQuery::Weight>(*this, query, flags)
+      : query.createWeight(*this, flags, multiplier);
+  if (mask.prunesAny()) weight->membership = &mask;
+  return weight;
+}
 
 bool QueryPruning::collectionEmpty(const Query& query, const Query::PlanningContext& planning) {
   return membership(query, planning).none();

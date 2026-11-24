@@ -63,7 +63,7 @@ public:
     auto part = segments[(size_t)segment.ord];
     return part.empty() ? nullptr : pool.make<Supplier>(part);
   }
-  Query::Scorer* createScorer(MemPool& pool, IndexReader::Segment& segment) override {
+  Query::Scorer* createScorerImpl(MemPool& pool, IndexReader::Segment& segment) override {
     auto part = segments[(size_t)segment.ord];
     return part.empty() ? nullptr : pool.make<Scorer>(part);
   }
