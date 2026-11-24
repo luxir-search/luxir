@@ -199,20 +199,56 @@ when a request ends comes with a bounded cache.
   existence.
 - Each acquire carries a `ReadClass`. `METADATA` marks what a reader navigates
   by: file headers, the catalog, version runs, term block offsets and tries,
-  the stored-field chunk index, and the directories and indexes over column
-  and point blocks. Everything else, term blocks included, is `DATA`.
+  the id filter, the stored-field chunk index, and the directories and
+  indexes over column and point blocks. Everything else, term blocks
+  included, is `DATA`.
   Whoever keeps a hold decides how long it lives: the segment for what it
   keeps, a request for what it uses. The class is a hint a cache or backend
   may use for residency and scheduling after release, and it never changes
   the bytes returned. A part has one class whichever reader acquires it.
 
 The manifest identifies the segment catalog at the end of file 0 by offset,
-length and xxh3. The catalog holds a field table for each row space, then
+length and xxh3, and rejects a segment without that range. Every open from
+the manifest checks the catalog bytes against the hash before decoding them,
+whether the bytes are mapped locally or fetched as a range, so a damaged
+catalog fails the open as a segment corruption error instead of decoding
+wrong offsets. A catalog found from file 0's trailer alone has no manifest
+hash and is not checked. The catalog holds a field table for each row space, then
 the directory and its length. A field table contains name-sorted records
 and their offsets. Each record contains a header followed by the parts
 present in its part mask. A separately placed extent has an absolute file
 number and offset. Adjacent pieces share that location and carry lengths
 where the reader cannot derive them from the record and row-space counts.
+
+The parts are the term dictionary and its postings, one column, points,
+norms, a stored-fields resource, a docs bitmap, end value ranks, vector
+owners, and the id filter. The id filter is a part of the root `id` field
+only: a membership filter over the dictionary's terms. Its keys are the XXH3
+of each term as the dictionary stores it (the fitted form, so a long id is
+never falsely absent), the same hash whose low byte the term blocks keep.
+Every flush and merge rebuilds it from the terms it writes, so it has exactly
+one key per term. The writer checks an id against the exact dictionary bounds
+and then the filter, and looks up only the segments and ids that pass.
+Writers build no filter unless `--indexing.id-filter` names a kind (see the
+operations guide).
+
+The part starts with a 24-byte header that names its kind and parameters, so
+a reader needs nothing else and the writer may choose them per segment. A
+part that does not parse is a corrupt segment. Two kinds exist:
+
+- `bloom`: a split-block Bloom filter in 32-byte blocks, sized for the
+  segment's document count at 16 bits per id unless configured otherwise
+  (about 0.13% of absent ids pass), and at least 16 KiB so a small segment
+  almost always excludes an absent id. Built in one pass.
+- `fuse8` and `fuse16`: a 3-wise binary fuse filter with 8- or 16-bit
+  fingerprints, 1.13 (millions of ids) to about 1.25 (thousands) fingerprints
+  per id. 0.39% or 0.0015% of absent ids pass. It is static: the writer holds
+  every key's hash until the dictionary ends and then builds it.
+
+A batch of ids skips a segment only when every id misses, so the false
+positive rate that matters is per batch: at 2,000 ids per commit, a 16-bit
+Bloom filter skips about 7% of segments and `fuse16` about 97%. Whether a
+kind should be on by default, and which, is to be settled by benchmarking.
 
 Each field record encodes the schema flags as an unsigned vint, excluding
 `ABSTRACT` and `DERIVED`. Bits 0-2 encode the cumulative postings level
@@ -258,9 +294,9 @@ needs:
 - a merge policy that leaves old, large segments alone, or merges that fetch
   their inputs through the cache;
 - id lookups for updates and deletes that skip cold segments without
-  fetching them. Append-only collections need no lookups. Otherwise
-  per-segment id ranges, which the writer already keeps, and per-segment id
-  filters do the skipping;
+  fetching them. Append-only collections need no lookups. Otherwise the
+  exact id bounds in each segment's catalog do the skipping, and the id
+  filter part, a small metadata read, skips most of what the bounds keep;
 - the syncer reporting which files are published, so that eviction knows
   what it may drop.
 
@@ -279,11 +315,11 @@ for a range read. The catalog directory points to the separate version runs.
 Per-field bounds stay in the catalog so manifests do not repeat them for
 every segment.
 
-Each manifest also carries a collection-level summary: per-field bounds over
-all of its segments. It is per field, not per segment, so it stays small, and
-it changes only when the set of segments does. A search across many
-collections uses it to skip a whole collection from the manifest alone,
-without reading any segment's catalog or opening the collection.
+A collection-level summary in each manifest is planned: per-field bounds
+over all of its segments. It would be per field, not per segment, so it stays
+small, and it would change only when the set of segments does. A search
+across many collections could then skip a whole collection from the manifest
+alone, without reading any segment's catalog or opening the collection.
 
 Per-segment bounds prove "no match" when a query's range does not overlap
 them, and "every document matches" when the minimum and maximum equal the

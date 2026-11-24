@@ -60,7 +60,14 @@ locations, browse `src/luxir/<area>/`.
      field name. Each space has a `PostingsReader` with its own row count and
      immutable, on-demand record cache. Records contain counts, bounds and data
      slices. Numeric leaf metadata and stored metadata are opened and cached
-     separately. Codec cursors borrow the space reader and its acquired bytes
+     separately. Codec cursors borrow the space reader and its acquired bytes.
+     Opens from a manifest check the catalog against the manifest's xxh3 first;
+     invalid segment bytes throw `SegmentCorruptError`, an internal `ApiError`
+   - `IdFilter`: the root id field's FILTER part, a membership filter over its
+     dictionary terms that names its own kind (split-block Bloom or binary fuse) and
+     parameters. `IdFilter::Options` picks what a writer builds (none by default).
+     `SegmentCore::idFilter` reads it; the writer's delete application skips ids
+     and segments it excludes
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
      opening reads metadata and endpoints without scanning child rows.

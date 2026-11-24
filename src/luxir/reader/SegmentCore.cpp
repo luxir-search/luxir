@@ -259,7 +259,7 @@ void SegmentCore::finishOpen(const PendingOpen& pending) {
   }
   SegmentReadContext primaryContext{this, PackedTerm(nullptr), primary};
   auto bytes = slice({{primary, range.offset}, range.length}, ReadClass::METADATA);
-  auto head = SegmentCatalog::readDirectory(bytes, range.offset, files[primary].size, primaryContext);
+  auto head = SegmentCatalog::readDirectory(bytes, range, files[primary].size, primaryContext);
   catalog = SegmentCatalog::decode(head, pending.source.files, primaryContext);
   if (spaces().front().maxDoc != pending.source.maxDoc) {
     corruptSegment(pending.name, "segment row count differs from manifest");
@@ -342,6 +342,16 @@ void SegmentCore::initializeSpaces() {
     child->reader.initialize(space.maxDoc, space.fields.size());
     children.push_back(std::move(child));
   }
+}
+
+std::optional<IdFilter> SegmentCore::idFilter() {
+  const auto* info = root.fieldInfo("id");
+  auto part = info ? info->idFilter() : field_parts::Slice();
+  if (!part) return std::nullopt;
+  // Writers only write filters that parse, so one that does not is damaged.
+  auto filter = IdFilter::parse(slice(part, ReadClass::METADATA));
+  if (!filter) segmentReadContext(*this, *info, part.location.filenum()).invalid("id filter does not parse");
+  return filter;
 }
 
 std::shared_ptr<SegmentCore> SegmentCore::create(Directory& dir, const api::SegmentInfo& segment,

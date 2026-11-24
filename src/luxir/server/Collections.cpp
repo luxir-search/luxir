@@ -4,6 +4,7 @@
 #include "Collections.h"
 #include "Promotion.h"
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/reader/IdFilter.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "luxir/store/CorruptionMarker.h"
@@ -354,6 +355,17 @@ std::string Collections::recoverWriter(const CollectionId& name, TenantCatalog& 
   return recovered;
 }
 
+static IdFilter::Options idFilterOptions(const IndexConfig& config) {
+  IdFilter::Options options;
+  options.kind = config.id_filter == "none" ? IdFilter::Kind::NONE
+                 : config.id_filter == "bloom" ? IdFilter::Kind::BLOOM
+                                               : IdFilter::Kind::FUSE;
+  options.fingerprintBits = config.id_filter == "fuse8" ? 8 : 16;
+  options.bitsPerKey = config.id_filter_bits_per_key;
+  options.minBytes = config.id_filter_min_kb * 1024;
+  return options;
+}
+
 // Best-effort marker cleanup after snapshot verification.
 static void clearMarkers(const CollectionId& name, Directory& dir, std::span<const std::string> markers) {
   if (markers.empty()) return;
@@ -405,6 +417,7 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   col->shard->iw->collectionMetrics = col->metrics;
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
+  col->shard->iw->idFilterOptions = idFilterOptions(config.index);
   if (col->shard->snapshots->snapshot()->id.incarnation != selected) throw std::runtime_error("Snapshot incarnation does not match catalog selection");
   if (creating) storage.activate(name.name, selected);
   retire(name, selected);

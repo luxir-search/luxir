@@ -6,6 +6,7 @@
 #include "PostingsReader.h"
 #include "SegmentCatalog.h"
 #include "CatalogRange.h"
+#include "IdFilter.h"
 #include "VersionRuns.h"
 #include <map>
 #include <mutex>
@@ -107,6 +108,10 @@ public:
   PostingsReader& rootReader() noexcept { return root; }
   const PostingsReader& rootReader() const noexcept { return root; }
   const VersionRuns& versionRuns() const noexcept { return versions; }
+
+  // The root "id" field's membership filter, or none when the segment wrote no
+  // filter part. Throws SegmentCorruptError when the part does not parse.
+  std::optional<IdFilter> idFilter();
 
   void forEachBaseFile(auto&& visit) const {
     for (uint32_t number = 0; number < files.size(); ++number) {
