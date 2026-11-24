@@ -149,7 +149,7 @@ TEST_F(RowOperationsTest, cachedRequiredConstantKeepsNamedMatchingRows) {
   ASSERT_TRUE(helper.submit(merge).success);
   auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
       .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2});
-  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.testSetFilterCache(cache);
   auto request = R"JSON({"ops":{"q":{"top_docs":{
     "get_scores":true,"count_limit":-1,"fields":["id"],"sort":[{"field":"id"}],
     "query":{"boolean":{"required":[{"match":{"field":"id","val":"a"}},
@@ -185,7 +185,7 @@ TEST_F(RowOperationsTest, cachedRequiredConstantKeepsNamedMatchingRows) {
 TEST_F(RowOperationsTest, namesDoNotChangeMembershipCacheOrPlanning) {
   auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
       .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2});
-  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.testSetFilterCache(cache);
   for (int pass = 0; pass < 3; pass++) {
     auto request = std::string(R"JSON({"ops":{"q":{"top_docs":{"limit":0,"count_limit":-1,"query":{)JSON")
         + (pass == 2 ? R"JSON("name":"same",)JSON" : "")

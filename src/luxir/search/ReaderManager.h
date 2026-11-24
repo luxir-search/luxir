@@ -5,6 +5,7 @@
 #include "luxir/util/Metrics.h"
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include "IndexReader.h"
 #include "FilterCache.h"
@@ -23,10 +24,22 @@ class ReaderManager {
   alignas(64) std::atomic<bool> closed = false;
   std::atomic<uint64_t> publishedSchemaGen = 0;
   std::atomic<uint64_t> lastAdvertisedCommitTime = 0;
+  // Steady-clock microseconds of the last search, stored at most once per
+  // SEARCH_MARK_US so the search path rarely writes this line. Starts at
+  // construction: a new manager counts as searched.
+  alignas(64) std::atomic<uint64_t> lastSearchUs;
   FilterCacheConfig originalFilterCacheConfig;
+  static constexpr uint64_t SEARCH_MARK_US = 1'000'000;
+  static uint64_t steadyUs() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
 public:
   // The node's service counters; set by the collection that owns this manager.
   std::shared_ptr<Metrics> metrics = Metrics::detached();
+  // A publisher opens the reader of a new snapshot only when a search ran
+  // this recently; otherwise the first search after it reopens. Tests lower it.
+  uint64_t idleAfterUs = 60'000'000;
   std::shared_ptr<FilterCache> filterCache;
   alignas(64) std::atomic<std::shared_ptr<IndexReader>> indexReader;
 
@@ -103,18 +116,34 @@ public:
   Stats stats(bool includeSegments, bool includeFiles = true);
   void cacheStats(CacheStats& out) const;
   explicit ReaderManager(Directory& dir, FilterCacheConfig config = {});
+  // Searches take the published reader without a lock when it satisfies their
+  // freshness and schema. Otherwise one thread reopens under indexReaderMutex
+  // and the others that need the new snapshot wait for it (READER_WAIT).
   std::shared_ptr<IndexReader> getReader(uint64_t freshness_us = 0);
   std::shared_ptr<const CommitSnapshot> snapshot() const { return published.load(); }
   std::shared_ptr<Schema> getSchema() const { return snapshot()->schema; }
-  // Opens a reader for a snapshot before it is published.
+  // Whether a search ran within idleAfterUs, so a writer publication opens
+  // its reader instead of leaving it to the next search.
+  bool searchedRecently() const {
+    auto now = steadyUs();
+    auto last = lastSearchUs.load(std::memory_order_relaxed);
+    return last > now || now - last < idleAfterUs;  // another thread may be ahead
+  }
+  // Opens a reader for a snapshot before it is published, on the publisher's
+  // thread (writer commits and schema updates, follower installs). Takes no
+  // lock: it only reuses the current reader's segments, and publish() swaps.
   std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot) { return prepare(snapshot, dir); }
   std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot, Directory& source);
   // Publishes a durable snapshot. With a reader from prepare() searches switch
-  // to it now; without one, readers reopen lazily on demand (local writers).
+  // to it before the snapshot is advertised, so none of them reopens; without
+  // one (an idle collection, a writer reopening an existing index, a failed
+  // prepare), the first search that needs it reopens.
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
   std::string resolvedSchema();
   void close() noexcept { closed.store(true, std::memory_order_release); }
   bool isClosed() const { return closed.load(std::memory_order_acquire); }
+  // Tests only: the next search opens its reader with this cache.
+  void testSetFilterCache(std::shared_ptr<FilterCache> cache);
   // Quiescent tests only: clear the physical namespace and cache together.
   void testReset();
 };

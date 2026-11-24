@@ -34,9 +34,13 @@ message SearchRequest {
   // Index view freshness tolerance in milliseconds. 0 (the default) requires the
   // latest advertised commit: wait for an immediate commit's response, and a
   // freshness_ms=0 search is guaranteed to see it.
-  // A positive value lets the search reuse a reader up to this stale, avoiding
-  // reader churn under frequent commits. It is a tolerance, not a latency bound:
-  // there is no guaranteed time from ingest to visibility.
+  // Commits open their reader before the commit is advertised, so the current
+  // reader is normally the latest. A positive value lets the search keep a
+  // reader up to this stale when it lags (the collection was idle, or its open
+  // at commit failed) instead of reopening it or waiting for another search's
+  // reopen. A schema change always requires the new reader. It is a
+  // tolerance, not a latency bound: there is no guaranteed time from ingest to
+  // visibility.
   uint64 freshness_ms = 4;
 
   // Time zone for date math and date literals without an offset. Empty is UTC;
@@ -1733,7 +1737,7 @@ message ServiceStats {
   // histograms.
   repeated double request_duration_bounds = 3;
   // Upper bounds, in seconds, of the flush, commit, delete pass, merge,
-  // vector build and reader refresh histograms.
+  // vector build, reader refresh and reader wait histograms.
   repeated double background_duration_bounds = 4;
   TransportStats http = 5;
   TransportStats grpc = 6;
@@ -1759,7 +1763,12 @@ message ServiceStats {
   ActivityStats delete_pass = 22;
   ActivityStats merge = 16;
   ActivityStats vector_build = 17;
+  // Reader opens: on publication (commits, schema updates, replicated
+  // snapshots) and, when that open was skipped or failed, by a search.
   ActivityStats reader_refresh = 18;
+  // Searches that waited for another thread's reader open because the
+  // published reader did not satisfy their freshness_ms or min_commit.
+  ActivityStats reader_wait = 90;
   // The control executor (server.control_threads): administration, schema
   // changes, collection lifecycle, replication transfers and timers, and
   // detailed stats.

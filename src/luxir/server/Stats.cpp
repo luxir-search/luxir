@@ -180,6 +180,7 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   fillActivity(dst.merge, counts, metricActivity(MetricStage::MERGE), resource);
   fillActivity(dst.vector_build, counts, metricActivity(MetricStage::VECTOR_BUILD), resource);
   fillActivity(dst.reader_refresh, counts, metricActivity(MetricStage::READER_REFRESH), resource);
+  fillActivity(dst.reader_wait, counts, metricActivity(MetricStage::READER_WAIT), resource);
   auto control = node.getControlExecutor().stats();
   dst.control_threads = control.threads;
   dst.control_busy = control.busy;
