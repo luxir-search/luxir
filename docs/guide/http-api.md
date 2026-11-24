@@ -269,6 +269,12 @@ when supplied in the body or as a URL parameter.
 A failure detected before output returns the kind's HTTP status and this
 body. A wrong method on a known path returns `405` with an `Allow` header.
 
+A buffered `_update` that arrives while the node has too many updates in
+flight returns `429` with `Retry-After: 1` and code `too_many_updates`; nothing
+in it was applied, so retry it after the delay. An NDJSON `_update` stream is
+never refused for load: it stops reading until there is room. See
+[Update admission](operations.md#update-admission).
+
 Once a chunked response has begun, its HTTP status cannot change, so a search
 that fails after output starts arrives with HTTP 200 as the final NDJSON line in
 the same shape, `{"request_id": ..., "error": {...}, "warnings": [...]}`,

@@ -160,6 +160,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   };
   events = std::make_shared<Events>(replication, commitWaits);
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
+  updateAdmission.setLimits(this->config.ingest.max_inflight_updates, this->config.ingest.max_inflight_update_bytes);
   preWarmTimeZoneDatabase();
   collections_ = std::make_unique<Collections>(this->config, lifetime, *events, indexRamBudget, indexArena, metrics);
 

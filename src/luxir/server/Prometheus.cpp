@@ -70,6 +70,13 @@ void service(Renderer& r, const api::ServiceStats& s) {
     r.counter("luxir_response_body_bytes_total", "Application payload bytes submitted for sending, including failed deliveries.", (double)transport->sent_bytes, t);
     r.counter("luxir_stream_pauses_total", "Response producers paused by flow control.", (double)transport->stream_pauses, t);
   }
+  const auto& admission = s.update_admission;
+  r.gauge("luxir_update_admission_in_flight", "Updates admitted node-wide and not yet complete.", (double)admission.in_flight);
+  r.gauge("luxir_update_admission_in_flight_bytes", "Raw request bytes of admitted, incomplete updates.", (double)admission.in_flight_bytes);
+  r.gauge("luxir_update_admission_max_in_flight", "Node-wide limit on admitted updates; zero means unlimited.", (double)admission.max_in_flight);
+  r.gauge("luxir_update_admission_max_bytes", "Node-wide limit on admitted update bytes; zero means unlimited.", (double)admission.max_bytes);
+  r.counter("luxir_update_admission_rejected_total", "Unary gRPC and buffered HTTP updates refused by node-wide admission.", (double)admission.rejected);
+  r.counter("luxir_update_admission_paused_total", "Times an update stream stopped reading for want of node-wide admission room.", (double)admission.paused);
   r.gauge("luxir_http_connections", "Live HTTP sessions, including idle keep-alive connections.", (double)s.http.connections);
   r.gauge("luxir_http_io_threads", "Running HTTP connection shard threads (excludes the accept thread).", (double)s.http.io_threads);
   r.activity("luxir_searches", "luxir_search_duration_seconds", s.search, s.request_duration_bounds);
