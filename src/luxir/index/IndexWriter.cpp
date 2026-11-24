@@ -2357,8 +2357,7 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
           auto file = dir.createFile(fileName);
           OutputStream os;
           os.setFile(&*file);
-          static constexpr std::string_view payload = "luxir test overlay\n";
-          os.write(payload.data(), payload.size());
+          os.write(TestOverlayAuxReader::PAYLOAD.data(), TestOverlayAuxReader::PAYLOAD.size());
           os.close();
           dir.finishFile(*file);
           descriptor = file->descriptor();

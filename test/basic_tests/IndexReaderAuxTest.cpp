@@ -30,7 +30,6 @@
 #include "luxir/store/FileIOException.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
-#include "test/LocalReq.h"
 #include "test/StrictStorage.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
@@ -185,6 +184,8 @@ TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
       os.close();
       dir.finishFile(*out);
       EXPECT_THROW(VectorAuxReader::open(dir, info, false), std::runtime_error);
+      // Opened for a segment, invalid bytes are that segment's corruption.
+      EXPECT_THROW(VectorAuxReader::open(dir.openFile("invalid-amplitude"), info, "s1"), SegmentCorruptError);
       dir.deleteFile("invalid-amplitude");
     }
   }
@@ -228,6 +229,9 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
           EXPECT_NE(message.find("opaque_meta says " + std::to_string(bits ? changed.rabitqBits : changed.nlist)), std::string::npos);
         }
       }
+      // Opened for a segment, a header found invalid at first search is that segment's corruption.
+      auto owned = VectorAuxReader::open(dir.openFile(copied.files[0].name, {.expectSynced = true}), copied, "s1");
+      EXPECT_THROW(owned->getFaissIndex(), SegmentCorruptError);
     }
     if (ann.codec == api::VectorAnnDef::Codec::RABITQ) {
       auto changed = meta;
@@ -779,22 +783,35 @@ TEST_F(IndexReaderAuxTest, inventoryReopensWithOverlaysAndDeletes) {
 
 namespace {
 
-// The test overlay's policy and open failure for one test.
+// The test overlay's policy for one test.
 class OverlayPolicyGuard {
 public:
-  OverlayPolicyGuard(OverlayPolicy policy, bool failOpen) {
-    TestOverlayAuxReader::policyForTests = policy;
-    TestOverlayAuxReader::failOpenForTests = failOpen;
-  }
-  ~OverlayPolicyGuard() {
-    TestOverlayAuxReader::policyForTests = OverlayPolicy::ON_DEMAND;
-    TestOverlayAuxReader::failOpenForTests = false;
-  }
+  explicit OverlayPolicyGuard(OverlayPolicy policy) { TestOverlayAuxReader::policyForTests = policy; }
+  ~OverlayPolicyGuard() { TestOverlayAuxReader::policyForTests = OverlayPolicy::REQUIRED; }
 };
 
 void commitWithTestOverlay(CollectionHelper& h) {
   ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
   h.commit({std::string(TestOverlayAuxReader::NAME)});
+}
+
+// Copies the collection's files, with the first byte of the test overlay's file changed.
+void copyWithInvalidOverlay(Directory& dir, RAMDir& copy) {
+  auto durable = readDurableIndexInfo(dir);
+  std::string overlay(durable.info.segments.front().overlays.front().files.front().name);
+  std::vector<Directory::FileInfo> files;
+  dir.listFiles(files);
+  for (const auto& descriptor : files) {
+    auto input = dir.openFile(descriptor.name);
+    auto hold = input->acquire({0, input->size()});
+    std::string bytes(hold.getData(), hold.getLength());
+    if (descriptor.name == overlay) bytes[0] ^= 1;
+    auto file = copy.createFile(descriptor.name);
+    OutputStream out(file.get());
+    out.write(bytes.data(), bytes.size());
+    out.close();
+    copy.finishFile(*file);
+  }
 }
 
 }  // namespace
@@ -818,36 +835,35 @@ TEST_F(IndexReaderAuxTest, overlayOpensOnFirstUse) {
   EXPECT_EQ(overlay, reopened.segments()[0].overlays()[0]);
 }
 
-TEST_F(IndexReaderAuxTest, advisoryOverlayFailureLeavesTheSegmentInService) {
+// An advisory overlay whose bytes are invalid reads as absent, and stays so.
+TEST_F(IndexReaderAuxTest, advisoryOverlayWithInvalidBytesReadsAsAbsent) {
   CollectionHelper h("main");
   commitWithTestOverlay(h);
-  OverlayPolicyGuard guard(OverlayPolicy::ADVISORY, /*failOpen=*/true);
-  auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
-  const auto& segment = reader->segments()[0];
-  auto aux = segment.getAuxReader(TestOverlayAuxReader::NAME);
-  ASSERT_NE(nullptr, dynamic_cast<UnavailableAuxReader*>(aux.get()));
-  EXPECT_EQ(TestOverlayAuxReader::KIND, aux->getKind());
-  EXPECT_EQ(2, segment.postingsReader().maxDoc());
-  auto req = localReq(h.getSearchEngine());
-  req->topDocs().allQuery().countLimit(-1);
-  req->execute(reader);
-  ASSERT_TRUE(req->ok()) << req->errorMsg();
-  EXPECT_EQ(2, req->getMatchCount());
+  RAMDir copy;
+  copyWithInvalidOverlay(h.getIndexWriter()->dir, copy);
+  OverlayPolicyGuard guard(OverlayPolicy::ADVISORY);
+  IndexReader reader(copy);
+  const auto& segment = reader.segments()[0];
+  ASSERT_EQ(1u, segment.overlays().size());
+  EXPECT_FALSE(segment.overlays()[0]->isUnusable());
+  for (int use = 0; use < 2; ++use) {
+    EXPECT_EQ(nullptr, segment.getAuxReader(TestOverlayAuxReader::NAME));
+    EXPECT_TRUE(segment.overlays()[0]->isUnusable());
+  }
 }
 
-// An on-demand overlay with invalid bytes fails every use as corruption, and
-// opens once its bytes read again.
-TEST_F(IndexReaderAuxTest, onDemandOverlayFailureIsCorruption) {
+// A required overlay whose bytes are invalid fails its uses as corruption.
+TEST_F(IndexReaderAuxTest, requiredOverlayWithInvalidBytesIsCorruption) {
   CollectionHelper h("main");
   commitWithTestOverlay(h);
-  auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
-  const auto& segment = reader->segments()[0];
-  {
-    OverlayPolicyGuard guard(OverlayPolicy::ON_DEMAND, /*failOpen=*/true);
-    EXPECT_THROW(segment.getAuxReader(TestOverlayAuxReader::NAME), SegmentCorruptError);
+  RAMDir copy;
+  copyWithInvalidOverlay(h.getIndexWriter()->dir, copy);
+  IndexReader reader(copy);
+  const auto& segment = reader.segments()[0];
+  for (int use = 0; use < 2; ++use) {
     EXPECT_THROW(segment.getAuxReader(TestOverlayAuxReader::NAME), SegmentCorruptError);
   }
-  EXPECT_NE(nullptr, dynamic_cast<TestOverlayAuxReader*>(segment.getAuxReader(TestOverlayAuxReader::NAME).get()));
+  EXPECT_FALSE(segment.overlays()[0]->isUnusable());
 }
 
 // A failed read fails the use under either policy, and the next use retries.
@@ -855,8 +871,8 @@ TEST_F(IndexReaderAuxTest, overlayReadFailureIsRetried) {
   CollectionHelper h("main");
   commitWithTestOverlay(h);
   auto writer = h.getIndexWriter();
-  for (auto policy : {OverlayPolicy::ON_DEMAND, OverlayPolicy::ADVISORY}) {
-    OverlayPolicyGuard guard(policy, /*failOpen=*/false);
+  for (auto policy : {OverlayPolicy::REQUIRED, OverlayPolicy::ADVISORY}) {
+    OverlayPolicyGuard guard(policy);
     auto counters = std::make_shared<StrictStorageCounters>();
     StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters);
     auto reader = std::make_shared<IndexReader>(dir);

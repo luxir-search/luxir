@@ -56,7 +56,7 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
 
 OverlayPolicy overlayPolicyOf(std::string_view kind) {
   if (kind == TestOverlayAuxReader::KIND) return TestOverlayAuxReader::policyForTests;
-  return OverlayPolicy::ON_DEMAND;
+  return OverlayPolicy::REQUIRED;
 }
 
 } // namespace
@@ -90,26 +90,19 @@ std::shared_ptr<SegmentOverlay> SegmentOverlay::open(Directory& dir, const luxir
 
 std::shared_ptr<AuxReader> SegmentOverlay::get() {
   return reader.getOrCreate([this]() -> std::shared_ptr<AuxReader> {
+    std::pmr::monotonic_buffer_resource arena;
+    auto entry = toWire(info, arena);
     try {
-      std::pmr::monotonic_buffer_resource arena;
-      auto entry = toWire(info, arena);
-      if (files.size() != 1) throw std::runtime_error(std::format("expected 1 file, got {}", files.size()));
-      if (info.kind == VectorAuxReader::KIND) return VectorAuxReader::open(files.front(), entry);
-      return TestOverlayAuxReader::open(files.front(), entry);
-    } catch (const ApiError&) {
-      throw;  // a failed read or a resource limit: the next use retries
-    } catch (const std::system_error&) {
-      throw;
-    } catch (const std::bad_alloc&) {
-      throw;
-    } catch (const std::exception& e) {
-      if (policy == OverlayPolicy::ADVISORY) {
-        LOG_WARN("Advisory overlay '{}' of segment {} is unusable and will answer nothing: {}",
-                 info.name, segment, e.what());
-        return std::make_shared<UnavailableAuxReader>(info.kind, info.name, info.gen, info.built_core_gen);
+      if (files.size() != 1) {
+        corruptSegment(segment, std::format("overlay '{}': expected 1 file, got {}", info.name, files.size()));
       }
-      if (dynamic_cast<const SegmentCorruptError*>(&e)) throw;
-      corruptSegment(segment, std::format("overlay '{}': {}", info.name, e.what()));
+      if (info.kind == VectorAuxReader::KIND) return VectorAuxReader::open(files.front(), entry, segment);
+      return TestOverlayAuxReader::open(files.front(), entry, segment);
+    } catch (const SegmentCorruptError& e) {
+      if (policy != OverlayPolicy::ADVISORY) throw;
+      LOG_WARN("Advisory overlay '{}' is unusable and reads as absent: {}", info.name, e.what());
+      unusable.store(true, std::memory_order_relaxed);
+      return nullptr;
     }
   });
 }
