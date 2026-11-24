@@ -347,90 +347,76 @@ alone, without reading any segment's catalog or opening the collection.
 
 ### Query-time pruning
 
-`Query::mayMatch(const CatalogSummaryView&)` answers, from field record
-headers alone, whether a query can match a segment: `EMPTY` is a proof that
-no document does (live or deleted), `UNKNOWN` is always legal. Headers
-describe the segment as written, so they prove "no match", never a count.
-The view reads the decoded catalog record through `FieldSegments::at`. Its
-segment core owns the record and the mapping behind its bounds. All operations
-on the same reader share one request-local field lookup, including misses. A
-schema/persisted type mismatch supplies no proof. Weights still check the
-fields they use. Proofs name the physical field the query's
-weights read (a derived variant, each field of a combined-field query), not
-the logical name.
+`Query::mayMatch` uses the physical field's record in one segment to prove
+that no row matches, including deleted rows. `CatalogSummaryView` reads
+the decoded record through `FieldSegments::at`. The segment core owns both
+the record and its catalog bytes. Field lookups, including misses, are shared
+across the request on each reader view.
+
+A missing record proves that the segment lacks the field. An unreadable
+record or a schema/persisted type mismatch supplies no evidence. Proofs add
+no request errors. Weight construction checks the fields that execution uses.
 
 | Query | Proof of absence |
 | --- | --- |
-| term, term set, phrase, combined fields | no record, no values or no terms; the term outside the dictionary bounds (a phrase needs every term, a set or combined-field query every entry proven absent) |
-| prefix, term range | no record, no values or no terms; the prefix or range outside the dictionary bounds |
+| term, term set, phrase, combined fields | a term is absent if its field has no record, values or indexed terms, or its dictionary bounds exclude the term. One absent term excludes a phrase. Every alternative must be absent for a term set or combined-field query. |
+| prefix, term range | no record, no values, no indexed terms, or dictionary bounds disjoint from the prefix or range |
 | fuzzy and other expansions | no record, no values or no terms |
-| numeric range or value set | no record or no values; no admitted value inside the scalar bounds |
+| numeric range or value set | no record, no values, or no admitted value inside the scalar bounds |
 | exists | no record or no values |
-| geo box, distance, polygon | no record or no values; the query's bounding box disjoint from the geo bounds |
-| range field | no record or no values; the relation's box disjoint from the interval bounds over low or high endpoints |
+| geo box, distance, polygon | no record, no values, or a query bounding box disjoint from the geo bounds |
+| range field | no record, no values, or a relation box disjoint from the interval bounds on either the low or high endpoints |
 | to_parent | the segment has no rows in the child space, or the child query is proven empty over them |
 | match-no-docs | always |
 
-Term proofs compare the bytes execution seeks (analyzed and fitted, as the
-query holds them) with the dictionary bounds and their modes: a `ROUNDED`
-lower is a strict prefix of the smallest term, so that prefix itself is
-absent; an `EXCLUSIVE` upper is above every term; an `UNBOUNDED` upper proves
-nothing. Composites combine their children: one empty required or filter
-clause empties a boolean; an optional group needs `min_match` (or, without
-required clauses, one) members not proven empty, duplicates counted once as
-the plan executes them. A Boolean reads the compiled clauses in its validation
-context. Without a compiled plan it answers `UNKNOWN`. A routed ANY filter
-is empty only when all its independently weighted sources are empty. A disjunction max
-needs every disjunct empty;
-wrappers pass their child's answer through. Prohibited clauses, kNN and any
-query without a rule prove nothing.
+Term comparisons use the analyzed and fitted bytes used for the dictionary
+seek. An exact lower or inclusive upper endpoint may itself be present. A
+`ROUNDED` lower endpoint is a strict prefix of the smallest term. An
+`EXCLUSIVE` upper endpoint is greater than every term. An `UNBOUNDED` upper
+endpoint supplies no upper limit.
 
-`QueryPruning` memoizes query verdicts per request as `SegmentMask`s.
-A root weight carries its query's mask when the proof excludes segments. In
-those segments it supplies a null scorer and a zero metadata count. Prepared
-weights receive the mask after whole-index preparation, so mapped kNN still
-selects its global top k. Fusion produces its shared filter domain before
-dispatching to each source.
+A Boolean reads the compiled plan in the row space where logical validation
+ran. An empty required or filter clause proves the conjunction empty.
+Distinct optional clauses must be able to meet the plan's adjusted
+`minShouldMatch`. Prohibited clauses supply no proof. A Boolean without a
+validated plan, or a query without a proof rule, answers `UNKNOWN`.
 
-TopDocs completes a segment early when its own result and every domain
-variant it owes are empty. A reset variant can still produce rows from an
-empty input. Empty completion feeds children, merges collectors and preserves
-zero buckets. Whole-membership resolution uses the key weight's own count
-and supplier for cache publication.
+`QueryPruning` memoizes a membership mask per query and validation context.
+A root weight carries the mask if it excludes any segments. In an excluded
+segment the weight returns a null supplier or scorer and a zero metadata
+count. Materializing the filter gives an empty domain. An eligible filter
+cache use still probes its slot and can publish raw empty membership.
+Field totals include every segment. A term's statistics omit a dictionary
+seek only where the field record proves that particular term absent.
 
-Scoring does not depend on pruning. Field totals come from every segment's
-header. A term's statistics skip a segment only where its header proves the
-term absent (df = 0); a segment pruned by another clause or a filter is still
-seeked, so scores are identical with and without pruning.
+If every segment of a nonempty reader excludes a root, the planner selects
+the empty weight unless its context may require whole-index preparation.
+This also proves requests that fall in a gap between segments' bounds. The
+authored query retains its cache key and its filters. A field error detectable
+only by the elided weight can consequently go unreported. There is no
+in-memory or persisted collection summary. A summary outside the collection
+would be useful for a search that must skip a collection it cannot open.
 
-A query is proven empty for a nonempty collection when every segment proves
-its raw membership empty. This includes gaps between segments' bounds. When
-the planning context has no whole-index preparation obligation, the planner
-selects the empty weight for that root before seeking terms for statistics.
-The authored query and cache key stay intact. A type error that only the
-elided weight would have discovered can therefore go unreported.
+After preparation, TopDocs can finish a segment early when its own result
+and every domain variant it owes are empty. A routed ANY filter requires
+every source to be empty. A reset variant can produce rows even from an empty
+input. Children receive their domains and collectors finish through the
+ordinary path, including named zero-count buckets. A filter or incoming
+domain alone cannot establish zero raw membership for the main query's
+cache key. Pruning leaves upstream domains intact, so a mapped kNN filter
+chooses its global top k before the consuming op skips collection.
 
-Explain identifies each selected root with an exclusion, using a representative
-segment for a collection-empty weight. A cache hit may omit a weight entirely.
-The `pruning` profile op contains the segment skips taken during collection
-and the evidence for each. `QueryPruning::disableForTests` turns off catalog
-proofs for differential tests. Cross-check mode (`--search.pruning-cross-check`)
-verifies skipped statistics seeks against the term dictionary.
-
-Per-segment bounds prove "no match" when a query's range does not overlap
-them, and "every document matches" when the minimum and maximum equal the
-queried value and every document has the field. Declared partition
-descriptors, which would reject documents at ingest, would add a
-collection-level guarantee about future documents. They wait for a concrete
-use.
+Explain lists the selected roots whose proofs exclude segments. An empty
+weight gets one representative segment and reason. A cache hit that omits
+the weight has no root proof to report. The `pruning` execution profile
+records the segment skips actually taken and their reasons.
 
 ## Many collections
 
 Searching several collections is a direction, not scheduled. The likely shape
 is one search over the segments of each collection's pinned snapshot, so that
-existing execution merges results across segments. Pruning then works at both
-levels: a collection's summary skips it entirely, and segment bounds skip
-segments within the collections that remain. Open problems:
+existing execution merges results across segments. Each open reader can use
+its own segment bounds. Three questions remain for multi-collection execution.
 
 - segment identity across collections, which the filter cache keys on;
 - per-reader ordinal maps, which would rebuild whenever any member commits;

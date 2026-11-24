@@ -41,9 +41,11 @@ protected:
     LuxirTest::SetUp();
     helper = std::make_unique<CollectionHelper>("prune");
     helper->clear();
-    helper->getIndexWriter()->mergePolicy->setMergeFactor(100);
+    auto writer = helper->getIndexWriter();
+    writer->mergePolicy->setMergeFactor(100);
+    // Let routed filters in the one- and two-document segments enter the cache.
+    writer->snapshots.readers.filterCache = std::make_shared<FilterCache>(FilterCacheConfig{.minSegmentDocs = 0});
     QueryPruning::disableForTests = false;
-    QueryPruning::crossCheck = true;
     Signal::listen("searchTopDocsSegmentPruned", [this](void*, void*, void*) -> void* {
       prunedSegments.fetch_add(1);
       return nullptr;
@@ -53,7 +55,7 @@ protected:
   void TearDown() override {
     Signal::unlisten("searchTopDocsSegmentPruned");
     QueryPruning::disableForTests = false;
-    QueryPruning::crossCheck = false;
+    QueryPruning::verifyTermAbsenceForTests = false;
     helper.reset();
   }
 
@@ -79,17 +81,19 @@ protected:
     return helper->getIndexWriter()->snapshots.readers.getReader();
   }
 
-  // The complete JSON response, scores included.
-  std::string render(std::string_view json, bool profile = false) {
+  // Complete response bodies, including scores, buckets, warnings and errors.
+  std::string render(std::string_view json, std::string_view expectedError = {}) {
     auto req = localReq(helper->getSearchEngine());
     parseQueryRequest(json, req->rawRequest(), req->mr);
-    req->collection("prune").profile(profile);
-    req->execute();
-    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    req->collection("prune").execute();
+    if (expectedError.empty()) {
+      EXPECT_OK(req);
+    } else {
+      EXPECT_EQ(expectedError, req->errorCode()) << req->errorMsg();
+    }
     std::string out;
     for (auto* response : req->responses) {
       auto copy = response->proto;
-      copy.profile.reset();
       // Ops appear in completion order; compare them by name.
       using Entry = std::remove_cvref_t<decltype(*copy.ops.begin())>;
       std::vector<Entry> ops(copy.ops.begin(), copy.ops.end());
@@ -100,8 +104,15 @@ protected:
     return out;
   }
 
-  // Segments the request pruned, from the TopDocs pruned path.
+  void clearCache() {
+    auto* cache = currentReader()->filterCache();
+    cache->clear();
+    cache->resetAdmission();
+  }
+
+  // Count TopDocs segment skips on the cold plan.
   int64_t prunedBy(std::string_view json) {
+    clearCache();
     prunedSegments = 0;
     render(json);
     return prunedSegments.load();
@@ -130,12 +141,23 @@ protected:
     return helper->getSearchEngine().explain(req->rawRequest(), "");
   }
 
-  void expectSameWithAndWithoutPruning(std::string_view json) {
+  void expectSameWithAndWithoutPruning(std::string_view json, std::string_view expectedError = {}) {
     SCOPED_TRACE(std::string(json));
-    QueryPruning::disableForTests = true;
-    auto reference = render(json);
+    std::string reference;
+    for (bool disabled : {true, false}) {
+      clearCache();
+      QueryPruning::disableForTests = disabled;
+      auto cold = render(json, expectedError);
+      if (disabled) reference = cold;
+      else EXPECT_EQ(reference, cold);
+      // The second sighting admits eligible entries. Check the populated cache
+      // from both modes, always against the cold, unpruned response.
+      EXPECT_EQ(reference, render(json, expectedError));
+      EXPECT_EQ(reference, render(json, expectedError));
+      QueryPruning::disableForTests = !disabled;
+      EXPECT_EQ(reference, render(json, expectedError));
+    }
     QueryPruning::disableForTests = false;
-    EXPECT_EQ(reference, render(json));
   }
 };
 
@@ -183,9 +205,10 @@ TEST_F(SegmentPruningTest, resultsMatchUnprunedExecution) {
 }
 
 TEST_F(SegmentPruningTest, scoresUseStatisticsOfEverySegment) {
+  QueryPruning::verifyTermAbsenceForTests = true;
   indexThreeSegments();
-  // aardvark is provably absent from two segments: they skip its dictionary
-  // seek and contribute zero frequency, so scores equal unpruned ones.
+  // Only the first segment contributes df for aardvark. Verify each omitted
+  // statistics seek directly against the dictionary as well as comparing scores.
   std::string absentElsewhere = topDocs(R"({"match":{"body_t":"aardvark"}})");
   EXPECT_EQ(2, prunedBy(absentElsewhere));
   expectSameWithAndWithoutPruning(absentElsewhere);
@@ -236,9 +259,8 @@ TEST_F(SegmentPruningTest, reopenedProofsUseTheNewCoresDictionaryBounds) {
   }
 }
 
-TEST_F(SegmentPruningTest, collectionProofSkipsTermSeeksInPriceGap) {
+TEST_F(SegmentPruningTest, emptyRootSkipsTermSeeksInPriceGap) {
   indexThreeSegments();
-  QueryPruning::crossCheck = false;
   auto req = localReq(helper->getSearchEngine());
   req->collection("prune").topDocs().exprQuery("body_t:common AND price_i:[5 TO 8]").getScores().countLimit();
   SkipStatsScope stats;
@@ -250,7 +272,6 @@ TEST_F(SegmentPruningTest, collectionProofSkipsTermSeeksInPriceGap) {
 
 TEST_F(SegmentPruningTest, emptyConjunctionEmitsNamedZeroBucketWithoutStatSeeks) {
   indexThreeSegments();
-  QueryPruning::crossCheck = false;
   auto req = localReq(helper->getSearchEngine());
   parseQueryRequest(R"({"query":"body_t:common AND price_i:[5 TO 8]","get_scores":true,
     "ops":{"tags":{"field_facet":{"field":"tag_s"}},
@@ -277,7 +298,6 @@ TEST_F(SegmentPruningTest, impossibleClauseKeepsPreparedRowOpValidation) {
 
 TEST_F(SegmentPruningTest, provenZeroWarmsTheAuthoredWholeCountKey) {
   indexThreeSegments();
-  QueryPruning::crossCheck = false;
   for (int repeat = 0; repeat < 3; repeat++) {
     // The last request must find all three zeros even without proofs.
     QueryPruning::disableForTests = repeat == 2;
@@ -307,8 +327,6 @@ TEST_F(SegmentPruningTest, directPrefixScorerHonorsRootProof) {
 }
 
 TEST_F(SegmentPruningTest, statisticsSeeksSkipOnlyProvenAbsence) {
-  // Cross-check mode seeks proven-absent terms too; this test counts seeks.
-  QueryPruning::crossCheck = false;
   indexThreeSegments();
   auto reader = currentReader();
   MemPool pool;
@@ -329,8 +347,14 @@ TEST_F(SegmentPruningTest, statisticsSeeksSkipOnlyProvenAbsence) {
   ASSERT_NE(nullptr, common);
   EXPECT_EQ(9, common->termStats.docFreq);
   EXPECT_EQ(12, common->termStats.totalTermFreq);
+}
 
-  // Scorers on proven-absent segments are null, never crashes.
+TEST_F(SegmentPruningTest, unprunedScorersAgreeWithSegmentEvidence) {
+  indexThreeSegments();
+  QueryPruning::disableForTests = true;
+  auto reader = currentReader();
+  MemPool pool;
+  Query::Context context(pool, *reader);
   std::string_view words[] = {"common", "zebra"};
   int32_t positions[] = {0, 1};
   PhraseQuery phrase("body_t", words, positions);
@@ -343,9 +367,13 @@ TEST_F(SegmentPruningTest, statisticsSeeksSkipOnlyProvenAbsence) {
     query->validateLogical(context.planningContext());
     auto* weight = query->createWeight(context, Query::NEED_SCORES);
     for (auto& segment : reader->segments()) {
-      bool absent = query->mayMatch(CatalogSummaryView(pruning, context.planningContext(), segment.ord)) == Query::MatchState::EMPTY;
+      CatalogSummaryView evidence(pruning, context.planningContext(), segment.ord);
+      bool absent = query->mayMatch(evidence) == Query::MatchState::EMPTY;
+      // Only the last segment admits either the phrase or tag c. No segment admits both tags.
+      EXPECT_EQ(query == &conjunction || segment.ord < 2, absent);
       if (absent) {
-        EXPECT_EQ(nullptr, weight->createScorer(pool, segment)) << segment.ord;
+        auto* scorer = weight->createScorer(pool, segment);
+        EXPECT_TRUE(!scorer || scorer->next() == PostingsReader::END) << segment.ord;
       }
     }
   }
@@ -427,13 +455,26 @@ TEST_F(SegmentPruningTest, cacheHitWithoutAWeightReportsNoProof) {
   prunedSegments = 0;
   auto req = localReq(helper->getSearchEngine());
   parseQueryRequest(json, req->rawRequest(), req->mr);
-  SkipStatsScope stats;
-  req->collection("prune").profile(true).execute(false);
-  ASSERT_OK(req);
-  ASSERT_EQ(1, SkipStats::cacheFirstMembershipWeightSkips);
+  {
+    SkipStatsScope stats;
+    req->collection("prune").profile(true).execute(false);
+    ASSERT_OK(req);
+    ASSERT_EQ(1, SkipStats::cacheFirstMembershipWeightSkips);
+  }
   EXPECT_EQ(0, prunedSegments.load());
   for (const auto& op : req->responses.back()->proto.profile->ops) EXPECT_NE("pruning", op.name);
   EXPECT_TRUE(helper->getSearchEngine().explain(req->rawRequest(), "").empty());
+  expectSameWithAndWithoutPruning(json);
+}
+
+TEST_F(SegmentPruningTest, survivingDisjunctionDoesNotSupplyTheEmptyReason) {
+  indexThreeSegments();
+  auto query = R"({"boolean":{"required":[
+    {"boolean":{"optional":["tag_s:zzz","body_t:common"]}},
+    {"range":{"field":"price_i","gte":100}}]}})";
+  auto explained = notes(topDocs(query));
+  ASSERT_EQ(1u, explained.size());
+  EXPECT_TRUE(explained.front().contains("numeric bounds disjoint")) << explained.front();
 }
 
 TEST_F(SegmentPruningTest, reportsPruningInProfileAndExplain) {
@@ -562,7 +603,7 @@ TEST_F(SegmentPruningTest, booleanProofsFollowNormalizedMatchCounts) {
 
 TEST_F(SegmentPruningTest, routedAnyProvesOnlySegmentsWithoutAnySource) {
   indexThreeSegments();
-  // The facet resets to a. Its domain cannot keep c viable. The list needs
+  // The facet resets to a. Both outputs exclude segment c. The list needs
   // both a and b, and the two separately weighted a buckets must stay separate.
   auto json = topDocs(R"({"all":true})", R"(,"ops":{"tags":{
     "domain":{"query":"tag_s:a"},
@@ -571,7 +612,10 @@ TEST_F(SegmentPruningTest, routedAnyProvesOnlySegmentsWithoutAnySource) {
                              "three":{"boolean":{"required":["tag_s:b"]}}},
                    "selected":["one","two","three"],"selection_mode":"any"}}})");
   EXPECT_EQ(1, prunedBy(json));
+  auto* cache = currentReader()->filterCache();
+  auto hits = cache->counters().hits;
   expectSameWithAndWithoutPruning(json);
+  EXPECT_GT(cache->counters().hits, hits);
 }
 
 TEST_F(SegmentPruningTest, knnPreparationSeesPrunedSegments) {
@@ -616,18 +660,12 @@ TEST_F(SegmentPruningTest, mappedKnnKeepsGlobalWinnerBeforeCollection) {
     SCOPED_TRACE(op);
     std::string json = R"({"ops":{"q":{"domain":{"to":"items","filter":[{"knn":{
       "field":"v","query":[0,0],"k":1,"exact":true}}]},)" + std::string(op) + "}}}";
-    auto count = [&] {
-      auto req = localReq(helper->getSearchEngine());
-      parseQueryRequest(json, req->rawRequest(), req->mr);
-      req->collection("prune").execute();
-      EXPECT_TRUE(req->ok()) << req->errorMsg();
-      return req->getMatchCount();
-    };
-    QueryPruning::disableForTests = true;
-    auto reference = count();
-    EXPECT_EQ(0, reference);
-    QueryPruning::disableForTests = false;
-    EXPECT_EQ(reference, count());
+    auto req = localReq(helper->getSearchEngine());
+    parseQueryRequest(json, req->rawRequest(), req->mr);
+    req->collection("prune").execute();
+    ASSERT_OK(req);
+    EXPECT_EQ(0, req->getMatchCount());
+    expectSameWithAndWithoutPruning(json);
   }
 }
 
@@ -637,10 +675,7 @@ TEST_F(SegmentPruningTest, fusionSharedFiltersDoNotPoisonTheMembershipCache) {
   QueryPruning::disableForTests = true;
   auto reference = render(plain);
   QueryPruning::disableForTests = false;
-  auto* cache = currentReader()->filterCache();
-  ASSERT_NE(nullptr, cache);
-  cache->clear();
-  cache->resetAdmission();
+  clearCache();
   // The shared filter prunes the source's count in two segments; the
   // cached membership of body_t:common must not record them as empty.
   std::string fusion = R"({"ops":{"f":{"fusion":{"rrf":{},"limit":-1,"filter":["price_i:[11 TO 13]"],)"
@@ -650,7 +685,7 @@ TEST_F(SegmentPruningTest, fusionSharedFiltersDoNotPoisonTheMembershipCache) {
   EXPECT_EQ(reference, render(plain));
 }
 
-TEST_F(SegmentPruningTest, collectionProofAnswersBeforeAnyWeight) {
+TEST_F(SegmentPruningTest, emptyRootsSkipCollection) {
   indexThreeSegments();
   std::string outOfRange = R"({"range":{"field":"price_i","gte":100}})";
   // The term alone would seek every segment's dictionary for statistics.
@@ -685,7 +720,7 @@ TEST_F(SegmentPruningTest, collectionProofAnswersBeforeAnyWeight) {
 
 // kNN prepares over the whole index, so its op keeps its weights; its
 // segments are still pruned for collection, and the answer is unchanged.
-TEST_F(SegmentPruningTest, collectionProofLeavesWholeIndexPreparation) {
+TEST_F(SegmentPruningTest, emptyRootKeepsWholeIndexPreparation) {
   SchemaBuilder schema;
   auto& vector = schema.field("v_v");
   vector.type = api::FieldDef::FieldClass::VECTOR;
@@ -701,9 +736,11 @@ TEST_F(SegmentPruningTest, collectionProofLeavesWholeIndexPreparation) {
   std::string json = R"({"ops":{"q":{"top_docs":{"query":{"boolean":{"required":[)"
                      R"({"knn":{"field":"v_v","query":[0,0],"k":2}},{"range":{"field":"price_i","gte":100}}]}},)"
                      R"("limit":5,"count_limit":-1,"fields":["id"]}}}})";
+  auto explained = notes(json);
+  ASSERT_EQ(2u, explained.size());
+  for (const auto& note : explained) EXPECT_TRUE(note.starts_with("op q: pruned segment")) << note;
   EXPECT_EQ(2, prunedBy(json));
   expectSameWithAndWithoutPruning(json);
-  for (const auto& note : notes(json)) EXPECT_FALSE(note.contains("for the collection")) << note;
 }
 
 TEST_F(SegmentPruningTest, mismatchedFieldOffersNoProof) {
@@ -733,9 +770,6 @@ TEST_F(SegmentPruningTest, mismatchedFieldOffersNoProof) {
     auto count = search(withOptional("a"), 0);
     EXPECT_TRUE(count->ok()) << count->errorMsg();
     EXPECT_EQ(1, count->getMatchCount());
-    auto mismatch = search(range, 1);
-    EXPECT_EQ("field_type_mismatch", mismatch->errorCode()) << mismatch->errorMsg();
-
     auto scored = search(withOptional("zzz"), 1);
     if (disabled) {
       EXPECT_EQ("field_type_mismatch", scored->errorCode());
@@ -744,6 +778,7 @@ TEST_F(SegmentPruningTest, mismatchedFieldOffersNoProof) {
       EXPECT_EQ(0, scored->getMatchCount());
     }
   }
+  expectSameWithAndWithoutPruning(topDocs(range), "field_type_mismatch");
   auto reader = currentReader();
   MemPool pool;
   Query::PlanningContext planning(pool, *reader);
