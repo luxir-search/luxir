@@ -13,7 +13,7 @@
 #include <optional>
 #include <string_view>
 
-#include "Query.h"
+#include "CatalogSummaryView.h"
 
 namespace luxir::proof {
 
@@ -83,7 +83,9 @@ inline bool boundsExcludeTermRange(const DictionaryBounds& bounds,
 inline const DecodedFieldRecord* requireField(const CatalogSummaryView& view, std::string_view field,
                                              MatchState& out) {
   out = MatchState::UNKNOWN;
-  const DecodedFieldRecord* record = view.record(field);
+  auto evidence = view.record(field);
+  if (!evidence) return nullptr;
+  const auto* record = *evidence;
   if (record == nullptr) {
     view.prove("field absent");
     out = MatchState::EMPTY;

@@ -57,6 +57,7 @@ public:
 
   MatchState mayMatch(const CatalogSummaryView& view) const override {
     if (box.empty()) {
+      if (!view.record(field)) return MatchState::UNKNOWN;
       view.prove("empty geo box");
       return MatchState::EMPTY;
     }

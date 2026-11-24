@@ -12,6 +12,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
+#include "CatalogSummaryView.h"
 #include "Query.h"
 #include "AllQuery.h"
 #include "BoostQuery.h"
@@ -109,6 +110,9 @@ private:
     int minShouldMatch = 0;
     Query* singleChild = nullptr;
     uint32_t ruleMask = 0;
+
+    // A weight may also compile a generated Boolean outside the validated tree.
+    bool validated = false;
 
     bool dropsOptional(bool needsScores) const {
       return !disableUnscoredOptionalDropForTests && !needsScores
@@ -573,7 +577,7 @@ private:
   };
 
   static DuplicateGroups findDuplicateScoringGroups(
-      MemPool& pool, std::span<Query*> clauses, bool sumBoosts = true) {
+      MemPool& pool, std::span<Query*> clauses) {
     DuplicateGroups result;
     result.byClause.resize(clauses.size(), -1);
     if (clauses.size() < 2) return result;
@@ -608,12 +612,9 @@ private:
       }
       result.byClause[i] = slot;
       duplicate.count++;
-      if (sumBoosts) {
-        duplicate.boost += peeled.boost;
-        if (!std::isfinite(duplicate.boost)) {
-          throw std::runtime_error(
-              "summed duplicate-clause boost must be finite");
-        }
+      duplicate.boost += peeled.boost;
+      if (!std::isfinite(duplicate.boost)) {
+        throw std::runtime_error("summed duplicate-clause boost must be finite");
       }
     }
     return result;
@@ -675,7 +676,6 @@ private:
   // min_match > 1 and lets duplicates satisfy multiple match slots):
   // - Above half the raw clauses, preserve the miss budget.
   // - At or below half, preserve the absolute distinct-term count.
-  // Shared by logicalPlan and mayMatch so a proof counts what executes.
   static int32_t dedupedMinShouldMatch(
       int32_t minShouldMatch, size_t rawOptional, size_t distinctOptional) {
     int32_t removed = (int32_t) (rawOptional - distinctOptional);
@@ -1078,37 +1078,25 @@ public:
   // clause is the planner's match-all and stays unknown. Duplicate optional
   // clauses count once, against the min_match logicalPlan executes.
   MatchState mayMatch(const CatalogSummaryView& view) const override {
-    for (auto clauses : {mandatory, filter}) {
+    const auto* plan = view.planning.findLogicalPlan<CompiledBoolean>(*this);
+    if (!plan || !plan->validated) return MatchState::UNKNOWN;
+    if (plan->singleChild) return plan->singleChild->mayMatch(view);
+    for (auto clauses : {plan->mandatory, plan->filter}) {
       for (Query* clause : clauses) {
         if (clause->mayMatch(view) == MatchState::EMPTY) return MatchState::EMPTY;
       }
     }
-    if (optional.empty()) return MatchState::UNKNOWN;
-    bool optionalRequired = mandatory.empty() && filter.empty();
-    int64_t needed = minShouldMatch > 0 ? minShouldMatch : (optionalRequired ? 1 : 0);
-    if (needed == 0) return MatchState::UNKNOWN;
-    int64_t possible = 0;
-    if (minShouldMatch > 1) {
-      auto guard = MemPool::threadLocalPoolGuard();
-      DuplicateGroups duplicates = findDuplicateScoringGroups(guard.pool(), optional, false);
-      size_t distinct = 0;
-      for (size_t i = 0; i < optional.size(); i++) {
-        int32_t group = duplicates.byClause[i];
-        if (group >= 0 && i != duplicates.slots[(size_t) group].representative) continue;
-        distinct++;
-        if (optional[i]->mayMatch(view) != MatchState::EMPTY) possible++;
-      }
-      needed = dedupedMinShouldMatch(minShouldMatch, optional.size(), distinct);
-    } else {
-      for (Query* clause : optional) {
-        if (clause->mayMatch(view) != MatchState::EMPTY) possible++;
-      }
+    if (plan->optional.empty()) return MatchState::UNKNOWN;
+    int needed = plan->minShouldMatch;
+    if (plan->mandatory.empty() && plan->filter.empty()) {
+      needed = std::max(1, needed);
     }
-    if (possible < needed) {
-      view.prove("too few possible optional clauses");
-      return MatchState::EMPTY;
+    if (needed <= 0) return MatchState::UNKNOWN;
+    for (Query* clause : plan->optional) {
+      if (clause->mayMatch(view) != MatchState::EMPTY && --needed == 0) return MatchState::UNKNOWN;
     }
-    return MatchState::UNKNOWN;
+    view.prove("too few possible optional clauses");
+    return MatchState::EMPTY;
   }
 
   // Every match satisfies every MUST and FILTER clause, so their envelopes
@@ -1165,7 +1153,7 @@ public:
     checkedBoostProduct(multiplier, 1.0f);
     // Build the logical plan here so its errors surface as validation
     // errors; nodes it generates are marked and skip the validation check.
-    logicalPlan(context);
+    auto& plan = logicalPlan(context);
 
     auto validate = [&](std::span<Query*> clauses, float childMultiplier) {
       for (Query* clause : clauses) {
@@ -1176,6 +1164,7 @@ public:
     validate(optional, multiplier);
     validate(prohibited, 1.0f);
     validate(filter, 1.0f);
+    plan.validated = true;
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
