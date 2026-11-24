@@ -77,58 +77,52 @@ inline bool boundsExcludeTermRange(const DictionaryBounds& bounds,
   return false;
 }
 
-// Looks the field up without using it: an exhaustive view must see every
-// field the query's weights would (see CatalogSummaryView::exhaustive).
-inline void touch(const CatalogSummaryView& view, std::string_view field) {
-  if (view.exhaustive()) view.header(field);
-}
-
 // Field absence and a record without documents prove every value-requiring
-// predicate empty. Returns the header to consult for bounds, or null with
+// predicate empty. Returns the record to consult for bounds, or null with
 // `out` set.
-inline const FieldRecordHeader* requireField(const CatalogSummaryView& view, std::string_view field,
+inline const DecodedFieldRecord* requireField(const CatalogSummaryView& view, std::string_view field,
                                              MatchState& out) {
   out = MatchState::UNKNOWN;
-  const FieldRecordHeader* header = view.header(field);
-  if (header == nullptr) {
+  const DecodedFieldRecord* record = view.record(field);
+  if (record == nullptr) {
     view.prove("field absent");
     out = MatchState::EMPTY;
     return nullptr;
   }
-  if (header->docsWithField == 0) {
+  if (record->docsWithField == 0) {
     view.prove("field has no values");
     out = MatchState::EMPTY;
     return nullptr;
   }
-  return header;
+  return record;
 }
 
-// Whether the header proves `term` absent from the field's dictionary: no
+// Whether the record proves `term` absent from the field's dictionary: no
 // terms, or term bounds that exclude it. Null (no record) is absence too.
-inline bool headerExcludesTerm(const FieldRecordHeader* header, std::string_view term) noexcept {
-  if (header == nullptr || header->docsWithField == 0) return true;
-  if ((header->flags & FieldType::INDEX_DOCS) && header->indexedTotals.numTerms == 0) return true;
-  const auto* bounds = std::get_if<DictionaryBounds>(&header->bounds);
+inline bool recordExcludesTerm(const DecodedFieldRecord* record, std::string_view term) noexcept {
+  if (record == nullptr || record->docsWithField == 0) return true;
+  if ((record->flags & FieldType::INDEX_DOCS) && record->indexedTotals().numTerms == 0) return true;
+  const auto* bounds = record->dictionaryBounds();
   return bounds != nullptr && boundsExcludeTerm(*bounds, term);
 }
 
-// The dictionary bounds of an indexed header, or null with `out` set when
+// The dictionary bounds of an indexed record, or null with `out` set when
 // the field indexes no terms.
-inline const DictionaryBounds* dictionary(const CatalogSummaryView& view, const FieldRecordHeader& header,
+inline const DictionaryBounds* dictionary(const CatalogSummaryView& view, const DecodedFieldRecord& record,
                                           MatchState& out) {
-  if ((header.flags & FieldType::INDEX_DOCS) && header.indexedTotals.numTerms == 0) {
+  if ((record.flags & FieldType::INDEX_DOCS) && record.indexedTotals().numTerms == 0) {
     view.prove("field has no terms");
     out = MatchState::EMPTY;
     return nullptr;
   }
-  return std::get_if<DictionaryBounds>(&header.bounds);
+  return record.dictionaryBounds();
 }
 
 inline MatchState termMatch(const CatalogSummaryView& view, std::string_view field, std::string_view term) {
   MatchState state;
-  const auto* header = requireField(view, field, state);
-  if (header == nullptr) return state;
-  const auto* bounds = dictionary(view, *header, state);
+  const auto* record = requireField(view, field, state);
+  if (record == nullptr) return state;
+  const auto* bounds = dictionary(view, *record, state);
   if (bounds != nullptr && boundsExcludeTerm(*bounds, term)) {
     view.prove("term outside term bounds");
     return MatchState::EMPTY;
@@ -138,9 +132,9 @@ inline MatchState termMatch(const CatalogSummaryView& view, std::string_view fie
 
 inline MatchState prefixMatch(const CatalogSummaryView& view, std::string_view field, std::string_view prefix) {
   MatchState state;
-  const auto* header = requireField(view, field, state);
-  if (header == nullptr) return state;
-  const auto* bounds = dictionary(view, *header, state);
+  const auto* record = requireField(view, field, state);
+  if (record == nullptr) return state;
+  const auto* bounds = dictionary(view, *record, state);
   if (bounds != nullptr && boundsExcludePrefix(*bounds, prefix)) {
     view.prove("prefix outside term bounds");
     return MatchState::EMPTY;
@@ -152,9 +146,9 @@ inline MatchState termRangeMatch(const CatalogSummaryView& view, std::string_vie
                                  std::optional<std::string_view> lower, bool lowerInclusive,
                                  std::optional<std::string_view> upper, bool upperInclusive) {
   MatchState state;
-  const auto* header = requireField(view, field, state);
-  if (header == nullptr) return state;
-  const auto* bounds = dictionary(view, *header, state);
+  const auto* record = requireField(view, field, state);
+  if (record == nullptr) return state;
+  const auto* bounds = dictionary(view, *record, state);
   if (bounds != nullptr && boundsExcludeTermRange(*bounds, lower, lowerInclusive, upper, upperInclusive)) {
     view.prove("term range outside term bounds");
     return MatchState::EMPTY;
@@ -166,9 +160,9 @@ inline MatchState termRangeMatch(const CatalogSummaryView& view, std::string_vie
 // proves them empty.
 inline MatchState termsMatch(const CatalogSummaryView& view, std::string_view field) {
   MatchState state;
-  const auto* header = requireField(view, field, state);
-  if (header == nullptr) return state;
-  dictionary(view, *header, state);
+  const auto* record = requireField(view, field, state);
+  if (record == nullptr) return state;
+  dictionary(view, *record, state);
   return state;
 }
 
@@ -178,9 +172,9 @@ inline MatchState termsMatch(const CatalogSummaryView& view, std::string_view fi
 template <typename Intersects>
 inline MatchState numericMatch(const CatalogSummaryView& view, std::string_view field, Intersects&& intersects) {
   MatchState state;
-  const auto* header = requireField(view, field, state);
-  if (header == nullptr) return state;
-  const auto* bounds = std::get_if<field_parts::ScalarBounds>(&header->bounds);
+  const auto* record = requireField(view, field, state);
+  if (record == nullptr) return state;
+  const auto* bounds = record->scalarBounds();
   if (bounds != nullptr && !bounds->empty() && !intersects(bounds->min, bounds->max)) {
     view.prove("numeric bounds disjoint");
     return MatchState::EMPTY;
@@ -199,9 +193,9 @@ inline MatchState existsMatch(const CatalogSummaryView& view, std::string_view f
 inline MatchState geoMatch(const CatalogSummaryView& view, std::string_view field, int32_t minLat, int32_t maxLat,
                            int32_t minLon, int32_t maxLon) {
   MatchState state;
-  const auto* header = requireField(view, field, state);
-  if (header == nullptr) return state;
-  const auto* bounds = std::get_if<field_parts::GeoBounds>(&header->bounds);
+  const auto* record = requireField(view, field, state);
+  if (record == nullptr) return state;
+  const auto* bounds = record->geoBounds();
   if (bounds == nullptr || bounds->lat.empty() || bounds->lon.empty()) return MatchState::UNKNOWN;
   auto overlaps = [](const field_parts::AxisBounds<int32_t>& axis, int32_t lo, int32_t hi) {
     return !(hi < axis.min || lo > axis.max);
@@ -217,13 +211,13 @@ inline MatchState geoMatch(const CatalogSummaryView& view, std::string_view fiel
 }
 
 // A range field query is one inclusive box over each interval's encoded
-// (low, high) endpoints; the header bounds every low and every high.
+// (low, high) endpoints; the record bounds every low and every high.
 inline MatchState intervalMatch(const CatalogSummaryView& view, std::string_view field,
                                 const int64_t lo[2], const int64_t hi[2]) {
   MatchState state;
-  const auto* header = requireField(view, field, state);
-  if (header == nullptr) return state;
-  const auto* bounds = std::get_if<field_parts::IntervalBounds>(&header->bounds);
+  const auto* record = requireField(view, field, state);
+  if (record == nullptr) return state;
+  const auto* bounds = record->intervalBounds();
   if (bounds == nullptr || bounds->low.empty() || bounds->high.empty()) return MatchState::UNKNOWN;
   auto disjoint = [](const field_parts::ScalarBounds& axis, int64_t qlo, int64_t qhi) {
     return axis.max < qlo || qhi < axis.min;

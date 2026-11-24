@@ -3,7 +3,7 @@
 
 // Query::mayMatch over field record headers: the dictionary bound checks in
 // every bounds mode, the proofs each query kind gives from presence and
-// bounds over real segments, merged headers for the collection view, and
+// bounds over real segments, collection-wide emptiness, and
 // the conservative answers for unknown evidence.
 
 #include <gtest/gtest.h>
@@ -214,46 +214,16 @@ TEST_F(QueryPruningUnit, booleanCombination) {
   EXPECT_EQ(MatchState::EMPTY, evaluate(*DisMaxQuery::make(pool, disjuncts, 0.0f)));
 }
 
-// The collection view merges every segment's header: bounds union, counts
-// sum, and a field is absent only when no segment has it.
-TEST_F(QueryPruningUnit, collectionViewMergesHeaders) {
-  indexTwoSegments();
-  auto current = reader();
-  CatalogSummaryView collection(*current, CatalogSummaryView::COLLECTION);
-  const auto* price = collection.header("price_i");
-  ASSERT_NE(nullptr, price);
-  EXPECT_EQ(3, price->docsWithField);
-  const auto* numeric = std::get_if<field_parts::ScalarBounds>(&price->bounds);
-  ASSERT_NE(nullptr, numeric);
-  EXPECT_EQ(10, numeric->min);
-  EXPECT_EQ(50, numeric->max);
-  const auto* tag = std::get_if<field_parts::DictionaryBounds>(&collection.header("tag_s")->bounds);
-  ASSERT_NE(nullptr, tag);
-  EXPECT_EQ("green", std::string_view(tag->lower));
-  EXPECT_EQ("zebra", std::string_view(tag->upper));
-  EXPECT_EQ(nullptr, collection.header("never_s"));
-  EXPECT_NE(nullptr, collection.header("body_t"));
-  EXPECT_EQ(MatchState::UNKNOWN, TermQuery("tag_s", "zebra").mayMatch(collection));
-  EXPECT_EQ(MatchState::EMPTY, TermQuery("tag_s", "zz").mayMatch(collection));
-  // The union of [10, 20] and [50, 50] does not see the gap between them.
-  EXPECT_EQ(MatchState::UNKNOWN, NumericPredicateQuery("price_i", 21, 49).mayMatch(collection));
-  EXPECT_EQ(MatchState::EMPTY, NumericPredicateQuery("price_i", 21, 49).mayMatch(CatalogSummaryView(*current, 0)));
-}
-
-// A query without proofs marks the view opaque; the collection proof then
-// stands aside, as it could not have looked up that query's fields.
-TEST_F(QueryPruningUnit, opaqueQueriesDisableTheCollectionProof) {
+TEST_F(QueryPruningUnit, unknownRequiredClauseAllowsAnIndependentProof) {
   indexTwoSegments();
   auto current = reader();
   QueryPruning pruning(*current);
   TermQuery absent("tag_s", "aaa");
   EXPECT_TRUE(pruning.collectionEmpty(absent));
-  EXPECT_EQ("term outside term bounds", pruning.collectionReason(absent));
   NoProofQuery opaque;
   std::vector<Query*> must = {&absent, &opaque};
   BooleanQuery both(must, {}, {}, {});
-  EXPECT_FALSE(pruning.collectionEmpty(both));
-  // Per segment the proof still holds: weights exist by then.
+  EXPECT_TRUE(pruning.collectionEmpty(both));
   EXPECT_FALSE(pruning.membership(both).test(0));
   EXPECT_FALSE(pruning.membership(both).test(1));
 }

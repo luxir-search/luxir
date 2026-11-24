@@ -120,10 +120,9 @@ locations, browse `src/luxir/<area>/`.
      metadata-only count probes use conservative bounds until it is known.
    - Supports Term, Boolean, Phrase, and All queries
    - `Query::mayMatch` proves from field record headers, through a
-     `CatalogSummaryView` (one segment, or the merged headers of the
-     collection), that a query cannot match; `CatalogPredicates.h` holds the
-     leaf proofs. `IndexReader::FieldSegments::header` / `mergedHeader`
-     memoize the headers with the field totals. `QueryPruning` evaluates and
+     `CatalogSummaryView` of one segment, that a query cannot match.
+     `CatalogPredicates.h` reads the core-owned catalog records through
+     `IndexReader::FieldSegments::at`. `QueryPruning` evaluates and
      memoizes verdicts per request as `SegmentMask`s, which the parser turns
      into each TopDocs op's collection mask (`SearchOp::viable`) or, for a collection proof,
      a `MatchNoDocsQuery`. See
