@@ -434,11 +434,12 @@ message KnnQuery {
   // The match set contains one best scored witness per selected group.
   string unit = 7;
 
-  // Minimum vector similarity for a hit, in the metric's own space (not the
-  // transformed score): for l2 the maximum L2 distance (not squared), for ip
-  // the minimum dot product, for cosine the minimum cosine similarity. Hits
-  // beyond it are dropped from the k nearest, so fewer than k may match.
-  // Compared before any enclosing boost. Must be finite; l2 requires >= 0.
+  // Threshold for the k nearest hits, applied before any enclosing boost.
+  // For l2, the maximum unsquared L2 distance. For ip, the minimum dot
+  // product. For cosine, the minimum cosine similarity. For hamming, the
+  // minimum score (1 - hamming distance / dims).
+  // The threshold must be finite, and l2 requires a nonnegative value.
+  // Fewer than k hits may match.
   optional float similarity = 8;
 
   // Search effort for IVF indexes.
@@ -2697,16 +2698,18 @@ message FieldDef {
   // and query vector, for Matryoshka (MRL) embeddings whose prefixes are
   // usable embeddings. Requires dims (the full input dimension, which must be
   // larger) and metric COSINE, which renormalizes the prefix, or HAMMING,
-  // which needs a multiple of 8; normalized=true is rejected. Inputs carry dims components, or truncate_dims for a vector
-  // already truncated. The column, ANN overlays and kNN scoring use
-  // truncate_dims. Unset inherits; 0 means no truncation.
+  // which needs a multiple of 8. normalized=true is rejected. Inputs carry
+  // dims components, or truncate_dims for a vector already truncated. The
+  // column, ANN overlays and kNN scoring use truncate_dims. Unset inherits.
+  // A value of 0 disables truncation.
   optional int32 truncate_dims = 19;
 
   // VECTOR only. Column storage encoding. Unset inherits, falling back to
   // BIT for metric HAMMING and F32 otherwise. F16 rejects elements with a
   // magnitude above 65504. Applies to newly written segments; merges rewrite
-  // older segments in it. An existing field cannot change between BIT and
-  // the other encodings.
+  // older segments in it. Merges do not convert across the BIT boundary, and a
+  // schema change that makes a field resolve across it is rejected if a
+  // published segment holds values for the field on the other side.
   optional VectorEncoding encoding = 20;
 
   // VECTOR only: ANN overlay settings. Absent inherits the parent's whole

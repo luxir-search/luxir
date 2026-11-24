@@ -43,7 +43,7 @@ inline constexpr int32_t SQ8_LEVELS = 255;
 // Largest finite binary16 value.
 inline constexpr float F16_MAX = 65504.0f;
 
-inline bool valid(int32_t encoding) {
+inline constexpr bool valid(int32_t encoding) {
   return encoding >= (int32_t)VectorEncoding::F32 && encoding <= (int32_t)VectorEncoding::BIT;
 }
 

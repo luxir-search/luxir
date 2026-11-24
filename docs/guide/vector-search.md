@@ -272,9 +272,14 @@ score on that scale.
   row costs a few popcount instructions.
 - `truncate_dims` keeps the signs of the leading components, for binary
   quantization of Matryoshka embeddings.
-- A field cannot change between `bit` and the other encodings: a merge never
-  converts between them, so the schema change is rejected. Index into a new
-  field instead.
+- An empty field can change between `bit` and the float encodings. A schema
+  update is rejected if it makes a field's definition incompatible with
+  values in a published segment. This includes removing a declaration that
+  exposes an incompatible template. To switch a field with existing values,
+  reindex into a new field.
+- Buffered writes can still land on the old side after a schema change.
+  Merges keep the two sides apart. kNN fails while it has old-side vectors
+  to score and can query the new vectors once the old documents are deleted.
 
 ### Truncate Matryoshka embeddings
 
@@ -999,13 +1004,14 @@ thresholds per deployment.
 
 `similarity` drops the nearest neighbors that are not similar enough, with the
 semantics of Elasticsearch's `knn.similarity`. The value is in the metric's
-space, not the score's:
+space, not the score's (for `hamming` the two are the same):
 
 | Metric | `similarity` means | Hit kept when |
 |---|---|---|
 | `l2` | Maximum L2 distance (not squared); must be `>= 0` | `distance <= similarity` |
 | `ip` | Minimum dot product | `dot >= similarity` |
 | `cosine` | Minimum cosine similarity | `cosine >= similarity` |
+| `hamming` | Minimum score, `1 - hamming distance / dims` | `score >= similarity` |
 
 ```json
 {"query": {"knn": {"field": "embedding_v", "query": [0.75, 0.15, 0.10], "k": 20, "similarity": 0.8}}}
