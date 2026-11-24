@@ -449,8 +449,12 @@ void SegmentCore::listParts(const std::function<bool(std::string_view space, std
       if (const auto* number = record->numberColumn()) navigation(number->index());
       navigation(record->ordBlockMetadata(space.maxDoc));
       if (record->points()) navigation(record->pointsDirectory());
-      if (const auto* stored = record->stored()) navigation(stored->names());
-      navigation(record->idFilter(), ReadClass::DATA);
+      if (const auto* stored = record->stored()) {
+        navigation(stored->names());
+        navigation(stored->firstDocs);  // the chunk index
+        navigation(stored->chunkOffsets);
+      }
+      navigation(record->idFilter());
       if (data(path, name)) selected.push_back(record);
     }
   }
@@ -479,8 +483,6 @@ void SegmentCore::listParts(const std::function<bool(std::string_view space, std
       if (const auto* stored = record->stored()) {
         extent(stored->chunks());
         extent(stored->dictionary());
-        extent(stored->firstDocs);
-        extent(stored->chunkOffsets);
       }
       extent(record->endValueRanks());
       extent(record->owners());

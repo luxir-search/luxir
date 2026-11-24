@@ -562,8 +562,8 @@ still complete afterwards, and their holds are kept.
 a snapshot without reading anything: each file's header and the catalog
 (`CATALOG`), the navigation parts of every field in every row space
 (`NAVIGATION`: term routing data, column indexes, ordinal block metadata,
-points directories, stored field names, id filters, version runs and
-ownership columns), and the data extents of the named fields, or of all
+points directories, stored field names and chunk indexes, id filters,
+version runs and ownership columns), and the data extents of the named fields, or of all
 fields with `allData` (`DATA`: dictionaries, postings, norms, columns, points
 leaves, stored chunks). Each entry gives the file name, offset and length, the
 `ReadClass` the readers acquire it with, the row space and the field. These are
