@@ -2169,15 +2169,12 @@ public:
     // every segment's domain, and the op is left to its (empty) root mask.
     std::vector<Query*> provenRoots;
     Query* provenQuery = nullptr;
-    std::span<ParsedFilter> provenFilters;
     if (domainVariants.empty() && !routedFilters && (foldFilters || filters.empty())
         && !planningContext->mayPrepare && pruningOf().collectionEmpty(*query)) {
       provenRoots = pruningRoots(*query, filters, {});
       provenQuery = query;
-      provenFilters = filters;
       query = domainQuery = req.requestPool.make<MatchNoDocsQuery>();
       query->validateLogical(*planningContext);
-      filters = {};
     }
 
     // Flags for this request's main query. Filters inherit these after
@@ -2437,7 +2434,7 @@ public:
     }
     Query::Weight* domainQueryWeight = nullptr;
     std::span<Query::Weight*> domainFilterWeights;
-    if (!routedFilters && !cacheFirstExactDomain && requirements.needExactDomain
+    if (provenQuery == nullptr && !routedFilters && !cacheFirstExactDomain && requirements.needExactDomain
         && (!requirements.needRankedDocs
             || (constantExactDomainRanking
                 && !parsedSorts.useFieldSort))) {
@@ -2648,7 +2645,7 @@ public:
     if (!provenRoots.empty()) collectionProven.emplace(qr, std::move(provenRoots));
     if (QueryPruning::crossCheck) {
       addPruneChecks(*qr, qcontext, *planningContext, provenQuery ? *provenQuery : *query,
-                     provenQuery ? provenFilters : filters, foldFilters);
+                     filters, foldFilters);
     }
     // A fusion source reports once the fusion's shared filters joined its mask.
     if (placement != TopDocsPlacement::FUSION_SOURCE) reportPruning(*qr, pruningRoots(*query, filters, {}));
