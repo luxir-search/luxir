@@ -3693,7 +3693,7 @@ bool IndexWriter::prepareDeletes(SegmentDeletes& target) {
     if (published != nullptr && published->segInfo.live_gen == seg.liveGen) live = published->rootLive();
     if (!live) {
       live = SegmentLive::open(dir, seg.segId, seg.creatorEpoch, seg.liveGen, seg.liveEpoch,
-                               target.core->rootReader().maxDoc(), -1, seg.liveFile ? seg.liveFile->size : 0,
+                               target.core->rootReader().maxDoc(), seg.liveDocs, seg.liveFile ? seg.liveFile->size : 0,
                                false, false);
     }
   }
