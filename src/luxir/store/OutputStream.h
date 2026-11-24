@@ -38,6 +38,8 @@ public:
   uint32_t filenum() const noexcept { return x >> OFFSET_BITS; }
   uint64_t offset() const noexcept { return x & OFFSET_MASK; }
   uint64_t raw() const noexcept { return x; }
+  // File 0, offset 0 encodes "no location". No part can start there: every
+  // segment data file begins with its header (PostingsWriter::beginSlice).
   bool isNull() const noexcept { return x == 0; }
   bool operator==(const seg_location&) const = default;
 
