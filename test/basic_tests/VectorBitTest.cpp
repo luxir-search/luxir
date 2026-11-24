@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -14,9 +15,9 @@
 #include <vector>
 
 #include "luxir/codec/VectorCodec.h"
+#include "luxir/query/HammingKernel.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/schema/Schema.h"
-#include "luxir/util/Popcount.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -135,18 +136,27 @@ TEST_F(VectorBitTest, codec) {
 
 // Every length through the vector chunks, 64-bit words and byte tail, from
 // unaligned addresses.
-TEST_F(VectorBitTest, popcountHamming) {
+TEST_F(VectorBitTest, hammingKernelsMatchByteReference) {
   std::mt19937 rng(7);
   std::vector<uint8_t> a(300), b(300);
   for (size_t i = 0; i < a.size(); i++) {
     a[i] = (uint8_t)rng();
     b[i] = (uint8_t)rng();
   }
-  for (size_t offset : {0, 1, 5}) {
-    for (size_t n = 0; n + offset <= 290; n++) {
+  auto levels = hamming::supported();
+  ASSERT_FALSE(levels.empty());
+  for (size_t n = 0; n <= 290; n++) {
+    SCOPED_TRACE(n);
+    auto best = hamming::best(n);
+    ASSERT_TRUE(std::ranges::any_of(levels, [&](const auto& level) { return level.count == best; }));
+    for (size_t offset : {0, 1, 5}) {
+      SCOPED_TRACE(offset);
       uint64_t expected = 0;
       for (size_t i = 0; i < n; i++) expected += (uint64_t)std::popcount((uint8_t)(a[offset + i] ^ b[offset + i]));
-      ASSERT_EQ(expected, popcnt::hamming(a.data() + offset, b.data() + offset, n)) << n << " " << offset;
+      for (const auto& level : levels) {
+        SCOPED_TRACE(level.name);
+        ASSERT_EQ(expected, level.count(a.data() + offset, b.data() + offset, n));
+      }
     }
   }
 }

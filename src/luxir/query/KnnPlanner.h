@@ -70,10 +70,9 @@ struct KnnPlanner {
     // Row 0 averages L2 and IP, and row 1 uses cosine. The 50k 768-dimensional
     // vectors fit in memory. f32 cosine over a raw column (normalize_on_write
     // false) also pays a norm pass but stays at 1, as before encodings were priced.
-    // bit (hamming, never cosine) measured the same way on an AVX2 host
-    // (i7-14700KF): 768-bit hamming rows at 291 us per query against f32 L2
-    // and IP at 4.8 ms.
-    static constexpr double BIT_DIM_COST = 0.06;
+    // bit (hamming, never cosine) was measured the same way: 768-bit rows at
+    // 445 us per query against f32 L2 and IP at 4.18 ms.
+    static constexpr double BIT_DIM_COST = 0.106;
     static constexpr std::array<std::array<double, 5>, 2> ENCODING_DIM_COST{{
         {1, 0.457, 0.459, 0.528, BIT_DIM_COST},
         {1, 0.722, 0.712, 0.668, BIT_DIM_COST}}};

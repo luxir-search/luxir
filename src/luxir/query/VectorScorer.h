@@ -18,9 +18,9 @@
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/codec/VectorCodec.h"
+#include "luxir/query/HammingKernel.h"
 #include "luxir/query/Sq8Kernel.h"
 #include "luxir/schema/FieldType.h"
-#include "luxir/util/Popcount.h"
 
 namespace luxir {
 
@@ -32,11 +32,11 @@ namespace luxir {
 /// Scores are higher-is-better: L2 -> 1 / (1 + squared distance), IP -> dot,
 /// COSINE -> dot / |x|, HAMMING -> 1 - hamming distance / dims.  HAMMING
 /// scores only BIT rows and BIT rows score only under HAMMING: the query is
-/// packed like a stored row once (element > 0) and compared with
-/// popcnt::hamming, in integers, so it is exact.  The query is already unit length for COSINE; an F32
-/// column of unit vectors skips the division (normalizeColumn false).  A
-/// stored unit vector in another encoding is not exactly unit length, so its
-/// cosine always divides by the stored norm.
+/// packed like a stored row once (element > 0) and compared by an integer
+/// kernel chosen for the CPU and row size. For COSINE the query is already
+/// unit length, and an F32 column of unit vectors skips the division
+/// (normalizeColumn false). A stored unit vector in another encoding is not
+/// exactly unit length, so its cosine always divides by the stored norm.
 ///
 /// F16 and BF16 rows are scored in place by FAISS's ScalarQuantizer distance
 /// computers (QT_fp16 is IEEE binary16 and QT_bf16 the high half of the float
@@ -65,7 +65,8 @@ class VectorScorer {
   const sq8::Kernels* sq8Kernels;
   // SQ8 without the sq8 kernels: the decoded row.
   mutable std::vector<float> scratch;
-  // BIT: the query packed like a stored row.
+  // BIT: the kernel and query packed like a stored row.
+  hamming::KernelFn hammingKernel = nullptr;
   std::vector<uint8_t> queryBits;
   // F16 / BF16: computers built from quantizer, which owns any trained state
   // they point into (none for the 16-bit types).  distance returns the
@@ -104,6 +105,7 @@ public:
     checkScorable(encoding, metric);
     if (encoding == VectorEncoding::BIT) {
       queryBits.resize((size_t)vcodec::bytesPerVector(encoding, dims));
+      hammingKernel = hamming::best(queryBits.size());
       vcodec::encode(encoding, query, dims, (char*)queryBits.data());
     }
     if (encoding == VectorEncoding::SQ8 && !sq8Kernels) scratch.resize((size_t)dims);
@@ -140,7 +142,7 @@ public:
         return score16((const uint8_t*)row.data(), fallbackScore);
       case VectorEncoding::BIT: {
         if (metric != (int32_t)api::VectorMetric::HAMMING) return fallbackScore;
-        uint64_t distance = popcnt::hamming(queryBits.data(), (const uint8_t*)row.data(), queryBits.size());
+        uint64_t distance = hammingKernel(queryBits.data(), (const uint8_t*)row.data(), queryBits.size());
         return 1.0f - (float)distance / (float)dims;
       }
       case VectorEncoding::SQ8:
