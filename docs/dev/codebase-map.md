@@ -186,8 +186,9 @@ locations, browse `src/luxir/<area>/`.
    - `VectorReader`: reads column-stored vectors in the segment's `VectorEncoding`
      (`codec/VectorCodec.h`: f32, f16, bf16, per-vector sq8) for exact flat KNN
    - `VectorScorer` (`query/`): the one place a float query is scored against a stored row
-     per encoding (FAISS scalar-quantizer computers for f16 and bf16), shared by the
-     flat column scan and candidate rescore
+     per encoding (FAISS scalar-quantizer computers for f16 and bf16, the register
+     kernels of `query/Sq8Kernel.h` for sq8), shared by the flat column scan and
+     candidate rescore
    - `VectorTranscoder`: a vector column's encoding in a merge (the schema's current one),
      re-encoding inputs in another; `SegmentMerger` passes each value through it
    - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (RaBitQ by default, or explicit PQ) aux overlays for ANN, built from the decoded column
