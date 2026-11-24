@@ -97,6 +97,14 @@ void service(Renderer& r, const api::ServiceStats& s) {
                                 {"vector_build", &s.vector_build}, {"reader_refresh", &s.reader_refresh}})
     r.activity("luxir_background", "luxir_background_duration_seconds", *activity, s.background_duration_bounds,
                PrometheusText::label("kind", kind));
+  constexpr std::string_view workers = "Pool workers now in each arena; indexing keeps at least one while it has work.";
+  r.gauge("luxir_arena_workers", workers, (double)s.query_workers, PrometheusText::label("arena", "query"));
+  r.gauge("luxir_arena_workers", workers, (double)s.indexing_workers, PrometheusText::label("arena", "indexing"));
+  r.gauge("luxir_merges_running", "Merges holding a node-wide merge slot.", (double)s.merges_running);
+  r.gauge("luxir_merges_waiting", "Collections queued for a node-wide merge slot.", (double)s.merges_waiting);
+  r.counter("luxir_merge_slot_waits_total", "Merges that waited for a node-wide merge slot.", (double)s.merge_slot_waits);
+  r.counter("luxir_merge_slot_wait_seconds_total", "Summed wait of merges for a node-wide merge slot.", s.merge_slot_wait_seconds);
+  r.counter("luxir_merge_paced_seconds_total", "Time merge writes waited on indexing.merge-max-bytes-per-sec.", s.merge_paced_seconds);
   r.gauge("luxir_control_threads", "Control executor threads (administration, replication transfers, detailed stats).", (double)s.control_threads);
   r.gauge("luxir_control_busy", "Control executor tasks running now.", (double)s.control_busy);
   r.gauge("luxir_control_queued", "Control executor tasks waiting for a thread.", (double)s.control_queued);

@@ -19,6 +19,7 @@
 #include "luxir/index/IndexRamBudget.h"
 #include "luxir/util/ApiError.h"
 #include "luxir/index/MergeCostModel.h"
+#include "luxir/index/MergeSlots.h"
 #include "luxir/store/Directory.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/search/IndexReader.h"
@@ -586,6 +587,13 @@ public:
   // the unlinked files' pages), so it stays off the commit that retired them.
   std::unique_ptr<ContinueMultiFunc> segmentReleaseNode;
 
+  // The node-wide merge limit (null = none) and this writer's place in its
+  // queue.  A slot handed to the ticket wakes mergeResumeNode, which submits
+  // the due policy merge or hands the slot back.
+  std::shared_ptr<MergeSlots> mergeSlots;
+  std::shared_ptr<MergeSlots::Ticket> mergeTicket;
+  std::unique_ptr<ContinueMultiFunc> mergeResumeNode;
+
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > commitSequencerNode;
   std::unique_ptr<UpdateMessageMultiFunc> commitFinishNode;
 
@@ -637,6 +645,16 @@ public:
   // pressure (releaseInverter). Shedding smaller inverters spams tiny segments
   // without meaningful RAM relief, e.g. when merge reservations hold the budget.
   size_t pressureFlushFloorBytes = 4 * 1024 * 1024;
+
+  // Paces the segment data files background merges write (node-wide, shared
+  // by Collections); null = unpaced.  Forced merges are never paced.  Set
+  // before the writer's first merge, like the fields above.
+  std::shared_ptr<ByteRateLimiter> mergeRateLimiter;
+
+  // Joins the node-wide merge limit (indexing.max-concurrent-merges); without
+  // it the writer's merges are limited only by its own one-at-a-time policy.
+  // Call once, before the writer's first merge.
+  void setMergeSlots(std::shared_ptr<MergeSlots> slots);
 
   // TEXT merge partitioning thresholds. Tests and constrained deployments may
   // lower these without changing the on-disk behavior of flushes or serial merges.
@@ -903,7 +921,7 @@ private:
   void releaseSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void moveSegmentToDelete(uint64_t segId);
   uint64_t applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
-  bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
+  bool finishMergeTail(MergeMessage& msg, bool allowSyntheticCommit, bool chainNextMerge = true);
   bool mergeSegmentsBody(MergeMessage& msg);
 
 public:

@@ -613,6 +613,13 @@ struct ServiceStats {
   ActivityStats merge;
   ActivityStats vector_build;
   ActivityStats reader_refresh;
+  int64_t query_workers = 0;
+  int64_t indexing_workers = 0;
+  int64_t merges_running = 0;
+  int64_t merges_waiting = 0;
+  uint64_t merge_slot_waits = 0;
+  double merge_slot_wait_seconds = 0;
+  double merge_paced_seconds = 0;
   uint64_t control_threads = 0;
   uint64_t control_busy = 0;
   uint64_t control_queued = 0;

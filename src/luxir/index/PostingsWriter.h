@@ -85,10 +85,12 @@ private:
     uint32_t fileNum;
     bool available = false;
 
-    DataFile(Directory& dir, std::string_view segStr, uint32_t fileNum)
+    DataFile(Directory& dir, std::string_view segStr, uint32_t fileNum, ByteRateLimiter* rateLimiter = nullptr)
         : fileNum(fileNum) {
       auto name = Postings::getIndexFileName(segStr, fileNum);
-      file = dir.createFile(name);
+      Directory::FileCreateOptions options;
+      options.rateLimiter = rateLimiter;
+      file = dir.createFile(name, options);
       if (!file) throw FileIOException("Failed to create segment file: " + name);
       out.setFile(file.get());
       out.writeBytes(Postings::LUXIR_HEADER);
@@ -105,11 +107,15 @@ public:
   MemPool pool;  // during concurrent writing, access only under mutex (see copyTerm)
   uint64_t segId;
   uint64_t creatorEpoch;
+  ByteRateLimiter* rateLimiter = nullptr;  // set before any file is created
 
 public:
   PostingsWriter(Directory& dir, uint64_t segId, uint64_t creatorEpoch, int32_t maxDoc = -1)
       : directory(dir), spaces{{"", maxDoc, {}}}, segStr(Postings::segmentKey(segId, creatorEpoch)),
         segId(segId), creatorEpoch(creatorEpoch) {}
+
+  // Paces this segment's data files; set before the first file is created.
+  void setRateLimiter(ByteRateLimiter* limiter) { rateLimiter = limiter; }
 
   // The owner installs its accounting before writing any checkouts. Merge
   // checkouts may call it concurrently.
@@ -186,7 +192,7 @@ public:
 
 private:
   DataFile& primaryFile() {
-    if (!primary) primary.emplace(directory, segStr, Postings::PRIMARY_FILE);
+    if (!primary) primary.emplace(directory, segStr, Postings::PRIMARY_FILE, rateLimiter);
     return *primary;
   }
 
@@ -233,7 +239,7 @@ private:
       number = (uint32_t)spillFiles.size();
     }
 
-    auto file = std::make_unique<DataFile>(directory, segStr, number);
+    auto file = std::make_unique<DataFile>(directory, segStr, number, rateLimiter);
     const std::lock_guard lock(spillMutex);
     return *(spillFiles[number - 1] = std::move(file));
   }
