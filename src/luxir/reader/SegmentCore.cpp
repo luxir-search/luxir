@@ -175,18 +175,20 @@ const OwnershipShape* SegmentCore::ownership(SpaceOrdinal child) const {
 const OwnershipShape* SegmentCore::buildOwnership(SpaceOrdinal child) const {
   auto& core = const_cast<SegmentCore&>(*this);
   auto& space = *children[(size_t)child - 1];
-  // A mapping walks from the root, so the shapes above this one are likely
-  // next: acquire the columns of every unbuilt shape on the path in one batch.
-  std::vector<field_parts::Slice> parts;
-  for (auto ordinal = child; ordinal != SpaceOrdinal::ROOT; ordinal = children[(size_t)ordinal - 1]->parent) {
-    if (children[(size_t)ordinal - 1]->shape.peek()) continue;
-    const auto& descriptor = spaces()[(size_t)ordinal].ownership;
-    for (auto part : {descriptor.ends, descriptor.owners}) {
-      if (part) parts.push_back(part);
-    }
-  }
-  if (parts.size() > 1) core.acquireSlices(parts);
   return space.shape.getOrCreate([&] {
+    // A mapping binds every shape from its descendant up, so the shapes above
+    // this one are likely next: acquire the columns of every unbuilt shape on
+    // the path in one batch. Inside the build, so concurrent first users of
+    // this shape wait on one batch instead of each issuing it.
+    std::vector<field_parts::Slice> parts;
+    for (auto ordinal = child; ordinal != SpaceOrdinal::ROOT; ordinal = children[(size_t)ordinal - 1]->parent) {
+      if (children[(size_t)ordinal - 1]->shape.peek()) continue;
+      const auto& descriptor = spaces()[(size_t)ordinal].ownership;
+      for (auto part : {descriptor.ends, descriptor.owners}) {
+        if (part) parts.push_back(part);
+      }
+    }
+    if (parts.size() > 1) core.acquireSlices(parts);
     return std::make_shared<OwnershipShape>(core, spaces()[(size_t)child].ownership,
                                             spaces()[(size_t)space.parent].maxDoc, spaces()[(size_t)child].maxDoc);
   }).get();
