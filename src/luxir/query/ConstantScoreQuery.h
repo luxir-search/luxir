@@ -268,7 +268,7 @@ public:
       Prepared(QueryPrep::PreparedSource&& child, float constantScore, bool needsScores)
         : child(std::move(child)), constantScore(constantScore), needsScores(needsScores) {}
 
-      Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+      Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) override {
         auto* childScorer = QueryPrep::createScorer(targetPool, segment, child.segmentSource());
         if (childScorer == nullptr) return nullptr;
         return targetPool.make<ConstantScoreQuery::Scorer>(childScorer, constantScore);
@@ -316,7 +316,7 @@ public:
       return constantScore;
     }
 
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& ctx) override {
       QueryPrep::PreparedSource source;
       source.weight = childWeight;
       if (childWeight->needsPrepare()) {
@@ -325,7 +325,7 @@ public:
       return std::make_unique<Prepared>(std::move(source), constantScore, needsScores());
     }
 
-    Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) override {
       auto* childScorer = QueryPrep::createScorer(targetPool, segment, *childWeight);
       if (childScorer == nullptr) return nullptr;
       return targetPool.make<ConstantScoreQuery::Scorer>(childScorer, constantScore);
@@ -349,7 +349,7 @@ public:
       return childWeight->hasReleasableSegmentState();
     }
 
-    CountShortcut countShortcut(
+    CountShortcut countShortcutImpl(
         IndexReader::Segment& segment, DocSet* domain) override {
       return childWeight->countShortcut(segment, domain);
     }

@@ -21,8 +21,8 @@ namespace luxir {
 class QueryPruning {
   friend class CatalogSummaryView;
   using PlanKey = std::pair<const Query::PlanningContext*, const Query*>;
-  boost::unordered_flat_map<PlanKey, SegmentMask> memo;
-  boost::unordered_flat_map<PlanKey, SegmentMask> membershipMemo;
+  boost::unordered_node_map<PlanKey, SegmentMask> memo;
+  boost::unordered_node_map<PlanKey, SegmentMask> membershipMemo;
 
   // All plans on a reader share its positive, absent and unusable fields.
   using FieldMemo = boost::unordered_flat_map<std::string, std::optional<IndexReader::FieldSegments>,

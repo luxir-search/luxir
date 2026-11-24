@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "SearchRequest.h"
+#include "luxir/query/QueryPruning.h"
 
 #include <cassert>
 
@@ -51,9 +52,11 @@ OwnershipRelation& SearchRequest::ownershipRelation(IndexReader& many, IndexRead
 Query::PlanningContext* SearchRequest::createPlanningContext(IndexReader& view) {
   Query::PlanningContext::Limits limits;
   limits.multiTermBudget = &multiTermBudget;
-  return arenaCreate<Query::PlanningContext>(arena, requestPool, view, limits, &warnings,
+  auto* planning = arenaCreate<Query::PlanningContext>(arena, requestPool, view, limits, &warnings,
       FilterKeyContext{.schemaGen = schema->gen_, .timeZone = proto.time_zone},
       uses(view), &memoryTracker, proto.profile ? this : nullptr);
+  planning->pruning = pruning;
+  return planning;
 }
 
 SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
@@ -68,6 +71,7 @@ SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
           .maxTermsExamined = searchConfig.multiterm_max_terms_examined,
           .maxPostings = searchConfig.multiterm_max_postings,
       }),
+      pruning(std::make_shared<QueryPruning>()),
       proto(proto), arena(arena), dateMathNowEpochMillis(
           forcedDateMathNowEpochMillis.value_or(currentEpochMillis())),
       startTime(startTime),

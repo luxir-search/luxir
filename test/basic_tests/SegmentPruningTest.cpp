@@ -15,6 +15,7 @@
 #include "luxir/query/CatalogSummaryView.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
+#include "luxir/query/PrefixQuery.h"
 #include "luxir/query/QueryPruning.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/search/FilterCache.h"
@@ -251,6 +252,64 @@ TEST_F(SegmentPruningTest, collectionProofSkipsTermSeeksInPriceGap) {
   ASSERT_OK(req);
   EXPECT_EQ(0, req->getMatchCount());
   EXPECT_EQ(0, SkipStats::termDictionarySeeks);
+}
+
+TEST_F(SegmentPruningTest, emptyConjunctionEmitsNamedZeroBucketWithoutStatSeeks) {
+  indexThreeSegments();
+  QueryPruning::crossCheck = false;
+  auto req = localReq(helper->getSearchEngine());
+  parseQueryRequest(R"({"query":"body_t:common AND price_i:[5 TO 8]","get_scores":true,
+    "ops":{"tags":{"field_facet":{"field":"tag_s"}},
+           "named":{"query_facet":{"buckets":{"all":"*:*"}}}}})", req->rawRequest(), req->mr);
+  SkipStatsScope stats;
+  req->collection("prune").execute(false);
+  ASSERT_OK(req);
+  const auto& bucket = *req->docList()->ops.at("named")->facetResult();
+  ASSERT_EQ(1u, bucket.counts.size());
+  EXPECT_EQ("all", std::get<api::ColStr>(bucket.bucket_ids->kind).v[0]);
+  EXPECT_EQ(0, bucket.counts[0]);
+  EXPECT_EQ(0, SkipStats::termDictionarySeeks);
+}
+
+TEST_F(SegmentPruningTest, impossibleClauseKeepsPreparedRowOpValidation) {
+  indexThreeSegments();
+  auto req = localReq(helper->getSearchEngine());
+  parseQueryRequest(R"({"query":"*:*","row_ops":{"row":{"top_docs":{
+    "query":"body_t:common AND price_i:[5 TO 8]"}}}})", req->rawRequest(), req->mr);
+  req->testForcePrepare = true;
+  req->collection("prune").execute(false);
+  EXPECT_TRUE(req->errorMsg().contains("prepared queries and routed filters")) << req->errorMsg();
+}
+
+TEST_F(SegmentPruningTest, provenZeroWarmsTheAuthoredWholeCountKey) {
+  indexThreeSegments();
+  QueryPruning::crossCheck = false;
+  for (int repeat = 0; repeat < 3; repeat++) {
+    // The last request must find all three zeros even without proofs.
+    QueryPruning::disableForTests = repeat == 2;
+    auto req = localReq(helper->getSearchEngine());
+    req->collection("prune").topDocs().exprQuery("body_t:common AND price_i:[5 TO 8]").countLimit().limit(0);
+    SkipStatsScope stats;
+    req->execute(false);
+    ASSERT_OK(req);
+    EXPECT_EQ(0, req->getMatchCount());
+    EXPECT_EQ(repeat == 2, SkipStats::cacheFirstMembershipWeightSkips);
+  }
+}
+
+TEST_F(SegmentPruningTest, directPrefixScorerHonorsRootProof) {
+  indexThreeSegments();
+  auto reader = currentReader();
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  PrefixQuery prefix("tag_s", "a");
+  prefix.validateLogical(context.planningContext());
+  auto* weight = context.createRootWeight(prefix, 0);
+  auto& excluded = reader->segments()[1];
+  SkipStatsScope stats;
+  EXPECT_EQ(nullptr, weight->createScorer(pool, excluded));
+  EXPECT_EQ(0, SkipStats::multitermExpansions);
+  EXPECT_NE(nullptr, weight->createScorer(pool, reader->segments()[0]));
 }
 
 TEST_F(SegmentPruningTest, statisticsSeeksSkipOnlyProvenAbsence) {

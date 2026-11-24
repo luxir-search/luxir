@@ -108,7 +108,7 @@ public:
         return weight.supplier(pool, segment, child,
             mode == Query::SupplierExecutionMode::RAW_MEMBERSHIP ? nullptr : segment.liveDocSet(), mode);
       }
-      Query::Scorer* createScorer(MemPool& pool, IndexReader::Segment& segment) override {
+      Query::Scorer* createScorerImpl(MemPool& pool, IndexReader::Segment& segment) override {
         return QueryPrep::createScorer(pool, segment, *this);
       }
       PreparedDomainDependence domainDependence() const noexcept override {
@@ -165,7 +165,7 @@ public:
       return reduction.kind == RowReduction::FIXED
           ? std::optional<float>(multiplier) : std::nullopt;
     }
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& prepareContext) override {
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& prepareContext) override {
       std::vector<DomainHandle> eligibility;
       std::vector<DocSet*> views;
       if (child->consumesDomain()) {
@@ -196,7 +196,7 @@ public:
       return supplier(pool, segment, input,
           mode == Query::SupplierExecutionMode::RAW_MEMBERSHIP ? nullptr : segment.liveDocSet(), mode);
     }
-    Query::Scorer* createScorer(MemPool& pool, IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(MemPool& pool, IndexReader::Segment& segment) override {
       return QueryPrep::createScorer(pool, segment, *this);
     }
     void releaseSegmentState(IndexReader::Segment& segment) noexcept override {

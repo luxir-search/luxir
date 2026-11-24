@@ -134,13 +134,10 @@ struct SearchParserImpl {
   std::span<ParsedFilter>* owningList = nullptr;
   std::string_view owningListChild;
   std::vector<std::shared_ptr<const FacetGroupPlan>> facetGroupPlans;
-  QueryPruning pruning;
   enum class FilterMaskKind { VIABLE, MEMBERSHIP };
   std::map<std::tuple<const Query::PlanningContext*, Query* const*, FilterMaskKind>, SegmentMask> unionMasks;
 
   ExecutionProfileOpState* pruningProfile = nullptr;
-  // The authored query before a collection proof substituted MatchNoDocs.
-  std::unordered_map<const SearchOp*, Query*> collectionProven;
   // Root-level ops are depth 1. Ops nested past the configured cap are rejected
   // in addSubs, the single funnel for op recursion.
   const int maxOpDepth;
@@ -243,7 +240,7 @@ public:
                                 FilterMaskKind kind = FilterMaskKind::VIABLE) {
     auto sourceMask = [&](Query& source) -> const SegmentMask& {
       return kind == FilterMaskKind::MEMBERSHIP
-          ? pruning.membership(source, planning) : pruning.viable(source, planning);
+          ? req.pruning->membership(source, planning) : req.pruning->viable(source, planning);
     };
     if (!filter.composesUnion()) return sourceMask(*filter.query);
     // A routed ANY builds a separate weight for each source. Its synthetic OR
@@ -264,11 +261,11 @@ public:
                           const SegmentMask& inherited, std::span<const ParsedFilter> filters,
                           Query::PlanningContext& planning) {
     SegmentMask mask = plan.frame(variant) == DomainVariantPlan::Frame::INHERIT
-        ? inherited : pruning.viable(*plan.sourceQuery(plan.resetSource(variant)), planning);
+        ? inherited : req.pruning->viable(*plan.sourceQuery(plan.resetSource(variant)), planning);
     for (size_t i = 0; i < filters.size(); i++) {
       if (plan.includesFilter(variant, i)) mask &= filterMask(filters[i], planning);
     }
-    for (size_t source : plan.extraSources(variant)) mask &= pruning.viable(*plan.sourceQuery(source), planning);
+    for (size_t source : plan.extraSources(variant)) mask &= req.pruning->viable(*plan.sourceQuery(source), planning);
     return mask;
   }
 
@@ -278,7 +275,7 @@ public:
   // document there.
   SegmentMask topDocsMask(Query& query, std::span<const ParsedFilter> filters,
                           const DomainVariantPlan& plan, Query::PlanningContext& planning) {
-    SegmentMask own = pruning.viable(query, planning);
+    SegmentMask own = req.pruning->viable(query, planning);
     SegmentMask mask = own;
     for (const auto& filter : filters) mask &= filterMask(filter, planning);
     for (size_t variant = 1; variant < plan.variantCount(); variant++) {
@@ -296,11 +293,11 @@ public:
     if (pruningProfile == nullptr) pruningProfile = req.addExecutionProfileOp("pruning");
     if (!explain && pruningProfile == nullptr) return;
     // Explain gives one witness. Each profile piece describes its own segment.
-    if (auto proven = collectionProven.find(&op); proven != collectionProven.end()) {
-      Query* root = proven->second;
+    if (op.weight && !op.planning.mayPrepare && op.weight->provenEmptyForCollection() && op.viable.none()) {
+      Query* root = op.query;
       if (explain) {
         req.resolvedFields->push_back(fmt::format("op {}: proven empty for the collection (segment 0: {})",
-                                                  op.name, pruning.reason(*root, op.planning, 0)));
+                                                  op.name, req.pruning->reason(*root, op.planning, 0)));
       }
       if (auto* run = pruningProfile ? req.addExecutionProfileRun(pruningProfile) : nullptr) {
         for (const auto& segment : view()->segments()) {
@@ -309,7 +306,7 @@ public:
           piece.wire.segment = segment.ord;
           piece.wire.max_doc = segment.maxDoc();
           piece.wire.strategy = "pruned";
-          piece.details.push_back(fmt::format("op {}: collection: {}", op.name, pruning.reason(*root, op.planning, segment.ord)));
+          piece.details.push_back(fmt::format("op {}: collection: {}", op.name, req.pruning->reason(*root, op.planning, segment.ord)));
           piece.complete = true;
         }
       }
@@ -321,14 +318,14 @@ public:
       bool pruned = !op.viable.test(ord);
       std::string why;
       if (pruned) {
-        if (!pruning.viable(*op.query, op.planning).test(ord)) {
-          why = pruning.reason(*op.query, op.planning, ord);
+        if (!req.pruning->viable(*op.query, op.planning).test(ord)) {
+          why = req.pruning->reason(*op.query, op.planning, ord);
         }
         auto explainFilters = [&](std::span<const ParsedFilter> filters, Query::PlanningContext& planning) {
           for (const auto& filter : filters) {
             if (filterMask(filter, planning).test(ord)) continue;
             why = filter.composesUnion() ? "every selection source proven empty"
-                                         : pruning.reason(*filter.query, planning, ord);
+                                         : req.pruning->reason(*filter.query, planning, ord);
             break;
           }
         };
@@ -1382,7 +1379,7 @@ public:
     for (const auto& filter : filters) {
       for (size_t i = 0; i < filter.sourceCount(); i++) {
         weights[source++] =
-            filter.source(i)->createWeight(qcontext, filterFlags);
+            qcontext.createRootWeight(*filter.source(i), filterFlags);
       }
     }
     assert(source == weights.size());
@@ -1648,7 +1645,7 @@ public:
     auto weights = req.requestPool.make_span<Query::Weight*>(
         plan.bucketQueries.size());
     for (size_t i = 0; i < weights.size(); i++) {
-      weights[i] = plan.bucketQueries[i]->createWeight(*context, 0);
+      weights[i] = context->createRootWeight(*plan.bucketQueries[i], 0);
     }
     std::span<FilterCache::Use*> uses;
     if (bucketChild && &plan.planning->topReader == view().get()) {
@@ -2154,21 +2151,6 @@ public:
       routedFilters = !domainVariants.empty();
     }
 
-    // The collection proof, before any weight exists: the segment masks
-    // prove the op's own matches empty and no domain variant widens its root
-    // mask. Its weights would still seek terms in every segment for
-    // statistics, so the op plans a query that matches nothing instead and
-    // answers as an empty match, reading no segment's data. A query that may
-    // prepare over the whole index (kNN) keeps its weights: preparation sees
-    // every segment's domain, and the op is left to its (empty) root mask.
-    Query* provenQuery = nullptr;
-    if (domainVariants.empty() && !routedFilters && (foldFilters || filters.empty())
-        && !planningContext->mayPrepare && pruning.collectionEmpty(*query, *planningContext)) {
-      provenQuery = query;
-      query = domainQuery = req.requestPool.make<MatchNoDocsQuery>();
-      query->validateLogical(*planningContext);
-    }
-
     // Flags for this request's main query. Filters inherit these after
     // buildFilterWeights clears NEED_SCORES.
     //
@@ -2347,7 +2329,7 @@ public:
       skipCount(SkipStats::queryContextsCreated);
     }
     auto* weight = omitMainWeight
-        ? nullptr : query->createWeight(*qcontext, mainWeightFlags);
+        ? nullptr : qcontext->createRootWeight(*query, mainWeightFlags);
     Query::Weight* variantMembershipWeight = nullptr;
     if (routedFilters) {
       assert(weight != nullptr);
@@ -2356,7 +2338,7 @@ public:
       variantMembershipWeight =
           !weight->needsScores() && !weight->allowsPruning()
               ? weight
-              : query->createWeight(*qcontext, membershipFlags);
+              : qcontext->createRootWeight(*query, membershipFlags);
     }
     if (cacheFirstTopKCount && weight != nullptr) {
       skipCount(SkipStats::cacheFirstTopKRankingWeights);
@@ -2370,7 +2352,7 @@ public:
       bool unionFamily = weight->sparseFilteredTopKFamily()
           == Query::Weight::SparseFilteredTopKFamily::UNION;
       mainWeightFlags &= ~Query::ALLOW_PRUNING;
-      weight = query->createWeight(*qcontext, mainWeightFlags);
+      weight = qcontext->createRootWeight(*query, mainWeightFlags);
       requestFlags &= ~Query::ALLOW_PRUNING;
       skipCount(SkipStats::sparseFilteredTopKReroutes);
       if (unionFamily) {
@@ -2414,8 +2396,8 @@ public:
           requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
       int32_t rankingFlags =
           requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING;
-      countWeight = query->createWeight(*qcontext, countFlags);
-      rankingWeight = query->createWeight(*qcontext, rankingFlags);
+      countWeight = qcontext->createRootWeight(*query, countFlags);
+      rankingWeight = qcontext->createRootWeight(*query, rankingFlags);
     }
     auto filterWeights = foldFilters || cacheFirstExactDomain || filters.empty()
       ? std::span<Query::Weight*>{}
@@ -2426,7 +2408,7 @@ public:
     }
     Query::Weight* domainQueryWeight = nullptr;
     std::span<Query::Weight*> domainFilterWeights;
-    if (provenQuery == nullptr && !routedFilters && !cacheFirstExactDomain && requirements.needExactDomain
+    if (!routedFilters && !cacheFirstExactDomain && requirements.needExactDomain
         && (!requirements.needRankedDocs
             || (constantExactDomainRanking
                 && !parsedSorts.useFieldSort))) {
@@ -2434,7 +2416,7 @@ public:
         int32_t domainFlags =
             requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
         domainQueryWeight =
-            domainQuery->createWeight(*qcontext, domainFlags);
+            qcontext->createRootWeight(*domainQuery, domainFlags);
         domainFilterWeights =
             buildFilterWeights(filters, *qcontext, domainFlags);
       } else {
@@ -2482,7 +2464,7 @@ public:
         int32_t membershipFlags =
             requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
         wholeMembershipWeight =
-            query->createWeight(*qcontext, membershipFlags);
+            qcontext->createRootWeight(*query, membershipFlags);
       }
       if (wholeMembershipWeight != nullptr) {
         assert(!wholeMembershipWeight->needsScores());
@@ -2492,11 +2474,7 @@ public:
         if (!everySegmentConstant) {
           everySegmentConstant = true;
           bool everySegmentEmpty = !view()->segments().empty();
-          // A segment the headers prove empty counts as a zero metadata
-          // count, without asking it for a shortcut.
-          const SegmentMask& keyViable = pruning.viable(*query, *planningContext);
           for (auto& segment : view()->segments()) {
-            if (!keyViable.test((size_t)segment.ord)) continue;
             DocSet* rootDomain = segment.liveDocSet();
             auto shortcut = wholeMembershipWeight->countShortcut(segment, rootDomain);
             everySegmentEmpty &= shortcut.how == Query::CountHow::METADATA
@@ -2547,7 +2525,7 @@ public:
           int32_t rankingFlags =
               requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING;
           countFreeRankingWeight =
-              query->createWeight(*qcontext, rankingFlags);
+              qcontext->createRootWeight(*query, rankingFlags);
         }
         bool reroute = !boundedCount && foldFilters
             && !countFreeRankingWeight->needsPrepare()
@@ -2611,8 +2589,7 @@ public:
         // limit would only duplicate the held ranking pass.
         auto bound = weight->countShortcut(segment, nullptr).maxMatches;
         if (bound > remaining) {
-          qr->boundedCountWeight = query->createWeight(
-              *qcontext, requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING));
+          qr->boundedCountWeight = qcontext->createRootWeight(*query, requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING));
           break;
         }
         remaining -= bound;
@@ -2628,17 +2605,8 @@ public:
       throw RequestError("fusion sources cannot decorate; put decorate on fusion");
     }
     qr->viable = topDocsMask(*query, filters, qr->domainVariants, *planningContext);
-    // The membership mask decides where an empty membership is published
-    // under the query's own key; an op emptied by a filter publishes none.
-    qr->membershipViable = qr->viable.none() && !pruning.collectionEmpty(*query, *planningContext)
-            && std::ranges::any_of(filters, [&](const ParsedFilter& filter) {
-              return filterMask(filter, *planningContext, FilterMaskKind::MEMBERSHIP).none();
-            })
-        ? SegmentMask(view()->segments().size(), true)
-        : pruning.membership(*query, *planningContext);
-    if (provenQuery) collectionProven.emplace(qr, provenQuery);
     if (QueryPruning::crossCheck) {
-      addPruneChecks(*qr, qcontext, *planningContext, provenQuery ? *provenQuery : *query,
+      addPruneChecks(*qr, qcontext, *planningContext, *query,
                      filters, foldFilters);
     }
     // A fusion source reports once the fusion's shared filters joined its mask.
@@ -2658,7 +2626,7 @@ public:
       context = Query::Context::create(&req.arena, planning);
       skipCount(SkipStats::queryContextsCreated);
     }
-    op.pruneChecks.push_back({query.createWeight(*context, 0), pruning.membership(query, planning)});
+    op.pruneChecks.push_back({query.createWeight(*context, 0), req.pruning->membership(query, planning)});
     if (folded) return;
     for (const auto& filter : filters) {
       const auto& mask = filterMask(filter, planning, FilterMaskKind::MEMBERSHIP);
