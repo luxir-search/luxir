@@ -186,6 +186,7 @@ defaults and constraints are described in the comments and guides.
 - [`RowSpaceStats`](#message-luxir.rowspacestats)
 - [`RrfFusion`](#message-luxir.rrffusion)
 - [`SchemaDef`](#message-luxir.schemadef)
+- [`SchemaDef.DocReorder`](#message-luxir.schemadef.docreorder)
 - [`SchemaDef.IndexSort`](#message-luxir.schemadef.indexsort)
 - [`SchemaRequest`](#message-luxir.schemarequest)
 - [`SchemaResponse`](#message-luxir.schemaresponse)
@@ -2229,7 +2230,22 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 | <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. \_version\_ is fixed and retrieval-only: it returns the update version of the request that indexed each document, including allow\_dups and documents without an ID. |
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
 | <a id="field-luxir.schemadef.index_sort"></a>[`index_sort`](#field-luxir.schemadef.index_sort) | 3 | [`SchemaDef.IndexSort`](#message-luxir.schemadef.indexsort) | singular | The order merges write documents in. Absent in a SET request keeps the current setting; present with an empty field clears it. Changes affect future merges only. |
+| <a id="field-luxir.schemadef.doc_reorder"></a>[`doc_reorder`](#field-luxir.schemadef.doc_reorder) | 5 | [`SchemaDef.DocReorder`](#message-luxir.schemadef.docreorder) | singular | Document reordering at merge by recursive graph bisection. Absent in a SET request keeps the current setting; present without enabled clears it. Not valid together with index\_sort. Changes affect future merges only. |
 | <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. |
+
+<a id="message-luxir.schemadef.docreorder"></a>
+
+### luxir.SchemaDef.DocReorder
+
+A large enough merge writes its documents in an order that places documents sharing terms next to each other (recursive graph bisection over the terms of the chosen fields), instead of concatenating its sources. Postings get smaller doc id gaps, so they compress better and conjunctions and phrases skip more; stored fields of similar documents compress together. It costs merge CPU and RAM (a forward index of the chosen fields' terms), and loses arrival order inside merged segments, which makes request-version runs larger. Flushed segments keep arrival order. Merges whose sources hold nested child rows do not reorder.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.schemadef.docreorder.enabled"></a>[`enabled`](#field-luxir.schemadef.docreorder.enabled) | 1 | `bool` | singular |  |
+| <a id="field-luxir.schemadef.docreorder.fields"></a>[`fields`](#field-luxir.schemadef.docreorder.fields) | 2 | `string` | repeated | Indexed text or string fields (concrete or template instances) whose terms drive the order. Empty selects every indexed text and string field of the merged segments; id fields never take part. |
+| <a id="field-luxir.schemadef.docreorder.min_merge_docs"></a>[`min_merge_docs`](#field-luxir.schemadef.docreorder.min_merge_docs) | 3 | `uint64` | optional | Smallest merge, in live documents, that reorders; absent selects 262144. A forced merge reorders at any size. |
 
 <a id="message-luxir.schemadef.indexsort"></a>
 

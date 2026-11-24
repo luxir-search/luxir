@@ -10,6 +10,7 @@
 #include "IndexWriter.h"
 #include "OwnershipWriter.h"
 #include "MergeCostModel.h"
+#include "DocBisection.h"
 #include "OrdCollector.h"
 #include "OrdColWriter.h"
 #include "NormsWriter.h"
@@ -603,6 +604,8 @@ class SegmentMerger {
   int64_t termPartitionMinBytes;
   int64_t termPartitionMinRangeBytes;
   int32_t termPartitionMaxRanges;
+  // A forced merge reorders documents (doc_reorder) at any size.
+  bool forced;
 
   // Reorder: merged root doc n is source doc newToOld[n], packed as
   // (source ord << 32 | local doc). Empty when the merge concatenates its
@@ -622,6 +625,10 @@ public:
   // Non-const so tests can force windows and spills.
   static inline int64_t reorderPositionsWindowBytes = MergeCostModel::REORDER_POSITIONS_WINDOW_BYTES;
   static inline int64_t reorderStoredRamBytes = MergeCostModel::REORDER_STORED_RAM_BYTES;
+  // The forward index addresses its postings with uint32 offsets: more kept
+  // postings are refused like a RAM budget refusal (minDocFreq rises).
+  // Non-const so tests can lower it.
+  static inline int64_t bisectionMaxPostings = UINT32_MAX;
 
   size_t rowMapBytes() const {
     size_t bytes = 0;
@@ -648,7 +655,7 @@ public:
                 PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
                 int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
                 int32_t termPartitionMaxRanges, const Schema& schema,
-                StoredDictionaryRegistry& storedDictionaries)
+                StoredDictionaryRegistry& storedDictionaries, bool forced = false)
   : cores(cores), root(SpaceOrdinal::ROOT, liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
     stagedRam(ramBudget, 0),
     schema(schema), storedDictionaries(storedDictionaries),
@@ -656,7 +663,8 @@ public:
     streamBudget(MergeCostModel::streamBudgetForBytes(estimatedOutputBytes)),
     termPartitionMinBytes(termPartitionMinBytes),
     termPartitionMinRangeBytes(termPartitionMinRangeBytes),
-    termPartitionMaxRanges(termPartitionMaxRanges)
+    termPartitionMaxRanges(termPartitionMaxRanges),
+    forced(forced)
   {
     assert(cores.size() == liveDocs.size());
     root.preaders.reserve(cores.size());
@@ -1162,11 +1170,18 @@ private:
   // Chooses the merged root doc order. A producer returns newToOld (every
   // live root doc once, packed as sourceOf/localOf) or nothing to keep the
   // concatenation order; it may charge its scratch to reorderGuard. The
-  // shared step below checks the order and applies it. The index sort is the
-  // only producer today.
+  // shared step below checks the order and applies it. The producers are
+  // the index sort and document reordering (doc_reorder); the schema allows
+  // at most one.
   void planReorder() {
-    if (root.maxDoc > 0 && reorderable()) applyOrder(indexSortOrder());
+    if (root.maxDoc > 0 && reorderable()) {
+      applyOrder(schema.indexSortField.empty() ? bisectionOrder() : indexSortOrder());
+    }
     Signal::emit("mergeReorder", &reorder);
+  }
+
+  static void skipReorder(std::string_view reason) {
+    Signal::emit("mergeReorderSkipped", &reason);
   }
 
   // A reorder moves root docs only. A child space's rows follow their
@@ -1176,10 +1191,7 @@ private:
   bool reorderable() const {
     bool childSpaces = std::ranges::any_of(cores, [](const auto& core) { return core->spaces().size() > 1; });
     if (!childSpaces) return true;
-    if (!schema.indexSortField.empty()) {
-      std::string_view reason = "child_spaces";
-      Signal::emit("mergeReorderSkipped", &reason);
-    }
+    if (!schema.indexSortField.empty() || schema.docReorder) skipReorder("child_spaces");
     return false;
   }
 
@@ -1282,6 +1294,258 @@ private:
     for (const auto& entry : entries) {
       order.push_back((uint64_t)entry.source << 32 | (uint32_t)entry.local);
     }
+    return order;
+  }
+
+  // Document reordering thresholds. Terms in fewer than minDocFreq merged
+  // docs carry little information for the cost of their postings in the
+  // forward index. Lucene keeps terms in at least 4096 docs whatever the
+  // segment size; this reaches 4096 at 16M merged docs and scales down for
+  // smaller merges (never below 2: a term in one doc cannot pull docs
+  // together), a deliberate deviation so that the merges this runs on
+  // (from 262144 docs) keep enough terms. As in Lucene (maxDocFreq 1.0), no
+  // term is too frequent.
+  static constexpr int64_t BISECTION_MAX_MIN_DOC_FREQ = 4096;
+  static constexpr int64_t BISECTION_DOCS_PER_MIN_DOC_FREQ = 4096;
+  static int64_t bisectionMinDocFreq(int64_t mergedDocs) {
+    return std::clamp<int64_t>(mergedDocs / BISECTION_DOCS_PER_MIN_DOC_FREQ, 2, BISECTION_MAX_MIN_DOC_FREQ);
+  }
+
+  // The fields whose terms drive document reordering: the schema's list, or
+  // every indexed text and string field of the sources (id fields never), as
+  // the sources typed them.
+  std::vector<std::string> bisectionFields() const {
+    std::set<std::string, std::less<>> names;
+    for (const auto& seg : root.segs) {
+      PostingsReader& reader = *seg.postingsReader;
+      for (int32_t ordinal = 0; ordinal < reader.numFields(); ordinal++) {
+        const auto* info = reader.fieldInfo(ordinal);
+        if (info == nullptr || info->indexedTotals().numTerms == 0 || (info->flags & FieldType::INDEX_DOCS) == 0) continue;
+        if (info->type != FieldType::TEXT && info->type != FieldType::STRING) continue;
+        auto name = (std::string_view)info->name;
+        if (!schema.docReorderFields.empty()
+            && std::ranges::find(schema.docReorderFields, name) == schema.docReorderFields.end()) continue;
+        names.emplace(name);
+      }
+    }
+    return {names.begin(), names.end()};
+  }
+
+  // Term-major lists of the kept terms' merged docs (in concatenation ids):
+  // term t's docs are docs[ends[t - 1], ends[t]).
+  struct TermLists {
+    std::vector<uint32_t> docs;
+    std::vector<uint32_t> ends;
+
+    // Drops the terms in fewer than minDocFreq docs, keeping term order.
+    void prune(int64_t minDocFreq) {
+      size_t out = 0, kept = 0, begin = 0;
+      for (uint32_t end : ends) {
+        if ((int64_t)(end - begin) >= minDocFreq) {
+          std::copy(docs.begin() + (ptrdiff_t)begin, docs.begin() + end, docs.begin() + (ptrdiff_t)out);
+          out += end - begin;
+          ends[kept++] = (uint32_t)out;
+        }
+        begin = end;
+      }
+      docs.resize(out);
+      ends.resize(kept);
+    }
+  };
+
+  // The doc_reorder producer. Builds a forward index over the chosen fields'
+  // terms (exact live doc frequencies from one DOCS pass over every source's
+  // postings, in concatenation ids), orders it by recursive graph bisection
+  // (DocBisection.h) and returns the order as newToOld. Everything is
+  // charged to reorderGuard; when the budget refuses the term lists, the
+  // smallest kept doc frequency doubles until they fit, and the merge
+  // concatenates (mergeReorderSkipped "ram") when nothing fits.
+  std::vector<uint64_t> bisectionOrder() {
+    if (!schema.docReorder) return {};
+    int64_t totalLive = root.maxDoc;
+    if (!forced && totalLive < schema.docReorderMinMergeDocs) {
+      skipReorder("min_merge_docs");
+      return {};
+    }
+    if (totalLive < 2 * DocBisection::MIN_PARTITION) return {};
+    int64_t minDocFreq = bisectionMinDocFreq(totalLive);
+    int64_t maxDocFreq = totalLive;
+    int64_t concurrency = oneapi::tbb::this_task_arena::max_concurrency();
+
+    TermLists lists;
+    // Term list capacities are charged as allocated, and the bisection's
+    // term counts for a kept-term allowance that doubles like a capacity,
+    // so the budget sees O(log terms) charges. The count charge scales with the
+    // arena's concurrency, so under RAM pressure the final minDocFreq (and
+    // with it the order) can depend on the arena width; without pressure
+    // the order depends only on the merged docs.
+    size_t chargedTerms = 0;
+    auto planBytes = [&](size_t docs, size_t ends, size_t terms) {
+      return MergeCostModel::bisectionPlanBytes(totalLive, (int64_t)docs, (int64_t)terms, concurrency)
+          + (int64_t)(ends > terms ? ends - terms : 0) * 4;
+    };
+    if (auto guard = ramBudget.tryAcquireGuard(planBytes(0, 0, 0))) {
+      reorderGuard = std::move(*guard);
+    } else {
+      skipReorder("ram");
+      return {};
+    }
+    // Room for `postings` more docs and one more term: doubled capacities
+    // and term allowance, else the exact need, else minDocFreq
+    // doubles (pruning what is kept) and the pending term is tried again.
+    // The postings limit counts as a refusal.
+    auto reserve = [&](int64_t postings) {
+      for (;;) {
+        size_t docs = lists.docs.size() + (size_t)postings, ends = lists.ends.size() + 1;
+        if ((int64_t)docs <= bisectionMaxPostings) {
+          size_t docsCap = lists.docs.capacity(), endsCap = lists.ends.capacity();
+          if (docs <= docsCap && ends <= endsCap && ends <= chargedTerms) return true;
+          for (bool doubled : {true, false}) {
+            size_t d = docs <= docsCap ? docsCap
+                : doubled ? (size_t)std::min<int64_t>((int64_t)std::max(docs, docsCap * 2), bisectionMaxPostings) : docs;
+            size_t e = ends <= endsCap ? endsCap : doubled ? std::max<size_t>(ends, endsCap * 2) : ends;
+            size_t t = ends <= chargedTerms ? chargedTerms
+                : doubled ? std::max<size_t>(ends, chargedTerms * 2) : ends;
+            if (reorderGuard.tryResize(planBytes(d, e, t))) {
+              lists.docs.reserve(d);
+              lists.ends.reserve(e);
+              chargedTerms = t;
+              return true;
+            }
+          }
+        }
+        if (minDocFreq * 2 > maxDocFreq) return false;
+        minDocFreq *= 2;
+        lists.prune(minDocFreq);
+        if (postings < minDocFreq) return true;  // the pending term no longer qualifies
+      }
+    };
+
+    struct TermsEnumIdx {
+      TermsEnum tenum;
+      const Segment* seg;
+      unsigned __int128 key = 0;
+    };
+    // A std heap of source enums, smallest term on top: a term's sources
+    // are all popped (and its doc frequency summed) before any postings are
+    // read, then pushed back once advanced.
+    auto termCmp = [](const TermsEnumIdx* a, const TermsEnumIdx* b) {
+      if (a->key != b->key) return b->key < a->key;
+      int cmp = b->tenum.term() <=> a->tenum.term();
+      return cmp < 0 || (cmp == 0 && b->seg->ord < a->seg->ord);
+    };
+    for (const auto& field : bisectionFields()) {
+      auto& pool = MemPool::threadLocal();
+      auto rewind = pool.rewindScopeGuard();
+      std::vector<TermsEnumIdx> tenums;
+      tenums.reserve(root.segs.size());
+      int64_t sumDocFreq = 0, mostTerms = 0;
+      for (const auto& seg : root.segs) {
+        const auto* info = seg.postingsReader->fieldInfo(field);
+        if (info == nullptr || info->indexedTotals().numTerms == 0 || (info->flags & FieldType::INDEX_DOCS) == 0
+            || (info->type != FieldType::TEXT && info->type != FieldType::STRING)) continue;
+        sumDocFreq += info->indexedTotals().sumDocFreq;
+        mostTerms = std::max(mostTerms, info->indexedTotals().numTerms);
+        tenums.emplace_back(TermsEnumIdx{TermsEnum(pool, *seg.postingsReader, *info), &seg});
+      }
+      // Id-like: sumDocFreq - terms bounds the sum of (df - 1) over terms,
+      // so no term reaches minDocFreq.
+      if (1 + sumDocFreq - mostTerms < minDocFreq) continue;
+      std::vector<TermsEnumIdx*> heap;
+      for (auto& entry : tenums) {
+        if (entry.tenum.nextTerm()) {
+          entry.key = entry.tenum.termPrefixKey();
+          heap.push_back(&entry);
+        }
+      }
+      std::make_heap(heap.begin(), heap.end(), termCmp);
+      std::vector<TermsEnumIdx*> same;
+      char termBuf[PackedTerm::MAX_BYTES];
+      while (!heap.empty()) {
+        PackedTerm term(termBuf);
+        heap.front()->tenum.term().copyTo(term);
+        auto termKey = heap.front()->key;
+        same.clear();
+        int64_t upper = 0;  // docFreq with deletes, an upper bound
+        do {
+          std::pop_heap(heap.begin(), heap.end(), termCmp);
+          same.push_back(heap.back());
+          heap.pop_back();
+          upper += same.back()->tenum.docFreq();
+        } while (!heap.empty() && heap.front()->key == termKey && heap.front()->tenum.term() == term);
+
+        if (upper >= minDocFreq) {
+          if (!reserve(upper)) {
+            reorderGuard.release();
+            skipReorder("ram");
+            return {};
+          }
+          if (upper >= minDocFreq) {
+            size_t start = lists.docs.size();
+            for (auto* entry : same) {
+              DocsOnlyEnum docs(entry->tenum);
+              for (int32_t doc = docs.nextDoc(); doc != INT_MAX; doc = docs.nextDoc()) {
+                auto [mapped, isDeleted] = entry->seg->remapDocId(doc);
+                if (!isDeleted) lists.docs.push_back((uint32_t)mapped);
+              }
+            }
+            int64_t docFreq = (int64_t)(lists.docs.size() - start);
+            if (docFreq < minDocFreq) lists.docs.resize(start);
+            else lists.ends.push_back((uint32_t)lists.docs.size());
+          }
+        }
+        for (auto* entry : same) {
+          if (entry->tenum.nextTerm()) {
+            entry->key = entry->tenum.termPrefixKey();
+            heap.push_back(entry);
+            std::push_heap(heap.begin(), heap.end(), termCmp);
+          }
+        }
+      }
+    }
+
+    int64_t terms = (int64_t)lists.ends.size(), postings = (int64_t)lists.docs.size();
+    std::array<int64_t, 4> stats = {totalLive, terms, postings, minDocFreq};
+    Signal::emit("mergeBisection", &stats);
+    if (terms == 0) {
+      reorderGuard.release();
+      skipReorder("no_terms");
+      return {};
+    }
+
+    // Transpose into the forward index: each doc's kept terms in term order.
+    DocBisection::ForwardIndex index;
+    index.numTerms = (uint32_t)terms;
+    index.offsets.assign((size_t)totalLive + 1, 0);
+    index.terms.resize((size_t)postings);
+    for (uint32_t doc : lists.docs) index.offsets[(size_t)doc + 1]++;
+    for (size_t doc = 0; doc < (size_t)totalLive; doc++) index.offsets[doc + 1] += index.offsets[doc];
+    {
+      size_t begin = 0;
+      for (uint32_t term = 0; term < (uint32_t)terms; term++) {
+        for (size_t i = begin; i < lists.ends[term]; i++) index.terms[index.offsets[lists.docs[i]]++] = term;
+        begin = lists.ends[term];
+      }
+    }
+    for (size_t doc = (size_t)totalLive; doc > 0; doc--) index.offsets[doc] = index.offsets[doc - 1];
+    index.offsets[0] = 0;
+    lists = TermLists();
+    // The forward index replaces the term lists.
+    reorderGuard.forceResize(MergeCostModel::bisectionPlanBytes(totalLive, postings, terms, concurrency)
+                             - postings * 4 - terms * 4);
+
+    std::vector<uint32_t> positions = DocBisection::order(index);
+    index = DocBisection::ForwardIndex();
+    // Concatenation id -> packed source doc, then the bisection order.
+    std::vector<uint64_t> packed((size_t)totalLive);
+    for (const auto& seg : root.segs) {
+      for (int32_t local = 0; local < seg.postingsReader->maxDoc(); local++) {
+        auto [mapped, isDeleted] = seg.remapDocId(local);
+        if (!isDeleted) packed[(size_t)mapped] = (uint64_t)seg.ord << 32 | (uint32_t)local;
+      }
+    }
+    std::vector<uint64_t> order((size_t)totalLive);
+    for (size_t n = 0; n < order.size(); n++) order[n] = packed[positions[n]];
     return order;
   }
 

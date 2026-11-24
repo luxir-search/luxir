@@ -81,6 +81,14 @@ public:
   // column's order (see SegmentMerger). Empty keeps arrival order.
   std::string indexSortField;
   api::SchemaDef::IndexSort::Order indexSortOrder = api::SchemaDef::IndexSort::Order::ASC;
+  // SchemaDef.doc_reorder: merges of at least docReorderMinMergeDocs live
+  // docs (any forced merge) write their documents in graph bisection order
+  // over the terms of docReorderFields (empty: every indexed text and string
+  // field). See SegmentMerger::bisectionOrder.
+  static constexpr int64_t DEFAULT_DOC_REORDER_MIN_MERGE_DOCS = 262144;
+  bool docReorder = false;
+  std::vector<std::string> docReorderFields;
+  int64_t docReorderMinMergeDocs = DEFAULT_DOC_REORDER_MIN_MERGE_DOCS;
   // Introduction generations for declared concrete and template representations.
   std::map<std::string, api::SchemaVersion, std::less<>> introducedGen;
   // Nonfatal notes from the schema update that produced this schema, for its

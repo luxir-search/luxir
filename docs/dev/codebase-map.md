@@ -173,7 +173,11 @@ locations, browse `src/luxir/<area>/`.
      into low/high FOR streams. `SegmentMerger` carries 1-D points forward by
      run-merging and rebuilds 2-D BKDs from the merged column.
    - `SegmentMerger` reorder: a producer (`indexSortOrder` for a schema
-     `index_sort`) returns the merged root doc order (`newToOld`);
+     `index_sort`, `bisectionOrder` for `doc_reorder`) returns the merged
+     root doc order (`newToOld`); `bisectionOrder` builds a forward index
+     (doc -> term ids) from one DOCS pass over the chosen fields' postings
+     and orders it with `DocBisection` (`DocBisection.h`, recursive graph
+     bisection, deterministic for any thread count);
      `applyOrder` keeps the concatenating merge for an identity order, else
      builds absolute per-source remaps, and every per-doc writer emits in that
      order through its `reorder` path. Merges with child row spaces do not

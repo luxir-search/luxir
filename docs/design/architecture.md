@@ -47,8 +47,10 @@ Most of what follows depends on segments being immutable:
 - Compaction is concurrent merging: merges produce new segments in the
   background and never stall ingest or search.
 - A merge concatenates whole source segments and keeps each source's
-  documents in arrival order, unless the schema sets an `index_sort`: then
-  the merge writes its documents in key order, and every per-doc structure
+  documents in arrival order, unless the schema sets an `index_sort` or
+  `doc_reorder`: then the merge writes its documents in key order, or in
+  recursive graph bisection order (documents sharing terms placed together,
+  as in Lucene's BPIndexReorderer), and every per-doc structure
   (postings with their positions, norms, stored fields, every column kind,
   points, request-version runs) follows the new doc ids. Merges whose
   sources hold nested child rows still concatenate, since child families

@@ -152,6 +152,18 @@ struct MergeCostModel {
   static int64_t indexSortPlanBytes(int64_t mergedDocs) {
     return mergedDocs * (SORT_KEY_ENTRY_BYTES + 8);
   }
+  // Document reordering (SegmentMerger::bisectionOrder). Per merged doc: a
+  // forward index offset, the bisection order, sort key and side flag, the
+  // concatenation's packed source ids and the returned newToOld. Per kept
+  // posting: its doc in the term lists and its term in the forward index.
+  // Per kept term: its list end, plus two counts per partition split at
+  // once (DocBisection::scratchBytes).
+  static constexpr int64_t BISECTION_DOC_BYTES = 4 + 4 + 8 + 1 + 8 + 8;
+  static constexpr int64_t BISECTION_POSTING_BYTES = 4 + 4;
+  static int64_t bisectionPlanBytes(int64_t mergedDocs, int64_t postings, int64_t terms, int64_t concurrency) {
+    return mergedDocs * BISECTION_DOC_BYTES + postings * BISECTION_POSTING_BYTES
+        + terms * (4 + 8 * concurrency);
+  }
   // Per-field reorder scratch indexed by merged doc: a source value rank
   // for columns, a norm for text.
   static constexpr int64_t REORDER_RANK_BYTES = 4;

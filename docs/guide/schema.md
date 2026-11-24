@@ -1063,6 +1063,60 @@ an optional `order` (`asc`, the default, or `desc`):
   rejected while it is the index sort; switching between `int` and `date` is
   allowed.
 
+## Document reordering
+
+`doc_reorder` makes large merges write their documents in an order that
+puts documents sharing terms next to each other, by recursive graph
+bisection over the terms of chosen fields (the technique of Lucene's
+`BPIndexReorderer`). It is off by default and cannot be combined with
+`index_sort`:
+
+```json
+{"doc_reorder": {"enabled": true, "fields": ["title_t", "body_t"], "min_merge_docs": 262144}}
+```
+
+- `fields` names indexed `text` or `string` fields (concrete or template
+  instances). Empty selects every indexed text and string field of the
+  merged segments; `id` fields never take part.
+- A merge reorders when it has at least `min_merge_docs` live documents
+  (default 262144). A forced merge (`max_segments`) reorders at any size.
+  Freshly flushed segments keep arrival order, and a merge whose sources have
+  nested (child) rows concatenates.
+- The order comes from term overlap only. Terms in fewer than
+  `max(2, min(4096, merged docs / 4096))` documents are left out of the
+  computation (Lucene uses 4096 at every size), and fields where no term can
+  reach that frequency (id-like fields) are skipped. A merge keeps at most
+  2^32 - 1 postings in the computation; past that the minimum frequency
+  rises as under RAM pressure.
+- When it helps: documents whose text clusters (topics, languages,
+  templates, tenants, near-duplicates) arrive interleaved. Postings get
+  smaller doc id gaps, so they take less space and conjunctions and phrase
+  queries skip more; stored fields of similar documents compress together.
+  Lucene reported about 19% smaller postings, 9% smaller stored fields and
+  much faster conjunctions and phrases on a full Wikipedia index. Results do
+  not change, except for the order of hits with equal sort keys.
+- When it hurts: documents that already arrive in a useful order (by time,
+  title or another key) lose it, so column zones get looser and stored
+  fields can compress worse; Lucene measured stored fields 43% larger on a
+  title-sorted Wikipedia sample. Request-version runs follow the new order
+  and take about log2(indexing requests) bits per document, and lookups by
+  id lose locality.
+- The cost is merge CPU and RAM. The merge reads the chosen fields'
+  postings once more to build a forward index (8 bytes per kept posting
+  while it is built, 4 afterwards, plus about 33 bytes per document and 8
+  bytes per kept term per thread), reserved from the indexing RAM budget;
+  when the budget is short it raises the minimum document frequency until
+  the index fits, and skips the reorder when nothing fits. The bisection
+  then takes up to 20 passes over the forward index per level, log2(docs /
+  32) levels, in parallel. The order is the same for any thread count,
+  except under RAM pressure: the per-thread term counts are part of the
+  reservation, so the raised minimum frequency can differ between machines. The rest of the merge pays what an `index_sort`
+  merge pays (see above).
+- A `mode=set` request without `doc_reorder` keeps the current setting;
+  `{"doc_reorder": {}}` (or `"enabled": false`) clears it, and
+  `mode=replace_all` without it clears it (the response then carries a
+  `doc_reorder_cleared` warning). A change affects only future merges.
+
 ## The operations
 
 | Request | Meaning |

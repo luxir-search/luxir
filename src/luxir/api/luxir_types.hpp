@@ -96,7 +96,7 @@ struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump; 
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
 namespace KnnQuery_ { struct Ivf; }
-namespace SchemaDef_ { struct IndexSort; }
+namespace SchemaDef_ { struct IndexSort; struct DocReorder; }
 namespace VectorAnnDef_ { struct RaBitQ; struct Pq; }
 
 // ---- nested enums (Foo_ namespace; matches generated metadata refs) ----
@@ -905,6 +905,11 @@ struct IndexSort {
   std::string_view field;
   Order order = Order::ASC;
 };
+struct DocReorder {
+  std::span<const std::string_view> fields;
+  std::optional<uint64_t> min_merge_docs;
+  bool enabled = false;
+};
 } // namespace SchemaDef_
 struct StoredResourceDef {
   using Codec = luxir::api::StoredResourceDef_::Codec;
@@ -917,8 +922,10 @@ struct StoredResourceDef {
 };
 struct SchemaDef {                                                // needs StoredResourceDef
   using IndexSort = luxir::api::SchemaDef_::IndexSort;
+  using DocReorder = luxir::api::SchemaDef_::DocReorder;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> templates;
+  std::optional<DocReorder> doc_reorder;
   std::optional<IndexSort> index_sort;
   map_view<std::string_view, StoredResourceDef> stored_resources;
 };
@@ -1342,7 +1349,7 @@ LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(Sc
 LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef) LUXIR_TD(StoredResourceDef)
 LUXIR_TD(VectorAnnDef) LUXIR_TD(VectorAnnDef_::RaBitQ) LUXIR_TD(VectorAnnDef_::Pq)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
-LUXIR_TD(KnnQuery_::Ivf) LUXIR_TD(SchemaDef_::IndexSort)
+LUXIR_TD(KnnQuery_::Ivf) LUXIR_TD(SchemaDef_::IndexSort) LUXIR_TD(SchemaDef_::DocReorder)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(RenameCollectionRequest) LUXIR_TD(RenameCollectionResponse) LUXIR_TD(SwapCollectionsRequest) LUXIR_TD(SwapCollectionsResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)

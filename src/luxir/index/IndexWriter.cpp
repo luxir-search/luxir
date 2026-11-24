@@ -2980,10 +2980,12 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
       phase = "segment_merge";
       // Do the actual merge.  The current schema chooses each stored-fields
-      // resource's output format and the index sort's document order.
+      // resource's output format and the merged document order (index sort or
+      // doc_reorder; a forced merge reorders at any size).
       SegmentMerger merger(sourceCores, liveDocsPtrs, pwriter, *indexRamBudget,
                            termPartitionMinBytes, termPartitionMinRangeBytes,
-                           termPartitionMaxRanges, *mergeSchema, storedDictionaries);
+                           termPartitionMaxRanges, *mergeSchema, storedDictionaries,
+                           clientOrigin);
       merger.merge();
 
       phase = "new_segment_info";
