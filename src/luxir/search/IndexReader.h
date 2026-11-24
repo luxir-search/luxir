@@ -633,6 +633,12 @@ public:
   // on access. Unused fields never prevent opening or using a reader.
   FieldSegments field(std::string_view name) const;
 
+  struct FieldLookup {
+    FieldSegments segments;
+    FieldType* mismatchedSchemaType = nullptr;
+  };
+  FieldLookup lookupField(std::string_view name) const;
+
   std::shared_ptr<OrdMap> getOrdMap(std::string_view name);
 
   // This reader's segment `segId`, or null.

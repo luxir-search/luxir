@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "CatalogSummaryView.h"
 #include "QueryPrep.h"
 #include "luxir/search/RowRelation.h"
 
@@ -30,7 +31,7 @@ public:
   // (min_children >= 1), so a segment without the child space, or whose
   // child rows the child query cannot match, holds no match.
   MatchState mayMatch(const CatalogSummaryView& view) const override {
-    auto rows = view.inSpace(source.topReader);
+    auto rows = view.inSpace(source);
     if (!rows) {
       view.prove("nested space absent");
       return MatchState::EMPTY;

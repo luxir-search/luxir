@@ -23,8 +23,6 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
-#include "QueryPruning.h"
-#include "CatalogSummaryView.h"
 #include "MultiTermBudget.h"
 #include "ExecutionProfile.h"
 #include "Warnings.h"
@@ -47,6 +45,8 @@
 #include <google/protobuf/arena.h>
 
 namespace luxir {
+
+class CatalogSummaryView;
 
 class FanoutScope;
 class DocSet;
@@ -1317,6 +1317,12 @@ public:
     // ranking, count, domain, and routing products; logical normalization is
     // query-shaped and belongs here once, not in every Weight constructor.
     // Each Query address owns at most one concrete Plan type.
+    template <typename Plan>
+    const Plan* findLogicalPlan(const Query& query) const {
+      auto found = logicalPlans.find(&query);
+      return found == logicalPlans.end() ? nullptr : static_cast<const Plan*>(found->second);
+    }
+
     template <typename Plan, typename Create>
     Plan& getOrCreateLogicalPlan(const Query& query, Create&& create) {
       auto found = logicalPlans.find(&query);
@@ -1620,17 +1626,7 @@ public:
     // Whether segment `segnum`'s header proves `term` absent from the field,
     // so its statistics are zero there without a seek. Cross-check mode
     // seeks anyway and fails on a hit.
-    bool termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term) {
-      if (!QueryPruning::termAbsent(field.segInfos, segnum, term)) return false;
-      if (QueryPruning::crossCheck) {
-        auto* terms = getTermsEnum(field, segnum);
-        if (terms && terms->seek(term)) {
-          QueryPruning::crossCheckFailed(std::format("term '{}' of field '{}' found in segment {} proven to lack it",
-                                                     term, field.segInfos.name(), segnum));
-        }
-      }
-      return true;
-    }
+    bool termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term);
 
   public:
     CachedTermInfo* getCachedTerminfo(CachedFieldInfo& cachedFieldInfo, std::string_view term) {

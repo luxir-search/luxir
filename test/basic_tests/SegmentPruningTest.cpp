@@ -13,6 +13,7 @@
 #include "luxir/index/IndexWriter.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/CatalogSummaryView.h"
+#include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/QueryPruning.h"
 #include "luxir/query/TermQuery.h"
@@ -284,10 +285,12 @@ TEST_F(SegmentPruningTest, statisticsSeeksSkipOnlyProvenAbsence) {
   TermQuery c("tag_s", "c");
   Query* both[] = {&a, &c};
   BooleanQuery conjunction(both, {}, {}, {});
+  QueryPruning pruning;
   for (Query* query : std::initializer_list<Query*>{&phrase, &conjunction, &c}) {
+    query->validateLogical(context.planningContext());
     auto* weight = query->createWeight(context, Query::NEED_SCORES);
     for (auto& segment : reader->segments()) {
-      bool absent = query->mayMatch(CatalogSummaryView(*reader, segment.ord)) == Query::MatchState::EMPTY;
+      bool absent = query->mayMatch(CatalogSummaryView(pruning, context.planningContext(), segment.ord)) == Query::MatchState::EMPTY;
       if (absent) {
         EXPECT_EQ(nullptr, weight->createScorer(pool, segment)) << segment.ord;
       }
@@ -456,12 +459,31 @@ TEST_F(SegmentPruningTest, emptyCollectionAndFullyPrunedRequests) {
       R"({"ops":{"q":{"top_docs":{"query":{"match":{"tag_s":"nope"}},"limit":10,"count_limit":-1,"fields":["id"]}}}})");
 }
 
-TEST_F(SegmentPruningTest, duplicateOptionalClausesCountOnce) {
+TEST_F(SegmentPruningTest, booleanProofsFollowNormalizedMatchCounts) {
   indexThreeSegments();
-  // The plan drops the duplicate and lowers min_match 2 to 1, so tag b's
-  // segment matches; only tag c's segment is pruned.
-  std::string json = topDocs(
-      R"({"boolean":{"optional":[{"match":{"tag_s":"a"}},{"match":{"tag_s":"a"}},{"match":{"tag_s":"b"}}],"min_match":2}})");
+  auto check = [&](std::string_view query, int pruned) {
+    auto json = topDocs(query);
+    EXPECT_EQ(pruned, prunedBy(json)) << query;
+    expectSameWithAndWithoutPruning(json);
+  };
+  // A required disjunction is hoisted into two optionals with min_match 1.
+  check(R"({"boolean":{"filter":["body_t:common"],"required":[{"boolean":{"optional":["tag_s:a","tag_s:b"]}}]}})", 1);
+  // Above half, preserve the miss budget. At half, require two distinct terms.
+  check(R"({"boolean":{"optional":["tag_s:a","tag_s:a","tag_s:b"],"min_match":2}})", 1);
+  check(R"({"boolean":{"optional":["tag_s:a","tag_s:a","tag_s:b","body_t:common"],"min_match":2}})", 1);
+  check(R"({"boolean":{"required":["tag_s:b"]}})", 2);
+}
+
+TEST_F(SegmentPruningTest, routedAnyProvesOnlySegmentsWithoutAnySource) {
+  indexThreeSegments();
+  // The facet resets to a. Its domain cannot keep c viable. The list needs
+  // both a and b, and the two separately weighted a buckets must stay separate.
+  auto json = topDocs(R"({"all":true})", R"(,"ops":{"tags":{
+    "domain":{"query":"tag_s:a"},
+    "query_facet":{"buckets":{"one":{"match":{"tag_s":"a"},"boost":2e38},
+                             "two":{"match":{"tag_s":"a"},"boost":2e38},
+                             "three":{"boolean":{"required":["tag_s:b"]}}},
+                   "selected":["one","two","three"],"selection_mode":"any"}}})");
   EXPECT_EQ(1, prunedBy(json));
   expectSameWithAndWithoutPruning(json);
 }
@@ -598,7 +620,7 @@ TEST_F(SegmentPruningTest, collectionProofLeavesWholeIndexPreparation) {
   for (const auto& note : notes(json)) EXPECT_FALSE(note.contains("for the collection")) << note;
 }
 
-TEST_F(SegmentPruningTest, queryOnMismatchedFieldFails) {
+TEST_F(SegmentPruningTest, mismatchedFieldOffersNoProof) {
   auto setValueType = [&](api::FieldDef::FieldClass type) {
     SchemaBuilder schema;
     schema.field("value").type = type;
@@ -606,28 +628,42 @@ TEST_F(SegmentPruningTest, queryOnMismatchedFieldFails) {
   };
   setValueType(api::FieldDef::FieldClass::INT);
   ASSERT_TRUE(helper->index(flatdoc("id", "one", "value", 7, "tag_s", "a"), UpdateMessage::COMMIT).success);
-  auto search = [&](std::string_view query) {
+  setValueType(api::FieldDef::FieldClass::DATE);
+
+  std::string range = R"({"range":{"field":"value","gte":100}})";
+  auto withOptional = [&](std::string_view tag) {
+    return std::string(R"({"boolean":{"required":[{"match":{"tag_s":")") + std::string(tag)
+        + R"("}}],"optional":[)" + range + "]}}";
+  };
+  auto search = [&](const std::string& query, int limit) {
     auto req = localReq(helper->getSearchEngine());
-    parseQueryRequest(topDocs(query), req->rawRequest(), req->mr);
-    req->collection("prune");
-    req->execute();
+    std::string json = R"({"count_limit":-1,"limit":)" + std::to_string(limit) + R"(,"query":)" + query + "}";
+    parseQueryRequest(json, req->rawRequest(), req->mr);
+    req->collection("prune").execute();
     return req;
   };
-  std::string outOfRange = R"({"range":{"field":"value","gte":100}})";
-  std::string prohibited = R"({"boolean":{"required":[{"match":{"tag_s":"zz"}}],"prohibited":[)" + outOfRange + "]}}";
-  EXPECT_TRUE(search(outOfRange)->ok());
-  EXPECT_TRUE(search(prohibited)->ok());
+  for (bool disabled : {true, false}) {
+    QueryPruning::disableForTests = disabled;
+    auto count = search(withOptional("a"), 0);
+    EXPECT_TRUE(count->ok()) << count->errorMsg();
+    EXPECT_EQ(1, count->getMatchCount());
+    auto mismatch = search(range, 1);
+    EXPECT_EQ("field_type_mismatch", mismatch->errorCode()) << mismatch->errorMsg();
 
-  setValueType(api::FieldDef::FieldClass::DATE);
-  {
-    auto mismatched = search(outOfRange);
-    ASSERT_FALSE(mismatched->ok());
-    EXPECT_NE(std::string::npos, mismatched->errorMsg().find("does not match persisted")) << mismatched->errorMsg();
+    auto scored = search(withOptional("zzz"), 1);
+    if (disabled) {
+      EXPECT_EQ("field_type_mismatch", scored->errorCode());
+    } else {
+      EXPECT_TRUE(scored->ok()) << scored->errorMsg();
+      EXPECT_EQ(0, scored->getMatchCount());
+    }
   }
-  // Requests that do not use the field still answer, and are still proven.
-  auto other = search(R"({"match":{"tag_s":"zz"}})");
-  ASSERT_TRUE(other->ok()) << other->errorMsg();
-  EXPECT_EQ(0u, other->getDocs("q").size());
+  auto reader = currentReader();
+  MemPool pool;
+  Query::PlanningContext planning(pool, *reader);
+  QueryPruning pruning;
+  NumericPredicateQuery disjoint("value", 100, 200);
+  EXPECT_EQ(Query::MatchState::UNKNOWN, disjoint.mayMatch(CatalogSummaryView(pruning, planning, 0)));
 }
 
 // Dictionary bounds cut long endpoints: a ROUNDED lower is a strict prefix of
@@ -707,7 +743,7 @@ TEST_F(SegmentPruningTest, nestedClausesPrunePerRowSpace) {
              R"({"id":"b","tag_s":"x","items":{"color":"green"}})"});
   indexJson({R"({"id":"c","tag_s":"x"})", R"({"id":"d","tag_s":"y"})"});
   indexJson({R"({"id":"e","tag_s":"y","items":{"color":"yellow"}})"});
-  std::string red = R"({"to_parent":{"path":"items","score":"none","query":{"match":{"field":"color","val":"red"}}}})";
+  std::string red = R"({"to_parent":{"path":"items","score":"none","query":{"boolean":{"required":["color:red"]}}}})";
   EXPECT_EQ(2, prunedBy(topDocs(red)));
   auto explained = notes(topDocs(red));
   EXPECT_TRUE(std::ranges::any_of(explained, [](const auto& note) { return note.ends_with("nested space absent"); }));

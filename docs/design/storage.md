@@ -352,7 +352,10 @@ headers alone, whether a query can match a segment: `EMPTY` is a proof that
 no document does (live or deleted), `UNKNOWN` is always legal. Headers
 describe the segment as written, so they prove "no match", never a count.
 The view reads the decoded catalog record through `FieldSegments::at`. Its
-segment core owns the record and the mapping behind its bounds. Proofs name the physical field the query's
+segment core owns the record and the mapping behind its bounds. All operations
+on the same reader share one request-local field lookup, including misses. A
+schema/persisted type mismatch supplies no proof. Weights still check the
+fields they use. Proofs name the physical field the query's
 weights read (a derived variant, each field of a combined-field query), not
 the logical name.
 
@@ -375,7 +378,10 @@ absent; an `EXCLUSIVE` upper is above every term; an `UNBOUNDED` upper proves
 nothing. Composites combine their children: one empty required or filter
 clause empties a boolean; an optional group needs `min_match` (or, without
 required clauses, one) members not proven empty, duplicates counted once as
-the plan executes them; a disjunction max needs every disjunct empty;
+the plan executes them. A Boolean reads the compiled clauses in its validation
+context. Without a compiled plan it answers `UNKNOWN`. A routed ANY filter
+unions the masks of its independently weighted sources. A disjunction max
+needs every disjunct empty;
 wrappers pass their child's answer through. Prohibited clauses, kNN and any
 query without a rule prove nothing.
 
@@ -402,7 +408,9 @@ A query is proven empty for a nonempty collection when every segment proves
 its raw membership empty. This includes gaps between segments' bounds. When
 no domain variant widens a TopDocs op's mask, it can plan a
 `MatchNoDocsQuery` before building weights or seeking terms for statistics.
-A query that may prepare over the whole index keeps its weights.
+A type error that only the replaced weights would have discovered can
+therefore go unreported. A query that may prepare over the whole index keeps
+its weights.
 
 Explain notes (`op <name>: pruned segment <id> (ord <n>): <reason>`, or `op
 <name>: proven empty for the collection (segment 0: <reason>)`) and a `pruning` profile

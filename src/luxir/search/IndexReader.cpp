@@ -701,7 +701,7 @@ const IndexReader::FieldNameEntry* IndexReader::FieldCache::insert(std::unique_p
   return kept;
 }
 
-IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
+IndexReader::FieldLookup IndexReader::lookupField(std::string_view name) const {
   size_t hash = PackedTermHash{}(name);
   const FieldNameEntry* entry = space->fields->find(name, hash);
   if (!entry) {
@@ -721,15 +721,23 @@ IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
       const auto& persisted = result.totals();
       if (expected->type() != persisted.type
           || expected->segmentTypeParameters() != persisted.typeParameters) {
-        throw RequestError(std::format(
-            "Field '{}': schema {} does not match persisted {}",
-            name, FieldType::describeType(expected->type(), expected->segmentTypeParameters()),
-            FieldType::describeType(persisted.type, persisted.typeParameters)),
-            "field_type_mismatch");
+        return {result, expected};
       }
     }
   }
-  return result;
+  return {result};
+}
+
+IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
+  auto [segments, mismatch] = lookupField(name);
+  if (mismatch) {
+    const auto& persisted = segments.totals();
+    throw RequestError(std::format(
+        "Field '{}': schema {} does not match persisted {}",
+        name, FieldType::describeType(mismatch->type(), mismatch->segmentTypeParameters()),
+        FieldType::describeType(persisted.type, persisted.typeParameters)), "field_type_mismatch");
+  }
+  return segments;
 }
 
 std::shared_ptr<OrdMap> IndexReader::getOrdMap(std::string_view name) {

@@ -41,17 +41,6 @@ Bounds bounds(MemPool& pool, std::string_view lower, Bounds::Lower lowerMode, st
           lowerMode, upperMode};
 }
 
-// A query kind without proofs of its own.
-class NoProofQuery final : public Query {
-public:
-  NoProofQuery() : Query(QueryKind::TEST) {}
-  Query::Weight* createWeight(Context&, int32_t, float) override { return nullptr; }
-  FilterKeyScope appendFilterKey(FilterKeyBuilder& out, const FilterKeyContext&) const override {
-    out.appendKind(kind);
-    return FilterKeyScope::SEGMENT_STABLE;
-  }
-};
-
 class QueryPruningUnit : public LuxirTest {
 protected:
   std::unique_ptr<CollectionHelper> helper;
@@ -79,7 +68,11 @@ protected:
 
   MatchState evaluate(const Query& query, int32_t ord = 0, std::string* reason = nullptr) {
     auto current = reader();
-    return query.mayMatch(CatalogSummaryView(*current, ord, reason));
+    MemPool pool;
+    Query::PlanningContext planning(pool, *current);
+    query.validateLogical(planning);
+    QueryPruning pruning;
+    return query.mayMatch(CatalogSummaryView(pruning, planning, ord, reason));
   }
 };
 
@@ -214,16 +207,22 @@ TEST_F(QueryPruningUnit, booleanCombination) {
   EXPECT_EQ(MatchState::EMPTY, evaluate(*DisMaxQuery::make(pool, disjuncts, 0.0f)));
 }
 
-TEST_F(QueryPruningUnit, unknownRequiredClauseAllowsAnIndependentProof) {
+TEST_F(QueryPruningUnit, booleanProofUsesItsValidationContext) {
   indexTwoSegments();
   auto current = reader();
-  QueryPruning pruning(*current);
-  TermQuery absent("tag_s", "aaa");
-  EXPECT_TRUE(pruning.collectionEmpty(absent));
-  NoProofQuery opaque;
-  std::vector<Query*> must = {&absent, &opaque};
-  BooleanQuery both(must, {}, {}, {});
-  EXPECT_TRUE(pruning.collectionEmpty(both));
-  EXPECT_FALSE(pruning.membership(both).test(0));
-  EXPECT_FALSE(pruning.membership(both).test(1));
+  MemPool pool;
+  QueryPruning pruning;
+  TermQuery absent("tag_s", "aaa"), present("tag_s", "red");
+  Query* required[] = {&present, &absent};
+  BooleanQuery both(required, {}, {}, {});
+  Query::Context execution(pool, *current);
+  CatalogSummaryView unvalidated(pruning, execution.planningContext(), 0);
+  EXPECT_EQ(MatchState::UNKNOWN, both.mayMatch(unvalidated));
+  both.createWeight(execution, 0);
+  EXPECT_EQ(MatchState::UNKNOWN, both.mayMatch(unvalidated));
+
+  Query::PlanningContext planning(pool, *current);
+  both.validateLogical(planning);
+  EXPECT_FALSE(pruning.collectionEmpty(both, execution.planningContext()));
+  EXPECT_TRUE(pruning.collectionEmpty(both, planning));
 }
