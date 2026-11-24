@@ -246,7 +246,12 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   for (const auto& [name, type] : getSchema()->fieldTypeMap) {
     auto* stored = dynamic_cast<const StoredFieldType*>(type.get());
     if (!stored || !stored->format_.dictionaryBytes) continue;
-    std::string_view bestDictionary;
+    auto token = storedDictionaries.token(name, stored->format_);
+    if (!token) continue;
+    // The winner is chosen from catalog records alone; only its dictionary
+    // is read, so a writer over remote segments fetches one per field.
+    std::shared_ptr<SegmentCore> bestCore;
+    field_parts::Slice bestDictionary;
     int64_t bestBytes = -1;
     uint64_t bestSegId = 0;
     for (const auto& [id, seg] : segInfos) {
@@ -256,20 +261,20 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
         const auto* field = reader->fieldInfo(name);
         const auto* part = field ? field->stored() : nullptr;
         if (!part || !part->dictionaryBytes) continue;
-        auto dictionary = std::string_view(readerCore->slice(part->dictionary()));
         auto bytes = part->chunksBytes;
         if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
           bestBytes = bytes;
           bestSegId = id;
-          bestDictionary = dictionary;
+          bestCore = readerCore;
+          bestDictionary = part->dictionary();
         }
       }
     }
-    auto token = storedDictionaries.token(name, stored->format_);
-    if (!bestDictionary.empty() && token) {
-      storedDictionaries.publish(name, *token,
-          std::make_shared<const StoredDictionary>(std::string(bestDictionary)));
-    }
+    if (!bestCore) continue;
+    auto dictionary = bestCore->slice(bestDictionary);
+    if (dictionary.empty()) continue;
+    storedDictionaries.publish(name, *token,
+        std::make_shared<const StoredDictionary>(std::string(dictionary.data(), dictionary.size())));
   }
   {
     std::lock_guard<std::mutex> lock(indexMutex);

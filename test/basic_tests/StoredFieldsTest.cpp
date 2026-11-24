@@ -26,11 +26,13 @@
 #include "luxir/search/IndexReader.h"
 #include "luxir/server/LuxirNode.h"
 #include "luxir/store/Directory.h"
+#include "luxir/store/Manifest.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/luxir_util.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
+#include "test/StrictStorage.h"
 #include "test/LuxirTest.h"
 
 using namespace luxir;
@@ -1547,6 +1549,44 @@ TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveChunkRegionThenLowestId) {
     EXPECT_EQ(pin->bytes(), stored->dictionary());
     EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{{"body", "orphan"}}), readStored(*stored, 0).flat());
   }
+}
+
+// A writer open picks the seed dictionary from catalog records and reads only
+// the winner's dictionary; plain adds afterwards read no old segment data.
+TEST_F(StoredFieldsTest, writerOpenReadsOnlyTheSeedDictionary) {
+  auto ram = std::make_shared<RAMDir>();
+  auto seed = std::make_shared<const StoredDictionary>(trainStoredDictionary());
+  {
+    CommitSnapshotRegistry snapshots(test::reserveIncarnation(*ram));
+    IndexWriter iw(snapshots, dictionarySchema());
+    ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, seed));
+    addBodySegment(iw, 0, 8);
+    addBodySegment(iw, 8, 64);
+    addBodySegment(iw, 72, 8);
+    ASSERT_EQ(3u, snapshots.readers.getReader()->segments().size());
+  }
+  auto counters = std::make_shared<test::StrictStorageCounters>();
+  auto dir = std::make_shared<test::StrictDirectory>(ram, counters, test::StrictWholeFiles::DENY);
+  std::vector<Directory::FileInfo> old;
+  ram->listFiles(old);
+  auto dataParts = [&] {
+    size_t parts = 0;
+    for (const auto& file : old) {
+      if (!Manifest::segmentDataFile(file.name)) continue;
+      auto stats = counters->fileStats(file.name);
+      EXPECT_EQ(0u, stats.wholeFileAccesses) << file.name;
+      parts += stats.parts.size() - stats.metadataParts.size();
+    }
+    return parts;
+  };
+  CommitSnapshotRegistry snapshots(*dir);
+  IndexWriter iw(snapshots);
+  auto pin = iw.storedDictionaries.lookup("_stored_", DICT_FORMAT);
+  ASSERT_NE(nullptr, pin);
+  EXPECT_EQ(seed->bytes(), pin->bytes());
+  EXPECT_EQ(1u, dataParts());
+  addBodySegment(iw, 80, 8);
+  EXPECT_EQ(1u, dataParts());
 }
 
 TEST_F(StoredFieldsTest, pinnedDictionaryRoundTrip) {
