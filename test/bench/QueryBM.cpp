@@ -331,6 +331,54 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
 
 
 
+// Top-10 of a value expression over all docs (Elasticsearch's field_value_factor
+// and decay function_score shapes): pruning must come from the column's own
+// per-leaf bounds, since match_all offers no block boundaries of its own.
+static void BM_QueryRescore(benchmark::State& state, int64_t nDocs, std::string_view shape,
+                            std::string_view qfield, std::string_view expr, int64_t countLimit) {
+  int mergeFactor = 10;  // TODO: actually get from IW?
+  if (luxir::unit_tests) {
+    nDocs = LuxirTest::scaleTestWork(200);
+  }
+  std::vector<int32_t> docsPerSeg;
+  CollectionHelper::calcSegSizes(nDocs, mergeFactor, shape, docsPerSeg);
+  CollectionHelper helper;
+  bool reuseIndex = helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    buildBenchIndex(helper, nDocs, docsPerSeg);
+  }
+
+  int64_t fp = -1;
+  for (auto _ : state) {
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
+    req->collection("main");
+    auto& topDocs = req->topDocs("q");
+    luxir::api::Query child = qfield == "all" ? qb::all()
+                                       : qb::match(topDocs.mr(), qfield, "0");
+    topDocs.rawQuery() = qb::rescore(topDocs.mr(), child, expr);
+    topDocs.limit(10).getScores(true).fields({"id"});
+    if (countLimit != 0) topDocs.countLimit(countLimit);
+    req->execute(false);
+    const auto* docs = req->responses[0]->proto.ops.at("q")->docList();
+    int64_t ret = (int64_t)docs->found.value_or(0);
+    const auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id").kind);
+    for (int i = 0; i < (int)idCol.v.size(); i++) {
+      int64_t id = 0;
+      std::from_chars(idCol.v[i].data(), idCol.v[i].data() + idCol.v[i].size(), id);
+      ret = ret * 31 + id;
+    }
+    benchmark::DoNotOptimize(ret);
+    if (fp != -1) {
+      ASSERT_EQ(fp, ret);
+    }
+    fp = ret;
+  }
+  state.counters["fp"] = fp;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
+
 // Conjunction (AND of two terms) -- the canonical advance()/leapfrog workload:
 // the smaller posting list leads and advance()s the larger across doc blocks,
 // which is exactly what postings skip data accelerates.  Kept deliberately lean
@@ -415,6 +463,12 @@ LUXIR_BENCHMARK_CAPTURE(BM_Query, short_u1m_s,      nDocs, shape, "all", "short_
 LUXIR_BENCHMARK_CAPTURE(BM_Query, short_u1m_s_para, nDocs, shape, "all", "short_u1m_s", true);
 
 // Conjunction shapes (rare term leads, advance()s the common one across blocks).
+LUXIR_BENCHMARK_CAPTURE(BM_QueryRescore, rescore_col_u10m,        nDocs, shape, "all", "u10m_i", 0);
+LUXIR_BENCHMARK_CAPTURE(BM_QueryRescore, rescore_col_u10m_count,  nDocs, shape, "all", "u10m_i", -1);
+LUXIR_BENCHMARK_CAPTURE(BM_QueryRescore, rescore_log_u10m,        nDocs, shape, "all", "log1p(u10m_i) * 2", 0);
+LUXIR_BENCHMARK_CAPTURE(BM_QueryRescore, rescore_decay_u10k,      nDocs, shape, "all", "gauss_decay(u10k_i, 5000, 100)", 0);
+LUXIR_BENCHMARK_CAPTURE(BM_QueryRescore, rescore_decay_term,      nDocs, shape, "short_u10_s", "score * gauss_decay(u10k_i, 5000, 100)", 0);
+
 LUXIR_BENCHMARK_CAPTURE(BM_QueryConj, conj_dense_sparse,      nDocs, shape, "short_u10_s",  "short_u100k_s", false);  // ~1M AND ~100
 LUXIR_BENCHMARK_CAPTURE(BM_QueryConj, conj_dense_sparse_para, nDocs, shape, "short_u10_s",  "short_u100k_s", true);
 LUXIR_BENCHMARK_CAPTURE(BM_QueryConj, conj_dense_mid,         nDocs, shape, "short_u10_s",  "short_u10k_s",  false);  // ~1M AND ~1k
