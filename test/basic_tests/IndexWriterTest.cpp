@@ -2835,9 +2835,64 @@ TEST_F(IndexWriterTest, liveDocsCreationFailureAbortsFlush) {
   EXPECT_EQ(reserved, node.getIndexRamBudget().reservedBytes());
   EXPECT_EQ(0, node.getIndexRamBudget().drainingBytesCount());
   EXPECT_EQ(0, node.getIndexRamBudget().retainedDeleteBytesCount());
-  ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup")},
-                             UpdateMessage::COMMIT, true).success);
+  // The aborted segment held acknowledged updates: the writer must not go on.
+  ASSERT_NE(nullptr, iw->getFailureReason());
+  EXPECT_FALSE(helper.index(flatdoc("id", "next"), UpdateMessage::COMMIT, true).success);
   expectValidInventory(iw->dir, *readDurableIndexInfo(iw->dir));
+}
+
+// An update acknowledged without a commit must not vanish when its inverter's
+// flush fails: a later commit must not report success without it.
+TEST_F(IndexWriterTest, abortedFlushFailsWriter) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  ASSERT_TRUE(helper.index(flatdoc("id", "acked")).success);
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(1, iw->idleInverters.size());
+  auto* postings = &iw->idleInverters.begin()->first->getPostingsWriter();
+  {
+    Signal::listen("postingsBeforeCollapse", [&](void* source, void*, void*) -> void* {
+      if (source == postings) throw std::runtime_error("injected flush failure");
+      return nullptr;
+    });
+    auto fault = scope_guard([] { Signal::unlisten("postingsBeforeCollapse"); });
+    ExpectLog quiet("injected flush failure");
+    // A flush no commit waits on, as a size or RAM-pressure flush would be.
+    iw->releaseInverter(iw->obtainInverter(), true);
+    iw->updateGraph->wait_for_all();
+  }
+  ASSERT_NE(nullptr, iw->getFailureReason());
+  CollectionHelper::UpdateBuilder commit;
+  commit.commit();
+  EXPECT_FALSE(helper.submit(commit).success);
+}
+
+// A request failing on an inverter only it used loses no acknowledged work.
+TEST_F(IndexWriterTest, requestFailureFailsWriterOnlyOnSharedInverter) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
+  IndexWriter iw(snapshots);
+  auto failure = std::make_exception_ptr(std::runtime_error("injected request failure"));
+  auto& alone = iw.obtainInverter(1);
+  alone.fail(failure);
+  iw.releaseInverter(alone, true);
+  iw.updateGraph->wait_for_all();
+  EXPECT_EQ(nullptr, iw.getFailureReason());
+
+  auto& acked = iw.obtainInverter(2);
+  acked.startDoc();
+  acked.getIndexHandler("id").index(acked, "a");
+  acked.finishDoc();
+  iw.releaseInverter(acked);
+  auto& shared = iw.obtainInverter(3);
+  ASSERT_EQ(&acked, &shared);
+  shared.fail(failure);
+  iw.releaseInverter(shared, true);
+  iw.updateGraph->wait_for_all();
+  ASSERT_NE(nullptr, iw.getFailureReason());
+  EXPECT_THROW(iw.commit(), IndexWriterClosedError);
 }
 
 TEST_F(IndexWriterTest, durableVersionIncludesDeletesAndNeverRegresses) {

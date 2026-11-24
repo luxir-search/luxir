@@ -54,6 +54,16 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
   }
 }
 
+std::string failureMessage(const std::exception_ptr& failure) {
+  try {
+    std::rethrow_exception(failure);
+  } catch (const std::exception& e) {
+    return e.what();
+  } catch (...) {
+    return "unknown non-standard exception";
+  }
+}
+
 bool mayApplyDeletes(const SegInfo& seg, const SortedDeletes& packet) {
   if (seg.minVersion >= packet.getLargestVersion()) return false;
   auto range = seg.idRange.load();
@@ -1452,7 +1462,8 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   bool success = false;
   CatalogRange catalog;
   std::optional<FileDescriptor> liveFile;
-  bool aborted = inverter.failed();
+  bool requestFailed = inverter.failed();
+  bool aborted = requestFailed;
   if (!aborted) {
     try {
       // uncomment to serialize inverter flushing (for testing purposes)
@@ -1476,6 +1487,27 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
       inverter.fail(std::current_exception());
       aborted = true;
       success = false;
+    }
+  }
+
+  // An aborted inverter is never published, but other requests that shared it
+  // were already acknowledged. Fail the writer so no later commit can succeed
+  // without their updates. A request that failed on an inverter only it
+  // acquired (each acquisition records its unique version) loses nothing that
+  // was acknowledged, and its own error reports the loss. Fail before the
+  // commit below is released so it cannot publish either.
+  if (aborted) {
+    // Only the request that triggered the flush (a failed one, or the commit
+    // waiting on it) is on the inverter, or it holds no versioned updates.
+    bool oneVersion = inverter.minVersion == inverter.maxVersion;
+    bool ownVersion = requestFailed ? inverter.currVersion != 0
+                                    : inverter.commitInfo != nullptr
+                                          && inverter.commitInfo->updateMessage->updateVersion == inverter.maxVersion;
+    bool soleRequest = inverter.maxVersion == 0 || (oneVersion && ownVersion);
+    if (!soleRequest) {
+      fail(std::format("segment s{} was aborted with acknowledged updates: {}",
+                       Postings::segmentKey(inverter.getPostingsWriter().segId, writerEpoch),
+                       failureMessage(inverter.failure())));
     }
   }
 

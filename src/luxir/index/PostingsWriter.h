@@ -467,6 +467,7 @@ public:
     for (const auto& file : spillFiles) {
       if (!file || !file->available) throw std::logic_error("unfinished spilled checkout");
     }
+    Signal::emit("postingsBeforeCollapse", this);
     primaryFile();
     writeCatalog();
 
