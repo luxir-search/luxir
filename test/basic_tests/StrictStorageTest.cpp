@@ -10,6 +10,7 @@
 #include <future>
 #include "luxir/store/Manifest.h"
 #include "luxir/store/VerifiedDirectory.h"
+#include "test/GatedStorage.h"
 #include "test/LuxirTest.h"
 #include "test/StrictStorage.h"
 
@@ -46,16 +47,15 @@ public:
   explicit ThreadedInputFile(std::shared_ptr<InputFile> delegate) : delegate(std::move(delegate)) {}
   ~ThreadedInputFile() override { threads.clear(); }
   size_t size() override { return delegate->size(); }
-  using InputFile::acquire;
   HeldRange acquire(ByteRange range) override { return delegate->acquire(range); }
-  void acquire(std::span<const ByteRange> ranges, AcquireDone done) override {
-    threads.emplace_back([this, requested = std::vector<ByteRange>(ranges.begin(), ranges.end()), done] {
-      try {
-        delegate->acquire(requested, done);
-      } catch (...) {
-        done({}, std::current_exception());
-      }
-    });
+  void acquireBatch(std::span<const ByteRange> ranges, AcquireDone done) noexcept override {
+    try {
+      threads.emplace_back([this, requested = std::vector(ranges.begin(), ranges.end()), done] {
+        delegate->acquireBatch(requested, done);
+      });
+    } catch (...) {
+      done({}, std::current_exception());
+    }
   }
 };
 
@@ -67,13 +67,12 @@ class ParkedInputFile : public InputFile {
 public:
   explicit ParkedInputFile(std::shared_ptr<InputFile> delegate) : delegate(std::move(delegate)) {}
   size_t size() override { return delegate->size(); }
-  using InputFile::acquire;
   HeldRange acquire(ByteRange range) override { return delegate->acquire(range); }
-  void acquire(std::span<const ByteRange> ranges, AcquireDone done) override {
+  void acquireBatch(std::span<const ByteRange> ranges, AcquireDone done) noexcept override {
     parked.emplace_back(std::vector<ByteRange>(ranges.begin(), ranges.end()), std::move(done));
   }
   void release() {
-    for (auto& [ranges, done] : std::exchange(parked, {})) delegate->acquire(ranges, done);
+    for (auto& [ranges, done] : std::exchange(parked, {})) delegate->acquireBatch(ranges, std::move(done));
   }
 };
 
@@ -198,6 +197,35 @@ TEST(StrictStorageTest, deniesWholeBaseSegmentFiles) {
   }
 }
 
+TEST(StrictStorageTest, rejectsAPartAcquiredUnderBothClasses) {
+  StrictDirectory dir(std::make_shared<RAMDir>(), std::make_shared<StrictStorageCounters>());
+  put(dir, "data");
+  auto file = dir.openFile("data");
+  EXPECT_NO_THROW(file->acquire({4, 8, ReadClass::METADATA}));
+  EXPECT_NO_THROW(file->acquire({4, 8, ReadClass::METADATA}));
+  EXPECT_NO_THROW(file->acquire({4, 9}));
+  EXPECT_THROW(file->acquire({4, 8}), std::logic_error);
+}
+
+// Reads no part makes count as whole-file reads: from offset 0 past the
+// header, and to EOF outside file 0, whose catalog runs to EOF.
+TEST(StrictStorageTest, deniesReadsNoSegmentPartMakes) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters, StrictWholeFiles::DENY);
+  auto header = Postings::LUXIR_HEADER.size();
+  for (uint32_t number : {0u, 1u}) {
+    auto name = Postings::getIndexFileName(Postings::segmentKey(1, 1), number);
+    put(dir, name);
+    auto file = dir.openFile(name);
+    auto size = file->size();
+    EXPECT_NO_THROW(file->acquire({0, header}));
+    EXPECT_THROW(file->acquire({0, header + 1}), FileIOException);
+    EXPECT_NO_THROW(file->acquire({header, size - header - 1}));
+    if (number == 0) EXPECT_NO_THROW(file->acquire({header, size - header}));
+    else EXPECT_THROW(file->acquire({header, size - header}), FileIOException);
+  }
+}
+
 TEST(StrictStorageTest, wrapsVerifiedMappingAfterDirectoryCloses) {
   auto counters = std::make_shared<StrictStorageCounters>();
   std::shared_ptr<InputFile> file;
@@ -245,7 +273,7 @@ TEST(StrictStorageTest, ramLinkSharesFileFromWrappedSource) {
   EXPECT_EQ(0u, counters->fileStats("data").acquires);
 }
 
-TEST(StrictStorageTest, batchesForwardAsOneRound) {
+TEST(StrictStorageTest, batchesForwardAsOneSubmission) {
   auto counters = std::make_shared<StrictStorageCounters>();
   StrictDirectory dir(std::make_shared<RAMDir>(), counters);
   put(dir, "data");
@@ -265,10 +293,33 @@ TEST(StrictStorageTest, batchesForwardAsOneRound) {
   EXPECT_EQ(3u, stats.acquires);
   EXPECT_EQ(1u, stats.metadataAcquires);
   EXPECT_EQ(1u, stats.batches);  // the rejected batch never went out
-  EXPECT_EQ(2u, stats.rounds);
-  EXPECT_EQ(1u, stats.firstRound);
-  EXPECT_EQ(2u, stats.lastRound);
-  EXPECT_EQ(2u, counters->totalRounds());
+  EXPECT_EQ(2u, stats.submissions);
+  EXPECT_EQ(1u, stats.firstSubmission);
+  EXPECT_EQ(2u, stats.lastSubmission);
+  EXPECT_EQ(2u, counters->totalSubmissions());
+}
+
+TEST(StrictStorageTest, batchReportsErrorsThroughDone) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters, StrictWholeFiles::DENY);
+  auto name = Postings::getIndexFileName(Postings::segmentKey(1, 1), 0u);
+  put(dir, name);
+  auto file = dir.openFile(name);
+  ASSERT_NE(nullptr, file);
+  ByteRange outside[] = {{0, 2}, {1, UINT64_MAX}};
+  ByteRange whole[] = {{0, 2}, {0, file->size()}};
+  for (auto ranges : {std::span<const ByteRange>(outside), std::span<const ByteRange>(whole)}) {
+    int calls = 0;
+    std::exception_ptr error;
+    file->acquireBatch(ranges, [&](std::vector<HeldRange>&& holds, std::exception_ptr failure) {
+      ++calls;
+      EXPECT_TRUE(holds.empty());
+      error = failure;
+    });
+    EXPECT_EQ(1, calls);
+    EXPECT_NE(nullptr, error);
+  }
+  EXPECT_EQ(0u, counters->fileStats(name).batches);
 }
 
 TEST(StrictStorageTest, joinWaitsForBatchesCompletingElsewhere) {
@@ -297,8 +348,25 @@ TEST(StrictStorageTest, joinWaitsForBatchesCompletingElsewhere) {
   failing.acquire(a, outside, [](auto&&) { FAIL(); });
   failing.acquire(b, ranges, [](auto&&) { throw FileIOException("take failed"); });
   EXPECT_ANY_THROW(failing.wait());
+  EXPECT_EQ(3u, counters->liveStats().holds);  // the failed take's holds released before wait() returned
   fromA.clear();
   fromB.clear();
+}
+
+TEST(StrictStorageTest, joinDestroyedWithoutWaitWaitsForItsBatches) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  auto strict = std::make_shared<StrictDirectory>(std::make_shared<RAMDir>(), counters);
+  put(*strict, "a");
+  GatedDirectory dir(strict, 2, std::chrono::milliseconds(50));  // Holds the batch for one that never comes.
+  auto file = dir.openFile("a");
+  std::vector<HeldRange> taken;
+  ByteRange ranges[] = {{0, 2}};
+  {
+    AcquireJoin join;
+    join.acquire(*file, ranges, [&](auto&& holds) { taken = std::move(holds); });
+  }
+  EXPECT_EQ(1u, taken.size());
+  EXPECT_TRUE(dir.gate.timedOut());
 }
 
 TEST(StrictStorageTest, roundResumesOnArenaOrInline) {

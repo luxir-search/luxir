@@ -1498,7 +1498,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
     // Set liveDocs + liveGen for deleted docs from errors during indexing
     if (inverter.liveGen > 0) {
-      liveDocsBytesWritten += LiveDocsWriter::fileBytes(segInfo->maxDoc);
+      liveDocsBytesWritten += inverter.liveDocsBytes;
       segInfo->liveGen = inverter.liveGen;
       segInfo->liveDocs = inverter.liveDocs;
       assert(segInfo->liveDocs <= segInfo->maxDoc);
@@ -2148,6 +2148,15 @@ const Segment* IndexWriter::publishedSegment(const SegInfo& seg, std::shared_ptr
   return segment != nullptr && segment->maxDoc() == seg.maxDoc ? segment : nullptr;
 }
 
+std::shared_ptr<LiveDocs> IndexWriter::loadLiveDocs(const SegInfo& seg, uint64_t gen, uint64_t epoch) {
+  std::shared_ptr<IndexReader> reader;
+  const auto* published = publishedSegment(seg, reader);
+  if (published != nullptr && published->segInfo.live_gen == gen) {
+    if (auto live = published->liveDocsShared()) return live;
+  }
+  return LiveDocs::create(dir, seg.segId, seg.creatorEpoch, gen, epoch, seg.maxDoc, false, false);
+}
+
 void IndexWriter::seedActiveVectorOverlayNamesFromManifestLocked() {
   activeVectorOverlayNames.clear();
   for (const auto& published : currentSegmentOverlays_) {
@@ -2348,8 +2357,7 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
           auto file = dir.createFile(fileName);
           OutputStream os;
           os.setFile(&*file);
-          static constexpr std::string_view payload = "luxir test overlay\n";
-          os.write(payload.data(), payload.size());
+          os.write(TestOverlayAuxReader::PAYLOAD.data(), TestOverlayAuxReader::PAYLOAD.size());
           os.close();
           dir.finishFile(*file);
           descriptor = file->descriptor();
@@ -2754,8 +2762,12 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       // dictionaries are exempt because they do not produce an ord column.
       // Doc ids carry the same shape of limit: the merged segment's maxDoc
       // (the live docs the merger copies) must stay below MAX_SEGMENT_DOCS.
+      // Vector fields are summed by values (deleted ones included) against
+      // MAX_SEGMENT_VECTORS, which multi-valued fields can reach before the
+      // doc cap.
       int64_t mergedDocs = 0;
       boost::unordered_flat_map<std::string, int64_t> ordTermSums;
+      boost::unordered_flat_map<std::string, int64_t> vectorSums;
       boost::unordered_flat_map<std::string, int64_t> pathRows;
       std::vector<SegInfo*> admitted;
       admitted.reserve(segs.size());
@@ -2768,9 +2780,19 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         auto postingsReaderCore = getSegmentCore(*seg);
         MemPool metadataPool;
         boost::unordered_flat_map<std::string, int64_t> additions;
-        auto ordsFit = [&](PostingsReader& reader) {
+        boost::unordered_flat_map<std::string, int64_t> vectorAdditions;
+        auto fieldsFit = [&](PostingsReader& reader) {
           for (int32_t ordinal = 0; ordinal < reader.numFields(); ++ordinal) {
             auto header = reader.fieldHeader(ordinal);
+            if (FieldType::storage(header.type) == FieldType::Storage::VECTOR) {
+              std::string name(std::string_view(header.name));
+              int64_t next = vectorAdditions[name] + header.numValues;
+              if (!MergeCostModel::vectorsFit(vectorSums[name], next)) {
+                return false;
+              }
+              vectorAdditions[name] = next;
+              continue;
+            }
             if (FieldType::storage(header.type) != FieldType::Storage::TERMS || !(header.flags & FieldType::INDEX_DOCS)
                 || !(header.flags & FieldType::MULTI_VALUED)) {
               continue;
@@ -2784,7 +2806,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           }
           return true;
         };
-        bool fits = ordsFit(postingsReaderCore->rootReader());
+        bool fits = fieldsFit(postingsReaderCore->rootReader());
         std::vector<std::pair<std::string, int64_t>> nextRows;
         for (size_t i = 1; fits && i < postingsReaderCore->spaces().size(); i++) {
           const auto& space = postingsReaderCore->spaces()[i];
@@ -2793,15 +2815,16 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           // can be skipped.
           int64_t next = pathRows[std::string(space.path)] + space.maxDoc;
           fits = MergeCostModel::docsFit(0, next)
-              && ordsFit(*postingsReaderCore->spaceReader(space.path));
+              && fieldsFit(*postingsReaderCore->spaceReader(space.path));
           nextRows.emplace_back(space.path, next);
         }
         if (!fits) {
-          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged row space or ord dictionary would exceed the safety limit",
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because a merged row space, ord dictionary or vector field would exceed the safety limit",
                       seg->name());
           continue;
         }
         for (const auto& [field, terms] : additions) ordTermSums[field] += terms;
+        for (const auto& [field, vectors] : vectorAdditions) vectorSums[field] += vectors;
         for (const auto& [path, rows] : nextRows) pathRows[path] = rows;
         mergedDocs += seg->liveDocs;
         admitted.push_back(seg);
@@ -2881,7 +2904,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     for (auto segInfo : segs) {
       if (segInfo->mergedLiveGen > 0) {
         // Load liveDocs for this segment
-        auto liveDocs = LiveDocs::create(dir, segInfo->segId, segInfo->creatorEpoch, segInfo->mergedLiveGen, segInfo->liveEpochFor(segInfo->mergedLiveGen, writerEpoch), segInfo->maxDoc, false, false);
+        auto liveDocs = loadLiveDocs(*segInfo, segInfo->mergedLiveGen, segInfo->liveEpochFor(segInfo->mergedLiveGen, writerEpoch));
         if (!liveDocs) {
           throw std::runtime_error("Failed to load liveDocs for segment " + std::to_string(segInfo->segId) +
                                    " gen=" + std::to_string(segInfo->mergedLiveGen));
@@ -2954,7 +2977,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           // Rescan from the merged generation on every retry. Clearing an
           // already-clear output bit is a no-op, so only the generation the
           // diff covered needs to be remembered.
-          auto current = LiveDocs::create(dir, seg->segId, seg->creatorEpoch, currentGens[i], seg->liveEpochFor(currentGens[i], writerEpoch), seg->maxDoc, false, false);
+          auto current = loadLiveDocs(*seg, currentGens[i], seg->liveEpochFor(currentGens[i], writerEpoch));
           const auto* merged = liveDocsVec[i] ? &liveDocsVec[i]->bitset() : nullptr;
           const auto& now = current->bitset();
           for (int32_t word = 0; word < (int32_t)screaming::FixedBitSet::sizeInWords(seg->maxDoc); word++) {
@@ -3615,9 +3638,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
 
   // The id filter proves most absent ids absent: those skip the dictionary,
   // and a segment that can hold none of them is not touched further.
-  // A filter this build cannot read proves nothing.
-  std::optional<IdFilter> idFilter;
-  if (auto slice = idFieldInfo->idFilter()) idFilter = IdFilter::parse(core->slice(slice));
+  auto idFilter = core->idFilter();
   auto mayHold = [&](const auto& entry) {
     return entry.val().deleteWatermark != 0 && (!idFilter || idFilter->mayContain((std::string_view)entry));
   };
@@ -3627,14 +3648,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
   // Load existing LiveDocs if they exist: the published reader's when it
   // holds this generation
   std::shared_ptr<LiveDocs> existingLiveDocs;
-  if (seg.liveGen > 0) {
-    std::shared_ptr<IndexReader> publishedReader;
-    const auto* published = publishedSegment(seg, publishedReader);
-    if (published != nullptr && published->segInfo.live_gen == seg.liveGen) {
-      existingLiveDocs = published->liveDocsShared();
-    }
-    if (!existingLiveDocs) existingLiveDocs = LiveDocs::create(dir, seg.segId, seg.creatorEpoch, seg.liveGen, seg.liveEpoch, maxDocId, false, false);
-  }
+  if (seg.liveGen > 0) existingLiveDocs = loadLiveDocs(seg, seg.liveGen, seg.liveEpoch);
 
   // The new generation's bits: copied from the existing liveDocs at the first
   // delete, or before chunk tasks start so they only clear bits.

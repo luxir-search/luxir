@@ -137,6 +137,7 @@ Slice ordBlockMetadata(const OrdColumn& column, uint64_t count);
 struct BytesColumn {
   Slice values;      // All values in rank order.
   Slice endOffsets;  // Monotonic end byte offsets, null for fixed stride.
+  uint8_t vectorEncoding = 0;  // VECTOR only: the values' VectorEncoding, as written for this segment.
 
   bool operator==(const BytesColumn&) const = default;
 };

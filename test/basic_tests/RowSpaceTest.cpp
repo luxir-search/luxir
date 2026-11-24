@@ -8,7 +8,7 @@
 #include "test/QueryBuild.h"
 #include "test/StorageTestUtils.h"
 #include "luxir/index/LiveDocsWriter.h"
-#include "luxir/reader/FieldMetadataMemory.h"
+#include "luxir/search/LiveDocsMemory.h"
 #include "luxir/search/DomainVariantPlan.h"
 #include "luxir/search/OwnershipRelation.h"
 #include "luxir/query/AllQuery.h"
@@ -464,7 +464,7 @@ TEST_F(RowSpaceTest, derivedLivenessClearsRangesAndWalksOwnerChains) {
   auto core = SegmentCore::create(dir, 1, 1);
   auto words = FixedBitSet::allocate(5, true);
   words[0] &= ~((1ULL << 1) | (1ULL << 2)); // Root 1 has no children.
-  auto roots = std::make_shared<SegmentLive>(std::make_shared<LiveDocs>(std::move(words), 5, 3));
+  auto roots = std::make_shared<SegmentLive>(std::make_shared<LiveDocs>(std::move(words), 5, 3, liveDocsMemory.sparseRoots));
   ChildLiveDocs child(core, roots, "items");
   auto live = child.get();
   ASSERT_NE(nullptr, live);
@@ -1017,7 +1017,7 @@ TEST_F(ScopedRowSpaceTest, consumingChildUsesDerivedLiveEligibilityAfterDelete) 
 
 TEST_F(ScopedRowSpaceTest, streamingJoinDoesNotBuildChildLiveBitmap) {
   publish(0);
-  auto before = fieldMetadataMemory.liveViews.load();
+  auto before = liveDocsMemory.views.count.load();
   auto req = request();
   req->topDocs().countLimit().limit(0).rawQuery() = qb::toParent(req->mr, Fixture::CHILD, qb::all(), "none");
   auto child = qb::boolean(req->mr, {qb::exists(req->mr, "number")}, {},
@@ -1027,13 +1027,13 @@ TEST_F(ScopedRowSpaceTest, streamingJoinDoesNotBuildChildLiveBitmap) {
   ASSERT_OK(req);
   EXPECT_EQ(3, req->getMatchCount());
   EXPECT_EQ(2, req->getMatchCount("boolean"));
-  EXPECT_EQ(before, fieldMetadataMemory.liveViews.load());
+  EXPECT_EQ(before, liveDocsMemory.views.count.load());
 }
 
 TEST_F(ScopedRowSpaceTest, preparedPredicateChildKeepsRawMembershipAcrossDeletes) {
   for (bool deleted : {false, true}) {
     if (deleted) publish(0);
-    auto before = fieldMetadataMemory.liveViews.load();
+    auto before = liveDocsMemory.views.count.load();
     auto req = request();
     auto inner = qb::toParent(req->mr, "deep", qb::all(), "none");
     auto predicate = qb::boolean(req->mr, {inner}, {}, {}, {qb::match(req->mr, "label", "a")});
@@ -1044,7 +1044,7 @@ TEST_F(ScopedRowSpaceTest, preparedPredicateChildKeepsRawMembershipAcrossDeletes
     ASSERT_OK(req);
     EXPECT_EQ(deleted ? 3 : 4, req->getMatchCount());
     EXPECT_EQ(deleted ? 3 : 4, req->getMatchCount("cached"));
-    EXPECT_EQ(before, fieldMetadataMemory.liveViews.load());
+    EXPECT_EQ(before, liveDocsMemory.views.count.load());
   }
 }
 

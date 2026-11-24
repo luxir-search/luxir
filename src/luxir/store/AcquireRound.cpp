@@ -68,24 +68,24 @@ AcquireRound::~AcquireRound() {
 }
 
 void AcquireRound::acquire(InputFile& file, std::span<const ByteRange> ranges, Take take) {
-  pending.fetch_add(1, std::memory_order_relaxed);
-  auto once = std::make_shared<std::atomic<bool>>(false);
-  try {
-    file.acquire(ranges, [self = shared_from_this(), once, take = std::move(take)](std::vector<HeldRange>&& holds,
-                                                                                   std::exception_ptr failure) {
-      if (once->exchange(true)) return;
-      if (!failure) {
-        try {
-          take(std::move(holds));
-        } catch (...) {
-          failure = std::current_exception();
-        }
+  // Built before the batch counts as pending: the conversion can allocate.
+  AcquireDone done = [self = shared_from_this(), count = ranges.size(), take = std::move(take)](
+                         std::vector<HeldRange>&& delivered, std::exception_ptr failure) noexcept {
+    // Owned here, so what `take` leaves releases before the round completes.
+    auto holds = std::move(delivered);
+    if (!failure) {
+      try {
+        if (holds.size() != count) throw FileIOException("batched acquire returned the wrong number of holds");
+        take(std::move(holds));
+      } catch (...) {
+        failure = std::current_exception();
       }
-      self->complete(std::move(failure));
-    });
-  } catch (...) {
-    if (!once->exchange(true)) complete(std::current_exception());
-  }
+    }
+    holds.clear();
+    self->complete(std::move(failure));
+  };
+  pending.fetch_add(1, std::memory_order_relaxed);
+  file.acquireBatch(ranges, std::move(done));
 }
 
 void AcquireRound::keep(std::shared_ptr<const void> owner) {

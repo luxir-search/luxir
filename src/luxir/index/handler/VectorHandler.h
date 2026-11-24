@@ -10,6 +10,7 @@
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/log.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -19,10 +20,12 @@
 namespace luxir::handler {
 
 /// Dense-float-vector field handler. Typed Vector / ArrVector values and
-/// schema-directed numeric Val arrays are copied to an owned f32 buffer, then stored as
-/// fixed-size byte blobs through the binary-column path inherited from
-/// StrColHandler. The column's existing fixed-size fast path captures
-/// per-segment dims in the value stride.
+/// schema-directed numeric Val arrays are copied to an owned f32 buffer,
+/// validated (and normalized for cosine), encoded in the field's
+/// VectorEncoding, then stored as fixed-size byte blobs through the
+/// binary-column path inherited from StrColHandler. The column's fixed-size
+/// path captures per-segment dims in the value stride (the encoded value
+/// size); the encoding is recorded on the column descriptor.
 ///
 /// dims_ tracks the stored vector size observed so far in this segment.  If
 /// the owning VectorFieldType declares a non-zero dims, its stored dims seed
@@ -39,8 +42,13 @@ class VectorHandler final : public StrColHandler {
   VectorFieldType::Metric metric = VectorFieldType::METRIC_NONE;
   bool trustNormalized = false;
   bool normalizeOnWrite = false;
+  VectorEncoding encoding = VectorEncoding::F32;
+  // Raw cosine vectors in a non-f32 encoding: check the stored direction.
+  bool checkStoredDirection = false;
   std::vector<float> floats;
   std::vector<int32_t> lens;
+  std::vector<char> encoded;
+  std::vector<float> decoded;
   std::vector<std::string_view> views;
 
 public:
@@ -54,6 +62,9 @@ public:
     metric = vft->metric_;
     trustNormalized = vft->normalized_;
     normalizeOnWrite = vft->normalizeOnWrite_;
+    encoding = vft->encoding_;
+    checkStoredDirection = metric == VectorFieldType::METRIC_COSINE && !trustNormalized
+        && !normalizeOnWrite && encoding != VectorEncoding::F32;
   }
 
   int32_t dims() const { return dims_; }
@@ -62,6 +73,10 @@ protected:
   // Persist the valueRank -> docId map for multi-valued vector fields so the kNN
   // engine can group per-vector hits back to their owning document.
   bool writesOwners() const override { return true; }
+
+  void describeColumn(field_parts::BytesColumn& column) const override {
+    column.vectorEncoding = (uint8_t)encoding;
+  }
 
 public:
   void index(Inverter& inverter, const IndexVal& val) override {
@@ -84,12 +99,16 @@ public:
       return;
     }
 
-    views.reserve(lens.size());
+    if (encoding != VectorEncoding::F32) {
+      // Room for every vector of the value, so views into it stay valid.
+      int32_t maxLen = *std::max_element(lens.begin(), lens.end());
+      encoded.resize(lens.size() * (size_t)vcodec::bytesPerVector(encoding, maxLen));
+    }
     size_t offset = 0;
     for (size_t i = 0; i < lens.size(); i++) {
       auto vec = std::span<float>(floats).subspan(offset, (size_t)lens[i]);
       offset += (size_t)lens[i];
-      if (validate(vec, isList ? (int32_t)i : -1)) views.push_back(bytesOf(vec));
+      if (validate(vec, isList ? (int32_t)i : -1)) store(vec);
     }
     if (views.empty()) return;
 
@@ -144,24 +163,62 @@ private:
           std::string_view(fieldName), prefix(), expected, n));
     }
     if (metric == VectorFieldType::METRIC_COSINE && !trustNormalized) {
-      // Finite elements: the double sum of squares cannot overflow.
-      double normSq = 0.0;
-      for (float x : vec) {
-        double d = (double)x;
-        normSq += d * d;
-      }
-      if (normSq <= VectorFieldType::MIN_COSINE_NORM_SQ) {
-        // No cosine direction - skip this value rather than abort the update.
-        LOG_WARN("VectorHandler: cosine field '{}' skipping zero / near-zero vector",
-                 std::string_view(fieldName));
-        return false;
-      }
+      double sq = normSq(vec);
+      if (!hasDirection(sq)) return false;
       if (normalizeOnWrite) {
-        float invNorm = (float)(1.0 / std::sqrt(normSq));
+        float invNorm = (float)(1.0 / std::sqrt(sq));
         for (float& x : vec) x *= invNorm;
       }
     }
+    if (encoding == VectorEncoding::F16) {
+      for (float x : vec) {
+        if (std::fabs(x) > vcodec::F16_MAX) {
+          throw DocumentError(fmt::format(
+              "field '{}': {}element {} exceeds the f16 range (+-{})",
+              std::string_view(fieldName), prefix(), x, vcodec::F16_MAX));
+        }
+      }
+    }
     return true;
+  }
+
+  // Appends the view of an accepted vector as stored.  F32 views point at the
+  // float buffer itself; other encodings encode into the next slot of
+  // `encoded` (every vector of a value has the stored dims).  A raw cosine
+  // vector checks the direction of its stored value, since tiny elements can
+  // underflow to zero in f16, and is skipped like a zero vector without one.
+  // A normalized vector cannot lose its direction to any encoding.
+  void store(std::span<const float> vec) {
+    if (encoding == VectorEncoding::F32) {
+      views.push_back(bytesOf(vec));
+      return;
+    }
+    int32_t n = (int32_t)vec.size();
+    size_t valueBytes = (size_t)vcodec::bytesPerVector(encoding, n);
+    char* out = encoded.data() + views.size() * valueBytes;
+    vcodec::encode(encoding, vec.data(), n, out);
+    if (checkStoredDirection) {
+      decoded.resize((size_t)n);
+      vcodec::decode(encoding, out, n, decoded.data());
+      if (!hasDirection(normSq(decoded))) return;
+    }
+    views.push_back(std::string_view(out, valueBytes));
+  }
+
+  // Finite elements: the double sum of squares cannot overflow.
+  static double normSq(std::span<const float> vec) {
+    double sum = 0.0;
+    for (float x : vec) sum += (double)x * (double)x;
+    return sum;
+  }
+
+  // A cosine vector without a direction is skipped rather than aborting the
+  // update.
+  bool hasDirection(double sq) const {
+    if (sq > VectorFieldType::MIN_COSINE_NORM_SQ) return true;
+    LOG_WARN("VectorHandler: cosine field '{}' skipping zero / near-zero vector",
+             std::string_view(fieldName));
+    return false;
   }
 
   static std::string_view bytesOf(std::span<const float> vec) {

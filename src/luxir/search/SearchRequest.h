@@ -108,6 +108,7 @@ public:
   // Shared by every query tree of the request: one allowance for all of its
   // prefix/wildcard/regex/range/fuzzy dictionary work.
   MultiTermBudget multiTermBudget;
+  std::shared_ptr<QueryPruning> pruning;
   const ReqProto& proto;            // borrowed non-owning view over the request bytes
   google::protobuf::Arena& arena;   // engine object allocator (NOT proto storage)
   std::shared_ptr<IndexReader> reader;
@@ -157,6 +158,9 @@ public:
   // proto.profile=true during parsing.
   std::vector<std::unique_ptr<ExecutionProfileOpState>> executionProfileOps;
   std::mutex executionProfileMutex;
+  ExecutionProfileOpState* pruningProfile = nullptr;
+  void recordPrunedSegment(ExecutionProfileRun*& run, IndexReader::Segment& segment,
+                           std::vector<std::string> details);
 
   // Transport default for DocList field placement when an op leaves
   // document_format at DEFAULT: gRPC serves COLUMNS; the HTTP/JSON layer sets

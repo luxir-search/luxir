@@ -417,12 +417,12 @@ TEST_F(DirectoryTest, checkedDirThrowsOnUnsyncedExpectSynced) {
   ASSERT_NO_THROW(dir.openFile("foo"));
 
   // Opening with expectSynced on an unsynced file should throw
-  ASSERT_THROW(dir.openFile("foo", true), std::runtime_error);
+  ASSERT_THROW(dir.openFile("foo", {.expectSynced = true}), std::runtime_error);
 
   // After syncing, expectSynced should succeed
   std::vector<std::string> syncFiles = {"foo"};
   dir.sync(syncFiles);
-  ASSERT_NO_THROW(dir.openFile("foo", true));
+  ASSERT_NO_THROW(dir.openFile("foo", {.expectSynced = true}));
 }
 
 // Readers share open segments instead of reopening their files, so it is
@@ -470,7 +470,7 @@ TEST_F(DirectoryTest, checkedDirWarnMode) {
   // WARN mode should not throw even with expectSynced on unsynced file
   {
     ExpectLog quiet("expectSynced openFile on unsynced file");
-    ASSERT_NO_THROW(dir.openFile("bar", true));
+    ASSERT_NO_THROW(dir.openFile("bar", {.expectSynced = true}));
   }
 }
 
@@ -498,7 +498,7 @@ TEST_F(DirectoryTest, checkedDirDeleteClearsUnsynced) {
 
   std::vector<std::string> syncFiles = {"gone"};
   dir.sync(syncFiles);
-  ASSERT_NO_THROW(dir.openFile("gone", true));
+  ASSERT_NO_THROW(dir.openFile("gone", {.expectSynced = true}));
 }
 
 TEST_F(DirectoryTest, checkedDirPreExistingFilesAssumedSynced) {
@@ -516,7 +516,7 @@ TEST_F(DirectoryTest, checkedDirPreExistingFilesAssumedSynced) {
   CheckedDirectory dir(ram, CheckedDirMode::THROW);
 
   // Pre-existing files should be assumed synced
-  ASSERT_NO_THROW(dir.openFile("pre_existing", true));
+  ASSERT_NO_THROW(dir.openFile("pre_existing", {.expectSynced = true}));
 }
 
 TEST_F(DirectoryTest, pathViewsOpenWithoutCreating) {
@@ -548,10 +548,10 @@ TEST_F(DirectoryTest, checkedStorageRemembersUnsyncedFilesAcrossOpens) {
   CheckedDirFactory factory(std::make_unique<RAMDirFactory>(), CheckedDirMode::THROW);
   auto open = [&] { return factory.directory(StorageRoot::AUTHORITATIVE, "first"); };
   addFile(*open(), "data", "bytes");
-  EXPECT_THROW(open()->openFile("data", true), std::runtime_error);
+  EXPECT_THROW(open()->openFile("data", {.expectSynced = true}), std::runtime_error);
   std::array<std::string, 1> names{"data"};
   open()->sync(names);
-  EXPECT_NE(nullptr, open()->openFile("data", true));
+  EXPECT_NE(nullptr, open()->openFile("data", {.expectSynced = true}));
 }
 
 TEST_F(DirectoryTest, unreadableFileIsAnErrorNotAbsence) {
@@ -611,7 +611,7 @@ TEST_F(DirectoryTest, publicationAndDurableDeletion) {
     EXPECT_FALSE(dir->publishFile("root", next, Directory::PublishCondition::match(published->version)));
     EXPECT_THROW(addFile(*dir, "root", "other"), FileIOException);
     {
-      auto file = dir->openFile("root", true);
+      auto file = dir->openFile("root", {.expectSynced = true});
       auto hold = file->acquire({0, file->size()});
       EXPECT_EQ("first", std::string_view(hold.bytes()));
     }
@@ -624,7 +624,7 @@ TEST_F(DirectoryTest, publicationAndDurableDeletion) {
     }
     ASSERT_TRUE(dir->publishFile("root", next, Directory::PublishMode::REPLACE));
     {
-      auto file = dir->openFile("root", true);
+      auto file = dir->openFile("root", {.expectSynced = true});
       auto hold = file->acquire({0, file->size()});
       EXPECT_EQ("next", std::string_view(hold.bytes()));
     }
@@ -633,7 +633,7 @@ TEST_F(DirectoryTest, publicationAndDurableDeletion) {
     addFile(*dir, "root", "unsynced");
     std::array<std::string, 2> names{"root", "absent"};
     dir->deleteDurably(names);
-    EXPECT_EQ(nullptr, dir->openFile("root", true));
+    EXPECT_EQ(nullptr, dir->openFile("root", {.expectSynced = true}));
     EXPECT_NO_THROW(dir->expectSynced(expected));
     EXPECT_NO_THROW(dir->deleteDurably(names));
     EXPECT_TRUE(dir->publishFile("root", {}, Directory::PublishMode::CREATE_ONLY));
@@ -782,11 +782,11 @@ TEST_F(DirectoryTest, publicationFailureAfterInstallNeedsSync) {
   auto unlisten = scope_guard([] { Signal::unlisten("fsSynced"); });
   EXPECT_THROW(dir.publishFile("root", {}, Directory::PublishMode::REPLACE), FileIOException);
   EXPECT_NE(nullptr, dir.openFile("root"));
-  EXPECT_THROW(dir.openFile("root", true), std::runtime_error);
+  EXPECT_THROW(dir.openFile("root", {.expectSynced = true}), std::runtime_error);
   Signal::unlisten("fsSynced");
   std::array<std::string, 1> names{"root"};
   dir.sync(names);
-  EXPECT_NE(nullptr, dir.openFile("root", true));
+  EXPECT_NE(nullptr, dir.openFile("root", {.expectSynced = true}));
 }
 
 TEST_F(DirectoryTest, publicationLockIsHiddenAndSurvivesErase) {

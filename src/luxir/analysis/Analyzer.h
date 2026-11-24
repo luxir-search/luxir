@@ -7,6 +7,8 @@
 #include <string_view>
 #include <vector>
 #include <cstdint>
+#include <bit>
+#include <cstddef>
 #include <cstring>
 #include <memory>
 #include "luxir/util/luxir_util.h"
@@ -28,32 +30,142 @@ namespace luxir {
 //                  buffering filter (shingles, CJK bigram) that needs to retain a
 //                  token past the current pull must copy the bytes out.
 // `text` (a string_view) is itself an attribute: the only way to change the
-// token's text is to reassign it. Positions/type/payload would join the same
+// token's text is to reassign it. The other attributes below sit in the same
 // mutable bag.
+//
+// Every attribute lives in the one shared Token, so a filter that rewrites or
+// drops tokens in place forwards the others untouched; the built-in filters
+// do exactly that. A filter that buffers tokens past the current pull (shingles,
+// CJK bigram) must save the attributes it wants back with the bytes, and restore
+// them when it re-emits.
+
+// The character class of a word, from the general categories of its code
+// points: letters are L* (ideographs included) and numbers are N* (so U+2163
+// ROMAN NUMERAL FOUR is numeric). Marks, symbols and punctuation inside a word
+// count as neither.
+enum class WordClass : uint8_t {
+  UNKNOWN = 0,  // not computed (Token::knownClass only)
+  ALPHA,        // letters, no digits
+  NUMERIC,      // digits, no letters
+  ALNUM,        // letters and digits
+  OTHER         // neither (emoji, ...)
+};
+
+// The Unicode script of a word: that of its first letter that has one (a
+// mixed-script word reports its first). COMMON for a word with no letter, such
+// as digits, or whose letters belong to no script. UNKNOWN only as
+// Token::knownScript, before it is computed. Scripts beyond this short list are
+// OTHER; scriptOf() is the full per-code-point lookup behind it.
+enum class Script : uint8_t {
+  UNKNOWN = 0,
+  COMMON,
+  LATIN,
+  HAN,
+  HIRAGANA,
+  KATAKANA,
+  HANGUL,
+  THAI,
+  ARABIC,
+  CYRILLIC,
+  GREEK,
+  OTHER
+};
+
+// The script of one code point; COMMON for characters that belong to no
+// script (digits, punctuation, symbols) or inherit one (combining marks).
+Script scriptOf(char32_t cp);
+const char* scriptName(Script script);
+const char* wordClassName(WordClass wordClass);
+
+struct WordClassification {
+  WordClass wordClass;
+  Script script;
+  bool operator==(const WordClassification&) const = default;
+};
+
+// The class and script of the UTF-8 bytes `word`, never UNKNOWN (no letter or
+// digit is OTHER / COMMON). Token::wordClass() and Token::script() apply it to
+// the token's input word; a filter calls it directly to classify other bytes,
+// such as the token.text it rewrote.
+WordClassification classifyWord(std::string_view word);
+
 class Token {
 public:
   std::string_view text;
   int positionIncrement; // increment from the previous token's position
+  // Number of positions the token spans (Lucene's PositionLengthAttribute: the
+  // arc length in the token graph, 1 for an ordinary token, 2 for a synonym
+  // covering two source words). It, knownClass and knownScript sit next to
+  // positionIncrement so clear() is one 8-byte store; a graph never needs more
+  // than 65535 positions. Nothing reads it yet: postings keep only each term's
+  // start position (as in Lucene), and phrase queries are built from position
+  // increments alone.
+  uint16_t positionLength;
+  // The class and script of the input word (inputText()), or UNKNOWN when
+  // nobody has computed them yet: a cache that wordClass() and script() fill on
+  // first read. A tokenizer stores them only where its scan already knows them
+  // (unicode_word's ASCII path), after setOffset(), which resets them. Read them
+  // through wordClass() and script().
+  WordClass knownClass;
+  Script knownScript;
   int startOffset; // byte offset into the tokenizer input of current token
   int endOffset;   // end offset (exclusive) into the tokenizer input
   // Stream state, deliberately untouched by clear(). Stop filters reset this
   // per value and accumulate trailing holes when exhaustion reaches them.
   int finalPositionIncrement = 0;
+  // Stream state set by Tokenizer::setValue: the start of the tokenizer input
+  // for the current value (after char filters), which the offsets index. Valid
+  // while the chain analyzes that value.
+  const char* input = nullptr;
 
   void clear() {
     // Offsets are deliberately not reset here: every emit path sets them, so
-    // zeroing first would just be a dead store on the hot path.
-    positionIncrement = 1;
+    // zeroing first would just be a dead store on the hot path. The four
+    // fields that do reset are adjacent and written as one 8-byte store:
+    // increment 1, length 1, knownClass and knownScript UNKNOWN (zero).
+    uint64_t defaults = 1 | (1ULL << 32);
+    std::memcpy(&positionIncrement, &defaults, sizeof defaults);
   }
 
   // Record the [start, end) span in tokenizer input bytes. Token filters
   // preserve it when rewriting text. With char filters, sourceOffset() maps
   // this span back to the original value only when an offset consumer needs it.
+  // A new span is a new input word, so the cached class and script reset; a
+  // filter that splits or merges tokens moves them with setOffset, never by
+  // assigning the offsets directly.
   void setOffset(int start, int end) {
     startOffset = start;
     endOffset = end;
+    knownClass = WordClass::UNKNOWN;
+    knownScript = Script::UNKNOWN;
   }
+
+  // The input word: the tokenizer input bytes the token was cut from. Token
+  // filters rewrite `text`, never this.
+  std::string_view inputText() const {
+    return std::string_view(input + startOffset, (size_t) (endOffset - startOffset));
+  }
+
+  // The class and script of the input word, computed on the first read and
+  // cached in knownClass / knownScript. Describes the input word, not `text`:
+  // U+2163 folded to "iv" by nfkc_cf is still NUMERIC (classifyWord(text) says
+  // ALPHA / LATIN).
+  WordClass wordClass() {
+    if (knownClass == WordClass::UNKNOWN) classify();
+    return knownClass;
+  }
+  Script script() {
+    if (knownScript == Script::UNKNOWN) classify();
+    return knownScript;
+  }
+
+private:
+  void classify();  // classifyWord(inputText()) into knownClass and knownScript
 };
+static_assert(sizeof(Token) == 48, "Token size changed; review its layout and clear()");
+static_assert(std::endian::native == std::endian::little && offsetof(Token, positionLength) == offsetof(Token, positionIncrement) + 4 &&
+              offsetof(Token, knownScript) == offsetof(Token, positionLength) + 3 && (int) WordClass::UNKNOWN == 0 &&
+              (int) Script::UNKNOWN == 0, "Token::clear() writes its defaults as one 8-byte store");
 
 
 // A pull-based stream of Tokens. The whole chain shares a single Token object
@@ -117,6 +229,7 @@ public:
     start_ = val.data();
     end_ = start_ + val.size();
     base_ = start_;
+    token.input = start_;
   }
 };
 

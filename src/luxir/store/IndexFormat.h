@@ -23,9 +23,10 @@ namespace luxir {
 //
 // A parameter that a part records about itself, and that readers take from
 // there (such as an id filter's kind and size), is not a format change: the
-// writer may vary it within one version.
+// writer may vary it within one version. A value this version's readers do not
+// know, such as a new id filter kind, is.
 struct IndexFormat {
-  static constexpr uint64_t VERSION = 17;
+  static constexpr uint64_t VERSION = 20;
   static_assert(VERSION > 0 && VERSION < 36 * 36 * 36);
   static constexpr auto HEADER_BYTES = [] {
     std::array<char, 8> header{'L', 'U', 'X', 'I', 'R'};

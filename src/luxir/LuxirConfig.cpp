@@ -261,7 +261,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
 
   app.add_option("--indexing.id-filter", index.id_filter,
                  "Membership filter over each segment's ids, used to skip segments when "
-                 "applying deletes and updates: bloom, fuse8, fuse16 or none")
+                 "applying deletes and updates: none, bloom, fuse8 or fuse16")
       ->default_val(index.id_filter)
       ->check(CLI::IsMember({"bloom", "fuse8", "fuse16", "none"}));
   app.add_option("--indexing.id-filter-bits-per-key", index.id_filter_bits_per_key,

@@ -8,7 +8,6 @@
 #include "CatalogRange.h"
 #include "IdFilter.h"
 #include "VersionRuns.h"
-#include <atomic>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -18,17 +17,9 @@
 
 namespace luxir {
 class AcquireBatches;
+class AcquireJoin;
 class OwnershipShape;
 namespace api { struct SegmentInfo; }
-
-// Reads segments make beyond their open, which acquires only file headers and
-// the catalog. Counted where a part is first held, so only on backends without
-// free holds: RAM and mmap hand out free views and count nothing.
-struct SegmentOpenCounters {
-  std::atomic<uint64_t> segmentsOpened{0};      // segments with a first read beyond the catalog
-  std::atomic<uint64_t> segmentBytesMapped{0};  // bytes of the parts those reads hold
-};
-inline SegmentOpenCounters segmentOpenCounters;
 
 // Immutable segment bundle. Shared across snapshots and with the writer;
 // liveness and overlays belong to the snapshot, not these base files.
@@ -47,12 +38,15 @@ private:
   // spilled filesystem/object-store keys stable.
   struct BaseFile {
     std::shared_ptr<InputFile> file;
-    uint64_t size = 0;  // The manifest's size when it records one, so reads need no size request.
+    uint64_t size = 0;  // Read once at open; checked against the manifest when it records one.
+    // RAM and mmap hand out views valid for the file's lifetime, so slice()
+    // retains nothing for them and acquireSlices() requests nothing. Every
+    // other path, the open included, is the same for every backend.
     bool holdsFree = false;
   };
   std::vector<BaseFile> files;
   // Holds must outlive the views below and release before files. A part is
-  // held once, under the read class of its first slice.
+  // held once; each part has one reader path, so its class does not vary.
   std::mutex holdsMutex;
   std::map<std::pair<uint64_t, uint64_t>, HeldRange> holds;
   SegmentCatalog catalog;
@@ -60,11 +54,7 @@ private:
   // Built on first use. A build that throws publishes nothing, so the next
   // use retries it.
   mutable SharedLazyCell<VersionRuns> versions;
-  // Set when the open has read what it needs; later first holds are counted.
-  bool opened = false;
   bool everyHoldFree = true;  // every file hands out free views
-  std::atomic<bool> readBeyondCatalog{false};
-  std::atomic<uint64_t> bytesBeyondCatalog{0};
 
   const uint64_t segId;
   const uint64_t creatorEpoch;
@@ -72,17 +62,18 @@ private:
   std::vector<std::unique_ptr<ChildSpace>> children;
   PostingsReader root;
 
+  struct PendingOpen;
+
   SegmentCore(uint64_t segId, uint64_t creatorEpoch);
   bool openBaseFile(Directory& dir, std::string_view segment, uint32_t number, uint64_t expected,
                     bool missingFileOK, bool expectSynced, bool checkHeader);
-  bool beginOpen(Directory& dir, std::string_view segment, const Source& source, bool missingFileOK,
-                 bool expectSynced, AcquireBatches& join);
-  bool finishOpen(Directory& dir, std::string_view segment, const Source& source, bool missingFileOK,
-                  bool expectSynced);
+  static void openPending(Directory& dir, std::span<PendingOpen> opens, bool missingFileOK, bool expectSynced);
+  bool beginOpen(Directory& dir, PendingOpen& pending, bool missingFileOK, bool expectSynced, AcquireJoin& join);
+  void finishOpen(const PendingOpen& pending);
   bool initializeFromFiles(Directory& dir, bool missingFileOK, bool expectSynced);
   void initializeSpaces();
   std::span<const char> retain(InputFile& file, field_parts::Slice part, ReadClass readClass);
-  void countFirstHold(uint64_t bytes) noexcept;
+  void releaseHold(field_parts::Slice part);
   const VersionRuns& buildVersionRuns() const;
   const OwnershipShape* buildOwnership(SpaceOrdinal child) const;
 
@@ -96,12 +87,15 @@ public:
                                             bool expectSynced = false);
   static std::shared_ptr<SegmentCore> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch,
                                             bool missingFileOK = false, bool expectSynced = false);
-  // Opens the segments together: every file 0 acquires its header and catalog
-  // in one batch, and all batches are issued before any catalog is decoded.
-  // An entry is null where a file is missing and missingFileOK is set.
-  static std::vector<std::shared_ptr<SegmentCore>> create(Directory& dir,
-                                                          std::span<const api::SegmentInfo* const> segments,
-                                                          bool missingFileOK = false, bool expectSynced = false);
+  // Opens together each segment whose entry in `cores` is null, and stores
+  // its core there. Every file's header and every file 0's catalog go out in
+  // one round of batches before any catalog is decoded. The segments fail in
+  // order, as if opened one at a time: the first that fails throws, naming
+  // the segment, and from the first with a missing file (when missingFileOK
+  // is set) the entries stay null.
+  static void open(Directory& dir, std::span<const api::SegmentInfo> segments,
+                   std::span<std::shared_ptr<SegmentCore>> cores, bool missingFileOK = false,
+                   bool expectSynced = false);
   explicit SegmentCore(Directory& dir, uint64_t segId, uint64_t creatorEpoch);
   ~SegmentCore();
   SegmentCore(const SegmentCore&) = delete;
@@ -130,17 +124,9 @@ public:
     return built ? *built : buildVersionRuns();
   }
 
-  // Whether this core has held a part beyond the open's headers and catalog,
-  // and the bytes of those parts; see SegmentOpenCounters.
-  bool readPastCatalog() const noexcept { return readBeyondCatalog.load(std::memory_order_relaxed); }
-  uint64_t bytesPastCatalog() const noexcept { return bytesBeyondCatalog.load(std::memory_order_relaxed); }
-
-  // False when the root "id" dictionary cannot hold the term: the segment has
-  // no id terms, the term is outside the dictionary's exact bounds, or the id
-  // filter excludes it. The term is in the form the dictionary stores (fitted).
-  bool mayContainId(std::string_view term) { return mayContainId(term, IdFilter::hash(term)); }
-  // As above, with the term's IdFilter::hash computed once by the caller.
-  bool mayContainId(std::string_view term, uint64_t hash);
+  // The root "id" field's membership filter, or none when the segment wrote no
+  // filter part. Throws SegmentCorruptError when the part does not parse.
+  std::optional<IdFilter> idFilter();
 
   void forEachBaseFile(auto&& visit) const {
     for (uint32_t number = 0; number < files.size(); ++number) {
@@ -187,20 +173,23 @@ public:
     return retain(*base.file, part, readClass);
   }
 
-  // Acquires the parts in one batch per file, keeps their holds as slice()
-  // does, and returns their bytes in order.
-  std::vector<std::span<const char>> slices(std::span<const field_parts::Slice> parts,
-                                            ReadClass readClass = ReadClass::DATA);
-  // Starts those batches on `join` without waiting, so batches of several
-  // segments go out together. Once join.wait() returns, slice() of each part
-  // returns its held bytes without an acquire.
-  void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireBatches& join);
-  // As acquireSlices(), with a read class per part: still one batch per file.
+  // Acquires the parts in one batch per file, skipping parts already held,
+  // keeps their holds as slice() does, and waits. Afterwards slice() of each
+  // part makes no backend request: it returns the held bytes, or a free view
+  // on a file with free holds, whose acquire costs nothing.
+  void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass = ReadClass::DATA);
+  // Issues the same batches on `join` without waiting, so batches of several
+  // segments go out together; slice() makes no request once join.wait()
+  // returns. A failure goes to `error` when given; see AcquireJoin::acquire.
+  void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join,
+                     std::exception_ptr* error = nullptr);
+  // As acquireSlices(), with a read class per part, on any AcquireBatches:
+  // still one batch per file.
   struct Part {
     field_parts::Slice slice;
     ReadClass readClass = ReadClass::DATA;
   };
-  void acquireParts(std::span<const Part> parts, AcquireBatches& join);
+  void acquireParts(std::span<const Part> parts, AcquireBatches& batches);
   // Whether slice() of `part` returns without an acquire: its file hands out
   // free views, or the segment holds the part.
   bool held(field_parts::Slice part);
@@ -226,6 +215,11 @@ public:
   // acquires; they may overlap (a run's docs within a field's postings).
   void listParts(const std::function<bool(std::string_view space, std::string_view field)>& data,
                  const std::function<void(const ListedPart&)>& visit);
+
+private:
+  // Issues the parts not yet held, one batch per file, through `issue`.
+  template <class Issue>
+  void issueParts(std::span<const Part> parts, Issue&& issue);
 
 };
 

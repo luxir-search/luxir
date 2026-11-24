@@ -12852,7 +12852,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         uniformConstantCandidate, executionMode, scorePolicy);
     }
 
-    Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) override {
       Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
       Query::Demand demand = Query::Demand::fromLeadCost(
           std::numeric_limits<int64_t>::max());
@@ -13141,7 +13141,7 @@ public:
   // A lone required clause determines membership when optionals only score.
   // Required ceilings intersect; their floors use inclusion-exclusion.
   // Optional membership keeps its largest floor, and exclusions subtract ceilings.
-  CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+  CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
     auto bound = countBound(segment, domain, segment.maxDoc());
     if (bound.maxMatches == 0) return bound;
     size_t required = mandatoryWeights.size() + filterWeights.size();
@@ -13194,7 +13194,7 @@ public:
     return bound;
   }
 
-  std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+  std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& ctx) override {
     auto filterSources = QueryPrep::prepareFilterSources(
         filterWeights, filterUses, ctx);
     auto prohibitedSources = QueryPrep::prepareFilterSources(
@@ -13349,7 +13349,7 @@ public:
     return sparseFilteredTopKFamilyKind;
   }
 
-  Query::Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
+  Query::Scorer* createScorerImpl(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
     Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
     Query::Demand demand = Query::Demand::fromLeadCost(
         std::numeric_limits<int64_t>::max());

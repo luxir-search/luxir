@@ -63,7 +63,7 @@ public:
     deferral.wait();
     return inner->acquire(range);
   }
-  void acquire(std::span<const ByteRange> ranges, AcquireDone done) override {
+  void acquireBatch(std::span<const ByteRange> ranges, AcquireDone done) noexcept override {
     deferral.batchesElsewhere.fetch_add(1);
     std::lock_guard lock(mutex);
     threads.emplace_back([this, requested = std::vector<ByteRange>(ranges.begin(), ranges.end()), done] {
@@ -82,8 +82,8 @@ public:
 class DeferredDirectory : public DelegatingDirectory {
 public:
   using DelegatingDirectory::DelegatingDirectory;
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) override {
-    auto file = delegate->openFile(name, expectSynced, size);
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) override {
+    auto file = delegate->openFile(name, options);
     return file ? std::make_shared<DeferredInputFile>(std::move(file)) : file;
   }
 };

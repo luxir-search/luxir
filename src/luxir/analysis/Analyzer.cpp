@@ -26,7 +26,9 @@
 #include <uni_algo/case.h>
 #include <uni_algo/norm.h>
 #include <uni_algo/ranges_word.h>
+#include <uni_algo/prop.h>
 #include <uni_algo/ranges_conv.h>
+#include <uni_algo/script.h>
 #include <uni_algo/version.h>
 
 // The uni-algo dependency is confined to this translation unit; the rest of the
@@ -34,6 +36,98 @@
 // pinned/vendored (Unicode 15.1.0) - its version is part of the index format.
 
 namespace luxir {
+
+namespace {
+
+// The script of a code point in the common blocks that hold only letters (no
+// digits, no marks, no punctuation), without the property tables; UNKNOWN
+// anywhere else. AnalysisTest checks it against the tables for every code point.
+Script letterScript(char32_t cp) {
+  if (cp >= 0x4E00 && cp <= 0x9FFF) return Script::HAN;
+  if (cp >= 0xAC00 && cp <= 0xD7A3) return Script::HANGUL;
+  if (cp >= 0x3041 && cp <= 0x3096) return Script::HIRAGANA;
+  if (cp >= 0x30A1 && cp <= 0x30FA) return Script::KATAKANA;
+  if (cp >= 0x0410 && cp <= 0x044F) return Script::CYRILLIC;
+  if ((cp >= 0x3B1 && cp <= 0x3C9) || (cp >= 0x391 && cp <= 0x3A9 && cp != 0x3A2)) return Script::GREEK;
+  if (cp >= 0xC0 && cp <= 0x24F && cp != 0xD7 && cp != 0xF7) return Script::LATIN;
+  return Script::UNKNOWN;
+}
+
+}  // namespace
+
+Script scriptOf(char32_t cp) {
+  if (cp < 0x80) return ((cp | 0x20) >= 'a' && (cp | 0x20) <= 'z') ? Script::LATIN : Script::COMMON;
+  if (Script s = letterScript(cp); s != Script::UNKNOWN) return s;
+  static constexpr una::locale::script latin("Latn"), han("Hani"), hiragana("Hira"), katakana("Kana"),
+      hangul("Hang"), thai("Thai"), arabic("Arab"), cyrillic("Cyrl"), greek("Grek"), common("Zyyy"),
+      inherited("Zinh");
+  una::locale::script s = una::codepoint::get_script(cp);
+  if (s == latin) return Script::LATIN;
+  if (s == common || s == inherited) return Script::COMMON;
+  if (s == han) return Script::HAN;
+  if (s == hiragana) return Script::HIRAGANA;
+  if (s == katakana) return Script::KATAKANA;
+  if (s == hangul) return Script::HANGUL;
+  if (s == thai) return Script::THAI;
+  if (s == arabic) return Script::ARABIC;
+  if (s == cyrillic) return Script::CYRILLIC;
+  if (s == greek) return Script::GREEK;
+  return Script::OTHER;
+}
+
+const char* scriptName(Script script) {
+  static constexpr const char* names[] = {"unknown", "common", "latin", "han", "hiragana", "katakana",
+                                          "hangul", "thai", "arabic", "cyrillic", "greek", "other"};
+  return names[(size_t) script];
+}
+
+const char* wordClassName(WordClass wordClass) {
+  static constexpr const char* names[] = {"unknown", "alpha", "numeric", "alnum", "other"};
+  return names[(size_t) wordClass];
+}
+
+WordClassification classifyWord(std::string_view word) {
+  bool alpha = false, numeric = false;
+  Script script = Script::COMMON;
+  auto letter = [&](Script s) {
+    alpha = true;
+    if (script == Script::COMMON) script = s;  // the first letter that has a script
+  };
+  // Most words are ASCII or start with an ASCII run; only decode from the first high byte.
+  size_t ascii = 0;
+  for (; ascii < word.size() && (unsigned char) word[ascii] < 0x80; ascii++) {
+    unsigned char c = (unsigned char) word[ascii];
+    if (c >= '0' && c <= '9') {
+      numeric = true;
+    } else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'z') {
+      letter(Script::LATIN);
+    }
+  }
+  if (ascii < word.size()) {
+    for (char32_t cp : una::views::utf8(word.substr(ascii))) {
+      if (Script s = letterScript(cp); s != Script::UNKNOWN) {
+        letter(s);
+        continue;
+      }
+      una::codepoint::prop p(cp);
+      if (p.General_Category_L()) {
+        letter(scriptOf(cp));
+      } else if (p.Numeric()) {
+        numeric = true;
+      }
+      // anything else (marks, symbols, '_') is neither, whatever its script
+    }
+  }
+  WordClass wordClass = alpha ? (numeric ? WordClass::ALNUM : WordClass::ALPHA)
+                              : (numeric ? WordClass::NUMERIC : WordClass::OTHER);
+  return {wordClass, script};
+}
+
+void Token::classify() {
+  WordClassification c = classifyWord(inputText());
+  knownClass = c.wordClass;
+  knownScript = c.script;
+}
 
 namespace {
 
@@ -172,7 +266,8 @@ std::string_view applyNfkcCf(std::string_view in, std::string& buf) {
 // A run with no letter or digit (a bare "_") is not a word: word_only filters
 // segments by their max word-break property and ExtendNumLet < Numeric.
 enum AsciiWb : unsigned char {
-  WB_BRK = 0, WB_LET, WB_NUM, WB_ENL, WB_MID_LET, WB_MID_NUM, WB_MID_BOTH
+  // Bit flags, so a word's kinds are the OR of its bytes' classes.
+  WB_BRK = 0, WB_LET = 1, WB_NUM = 2, WB_ENL = 4, WB_MID_LET = 8, WB_MID_NUM = 16, WB_MID_BOTH = 32
 };
 
 struct AsciiWbTable {
@@ -193,7 +288,12 @@ struct AsciiWbTable {
 };
 constexpr AsciiWbTable wbTable;
 
-inline bool isWbWord(unsigned char cls) { return cls >= WB_LET && cls <= WB_ENL; }
+static_assert(offsetof(Token, knownScript) == offsetof(Token, knownClass) + 1);
+constexpr uint16_t asciiClass(WordClass wordClass, Script script) {
+  return (uint16_t) ((unsigned) wordClass | ((unsigned) script << 8));
+}
+
+inline bool isWbWord(unsigned char cls) { return (unsigned) (cls - 1) < 4u; }  // LET, NUM or ENL
 
 inline bool isAscii(std::string_view s) {
   return ascii::findNonAscii(s.data(), s.size()) == s.size();
@@ -282,7 +382,9 @@ public:
     if (fold == WordFold::NFKC_CF_ACCENTS && !isAscii(term)) term = una::norm::to_unaccent_utf8(term);
   }
 
-  bool incrementToken() override {
+  // Aligned because the inlined ASCII DFA loop below is sensitive to where the
+  // linker puts it: an unlucky offset cost ~10% on the ASCII benchmarks.
+  [[gnu::aligned(64)]] bool incrementToken() override {
     token.clear();
     for (;;) {
       // Drain the active region first. The ASCII DFA is the hot path and stays
@@ -304,7 +406,10 @@ private:
     while (it != view->end()) {
       // Capture the source span before the case filter repoints token.text
       // at `buf`. `lowered` is a length-preserving ASCII-lowercased copy, so
-      // byte offsets into it equal byte offsets into the original value.
+      // byte offsets into it equal byte offsets into the original value, and
+      // Token::inputText() reads the word back from there. The class stays
+      // unknown: classifying here would be a second pass over every word, and
+      // Token::wordClass() does it only for a filter that asks.
       std::string_view w = *it;
       token.setOffset((int) (w.data() - textBase),
                       (int) (w.data() + w.size() - textBase));
@@ -386,11 +491,11 @@ private:
         return false;
       }
       const char* w = s;
-      bool sawLetNum = false;
+      unsigned kinds = 0;  // WB_LET / WB_NUM set when the word has a letter / digit (WB_ENL too for '_')
       for (;;) {
         unsigned char k;
         while (s < e && isWbWord(k = wbTable.cls[(unsigned char) *s])) {
-          sawLetNum |= (k <= WB_NUM);  // LET or NUM
+          kinds |= k;
           s++;
         }
         // a mid char continues the word iff bracketed by kind-matched word
@@ -411,9 +516,16 @@ private:
         }
         break;
       }
-      if (sawLetNum) {
+      if (kinds & (WB_LET | WB_NUM)) {
         token.text = std::string_view(w, (size_t) (s - w));
         token.setOffset((int) (w - textBase), (int) (s - textBase));
+        // The scan already knows the class, so store it, after setOffset (which
+        // resets it). ASCII letters are Latin; a digits-only word has no script.
+        // Class and script in one 16-bit store (adjacent, little-endian: see Token).
+        static constexpr uint16_t classes[4] = {0, asciiClass(WordClass::ALPHA, Script::LATIN),
+                                                asciiClass(WordClass::NUMERIC, Script::COMMON),
+                                                asciiClass(WordClass::ALNUM, Script::LATIN)};
+        std::memcpy(&token.knownClass, &classes[kinds & 3], sizeof(uint16_t));
         dfaCur = s;
         return true;
       }

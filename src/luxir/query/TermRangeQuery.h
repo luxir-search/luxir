@@ -61,6 +61,10 @@ public:
   bool lowerInclusive() const { return includeLower; }
   bool upperInclusive() const { return includeUpper; }
 
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return proof::termRangeMatch(view, field, lower, includeLower, upper, includeUpper);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);

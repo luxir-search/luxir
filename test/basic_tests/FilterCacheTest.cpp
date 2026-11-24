@@ -339,7 +339,7 @@ class FailSecondSupplierQuery final : public Query {
       return child->scorerSupplier(targetPool, segment, executionMode);
     }
 
-    Query::Scorer* createScorer(
+    Query::Scorer* createScorerImpl(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       return child->createScorer(targetPool, segment);
     }

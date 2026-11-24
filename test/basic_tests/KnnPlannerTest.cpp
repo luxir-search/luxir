@@ -24,17 +24,17 @@ double cost(std::span<const KnnPlanner::Segment> segments, const KnnPlanner::Req
     const auto& s = segments[i];
     auto p = KnnPlanner::price(s, req, costs);
     if (KnnPlanner::canIvf(s) && s.bounded) {
-      physicalDims += (double)s.vectors * s.dims; physicalReads += (double)s.vectors; physicalDocs += s.docsWithField;
+      physicalDims += (double)s.vectors * KnnPlanner::scoreDims(s); physicalReads += (double)s.vectors; physicalDocs += s.docsWithField;
     }
     if ((mask >> i & 1) && KnnPlanner::canIvf(s)) {
       linear += p.a; fixed += p.b; live += s.liveVectors; slots++;
       eligible += s.eligibleVectors; docs += s.eligibleDocs;
       if (s.bounded) {
         bounded += s.eligibleDocs; boundedLive += s.liveVectors;
-        boundedDims += (double)s.eligibleVectors * s.dims; boundedReads += (double)s.eligibleVectors;
+        boundedDims += (double)s.eligibleVectors * KnnPlanner::scoreDims(s); boundedReads += (double)s.eligibleVectors;
       } else {
         intervalVectors += s.eligibleVectors;
-        intervalDims += (double)s.eligibleVectors * s.dims * p.intervalReadFraction;
+        intervalDims += (double)s.eligibleVectors * KnnPlanner::scoreDims(s) * p.intervalReadFraction;
         intervalReads += (double)s.eligibleVectors * p.intervalReadFraction;
       }
     } else { exact += p.exactCost; exactDocs += s.eligibleDocs; }
@@ -181,6 +181,40 @@ TEST(KnnPlannerTest, sharedTerminalPoolAndCodecSetup) {
   EXPECT_EQ(actual[KnnPlanner::TERMINAL_DIM], 5 * 128);
   EXPECT_EQ(actual[KnnPlanner::TERMINAL_READ], 5);
   EXPECT_EQ(actual[KnnPlanner::ROUND], 0);
+}
+
+// A column's encoding scales its exact and terminal dimensions, planned and
+// actual, and nothing else; cosine on an encoded column adds its norm pass.
+TEST(KnnPlannerTest, encodingScalesScoreDims) {
+  KnnPlanner::Costs costs;
+  KnnPlanner::Request req{.k = 20, .boundedTarget = 100};
+  auto f32 = segment();
+  auto plain = KnnPlanner::price(f32, req, costs);
+  for (bool cosine : {false, true}) {
+    SCOPED_TRACE(cosine);
+    auto sq8 = segment();
+    sq8.encoding = VectorEncoding::SQ8;
+    sq8.cosine = cosine;
+    double factor = KnnPlanner::Costs::ENCODING_DIM_COST[cosine][(size_t)VectorEncoding::SQ8];
+    EXPECT_DOUBLE_EQ(factor * 128, KnnPlanner::scoreDims(sq8));
+    auto encoded = KnnPlanner::price(sq8, req, costs);
+    EXPECT_DOUBLE_EQ(factor * plain.exact[KnnPlanner::EXACT_DIM], encoded.exact[KnnPlanner::EXACT_DIM]);
+    EXPECT_EQ(plain.linear, encoded.linear);
+    std::array segments{sq8};
+    auto totals = KnnPlanner::exactTotals(segments, std::span(&encoded, 1), req);
+    KnnPlanner::addIvf(totals, sq8, encoded, 1);
+    EXPECT_DOUBLE_EQ(factor * 100 * 128, KnnPlanner::terminalDims(totals, KnnPlanner::coverage(totals, req), req.k));
+    VectorSearchWork work;
+    work.exactVectors = 10; work.seedReads = 3; work.remainingReads = 2;
+    auto actual = KnnPlanner::actualWork(sq8, work);
+    EXPECT_DOUBLE_EQ(factor * 10 * 128, actual[KnnPlanner::EXACT_DIM]);
+    EXPECT_DOUBLE_EQ(factor * 5 * 128, actual[KnnPlanner::TERMINAL_DIM]);
+    EXPECT_EQ(5, actual[KnnPlanner::TERMINAL_READ]);
+  }
+  EXPECT_LT(KnnPlanner::Costs::ENCODING_DIM_COST[0][(size_t)VectorEncoding::SQ8],
+            KnnPlanner::Costs::ENCODING_DIM_COST[1][(size_t)VectorEncoding::SQ8]);
+  f32.cosine = true;
+  EXPECT_DOUBLE_EQ(128, KnnPlanner::scoreDims(f32));
 }
 
 TEST(KnnPlannerTest, predictedRoundGrowthAndPin) {

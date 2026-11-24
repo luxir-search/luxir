@@ -27,6 +27,7 @@
 #include "luxir/query/NumericIndexPrice.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/PointsReader.h"
+#include "CatalogPredicates.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/util/NumericUtils.h"
 
@@ -192,6 +193,15 @@ public:
       std::string_view target) const override {
     if (target != field) return std::nullopt;
     return ValueEnvelope{envelope.lo, envelope.hi};
+  }
+
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    if (envelope.lo > envelope.hi) {
+      if (!view.record(field)) return MatchState::UNKNOWN;
+      view.prove("empty numeric range");
+      return MatchState::EMPTY;
+    }
+    return proof::numericMatch(view, field, [this](int64_t min, int64_t max) { return intersects(min, max); });
   }
 
   float valueMatchCost() const {
@@ -1609,7 +1619,7 @@ public:
     // Bounds answer covering and disjoint ranges without opening points.
     // Partial single-valued indexed counts resolve at supplier construction;
     // other counts walk the column only at execution.
-    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+    CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
       if (query.forcedArm) return countBound(segment, domain, segment.maxDoc());
       if (query.getHi() < query.getLo()) return {0, CountHow::METADATA};
       const auto* info = segmentInfo(segment);
@@ -2522,7 +2532,7 @@ public:
                                        pointValueCount, postings);
     }
 
-    Query::Scorer* createScorer(MemPool& targetPool,
+    Query::Scorer* createScorerImpl(MemPool& targetPool,
                                 IndexReader::Segment& segment) override {
       auto* supplier = scorerSupplier(targetPool, segment);
       if (supplier == nullptr) return nullptr;

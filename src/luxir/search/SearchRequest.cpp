@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "SearchRequest.h"
+#include "luxir/query/QueryPruning.h"
 
 #include <cassert>
 
@@ -55,8 +56,25 @@ Query::PlanningContext* SearchRequest::createPlanningContext(IndexReader& view) 
   auto* planning = arenaCreate<Query::PlanningContext>(arena, requestPool, view, limits, &warnings,
       FilterKeyContext{.schemaGen = schema->gen_, .timeZone = proto.time_zone},
       uses(view), &memoryTracker, proto.profile ? this : nullptr);
+  planning->pruning = pruning;
+  planning->proofNotes = resolvedFields;
   if (declaredReads) planning->plannedReads = &declaredReads->plannedReads();
   return planning;
+}
+
+// One profile op for the request and one run per calculator that actually skips.
+void SearchRequest::recordPrunedSegment(ExecutionProfileRun*& run, IndexReader::Segment& segment,
+                                        std::vector<std::string> details) {
+  std::lock_guard lock(mutex);
+  if (!pruningProfile) pruningProfile = addExecutionProfileOp("pruning");
+  if (!run) run = addExecutionProfileRun(pruningProfile);
+  auto& piece = run->pieces[(size_t)segment.ord];
+  piece.wire.kind = "segment";
+  piece.wire.segment = segment.ord;
+  piece.wire.max_doc = segment.maxDoc();
+  piece.wire.strategy = "pruned";
+  piece.details = std::move(details);
+  piece.complete = true;
 }
 
 SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
@@ -71,6 +89,7 @@ SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
           .maxTermsExamined = searchConfig.multiterm_max_terms_examined,
           .maxPostings = searchConfig.multiterm_max_postings,
       }),
+      pruning(std::make_shared<QueryPruning>()),
       proto(proto), arena(arena), dateMathNowEpochMillis(
           forcedDateMathNowEpochMillis.value_or(currentEpochMillis())),
       startTime(startTime),

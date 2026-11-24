@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include "CountingStorage.h"
+#include "luxir/index/PostingsWriter.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/reader/OwnershipShape.h"
 #include "luxir/reader/TermsEnum.h"
@@ -18,6 +19,7 @@
 #include "luxir/store/CheckedDirFactory.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
+#include "test/GatedStorage.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/StrictStorage.h"
@@ -142,7 +144,6 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
   // The open acquires the headers and the catalog, nothing it can build later.
   expectPart({{0, range.offset}, range.length}, ReadClass::METADATA);
   check();
-  EXPECT_FALSE(postings.core().readPastCatalog());
 
   for (auto field : {"freqs", "body_w"}) {
     const auto* record = postings.fieldInfo(field);
@@ -164,7 +165,6 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
       check();
     }
   }
-  EXPECT_TRUE(postings.core().readPastCatalog());
 
   // The first query that returns versions acquires the version runs, once.
   expectPart(catalog.versionRuns().slice, ReadClass::METADATA);
@@ -177,62 +177,75 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
   }
 }
 
-// A manifest open issues one batch per segment's file 0, holding its header and
-// catalog, issues all of them before it reads anything else, and reads nothing
-// more: version runs and ownership shapes wait for their first use.
-TEST_F(StorageExampleTest, manifestOpenAcquiresCatalogsInOneRound) {
+// A manifest open issues one batch per segment file: file 0's holds its header
+// and catalog, every other file's its header. A snapshot open issues all of
+// them before it waits on any, so a gate holding back every completion until
+// the last batch arrives opens without timing out. It reads nothing more:
+// version runs and ownership shapes wait for their first use.
+TEST_F(StorageExampleTest, snapshotOpenIssuesEveryHeaderAndCatalogTogether) {
   LuxirConfig config;
   LuxirNode node(config);
   CollectionHelper h(node, "main");
   auto writer = h.getIndexWriter();
-  for (int i = 0; i < 3; ++i) {
+  for (int i = 0; i < 2; ++i) {
     ASSERT_TRUE(h.indexAll({flatdoc("id", std::to_string(i), "body_w", "needle")}, UpdateMessage::COMMIT).success);
   }
+  // A vector larger than a stream's RAM buffer spills to a second file.
+  std::vector<float> large(PostingsWriter::RAM_SPILL_BYTES / sizeof(float) + 1, 1.0f);
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "large", "vec_v", large)}, UpdateMessage::COMMIT).success);
   auto info = readDurableIndexInfo(writer->dir);
   ASSERT_EQ(3u, info->segments.size());
+  std::vector<std::string> dataFiles;
+  for (const auto& segment : info->segments) {
+    for (const auto& file : segment.files) {
+      if (Manifest::segmentDataFile(file.name)) dataFiles.emplace_back(file.name);
+    }
+  }
+  ASSERT_GT(dataFiles.size(), info->segments.size());
   auto snapshot = *writer->snapshots.snapshot();
   snapshot.openCores.clear();
 
   auto counters = std::make_shared<StrictStorageCounters>();
-  StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
+  auto strict = std::make_shared<StrictDirectory>(std::shared_ptr<Directory>(writer, &writer->dir), counters,
+                                                  StrictWholeFiles::DENY);
+  GatedDirectory dir(strict, dataFiles.size(), std::chrono::seconds(5));
   auto reader = std::make_shared<IndexReader>(dir, snapshot);
   ASSERT_EQ(3u, reader->segments().size());
-  std::vector<uint64_t> firstRounds;
+  EXPECT_FALSE(dir.gate.timedOut());
+  EXPECT_EQ(dataFiles.size(), dir.gate.submissions());
+  for (const auto& name : dataFiles) {
+    auto stats = counters->fileStats(name);
+    EXPECT_EQ(1u, stats.batches) << name;
+    EXPECT_TRUE(stats.metadataParts.contains({0, Postings::LUXIR_HEADER.size()})) << name;
+  }
   for (const auto& segment : info->segments) {
     auto name = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
     auto range = catalogRangeFromManifest(segment.catalog);
-    auto stats = counters->fileStats(name);
-    EXPECT_EQ(1u, stats.batches) << name;
-    EXPECT_EQ(1u, stats.rounds) << name;
-    EXPECT_TRUE(stats.metadataParts.contains({0, Postings::LUXIR_HEADER.size()})) << name;
-    EXPECT_TRUE(stats.metadataParts.contains({range.offset, range.length})) << name;
-    firstRounds.push_back(stats.firstRound);
+    EXPECT_TRUE(counters->fileStats(name).metadataParts.contains({range.offset, range.length})) << name;
   }
-  std::ranges::sort(firstRounds);
-  EXPECT_EQ((std::vector<uint64_t>{1, 2, 3}), firstRounds);
-  EXPECT_EQ(3u, counters->totalRounds());
-  auto opened = segmentOpenCounters.segmentsOpened.load();
-  for (auto& segment : reader->segments()) EXPECT_FALSE(segment.segmentCore().readPastCatalog());
+  // The open submitted those batches and nothing else; the first use of the
+  // version runs acquires them as one more round.
+  EXPECT_EQ(dataFiles.size(), counters->totalSubmissions());
+  reader->segments().front().segmentCore().versionRuns();
+  EXPECT_EQ(dataFiles.size() + 1, counters->totalSubmissions());
 
-  // The first use of the version runs acquires them as one more round.
-  auto& first = reader->segments().front().segmentCore();
-  first.versionRuns();
-  EXPECT_EQ(4u, counters->totalRounds());
-  EXPECT_TRUE(first.readPastCatalog());
-  EXPECT_EQ(opened + 1, segmentOpenCounters.segmentsOpened.load());
-
-  // A later batch acquires only the parts the segment does not hold yet.
+  // A later batch acquires only the parts the segment does not hold yet,
+  // and slice() of them then makes no request. The catalog stays held; the
+  // header's hold went once the open checked it.
   auto& core = reader->segments().front().postingsReader().core();
   auto name = Postings::getIndexFileName(core.segmentName(), 0);
   auto before = counters->fileStats(name);
-  field_parts::Slice parts[] = {{{0, 0}, 2}, {{0, 2}, 3}, {{0, 0}, 2}, {{0, 0}, Postings::LUXIR_HEADER.size()}};
-  auto bytes = core.slices(parts);
-  ASSERT_EQ(4u, bytes.size());
-  EXPECT_EQ(Postings::LUXIR_HEADER.substr(2, 3), std::string_view(bytes[1].data(), bytes[1].size()));
-  EXPECT_EQ(bytes[0].data(), bytes[2].data());
+  auto catalog = core.catalogRange();
+  field_parts::Slice parts[] = {{{0, 0}, 2}, {{0, 2}, 3}, {{0, 0}, 2}, {{0, catalog.offset}, catalog.length},
+                                {{0, 0}, Postings::LUXIR_HEADER.size()}};
+  core.acquireSlices(parts, ReadClass::METADATA);
   auto after = counters->fileStats(name);
   EXPECT_EQ(before.batches + 1, after.batches);
-  EXPECT_EQ(before.acquires + 2, after.acquires);
+  EXPECT_EQ(before.acquires + 3, after.acquires);
+  auto bytes = core.slice(parts[1], ReadClass::METADATA);
+  EXPECT_EQ(Postings::LUXIR_HEADER.substr(2, 3), std::string_view(bytes.data(), bytes.size()));
+  EXPECT_EQ(core.slice(parts[0], ReadClass::METADATA).data(), core.slice(parts[2], ReadClass::METADATA).data());
+  EXPECT_EQ(after.acquires, counters->fileStats(name).acquires);
 }
 
 // A term lookup in a large dictionary holds its routing data, the block it
@@ -326,7 +339,7 @@ TEST_F(StorageExampleTest, coldTermQueryWaitsOnRoundsNotSegments) {
       for (const auto& file : snapshot.files) {
         auto stats = counters->fileStats(file.name);
         cost.batches += stats.batches;
-        cost.singles += stats.rounds - stats.batches;
+        cost.singles += stats.submissions - stats.batches;
       }
       return cost;
     };
@@ -440,8 +453,64 @@ TEST_F(StorageExampleTest, listedPartsServeAQueryOnTheirFields) {
   EXPECT_EQ(0u, req->responses.back()->proto.profile.value_or(api::ExecutionProfile{}).io_acquire_rounds);
 }
 
-// The canonical query shapes read parts, never whole segment files, and each
-// segment acquires its catalog as metadata.
+// Batch failures surface in segment order, naming the segment, whichever
+// completes first: the gate completes the second segment's batch first.
+TEST_F(StorageExampleTest, openReportsTheLowestSegmentsBatchFailure) {
+  LuxirConfig config;
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  auto writer = h.getIndexWriter();
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_TRUE(h.indexAll({flatdoc("id", std::to_string(i))}, UpdateMessage::COMMIT).success);
+  }
+  auto info = readDurableIndexInfo(writer->dir);
+  ASSERT_EQ(2u, info->segments.size());
+  auto strict = std::make_shared<StrictDirectory>(std::shared_ptr<Directory>(writer, &writer->dir),
+                                                  std::make_shared<StrictStorageCounters>());
+  GatedDirectory dir(strict, 2, std::chrono::seconds(5));
+  std::vector<std::string> names;
+  for (const auto& segment : info->segments) {
+    names.push_back(Postings::segmentKey(segment.seg_id, segment.creator_epoch));
+    dir.failing.insert(Postings::getIndexFileName(names.back(), 0));
+  }
+  std::vector<std::shared_ptr<SegmentCore>> cores(2);
+  try {
+    SegmentCore::open(dir, info->segments, cores);
+    FAIL() << "the open should fail";
+  } catch (const ApiError& e) {
+    std::string_view message(e.what());
+    EXPECT_TRUE(message.contains(std::format("Segment '{}'", names[0])) && !message.contains(names[1])) << message;
+  }
+  EXPECT_FALSE(dir.gate.timedOut());
+}
+
+// When a later segment's open throws, the open waits for the batches already
+// in flight to complete into their cores before it releases them.
+TEST_F(StorageExampleTest, failedOpenWaitsForBatchesInFlight) {
+  LuxirConfig config;
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  auto writer = h.getIndexWriter();
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "a")}, UpdateMessage::COMMIT).success);
+  auto info = readDurableIndexInfo(writer->dir);
+  ASSERT_EQ(1u, info->segments.size());
+  std::vector<api::SegmentInfo> segments{info->segments[0], info->segments[0]};
+  ++segments[1].creator_epoch;  // Names none of the listed files, so its open throws.
+
+  auto counters = std::make_shared<StrictStorageCounters>();
+  auto strict = std::make_shared<StrictDirectory>(std::shared_ptr<Directory>(writer, &writer->dir), counters);
+  // Holds the first segment's batch for one from the second that never comes.
+  GatedDirectory dir(strict, 2, std::chrono::milliseconds(50));
+  std::vector<std::shared_ptr<SegmentCore>> cores(segments.size());
+  EXPECT_THROW(SegmentCore::open(dir, segments, cores), std::runtime_error);
+  EXPECT_EQ(1u, dir.gate.deliveries());
+  EXPECT_TRUE(dir.gate.timedOut());
+  EXPECT_EQ(0u, counters->liveStats().holds);
+}
+
+// The canonical query shapes read parts, never whole segment files, need no
+// size requests, and acquire the catalog, points directories and numeric
+// column indexes as metadata.
 TEST_F(StorageExampleTest, canonicalQueriesRunWithWholeSegmentFilesDenied) {
   LuxirConfig config;
   config.store.layers = {"strict"};
@@ -453,7 +522,7 @@ TEST_F(StorageExampleTest, canonicalQueriesRunWithWholeSegmentFilesDenied) {
     for (int i = 0; i < 100; i++) {
       int n = batch * 100 + i;
       docs.push_back(flatdoc("id", "d" + std::to_string(n), "body_t", "alpha beta w" + std::to_string(n % 13),
-                             "c_s", "c" + std::to_string(n % 5), "n_i", (int64_t)(n % 31)));
+                             "c_s", "c" + std::to_string(n % 5), "n_i", (int64_t)(n % 31), "t_dt", (int64_t)n * 1000));
     }
     ASSERT_TRUE(h.indexAll(docs, UpdateMessage::COMMIT).success);
   }
@@ -472,6 +541,9 @@ TEST_F(StorageExampleTest, canonicalQueriesRunWithWholeSegmentFilesDenied) {
   run([](auto& r) { r.topDocs().prefixQuery("body_t", "w1").countLimit(); }, -1);
   run([](auto& r) { r.topDocs().exprQuery("n_i:[3 TO 5]").countLimit(); }, -1);
   run([](auto& r) { r.topDocs().existsQuery("n_i").countLimit(); }, 200);
+  for (auto when : {"1970-01-01T00:00:05Z", "1970-01-01T00:02:30Z"}) {  // one per segment
+    run([&](auto& r) { r.topDocs().matchQuery("t_dt", when).countLimit(); }, 1);
+  }
   run([](auto& r) { r.facet("f", "c_s"); r.avg("a", "n_i"); r.topDocs().allQuery().countLimit(); }, 200);
 
   auto* layer = node.collections().storage().find<StrictLayer>();
@@ -479,13 +551,30 @@ TEST_F(StorageExampleTest, canonicalQueriesRunWithWholeSegmentFilesDenied) {
   for (const auto& file : h.getIndexWriter()->snapshots.snapshot()->files) {
     if (Manifest::segmentDataFile(file.name)) {
       EXPECT_EQ(0u, layer->counters->fileStats(file.name).wholeFileAccesses) << file.name;
+      EXPECT_EQ(0u, layer->counters->fileStats(file.name).sizeRequests) << file.name;
     }
   }
   auto info = readDurableIndexInfo(h.getIndexWriter()->dir);
   ASSERT_EQ(2u, info->segments.size());
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
   for (const auto& segment : info->segments) {
-    auto primary = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
-    EXPECT_GT(layer->counters->fileStats(primary).metadataAcquires, 0u) << primary;
+    auto key = Postings::segmentKey(segment.seg_id, segment.creator_epoch);
+    auto expectMetadata = [&](field_parts::Slice part) {
+      ASSERT_TRUE(part);
+      auto name = Postings::getIndexFileName(key, part.location.filenum());
+      EXPECT_TRUE(layer->counters->fileStats(name).metadataParts.contains({part.location.offset(), part.bytes}))
+          << name << " @" << part.location.offset();
+    };
+    expectMetadata({{Postings::PRIMARY_FILE, segment.catalog.offset}, segment.catalog.length});
+    auto found = std::ranges::find_if(reader->segments(), [&](const auto& open) {
+      return open.postingsReader().core().id() == segment.seg_id;
+    });
+    ASSERT_NE(reader->segments().end(), found);
+    const auto* number = found->postingsReader().fieldInfo("n_i");
+    const auto* date = found->postingsReader().fieldInfo("t_dt");
+    ASSERT_TRUE(number && number->numberColumn() && date);
+    expectMetadata(number->numberColumn()->index());
+    expectMetadata(date->pointsDirectory());
   }
 }
 
