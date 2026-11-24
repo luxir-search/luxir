@@ -223,7 +223,9 @@ public:
   // before a caller-owned comma or close parenthesis. The caller and this
   // parser therefore share source positions without substring translation.
   // Result coercions use the same node construction and depth accounting.
-  ValueProgram* parsePartial(Cursor& cursor, NaturePolicy resultNatures = NaturePolicy::RAW) {
+  // geoPoints admits a GEO_POINT result, for a consumer that only counts values.
+  ValueProgram* parsePartial(Cursor& cursor, NaturePolicy resultNatures = NaturePolicy::RAW,
+                             bool geoPoints = false) {
     if (opts.schema == nullptr) throw std::runtime_error("ValueExpr requires a schema");
     cur = &cursor;
     program = arenaCreate<ValueProgram>(arena, arena);
@@ -239,7 +241,7 @@ public:
     if (convertValueNature(resultNatures, {&result, 1}, 0)) {
       program->rootNode = numericNode(program->rootNode);
     }
-    if (program->root().nature == ValueNature::GEO_POINT) {
+    if (program->root().nature == ValueNature::GEO_POINT && !geoPoints) {
       fail(program->root().sourcePos, "GEO_POINT is not numeric; use geo_distance(), or geo_lat() and geo_lon()");
     }
     constants.finishArrays(*program);
