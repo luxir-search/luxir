@@ -1,7 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-// Segment pruning end to end: one root mask per op from the segments'
+// Segment pruning end to end: one collection mask per TopDocs op from the segments'
 // field record headers, collection proofs from the merged headers, pruned
 // execution answering exactly as unpruned execution (scores included), and
 // the reporting around it. Every test runs in cross-check mode: pruned
@@ -443,6 +443,41 @@ TEST_F(SegmentPruningTest, knnPreparationSeesPrunedSegments) {
       R"({"boolean":{"required":[{"knn":{"field":"v_v","query":[0,0],"k":2,"exact":true}},{"match":{"tag_s":"x"}}]}})");
   EXPECT_EQ(1, prunedBy(json));
   expectSameWithAndWithoutPruning(json);
+}
+
+TEST_F(SegmentPruningTest, mappedKnnKeepsGlobalWinnerBeforeCollection) {
+  SchemaBuilder schema;
+  using Type = api::FieldDef::FieldClass;
+  schema.field("items").type = Type::NESTED;
+  schema.field("items.tag").type = Type::STRING;
+  auto& vector = schema.field("items.v");
+  vector.type = Type::VECTOR;
+  vector.dims = 2;
+  vector.metric = api::VectorMetric::L2;
+  schema.set(helper->collection());
+  indexJson({R"({"id":"nearest","items":{"tag":"x","v":[0,0]}})"});
+  indexJson({R"({"id":"second","items":{"tag":"y","v":[1,0]}})"});
+  ASSERT_EQ(2u, currentReader()->segments().size());
+
+  for (std::string_view op : {
+      R"("top_docs":{"query":"tag:y","count_limit":-1})",
+      R"("fusion":{"rrf":{},"count_limit":-1,"sources":{"s":{"query":"tag:y","limit":1}}})"}) {
+    SCOPED_TRACE(op);
+    std::string json = R"({"ops":{"q":{"domain":{"to":"items","filter":[{"knn":{
+      "field":"v","query":[0,0],"k":1,"exact":true}}]},)" + std::string(op) + "}}}";
+    auto count = [&] {
+      auto req = localReq(helper->getSearchEngine());
+      parseQueryRequest(json, req->rawRequest(), req->mr);
+      req->collection("prune").execute();
+      EXPECT_TRUE(req->ok()) << req->errorMsg();
+      return req->getMatchCount();
+    };
+    QueryPruning::disableForTests = true;
+    auto reference = count();
+    EXPECT_EQ(0, reference);
+    QueryPruning::disableForTests = false;
+    EXPECT_EQ(reference, count());
+  }
 }
 
 TEST_F(SegmentPruningTest, fusionSharedFiltersDoNotPoisonTheMembershipCache) {

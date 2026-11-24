@@ -385,17 +385,17 @@ the plan executes them; a disjunction max needs every disjunct empty;
 wrappers pass their child's answer through. Prohibited clauses, kNN and any
 query without a rule prove nothing.
 
-`QueryPruning` evaluates the trees an op is masked by and memoizes the
-verdicts per request as `SegmentMask`s. The parser computes each op's root
-mask (`SearchOp::viable`) from its query and filters, widened by the domain
-variants it produces, and the request root masks its domain variants. A
-TopDocs op skips a pruned segment: no supplier, scorer, filter or count is
-built, children receive the empty domain, and the collector counts the
-segment as visited, so the response is that of an empty match. The
+`QueryPruning` memoizes query verdicts per request as `SegmentMask`s.
+The parser computes each TopDocs op's collection mask (`SearchOp::viable`)
+from its query and filters, widened by the domain variants it produces.
+Fusion's shared filters also narrow each source's mask. The request root
+produces its normal input domains for every segment, and Fusion applies
+its shared filters before dispatching to its sources. A mapped kNN filter
+therefore selects its global top k before the consuming op skips collection.
+On a pruned segment the TopDocs collector records a visit and feeds empty
+domains to its children without building a supplier, scorer or count. The
 exact-count planning loop skips segments the key query cannot match, as a
-zero metadata count. Masks never change what whole-index preparation sees:
-while some weight prepares over the whole index (kNN's global top k), every
-segment keeps its domains and pruning only skips each op's collection. A
+zero metadata count. A
 cache-backed whole-membership plan records an empty membership only where
 the key query itself is proven empty.
 
