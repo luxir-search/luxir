@@ -17,6 +17,7 @@
 #include "PointsWriter.h"
 #include "StoredFieldsWriter.h"
 #include "StoredDictionaryRegistry.h"
+#include "VectorTranscoder.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/PosEnum.h"
 #include "luxir/reader/NormsReader.h"
@@ -957,13 +958,18 @@ private:
       numValues += values;
       if (!field.record->points()) synthesizedPointValues += values;
     }
-    int64_t pointsBytes = hasOneDimensionalPoints(type, allFlags)
+    // Indexes rebuilt beside the values: points, and a root id dictionary's
+    // filter, which a staged charge covers again while it lives.
+    int64_t rebuiltBytes = hasOneDimensionalPoints(type, allFlags)
         ? MergeCostModel::pointsBytes((int64_t)fields.size(), numValues,
                                       synthesizedPointValues)
         : hasGeoPoints(type, allFlags)
           ? MergeCostModel::geoPointsBytes(numValues)
           : hasRangePoints(type, allFlags)
             ? MergeCostModel::rangePointsBytes(numValues) : 0;
+    if (type == FieldType::ID && space.ordinal == SpaceOrdinal::ROOT) {
+      rebuiltBytes += (int64_t)IdFilter::buildBytes(postingsWriter.idFilterOptions, (uint64_t)space.maxDoc);
+    }
 
     if (storage == FieldType::Storage::TERMS && (allFlags & FieldType::INDEX_DOCS) != 0
         && ordColumn) {
@@ -978,21 +984,21 @@ private:
         int64_t blocks = (numValues + OrdColumnFormat::BLOCK_SIZE - 1) / OrdColumnFormat::BLOCK_SIZE;
         return mapBytes + (int64_t)fields.size() * sizeof(std::vector<uint32_t>)
             + blocks * (2 * sizeof(OrdColumnFormat::PredictedBlockPlan))
-            + MergeCostModel::LIGHT_BYTES + pointsBytes;
+            + MergeCostModel::LIGHT_BYTES + rebuiltBytes;
       }
       // Single-valued columns hold the term-order -> doc-order transposition
       // in RAM until the postings pass finishes: OrdCollector's
       // ords[mergedMaxDoc] (int32).
       return (int64_t)space.maxDoc * 4
-          + MergeCostModel::LIGHT_BYTES + pointsBytes;
+          + MergeCostModel::LIGHT_BYTES + rebuiltBytes;
     }
     if (storage == FieldType::Storage::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Text postings stream. What accumulates is the norms build (roughly one
       // byte per doc-with-field plus its DocStream).
-      return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + pointsBytes;
+      return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + rebuiltBytes;
     }
     // Int/str/vector columns and stored fields stream through fixed block buffers.
-    return MergeCostModel::LIGHT_BYTES + pointsBytes;
+    return MergeCostModel::LIGHT_BYTES + rebuiltBytes;
   }
 
   // In postings and values processed. A merged term is a heap step over the
@@ -1961,8 +1967,14 @@ private:
     } else if ((storage == FieldType::Storage::TERMS || storage == FieldType::Storage::VECTOR)
                && !(allFlags & FieldType::INDEX_DOCS)) {
       // Non-indexed string/binary column (column-only storage).  Vector columns use
-      // the same fixed-size binary blob format (VectorHandler extends StrColHandler).
-      if (auto column = mergeStrCol(space, sortedFields, allFlags)) {
+      // the same fixed-size binary blob format (VectorHandler extends StrColHandler),
+      // with values in the encoding VectorTranscoder chooses.
+      std::optional<VectorTranscoder> vectors;
+      if (storage == FieldType::Storage::VECTOR) {
+        auto name = (std::string_view)compactFields[0]->record->name;
+        vectors.emplace(name, schema.getFieldTypePtr(name));
+      }
+      if (auto column = mergeStrCol(space, sortedFields, allFlags, vectors ? &*vectors : nullptr)) {
         outputFieldInfo.setColumn(*column);
       }
     } else {
@@ -2196,8 +2208,10 @@ private:
 
   // Merges non-indexed string/binary columns written by StrColHandler.
   // Rebuilds the value bytes, end offsets for variable-size values and end value
-  // ranks for multi-valued docs.
-  std::optional<WrittenColumn<field_parts::BytesColumn>> mergeStrCol(const Space& space, std::span<MergeFieldInfo*> sortedFields, int32_t flags) {
+  // ranks for multi-valued docs.  A vector column's values pass through
+  // vectors, which also chooses the column's encoding.
+  std::optional<WrittenColumn<field_parts::BytesColumn>> mergeStrCol(const Space& space, std::span<MergeFieldInfo*> sortedFields,
+                                                                     int32_t flags, VectorTranscoder* vectors) {
     assert(sortedFields.size() == space.segs.size());
 
     auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -2287,6 +2301,9 @@ private:
       StrColReader::Iterator iter(reader);
       bool sourceMultiValued = reader.multiValued();
 
+      if (vectors) vectors->startInput(*field->seg->postingsReader, *field->record);
+      auto convert = [&](std::string_view value) { return vectors ? (*vectors)(value) : value; };
+
       for (int32_t localId = iter.advance(0); localId != StrColReader::Iterator::ENDDOC; localId = iter.next()) {
         auto [mappedDoc, isDeleted] = seg.remapDocId(localId);
         if (isDeleted) {
@@ -2297,18 +2314,19 @@ private:
           int64_t rank = iter.rank();
           auto [startValueRank, endValueRank] = sourceMultiValued ? iter.valueRange() : std::pair(rank, rank + 1);
           for (int64_t r = startValueRank; r < endValueRank; r++) {
-            emitValue(reader.valueAt(r));
+            emitValue(convert(reader.valueAt(r)));
             if (ownerWriter) ownerWriter->addInt64(mappedDoc);
           }
           endValueRankWriter->addInt64(totalValues);
         } else {
-          emitValue(iter.value());
+          emitValue(convert(iter.value()));
         }
 
         docsWriter.startDoc(mappedDoc);
       }
     }
 
+    if (vectors) vectors->finish();
     if (docsWriter.numAdded() == 0) return {};
 
     valuesOut->flush(true);
@@ -2328,7 +2346,8 @@ private:
     }
 
     auto presence = docsWriter.finish();
-    field_parts::BytesColumn bytes{postingsWriter.finishStream(std::move(valuesOut)), endOffsets};
+    field_parts::BytesColumn bytes{postingsWriter.finishStream(std::move(valuesOut)), endOffsets,
+                                   vectors ? (uint8_t)vectors->outputEncoding() : (uint8_t)0};
     return WrittenColumn{bytes, totalValues, presence, endValueRanks, owners, {}};
   }
 

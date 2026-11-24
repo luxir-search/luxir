@@ -131,6 +131,12 @@ struct IndexConfig {
   int64_t max_ram_mb = -1;
   int64_t pressure_flush_floor_mb = 4;           // min idle-inverter size to shed when over the shared cap
   int merge_factor = 10;
+  // The membership filter flushes and merges write over each segment's ids
+  // (reader/IdFilter.h): none, bloom, fuse8 or fuse16. Each segment records its
+  // own choice, so changing it needs no reindex and merges move segments to it.
+  std::string id_filter = "none";
+  uint32_t id_filter_bits_per_key = 16;  // bloom only
+  uint32_t id_filter_min_kb = 16;  // bloom only: smallest filter per segment
 };
 
 struct IngestConfig {

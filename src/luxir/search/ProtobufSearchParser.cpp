@@ -10,6 +10,7 @@
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -229,8 +230,10 @@ public:
   }
 
   // Every planning context of the request draws on one multi-term budget.
-  Query::PlanningContext* createPlanningContext() {
-    return req.createPlanningContext(*view());
+  Query::PlanningContext* createPlanningContext(std::string_view opName) {
+    auto* planning = req.createPlanningContext(*view());
+    planning->opName = opName;
+    return planning;
   }
 
   // All request parse paths share the operator rules and field resolver.
@@ -258,7 +261,7 @@ public:
     auto parseContext = createParseContext("root");
     ParsedDomains domains = parseChildDomains(req.proto.ops, parseContext);
     if (!domains.empty()) {
-      rootOp.planning = createPlanningContext();
+      rootOp.planning = createPlanningContext("root");
       validateDomainQueries(domains, *rootOp.planning);
       rootOp.domainVariants.begin(0);
       addDomainVariants(
@@ -364,7 +367,7 @@ public:
           domain.applyParentFilters = false;
         }
         bucketPlan = luxir::arenaCreate<BucketDomainPlan>(req.arena);
-        bucketPlan->planning = createPlanningContext();
+        bucketPlan->planning = createPlanningContext(currOp.name);
         validateDomainQueries(domains, *bucketPlan->planning);
         bucketPlan->variants.begin(0);
         addDomainVariants(ops, {}, domains, bucketPlan->planning, bucketPlan->variants);
@@ -483,7 +486,7 @@ public:
       input->applyParentFilters = parsed.applyParentFilters;
       parsed.applyParentFilters = false;
       if (parsed.query || !parsed.filters.empty()) {
-        input->planning = createPlanningContext();
+        input->planning = createPlanningContext(name);
         ParsedDomains domains;
         domains.emplace(name, std::move(parsed));
         validateDomainQueries(domains, *input->planning);
@@ -575,7 +578,7 @@ public:
           ProtobufQueryParser parser(parseContext);
           plan = createQueryFacetPlan(
               name, facetReq, placement, parser);
-          validateQueryFacetQueries(plan);
+          validateQueryFacetQueries(plan, name);
         }
         FacetReq* facet = createQueryFacetReq(
             name, facetReq, plan,
@@ -1258,7 +1261,7 @@ public:
     for (const auto& filter : filters) {
       for (size_t i = 0; i < filter.sourceCount(); i++) {
         weights[source++] =
-            filter.source(i)->createWeight(qcontext, filterFlags);
+            qcontext.createRootWeight(*filter.source(i), filterFlags);
       }
     }
     assert(source == weights.size());
@@ -1483,8 +1486,8 @@ public:
     return plan;
   }
 
-  void validateQueryFacetQueries(FacetParsePlan& plan) {
-    plan.planning = createPlanningContext();
+  void validateQueryFacetQueries(FacetParsePlan& plan, std::string_view name) {
+    plan.planning = createPlanningContext(name);
     for (Query* query : plan.bucketQueries) {
       query->validateLogical(*plan.planning);
     }
@@ -1524,7 +1527,7 @@ public:
     auto weights = req.requestPool.make_span<Query::Weight*>(
         plan.bucketQueries.size());
     for (size_t i = 0; i < weights.size(); i++) {
-      weights[i] = plan.bucketQueries[i]->createWeight(*context, 0);
+      weights[i] = context->createRootWeight(*plan.bucketQueries[i], 0);
     }
     std::span<FilterCache::Use*> uses;
     if (bucketChild && &plan.planning->topReader == view().get()) {
@@ -2000,7 +2003,7 @@ public:
     if (topDocsReq.collapse && !topDocsReq.collapse->head_sort.empty()) {
       headSort = parseSorts(topDocsReq.collapse->head_sort);
     }
-    auto* planningContext = createPlanningContext();
+    auto* planningContext = createPlanningContext(name);
     // One unconditional serial pass validates the complete effective query,
     // including score decorations that an unscored Weight would not consume.
     // Folded filters are already children of query; passive filters remain
@@ -2208,7 +2211,7 @@ public:
       skipCount(SkipStats::queryContextsCreated);
     }
     auto* weight = omitMainWeight
-        ? nullptr : query->createWeight(*qcontext, mainWeightFlags);
+        ? nullptr : qcontext->createRootWeight(*query, mainWeightFlags);
     Query::Weight* variantMembershipWeight = nullptr;
     if (routedFilters) {
       assert(weight != nullptr);
@@ -2217,7 +2220,7 @@ public:
       variantMembershipWeight =
           !weight->needsScores() && !weight->allowsPruning()
               ? weight
-              : query->createWeight(*qcontext, membershipFlags);
+              : qcontext->createRootWeight(*query, membershipFlags);
     }
     if (cacheFirstTopKCount && weight != nullptr) {
       skipCount(SkipStats::cacheFirstTopKRankingWeights);
@@ -2231,7 +2234,7 @@ public:
       bool unionFamily = weight->sparseFilteredTopKFamily()
           == Query::Weight::SparseFilteredTopKFamily::UNION;
       mainWeightFlags &= ~Query::ALLOW_PRUNING;
-      weight = query->createWeight(*qcontext, mainWeightFlags);
+      weight = qcontext->createRootWeight(*query, mainWeightFlags);
       requestFlags &= ~Query::ALLOW_PRUNING;
       skipCount(SkipStats::sparseFilteredTopKReroutes);
       if (unionFamily) {
@@ -2275,8 +2278,8 @@ public:
           requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
       int32_t rankingFlags =
           requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING;
-      countWeight = query->createWeight(*qcontext, countFlags);
-      rankingWeight = query->createWeight(*qcontext, rankingFlags);
+      countWeight = qcontext->createRootWeight(*query, countFlags);
+      rankingWeight = qcontext->createRootWeight(*query, rankingFlags);
     }
     auto filterWeights = foldFilters || cacheFirstExactDomain || filters.empty()
       ? std::span<Query::Weight*>{}
@@ -2295,7 +2298,7 @@ public:
         int32_t domainFlags =
             requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
         domainQueryWeight =
-            domainQuery->createWeight(*qcontext, domainFlags);
+            qcontext->createRootWeight(*domainQuery, domainFlags);
         domainFilterWeights =
             buildFilterWeights(filters, *qcontext, domainFlags);
       } else {
@@ -2343,7 +2346,7 @@ public:
         int32_t membershipFlags =
             requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
         wholeMembershipWeight =
-            query->createWeight(*qcontext, membershipFlags);
+            qcontext->createRootWeight(*query, membershipFlags);
       }
       if (wholeMembershipWeight != nullptr) {
         assert(!wholeMembershipWeight->needsScores());
@@ -2404,7 +2407,7 @@ public:
           int32_t rankingFlags =
               requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING;
           countFreeRankingWeight =
-              query->createWeight(*qcontext, rankingFlags);
+              qcontext->createRootWeight(*query, rankingFlags);
         }
         bool reroute = !boundedCount && foldFilters
             && !countFreeRankingWeight->needsPrepare()
@@ -2468,8 +2471,8 @@ public:
         // limit would only duplicate the held ranking pass.
         auto bound = weight->countShortcut(segment, nullptr).maxMatches;
         if (bound > remaining) {
-          qr->boundedCountWeight = query->createWeight(
-              *qcontext, requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING));
+          qr->boundedCountWeight = qcontext->createRootWeight(
+              *query, requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING));
           break;
         }
         remaining -= bound;
@@ -2559,7 +2562,7 @@ public:
 
     Query::PlanningContext& planning() override {
       if (planningContext == nullptr) {
-        planningContext = parser.createPlanningContext();
+        planningContext = parser.createPlanningContext(name);
       }
       return *planningContext;
     }
@@ -2746,6 +2749,9 @@ public:
             &req.arena, sources.front()->planning);
         skipCount(SkipStats::queryContextsCreated);
       }
+      auto& opName = sources.front()->planning.opName;
+      auto savedName = std::exchange(opName, name);
+      auto restoreName = scope_guard([&]() noexcept { opName = savedName; });
       sharedFilterWeights = buildFilterWeights(
           sharedFilters, *sharedContext, Query::NEED_SCORES);
     }

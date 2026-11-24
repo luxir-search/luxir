@@ -33,7 +33,7 @@ class FieldValueQuery final : public luxir::PluginQueryBase {
       return child->scorerSupplier(pool, segment, mode);
     }
 
-    Scorer* createScorer(luxir::MemPool& pool, luxir::IndexReader::Segment& segment) override {
+    Scorer* createScorerImpl(luxir::MemPool& pool, luxir::IndexReader::Segment& segment) override {
       return child->createScorer(pool, segment);
     }
   };

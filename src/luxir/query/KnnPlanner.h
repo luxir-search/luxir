@@ -13,6 +13,7 @@
 #include <string_view>
 #include <vector>
 #include "VectorEngine.h"
+#include "luxir/codec/VectorCodec.h"
 
 namespace luxir {
 
@@ -61,6 +62,17 @@ struct KnnPlanner {
                0.00868 / NS_PER_DIM, 0.340 / NS_PER_DIM,
                7.50 / NS_PER_DIM, 17.7 / NS_PER_DIM, 7.50 / NS_PER_DIM};
     double requestCost = 18400 / NS_PER_DIM; // Common to both arms, once per query.
+    // EXACT_DIM and TERMINAL_DIM per stored encoding, relative to f32, indexed
+    // [cosine on a non-f32 column][VectorEncoding] (f32, f16, bf16, sq8).
+    // Cosine over a non-f32 column pays a second pass over the row for the
+    // stored norm. BM_VectorEncodingExact's exact-scan time per query (warm
+    // cache, one thread, x86 with AVX-512) over f32's: row 0 is the mean of L2
+    // and IP, row 1 cosine. They fit memory-resident columns at 768-d and 50k
+    // vectors. f32 cosine over a raw column (normalize_on_write false) also
+    // pays a norm pass but stays at 1, as before encodings were priced.
+    static constexpr std::array<std::array<double, 4>, 2> ENCODING_DIM_COST{{
+        {1, 0.457, 0.459, 0.528},
+        {1, 0.722, 0.712, 0.668}}};
     // Fraction of one-bit RaBitQ candidates that pass the gate to the
     // extra-bit pass, for an independent filter at the selectivities where
     // IVF is chosen: 0.04-0.06 at 128-d (SIFT) and ~0.011 at 768-d (miracl),
@@ -89,7 +101,8 @@ struct KnnPlanner {
     int64_t unitsWithValue = -1, eligibleUnits = -1;
     int32_t dims = 0, nlist = 0, pqM = 0, pqBits = 0, rabitqBits = 0, rabitqQueryBits = 4;
     Codec codec = Codec::FLAT;
-    bool l2 = false, domain = false, arrayDomain = false, unfiltered = true, deletes = false;
+    VectorEncoding encoding = VectorEncoding::F32;  // of the column exact and terminal scores read
+    bool l2 = false, cosine = false, domain = false, arrayDomain = false, unfiltered = true, deletes = false;
     bool sparse = false, multi = false, bounded = false;
     bool vectorsEstimated = false, pqPerListTable = false, forceFaissRaBitQ = false;
 
@@ -123,6 +136,11 @@ struct KnnPlanner {
     double cost = 0, allIvfCost = 0, allExactCost = 0, coverage = 0, allIvfCoverage = 0;
   };
 
+  // Exact and terminal scoring dimensions of one vector, in f32 equivalents.
+  static double scoreDims(const Segment& s) {
+    bool normPass = s.cosine && s.encoding != VectorEncoding::F32;
+    return s.dims * Costs::ENCODING_DIM_COST[normPass][(size_t)s.encoding];
+  }
   static bool walkDomain(bool domain, bool sparse, bool multi, int64_t card,
                          int64_t docsWithField, double threshold) {
     return domain && threshold >= 0 && (sparse || multi
@@ -194,7 +212,7 @@ struct KnnPlanner {
     Price p;
     if (s.eligibleDocs <= 0 || s.liveVectors <= 0) return p;
     bool walk = walkDomain(s.domain, s.sparse, s.multi, s.domainSize, s.docsWithField, request.flatDensity);
-    p.exact[EXACT_DIM] = (double)s.eligibleVectors * s.dims;
+    p.exact[EXACT_DIM] = (double)s.eligibleVectors * scoreDims(s);
     p.exact[DOMAIN_DOC] = walk ? (double)s.domainSize : 0;
     p.exact[RANK_VISIT] = walk ? 0 : (double)s.vectors;
     p.exact[FLAT_PROBE] = !walk && s.domain ? (double)s.docsWithField : 0;
@@ -251,12 +269,12 @@ struct KnnPlanner {
     t.ivf += sign;
     if (s.bounded) {
       t.boundedDocs += sign * s.selectedUnits(); t.boundedLive += sign * s.liveVectors;
-      t.boundedDims += sign * (double)s.eligibleVectors * s.dims;
+      t.boundedDims += sign * (double)s.eligibleVectors * scoreDims(s);
       t.boundedReads += sign * (double)s.eligibleVectors;
     } else {
       // Apply the shared k floor after summing interval slots.
       t.intervalVectors += sign * s.eligibleVectors;
-      t.intervalDims += sign * (double)s.eligibleVectors * s.dims * p.intervalReadFraction;
+      t.intervalDims += sign * (double)s.eligibleVectors * scoreDims(s) * p.intervalReadFraction;
       t.intervalReads += sign * (double)s.eligibleVectors * p.intervalReadFraction;
     }
   }
@@ -306,7 +324,7 @@ struct KnnPlanner {
       const auto& s = segments[i];
       t.exact += prices[i].exactCost; t.exactDocs += s.selectedUnits();
       if (canIvf(s) && s.bounded) {
-        vectorDims += (double)s.vectors * s.dims; vectors += (double)s.vectors; docs += s.physicalUnits();
+        vectorDims += (double)s.vectors * scoreDims(s); vectors += (double)s.vectors; docs += s.physicalUnits();
       }
     }
     // One shared bounded pool. Freeze physical average reads/dimensions per
@@ -395,7 +413,7 @@ struct KnnPlanner {
         for (size_t i : order) {
           const auto& s = segments[i]; const auto& price = result.prices[i];
           double reads = (double)s.eligibleVectors * (s.bounded ? capReads ? 0 : 1 : p * price.intervalReadFraction);
-          double dims = (double)s.eligibleVectors * s.dims * (s.bounded ? capDims ? 0 : 1 : p * price.intervalReadFraction);
+          double dims = (double)s.eligibleVectors * scoreDims(s) * (s.bounded ? capDims ? 0 : 1 : p * price.intervalReadFraction);
           double ivf = p * price.a + price.b + selectorCost(price, p, false) + costs.units[ROUND]
               + terminalCost(reads, dims, costs);
           if (ivf <= price.exactCost) { modes[i] = true; addIvf(t, s, price, 1); selectors.add(i, price, 1); }
@@ -407,7 +425,7 @@ struct KnnPlanner {
       std::vector<double> savings(segments.size());
       for (size_t i : order) {
         const auto& s = segments[i]; const auto& price = result.prices[i];
-        double dims = (double)s.eligibleVectors * s.dims * (s.bounded
+        double dims = (double)s.eligibleVectors * scoreDims(s) * (s.bounded
             ? std::min(1.0, all.boundedDimLimit / std::max(1.0, all.boundedDims)) : p * price.intervalReadFraction);
         double reads = (double)s.eligibleVectors * (s.bounded
             ? std::min(1.0, all.boundedReadLimit / std::max(1.0, all.boundedReads)) : p * price.intervalReadFraction);
@@ -448,9 +466,9 @@ struct KnnPlanner {
   // segment completion must not charge that sunk, shared cost again.
   static Work actualWork(const Segment& s, const VectorSearchWork& w) {
     Work f{};
-    f[EXACT_DIM] = (double)w.exactVectors * s.dims;
+    f[EXACT_DIM] = (double)w.exactVectors * scoreDims(s);
     f[TERMINAL_READ] = (double)(w.seedReads + w.remainingReads);
-    f[TERMINAL_DIM] = f[TERMINAL_READ] * s.dims;
+    f[TERMINAL_DIM] = f[TERMINAL_READ] * scoreDims(s);
     f[DOMAIN_DOC] = (double)w.domainDocs; f[RANK_VISIT] = (double)w.rankVisits;
     f[FLAT_PROBE] = (double)w.domainProbes;
     f[SPARSE_MAP] = (double)w.sparseMaps; f[MULTI_MAP] = (double)w.multiMaps;

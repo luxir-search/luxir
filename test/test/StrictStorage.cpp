@@ -26,6 +26,11 @@ StrictStorageCounters::FileStats StrictStorageCounters::fileStats(std::string_vi
   return it == files.end() ? FileStats{} : it->second;
 }
 
+uint64_t StrictStorageCounters::totalSubmissions() const {
+  std::lock_guard lock(mutex);
+  return submissions;
+}
+
 StrictStorageCounters::LiveStats StrictStorageCounters::liveStats() const {
   std::lock_guard lock(mutex);
   return live;
@@ -33,17 +38,18 @@ StrictStorageCounters::LiveStats StrictStorageCounters::liveStats() const {
 
 void StrictStorageCounters::logSummary() const {
   std::lock_guard lock(mutex);
-  uint64_t acquires = 0, metadata = 0, uniqueParts = 0, wholeFiles = 0, sizes = 0;
+  uint64_t acquires = 0, metadata = 0, uniqueParts = 0, wholeFiles = 0, sizes = 0, batches = 0;
   for (const auto& [name, file] : files) {
     acquires += file.acquires;
+    batches += file.batches;
     metadata += file.metadataAcquires;
     uniqueParts += file.parts.size();
     wholeFiles += file.wholeFileAccesses;
     sizes += file.sizeRequests;
   }
-  LOG_INFO("strict: acquires={} (metadata={}), unique parts={}, peak live holds={}, peak live bytes={}, "
-           "whole-file accesses={}, size requests={}",
-           acquires, metadata, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles, sizes);
+  LOG_INFO("strict: acquires={} (metadata={}), submissions={} (batches={}), unique parts={}, peak live holds={}, "
+           "peak live bytes={}, whole-file accesses={}, size requests={}",
+           acquires, metadata, submissions, batches, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles, sizes);
 }
 
 StrictLayer::~StrictLayer() {
@@ -58,6 +64,14 @@ void StrictStorageCounters::wholeFile(std::string_view name) {
 void StrictStorageCounters::sizeRequested(std::string_view name) {
   std::lock_guard lock(mutex);
   ++files[std::string(name)].sizeRequests;
+}
+
+void StrictStorageCounters::submitted(std::string_view name, bool batch) {
+  std::lock_guard lock(mutex);
+  auto& file = files[std::string(name)];
+  file.lastSubmission = ++submissions;
+  if (!file.submissions++) file.firstSubmission = submissions;
+  if (batch) ++file.batches;
 }
 
 uint8_t StrictStorageCounters::acquired(std::string_view name, ByteRange range) {
@@ -121,6 +135,10 @@ public:
 
   void sizeRequested() {
     if (!sized) counters->sizeRequested(name);
+  }
+  void submitted(bool batch) {
+    if (counters->takeInjectedFailure()) throw FileIOException("strict: injected acquire failure on " + name);
+    counters->submitted(name, batch);
   }
 
   // A part's bytes are metadata or data whoever reads them, so a cache hint
@@ -189,6 +207,10 @@ class StrictInputFile : public InputFile {
   std::shared_ptr<InputFile> delegate;
   std::shared_ptr<StrictFileState> state;
 
+  static size_t slack(ByteRange range, uint64_t fileSize) {
+    return std::min<uint64_t>(kReadSlack, fileSize - range.offset - range.length);
+  }
+
 public:
   StrictInputFile(std::shared_ptr<InputFile> inner, std::shared_ptr<StrictFileState> state)
       : delegate(std::move(inner)), state(std::move(state)) {}
@@ -204,9 +226,51 @@ public:
     checkRange(range, fileSize);
     state->checkClass(range);
     if (state->readsWholeFile(range, fileSize)) state->wholeFile();
+    state->submitted(false);
     auto source = delegate->acquire(range);
-    size_t slack = std::min<uint64_t>(kReadSlack, fileSize - range.offset - range.length);
-    return state->copy(source, range, slack);
+    return state->copy(source, range, slack(range, fileSize));
+  }
+
+  // Checks every range as a single acquire would, then forwards the batch
+  // whole, so the delegate sees it as one submission. Each hold is copied under
+  // the strict rules and the delegate's holds release before `done` runs.
+  void acquireBatch(std::span<const ByteRange> ranges, AcquireDone done) noexcept override {
+    AcquireDone forward;
+    try {
+      auto fileSize = delegate->size();
+      for (auto range : ranges) {
+        checkRange(range, fileSize);
+        state->checkClass(range);
+        if (state->readsWholeFile(range, fileSize)) state->wholeFile();
+      }
+      // Copies `done`, so it is still ours to fail if building `forward` throws.
+      forward = [state = state, fileSize, requested = std::vector(ranges.begin(), ranges.end()), done](
+                    std::vector<HeldRange>&& delivered, std::exception_ptr failure) noexcept {
+        auto sources = std::move(delivered);
+        std::vector<HeldRange> holds;
+        if (!failure) {
+          try {
+            if (sources.size() != requested.size()) {
+              throw FileIOException("strict: batch returned the wrong number of holds");
+            }
+            holds.reserve(sources.size());
+            for (size_t i = 0; i < sources.size(); ++i) {
+              holds.push_back(state->copy(sources[i], requested[i], slack(requested[i], fileSize)));
+            }
+          } catch (...) {
+            holds.clear();
+            failure = std::current_exception();
+          }
+        }
+        sources.clear();
+        done(std::move(holds), std::move(failure));
+      };
+      state->submitted(true);
+    } catch (...) {
+      done({}, std::current_exception());
+      return;
+    }
+    delegate->acquireBatch(ranges, std::move(forward));
   }
 
   void prefetch(size_t offset, size_t length) override { delegate->prefetch(offset, length); }

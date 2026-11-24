@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <set>
@@ -22,6 +23,13 @@ public:
     uint64_t acquiredBytes = 0;
     uint64_t wholeFileAccesses = 0;
     uint64_t sizeRequests = 0;  // InputFile::size() calls on files opened without a size.
+    // A submission is one single acquire or one batch, whatever its size,
+    // numbered in issue order across all files. The layer completes inline,
+    // so the numbers show order only, never which requests waited on others.
+    uint64_t batches = 0;
+    uint64_t submissions = 0;
+    uint64_t firstSubmission = 0;
+    uint64_t lastSubmission = 0;
     std::set<std::pair<uint64_t, uint64_t>> parts;
     std::set<std::pair<uint64_t, uint64_t>> metadataParts;
   };
@@ -37,15 +45,28 @@ private:
   mutable std::mutex mutex;
   std::map<std::string, FileStats, std::less<>> files;
   LiveStats live;
+  uint64_t submissions = 0;
   uint8_t pattern = 0;
+  std::atomic<uint64_t> injectedFailures{0};
 
 public:
   FileStats fileStats(std::string_view name) const;
   LiveStats liveStats() const;
+  uint64_t totalSubmissions() const;
   void logSummary() const;
+
+  // The next `count` rounds (single acquires or batches) throw
+  // FileIOException instead of reaching the delegate, as a failed request would.
+  void failNextRounds(uint64_t count) { injectedFailures.store(count); }
+  bool takeInjectedFailure() noexcept {
+    auto left = injectedFailures.load();
+    while (left && !injectedFailures.compare_exchange_weak(left, left - 1)) {}
+    return left != 0;
+  }
 
   void wholeFile(std::string_view name);
   void sizeRequested(std::string_view name);
+  void submitted(std::string_view name, bool batch);
   uint8_t acquired(std::string_view name, ByteRange range);
   void released(uint64_t length) noexcept;
 };

@@ -4,20 +4,26 @@
 #include "IndexReader.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
+#include "luxir/index/LiveDocsWriter.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/OwnershipMapper.h"
+#include "luxir/reader/ReaderErrors.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/schema/SchemaCache.h"
+#include "luxir/util/ApiError.h"
 #include "luxir/util/MemPool.h"
+#include "luxir/util/log.h"
 
 #include "luxir/api/padded_input.h"
 #include "luxir/api/luxir_index.hpp"
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <algorithm>
+#include <cstring>
 #include <bit>
+#include <cstring>
 #include <map>
 #include <memory_resource>
 #include <span>
@@ -48,32 +54,79 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
   return nullptr;
 }
 
+OverlayPolicy overlayPolicyOf(std::string_view kind) {
+  if (kind == TestOverlayAuxReader::KIND) return TestOverlayAuxReader::policyForTests;
+  return OverlayPolicy::REQUIRED;
+}
+
 } // namespace
 
-LiveDocs::LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive)
-    : ownedWords(std::move(words)), docSet(FixedBitSet(ownedWords.get(), maxDoc), numLive),
-      derivedBytes(sizeof(*this) + FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t)) {
-  fieldMetadataMemory.liveViews.fetch_add(1, std::memory_order_relaxed);
-  fieldMetadataMemory.liveViewBytes.fetch_add(derivedBytes, std::memory_order_relaxed);
+bool SegmentOverlay::knownKind(std::string_view kind) {
+  return kind == VectorAuxReader::KIND || kind == TestOverlayAuxReader::KIND;
+}
+
+std::shared_ptr<SegmentOverlay> SegmentOverlay::open(Directory& dir, const luxir::api::AuxIndexInfo& entry,
+                                                     std::string segment, bool missingFileOK) {
+  assert(knownKind(entry.kind));
+  std::vector<std::shared_ptr<InputFile>> files;
+  files.reserve(entry.files.size());
+  for (const auto& descriptor : entry.files) {
+    // Overlay files were synced before the manifest naming them was published.
+    auto file = dir.openFile(descriptor.name, {.expectSynced = true, .size = descriptor.size});
+    if (!file) {
+      if (missingFileOK) {
+        IREADER_DEBUG("Overlay file {} missing for '{}', will retry", descriptor.name, entry.name);
+        return nullptr;
+      }
+      throw std::filesystem::filesystem_error(
+          std::format("Missing overlay file '{}' for overlay '{}'", descriptor.name, entry.name),
+          std::make_error_code(std::errc::no_such_file_or_directory));
+    }
+    files.push_back(std::move(file));
+  }
+  return std::make_shared<SegmentOverlay>(fromWire(entry), overlayPolicyOf(entry.kind), std::move(segment),
+                                          std::move(files));
+}
+
+std::shared_ptr<AuxReader> SegmentOverlay::get() {
+  return reader.getOrCreate([this]() -> std::shared_ptr<AuxReader> {
+    std::pmr::monotonic_buffer_resource arena;
+    auto entry = toWire(info, arena);
+    try {
+      if (files.size() != 1) {
+        corruptSegment(segment, std::format("overlay '{}': expected 1 file, got {}", info.name, files.size()));
+      }
+      if (info.kind == VectorAuxReader::KIND) return VectorAuxReader::open(files.front(), entry, segment);
+      return TestOverlayAuxReader::open(files.front(), entry, segment);
+    } catch (const SegmentCorruptError& e) {
+      if (policy != OverlayPolicy::ADVISORY) throw;
+      LOG_WARN("Advisory overlay '{}' is unusable and reads as absent: {}", info.name, e.what());
+      unusable.store(true, std::memory_order_relaxed);
+      return nullptr;
+    }
+  });
+}
+
+LiveDocs::LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive, LiveDocsMemory::Counter& counter)
+    : ownedWords(std::move(words)), docSet(FixedBitSet(ownedWords.get(), maxDoc), numLive), memory(&counter) {
+  counter.add(heapBytes());
 }
 
 LiveDocs::~LiveDocs() {
-  if (derivedBytes) {
-    fieldMetadataMemory.liveViews.fetch_sub(1, std::memory_order_relaxed);
-    fieldMetadataMemory.liveViewBytes.fetch_sub(derivedBytes, std::memory_order_relaxed);
-  }
+  if (memory) memory->remove(heapBytes());
 }
 
 std::shared_ptr<LiveDocs> ChildLiveDocs::get() {
   return value.getOrCreate([&]() -> std::shared_ptr<LiveDocs> {
+    auto rootLive = root->shared();
     OwnershipMapper mapper(*core, "", path);
     int32_t count = core->spaceReader(path)->maxDoc();
     auto words = FixedBitSet::allocate(count, true);
     int32_t live = count;
     // Only dead roots decode individual ranges; all-live words need no mapping.
-    for (int32_t word = 0; word < (int32_t)FixedBitSet::sizeInWords(root->size()); word++) {
-      int32_t end = (int32_t)std::min((int64_t)(word + 1) * 64, (int64_t)root->size());
-      uint64_t dead = ~root->bitset().words[word];
+    for (int32_t word = 0; word < (int32_t)FixedBitSet::sizeInWords(rootLive->size()); word++) {
+      int32_t end = (int32_t)std::min((int64_t)(word + 1) * 64, (int64_t)rootLive->size());
+      uint64_t dead = ~rootLive->bitset().words[word];
       if (end & 63) dead &= (1ULL << (end & 63)) - 1;
       while (dead) {
         int32_t parent = word * 64 + (int32_t)std::countr_zero(dead);
@@ -94,85 +147,129 @@ std::shared_ptr<LiveDocs> ChildLiveDocs::get() {
         if (first < last) words[first >> 6] &= ~((1ULL << (last - first)) - 1);
       }
     }
-    auto result = live == count ? nullptr : std::make_shared<LiveDocs>(std::move(words), count, live);
+    auto result = live == count ? nullptr : std::make_shared<LiveDocs>(std::move(words), count, live, liveDocsMemory.views);
     knownCard.store(live, std::memory_order_release);
     return result;
   });
 }
 
-std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
-  assert(liveGen > 0 && maxDoc > 0);
-  std::string deleteFileName = Postings::getLiveDocsFileName(
-    Postings::segmentKey(segId, creatorEpoch), liveGen, liveEpoch);
+namespace {
 
-  auto deleteFile = dir.openFile(deleteFileName, {.expectSynced = expectSynced});
-  if (deleteFile == nullptr) {
+struct LiveFile {
+  std::shared_ptr<InputFile> file;  // Null when the file is missing.
+  std::string name;
+  std::string segment;
+  uint64_t size = 0;
+};
+
+// Opens the live docs file of generation `liveGen`. `size` is the manifest's,
+// zero when unknown; a file of another size is corrupt.
+LiveFile openLiveFile(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen, uint64_t liveEpoch,
+                      uint64_t size, bool missingFileOK, bool expectSynced) {
+  LiveFile live;
+  live.segment = Postings::segmentKey(segId, creatorEpoch);
+  live.name = Postings::getLiveDocsFileName(live.segment, liveGen, liveEpoch);
+  // With the manifest's size, size() needs no request; see Directory::openFile.
+  live.file = dir.openFile(live.name, {.expectSynced = expectSynced, .size = size});
+  if (!live.file) {
     if (missingFileOK) {
-      // Delete file not found - return nullptr instead of throwing
-      IREADER_DEBUG("Delete file {} not found for segment s{} (liveGen={})",
-                deleteFileName, Postings::segmentKey(segId, creatorEpoch), liveGen);
-      return nullptr;
-    } else {
-      throw std::filesystem::filesystem_error(
-              std::format("Delete file {} not found for segment s{} (liveGen={})",
-                         deleteFileName, Postings::segmentKey(segId, creatorEpoch), liveGen),
-              std::make_error_code(std::errc::no_such_file_or_directory));
+      IREADER_DEBUG("Delete file {} not found for segment s{} (liveGen={})", live.name, live.segment, liveGen);
+      return live;
     }
+    throw std::filesystem::filesystem_error(
+        std::format("Delete file {} not found for segment s{} (liveGen={})", live.name, live.segment, liveGen),
+        std::make_error_code(std::errc::no_such_file_or_directory));
   }
-  IREADER_DEBUG("Successfully opened delete file {} for segment s{}", deleteFileName, Postings::segmentKey(segId, creatorEpoch));
-
-  auto hold = deleteFile->acquire({0, deleteFile->size()});
-  InputStream deleteStream = hold.stream();
-
-  // Validate file format
-  const char* data = deleteStream.ptr();
-  size_t dataSize = deleteStream.size();
-
-  // Define offsets based on field sizes
-  auto headerSize =  Postings::LUXIR_HEADER.size() + sizeof(uint64_t) + sizeof(int32_t) + sizeof(int32_t);
-  // Minimum size check
-  if (dataSize < headerSize) {
-    throw std::runtime_error(std::format("Delete file {} is too small: {} bytes", deleteFileName, dataSize));
+  live.size = live.file->size();
+  if (size && live.size != size) {
+    corruptSegment(live.segment, std::format("live docs file '{}': size {} differs from the manifest's {}",
+                                             live.name, live.size, size));
   }
+  return live;
+}
 
-  // Check magic number
-  if (std::memcmp(data, Postings::LUXIR_HEADER.data(), Postings::LUXIR_HEADER.size()) != 0) {
-    throw std::runtime_error(std::format("Delete file {} has invalid magic number", deleteFileName));
+} // namespace
+
+std::shared_ptr<SegmentLive> SegmentLive::open(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
+                                               uint64_t liveEpoch, int32_t maxDoc, int32_t numLive, uint64_t size,
+                                               bool missingFileOK, bool expectSynced) {
+  assert(liveGen > 0 && maxDoc > 0 && numLive >= 0);
+  auto live = openLiveFile(dir, segId, creatorEpoch, liveGen, liveEpoch, size, missingFileOK, expectSynced);
+  if (!live.file) return nullptr;
+  return std::make_shared<SegmentLive>(std::move(live.file), std::move(live.name), std::move(live.segment),
+                                       live.size, maxDoc, numLive);
+}
+
+std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
+                                           uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
+  assert(liveGen > 0 && maxDoc > 0);
+  auto live = openLiveFile(dir, segId, creatorEpoch, liveGen, liveEpoch, 0, missingFileOK, expectSynced);
+  return live.file ? decode(std::move(live.file), live.size, live.name, live.segment, maxDoc, -1) : nullptr;
+}
+
+std::shared_ptr<LiveDocs> SegmentLive::shared() {
+  return value.getOrCreate([this] {
+    auto docs = LiveDocs::decode(file, fileSize, name, segment, maxDoc, liveCount);
+    // A mapped bitmap keeps its own reference, and an expanded one is done with the file.
+    file.reset();
+    return docs;
+  });
+}
+
+std::shared_ptr<LiveDocs> LiveDocs::decode(std::shared_ptr<InputFile> file, uint64_t size, std::string_view name,
+                                           std::string_view segment, int32_t maxDoc, int32_t numLive) {
+  auto invalid = [&](std::string_view reason) {
+    corruptSegment(segment, std::format("live docs file '{}': {}", name, reason));
+  };
+  constexpr auto headerSize = Postings::LUXIR_HEADER.size() + sizeof(uint64_t) + sizeof(int32_t) + sizeof(int32_t);
+  if (size < headerSize) invalid(std::format("too small: {} bytes", size));
+  auto hold = file->acquire({0, size});
+  InputStream in = hold.stream();
+  if (std::memcmp(in.ptr(), Postings::LUXIR_HEADER.data(), Postings::LUXIR_HEADER.size()) != 0) {
+    invalid("invalid magic number");
   }
-
-  deleteStream.skip(Postings::LUXIR_HEADER.size());
-  uint64_t format = (uint64_t)deleteStream.readLong();
-  int32_t fileMaxDoc = deleteStream.readInt();
-  int32_t numLiveDocs = deleteStream.readInt();
-
-  if (format != 1) {
-    throw std::runtime_error(std::format("Delete file {} has unsupported format: {}", deleteFileName, format));
+  in.skip(Postings::LUXIR_HEADER.size());
+  uint64_t format = (uint64_t)in.readLong();
+  int32_t fileMaxDoc = in.readInt();
+  int32_t fileLive = in.readInt();
+  if (format != LiveDocsWriter::DENSE && format != LiveDocsWriter::SPARSE) {
+    invalid(std::format("unsupported format {}", format));
   }
-
-  if (fileMaxDoc != maxDoc) {
-    throw std::runtime_error(std::format("Delete file {} maxDoc mismatch: {} (expected {})",
-              deleteFileName, fileMaxDoc, maxDoc));
+  if (fileMaxDoc != maxDoc) invalid(std::format("maxDoc {} differs from the segment's {}", fileMaxDoc, maxDoc));
+  if (fileLive < 0 || fileLive > maxDoc) invalid(std::format("invalid live count {} (maxDoc={})", fileLive, maxDoc));
+  if (numLive >= 0 && fileLive != numLive) {
+    invalid(std::format("live count {} differs from the manifest's {}", fileLive, numLive));
   }
+  numLive = fileLive;
+  int32_t numDeleted = maxDoc - numLive;
+  uint64_t expectedSize = (uint64_t)in.offset() + (format == LiveDocsWriter::SPARSE
+      ? (uint64_t)numDeleted * sizeof(uint32_t)
+      : FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t));
+  if (size != expectedSize) invalid(std::format("size {} bytes, expected {}", size, expectedSize));
 
-  if (numLiveDocs < 0 || numLiveDocs > maxDoc) {
-    throw std::runtime_error(std::format("Delete file {} has invalid numLiveDocs: {} (maxDoc={})",
-              deleteFileName, numLiveDocs, maxDoc));
-  }
+  IREADER_DEBUG("Loaded {} deleted documents from {} for segment s{}, {} live docs",
+                numDeleted, name, segment, numLive);
 
-  // Validate file size
-  int64_t expectedSize = deleteStream.offset() + screaming::FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t);
-  if (deleteStream.size() != expectedSize) {
-    throw std::runtime_error(std::format("Delete file {} size mismatch: {} bytes (expected {})",
-              deleteFileName, dataSize, expectedSize));
+  if (format == LiveDocsWriter::SPARSE) {
+    // Expand the sorted deleted ids into an owned bitmap; the hold is released.
+    auto words = FixedBitSet::allocate(maxDoc, true);
+    const char* ids = in.ptr();
+    int64_t prev = -1;
+    for (int32_t i = 0; i < numDeleted; i++) {
+      uint32_t doc;
+      std::memcpy(&doc, ids + (size_t)i * sizeof(uint32_t), sizeof(doc));
+      if ((int64_t)doc <= prev || doc >= (uint32_t)maxDoc) {
+        invalid(std::format("invalid deleted doc {} at {} (previous {}, maxDoc={})", doc, i, prev, maxDoc));
+      }
+      words[doc >> 6] &= ~(1ULL << (doc & 63));
+      prev = doc;
+    }
+    return std::make_shared<LiveDocs>(std::move(words), maxDoc, numLive, liveDocsMemory.sparseRoots);
   }
 
   // The bitmap borrows the bytes from the hold.
-  uint64_t* liveBitsMemory = (uint64_t*)deleteStream.ptr();
-
-  IREADER_DEBUG("Loaded {} deleted documents from {} for segment s{}, {} live docs",
-            maxDoc - numLiveDocs, deleteFileName, Postings::segmentKey(segId, creatorEpoch), numLiveDocs);
-
-  return std::make_shared<LiveDocs>(liveBitsMemory, maxDoc, std::move(deleteFile), std::move(hold), numLiveDocs);
+  auto* bits = (uint64_t*)in.ptr();
+  return std::make_shared<LiveDocs>(bits, maxDoc, std::move(file), std::move(hold), numLive);
 }
 
 
@@ -235,15 +332,15 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
   // commit carried the entry forward (same gen + built_core_gen).  FAISS
   // deserialization is the expensive part; reuse keeps reopens cheap.
   boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevAuxByName;
-  boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevSegAuxByKey;
+  boost::unordered_flat_map<std::string, std::shared_ptr<SegmentOverlay>> prevSegAuxByKey;
   if (previous) {
     assert(previous->segmentFiles.size() == previous->bundles.size());
     for (const auto& r : previous->auxReadersList) {
       prevAuxByName.emplace(std::string(r->getName()), r);
     }
     for (const auto& seg : previous->bundles) {
-      for (const auto& r : seg.aux) {
-        prevSegAuxByKey.emplace(segmentAuxKey(seg.info.seg_id, r->getName()), r);
+      for (const auto& overlay : seg.aux) {
+        prevSegAuxByKey.emplace(segmentAuxKey(seg.info.seg_id, overlay->name()), overlay);
       }
     }
   }
@@ -318,6 +415,34 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
       }
       lastCommitTime = commitTimeUs;
 
+      // Every holder of a physical segment shares one open SegmentCore.
+      // The publisher's (the writer's) comes first: it opened the segment for
+      // deletes, a merge or an overlay build, possibly while a reader opened
+      // it too, so preferring it converges all holders by the next reopen.
+      // Then the previous snapshot's, when the base files are identical (a
+      // delete or overlay commit leaves them unchanged); without descriptors
+      // the identity is unknown and nothing is shared. The rest open together,
+      // so their headers and catalogs are acquired in one round.
+      std::vector<std::shared_ptr<SegmentCore>> segmentCores(indexInfo.segments.size());
+      std::vector<const PhysicalCore::Bundle*> prevSegs(indexInfo.segments.size());
+      for (size_t i = 0; i < indexInfo.segments.size(); i++) {
+        const auto& segment = indexInfo.segments[i];
+        const auto& files = core->segmentFiles[i];
+        const auto* prevSeg = prevSegs[i] = previous ? previous->bundle(segment.seg_id) : nullptr;
+        const auto* prevFiles = prevSeg ? &previous->segmentFiles[(size_t)prevSeg->ord] : nullptr;
+        auto& segmentCore = segmentCores[i];
+        if (i < published.size()) {
+          segmentCore = published[i].lock();
+          if (segmentCore && (segmentCore->rootReader().maxDoc() != segment.max_doc
+                              || segmentCore->catalogRange() != files.catalog)) segmentCore = nullptr;
+        }
+        if (!segmentCore && prevSeg && !files.files.empty() && prevFiles->files == files.files
+            && prevFiles->catalog == files.catalog && prevFiles->maxDoc == segment.max_doc) {
+          segmentCore = prevSeg->core;
+        }
+      }
+      SegmentCore::open(dir, indexInfo.segments, segmentCores, missingFileOK, true);
+
       segs.reserve(indexInfo.segments.size());
       for (int i = 0; i < (int)indexInfo.segments.size(); i++) {
         const auto& segment = indexInfo.segments[i];
@@ -326,39 +451,33 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
         int32_t nDocs = segment.max_doc;
         const auto& files = core->segmentFiles[i];
 
-        // Every holder of a physical segment shares one open SegmentCore.
-        // The publisher's (the writer's) comes first: it opened the segment for
-        // deletes, a merge or an overlay build, possibly while a reader opened
-        // it too, so preferring it converges all holders by the next reopen.
-        // Then the previous snapshot's, when the base files are identical (a
-        // delete or overlay commit leaves them unchanged); without descriptors
-        // the identity is unknown and nothing is shared. Live docs carry over
-        // when the generation's file is unchanged.
-        const auto* prevSeg = previous ? previous->bundle(segId) : nullptr;
+        // Live docs carry over when the generation's file is unchanged.
+        const auto* prevSeg = prevSegs[(size_t)i];
         const auto* prevFiles = prevSeg ? &previous->segmentFiles[(size_t)prevSeg->ord] : nullptr;
-        std::shared_ptr<SegmentCore> segmentCore;
-        if ((size_t)i < published.size()) {
-          segmentCore = published[i].lock();
-          if (segmentCore && (segmentCore->rootReader().maxDoc() != nDocs
-                              || segmentCore->catalogRange() != files.catalog)) segmentCore = nullptr;
-        }
-        if (!segmentCore && prevSeg && !files.files.empty() && prevFiles->files == files.files
-            && prevFiles->catalog == files.catalog && prevFiles->maxDoc == nDocs) {
-          segmentCore = prevSeg->core;
-        }
-        if (!segmentCore) segmentCore = SegmentCore::create(dir, segment, missingFileOK, true);
+        auto segmentCore = std::move(segmentCores[i]);
         if (!segmentCore) {
           // Failed to create SegmentCore (segment files not found) - trigger retry
           retry = true;
           break; // Break out of the segments loop to retry
         }
 
-        std::shared_ptr<LiveDocs> liveDocs;
+        // Counts come from the manifest before any live docs file is read, so
+        // a count the generation cannot have is rejected here.
+        if (liveGen > 0 ? segment.live_docs < 0 || segment.live_docs >= nDocs : segment.live_docs != nDocs) {
+          corruptSegment(Postings::segmentKey(segId, segment.creator_epoch),
+                         std::format("manifest records {} live of {} rows at live generation {}",
+                                     (int32_t)segment.live_docs, nDocs, liveGen));
+        }
+
+        // Opened here and decoded on first use; the live count is the manifest's.
+        std::shared_ptr<SegmentLive> liveDocs;
         if (liveGen > 0 && prevSeg && prevSeg->live && !files.liveDocs.empty()
             && prevFiles->liveDocs == files.liveDocs) {
           liveDocs = prevSeg->live;
         } else if (liveGen > 0) {
-          liveDocs = LiveDocs::create(dir, segId, segment.creator_epoch, liveGen, segment.live_epoch, nDocs, missingFileOK, true);
+          uint64_t liveSize = files.liveDocs.empty() ? 0 : files.liveDocs.front().size;
+          liveDocs = SegmentLive::open(dir, segId, segment.creator_epoch, liveGen, segment.live_epoch, nDocs,
+                                       segment.live_docs, liveSize, missingFileOK, true);
           if (!liveDocs) {
             // Failed to create LiveDocs (delete file not found) - trigger retry
             retry = true;
@@ -367,32 +486,35 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
         }
         // If liveGen == 0, liveDocs remains nullptr (no deletes)
 
-        std::vector<std::shared_ptr<AuxReader>> segmentAuxReaders;
+        // Overlay files are opened here and their readers on first use.
+        std::vector<std::shared_ptr<SegmentOverlay>> segmentAuxReaders;
         segmentAuxReaders.reserve(segment.overlays.size());
         for (int j = 0; j < (int)segment.overlays.size(); j++) {
           const auto& info = segment.overlays[j];
+          if (!SegmentOverlay::knownKind(info.kind)) {
+            IREADER_DEBUG("Skipping unknown overlay kind '{}' for '{}'", info.kind, info.name);
+            continue;
+          }
 
           auto prevIt = prevSegAuxByKey.find(segmentAuxKey(segId, info.name));
           if (prevIt != prevSegAuxByKey.end()
-              && prevIt->second->getGen() == info.gen
-              && prevIt->second->getBuiltCoreGen() == info.built_core_gen) {
+              && prevIt->second->gen() == info.gen
+              && prevIt->second->builtCoreGen() == info.built_core_gen) {
             IREADER_DEBUG("Reusing segment overlay '{}' for seg=s{} (gen={}) from previous IndexReader",
                           info.name, Postings::segmentKey(segId, segment.creator_epoch), info.gen);
             segmentAuxReaders.push_back(prevIt->second);
             continue;
           }
 
-          auto aux = openKnownAux(dir, info, missingFileOK);
-          if (!aux && (info.kind == VectorAuxReader::KIND
-                       || info.kind == TestOverlayAuxReader::KIND)) {
+          auto overlay = SegmentOverlay::open(dir, info, Postings::segmentKey(segId, segment.creator_epoch),
+                                              missingFileOK);
+          if (!overlay) {
             IREADER_DEBUG("Segment overlay file missing for '{}' seg=s{} - triggering retry",
                           info.name, Postings::segmentKey(segId, segment.creator_epoch));
             retry = true;
             break;
           }
-          if (aux) {
-            segmentAuxReaders.push_back(std::move(aux));
-          }
+          segmentAuxReaders.push_back(std::move(overlay));
         }
         if (retry) break;
 
@@ -579,7 +701,7 @@ const IndexReader::FieldNameEntry* IndexReader::FieldCache::insert(std::unique_p
   return kept;
 }
 
-IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
+IndexReader::FieldLookup IndexReader::lookupField(std::string_view name) const {
   size_t hash = PackedTermHash{}(name);
   const FieldNameEntry* entry = space->fields->find(name, hash);
   if (!entry) {
@@ -599,15 +721,23 @@ IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
       const auto& persisted = result.totals();
       if (expected->type() != persisted.type
           || expected->segmentTypeParameters() != persisted.typeParameters) {
-        throw RequestError(std::format(
-            "Field '{}': schema {} does not match persisted {}",
-            name, FieldType::describeType(expected->type(), expected->segmentTypeParameters()),
-            FieldType::describeType(persisted.type, persisted.typeParameters)),
-            "field_type_mismatch");
+        return {result, expected};
       }
     }
   }
-  return result;
+  return {result};
+}
+
+IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
+  auto [segments, mismatch] = lookupField(name);
+  if (mismatch) {
+    const auto& persisted = segments.totals();
+    throw RequestError(std::format(
+        "Field '{}': schema {} does not match persisted {}",
+        name, FieldType::describeType(mismatch->type(), mismatch->segmentTypeParameters()),
+        FieldType::describeType(persisted.type, persisted.typeParameters)), "field_type_mismatch");
+  }
+  return segments;
 }
 
 std::shared_ptr<OrdMap> IndexReader::getOrdMap(std::string_view name) {

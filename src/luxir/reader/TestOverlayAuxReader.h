@@ -11,6 +11,7 @@
 #include <string_view>
 
 #include "AuxReader.h"
+#include "ReaderErrors.h"
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/store/Directory.h"
 #include "luxir/store/OutputStream.h"
@@ -34,6 +35,10 @@ public:
   // Without this, any client commit naming "test.overlay" in
   // build_aux_indexes would write test overlay files into a real index.
   static inline bool enabledForTests = false;
+  // The policy readers open this kind under.
+  static inline OverlayPolicy policyForTests = OverlayPolicy::REQUIRED;
+  // What the writer stores in the overlay's file; anything else is invalid.
+  static constexpr std::string_view PAYLOAD = "luxir test overlay\n";
 
   TestOverlayAuxReader(std::string name, uint64_t gen, uint64_t builtCoreGen,
                        std::shared_ptr<InputFile> file)
@@ -53,7 +58,7 @@ public:
         info.files.size(), info.name));
     }
     std::string_view fname = info.files[0].name;
-    auto file = dir.openFile(fname, {.expectSynced = true});
+    auto file = dir.openFile(fname, {.expectSynced = true, .size = info.files[0].size});
     if (file == nullptr) {
       if (missingFileOK) {
         LOG_TRACE("TestOverlayAuxReader::open: file {} missing for overlay '{}', will retry",
@@ -64,8 +69,20 @@ public:
         std::format("Missing test overlay file '{}' for overlay '{}'", fname, info.name),
         std::make_error_code(std::errc::no_such_file_or_directory));
     }
-    return std::make_shared<TestOverlayAuxReader>(
+    return open(std::move(file), info);
+  }
+
+  // Opens the reader over the overlay's file, already open, and checks its
+  // bytes; invalid bytes are `segment`'s SegmentCorruptError.
+  static std::shared_ptr<TestOverlayAuxReader> open(std::shared_ptr<InputFile> file,
+                                                    const luxir::api::AuxIndexInfo& info,
+                                                    std::string_view segment = {}) {
+    auto reader = std::make_shared<TestOverlayAuxReader>(
       std::string(info.name), info.gen, info.built_core_gen, std::move(file));
+    if (std::string_view(reader->hold.getData(), reader->hold.getLength()) != PAYLOAD) {
+      corruptSegment(segment, std::format("overlay '{}': unexpected payload", info.name));
+    }
+    return reader;
   }
 };
 

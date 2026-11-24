@@ -685,6 +685,15 @@ TEST_F(OrdColFormatTest, mergeDocCountSafetyMargin) {
       PostingsReader::MAX_SEGMENT_DOCS - 5, 5));
 }
 
+TEST_F(OrdColFormatTest, mergeVectorCountFitsOverlayIds) {
+  static_assert(MergeCostModel::MAX_SEGMENT_VECTORS == std::numeric_limits<uint32_t>::max());
+  EXPECT_TRUE(MergeCostModel::vectorsFit(0, MergeCostModel::MAX_SEGMENT_VECTORS));
+  EXPECT_FALSE(MergeCostModel::vectorsFit(MergeCostModel::MAX_SEGMENT_VECTORS, 1));
+  EXPECT_FALSE(MergeCostModel::vectorsFit(0, -1));
+  // A multi-valued field passes the cap well before the doc cap.
+  EXPECT_FALSE(MergeCostModel::vectorsFit(4LL * PostingsReader::MAX_SEGMENT_DOCS, 1LL << 30));
+}
+
 TEST_F(OrdColFormatTest, stringSortMissingLastAcrossSegmentsBothDirections) {
   OrdFormatGuard guard(OrdColWriter::FormatOverride::PREDICTED);
   CollectionHelper helper;

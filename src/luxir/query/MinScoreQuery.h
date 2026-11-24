@@ -457,6 +457,10 @@ public:
     return child->requiredValueEnvelope(field);
   }
 
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return child->mayMatch(view);
+  }
+
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     checkedBoostProduct(multiplier, 1.0f);
@@ -493,7 +497,7 @@ public:
         : child(std::move(child)), minScore(minScore), multiplier(multiplier),
           scored(scored) {}
 
-      Query::Scorer* createScorer(
+      Query::Scorer* createScorerImpl(
           MemPool& targetPool, IndexReader::Segment& segment) override {
         return buildPull(targetPool, scorerSupplier(targetPool, segment));
       }
@@ -534,7 +538,7 @@ public:
       if (!scored) traits |= IS_CONSTANT_SCORING;
     }
 
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(
         Query::Weight::PrepareContext& ctx) override {
       QueryPrep::PreparedSource source;
       source.weight = childWeight;
@@ -545,7 +549,7 @@ public:
                                         multiplier, scored);
     }
 
-    Query::Scorer* createScorer(
+    Query::Scorer* createScorerImpl(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       return buildPull(targetPool, scorerSupplier(targetPool, segment));
     }

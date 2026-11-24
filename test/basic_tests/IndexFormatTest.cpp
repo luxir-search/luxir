@@ -43,8 +43,10 @@ namespace {
 // The digest of the reference index written by IndexFormat::VERSION. A byte
 // change requires reviewing the format version. Writer choices among layouts
 // already supported by that version can change the digest within the version.
-constexpr uint64_t kReferenceVersion = 16;
-constexpr uint64_t kReferenceDigest = 0x546d55a9c469d50d;
+constexpr uint64_t kReferenceVersion = 20;
+constexpr uint64_t kReferenceDigest = 0xe28606d1770a1f74;
+
+constexpr IdFilter::Options REFERENCE_ID_FILTER = {.kind = IdFilter::Kind::BLOOM};
 
 // A small index over every default field template's kind, with three segments
 // and a delete. Each segment is one request flushed by a single inverter.
@@ -65,18 +67,25 @@ void buildReferenceIndex(CollectionHelper& ch) {
   auto& interval = schema.field("interval_value");
   interval.type = api::FieldDef::FieldClass::LONG_RANGE;
   interval.index = api::FieldDef::IndexMode::RANGE;
+  auto& quantized = schema.field("vector_sq8");
+  quantized.type = api::FieldDef::FieldClass::VECTOR;
+  quantized.encoding = api::VectorEncoding::SQ8;
   schema.set(ch.collection());
+  // Writers leave the id filter out by default; the reference covers it.
+  ch.getIndexWriter()->idFilterOptions = REFERENCE_ID_FILTER;
   ASSERT_TRUE(ch.indexAll({
       flatdoc("id", "a", "numeric_match", (int64_t)-7, "numeric_array", vec_i(2, 1, 2), "title_t", "the quick brown fox", "tag_s", "red", "tags_ss", vecs("x", "y"),
               "n_i", (int64_t)7, "ns_is", std::vector<int64_t>{1, 2}, "on_b", true,
               "flags_bs", std::vector<bool>{true, false}, "address_ip", "10.0.0.1", "addresses_ips", vecs("10.0.0.2", "2001:db8::1"), "decimal_value", "1.005", "f_f", 1.5f, "d_d", 2.25,
               "dt_dt", "2026-01-02T03:04:05Z", "w_w", "Hello World", "vec_v", std::vector<float>{1, 0},
+              "vector_sq8", std::vector<float>{0.25f, -0.75f, 2},
               "code_sc", "k1", "codes_ssc", vecs("k2", "k3"), "fs_fs", std::vector<double>{0.5, -1.25},
               "ds_ds", std::vector<double>{3.75}, "dts_dts", vecs("2026-01-02T03:04:05Z", "2024-02-29T00:00:00Z"),
               "at_p", std::vector<double>{-74.006, 40.7128},
               "stops_ps", std::vector<std::vector<double>>{{-0.1278, 51.5074}, {139.6503, 35.6762}}),
       flatdoc("id", "b", "title_t", "lazy dogs sleep", "tag_s", "blue", "n_i", (int64_t)-3,
-              "vec_v", std::vector<float>{0, 1}, "at_p", std::vector<double>{2.3522, 48.8566}),
+              "vec_v", std::vector<float>{0, 1}, "vector_sq8", std::vector<float>{1, 1, 1},
+              "at_p", std::vector<double>{2.3522, 48.8566}),
   }, UpdateMessage::COMMIT).success);
   CollectionHelper::UpdateBuilder range;
   for (std::string_view json : {
@@ -91,6 +100,7 @@ void buildReferenceIndex(CollectionHelper& ch) {
   ASSERT_TRUE(ch.indexAll({
       flatdoc("id", "c", "title_t", "quick quick fox", "tag_s", "red", "n_i", (int64_t)42,
               "dt_dt", "2025-12-31T00:00:00Z", "vec_v", std::vector<float>{0.5f, 0.5f},
+              "vector_sq8", std::vector<float>{-3, 0.5f, 0},
               "at_p", std::vector<double>{151.2093, -33.8688},
               "stops_ps", std::vector<std::vector<double>>{{-58.3816, -34.6037}}),
   }, UpdateMessage::COMMIT).success);
@@ -178,6 +188,7 @@ uint64_t buildMergedReferenceDigest() {
   budget.setTotalBytes(1);
   StoredDictionaryRegistry dictionaries;
   PostingsWriter writer(output, 3, 1);
+  writer.idFilterOptions = REFERENCE_ID_FILTER;
   SegmentMerger merger(inputs, live, writer, budget, INT64_MAX, 1, 4, *reader->schema(), dictionaries);
   oneapi::tbb::task_arena serial(1);
   serial.execute([&] { merger.merge(); });
@@ -204,14 +215,22 @@ void expectCorrupt(Action action, std::string_view context, std::string_view rea
   try {
     action();
     ADD_FAILURE() << "Expected corruption: " << reason;
-  } catch (const std::runtime_error& e) {
+  } catch (const SegmentCorruptError& e) {
     auto message = std::string_view(e.what());
     EXPECT_TRUE(message.contains(context) && message.contains(reason)) << message;
+    // A request that meets corruption reports a server fault, whatever its phase.
+    EXPECT_EQ(ErrorKind::INTERNAL, classifyException(e, ErrorKind::INVALID_REQUEST).kind);
+    EXPECT_EQ("segment_corrupt", e.code);
   }
 }
 
 void storeInt(std::string& bytes, size_t at, int32_t value) {
   std::memcpy(bytes.data() + at, &value, sizeof(value));
+}
+
+// Rehashes a deliberately changed catalog, so its decoder rather than the hash check sees it.
+void rehashCatalog(std::string_view file, api::CatalogRange& range) {
+  if (range.offset <= file.size()) range.xxh3 = XXH3_64bits(file.data() + range.offset, file.size() - range.offset);
 }
 
 } // namespace
@@ -229,7 +248,7 @@ TEST_F(IndexFormatTest, referenceIndexBytesMatchFormatVersion) {
 TEST_F(IndexFormatTest, serialRootMergeBytesMatchReference) {
   auto digest = buildMergedReferenceDigest();
   ASSERT_EQ(digest, buildMergedReferenceDigest()) << "the serial merge is not deterministic";
-  EXPECT_EQ(0xe402da4c8227236eULL, digest) << std::format("merged digest {:#x}", digest);
+  EXPECT_EQ(0x89442a27728a852bULL, digest) << std::format("merged digest {:#x}", digest);
 }
 
 TEST_F(IndexFormatTest, otherFormatVersionFailsToLoad) {
@@ -456,7 +475,11 @@ TEST_F(IndexFormatTest, malformedSegmentMetadataThrows) {
     std::string changed(bytes);
     auto manifest = segment;
     corrupt(changed, manifest);
+    rehashCatalog(changed, manifest.catalog);
     writeFile(copy, file, changed);
+    // An open reads every file the manifest lists, so the one the catalog
+    // does not know exists, and the inventory check is what rejects it.
+    writeFile(copy, unknownFile, bytes);
     expectCorrupt([&] { SegmentCore::create(copy, manifest); }, namesFile ? file : segmentName, reason);
   }
 }
@@ -488,9 +511,10 @@ TEST_F(IndexFormatTest, invalidSpacePathAndRootCount) {
   std::memcpy(corrupt.data() + corrupt.size() - sizeof(length), &length, sizeof(length));
   auto range = writer.catalogRange();
   range.length = corrupt.size() - range.offset;
+  range.xxh3 = XXH3_64bits(corrupt.data() + range.offset, range.length);
   expectCorrupt([&] { SegmentCatalog::readDirectory(corrupt); }, "segment catalog", "root doc count out of range");
   expectCorrupt([&] {
-    SegmentCatalog::readDirectory(std::span(corrupt).subspan(range.offset), range.offset, corrupt.size());
+    SegmentCatalog::readDirectory(std::span(corrupt).subspan(range.offset), range, corrupt.size());
   }, "segment catalog", "root doc count out of range");
 }
 
@@ -515,7 +539,7 @@ TEST_F(IndexFormatTest, opensCatalogFromCopiedRange) {
     bytes.assign(hold.getData(), hold.getLength());
   }
 
-  auto head = SegmentCatalog::readDirectory(bytes, range.offset, source.files[0]);
+  auto head = SegmentCatalog::readDirectory(bytes, range, source.files[0]);
   auto catalog = SegmentCatalog::decode(head, source.files);
   auto ordinal = catalog.rowSpaces()[0].fields.find("tag_s");
   ASSERT_GE(ordinal, 0);
@@ -525,7 +549,119 @@ TEST_F(IndexFormatTest, opensCatalogFromCopiedRange) {
   auto record = catalog.field(SpaceOrdinal::ROOT, ordinal);
   ASSERT_TRUE(record->terms());
   EXPECT_EQ(1, record->indexedTotals().numTerms);
-  EXPECT_THROW(SegmentCatalog::readDirectory(bytes, range.offset, source.files[0] + 1), std::runtime_error);
+  EXPECT_THROW(SegmentCatalog::readDirectory(bytes, range, source.files[0] + 1), SegmentCorruptError);
+}
+
+// Any changed catalog byte fails the manifest hash before decoding, whether the
+// catalog is read in place or as copied range bytes.
+TEST_F(IndexFormatTest, catalogHashMismatchIsCorruption) {
+  LuxirNode node(LuxirConfig{});
+  CollectionHelper ch(node, "main");
+  ASSERT_TRUE(ch.index(flatdoc("id", "a", "tag_s", "red"), UpdateMessage::COMMIT).success);
+  auto& dir = ch.getIndexWriter()->dir;
+  auto durable = readDurableIndexInfo(dir);
+  const auto& segment = durable.info.segments.front();
+  auto range = catalogRangeFromManifest(segment.catalog);
+  auto name = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch), 0);
+  auto readWhole = [&](const std::string& file) {
+    auto input = dir.openFile(file);
+    auto hold = input->acquire({0, input->size()});
+    return std::string(hold.getData(), hold.getLength());
+  };
+  std::string bytes = readWhole(name);
+  bytes[range.offset + range.length / 2] ^= 1;
+  RAMDir copy;
+  writeFile(copy, name, bytes);
+  for (const auto& file : segment.files) {
+    if (file.name != name) writeFile(copy, file.name, readWhole(std::string(file.name)));
+  }
+  expectCorrupt([&] { SegmentCore::create(copy, segment); }, name, "catalog hash differs from manifest");
+  auto catalog = std::string_view(bytes).substr(range.offset);
+  expectCorrupt([&] { SegmentCatalog::readDirectory(catalog, range, bytes.size()); },
+                "segment catalog", "catalog hash differs from manifest");
+}
+
+TEST_F(IndexFormatTest, manifestRequiresCatalogRange) {
+  LuxirNode node(LuxirConfig{});
+  CollectionHelper ch(node, "main");
+  ASSERT_TRUE(ch.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  auto manifest = Manifest::load(ch.getIndexWriter()->dir);
+  std::pmr::monotonic_buffer_resource arena;
+  auto info = Manifest::decode(manifest.bytes, arena);
+  std::vector<api::SegmentInfo> segments(info.segments.begin(), info.segments.end());
+  segments[0].catalog = {};
+  info.segments = segments;
+  auto bytes = std::make_shared<std::vector<std::byte>>();
+  ASSERT_TRUE(api::encode(info, *bytes));
+  EXPECT_THROW(Manifest::decode(bytes, arena), std::runtime_error);
+}
+
+// A live docs file is decoded on first use, so a live count that differs from
+// the manifest's fails that use as corruption, not the open.
+TEST_F(IndexFormatTest, liveDocsCountDifferingFromManifestIsCorruption) {
+  LuxirNode node(LuxirConfig{});
+  CollectionHelper ch(node, "main");
+  ASSERT_TRUE(ch.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(ch.deleteById("a", UpdateMessage::COMMIT).success);
+  auto& dir = ch.getIndexWriter()->dir;
+  auto durable = readDurableIndexInfo(dir);
+  const auto& segment = durable.info.segments.front();
+  auto live = Postings::getLiveDocsFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch),
+                                            segment.live_gen, segment.live_epoch);
+  RAMDir copy;
+  std::vector<Directory::FileInfo> files;
+  dir.listFiles(files);
+  for (const auto& descriptor : files) {
+    auto input = dir.openFile(descriptor.name);
+    auto hold = input->acquire({0, input->size()});
+    std::string bytes(hold.getData(), hold.getLength());
+    // The live count follows the magic, the format and maxDoc.
+    if (descriptor.name == live) storeInt(bytes, Postings::LUXIR_HEADER.size() + sizeof(uint64_t) + sizeof(int32_t), 2);
+    writeFile(copy, descriptor.name, bytes);
+  }
+  IndexReader reader(copy);
+  const auto& leaf = reader.segments().front();
+  EXPECT_EQ(1, leaf.numLive());
+  expectCorrupt([&] { leaf.liveDocs(); }, live, "live count 2 differs from the manifest's 1");
+  expectCorrupt([&] { leaf.liveDocs(); }, live, "live count 2 differs from the manifest's 1");
+}
+
+// Live counts are served from the manifest before a live docs file is read, so
+// a snapshot open checks the file's size and rejects a count its generation
+// cannot have.
+TEST_F(IndexFormatTest, manifestLiveCountAndSizeAreCheckedAtOpen) {
+  LuxirNode node(LuxirConfig{});
+  CollectionHelper ch(node, "main");
+  ASSERT_TRUE(ch.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(ch.deleteById("a", UpdateMessage::COMMIT).success);
+  auto& dir = ch.getIndexWriter()->dir;
+  auto root = readDurableIndexInfo(dir);
+  auto segment = root.info.segments.front();
+  auto name = Postings::segmentKey(segment.seg_id, segment.creator_epoch);
+  auto live = Postings::getLiveDocsFileName(name, segment.live_gen, segment.live_epoch);
+  {
+    RAMDir copy;
+    std::vector<Directory::FileInfo> files;
+    dir.listFiles(files);
+    for (const auto& descriptor : files) {
+      auto input = dir.openFile(descriptor.name);
+      auto hold = input->acquire({0, input->size()});
+      std::string bytes(hold.getData(), hold.getLength());
+      if (descriptor.name == live) bytes.push_back('x');
+      writeFile(copy, descriptor.name, bytes);
+    }
+    expectCorrupt([&] { IndexReader reader(copy); }, live, "differs from the manifest's");
+  }
+  for (int32_t count : {-1, 2}) {
+    segment.live_docs = count;
+    root.info.segments = std::span(&segment, 1);
+    root.info.index_gen++;
+    std::vector<std::byte> bytes;
+    ASSERT_TRUE(api::encode(root.info, bytes));
+    Manifest::write(dir, root.info.index_gen, bytes, root->writer_epoch);
+    IncarnationState::install(dir, Manifest::tip(root->index_gen, root->writer_epoch));
+    expectCorrupt([&] { IndexReader reader(dir); }, name, std::format("manifest records {} live of 2 rows", count));
+  }
 }
 
 TEST_F(IndexFormatTest, corruptFieldPrefixRespectsVerificationPolicy) {
@@ -556,14 +692,12 @@ TEST_F(IndexFormatTest, corruptFieldPrefixRespectsVerificationPolicy) {
   {
     CommitSnapshotRegistry snapshot(copy);
     EXPECT_THROW(snapshot.openLocalSnapshot(true), ChecksumMismatchError);
-    ASSERT_NO_THROW(snapshot.openLocalSnapshot(false));
-    auto reader = snapshot.readers.getReader();
-    auto& postings = reader->segments().front().postingsReader();
-    expectCorrupt([&] { postings.fieldHeader(0); }, file, fieldContext);
-    expectCorrupt([&] { postings.fieldInfo(0); }, file, fieldContext);
+    // Without file verification the manifest's catalog hash still rejects the record.
+    expectCorrupt([&] { snapshot.openLocalSnapshot(false); }, file, "catalog hash differs from manifest");
     CorruptionMarker::write(copy, std::span(&file, 1), "bad field prefix");
     EXPECT_THROW(snapshot.openLocalSnapshot(false), ChecksumMismatchError);
   }
+  // A catalog found from the trailer has no hash; the record fails when it decodes.
   SegmentCore core(copy, segment.seg_id, segment.creator_epoch);
   EXPECT_FALSE(core.catalogRange().xxh3.has_value());
   EXPECT_THROW(catalogRangeToManifest(core.catalogRange()), std::logic_error);

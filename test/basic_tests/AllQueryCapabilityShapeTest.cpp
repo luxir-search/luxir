@@ -90,8 +90,8 @@ TEST_F(AllQueryCapabilityShapeTest,
     .live_docs = 0,
   };
   Segment zeroSegment(
-      std::move(core), std::shared_ptr<LiveDocs>{},
-      std::vector<std::shared_ptr<AuxReader>>{}, info, 0, 0, nullptr);
+      std::move(core), std::shared_ptr<SegmentLive>{},
+      std::vector<std::shared_ptr<SegmentOverlay>>{}, info, 0, 0, nullptr);
   AllQuery::Supplier supplier(zeroSegment, 0.0f, false);
   MemPool pool;
 

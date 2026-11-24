@@ -525,7 +525,11 @@ public:
         });
   }
 
+  bool outputsEmpty(IndexReader::Segment& segment, DocSet* input,
+                    std::vector<std::string>* details) const;
+
   class CalcBase : public SearchOp::Calculator {
+    ExecutionProfileRun* pruningRun = nullptr;
 #ifndef NDEBUG
     bool prunedFanout = false;
 #endif
@@ -1758,6 +1762,42 @@ public:
       return accumulator;
     }
 
+    bool canRecordSegmentCount(IndexReader::Segment& seg, DocSet* domain) {
+      auto& op = thisOp();
+      return !op.sortPlan.useFieldSort && op.requirements.countLimit < 0 && op.filterWeights.empty()
+          && !requiresWholeIndexPrepare && op.wholeMembershipPlan.canRecordCount(seg, domain);
+    }
+
+    template <bool Collapsed, bool MetricGroups>
+    auto* skipSegment(IndexReader::Segment& seg, DomainHandle& domain, std::vector<std::string> details) {
+      auto& op = thisOp();
+      auto release = scope_guard([&]() noexcept { releaseSegmentState(seg); });
+      size_t ord = (size_t)seg.ord;
+      // Drop the inputs that prepareRoutedProduction would consume for this segment.
+      if (!preparedRoutedReservations.empty()) {
+        for (auto* inputs : {&preparedRoutedFilters, &preparedResetRoutedFilters, &preparedVariantInheritBases}) {
+          if (!inputs->empty()) (*inputs)[ord] = std::vector<DomainHandle>{};
+        }
+        preparedRoutedReservations[ord].reset();
+      }
+
+      // Only a proof for the key can publish raw empty membership.
+      if (op.weight && op.weight->provenEmpty(seg) && !op.wholeMembershipPlan.empty()) {
+        FilterCache::UseRegistry::SegmentScope cacheTiming(*op.planning.filterUses, ord);
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        op.wholeMembershipPlan.resolve(*op.view, seg, domain.get(), preparedWeight.get(),
+            [&](Query::Weight& resolver) { return resolver.scorerSupplier(poolGuard.pool(), seg); });
+        if (!Collapsed && canRecordSegmentCount(seg, domain.get())) op.wholeMembershipPlan.recordCount(seg, 0);
+      }
+      domain = DomainHandle::empty().scoped(seg);
+      if (!output.empty()) output[ord] = domain;
+      if (memberReplay) memberReplay->domains[ord] = domain;
+      Signal::emit("searchTopDocsSegmentPruned", this);
+      if (op.req.proto.profile) op.req.recordPrunedSegment(pruningRun, seg, std::move(details));
+      if constexpr (MetricGroups) return metricGroups->merger.obtain();
+      else return collectorMerger.obtain();
+    }
+
     // One collection ladder, specialized once per segment. Document requests
     // instantiate their original admission loop without per-hit group checks.
     template <bool Structural, bool Collapsed, bool MetricGroups = false,
@@ -1786,8 +1826,12 @@ public:
       DocSet* routedBaseDomain = nullptr;
       int64_t numSegs = (int64_t)op.view->segments().size();
 
-      {
-        auto& seg = op.planning.topReader.segments()[segnum];
+      auto& seg = op.planning.topReader.segments()[segnum];
+      std::vector<std::string> details;
+      bool skipped = op.outputsEmpty(seg, domain, op.req.proto.profile ? &details : nullptr);
+      if (skipped) {
+        data.reset(skipSegment<Collapsed, MetricGroups>(seg, domainHandle, std::move(details)));
+      } else {
         auto release = scope_guard([&]() noexcept { releaseSegmentState(seg); });
         auto poolGuard = MemPool::threadLocalPoolGuard();
         if (!op.domainVariants.empty()) {
@@ -1845,9 +1889,7 @@ public:
           auto* fieldCollector = data->template fields<Collapsed, Admission>();
           using ActiveFieldCollector = FieldCollector<Collapsed, Admission>;
 
-          bool recordCount = !Collapsed && !data->useFieldSort
-              && op.requirements.countLimit < 0 && op.filterWeights.empty()
-              && !requiresWholeIndexPrepare && op.wholeMembershipPlan.canRecordCount(seg, domain);
+          bool recordCount = !Collapsed && canRecordSegmentCount(seg, domain);
 
           // A segment ranking never pruned has its exact count already. Track
           // pruning per segment, restoring the collector's own flag afterward.
@@ -2676,7 +2718,7 @@ public:
             newDomain = routedProduction->domains[variant];
           }
         } else {
-          newDomain = matchEverything ? domainHandle : output[(size_t)segnum];
+          newDomain = skipped || matchEverything ? domainHandle : output[(size_t)segnum];
         }
         assert(newDomain.isDeliverable());
         return newDomain;
@@ -2857,6 +2899,8 @@ public:
 
       domain.assertScope(op.view->segments()[segnum]);
       assert(segnum < (int32_t)inputDomains.size());
+      // Gather every input before testing segment outputs. A kNN weight
+      // chooses its global top k from all of these domains.
       inputDomains[(size_t)segnum] = std::move(domain);
       inputDomainViews[(size_t)segnum] = inputDomains[(size_t)segnum].get();
       auto count =

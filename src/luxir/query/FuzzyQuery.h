@@ -19,6 +19,7 @@
 #include "TermQuery.h"
 #include "luxir/reader/FuzzySeekEnum.h"
 #include "luxir/util/MemPool.h"
+#include "CatalogPredicates.h"
 
 namespace luxir {
 
@@ -111,6 +112,11 @@ public:
     checkedBoostProduct(multiplier, boost);
     if (!fittedPolicy) return;
     warnIfFittedTermsReachable(context, field, *fittedPolicy, [] { return true; });
+  }
+
+  // Expansions are unknown without the dictionary; field absence proves it.
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return proof::termsMatch(view, field);
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
