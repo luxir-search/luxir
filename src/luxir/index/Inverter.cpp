@@ -178,7 +178,11 @@ Inverter::IndexHandler* Inverter::createPhysicalHandler(
   } else {
     switch (FieldType::storage(fieldType->type())) {
       case FieldType::Storage::TEXT:
-        fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType, space);
+        if (fieldType->hasPositions()) {
+          fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType, space);
+        } else {
+          fieldHandler = pool.make_unique<handler::PositionlessTextHandler>(*this, name, fieldType, space);
+        }
         break;
       case FieldType::Storage::TERMS:
         if (!fieldType->indexed()) {

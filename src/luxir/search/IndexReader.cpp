@@ -797,6 +797,8 @@ const IndexReader::FieldTotals& IndexReader::FieldSegments::totals() const {
       fresh->stats.sumDocFreq += header.indexedTotals.sumDocFreq;
       fresh->stats.sumTotalTermFreq += header.indexedTotals.sumTotalTermFreq;
       fresh->segFlags |= header.segFlags;
+      fresh->normFreeText |= FieldType::storage(header.type) == FieldType::Storage::TEXT
+          && (header.flags & FieldType::INDEX_DOCS) && !FieldType::hasNorms(header.flags);
     }
     if (entry->totals.compare_exchange_strong(totals, fresh.get(),
                                                std::memory_order_release,
@@ -814,6 +816,10 @@ const Similarity::FieldStats& IndexReader::FieldSegments::stats() const {
 
 uint8_t IndexReader::FieldSegments::segFlags() const {
   return entry ? totals().segFlags : 0;
+}
+
+bool IndexReader::FieldSegments::hasNormFreeText() const {
+  return entry && totals().normFreeText;
 }
 
 void IndexReader::SpaceState::buildFieldNameLists() {

@@ -89,13 +89,15 @@ private:
   }
 
 public:
+  // Without norms (hasNorms false) normBytes must be empty; only the presence
+  // set is written and writeValues returns no norms part.
   static PreparedNorms prepare(MemPool& pool, PostingsWriter& postingsWriter,
                                SpaceOrdinal space,
                                const Stream& normBytes, DocStream& docs,
-                               int32_t docsWithField) {
+                               int32_t docsWithField, bool hasNorms = true) {
     int32_t maxDoc = postingsWriter.getMaxDoc(space);
     assert(maxDoc >= docsWithField);
-    assert(normBytes.size(pool) == docsWithField);
+    assert(normBytes.size(pool) == (hasNorms ? docsWithField : 0));
 
     PreparedNorms prepared;
     prepared.presence = {docsWithField, {}};
@@ -103,7 +105,9 @@ public:
     if (docsWithField == 0) return prepared;
 
     prepared.flat = useDocIdIndexing(docsWithField, maxDoc);
-    prepared.ordinalNorms = materializeOrdinalNorms(pool, normBytes, docsWithField);
+    if (hasNorms) {
+      prepared.ordinalNorms = materializeOrdinalNorms(pool, normBytes, docsWithField);
+    }
 
     if (docsWithField < maxDoc) {
       prepared.presence = writePresenceBitset(pool, postingsWriter, docs, docsWithField, prepared);
@@ -118,6 +122,8 @@ public:
     assert(maxDoc >= docsWithField);
 
     if (docsWithField == 0) return {};
+    // A field without norms keeps only its presence set: no norms part.
+    if (prepared.ordinalNorms.empty()) return {};
 
     auto outPtr = postingsWriter.getOutputStream();
     OutputStream& out = *outPtr;

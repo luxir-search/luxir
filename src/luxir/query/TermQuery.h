@@ -118,6 +118,7 @@ public:
     luxir::CachedFieldInfo* cachedFieldInfo = nullptr;
     luxir::CachedTermInfo* cachedTermInfo = nullptr;
     luxir::Similarity::BM25Scorer* simScorer = nullptr;
+    luxir::Similarity::BM25Scorer* normFreeScorer = nullptr;  // segments without norms
     float boost;
   public:
     Weight(Context& context, TermQuery& query, int32_t flags, float multiplier)
@@ -152,6 +153,13 @@ public:
                   hasNorms));
           if (!query.hasInjectedStats()) cachedTermInfo->simScorer = simScorer;
         }
+        // Only while some segment holds the field as text without norms.
+        if (cachedFieldInfo->segInfos.hasNormFreeText()) {
+          luxir::Similarity similarity;
+          normFreeScorer = context.pool.make<luxir::Similarity::BM25Scorer>(
+              similarity.getNormFreeScorer(1.0f, similarity.idf(
+                  cachedFieldInfo->fieldStats, query.scoringTermStats(*cachedTermInfo))));
+        }
       }
     }
 
@@ -179,6 +187,11 @@ public:
       luxir::NormsReader* normsReader = nullptr;
       if (fieldInfo->norms()) {
         normsReader = targetPool.make<luxir::NormsReader>(segment.postingsReader(), *fieldInfo);
+      } else if (FieldType::storage(fieldInfo->type) == FieldType::Storage::TEXT) {
+        // A text segment written without norms (norms: false or index_options: docs).
+        assert(normFreeScorer != nullptr);
+        return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, nullptr, normFreeScorer, boost,
+                                                  query.shouldUseFrontierBound());
       }
       return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader,
                                                 simScorer, boost,

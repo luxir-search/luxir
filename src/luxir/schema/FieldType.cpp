@@ -28,6 +28,10 @@ static void termSignatureProps(const FieldType& type, FieldType::SignatureProps&
 void TextFieldType::signatureProps(SignatureProps& out) const {
   FieldType::signatureProps(out);
   termSignatureProps(*this, out);
+  if (flags_ & INDEX_DOCS) {
+    out["index_options"] = hasPositions(flags_) ? "\"positions\"" : hasFreqs(flags_) ? "\"freqs\"" : "\"docs\"";
+    out["norms"] = hasNorms(flags_) ? "true" : "false";
+  }
   out["analyzer"] = analyzer_->canonical;
 }
 

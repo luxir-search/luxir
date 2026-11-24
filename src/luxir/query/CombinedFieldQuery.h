@@ -198,6 +198,8 @@ public:
     const uint8_t* singleNorms;
     // Set when both fields of a two-field query have norms; see fillPairNorms.
     const uint8_t* pairNorms;
+    // Weighted average lengths of the fields this segment has without norms.
+    double normFreeLength;
     int32_t doc = -1;
     float freq = 0.0f;
 
@@ -228,7 +230,7 @@ public:
     int64_t combinedNorm() {
       if (pairNorms != nullptr) return pairNorms[(size_t)code(norms[0]) << 8 | code(norms[1])];
       if (singleNorms != nullptr) return singleNorms[code(norms[0])];
-      double length = 0.0;
+      double length = normFreeLength;
       for (auto& n : norms) length += n.lengths[code(n)];
       return encodeLength(length);
     }
@@ -236,9 +238,10 @@ public:
   public:
     Scorer(std::span<Postings> postings, std::span<Norms> norms,
            Similarity::BM25Scorer* simScorer, const uint8_t* singleNorms,
-           const uint8_t* pairNorms)
+           const uint8_t* pairNorms, double normFreeLength = 0.0)
       : postings(postings), norms(norms), simScorer(simScorer),
-        singleNorms(singleNorms), pairNorms(pairNorms) {
+        singleNorms(singleNorms), pairNorms(pairNorms), normFreeLength(normFreeLength) {
+      assert(normFreeLength == 0.0 || (singleNorms == nullptr && pairNorms == nullptr));
       assert(singleNorms == nullptr || norms.size() == 1);
       assert(pairNorms == nullptr || norms.size() == 2);
     }
@@ -369,14 +372,16 @@ public:
         fieldInfos[i] = context.getCachedFieldInfo(query.fields[i]);
         if (fieldInfos[i] == nullptr) continue;
         // Use segment metadata, as in TermQuery; older fields need not be
-        // listed in the current schema. Query builders keep these modes apart.
+        // listed in the current schema. Query builders keep text and non-text
+        // fields apart, and text fields with and without norms. A segment of
+        // a norms group whose field has no norms part adds no length for it.
         const auto& segInfos = fieldInfos[i]->segInfos;
         for (size_t seg = 0; seg < segInfos.size(); seg++) {
           if (const auto* info = segInfos.at(seg)) {
-            bool text = FieldType::storage(info->type) == FieldType::Storage::TEXT;
-            assert(!fieldHasNorms || *fieldHasNorms == text);
-            fieldHasNorms = text;
-            break;
+            bool norms = FieldType::storage(info->type) == FieldType::Storage::TEXT
+                && FieldType::hasNorms(info->flags);
+            fieldHasNorms = fieldHasNorms.value_or(false) || norms;
+            if (norms) break;
           }
         }
         const auto& stats = fieldInfos[i]->fieldStats;
@@ -480,12 +485,22 @@ public:
       }
       auto norms = targetPool.make_span<Scorer::Norms>(hasNorms ? n : 0);
       size_t lastNormsField = 0;
+      // A field this segment wrote without norms counts every doc at the
+      // field's weighted average length, as TermQuery scores such a segment.
+      double normFreeLength = 0.0;
       for (size_t i = 0; hasNorms && i < n; i++) {
         if (fieldInfos[i] == nullptr) continue;
         const DecodedFieldRecord* segInfo = fieldInfos[i]->segInfos.at(segment);
         if (segInfo == nullptr) continue;
         assert(FieldType::storage(segInfo->type) == FieldType::Storage::TEXT);
-        if (!segInfo->norms()) continue;
+        if (!segInfo->norms()) {
+          const auto& stats = fieldInfos[i]->fieldStats;
+          if (stats.docsWithField > 0) {
+            normFreeLength += (double)query.weights[i] * (double)stats.sumTotalTermFreq
+                / (double)stats.docsWithField;
+          }
+          continue;
+        }
         auto* reader = targetPool.make<NormsReader>(segment.postingsReader(), *segInfo);
         lastNormsField = i;
         const double* lengths = normTables->lengths + i * 256;
@@ -497,10 +512,12 @@ public:
       }
       if (numPostings == 0) return nullptr;
       // Only a two-field query has a pair table, so two norms are fields 0 and 1.
-      const uint8_t* singleNorms = numNorms == 1 ? normTables->singleNorms + lastNormsField * 256 : nullptr;
-      const uint8_t* pairNorms = numNorms == 2 ? normTables->pairNorms : nullptr;
+      bool exactTables = normFreeLength == 0.0;
+      const uint8_t* singleNorms = exactTables && numNorms == 1
+          ? normTables->singleNorms + lastNormsField * 256 : nullptr;
+      const uint8_t* pairNorms = exactTables && numNorms == 2 ? normTables->pairNorms : nullptr;
       return targetPool.make<Scorer>(postings.first(numPostings), norms.first(numNorms), simScorer,
-                                     singleNorms, pairNorms);
+                                     singleNorms, pairNorms, normFreeLength);
     }
   };
 

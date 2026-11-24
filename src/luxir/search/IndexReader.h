@@ -367,6 +367,8 @@ public:
     const Similarity::FieldStats& stats() const;
     // Union of the segment-specific flags over the field's segments.
     uint8_t segFlags() const;
+    // Some segment holds the field as text written without length norms.
+    bool hasNormFreeText() const;
     bool operator==(const FieldSegments&) const = default;
   };
 
@@ -392,6 +394,7 @@ private:
   struct FieldTotals {
     Similarity::FieldStats stats;
     uint8_t segFlags = 0;  // See FieldSegmentFlags.
+    bool normFreeText = false;
     FieldType::Type type = FieldType::NONE;
     uint32_t typeParameters = 0;
   };

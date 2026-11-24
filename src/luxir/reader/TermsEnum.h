@@ -151,6 +151,7 @@ public:
     int32_t pulsedPos = -1;
     bool hasFreqs = false;
     bool hasPositions = false;
+    bool hasNorms = false;
   };
 
   // The decoded record and segment core must outlive the enum.
@@ -377,7 +378,7 @@ public:
   }
 
   bool hasTermImpacts() const {
-    return FieldType::hasFreqs(flags) && FieldType::hasPositions(flags);
+    return FieldType::hasNorms(flags);
   }
 
   EncodedImpactFrontier currentTermImpactFrontierSpan() {
@@ -410,6 +411,7 @@ public:
     PostingsState state;
     state.hasFreqs = FieldType::hasFreqs(flags);
     state.hasPositions = FieldType::hasPositions(flags);
+    state.hasNorms = FieldType::hasNorms(flags);
     state.termOrdinal = ord();
     state.docFreq = docFreq();
     state.packedBlockCount = packedBlockCount();

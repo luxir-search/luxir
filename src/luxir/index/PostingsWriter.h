@@ -1362,7 +1362,7 @@ public:
     this->flags = flags;
     hasFreqs = FieldType::hasFreqs(flags);
     hasPositions = FieldType::hasPositions(flags);
-    hasNorms = hasPositions;
+    hasNorms = FieldType::hasNorms(flags);
     termsLoc = termOutput.size();
     docsLoc = docOutput.size();
     posLoc = posOutput.size();

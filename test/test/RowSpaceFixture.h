@@ -74,7 +74,7 @@ struct RowSpaceFixture {
     if (!terms.empty()) {
       auto& field = writer.addField(space, Schema::qualify(path, "body"));
       field.header.type = FieldType::TEXT;
-      field.header.flags = FieldType::INDEX_DOCS_FREQS;
+      field.header.flags = FieldType::INDEX_DOCS_FREQS | (norms.empty() ? FieldType::OMIT_NORMS : 0);
       DocStream normDocs(writer.pool);
       Stream normBytes;
       NormsWriter::PreparedNorms prepared;

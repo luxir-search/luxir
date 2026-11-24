@@ -105,45 +105,61 @@ public:
 
 } LUXIR_UNALIGNED_END;
 
+// Docs and term freqs for one term of a positionless text field. Mirrors
+// DocFreqPosStream's doc coding and canonicalizes repeated occurrences at one
+// position the same way, so a field's freqs do not depend on its index level.
 LUXIR_UNALIGNED_START
-class DocFreqStream {
-
-public:
-
-
+class alignas(1) DocFreqStream {
   Stream docs;
   int lastDoc;
-  int docFreq;
-  int lastDocCode;
+  int lastDocDelta;
   int termFreq;
+  int lastPos;
 
-  explicit DocFreqStream(int docid) : lastDoc(docid), docFreq(1), lastDocCode(docid << 1), termFreq(1) {
+public:
+  DocFreqStream(MemPool &pool, int docid, int pos) : lastDoc(docid), lastDocDelta(docid), termFreq(1),
+                                                     lastPos(pos) {
+    unused(pool);
   }
 
   DocFreqStream(const DocFreqStream &) = delete;
-
   DocFreqStream(DocFreqStream &&) = delete;
 
-
-  void addDoc(MemPool &pool, int docid) {
+  void addDoc(MemPool &pool, int docid, int pos) {
     int delta = docid - lastDoc;
     if (delta == 0) {
-      // same document
+      if (pos == lastPos) {
+        return;
+      }
+      if (pos < lastPos) {
+        throw std::runtime_error("Term positions must be strictly increasing within a document");
+      }
       ++termFreq;
     } else {
-      // new document... first write doc+freq for prev document
-      int code = termFreq != 1 ? lastDocCode : (lastDocCode | 0x01);
+      int code = termFreq == 1 ? (lastDocDelta<<1)|0x01 : lastDocDelta<<1;
       docs.writeVInt(pool, code);
       if (termFreq != 1) {
         docs.writeVInt(pool, termFreq);
       }
-
-      // now handle stuff for new doc
       termFreq = 1;
-      lastDocCode = delta << 1;
       lastDoc = docid;
-      ++docFreq;
+      lastDocDelta = delta;
     }
+    lastPos = pos;
+  }
+
+  /// Calls sink.addDoc(docid, tf) for each doc.
+  template <class PostingsConsumer>
+  void pushDocs(MemPool& pool, PostingsConsumer& sink) {
+    StreamReader dstream(docs, pool);
+    int docid = 0;
+    while (!dstream.eof()) {
+      uint32_t docCode = (uint32_t) dstream.readVint();
+      docid += (int) (docCode >> 1);
+      int tf = (docCode & 0x01) != 0 ? 1 : dstream.readVint();
+      sink.addDoc(docid, tf);
+    }
+    sink.addDoc(lastDoc, termFreq);
   }
 }
   LUXIR_UNALIGNED_END;

@@ -427,6 +427,8 @@ publication advances the schema generation.
 | `analyzer` | `text` only: `{"char_filters": [...], "tokenizer": <component>, "filters": [...]}`, or the name of a registered analyzer such as `"english"`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
+| `index_options` | `text` only: `positions` (default), `freqs`, or `docs`, what the postings record per term; see [Postings detail and norms](#postings-detail-and-norms) |
+| `norms` | `text` only: keep per-document length norms for scoring; default `true`, always off at `docs`; see [Postings detail and norms](#postings-detail-and-norms) |
 | `unit` | `date` only: `ms` (default) or `ns`. Inherits from the parent and is part of the field signature. An existing date definition cannot change its resolved unit. |
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
@@ -757,6 +759,71 @@ does not have is rejected on write; a collection already holding such a schema
 fails to load with that message while the node keeps serving its other
 collections.
 
+## Postings detail and norms
+
+`index_options` chooses what a `text` field records for each term:
+
+| Value | Records | Phrase queries | Term scoring |
+|---|---|---|---|
+| `positions` (default) | documents, term frequencies, positions | yes | BM25 |
+| `freqs` | documents, term frequencies | verified against the stored source | BM25 |
+| `docs` | documents only | verified against the stored source | every match counts one occurrence; no norms |
+
+`norms: false` drops the per-document length norm. BM25 then scores every
+document as if it had the average field length, so a short and a long value
+with the same term frequency score alike. Norms need term frequencies: `docs`
+never keeps them and rejects `norms: true`.
+
+Term, match, prefix, wildcard, regex, fuzzy, and exists queries work at every
+level. Positions are usually the largest part of a text field's postings, so
+dropping them saves the most space and indexing time.
+
+A phrase on a field whose definition lacks positions is verified against the
+logical field's stored source (`stored`, on by default for `text`), as
+Elasticsearch's `match_only_text` does. Documents containing every phrase term
+are the candidates. Each candidate that passes the query's other clauses has
+its stored value(s) re-analyzed with the field's analyzer and must contain the
+phrase under the same slop and multi-valued position gap rules as an indexed
+phrase. This applies to `phrase` queries and to phrases written in `expr` and
+`simple_query` strings. A verified phrase scores like the conjunction of its
+terms: matches are not ranked by phrase frequency. Verification reads and
+re-analyzes each candidate, so it costs far more per document than an indexed
+phrase; put selective filters beside it. Segments that have no stored source
+for the field match nothing. Without a stored source, a phrase on the field
+fails with an error.
+
+### Choosing a level
+
+- **Text that never gets phrase or proximity queries:** set
+  `index_options: "freqs"`. It drops positions, usually the largest part of a
+  text field's index, and keeps BM25 scoring unchanged: term frequencies and
+  length norms stay, so term and match scores are identical to `positions`.
+- **Text that is matched but not ranked** (log messages, labels, tags kept as
+  text): use the match-only recipe, which also drops term frequencies and
+  norms.
+
+```json
+{"fields": {
+  "description": {"type": "text", "index_options": "freqs"},
+  "message": {"type": "text", "index_options": "docs", "norms": false}
+}}
+```
+
+Measured on 2000 synthetic documents with one unstored text field, merged to
+one segment (whole-segment bytes, `IndexOptionsTest.lowerIndexOptionsAreSmaller`):
+
+| Corpus | `positions` | `freqs` | `docs`, `norms: false` |
+|---|---|---|---|
+| short log lines (about 10 tokens) | 87,432 | 73,114 (-16%) | 50,798 (-42%) |
+| 30-word lines from a 20-word vocabulary | 66,564 | 33,701 (-49%) | 24,847 (-63%) |
+
+Positions cost more the longer the field and the more often a term repeats
+within a document. Both corpora are synthetic, so check the effect on your own
+data.
+
+See [Changes to a live collection](#changes-to-a-live-collection) for what
+happens to existing segments when these settings change.
+
 ## Field variants
 
 A document supplies one value per logical field, and the schema can index that
@@ -1059,11 +1126,13 @@ GET /collections/authors/_schema?view=resolved
           "column": false,
           "coverage_complete": false,
           "index": "match",
+          "index_options": "positions",
           "introduced_generation": 1,
           "long_terms": "hash128",
           "multi": false,
           "name": "inherited",
           "normalizer": null,
+          "norms": true,
           "oldest_generation": 0,
           "stored": true,
           "stored_resource": "_stored_",
@@ -1108,6 +1177,19 @@ Reindex from your source data, then select the new variant explicitly or set
 pinned, retain it in the `defaults` object and omit only the other. Older
 documents without a new `author__s` variant will not match its exact queries
 or appear in its facet buckets.
+
+Changing `index_options` or `norms` applies to newly indexed documents; older
+segments are queried as written. While the definition has positions, a
+phrase finds no matches in segments written without them; once it drops
+positions, every segment is verified against the stored source. Segments
+without norms score without length normalization. Segments written at `docs`
+count each match as one occurrence in the field's length statistics, which
+lowers the average length that segments with norms are scored against until
+those segments merge into the new level. A merge keeps a level or norms only
+when the current definition and every merged segment have them. Lowering a
+setting therefore shrinks older segments as they merge, while raising one
+reaches merged segments only once every merged segment already has it:
+reindex older documents to upgrade them.
 
 Schema edits are not checked for compatibility with existing data. To change
 a field's type or analysis, use a new field or variant label and reindex.
