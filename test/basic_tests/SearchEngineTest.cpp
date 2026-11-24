@@ -8441,7 +8441,7 @@ TEST_F(SearchEngineTest, scalarFactsKeepTheExistingKnownCountRankingFormation) {
 // pass on another row's or another mode's spawns.
 TEST_F(SearchEngineTest, maxParallelNeverChangesResults) {
   CollectionHelper helper("max_parallel");
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  helper.getIndexWriter()->setMergeFactor(100);
   SchemaBuilder schema;
   auto& vector = schema.field("v_v");
   vector.type = api::FieldDef::FieldClass::VECTOR;

@@ -54,7 +54,7 @@ protected:
     node = std::make_unique<LuxirNode>(config);
     helper = std::make_unique<CollectionHelper>(*node, "share");
     writer = helper->getIndexWriter();
-    writer->mergePolicy->setMergeFactor(100);
+    writer->setMergeFactor(100);
   }
 
   void TearDown() override {
@@ -323,7 +323,7 @@ TEST_F(SegmentSharingTest, newIncarnationSharesNothing) {
   writer.reset();
   helper = std::make_unique<CollectionHelper>(*node, "share");
   writer = helper->getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   nextId = 0;
   addSegment(900);
   auto snapshot = writer->snapshots.snapshot();

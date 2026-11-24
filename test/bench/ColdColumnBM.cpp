@@ -84,7 +84,7 @@ ColdIndex& coldIndex(int32_t dims, int64_t nDocs, int32_t nSegs, bool deletes) {
   slot->node = std::make_unique<LuxirNode>(config);
   slot->helper = std::make_unique<CollectionHelper>(*slot->node, "main");
   auto& h = *slot->helper;
-  h.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  h.getIndexWriter()->setMergeFactor(1000);
 
   SchemaBuilder b;
   auto& f = b.templ("_v");

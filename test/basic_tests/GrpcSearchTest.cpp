@@ -157,7 +157,7 @@ TEST_F(GrpcSearchTest, adaptiveZeroMatchesSerialAfterBackpressure) {
   FanoutGrainGuard grain(1);
   LuxirTest::clearCollection("grpc_bp");
   CollectionHelper ch("grpc_bp");
-  ch.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  ch.getIndexWriter()->setMergeFactor(100);
   std::string pad(400, 'x');
   for (int seg = 0; seg < 5; seg++) {
     std::vector<Doc> docs;

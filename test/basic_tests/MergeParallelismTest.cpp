@@ -65,7 +65,7 @@ void sortById(std::vector<Doc>& docs) {
 void buildMergedIndex(CollectionHelper& helper) {
   helper.clear();
   auto iw = helper.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(1000);
+  iw->setMergeFactor(1000);
   auto docs = mergeCorpus();
   for (const auto& doc : docs) {
     auto result = helper.index(doc, UpdateMessage::COMMIT, true);
@@ -171,7 +171,7 @@ TEST(MergeParallelismTest, SmallNestedMergeUsesOneDataFile) {
 TEST(MergeParallelismTest, RowMapsShareOneReservationUntilMergerDestruction) {
   for (bool nested : {false, true}) {
     CollectionHelper helper(nested ? "maps_nested" : "maps_root");
-    helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+    helper.getIndexWriter()->setMergeFactor(1000);
     CollectionHelper::UpdateBuilder input;
     for (auto id : {"a", "b", "c"}) {
       std::string json = "{\"id\":\"" + std::string(id) + "\"";

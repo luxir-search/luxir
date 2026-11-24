@@ -243,7 +243,7 @@ void holdDeletePasses(LuxirNode& node) { node.getIndexRamBudget().setTotalBytes(
 // Any finite budget runs passes. This one sits far above what these tests
 // reserve (nothing, when they call this), so no release is a pressure event.
 void enableDeletePasses(LuxirNode& node, IndexWriter& writer) {
-  writer.mergePolicy->setMergeFactor(1000);
+  writer.setMergeFactor(1000);
   writer.perInverterRamBytes = 1;
   node.getIndexRamBudget().setTotalBytes(1 << 30);
 }
@@ -253,7 +253,7 @@ void enableDeletePasses(LuxirNode& node, IndexWriter& writer) {
 
 TEST_F(IndexWriterTest, mergeFactorComesFromNodeConfig) {
   EXPECT_EQ(LuxirConfig{}.index.merge_factor,
-            IndexWriter::MergePolicy::DEFAULT_MERGE_FACTOR);
+            TieredMergePolicy::DEFAULT_MERGE_FACTOR);
 
   LuxirConfig config;
   CLI::App app;
@@ -263,8 +263,8 @@ TEST_F(IndexWriterTest, mergeFactorComesFromNodeConfig) {
 
   LuxirNode node(config);
   luxir::test::CollectionHelper main(node);
-  EXPECT_EQ(main.getIndexWriter()->mergePolicy->mergeFactor, 1000);
-  EXPECT_EQ(node.getOrCreateCollection("other")->getShard()->getIndexWriter()->mergePolicy->mergeFactor,
+  EXPECT_EQ(main.getIndexWriter()->mergeFactor, 1000);
+  EXPECT_EQ(node.getOrCreateCollection("other")->getShard()->getIndexWriter()->mergeFactor,
             1000);
 
   LuxirConfig invalidConfig;
@@ -335,7 +335,7 @@ TEST_F(IndexWriterTest, firstCommitAfterReloadCompletes) {
   {
     CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(*dir));
     IndexWriter writer(writerSnapshots);
-    writer.mergePolicy->setMergeFactor(2);
+    writer.setMergeFactor(2);
 
     // Models a later update that auto-flushed while an earlier commit was in
     // flight. Merge it first to ensure the merged segment preserves the source
@@ -679,8 +679,7 @@ TEST_F(IndexWriterTest, autoMerge) {
     CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
     IndexWriter iw(iwSnapshots);
     int MERGE_FACTOR = 3;
-    iw.mergePolicy->setMergeFactor(MERGE_FACTOR);
-    iw.mergePolicy->refresh();  // should be a no-op at this point since no existing segs.
+    iw.setMergeFactor(MERGE_FACTOR);
 
     // add  segments
     for (int i = 0; i < MERGE_FACTOR - 1; i++) {
@@ -854,8 +853,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
   CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots);
   int MERGE_FACTOR = 3;
-  iw.mergePolicy->setMergeFactor(MERGE_FACTOR);
-  iw.mergePolicy->refresh();  // should be a no-op at this point since no existing segs.
+  iw.setMergeFactor(MERGE_FACTOR);
 
   std::atomic_long docsRequested(0);
   std::atomic_long docsAdded(0);
@@ -1450,7 +1448,7 @@ TEST_F(IndexWriterTest, requestBirthsMergeDeletedRuns) {
   LuxirNode node;
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(1000);
+  iw->setMergeFactor(1000);
   auto first = helper.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT, false);
   ASSERT_TRUE(first.success);
   ASSERT_TRUE(helper.deleteById("a").success);
@@ -1472,7 +1470,7 @@ TEST_F(IndexWriterTest, requestBirthsMergeDeletedRuns) {
 TEST_F(IndexWriterTest, requestBirthMergeMixedBlocks) {
   using namespace luxir::test;
   CollectionHelper helper;
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  helper.getIndexWriter()->setMergeFactor(1000);
   std::vector<uint64_t> births;
   for (int mode = 0; mode < 3; mode++) {
     for (uint32_t i = 0; i < VersionRuns::BLOCK_SIZE + 3; i++) {
@@ -1833,7 +1831,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
   CollectionHelper helper("main");
 
   auto indexWriter = helper.getIndexWriter();
-  indexWriter->mergePolicy->setMergeFactor(3);  // low merge factor to stress merge concurrency with other operations
+  indexWriter->setMergeFactor(3);  // low merge factor to stress merge concurrency with other operations
 
   std::atomic<int> injectedDocFailures{0};
   std::atomic<int> forceMergesRequested{0};
@@ -2148,7 +2146,7 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
   CollectionHelper helper("main");
   
   auto indexWriter = helper.getIndexWriter();
-  indexWriter->mergePolicy->setMergeFactor(3);
+  indexWriter->setMergeFactor(3);
   
   // Create first segment with doc1
   Doc doc1 = flatdoc("id", "doc1", "text_w", "hello world");
@@ -2247,7 +2245,7 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
   CollectionHelper helper("main");
 
   auto indexWriter = helper.getIndexWriter();
-  indexWriter->mergePolicy->setMergeFactor(numSegs);
+  indexWriter->setMergeFactor(numSegs);
 
   // Track which documents we're deleting for verification later
   std::set<std::string> deletedIds;
@@ -2526,7 +2524,7 @@ TEST_F(IndexWriterTest, idRangeClipsDeleteSelection) {
     SCOPED_TRACE(wideEnvelope);
     test::CollectionHelper helper;
     auto iw = helper.getIndexWriter();
-    iw->mergePolicy->setMergeFactor(100);
+    iw->setMergeFactor(100);
     ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "a"), test::flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
     auto* disjoint = iw->segInfos.begin()->second.get();
     ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "x"), test::flatdoc("id", "y")}, UpdateMessage::COMMIT).success);
@@ -2565,7 +2563,7 @@ TEST_F(IndexWriterTest, idRangeTracksMergeAndReopen) {
   LuxirNode node;
   test::CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(100);
+  iw->setMergeFactor(100);
   ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "a"), test::flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "y"), test::flatdoc("id", "z")}, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(helper.deleteByIds({"a", "z"}, UpdateMessage::COMMIT).success);
@@ -2615,7 +2613,7 @@ TEST_F(IndexWriterTest, overwriteSurvivesCommitAheadOfOlderUpdate) {
   LuxirNode node;
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(1000);
+  iw->setMergeFactor(1000);
   ASSERT_TRUE(helper.index(flatdoc("id", "seed")).success);
 
   TimedCommitMessage earlyCommit;
@@ -2708,7 +2706,7 @@ TEST_F(IndexWriterTest, publicationSnapshotsDeletesAndRetainsUnflushedPrefix) {
   LuxirNode node;
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(1000);
+  iw->setMergeFactor(1000);
   ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT, true).success);
 
   auto& older = iw->obtainInverter(2);
@@ -2771,7 +2769,7 @@ TEST_F(IndexWriterTest, liveDocsCreationFailureRetainsDeletesForRetry) {
   LuxirNode node(config);
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(1000);
+  iw->setMergeFactor(1000);
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup"), flatdoc("id", "keep")},
                              UpdateMessage::COMMIT, true).success);
   iw->updateGraph->wait_for_all();
@@ -2804,7 +2802,7 @@ TEST_F(IndexWriterTest, liveDocsCreationFailureAbortsFlush) {
   LuxirNode node(config);
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(1000);
+  iw->setMergeFactor(1000);
   ASSERT_TRUE(helper.index(flatdoc("id", "keep"), UpdateMessage::COMMIT, true).success);
   iw->updateGraph->wait_for_all();
   int64_t reserved = node.getIndexRamBudget().reservedBytes();
@@ -3119,7 +3117,7 @@ TEST_F(IndexWriterTest, testCoreGen) {
   }
 
   // Merge segments - this should increment coreGen
-  iw->mergePolicy->mergeFactor = 2; // Force merge
+  iw->setMergeFactor(2); // Force merge
   iw->mergeSegments();
 
   // Add a doc to trigger commit after merge
@@ -3401,7 +3399,7 @@ TEST_F(IndexWriterTest, filesystemCommitsSyncSegmentDataAndDeletes) {
   LuxirNode node(config);
   test::CollectionHelper helper(node, "main");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   Signal::listen("publishWritten", [&](void* source, void*, void*) -> void* {
     if (source == &writer->dir.underlying()) {
       auto manifest = test::readDurableIndexInfo(writer->dir);
@@ -3774,7 +3772,7 @@ void lateApplicationAcrossTwoMerges(bool carryWhileMerging) {
   LuxirNode node;
   test::CollectionHelper helper(node, "main");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(1000);
+  writer->setMergeFactor(1000);
   ASSERT_TRUE(helper.index(test::flatdoc("id", "a"), UpdateMessage::COMMIT).success);
   auto* source = writer->segInfos.begin()->second.get();
   auto sourceId = source->segId;
@@ -3783,8 +3781,7 @@ void lateApplicationAcrossTwoMerges(bool carryWhileMerging) {
                               UpdateMessage::COMMIT).success);
   // The forced merge takes the two smallest segments; its output then chains
   // into a policy merge with the untouched two-document segment.
-  writer->mergePolicy->setMergeFactor(2);
-  writer->mergePolicy->refresh();
+  writer->setMergeFactor(2);
   std::latch diff(1), releaseMerge(1), application(1), releaseApplication(1);
   std::latch secondStarted(1), releaseSecond(1), secondSwapped(1), releaseOutputApplication(1);
   uint64_t firstOutput = 0, secondOutput = 0;
@@ -3882,7 +3879,7 @@ TEST_F(IndexWriterTest, lateApplicationCarriesOntoMergingOutput) {
 TEST_F(IndexWriterTest, mergeRetriesLiveDocsDiffBeforeSwap) {
   test::CollectionHelper helper("merge_diff_retry");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   for (auto ids : {std::vector<std::string>{"a", "b"}, std::vector<std::string>{"keep"}}) {
     test::CollectionHelper::UpdateBuilder input;
     for (const auto& id : ids) {
@@ -3972,7 +3969,7 @@ TEST_F(IndexWriterTest, automaticMergePublishesDuringClose) {
   RAMDir dir;
   CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
-  writer.mergePolicy->setMergeFactor(2);
+  writer.setMergeFactor(2);
   addDoc(writer);
   writer.commit();
   std::latch started(1), release(1);
@@ -4134,56 +4131,43 @@ TEST_F(IndexWriterTest, shadowFrontierWaitsForCompletedHandlers) {
 }
 
 TEST_F(IndexWriterTest, mergeLevelsBreakAtExactPowersOfMergeFactor) {
-  RAMDir dir;
-  CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
-  IndexWriter writer(writerSnapshots);
-  auto& policy = *writer.mergePolicy;
   for (int32_t factor = 2; factor <= 32; factor++) {
-    policy.setMergeFactor(factor);
-    EXPECT_EQ(0, policy._mergeLevelForRows(0));
+    TieredMergePolicy policy(factor);
+    EXPECT_EQ(0, policy.levelForRows(0));
     int32_t level = 0;
     for (int64_t bound = factor; bound <= INT32_MAX; bound *= factor) {
       level++;
-      EXPECT_EQ(level - 1, policy._mergeLevelForRows((int32_t)bound - 1)) << "factor=" << factor;
-      EXPECT_EQ(level, policy._mergeLevelForRows((int32_t)bound)) << "factor=" << factor;
+      EXPECT_EQ(level - 1, policy.levelForRows((int32_t)bound - 1)) << "factor=" << factor;
+      EXPECT_EQ(level, policy.levelForRows((int32_t)bound)) << "factor=" << factor;
     }
-    EXPECT_EQ(level, policy._mergeLevelForRows(INT32_MAX)) << "factor=" << factor;
+    EXPECT_EQ(level, policy.levelForRows(INT32_MAX)) << "factor=" << factor;
   }
-  policy.setMergeFactor(0);
-  EXPECT_EQ(2, policy.mergeFactor);
-  EXPECT_EQ(1, policy._mergeLevelForRows(2));
+  TieredMergePolicy floor(0);
+  EXPECT_EQ(2, floor.mergeFactor);
+  EXPECT_EQ(1, floor.levelForRows(2));
 }
 
 TEST_F(IndexWriterTest, rootLevelSequenceAndMergeSizeArithmetic) {
-  RAMDir dir;
-  CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
-  IndexWriter writer(snapshots);
-  auto& policy = *writer.mergePolicy;
-  policy.setMergeFactor(10);
+  TieredMergePolicy policy(10);
   const std::pair<int32_t, int32_t> sequence[] = {
       {0, 0}, {1, 0}, {9, 0}, {10, 1}, {99, 1}, {100, 2}, {999, 2}, {1000, 3}, {INT32_MAX, 9}};
   for (auto [rows, level] : sequence) {
     SegInfo segment(1, 1, rows);
-    policy._prepareUpdate(&segment);
-    policy._update(&segment);
-    EXPECT_EQ(level, segment.mergeLevel);
+    EXPECT_EQ(level, policy.level(MergeSegment{.maxDoc = segment.maxDoc, .rows = segment.mergeRows}));
     EXPECT_EQ(rows, segment.estimatedLiveMergeRows());
-    policy._remove(&segment);
   }
   SegInfo nested(1, 1, PostingsReader::MAX_SEGMENT_DOCS / 2);
   nested.mergeRows = PostingsReader::MAX_SEGMENT_DOCS;
   nested.liveDocs = nested.maxDoc - 1;
   EXPECT_EQ(PostingsReader::MAX_SEGMENT_DOCS - 3, nested.estimatedLiveMergeRows());
-  policy._update(&nested);
-  EXPECT_EQ(9, nested.mergeLevel);
-  policy._remove(&nested);
+  EXPECT_EQ(9, policy.level(MergeSegment{.maxDoc = nested.maxDoc, .rows = nested.mergeRows}));
 }
 
 TEST_F(IndexWriterTest, failedCommitDoesNotPinMergedAwaySegments) {
   RAMDir dir;
   CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
-  writer.mergePolicy->setMergeFactor(2);
+  writer.setMergeFactor(2);
   addDoc(writer);
   Signal::listen("commitDataSync", [](void*, void*, void*) -> void* {
     throw std::runtime_error("injected I/O failure");
@@ -4597,7 +4581,7 @@ TEST_F(IndexWriterTest, deletePassRetiresDuringMergeAndCarriesRetiredVersion) {
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup"), flatdoc("id", "a"),
       flatdoc("id", "b"), flatdoc("id", "c"), flatdoc("id", "keep")}, UpdateMessage::COMMIT, true).success);
   holdDeletePasses(node);
-  iw->mergePolicy->setMergeFactor(1000);
+  iw->setMergeFactor(1000);
   iw->perInverterRamBytes = 1;
   ASSERT_TRUE(helper.deleteById("a").success);
   iw->updateGraph->wait_for_all();
@@ -4614,8 +4598,12 @@ TEST_F(IndexWriterTest, deletePassRetiresDuringMergeAndCarriesRetiredVersion) {
     Signal::unlisten("mergeStart"); Signal::unlisten("commitWaitingForMerges"); Signal::unlisten("manifestDurable");
   });
   Signal::listen("mergeStart", [&](void*, void*, void*) -> void* { started.count_down(); release.wait(); return nullptr; });
-  iw->mergePolicy->setMergeFactor(2);
-  trigger = std::async(std::launch::async, [&] { return helper.index(flatdoc("id", "d"), UpdateMessage::NO_COMMIT, true); });
+  // Four documents put the trigger segment at the six-document source's level (factor 2).
+  iw->setMergeFactor(2);
+  trigger = std::async(std::launch::async, [&] {
+    return helper.indexAll({flatdoc("id", "d0"), flatdoc("id", "d1"), flatdoc("id", "d2"), flatdoc("id", "d3")},
+                           UpdateMessage::NO_COMMIT, true);
+  });
   ASSERT_TRUE(eventually([&] { return started.try_wait(); }));
   Signal::listen("commitWaitingForMerges", [&](void*, void*, void*) -> void* { waiting.count_down(); return nullptr; });
   oldCommit.waitForMerges = true;
@@ -4641,7 +4629,7 @@ TEST_F(IndexWriterTest, deletePassRetiresDuringMergeAndCarriesRetiredVersion) {
   EXPECT_TRUE(oldCommit.waitFor(std::chrono::seconds(10)));
   EXPECT_TRUE(trigger.get().success);
   iw->updateGraph->wait_for_all();
-  EXPECT_EQ(3, iw->snapshots.readers.getReader()->liveDocs());
+  EXPECT_EQ(6, iw->snapshots.readers.getReader()->liveDocs());
   EXPECT_EQ(nullptr, iw->dir.openFile(captured));
   Signal::unlisten("manifestDurable");
   iw->close();
@@ -4823,7 +4811,7 @@ TEST_F(IndexWriterTest, deleteFactReachesMergedDuplicatePostings) {
   LuxirNode node;
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(1000);
+  iw->setMergeFactor(1000);
   // An inverter keeps one document per id, so each duplicate gets its own segment.
   ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT).success);
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "keep")}, UpdateMessage::COMMIT).success);
@@ -4961,7 +4949,7 @@ TEST_F(IndexWriterTest, idTypeSurvivesMergeAndReopen) {
   LuxirNode node;
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(1000);
+  iw->setMergeFactor(1000);
   ASSERT_TRUE(helper.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
   ASSERT_TRUE(helper.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
   auto check = [](IndexReader& reader, size_t segments) {

@@ -96,7 +96,7 @@ TEST_F(MultiValuedNumericTest, layoutFollowsValuesThroughMerges) {
   using Multi = api::FieldDef::MultiMode;
   CollectionHelper helper;
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   SchemaBuilder schema;
   auto& singleton = schema.field("n_is");
   singleton.type = api::FieldDef::FieldClass::INT;

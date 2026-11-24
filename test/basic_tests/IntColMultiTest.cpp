@@ -108,7 +108,7 @@ TEST_F(IntColMultiTest, mergeSingleAfterMultiWithDeletes) {
   using FieldDef = api::FieldDef;
   CollectionHelper helper;
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   for (bool multi : {true, false}) {
     SchemaBuilder schema;
     auto& number = schema.field("number");

@@ -151,7 +151,7 @@ TEST_P(IdFilterKindTest, everyIdIsMaybePresentAfterFlushAndMerge) {
   LuxirNode node;
   CollectionHelper helper(node);
   helper.getIndexWriter()->idFilterOptions = options;
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  helper.getIndexWriter()->setMergeFactor(1000);
   for (int segment = 0; segment < 3; segment++) {
     ASSERT_TRUE(helper.indexAll(docs(segment * 200, 200), UpdateMessage::COMMIT).success);
   }
@@ -174,7 +174,7 @@ TEST_P(IdFilterKindTest, partitionedMergeFeedsTheIdFilter) {
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
   iw->idFilterOptions = options;
-  iw->mergePolicy->setMergeFactor(1000);
+  iw->setMergeFactor(1000);
   // Text fields split into parallel term ranges; the id dictionary stays one writer.
   iw->termPartitionMinBytes = 1;
   iw->termPartitionMinRangeBytes = 1;
@@ -196,7 +196,7 @@ TEST_P(IdFilterKindTest, deletesLookUpOnlyCandidateSegments) {
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
   iw->idFilterOptions = options;
-  iw->mergePolicy->setMergeFactor(1000);
+  iw->setMergeFactor(1000);
   // Interleaved ids give every segment the same id range, so only the filter can skip.
   constexpr int segments = 8;
   for (int segment = 0; segment < segments; segment++) {
