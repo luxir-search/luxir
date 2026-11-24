@@ -243,20 +243,69 @@ TEST_F(VectorBitTest, storedDimsPackIntoBytes) {
   EXPECT_EQ(Vec(24, 1.0f), retrieved("free_v")["even"]);
 }
 
-// A declared field cannot change between bit and the other encodings, in
-// either direction.
-TEST_F(VectorBitTest, schemaChangeAcrossBitRejected) {
+TEST_F(VectorBitTest, emptyDeclaredFieldCanChangeAcrossBit) {
   CollectionHelper h("main");
   installField(h.collection(), "emb", api::VectorMetric::COSINE, 16);
-  EXPECT_THROW(installField(h.collection(), "emb", api::VectorMetric::HAMMING, 16), SchemaError);
+  installField(h.collection(), "emb", api::VectorMetric::HAMMING, 16);
   installField(h.collection(), "emb", api::VectorMetric::COSINE, 16, api::VectorEncoding::SQ8);
-  installField(h.collection(), "bits", api::VectorMetric::HAMMING, 16);
-  EXPECT_THROW(installField(h.collection(), "bits", api::VectorMetric::NONE, 16, api::VectorEncoding::F16), SchemaError);
 }
 
-// A field removed and declared again as bit over f32 segments: a merge never
-// converts across the boundary.  f32 inputs keep their encoding (the dims of
-// 12 would not even pack into bytes), and each side can merge independently.
+TEST_F(VectorBitTest, committedDeclaredFieldCannotChangeAcrossBit) {
+  CollectionHelper h("main");
+  installField(h.collection(), "emb", api::VectorMetric::HAMMING, 16);
+  h.index(flatdoc("id", std::string("a"), "emb", signs(1)));
+  h.commit();
+  EXPECT_THROW(installField(h.collection(), "emb", api::VectorMetric::NONE, 16, api::VectorEncoding::F16), SchemaError);
+}
+
+TEST_F(VectorBitTest, committedTemplateInstanceCannotChangeAcrossBit) {
+  CollectionHelper h("main");
+  h.index(flatdoc("id", std::string("a"), "emb_v", signs(1)));
+  h.commit();
+  EXPECT_THROW(installField(h.collection(), "emb_v", api::VectorMetric::HAMMING, 16), SchemaError);
+  SchemaBuilder b;
+  auto& templ = b.templ("_v");
+  templ.type = api::FieldDef::FieldClass::VECTOR;
+  templ.metric = api::VectorMetric::HAMMING;
+  templ.dims = 16;
+  EXPECT_THROW(b.set(h.collection()), SchemaError);
+}
+
+TEST_F(VectorBitTest, committedTemplateVariantCannotChangeAcrossBit) {
+  CollectionHelper h("main");
+  SchemaBuilder b;
+  auto& templ = b.templ("_v");
+  templ.type = api::FieldDef::FieldClass::VECTOR;
+  templ.dims = 16;
+  auto& variant = b.variant(templ, "copy");
+  variant.type = api::FieldDef::FieldClass::VECTOR;
+  variant.dims = 16;
+  b.set(h.collection());
+  h.index(flatdoc("id", std::string("a"), "emb_v", signs(1)));
+  h.commit();
+  variant.metric = api::VectorMetric::HAMMING;
+  EXPECT_THROW(b.set(h.collection()), SchemaError);
+}
+
+TEST_F(VectorBitTest, removedFieldCannotBeRedeclaredAcrossBit) {
+  CollectionHelper h("main");
+  installField(h.collection(), "emb", api::VectorMetric::COSINE, 16);
+  h.index(flatdoc("id", std::string("a"), "emb", signs(1)));
+  h.commit();
+  h.collection().setSchema(Schema::createDefaultSchema());
+  EXPECT_THROW(installField(h.collection(), "emb", api::VectorMetric::HAMMING, 16), SchemaError);
+}
+
+TEST_F(VectorBitTest, removingFieldCannotExposeIncompatibleTemplate) {
+  CollectionHelper h("main");
+  installField(h.collection(), "emb_v", api::VectorMetric::HAMMING, 16);
+  h.index(flatdoc("id", std::string("a"), "emb_v", signs(1)));
+  h.commit();
+  EXPECT_THROW(h.collection().setSchema(Schema::createDefaultSchema()), SchemaError);
+}
+
+// Two batches pinned to old schemas retain f32 when published under hamming.
+// Their dims of 12 would not pack into bytes. Each side can merge independently.
 TEST_F(VectorBitTest, mergeNeverConvertsAcrossBit) {
   CollectionHelper h("main");
   installField(h.collection(), "emb", api::VectorMetric::COSINE, 12);
@@ -271,10 +320,12 @@ TEST_F(VectorBitTest, mergeNeverConvertsAcrossBit) {
       for (float& x : v) x *= inv;
       expected[id] = v;
     }
-    h.commit();
+    // The next batch uses a fresh inverter while the first goes to flush.
+    if (seg == 0) installField(h.collection(), "emb", api::VectorMetric::COSINE, 12);
   }
-  h.collection().setSchema(Schema::createDefaultSchema());
   installField(h.collection(), "emb", api::VectorMetric::HAMMING, 16);
+  h.commit();
+  ASSERT_EQ(std::vector(2, VectorEncoding::F32), segmentEncodings(h, "emb"));
   {
     ExpectLog kept("keeping the inputs' f32 encoding");
     ASSERT_TRUE(forceMerge(h).success);
@@ -318,8 +369,8 @@ TEST_F(VectorBitTest, mergeNeverConvertsAcrossBit) {
 TEST_F(VectorBitTest, mergePrefersMajorityWhenSmallestSegmentIsOnOldSide) {
   CollectionHelper h("main");
   h.index(flatdoc("id", std::string("f"), "emb_v", Vec(16, 0.25f)));
-  h.commit();
   installField(h.collection(), "emb_v", api::VectorMetric::HAMMING, 16);
+  h.commit();
   std::map<std::string, Vec> expected{{"f", Vec(16, 0.25f)}};
   for (int seg = 0; seg < 3; seg++) {
     for (int i = 0; i < 2; i++) {
@@ -334,4 +385,6 @@ TEST_F(VectorBitTest, mergePrefersMajorityWhenSmallestSegmentIsOnOldSide) {
   ASSERT_TRUE(forceMerge(h).success);
   EXPECT_EQ((std::vector{VectorEncoding::F32, VectorEncoding::BIT}), segmentEncodings(h, "emb_v"));
   EXPECT_EQ(expected, retrieved("emb_v"));
+  // Adding a vector definition scans segments and ignores the unchanged mixed field.
+  installField(h.collection(), "other_v", api::VectorMetric::HAMMING, 16);
 }

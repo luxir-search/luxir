@@ -708,19 +708,16 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
   auto schema = change(previous.get());
   if (!schema) throw std::invalid_argument("Schema change returned no schema");
   auto before = previous->signatures(true);
-  for (const auto& [name, signature] : schema->signatures(true)) {
+  auto after = schema->signatures(true);
+  bool scanVectorColumns = false;
+  for (const auto& [name, signature] : after) {
     auto old = before.find(name);
+    if (signature.vectorEncoding && (old == before.end() || !old->second.vectorEncoding
+        || !vcodec::convertible(*old->second.vectorEncoding, *signature.vectorEncoding))) {
+      scanVectorColumns = true;
+    }
     if (old == before.end()) continue;
     auto* type = schema->getFieldTypePtr(name);
-    // A merge never converts vectors between bit and the other encodings
-    // (see VectorTranscoder), so existing segments could never converge.
-    auto* oldVector = dynamic_cast<const VectorFieldType*>(previous->getFieldTypePtr(name));
-    auto* newVector = dynamic_cast<const VectorFieldType*>(type);
-    if (oldVector && newVector && !vcodec::convertible(oldVector->encoding(), newVector->encoding())) {
-      throw SchemaError(std::format(
-          "Cannot change encoding of existing vector field '{}' between {} and {}; reindex into a new field",
-          name, vcodec::name(oldVector->encoding()), vcodec::name(newVector->encoding())));
-    }
     auto oldUnit = old->second.properties.find("unit");
     auto newUnit = signature.properties.find("unit");
     if (oldUnit != old->second.properties.end() && newUnit != signature.properties.end()
@@ -739,10 +736,61 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
           name));
     }
   }
+  if (!scanVectorColumns) {
+    // Removing a vector definition can expose a different template.
+    scanVectorColumns = std::ranges::any_of(before, [&](const auto& entry) {
+      if (!entry.second.vectorEncoding) return false;
+      auto next = after.find(entry.first);
+      return next == after.end() || !next->second.vectorEncoding;
+    });
+  }
   std::pmr::monotonic_buffer_resource arena;
   api::IndexInfo info;
   if (!api::decode(info, api::copyToPaddedInput(*lastSnapshot.load()->bytes, arena), arena)) {
     throw std::runtime_error("Failed to decode published manifest");
+  }
+  if (scanVectorColumns) {
+    // Unpublished rows may retain their old encoding, and merge admission keeps the two sides apart.
+    std::vector<SegInfo*> published;
+    published.reserve(info.segments.size());
+    {
+      // publicationMutex keeps published segments alive even if a merge
+      // moves them to segmentsToDelete after we release indexMutex.
+      std::lock_guard indexLock(indexMutex);
+      for (const auto& segment : info.segments) {
+        if (auto it = segInfos.find(segment.seg_id); it != segInfos.end()) {
+          published.push_back(it->second.get());
+        } else {
+          auto retired = std::ranges::find_if(segmentsToDelete,
+              [&](const auto& seg) { return seg->segId == segment.seg_id; });
+          if (retired == segmentsToDelete.end()) throw std::logic_error("Published segment has no writer state");
+          published.push_back(retired->get());
+        }
+      }
+    }
+    for (auto* seg : published) {
+      auto core = acquireSegmentCore(*seg);
+      for (const auto& space : core->spaces()) {
+        auto& reader = *core->spaceReader(space.path);
+        for (int32_t ordinal = 0; ordinal < reader.numFields(); ++ordinal) {
+          auto header = reader.fieldHeader(ordinal);
+          if (FieldType::storage(header.type) != FieldType::Storage::VECTOR || header.numValues == 0) continue;
+          std::string_view name(header.name);
+          auto* type = dynamic_cast<const VectorFieldType*>(schema->getFieldTypePtr(name));
+          if (!type) continue;
+          const auto* record = reader.fieldInfo(ordinal);
+          if (!record->bytesColumn()) continue;
+          auto encoding = VectorReader::encodingOf(*record);
+          if (!vcodec::convertible(encoding, type->encoding())) {
+            auto* oldType = dynamic_cast<const VectorFieldType*>(previous->getFieldTypePtr(name));
+            if (oldType && !vcodec::convertible(encoding, oldType->encoding())) continue;
+            throw SchemaError(std::format(
+                "Cannot change encoding of existing vector field '{}' between {} and {}; reindex into a new field",
+                name, vcodec::name(encoding), vcodec::name(type->encoding())));
+          }
+        }
+      }
+    }
   }
   publish(info, arena, std::move(schema));
   auto published = lastSnapshot.load();
@@ -2114,21 +2162,26 @@ std::vector<std::string> collectValidatedExactVectorOverlayNames(
 
 } // namespace
 
+// Merge admission can acquire a core under indexMutex. The file inventory is
+// immutable, so this needs no writer lock and can also be used by schema checks.
+std::shared_ptr<SegmentCore> IndexWriter::acquireSegmentCore(const SegInfo& seg) {
+  if (auto core = seg.sharedSegmentCore.load()) return core;
+  std::shared_ptr<IndexReader> reader;
+  if (const auto* published = publishedSegment(seg, reader)) {
+    if (auto core = published->segmentCoreShared()) return core;
+  }
+  auto source = SegmentCore::source(seg.segId, seg.creatorEpoch, seg.catalog, seg.maxDoc, seg.baseFiles);
+  return SegmentCore::create(dir, seg.segId, seg.creatorEpoch, source);
+}
+
 // Benign load-then-store race: the commit thread and a merge thread can both
 // miss and each create a SegmentCore for a source segment - both are valid,
 // one is wasted, last store wins.  Deliberately NOT a lock or CAS; do not
-// "fix" this into synchronization. Merge admission calls this with indexMutex
-// held, so nothing here may take it: the base file inventory is immutable.
-//
+// "fix" this into synchronization.
 std::shared_ptr<SegmentCore> IndexWriter::getSegmentCore(SegInfo& seg) {
   auto core = seg.sharedSegmentCore.load();
   if (!core) {
-    std::shared_ptr<IndexReader> reader;
-    if (const auto* published = publishedSegment(seg, reader)) core = published->segmentCoreShared();
-    if (!core) {
-      auto source = SegmentCore::source(seg.segId, seg.creatorEpoch, seg.catalog, seg.maxDoc, seg.baseFiles);
-      core = SegmentCore::create(dir, seg.segId, seg.creatorEpoch, source);
-    }
+    core = acquireSegmentCore(seg);
     seg.sharedSegmentCore.store(core);
   }
   auto& pr = core->rootReader();
