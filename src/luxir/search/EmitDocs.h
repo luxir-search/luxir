@@ -54,6 +54,7 @@
 #include "luxir/util/geo.h"
 #include "luxir/util/Signal.h"
 #include "luxir/schema/FieldPattern.h"
+#include "luxir/schema/FieldTypeRegistry.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/util/thread.h"
 
@@ -879,7 +880,7 @@ struct ExtraColumn {
 struct MappedReturnFields;
 
 struct ReturnField {
-  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA, MAPPED };
+  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA, MAPPED, PROJECT };
 
   std::string_view outputKey;
   std::string_view physicalName;
@@ -910,6 +911,66 @@ void loadMappedFields(SearchResponse& response, const ReturnField& field,
 bool appendMappedSelector(SearchRequest& req, IndexReader& reader, std::string_view selector,
                           std::vector<ReturnField>& picked);
 
+// A PROJECT field in one batch: its derived columns load like any field's
+// (columns[i] for PluginFieldType::fields[i]; left empty for a field without
+// a readable column), and projectFields builds the values once they are in.
+struct ProjectedField {
+  const ReturnField* field;
+  luxir::api::Val* out;
+  std::vector<luxir::api::Column> columns;
+};
+
+// Starts the loads of a PROJECT field's derived columns into projected.columns.
+inline void loadProjectedColumns(SearchRequest& req, IndexReader& reader, ProjectedField& projected,
+                                 std::span<const segdoc> segDocs, SegmentRuns runs, FieldLoaders* loaders,
+                                 PendingCols& pendingCols, std::pmr::memory_resource& mr, uint64_t flags) {
+  const auto& fields = static_cast<CompositeFieldType&>(*projected.field->fieldType).impl().fields;
+  // Sized once: the loaders and pending columns point into these.
+  projected.columns.resize(fields.size());
+  if (segDocs.empty()) return;
+  for (size_t i = 0; i < fields.size(); i++) {
+    const auto& spec = fields[i];
+    bool ints = spec.kind == DerivedField::Kind::INT || spec.kind == DerivedField::Kind::DATE;
+    if (!spec.column || (!ints && spec.kind != DerivedField::Kind::STRING)) continue;
+    auto name = CompositeFieldType::derivedName(projected.field->physicalName, spec.suffix);
+    FieldType* type = req.schema->getFieldTypePtr(name);
+    if (type == nullptr || !type->hasColumn()) continue;
+    auto infos = reader.field(name);
+    if (ints) {
+      // DATE values stay epoch units.
+      loadNumCol<ColEmit<int64_t>>(req, reader, infos, *type, segDocs, runs, projected.columns[i], loaders, pendingCols, mr);
+    } else {
+      loadStrCol(req, reader, infos, *type, segDocs, runs, projected.columns[i], loaders, pendingCols, mr, flags);
+    }
+  }
+}
+
+// After finishPendingCols: the value of every row with some derived value.
+inline void projectFields(std::deque<ProjectedField>& projected, size_t numDocs, std::pmr::memory_resource& mr) {
+  using namespace luxir::api;
+  std::vector<Val> row;
+  for (auto& p : projected) {
+    const auto& type = static_cast<CompositeFieldType&>(*p.field->fieldType).impl();
+    row.assign(p.columns.size(), Val{});
+    for (size_t r = 0; r < numDocs; r++) {
+      bool any = false;
+      for (size_t i = 0; i < p.columns.size(); i++) {
+        auto& value = row[i];
+        value = Val{};
+        std::visit([&](const auto& c) {
+          using T = std::decay_t<decltype(c)>;
+          if constexpr (std::is_same_v<T, ColInt> || std::is_same_v<T, ColStr>) {
+            if (c.v[r] != c.missing_val) value.kind = c.v[r];
+          } else if constexpr (std::is_same_v<T, ArrArrInt> || std::is_same_v<T, ArrArrStr>) {
+            if (!c.v[r].v.empty()) value.kind = c.v[r];
+          }
+        }, p.columns[i].kind);
+        any |= !value.isNull();
+      }
+      if (any) type.project(DerivedValues{row, type.fields}, p.out[r], mr);
+    }
+  }
+}
 
 inline void resolveReturnFieldMetadata(IndexReader& reader, std::span<ReturnField> fields) {
   boost::unordered_flat_map<std::pair<IndexReader*, std::string_view>, IndexReader::FieldSegments> resources;
@@ -1159,6 +1220,8 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
   std::vector<StoredGroup> columnGroups;
   std::vector<RowIndex> fittedIdx;
   std::vector<std::span<RowIndex>> fittedRuns;
+  // PROJECT fields; the loaders write their columns.
+  std::deque<ProjectedField> projections;
   FieldLoaders loaders;
   auto* pendingLoaders = fanout.policy ? &loaders : nullptr;
 
@@ -1234,6 +1297,16 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
           loadMappedFields(response, rf, segDocs, rows, docListProto, flags, scopedMemory);
         });
         registerColumn();
+        continue;
+      }
+      case ReturnField::Kind::PROJECT: {
+        auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
+        auto& projected = projections.emplace_back(
+            ProjectedField{&rf, build::allocArray(column.v, columnSize, mr), {}});
+        loadProjectedColumns(req, sourceReader, projected, sourceDocs, runs, pendingLoaders, pendingCols, mr, flags);
+        // The derived columns' slot trackers are not this column's.
+        columnFields.push_back(&rf);
+        columnPresent.push_back(nullptr);
         continue;
       }
       case ReturnField::Kind::PHYSICAL:
@@ -1396,6 +1469,7 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
   // missing_val and fill its missing slots.  (ROWS mode relies on the
   // exact sentinels for its presence checks.)
   finishPendingCols(pendingCols);
+  projectFields(projections, (size_t)columnSize, mr);
   placeBatchColumns(placement, columnFields, columnPresent, docListProto.columns, rowColumns,
                     (size_t)columnSize, scoreRows, columnFate, rowCaps, mr);
 
@@ -1647,6 +1721,9 @@ inline void appendReturnFields(SearchRequest& req, IndexReader& reader,
   auto relative = [&](std::string_view name) {
     return reader.path().empty() ? name : name.substr(reader.path().size() + 1);
   };
+  auto kindOf = [](FieldType* type) {
+    return dynamic_cast<CompositeFieldType*>(type) ? ReturnField::Kind::PROJECT : ReturnField::Kind::PHYSICAL;
+  };
   auto pushDiscovered = [&](const IndexReader::RetrievableField& field) {
     auto output = relative(field.name);
     if (extraNames.contains(output)) {
@@ -1654,7 +1731,7 @@ inline void appendReturnFields(SearchRequest& req, IndexReader& reader,
                          + "' conflicts with a returned field; use an explicit field list to omit the physical field"
                            " or select the extra by name");
     }
-    picked.push_back({output, field.name, field.type, ReturnField::Kind::PHYSICAL, true});
+    picked.push_back({output, field.name, field.type, kindOf(field.type), true});
   };
   auto pushMapped = [&](std::string_view f) {
     if (!appendMappedSelector(req, reader, f, picked)) return false;
@@ -1688,6 +1765,15 @@ inline void appendReturnFields(SearchRequest& req, IndexReader& reader,
         pushMapped(f);
         return;
       }
+      const CompositeFieldType* owner = nullptr;
+      if (const auto* spec = req.schema->derivedField(source.physicalName, &owner); spec && spec->opaque) {
+        std::string root(f.substr(0, f.find(CompositeFieldType::SEPARATOR)));
+        throw RequestError("Field '" + std::string(f) + "' holds plugin type '" + owner->plugin->name +
+                           "''s internal encoding and is not retrievable; " +
+                           (owner->impl().projects() ? "retrieve '" + root + "' for its value"
+                                                     : std::string("query, sort or facet it instead")),
+                           "invalid_field");
+      }
       if (source.fieldType->type() == FieldType::TEXT && !source.fieldType->isStored()) {
         auto* primary = source.owner ? source.owner->primary.get() : source.fieldType;
         std::string message = "Field '" + std::string(f) + "' has no retrievable value";
@@ -1700,7 +1786,13 @@ inline void appendReturnFields(SearchRequest& req, IndexReader& reader,
         }
         throw RequestError(message, "invalid_field");
       }
-      auto kind = source.physicalName == "_version_" ? ReturnField::Kind::VERSION : ReturnField::Kind::PHYSICAL;
+      if (auto* composite = dynamic_cast<CompositeFieldType*>(source.fieldType);
+          composite && !composite->impl().projects()) {
+        throw RequestError("Field '" + std::string(f) + "' has plugin type '" + composite->plugin->name +
+                           "', which returns no value; retrieve its derived fields (" + std::string(f) +
+                           "$<suffix>) instead", "invalid_field");
+      }
+      auto kind = source.physicalName == "_version_" ? ReturnField::Kind::VERSION : kindOf(source.fieldType);
       picked.push_back({f, build::arenaStr(mr, source.physicalName), source.fieldType, kind, false});
     } catch (const RequestError&) {
       // A real leaf error is reported in its destination view, just as when

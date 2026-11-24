@@ -7,6 +7,7 @@
 #include "luxir/search/HitDecorator.h"
 #include "luxir/store/StorageRegistry.h"
 #include "luxir/query/QueryRegistry.h"
+#include "luxir/schema/FieldTypeRegistry.h"
 #include "luxir/search/SearchOpRegistry.h"
 #include "luxir/server/HttpRouteRegistry.h"
 
@@ -18,6 +19,8 @@ struct Registries {
   AnalysisRegistry& analysis;
   // Storage backends and layers.
   StorageRegistry& storage;
+  // Plugin field types: one authored field indexed into derived built-in fields.
+  FieldTypeRegistry& fieldTypes;
   // Plugin query types (api::PluginQuery).
   QueryRegistry& query;
   // Plugin search operations (api::PluginOp).
