@@ -470,10 +470,6 @@ public:
   // plans stay lazy: an unscored weight would materialize a multi-term union.
   bool estimateCount = false;
   QueryPrep::WholeMembershipPlan wholeMembershipPlan;
-  // The segments where the op's key query alone (the one the whole-membership
-  // cache is keyed by) may match, deletes ignored. `viable` also prunes by
-  // filters, fusion shared filters and segments without live documents; only
-  // a segment outside this mask may record an empty cached membership.
   QueryPrep::ExactDomainPlan exactDomainPlan;
   SortPlan sortPlan;
   // Every field-sort collector's primaryValues (see sortValueEnvelope).
@@ -529,7 +525,11 @@ public:
         });
   }
 
+  bool outputsEmpty(IndexReader::Segment& segment, DocSet* input,
+                    std::vector<std::string>* details) const;
+
   class CalcBase : public SearchOp::Calculator {
+    ExecutionProfileRun* pruningRun = nullptr;
 #ifndef NDEBUG
     bool prunedFanout = false;
 #endif
@@ -1730,47 +1730,9 @@ public:
       op.releaseSegmentState(segment);
     }
 
-    // A segment the op's root mask pruned contributes exactly an empty
-    // match: no supplier, scorer, filter or count is built for it, every
-    // child receives the empty domain, and the collector still counts the
-    // segment as visited. The whole-membership cache records the empty
-    // membership only where the key query itself is proven empty; a segment
-    // pruned by filters or fusion shared filters publishes nothing.
-    template <bool MetricGroups>
-    void collectPrunedSegment(FanoutScope* tg, int32_t segnum) {
-      auto& op = thisOp();
-      auto& seg = op.view->segments()[(size_t)segnum];
-      releaseSegmentState(seg);
-      DomainHandle empty = DomainHandle::empty().scoped(seg);
-      if (memberReplay) memberReplay->domains[(size_t)segnum] = empty;
-      if (!output.empty()) output[(size_t)segnum] = empty;
-      task_group_fanout(tg, subCalcs.size(), [&](size_t i) {
-        auto* subCalc = subCalcs[subCalcs.size() - 1 - i].get();
-        return [subCalc, tg, segnum, empty]() {
-          Signal::emit("searchTopDocsChildStart", subCalc);
-          subCalc->accept(tg, segnum, empty);
-        };
-      });
-      int64_t count;
-      if constexpr (MetricGroups) count = metricGroups->merger.release(metricGroups->merger.obtain());
-      else count = collectorMerger.release(collectorMerger.obtain());
-      if (count == (int64_t)op.view->segments().size()) doneCollecting<MetricGroups>();
-    }
-
     template <bool Structural, bool MetricGroups = false, typename Admission = CollapseAdmission>
     void doCollect(FanoutScope* tg, int32_t segnum,
                    DomainHandle domainHandle) {
-      if (thisOp().segmentPruned(segnum)) {
-        auto& op = thisOp();
-        auto& seg = op.view->segments()[(size_t)segnum];
-        Signal::emit("searchTopDocsSegmentPruned", this);
-        if (QueryPruning::crossCheck) op.crossCheckPruned(seg);
-        // Let ordinary count resolution publish the key query's own zero.
-        if (op.wholeMembershipPlan.empty() || !op.weight || !op.weight->provenEmpty(seg)) {
-          collectPrunedSegment<MetricGroups>(tg, segnum);
-          return;
-        }
-      }
       if constexpr (Admission::isDiversified) {
         doCollectPolicy<Structural, true, false, Admission>(tg, segnum, std::move(domainHandle));
       } else if constexpr (MetricGroups) {
@@ -1828,11 +1790,15 @@ public:
       DocSet* routedBaseDomain = nullptr;
       int64_t numSegs = (int64_t)op.view->segments().size();
 
-      {
-        auto& seg = op.planning.topReader.segments()[segnum];
+      auto& seg = op.planning.topReader.segments()[segnum];
+      std::optional<int64_t> countBefore;
+      bool skipped = false;
+      auto collectSegment = [&] {
         auto release = scope_guard([&]() noexcept { releaseSegmentState(seg); });
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        if (!op.domainVariants.empty()) {
+        std::vector<std::string> details;
+        skipped = op.outputsEmpty(seg, domain, op.req.proto.profile ? &details : nullptr);
+        if (!skipped && !op.domainVariants.empty()) {
           routedBaseDomain = domain;
           routedProduction.emplace(prepareRoutedProduction<Structural>(
               poolGuard.pool(), segnum, domainHandle));
@@ -1841,29 +1807,51 @@ public:
         }
 
         if constexpr (Collapsed) {
-          if (memberReplay) {
-            // Retain precisely the eligibility used by collection. Prepared
-            // sources (notably kNN) outlive this pass and are replayed as-is.
-            if (!requiresWholeIndexPrepare && op.domainVariants.empty()
-                && !op.filterWeights.empty()) {
-              std::vector<DomainHandle> parts{domainHandle};
-              for (size_t i = 0; i < op.filterWeights.size(); i++) {
-                parts.push_back(QueryPrep::materializeEffectiveFilter(
-                    *op.filterWeights[i], op.filterUses[i], *op.view, seg, nullptr));
-              }
-              domainHandle = memberReplay->compose(std::move(parts),
-                  op.domainVariants.estimatedSetBytes(seg.maxDoc()));
-              domain = domainHandle.get();
+          // Retain the eligibility collection uses for member replay.
+          if (memberReplay && !skipped && !requiresWholeIndexPrepare
+              && op.domainVariants.empty() && !op.filterWeights.empty()) {
+            std::vector<DomainHandle> parts{domainHandle};
+            for (size_t i = 0; i < op.filterWeights.size(); i++) {
+              parts.push_back(QueryPrep::materializeEffectiveFilter(
+                  *op.filterWeights[i], op.filterUses[i], *op.view, seg, nullptr));
             }
-            memberReplay->domains[(size_t)segnum] = domainHandle;
+            domainHandle = memberReplay->compose(std::move(parts),
+                op.domainVariants.estimatedSetBytes(seg.maxDoc()));
+            domain = domainHandle.get();
           }
         }
 
+        // Obtain as late as possible so concurrent segments can reuse a collector.
+        if constexpr (MetricGroups) data.reset(metricGroups->merger.obtain());
+        else data.reset(collectorMerger.obtain());
+        bool keyEmpty = skipped && op.weight && op.weight->provenEmpty(seg);
+        if constexpr (!Collapsed) {
+          if ((!skipped || keyEmpty) && !data->useFieldSort && op.requirements.countLimit < 0
+              && op.filterWeights.empty() && !requiresWholeIndexPrepare
+              && op.wholeMembershipPlan.canRecordCount(seg, domain)) {
+            countBefore = data->template scores<Collapsed, Admission>()->totalHits();
+          }
+        }
+        // An empty input or filter supplies no raw fact about the key. Keep
+        // the original domain pinned through the resolver's canonicality check.
+        if (keyEmpty && !op.wholeMembershipPlan.empty()) {
+          op.wholeMembershipPlan.resolve(*op.view, seg, domain, preparedWeight.get(),
+              [&](Query::Weight& resolver) { return resolver.scorerSupplier(poolGuard.pool(), seg); });
+        }
+        if (skipped) {
+          domainHandle = DomainHandle::empty().scoped(seg);
+          if (!output.empty()) output[(size_t)segnum] = domainHandle;
+        }
+        if (memberReplay) memberReplay->domains[(size_t)segnum] = domainHandle;
+        if (skipped) {
+          Signal::emit("searchTopDocsSegmentPruned", this);
+          if (op.req.proto.profile) op.req.recordPrunedSegment(pruningRun, seg, std::move(details));
+          return;
+        }
         std::optional<DocSetBuilder> builder;
         bool captureSharedRaw = routedProduction.has_value()
             && routedProduction->captureSharedRaw;
         if constexpr (MetricGroups) {
-          data.reset(metricGroups->merger.obtain());
           if (captureSharedRaw || !output.empty()) builder.emplace(seg.maxDoc());
           std::vector<DomainHandle> parts{domainHandle};
           if (!requiresWholeIndexPrepare && op.domainVariants.empty() && !memberReplay) {
@@ -1880,20 +1868,13 @@ public:
               captureSharedRaw ? DomainBuildMode::RAW_QUERY_MATCHES : DomainBuildMode::FILTERED_MATCHES,
               routedBaseDomain);
         } else {
-          // Wait until last moment to obtain collector in hopes of reusing an existing one.
-          // Keep ownership until release so a scoring error cannot orphan it.
-          data.reset(collectorMerger.obtain());
           auto* scoreCollector = data->template scores<Collapsed, Admission>();
           auto* fieldCollector = data->template fields<Collapsed, Admission>();
           using ActiveFieldCollector = FieldCollector<Collapsed, Admission>;
 
-          bool recordCount = !Collapsed && !data->useFieldSort
-              && op.requirements.countLimit < 0 && op.filterWeights.empty()
-              && !requiresWholeIndexPrepare && op.wholeMembershipPlan.canRecordCount(seg, domain);
-
           // A segment ranking never pruned has its exact count already. Track
           // pruning per segment, restoring the collector's own flag afterward.
-          int64_t hitsBeforeSegment = recordCount ? scoreCollector->totalHits() : 0;
+          int64_t hitsBeforeSegment = countBefore.value_or(0);
           bool prunedBeforeSegment = false;
           DocSet* estimateFilter = nullptr;
           bool estimatorReady = false;
@@ -2666,9 +2647,6 @@ public:
               }
             }
           }
-          if (recordCount) {
-            op.wholeMembershipPlan.recordCount(seg, scoreCollector->totalHits() - hitsBeforeSegment);
-          }
           if constexpr (!Collapsed) {
             if (op.estimateCount) {
               int64_t seen = scoreCollector->totalHits() - hitsBeforeSegment;
@@ -2702,6 +2680,11 @@ public:
             output[(size_t)segnum] = std::move(built);
           }
         }
+      };
+      collectSegment();
+      if constexpr (!Collapsed) {
+        if (countBefore) op.wholeMembershipPlan.recordCount(seg,
+            data->template scores<Collapsed, Admission>()->totalHits() - *countBefore);
       }
       auto childDomain = [&](size_t child) {
         DomainHandle newDomain;
@@ -2718,7 +2701,7 @@ public:
             newDomain = routedProduction->domains[variant];
           }
         } else {
-          newDomain = matchEverything ? domainHandle : output[(size_t)segnum];
+          newDomain = skipped || matchEverything ? domainHandle : output[(size_t)segnum];
         }
         assert(newDomain.isDeliverable());
         return newDomain;

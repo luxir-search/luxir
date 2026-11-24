@@ -223,6 +223,6 @@ TEST_F(QueryPruningUnit, booleanProofUsesItsValidationContext) {
 
   Query::PlanningContext planning(pool, *current);
   both.validateLogical(planning);
-  EXPECT_FALSE(pruning.collectionEmpty(both, execution.planningContext()));
-  EXPECT_TRUE(pruning.collectionEmpty(both, planning));
+  EXPECT_FALSE(pruning.membership(both, execution.planningContext()).none());
+  EXPECT_TRUE(pruning.membership(both, planning).none());
 }
