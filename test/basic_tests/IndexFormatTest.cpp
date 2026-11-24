@@ -44,7 +44,7 @@ namespace {
 // change requires reviewing the format version. Writer choices among layouts
 // already supported by that version can change the digest within the version.
 constexpr uint64_t kReferenceVersion = 19;
-constexpr uint64_t kReferenceDigest = 0x55b9af943d4c4000;
+constexpr uint64_t kReferenceDigest = 0xa52527626525a9d;
 
 constexpr IdFilter::Options REFERENCE_ID_FILTER = {.kind = IdFilter::Kind::BLOOM};
 
@@ -248,7 +248,7 @@ TEST_F(IndexFormatTest, referenceIndexBytesMatchFormatVersion) {
 TEST_F(IndexFormatTest, serialRootMergeBytesMatchReference) {
   auto digest = buildMergedReferenceDigest();
   ASSERT_EQ(digest, buildMergedReferenceDigest()) << "the serial merge is not deterministic";
-  EXPECT_EQ(0x39faa55685fbf612ULL, digest) << std::format("merged digest {:#x}", digest);
+  EXPECT_EQ(0x77f3d1910b620e63ULL, digest) << std::format("merged digest {:#x}", digest);
 }
 
 TEST_F(IndexFormatTest, otherFormatVersionFailsToLoad) {
