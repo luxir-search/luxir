@@ -123,6 +123,20 @@ class RescoreQuery final : public Query {
       return output;
     }
 
+    // The fused program's output for the current doc. False leaves the doc to
+    // evalPoint and convertResult, which own every error.
+    bool fusedOutput(float childScore, float& output) {
+      constexpr double MAX_FLOAT = (double)std::numeric_limits<float>::max();
+      double value;
+      if (!expression->fusedReady()
+          || !expression->evalFused(doc, childScore, value)
+          || value < -MAX_FLOAT || value > MAX_FLOAT) {
+        return false;
+      }
+      output = (float)value * multiplier;
+      return std::isfinite(output);
+    }
+
     ScoreBounds composeBounds(int32_t upTo, bool refined) {
       ScoreBounds childBounds = refined
           ? child->refineScoreBounds(upTo) : child->getScoreBounds(upTo);
@@ -227,7 +241,9 @@ class RescoreQuery final : public Query {
       uint32_t scoreBits = std::bit_cast<uint32_t>(childScore);
       if (!cacheValid || cachedDoc != doc
           || cachedChildScoreBits != scoreBits) {
-        cachedOutput = convertResult(expression->evalPoint(doc, childScore));
+        if (!fusedOutput(childScore, cachedOutput)) {
+          cachedOutput = convertResult(expression->evalPoint(doc, childScore));
+        }
         cachedDoc = doc;
         cachedChildScoreBits = scoreBits;
         cacheValid = true;
@@ -304,6 +320,9 @@ class RescoreQuery final : public Query {
               "segment; use def() in the expression or exists() in the "
               "child query");
         }
+        // The bulk decoder pays a whole frame per access, so it needs the
+        // child to visit a good share of the segment.
+        expression->prepareFused(targetPool, cost() * 8 >= (int64_t)segment->maxDoc());
         return targetPool.make<Scorer>(
             childScorer, expression, multiplier, needsChildScore, pruning);
       }
