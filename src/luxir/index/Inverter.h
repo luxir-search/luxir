@@ -258,6 +258,13 @@ public:
 
     virtual void flush(Inverter &inverter) = 0;
 
+    // Text handlers of a stored field record position checkpoints per
+    // document; the field's input handler stores them beside its value.
+    virtual void recordCheckpoints() {}
+    virtual void storeCheckpoints(Inverter& inverter, StoredFieldsWriter& writer) {
+      unused(inverter, writer);
+    }
+
     // Extra (non-pool) RAM accounting. A handler that holds memory outside the
     // inverter's pool tracks its current such size and calls accountExtraRam once
     // per index() with the new total; the delta since the last call is folded into

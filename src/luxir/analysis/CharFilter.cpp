@@ -33,6 +33,31 @@ void CharFilter::replace(size_t start, size_t end, std::string_view replacement)
   copied = end;
 }
 
+void CharFilter::consumed(size_t start, size_t end) {
+  if (end - start > 1) opaque.emplace_back(start, end);
+}
+
+bool CharFilter::resumesAt(size_t offset) const {
+  if (offset > input.size() || !scanPosition(offset)) return false;
+  // Both lists are in increasing input order and their spans do not overlap.
+  auto inside = [offset](size_t start, size_t end) { return start < offset && offset < end; };
+  auto edit = std::upper_bound(edits.begin(), edits.end(), offset,
+      [](size_t pos, const Edit& e) { return pos < e.inEnd; });
+  if (edit != edits.end() && inside(edit->inStart, edit->inEnd)) return false;
+  auto span = std::upper_bound(opaque.begin(), opaque.end(), offset,
+      [](size_t pos, const std::pair<size_t, size_t>& s) { return pos < s.second; });
+  return span == opaque.end() || !inside(span->first, span->second);
+}
+
+size_t CharFilter::outputOffset(size_t offset) const {
+  // The last edit ending at or before offset fixes the shift.
+  auto edit = std::upper_bound(edits.begin(), edits.end(), offset,
+      [](size_t pos, const Edit& e) { return pos < e.inEnd; });
+  if (edit == edits.begin()) return offset;
+  --edit;
+  return edit->outEnd + (offset - edit->inEnd);
+}
+
 std::span<char> CharFilter::bytewiseOutput() {
   buffer.resize(input.size());
   copied = input.size();
@@ -44,6 +69,7 @@ std::string_view CharFilter::apply(std::string_view value) {
   copied = 0;
   buffer.clear();
   edits.clear();
+  opaque.clear();
   cursors = {};
   filter();
   if (!copied) return input;
@@ -186,6 +212,9 @@ class MappingFilter : public CharFilter {
 public:
   explicit MappingFilter(std::shared_ptr<const MappingTrie> trie) : trie(std::move(trie)) {}
 private:
+  // Leftmost-longest matching from each scan position looks only forward.
+  bool scanPosition(size_t) const override { return true; }
+
   void filter() override {
     // Schema-authored keys are short. Forward leftmost-longest matching costs
     // O(input bytes * longest key bytes) in the worst case; replacements are not rescanned.
@@ -201,6 +230,8 @@ private:
         }
       }
       if (replacement == std::string_view::npos) { ++pos; continue; }
+      // An identity rule still consumes its match whole.
+      if (input.substr(pos, end - pos) == trie->replacements[replacement]) consumed(pos, end);
       replace(pos, end, trie->replacements[replacement]);
       pos = end;
     }
@@ -340,6 +371,10 @@ class HtmlStripFilter : public CharFilter {
     return start;
   }
 
+  // Every construct is recognized by scanning forward from its first byte;
+  // the failure caches below are facts about the input suffix only.
+  bool scanPosition(size_t) const override { return true; }
+
   void filter() override {
     noTagAfter = input.size();
     noQuoteAfter.fill(input.size());
@@ -353,7 +388,10 @@ class HtmlStripFilter : public CharFilter {
           replace(pos, pos + 9, "");
           pos = input.find("]]>", pos + 9);
           if (pos == std::string_view::npos) pos = input.size();
-          else { replace(pos, pos + 3, ""); pos += 3; }
+          // The section is one construct, its content kept unscanned: no
+          // tags or references inside.
+          consumed(start, pos);
+          if (pos < input.size()) { replace(pos, pos + 3, ""); pos += 3; }
           continue;
         }
         if (input.substr(pos).starts_with("<!--")) {
@@ -426,6 +464,7 @@ std::unique_ptr<const CharFilterFactory> mappingCharFilter(const api::AnalyzerCo
   auto factory = std::make_unique<Factory>();
   factory->name = def.name;
   factory->normalizing = true;
+  factory->resumable = true;
   factory->trie = std::move(trie);
   return factory;
 }
@@ -439,6 +478,7 @@ std::unique_ptr<const CharFilterFactory> plainCharFilter(const api::AnalyzerComp
   auto factory = std::make_unique<Factory>();
   factory->name = def.name;
   factory->normalizing = Normalizing;
+  factory->resumable = true;  // the built-ins implement CharFilter::scanPosition
   return factory;
 }
 

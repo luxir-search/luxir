@@ -147,6 +147,9 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
       addBranch(label, resolved.logicalName + "__" + label, type);
     }
   }
+  if (writer) {
+    for (const auto& branch : input->branches) branch.handler->recordCheckpoints();
+  }
   auto [iter, inserted] = inputHandlers.try_emplace(std::string(name), std::move(input));
   assert(inserted);
   return *iter->second;
@@ -303,6 +306,9 @@ void Inverter::InputHandler::index(Inverter& inverter, const IndexVal& val) {
   // Capture the original value before any branch's analysis or normalization.
   if (writer) store(inverter, val);
   forEachBranch([&](IndexHandler& branch) { branch.index(inverter, val); });
+  if (writer) {
+    for (const auto& branch : branches) branch.handler->storeCheckpoints(inverter, *writer);
+  }
 }
 
 // Scalar overloads retain the submitted kind in a non-owning IndexVal. Every
