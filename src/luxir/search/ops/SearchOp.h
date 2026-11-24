@@ -140,15 +140,35 @@ struct StructuralConstraint {
 };
 
 struct BucketDomainPlan {
+private:
+  // Request arena that owns the execution context.
+  google::protobuf::Arena& arena;
+
+public:
   DomainVariantPlan variants;
   Query::PlanningContext* planning = nullptr;
+
+  explicit BucketDomainPlan(google::protobuf::Arena& arena) : arena(arena) {}
+
+  // Build the context, weights and filter uses for the bucket domain variants.
+  void materialize();
 };
 
 struct InputDomainPlan {
+private:
+  // Request arena that owns the execution context.
+  google::protobuf::Arena& arena;
+
+public:
   RowRelation::Mapping mapping;
   DomainVariantPlan variants;
   Query::PlanningContext* planning = nullptr;
   bool applyParentFilters = false;
+
+  explicit InputDomainPlan(google::protobuf::Arena& arena) : arena(arena) {}
+
+  // Build the context, weights and filter uses for the mapped input variants.
+  void materialize();
 };
 
 class SearchOp {

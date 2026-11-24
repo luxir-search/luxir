@@ -19,6 +19,8 @@ public:
   RootOp(SearchRequest& req) : SearchOp(req, req.reader, "root") {
   }
 
+  // Build the context, weights and filter uses for the root domain variants.
+  void materialize();
 
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     domainVariants.releaseSegmentState(segment);
