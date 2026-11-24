@@ -4,6 +4,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cmath>
+#include <format>
+#include <random>
 #include <array>
 #include <cstdint>
 #include <numeric>
@@ -20,6 +23,7 @@
 #include "luxir/reader/PointsReader.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
@@ -1121,7 +1125,7 @@ TEST_F(NumericRangePointsTest, arrayPathDedupsMultiValuedDuplicates) {
 // range (ceil on the lower residual): even-valued leaves probed with odd
 // bounds, plus a >32-bit-residual raw leaf probed off-value.  All other test
 // data has gcd == 1, which cannot distinguish ceil from floor.
-TEST_F(NumericRangePointsTest, boundaryInsideGcdStepAndRawLeaf) {
+TEST_F(NumericRangePointsTest, boundaryInsideGcdStepAndWideDeltaLeaf) {
   constexpr int32_t N = 200;
   CollectionHelper helper;
   const RangeField fields[] = {{"even_point"}, {"wide_point"}};
@@ -1137,8 +1141,8 @@ TEST_F(NumericRangePointsTest, boundaryInsideGcdStepAndRawLeaf) {
     inverter.startDoc();
     even[(size_t)doc] = {2 * doc};
     evenHandler.index(inverter, 2 * doc);
-    // Spread exceeds 32 bits of residual and the +doc%3 breaks the gcd (a
-    // pure doc<<33 progression has gcd 2^33 and would FOR-pack after all).
+    // Deltas exceed 32 bits and the +doc%3 breaks the gcd (a pure doc<<33
+    // progression has gcd 2^33 and unit deltas).
     int64_t wideValue = ((int64_t)doc << 33) + doc % 3;
     wide[(size_t)doc] = {wideValue};
     wideHandler.index(inverter, wideValue);
@@ -1307,4 +1311,75 @@ TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
   EXPECT_EQ(selectedScorer(*mergedReader, "merge_values_is", 5, 19,
                            std::numeric_limits<int64_t>::max()),
             fullScan(*mergedReader, "merge_values_is", 5, 19));
+}
+
+// Doubles and nanosecond timestamps through the request path, across two
+// flushed segments and after a merge, against a brute-force oracle. The
+// timestamps jump by 2^40 every 300 docs, so some leaves hold deltas wider
+// than 32 bits.
+TEST_F(NumericRangePointsTest, doublesAndNanosecondTimestampsMatchOracle) {
+  constexpr int32_t N = 3000;
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& price = schema.field("price");
+  price.type = api::FieldDef::FieldClass::DOUBLE;
+  price.index = api::FieldDef::IndexMode::RANGE;
+  auto& ts = schema.field("ts_ns");
+  ts.type = api::FieldDef::FieldClass::INT;
+  ts.index = api::FieldDef::IndexMode::RANGE;
+  schema.set(helper.collection());
+
+  std::mt19937_64 rng(7);
+  std::uniform_real_distribution<double> cents(-500, 1000);
+  std::exponential_distribution<double> gap(1e-6);
+  std::vector<double> prices;
+  std::vector<int64_t> stamps;
+  int64_t t = 1'700'000'000'000'000'000;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < N; doc++) {
+    t += (int64_t)gap(rng) + (doc % 300 == 299 ? (int64_t)1 << 40 : 0);
+    double value = doc % 10 == 0 ? 19.99 : std::round(cents(rng) * 100) / 100;
+    if (value == 0) value = 0.01;  // -0.0 and 0.0 are distinct points.
+    prices.push_back(value);
+    stamps.push_back(t);
+    docs.push_back(flatdoc("id", std::to_string(doc), "price", value, "ts_ns", t));
+    if (doc == N / 2) {
+      ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+      docs.clear();
+    }
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  auto count = [&](const std::string& query) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").exprQuery(query).countLimit().limit(0);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req->getMatchCount();
+  };
+  auto checkAll = [&] {
+    for (auto [lo, hi] : {std::pair{-500.0, 1000.0}, {19.99, 19.99}, {-12.5, 3.75},
+                          {0.0, 0.01}, {999.0, 2000.0}, {-1000.0, -499.99}}) {
+      auto expected = std::ranges::count_if(prices, [=](double v) { return lo <= v && v <= hi; });
+      EXPECT_EQ(expected, count(std::format("price:[{} TO {}]", lo, hi))) << lo << " " << hi;
+    }
+    for (size_t i = 0; i < 40; i++) {
+      size_t a = (size_t)(rng() % N), b = (size_t)(rng() % N);
+      int64_t lo = std::min(stamps[a], stamps[b]) + (int64_t)(i % 3) - 1;
+      int64_t hi = std::max(stamps[a], stamps[b]) - (int64_t)(i % 2);
+      auto expected = std::ranges::count_if(stamps, [=](int64_t v) { return lo <= v && v <= hi; });
+      EXPECT_EQ(expected, count(std::format("ts_ns:[{} TO {}]", lo, hi))) << lo << " " << hi;
+    }
+  };
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(2u, reader->segments().size());
+  for (auto& segment : reader->segments()) {
+    for (auto field : {"price", "ts_ns"}) EXPECT_FALSE(readPoints(segment, field).empty());
+  }
+  checkAll();
+  helper.getIndexWriter()->mergeSegments();
+  reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  EXPECT_EQ((size_t)N, readPoints(reader->segments()[0], "ts_ns").size());
+  checkAll();
 }

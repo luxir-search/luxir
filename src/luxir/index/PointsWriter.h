@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "luxir/codec/Codec.h"
+#include "luxir/codec/ForCodec.h"
 #include "luxir/index/PostingsWriter.h"
 #include "luxir/store/OutputStream.h"
 #include "luxir/util/IntegerSort.h"
@@ -42,7 +42,7 @@ void sortPointsByValueDocid(std::span<Point> points) {
 class PointsWriter {
 public:
   static constexpr uint32_t MAGIC = 0x31545053;
-  static constexpr uint16_t VERSION = 2;
+  static constexpr uint16_t VERSION = 3;
   static constexpr uint8_t FORMAT_KIND = 1;
   static constexpr uint32_t FLAG_LEAF_MAX = 1;
   static constexpr uint16_t DEFAULT_MAX_POINTS_PER_LEAF = 512;
@@ -77,7 +77,17 @@ public:
   static uint64_t directoryOffset(uint64_t start) noexcept {
     return alignUp(start + FIXED_HEADER_SIZE, MAX_ALIGN) - start;
   }
-  static constexpr uint32_t LEAF_HEADER_SIZE = 32;
+  // A leaf is [header][docids][values]. The header holds docBase (u32) and a
+  // value byte: the residual delta width in the low 7 bits and VALUE_GCD in
+  // the high bit, in which case a u64 gcd (> 1) follows. Count, docid codec,
+  // docBits and docid bytes derive from the directory (pointCount and
+  // leafEncodings); the value minimum is the directory leafMin.
+  static constexpr uint8_t VALUE_GCD = 0x80;
+  static constexpr uint8_t VALUE_BITS_MASK = 0x7f;
+  static constexpr uint32_t LEAF_HEADER_MIN_SIZE = sizeof(uint32_t) + 1;
+  static constexpr uint32_t leafHeaderSize(uint8_t valueByte) noexcept {
+    return LEAF_HEADER_MIN_SIZE + (valueByte & VALUE_GCD ? sizeof(uint64_t) : 0);
+  }
   static constexpr uint8_t DOC_CONTIG = 0;
   static constexpr uint8_t DOC_FOR = 1;
   // Codec value 2 remains reserved. BITSET is valid only when docids are
@@ -114,13 +124,10 @@ private:
   std::vector<uint64_t> leafFP;
   std::vector<uint32_t> leafEncodings;
   std::vector<uint32_t> residuals;
+  std::vector<uint64_t> valueDeltas;
   std::vector<char> encodedDocs;
   std::vector<char> encodedValues;
   std::vector<uint64_t> docWords;
-
-  static void writeU16(OutputStream& target, uint16_t value) {
-    target.write(&value, sizeof(value));
-  }
 
   static void writeU32(OutputStream& target, uint32_t value) {
     target.write(&value, sizeof(value));
@@ -128,19 +135,6 @@ private:
 
   static void writeU64(OutputStream& target, uint64_t value) {
     target.write(&value, sizeof(value));
-  }
-
-  static void encode(std::span<uint32_t> values, uint8_t bits, std::vector<char>& target) {
-    uint64_t byteSize = LuxirSIMDFor::byteSize((uint32_t)values.size(), bits);
-    if (byteSize > std::numeric_limits<uint32_t>::max()) {
-      throw std::overflow_error("PointsWriter: encoded leaf exceeds uint32");
-    }
-    target.resize((size_t)byteSize);
-    uint32_t encodedSize = (uint32_t)target.size();
-    IndexCodec::numericCodec.encodeWithMeta(values.data(), (uint32_t)values.size(),
-                                             target.data(), encodedSize, 0, bits);
-    assert(encodedSize == byteSize);
-    target.resize(encodedSize);
   }
 
   void flushLeaf() {
@@ -155,7 +149,7 @@ private:
     leafMax.push_back(leaf.back().value);
 
     int64_t valueMin = leaf.front().value;
-    int64_t valueMax = leaf.back().value;
+    [[maybe_unused]] int64_t valueMax = leaf.back().value;
     uint64_t valueGcd = options.valueGcd ? 0 : 1;
     if (options.valueGcd) {
       for (const auto& point : leaf) {
@@ -165,8 +159,6 @@ private:
       }
     }
     if (valueGcd == 0) valueGcd = 1;
-    uint64_t valueRange = ((uint64_t)valueMax - (uint64_t)valueMin) / valueGcd;
-    uint8_t valueFormat = (uint8_t)std::bit_width(valueRange);
 
     uint32_t docBase = (uint32_t)leaf.front().docid;
     for (const auto& point : leaf) docBase = std::min(docBase, (uint32_t)point.docid);
@@ -200,7 +192,7 @@ private:
       }
       docBits = (uint8_t)std::bit_width(maxResidual);
       assert(docBits <= 31);
-      encode(residuals, docBits, encodedDocs);
+      ForCodec::encode(residuals, docBits, encodedDocs);
 
       uint32_t maxDocid = (uint32_t)leaf.front().docid;
       for (const auto& point : leaf) {
@@ -229,37 +221,33 @@ private:
         : docCodec == DOC_FOR ? docBits : (uint32_t)(encodedDocs.size() / 8);
     leafEncodings.push_back((detail << 2) | docCodec);
 
-    encodedValues.clear();
-    if (valueFormat <= 32) {
-      residuals.resize(leaf.size());
-      for (size_t i = 0; i < leaf.size(); i++) {
-        uint32_t residual = (uint32_t)(((uint64_t)leaf[i].value - (uint64_t)valueMin) / valueGcd);
-        residuals[i] = residual;
-        assert((int64_t)((uint64_t)residual * valueGcd + (uint64_t)valueMin) == leaf[i].value);
-      }
-      encode(residuals, valueFormat, encodedValues);
+    // Values are sorted, so the residuals (value - leafMin) / gcd ascend and
+    // are stored as deltas from their predecessor (the first delta is 0).
+    // A delta never exceeds the residual range, so this width is at most the
+    // plain FOR width; deltas wider than 32 bits use low and high streams.
+    valueDeltas.resize(leaf.size());
+    uint64_t previous = 0;
+    uint64_t maxDelta = 0;
+    for (size_t i = 0; i < leaf.size(); i++) {
+      uint64_t residual = ((uint64_t)leaf[i].value - (uint64_t)valueMin) / valueGcd;
+      assert((int64_t)(residual * valueGcd + (uint64_t)valueMin) == leaf[i].value);
+      valueDeltas[i] = residual - previous;
+      maxDelta = std::max(maxDelta, valueDeltas[i]);
+      previous = residual;
     }
+    assert(previous * valueGcd + (uint64_t)valueMin == (uint64_t)valueMax);
+    auto valueBits = (uint8_t)std::bit_width(maxDelta);
+    SplitForCodec::encode(valueDeltas, valueBits, encodedValues);
 
     [[maybe_unused]] size_t headerStart = out.size();
-    writeU16(out, (uint16_t)leaf.size());
-    out.write((char)docCodec);
-    out.write((char)docBits);
-    out.write((char)valueFormat);
-    out.write((char)0x11);
-    out.write((char)0x11);
-    out.write((char)0x11);
+    uint8_t valueByte = valueBits | (valueGcd != 1 ? VALUE_GCD : 0);
     writeU32(out, docBase);
-    writeU32(out, (uint32_t)encodedDocs.size());
-    writeU64(out, (uint64_t)valueMin);
-    writeU64(out, valueGcd);
-    assert(out.size() - headerStart == LEAF_HEADER_SIZE);
+    out.write((char)valueByte);
+    if (valueGcd != 1) writeU64(out, valueGcd);
+    assert(out.size() - headerStart == leafHeaderSize(valueByte));
 
     out.write(encodedDocs.data(), encodedDocs.size());
-    if (valueFormat <= 32) {
-      out.write(encodedValues.data(), encodedValues.size());
-    } else {
-      for (const auto& point : leaf) writeU64(out, (uint64_t)point.value);
-    }
+    out.write(encodedValues.data(), encodedValues.size());
     assert((uint64_t)(out.size() - pointsStart) > leafOffset);
     leaf.clear();
   }
@@ -315,6 +303,9 @@ public:
     if (pointCount == 0) throw std::invalid_argument("PointsWriter: empty input");
     flushLeaf();
     finished = true;
+    // Leaves have byte-granular sizes; the directory starts aligned, so the
+    // final leaf carries up to MAX_ALIGN - 1 bytes of padding.
+    out.align(MAX_ALIGN);
 
     uint64_t pointsMetaOff = (uint64_t)(out.size() - pointsStart);
     leafFP.push_back(pointsMetaOff);

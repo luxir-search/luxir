@@ -144,15 +144,22 @@ TEST_F(PointsIndexTest, leafBoundariesAndDirectory) {
     EXPECT_EQ(12, reader.leafMax(2));
     EXPECT_EQ((uint64_t)data.pointsMetaOff, reader.leafFP(reader.leafCount()));
 
+    // Leaf 0: docBase 0, residuals 0, 1, 2 at gcd 6 (deltas 0, 1, 1).
     const char* leaf = input.ptr((int64_t)data.pointsStart);
-    EXPECT_EQ(3, load<uint16_t>(leaf + 0));
-    EXPECT_EQ(PointsWriter::DOC_CONTIG, (uint8_t)leaf[2]);
-    EXPECT_EQ(0, (uint8_t)leaf[3]);
-    EXPECT_EQ(reader.leafInfo(0).valueFormat, (uint8_t)leaf[4]);
-    EXPECT_EQ(0u, load<uint32_t>(leaf + 8));
-    EXPECT_EQ(0u, load<uint32_t>(leaf + 12));
-    EXPECT_EQ(-5, load<int64_t>(leaf + 16));
-    EXPECT_EQ(reader.leafInfo(0).valueGcd, load<uint64_t>(leaf + 24));
+    EXPECT_EQ(PointsWriter::DOC_CONTIG, reader.leafInfo(0).docCodec);
+    EXPECT_EQ(0u, load<uint32_t>(leaf + 0));
+    EXPECT_EQ(1 | PointsWriter::VALUE_GCD, (uint8_t)leaf[4]);
+    EXPECT_EQ(6u, load<uint64_t>(leaf + 5));
+    EXPECT_EQ(13u, reader.leafInfo(0).headerBytes);
+    EXPECT_EQ(1, reader.leafInfo(0).valueFormat);
+    // The single-point tail leaf is a bare 5-byte header (CONTIG docids,
+    // zero-width values) padded so the directory starts aligned.
+    const char* tail = leaf + reader.leafFP(2);
+    EXPECT_EQ(9u, load<uint32_t>(tail));
+    EXPECT_EQ(0, (uint8_t)tail[4]);
+    EXPECT_EQ(PointsWriter::LEAF_HEADER_MIN_SIZE, reader.leafInfo(2).headerBytes);
+    EXPECT_EQ(0u, reader.leafInfo(2).valueBytes());
+    EXPECT_EQ(0u, (data.pointsStart + data.pointsMetaOff) % MAX_ALIGN);
 
     const char* meta = input.ptr((int64_t)(data.pointsStart + data.pointsMetaOff));
     EXPECT_EQ(PointsWriter::MAGIC, load<uint32_t>(meta + 0));
@@ -236,6 +243,82 @@ TEST_F(PointsIndexTest, valueEncodingExtremes) {
     return lhs.value < rhs.value || (lhs.value == rhs.value && lhs.docid < rhs.docid);
   });
   expectRoundTrip(sortablePatterns, 3);
+}
+
+// Sorted (value, docid) points with docids in ingest order.
+static std::vector<Point> sortedPoints(std::vector<int64_t> values) {
+  std::vector<Point> points;
+  for (size_t i = 0; i < values.size(); i++) points.push_back({values[i], (int32_t)i});
+  std::sort(points.begin(), points.end(), [](const Point& lhs, const Point& rhs) {
+    return lhs.value < rhs.value || (lhs.value == rhs.value && lhs.docid < rhs.docid);
+  });
+  return points;
+}
+
+// Leaf values are deltas of (value - leafMin) / gcd. Each case round-trips
+// through validate() and readAll(), and value lookups match an oracle.
+TEST_F(PointsIndexTest, deltaValueEncoding) {
+  const int64_t i64min = std::numeric_limits<int64_t>::min();
+  const int64_t i64max = std::numeric_limits<int64_t>::max();
+  auto check = [](const std::vector<Point>& points, uint16_t leafSize, auto&& leafCheck) {
+    withPoints(points, leafSize, [&](const PointsReader& reader, const PointsWriter::Data&,
+                                     const InputStream&) {
+      std::vector<uint32_t> residuals(reader.maxPointsPerLeaf());
+      std::vector<int64_t> raw(reader.maxPointsPerLeaf());
+      for (const auto& point : points) {
+        for (int64_t probe : {point.value, point.value == i64max ? i64max : point.value + 1}) {
+          auto expected = std::lower_bound(points.begin(), points.end(), probe,
+              [](const Point& p, int64_t v) { return p.value < v; }) - points.begin();
+          EXPECT_EQ((uint64_t)expected, reader.ordinalOfFirstAtLeast(probe, residuals, raw)) << probe;
+        }
+      }
+      leafCheck(reader);
+    });
+  };
+
+  // Deltas just over 32 bits, across FOR block boundaries and a tail leaf.
+  std::vector<int64_t> wide = {0};
+  for (int64_t i = 1; i < 300; i++) wide.push_back(wide.back() + ((int64_t)1 << 32) + i);
+  for (uint16_t leafSize : {(uint16_t)512, (uint16_t)128}) {
+    check(sortedPoints(wide), leafSize, [](const PointsReader& reader) {
+      EXPECT_EQ(33, reader.leafInfo(0).valueFormat);
+      EXPECT_EQ(1u, reader.leafInfo(0).valueGcd);
+    });
+  }
+
+  // A residual range above 32 bits whose deltas fit in 32.
+  std::vector<int64_t> spread;
+  for (int64_t i = 0; i < 600; i++) spread.push_back(i * 3'000'000'000LL + i % 7);
+  check(sortedPoints(spread), 512, [](const PointsReader& reader) {
+    EXPECT_GT((uint64_t)(reader.leafMax(0) - reader.leafMin(0)), (uint64_t)UINT32_MAX);
+    EXPECT_EQ(32, reader.leafInfo(0).valueFormat);
+    EXPECT_EQ(600u - 512u, reader.leafInfo(1).count);
+  });
+
+  // The full int64 span is one 64-bit delta.
+  check(sortedPoints({i64min, i64min + 1, i64max - 1, i64max}), 4, [](const PointsReader& reader) {
+    EXPECT_EQ(64, reader.leafInfo(0).valueFormat);
+  });
+
+  // gcd and deltas compose: 1000 * i^2 stores deltas 2i - 1 at gcd 1000.
+  std::vector<int64_t> squares;
+  for (int64_t i = 0; i < 200; i++) squares.push_back(-5'000'000 + 1000 * i * i);
+  check(sortedPoints(squares), 512, [](const PointsReader& reader) {
+    EXPECT_EQ(1000u, reader.leafInfo(0).valueGcd);
+    EXPECT_EQ(std::bit_width((uint64_t)(2 * 199 - 1)), reader.leafInfo(0).valueFormat);
+  });
+
+  // Equal values store no value payload: a leaf is a bare header.
+  check(sortedPoints(std::vector<int64_t>(1000, 42)), 512, [](const PointsReader& reader) {
+    EXPECT_EQ(0, reader.leafInfo(0).valueFormat);
+    EXPECT_EQ(1u, reader.leafInfo(0).valueGcd);
+    EXPECT_EQ(PointsWriter::LEAF_HEADER_MIN_SIZE, reader.leafFP(1) - reader.leafFP(0));
+  });
+
+  check(sortedPoints({i64min}), 512, [](const PointsReader& reader) {
+    EXPECT_EQ(PointsWriter::LEAF_HEADER_MIN_SIZE, reader.leafInfo(0).headerBytes);
+    EXPECT_EQ(0u, reader.leafInfo(0).valueBytes());
+  });
 }
 
 TEST_F(PointsIndexTest, docidCodecSelection) {
