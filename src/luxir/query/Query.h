@@ -25,6 +25,7 @@
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
 #include "MultiTermBudget.h"
+#include "SegmentMask.h"
 #include "ExecutionProfile.h"
 #include "Warnings.h"
 #include "luxir/util/proto.h"
@@ -46,6 +47,9 @@
 #include <google/protobuf/arena.h>
 
 namespace luxir {
+
+class CatalogSummaryView;
+class QueryPruning;
 
 class FanoutScope;
 class DocSet;
@@ -722,6 +726,23 @@ public:
     return std::nullopt;
   }
 
+  // Whether this query can match any document in the segment. EMPTY proves
+  // absence over live and deleted rows alike. UNKNOWN is always legal;
+  // NONEMPTY gives no proof of absence. Proofs read the physical fields'
+  // catalog records. An EMPTY node supplies its reason with view.prove()
+  // or forwards its child's proof. Queries without a rule return UNKNOWN.
+  //
+  // Only absence is proven today. The opposite proof, that every row of the
+  // segment matches (ALL_ROWS: exists on a field every row has, a range that
+  // covers the field's bounds), can be answered by this same walk from the
+  // same headers when something needs it, such as count shortcuts or
+  // dropping a filter that excludes nothing. Like EMPTY it would describe
+  // rows as written, deleted ones included. A wrapper may forward EMPTY from
+  // its child but not ALL_ROWS when it can reject rows itself (min_score).
+  virtual MatchState mayMatch(const CatalogSummaryView&) const {
+    return MatchState::UNKNOWN;
+  }
+
   // Validate the complete logical tree once during serial request planning,
   // before cache lookup or Weight construction. Every concrete query must
   // make an explicit validation decision. A composite MUST override
@@ -1213,7 +1234,24 @@ public:
 
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
   class SegmentSource {
+    friend class Context;
+    friend class Weight;
+    const SegmentMask* membership = nullptr;
+
   public:
+    bool provenEmpty(const IndexReader::Segment& segment) const noexcept {
+      return membership && !membership->test((size_t)segment.ord);
+    }
+    // For a segment this source excludes. Detailed reasons are optional.
+    std::string_view proofReason(const IndexReader::Segment& segment) const {
+      assert(provenEmpty(segment));
+      if (membership && !membership->reasons.empty()) {
+        const auto& reason = membership->reasons[(size_t)segment.ord];
+        if (!reason.empty()) return reason;
+      }
+      return "proven empty";
+    }
+
     /// Drop refillable transient state only; preserve semantics and prepared
     /// results. Idempotent. No plan or scorer from this source for the segment
     /// may still be in use, including plans abandoned during route selection.
@@ -1226,6 +1264,7 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         SupplierExecutionMode executionMode =
             SupplierExecutionMode::ORDINARY) {
+      if (provenEmpty(segment)) return nullptr;
       return scorerSupplierImpl(targetPool, segment, executionMode);
     }
 
@@ -1233,9 +1272,12 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         SupplierExecutionMode executionMode) = 0;
 
-    /// Direct scorer construction implemented by SegmentSources whose supplier
-    /// delegates its build to the source.
-    virtual Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) = 0;
+    /// Direct segment scoring can run concurrently on workers. Allocate
+    /// scorer state from targetPool and leave request planning state alone.
+    Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) {
+      return provenEmpty(segment) ? nullptr : createScorerImpl(targetPool, segment);
+    }
+    virtual Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) = 0;
 
     /// Advisory flag for callers that can optimize domain filtering. Return
     /// true only when every emitted doc is already within this SegmentSource's
@@ -1299,6 +1341,12 @@ public:
     FilterKeyContext filterKeyContext;
     Limits limits;
     std::vector<api::Warning>* warnings = nullptr;
+    // Validation must set this for any query that introduces NEEDS_PREPARE
+    // so an empty root still creates its whole-index preparation weight.
+    bool mayPrepare = false;
+    std::shared_ptr<QueryPruning> pruning;
+    std::string_view opName;
+    std::vector<std::string>* proofNotes = nullptr;
     ExecutionProfileSink* profiles = nullptr;
     // Where weights register the parts they will read, when the search
     // acquires them ahead (DeclaredReads); null otherwise.
@@ -1336,6 +1384,12 @@ public:
     // ranking, count, domain, and routing products; logical normalization is
     // query-shaped and belongs here once, not in every Weight constructor.
     // Each Query address owns at most one concrete Plan type.
+    template <typename Plan>
+    const Plan* findLogicalPlan(const Query& query) const {
+      auto found = logicalPlans.find(&query);
+      return found == logicalPlans.end() ? nullptr : static_cast<const Plan*>(found->second);
+    }
+
     template <typename Plan, typename Create>
     Plan& getOrCreateLogicalPlan(const Query& query, Create&& create) {
       auto found = logicalPlans.find(&query);
@@ -1561,6 +1615,8 @@ public:
           limits, warnings, filterKeyContext, std::move(filterUses));
     }
 
+    Weight* createRootWeight(Query& query, int32_t flags, float multiplier = 1.0f);
+
     PlanningContext& planningContext() const noexcept { return planning; }
 
     MultiTermBudget& multiTermBudget() const noexcept {
@@ -1641,6 +1697,9 @@ public:
       return terms;
     }
 
+    // A term outside this segment's catalog bounds contributes zero frequency.
+    bool termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term);
+
   public:
     CachedTermInfo* getCachedTerminfo(CachedFieldInfo& cachedFieldInfo, std::string_view term) {
       auto [iter, inserted] = cachedFieldInfo.termInfos.try_emplace(term);
@@ -1652,14 +1711,20 @@ public:
       auto numSegs = numSegments();
       // TermsEnums survive missing-term lookups; allocate them before the
       // temporary postings states that can be rewound below.
-      for (size_t i = 0; i < numSegs; i++) getTermsEnum(cachedFieldInfo, i);
+      for (size_t i = 0; i < numSegs; i++) {
+        if (!termAbsent(cachedFieldInfo, i, term)) getTermsEnum(cachedFieldInfo, i);
+      }
       auto savepoint = pool.getSavePoint();
       int foundInSegCount = 0;
       result.postingsStates = {
           pool.make_arr<const TermsEnum::PostingsState*>(numSegs), numSegs};
       for (size_t i = 0; i < numSegs; ++i) {
+        // A segment whose header proves the term absent holds zero
+        // frequency for it, exactly what a seek would find, so it is not
+        // seeked. Every other segment is, pruned by other predicates or not:
+        // statistics always cover the whole reader.
         auto* termsEnum = cachedFieldInfo.termsEnums[i];
-        if (!termsEnum || !termsEnum->seek(term)) {
+        if (!termsEnum || termAbsent(cachedFieldInfo, i, term) || !termsEnum->seek(term)) {
           result.postingsStates[i] = nullptr;
           continue;
         }
@@ -1683,6 +1748,7 @@ public:
       result = {};
       bool found = false;
       for (int i = 0; i < (int)numSegments(); ++i) {
+        if (termAbsent(cachedFieldInfo, (size_t)i, term)) continue;
         auto* termsEnum = getTermsEnum(cachedFieldInfo, (size_t)i);
         if (!termsEnum || !termsEnum->seek(term)) {
           continue;
@@ -1774,10 +1840,6 @@ public:
     /// whole-index work has completed.
     class PreparedWeight : public Query::SegmentSource {
     public:
-      /// Create a scorer from prepared state. Follows the same threading and
-      /// allocation rules as Weight::createScorer().
-      virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
-
       /// Advisory flag for callers that can optimize domain filtering. Return
       /// true only when every emitted doc is already within this
       /// PreparedWeight's PrepareContext construction domain; false is always
@@ -1879,7 +1941,12 @@ public:
     /// so probes stop before it; ITERATE is a bound.
     /// Resolvable non-metadata shortcuts name the leaf that resolves them.
     /// Execution may resolve more than this metadata proves.
-    virtual CountShortcut countShortcut(IndexReader::Segment& segment,
+    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) {
+      if (provenEmpty(segment)) return {0, CountHow::METADATA};
+      return countShortcutImpl(segment, domain);
+    }
+
+    virtual CountShortcut countShortcutImpl(IndexReader::Segment& segment,
                                          DocSet* domain) {
       return countBound(segment, domain, segment.maxDoc());
     }
@@ -1916,16 +1983,16 @@ public:
     /// The returned PreparedWeight may later be asked to create per-segment
     /// scorers from segment tasks, so createScorer() should treat its stored
     /// prepared state as read-only.
-    virtual std::unique_ptr<PreparedWeight> prepare(PrepareContext& ctx) {
+    std::unique_ptr<PreparedWeight> prepare(PrepareContext& ctx) {
+      auto prepared = prepareImpl(ctx);
+      if (prepared) prepared->membership = membership;
+      return prepared;
+    }
+
+    virtual std::unique_ptr<PreparedWeight> prepareImpl(PrepareContext& ctx) {
       unused(ctx);
       return nullptr;
     }
-
-    /// Create a scorer for a specific segment in the specific MemPool. Can
-    /// return null if no docs match. This may run concurrently on worker tasks:
-    /// allocate scorer state from target, and do not allocate from context.pool
-    /// or populate/mutate Query::Context caches.
-    virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };
@@ -2460,6 +2527,7 @@ Query::VerificationWork membershipVerificationWork(const Query& query);
 
 inline void Query::validateLogical(
     PlanningContext& context, float multiplier) const {
+  if (kind == QueryKind::KNN || kind == QueryKind::FORCE_PREPARE) context.mayPrepare = true;
   validateLogicalImpl(context, multiplier);
 #ifndef NDEBUG
   context.recordLogicalValidation(*this);

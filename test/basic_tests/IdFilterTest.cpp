@@ -8,12 +8,15 @@
 
 #include "luxir/index/IndexWriter.h"
 #include "luxir/reader/IdFilter.h"
+#include "luxir/reader/ReaderErrors.h"
 #include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/luxir_util.h"
+#include "luxir/store/Directory.h"
 #include "test/CollectionHelper.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
@@ -61,18 +64,17 @@ size_t expectNoFalseNegatives(CollectionHelper& helper) {
     auto core = segment.segmentCoreShared();
     auto& postings = core->rootReader();
     const auto* info = postings.fieldInfo("id");
-    EXPECT_TRUE(info && info->idFilter());
-    if (!info || !info->idFilter()) continue;
-    auto filter = IdFilter::parse(core->slice(info->idFilter()));
+    auto filter = core->idFilter();
     EXPECT_TRUE(filter && filter->filterKind() == options.kind);
-    if (filter && options.kind == IdFilter::Kind::BLOOM) {
+    if (!filter) continue;
+    if (options.kind == IdFilter::Kind::BLOOM) {
       EXPECT_EQ(IdFilter::HEADER_BYTES + IdFilter::bloomBlocksFor(options, postings.maxDoc()) * IdFilter::BLOCK_BYTES,
                 info->idFilter().bytes);
     }
     MemPool pool;
     TermsEnum terms(pool, postings, *info);
     while (terms.nextTerm()) {
-      EXPECT_TRUE(core->mayContainId(std::string_view(terms.term()))) << std::string_view(terms.term());
+      EXPECT_TRUE(filter->mayContain(std::string_view(terms.term()))) << std::string_view(terms.term());
       seen++;
     }
   }
@@ -183,8 +185,7 @@ TEST_P(IdFilterKindTest, everyIdIsMaybePresentAfterFlushAndMerge) {
   ASSERT_EQ(1u, helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
   EXPECT_EQ(598u, expectNoFalseNegatives(helper));
   auto core = helper.getIndexWriter()->snapshots.readers.getReader()->segments()[0].segmentCoreShared();
-  EXPECT_TRUE(core->mayContainId(fitted(longId(20))));
-  EXPECT_FALSE(core->mayContainId("zzz"));  // Above the exact bounds.
+  EXPECT_TRUE(core->idFilter()->mayContain(fitted(longId(20))));
 }
 
 TEST_P(IdFilterKindTest, partitionedMergeFeedsTheIdFilter) {
@@ -242,17 +243,44 @@ TEST_P(IdFilterKindTest, deletesLookUpOnlyCandidateSegments) {
   EXPECT_LE(lookups.load(), 3);
 }
 
+// Writers build no filter by default.
 TEST_F(IdFilterTest, noFilterStillAppliesDeletes) {
   LuxirNode node;
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
-  iw->idFilterOptions.kind = IdFilter::Kind::NONE;
   ASSERT_TRUE(helper.indexAll(docs(0, 100), UpdateMessage::COMMIT).success);
   auto core = iw->snapshots.readers.getReader()->segments()[0].segmentCoreShared();
   EXPECT_FALSE(core->rootReader().fieldInfo("id")->idFilter());
-  EXPECT_TRUE(core->mayContainId("id00050x"));  // Inside the bounds, so only a lookup can tell.
+  EXPECT_FALSE(core->idFilter());
   ASSERT_TRUE(helper.deleteByIds({"id00001", longId(10)}, UpdateMessage::COMMIT).success);
   EXPECT_EQ(98, iw->snapshots.readers.getReader()->liveDocs());
+}
+
+// Writers only write filters that parse, so a reader takes one that does not as damage.
+TEST_F(IdFilterTest, unparseableFilterIsCorruption) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->idFilterOptions = bloom();
+  ASSERT_TRUE(helper.indexAll(docs(0, 10), UpdateMessage::COMMIT).success);
+  auto durable = readDurableIndexInfo(iw->dir);
+  const auto& segment = durable.info.segments.front();
+  auto part = SegmentCore::create(iw->dir, segment)->rootReader().fieldInfo("id")->idFilter();
+  auto damaged = Postings::getIndexFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch),
+                                            part.location.filenum());
+  RAMDir copy;
+  for (const auto& file : segment.files) {
+    auto input = iw->dir.openFile(file.name);
+    auto hold = input->acquire({0, input->size()});
+    std::string bytes(hold.getData(), hold.getLength());
+    if (file.name == damaged) bytes[part.location.offset()] = 9;  // No such kind.
+    auto out = copy.createFile(file.name);
+    OutputStream stream(out.get());
+    stream.write(bytes.data(), bytes.size());
+    stream.close();
+    copy.finishFile(*out);
+  }
+  EXPECT_THROW(SegmentCore::create(copy, segment)->idFilter(), SegmentCorruptError);
 }
 
 } // namespace luxir::test

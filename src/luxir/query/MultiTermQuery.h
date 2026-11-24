@@ -22,6 +22,7 @@
 #include "luxir/reader/FilteredTermsEnum.h"
 #include "luxir/search/RequestMemTracker.h"
 #include "luxir/util/screaming.h"
+#include "CatalogPredicates.h"
 
 namespace luxir {
 
@@ -48,6 +49,12 @@ public:
 
   std::string_view getField() const { return field; }
   int32_t getMaxExpansions() const { return maxExpansions; }
+
+  // Expansions are unknown without the dictionary; only field absence proves
+  // emptiness. Subclasses with bounded shapes (prefix, range, set) refine this.
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return proof::termsMatch(view, field);
+  }
 
   // Build the per-segment filtered term iterator.
   virtual FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) = 0;
@@ -795,7 +802,7 @@ public:
     // Disjoint postings make the expansion's docFreq sum exact. A cold sum
     // needs a dictionary walk; a resident sum needs only metadata. Deletes
     // and domains still need iteration.
-    CountShortcut countShortcut(IndexReader::Segment& segment,
+    CountShortcut countShortcutImpl(IndexReader::Segment& segment,
                                 DocSet* domain) override {
       auto* info = cachedFieldInfo == nullptr ? nullptr
           : cachedFieldInfo->segInfos.at(segment.ord);
@@ -823,7 +830,7 @@ public:
       return targetPool.make<Supplier>(*this, segment, targetPool);
     }
 
-    Query::Scorer* createScorer(
+    Query::Scorer* createScorerImpl(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       auto* supplier = scorerSupplier(targetPool, segment);
       Query::PlanContext planContext = scorerBuildContext(

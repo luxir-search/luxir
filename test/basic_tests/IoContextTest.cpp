@@ -50,8 +50,8 @@ public:
 class HeldDirectory : public DelegatingDirectory {
 public:
   using DelegatingDirectory::DelegatingDirectory;
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) override {
-    auto file = delegate->openFile(name, expectSynced, size);
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) override {
+    auto file = delegate->openFile(name, options);
     return file ? std::make_shared<HeldInputFile>(std::move(file)) : file;
   }
 };

@@ -64,6 +64,8 @@ struct ResolvedField {
   bool vectorNormalized = false;
   bool hasVectorNormalizeOnWrite = false;
   bool vectorNormalizeOnWrite = false;
+  bool hasVectorEncoding = false;
+  VectorEncoding vectorEncoding = VectorEncoding::F32;
   // Atomic: the nearest authored ann in the parent chain.
   const luxir::api::VectorAnnDef* ann = nullptr;
   std::optional<bool> geoIgnoreMalformed;
@@ -301,6 +303,19 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorNormalizeOnWrite = parentResolved.vectorNormalizeOnWrite;
   }
 
+  // encoding: explicit set on this field overrides; otherwise inherit.
+  if (def.encoding.has_value()) {
+    if (!vcodec::valid((int32_t)*def.encoding)) {
+      throw SchemaError("unknown encoding value " + std::to_string((int)*def.encoding) +
+                        " (field: " + std::string(name) + "); valid: f32, f16, bf16, sq8");
+    }
+    r.hasVectorEncoding = true;
+    r.vectorEncoding = (VectorEncoding)*def.encoding;
+  } else {
+    r.hasVectorEncoding = parentResolved.hasVectorEncoding;
+    r.vectorEncoding = parentResolved.vectorEncoding;
+  }
+
   r.reverseMap = def.reverse_map.value_or(parentResolved.reverseMap);
   r.ann = def.ann ? &*def.ann : parentResolved.ann;
   r.geoIgnoreMalformed = def.ignore_malformed ? def.ignore_malformed
@@ -445,7 +460,8 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   if (r.type == FieldClass::NESTED && (def.index || def.column || def.multi || def.stored
       || def.stored_resource || def.variants || def.defaults || def.analyzer || def.normalizer
       || def.long_terms || def.unit || def.scale || def.dims || def.truncate_dims || def.metric
-      || def.normalized || def.normalize_on_write || def.ann || def.ignore_malformed || def.ignore_z_value)) {
+      || def.normalized || def.normalize_on_write || def.encoding || def.ann || def.ignore_malformed
+      || def.ignore_z_value)) {
     throw SchemaError("Nested path cannot have value settings: " + name);
   }
   if (def.reverse_map && r.type != FieldClass::NESTED) {
@@ -465,11 +481,11 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   }
   bool vectorProp = def.dims.has_value() || def.truncate_dims.has_value() || def.metric.has_value() ||
                     def.normalized.has_value() || def.normalize_on_write.has_value() ||
-                    def.ann.has_value();
+                    def.encoding.has_value() || def.ann.has_value();
   if (vectorProp && r.type != FieldClass::VECTOR) {
     throw SchemaError(
-      "dims/truncate_dims/metric/normalized/normalize_on_write/ann are only valid for vector fields (field: " +
-      name + ")");
+      "dims/truncate_dims/metric/normalized/normalize_on_write/encoding/ann are only valid for "
+      "vector fields (field: " + name + ")");
   }
   if ((def.ignore_malformed || def.ignore_z_value) && r.type != FieldClass::GEO_POINT) {
     throw SchemaError("ignore_malformed/ignore_z_value are only valid for geo_point fields (field: " +
@@ -551,7 +567,7 @@ struct FieldCompiler {
           || logical.hasStoredResource || logical.variants || logical.defaults
           || r.analyzer || r.normalizer || r.longTerms || r.scale || r.dateUnit
           || r.hasVectorDims || r.vectorTruncateDims || r.hasVectorMetric
-          || r.hasVectorNormalized || r.hasVectorNormalizeOnWrite || r.ann
+          || r.hasVectorNormalized || r.hasVectorNormalizeOnWrite || r.hasVectorEncoding || r.ann
           || r.geoIgnoreMalformed || r.geoIgnoreZValue || derived) {
         throw SchemaError("Nested path cannot have value settings: " + std::string(name));
       }
@@ -792,7 +808,7 @@ struct FieldCompiler {
                                                truncated ? "truncate_dims" : "dims", name);
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags,
                                                r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
-                                               ann, r.vectorTruncateDims);
+                                               r.vectorEncoding, ann, r.vectorTruncateDims);
         break;
       }
       default:

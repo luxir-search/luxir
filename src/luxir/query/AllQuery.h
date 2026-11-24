@@ -25,6 +25,11 @@ public:
 
   uint64_t hashImpl() const override { return Query::hashImpl(); }
 
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    unused(view);
+    return MatchState::NONEMPTY;
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
@@ -231,11 +236,11 @@ public:
       return targetPool.make<AllQuery::Supplier>(segment, score, needsScores());
     }
 
-    AllQuery::Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
+    AllQuery::Scorer* createScorerImpl(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
       return targetPool.make<AllQuery::Scorer>(segment, score);
     }
 
-    CountShortcut countShortcut(
+    CountShortcut countShortcutImpl(
         IndexReader::Segment& segment, DocSet* domain) override {
       if (domain && domain->cachedCard() >= 0
           && (!segment.mayHaveDeletes() || isCanonicalCountDomain(segment, domain))) {

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "CatalogSummaryView.h"
 #include "Query.h"
 
 namespace luxir {
@@ -23,6 +24,11 @@ public:
 
   uint64_t hashImpl() const override { return Query::hashImpl(); }
 
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    view.prove("match no docs");
+    return MatchState::EMPTY;
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
@@ -37,7 +43,7 @@ public:
 
   class Weight final : public Query::Weight {
   public:
-    Weight(Context& context, const MatchNoDocsQuery& query, int32_t flags)
+    Weight(Context& context, const Query& query, int32_t flags)
       : Query::Weight(context, query, flags) {
       traits |= IS_CONSTANT_SCORING;  // vacuously constant
     }
@@ -50,13 +56,13 @@ public:
       return nullptr;
     }
 
-    Query::Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
       unused(targetPool);
       unused(segment);
       return nullptr;  // never matches any doc
     }
 
-    CountShortcut countShortcut(
+    CountShortcut countShortcutImpl(
         IndexReader::Segment& segment, DocSet* domain) override {
       unused(segment, domain);
       return {0, CountHow::METADATA};

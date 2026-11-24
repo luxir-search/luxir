@@ -46,7 +46,7 @@ public:
   void parts(uint64_t hash, Out&& out) const {
     if (!part) return;
     if (!byBlock) {
-      out(part, ReadClass::DATA);
+      out(part, ReadClass::METADATA);
       return;
     }
     out(header(), ReadClass::METADATA);
@@ -54,12 +54,14 @@ public:
   }
 
   /// Reads the filter, or its header when read by block. False when a filter
-  /// read by block turns out not to be BLOOM: it is then read whole, and the
-  /// next load() acquires the whole part unless it is held by then.
+  /// read by block turns out not to be BLOOM, or its header does not parse:
+  /// it is then read whole, and the next load() acquires the whole part
+  /// unless it is held by then. A part that does not parse throws
+  /// SegmentCorruptError, as SegmentCore::idFilter() does.
   bool load();
 
-  /// After load(): false when the filter proves `hash` absent. A filter this
-  /// build cannot read proves nothing. Safe to call from several threads.
+  /// After load(): false when the filter proves `hash` absent. Safe to call
+  /// from several threads.
   bool mayContainHash(uint64_t hash) const;
   bool mayContain(std::string_view id) const { return mayContainHash(IdFilter::hash(id)); }
 

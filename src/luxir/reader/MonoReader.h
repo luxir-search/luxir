@@ -28,7 +28,7 @@ public:
 
   MonoReader() = default;
   MonoReader(SegmentCore& core, field_parts::Slice slice, int64_t numValues,
-             PackedTerm field = PackedTerm(nullptr));
+             PackedTerm field = PackedTerm(nullptr), ReadClass readClass = ReadClass::DATA);
 
   static MonoReader openEndValueRanks(PostingsReader& reader, const DecodedFieldRecord& fieldInfo);
 

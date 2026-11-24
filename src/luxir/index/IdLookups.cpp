@@ -28,16 +28,18 @@ bool IdFilterProbe::load() {
   if (!part) return true;
   if (byBlock) {
     filter = IdFilter::parseHeader(core->slice(header(), ReadClass::METADATA), part.bytes);
-    if (!filter || filter->filterKind() == IdFilter::Kind::BLOOM) {
+    if (filter && filter->filterKind() == IdFilter::Kind::BLOOM) {
       loaded = true;
       return true;
     }
-    // Another kind probes elsewhere than one block: read it whole.
+    // Another kind probes elsewhere than one block, and a header that does
+    // not parse is checked whole: read it whole.
     byBlock = false;
     filter.reset();
     if (!core->held(part)) return false;
   }
-  filter = IdFilter::parse(core->slice(part));
+  // Throws SegmentCorruptError when the part does not parse.
+  filter = core->idFilter();
   loaded = true;
   return true;
 }
@@ -134,7 +136,7 @@ uint64_t acquireIdLookups(std::span<SegmentIdLookups* const> segments) {
   for (size_t i = 0; i < segments.size(); ++i) whole[i] = !segments[i]->filter.load();
   if (std::ranges::find(whole, true) != whole.end()) {
     rounds.run([&](size_t i, SegmentIdLookups& segment, Declared& out) {
-      if (whole[i]) out.add(segment.core, segment.field.idFilter(), ReadClass::DATA);
+      if (whole[i]) out.add(segment.core, segment.field.idFilter(), ReadClass::METADATA);
     });
     for (size_t i = 0; i < segments.size(); ++i) {
       if (whole[i]) segments[i]->filter.load();

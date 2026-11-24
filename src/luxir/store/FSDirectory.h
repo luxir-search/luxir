@@ -75,7 +75,6 @@ public:
 
   size_t size() override { return sz_; }
 
-  using InputFile::acquire;
   HeldRange acquire(ByteRange range) override {
     checkRange(range, sz_);
     return {data_ + range.offset, range.length};
@@ -425,8 +424,8 @@ public:
               [](const FileInfo& a, const FileInfo& b) { return a.name < b.name; });
   }
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) override {
-    unused(expectSynced, size);
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) override {
+    unused(options);
     auto path = filePath(name);
     // Only absence is a null result; an unreadable file is an error, never
     // evidence that the file does not exist.

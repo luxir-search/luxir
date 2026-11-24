@@ -154,23 +154,38 @@ other backends release through the hold's `HoldOwner`.
 - The data address is congruent to the file offset modulo 16, so alignment the
   writer gave a structure in the file holds in memory.
 
-`InputFile::acquire(ranges, done)` acquires a batch of ranges together, so a
-backend can merge them and issue them at once. It calls `done` exactly once,
-on any thread, with one hold per range in the order requested or with an
-error and no holds. The holds follow the single-acquire contract. The
-default acquires each range in turn and completes inline, and
-`acquireAll(ranges)` blocks on the batch and returns its holds.
+`InputFile::acquireBatch(ranges, done)` acquires a batch of ranges together,
+so a backend can merge them and issue them at once. It never throws: it
+calls `done` exactly once, possibly inline, from any thread, with one hold
+per range in the order requested or with an error and no holds, and every
+failure, including one to issue the batch, arrives that way. The holds
+follow the single-acquire contract. The default acquires each range in turn
+and completes inline, and `acquireAll(ranges)` blocks on the batch and
+returns its holds.
 
-A segment reads every part through `SegmentCore::slice()`, or through
-`SegmentCore::slices()`, which issues one batch per file and keeps the holds
-the same way. A manifest open acquires each file's header and the catalog
-range and nothing else, never a whole segment file. A snapshot open issues one
-batch per new segment's file 0, holding its header and catalog, issues all of
-them before it decodes any catalog, and waits on them together, so a backend
-that completes batches asynchronously serves every catalog in one round. The
-headers of the other files still follow, one acquire each. For now the segment
-keeps the holds it hands out until it closes, so nothing held is evicted;
-releasing holds when a request ends comes with a bounded cache.
+A completion runs on a backend thread and takes the locks of whatever keeps
+the holds, such as a segment's holds lock. A caller must not hold, across a
+backend call, any lock that a batch completion takes: a backend that serves
+blocking acquires and completes batches on the same threads would deadlock.
+`SegmentCore::retain()` therefore acquires outside its holds lock.
+
+A segment reads every part through `SegmentCore::slice()`. Its
+`acquireSlices()` acquires parts ahead in one batch per file, skipping parts
+already held, and keeps the holds the same way. A manifest open acquires
+each file's header and the catalog range and nothing else, never a whole
+segment file. It opens every file the manifest lists, then issues one batch
+per file: file 0's header with the catalog, every other file's header
+alone. A snapshot open issues the batches of all its new segments before it
+waits on any, so a backend that completes batches asynchronously serves
+every header and catalog in one round. A header's hold is released once
+checked. Each segment's batches report failure to that segment, and the
+segments fail in order as if opened one at a time: the lowest failing
+segment's error surfaces, naming the segment, whichever batch completed
+first. The open takes the same path on every backend; files with free
+holds (RAM, mmap) differ only in that `slice()` retains nothing for them
+and `acquireSlices()` issues no batch. For now the segment keeps the holds
+it hands out until it closes, so nothing held is evicted; releasing holds
+when a request ends comes with a bounded cache.
 
 Everything else a reader needs from a segment or snapshot waits for its first
 use:
@@ -184,10 +199,11 @@ use:
   Live counts come from the manifest's `live_docs`, so counting rows reads
   nothing; a decoded count that differs is a `SegmentCorruptError`.
 - A snapshot opens each segment overlay's files and opens the overlay's reader
-  (a vector index, for example) on first use. Overlay kinds choose a policy:
-  an on-demand overlay whose bytes are invalid fails its use as corruption,
-  and an advisory one is replaced by a reader that answers nothing, leaving
-  the segment in service.
+  (a vector index, for example) on first use, from those files. A kind's
+  open reports invalid bytes as `SegmentCorruptError`, and the kind's policy
+  decides what that means: a required overlay fails its use, and an advisory
+  one, an accelerator with an exact fallback, reads as absent from then on,
+  as on a segment that never had one. Vector indexes are required.
 - The open `InputFile` keeps the bytes readable until it is released (see
   `Directory::openFile`), so a later first use does not race the writer
   retiring files of an older commit.
@@ -195,9 +211,6 @@ use:
   backend's error and the next use reads again; bytes that fail validation
   throw `SegmentCorruptError` on every use. The scrubber still checks every
   file of a snapshot, read or not.
-- `segmentOpenCounters` counts the segments with a first hold beyond the
-  catalog and the bytes those holds cover (`segments_opened`,
-  `segment_bytes_mapped`). Free views (RAM, mmap) are not counted.
 
 A query declares what it will read in each segment before it reads it
 (`search/DeclaredReads.h`), so that its cold reads cost a few rounds rather
@@ -238,17 +251,22 @@ than one acquire per part per segment:
 
 Two more properties of the open path:
 
-- A manifest open passes each file's recorded size to `Directory::openFile`,
-  so a backend can answer `size()` without a request. Files with free holds
-  (RAM, mmap) are local, and the open still checks their size against the
-  manifest.
+- A manifest open passes each file's recorded size to `Directory::openFile`
+  and checks it against `size()` once per file; after a sized open, `size()`
+  makes no request. A remote directory can keep a cached listing of its
+  prefix (names, sizes, ETags), answer `openFile` and `size()` from it, and
+  list again when a name is missing, so neither existence nor size costs a
+  request per file. With a passed size it needs the listing only for
+  existence.
 - Each acquire carries a `ReadClass`. `METADATA` marks what a reader navigates
   by: file headers, the catalog, version runs, term block offsets and tries,
-  and the directories and indexes over column and point blocks. Everything
-  else, term blocks included, is `DATA`. A bounded cache can then keep
-  metadata for a segment's life and release data when a request ends. A part
-  is held once, under the class of its first slice; each part has one reader
-  path, so the class does not vary.
+  the id filter, the stored-field chunk index, and the directories and
+  indexes over column and point blocks. Everything else, term blocks
+  included, is `DATA`.
+  Whoever keeps a hold decides how long it lives: the segment for what it
+  keeps, a request for what it uses. The class is a hint a cache or backend
+  may use for residency and scheduling after release, and it never changes
+  the bytes returned. A part has one class whichever reader acquires it.
 
 The manifest identifies the segment catalog at the end of file 0 by offset,
 length and xxh3, and rejects a segment without that range. Every open from
@@ -271,27 +289,27 @@ of each term as the dictionary stores it (the fitted form, so a long id is
 never falsely absent), the same hash whose low byte the term blocks keep.
 Every flush and merge rebuilds it from the terms it writes, so it has exactly
 one key per term. The writer checks an id against the exact dictionary bounds
-in the record header and then the filter, and looks up only the segments and
-ids that pass.
+and then the filter, and looks up only the segments and ids that pass.
+Writers build no filter unless `--indexing.id-filter` names a kind (see the
+operations guide).
 
 The part starts with a 24-byte header that names its kind and parameters, so
-a reader needs nothing else and the writer may change them freely
-(`--indexing.id-filter`, see the operations guide). Two kinds exist:
+a reader needs nothing else and the writer may choose them per segment. A
+part that does not parse is a corrupt segment. Two kinds exist:
 
 - `bloom`: a split-block Bloom filter in 32-byte blocks, sized for the
-  segment's document count at 16 bits per id by default (about 0.13% of
-  absent ids pass), and at least 16 KiB so a small segment almost always
-  excludes an absent id. Built in one pass.
+  segment's document count at 16 bits per id unless configured otherwise
+  (about 0.13% of absent ids pass), and at least 16 KiB so a small segment
+  almost always excludes an absent id. Built in one pass.
 - `fuse8` and `fuse16`: a 3-wise binary fuse filter with 8- or 16-bit
   fingerprints, 1.13 (millions of ids) to about 1.25 (thousands) fingerprints
-  per id. 0.39% or 0.0015% of absent
-  ids pass. It is static: the writer holds every key's hash until the
-  dictionary ends and then builds it.
+  per id. 0.39% or 0.0015% of absent ids pass. It is static: the writer holds
+  every key's hash until the dictionary ends and then builds it.
 
 A batch of ids skips a segment only when every id misses, so the false
 positive rate that matters is per batch: at 2,000 ids per commit, a 16-bit
-Bloom filter skips about 7% of segments and `fuse16` about 97%. Which kind
-to ship as the default is to be settled by benchmarking both.
+Bloom filter skips about 7% of segments and `fuse16` about 97%. Whether a
+kind should be on by default, and which, is to be settled by benchmarking.
 
 Each field record encodes the schema flags as an unsigned vint, excluding
 `ABSTRACT` and `DERIVED`. Bits 0-2 encode the cumulative postings level
@@ -346,8 +364,9 @@ needs:
   their inputs through the cache;
 - id lookups for updates and deletes that skip cold segments without
   fetching them. Append-only collections need no lookups. Otherwise the
-  exact id bounds in each segment's catalog and its id filter part do the
-  skipping, from the catalog alone. On segments without free views, a delete
+  exact id bounds in each segment's catalog do the skipping, and the id
+  filter part, a small metadata read, skips most of what the bounds keep.
+  On segments without free views, a delete
   application acquires what its lookups read ahead of them, in rounds that
   each wait once on one batch per segment file, across every segment and id
   of the batch (`acquireIdLookups`): the filter (whole up to 64 KiB, else its
@@ -383,20 +402,79 @@ small, and it would change only when the set of segments does. A search
 across many collections could then skip a whole collection from the manifest
 alone, without reading any segment's catalog or opening the collection.
 
-Per-segment bounds prove "no match" when a query's range does not overlap
-them, and "every document matches" when the minimum and maximum equal the
-queried value and every document has the field. Declared partition
-descriptors, which would reject documents at ingest, would add a
-collection-level guarantee about future documents. They wait for a concrete
-use.
+### Query-time pruning
+
+`Query::mayMatch` uses the physical field's record in one segment to prove
+that no row matches, including deleted rows. `CatalogSummaryView` reads
+the decoded record through `FieldSegments::at`. The segment core owns both
+the record and its catalog bytes. Field lookups, including misses, are shared
+across the request on each reader view.
+
+A missing record proves that the segment lacks the field. Every present
+record represents at least one document. An unreadable record or a
+schema/persisted type mismatch supplies no evidence. Proofs add no request
+errors. Weight construction checks the fields that execution uses.
+
+| Query | Proof of absence |
+| --- | --- |
+| term, term set, phrase, combined fields | a term is absent if its field has no record or no indexed terms, or its dictionary bounds exclude the term. One absent term excludes a phrase. Every alternative must be absent for a term set or combined-field query. |
+| prefix, term range | no record, no indexed terms, or dictionary bounds disjoint from the prefix or range |
+| fuzzy and other expansions | no record or no indexed terms |
+| numeric range or value set | no record or no admitted value inside the scalar bounds |
+| exists | no record |
+| geo box, distance, polygon | no record or a query bounding box disjoint from the geo bounds |
+| range field | no record or a relation box disjoint from the interval bounds on either the low or high endpoints |
+| to_parent | the segment has no rows in the child space, or the child query is proven empty over them |
+| match-no-docs | always |
+
+Term comparisons use the analyzed and fitted bytes used for the dictionary
+seek. An exact lower or inclusive upper endpoint may itself be present. A
+`ROUNDED` lower endpoint is a strict prefix of the smallest term. An
+`EXCLUSIVE` upper endpoint is greater than every term. An `UNBOUNDED` upper
+endpoint supplies no upper limit.
+
+A Boolean reads the compiled plan in the row space where logical validation
+ran. An empty required or filter clause proves the conjunction empty.
+Distinct optional clauses must be able to meet the plan's adjusted
+`minShouldMatch`. Prohibited clauses supply no proof. A Boolean without a
+validated plan, or a query without a proof rule, answers `UNKNOWN`.
+
+`QueryPruning` memoizes a membership mask per query and validation context.
+A root weight carries the mask if it excludes any segments. In an excluded
+segment the weight returns a null supplier or scorer and a zero metadata
+count. Materializing the filter gives an empty domain. An eligible filter
+cache use still probes its slot and can publish raw empty membership.
+Field totals include every segment. A term's statistics omit a dictionary
+seek only where the field record proves that particular term absent.
+
+If every segment of a nonempty reader excludes a root, the planner selects
+the empty weight unless its context may require whole-index preparation.
+This also proves requests that fall in a gap between segments' bounds. The
+authored query retains its cache key and its filters. A field error detectable
+only by the elided weight can consequently go unreported. There is no
+in-memory or persisted collection summary. A summary outside the collection
+would be useful for a search that must skip a collection it cannot open.
+
+After preparation, TopDocs can finish a segment early when its own result
+and every domain variant it owes are empty. A routed ANY filter requires
+every source to be empty. A reset variant can produce rows even from an empty
+input. Children receive their domains and collectors finish through the
+ordinary path, including named zero-count buckets. A filter or incoming
+domain alone cannot establish zero raw membership for the main query's
+cache key. Pruning leaves upstream domains intact, so a mapped kNN filter
+chooses its global top k before the consuming op skips collection.
+
+Explain lists the selected roots whose proofs exclude segments. An empty
+weight gets one representative segment and reason. A cache hit that omits
+the weight has no root proof to report. The `pruning` execution profile
+records the segment skips actually taken and their reasons.
 
 ## Many collections
 
 Searching several collections is a direction, not scheduled. The likely shape
 is one search over the segments of each collection's pinned snapshot, so that
-existing execution merges results across segments. Pruning then works at both
-levels: a collection's summary skips it entirely, and segment bounds skip
-segments within the collections that remain. Open problems:
+existing execution merges results across segments. Each open reader can use
+its own segment bounds. Three questions remain for multi-collection execution.
 
 - segment identity across collections, which the filter cache keys on;
 - per-reader ordinal maps, which would rebuild whenever any member commits;

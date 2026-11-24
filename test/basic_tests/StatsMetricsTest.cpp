@@ -161,6 +161,8 @@ TEST_F(StatsMetricsTest, EveryNumericFieldIsRenderedOrJsonOnly) {
       "collections.shards.index.totals.committed_segments", "collections.shards.index.totals.max_docs",
       "collections.shards.index.totals.collections", "collections.shards.index.totals.shards",
       "memory.field_metadata.bytes",
+      // A count beside its rendered bytes gauge.
+      "memory.live_docs_heaps",
       // HTTP only.
       "service.grpc.connections", "service.grpc.io_threads",
   };

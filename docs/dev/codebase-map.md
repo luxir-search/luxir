@@ -59,16 +59,18 @@ locations, browse `src/luxir/<area>/`.
 3. **Segment Reading** (`src/luxir/reader/`)
    - `SegmentCore` owns a segment bundle's open files, retained byte ranges, root
      VersionRuns and ownership shapes, shared across snapshots and with the writer.
-     A manifest open reads only file headers and the catalog; version runs and shapes
-     are built on first use and a failed build is retried by the next use. `slice()` acquires
-     parts from the files, `slices()` acquires them in one batch per file, and
-     both retain holds that need release until the core closes. File 0's catalog indexes field records by row-space path (root is
-     the empty path) and field name. Each space has a
-     `PostingsReader` with its own row count and immutable, on-demand record cache.
-     Records contain counts, bounds and data slices. Numeric leaf metadata
-     and stored metadata are opened and cached separately. Codec cursors borrow
-     the space reader and its acquired bytes. Opens from a manifest check the catalog
-     against the manifest's xxh3 first; invalid segment bytes throw `SegmentCorruptError`
+     A manifest open reads only file headers and the catalog; version runs and
+     shapes are built on first use and a failed build is retried by the next use.
+     `slice()` acquires
+     parts from the files, `acquireSlices()` acquires them ahead in one batch per
+     file, and both retain holds that need release until the core closes. File 0's
+     catalog indexes field records by row-space path (root is the empty path) and
+     field name. Each space has a `PostingsReader` with its own row count and
+     immutable, on-demand record cache. Records contain counts, bounds and data
+     slices. Numeric leaf metadata and stored metadata are opened and cached
+     separately. Codec cursors borrow the space reader and its acquired bytes.
+     Opens from a manifest check the catalog against the manifest's xxh3 first;
+     invalid segment bytes throw `SegmentCorruptError`, an internal `ApiError`
    - A term lookup holds the routing data, then the block it lands in, then the found term's
      postings; a part of at most `WHOLE_READ_BYTES` or on a file with free holds is held whole.
      `SegmentCore::acquireParts` batches parts of mixed read classes per file, `held()` says
@@ -76,8 +78,9 @@ locations, browse `src/luxir/<area>/`.
      parts for warming (`IndexReader::listParts`)
    - `IdFilter`: the root id field's FILTER part, a membership filter over its
      dictionary terms that names its own kind (split-block Bloom or binary fuse) and
-     parameters. `IdFilter::Options` picks what a writer builds. `SegmentCore::mayContainId` checks the exact id bounds, then the
-     filter; the writer's delete application skips ids and segments it excludes
+     parameters. `IdFilter::Options` picks what a writer builds (none by default).
+     `SegmentCore::idFilter` reads it; the writer's delete application skips ids
+     and segments it excludes
    - `IdLookups` (index/): on segments without free views, `acquireIdLookups` acquires what a
      delete application's id lookups read, in rounds across its segments and ids (filter
      header and blocks through `IdFilterProbe`, routing data, term blocks, postings); the
@@ -129,6 +132,15 @@ locations, browse `src/luxir/<area>/`.
    - Child liveness is derived lazily from root deletes through ownership ranges;
      metadata-only count probes use conservative bounds until it is known.
    - Supports Term, Boolean, Phrase, and All queries
+   - `CatalogSummaryView` reads core-owned field records through
+     `IndexReader::FieldSegments::at`. Query rules in `CatalogPredicates.h`
+     and the validated Boolean plan implement `Query::mayMatch`.
+     `QueryPruning` memoizes raw membership by root and validation context.
+     `Query::Context::createRootWeight` selects the empty weight or attaches
+     an excluding mask to the real weight. `TopDocsReq::outputsEmpty` checks
+     the list and its routed variants after preparation. Explain reports
+     planned exclusions and the pruning profile records actual segment skips.
+     See [storage design](../design/storage.md#query-time-pruning).
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
      column scans. `BKDQueryWeight<QueryType, Relation>` serves geo box,
@@ -163,6 +175,10 @@ locations, browse `src/luxir/<area>/`.
      - `IndexHandler`: One physical representation, owned by `indexHandlers`;
        finish/flush visits each once in global physical-name order
    - `PostingsWriter`: used by an Inverter on flush to write a new segment.
+   - `LiveDocsWriter`: one immutable file per delete generation (indexing errors,
+     applied deletes, merge live docs diffs): a DENSE live bitmap, mapped in place
+     by `LiveDocs::create`, or with few deletes a SPARSE list of deleted doc ids,
+     which readers expand into a heap bitmap (`memory.live_docs_heap_bytes`).
    - `PointsWriter` builds 1-D sorted leaves. `BasicBKDWriter<PointTraits>`
      shares 2-D tree construction, docid codecs, and the bounded parallel leaf
      pipeline: `BKDInt32Traits` serves geo (`BKDWriter`), and `BKDInt64Traits`
@@ -171,19 +187,26 @@ locations, browse `src/luxir/<area>/`.
      run-merging and rebuilds 2-D BKDs from the merged column.
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)
-   - `VectorReader`: reads column-stored vectors for exact flat KNN
-   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (RaBitQ by default, or explicit PQ) aux overlays for ANN
+   - `VectorReader`: reads column-stored vectors in the segment's `VectorEncoding`
+     (`codec/VectorCodec.h`: f32, f16, bf16, per-vector sq8) for exact flat KNN
+   - `VectorScorer` (`query/`): the one place a float query is scored against a stored row
+     per encoding (FAISS scalar-quantizer computers for f16 and bf16), shared by the
+     flat column scan and candidate rescore
+   - `VectorTranscoder`: a vector column's encoding in a merge (the schema's current one),
+     re-encoding inputs in another; `SegmentMerger` passes each value through it
+   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (RaBitQ by default, or explicit PQ) aux overlays for ANN, built from the decoded column
    - `util/VectorRotation.h`: seeded orthogonal FHT-Kac transform shared by ANN builders, readers and queries; parameters define the rotation disk contract.
-   - Reuses column storage for exact search, cosine raw-column normalization, and full-precision rescoring
+   - Reuses column storage for exact search, cosine raw-column normalization, and candidate rescoring
    - See [../guide/vector-search.md](../guide/vector-search.md) for the user contract (query knobs, scoring, recall) and [../design/vector-search.md](../design/vector-search.md) for the overlay/build/query internals
 
 7. **Storage** (`src/luxir/store/`)
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
      `FSDirectory` (on-disk, mmap reads), `CheckedDirectory` (validation wrapper)
-   - `InputFile`: acquires file ranges as `HeldRange` objects, one at a time or in
-     a completion-based batch (`AcquireJoin` waits on batches across files). RAM
-     and mmap supply views valid for the file's lifetime. Each `ByteRange` carries a `ReadClass`
-     (`METADATA` or `DATA`), and `Directory::openFile` takes the size a manifest records
+   - `InputFile`: acquires file ranges as `HeldRange` objects, one at a time or in a
+     completion-based batch (`acquireBatch`; `AcquireJoin` waits on batches across
+     files). RAM and mmap supply views valid for the file's lifetime. Each `ByteRange`
+     carries a `ReadClass` (`METADATA` or `DATA`), and `Directory::openFile` takes
+     `OpenOptions` (`expectSynced`, and the size a manifest records)
    - `InputStream` / `OutputStream`: codec I/O primitives. The catalog and record
      codecs validate directory entries, field offsets and data slices within their input ranges
    - `IndexFormat`: the on-disk format version, recorded in each manifest and in every data

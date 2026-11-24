@@ -7,7 +7,7 @@ knobs, scoring, recall) is in
 
 The stored vector column is the source of truth; ANN indexes are derived,
 per-segment aux overlays behind an engine seam. Exact flat KNN, cosine
-raw-column normalization, full-precision rescoring, and creation of missing
+raw-column normalization, candidate rescoring, and creation of missing
 overlays all read or regenerate from the column.
 
 `truncate_dims` (Matryoshka prefix truncation) is applied before the column:
@@ -21,6 +21,74 @@ such as `pq.m` are validated against `storedDims()`. Truncation requires
 `dims`, since stored lengths can no longer tell models apart, and cosine,
 under which a prefix cut here and one renormalized by the provider score the
 same.
+
+## Column Encoding
+
+A vector field's column stores one fixed-size value per vector in the field's
+`encoding`: `f32` (4 bytes per dimension), `f16` or `bf16` (2), or `sq8`
+(8 + dims bytes per vector). The encoding is recorded on each segment's column
+descriptor in the field catalog (an f32 column records nothing) rather than
+read from the schema, so a schema change never reinterprets an
+existing segment, and the column stays a plain fixed-size binary column
+(`dims` is derived from the value size and the encoding).
+
+`bf16` keeps the high 16 bits of each float32, rounded to nearest even with
+integer operations on the float bits, so the stored bytes do not depend on the
+compiler or CPU. It keeps the float32 exponent, and accepted elements are at
+most 2^40 in magnitude, so rounding never overflows and `bf16` needs no range
+check. `f16` keeps three more bits of precision but rejects elements above
+65504.
+
+`sq8` follows the per-vector scaling of LVQ (Aguerrebere et al., "Similarity
+search in the blink of an eye with compressed indices", VLDB 2023,
+arXiv:2304.04759): each value is `offset, scale, codes[dims]` with
+`x[i] ~= offset + scale * code[i]`, where offset is the vector's minimum and
+scale is its range over 255. LVQ also centers the data on a dataset mean
+before quantizing; Luxir does not, because any shared statistic would tie a
+stored value to the segment it was written in. With purely per-vector
+parameters:
+
+- Each value is self-describing, so a merge copies values that are already in
+  its output encoding verbatim.
+- No per-segment or per-dimension statistics exist, so nothing has to be
+  recomputed or reconciled when immutable segments merge, and a vector's
+  bytes do not change when its neighbors are deleted.
+- Quantization error is bounded by each vector's own range: half a step,
+  `(max - min) / 510`, per element.
+
+A merge writes the schema's current encoding, so a field converges to its
+declared encoding as its segments merge; when the schema no longer has a
+vector type under the field's name, it keeps the first non-empty input's
+encoding. Inputs already in the output encoding are byte copies. Every other
+input is decoded and re-encoded, whether the inputs differ from each other or
+all share an out-of-date encoding. Re-encoding to a narrower encoding is
+lossy. `f16` clamps elements to its range and logs one warning per merged
+field with the clamped-element count; `bf16` and `sq8` never clamp. Cosine
+rows promoted to `f32` in a field that stores unit vectors are renormalized,
+since a decoded unit vector is only approximately unit length.
+`VectorTranscoder` owns this policy: `SegmentMerger` asks it for the output
+encoding and passes each value through it, as `VectorHandler` describes the
+column to `StrColHandler` at flush. Only segments that merge are re-encoded;
+a forced merge rewrites the segments it merges.
+
+Ingest validates the vector it will store. A cosine field that keeps raw
+vectors (`normalize_on_write: false`) checks the norm of the encoded vector
+after decoding, so a vector whose elements underflow in `f16` is skipped like
+a zero vector instead of being stored without a direction.
+
+Exact scoring means exact over the stored values. `VectorScorer` is the single
+place a float query is scored against a stored row, used by the flat column
+engine and the terminal candidate rescore. `f16` and `bf16` rows are scored in
+place by FAISS's `ScalarQuantizer` distance computers (`QT_fp16` and
+`QT_bf16` read the layouts written here and need no training); cosine takes
+the dot from an inner-product computer and `|x|^2` from an L2 computer against
+an all-zero query, a second pass over the row. `sq8` rows are decoded into a
+per-task buffer and scored with the float32 kernels, rather than scoring the
+codes against per-vector offset and scale terms, which cancel catastrophically
+for a query with a large dynamic range. Either way a score is the f32 score of
+the stored vector up to summation order. Cosine over a non-f32 row always
+divides by the stored vector's norm, since a quantized unit vector is not
+exactly unit length.
 
 ## Overlay Lifecycle
 
@@ -243,7 +311,9 @@ defaults are close in recall (0.953 vs 0.960 at the default nprobe; 0.989 vs
 coarse assignment, took 10.2 s (RaBitQ, 140 B/vector) vs 16.7 s (PQ m=32,
 55 B/vector) at 768 dims and 10.4 s vs 12.9 s at 128 dims. Bytes per vector
 include the 8-byte id and per-overlay headers (centroids, and for RaBitQ the
-stored d x d rotation).
+stored d x d rotation), as the overlay was laid out at the time; the
+[guide](../guide/vector-search.md#index-settings) gives the current per-vector
+layout.
 
 The Cohere-768 cosine comparison motivating PQ's automatic `m=96` is:
 
@@ -276,8 +346,9 @@ PQ floor, and the exact path keeps small segments exact.
 
 The training set is a strided sample across the segment's vector values, not
 a prefix sample. This avoids training only on the oldest values when data
-inside a segment is time ordered. The builder normalizes vectors for FAISS
-when the field uses cosine and the stored column is raw.
+inside a segment is time ordered. The builder decodes the column and
+normalizes vectors for FAISS when the field uses cosine and its input is raw
+(a raw column or a quantized column).
 
 The sample holds `ivfTrainingPointsPerCentroid` (100) vectors per trained
 centroid: the IVF lists for RaBitQ, and the larger of the lists and the 2^bits
@@ -304,8 +375,9 @@ Raw-cosine training samples are normalized in place in their owned buffer.
 RaBitQ rotates the sample in place in row partitions; PQ needs no transform.
 Each add scratch buffer is limited by `ivfAddChunkBytes` (16 MiB by default),
 capped by available vectors with a minimum of one vector. Add uses up to two
-buffers for raw cosine plus rotation. Untransformed PQ add passes column bytes
-directly to FAISS. The serialized header's `nprobe` is unused by Luxir:
+buffers for raw cosine plus rotation. Untransformed PQ add passes f32 column
+bytes directly to FAISS; f16, bf16 and sq8 columns decode one chunk at a time into
+an owned buffer, normalized in place for cosine. The serialized header's `nprobe` is unused by Luxir:
 searches supply explicit probe parameters or selected lists.
 
 ### Build parallelism
@@ -367,7 +439,7 @@ the fixed 1.9 confidence multiplier. These amplitudes support empirical
 confidence intervals; they are not deterministic error bounds. The reader
 exposes a mmap view, validates finite, non-negative amplitudes once at open and
 exposes per-list spans for sequential, unchecked scan loads. Metadata and footer
-version 3 validate the component count and file size;
+version 4 validate the component count and file size;
 older formats fail on open and must be rebuilt.
 
 `VectorIndexBuilder::finishRaBitQCode` writes the sign-bit factors for every
@@ -495,7 +567,11 @@ priced as `2^bits * dims` distance dimensions with an unfitted seed equal to
 the exact-dimension cost. Interval terminal reads have a shared floor of
 `min(k, examined interval vectors)`, with dimensions scaled by the
 read-weighted average. Every query pays a request constant, and any query that
-runs IVF pays a second one. Units are nanoseconds divided by the cost of one exact
+runs IVF pays a second one. Exact and terminal dimensions are weighted by the
+segment column's encoding (`Costs::ENCODING_DIM_COST`, measured against f32),
+with a higher weight for cosine on a non-f32 column, which pays a second pass
+for the stored norm.
+Units are nanoseconds divided by the cost of one exact
 dimension; counters expose the same units, and `KnnPlanner::Costs` records what
 they were fitted on.
 
@@ -662,7 +738,8 @@ Then `T = max(k-th exact seed score, pessimistic witness floor)` selects the
 remaining interval values by `upper >= T`. A value whose upper score is below
 its unit's best known exact score is also skipped. Both stages read in segment
 and value-rank order, with disjoint column reads and a shared exact-score cache.
-Final unit collapse and similarity filtering use exact scores.
+Final unit collapse and similarity filtering use exact scores, exact over the
+stored values.
 Before similarity filtering, a diagnostic reports an unsupported floor and
 its distinct-unit shortfall when fewer than k exact units reach the final
 witness floor; it changes no selection behavior and does not detect every
@@ -681,7 +758,7 @@ A single query's scan and rescore run in parallel when the request executes in
 parallel mode. The selected IVF lists are split into contiguous per-segment
 chunks sized by their actual vector counts, and each chunk (plus each
 column-scanned segment) is scanned as an independent task; the terminal
-full-precision rescore runs one task per segment whose candidate bucket
+column rescore runs one task per segment whose candidate bucket
 exceeds a small grain (smaller buckets, including the common small-`k`
 single-segment pool, fold inline on the calling thread).
 

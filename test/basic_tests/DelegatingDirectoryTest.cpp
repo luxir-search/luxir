@@ -47,7 +47,7 @@ TEST(DelegatingDirectoryTest, everyVirtualForwards) {
   ASSERT_EQ(3u, listing.size());
   EXPECT_EQ("a.bin", listing[0].name);
   EXPECT_EQ(5u, listing[0].size);
-  EXPECT_EQ(ram->openFile("a.bin"), dir.openFile("a.bin", true));
+  EXPECT_EQ(ram->openFile("a.bin"), dir.openFile("a.bin", {.expectSynced = true}));
   EXPECT_EQ(nullptr, dir.openFile("missing"));
   EXPECT_EQ(&*ram, &dir.underlying());
 
