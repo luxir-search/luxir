@@ -18,19 +18,21 @@ normalization, and the query parser cuts the query vector the same way.
 declared input one, so the column, overlays, exact scan and rescoring see
 only the truncated vector and need no special casing; schema `ann` settings
 such as `pq.m` are validated against `storedDims()`. Truncation requires
-`dims`, since stored lengths can no longer tell models apart, and cosine,
-under which a prefix cut here and one renormalized by the provider score the
-same.
+`dims`, since stored lengths can no longer tell models apart. Cosine
+renormalizes the prefix, so truncating here or at the provider scores the
+same. Hamming keeps the signs of the prefix and requires a multiple of eight
+stored dimensions.
 
 ## Column Encoding
 
 A vector field's column stores one fixed-size value per vector in the field's
 `encoding`: `f32` (4 bytes per dimension), `f16` or `bf16` (2), `sq8`
-(8 + dims bytes per vector), or `bit` (one bit per dimension). The encoding is recorded on each segment's column
-descriptor in the field catalog (an f32 column records nothing) rather than
-read from the schema, so a schema change never reinterprets an
-existing segment, and the column stays a plain fixed-size binary column
-(`dims` is derived from the value size and the encoding).
+(8 + dims bytes per vector), or `bit` (one bit per dimension). The encoding
+is recorded on each segment's column descriptor in the field catalog (an f32
+column records nothing) rather than read from the schema, so a schema change
+never reinterprets an existing segment, and the column stays a plain
+fixed-size binary column (`dims` is derived from the value size and the
+encoding).
 
 `bf16` keeps the high 16 bits of each float32, rounded to nearest even with
 integer operations on the float bits, so the stored bytes do not depend on the
@@ -57,10 +59,11 @@ parameters:
   `(max - min) / 510`, per element.
 
 A merge writes the schema's current encoding, so a field converges to its
-declared encoding as its segments merge; when the schema no longer has a
-vector type under the field's name, it keeps the first non-empty input's
-encoding. Inputs already in the output encoding are byte copies. Every other
-input is decoded and re-encoded, whether the inputs differ from each other or
+declared encoding as its segments merge; when the inputs cannot convert to it
+(the `bit` boundary, below) or the schema no longer has a vector type under
+the field's name, it keeps the first input's encoding. Inputs already in the
+output encoding are byte copies. Every other input is decoded and re-encoded,
+whether the inputs differ from each other or
 all share an out-of-date encoding. Re-encoding to a narrower encoding is
 lossy. `f16` clamps elements to its range and logs one warning per merged
 field with the clamped-element count; `bf16` and `sq8` never clamp. Cosine
@@ -73,20 +76,24 @@ a forced merge rewrites the segments it merges.
 
 `bit` packs each dimension's sign (set when the element is > 0), dimension 0
 in the high bit of the first byte, for binary embeddings and fingerprints.
-It is the encoding of the `hamming` metric and only of it: `hamming` defaults
-to `bit` and rejects any other encoding, `bit` allows only `hamming` or
-`none`, and the stored dimension (`truncate_dims` when set) must be a multiple
-of 8, checked by the schema or, for inferred dims, at ingest. `bit` stores
-signs, not values, so it is not a precision of the float encodings, and a
-merge never converts between them in either direction
-(`vcodec::convertible`). Changing a declared field across that boundary is a
-schema error (`IndexWriter::updateSchema`, as for a date field's unit). A
-field declared again after its removal, or one a template defines, can still
-meet older segments on the other side: `VectorTranscoder` then keeps the
-inputs' own encoding when they all share a side, and a merge whose inputs
-straddle the boundary fails before writing anything and is contained like any
-merge failure. Queries over such a segment fail the same way (`VectorScorer`
-rejects the pair), and the field has to be reindexed.
+`hamming` requires `bit`, which also supports `none` for storage only. The
+stored dimension (`truncate_dims` when set) must be a multiple of eight,
+checked by the schema or at ingest for inferred dims. Merges never convert
+between bit and float encodings (`vcodec::convertible`).
+
+`IndexWriter::updateSchema` scans published vector columns if a vector
+definition is added, removed, or changes sides. It compares how the column's
+name resolves in the two schemas and rejects a new mismatch with the stored
+encoding. This includes removing a declaration that exposes an incompatible
+template. An empty field can change encoding. Buffered writes pinned to an
+earlier schema can still publish old-side segments.
+
+When candidates span both sides for a field, merge admission picks the side
+with more candidates. A tie follows the current vector type, or the first
+candidate if there is no current vector type. Each side can merge
+independently. kNN fails if an eligible vector uses an encoding incompatible
+with the current metric. Once the old documents are deleted, queries can
+score the new vectors even before a merge.
 
 Ingest validates the vector it will store. A cosine field that keeps raw
 vectors (`normalize_on_write: false`) checks the norm of the encoded vector
@@ -120,12 +127,11 @@ exactly unit length.
 query packed like a stored row once per scorer, in integers, so it is exact.
 `util/Popcount.h` holds the population counts `hamming` and `RaBitQScorer`
 share, chosen at compile time from the build's CPU target like the rest of the
-scoring code: VPOPCNTDQ counts 64-bit lanes directly, and NEON counts bytes.
-On AVX2 without VPOPCNTDQ both use the nibble shuffle table (Mula et al.);
-`hamming` switches to it from 64-byte rows, since below that the scalar 64-bit
-popcount measured faster, and above it the table is 1.5x to 1.8x faster in
-cache. Commits and
-merges build no ANN overlay for a `hamming` field
+scoring code. VPOPCNTDQ counts 64-bit lanes directly, and NEON counts bytes.
+On AVX2 without VPOPCNTDQ both use the nibble shuffle table (Mula et al.).
+`hamming` uses scalar popcount below 32-byte rows with VPOPCNTDQ and below
+64-byte rows with AVX2. The AVX2 table is 1.5x to 1.8x faster in cache from
+128 bytes. Commits and merges build no ANN overlay for a `hamming` field
 (`VectorFieldType::annIndexable`): the column is a thirty-second of `f32`
 and is always scanned exactly.
 
