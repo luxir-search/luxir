@@ -695,6 +695,14 @@ public:
   // Composites combine their children's answers (QueryPruning evaluates
   // them once per segment). The default proves nothing and marks the view
   // opaque, as such a query may read fields the view never looked up.
+  //
+  // Only absence is proven today. The opposite proof, that every row of the
+  // segment matches (ALL_ROWS: exists on a field every row has, a range that
+  // covers the field's bounds), can be answered by this same walk from the
+  // same headers when something needs it, such as count shortcuts or
+  // dropping a filter that excludes nothing. Like EMPTY it would describe
+  // rows as written, deleted ones included. A wrapper may forward EMPTY from
+  // its child but not ALL_ROWS when it can reject rows itself (min_score).
   virtual MatchState mayMatch(const CatalogSummaryView& view) const {
     view.opaque();
     return MatchState::UNKNOWN;
