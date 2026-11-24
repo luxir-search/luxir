@@ -25,8 +25,8 @@ same.
 ## Column Encoding
 
 A vector field's column stores one fixed-size value per vector in the field's
-`encoding`: `f32` (4 bytes per dimension), `f16` or `bf16` (2), or `sq8`
-(8 + dims bytes per vector). The encoding is recorded on each segment's column
+`encoding`: `f32` (4 bytes per dimension), `f16` or `bf16` (2), `sq8`
+(8 + dims bytes per vector), or `bit` (one bit per dimension). The encoding is recorded on each segment's column
 descriptor in the field catalog (an f32 column records nothing) rather than
 read from the schema, so a schema change never reinterprets an
 existing segment, and the column stays a plain fixed-size binary column
@@ -71,6 +71,23 @@ encoding and passes each value through it, as `VectorHandler` describes the
 column to `StrColHandler` at flush. Only segments that merge are re-encoded;
 a forced merge rewrites the segments it merges.
 
+`bit` packs each dimension's sign (set when the element is > 0), dimension 0
+in the high bit of the first byte, for binary embeddings and fingerprints.
+It is the encoding of the `hamming` metric and only of it: `hamming` defaults
+to `bit` and rejects any other encoding, `bit` allows only `hamming` or
+`none`, and the stored dimension (`truncate_dims` when set) must be a multiple
+of 8, checked by the schema or, for inferred dims, at ingest. `bit` stores
+signs, not values, so it is not a precision of the float encodings, and a
+merge never converts between them in either direction
+(`vcodec::convertible`). Changing a declared field across that boundary is a
+schema error (`IndexWriter::updateSchema`, as for a date field's unit). A
+field declared again after its removal, or one a template defines, can still
+meet older segments on the other side: `VectorTranscoder` then keeps the
+inputs' own encoding when they all share a side, and a merge whose inputs
+straddle the boundary fails before writing anything and is contained like any
+merge failure. Queries over such a segment fail the same way (`VectorScorer`
+rejects the pair), and the field has to be reindexed.
+
 Ingest validates the vector it will store. A cosine field that keeps raw
 vectors (`normalize_on_write: false`) checks the norm of the encoded vector
 after decoding, so a vector whose elements underflow in `f16` is skipped like
@@ -98,6 +115,19 @@ Scores may round differently across kernel levels. Within a process, the
 flat scan and rescore score a row identically. Cosine over a non-f32 row always
 divides by the stored vector's norm, since a quantized unit vector is not
 exactly unit length.
+
+`hamming` scores a `bit` row as `1 - popcount(q ^ x) / dims`, where `q` is the
+query packed like a stored row once per scorer, in integers, so it is exact.
+`util/Popcount.h` holds the population counts `hamming` and `RaBitQScorer`
+share, chosen at compile time from the build's CPU target like the rest of the
+scoring code: VPOPCNTDQ counts 64-bit lanes directly, and NEON counts bytes.
+On AVX2 without VPOPCNTDQ both use the nibble shuffle table (Mula et al.);
+`hamming` switches to it from 64-byte rows, since below that the scalar 64-bit
+popcount measured faster, and above it the table is 1.5x to 1.8x faster in
+cache. Commits and
+merges build no ANN overlay for a `hamming` field
+(`VectorFieldType::annIndexable`): the column is a thirty-second of `f32`
+and is always scanned exactly.
 
 ## Overlay Lifecycle
 

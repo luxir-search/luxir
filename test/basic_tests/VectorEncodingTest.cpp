@@ -223,7 +223,7 @@ TEST_F(VectorEncodingTest, codecRoundTrip) {
   EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::BF16, 16));
   EXPECT_EQ(-1, vcodec::dimsFromBytes(VectorEncoding::BF16, 15));
   EXPECT_EQ(-1, vcodec::dimsFromBytes(VectorEncoding::SQ8, vcodec::SQ8_HEADER_BYTES));
-  EXPECT_FALSE(vcodec::valid((int32_t)VectorEncoding::SQ8 + 1));
+  EXPECT_FALSE(vcodec::valid((int32_t)VectorEncoding::BIT + 1));
 }
 
 // bf16 keeps the high half of the float bits, rounded to nearest even.

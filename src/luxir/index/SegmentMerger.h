@@ -2286,6 +2286,14 @@ private:
       totalValues++;
     };
 
+    if (vectors) {
+      std::vector<VectorEncoding> encodings;
+      for (auto* f : sortedFields) {
+        if (f && f->record->bytesColumn()) encodings.push_back(VectorReader::encodingOf(*f->record));
+      }
+      vectors->chooseOutput(encodings);
+    }
+
     // Process segments in order - since doc remapping is monotonic,
     // we can simply iterate through each segment sequentially.
     for (size_t segnum = 0; segnum < sortedFields.size(); segnum++) {

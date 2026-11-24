@@ -5,6 +5,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <format>
+#include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -29,10 +32,22 @@ namespace luxir {
 /// that stores unit vectors are renormalized, since a decoded unit vector is
 /// only approximately unit length.  bf16 and sq8 represent every accepted
 /// element (at most VectorFieldType::MAX_ELEMENT_MAGNITUDE), so they never clamp.
+///
+/// bit is not a precision of the float encodings: it stores signs, its dims
+/// are a multiple of 8, and only the hamming metric scores it.  So a merge
+/// never converts between bit and the others (vcodec::convertible), in either
+/// direction.  A schema change of a declared field across that boundary is
+/// rejected (IndexWriter::updateSchema), but a field declared again after its
+/// removal, or one a template defines, can still meet older segments on the
+/// other side: inputs that cannot convert to the schema's encoding keep their
+/// own, and a merge whose inputs straddle the boundary fails before writing
+/// anything (queries over such a field fail the same way; reindex it).
 class VectorTranscoder {
   std::string_view field;
   bool hasOutput = false;
   VectorEncoding output = VectorEncoding::F32;
+  // Cosine rows promoted to f32 in a field that stores unit vectors.
+  bool renormalizeF32 = false;
   bool renormalize = false;
   VectorEncoding input = VectorEncoding::F32;
   int32_t dims = 0;
@@ -46,9 +61,36 @@ public:
     if (auto* vtype = dynamic_cast<const VectorFieldType*>(current)) {
       hasOutput = true;
       output = vtype->encoding();
-      renormalize = output == VectorEncoding::F32 && vtype->metric() == VectorFieldType::METRIC_COSINE
+      renormalizeF32 = vtype->metric() == VectorFieldType::METRIC_COSINE
           && (vtype->normalizeOnWrite() || vtype->normalized());
     }
+  }
+
+  /// Fixes the output encoding from the encodings of the inputs with values,
+  /// before the first startInput: the schema's when every input converts to
+  /// it, else the first input's when every input converts to that.  Throws
+  /// when the inputs straddle the bit boundary.
+  void chooseOutput(std::span<const VectorEncoding> inputs) {
+    auto convertsTo = [&](VectorEncoding target) {
+      for (auto e : inputs) {
+        if (!vcodec::convertible(e, target)) return false;
+      }
+      return true;
+    };
+    if (!inputs.empty() && !(hasOutput && convertsTo(output))) {
+      if (!convertsTo(inputs[0])) {
+        throw std::runtime_error(std::format(
+            "vector field '{}': cannot merge segments encoded as bit with segments in another encoding; "
+            "reindex the field", field));
+      }
+      if (hasOutput) {
+        LOG_WARN("VectorTranscoder: field '{}': keeping the inputs' {} encoding; a merge does not convert to {}",
+                 field, vcodec::name(inputs[0]), vcodec::name(output));
+      }
+      output = inputs[0];
+    }
+    hasOutput = hasOutput || !inputs.empty();
+    renormalize = renormalizeF32 && output == VectorEncoding::F32;
   }
 
   /// Starts the values of one input segment's column.
@@ -56,9 +98,9 @@ public:
     VectorReader column(reader, record);
     input = column.encoding();
     dims = column.dims();
-    if (!hasOutput) {
-      hasOutput = true;
-      output = input;
+    // chooseOutput saw this input, so it converts.
+    if (!hasOutput || !vcodec::convertible(input, output)) {
+      throw std::logic_error(std::format("vector field '{}': input not seen by chooseOutput", field));
     }
     if (input != output) {
       floats.resize((size_t)dims);

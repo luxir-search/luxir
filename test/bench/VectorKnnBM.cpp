@@ -878,11 +878,14 @@ void BM_VectorIvfIncrementalBuild(benchmark::State& state) {
 // Column encoding benchmark.
 //
 // Exact search (KnnQuery.exact: a full scan of the stored column) over one
-// field stored as f32, f16, bf16, or sq8, on a clustered corpus at a typical
-// embedding width.  Reports the stored column bytes per vector, recall@k of
-// exact search over the encoding against brute-force float32 ground truth
-// (computed here from the generated vectors in double precision), and the
-// serial exact-scan latency (rate = QPS on one thread).
+// field stored as f32, f16, bf16, sq8, or bit, on a clustered corpus at a
+// typical embedding width.  Reports the stored column bytes per vector,
+// recall@k of exact search over the encoding against brute-force float32
+// ground truth (computed here from the generated vectors in double
+// precision; cosine truth for bit / hamming, so it measures what binarizing
+// the vectors loses: little signal here, where a cluster's members share
+// nearly all their signs), and the serial exact-scan latency (rate = QPS on one
+// thread).
 void BM_VectorEncodingExact(benchmark::State& state) {
   auto encoding = (api::VectorEncoding)state.range(0);
   auto metric = (api::VectorMetric)state.range(1);
@@ -941,7 +944,7 @@ void BM_VectorEncodingExact(benchmark::State& state) {
     }
     if (metric == api::VectorMetric::L2) return -dist;
     if (metric == api::VectorMetric::IP) return dot;
-    return dot / std::sqrt(qq * xx);
+    return dot / std::sqrt(qq * xx);  // cosine, and hamming's reference
   };
   std::vector<std::vector<float>> queries;
   double recallSum = 0;
@@ -1537,9 +1540,10 @@ LUXIR_BENCHMARK(BM_VectorKnnRecallParallel)->Apply(forceIvfBenchmark)->ArgNames(
     ->Args({0, 0, 10, RABITQ1})->Args({16, 0, 10, RABITQ1})->Args({1 << 20, 0, 10, RABITQ1})
     ->Args({0, 0, 1000, RABITQ1});
 
-// encoding: 0 = f32, 1 = f16, 2 = bf16, 3 = sq8; metric: 1 = l2, 2 = ip, 3 = cosine.
+// encoding: 0 = f32, 1 = f16, 2 = bf16, 3 = sq8, 4 = bit; metric: 1 = l2,
+// 2 = ip, 3 = cosine, 4 = hamming (bit only).
 LUXIR_BENCHMARK(BM_VectorEncodingExact)->ArgNames({"encoding", "metric"})
-    ->ArgsProduct({{0, 1, 2, 3}, {1, 2, 3}});
+    ->ArgsProduct({{0, 1, 2, 3}, {1, 2, 3}})->Args({4, 4});
 
 LUXIR_BENCHMARK(BM_VectorKnnRecallThreads)->Apply(forceIvfBenchmark)->ArgNames({"nprobe", "cand", "k", "codec"})
     ->Args({0, 0, 10, RABITQ1})->ThreadRange(1, 32);

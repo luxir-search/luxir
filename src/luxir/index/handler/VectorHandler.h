@@ -22,8 +22,9 @@ namespace luxir::handler {
 /// Dense-float-vector field handler. Typed Vector / ArrVector values and
 /// schema-directed numeric Val arrays are copied to an owned f32 buffer,
 /// validated (and normalized for cosine), encoded in the field's
-/// VectorEncoding, then stored as fixed-size byte blobs through the
-/// binary-column path inherited from StrColHandler. The column's fixed-size
+/// VectorEncoding (bit: one sign bit per dimension, dims a multiple of 8),
+/// then stored as fixed-size byte blobs through the binary-column path
+/// inherited from StrColHandler. The column's fixed-size
 /// path captures per-segment dims in the value stride (the encoded value
 /// size); the encoding is recorded on the column descriptor.
 ///
@@ -154,6 +155,11 @@ private:
     vec = vec.first(vft.storedSize(vec.size()));
     // Without schema dims, the segment's first value sets them.
     int32_t n = (int32_t)vec.size();
+    if (encoding == VectorEncoding::BIT && n % 8 != 0) {
+      throw DocumentError(fmt::format(
+          "field '{}': {}bit vectors need dims that are a multiple of 8, got {}",
+          std::string_view(fieldName), prefix(), n));
+    }
     int32_t expected = effectiveDims();
     if (expected == 0) {
       pendingDims_ = n;
