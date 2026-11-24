@@ -334,16 +334,6 @@ TEST_F(VectorBitTest, mergeNeverConvertsAcrossBit) {
   EXPECT_EQ(std::vector{VectorEncoding::F32}, segmentEncodings(h, "emb"));
   EXPECT_EQ(expected, retrieved("emb"));
 
-  auto req = localReq(luxirNode->getSearchEngine());
-  auto& cur = req->collection("main").topDocs("q");
-  cur.rawQuery() = qb::knn(cur.mr(), "emb", signs(1), 1, 0, true);
-  {
-    ExpectLog quiet("cannot be scored");
-    req->execute();
-  }
-  EXPECT_FALSE(req->ok());
-  EXPECT_NE(std::string::npos, req->errorMsg().find("encoding f32 cannot be scored with metric hamming")) << req->errorMsg();
-
   ExpectLog failed("Merge failed");
   const std::vector sides{VectorEncoding::F32, VectorEncoding::BIT};
   for (int i = 0; i < 4; i++) {
@@ -387,4 +377,38 @@ TEST_F(VectorBitTest, mergePrefersMajorityWhenSmallestSegmentIsOnOldSide) {
   EXPECT_EQ(expected, retrieved("emb_v"));
   // Adding a vector definition scans segments and ignores the unchanged mixed field.
   installField(h.collection(), "other_v", api::VectorMetric::HAMMING, 16);
+}
+
+TEST_F(VectorBitTest, knnIgnoresDeletedVectorsAcrossBit) {
+  CollectionHelper h("main");
+  SchemaBuilder b;
+  auto& field = b.field("emb");
+  field.type = api::FieldDef::FieldClass::VECTOR;
+  field.multi = api::FieldDef::MultiMode::ARRAY;
+  field.dims = 12;
+  b.set(h.collection());
+  h.index(flatdoc("id", std::string("old"), "emb", std::vector<Vec>{Vec(12, 1.0f), Vec(12, 2.0f)}));
+  h.index(flatdoc("id", std::string("keep")));
+  field.dims = 16;
+  field.metric = api::VectorMetric::HAMMING;
+  b.set(h.collection());
+  h.commit();
+  h.index(flatdoc("id", std::string("b0"), "emb", std::vector<Vec>{signs(1)}));
+  h.index(flatdoc("id", std::string("b1"), "emb", std::vector<Vec>{signs(3)}));
+  h.commit();
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  cur.rawQuery() = qb::knn(cur.mr(), "emb", signs(1), 2, 0, true);
+  {
+    ExpectLog quiet("cannot be scored");
+    req->execute();
+  }
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("encoding f32 cannot be scored with metric hamming for field 'emb'"))
+      << req->errorMsg();
+
+  ASSERT_TRUE(h.deleteById("old", UpdateMessage::COMMIT).success);
+  EXPECT_EQ((std::vector{VectorEncoding::F32, VectorEncoding::BIT}), segmentEncodings(h, "emb"));
+  EXPECT_EQ((std::vector<Hit>{{"b0", 1.0f}, {"b1", 15.0f / 16.0f}}), knnHits("emb", signs(1), 2, true));
 }

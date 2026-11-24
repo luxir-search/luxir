@@ -77,15 +77,21 @@ class VectorScorer {
   std::vector<float> zeros;
 
 public:
+  static bool isScorable(VectorEncoding encoding, int32_t metric) {
+    return metric == (int32_t)api::VectorMetric::NONE
+        || (metric == (int32_t)api::VectorMetric::HAMMING) == (encoding == VectorEncoding::BIT);
+  }
+
   /// Throws when a segment's encoding cannot be scored under the metric (BIT
-  /// without HAMMING or the reverse), which only a field redefined over
-  /// existing segments can produce (see VectorTranscoder).
-  static void checkScorable(VectorEncoding encoding, int32_t metric) {
-    bool hamming = metric == (int32_t)api::VectorMetric::HAMMING;
-    if (metric != (int32_t)api::VectorMetric::NONE && hamming != (encoding == VectorEncoding::BIT)) {
+  /// without HAMMING or the reverse). An inverter pinned to an earlier schema
+  /// can publish such a segment after a schema change.
+  static void checkScorable(VectorEncoding encoding, int32_t metric, std::string_view field = {}) {
+    if (!isScorable(encoding, metric)) {
+      bool hamming = metric == (int32_t)api::VectorMetric::HAMMING;
       throw std::runtime_error(std::format(
-          "vector segment encoding {} cannot be scored with metric {}; reindex the field",
-          vcodec::name(encoding), hamming ? "hamming" : "l2/ip/cosine"));
+          "vector segment encoding {} cannot be scored with metric {}{}; reindex the field",
+          vcodec::name(encoding), hamming ? "hamming" : "l2/ip/cosine",
+          field.empty() ? std::string() : std::format(" for field '{}'", field)));
     }
   }
 
