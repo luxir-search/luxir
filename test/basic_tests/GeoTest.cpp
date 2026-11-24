@@ -909,7 +909,7 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
 TEST_F(GeoBoxQueryTest, declaredMultiSingletonUsesSinglePointLayout) {
   CollectionHelper helper;
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   ASSERT_TRUE(helper.index(flatdoc("id", "a", "home_ps", vec(13.0, 17.0)),
                            UpdateMessage::COMMIT).success);
   ASSERT_TRUE(helper.index(flatdoc("id", "b", "home_ps", vec(35.0, 40.0)),

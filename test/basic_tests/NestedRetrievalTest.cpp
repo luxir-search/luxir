@@ -31,7 +31,7 @@ protected:
 
   void setup() {
     nested_test::setSchema(helper.collection());
-    helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+    helper.getIndexWriter()->setMergeFactor(1000);
     for (int batch = 0; batch < 2; batch++) {
       CollectionHelper::UpdateBuilder input;
       for (int i = batch * 2; i < batch * 2 + 2; i++) nested_test::add(input, nested_test::DOCS[i]);

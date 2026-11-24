@@ -45,7 +45,7 @@ protected:
 
 TEST_F(ReverseMapTest, mixedSourcesAreRewrittenUsingTheCurrentSettingAtEveryLevel) {
   for (bool output : {false,true}) {
-    helper.clear(); helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+    helper.clear(); helper.getIndexWriter()->setMergeFactor(1000);
     setting(true,false);
     index({R"({"id":"dead","items_nested":[{},{}]})",
         R"({"id":"a","items_nested":{"n_i":1,"parts_nested":[{},{}]}})"});

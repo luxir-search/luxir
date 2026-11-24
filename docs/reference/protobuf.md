@@ -152,6 +152,7 @@ defaults and constraints are described in the comments and guides.
 - [`Map`](#message-luxir.map)
 - [`Match`](#message-luxir.match)
 - [`MemoryStats`](#message-luxir.memorystats)
+- [`MergePolicyDef`](#message-luxir.mergepolicydef)
 - [`MultiMatchQuery`](#message-luxir.multimatchquery)
 - [`MultiVector`](#message-luxir.multivector)
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
@@ -1663,6 +1664,19 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.live_docs_heaps"></a>[`live_docs_heaps`](#field-luxir.memorystats.live_docs_heaps) | 8 | `uint64` | singular | Live docs generations loaded from sparse files and expanded to heap bitmaps, held by readers and in-flight writer work. Dense generations are mapped and not counted. |
 | <a id="field-luxir.memorystats.live_docs_heap_bytes"></a>[`live_docs_heap_bytes`](#field-luxir.memorystats.live_docs_heap_bytes) | 9 | `uint64` | singular | Heap bytes of those generations. |
 
+<a id="message-luxir.mergepolicydef"></a>
+
+### luxir.MergePolicyDef
+
+A merge policy selection (SchemaDef.merge\_policy).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.mergepolicydef.name"></a>[`name`](#field-luxir.mergepolicydef.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.mergepolicydef.params"></a>[`params`](#field-luxir.mergepolicydef.params) | 2 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | Typed params, read by the policy's maker. "tiered" takes merge\_factor: the number of same-level segments that merge into one (&gt;= 2). |
+
 <a id="message-luxir.multimatchquery"></a>
 
 ### luxir.MultiMatchQuery
@@ -2227,6 +2241,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 | <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. \_version\_ is fixed and retrieval-only: it returns the update version of the request that indexed each document, including allow\_dups and documents without an ID. |
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
 | <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. |
+| <a id="field-luxir.schemadef.merge_policy"></a>[`merge_policy`](#field-luxir.schemadef.merge_policy) | 6 | [`MergePolicyDef`](#message-luxir.mergepolicydef) | singular | How the collection's segments merge: a policy registered under \`name\` (built in: "tiered"; plugins add others) and its params. Absent selects "tiered" with the node's --indexing.merge-factor. An unknown name or a bad param fails the schema request. mode=set replaces it only when the request names one; it applies to merge decisions from the next one on. |
 
 <a id="message-luxir.schemarequest"></a>
 

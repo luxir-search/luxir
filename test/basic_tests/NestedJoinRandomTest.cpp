@@ -407,7 +407,7 @@ TEST_F(NestedJoinRandomTest, seededModelAcrossUpdatesDomainsScoresAndCache) {
     SCOPED_TRACE("seed=" + std::to_string(seed));
     std::cerr << "NestedJoinRandomTest seed=" << seed << '\n';
     helper.clear(); model.clear(); nextTag = 0; state = seed;
-    helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+    helper.getIndexWriter()->setMergeFactor(1000);
     auto setting = [&](bool reverse) {
       SchemaBuilder schema;
       auto& outer = schema.templ("_nested"); outer.type = api::FieldDef::FieldClass::NESTED; outer.reverse_map = reverse;

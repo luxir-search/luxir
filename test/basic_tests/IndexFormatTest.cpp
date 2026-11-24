@@ -319,7 +319,7 @@ TEST_F(IndexFormatTest, catalogSurvivesPublicationDeleteAndMerge) {
   LuxirNode node(config);
   CollectionHelper helper(node, "main");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "n_i", 11), flatdoc("id", "b", "n_i", 22)},
                               UpdateMessage::COMMIT).success);
   auto before = writer->snapshots.readers.getReader();

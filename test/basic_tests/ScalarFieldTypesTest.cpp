@@ -207,7 +207,7 @@ TEST_F(ScalarFieldTypesTest, booleanModesAcrossFlushDeleteAndMerge) {
     }
     b.set(helper.collection());
     auto writer = helper.getIndexWriter();
-    writer->mergePolicy->setMergeFactor(100);
+    writer->setMergeFactor(100);
     for (auto id : {"a", "b", "c", "d"}) {
       Doc doc = flatdoc("id", id);
       if (std::string_view(id) != "d") for (auto name : {"n", "r", "m"}) {
@@ -254,7 +254,7 @@ TEST_F(ScalarFieldTypesTest, booleanPersistenceAndTypeChanges) {
   IndexReader reopened(writer->dir);
   EXPECT_EQ(FieldType::BOOLEAN, reopened.field("flag").at(0)->type);
   EXPECT_EQ(FieldType::BOOLEAN, reopened.schema()->getFieldTypeEx("flag")->type());
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   SchemaBuilder removed;
   removed.replaceAll(helper.collection());
   SchemaBuilder changed;
@@ -645,7 +645,7 @@ TEST_F(DecimalFieldTypesTest, scalePersistenceAndSchemaValidation) {
   wrongField.scale = 2;
   EXPECT_THROW(wrong.build(), SchemaError);
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   IndexReader reopened(writer->dir);
   EXPECT_EQ(2u, reopened.field("price").at(0)->typeParameters);
   EXPECT_EQ(FieldType::DECIMAL, reopened.field("price").at(0)->type);
@@ -704,7 +704,7 @@ TEST_F(DecimalFieldTypesTest, typedMembershipAndIndexes) {
 
 TEST_F(DecimalFieldTypesTest, typeChangeRefusesReadAndMerge) {
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   SchemaBuilder removed;
   removed.replaceAll(helper.collection());
   SchemaBuilder changed;

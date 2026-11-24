@@ -648,7 +648,7 @@ TEST(PressureShedDirectTest, mergeDemandDoesNotShedEveryBatch) {
   IndexRamBudget budget;
   CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots, schema, &budget);
-  iw.mergePolicy->setMergeFactor(1000);  // count flushed segments only
+  iw.setMergeFactor(1000);  // count flushed segments only
   iw.pressureFlushFloorBytes = 1;
 
   int docOrd = 0;
@@ -703,7 +703,7 @@ TEST(PressureShedDirectTest, mergeDemandRestoresParallelAdmission) {
   IndexRamBudget budget;
   CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
   IndexWriter iw(iwSnapshots, schema, &budget);
-  iw.mergePolicy->setMergeFactor(2);
+  iw.setMergeFactor(2);
   iw.termPartitionMinBytes = INT64_MAX;
   iw.pressureFlushFloorBytes = 1;
 
@@ -804,7 +804,8 @@ TEST(PressureShedDirectTest, mergeDemandRestoresParallelAdmission) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   ASSERT_EQ(1, pressureFlushesStarted.load(std::memory_order_relaxed));
-  EXPECT_EQ(6 * (MergeCostModel::LIGHT_BYTES + 4),
+  // Each batch: the light floor, 4 bytes of norms, and one term index block.
+  EXPECT_EQ(6 * (MergeCostModel::LIGHT_BYTES + 4 + MergeCostModel::TERM_INDEX_BYTES_PER_BLOCK),
             maxDemand.load(std::memory_order_relaxed))
       << "all six text batches fit the expanded virtual stream schedule";
   EXPECT_EQ(18, maxHypotheticalStreams.load(std::memory_order_relaxed));
