@@ -590,6 +590,13 @@ sees only the documents in its parent bucket:
 Nesting is not limited to one level, and metrics sit beside sub-facets in the
 same `ops` map.
 
+Sub-ops that are not computed during the parent's own counting pass run after
+the parent selects its buckets. When the request runs in parallel (the
+default), they run concurrently across segments, and metrics also across
+buckets; `max_parallel: 1` runs them serially. A sub-op with sub-ops of its
+own, or one that needs every segment at once (such as `top_docs`), keeps its
+level serial while its own children may still run in parallel.
+
 ## Top documents per bucket
 
 A `top_docs` (or `fusion`) operation under a facet returns a ranked document

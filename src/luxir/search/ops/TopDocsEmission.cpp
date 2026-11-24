@@ -177,7 +177,7 @@ void emitPage(const CollapsedPageSettings& settings,
             });
       };
       FacetBucketBlockExecutor::execute<size_t>(calc, children, buckets,
-          *qr.view, FacetBucketProducer::JOINT,
+          *qr.view, FacetBucketProducer::JOINT, FacetBucketConcurrency::SERIAL,
           [&](size_t segnum, auto block, FacetBucketFeed feed) {
             domains.template operator()<false>(segnum, block,
                 settings.domains[segnum], feed);
