@@ -363,6 +363,7 @@ static IdFilter::Options idFilterOptions(const IndexConfig& config) {
   options.fingerprintBits = config.id_filter == "fuse8" ? 8 : 16;
   options.bitsPerKey = config.id_filter_bits_per_key;
   options.minBytes = config.id_filter_min_kb * 1024;
+  options.maxFuseKeys = IdFilter::maxFuseKeysFor(config.max_ram_mb * 1024 * 1024);
   return options;
 }
 

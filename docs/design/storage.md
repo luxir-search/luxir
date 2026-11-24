@@ -253,8 +253,8 @@ never falsely absent), the same hash whose low byte the term blocks keep.
 Every flush and merge rebuilds it from the terms it writes, so it has exactly
 one key per term. The writer checks an id against the exact dictionary bounds
 and then the filter, and looks up only the segments and ids that pass.
-Writers build no filter unless `--indexing.id-filter` names a kind (see the
-operations guide).
+Writers build `fuse16` unless `--indexing.id-filter` names another kind (see
+the operations guide).
 
 The part starts with a 24-byte header that names its kind and parameters, so
 a reader needs nothing else and the writer may choose them per segment. A
@@ -267,12 +267,18 @@ part that does not parse is a corrupt segment. Two kinds exist:
 - `fuse8` and `fuse16`: a 3-wise binary fuse filter with 8- or 16-bit
   fingerprints, 1.13 (millions of ids) to about 1.25 (thousands) fingerprints
   per id. 0.39% or 0.0015% of absent ids pass. It is static: the writer holds
-  every key's hash until the dictionary ends and then builds it.
+  every key's hash until the dictionary ends and then builds it, about 34
+  bytes per key in all. So a writer whose upper bound on the keys is above a
+  cap (`IdFilter::maxFuseKeysFor`: 2^24 keys, or fewer when a quarter of the
+  indexing RAM budget holds fewer) builds `bloom` at 32 or more bits per key
+  instead.
 
 A batch of ids skips a segment only when every id misses, so the false
 positive rate that matters is per batch: at 2,000 ids per commit, a 16-bit
-Bloom filter skips about 7% of segments and `fuse16` about 97%. Whether a
-kind should be on by default, and which, is to be settled by benchmarking.
+Bloom filter skips about 7% of segments and `fuse16` about 97%. Measured on
+40-44 segment layouts with 2,000 new random ids per commit, `fuse16` looks up
+1.0-1.4 segments, a 32-bit Bloom filter 1.8-2.3 and a 16-bit one 13-21, at
+2.28, 4.04 and 2.05 bytes per document. Hence the `fuse16` default.
 
 Each field record encodes the schema flags as an unsigned vint, excluding
 `ABSTRACT` and `DERIVED`. Bits 0-2 encode the cumulative postings level

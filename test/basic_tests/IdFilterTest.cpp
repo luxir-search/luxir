@@ -6,6 +6,7 @@
 #include <atomic>
 #include <format>
 
+#include "luxir/LuxirConfig.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/reader/IdFilter.h"
 #include "luxir/reader/ReaderErrors.h"
@@ -223,11 +224,80 @@ TEST_P(IdFilterKindTest, deletesLookUpOnlyCandidateSegments) {
   EXPECT_LE(lookups.load(), 3);
 }
 
-// Writers build no filter by default.
+TEST_F(IdFilterTest, defaultConfigWritesFuse16) {
+  EXPECT_EQ("fuse16", IndexConfig{}.id_filter);
+  LuxirNode node;
+  CollectionHelper helper(node);
+  const auto& options = helper.getIndexWriter()->idFilterOptions;
+  EXPECT_EQ(IdFilter::Kind::FUSE, options.kind);
+  EXPECT_EQ(16u, options.fingerprintBits);
+  ASSERT_TRUE(helper.indexAll(docs(0, 100), UpdateMessage::COMMIT).success);
+  auto filter = helper.getIndexWriter()->snapshots.readers.getReader()->segments()[0].segmentCoreShared()->idFilter();
+  ASSERT_TRUE(filter);
+  EXPECT_EQ(IdFilter::Kind::FUSE, filter->filterKind());
+  EXPECT_EQ(16u, filter->fuseFingerprintBits());
+}
+
+TEST_F(IdFilterTest, fuseCapFollowsTheRamBudget) {
+  EXPECT_EQ(IdFilter::MAX_FUSE_KEYS, IdFilter::maxFuseKeysFor(0));  // Unlimited.
+  EXPECT_EQ(IdFilter::MAX_FUSE_KEYS, IdFilter::maxFuseKeysFor(64ll << 30));
+  EXPECT_EQ((uint64_t)(1ll << 30) / 4 / IdFilter::FUSE_BUILD_BYTES_PER_KEY, IdFilter::maxFuseKeysFor(1ll << 30));
+  EXPECT_EQ(IdFilter::MAX_FUSE_KEYS, IdFilter::Options{}.maxFuseKeys);
+}
+
+// A fuse builder sized above the key cap builds bloom at 32 or more bits per key.
+TEST_F(IdFilterTest, fuseAboveTheKeyCapBuildsBloom32) {
+  constexpr int keys = 5000;
+  auto capped = fuse(16);
+  capped.maxFuseKeys = keys - 1;
+  EXPECT_EQ(IdFilter::Kind::FUSE, IdFilter::Builder(fuse(16), keys).builds().kind);
+  auto atCap = capped;
+  atCap.maxFuseKeys = keys;
+  EXPECT_EQ(IdFilter::Kind::FUSE, IdFilter::Builder(atCap, keys).builds().kind);
+
+  auto fallbacks = IdFilter::fuseCapFallbacks();
+  auto bytes = buildFilter(capped, keys);
+  EXPECT_EQ(fallbacks + 1, IdFilter::fuseCapFallbacks());
+  auto filter = IdFilter::parse(bytes);
+  ASSERT_TRUE(filter);
+  EXPECT_EQ(IdFilter::Kind::BLOOM, filter->filterKind());
+  EXPECT_EQ(32, (uint8_t)bytes[1]);  // Bits per key in the header.
+  EXPECT_GE((bytes.size() - IdFilter::HEADER_BYTES) * 8, (size_t)keys * 32);
+  for (int i = 0; i < keys; i++) ASSERT_TRUE(filter->mayContain(std::format("present{}", i)));
+  // The memory a merge reserves is the bloom filter's.
+  EXPECT_EQ(IdFilter::bloomBlocksFor(IdFilter::optionsFor(capped, keys), keys) * IdFilter::BLOCK_BYTES,
+            IdFilter::buildBytes(capped, keys));
+
+  // More configured bits per key are kept.
+  capped.bitsPerKey = 40;
+  EXPECT_EQ(40u, IdFilter::Builder(capped, keys).builds().bitsPerKey);
+}
+
+TEST_F(IdFilterTest, writerAboveTheKeyCapWritesBloom) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->idFilterOptions.maxFuseKeys = 10;
+  ASSERT_TRUE(helper.indexAll(docs(0, 100), UpdateMessage::COMMIT).success);
+  auto core = iw->snapshots.readers.getReader()->segments()[0].segmentCoreShared();
+  auto filter = core->idFilter();
+  ASSERT_TRUE(filter);
+  EXPECT_EQ(IdFilter::Kind::BLOOM, filter->filterKind());
+  MemPool pool;
+  const auto* info = core->rootReader().fieldInfo("id");
+  TermsEnum terms(pool, core->rootReader(), *info);
+  int seen = 0;
+  for (; terms.nextTerm(); seen++) EXPECT_TRUE(filter->mayContain(std::string_view(terms.term())));
+  EXPECT_EQ(100, seen);
+  ASSERT_TRUE(helper.deleteByIds({"id00001", longId(10)}, UpdateMessage::COMMIT).success);
+  EXPECT_EQ(98, iw->snapshots.readers.getReader()->liveDocs());
+}
+
 TEST_F(IdFilterTest, noFilterStillAppliesDeletes) {
   LuxirNode node;
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
+  iw->idFilterOptions = {.kind = IdFilter::Kind::NONE};
   ASSERT_TRUE(helper.indexAll(docs(0, 100), UpdateMessage::COMMIT).success);
   auto core = iw->snapshots.readers.getReader()->segments()[0].segmentCoreShared();
   EXPECT_FALSE(core->rootReader().fieldInfo("id")->idFilter());

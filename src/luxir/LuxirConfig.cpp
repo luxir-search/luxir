@@ -261,15 +261,19 @@ void LuxirConfig::addOptions(CLI::App& app) {
 
   app.add_option("--indexing.id-filter", index.id_filter,
                  "Membership filter over each segment's ids, used to skip segments when "
-                 "applying deletes and updates: none, bloom, fuse8 or fuse16")
+                 "applying deletes and updates: none, bloom, fuse8 or fuse16. A fuse filter "
+                 "over more ids than min(2^24, --indexing.max-ram-mb / 4 / 34 B) is built as "
+                 "bloom at max(32, --indexing.id-filter-bits-per-key) bits per id")
       ->default_val(index.id_filter)
       ->check(CLI::IsMember({"bloom", "fuse8", "fuse16", "none"}));
   app.add_option("--indexing.id-filter-bits-per-key", index.id_filter_bits_per_key,
-                 "Bits per id of a bloom id filter")
+                 "Bits per id of a bloom id filter (bloom only; the fallback above the "
+                 "fuse key cap uses at least 32)")
       ->default_val(index.id_filter_bits_per_key)
       ->check(CLI::Range(1, 64));
   app.add_option("--indexing.id-filter-min-kb", index.id_filter_min_kb,
-                 "Smallest bloom id filter per segment (KiB, 0 = sized by bits per id only)")
+                 "Smallest bloom id filter per segment (bloom only, also the fallback above "
+                 "the fuse key cap; KiB, 0 = sized by bits per id only)")
       ->default_val(index.id_filter_min_kb)
       ->check(CLI::Range(0, 1024));
 

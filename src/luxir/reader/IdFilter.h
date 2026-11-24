@@ -47,16 +47,37 @@ class IdFilter {
 public:
   enum class Kind : uint8_t { NONE = 0, BLOOM = 1, FUSE = 2 };
 
-  // What a writer builds. Writers build no filter unless configured to.
+  // A FUSE builder holds about this much per key: the key while the
+  // dictionary is written, then scratch while finish() builds.
+  static constexpr uint64_t FUSE_BUILD_BYTES_PER_KEY = 34;
+  // Most keys a FUSE builder takes by default (about 570 MB while it builds).
+  static constexpr uint64_t MAX_FUSE_KEYS = 1ull << 24;
+  // Bits per key of the BLOOM filter built instead above the FUSE key cap: it
+  // skips segments nearly as well as fuse16 and holds only its bit array.
+  static constexpr uint32_t CAP_FALLBACK_BITS_PER_KEY = 32;
+
+  // What a writer builds: fuse16 by default.
   struct Options {
-    Kind kind = Kind::NONE;
+    Kind kind = Kind::FUSE;
     uint32_t bitsPerKey = 16;  // BLOOM
     // BLOOM: smallest body. The part is read whole, so small segments get a
     // lower false positive rate for RAM only.
     uint32_t minBytes = 16 * 1024;
     uint32_t fingerprintBits = 16;  // FUSE: 8 or 16
+    // FUSE: a builder sized for more keys builds BLOOM at no fewer than
+    // CAP_FALLBACK_BITS_PER_KEY bits per key instead. See maxFuseKeysFor.
+    uint64_t maxFuseKeys = MAX_FUSE_KEYS;
   };
   static constexpr uint32_t MAX_BITS_PER_KEY = 64;
+
+  // The FUSE key cap for an indexing RAM budget (zero or less is unlimited):
+  // one builder may take a quarter of it, and never more than MAX_FUSE_KEYS keys.
+  static uint64_t maxFuseKeysFor(int64_t ramBudgetBytes) noexcept;
+  // What a builder over at most `maxKeys` keys builds under `options`: BLOOM in
+  // place of FUSE above the key cap.
+  static Options optionsFor(const Options& options, uint64_t maxKeys) noexcept;
+  // Builders that built BLOOM because their key bound was above the FUSE cap.
+  static uint64_t fuseCapFallbacks() noexcept;
 
   static constexpr size_t HEADER_BYTES = 24;
   static constexpr size_t BLOCK_WORDS = 8;
@@ -101,8 +122,11 @@ public:
     uint64_t added = 0;
 
   public:
-    // options.kind is BLOOM or FUSE.
+    // options.kind is BLOOM or FUSE. A FUSE builder whose maxKeys is above
+    // options.maxFuseKeys builds BLOOM (see optionsFor).
     Builder(const Options& options, uint64_t maxKeys);
+    // The kind and parameters this builder writes.
+    const Options& builds() const noexcept { return options; }
     void add(uint64_t hash);
     uint64_t numKeys() const noexcept { return added; }
     // Memory held between keys.
