@@ -142,6 +142,9 @@ public:
   // proto.profile=true during parsing.
   std::vector<std::unique_ptr<ExecutionProfileOpState>> executionProfileOps;
   std::mutex executionProfileMutex;
+  ExecutionProfileOpState* pruningProfile = nullptr;
+  void recordPrunedSegment(ExecutionProfileRun*& run, IndexReader::Segment& segment,
+                           std::vector<std::string> details);
 
   // Transport default for DocList field placement when an op leaves
   // document_format at DEFAULT: gRPC serves COLUMNS; the HTTP/JSON layer sets

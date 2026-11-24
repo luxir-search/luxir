@@ -1203,7 +1203,11 @@ public:
     bool provenEmpty(const IndexReader::Segment& segment) const noexcept {
       return membership && !membership->test((size_t)segment.ord);
     }
-    bool provenEmptyForCollection() const noexcept { return membership && membership->none(); }
+    // For a segment this source excludes, when profiling requested proof details.
+    std::string_view proofReason(const IndexReader::Segment& segment) const {
+      assert(provenEmpty(segment) && !membership->reasons.empty());
+      return membership->reasons[(size_t)segment.ord];
+    }
 
     /// Drop refillable transient state only; preserve semantics and prepared
     /// results. Idempotent. No plan or scorer from this source for the segment
@@ -1299,6 +1303,8 @@ public:
     // sources of Weight::NEEDS_PREPARE, known before any weight exists.
     bool mayPrepare = false;
     std::shared_ptr<QueryPruning> pruning;
+    std::string_view opName;
+    std::vector<std::string>* proofNotes = nullptr;
     ExecutionProfileSink* profiles = nullptr;
 
     PlanningContext(
