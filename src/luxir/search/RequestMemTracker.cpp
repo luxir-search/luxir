@@ -50,6 +50,16 @@ void RequestMemTracker::charge(size_t bytes, std::string_view breaker,
   unused(charged);
 }
 
+[[noreturn]] void RequestMemTracker::throwNodeLimit(
+    std::string_view breaker, std::string_view detail, size_t bytes) const {
+  node->countRejection();
+  throw ResourceExhaustedError(fmt::format(
+      "node request memory breaker '{}' rejected {}: {} more bytes would pass "
+      "the node-wide ceiling of {} bytes ({} in use by running requests); "
+      "retry later", breaker, detail, bytes, node->ceiling(), node->bytes()),
+      "node_request_memory_exceeded");
+}
+
 bool RequestMemTracker::tryCharge(size_t bytes) {
   if (bytes == 0) return true;
   size_t current = chargedBytes.load(std::memory_order_relaxed);
@@ -59,6 +69,10 @@ bool RequestMemTracker::tryCharge(size_t bytes) {
     if (maxBytes != 0 && total > maxBytes) return false;
     if (chargedBytes.compare_exchange_weak(
             current, total, std::memory_order_relaxed)) {
+      if (node && !node->tryCharge(bytes)) {
+        chargedBytes.fetch_sub(bytes, std::memory_order_relaxed);
+        return false;
+      }
       recordPeak(total);
       return true;
     }
@@ -89,6 +103,17 @@ size_t RequestMemTracker::chargeUpTo(
     size_t total = current + granted;
     if (chargedBytes.compare_exchange_weak(
             current, total, std::memory_order_relaxed)) {
+      // The node total takes the grant, or failing that the minimum; the
+      // request gives back what the node refused.
+      if (node && !node->tryCharge(granted)) {
+        if (granted == minimumBytes || !node->tryCharge(minimumBytes)) {
+          chargedBytes.fetch_sub(granted, std::memory_order_relaxed);
+          throwNodeLimit(breaker, detail, minimumBytes);
+        }
+        chargedBytes.fetch_sub(granted - minimumBytes, std::memory_order_relaxed);
+        total -= granted - minimumBytes;
+        granted = minimumBytes;
+      }
       recordPeak(total);
       return granted;
     }
@@ -100,6 +125,7 @@ void RequestMemTracker::release(size_t bytes) {
   size_t previous = chargedBytes.fetch_sub(bytes, std::memory_order_relaxed);
   assert(previous >= bytes);
   unused(previous);
+  if (node) node->release(bytes);
 }
 
 } // namespace luxir

@@ -151,6 +151,7 @@ defaults and constraints are described in the comments and guides.
 - [`ListTenantsResponse`](#message-luxir.listtenantsresponse)
 - [`Map`](#message-luxir.map)
 - [`Match`](#message-luxir.match)
+- [`MemoryPressureStats`](#message-luxir.memorypressurestats)
 - [`MemoryStats`](#message-luxir.memorystats)
 - [`MultiMatchQuery`](#message-luxir.multimatchquery)
 - [`MultiVector`](#message-luxir.multivector)
@@ -1643,6 +1644,28 @@ Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolea
 | <a id="field-luxir.match.min_match"></a>[`min_match`](#field-luxir.match.min_match) | 4 | `int32` | singular | Minimum number of the analyzed terms that must match (the OR..AND middle ground). When set it overrides \`operator\`; clamped to the term count. Mirrors BooleanQuery.min\_match. |
 | <a id="field-luxir.match.case_insensitive"></a>[`case_insensitive`](#field-luxir.match.case_insensitive) | 10 | `bool` | singular | Match TEXT tokens and STRING/ID values regardless of simple Unicode case, after query analysis/normalization. Indexed case variants score as one word, with the query's exact case preferred slightly: frequency weight 1.0 for the analyzed/normalized query token, 0.9 for other variants. Frequencies sum before BM25 saturation, with shared statistics. Slower than a folding variant (\_t, \_un, \_wl), recommended for frequent use. Alternates come from analyzed tokens; case-preserving stemmers can be asymmetric (KStem stems lowercase only). Numeric and DATE fields ignore it. |
 
+<a id="message-luxir.memorypressurestats"></a>
+
+### luxir.MemoryPressureStats
+
+Node-wide memory pressure admission. used\_bytes excludes reclaimable page cache (mapped segment files never count): the limiting cgroup's memory.current less its file pages, or this process's anonymous RSS.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.memorypressurestats.state"></a>[`state`](#field-luxir.memorypressurestats.state) | 1 | `string` | singular | normal, soft or hard. |
+| <a id="field-luxir.memorypressurestats.source"></a>[`source`](#field-luxir.memorypressurestats.source) | 2 | `string` | singular | cgroup, process, none (sampling off or no source) or injected (tests). |
+| <a id="field-luxir.memorypressurestats.used_bytes"></a>[`used_bytes`](#field-luxir.memorypressurestats.used_bytes) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.memorypressurestats.limit_bytes"></a>[`limit_bytes`](#field-luxir.memorypressurestats.limit_bytes) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.memorypressurestats.soft_ratio"></a>[`soft_ratio`](#field-luxir.memorypressurestats.soft_ratio) | 5 | `double` | singular | Thresholds as fractions of limit\_bytes. |
+| <a id="field-luxir.memorypressurestats.hard_ratio"></a>[`hard_ratio`](#field-luxir.memorypressurestats.hard_ratio) | 6 | `double` | singular |  |
+| <a id="field-luxir.memorypressurestats.transitions"></a>[`transitions`](#field-luxir.memorypressurestats.transitions) | 7 | `uint64` | singular | State changes since start. |
+| <a id="field-luxir.memorypressurestats.rejected_updates_soft"></a>[`rejected_updates_soft`](#field-luxir.memorypressurestats.rejected_updates_soft) | 8 | `uint64` | singular | New update requests refused at soft and at hard pressure. |
+| <a id="field-luxir.memorypressurestats.rejected_updates_hard"></a>[`rejected_updates_hard`](#field-luxir.memorypressurestats.rejected_updates_hard) | 9 | `uint64` | singular |  |
+| <a id="field-luxir.memorypressurestats.rejected_update_batches"></a>[`rejected_update_batches`](#field-luxir.memorypressurestats.rejected_update_batches) | 10 | `uint64` | singular | Further batches of running update streams refused at hard pressure. |
+| <a id="field-luxir.memorypressurestats.rejected_searches"></a>[`rejected_searches`](#field-luxir.memorypressurestats.rejected_searches) | 11 | `uint64` | singular | New searches refused at hard pressure. |
+
 <a id="message-luxir.memorystats"></a>
 
 ### luxir.MemoryStats
@@ -1662,6 +1685,10 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.schema_cache_bytes"></a>[`schema_cache_bytes`](#field-luxir.memorystats.schema_cache_bytes) | 7 | `uint64` | singular | Estimated parsed schema payload held by snapshots/readers, not allocator RSS. |
 | <a id="field-luxir.memorystats.live_docs_heaps"></a>[`live_docs_heaps`](#field-luxir.memorystats.live_docs_heaps) | 8 | `uint64` | singular | Live docs generations loaded from sparse files and expanded to heap bitmaps, held by readers and in-flight writer work. Dense generations are mapped and not counted. |
 | <a id="field-luxir.memorystats.live_docs_heap_bytes"></a>[`live_docs_heap_bytes`](#field-luxir.memorystats.live_docs_heap_bytes) | 9 | `uint64` | singular | Heap bytes of those generations. |
+| <a id="field-luxir.memorystats.pressure"></a>[`pressure`](#field-luxir.memorystats.pressure) | 40 | [`MemoryPressureStats`](#message-luxir.memorypressurestats) | singular |  |
+| <a id="field-luxir.memorystats.search_node_request_bytes"></a>[`search_node_request_bytes`](#field-luxir.memorystats.search_node_request_bytes) | 41 | `uint64` | singular | Query memory tracked across all running searches, its node-wide ceiling (zero is unlimited), and the charges that ceiling refused. |
+| <a id="field-luxir.memorystats.search_node_request_limit_bytes"></a>[`search_node_request_limit_bytes`](#field-luxir.memorystats.search_node_request_limit_bytes) | 42 | `uint64` | singular |  |
+| <a id="field-luxir.memorystats.search_node_request_rejected"></a>[`search_node_request_rejected`](#field-luxir.memorystats.search_node_request_rejected) | 43 | `uint64` | singular |  |
 
 <a id="message-luxir.multimatchquery"></a>
 

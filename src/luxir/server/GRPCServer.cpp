@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <grpcpp/alarm.h>
 #include <grpcpp/grpcpp.h>
@@ -338,6 +339,9 @@ public:
 
   bool doneReceived = false;
   bool finishReceived = false;
+  // An UpdateStream's first message was admitted: later ones are batches of
+  // running work (MemoryPressure::Work::UPDATE_BATCH).
+  bool updateAdmitted = false;
   enum CallTags { READ = 1, WRITE = 2, FINISH = 3, CONNECT = 4, KICK = 5, DONE = 6 };
 
   GenericCallData(GRPCServer& server, grpc::AsyncGenericService& genericService, GRPCServer::ThreadInfo& threadInfo)
@@ -794,6 +798,12 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 // Unary Update and streaming UpdateStream share asynchronous completion.
 static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto startTime = std::chrono::steady_clock::now();
+  using Work = MemoryPressure::Work;
+  if (auto rejected = call.server.getLuxirNode().getMemoryPressure().admit(
+          std::exchange(call.updateAdmitted, true) ? Work::UPDATE_BATCH : Work::UPDATE)) {
+    finishWithError(call, *rejected);
+    return;
+  }
   auto request = std::make_unique<HppRequestState<UpdateReqProto>>();
   if (!parseRequest(readBuf, *request, "Update")) {
     finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Update: malformed request"));

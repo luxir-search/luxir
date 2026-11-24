@@ -86,7 +86,7 @@ struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct RowSpaceStats; struct AuxStats;
-struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats;
+struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryPressureStats; struct MemoryStats; struct ScrubStats;
 struct HistogramStats; struct ActivityStats; struct TransportStats; struct ServiceStats; struct SystemStats;
 struct HostStats; struct SearchFanoutStats; struct OutcomeStats; struct CollectionActivityStats; struct ProcessIoStats;
 struct ProcessStats; struct CpuTimes; struct HostCpuStats; struct HostMemoryStats; struct NetworkInterfaceStats;
@@ -407,14 +407,31 @@ struct FieldMetadataStats {
   uint64_t live_views = 0;
   uint64_t live_view_bytes = 0;
 };
+struct MemoryPressureStats {
+  std::string_view state;
+  std::string_view source;
+  uint64_t used_bytes = 0;
+  uint64_t limit_bytes = 0;
+  double soft_ratio = 0;
+  double hard_ratio = 0;
+  uint64_t transitions = 0;
+  uint64_t rejected_updates_soft = 0;
+  uint64_t rejected_updates_hard = 0;
+  uint64_t rejected_update_batches = 0;
+  uint64_t rejected_searches = 0;
+};
 struct MemoryStats {
   IndexRamStats indexing_budget;
   StorageRamStats storage_ram;
   std::optional<JemallocStats> jemalloc;
   FieldMetadataStats field_metadata;
+  MemoryPressureStats pressure;
   uint64_t node_budget_bytes = 0;
   uint64_t search_request_limit_bytes = 0;
   uint64_t schema_cache_bytes = 0;
+  uint64_t search_node_request_bytes = 0;
+  uint64_t search_node_request_limit_bytes = 0;
+  uint64_t search_node_request_rejected = 0;
   uint64_t live_docs_heaps = 0;
   uint64_t live_docs_heap_bytes = 0;
 };
@@ -1336,7 +1353,7 @@ LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(Li
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(OutcomeStats) LUXIR_TD(CollectionActivityStats) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(RowSpaceStats) LUXIR_TD(AuxStats)
 LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
-LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats) LUXIR_TD(ScrubStats)
+LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryPressureStats) LUXIR_TD(MemoryStats) LUXIR_TD(ScrubStats)
 LUXIR_TD(HistogramStats) LUXIR_TD(ActivityStats) LUXIR_TD(TransportStats) LUXIR_TD(ServiceStats) LUXIR_TD(HostStats) LUXIR_TD(SystemStats) LUXIR_TD(ProcessIoStats) LUXIR_TD(ProcessStats) LUXIR_TD(CpuTimes) LUXIR_TD(HostCpuStats) LUXIR_TD(HostMemoryStats) LUXIR_TD(NetworkInterfaceStats) LUXIR_TD(TcpStats) LUXIR_TD(DiskStats) LUXIR_TD(FilesystemStats) LUXIR_TD(PressureStats) LUXIR_TD(CgroupStats) LUXIR_TD(CgroupMemoryStats) LUXIR_TD(CgroupCpuStats) LUXIR_TD(CgroupTaskStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump) LUXIR_TD(CacheValueDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)

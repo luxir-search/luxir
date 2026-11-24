@@ -2060,6 +2060,36 @@ message MemoryStats {
   uint64 live_docs_heaps = 8;
   // Heap bytes of those generations.
   uint64 live_docs_heap_bytes = 9;
+  MemoryPressureStats pressure = 40;
+  // Query memory tracked across all running searches, its node-wide ceiling
+  // (zero is unlimited), and the charges that ceiling refused.
+  uint64 search_node_request_bytes = 41;
+  uint64 search_node_request_limit_bytes = 42;
+  uint64 search_node_request_rejected = 43;
+}
+
+// Node-wide memory pressure admission. used_bytes excludes reclaimable page
+// cache (mapped segment files never count): the limiting cgroup's
+// memory.current less its file pages, or this process's anonymous RSS.
+message MemoryPressureStats {
+  // normal, soft or hard.
+  string state = 1;
+  // cgroup, process, none (sampling off or no source) or injected (tests).
+  string source = 2;
+  uint64 used_bytes = 3;
+  uint64 limit_bytes = 4;
+  // Thresholds as fractions of limit_bytes.
+  double soft_ratio = 5;
+  double hard_ratio = 6;
+  // State changes since start.
+  uint64 transitions = 7;
+  // New update requests refused at soft and at hard pressure.
+  uint64 rejected_updates_soft = 8;
+  uint64 rejected_updates_hard = 9;
+  // Further batches of running update streams refused at hard pressure.
+  uint64 rejected_update_batches = 10;
+  // New searches refused at hard pressure.
+  uint64 rejected_searches = 11;
 }
 
 // Full catalog for a discovery cursor, scoped to this source boot.
