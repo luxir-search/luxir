@@ -626,6 +626,44 @@ TEST_F(IndexFormatTest, liveDocsCountDifferingFromManifestIsCorruption) {
   expectCorrupt([&] { leaf.liveDocs(); }, live, "live count 2 differs from the manifest's 1");
 }
 
+// Live counts are served from the manifest before a live docs file is read, so
+// a snapshot open checks the file's size and rejects a count its generation
+// cannot have.
+TEST_F(IndexFormatTest, manifestLiveCountAndSizeAreCheckedAtOpen) {
+  LuxirNode node(LuxirConfig{});
+  CollectionHelper ch(node, "main");
+  ASSERT_TRUE(ch.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(ch.deleteById("a", UpdateMessage::COMMIT).success);
+  auto& dir = ch.getIndexWriter()->dir;
+  auto root = readDurableIndexInfo(dir);
+  auto segment = root.info.segments.front();
+  auto name = Postings::segmentKey(segment.seg_id, segment.creator_epoch);
+  auto live = Postings::getLiveDocsFileName(name, segment.live_gen, segment.live_epoch);
+  {
+    RAMDir copy;
+    std::vector<Directory::FileInfo> files;
+    dir.listFiles(files);
+    for (const auto& descriptor : files) {
+      auto input = dir.openFile(descriptor.name);
+      auto hold = input->acquire({0, input->size()});
+      std::string bytes(hold.getData(), hold.getLength());
+      if (descriptor.name == live) bytes.push_back('x');
+      writeFile(copy, descriptor.name, bytes);
+    }
+    expectCorrupt([&] { IndexReader reader(copy); }, live, "differs from the manifest's");
+  }
+  for (int32_t count : {-1, 2}) {
+    segment.live_docs = count;
+    root.info.segments = std::span(&segment, 1);
+    root.info.index_gen++;
+    std::vector<std::byte> bytes;
+    ASSERT_TRUE(api::encode(root.info, bytes));
+    Manifest::write(dir, root.info.index_gen, bytes, root->writer_epoch);
+    IncarnationState::install(dir, Manifest::tip(root->index_gen, root->writer_epoch));
+    expectCorrupt([&] { IndexReader reader(dir); }, name, std::format("manifest records {} live of 2 rows", count));
+  }
+}
+
 TEST_F(IndexFormatTest, corruptFieldPrefixRespectsVerificationPolicy) {
   LuxirNode node(LuxirConfig{});
   CollectionHelper ch(node, "main");

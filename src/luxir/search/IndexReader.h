@@ -138,8 +138,9 @@ public:
   }
 
   // Opens the file of generation `liveGen`, whose manifest records `size`
-  // bytes (zero when unknown) and `numLive` live rows. Null when the file is
-  // missing and missingFileOK is set, so the caller can reload the manifest.
+  // bytes (zero when unknown) and `numLive` live rows; a file of another size
+  // is corrupt. Null when the file is missing and missingFileOK is set, so
+  // the caller can reload the manifest.
   static std::shared_ptr<SegmentLive> open(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
                                            uint64_t liveEpoch, int32_t maxDoc, int32_t numLive, uint64_t size,
                                            bool missingFileOK, bool expectSynced);
