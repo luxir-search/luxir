@@ -137,6 +137,8 @@ public:
   static constexpr flag_type MULTI_ARRAY = (1 << 7);
   static constexpr flag_type NUM_TOKENS_APPROX = (1 << 8);
   static constexpr flag_type NUM_TOKENS_EXACT = (1 << 9);
+  // TEXT only: no per-doc length norms. Fields without freqs never carry norms.
+  static constexpr flag_type OMIT_NORMS = (1 << 10);
 
   // Schema-only roles.
   static constexpr flag_type ABSTRACT = (1 << 29);  // Usable via suffix matching or inheritance.
@@ -149,7 +151,7 @@ public:
       INDEX_DOCS, INDEX_DOCS_FREQS ^ INDEX_DOCS,
       INDEX_DOCS_FREQS_POSITIONS ^ INDEX_DOCS_FREQS,
       COLUMN_STORED, MULTI_VALUED, STORED, INDEX_RANGE, MULTI_ARRAY,
-      NUM_TOKENS_APPROX, NUM_TOKENS_EXACT
+      NUM_TOKENS_APPROX, NUM_TOKENS_EXACT, OMIT_NORMS
     };
     flag_type used = SCHEMA_ROLES;
     for (auto bit : bits) {
@@ -216,12 +218,14 @@ public:
   // bit-and would report a DOCS-only field as having freqs/positions.
   static bool hasFreqs(flag_type flags) { return (flags & INDEX_DOCS_FREQS) == INDEX_DOCS_FREQS; }
   static bool hasPositions(flag_type flags) { return (flags & INDEX_DOCS_FREQS_POSITIONS) == INDEX_DOCS_FREQS_POSITIONS; }
+  // Length norms (and the block impacts built from them) for TEXT postings.
+  static bool hasNorms(flag_type flags) { return hasFreqs(flags) && !(flags & OMIT_NORMS); }
 
   bool hasFreqs() { return hasFreqs(flags_); }
 
   bool hasPositions() { return hasPositions(flags_); }
 
-  bool hasNumTokens() { return (bool) (flags_ & (NUM_TOKENS_APPROX | NUM_TOKENS_EXACT)); }
+  bool hasNorms() { return hasNorms(flags_); }
 
   bool multiValued() { return (bool) (flags_ & MULTI_VALUED); }
   bool multiArray() const { return (flags_ & MULTI_ARRAY) != 0; }
@@ -312,6 +316,11 @@ public:
   // The compiled plan (analysis/Analyzer.h), shared by fields inheriting the same
   // authored definition; equal inline definitions may have separate plans.
   std::shared_ptr<const Analyzer> analyzer_;
+
+  // Positions jump by this between values of a multi-valued text field. The
+  // gap discourages ordinary phrase matches but does not isolate values:
+  // slop >= 100 can cross the boundary (adjacent raw positions differ by 101).
+  static constexpr int POSITION_INCREMENT_GAP = 100;
 
   TextFieldType(std::string_view name, int flags, std::shared_ptr<const Analyzer> analyzer)
     : FieldType(name, FieldType::TEXT, flags, true), analyzer_(std::move(analyzer)) {}

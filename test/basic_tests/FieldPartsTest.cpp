@@ -75,7 +75,7 @@ void checkCorruptRecord(const EncodedFieldRecord& record, std::vector<uint64_t> 
     EXPECT_THROW(FieldRecordCodec::fieldHeader(corrupt, NUM_DOCS), std::runtime_error) << (int)level;
   }
   ASSERT_EQ(FieldType::NUM_TOKENS_EXACT, record.field.header.flags & FieldType::NUM_TOKENS_EXACT);
-  for (auto bit : {FieldType::NUM_TOKENS_APPROX, 1 << 10, FieldType::ABSTRACT, FieldType::DERIVED}) {
+  for (auto bit : {FieldType::NUM_TOKENS_APPROX, 1 << 11, FieldType::ABSTRACT, FieldType::DERIVED}) {
     corrupt = record.bytes;
     std::array<char, MAX_VLONG_SIZE> encoded;
     auto* end = writeVLong(encoded.data(), flagsValue | bit);
@@ -539,7 +539,7 @@ TEST_P(FieldPartsTest, IndexAndColumnSlices) {
   ASSERT_TRUE(norms);
   termsField.setNorms(*norms);
 
-  auto& plain = addField("no_positions", FieldType::TEXT, FieldType::INDEX_DOCS_FREQS);
+  auto& plain = addField("no_positions", FieldType::TEXT, FieldType::INDEX_DOCS_FREQS | FieldType::OMIT_NORMS);
   TextWriter noPositions(writer);
   noPositions.startField(ROOT, plain);
   noPositions.startTerm(term);

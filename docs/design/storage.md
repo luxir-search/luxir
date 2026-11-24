@@ -278,7 +278,8 @@ Each field record encodes the schema flags as an unsigned vint, excluding
 `ABSTRACT` and `DERIVED`. Bits 0-2 encode the cumulative postings level
 (0, 1, 3 or 7). Bits 3-7 are `COLUMN_STORED`, `MULTI_VALUED`, `STORED`,
 `INDEX_RANGE` and `MULTI_ARRAY`. Bits 8 and 9 are `NUM_TOKENS_APPROX` and
-`NUM_TOKENS_EXACT`. Intervals set the multi-valued and array bits for their
+`NUM_TOKENS_EXACT`. Bit 10 is `OMIT_NORMS`: a text field indexed with
+frequencies but no length norms, which then has no norms part. Intervals set the multi-valued and array bits for their
 physical endpoint pairs. The state byte carries the segment-specific
 `MAY_HAVE_FITTED` flag and records the presence of bounds and an explicit
 column value count. The field type determines the bounds kind.

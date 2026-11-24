@@ -263,8 +263,12 @@ void checkHeader(const Errors& errors, const FieldRecordHeader& header, int32_t 
   }
   if (parts.has(FieldPart::TERMS) && !header.indexedTotals.numTerms) errors.invalid("terms part has no terms");
   if (!parts.has(FieldPart::TERMS) && header.indexedTotals.numTerms) errors.invalid("indexed terms have no terms part");
+  if ((flags & FieldType::OMIT_NORMS) && (storage != FieldType::Storage::TEXT || !FieldType::hasFreqs(flags))) {
+    errors.invalid("omitted norms without text frequencies");
+  }
   if (parts.has(FieldPart::NORMS)) {
     if (storage != FieldType::Storage::TEXT) errors.invalid("norms on nontext field");
+    if ((flags & FieldType::INDEX_DOCS) && !FieldType::hasNorms(flags)) errors.invalid("norms on field without norms");
   }
   if (parts.has(FieldPart::POINTS)) {
     if (storage != FieldType::Storage::INT64) errors.invalid("points on incompatible field type");
