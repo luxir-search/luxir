@@ -3545,7 +3545,7 @@ protected:
     cache = std::make_shared<FilterCache>(config);
     auto writer = helper.getIndexWriter();
     writer->snapshots.readers.filterCache = cache;
-    writer->mergePolicy->setMergeFactor(100);
+    writer->setMergeFactor(100);
     for (int batch = 0; batch < 2; batch++) {
       test::CollectionHelper::UpdateBuilder input;
       for (int i = 0; i < 16; i++) {
@@ -4773,7 +4773,7 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
 
   test::CollectionHelper helper("merged_nested_cache");
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
   auto shared = std::make_shared<FilterCache>(FilterCacheConfig{
       .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2});
   writer->snapshots.readers.filterCache = shared;
@@ -7531,7 +7531,7 @@ TEST(FilterCacheTest, readerValueParticipatesInRecentWorkEviction) {
   RAMDir dir;
   CommitSnapshotRegistry writerSnapshots(test::reserveIncarnation(dir));
   IndexWriter writer(writerSnapshots);
-  writer.mergePolicy->setMergeFactor(100);
+  writer.setMergeFactor(100);
   addTermDoc(writer, "first");
   addTermDoc(writer, "second");
   writer.commit();
@@ -9943,7 +9943,7 @@ TEST_F(FilterCacheConcurrencyTest, updateMergePurgeEvictFuzz) {
   LuxirNode node(nodeConfig);
   CollectionHelper helper(node, collection);
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(3);
+  writer->setMergeFactor(3);
   writer->perInverterMaxDocs = 4;
   writer->perInverterRamBytes = 16 * 1024;
 

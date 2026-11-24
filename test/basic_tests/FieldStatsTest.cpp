@@ -171,7 +171,7 @@ TEST_P(FieldStatsOutputTest, flushAndMergeMatchPhysicalValues) {
   schema.field("address").type = Class::IP;
   schema.set(helper.collection());
   auto writer = helper.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(100);
+  writer->setMergeFactor(100);
 
   double inf = std::numeric_limits<double>::infinity();
   double nan = std::numeric_limits<double>::quiet_NaN();

@@ -3,6 +3,7 @@
 
 #pragma once
 #include "luxir/analysis/AnalysisRegistry.h"
+#include "luxir/index/MergePolicyRegistry.h"
 #include "luxir/plugin/Plugin.h"
 #include "luxir/search/HitDecorator.h"
 #include "luxir/store/StorageRegistry.h"
@@ -25,6 +26,8 @@ struct Registries {
   // Plugin HTTP routes.
   HttpRouteRegistry& http;
   HitDecoratorRegistry& hitDecorators;
+  // Segment merge policies, selected per collection (SchemaDef.merge_policy).
+  MergePolicyRegistry& mergePolicies;
 
   static Registries global();
   // Freezes every registry.

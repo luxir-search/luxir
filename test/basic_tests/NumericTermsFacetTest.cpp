@@ -115,7 +115,7 @@ TEST_F(NumericTermsFacetTest, dictionaryStrategiesMatchColumnScan) {
       CollectionHelper helper;
       helper.clear();
       setSchema(helper, type, multi);
-      helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+      helper.getIndexWriter()->setMergeFactor(1000);
       bool integral = type == FC::INT;
       for (int i = 0; i < 360; i++) {
         Doc doc = flatdoc("id", std::to_string(i), "w", i % 11,
@@ -213,7 +213,7 @@ TEST_F(NumericTermsFacetTest, wideFilterWithFewWidelySpacedKeysUsesPostings) {
 
 TEST_F(NumericTermsFacetTest, mixedSegmentDictionaries) {
   CollectionHelper helper;
-  helper.getIndexWriter()->mergePolicy->setMergeFactor(1000);
+  helper.getIndexWriter()->setMergeFactor(1000);
   for (auto mode : {IM::NONE, IM::MATCH}) {
     setSchema(helper, FC::INT, MM::SINGLE, mode);
     std::vector<Doc> docs;

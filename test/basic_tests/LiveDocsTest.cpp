@@ -179,7 +179,7 @@ TEST_F(LiveDocsTest, kindFollowsDeleteCountAcrossGenerationsAndMerges) {
   LuxirNode node;
   CollectionHelper ch(node, "main");
   auto writer = ch.getIndexWriter();
-  writer->mergePolicy->setMergeFactor(1000);
+  writer->setMergeFactor(1000);
   // 640 docs take ten bitmap words (80 bytes): SPARSE for at most five deletes.
   indexRange(ch, 0, 640);
   auto live = range(0, 640);
@@ -214,7 +214,7 @@ TEST_F(LiveDocsTest, mergeDiffWritesEitherKind) {
     LuxirNode node;
     CollectionHelper ch(node, "main");
     auto writer = ch.getIndexWriter();
-    writer->mergePolicy->setMergeFactor(1000);
+    writer->setMergeFactor(1000);
     // The merged 640 docs take 80 bytes: SPARSE for at most five deletes.
     indexRange(ch, 0, 320);
     indexRange(ch, 320, 640);

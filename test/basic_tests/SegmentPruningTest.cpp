@@ -43,7 +43,7 @@ protected:
     helper = std::make_unique<CollectionHelper>("prune");
     helper->clear();
     auto writer = helper->getIndexWriter();
-    writer->mergePolicy->setMergeFactor(100);
+    writer->setMergeFactor(100);
     // Let routed filters in the one- and two-document segments enter the cache.
     writer->snapshots.readers.filterCache = std::make_shared<FilterCache>(FilterCacheConfig{.minSegmentDocs = 0});
     QueryPruning::disableForTests = false;

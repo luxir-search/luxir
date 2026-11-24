@@ -162,6 +162,11 @@ locations, browse `src/luxir/<area>/`.
      - `IndexHandler`: One physical representation, owned by `indexHandlers`;
        finish/flush visits each once in global physical-name order
    - `PostingsWriter`: used by an Inverter on flush to write a new segment.
+   - `MergePolicy` (`MergePolicy.h`): decides which segments merge, from each live
+     segment's counts, size, versions and a `MergeSegmentSummary` (column bounds).
+     `TieredMergePolicy` ("tiered") is the default; `MergePolicyRegistry` holds the
+     named makers plugins extend, and the schema's `merge_policy` selects one per
+     collection. Scheduling, admission and concurrency stay in `IndexWriter`.
    - `LiveDocsWriter`: one immutable file per delete generation (indexing errors,
      applied deletes, merge live docs diffs): a DENSE live bitmap, mapped in place
      by `LiveDocs::create`, or with few deletes a SPARSE list of deleted doc ids,
