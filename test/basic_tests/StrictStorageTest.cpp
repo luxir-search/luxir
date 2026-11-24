@@ -376,13 +376,15 @@ TEST(StrictStorageTest, roundResumesOnArenaOrInline) {
   ByteRange ranges[] = {{0, 2}, {10, 1}};
   oneapi::tbb::task_arena arena(2);
 
-  // Batches completing elsewhere resume the request on the arena.
-  ThreadedInputFile threaded(dir.openFile("a"));
+  // Batches completing elsewhere, after the round ended issuing, resume the
+  // request on the arena. Parked, so the batch cannot complete first.
+  ParkedInputFile parked(dir.openFile("a"));
   std::vector<HeldRange> holds;
   std::promise<std::exception_ptr> resumed;
   auto round = AcquireRound::create();
-  round->acquire(threaded, ranges, [&](auto&& acquired) { holds = std::move(acquired); });
+  round->acquire(parked, ranges, [&](auto&& acquired) { holds = std::move(acquired); });
   EXPECT_FALSE(round->resumeOn(arena, [&](std::exception_ptr failure) { resumed.set_value(failure); }));
+  std::jthread([&] { parked.release(); }).join();
   EXPECT_EQ(nullptr, resumed.get_future().get());
   ASSERT_EQ(2u, holds.size());
   EXPECT_EQ("a", contents(holds[1]));
