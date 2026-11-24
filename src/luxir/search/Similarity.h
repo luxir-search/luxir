@@ -219,6 +219,19 @@ public:
       }
     }
 
+    // scoreBlock for fractional frequencies, bit-identical to score(): the
+    // same two-loop split, for weighted combined-field frequencies.
+    void scoreFreqBlock(const float* freq, const uint8_t* norms, float* out, int32_t count) {
+      assert(count >= 0 && count <= Postings::DOCS_BLOCK_SIZE);
+      float factor[Postings::DOCS_BLOCK_SIZE];
+      for (int32_t i = 0; i < count; i++) {
+        factor[i] = invNorm[norms[i]];
+      }
+      for (int32_t i = 0; i < count; i++) {
+        out[i] = bm25ScoreFromDenominator(weight, bm25Denominator(freq[i], factor[i]), 1.0f);
+      }
+    }
+
     // Keep the vector and reduction loop alignment stable when unrelated cold
     // functions move. Otherwise gcc can add a retired padding instruction on
     // every frontier evaluation, despite generating identical scoring code.
