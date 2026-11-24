@@ -1096,8 +1096,8 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.defaults"></a>[`defaults`](#field-luxir.fielddef.defaults) | 14 | [`FieldDefaults`](#message-luxir.fielddefaults) | singular | default search and value representations |
 | <a id="field-luxir.fielddef.normalizer"></a>[`normalizer`](#field-luxir.fielddef.normalizer) | 15 | [`NormalizerDef`](#message-luxir.normalizerdef) | singular | whole-value STRING normalization |
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
-| <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix; normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits; 0 means no truncation. |
-| <a id="field-luxir.fielddef.encoding"></a>[`encoding`](#field-luxir.fielddef.encoding) | 20 | [`VectorEncoding`](#enum-luxir.vectorencoding) | optional | VECTOR only. Column storage encoding. Unset inherits, falling back to F32. F16 rejects elements with a magnitude above 65504. Applies to newly written segments; merges rewrite older segments in it. |
+| <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix, or HAMMING, which needs a multiple of 8; normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits; 0 means no truncation. |
+| <a id="field-luxir.fielddef.encoding"></a>[`encoding`](#field-luxir.fielddef.encoding) | 20 | [`VectorEncoding`](#enum-luxir.vectorencoding) | optional | VECTOR only. Column storage encoding. Unset inherits, falling back to BIT for metric HAMMING and F32 otherwise. F16 rejects elements with a magnitude above 65504. Applies to newly written segments; merges rewrite older segments in it. An existing field cannot change between BIT and the other encodings. |
 | <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
 | <a id="field-luxir.fielddef.scale"></a>[`scale`](#field-luxir.fielddef.scale) | 25 | `int32` | optional | DECIMAL only, and required there: digits after the decimal point, 0 to 18. Excess fractional digits round half away from zero. |
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
@@ -3268,12 +3268,13 @@ Storage encoding of a vector field's column. Exact search and the rescoring of A
 | <a id="value-luxir.vectorencoding.f16"></a>[`F16`](#value-luxir.vectorencoding.f16) | 1 | IEEE half precision per element (2 bytes per dimension) |
 | <a id="value-luxir.vectorencoding.bf16"></a>[`BF16`](#value-luxir.vectorencoding.bf16) | 2 | bfloat16 per element (2 bytes per dimension) |
 | <a id="value-luxir.vectorencoding.sq8"></a>[`SQ8`](#value-luxir.vectorencoding.sq8) | 3 | Per-vector scalar quantization: a float offset and scale per vector plus one uint8 code per dimension (8 + dims bytes). |
+| <a id="value-luxir.vectorencoding.bit"></a>[`BIT`](#value-luxir.vectorencoding.bit) | 4 | One bit per dimension, set when the element is &gt; 0 (dims / 8 bytes; dims a multiple of 8). Searchable only with metric HAMMING, whose default encoding it is. |
 
 <a id="enum-luxir.vectormetric"></a>
 
 ### luxir.VectorMetric
 
-Vector similarity metric. NONE = storage-only, not kNN-searchable; L2 / IP / COSINE select the metric for exact column search and any ANN index.
+Vector similarity metric. NONE = storage-only, not kNN-searchable; L2 / IP / COSINE select the metric for exact column search and any ANN index. HAMMING scores BIT-encoded binary vectors by 1 - hamming distance / dims, by exact search only (no ANN index).
 
 [Source](../../protos/luxir_types.proto)
 
@@ -3283,6 +3284,7 @@ Vector similarity metric. NONE = storage-only, not kNN-searchable; L2 / IP / COS
 | <a id="value-luxir.vectormetric.l2"></a>[`L2`](#value-luxir.vectormetric.l2) | 1 |  |
 | <a id="value-luxir.vectormetric.ip"></a>[`IP`](#value-luxir.vectormetric.ip) | 2 |  |
 | <a id="value-luxir.vectormetric.cosine"></a>[`COSINE`](#value-luxir.vectormetric.cosine) | 3 |  |
+| <a id="value-luxir.vectormetric.hamming"></a>[`HAMMING`](#value-luxir.vectormetric.hamming) | 4 |  |
 
 ## Imported types
 

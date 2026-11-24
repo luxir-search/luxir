@@ -691,7 +691,7 @@ TEST_P(FieldPartsTest, IndexAndColumnSlices) {
            "vector column must use fixed stride");
     reject("vec", [](auto& record) { record.field.bytes.values.bytes = 3; },
            "vector stride is not a whole vector in the column's encoding");
-    reject("vec", [](auto& record) { record.field.bytes.vectorEncoding = (uint8_t)VectorEncoding::SQ8 + 1; },
+    reject("vec", [](auto& record) { record.field.bytes.vectorEncoding = (uint8_t)VectorEncoding::BIT + 1; },
            "unknown vector encoding");
     reject("bytes", [](auto& record) { record.field.bytes.vectorEncoding = (uint8_t)VectorEncoding::F16; },
            "vector encoding on a non-vector column");

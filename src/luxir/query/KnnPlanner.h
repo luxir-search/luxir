@@ -63,16 +63,20 @@ struct KnnPlanner {
                7.50 / NS_PER_DIM, 17.7 / NS_PER_DIM, 7.50 / NS_PER_DIM};
     double requestCost = 18400 / NS_PER_DIM; // Common to both arms, once per query.
     // EXACT_DIM and TERMINAL_DIM per stored encoding, relative to f32, indexed
-    // [cosine on a non-f32 column][VectorEncoding] (f32, f16, bf16, sq8).
+    // [cosine on a non-f32 column][VectorEncoding] (f32, f16, bf16, sq8, bit).
     // Cosine over a non-f32 column pays a second pass over the row for the
     // stored norm. BM_VectorEncodingExact's exact-scan time per query (warm
     // cache, one thread, x86 with AVX-512) over f32's: row 0 is the mean of L2
     // and IP, row 1 cosine. They fit memory-resident columns at 768-d and 50k
     // vectors. f32 cosine over a raw column (normalize_on_write false) also
     // pays a norm pass but stays at 1, as before encodings were priced.
-    static constexpr std::array<std::array<double, 4>, 2> ENCODING_DIM_COST{{
-        {1, 0.457, 0.459, 0.528},
-        {1, 0.722, 0.712, 0.668}}};
+    // bit (hamming, never cosine) measured the same way on an AVX2 host
+    // (i7-14700KF): 768-bit hamming rows at 291 us per query against f32 L2
+    // and IP at 4.8 ms.
+    static constexpr double BIT_DIM_COST = 0.06;
+    static constexpr std::array<std::array<double, 5>, 2> ENCODING_DIM_COST{{
+        {1, 0.457, 0.459, 0.528, BIT_DIM_COST},
+        {1, 0.722, 0.712, 0.668, BIT_DIM_COST}}};
     // Fraction of one-bit RaBitQ candidates that pass the gate to the
     // extra-bit pass, for an independent filter at the selectivities where
     // IVF is chosen: 0.04-0.06 at 128-d (SIFT) and ~0.011 at 768-d (miracl),

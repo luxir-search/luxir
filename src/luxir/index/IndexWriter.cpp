@@ -711,6 +711,16 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
   for (const auto& [name, signature] : schema->signatures(true)) {
     auto old = before.find(name);
     if (old == before.end()) continue;
+    auto* type = schema->getFieldTypePtr(name);
+    // A merge never converts vectors between bit and the other encodings
+    // (see VectorTranscoder), so existing segments could never converge.
+    auto* oldVector = dynamic_cast<const VectorFieldType*>(previous->getFieldTypePtr(name));
+    auto* newVector = dynamic_cast<const VectorFieldType*>(type);
+    if (oldVector && newVector && !vcodec::convertible(oldVector->encoding(), newVector->encoding())) {
+      throw SchemaError(std::format(
+          "Cannot change encoding of existing vector field '{}' between {} and {}; reindex into a new field",
+          name, vcodec::name(oldVector->encoding()), vcodec::name(newVector->encoding())));
+    }
     auto oldUnit = old->second.properties.find("unit");
     auto newUnit = signature.properties.find("unit");
     if (oldUnit != old->second.properties.end() && newUnit != signature.properties.end()
@@ -720,7 +730,6 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
     }
     // Existing segments hold only the postings of an indexed string written
     // without a column, and ARRAY sequences cannot be rebuilt from those.
-    auto* type = schema->getFieldTypePtr(name);
     auto oldColumn = old->second.properties.find("column");
     if (type && FieldType::storage(type->type()) == FieldType::Storage::TERMS && type->indexed()
         && type->hasColumn() && oldColumn != old->second.properties.end()
@@ -2081,7 +2090,7 @@ bool eligibleVectorOverlayName(const Schema& schema, std::string_view overlayNam
   auto* ft = schema.getFieldTypePtr(overlayName);
   if (ft == nullptr || ft->type() != FieldType::VECTOR) return false;
   auto* vft = (const VectorFieldType*)ft;
-  return vft->knnSearchable();
+  return vft->annIndexable();
 }
 
 std::vector<std::string> collectValidatedExactVectorOverlayNames(

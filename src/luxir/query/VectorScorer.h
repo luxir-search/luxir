@@ -9,8 +9,10 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -18,6 +20,7 @@
 #include "luxir/codec/VectorCodec.h"
 #include "luxir/query/Sq8Kernel.h"
 #include "luxir/schema/FieldType.h"
+#include "luxir/util/Popcount.h"
 
 namespace luxir {
 
@@ -27,7 +30,10 @@ namespace luxir {
 /// exact over the stored values.
 ///
 /// Scores are higher-is-better: L2 -> 1 / (1 + squared distance), IP -> dot,
-/// COSINE -> dot / |x|.  The query is already unit length for COSINE; an F32
+/// COSINE -> dot / |x|, HAMMING -> 1 - hamming distance / dims.  HAMMING
+/// scores only BIT rows and BIT rows score only under HAMMING: the query is
+/// packed like a stored row once (element > 0) and compared with
+/// popcnt::hamming, in integers, so it is exact.  The query is already unit length for COSINE; an F32
 /// column of unit vectors skips the division (normalizeColumn false).  A
 /// stored unit vector in another encoding is not exactly unit length, so its
 /// cosine always divides by the stored norm.
@@ -59,6 +65,8 @@ class VectorScorer {
   const sq8::Kernels* sq8Kernels;
   // SQ8 without the sq8 kernels: the decoded row.
   mutable std::vector<float> scratch;
+  // BIT: the query packed like a stored row.
+  std::vector<uint8_t> queryBits;
   // F16 / BF16: computers built from quantizer, which owns any trained state
   // they point into (none for the 16-bit types).  distance returns the
   // squared L2 distance, or the dot product for IP and COSINE; norm returns
@@ -69,11 +77,29 @@ class VectorScorer {
   std::vector<float> zeros;
 
 public:
+  /// Throws when a segment's encoding cannot be scored under the metric (BIT
+  /// without HAMMING or the reverse), which only a field redefined over
+  /// existing segments can produce (see VectorTranscoder).
+  static void checkScorable(VectorEncoding encoding, int32_t metric) {
+    bool hamming = metric == (int32_t)api::VectorMetric::HAMMING;
+    if (metric != (int32_t)api::VectorMetric::NONE && hamming != (encoding == VectorEncoding::BIT)) {
+      throw std::runtime_error(std::format(
+          "vector segment encoding {} cannot be scored with metric {}; reindex the field",
+          vcodec::name(encoding), hamming ? "hamming" : "l2/ip/cosine"));
+    }
+  }
+
+  /// See checkScorable.
   VectorScorer(const float* query, int32_t dims, int32_t metric, bool normalizeColumn,
                VectorEncoding encoding)
     : query(query), dims(dims), metric(metric), normalizeColumn(normalizeColumn),
       encoding(encoding), sq8Kernels(encoding == VectorEncoding::SQ8 ? sq8::best() : nullptr) {
     assert(query != nullptr);
+    checkScorable(encoding, metric);
+    if (encoding == VectorEncoding::BIT) {
+      queryBits.resize((size_t)vcodec::bytesPerVector(encoding, dims));
+      vcodec::encode(encoding, query, dims, (char*)queryBits.data());
+    }
     if (encoding == VectorEncoding::SQ8 && !sq8Kernels) scratch.resize((size_t)dims);
     bool sixteenBit = encoding == VectorEncoding::F16 || encoding == VectorEncoding::BF16;
     bool scored = metric == (int32_t)api::VectorMetric::L2 || metric == (int32_t)api::VectorMetric::IP
@@ -106,6 +132,11 @@ public:
       case VectorEncoding::F16:
       case VectorEncoding::BF16:
         return score16((const uint8_t*)row.data(), fallbackScore);
+      case VectorEncoding::BIT: {
+        if (metric != (int32_t)api::VectorMetric::HAMMING) return fallbackScore;
+        uint64_t distance = popcnt::hamming(queryBits.data(), (const uint8_t*)row.data(), queryBits.size());
+        return 1.0f - (float)distance / (float)dims;
+      }
       case VectorEncoding::SQ8:
         if (sq8Kernels) return scoreSq8(row.data(), fallbackScore);
         [[fallthrough]];

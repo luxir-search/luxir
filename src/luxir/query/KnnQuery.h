@@ -1119,6 +1119,7 @@ public:
           VectorReader vr(reader.segments()[i].postingsReader(), *info);
           segCount = vr.numVectors();
           if (segCount > 0) {
+            VectorScorer::checkScorable(vr.encoding(), metric);
             if (vr.dims() != dims) {
               throw std::runtime_error(std::format(
                 "KnnQuery: query vector dims {} do not match segment dims {} for field '{}'",

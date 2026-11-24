@@ -27,9 +27,14 @@ namespace luxir {
 ///         with x[i] ~= offset + scale * code[i] (8 + dims bytes).  offset and
 ///         scale are the vector's own min and (max - min) / 255, so a value
 ///         needs no per-segment or per-dimension statistics.
+///   BIT:  one bit per dimension (dims / 8 bytes; dims a multiple of 8), set
+///         when the element is > 0, most significant bit first within a byte.
+///         Binary embeddings and fingerprints, scored only by the hamming
+///         metric.  It is not a precision of the float encodings: a merge
+///         never converts between BIT and them (see VectorTranscoder).
 ///
 /// The numeric values are persisted in segment field metadata; do not renumber.
-enum class VectorEncoding : uint8_t { F32 = 0, F16 = 1, BF16 = 2, SQ8 = 3 };
+enum class VectorEncoding : uint8_t { F32 = 0, F16 = 1, BF16 = 2, SQ8 = 3, BIT = 4 };
 
 namespace vcodec {
 
@@ -39,7 +44,7 @@ inline constexpr int32_t SQ8_LEVELS = 255;
 inline constexpr float F16_MAX = 65504.0f;
 
 inline bool valid(int32_t encoding) {
-  return encoding >= (int32_t)VectorEncoding::F32 && encoding <= (int32_t)VectorEncoding::SQ8;
+  return encoding >= (int32_t)VectorEncoding::F32 && encoding <= (int32_t)VectorEncoding::BIT;
 }
 
 inline const char* name(VectorEncoding e) {
@@ -47,6 +52,7 @@ inline const char* name(VectorEncoding e) {
     case VectorEncoding::F16: return "f16";
     case VectorEncoding::BF16: return "bf16";
     case VectorEncoding::SQ8: return "sq8";
+    case VectorEncoding::BIT: return "bit";
     case VectorEncoding::F32:
     default: return "f32";
   }
@@ -57,6 +63,7 @@ inline int32_t bytesPerVector(VectorEncoding e, int32_t dims) {
     case VectorEncoding::F16:
     case VectorEncoding::BF16: return dims * 2;
     case VectorEncoding::SQ8: return SQ8_HEADER_BYTES + dims;
+    case VectorEncoding::BIT: return dims / 8;
     case VectorEncoding::F32:
     default: return dims * (int32_t)sizeof(float);
   }
@@ -70,6 +77,7 @@ inline int32_t dimsFromBytes(VectorEncoding e, int32_t bytes) {
     case VectorEncoding::F16:
     case VectorEncoding::BF16: return bytes % 2 == 0 ? bytes / 2 : -1;
     case VectorEncoding::SQ8: return bytes > SQ8_HEADER_BYTES ? bytes - SQ8_HEADER_BYTES : -1;
+    case VectorEncoding::BIT: return bytes * 8;
     case VectorEncoding::F32:
     default: return bytes % (int32_t)sizeof(float) == 0 ? bytes / (int32_t)sizeof(float) : -1;
   }
@@ -87,9 +95,15 @@ inline Sq8Header readSq8Header(const char* in) {
   return h;
 }
 
+/// Whether a column can be converted between encodings a and b: BIT holds
+/// signs, not values, so it converts only to itself.
+inline bool convertible(VectorEncoding a, VectorEncoding b) {
+  return (a == VectorEncoding::BIT) == (b == VectorEncoding::BIT);
+}
+
 /// Encodes dims finite floats into bytesPerVector(e, dims) bytes at out.
 /// Callers validate finiteness and VectorFieldType::MAX_ELEMENT_MAGNITUDE
-/// (and the F16 range) first.
+/// (and the F16 range) first.  BIT needs dims to be a multiple of 8.
 inline void encode(VectorEncoding e, const float* in, int32_t dims, char* out) {
   switch (e) {
     case VectorEncoding::F16:
@@ -136,6 +150,13 @@ inline void encode(VectorEncoding e, const float* in, int32_t dims, char* out) {
       std::memcpy(out + sizeof(float), &h.scale, sizeof(float));
       return;
     }
+    case VectorEncoding::BIT:
+      for (int32_t byte = 0; byte < dims / 8; byte++) {
+        uint32_t bits = 0;
+        for (int32_t i = 0; i < 8; i++) bits = (bits << 1) | (in[8 * byte + i] > 0.0f ? 1u : 0u);
+        out[byte] = (char)bits;
+      }
+      return;
     case VectorEncoding::F32:
     default:
       std::memcpy(out, in, (size_t)dims * sizeof(float));
@@ -166,6 +187,9 @@ inline void decode(VectorEncoding e, const char* in, int32_t dims, float* out) {
       for (int32_t i = 0; i < dims; i++) out[i] = h.offset + h.scale * (float)codes[i];
       return;
     }
+    case VectorEncoding::BIT:
+      for (int32_t i = 0; i < dims; i++) out[i] = (float)(((uint8_t)in[i >> 3] >> (7 - (i & 7))) & 1u);
+      return;
     case VectorEncoding::F32:
     default:
       std::memcpy(out, in, (size_t)dims * sizeof(float));
