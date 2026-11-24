@@ -162,12 +162,12 @@ void ReplicationSource::seenLocked(std::string_view follower) {
 }
 
 uint64_t ReplicationSource::watch(std::string_view cursor, std::string_view follower,
-                                 std::function<void()> completion, std::span<const std::string> tenants) {
-  std::set<std::string> subscription;
-  for (const auto& tenant : tenants) {
-    Collections::validateName(tenant, "tenant");
-    subscription.insert(tenant);
-  }
+                                 std::function<void()> completion, std::span<const std::string> tenants,
+                                 std::span<const std::string> labels) {
+  auto subscription = ReplicationSubscription::of(tenants, labels);
+  // Wakes on any change of a tenant the subscription reaches; empty is all.
+  std::set<std::string> watched(subscription.tenants.begin(), subscription.tenants.end());
+  for (const auto& id : subscription.collections) watched.insert(id.tenant);
   uint64_t parked = 0;
   bool membershipChanged = false;
   {
@@ -176,14 +176,14 @@ uint64_t ReplicationSource::watch(std::string_view cursor, std::string_view foll
     seenLocked(follower);
     if (!follower.empty()) {
       auto& live = followers.find(follower)->second;
-      membershipChanged = live.tenants != subscription;
-      live.tenants = subscription;
+      membershipChanged = live.subscription != subscription;
+      live.subscription = subscription;
       acknowledgments -= std::erase_if(live.commits, [&](const auto& entry) { return !live.includes(entry.first); });
     }
     uint64_t relevant = revision;
-    if (!subscription.empty()) {
+    if (!watched.empty()) {
       relevant = 0;
-      for (const auto& tenant : subscription) {
+      for (const auto& tenant : watched) {
         auto it = tenantWatches.find(tenant);
         if (it != tenantWatches.end()) relevant = std::max(relevant, it->second.revision);
       }
@@ -198,9 +198,9 @@ uint64_t ReplicationSource::watch(std::string_view cursor, std::string_view foll
     }
     if (current) {
       parked = ++nextWatch;
-      watches.emplace(parked, Watch{subscription, std::move(completion)});
-      if (subscription.empty()) allWatches.insert(parked);
-      else for (const auto& tenant : subscription) tenantWatches[tenant].watches.insert(parked);
+      if (watched.empty()) allWatches.insert(parked);
+      else for (const auto& tenant : watched) tenantWatches[tenant].watches.insert(parked);
+      watches.emplace(parked, Watch{std::move(watched), std::move(completion)});
     }
   }
   if (membershipChanged && acknowledgmentsChanged) acknowledgmentsChanged(nullptr);
@@ -214,12 +214,14 @@ void ReplicationSource::cancel(uint64_t watch) {
   if (watches.contains(watch)) takeWatchLocked(watch);
 }
 
-api::ReplicationCatalog ReplicationSource::catalog(std::pmr::memory_resource& arena, std::span<const std::string> tenants) {
+api::ReplicationCatalog ReplicationSource::catalog(std::pmr::memory_resource& arena, std::span<const std::string> tenants,
+                                                  std::span<const std::string> labels) {
+  auto subscription = ReplicationSubscription::of(tenants, labels);
   std::lock_guard lock(mutex);
   api::ReplicationCatalog response;
   response.boot = api::build::arenaStr(arena, boot);
   response.cursor = api::build::arenaStr(arena, boot + ":" + std::to_string(revision));
-  auto wanted = [&](const CollectionId& id) { return tenants.empty() || std::ranges::find(tenants, id.tenant) != tenants.end(); };
+  auto wanted = [&](const CollectionId& id) { return subscription.includes(id); };
   auto* entries = api::build::allocArray(response.collections,
       (size_t)std::ranges::count_if(collections, [&](const auto& entry) { return wanted(entry.first); }), arena);
   size_t i = 0;
@@ -229,16 +231,17 @@ api::ReplicationCatalog ReplicationSource::catalog(std::pmr::memory_resource& ar
     entry.tenant = api::build::arenaStr(arena, id.tenant);
     entry.collection = api::build::arenaStr(arena, id.name);
     entry.available = state.error.empty();
+    entry.read_only = state.readOnly;
     if (state.commit) {
       entry.commit = api::build::arenaStr(arena, state.commit->token());
       entry.manifest_xxh3 = api::build::arenaStr(arena, CommitSnapshot::digestText(state.digest));
     }
   }
   auto* revisions = api::build::allocArray(response.tenants,
-      (size_t)std::ranges::count_if(catalogRevisions, [&](const auto& e) { return tenants.empty() || std::ranges::find(tenants, e.first) != tenants.end(); }), arena);
+      (size_t)std::ranges::count_if(catalogRevisions, [&](const auto& e) { return subscription.includesTenant(e.first); }), arena);
   i = 0;
   for (const auto& [tenant, rev] : catalogRevisions) {
-    if (!tenants.empty() && std::ranges::find(tenants, tenant) == tenants.end()) continue;
+    if (!subscription.includesTenant(tenant)) continue;
     revisions[i++] = {api::build::arenaStr(arena, tenant), rev};
   }
   return response;

@@ -1102,21 +1102,44 @@ void IndexWriter::autoCommitFinished() {
   }
 }
 
+namespace {
+class BlockingUpdateMessage : public UpdateMessage {
+public:
+  Blocker blocker;
+
+  void handle(IndexWriter& iw) override {
+    unused(iw);
+  }
+
+  void done(IndexWriter& iw) override {
+    unused(iw);
+    blocker.notify();
+  }
+};
+} // namespace
+
+std::optional<CommitId> IndexWriter::seal() {
+  BlockingUpdateMessage updateMessage;
+  updateMessage.commit = UpdateMessage::COMMIT;
+  const UpdateMessage* none = nullptr;
+  if (!sealing.compare_exchange_strong(none, &updateMessage, std::memory_order_acq_rel)) {
+    throw std::logic_error("index writer is already sealed");
+  }
+  std::exception_ptr failure;
+  if (submitUpdate(&updateMessage)) {
+    updateMessage.blocker.wait();
+    if (updateMessage.result.errored()) failure = updateMessage.result.getError()->eptr;
+  } else {
+    failure = std::make_exception_ptr(std::runtime_error("Commit admission failed"));
+  }
+  // A writer closed before the seal was sequenced still refuses everything.
+  sealed.store(true, std::memory_order_release);
+  close();
+  if (failure) std::rethrow_exception(failure);
+  return updateMessage.resultingCommit;
+}
+
 std::optional<CommitId> IndexWriter::commit(UpdateMessage::CommitType commitType) {
-  class BlockingUpdateMessage : public UpdateMessage {
-  public:
-    Blocker blocker;
-
-    void handle(IndexWriter& iw) override {
-      unused(iw);
-    }
-
-    void done(IndexWriter& iw) override {
-      unused(iw);
-      blocker.notify();
-    }
-  };
-
   // all stack allocated since we will be waiting for completion.
   BlockingUpdateMessage updateMessage;
   updateMessage.commit = commitType;

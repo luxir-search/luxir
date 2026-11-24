@@ -172,6 +172,11 @@ public:
     view.collection = build::arenaStr(mr, name);
     return *this;
   }
+  LocalReq& tenant(std::string_view name) {
+    view.tenant = build::arenaStr(mr, name);
+    SearchRequest::tenant = name;
+    return *this;
+  }
   LocalReq& responseFormat(luxir::api::ResponseFormat f) {
     view.response_format = f;
     return *this;

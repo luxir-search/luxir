@@ -31,6 +31,13 @@ The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
 | [`luxir.Admin/CreateCollection`](../reference/protobuf.md#method-luxir.admin.createcollection) | unary | Create a collection, optionally with a schema. |
 | [`luxir.Admin/DeleteCollection`](../reference/protobuf.md#method-luxir.admin.deletecollection) | unary | Delete a collection and its stored data. |
 | [`luxir.Admin/Stats`](../reference/protobuf.md#method-luxir.admin.stats) | unary | Read node, tenant or collection statistics (the structured form of HTTP `_stats`). |
+| [`luxir.Admin/ListCollections`](../reference/protobuf.md#method-luxir.admin.listcollections) | unary | One tenant's collection names. |
+| [`luxir.Admin/ListTenants`](../reference/protobuf.md#method-luxir.admin.listtenants) | unary | Tenants that own a collection. |
+| [`luxir.Admin/GetFollowerSubscription`](../reference/protobuf.md#method-luxir.admin.getfollowersubscription), [`SetFollowerSubscription`](../reference/protobuf.md#method-luxir.admin.setfollowersubscription) | unary | Read or change a follower's source and subscription; see [Replication](replication.md#change-the-subscription-at-runtime). |
+| [`luxir.Admin/SetReadOnly`](../reference/protobuf.md#method-luxir.admin.setreadonly) | unary | Make a collection read-only or writable again; see [Read-only collections](operations.md#read-only-collections). |
+
+Every request that names a collection also has a `tenant` field. Empty is the
+default tenant, `t0`. Each message of a stream resolves its own tenant.
 
 The server also registers the standard gRPC health service and descriptor
 reflection. Luxir implements the application services through gRPC's generic

@@ -81,21 +81,8 @@ void NodeConfig::validate() const {
   }
 }
 
-std::vector<std::string> ReplicationConfig::tenantFilter() const {
-  std::vector<std::string> result;
-  if (tenants.empty()) return result;
-  std::string_view remaining = tenants;
-  for (;;) {
-    auto comma = remaining.find(',');
-    auto tenant = remaining.substr(0, comma);
-    Collections::validateName(tenant, "tenant");
-    result.emplace_back(tenant);
-    if (comma == std::string_view::npos) break;
-    remaining.remove_prefix(comma + 1);
-  }
-  std::ranges::sort(result);
-  result.erase(std::unique(result.begin(), result.end()), result.end());
-  return result;
+ReplicationSubscription ReplicationConfig::subscription() const {
+  return ReplicationSubscription::parse(tenants, collections);
 }
 
 std::vector<std::string> ReplicationConfig::peerList() const {
@@ -113,7 +100,7 @@ std::vector<std::string> ReplicationConfig::peerList() const {
 }
 
 void ReplicationConfig::validate() const {
-  tenantFilter();
+  subscription();
   if (!max_acknowledgments) throw std::invalid_argument("replication.max-acknowledgments must be positive");
   if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
     throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
@@ -124,7 +111,8 @@ void ReplicationConfig::validate() const {
 void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--node.id", node.id, "Node identity (default host:port, otherwise a random UUID)");
   app.add_option("--replicate-from,--replication.source", replication.source, "Follow this HTTP source namespace");
-  app.add_option("--replication.tenants", replication.tenants, "Comma-separated tenant subscription (empty follows all)");
+  app.add_option("--replication.tenants", replication.tenants, "Comma-separated tenants a follower copies whole (with collections empty, follows all)");
+  app.add_option("--replication.collections", replication.collections, "Comma-separated tenant/name collections a follower copies (a bare name is in t0)");
   app.add_option("--replication.peers", replication.peers, "Comma-separated http:// nodes serving file copies, tried before the source");
   app.add_option("--replication.max-acknowledgments", replication.max_acknowledgments,
       "Node-wide follower/collection acknowledgment row budget")->default_val(replication.max_acknowledgments);

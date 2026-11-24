@@ -1151,6 +1151,59 @@ TEST_F(GrpcIndexTest, updateBodyReleasedBeforeWaitAndClientCancellationDrains) {
   EXPECT_EQ(api::ReplicaResult::Outcome::CANCELLED, outcome.get().outcome);
 }
 
+TEST_F(GrpcIndexTest, requestsActInTheirTenant) {
+  api::CreateCollectionRequest create;
+  create.name = "tdocs";
+  create.tenant = "acme";
+  Reply<api::CreateCollectionResponse> created;
+  grpc::ClientContext creation;
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::CreateCollection, &creation, create, &created).ok());
+
+  auto update = [&](std::string_view tenant, std::string_view id) {
+    CollectionHelper::UpdateBuilder b;
+    b.collection("tdocs").tenant(tenant).commit();
+    b.add(flatdoc("id", std::string(id)));
+    Reply<api::UpdateResponse> response;
+    grpc::ClientContext context;
+    return hppUnaryCall(channel.get(), rpc::Update, &context, b.finish(), &response);
+  };
+  ASSERT_TRUE(update("acme", "a").ok());
+  // The default tenant has no tdocs until auto-create makes one.
+  ASSERT_TRUE(update("", "b").ok());
+  EXPECT_EQ(1, luxirNode->getCollection(CollectionId{"acme", "tdocs"})->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(1, luxirNode->getCollection(CollectionId::of("tdocs"))->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, update("Bad", "c").error_code());
+
+  // A search resolves the collection in its own tenant: beta has no tdocs.
+  auto search = [&](std::string_view tenant) {
+    TrivialSearchRequest trivial;
+    trivial.request.collection = "tdocs";
+    trivial.request.tenant = tenant;
+    grpc::ClientContext context;
+    HppClientReaderWriter<api::SearchRequest, api::SearchResponse> stream(channel.get(), rpc::Search, &context);
+    EXPECT_TRUE(stream.Write(trivial.request)); stream.WritesDone();
+    Reply<api::SearchResponse> result;
+    while (stream.Read(&result)) {}
+    return stream.Finish().error_code();
+  };
+  EXPECT_EQ(grpc::StatusCode::OK, search("acme"));
+  EXPECT_EQ(grpc::StatusCode::OK, search(""));
+  EXPECT_EQ(grpc::StatusCode::NOT_FOUND, search("beta"));
+
+  api::ListCollectionsRequest list;
+  list.tenant = "acme";
+  Reply<api::ListCollectionsResponse> listed;
+  grpc::ClientContext listing;
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::ListCollections, &listing, list, &listed).ok());
+  ASSERT_EQ(1u, listed.msg.collections.size());
+  EXPECT_EQ("tdocs", listed.msg.collections[0]);
+  api::ListTenantsRequest tenants;
+  Reply<api::ListTenantsResponse> named;
+  grpc::ClientContext naming;
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::ListTenants, &naming, tenants, &named).ok());
+  EXPECT_NE(named.msg.tenants.end(), std::find(named.msg.tenants.begin(), named.msg.tenants.end(), "acme"));
+}
+
 TEST_F(GrpcIndexTest, createSchemaAndSearchReturnExactTokens) {
   api::CreateCollectionRequest create;
   create.name = "grpc_tokens";

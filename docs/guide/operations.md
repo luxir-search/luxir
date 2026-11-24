@@ -193,6 +193,33 @@ session cache policy for a later re-attach. If the old owner is dead, use
 `target.attachCollection(id, true)` to take over its assignment and fence its
 writer. Without force, attach requires the assignment to name this node.
 These are writer-node engine hooks; read-only nodes and followers refuse them.
+A read-only collection cannot be detached; make it writable first, or take it
+over with a forced attach, which opens it read-only on the target.
+
+## Read-only collections
+
+`POST /collections/_read_only` with `{"name":"docs","read_only":true}` (or
+gRPC `luxir.Admin/SetReadOnly`) freezes one collection on the node that writes
+it, while the node keeps writing its other collections. `/tenants/{tenant}`
+selects another tenant. The call:
+
+1. records the flag in the tenant catalog;
+2. commits every update admitted before the call and refuses later ones;
+3. closes the collection's index writer, which returns its indexing memory to
+   the node's shared budget;
+4. serves the committed snapshot without a writer.
+
+Afterwards updates and schema changes fail with `read_only` (HTTP 403), an
+update before its body is read. Search, stats, rename, swap and delete still
+work; detach does not. The flag belongs to the collection's data: it survives
+restarts, moves with renames and swaps, and is copied to followers, so a
+promoted follower keeps the collection read-only. Deleting and recreating the
+name starts a writable collection. `{"read_only":false}` reopens the writer.
+If the final commit fails, the collection is still made read-only and the
+call reports the failure; updates admitted but not committed are lost.
+`_stats` reports `read_only` per collection and Prometheus exports
+`luxir_collection_read_only`. Read-only nodes and followers refuse the call;
+their collections are always read-only.
 
 ## Collection lifecycle
 
@@ -238,6 +265,9 @@ for the effect on queued work.
 On the filesystem backend, incarnations live at `t/<tenant>/i/<id>/`.
 A tenant's `CATALOG` maps collection names to active incarnations and records
 reservations and retirements. Single-tenant deployments use tenant `t0`.
+Every data and administration route reaches another tenant through a
+`/tenants/{tenant}` prefix, and every gRPC request that names a collection has a
+`tenant` field; see [HTTP API conventions](http-api.md).
 Incarnation ids are millisecond timestamps in 11 lowercase hex digits, allocated
 monotonically by the catalog. The root `LAYOUT` marker identifies this format.
 A refused directory reports `data directory <storage description>: ...`, naming
@@ -301,7 +331,8 @@ A configured nonzero port binds `0.0.0.0`; there is no listen-address option
 yet. Disable HTTP with `--no-http`. The gRPC server always starts.
 
 Luxir does **not** provide TLS, authentication, authorization, per-tenant
-quotas, or a permission model. Do not expose either port directly to an
+quotas, or a permission model. Tenants separate data, not clients: any client
+that reaches a port can name any tenant. Do not expose either port directly to an
 untrusted network. Network policy is mandatory: place the
 process in a private network namespace, firewall both ports, or front them with
 an authenticated TLS proxy/service mesh.

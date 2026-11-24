@@ -215,6 +215,10 @@ public:
       request_.collection = build::arenaStr(mr_, name);
       return *this;
     }
+    UpdateBuilder& tenant(std::string_view name) {
+      request_.tenant = build::arenaStr(mr_, name);
+      return *this;
+    }
     UpdateBuilder& requestId(std::string_view id) {
       request_.request_id = build::arenaStr(mr_, id);
       return *this;

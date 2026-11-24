@@ -33,6 +33,11 @@ defaults and constraints are described in the comments and guides.
 | <a id="method-luxir.admin.swapcollections"></a>[`SwapCollections`](#method-luxir.admin.swapcollections) | [`SwapCollectionsRequest`](#message-luxir.swapcollectionsrequest) | [`SwapCollectionsResponse`](#message-luxir.swapcollectionsresponse) |  |
 | <a id="method-luxir.admin.stats"></a>[`Stats`](#method-luxir.admin.stats) | [`StatsRequest`](#message-luxir.statsrequest) | [`StatsResponse`](#message-luxir.statsresponse) |  |
 | <a id="method-luxir.admin.cachecontrol"></a>[`CacheControl`](#method-luxir.admin.cachecontrol) | [`CacheControlRequest`](#message-luxir.cachecontrolrequest) | [`CacheControlResponse`](#message-luxir.cachecontrolresponse) |  |
+| <a id="method-luxir.admin.listcollections"></a>[`ListCollections`](#method-luxir.admin.listcollections) | [`ListCollectionsRequest`](#message-luxir.listcollectionsrequest) | [`ListCollectionsResponse`](#message-luxir.listcollectionsresponse) |  |
+| <a id="method-luxir.admin.listtenants"></a>[`ListTenants`](#method-luxir.admin.listtenants) | [`ListTenantsRequest`](#message-luxir.listtenantsrequest) | [`ListTenantsResponse`](#message-luxir.listtenantsresponse) |  |
+| <a id="method-luxir.admin.setreadonly"></a>[`SetReadOnly`](#method-luxir.admin.setreadonly) | [`SetReadOnlyRequest`](#message-luxir.setreadonlyrequest) | [`SetReadOnlyResponse`](#message-luxir.setreadonlyresponse) |  |
+| <a id="method-luxir.admin.getfollowersubscription"></a>[`GetFollowerSubscription`](#method-luxir.admin.getfollowersubscription) | [`GetFollowerSubscriptionRequest`](#message-luxir.getfollowersubscriptionrequest) | [`FollowerSubscription`](#message-luxir.followersubscription) |  |
+| <a id="method-luxir.admin.setfollowersubscription"></a>[`SetFollowerSubscription`](#method-luxir.admin.setfollowersubscription) | [`SetFollowerSubscriptionRequest`](#message-luxir.setfollowersubscriptionrequest) | [`FollowerSubscription`](#message-luxir.followersubscription) |  |
 
 <a id="service-luxir.indexer"></a>
 
@@ -125,7 +130,9 @@ defaults and constraints are described in the comments and guides.
 - [`FieldVariants`](#message-luxir.fieldvariants)
 - [`FilesystemStats`](#message-luxir.filesystemstats)
 - [`Filter`](#message-luxir.filter)
+- [`FollowerFilter`](#message-luxir.followerfilter)
 - [`FollowerStatus`](#message-luxir.followerstatus)
+- [`FollowerSubscription`](#message-luxir.followersubscription)
 - [`Fusion`](#message-luxir.fusion)
 - [`FuzzyQuery`](#message-luxir.fuzzyquery)
 - [`GeoBoxQuery`](#message-luxir.geoboxquery)
@@ -134,6 +141,7 @@ defaults and constraints are described in the comments and guides.
 - [`GeoPolygon`](#message-luxir.geopolygon)
 - [`GeoPolygonQuery`](#message-luxir.geopolygonquery)
 - [`GeoRing`](#message-luxir.georing)
+- [`GetFollowerSubscriptionRequest`](#message-luxir.getfollowersubscriptionrequest)
 - [`GroupComponent`](#message-luxir.groupcomponent)
 - [`GroupKey`](#message-luxir.groupkey)
 - [`GroupTable`](#message-luxir.grouptable)
@@ -147,7 +155,9 @@ defaults and constraints are described in the comments and guides.
 - [`KnnQuery`](#message-luxir.knnquery)
 - [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf)
 - [`LinearFusion`](#message-luxir.linearfusion)
+- [`ListCollectionsRequest`](#message-luxir.listcollectionsrequest)
 - [`ListCollectionsResponse`](#message-luxir.listcollectionsresponse)
+- [`ListTenantsRequest`](#message-luxir.listtenantsrequest)
 - [`ListTenantsResponse`](#message-luxir.listtenantsresponse)
 - [`Map`](#message-luxir.map)
 - [`Match`](#message-luxir.match)
@@ -195,6 +205,9 @@ defaults and constraints are described in the comments and guides.
 - [`SearchResponse`](#message-luxir.searchresponse)
 - [`SegmentStats`](#message-luxir.segmentstats)
 - [`ServiceStats`](#message-luxir.servicestats)
+- [`SetFollowerSubscriptionRequest`](#message-luxir.setfollowersubscriptionrequest)
+- [`SetReadOnlyRequest`](#message-luxir.setreadonlyrequest)
+- [`SetReadOnlyResponse`](#message-luxir.setreadonlyresponse)
 - [`ShardCacheControl`](#message-luxir.shardcachecontrol)
 - [`ShardStats`](#message-luxir.shardstats)
 - [`SimpleQuery`](#message-luxir.simplequery)
@@ -467,7 +480,7 @@ Admin control over the per-collection query cache. Actions compose and apply in 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.cachecontrolrequest.collection"></a>[`collection`](#field-luxir.cachecontrolrequest.collection) | 1 | `string` | singular | Empty selects every collection of \`tenant\`, or of every tenant when \`tenant\` is also empty (administration). |
-| <a id="field-luxir.cachecontrolrequest.tenant"></a>[`tenant`](#field-luxir.cachecontrolrequest.tenant) | 7 | `string` | singular | Administration only. With a collection, empty is the caller's tenant. |
+| <a id="field-luxir.cachecontrolrequest.tenant"></a>[`tenant`](#field-luxir.cachecontrolrequest.tenant) | 7 | `string` | singular | With a collection, empty is the default tenant. |
 | <a id="field-luxir.cachecontrolrequest.flush"></a>[`flush`](#field-luxir.cachecontrolrequest.flush) | 2 | `bool` | singular |  |
 | <a id="field-luxir.cachecontrolrequest.reset_admission"></a>[`reset_admission`](#field-luxir.cachecontrolrequest.reset_admission) | 3 | `bool` | singular |  |
 | <a id="field-luxir.cachecontrolrequest.reset_counters"></a>[`reset_counters`](#field-luxir.cachecontrolrequest.reset_counters) | 4 | `bool` | singular |  |
@@ -750,6 +763,7 @@ Engine work that reached this collection since it was opened. The node's Service
 | <a id="field-luxir.collectionstats.error"></a>[`error`](#field-luxir.collectionstats.error) | 5 | [`Error`](#message-luxir.error) | singular | Set for a collection that is not serving (failed to load, being deleted, or a delete failed partway): kind is UNAVAILABLE and the message is the reason. A node-wide walk also reports here a collection whose statistics could not be read, with the failure's kind. |
 | <a id="field-luxir.collectionstats.storage_ram_bytes"></a>[`storage_ram_bytes`](#field-luxir.collectionstats.storage_ram_bytes) | 6 | `uint64` | singular |  |
 | <a id="field-luxir.collectionstats.activity"></a>[`activity`](#field-luxir.collectionstats.activity) | 8 | [`CollectionActivityStats`](#message-luxir.collectionactivitystats) | singular | Set for a serving collection. |
+| <a id="field-luxir.collectionstats.read_only"></a>[`read_only`](#field-luxir.collectionstats.read_only) | 9 | `bool` | singular | The collection serves without a writer: made read-only, or on a read-only node or follower. |
 
 <a id="message-luxir.column"></a>
 
@@ -833,7 +847,7 @@ Parameters governing how a commit is performed. Presence of this message in an U
 |---|---|---|---|---|
 | <a id="field-luxir.createcollectionrequest.name"></a>[`name`](#field-luxir.createcollectionrequest.name) | 1 | `string` | singular |  |
 | <a id="field-luxir.createcollectionrequest.schema"></a>[`schema`](#field-luxir.createcollectionrequest.schema) | 2 | [`SchemaDef`](#message-luxir.schemadef) | singular |  |
-| <a id="field-luxir.createcollectionrequest.tenant"></a>[`tenant`](#field-luxir.createcollectionrequest.tenant) | 3 | `string` | singular | Administration only: the owning tenant. Empty is the caller's tenant (the default tenant until credentials carry one). |
+| <a id="field-luxir.createcollectionrequest.tenant"></a>[`tenant`](#field-luxir.createcollectionrequest.tenant) | 3 | `string` | singular | The owning tenant. Empty is the default tenant, t0. |
 | <a id="field-luxir.createcollectionrequest.wait_for_replicas"></a>[`wait_for_replicas`](#field-luxir.createcollectionrequest.wait_for_replicas) | 4 | [`ReplicaRequirement`](#message-luxir.replicarequirement) | singular | All counts live followers subscribed to the tenant that serve any collection, since none serves the new one yet. |
 | <a id="field-luxir.createcollectionrequest.wait_for_replicas_timeout_ms"></a>[`wait_for_replicas_timeout_ms`](#field-luxir.createcollectionrequest.wait_for_replicas_timeout_ms) | 5 | `uint64` | optional | absent = 30000 |
 
@@ -1205,6 +1219,17 @@ Alternate representations of the same input value, keyed by local label. Absent 
 | <a id="field-luxir.filter.query"></a>[`query`](#field-luxir.filter.query) | 1 | [`Query`](#message-luxir.query) | singular | required; restricts matches without contributing to scores |
 | <a id="field-luxir.filter.except_ops"></a>[`except_ops`](#field-luxir.filter.except_ops) | 2 | `string` | repeated | Keys in the enclosing TopDocs.ops map that should not receive this filter. The filter still applies to the TopDocs results and other sub-operations. Names must be nonempty, distinct, and present in that ops map. Empty applies the filter to all sub-operations. Not supported on Fusion filters or Fusion source filters. |
 
+<a id="message-luxir.followerfilter"></a>
+
+### luxir.FollowerFilter
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.followerfilter.tenants"></a>[`tenants`](#field-luxir.followerfilter.tenants) | 1 | `string` | repeated |  |
+| <a id="field-luxir.followerfilter.collections"></a>[`collections`](#field-luxir.followerfilter.collections) | 2 | `string` | repeated | tenant/name; a bare name is in t0 |
+
 <a id="message-luxir.followerstatus"></a>
 
 ### luxir.FollowerStatus
@@ -1219,6 +1244,20 @@ Alternate representations of the same input value, keyed by local label. Absent 
 | <a id="field-luxir.followerstatus.commit"></a>[`commit`](#field-luxir.followerstatus.commit) | 3 | `string` | singular |  |
 | <a id="field-luxir.followerstatus.last_seen"></a>[`last_seen`](#field-luxir.followerstatus.last_seen) | 4 | `uint64` | singular | Unix milliseconds |
 | <a id="field-luxir.followerstatus.lag"></a>[`lag`](#field-luxir.followerstatus.lag) | 5 | `uint64` | optional | generation distance; absent without a current acknowledgment |
+
+<a id="message-luxir.followersubscription"></a>
+
+### luxir.FollowerSubscription
+
+What a follower copies, and from where. HTTP GET /\_replication/subscription, or gRPC Admin/GetFollowerSubscription.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.followersubscription.source"></a>[`source`](#field-luxir.followersubscription.source) | 1 | `string` | singular | http://host:port |
+| <a id="field-luxir.followersubscription.tenants"></a>[`tenants`](#field-luxir.followersubscription.tenants) | 2 | `string` | repeated | Every collection of each of these tenants, sorted. |
+| <a id="field-luxir.followersubscription.collections"></a>[`collections`](#field-luxir.followersubscription.collections) | 3 | `string` | repeated | And each of these collections, as tenant/name, sorted. Both lists empty copy every collection of every tenant. |
 
 <a id="message-luxir.fusion"></a>
 
@@ -1349,6 +1388,12 @@ A ring lists its vertices in order; the last connects back to the first, and rep
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.georing.points"></a>[`points`](#field-luxir.georing.points) | 1 | [`GeoLatLon`](#message-luxir.geolatlon) | repeated |  |
+
+<a id="message-luxir.getfollowersubscriptionrequest"></a>
+
+### luxir.GetFollowerSubscriptionRequest
+
+[Source](../../protos/luxir_types.proto)
 
 <a id="message-luxir.groupcomponent"></a>
 
@@ -1593,11 +1638,23 @@ Weighted linear fusion of normalized scores: fused\_score(d) = sum over sources 
 |---|---|---|---|---|
 | <a id="field-luxir.linearfusion.normalization"></a>[`normalization`](#field-luxir.linearfusion.normalization) | 1 | [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization) | singular | unset selects MIN\_MAX |
 
+<a id="message-luxir.listcollectionsrequest"></a>
+
+### luxir.ListCollectionsRequest
+
+Lists one tenant's collections: gRPC Admin/ListCollections, or HTTP GET or POST /collections/\_list (also GET /collections) for the default tenant and /tenants/{tenant}/collections/\_list.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.listcollectionsrequest.tenant"></a>[`tenant`](#field-luxir.listcollectionsrequest.tenant) | 1 | `string` | singular | empty is the default tenant |
+
 <a id="message-luxir.listcollectionsresponse"></a>
 
 ### luxir.ListCollectionsResponse
 
-Names of every collection of one tenant, sorted. HTTP-only: GET or POST /collections/\_list (also GET /collections) for the caller's tenant, or /tenants/{tenant}/collections/\_list.
+Names of every collection of one tenant, sorted.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1605,11 +1662,19 @@ Names of every collection of one tenant, sorted. HTTP-only: GET or POST /collect
 |---|---|---|---|---|
 | <a id="field-luxir.listcollectionsresponse.collections"></a>[`collections`](#field-luxir.listcollectionsresponse.collections) | 1 | `string` | repeated |  |
 
+<a id="message-luxir.listtenantsrequest"></a>
+
+### luxir.ListTenantsRequest
+
+Lists tenants: gRPC Admin/ListTenants, or HTTP GET /tenants.
+
+[Source](../../protos/luxir_types.proto)
+
 <a id="message-luxir.listtenantsresponse"></a>
 
 ### luxir.ListTenantsResponse
 
-Tenants that own at least one collection, sorted. HTTP-only: GET /tenants.
+Tenants that own at least one collection, sorted.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -2120,6 +2185,7 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.replicationcatalogentry.tenant"></a>[`tenant`](#field-luxir.replicationcatalogentry.tenant) | 3 | `string` | singular |  |
 | <a id="field-luxir.replicationcatalogentry.collection"></a>[`collection`](#field-luxir.replicationcatalogentry.collection) | 4 | `string` | singular |  |
 | <a id="field-luxir.replicationcatalogentry.manifest_xxh3"></a>[`manifest_xxh3`](#field-luxir.replicationcatalogentry.manifest_xxh3) | 5 | `string` | singular | xxh3-64 of the exact manifest bytes of \`commit\`, as 16 lowercase hex digits (exact in every JSON client): a manifest of \`commit\` from any source must hash to it. |
+| <a id="field-luxir.replicationcatalogentry.read_only"></a>[`read_only`](#field-luxir.replicationcatalogentry.read_only) | 6 | `bool` | singular | The collection is read-only on the source; a follower records it, so a promoted follower keeps it read-only. |
 
 <a id="message-luxir.replicationcollectionstatus"></a>
 
@@ -2166,6 +2232,7 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.replicationstatus.last_contact"></a>[`last_contact`](#field-luxir.replicationstatus.last_contact) | 4 | `uint64` | singular | Unix milliseconds |
 | <a id="field-luxir.replicationstatus.collections"></a>[`collections`](#field-luxir.replicationstatus.collections) | 5 | [`ReplicationCollectionStatus`](#message-luxir.replicationcollectionstatus) | repeated |  |
 | <a id="field-luxir.replicationstatus.followers"></a>[`followers`](#field-luxir.replicationstatus.followers) | 6 | [`FollowerStatus`](#message-luxir.followerstatus) | repeated |  |
+| <a id="field-luxir.replicationstatus.subscription"></a>[`subscription`](#field-luxir.replicationstatus.subscription) | 7 | [`FollowerSubscription`](#message-luxir.followersubscription) | singular | set on a follower |
 
 <a id="message-luxir.replicationtenant"></a>
 
@@ -2237,7 +2304,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.schemarequest.collection"></a>[`collection`](#field-luxir.schemarequest.collection) | 1 | `string` | singular | empty selects the default collection, "main" |
-| <a id="field-luxir.schemarequest.tenant"></a>[`tenant`](#field-luxir.schemarequest.tenant) | 4 | `string` | singular | Administration only: the owning tenant. Empty is the caller's tenant. |
+| <a id="field-luxir.schemarequest.tenant"></a>[`tenant`](#field-luxir.schemarequest.tenant) | 4 | `string` | singular | The owning tenant. Empty is the default tenant. |
 | <a id="field-luxir.schemarequest.mode"></a>[`mode`](#field-luxir.schemarequest.mode) | 2 | [`SchemaRequest.Mode`](#enum-luxir.schemarequest.mode) | singular |  |
 | <a id="field-luxir.schemarequest.schema"></a>[`schema`](#field-luxir.schemarequest.schema) | 3 | [`SchemaDef`](#message-luxir.schemadef) | singular |  |
 | <a id="field-luxir.schemarequest.wait_for_replicas"></a>[`wait_for_replicas`](#field-luxir.schemarequest.wait_for_replicas) | 5 | [`ReplicaRequirement`](#message-luxir.replicarequirement) | singular | Updates only: as CommitParams.wait\_for\_replicas. |
@@ -2337,6 +2404,7 @@ Top-level search request that can contain multiple search operations.
 | <a id="field-luxir.searchrequest.min_commit_timeout_ms"></a>[`min_commit_timeout_ms`](#field-luxir.searchrequest.min_commit_timeout_ms) | 10 | `uint64` | optional | Search floor deadline. Absent defaults to 30000; zero checks immediately. |
 | <a id="field-luxir.searchrequest.flags"></a>[`flags`](#field-luxir.searchrequest.flags) | 11 | `uint64` | singular | Packed request options. Effective = (inherited &amp; ~flags\_set) \| (flags &amp; flags\_set); the request inherits 0. JSON uses lowercase names, e.g. "flags": \["date\_ms"\], rather than numeric flags/flags\_set. Date modes control numeric date literal units: ms or ns overrides the field unit; native and iso use the field unit. Value arithmetic is unchanged. |
 | <a id="field-luxir.searchrequest.flags_set"></a>[`flags_set`](#field-luxir.searchrequest.flags_set) | 12 | `uint64` | singular | Override mask. Set both date-mode bits (3), or neither. Request-only int64\_str (bit 2) quotes JSON int64/uint64 values outside the safe integer range, +/- (2^53 - 1). Unknown bits are rejected in either word. Binary gRPC responses retain their integer types. |
+| <a id="field-luxir.searchrequest.tenant"></a>[`tenant`](#field-luxir.searchrequest.tenant) | 13 | `string` | singular | The tenant that owns the collection. Empty is the default tenant, t0. An HTTP body may repeat the tenant of its /tenants/{tenant} route but not name another. |
 
 <a id="message-luxir.searchresponse"></a>
 
@@ -2424,6 +2492,44 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.control_completed"></a>[`control_completed`](#field-luxir.servicestats.control_completed) | 63 | `uint64` | singular |  |
 | <a id="field-luxir.servicestats.search_fanout"></a>[`search_fanout`](#field-luxir.servicestats.search_fanout) | 26 | [`SearchFanoutStats`](#message-luxir.searchfanoutstats) | singular |  |
 
+<a id="message-luxir.setfollowersubscriptionrequest"></a>
+
+### luxir.SetFollowerSubscriptionRequest
+
+Changes a running follower's subscription without a restart: HTTP POST /\_replication/subscription, or gRPC Admin/SetFollowerSubscription. The follower stops its transfers, applies the change, records it in its data directory, and resumes; the response is the new FollowerSubscription.<br><br>A collection left out becomes an orphan: kept as it is, no longer updated, deletable with \_delete. A collection brought in is copied. A new source is treated like a restart pointed elsewhere: local copies whose data the new source also serves are reused file by file, and the others become orphans.<br><br>A restart keeps a runtime change unless the configured replication.source, replication.tenants or replication.collections changed since the last start; then the configuration wins. Writer and read-only nodes refuse the request with not\_follower.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.setfollowersubscriptionrequest.source"></a>[`source`](#field-luxir.setfollowersubscriptionrequest.source) | 1 | `string` | singular | empty keeps the current source |
+| <a id="field-luxir.setfollowersubscriptionrequest.filter"></a>[`filter`](#field-luxir.setfollowersubscriptionrequest.filter) | 2 | [`FollowerFilter`](#message-luxir.followerfilter) | singular | Replaces both lists when present; absent keeps them. |
+
+<a id="message-luxir.setreadonlyrequest"></a>
+
+### luxir.SetReadOnlyRequest
+
+Makes a collection read-only, or writable again, on the node that writes it. Read-only commits every update admitted before the request, then refuses updates and schema changes with read\_only and serves the committed snapshot; its index writer and indexing memory are released. Search, stats, rename, swap and delete still work. The flag is kept in the tenant catalog, survives restarts, follows the data through renames and swaps, and is copied to followers. Read-only nodes and followers refuse the request.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.setreadonlyrequest.name"></a>[`name`](#field-luxir.setreadonlyrequest.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.setreadonlyrequest.read_only"></a>[`read_only`](#field-luxir.setreadonlyrequest.read_only) | 2 | `bool` | singular |  |
+| <a id="field-luxir.setreadonlyrequest.tenant"></a>[`tenant`](#field-luxir.setreadonlyrequest.tenant) | 3 | `string` | singular | empty is the default tenant |
+
+<a id="message-luxir.setreadonlyresponse"></a>
+
+### luxir.SetReadOnlyResponse
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.setreadonlyresponse.name"></a>[`name`](#field-luxir.setreadonlyresponse.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.setreadonlyresponse.read_only"></a>[`read_only`](#field-luxir.setreadonlyresponse.read_only) | 2 | `bool` | singular |  |
+
 <a id="message-luxir.shardcachecontrol"></a>
 
 ### luxir.ShardCacheControl
@@ -2491,7 +2597,7 @@ Which statistics to gather. The node scope (no collection, no tenant) always ret
 |---|---|---|---|---|
 | <a id="field-luxir.statsrequest.collection"></a>[`collection`](#field-luxir.statsrequest.collection) | 1 | `string` | singular | Empty selects every collection of \`tenant\`, or of every tenant when \`tenant\` is also empty (administration). |
 | <a id="field-luxir.statsrequest.segments"></a>[`segments`](#field-luxir.statsrequest.segments) | 2 | `bool` | singular | Per-segment records. Implies \`files\`, and \`collections\` at node scope. |
-| <a id="field-luxir.statsrequest.tenant"></a>[`tenant`](#field-luxir.statsrequest.tenant) | 3 | `string` | singular | Administration only. With a collection, empty is the caller's tenant. |
+| <a id="field-luxir.statsrequest.tenant"></a>[`tenant`](#field-luxir.statsrequest.tenant) | 3 | `string` | singular | With a collection, empty is the default tenant. |
 | <a id="field-luxir.statsrequest.collections"></a>[`collections`](#field-luxir.statsrequest.collections) | 5 | `bool` | singular | Node scope: also walk every collection (totals, index state, query cache, snapshot pins, inverters). Takes each writer's index lock briefly; no file I/O. Implied by a tenant or collection scope. |
 | <a id="field-luxir.statsrequest.files"></a>[`files`](#field-luxir.statsrequest.files) | 6 | `bool` | singular | Also list index directories, filling the \`bytes\` totals, segment bytes and aux index bytes. Implies \`collections\` at node scope. |
 | <a id="field-luxir.statsrequest.system"></a>[`system`](#field-luxir.statsrequest.system) | 7 | `bool` | singular | Node scope only: this process, the data directory's filesystem and the process's cgroup v2, read from procfs and cgroupfs (Linux only). |
@@ -2714,6 +2820,7 @@ Index or delete documents, with an optional commit.
 | <a id="field-luxir.updaterequest.commit"></a>[`commit`](#field-luxir.updaterequest.commit) | 10 | [`CommitParams`](#message-luxir.commitparams) | singular | Commit parameters. If present, this request will commit; if absent, no commit is performed. |
 | <a id="field-luxir.updaterequest.field_map"></a>[`field_map`](#field-luxir.updaterequest.field_map) | 11 | map&lt;`string`, `string`&gt; | map | Renames input document keys onto schema fields for this request's docs, applied before schema lookup: a doc key found in the map indexes under the mapped name. An entry mapping to "" drops that input key. After mapping, a name appearing more than once in a doc keeps the last occurrence (the same last-wins rule as duplicate keys). Keys not in the map index under their own name unless drop\_unmapped is set. This reshapes a foreign document stream per request, without editing the input or the schema. |
 | <a id="field-luxir.updaterequest.drop_unmapped"></a>[`drop_unmapped`](#field-luxir.updaterequest.drop_unmapped) | 12 | `bool` | singular | If true, doc keys not present in field\_map are dropped instead of indexed. Requires a non-empty field\_map (note "id" is dropped too unless mapped). |
+| <a id="field-luxir.updaterequest.tenant"></a>[`tenant`](#field-luxir.updaterequest.tenant) | 13 | `string` | singular | The tenant that owns the collection; as SearchRequest.tenant. An HTTP NDJSON stream stays in the tenant of its route. |
 
 <a id="message-luxir.updateresponse"></a>
 
@@ -3290,7 +3397,7 @@ Vector similarity metric. NONE = storage-only, not kNN-searchable; L2 / IP / COS
 
 ### google.protobuf.NullValue
 
-\`NullValue\` is a singleton enumeration to represent the null value for the \`Value\` type union.<br><br>The JSON representation for \`NullValue\` is JSON \`null\`.
+Represents a JSON \`null\`.<br><br>\`NullValue\` is a sentinel, using an enum with only one value to represent the null value for the \`Value\` type union.<br><br>A field of type \`NullValue\` with any value other than \`0\` is considered invalid. Most ProtoJSON serializers will emit a \`Value\` with a \`null\_value\` set as a JSON \`null\` regardless of the integer value, and so will round trip to a \`0\` value.
 
 | Value | Number | Description |
 |---|---|---|

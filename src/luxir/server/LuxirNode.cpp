@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/util/ApiError.h"
 #include "luxir/server/ReplicationSource.h"
 #include "CommitWaits.h"
 #include "LuxirNode.h"
@@ -242,6 +243,15 @@ void LuxirNode::swapCollections(const CollectionId& a, const CollectionId& b) {
 void LuxirNode::deleteCollection(const CollectionId& id) {
   if (follower) follower->deleteOrphan(id);
   else collections_->remove(id);
+}
+
+ReplicationFollower& LuxirNode::requireFollower() {
+  if (!follower) throw ApiError(ErrorKind::FAILED_PRECONDITION, "not_follower", "this node is not a follower (see --replicate-from)");
+  return *follower;
+}
+
+void LuxirNode::setCollectionReadOnly(const CollectionId& id, bool readOnly) {
+  collections_->setReadOnly(id, readOnly);
 }
 
 void LuxirNode::detachCollection(const CollectionId& id, std::string_view target) {

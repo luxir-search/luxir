@@ -166,6 +166,19 @@ bool TenantCatalog::assign(std::string_view id, std::string_view expectedNode, s
   return assigned;
 }
 
+bool TenantCatalog::setReadOnly(std::string_view id, bool readOnly) {
+  bool changed = false;
+  mutate([&](State& state) {
+    auto entry = std::ranges::find(state.entries, id, &Entry::id);
+    if (entry == state.entries.end() || entry->state != "active") throw CollectionNotFoundError("incarnation " + std::string(id) + " is not active");
+    requireOwner(*entry);
+    changed = entry->read_only != readOnly;
+    entry->read_only = readOnly;
+    return changed;
+  });
+  return changed;
+}
+
 std::optional<TenantCatalog::Entry> TenantCatalog::find(std::string_view name) {
   auto state = read();
   for (const auto& entry : state.entries) if (entry.name == name && entry.state == "active") return entry;
@@ -357,7 +370,12 @@ void TenantCatalog::activate(std::string_view name, std::string_view id, std::st
       requireOwner(*old);
     }
     if (selected->state == "active") return false;
-    for (auto& entry : state.entries) if (entry.name == name && entry.state == "active") { requireOwner(entry); retiring(entry); }
+    // A replacement copy of the same data (recovery, promotion) keeps its flag.
+    for (auto& entry : state.entries) if (entry.name == name && entry.state == "active") {
+      requireOwner(entry);
+      selected->read_only = selected->read_only || entry.read_only;
+      retiring(entry);
+    }
     selected->state = "active";
     selected->retired_ms.reset();
     return true;
@@ -400,7 +418,8 @@ uint64_t TenantCatalog::swap(std::string_view a, std::string_view b) {
 }
 
 uint64_t TenantCatalog::apply(const std::map<std::string, std::string>& names,
-                              const std::map<std::string, std::string>& desired) {
+                              const std::map<std::string, std::string>& desired,
+                              const std::set<std::string>& readOnly) {
   auto lock = transition();
   std::map<std::string, std::string> byId;
   for (const auto& [name, id] : names) {
@@ -429,8 +448,9 @@ uint64_t TenantCatalog::apply(const std::map<std::string, std::string>& names,
     for (auto& entry : state.entries) {
       if (byId.contains(entry.id) || pending.contains(entry.id) || entry.state == "active") requireOwner(entry);
       if (auto it = byId.find(entry.id); it != byId.end()) {
-        changed |= entry.name != it->second || entry.state != "active";
-        entry.name = it->second; entry.state = "active";
+        bool frozen = readOnly.contains(entry.id);
+        changed |= entry.name != it->second || entry.state != "active" || entry.read_only != frozen;
+        entry.name = it->second; entry.state = "active"; entry.read_only = frozen;
         entry.retired_ms.reset();
       } else if (auto it = pending.find(entry.id); it != pending.end()) {
         changed |= entry.name != it->second || entry.state != "reserved";

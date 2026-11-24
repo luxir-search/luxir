@@ -4,10 +4,13 @@ The HTTP surface is plain JSON for bounded messages and NDJSON for streams.
 Collection names live in the path, and the request body uses the same field
 names as the protobuf messages.
 
-Collections belong to a tenant. Search and update routes act in the caller's
-own tenant, which is the default tenant `t0` until requests carry
-credentials. Administration and snapshot routes may name another tenant under
-`/tenants/{tenant}`.
+Collections belong to a tenant. Every collection route, including search,
+update and plugin routes, takes an optional `/tenants/{tenant}` prefix; without
+it the route acts in the default tenant `t0`. A request body may carry a
+`tenant` field equal to its route's tenant, but a body naming a different
+tenant is rejected with 400. An NDJSON update stream stays in its route's
+tenant: an `_update_` header may repeat that tenant but not name another.
+Tenant names follow the collection name rules.
 
 ## Endpoints
 
@@ -25,18 +28,21 @@ credentials. Administration and snapshot routes may name another tenant under
 | `POST /collections/_rename` | Rename one collection; body `{"from":"old","to":"new"}`. The destination must be free. |
 | `POST /collections/_swap` | Exchange two collection names in one catalog update; body `{"a":"live","b":"staging"}`. |
 | `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
+| `POST /collections/_read_only` | Make a collection read-only or writable again; body `{"name":"...","read_only":true}`. See [Read-only collections](operations.md#read-only-collections). |
 | `GET /_stats` | Node statistics: service activity and memory by default; `collections`, `files`, `segments`, `system` and `host` opt in to costlier sections; `format=prometheus` renders Prometheus text. See [Stats and monitoring](operations.md#stats-and-monitoring). |
 | `GET /metrics` | The node's Prometheus scrape: `_stats` rendered as Prometheus text, with `collections` and `system` on by default. |
 | `GET /collections/{collection}/_stats` | Statistics for one collection, in JSON or Prometheus text. |
 | `GET /collections/{collection}/_snapshot` | Pin the current snapshot for copying; see [Replication](replication.md). |
 | `GET /collections/{collection}/_snapshot/files/{name}` | One file of a pinned snapshot. |
 | `GET /tenants` | Tenants that own a collection. |
-| `/tenants/{tenant}/collections/...` | The administration and snapshot routes above (`_list`, `_create`, `_delete`, `_rename`, `_swap`, `_schema`, `_stats`, `_snapshot`) for a named tenant; `GET /tenants/{tenant}/_stats` covers that tenant. |
+| `/tenants/{tenant}/collections/...` | Every collection route above (`_search`, `_update`, `_list`, `_create`, `_delete`, `_rename`, `_swap`, `_read_only`, `_schema`, `_stats`, `_snapshot`) and every plugin route, acting in a named tenant; `GET /tenants/{tenant}/_stats` covers that tenant. |
 | `GET /_replication/watch`, `POST /_replication/installed`, `GET /_replication/status` | Replication discovery, acknowledgments and status; see [Replication](replication.md). |
+| `GET` or `POST /_replication/subscription` | Read or change a follower's source and subscription at runtime; see [Replication](replication.md#change-the-subscription-at-runtime). |
 
 Collection names occupy one URL path component. Names beginning with `_` are
 reserved. Search and schema reads never create a missing collection; an update
-does by default unless `--no-indexing.auto-create-collection` is set.
+does by default unless `--no-indexing.auto-create-collection` is set. In a
+named tenant, that first update also creates the tenant.
 
 `_create` installs the optional `schema` (same shape as a `_schema` set)
 before the collection becomes visible and returns `{name, commit}`. Schema
@@ -301,6 +307,7 @@ warnings declared before a failure ride along with the error.
 
 HTTP/1.1 keep-alive and request streaming are supported. A configured nonzero
 HTTP port currently binds all interfaces, and the server has no TLS,
-authentication, authorization, CORS policy, or tenant permission layer. Do not
+authentication, authorization, CORS policy, or tenant permission layer: any
+client can name any tenant. Do not
 expose it directly to an untrusted network. See
 [Operating Luxir](operations.md#network-ports-and-security).

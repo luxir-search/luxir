@@ -4,6 +4,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 #include "luxir/store/Directory.h"
 #include "luxir/store/CollectionId.h"
 
@@ -25,7 +26,17 @@ struct ReplicationState {
     std::map<std::string, std::string> names;
     std::map<std::string, Collection> incarnations;
   };
+  // The subscription in force, and the configuration it last came from. A
+  // restart whose configuration differs from `configured` adopts it; otherwise
+  // a runtime change stands.
+  struct Subscription {
+    std::string source;
+    std::vector<std::string> tenants, collections;
+    bool operator==(const Subscription&) const = default;
+  };
   std::string source;
+  std::vector<std::string> subscribed_tenants, subscribed_collections;
+  Subscription configured;
   std::map<std::string, Tenant> tenants;
 
   Collection& incarnation(std::string_view tenant, std::string_view id) {

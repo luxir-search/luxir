@@ -71,6 +71,7 @@ public:
   explicit HttpReq(int port) : port_(port) {}
 
   HttpReq& collection(std::string_view n) { collection_ = n; return *this; }
+  HttpReq& tenant(std::string_view t) { tenant_ = t; return *this; }
   HttpReq& matchQuery(std::string_view f, std::string_view v) { field_ = f; value_ = v; return *this; }
   HttpReq& limit(int64_t n) { limit_ = n; return *this; }
   HttpReq& offset(int64_t n) { offset_ = n; return *this; }
@@ -100,7 +101,8 @@ public:
 
   HttpReq& execute() {
     auto res = httpRequest(port_, http::verb::post,
-                           "/collections/" + collection_ + "/_search", buildJson());
+                           (tenant_.empty() ? "" : "/tenants/" + tenant_) + "/collections/" + collection_ + "/_search",
+                           buildJson());
     status_ = res.result_int();
     body_ = res.body();
     return *this;
@@ -169,6 +171,7 @@ public:
 private:
   int port_;
   std::string collection_ = "main";
+  std::string tenant_;
   std::string field_, value_;
   std::optional<int64_t> limit_, offset_, batch_;
   std::vector<std::string> fields_;

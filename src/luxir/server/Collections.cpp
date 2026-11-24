@@ -393,6 +393,7 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   if (entry->node != config.node.id) throw CollectionServedByError(entry->node);
   bool creating = entry->state == "reserved";
   if (creating && !reserved) throw CollectionUnavailableError("collection is being created");
+  if (!creating && entry->read_only) return openReader(name, Role::WRITER, *entry);
   auto selected = entry->id;
   // A healthy reopen shares one root read and one listing. Copying a fallback
   // snapshot requires additional listings of the source and destination.
@@ -431,18 +432,24 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
 // Read-only and follower collections serve their selected local snapshot.
 std::shared_ptr<Collection> Collections::openCollection(const CollectionId& name, Role role,
                                                         const std::optional<TenantCatalog::Entry>& selected) {
-  std::shared_ptr<Collection> col;
   if (role == Role::WRITER) {
     if (selected && selected->state != "active") throw CollectionUnavailableError("collection is being created");
-    col = initWriter(name, {}, true, selected);
-  } else {
-    if (!selected || selected->state != "active") throw ReadOnlyError("Collection has no catalog selection");
-    col = makeCollection(name, catalog(name.tenant).directory(selected->id));
-    auto markers = arena.execute([&] { return col->shard->snapshots->openLocalSnapshot(verifyOnOpen); });
-    if (col->shard->snapshots->snapshot()->id.incarnation != selected->id) throw std::runtime_error("Snapshot incarnation does not match catalog selection");
-    observe(name, *col);
-    if (role == Role::FOLLOWER) clearMarkers(name, *col->shard->dir, markers);
+    return initWriter(name, {}, true, selected);
   }
+  if (!selected || selected->state != "active") throw ReadOnlyError("Collection has no catalog selection");
+  return openReader(name, role, *selected);
+}
+
+std::shared_ptr<Collection> Collections::openReader(const CollectionId& name, Role role, const TenantCatalog::Entry& selected) {
+  auto directory = catalog(name.tenant).directory(selected.id);
+  // A read-only node's factory already refuses writes; a writer node's does not.
+  if (role == Role::WRITER) directory = std::make_shared<ReadOnlyDirectory>(std::move(directory), selected.id);
+  auto col = makeCollection(name, std::move(directory));
+  col->readOnly = selected.read_only;
+  auto markers = arena.execute([&] { return col->shard->snapshots->openLocalSnapshot(verifyOnOpen); });
+  if (col->shard->snapshots->snapshot()->id.incarnation != selected.id) throw std::runtime_error("Snapshot incarnation does not match catalog selection");
+  observe(name, *col);
+  if (role == Role::FOLLOWER) clearMarkers(name, *col->shard->dir, markers);
   return col;
 }
 
@@ -687,7 +694,8 @@ void Collections::detach(const CollectionId& key, std::string_view target) {
   if (entry->node != config.node.id) throw CollectionServedByError(entry->node);
   auto collection = map.get(key);
   auto shard = collection ? collection->getShard() : nullptr;
-  if (!shard || !shard->iw) throw CollectionNotFoundError("collection '" + key.label() + "' is not loaded here");
+  if (!shard) throw CollectionNotFoundError("collection '" + key.label() + "' is not loaded here");
+  if (!shard->iw) throw ReadOnlyError("collection '" + key.label() + "' is read-only; make it writable before detaching");
   auto snapshot = shard->snapshots->snapshot();
   if (!snapshot || snapshot->id.incarnation != entry->id) throw CollectionUnavailableError("loaded incarnation is no longer selected");
   std::exception_ptr commitFailure;
@@ -732,6 +740,60 @@ std::shared_ptr<Collection> Collections::attach(const CollectionId& key, bool fo
   Opened row{key, nullptr, entry->id, {}};
   openOne(row, Role::WRITER, expected);
   return row.collection;
+}
+
+void Collections::setReadOnly(const CollectionId& key, bool readOnly) {
+  if (config.read_only || !config.replication.source.empty()) {
+    throw ReadOnlyError("cannot change a collection's read-only state on a read-only node or follower");
+  }
+  validate(key);
+  Transition transition(*this, key);
+  {
+    std::lock_guard lock(slotsMutex);
+    if (!slots[key].leased.empty()) throw CollectionUnavailableError("collection '" + key.label() + "' has a staged replacement");
+  }
+  auto& storage = catalog(key.tenant);
+  auto entry = storage.find(key.name);
+  if (!entry || entry->state != "active") throw CollectionNotFoundError("collection '" + key.label() + "' does not exist");
+  if (entry->node != config.node.id) throw CollectionServedByError(entry->node);
+  auto expected = map.get(key);
+  auto shard = expected ? expected->getShard() : nullptr;
+  if (!shard) throw CollectionUnavailableError("collection '" + key.label() + "' is not loaded here");
+  auto snapshot = shard->snapshots->snapshot();
+  if (!snapshot || snapshot->id.incarnation != entry->id) throw CollectionUnavailableError("loaded incarnation is no longer selected");
+  if (entry->read_only == readOnly && (shard->iw == nullptr) == readOnly) return;
+
+  // The flag is recorded first: a crash after it reopens the collection as asked.
+  storage.setReadOnly(entry->id, readOnly);
+  entry->read_only = readOnly;
+  std::exception_ptr sealFailure;
+  if (readOnly && shard->iw) {
+    try { shard->iw->seal(); }
+    catch (...) { sealFailure = std::current_exception(); }
+  }
+  std::shared_ptr<Collection> replacement;
+  try {
+    replacement = readOnly ? openReader(key, Role::WRITER, *entry) : initWriter(key, {}, false, entry);
+  } catch (const std::exception& e) {
+    if (readOnly) {
+      expected->fail("cannot reopen read-only: " + std::string(e.what()));
+    } else {
+      // The read-only collection keeps serving; put the flag back to match it.
+      try { storage.setReadOnly(entry->id, true); }
+      catch (const std::exception& restore) { LOG_ERROR("Cannot restore read-only flag of '{}': {}", key.label(), restore.what()); }
+    }
+    throw;
+  }
+  {
+    std::lock_guard lock(cachePolicyMutex);
+    applyCachePolicy(key, replacement);
+    if (!map.replace(key, expected, replacement)) throw std::runtime_error("collection '" + key.label() + "' changed while changing read-only state");
+    listCollection(key, replacement);
+  }
+  events.registered(key, replacement, revision(key.tenant));
+  shard->snapshots->detach();
+  LOG_INFO("Collection '{}' is now {}", key.label(), readOnly ? "read-only" : "writable");
+  if (sealFailure) std::rethrow_exception(sealFailure);
 }
 
 uint64_t Collections::revision(std::string_view tenant) {
@@ -829,7 +891,8 @@ void Collections::changeNames(const CollectionId& from, const CollectionId& to, 
 
 void Collections::applyMapping(std::string_view tenant, const std::map<std::string, std::string>& names,
                                const std::map<std::string, std::string>& desired,
-                               std::vector<Prepared> prepared, std::span<const std::string> retained) {
+                               std::vector<Prepared> prepared, std::span<const std::string> retained,
+                               const std::set<std::string>& readOnly) {
   auto lock = catalog(tenant).transition();
   std::set<CollectionId> keys;
   for (const auto& entry : entries(tenant)) keys.insert(entry.id);
@@ -863,7 +926,7 @@ void Collections::applyMapping(std::string_view tenant, const std::map<std::stri
       selected.emplace(name, id);
     }
   }
-  publishMapping(tenant, next, [&] { return catalog(tenant).apply(selected, desired); });
+  publishMapping(tenant, next, [&] { return catalog(tenant).apply(selected, desired, readOnly); });
   for (auto& item : prepared) {
     item.candidate.lease.reset();
     try { item.candidate.collection_->getShard()->getSnapshots().sweepOrphans(); }

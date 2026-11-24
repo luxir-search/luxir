@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <oneapi/tbb/info.h>
+#include "luxir/server/ReplicationSubscription.h"
 
 namespace CLI { class App; }
 
@@ -218,13 +219,16 @@ struct ReplicationConfig {
   // retry of a failed collection sync (doubling per consecutive failure, to 60 s).
   int64_t retry_ms = 1000;
   std::string source;
-  std::string tenants; // comma-separated; empty subscribes to every tenant
+  // The follower's initial subscription; changeable at runtime (see
+  // ReplicationFollower::resubscribe). Both empty follow everything.
+  std::string tenants; // comma-separated tenants, every collection of each
+  std::string collections; // comma-separated tenant/name (a bare name is in t0)
   // Comma-separated http:// nodes that serve verified file copies, tried in
   // order before the source; they never decide which commit is current.
   std::string peers;
   uint64_t max_acknowledgments = 262144; // node-wide follower/collection rows
   int downloads = 2; // node-wide concurrent collection downloads
-  std::vector<std::string> tenantFilter() const;
+  ReplicationSubscription subscription() const;
   std::vector<std::string> peerList() const;
   void validate() const;
 };

@@ -79,6 +79,11 @@ message SearchRequest {
   // range, +/- (2^53 - 1). Unknown bits are rejected in either word.
   // Binary gRPC responses retain their integer types.
   uint64 flags_set = 12;
+
+  // The tenant that owns the collection. Empty is the default tenant, t0.
+  // An HTTP body may repeat the tenant of its /tenants/{tenant} route but not
+  // name another.
+  string tenant = 13;
 }
 
 enum ResponseFormat {
@@ -1345,6 +1350,10 @@ message UpdateRequest {
   // If true, doc keys not present in field_map are dropped instead of indexed.
   // Requires a non-empty field_map (note "id" is dropped too unless mapped).
   bool drop_unmapped = 12;
+
+  // The tenant that owns the collection; as SearchRequest.tenant. An HTTP
+  // NDJSON stream stays in the tenant of its route.
+  string tenant = 13;
 }
 
 // The response to an update request.  In streaming mode the server sends exactly one
@@ -1577,8 +1586,7 @@ message ColDouble {
 message CreateCollectionRequest {
   string name = 1;
   SchemaDef schema = 2;
-  // Administration only: the owning tenant. Empty is the caller's tenant
-  // (the default tenant until credentials carry one).
+  // The owning tenant. Empty is the default tenant, t0.
   string tenant = 3;
   // All counts live followers subscribed to the tenant that serve any
   // collection, since none serves the new one yet.
@@ -1614,14 +1622,36 @@ message SwapCollectionsRequest {
 }
 message SwapCollectionsResponse { string a = 1; string b = 2; }
 
-// Names of every collection of one tenant, sorted. HTTP-only: GET or POST
-// /collections/_list (also GET /collections) for the caller's tenant, or
+// Makes a collection read-only, or writable again, on the node that writes it.
+// Read-only commits every update admitted before the request, then refuses
+// updates and schema changes with read_only and serves the committed snapshot;
+// its index writer and indexing memory are released. Search, stats, rename,
+// swap and delete still work. The flag is kept in the tenant catalog, survives
+// restarts, follows the data through renames and swaps, and is copied to
+// followers. Read-only nodes and followers refuse the request.
+message SetReadOnlyRequest {
+  string name = 1;
+  bool read_only = 2;
+  string tenant = 3; // empty is the default tenant
+}
+message SetReadOnlyResponse { string name = 1; bool read_only = 2; }
+
+// Lists one tenant's collections: gRPC Admin/ListCollections, or HTTP GET or
+// POST /collections/_list (also GET /collections) for the default tenant and
 // /tenants/{tenant}/collections/_list.
+message ListCollectionsRequest {
+  string tenant = 1; // empty is the default tenant
+}
+
+// Names of every collection of one tenant, sorted.
 message ListCollectionsResponse {
   repeated string collections = 1;
 }
 
-// Tenants that own at least one collection, sorted. HTTP-only: GET /tenants.
+// Lists tenants: gRPC Admin/ListTenants, or HTTP GET /tenants.
+message ListTenantsRequest {}
+
+// Tenants that own at least one collection, sorted.
 message ListTenantsResponse {
   repeated string tenants = 1;
 }
@@ -1639,7 +1669,7 @@ message StatsRequest {
   string collection = 1;
   // Per-segment records. Implies `files`, and `collections` at node scope.
   bool segments = 2;
-  // Administration only. With a collection, empty is the caller's tenant.
+  // With a collection, empty is the default tenant.
   string tenant = 3;
   // Node scope: also walk every collection (totals, index state, query cache,
   // snapshot pins, inverters). Takes each writer's index lock briefly; no
@@ -2082,6 +2112,9 @@ message ReplicationCatalogEntry {
   // digits (exact in every JSON client): a manifest of `commit` from any
   // source must hash to it.
   string manifest_xxh3 = 5;
+  // The collection is read-only on the source; a follower records it, so a
+  // promoted follower keeps it read-only.
+  bool read_only = 6;
 }
 message ReplicationInstalled {
   string follower = 1;
@@ -2116,6 +2149,43 @@ message ReplicationStatus {
   uint64 last_contact = 4; // Unix milliseconds
   repeated ReplicationCollectionStatus collections = 5;
   repeated FollowerStatus followers = 6;
+  FollowerSubscription subscription = 7; // set on a follower
+}
+
+// What a follower copies, and from where. HTTP GET /_replication/subscription,
+// or gRPC Admin/GetFollowerSubscription.
+message FollowerSubscription {
+  string source = 1; // http://host:port
+  // Every collection of each of these tenants, sorted.
+  repeated string tenants = 2;
+  // And each of these collections, as tenant/name, sorted. Both lists empty
+  // copy every collection of every tenant.
+  repeated string collections = 3;
+}
+message GetFollowerSubscriptionRequest {}
+
+// Changes a running follower's subscription without a restart: HTTP POST
+// /_replication/subscription, or gRPC Admin/SetFollowerSubscription. The
+// follower stops its transfers, applies the change, records it in its data
+// directory, and resumes; the response is the new FollowerSubscription.
+//
+// A collection left out becomes an orphan: kept as it is, no longer updated,
+// deletable with _delete. A collection brought in is copied. A new source is
+// treated like a restart pointed elsewhere: local copies whose data the new
+// source also serves are reused file by file, and the others become orphans.
+//
+// A restart keeps a runtime change unless the configured replication.source,
+// replication.tenants or replication.collections changed since the last
+// start; then the configuration wins. Writer and read-only nodes refuse the
+// request with not_follower.
+message SetFollowerSubscriptionRequest {
+  string source = 1; // empty keeps the current source
+  // Replaces both lists when present; absent keeps them.
+  FollowerFilter filter = 2;
+}
+message FollowerFilter {
+  repeated string tenants = 1;
+  repeated string collections = 2; // tenant/name; a bare name is in t0
 }
 
 message FollowerStatus {
@@ -2168,6 +2238,9 @@ message CollectionStats {
   uint64 storage_ram_bytes = 6;
   // Set for a serving collection.
   CollectionActivityStats activity = 8;
+  // The collection serves without a writer: made read-only, or on a read-only
+  // node or follower.
+  bool read_only = 9;
 }
 
 // Engine work that reached this collection since it was opened. The node's
@@ -2362,7 +2435,7 @@ message CacheControlRequest {
   // Empty selects every collection of `tenant`, or of every tenant when
   // `tenant` is also empty (administration).
   string collection = 1;
-  // Administration only. With a collection, empty is the caller's tenant.
+  // With a collection, empty is the default tenant.
   string tenant = 7;
   bool flush = 2;
   bool reset_admission = 3;
@@ -2799,7 +2872,7 @@ message SchemaDef {
 
 message SchemaRequest {
   string collection = 1; // empty selects the default collection, "main"
-  // Administration only: the owning tenant. Empty is the caller's tenant.
+  // The owning tenant. Empty is the default tenant.
   string tenant = 4;
 
   enum Mode {

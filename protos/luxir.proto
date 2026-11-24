@@ -34,4 +34,9 @@ service Admin {
   rpc SwapCollections(SwapCollectionsRequest) returns (SwapCollectionsResponse) {}
   rpc Stats(StatsRequest) returns (StatsResponse) {}
   rpc CacheControl(CacheControlRequest) returns (CacheControlResponse) {}
+  rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse) {}
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse) {}
+  rpc SetReadOnly(SetReadOnlyRequest) returns (SetReadOnlyResponse) {}
+  rpc GetFollowerSubscription(GetFollowerSubscriptionRequest) returns (FollowerSubscription) {}
+  rpc SetFollowerSubscription(SetFollowerSubscriptionRequest) returns (FollowerSubscription) {}
 }
