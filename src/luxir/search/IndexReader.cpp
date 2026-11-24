@@ -256,7 +256,9 @@ std::shared_ptr<LiveDocs> LiveDocs::decode(std::shared_ptr<InputFile> file, uint
   constexpr auto headerSize = Postings::LUXIR_HEADER.size() + sizeof(uint64_t) + sizeof(int32_t) + sizeof(int32_t);
   if (size < headerSize) corruptSegment(segment, std::format("live docs file '{}': too small: {} bytes", name, size));
   auto hold = file->acquire({0, size});
-  return decode(std::move(file), std::move(hold), name, segment, maxDoc, numLive);
+  // `file` outlives the call, so the hold, released in it or kept by the
+  // bitmap, never outlives its file.
+  return decode(file, std::move(hold), name, segment, maxDoc, numLive);
 }
 
 std::shared_ptr<LiveDocs> LiveDocs::decode(std::shared_ptr<InputFile> file, HeldRange hold, std::string_view name,
@@ -307,7 +309,9 @@ std::shared_ptr<LiveDocs> LiveDocs::decode(std::shared_ptr<InputFile> file, Held
       words[doc >> 6] &= ~(1ULL << (doc & 63));
       prev = doc;
     }
-    return std::make_shared<LiveDocs>(std::move(words), maxDoc, numLive, liveDocsMemory.sparseRoots);
+    auto docs = std::make_shared<LiveDocs>(std::move(words), maxDoc, numLive, liveDocsMemory.sparseRoots);
+    hold = HeldRange();  // before `file`, which may be the last reference
+    return docs;
   }
 
   // The bitmap borrows the bytes from the hold.
