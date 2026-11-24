@@ -82,13 +82,21 @@ engine and the terminal candidate rescore. `f16` and `bf16` rows are scored in
 place by FAISS's `ScalarQuantizer` distance computers (`QT_fp16` and
 `QT_bf16` read the layouts written here and need no training); cosine takes
 the dot from an inner-product computer and `|x|^2` from an L2 computer against
-an all-zero query, a second pass over the row. `sq8` rows are decoded into a
-per-task buffer and scored with the float32 kernels, rather than scoring the
-codes against per-vector offset and scale terms, which cancel catastrophically
-for a query with a large dynamic range. Either way a score is the f32 score of
-the stored vector up to summation order. Cosine over a non-f32 row always
-divides by the stored vector's norm, since a quantized unit vector is not
-exactly unit length.
+an all-zero query, a second pass over the row. `sq8` rows are scored in
+registers (`query/Sq8Kernel.h`): each code is widened and decoded as
+`offset + scale * code` with one FMA and fed straight into the squared
+distance or dot product, and cosine sums `|x|^2` in the same pass. This scores
+the decoded vector rather than the codes against per-vector offset and scale
+terms (`scale * dot(q, codes) + offset * sum(q)`), which cancel
+catastrophically for a query with a large dynamic range. The kernels need AVX2
+and FMA, chosen at compile time from the CPU target like the RaBitQ kernels.
+Other targets (x86-64-v2, AArch64) decode the row into a per-task buffer and
+call the FAISS float32 kernels: those dispatch at run time, and on x86-64-v2
+a portable lane loop was about 2x slower than they are. Either way a score is
+the f32 score of the stored vector up to summation order, and a build scores a
+row identically in the flat scan and the rescore. Cosine over a non-f32 row
+always divides by the stored vector's norm, since a quantized unit vector is
+not exactly unit length.
 
 ## Overlay Lifecycle
 
