@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <span>
 #include <optional>
 
 #include "DocsReader.h"
@@ -28,6 +31,38 @@ public:
   }
 
   bool multiValued() const noexcept { return endValueRanks.has_value(); }
+
+  // Whether every document of the segment holds exactly one value.
+  bool oneValuePerDoc() const noexcept {
+    return !endValueRanks && docs.allRows();
+  }
+
+  // Values held by all documents of the segment.
+  int64_t numValues() const {
+    if (!endValueRanks) return docs.docsWithField();
+    return docs.docsWithField() == 0 ? 0 : endValueRanks.valueAt(docs.docsWithField() - 1);
+  }
+
+  // Visits the value rank range [first, end) of every document holding a
+  // value, in document order, decoding the end value ranks a frame at a time.
+  template <typename Visit>
+  void forEachDocValues(Visit&& visit) const {
+    int32_t numDocs = docs.docsWithField();
+    if (!endValueRanks) {
+      for (int32_t rank = 0; rank < numDocs; rank++) visit((int64_t)rank, (int64_t)rank + 1);
+      return;
+    }
+    std::array<int64_t, 128> ends;
+    int64_t first = 0;
+    for (int32_t rank = 0; rank < numDocs; rank += (int32_t)ends.size()) {
+      size_t count = std::min(ends.size(), (size_t)(numDocs - rank));
+      endValueRanks.readValues(rank, std::span<int64_t>(ends.data(), count));
+      for (size_t i = 0; i < count; i++) {
+        visit(first, ends[i]);
+        first = ends[i];
+      }
+    }
+  }
 
   // Seeks documents in any order: repeating a target is free, and a target
   // behind the previous one restarts the scan.

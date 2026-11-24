@@ -835,8 +835,13 @@ to its following value. The function spellings remain available:
   one or zero for a present or missing scalar). `count` also takes STRING, ID
   and GEO_POINT fields; for STRING and ID, indexed or column-only, it counts a
   document's stored values without reading them. It is the only function that
-  takes a STRING or ID field inside an expression. `sum(count(tags_ss))`
-  counts every value in a bucket, like Elasticsearch `value_count`. Integers
+  takes a STRING or ID field inside an expression. The aggregate
+  `value_count(tags_ss)` counts the values in a bucket like Elasticsearch
+  `value_count`, without evaluating `count` per document; unlike `count`, it
+  counts a value repeated in one document's STRING, ID or IP array once (see
+  [expression metrics](faceting.md#expression-metrics)). `sum(count(tags_ss))`
+  over a bare field counts every stored value, repeats included, on the same
+  native value-count path. Integers
   add exactly. A `sum` that overflows makes that document's value missing,
   and a floating `avg` that overflows double is an evaluation error; `sum`
   rejects DATE arrays. A composed array-valued root must use an explicit
