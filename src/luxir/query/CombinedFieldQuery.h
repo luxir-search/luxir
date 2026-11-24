@@ -465,7 +465,7 @@ public:
       return targetPool.make<Supplier>(*this, segment);
     }
 
-    Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) override {
       if (simScorer == nullptr) return nullptr;
       size_t n = query.fields.size();
       size_t numPostings = 0;

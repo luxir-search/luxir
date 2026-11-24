@@ -156,7 +156,7 @@ public:
     }
 
 
-    Query::Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
       if (cachedTermInfo == nullptr) {
         // term doesn't exist in any segment
         return nullptr;
@@ -187,7 +187,7 @@ public:
 
     // A missing term is empty under any domain; otherwise docFreq is exact
     // only when eligibility does not restrict the segment.
-    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+    CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
       int64_t docs = cachedTermInfo ? cachedTermInfo->docFreq(segment.ord) : 0;
       return countBound(segment, domain, docs, CountHow::METADATA);
     }

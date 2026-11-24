@@ -370,7 +370,7 @@ void DomainVariantPlan::buildWeights(Query::Context& context, Query::PlanningCon
                                      int32_t requestFlags) {
   int32_t filterFlags = requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
   for (auto& source : querySources) {
-    source.weight = source.query->createWeight(context, filterFlags);
+    source.weight = context.createRootWeight(*source.query, filterFlags);
     source.use = planning.getFilterUse(*source.query);
   }
 }

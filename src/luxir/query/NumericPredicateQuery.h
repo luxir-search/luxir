@@ -1619,7 +1619,7 @@ public:
     // Bounds answer covering and disjoint ranges without opening points.
     // Partial single-valued indexed counts resolve at supplier construction;
     // other counts walk the column only at execution.
-    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+    CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
       if (query.forcedArm) return countBound(segment, domain, segment.maxDoc());
       if (query.getHi() < query.getLo()) return {0, CountHow::METADATA};
       const auto* info = segmentInfo(segment);
@@ -2532,7 +2532,7 @@ public:
                                        pointValueCount, postings);
     }
 
-    Query::Scorer* createScorer(MemPool& targetPool,
+    Query::Scorer* createScorerImpl(MemPool& targetPool,
                                 IndexReader::Segment& segment) override {
       auto* supplier = scorerSupplier(targetPool, segment);
       if (supplier == nullptr) return nullptr;

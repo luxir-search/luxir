@@ -474,7 +474,6 @@ public:
   // cache is keyed by) may match, deletes ignored. `viable` also prunes by
   // filters, fusion shared filters and segments without live documents; only
   // a segment outside this mask may record an empty cached membership.
-  SegmentMask membershipViable;
   QueryPrep::ExactDomainPlan exactDomainPlan;
   SortPlan sortPlan;
   // Every field-sort collector's primaryValues (see sortValueEnvelope).
@@ -1741,14 +1740,7 @@ public:
     void collectPrunedSegment(FanoutScope* tg, int32_t segnum) {
       auto& op = thisOp();
       auto& seg = op.view->segments()[(size_t)segnum];
-      Signal::emit("searchTopDocsSegmentPruned", this);
-      if (QueryPruning::crossCheck) op.crossCheckPruned(seg);
-      {
-        // Released before the children run and the collector completes, as
-        // doCollectPolicy releases before its merge.
-        auto release = scope_guard([&]() noexcept { releaseSegmentState(seg); });
-        if (!op.membershipViable.test((size_t)segnum)) op.wholeMembershipPlan.recordProvenEmpty(seg);
-      }
+      releaseSegmentState(seg);
       DomainHandle empty = DomainHandle::empty().scoped(seg);
       if (memberReplay) memberReplay->domains[(size_t)segnum] = empty;
       if (!output.empty()) output[(size_t)segnum] = empty;
@@ -1769,8 +1761,15 @@ public:
     void doCollect(FanoutScope* tg, int32_t segnum,
                    DomainHandle domainHandle) {
       if (thisOp().segmentPruned(segnum)) {
-        collectPrunedSegment<MetricGroups>(tg, segnum);
-        return;
+        auto& op = thisOp();
+        auto& seg = op.view->segments()[(size_t)segnum];
+        Signal::emit("searchTopDocsSegmentPruned", this);
+        if (QueryPruning::crossCheck) op.crossCheckPruned(seg);
+        // Let ordinary count resolution publish the key query's own zero.
+        if (op.wholeMembershipPlan.empty() || !op.weight || !op.weight->provenEmpty(seg)) {
+          collectPrunedSegment<MetricGroups>(tg, segnum);
+          return;
+        }
       }
       if constexpr (Admission::isDiversified) {
         doCollectPolicy<Structural, true, false, Admission>(tg, segnum, std::move(domainHandle));

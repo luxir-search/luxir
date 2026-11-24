@@ -970,7 +970,7 @@ public:
       explicit KnnPreparedWeight(std::vector<std::vector<Hit>>&& perSegHits)
         : perSegHits(std::move(perSegHits)) {}
 
-      Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) override {
+      Query::Scorer* createScorerImpl(MemPool& target, IndexReader::Segment& segment) override {
         if ((size_t)segment.ord >= perSegHits.size()) return nullptr;
         auto& hits = perSegHits[(size_t)segment.ord];
         if (hits.empty()) return nullptr;
@@ -1016,7 +1016,7 @@ public:
     };
 
   public:
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& ctx) override {
       if (query.resultPath != query.sourcePath)
         return query.groups ? prepareUnit<true, true>(ctx) : prepareUnit<false, true>(ctx);
       return query.groups ? prepareUnit<true, false>(ctx) : prepareUnit<false, false>(ctx);
@@ -1940,7 +1940,7 @@ public:
       return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
     }
 
-    Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(MemPool& target, IndexReader::Segment& segment) override {
       unused(target, segment);
       return nullptr;
     }
