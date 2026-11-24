@@ -85,12 +85,26 @@ static std::string_view docId(const luxir::api::Map& doc, const FieldNameMap& fi
 }
 
 
+// Resolves like `map`, but drops the id field (append_only with drop_ids).
+struct WithoutId {
+  const FieldNameMap& map;
+  std::optional<std::string_view> resolve(std::string_view name) const {
+    auto fname = map.resolve(name);
+    if (fname && *fname == "id") return std::nullopt;
+    return fname;
+  }
+};
+
 static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::UndoMark& requestMark) {
   auto& request = *msg.req;
   const bool allOrNone = request.all_or_none;
   const bool returnIds = request.return_ids;
   const FieldNameMap fieldMap(request);
   ObjectFields objectFields;
+  // An append-only collection takes no ids: one is rejected or dropped.
+  const bool appendOnly = inverter.schema->appendOnly;
+  const bool dropIds = appendOnly && inverter.schema->appendOnlyDropIds;
+  auto idOf = [&](const luxir::api::Map& doc) { return dropIds ? std::string_view() : docId(doc, fieldMap); };
 
   // first docid this request's adds will use; needed for all_or_none rollback.
   const int32_t firstDoc = inverter.getMaxDoc();
@@ -104,7 +118,14 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
     inverter.startDoc();
 
     try {
-      objectFields.index(inverter, doc, fieldMap);
+      if (dropIds) {
+        objectFields.index(inverter, doc, WithoutId{fieldMap});
+      } else {
+        if (appendOnly && !docId(doc, fieldMap).empty()) {
+          throw DocumentError("Collection is append-only: documents may not carry an id");
+        }
+        objectFields.index(inverter, doc, fieldMap);
+      }
 
       inverter.finishDoc();
     } catch (const FileIOException&) {
@@ -123,12 +144,12 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       failed++;
       ErrorInfo info = currentExceptionInfo(ErrorKind::INTERNAL);
       if (info.kind == ErrorKind::INTERNAL) {
-        LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, docId(doc, fieldMap),
+        LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, idOf(doc),
                   info.message);
       }
       auto* response = msg.getResponse();
       auto& err = msg.addError();
-      err.id = luxir::api::build::arenaStr(msg.responseArena(), docId(doc, fieldMap));
+      err.id = luxir::api::build::arenaStr(msg.responseArena(), idOf(doc));
       err.index = docIndex;
       err.error = luxir::api::build::arenaError(msg.responseArena(), info);
 
@@ -153,7 +174,7 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
     }
 
     if (returnIds) {
-      msg.addId(docId(doc, fieldMap));
+      msg.addId(idOf(doc));
     }
   }
 
@@ -212,8 +233,12 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
     return;
   }
 
+  if (!req->delete_ids.empty() && (this->schema ? this->schema : iw.getSchema())->appendOnly) {
+    throw RequestError("Collection is append-only: delete_ids are not accepted");
+  }
   Inverter& inverter = iw.obtainInverter(this->updateVersion, this->schema);
-  inverter.overwrite = !req->allow_dups;
+  // Append-only: nothing is overwritten, so no write looks up older documents.
+  inverter.overwrite = !req->allow_dups && !inverter.schema->appendOnly;
   inverter.coerceContext.dateMathNowEpochMillis = dateMathNowEpochMillis;
 
   // Captured before deletes are queued so an all_or_none failure rolls them back too.

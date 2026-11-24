@@ -562,6 +562,36 @@ There is no automatic retraining. Changing `zstd_dictionary`,
 merge can train another. After a restart, the dictionary from the largest
 live segment carrying one is used.
 
+### Append-only collections
+
+The top-level `append_only` makes a collection take only new documents:
+documents carry no `id`, and update requests carry no `delete_ids` (the
+request fails). Nothing is ever overwritten, so a write never looks up older
+documents. A document that has an `id` is rejected with a document error,
+or, with `"ids": "drop_ids"`, indexed without it.
+
+```http
+POST /collections/logs/_schema
+
+{
+  "append_only": {"enabled": true, "ids": "drop_ids"}
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `enabled` | `true` makes the collection append-only; `false` clears the setting |
+| `ids` | `reject_ids` (default): a document with an id is rejected. `drop_ids`: its id is dropped |
+
+`mode=set` replaces `append_only` only when the request names it. Documents
+indexed before it was enabled keep their ids. Documents indexed without an
+id cannot be fetched, overwritten or deleted by id later, also after the
+setting is cleared.
+
+Any collection gets the same write cost for requests that only add documents
+(no ids, or `allow_dups`, and no `delete_ids`); the option enforces that
+shape.
+
 ## Text analysis
 
 A text analyzer applies an ordered list of `char_filters` to the whole value,
