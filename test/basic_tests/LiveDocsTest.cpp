@@ -112,7 +112,7 @@ TEST_F(LiveDocsTest, writerPicksSmallerKindAndReaderRestoresBits) {
 
     auto before = liveDocsMemory.sparseRoots.bytes.load();
     auto views = liveDocsMemory.views.bytes.load();
-    auto live = LiveDocs::create(dir, 1, 1, 1, 1, 100, false);
+    auto live = LiveDocs::create(dir, 1, 1, 1, 1, 100, -1, 0, false);
     ASSERT_NE(nullptr, live);
     // A sparse file is expanded into a heap bitmap with its own counter; child
     // live views keep theirs.
@@ -138,7 +138,7 @@ TEST_F(LiveDocsTest, sparseRoundTripWhenMaxDocFillsWholeWords) {
   RAMDir expected;
   writeRaw(expected, LiveDocsWriter::SPARSE, 256, 254, std::vector<uint32_t>{0, 255});
   EXPECT_EQ(rawBytes(expected), rawBytes(dir));
-  auto live = LiveDocs::create(dir, 1, 1, 1, 1, 256, false);
+  auto live = LiveDocs::create(dir, 1, 1, 1, 1, 256, -1, 0, false);
   EXPECT_EQ(254, live->numLive());
   for (int32_t doc = 0; doc < 256; doc++) EXPECT_EQ(doc != 0 && doc != 255, live->bitset().get(doc)) << doc;
 }
@@ -159,7 +159,7 @@ TEST_F(LiveDocsTest, corruptSparseFilesThrow) {
   auto load = [](uint64_t kind, int32_t maxDoc, int32_t numLive, std::vector<uint32_t> ids) {
     RAMDir dir;
     writeRaw(dir, kind, maxDoc, numLive, ids);
-    return LiveDocs::create(dir, 1, 1, 1, 1, 100, false);
+    return LiveDocs::create(dir, 1, 1, 1, 1, 100, -1, 0, false);
   };
   EXPECT_EQ(97, load(LiveDocsWriter::SPARSE, 100, 97, {3, 50, 99})->numLive());
   EXPECT_THROW(load(LiveDocsWriter::SPARSE, 100, 98, {50, 3}), std::runtime_error);   // unsorted

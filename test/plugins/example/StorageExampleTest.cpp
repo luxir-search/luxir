@@ -780,6 +780,43 @@ TEST_F(StorageExampleTest, liveDocsDecodeOnFirstUse) {
   EXPECT_EQ(2, leaf.liveDocs()->numLive());
 }
 
+// The writer opens a source's live docs at the size it recorded for them, so
+// a merge over segments with deletes makes no size request on their files.
+TEST_F(StorageExampleTest, mergeOpensLiveDocsAtTheirRecordedSize) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  config.store.layers = {"strict"};
+  config.store.options = {{"strict", {{"whole_segment_files", "deny"}}}};
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  auto writer = h.getIndexWriter();
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b"), flatdoc("id", "c")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "d"), flatdoc("id", "e"), flatdoc("id", "f")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(h.deleteByIds({"a", "d"}, UpdateMessage::COMMIT).success);
+  // No reader opens on these generations, so the merge reads their files.
+  ASSERT_TRUE(h.deleteByIds({"b", "e"}, UpdateMessage::COMMIT).success);
+  std::vector<std::string> liveFiles;
+  for (const auto& segment : readDurableIndexInfo(writer->dir)->segments) {
+    ASSERT_EQ(2u, segment.live_gen);
+    liveFiles.push_back(Postings::getLiveDocsFileName(Postings::segmentKey(segment.seg_id, segment.creator_epoch),
+                                                      segment.live_gen, segment.live_epoch));
+  }
+  ASSERT_EQ(2u, liveFiles.size());
+  auto* layer = node.collections().storage().find<StrictLayer>();
+  ASSERT_NE(nullptr, layer);
+
+  CollectionHelper::UpdateBuilder merge;
+  ASSERT_TRUE(h.submit(merge.commit(true, 1)).success);
+  auto reader = writer->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  EXPECT_EQ(2, reader->liveDocs());
+  for (const auto& name : liveFiles) {
+    auto stats = layer->counters->fileStats(name);
+    EXPECT_EQ(1u, stats.acquires) << name;
+    EXPECT_EQ(0u, stats.sizeRequests) << name;
+  }
+}
+
 TEST_F(StorageExampleTest, strictRejectsInvalidWholeFileMode) {
   LuxirConfig config;
   config.store.backend = "ram";

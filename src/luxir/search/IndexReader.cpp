@@ -203,10 +203,11 @@ std::shared_ptr<SegmentLive> SegmentLive::open(Directory& dir, uint64_t segId, u
 }
 
 std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
-                                           uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
+                                           uint64_t liveEpoch, int32_t maxDoc, int32_t numLive, uint64_t size,
+                                           bool missingFileOK, bool expectSynced) {
   assert(liveGen > 0 && maxDoc > 0);
-  auto live = openLiveFile(dir, segId, creatorEpoch, liveGen, liveEpoch, 0, missingFileOK, expectSynced);
-  return live.file ? decode(std::move(live.file), live.size, live.name, live.segment, maxDoc, -1) : nullptr;
+  auto live = openLiveFile(dir, segId, creatorEpoch, liveGen, liveEpoch, size, missingFileOK, expectSynced);
+  return live.file ? decode(std::move(live.file), live.size, live.name, live.segment, maxDoc, numLive) : nullptr;
 }
 
 std::vector<IndexReader::ListedPart> IndexReader::listParts(std::span<const std::string_view> dataFields,

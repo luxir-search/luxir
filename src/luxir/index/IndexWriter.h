@@ -110,6 +110,18 @@ public:
 
     uint64_t liveEpochFor(uint64_t gen, uint64_t writerEpoch) const { return gen == initialLiveGen ? initialLiveEpoch : writerEpoch; }
 
+    // A live docs generation as the writer recorded it: its live count and its
+    // file's size (0 when unknown), so opening the file makes no size request.
+    struct LiveRecord {
+      uint64_t gen = 0;
+      int32_t live = -1;
+      uint64_t size = 0;
+    };
+    // The latest generation's record. Read under indexMutex, or on the thread
+    // that applies this segment's deletes.
+    LiveRecord liveRecord() const { return {liveGen, liveDocs, liveFile ? liveFile->size : 0}; }
+    LiveRecord mergedLive;  // the record of mergedLiveGen when the merge marked this segment
+
     SegInfo(uint64_t segId, uint64_t creatorEpoch, int nDocs)
       : segId(segId), creatorEpoch(creatorEpoch), initialLiveEpoch(creatorEpoch), liveEpoch(creatorEpoch),
         maxDoc(nDocs), liveDocs(nDocs), mergeRows(nDocs) {}
@@ -876,9 +888,9 @@ private:
                             std::vector<std::string>& outFilesToSync);
   // The published reader's copy of `seg`, or null; `reader` keeps it valid.
   const Segment* publishedSegment(const SegInfo& seg, std::shared_ptr<IndexReader>& reader);
-  // Live docs generation `gen` of `seg`: the published reader's when it holds that
-  // generation, else loaded from its file.
-  std::shared_ptr<LiveDocs> loadLiveDocs(const SegInfo& seg, uint64_t gen, uint64_t epoch);
+  // Live docs generation `live.gen` of `seg`: the published reader's when it holds
+  // that generation, else loaded from its file at its recorded size.
+  std::shared_ptr<LiveDocs> loadLiveDocs(const SegInfo& seg, const SegInfo::LiveRecord& live, uint64_t epoch);
   // The segment's core: its slot's, else the published reader's, else a new one; the
   // slot keeps it.
   std::shared_ptr<SegmentCore> getSegmentCore(SegInfo& seg);
