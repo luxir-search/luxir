@@ -256,8 +256,7 @@ TEST_F(VectorBitTest, schemaChangeAcrossBitRejected) {
 
 // A field removed and declared again as bit over f32 segments: a merge never
 // converts across the boundary.  f32 inputs keep their encoding (the dims of
-// 12 would not even pack into bytes), and inputs on both sides fail the merge
-// without touching the sources.  Queries report the mismatch.
+// 12 would not even pack into bytes), and each side can merge independently.
 TEST_F(VectorBitTest, mergeNeverConvertsAcrossBit) {
   CollectionHelper h("main");
   installField(h.collection(), "emb", api::VectorMetric::COSINE, 12);
@@ -294,13 +293,45 @@ TEST_F(VectorBitTest, mergeNeverConvertsAcrossBit) {
   EXPECT_FALSE(req->ok());
   EXPECT_NE(std::string::npos, req->errorMsg().find("encoding f32 cannot be scored with metric hamming")) << req->errorMsg();
 
-  h.index(flatdoc("id", std::string("b0"), "emb", signs(0x00FF)));
-  h.commit();
-  expected["b0"] = Vec{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
-  {
-    ExpectLog quiet("cannot merge segments encoded as bit");
-    EXPECT_FALSE(forceMerge(h).success);
+  ExpectLog failed("Merge failed");
+  const std::vector sides{VectorEncoding::F32, VectorEncoding::BIT};
+  for (int i = 0; i < 4; i++) {
+    std::string id = "b" + std::to_string(i);
+    h.index(flatdoc("id", id, "emb", signs(0x00FF)));
+    h.commit();
+    expected[id] = Vec{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
+    EXPECT_EQ(expected, retrieved("emb"));
+    if (i == 0) {
+      ASSERT_TRUE(forceMerge(h).success);
+      EXPECT_EQ(sides, segmentEncodings(h, "emb"));
+      EXPECT_EQ(expected, retrieved("emb"));
+    }
   }
-  EXPECT_EQ((std::vector{VectorEncoding::F32, VectorEncoding::BIT}), segmentEncodings(h, "emb"));
+  EXPECT_EQ((std::vector{VectorEncoding::F32, VectorEncoding::BIT, VectorEncoding::BIT,
+                         VectorEncoding::BIT, VectorEncoding::BIT}), segmentEncodings(h, "emb"));
+  ASSERT_TRUE(forceMerge(h).success);
+  EXPECT_EQ(sides, segmentEncodings(h, "emb"));
   EXPECT_EQ(expected, retrieved("emb"));
+  EXPECT_EQ(0u, failed.suppressed());
+}
+
+TEST_F(VectorBitTest, mergePrefersMajorityWhenSmallestSegmentIsOnOldSide) {
+  CollectionHelper h("main");
+  h.index(flatdoc("id", std::string("f"), "emb_v", Vec(16, 0.25f)));
+  h.commit();
+  installField(h.collection(), "emb_v", api::VectorMetric::HAMMING, 16);
+  std::map<std::string, Vec> expected{{"f", Vec(16, 0.25f)}};
+  for (int seg = 0; seg < 3; seg++) {
+    for (int i = 0; i < 2; i++) {
+      std::string id = "b" + std::to_string(2 * seg + i);
+      h.index(flatdoc("id", id, "emb_v", signs(0xFFFF)));
+      expected[id] = Vec(16, 1.0f);
+    }
+    h.commit();
+  }
+  EXPECT_EQ((std::vector{VectorEncoding::F32, VectorEncoding::BIT, VectorEncoding::BIT,
+                         VectorEncoding::BIT}), segmentEncodings(h, "emb_v"));
+  ASSERT_TRUE(forceMerge(h).success);
+  EXPECT_EQ((std::vector{VectorEncoding::F32, VectorEncoding::BIT}), segmentEncodings(h, "emb_v"));
+  EXPECT_EQ(expected, retrieved("emb_v"));
 }

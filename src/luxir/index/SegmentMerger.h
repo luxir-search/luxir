@@ -1971,8 +1971,15 @@ private:
       // with values in the encoding VectorTranscoder chooses.
       std::optional<VectorTranscoder> vectors;
       if (storage == FieldType::Storage::VECTOR) {
-        auto name = (std::string_view)compactFields[0]->record->name;
-        vectors.emplace(name, schema.getFieldTypePtr(name));
+        std::vector<VectorEncoding> encodings;
+        encodings.reserve(compactFields.size());
+        for (auto* f : compactFields) {
+          if (f->record->bytesColumn()) encodings.push_back(VectorReader::encodingOf(*f->record));
+        }
+        if (!encodings.empty()) {
+          auto name = (std::string_view)compactFields[0]->record->name;
+          vectors.emplace(name, schema.getFieldTypePtr(name), encodings);
+        }
       }
       if (auto column = mergeStrCol(space, sortedFields, allFlags, vectors ? &*vectors : nullptr)) {
         outputFieldInfo.setColumn(*column);
@@ -2285,14 +2292,6 @@ private:
       }
       totalValues++;
     };
-
-    if (vectors) {
-      std::vector<VectorEncoding> encodings;
-      for (auto* f : sortedFields) {
-        if (f && f->record->bytesColumn()) encodings.push_back(VectorReader::encodingOf(*f->record));
-      }
-      vectors->chooseOutput(encodings);
-    }
 
     // Process segments in order - since doc remapping is monotonic,
     // we can simply iterate through each segment sequentially.
