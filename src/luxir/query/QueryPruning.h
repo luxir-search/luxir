@@ -24,8 +24,6 @@ class QueryPruning {
   IndexReader& reader;
   boost::unordered_flat_map<const Query*, SegmentMask> memo;
   boost::unordered_flat_map<const Query*, SegmentMask> membershipMemo;
-  // Whether the merged headers prove the query empty, by query.
-  boost::unordered_flat_map<const Query*, bool> collectionMemo;
 
 public:
   // Disables every proof, including the skipped statistics seeks, so pruned
@@ -38,22 +36,13 @@ public:
 
   explicit QueryPruning(IndexReader& reader) : reader(reader) {}
 
-  // Whether the segments' headers, merged per field, prove that no document
-  // of any segment, deleted or not, matches `query`. Evaluated once, before
-  // any weight exists, and memoized. A query with a part that offers no
-  // proof is never proven empty here, as that part may use fields the proof
-  // did not look up (and so did not type check).
+  // True when the reader has segments and every segment proves raw membership empty.
   bool collectionEmpty(const Query& query);
-
-  // Why the merged headers prove `query` empty, for explain and profile
-  // notes; empty when they do not.
-  std::string collectionReason(const Query& query);
 
   // The segments where `query`'s header proofs allow a match, deletes
   // ignored, by ordinal, memoized for the request. A segment outside it holds
   // no document matching `query`, deleted or not, so its cached membership
-  // is exactly empty. A query proven empty for the collection gets the empty
-  // mask without a proof per segment.
+  // is exactly empty.
   const SegmentMask& membership(const Query& query);
 
   // The segments `query` may match: membership() without the segments that

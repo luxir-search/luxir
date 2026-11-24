@@ -13,31 +13,13 @@
 namespace luxir {
 
 bool QueryPruning::collectionEmpty(const Query& query) {
-  if (disableForTests) return false;
-  auto found = collectionMemo.find(&query);
-  if (found != collectionMemo.end()) return found->second;
-  bool opaque = false;
-  CatalogSummaryView view(reader, CatalogSummaryView::COLLECTION, nullptr, &opaque);
-  bool empty = query.mayMatch(view) == Query::MatchState::EMPTY && !opaque;
-  collectionMemo.emplace(&query, empty);
-  return empty;
-}
-
-std::string QueryPruning::collectionReason(const Query& query) {
-  if (!collectionEmpty(query)) return {};
-  std::string why;
-  CatalogSummaryView view(reader, CatalogSummaryView::COLLECTION, &why);
-  query.mayMatch(view);
-  return why.empty() ? std::string("proven empty") : why;
+  return membership(query).none();
 }
 
 const SegmentMask& QueryPruning::membership(const Query& query) {
   auto found = membershipMemo.find(&query);
   if (found != membershipMemo.end()) return found->second;
   auto segments = reader.segments();
-  if (collectionEmpty(query)) {
-    return membershipMemo.emplace(&query, SegmentMask(segments.size(), false)).first->second;
-  }
   SegmentMask mask(segments.size(), true);
   if (!disableForTests) {
     for (const auto& segment : segments) {
@@ -61,17 +43,17 @@ const SegmentMask& QueryPruning::viable(const Query& query) {
 }
 
 std::string QueryPruning::reason(const Query& query, size_t ord) {
-  if (auto collection = collectionReason(query); !collection.empty()) return "collection: " + collection;
   const auto& segment = reader.segments()[ord];
-  if (segment.liveCountBounds().second == 0) return "live_docs=0";
   std::string why;
   CatalogSummaryView view(reader, (int32_t)ord, &why);
-  if (query.mayMatch(view) != Query::MatchState::EMPTY) return {};
+  if (query.mayMatch(view) != Query::MatchState::EMPTY) {
+    return segment.liveCountBounds().second == 0 ? "live_docs=0" : "";
+  }
   return why.empty() ? std::string("proven empty") : why;
 }
 
 bool QueryPruning::termAbsent(const IndexReader::FieldSegments& field, size_t segment, std::string_view term) {
-  return !disableForTests && field.exists() && proof::headerExcludesTerm(field.header(segment), term);
+  return !disableForTests && field.exists() && proof::recordExcludesTerm(field.at(segment), term);
 }
 
 void QueryPruning::crossCheckFailed(std::string_view what) {

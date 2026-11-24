@@ -657,7 +657,7 @@ IndexReader::FieldNameEntry::FieldNameEntry(std::string_view name, size_t hash, 
 IndexReader::FieldNameEntry::~FieldNameEntry() {
   auto* resolved = totals.load(std::memory_order_relaxed);
   fieldMetadataMemory.names.fetch_sub(1, std::memory_order_relaxed);
-  fieldMetadataMemory.nameBytes.fetch_sub(bytes + (resolved ? resolved->bytes() : 0), std::memory_order_relaxed);
+  fieldMetadataMemory.nameBytes.fetch_sub(bytes + (resolved ? sizeof(*resolved) : 0), std::memory_order_relaxed);
   delete resolved;
 }
 
@@ -768,110 +768,11 @@ size_t IndexReader::FieldSegments::size() const noexcept {
   return entry ? entry->numSegments : 0;
 }
 
-namespace {
-
-// Lower bound union: the smaller endpoint, which is <= every term either side
-// holds. ROUNDED survives only when both sides round to the same endpoint.
-void mergeLower(field_parts::DictionaryBounds& into, const field_parts::DictionaryBounds& other) {
-  using Lower = field_parts::DictionaryBounds::Lower;
-  auto ours = std::string_view(into.lower);
-  auto theirs = std::string_view(other.lower);
-  if (theirs < ours) {
-    into.lower = other.lower;
-    into.lowerMode = other.lowerMode;
-  } else if (theirs == ours && other.lowerMode == Lower::EXACT) {
-    into.lowerMode = Lower::EXACT;
-  }
-}
-
-// Upper bound union: the larger endpoint; INCLUSIVE wins a tie, and one
-// unbounded side leaves the union unbounded.
-void mergeUpper(field_parts::DictionaryBounds& into, const field_parts::DictionaryBounds& other) {
-  using Upper = field_parts::DictionaryBounds::Upper;
-  if (into.upperMode == Upper::UNBOUNDED) return;
-  if (other.upperMode == Upper::UNBOUNDED) {
-    into.upper = PackedTerm(nullptr);
-    into.upperMode = Upper::UNBOUNDED;
-    return;
-  }
-  auto ours = std::string_view(into.upper);
-  auto theirs = std::string_view(other.upper);
-  if (theirs > ours) {
-    into.upper = other.upper;
-    into.upperMode = other.upperMode;
-  } else if (theirs == ours && other.upperMode == Upper::INCLUSIVE) {
-    into.upperMode = Upper::INCLUSIVE;
-  }
-}
-
-// Bounds of `other` merged into `into`. Both sides have the same kind.
-void mergeBounds(field_parts::Bounds& into, const field_parts::Bounds& other) {
-  using namespace field_parts;
-  std::visit([&](auto& ours) {
-    using T = std::decay_t<decltype(ours)>;
-    const auto& theirs = std::get<T>(other);
-    if constexpr (std::is_same_v<T, ScalarBounds>) {
-      ours.include(theirs.min, theirs.max);
-    } else if constexpr (std::is_same_v<T, DictionaryBounds>) {
-      mergeLower(ours, theirs);
-      mergeUpper(ours, theirs);
-    } else if constexpr (std::is_same_v<T, GeoBounds>) {
-      ours.lat.include(theirs.lat.min, theirs.lat.max);
-      ours.lon.include(theirs.lon.min, theirs.lon.max);
-    } else if constexpr (std::is_same_v<T, IntervalBounds>) {
-      ours.low.include(theirs.low.min, theirs.low.max);
-      ours.high.include(theirs.high.min, theirs.high.max);
-    }
-  }, into);
-}
-
-} // namespace
-
-FieldRecordHeader IndexReader::FieldSegments::mergeHeaders(
-    std::span<const std::optional<FieldRecordHeader>> headers) {
-  FieldRecordHeader merged;
-  bool first = true;
-  // Bounds survive only while every segment with values has bounds of one kind.
-  bool boundsKnown = true;
-  int64_t docs = 0;
-  for (const auto& header : headers) {
-    if (!header) continue;
-    if (first) {
-      merged.name = header->name;
-      merged.type = header->type;
-      merged.typeParameters = header->typeParameters;
-      first = false;
-    }
-    merged.flags |= header->flags;
-    merged.segFlags |= header->segFlags;
-    merged.parts = FieldPartSet((uint16_t)(merged.parts.mask() | header->parts.mask()));
-    docs += header->docsWithField;
-    merged.numValues += header->numValues;
-    merged.indexedTotals.numTerms += header->indexedTotals.numTerms;
-    merged.indexedTotals.sumDocFreq += header->indexedTotals.sumDocFreq;
-    merged.indexedTotals.sumTotalTermFreq += header->indexedTotals.sumTotalTermFreq;
-    if (header->docsWithField == 0 || !boundsKnown) continue;
-    if (std::holds_alternative<std::monostate>(header->bounds)) {
-      boundsKnown = false;
-    } else if (std::holds_alternative<std::monostate>(merged.bounds)) {
-      merged.bounds = header->bounds;
-    } else if (merged.bounds.index() != header->bounds.index()) {
-      boundsKnown = false;
-    } else {
-      mergeBounds(merged.bounds, header->bounds);
-    }
-  }
-  if (!boundsKnown) merged.bounds = std::monostate{};
-  merged.docsWithField = (int32_t)std::min<int64_t>(docs, std::numeric_limits<int32_t>::max());
-  return merged;
-}
-
 const IndexReader::FieldTotals& IndexReader::FieldSegments::totals() const {
   assert(entry);
   auto* totals = entry->totals.load(std::memory_order_acquire);
   if (!totals) {
     auto fresh = std::make_unique<FieldTotals>();
-    fresh->headers.resize(size());
     std::optional<FieldRecordHeader> first;
     for (size_t i = 0; i < size(); i++) {
       fresh->stats.maxDoc += segments[i].maxDoc();
@@ -888,28 +789,15 @@ const IndexReader::FieldTotals& IndexReader::FieldSegments::totals() const {
       fresh->stats.sumDocFreq += header.indexedTotals.sumDocFreq;
       fresh->stats.sumTotalTermFreq += header.indexedTotals.sumTotalTermFreq;
       fresh->segFlags |= header.segFlags;
-      fresh->headers[i] = std::move(header);
     }
-    fresh->merged = mergeHeaders(fresh->headers);
     if (entry->totals.compare_exchange_strong(totals, fresh.get(),
                                                std::memory_order_release,
                                                std::memory_order_acquire)) {
       totals = fresh.release();
-      fieldMetadataMemory.nameBytes.fetch_add(totals->bytes(), std::memory_order_relaxed);
+      fieldMetadataMemory.nameBytes.fetch_add(sizeof(*totals), std::memory_order_relaxed);
     }
   }
   return *totals;
-}
-
-const FieldRecordHeader* IndexReader::FieldSegments::header(size_t segment) const {
-  if (!entry) return nullptr;
-  const auto& header = totals().headers[segment];
-  return header ? &*header : nullptr;
-}
-
-const FieldRecordHeader& IndexReader::FieldSegments::mergedHeader() const {
-  assert(entry);
-  return totals().merged;
 }
 
 const Similarity::FieldStats& IndexReader::FieldSegments::stats() const {

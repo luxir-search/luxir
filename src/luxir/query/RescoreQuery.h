@@ -449,7 +449,6 @@ public:
   // Rescoring reorders matches; the inner query decides membership. The
   // program may read fields the view never looks up.
   MatchState mayMatch(const CatalogSummaryView& view) const override {
-    if (program != nullptr) view.opaque();
     return child->mayMatch(view);
   }
 
