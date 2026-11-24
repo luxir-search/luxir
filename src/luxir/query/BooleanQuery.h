@@ -634,13 +634,9 @@ private:
   // into the mandatory clause; a prohibited duplicate of a required clause
   // matches nothing).
   static std::span<Query*> mergeDuplicateScoringClauses(
-      luxir::MemPool& pool, std::span<Query*> clauses,
-      int32_t* removedOut = nullptr) {
+      luxir::MemPool& pool, std::span<Query*> clauses) {
     DuplicateGroups duplicates = findDuplicateScoringGroups(pool, clauses);
-    if (duplicates.duplicateSlots == 0) {
-      if (removedOut != nullptr) *removedOut = 0;
-      return clauses;
-    }
+    if (duplicates.duplicateSlots == 0) return clauses;
 
     boost::container::small_vector<Query*, 16> out;
     for (size_t i = 0; i < clauses.size(); i++) {
@@ -662,9 +658,6 @@ private:
         core = scoringClause(pool, core, duplicate.boost);
       }
       out.push_back(core);
-    }
-    if (removedOut != nullptr) {
-      *removedOut = (int32_t) (clauses.size() - out.size());
     }
     auto* kept = pool.make_arr<Query*>(out.size());
     std::copy(out.begin(), out.end(), kept);
@@ -705,13 +698,11 @@ private:
 
       auto mandatoryClauses = mergeDuplicateScoringClauses(
           context.pool, normalized.mandatory);
-      int32_t removedOptional = 0;
       auto optionalClauses = mergeDuplicateScoringClauses(
-          context.pool, normalized.optional, &removedOptional);
+          context.pool, normalized.optional);
 
       compiled->minShouldMatch = dedupedMinShouldMatch(
-          compiled->minShouldMatch, normalized.optional.size(),
-          normalized.optional.size() - (size_t) removedOptional);
+          compiled->minShouldMatch, normalized.optional.size(), optionalClauses.size());
 
       // NormalizedBoolean owns small_vector storage. Persist every final span
       // in the request pool so all Weights for this Query share one plan.

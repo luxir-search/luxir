@@ -115,11 +115,11 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - **SIMD codecs** for postings and numeric data (FastPFOR-based bit-packing,
   StreamVByte), roaring-style two-level bitsets for document sets, and BM25
   hot loops written to auto-vectorize.
-- **Segment pruning:** Per-field bounds and presence in each segment's
-  catalog prove that a query cannot match a segment, which is then skipped
-  without building scorers. When every segment proves the query empty, the
-  planner can answer before any term is looked up. Scores are
-  unchanged.
+- **Segment pruning.** Field presence and bounds let root weights skip segments
+  where their query cannot match. When every segment excludes a root and its
+  context needs no whole-index preparation, planning skips construction of
+  its scoring weight. Filters and kNN retain their input domains, and term
+  statistics include every segment where the term could occur.
 - **Block-max pruning:** Skips whole blocks of documents that cannot enter
   the top k. Pareto frontiers provide score bounds that eliminate scoring
   work while preserving exact top-k results.

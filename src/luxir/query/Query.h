@@ -691,7 +691,8 @@ public:
   // Whether this query can match any document in the segment. EMPTY proves
   // absence over live and deleted rows alike. UNKNOWN is always legal;
   // NONEMPTY gives no proof of absence. Proofs read the physical fields'
-  // catalog records. Queries without a rule return UNKNOWN.
+  // catalog records. An EMPTY node supplies its reason with view.prove()
+  // or forwards its child's proof. Queries without a rule return UNKNOWN.
   //
   // Only absence is proven today. The opposite proof, that every row of the
   // segment matches (ALL_ROWS: exists on a field every row has, a range that
@@ -1298,9 +1299,8 @@ public:
     FilterKeyContext filterKeyContext;
     Limits limits;
     std::vector<api::Warning>* warnings = nullptr;
-    // Logical validation visited a query whose weight may prepare over the
-    // whole index (kNN, the test-only force-prepare wrapper): the only
-    // sources of Weight::NEEDS_PREPARE, known before any weight exists.
+    // Validation must set this for any query that introduces NEEDS_PREPARE
+    // so an empty root still creates its whole-index preparation weight.
     bool mayPrepare = false;
     std::shared_ptr<QueryPruning> pruning;
     std::string_view opName;
@@ -1647,9 +1647,7 @@ public:
       return terms;
     }
 
-    // Whether segment `segnum`'s header proves `term` absent from the field,
-    // so its statistics are zero there without a seek. Cross-check mode
-    // seeks anyway and fails on a hit.
+    // A term outside this segment's catalog bounds contributes zero frequency.
     bool termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term);
 
   public:

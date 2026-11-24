@@ -34,9 +34,9 @@ public:
     return CatalogSummaryView(pruning, space, ord, reason);
   }
 
-  // Records why a leaf proved the view empty; the first reason wins.
+  // The clause that completes an EMPTY verdict supplies its witness last.
   void prove(std::string_view why) const {
-    if (reason != nullptr && reason->empty()) reason->assign(why);
+    if (reason != nullptr) reason->assign(why);
   }
 };
 

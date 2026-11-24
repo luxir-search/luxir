@@ -8,8 +8,8 @@
 // and its validation context. See docs/design/storage.md (Pruning).
 
 #include <map>
+#include <optional>
 #include <string>
-#include <string_view>
 
 #include <boost/unordered/unordered_node_map.hpp>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -33,17 +33,14 @@ public:
   // Disables every proof, including the skipped statistics seeks, so pruned
   // and unpruned execution can be compared.
   static inline bool disableForTests = false;
-  // Verify skipped statistics seeks against the dictionary.
-  static inline bool crossCheck = false;
+  // Tests seek each term whose statistics lookup the catalog would skip and fail on a hit.
+  static inline bool verifyTermAbsenceForTests = false;
 
   // The segments where `query`'s header proofs allow a match, deletes
   // ignored, by ordinal, memoized for the request. A segment outside it holds
   // no document matching `query`, deleted or not, so its cached membership
   // is exactly empty.
   const SegmentMask& membership(const Query& query, const Query::PlanningContext& planning);
-
-  // Thrown by cross-check mode when pruned work finds a match.
-  [[noreturn]] static void crossCheckFailed(std::string_view what);
 };
 
 } // namespace luxir

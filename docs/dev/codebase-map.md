@@ -119,14 +119,15 @@ locations, browse `src/luxir/<area>/`.
    - Child liveness is derived lazily from root deletes through ownership ranges;
      metadata-only count probes use conservative bounds until it is known.
    - Supports Term, Boolean, Phrase, and All queries
-   - `Query::mayMatch` proves from field record headers, through a
-     `CatalogSummaryView` of one segment, that a query cannot match.
-     `CatalogPredicates.h` reads the core-owned catalog records through
-     `IndexReader::FieldSegments::at`. `QueryPruning` evaluates and
-     memoizes membership masks per root and validation context. Root weights
-     use them for suppliers and counts. TopDocs completes a segment early
-     when all its outputs are empty. See
-     [storage design](../design/storage.md#query-time-pruning).
+   - `CatalogSummaryView` reads core-owned field records through
+     `IndexReader::FieldSegments::at`. Query rules in `CatalogPredicates.h`
+     and the validated Boolean plan implement `Query::mayMatch`.
+     `QueryPruning` memoizes raw membership by root and validation context.
+     `Query::Context::createRootWeight` selects the empty weight or attaches
+     an excluding mask to the real weight. `TopDocsReq::outputsEmpty` checks
+     the list and its routed variants after preparation. Explain reports
+     planned exclusions and the pruning profile records actual segment skips.
+     See [storage design](../design/storage.md#query-time-pruning).
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
      column scans. `BKDQueryWeight<QueryType, Relation>` serves geo box,
