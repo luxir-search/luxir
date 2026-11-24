@@ -106,6 +106,9 @@ class StrictFileState : public HoldOwner {
   std::shared_ptr<StrictStorageCounters> counters;
   std::string name;
   std::optional<uint64_t> segmentFile;  // The number of a base segment data file.
+  // Deny covers base segment data files only: their parts are read by range,
+  // while a live docs bitmap and an overlay (a vector index) are whole-file
+  // formats, decoded or mapped as one hold.
   bool denyWhole;
   bool sized;  // Opened with a size, so size() makes no request.
   std::atomic<uint64_t> liveHolds{0};
@@ -152,11 +155,19 @@ public:
     }
   }
 
-  // A whole-file read, or in a segment data file a read no part makes: one
-  // from offset 0 past the header (no part starts at 0), or one to EOF outside
-  // file 0 (the writer pads every other file after its last part).
+  // A whole-file read leaves out at most a header's worth of bytes, wherever
+  // they are: skipping only the header (or a few trailing bytes) still pulls
+  // the whole file. Segment data and live docs files start with the header;
+  // other files are held to the same margin.
+  // In a segment data file a read no part makes also counts: one from offset 0
+  // past the header (no part starts at 0), or one to EOF outside file 0 (the
+  // writer pads every other file after its last part). File 0's catalog runs
+  // to EOF but starts after the file's parts.
   bool readsWholeFile(ByteRange range, uint64_t size) const {
-    if (range.offset == 0 && range.length == size) return true;
+    constexpr uint64_t header = Postings::LUXIR_HEADER.size();
+    if (range.length == size || (range.length && size - range.length <= header)) {
+      return true;
+    }
     if (!segmentFile) return false;
     if (range.offset == 0 && range.length > Postings::LUXIR_HEADER.size()) return true;
     return *segmentFile != Postings::PRIMARY_FILE && range.length && range.offset + range.length == size;

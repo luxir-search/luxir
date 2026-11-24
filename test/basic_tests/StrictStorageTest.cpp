@@ -178,7 +178,8 @@ TEST(StrictStorageTest, rejectsAPartAcquiredUnderBothClasses) {
 }
 
 // Reads no part makes count as whole-file reads: from offset 0 past the
-// header, and to EOF outside file 0, whose catalog runs to EOF.
+// header, to EOF outside file 0, and any that leaves out at most a header's
+// worth of bytes, which includes file 0 past its header.
 TEST(StrictStorageTest, deniesReadsNoSegmentPartMakes) {
   auto counters = std::make_shared<StrictStorageCounters>();
   StrictDirectory dir(std::make_shared<RAMDir>(), counters, StrictWholeFiles::DENY);
@@ -190,10 +191,29 @@ TEST(StrictStorageTest, deniesReadsNoSegmentPartMakes) {
     auto size = file->size();
     EXPECT_NO_THROW(file->acquire({0, header}));
     EXPECT_THROW(file->acquire({0, header + 1}), FileIOException);
+    EXPECT_THROW(file->acquire({header, size - header}), FileIOException);
+    EXPECT_THROW(file->acquire({1, size - header}), FileIOException);
     EXPECT_NO_THROW(file->acquire({header, size - header - 1}));
-    if (number == 0) EXPECT_NO_THROW(file->acquire({header, size - header}));
-    else EXPECT_THROW(file->acquire({header, size - header}), FileIOException);
+    if (number == 0) EXPECT_NO_THROW(file->acquire({header + 1, size - header - 1}));
+    else EXPECT_THROW(file->acquire({header + 1, size - header - 1}), FileIOException);
   }
+}
+
+// Other files count reads leaving out at most a header's worth of bytes as
+// whole, and deny does not apply to them.
+TEST(StrictStorageTest, countsNearWholeReadsOfAnyFile) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters, StrictWholeFiles::DENY);
+  auto header = Postings::LUXIR_HEADER.size();
+  auto name = Postings::getLiveDocsFileName(Postings::segmentKey(1, 1), 1, 1);
+  put(dir, name);
+  auto file = dir.openFile(name);
+  auto size = file->size();
+  ByteRange whole[] = {{0, size}, {header, size - header}, {0, size - header}, {1, size - 2}};
+  for (auto range : whole) EXPECT_NO_THROW(file->acquire(range));
+  EXPECT_NO_THROW(file->acquire({header, size - header - 1}));
+  EXPECT_NO_THROW(file->acquire({0, size - header - 1}));
+  EXPECT_EQ(4u, counters->fileStats(name).wholeFileAccesses);
 }
 
 TEST(StrictStorageTest, wrapsVerifiedMappingAfterDirectoryCloses) {
