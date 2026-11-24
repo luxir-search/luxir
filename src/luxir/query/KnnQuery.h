@@ -1081,8 +1081,7 @@ public:
       if (!query.getExact()) {
         for (size_t i = 0; i < numSegs; i++) {
           auto aux = reader.segments()[i].getAuxReader(auxName);
-          // An advisory overlay that could not be opened answers nothing: scan exactly.
-          if (!aux || dynamic_cast<const UnavailableAuxReader*>(aux.get())) continue;
+          if (!aux) continue;
           auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
           if (!vaux) {
             throw std::runtime_error(std::format(

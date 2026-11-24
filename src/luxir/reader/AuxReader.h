@@ -10,16 +10,17 @@
 
 namespace luxir {
 
-// What the first use of a segment overlay does when it cannot open it.
-// Segment overlays open on first use, never with the segment, from files the
-// snapshot opened. A failed read (an ApiError such as FileIOException, a
-// system error, or running out of memory) fails that use under either policy,
-// and the next use retries.
+// What the first use of a segment overlay does when the overlay's bytes are
+// invalid. Segment overlays open on first use, never with the segment, from
+// files the snapshot opened, and a kind's open reports invalid bytes as
+// SegmentCorruptError. Any other failure (a failed read, running out of
+// memory) fails that use under either policy, and the next use retries.
 enum class OverlayPolicy {
-  // Invalid overlay bytes fail every use with SegmentCorruptError.
-  ON_DEMAND,
-  // An accelerator: invalid overlay bytes leave an UnavailableAuxReader that
-  // answers nothing, and the segment stays in service.
+  // Queries need what the overlay holds: invalid bytes fail every use.
+  REQUIRED,
+  // An accelerator with an exact fallback: an overlay whose bytes are invalid
+  // reads as absent, as on a segment that never had one, and the segment
+  // stays in service.
   ADVISORY,
 };
 
@@ -53,19 +54,6 @@ public:
 protected:
   AuxReader(uint64_t gen, uint64_t builtCoreGen) noexcept
     : gen(gen), builtCoreGen(builtCoreGen) {}
-};
-
-/// Stands in for an advisory overlay that could not be opened: it answers
-/// nothing, and whatever consults the overlay does without it.
-class UnavailableAuxReader final : public AuxReader {
-  std::string kind;
-  std::string name;
-
-public:
-  UnavailableAuxReader(std::string_view kind, std::string_view name, uint64_t gen, uint64_t builtCoreGen)
-      : AuxReader(gen, builtCoreGen), kind(kind), name(name) {}
-  std::string_view getKind() const override { return kind; }
-  std::string_view getName() const override { return name; }
 };
 
 } // namespace luxir

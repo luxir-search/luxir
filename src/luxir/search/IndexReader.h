@@ -156,14 +156,17 @@ public:
 
 // A segment overlay of known kind. Its files are opened with the snapshot,
 // which keeps their bytes readable; its reader is opened on first use, under
-// the kind's OverlayPolicy. A failed open publishes nothing unless the policy
-// leaves an UnavailableAuxReader, so the next use retries it.
+// the kind's OverlayPolicy. A kind opens from these files and never from the
+// directory, so no kind reads before its first use or after its files are
+// retired. A failed open publishes nothing, so the next use retries it,
+// except that an advisory overlay with invalid bytes stays absent.
 class SegmentOverlay {
   AuxInfo info;
   OverlayPolicy policy;
   std::string segment;
   std::vector<std::shared_ptr<InputFile>> files;
   SharedLazyCell<AuxReader> reader;
+  std::atomic<bool> unusable = false;  // An advisory overlay whose bytes were found invalid.
 
 public:
   SegmentOverlay(AuxInfo info, OverlayPolicy policy, std::string segment,
@@ -183,6 +186,8 @@ public:
   uint64_t builtCoreGen() const noexcept { return info.built_core_gen; }
   OverlayPolicy openPolicy() const noexcept { return policy; }
   bool isOpen() const noexcept { return reader.peek() != nullptr; }
+  bool isUnusable() const noexcept { return unusable.load(std::memory_order_relaxed); }
+  // The reader, opened on first use; null for an advisory overlay whose bytes are invalid.
   std::shared_ptr<AuxReader> get();
 };
 
@@ -295,9 +300,9 @@ public:
       return sharedOverlays;
     }
 
-    // The overlay `name`, opened on first use; null when the segment has none.
-    // Throws when its open fails, except where an advisory overlay leaves an
-    // UnavailableAuxReader.
+    // The overlay `name`, opened on first use. Null when the segment has none,
+    // or has an advisory one whose bytes are invalid. Throws when its open
+    // fails otherwise.
     std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const {
       for (const auto& overlay : sharedOverlays) {
         if (overlay->name() == name) return overlay->get();
