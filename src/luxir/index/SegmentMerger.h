@@ -17,6 +17,7 @@
 #include "PointsWriter.h"
 #include "StoredFieldsWriter.h"
 #include "StoredDictionaryRegistry.h"
+#include "VectorTranscoder.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/PosEnum.h"
 #include "luxir/reader/NormsReader.h"
@@ -1966,8 +1967,14 @@ private:
     } else if ((storage == FieldType::Storage::TERMS || storage == FieldType::Storage::VECTOR)
                && !(allFlags & FieldType::INDEX_DOCS)) {
       // Non-indexed string/binary column (column-only storage).  Vector columns use
-      // the same fixed-size binary blob format (VectorHandler extends StrColHandler).
-      if (auto column = mergeStrCol(space, sortedFields, allFlags)) {
+      // the same fixed-size binary blob format (VectorHandler extends StrColHandler),
+      // with values in the encoding VectorTranscoder chooses.
+      std::optional<VectorTranscoder> vectors;
+      if (storage == FieldType::Storage::VECTOR) {
+        auto name = (std::string_view)compactFields[0]->record->name;
+        vectors.emplace(name, schema.getFieldTypePtr(name));
+      }
+      if (auto column = mergeStrCol(space, sortedFields, allFlags, vectors ? &*vectors : nullptr)) {
         outputFieldInfo.setColumn(*column);
       }
     } else {
@@ -2201,8 +2208,10 @@ private:
 
   // Merges non-indexed string/binary columns written by StrColHandler.
   // Rebuilds the value bytes, end offsets for variable-size values and end value
-  // ranks for multi-valued docs.
-  std::optional<WrittenColumn<field_parts::BytesColumn>> mergeStrCol(const Space& space, std::span<MergeFieldInfo*> sortedFields, int32_t flags) {
+  // ranks for multi-valued docs.  A vector column's values pass through
+  // vectors, which also chooses the column's encoding.
+  std::optional<WrittenColumn<field_parts::BytesColumn>> mergeStrCol(const Space& space, std::span<MergeFieldInfo*> sortedFields,
+                                                                     int32_t flags, VectorTranscoder* vectors) {
     assert(sortedFields.size() == space.segs.size());
 
     auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -2292,6 +2301,9 @@ private:
       StrColReader::Iterator iter(reader);
       bool sourceMultiValued = reader.multiValued();
 
+      if (vectors) vectors->startInput(*field->seg->postingsReader, *field->record);
+      auto convert = [&](std::string_view value) { return vectors ? (*vectors)(value) : value; };
+
       for (int32_t localId = iter.advance(0); localId != StrColReader::Iterator::ENDDOC; localId = iter.next()) {
         auto [mappedDoc, isDeleted] = seg.remapDocId(localId);
         if (isDeleted) {
@@ -2302,18 +2314,19 @@ private:
           int64_t rank = iter.rank();
           auto [startValueRank, endValueRank] = sourceMultiValued ? iter.valueRange() : std::pair(rank, rank + 1);
           for (int64_t r = startValueRank; r < endValueRank; r++) {
-            emitValue(reader.valueAt(r));
+            emitValue(convert(reader.valueAt(r)));
             if (ownerWriter) ownerWriter->addInt64(mappedDoc);
           }
           endValueRankWriter->addInt64(totalValues);
         } else {
-          emitValue(iter.value());
+          emitValue(convert(iter.value()));
         }
 
         docsWriter.startDoc(mappedDoc);
       }
     }
 
+    if (vectors) vectors->finish();
     if (docsWriter.numAdded() == 0) return {};
 
     valuesOut->flush(true);
@@ -2333,7 +2346,8 @@ private:
     }
 
     auto presence = docsWriter.finish();
-    field_parts::BytesColumn bytes{postingsWriter.finishStream(std::move(valuesOut)), endOffsets};
+    field_parts::BytesColumn bytes{postingsWriter.finishStream(std::move(valuesOut)), endOffsets,
+                                   vectors ? (uint8_t)vectors->outputEncoding() : (uint8_t)0};
     return WrittenColumn{bytes, totalValues, presence, endValueRanks, owners, {}};
   }
 

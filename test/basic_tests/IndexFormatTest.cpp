@@ -43,8 +43,8 @@ namespace {
 // The digest of the reference index written by IndexFormat::VERSION. A byte
 // change requires reviewing the format version. Writer choices among layouts
 // already supported by that version can change the digest within the version.
-constexpr uint64_t kReferenceVersion = 18;
-constexpr uint64_t kReferenceDigest = 0x55b9af943d4c4000;
+constexpr uint64_t kReferenceVersion = 19;
+constexpr uint64_t kReferenceDigest = 0xa52527626525a9d;
 
 constexpr IdFilter::Options REFERENCE_ID_FILTER = {.kind = IdFilter::Kind::BLOOM};
 
@@ -67,6 +67,9 @@ void buildReferenceIndex(CollectionHelper& ch) {
   auto& interval = schema.field("interval_value");
   interval.type = api::FieldDef::FieldClass::LONG_RANGE;
   interval.index = api::FieldDef::IndexMode::RANGE;
+  auto& quantized = schema.field("vector_sq8");
+  quantized.type = api::FieldDef::FieldClass::VECTOR;
+  quantized.encoding = api::VectorEncoding::SQ8;
   schema.set(ch.collection());
   // Writers leave the id filter out by default; the reference covers it.
   ch.getIndexWriter()->idFilterOptions = REFERENCE_ID_FILTER;
@@ -75,12 +78,14 @@ void buildReferenceIndex(CollectionHelper& ch) {
               "n_i", (int64_t)7, "ns_is", std::vector<int64_t>{1, 2}, "on_b", true,
               "flags_bs", std::vector<bool>{true, false}, "address_ip", "10.0.0.1", "addresses_ips", vecs("10.0.0.2", "2001:db8::1"), "decimal_value", "1.005", "f_f", 1.5f, "d_d", 2.25,
               "dt_dt", "2026-01-02T03:04:05Z", "w_w", "Hello World", "vec_v", std::vector<float>{1, 0},
+              "vector_sq8", std::vector<float>{0.25f, -0.75f, 2},
               "code_sc", "k1", "codes_ssc", vecs("k2", "k3"), "fs_fs", std::vector<double>{0.5, -1.25},
               "ds_ds", std::vector<double>{3.75}, "dts_dts", vecs("2026-01-02T03:04:05Z", "2024-02-29T00:00:00Z"),
               "at_p", std::vector<double>{-74.006, 40.7128},
               "stops_ps", std::vector<std::vector<double>>{{-0.1278, 51.5074}, {139.6503, 35.6762}}),
       flatdoc("id", "b", "title_t", "lazy dogs sleep", "tag_s", "blue", "n_i", (int64_t)-3,
-              "vec_v", std::vector<float>{0, 1}, "at_p", std::vector<double>{2.3522, 48.8566}),
+              "vec_v", std::vector<float>{0, 1}, "vector_sq8", std::vector<float>{1, 1, 1},
+              "at_p", std::vector<double>{2.3522, 48.8566}),
   }, UpdateMessage::COMMIT).success);
   CollectionHelper::UpdateBuilder range;
   for (std::string_view json : {
@@ -95,6 +100,7 @@ void buildReferenceIndex(CollectionHelper& ch) {
   ASSERT_TRUE(ch.indexAll({
       flatdoc("id", "c", "title_t", "quick quick fox", "tag_s", "red", "n_i", (int64_t)42,
               "dt_dt", "2025-12-31T00:00:00Z", "vec_v", std::vector<float>{0.5f, 0.5f},
+              "vector_sq8", std::vector<float>{-3, 0.5f, 0},
               "at_p", std::vector<double>{151.2093, -33.8688},
               "stops_ps", std::vector<std::vector<double>>{{-58.3816, -34.6037}}),
   }, UpdateMessage::COMMIT).success);
@@ -242,7 +248,7 @@ TEST_F(IndexFormatTest, referenceIndexBytesMatchFormatVersion) {
 TEST_F(IndexFormatTest, serialRootMergeBytesMatchReference) {
   auto digest = buildMergedReferenceDigest();
   ASSERT_EQ(digest, buildMergedReferenceDigest()) << "the serial merge is not deterministic";
-  EXPECT_EQ(0x39faa55685fbf612ULL, digest) << std::format("merged digest {:#x}", digest);
+  EXPECT_EQ(0x77f3d1910b620e63ULL, digest) << std::format("merged digest {:#x}", digest);
 }
 
 TEST_F(IndexFormatTest, otherFormatVersionFailsToLoad) {
