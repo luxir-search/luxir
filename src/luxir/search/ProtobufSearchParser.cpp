@@ -389,16 +389,6 @@ public:
             &req.arena, *rootOp.planning);
         rootOp.domainVariants.buildWeights(
             *rootOp.weightContext, *rootOp.planning, 0);
-        rootOp.variantViable.resize(rootOp.domainVariants.variantCount());
-        for (size_t variant = 1; variant < rootOp.variantViable.size(); variant++) {
-          rootOp.variantViable[variant] = variantMask(rootOp.domainVariants, variant, SegmentMask{}, {});
-        }
-        if (QueryPruning::crossCheck) {
-          for (size_t source = 0; source < rootOp.domainVariants.sourceCount(); source++) {
-            rootOp.pruneChecks.push_back({rootOp.domainVariants.sourceWeight(source),
-                                          pruningOf().membership(*rootOp.domainVariants.sourceQuery(source))});
-          }
-        }
       }
     }
     addSubs(rootOp, req.proto.ops, 0, OpsPlacement::REQUEST_ROOT);
@@ -2974,11 +2964,9 @@ public:
     for (auto* src : fusion->sources) {
       src->parent = fusion;
     }
-    // The shared filters bound every source; the fusion itself needs a
-    // segment some source may match.
+    // Shared filters narrow each source's collection mask.
     SegmentMask shared;
     for (const auto& filter : sharedFilters) shared &= pruningOf().viable(*filter.query);
-    SegmentMask anySource(view()->segments().size(), false);
     for (auto* src : fusion->sources) {
       if (QueryPruning::crossCheck && !sharedFilters.empty()) {
         auto* first = fusion->sources.front();
@@ -2992,10 +2980,8 @@ public:
         }
       }
       src->viable &= shared;
-      anySource |= src->viable;
       reportPruning(*src, pruningRoots(*src->query, src->filters, sharedFilters));
     }
-    fusion->viable = fusion->sources.empty() ? shared : anySource;
 
     addSubs(*fusion, fusionProto.ops, depth, OpsPlacement::FUSION);
     if (collapse) {

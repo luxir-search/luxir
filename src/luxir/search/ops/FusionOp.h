@@ -150,13 +150,6 @@ public:
     for (auto& [name, child] : groupOps) child->releaseSegmentState(segment);
   }
 
-  bool needsWholePreparation() const override {
-    return std::ranges::any_of(filterWeights, [](auto* weight) { return weight->needsPrepare(); })
-        || std::ranges::any_of(sources, [](auto* source) { return source->needsWholePreparation(); })
-        || SearchOp::needsWholePreparation()
-        || std::ranges::any_of(groupOps, [](const auto& entry) { return entry.second->needsWholePreparation(); });
-  }
-
   bool needsCompleteBucketInput() const override {
     // Fusion gathers all segment inputs before executing its result children.
     return true;
@@ -324,8 +317,6 @@ public:
         return;
       }
 
-      // Preparation keeps every segment's domain, pruned or not; a pruned
-      // segment is skipped only by each source's collection.
       baseDomains[(size_t)segnum] = std::move(domain);
       baseDomainViews[(size_t)segnum] = baseDomains[(size_t)segnum].get();
       auto count = preparedDomainsSeen.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -360,15 +351,6 @@ public:
         return;
       }
 
-      // No source may match a pruned segment: they take their own pruned
-      // path, so the shared filter is never built there.
-      // Sources that prepare over the whole index (kNN) must still see the
-      // unpruned domains, so they keep the normal path.
-      if (!op.needsWholePreparation() && op.segmentPruned(segnum)) {
-        dispatchSources(tg, segnum,
-                        DomainHandle::empty().scoped(op.view->segments()[segnum]));
-        return;
-      }
       DomainHandle sharedFilter = std::move(domain);
       if (!op.filterWeights.empty()) {
         segFilters[(size_t)segnum] =

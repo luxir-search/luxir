@@ -520,14 +520,6 @@ public:
     return !domainVariants.segmentLocal(selectionInPath);
   }
 
-  bool needsWholePreparation() const override {
-    return (weight && weight->needsPrepare())
-        || std::ranges::any_of(filterWeights, [](auto* source) { return source->needsPrepare(); })
-        || domainVariants.sourcesNeedPrepare()
-        || SearchOp::needsWholePreparation()
-        || std::ranges::any_of(groupOps, [](const auto& entry) { return entry.second->needsWholePreparation(); });
-  }
-
   bool needsCompleteBucketInput() const override {
     return enrichGroups() || (weight && weight->needsPrepare())
         || std::ranges::any_of(filterWeights, [](auto* source) { return source->needsPrepare(); })
