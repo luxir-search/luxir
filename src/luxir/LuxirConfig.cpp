@@ -7,7 +7,6 @@
 #include "luxir/util/TaskWork.h"
 #include "luxir/util/LoadSignal.h"
 #include "luxir/server/Collections.h"
-#include "luxir/query/QueryPruning.h"
 #include <unistd.h>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -340,9 +339,6 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "type-ahead keystrokes shorter than N are rejected (0 = off, default)")
       ->default_val(search.multiterm_min_prefix_length)
       ->check(CLI::NonNegativeNumber);
-  app.add_flag("--search.pruning-cross-check", search.pruning_cross_check,
-               "Diagnostic: verify term statistics seeks skipped by catalog proofs")
-      ->group("");
 }
 
 void LuxirConfig::resolveRamBudgets() {
@@ -414,7 +410,6 @@ void LuxirConfig::apply() const {
   fanoutSiblingGrainNs.store(search.fanout_sibling_grain_us < 0 ? FANOUT_GRAIN_NEVER
       : (uint64_t)search.fanout_sibling_grain_us * 1000, std::memory_order_relaxed);
   LoadRegistry::enabled.store(search.fanout_grain_us >= 1, std::memory_order_relaxed);
-  QueryPruning::crossCheck = search.pruning_cross_check;
   auto level = spdlog::level::from_str(log_level);
   spdlog::set_level(level);
 }

@@ -2882,8 +2882,8 @@ public:
 
       domain.assertScope(op.view->segments()[segnum]);
       assert(segnum < (int32_t)inputDomains.size());
-      // Whole-index preparation keeps every segment's domain, pruned or not:
-      // a prepared weight (kNN's global top k) chooses across all segments.
+      // Gather every input before testing segment outputs. A kNN weight
+      // chooses its global top k from all of these domains.
       inputDomains[(size_t)segnum] = std::move(domain);
       inputDomainViews[(size_t)segnum] = inputDomains[(size_t)segnum].get();
       auto count =

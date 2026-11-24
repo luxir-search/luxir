@@ -75,18 +75,14 @@ std::optional<const DecodedFieldRecord*> CatalogSummaryView::record(std::string_
 
 bool Query::Context::termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term) {
   if (QueryPruning::disableForTests || !proof::recordExcludesTerm(field.segInfos.at(segnum), term)) return false;
-  if (QueryPruning::crossCheck) {
+  if (QueryPruning::verifyTermAbsenceForTests) {
     auto* terms = getTermsEnum(field, segnum);
     if (terms && terms->seek(term)) {
-      QueryPruning::crossCheckFailed(std::format("term '{}' of field '{}' found in segment {} proven to lack it",
-                                                 term, field.segInfos.name(), segnum));
+      throw std::logic_error(std::format("term '{}' of field '{}' found in segment {} proven to lack it",
+                                         term, field.segInfos.name(), segnum));
     }
   }
   return true;
-}
-
-void QueryPruning::crossCheckFailed(std::string_view what) {
-  throw std::logic_error(std::format("pruning cross-check: {}", what));
 }
 
 } // namespace luxir
