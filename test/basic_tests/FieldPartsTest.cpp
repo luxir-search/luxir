@@ -263,7 +263,7 @@ TEST(FieldRecordCodecTest, shortCachePage) {
     PostingsWriter writer(dir, 1, 1, 1);
     for (int i = 0; i < count; ++i) {
       auto output = writer.getOutputStream();
-      IntColWriter number(*output, false);
+      IntColWriter number(*output, NumColumnFormat::SketchMode::NONE);
       number.addInt64(i);
       auto written = IntColWriter::placeColumn(writer, std::move(output), number.finish());
       auto& field = writer.addField(ROOT, std::format("field{:02}", i));
@@ -585,7 +585,7 @@ TEST_P(FieldPartsTest, IndexAndColumnSlices) {
   };
   separatePages();
   auto numberOut = writer.getOutputStream();
-  IntColWriter intWriter(*numberOut, !alternate);
+  IntColWriter intWriter(*numberOut, alternate ? NumColumnFormat::SketchMode::NONE : NumColumnFormat::SketchMode::PERSIST);
   auto numericValue = [&](int32_t doc) -> int64_t {
     return alternate ? geo::pack(10 * doc, -doc) : 10000 * doc + doc % 2;
   };

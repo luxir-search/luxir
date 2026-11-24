@@ -407,7 +407,13 @@ public:
     uint8_t leafCrossing = 0;
     // Classification already establishes the domain of the residual bounds.
     // Do not re-read codec metadata and query kind for every crossing value.
+    // The residuals are the block's packed slots (NumBlockInfo::
+    // slotComparable): FOR residuals, DICT codes, ALP scaled integers or
+    // FOR_PATCHED residuals.
     bool residualComparable = false;
+    // The block has exceptions (NumBlockInfo::patched), whose slots say
+    // nothing: their values are compared apart.
+    bool patched = false;
     // In-block ranks outside [checkBegin, checkEnd) cannot match; ranks in
     // [insideBegin, insideEnd) all match.
     uint16_t checkBegin = 0;
@@ -718,18 +724,21 @@ public:
     }
 
     if (!anyCrossing || isExactSet()) return plan;
-    auto block = reader.blockInfo(blockNum);
-    if (block.residualComparable()) {
-      auto bounds = NumColumnFormat::residualBounds(
-          block, envelope.lo, envelope.hi);
-      // No lattice point falls in the range, so nothing in the block matches.
-      if (bounds.lower > bounds.upper) {
+    // Every slotComparable kind decodes nondecreasingly in its slot, so the
+    // range maps to one slot interval; exceptions are checked apart. DELTA
+    // and sloped or wide FOR blocks decode and compare instead.
+    if (auto bounds = reader.slotBounds(blockNum, envelope.lo, envelope.hi)) {
+      bool patched = reader.blockInfo(blockNum).exceptions() != 0;
+      if (bounds->lower > bounds->upper) {
+        // No slot falls in the range, so only exceptions can match.
+        if (patched) return plan;
         assert(!anyInside);
         return BlockPlan();
       }
-      plan.residualLower = bounds.lower;
-      plan.residualWidth = bounds.upper - bounds.lower;
+      plan.residualLower = bounds->lower;
+      plan.residualWidth = bounds->upper - bounds->lower;
       plan.residualComparable = true;
+      plan.patched = patched;
     }
     return plan;
   }
@@ -751,11 +760,37 @@ public:
     uint32_t rawCount = 0;
     uint32_t residuals[FRAME];
     int64_t raw[FRAME];
+    // The residual frame's exceptions: bit i of patchBits marks rank
+    // residualStart + i, whose value is patches[i].
+    uint64_t patchBits[FRAME / 64];
+    int64_t patches[FRAME];
 
     // Once per frame, out of line: the group loops carry no codec dispatch.
     LUXIR_NOINLINE void decodeResiduals(int64_t rank) {
       residualStart = reader.decodeResidualSubBlock(rank, residuals,
                                                     residualCount);
+      memset(patchBits, 0, sizeof(patchBits));
+      reader.forEachException(residualStart, residualCount,
+                              [&](int64_t at, int64_t value) {
+        uint64_t i = (uint64_t)(at - residualStart);
+        patchBits[i / 64] |= 1ULL << (i % 64);
+        patches[i] = value;
+      });
+    }
+
+    // `bits` for the n values at rank with each exception's bit replaced by
+    // whether its value matches.
+    uint64_t patchMask(int64_t rank, uint32_t n, uint64_t bits,
+                       const NumericPredicateQuery& query) const {
+      uint64_t offset = (uint64_t)(rank - residualStart);
+      uint64_t word = patchBits[offset / 64] >> (offset % 64);
+      if (n < 64) word &= (1ULL << n) - 1;
+      for (; word != 0; word &= word - 1) {
+        uint32_t i = (uint32_t)std::countr_zero(word);
+        uint64_t bit = 1ULL << i;
+        bits = query.matchesValue(patches[offset + i]) ? bits | bit : bits & ~bit;
+      }
+      return bits;
     }
 
     LUXIR_NOINLINE void decodeRaw(int64_t rank) {
@@ -844,13 +879,15 @@ public:
         const uint32_t* values = residualsAt(rank);
         assert(rank + n <= residualStart + (int64_t)residualCount);
         if (n == 64) [[likely]] {
-          return residualMask64(values, plan.residualLower, plan.residualWidth);
-        }
+          bits = residualMask64(values, plan.residualLower, plan.residualWidth);
+        } else {
 #pragma GCC novector
-        for (uint32_t i = 0; i < n; i++) {
-          bits |= (uint64_t)((uint32_t)(values[i] - plan.residualLower)
-                             <= plan.residualWidth) << i;
+          for (uint32_t i = 0; i < n; i++) {
+            bits |= (uint64_t)((uint32_t)(values[i] - plan.residualLower)
+                               <= plan.residualWidth) << i;
+          }
         }
+        if (plan.patched) [[unlikely]] bits = patchMask(rank, n, bits, query);
         return bits;
       }
       const int64_t* values = rawAt(rank);
@@ -872,6 +909,16 @@ public:
         if (plan.residualComparable) {
           const uint32_t* values = residualsAt(rank);
           frameEnd = std::min<int64_t>(end, residualStart + (int64_t)residualCount);
+          if (plan.patched) [[unlikely]] {
+            for (int64_t r = rank; r < frameEnd; r++, values++) {
+              uint64_t i = (uint64_t)(r - residualStart);
+              bool match = (patchBits[i / 64] >> (i % 64)) & 1
+                  ? query.matchesValue(patches[i])
+                  : (uint32_t)(*values - plan.residualLower) <= plan.residualWidth;
+              if (match) return true;
+            }
+            continue;
+          }
 #pragma GCC novector
           for (int64_t r = rank; r < frameEnd; r++, values++) {
             if ((uint32_t)(*values - plan.residualLower) <= plan.residualWidth) {

@@ -217,15 +217,21 @@ NumColumnFormat::LeafMeta readNumericLeafMeta(std::span<const char> index, int64
 }
 
 const NumColumnFormat::LeafMeta* PostingsReader::openNumericLeafMeta(const DecodedFieldRecord& fieldInfo) {
+  if (fieldInfo.docsWithField != maxDoc()) return nullptr;
+  return openColumnLeafMeta(fieldInfo);
+}
+
+const NumColumnFormat::LeafMeta* PostingsReader::openColumnLeafMeta(const DecodedFieldRecord& fieldInfo) {
   const auto* number = fieldInfo.numberColumn();
-  if (!number || !FieldType::isNumericColumn(fieldInfo.type)
-      || fieldInfo.docsWithField != maxDoc() || fieldInfo.endValueRanks()) return nullptr;
-  return acquire(openedField(fieldInfo), [&] {
+  if (!number || !FieldType::isNumericColumn(fieldInfo.type) || fieldInfo.endValueRanks()) return nullptr;
+  return &acquire(openedField(fieldInfo), [&] {
     auto index = number->index();
-    auto metadata = readNumericLeafMeta(core().slice(index, ReadClass::METADATA), fieldInfo.numValues,
+    auto opened = std::make_unique<OpenedLeafMeta>();
+    opened->meta = readNumericLeafMeta(core().slice(index, ReadClass::METADATA), fieldInfo.numValues,
         segmentReadContext(core(), fieldInfo, index.location.filenum()));
-    return std::make_unique<NumColumnFormat::LeafMeta>(metadata);
-  }, [](const NumColumnFormat::LeafMeta& entry) { accountOpened(sizeof(entry)); });
+    opened->meta.derive(opened->derived);
+    return opened;
+  }, [](const OpenedLeafMeta& entry) { accountOpened(entry.bytes()); })->meta;
 }
 
 const StoredFieldsMetadata* PostingsReader::openStoredMetadata(const DecodedFieldRecord& fieldInfo) {
@@ -275,7 +281,7 @@ PostingsReader::FieldCacheStats PostingsReader::fieldCacheStats() const noexcept
     for (size_t j = 0; j < count; ++j) {
       auto& slot = page->slots()[j];
       if (opened) {
-        if (auto* entry = opened[j].load(std::memory_order_acquire)) addOpenedStats(stats, sizeof(*entry));
+        if (auto* entry = opened[j].load(std::memory_order_acquire)) addOpenedStats(stats, entry->bytes());
       }
       if (auto* entry = slot.load(std::memory_order_acquire)) {
         stats.entries++;

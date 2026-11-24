@@ -2464,7 +2464,9 @@ private:
           return field && field->record->endValueRanks();
         });
     auto valuesOut = postingsWriter.getOutputStream();
-    IntColWriter valuesWriter(*valuesOut, IntColWriter::writesValueSketch(type, hasEndValueRanks));
+    IntColWriter valuesWriter(*valuesOut,
+                              fieldColumnSketch(type, IntColWriter::writesValueSketch(type, hasEndValueRanks)),
+                              fieldColumnCodecs(type));
     PresenceWriter docsWriter(pool, postingsWriter, space.ordinal);
     OutputStreamPtr ranksOut;
     std::optional<MonoWriter> endRanks;

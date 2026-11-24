@@ -248,7 +248,9 @@ inline VersionRuns::VersionRuns(const char* file, size_t fileSize, size_t header
     size_t metaSize = sizeof(VersionBlockHeader) + (bh.step ? 0 : sizeof(NumBlockInfo));
     auto check = [&](const NumBlockInfo& info, bool monotonic) {
       uint8_t bits = info.bits();
-      if ((!info.forPacked() && bits != NumBlockInfo::RAW_BITS) || !info.gcd
+      // FOR only (forPacked or raw both test the kind): version columns
+      // never take the other block kinds.
+      if ((!info.forPacked() && !info.raw()) || !info.gcd
           || (monotonic && info.gcd != 1)) invalid();
       uint64_t payload = info.payloadOffset();
       uint64_t payloadBytes = info.forPacked() ? LinearPack::packedByteSize(view.size(), bits)

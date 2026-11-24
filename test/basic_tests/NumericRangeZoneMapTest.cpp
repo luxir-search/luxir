@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <span>
@@ -13,12 +14,14 @@
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/schema/ValCoerce.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/LuxirTest.h"
+#include "test/NumericCorpora.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
 
@@ -580,6 +583,139 @@ int64_t zoneVerifications(IndexReader& reader, std::string_view field,
 }
 
 } // namespace
+
+// Each block kind (NumBlockKind) through flush, a second segment and a
+// merge, single and multivalued. Range plans compare DICT codes, ALP
+// integers and FOR_PATCHED residuals against bounds mapped into their slot
+// domain, exceptions apart, and decode DELTA blocks; every collection path
+// agrees with the oracle, including ranges only exceptions satisfy.
+TEST_F(NumericRangeZoneMapTest, codecBlocksMatchAllCollectionPaths) {
+  constexpr int32_t PER_SEGMENT = 2 * IntColReader::BLOCK_SIZE + 200;
+  struct Field {
+    std::string_view corpus;
+    const char* name;
+    FieldType::Type type;
+    bool multi;
+  };
+  const Field fields[] = {{"prices", "price_d", FieldType::DOUBLE, false},
+                          {"signed_doubles", "amount_d", FieldType::DOUBLE, false},
+                          {"float_readings", "reading_f", FieldType::FLOAT, false},
+                          {"bursty_times", "time_i", FieldType::INT, false},
+                          {"status_codes", "status_i", FieldType::INT, false},
+                          {"outliers", "count_i", FieldType::INT, false},
+                          {"outliers", "counts_is", FieldType::INT, true}};
+  // Stored column values per field, per doc.
+  std::vector<std::vector<std::vector<int64_t>>> values(std::size(fields));
+  std::vector<NumBlockKind> kinds(std::size(fields));
+
+  TestIndex index;
+  auto addSegment = [&](uint64_t seed) {
+    Inverter& inverter = index.getInverter();
+    std::vector<std::vector<int64_t>> columns(std::size(fields));
+    for (size_t f = 0; f < std::size(fields); f++) {
+      int32_t n = fields[f].multi ? 2 * PER_SEGMENT : PER_SEGMENT;
+      for (auto& corpus : numericCorpora((size_t)n, seed)) {
+        if (corpus.name != fields[f].corpus) continue;
+        columns[f] = corpus.values;
+        kinds[f] = corpus.kind;
+        // Timestamps continue across segments, so the merge stays bursty.
+        if (corpus.name == "bursty_times" && !values[f].empty()) {
+          int64_t shift = values[f].back().back() + 1000 - columns[f].front();
+          for (auto& v : columns[f]) v += shift;
+        }
+      }
+    }
+    for (int32_t doc = 0; doc < PER_SEGMENT; doc++) {
+      inverter.startDoc();
+      for (size_t f = 0; f < std::size(fields); f++) {
+        auto& handler = inverter.getIndexHandler(fields[f].name);
+        std::vector<int64_t> stored;
+        for (int32_t i = 0; i < (fields[f].multi ? 2 : 1); i++) {
+          int64_t v = columns[f][(size_t)(fields[f].multi ? 2 * doc + i : doc)];
+          stored.push_back(v);
+          if (fields[f].multi) continue;
+          if (fields[f].type == FieldType::DOUBLE) {
+            handler.index(inverter, coerce::scalarVal(sortableInt64ToDouble(v)));
+          } else if (fields[f].type == FieldType::FLOAT) {
+            handler.index(inverter, coerce::scalarVal(sortableInt32ToFloat((int32_t)v)));
+          } else {
+            handler.index(inverter, v);
+          }
+        }
+        if (fields[f].multi) handler.index(inverter, std::span<const int64_t>(stored));
+        // Numeric sets hold a doc's values sorted and deduplicated.
+        std::sort(stored.begin(), stored.end());
+        stored.erase(std::unique(stored.begin(), stored.end()), stored.end());
+        values[f].push_back(stored);
+      }
+      inverter.finishDoc();
+    }
+    index.flush();
+  };
+
+  auto check = [&] {
+    index.initReader();
+    ASSERT_EQ(1u, index.reader->segments().size());
+    auto& segment = index.reader->segments()[0];
+    for (size_t f = 0; f < std::size(fields); f++) {
+      SCOPED_TRACE(fields[f].name);
+      const auto* info = segment.postingsReader().fieldInfo(fields[f].name);
+      ASSERT_NE(nullptr, info);
+      IntColReader column(segment.postingsReader(), *info);
+      std::vector<int64_t> flat;
+      for (const auto& doc : values[f]) flat.insert(flat.end(), doc.begin(), doc.end());
+      ASSERT_EQ((int64_t)flat.size(), column.numValues());
+      IntColReader::BulkValues bulk(column);
+      for (int64_t rank = 0; rank < column.numValues(); rank++) {
+        ASSERT_EQ(flat[(size_t)rank], bulk.valueAt(rank)) << "rank=" << rank;
+      }
+      // Every whole block takes the corpus's kind (a tail of a few hundred
+      // values may not: too few gaps or outliers to pay for it).
+      for (int64_t b = 0; b < column.numBlocks(); b++) {
+        if (column.valuesInBlock(b) < (int32_t)IntColReader::BLOCK_SIZE) continue;
+        EXPECT_EQ((int)kinds[f], (int)column.blockInfo(b).kind()) << "block=" << b;
+      }
+      std::vector<int64_t> sorted = flat;
+      std::sort(sorted.begin(), sorted.end());
+      size_t n = sorted.size();
+      std::vector<std::pair<int64_t, int64_t>> ranges = {
+          {sorted[n / 3], sorted[n / 3 + n / 50]},
+          {sorted[n / 2], sorted[n / 2]},
+          {sorted[0], sorted[n / 10]},
+          {sorted[n - n / 7], sorted[n - 1]},
+          {sorted[n - 1], sorted[n - 1]}};
+      // Ranges only exceptions satisfy: the outliers, NaN, the infinities,
+      // -0.0 and the irrational values.
+      if (std::string_view(fields[f].name).starts_with("count")) {
+        ranges.push_back({(int64_t)1 << 40, (int64_t)1 << 40});
+        ranges.push_back({1000, (int64_t)1 << 40});
+      }
+      if (fields[f].name == std::string_view("amount_d")) {
+        double sqrts[] = {std::sqrt(7.0), std::sqrt(407.0)};
+        for (double v : sqrts) {
+          ranges.push_back({doubleToSortableInt64(v), doubleToSortableInt64(v)});
+        }
+        ranges.push_back({doubleToSortableInt64(-0.0), doubleToSortableInt64(-0.0)});
+        ranges.push_back({doubleToSortableInt64(std::numeric_limits<double>::infinity()),
+                          std::numeric_limits<int64_t>::max()});
+        ranges.push_back({std::numeric_limits<int64_t>::min(),
+                          doubleToSortableInt64(-std::numeric_limits<double>::infinity())});
+        ranges.push_back({doubleToSortableInt64(2.5), doubleToSortableInt64(2.75)});
+      }
+      for (auto [lo, hi] : ranges) {
+        SCOPED_TRACE(::testing::Message() << "[" << lo << ", " << hi << "]");
+        expectRun(runRange(*index.reader, fields[f].name, lo, hi),
+                  oracle(values[f], lo, hi));
+      }
+    }
+  };
+
+  addSegment(7);
+  check();
+  addSegment(8);
+  index.iw->mergeSegments();
+  check();
+}
 
 // Linear-fit blocks (sorted ramps, the shape time-sorted timestamps get)
 // resolve crossing blocks to rank runs; every bound placement and slope sign

@@ -112,7 +112,10 @@ inline WrittenNumberColumn writeNumberColumn(Inverter& inverter, LongStream& val
   auto out = postingsWriter.getOutputStream();
   bool numeric = FieldType::isNumericColumn(fieldInfo.header.type);
   bool writesPoints = (fieldInfo.header.flags & FieldType::INDEX_RANGE) != 0;
-  IntColWriter writer(*out, IntColWriter::writesValueSketch(fieldInfo.header.type, hasEndValueRanks));
+  IntColWriter writer(*out,
+                      fieldColumnSketch(fieldInfo.header.type,
+                                        IntColWriter::writesValueSketch(fieldInfo.header.type, hasEndValueRanks)),
+                      fieldColumnCodecs(fieldInfo.header.type));
   auto writeAndFold = [&](auto& bounds, auto fold) {
     values.visitValues(inverter.pool, [&](int64_t value) {
       writer.addInt64(value);

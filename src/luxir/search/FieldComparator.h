@@ -89,7 +89,8 @@ public:
     }
 
     // The leaf at `rank` ascending by (leafBestKey, leaf), with that bound:
-    // the column persists both directions' orders, and descending zone.max
+    // the reader derives both directions' orders from the leaf zones on
+    // load (LeafMeta::derive), and descending zone.max
     // with ties by leaf is ascending (~max, leaf).
     RankedLeaf boundOrderLeaf(int64_t rank) const {
       int64_t leaf = leafAt(rank);
@@ -101,7 +102,7 @@ public:
     // kTrendLeaves worst, over the most it could be. Near 1 for keys that
     // improve with doc order sorted newest first (time-ordered keys), near
     // -1 sorted oldest first, and 0 +- 0.08 for keys in random order. Both
-    // ends of the persisted order are contiguous: a few cache lines.
+    // ends of the derived order are contiguous: a few cache lines.
     static constexpr int64_t kTrendLeaves = 32;
     double docOrderTrend() const {
       int64_t n = leafCount();

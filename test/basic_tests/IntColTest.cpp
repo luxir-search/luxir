@@ -6,22 +6,41 @@
 #include "luxir/reader/PostingsReader.h"
 #include "gtest/gtest.h"
 #include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
 #include "test/LuxirTest.h"
+#include "test/QueryBuild.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
+#include <format>
+#include <map>
 #include <numeric>
+#include <optional>
+#include <random>
 #include <vector>
 
 #include "luxir/index/IntColWriter.h"
+#include "test/NumericCorpora.h"
 
 using namespace luxir;
 using namespace luxir::test;
 
-// The persisted leaf visit orders against an independent oracle: a stable
+// A reader's leaf metadata with the parts the field cache derives on load:
+// the visit orders and a sketch left to the reader.
+struct DerivedLeafMeta {
+  NumColumnFormat::LeafDerived storage;
+  NumColumnFormat::LeafMeta meta;
+
+  explicit DerivedLeafMeta(const IntColReader& reader) : meta(reader.leafMeta()) {
+    meta.derive(storage);
+  }
+};
+
+// The leaf visit orders derived on load against an independent oracle: a stable
 // sort of leaf ids by zone.min ascending, and by zone.max descending, so ties
 // keep ascending leaf order.
 static void expectLeafVisitOrders(const IntColReader& reader) {
-  const auto& meta = reader.leafMeta();
+  DerivedLeafMeta derived(reader);
+  const auto& meta = derived.meta;
   int64_t leaves = meta.numLeafZones();
   for (bool byMax : {false, true}) {
     std::vector<int64_t> oracle((size_t)leaves);
@@ -38,6 +57,18 @@ static void expectLeafVisitOrders(const IntColReader& reader) {
                                             << " rank=" << rank;
     }
   }
+  // Range summaries agree with and without the derived orders (a scan).
+  for (int64_t leaf = 0; leaf < leaves; leaf += std::max<int64_t>(1, leaves / 7)) {
+    NumBlockZone zone = meta.leafZone(leaf);
+    for (auto [lo, hi] : {std::pair{zone.min, zone.max}, std::pair{zone.max, zone.max > INT64_MAX - 1000 ? INT64_MAX : zone.max + 1000},
+                          std::pair{std::numeric_limits<int64_t>::min(), zone.min}}) {
+      auto ordered = meta.summarizeRange(lo, hi);
+      auto scanned = reader.leafMeta().summarizeRange(lo, hi);
+      EXPECT_EQ(ordered.outside, scanned.outside);
+      EXPECT_EQ(ordered.insideLower, scanned.insideLower);
+      EXPECT_EQ(ordered.insideUpper, scanned.insideUpper);
+    }
+  }
 }
 
 // The persisted value sketch against the sorted values: ranks strictly
@@ -51,7 +82,8 @@ static std::vector<int64_t> expectValueSketch(
   std::vector<int64_t> sorted(values.begin(), values.end());
   std::sort(sorted.begin(), sorted.end());
   int64_t n = (int64_t)sorted.size();
-  auto sketch = reader.leafMeta().valueSketch();
+  DerivedLeafMeta derived(reader);
+  auto sketch = derived.meta.valueSketch();
   EXPECT_EQ(n, sketch.values());
   if (n == 0) {
     EXPECT_TRUE(sketch.empty());
@@ -59,6 +91,17 @@ static std::vector<int64_t> expectValueSketch(
   }
   EXPECT_EQ(0, sketch.point(0).rank);
   EXPECT_EQ(n - 1, sketch.point(sketch.size() - 1).rank);
+  EXPECT_EQ(sorted.front(), sketch.point(0).value);
+  EXPECT_EQ(sorted.back(), sketch.point(sketch.size() - 1).value);
+  if (n < NumColumnFormat::SKETCH_MIN_VALUES) {
+    // Left to the reader, which derives it from the leaf zones: monotone
+    // with the exact extremes, no exact tails.
+    for (int64_t i = 1; i < sketch.size(); i++) {
+      EXPECT_LT(sketch.point(i - 1).rank, sketch.point(i).rank) << "i=" << i;
+      EXPECT_LE(sketch.point(i - 1).value, sketch.point(i).value) << "i=" << i;
+    }
+    return sorted;
+  }
   for (int64_t i = 0; i < sketch.size(); i++) {
     auto p = sketch.point(i);
     if (i > 0) {
@@ -419,7 +462,7 @@ TEST_F(IntColTest, linearPackFormatCorners) {
     auto file = dir.createFile("numeric");
     OutputStream out(file.get());
     out.writeStr("odd");
-    IntColWriter writer(out, true);
+    IntColWriter writer(out, NumColumnFormat::SketchMode::PERSIST);
     for (int64_t value : expected) writer.addInt64(value);
     auto data = writer.finish();
     out.close();
@@ -536,6 +579,325 @@ TEST_F(IntColTest, linearPackFormatCorners) {
   }
 }
 
+// One column of `values` written with `codecs`, read back through every read
+// path (sparse and bulk, point reads backwards off frame starts) with its
+// zones checked. Returns the column's bytes: payload, alignment and block
+// descriptors, the zones and the rest of the metadata excluded.
+struct CodecColumn {
+  RAMDir dir;
+  std::shared_ptr<InputFile> in;
+  std::optional<HeldRange> hold;
+  std::optional<InputStream> input;
+  std::optional<IntColReader> reader;
+  int64_t blockBytes = 0;
+
+  CodecColumn(std::span<const int64_t> values, NumColumnFormat::BlockCodecs codecs) {
+    auto out = dir.createFile("numeric");
+    OutputStream stream(out.get());
+    IntColWriter writer(stream, NumColumnFormat::SketchMode::NONE, codecs);
+    for (int64_t value : values) writer.addInt64(value);
+    auto data = writer.finish();
+    stream.close();
+    dir.finishFile(*out);
+    in = dir.openFile("numeric");
+    hold.emplace(in->acquire({0, in->size()}));
+    input.emplace(hold->stream());
+    reader.emplace(input->ptr(data.columnLoc),
+                   std::span(input->ptr(data.columnLoc + data.columnMetaOff), data.indexBytes),
+                   data.numValues);
+    int64_t blocks = reader->numBlocks();
+    blockBytes = data.columnMetaOff + blocks * (int64_t)sizeof(NumBlockInfo);
+  }
+
+  void expectValues(std::span<const int64_t> values) {
+    IntColReader::SparseValues sparse(*reader);
+    IntColReader::BulkValues bulk(*reader);
+    for (int64_t i = 0; i < (int64_t)values.size(); i++) {
+      ASSERT_EQ(sparse.valueAt(i), values[(size_t)i]) << "rank=" << i;
+      ASSERT_EQ(bulk.valueAt(i), values[(size_t)i]) << "rank=" << i;
+    }
+    // Point reads off frame starts, backwards (DELTA prefix sums).
+    IntColReader::SparseValues backwards(*reader);
+    for (int64_t i = (int64_t)values.size() - 1; i >= 0; i -= 37) {
+      ASSERT_EQ(backwards.valueAt(i), values[(size_t)i]) << "rank=" << i;
+    }
+    for (int64_t block = 0; block < reader->numBlocks(); block++) {
+      int64_t start = block * IntColReader::BLOCK_SIZE;
+      int64_t end = start + reader->valuesInBlock(block);
+      auto [minIt, maxIt] = std::minmax_element(values.begin() + start,
+                                                values.begin() + end);
+      EXPECT_EQ(reader->blockZone(block).min, *minIt);
+      EXPECT_EQ(reader->blockZone(block).max, *maxIt);
+    }
+  }
+
+  // The kinds of the column's blocks, or of its whole blocks only: a tail of
+  // a few hundred values may lack the gaps or outliers that pay for a kind.
+  std::vector<NumBlockKind> kinds(bool wholeOnly = false) const {
+    std::vector<NumBlockKind> kinds;
+    for (int64_t block = 0; block < reader->numBlocks(); block++) {
+      if (wholeOnly && reader->valuesInBlock(block) < (int32_t)IntColReader::BLOCK_SIZE) continue;
+      kinds.push_back(reader->blockInfo(block).kind());
+    }
+    return kinds;
+  }
+};
+
+static NumColumnFormat::BlockCodecs codecsFor(NumColumnFormat::ValueDomain domain) {
+  return {true, domain};
+}
+
+// Each block kind is chosen on the data shape it targets, only when it is
+// smaller than FOR, and decodes back to the stored values; with the codecs
+// off (internal columns) every block stays FOR. The last block is a partial
+// one, above the 128-value floor for the other kinds.
+TEST_F(IntColTest, codecBlockKinds) {
+  constexpr size_t N = 3 * IntColReader::BLOCK_SIZE + 300;
+  for (auto& corpus : numericCorpora(N)) {
+    SCOPED_TRACE(corpus.name);
+    CodecColumn on(corpus.values, codecsFor(corpus.domain));
+    on.expectValues(corpus.values);
+    for (NumBlockKind kind : on.kinds(true)) EXPECT_EQ((int)corpus.kind, (int)kind);
+    CodecColumn off(corpus.values, {});
+    off.expectValues(corpus.values);
+    for (NumBlockKind kind : off.kinds()) EXPECT_EQ((int)NumBlockKind::FOR, (int)kind);
+    EXPECT_LE(on.blockBytes, off.blockBytes);
+    // Sizes per corpus for the record (--gtest_output=xml).
+    RecordProperty(std::string(corpus.name), std::format(
+        "{:.2f} -> {:.2f} bits/value",
+        8.0 * (double)off.blockBytes / (double)N, 8.0 * (double)on.blockBytes / (double)N));
+  }
+
+  // The same bits as an INT column are never read as doubles.
+  auto doubles = numericCorpora(N)[0].values;
+  CodecColumn asInt(doubles, codecsFor(NumColumnFormat::ValueDomain::INT));
+  asInt.expectValues(doubles);
+  for (NumBlockKind kind : asInt.kinds()) {
+    EXPECT_NE((int)NumBlockKind::ALP_DOUBLE, (int)kind);
+  }
+
+  // Short columns keep the plain layout: the other kinds need a whole frame.
+  std::vector<int64_t> few(100, 404);
+  few[7] = 200;
+  CodecColumn small(few, codecsFor(NumColumnFormat::ValueDomain::INT));
+  small.expectValues(few);
+  EXPECT_EQ((int)NumBlockKind::FOR, (int)small.kinds()[0]);
+}
+
+// Kind edge cases: DELTA descending from INT64_MAX (negative deltas,
+// wrapping reconstruction), outliers at both ends of a FOR_PATCHED block,
+// a RAW-wide block narrowed by patching, exception-heavy ALP blocks, and
+// floats stored out of int32 range (never ALP-scaled).
+TEST_F(IntColTest, codecKindCorners) {
+  constexpr size_t N = 2 * IntColReader::BLOCK_SIZE + 129;
+  std::mt19937_64 gen(5);
+  std::vector<int64_t> values(N);
+  auto expectKind = [&](NumColumnFormat::ValueDomain domain, NumBlockKind kind) {
+    CodecColumn column(values, codecsFor(domain));
+    column.expectValues(values);
+    for (NumBlockKind k : column.kinds(true)) EXPECT_EQ((int)kind, (int)k);
+  };
+  using Domain = NumColumnFormat::ValueDomain;
+
+  int64_t t = std::numeric_limits<int64_t>::max();
+  for (auto& v : values) v = t -= (int64_t)(gen() % 16) + (gen() % 50 == 0 ? 100'000 : 0);
+  expectKind(Domain::INT, NumBlockKind::DELTA);
+
+  for (size_t i = 0; i < N; i++) {
+    values[i] = (int64_t)(gen() % 100);
+    if (i % 997 == 3) values[i] = std::numeric_limits<int64_t>::min() + (int64_t)i;
+    if (i % 991 == 5) values[i] = std::numeric_limits<int64_t>::max() - (int64_t)i;
+  }
+  values.back() = std::numeric_limits<int64_t>::min();  // the tail block patches too
+  expectKind(Domain::INT, NumBlockKind::FOR_PATCHED);
+  {
+    CodecColumn column(values, codecsFor(Domain::INT));
+    EXPECT_EQ((int)NumBlockKind::FOR_PATCHED, (int)column.kinds().back());
+  }
+
+  // Mostly irrational: ALP pays for its exceptions and loses to RAW FOR,
+  // or patches what it cannot scale.
+  for (size_t i = 0; i < N; i++) {
+    double v = i % 3 == 0 ? std::sqrt((double)i + 0.5) : (double)(gen() % 1000) / 4.0;
+    values[i] = doubleToSortableInt64(v);
+  }
+  {
+    CodecColumn column(values, codecsFor(Domain::DOUBLE));
+    column.expectValues(values);
+  }
+
+  // A FLOAT column holding patterns outside int32 decodes them exactly.
+  for (size_t i = 0; i < N; i++) {
+    values[i] = i % 500 == 1 ? (int64_t)1 << 40
+                             : (int64_t)floatToSortableInt32((float)(gen() % 1000) / 2.0f);
+  }
+  {
+    CodecColumn column(values, codecsFor(Domain::FLOAT));
+    column.expectValues(values);
+  }
+}
+
+// Range bounds mapped into each kind's slot domain (NumColumn::slotBounds)
+// against the decoded values: off its exceptions, a slot is inside the
+// interval exactly when its value is in [lo, hi].
+TEST_F(IntColTest, slotBoundsMatchDecodedValues) {
+  constexpr size_t N = IntColReader::BLOCK_SIZE + 700;
+  constexpr int64_t MIN = std::numeric_limits<int64_t>::min();
+  constexpr int64_t MAX = std::numeric_limits<int64_t>::max();
+  for (auto& corpus : numericCorpora(N, 11)) {
+    SCOPED_TRACE(corpus.name);
+    CodecColumn column(corpus.values, codecsFor(corpus.domain));
+    IntColReader& reader = *column.reader;
+    std::vector<int64_t> sorted = corpus.values;
+    std::sort(sorted.begin(), sorted.end());
+    std::vector<std::pair<int64_t, int64_t>> ranges = {
+        {MIN, MAX}, {MAX, MIN}, {sorted[N / 3], sorted[N / 3 + N / 50]},
+        {sorted[N / 2], sorted[N / 2]}, {sorted[N / 2] + 1, sorted[N / 2] + 1},
+        {MIN, sorted[N / 10]}, {sorted[N - N / 7], MAX}, {sorted[N - 1], MAX},
+        {MIN, sorted[0] - 1}};
+    for (int64_t block = 0; block < reader.numBlocks(); block++) {
+      int64_t start = block * IntColReader::BLOCK_SIZE;
+      const NumBlockInfo info = reader.blockInfo(block);
+      for (auto [lo, hi] : ranges) {
+        auto bounds = reader.slotBounds(block, lo, hi);
+        ASSERT_EQ(info.slotComparable(), bounds.has_value());
+        if (!bounds) continue;
+        std::vector<bool> exception((size_t)reader.valuesInBlock(block));
+        reader.forEachException(start, (uint32_t)exception.size(),
+                                [&](int64_t rank, int64_t value) {
+          exception[(size_t)(rank - start)] = true;
+          EXPECT_EQ(corpus.values[(size_t)rank], value);
+        });
+        for (int64_t rank = start; rank < start + (int64_t)exception.size();
+             rank += NumColumnFormat::BULK_SIZE) {
+          uint32_t slots[NumColumnFormat::BULK_SIZE];
+          uint32_t count;
+          ASSERT_EQ(rank, reader.decodeResidualSubBlock(rank, slots, count));
+          for (uint32_t i = 0; i < count; i++) {
+            if (exception[(size_t)(rank - start + i)]) continue;
+            int64_t value = corpus.values[(size_t)(rank + i)];
+            bool inside = bounds->lower <= slots[i] && slots[i] <= bounds->upper;
+            ASSERT_EQ(lo <= value && value <= hi, inside)
+                << "rank=" << rank + i << " lo=" << lo << " hi=" << hi;
+          }
+        }
+      }
+    }
+  }
+}
+
+// Field sorts and facets over columns whose blocks take the other kinds
+// (ALP, DELTA, DICT, FOR_PATCHED), across two segments and after merging
+// them, match an oracle over the indexed values.
+TEST_F(IntColTest, codecColumnsSortAndFacet) {
+  constexpr size_t N = 2 * IntColReader::BLOCK_SIZE + 500;
+  auto corpora = numericCorpora(N, 3);
+  auto corpus = [&](std::string_view name) -> const NumericCorpus& {
+    return *std::ranges::find(corpora, name, &NumericCorpus::name);
+  };
+  const auto& prices = corpus("prices").values;
+  const auto& times = corpus("bursty_times").values;
+  const auto& codes = corpus("status_codes").values;
+  const auto& counts = corpus("outliers").values;
+
+  CollectionHelper helper("codec_sort");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  for (size_t half : {0, 1}) {
+    std::vector<Doc> docs;
+    for (size_t i = half * N / 2; i < (half + 1) * N / 2; i++) {
+      docs.push_back(flatdoc("id_s", std::to_string(i),
+                             "price_d", sortableInt64ToDouble(prices[i]),
+                             "time_i", times[i], "status_i", codes[i],
+                             "count_i", counts[i]));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+
+  auto expectKind = [&](std::string_view field, NumBlockKind kind) {
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    for (auto& segment : reader->segments()) {
+      IntColReader column(segment.postingsReader(),
+                          *segment.postingsReader().fieldInfo(field));
+      EXPECT_EQ((int)kind, (int)column.blockInfo(0).kind()) << field;
+    }
+  };
+  auto check = [&] {
+    expectKind("price_d", NumBlockKind::ALP_DOUBLE);
+    expectKind("time_i", NumBlockKind::DELTA);
+    expectKind("status_i", NumBlockKind::DICT);
+    expectKind("count_i", NumBlockKind::FOR_PATCHED);
+    for (auto [field, stored] : std::array<std::pair<const char*, const std::vector<int64_t>*>, 4>{{
+             {"price_d", &prices}, {"time_i", &times}, {"status_i", &codes},
+             {"count_i", &counts}}}) {
+      std::vector<int64_t> sorted = *stored;
+      std::sort(sorted.begin(), sorted.end());
+      for (auto dir : {qb::ASC, qb::DESC}) {
+        SCOPED_TRACE(::testing::Message() << field << " desc=" << (dir == qb::DESC));
+        auto req = localReq(helper.getSearchEngine());
+        req->collection("codec_sort");
+        auto& cur = req->topDocs("q").allQuery().fields({"id_s"}).limit(25);
+        qb::sort(cur, field, dir);
+        req->execute();
+        ASSERT_OK(req);
+        std::vector<int64_t> got;
+        for (auto& doc : req->getDocs()) {
+          size_t id = std::stoul(std::get<std::string>(*find(doc, "id_s")));
+          got.push_back((*stored)[id]);
+        }
+        std::vector<int64_t> want(sorted.begin(), sorted.begin() + 25);
+        if (dir == qb::DESC) want.assign(sorted.rbegin(), sorted.rbegin() + 25);
+        EXPECT_EQ(want, got);
+      }
+    }
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("codec_sort").topDocs("q").allQuery().limit(0);
+    req->facet("codes", "status_i").limit(-1);
+    req->execute();
+    ASSERT_OK(req);
+    const auto* facet = req->responses[0]->proto.ops.at("codes")->facetResult();
+    ASSERT_NE(facet, nullptr);
+    auto& ids = std::get<luxir::api::ColInt>(facet->bucket_ids->kind);
+    std::map<int64_t, int64_t> want, got;
+    for (int64_t code : codes) want[code]++;
+    for (size_t b = 0; b < ids.v.size(); b++) got[ids.v[b]] = facet->counts[b];
+    EXPECT_EQ(want, got);
+  };
+
+  check();
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(helper.submit(merge).success);
+  ASSERT_EQ(1u, helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+  check();
+}
+
+// The least-squares fit catches what the endpoint fit misses: a noisy ramp
+// whose first value sits at the top of the noise and whose last at the
+// bottom tilts the endpoint line by the whole noise band.
+TEST_F(IntColTest, leastSquaresFitNarrowsEndpointFit) {
+  std::vector<uint64_t> values(NumColumnFormat::BLOCK_SIZE);
+  std::mt19937_64 gen(9);
+  for (size_t i = 0; i < values.size(); i++) values[i] = 1'000'000 + i * 10 + gen() % 1000;
+  values.front() = 1'000'000 + 999;
+  values.back() = 1'000'000 + (values.size() - 1) * 10;
+  std::span<const uint64_t> q(values);
+  auto endpoint = LinearFit::planLinearFit(q, NumColumnFormat::SLOPE_SHIFT);
+  auto leastSquares = LinearFit::planLeastSquaresFit(q, NumColumnFormat::SLOPE_SHIFT);
+  ASSERT_TRUE(endpoint && leastSquares);
+  EXPECT_LT(leastSquares->bits, endpoint->bits);
+  auto best = LinearFit::planBestLinearFit(q, NumColumnFormat::SLOPE_SHIFT);
+  EXPECT_EQ(leastSquares->bits, best->bits);
+  // Either fit reconstructs exactly.
+  for (const auto& plan : {*endpoint, *leastSquares}) {
+    for (size_t i = 0; i < values.size(); i++) {
+      uint64_t residual = LinearFit::residual(plan, i, values[i], NumColumnFormat::SLOPE_SHIFT);
+      EXPECT_LE(std::bit_width(residual), plan.bits);
+      EXPECT_EQ(values[i], (uint64_t)LinearFit::predict(plan.intercept, plan.scaledSlope, i,
+                                                        NumColumnFormat::SLOPE_SHIFT) + residual);
+    }
+  }
+}
+
 // Leaf visit orders over ten leaves spanning two blocks (the last one
 // partial), with tied mins and tied maxes: ascending by (min, leaf), and
 // descending by max with ties by ascending leaf.
@@ -571,8 +933,9 @@ TEST_F(IntColTest, leafVisitOrders) {
   ASSERT_EQ((int64_t)zones.size(), reader.numLeafZones());
   std::vector<int64_t> ascending;
   std::vector<int64_t> descending;
+  DerivedLeafMeta derived(reader);
   for (int64_t rank = 0; rank < reader.numLeafZones(); rank++) {
-    const auto& meta = reader.leafMeta();
+    const auto& meta = derived.meta;
     EXPECT_EQ(zones[(size_t)rank].min, meta.leafZone(rank).min);
     EXPECT_EQ(zones[(size_t)rank].max, meta.leafZone(rank).max);
     ascending.push_back(meta.leafByMinAscending(rank));
@@ -621,7 +984,7 @@ TEST_F(IntColTest, valueSketchEstimates) {
     RAMDir dir;
     auto file = dir.createFile("numeric");
     OutputStream out(file.get());
-    IntColWriter writer(out, true);
+    IntColWriter writer(out, NumColumnFormat::SketchMode::PERSIST);
     for (int64_t value : values) writer.addInt64(value);
     auto data = writer.finish();
     out.close();
@@ -634,6 +997,7 @@ TEST_F(IntColTest, valueSketchEstimates) {
                         data.numValues);
     auto sorted = expectValueSketch(reader, values);
     auto sketch = reader.leafMeta().valueSketch();
+    ASSERT_FALSE(sketch.empty());
     int64_t n = (int64_t)sorted.size();
     auto trueBelow = [&](int64_t v) {
       return (double)(std::lower_bound(sorted.begin(), sorted.end(), v)
@@ -662,9 +1026,15 @@ TEST_F(IntColTest, valueSketchEstimates) {
   };
   auto none = [](auto&, auto&) {};
 
-  // The tails cover every value: exact, ties at 7 and at the extremes.
+  // The tails cover every value: exact, ties at 7 and at the extremes. The
+  // sketcher itself: a column this small leaves its sketch to the reader.
   std::vector<int64_t> small = {9, 7, 3, 7, 7, -4, 12, 7, 3, 12};
-  check(small, [&](auto& sketch, auto&) {
+  {
+    NumColumnFormat::ValueSketcher sketcher;
+    sketcher.add(small);
+    auto points = sketcher.finish();
+    NumColumnFormat::ValueSketch sketch((const char*)points.data(),
+                                        (int64_t)points.size(), 10);
     EXPECT_EQ(10, sketch.size());
     EXPECT_EQ(3, sketch.countBelow(7));
     EXPECT_EQ(7, sketch.countBelow(8));
@@ -673,7 +1043,7 @@ TEST_F(IntColTest, valueSketchEstimates) {
     EXPECT_EQ(7, sketch.valueAt(6.5));
     EXPECT_EQ(9, sketch.valueAt(7));
     EXPECT_EQ(12, sketch.valueAt(9.9));
-  });
+  }
 
   constexpr int64_t kN = 300000;
   std::vector<int64_t> ramp(kN);
@@ -701,6 +1071,57 @@ TEST_F(IntColTest, valueSketchEstimates) {
   // value; the selection trims keep them exact.
   std::vector<int64_t> falling(ramp.rbegin(), ramp.rend());
   check(falling, none);
+}
+
+// A column under SKETCH_MIN_VALUES values persists no sketch; the reader
+// derives one from the leaf zones, each leaf's values spread over its zone.
+// Within a leaf of the truth on a sorted ramp, a reversed one and runs of
+// ties (every value of a leaf one value); monotone throughout.
+TEST_F(IntColTest, valueSketchFromLeafZones) {
+  constexpr int64_t kN = NumColumnFormat::SKETCH_MIN_VALUES - 1000;
+  constexpr int64_t kLeaf = NumColumnFormat::LEAF_ZONE_SIZE;
+  auto check = [&](std::vector<int64_t> values, double tolerance) {
+    RAMDir dir;
+    auto file = dir.createFile("numeric");
+    OutputStream out(file.get());
+    IntColWriter writer(out, NumColumnFormat::SketchMode::PERSIST);
+    for (int64_t value : values) writer.addInt64(value);
+    auto data = writer.finish();
+    out.close();
+    dir.finishFile(*file);
+    auto in = dir.openFile("numeric");
+    auto hold = in->acquire({0, in->size()});
+    InputStream input = hold.stream();
+    IntColReader reader(input.ptr(data.columnLoc),
+                        std::span(input.ptr(data.columnLoc + data.columnMetaOff), data.indexBytes),
+                        data.numValues);
+    auto sorted = expectValueSketch(reader, values);
+    // Without the field cache's derive(), no sketch.
+    EXPECT_TRUE(reader.leafMeta().valueSketch().empty());
+    DerivedLeafMeta derived(reader);
+    const auto& sketch = derived.meta.valueSketch();
+    double previous = -1;
+    for (int64_t v = sorted.front() - 1; v <= sorted.back() + 1;
+         v += std::max<int64_t>(1, (sorted.back() - sorted.front()) / 997)) {
+      double truth = (double)(std::lower_bound(sorted.begin(), sorted.end(), v)
+                              - sorted.begin());
+      double below = sketch.countBelow(v);
+      EXPECT_NEAR(truth, below, tolerance) << "v=" << v;
+      EXPECT_GE(below, previous);
+      previous = below;
+    }
+  };
+  std::vector<int64_t> ramp(kN);
+  std::iota(ramp.begin(), ramp.end(), -5000);
+  check(ramp, 2);
+  check(std::vector<int64_t>(ramp.rbegin(), ramp.rend()), 2);
+  std::vector<int64_t> runs(kN);
+  for (int64_t i = 0; i < kN; i++) runs[(size_t)i] = i / kLeaf * 10;
+  check(runs, kLeaf);
+  // Booleans: every leaf spans both values.
+  std::vector<int64_t> flags(kN);
+  for (int64_t i = 0; i < kN; i++) flags[(size_t)i] = (i * 7) % 3 == 0;
+  check(flags, (double)kN);
 }
 
 // Only the columns field-sort planning reads persist a value sketch: a

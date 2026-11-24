@@ -115,6 +115,15 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - **SIMD codecs** for postings and numeric data (FastPFOR-based bit-packing,
   StreamVByte), roaring-style two-level bitsets for document sets, and BM25
   hot loops written to auto-vectorize.
+- **Numeric column compression:** Each 4096-value block of a numeric
+  column picks the smallest of frame-of-reference with a linear fit,
+  frame-of-reference with patched outliers, frame deltas (bursty
+  timestamps), a per-block dictionary (status codes) and, for float and
+  double fields, ALP decimal scaling (prices stored as doubles pack like
+  the integers they came from). Every encoding is lossless, and range
+  filters compare packed values without decoding them in constant FOR,
+  patched FOR, dictionary and ALP blocks of up to 32 bits (delta, sloped
+  and wider blocks decode and compare).
 - **Segment pruning.** Field presence and bounds let root weights skip segments
   where their query cannot match. When every segment excludes a root and its
   context needs no whole-index preparation, planning skips construction of

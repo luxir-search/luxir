@@ -36,22 +36,27 @@ private:
   NumColumnFormat::ValueSketcher sketcher;
   std::vector<int64_t> values;
   std::vector<uint64_t> quotients;
+  NumBlockPlanner::Payload payload;
+  NumColumnFormat::BlockCodecs codecs;
   bool useGcd = true;
   bool zonesEnabled = true;
-  bool sketchEnabled = false;
+  NumColumnFormat::SketchMode sketchMode = NumColumnFormat::SketchMode::NONE;
 
   void addBlock(std::span<const int64_t> block) {
     NumColumnFormat::BlockPlan plan =
         NumColumnFormat::planBlock(block, quotients, useGcd, zonesEnabled);
+    if (codecs.enabled) {
+      NumBlockPlanner::plan(block, plan, codecs.domain, payload);
+    }
     overallMin = std::min(overallMin, plan.zone.min);
     overallMax = std::max(overallMax, plan.zone.max);
 
-    NumBlockCodec::write(out, colStart, block, plan, quotients);
+    NumBlockCodec::write(out, colStart, block, plan, quotients, &payload);
     blockInfo.push_back(plan.info);
     blockZones.push_back(plan.zone);
     leafZones.insert(leafZones.end(), plan.leafZones,
                      plan.leafZones + plan.leafCount);
-    if (sketchEnabled) sketcher.add(block);
+    if (sketchMode == NumColumnFormat::SketchMode::PERSIST) sketcher.add(block);
   }
 
 public:
@@ -60,17 +65,25 @@ public:
   // writeZones == false declares at construction that finish() will not
   // persist zones, so planning skips the per-leaf extrema pass and nothing
   // accumulates (monotonic sidecars are the large writers on this path).
-  // writeSketch persists a value sketch with the zones; it is for the
-  // columns field-sort planning reads (FieldType::isNumericColumn, single
-  // valued). Every other zone-bearing column (geo points, multi-valued
-  // columns, a query-time OrdMap's internal columns) writes an empty one
-  // and skips the sketcher: two tail-buffer passes per value and up to
-  // 512 KB while writing.
+  // `sketch` keeps a value sketch with the zones; it is for the columns
+  // field-sort planning reads (FieldType::isNumericColumn, single valued).
+  // PERSIST writes one for a column of at least SKETCH_MIN_VALUES values and
+  // otherwise leaves it to the reader, as FROM_ZONES always does (BOOLEAN
+  // columns). Every other zone-bearing column (geo points, multi-valued
+  // columns, a query-time OrdMap's internal columns) has none and skips the
+  // sketcher: two tail-buffer passes per value and up to 512 KB while
+  // writing.
+  // `codecs` lets blocks take the kinds other than FOR (NumBlockPlanner):
+  // field value columns enable it, and only with useGcd, since monotonic
+  // columns are read through NumColumnT<false>, which decodes FOR only.
   explicit NumColumnWriter(OutputStream& out, bool useGcd = true,
-                           bool writeZones = true, bool writeSketch = false)
-      : out(out), colStart(out.size()), useGcd(useGcd),
-        zonesEnabled(writeZones), sketchEnabled(writeSketch) {
-    assert(!writeSketch || writeZones);
+                           bool writeZones = true,
+                           NumColumnFormat::SketchMode sketch = NumColumnFormat::SketchMode::NONE,
+                           NumColumnFormat::BlockCodecs codecs = {})
+      : out(out), colStart(out.size()), codecs(codecs), useGcd(useGcd),
+        zonesEnabled(writeZones), sketchMode(sketch) {
+    assert(sketch == NumColumnFormat::SketchMode::NONE || writeZones);
+    assert(!codecs.enabled || useGcd);
     values.reserve(NumColumnFormat::BLOCK_SIZE);
     quotients.reserve(NumColumnFormat::BLOCK_SIZE);
   }
@@ -106,27 +119,25 @@ public:
         out.write(blockZones.data(), blockZones.size() * sizeof(NumBlockZone));
       }
       // Leaf zones directly follow the block zones (both 16-byte entries, so
-      // alignment is preserved), then the two leaf visit orders as uint32
-      // leaf ids (NumColumnFormat::leafVisitOrder): by min ascending, then by
-      // max descending, then the value sketch (NumColumnFormat::
-      // ValueSketcher) as a uint32 count (0 for a column written without
-      // one) and that many (rank, value) int64 pairs. Readers locate all of
-      // them from the block count and ceil(numValues / LEAF_ZONE_SIZE).
+      // alignment is preserved), then the value sketch (NumColumnFormat::
+      // ValueSketcher) as a uint32 count (0 for a column without one,
+      // SKETCH_FROM_ZONES for one left to the reader) and that many (rank,
+      // value) int64 pairs. Readers locate them from the block count and
+      // ceil(numValues / LEAF_ZONE_SIZE). The leaf visit orders are derived
+      // from the zones on load (NumColumnFormat::LeafMeta::derive).
       if (!leafZones.empty()) {
         assert((int64_t)leafZones.size()
                == (nAdded + NumColumnFormat::LEAF_ZONE_SIZE - 1)
                    / NumColumnFormat::LEAF_ZONE_SIZE);
         out.write(leafZones.data(), leafZones.size() * sizeof(NumBlockZone));
-        std::vector<uint32_t> order(leafZones.size());
-        for (bool byMaxDescending : {false, true}) {
-          NumColumnFormat::leafVisitOrder(leafZones, byMaxDescending, order);
-          out.write(order.data(), order.size() * sizeof(uint32_t));
-        }
+        using SketchMode = NumColumnFormat::SketchMode;
+        bool persist = sketchMode == SketchMode::PERSIST
+            && nAdded >= NumColumnFormat::SKETCH_MIN_VALUES;
         std::vector<NumColumnFormat::SketchPoint> sketch;
-        if (sketchEnabled) sketch = sketcher.finish();
-        assert(sketch.empty() != sketchEnabled
-               && (int64_t)sketch.size() <= nAdded);
-        uint32_t sketchCount = (uint32_t)sketch.size();
+        if (persist) sketch = sketcher.finish();
+        assert(sketch.empty() != persist && (int64_t)sketch.size() <= nAdded);
+        uint32_t sketchCount = sketchMode == SketchMode::NONE ? 0
+            : persist ? (uint32_t)sketch.size() : NumColumnFormat::SKETCH_FROM_ZONES;
         out.write(&sketchCount, sizeof(sketchCount));
         out.write(sketch.data(),
                   sketch.size() * sizeof(NumColumnFormat::SketchPoint));

@@ -83,6 +83,22 @@ locations, browse `src/luxir/<area>/`.
      store an order-preserving encoded int64. End-value ranks in the record
      describe the column layout. A singleton column can omit them even when
      the schema permits multiple values. Interval endpoints always carry ranks.
+     Each 4096-value block of a field value column takes the smallest of
+     its kinds (`NumBlockKind` in `codec/NumColumnFormat.h`, chosen by
+     `codec/NumBlockPlanner.h`): FOR (min + gcd + endpoint or least-squares
+     linear fit, or raw), FOR_PATCHED (FOR with a few outliers patched),
+     DELTA (FOR-packed frame anchors + packed deltas), DICT (sorted
+     per-block dictionary + codes) and, for FLOAT/DOUBLE, ALP decimal
+     scaling with patched exceptions. All decode to the same int64s;
+     internal point-read columns (monotonic sidecars, OrdMap columns) stay
+     FOR. Range queries compare FOR residuals, DICT codes, ALP integers and
+     FOR_PATCHED residuals against bounds mapped into the block's slot
+     domain (`NumBlockInfo::slotComparable`), exceptions apart. After the
+     block zones the column keeps 512-value leaf zones and, for sortable
+     single-valued columns of at least 64k values, a value sketch; the
+     leaf visit orders and the sketch of smaller or BOOLEAN columns are
+     derived from the leaf zones on load (`NumColumnFormat::LeafMeta`,
+     cached per field by `PostingsReader::Field`).
    - `PointsReader` reads the optional 1-D sorted-leaf points index of a
      `RANGE`-indexed numeric field (value-sorted leaves + fence directory;
      exact ordinal counts). `BasicBKDReader<PointTraits>` shares 2-D tree

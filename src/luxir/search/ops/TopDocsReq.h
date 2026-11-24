@@ -2218,7 +2218,7 @@ public:
               // Bound-order visits reset sparse key readers on backward reads.
               // Exact-domain route: when the whole result set is already
               // materialized (BITSET or ARRAY), no scorer needs to run - the
-              // driver visits leaves in the column's persisted bound order,
+              // driver visits leaves in the column's derived bound order,
               // terminating on proof, sweeps the domain's leaves in doc order,
               // or scans every domain doc, whichever costs least
               // (ExactDomainSortCosts). The domain sources: a resident whole

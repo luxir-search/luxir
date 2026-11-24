@@ -4110,7 +4110,9 @@ void SortCollectorTest::rangeOnSortFieldClipsBoundOrder() {
 // -1 ascending) from keys in random order (near 0).
 TEST_F(SortCollectorTest, segmentKeysEstimateKeysWithinEnvelopes) {
   CollectionHelper helper;
-  constexpr int32_t kDocs = 96 * 512 + 100;
+  // Enough values to persist the sketch (SKETCH_MIN_VALUES).
+  constexpr int32_t kDocs = 130 * 512 + 100;
+  static_assert(kDocs >= NumColumnFormat::SKETCH_MIN_VALUES);
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < kDocs; doc++) {
     docs.push_back(flatdoc(
