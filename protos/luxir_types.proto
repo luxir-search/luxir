@@ -2219,6 +2219,9 @@ message IndexStats {
   // catch-up, deduplicated across owners. Included in the node indexing
   // reservation.
   uint64 retained_delete_bytes = 19;
+  // Writer only: merges started to reclaim the deletes of segments the merge
+  // policy no longer merges (MergePolicyDef.deletes_pct_allowed).
+  uint64 reclaim_merges = 20;
 }
 
 // Ids and generations that appear in filenames are reported in their
@@ -2246,6 +2249,9 @@ message SegmentStats {
   repeated AuxStats overlays = 13;
   uint64 bytes = 14;
   repeated RowSpaceStats spaces = 15; // non-root spaces; bytes already included in the segment
+  // Over half of a merge cap (MergePolicyDef): background merges no longer
+  // select it; deletes past deletes_pct_allowed rewrite it.
+  bool terminal = 16;
 }
 
 message RowSpaceStats {
@@ -2804,12 +2810,29 @@ message SchemaDef {
   MergePolicyDef merge_policy = 6;
 }
 
-// A merge policy selection (SchemaDef.merge_policy).
+// A merge policy selection (SchemaDef.merge_policy) and the size limits the
+// collection's merges respect under any policy.
 message MergePolicyDef {
-  string name = 1;
+  string name = 1; // empty selects "tiered"
   // Typed params, read by the policy's maker. "tiered" takes merge_factor:
   // the number of same-level segments that merge into one (>= 2).
   map<string, Val> params = 2;
+  // Live bytes a background merge may produce (0 = unlimited). A segment over
+  // half of either cap takes no further part in tiered merges. Absent: 1 GiB
+  // on a remote directory, else 32 GiB when the schema has a vector field,
+  // else 5 GiB. Bytes are the segment's own data files prorated by its live
+  // docs; shared stored source files do not count. For multi-TB collections,
+  // raise it to about the collection's live bytes / 128 (a power of two,
+  // 5 to 64 GiB) to keep the segment count near a hundred.
+  optional uint64 max_merged_segment_bytes = 3;
+  // Live docs a background merge may produce (0 = unlimited, at most
+  // 2147483647). Absent: 10M on a remote directory, else 8M with a vector
+  // field, else 50M.
+  optional uint64 max_merged_segment_docs = 4;
+  // A segment no longer merged by the policy is rewritten once more than this
+  // percent of its docs are deleted (1 to 100; 100 never rewrites). Absent:
+  // 20. Not applied on a remote directory yet.
+  optional uint32 deletes_pct_allowed = 5;
 }
 
 message SchemaRequest {

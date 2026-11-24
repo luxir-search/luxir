@@ -4153,14 +4153,16 @@ TEST_F(IndexWriterTest, rootLevelSequenceAndMergeSizeArithmetic) {
       {0, 0}, {1, 0}, {9, 0}, {10, 1}, {99, 1}, {100, 2}, {999, 2}, {1000, 3}, {INT32_MAX, 9}};
   for (auto [rows, level] : sequence) {
     SegInfo segment(1, 1, rows);
-    EXPECT_EQ(level, policy.level(MergeSegment{.maxDoc = segment.maxDoc, .rows = segment.mergeRows}));
+    EXPECT_EQ(level, policy.level(MergeSegment{.maxDoc = segment.maxDoc, .liveDocs = segment.liveDocs,
+                                                .rows = segment.mergeRows}));
     EXPECT_EQ(rows, segment.estimatedLiveMergeRows());
   }
   SegInfo nested(1, 1, PostingsReader::MAX_SEGMENT_DOCS / 2);
   nested.mergeRows = PostingsReader::MAX_SEGMENT_DOCS;
   nested.liveDocs = nested.maxDoc - 1;
   EXPECT_EQ(PostingsReader::MAX_SEGMENT_DOCS - 3, nested.estimatedLiveMergeRows());
-  EXPECT_EQ(9, policy.level(MergeSegment{.maxDoc = nested.maxDoc, .rows = nested.mergeRows}));
+  EXPECT_EQ(9, policy.level(MergeSegment{.maxDoc = nested.maxDoc, .liveDocs = nested.liveDocs,
+                                          .rows = nested.mergeRows}));
 }
 
 TEST_F(IndexWriterTest, failedCommitDoesNotPinMergedAwaySegments) {

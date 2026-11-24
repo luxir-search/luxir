@@ -116,6 +116,17 @@ public:
       : segId(segId), creatorEpoch(creatorEpoch), initialLiveEpoch(creatorEpoch), liveEpoch(creatorEpoch),
         maxDoc(nDocs), liveDocs(nDocs), mergeRows(nDocs) {}
 
+    // The data files a merge rewrites: the base files, not the live docs file.
+    uint64_t mergeBytes() const {
+      uint64_t bytes = 0;
+      for (const auto& file : baseFiles) bytes += file.size;
+      return bytes;
+    }
+    // The live share of mergeBytes: what a merge copies.
+    uint64_t liveMergeBytes() const {
+      return maxDoc > 0 ? (uint64_t)((double)mergeBytes() * liveDocs / maxDoc) : 0;
+    }
+
     // Forced selection estimates child survival from the live root fraction.
     int64_t estimatedLiveMergeRows() const {
       if (mergeRows == maxDoc) return liveDocs;
@@ -174,6 +185,7 @@ public:
   struct SegmentStats : ReaderManager::SegmentStats {
     int32_t mergeLevel = 0;
     bool merging = false;
+    bool terminal = false;  // over half of a merge cap (MergeLimits::terminal)
   };
   struct DeletePassStats {
     uint64_t deletePassCount = 0, deletePassNanos = 0, deletePassMaxNanos = 0;
@@ -196,6 +208,7 @@ public:
     uint64_t liveDocsBytesWritten = 0;
     uint64_t pinningInverterFlushes = 0, deleteOnlyKneeFlushes = 0;
     uint64_t deleteOnlyFlushCap = 0;
+    uint64_t reclaimMerges = 0;
   };
 
 
@@ -525,6 +538,11 @@ public:
   // Zero derives the ceiling from this merge's size-scaled stream budget.
   // Tests and constrained deployments may set an explicit 2..64 ceiling.
   int32_t termPartitionMaxRanges = MergeCostModel::DERIVED_TERM_RANGES;
+  // A natural merge admits sources only while its most expensive field's
+  // estimated working set (SegmentMerger::estimateFieldCost) stays within
+  // this; 0 uses the whole indexing RAM budget, and an uncapped budget leaves
+  // it unlimited. A client force merge is warned about, not trimmed.
+  int64_t maxMergeWorkingSetBytes = 0;
   // Replay merges whose term ord maps reach this many bytes write them to
   // node-local scratch files (ScratchFile) and map them, rather than holding
   // every source's map on the heap. Debug builds spill every replay merge.
@@ -718,19 +736,38 @@ private:
   void completeForceMerge(MergeMessage& msg);
   void _resumePolicyMergesLocked();
 
-  // The policy in force: built from the published schema's merge_policy and
-  // mergeFactor, rebuilt when either changes. Protected by indexMutex.
+  // The policy in force and the collection's merge limits: built from the
+  // published schema (its merge_policy and whether it has a vector field), the
+  // directory's capabilities and mergeFactor, rebuilt when the schema or
+  // mergeFactor changes. Protected by indexMutex.
   struct ActiveMergePolicy {
-    std::shared_ptr<const MergePolicySpec> spec;
+    std::shared_ptr<const Schema> schema;
     int32_t nodeMergeFactor = 0;
+    MergeLimits limits;
     std::unique_ptr<MergePolicy> policy;
   } activeMergePolicy;
+  // Delete-reclaim merges started (Stats::reclaimMerges), and sources of a
+  // reclaim merge that failed, which no reclaim selects again. Protected by
+  // indexMutex.
+  uint64_t reclaimMerges = 0;
+  boost::unordered_flat_set<uint64_t> reclaimFailedSegIds;
   // Answers MergeSegmentSummary from the root row space of the segment's core.
   class PolicySegmentSummary;
   // Caller must hold indexMutex. Never throws: a policy that cannot be built
   // from the schema (a plugin's maker failing at reopen) falls back to the
   // default policy.
   MergePolicy& _mergePolicyLocked();
+  // The limits of the policy in force (see above). Caller must hold indexMutex.
+  const MergeLimits& _mergeLimitsLocked() {
+    _mergePolicyLocked();
+    return activeMergePolicy.limits;
+  }
+  // A delete-reclaim merge, when no policy merge is due: the terminal segment
+  // with the most deleted bytes past limits.deletesPctAllowed, plus
+  // segId-adjacent such segments while the output fits the caps. Other
+  // segments drop their deletes in policy merges. Empty on a REMOTE directory.
+  // Caller must hold indexMutex.
+  std::vector<SegInfo*> _selectReclaimMergeLocked();
   // Asks the policy over the live segments (segId order) and maps its merge
   // back to segments that can merge (live, not empty, not merging): the first
   // spec naming `triggerSegId`, or the first spec when that is 0. A flush

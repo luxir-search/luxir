@@ -167,6 +167,10 @@ locations, browse `src/luxir/<area>/`.
      `TieredMergePolicy` ("tiered") is the default; `MergePolicyRegistry` holds the
      named makers plugins extend, and the schema's `merge_policy` selects one per
      collection. Scheduling, admission and concurrency stay in `IndexWriter`.
+     `MergeLimits` holds the collection's merged-segment byte and doc caps and
+     `deletes_pct_allowed`, resolved by `resolveMergeLimits` from the schema's
+     `merge_policy` (defaults depend on remote storage and vector fields); the
+     writer enforces the caps at admission and runs delete-reclaim merges.
    - `LiveDocsWriter`: one immutable file per delete generation (indexing errors,
      applied deletes, merge live docs diffs): a DENSE live bitmap, mapped in place
      by `LiveDocs::create`, or with few deletes a SPARSE list of deleted doc ids,

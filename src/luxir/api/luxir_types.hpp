@@ -451,6 +451,7 @@ struct SegmentStats {
   uint32_t merge_level = 0;
   bool committed = false;
   bool merging = false;
+  bool terminal = false;
 };
 struct IndexStats {
   StatsTotals totals;
@@ -469,6 +470,7 @@ struct IndexStats {
   uint64_t inverters_flushing = 0;
   uint64_t commits = 0;
   uint64_t retained_delete_bytes = 0;
+  uint64_t reclaim_merges = 0;
   std::span<const AuxStats> aux_indexes;
   QueryCacheStats query_cache;
   std::span<const SegmentStats> segments;
@@ -908,6 +910,9 @@ struct StoredResourceDef {
 struct MergePolicyDef {
   std::string_view name;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> params;
+  std::optional<uint64_t> max_merged_segment_bytes;
+  std::optional<uint64_t> max_merged_segment_docs;
+  std::optional<uint32_t> deletes_pct_allowed;
 };
 struct SchemaDef {                                                // needs StoredResourceDef, MergePolicyDef
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;

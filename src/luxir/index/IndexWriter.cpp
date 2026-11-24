@@ -676,18 +676,26 @@ public:
 
 namespace {
 
-MergeSegment mergeSegmentOf(const SegInfo& seg, const MergeSegmentSummary& summary) {
+MergeSegment mergeSegmentOf(const SegInfo& seg, const MergeSegmentSummary& summary, const MergeLimits& limits) {
   MergeSegment out;
   out.segId = seg.segId;
   out.maxDoc = seg.maxDoc;
   out.liveDocs = seg.liveDocs;
   out.rows = seg.mergeRows;
-  for (const auto& file : seg.baseFiles) out.bytes += file.size;
+  out.bytes = seg.mergeBytes();
   out.minVersion = seg.minVersion;
   out.maxVersion = seg.maxVersion;
   out.firstCommitTime = seg.firstCommitTime;
+  out.terminal = limits.terminal(out.liveBytes(), out.liveDocs);
   out.summary = &summary;
   return out;
+}
+
+bool hasVectorField(const Schema* schema) {
+  if (!schema) return false;
+  return std::ranges::any_of(schema->fieldTypeMap, [](const auto& entry) {
+    return entry.second && entry.second->type() == FieldType::VECTOR;
+  });
 }
 
 class PolicyMergeMessage : public MergeMessage {
@@ -708,21 +716,26 @@ void IndexWriter::setMergeFactor(int32_t factor) {
 
 MergePolicy& IndexWriter::_mergePolicyLocked() {
   auto snapshot = lastSnapshot.load();
-  std::shared_ptr<const MergePolicySpec> spec = snapshot && snapshot->schema ? snapshot->schema->mergePolicy : nullptr;
+  std::shared_ptr<const Schema> schema = snapshot ? snapshot->schema : nullptr;
   auto& active = activeMergePolicy;
-  if (!active.policy || active.spec != spec || active.nodeMergeFactor != mergeFactor) {
+  if (!active.policy || active.schema != schema || active.nodeMergeFactor != mergeFactor) {
+    std::shared_ptr<const MergePolicySpec> spec = schema ? schema->mergePolicy : nullptr;
+    MergeLimits limits = resolveMergeLimits(spec ? &spec->def : nullptr,
+                                            (dir.capabilities() & Directory::REMOTE) != 0,
+                                            hasVectorField(schema.get()));
     std::unique_ptr<MergePolicy> policy;
     try {
-      policy = MergePolicyRegistry::global().make(spec.get(), mergeFactor);
+      policy = MergePolicyRegistry::global().make(spec.get(), mergeFactor, limits);
     } catch (const std::exception& e) {
       // The schema was validated when it was set; a maker can still refuse
       // it later (a plugin changed between restarts). Keep merging.
       LOG_ERROR("Merge policy '{}' could not be built; using the default: {}", spec ? spec->def.name : "",
                 e.what());
-      policy = std::make_unique<TieredMergePolicy>(mergeFactor);
+      policy = std::make_unique<TieredMergePolicy>(mergeFactor, limits);
     }
-    active.spec = std::move(spec);
+    active.schema = std::move(schema);
     active.nodeMergeFactor = mergeFactor;
+    active.limits = limits;
     active.policy = std::move(policy);
   }
   return *active.policy;
@@ -736,18 +749,20 @@ std::vector<SegInfo*> IndexWriter::_selectPolicyMergeLocked(uint64_t triggerSegI
     live.push_back(seg.get());
   }
   std::ranges::sort(live, {}, &SegInfo::segId);
+  auto& policy = _mergePolicyLocked();
+  const MergeLimits& limits = activeMergePolicy.limits;
   std::vector<PolicySegmentSummary> summaries;
   summaries.reserve(live.size());
   std::vector<MergeSegment> segments;
   segments.reserve(live.size());
   for (SegInfo* seg : live) {
     summaries.emplace_back(*this, *seg);
-    segments.push_back(mergeSegmentOf(*seg, summaries.back()));
+    segments.push_back(mergeSegmentOf(*seg, summaries.back(), limits));
   }
 
   std::vector<MergeSpec> merges;
   try {
-    merges = _mergePolicyLocked().findMerges(segments);
+    merges = policy.findMerges(segments);
   } catch (const std::exception& e) {
     LOG_ERROR("Merge policy failed to choose merges: {}", e.what());
     return {};
@@ -772,15 +787,85 @@ std::vector<SegInfo*> IndexWriter::_selectPolicyMergeLocked(uint64_t triggerSegI
 
 int32_t IndexWriter::_mergeLevelLocked(SegInfo& seg) {
   PolicySegmentSummary summary(*this, seg);
-  return _mergePolicyLocked().level(mergeSegmentOf(seg, summary));
+  auto& policy = _mergePolicyLocked();
+  return policy.level(mergeSegmentOf(seg, summary, activeMergePolicy.limits));
+}
+
+std::vector<SegInfo*> IndexWriter::_selectReclaimMergeLocked() {
+  const MergeLimits& limits = _mergeLimitsLocked();
+  // A rewrite reads the whole segment: on a REMOTE directory that is a fetch
+  // of cold data.
+  // TODO: reclaim resident segments once the writer can tell which are.
+  if (limits.deletesPctAllowed >= 100 || (dir.capabilities() & Directory::REMOTE) != 0) return {};
+  std::vector<SegInfo*> live;
+  live.reserve(segInfos.size());
+  for (auto& [segId, seg] : segInfos) {
+    unused(segId);
+    if (seg->liveDocs > 0) live.push_back(seg.get());
+  }
+  std::ranges::sort(live, {}, &SegInfo::segId);
+  struct Candidate {
+    SegInfo* seg;
+    MergeSegment view;
+    bool eligible;
+  };
+  std::vector<PolicySegmentSummary> summaries;
+  summaries.reserve(live.size());
+  std::vector<Candidate> candidates;
+  candidates.reserve(live.size());
+  for (SegInfo* seg : live) {
+    summaries.emplace_back(*this, *seg);
+    MergeSegment view = mergeSegmentOf(*seg, summaries.back(), limits);
+    int64_t deleted = (int64_t)view.maxDoc - view.liveDocs;
+    // A segment that is not terminal drops its deletes in policy merges.
+    bool eligible = view.terminal && !seg->merging && !reclaimFailedSegIds.contains(seg->segId)
+        && deleted * 100 > (int64_t)limits.deletesPctAllowed * view.maxDoc;
+    candidates.push_back({seg, view, eligible});
+  }
+  auto deadBytes = [](const MergeSegment& view) { return view.bytes - view.liveBytes(); };
+  size_t best = candidates.size();
+  for (size_t i = 0; i < candidates.size(); i++) {
+    if (!candidates[i].eligible) continue;
+    if (best == candidates.size() || deadBytes(candidates[i].view) > deadBytes(candidates[best].view)) best = i;
+  }
+  if (best == candidates.size()) return {};
+  // Neighbors in segId order join while the output fits, so two half-dead
+  // terminal segments become one full one.
+  uint64_t bytes = candidates[best].view.liveBytes();
+  int64_t docs = candidates[best].view.liveDocs;
+  size_t lo = best, hi = best;
+  auto tryJoin = [&](size_t i) {
+    if (!candidates[i].eligible) return false;
+    uint64_t nextBytes = bytes + candidates[i].view.liveBytes();
+    int64_t nextDocs = docs + candidates[i].view.liveDocs;
+    if (!limits.fits(nextBytes, nextDocs)) return false;
+    bytes = nextBytes;
+    docs = nextDocs;
+    return true;
+  };
+  for (bool grew = true; grew;) {
+    grew = false;
+    if (lo > 0 && tryJoin(lo - 1)) { lo--; grew = true; }
+    if (hi + 1 < candidates.size() && tryJoin(hi + 1)) { hi++; grew = true; }
+  }
+  std::vector<SegInfo*> selected;
+  for (size_t i = lo; i <= hi; i++) selected.push_back(candidates[i].seg);
+  return selected;
 }
 
 bool IndexWriter::_maybeMergeSegmentsLocked(uint64_t triggerSegId) {
   if (outstandingMerges > 0 || _forceMergePendingLocked()) return false;
   try {
-    if (_selectPolicyMergeLocked(triggerSegId).size() < 2) return false;
+    bool reclaim = false;
+    if (_selectPolicyMergeLocked(triggerSegId).size() < 2) {
+      // No policy merge is due: rewrite a segment the policy no longer
+      // merges if enough of it is deleted.
+      if (_selectReclaimMergeLocked().empty()) return false;
+      reclaim = true;
+    }
     auto msg = std::make_unique<PolicyMergeMessage>();
     msg->triggerSegId = triggerSegId;
+    msg->reclaim = reclaim;
     if (!_submitMergeLocked(msg.get())) return false;
     msg.release();
     return true;
@@ -2877,6 +2962,11 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         } else {
           segs.clear();
         }
+      } else if (msg.reclaim) {
+        segs = _selectReclaimMergeLocked();
+        // Even when admission leaves one source: rewriting it drops its deletes.
+        allowSingleSourceRewrite = true;
+        if (!segs.empty()) mergeLevel = _mergeLevelLocked(*segs.front());
       } else {
         // Asked again rather than replaying the decision that submitted
         // this merge: segments flushed since then take part.
@@ -2892,10 +2982,27 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       // Vector fields are summed by values (deleted ones included) against
       // MAX_SEGMENT_VECTORS, which multi-valued fields can reach before the
       // doc cap.
+      //
+      // A natural merge also respects the collection's MergeLimits, taking
+      // sources in order and stopping at the first that would carry the
+      // output past a cap (a later, smaller source would leapfrog it and
+      // interleave the segments' version ranges), and the merge working-set
+      // limit on its most expensive field. A client force merge is warned
+      // about instead. The first source always enters: rewriting it alone
+      // does not grow it.
+      const MergeLimits& limits = clientOrigin ? MergeLimits{} : _mergeLimitsLocked();
+      bool capped = !clientOrigin;
+      int64_t workingSetLimit = maxMergeWorkingSetBytes > 0 ? maxMergeWorkingSetBytes
+          : indexRamBudget != nullptr ? indexRamBudget->totalBytes() : 0;
+      int64_t workingSet = 0;
+      uint64_t mergedBytes = 0;
       int64_t mergedDocs = 0;
       boost::unordered_flat_map<std::string, int64_t> ordTermSums;
       boost::unordered_flat_map<std::string, int64_t> vectorSums;
       boost::unordered_flat_map<std::string, int64_t> pathRows;
+      // Admitted sources' field infos per (row space path, field), to price
+      // each field's merge working set as candidates join.
+      boost::unordered_flat_map<std::string, std::vector<FieldRecordPtr>> sourceInfos;
       std::vector<SegInfo*> admitted;
       admitted.reserve(segs.size());
       for (SegInfo* seg : segs) {
@@ -2904,13 +3011,29 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
                       seg->name());
           continue;
         }
+        uint64_t segBytes = seg->liveMergeBytes();
+        if (capped && !admitted.empty() && !limits.fits(mergedBytes + segBytes, mergedDocs + seg->liveDocs)) {
+          INDEX_DEBUG("mergeSegmentsBody: stopping before segment {} because the merged segment would exceed the merge caps",
+                      seg->name());
+          break;
+        }
         auto postingsReaderCore = getSegmentCore(*seg);
         MemPool metadataPool;
         boost::unordered_flat_map<std::string, int64_t> additions;
         boost::unordered_flat_map<std::string, int64_t> vectorAdditions;
-        auto fieldsFit = [&](PostingsReader& reader) {
+        std::vector<std::pair<std::string, FieldRecordPtr>> candidateInfos;
+        auto fieldsFit = [&](PostingsReader& reader, std::string_view path) {
           for (int32_t ordinal = 0; ordinal < reader.numFields(); ++ordinal) {
             auto header = reader.fieldHeader(ordinal);
+            if (FieldType::storage(header.type) == FieldType::Storage::BIN && (header.flags & FieldType::STORED) != 0) {
+              continue;
+            }
+            {
+              std::string key(path);
+              key += '\0';
+              key += std::string_view(header.name);
+              candidateInfos.emplace_back(std::move(key), reader.decodeField(ordinal));
+            }
             if (FieldType::storage(header.type) == FieldType::Storage::VECTOR) {
               std::string name(std::string_view(header.name));
               int64_t next = vectorAdditions[name] + header.numValues;
@@ -2933,7 +3056,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           }
           return true;
         };
-        bool fits = fieldsFit(postingsReaderCore->rootReader());
+        bool fits = fieldsFit(postingsReaderCore->rootReader(), {});
         std::vector<std::pair<std::string, int64_t>> nextRows;
         for (size_t i = 1; fits && i < postingsReaderCore->spaces().size(); i++) {
           const auto& space = postingsReaderCore->spaces()[i];
@@ -2942,7 +3065,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           // can be skipped.
           int64_t next = pathRows[std::string(space.path)] + space.maxDoc;
           fits = MergeCostModel::docsFit(0, next)
-              && fieldsFit(*postingsReaderCore->spaceReader(space.path));
+              && fieldsFit(*postingsReaderCore->spaceReader(space.path), space.path);
           nextRows.emplace_back(space.path, next);
         }
         if (!fits) {
@@ -2950,12 +3073,45 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
                       seg->name());
           continue;
         }
+        int64_t candidateWorkingSet = workingSet;
+        for (auto& [key, info] : candidateInfos) {
+          std::string_view path(key.data(), key.find('\0'));
+          auto rows = std::ranges::find(nextRows, path, &std::pair<std::string, int64_t>::first);
+          int64_t spaceDocs = path.empty() ? mergedDocs + seg->liveDocs
+              : rows != nextRows.end() ? rows->second : pathRows[std::string(path)];
+          std::vector<const DecodedFieldRecord*> infos;
+          for (const auto& source : sourceInfos[key]) infos.push_back(source.get());
+          infos.push_back(info.get());
+          candidateWorkingSet = std::max(candidateWorkingSet, SegmentMerger::estimateFieldCost(
+              infos, SegmentMerger::FieldCostContext{spaceDocs, ordMapSpillMinBytes, path.empty(), idFilterOptions}));
+        }
+        if (capped && workingSetLimit > 0 && !admitted.empty() && candidateWorkingSet > workingSetLimit) {
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because the merge working set would reach {} bytes, over {}",
+                      seg->name(), candidateWorkingSet, workingSetLimit);
+          continue;
+        }
+        for (auto& [key, info] : candidateInfos) sourceInfos[key].push_back(std::move(info));
+        workingSet = candidateWorkingSet;
         for (const auto& [field, terms] : additions) ordTermSums[field] += terms;
         for (const auto& [field, vectors] : vectorAdditions) vectorSums[field] += vectors;
         for (const auto& [path, rows] : nextRows) pathRows[path] = rows;
+        mergedBytes += segBytes;
         mergedDocs += seg->liveDocs;
         admitted.push_back(seg);
       }
+      if (clientOrigin && admitted.size() > 1) {
+        const MergeLimits& collectionLimits = _mergeLimitsLocked();
+        if (!collectionLimits.fits(mergedBytes, mergedDocs)) {
+          LOG_WARN("Force merge into {} segment(s) builds a segment of {} live docs and about {} live bytes, over the collection's merge caps ({} docs, {} bytes; 0 is unlimited)",
+                   msg.maxSegments, mergedDocs, mergedBytes, collectionLimits.maxMergedSegmentDocs,
+                   collectionLimits.maxMergedSegmentBytes);
+        }
+        if (workingSetLimit > 0 && workingSet > workingSetLimit) {
+          LOG_WARN("Force merge into {} segment(s) has an estimated per-field working set of {} bytes, over {}",
+                   msg.maxSegments, workingSet, workingSetLimit);
+        }
+      }
+      if (msg.reclaim && !admitted.empty()) reclaimMerges++;
       segs.swap(admitted);
 
       // Selection must be complete before changing segment state.  Marking an
@@ -3286,6 +3442,11 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       "Merge failed and was contained: sources=[{}] outputSegId={} outputPublished={} phase={} exceptionType={} message={}",
       sourceSegIdsString(), outputSegId, outputPublished, failure.phase,
       failure.exceptionType, failure.message);
+    if (msg.reclaim && !outputPublished) {
+      // Its sources are unchanged: reclaiming them again would fail the same way.
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      reclaimFailedSegIds.insert(sourceSegIds.begin(), sourceSegIds.end());
+    }
     if (clientOrigin) {
       std::string detail = "merge failed during ";
       detail.append(failure.phase);
@@ -3564,6 +3725,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
     out.updateVersion = updateNumber.load(std::memory_order_relaxed);
     out.schemaGen = schemaGen_;
     out.activeMerges = (uint64_t)outstandingMerges;
+    out.reclaimMerges = reclaimMerges;
     static_cast<DeletePassStats&>(out) = deletePassStats;
     out.completedUpdateVersion = completedUpdateVersion;
     out.minInverterDocVersion = minInverterDocVersion;
@@ -3621,6 +3783,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
       dst.liveDocs = seg->liveDocs;
       dst.mergeLevel = std::max(0, _mergeLevelLocked(*seg));
       dst.merging = seg->merging;
+      dst.terminal = _mergeLimitsLocked().terminal(seg->liveMergeBytes(), seg->liveDocs);
     }
   }
 

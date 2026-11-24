@@ -342,7 +342,11 @@ All replication settings use `--replication.` (configuration keys use underscore
 Copying a snapshot pins it so its files stay readable. A pin expires after
 `pin-idle-timeout-ms` without progress, and the oldest pins are revoked when
 retired files held only by pins exceed `pin-retained-bytes`. The follower then
-fetches a new snapshot and reuses the files it already verified.
+fetches a new snapshot and reuses the files it already verified. A merge that
+builds a terminal segment retires up to a merge cap's worth of sources at
+once (`merge_policy.max_merged_segment_bytes`, 5 GiB by default), so keep
+`pin-retained-bytes` at least that large where followers copy during heavy
+merging.
 `_stats?collections=true` reports `snapshot_pins`, `pin_retained_bytes`, `pin_idle_drops` and
 `pin_budget_drops`.
 

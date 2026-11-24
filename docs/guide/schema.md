@@ -565,27 +565,53 @@ live segment carrying one is used.
 ### Merge policy
 
 Segments written by flushes are merged in the background. The top-level
-`merge_policy` chooses how: `name` selects a registered policy and `params`
-configures it. Without one, the collection uses `tiered` with the node's
-`--indexing.merge-factor` (default 10).
+`merge_policy` chooses how: `name` selects a registered policy (empty or
+absent selects `tiered`) and `params` configures it. Without one, the
+collection uses `tiered` with the node's `--indexing.merge-factor`
+(default 10). Three more fields bound the segments any policy's background
+merges build:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `max_merged_segment_bytes` | 5 GiB; 32 GiB with a vector field; 1 GiB on remote storage | Live bytes a merge may produce. `0` is unlimited |
+| `max_merged_segment_docs` | 50,000,000; 8,000,000 with a vector field; 10,000,000 on remote storage | Live docs a merge may produce, at most 2147483647. `0` is unlimited |
+| `deletes_pct_allowed` | 20 | Deleted share (percent, 1 to 100) past which a segment that no longer merges is rewritten; `100` never rewrites |
+
+A segment's bytes are its data files without its live docs file, prorated by
+its live docs. A merge takes its sources in segment order and stops before the
+first that would carry it past a cap. A segment over half of either cap is
+terminal: `tiered` no longer selects it, and stats report it as `terminal`.
+Once more than `deletes_pct_allowed` of a terminal segment is deleted, the
+writer rewrites it, joined by adjacent such segments while the result fits,
+when no other merge is due. Other segments drop their deletes as they merge. These
+rewrites are not done on remote storage yet. A force merge (`max_segments`)
+ignores the caps and logs a warning when it passes one.
+
+The defaults suit collections up to a few hundred GB. A multi-TB collection
+would otherwise hold thousands of 5 GiB segments, and every segment adds
+per-query cost: raise `max_merged_segment_bytes` to about the collection's
+live bytes / 128, rounded to a power of two, between 5 and 64 GiB (16 GiB at
+2 TB, 64 GiB at 10 TB). Larger segments make each terminal merge longer, and
+a collection runs one merge at a time.
 
 ```http
 POST /collections/logs/_schema
 
 {
-  "merge_policy": {"name": "tiered", "params": {"merge_factor": 4}}
+  "merge_policy": {"name": "tiered", "params": {"merge_factor": 4},
+                   "max_merged_segment_bytes": 17179869184}
 }
 ```
 
 | Policy | Params | Behavior |
 |---|---|---|
-| `tiered` | `merge_factor` (integer, at least 2; default the node's `--indexing.merge-factor`) | A segment's level is how many times `merge_factor` divides into its row count (its documents, or a nested field's child rows when there are more). Once `merge_factor` segments share a level, that level's segments merge into one, lowest level first |
+| `tiered` | `merge_factor` (integer, at least 2; default the node's `--indexing.merge-factor`) | A segment's level is how many times `merge_factor` divides into its live row count (its documents, or a nested field's child rows when there are more, prorated by its live documents). Once `merge_factor` segments share a level, that level's segments merge into one, lowest level first. A level also merges with fewer segments once their live size reaches a cap, building a terminal segment. Terminal segments take no part |
 
 Plugins can register other policies, for example one that merges only
 segments with overlapping ranges on a timestamp or tenant field, so each
 segment covers a narrow range. An unknown name or an invalid param fails the
-schema request and lists what is valid. `mode=set` replaces `merge_policy`
-only when the request names one; a change applies to merge decisions from the
+schema request and lists what is valid, as does a limit out of range.
+`mode=set` replaces `merge_policy` only when the request names one; a change applies to merge decisions from the
 next one on and does not rewrite existing segments. A collection whose stored
 schema names a policy the binary no longer has fails to load, like one naming
 an unknown analyzer.

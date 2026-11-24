@@ -99,7 +99,8 @@ TEST(NestedMergeTest, largestSpaceSizesLevelsAndSurvivingOutput) {
       auto found = std::ranges::find(stats.segmentStats, seg.seg_id, &IndexWriter::SegmentStats::segId);
       EXPECT_NE(stats.segmentStats.end(), found);
       if (found != stats.segmentStats.end()) {
-        EXPECT_EQ(TieredMergePolicy(10).levelForRows(count), found->mergeLevel);
+        // Levels count live rows: physical rows prorated by live roots.
+        EXPECT_EQ(TieredMergePolicy(10).levelForRows((int64_t)count * seg.live_docs / seg.max_doc), found->mergeLevel);
       }
     }
     std::sort(counts.begin(), counts.end());
