@@ -614,7 +614,8 @@ private:
       duplicate.count++;
       duplicate.boost += peeled.boost;
       if (!std::isfinite(duplicate.boost)) {
-        throw std::runtime_error("summed duplicate-clause boost must be finite");
+        throw std::runtime_error(
+            "summed duplicate-clause boost must be finite");
       }
     }
     return result;

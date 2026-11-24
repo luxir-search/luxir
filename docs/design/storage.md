@@ -353,19 +353,20 @@ the decoded record through `FieldSegments::at`. The segment core owns both
 the record and its catalog bytes. Field lookups, including misses, are shared
 across the request on each reader view.
 
-A missing record proves that the segment lacks the field. An unreadable
-record or a schema/persisted type mismatch supplies no evidence. Proofs add
-no request errors. Weight construction checks the fields that execution uses.
+A missing record proves that the segment lacks the field. Every present
+record represents at least one document. An unreadable record or a
+schema/persisted type mismatch supplies no evidence. Proofs add no request
+errors. Weight construction checks the fields that execution uses.
 
 | Query | Proof of absence |
 | --- | --- |
-| term, term set, phrase, combined fields | a term is absent if its field has no record, values or indexed terms, or its dictionary bounds exclude the term. One absent term excludes a phrase. Every alternative must be absent for a term set or combined-field query. |
-| prefix, term range | no record, no values, no indexed terms, or dictionary bounds disjoint from the prefix or range |
-| fuzzy and other expansions | no record, no values or no terms |
-| numeric range or value set | no record, no values, or no admitted value inside the scalar bounds |
-| exists | no record or no values |
-| geo box, distance, polygon | no record, no values, or a query bounding box disjoint from the geo bounds |
-| range field | no record, no values, or a relation box disjoint from the interval bounds on either the low or high endpoints |
+| term, term set, phrase, combined fields | a term is absent if its field has no record or no indexed terms, or its dictionary bounds exclude the term. One absent term excludes a phrase. Every alternative must be absent for a term set or combined-field query. |
+| prefix, term range | no record, no indexed terms, or dictionary bounds disjoint from the prefix or range |
+| fuzzy and other expansions | no record or no indexed terms |
+| numeric range or value set | no record or no admitted value inside the scalar bounds |
+| exists | no record |
+| geo box, distance, polygon | no record or a query bounding box disjoint from the geo bounds |
+| range field | no record or a relation box disjoint from the interval bounds on either the low or high endpoints |
 | to_parent | the segment has no rows in the child space, or the child query is proven empty over them |
 | match-no-docs | always |
 

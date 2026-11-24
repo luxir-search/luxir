@@ -5,7 +5,7 @@
 // Segment pruning: evaluates logical query trees against the segments' field
 // record headers (Query::mayMatch over a CatalogSummaryView) and turns the
 // verdicts into a root weight's membership mask. Masks belong to the query
-// and its validation context. See docs/design/storage.md (Pruning).
+// and its validation context. See docs/design/storage.md (Query-time pruning).
 
 #include <map>
 #include <optional>
@@ -36,11 +36,16 @@ public:
   // Tests seek each term whose statistics lookup the catalog would skip and fail on a hit.
   static inline bool verifyTermAbsenceForTests = false;
 
+  struct Membership {
+    const SegmentMask& mask;
+    bool inserted;
+  };
+
   // The segments where `query`'s header proofs allow a match, deletes
   // ignored, by ordinal, memoized for the request. A segment outside it holds
   // no document matching `query`, deleted or not, so its cached membership
   // is exactly empty.
-  const SegmentMask& membership(const Query& query, const Query::PlanningContext& planning);
+  Membership membership(const Query& query, const Query::PlanningContext& planning);
 };
 
 } // namespace luxir

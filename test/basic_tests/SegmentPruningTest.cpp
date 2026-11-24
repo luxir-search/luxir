@@ -12,6 +12,7 @@
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/query/QueryPruning.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/search/FilterCache.h"
@@ -204,6 +205,60 @@ TEST_F(SegmentPruningTest, resultsMatchUnprunedExecution) {
   EXPECT_EQ(0, prunedBy(topDocs(R"({"all":true})")));
 }
 
+TEST_F(SegmentPruningTest, lexicalQueriesAndCollapseAcrossCacheStates) {
+  indexJson({R"({"id":"gap","body_t":"amber zebra","title_t":"apple","price_i":1,"tag_s":"a"})"});
+  indexJson({R"({"id":"low","body_t":"kiwi","title_t":"apple","price_i":2,"tag_s":"b"})",
+             R"({"id":"high","body_t":"kiwi","title_t":"kiwi","price_i":3,"tag_s":"b"})"});
+  indexJson({R"({"id":"title","title_t":"kiwi","price_i":4,"tag_s":"c"})"});
+  // Only the missing field proves absence. The first dictionary admits kiwi
+  // between its endpoints and a seek must discover the gap.
+  auto filtered = topDocs(R"({"all":true})", R"(,"filter":["body_t:kiwi"])");
+  EXPECT_EQ(1, prunedBy(filtered));
+  expectSameWithAndWithoutPruning(filtered);
+  for (std::string_view query : {
+         R"({"wildcard":{"field":"body_t","pattern":"ki?i"}})",
+         R"({"fuzzy":{"field":"body_t","term":"kiwy","max_edits":1}})",
+         R"({"multi_match":{"fields":["title_t","body_t"],"text":"kiwi","mode":"combined"}})",
+         R"({"dis_max":{"queries":["title_t:kiwi","body_t:kiwi"],"tie":0.25}})",
+         R"({"rescore":{"query":"body_t:kiwi","expr":"price_i"}})"}) {
+    expectSameWithAndWithoutPruning(topDocs(query));
+  }
+  expectSameWithAndWithoutPruning(topDocs(R"({"rescore":{"query":"body_t:kiwi","expr":"price_i"}})",
+                                          R"(,"min_score":2.5)"));
+  expectSameWithAndWithoutPruning(topDocs(R"("body_t:kiwi")", R"(,"collapse":{"field":"tag_s","get_count":true})"));
+}
+
+TEST_F(SegmentPruningTest, geoQueriesCrossTheDateline) {
+  indexJson({R"({"id":"east","location_p":[179,0]})"});
+  indexJson({R"({"id":"west","location_p":[-179,0]})"});
+  indexJson({R"({"id":"outside","location_p":[0,0]})"});
+  for (std::string_view query : {
+         R"({"geo_box":{"field":"location_p","min_lat":-1,"max_lat":1,"min_lon":178,"max_lon":-178}})",
+         R"({"geo_distance":{"field":"location_p","lat":0,"lon":180,"radius_meters":150000}})"}) {
+    auto json = topDocs(query);
+    EXPECT_EQ(1, prunedBy(json));
+    expectSameWithAndWithoutPruning(json);
+  }
+}
+
+TEST_F(SegmentPruningTest, nestedSegmentWithOnlyDeletedRows) {
+  SchemaBuilder schema;
+  schema.field("items").type = api::FieldDef::FieldClass::NESTED;
+  schema.field("items.tag").type = api::FieldDef::FieldClass::STRING;
+  schema.set(helper->collection());
+  // The root without items keeps its segment through the delete commit.
+  indexJson({R"({"id":"gone","items":{"tag":"a"}})", R"({"id":"keep"})"});
+  indexJson({R"({"id":"live","items":{"tag":"a"}})"});
+  ASSERT_TRUE(helper->deleteById("gone", UpdateMessage::COMMIT).success);
+  auto view = currentReader()->view("items");
+  ASSERT_EQ(2u, view->segments().size());
+  ASSERT_EQ(1, view->segments()[0].maxDoc());
+  ASSERT_EQ(0, view->segments()[0].numLive());
+  auto json = R"({"ops":{"q":{"domain":{"to":"items"},"top_docs":{"query":"tag:a","count_limit":-1}}}})";
+  EXPECT_EQ(1, prunedBy(json));
+  expectSameWithAndWithoutPruning(json);
+}
+
 TEST_F(SegmentPruningTest, scoresUseStatisticsOfEverySegment) {
   QueryPruning::verifyTermAbsenceForTests = true;
   indexThreeSegments();
@@ -320,7 +375,12 @@ TEST_F(SegmentPruningTest, directPrefixScorerHonorsRootProof) {
   prefix.validateLogical(context.planningContext());
   auto* weight = context.createRootWeight(prefix, 0);
   auto& excluded = reader->segments()[1];
+  ASSERT_TRUE(weight->provenEmpty(excluded));
+  EXPECT_EQ("proven empty", weight->proofReason(excluded));
   SkipStatsScope stats;
+  auto filter = QueryPrep::materializeEffectiveFilter(*weight, nullptr, *reader, excluded, nullptr);
+  ASSERT_NE(nullptr, filter.get(excluded));
+  EXPECT_EQ(0, filter.get()->cachedCard());
   EXPECT_EQ(nullptr, weight->createScorer(pool, excluded));
   EXPECT_EQ(0, SkipStats::multitermExpansions);
   EXPECT_NE(nullptr, weight->createScorer(pool, reader->segments()[0]));
@@ -498,7 +558,7 @@ TEST_F(SegmentPruningTest, reportsPruningInProfileAndExplain) {
     if (piece.strategy != "pruned") continue;
     prunedPieces++;
     ASSERT_FALSE(piece.details.empty());
-    EXPECT_EQ("op q: root 1: numeric bounds disjoint", piece.details[0]);
+    EXPECT_EQ("op q: numeric bounds disjoint", piece.details[0]);
   }
   EXPECT_EQ(2u, prunedPieces);
   auto notes = helper->getSearchEngine().explain(req->rawRequest(), "");
@@ -700,7 +760,7 @@ TEST_F(SegmentPruningTest, emptyRootsSkipCollection) {
   }
   auto explained = notes(topDocs(outOfRange));
   ASSERT_EQ(1u, explained.size());
-  EXPECT_EQ("op q: empty weight for the collection (segment 0, root 1: numeric bounds disjoint)", explained[0]);
+  EXPECT_EQ("op q: empty weight for the collection (segment 0, numeric bounds disjoint)", explained[0]);
   // A filter proven empty, fusion sources, and a request mixing a proven op
   // with one that matches.
   expectSameWithAndWithoutPruning(topDocs(R"({"match":{"body_t":"common"}})", R"(,"filter":[{"match":{"tag_s":"zz"}}])"));
