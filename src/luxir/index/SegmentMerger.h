@@ -1746,7 +1746,7 @@ private:
       // Release the working set, keeping the term blocks and their block index
       // charged until stitch.
       int64_t retained = (int64_t) termsOut.size()
-          + (int64_t) (output.result.termBlockOffsets.capacity() * sizeof(field_parts::Terms::BlockOffset))
+          + (int64_t) (output.result.termBlockOffsets.capacity() * sizeof(uint64_t))
           + (int64_t)(output.result.runs.capacity() * sizeof(TextWriter::RunStart));
       for (const auto& key : output.result.separatorKeys) {
         retained += (int64_t) (sizeof(std::string) + key.capacity());
@@ -1764,7 +1764,7 @@ private:
 
     void stitch() {
       OutputStream& termsOut = *termsStream;
-      std::vector<field_parts::Terms::BlockOffset> blockOffsets;
+      std::vector<uint64_t> blockOffsets;
       std::vector<field_parts::TermRun> runs;
       std::string_view firstTerm;
       TrieBuilder trieBuilder;
@@ -1802,8 +1802,7 @@ private:
         auto dictionaryStart = termsOut.size();
         termsOut.appendFile(output.termsFile);
         result.appendRuns(runs, (int32_t)termOrd, blockOrd, dictionaryStart, output.docs, output.positions);
-        blockOffsets.insert(blockOffsets.end(), result.termBlockOffsets.begin(),
-                            result.termBlockOffsets.end());
+        for (auto offset : result.termBlockOffsets) blockOffsets.push_back(dictionaryStart + offset);
         output.termsGuard.release();
         termOrd += result.nTerms;
         blockOrd += result.nBlocks;

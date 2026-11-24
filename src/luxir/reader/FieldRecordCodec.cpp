@@ -363,7 +363,11 @@ public:
     auto dictionary = terms.dictionaryBlocks();
     extents.check(io, dictionary);
     if (terms.trieRootOffset >= terms.trieBytes) io.invalid("trie root outside trie");
-    if (termBlockOffsetsStart(dictionary.end().offset()) > seg_location::maxOffset()) {
+    auto blocks = termBlockCount(terms, header.indexedTotals.numTerms);
+    if (terms.blockOffsetBits > BlockOffsetTable::MAX_BITS || (blocks > 1) != (terms.blockOffsetBits > 0)) {
+      io.invalid("term block offset width");
+    }
+    if (termBlockOffsetsStart(dictionary.end().offset(), 1) > seg_location::maxOffset()) {
       io.invalid("aligned term block offsets exceed the file offset limit");
     }
     auto offsets = termBlockOffsets(terms, header.indexedTotals.numTerms);
@@ -516,9 +520,6 @@ public:
     if (!terms || !bytes) io.invalid("term run is empty");
     if (terms > remainingTerms()) io.invalid("term run exceeds the remaining terms");
     if (bytes > remainingBytes()) io.invalid("term run exceeds the remaining dictionary bytes");
-    if (bytes > std::numeric_limits<Terms::BlockOffset>::max()) {
-      io.invalid("term run bytes exceed the block offset limit");
-    }
     auto blocks = Postings::termBlockCount(terms);
     if (!Postings::fitsTermBlocks(blockOrd, blocks)) io.invalid(Postings::TERM_BLOCK_LIMIT_ERROR);
     static_assert((uint64_t)Postings::MAX_TERM_BLOCKS * Postings::TERMS_BLOCK_SIZE <= INT32_MAX);
@@ -572,6 +573,7 @@ void writeTerms(Writer& out, const Terms& terms, int64_t numTerms) {
   out.writeVarUInt(terms.dictionaryBytes);
   out.writeVarUInt(terms.trieBytes);
   out.writeVarUInt(terms.trieRootOffset);
+  out.writeVarUInt(terms.blockOffsetBits);
   for (int32_t i = 0; i + 1 < runCount; ++i) {
     auto [count, bytes] = runSize(terms, numTerms, i);
     out.writeVarUInt(count);
@@ -596,6 +598,7 @@ void readTerms(Reader& in, PartChecks& checks, Terms& terms, uint64_t tag, std::
   terms.dictionaryBytes = in.readVarUInt(seg_location::maxOffset());
   terms.trieBytes = in.readVarUInt(seg_location::maxOffset());
   terms.trieRootOffset = in.readVarUInt();
+  terms.blockOffsetBits = (uint8_t)in.readVarUInt(BlockOffsetTable::MAX_BITS);
   terms.runs = runs;
   TermRunCoverage coverage(terms, numTerms);
   for (int32_t i = 0; i < runCount; ++i) {

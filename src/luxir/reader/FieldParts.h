@@ -9,6 +9,7 @@
 #include <span>
 #include <stdexcept>
 
+#include "luxir/codec/BlockOffsetTable.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/store/OutputStream.h"
 #include "Postings.h"
@@ -65,28 +66,30 @@ struct TermRun {
   bool operator==(const TermRun&) const = default;
 };
 
-// Dictionary blocks, the aligned offset table, then the trie on one checkout.
+// Dictionary blocks, the block offset table (BlockOffsetTable, aligned when
+// nonempty), then the trie on one checkout.
 struct Terms {
-  using BlockOffset = uint32_t;
-  static constexpr size_t OFFSETS_ALIGN = alignof(BlockOffset);
+  static constexpr size_t OFFSETS_ALIGN = BlockOffsetTable::ALIGN;
 
   seg_location location;          // First dictionary block.
   uint64_t dictionaryBytes = 0;   // Dictionary blocks up to the alignment padding.
   uint64_t trieBytes = 0;         // Trie extent including decoder slack.
   uint64_t trieRootOffset = 0;    // Root offset relative to the start of the trie.
   std::span<const TermRun> runs;  // Run starts in term order.
+  uint8_t blockOffsetBits = 0;    // Relative offset width in the block offset table.
 
   Slice dictionaryBlocks() const { return {location, dictionaryBytes}; }
 
   bool operator==(const Terms& other) const {
     return location == other.location && dictionaryBytes == other.dictionaryBytes && trieBytes == other.trieBytes
-        && trieRootOffset == other.trieRootOffset && std::ranges::equal(runs, other.runs);
+        && trieRootOffset == other.trieRootOffset && std::ranges::equal(runs, other.runs)
+        && blockOffsetBits == other.blockOffsetBits;
   }
 };
 
 // Dictionary layout derived from the last run and the indexed term count.
 int32_t termBlockCount(const Terms& terms, int64_t numTerms) noexcept;
-uint64_t termBlockOffsetsStart(uint64_t dictionaryEnd) noexcept;
+uint64_t termBlockOffsetsStart(uint64_t dictionaryEnd, uint64_t tableBytes) noexcept;
 Slice termBlockOffsets(const Terms& terms, int64_t numTerms);
 Slice termTrie(Slice offsets, uint64_t trieBytes);
 

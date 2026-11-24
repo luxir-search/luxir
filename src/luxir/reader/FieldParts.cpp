@@ -18,14 +18,15 @@ int32_t termBlockCount(const Terms& terms, int64_t numTerms) noexcept {
   return last.firstBlockOrd + (int32_t)Postings::termBlockCount(numTerms - last.firstTermOrd);
 }
 
-uint64_t termBlockOffsetsStart(uint64_t dictionaryEnd) noexcept {
-  return alignUp(dictionaryEnd, Terms::OFFSETS_ALIGN);
+uint64_t termBlockOffsetsStart(uint64_t dictionaryEnd, uint64_t tableBytes) noexcept {
+  return tableBytes ? alignUp(dictionaryEnd, Terms::OFFSETS_ALIGN) : dictionaryEnd;
 }
 
 Slice termBlockOffsets(const Terms& terms, int64_t numTerms) {
   auto end = terms.dictionaryBlocks().end();
-  auto padding = termBlockOffsetsStart(end.offset()) - end.offset();
-  return {end.addOffset(padding), (uint64_t)termBlockCount(terms, numTerms) * sizeof(Terms::BlockOffset)};
+  auto bytes = BlockOffsetTable::bytes((uint64_t)termBlockCount(terms, numTerms), terms.blockOffsetBits);
+  auto padding = termBlockOffsetsStart(end.offset(), bytes) - end.offset();
+  return {end.addOffset(padding), bytes};
 }
 
 Slice termTrie(Slice offsets, uint64_t trieBytes) {

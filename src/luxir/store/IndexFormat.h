@@ -26,7 +26,7 @@ namespace luxir {
 // writer may vary it within one version. A value this version's readers do not
 // know, such as a new id filter kind, is.
 struct IndexFormat {
-  static constexpr uint64_t VERSION = 21;
+  static constexpr uint64_t VERSION = 22;
   static_assert(VERSION > 0 && VERSION < 36 * 36 * 36);
   static constexpr auto HEADER_BYTES = [] {
     std::array<char, 8> header{'L', 'U', 'X', 'I', 'R'};

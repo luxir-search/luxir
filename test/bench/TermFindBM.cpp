@@ -357,7 +357,7 @@ private:
 
     nBlocks = fieldInfo->termBlockCount();
     termsRegionBytes = fieldInfo->terms()->dictionaryBytes;
-    termBlockOffsetBytes = (int64_t)nBlocks * (int64_t)sizeof(field_parts::Terms::BlockOffset);
+    termBlockOffsetBytes = (int64_t)fieldInfo->termBlockOffsets().bytes;
     trieBytes = fieldInfo->terms()->trieBytes;
   }
 };
