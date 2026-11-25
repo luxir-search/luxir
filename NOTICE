@@ -28,6 +28,13 @@ under its own license as noted. Their license texts are kept alongside them.
 
 This product also contains code adapted from:
 
+  FAISS e-means (src/luxir/index/EMeans.h, EMeans.cpp)
+    https://github.com/facebookresearch/faiss, contrib/e_means and the
+    e-means helpers in faiss/utils/distances.cpp, at commit 6074b69e9
+    Copyright (c) Meta Platforms, Inc. and affiliates
+    MIT License; the notice is retained in EMeans.cpp
+    Translated from Python to C++ for IVF list training.
+
   Apache Lucene KStem (src/luxir/analysis/KStemmer.cpp, KStemData.h,
     and test/basic_tests/data/kstem_examples.txt)
     Apache Lucene, Copyright 2001-2025 The Apache Software Foundation

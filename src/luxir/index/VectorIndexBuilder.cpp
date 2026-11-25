@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "VectorIndexBuilder.h"
+#include "EMeans.h"
 #include "IndexRamBudget.h"
 #include "MergeCostModel.h"
 #include "luxir/util/thread.h"
@@ -316,10 +317,17 @@ int64_t VectorIndexBuilder::ivfBuildThresholdScanCost = 1'000'000;
 std::atomic<int64_t> VectorIndexBuilder::ivfBuildCountForTests{0};
 std::atomic<int64_t> VectorIndexBuilder::ivfMergeBuildCountForTests{0};
 int64_t VectorIndexBuilder::ivfTrainingPointsPerCentroid = 100;
+VectorIndexBuilder::Trainer VectorIndexBuilder::ivfTrainer = VectorIndexBuilder::Trainer::EMEANS;
+int32_t VectorIndexBuilder::ivfTrainingSeed = 1234;
 size_t VectorIndexBuilder::ivfTrainingSampleMaxBytes = (size_t)2560 * 1024 * 1024;
 std::atomic<int64_t> VectorIndexBuilder::ivfLastTrainingVectorsForTests{0};
 size_t VectorIndexBuilder::ivfAddChunkBytes = 16 * 1024 * 1024;
 int64_t VectorIndexBuilder::ivfBuildMinRowsPerTask = 0;
+
+std::unique_ptr<faiss::IndexFlat> VectorIndexBuilder::newCoarseQuantizer(
+    int32_t dims, faiss::MetricType metric) {
+  return std::make_unique<PartitionedFlatQuantizer>(dims, metric, buildMinRowsPerTask(dims));
+}
 
 float VectorIndexBuilder::finishRaBitQCode(const float* x, const float* centroid, uint8_t* code,
                                            int32_t dims, int32_t bits, faiss::MetricType metric) {
@@ -540,7 +548,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   int32_t rabitqBits = ann.resolvedRabitqBits(dims);
   std::unique_ptr<VectorRotation> rotation;
   int64_t minRows = buildMinRowsPerTask(dims);
-  auto quantizer = std::make_unique<PartitionedFlatQuantizer>(dims, metric, minRows);
+  auto quantizer = newCoarseQuantizer(dims, metric);
   std::unique_ptr<faiss::IndexIVF> index;
   if (rabitq) {
     rotation = std::make_unique<VectorRotation>(VectorRotation::FHT_KAC, dims, RABITQ_ROTATION_SEED);
@@ -586,7 +594,25 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   if (rabitq) {
     // RaBitQuantizer::train is a no-op. IndexIVF::train would first assign
     // every sample row and allocate an equally large, unused residual copy.
-    index->train_q1(ntrain, training.data(), index->verbose, metric);
+    if (ivfTrainer == Trainer::EMEANS) {
+      // e-means lists, spherical for inner product as IndexIVF's k-means is
+      // (its constructor sets cp.spherical).  Its workspace is charged with
+      // the sample.
+      auto& lists = dynamic_cast<faiss::IndexFlat&>(*index->quantizer);
+      EMeans::Params params{.seed = (uint64_t)ivfTrainingSeed,
+                            .spherical = metric == faiss::METRIC_INNER_PRODUCT};
+      if (trainingRam) {
+        trainingRam.forceResize(trainingRam.size() + EMeans::workspaceBytes(ntrain, nlist, dims, params));
+      }
+      [[maybe_unused]] auto trained = EMeans::train(ntrain, training.data(), nlist, params, lists);
+      lists.is_trained = true;
+      LOG_TRACE("VectorIndexBuilder: e-means batch={} alpha0={} splits={} handed over={} reassigned={}",
+                trained.recipe.batchSize, trained.recipe.alpha0, trained.splits,
+                trained.handedOver, trained.reassigned);
+    } else {
+      index->cp.seed = ivfTrainingSeed;
+      index->train_q1(ntrain, training.data(), index->verbose, metric);
+    }
     index->is_trained = true;
   } else {
     // PQ bounds residual training at 256 * ksub rows, but at high dimensions

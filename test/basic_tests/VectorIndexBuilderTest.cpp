@@ -1976,3 +1976,85 @@ TEST_F(VectorIndexBuilderTest, overlayGenerationSurvivesPublishedDropAndRestart)
   EXPECT_EQ(1u, onlyVectorOverlay(info).gen);
   EXPECT_NE(oldName, onlyVectorOverlay(info).files.front().name);
 }
+
+// A cosine RaBitQ overlay with e-means lists recalls as well as with Lloyd's
+// on a small clustered corpus; comparative recall is measured on real corpora
+// by BM_VectorAnnDataset.
+TEST_F(VectorIndexBuilderTest, emeansListsServeRecall) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard(16);
+  SearchOverridesGuard<VectorIndexBuilder::Trainer> trainer{VectorIndexBuilder::ivfTrainer};
+  constexpr int32_t dims = 16, rows = 2000, k = 10, nprobe = 4;
+  std::mt19937 rng(7);
+  std::vector<std::vector<float>> centers;
+  for (int32_t c = 0; c < 40; c++) centers.push_back(randomUnit(rng, dims));
+  std::normal_distribution<float> noise(0, 0.15f);
+  auto next = [&] {
+    auto v = centers[rng() % centers.size()];
+    for (auto& x : v) x += noise(rng);
+    return v;
+  };
+  std::vector<std::vector<float>> docs, queries;
+  for (int32_t i = 0; i < rows; i++) docs.push_back(next());
+  for (int32_t q = 0; q < 20; q++) queries.push_back(next());
+  double recall[2];
+  std::vector<float> lists[2];
+  for (auto which : {VectorIndexBuilder::Trainer::LLOYD, VectorIndexBuilder::Trainer::EMEANS}) {
+    VectorIndexBuilder::ivfTrainer = which;
+    CollectionHelper h("main");
+    h.clear();
+    SchemaBuilder b;
+    auto& f = b.templ("_v");
+    f.type = api::FieldDef_::FieldClass::VECTOR;
+    f.metric = api::VectorMetric::COSINE;
+    f.dims = dims;
+    f.ann = rabitqAnn(32, 1);
+    b.set(h.collection());
+    for (int32_t i = 0; i < rows; i++) h.index(flatdoc("id", std::to_string(i), "v_v", docs[(size_t)i]));
+    h.commit({"*"});
+    auto info = readIndexInfo(h.getIndexWriter()->dir);
+    auto idx = readFaissIndex(h.getIndexWriter()->dir, onlyVectorOverlay(info).files.front().name);
+    auto* quantizer = dynamic_cast<faiss::IndexFlat*>(dynamic_cast<faiss::IndexIVF&>(*idx).quantizer);
+    ASSERT_NE(quantizer, nullptr);
+    lists[(int)which].assign(quantizer->get_xb(), quantizer->get_xb() + quantizer->ntotal * quantizer->d);
+    int32_t hits = 0;
+    for (const auto& query : queries) {
+      auto approx = runKnnIds(h.getSearchEngine(), "v_v", query, k, nprobe, 50);
+      auto exact = runKnnIds(h.getSearchEngine(), "v_v", query, k, 0, 0, true);
+      for (const auto& id : exact) hits += std::ranges::count(approx, id) > 0 ? 1 : 0;
+    }
+    recall[(int)which] = (double)hits / (double)(queries.size() * k);
+  }
+  EXPECT_NE(lists[0], lists[1]);  // the two arms really trained differently
+  EXPECT_GE(recall[0], 0.85);
+  EXPECT_GE(recall[1], 0.85);
+}
+
+// PQ overlays train their lists and codebooks with Lloyd whatever ivfTrainer is.
+TEST_F(VectorIndexBuilderTest, pqOverlaysIgnoreTrainer) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard(16);
+  SearchOverridesGuard<VectorIndexBuilder::Trainer> trainer{VectorIndexBuilder::ivfTrainer};
+  std::mt19937 rng(9);
+  std::vector<std::vector<float>> docs;
+  for (int32_t i = 0; i < 2000; i++) docs.push_back(randomUnit(rng, 8));
+  std::vector<std::vector<float>> built;
+  for (auto which : {VectorIndexBuilder::Trainer::LLOYD, VectorIndexBuilder::Trainer::EMEANS}) {
+    VectorIndexBuilder::ivfTrainer = which;
+    CollectionHelper h("main");
+    h.clear();
+    enableL2OnVecSuffix(h.collection(), pqAnn(16, 4, 4), 8);
+    for (int32_t i = 0; i < 2000; i++) h.index(flatdoc("id", std::to_string(i), "embedding_v", docs[(size_t)i]));
+    h.commit({"*"});
+    auto info = readIndexInfo(h.getIndexWriter()->dir);
+    auto idx = readFaissIndex(h.getIndexWriter()->dir, onlyVectorOverlay(info).files.front().name);
+    auto* pq = dynamic_cast<faiss::IndexIVFPQ*>(idx.get());
+    ASSERT_NE(pq, nullptr);
+    auto* lists = dynamic_cast<faiss::IndexFlat*>(pq->quantizer);
+    ASSERT_NE(lists, nullptr);
+    std::vector<float> state(lists->get_xb(), lists->get_xb() + lists->ntotal * lists->d);
+    state.insert(state.end(), pq->pq.centroids.begin(), pq->pq.centroids.end());
+    built.push_back(std::move(state));
+  }
+  EXPECT_EQ(built[0], built[1]);
+}

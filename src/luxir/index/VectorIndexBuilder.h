@@ -17,6 +17,10 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/reader/PostingsReader.h"
 
+namespace faiss {
+struct IndexFlat;
+}
+
 namespace luxir {
 
 class IndexRamBudget;
@@ -68,6 +72,13 @@ public:
   // by the memory ceiling for the sample's in-memory copy. The codec training
   // floor still applies.
   static int64_t ivfTrainingPointsPerCentroid;
+  // How RaBitQ overlays train their lists: EMEANS (EMeans.h), or LLOYD,
+  // IndexIVF's own 10-iteration k-means, kept as the benchmark control.  PQ
+  // overlays train their lists and codebooks with IndexIVF::train.  The seed
+  // feeds either trainer, for paired benchmark runs.
+  enum class Trainer { LLOYD, EMEANS };
+  static Trainer ivfTrainer;
+  static int32_t ivfTrainingSeed;
   static size_t ivfTrainingSampleMaxBytes;
   static std::atomic<int64_t> ivfLastTrainingVectorsForTests;
   // Add chunk input-byte target. Chunks also hold at least four row tasks
@@ -84,6 +95,11 @@ public:
   // amplitude stored beside the code. x and centroid are in the rotated space.
   static float finishRaBitQCode(const float* x, const float* centroid, uint8_t* code,
                                 int32_t dims, int32_t bits, faiss::MetricType metric);
+
+  // An empty coarse quantizer whose batch searches split rows across TBB
+  // tasks of the calling arena, as overlay builds train with.
+  static std::unique_ptr<faiss::IndexFlat> newCoarseQuantizer(int32_t dims,
+                                                              faiss::MetricType metric);
 
   // Seed of the RaBitQ random rotation.  Fixed so every overlay of a given
   // dims shares one transform (deduplicated in RAM by internVectorRotation).

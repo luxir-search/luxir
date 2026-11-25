@@ -15,12 +15,18 @@
 #include <string_view>
 #include <vector>
 
+#include <faiss/Clustering.h>
+#include <faiss/IndexFlat.h>
+#include <sys/resource.h>
+
 #include "bench/luxir_bench.h"
+#include "luxir/index/EMeans.h"
 #include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/util/random.h"
+#include "luxir/util/VectorRotation.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -128,6 +134,32 @@ struct IvfBenchGuard {
     // thread for A/B comparison. PQ codebooks still train per sub-quantizer.
     if (const char* rows = std::getenv("LUXIR_BENCH_IVF_MIN_ROWS")) {
       VectorIndexBuilder::ivfBuildMinRowsPerTask = std::atoll(rows);
+    }
+  }
+};
+
+// IVF training knobs for A/B runs from one binary: LUXIR_IVF_TRAINER (lloyd
+// or emeans: the RaBitQ list trainer), LUXIR_IVF_POINTS (training vectors per
+// centroid) and LUXIR_IVF_SEED (clustering seed, for paired runs).
+struct IvfTrainingBenchGuard {
+  SearchOverridesGuard<VectorIndexBuilder::Trainer, int64_t, int32_t> saved{
+    VectorIndexBuilder::ivfTrainer, VectorIndexBuilder::ivfTrainingPointsPerCentroid,
+    VectorIndexBuilder::ivfTrainingSeed};
+
+  IvfTrainingBenchGuard() {
+    if (const char* trainer = std::getenv("LUXIR_IVF_TRAINER"); trainer && *trainer) {
+      std::string_view name(trainer);
+      if (name != "lloyd" && name != "emeans") {
+        throw std::invalid_argument("LUXIR_IVF_TRAINER must be lloyd or emeans");
+      }
+      VectorIndexBuilder::ivfTrainer = name == "lloyd"
+          ? VectorIndexBuilder::Trainer::LLOYD : VectorIndexBuilder::Trainer::EMEANS;
+    }
+    if (const char* points = std::getenv("LUXIR_IVF_POINTS"); points && *points) {
+      VectorIndexBuilder::ivfTrainingPointsPerCentroid = std::atoll(points);
+    }
+    if (const char* seed = std::getenv("LUXIR_IVF_SEED"); seed && *seed) {
+      VectorIndexBuilder::ivfTrainingSeed = std::atoi(seed);
     }
   }
 };
@@ -1326,6 +1358,7 @@ void BM_VectorAnnDataset(benchmark::State& state) {
       if ((i + 1) % perSeg == 0 || i + 1 == ds->nBase) helper.commit();
     }
     // Production build policy and schema settings; only the aux commit is timed.
+    IvfTrainingBenchGuard training;
     auto start = std::chrono::steady_clock::now();
     helper.commit({"vec.bench_v"});
     buildSecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -1432,6 +1465,102 @@ void BM_VectorAnnDataset(benchmark::State& state) {
   state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
 }
 
+double processCpuSeconds() {
+  rusage usage{};
+  getrusage(RUSAGE_SELF, &usage);
+  auto secs = [](const timeval& t) { return (double)t.tv_sec + (double)t.tv_usec / 1e6; };
+  return secs(usage.ru_utime) + secs(usage.ru_stime);
+}
+
+// RaBitQ list training alone on LUXIR_VECTOR_DATASET (see BM_VectorAnnDataset),
+// as the builder trains it: its strided sample of ivfTrainingPointsPerCentroid
+// rows per list (nlist from LUXIR_VECTOR_NLIST or the sqrt(N) default),
+// normalized for cosine and rotated, on the builder's row-partitioned
+// quantizer in the calling arena.  `trainer` 0 is IndexIVF's k-means
+// (Clustering with its parameters) at `niter` iterations; 1 is e-means with
+// removal-cost revival and 2 with mass revival.  `seed` pairs the arms.
+// Reports process CPU seconds (robust to other load on the machine) and, over
+// every base row, the clustering loss (mean squared L2 distance, or mean
+// 1 - cosine) and the list imbalance nlist * sum(n_j^2) / N^2: the mean size,
+// relative to an even split, of the list a row falls in.
+void BM_VectorIvfTraining(benchmark::State& state) {
+  const VectorDataset* ds = VectorDataset::get();
+  if (skipBenchIfDataMissing(state, ds != nullptr, "LUXIR_VECTOR_DATASET")) return;
+  int64_t trainer = state.range(0);
+  int32_t niter = (int32_t)state.range(1);
+  int32_t seed = (int32_t)state.range(2);
+  const char* nlistEnv = std::getenv("LUXIR_VECTOR_NLIST");
+  int32_t nlist = nlistEnv ? std::atoi(nlistEnv) : defaultIvfNList(ds->nBase);
+  int32_t dims = ds->dims;
+  faiss::MetricType metric = ds->metric == api::VectorMetric::L2 ? faiss::METRIC_L2
+                                                                  : faiss::METRIC_INNER_PRODUCT;
+  static std::vector<float> base;  // the corpus in index space, shared across instances
+  if (base.empty()) {
+    base.assign(ds->data.begin(), ds->data.begin() + ds->nBase * dims);
+    if (ds->metric == api::VectorMetric::COSINE) {
+      faiss::fvec_renorm_L2((size_t)dims, (size_t)ds->nBase, base.data());
+    }
+    VectorRotation rotation(VectorRotation::FHT_KAC, dims, VectorIndexBuilder::RABITQ_ROTATION_SEED);
+    rotation.applyBatch(ds->nBase, base.data(), base.data());
+  }
+  int64_t ntrain = std::min<int64_t>(ds->nBase,
+      VectorIndexBuilder::ivfTrainingPointsPerCentroid * nlist);
+  std::vector<float> sample((size_t)ntrain * dims);
+  for (int64_t i = 0; i < ntrain; i++) {
+    std::copy_n(base.data() + (i * ds->nBase / ntrain) * dims, dims, sample.data() + i * dims);
+  }
+
+  auto quantizer = VectorIndexBuilder::newCoarseQuantizer(dims, metric);
+  double cpu = 0;
+  EMeans::Result trained;
+  for (auto _ : state) {
+    auto wallStart = std::chrono::steady_clock::now();
+    double cpuStart = processCpuSeconds();
+    if (trainer == 0) {
+      faiss::ClusteringParameters cp;
+      cp.niter = niter;
+      cp.seed = seed;
+      cp.spherical = metric == faiss::METRIC_INNER_PRODUCT;
+      cp.min_points_per_centroid = 1;
+      quantizer->reset();
+      faiss::Clustering clus(dims, nlist, cp);
+      clus.train(ntrain, sample.data(), *quantizer);
+    } else {
+      EMeans::Params params{.seed = (uint64_t)seed, .spherical = metric == faiss::METRIC_INNER_PRODUCT,
+          .revival = trainer == 1 ? EMeans::Revival::REMOVAL_COST : EMeans::Revival::MASS};
+      trained = EMeans::train(ntrain, sample.data(), nlist, params, *quantizer);
+    }
+    cpu += processCpuSeconds() - cpuStart;
+    state.SetIterationTime(std::chrono::duration<double>(std::chrono::steady_clock::now() - wallStart).count());
+  }
+
+  std::vector<float> distances((size_t)ds->nBase);
+  std::vector<faiss::idx_t> labels((size_t)ds->nBase);
+  quantizer->search(ds->nBase, base.data(), 1, distances.data(), labels.data());
+  double loss = 0;
+  std::vector<double> sizes((size_t)nlist);
+  for (int64_t i = 0; i < ds->nBase; i++) {
+    faiss::idx_t label = labels[(size_t)i];
+    if (label < 0 || label >= nlist) {
+      state.SkipWithError("search returned no list");
+      return;
+    }
+    loss += metric == faiss::METRIC_L2 ? (double)distances[(size_t)i] : 1.0 - (double)distances[(size_t)i];
+    sizes[(size_t)label] += 1;
+  }
+  double squares = 0;
+  for (double size : sizes) squares += size * size;
+  state.counters["cpuSecs"] = cpu / (double)state.iterations();
+  state.counters["loss"] = loss / (double)ds->nBase;
+  state.counters["imbalance"] = (double)nlist * squares / ((double)ds->nBase * (double)ds->nBase);
+  state.counters["splits"] = (double)trained.splits;
+  state.counters["handedOver"] = (double)trained.handedOver;
+  state.counters["reassigned"] = (double)trained.reassigned;
+  state.counters["nlist"] = nlist;
+  state.counters["ntrain"] = (double)ntrain;
+  state.counters["dims"] = dims;
+}
+
 }  // namespace
 
 // Real-corpus codec comparison (see BM_VectorAnnDataset); needs
@@ -1450,6 +1579,17 @@ TUNING_BENCHMARK(BM_VectorAnnDataset)->ArgNames({"codec", "nprobe", "cand"})
       datasetSweep(b, PQ);
       datasetSweep(b, PQ_D8);
     })->UseRealTime()->MinTime(2.0);
+
+// IndexIVF's k-means at its 10 iterations and at the equal-CPU 5 and 3,
+// against e-means (5 passes) with each revival rule, over three paired seeds.
+BENCHMARK(BM_VectorIvfTraining)->Name("Tuning/BM_VectorIvfTraining")
+    ->ArgNames({"trainer", "niter", "seed"})
+    ->Apply([](benchmark::Benchmark* b) {
+      for (int64_t seed : {1234, 7, 99}) {
+        for (int64_t niter : {10, 5, 3}) b->Args({0, niter, seed});
+        b->Args({1, 0, seed})->Args({2, 0, seed});
+      }
+    })->UseManualTime()->Iterations(1);
 
 // Plain BENCHMARK: manual time is incompatible with the UseRealTime() that
 // LUXIR_BENCHMARK appends.
