@@ -1459,6 +1459,10 @@ public:
       rankEligibility.reserve(numSegs);
       for (size_t i = 0; i < numSegs; i++) rankEligibility.emplace_back(&rankMemory);
       std::vector<std::span<const uint8_t>> eligibleSpans(numSegs);
+      // Completion compares against exact work at the folded count once a
+      // multi-valued estimate is replaced by the exact eligible-vector count.
+      std::vector<double> exactCosts(numSegs);
+      for (size_t i = 0; i < numSegs; i++) exactCosts[i] = plan.prices[i].exactCost;
       auto foldDomainAt = [&](size_t i) {
         auto& ranks = rankEligibility[i];
         if (!ranks.bits.empty()) return;
@@ -1474,6 +1478,12 @@ public:
         } else {
           ranks.original = foldDomain(vr, *domain, seg.maxDoc(), ranks.owned, workBySeg[i]);
           ranks.bits = ranks.owned;
+          if (planSegments[i].vectorsEstimated) {
+            auto exact = planSegments[i];
+            exact.eligibleVectors = ranks.original;
+            exact.vectorsEstimated = false;
+            exactCosts[i] = KnnPlanner::price(exact, planRequest, tuning.plannerCosts).exactCost;
+          }
         }
         ranks.remaining = ranks.original;
         eligibleSpans[i] = ranks.bits;
@@ -1599,7 +1609,7 @@ public:
               && (input.unfiltered || KnnPlanner::borrowDomain(input)))
             marginal += ((input.vectors + 63) / 64) * tuning.plannerCosts.units[KnnPlanner::FOLD_WORD];
           double cumulative = tuning.plannerCosts.price(KnnPlanner::actualWork(input, spent));
-          double exact = plan.prices[i].exactCost;
+          double exact = exactCosts[i];
           if (!force && cumulative + marginal <= exact) continue;
           completions.push_back({(int32_t)i, roundNumber, force ? "forced" : marginal > exact ? "marginal" : "cumulative",
               exact, marginal, cumulative, spent.physicalEntries, spent.ivfRounds});

@@ -5195,6 +5195,43 @@ TEST_F(KnnQueryTest, completionRecoversUnpooledMaximumBeyondCandidateCap) {
   EXPECT_EQ(1, stats.switches.load());
 }
 
+TEST_F(KnnQueryTest, completionPricesFoldedMultiValuedEligibility) {
+  // Heavy docs hold 8 vectors, light docs 1: a bitset filter on heavy docs is
+  // estimated at the average multiplicity (4.5) until the round-one fold.
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf(16);
+  SearchOverridesGuard saved(KnnQuery::tuning.completion, KnnQuery::statsForTests);
+  KnnQuery::tuning.completion = KnnQuery::Completion::FORCE;
+  CollectionHelper h("main");
+  installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  for (int i = 0; i < 4096; i++) {
+    bool heavy = i % 2 == 0;
+    std::vector<std::vector<float>> vectors;
+    for (int j = 0; j < (heavy ? 8 : 1); j++) vectors.push_back({(float)i + 1 + j * 0.01f, 0, 0, 0});
+    h.index(flatdoc("id", std::to_string(i), "heavy_s", heavy ? "yes" : "no", "emb_vs", vectors));
+  }
+  h.commit({"*"});
+  KnnQuery::Stats stats;
+  KnnQuery::statsForTests = &stats;
+  auto req = localReq(h.getSearchEngine());
+  req->collection("main").profile();
+  auto& cur = req->topDocs("q");
+  configKnn(cur, "emb_vs", {0, 0, 0, 0}, 3);
+  addMatchFilter(cur, "heavy_s", "yes");
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& piece = req->responses.back()->proto.profile->ops.at(0).pieces.at(0);
+  EXPECT_EQ(9216, profileNumber(piece, "eligible_vectors")); // Actual: 2048 * 8 = 16384.
+  EXPECT_EQ(16384 * 4, profileNumber(piece, "exact_dims")); // Completion scored the actual count.
+  auto planned = profileNumber(piece, "exact_cost");
+  ASSERT_TRUE(planned);
+  ASSERT_EQ(1u, stats.completions.size());
+  // Completion prices exact scoring at the folded count; only that term depends on it.
+  double perVector = 4 * KnnPlanner::Costs::ENCODING_DIM_COST[0][(size_t)VectorEncoding::F32]
+      * KnnQuery::tuning.plannerCosts.units[KnnPlanner::EXACT_DIM];
+  EXPECT_DOUBLE_EQ(*planned + (16384 - 9216) * perVector, stats.completions[0].exact);
+}
+
 TEST_F(KnnQueryTest, forcedCompletionMatchesExactAcrossSegments) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);
