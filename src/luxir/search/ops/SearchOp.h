@@ -194,6 +194,12 @@ public:
     : segmentStateRetentions(view->segments().size()), req(req), view(view), name(name) {
   }
 
+  // Runs once, serially, after construction from parsed, validated inputs and
+  // before init(). Create query contexts and weights and make weight-dependent
+  // choices here. The caller orders materialization for each op.
+  virtual void materialize() {}
+
+  // Initialize the materialized op tree for execution.
   virtual void init() {
     for (auto& [name, subOp] : subOps) {
       subOp->init();

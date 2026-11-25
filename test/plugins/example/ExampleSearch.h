@@ -12,6 +12,7 @@
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/QueryRegistry.h"
 #include "luxir/query/ParseContext.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/search/DocSet.h"
@@ -172,6 +173,75 @@ inline luxir::SearchOp* makeSampleDocs(luxir::PluginOpContext& ctx) {
   ctx.params.rejectUnknown();
   ctx.addSubs(*op);
   return op;
+}
+
+// query_count returns the number of matches within its input domain.
+class QueryCountOp final : public luxir::SearchOp {
+  luxir::Query& query;
+  luxir::Query::PlanningContext& planning;
+  // The unscored root weight, bound in materialize().
+  luxir::Query::Weight* weight = nullptr;
+
+public:
+  QueryCountOp(luxir::SearchRequest& req, const std::shared_ptr<luxir::IndexReader>& view,
+               std::string_view name, luxir::Query& query, luxir::Query::PlanningContext& planning)
+    : SearchOp(req, view, name), query(query), planning(planning) {}
+
+  void materialize() override {
+    auto* context = luxir::Query::Context::create(&req.arena, planning);
+    weight = context->createRootWeight(query, 0);
+    if (weight->needsPrepare()) throw luxir::RequestError("query_count requires a segment-local query");
+  }
+
+  void releaseSegmentState(luxir::IndexReader::Segment& segment) noexcept override {
+    if (segmentStateRetained(segment)) return;
+    weight->releaseSegmentState(segment);
+    SearchOp::releaseSegmentState(segment);
+  }
+
+  class Calc final : public Calculator {
+    std::atomic<int64_t> total = 0;
+    // The last segment emits the total after all segments have contributed.
+    std::atomic<size_t> remaining;
+
+  public:
+    Calc(QueryCountOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+         const luxir::StructuralConstraint* structural)
+      : Calculator(op, parent, slot, numSlots, structural), remaining(op.view->segments().size()) {}
+
+    luxir::api::Val* getTargetForSub(luxir::SearchResponse*, SearchOp&) override {
+      std::unreachable();
+    }
+
+    void calc(luxir::FanoutScope*, int32_t segnum, luxir::DomainHandle domain) override {
+      if (segnum >= 0) {
+        auto& segment = op.view->segments()[(size_t)segnum];
+        auto release = luxir::scope_guard([&]() noexcept { releaseSegmentState(segment); });
+        auto guard = luxir::MemPool::threadLocalPoolGuard();
+        auto& pool = guard.pool();
+        auto* supplier = ((QueryCountOp&)op).weight->scorerSupplier(pool, segment);
+        total.fetch_add(luxir::QueryPrep::countSegment(
+            pool, supplier, domain.get(), segment.maxDoc()), std::memory_order_relaxed);
+        if (remaining.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+      }
+      *slotArm<int64_t>(nullptr) = total.load(std::memory_order_relaxed);
+    }
+  };
+
+  Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots,
+                               const luxir::StructuralConstraint* structural) override {
+    return new Calc(*this, parent, slot, numSlots, structural);
+  }
+};
+
+inline luxir::SearchOp* makeQueryCount(luxir::PluginOpContext& ctx) {
+  const auto* param = ctx.params.get("query");
+  if (param == nullptr) ctx.params.fail("query", "is required");
+  ctx.params.rejectUnknown();
+  if (!ctx.proto.ops.empty()) throw luxir::RequestError("query_count does not accept child operations");
+  auto* query = ctx.parseQuery(*param);
+  return luxir::arenaCreate<QueryCountOp>(
+      ctx.req.arena, ctx.req, ctx.view, ctx.name, *query, ctx.planning());
 }
 
 }  // namespace example

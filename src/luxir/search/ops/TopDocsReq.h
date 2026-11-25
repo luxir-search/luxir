@@ -163,7 +163,7 @@ public:
              bool requestNeedsScores, Preparation preparation);
 
   // Runs once after construction to build the contexts, weights, filter uses and execution routes.
-  void materialize();
+  void materialize() override;
 
   std::vector<ExtraColumn> rowColumns();
 

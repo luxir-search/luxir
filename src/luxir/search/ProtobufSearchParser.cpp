@@ -590,7 +590,11 @@ public:
       },
       [&](std::monostate) -> SearchOp* { throw std::runtime_error("search op oneof not set"); },
     }, searchOp.kind);
-    if (op != nullptr) { op->flags = options.flags; op->inputDomain = input; }
+    if (op != nullptr) {
+      op->flags = options.flags;
+      op->inputDomain = input;
+      if (std::holds_alternative<luxir::api::PluginOp>(searchOp.kind)) op->materialize();
+    }
     return op;
   }
 
@@ -2043,9 +2047,10 @@ public:
         });
     qr->materialize();
     if (placement != TopDocsPlacement::FUSION_SOURCE && !topDocsReq.decorate.empty()) {
-      DecoratorContext::QuerySource source{qr->resultQuery, decoratorQueryContext(*qr)};
+      HitDecorator::QuerySource bound{qr->resultQuery, decoratorQueryContext(*qr)};
+      DecoratorContext::QuerySource source{qr->resultQuery, qr->planning};
       DecoratorContext dc{req, parseContext, {&source, 1}};
-      qr->decorators = HitDecoratorRegistry::global().make(topDocsReq.decorate, dc);
+      qr->decorators = HitDecoratorRegistry::global().make(topDocsReq.decorate, dc, {&bound, 1});
     } else if (placement == TopDocsPlacement::FUSION_SOURCE && !topDocsReq.decorate.empty()) {
       throw RequestError("fusion sources cannot decorate; put decorate on fusion");
     }
@@ -2110,7 +2115,6 @@ public:
     int depth;
     ParseContext context;
     Query::PlanningContext* planningContext = nullptr;
-    Query::Context* executionContext = nullptr;
 
   public:
     PluginOpContextImpl(SearchParserImpl& parser, std::string_view name, const luxir::api::PluginOp& proto, int depth)
@@ -2127,11 +2131,6 @@ public:
         planningContext = parser.createPlanningContext(name);
       }
       return *planningContext;
-    }
-
-    Query::Context& weightContext() override {
-      if (executionContext == nullptr) executionContext = Query::Context::create(&req.arena, planning());
-      return *executionContext;
     }
 
     Query* parseQuery(const luxir::api::Query& query) override {
@@ -2317,12 +2316,14 @@ public:
       fusion->headSort = parseSorts(fusionProto.collapse->head_sort);
     }
     if (!fusionProto.decorate.empty()) {
+      std::vector<HitDecorator::QuerySource> boundQueries;
       std::vector<DecoratorContext::QuerySource> resultQueries;
       for (auto* source : fusion->sources) {
-        resultQueries.push_back({source->resultQuery, decoratorQueryContext(*source)});
+        boundQueries.push_back({source->resultQuery, decoratorQueryContext(*source)});
+        resultQueries.push_back({source->resultQuery, source->planning});
       }
       DecoratorContext dc{req, parseContext, resultQueries};
-      fusion->decorators = HitDecoratorRegistry::global().make(fusionProto.decorate, dc);
+      fusion->decorators = HitDecoratorRegistry::global().make(fusionProto.decorate, dc, boundQueries);
     }
     fusion->diverseSources = std::ranges::any_of(fusion->sources,
         [](const TopDocsReq* source) { return source->collapse != nullptr || source->diversify != nullptr; });
