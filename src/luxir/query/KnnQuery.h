@@ -1086,10 +1086,19 @@ public:
           binding.owners = query.relation->mapper(i);
         }
       }
-      std::span<DocSet* const> sourceDomain = [&]() -> std::span<DocSet* const> {
-        if constexpr (Owned) return domains;
-        else return ctx.domainPerSeg;
-      }();
+      if constexpr (!Owned) if (!ctx.domainPerSeg.empty()) {
+        // A domain is live-filtered (Query.h), so one holding every live
+        // doc is the live set itself: a filter on a dense field's exists,
+        // a range over every doc. Route it as unfiltered (rank-live bitmap
+        // or no selector, unfiltered pricing) rather than as a filter.
+        domains.assign(ctx.domainPerSeg.begin(), ctx.domainPerSeg.end());
+        for (size_t i = 0; i < numSegs; i++) {
+          auto& seg = reader.segments()[i];
+          DocSet*& domain = domains[i];
+          if (domain && domain != seg.liveDocSet() && domain->card() == seg.numLive()) domain = seg.liveDocSet();
+        }
+      }
+      std::span<DocSet* const> sourceDomain = domains;
       std::vector<int64_t> segVectorCounts(numSegs, 0);
       std::vector<int64_t> segLiveVectorCounts(numSegs, 0);
       std::vector<SegmentEligibility> eligibilityPerSeg(numSegs);
@@ -1174,7 +1183,7 @@ public:
               input.domain = binding.unitDomain != nullptr;
               input.deletes = owner.mayHaveDeletes();
             } else {
-              DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
+              DocSet* domain = sourceDomain.empty() ? nullptr : sourceDomain[i];
               eligible = countEligible(vr, domain, seg.liveDocs(), seg.maxDoc());
               segLiveVectorCounts[i] = eligible.unfiltered && !vr.multiValued()
                   ? eligible.eligibleVectors : liveVectorUpperBound(seg, vr, query.getField());

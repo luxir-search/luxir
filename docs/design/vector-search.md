@@ -594,7 +594,10 @@ The FAISS index bytes are decoded lazily on first kNN use and then cached on
 the segment reader.
 
 Routing uses column and overlay metadata before loading FAISS or rank-liveness
-state. Single-valued eligibility counts are exact. Unfiltered multi-valued
+state. A domain holding every live doc (a range or `exists` matching all of a
+segment) is the live set, since domains are live-filtered, so it routes as
+unfiltered: no selector without deletes, the rank-liveness bitmap with them,
+and unfiltered pricing. Single-valued eligibility counts are exact. Unfiltered multi-valued
 columns use upper bounds without a domain walk; IVF replaces their live-vector
 bound with the cached rank-liveness count. Filtered multi-valued counts sum
 value ranges for array domains or when the domain or its complement has at

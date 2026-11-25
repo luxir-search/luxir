@@ -4377,6 +4377,39 @@ TEST_F(KnnQueryTest, filteredFlatWorkIgnoresSurroundingColumn) {
   }
 }
 
+TEST_F(KnnQueryTest, filterMatchingEveryLiveDocRunsUnfiltered) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::statsForTests);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(8, 2, 2), 4);
+  for (int i = 0; i < 512; i++)
+    h.index(flatdoc("id", std::to_string(i), "all_s", "yes", "keep_s", i == 7 ? "no" : "yes",
+        "emb_v", std::vector<float>{(float)i + 1, 0, 0, 0}));
+  h.commit({"*"});
+  auto run = [&](std::string_view filter) {
+    KnnQuery::Stats stats;
+    KnnQuery::statsForTests = &stats;
+    auto req = localReq(h.getSearchEngine());
+    auto& cur = req->topDocs("q");
+    configKnn(cur, "emb_v", {0, 0, 0, 0}, 5);
+    if (!filter.empty()) addMatchFilter(cur, filter, "yes");
+    req->execute(false);
+    EXPECT_OK(req);
+    KnnQuery::statsForTests = nullptr;
+    return std::tuple{resultIds(*req), stats.work.selectorNone, stats.work.selectorBitmap, stats.targetExamined.load()};
+  };
+  // Without deletes the full filter scans with no selector, like no filter.
+  auto unfiltered = run("");
+  EXPECT_GT(std::get<1>(unfiltered), 0);
+  EXPECT_EQ(unfiltered, run("all_s"));
+  // With deletes, a filter whose only misses are deleted is the live set.
+  h.deleteByIds({"7"}, UpdateMessage::COMMIT);
+  unfiltered = run("");
+  EXPECT_GT(std::get<2>(unfiltered), 0);
+  EXPECT_EQ(unfiltered, run("keep_s"));
+}
+
 TEST_F(KnnQueryTest, filteredFlatExcludesPooledDocumentRun) {
   class ExcludingEngine final : public VectorEngine {
     VectorEngine& inner;
@@ -4397,7 +4430,10 @@ TEST_F(KnnQueryTest, filteredFlatExcludesPooledDocumentRun) {
   h.indexAll({flatdoc("id", "a", "keep_s", "yes", "emb_vs",
                      std::vector<std::vector<float>>{{1, 0}, {0, 0}, {2, 0}}),
               flatdoc("id", "b", "keep_s", "yes", "emb_vs",
-                     std::vector<std::vector<float>>{{3, 0}})}, UpdateMessage::COMMIT);
+                     std::vector<std::vector<float>>{{3, 0}}),
+              // Excluded, so the filter is not the whole live set.
+              flatdoc("id", "c", "keep_s", "no", "emb_vs",
+                     std::vector<std::vector<float>>{{9, 0}})}, UpdateMessage::COMMIT);
   SearchOverridesGuard saved(KnnQuery::tuning.flatDomainDensityThreshold, KnnQuery::statsForTests);
   KnnQuery::tuning.flatDomainDensityThreshold = INFINITY;
   EngineWrapperGuard wrapper([](VectorEngine& engine) { return std::make_unique<ExcludingEngine>(engine); });
@@ -5741,7 +5777,7 @@ TEST_F(KnnQueryTest, documentCompletionPreservesSatisfiedPool) {
   installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(16, 2, 2), 4);
   for (int s = 0; s < 2; s++) {
     for (int i = 0; i < 1024; i++) {
-      bool keep = s || i == 1023;
+      bool keep = s ? i > 0 : i == 1023; // Not every doc: segment 1 stays filtered.
       float value = !s && keep ? 10000 : (float)i * (s ? 1.5f : 1.0f);
       h.index(flatdoc("id", std::to_string(s * 1024 + i), "keep_s", keep ? "yes" : "no",
           "emb_vs", std::vector<std::vector<float>>(i == 1022 ? 2 : 1, {value, 0, 0, 0})));
@@ -5769,7 +5805,7 @@ TEST_F(KnnQueryTest, documentCompletionPreservesSatisfiedPool) {
       EXPECT_EQ(VectorSearchRound::COMPLETION, rounds.back().kind);
       EXPECT_EQ(0, rounds.back().result.work.physicalEntries);
       EXPECT_EQ(1, stats.segmentWork[1].ivfRounds);
-      EXPECT_EQ(0, stats.segmentWork[1].foldDocs); // All docs: the empty complement.
+      EXPECT_EQ(1, stats.segmentWork[1].foldDocs); // The one-doc complement.
       EXPECT_EQ(17, stats.segmentWork[1].foldWords); // One fold, no reopening.
     }
   }
