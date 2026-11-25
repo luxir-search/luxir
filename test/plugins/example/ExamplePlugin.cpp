@@ -14,6 +14,7 @@
 #include "luxir/api/build.h"
 #include "ExampleQuery.h"
 #include "luxir/plugin/Registries.h"
+#include "luxir/reader/ReaderErrors.h"
 #include "luxir/server/LuxirNode.h"
 #include "test/StrictStorage.h"
 
@@ -236,6 +237,12 @@ void noParams(const api::AnalyzerComponent& def) {
 
 namespace {
 
+// How example_field_list overlays open: 0 normally, 1 throws SegmentCorruptError
+// (what invalid bytes do), 2 throws another exception.
+std::atomic<int> overlayOpenMode{0};
+
+std::shared_ptr<AuxReader> openFieldList(std::span<const std::shared_ptr<InputFile>> files, const api::AuxIndexInfo& info);
+
 class FieldListOverlay final : public SegmentOverlayKind {
   bool fail;
 
@@ -274,6 +281,18 @@ public:
   std::string_view getKind() const override { return "example_field_list"; }
   std::string_view getName() const override { return name; }
 };
+
+namespace {
+
+std::shared_ptr<AuxReader> openFieldList(std::span<const std::shared_ptr<InputFile>> files, const api::AuxIndexInfo& info) {
+  if (overlayOpenMode == 1) throw SegmentCorruptError("example_field_list: invalid bytes");
+  if (overlayOpenMode == 2) throw std::runtime_error("example_field_list: storage failure");
+  auto held = files.front()->acquire({0, files.front()->size()});
+  auto bytes = held.bytes();
+  return std::make_shared<FieldListReader>(info, std::string(bytes.data(), bytes.size()));
+}
+
+}  // namespace
 
 // Test-only plugin that exercises the plugin framework: analysis components,
 // query types, search ops, HTTP routes, the node lifecycle, and storage
@@ -377,11 +396,16 @@ public:
       .maker = [](const SegmentOverlayContext& ctx) -> std::unique_ptr<SegmentOverlayKind> {
         return std::make_unique<FieldListOverlay>(ctx.params.getBool("fail", false));
       },
-      .open = [](std::span<const std::shared_ptr<InputFile>> files, const api::AuxIndexInfo& info) -> std::shared_ptr<AuxReader> {
-        auto held = files.front()->acquire({0, files.front()->size()});
-        auto bytes = held.bytes();
-        return std::make_shared<FieldListReader>(info, std::string(bytes.data(), bytes.size()));
+      .open = openFieldList,
+    });
+
+    // The same kind, but queries need it: invalid bytes fail every use.
+    r.segmentOverlays.add("example_field_list_required", {
+      .maker = [](const SegmentOverlayContext& ctx) -> std::unique_ptr<SegmentOverlayKind> {
+        return std::make_unique<FieldListOverlay>(ctx.params.getBool("fail", false));
       },
+      .open = openFieldList,
+      .policy = OverlayPolicy::REQUIRED,
     });
 
     r.query.add("doc_ids", ::example::docIdsDef());
@@ -459,6 +483,7 @@ public:
 }  // namespace luxir::example
 
 // For the node-construction failure test.
+void exampleSetOverlayOpenMode(int mode) { luxir::example::overlayOpenMode = mode; }
 void exampleThrowOnNodeStateCreation(bool value) { luxir::example::ExamplePlugin::throwOnNodeStateCreation.store(value); }
 
 LUXIR_PLUGIN(example, luxir::example::ExamplePlugin)

@@ -4,6 +4,9 @@
 #include "luxir/index/SegmentOverlayRegistry.h"
 
 #include <algorithm>
+#include <format>
+
+#include <xxhash.h>
 #include <stdexcept>
 
 #include "luxir/api/padded_input.h"
@@ -33,13 +36,14 @@ SegmentOverlaySpec::SegmentOverlaySpec(const api::SegmentOverlayDef& source) {
   if (!api::decode(def, api::copyToPaddedInput(bytes, arena), arena)) {
     throw std::runtime_error("Failed to parse SegmentOverlayDef");
   }
-}
-
-std::string SegmentOverlaySpec::overlayName() const {
-  std::string name(def.kind);
-  name.push_back('.');
-  name.append(def.name);
-  return name;
+  overlayNameText = std::string(def.kind) + "." + std::string(def.name);
+  // Name and min_docs do not change what a built overlay holds.
+  api::SegmentOverlayDef content = def;
+  content.name = {};
+  content.min_docs = 0;
+  std::vector<std::byte> contentBytes;
+  if (!api::encode(content, contentBytes)) throw std::runtime_error("Failed to serialize SegmentOverlayDef");
+  contentHash = std::format("{:016x}", XXH3_64bits(contentBytes.data(), contentBytes.size()));
 }
 
 std::vector<std::string> SegmentOverlaySpec::resolveFields(PostingsReader& segment) const {

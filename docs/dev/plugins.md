@@ -476,14 +476,27 @@ A kind (`SegmentOverlayKindInfo`) has:
   `nullopt` means the segment needs no overlay. A build that throws leaves the segment
   without the overlay; indexing is not affected.
 - `open`: returns the `AuxReader` from the overlay's files, which the snapshot already
-  opened (in manifest order). It runs on first use, and reports invalid bytes by throwing
-  `SegmentCorruptError`.
+  opened (in manifest order). It runs on first use. Any exception it throws counts as
+  invalid bytes: it becomes a `SegmentCorruptError` that names the segment and overlay (the
+  plugin need not), so a failure that may be transient (a failed read) also disables an
+  `ADVISORY` overlay for the life of that snapshot.
 - `policy`: an `OverlayPolicy`. `ADVISORY` (the default) overlays with invalid bytes read
   as absent instead of taking the segment out of service; `REQUIRED` ones fail every use.
 
-Overlays are built when a merge finishes and, at commits, for segments that lack one, a few
-per commit: newly flushed segments and, after the schema gains an overlay, the older ones.
-Read a built overlay with `Segment::getAuxReader("<kind>.<name>")`.
+Overlays are built when a merge finishes and, at commits, for segments that lack one: at
+most 8 builds per commit, newest segments first, skipping segments that are inputs of a
+running merge. Covered segments (an overlay built from the same kind, fields and params, which
+`AuxInfo.field` records as a hash) cost nothing, including after a restart; a segment whose
+overlay was built from another definition is rebuilt and the stale files are deleted with the
+segment. A build that fails or returns `nullopt` is not retried by this writer lifetime. Merge
+outputs get their overlays built from the merge's schema; overlay files of a merge that fails
+are deleted with the rest of its output.
+
+A manifest entry whose kind no plugin registers is skipped when a snapshot opens (a warning,
+once per kind) and its files stay. The writer keeps the entry across commits; a merge does not
+carry it to the output, so the entry goes when its segment merges away. Read a built overlay
+with `Segment::getAuxReader("<kind>.<name>")`. Register kinds during startup only: `add()`
+throws once the registry is frozen.
 
 ## Analysis components
 

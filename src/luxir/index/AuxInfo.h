@@ -26,7 +26,7 @@ namespace luxir {
 
 struct AuxInfo {
   std::string kind;
-  std::string field;
+  std::string field;  // plugin segment overlays: hash of the definition they were built from
   std::string name;
   std::uint64_t gen = 0;
   std::uint64_t commit_time = 0;

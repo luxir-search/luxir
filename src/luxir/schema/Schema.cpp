@@ -1097,19 +1097,29 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
   }
   std::ranges::sort(resources, {}, &ResourcePair::first);
 
-  // The overlay list is replaced only when the def names one.
-  std::span<const api::SegmentOverlayDef> segmentOverlays = !def.segment_overlays.empty() ? def.segment_overlays : baseSrc.segment_overlays;
+  // Overlays merge by name like the other definitions: a named overlay is set, the others
+  // are kept, and a named overlay with no kind removes it. REPLACE_ALL has no base.
+  std::vector<api::SegmentOverlayDef> segmentOverlays(baseSrc.segment_overlays.begin(), baseSrc.segment_overlays.end());
   {
-    std::set<std::string_view> overlayNames;
-    for (const auto& overlay : segmentOverlays) {
-      if (!overlayNames.insert(overlay.name).second) {
+    std::set<std::string_view> requested;
+    for (const auto& overlay : def.segment_overlays) {
+      if (!requested.insert(overlay.name).second) {
         throw SchemaError("segment_overlays: duplicate overlay '" + std::string(overlay.name) + "'");
+      }
+      auto existing = std::ranges::find(segmentOverlays, overlay.name, &api::SegmentOverlayDef::name);
+      if (overlay.kind.empty()) {
+        if (existing != segmentOverlays.end()) segmentOverlays.erase(existing);
+        continue;
       }
       try {
         SegmentOverlayRegistry::global().validate(overlay);
       } catch (const std::invalid_argument& e) {
         throw SchemaError(std::string("segment_overlays: ") + e.what());
       }
+      if (existing != segmentOverlays.end()) *existing = overlay;
+      else segmentOverlays.push_back(overlay);
+    }
+    for (const auto& overlay : segmentOverlays) {
       schema->segmentOverlays.push_back(std::make_shared<const SegmentOverlaySpec>(overlay));
     }
   }
@@ -1171,7 +1181,7 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(templatePairs.data(), templatePairs.size()));
     src.stored_resources = luxir::api::map_view<std::string_view, api::StoredResourceDef>(
       std::span<const ResourcePair>(resources.data(), resources.size()));
-    src.segment_overlays = segmentOverlays;
+    src.segment_overlays = std::span<const api::SegmentOverlayDef>(segmentOverlays.data(), segmentOverlays.size());
     schema->sourceDef_ = serializeSchemaDef(src);
   }
 

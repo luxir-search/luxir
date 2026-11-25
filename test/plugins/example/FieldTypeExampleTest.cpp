@@ -459,6 +459,18 @@ TEST_F(FieldTypeExampleTest, mergesWithDeletesKeepDerivedFields) {
   EXPECT_EQ((Strings{R"({"a":0,"b":100})", R"({"a":2,"b":98})", R"({"a":3,"b":97})"}), values(body, "pt"));
 }
 
+// Overwriting a document replaces its derived values, and deleting removes it from them.
+TEST_F(FieldTypeExampleTest, overwriteAndDeleteReplaceDerivedValues) {
+  putSchema(helper.collection(), PAIR_SCHEMA);
+  update(R"([{"id":"a","pt":{"a":1,"b":2}},{"id":"b","pt":{"a":3,"b":4}}])");
+  update(R"([{"id":"a","pt":{"a":5,"b":6}}])");
+  EXPECT_EQ((Strings{}), ids(R"("pt$a:1")"));
+  EXPECT_EQ((Strings{"a"}), ids(R"("pt$a:5")"));
+  helper.deleteByIds({"b"}, UpdateMessage::COMMIT);
+  EXPECT_EQ((Strings{}), ids(R"("pt$a:3")"));
+  EXPECT_EQ((Strings{"a"}), ids(R"({"all":true})"));
+}
+
 class FieldTypeGrpcTest : public GrpcLuxirTest {};
 
 TEST_F(FieldTypeGrpcTest, objectsOverProtobuf) {

@@ -26,6 +26,8 @@
 #include <bit>
 #include <cstring>
 #include <map>
+#include <mutex>
+#include <set>
 #include <memory_resource>
 #include <span>
 
@@ -61,6 +63,17 @@ OverlayPolicy overlayPolicyOf(std::string_view kind) {
   return OverlayPolicy::REQUIRED;
 }
 
+// Once per kind and process: the manifest keeps such entries, so every snapshot meets them again.
+void warnUnknownOverlayKind(std::string_view kind) {
+  static std::mutex mutex;
+  static std::set<std::string, std::less<>> warned;
+  {
+    std::lock_guard lock(mutex);
+    if (!warned.emplace(kind).second) return;
+  }
+  LOG_WARN("Segment overlays of kind '{}' are ignored: no plugin registers that kind. Their files are kept.", kind);
+}
+
 } // namespace
 
 bool SegmentOverlay::knownKind(std::string_view kind) {
@@ -92,12 +105,20 @@ std::shared_ptr<SegmentOverlay> SegmentOverlay::open(Directory& dir, const luxir
 }
 
 std::shared_ptr<AuxReader> SegmentOverlay::get() {
+  if (isUnusable()) return nullptr;
   return reader.getOrCreate([this]() -> std::shared_ptr<AuxReader> {
     std::pmr::monotonic_buffer_resource arena;
     auto entry = toWire(info, arena);
     try {
       const auto* registered = SegmentOverlayRegistry::global().find(info.kind);
-      if (registered) return registered->open(files, entry);
+      if (registered) {
+        // A plugin's failure of any kind counts as invalid bytes, named with the segment.
+        try {
+          return registered->open(files, entry);
+        } catch (const std::exception& e) {
+          corruptSegment(segment, std::format("overlay '{}' (kind '{}') did not open: {}", info.name, info.kind, e.what()));
+        }
+      }
       if (files.size() != 1) {
         corruptSegment(segment, std::format("overlay '{}': expected 1 file, got {}", info.name, files.size()));
       }
@@ -497,6 +518,7 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
         for (int j = 0; j < (int)segment.overlays.size(); j++) {
           const auto& info = segment.overlays[j];
           if (!SegmentOverlay::knownKind(info.kind)) {
+            warnUnknownOverlayKind(info.kind);
             IREADER_DEBUG("Skipping unknown overlay kind '{}' for '{}'", info.kind, info.name);
             continue;
           }

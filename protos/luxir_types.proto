@@ -2821,9 +2821,13 @@ message SchemaDef {
   map<string, StoredResourceDef> stored_resources = 4;
 
   // Per-segment overlays registered by plugins (for example term filters),
-  // built for the segments of this collection. mode=set replaces the list
-  // only when the request names one. An unknown kind or a bad param fails the
-  // schema request. Segments written earlier gain an overlay at later commits.
+  // built for the segments of this collection. Entries are keyed by name:
+  // mode=set sets the named overlays and keeps the others, and an entry with
+  // an empty kind removes that name (its existing files stay with their
+  // segments until those are merged away). An unknown kind or a bad param
+  // fails the schema request. Segments written earlier gain an overlay at
+  // later commits, and an overlay whose kind, fields or params changed is
+  // rebuilt.
   repeated SegmentOverlayDef segment_overlays = 7;
 }
 

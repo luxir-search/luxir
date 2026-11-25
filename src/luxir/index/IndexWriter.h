@@ -109,6 +109,8 @@ public:
     // Plugin overlays this writer already tried to build for the segment, so
     // one that built nothing or failed is not rebuilt at every commit.
     boost::unordered_flat_set<std::string> attemptedPluginOverlays;
+    // Files of plugin overlays rebuilt from a changed definition; deleted with the segment.
+    std::vector<std::string> supersededOverlayFiles;
     uint64_t nextOverlayGen = 0; // high-water mark survives separately published drops
 
     uint64_t liveEpochFor(uint64_t gen, uint64_t writerEpoch) const { return gen == initialLiveGen ? initialLiveEpoch : writerEpoch; }
@@ -895,8 +897,11 @@ private:
   static constexpr size_t PLUGIN_OVERLAY_BUILDS_PER_COMMIT = 8;
   // Builds the schema's plugin overlays `seg` lacks. Never throws: an overlay
   // that fails is logged and the segment goes on without it. Returns the
-  // built overlays and adds their files to `outFiles`.
-  std::vector<AuxInfo> buildPluginOverlays(SegInfo& seg, const Schema& schema, std::vector<std::string>& outFiles) noexcept;
+  // built overlays and adds their files to `outFiles`. `builds` counts the
+  // overlays it really tried to build (the per-commit budget). An overlay
+  // that exists from the same definition is skipped for free.
+  std::vector<AuxInfo> buildPluginOverlays(SegInfo& seg, const Schema& schema, std::vector<std::string>& outFiles,
+                                           size_t& builds) noexcept;
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,
       SegmentCore& core,

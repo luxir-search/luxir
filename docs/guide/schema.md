@@ -591,8 +591,15 @@ documents get no overlay.
 
 An overlay never affects indexing or results if it fails to build or read: the
 segment simply goes without it. Segments written before the overlay was added
-gain it over later commits. An unknown kind or an invalid param fails the
-schema request. `mode=set` replaces the list only when the request names one.
+gain it over later commits, a few per commit. A segment whose overlay was
+built from another kind, `fields` or `params` is rebuilt the same way; changing
+only `name` or `min_docs` rebuilds nothing. An unknown kind or an invalid param
+fails the schema request.
+
+Overlays are keyed by `name`. `mode=set` sets the named overlays and keeps the
+others; an entry with only a `name` (no `kind`) removes that overlay, which
+stops new builds (files already written stay with their segments until those
+are merged away). `mode=replace_all` replaces the whole list.
 
 ## Text analysis
 

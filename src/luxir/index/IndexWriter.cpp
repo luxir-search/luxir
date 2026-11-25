@@ -2051,6 +2051,7 @@ void IndexWriter::retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments
     for (const auto& file : seg->baseFiles) names.push_back(file.name);
     if (seg->liveFile) names.push_back(seg->liveFile->name);
     for (const auto& overlay : seg->auxOverlays) for (const auto& file : overlay.files) names.push_back(file.name);
+    names.insert(names.end(), seg->supersededOverlayFiles.begin(), seg->supersededOverlayFiles.end());
     for (auto gen : seg->obsoleteLiveGens) names.push_back(Postings::getLiveDocsFileName(
         Postings::segmentKey(seg->segId, seg->creatorEpoch), gen, seg->liveEpochFor(gen, writerEpoch)));
     snapshots.retire(names);
@@ -2310,26 +2311,32 @@ void IndexWriter::prepareMergedVectorOverlays(SegInfo& output,
 }
 
 std::vector<AuxInfo> IndexWriter::buildPluginOverlays(SegInfo& seg, const Schema& schema,
-                                                      std::vector<std::string>& outFiles) noexcept {
+                                                      std::vector<std::string>& outFiles,
+                                                      size_t& builds) noexcept {
   std::vector<AuxInfo> built;
   for (const auto& spec : schema.segmentOverlays) {
-    std::string overlayName = spec->overlayName();
+    const std::string& overlayName = spec->overlayName();
     std::vector<std::string> staged;
     try {
       if (seg.maxDoc < spec->def.min_docs) continue;
-      if (!seg.attemptedPluginOverlays.insert(overlayName).second) continue;
-      if (std::ranges::any_of(seg.auxOverlays, [&](const AuxInfo& info) { return info.name == overlayName; })) continue;
+      // Covered: an overlay of this definition is already there (for example
+      // from before a restart). One built from another definition is rebuilt.
+      auto existing = std::ranges::find(seg.auxOverlays, overlayName, &AuxInfo::name);
+      if (existing != seg.auxOverlays.end() && existing->field == spec->contentHash) continue;
+      if (!seg.attemptedPluginOverlays.insert(overlayName + ":" + spec->contentHash).second) continue;
       auto core = getSegmentCore(seg);
       PostingsReader& reader = core->rootReader();
+      auto fields = spec->resolveFields(reader);
+      if (fields.empty()) continue;
+      builds++;
       uint64_t gen = nextSegmentOverlayGen(seg);
-      SegmentOverlayBuild request{seg.segId, seg.maxDoc, reader, spec->resolveFields(reader), dir,
+      SegmentOverlayBuild request{seg.segId, seg.maxDoc, reader, std::move(fields), dir,
                                   [&](uint32_t fnum) {
                                     std::string name = Postings::getSegmentOverlayFileName(seg.segId, overlayName, gen, fnum,
                                                                                            seg.creatorEpoch, writerEpoch);
                                     staged.push_back(name);
                                     return name;
                                   }};
-      if (request.fields.empty()) continue;
       auto output = SegmentOverlayRegistry::global().make(*spec)->build(request);
       if (!output) {
         deleteStagedOverlayFiles(staged, "empty plugin overlay build");
@@ -2337,7 +2344,8 @@ std::vector<AuxInfo> IndexWriter::buildPluginOverlays(SegInfo& seg, const Schema
       }
       AuxInfo info;
       info.kind = std::string(spec->def.kind);
-      info.name = std::move(overlayName);
+      info.name = overlayName;
+      info.field = spec->contentHash;
       info.gen = gen;
       info.files = std::move(output->files);
       info.opaque_meta = std::move(output->meta);
@@ -2345,10 +2353,10 @@ std::vector<AuxInfo> IndexWriter::buildPluginOverlays(SegInfo& seg, const Schema
       outFiles.insert(outFiles.end(), staged.begin(), staged.end());
     } catch (const std::exception& e) {
       deleteStagedOverlayFiles(staged, "plugin overlay build failure");
-      LOG_WARN("Overlay '{}' not built for seg={}: {}", spec->overlayName(), seg.segId, e.what());
+      LOG_WARN("Overlay '{}' not built for seg={}: {}", overlayName, seg.segId, e.what());
     } catch (...) {
       deleteStagedOverlayFiles(staged, "plugin overlay build failure");
-      LOG_WARN("Overlay '{}' not built for seg={}: unknown exception", spec->overlayName(), seg.segId);
+      LOG_WARN("Overlay '{}' not built for seg={}: unknown exception", overlayName, seg.segId);
     }
   }
   return built;
@@ -2491,12 +2499,12 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
     if (auto current = getSchema(); !current->segmentOverlays.empty()) {
       // Bounded per commit: a collection that just enabled an overlay reaches
       // its older segments over several commits.
-      size_t budget = PLUGIN_OVERLAY_BUILDS_PER_COMMIT;
-      for (size_t i = segsToKeep.size(); i > 0 && budget > 0; i--) {
+      size_t builds = 0;
+      for (size_t i = segsToKeep.size(); i > 0 && builds < PLUGIN_OVERLAY_BUILDS_PER_COMMIT; i--) {
         auto* seg = segsToKeep[i - 1];
-        size_t attempted = seg->attemptedPluginOverlays.size();
-        for (auto& info : buildPluginOverlays(*seg, *current, stagedFiles)) stagedOverlays.push_back({seg, std::move(info)});
-        if (seg->attemptedPluginOverlays.size() != attempted) budget--;
+        // An input of a running merge is covered by the merge's output.
+        if (seg->merging) continue;
+        for (auto& info : buildPluginOverlays(*seg, *current, stagedFiles, builds)) stagedOverlays.push_back({seg, std::move(info)});
       }
     }
 
@@ -2530,6 +2538,13 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
     for (auto& staged : stagedOverlays) {
       for (const auto& file : staged.info.files) {
         staged.seg->unsyncedFiles.push_back(file.name);
+      }
+      // A rebuilt plugin overlay replaces the stale one; its files go when the segment does.
+      for (auto stale = std::ranges::find(staged.seg->auxOverlays, staged.info.name, &AuxInfo::name);
+           stale != staged.seg->auxOverlays.end() && staged.info.kind != VectorIndexBuilder::KIND;
+           stale = std::ranges::find(staged.seg->auxOverlays, staged.info.name, &AuxInfo::name)) {
+        for (const auto& file : stale->files) staged.seg->supersededOverlayFiles.push_back(file.name);
+        staged.seg->auxOverlays.erase(stale);
       }
       staged.seg->auxOverlays.push_back(std::move(staged.info));
     }
@@ -3129,7 +3144,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       phase = "plugin_overlays";
       {
         std::vector<std::string> pluginOverlayFiles;
-        for (auto& info : buildPluginOverlays(*newSegInfo, *mergeSchema, pluginOverlayFiles)) newSegInfo->auxOverlays.push_back(std::move(info));
+        size_t builds = 0;
+        for (auto& info : buildPluginOverlays(*newSegInfo, *mergeSchema, pluginOverlayFiles, builds)) newSegInfo->auxOverlays.push_back(std::move(info));
         newSegInfo->unsyncedFiles.insert(newSegInfo->unsyncedFiles.end(), pluginOverlayFiles.begin(), pluginOverlayFiles.end());
       }
 

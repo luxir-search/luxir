@@ -403,6 +403,11 @@ TEST_F(PluginSortTest, badArgumentsAreRequestErrors) {
   EXPECT_NE(std::string::npos, error(R"j("abs_diff(nope_xyz, 17)")j").find("nope_xyz"));
 }
 
+// A name no plugin claims is the value language's, so it fails as an unknown function at request time.
+TEST_F(PluginSortTest, anUnclaimedFunctionIsARequestError) {
+  EXPECT_NE(std::string::npos, error(R"j("nope_kind(x_i, 17)")j").find("nope_kind"));
+}
+
 // Seed windows change only the visit order: every form of query sorts as
 // brute force and as the unseeded path, the windows were run, and no doc is
 // collected twice (a limit holding every doc returns each once).
