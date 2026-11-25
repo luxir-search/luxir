@@ -480,7 +480,8 @@ TEST_F(FuzzyQueryTest, exactOutranksRareOneAndTwoEditVariants) {
   helper.index(flatdoc("id", "two_typo", "body_w", "appel pad"), UpdateMessage::COMMIT);
 
   auto req = localReq(helper.getSearchEngine());
-  req->collection("main").topDocs("q")
+  req->collection("main").topDocs("term").matchQuery("body_w", "apply").getScores();
+  req->topDocs("q")
       .fuzzyQuery("body_w", "apple", 2, 0)
       .fields({"id"}).limit(-1).getScores();
   req->execute();

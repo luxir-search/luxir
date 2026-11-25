@@ -77,7 +77,7 @@ std::optional<const DecodedFieldRecord*> CatalogSummaryView::record(std::string_
   return std::nullopt;
 }
 
-bool Query::Context::termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term) {
+bool TermFactsCache::termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term) {
   if (QueryPruning::disableForTests || !proof::recordExcludesTerm(field.segInfos.at(segnum), term)) return false;
   if (QueryPruning::verifyTermAbsenceForTests) {
     auto* terms = getTermsEnum(field, segnum);
