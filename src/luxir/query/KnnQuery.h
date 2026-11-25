@@ -362,6 +362,11 @@ public:
   static inline std::function<std::unique_ptr<VectorEngine>(VectorEngine& engine)>
       engineWrapperForTests;
 
+  // Independent-filter passes expected on the lists scanned so far, at or
+  // above which zero observed passes prices completion against the whole
+  // remaining scan (P(0) = e^-16 for an independent filter).
+  static constexpr double ANTI_CORRELATED_EXPECTED_PASSES = 16;
+
   static double projectedScanFraction(double covered, double need, double have) {
     return have > 0 ? covered * (need / have) * tuning.breadthHeadroom : covered * tuning.breadthGrowth;
   }
@@ -1834,6 +1839,16 @@ public:
           scanFraction = std::min(target, maxFraction);
           auto next = request;
           next.round = VectorSearchRound::BREADTH; next.scanFraction = scanFraction; next.candidates = kReq;
+          // No eligible yield where an independent filter expects many marks
+          // an anti-correlated filter. Zero yield only doubles coverage, so
+          // the cumulative rule would fire rounds later; price reaching the
+          // examined target at the observed rate (one pseudo-pass) instead.
+          if (!examinedDone && eligibleExamined == 0
+              && coveredFraction * ivfEligibleVectors >= ANTI_CORRELATED_EXPECTED_PASSES) {
+            auto toTarget = next;
+            toTarget.scanFraction = std::min(maxFraction, projectedScanFraction(coveredFraction, targetExamined, 1));
+            if (toTarget.scanFraction > scanFraction && tryComplete(toTarget)) continue;
+          }
           if (tryComplete(next)) continue;
           round = VectorSearchRound::BREADTH;
           foldSeen();

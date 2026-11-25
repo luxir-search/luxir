@@ -677,7 +677,11 @@ FAISS's scanner and its selector interface.
 
 At each joined round boundary, the host previews the next allocation without
 advancing its cursors. If a slot's cumulative IVF cost plus its next-round cost
-exceeds its full-domain exact cost, the slot completes exactly. This is a cost
+exceeds its full-domain exact cost, the slot completes exactly. A breadth round
+that examined no eligible code where an independent filter expects at least 16
+also prices the scan to the examined target at one pseudo-pass, usually the
+remaining index: zero yield only doubles coverage, so an anti-correlated filter
+would otherwise pay rounds before the cumulative rule fires. This is a cost
 rule, not a regret bound. Explicit probe pins disable completion, and idle
 slots never trigger it. Completion removes the slot from allocation,
 recomputes effort over the active IVF slots, and runs one exact top-k pass over

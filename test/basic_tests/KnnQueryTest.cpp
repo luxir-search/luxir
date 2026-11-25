@@ -5439,6 +5439,45 @@ TEST_F(KnnQueryTest, explicitNprobeUnderfillWarns) {
   EXPECT_EQ("field 'emb_v': returned 0 of k=3 docs; eligible_docs=52; nprobe_pinned=true", warnings[0].message);
 }
 
+TEST_F(KnnQueryTest, zeroYieldFilterCompletesBeforeDoubling) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::tuning.completion, KnnQuery::statsForTests, KnnQuery::tuning.plannerCosts);
+  KnnQuery::tuning.completion = KnnQuery::Completion::AUTO;
+  // An exact pass costs about 0.6 of a full scan: a doubling round stays
+  // cheaper than exact, while the whole remaining scan does not.
+  KnnQuery::tuning.plannerCosts.units.fill(0);
+  KnnQuery::tuning.plannerCosts.units[KnnPlanner::EXACT_DIM] = 3;
+  KnnQuery::tuning.plannerCosts.units[KnnPlanner::ENTRY_BITMAP] = 2;
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(64, 2, 2), 4);
+  for (int i = 0; i < 8192; i++)
+    h.index(flatdoc("id", std::to_string(i), "far_s", i >= 7372 ? "yes" : "no",
+        "independent_s", i % 10 == 0 ? "yes" : "no", "emb_v", std::vector<float>{(float)i + 1, 0, 0, 0}));
+  h.commit({"*"});
+  for (std::string filter : {"far_s", "independent_s"}) {
+    std::vector<std::string> expected;
+    for (bool exact : {true, false}) {
+      KnnQuery::Stats stats;
+      KnnQuery::statsForTests = &stats;
+      auto req = localReq(h.getSearchEngine());
+      auto& cur = req->topDocs("q");
+      configKnn(cur, "emb_v", {0, 0, 0, 0}, 3, 0, 0, exact);
+      addMatchFilter(cur, filter, "yes");
+      req->execute(false);
+      ASSERT_OK(req);
+      if (exact) { expected = resultIds(*req); continue; }
+      EXPECT_EQ(expected, resultIds(*req));
+      if (filter == "independent_s") { EXPECT_EQ(0, stats.switches.load()); continue; }
+      // Round one finds no eligible code, so the scan to the examined
+      // target is priced at once; doubling took one more IVF round.
+      ASSERT_EQ(1u, stats.completions.size());
+      EXPECT_EQ(1, stats.completions[0].round);
+      EXPECT_EQ(2, stats.rounds.load());
+    }
+  }
+}
+
 TEST_F(KnnQueryTest, profileReportsInitialNprobeAndDistinctLists) {
   ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
