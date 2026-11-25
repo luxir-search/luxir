@@ -20,7 +20,7 @@ public:
   }
 
   // Build the context, weights and filter uses for the root domain variants.
-  void materialize();
+  void materialize() override;
 
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     domainVariants.releaseSegmentState(segment);

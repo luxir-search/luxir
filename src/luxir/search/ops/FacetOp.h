@@ -2350,7 +2350,7 @@ public:
   }
 
   // Build the bucket context, weights, filter uses and preparation state.
-  void materialize();
+  void materialize() override;
 
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;

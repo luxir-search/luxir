@@ -176,6 +176,7 @@ public:
     r.query.add("field_value_alias", ::example::fieldValueDef());
     r.query.add("unscoped_value", ::example::unscopedDef());
     r.searchOps.add("sample_docs", ::example::makeSampleDocs);
+    r.searchOps.add("query_count", ::example::makeQueryCount);
     // Adds a "label" column holding the configured text to every emitted hit.
     r.hitDecorators.add("label", [](DecoratorContext&, const ParamReader& params) {
       struct Label : HitDecorator {
@@ -195,10 +196,15 @@ public:
       return label;
     });
     // A request-wide term summary, collected once during serial planning.
-    r.hitDecorators.add("ranking_terms", [](DecoratorContext& ctx, const ParamReader&) {
+    r.hitDecorators.add("ranking_terms", [](DecoratorContext&, const ParamReader&) {
       struct Terms : HitDecorator, QueryVisitor {
         std::string text;
         std::string_view columnName() const override { return "ranking_terms"; }
+        void bind(std::span<const QuerySource> sources) override {
+          for (const auto& source : sources) {
+            if (source.query) source.query->visit(*this, source.context);
+          }
+        }
         QueryVisitor* sub(Occur occur, const Query&) override {
           return occur == Occur::MUST || occur == Occur::SHOULD ? this : nullptr;
         }
@@ -217,11 +223,7 @@ public:
           }
         }
       };
-      auto terms = std::make_shared<Terms>();
-      for (const auto& source : ctx.queries) {
-        if (source.query) source.query->visit(*terms, source.context);
-      }
-      return terms;
+      return std::make_shared<Terms>();
     });
     r.http.add("GET", "/_plugins/example/ping", [](HttpPluginRequest& request, HttpPluginResponse& response) {
       request.node.pluginState<::example::NodeState>("example")->routes++;

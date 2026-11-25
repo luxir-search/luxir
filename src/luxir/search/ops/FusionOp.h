@@ -92,7 +92,7 @@ public:
   }
 
   // Build the shared-filter weights and uses, reusing the first source's context when present.
-  void materialize();
+  void materialize() override;
 
   bool needsCount() const {
     return fusionProto.count_limit.has_value()
