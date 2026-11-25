@@ -384,6 +384,9 @@ protected:
   ~Query() = default;
 
 private:
+  enum class Preparation : uint8_t { UNKNOWN, UNNEEDED, REQUIRED };
+  // Subtree result from serial logical validation, independent of weight flags.
+  mutable Preparation preparation = Preparation::UNKNOWN;
   // Structural hash, computed once by hash(). Only planning reaches it, and
   // planning runs single-threaded per request; a default copy carries it.
   mutable uint64_t cachedHash = 0;
@@ -396,6 +399,11 @@ private:
 
 public:
   QueryKind getKind() const { return kind; }
+
+  // Unvalidated queries conservatively keep their real weight.
+  bool mayRequirePreparation() const noexcept {
+    return preparation != Preparation::UNNEEDED;
+  }
 
   // Predicates recover structural membership segmentwise. Selection queries
   // choose a window and need fresh preparation over the reset's complete
@@ -710,7 +718,8 @@ public:
   // make an explicit validation decision. A composite MUST override
   // validateLogicalImpl to visit every raw child, including score-only and
   // otherwise unused clauses, and pass the multiplier that applies to that
-  // child's score semantics.
+  // child's score semantics. A query that introduces a prepare pass calls
+  // context.requirePreparation() from its validator.
   void validateLogical(
       PlanningContext& context, float multiplier = 1.0f) const;
 
@@ -1251,6 +1260,10 @@ public:
   // owns logical/key memos, validation tracking, and request cache Uses, but
   // deliberately does not initialize per-segment field readers.
   class PlanningContext {
+    friend class Query;
+
+    // A validation visit detects preparation by comparing this counter across its subtree.
+    uint64_t preparationVisits = 0;
     RequestMemTracker standaloneMemoryTracker{0};
     struct CachedFilterIdentity {
       FilterKeyScope scope;
@@ -1303,9 +1316,6 @@ public:
     FilterKeyContext filterKeyContext;
     Limits limits;
     std::vector<api::Warning>* warnings = nullptr;
-    // Validation must set this for any query that introduces NEEDS_PREPARE
-    // so an empty root still creates its whole-index preparation weight.
-    bool mayPrepare = false;
     std::shared_ptr<QueryPruning> pruning;
     std::string_view opName;
     std::vector<std::string>* proofNotes = nullptr;
@@ -1338,6 +1348,9 @@ public:
     ~PlanningContext() {
       if (ownsFilterUses) filterUses->settle(std::uncaught_exceptions() == uncaught);
     }
+
+    // Report a preparation requirement during logical validation.
+    void requirePreparation() noexcept { ++preparationVisits; }
 
     // Serial request-build memo. A query may create several Weights for
     // ranking, count, domain, and routing products; logical normalization is
@@ -2481,11 +2494,13 @@ Query::VerificationWork membershipVerificationWork(const Query& query);
 
 inline void Query::validateLogical(
     PlanningContext& context, float multiplier) const {
-  if (kind == QueryKind::KNN || kind == QueryKind::FORCE_PREPARE) context.mayPrepare = true;
+  uint64_t before = context.preparationVisits;
   validateLogicalImpl(context, multiplier);
 #ifndef NDEBUG
   context.recordLogicalValidation(*this);
 #endif
+  preparation = context.preparationVisits == before
+      ? Preparation::UNNEEDED : Preparation::REQUIRED;
 }
 
 // Reusable word intersection of scorer memberships over one L1-sized window.

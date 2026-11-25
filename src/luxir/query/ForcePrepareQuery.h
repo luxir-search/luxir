@@ -40,6 +40,7 @@ public:
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     child->validateLogical(context, multiplier);
+    context.requirePreparation();
   }
 
   std::optional<ValueEnvelope> requiredValueEnvelope(
