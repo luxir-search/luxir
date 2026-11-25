@@ -201,8 +201,15 @@ public:
   // choices here. The caller orders materialization for each op.
   virtual void materialize() {}
 
-  // Materialize a plugin owner whose roots are opaque to the built-in planner.
-  void materializePlugin();
+  // Choose sources that make a weight unnecessary (resident filter-cache
+  // entries) and keep the decision for materialize(). Runs at most once per
+  // op, serially, before declareReads() and materialize(); materialize() runs
+  // it if nobody did. It builds no context and no weight.
+  virtual void selectSources() {}
+
+  // Project the op's possible root modes before building weights, after
+  // selectSources(). The default is opaque.
+  virtual void declareReads(ReadDeclarer& reads) const;
 
   // Initialize the materialized op tree for execution.
   virtual void init() {

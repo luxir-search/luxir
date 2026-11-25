@@ -57,7 +57,7 @@ TopDocsReq::TopDocsReq(
     diversify(diversify), headSort(std::move(headSort)), scoreProfile(scoreProfile),
     requestNeedsScores(requestNeedsScores) {}
 
-void TopDocsReq::selectSources() {
+void TopDocsReq::runSourceSelection() {
   assert(!sourceSelection);
   int32_t requestFlags = preparation.weightFlags;
   if (requestNeedsScores) requestFlags |= Query::NEED_SCORES;
@@ -270,8 +270,7 @@ void TopDocsReq::declareReads(ReadDeclarer& reads) const {
 }
 
 void TopDocsReq::materialize() {
-  if (!sourceSelection) selectSources();
-  if (auto* reads = ReadVerification::active()) declareReads(*reads);
+  selectSources();
   const auto& selected = *sourceSelection;
   auto* cache = selected.cache;
   auto* cacheFirstMembershipUse = selected.cacheFirstMembershipUse;

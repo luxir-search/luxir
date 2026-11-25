@@ -36,6 +36,7 @@ struct CachedTermInfo {
   // Requested products remain meaningful even after resolution or a miss.
   uint8_t requested = 0;
   // True until dictionary resolution succeeds, including a successful miss.
+  // A resolved absent field settles all its terms regardless of this bit.
   bool unresolved = false;
 
   // A captured state provides stats and a docs stream. Positions are
@@ -69,6 +70,7 @@ struct CachedFieldInfo {
   std::span<TermsEnum*> termsEnums = {};
   boost::unordered_node_map<std::string_view, CachedTermInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedTermInfo>>> termInfos;
   // Metadata for declared fields is opened only on a weight lookup.
+  // A resolved absent field leaves no pending term work in this entry.
   bool unresolved = false;
   // Field products independent of any term in this field.
   uint8_t requested = 0;
@@ -87,7 +89,8 @@ class TermFactsCache {
   IndexReader& reader;
   FieldInfoMap fieldInfoMap;
 #ifndef NDEBUG
-  // Set for a request cache at its first context binding.
+  // Thread affinity for today's single-thread planning, set at first binding.
+  // Resumable planning will need serial-stage ownership instead.
   std::thread::id owningThread;
 #endif
 

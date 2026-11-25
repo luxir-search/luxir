@@ -48,7 +48,8 @@ TermFactsCache* demandCache(Query::PlanningContext& planning) {
 
 std::mutex totalsMutex;
 std::array<ReadVerification::Counts, (size_t)QueryKind::TEST + 1> totals;
-uint64_t pluginOwners = 0;
+uint64_t opaqueOwners = 0;
+uint64_t unscopedLookups = 0;
 uint64_t totalFailures = 0;
 
 } // namespace
@@ -114,7 +115,8 @@ ReadVerification::~ReadVerification() {
     totals[i].lookupsExempt += counts[i].lookupsExempt;
     totals[i].unusedTerms += counts[i].unusedTerms;
   }
-  pluginOwners += plugin;
+  opaqueOwners += opaqueOwner;
+  unscopedLookups += lookupsUnscoped;
   totalFailures += failures;
 }
 
@@ -129,7 +131,8 @@ bool ReadVerification::report(std::ostream& out) {
           << c.lookupsChecked << ' ' << c.lookupsExempt << ' ' << c.unusedTerms << '\n';
     }
   }
-  out << "Undeclared plugin owners: " << pluginOwners << ", mismatches: " << totalFailures << '\n';
+  out << "Unscoped lookups: " << unscopedLookups << '\n';
+  out << "Undeclared op owners: " << opaqueOwners << ", mismatches: " << totalFailures << '\n';
   return totalFailures == 0;
 }
 
@@ -153,12 +156,12 @@ ReadVerification::RootScope::RootScope(const Query& query, const Query::Planning
   if (verification == nullptr) return;
   assert(verification->reading == nullptr);
   auto kind = query.getKind();
-  if (verification->plugin || (!empty && undeclaredKind(kind))) {
+  if (verification->opaqueOwner || (!empty && undeclaredKind(kind))) {
     verification->counts[(size_t)kind].rootsExempt++;
   } else {
     verification->counts[(size_t)kind].rootsChecked++;
   }
-  if (verification->plugin) return;
+  if (verification->opaqueOwner) return;
   auto found = verification->declarations.find(key(query, planning, flags, multiplier));
   if (found == verification->declarations.end()) {
     verification->fail(std::format("undeclared root mode {} flags {} in op {}", (int)kind, flags, planning.opName));
@@ -172,6 +175,10 @@ ReadVerification::RootScope::~RootScope() {
 
 Query::Weight* ReadVerification::buildChild(Query& query, Query::Context& context,
                                        int32_t flags, float multiplier) {
+  if (reading == nullptr && !opaqueOwner) {
+    fail(std::format("weight without a root scope in op {}, query kind {}",
+                     context.planningContext().opName, (int)query.getKind()));
+  }
   auto oldExempt = exempt;
   auto oldBuilding = std::exchange(building, query.getKind());
   if (!exempt && undeclaredKind(building)) exempt = building;
@@ -184,11 +191,14 @@ Query::Weight* ReadVerification::buildChild(Query& query, Query::Context& contex
 
 void ReadVerification::check(const Query::PlanningContext& planning, std::string_view field,
                              std::optional<std::string_view> term) {
-  if (plugin || (reading != nullptr && exempt)) {
+  if (opaqueOwner || (reading != nullptr && exempt)) {
     counts[(size_t)exempt.value_or(building)].lookupsExempt++;
     return;
   }
-  if (reading == nullptr) return;
+  if (reading == nullptr) {
+    lookupsUnscoped++;
+    return;
+  }
   auto found = reading->find({&planning, field, term});
   if (found == reading->end()) {
     fail(std::format("undeclared lookup in op {}, query kind {}, field {}, term {}",

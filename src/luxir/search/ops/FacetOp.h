@@ -2349,7 +2349,7 @@ public:
     assert(bucketQueries.size() == queryFacet.buckets.size());
   }
 
-  void declareReads(ReadDeclarer& reads) const;
+  void declareReads(ReadDeclarer& reads) const override;
   // Build the bucket context, weights, filter uses and preparation state.
   void materialize() override;
 

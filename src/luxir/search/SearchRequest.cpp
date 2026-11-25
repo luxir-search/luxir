@@ -11,6 +11,7 @@
 #include "OwnershipRelation.h"
 #include "luxir/api/build.h"
 #include "luxir/search/SearchOverrides.h"
+#include "luxir/search/ops/SearchOp.h"
 
 namespace luxir {
 
@@ -64,6 +65,18 @@ Query::PlanningContext* SearchRequest::createPlanningContext(IndexReader& view) 
   planning->requestStage = &stage;
 #endif
   return planning;
+}
+
+void SearchRequest::addMaterializationStep(SearchOp& op) {
+  assert(stage == Stage::LOGICAL);
+  materializationSteps.push_back({&op, [](void* object) {
+    auto& op = *static_cast<SearchOp*>(object);
+    if (auto* reads = ReadVerification::active()) {
+      op.selectSources();
+      op.declareReads(*reads);
+    }
+    op.materialize();
+  }});
 }
 
 void SearchRequest::materialize() {

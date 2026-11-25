@@ -127,7 +127,7 @@ private:
   std::optional<SourceSelection> sourceSelection;
 
   // Select and pin resident sources without building a context or weights.
-  void selectSources();
+  void runSourceSelection();
   bool buildsFilterWeights() const;
   bool hasOrdinaryExactDomain() const;
   bool buildsSeparateExactDomain() const;
@@ -202,8 +202,13 @@ public:
              std::optional<SortPlan>&& headSort, Query::ScoreProfile scoreProfile,
              bool requestNeedsScores, Preparation preparation);
 
+  // Complete source selection once before projecting or building weights.
+  void selectSources() override {
+    if (!sourceSelection) runSourceSelection();
+  }
+
   // Project the possible root modes after source selection.
-  void declareReads(ReadDeclarer& reads) const;
+  void declareReads(ReadDeclarer& reads) const override;
   // Runs once after construction to build the contexts, weights, filter uses and execution routes.
   void materialize() override;
 
