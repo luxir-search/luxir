@@ -205,6 +205,19 @@ TEST_F(ReadDeclarationTest, DeclaredEntryResolvesOnlyOnLookup) {
   EXPECT_EQ(TERM_STATS | FIELD_NORMS, field.termInfos.at("alphx").requested);
 }
 
+TEST_F(ReadDeclarationTest, DeclaredTermInMissingFieldIsNotFound) {
+  auto view = reader();
+  MemPool pool;
+  TermFactsCache cache(pool, *view);
+  auto& field = cache.declareField("missing_w");
+  cache.declareTerm("missing_w", "alpha", TERM_STATS);
+  EXPECT_TRUE(field.unresolved);
+  EXPECT_EQ(nullptr, cache.getCachedFieldInfo("missing_w"));
+  EXPECT_FALSE(field.unresolved);
+  Similarity::TermStats stats;
+  EXPECT_FALSE(cache.lookupTermStats("missing_w", "alpha", stats));
+}
+
 TEST_F(ReadDeclarationTest, PhraseMayStopBeforeADeclaredTerm) {
   auto view = reader();
   MemPool pool;
@@ -354,6 +367,22 @@ TEST_F(ReadDeclarationTest, MissingSiblingDemandIsCaughtAfterExemptRewrite) {
   }
   EXPECT_GT(reads.countsFor(QueryKind::FUZZY).lookupsExempt, 0u);
   EXPECT_GT(reads.countsFor(QueryKind::PREFIX).lookupsExempt, 0u);
+}
+
+TEST_F(ReadDeclarationTest, DirectWeightBuildRequiresRootScope) {
+  auto view = reader();
+  MemPool pool;
+  Query::Context context(pool, *view);
+  TermQuery term("body_w", "alpha");
+  term.validateLogical(context.planningContext());
+  ReadVerification reads(false);
+  EXPECT_NE(nullptr, context.getCachedFieldInfo("body_w"));
+  try {
+    term.buildWeight(context, 0);
+    FAIL() << "weight built outside a root scope";
+  } catch (const std::logic_error& error) {
+    EXPECT_TRUE(std::string_view(error.what()).starts_with("weight without a root scope")) << error.what();
+  }
 }
 
 TEST_F(ReadDeclarationTest, AnotherRootsDeclarationDoesNotCoverLookups) {

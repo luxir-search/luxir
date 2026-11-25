@@ -12,9 +12,8 @@
 
 namespace luxir {
 
-void SearchOp::materializePlugin() {
-  if (auto* reads = ReadVerification::active()) reads->pluginOwner();
-  materialize();
+void SearchOp::declareReads(ReadDeclarer& reads) const {
+  reads.undeclaredOwner();
 }
 
 void RootOp::declareReads(ReadDeclarer& reads) const {
@@ -38,7 +37,6 @@ void FusionOp::declareReads(ReadDeclarer& reads) const {
 }
 
 void RootOp::materialize() {
-  if (auto* reads = ReadVerification::active()) declareReads(*reads);
   if (domainVariants.empty()) return;
   weightContext = Query::Context::create(&req.arena, *planning);
   domainVariants.buildWeights(*weightContext, *planning, 0);
@@ -76,7 +74,6 @@ void TopDocsReq::validateRowExecution() const {
 }
 
 void QueryFacetReq::materialize() {
-  if (auto* reads = ReadVerification::active()) declareReads(*reads);
   auto* context = Query::Context::create(&req.arena, planning);
   auto weights = req.requestPool.make_span<Query::Weight*>(bucketQueries.size());
   for (size_t i = 0; i < weights.size(); i++) {
@@ -99,7 +96,6 @@ void QueryFacetReq::materialize() {
 }
 
 void FusionOp::materialize() {
-  if (auto* reads = ReadVerification::active()) declareReads(*reads);
   if (filters.empty()) return;
   assert(!sources.empty());
   auto& planning = sources.front()->planning;

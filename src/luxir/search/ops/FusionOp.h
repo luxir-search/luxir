@@ -91,7 +91,7 @@ public:
     assert(this->sourceWeights.size() == this->sources.size());
   }
 
-  void declareReads(ReadDeclarer& reads) const;
+  void declareReads(ReadDeclarer& reads) const override;
   // Build the shared-filter weights and uses, reusing the first source's context when present.
   void materialize() override;
   // Bind the decorators against all materialized sources in source order.

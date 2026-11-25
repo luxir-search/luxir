@@ -35,6 +35,7 @@ namespace luxir {
 
 class FanoutScope;
 class SearchEngine;
+class SearchOp;
 class SearchResponse;
 class OwnershipRelation;
 class ProtobufSearchParser;
@@ -186,6 +187,8 @@ public:
                 std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now());
 
   virtual ~SearchRequest();
+
+  void addMaterializationStep(SearchOp& op);
 
   template <auto Method, typename Owner>
   void addMaterializationStep(Owner& owner) {

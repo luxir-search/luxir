@@ -34,6 +34,8 @@ public:
   void field(Query::PlanningContext& planning, std::string_view field,
              uint8_t products = 0);
   void undeclared(const Query& query);
+  // The op has no projection for any of its weights.
+  virtual void undeclaredOwner() { complete = false; }
   bool fullyDeclared() const noexcept { return complete; }
 };
 
@@ -82,7 +84,10 @@ private:
   // The innermost query making the current lookup.
   QueryKind building = QueryKind::TEST;
   std::array<Counts, kindCount> counts = {};
-  bool plugin = false;
+  // The current op explicitly left its weights opaque.
+  bool opaqueOwner = false;
+  // Lookups outside a weight root, such as decorator inspection.
+  uint64_t lookupsUnscoped = 0;
   // Focused fixtures can keep their counts out of the suite-wide report.
   bool aggregate;
   uint64_t failures = 0;
@@ -112,13 +117,17 @@ public:
 
   void root(const Query& query, Query::PlanningContext& planning,
             int32_t flags, float multiplier = 1.0f) override;
-  void pluginOwner() { plugin = true; }
+  void undeclaredOwner() override {
+    ReadDeclarer::undeclaredOwner();
+    opaqueOwner = true;
+  }
   const Demands& demands(const Query& query, const Query::PlanningContext& planning,
                          int32_t flags, float multiplier = 1.0f) const {
     return declarations.at(key(query, planning, flags, multiplier));
   }
   const Counts& countsFor(QueryKind kind) const { return counts[(size_t)kind]; }
 
+  // Root scopes do not nest. Built-in root weights enter children through buildWeight().
   class RootScope {
     ReadVerification* verification;
   public:

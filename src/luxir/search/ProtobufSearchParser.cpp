@@ -260,7 +260,7 @@ public:
       addDomainVariants(
           req.proto.ops, {}, domains, rootOp.planning,
           rootOp.domainVariants);
-      req.addMaterializationStep<&SearchOp::materialize>(rootOp);
+      req.addMaterializationStep(rootOp);
     }
     addSubs(rootOp, req.proto.ops, 0, OpsPlacement::REQUEST_ROOT);
     return &rootOp;
@@ -594,7 +594,7 @@ public:
       op->flags = options.flags;
       op->inputDomain = input;
       if (std::holds_alternative<luxir::api::PluginOp>(searchOp.kind)) {
-        req.addMaterializationStep<&SearchOp::materializePlugin>(*op);
+        req.addMaterializationStep(*op);
       }
     }
     return op;
@@ -1491,7 +1491,7 @@ public:
     auto* facet = luxir::arenaCreate<QueryFacetReq>(
         req.arena, req, view(), facetReq, facetName, plan.bucketQueries,
         *plan.planning, bucketChild);
-    req.addMaterializationStep<&SearchOp::materialize>(*facet);
+    req.addMaterializationStep(*facet);
     configureMeasure(*facet, resolveMeasure(facetReq));
     return facet;
   }
@@ -2045,7 +2045,7 @@ public:
             .pureCountShape = pureCountShape,
             .estimateCount = estimateCount,
         });
-    req.addMaterializationStep<&SearchOp::materialize>(*qr);
+    req.addMaterializationStep(*qr);
     if (placement != TopDocsPlacement::FUSION_SOURCE && !topDocsReq.decorate.empty()) {
       DecoratorContext::QuerySource source{qr->resultQuery, qr->planning};
       DecoratorContext dc{req, parseContext, {&source, 1}};
@@ -2301,7 +2301,7 @@ public:
       req.arena, req, view(), name, fusionProto, std::move(sources),
       std::move(sourceWeights), topCount, sharedFilters,
       method, rrfK);
-    req.addMaterializationStep<&SearchOp::materialize>(*fusion);
+    req.addMaterializationStep(*fusion);
 
     fusion->collapse = collapse;
     if (collapse && !fusionProto.collapse->head_sort.empty()) {
