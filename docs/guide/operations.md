@@ -283,7 +283,10 @@ the others. A collection with no search in the last minute skips that open,
 and if it fails (logged as a warning) the same applies: the first search that
 needs the view reopens it; meanwhile searches the previous reader still
 satisfies keep using it, and those that require the new view (by freshness, or
-after a schema change) wait, counted in `service.reader_wait`. Decide these together:
+after a schema change) wait, counted in `service.reader_wait`, at most until
+their deadline (less a small margin): then they search the previous reader, or
+fail `UNAVAILABLE reader_opening` if the collection has none yet. A request with
+`min_commit` waits for the new view. Decide these together:
 
 - Interactive writes that must be read immediately should use an immediate
   commit.

@@ -42,8 +42,11 @@ locations, browse `src/luxir/<area>/`.
      so `getReader` normally returns from its lock-free path. `prepare()` takes no lock;
      `publish()` holds `indexReaderMutex` only for the swap. When that open was skipped
      (no search within `idleAfterUs`, a writer reopening an existing index) or failed,
-     one search reopens under `indexReaderMutex`; requests the old reader satisfies
-     (freshness and schema) keep it, the rest wait (`READER_WAIT`).
+     one search reopens, outside `indexReaderMutex` (which guards only publication and
+     the `opening` flag); requests the old reader satisfies (freshness and schema) keep
+     it, the rest wait (`READER_WAIT`) up to the request's `IoContext::waitDeadline()`,
+     then search the published reader, or fail `reader_opening` if none. A request with
+     `min_commit` waits without a deadline.
    - `ResolvedSchema.cpp`: Declared representations and segment-generation coverage
    - `IndexReader` is a view of one path in a snapshot, with a leaf per bundle;
      a reopen shares each unchanged `SegmentCore`, live docs and overlay with the

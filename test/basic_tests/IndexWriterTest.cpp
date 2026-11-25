@@ -646,6 +646,86 @@ TEST_F(IndexWriterTest, reopenInProgressBlocksOnlyRequestsThatNeedIt) {
   }
 }
 
+// Holds the first reopen of a manager inside its open, after the reader is
+// opened and before it is published, until release().
+class HeldReopen {
+  std::promise<void> entered, released;
+  std::shared_future<void> releasing = released.get_future().share();
+  std::atomic<bool> first{true};
+  bool done = false;
+
+public:
+  explicit HeldReopen(ReaderManager& readers) {
+    Signal::listen("indexReaderOpened", [this, &readers](void* source, void*, void*) -> void* {
+      if (source == &readers && first.exchange(false)) {
+        entered.set_value();
+        releasing.wait();
+      }
+      return nullptr;
+    });
+  }
+  ~HeldReopen() {
+    release();
+    Signal::unlisten("indexReaderOpened");
+  }
+  void waitEntered() { entered.get_future().wait(); }
+  void release() {
+    if (!std::exchange(done, true)) released.set_value();
+  }
+};
+
+// A search past its deadline does not wait out a reopen: it takes the reader
+// already published. One without a deadline waits for the reopen.
+TEST_F(IndexWriterTest, reopenWaitersStopAtTheirDeadline) {
+  RAMDir dir;
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
+  IndexWriter iw(iwSnapshots);
+  auto& readers = iw.snapshots.readers;
+  addDoc(iw);
+  iw.commit();
+  auto before = readers.getReader();
+  {
+    auto failing = failPublicationOpens();
+    addDoc(iw);
+    iw.commit();
+  }
+  HeldReopen held(readers);
+  auto opener = std::async(std::launch::async, [&] { return readers.getReader(); });
+  held.waitEntered();
+  auto soon = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+  EXPECT_EQ(before, readers.getReader(0, soon));
+  auto patient = std::async(std::launch::async, [&] { return readers.getReader(); });
+  EXPECT_EQ(std::future_status::timeout, patient.wait_for(std::chrono::milliseconds(100)));
+  held.release();
+  auto fresh = opener.get();
+  EXPECT_NE(before, fresh);
+  EXPECT_EQ(fresh, patient.get());
+}
+
+// With no reader published yet, a search waits for the first open up to its
+// deadline, then fails retryably.
+TEST_F(IndexWriterTest, aSearchWithNoReaderFailsReaderOpeningAtItsDeadline) {
+  RAMDir dir;
+  CommitSnapshotRegistry iwSnapshots(test::reserveIncarnation(dir));
+  IndexWriter iw(iwSnapshots);
+  auto& readers = iw.snapshots.readers;
+  addDoc(iw);
+  iw.commit();
+  readers.indexReader.store(nullptr);
+  HeldReopen held(readers);
+  auto opener = std::async(std::launch::async, [&] { return readers.getReader(); });
+  held.waitEntered();
+  try {
+    readers.getReader(0, std::chrono::steady_clock::now() + std::chrono::milliseconds(50));
+    ADD_FAILURE() << "expected reader_opening";
+  } catch (const ApiError& e) {
+    EXPECT_EQ("reader_opening", e.code);
+    EXPECT_EQ(ErrorKind::UNAVAILABLE, e.kind);
+  }
+  held.release();
+  EXPECT_NE(nullptr, opener.get());
+}
+
 // A publication's reader open holds no lock: a search keeps the previous
 // reader until the snapshot is advertised, and a search that must reopen (the
 // previous publication's open failed) does so without waiting for it.

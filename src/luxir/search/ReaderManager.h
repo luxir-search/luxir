@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include "IndexReader.h"
 #include "FilterCache.h"
@@ -18,7 +19,11 @@ namespace luxir {
 // Recreating a collection uses a new manager and cache for its new incarnation.
 class ReaderManager {
   Directory& dir;
+  // Guards publication of indexReader and `opening`. A reader open reads
+  // storage and may take a store round trip or more, so it never holds this.
   std::mutex indexReaderMutex;
+  std::condition_variable openDone;  // signalled when a getReader reopen ends
+  bool opening = false;              // a getReader reopen is in progress
   std::atomic<std::shared_ptr<const CommitSnapshot>> published;
   // These read-only query hints must not share the snapshot or reader lock bit.
   alignas(64) std::atomic<bool> closed = false;
@@ -117,9 +122,16 @@ public:
   void cacheStats(CacheStats& out) const;
   explicit ReaderManager(Directory& dir, FilterCacheConfig config = {});
   // Searches take the published reader without a lock when it satisfies their
-  // freshness and schema. Otherwise one thread reopens under indexReaderMutex
-  // and the others that need the new snapshot wait for it (READER_WAIT).
-  std::shared_ptr<IndexReader> getReader(uint64_t freshness_us = 0);
+  // freshness and schema. Otherwise one thread reopens, outside
+  // indexReaderMutex, and the others that need the new snapshot wait for it
+  // (READER_WAIT). A waiter stops at `deadline`, which callers pass as the
+  // request's IoContext::waitDeadline() (a margin before the transport
+  // deadline), and searches the published reader instead, or, when none is
+  // published yet, fails UNAVAILABLE reader_opening. The reopen's reads see
+  // the same deadline, and one that fails deadline_exceeded falls back likewise.
+  std::shared_ptr<IndexReader> getReader(uint64_t freshness_us = 0,
+                                         std::chrono::steady_clock::time_point deadline
+                                         = std::chrono::steady_clock::time_point::max());
   std::shared_ptr<const CommitSnapshot> snapshot() const { return published.load(); }
   std::shared_ptr<Schema> getSchema() const { return snapshot()->schema; }
   // Whether a search ran within idleAfterUs, so a writer publication opens
