@@ -148,7 +148,8 @@ POST /collections/books/_schema
 }
 ```
 
-Metrics are `l2`, `ip` (inner product), and `cosine`. Set a positive `dims`
+Metrics are `l2`, `ip` (inner product), `cosine`, and `hamming` for
+[binary vectors](#binary-vectors). Set a positive `dims`
 to fix the dimension for indexed and query vectors across the collection.
 When omitted, the first vector in each segment establishes the dimension.
 
@@ -171,8 +172,9 @@ it. `encoding` chooses how each vector is stored:
 | `f16` | `2 * dims` | IEEE half precision per element: 11 significant bits, magnitudes up to 65504 |
 | `bf16` | `2 * dims` | bfloat16 per element: 8 significant bits, the float32 range |
 | `sq8` | `8 + dims` | per-vector scalar quantization: a float offset and scale, plus one byte per dimension |
+| `bit` | `dims / 8` | one bit per dimension, set when the element is positive; for `metric: hamming` only (see [Binary vectors](#binary-vectors)) |
 
-At 768 dimensions that is 3072, 1536, 1536, and 776 bytes per vector.
+At 768 dimensions that is 3072, 1536, 1536, 776, and 96 bytes per vector.
 
 ```json
 {
@@ -234,6 +236,51 @@ With
 [`truncate_dims`](#truncate-matryoshka-embeddings), `dims` in the table
 above is the truncated dimension.
 
+### Binary vectors
+
+Binary embeddings (models with a binary or "ubinary" output, or float
+embeddings quantized to their signs) and bit fingerprints such as SimHash
+compare by Hamming distance, the number of bits that differ. `metric:
+hamming` stores one bit per dimension and defaults `encoding` to `bit`:
+
+```json
+{
+  "fields": {
+    "fingerprint_v": {
+      "type": "vector",
+      "dims": 1024,
+      "metric": "hamming"
+    }
+  }
+}
+```
+
+Vectors are sent as numbers, like any other vector: a dimension's bit is set
+when its value is greater than zero, so the float output of a model is
+binarized by its signs, and a 0/1 bit array is stored as is. Reading the
+field back returns 0s and 1s. The score is `1 - hamming distance / dims`:
+1 for identical bits, 0 for complementary ones, and `similarity` is a minimum
+score on that scale.
+
+- `dims` (or `truncate_dims`, when set) must be a multiple of 8. Without
+  `dims`, a vector whose length is not is rejected.
+- `hamming` requires `encoding: bit`, and `bit` requires `hamming` or `none`
+  (storage only).
+- Search scans the column exactly, with or without `exact: true`; no
+  approximate index is built for a `hamming` field. At 96 bytes per
+  768-dimension vector the column is a thirty-second of `f32`, and comparing a
+  row costs a few popcount instructions.
+- `truncate_dims` keeps the signs of the leading components, for binary
+  quantization of Matryoshka embeddings.
+- An empty field can change between `bit` and the float encodings. A schema
+  update is rejected if it makes a field's definition incompatible with
+  values in a published segment. This includes removing a declaration that
+  exposes an incompatible template. To switch a field with existing values,
+  reindex into a new field.
+- Buffered writes can still land on the old side after a schema change.
+  Merges keep the two sides apart. kNN fails while it has old-side vectors
+  to score and can query the new vectors once the old documents are deleted.
+
 ### Truncate Matryoshka embeddings
 
 Some embedding models are trained with
@@ -275,7 +322,8 @@ and scan a quarter of the bytes of 1024.
   accepted as already truncated.
 - A vector whose truncated prefix is all zeros has no cosine direction, even
   when its tail does: it is skipped at index time and rejected as a query.
-- `truncate_dims` requires `metric: cosine`. The prefix of a unit vector is
+- `truncate_dims` requires `metric: cosine` (or `hamming`, which keeps the
+  prefix's signs). The prefix of a unit vector is
   shorter than 1, and MRL models compare renormalized prefixes, so Luxir
   renormalizes it. Cosine ignores length, so a full vector cut by Luxir and a
   prefix renormalized by the provider score the same. `normalized: true` is
@@ -956,13 +1004,14 @@ thresholds per deployment.
 
 `similarity` drops the nearest neighbors that are not similar enough, with the
 semantics of Elasticsearch's `knn.similarity`. The value is in the metric's
-space, not the score's:
+space, not the score's (for `hamming` the two are the same):
 
 | Metric | `similarity` means | Hit kept when |
 |---|---|---|
 | `l2` | Maximum L2 distance (not squared); must be `>= 0` | `distance <= similarity` |
 | `ip` | Minimum dot product | `dot >= similarity` |
 | `cosine` | Minimum cosine similarity | `cosine >= similarity` |
+| `hamming` | Minimum score, `1 - hamming distance / dims` | `score >= similarity` |
 
 ```json
 {"query": {"knn": {"field": "embedding_v", "query": [0.75, 0.15, 0.10], "k": 20, "similarity": 0.8}}}
@@ -1053,4 +1102,6 @@ bit-identical results to a serial run of the same query.
 - Vector fields are returned only when named in `fields`; they are excluded
   from default projection.
 - Changing `encoding` re-encodes a segment only when it merges; a segment
-  that never merges keeps its old encoding.
+  that never merges keeps its old encoding. A field cannot change between
+  `bit` and the other encodings.
+- `hamming` has no approximate index; it is always an exact scan.

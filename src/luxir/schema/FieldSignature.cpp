@@ -9,6 +9,7 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
   auto split = name.rfind("__");
   logicalName = name.substr(0, split);
   label = split == std::string_view::npos ? "self" : std::string(name.substr(split + 2));
+  if (auto* vector = dynamic_cast<const VectorFieldType*>(&type)) vectorEncoding = vector->encoding();
   if (type.type() == FieldType::NESTED) {
     type.signatureProps(properties);
     return;

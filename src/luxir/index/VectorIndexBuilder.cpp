@@ -413,7 +413,7 @@ VectorIndexBuilder::collectEligibleFields() {
     auto* ft = schema_.getFieldTypePtr(name);
     if (ft == nullptr || ft->type() != FieldType::VECTOR) continue;
     auto* vft = (const VectorFieldType*)ft;
-    if (!vft->knnSearchable()) continue;
+    if (!vft->annIndexable()) continue;
     // Multi-valued vectors are indexed too: every value is added to FAISS, and the
     // query layer maps each FAISS id back to its owning doc via the valueRank->docId
     // column (StrColReader::ownerIndex).

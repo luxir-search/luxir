@@ -274,9 +274,10 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   // "none" = storage-only); otherwise inherit.  Range-checked like index.
   if (def.metric.has_value()) {
     if (*def.metric != VectorMetric::NONE && *def.metric != VectorMetric::L2 &&
-        *def.metric != VectorMetric::IP && *def.metric != VectorMetric::COSINE) {
+        *def.metric != VectorMetric::IP && *def.metric != VectorMetric::COSINE &&
+        *def.metric != VectorMetric::HAMMING) {
       throw SchemaError("unknown metric value " + std::to_string((int)*def.metric) +
-                        " (field: " + std::string(name) + "); valid: none, l2, ip, cosine");
+                        " (field: " + std::string(name) + "); valid: none, l2, ip, cosine, hamming");
     }
     r.hasVectorMetric = true;
     r.vectorMetric = (VectorFieldType::Metric)*def.metric;
@@ -307,7 +308,7 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   if (def.encoding.has_value()) {
     if (!vcodec::valid((int32_t)*def.encoding)) {
       throw SchemaError("unknown encoding value " + std::to_string((int)*def.encoding) +
-                        " (field: " + std::string(name) + "); valid: f32, f16, bf16, sq8");
+                        " (field: " + std::string(name) + "); valid: f32, f16, bf16, sq8, bit");
     }
     r.hasVectorEncoding = true;
     r.vectorEncoding = (VectorEncoding)*def.encoding;
@@ -786,9 +787,12 @@ struct FieldCompiler {
           }
           // Matryoshka models compare renormalized prefixes.  Under cosine a
           // prefix cut here and one the provider renormalized score the same;
-          // l2 and ip would score the raw prefix's shrunken length.
-          if (r.vectorMetric != VectorFieldType::METRIC_COSINE) {
-            throw SchemaError("truncate_dims requires metric cosine (field: " + std::string(name) + ")");
+          // l2 and ip would score the raw prefix's shrunken length.  hamming
+          // compares the prefix's signs, which renormalizing would not change.
+          if (r.vectorMetric != VectorFieldType::METRIC_COSINE
+              && r.vectorMetric != VectorFieldType::METRIC_HAMMING) {
+            throw SchemaError("truncate_dims requires metric cosine or hamming (field: " +
+                              std::string(name) + ")");
           }
           // normalized asserts unit-length input, but a truncated prefix of a
           // unit vector is shorter than 1.
@@ -796,6 +800,27 @@ struct FieldCompiler {
             throw SchemaError("normalized=true cannot be combined with truncate_dims "
                               "(a truncated prefix is not unit length; it is renormalized on write) (field: " +
                               std::string(name) + ")");
+          }
+        }
+        // Binary vectors: hamming defaults to the bit encoding, and the two
+        // only go together (bit also allows metric none, storage only).
+        bool hamming = r.vectorMetric == VectorFieldType::METRIC_HAMMING;
+        VectorEncoding encoding = hamming && !r.hasVectorEncoding ? VectorEncoding::BIT : r.vectorEncoding;
+        if (hamming && encoding != VectorEncoding::BIT) {
+          throw SchemaError("metric hamming requires encoding bit (field: " + std::string(name) + ")");
+        }
+        if (encoding == VectorEncoding::BIT) {
+          if (!hamming && r.vectorMetric != VectorFieldType::METRIC_NONE) {
+            throw SchemaError("encoding bit requires metric hamming or none (field: " +
+                              std::string(name) + ")");
+          }
+          // The stored dimension packs into whole bytes.  dims 0 (inferred
+          // from the first vector) is checked when vectors are written.
+          bool truncatedBits = r.vectorTruncateDims > 0;
+          int32_t storedDims = truncatedBits ? r.vectorTruncateDims : r.vectorDims;
+          if (storedDims % 8 != 0) {
+            throw SchemaError(std::string(truncatedBits ? "truncate_dims" : "dims") +
+                              " must be a multiple of 8 for encoding bit (field: " + std::string(name) + ")");
           }
         }
         bool normalizeOnWrite;
@@ -808,7 +833,7 @@ struct FieldCompiler {
                                                truncated ? "truncate_dims" : "dims", name);
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags,
                                                r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
-                                               r.vectorEncoding, ann, r.vectorTruncateDims);
+                                               encoding, ann, r.vectorTruncateDims);
         break;
       }
       default:

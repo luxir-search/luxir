@@ -708,9 +708,16 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
   auto schema = change(previous.get());
   if (!schema) throw std::invalid_argument("Schema change returned no schema");
   auto before = previous->signatures(true);
-  for (const auto& [name, signature] : schema->signatures(true)) {
+  auto after = schema->signatures(true);
+  bool scanVectorColumns = false;
+  for (const auto& [name, signature] : after) {
     auto old = before.find(name);
+    if (signature.vectorEncoding && (old == before.end() || !old->second.vectorEncoding
+        || !vcodec::convertible(*old->second.vectorEncoding, *signature.vectorEncoding))) {
+      scanVectorColumns = true;
+    }
     if (old == before.end()) continue;
+    auto* type = schema->getFieldTypePtr(name);
     auto oldUnit = old->second.properties.find("unit");
     auto newUnit = signature.properties.find("unit");
     if (oldUnit != old->second.properties.end() && newUnit != signature.properties.end()
@@ -720,7 +727,6 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
     }
     // Existing segments hold only the postings of an indexed string written
     // without a column, and ARRAY sequences cannot be rebuilt from those.
-    auto* type = schema->getFieldTypePtr(name);
     auto oldColumn = old->second.properties.find("column");
     if (type && FieldType::storage(type->type()) == FieldType::Storage::TERMS && type->indexed()
         && type->hasColumn() && oldColumn != old->second.properties.end()
@@ -730,10 +736,61 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
           name));
     }
   }
+  if (!scanVectorColumns) {
+    // Removing a vector definition can expose a different template.
+    scanVectorColumns = std::ranges::any_of(before, [&](const auto& entry) {
+      if (!entry.second.vectorEncoding) return false;
+      auto next = after.find(entry.first);
+      return next == after.end() || !next->second.vectorEncoding;
+    });
+  }
   std::pmr::monotonic_buffer_resource arena;
   api::IndexInfo info;
   if (!api::decode(info, api::copyToPaddedInput(*lastSnapshot.load()->bytes, arena), arena)) {
     throw std::runtime_error("Failed to decode published manifest");
+  }
+  if (scanVectorColumns) {
+    // Unpublished rows may retain their old encoding, and merge admission keeps the two sides apart.
+    std::vector<SegInfo*> published;
+    published.reserve(info.segments.size());
+    {
+      // publicationMutex keeps published segments alive even if a merge
+      // moves them to segmentsToDelete after we release indexMutex.
+      std::lock_guard indexLock(indexMutex);
+      for (const auto& segment : info.segments) {
+        if (auto it = segInfos.find(segment.seg_id); it != segInfos.end()) {
+          published.push_back(it->second.get());
+        } else {
+          auto retired = std::ranges::find_if(segmentsToDelete,
+              [&](const auto& seg) { return seg->segId == segment.seg_id; });
+          if (retired == segmentsToDelete.end()) throw std::logic_error("Published segment has no writer state");
+          published.push_back(retired->get());
+        }
+      }
+    }
+    for (auto* seg : published) {
+      auto core = acquireSegmentCore(*seg);
+      for (const auto& space : core->spaces()) {
+        auto& reader = *core->spaceReader(space.path);
+        for (int32_t ordinal = 0; ordinal < reader.numFields(); ++ordinal) {
+          auto header = reader.fieldHeader(ordinal);
+          if (FieldType::storage(header.type) != FieldType::Storage::VECTOR || header.numValues == 0) continue;
+          std::string_view name(header.name);
+          auto* type = dynamic_cast<const VectorFieldType*>(schema->getFieldTypePtr(name));
+          if (!type) continue;
+          const auto* record = reader.fieldInfo(ordinal);
+          if (!record->bytesColumn()) continue;
+          auto encoding = VectorReader::encodingOf(*record);
+          if (!vcodec::convertible(encoding, type->encoding())) {
+            auto* oldType = dynamic_cast<const VectorFieldType*>(previous->getFieldTypePtr(name));
+            if (oldType && !vcodec::convertible(encoding, oldType->encoding())) continue;
+            throw SchemaError(std::format(
+                "Cannot change encoding of existing vector field '{}' between {} and {}; reindex into a new field",
+                name, vcodec::name(encoding), vcodec::name(type->encoding())));
+          }
+        }
+      }
+    }
   }
   publish(info, arena, std::move(schema));
   auto published = lastSnapshot.load();
@@ -2081,7 +2138,7 @@ bool eligibleVectorOverlayName(const Schema& schema, std::string_view overlayNam
   auto* ft = schema.getFieldTypePtr(overlayName);
   if (ft == nullptr || ft->type() != FieldType::VECTOR) return false;
   auto* vft = (const VectorFieldType*)ft;
-  return vft->knnSearchable();
+  return vft->annIndexable();
 }
 
 std::vector<std::string> collectValidatedExactVectorOverlayNames(
@@ -2105,21 +2162,26 @@ std::vector<std::string> collectValidatedExactVectorOverlayNames(
 
 } // namespace
 
+// Merge admission can acquire a core under indexMutex. The file inventory is
+// immutable, so this needs no writer lock and can also be used by schema checks.
+std::shared_ptr<SegmentCore> IndexWriter::acquireSegmentCore(const SegInfo& seg) {
+  if (auto core = seg.sharedSegmentCore.load()) return core;
+  std::shared_ptr<IndexReader> reader;
+  if (const auto* published = publishedSegment(seg, reader)) {
+    if (auto core = published->segmentCoreShared()) return core;
+  }
+  auto source = SegmentCore::source(seg.segId, seg.creatorEpoch, seg.catalog, seg.maxDoc, seg.baseFiles);
+  return SegmentCore::create(dir, seg.segId, seg.creatorEpoch, source);
+}
+
 // Benign load-then-store race: the commit thread and a merge thread can both
 // miss and each create a SegmentCore for a source segment - both are valid,
 // one is wasted, last store wins.  Deliberately NOT a lock or CAS; do not
-// "fix" this into synchronization. Merge admission calls this with indexMutex
-// held, so nothing here may take it: the base file inventory is immutable.
-//
+// "fix" this into synchronization.
 std::shared_ptr<SegmentCore> IndexWriter::getSegmentCore(SegInfo& seg) {
   auto core = seg.sharedSegmentCore.load();
   if (!core) {
-    std::shared_ptr<IndexReader> reader;
-    if (const auto* published = publishedSegment(seg, reader)) core = published->segmentCoreShared();
-    if (!core) {
-      auto source = SegmentCore::source(seg.segId, seg.creatorEpoch, seg.catalog, seg.maxDoc, seg.baseFiles);
-      core = SegmentCore::create(dir, seg.segId, seg.creatorEpoch, source);
-    }
+    core = acquireSegmentCore(seg);
     seg.sharedSegmentCore.store(core);
   }
   auto& pr = core->rootReader();
@@ -2762,6 +2824,49 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         }
       }
 
+      // Pick a side for each vector field before admission, so an early
+      // minority segment cannot keep the majority from merging.
+      struct EncodingVote {
+        VectorEncoding first;
+        size_t bit = 0;
+        size_t floating = 0;
+        VectorEncoding selected = first;
+      };
+      struct Candidate {
+        std::shared_ptr<SegmentCore> core;
+        std::vector<std::pair<std::string_view, VectorEncoding>> encodings;
+      };
+      boost::unordered_flat_map<std::string_view, EncodingVote> votes;
+      std::vector<Candidate> candidates;
+      candidates.reserve(segs.size());
+      for (auto* seg : segs) {
+        auto& candidate = candidates.emplace_back(getSegmentCore(*seg));
+        for (const auto& space : candidate.core->spaces()) {
+          auto& reader = *candidate.core->spaceReader(space.path);
+          for (int32_t ordinal = 0; ordinal < reader.numFields(); ++ordinal) {
+            auto header = reader.fieldHeader(ordinal);
+            if (FieldType::storage(header.type) != FieldType::Storage::VECTOR) continue;
+            const auto* record = reader.fieldInfo(ordinal);
+            if (!record->bytesColumn()) continue;
+            auto encoding = VectorReader::encodingOf(*record);
+            std::string_view name(record->name);
+            candidate.encodings.emplace_back(name, encoding);
+            auto& vote = votes.try_emplace(name, EncodingVote{encoding}).first->second;
+            if (encoding == VectorEncoding::BIT) ++vote.bit;
+            else ++vote.floating;
+          }
+        }
+      }
+      auto schema = getSchema();
+      for (auto& [name, vote] : votes) {
+        if (vote.bit == 0 || vote.floating == 0) continue;
+        if (vote.bit != vote.floating) {
+          vote.selected = vote.bit > vote.floating ? VectorEncoding::BIT : VectorEncoding::F32;
+        } else if (auto* type = dynamic_cast<const VectorFieldType*>(schema->getFieldTypePtr(name))) {
+          vote.selected = type->encoding();
+        }
+      }
+
       // Segment-local ords are signed int32. Admit only sources whose summed
       // per-field term dictionaries remain below the flush-side limit. Text
       // dictionaries are exempt because they do not produce an ord column.
@@ -2776,14 +2881,23 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       boost::unordered_flat_map<std::string, int64_t> pathRows;
       std::vector<SegInfo*> admitted;
       admitted.reserve(segs.size());
-      for (SegInfo* seg : segs) {
+      for (size_t i = 0; i < segs.size(); ++i) {
+        auto* seg = segs[i];
+        const auto& candidate = candidates[i];
+        auto incompatible = std::ranges::find_if(candidate.encodings, [&](const auto& column) {
+          return !vcodec::convertible(column.second, votes.at(column.first).selected);
+        });
+        if (incompatible != candidate.encodings.end()) {
+          INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because vector field '{}' is outside the selected encoding group",
+                      seg->name(), incompatible->first);
+          continue;
+        }
         if (!MergeCostModel::docsFit(mergedDocs, seg->liveDocs)) {
           INDEX_DEBUG("mergeSegmentsBody: skipping segment {} because the merged segment would exceed MAX_SEGMENT_DOCS",
                       seg->name());
           continue;
         }
-        auto postingsReaderCore = getSegmentCore(*seg);
-        MemPool metadataPool;
+        const auto& postingsReaderCore = candidate.core;
         boost::unordered_flat_map<std::string, int64_t> additions;
         boost::unordered_flat_map<std::string, int64_t> vectorAdditions;
         auto fieldsFit = [&](PostingsReader& reader) {
@@ -2813,8 +2927,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         };
         bool fits = fieldsFit(postingsReaderCore->rootReader());
         std::vector<std::pair<std::string, int64_t>> nextRows;
-        for (size_t i = 1; fits && i < postingsReaderCore->spaces().size(); i++) {
-          const auto& space = postingsReaderCore->spaces()[i];
+        for (size_t j = 1; fits && j < postingsReaderCore->spaces().size(); j++) {
+          const auto& space = postingsReaderCore->spaces()[j];
           // Physical rows bound the merged space from above: rows of deleted
           // roots still count, so a merge that would fit once they are dropped
           // can be skipped.
