@@ -1467,7 +1467,7 @@ public:
       RequestMemResource rankMemory(context.planningContext().memoryTracker, query.getField(), "knn rank eligibility");
       std::vector<RankEligibility> rankEligibility;
       rankEligibility.reserve(numSegs);
-      for (size_t i = 0; i < numSegs; i++) rankEligibility.emplace_back(&rankMemory);
+      for (size_t i = 0; i < numSegs; i++) rankEligibility.emplace_back(&rankMemory).logClears = Groups;
       std::vector<std::span<const uint8_t>> eligibleSpans(numSegs);
       // Completion compares against exact work at the folded count once a
       // multi-valued estimate is replaced by the exact eligible-vector count.
@@ -1661,14 +1661,15 @@ public:
 
         if constexpr (Groups) {
           // Group admission can evict another slot's members. Reopen the
-          // active bounded ranks so covered lists can restore those members.
+          // active bounded ranks so covered lists can restore those members:
+          // setting the logged pooled clears back keeps any folded domain.
           candidateHits.clear(); docHits.clear(); seenDocs.clear(); seenVectors.clear();
           candidatePoolSorted = true;
           perKey = boundedEngine ? membersPerGroup(baseReq, kDocs) : 1;
           groupPool = std::make_unique<BoundedHits<true, VectorEngineHit, betterHit, Owned>>(
               std::min(baseReq, cap), query.groups, v2dSpan, (size_t)perKey);
           for (size_t i = 0; i < numSegs; i++) if (activeIvf[i] && planSegments[i].bounded) {
-            rankEligibility[i].reset(); eligibleSpans[i] = {}; segApproxInPool[i] = false;
+            rankEligibility[i].reopen(); segApproxInPool[i] = false;
             if (seenFolded) seedRanks(i);
           }
           resumeBoundedDepth = boundedEngine && baseEngine->hasCoveredBounded();
@@ -3220,14 +3221,23 @@ private:
   // Query-owned rank domain. Original cardinality survives pooled clears;
   // remaining also subtracts pending seen-hash entries before their first
   // fold. Both counts are exact once the domain is mapped, even for multi.
+  // Group mode logs pooled clears so reopen() restores the pre-pooling
+  // domain in O(pooled) instead of folding the domain again.
   struct RankEligibility {
     std::pmr::vector<uint8_t> owned;
+    std::pmr::vector<int64_t> cleared;
     std::span<const uint8_t> bits;
     int64_t original = -1, remaining = -1;
+    bool logClears = false;
 
-    explicit RankEligibility(std::pmr::memory_resource* resource) : owned(resource) {}
+    explicit RankEligibility(std::pmr::memory_resource* resource) : owned(resource), cleared(resource) {}
 
-    void reset() { owned.clear(); bits = {}; original = remaining = -1; }
+    void reopen() {
+      assert(logClears);
+      for (int64_t rank : cleared) owned[(size_t)(rank >> 3)] |= (uint8_t)(1u << (rank & 7));
+      cleared.clear();
+      remaining = original;
+    }
 
     bool clear(int64_t rank, int64_t numVectors, VectorSearchWork& work) {
       if (owned.empty()) {
@@ -3241,6 +3251,7 @@ private:
       bool fresh = (byte & mask) != 0;
       byte &= (uint8_t)~mask;
       remaining -= fresh;
+      if (fresh && logClears) cleared.push_back(rank);
       return fresh;
     }
   };

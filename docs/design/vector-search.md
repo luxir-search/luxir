@@ -686,7 +686,8 @@ lower-bound witnesses stay valid. In document mode only the completed slot's
 approximate candidates are retracted: nominees never evict across slots, so the
 active pool continues and deepens only if it falls short. Group admission can
 evict another slot's members, so in group mode the active bounded pool starts
-a fresh epoch with covered lists rescanned and exclusions reopened. Profiles
+a fresh epoch with covered lists rescanned and exclusions reopened; reopening
+sets the logged pooled ranks back rather than folding the domain again. Profiles
 add the completion round, reason and costs; work counters include the
 abandoned IVF work and the exact pass.
 

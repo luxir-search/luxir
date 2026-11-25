@@ -1029,15 +1029,19 @@ TEST_F(GroupKnnTest, completionReopensEvictedActiveMembers) {
         "vec_vs", std::vector<std::vector<float>>(40, {i == 0 ? 1.0f : 10000 + (float)i, 0, 0, 0})));
   h.commit({"*"});
   for (int i = 0; i < 1024; i++)
-    h.index(flatdoc("id", "b" + std::to_string(i), "key_s", std::to_string(i % 7), "keep_s", "yes",
+    h.index(flatdoc("id", "b" + std::to_string(i), "key_s", std::to_string(i % 7), "keep_s", i % 64 ? "yes" : "no",
         "vec_vs", std::vector<std::vector<float>>{{1000 + (float)i, 0, 0, 0}}));
   h.commit({"*"});
   std::string prefix = R"("limit":-1,"collapse":"key_s","filter":["keep_s:yes"],"query":)";
   auto expected = rows(*run("main", prefix + knn(3, true)));
   KnnQuery::Stats stats;
   KnnQuery::statsForTests = &stats;
+  int64_t walks = KnnQuery::domainWalksForTests.load();
   auto actual = run("main", prefix + knn(3, true, false));
   EXPECT_EQ(expected, rows(*actual));
+  // Planning counts and round-one folds walk the two domains; reopening
+  // the active slot at completion restores its fold without a fifth walk.
+  EXPECT_EQ(walks + 4, KnnQuery::domainWalksForTests.load());
   ASSERT_EQ(1u, stats.completions.size()) << "ivf=" << stats.plannedIvf << " entries=" << stats.work.physicalEntries
       << " bitmap=" << stats.work.selectorBitmap << " rounds=" << stats.rounds << " budget=" << stats.initialBudget
       << " target=" << stats.targetDocs << " reads=" << stats.terminalReads;
