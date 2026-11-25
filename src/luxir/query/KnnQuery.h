@@ -2101,7 +2101,6 @@ public:
       class RoundSelector {
         std::optional<faiss::IDSelectorBitmap> bitmap;
         std::optional<LocalDomainSelector> domainSel;
-        const faiss::IDSelector* selPtr = nullptr;
 
       public:
         RoundSelector(const SegmentIvfScanner& eng,
@@ -2112,24 +2111,19 @@ public:
               : std::span<const uint8_t>{};
           if (!elig.empty()) {
             bitmap.emplace(elig.size(), elig.data());
-            selPtr = &*bitmap;
           } else if (eng.domain != nullptr && !eng.domainIsLive) {
             assert(request.round == VectorSearchRound::BREADTH);
             domainSel.emplace(eng.v2d, eng.domain);
-            selPtr = &*domainSel;
           } else if (eng.domainIsLive) {
             bitmap.emplace(eng.rankLive->numBytes, eng.rankLive->bits);
-            selPtr = &*bitmap;
           }
         }
 
         RoundSelector(const RoundSelector&) = delete;
         RoundSelector& operator=(const RoundSelector&) = delete;
 
-        const faiss::IDSelector* get() const { return selPtr; }
-
-        // RaBitQ dispatches once per scan, keeping selector kind and virtual
-        // membership calls out of its per-code loop. PQ still uses get().
+        // Both codecs dispatch once per scan, keeping selector kind and
+        // virtual membership calls out of their per-code loops.
         template <class Scan>
         VectorSearchWork withProbe(int64_t numVectors, Scan&& scan) const {
           if (bitmap) return scan([bits = bitmap->bitmap, numVectors](faiss::idx_t id) LUXIR_INLINE {
@@ -2190,6 +2184,7 @@ public:
           updateThreshold();
         }
         bool add_result(float distance, faiss::idx_t rank) override {
+          if (rank < 0) return false; // A dense PQ block's non-member.
           float score = scoreFromDist(distance, metric);
           if (score < cut.floorScore()) return false;
           if constexpr (Groups) {
@@ -2327,7 +2322,6 @@ public:
         auto scan = [&](auto probe) {
           return scanListsWithProbe<Interval>(request, listIds, centroidDists, rangeLiveVectors, cut, selector, probe);
         };
-        if (rabitq == nullptr) return scan(nullptr); // Keep FAISS's PQ kernel and selector.
         return selector.withProbe(ivf.ntotal, scan);
       }
 
@@ -2354,10 +2348,15 @@ public:
             oneBitScorer.emplace(ivf.d, preparedQuery.queryBits,
                                  rabitq->rabitq.metric_type == faiss::METRIC_INNER_PRODUCT, preparedQuery.query);
         } else {
-          pqScanner.reset(ivf.get_InvertedListScanner(false, selector.get()));
+          // Selection happens here, before FAISS: its scanner sees only
+          // passing codes and never calls a selector.
+          pqScanner.reset(ivf.get_InvertedListScanner(false, nullptr));
           pqScanner->set_query(preparedQuery.query);
         }
-        int64_t scanned = 0, extra = 0, rejected = 0, visited = 0;
+        std::vector<uint8_t> pqCodes;
+        if constexpr (!std::is_same_v<Probe, std::nullptr_t>)
+          if (pqScanner) pqCodes.resize(RaBitQScorer::BLOCK_ROWS * ivf.code_size);
+        int64_t scanned = 0, extra = 0, rejected = 0, visited = 0, passes = 0;
         bool keepMax = metric != (int32_t)api::VectorMetric::L2;
         const float* listAmplitudes = nullptr;
         double selectionScale = 0;
@@ -2434,9 +2433,37 @@ public:
               if constexpr (!Interval) {
                 // FAISS's PQ scan_codes takes idx_t ids: widen one block.
                 faiss::idx_t wideIds[RaBitQScorer::BLOCK_ROWS];
-                std::copy(ids + begin, ids + end, wideIds);
-                pqScanner->scan_codes(end - begin, codes + begin * ivf.code_size,
-                                      wideIds, handler);
+                if constexpr (std::is_same_v<Probe, std::nullptr_t>) {
+                  std::copy(ids + begin, ids + end, wideIds);
+                  pqScanner->scan_codes(end - begin, codes + begin * ivf.code_size,
+                                        wideIds, handler);
+                } else {
+                  // Select rows with a branch-free probe. A sparse block is
+                  // compacted and scored contiguously; a dense one is scored
+                  // in place, its few non-members carrying id -1, which the
+                  // handler drops, so it pays no copy.
+                  uint16_t selected[RaBitQScorer::BLOCK_ROWS];
+                  size_t rows = 0, size = end - begin;
+                  for (size_t k = begin; k < end; k++) {
+                    selected[rows] = (uint16_t)(k - begin);
+                    wideIds[rows] = ids[k];
+                    rows += probe(ids[k]) ? 1 : 0;
+                  }
+                  passes += (int64_t)rows;
+                  const uint8_t* block = codes + begin * ivf.code_size;
+                  if (rows * 8 >= size * 7) {
+                    for (size_t r = rows; r-- > 0;) wideIds[selected[r]] = wideIds[r];
+                    for (size_t k = 0, r = 0; k < size; k++) {
+                      if (r < rows && selected[r] == k) r++;
+                      else wideIds[k] = -1;
+                    }
+                    pqScanner->scan_codes(size, block, wideIds, handler);
+                  } else if (rows) {
+                    for (size_t r = 0; r < rows; r++)
+                      std::memcpy(pqCodes.data() + r * ivf.code_size, block + selected[r] * ivf.code_size, ivf.code_size);
+                    pqScanner->scan_codes(rows, pqCodes.data(), wideIds, handler);
+                  }
+                }
               }
             } else for (size_t i = begin; i < end; i++) {
               if constexpr (!std::is_same_v<Probe, std::nullptr_t>) {
@@ -2462,8 +2489,14 @@ public:
           }
           handler.flush();
         }
+        // PQ scores what FAISS counted, including dense-block non-members;
+        // selector passes count only members.
+        int64_t pqScores = 0;
         if constexpr (!Interval) {
-          if (rabitq == nullptr) scanned = (int64_t)handler.stats.scan_cnt;
+          if (rabitq == nullptr) {
+            pqScores = (int64_t)handler.stats.scan_cnt;
+            scanned = std::is_same_v<Probe, std::nullptr_t> ? pqScores : passes;
+          }
           cut.finishScan(scanned);
         }
         VectorSearchWork work;
@@ -2475,7 +2508,7 @@ public:
           work.newListSelectorPasses = scanned;
           work.newListLiveVectors = rangeLiveVectors;
         } else work.depthEntries = visited;
-        work.pqScores = rabitq == nullptr ? scanned : 0;
+        work.pqScores = pqScores;
         work.oneBitScores = rabitq != nullptr ? scanned : 0;
         work.extraBitScores = extra;
         work.gateRejections = rejected;

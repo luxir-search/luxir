@@ -608,10 +608,11 @@ and rank-bitmap folds use the same doc-to-rank walk.
 
 `KnnPlanner` prices predicted work with one calibrated unit-cost table. Exact
 slots pay per scored dimension, per visited domain doc and per rank mapping.
-IVF slots pay per examined entry, with an extra term for PQ (its FAISS scanner
-tests the selector through a virtual call) and a branch-misprediction term
-proportional to `p(1-p)` for selector pass rate `p`, except on 1-bit RaBitQ, whose
-selector test does not branch; per codec score (PQ
+IVF slots pay per examined entry, with an extra term for PQ and a
+branch-misprediction term proportional to `p(1-p)` for selector pass rate `p`,
+except on 1-bit RaBitQ, whose selector test does not branch (both PQ terms
+were fitted when FAISS tested the selector per code through a virtual call;
+the PQ scan now selects branch-free, so they need recalibration); per codec score (PQ
 subcodes; RaBitQ one-bit and extra-bit scores, each a constant per code plus
 a term per dimension); per list setup; per coarse
 centroid dimension; per slot-round; and per terminal read plus per terminal
@@ -671,9 +672,13 @@ smaller of members and nonmembers, and multi-valued docs contribute their full
 vector ranges. Every deepen folds filtered domains, including interval-only
 breadth widening, and clears pooled ranks, so later scans use one bitmap probe
 without resolving IDs. Borrowed words are copied on the first pooled clear, and
-owned bitmaps are charged to the request memory tracker. The RaBitQ scan
-dispatches the selector kind once per scan and tests bitmaps inline; PQ uses
-FAISS's scanner and its selector interface.
+owned bitmaps are charged to the request memory tracker. Both codecs dispatch
+the selector kind once per scan and test bitmaps inline, without branching.
+PQ then hands FAISS's scanner, which never sees a selector, the passing codes
+of each 256-row block: compacted when sparse, or in place when at least 7/8
+pass, the non-members carrying id -1 for the handler to drop. That cut PQ
+filtered scans by about 27% at 10% selectivity (`BM_VectorKnnFiltered`, 500k x
+128, PQ) with no change for near-total pass rates.
 
 At each joined round boundary, the host previews the next allocation without
 advancing its cursors. If a slot's cumulative IVF cost plus its next-round cost

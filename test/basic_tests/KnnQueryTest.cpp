@@ -2509,7 +2509,9 @@ TEST_F(KnnQueryTest, filteredBreadthProjectsFromEligibleYield) {
         EXPECT_EQ(passed, stats.newListSelectorPasses.load());
         EXPECT_EQ(0, stats.depthEntries.load());
         EXPECT_EQ(interval ? passed : 0, stats.oneBitScores.load());
-        EXPECT_EQ(interval ? 0 : passed, stats.pqScores.load());
+        // Dense PQ blocks also score their few non-members in place.
+        if (interval) { EXPECT_EQ(0, stats.pqScores.load()); }
+        else { EXPECT_LE(passed, stats.pqScores.load()); EXPECT_LE(stats.pqScores.load(), visited); }
         if (!interval) { EXPECT_EQ((int64_t)pooled.size(), stats.terminalReads.load()); }
         if (nprobe == 0) {
           EXPECT_TRUE(passed + 1e-9 >= stats.targetExamined.load() || rounds.back().result.breadthExhausted);
