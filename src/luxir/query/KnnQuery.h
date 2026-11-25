@@ -266,8 +266,8 @@ public:
     if (!domain) return vr.numVectors() > 0;
     const auto& docs = vr.strColReader().docsReader();
     const auto* bitmap = docs.bitset();
-    // Without a bitmap every row has a vector; assume so for any other shape too.
-    if (!bitmap) return !docs.allRows() || domain->card() > 0;
+    // Without a bitmap either every row has a vector or none does.
+    if (!bitmap) return docs.allRows() && domain->card() > 0;
     if (domain->type == DocSet::BITSET) {
       return bitmap->intersectionCardinality(((const BitDocSet*)domain)->bits()) > 0;
     }
