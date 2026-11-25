@@ -27,7 +27,9 @@ struct LiveDocsMemory {
     }
   };
 
-  // Child live views derived from root deletes; reported under field_metadata.
+  // Child live views derived from root deletes, and the rank-space live
+  // bitmaps of vector columns in segments with deletes; reported under
+  // field_metadata.
   Counter views;
   // Root generations expanded from SPARSE files, reader and writer copies.
   Counter sparseRoots;

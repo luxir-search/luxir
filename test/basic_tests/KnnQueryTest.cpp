@@ -2882,6 +2882,31 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
   EXPECT_EQ(builds3, builds2 + 1) << "new liveGen must rebuild the bitmap";
 }
 
+TEST_F(KnnQueryTest, rankLiveBitmapIsChargedToLiveDocsMemory) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard(/*minTraining=*/16);
+  CollectionHelper h("main");
+  installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  for (int i = 0; i < 4096; i++)
+    h.index(flatdoc("id", std::to_string(i), "emb_vs", std::vector<std::vector<float>>{
+        {(float)i + 1, 0, 0, 0}, {(float)i + 1.5f, 0, 0, 0}}));
+  h.commit({"*"});
+  h.deleteByIds({"40"}, UpdateMessage::COMMIT);
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto before = liveDocsMemory.views.bytes.load();
+  auto builds = KnnQuery::rankLiveBitmapBuildsForTests.load();
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 3);
+  req->execute();
+  ASSERT_OK(req);
+  req->done();
+  ASSERT_EQ(builds + 1, KnnQuery::rankLiveBitmapBuildsForTests.load());
+  // The 8192-vector rank bitmap owns 1024 bytes, charged as a live view.
+  auto charged = liveDocsMemory.views.bytes.load() - before;
+  EXPECT_GE(charged, 1024u);
+  EXPECT_LT(charged, 2048u);
+}
+
 TEST_F(KnnQueryTest, deleteCommitReleasesSupersededLiveDocs) {
   ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
