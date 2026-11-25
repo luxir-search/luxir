@@ -583,7 +583,9 @@ public:
         AggregateProgram* program =
             AggregateExprParser(options, req.arena).parse(exprOp.expr);
         auto fields = resolveAggregateFields(*program, req.requestPool, *view());
-        return luxir::arenaCreate<ExprStatsOp>(req.arena, req, view(), name, *program, fields);
+        auto* op = luxir::arenaCreate<ExprStatsOp>(req.arena, req, view(), name, *program, fields);
+        req.addMaterializationStep<&ExprStatsOp::bindFields>(*op);
+        return op;
       },
       [&](const luxir::api::PluginOp& pluginOp) -> SearchOp* {
         return parsePluginOp(name, pluginOp, depth);
@@ -680,9 +682,11 @@ public:
       if (ordinal && !type.isSet(FieldType::INDEX_DOCS)) {
         throw RequestError("string collapse key must be indexed: " + std::string(name));
       }
-      collapse->fields.push_back({field.physicalName, wireType, storage,
-          ordinal ? view()->getOrdMap(field.physicalName) : nullptr,
+      collapse->fields.push_back({field.physicalName, wireType, storage, {},
           view()->field(field.physicalName), type.valueNature()});
+    }
+    if (std::ranges::any_of(collapse->fields, &CollapsePlan::Field::ordinal)) {
+      req.addMaterializationStep<&CollapsePlan::bindOrdinalMaps>(*collapse);
     }
     return collapse;
   }
@@ -732,7 +736,9 @@ public:
       if (same) for (size_t i = 0; i < spec->fields.size(); i++) same &= spec->fields[i].name == measure->fields[i].name;
       if (same) { facet.groupPlan = plan; return; }
     }
-    facet.groupPlan = std::make_shared<FacetGroupPlan>(*measure);
+    auto plan = std::make_shared<FacetGroupPlan>(*measure);
+    req.addMaterializationStep<&FacetGroupPlan::bindDimensions>(*plan);
+    facet.groupPlan = std::move(plan);
     facetGroupPlans.push_back(facet.groupPlan);
   }
 
@@ -892,10 +898,11 @@ public:
         if (facetReq.term_filter.has_value()) {
           termFilter = parseTermFilter(facetName, target, *facetReq.term_filter);
         }
-        auto ordMap = view()->getOrdMap(facetField);
-        facet = luxir::arenaCreate<StrFacetOp>(req.arena, req, view(), facetReq,
+        auto* stringFacet = luxir::arenaCreate<StrFacetOp>(req.arena, req, view(), facetReq,
             facetField, facetName, limit, minCount, missing,
-            std::move(ordMap), selectedStrings, std::move(termFilter));
+            selectedStrings, std::move(termFilter));
+        req.addMaterializationStep<&StrFacetOp::bindOrdinals>(*stringFacet);
+        facet = stringFacet;
         break;
       }
       case FieldType::Storage::TEXT:

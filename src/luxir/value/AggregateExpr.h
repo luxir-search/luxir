@@ -419,8 +419,13 @@ struct AggregateFieldInfos {
   const OrdMap* ords = nullptr;
 };
 
-std::span<const AggregateFieldInfos> resolveAggregateFields(
+// Resolve and validate catalog field handles during logical planning.
+std::span<AggregateFieldInfos> resolveAggregateFields(
     const AggregateProgram& program, MemPool& pool, IndexReader& reader);
+
+// Bind the runtime ordinal maps for the producers that read string columns.
+void bindAggregateOrdinals(const AggregateProgram& program, IndexReader& reader,
+    std::span<AggregateFieldInfos> fields);
 
 std::vector<BoundAggregateInput> bindAggregateInputs(
     const AggregateProgram& program, MemPool& pool,

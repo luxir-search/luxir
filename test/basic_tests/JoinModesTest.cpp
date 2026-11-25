@@ -143,6 +143,7 @@ TEST_F(JoinModesTest, boundedMembershipStopsAtTheDecidingMatchInEveryArm) {
     query.forcedArm = NumericPredicateQuery::ScorerArm::SPARSE_VERIFY;
     auto* child = query.createWeight(context, 0)->scorerSupplier(pool, many->segments()[0]);
     OwnershipRelation relation(*many, *root, context.planningContext().memoryTracker);
+    relation.bindMappers();
     RowReduction reduction{RowReduction::FIXED, upper ? 1 : 2, upper ? 2 : INT32_MAX};
     auto* source = relation.reduce(pool, 0, *child, nullptr, reduction, 0);
     auto demand = Query::PlanContext::fromLeadCost(1, Query::ExecutionUse::COUNT_WINDOWS);
@@ -234,6 +235,7 @@ TEST_F(JoinModesTest, denseCandidateAndWindowMasksCountShortFamiliesAndLargeTail
     query.forcedArm = NumericPredicateQuery::ScorerArm::SPARSE_VERIFY;
     auto* child = query.createWeight(context,0)->scorerSupplier(pool,many->segments()[0]);
     OwnershipRelation relation(*many,*root,context.planningContext().memoryTracker);
+    relation.bindMappers();
     auto* source = relation.reduce(pool,0,*child,nullptr,{RowReduction::FIXED,upper ? 1 : 2,upper ? 2 : INT32_MAX},0);
     auto plan = Query::PlanContext::fromLeadCost(N,Query::ExecutionUse::COUNT_WINDOWS);
     plan.membershipConsumption = Query::MembershipConsumption::CANDIDATES;
