@@ -9,6 +9,7 @@
 #include "luxir/index/IndexWriter.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/CatalogSummaryView.h"
+#include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
@@ -349,6 +350,18 @@ TEST_F(SegmentPruningTest, impossibleClauseKeepsPreparedRowOpValidation) {
   req->testForcePrepare = true;
   req->collection("prune").execute(false);
   EXPECT_TRUE(req->errorMsg().contains("prepared queries and routed filters")) << req->errorMsg();
+}
+
+TEST_F(SegmentPruningTest, unvalidatedGeneratedRootKeepsItsPreparation) {
+  indexThreeSegments();
+  auto reader = currentReader();
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  TermQuery absent("tag_s", "zz");
+  absent.validateLogical(context.planningContext());
+  ForcePrepareQuery generated(&absent);
+  generated.markPlannerGenerated();
+  EXPECT_TRUE(context.createRootWeight(generated, 0)->needsPrepare());
 }
 
 TEST_F(SegmentPruningTest, provenZeroWarmsTheAuthoredWholeCountKey) {
@@ -778,6 +791,33 @@ TEST_F(SegmentPruningTest, emptyRootsSkipCollection) {
   EXPECT_TRUE(notes(topDocs(R"({"range":{"field":"price_i","gte":1,"lte":23}})")).empty());
 }
 
+TEST_F(SegmentPruningTest, unrelatedPreparationKeepsTheEmptyWeightShortcut) {
+  SchemaBuilder schema;
+  auto& vector = schema.field("v_v");
+  vector.type = api::FieldDef::FieldClass::VECTOR;
+  vector.dims = 2;
+  vector.metric = api::VectorMetric::L2;
+  schema.set(helper->collection());
+  indexJson({R"({"id":"one","tag_s":"a","v_v":[0,0]})"});
+
+  std::string knn = R"({"knn":{"field":"v_v","query":[0,0],"k":1,"exact":true}})";
+  // The routed filter and the facet bucket are validated before the empty
+  // root's weight. Fusion validates its shared filter after the source.
+  for (const auto& json : {
+      topDocs(R"("tag_s:zz")", R"(,"filter":[{"query":)" + knn +
+          R"(,"except_ops":["tags"]}],"ops":{"tags":{"field_facet":{"field":"tag_s"}}})"),
+      topDocs(R"("tag_s:zz")", R"(,"ops":{"near":{"query_facet":{"buckets":{"one":)" +
+          knn + "}}}}"),
+      R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{"q":{"query":"tag_s:zz"}},"filter":[)" +
+          knn + "]}}}}"}) {
+    SCOPED_TRACE(json);
+    EXPECT_TRUE(std::ranges::any_of(notes(json), [](const std::string& note) {
+      return note.starts_with("op q: empty weight for the collection");
+    }));
+    expectSameWithAndWithoutPruning(json);
+  }
+}
+
 // kNN prepares over the whole index, so its op keeps its weights; its
 // segments are still pruned for collection, and the answer is unchanged.
 TEST_F(SegmentPruningTest, emptyRootKeepsWholeIndexPreparation) {
@@ -793,9 +833,9 @@ TEST_F(SegmentPruningTest, emptyRootKeepsWholeIndexPreparation) {
                                       "v_v", std::vector<float>{(float)segment, 0}),
                               UpdateMessage::COMMIT).success);
   }
-  std::string json = R"({"ops":{"q":{"top_docs":{"query":{"boolean":{"required":[)"
-                     R"({"knn":{"field":"v_v","query":[0,0],"k":2}},{"range":{"field":"price_i","gte":100}}]}},)"
-                     R"("limit":5,"count_limit":-1,"fields":["id"]}}}})";
+  std::string json = topDocs(R"({"boolean":{"required":[{"boolean":{"required":[)"
+      R"({"knn":{"field":"v_v","query":[0,0],"k":2}}],"filter":["*:*"]}},)"
+      R"({"range":{"field":"price_i","gte":100}}]}})");
   auto explained = notes(json);
   ASSERT_EQ(2u, explained.size());
   for (const auto& note : explained) EXPECT_TRUE(note.starts_with("op q: pruned segment")) << note;

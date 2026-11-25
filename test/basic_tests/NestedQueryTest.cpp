@@ -8,6 +8,7 @@
 #include "test/SchemaBuilder.h"
 #include "luxir/api/padded_input.h"
 #include "luxir/query/ParseContext.h"
+#include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/ProtobufQueryParser.h"
 #include "luxir/query/ToParentQuery.h"
 #include "luxir/query/ImpactsIndex.h"
@@ -184,6 +185,33 @@ TEST_F(NestedQueryTest, uniformMaximumPreservesChildScoresAndExactBounds) {
     scorer->setMinCompetitiveScore(std::nextafter(constant, std::numeric_limits<float>::infinity()));
     EXPECT_EQ(constant, scorer->score());
     EXPECT_EQ(PostingsReader::END, scorer->next());
+  }
+}
+
+TEST_F(NestedQueryTest, joinedPreparationUsesOnlyItsChildTree) {
+  auto req = localReq(helper.getSearchEngine());
+  auto& mr = req->mr;
+  auto wire = qb::toParent(mr, "items", qb::boolean(mr, {
+      qb::knn(mr, "embedding", {0, 0}, 1, 0, true),
+      qb::match(mr, "color", "zz")}));
+  auto* parsed = (ToParentQuery*)parse(*req, wire);
+  const auto& childView = req->pinView("items");
+  auto* source = req->createPlanningContext(*childView);
+  auto& relation = req->ownershipRelation(*childView, *req->reader);
+  ToParentQuery prepared(parsed->getChild(), *source, relation, parsed->getReduction());
+  MatchNoDocsQuery empty;
+  ToParentQuery plain(&empty, *source, relation, parsed->getReduction());
+  auto* planning = req->createPlanningContext(*req->reader);
+  prepared.validateLogical(*planning);
+  plain.validateLogical(*planning);
+
+  auto* context = Query::Context::create(&req->arena, *planning);
+  for (int32_t flags : {0, Query::NEED_SCORES}) {
+    auto* weight = context->createRootWeight(prepared, flags);
+    EXPECT_TRUE(weight->provenEmpty(req->reader->segments().front()));
+    EXPECT_TRUE(weight->needsPrepare());
+    EXPECT_NE(nullptr, dynamic_cast<MatchNoDocsQuery::Weight*>(
+        context->createRootWeight(plain, flags)));
   }
 }
 

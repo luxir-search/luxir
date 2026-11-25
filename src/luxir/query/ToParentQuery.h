@@ -51,7 +51,7 @@ public:
   }
   void validateLogicalImpl(PlanningContext& context, float multiplier) const override {
     child->validateLogical(source, reduction.kind != RowReduction::NONE ? multiplier : 1.0f);
-    if (source.mayPrepare) context.mayPrepare = true;
+    if (child->mayRequirePreparation()) context.requirePreparation();
   }
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out, const FilterKeyContext& context) const override {
     out.appendKind(getKind());

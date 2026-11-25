@@ -16,10 +16,11 @@ namespace luxir {
 Query::Weight* Query::Context::createRootWeight(Query& query, int32_t flags, float multiplier) {
   if (!planning.pruning) planning.pruning = std::make_shared<QueryPruning>();
   auto [mask, inserted] = planning.pruning->membership(query, planning);
-  bool emptyWeight = !planning.mayPrepare && mask.none();
+  bool mayPrepare = query.mayRequirePreparation();
+  bool emptyWeight = !mayPrepare && mask.none();
   auto* weight = emptyWeight ? pool.make<MatchNoDocsQuery::Weight>(*this, query, flags)
                              : query.createWeight(*this, flags, multiplier);
-  assert(!weight->needsPrepare() || planning.mayPrepare);
+  assert(!weight->needsPrepare() || mayPrepare);
   if (mask.prunesAny()) {
     weight->membership = &mask;
     if (inserted && planning.proofNotes) {
