@@ -1407,7 +1407,10 @@ protected:
     NEGATIVE, NESTED_FILTER, NESTED_REQUIRED, WRAPPED_REQUIRED, BOOSTED_REQUIRED,
     FILTER_CHAIN, OPTIONAL_GROUP, NESTED_MIN_MATCH,
     REQUIRED_FILTER_CONSUMER, REQUIRED_PROHIBITED_CONSUMER, FILTER_REQUIRED_CONSUMER,
-    LIFTED_OPTIONAL_CONSUMER, FILTER_NEGATIVE_OPTIONAL_CONSUMER
+    LIFTED_OPTIONAL_CONSUMER, FILTER_NEGATIVE_OPTIONAL_CONSUMER,
+    CONSUMER_FILTER_REQUIRED_CONSUMER, OPTIONAL_CONSUMER_FILTER_REQUIRED_CONSUMER,
+    CONSUMER_FILTER_PROHIBITED_CONSUMER, CONSUMER_FILTER_FILTER_CONSUMER,
+    CONSUMER_FILTER_SCALAR_FILTER_CONSUMER, FILTER_SCALAR_FILTER_CONSUMER
   };
   enum class Caller { SCORED, COUNT, FIELD_SORT, CONSTANT_SCORE, RESCORE, FACET };
   struct Result {
@@ -1469,6 +1472,24 @@ protected:
     if (shape == Shape::FILTER_REQUIRED_CONSUMER) {
       auto inner = qb::boolean(mr, {knn}, {}, {}, {constraint});
       return qb::boolean(mr, {}, {}, {}, {inner});
+    }
+    if (shape >= Shape::CONSUMER_FILTER_REQUIRED_CONSUMER) {
+      // The outer consumer's top-2 is {2, 3} in any domain containing them.
+      auto outer = qb::knn(mr, "body_v", {3, 0}, 2, 0, true);
+      auto excluded = qb::match(mr, "cat_s", "y");
+      auto inner = shape == Shape::CONSUMER_FILTER_PROHIBITED_CONSUMER
+          ? qb::boolean(mr, {knn}, {}, {excluded})
+          : shape == Shape::CONSUMER_FILTER_FILTER_CONSUMER
+          ? qb::boolean(mr, {}, {}, {}, {knn, constraint})
+          : shape == Shape::CONSUMER_FILTER_SCALAR_FILTER_CONSUMER
+                || shape == Shape::FILTER_SCALAR_FILTER_CONSUMER
+          ? qb::boolean(mr, {constraint}, {}, {}, {knn})
+          : qb::boolean(mr, {knn}, {}, {}, {constraint});
+      if (shape == Shape::FILTER_SCALAR_FILTER_CONSUMER) return qb::boolean(mr, {}, {}, {}, {inner});
+      if (shape == Shape::OPTIONAL_CONSUMER_FILTER_REQUIRED_CONSUMER) {
+        return qb::boolean(mr, {}, {outer}, {}, {inner});
+      }
+      return qb::boolean(mr, {outer}, {}, {}, {inner});
     }
     if (shape == Shape::FILTER_NEGATIVE_OPTIONAL_CONSUMER) {
       auto selected = qb::knn(mr, "body_v", {0, 0}, 1, 0, true);
@@ -1617,6 +1638,36 @@ TEST_F(KnnBooleanDomainTest, requiredProhibitedConsumerKeepsOuterDomain) {
 
 TEST_F(KnnBooleanDomainTest, filterRequiredConsumerKeepsInnerDomain) {
   expect(Shape::FILTER_REQUIRED_CONSUMER, {"2", "3"});
+}
+
+TEST_F(KnnBooleanDomainTest, consumerParentKeepsInnerDomain) {
+  expect(Shape::CONSUMER_FILTER_REQUIRED_CONSUMER, {"2", "3"});
+  expect(Shape::OPTIONAL_CONSUMER_FILTER_REQUIRED_CONSUMER, {"2", "3"});
+  expect(Shape::CONSUMER_FILTER_PROHIBITED_CONSUMER, {"2", "3"});
+}
+
+TEST_F(KnnBooleanDomainTest, consumerParentKeepsInnerPostFilter) {
+  // A range beside a filter-role kNN intersects after selection, as it does
+  // alone or under a non-consuming parent: the kNN's top-2 is {0, 1}.
+  expect(Shape::FILTER_SCALAR_FILTER_CONSUMER, {});
+  expect(Shape::CONSUMER_FILTER_SCALAR_FILTER_CONSUMER, {});
+  expect(Shape::CONSUMER_FILTER_FILTER_CONSUMER, {});
+}
+
+TEST_F(KnnBooleanDomainTest, cachedProhibitedConsumerFoldsIntoFilteredDomain) {
+  // The fixture admits on first sight, so the excluded kNN is a reader-stable
+  // cache build that the fold then reads inside a filtered (non-canonical) domain.
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->topDocs("q").countLimit().fields({"id"});
+  auto& mr = cur.mr();
+  auto range = qb::range(mr, "rank_i", qb::valI64(mr, 1), nullptr, nullptr, nullptr);
+  cur.rawQuery() = qb::boolean(mr, {qb::knn(mr, "body_v", {0, 0}, 2, 0, true), range}, {},
+      {qb::knn(mr, "body_v", {1, 0}, 1, 0, true)});
+  req->execute();
+  ASSERT_OK(req);
+  auto ids = resultIds(*req);
+  std::sort(ids.begin(), ids.end());
+  EXPECT_EQ((std::vector<std::string>{"2", "3"}), ids);
 }
 
 TEST_F(KnnBooleanDomainTest, negativeMergeKeepsOptionalConsumerOptional) {
@@ -2458,7 +2509,9 @@ TEST_F(KnnQueryTest, filteredBreadthProjectsFromEligibleYield) {
         EXPECT_EQ(passed, stats.newListSelectorPasses.load());
         EXPECT_EQ(0, stats.depthEntries.load());
         EXPECT_EQ(interval ? passed : 0, stats.oneBitScores.load());
-        EXPECT_EQ(interval ? 0 : passed, stats.pqScores.load());
+        // Dense PQ blocks also score their few non-members in place.
+        if (interval) { EXPECT_EQ(0, stats.pqScores.load()); }
+        else { EXPECT_LE(passed, stats.pqScores.load()); EXPECT_LE(stats.pqScores.load(), visited); }
         if (!interval) { EXPECT_EQ((int64_t)pooled.size(), stats.terminalReads.load()); }
         if (nprobe == 0) {
           EXPECT_TRUE(passed + 1e-9 >= stats.targetExamined.load() || rounds.back().result.breadthExhausted);
@@ -2829,6 +2882,31 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
   runAndCheck("d41");
   int64_t builds3 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
   EXPECT_EQ(builds3, builds2 + 1) << "new liveGen must rebuild the bitmap";
+}
+
+TEST_F(KnnQueryTest, rankLiveBitmapIsChargedToLiveDocsMemory) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard guard(/*minTraining=*/16);
+  CollectionHelper h("main");
+  installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  for (int i = 0; i < 4096; i++)
+    h.index(flatdoc("id", std::to_string(i), "emb_vs", std::vector<std::vector<float>>{
+        {(float)i + 1, 0, 0, 0}, {(float)i + 1.5f, 0, 0, 0}}));
+  h.commit({"*"});
+  h.deleteByIds({"40"}, UpdateMessage::COMMIT);
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto before = liveDocsMemory.views.bytes.load();
+  auto builds = KnnQuery::rankLiveBitmapBuildsForTests.load();
+  auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 3);
+  req->execute();
+  ASSERT_OK(req);
+  req->done();
+  ASSERT_EQ(builds + 1, KnnQuery::rankLiveBitmapBuildsForTests.load());
+  // The 8192-vector rank bitmap owns 1024 bytes, charged as a live view.
+  auto charged = liveDocsMemory.views.bytes.load() - before;
+  EXPECT_GE(charged, 1024u);
+  EXPECT_LT(charged, 2048u);
 }
 
 TEST_F(KnnQueryTest, deleteCommitReleasesSupersededLiveDocs) {
@@ -4301,6 +4379,39 @@ TEST_F(KnnQueryTest, filteredFlatWorkIgnoresSurroundingColumn) {
   }
 }
 
+TEST_F(KnnQueryTest, filterMatchingEveryLiveDocRunsUnfiltered) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::statsForTests);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(8, 2, 2), 4);
+  for (int i = 0; i < 512; i++)
+    h.index(flatdoc("id", std::to_string(i), "all_s", "yes", "keep_s", i == 7 ? "no" : "yes",
+        "emb_v", std::vector<float>{(float)i + 1, 0, 0, 0}));
+  h.commit({"*"});
+  auto run = [&](std::string_view filter) {
+    KnnQuery::Stats stats;
+    KnnQuery::statsForTests = &stats;
+    auto req = localReq(h.getSearchEngine());
+    auto& cur = req->topDocs("q");
+    configKnn(cur, "emb_v", {0, 0, 0, 0}, 5);
+    if (!filter.empty()) addMatchFilter(cur, filter, "yes");
+    req->execute(false);
+    EXPECT_OK(req);
+    KnnQuery::statsForTests = nullptr;
+    return std::tuple{resultIds(*req), stats.work.selectorNone, stats.work.selectorBitmap, stats.targetExamined.load()};
+  };
+  // Without deletes the full filter scans with no selector, like no filter.
+  auto unfiltered = run("");
+  EXPECT_GT(std::get<1>(unfiltered), 0);
+  EXPECT_EQ(unfiltered, run("all_s"));
+  // With deletes, a filter whose only misses are deleted is the live set.
+  h.deleteByIds({"7"}, UpdateMessage::COMMIT);
+  unfiltered = run("");
+  EXPECT_GT(std::get<2>(unfiltered), 0);
+  EXPECT_EQ(unfiltered, run("keep_s"));
+}
+
 TEST_F(KnnQueryTest, filteredFlatExcludesPooledDocumentRun) {
   class ExcludingEngine final : public VectorEngine {
     VectorEngine& inner;
@@ -4321,7 +4432,10 @@ TEST_F(KnnQueryTest, filteredFlatExcludesPooledDocumentRun) {
   h.indexAll({flatdoc("id", "a", "keep_s", "yes", "emb_vs",
                      std::vector<std::vector<float>>{{1, 0}, {0, 0}, {2, 0}}),
               flatdoc("id", "b", "keep_s", "yes", "emb_vs",
-                     std::vector<std::vector<float>>{{3, 0}})}, UpdateMessage::COMMIT);
+                     std::vector<std::vector<float>>{{3, 0}}),
+              // Excluded, so the filter is not the whole live set.
+              flatdoc("id", "c", "keep_s", "no", "emb_vs",
+                     std::vector<std::vector<float>>{{9, 0}})}, UpdateMessage::COMMIT);
   SearchOverridesGuard saved(KnnQuery::tuning.flatDomainDensityThreshold, KnnQuery::statsForTests);
   KnnQuery::tuning.flatDomainDensityThreshold = INFINITY;
   EngineWrapperGuard wrapper([](VectorEngine& engine) { return std::make_unique<ExcludingEngine>(engine); });
@@ -5144,6 +5258,43 @@ TEST_F(KnnQueryTest, completionRecoversUnpooledMaximumBeyondCandidateCap) {
   EXPECT_EQ(1, stats.switches.load());
 }
 
+TEST_F(KnnQueryTest, completionPricesFoldedMultiValuedEligibility) {
+  // Heavy docs hold 8 vectors, light docs 1: a bitset filter on heavy docs is
+  // estimated at the average multiplicity (4.5) until the round-one fold.
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf(16);
+  SearchOverridesGuard saved(KnnQuery::tuning.completion, KnnQuery::statsForTests);
+  KnnQuery::tuning.completion = KnnQuery::Completion::FORCE;
+  CollectionHelper h("main");
+  installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  for (int i = 0; i < 4096; i++) {
+    bool heavy = i % 2 == 0;
+    std::vector<std::vector<float>> vectors;
+    for (int j = 0; j < (heavy ? 8 : 1); j++) vectors.push_back({(float)i + 1 + j * 0.01f, 0, 0, 0});
+    h.index(flatdoc("id", std::to_string(i), "heavy_s", heavy ? "yes" : "no", "emb_vs", vectors));
+  }
+  h.commit({"*"});
+  KnnQuery::Stats stats;
+  KnnQuery::statsForTests = &stats;
+  auto req = localReq(h.getSearchEngine());
+  req->collection("main").profile();
+  auto& cur = req->topDocs("q");
+  configKnn(cur, "emb_vs", {0, 0, 0, 0}, 3);
+  addMatchFilter(cur, "heavy_s", "yes");
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& piece = req->responses.back()->proto.profile->ops.at(0).pieces.at(0);
+  EXPECT_EQ(9216, profileNumber(piece, "eligible_vectors")); // Actual: 2048 * 8 = 16384.
+  EXPECT_EQ(16384 * 4, profileNumber(piece, "exact_dims")); // Completion scored the actual count.
+  auto planned = profileNumber(piece, "exact_cost");
+  ASSERT_TRUE(planned);
+  ASSERT_EQ(1u, stats.completions.size());
+  // Completion prices exact scoring at the folded count; only that term depends on it.
+  double perVector = 4 * KnnPlanner::Costs::ENCODING_DIM_COST[0][(size_t)VectorEncoding::F32]
+      * KnnQuery::tuning.plannerCosts.units[KnnPlanner::EXACT_DIM];
+  EXPECT_DOUBLE_EQ(*planned + (16384 - 9216) * perVector, stats.completions[0].exact);
+}
+
 TEST_F(KnnQueryTest, forcedCompletionMatchesExactAcrossSegments) {
   ForceIvfGuard forceIvf;
   IvfTestGuard ivf(16);
@@ -5266,6 +5417,69 @@ TEST_F(KnnQueryTest, runtimeCompletionDistinguishesFarAndIndependentFilters) {
   }
 }
 
+TEST_F(KnnQueryTest, explicitNprobeUnderfillWarns) {
+  // An explicit nprobe never deepens, so a filter anti-correlated with the
+  // probed lists underfills k; the response says so.
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, rabitqAnn(16, 4), 4);
+  for (int i = 0; i < 512; i++)
+    h.index(flatdoc("id", std::to_string(i), "far_s", i >= 460 ? "yes" : "no",
+        "emb_v", std::vector<float>{(float)i + 1, 0, 0, 0}));
+  h.commit({"*"});
+  auto req = localReq(h.getSearchEngine());
+  auto& cur = req->topDocs("q");
+  configKnn(cur, "emb_v", {0, 0, 0, 0}, 3, 1);
+  addMatchFilter(cur, "far_s", "yes");
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ(0u, resultIds(*req).size()); // k=3; 52 docs match the filter.
+  const auto& warnings = req->responses.back()->proto.warnings;
+  ASSERT_EQ(1u, warnings.size());
+  EXPECT_EQ("knn_underfill", warnings[0].code);
+  EXPECT_EQ("field 'emb_v': returned 0 of k=3 docs; eligible_docs=52; nprobe_pinned=true", warnings[0].message);
+}
+
+TEST_F(KnnQueryTest, zeroYieldFilterCompletesBeforeDoubling) {
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  SearchOverridesGuard saved(KnnQuery::tuning.completion, KnnQuery::statsForTests, KnnQuery::tuning.plannerCosts);
+  KnnQuery::tuning.completion = KnnQuery::Completion::AUTO;
+  // An exact pass costs about 0.6 of a full scan: a doubling round stays
+  // cheaper than exact, while the whole remaining scan does not.
+  KnnQuery::tuning.plannerCosts.units.fill(0);
+  KnnQuery::tuning.plannerCosts.units[KnnPlanner::EXACT_DIM] = 3;
+  KnnQuery::tuning.plannerCosts.units[KnnPlanner::ENTRY_BITMAP] = 2;
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(64, 2, 2), 4);
+  for (int i = 0; i < 8192; i++)
+    h.index(flatdoc("id", std::to_string(i), "far_s", i >= 7372 ? "yes" : "no",
+        "independent_s", i % 10 == 0 ? "yes" : "no", "emb_v", std::vector<float>{(float)i + 1, 0, 0, 0}));
+  h.commit({"*"});
+  for (std::string filter : {"far_s", "independent_s"}) {
+    std::vector<std::string> expected;
+    for (bool exact : {true, false}) {
+      KnnQuery::Stats stats;
+      KnnQuery::statsForTests = &stats;
+      auto req = localReq(h.getSearchEngine());
+      auto& cur = req->topDocs("q");
+      configKnn(cur, "emb_v", {0, 0, 0, 0}, 3, 0, 0, exact);
+      addMatchFilter(cur, filter, "yes");
+      req->execute(false);
+      ASSERT_OK(req);
+      if (exact) { expected = resultIds(*req); continue; }
+      EXPECT_EQ(expected, resultIds(*req));
+      if (filter == "independent_s") { EXPECT_EQ(0, stats.switches.load()); continue; }
+      // Round one finds no eligible code, so the scan to the examined
+      // target is priced at once; doubling took one more IVF round.
+      ASSERT_EQ(1u, stats.completions.size());
+      EXPECT_EQ(1, stats.completions[0].round);
+      EXPECT_EQ(2, stats.rounds.load());
+    }
+  }
+}
+
 TEST_F(KnnQueryTest, profileReportsInitialNprobeAndDistinctLists) {
   ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
@@ -5382,7 +5596,6 @@ TEST_F(KnnQueryTest, completionPreviewPreservesAllocationAndPins) {
   for (int nprobe : {0, 1}) {
     std::vector<std::string> expected;
     std::vector<RecordedVectorRound> baseline;
-    int64_t allocatorEntries = 0;
     for (auto mode : {KnnQuery::Completion::OFF, nprobe ? KnnQuery::Completion::FORCE : KnnQuery::Completion::AUTO}) {
       KnnQuery::tuning.completion = mode;
       KnnQuery::Stats stats;
@@ -5397,12 +5610,14 @@ TEST_F(KnnQueryTest, completionPreviewPreservesAllocationAndPins) {
       ASSERT_OK(req);
       EXPECT_EQ(0, stats.switches.load());
       if (mode == KnnQuery::Completion::OFF) {
-        expected = resultIds(*req); baseline = rounds; allocatorEntries = stats.work.allocatorEntries;
-        if (!nprobe) { EXPECT_GT(rounds.size(), 1u); }
+        expected = resultIds(*req); baseline = rounds;
+        // Live list sizes are cached per deletes generation: only the first
+        // query of the generation probes list ids.
+        if (!nprobe) { EXPECT_GT(rounds.size(), 1u); EXPECT_GT(stats.work.allocatorEntries, 0); }
       } else {
         EXPECT_EQ(expected, resultIds(*req));
         ASSERT_EQ(baseline.size(), rounds.size());
-        EXPECT_EQ(allocatorEntries, stats.work.allocatorEntries);
+        EXPECT_EQ(0, stats.work.allocatorEntries);
         for (size_t r = 0; r < rounds.size(); r++) {
           EXPECT_EQ(baseline[r].kind, rounds[r].kind);
           EXPECT_EQ(baseline[r].target, rounds[r].target);
@@ -5604,7 +5819,7 @@ TEST_F(KnnQueryTest, documentCompletionPreservesSatisfiedPool) {
   installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(16, 2, 2), 4);
   for (int s = 0; s < 2; s++) {
     for (int i = 0; i < 1024; i++) {
-      bool keep = s || i == 1023;
+      bool keep = s ? i > 0 : i == 1023; // Not every doc: segment 1 stays filtered.
       float value = !s && keep ? 10000 : (float)i * (s ? 1.5f : 1.0f);
       h.index(flatdoc("id", std::to_string(s * 1024 + i), "keep_s", keep ? "yes" : "no",
           "emb_vs", std::vector<std::vector<float>>(i == 1022 ? 2 : 1, {value, 0, 0, 0})));
@@ -5632,7 +5847,7 @@ TEST_F(KnnQueryTest, documentCompletionPreservesSatisfiedPool) {
       EXPECT_EQ(VectorSearchRound::COMPLETION, rounds.back().kind);
       EXPECT_EQ(0, rounds.back().result.work.physicalEntries);
       EXPECT_EQ(1, stats.segmentWork[1].ivfRounds);
-      EXPECT_EQ(0, stats.segmentWork[1].foldDocs); // All docs: the empty complement.
+      EXPECT_EQ(1, stats.segmentWork[1].foldDocs); // The one-doc complement.
       EXPECT_EQ(17, stats.segmentWork[1].foldWords); // One fold, no reopening.
     }
   }

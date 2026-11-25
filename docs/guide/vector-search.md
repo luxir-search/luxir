@@ -993,6 +993,14 @@ exhausted. Widening projects from observed yield instead of adding one list at
 a time. These are effort heuristics; approximate candidate selection can still
 miss neighbors even when every list is scanned.
 
+When a document-mode kNN returns fewer than `k` documents although more
+eligible documents exist, the response includes a warning with code
+`knn_underfill`. Its message reports the field, the returned count, `k`, the
+eligible document count, and `nprobe_pinned`: `true` means an explicit `nprobe`
+capped the effort, so the search neither deepened nor completed exactly;
+raise `nprobe` or leave it adaptive. Hits removed by `similarity` do not
+trigger the warning.
+
 ### Scoring
 
 L2 scores are `1 / (1 + squared_distance)`. Inner product scores are the dot

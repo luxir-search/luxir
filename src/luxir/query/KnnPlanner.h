@@ -231,9 +231,10 @@ struct KnnPlanner {
       p.resolveExtra = predictedChecks(s, 1) * (resolveCost(s, costs) - costs.units[ENTRY_BITMAP]);
       p.foldCost = costs.price(foldWork(s));
       p.foldThreshold = foldThreshold(s, request.selector, costs);
-      // A borrowed domain stays read-only until bounded pooling clears ranks.
-      if (borrowDomain(s) && s.bounded) p.deepenCopy = ((s.vectors + 63) / 64) * costs.units[FOLD_WORD];
     }
+    // Ranks without an owned fold (borrowed domains, unfiltered live ranks)
+    // are copied or filled when bounded pooling first clears one.
+    if (s.bounded && (s.unfiltered || borrowDomain(s))) p.deepenCopy = ((s.vectors + 63) / 64) * costs.units[FOLD_WORD];
     // Both resolve and folded selectors pay these terms. They cancel in
     // the round-one selector crossover; allocator liveness probes do not.
     if (s.codec == Codec::PQ && (!s.unfiltered || s.deletes)) p.linear[ENTRY_PQ] = (double)s.vectors;

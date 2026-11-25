@@ -1665,7 +1665,17 @@ inline DomainHandle materializeEffectiveExclusion(
   excluded.reserve(sources.size());
   ptrs.reserve(sources.size());
   for (auto& source : sources) {
-    DomainHandle set = materializeEffectiveFilter(source, reader, segment, base);
+    // A reader-stable value holds the exclusion's membership in the canonical
+    // live domain it was prepared in, a superset of its restriction to a
+    // filtered base. Subtracting that superset removes exactly the excluded
+    // docs of the base, so it is borrowed whole instead of being handed a
+    // non-canonical domain it cannot honor.
+    DomainHandle set;
+    if (auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(source.prepared.get())) {
+      set = DomainHandle::borrowed(cached->docSet(segment)).scoped(segment);
+    } else {
+      set = materializeEffectiveFilter(source, reader, segment, base);
+    }
     if (set.get() == nullptr) {
       set = DomainHandle(materialize(
           source.segmentSource(), segment, base)).scoped(segment);

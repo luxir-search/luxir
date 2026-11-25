@@ -575,9 +575,11 @@ That makes eligibility closed under AND re-association. It never follows an
 optional group (even with min_match) or a prohibited branch, and never extracts
 a domain consumer; extracted exclusions stay prohibited. A nested copy is
 dropped only while its boolean keeps another required clause, so rank-only
-optionals never become requirements, and a retained copy shares the extracted
-one's query-owned filter use, which is request-owned when the shared cache
-rejects admission or is absent. Scoring siblings, including terms and
+optionals never become requirements, and never from a boolean that itself
+contains a domain consumer: that consumer selects inside the domain its own
+constraints fold, and a filter-role boolean never sees its parent's filters.
+A retained copy shares the extracted one's query-owned filter use, which is
+request-owned when the shared cache rejects admission or is absent. Scoring siblings, including terms and
 constraints wrapped in `constant_score(...)`, intersect with the kNN's top-k
 afterwards. Required-clause inlining never moves a domain consumer to a
 different prepare stage.
@@ -592,7 +594,10 @@ The FAISS index bytes are decoded lazily on first kNN use and then cached on
 the segment reader.
 
 Routing uses column and overlay metadata before loading FAISS or rank-liveness
-state. Single-valued eligibility counts are exact. Unfiltered multi-valued
+state. A domain holding every live doc (a range or `exists` matching all of a
+segment) is the live set, since domains are live-filtered, so it routes as
+unfiltered: no selector without deletes, the rank-liveness bitmap with them,
+and unfiltered pricing. Single-valued eligibility counts are exact. Unfiltered multi-valued
 columns use upper bounds without a domain walk; IVF replaces their live-vector
 bound with the cached rank-liveness count. Filtered multi-valued counts sum
 value ranges for array domains or when the domain or its complement has at
@@ -603,10 +608,11 @@ and rank-bitmap folds use the same doc-to-rank walk.
 
 `KnnPlanner` prices predicted work with one calibrated unit-cost table. Exact
 slots pay per scored dimension, per visited domain doc and per rank mapping.
-IVF slots pay per examined entry, with an extra term for PQ (its FAISS scanner
-tests the selector through a virtual call) and a branch-misprediction term
-proportional to `p(1-p)` for selector pass rate `p`, except on 1-bit RaBitQ, whose
-selector test does not branch; per codec score (PQ
+IVF slots pay per examined entry, with an extra term for PQ and a
+branch-misprediction term proportional to `p(1-p)` for selector pass rate `p`,
+except on 1-bit RaBitQ, whose selector test does not branch (both PQ terms
+were fitted when FAISS tested the selector per code through a virtual call;
+the PQ scan now selects branch-free, so they need recalibration); per codec score (PQ
 subcodes; RaBitQ one-bit and extra-bit scores, each a constant per code plus
 a term per dimension); per list setup; per coarse
 centroid dimension; per slot-round; and per terminal read plus per terminal
@@ -666,13 +672,21 @@ smaller of members and nonmembers, and multi-valued docs contribute their full
 vector ranges. Every deepen folds filtered domains, including interval-only
 breadth widening, and clears pooled ranks, so later scans use one bitmap probe
 without resolving IDs. Borrowed words are copied on the first pooled clear, and
-owned bitmaps are charged to the request memory tracker. The RaBitQ scan
-dispatches the selector kind once per scan and tests bitmaps inline; PQ uses
-FAISS's scanner and its selector interface.
+owned bitmaps are charged to the request memory tracker. Both codecs dispatch
+the selector kind once per scan and test bitmaps inline, without branching.
+PQ then hands FAISS's scanner, which never sees a selector, the passing codes
+of each 256-row block: compacted when sparse, or in place when at least 7/8
+pass, the non-members carrying id -1 for the handler to drop. That cut PQ
+filtered scans by about 27% at 10% selectivity (`BM_VectorKnnFiltered`, 500k x
+128, PQ) with no change for near-total pass rates.
 
 At each joined round boundary, the host previews the next allocation without
 advancing its cursors. If a slot's cumulative IVF cost plus its next-round cost
-exceeds its full-domain exact cost, the slot completes exactly. This is a cost
+exceeds its full-domain exact cost, the slot completes exactly. A breadth round
+that examined no eligible code where an independent filter expects at least 16
+also prices the scan to the examined target at one pseudo-pass, usually the
+remaining index: zero yield only doubles coverage, so an anti-correlated filter
+would otherwise pay rounds before the cumulative rule fires. This is a cost
 rule, not a regret bound. Explicit probe pins disable completion, and idle
 slots never trigger it. Completion removes the slot from allocation,
 recomputes effort over the active IVF slots, and runs one exact top-k pass over
@@ -681,7 +695,8 @@ lower-bound witnesses stay valid. In document mode only the completed slot's
 approximate candidates are retracted: nominees never evict across slots, so the
 active pool continues and deepens only if it falls short. Group admission can
 evict another slot's members, so in group mode the active bounded pool starts
-a fresh epoch with covered lists rescanned and exclusions reopened. Profiles
+a fresh epoch with covered lists rescanned and exclusions reopened; reopening
+sets the logged pooled ranks back rather than folding the domain again. Profiles
 add the completion round, reason and costs; work counters include the
 abandoned IVF work and the exact pass.
 
@@ -701,7 +716,9 @@ uneven list sizes and avoids applying equal work to every segment. For an IVF se
 the live count is exact: it rides along with the segment's cached
 rank-liveness bitmap, which is rebuilt per delete generation in time
 proportional to the deleted docs (for a dense single-valued field the bitmap
-simply borrows the liveDocs bits). Filtered flat-scanned segments with deletions use a
+simply borrows the liveDocs bits). Per-list live counts are query-independent
+too: the overlay caches them per delete generation, filled by the first query
+to allocate each list. Filtered flat-scanned segments with deletions use a
 cheap upper bound for their live count instead. It contributes only to the whole-index reference breadth; the IVF
 allocation denominator uses exact live counts.
 
@@ -738,7 +755,9 @@ PQ scores, RaBitQ one-bit and extra-bit scores, list setups, depth revisits,
 flat scores and domain visits. Terminal scoring adds its column reads after
 each read-stage barrier. These count scoring work, not physical page IO;
 allocator liveness probes are counted separately and priced as rank-bitmap
-work, including the next-list lookahead under deletes.
+work, including the next-list lookahead under deletes. The planner still
+prices those probes on every query, although only a generation's first query
+pays them; that term needs recalibration.
 
 Probed lists are always scanned in full. Entries within an IVF list are stored
 in insertion order, not relevance order, so a partial list scan would drop

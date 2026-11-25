@@ -205,19 +205,26 @@ private:
         for (auto* prohibited : roles.prohibited) {
           if (extractableProhibited(prohibited)) parent.prohibited.push_back(prohibited);
         }
-        // Keep a required carrier so optional clauses never become required.
-        size_t required = roles.mandatory.size() + roles.filter.size();
-        auto end = std::remove_if(roles.filter.begin(), roles.filter.end(),
-            [&](Query* query) {
-              if (required <= 1 || !extractableFilter(query)) return false;
-              required--;
-              return true;
-            });
-        roles.filter.erase(end, roles.filter.end());
-        if (required != 0) {
-          auto end = std::remove_if(roles.prohibited.begin(), roles.prohibited.end(),
-              extractableProhibited);
-          roles.prohibited.erase(end, roles.prohibited.end());
+        // A consumer inside this boolean selects within the domain its own
+        // constraints fold, and the parent's copy reaches it only through
+        // the parent's incoming domain, which a filter-role boolean never
+        // sees. Its nested copies therefore stay; they share the extracted
+        // copy's filter use.
+        if (!inner.shapeConsumesDomain()) {
+          // Keep a required carrier so optional clauses never become required.
+          size_t required = roles.mandatory.size() + roles.filter.size();
+          auto end = std::remove_if(roles.filter.begin(), roles.filter.end(),
+              [&](Query* query) {
+                if (required <= 1 || !extractableFilter(query)) return false;
+                required--;
+                return true;
+              });
+          roles.filter.erase(end, roles.filter.end());
+          if (required != 0) {
+            auto end = std::remove_if(roles.prohibited.begin(), roles.prohibited.end(),
+                extractableProhibited);
+            roles.prohibited.erase(end, roles.prohibited.end());
+          }
         }
         parent.ruleMask |= roles.ruleMask;
         auto same = [](const ClauseList& a, std::span<Query*> b) {

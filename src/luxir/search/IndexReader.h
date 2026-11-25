@@ -74,6 +74,7 @@ public:
   // Callers must retain this LiveDocs and alias its shared_ptr to the returned
   // record. The record must never own this LiveDocs, which would form a cycle.
   // Holding the lock during build prevents concurrent first callers folding twice.
+  // Each view is charged to liveDocsMemory.views once built, until this LiveDocs dies.
   template <typename Build>
   const RankLiveBitmap& rankLiveBitmap(std::string_view field, Build&& build) const {
     std::lock_guard lock(rankLiveMutex);
@@ -82,7 +83,23 @@ public:
     }
     auto made = std::make_unique<const RankLiveBitmap>(build());
     rankLiveViews.emplace_back(field, std::move(made));
-    return *rankLiveViews.back().second;
+    const auto& [name, view] = rankLiveViews.back();
+    liveDocsMemory.views.add(rankLiveBytes(name, *view));
+    return *view;
+  }
+
+  // The live vector count of `field`'s rank view once built, or -1.
+  int64_t builtRankLiveVectors(std::string_view field) const {
+    std::lock_guard lock(rankLiveMutex);
+    for (const auto& [name, view] : rankLiveViews) {
+      if (name == field) return view->liveVectors;
+    }
+    return -1;
+  }
+
+  static size_t rankLiveBytes(const std::string& name, const RankLiveBitmap& view) {
+    return sizeof(RankLiveBitmap) + name.capacity()
+        + (view.backing ? sizeof(std::vector<uint8_t>) + view.backing->capacity() : 0);
   }
 
   // Get the underlying FixedBitSet for direct access
@@ -95,7 +112,8 @@ public:
     return docSet;
   }
 
-  // Bytes this LiveDocs holds on the heap; 0 for a mapped DENSE file.
+  // Bytes of the bitmap this LiveDocs owns on the heap; 0 for a mapped DENSE
+  // file. Rank views are charged separately, as live views.
   size_t heapBytes() const {
     return ownedWords ? sizeof(*this) + FixedBitSet::sizeInWords(size()) * sizeof(uint64_t) : 0;
   }

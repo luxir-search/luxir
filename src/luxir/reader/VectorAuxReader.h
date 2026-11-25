@@ -14,6 +14,7 @@
 #include <faiss/utils/distances.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -31,6 +32,7 @@
 #include "ReaderErrors.h"
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/reader/RankLiveBitmap.h"
 #include "luxir/store/Directory.h"
 #include "luxir/store/InputStream.h"
 #include "luxir/util/log.h"
@@ -324,6 +326,12 @@ class VectorAuxReader : public AuxReader {
   VectorAuxListsFooter footer;
   mutable std::mutex unitCountMutex;
   mutable std::vector<std::pair<std::string, int64_t>> unitCounts;
+  // Per-list live vector counts of one rank-liveness generation (-1 until a
+  // query counts that list). Keyed by the generation's RankLiveBitmap, whose
+  // aliasing handle expires with its LiveDocs; expired entries are dropped.
+  mutable std::mutex listLiveMutex;
+  mutable std::vector<std::pair<std::weak_ptr<const RankLiveBitmap>,
+                                std::shared_ptr<std::atomic<int32_t>[]>>> listLive;
   std::string segment;  // The owning segment, named when the bytes are invalid; empty outside a segment.
 
   // Runs a step that only decodes bytes already held, so what it rejects is
@@ -396,6 +404,19 @@ public:
     int64_t units = count();
     unitCounts.emplace_back(ancestor, units);
     return units;
+  }
+
+  // List liveness is query-independent: queries of one deletes generation
+  // share these counts instead of probing every allocated list's ids.
+  std::shared_ptr<std::atomic<int32_t>[]> listLiveCounts(const std::shared_ptr<const RankLiveBitmap>& live) const {
+    std::lock_guard lock(listLiveMutex);
+    for (const auto& [key, counts] : listLive)
+      if (!key.owner_before(live) && !live.owner_before(key) && key.lock().get() == live.get()) return counts;
+    std::erase_if(listLive, [](const auto& entry) { return entry.first.expired(); });
+    std::shared_ptr<std::atomic<int32_t>[]> counts(new std::atomic<int32_t>[(size_t)std::max(0, meta.nlist)]);
+    for (int32_t i = 0; i < meta.nlist; i++) counts[(size_t)i].store(-1, std::memory_order_relaxed);
+    listLive.emplace_back(live, counts);
+    return counts;
   }
 
   std::string_view getKind() const override { return KIND; }

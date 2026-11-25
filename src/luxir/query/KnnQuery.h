@@ -266,8 +266,8 @@ public:
     if (!domain) return vr.numVectors() > 0;
     const auto& docs = vr.strColReader().docsReader();
     const auto* bitmap = docs.bitset();
-    // Without a bitmap every row has a vector; assume so for any other shape too.
-    if (!bitmap) return !docs.allRows() || domain->card() > 0;
+    // Without a bitmap either every row has a vector or none does.
+    if (!bitmap) return docs.allRows() && domain->card() > 0;
     if (domain->type == DocSet::BITSET) {
       return bitmap->intersectionCardinality(((const BitDocSet*)domain)->bits()) > 0;
     }
@@ -361,6 +361,11 @@ public:
   // real search results before the host's pooling and terminal scoring.
   static inline std::function<std::unique_ptr<VectorEngine>(VectorEngine& engine)>
       engineWrapperForTests;
+
+  // Independent-filter passes expected on the lists scanned so far, at or
+  // above which zero observed passes prices completion against the whole
+  // remaining scan (P(0) = e^-16 for an independent filter).
+  static constexpr double ANTI_CORRELATED_EXPECTED_PASSES = 16;
 
   static double projectedScanFraction(double covered, double need, double have) {
     return have > 0 ? covered * (need / have) * tuning.breadthHeadroom : covered * tuning.breadthGrowth;
@@ -1086,10 +1091,19 @@ public:
           binding.owners = query.relation->mapper(i);
         }
       }
-      std::span<DocSet* const> sourceDomain = [&]() -> std::span<DocSet* const> {
-        if constexpr (Owned) return domains;
-        else return ctx.domainPerSeg;
-      }();
+      if constexpr (!Owned) if (!ctx.domainPerSeg.empty()) {
+        // A domain is live-filtered (Query.h), so one holding every live
+        // doc is the live set itself: a filter on a dense field's exists,
+        // a range over every doc. Route it as unfiltered (rank-live bitmap
+        // or no selector, unfiltered pricing) rather than as a filter.
+        domains.assign(ctx.domainPerSeg.begin(), ctx.domainPerSeg.end());
+        for (size_t i = 0; i < numSegs; i++) {
+          auto& seg = reader.segments()[i];
+          DocSet*& domain = domains[i];
+          if (domain && domain != seg.liveDocSet() && domain->card() == seg.numLive()) domain = seg.liveDocSet();
+        }
+      }
+      std::span<DocSet* const> sourceDomain = domains;
       std::vector<int64_t> segVectorCounts(numSegs, 0);
       std::vector<int64_t> segLiveVectorCounts(numSegs, 0);
       std::vector<SegmentEligibility> eligibilityPerSeg(numSegs);
@@ -1174,10 +1188,10 @@ public:
               input.domain = binding.unitDomain != nullptr;
               input.deletes = owner.mayHaveDeletes();
             } else {
-              DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
+              DocSet* domain = sourceDomain.empty() ? nullptr : sourceDomain[i];
               eligible = countEligible(vr, domain, seg.liveDocs(), seg.maxDoc());
               segLiveVectorCounts[i] = eligible.unfiltered && !vr.multiValued()
-                  ? eligible.eligibleVectors : liveVectorUpperBound(seg, vr);
+                  ? eligible.eligibleVectors : liveVectorUpperBound(seg, vr, query.getField());
               input.domainSize = domain ? domain->card() : seg.maxDoc();
               input.domain = domain != nullptr;
               input.arrayDomain = domain && domain->type == DocSet::ARRAY;
@@ -1361,6 +1375,7 @@ public:
             .liveVectorCount = segLiveVectorCounts[i],
             .ivfEngine = std::make_unique<SegmentIvfScanner<Groups, Owned>>(
                 *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
+                rankLivePerSeg[i] ? vaux->listLiveCounts(rankLivePerSeg[i]) : nullptr,
                 metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
                 vaux->getLists(), vaux->getAmplitudes(), interval ? &intervals : nullptr),
           });
@@ -1457,8 +1472,12 @@ public:
       RequestMemResource rankMemory(context.planningContext().memoryTracker, query.getField(), "knn rank eligibility");
       std::vector<RankEligibility> rankEligibility;
       rankEligibility.reserve(numSegs);
-      for (size_t i = 0; i < numSegs; i++) rankEligibility.emplace_back(&rankMemory);
+      for (size_t i = 0; i < numSegs; i++) rankEligibility.emplace_back(&rankMemory).logClears = Groups;
       std::vector<std::span<const uint8_t>> eligibleSpans(numSegs);
+      // Completion compares against exact work at the folded count once a
+      // multi-valued estimate is replaced by the exact eligible-vector count.
+      std::vector<double> exactCosts(numSegs);
+      for (size_t i = 0; i < numSegs; i++) exactCosts[i] = plan.prices[i].exactCost;
       auto foldDomainAt = [&](size_t i) {
         auto& ranks = rankEligibility[i];
         if (!ranks.bits.empty()) return;
@@ -1474,6 +1493,12 @@ public:
         } else {
           ranks.original = foldDomain(vr, *domain, seg.maxDoc(), ranks.owned, workBySeg[i]);
           ranks.bits = ranks.owned;
+          if (planSegments[i].vectorsEstimated) {
+            auto exact = planSegments[i];
+            exact.eligibleVectors = ranks.original;
+            exact.vectorsEstimated = false;
+            exactCosts[i] = KnnPlanner::price(exact, planRequest, tuning.plannerCosts).exactCost;
+          }
         }
         ranks.remaining = ranks.original;
         eligibleSpans[i] = ranks.bits;
@@ -1599,7 +1624,7 @@ public:
               && (input.unfiltered || KnnPlanner::borrowDomain(input)))
             marginal += ((input.vectors + 63) / 64) * tuning.plannerCosts.units[KnnPlanner::FOLD_WORD];
           double cumulative = tuning.plannerCosts.price(KnnPlanner::actualWork(input, spent));
-          double exact = plan.prices[i].exactCost;
+          double exact = exactCosts[i];
           if (!force && cumulative + marginal <= exact) continue;
           completions.push_back({(int32_t)i, roundNumber, force ? "forced" : marginal > exact ? "marginal" : "cumulative",
               exact, marginal, cumulative, spent.physicalEntries, spent.ivfRounds});
@@ -1641,14 +1666,15 @@ public:
 
         if constexpr (Groups) {
           // Group admission can evict another slot's members. Reopen the
-          // active bounded ranks so covered lists can restore those members.
+          // active bounded ranks so covered lists can restore those members:
+          // setting the logged pooled clears back keeps any folded domain.
           candidateHits.clear(); docHits.clear(); seenDocs.clear(); seenVectors.clear();
           candidatePoolSorted = true;
           perKey = boundedEngine ? membersPerGroup(baseReq, kDocs) : 1;
           groupPool = std::make_unique<BoundedHits<true, VectorEngineHit, betterHit, Owned>>(
               std::min(baseReq, cap), query.groups, v2dSpan, (size_t)perKey);
           for (size_t i = 0; i < numSegs; i++) if (activeIvf[i] && planSegments[i].bounded) {
-            rankEligibility[i].reset(); eligibleSpans[i] = {}; segApproxInPool[i] = false;
+            rankEligibility[i].reopen(); segApproxInPool[i] = false;
             if (seenFolded) seedRanks(i);
           }
           resumeBoundedDepth = boundedEngine && baseEngine->hasCoveredBounded();
@@ -1813,6 +1839,16 @@ public:
           scanFraction = std::min(target, maxFraction);
           auto next = request;
           next.round = VectorSearchRound::BREADTH; next.scanFraction = scanFraction; next.candidates = kReq;
+          // No eligible yield where an independent filter expects many marks
+          // an anti-correlated filter. Zero yield only doubles coverage, so
+          // the cumulative rule would fire rounds later; price reaching the
+          // examined target at the observed rate (one pseudo-pass) instead.
+          if (!examinedDone && eligibleExamined == 0
+              && coveredFraction * ivfEligibleVectors >= ANTI_CORRELATED_EXPECTED_PASSES) {
+            auto toTarget = next;
+            toTarget.scanFraction = std::min(maxFraction, projectedScanFraction(coveredFraction, targetExamined, 1));
+            if (toTarget.scanFraction > scanFraction && tryComplete(toTarget)) continue;
+          }
           if (tryComplete(next)) continue;
           round = VectorSearchRound::BREADTH;
           foldSeen();
@@ -1932,6 +1968,15 @@ public:
               "field '{}': returned {} of k={} groups; candidates_exhausted={}",
               query.field, docHits.size(), kDocs, candidatesExhausted));
         }
+      } else if ((int64_t)docHits.size() < std::min(kDocs, allEligibleDocs) && ctx.warnings) {
+        // Approximate effort stopped short of k while more eligible docs
+        // remain; a pinned nprobe never deepens or completes. Checked before
+        // the similarity threshold, which may drop hits by design. Counted
+        // eligible docs are exact except an unfiltered multi-valued segment
+        // with deletes, whose count is an upper bound.
+        ctx.warnings->warnOnce("knn_underfill", std::format(
+            "field '{}': returned {} of k={} docs; eligible_docs={}; nprobe_pinned={}",
+            query.field, docHits.size(), kDocs, allEligibleDocs, query.getNProbe() > 0));
       }
 
       // The similarity threshold drops hits from the k nearest rather than
@@ -2039,6 +2084,8 @@ public:
       // always reads it; RoundSelector hands it to FAISS as the eligibility
       // bitmap when the domain is exactly liveDocs (unfiltered query).
       std::shared_ptr<const RankLiveBitmap> rankLive;
+      // The overlay's per-list live counts for rankLive's generation.
+      std::shared_ptr<std::atomic<int32_t>[]> listLive;
       // The query domain per the live-filtered contract; domainIsLive marks
       // the unfiltered case (domain == the liveDocs docset) where rank-space
       // bitmaps can stand in for the resolve-based check.
@@ -2054,7 +2101,6 @@ public:
       class RoundSelector {
         std::optional<faiss::IDSelectorBitmap> bitmap;
         std::optional<LocalDomainSelector> domainSel;
-        const faiss::IDSelector* selPtr = nullptr;
 
       public:
         RoundSelector(const SegmentIvfScanner& eng,
@@ -2065,24 +2111,19 @@ public:
               : std::span<const uint8_t>{};
           if (!elig.empty()) {
             bitmap.emplace(elig.size(), elig.data());
-            selPtr = &*bitmap;
           } else if (eng.domain != nullptr && !eng.domainIsLive) {
             assert(request.round == VectorSearchRound::BREADTH);
             domainSel.emplace(eng.v2d, eng.domain);
-            selPtr = &*domainSel;
           } else if (eng.domainIsLive) {
             bitmap.emplace(eng.rankLive->numBytes, eng.rankLive->bits);
-            selPtr = &*bitmap;
           }
         }
 
         RoundSelector(const RoundSelector&) = delete;
         RoundSelector& operator=(const RoundSelector&) = delete;
 
-        const faiss::IDSelector* get() const { return selPtr; }
-
-        // RaBitQ dispatches once per scan, keeping selector kind and virtual
-        // membership calls out of its per-code loop. PQ still uses get().
+        // Both codecs dispatch once per scan, keeping selector kind and
+        // virtual membership calls out of their per-code loops.
         template <class Scan>
         VectorSearchWork withProbe(int64_t numVectors, Scan&& scan) const {
           if (bitmap) return scan([bits = bitmap->bitmap, numVectors](faiss::idx_t id) LUXIR_INLINE {
@@ -2143,6 +2184,7 @@ public:
           updateThreshold();
         }
         bool add_result(float distance, faiss::idx_t rank) override {
+          if (rank < 0) return false; // A dense PQ block's non-member.
           float score = scoreFromDist(distance, metric);
           if (score < cut.floorScore()) return false;
           if constexpr (Groups) {
@@ -2204,17 +2246,20 @@ public:
     public:
       SegmentIvfScanner(faiss::IndexIVF& ivf, int32_t segOrd,
                         IndexReader::Segment& seg, const Binding<Owned>& v2d, DocSet* domain,
-                        std::shared_ptr<const RankLiveBitmap> rankLive, int32_t metric,
+                        std::shared_ptr<const RankLiveBitmap> rankLive,
+                        std::shared_ptr<std::atomic<int32_t>[]> listLive, int32_t metric,
                         const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
                         const MmapInvertedLists& lists, RaBitQAmplitudes amplitudes,
                         KnnIntervalCollector<Groups>* intervals)
           : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
             lists(lists), segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
+            listLive(std::move(listLive)),
             domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
                                         && domain == &liveDocs->docset()),
             metric(metric), preparedQuery(preparedQuery) {
         assert(preparedQuery.query != nullptr);
         assert((liveDocs != nullptr) == (this->rankLive != nullptr));
+        assert((liveDocs != nullptr) == (this->listLive != nullptr));
         assert(ivf.invlists == &lists);
       }
 
@@ -2240,17 +2285,21 @@ public:
       /// (full selection always sums to ~N).  Under deletes this reads the
       /// cached rank-space liveness bitmap per id (no rank -> doc resolve);
       /// liveness only (not the query domain), matching the live-N
-      /// denominator.
+      /// denominator. The count is query-independent, so the first query of
+      /// a deletes generation to allocate a list publishes it for the rest.
       int64_t liveListSize(faiss::idx_t listId, VectorSearchWork& work) const {
         if (listId < 0 || (size_t)listId >= ivf.nlist) return 0;
         auto listIds = lists.ids32((size_t)listId);
         if (listIds.empty()) return 0;
         if (liveDocs == nullptr) return (int64_t)listIds.size();
+        auto& cached = listLive[(size_t)listId];
+        if (int32_t count = cached.load(std::memory_order_relaxed); count >= 0) return count;
 
         work.allocatorEntries += (int64_t)listIds.size();
         const uint8_t* bits = rankLive->bits;
         int64_t liveSize = 0;
         for (uint32_t r : listIds) liveSize += (bits[r >> 3] >> (r & 7)) & 1;
+        cached.store((int32_t)liveSize, std::memory_order_relaxed);
         return liveSize;
       }
 
@@ -2273,7 +2322,6 @@ public:
         auto scan = [&](auto probe) {
           return scanListsWithProbe<Interval>(request, listIds, centroidDists, rangeLiveVectors, cut, selector, probe);
         };
-        if (rabitq == nullptr) return scan(nullptr); // Keep FAISS's PQ kernel and selector.
         return selector.withProbe(ivf.ntotal, scan);
       }
 
@@ -2300,10 +2348,15 @@ public:
             oneBitScorer.emplace(ivf.d, preparedQuery.queryBits,
                                  rabitq->rabitq.metric_type == faiss::METRIC_INNER_PRODUCT, preparedQuery.query);
         } else {
-          pqScanner.reset(ivf.get_InvertedListScanner(false, selector.get()));
+          // Selection happens here, before FAISS: its scanner sees only
+          // passing codes and never calls a selector.
+          pqScanner.reset(ivf.get_InvertedListScanner(false, nullptr));
           pqScanner->set_query(preparedQuery.query);
         }
-        int64_t scanned = 0, extra = 0, rejected = 0, visited = 0;
+        std::vector<uint8_t> pqCodes;
+        if constexpr (!std::is_same_v<Probe, std::nullptr_t>)
+          if (pqScanner) pqCodes.resize(RaBitQScorer::BLOCK_ROWS * ivf.code_size);
+        int64_t scanned = 0, extra = 0, rejected = 0, visited = 0, passes = 0;
         bool keepMax = metric != (int32_t)api::VectorMetric::L2;
         const float* listAmplitudes = nullptr;
         double selectionScale = 0;
@@ -2380,9 +2433,37 @@ public:
               if constexpr (!Interval) {
                 // FAISS's PQ scan_codes takes idx_t ids: widen one block.
                 faiss::idx_t wideIds[RaBitQScorer::BLOCK_ROWS];
-                std::copy(ids + begin, ids + end, wideIds);
-                pqScanner->scan_codes(end - begin, codes + begin * ivf.code_size,
-                                      wideIds, handler);
+                if constexpr (std::is_same_v<Probe, std::nullptr_t>) {
+                  std::copy(ids + begin, ids + end, wideIds);
+                  pqScanner->scan_codes(end - begin, codes + begin * ivf.code_size,
+                                        wideIds, handler);
+                } else {
+                  // Select rows with a branch-free probe. A sparse block is
+                  // compacted and scored contiguously; a dense one is scored
+                  // in place, its few non-members carrying id -1, which the
+                  // handler drops, so it pays no copy.
+                  uint16_t selected[RaBitQScorer::BLOCK_ROWS];
+                  size_t rows = 0, size = end - begin;
+                  for (size_t k = begin; k < end; k++) {
+                    selected[rows] = (uint16_t)(k - begin);
+                    wideIds[rows] = ids[k];
+                    rows += probe(ids[k]) ? 1 : 0;
+                  }
+                  passes += (int64_t)rows;
+                  const uint8_t* block = codes + begin * ivf.code_size;
+                  if (rows * 8 >= size * 7) {
+                    for (size_t r = rows; r-- > 0;) wideIds[selected[r]] = wideIds[r];
+                    for (size_t k = 0, r = 0; k < size; k++) {
+                      if (r < rows && selected[r] == k) r++;
+                      else wideIds[k] = -1;
+                    }
+                    pqScanner->scan_codes(size, block, wideIds, handler);
+                  } else if (rows) {
+                    for (size_t r = 0; r < rows; r++)
+                      std::memcpy(pqCodes.data() + r * ivf.code_size, block + selected[r] * ivf.code_size, ivf.code_size);
+                    pqScanner->scan_codes(rows, pqCodes.data(), wideIds, handler);
+                  }
+                }
               }
             } else for (size_t i = begin; i < end; i++) {
               if constexpr (!std::is_same_v<Probe, std::nullptr_t>) {
@@ -2408,8 +2489,14 @@ public:
           }
           handler.flush();
         }
+        // PQ scores what FAISS counted, including dense-block non-members;
+        // selector passes count only members.
+        int64_t pqScores = 0;
         if constexpr (!Interval) {
-          if (rabitq == nullptr) scanned = (int64_t)handler.stats.scan_cnt;
+          if (rabitq == nullptr) {
+            pqScores = (int64_t)handler.stats.scan_cnt;
+            scanned = std::is_same_v<Probe, std::nullptr_t> ? pqScores : passes;
+          }
           cut.finishScan(scanned);
         }
         VectorSearchWork work;
@@ -2421,7 +2508,7 @@ public:
           work.newListSelectorPasses = scanned;
           work.newListLiveVectors = rangeLiveVectors;
         } else work.depthEntries = visited;
-        work.pqScores = rabitq == nullptr ? scanned : 0;
+        work.pqScores = pqScores;
         work.oneBitScores = rabitq != nullptr ? scanned : 0;
         work.extraBitScores = extra;
         work.gateRejections = rejected;
@@ -3182,14 +3269,23 @@ private:
   // Query-owned rank domain. Original cardinality survives pooled clears;
   // remaining also subtracts pending seen-hash entries before their first
   // fold. Both counts are exact once the domain is mapped, even for multi.
+  // Group mode logs pooled clears so reopen() restores the pre-pooling
+  // domain in O(pooled) instead of folding the domain again.
   struct RankEligibility {
     std::pmr::vector<uint8_t> owned;
+    std::pmr::vector<int64_t> cleared;
     std::span<const uint8_t> bits;
     int64_t original = -1, remaining = -1;
+    bool logClears = false;
 
-    explicit RankEligibility(std::pmr::memory_resource* resource) : owned(resource) {}
+    explicit RankEligibility(std::pmr::memory_resource* resource) : owned(resource), cleared(resource) {}
 
-    void reset() { owned.clear(); bits = {}; original = remaining = -1; }
+    void reopen() {
+      assert(logClears);
+      for (int64_t rank : cleared) owned[(size_t)(rank >> 3)] |= (uint8_t)(1u << (rank & 7));
+      cleared.clear();
+      remaining = original;
+    }
 
     bool clear(int64_t rank, int64_t numVectors, VectorSearchWork& work) {
       if (owned.empty()) {
@@ -3203,6 +3299,7 @@ private:
       bool fresh = (byte & mask) != 0;
       byte &= (uint8_t)~mask;
       remaining -= fresh;
+      if (fresh && logClears) cleared.push_back(rank);
       return fresh;
     }
   };
@@ -3322,8 +3419,12 @@ private:
   /// their scan still checks the live domain. Exact without deletes and for
   /// dense single-valued columns; sparse and multi-valued counts may be high.
   static int64_t liveVectorUpperBound(IndexReader::Segment& segment,
-                                      VectorReader& vr) {
+                                      VectorReader& vr, std::string_view field) {
     if (!segment.hasDeletes()) return vr.numVectors();
+    // An earlier IVF search's rank view is exact, so planning agrees with execution.
+    if (auto* live = segment.liveDocs()) {
+      if (int64_t exact = live->builtRankLiveVectors(field); exact >= 0) return exact;
+    }
     if (!vr.multiValued()) {
       // Each live doc holds at most one vector.
       return std::min<int64_t>(vr.numVectors(), segment.numLive());

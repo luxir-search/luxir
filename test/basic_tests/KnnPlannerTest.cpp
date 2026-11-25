@@ -53,11 +53,11 @@ double cost(std::span<const KnnPlanner::Segment> segments, const KnnPlanner::Req
   double selectors = 0;
   for (size_t i = 0; i < segments.size(); i++) if ((mask >> i & 1) && KnnPlanner::canIvf(segments[i])) {
     const auto& s = segments[i];
+    if (coverage > p0 && s.bounded && (s.unfiltered || KnnPlanner::borrowDomain(s)))
+      selectors += ((s.vectors + 63) / 64) * costs.units[KnnPlanner::FOLD_WORD];
     if (s.unfiltered) continue;
     double fold = costs.price(KnnPlanner::foldWork(s));
     bool folded = KnnPlanner::foldFirst(s, p0, req.selector, costs);
-    if (coverage > p0 && KnnPlanner::borrowDomain(s) && s.bounded)
-      selectors += ((s.vectors + 63) / 64) * costs.units[KnnPlanner::FOLD_WORD];
     selectors += (folded || coverage > p0 ? fold : 0)
         + (folded ? 0 : KnnPlanner::predictedChecks(s, p0) * (KnnPlanner::resolveCost(s, costs) - costs.units[KnnPlanner::ENTRY_BITMAP]));
   }
@@ -281,6 +281,26 @@ TEST(KnnPlannerTest, selectorCrossoverAndDeepenCost) {
   EXPECT_EQ(1, KnnPlanner::foldWork(s)[KnnPlanner::FOLD_DOC]);
   s.arrayDomain = true;
   EXPECT_EQ(99999, KnnPlanner::foldWork(s)[KnnPlanner::FOLD_DOC]);
+}
+
+TEST(KnnPlannerTest, deepenCopyPricesEveryUnownedBoundedRankSet) {
+  // Pooled exclusion copies borrowed ranks, or fills unfiltered ones, on first clear.
+  KnnPlanner::Costs costs;
+  KnnPlanner::Request req;
+  double copy = ((100000 + 63) / 64) * costs.units[KnnPlanner::FOLD_WORD];
+  ASSERT_GT(copy, 0);
+  auto s = segment(25000);
+  EXPECT_EQ(copy, KnnPlanner::price(s, req, costs).deepenCopy);
+  s.domain = false; s.unfiltered = true;
+  auto price = KnnPlanner::price(s, req, costs);
+  EXPECT_EQ(copy, price.deepenCopy);
+  EXPECT_EQ(copy, KnnPlanner::selectorCost(price, 0.1, true));
+  EXPECT_EQ(0, KnnPlanner::selectorCost(price, 0.1, false));
+  s.bounded = false;
+  EXPECT_EQ(0, KnnPlanner::price(s, req, costs).deepenCopy);
+  s = segment(25000);
+  s.sparse = true; // An owned fold is written in place.
+  EXPECT_EQ(0, KnnPlanner::price(s, req, costs).deepenCopy);
 }
 
 TEST(KnnPlannerTest, sharedIvfRequestCanFavorExact) {

@@ -114,6 +114,7 @@ LiveDocs::LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t nu
 
 LiveDocs::~LiveDocs() {
   if (memory) memory->remove(heapBytes());
+  for (const auto& [name, view] : rankLiveViews) liveDocsMemory.views.remove(rankLiveBytes(name, *view));
 }
 
 std::shared_ptr<LiveDocs> ChildLiveDocs::get() {
