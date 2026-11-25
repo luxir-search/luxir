@@ -687,3 +687,23 @@ TEST_F(CollectionOwnershipTest, readOnlyAttachServesTheSelectedSnapshotWithoutTh
   EXPECT_TRUE(collection->getShard()->isReadOnly());
   EXPECT_EQ("A", b->collections().catalog().find("c")->node);
 }
+
+TEST_F(CollectionOwnershipTest, demotedShardRefusesSchemaUpdates) {
+  startA();
+  CollectionHelper c(*a, "c");
+  ASSERT_TRUE(c.index(flatdoc("id", "first"), UpdateMessage::COMMIT).success);
+  a->demoteCollection(CollectionId::of("c"));
+  EXPECT_THROW(c.collection().setSchema(std::make_shared<Schema>()), ReadOnlyError);
+  api::SchemaDef def;
+  EXPECT_THROW(c.collection().updateSchema(def, api::SchemaRequest_::Mode::SET), ReadOnlyError);
+}
+
+TEST_F(CollectionOwnershipTest, readOnlyAttachOnAWriterNodeRefusesUpdates) {
+  startA();
+  { CollectionHelper c(*a, "c"); ASSERT_TRUE(c.index(flatdoc("id", "durable"), UpdateMessage::COMMIT).success); }
+  startB();
+  auto attached = b->attachCollection(CollectionId::of("c"), Collections::Role::READ_ONLY);
+  EXPECT_THROW(attached->getShard()->requireIndexWriter(), ReadOnlyError);
+  auto& catalog = b->collections().catalog();
+  EXPECT_EQ("A", catalog.find("c")->node);
+}

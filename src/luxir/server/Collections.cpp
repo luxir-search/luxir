@@ -48,8 +48,7 @@ std::string Collection::getUnavailableReason() const {
 
 std::shared_ptr<const CommitSnapshot> Collection::updateSchema(const luxir::api::SchemaDef& def,
                                                  luxir::api::SchemaRequest_::Mode mode) {
-  if (!shard->iw) throw ReadOnlyError("collection has no writer");
-  return shard->iw->updateSchema([&](const Schema* current) {
+  return shard->requireIndexWriter()->updateSchema([&](const Schema* current) {
     bool replace = mode != api::SchemaRequest_::Mode::SET;
     auto schema = Schema::fromProto(def, replace ? nullptr : current);
     // REPLACE_ALL rebuilds the schema from the request alone, so leaving out
@@ -63,8 +62,7 @@ std::shared_ptr<const CommitSnapshot> Collection::updateSchema(const luxir::api:
 }
 
 void Collection::setSchema(std::shared_ptr<Schema> newSchema) {
-  if (!shard->iw) throw ReadOnlyError("collection has no writer");
-  shard->iw->setSchema(std::move(newSchema));
+  shard->requireIndexWriter()->setSchema(std::move(newSchema));
 }
 
 void Collections::validateName(std::string_view name, std::string_view kind) {
@@ -735,13 +733,15 @@ void Collections::demote(const CollectionId& key) {
   // Refuse new updates first, then make what was accepted durable, then
   // let the writer go. The registry and its readers stay: searches go on.
   shard->readOnly.store(true, std::memory_order_release);
-  try {
-    shard->iw->commit();
-    shard->iw->close();
-  } catch (...) {
+  // An update admitted before the flag was set may still land between the
+  // commit and the close; the close fails or drops it, never a later commit.
+  try { shard->iw->commit(); }
+  catch (...) {
     shard->readOnly.store(false, std::memory_order_release);
     throw;
   }
+  // Once the close has begun the writer is unusable, so the flag stays set.
+  shard->iw->close();
   LOG_INFO("Demoted collection to read-only: {}", key.label());
 }
 
@@ -761,7 +761,8 @@ std::shared_ptr<Collection> Collections::attach(const CollectionId& key, Role ro
     if (!force) throw CollectionServedByError(entry->node);
     if (!storage.assign(entry->id, entry->node, config.node.id)) throw CollectionUnavailableError("collection assignment changed before attach");
   }
-  Opened row{key, nullptr, entry->id, {}};
+  // A read-only view follows the catalog selection; owned() would refuse another node's incarnation.
+  Opened row{key, nullptr, role == Role::WRITER ? std::optional(entry->id) : std::nullopt, {}};
   openOne(row, role, expected);
   return row.collection;
 }

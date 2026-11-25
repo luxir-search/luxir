@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <stop_token>
@@ -86,11 +87,16 @@ public:
   void close();
   // Runs (outside the lock) whenever a wait parks on a collection: a
   // publisher that pulls commits from elsewhere (a replica refresher) can
-  // fetch at once instead of on its next interval. Dispatch only.
+  // fetch at once instead of on its next interval. Dispatch only; an
+  // exception from the hook is logged. Replacing or clearing the hook (also
+  // done by close()) returns after in-flight calls of the old one finish, so
+  // the owner may then destroy what it captured; do not call it from a hook.
   using ParkHook = std::function<void(const CollectionId&)>;
   void setParkHook(ParkHook hook);
 private:
   std::mutex hookMutex;
+  std::condition_variable hookIdle;
+  size_t hookCalls = 0;
   ParkHook parkHook;
 };
 }

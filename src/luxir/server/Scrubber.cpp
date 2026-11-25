@@ -104,7 +104,7 @@ size_t Scrubber::pass(std::stop_token stop, bool preemptible) {
         try {
           auto reader = registry.openChecksum(file, true);
           if (!reader) {
-            if (node.readOnly()) continue; // the live writer retired this name
+            if (shard->isReadOnly()) continue; // the live writer retired this name
             problem = "missing file: " + file.name;
           } else {
             problem = checksumMismatch(file, reader->checksum(pace));
