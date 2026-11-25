@@ -354,7 +354,8 @@ protected:
 
 private:
   enum class Preparation : uint8_t { UNKNOWN, UNNEEDED, REQUIRED };
-  // Subtree result from serial logical validation, independent of weight flags.
+  // Conservative result for this fixed subtree, independent of the planning
+  // context and weight flags. Every successful validateLogical overwrites it.
   mutable Preparation preparation = Preparation::UNKNOWN;
   // Structural hash, computed once by hash(). Only planning reaches it, and
   // planning runs single-threaded per request; a default copy carries it.
@@ -1295,7 +1296,9 @@ public:
     std::optional<TermFactsCache>* sharedTermFacts = nullptr;
 
 #ifndef NDEBUG
-    // Borrowed from the request when planning belongs to a search.
+    // The debug phase check covers contexts built from request planning state.
+    // A maker violates the lifecycle by constructing a private standalone
+    // Context during parsing, which this check cannot detect.
     const Stage* requestStage = nullptr;
 
     bool inLogicalPhase() const noexcept {
@@ -1336,7 +1339,9 @@ public:
       if (ownsFilterUses) filterUses->settle(std::uncaught_exceptions() == uncaught);
     }
 
-    // Report a preparation requirement during logical validation.
+    // Report on every validation visit of a query that introduces a prepare
+    // pass, even if the validator memoizes other work. The subtree result is
+    // computed from the visits made during that validateLogical call.
     void requirePreparation() noexcept { ++preparationVisits; }
 
     // Serial request-build memo. A query may create several Weights for

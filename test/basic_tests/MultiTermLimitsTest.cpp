@@ -14,6 +14,7 @@
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestIndex.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/query/MultiTermBudget.h"
@@ -305,6 +306,38 @@ TEST_F(MultiTermLimitsTest, fuzzyExpansionSharesTheBudget) {
   EXPECT_FALSE(req->ok());
   EXPECT_EQ("too_many_terms_examined", req->errorCode());
   EXPECT_NE(req->errorMsg().find("fuzzy query 't050'"), std::string::npos) << req->errorMsg();
+}
+
+TEST_F(MultiTermLimitsTest, emptyBooleanSkipsFuzzyExpansionBesidePreparedQuery) {
+  LuxirNode node(config(1000, 5, 0));
+  CollectionHelper helper(node);
+  SchemaBuilder schema;
+  auto& vector = schema.field("v_v");
+  vector.type = api::FieldDef::FieldClass::VECTOR;
+  vector.dims = 2;
+  vector.metric = api::VectorMetric::L2;
+  schema.set(helper.collection());
+  indexTerms(helper);
+  ASSERT_TRUE(helper.index(flatdoc("id", "vector", "v_v", std::vector<float>{0, 0}),
+                           UpdateMessage::COMMIT).success);
+
+  for (bool withKnn : {false, true}) {
+    SCOPED_TRACE(withKnn);
+    auto req = localReq(helper.getSearchEngine());
+    std::string json = R"({"ops":{"q":{"top_docs":{"count_limit":-1,"query":{"boolean":{"required":[
+      {"fuzzy":{"field":"tag_s","term":"t050","max_edits":2,"prefix_length":0}},"tag_s:zz"]}})";
+    // Unselected bucket queries are validated in the TopDocs planning context.
+    if (withKnn) json += R"(,"ops":{"near":{"query_facet":{"buckets":{"one":{"knn":{
+      "field":"v_v","query":[0,0],"k":1,"exact":true}}}}}})";
+    json += "}}}}";
+    parseQueryRequest(api::build::arenaStr(req->mr, json), req->rawRequest(), req->mr);
+    req->collection("main").execute(false);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    ASSERT_NE(nullptr, req->docList("q"));
+    EXPECT_EQ(0, req->getMatchCount("q"));
+    EXPECT_TRUE(req->getDocs("q").empty());
+    EXPECT_EQ(0, req->multiTermBudget.termsExamined());
+  }
 }
 
 TEST_F(MultiTermLimitsTest, logicalErrorsPrecedeWeightErrorsInEitherOpOrder) {

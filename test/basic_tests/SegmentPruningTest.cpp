@@ -427,6 +427,24 @@ TEST_F(SegmentPruningTest, unvalidatedGeneratedRootKeepsItsPreparation) {
   EXPECT_TRUE(context.createRootWeight(generated, 0)->needsPrepare());
 }
 
+TEST_F(SegmentPruningTest, repeatedValidationKeepsPreparation) {
+  indexThreeSegments();
+  auto reader = currentReader();
+  TermQuery absent("tag_s", "zz");
+  ForcePrepareQuery prepared(&absent);
+  MemPool pool;
+  Query::Context first(pool, *reader);
+  Query::Context second(pool, *reader);
+  for (auto* context : {&first, &second}) {
+    prepared.validateLogical(context->planningContext());
+    EXPECT_TRUE(prepared.mayRequirePreparation());
+    EXPECT_FALSE(absent.mayRequirePreparation());
+    auto* weight = context->createRootWeight(prepared, 0);
+    EXPECT_TRUE(weight->provenEmpty(reader->segments().front()));
+    EXPECT_TRUE(weight->needsPrepare());
+  }
+}
+
 TEST_F(SegmentPruningTest, provenZeroWarmsTheAuthoredWholeCountKey) {
   indexThreeSegments();
   for (int repeat = 0; repeat < 3; repeat++) {

@@ -226,6 +226,13 @@ A maker constructs the op from parsed, validated inputs. Override
 uses. The engine finishes logical parsing for the request before running
 materialization in recorded order. The hook runs once, serially, before
 `init()` and after the sources the maker parsed.
+The debug phase check covers contexts built from the request's planning state.
+A maker still violates the lifecycle by constructing a private standalone
+`Query::Context` during parsing, which the debug check cannot detect.
+
+`releaseSegmentState()` can be called if the op's `materialize()` never ran or
+threw partway through. It must tolerate unset execution state.
+
 For example, `query_count` stores the parsed query and planning context in its
 maker and builds the unscored weight in its materialization hook.
 
