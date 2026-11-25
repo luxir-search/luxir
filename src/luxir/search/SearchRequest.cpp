@@ -41,6 +41,12 @@ OwnershipRelation& SearchRequest::ownershipRelation(IndexReader& many, IndexRead
   auto found = state.relations.find(key);
   if (found != state.relations.end()) return *found->second;
   auto* relation = arenaCreate<OwnershipRelation>(arena, many, one, memoryTracker);
+  if (stage == Stage::LOGICAL) {
+    addMaterializationStep<&OwnershipRelation::bindMappers>(*relation);
+  } else {
+    // Standalone query planning has no logical op tree or step list to run.
+    relation->bindMappers();
+  }
   state.relations.emplace(std::move(key), relation);
   return *relation;
 }

@@ -63,6 +63,7 @@ TEST_F(JoinProbeTest, sparseFamiliesUsePointChecksAndBoundedCandidateMasks) {
     MemPool pool;
     Query::Context context(pool, *many);
     OwnershipRelation relation(*many, *root, context.planningContext().memoryTracker);
+    relation.bindMappers();
     std::string field = std::string(path) + ".n_i";
     NumericPredicateQuery numeric(field, 0, high);
     auto* source = numeric.createWeight(context, 0)->scorerSupplier(pool, many->segments()[0]);
@@ -173,6 +174,7 @@ TEST_F(JoinProbeTest, childProofProjectsEmptyZonesWithoutRejectingPossibleOwners
   MemPool pool;
   Query::Context context(pool, *many);
   OwnershipRelation relation(*many, *root, context.planningContext().memoryTracker);
+  relation.bindMappers();
   NumericPredicateQuery numeric("items_nested.n_i", 0, 1);
   auto* source = numeric.createWeight(context, 0)->scorerSupplier(pool, many->segments()[0]);
   auto* supplier = relation.reduce(pool, 0, *source, nullptr, RowReduction{RowReduction::FIXED}, 1.0f);

@@ -53,7 +53,10 @@ public:
   // segment. Index sorting alone is insufficient: it also needs ownership or
   // a key-ordered merge across segments.
   static constexpr bool isContiguous = false;
-  FacetDimension groupDimension() const { return groupPlan->dimension; }
+  FacetDimension groupDimension() const {
+    assert(groupPlan->bound);
+    return groupPlan->dimension;
+  }
 
   template <bool Growing = false, typename Visit>
   void collectGroups(DistinctFacetCounts& data, int32_t segnum, DocSet* domain, Visit&& visit) {

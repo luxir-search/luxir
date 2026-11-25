@@ -122,6 +122,10 @@ class StrFacetOp : public FieldFacetReq {
   static constexpr int64_t FUSED_METRICS_MAX_PAGES = 4;
 
   std::shared_ptr<OrdMap> ordMap;
+  // Normalized logical filter inputs, consumed by bindOrdinals().
+  std::optional<FacetTermFilterSpec> termFilterSpec;
+  // True once the map, selected buckets and ordinal filter have been bound.
+  bool ordinalsBound = false;
   struct PinnedBucket {
     std::string_view key;
     std::optional<int64_t> ord;
@@ -338,32 +342,37 @@ public:
 
 public:
 
-  // ProtobufSearchParser resolves the OrdMap and passes it in
-  // (see TopDocsReq's ctor comment).
   StrFacetOp(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
-    std::shared_ptr<OrdMap> ordMap,
     std::span<const std::string_view> selected,
     std::optional<FacetTermFilterSpec> termFilterSpec = std::nullopt) :
   FieldFacetReq(req, view, fieldFacet, fieldName, facetName, limit, minCount, missing,
                 {}, selected),
-  ordMap(std::move(ordMap)) {
-    if (!selected.empty() || termFilterSpec) {
+  termFilterSpec(std::move(termFilterSpec)) {
+    enableExecutionProfile();
+  }
+
+  // Bind the global map, selected term ordinals and ordinary bucket filter.
+  void bindOrdinals() {
+    assert(!ordinalsBound);
+    ordMap = reader.getOrdMap(fieldName);
+    if (!selectedStrings.empty() || termFilterSpec) {
       auto poolGuard = MemPool::threadLocalPoolGuard();
-      OrdMapStr lookup(poolGuard.pool(), this->ordMap.get(), reader, segInfos);
-      pinnedBuckets.reserve(selected.size());
-      for (std::string_view key : selected) {
+      OrdMapStr lookup(poolGuard.pool(), ordMap.get(), reader, segInfos);
+      pinnedBuckets.reserve(selectedStrings.size());
+      for (std::string_view key : selectedStrings) {
         auto stats = lookup.termStats(key);
         pinnedBuckets.push_back({key, stats.globalOrd, stats.docFreq});
       }
       if (termFilterSpec) {
         resolvedTermFilter = FacetOrdFilter::resolve(std::move(*termFilterSpec), lookup,
-            this->ordMap ? this->ordMap->numOrds() : 0);
+            ordMap ? ordMap->numOrds() : 0);
         // With limit 0 there are no ordinary buckets for it to choose.
         if (resolvedTermFilter && limit != 0) termFilter = &*resolvedTermFilter;
       }
     }
-    enableExecutionProfile();
+    termFilterSpec.reset();
+    ordinalsBound = true;
   }
 
   bool canEmitAsBucketChild() const override {
@@ -371,6 +380,7 @@ public:
   }
 
   void init() override {
+    assert(ordinalsBound);
     FieldFacetReq::init();
     if (countDistinct != nullptr) return;
     // Whether the REMAINING sub-ops join the count pass or stay behind for the

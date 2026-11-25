@@ -9,6 +9,8 @@
 #include "luxir/index/PostingsWriter.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/reader/OwnershipShape.h"
+#include "luxir/search/ProtobufSearchParser.h"
+#include "luxir/search/ops/RootOp.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/store/CorruptionMarker.h"
@@ -28,7 +30,27 @@ using namespace luxir::test;
 using luxir::example::CountingLayer;
 using luxir::example::CountingRamBackend;
 
-class StorageExampleTest : public LuxirTest {};
+class StorageExampleTest : public LuxirTest {
+protected:
+  void expectDeferredBinding(CollectionHelper& collection, std::string_view json) {
+    auto writer = collection.getIndexWriter();
+    auto snapshot = *writer->snapshots.snapshot();
+    snapshot.openCores.clear();
+    auto counters = std::make_shared<StrictStorageCounters>();
+    StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
+    auto req = localReq(collection.getSearchEngine());
+    req->reader = std::make_shared<IndexReader>(dir, snapshot);
+    req->schema = req->reader->schema();
+    ASSERT_TRUE(api::read_json(req->rawRequest(), json, req->mr));
+
+    auto before = counters->totalSubmissions();
+    auto* root = ProtobufSearchParser(*req).parse();
+    EXPECT_EQ(before, counters->totalSubmissions());
+    req->materialize();
+    EXPECT_GT(counters->totalSubmissions(), before);
+    root->init();
+  }
+};
 
 TEST_F(StorageExampleTest, nodeRunsOnPluginBackendAndLayer) {
   LuxirConfig config;
@@ -78,6 +100,17 @@ TEST_F(StorageExampleTest, nodeIndexesMergesAndSearchesOnStrictRam) {
   EXPECT_FALSE(std::ranges::any_of(snapshot->files, [&](const auto& file) {
     return Manifest::segmentDataFile(file.name) && layer->counters->fileStats(file.name).wholeFileAccesses > 0;
   }));
+}
+
+TEST_F(StorageExampleTest, ordinalMapsBindAfterLogicalPlanning) {
+  CollectionHelper collection;
+  ASSERT_TRUE(collection.indexAll({flatdoc("id", "a", "cat_s", "red"),
+      flatdoc("id", "b", "cat_s", "blue")}, UpdateMessage::COMMIT).success);
+  expectDeferredBinding(collection,
+      R"json({"ops":{"q":{"top_docs":{"collapse":"cat_s","limit":1,"count_limit":-1}}}})json");
+  expectDeferredBinding(collection, R"json({"ops":{"q":{"top_docs":{"limit":0,"ops":{
+    "cat":{"field_facet":{"field":"cat_s","limit":1,"selected":["red"],
+          "term_filter":{"include":["blue"]},"count_distinct":"id"}}}}}}})json");
 }
 
 TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
@@ -371,6 +404,19 @@ TEST_F(StorageExampleTest, canonicalQueriesRunWithWholeSegmentFilesDenied) {
   }
 }
 
+TEST_F(StorageExampleTest, ownershipBindsAfterLogicalPlanning) {
+  CollectionHelper collection;
+  CollectionHelper::UpdateBuilder input;
+  input.addRaw([](auto& doc, auto& arena) {
+    ASSERT_TRUE(api::read_json(doc, R"({"id":"a","items_nested":[{},{}]})", arena));
+  });
+  ASSERT_TRUE(collection.submit(input.commit()).success);
+  expectDeferredBinding(collection, R"json({"ops":{"q":{"top_docs":{"limit":0,"count_limit":-1,
+    "query":{"to_parent":{"path":"items_nested","query":{"all":true}}}}}}})json");
+  expectDeferredBinding(collection, R"json({"ops":{"q":{"domain":{"to":"items_nested"},
+    "top_docs":{"limit":0,"count_limit":-1}}}})json");
+}
+
 TEST_F(StorageExampleTest, nestedReaderOpensWithWholeSegmentFilesDenied) {
   LuxirConfig config;
   config.store.layers = {"strict"};
@@ -459,6 +505,13 @@ TEST_F(StorageExampleTest, liveDocsDecodeOnFirstUse) {
   EXPECT_EQ(1u, counters->fileStats(liveName).acquires);
   ASSERT_TRUE(leaf.liveDocs());
   EXPECT_EQ(2, leaf.liveDocs()->numLive());
+}
+
+TEST_F(StorageExampleTest, aggregateOrdinalsBindAfterLogicalPlanning) {
+  CollectionHelper collection;
+  ASSERT_TRUE(collection.index(flatdoc("id", "a", "cat_s", "red"), UpdateMessage::COMMIT).success);
+  expectDeferredBinding(collection,
+      R"json({"ops":{"z":"cardinality(cat_s)+1","a":"cardinality(cat_s)"}})json");
 }
 
 TEST_F(StorageExampleTest, strictRejectsInvalidWholeFileMode) {

@@ -162,7 +162,7 @@ void CollapseMembers::walk(int32_t segment, DocSet* eligibility,
   if (useKeys && collapseMemberStrategy == CollapseMemberStrategy::AUTO) {
     int64_t groups = 0;
     for (const auto& field : plan.fields) {
-      if (field.ordinal()) groups = std::max(groups, field.ords->numOrds());
+      if (field.ordinal()) groups = std::max(groups, field.ordinalMap()->numOrds());
     }
     double estimated = groups ? (double)seg.maxDoc() * (double)keys.size() / (double)groups : 0.0;
     // Stream setup (term seek, cursor construction and inverse-ord lookup)
@@ -208,7 +208,7 @@ void CollapseMembers::walk(int32_t segment, DocSet* eligibility,
           if (!recoverable(slot, c)) continue;
           double cost;
           if (plan.fields[c].ordinal()) {
-            cost = (double)seg.maxDoc() / std::max<int64_t>(1, plan.fields[c].ords->numOrds());
+            cost = (double)seg.maxDoc() / std::max<int64_t>(1, plan.fields[c].ordinalMap()->numOrds());
           } else {
             PointsReader points(seg.postingsReader(), *info[c]);
             int64_t value = keys[slot].components[c].value;

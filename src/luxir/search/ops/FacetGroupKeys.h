@@ -14,14 +14,16 @@ struct FacetDimension {
   int64_t value(uint64_t index) const { return (int64_t)((uint64_t)base + index); }
 };
 
-// Request metadata only. Small tuple ranges have an exact mixed-radix
-// identity; wide tuples use accumulator-local exact interning at reduction.
+// Small tuple ranges have an exact mixed-radix identity; wide tuples use
+// accumulator-local exact interning at reduction.
 class FacetGroupPlan {
   struct Component { int64_t base; uint64_t radix; };
   std::vector<Component> components;
   static FacetDimension componentDimension(const CollapsePlan& key, const CollapsePlan::Field& field) {
-    if (field.ordinal()) return {true, 0,
-        (uint64_t)(field.ords ? field.ords->numOrds() : 0)};
+    if (field.ordinal()) {
+      const auto& ords = field.ordinalMap();
+      return {true, 0, (uint64_t)(ords ? ords->numOrds() : 0)};
+    }
     int64_t lo = INT64_MAX, hi = INT64_MIN;
     for (size_t segnum = 0; segnum < key.reader.segments().size(); segnum++) {
       auto* info = field.segments.at(segnum);
@@ -42,29 +44,36 @@ public:
   const CollapsePlan& key;
   FacetDimension dimension;
   bool internTuples = false;
+  // The runtime dimensions have been derived from the bound key.
+  bool bound = false;
 
-  explicit FacetGroupPlan(const CollapsePlan& key) : key(key) {
+  explicit FacetGroupPlan(const CollapsePlan& key) : key(key) {}
+
+  // Size the runtime distinct-count key space after binding the key's maps.
+  void bindDimensions() {
+    assert(!bound);
     if (key.fields.size() == 1) {
       dimension = componentDimension(key, key.fields[0]);
-      return;
-    }
-    uint64_t product = 1;
-    for (const auto& field : key.fields) {
-      auto dimension = componentDimension(key, field);
-      uint64_t cardinality = dimension.size;
-      if (!dimension.dense || cardinality >= (uint64_t)INT64_MAX
-          || product > (uint64_t)INT64_MAX / (cardinality + 1)) {
-        internTuples = true;
-        break;
+    } else {
+      uint64_t product = 1;
+      for (const auto& field : key.fields) {
+        auto extent = componentDimension(key, field);
+        uint64_t cardinality = extent.size;
+        if (!extent.dense || cardinality >= (uint64_t)INT64_MAX
+            || product > (uint64_t)INT64_MAX / (cardinality + 1)) {
+          internTuples = true;
+          break;
+        }
+        components.push_back({extent.base, cardinality + 1});
+        product *= cardinality + 1;
       }
-      components.push_back({dimension.base, cardinality + 1});
-      product *= cardinality + 1;
+      if (!internTuples) dimension = {true, 0, product};
     }
-    if (!internTuples) dimension = {true, 0, product};
+    bound = true;
   }
 
   int64_t tupleId(const CollapseKey& tuple) const {
-    assert(!internTuples);
+    assert(bound && !internTuples);
     uint64_t id = 0;
     for (size_t i = 0; i < components.size(); i++) {
       auto part = tuple.components[i];

@@ -443,6 +443,7 @@ TEST_F(NestedQueryTest, phraseJoinUsesTwoPhaseVerificationAndAdvance) {
   MemPool pool;
   Query::Context context(pool, *child);
   OwnershipRelation relation(*child, *reader(), context.planningContext().memoryTracker);
+  relation.bindMappers();
   auto* weight = query->getChild()->createWeight(context, Query::NEED_SCORES);
   for (bool maximum : {false, true}) {
     for (bool seek : {false, true}) {
