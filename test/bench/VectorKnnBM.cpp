@@ -1163,6 +1163,15 @@ void BM_VectorKnnFiltered(benchmark::State& state) {
     }
     IvfBenchGuard guard;
     helper.commit({"vec.bench_v"});
+    // Optional deletes, spread independently of vector position, exercise
+    // the rank-liveness paths. Exact truth below sees the same deletes.
+    const char* deleteEnv = getenv("LUXIR_FILTERED_DELETE_PERMYRIAD");
+    if (int deletes = deleteEnv ? std::stoi(deleteEnv) : 0; deletes > 0) {
+      std::vector<std::string> ids;
+      for (int64_t i = 0; i < data.size; i++)
+        if (data.randomRank[(size_t)i] % 10000 < deletes) ids.push_back("d" + std::to_string(i));
+      helper.deleteByIds(ids, UpdateMessage::COMMIT);
+    }
     auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     for (const auto& seg : reader->segments()) {
       if (!seg.getAuxReader("vec.bench_v")) {
@@ -1478,6 +1487,8 @@ LUXIR_BENCHMARK(BM_VectorKnnFiltered)->ArgNames({"codec", "permyriad", "correlat
       for (int codec : {PQ, RABITQ2, RABITQ1}) for (int selector : {1, 2})
         b->Args({codec, 1000, 0, FILTERED_ALPHA100, 1, selector, 1});
       for (int codec : {PQ, RABITQ2, RABITQ1}) b->Args({codec, 1000, 2, FILTERED_ALPHA100, 1, 0, 0});
+      // A filter matching every document.
+      for (int codec : {PQ, RABITQ1}) b->Args({codec, 10000, 0, FILTERED_ALPHA100, 0, 0, 0});
     });
 
 TUNING_BENCHMARK(BM_VectorKnnFiltered)->UseRealTime()->ArgNames({"codec", "permyriad", "correlation", "alpha100", "mode", "selector", "completion"})
