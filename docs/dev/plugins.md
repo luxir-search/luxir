@@ -583,6 +583,48 @@ selects conservative paths: `reuseFiles` copies with `Directory::copyFile` inste
 linking when `HARD_LINK` is absent. A wrapper that changes a property (for instance
 masks `HARD_LINK`) overrides `capabilities()`.
 
+### The request I/O context
+
+A read done for a search can see that search through `luxir::IoContext`
+(`src/luxir/util/IoContext.h`): `IoContext::current()` returns it, or null
+when the read is not done for a request (merges, startup, reader refresh,
+verification, replication). It is visible in `InputFile::acquire` and in every
+`DelegatingDirectory` method called on a query thread, including
+segment-parallel tasks, since core carries it into the tasks it spawns.
+
+```cpp
+luxir::HeldRange MyInputFile::acquire(luxir::ByteRange range) {
+  const luxir::IoContext* io = luxir::IoContext::current();
+  bool hedge = io && io->remaining() < hedgeBudget;  // deadline: hedge a slow GET early
+  bool admit = !io || io->fillCache;                 // a scan: do not admit into a cache
+  ...
+  if (io) io->countFetch(bytes);                     // one GET, one round
+}
+```
+
+The fields are the query id and `request_id` (for correlating a layer's logs),
+the deadline (`hasDeadline()`, `remaining()`, `waitDeadline()`), the stop
+token, the `fillCache` hint and the request's `IoCounters`. The deadline and
+the hint are advice: a read must return the same bytes, and core never fails a
+read on them. A layer that gives up a wait on the deadline or the stop token
+throws `DeadlineExceededError` or `RequestCancelledError`.
+
+Core counts every range a segment acquires from a file that is not
+`holdsFree()` (`io_acquires`, `io_acquired_bytes`), so those counts appear on
+any such backend without its help. What a range costs in store requests only
+the backend knows: it counts them with `io->countFetch(bytes, requests,
+rounds)` (`countFetch(bytes)` is one request and one round), counting a wave
+of concurrent requests as one round. Counts appear in the search profile
+(`io_*`) and in the node's `search_io_*` totals.
+
+Work handed to a thread or pool of the plugin's own runs without a context
+unless it is wrapped: `pool.submit(luxir::bindIoContext(task))` copies the
+current context into the task and restores the pool thread's own afterwards.
+`IoScope` is the underlying guard; `IoScope scope(nullptr)` detaches work from
+the enclosing request. The counters belong to the request and outlive its
+tasks, but not the request: work still running after the request ends must
+not count.
+
 ### The example plugin
 
 `test/plugins/example` registers a `counting_ram` backend (RAM storage counting

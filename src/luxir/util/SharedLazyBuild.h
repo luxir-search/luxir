@@ -4,11 +4,14 @@
 #pragma once
 
 #include <cassert>
+#include <condition_variable>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <tbb/task_arena.h>
 #include <tbb/task_group.h>
+#include "IoContext.h"
 #include "Signal.h"
 
 namespace luxir {
@@ -17,6 +20,9 @@ namespace luxir {
 // request's deadline or charge request-scoped memory: everyone takes the
 // builder's outcome. The deferred handle holds the wait open until the builder
 // runs it itself; spawning could strand it behind critical tasks or in another arena.
+// For the same reason the build runs under IoContext::shared(): its reads count
+// for the builder's request, but that request's deadline and fill hint do not
+// apply to a value every waiter takes.
 template <typename Value>
 class SharedLazyBuild {
   using Pointer = std::shared_ptr<Value>;
@@ -26,6 +32,10 @@ class SharedLazyBuild {
   tbb::task_group group{context};
   Pointer value;
   std::exception_ptr error;
+  // Set once value or error is, for waiters bounded by their request.
+  std::mutex finishedMutex;
+  std::condition_variable_any finishedChanged;
+  bool finished = false;
 
 #ifndef NDEBUG
   struct ActiveBuild;
@@ -55,7 +65,10 @@ class SharedLazyBuild {
 public:
   template <typename CreateFunc>
   tbb::task_handle defer(CreateFunc&& createFunc) {
-    return group.defer([this, create = std::forward<CreateFunc>(createFunc)] {
+    auto io = captureIoContext();
+    if (io) io = io->shared();
+    return group.defer([this, io, create = std::forward<CreateFunc>(createFunc)] {
+      IoScope scope(io ? &*io : nullptr);
       try {
         // A nested wait must not steal a task that joins this suspended build.
         value = tbb::this_task_arena::isolate([&] {
@@ -67,6 +80,11 @@ public:
       } catch (...) {
         error = std::current_exception();
       }
+      {
+        std::lock_guard lock(finishedMutex);
+        finished = true;
+      }
+      finishedChanged.notify_all();
     });
   }
 
@@ -76,10 +94,25 @@ public:
     return result();
   }
 
+  // Waits for the builder's outcome. A waiter working for a request with a
+  // deadline or a stop token waits no longer than its request: it leaves
+  // with a deadline_exceeded or cancelled error while the build goes on for
+  // the others.
   Pointer wait() {
     checkRecursion();
     Signal::emit("sharedLazyBuildWait", this);
-    group.wait();
+    const IoContext* io = IoContext::current();
+    if (!io || (!io->hasDeadline() && !io->stop.stop_possible())) {
+      group.wait();
+      return result();
+    }
+    std::unique_lock lock(finishedMutex);
+    auto done = [this] { return finished; };
+    if (!(io->hasDeadline() ? finishedChanged.wait_until(lock, io->stop, io->waitDeadline(), done)
+                            : finishedChanged.wait(lock, io->stop, done))) {
+      if (io->stopRequested()) throw RequestCancelledError();
+      throw DeadlineExceededError("the request's deadline passed while it waited for a build shared with other requests");
+    }
     return result();
   }
 };

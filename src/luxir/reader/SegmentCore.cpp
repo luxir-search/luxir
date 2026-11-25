@@ -14,6 +14,7 @@
 #include "luxir/store/AcquireJoin.h"
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/util/ApiError.h"
+#include "luxir/util/IoContext.h"
 
 namespace luxir {
 
@@ -128,6 +129,7 @@ std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice pa
   // miss must not hold up other slices of the segment, hits included. Two
   // threads missing the same part both acquire it; the first to store wins.
   auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
+  countAcquire(part.bytes);
   // Declared after `hold`, so it unlocks before a duplicate hold releases.
   std::lock_guard lock(holdsMutex);
   return holds.try_emplace(key, std::move(hold)).first->second.bytes();
@@ -247,6 +249,7 @@ bool SegmentCore::openBaseFile(Directory& dir, std::string_view segment, uint32_
   }
   if (checkHeader) {
     auto header = file->acquire({0, Postings::LUXIR_HEADER.size(), ReadClass::METADATA});
+    if (!file->holdsFree()) countAcquire(header.getLength());
     validateSegmentFileHeader(header.bytes(), segment, number);
   }
   bool holdsFree = file->holdsFree();
