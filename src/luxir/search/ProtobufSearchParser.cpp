@@ -594,7 +594,7 @@ public:
       op->flags = options.flags;
       op->inputDomain = input;
       if (std::holds_alternative<luxir::api::PluginOp>(searchOp.kind)) {
-        req.addMaterializationStep<&SearchOp::materialize>(*op);
+        req.addMaterializationStep<&SearchOp::materializePlugin>(*op);
       }
     }
     return op;

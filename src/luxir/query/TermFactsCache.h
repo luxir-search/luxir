@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cassert>
+#include <cstring>
 #include <span>
 #include <string_view>
 #ifndef NDEBUG
@@ -21,12 +22,28 @@
 
 namespace luxir {
 
+enum ReadProduct : uint8_t {
+  TERM_STATS = 1, TERM_DOCS = 2, TERM_POSITIONS = 4, FIELD_NORMS = 8,
+};
+
 struct CachedTermInfo {
   Similarity::TermStats termStats = {};
   // Scored ordinary terms can reuse this view-wide, unit-boost scorer.
   Similarity::BM25Scorer* simScorer = nullptr;
-  // Empty for a term absent from every segment.
+  // Empty for a miss or an unresolved declaration. Nonempty states include
+  // stats, docs and any positions physically present in each segment.
   std::span<const TermsEnum::PostingsState*> postingsStates = {};
+  // Requested products remain meaningful even after resolution or a miss.
+  uint8_t requested = 0;
+  // True until dictionary resolution succeeds, including a successful miss.
+  bool unresolved = false;
+
+  // A captured state provides stats and a docs stream. Positions are
+  // available per segment in that state. Norms are outside the term cache.
+  uint8_t available(size_t segment) const {
+    if (postingsStates.empty() || postingsStates[segment] == nullptr) return 0;
+    return TERM_STATS | TERM_DOCS | (postingsStates[segment]->hasPositions ? TERM_POSITIONS : 0);
+  }
 
   /// Construct an independent tiered docs enum from the immutable state captured by the
   /// original term seek. No dictionary re-seek or shared mutable enum is involved.
@@ -51,6 +68,10 @@ struct CachedFieldInfo {
   // Mutable dictionary cursors used only by serial lookup.
   std::span<TermsEnum*> termsEnums = {};
   boost::unordered_node_map<std::string_view, CachedTermInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedTermInfo>>> termInfos;
+  // Metadata for declared fields is opened only on a weight lookup.
+  bool unresolved = false;
+  // Field products independent of any term in this field.
+  uint8_t requested = 0;
 
   explicit CachedFieldInfo(MemPool& pool, size_t initialMapSize=4) : termInfos(initialMapSize, pool.getAllocator()) {}
 };
@@ -72,6 +93,13 @@ class TermFactsCache {
 
   size_t numSegments() const noexcept { return reader.segments().size(); }
 
+  std::string_view ownKey(std::string_view key) {
+    if (key.empty()) return {};
+    auto* dest = pool.alloc(key.size());
+    std::memcpy(dest, key.data(), key.size());
+    return {dest, key.size()};
+  }
+
 public:
   TermFactsCache(MemPool& pool, IndexReader& reader, [[maybe_unused]] bool shared = false)
       : pool(pool), reader(reader), fieldInfoMap(4, pool.getAllocator()) {
@@ -86,16 +114,37 @@ public:
   }
 #endif
 
+  CachedFieldInfo& declareField(std::string_view field, uint8_t products = 0) {
+    auto iter = fieldInfoMap.find(field);
+    if (iter == fieldInfoMap.end()) {
+      iter = fieldInfoMap.try_emplace(ownKey(field), pool, 4).first;
+      iter->second.unresolved = true;
+    }
+    iter->second.requested |= products;
+    return iter->second;
+  }
+
+  void declareTerm(std::string_view field, std::string_view term, uint8_t products) {
+    auto& terms = declareField(field).termInfos;
+    auto iter = terms.find(term);
+    if (iter == terms.end()) {
+      iter = terms.try_emplace(ownKey(term)).first;
+      iter->second.unresolved = true;
+    }
+    iter->second.requested |= products;
+  }
+
   /// Returns nullptr if the field is not found in any segment.
   CachedFieldInfo* getCachedFieldInfo(std::string_view field) {
     auto [iter, inserted] = fieldInfoMap.try_emplace(field, pool, 4);
     CachedFieldInfo& result = iter->second;
-    if (inserted) {
+    if (inserted || result.unresolved) {
       result.segInfos = reader.field(field);
       if (result.segInfos.exists()) {
         result.fieldStats = result.segInfos.stats();
         result.termsEnums = pool.make_span_zeroed<TermsEnum*>(numSegments());
       }
+      result.unresolved = false;
     }
     return result.segInfos.exists() ? &result : nullptr;
   }
@@ -120,7 +169,7 @@ public:
   CachedTermInfo* getCachedTerminfo(CachedFieldInfo& cachedFieldInfo, std::string_view term) {
     auto [iter, inserted] = cachedFieldInfo.termInfos.try_emplace(term);
     CachedTermInfo& result = iter->second;
-    if (!inserted) {
+    if (!inserted && !result.unresolved) {
       return result.postingsStates.empty() ? nullptr : &result;
     }
 
@@ -149,6 +198,7 @@ public:
         result.termStats.totalTermFreq += state->totalTermFreq;
       }
 
+      result.unresolved = false;
       if (!found) {
         pool.rewind(savepoint);
         return nullptr;
@@ -156,7 +206,8 @@ public:
       result.postingsStates = postingsStates;
       return &result;
     } catch (...) {
-      cachedFieldInfo.termInfos.erase(iter);
+      if (result.requested == 0) cachedFieldInfo.termInfos.erase(iter);
+      else result.termStats = {};
       throw;
     }
   }

@@ -3,6 +3,8 @@
 
 #include <utility>
 
+#include "luxir/query/ReadDeclarer.h"
+
 #include "luxir/search/ops/FacetOp.h"
 #include "luxir/search/ops/FusionOp.h"
 #include "luxir/search/ops/RootOp.h"
@@ -10,18 +12,46 @@
 
 namespace luxir {
 
+void SearchOp::materializePlugin() {
+  if (auto* reads = ReadVerification::active()) reads->pluginOwner();
+  materialize();
+}
+
+void RootOp::declareReads(ReadDeclarer& reads) const {
+  if (!domainVariants.empty()) domainVariants.declareReads(reads, *planning, 0);
+}
+
+void BucketDomainPlan::declareReads(ReadDeclarer& reads) const {
+  variants.declareReads(reads, *planning, 0);
+}
+
+void InputDomainPlan::declareReads(ReadDeclarer& reads) const {
+  variants.declareReads(reads, *planning, 0);
+}
+
+void QueryFacetReq::declareReads(ReadDeclarer& reads) const {
+  for (auto* query : bucketQueries) reads.root(*query, planning, 0);
+}
+
+void FusionOp::declareReads(ReadDeclarer& reads) const {
+  if (!filters.empty()) declareFilterReads(reads, filters, sources.front()->planning, Query::NEED_SCORES);
+}
+
 void RootOp::materialize() {
+  if (auto* reads = ReadVerification::active()) declareReads(*reads);
   if (domainVariants.empty()) return;
   weightContext = Query::Context::create(&req.arena, *planning);
   domainVariants.buildWeights(*weightContext, *planning, 0);
 }
 
 void BucketDomainPlan::materialize() {
+  if (auto* reads = ReadVerification::active()) declareReads(*reads);
   auto* context = Query::Context::create(&arena, *planning);
   variants.buildWeights(*context, *planning, 0);
 }
 
 void InputDomainPlan::materialize() {
+  if (auto* reads = ReadVerification::active()) declareReads(*reads);
   auto* context = Query::Context::create(&arena, *planning);
   variants.buildWeights(*context, *planning, 0);
 }
@@ -46,6 +76,7 @@ void TopDocsReq::validateRowExecution() const {
 }
 
 void QueryFacetReq::materialize() {
+  if (auto* reads = ReadVerification::active()) declareReads(*reads);
   auto* context = Query::Context::create(&req.arena, planning);
   auto weights = req.requestPool.make_span<Query::Weight*>(bucketQueries.size());
   for (size_t i = 0; i < weights.size(); i++) {
@@ -68,6 +99,7 @@ void QueryFacetReq::materialize() {
 }
 
 void FusionOp::materialize() {
+  if (auto* reads = ReadVerification::active()) declareReads(*reads);
   if (filters.empty()) return;
   assert(!sources.empty());
   auto& planning = sources.front()->planning;

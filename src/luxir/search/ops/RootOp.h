@@ -19,6 +19,7 @@ public:
   RootOp(SearchRequest& req) : SearchOp(req, req.reader, "root") {
   }
 
+  void declareReads(ReadDeclarer& reads) const;
   // Build the context, weights and filter uses for the root domain variants.
   void materialize() override;
 

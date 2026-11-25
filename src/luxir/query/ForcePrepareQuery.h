@@ -57,6 +57,8 @@ public:
     return child->appendFilterKey(out, ctx);
   }
 
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
+
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
 
@@ -104,7 +106,7 @@ public:
   public:
     Weight(Context& context, ForcePrepareQuery& query, int32_t flags, float multiplier)
       : Query::Weight(context, query, flags) {
-      childWeight = query.child->createWeight(context, flags, multiplier);
+      childWeight = query.child->buildWeight(context, flags, multiplier);
       // Forces prepare; scoring behavior is otherwise the child's.
       traits |= NEEDS_PREPARE
           | (childWeight->getFlags() & (IS_CONSTANT_SCORING | CONSUMES_DOMAIN));

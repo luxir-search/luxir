@@ -150,6 +150,7 @@ public:
 
   explicit BucketDomainPlan(google::protobuf::Arena& arena) : arena(arena) {}
 
+  void declareReads(ReadDeclarer& reads) const;
   // Build the context, weights and filter uses for the bucket domain variants.
   void materialize();
 };
@@ -167,6 +168,7 @@ public:
 
   explicit InputDomainPlan(google::protobuf::Arena& arena) : arena(arena) {}
 
+  void declareReads(ReadDeclarer& reads) const;
   // Build the context, weights and filter uses for the mapped input variants.
   void materialize();
 };
@@ -198,6 +200,9 @@ public:
   // before init(). Create query contexts and weights and make weight-dependent
   // choices here. The caller orders materialization for each op.
   virtual void materialize() {}
+
+  // Materialize a plugin owner whose roots are opaque to the built-in planner.
+  void materializePlugin();
 
   // Initialize the materialized op tree for execution.
   virtual void init() {
