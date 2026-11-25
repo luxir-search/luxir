@@ -208,6 +208,191 @@ TEST_F(StorageExampleTest, mergedReaderAcquiresOnlyOpenedParts) {
   }
 }
 
+namespace {
+
+LuxirConfig deleteCostConfig(bool bloom) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  config.store.layers = {"strict"};
+  config.store.options = {{"strict", {{"whole_segment_files", "deny"}}}};
+  config.index.id_filter = bloom ? "bloom" : "none";
+  config.index.merge_factor = 1000;
+  return config;
+}
+
+struct DeleteCostIndex {
+  LuxirNode node;
+  CollectionHelper h;
+  std::shared_ptr<IndexWriter> writer;
+  StrictStorageCounters& counters;
+
+  explicit DeleteCostIndex(bool bloom = true)
+      : node(deleteCostConfig(bloom)), h(node), writer(h.getIndexWriter()),
+        counters(*node.collections().storage().find<StrictLayer>()->counters) {
+    node.getIndexRamBudget().setTotalBytes(0);  // Only the measured commit applies deletes.
+  }
+
+  // One base file per segment, distinct bounds with a gap for a filter miss.
+  void seed(int count) {
+    for (int i = 0; i < count; ++i) {
+      auto prefix = std::to_string(i);
+      ASSERT_TRUE(h.indexAll({flatdoc("id", prefix + "a"), flatdoc("id", prefix + "z")},
+                             UpdateMessage::COMMIT).success);
+    }
+    ASSERT_EQ((size_t)count, writer->snapshots.readers.getReader()->segments().size());
+  }
+
+  static std::string baseFile(const Segment& seg) {
+    return Postings::getIndexFileName(seg.segmentCore().segmentName(), 0);
+  }
+};
+
+} // namespace
+
+TEST_F(StorageExampleTest, idLookupPrefetchColdAndWarm) {
+  for (int count : {2, 6}) {
+    DeleteCostIndex index;
+    ASSERT_NO_FATAL_FAILURE(index.seed(count));
+    auto reader = index.writer->snapshots.readers.getReader();
+    int targets = count / 2;
+    std::vector<Doc> updates;
+    for (int i = 0; i < targets; ++i) updates.push_back(flatdoc("id", std::to_string(i) + "a"));
+    updates.push_back(flatdoc("id", std::to_string(count - 1) + "m"));
+
+    std::map<std::string, StrictStorageCounters::FileStats> before;
+    std::map<std::string, field_parts::Slice> versions;
+    for (const auto& seg : reader->segments()) {
+      auto name = index.baseFile(seg);
+      before[name] = index.counters.fileStats(name);
+      versions[name] = seg.segmentCore().versionRunsPart();
+    }
+    ASSERT_TRUE(index.h.indexAll(updates, UpdateMessage::COMMIT, true).success);
+    EXPECT_EQ(2 * count + 1, index.writer->snapshots.readers.getReader()->liveDocs());
+    for (const auto& seg : reader->segments()) {
+      const auto* field = seg.postingsReader().fieldInfo("id");
+      auto name = index.baseFile(seg);
+      SCOPED_TRACE(name);
+      auto after = index.counters.fileStats(name);
+      auto& was = before.at(name);
+      uint64_t batches = after.batches - was.batches;
+      EXPECT_EQ(batches, after.submissions - was.submissions);
+      EXPECT_LE(batches, 3u);
+      int i = std::string_view(field->dictionaryBounds()->lower).front() - '0';
+      uint64_t expectedRanges = 0;
+      auto expectPart = [&](field_parts::Slice part, ReadClass cls) {
+        ASSERT_TRUE(part);
+        auto key = std::pair(part.location.offset(), part.bytes);
+        EXPECT_FALSE(was.parts.contains(key));
+        EXPECT_TRUE(after.parts.contains(key));
+        EXPECT_EQ(cls == ReadClass::METADATA, after.metadataParts.contains(key));
+        ++expectedRanges;
+      };
+      if (i < targets || i == count - 1) expectPart(field->idFilter(), ReadClass::METADATA);
+      if (i < targets) {
+        expectPart(field->termNavigation(), ReadClass::METADATA);
+        expectPart(field->terms()->dictionaryBlocks(), ReadClass::DATA);
+        expectPart(versions.at(name), ReadClass::METADATA);
+      }
+      EXPECT_EQ(expectedRanges, after.acquires - was.acquires);
+      was = std::move(after);
+    }
+    updates.clear();
+    for (int i = 0; i < targets; ++i) updates.push_back(flatdoc("id", std::to_string(i) + "z"));
+    ASSERT_TRUE(index.h.indexAll(updates, UpdateMessage::COMMIT, true).success);
+    for (const auto& [name, was] : before) EXPECT_EQ(was.submissions, index.counters.fileStats(name).submissions);
+    EXPECT_EQ(2 * count + 1, index.writer->snapshots.readers.getReader()->liveDocs());
+  }
+}
+
+TEST_F(StorageExampleTest, idLookupPrefetchIssuesEachPhaseAcrossSegments) {
+  for (bool filters : {true, false}) {
+    DeleteCostIndex index(filters);
+    ASSERT_NO_FATAL_FAILURE(index.seed(2));
+    // With filters, the two filter batches must be in flight together. Without
+    // filters the first submissions are metadata and data for each survivor.
+    auto gate = std::make_shared<BatchGate>(filters ? 2 : 4, std::chrono::seconds(5));
+    for (const auto& seg : index.writer->snapshots.readers.getReader()->segments()) {
+      index.counters.gateBatches(index.baseFile(seg), gate);
+    }
+    ASSERT_TRUE(index.h.deleteByIds({"0a", "1a"}, UpdateMessage::COMMIT).success);
+    EXPECT_FALSE(gate->timedOut());
+    EXPECT_EQ(filters ? 6u : 4u, gate->submissions());
+    EXPECT_EQ(gate->submissions(), gate->deliveries());
+    EXPECT_EQ((std::vector<std::string>{"0z", "1z"}), allIds(index.h));
+  }
+}
+
+TEST_F(StorageExampleTest, idLookupPrefetchFailedBatchRetriesOnUse) {
+  for (bool filters : {true, false}) {
+    DeleteCostIndex index(filters);
+    ASSERT_NO_FATAL_FAILURE(index.seed(2));
+    auto reader = index.writer->snapshots.readers.getReader();
+    std::map<std::string, StrictStorageCounters::FileStats> before;
+    for (const auto& seg : reader->segments()) before[index.baseFile(seg)] = index.counters.fileStats(index.baseFile(seg));
+    // Both cores are open, so the next submission is a prefetch batch on one of their base files.
+    index.counters.failNextRounds(1);
+    ASSERT_TRUE(index.h.deleteByIds({"0a", "1a"}, UpdateMessage::COMMIT).success);
+    int retried = 0;
+    for (const auto& [name, was] : before) {
+      auto after = index.counters.fileStats(name);
+      auto singles = (after.submissions - was.submissions) - (after.batches - was.batches);
+      if (singles) ++retried;
+      EXPECT_GT(after.batches, was.batches);
+    }
+    EXPECT_EQ(1, retried);  // Only the failed segment needed single acquires.
+    EXPECT_EQ((std::vector<std::string>{"0z", "1z"}), allIds(index.h));
+  }
+}
+
+TEST_F(StorageExampleTest, idLookupPrefetchMergedDuplicatePostings) {
+  DeleteCostIndex index;
+  ASSERT_TRUE(index.h.index(flatdoc("id", "dup"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(index.h.indexAll({flatdoc("id", "dup"), flatdoc("id", "keep")}, UpdateMessage::COMMIT).success);
+  index.writer->mergeSegments();
+  auto reader = index.writer->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  const auto& seg = reader->segments().front();
+  auto docs = seg.postingsReader().fieldInfo("id")->terms()->runs.front().docs;
+  ASSERT_TRUE(docs);
+  auto name = Postings::getIndexFileName(seg.segmentCore().segmentName(), docs.location.filenum());
+  auto before = index.counters.fileStats(name);
+  auto range = std::pair(docs.location.offset(), docs.bytes);
+  ASSERT_FALSE(before.parts.contains(range));
+  ASSERT_TRUE(index.h.index(flatdoc("id", "dup"), UpdateMessage::COMMIT, true).success);
+  auto after = index.counters.fileStats(name);
+  EXPECT_TRUE(after.parts.contains(range));
+  EXPECT_FALSE(after.metadataParts.contains(range));
+  EXPECT_EQ(after.batches - before.batches, after.submissions - before.submissions);
+  EXPECT_EQ((std::vector<std::string>{"dup", "keep"}), allIds(index.h));
+}
+
+TEST_F(StorageExampleTest, idLookupPrefetchUnpublishedLiveDocsOnDemand) {
+  DeleteCostIndex index;
+  ASSERT_TRUE(index.h.indexAll({flatdoc("id", "a"), flatdoc("id", "b"), flatdoc("id", "keep")},
+                               UpdateMessage::COMMIT).success);
+  auto reader = index.writer->snapshots.readers.getReader();
+  const auto& published = reader->segments().front();
+  {
+    // Leave a writer generation newer than the reader by failing before publication.
+    Signal::listen("commitDataSync", [](void*, void*, void*) -> void* { throw std::runtime_error("test sync failure"); });
+    auto cleanup = scope_guard([] { Signal::unlisten("commitDataSync"); });
+    ExpectLog quiet("test sync failure");
+    ASSERT_FALSE(index.h.deleteById("a", UpdateMessage::COMMIT).success);
+  }
+  const auto& seg = *index.writer->segInfos.at(published.segInfo.seg_id);
+  ASSERT_GT(seg.liveGen, published.segInfo.live_gen);
+  auto live = Postings::getLiveDocsFileName(published.segmentCore().segmentName(), seg.liveGen, seg.liveEpoch);
+  auto before = index.counters.fileStats(live);
+  auto base = index.baseFile(published);
+  auto baseBefore = index.counters.fileStats(base);
+  ASSERT_TRUE(index.h.deleteById("b", UpdateMessage::COMMIT).success);
+  auto after = index.counters.fileStats(live);
+  EXPECT_EQ(before.submissions + 1, after.submissions);
+  EXPECT_EQ(before.batches, after.batches);
+  EXPECT_EQ(baseBefore.submissions, index.counters.fileStats(base).submissions);
+  EXPECT_EQ((std::vector<std::string>{"keep"}), allIds(index.h));
+}
+
 // A manifest open issues one batch per segment file: file 0's holds its header
 // and catalog, every other file's its header. A snapshot open issues all of
 // them before it waits on any, so a gate holding back every completion until

@@ -115,6 +115,10 @@ public:
   uint64_t epoch() const noexcept { return creatorEpoch; }
   PostingsReader& rootReader() noexcept { return root; }
   const PostingsReader& rootReader() const noexcept { return root; }
+  // The part versionRuns() acquires on first use. Empty when the runs are built or the segment has none.
+  field_parts::Slice versionRunsPart() const {
+    return versions.peek() ? field_parts::Slice{} : catalog.versionRuns().slice;
+  }
   // Built on first use, which may acquire the version runs part.
   const VersionRuns& versionRuns() const {
     auto* built = versions.peek();
