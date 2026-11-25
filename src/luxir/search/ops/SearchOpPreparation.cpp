@@ -26,6 +26,25 @@ void InputDomainPlan::materialize() {
   variants.buildWeights(*context, *planning, 0);
 }
 
+Query::Context& TopDocsReq::decoratorQueryContext() {
+  if (weightContext == nullptr) {
+    weightContext = Query::Context::create(&req.arena, planning);
+    skipCount(SkipStats::queryContextsCreated);
+  }
+  return *weightContext;
+}
+
+void TopDocsReq::bindDecorators() {
+  HitDecorator::QuerySource bound{resultQuery, decoratorQueryContext()};
+  for (const auto& decorator : decorators) decorator->bind({&bound, 1});
+}
+
+void TopDocsReq::validateRowExecution() const {
+  if (weight->needsPrepare() || !filterWeights.empty()) {
+    throw RequestError("row operation '" + std::string(name) + "': prepared queries and routed filters are not supported yet");
+  }
+}
+
 void QueryFacetReq::materialize() {
   auto* context = Query::Context::create(&req.arena, planning);
   auto weights = req.requestPool.make_span<Query::Weight*>(bucketQueries.size());
@@ -70,6 +89,14 @@ void FusionOp::materialize() {
     uses[i] = planning.getFilterUse(*filters[i].query);
   }
   filterUses = uses;
+}
+
+void FusionOp::bindDecorators() {
+  std::vector<HitDecorator::QuerySource> boundQueries;
+  for (auto* source : sources) {
+    boundQueries.push_back({source->resultQuery, source->decoratorQueryContext()});
+  }
+  for (const auto& decorator : decorators) decorator->bind(boundQueries);
 }
 
 }  // namespace luxir

@@ -57,7 +57,20 @@ Query::PlanningContext* SearchRequest::createPlanningContext(IndexReader& view) 
       uses(view), &memoryTracker, proto.profile ? this : nullptr);
   planning->pruning = pruning;
   planning->proofNotes = resolvedFields;
+#ifndef NDEBUG
+  planning->requestStage = &stage;
+#endif
   return planning;
+}
+
+void SearchRequest::materialize() {
+  assert(stage == Stage::LOGICAL && logicalRoot != nullptr);
+  stage = Stage::MATERIALIZING;
+  for (; materializationCursor < materializationSteps.size(); ++materializationCursor) {
+    const auto& step = materializationSteps[materializationCursor];
+    step.run(step.owner);
+  }
+  stage = Stage::MATERIALIZED;
 }
 
 // One profile op for the request and one run per calculator that actually skips.

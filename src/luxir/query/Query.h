@@ -1294,6 +1294,8 @@ public:
     }
 
   public:
+    enum class Stage : uint8_t { INACTIVE, LOGICAL, MATERIALIZING, MATERIALIZED };
+
     struct Limits {
       // Request-wide multi-term work allowance, shared by every planning
       // context of one request. Null gives the context its own unlimited one.
@@ -1320,6 +1322,15 @@ public:
     std::string_view opName;
     std::vector<std::string>* proofNotes = nullptr;
     ExecutionProfileSink* profiles = nullptr;
+
+#ifndef NDEBUG
+    // Borrowed from the request when planning belongs to a search.
+    const Stage* requestStage = nullptr;
+
+    bool inLogicalPhase() const noexcept {
+      return requestStage != nullptr && *requestStage == Stage::LOGICAL;
+    }
+#endif
 
     PlanningContext(
         MemPool& pool, IndexReader& topReader, Limits limits = {},
@@ -1534,7 +1545,9 @@ public:
         pool(planning.pool), topReader(planning.topReader),
         filterUses(planning.filterUses),
         filterKeyContext(planning.filterKeyContext), limits(planning.limits),
-        fieldInfoMap(std::move(fieldInfoMap)) {}
+        fieldInfoMap(std::move(fieldInfoMap)) {
+      assert(!planning.inLogicalPhase());
+    }
 
     // Arena-owned form used by standalone embedders that do not already have
     // serial planning state.
@@ -1550,7 +1563,9 @@ public:
         pool(planning.pool), topReader(planning.topReader),
         filterUses(planning.filterUses),
         filterKeyContext(planning.filterKeyContext), limits(planning.limits),
-        fieldInfoMap(std::move(fieldInfoMap)) {}
+        fieldInfoMap(std::move(fieldInfoMap)) {
+      assert(!planning.inLogicalPhase());
+    }
 
     // Convenience ctor for stack-allocated Contexts (tests, non-arena code).
     Context(MemPool& pool, IndexReader& topReader, Limits limits = {},
@@ -1566,6 +1581,7 @@ public:
         filterUses(planning.filterUses),
         filterKeyContext(planning.filterKeyContext), limits(planning.limits),
         fieldInfoMap(4, pool.getAllocator()) {
+      assert(!planning.inLogicalPhase());
     }
 
     static Context* create(google::protobuf::Arena* arena,
@@ -1767,6 +1783,7 @@ public:
 #endif
     {
 #ifndef NDEBUG
+      assert(!context.planningContext().inLogicalPhase());
       context.assertLogicalValidation(query);
 #else
       unused(query);

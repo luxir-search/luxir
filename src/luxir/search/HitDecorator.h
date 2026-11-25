@@ -66,9 +66,7 @@ public:
     if (!maker || !makers.emplace(name, std::move(maker)).second)
       throw std::invalid_argument("invalid or duplicate hit decorator: " + name);
   }
-  std::vector<std::shared_ptr<HitDecorator>> make(
-      ParamReader::Entries specs, DecoratorContext& ctx,
-      std::span<const HitDecorator::QuerySource> sources) const {
+  std::vector<std::shared_ptr<HitDecorator>> make(ParamReader::Entries specs, DecoratorContext& ctx) const {
     std::vector<std::shared_ptr<HitDecorator>> result;
     std::set<std::string_view> names, columns;
     for (const auto& [name, value] : specs) {
@@ -79,8 +77,6 @@ public:
       if (!params) throw RequestError("decorator '" + std::string(name) + "' requires an object");
       ParamReader reader("decorate." + std::string(name), *params);
       auto decorator = found->second(ctx, reader);
-      // Preserve the order of inspection, unused parameter checks and later makers.
-      if (decorator) decorator->bind(sources);
       reader.rejectUnknown();
       if (!decorator || decorator->columnName().empty() || !columns.insert(decorator->columnName()).second)
         throw std::logic_error("decorators must produce unique nonempty columns");

@@ -260,7 +260,7 @@ public:
       addDomainVariants(
           req.proto.ops, {}, domains, rootOp.planning,
           rootOp.domainVariants);
-      rootOp.materialize();
+      req.addMaterializationStep<&SearchOp::materialize>(rootOp);
     }
     addSubs(rootOp, req.proto.ops, 0, OpsPlacement::REQUEST_ROOT);
     return &rootOp;
@@ -359,7 +359,7 @@ public:
         validateDomainQueries(domains, *bucketPlan->planning);
         bucketPlan->variants.begin(0);
         addDomainVariants(ops, {}, domains, bucketPlan->planning, bucketPlan->variants);
-        bucketPlan->materialize();
+        req.addMaterializationStep<&BucketDomainPlan::materialize>(*bucketPlan);
       }
     }
     for (auto& [name, searchOp] : lastWins(ops)) {
@@ -480,7 +480,7 @@ public:
         input->variants.begin(0);
         addDomainRoute(name, &domains.at(name), [](size_t) { return false; },
             input->planning, input->variants);
-        input->materialize();
+        req.addMaterializationStep<&InputDomainPlan::materialize>(*input);
       }
     }
     if (searchOp.domain && placement == OpsPlacement::FUSION) {
@@ -593,7 +593,9 @@ public:
     if (op != nullptr) {
       op->flags = options.flags;
       op->inputDomain = input;
-      if (std::holds_alternative<luxir::api::PluginOp>(searchOp.kind)) op->materialize();
+      if (std::holds_alternative<luxir::api::PluginOp>(searchOp.kind)) {
+        req.addMaterializationStep<&SearchOp::materialize>(*op);
+      }
     }
     return op;
   }
@@ -1489,7 +1491,7 @@ public:
     auto* facet = luxir::arenaCreate<QueryFacetReq>(
         req.arena, req, view(), facetReq, facetName, plan.bucketQueries,
         *plan.planning, bucketChild);
-    facet->materialize();
+    req.addMaterializationStep<&SearchOp::materialize>(*facet);
     configureMeasure(*facet, resolveMeasure(facetReq));
     return facet;
   }
@@ -1777,9 +1779,7 @@ public:
         copy->filter = filters;
       }
       auto* row = parseTopDocs(name, *copy, TopDocsPlacement::ROW_OP, selectedRows);
-      if (row->weight->needsPrepare() || !row->filterWeights.empty()) {
-        throw RequestError("row operation '" + std::string(name) + "': prepared queries and routed filters are not supported yet");
-      }
+      req.addMaterializationStep<&TopDocsReq::validateRowExecution>(*row);
       row->rowFields = resolveReturnFields(req, *row->view, top->fields);
       resolveReturnFieldMetadata(*row->view, row->rowFields);
       row->parent = &owner;
@@ -2045,12 +2045,12 @@ public:
             .pureCountShape = pureCountShape,
             .estimateCount = estimateCount,
         });
-    qr->materialize();
+    req.addMaterializationStep<&SearchOp::materialize>(*qr);
     if (placement != TopDocsPlacement::FUSION_SOURCE && !topDocsReq.decorate.empty()) {
-      HitDecorator::QuerySource bound{qr->resultQuery, decoratorQueryContext(*qr)};
       DecoratorContext::QuerySource source{qr->resultQuery, qr->planning};
       DecoratorContext dc{req, parseContext, {&source, 1}};
-      qr->decorators = HitDecoratorRegistry::global().make(topDocsReq.decorate, dc, {&bound, 1});
+      qr->decorators = HitDecoratorRegistry::global().make(topDocsReq.decorate, dc);
+      req.addMaterializationStep<&TopDocsReq::bindDecorators>(*qr);
     } else if (placement == TopDocsPlacement::FUSION_SOURCE && !topDocsReq.decorate.empty()) {
       throw RequestError("fusion sources cannot decorate; put decorate on fusion");
     }
@@ -2098,14 +2098,6 @@ public:
       }
     }
     return out;
-  }
-
-  Query::Context& decoratorQueryContext(TopDocsReq& source) {
-    if (source.weightContext == nullptr) {
-      source.weightContext = Query::Context::create(&req.arena, source.planning);
-      skipCount(SkipStats::queryContextsCreated);
-    }
-    return *source.weightContext;
   }
 
   // The parser side of a plugin op: query parsing, a planning context of its
@@ -2309,21 +2301,20 @@ public:
       req.arena, req, view(), name, fusionProto, std::move(sources),
       std::move(sourceWeights), topCount, sharedFilters,
       method, rrfK);
-    fusion->materialize();
+    req.addMaterializationStep<&SearchOp::materialize>(*fusion);
 
     fusion->collapse = collapse;
     if (collapse && !fusionProto.collapse->head_sort.empty()) {
       fusion->headSort = parseSorts(fusionProto.collapse->head_sort);
     }
     if (!fusionProto.decorate.empty()) {
-      std::vector<HitDecorator::QuerySource> boundQueries;
       std::vector<DecoratorContext::QuerySource> resultQueries;
       for (auto* source : fusion->sources) {
-        boundQueries.push_back({source->resultQuery, decoratorQueryContext(*source)});
         resultQueries.push_back({source->resultQuery, source->planning});
       }
       DecoratorContext dc{req, parseContext, resultQueries};
-      fusion->decorators = HitDecoratorRegistry::global().make(fusionProto.decorate, dc, boundQueries);
+      fusion->decorators = HitDecoratorRegistry::global().make(fusionProto.decorate, dc);
+      req.addMaterializationStep<&FusionOp::bindDecorators>(*fusion);
     }
     fusion->diverseSources = std::ranges::any_of(fusion->sources,
         [](const TopDocsReq* source) { return source->collapse != nullptr || source->diversify != nullptr; });
@@ -2353,7 +2344,10 @@ ProtobufSearchParser::ProtobufSearchParser(SearchRequest& req) : req(req) {
 }
 
 RootOp* ProtobufSearchParser::parse() {
-  return SearchParserImpl(req).parse();
+  assert(req.stage == SearchRequest::Stage::INACTIVE);
+  req.stage = SearchRequest::Stage::LOGICAL;
+  req.logicalRoot = SearchParserImpl(req).parse();
+  return req.logicalRoot;
 }
 
 } // luxir

@@ -195,7 +195,7 @@ public:
 
   void releaseSegmentState(luxir::IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;
-    weight->releaseSegmentState(segment);
+    if (weight != nullptr) weight->releaseSegmentState(segment);
     SearchOp::releaseSegmentState(segment);
   }
 

@@ -215,6 +215,7 @@ public:
     return false;
   }
 
+  // Release any state present, including after incomplete materialization.
   virtual void releaseSegmentState(IndexReader::Segment& segment) noexcept {
     if (segmentStateRetained(segment)) return;
     if (inputDomain) inputDomain->variants.releaseSegmentState(view->segments()[(size_t)segment.ord]);

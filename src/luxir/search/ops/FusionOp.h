@@ -93,6 +93,8 @@ public:
 
   // Build the shared-filter weights and uses, reusing the first source's context when present.
   void materialize() override;
+  // Bind the decorators against all materialized sources in source order.
+  void bindDecorators();
 
   bool needsCount() const {
     return fusionProto.count_limit.has_value()

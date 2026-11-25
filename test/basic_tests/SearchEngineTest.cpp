@@ -3367,18 +3367,24 @@ TEST_F(SearchEngineTest, uncacheableFieldSortKeepsItsOrdinarySource) {
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   auto run = [&](bool disabled) {
     WholeMembershipPlanGuard guard(disabled);
-    auto req = localReq(helper.getSearchEngine());
-    req->collection("uncacheable_field_sort");
-    auto& top = req->topDocs("q").exprQuery("rescore(body_w:alpha,sort_i,min_score=4)")
-        .countLimit().fields({"id"}).limit(3);
-    qb::sort(top, "sort_i", qb::ASC);
-    req->reader = helper.getIndexWriter()->snapshots.readers.getReader();
-    req->schema = req->reader->schema();
-    auto* root = ProtobufSearchParser(*req).parse();
+    auto makeRequest = [&] {
+      auto req = localReq(helper.getSearchEngine());
+      req->collection("uncacheable_field_sort");
+      auto& top = req->topDocs("q").exprQuery("rescore(body_w:alpha,sort_i,min_score=4)")
+          .countLimit().fields({"id"}).limit(3);
+      qb::sort(top, "sort_i", qb::ASC);
+      req->reader = helper.getIndexWriter()->snapshots.readers.getReader();
+      req->schema = req->reader->schema();
+      return req;
+    };
+    auto inspection = makeRequest();
+    auto* root = ProtobufSearchParser(*inspection).parse();
+    inspection->materialize();
     auto* op = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
     ASSERT_NE(nullptr, op);
     EXPECT_FALSE(op->weight->needsPrepare());
     EXPECT_FALSE(op->wholeMembershipPlan.hasCacheUse());
+    auto req = makeRequest();
     req->execute(false); EXPECT_OK(req);
     EXPECT_EQ(4, req->getMatchCount("q"));
     EXPECT_EQ((std::vector<std::string>{"4", "5", "6"}), resultIds(*req, "q"));
@@ -4778,6 +4784,7 @@ TEST_F(SearchEngineTest, structurallyEqualDomainsShareVariant) {
   req->reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ProtobufSearchParser parser(*req);
   auto* root = parser.parse();
+  req->materialize();
   auto* parsed = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
   ASSERT_NE(nullptr, parsed);
   EXPECT_EQ(2u, parsed->domainVariants.variantCount());
@@ -7879,6 +7886,7 @@ TEST_F(SearchEngineTest, forcedCountCompositionKeepsCanonicalScores) {
   req->schema = helper.collection().getSchema();
   req->topDocs("q").exprQuery("body_w:(+alpha +beta)").countLimit().getScores().limit(10);
   auto* root = ProtobufSearchParser(*req).parse();
+  req->materialize();
   auto* top = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
   ASSERT_NE(nullptr, top);
   EXPECT_EQ(nullptr, top->countWeight);
@@ -7979,6 +7987,7 @@ TEST_F(SearchEngineTest, provedDensitySelectsSegmentsBeforeConstructingCompanion
   auto inspect = [&](std::string_view query, bool companions) {
     auto req = make(query);
     auto* root = ProtobufSearchParser(*req).parse();
+    req->materialize();
     auto* op = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
     EXPECT_EQ(companions, op->countWeight != nullptr);
     EXPECT_EQ(companions, op->rankingWeight != nullptr);
@@ -8032,6 +8041,7 @@ TEST_F(SearchEngineTest, provedDensitySelectsSegmentsBeforeConstructingCompanion
     disableTopDocsFilterFold = true;
     auto req = make("+wide -excluded", true);
     auto* root = ProtobufSearchParser(*req).parse();
+    req->materialize();
     auto* op = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
     EXPECT_EQ(nullptr, op->countWeight);
     EXPECT_EQ(nullptr, op->rankingWeight);

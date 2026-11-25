@@ -499,7 +499,7 @@ TEST_F(PluginExtensionTest, decoratorInspectsBrowseNestedAndFusionSources) {
       {R"({"ops":{"q":{"top_docs":{"fields":["id"],"decorate":{"ranking_terms":{}}}}}})", ""},
       {R"({"ops":{"q":{"top_docs":{"query":{"boolean":{"required":["id:d1"],"optional":["cat_s:x","id:d1"],"filter":["cat_s:x"],"prohibited":["id:d2"]}},"fields":["id"],"decorate":{"ranking_terms":{}}}}}})", "id:d1,cat_s:x,id:d1"},
       {R"({"ops":{"cats":{"field_facet":{"field":"cat_s","ops":{"q":{"top_docs":{"query":"id:d1","fields":["id"],"decorate":{"ranking_terms":{}}}}}}}}})", "id:d1"},
-      {R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{"a":{"query":"id:d1"},"b":{"query":"id:d2"}},"fields":["id"],"decorate":{"ranking_terms":{}}}}}})", "id:d1,id:d2"}};
+      {R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{"a":{"query":"id:d1"},"b":{"query":"id:d2"}},"filter":["*:*"],"fields":["id"],"decorate":{"ranking_terms":{}}}}}})", "id:d1,id:d2"}};
   for (const auto& [request, terms] : cases) {
     auto res = search(std::string(request));
     ASSERT_EQ(200, res.result_int()) << res.body();
@@ -528,8 +528,8 @@ TEST_F(PluginExtensionTest, decoratorBindsWithAContextForAResidentSource) {
     req->collection("decorator_resident");
     SkipStatsScope stats;
     req->execute(false);
-    EXPECT_EQ(1, SkipStats::cacheFirstQueryContextsOmitted);
-    EXPECT_EQ(1, SkipStats::queryContextsCreated);
+    EXPECT_EQ(valid ? 1 : 0, SkipStats::cacheFirstQueryContextsOmitted);
+    EXPECT_EQ(valid ? 1 : 0, SkipStats::queryContextsCreated);
     if (!valid) {
       EXPECT_FALSE(req->ok());
       EXPECT_TRUE(req->errorMsg().contains("unused")) << req->errorMsg();
