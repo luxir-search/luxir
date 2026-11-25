@@ -196,6 +196,8 @@ These are writer-node engine hooks; read-only nodes and followers refuse them.
 `demoteCollection(id)` instead stops only the writer: it commits, closes, and keeps
 serving reads. `attachCollection(id, Collections::Role::READ_ONLY)` serves a
 collection without a writer or an assignment and is allowed on read-only nodes.
+Such a view serves the snapshot it opened until a publisher advances it; the
+engine does not fetch newer commits for it.
 
 ## Collection lifecycle
 

@@ -210,9 +210,13 @@ public:
   void demote(const CollectionId& id);
   // Open an active catalog entry. As WRITER, optionally taking its assignment
   // first. As READ_ONLY the selected snapshot is served without a writer and
-  // without touching the assignment, so a publisher other than a writer (a
-  // replica refresher) can advance it with stage/prepare/install; this is
-  // also allowed on a read-only node.
+  // without touching the assignment; this is also allowed on a read-only
+  // node. The view does not advance by itself: a publisher other than a
+  // writer (a replica refresher) publishes newer commits of the same
+  // incarnation into the shard's snapshot registry. stage/prepare/install
+  // are for the node that owns the collection and refuse another node's
+  // incarnation. Registered as read-only (Shard::isReadOnly), updates are
+  // refused.
   std::shared_ptr<Collection> attach(const CollectionId& id, Role role, bool force = false);
   std::shared_ptr<Collection> attach(const CollectionId& id, bool force = false) { return attach(id, Role::WRITER, force); }
 

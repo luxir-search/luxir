@@ -576,8 +576,12 @@ and `LuxirNode::attachCollection(id, force)` to hand off writers or force a take
 keeps serving its last snapshot (updates get `ReadOnlyError`), the first half of a
 handoff. `attachCollection(id, Collections::Role::READ_ONLY)` opens the selected
 snapshot without a writer and without touching the assignment, also on a read-only
-node; a publisher such as a replica refresher advances it with stage, prepare and
-install. `CommitWaits::setParkHook` runs a callback whenever a commit wait parks on
+node. Updates to it get `ReadOnlyError`. It does not advance on its own: a
+publisher such as a replica refresher resolves the newest commit of the same
+incarnation and publishes it into the shard's snapshot registry
+(`Shard::getSnapshots()`). `Collections::stage`, `prepare` and `install` are for the
+node that owns the collection and refuse another node's incarnation, so a view
+of a new incarnation is detached and attached again. `CommitWaits::setParkHook` runs a callback whenever a commit wait parks on
 a collection, so such a publisher can fetch at once instead of on its next interval.
 
 ### Capabilities
