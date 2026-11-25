@@ -21,7 +21,6 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -319,45 +318,15 @@ std::atomic<int64_t> VectorIndexBuilder::ivfBuildCountForTests{0};
 std::atomic<int64_t> VectorIndexBuilder::ivfMergeBuildCountForTests{0};
 int64_t VectorIndexBuilder::ivfTrainingPointsPerCentroid = 100;
 VectorIndexBuilder::Trainer VectorIndexBuilder::ivfTrainer = VectorIndexBuilder::Trainer::EMEANS;
-double VectorIndexBuilder::ivfEMeansEpochs = 5;
 int32_t VectorIndexBuilder::ivfTrainingSeed = 1234;
 size_t VectorIndexBuilder::ivfTrainingSampleMaxBytes = (size_t)2560 * 1024 * 1024;
 std::atomic<int64_t> VectorIndexBuilder::ivfLastTrainingVectorsForTests{0};
-std::atomic<int64_t> VectorIndexBuilder::ivfTrainingMicrosForTests{0};
 size_t VectorIndexBuilder::ivfAddChunkBytes = 16 * 1024 * 1024;
 int64_t VectorIndexBuilder::ivfBuildMinRowsPerTask = 0;
 
 std::unique_ptr<faiss::IndexFlat> VectorIndexBuilder::newCoarseQuantizer(
     int32_t dims, faiss::MetricType metric) {
   return std::make_unique<PartitionedFlatQuantizer>(dims, metric, buildMinRowsPerTask(dims));
-}
-
-void VectorIndexBuilder::trainCoarseQuantizer(int64_t n, const float* x, int32_t nlist,
-                                              faiss::IndexFlat& quantizer, Trainer trainer) {
-  // FAISS clusters inner-product IVF lists spherically (IndexIVF's constructor
-  // sets cp.spherical); e-means does the same in its spherical mode.
-  bool spherical = quantizer.metric_type == faiss::METRIC_INNER_PRODUCT;
-  faiss::ClusteringParameters cp;
-  cp.seed = ivfTrainingSeed;
-  if (trainer == Trainer::EMEANS) {
-    EMeans::Params params{.epochs = ivfEMeansEpochs, .seed = (uint64_t)cp.seed,
-                          .spherical = spherical};
-    [[maybe_unused]] auto trained = EMeans::train(n, x, nlist, params, quantizer);
-    LOG_TRACE("VectorIndexBuilder: e-means {} epochs batch={} alpha0={} splits={}",
-              ivfEMeansEpochs, trained.recipe.batchSize, trained.recipe.alpha0, trained.splits);
-  } else {
-    // The parameters IndexIVF's own training uses: Level1Quantizer sets 10
-    // iterations (ClusteringParameters defaults to 25).  min_points_per_centroid
-    // only gates FAISS's under-training warning to stderr; the
-    // *MinTrainingVectors floors are Luxir's policy.
-    cp.niter = 10;
-    cp.spherical = spherical;
-    cp.min_points_per_centroid = 1;
-    quantizer.reset();
-    faiss::Clustering clus((int)quantizer.d, nlist, cp);
-    clus.train(n, x, quantizer);
-  }
-  quantizer.is_trained = true;
 }
 
 float VectorIndexBuilder::finishRaBitQCode(const float* x, const float* centroid, uint8_t* code,
@@ -592,10 +561,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     auto pq = std::make_unique<PartitionedIVFPQ>(
         quantizer.get(), (size_t)dims, (size_t)nlist, (size_t)pqM,
         (size_t)pqBits, metric);
-    // Luxir gates IVF building on its own training-size policy (the
-    // *MinTrainingVectors floors), so FAISS's under-training heuristic is
-    // redundant: min_points_per_centroid only controls the warning FAISS
-    // prints unconditionally to stderr.
+    // See min_points_per_centroid below.
     pq->pq.cp.min_points_per_centroid = 1;
     index = std::move(pq);
   }
@@ -618,17 +584,35 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   } else {
     ivfBuildCountForTests.fetch_add(1, std::memory_order_relaxed);
   }
-  auto trainStart = std::chrono::steady_clock::now();
-  // A trained quantizer holding nlist centroids makes IndexIVF::train skip
-  // its own k-means and go straight to the PQ residual codebooks.  PQ keeps
-  // Lloyd lists: with e-means lists, mean PQ recall on Cohere-1024 over three
-  // seeds was 0.0013 to 0.0024 lower at every probe level.
-  trainCoarseQuantizer(ntrain, training.data(), nlist,
-                       dynamic_cast<faiss::IndexFlat&>(*index->quantizer),
-                       rabitq ? ivfTrainer : Trainer::LLOYD);
+  // Luxir gates IVF building on its own training-size policy (the
+  // *MinTrainingVectors floors), so FAISS's separate under-training
+  // heuristic is redundant.  It is the one message FAISS prints
+  // unconditionally to stderr during train(); min_points_per_centroid only
+  // controls that warning (not the clustering itself), so drop it to 1 on
+  // the coarse quantizer (and the PQ, above) to keep that policy decision ours.
+  index->cp.min_points_per_centroid = 1;
   if (rabitq) {
     // RaBitQuantizer::train is a no-op. IndexIVF::train would first assign
     // every sample row and allocate an equally large, unused residual copy.
+    if (ivfTrainer == Trainer::EMEANS) {
+      // e-means lists, spherical for inner product as IndexIVF's k-means is
+      // (its constructor sets cp.spherical).  Its workspace is charged with
+      // the sample.
+      auto& lists = dynamic_cast<faiss::IndexFlat&>(*index->quantizer);
+      EMeans::Params params{.seed = (uint64_t)ivfTrainingSeed,
+                            .spherical = metric == faiss::METRIC_INNER_PRODUCT};
+      if (trainingRam) {
+        trainingRam.forceResize(trainingRam.size() + EMeans::workspaceBytes(ntrain, nlist, dims, params));
+      }
+      [[maybe_unused]] auto trained = EMeans::train(ntrain, training.data(), nlist, params, lists);
+      lists.is_trained = true;
+      LOG_TRACE("VectorIndexBuilder: e-means batch={} alpha0={} splits={} handed over={} reassigned={}",
+                trained.recipe.batchSize, trained.recipe.alpha0, trained.splits,
+                trained.handedOver, trained.reassigned);
+    } else {
+      index->cp.seed = ivfTrainingSeed;
+      index->train_q1(ntrain, training.data(), index->verbose, metric);
+    }
     index->is_trained = true;
   } else {
     // PQ bounds residual training at 256 * ksub rows, but at high dimensions
@@ -638,8 +622,6 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     if (trainingRam) trainingRam.forceResize(trainingRam.size() + copies * pqRows * (int64_t)bytesPerVec);
     index->train(ntrain, training.data());
   }
-  ivfTrainingMicrosForTests.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(
-      std::chrono::steady_clock::now() - trainStart).count(), std::memory_order_relaxed);
   std::vector<float>().swap(training);
   trainingRam.release();
 

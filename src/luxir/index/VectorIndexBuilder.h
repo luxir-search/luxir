@@ -72,19 +72,15 @@ public:
   // by the memory ceiling for the sample's in-memory copy. The codec training
   // floor still applies.
   static int64_t ivfTrainingPointsPerCentroid;
-  static size_t ivfTrainingSampleMaxBytes;
-  // Clustering for the lists of RaBitQ overlays: EMEANS (EMeans.h), or
-  // LLOYD, the 10-iteration FAISS k-means IndexIVF trains with.  PQ overlays
-  // train their lists and codebooks with LLOYD.
+  // How RaBitQ overlays train their lists: EMEANS (EMeans.h), or LLOYD,
+  // IndexIVF's own 10-iteration k-means, kept as the benchmark control.  PQ
+  // overlays train their lists and codebooks with IndexIVF::train.  The seed
+  // feeds either trainer, for paired benchmark runs.
   enum class Trainer { LLOYD, EMEANS };
   static Trainer ivfTrainer;
-  // Passes e-means makes over the training sample.
-  static double ivfEMeansEpochs;
-  // Seed of the coarse quantizer's clustering (either trainer).
   static int32_t ivfTrainingSeed;
+  static size_t ivfTrainingSampleMaxBytes;
   static std::atomic<int64_t> ivfLastTrainingVectorsForTests;
-  // Cumulative wall time spent training (IVF lists, and PQ codebooks).
-  static std::atomic<int64_t> ivfTrainingMicrosForTests;
   // Add chunk input-byte target. Chunks also hold at least four row tasks
   // per arena compute slot, capped by available vectors.
   static size_t ivfAddChunkBytes;
@@ -101,12 +97,9 @@ public:
                                 int32_t dims, int32_t bits, faiss::MetricType metric);
 
   // An empty coarse quantizer whose batch searches split rows across TBB
-  // tasks, and its training on n rows of x (in the index's space): nlist
-  // centroids by trainer, spherical for inner product.
+  // tasks of the calling arena, as overlay builds train with.
   static std::unique_ptr<faiss::IndexFlat> newCoarseQuantizer(int32_t dims,
                                                               faiss::MetricType metric);
-  static void trainCoarseQuantizer(int64_t n, const float* x, int32_t nlist,
-                                   faiss::IndexFlat& quantizer, Trainer trainer);
 
   // Seed of the RaBitQ random rotation.  Fixed so every overlay of a given
   // dims shares one transform (deduplicated in RAM by internVectorRotation).

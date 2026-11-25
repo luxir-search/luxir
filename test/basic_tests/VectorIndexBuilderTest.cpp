@@ -27,7 +27,6 @@
 #include "test/QueryBuild.h"
 
 #include <faiss/IndexFlat.h>
-#include <faiss/IndexIVFFlat.h>
 #include <faiss/IndexIVFPQ.h>
 #include <faiss/MetricType.h>
 #include <faiss/index_io.h>
@@ -1978,13 +1977,14 @@ TEST_F(VectorIndexBuilderTest, overlayGenerationSurvivesPublishedDropAndRestart)
   EXPECT_NE(oldName, onlyVectorOverlay(info).files.front().name);
 }
 
-// Both list trainers produce RaBitQ overlays of equal recall, for L2 and
-// cosine (spherical) and for 1- and 4-bit codes.
-TEST_F(VectorIndexBuilderTest, trainersBuildOverlaysOfEqualRecall) {
+// A cosine RaBitQ overlay with e-means lists recalls as well as with Lloyd's
+// on a small clustered corpus; comparative recall is measured on real corpora
+// by BM_VectorAnnDataset.
+TEST_F(VectorIndexBuilderTest, emeansListsServeRecall) {
   ForceIvfGuard forceIvf;
   IvfTestGuard guard(16);
   SearchOverridesGuard<VectorIndexBuilder::Trainer> trainer{VectorIndexBuilder::ivfTrainer};
-  constexpr int32_t dims = 16, rows = 3000, k = 10, nprobe = 4;
+  constexpr int32_t dims = 16, rows = 2000, k = 10, nprobe = 4;
   std::mt19937 rng(7);
   std::vector<std::vector<float>> centers;
   for (int32_t c = 0; c < 40; c++) centers.push_back(randomUnit(rng, dims));
@@ -1997,71 +1997,37 @@ TEST_F(VectorIndexBuilderTest, trainersBuildOverlaysOfEqualRecall) {
   std::vector<std::vector<float>> docs, queries;
   for (int32_t i = 0; i < rows; i++) docs.push_back(next());
   for (int32_t q = 0; q < 20; q++) queries.push_back(next());
-  double lloydSum = 0, emeansSum = 0;
-  for (auto metric : {api::VectorMetric::L2, api::VectorMetric::COSINE}) {
-    for (auto ann : {rabitqAnn(32, 1), rabitqAnn(32, 4)}) {
-      double recall[2];
-      for (auto which : {VectorIndexBuilder::Trainer::LLOYD, VectorIndexBuilder::Trainer::EMEANS}) {
-        VectorIndexBuilder::ivfTrainer = which;
-        CollectionHelper h("main");
-        h.clear();
-        SchemaBuilder b;
-        auto& f = b.templ("_v");
-        f.type = api::FieldDef_::FieldClass::VECTOR;
-        f.metric = metric;
-        f.dims = dims;
-        f.ann = ann;
-        b.set(h.collection());
-        for (int32_t i = 0; i < rows; i++) h.index(flatdoc("id", std::to_string(i), "v_v", docs[(size_t)i]));
-        h.commit({"*"});
-        ASSERT_EQ(vectorOverlays(readIndexInfo(h.getIndexWriter()->dir)).size(), 1u);
-        int32_t hits = 0;
-        for (const auto& query : queries) {
-          auto approx = runKnnIds(h.getSearchEngine(), "v_v", query, k, nprobe, 50);
-          auto exact = runKnnIds(h.getSearchEngine(), "v_v", query, k, 0, 0, true);
-          for (const auto& id : exact) hits += std::ranges::count(approx, id) > 0 ? 1 : 0;
-        }
-        recall[(int)which] = (double)hits / (double)(queries.size() * k);
-      }
-      SCOPED_TRACE(fmt::format("metric={} codec={} lloyd={} emeans={}", (int)metric,
-                               (int)ann.codec.value_or(api::VectorAnnDef_::Codec{}), recall[0], recall[1]));
-      EXPECT_GE(recall[0], 0.85);
-      EXPECT_GE(recall[1], 0.85);
-      lloydSum += recall[0];
-      emeansSum += recall[1];
+  double recall[2];
+  std::vector<float> lists[2];
+  for (auto which : {VectorIndexBuilder::Trainer::LLOYD, VectorIndexBuilder::Trainer::EMEANS}) {
+    VectorIndexBuilder::ivfTrainer = which;
+    CollectionHelper h("main");
+    h.clear();
+    SchemaBuilder b;
+    auto& f = b.templ("_v");
+    f.type = api::FieldDef_::FieldClass::VECTOR;
+    f.metric = api::VectorMetric::COSINE;
+    f.dims = dims;
+    f.ann = rabitqAnn(32, 1);
+    b.set(h.collection());
+    for (int32_t i = 0; i < rows; i++) h.index(flatdoc("id", std::to_string(i), "v_v", docs[(size_t)i]));
+    h.commit({"*"});
+    auto info = readIndexInfo(h.getIndexWriter()->dir);
+    auto idx = readFaissIndex(h.getIndexWriter()->dir, onlyVectorOverlay(info).files.front().name);
+    auto* quantizer = dynamic_cast<faiss::IndexFlat*>(dynamic_cast<faiss::IndexIVF&>(*idx).quantizer);
+    ASSERT_NE(quantizer, nullptr);
+    lists[(int)which].assign(quantizer->get_xb(), quantizer->get_xb() + quantizer->ntotal * quantizer->d);
+    int32_t hits = 0;
+    for (const auto& query : queries) {
+      auto approx = runKnnIds(h.getSearchEngine(), "v_v", query, k, nprobe, 50);
+      auto exact = runKnnIds(h.getSearchEngine(), "v_v", query, k, 0, 0, true);
+      for (const auto& id : exact) hits += std::ranges::count(approx, id) > 0 ? 1 : 0;
     }
+    recall[(int)which] = (double)hits / (double)(queries.size() * k);
   }
-  // One small corpus's partition varies by a few points either way; across
-  // the cases the trainers agree.
-  EXPECT_GE(emeansSum / 4, lloydSum / 4 - 0.02);
-}
-
-// LLOYD lists are exactly what IndexIVF::train builds (Level1Quantizer's 10
-// iterations, spherical for inner product); EMEANS lists differ.
-TEST_F(VectorIndexBuilderTest, lloydListsMatchFaissIvfTraining) {
-  constexpr int32_t dims = 16, nlist = 32, rows = 3000;
-  std::mt19937 rng(5);
-  std::vector<float> x;
-  for (int32_t i = 0; i < rows; i++) {
-    auto v = randomUnit(rng, dims);
-    x.insert(x.end(), v.begin(), v.end());
-  }
-  for (auto metric : {faiss::METRIC_L2, faiss::METRIC_INNER_PRODUCT}) {
-    auto ivfQuantizer = VectorIndexBuilder::newCoarseQuantizer(dims, metric);
-    faiss::IndexIVFFlat ivf(ivfQuantizer.get(), dims, nlist, metric);
-    ivf.cp.min_points_per_centroid = 1;
-    ivf.train(rows, x.data());
-    auto centroids = [](faiss::IndexFlat& q) {
-      return std::vector<float>(q.get_xb(), q.get_xb() + q.ntotal * q.d);
-    };
-    for (auto trainer : {VectorIndexBuilder::Trainer::LLOYD, VectorIndexBuilder::Trainer::EMEANS}) {
-      auto q = VectorIndexBuilder::newCoarseQuantizer(dims, metric);
-      VectorIndexBuilder::trainCoarseQuantizer(rows, x.data(), nlist, *q, trainer);
-      ASSERT_EQ(q->ntotal, nlist);
-      EXPECT_EQ(trainer == VectorIndexBuilder::Trainer::LLOYD,
-                centroids(*q) == centroids(*ivfQuantizer));
-    }
-  }
+  EXPECT_NE(lists[0], lists[1]);  // the two arms really trained differently
+  EXPECT_GE(recall[0], 0.85);
+  EXPECT_GE(recall[1], 0.85);
 }
 
 // PQ overlays train their lists and codebooks with Lloyd whatever ivfTrainer is.

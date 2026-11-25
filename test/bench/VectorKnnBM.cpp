@@ -15,15 +15,18 @@
 #include <string_view>
 #include <vector>
 
+#include <faiss/Clustering.h>
 #include <faiss/IndexFlat.h>
 #include <sys/resource.h>
 
 #include "bench/luxir_bench.h"
+#include "luxir/index/EMeans.h"
 #include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/util/random.h"
+#include "luxir/util/VectorRotation.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -136,12 +139,12 @@ struct IvfBenchGuard {
 };
 
 // IVF training knobs for A/B runs from one binary: LUXIR_IVF_TRAINER (lloyd
-// or emeans), LUXIR_IVF_EPOCHS (e-means passes), LUXIR_IVF_POINTS (training
-// vectors per centroid) and LUXIR_IVF_SEED (clustering seed).
+// or emeans: the RaBitQ list trainer), LUXIR_IVF_POINTS (training vectors per
+// centroid) and LUXIR_IVF_SEED (clustering seed, for paired runs).
 struct IvfTrainingBenchGuard {
-  SearchOverridesGuard<VectorIndexBuilder::Trainer, double, int64_t, int32_t> saved{
-    VectorIndexBuilder::ivfTrainer, VectorIndexBuilder::ivfEMeansEpochs,
-    VectorIndexBuilder::ivfTrainingPointsPerCentroid, VectorIndexBuilder::ivfTrainingSeed};
+  SearchOverridesGuard<VectorIndexBuilder::Trainer, int64_t, int32_t> saved{
+    VectorIndexBuilder::ivfTrainer, VectorIndexBuilder::ivfTrainingPointsPerCentroid,
+    VectorIndexBuilder::ivfTrainingSeed};
 
   IvfTrainingBenchGuard() {
     if (const char* trainer = std::getenv("LUXIR_IVF_TRAINER"); trainer && *trainer) {
@@ -151,9 +154,6 @@ struct IvfTrainingBenchGuard {
       }
       VectorIndexBuilder::ivfTrainer = name == "lloyd"
           ? VectorIndexBuilder::Trainer::LLOYD : VectorIndexBuilder::Trainer::EMEANS;
-    }
-    if (const char* epochs = std::getenv("LUXIR_IVF_EPOCHS"); epochs && *epochs) {
-      VectorIndexBuilder::ivfEMeansEpochs = std::atof(epochs);
     }
     if (const char* points = std::getenv("LUXIR_IVF_POINTS"); points && *points) {
       VectorIndexBuilder::ivfTrainingPointsPerCentroid = std::atoll(points);
@@ -1341,7 +1341,6 @@ void BM_VectorAnnDataset(benchmark::State& state) {
   CollectionHelper helper("main");
   static int32_t builtCodec = -1;
   static double buildSecs = 0;
-  static double trainSecs = 0;
   static double overlayBytes = 0;
   static int32_t overlaySegments = 0;
   static std::vector<std::vector<std::string>> truth;
@@ -1360,11 +1359,9 @@ void BM_VectorAnnDataset(benchmark::State& state) {
     }
     // Production build policy and schema settings; only the aux commit is timed.
     IvfTrainingBenchGuard training;
-    int64_t trainMicros = VectorIndexBuilder::ivfTrainingMicrosForTests.load();
     auto start = std::chrono::steady_clock::now();
     helper.commit({"vec.bench_v"});
     buildSecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    trainSecs = (double)(VectorIndexBuilder::ivfTrainingMicrosForTests.load() - trainMicros) / 1e6;
     overlayBytes = 0;
     overlaySegments = 0;
     for (const auto& seg : helper.getIndexWriter()->stats(true).segmentStats) {
@@ -1459,7 +1456,6 @@ void BM_VectorAnnDataset(benchmark::State& state) {
   state.counters["unsupported_floors"] = (double)stats.unsupportedFloors.load();
   state.counters["unsupported_floor_shortfall"] = (double)stats.unsupportedFloorShortfall.load();
   state.counters["buildSecs"] = buildSecs;
-  state.counters["trainSecs"] = trainSecs;
   state.counters["bytesPerVec"] = overlayBytes / (double)ds->nBase;
   state.counters["overlaySegs"] = (double)overlaySegments;
   state.counters["nBase"] = (double)ds->nBase;
@@ -1476,51 +1472,66 @@ double processCpuSeconds() {
   return secs(usage.ru_utime) + secs(usage.ru_stime);
 }
 
-// IVF centroid training alone on LUXIR_VECTOR_DATASET (see BM_VectorAnnDataset):
-// the builder's strided sample of `points` rows per list (nlist from
-// LUXIR_VECTOR_NLIST or the sqrt(N) default), trained by `trainer` (0 Lloyd,
-// 1 e-means at epochs10 / 10 passes).  Reports wall and process CPU seconds (CPU time is
-// robust to other load on the machine) and, over every base row, the
-// clustering loss (mean squared L2 distance, or mean 1 - cosine) and the list
-// imbalance nlist * sum(n_j^2) / N^2: the mean size, relative to an even
-// split, of the list a row falls in.  Probes budget vectors, so oversized
-// lists crowd others out of a query's probe set.
+// RaBitQ list training alone on LUXIR_VECTOR_DATASET (see BM_VectorAnnDataset),
+// as the builder trains it: its strided sample of ivfTrainingPointsPerCentroid
+// rows per list (nlist from LUXIR_VECTOR_NLIST or the sqrt(N) default),
+// normalized for cosine and rotated, on the builder's row-partitioned
+// quantizer in the calling arena.  `trainer` 0 is IndexIVF's k-means
+// (Clustering with its parameters) at `niter` iterations; 1 is e-means with
+// removal-cost revival and 2 with mass revival.  `seed` pairs the arms.
+// Reports process CPU seconds (robust to other load on the machine) and, over
+// every base row, the clustering loss (mean squared L2 distance, or mean
+// 1 - cosine) and the list imbalance nlist * sum(n_j^2) / N^2: the mean size,
+// relative to an even split, of the list a row falls in.
 void BM_VectorIvfTraining(benchmark::State& state) {
   const VectorDataset* ds = VectorDataset::get();
   if (skipBenchIfDataMissing(state, ds != nullptr, "LUXIR_VECTOR_DATASET")) return;
-  SearchOverridesGuard saved(VectorIndexBuilder::ivfTrainer, VectorIndexBuilder::ivfEMeansEpochs);
-  VectorIndexBuilder::ivfTrainer = state.range(0) == 0 ? VectorIndexBuilder::Trainer::LLOYD
-                                                       : VectorIndexBuilder::Trainer::EMEANS;
-  VectorIndexBuilder::ivfEMeansEpochs = (double)state.range(1) / 10;
-  int64_t points = state.range(2);
+  int64_t trainer = state.range(0);
+  int32_t niter = (int32_t)state.range(1);
+  int32_t seed = (int32_t)state.range(2);
   const char* nlistEnv = std::getenv("LUXIR_VECTOR_NLIST");
   int32_t nlist = nlistEnv ? std::atoi(nlistEnv) : defaultIvfNList(ds->nBase);
   int32_t dims = ds->dims;
-  bool cosine = ds->metric == api::VectorMetric::COSINE;
   faiss::MetricType metric = ds->metric == api::VectorMetric::L2 ? faiss::METRIC_L2
                                                                   : faiss::METRIC_INNER_PRODUCT;
   static std::vector<float> base;  // the corpus in index space, shared across instances
   if (base.empty()) {
     base.assign(ds->data.begin(), ds->data.begin() + ds->nBase * dims);
-    if (cosine) faiss::fvec_renorm_L2((size_t)dims, (size_t)ds->nBase, base.data());
+    if (ds->metric == api::VectorMetric::COSINE) {
+      faiss::fvec_renorm_L2((size_t)dims, (size_t)ds->nBase, base.data());
+    }
+    VectorRotation rotation(VectorRotation::FHT_KAC, dims, VectorIndexBuilder::RABITQ_ROTATION_SEED);
+    rotation.applyBatch(ds->nBase, base.data(), base.data());
   }
-  int64_t ntrain = std::min<int64_t>(ds->nBase, points * nlist);
+  int64_t ntrain = std::min<int64_t>(ds->nBase,
+      VectorIndexBuilder::ivfTrainingPointsPerCentroid * nlist);
   std::vector<float> sample((size_t)ntrain * dims);
   for (int64_t i = 0; i < ntrain; i++) {
     std::copy_n(base.data() + (i * ds->nBase / ntrain) * dims, dims, sample.data() + i * dims);
   }
 
   auto quantizer = VectorIndexBuilder::newCoarseQuantizer(dims, metric);
-  double wall = 0, cpu = 0;
+  double cpu = 0;
+  EMeans::Result trained;
   for (auto _ : state) {
     auto wallStart = std::chrono::steady_clock::now();
     double cpuStart = processCpuSeconds();
-    VectorIndexBuilder::trainCoarseQuantizer(ntrain, sample.data(), nlist, *quantizer,
-                                             VectorIndexBuilder::ivfTrainer);
+    if (trainer == 0) {
+      faiss::ClusteringParameters cp;
+      cp.niter = niter;
+      cp.seed = seed;
+      cp.spherical = metric == faiss::METRIC_INNER_PRODUCT;
+      cp.min_points_per_centroid = 1;
+      quantizer->reset();
+      faiss::Clustering clus(dims, nlist, cp);
+      clus.train(ntrain, sample.data(), *quantizer);
+    } else {
+      EMeans::Params params{.seed = (uint64_t)seed, .spherical = metric == faiss::METRIC_INNER_PRODUCT,
+          .revival = trainer == 1 ? EMeans::Revival::REMOVAL_COST : EMeans::Revival::MASS};
+      trained = EMeans::train(ntrain, sample.data(), nlist, params, *quantizer);
+    }
     cpu += processCpuSeconds() - cpuStart;
-    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - wallStart).count();
-    wall += elapsed;
-    state.SetIterationTime(elapsed);
+    state.SetIterationTime(std::chrono::duration<double>(std::chrono::steady_clock::now() - wallStart).count());
   }
 
   std::vector<float> distances((size_t)ds->nBase);
@@ -1529,16 +1540,22 @@ void BM_VectorIvfTraining(benchmark::State& state) {
   double loss = 0;
   std::vector<double> sizes((size_t)nlist);
   for (int64_t i = 0; i < ds->nBase; i++) {
+    faiss::idx_t label = labels[(size_t)i];
+    if (label < 0 || label >= nlist) {
+      state.SkipWithError("search returned no list");
+      return;
+    }
     loss += metric == faiss::METRIC_L2 ? (double)distances[(size_t)i] : 1.0 - (double)distances[(size_t)i];
-    sizes[(size_t)labels[(size_t)i]] += 1;
+    sizes[(size_t)label] += 1;
   }
   double squares = 0;
   for (double size : sizes) squares += size * size;
-  double iterations = (double)state.iterations();
-  state.counters["wallSecs"] = wall / iterations;
-  state.counters["cpuSecs"] = cpu / iterations;
+  state.counters["cpuSecs"] = cpu / (double)state.iterations();
   state.counters["loss"] = loss / (double)ds->nBase;
   state.counters["imbalance"] = (double)nlist * squares / ((double)ds->nBase * (double)ds->nBase);
+  state.counters["splits"] = (double)trained.splits;
+  state.counters["handedOver"] = (double)trained.handedOver;
+  state.counters["reassigned"] = (double)trained.reassigned;
   state.counters["nlist"] = nlist;
   state.counters["ntrain"] = (double)ntrain;
   state.counters["dims"] = dims;
@@ -1563,13 +1580,16 @@ TUNING_BENCHMARK(BM_VectorAnnDataset)->ArgNames({"codec", "nprobe", "cand"})
       datasetSweep(b, PQ_D8);
     })->UseRealTime()->MinTime(2.0);
 
-// Lloyd (IndexIVF's 10 iterations) against e-means at 2, 3 and 5 passes over
-// the default sample, and 2 passes over the 2.5x larger sample that the
-// cheaper passes afford.
+// IndexIVF's k-means at its 10 iterations and at the equal-CPU 5 and 3,
+// against e-means (5 passes) with each revival rule, over three paired seeds.
 BENCHMARK(BM_VectorIvfTraining)->Name("Tuning/BM_VectorIvfTraining")
-    ->ArgNames({"trainer", "epochs10", "points"})
-    ->Args({0, 0, 100})->Args({1, 20, 100})->Args({1, 30, 100})->Args({1, 50, 100})
-    ->Args({1, 20, 250})->UseManualTime()->Iterations(1);
+    ->ArgNames({"trainer", "niter", "seed"})
+    ->Apply([](benchmark::Benchmark* b) {
+      for (int64_t seed : {1234, 7, 99}) {
+        for (int64_t niter : {10, 5, 3}) b->Args({0, niter, seed});
+        b->Args({1, 0, seed})->Args({2, 0, seed});
+      }
+    })->UseManualTime()->Iterations(1);
 
 // Plain BENCHMARK: manual time is incompatible with the UseRealTime() that
 // LUXIR_BENCHMARK appends.

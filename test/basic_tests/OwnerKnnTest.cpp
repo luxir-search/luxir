@@ -7,6 +7,7 @@
 #include "luxir/query/ProtobufQueryParser.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/server/JsonResponse.h"
+#include "luxir/index/VectorIndexBuilder.h"
 #include "test/CollectionHelper.h"
 #include "test/KnnTestUtils.h"
 #include "test/LocalReq.h"
@@ -177,6 +178,12 @@ TEST_F(OwnerKnnTest, exactMatchesDistinctOwnerModelAtEveryView) {
 TEST_F(OwnerKnnTest, approximateChannelsAndMixedReverseMapsUseOwnerUnits) {
   ForceIvfGuard force;
   IvfTestGuard ivf(8);
+  // The corpus has 17 distinct values, so many owners tie at the same score,
+  // and which tied owners fill a top k depends on how the rows fall into
+  // lists. These checks compare that choice with the exact path's; they hold
+  // with Lloyd's lists, not with every partition, so pin the trainer.
+  SearchOverridesGuard<VectorIndexBuilder::Trainer> trainer{VectorIndexBuilder::ivfTrainer};
+  VectorIndexBuilder::ivfTrainer = VectorIndexBuilder::Trainer::LLOYD;
   for (auto ann : {pqAnn(2, 2, 1), rabitqAnn(4), rabitqAnn(4, 4)}) for (int maps : {-1, 0, 1}) {
     helper.clear(); roots.clear(); items.clear(); parts.clear();
     generate(17, ann, maps); schema(true, ann);

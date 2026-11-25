@@ -436,73 +436,95 @@ searches supply explicit probe parameters or selected lists.
 
 The IVF lists of RaBitQ overlays are trained with e-means
 (`index/EMeans.h`; Bessa et al., "e-means: outperforming k-means (in one-tenth
-the epochs)", arXiv:2611.09501), ported from the FAISS reference in
-`contrib/e_means`. It is mini-batch k-means whose centroids are exponential
-moving averages of per-batch cluster sums and counts. The step follows a
-cosine schedule, and clusters whose mass falls below 0.1 of the mean are
-revived by splitting a donor drawn in proportion to mass. The closing
-centroids are the means of the last pass's assignments. The batch size and
-initial step come from the reference's fitted scaling laws, so there is
-nothing to tune per corpus. One pass costs about one Lloyd iteration, since
-both are dominated by assigning every sample row. The default is the
-reference's 5 passes (`ivfEMeansEpochs`), against the 10 Lloyd iterations
-`IndexIVF` training runs. Batch assignment uses the row-parallel coarse
-quantizer. Grouping rows by cluster makes the sums and EMA updates parallel
-across clusters without changing their order, so a seed gives the same
-centroids for a given thread count, as with Lloyd (the batch-distance
-kernels FAISS picks can vary with the row partition). Inner-product fields
-train spherically, as FAISS does: assignment uses unit centroid directions,
-and the closing centroids are unit.
+the epochs)", arXiv:2611.09501), a port of the FAISS reference `NumpyEmeans`
+at facebookresearch/faiss commit 6074b69e9 (2026-11-24), with its default
+recipe. It is mini-batch k-means whose centroids are exponential moving
+averages of per-batch cluster sums and counts, over 5 passes with a
+cosine-annealed step. The batch size and initial step come from the
+reference's fitted scaling laws, so there is nothing to tune per corpus. One
+pass costs about one Lloyd iteration, since both are dominated by assigning
+every sample row; the reference default of 5 passes compares with the 10
+Lloyd iterations `IndexIVF` training runs.
 
-PQ overlays keep FAISS k-means for their lists and codebooks, unchanged. With
-e-means lists, PQ recall on Cohere-1024 was 0.0013 to 0.0024 lower than
-Lloyd's at every probe level in the mean over three seeds (nprobe 32: 0.9589
-against 0.9565). That is within Lloyd's seed-to-seed spread, driven mostly by
-one strong Lloyd seed, but larger than the RaBitQ gap on the same corpus. Training the codebooks with
-e-means as well changed neither PQ recall nor training time measurably: each
-codebook is 256 entries over at most 65,536 short residual slices, a small
-part of a PQ build.
+Every five batches, revival moves the centroids that are cheap to remove:
+those whose removal cost, an EMA of (second-nearest minus nearest) distance
+over their rows, is zero or below 0.3 of the median. Each splits a donor with
+the longest running long axis (Oja's rule), at the Gaussian half-means along
+that axis. When a centroid moves during the last pass, the rows it held go to
+their second-nearest centroid, or are assigned again if that moved too; a
+donor's earlier rows go to the nearer of its two copies; and the closing
+centroids of everything involved are rebuilt as the means of the rows that
+end with them. Inner-product fields train spherically, as `IndexIVF` does,
+against unit centroid directions, normalized in double after prescaling by
+the largest element so that tiny or all-zero rows stay finite.
 
-`Tuning/BM_VectorIvfTraining` trains the lists alone on a corpus sample
-(`LUXIR_VECTOR_DATASET`). It reports process CPU time, which is robust to
-other load, and the loss and the list imbalance `nlist * sum(n_j^2) / N^2`
-over every corpus row. With the default 100 sample rows per list, one run
-each:
+Batch assignment uses the row-parallel coarse quantizer that Lloyd uses.
+Batch sums, revival terms and EMA updates are grouped by cluster and run in
+parallel across clusters in a fixed order, so a seed gives the same
+centroids for a given thread count, as with Lloyd. The trainer's workspace
+(`EMeans::workspaceBytes`) is charged to the index RAM budget with the
+sample. PQ overlays train their lists and codebooks with `IndexIVF::train`,
+unchanged.
 
-| Corpus | Trainer | CPU s | Loss | Imbalance |
+`Tuning/BM_VectorIvfTraining` trains the lists as the builder does (the
+builder's sample, normalized for cosine and rotated, on its quantizer) and
+reports process CPU time, which other load on the machine does not inflate,
+and the loss and list imbalance `nlist * sum(n_j^2) / N^2` over every corpus
+row. Means over three paired seeds, with the loss relative to Lloyd at 10
+iterations:
+
+| Corpus | Trainer | CPU s | Loss vs Lloyd-10 | Imbalance |
 |---|---|---:|---:|---:|
-| Deep 2M, 96 d, L2 (1414 lists) | Lloyd, 10 iterations | 9.5 | 0.4640 | 1.180 |
-| | e-means, 5 passes | 3.7 | 0.4603 | 1.140 |
-| Cohere 1M, 1024 d, cosine (1000 lists) | Lloyd | 28.9 | 0.3430 | 1.185 |
-| | e-means | 16.1 | 0.3403 | 1.239 |
-| DBpedia 1M, 1536 d, cosine (999 lists) | Lloyd | 50.4 | 0.4456 | 1.244 |
-| | e-means | 26.7 | 0.4412 | 1.291 |
+| Deep 2M, 96 d, L2 | Lloyd, 10 iterations (main) | 8.5 |  | 1.187 |
+|  | Lloyd, 5 | 4.3 | +0.62% | 1.214 |
+|  | Lloyd, 3 | 2.6 | +1.47% | 1.251 |
+|  | e-means, cost revival | 4.5 | -1.03% | 1.137 |
+|  | e-means, mass revival | 4.2 | -0.83% | 1.151 |
+| Cohere 1M, 1024 d, cosine | Lloyd, 10 iterations (main) | 28.3 |  | 1.192 |
+|  | Lloyd, 5 | 13.7 | +0.62% | 1.209 |
+|  | Lloyd, 3 | 9.7 | +1.45% | 1.231 |
+|  | e-means, cost revival | 17.1 | -0.83% | 1.143 |
+|  | e-means, mass revival | 15.1 | -0.81% | 1.264 |
+| DBpedia 1M, 1536 d, cosine | Lloyd, 10 iterations (main) | 44.4 |  | 1.239 |
+|  | Lloyd, 5 | 21.9 | +0.87% | 1.254 |
+|  | Lloyd, 3 | 12.9 | +2.06% | 1.276 |
+|  | e-means, cost revival | 27.0 | -0.70% | 1.195 |
+|  | e-means, mass revival | 25.4 | -0.72% | 1.396 |
 
-e-means takes 1.8 to 2.6x less CPU for a lower loss. On the text embeddings
-its lists are less even than Lloyd's. The probe budget counts vectors, so
-oversized lists could crowd others out of a query's probe set, but recall at
-equal scan work holds (below).
+The reference's earlier default, mass-based revival, reaches the same loss
+but leaves the lists of text embeddings much less even than Lloyd's. Lloyd at
+5 iterations costs about what e-means does; its loss is worse than at 10, but
+its recall (below) is not.
 
 End to end, `BM_VectorAnnDataset` builds one segment with 1-bit RaBitQ and
-measures recall@10 against the exact path on 1000 held-out corpus rows.
-Recall is the mean over training seeds; both trainers score the same number
-of codes per query at each probe level, within 0.3%. Times are median wall
-seconds on a 28-thread machine that other jobs were loading. The Lloyd and
-e-means runs saw different load, so the time columns do not compare; the
-CPU table above does:
+measures recall@10 against the exact path on 1000 held-out corpus rows. Each
+cell is the mean over three seeds of the paired difference from Lloyd at 10
+iterations with the same seed; all arms score the same number of codes per
+query at each probe level, within 0.3%:
 
-| Corpus | Trainer | Default | nprobe 32 | 64 | 128 | Train s | Build s |
-|---|---|---:|---:|---:|---:|---:|---:|
-| Deep 2M (3 seeds) | Lloyd | 0.9816 | 0.9754 | 0.9931 | 0.9985 | 0.87 | 2.54 |
-| | e-means | 0.9830 | 0.9780 | 0.9939 | 0.9987 | 0.71 | 1.65 |
-| Cohere 1M (3 seeds) | Lloyd | 0.9863 | 0.9590 | 0.9799 | 0.9912 | 2.61 | 7.96 |
-| | e-means | 0.9859 | 0.9574 | 0.9792 | 0.9905 | 1.65 | 6.07 |
-| DBpedia 500k (2 seeds) | Lloyd | 0.9767 | 0.9348 | 0.9667 | 0.9855 | 1.94 | 4.19 |
-| | e-means | 0.9786 | 0.9359 | 0.9674 | 0.9871 | 1.13 | 3.42 |
+| Corpus | Trainer | Default | nprobe 32 | 64 | 128 |
+|---|---|---:|---:|---:|---:|
+| Deep 2M | Lloyd-10 recall | 0.9816 | 0.9754 | 0.9931 | 0.9985 |
+| | Lloyd, 5 | -0.0008 [-0.0011, -0.0002] | -0.0006 [-0.0014, -0.0001] | +0.0002 [-0.0007, +0.0010] | +0.0000 [-0.0004, +0.0007] |
+| | e-means, cost revival | +0.0002 [-0.0003, +0.0009] | +0.0018 [-0.0000, +0.0036] | +0.0003 [-0.0002, +0.0011] | +0.0001 [+0.0000, +0.0001] |
+| | e-means, mass revival | +0.0023 [+0.0020, +0.0030] | +0.0033 [+0.0024, +0.0046] | +0.0002 [-0.0004, +0.0011] | +0.0000 [-0.0005, +0.0005] |
+| Cohere 1M | Lloyd-10 recall | 0.9863 | 0.9590 | 0.9799 | 0.9912 |
+| | Lloyd, 5 | -0.0005 [-0.0026, +0.0020] | -0.0006 [-0.0029, +0.0038] | -0.0002 [-0.0027, +0.0026] | -0.0002 [-0.0011, +0.0004] |
+| | e-means, cost revival | -0.0016 [-0.0029, -0.0007] | -0.0024 [-0.0064, +0.0020] | -0.0023 [-0.0038, +0.0000] | -0.0011 [-0.0018, -0.0007] |
+| | e-means, mass revival | -0.0014 [-0.0024, +0.0002] | -0.0027 [-0.0060, +0.0017] | -0.0022 [-0.0042, +0.0016] | -0.0011 [-0.0017, -0.0007] |
+| DBpedia 500k | Lloyd-10 recall | 0.9770 | 0.9344 | 0.9662 | 0.9857 |
+| | Lloyd, 5 | +0.0001 [+0.0000, +0.0004] | -0.0003 [-0.0018, +0.0011] | -0.0002 [-0.0014, +0.0006] | -0.0003 [-0.0006, +0.0001] |
+| | e-means, cost revival | +0.0008 [+0.0002, +0.0013] | -0.0004 [-0.0011, +0.0009] | -0.0012 [-0.0029, +0.0006] | -0.0000 [-0.0015, +0.0011] |
+| | e-means, mass revival | +0.0001 [-0.0014, +0.0017] | -0.0004 [-0.0014, +0.0011] | -0.0017 [-0.0030, -0.0009] | -0.0003 [-0.0009, +0.0010] |
 
-e-means is ahead on Deep and DBpedia at every level and behind on Cohere by
-at most 0.0016. Lloyd's recall alone moves by up to 0.0063 between seeds
-(Cohere, nprobe 32).
+Brackets give the range over the seeds. Lloyd's recall alone moves by up to
+0.0063 between seeds (Cohere, nprobe 32). In the mean every arm is within 0.0035 of
+Lloyd at 10 iterations, and so is Lloyd at 5: the lower loss and more even
+lists of e-means do not show up as recall on these corpora. It is ahead on
+Deep, behind on Cohere by up to 0.0024 in the mean, and level on DBpedia.
+Per pass, e-means keeps fewer cores busy than Lloyd (about 9 against 11 at
+1024 and 1536 dimensions, 4.5 at 96), because each mini-batch is a few short
+parallel steps.
 
 ### Build parallelism
 
