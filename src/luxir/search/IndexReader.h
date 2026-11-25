@@ -88,6 +88,15 @@ public:
     return *view;
   }
 
+  // The live vector count of `field`'s rank view once built, or -1.
+  int64_t builtRankLiveVectors(std::string_view field) const {
+    std::lock_guard lock(rankLiveMutex);
+    for (const auto& [name, view] : rankLiveViews) {
+      if (name == field) return view->liveVectors;
+    }
+    return -1;
+  }
+
   static size_t rankLiveBytes(const std::string& name, const RankLiveBitmap& view) {
     return sizeof(RankLiveBitmap) + name.capacity()
         + (view.backing ? sizeof(std::vector<uint8_t>) + view.backing->capacity() : 0);

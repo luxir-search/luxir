@@ -1177,7 +1177,7 @@ public:
               DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
               eligible = countEligible(vr, domain, seg.liveDocs(), seg.maxDoc());
               segLiveVectorCounts[i] = eligible.unfiltered && !vr.multiValued()
-                  ? eligible.eligibleVectors : liveVectorUpperBound(seg, vr);
+                  ? eligible.eligibleVectors : liveVectorUpperBound(seg, vr, query.getField());
               input.domainSize = domain ? domain->card() : seg.maxDoc();
               input.domain = domain != nullptr;
               input.arrayDomain = domain && domain->type == DocSet::ARRAY;
@@ -3341,8 +3341,12 @@ private:
   /// their scan still checks the live domain. Exact without deletes and for
   /// dense single-valued columns; sparse and multi-valued counts may be high.
   static int64_t liveVectorUpperBound(IndexReader::Segment& segment,
-                                      VectorReader& vr) {
+                                      VectorReader& vr, std::string_view field) {
     if (!segment.hasDeletes()) return vr.numVectors();
+    // An earlier IVF search's rank view is exact, so planning agrees with execution.
+    if (auto* live = segment.liveDocs()) {
+      if (int64_t exact = live->builtRankLiveVectors(field); exact >= 0) return exact;
+    }
     if (!vr.multiValued()) {
       // Each live doc holds at most one vector.
       return std::min<int64_t>(vr.numVectors(), segment.numLive());
