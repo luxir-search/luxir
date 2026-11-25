@@ -1654,6 +1654,22 @@ TEST_F(KnnBooleanDomainTest, consumerParentKeepsInnerPostFilter) {
   expect(Shape::CONSUMER_FILTER_FILTER_CONSUMER, {});
 }
 
+TEST_F(KnnBooleanDomainTest, cachedProhibitedConsumerFoldsIntoFilteredDomain) {
+  // The fixture admits on first sight, so the excluded kNN is a reader-stable
+  // cache build that the fold then reads inside a filtered (non-canonical) domain.
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->topDocs("q").countLimit().fields({"id"});
+  auto& mr = cur.mr();
+  auto range = qb::range(mr, "rank_i", qb::valI64(mr, 1), nullptr, nullptr, nullptr);
+  cur.rawQuery() = qb::boolean(mr, {qb::knn(mr, "body_v", {0, 0}, 2, 0, true), range}, {},
+      {qb::knn(mr, "body_v", {1, 0}, 1, 0, true)});
+  req->execute();
+  ASSERT_OK(req);
+  auto ids = resultIds(*req);
+  std::sort(ids.begin(), ids.end());
+  EXPECT_EQ((std::vector<std::string>{"2", "3"}), ids);
+}
+
 TEST_F(KnnBooleanDomainTest, negativeMergeKeepsOptionalConsumerOptional) {
   expect(Shape::FILTER_NEGATIVE_OPTIONAL_CONSUMER, {"1", "2", "3"});
   auto result = run(Shape::FILTER_NEGATIVE_OPTIONAL_CONSUMER);
