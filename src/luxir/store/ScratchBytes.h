@@ -28,7 +28,7 @@ class ScratchBytes {
   std::vector<char> ram;
   std::vector<char> buffer;  // pending file writes
   int fd = -1;
-  uint64_t size_ = 0;
+  uint64_t total = 0;
   char* mapped = nullptr;
   bool finished = false;
 
@@ -72,11 +72,11 @@ public:
   ScratchBytes(const ScratchBytes&) = delete;
   ScratchBytes& operator=(const ScratchBytes&) = delete;
   ~ScratchBytes() {
-    if (mapped != nullptr) ::munmap(mapped, size_);
+    if (mapped != nullptr) ::munmap(mapped, total);
     if (fd >= 0) ::close(fd);
   }
 
-  uint64_t size() const { return size_; }
+  uint64_t size() const { return total; }
   // RAM held: the in-RAM bytes' capacity, or the write buffer once spilled.
   // At most max(ramLimit, WRITE_BUFFER_BYTES) when dir is set; unbounded
   // with an empty dir, so a caller charging RAM tracks it.
@@ -85,7 +85,7 @@ public:
 
   uint64_t append(std::string_view bytes) {
     assert(!finished);
-    uint64_t offset = size_;
+    uint64_t offset = total;
     if (fd < 0 && (dir.empty() || ram.size() + bytes.size() <= ramLimit)) {
       // Geometric growth, capped at the limit when the bytes can spill, so
       // the RAM held stays within ramLimit (see ramBytes()).
@@ -109,22 +109,22 @@ public:
         buffer.insert(buffer.end(), bytes.begin(), bytes.end());
       }
     }
-    size_ += bytes.size();
+    total += bytes.size();
     return offset;
   }
 
   void finish() {
     finished = true;
-    if (fd < 0 || size_ == 0) return;
+    if (fd < 0 || total == 0) return;
     flush();
     std::vector<char>().swap(buffer);
-    void* map = ::mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd, 0);
+    void* map = ::mmap(nullptr, total, PROT_READ, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) fail("map");
     mapped = (char*)map;
   }
 
   std::string_view view(uint64_t offset, size_t length) const {
-    assert(finished && offset + length <= size_);
+    assert(finished && offset + length <= total);
     return {(fd >= 0 ? mapped : ram.data()) + offset, length};
   }
 };

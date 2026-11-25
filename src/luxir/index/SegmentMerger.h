@@ -1270,13 +1270,38 @@ private:
     assert(valued == missing);
     std::reverse(entries.begin() + (ptrdiff_t)missing, entries.end());
 
-    // Ties keep concatenation order. (source, local) is unique, so an
-    // unstable sort on the full triple needs no merge buffer.
+    // Ties keep concatenation order. (source, local) is unique, so the
+    // comparison is a total order. Sources are usually sorted runs already:
+    // when the keyed entries form one ascending run nothing moves, and a few
+    // runs are merged pairwise instead of sorted from scratch.
     auto keyed = std::span<SortKeyEntry>(entries).first(valued);
-    std::sort(keyed.begin(), keyed.end(), [](const SortKeyEntry& a, const SortKeyEntry& b) {
+    auto less = [](const SortKeyEntry& a, const SortKeyEntry& b) {
       if (a.key != b.key) return a.key < b.key;
       return a.source != b.source ? a.source < b.source : a.local < b.local;
-    });
+    };
+    std::vector<size_t> bounds{0};
+    for (size_t i = 1; i < valued; i++) {
+      if (less(keyed[i], keyed[i - 1])) bounds.push_back(i);
+    }
+    constexpr size_t MAX_MERGE_RUNS = 64;
+    if (bounds.size() > MAX_MERGE_RUNS) {
+      std::sort(keyed.begin(), keyed.end(), less);
+    } else if (bounds.size() > 1) {
+      bounds.push_back(valued);
+      while (bounds.size() > 2) {
+        std::vector<size_t> next{0};
+        for (size_t r = 0; r + 1 < bounds.size(); r += 2) {
+          if (r + 2 < bounds.size()) {
+            std::inplace_merge(keyed.begin() + (ptrdiff_t)bounds[r], keyed.begin() + (ptrdiff_t)bounds[r + 1],
+                               keyed.begin() + (ptrdiff_t)bounds[r + 2], less);
+            next.push_back(bounds[r + 2]);
+          } else {
+            next.push_back(bounds[r + 1]);
+          }
+        }
+        bounds = std::move(next);
+      }
+    }
     std::vector<uint64_t> order;
     order.reserve((size_t)totalLive);
     for (const auto& entry : entries) {

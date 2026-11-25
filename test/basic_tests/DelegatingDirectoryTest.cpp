@@ -245,3 +245,34 @@ TEST(DelegatingDirectoryTest, scratchPathAndScratchBytes) {
   }
   std::filesystem::remove_all(path);
 }
+
+// Spill edges: the RAM to file transition mid-append, a single append at or
+// over the write buffer, an empty spill, and an unusable directory.
+TEST(ScratchBytesTest, spillTransitionsAndEdges) {
+  std::string path = (std::filesystem::temp_directory_path() / "luxir_scratch_XXXXXX").string();
+  ASSERT_NE(nullptr, ::mkdtemp(path.data()));
+  {
+    ScratchBytes scratch(path, 10);
+    std::string small(8, 's'), big(ScratchBytes::WRITE_BUFFER_BYTES, 'b'), tail(5, 't');
+    EXPECT_EQ(0u, scratch.append(small));
+    EXPECT_FALSE(scratch.spilled());
+    EXPECT_EQ(8u, scratch.append(std::string(5, 'x'))); // crosses the limit: RAM moves to the file
+    EXPECT_TRUE(scratch.spilled());
+    uint64_t bigOffset = scratch.append(big);
+    uint64_t tailOffset = scratch.append(tail);
+    scratch.finish();
+    EXPECT_EQ(small, scratch.view(0, 8));
+    EXPECT_EQ(big, scratch.view(bigOffset, big.size()));
+    EXPECT_EQ(tail, scratch.view(tailOffset, tail.size()));
+  }
+  {
+    ScratchBytes empty(path, 0);
+    empty.append("");
+    empty.finish();
+    EXPECT_EQ(0u, empty.size());
+    EXPECT_EQ("", empty.view(0, 0));
+  }
+  std::filesystem::remove_all(path);
+  ScratchBytes missing(path + "/absent", 0);
+  EXPECT_ANY_THROW(missing.append("x"));
+}

@@ -3,6 +3,7 @@
 
 #include "Schema.h"
 #include "luxir/reader/Space.h"
+#include "luxir/util/log.h"
 #include <algorithm>
 #include <memory_resource>
 #include "luxir/api/build.h"
@@ -1200,6 +1201,8 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
     if ((type != FieldType::INT && type != FieldType::DATE) || !(*ft)->hasColumn()) {
       throw SchemaError("index_sort field must be an int or date field with a column: " + field);
     }
+    bool nested = std::ranges::any_of(schema->fieldTypeMap, [](const auto& e) { return e.second->type() == FieldType::NESTED; });
+    if (nested) LOG_INFO("index_sort '{}' accepted on a schema with nested fields: merges of segments with nested docs keep arrival order", field);
   }
 
   // Stored-fields resources share the field registry (a segment registers
