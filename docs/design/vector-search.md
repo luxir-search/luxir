@@ -706,7 +706,9 @@ uneven list sizes and avoids applying equal work to every segment. For an IVF se
 the live count is exact: it rides along with the segment's cached
 rank-liveness bitmap, which is rebuilt per delete generation in time
 proportional to the deleted docs (for a dense single-valued field the bitmap
-simply borrows the liveDocs bits). Filtered flat-scanned segments with deletions use a
+simply borrows the liveDocs bits). Per-list live counts are query-independent
+too: the overlay caches them per delete generation, filled by the first query
+to allocate each list. Filtered flat-scanned segments with deletions use a
 cheap upper bound for their live count instead. It contributes only to the whole-index reference breadth; the IVF
 allocation denominator uses exact live counts.
 
@@ -743,7 +745,9 @@ PQ scores, RaBitQ one-bit and extra-bit scores, list setups, depth revisits,
 flat scores and domain visits. Terminal scoring adds its column reads after
 each read-stage barrier. These count scoring work, not physical page IO;
 allocator liveness probes are counted separately and priced as rank-bitmap
-work, including the next-list lookahead under deletes.
+work, including the next-list lookahead under deletes. The planner still
+prices those probes on every query, although only a generation's first query
+pays them; that term needs recalibration.
 
 Probed lists are always scanned in full. Entries within an IVF list are stored
 in insertion order, not relevance order, so a partial list scan would drop

@@ -1370,6 +1370,7 @@ public:
             .liveVectorCount = segLiveVectorCounts[i],
             .ivfEngine = std::make_unique<SegmentIvfScanner<Groups, Owned>>(
                 *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
+                rankLivePerSeg[i] ? vaux->listLiveCounts(rankLivePerSeg[i]) : nullptr,
                 metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
                 vaux->getLists(), vaux->getAmplitudes(), interval ? &intervals : nullptr),
           });
@@ -2067,6 +2068,8 @@ public:
       // always reads it; RoundSelector hands it to FAISS as the eligibility
       // bitmap when the domain is exactly liveDocs (unfiltered query).
       std::shared_ptr<const RankLiveBitmap> rankLive;
+      // The overlay's per-list live counts for rankLive's generation.
+      std::shared_ptr<std::atomic<int32_t>[]> listLive;
       // The query domain per the live-filtered contract; domainIsLive marks
       // the unfiltered case (domain == the liveDocs docset) where rank-space
       // bitmaps can stand in for the resolve-based check.
@@ -2232,17 +2235,20 @@ public:
     public:
       SegmentIvfScanner(faiss::IndexIVF& ivf, int32_t segOrd,
                         IndexReader::Segment& seg, const Binding<Owned>& v2d, DocSet* domain,
-                        std::shared_ptr<const RankLiveBitmap> rankLive, int32_t metric,
+                        std::shared_ptr<const RankLiveBitmap> rankLive,
+                        std::shared_ptr<std::atomic<int32_t>[]> listLive, int32_t metric,
                         const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
                         const MmapInvertedLists& lists, RaBitQAmplitudes amplitudes,
                         KnnIntervalCollector<Groups>* intervals)
           : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
             lists(lists), segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
+            listLive(std::move(listLive)),
             domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
                                         && domain == &liveDocs->docset()),
             metric(metric), preparedQuery(preparedQuery) {
         assert(preparedQuery.query != nullptr);
         assert((liveDocs != nullptr) == (this->rankLive != nullptr));
+        assert((liveDocs != nullptr) == (this->listLive != nullptr));
         assert(ivf.invlists == &lists);
       }
 
@@ -2268,17 +2274,21 @@ public:
       /// (full selection always sums to ~N).  Under deletes this reads the
       /// cached rank-space liveness bitmap per id (no rank -> doc resolve);
       /// liveness only (not the query domain), matching the live-N
-      /// denominator.
+      /// denominator. The count is query-independent, so the first query of
+      /// a deletes generation to allocate a list publishes it for the rest.
       int64_t liveListSize(faiss::idx_t listId, VectorSearchWork& work) const {
         if (listId < 0 || (size_t)listId >= ivf.nlist) return 0;
         auto listIds = lists.ids32((size_t)listId);
         if (listIds.empty()) return 0;
         if (liveDocs == nullptr) return (int64_t)listIds.size();
+        auto& cached = listLive[(size_t)listId];
+        if (int32_t count = cached.load(std::memory_order_relaxed); count >= 0) return count;
 
         work.allocatorEntries += (int64_t)listIds.size();
         const uint8_t* bits = rankLive->bits;
         int64_t liveSize = 0;
         for (uint32_t r : listIds) liveSize += (bits[r >> 3] >> (r & 7)) & 1;
+        cached.store((int32_t)liveSize, std::memory_order_relaxed);
         return liveSize;
       }
 

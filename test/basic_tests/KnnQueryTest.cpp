@@ -5555,7 +5555,6 @@ TEST_F(KnnQueryTest, completionPreviewPreservesAllocationAndPins) {
   for (int nprobe : {0, 1}) {
     std::vector<std::string> expected;
     std::vector<RecordedVectorRound> baseline;
-    int64_t allocatorEntries = 0;
     for (auto mode : {KnnQuery::Completion::OFF, nprobe ? KnnQuery::Completion::FORCE : KnnQuery::Completion::AUTO}) {
       KnnQuery::tuning.completion = mode;
       KnnQuery::Stats stats;
@@ -5570,12 +5569,14 @@ TEST_F(KnnQueryTest, completionPreviewPreservesAllocationAndPins) {
       ASSERT_OK(req);
       EXPECT_EQ(0, stats.switches.load());
       if (mode == KnnQuery::Completion::OFF) {
-        expected = resultIds(*req); baseline = rounds; allocatorEntries = stats.work.allocatorEntries;
-        if (!nprobe) { EXPECT_GT(rounds.size(), 1u); }
+        expected = resultIds(*req); baseline = rounds;
+        // Live list sizes are cached per deletes generation: only the first
+        // query of the generation probes list ids.
+        if (!nprobe) { EXPECT_GT(rounds.size(), 1u); EXPECT_GT(stats.work.allocatorEntries, 0); }
       } else {
         EXPECT_EQ(expected, resultIds(*req));
         ASSERT_EQ(baseline.size(), rounds.size());
-        EXPECT_EQ(allocatorEntries, stats.work.allocatorEntries);
+        EXPECT_EQ(0, stats.work.allocatorEntries);
         for (size_t r = 0; r < rounds.size(); r++) {
           EXPECT_EQ(baseline[r].kind, rounds[r].kind);
           EXPECT_EQ(baseline[r].target, rounds[r].target);
