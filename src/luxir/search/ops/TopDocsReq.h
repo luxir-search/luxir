@@ -58,6 +58,9 @@ std::span<Query::Weight*> buildFilterWeights(
     std::span<ParsedFilter> filters, Query::Context& qcontext,
     int32_t requestFlags);
 
+void declareFilterReads(ReadDeclarer& reads, std::span<ParsedFilter> filters,
+                        Query::PlanningContext& planning, int32_t requestFlags);
+
 enum class TopDocsPlacement : uint8_t {
   ROOT_OP,
   NESTED_OP,
@@ -125,6 +128,11 @@ private:
 
   // Select and pin resident sources without building a context or weights.
   void selectSources();
+  bool buildsFilterWeights() const;
+  bool hasOrdinaryExactDomain() const;
+  bool buildsSeparateExactDomain() const;
+  bool mayRerouteMainWeight() const;
+  bool mayComposeExactCountTopK() const;
 
 public:
   // Parsed inputs shared by planning and execution.
@@ -194,6 +202,8 @@ public:
              std::optional<SortPlan>&& headSort, Query::ScoreProfile scoreProfile,
              bool requestNeedsScores, Preparation preparation);
 
+  // Project the possible root modes after source selection.
+  void declareReads(ReadDeclarer& reads) const;
   // Runs once after construction to build the contexts, weights, filter uses and execution routes.
   void materialize() override;
 

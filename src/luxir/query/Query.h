@@ -50,6 +50,7 @@ namespace luxir {
 
 class CatalogSummaryView;
 class QueryPruning;
+class ReadDeclarer;
 
 class FanoutScope;
 class DocSet;
@@ -404,6 +405,19 @@ public:
   /// expensive exact-fill scorers expose the window contract only to
   /// exclusion consumers, without changing positive-side execution.
   static constexpr int32_t EXCLUSION_WINDOW_FILL = 1 << 2;
+
+  static int32_t membershipWeightFlags(int32_t flags) {
+    return flags & ~(NEED_SCORES | ALLOW_PRUNING);
+  }
+
+  static int32_t rankingWeightFlags(int32_t flags) {
+    return flags | NEED_SCORES | ALLOW_PRUNING;
+  }
+
+  static int32_t exhaustiveWeightFlags(int32_t flags) {
+    return flags & ~ALLOW_PRUNING;
+  }
+
 
   // Query-tree score semantics, derived before Weight creation. This is
   // intentionally separate from Weight::IS_CONSTANT_SCORING: the latter is
@@ -777,6 +791,27 @@ public:
   /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.
   virtual Query::Weight* createWeight(Query::Context& context, int32_t flags,
                                       float multiplier = 1.0f) = 0;
+
+  // Cover exact-term lookups and their products for this child weight mode.
+  // The default leaves the subtree on demand. Declaration may normalize the
+  // logical tree but never opens dictionaries or registers filter uses.
+  virtual void declareReads(ReadDeclarer& reads, PlanningContext& planning,
+                            int32_t flags, float multiplier = 1.0f) const;
+
+  // Dispatch child weights through the verification scope in test builds.
+  Weight* buildWeight(Context& context, int32_t flags, float multiplier = 1.0f) {
+#ifndef NDEBUG
+    if (verifyReadDeclarationsForTests) return buildCheckedWeight(context, flags, multiplier);
+#endif
+    return createWeight(context, flags, multiplier);
+  }
+
+  static inline bool verifyReadDeclarationsForTests = false;
+
+private:
+  Weight* buildCheckedWeight(Context& context, int32_t flags, float multiplier);
+
+public:
 
   static float checkedBoostProduct(float inherited, float local) {
     float product = inherited * local;
@@ -1643,24 +1678,38 @@ public:
 
     CachedFieldInfo* getCachedFieldInfo(std::string_view field) {
       assertTermPlanning();
+#ifndef NDEBUG
+      if (verifyReadDeclarationsForTests) checkRead(field, std::nullopt);
+#endif
       return termFacts.getCachedFieldInfo(field);
     }
 
     CachedTermInfo* getCachedTerminfo(CachedFieldInfo& field, std::string_view term) {
       assertTermPlanning();
+#ifndef NDEBUG
+      if (verifyReadDeclarationsForTests) checkRead(field.segInfos.name(), term);
+#endif
       return termFacts.getCachedTerminfo(field, term);
     }
 
     bool lookupTermStats(CachedFieldInfo& field, std::string_view term, Similarity::TermStats& result) {
       assertTermPlanning();
+#ifndef NDEBUG
+      if (verifyReadDeclarationsForTests) checkRead(field.segInfos.name(), term);
+#endif
       return termFacts.lookupTermStats(field, term, result);
     }
 
     bool lookupTermStats(std::string_view field, std::string_view term, Similarity::TermStats& result) {
       assertTermPlanning();
-      return termFacts.lookupTermStats(field, term, result);
+      auto* cached = getCachedFieldInfo(field);
+      if (cached != nullptr) return lookupTermStats(*cached, term, result);
+      result = {};
+      return false;
     }
 
+  private:
+    void checkRead(std::string_view field, std::optional<std::string_view> term);
   };
 
   // A weight is created by a query for execution over a specific index

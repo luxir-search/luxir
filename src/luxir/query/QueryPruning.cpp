@@ -10,6 +10,7 @@
 #include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/CatalogSummaryView.h"
 #include "luxir/query/Query.h"
+#include "luxir/query/ReadDeclarer.h"
 
 namespace luxir {
 
@@ -20,8 +21,11 @@ Query::Weight* Query::Context::createRootWeight(Query& query, int32_t flags, flo
   bool firstWeight = !std::exchange(membership.weightAttempted, true);
   bool mayPrepare = query.mayRequirePreparation();
   bool emptyWeight = !mayPrepare && mask.none();
+#ifndef NDEBUG
+  ReadVerification::RootScope verify(query, planning, flags, multiplier, emptyWeight);
+#endif
   auto* weight = emptyWeight ? pool.make<MatchNoDocsQuery::Weight>(*this, query, flags)
-                             : query.createWeight(*this, flags, multiplier);
+                             : query.buildWeight(*this, flags, multiplier);
   assert(!weight->needsPrepare() || mayPrepare);
   if (mask.prunesAny()) {
     weight->membership = &mask;

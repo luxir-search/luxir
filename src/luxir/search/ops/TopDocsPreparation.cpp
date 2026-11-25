@@ -2,8 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/search/ops/TopDocsReq.h"
+#include "luxir/query/ReadDeclarer.h"
 
 namespace luxir {
+
+namespace {
+template <class F>
+void forEachFilterSource(std::span<ParsedFilter> filters, F&& visit) {
+  for (const auto& filter : filters) {
+    for (size_t i = 0; i < filter.sourceCount(); i++) visit(*filter.source(i));
+  }
+}
+} // namespace
+
+void declareFilterReads(ReadDeclarer& reads, std::span<ParsedFilter> filters,
+                        Query::PlanningContext& planning, int32_t requestFlags) {
+  int32_t flags = Query::membershipWeightFlags(requestFlags);
+  forEachFilterSource(filters, [&](Query& query) { reads.root(query, planning, flags); });
+}
 
 std::span<Query::Weight*> buildFilterWeights(
     std::span<ParsedFilter> filters,
@@ -11,20 +27,16 @@ std::span<Query::Weight*> buildFilterWeights(
   if (filters.empty()) return {};
   // Filters constrain matches but never contribute to score. Preserve any
   // future request flags, but clear NEED_SCORES.
-  int32_t filterFlags = requestFlags
-      & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  int32_t filterFlags = Query::membershipWeightFlags(requestFlags);
   size_t sourceCount = 0;
   for (const auto& filter : filters) {
     sourceCount += filter.sourceCount();
   }
   auto weights = qcontext.pool.make_span<Query::Weight*>(sourceCount);
   size_t source = 0;
-  for (const auto& filter : filters) {
-    for (size_t i = 0; i < filter.sourceCount(); i++) {
-      weights[source++] =
-          qcontext.createRootWeight(*filter.source(i), filterFlags);
-    }
-  }
+  forEachFilterSource(filters, [&](Query& query) {
+    weights[source++] = qcontext.createRootWeight(query, filterFlags);
+  });
   assert(source == weights.size());
   return weights;
 }
@@ -176,7 +188,7 @@ void TopDocsReq::selectSources() {
   bool cacheFirstVariableRanking = cacheFirstTopKCount
       && scoreProfile.kind == Query::ScoreProfile::Kind::VARIABLE;
   int32_t mainWeightFlags = cacheFirstVariableRanking
-      ? requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING
+      ? Query::rankingWeightFlags(requestFlags)
       : requestFlags;
   sourceSelection = SourceSelection{
       .cache = cache,
@@ -194,8 +206,72 @@ void TopDocsReq::selectSources() {
   };
 }
 
+bool TopDocsReq::buildsFilterWeights() const {
+  return !preparation.foldFilters && !sourceSelection->cacheFirstExactDomain && !filters.empty();
+}
+
+bool TopDocsReq::hasOrdinaryExactDomain() const {
+  return !preparation.routedFilters && !sourceSelection->cacheFirstExactDomain
+      && requirements.needExactDomain
+      && (!requirements.needRankedDocs
+          || (sourceSelection->constantExactDomainRanking && !sortPlan.useFieldSort));
+}
+
+bool TopDocsReq::buildsSeparateExactDomain() const {
+  return preparation.foldFilters || requirements.needRankedDocs;
+}
+
+bool TopDocsReq::mayRerouteMainWeight() const {
+  return (preparation.allowPruning || sourceSelection->cacheFirstVariableRanking)
+      && preparation.foldFilters && !requirements.needExactDomain;
+}
+
+bool TopDocsReq::mayComposeExactCountTopK() const {
+  return !sourceSelection->cacheFirstTopKCount
+      && !disableTopKCountComposition && sourceSelection->exactCountTopK;
+}
+
+void TopDocsReq::declareReads(ReadDeclarer& reads) const {
+  assert(sourceSelection);
+  const auto& selected = *sourceSelection;
+  int32_t membership = Query::membershipWeightFlags(selected.requestFlags);
+  int32_t ranking = Query::rankingWeightFlags(selected.requestFlags);
+  bool separateFilters = buildsFilterWeights();
+  if (!selected.omitMainWeight) {
+    reads.root(*query, planning, selected.mainWeightFlags);
+    if (preparation.routedFilters) reads.root(*query, planning, membership);
+    if (mayRerouteMainWeight()) {
+      reads.root(*query, planning, Query::exhaustiveWeightFlags(selected.mainWeightFlags));
+    }
+    if (mayComposeExactCountTopK()) {
+      reads.root(*query, planning, membership);
+      reads.root(*query, planning, ranking);
+    }
+    // Whole count and field-sort reuse the main weight. Whole top-K may
+    // construct an independent membership weight and then a ranking weight.
+    if (!QueryPrep::disableWholeMembershipPlanForTests
+        && preparation.exactCountTopKShape && !separateFilters
+        && selected.cacheFirstMembershipUse == nullptr) {
+      reads.root(*query, planning, membership);
+      if (!preparation.boundedCount) reads.root(*query, planning, ranking);
+    }
+    if (preparation.boundedCount && !separateFilters
+        && selected.cacheFirstMembershipUse == nullptr
+        && !preparation.estimateCount && !disableBoundedCountSplit) {
+      reads.root(*query, planning, membership);
+    }
+  }
+  if (separateFilters) declareFilterReads(reads, filters, planning, selected.requestFlags);
+  if (hasOrdinaryExactDomain() && buildsSeparateExactDomain()) {
+    reads.root(*preparation.domainQuery, planning, membership);
+    declareFilterReads(reads, filters, planning, membership);
+  }
+  domainVariants.declareReads(reads, planning, selected.requestFlags);
+}
+
 void TopDocsReq::materialize() {
   if (!sourceSelection) selectSources();
+  if (auto* reads = ReadVerification::active()) declareReads(*reads);
   const auto& selected = *sourceSelection;
   auto* cache = selected.cache;
   auto* cacheFirstMembershipUse = selected.cacheFirstMembershipUse;
@@ -203,9 +279,7 @@ void TopDocsReq::materialize() {
   int32_t requestFlags = selected.requestFlags;
   int32_t mainWeightFlags = selected.mainWeightFlags;
   bool exactCountTopK = selected.exactCountTopK;
-  bool constantExactDomainRanking = selected.constantExactDomainRanking;
   bool cacheFirstTopKCount = selected.cacheFirstTopKCount;
-  bool cacheFirstExactDomain = selected.cacheFirstExactDomain;
   bool cacheFirstFieldSort = selected.cacheFirstFieldSort;
   bool cacheFirstVariableRanking = selected.cacheFirstVariableRanking;
   bool omitMainWeight = selected.omitMainWeight;
@@ -222,7 +296,7 @@ void TopDocsReq::materialize() {
   if (preparation.routedFilters) {
     assert(weight != nullptr);
     int32_t membershipFlags =
-        requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
+        Query::membershipWeightFlags(requestFlags);
     variantMembershipWeight =
         !weight->needsScores() && !weight->allowsPruning()
             ? weight
@@ -232,17 +306,15 @@ void TopDocsReq::materialize() {
     skipCount(SkipStats::cacheFirstTopKRankingWeights);
   }
   bool sparseFilteredTopKReroute = weight != nullptr
-      && (preparation.allowPruning || cacheFirstVariableRanking)
-      && preparation.foldFilters
-      && !requirements.needExactDomain && !weight->needsPrepare()
+      && mayRerouteMainWeight() && !weight->needsPrepare()
       && admitSparseFilteredTopK(
           *weight, *view, topCount);
   if (sparseFilteredTopKReroute) {
     bool unionFamily = weight->sparseFilteredTopKFamily()
         == Query::Weight::SparseFilteredTopKFamily::UNION;
-    mainWeightFlags &= ~Query::ALLOW_PRUNING;
+    mainWeightFlags = Query::exhaustiveWeightFlags(mainWeightFlags);
     weight = qcontext->createRootWeight(*query, mainWeightFlags);
-    requestFlags &= ~Query::ALLOW_PRUNING;
+    requestFlags = Query::exhaustiveWeightFlags(requestFlags);
     skipCount(SkipStats::sparseFilteredTopKReroutes);
     if (unionFamily) {
       skipCount(SkipStats::sparseFilteredTopKUnionReroutes);
@@ -273,8 +345,7 @@ void TopDocsReq::materialize() {
       provedSegments[(size_t)segment.ord] = 1;
     }
   }
-  if (weight != nullptr && !cacheFirstTopKCount
-      && !disableTopKCountComposition && exactCountTopK
+  if (weight != nullptr && mayComposeExactCountTopK()
       && !weight->needsPrepare()
       && (weight->canComposeExactCountTopK() || forcedComposition || !provedSegments.empty())
       // A constant-score ranking pass is bounded only when no collector
@@ -282,29 +353,25 @@ void TopDocsReq::materialize() {
       // retains its existing filtered candidate route.
       && (filters.empty() || !weight->isConstantScoring())) {
     int32_t countFlags =
-        requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
+        Query::membershipWeightFlags(requestFlags);
     int32_t rankingFlags =
-        requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING;
+        Query::rankingWeightFlags(requestFlags);
     countWeight = qcontext->createRootWeight(*query, countFlags);
     rankingWeight = qcontext->createRootWeight(*query, rankingFlags);
   }
-  auto filterWeights = preparation.foldFilters || cacheFirstExactDomain || filters.empty()
-    ? std::span<Query::Weight*>{}
-    : buildFilterWeights(filters, *qcontext, requestFlags);
+  auto filterWeights = buildsFilterWeights()
+    ? buildFilterWeights(filters, *qcontext, requestFlags)
+    : std::span<Query::Weight*>{};
   if (domainVariants.sourceCount() > 0) {
     domainVariants.buildWeights(
         *qcontext, planning, requestFlags);
   }
   Query::Weight* domainQueryWeight = nullptr;
   std::span<Query::Weight*> domainFilterWeights;
-  if (!preparation.routedFilters && !cacheFirstExactDomain
-      && requirements.needExactDomain
-      && (!requirements.needRankedDocs
-          || (constantExactDomainRanking
-              && !sortPlan.useFieldSort))) {
-    if (preparation.foldFilters || requirements.needRankedDocs) {
+  if (hasOrdinaryExactDomain()) {
+    if (buildsSeparateExactDomain()) {
       int32_t domainFlags =
-          requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
+          Query::membershipWeightFlags(requestFlags);
       domainQueryWeight =
           qcontext->createRootWeight(*preparation.domainQuery, domainFlags);
       domainFilterWeights =
@@ -352,7 +419,7 @@ void TopDocsReq::materialize() {
       wholeMembershipWeight = weight;
     } else {
       int32_t membershipFlags =
-          requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
+          Query::membershipWeightFlags(requestFlags);
       wholeMembershipWeight =
           qcontext->createRootWeight(*query, membershipFlags);
     }
@@ -413,7 +480,7 @@ void TopDocsReq::materialize() {
       Query::Weight* countFreeRankingWeight = preparation.boundedCount ? weight : rankingWeight;
       if (countFreeRankingWeight == nullptr) {
         int32_t rankingFlags =
-            requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING;
+            Query::rankingWeightFlags(requestFlags);
         countFreeRankingWeight =
             qcontext->createRootWeight(*query, rankingFlags);
       }
@@ -544,7 +611,7 @@ void TopDocsReq::materialize() {
       auto bound = weight->countShortcut(segment, nullptr).maxMatches;
       if (bound > remaining) {
         boundedCountWeight = qcontext->createRootWeight(
-            *query, requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING));
+            *query, Query::membershipWeightFlags(requestFlags));
         break;
       }
       remaining -= bound;

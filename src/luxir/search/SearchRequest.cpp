@@ -3,6 +3,7 @@
 
 #include "SearchRequest.h"
 #include "luxir/query/QueryPruning.h"
+#include "luxir/query/ReadDeclarer.h"
 
 #include <cassert>
 
@@ -70,6 +71,13 @@ void SearchRequest::materialize() {
   stage = Stage::MATERIALIZING;
   for (; materializationCursor < materializationSteps.size(); ++materializationCursor) {
     const auto& step = materializationSteps[materializationCursor];
+#ifndef NDEBUG
+    if (Query::verifyReadDeclarationsForTests && ReadVerification::active() == nullptr) {
+      ReadVerification verify;
+      step.run(step.owner);
+      continue;
+    }
+#endif
     step.run(step.owner);
   }
   stage = Stage::MATERIALIZED;

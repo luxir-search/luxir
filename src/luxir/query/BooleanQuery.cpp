@@ -7,12 +7,12 @@ namespace luxir {
 
 Query::Weight* BooleanQuery::createWeight(Context& context, int32_t flags,
                                           float multiplier) {
-  CompiledBoolean& plan = logicalPlan(context.planningContext());
-  if (plan.singleChild != nullptr) {
-    return plan.singleChild->createWeight(context, flags, multiplier);
-  }
-  return context.pool.make<BooleanQuery::Weight>(
-      context, *this, plan, flags, multiplier, ScorePolicy{});
+  return dispatchWeight(context.planningContext(), [&](Query& child) {
+    return child.buildWeight(context, flags, multiplier);
+  }, [&](CompiledBoolean& plan) -> Query::Weight* {
+    return context.pool.make<BooleanQuery::Weight>(
+        context, *this, plan, flags, multiplier, ScorePolicy{});
+  });
 }
 
 Query::Weight* BooleanQuery::makeDisjunctionWeight(
