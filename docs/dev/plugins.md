@@ -214,7 +214,8 @@ The maker receives a `PluginOpContext` while the request is parsed and returns a
 - `parseSource(name, val)` parses a TopDocs-shaped param as a source the op runs
   itself, as `FusionOp` runs its sources: set its `rankingSink` and `parent`,
   create its calculator under the op's own, dispatch it per segment and receive
-  the merged collector. The source is already materialized when this returns.
+  the merged collector. The returned source is logical. Inspect its execution
+  state in the plugin op's `materialize()`, after the source's step has run.
 - `addSubs(op)` parses the nested ops into `op.subOps`. They run over whatever
   domain the op hands their calculators (`acceptAll` with one `DomainHandle` per
   segment; an empty set, never null, for a segment with no documents), and may not
@@ -222,7 +223,9 @@ The maker receives a `PluginOpContext` while the request is parsed and returns a
 
 A maker constructs the op from parsed, validated inputs. Override
 `SearchOp::materialize()` to create execution contexts, weights, and filter
-uses. It runs once, serially, after the maker returns and before `init()`.
+uses. The engine finishes logical parsing for the request before running
+materialization in recorded order. The hook runs once, serially, before
+`init()` and after the sources the maker parsed.
 For example, `query_count` stores the parsed query and planning context in its
 maker and builds the unscored weight in its materialization hook.
 
@@ -630,10 +633,10 @@ Validate parameters and return a shared `HitDecorator` with a fixed, unique
 source span expire when the maker returns. Register during startup before the
 registries freeze.
 
-`HitDecorator::bind(sources)` is called once, serially, after the source
-weights are materialized and before execution. Each source supplies its
-original ranking query and execution context. A cache-resident source that
-omitted its weight gets an execution context on demand. Binding can inspect
+`HitDecorator::bind(sources)` is called once, serially, before execution and
+after both request-wide logical validation and source materialization. Each
+source supplies its original ranking query and execution context. A cache-resident
+source that omitted its weight gets an execution context on demand. Binding can inspect
 the existing queries and copy borrowed data. Query parsing belongs in the
 maker. The default binding does nothing, which is sufficient for `label`.
 

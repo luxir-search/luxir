@@ -54,7 +54,7 @@ public:
   // dispatches it per segment, and receives the merged ranking through the
   // rankingSink it sets. The parser does not wire the source: the op must set
   // source->parent (itself) and source->rankingSink, as FusionOp.h describes.
-  // The source has been materialized when this returns.
+  // Returns a logical source. Its step runs before the plugin op's materialize().
   virtual TopDocsReq* parseSource(std::string_view sourceName, const api::Val& topDocs) = 0;
 
   // Parse proto.ops as `op`'s nested ops (op.subOps, parent = op). Nested ops

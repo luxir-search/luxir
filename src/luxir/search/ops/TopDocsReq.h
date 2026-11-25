@@ -165,6 +165,13 @@ public:
   // Runs once after construction to build the contexts, weights, filter uses and execution routes.
   void materialize() override;
 
+  // Bind the decorators against this source's materialized query.
+  void bindDecorators();
+  // Open the execution context on demand if cache-first selection omitted it.
+  Query::Context& decoratorQueryContext();
+  // Check execution traits after materializing a row operation.
+  void validateRowExecution() const;
+
   std::vector<ExtraColumn> rowColumns();
 
   // Exact COUNT + pruned TOP_100 over the 5M/301-union cohort crossed between

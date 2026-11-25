@@ -28,8 +28,9 @@ RootOp* SearchEngine::prepare(SearchRequest& req) {
   getResources(req);
   req.lastResponse = SearchResponse::create(req, true);
 
-  ProtobufSearchParser parser(req);
-  return parser.parse();
+  auto* root = ProtobufSearchParser(req).parse();
+  req.materialize();
+  return root;
 }
 
 std::vector<std::string> SearchEngine::explain(const ReqProto& proto, std::string tenant) {
@@ -69,9 +70,8 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // Once execution is under way it is the engine's.  Throw sites that know
   // better say so with an ApiError, which classifies itself in either phase.
   ErrorKind fallback = ErrorKind::INVALID_REQUEST;
-  RootOp* root = nullptr;
   try {
-    root = prepare(req);
+    auto* root = prepare(req);
     root->init();
     std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can
@@ -117,8 +117,8 @@ void SearchEngine::submitBody(SearchRequest& req) {
     req.setError(info);
   }
 
-  if (root != nullptr) {
-    for (auto& segment : req.reader->segments()) root->releaseSegmentState(segment);
+  if (req.logicalRoot != nullptr) {
+    for (auto& segment : req.reader->segments()) req.logicalRoot->releaseSegmentState(segment);
   }
 
   // Profile slots are written only by segment tasks. Materialize the shared

@@ -307,6 +307,40 @@ TEST_F(MultiTermLimitsTest, fuzzyExpansionSharesTheBudget) {
   EXPECT_NE(req->errorMsg().find("fuzzy query 't050'"), std::string::npos) << req->errorMsg();
 }
 
+TEST_F(MultiTermLimitsTest, logicalErrorsPrecedeWeightErrorsInEitherOpOrder) {
+  LuxirNode node(config(1000, 5));
+  CollectionHelper helper(node);
+  indexTerms(helper);
+
+  for (bool logicalFirst : {true, false}) {
+    SCOPED_TRACE(logicalFirst);
+    auto req = localReq(helper.getSearchEngine());
+    if (logicalFirst) req->topDocs("invalid").offset(-1);
+    req->topDocs("expand").fuzzyQuery("tag_s", "t050", 2, 0);
+    if (!logicalFirst) req->topDocs("invalid").offset(-1);
+    SkipStatsScope stats;
+    req->execute(false);
+    EXPECT_FALSE(req->ok());
+    EXPECT_EQ("top_docs 'invalid': offset must be >= 0", req->errorMsg());
+    EXPECT_EQ(0, SkipStats::queryContextsCreated);
+  }
+}
+
+TEST_F(MultiTermLimitsTest, weightFailureStopsAfterEarlierMaterialization) {
+  LuxirNode node(config(1000, 5));
+  CollectionHelper helper(node);
+  indexTerms(helper);
+  auto req = localReq(helper.getSearchEngine());
+  req->topDocs("ready").matchQuery("tag_s", "t000");
+  req->topDocs("expand").fuzzyQuery("tag_s", "t050", 2, 0);
+  req->topDocs("later").allQuery();
+  SkipStatsScope stats;
+  req->execute(false);
+  EXPECT_FALSE(req->ok());
+  EXPECT_EQ("too_many_terms_examined", req->errorCode());
+  EXPECT_EQ(2, SkipStats::queryContextsCreated);
+}
+
 TEST_F(MultiTermLimitsTest, scoredCaseInsensitiveMatchHonorsLimits) {
   auto errorCode = [](const LuxirConfig& limited) {
     LuxirNode node(limited);
