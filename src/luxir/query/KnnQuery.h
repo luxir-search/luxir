@@ -1932,6 +1932,15 @@ public:
               "field '{}': returned {} of k={} groups; candidates_exhausted={}",
               query.field, docHits.size(), kDocs, candidatesExhausted));
         }
+      } else if ((int64_t)docHits.size() < std::min(kDocs, allEligibleDocs) && ctx.warnings) {
+        // Approximate effort stopped short of k while more eligible docs
+        // remain; a pinned nprobe never deepens or completes. Checked before
+        // the similarity threshold, which may drop hits by design. Counted
+        // eligible docs are exact except an unfiltered multi-valued segment
+        // with deletes, whose count is an upper bound.
+        ctx.warnings->warnOnce("knn_underfill", std::format(
+            "field '{}': returned {} of k={} docs; eligible_docs={}; nprobe_pinned={}",
+            query.field, docHits.size(), kDocs, allEligibleDocs, query.getNProbe() > 0));
       }
 
       // The similarity threshold drops hits from the k nearest rather than

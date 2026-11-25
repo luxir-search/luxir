@@ -5301,6 +5301,30 @@ TEST_F(KnnQueryTest, runtimeCompletionDistinguishesFarAndIndependentFilters) {
   }
 }
 
+TEST_F(KnnQueryTest, explicitNprobeUnderfillWarns) {
+  // An explicit nprobe never deepens, so a filter anti-correlated with the
+  // probed lists underfills k; the response says so.
+  ForceIvfGuard forceIvf;
+  IvfTestGuard ivf;
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2, rabitqAnn(16, 4), 4);
+  for (int i = 0; i < 512; i++)
+    h.index(flatdoc("id", std::to_string(i), "far_s", i >= 460 ? "yes" : "no",
+        "emb_v", std::vector<float>{(float)i + 1, 0, 0, 0}));
+  h.commit({"*"});
+  auto req = localReq(h.getSearchEngine());
+  auto& cur = req->topDocs("q");
+  configKnn(cur, "emb_v", {0, 0, 0, 0}, 3, 1);
+  addMatchFilter(cur, "far_s", "yes");
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ(0u, resultIds(*req).size()); // k=3; 52 docs match the filter.
+  const auto& warnings = req->responses.back()->proto.warnings;
+  ASSERT_EQ(1u, warnings.size());
+  EXPECT_EQ("knn_underfill", warnings[0].code);
+  EXPECT_EQ("field 'emb_v': returned 0 of k=3 docs; eligible_docs=52; nprobe_pinned=true", warnings[0].message);
+}
+
 TEST_F(KnnQueryTest, profileReportsInitialNprobeAndDistinctLists) {
   ForceIvfGuard forceIvf;
   IvfTestGuard guard(/*minTraining=*/16);
