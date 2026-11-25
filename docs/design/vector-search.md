@@ -575,9 +575,11 @@ That makes eligibility closed under AND re-association. It never follows an
 optional group (even with min_match) or a prohibited branch, and never extracts
 a domain consumer; extracted exclusions stay prohibited. A nested copy is
 dropped only while its boolean keeps another required clause, so rank-only
-optionals never become requirements, and a retained copy shares the extracted
-one's query-owned filter use, which is request-owned when the shared cache
-rejects admission or is absent. Scoring siblings, including terms and
+optionals never become requirements, and never from a boolean that itself
+contains a domain consumer: that consumer selects inside the domain its own
+constraints fold, and a filter-role boolean never sees its parent's filters.
+A retained copy shares the extracted one's query-owned filter use, which is
+request-owned when the shared cache rejects admission or is absent. Scoring siblings, including terms and
 constraints wrapped in `constant_score(...)`, intersect with the kNN's top-k
 afterwards. Required-clause inlining never moves a domain consumer to a
 different prepare stage.

@@ -1407,7 +1407,10 @@ protected:
     NEGATIVE, NESTED_FILTER, NESTED_REQUIRED, WRAPPED_REQUIRED, BOOSTED_REQUIRED,
     FILTER_CHAIN, OPTIONAL_GROUP, NESTED_MIN_MATCH,
     REQUIRED_FILTER_CONSUMER, REQUIRED_PROHIBITED_CONSUMER, FILTER_REQUIRED_CONSUMER,
-    LIFTED_OPTIONAL_CONSUMER, FILTER_NEGATIVE_OPTIONAL_CONSUMER
+    LIFTED_OPTIONAL_CONSUMER, FILTER_NEGATIVE_OPTIONAL_CONSUMER,
+    CONSUMER_FILTER_REQUIRED_CONSUMER, OPTIONAL_CONSUMER_FILTER_REQUIRED_CONSUMER,
+    CONSUMER_FILTER_PROHIBITED_CONSUMER, CONSUMER_FILTER_FILTER_CONSUMER,
+    CONSUMER_FILTER_SCALAR_FILTER_CONSUMER, FILTER_SCALAR_FILTER_CONSUMER
   };
   enum class Caller { SCORED, COUNT, FIELD_SORT, CONSTANT_SCORE, RESCORE, FACET };
   struct Result {
@@ -1469,6 +1472,24 @@ protected:
     if (shape == Shape::FILTER_REQUIRED_CONSUMER) {
       auto inner = qb::boolean(mr, {knn}, {}, {}, {constraint});
       return qb::boolean(mr, {}, {}, {}, {inner});
+    }
+    if (shape >= Shape::CONSUMER_FILTER_REQUIRED_CONSUMER) {
+      // The outer consumer's top-2 is {2, 3} in any domain containing them.
+      auto outer = qb::knn(mr, "body_v", {3, 0}, 2, 0, true);
+      auto excluded = qb::match(mr, "cat_s", "y");
+      auto inner = shape == Shape::CONSUMER_FILTER_PROHIBITED_CONSUMER
+          ? qb::boolean(mr, {knn}, {}, {excluded})
+          : shape == Shape::CONSUMER_FILTER_FILTER_CONSUMER
+          ? qb::boolean(mr, {}, {}, {}, {knn, constraint})
+          : shape == Shape::CONSUMER_FILTER_SCALAR_FILTER_CONSUMER
+                || shape == Shape::FILTER_SCALAR_FILTER_CONSUMER
+          ? qb::boolean(mr, {constraint}, {}, {}, {knn})
+          : qb::boolean(mr, {knn}, {}, {}, {constraint});
+      if (shape == Shape::FILTER_SCALAR_FILTER_CONSUMER) return qb::boolean(mr, {}, {}, {}, {inner});
+      if (shape == Shape::OPTIONAL_CONSUMER_FILTER_REQUIRED_CONSUMER) {
+        return qb::boolean(mr, {}, {outer}, {}, {inner});
+      }
+      return qb::boolean(mr, {outer}, {}, {}, {inner});
     }
     if (shape == Shape::FILTER_NEGATIVE_OPTIONAL_CONSUMER) {
       auto selected = qb::knn(mr, "body_v", {0, 0}, 1, 0, true);
@@ -1617,6 +1638,20 @@ TEST_F(KnnBooleanDomainTest, requiredProhibitedConsumerKeepsOuterDomain) {
 
 TEST_F(KnnBooleanDomainTest, filterRequiredConsumerKeepsInnerDomain) {
   expect(Shape::FILTER_REQUIRED_CONSUMER, {"2", "3"});
+}
+
+TEST_F(KnnBooleanDomainTest, consumerParentKeepsInnerDomain) {
+  expect(Shape::CONSUMER_FILTER_REQUIRED_CONSUMER, {"2", "3"});
+  expect(Shape::OPTIONAL_CONSUMER_FILTER_REQUIRED_CONSUMER, {"2", "3"});
+  expect(Shape::CONSUMER_FILTER_PROHIBITED_CONSUMER, {"2", "3"});
+}
+
+TEST_F(KnnBooleanDomainTest, consumerParentKeepsInnerPostFilter) {
+  // A range beside a filter-role kNN intersects after selection, as it does
+  // alone or under a non-consuming parent: the kNN's top-2 is {0, 1}.
+  expect(Shape::FILTER_SCALAR_FILTER_CONSUMER, {});
+  expect(Shape::CONSUMER_FILTER_SCALAR_FILTER_CONSUMER, {});
+  expect(Shape::CONSUMER_FILTER_FILTER_CONSUMER, {});
 }
 
 TEST_F(KnnBooleanDomainTest, negativeMergeKeepsOptionalConsumerOptional) {
