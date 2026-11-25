@@ -15,7 +15,9 @@ namespace luxir {
 
 Query::Weight* Query::Context::createRootWeight(Query& query, int32_t flags, float multiplier) {
   if (!planning.pruning) planning.pruning = std::make_shared<QueryPruning>();
-  auto [mask, inserted] = planning.pruning->membership(query, planning);
+  auto& membership = planning.pruning->membership(query, planning);
+  const auto& mask = membership.mask;
+  bool firstWeight = !std::exchange(membership.weightAttempted, true);
   bool mayPrepare = query.mayRequirePreparation();
   bool emptyWeight = !mayPrepare && mask.none();
   auto* weight = emptyWeight ? pool.make<MatchNoDocsQuery::Weight>(*this, query, flags)
@@ -23,7 +25,7 @@ Query::Weight* Query::Context::createRootWeight(Query& query, int32_t flags, flo
   assert(!weight->needsPrepare() || mayPrepare);
   if (mask.prunesAny()) {
     weight->membership = &mask;
-    if (inserted && planning.proofNotes) {
+    if (firstWeight && planning.proofNotes) {
       auto segments = planning.topReader.segments();
       if (emptyWeight) {
         planning.proofNotes->push_back(std::format("op {}: empty weight for the collection (segment 0, {})",
@@ -40,9 +42,9 @@ Query::Weight* Query::Context::createRootWeight(Query& query, int32_t flags, flo
   return weight;
 }
 
-QueryPruning::Membership QueryPruning::membership(const Query& query, const Query::PlanningContext& planning) {
+QueryPruning::Membership& QueryPruning::membership(const Query& query, const Query::PlanningContext& planning) {
   auto found = membershipMemo.find({&planning, &query});
-  if (found != membershipMemo.end()) return {found->second, false};
+  if (found != membershipMemo.end()) return found->second;
   auto segments = planning.topReader.segments();
   SegmentMask mask(segments.size());
   if (!disableForTests) {
@@ -60,7 +62,7 @@ QueryPruning::Membership QueryPruning::membership(const Query& query, const Quer
       }
     }
   }
-  return {membershipMemo.emplace(PlanKey{&planning, &query}, std::move(mask)).first->second, true};
+  return membershipMemo.emplace(PlanKey{&planning, &query}, Membership{std::move(mask)}).first->second;
 }
 
 std::optional<const DecodedFieldRecord*> CatalogSummaryView::record(std::string_view field) const {
