@@ -83,6 +83,8 @@ class SearchRequest : public ExecutionWarnings, public ExecutionProfileSink {
   struct ScopedState {
     std::shared_ptr<IndexReader> reader;
     std::shared_ptr<FilterCache::UseRegistry> uses;
+    // Populated only if a Context binds to this view.
+    std::optional<TermFactsCache> termFacts;
     // Request-arena owned; the pair of paths fixes the direction of reduction.
     std::map<std::pair<std::string, std::string>, OwnershipRelation*> relations;
   };
@@ -139,8 +141,9 @@ public:
   std::string timeZoneError;
   MemPool requestPool;
 private:
-  // Registries can retain request memory charges. Destroy them before the
-  // request pool and tracker, and before releasing their reader pins.
+  // Lazy term facts for the root view, using requestPool.
+  std::optional<TermFactsCache> termFacts;
+  // Destroy the view caches and registries before the request pool and tracker.
   std::unique_ptr<std::map<std::string, ScopedState, std::less<>>> scopedStates;
 public:
   FanoutScope* tg = nullptr; // optional top-level fan-out scope for this request.
@@ -199,7 +202,6 @@ public:
   // The map has no allocation until
   // a request crosses a space boundary; registry identities never cross it.
   const std::shared_ptr<IndexReader>& pinView(std::string_view path);
-  const std::shared_ptr<FilterCache::UseRegistry>& uses(IndexReader& view);
   OwnershipRelation& ownershipRelation(IndexReader& many, IndexReader& one);
   Query::PlanningContext* createPlanningContext(IndexReader& view);
   size_t scopedViewCountForTests() const noexcept { return scopedStates ? scopedStates->size() : 0; }

@@ -39,6 +39,7 @@
 #include "luxir/search/FilterKey.h"
 #include "luxir/search/Similarity.h"
 #include "QueryVisitor.h"
+#include "TermFactsCache.h"
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -321,38 +322,6 @@ public:
     return map.try_emplace(key, pool.getAllocator()).first->second;
   }
 };
-
-struct CachedTermInfo {
-  Similarity::TermStats termStats = {};
-  Similarity::BM25Scorer* simScorer = nullptr;  // This may be null even if other elements are fille in (phrase query would have different one)
-  std::span<const TermsEnum::PostingsState*> postingsStates = {};
-
-  /// Construct an independent tiered docs enum from the immutable state captured by the
-  /// original term seek. No dictionary re-seek or shared mutable enum is involved.
-  template<DocsEnumTier Tier>
-  BasicDocsEnum<Tier>* useDocsEnum(MemPool& targetPool, IndexReader::Segment& segment) {
-    auto* state = postingsStates[segment.ord];
-    if (state == nullptr) {
-      return nullptr;
-    }
-    return targetPool.make<BasicDocsEnum<Tier>>(*state);
-  }
-
-  int32_t docFreq(int32_t segmentOrd) const {
-    auto* state = postingsStates[segmentOrd];
-    return state == nullptr ? 0 : state->docFreq;
-  }
-};
-
-struct CachedFieldInfo {
-  IndexReader::FieldSegments segInfos;
-  Similarity::FieldStats fieldStats = {};
-  std::span<TermsEnum*> termsEnums = {};  // TODO: cache align if they will be used in multiple threads
-  boost::unordered_node_map<std::string_view, CachedTermInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedTermInfo>>> termInfos;
-
-  explicit CachedFieldInfo(MemPool& pool, size_t initialMapSize=4) : termInfos(initialMapSize, pool.getAllocator()) {}
-};
-
 
 // NOTE: no virtual destructor, so subclasses of Query should be made trivially destructible
 // Scored TOP_k filter routing crossover, shared by the boolean window-mask
@@ -1322,6 +1291,8 @@ public:
     std::string_view opName;
     std::vector<std::string>* proofNotes = nullptr;
     ExecutionProfileSink* profiles = nullptr;
+    // The pinned view's request-owned cache slot, populated by the first Context.
+    std::optional<TermFactsCache>* sharedTermFacts = nullptr;
 
 #ifndef NDEBUG
     // Borrowed from the request when planning belongs to a search.
@@ -1329,6 +1300,11 @@ public:
 
     bool inLogicalPhase() const noexcept {
       return requestStage != nullptr && *requestStage == Stage::LOGICAL;
+    }
+
+    bool inTermPlanningPhase() const noexcept {
+      return requestStage == nullptr || *requestStage == Stage::MATERIALIZING
+          || *requestStage == Stage::INACTIVE;
     }
 #endif
 
@@ -1520,13 +1496,51 @@ public:
   /// borrowing the serial planning state that already validated and keyed the
   /// query tree. A Context is not generally thread-safe.
   class Context {
-    std::optional<PlanningContext> ownedPlanning;
+    struct PrivatePlanning {
+      PlanningContext planning;
+      TermFactsCache termFacts;
+
+      PrivatePlanning(MemPool& pool, IndexReader& reader, PlanningContext::Limits limits,
+                      std::vector<api::Warning>* warnings, FilterKeyContext filterKeyContext,
+                      std::shared_ptr<FilterCache::UseRegistry> filterUses)
+          : planning(pool, reader, limits, warnings, filterKeyContext, std::move(filterUses)),
+            termFacts(pool, reader) {}
+    };
+
+    struct StackState : PrivatePlanning {
+      using PrivatePlanning::PrivatePlanning;
+      google::protobuf::Arena arena;
+    };
+
+    // Only a stack Context owns the arena and planning state it uses.
+    std::unique_ptr<StackState> stackState;
     PlanningContext& planning;
-    std::unique_ptr<google::protobuf::Arena> standaloneArena;
-    google::protobuf::Arena* allocationArena;
+    google::protobuf::Arena& allocationArena;
+    // Bound once to the request view or to private standalone storage.
+    TermFactsCache& termFacts;
+
+    static TermFactsCache& bindTermFacts(google::protobuf::Arena& arena, PlanningContext& planning) {
+      if (auto* cache = planning.sharedTermFacts) {
+        assert(planning.inTermPlanningPhase());
+        if (!*cache) cache->emplace(planning.pool, planning.topReader, true);
+        return **cache;
+      }
+      return *luxir::arenaCreate<TermFactsCache>(arena, planning.pool, planning.topReader);
+    }
+
+    void assertTermPlanning() const {
+#ifndef NDEBUG
+      termFacts.assertOwner();
+      assert(planning.inTermPlanningPhase());
+#endif
+    }
+
+    explicit Context(std::unique_ptr<StackState> state)
+      : Context(state->arena, state->planning, state->termFacts) {
+      stackState = std::move(state);
+    }
 
   public:
-    using FieldInfoMap = boost::unordered_node_map<std::string_view, CachedFieldInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedFieldInfo>>>;
     using Limits = PlanningContext::Limits;
 
     MemPool& pool;
@@ -1534,36 +1548,15 @@ public:
     std::shared_ptr<FilterCache::UseRegistry>& filterUses;
     FilterKeyContext& filterKeyContext;
     Limits& limits;
-    FieldInfoMap fieldInfoMap;
     // Pool-owned norm tables shared by the request's CombinedFieldQuery
     // weights, one per field weight vector; defined in CombinedFieldQuery.h.
     CombinedNormTables* combinedNormTables = nullptr;
 
-    Context(google::protobuf::Arena& arena, PlanningContext& planning,
-            FieldInfoMap&& fieldInfoMap)
-      : planning(planning), allocationArena(&arena),
+    Context(google::protobuf::Arena& arena, PlanningContext& planning, TermFactsCache& termFacts)
+      : planning(planning), allocationArena(arena), termFacts(termFacts),
         pool(planning.pool), topReader(planning.topReader),
         filterUses(planning.filterUses),
-        filterKeyContext(planning.filterKeyContext), limits(planning.limits),
-        fieldInfoMap(std::move(fieldInfoMap)) {
-      assert(!planning.inLogicalPhase());
-    }
-
-    // Arena-owned form used by standalone embedders that do not already have
-    // serial planning state.
-    Context(google::protobuf::Arena& arena, MemPool& pool,
-            IndexReader& topReader,
-            FieldInfoMap&& fieldInfoMap,
-            Limits limits = {}, std::vector<api::Warning>* warnings = nullptr,
-            FilterKeyContext filterKeyContext = {},
-            std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
-      : ownedPlanning(std::in_place, pool, topReader, limits, warnings,
-                      filterKeyContext, std::move(filterUses)),
-        planning(*ownedPlanning), allocationArena(&arena),
-        pool(planning.pool), topReader(planning.topReader),
-        filterUses(planning.filterUses),
-        filterKeyContext(planning.filterKeyContext), limits(planning.limits),
-        fieldInfoMap(std::move(fieldInfoMap)) {
+        filterKeyContext(planning.filterKeyContext), limits(planning.limits) {
       assert(!planning.inLogicalPhase());
     }
 
@@ -1572,35 +1565,25 @@ public:
             std::vector<api::Warning>* warnings = nullptr,
             FilterKeyContext filterKeyContext = {},
             std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
-      : ownedPlanning(std::in_place, pool, topReader, limits, warnings,
-                      filterKeyContext, std::move(filterUses)),
-        planning(*ownedPlanning),
-        standaloneArena(std::make_unique<google::protobuf::Arena>()),
-        allocationArena(standaloneArena.get()),
-        pool(planning.pool), topReader(planning.topReader),
-        filterUses(planning.filterUses),
-        filterKeyContext(planning.filterKeyContext), limits(planning.limits),
-        fieldInfoMap(4, pool.getAllocator()) {
-      assert(!planning.inLogicalPhase());
-    }
+      : Context(std::make_unique<StackState>(
+            pool, topReader, limits, warnings, filterKeyContext, std::move(filterUses))) {}
 
     static Context* create(google::protobuf::Arena* arena,
                            PlanningContext& planning) {
-      FieldInfoMap map(4, planning.pool.getAllocator());
-      return luxir::arenaCreate<Context>(
-          *arena, *arena, planning, std::move(map));
+      auto& termFacts = bindTermFacts(*arena, planning);
+      return luxir::arenaCreate<Context>(*arena, *arena, planning, termFacts);
     }
 
+    // Standalone embedders can keep private planning and the cache in an arena.
     static Context* create(
         google::protobuf::Arena* arena, MemPool& pool,
         IndexReader& topReader, Limits limits = {},
         std::vector<api::Warning>* warnings = nullptr,
         FilterKeyContext filterKeyContext = {},
         std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr) {
-      FieldInfoMap map(4, pool.getAllocator());
-      return luxir::arenaCreate<Context>(
-          *arena, *arena, pool, topReader, std::move(map),
-          limits, warnings, filterKeyContext, std::move(filterUses));
+      auto* state = luxir::arenaCreate<PrivatePlanning>(
+          *arena, pool, topReader, limits, warnings, filterKeyContext, std::move(filterUses));
+      return luxir::arenaCreate<Context>(*arena, *arena, state->planning, state->termFacts);
     }
 
     Weight* createRootWeight(Query& query, int32_t flags, float multiplier = 1.0f);
@@ -1612,7 +1595,7 @@ public:
     }
 
     google::protobuf::Arena& arena() const noexcept {
-      return *allocationArena;
+      return allocationArena;
     }
 
     template <typename Plan, typename Create>
@@ -1653,103 +1636,24 @@ public:
       return topReader.segments().size();
     }
 
-    /// Returns nullptr if the field is not found in any segment.
     CachedFieldInfo* getCachedFieldInfo(std::string_view field) {
-      auto [iter, inserted] = fieldInfoMap.try_emplace(field, pool, 4);
-      CachedFieldInfo& result = iter->second;
-      if (inserted) {
-        result.segInfos = topReader.field(field);
-        if (result.segInfos.exists()) {
-          result.fieldStats = result.segInfos.stats();
-          result.termsEnums = pool.make_span_zeroed<TermsEnum*>(numSegments());
-        }
-      }
-      return result.segInfos.exists() ? &result : nullptr;
+      assertTermPlanning();
+      return termFacts.getCachedFieldInfo(field);
     }
 
-  private:
-    // The cached dictionary outlives temporary pool rewinds. Call only before
-    // taking a savepoint that may be rewound, or outside any rewind scope.
-    TermsEnum* getTermsEnum(CachedFieldInfo& field, size_t segnum) {
-      auto*& terms = field.termsEnums[segnum];
-      if (!terms) {
-        if (auto* info = field.segInfos.at(segnum)) {
-          terms = pool.make<TermsEnum>(pool, topReader.segments()[segnum].postingsReader(), *info);
-        }
-      }
-      return terms;
+    CachedTermInfo* getCachedTerminfo(CachedFieldInfo& field, std::string_view term) {
+      assertTermPlanning();
+      return termFacts.getCachedTerminfo(field, term);
     }
 
-    // A term outside this segment's catalog bounds contributes zero frequency.
-    bool termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term);
-
-  public:
-    CachedTermInfo* getCachedTerminfo(CachedFieldInfo& cachedFieldInfo, std::string_view term) {
-      auto [iter, inserted] = cachedFieldInfo.termInfos.try_emplace(term);
-      CachedTermInfo& result = iter->second;
-      if (!inserted) {
-        return &result;
-      }
-
-      auto numSegs = numSegments();
-      // TermsEnums survive missing-term lookups; allocate them before the
-      // temporary postings states that can be rewound below.
-      for (size_t i = 0; i < numSegs; i++) {
-        if (!termAbsent(cachedFieldInfo, i, term)) getTermsEnum(cachedFieldInfo, i);
-      }
-      auto savepoint = pool.getSavePoint();
-      int foundInSegCount = 0;
-      result.postingsStates = {
-          pool.make_arr<const TermsEnum::PostingsState*>(numSegs), numSegs};
-      for (size_t i = 0; i < numSegs; ++i) {
-        // A segment whose header proves the term absent holds zero
-        // frequency for it, exactly what a seek would find, so it is not
-        // seeked. Every other segment is, pruned by other predicates or not:
-        // statistics always cover the whole reader.
-        auto* termsEnum = cachedFieldInfo.termsEnums[i];
-        if (!termsEnum || termAbsent(cachedFieldInfo, i, term) || !termsEnum->seek(term)) {
-          result.postingsStates[i] = nullptr;
-          continue;
-        }
-        foundInSegCount++;
-        auto* state = pool.make<TermsEnum::PostingsState>(termsEnum->postingsState());
-        result.postingsStates[i] = state;
-        result.termStats.docFreq += state->docFreq;
-        result.termStats.totalTermFreq += state->totalTermFreq;
-      }
-
-      if (foundInSegCount == 0) {
-        pool.rewind(savepoint);
-        cachedFieldInfo.termInfos.erase(iter);
-        return nullptr;
-      }
-
-      return &result;
-    }
-
-    bool lookupTermStats(CachedFieldInfo& cachedFieldInfo, std::string_view term, Similarity::TermStats& result) {
-      result = {};
-      bool found = false;
-      for (int i = 0; i < (int)numSegments(); ++i) {
-        if (termAbsent(cachedFieldInfo, (size_t)i, term)) continue;
-        auto* termsEnum = getTermsEnum(cachedFieldInfo, (size_t)i);
-        if (!termsEnum || !termsEnum->seek(term)) {
-          continue;
-        }
-        found = true;
-        result.docFreq += termsEnum->docFreq();
-        result.totalTermFreq += termsEnum->totalTermFreq();
-      }
-      return found;
+    bool lookupTermStats(CachedFieldInfo& field, std::string_view term, Similarity::TermStats& result) {
+      assertTermPlanning();
+      return termFacts.lookupTermStats(field, term, result);
     }
 
     bool lookupTermStats(std::string_view field, std::string_view term, Similarity::TermStats& result) {
-      CachedFieldInfo* cachedFieldInfo = getCachedFieldInfo(field);
-      if (cachedFieldInfo == nullptr) {
-        result = {};
-        return false;
-      }
-      return lookupTermStats(*cachedFieldInfo, term, result);
+      assertTermPlanning();
+      return termFacts.lookupTermStats(field, term, result);
     }
 
   };
