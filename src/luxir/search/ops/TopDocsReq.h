@@ -91,8 +91,40 @@ public:
   };
 
 private:
+  struct SourceSelection {
+    // View cache used for resident selection and weight-time registration.
+    FilterCache* cache;
+    // Accepted whole-membership source for count or ranking.
+    FilterCache::Use* cacheFirstMembershipUse;
+    // Accepted sources for an exact child domain.
+    std::span<FilterCache::Use*> residentExactDomainUses;
+    // Original request weight flags, including scoring.
+    int32_t requestFlags;
+    // Initial main weight flags after choosing a resident route.
+    int32_t mainWeightFlags;
+    // The request asks for score-ranked hits and an unbounded exact count.
+    bool exactCountTopK;
+    // Ranked exact-domain hits can use constant scores.
+    bool constantExactDomainRanking;
+    // The exact-count top-K route accepted a resident count source.
+    bool cacheFirstTopKCount;
+    // The entire exact domain can use resident sources.
+    bool cacheFirstExactDomain;
+    // Field sort can rank directly from resident membership.
+    bool cacheFirstFieldSort;
+    // Resident top-K counting still needs a variable-score ranking weight.
+    bool cacheFirstVariableRanking;
+    // The selected route can skip the main weight and its context.
+    bool omitMainWeight;
+  };
+
   // Additional inputs used only during materialization.
   const Preparation preparation;
+  // Filled once before building the execution plan.
+  std::optional<SourceSelection> sourceSelection;
+
+  // Select and pin resident sources without building a context or weights.
+  void selectSources();
 
 public:
   // Parsed inputs shared by planning and execution.

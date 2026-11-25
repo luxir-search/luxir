@@ -45,7 +45,8 @@ TopDocsReq::TopDocsReq(
     diversify(diversify), headSort(std::move(headSort)), scoreProfile(scoreProfile),
     requestNeedsScores(requestNeedsScores) {}
 
-void TopDocsReq::materialize() {
+void TopDocsReq::selectSources() {
+  assert(!sourceSelection);
   int32_t requestFlags = preparation.weightFlags;
   if (requestNeedsScores) requestFlags |= Query::NEED_SCORES;
   bool exactCountTopK = preparation.exactCountTopKShape && !preparation.boundedCount;
@@ -177,6 +178,37 @@ void TopDocsReq::materialize() {
   int32_t mainWeightFlags = cacheFirstVariableRanking
       ? requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING
       : requestFlags;
+  sourceSelection = SourceSelection{
+      .cache = cache,
+      .cacheFirstMembershipUse = cacheFirstMembershipUse,
+      .residentExactDomainUses = residentExactDomainUses,
+      .requestFlags = requestFlags,
+      .mainWeightFlags = mainWeightFlags,
+      .exactCountTopK = exactCountTopK,
+      .constantExactDomainRanking = constantExactDomainRanking,
+      .cacheFirstTopKCount = cacheFirstTopKCount,
+      .cacheFirstExactDomain = cacheFirstExactDomain,
+      .cacheFirstFieldSort = cacheFirstFieldSort,
+      .cacheFirstVariableRanking = cacheFirstVariableRanking,
+      .omitMainWeight = omitMainWeight,
+  };
+}
+
+void TopDocsReq::materialize() {
+  if (!sourceSelection) selectSources();
+  const auto& selected = *sourceSelection;
+  auto* cache = selected.cache;
+  auto* cacheFirstMembershipUse = selected.cacheFirstMembershipUse;
+  auto residentExactDomainUses = selected.residentExactDomainUses;
+  int32_t requestFlags = selected.requestFlags;
+  int32_t mainWeightFlags = selected.mainWeightFlags;
+  bool exactCountTopK = selected.exactCountTopK;
+  bool constantExactDomainRanking = selected.constantExactDomainRanking;
+  bool cacheFirstTopKCount = selected.cacheFirstTopKCount;
+  bool cacheFirstExactDomain = selected.cacheFirstExactDomain;
+  bool cacheFirstFieldSort = selected.cacheFirstFieldSort;
+  bool cacheFirstVariableRanking = selected.cacheFirstVariableRanking;
+  bool omitMainWeight = selected.omitMainWeight;
   Query::Context* qcontext = nullptr;
   if (omitMainWeight) {
     skipCount(SkipStats::cacheFirstQueryContextsOmitted);
