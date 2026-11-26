@@ -260,6 +260,26 @@ public:
     counts.unfiltered = unfiltered;
     return counts;
   }
+
+  // A row in the presence bitmap has at least one vector. The domain is live-filtered.
+  static bool hasEligibleVector(VectorReader& vr, DocSet* domain) {
+    if (!domain) return vr.numVectors() > 0;
+    const auto& docs = vr.strColReader().docsReader();
+    const auto* bitmap = docs.bitset();
+    // Without a bitmap every row has a vector; assume so for any other shape too.
+    if (!bitmap) return !docs.allRows() || domain->card() > 0;
+    if (domain->type == DocSet::BITSET) {
+      return bitmap->intersectionCardinality(((const BitDocSet*)domain)->bits()) > 0;
+    }
+    auto present = docs.bitmapIterator();
+    for (int32_t doc : ((const ArrDocSet*)domain)->docs()) {
+      if (present.val() < doc) present.advance(doc);
+      if (present.val() == doc) return true;
+      if (present.val() == PostingsReader::END) break;
+    }
+    return false;
+  }
+
   // Test/benchmark seam only. Zero selects the measured default; positive
   // values are clamped to R/k so k groups remain reachable in R documents.
   static inline int32_t membersPerGroupForTests = 0;
@@ -843,9 +863,9 @@ public:
 
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
-    unused(context);
     checkedBoostProduct(multiplier, 1.0f);
     validateKnnLogical();
+    context.requirePreparation();
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
@@ -1119,6 +1139,21 @@ public:
           VectorReader vr(reader.segments()[i].postingsReader(), *info);
           segCount = vr.numVectors();
           if (segCount > 0) {
+            if (!VectorScorer::isScorable(vr.encoding(), metric)) {
+              auto& seg = reader.segments()[i];
+              bool hasEligible;
+              if constexpr (Owned) {
+                auto binding = v2dPerSeg[i];
+                int64_t physicalUnits, eligibleUnits;
+                hasEligible = countOwned(vr, binding, seg.postingsReader(), *info, scratch,
+                    nullptr, query.resultPath, physicalUnits, eligibleUnits).eligibleVectors > 0;
+              } else {
+                DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
+                hasEligible = hasEligibleVector(vr, domain ? domain : seg.liveDocSet());
+              }
+              if (!hasEligible) continue;
+              VectorScorer::checkScorable(vr.encoding(), metric, query.getField());
+            }
             if (vr.dims() != dims) {
               throw std::runtime_error(std::format(
                 "KnnQuery: query vector dims {} do not match segment dims {} for field '{}'",

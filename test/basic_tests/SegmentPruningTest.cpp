@@ -9,6 +9,7 @@
 #include "luxir/index/IndexWriter.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/CatalogSummaryView.h"
+#include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
@@ -285,6 +286,69 @@ TEST_F(SegmentPruningTest, scoresUseStatisticsOfEverySegment) {
   expectSameWithAndWithoutPruning(disjunction);
 }
 
+TEST_F(SegmentPruningTest, rootsShareTermFactsAcrossPrunedAndUnprunedSegments) {
+  indexThreeSegments();
+  std::string_view json = R"({"ops": {
+    "pruned": {"top_docs": {"query": "body_t:common AND price_i:[11 TO 13]", "get_scores": true}},
+    "whole": {"top_docs": {"query": "body_t:common", "get_scores": true}}
+  }})";
+  auto req = localReq(helper->getSearchEngine());
+  parseQueryRequest(json, req->rawRequest(), req->mr);
+  {
+    SkipStatsScope stats;
+    req->collection("prune").execute(false);
+    ASSERT_OK(req);
+    EXPECT_EQ(3, SkipStats::termDictionarySeeks);
+    EXPECT_EQ(2, prunedSegments.load());
+  }
+  expectSameWithAndWithoutPruning(json);
+}
+
+TEST_F(SegmentPruningTest, rootsReuseAbsentTermFacts) {
+  indexThreeSegments();
+  auto req = localReq(helper->getSearchEngine());
+  req->topDocs("first").matchQuery("body_t", "jewel").countLimit();
+  req->topDocs("second").matchQuery("body_t", "jewel").countLimit();
+  req->topDocs("present").matchQuery("body_t", "common").countLimit();
+  SkipStatsScope stats;
+  req->collection("prune").execute(false);
+  ASSERT_OK(req);
+  // The absent term falls within the term bounds of two segments.
+  EXPECT_EQ(5, SkipStats::termDictionarySeeks);
+  EXPECT_EQ(0, req->getMatchCount("first"));
+  EXPECT_EQ(0, req->getMatchCount("second"));
+  EXPECT_EQ(9, req->getMatchCount("present"));
+}
+
+TEST_F(SegmentPruningTest, nestedTermUsesChildViewStatistics) {
+  SchemaBuilder schema;
+  using Type = api::FieldDef::FieldClass;
+  schema.field("body").type = Type::TEXT;
+  schema.field("items").type = Type::NESTED;
+  schema.field("items.body").type = Type::TEXT;
+  schema.set(helper->collection());
+  indexJson({R"({"id":"a","body":"common","items":[{"body":"common"},{"body":"other"}]})",
+             R"({"id":"b","body":"common","items":{"body":"other"}})"});
+  auto req = localReq(helper->getSearchEngine());
+  parseQueryRequest(R"({"ops":{
+    "root":{"top_docs":{"query":"body:common","get_scores":true}},
+    "join":{"top_docs":{"query":{"to_parent":{"path":"items","score":"max","query":"body:common"}},"get_scores":true}},
+    "child":{"domain":{"to":"items"},"top_docs":{"query":"body:common","get_scores":true}}
+  }})", req->rawRequest(), req->mr);
+  SkipStatsScope stats;
+  req->collection("prune").execute(false);
+  ASSERT_OK(req);
+  auto scores = [&](std::string_view op) {
+    return std::get<api::ColFloat>(req->docList(op)->columns.at("_score_").kind).v;
+  };
+  ASSERT_EQ(2, scores("root").size());
+  ASSERT_EQ(1, scores("join").size());
+  ASSERT_EQ(1, scores("child").size());
+  EXPECT_EQ(scores("child")[0], scores("join")[0]);
+  EXPECT_LT(scores("root")[0], scores("join")[0]);
+  EXPECT_EQ(2, SkipStats::termDictionarySeeks);
+}
+
 TEST_F(SegmentPruningTest, reopenedProofsUseTheNewCoresDictionaryBounds) {
   ASSERT_TRUE(helper->indexAll({flatdoc("id", "1", "tag_s", "green"), flatdoc("id", "2", "tag_s", "red"),
                                 flatdoc("id", "3", "tag_s", "middle")}, UpdateMessage::COMMIT).success);
@@ -349,6 +413,36 @@ TEST_F(SegmentPruningTest, impossibleClauseKeepsPreparedRowOpValidation) {
   req->testForcePrepare = true;
   req->collection("prune").execute(false);
   EXPECT_TRUE(req->errorMsg().contains("prepared queries and routed filters")) << req->errorMsg();
+}
+
+TEST_F(SegmentPruningTest, unvalidatedGeneratedRootKeepsItsPreparation) {
+  indexThreeSegments();
+  auto reader = currentReader();
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  TermQuery absent("tag_s", "zz");
+  absent.validateLogical(context.planningContext());
+  ForcePrepareQuery generated(&absent);
+  generated.markPlannerGenerated();
+  EXPECT_TRUE(context.createRootWeight(generated, 0)->needsPrepare());
+}
+
+TEST_F(SegmentPruningTest, repeatedValidationKeepsPreparation) {
+  indexThreeSegments();
+  auto reader = currentReader();
+  TermQuery absent("tag_s", "zz");
+  ForcePrepareQuery prepared(&absent);
+  MemPool pool;
+  Query::Context first(pool, *reader);
+  Query::Context second(pool, *reader);
+  for (auto* context : {&first, &second}) {
+    prepared.validateLogical(context->planningContext());
+    EXPECT_TRUE(prepared.mayRequirePreparation());
+    EXPECT_FALSE(absent.mayRequirePreparation());
+    auto* weight = context->createRootWeight(prepared, 0);
+    EXPECT_TRUE(weight->provenEmpty(reader->segments().front()));
+    EXPECT_TRUE(weight->needsPrepare());
+  }
 }
 
 TEST_F(SegmentPruningTest, provenZeroWarmsTheAuthoredWholeCountKey) {
@@ -778,6 +872,33 @@ TEST_F(SegmentPruningTest, emptyRootsSkipCollection) {
   EXPECT_TRUE(notes(topDocs(R"({"range":{"field":"price_i","gte":1,"lte":23}})")).empty());
 }
 
+TEST_F(SegmentPruningTest, unrelatedPreparationKeepsTheEmptyWeightShortcut) {
+  SchemaBuilder schema;
+  auto& vector = schema.field("v_v");
+  vector.type = api::FieldDef::FieldClass::VECTOR;
+  vector.dims = 2;
+  vector.metric = api::VectorMetric::L2;
+  schema.set(helper->collection());
+  indexJson({R"({"id":"one","tag_s":"a","v_v":[0,0]})"});
+
+  std::string knn = R"({"knn":{"field":"v_v","query":[0,0],"k":1,"exact":true}})";
+  // The routed filter and the facet bucket are validated before the empty
+  // root's weight. Fusion validates its shared filter after the source.
+  for (const auto& json : {
+      topDocs(R"("tag_s:zz")", R"(,"filter":[{"query":)" + knn +
+          R"(,"except_ops":["tags"]}],"ops":{"tags":{"field_facet":{"field":"tag_s"}}})"),
+      topDocs(R"("tag_s:zz")", R"(,"ops":{"near":{"query_facet":{"buckets":{"one":)" +
+          knn + "}}}}"),
+      R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{"q":{"query":"tag_s:zz"}},"filter":[)" +
+          knn + "]}}}}"}) {
+    SCOPED_TRACE(json);
+    EXPECT_TRUE(std::ranges::any_of(notes(json), [](const std::string& note) {
+      return note.starts_with("op q: empty weight for the collection");
+    }));
+    expectSameWithAndWithoutPruning(json);
+  }
+}
+
 // kNN prepares over the whole index, so its op keeps its weights; its
 // segments are still pruned for collection, and the answer is unchanged.
 TEST_F(SegmentPruningTest, emptyRootKeepsWholeIndexPreparation) {
@@ -793,9 +914,9 @@ TEST_F(SegmentPruningTest, emptyRootKeepsWholeIndexPreparation) {
                                       "v_v", std::vector<float>{(float)segment, 0}),
                               UpdateMessage::COMMIT).success);
   }
-  std::string json = R"({"ops":{"q":{"top_docs":{"query":{"boolean":{"required":[)"
-                     R"({"knn":{"field":"v_v","query":[0,0],"k":2}},{"range":{"field":"price_i","gte":100}}]}},)"
-                     R"("limit":5,"count_limit":-1,"fields":["id"]}}}})";
+  std::string json = topDocs(R"({"boolean":{"required":[{"boolean":{"required":[)"
+      R"({"knn":{"field":"v_v","query":[0,0],"k":2}}],"filter":["*:*"]}},)"
+      R"({"range":{"field":"price_i","gte":100}}]}})");
   auto explained = notes(json);
   ASSERT_EQ(2u, explained.size());
   for (const auto& note : explained) EXPECT_TRUE(note.starts_with("op q: pruned segment")) << note;

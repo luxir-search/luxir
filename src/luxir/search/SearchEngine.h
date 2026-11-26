@@ -34,9 +34,9 @@ class SearchEngine {
   // Records a failure on the request after draining its fan-out scope.
   void failBody(SearchRequest& req, std::exception& e, ErrorKind fallback);
   // Fails the request with `failure` after a round of reads, then finishBody().
-  void abandon(SearchRequest& req, std::exception_ptr failure, RootOp* root);
+  void abandon(SearchRequest& req, std::exception_ptr failure);
   // Releases segment state, fills the profile and warnings, and sends the final response.
-  void finishBody(SearchRequest& req, RootOp* root);
+  void finishBody(SearchRequest& req);
   // Goes on with the request after its rounds; with a failure, fails it.
   using Resume = std::function<void(std::exception_ptr failure)>;
   // Issues the request's declared rounds until it has nothing more to read

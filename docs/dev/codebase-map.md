@@ -80,7 +80,8 @@ locations, browse `src/luxir/<area>/`.
      dictionary terms that names its own kind (split-block Bloom or binary fuse) and
      parameters. `IdFilter::Options` picks what a writer builds (none by default).
      `SegmentCore::idFilter` reads it; the writer's delete application skips ids
-     and segments it excludes
+     and segments it excludes. After core open it prefetches whole filters, then
+     survivors' whole lookup parts.
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
      its first use reads metadata and endpoints without scanning child rows.
@@ -184,14 +185,17 @@ locations, browse `src/luxir/<area>/`.
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)
    - `VectorReader`: reads column-stored vectors in the segment's `VectorEncoding`
-     (`codec/VectorCodec.h`: f32, f16, bf16, per-vector sq8) for exact flat KNN
+     (`codec/VectorCodec.h`: f32, f16, bf16, per-vector sq8, bit) for exact flat KNN
    - `VectorScorer` (`query/`): the one place a float query is scored against a stored row
-     per encoding (FAISS scalar-quantizer computers for f16 and bf16, the register
-     kernels of `query/Sq8Kernel.h` for sq8), shared by the flat column scan and
-     candidate rescore
+     per encoding, shared by the flat column scan and candidate rescore. Uses FAISS
+     scalar-quantizer computers for f16 and bf16, CPU-selected register kernels
+     (`query/Sq8Kernel.h`) for sq8, with a decode-first fallback, and a Hamming
+     kernel selected for the CPU and row size
+   - `query/HammingKernel.h`: runtime dispatch for bit / hamming popcount
    - `VectorTranscoder`: a vector column's encoding in a merge (the schema's current one),
      re-encoding inputs in another; `SegmentMerger` passes each value through it
    - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (RaBitQ by default, or explicit PQ) aux overlays for ANN, built from the decoded column
+   - `RaBitQScorer` (`query/`): scores blocks of one-bit IVF codes and packs query planes for its kernel level, selected at run time on GCC x86-64
    - `util/VectorRotation.h`: seeded orthogonal FHT-Kac transform shared by ANN builders, readers and queries; parameters define the rotation disk contract.
    - Reuses column storage for exact search, cosine raw-column normalization, and candidate rescoring
    - See [../guide/vector-search.md](../guide/vector-search.md) for the user contract (query knobs, scoring, recall) and [../design/vector-search.md](../design/vector-search.md) for the overlay/build/query internals

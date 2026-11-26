@@ -62,7 +62,7 @@ void VectorFieldType::signatureProps(SignatureProps& out) const {
   FieldType::signatureProps(out);
   out["dims"] = std::to_string(inputDims());
   if (truncateDims() > 0) out["truncate_dims"] = std::to_string(truncateDims());
-  static constexpr const char* metrics[] = {"none", "l2", "ip", "cosine"};
+  static constexpr const char* metrics[] = {"none", "l2", "ip", "cosine", "hamming"};
   out["metric"] = "\"" + std::string(metrics[metric()]) + "\"";
   out["normalize_on_write"] = normalizeOnWrite() ? "true" : "false";
   out["normalized"] = metric() == METRIC_COSINE && normalized() ? "true" : "false";

@@ -15,6 +15,8 @@ struct FieldSignature {
   std::string logicalName;
   std::string label;
   std::map<std::string, std::string> properties;
+  // Physical encoding is used for schema validation, outside the introduction properties.
+  std::optional<VectorEncoding> vectorEncoding;
 
   FieldSignature(std::string_view name, FieldType& type);
 };

@@ -5,6 +5,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <format>
+#include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -20,9 +23,10 @@ namespace luxir {
 /// output encoding and passes every value through it, without knowing what the
 /// bytes mean.
 ///
-/// The output is the schema's current encoding, so a field converges to its
-/// declared encoding as its segments merge; when the schema no longer has a
-/// vector type under the name, it is the first non-empty input's.  Values of
+/// The output is fixed at construction. It is the schema's current encoding
+/// when all inputs can convert to it, otherwise the first input's encoding.
+/// Merge admission keeps bit and float inputs apart (vcodec::convertible), so
+/// inputs on both sides of that boundary are a logic error. Values of
 /// an input already in the output encoding are copied verbatim.  Others are
 /// decoded and re-encoded: f16 clamps elements to its range, counting them for
 /// one warning per merged field, and cosine rows promoted to f32 in a field
@@ -31,8 +35,7 @@ namespace luxir {
 /// element (at most VectorFieldType::MAX_ELEMENT_MAGNITUDE), so they never clamp.
 class VectorTranscoder {
   std::string_view field;
-  bool hasOutput = false;
-  VectorEncoding output = VectorEncoding::F32;
+  VectorEncoding output;
   bool renormalize = false;
   VectorEncoding input = VectorEncoding::F32;
   int32_t dims = 0;
@@ -41,11 +44,23 @@ class VectorTranscoder {
   std::vector<char> encoded;
 
 public:
-  /// current: the schema's type for the field now, or null.
-  VectorTranscoder(std::string_view field, const FieldType* current) : field(field) {
+  /// inputs: the recorded encodings of the sources with a vector column.
+  VectorTranscoder(std::string_view field, const FieldType* current, std::span<const VectorEncoding> inputs)
+    : field(field), output(inputs.front()) {
+    for (auto encoding : inputs) {
+      if (!vcodec::convertible(encoding, output)) {
+        throw std::logic_error(std::format(
+            "vector field '{}': merge inputs mix bit and float encodings", field));
+      }
+    }
     if (auto* vtype = dynamic_cast<const VectorFieldType*>(current)) {
-      hasOutput = true;
-      output = vtype->encoding();
+      // Convertibility partitions the encodings, so checking the first input suffices.
+      if (vcodec::convertible(output, vtype->encoding())) {
+        output = vtype->encoding();
+      } else {
+        LOG_WARN("VectorTranscoder: field '{}': keeping the inputs' {} encoding; a merge does not convert to {}",
+                 field, vcodec::name(output), vcodec::name(vtype->encoding()));
+      }
       renormalize = output == VectorEncoding::F32 && vtype->metric() == VectorFieldType::METRIC_COSINE
           && (vtype->normalizeOnWrite() || vtype->normalized());
     }
@@ -56,10 +71,6 @@ public:
     VectorReader column(reader, record);
     input = column.encoding();
     dims = column.dims();
-    if (!hasOutput) {
-      hasOutput = true;
-      output = input;
-    }
     if (input != output) {
       floats.resize((size_t)dims);
       encoded.resize((size_t)vcodec::bytesPerVector(output, dims));

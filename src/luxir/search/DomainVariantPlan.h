@@ -225,6 +225,7 @@ public:
       bool applyParentFilters = false,
       std::span<const QuerySpec> extraFilters = std::span<const QuerySpec>());
 
+  void declareReads(ReadDeclarer& reads, Query::PlanningContext& planning, int32_t requestFlags) const;
   void buildWeights(
       Query::Context& context, Query::PlanningContext& planning,
       int32_t requestFlags);

@@ -209,16 +209,40 @@ The maker receives a `PluginOpContext` while the request is parsed and returns a
 - `node()` returns the request's node by reference. Its `pluginState<T>(name)`
   accesses the same state that query makers and HTTP handlers see.
 - `parseQuery(...)` lowers and validates a query against the op's `planning()`
-  context; `weightContext()` is the `Query::Context` for `createWeight`, and
-  `planning().getFilterUse(query)` its filter cache entry.
+  context. Keep the returned query and the `Query::PlanningContext&` on the op.
+  The `PluginOpContext` and its `ParseContext` expire when the maker returns.
 - `parseSource(name, val)` parses a TopDocs-shaped param as a source the op runs
   itself, as `FusionOp` runs its sources: set its `rankingSink` and `parent`,
   create its calculator under the op's own, dispatch it per segment and receive
-  the merged collector.
+  the merged collector. The returned source is logical. Inspect its execution
+  state in the plugin op's `materialize()`, after the source's step has run.
 - `addSubs(op)` parses the nested ops into `op.subOps`. They run over whatever
   domain the op hands their calculators (`acceptAll` with one `DomainHandle` per
   segment; an empty set, never null, for a segment with no documents), and may not
   declare their own `domain`.
+
+A maker constructs the op from parsed, validated inputs. Override
+`SearchOp::materialize()` to create execution contexts, weights, and filter
+uses. The engine finishes logical parsing for the request before running
+materialization in recorded order. The hook runs once, serially, before
+`init()` and after the sources the maker parsed.
+The debug phase check covers contexts built from the request's planning state.
+A maker still violates the lifecycle by constructing a private standalone
+`Query::Context` during parsing, which the debug check cannot detect.
+
+`releaseSegmentState()` can be called if the op's `materialize()` never ran or
+threw partway through. It must tolerate unset execution state.
+
+For example, `query_count` stores the parsed query and planning context in its
+maker and builds the unscored weight in its materialization hook.
+
+```cpp
+void materialize() override {
+  auto* context = luxir::Query::Context::create(&req.arena, planning);
+  weight = context->createRootWeight(query, 0);
+  if (weight->needsPrepare()) throw luxir::RequestError("query_count requires a segment-local query");
+}
+```
 
 The op's calculator follows the `SearchOp::Calculator` contract (see
 `src/luxir/search/ops/SearchOp.h` and `FusionOp.h`). Results are a `Val` in the
@@ -235,7 +259,7 @@ field list to omit that physical field or select the extra by name. `_score_`
 and `_version_` are reserved output names and cannot be extras. Duplicate extra
 names are a plugin error (`std::logic_error`); field clashes are `RequestError`s.
 All checks run during resolution, before any column or loader is created.
-A free-form result is a `Map`. Nested op
+A plugin can also return a scalar or a `Map`. Nested op
 results go in the `DocList`'s `ops` (route them in `getTargetForSub`). `format=docs`
 accepts only `top_docs` and `fusion` ops.
 
@@ -279,8 +303,10 @@ r.http.add("POST", "/collections/{collection}/_sample",
 and `unscoped_value` to test rejection of a PLUGIN query without the base.
 It also registers a `sample_docs` search op
 (rank columns named by `rank_names`, defaulting to `_rank`, and nested ops over
-its documents), two HTTP routes and a per-node state with query, op and route
-counters. The makers and handlers reach that state through their contexts.
+its documents), and a `query_count` leaf op that counts a segment-local query
+within its input domain. The plugin has two HTTP routes and a per-node state
+with query, op and route counters. The makers and handlers reach that state
+through their contexts.
 `PluginExtensionTest` and `PluginQueryTest` exercise the plugin end to end,
 including independent live nodes; `PluginTest` covers registry validation and
 state creation/destruction order.
@@ -686,10 +712,20 @@ last part.
 
 ## Result decorators
 
-`Registries::hitDecorators` registers a maker receiving a `DecoratorContext`
-(request, query parse context, and original ranking queries with execution
-contexts) and a `ParamReader`. Return a shared `HitDecorator` with a unique output column name.
-Register during startup; the registry is frozen with the other registries.
+`Registries::hitDecorators` registers a logical maker receiving a
+`DecoratorContext` and a `ParamReader`. The context provides the request, the
+query parse context, and original ranking queries with their planning contexts.
+Validate parameters and return a shared `HitDecorator` with a fixed, unique
+`columnName()` so parsing can check name collisions. The maker context and
+source span expire when the maker returns. Register during startup before the
+registries freeze.
+
+`HitDecorator::bind(sources)` is called once, serially, before execution and
+after both request-wide logical validation and source materialization. Each
+source supplies its original ranking query and execution context. A cache-resident
+source that omitted its weight gets an execution context on demand. Binding can inspect
+the existing queries and copy borrowed data. Query parsing belongs in the
+maker. The default binding does nothing, which is sufficient for `label`.
 
 TopDocs and Fusion accept `decorate: {"registered_name": {params...}}` on the
 wire. JSON also accepts a registered name directly as a list key. Unknown names,
@@ -706,15 +742,15 @@ ADAPTIVE placement and streaming paths.
 
 Keep mutable readers and forward-only iterators call-local: sorting is per batch,
 and a later ranked batch can contain lower document IDs. Immutable per-request
-plans may be shared with synchronization during initialization. Decorators cannot
+plans may be shared by concurrent calls after binding. Decorators cannot
 change membership, order or scores. The output name must not collide with another
 extra column. Decorators are also invoked for nested top-doc lists, collapsed
 heads, and diversified lists.
 
 ### Inspecting the ranking queries
 
-In the maker, call `source.query->visit(visitor, source.context)` for each entry
-in `DecoratorContext::queries`; a null query means browse. `QueryVisitor`
+In `bind()`, call `source.query->visit(visitor, source.context)` for each
+source with a query. A null query means browse. `QueryVisitor`
 (`luxir/query/QueryVisitor.h`) reports indexed bytes through `term(field, text,
 boost)`. `sub(occur, parent)` chooses the visitor for a composite's children or
 returns null to skip them; the default skips MUST_NOT. Inspectors interested only
@@ -722,12 +758,12 @@ in ranking terms should also skip FILTER. `leaf(query)` means the term picture
 is incomplete. Plugin queries can override the protected `Query::visitImpl`
 to participate without exposing their concrete tree.
 
-Inspection runs only during serial planning, in the maker. It may expand fuzzy
+Inspection runs during serial binding. It may expand fuzzy
 terms, cache the expansion shared with execution, and throw the request's
 multi-term budget errors. Never call visit from concurrent `decorate()` calls.
 Term views borrow query/context storage; copy what decorate needs into the
-decorator. The example `ranking_terms` decorator does this (it lists request
-ranking terms, not the terms matched by each hit).
+decorator. The example `ranking_terms` decorator lists the terms of the request's
+ranking queries.
 
 Traversal preserves raw Boolean occurrences and authored dis_max disjuncts.
 Boosts mirror logical validation and execution: filter children reset the

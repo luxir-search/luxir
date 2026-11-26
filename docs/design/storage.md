@@ -369,6 +369,15 @@ needs:
 - the syncer reporting which files are published, so that eviction knows
   what it may drop.
 
+Delete application uses at most two potentially nonempty prefetch rounds for
+base-file reads after the target cores are open. Core opens, live docs and
+retries after a failed batch are outside that count. The first round acquires
+whole id filters across segments. For segments with a surviving id, the second
+acquires routing data, the whole dictionary, run streams and version runs.
+The core retains these whole parts, including speculative reads a lookup may
+never use. RAM and mmap follow the same selection and declaration stages with
+no prefetch submissions. Sparse reads for cold updates are future work.
+
 ## Pruning metadata
 
 Field record headers in the catalog hold per-segment bounds, counts, and

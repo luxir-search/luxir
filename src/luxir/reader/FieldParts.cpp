@@ -92,9 +92,11 @@ Slice DecodedFieldRecord::termTrie() const {
 }
 
 Slice DecodedFieldRecord::termNavigation() const {
-  if (!terms()) return Slice();
+  auto* dictionary = terms();
+  if (!dictionary) return {};
   auto offsets = termBlockOffsets();
-  return {offsets.location, termTrie().end().offset() - offsets.location.offset()};
+  auto trie = field_parts::termTrie(offsets, dictionary->trieBytes);
+  return {offsets.location, trie.end().offset() - offsets.location.offset()};
 }
 
 uint64_t DecodedFieldRecord::pointCount() const noexcept {

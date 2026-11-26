@@ -102,6 +102,30 @@ private:
         minShouldMatch(query.minShouldMatch) {}
   };
 
+  static int32_t filterWeightFlags(int32_t flags) {
+    return flags & ~(NEED_SCORES | ALLOW_PRUNING);
+  }
+
+  static int32_t exclusionWeightFlags(int32_t flags) {
+    return filterWeightFlags(flags) | EXCLUSION_WINDOW_FILL;
+  }
+
+  struct MandatoryWeightMode {
+    int32_t flags;
+    bool contributes;
+  };
+
+  static MandatoryWeightMode mandatoryWeightMode(const Query& query, int32_t flags) {
+    bool contributes = (flags & NEED_SCORES) != 0
+        && luxir::scoreProfile(query).kind != ScoreProfile::Kind::AUTO_UNIFORM;
+    return {contributes ? flags : flags & ~NEED_SCORES, contributes};
+  }
+
+  static bool mandatoryCacheEnabled(const IndexReader& reader) {
+    auto* cache = reader.filterCache();
+    return !disableMandatoryCacheForTests && cache && cache->enabled();
+  }
+
   struct CompiledBoolean {
     std::span<Query*> mandatory;
     std::span<Query*> optional;
@@ -118,6 +142,10 @@ private:
       return !disableUnscoredOptionalDropForTests && !needsScores
           && (!mandatory.empty() || !filter.empty())
           && minShouldMatch < 1;
+    }
+
+    std::span<Query*> optionalForWeight(int32_t flags) const {
+      return dropsOptional((flags & NEED_SCORES) != 0) ? std::span<Query*>{} : optional;
     }
 
     // The one clause that alone determines unscored membership, or null.
@@ -715,6 +743,13 @@ private:
     });
   }
 
+  template <class Single, class Composite>
+  decltype(auto) dispatchWeight(PlanningContext& planning, Single&& single, Composite&& composite) const {
+    auto& plan = logicalPlan(planning);
+    if (plan.singleChild != nullptr) return single(*plan.singleChild);
+    return composite(plan);
+  }
+
 public:
   static inline bool disableBulkDomainDriveForTests = false;
   static inline bool disableWindowDispatchForTests = false;
@@ -1276,6 +1311,8 @@ public:
       .filter = {plan.filter.data(), plan.filter.size()},
     };
   }
+
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;

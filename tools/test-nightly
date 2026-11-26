@@ -61,6 +61,21 @@ class NightlyTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.assemble()
 
+    def test_failed_leg_is_left_out_and_noted(self):
+        import shutil
+        shutil.rmtree(self.root / "nightly-macos-arm64-macos-release")
+        os.environ["NIGHTLY_LEGS"] = " ".join(self.presets)
+        self.addCleanup(os.environ.pop, "NIGHTLY_LEGS")
+        legs, missing = nightly.built_legs(self.root)
+        self.assertEqual(missing, ["macos-arm64/macos-release"])
+        assets, notes = nightly.assemble(self.root, self.commit, "registry:key", legs, missing)
+        self.assertEqual(len(list(assets.iterdir())), 4)
+        self.assertIn("did not run): `macos-arm64/macos-release`", notes.read_text())
+        for leg in legs:
+            shutil.rmtree(self.root / ("nightly-" + "-".join(nightly.split_leg(leg))))
+        with self.assertRaisesRegex(RuntimeError, "No nightly leg"):
+            nightly.built_legs(self.root)
+
     def test_wrong_commit_blocks_assembly(self):
         self.commit = "c" * 40
         with self.assertRaisesRegex(ValueError, "Wrong source"):

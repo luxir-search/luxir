@@ -66,18 +66,21 @@ jobs:
         env:
           PRESET: ${{ matrix.preset }}
         run: tools/nightly-build "$PRESET"
+      # Only a successful leg uploads under nightly-*, which is what publish
+      # gathers; a failed leg keeps its logs under failed-nightly-*.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
-          name: nightly-${{ matrix.platform }}-${{ matrix.preset }}
+          name: ${{ job.status == 'success' && 'nightly' || 'failed-nightly' }}-${{ matrix.platform }}-${{ matrix.preset }}
           path: build/nightly/${{ matrix.platform }}-${{ matrix.preset }}/
-          if-no-files-found: error
+          if-no-files-found: ${{ job.status == 'success' && 'error' || 'warn' }}
           retention-days: 14
 
-  # Add future platform build jobs to needs. All must succeed before publishing.
+  # Add future platform build jobs to needs. Publishes whichever legs succeeded,
+  # so one failed or unscheduled runner does not hold back the rest.
   publish:
     needs: [plan, build]
-    if: needs.plan.outputs.build == 'true'
+    if: ${{ !cancelled() && needs.plan.outputs.build == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:

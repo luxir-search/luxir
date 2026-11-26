@@ -27,6 +27,13 @@ class RescoreQuery final : public Query {
   ValueProgram* program;
   std::optional<float> constantOutput;
 
+  bool childNeedsScore(int32_t flags) const {
+    return (flags & NEED_SCORES) != 0 && program->needsScore;
+  }
+  static int32_t childFlags(int32_t flags, bool needsScore) {
+    return needsScore ? flags : flags & ~NEED_SCORES;
+  }
+
   static ValueBounds scoreEnvironment(ScoreBounds bounds) {
     if (!std::isfinite(bounds.lo) || !std::isfinite(bounds.hi)
         || bounds.lo > bounds.hi) {
@@ -457,6 +464,8 @@ public:
     return child->appendFilterKey(out, ctx);
   }
 
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
+
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
 
@@ -530,10 +539,9 @@ public:
            float multiplier)
       : Query::Weight(context, query, flags), program(query.program),
         multiplier(multiplier), scored((flags & NEED_SCORES) != 0),
-        needsChildScore(scored && program->needsScore) {
+        needsChildScore(query.childNeedsScore(flags)) {
       if (scored) fieldInfos = program->resolveFields(context.pool, context.topReader);
-      int32_t childFlags = needsChildScore ? flags : flags & ~NEED_SCORES;
-      childWeight = query.child->createWeight(context, childFlags, 1.0f);
+      childWeight = query.child->buildWeight(context, childFlags(flags, needsChildScore), 1.0f);
       traits = childWeight->getFlags() & ~IS_CONSTANT_SCORING;
       if (!scored || query.constantOutput.has_value()) {
         traits |= IS_CONSTANT_SCORING;

@@ -336,41 +336,46 @@ TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
   BooleanQuery query(required, {}, {}, {});
   publishWholeMembershipForTests(*reader, query);
 
-  auto lreq = localReq(luxirNode->getSearchEngine());
-  lreq->collection("main");
-  auto& fusion =
-      lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
-  auto& mr = lreq->mr;
-  fusion.limit = 10;
-  fusion.count_limit = -1;
-  addField(fusion, "id", mr);
-  fusion.method.emplace<api::RrfFusion>().k = 60;
-
-  auto& countSource = addSource(fusion, "count", mr);
-  countSource.limit = 0;
-  countSource.count_limit = -1;
-  countSource.query = arenaQuery(mr, countQuery(mr));
-  auto& rankedSource = addSource(fusion, "ranked", mr);
-  rankedSource.limit = 10;
-  rankedSource.query = arenaQuery(mr, countQuery(mr));
-  addFilter(fusion.filter, qb::match(mr, "keep_s", "yes"), mr);
-
   auto cache = h.getIndexWriter()->snapshots.readers.filterCache;
-  auto credits = cache->counters().assumedCredits;
-  bool saved = SkipStats::enabled;
-  SkipStats::enabled = true;
-  SkipStats::reset();
-  lreq->execute(false);
-  int64_t wholeHits = SkipStats::wholeCountHits;
-  int64_t wholeBuilds = SkipStats::wholeCountBuilds;
-  int64_t wholeBypasses = SkipStats::wholeCountBypasses;
-  SkipStats::enabled = saved;
-  ASSERT_OK(lreq);
-  EXPECT_EQ(1, wholeHits);
-  EXPECT_EQ(0, wholeBuilds);
-  EXPECT_EQ(0, wholeBypasses);
-  EXPECT_EQ(credits + 1, cache->counters().assumedCredits);
-  EXPECT_EQ((std::vector<std::string>{"a", "d"}), resultIds(*lreq));
+  SearchOverridesGuard guard(QueryPrep::disableCanonicalCountFactsForTests);
+  // Disabling canonical count facts lets the count source accept resident
+  // doc IDs before building weights.
+  for (bool cacheFirst : {false, true}) {
+    SCOPED_TRACE(cacheFirst);
+    QueryPrep::disableCanonicalCountFactsForTests = cacheFirst;
+    auto lreq = localReq(luxirNode->getSearchEngine());
+    lreq->collection("main");
+    auto& fusion =
+        lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
+    auto& mr = lreq->mr;
+    fusion.limit = 10;
+    fusion.count_limit = -1;
+    addField(fusion, "id", mr);
+    fusion.method.emplace<api::RrfFusion>().k = 60;
+
+    auto& countSource = addSource(fusion, "count", mr);
+    countSource.limit = 0;
+    countSource.count_limit = -1;
+    countSource.query = arenaQuery(mr, countQuery(mr));
+    auto& rankedSource = addSource(fusion, "ranked", mr);
+    rankedSource.limit = 10;
+    rankedSource.query = arenaQuery(mr, countQuery(mr));
+    addFilter(fusion.filter, qb::match(mr, "keep_s", "yes"), mr);
+
+    auto credits = cache->counters().assumedCredits;
+    SkipStatsScope stats;
+    lreq->execute(false);
+    ASSERT_OK(lreq);
+    EXPECT_EQ(1, SkipStats::wholeCountHits);
+    EXPECT_EQ(0, SkipStats::wholeCountBuilds);
+    EXPECT_EQ(0, SkipStats::wholeCountBypasses);
+    EXPECT_EQ((int64_t)cacheFirst, SkipStats::cacheFirstQueryContextsOmitted);
+    // The ranked source always creates a context. The other belongs to the
+    // count source on the ordinary path or to the shared filters on a hit.
+    EXPECT_EQ(2, SkipStats::queryContextsCreated);
+    EXPECT_EQ(credits + 1, cache->counters().assumedCredits);
+    EXPECT_EQ((std::vector<std::string>{"a", "d"}), resultIds(*lreq));
+  }
 }
 
 // No fusion-level fields: the default projection applies to the fused list

@@ -171,18 +171,30 @@ public:
       : segmentCore(reader.core()), termData(fieldInfo.terms()), totals(fieldInfo.indexedTotals()),
         flags(fieldInfo.flags), currTerm(pool.alloc(TERM_BUFFER_BYTES), 0) {
     if (!termData) return;
-    auto blockOffsets = fieldInfo.termBlockOffsets();
+    auto offsetsBytes = fieldInfo.termBlockOffsets().bytes;
     // The blocks are data; the offsets and trie that route to them are
     // metadata. A lookup holds the routing data and then only the block it
     // lands in, unless the dictionary is read whole.
     auto navigation = segmentCore.slice(navigationPart(fieldInfo), ReadClass::METADATA);
     if (readsWhole(segmentCore, termData->dictionaryBlocks())) holdDictionary();
     termBlockOffsets = reinterpret_cast<const field_parts::Terms::BlockOffset*>(navigation.data());
-    numTermBlocks = (int32_t)(blockOffsets.bytes / sizeof(field_parts::Terms::BlockOffset));
-    trieBase = navigation.data() + blockOffsets.bytes;
+    numTermBlocks = (int32_t)(offsetsBytes / sizeof(field_parts::Terms::BlockOffset));
+    trieBase = navigation.data() + offsetsBytes;
     runCount = (int32_t)termData->runs.size();
     runs = termData->runs.data();
     selectRun(runs);
+  }
+
+  // Parts a forward walk can hold, including the streams selected on run changes.
+  static void wholeReadParts(const DecodedFieldRecord& field, auto&& emit) {
+    auto* terms = field.terms();
+    if (!terms) return;
+    emit(field.termNavigation(), ReadClass::METADATA);
+    emit(terms->dictionaryBlocks(), ReadClass::DATA);
+    for (const auto& run : terms->runs) {
+      if (run.docs) emit(run.docs, ReadClass::DATA);
+      if (run.positions) emit(run.positions, ReadClass::DATA);
+    }
   }
 
   int64_t numTerms() const {

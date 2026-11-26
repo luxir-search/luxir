@@ -80,28 +80,22 @@ public:
   boost::unordered_flat_map<std::string_view, SearchOp*> groupOps;
   bool diverseSources = false;
 
-  // ProtobufSearchParser builds each source TopDocsReq (with rankingSink wired)
-  // and the filter weights, then passes them in (see TopDocsReq's ctor comment).
+  // Takes the wired sources and validated shared filters.
   FusionOp(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view name, const ReqFusion& fusionProto,
            std::vector<TopDocsReq*>&& sources,
            std::vector<double>&& sourceWeights, int64_t topCount,
-           std::span<ParsedFilter> filters,
-           std::span<Query::Weight*> filterWeights, Method method, int32_t rrfK)
+           std::span<ParsedFilter> filters, Method method, int32_t rrfK)
     : SearchOp(req, view, name), fusionProto(fusionProto),
       sources(std::move(sources)), sourceWeights(std::move(sourceWeights)),
-      topCount(topCount), filters(filters),
-      filterWeights(filterWeights), method(method), rrfK(rrfK) {
+      topCount(topCount), filters(filters), method(method), rrfK(rrfK) {
     assert(this->sourceWeights.size() == this->sources.size());
-    if (!filterWeights.empty()) {
-      assert(!this->sources.empty());
-      assert(filterWeights.size() == filters.size());
-      auto& context = this->sources.front()->planning;
-      filterUses = context.pool.make_span<FilterCache::Use*>(filters.size());
-      for (size_t i = 0; i < filters.size(); i++) {
-        filterUses[i] = context.getFilterUse(*filters[i].query);
-      }
-    }
   }
+
+  void declareReads(ReadDeclarer& reads) const override;
+  // Build the shared-filter weights and uses, reusing the first source's context when present.
+  void materialize() override;
+  // Bind the decorators against all materialized sources in source order.
+  void bindDecorators();
 
   bool needsCount() const {
     return fusionProto.count_limit.has_value()

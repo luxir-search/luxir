@@ -30,8 +30,9 @@ RootOp* SearchEngine::prepare(SearchRequest& req) {
   getResources(req);
   req.lastResponse = SearchResponse::create(req, true);
 
-  ProtobufSearchParser parser(req);
-  return parser.parse();
+  auto* root = ProtobufSearchParser(req).parse();
+  req.materialize();
+  return root;
 }
 
 std::vector<std::string> SearchEngine::explain(const ReqProto& proto, std::string tenant) {
@@ -96,7 +97,7 @@ void SearchEngine::submitBody(SearchRequest& req, bool mayDefer, FanoutScope* ow
   }
   if (req.declaredReads) {
     auto resume = [this, &req](std::exception_ptr failure) {
-      if (failure) return abandon(req, failure, nullptr);
+      if (failure) return abandon(req, failure);
       planBody(req, true, req.tg);
     };
     if (readAhead(req, mayDefer, ownTg, std::move(resume))) return;
@@ -115,14 +116,14 @@ void SearchEngine::planBody(SearchRequest& req, bool mayDefer, FanoutScope* ownT
     root->init();
   } catch (std::exception& e) {
     failBody(req, e, ErrorKind::INVALID_REQUEST);
-    finishBody(req, root);
+    finishBody(req);
     return;
   }
   if (req.declaredReads) {
     // Planning registered what the weights will read: one more round.
     req.declaredReads->plan();
     auto resume = [this, &req, root](std::exception_ptr failure) {
-      if (failure) return abandon(req, failure, root);
+      if (failure) return abandon(req, failure);
       executeBody(req, root);
     };
     if (readAhead(req, mayDefer, ownTg, std::move(resume))) return;
@@ -164,7 +165,7 @@ void SearchEngine::executeBody(SearchRequest& req, RootOp* root) {
   } catch (std::exception& e) {
     failBody(req, e, fallback);
   }
-  finishBody(req, root);
+  finishBody(req);
 }
 
 void SearchEngine::failBody(SearchRequest& req, std::exception& e, ErrorKind fallback) {
@@ -183,18 +184,18 @@ void SearchEngine::failBody(SearchRequest& req, std::exception& e, ErrorKind fal
   req.setError(info);
 }
 
-void SearchEngine::abandon(SearchRequest& req, std::exception_ptr failure, RootOp* root) {
+void SearchEngine::abandon(SearchRequest& req, std::exception_ptr failure) {
   try {
     std::rethrow_exception(failure);
   } catch (std::exception& e) {
     failBody(req, e, ErrorKind::UNAVAILABLE);
   }
-  finishBody(req, root);
+  finishBody(req);
 }
 
-void SearchEngine::finishBody(SearchRequest& req, RootOp* root) {
-  if (root != nullptr) {
-    for (auto& segment : req.reader->segments()) root->releaseSegmentState(segment);
+void SearchEngine::finishBody(SearchRequest& req) {
+  if (req.logicalRoot != nullptr) {
+    for (auto& segment : req.reader->segments()) req.logicalRoot->releaseSegmentState(segment);
   }
 
   // Profile slots are written only by segment tasks. Materialize the shared

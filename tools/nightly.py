@@ -5,8 +5,9 @@
 
 Usage: nightly.py plan
        nightly.py test PRESET OUTPUT IMAGE_ID
-       nightly.py publish DOWNLOAD_DIRECTORY COMMIT IMAGE LEG [LEG ...]
-Legs use platform/preset, e.g. linux-arm64/container-release.
+       nightly.py publish DOWNLOAD_DIRECTORY COMMIT IMAGE [LEG ...]
+Legs use platform/preset, e.g. linux-arm64/container-release. Without legs,
+publish takes every configured leg that has a downloaded artifact.
 Environment: standard GitHub Actions variables and GH_TOKEN for API operations.
 """
 
@@ -181,8 +182,22 @@ def validate_builder(builder, platform):
         raise ValueError("Missing native toolchain identity")
 
 
-def assemble(directory, commit, image, legs):
-    """Validate the complete fan-in before touching the previous nightly."""
+def built_legs(directory):
+    """Configured legs with a downloaded artifact, and those without one.
+
+    Only successful legs upload under nightly-*, so absence means the leg
+    failed or never got a runner.
+    """
+    legs = configured_legs()
+    built = [leg for leg in legs
+             if (Path(directory) / ("nightly-" + "-".join(split_leg(leg)))).is_dir()]
+    if not built:
+        raise RuntimeError("No nightly leg succeeded")
+    return built, [leg for leg in legs if leg not in built]
+
+
+def assemble(directory, commit, image, legs, missing=()):
+    """Validate every published leg before touching the previous nightly."""
     directory = Path(directory)
     assets = directory / "release"
     assets.mkdir()
@@ -219,22 +234,26 @@ def assemble(directory, commit, image, legs):
     files = sorted(assets.iterdir())
     (assets / "SHA256SUMS").write_text("".join(f"{digest(p)}  {p.name}\n" for p in files))
     first = reports[0]
-    notes = [f"Commit: `{commit}`", f"Subject: {first['subject']}", f"Date: {first['date']}",
-             f"Dependency builders: `{image}`", "", "Tests are advisory; failures do not block publication.",
-             "", "| Platform | Preset | luxir_test | decoded_successor_no_avx512_test | decoded_successor_scalar_test | Builder image or dependencies |",
+    header = [f"Commit: `{commit}`", f"Subject: {first['subject']}", f"Date: {first['date']}",
+              f"Dependency builders: `{image}`"]
+    if missing:
+        header.append("Not in this nightly (leg failed or did not run): "
+                      + ", ".join(f"`{leg}`" for leg in missing))
+    header.append("Tests are advisory; failures do not block publication.")
+    table = ["| Platform | Preset | luxir_test | decoded_successor_no_avx512_test | decoded_successor_scalar_test | Builder image or dependencies |",
              "| --- | --- | --- | --- | --- | --- |"]
     for report in reports:
         statuses = " | ".join(report["tests"][binary]["status"] for binary in TESTS)
-        notes.append(f"| {report['platform']} | {report['preset']} | {statuses} | `{report['builder'].get('image') or report['builder']['dependency_digest']}` |")
-    notes.append(f"\nFull test output: https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
+        table.append(f"| {report['platform']} | {report['preset']} | {statuses} | `{report['builder'].get('image') or report['builder']['dependency_digest']}` |")
+    table.append(f"\nFull test output: https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
     notes_file = directory / "notes.md"
-    notes_file.write_text("\n\n".join(notes[:5]) + "\n" + "\n".join(notes[5:]) + "\n")
+    notes_file.write_text("\n\n".join(header) + "\n\n" + "\n".join(table) + "\n")
     return assets, notes_file
 
 
 def publish(directory, commit, image, *legs):
-    legs = legs or configured_legs()
-    assets, notes = assemble(directory, commit, image, legs)
+    legs, missing = (legs, ()) if legs else built_legs(directory)
+    assets, notes = assemble(directory, commit, image, legs, missing)
     stage = f"nightly-staging-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
     # Upload first. A failed upload leaves nightly and its tag untouched.
     gh("release", "create", stage, "--draft", "--prerelease", "--target", commit,

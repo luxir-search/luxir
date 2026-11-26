@@ -72,6 +72,10 @@ struct CollapsePlan {
           ValueNature nature = ValueNature::NUMBER)
       : name(std::move(name)), type(type), storage(storage), ords(std::move(ords)), segments(segments), nature(nature) {}
     bool ordinal() const { return storage == FieldType::Storage::TERMS; }
+    const std::shared_ptr<OrdMap>& ordinalMap() const {
+      assert(ordinal() && (ords || !segments.exists() || segments.stats().sumDocFreq == 0));
+      return ords;
+    }
   };
   std::vector<Field> fields;
   luxir::api::Collapse_::MissingPolicy missing;
@@ -80,6 +84,13 @@ struct CollapsePlan {
 
   CollapsePlan(IndexReader& reader, luxir::api::Collapse_::MissingPolicy missing,
                bool getNumber) : missing(missing), reader(reader), getNumber(getNumber) {}
+
+  // Bind the global ordinal maps for the string keys.
+  void bindOrdinalMaps() {
+    for (auto& field : fields) {
+      if (field.ordinal()) field.ords = reader.getOrdMap(field.name);
+    }
+  }
 
   GroupIdentity missingIdentity(int32_t segment, int32_t doc) const {
     using Missing = luxir::api::Collapse_::MissingPolicy;
@@ -130,7 +141,7 @@ struct CollapsePlan {
       if (!key.components[i].present) {
         components[i].value = google::protobuf::NullValue::NULL_VALUE;
       } else if (fields[i].ordinal()) {
-        OrdMapStr strings(pool, fields[i].ords.get(), reader, fields[i].segments);
+        OrdMapStr strings(pool, fields[i].ordinalMap().get(), reader, fields[i].segments);
         components[i].value = luxir::api::build::arenaStr(
             mr, strings.ordToStr(key.components[i].value));
       } else components[i].value = key.components[i].value;
@@ -174,7 +185,7 @@ public:
         const auto* ord = info->ordColumn();
         if (!ord) continue;
         columns[i].ords.emplace(postings, *info);
-        columns[i].mapping = plan.fields[i].ords->getSegToGlobal(segment);
+        columns[i].mapping = plan.fields[i].ordinalMap()->getSegToGlobal(segment);
       } else {
         const auto* number = info->numberColumn();
         if (!number) continue;
@@ -693,7 +704,8 @@ public:
 
   explicit CollapseAdmission(const CollapsePlan& plan) : GroupAdmission<>(plan) {
     if (plan.getNumber && plan.fields.size() == 1 && plan.fields[0].ordinal()) {
-      seenOrds.resize((size_t)(((plan.fields[0].ords ? plan.fields[0].ords->numOrds() : 0) + 1 + 63) / 64));
+      const auto& ords = plan.fields[0].ordinalMap();
+      seenOrds.resize((size_t)(((ords ? ords->numOrds() : 0) + 1 + 63) / 64));
     }
   }
 
