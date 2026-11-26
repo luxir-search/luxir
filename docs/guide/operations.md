@@ -1038,6 +1038,30 @@ publishes it under a new incarnation so followers cannot confuse it with an
 older generation of their current source. File retirement does not fsync removals:
 reappearing obsolete files are harmless and a later sweep reclaims them.
 
+### Running under systemd
+
+The server speaks systemd's notification protocol without needing libsystemd,
+so a unit can use `Type=notify`. Luxir sends `READY=1` once the HTTP and gRPC
+servers accept connections, and `STOPPING=1` when a shutdown signal starts the
+drain. With `WatchdogSec=` set, Luxir sends `WATCHDOG=1` every quarter of the
+timeout. During startup it pings unconditionally; `TimeoutStartSec=` bounds
+startup. Once the server is ready, a ping first requires `GET /health` on the
+HTTP port to answer over loopback, with each probe given a quarter of the
+timeout. A server that accepts no connections or routes no requests for the
+whole timeout is therefore aborted (`SIGABRT` by default, which leaves a core
+that shows where it hung) and restarted under `Restart=`. Without HTTP, the
+pings only show that the process is alive. Outside systemd, none of this does
+anything.
+
+```ini
+[Service]
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=300
+WatchdogSec=60
+Restart=always
+```
+
 At startup, a collection whose top-level index metadata cannot be parsed is
 kept as a tombstone rather than preventing healthy collections from loading.
 Queries and updates to that collection return the recorded load error as an

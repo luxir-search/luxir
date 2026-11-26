@@ -1,10 +1,14 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <pthread.h>
 #include <semaphore>
@@ -16,6 +20,7 @@
 #include "luxir/KernelInfo.h"
 #include "luxir/server/Promotion.h"
 #include "luxir/util/ProcessAllocator.h"
+#include "luxir/util/SystemdNotify.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/util/thread.h"
 #include "luxir/server/GRPCServer.h"
@@ -70,6 +75,64 @@ public:
   ~SignalWatcher() {
     done.store(true, std::memory_order_release);
     pthread_kill(thread.native_handle(), SIGTERM);  // wake sigwait
+    thread.join();
+  }
+};
+
+// Keeps systemd's watchdog (WatchdogSec) fed while Luxir is healthy.  Until
+// probe() names the HTTP port it pings unconditionally (startup); after that a
+// ping needs GET /health to answer, which proves the accept thread, an I/O
+// shard and routing are alive, not just this thread.  Without a success for
+// the whole timeout systemd aborts Luxir (a core shows where it hung) and
+// restarts it.  Attempts run every quarter of the timeout, each bounded by a
+// quarter, so a slow but live server still gets a ping in.
+class ServiceWatchdog {
+  std::chrono::microseconds timeout;
+  std::mutex mu;
+  std::condition_variable cv;
+  int port = 0;
+  bool done = false;
+  std::thread thread;
+
+  void run() {
+    nameThisThread("luxir_watchdog");
+    auto period = (std::max)(std::chrono::duration_cast<std::chrono::milliseconds>(timeout / 4),
+                             std::chrono::milliseconds(1));
+    bool failing = false;
+    std::unique_lock lock(mu);
+    while (!cv.wait_for(lock, period, [this] { return done; })) {
+      int p = port;
+      lock.unlock();
+      if (p == 0 || systemd::probeHealth(p, period)) {
+        systemd::notify("WATCHDOG=1");
+        if (failing) LOG_INFO("Watchdog: GET /health answers again");
+        failing = false;
+      } else if (!failing) {
+        LOG_WARN("Watchdog: GET /health on port {} failed; systemd aborts Luxir after {} ms "
+                 "without an answer", p, (long long)(timeout.count() / 1000));
+        failing = true;
+      }
+      lock.lock();
+    }
+  }
+
+public:
+  explicit ServiceWatchdog(std::chrono::microseconds timeout)
+      : timeout(timeout), thread([this] { run(); }) {
+    LOG_INFO("systemd watchdog: {} ms", (long long)(timeout.count() / 1000));
+  }
+
+  void probe(int httpPort) {
+    std::lock_guard lock(mu);
+    port = httpPort;
+  }
+
+  ~ServiceWatchdog() {
+    {
+      std::lock_guard lock(mu);
+      done = true;
+    }
+    cv.notify_all();
     thread.join();
   }
 };
@@ -173,6 +236,10 @@ int luxir_main(int argc, char** argv, void (*addPlugins)(PluginRegistry&)) {
   try {
     // Released by the first SIGTERM/SIGINT, or when gRPC run() returns early.
     std::binary_semaphore stop{0};
+    // Under systemd's WatchdogSec the watchdog runs from the first moment
+    // (startup is bounded by TimeoutStartSec instead of a health check).
+    std::optional<ServiceWatchdog> watchdog;
+    if (auto timeout = systemd::watchdogTimeout(); timeout.count() > 0) watchdog.emplace(timeout);
     LuxirNode node{config};
 
     // The HTTP/JSON server runs on its own connection-I/O shards and accept
@@ -188,7 +255,15 @@ int luxir_main(int argc, char** argv, void (*addPlugins)(PluginRegistry&)) {
     SignalWatcher signals{stop};
     std::thread grpcThread([&] { server.run(); stop.release(); });
     started = server.waitForStart();
-    if (started) stop.acquire();
+    if (started) {
+      systemd::notify("READY=1");
+      if (watchdog && httpServer) watchdog->probe(httpServer->getPort());
+      stop.acquire();
+      systemd::notify("STOPPING=1");
+    }
+    // systemd does not enforce the watchdog while the unit stops, and a drain
+    // fails /health by design.
+    watchdog.reset();
 
     // Drain: stop accepting, let in-flight requests finish, then join threads.
     server.shutdown();
