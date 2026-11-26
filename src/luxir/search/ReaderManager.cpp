@@ -3,8 +3,6 @@
 
 #include "ReaderManager.h"
 
-#include <optional>
-
 #include "luxir/reader/OwnershipShape.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/util/ApiError.h"
@@ -37,6 +35,7 @@ void ReaderManager::publishReader(std::shared_ptr<IndexReader> reader) {
   auto previous = indexReader.load(std::memory_order_relaxed);
   if (!previous || reader->snapshot->core != previous->snapshot->core) filterCache->onReaderPublished(*reader);
   indexReader.store(std::move(reader), std::memory_order_release);
+  publications++;
 }
 
 void ReaderManager::publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened) {
@@ -47,6 +46,8 @@ void ReaderManager::publish(std::shared_ptr<const CommitSnapshot> snapshot, std:
     lock.lock();
     assert(opened->commitId() == snapshot->id.index_gen && opened->schema() == snapshot->schema);
     if (!isClosed()) publishReader(std::move(opened));
+    lock.unlock();
+    openDone.notify_all();  // waiters may now have the reader they need
   }
   // Hints precede the owning state: a fast-path miss may reopen early, but
   // satisfied searches acquire only the reader and plain scalar atomics.
@@ -85,6 +86,10 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us,
     return publishedSchemaGen.load(std::memory_order_relaxed) > reader.schema()->gen_;
   };
 
+  auto acceptable = [&](const std::shared_ptr<IndexReader>& reader) {
+    return reader && !stale(*reader) && !schemaChanged(*reader);
+  };
+
   // Mark the collection searched, writing the shared line at most once per
   // SEARCH_MARK_US.
   auto nowSteady = steadyUs();
@@ -97,32 +102,51 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us,
   if (reader && !stale(*reader) && !schemaChanged(*reader)) return reader;
 
   constexpr auto noDeadline = std::chrono::steady_clock::time_point::max();
-  // Past its deadline a request searches the reader it has rather than wait
-  // on a reopen it cannot outlast; with none published yet it cannot search.
-  auto giveUp = [&] {
+  // A request past its deadline does not wait on a reopen it cannot outlast.
+  // It searches the reader it has, counted in reader_wait as cancelled, unless
+  // that reader predates a schema change (its results would silently use the
+  // old schema) or none is published yet: then it fails, retryably.
+  MetricScope wait;
+  auto giveUp = [&]() -> std::shared_ptr<IndexReader> {
+    if (!wait.active()) wait.begin(*metrics, metricActivity(MetricStage::READER_WAIT));
     if (!reader) throw ApiError(ErrorKind::UNAVAILABLE, "reader_opening", "the collection is still opening its reader");
+    if (schemaChanged(*reader)) {
+      wait.finish(MetricOutcome::ERROR);
+      throw ApiError(ErrorKind::UNAVAILABLE, "reader_opening", "the collection is still opening a reader for its new schema");
+    }
     LOG_DEBUG("reader refresh outlasted a search deadline: searched the previous reader (gen={})", reader->commitId());
-    return reader;
+    return reader;  // `wait` ends as cancelled
   };
 
   // The publication-time open was skipped (an idle collection, a writer
   // reopening an existing index) or failed. One thread reopens; the others
   // need the new snapshot (freshness or schema), so they wait for it, up to
-  // their deadline, and are counted.
+  // their deadline, and are counted. A publish() or close() wakes them too.
   {
     std::unique_lock lock(indexReaderMutex);
-    std::optional<MetricWork> wait;
+    auto seen = publications;
     for (;;) {
       reader = indexReader.load(std::memory_order_acquire);
-      if (reader && !stale(*reader) && !schemaChanged(*reader)) return reader;
-      if (!opening) break;
-      if (!wait) wait.emplace(*metrics, MetricStage::READER_WAIT);
-      auto done = [&] { return !opening; };
+      if (acceptable(reader)) {
+        wait.finish(MetricOutcome::OK);
+        return reader;
+      }
+      bool pastDeadline = deadline != noDeadline && std::chrono::steady_clock::now() >= deadline;
+      if (!opening) {
+        // With a reader and no time left, take it up front rather than open.
+        if (reader && pastDeadline) return giveUp();
+        break;
+      }
+      if (pastDeadline) return giveUp();
+      if (!wait.active()) wait.begin(*metrics, metricActivity(MetricStage::READER_WAIT));
+      auto done = [&] { return !opening || publications != seen || isClosed(); };
       if (deadline == noDeadline) openDone.wait(lock, done);
-      else if (!openDone.wait_until(lock, deadline, done)) return giveUp();
+      else openDone.wait_until(lock, deadline, done);
       checkOpen();
+      seen = publications;
     }
     opening = true;
+    wait.finish(MetricOutcome::OK);
   }
   auto finished = scope_guard([this] {
     {
@@ -134,12 +158,10 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us,
 
   MetricWork metric(*metrics, MetricStage::READER_REFRESH);
   // The open runs outside indexReaderMutex, so searches the published reader
-  // satisfies and publish() of a prepared reader proceed meanwhile. Its reads
-  // see this caller's deadline, which is already a wait deadline: no second
-  // margin.
-  IoContext io = IoContext::current() ? *IoContext::current() : IoContext{};
-  io.deadline = deadline;
-  io.waitMargin = IoContext::Clock::duration::zero();
+  // satisfies and publish() of a prepared reader proceed meanwhile. The open
+  // is shared by every waiter, so no one request's deadline applies to its
+  // reads (as for a SharedLazyBuild); the opener itself waits for it.
+  IoContext io = IoContext::current() ? IoContext::current()->shared() : IoContext{};
   IoScope ioScope(&io);
   auto openPublished = [&](IndexReader* previous) {
     for (;;) {
@@ -154,16 +176,10 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us,
       }
     }
   };
-  std::shared_ptr<IndexReader> opened;
-  try {
-    opened = openPublished(reader.get());
-    Signal::emit("indexReaderOpened", this);
-    // Hints can run ahead of published; the reopen path follows owning state.
-    while (published.load()->schema->gen_ > opened->schema()->gen_) opened = openPublished(opened.get());
-  } catch (const DeadlineExceededError&) {
-    if (!reader) throw;
-    return giveUp();
-  }
+  auto opened = openPublished(reader.get());
+  Signal::emit("indexReaderOpened", this);
+  // Hints can run ahead of published; the reopen path follows owning state.
+  while (published.load()->schema->gen_ > opened->schema()->gen_) opened = openPublished(opened.get());
   std::lock_guard lock(indexReaderMutex);
   // A publish() of a prepared reader may have landed during the open. It is
   // at least as new as the snapshot this open read, so it stays.

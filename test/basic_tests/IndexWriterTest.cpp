@@ -32,6 +32,7 @@
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/Signal.h"
+#include "luxir/server/JsonRequest.h"
 #include <future>
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
@@ -724,6 +725,143 @@ TEST_F(IndexWriterTest, aSearchWithNoReaderFailsReaderOpeningAtItsDeadline) {
   }
   held.release();
   EXPECT_NE(nullptr, opener.get());
+}
+
+// The reopen tests below share a writer whose last publication opened no
+// reader, so the next getReader must reopen.
+class ReaderReopenTest : public IndexWriterTest {
+public:
+  RAMDir dir;
+  CommitSnapshotRegistry registry{test::reserveIncarnation(dir)};
+  IndexWriter iw{registry};
+  ReaderManager& readers = iw.snapshots.readers;
+  std::shared_ptr<Metrics> metrics = std::make_shared<Metrics>();
+  std::shared_ptr<IndexReader> before;
+
+  void SetUp() override {
+    IndexWriterTest::SetUp();
+    readers.metrics = metrics;
+    addDoc(iw);
+    iw.commit();
+    before = readers.getReader();
+    skipNextPublicationOpen();
+  }
+  void skipNextPublicationOpen(bool schemaChange = false) {
+    auto failing = failPublicationOpens();
+    if (schemaChange) iw.setSchema(Schema::createDefaultSchema());
+    else {
+      addDoc(iw);
+      iw.commit();
+    }
+  }
+  uint64_t waits() {
+    return metrics->counts().activities[metricActivity(MetricStage::READER_WAIT)].started;
+  }
+  void waitForWaits(uint64_t n) {
+    for (int i = 0; i < 10000 && waits() < n; i++) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  static auto soon() { return std::chrono::steady_clock::now() + std::chrono::milliseconds(50); }
+};
+
+// An opener that fails clears the flag: a waiter becomes the opener.
+TEST_F(ReaderReopenTest, aFailedOpenerHandsTheOpenToAWaiter) {
+  std::future<std::shared_ptr<IndexReader>> waiter;
+  std::atomic<bool> first{true};
+  Signal::listen("indexReaderOpening", [&](void* source, void*, void*) -> void* {
+    if (source != &readers || !first.exchange(false)) return nullptr;
+    waiter = std::async(std::launch::async, [&] { return readers.getReader(); });
+    waitForWaits(1);
+    throw std::runtime_error("injected open failure");
+  });
+  auto cleanup = scope_guard([] { Signal::unlisten("indexReaderOpening"); });
+  EXPECT_THROW(readers.getReader(), std::runtime_error);
+  auto fresh = waiter.get();
+  EXPECT_NE(before, fresh);
+  EXPECT_EQ(fresh, readers.getReader());
+}
+
+// A publication that lands during a reopen serves the waiters at once.
+TEST_F(ReaderReopenTest, aPublicationDuringAnOpenWakesWaiters) {
+  HeldReopen held(readers);
+  auto opener = std::async(std::launch::async, [&] { return readers.getReader(); });
+  held.waitEntered();
+  auto waiter = std::async(std::launch::async, [&] { return readers.getReader(); });
+  waitForWaits(1);
+  addDoc(iw);
+  iw.commit();  // opens and publishes its reader
+  auto published = readers.indexReader.load();
+  EXPECT_EQ(std::future_status::ready, waiter.wait_for(std::chrono::seconds(10)));
+  held.release();
+  EXPECT_EQ(published, waiter.get());
+  EXPECT_EQ(published, opener.get());  // the publication wins over the reopen
+}
+
+// A deadline already past takes the published reader without opening.
+TEST_F(ReaderReopenTest, aPastDeadlineWithAReaderOpensNothing) {
+  int opens = 0;
+  Signal::listen("indexReaderOpening", [&](void*, void*, void*) -> void* { opens++; return nullptr; });
+  auto cleanup = scope_guard([] { Signal::unlisten("indexReaderOpening"); });
+  EXPECT_EQ(before, readers.getReader(0, std::chrono::steady_clock::now() - std::chrono::seconds(1)));
+  EXPECT_EQ(0, opens);
+  EXPECT_EQ(1u, waits());  // counted
+}
+
+// Closing the manager ends the waits, a deadline-free one included.
+TEST_F(ReaderReopenTest, closeEndsWaiters) {
+  HeldReopen held(readers);
+  auto opener = std::async(std::launch::async, [&] { return readers.getReader(); });
+  held.waitEntered();
+  auto waiter = std::async(std::launch::async, [&] { return readers.getReader(); });
+  waitForWaits(1);
+  readers.close();
+  EXPECT_EQ(std::future_status::ready, waiter.wait_for(std::chrono::seconds(10)));
+  EXPECT_THROW(waiter.get(), ApiError);
+  held.release();
+  opener.wait();
+}
+
+// A waiter whose reader predates a schema change must not search it.
+TEST_F(ReaderReopenTest, aSchemaChangeWaiterFailsAtItsDeadline) {
+  skipNextPublicationOpen(true);
+  HeldReopen held(readers);
+  auto opener = std::async(std::launch::async, [&] { return readers.getReader(); });
+  held.waitEntered();
+  try {
+    readers.getReader(10'000'000, soon());
+    ADD_FAILURE() << "expected reader_opening";
+  } catch (const ApiError& e) {
+    EXPECT_EQ("reader_opening", e.code);
+  }
+  held.release();
+  EXPECT_EQ(iw.getSchema(), opener.get()->schema());
+}
+
+// A request naming min_commit waits for the new view past its deadline.
+TEST_F(IndexWriterTest, aMinCommitSearchWaitsForTheReopen) {
+  test::CollectionHelper helper;
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  auto& readers = helper.collection().getShard()->getReaderManager();
+  readers.getReader();
+  {
+    auto failing = failPublicationOpens();
+    ASSERT_TRUE(helper.index(test::flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  }
+  auto token = readers.snapshot()->id.token();
+  HeldReopen held(readers);
+  auto opener = std::async(std::launch::async, [&] { return readers.getReader(); });
+  held.waitEntered();
+  auto floor = std::async(std::launch::async, [&] {
+    auto req = test::localReq(helper.getSearchEngine());
+    parseQueryRequest(R"({"ops":{"q":{"top_docs":{"query":{"all":true},"limit":10}}}})", req->rawRequest(), req->mr);
+    req->rawRequest().min_commit = token;
+    req->io.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    req->execute();
+    return req->ok();
+  });
+  EXPECT_EQ(std::future_status::timeout, floor.wait_for(std::chrono::milliseconds(300)));
+  held.release();
+  EXPECT_TRUE(floor.get());
+  opener.wait();
 }
 
 // A publication's reader open holds no lock: a search keeps the previous

@@ -24,6 +24,7 @@ class ReaderManager {
   std::mutex indexReaderMutex;
   std::condition_variable openDone;  // signalled when a getReader reopen ends
   bool opening = false;              // a getReader reopen is in progress
+  uint64_t publications = 0;         // readers published, under indexReaderMutex
   std::atomic<std::shared_ptr<const CommitSnapshot>> published;
   // These read-only query hints must not share the snapshot or reader lock bit.
   alignas(64) std::atomic<bool> closed = false;
@@ -124,11 +125,16 @@ public:
   // Searches take the published reader without a lock when it satisfies their
   // freshness and schema. Otherwise one thread reopens, outside
   // indexReaderMutex, and the others that need the new snapshot wait for it
-  // (READER_WAIT). A waiter stops at `deadline`, which callers pass as the
-  // request's IoContext::waitDeadline() (a margin before the transport
-  // deadline), and searches the published reader instead, or, when none is
-  // published yet, fails UNAVAILABLE reader_opening. The reopen's reads see
-  // the same deadline, and one that fails deadline_exceeded falls back likewise.
+  // (READER_WAIT), until it or a publish() provides it, the manager closes, or
+  // `deadline` passes (callers pass the request's IoContext::waitDeadline(), a
+  // margin before the transport deadline; none for a min_commit request, which
+  // needs the new view). At the deadline a waiter searches the published
+  // reader, counted as a cancelled READER_WAIT, but fails UNAVAILABLE
+  // reader_opening when none is published or the published one predates a
+  // schema change. A caller that is itself the opener waits for the open it
+  // performs: the open does not see any one request's deadline, since every
+  // waiter shares its result. A caller already past its deadline with a
+  // reader and no open in progress takes the reader without opening.
   std::shared_ptr<IndexReader> getReader(uint64_t freshness_us = 0,
                                          std::chrono::steady_clock::time_point deadline
                                          = std::chrono::steady_clock::time_point::max());
@@ -152,7 +158,13 @@ public:
   // prepare), the first search that needs it reopens.
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
   std::string resolvedSchema();
-  void close() noexcept { closed.store(true, std::memory_order_release); }
+  void close() noexcept {
+    {
+      std::lock_guard lock(indexReaderMutex);  // a waiter then sees it before it sleeps
+      closed.store(true, std::memory_order_release);
+    }
+    openDone.notify_all();
+  }
   bool isClosed() const { return closed.load(std::memory_order_acquire); }
   // Tests only: the next search opens its reader with this cache.
   void testSetFilterCache(std::shared_ptr<FilterCache> cache);
