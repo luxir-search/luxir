@@ -8,6 +8,7 @@
 #include <cassert>
 
 #include "SearchEngine.h"
+#include "DeclaredReads.h"
 #include "OwnershipRelation.h"
 #include "luxir/api/build.h"
 #include "luxir/search/SearchOverrides.h"
@@ -66,6 +67,7 @@ Query::PlanningContext* SearchRequest::createPlanningContext(IndexReader& view) 
       scoped ? scoped->uses : filterUses, &memoryTracker, proto.profile ? this : nullptr);
   planning->pruning = pruning;
   planning->proofNotes = resolvedFields;
+  if (declaredReads) planning->plannedReads = &declaredReads->plannedReads();
   planning->sharedTermFacts = scoped ? &scoped->termFacts : &termFacts;
 #ifndef NDEBUG
   planning->requestStage = &stage;
@@ -135,6 +137,8 @@ SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
       startTime(startTime),
       timeZone(resolveTimeZone(proto.time_zone)) {
   if (!timeZone) timeZoneError = timeZoneResolutionError(proto.time_zone);
+  io.queryId = IoContext::newQueryId();
+  io.counters = &ioCounters;
 }
 
 // A dispatched search that never sent its final response was abandoned.
@@ -202,6 +206,28 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
     // lastResponse once finalSent is decided.
     auto end = std::chrono::steady_clock::now();
     lastResponse->proto.took_us = microsSince(startTime, end);
+    // Every task and stream has ended: the I/O counters are final.
+    auto ioTotals = ioCounters.snapshot();
+    if (lastResponse->proto.profile) {
+      auto& profile = *lastResponse->proto.profile;
+      profile.io_acquires = ioTotals.acquires;
+      profile.io_acquired_bytes = ioTotals.acquiredBytes;
+      profile.io_requests = ioTotals.requests;
+      profile.io_rounds = ioTotals.rounds;
+      profile.io_fetched_bytes = ioTotals.fetchedBytes;
+      profile.io_acquire_batches = ioTotals.acquireBatches;
+      profile.io_acquire_rounds = ioTotals.acquireRounds;
+    }
+    if (!ioTotals.empty()) {
+      auto& metrics = engine.metrics();
+      metrics.add(MetricCounter::SEARCH_IO_ACQUIRES, ioTotals.acquires);
+      metrics.add(MetricCounter::SEARCH_IO_ACQUIRED_BYTES, ioTotals.acquiredBytes);
+      metrics.add(MetricCounter::SEARCH_IO_REQUESTS, ioTotals.requests);
+      metrics.add(MetricCounter::SEARCH_IO_ROUNDS, ioTotals.rounds);
+      metrics.add(MetricCounter::SEARCH_IO_FETCHED_BYTES, ioTotals.fetchedBytes);
+      metrics.add(MetricCounter::SEARCH_IO_ACQUIRE_BATCHES, ioTotals.acquireBatches);
+      metrics.add(MetricCounter::SEARCH_IO_ACQUIRE_ROUNDS, ioTotals.acquireRounds);
+    }
     if (!warnings.empty()) engine.metrics().add(MetricCounter::SEARCH_WARNINGS);
     if (counting) count(lastResponse->proto.error ? MetricOutcome::ERROR : MetricOutcome::OK, end);
     reply(*lastResponse);  // may delete *this*; nothing after this call

@@ -8,6 +8,7 @@
 #include "CatalogRange.h"
 #include "IdFilter.h"
 #include "VersionRuns.h"
+#include <functional>
 #include <map>
 #include <mutex>
 #include <span>
@@ -15,6 +16,7 @@
 #include "luxir/util/SharedLazyCell.h"
 
 namespace luxir {
+class AcquireBatches;
 class AcquireJoin;
 class OwnershipShape;
 namespace api { struct SegmentInfo; }
@@ -52,6 +54,7 @@ private:
   // Built on first use. A build that throws publishes nothing, so the next
   // use retries it.
   mutable SharedLazyCell<VersionRuns> versions;
+  bool everyHoldFree = true;  // every file hands out free views
 
   const uint64_t segId;
   const uint64_t creatorEpoch;
@@ -145,6 +148,15 @@ public:
     return total;
   }
 
+  // Whether file `fnum` hands out free views (RAM, mmap): an acquire there
+  // costs nothing, so its parts are read whole and never declared ahead.
+  bool holdsFree(uint32_t fnum) const noexcept {
+    assert(fnum < files.size() && files[fnum].file);
+    return files[fnum].holdsFree;
+  }
+  // Whether every file of the segment does.
+  bool holdsFree() const noexcept { return everyHoldFree; }
+
   InputFile* getFile(uint32_t fnum) {
     assert(fnum < files.size());
     assert(files[fnum].file != nullptr);
@@ -175,6 +187,43 @@ public:
   // returns. A failure goes to `error` when given; see AcquireJoin::acquire.
   void acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join,
                      std::exception_ptr* error = nullptr);
+  // As acquireSlices(), with a read class per part, on any AcquireBatches:
+  // still one batch per file.
+  struct Part {
+    field_parts::Slice slice;
+    ReadClass readClass = ReadClass::DATA;
+  };
+  void acquireParts(std::span<const Part> parts, AcquireBatches& batches);
+  // Whether slice() of `part` returns without an acquire: its file hands out
+  // free views, or the segment holds the part.
+  bool held(field_parts::Slice part);
+
+  // A part of the segment, as listParts() lists it for a storage backend
+  // that warms what reads will need.
+  struct ListedPart {
+    enum class Kind : uint8_t {
+      CATALOG,     // file headers and the catalog, which an open reads
+      NAVIGATION,  // what locates data: term routing data, column indexes, points directories, ...
+      DATA,        // a field's data extents
+    };
+    Kind kind;
+    ReadClass readClass;  // the class the readers acquire it with
+    field_parts::Slice slice;
+    std::string_view space;  // row space path, empty for the root
+    std::string_view field;  // empty for a part of the segment rather than of a field
+  };
+  // Visits the file headers and the catalog, then each row space's
+  // navigation (version runs, ownership columns) and its fields' navigation
+  // parts, then the data parts of the fields `data` accepts. The parts are
+  // the ranges the readers acquire, so a backend that holds them serves those
+  // acquires; they may overlap (a run's docs within a field's postings).
+  void listParts(const std::function<bool(std::string_view space, std::string_view field)>& data,
+                 const std::function<void(const ListedPart&)>& visit);
+
+private:
+  // Issues the parts not yet held, one batch per file, through `issue`.
+  template <class Issue>
+  void issueParts(std::span<const Part> parts, Issue&& issue);
 
 };
 

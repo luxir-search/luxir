@@ -64,6 +64,9 @@ public:
   // negative, throw SegmentCorruptError.
   static std::shared_ptr<LiveDocs> decode(std::shared_ptr<InputFile> file, uint64_t size, std::string_view name,
                                           std::string_view segment, int32_t maxDoc, int32_t numLive);
+  // As above, from a hold of the whole file acquired ahead.
+  static std::shared_ptr<LiveDocs> decode(std::shared_ptr<InputFile> file, HeldRange hold, std::string_view name,
+                                          std::string_view segment, int32_t maxDoc, int32_t numLive);
   // Opens and decodes generation `liveGen` at once, for the writer. Null when
   // the file is missing and missingFileOK is set.
   static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
@@ -149,6 +152,12 @@ public:
   int32_t size() const noexcept { return maxDoc; }
   bool decoded() const noexcept { return value.peek() != nullptr; }
   std::shared_ptr<LiveDocs> shared();
+  // Starts acquiring the file on `batches` and decodes it once the hold
+  // arrives, unless it is decoded already or its file hands out free views.
+  // A failed acquire or decode publishes nothing: the first use retries.
+  // The caller keeps this alive until the batch completed. False when it
+  // issued nothing.
+  bool acquireAhead(AcquireBatches& batches);
   LiveDocs* get() {
     auto* decodedDocs = value.peek();
     return decodedDocs ? decodedDocs : shared().get();
@@ -259,6 +268,9 @@ public:
     }
 
     SegmentCore& segmentCore() const noexcept { return *sharedSegmentCore; }
+
+    // The root live docs generation, null without deletes.
+    const std::shared_ptr<SegmentLive>& rootLive() const noexcept { return sharedLiveDocs; }
 
     // Pins the immutable bundle and all of its space readers.
     std::shared_ptr<SegmentCore> segmentCoreShared() const noexcept {
@@ -638,6 +650,24 @@ public:
     FieldType* mismatchedSchemaType = nullptr;
   };
   FieldLookup lookupField(std::string_view name) const;
+
+  // A part of a segment file, as listParts() lists it.
+  struct ListedPart {
+    std::string file;  // The segment file's name.
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    ReadClass readClass = ReadClass::METADATA;  // The class the readers acquire it with.
+    SegmentCore::ListedPart::Kind kind = SegmentCore::ListedPart::Kind::CATALOG;
+    std::string space;  // Row space path, empty for the root.
+    std::string field;  // Physical field name, empty for a part of the segment.
+  };
+  // Lists, for each segment of the snapshot, its file headers and catalog,
+  // the navigation parts of every field in every row space (term routing
+  // data, column indexes, points directories, ...), and the data extents of
+  // the fields named in `dataFields` (physical names, in any row space), or
+  // of every field with allData. For a storage backend that warms metadata
+  // or listed fields: the parts are the ranges reads acquire. Reads nothing.
+  std::vector<ListedPart> listParts(std::span<const std::string_view> dataFields = {}, bool allData = false);
 
   std::shared_ptr<OrdMap> getOrdMap(std::string_view name);
 

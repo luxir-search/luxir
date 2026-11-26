@@ -988,6 +988,13 @@ Execution details for instrumented operations. STRING/ID field facets provide pr
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.executionprofile.ops"></a>[`ops`](#field-luxir.executionprofile.ops) | 1 | [`ExecutionProfileOp`](#message-luxir.executionprofileop) | repeated |  |
+| <a id="field-luxir.executionprofile.io_acquires"></a>[`io_acquires`](#field-luxir.executionprofile.io_acquires) | 10 | `uint64` | singular | Storage I/O of the whole request, from all of its threads and streamed batches. io\_acquires: ranges segments acquired from storage that hands out held copies (InputFile::acquire); zero on RAM and mmap, whose views cost nothing, and on ranges a segment already holds. |
+| <a id="field-luxir.executionprofile.io_acquired_bytes"></a>[`io_acquired_bytes`](#field-luxir.executionprofile.io_acquired_bytes) | 11 | `uint64` | singular | Bytes those ranges cover. |
+| <a id="field-luxir.executionprofile.io_requests"></a>[`io_requests`](#field-luxir.executionprofile.io_requests) | 12 | `uint64` | singular | Store requests a storage backend or layer counted for the request (an object-store GET); zero on a backend that counts none. |
+| <a id="field-luxir.executionprofile.io_rounds"></a>[`io_rounds`](#field-luxir.executionprofile.io_rounds) | 13 | `uint64` | singular | Sequential waits on the store: requests awaited together count once. |
+| <a id="field-luxir.executionprofile.io_fetched_bytes"></a>[`io_fetched_bytes`](#field-luxir.executionprofile.io_fetched_bytes) | 14 | `uint64` | singular | Bytes those requests returned. |
+| <a id="field-luxir.executionprofile.io_acquire_batches"></a>[`io_acquire_batches`](#field-luxir.executionprofile.io_acquire_batches) | 15 | `uint64` | singular | Calls that acquired io\_acquires: a batch of ranges on one file counts once, and so does a single acquire. |
+| <a id="field-luxir.executionprofile.io_acquire_rounds"></a>[`io_acquire_rounds`](#field-luxir.executionprofile.io_acquire_rounds) | 16 | `uint64` | singular | Waits on those calls in sequence: the batches of one round, issued together across files and segments, count once, and so does each acquire a read makes on demand. |
 
 <a id="message-luxir.executionprofileop"></a>
 
@@ -2407,6 +2414,13 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.search_execution"></a>[`search_execution`](#field-luxir.servicestats.search_execution) | 7 | [`HistogramStats`](#message-luxir.histogramstats) | singular | Search body execution, excluding scheduler waits and streaming drains. |
 | <a id="field-luxir.servicestats.search_resource_exhausted"></a>[`search_resource_exhausted`](#field-luxir.servicestats.search_resource_exhausted) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.servicestats.search_warnings"></a>[`search_warnings`](#field-luxir.servicestats.search_warnings) | 9 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.search_io_acquires"></a>[`search_io_acquires`](#field-luxir.servicestats.search_io_acquires) | 27 | `uint64` | singular | Storage I/O of finished searches, summed over their ExecutionProfile io\_\* counts (counted whether or not a search asked for a profile). |
+| <a id="field-luxir.servicestats.search_io_acquired_bytes"></a>[`search_io_acquired_bytes`](#field-luxir.servicestats.search_io_acquired_bytes) | 28 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.search_io_requests"></a>[`search_io_requests`](#field-luxir.servicestats.search_io_requests) | 29 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.search_io_rounds"></a>[`search_io_rounds`](#field-luxir.servicestats.search_io_rounds) | 30 | `uint64` | singular | requests awaited together count once |
+| <a id="field-luxir.servicestats.search_io_fetched_bytes"></a>[`search_io_fetched_bytes`](#field-luxir.servicestats.search_io_fetched_bytes) | 31 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.search_io_acquire_batches"></a>[`search_io_acquire_batches`](#field-luxir.servicestats.search_io_acquire_batches) | 32 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.search_io_acquire_rounds"></a>[`search_io_acquire_rounds`](#field-luxir.servicestats.search_io_acquire_rounds) | 33 | `uint64` | singular |  |
 | <a id="field-luxir.servicestats.index_batches"></a>[`index_batches`](#field-luxir.servicestats.index_batches) | 10 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.documents_accepted"></a>[`documents_accepted`](#field-luxir.servicestats.documents_accepted) | 11 | `uint64` | singular | Accepted into indexing (not durably acknowledged) or rejected/rolled back. |
 | <a id="field-luxir.servicestats.documents_rejected"></a>[`documents_rejected`](#field-luxir.servicestats.documents_rejected) | 12 | `uint64` | singular |  |

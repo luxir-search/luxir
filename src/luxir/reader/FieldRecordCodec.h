@@ -213,7 +213,9 @@ public:
   int32_t termBlockCount() const noexcept;
   field_parts::Slice termBlockOffsets() const;
   field_parts::Slice termTrie() const;
-  field_parts::Slice termNavigation() const;  // Offset table and trie, held together.
+  // The block offsets and the trie, which route a lookup to its block: the
+  // one metadata part a term lookup reads before the block.
+  field_parts::Slice termNavigation() const;
   uint64_t pointCount() const noexcept;
   uint64_t pointLeafCount() const noexcept;
   field_parts::Slice pointsDirectory() const;

@@ -567,6 +567,44 @@ does not throw. The ranges are valid only during the call, so copy what the
 completion needs. Wrappers forward the batch to their delegate rather than
 splitting it, so the backend sees it whole.
 
+A search over files that are not `holdsFree()` declares the parts it will
+read in each segment and acquires them in rounds of batches: the term routing
+data (block offsets and trie) and live docs, then the term blocks its lookups
+land in, then the postings of the terms found, then what its scorers read
+(norms). Each round is one batch per segment file, issued together across
+segments, so a backend that completes batches asynchronously serves a cold
+query in a few round trips however many segments it has. No search worker
+waits for a round: the search resumes on the node's arena when the last batch
+completes, so `done` may run on a thread of the backend's own. A part of at
+most 64 KiB (`field_parts::WHOLE_READ_BYTES`), such as a small dictionary, is
+acquired whole. Past `search.read-ahead-max-bytes` per request, parts are
+acquired on demand instead. A round still pending at the request's
+`waitDeadline()`, or when it is cancelled, fails the search; its batches may
+still complete afterwards, and their holds are kept.
+
+### Warming a snapshot
+
+`IndexReader::listParts(fields, allData)` lists the parts of every segment of
+a snapshot without reading anything: each file's header and the catalog
+(`CATALOG`), the navigation parts of every field in every row space
+(`NAVIGATION`: term routing data, column indexes, ordinal block metadata,
+points directories, stored field names and chunk indexes, id filters,
+version runs and ownership columns), and the data extents of the named fields, or of all
+fields with `allData` (`DATA`: dictionaries, postings, norms, columns, points
+leaves, stored chunks). Each entry gives the file name, offset and length, the
+`ReadClass` the readers acquire it with, the row space and the field. These are
+exactly the ranges reads acquire, so a backend can warm metadata from the
+first two kinds, or a listed field's data from the third, and serve the reads
+that follow from its cache:
+
+```cpp
+// Metadata of every field, and the data of two fields.
+std::string_view fields[] = {"title", "body"};
+for (const auto& part : collection.getReaderManager().getReader()->listParts(fields)) {
+  warm(part.file, part.offset, part.length, part.readClass);
+}
+```
+
 ### Storage layers
 
 A layer derives from `DelegatingDirFactory` and overrides what it changes, usually
@@ -608,6 +646,48 @@ replacement), `DURABLE_SYNC` (`sync` persists bytes and names), `MEMORY_MAPPED`
 selects conservative paths: `reuseFiles` copies with `Directory::copyFile` instead of
 linking when `HARD_LINK` is absent. A wrapper that changes a property (for instance
 masks `HARD_LINK`) overrides `capabilities()`.
+
+### The request I/O context
+
+A read done for a search can see that search through `luxir::IoContext`
+(`src/luxir/util/IoContext.h`): `IoContext::current()` returns it, or null
+when the read is not done for a request (merges, startup, reader refresh,
+verification, replication). It is visible in `InputFile::acquire` and in every
+`DelegatingDirectory` method called on a query thread, including
+segment-parallel tasks, since core carries it into the tasks it spawns.
+
+```cpp
+luxir::HeldRange MyInputFile::acquire(luxir::ByteRange range) {
+  const luxir::IoContext* io = luxir::IoContext::current();
+  bool hedge = io && io->remaining() < hedgeBudget;  // deadline: hedge a slow GET early
+  bool admit = !io || io->fillCache;                 // a scan: do not admit into a cache
+  ...
+  if (io) io->countFetch(bytes);                     // one GET, one round
+}
+```
+
+The fields are the query id and `request_id` (for correlating a layer's logs),
+the deadline (`hasDeadline()`, `remaining()`, `waitDeadline()`), the stop
+token, the `fillCache` hint and the request's `IoCounters`. The deadline and
+the hint are advice: a read must return the same bytes, and core never fails a
+read on them. A layer that gives up a wait on the deadline or the stop token
+throws `DeadlineExceededError` or `RequestCancelledError`.
+
+Core counts every range a segment acquires from a file that is not
+`holdsFree()` (`io_acquires`, `io_acquired_bytes`), so those counts appear on
+any such backend without its help. What a range costs in store requests only
+the backend knows: it counts them with `io->countFetch(bytes, requests,
+rounds)` (`countFetch(bytes)` is one request and one round), counting a wave
+of concurrent requests as one round. Counts appear in the search profile
+(`io_*`) and in the node's `search_io_*` totals.
+
+Work handed to a thread or pool of the plugin's own runs without a context
+unless it is wrapped: `pool.submit(luxir::bindIoContext(task))` copies the
+current context into the task and restores the pool thread's own afterwards.
+`IoScope` is the underlying guard; `IoScope scope(nullptr)` detaches work from
+the enclosing request. The counters belong to the request and outlive its
+tasks, but not the request: work still running after the request ends must
+not count.
 
 ### The example plugin
 
