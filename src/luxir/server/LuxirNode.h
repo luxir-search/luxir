@@ -63,6 +63,8 @@ public:
   }
   Clock::time_point now() const { return clock(); }
   ReplicationFollower* getFollower() { return follower.get(); }
+  // The follower, or FAILED_PRECONDITION not_follower on any other node.
+  ReplicationFollower& requireFollower();
   // Checksum scrub of published snapshots; runs periodically only when
   // store.scrub-interval-s is set, but scrub() works on demand regardless.
   Scrubber& getScrubber() { return *scrubber; }
@@ -113,6 +115,8 @@ public:
   void detachCollection(std::string_view name, std::string_view target) { detachCollection(CollectionId::of(name), target); }
   std::shared_ptr<Collection> attachCollection(const CollectionId& id, bool force = false);
   std::shared_ptr<Collection> attachCollection(std::string_view name, bool force = false) { return attachCollection(CollectionId::of(name), force); }
+  // Freezes or thaws one collection on a writer node; see Collections::setReadOnly.
+  void setCollectionReadOnly(const CollectionId& id, bool readOnly);
 
   oneapi::tbb::task_arena& getTaskArena() {
     return taskArena;

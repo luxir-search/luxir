@@ -486,9 +486,9 @@ TEST_F(CollectionAdminApiTest, tenantRoutesAdministerNamedTenants) {
   // Node blocks are node-wide, not a tenant's view.
   EXPECT_EQ(std::string::npos, stats.find(R"("memory")"));
   EXPECT_EQ(400, body(http::verb::get, "/tenants/acme/_stats?system=true").first);
-  // Searching and indexing act in the caller's own tenant only.
-  EXPECT_EQ(404, body(http::verb::post, "/tenants/acme/collections/docs/_search", "{}").first);
-  EXPECT_EQ(404, body(http::verb::post, "/tenants/acme/collections/docs/_update", "{}").first);
+  // Searching and indexing act in the route's tenant.
+  EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/docs/_search", "{}").first);
+  EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/docs/_update", "{}").first);
   EXPECT_EQ(404, body(http::verb::post, "/collections/docs/_search", "{}").first);
   EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_delete", R"({"name":"docs"})").first);
   EXPECT_TRUE(test::catalogIncarnations(data.path(), "docs", "acme").empty());
@@ -514,7 +514,7 @@ TEST_F(CollectionAdminApiTest, requestScopeNeverOutlivesItsRequest) {
   EXPECT_NE(nullptr, node.getCollection(CollectionId{"acme", "docs"})->getSchema()->getFieldTypePtr("title_i"));
 
   // On one keep-alive connection, an NDJSON update after a tenant route acts in
-  // the caller's own tenant.
+  // the default tenant.
   net::io_context ioc;
   beast::tcp_stream stream(ioc);
   stream.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"), (unsigned short)server.getPort()));
@@ -572,5 +572,113 @@ TEST_F(CollectionAdminApiTest, readOnlyRejectsNameChanges) {
   HttpServer server(reader, 1, 0); server.start();
   EXPECT_EQ(403, httpRequest(server.getPort(), http::verb::post, "/collections/_rename", R"({"from":"main","to":"renamed"})").result_int());
   EXPECT_EQ(403, httpRequest(server.getPort(), http::verb::post, "/collections/_swap", R"({"a":"main","b":"other"})").result_int());
+}
+
+TEST_F(CollectionAdminApiTest, readOnlyServesNamedTenants) {
+  CollectionAdminDataDir data("luxir_readonly_tenants");
+  auto config = fsConfig(data);
+  {
+    LuxirNode writer(config);
+    CollectionHelper docs(writer, CollectionId{"acme", "docs"});
+    docs.index(flatdoc("id", "a"));
+    docs.commit();
+  }
+  config.read_only = true;
+  LuxirNode reader(config);
+  HttpServer server(reader, 1, 0); server.start();
+  EXPECT_EQ(1, HttpReq(server.getPort()).tenant("acme").collection("docs").matchQuery("id", "a").execute().getDocs().size());
+  EXPECT_EQ(403, httpRequest(server.getPort(), http::verb::post, "/tenants/acme/collections/docs/_update", R"({"docs":[{"id":"b"}]})").result_int());
+  EXPECT_EQ(403, httpRequest(server.getPort(), http::verb::post, "/tenants/acme/collections/docs/_update", "{\"id\":\"b\"}\n", "application/x-ndjson").result_int());
+  server.shutdown();
+}
+}
+
+namespace luxir::test {
+TEST_F(CollectionAdminApiTest, dataRoutesActInTheirTenant) {
+  CollectionAdminDataDir data("luxir_collection_admin_tenant_data");
+  LuxirNode node(fsConfig(data));
+  HttpServer server(node, 2, 0);
+  server.start();
+  int port = server.getPort();
+  auto call = [&](std::string target, std::string request, std::string_view type = "application/json") {
+    auto response = httpRequest(port, http::verb::post, target, std::move(request), type);
+    return std::pair{response.result_int(), std::string(response.body())};
+  };
+  auto live = [&](CollectionId id) { return node.getCollection(id)->getReaderManager().getReader()->liveDocs(); };
+
+  // The same name in two tenants: each write lands in its route's tenant.
+  ASSERT_EQ(200, call("/collections/_create", R"({"name":"docs"})").first);
+  ASSERT_EQ(200, call("/tenants/acme/collections/_create", R"({"name":"docs"})").first);
+  ASSERT_EQ(200, call("/collections/docs/_update?commit=true", R"({"docs":[{"id":"a"}]})").first);
+  auto buffered = call("/tenants/acme/collections/docs/_update?commit=true",
+                       R"({"tenant":"acme","docs":[{"id":"b"},{"id":"c"}]})");
+  ASSERT_EQ(200, buffered.first) << buffered.second;
+  auto stream = call("/tenants/acme/collections/docs/_update?commit=true", "{\"id\":\"d\"}\n", "application/x-ndjson");
+  ASSERT_EQ(200, stream.first) << stream.second;
+  EXPECT_EQ(1, live(CollectionId::of("docs")));
+  EXPECT_EQ(3, live(CollectionId{"acme", "docs"}));
+
+  EXPECT_EQ(1, HttpReq(port).collection("docs").matchQuery("id", "a").execute().getDocs().size());
+  EXPECT_EQ(0, HttpReq(port).tenant("acme").collection("docs").matchQuery("id", "a").execute().getDocs().size());
+  EXPECT_EQ(1, HttpReq(port).tenant("acme").collection("docs").matchQuery("id", "b").execute().getDocs().size());
+  auto explained = call("/tenants/acme/collections/docs/_search?explain=resolved", "{}");
+  EXPECT_EQ(200, explained.first) << explained.second;
+
+  // A body may repeat its route's tenant, never name another.
+  EXPECT_EQ(400, call("/tenants/acme/collections/docs/_search", R"({"tenant":"t0"})").first);
+  EXPECT_EQ(400, call("/collections/docs/_search", R"({"tenant":"acme"})").first);
+  EXPECT_EQ(400, call("/collections/docs/_update", R"({"tenant":"acme","docs":[{"id":"x"}]})").first);
+  auto crossing = call("/tenants/acme/collections/docs/_update",
+                       "{\"_update_\":{\"tenant\":\"t0\"}}\n{\"id\":\"x\"}\n", "application/x-ndjson");
+  EXPECT_NE(std::string::npos, crossing.second.find("belongs in a /tenants/t0 route")) << crossing.second;
+  EXPECT_EQ(400, call("/tenants/Bad/collections/docs/_search", "{}").first);
+  EXPECT_EQ(400, call("/tenants/Bad/collections/docs/_update", "{\"id\":\"x\"}\n", "application/x-ndjson").first);
+  EXPECT_EQ(3, live(CollectionId{"acme", "docs"}));
+  server.shutdown();
+}
+}
+
+namespace luxir::test {
+TEST_F(CollectionAdminApiTest, readOnlyRouteFreezesAndThaws) {
+  CollectionAdminDataDir data("luxir_collection_admin_read_only");
+  LuxirNode node(fsConfig(data));
+  HttpServer server(node, 2, 0);
+  server.start();
+  int port = server.getPort();
+  auto call = [&](http::verb verb, std::string target, std::string request = {}, std::string_view type = "application/json") {
+    auto response = httpRequest(port, verb, target, std::move(request), type);
+    return std::pair{response.result_int(), std::string(response.body())};
+  };
+  ASSERT_EQ(200, call(http::verb::post, "/tenants/acme/collections/_create", R"({"name":"docs"})").first);
+  ASSERT_EQ(200, call(http::verb::post, "/tenants/acme/collections/docs/_update", R"({"docs":[{"id":"a"}]})").first);
+  auto frozen = call(http::verb::post, "/tenants/acme/collections/_read_only", R"({"name":"docs","read_only":true})");
+  ASSERT_EQ(200, frozen.first) << frozen.second;
+  EXPECT_EQ(R"({"name":"docs","read_only":true})", frozen.second);
+
+  auto refused = call(http::verb::post, "/tenants/acme/collections/docs/_update", R"({"docs":[{"id":"b"}]})");
+  EXPECT_EQ(403, refused.first);
+  EXPECT_NE(std::string::npos, refused.second.find("read_only")) << refused.second;
+  EXPECT_EQ(403, call(http::verb::post, "/tenants/acme/collections/docs/_update", "{\"id\":\"b\"}\n", "application/x-ndjson").first);
+  EXPECT_EQ(403, call(http::verb::post, "/tenants/acme/collections/docs/_schema", R"({"fields":{"n_i":{"type":"int"}}})").first);
+  EXPECT_EQ(1, HttpReq(port).tenant("acme").collection("docs").matchQuery("id", "a").execute().getDocs().size());
+  EXPECT_NE(std::string::npos, call(http::verb::get, "/tenants/acme/collections/docs/_stats?pretty=false").second.find(R"("read_only":true)"));
+  EXPECT_NE(std::string::npos, call(http::verb::get, "/metrics").second.find(R"(luxir_collection_read_only{tenant="acme",collection="docs"} 1)"));
+
+  EXPECT_EQ(404, call(http::verb::post, "/tenants/acme/collections/_read_only", R"({"name":"nope","read_only":true})").first);
+  ASSERT_EQ(200, call(http::verb::post, "/tenants/acme/collections/_read_only", R"({"name":"docs","read_only":false})").first);
+  EXPECT_EQ(200, call(http::verb::post, "/tenants/acme/collections/docs/_update?commit=true", R"({"docs":[{"id":"b"}]})").first);
+  EXPECT_EQ(2, node.getCollection(CollectionId{"acme", "docs"})->getReaderManager().getReader()->liveDocs());
+  server.shutdown();
+}
+
+TEST_F(CollectionAdminApiTest, readOnlyNodeRefusesReadOnlyRoute) {
+  CollectionAdminDataDir data("luxir_readonly_node_read_only_route");
+  auto config = fsConfig(data);
+  { LuxirNode writer(config); }
+  config.read_only = true;
+  LuxirNode reader(config);
+  HttpServer server(reader, 1, 0); server.start();
+  EXPECT_EQ(403, httpRequest(server.getPort(), http::verb::post, "/collections/_read_only", R"({"name":"main","read_only":true})").result_int());
+  server.shutdown();
 }
 }

@@ -138,6 +138,9 @@ private:
   std::shared_ptr<Collection> makeCollection(const CollectionId& id, std::shared_ptr<Directory> directory);
   void openOne(Opened& row, Role role, const std::shared_ptr<Collection>& expected = {});
   std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<TenantCatalog::Entry>& selected);
+  // Serves the selected local snapshot without a writer. A writer node opens a
+  // read-only collection this way, over a directory that refuses mutations.
+  std::shared_ptr<Collection> openReader(const CollectionId& id, Role role, const TenantCatalog::Entry& selected);
   std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {}, bool startup = false,
                                         std::optional<TenantCatalog::Entry> entry = {});
   void unload(const Transition& transition, const std::shared_ptr<Collection>& expected, std::string reason);
@@ -206,6 +209,10 @@ public:
   void detach(const CollectionId& id, std::string_view target);
   // Open an active catalog entry, optionally taking its assignment first.
   std::shared_ptr<Collection> attach(const CollectionId& id, bool force = false);
+  // Makes an owned collection read-only, or writable again, on a writer node.
+  // Read-only seals its writer (committing what was admitted) and serves the
+  // committed snapshot; the catalog keeps the flag across restarts.
+  void setReadOnly(const CollectionId& id, bool readOnly);
 
   void rename(const CollectionId& from, const CollectionId& to) { changeNames(from, to, false); }
   void swap(const CollectionId& a, const CollectionId& b) { changeNames(a, b, true); }
@@ -213,7 +220,8 @@ public:
   // their directories until they finish, even if the mapping removes them.
   void applyMapping(std::string_view tenant, const std::map<std::string, std::string>& names,
                     const std::map<std::string, std::string>& desired,
-                    std::vector<Prepared> prepared, std::span<const std::string> retained);
+                    std::vector<Prepared> prepared, std::span<const std::string> retained,
+                    const std::set<std::string>& readOnly = {});
 
   Candidate stage(const CollectionId& id, std::string_view incarnation);
   // Makes `snapshot` durable in the candidate's directory, whose files the

@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <set>
 #include "luxir/store/DirectoryFactory.h"
 #include "luxir/store/CollectionId.h"
 #include "luxir/store/IncarnationState.h"
@@ -21,6 +22,9 @@ public:
     std::string node;
     // Absent: never active. Zero: retirement visible, timestamp not yet finalized.
     std::optional<int64_t> retired_ms = {};
+    // The incarnation is served without a writer. It follows its data through
+    // renames and swaps; a recreated collection starts writable.
+    bool read_only = false;
   };
   struct State {
     uint64_t rev = 0;
@@ -70,6 +74,8 @@ public:
   void recover(bool follower);
   void adopt();
   bool assign(std::string_view id, std::string_view expectedNode, std::string_view node);
+  // Marks an owned active incarnation read-only or writable; false if unchanged.
+  bool setReadOnly(std::string_view id, bool readOnly);
   std::optional<Entry> find(std::string_view name);
   Entry owned(std::string_view id);
   // Read STATE before confirming the entry, then claim only that version.
@@ -79,8 +85,10 @@ public:
   uint64_t rename(std::string_view from, std::string_view to);
   uint64_t swap(std::string_view a, std::string_view b);
   // Installs ready bindings and reserves desired incarnations still being staged.
+  // Installed incarnations in `readOnly` are recorded read-only, the others writable.
   uint64_t apply(const std::map<std::string, std::string>& names,
-                 const std::map<std::string, std::string>& desired);
+                 const std::map<std::string, std::string>& desired,
+                 const std::set<std::string>& readOnly = {});
   std::optional<std::string> current(std::string_view name);
   std::vector<std::string> incarnations(std::string_view name);
   // A supplied source id resumes a follower candidate or its active incarnation.

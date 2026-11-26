@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <array>
 #include "test/LuxirTest.h"
 #include "test/StorageTestUtils.h"
 #include "test/CollectionHelper.h"
@@ -552,6 +553,24 @@ TEST_F(ReplicationFollowerTest, writerAndReadOnlyOpenFollowerLayout) {
     ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
     EXPECT_EQ(2, h.collection().getReaderManager().getReader()->liveDocs());
   }
+}
+
+TEST_F(ReplicationFollowerTest, readOnlyFlagReachesFollowerAndSurvivesPromotion) {
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto recorded = [&] { auto entry = follower->collections().catalog().find("main"); return entry && entry->read_only; };
+  EXPECT_FALSE(recorded());
+  source->setCollectionReadOnly(CollectionId::of("main"), true);
+  ASSERT_TRUE(until(recorded));
+  EXPECT_THROW(follower->setCollectionReadOnly(CollectionId::of("main"), false), ReadOnlyError);
+  stopFollower();
+  ASSERT_EQ(0, promote().first);
+  auto config = followerConfig; config.replication.source.clear();
+  LuxirNode writer(config);
+  EXPECT_EQ(nullptr, writer.getCollection("main")->getShard()->iw);
+  writer.setCollectionReadOnly(CollectionId::of("main"), false);
+  EXPECT_NE(nullptr, writer.getCollection("main")->getShard()->iw);
 }
 
 TEST_F(ReplicationFollowerTest, unavailableSourceKeepsReplica) {
@@ -1609,15 +1628,30 @@ TEST_F(ReplicationFollowerTest, nodeIdConfig) {
   EXPECT_NO_THROW(config.normalize()); // empty requests automatic resolution
 }
 
-TEST_F(ReplicationFollowerTest, tenantFilterConfig) {
+TEST_F(ReplicationFollowerTest, subscriptionConfig) {
   LuxirConfig config;
   CLI::App app;
   config.addOptions(app);
-  app.parse("--replication.tenants beta,alpha,beta --replication.max-acknowledgments 17");
-  EXPECT_EQ((std::vector<std::string>{"alpha", "beta"}), config.replication.tenantFilter());
+  app.parse("--replication.tenants beta,alpha,beta --replication.collections alpha/x,docs,gamma/y,docs "
+            "--replication.max-acknowledgments 17");
+  auto subscription = config.replication.subscription();
+  EXPECT_EQ((std::vector<std::string>{"alpha", "beta"}), subscription.tenants);
+  // A collection of a whole tenant is already included.
+  EXPECT_EQ((std::vector<CollectionId>{{"gamma", "y"}, CollectionId::of("docs")}), subscription.collections);
+  EXPECT_TRUE(subscription.includes({"alpha", "anything"}));
+  EXPECT_TRUE(subscription.includes({"gamma", "y"}));
+  EXPECT_FALSE(subscription.includes({"gamma", "z"}));
+  EXPECT_TRUE(subscription.includesTenant("gamma"));
+  EXPECT_FALSE(subscription.includesTenant("delta"));
   EXPECT_EQ(17u, config.replication.max_acknowledgments);
   config.replication.tenants.clear();
-  EXPECT_TRUE(config.replication.tenantFilter().empty());
+  config.replication.collections.clear();
+  EXPECT_TRUE(config.replication.subscription().all());
+  for (auto collections : {"Docs", "a/b/c", "/docs", "alpha/", ","}) {
+    config.replication.collections = collections;
+    EXPECT_THROW(config.replication.validate(), InvalidCollectionNameError) << collections;
+  }
+  config.replication.collections.clear();
   for (auto tenants : {",alpha", "alpha,", "alpha,,beta", "Alpha", "alpha/beta", "alpha, beta"}) {
     config.replication.tenants = tenants;
     EXPECT_THROW(config.replication.validate(), InvalidCollectionNameError) << tenants;
@@ -1646,12 +1680,131 @@ TEST_F(ReplicationFollowerTest, filteredFollowerIgnoresOtherTenants) {
   source->deleteCollection(beta);
   { CollectionHelper h(*source, alpha); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
   ASSERT_TRUE(caughtUp(alpha));
+  // The followed tenant is searchable through its own route.
+  EXPECT_EQ(1, HttpReq(followerServer->getPort()).tenant("alpha").collection("docs").matchQuery("id", "a").execute().getDocs().size());
+  EXPECT_EQ(403, httpRequest(followerServer->getPort(), http::verb::post, "/tenants/alpha/collections/docs/_update",
+                             R"({"docs":[{"id":"b"}]})").result_int());
   std::pmr::monotonic_buffer_resource arena;
   api::ReplicationStatus stats;
   follower->getFollower()->stats(stats, arena);
   ASSERT_EQ(1u, stats.collections.size());
   EXPECT_EQ("alpha", stats.collections[0].tenant);
   for (const auto& row : source->getReplication().status()) EXPECT_EQ(alpha, row.collection);
+}
+
+TEST_F(ReplicationFollowerTest, collectionFilterCopiesOnlyListedCollections) {
+  startSource();
+  CollectionId docs{"alpha", "docs"}, logs{"alpha", "logs"};
+  source->createCollection(docs); source->createCollection(logs);
+  followerConfig.replication.collections = "alpha/docs";
+  startFollower();
+  ASSERT_TRUE(caughtUp(docs)); ASSERT_TRUE(acknowledged(docs));
+  EXPECT_THROW(follower->getCollection(logs), CollectionNotFoundError);
+  { CollectionHelper h(*source, docs); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp(docs));
+  EXPECT_EQ(1, HttpReq(followerServer->getPort()).tenant("alpha").collection("docs").matchQuery("id", "a").execute().getDocs().size());
+  // An "all" wait on an unlisted collection does not count this follower.
+  auto token = source->getCollection(logs)->getShard()->getSnapshots().snapshot()->id;
+  EXPECT_TRUE(source->getReplication().capture({api::AllReplicas{}}, logs, token).members.empty());
+  token = source->getCollection(docs)->getShard()->getSnapshots().snapshot()->id;
+  EXPECT_EQ(1u, source->getReplication().capture({api::AllReplicas{}}, docs, token).members.size());
+  std::pmr::monotonic_buffer_resource arena;
+  std::array<std::string, 1> labels{"alpha/docs"};
+  auto catalog = source->getReplication().catalog(arena, {}, labels);
+  ASSERT_EQ(1u, catalog.collections.size());
+  EXPECT_EQ("docs", catalog.collections[0].collection);
+  EXPECT_EQ(400, httpRequest(sourcePort, http::verb::get, "/_replication/watch?collection=alpha/Bad").result_int());
+}
+
+TEST_F(ReplicationFollowerTest, narrowingToCollectionsKeepsExcludedCopies) {
+  startSource();
+  CollectionId docs{"alpha", "docs"}, logs{"alpha", "logs"};
+  { CollectionHelper h(*source, docs); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  { CollectionHelper h(*source, logs); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  startFollower();
+  ASSERT_TRUE(caughtUp(docs)); ASSERT_TRUE(caughtUp(logs));
+  auto before = follower->getCollection(logs)->getShard()->getSnapshots().snapshot()->id;
+  stopFollower();
+  followerConfig.replication.collections = "alpha/docs";
+  startFollower();
+  { CollectionHelper h(*source, logs); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
+  { CollectionHelper h(*source, docs); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp(docs));
+  // The excluded copy stays as it was: neither updated nor retired.
+  EXPECT_EQ(before, follower->getCollection(logs)->getShard()->getSnapshots().snapshot()->id);
+  EXPECT_EQ(1, follower->getCollection(logs)->getReaderManager().getReader()->liveDocs());
+  follower->getFollower()->deleteOrphan(logs);
+  EXPECT_THROW(follower->getCollection(logs), CollectionNotFoundError);
+  EXPECT_NO_THROW(follower->getCollection(docs));
+}
+
+TEST_F(ReplicationFollowerTest, runtimeSubscriptionChangesWithoutRestart) {
+  sourceConfig.replication.follower_timeout_ms = 60000;
+  startSource();
+  CollectionId alpha{"alpha", "docs"}, beta{"beta", "docs"};
+  { CollectionHelper h(*source, alpha); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  { CollectionHelper h(*source, beta); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  followerConfig.replication.tenants = "alpha";
+  startFollower();
+  ASSERT_TRUE(caughtUp(alpha));
+  EXPECT_THROW(follower->getCollection(beta), CollectionNotFoundError);
+  auto post = [&](std::string body) { return httpRequest(followerServer->getPort(), http::verb::post, "/_replication/subscription", std::move(body)); };
+
+  // Widening copies the tenant's existing collections; nothing changed on the source.
+  auto widened = post(R"({"filter":{"tenants":["beta","alpha"]}})");
+  ASSERT_EQ(200, widened.result_int()) << widened.body();
+  EXPECT_NE(std::string::npos, widened.body().find(R"("tenants": [)")) << widened.body();
+  ASSERT_TRUE(caughtUp(beta)); ASSERT_TRUE(acknowledged(beta));
+  auto token = source->getCollection(beta)->getShard()->getSnapshots().snapshot()->id;
+  auto barrier = source->getReplication().capture({api::AllReplicas{}}, beta, token);
+  ASSERT_EQ(1u, barrier.members.size());
+
+  // Narrowing to one collection leaves beta an orphan and out of the barrier.
+  EXPECT_EQ(400, post(R"({"filter":{"collections":["alpha/Bad"]}})").result_int());
+  follower->getFollower()->resubscribe({}, ReplicationSubscription::parse("", "alpha/docs"));
+  ASSERT_TRUE(until([&] { return source->getReplication().progress(barrier, beta, token).wanted == 0; }));
+  { CollectionHelper h(*source, beta); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
+  { CollectionHelper h(*source, alpha); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp(alpha));
+  EXPECT_EQ(1, follower->getCollection(beta)->getReaderManager().getReader()->liveDocs());
+  auto status = httpRequest(followerServer->getPort(), http::verb::get, "/_replication/status").body();
+  EXPECT_NE(std::string::npos, status.find(R"("collections":["alpha/docs"])")) << status;
+
+  // A restart keeps the runtime subscription while the configuration is unchanged...
+  stopFollower(); startFollower();
+  EXPECT_EQ(ReplicationSubscription::parse("", "alpha/docs"), follower->getFollower()->subscription().subscription);
+  // ...and adopts a changed configuration.
+  stopFollower(); followerConfig.replication.tenants = "beta"; startFollower();
+  EXPECT_EQ(ReplicationSubscription::parse("beta", ""), follower->getFollower()->subscription().subscription);
+  ASSERT_TRUE(caughtUp(beta));
+  EXPECT_EQ(2, follower->getCollection(beta)->getReaderManager().getReader()->liveDocs());
+}
+
+TEST_F(ReplicationFollowerTest, runtimeRepointKeepsLocalCopies) {
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto before = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
+  HttpServer second(*source, 1, 0);
+  second.start();
+  auto url = "http://127.0.0.1:" + std::to_string(second.getPort());
+  EXPECT_THROW(follower->getFollower()->resubscribe(std::string("ftp://nowhere"), {}), std::invalid_argument);
+  follower->getFollower()->resubscribe(url, {});
+  EXPECT_EQ(url, follower->getFollower()->subscription().source);
+  sourceServer.reset(); // the old address is gone
+  EXPECT_EQ(before, follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id);
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+  stopFollower();
+  second.shutdown();
+}
+
+TEST_F(ReplicationFollowerTest, subscriptionRouteNeedsAFollower) {
+  startSource();
+  auto response = httpRequest(sourcePort, http::verb::get, "/_replication/subscription");
+  EXPECT_NE(200, response.result_int());
+  EXPECT_NE(std::string::npos, response.body().find("not_follower")) << response.body();
 }
 
 TEST_F(ReplicationFollowerTest, narrowerRestartOrphansCopiesAndDropsBarrierMembership) {

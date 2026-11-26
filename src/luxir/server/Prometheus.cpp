@@ -200,6 +200,7 @@ void collections(Renderer& r, const api::StatsResponse& stats) {
     r.gauge("luxir_collection_available", "Collection is available for requests.", ok, labels);
     r.gauge("luxir_collection_storage_ram_bytes", "RAM storage bytes owned by the collection.", (double)c.storage_ram_bytes, labels);
     if (!ok) continue;
+    r.gauge("luxir_collection_read_only", "Collection serves without a writer.", c.read_only, labels);
     const auto& index = c.shards[0].index;
     const auto& t = index.totals;
     constexpr std::string_view documents = "Documents in flushed index segments; excludes documents still in inverters.";

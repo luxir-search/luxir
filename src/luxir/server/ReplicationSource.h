@@ -9,6 +9,7 @@
 #include <mutex>
 #include "CollectionEvents.h"
 #include "CollectionPublication.h"
+#include "ReplicationSubscription.h"
 
 namespace luxir {
 // Discovery and follower acknowledgments, using only state from the ordered feed.
@@ -41,9 +42,9 @@ private:
   struct LiveFollower {
     uint64_t lastSeen;
     Clock::time_point seen;
-    std::set<std::string> tenants; // empty subscribes to all
+    ReplicationSubscription subscription;
     std::map<CollectionId, Acknowledgment> commits;
-    bool includes(const CollectionId& id) const { return tenants.empty() || tenants.contains(id.tenant); }
+    bool includes(const CollectionId& id) const { return subscription.includes(id); }
   };
   std::mutex mutex;
   std::string boot;
@@ -83,11 +84,15 @@ public:
   void remapped(std::string_view tenant, uint64_t revision, std::span<const Binding> changes) noexcept override;
   void updated(const CollectionId& id, const Collection& collection) noexcept override;
   void removed(const CollectionId& id, uint64_t revision = 0) noexcept override;
-  uint64_t watch(std::string_view cursor, std::string_view follower, std::function<void()> completion, std::span<const std::string> tenants = {});
+  // A follower's subscription: whole `tenants` plus collection `labels`
+  // ("tenant/name"); both empty follow everything. Each watch replaces it.
+  uint64_t watch(std::string_view cursor, std::string_view follower, std::function<void()> completion,
+                 std::span<const std::string> tenants = {}, std::span<const std::string> labels = {});
   void cancel(uint64_t watch);
-  // Every collection, or only those of `tenants` when not empty. The cursor
-  // covers every tenant.
-  api::ReplicationCatalog catalog(std::pmr::memory_resource& arena, std::span<const std::string> tenants = {});
+  // Every collection, or only those of a subscription (as in watch). The
+  // cursor covers every tenant.
+  api::ReplicationCatalog catalog(std::pmr::memory_resource& arena, std::span<const std::string> tenants = {},
+                                  std::span<const std::string> labels = {});
   void installed(const api::ReplicationInstalled& request);
   std::vector<Follower> status();
   void seen(std::string_view follower);

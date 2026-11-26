@@ -9,6 +9,8 @@
 #include "luxir/store/Manifest.h"
 #include "luxir/store/CorruptionMarker.h"
 #include "luxir/util/Signal.h"
+#include "luxir/util/luxir_util.h"
+#include "luxir/util/ApiError.h"
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <glaze/glaze.hpp>
@@ -240,6 +242,9 @@ struct ReplicationFollower::Impl {
     std::optional<CommitId> advertised, serving, acknowledged;
     std::string error;
     bool busy = false, waiting = false, remove = false, unavailable = false, retiring = false;
+    // The source marks the collection read-only; recorded: what this follower's
+    // catalog last recorded for the incarnation.
+    bool readOnly = false, recordedReadOnly = false;
     std::string seenBoot; // last boot advertising this incarnation or its selected name
     bool replaceEmpty = true;
     // The local copy could not be opened; the catalog, if it could be read, selects
@@ -267,7 +272,7 @@ struct ReplicationFollower::Impl {
   const std::chrono::milliseconds retryDelay; // reconnect, and first sync retry
   Source source;
   std::vector<Source> peers; // never resized after construction: clients reference them
-  const std::vector<std::string> tenants;
+  ReplicationSubscription subscription;
   ReplicationState binding;
   std::string follower; // set by start(); pull runs anonymously
   std::mutex metadataMutex;
@@ -284,21 +289,110 @@ struct ReplicationFollower::Impl {
   std::string cursor;
   std::stop_source stopping;
   std::vector<std::jthread> threads;
+  // Orders start, stop and resubscribe; `shutdown` once stop() is final.
+  std::mutex control;
+  bool shutdown = false;
+
+  void startThreads() {
+    {
+      std::lock_guard lock(mutex);
+      follower = node.nodeId();
+    }
+    threads.emplace_back([this] { watch(); });
+    for (int i = 0; i < node.getConfig().replication.downloads; i++) threads.emplace_back([this] { worker(); });
+  }
+  void stopThreads() {
+    stopping.request_stop(); changed.notify_all(); threads.clear();
+  }
+
+  // Like a restart with a new configuration, without one: transfers stop and
+  // resume; each copy keeps its local history.
+  void resubscribe(const std::optional<std::string>& nextSource, const std::optional<ReplicationSubscription>& next) {
+    std::optional<Source> parsed;
+    if (nextSource) parsed.emplace(*nextSource);
+    std::lock_guard controlLock(control);
+    if (shutdown) throw CollectionUnavailableError("follower is shutting down");
+    bool repoint, refilter;
+    {
+      std::lock_guard lock(mutex);
+      repoint = parsed && parsed->authority != source.authority;
+      refilter = next && *next != subscription;
+    }
+    if (!repoint && !refilter) return;
+    bool running = !threads.empty();
+    if (running) {
+      stopThreads();
+      stopping = std::stop_source{};
+    }
+    // Transfers resume even if recording the change fails.
+    auto restart = scope_guard([&] {
+      if (running) startThreads();
+      changed.notify_all();
+    });
+    {
+      std::lock_guard applyLock(mappingMutex);
+      std::lock_guard lock(mutex);
+      if (repoint) {
+        source = *parsed;
+        binding.source = "http://" + source.authority;
+        boot.clear(); cursor.clear(); discoveryError.clear();
+        connected = discovered = false; lastContact = 0;
+        for (auto& [key, state] : states) state.waiting = state.unavailable = state.remove = false;
+      }
+      if (next) subscription = *next;
+      for (auto& [key, state] : states) {
+        // The source dropped acknowledgments outside the old subscription, and
+        // the stop interrupted transfers: neither is a failure to back off from.
+        state.acknowledged.reset();
+        state.error.clear(); state.failures = 0; state.retry = {};
+      }
+      // Every mapping waits for a catalog under the new subscription, as after a restart.
+      std::erase_if(mappings, [&](const auto& entry) { return !includesTenant(entry.first) && !entry.second.applying; });
+      for (auto& [tenant, mapping] : mappings) {
+        mapping.available = false;
+        std::erase_if(mapping.names, [&](const auto& name) { return !includes({tenant, name.first}); });
+      }
+    }
+    persistState();
+    LOG_INFO("Follower subscription: source {}, tenants [{}], collections [{}]", binding.source,
+             join(subscription.tenants), join(subscription.labels()));
+  }
+  static std::string join(const std::vector<std::string>& values) {
+    std::string result;
+    for (const auto& value : values) { if (!result.empty()) result += ","; result += value; }
+    return result;
+  }
 
   explicit Impl(LuxirNode& node) : node(node), retryDelay(node.getConfig().replication.retry_ms),
       source(node.getConfig().replication.source),
-      tenants(node.getConfig().replication.tenantFilter()) {
+      subscription(node.getConfig().replication.subscription()) {
     for (const auto& peer : node.getConfig().replication.peerList()) peers.emplace_back(peer);
     if (node.getConfig().replication.downloads < 1 || node.getConfig().replication.downloads > 64) {
       throw std::invalid_argument("replication.downloads must be between 1 and 64");
     }
     binding.source = "http://" + source.authority;
+    ReplicationState::Subscription configured{binding.source, subscription.tenants, subscription.labels()};
+    binding.configured = configured;
     metadata = node.collections().storage().directory(StorageRoot::NODE_PRIVATE, "");
     if (auto stored = metadata->openFile("replication.json")) {
       auto existing = ReplicationState::read(*stored);
-      existing.source = binding.source;
+      if (existing.configured == configured) {
+        // The configuration is the one this directory last started with, so a
+        // runtime change made since then stands.
+        source = Source(existing.source);
+        subscription = ReplicationSubscription::of(existing.subscribed_tenants, existing.subscribed_collections);
+        if (existing.source != configured.source || subscription != node.getConfig().replication.subscription())
+          LOG_INFO("Follower keeps its runtime subscription to {}; the configuration is unchanged since it was set", existing.source);
+      } else {
+        existing.source = binding.source; // a changed configuration repoints the follower
+        existing.configured = configured;
+      }
+      existing.subscribed_tenants = subscription.tenants;
+      existing.subscribed_collections = subscription.labels();
       binding = std::move(existing);
     } else {
+      binding.subscribed_tenants = subscription.tenants;
+      binding.subscribed_collections = subscription.labels();
       auto& storage = node.collections().storage();
       if (!TenantCatalog::empty(storage)) throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
       for (const auto& entry : storage.children(StorageRoot::NODE_PRIVATE, "")) {
@@ -317,14 +411,26 @@ struct ReplicationFollower::Impl {
     }
   };
 
-  bool includes(const CollectionId& id) const {
-    return tenants.empty() || std::ranges::find(tenants, id.tenant) != tenants.end();
+  bool includes(const CollectionId& id) const { return subscription.includes(id); }
+  bool includesTenant(std::string_view tenant) const { return subscription.includesTenant(tenant); }
+  // A state follows the subscription by its local name, else its source route.
+  bool follows(const Key& key, const State& state) const {
+    return includes({key.tenant, state.selectedName.value_or(state.name.name)});
+  }
+  // Local work that removes data: a retired or deleted copy of a followed
+  // tenant, or a partial copy the subscription no longer wants.
+  bool cleanupDue(const Key& key, const State& state) const {
+    bool followed = includesTenant(key.tenant) && follows(key, state);
+    if (!followed) return !state.selectedName && (state.candidate || state.prepared);
+    return state.retiring || (state.remove && !state.selectedName && !state.advertised);
   }
 
   void seed(const std::vector<Collections::Opened>& opened) {
     for (const auto& [tenant, saved] : binding.tenants) {
-      if (!saved.boot.empty() && includes({tenant, ""}))
-        mappings[tenant] = {saved.boot, saved.revision, saved.names, false, false};
+      if (!saved.boot.empty() && includesTenant(tenant)) {
+        auto& mapping = mappings[tenant] = {saved.boot, saved.revision, {}, false, false};
+        for (const auto& [name, id] : saved.names) if (includes({tenant, name})) mapping.names[name] = id;
+      }
       for (const auto& [incarnation, history] : saved.incarnations) {
         auto& state = states[{tenant, incarnation}];
         state.seenBoot = history.boot; state.replaceEmpty = history.replace_empty;
@@ -336,6 +442,7 @@ struct ReplicationFollower::Impl {
       if (!row.collection || !row.incarnation) continue;
       auto& state = states[{row.id.tenant, *row.incarnation}];
       state.name = row.id; state.selectedName = row.id.name; state.local = row.collection;
+      state.readOnly = state.recordedReadOnly = row.collection->isReadOnly();
       if (row.error.empty()) state.serving = row.collection->getShard()->getSnapshots().snapshot()->id;
       else { state.unreadable = row.incarnation; state.error = row.error; }
     }
@@ -349,6 +456,9 @@ struct ReplicationFollower::Impl {
     {
       std::lock_guard lock(mutex);
       next.source = binding.source;
+      next.subscribed_tenants = subscription.tenants;
+      next.subscribed_collections = subscription.labels();
+      next.configured = binding.configured;
       for (const auto& [key, state] : states) {
         next.incarnation(key.tenant, key.incarnation) = ReplicationState::Collection{
             state.advertised ? state.advertised->token() : "", state.seenBoot, state.replaceEmpty, {}};
@@ -431,9 +541,10 @@ struct ReplicationFollower::Impl {
   }
 
   api::ReplicationCatalog fetchCatalog(Client& client, const std::string& cursor, std::chrono::milliseconds timeout, std::pmr::memory_resource& arena) {
-    std::string subscription;
-    for (const auto& tenant : tenants) subscription += "&tenant=" + escape(tenant);
-    auto response = request(client, http::verb::get, "/_replication/watch?" + followerQuery() + subscription
+    std::string query;
+    for (const auto& tenant : subscription.tenants) query += "&tenant=" + escape(tenant);
+    for (const auto& label : subscription.labels()) query += "&collection=" + escape(label);
+    auto response = request(client, http::verb::get, "/_replication/watch?" + followerQuery() + query
         + "&since=" + escape(cursor) + "&timeout_ms=" + std::to_string(timeout.count()), {}, timeout + 10s);
     api::ReplicationCatalog catalog;
     if (!api::read_json(catalog, api::build::arenaStr(arena, response.body()), arena) || catalog.boot.empty() || catalog.cursor.empty()) throw std::runtime_error("invalid source catalog");
@@ -492,7 +603,7 @@ struct ReplicationFollower::Impl {
     connected = discovered = true; discoveryError.clear();
     std::map<std::string, Mapping> next;
     for (const auto& tenant : catalog.tenants) {
-      if (!includes({std::string(tenant.tenant), ""})) continue;
+      if (!includesTenant(tenant.tenant)) continue;
       next[std::string(tenant.tenant)] = {boot, tenant.revision, {}, true, false};
     }
     std::set<Key> seen;
@@ -512,14 +623,15 @@ struct ReplicationFollower::Impl {
       }
       auto replaceEmpty = state.replaceEmpty;
       if (state.name != name) state.acknowledged.reset();
-      state.name = name; state.unavailable = !entry.available;
+      state.name = name; state.unavailable = !entry.available; state.readOnly = entry.read_only;
       observe(state, announced, true, boot);
       state.replaceEmpty = replaceEmpty;
       if (!state.busy && state.serving && state.advertised == state.serving && state.acknowledged == state.serving) {
         state.error.clear(); state.failures = 0; state.retry = {};
       }
     }
-    for (auto& [key, state] : states) if (includes({key.tenant, ""}) && !seen.contains(key)) {
+    // Absence decides only for followed names: an excluded copy is an orphan.
+    for (auto& [key, state] : states) if (includesTenant(key.tenant) && follows(key, state) && !seen.contains(key)) {
       // An unavailable source row without an identity cannot authorize deletion.
       auto tenant = next.find(key.tenant);
       if (tenant != next.end()) {
@@ -535,7 +647,7 @@ struct ReplicationFollower::Impl {
       state.unavailable = false;
       observe(state, {}, false, boot);
     }
-    for (const auto& [key, state] : states) if (includes({key.tenant, ""}) && !next.contains(key.tenant))
+    for (const auto& [key, state] : states) if (includesTenant(key.tenant) && !next.contains(key.tenant))
       next[key.tenant] = {boot, 0, {}, true, false};
     for (auto& [tenant, mapping] : next) {
       mapping.applying = mappings[tenant].applying;
@@ -553,6 +665,7 @@ struct ReplicationFollower::Impl {
     { std::lock_guard lock(mutex); for (const auto& [tenant, mapping] : mappings) tenants.push_back(tenant); }
     for (const auto& tenant : tenants) {
       std::map<std::string, std::string> names, desired;
+      std::set<std::string> readOnly;
       std::vector<Collections::Prepared> prepared;
       std::vector<std::string> retained;
       {
@@ -575,11 +688,16 @@ struct ReplicationFollower::Impl {
             else names[name] = {}; // Never serve data now assigned to another name.
           }
         }
-        for (const auto& [key, state] : states) if (key.tenant == tenant && state.selectedName && !state.advertised && !state.remove
+        for (const auto& [key, state] : states) if (key.tenant == tenant && state.selectedName
+            && (!follows(key, state) || (!state.advertised && !state.remove))
             && !names.contains(*state.selectedName) && !owners.contains(key.incarnation))
-          names[*state.selectedName] = key.incarnation; // orphan after a source reboot
+          names[*state.selectedName] = key.incarnation; // orphan: excluded, or after a source reboot
         bool changed = current != names;
-        for (const auto& [name, id] : names) if (!id.empty() && states.at({tenant, id}).prepared) changed = true;
+        for (const auto& [name, id] : names) if (!id.empty()) {
+          const auto& state = states.at({tenant, id});
+          if (state.readOnly) readOnly.insert(id);
+          if (state.prepared || state.readOnly != state.recordedReadOnly) changed = true;
+        }
         if (!changed) continue;
         mapping.applying = true;
         for (const auto& [key, state] : states) if (key.tenant == tenant && state.busy) retained.push_back(key.incarnation);
@@ -590,7 +708,7 @@ struct ReplicationFollower::Impl {
       }
       try {
         Signal::emit("replicationMappingReady", (void*)&tenant);
-        node.collections().applyMapping(tenant, names, desired, std::move(prepared), retained);
+        node.collections().applyMapping(tenant, names, desired, std::move(prepared), retained, readOnly);
         std::map<std::string, std::string> selected;
         for (const auto& [name, id] : names) if (!id.empty()) selected[id] = name;
         std::lock_guard lock(mutex);
@@ -605,6 +723,7 @@ struct ReplicationFollower::Impl {
             state.selectedName.reset(); state.acknowledged.reset();
             if (state.retiring && !state.busy) { state.serving.reset(); state.local.reset(); }
           } else {
+            state.recordedReadOnly = readOnly.contains(key.incarnation);
             auto local = node.collections().get({tenant, it->second});
             bool installed = state.local != local;
             if (installed || state.selectedName != it->second) state.acknowledged.reset();
@@ -991,8 +1110,11 @@ struct ReplicationFollower::Impl {
         auto ready = [&] {
           State* selected = nullptr;
           for (auto& [candidate, state] : states) {
-            if (!includes({candidate.tenant, ""}) || mappings[candidate.tenant].applying) continue;
-            bool cleanup = state.retiring || (state.remove && !state.selectedName && !state.advertised);
+            // find, not operator[]: an empty default mapping would retire local copies.
+            auto mapping = mappings.find(candidate.tenant);
+            if (mapping != mappings.end() && mapping->second.applying) continue;
+            bool cleanup = cleanupDue(candidate, state);
+            if (!cleanup && !(includesTenant(candidate.tenant) && follows(candidate, state))) continue;
             bool work = cleanup || (connected && ((state.corrupt && (state.selectedName || !state.advertised)) || (state.advertised && ((state.advertised != state.serving && state.advertised != state.ready && !state.waiting)
                     || state.needsAck()))));
             if (!state.busy && (!state.unavailable || cleanup) && work && node.now() >= state.retry && (!selected || std::max(state.readySince, state.retry) < std::max(selected->readySince, selected->retry))) {
@@ -1008,7 +1130,11 @@ struct ReplicationFollower::Impl {
         auto now = node.now();
         for (const auto& [key, state] : states) if (state.retry > now) recheck = std::min(recheck, state.retry - now);
         changed.wait_for(lock, stopping.get_token(), recheck, ready);
-        if (stopping.stop_requested()) break;
+        if (stopping.stop_requested()) {
+          // A stop can still run the predicate, which claims work; resubscribe restarts the threads.
+          if (!key.incarnation.empty()) states[key].busy = false;
+          break;
+        }
         if (key.incarnation.empty()) continue;
       }
       std::string error;
@@ -1019,7 +1145,7 @@ struct ReplicationFollower::Impl {
         {
           std::lock_guard lock(mutex);
           auto& state = states[key]; corrupt = state.corrupt;
-          cleanup = state.retiring || (state.remove && !state.selectedName && !state.advertised);
+          cleanup = cleanupDue(key, state);
         }
         if (corrupt && !cleanup) unloadCorrupt(key, corrupt);
         {
@@ -1081,15 +1207,47 @@ ReplicationFollower::~ReplicationFollower() { stop(); }
 void ReplicationFollower::seed(const std::vector<Collections::Opened>& opened) { impl->seed(opened); }
 bool ReplicationFollower::pull(std::ostream& output) { return impl->pull(output); }
 void ReplicationFollower::start() {
-  {
-    std::lock_guard lock(impl->mutex);
-    impl->follower = impl->node.nodeId();
-  }
-  impl->threads.emplace_back([this] { impl->watch(); });
-  for (int i = 0; i < impl->node.getConfig().replication.downloads; i++) impl->threads.emplace_back([this] { impl->worker(); });
+  std::lock_guard lock(impl->control);
+  if (!impl->shutdown && impl->threads.empty()) impl->startThreads();
 }
 void ReplicationFollower::stop() {
-  impl->stopping.request_stop(); impl->changed.notify_all(); impl->threads.clear();
+  std::lock_guard lock(impl->control);
+  impl->shutdown = true;
+  impl->stopThreads();
+}
+void ReplicationFollower::resubscribe(const std::optional<std::string>& source,
+                                      const std::optional<ReplicationSubscription>& subscription) {
+  impl->resubscribe(source, subscription);
+}
+ReplicationFollower::Subscription ReplicationFollower::subscription() {
+  std::lock_guard lock(impl->mutex);
+  return {impl->binding.source, impl->subscription};
+}
+void ReplicationFollower::describe(api::FollowerSubscription& out, std::pmr::memory_resource& arena) {
+  auto current = subscription();
+  auto strings = [&](std::span<const std::string_view>& field, const std::vector<std::string>& values) {
+    auto* items = api::build::allocArray(field, values.size(), arena);
+    for (size_t i = 0; i < values.size(); i++) items[i] = api::build::arenaStr(arena, values[i]);
+  };
+  out.source = api::build::arenaStr(arena, current.source);
+  strings(out.tenants, current.subscription.tenants);
+  strings(out.collections, current.subscription.labels());
+}
+void ReplicationFollower::resubscribe(const api::SetFollowerSubscriptionRequest& request) {
+  std::optional<std::string> source;
+  if (!request.source.empty()) source = std::string(request.source);
+  std::optional<ReplicationSubscription> next;
+  try {
+    if (source) [[maybe_unused]] Source validated(*source);
+    if (request.filter) {
+      std::vector<std::string> tenants(request.filter->tenants.begin(), request.filter->tenants.end());
+      std::vector<std::string> collections(request.filter->collections.begin(), request.filter->collections.end());
+      next = ReplicationSubscription::of(tenants, collections);
+    }
+  } catch (const std::exception& e) {
+    throw ApiError(ErrorKind::INVALID_REQUEST, "invalid_subscription", e.what());
+  }
+  resubscribe(source, next);
 }
 void ReplicationFollower::deleteOrphan(const CollectionId& name) {
   Collections::validate(name);
@@ -1126,6 +1284,7 @@ void ReplicationFollower::repair(const CollectionId& id, const std::shared_ptr<C
   impl->changed.notify_all();
 }
 void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_resource& arena) {
+  describe(out.subscription.emplace(), arena);
   std::lock_guard lock(impl->mutex);
   auto str = [&](std::string_view value) { return api::build::arenaStr(arena, value); };
   out.source = str(impl->binding.source); out.follower = str(impl->follower);

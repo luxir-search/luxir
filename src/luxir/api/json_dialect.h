@@ -1705,7 +1705,7 @@ struct to<JSON, luxir::api::Val> {
 
 // Commit counts accept either a JSON integer or a string (including "all").
 // ----- SearchRequest: full form, root top_docs shorthand, or both at one root -----
-// Read accepts request-level keys (request_id, collection, ops, freshness_ms,
+// Read accepts request-level keys (request_id, collection, tenant, ops, freshness_ms,
 // time_zone, response_format, profile, max_parallel) and TopDocs keys mixed at
 // the root: any TopDocs key lazily creates the shorthand op, registered as
 // ops["q"]. "ops" is ambiguous until the scan ends - it is SearchRequest.ops in
@@ -1756,6 +1756,8 @@ struct from<JSON, luxir::api::SearchRequest> {
             util::from_json<O>(value.request_id, ctx, vit, vend);
           } else if (key == "collection") {
             util::from_json<O>(value.collection, ctx, vit, vend);
+          } else if (key == "tenant") {
+            util::from_json<O>(value.tenant, ctx, vit, vend);
           } else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);

@@ -11,7 +11,7 @@
 namespace luxir {
 
 // A collection's identity: the tenant that owns it and its name there.
-// Requests name only the collection; their scope supplies the tenant.
+// Requests name the collection and, optionally, its tenant; empty is t0.
 // Manifests and commit tokens never carry either.
 struct CollectionId {
   static constexpr std::string_view kDefaultTenant = "t0";

@@ -4,15 +4,17 @@
 
 #include <iosfwd>
 #include <memory>
+#include <optional>
 #include <memory_resource>
 #include <span>
 #include <string_view>
 #include <vector>
 #include "Collections.h"
+#include "ReplicationSubscription.h"
 
 namespace luxir {
 class LuxirNode;
-namespace api { struct ReplicationStatus; }
+namespace api { struct ReplicationStatus; struct FollowerSubscription; struct SetFollowerSubscriptionRequest; }
 
 // Owns discovery and a bounded set of transfer workers. Ordinary writer nodes
 // do not construct one. Local publication is independent of network waits.
@@ -29,7 +31,20 @@ public:
   // Does not acknowledge serving traffic. Returns false if any collection failed.
   bool pull(std::ostream& output);
   void start();
+  // Final: a stopped follower does not start or resubscribe again.
   void stop();
+  struct Subscription {
+    std::string source; // http://host:port
+    ReplicationSubscription subscription;
+  };
+  Subscription subscription();
+  // Changes the source and/or the subscription of a running follower; absent
+  // keeps the current value. Persisted, so a restart keeps it unless the
+  // configuration changed. Validates before stopping anything.
+  void resubscribe(const std::optional<std::string>& source, const std::optional<ReplicationSubscription>& subscription);
+  // The API forms of subscription() and resubscribe().
+  void describe(api::FollowerSubscription& out, std::pmr::memory_resource& arena);
+  void resubscribe(const api::SetFollowerSubscriptionRequest& request);
   void deleteOrphan(const CollectionId& id);
   // After Collections::fail: repair the failed collection, or a replacement
   // still holding one of its suspect descriptors. Unrelated replacements stay

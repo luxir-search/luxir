@@ -271,9 +271,10 @@ server. A pattern lives under `/_plugins/<plugin>/...` (node level) or
 capture. Built-in routes always win, so collection patterns may not end in a
 built-in endpoint name or use `_snapshot`. Patterns may not overlap: two patterns
 with the same segment count must differ at some position where both are literals
-(`add` throws otherwise). Plugin routes are not reachable under `/tenants/{t}/`;
-they always act in the default tenant, which is what `HttpPluginRequest::tenant`
-holds.
+(`add` throws otherwise). Every plugin route is also reachable under
+`/tenants/{tenant}/`; `HttpPluginRequest::tenant` holds that tenant, or the
+default tenant for an unprefixed path, and a `searchBody` response searches in
+it. Resolve collections with `LuxirNode::target(request.tenant, name)`.
 
 ```cpp
 r.http.add("POST", "/collections/{collection}/_sample",

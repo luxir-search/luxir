@@ -653,8 +653,8 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, BUILD_INFO, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, COLLECTION_RENAME, COLLECTION_SWAP, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
-    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED,
+    NONE, BUILD_INFO, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, COLLECTION_RENAME, COLLECTION_SWAP, COLLECTION_READ_ONLY, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
+    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED, REPLICATION_SUBSCRIPTION,
     PLUGIN
   };
 
@@ -664,8 +664,8 @@ private:
     std::string_view hint;   // appended to a 405 message when the verb choice needs teaching
     std::string coll;
     std::string file;
-    // /tenants/{tenant}/...: an administration or replication route naming its
-    // tenant. Other routes act in the request's own tenant.
+    // /tenants/{tenant}/...: a route naming its tenant. Unprefixed routes act in
+    // the default tenant.
     std::string tenant;
     bool tenantRoute = false;
     // /collections//{endpoint}: a collection route whose {c} segment is empty.  That
@@ -720,7 +720,7 @@ private:
   std::string bufferedBody_;
   std::shared_ptr<HttpStreamUpdateState> streamUpdate_;
   std::optional<net::steady_timer> replicationTimer_;
-  std::vector<std::string> replicationTenants_;
+  std::vector<std::string> replicationTenants_, replicationCollections_;
   uint64_t replicationWatch_ = 0;
   uint64_t replicationWatchEpoch_ = 0;
   uint64_t replicationTransferEpoch_ = 0;
@@ -731,8 +731,7 @@ private:
   bool keepAlive_ = false;
   std::string requestId_;  // URL param, then the parsed body
   // The current request's tenant: named by a /tenants route, otherwise the
-  // caller's (the default tenant until credentials carry one). Asynchronous
-  // work captures it by value.
+  // default tenant. Asynchronous work captures it by value.
   std::string tenant_;
   std::vector<UrlParam> urlParams_;
   RouteMatch route_;
@@ -750,10 +749,12 @@ private:
       case Route::HEALTH: operation = MetricOperation::HEALTH; break;
       case Route::TENANT_LIST: case Route::COLLECTION_LIST:
       case Route::COLLECTION_CREATE: case Route::COLLECTION_DELETE: case Route::COLLECTION_RENAME: case Route::COLLECTION_SWAP:
+      case Route::COLLECTION_READ_ONLY:
         operation = MetricOperation::COLLECTIONS; break;
       case Route::REPLICATION_STATUS: case Route::REPLICATION_WATCH:
       case Route::REPLICATION_SNAPSHOT: case Route::REPLICATION_FILE:
       case Route::REPLICATION_INSTALLED: return;
+      case Route::REPLICATION_SUBSCRIPTION: operation = MetricOperation::OTHER; break;
       default: break;
     }
     requestMetric.begin(*metrics, metricActivity(MetricTransport::HTTP, operation));
@@ -949,6 +950,11 @@ private:
     // The request's scope is settled with its route, before the buffered and
     // streaming paths split; nothing carries over from an earlier request.
     tenant_ = route_.tenantRoute ? route_.tenant : std::string(CollectionId::kDefaultTenant);
+    // Validated before any body is read: an NDJSON stream never reaches route().
+    if (route_.tenantRoute) {
+      try { Collections::validateName(route_.tenant, "tenant"); }
+      catch (const std::exception& e) { respondBeforeBodyError(classifyException(e, ErrorKind::INVALID_REQUEST)); return; }
+    }
     pretty_ = route_.prettyDefault;
     if (const std::string* pretty = findParam(params, "pretty"); pretty && pretty->empty()) {
       pretty_ = true;  // A bare ?pretty also means true.
@@ -964,6 +970,17 @@ private:
       std::string paramErr;
       if (!parseUpdateUrlParams(params, updateUrl_, paramErr)) {
         respondBeforeBodyError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, paramErr));
+        return;
+      }
+    }
+    // A loaded collection without a writer (read-only, or a follower's copy)
+    // refuses before its body is read. Storage would refuse it anyway.
+    if (postUpdate && !node_.readOnly() && !route_.emptyCollection) {
+      auto existing = node_.collections().get(LuxirNode::target(tenant_, route_.coll));
+      auto shard = existing ? existing->getShard() : nullptr;
+      if (shard && !shard->iw) {
+        respondBeforeBodyError({ErrorKind::FAILED_PRECONDITION, "read_only",
+                                "collection '" + existing->getId().label() + "' is read-only"});
         return;
       }
     }
@@ -1074,7 +1091,8 @@ private:
       auto slash = target.find('/', 9);
       target = slash == std::string_view::npos ? std::string_view{} : target.substr(slash);
     }
-    if (target == "/collections/_create" || target == "/collections/_delete" || target == "/collections/_rename" || target == "/collections/_swap") return true;
+    if (target == "/collections/_create" || target == "/collections/_delete" || target == "/collections/_rename" ||
+        target == "/collections/_swap" || target == "/collections/_read_only") return true;
     if (method != http::verb::post) return false;
     std::string coll;
     return parseUpdatePath(target, coll) || parseSchemaPath(target, coll);
@@ -1445,12 +1463,21 @@ private:
     return true;
   }
 
-  // Routes that may name a tenant: administration and replication. Search,
-  // update and replica waits always act in the caller's own tenant.
+  // Routes that may name a tenant: everything that addresses collections, and
+  // plugin routes. Node routes (/, /health, /metrics) and the replication watch
+  // protocol, which names tenants in its own parameters, do not.
   static bool tenantRoute(Route route) {
     return route == Route::COLLECTION_LIST || route == Route::COLLECTION_CREATE || route == Route::COLLECTION_DELETE || route == Route::COLLECTION_RENAME || route == Route::COLLECTION_SWAP ||
-           route == Route::STATS || route == Route::SCHEMA || route == Route::REPLICATION_SNAPSHOT ||
-           route == Route::REPLICATION_FILE;
+           route == Route::COLLECTION_READ_ONLY || route == Route::STATS || route == Route::SCHEMA || route == Route::REPLICATION_SNAPSHOT ||
+           route == Route::REPLICATION_FILE || route == Route::SEARCH || route == Route::UPDATE || route == Route::PLUGIN;
+  }
+
+  // A request body may repeat its route's tenant, never name another: the route
+  // decides, so a body is not quietly applied elsewhere.
+  static void requireRouteTenant(std::string_view bodyTenant, std::string_view tenant) {
+    if (!bodyTenant.empty() && bodyTenant != tenant) {
+      throw RequestError("tenant '" + std::string(bodyTenant) + "' belongs in a /tenants/" + std::string(bodyTenant) + " route");
+    }
   }
 
   static RouteMatch matchRoute(std::string_view target) {
@@ -1492,6 +1519,8 @@ private:
       m.route = Route::COLLECTION_RENAME; m.allow = "POST";
     } else if (target == "/collections/_swap") {
       m.route = Route::COLLECTION_SWAP; m.allow = "POST";
+    } else if (target == "/collections/_read_only") {
+      m.route = Route::COLLECTION_READ_ONLY; m.allow = "POST";
     } else if (target == "/collections/_delete") {
       m.route = Route::COLLECTION_DELETE; m.allow = "POST";
     } else if (parseCollectionPath(target, "/_snapshot", m.coll)) {
@@ -1511,6 +1540,7 @@ private:
     } else if (target.starts_with("/_replication/")) {
       auto path = target.substr(14);
       if (path == "status") { m.route = Route::REPLICATION_STATUS; m.allow = "GET"; }
+      else if (path == "subscription") { m.route = Route::REPLICATION_SUBSCRIPTION; m.allow = "GET, POST"; m.prettyDefault = true; }
       else if (path == "watch") { m.route = Route::REPLICATION_WATCH; m.allow = "GET"; }
       else if (path == "installed") { m.route = Route::REPLICATION_INSTALLED; m.allow = "POST"; }
       return m;
@@ -1584,11 +1614,6 @@ private:
       }
     }
 
-    if (match.tenantRoute) {
-      try { Collections::validateName(match.tenant, "tenant"); }
-      catch (const std::exception& e) { respondError(classifyException(e, ErrorKind::INVALID_REQUEST)); return; }
-    }
-
     const std::string& coll = match.coll;
     switch (match.route) {
       case Route::BUILD_INFO: {
@@ -1621,6 +1646,7 @@ private:
         return;
       }
       case Route::REPLICATION_WATCH: handleReplicationWatch(); break;
+      case Route::REPLICATION_SUBSCRIPTION: handleFollowerSubscription(req.method() == http::verb::post, std::move(req.body())); break;
       case Route::REPLICATION_SNAPSHOT: handleReplicationFile(coll, {}, {}, req.method() == http::verb::head); break;
       case Route::REPLICATION_FILE:
         handleReplicationFile(coll, match.file, req.count(http::field::range) == 1 ? std::string(req[http::field::range]) : std::string(),
@@ -1636,6 +1662,7 @@ private:
         handleCollectionCreate(std::move(req.body()));
         break;
       case Route::COLLECTION_RENAME: handleCollectionNames<false>(std::move(req.body())); break;
+      case Route::COLLECTION_READ_ONLY: handleSetReadOnly(std::move(req.body())); break;
       case Route::COLLECTION_SWAP: handleCollectionNames<true>(std::move(req.body())); break;
       case Route::COLLECTION_DELETE:
         handleCollectionDelete(req.body());
@@ -1800,7 +1827,7 @@ private:
   // form) with the path-derived collection applied (overwrites a body-supplied one).
   // Throws with a client-facing message on malformed input.
   static void parseEffectiveRequest(const std::string& body, const std::string& coll,
-                                    const SearchUrlOverlay& overlay,
+                                    std::string_view tenant, const SearchUrlOverlay& overlay,
                                     HttpSearchRequestState& state) {
     // SearchRequest's readers copy strings (including overlay strings) into
     // resource. That arena follows the request through async search/reply.
@@ -1815,6 +1842,7 @@ private:
     if (!overlay.empty) {
       overlayQueryRequest(overlay.json, state.proto, state.resource);
     }
+    requireRouteTenant(state.proto.tenant, tenant);
     setCollectionTarget(state.proto.collection, coll, state.resource);
   }
 
@@ -1826,7 +1854,7 @@ private:
     HttpSearchRequestState state;
     std::string out;
     try {
-      parseEffectiveRequest(body, coll, overlay, state);
+      parseEffectiveRequest(body, coll, tenant_, overlay, state);
       requestId_ = std::string(state.proto.request_id);
       // Mirrors the URL-param check in route(): the docs format can also be
       // selected in the body, and it composes with explain no better.
@@ -1905,7 +1933,7 @@ private:
     auto* arena = createArena();
     auto requestState = std::make_unique<HttpSearchRequestState>();
     try {
-      parseEffectiveRequest(body, coll, overlay, *requestState);
+      parseEffectiveRequest(body, coll, tenant_, overlay, *requestState);
     } catch (const std::exception& e) {
       releaseArena(arena);
       respondException(e, ErrorKind::INVALID_REQUEST);
@@ -1959,12 +1987,13 @@ private:
   // must not occupy the connection's I/O shard, which serves every other
   // connection assigned to it, nor a search worker.
   static void prepareBufferedUpdate(HttpUpdateState& state, std::string_view coll,
-                                    const UpdateUrlParams& url) {
+                                    std::string_view tenant, const UpdateUrlParams& url) {
     std::string err;
     if (!luxir::api::read_json(state.proto, state.body, state.resource, &err)) {
       throw RequestError(err.empty() ? "malformed update request" : err, "invalid_json");
     }
     std::string{}.swap(state.body); // Decoded request strings live in state.resource.
+    requireRouteTenant(state.proto.tenant, tenant);
     setCollectionTarget(state.proto.collection, coll, state.resource);
     // Same unit rule as streaming groups: a body that sets either field-map knob
     // owns the pair; otherwise the URL-param default applies.
@@ -2057,7 +2086,7 @@ private:
         auto state = std::move(slot.state);
         std::optional<ErrorInfo> failure;
         try {
-          prepareBufferedUpdate(*state, coll, url);
+          prepareBufferedUpdate(*state, coll, tenant, url);
         } catch (const std::exception& e) {
           failure = classifyException(e, ErrorKind::INVALID_REQUEST);
         } catch (...) {
@@ -2118,9 +2147,7 @@ private:
 
   // An administration body may repeat the route's tenant, never name another.
   CollectionId adminTarget(std::string_view bodyTenant, std::string_view name) const {
-    if (!bodyTenant.empty() && bodyTenant != tenant_) {
-      throw RequestError("tenant '" + std::string(bodyTenant) + "' belongs in a /tenants/" + std::string(bodyTenant) + " route");
-    }
+    requireRouteTenant(bodyTenant, tenant_);
     return {tenant_, std::string(name)};
   }
 
@@ -2291,6 +2318,73 @@ private:
     });
   }
 
+  // GET reads, POST changes a follower's subscription. A change stops and
+  // joins the follower's transfers, so it runs on a control thread.
+  void handleFollowerSubscription(bool change, std::string body) {
+    struct State {
+      std::string body;
+      std::pmr::monotonic_buffer_resource resource;
+      api::SetFollowerSubscriptionRequest request;
+    };
+    auto state = std::make_shared<State>();
+    state->body = std::move(body);
+    try {
+      node_.requireFollower();
+      std::string error;
+      if (change && !api::read_json(state->request, state->body.empty() ? std::string_view("{}") : std::string_view(state->body),
+                                    state->resource, &error)) {
+        throw RequestError(error, "invalid_json");
+      }
+    } catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
+    auto pin = makeShardPin();
+    node_.getControlExecutor().enqueue([self = shared_from_this(), state, change, pin] {
+      std::string out;
+      std::optional<ErrorInfo> failure;
+      try {
+        auto& follower = self->node_.requireFollower();
+        if (change) follower.resubscribe(state->request);
+        std::pmr::monotonic_buffer_resource arena;
+        api::FollowerSubscription response;
+        follower.describe(response, arena);
+        if (!api::write_json(response, out)) throw std::runtime_error("failed to serialize follower subscription");
+      } catch (const std::exception& e) { failure = classifyException(e, ErrorKind::INTERNAL); }
+      net::post(self->stream_.get_executor(), [self, pin, failure = std::move(failure), body = std::move(out)]() mutable {
+        if (failure) self->respondError(*failure);
+        else self->respondJson(http::status::ok, std::move(body));
+      });
+    });
+  }
+
+  void handleSetReadOnly(std::string body) {
+    struct State {
+      std::string body;
+      std::pmr::monotonic_buffer_resource resource;
+      api::SetReadOnlyRequest request;
+    };
+    auto state = std::make_shared<State>();
+    state->body = std::move(body);
+    CollectionId id;
+    try {
+      std::string error;
+      if (!api::read_json(state->request, state->body, state->resource, &error)) throw RequestError(error, "invalid_json");
+      id = adminTarget(state->request.tenant, state->request.name);
+    } catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
+    auto pin = makeShardPin();
+    node_.getControlExecutor().enqueue([self = shared_from_this(), state, id, pin] {
+      std::string out;
+      std::optional<ErrorInfo> failure;
+      try {
+        self->node_.setCollectionReadOnly(id, state->request.read_only);
+        api::SetReadOnlyResponse response{id.name, state->request.read_only};
+        if (!api::write_json(response, out)) throw std::runtime_error("failed to serialize read-only response");
+      } catch (const std::exception& e) { failure = classifyException(e, ErrorKind::INTERNAL); }
+      net::post(self->stream_.get_executor(), [self, pin, failure = std::move(failure), body = std::move(out)]() mutable {
+        if (failure) self->respondError(*failure);
+        else self->respondJson(http::status::ok, std::move(body));
+      });
+    });
+  }
+
   // ---- /_schema -------------------------------------------------------------
   // The schema JSON is a for-humans surface (it gets pasted into forums and
   // docs), so responses default to pretty.  GET output is a valid write body:
@@ -2376,7 +2470,7 @@ private:
     if (replicationStopped_) return;
     try {
       std::pmr::monotonic_buffer_resource arena;
-      auto catalog = node_.getReplication().catalog(arena, replicationTenants_);
+      auto catalog = node_.getReplication().catalog(arena, replicationTenants_, replicationCollections_);
       std::string body;
       if (!api::write_json(catalog, body)) throw std::runtime_error("failed to serialize catalog");
       respondJson(http::status::ok, std::move(body));
@@ -2391,10 +2485,12 @@ private:
       uint64_t timeout = (uint64_t)maximum;
       std::string cursor, follower;
       replicationTenants_.clear();
-      for (const auto& param : urlParams_) if (param.key == "tenant") {
-        Collections::validateName(param.value, "tenant");
-        replicationTenants_.push_back(param.value);
+      replicationCollections_.clear();
+      for (const auto& param : urlParams_) {
+        if (param.key == "tenant") replicationTenants_.push_back(param.value);
+        else if (param.key == "collection") replicationCollections_.push_back(param.value);
       }
+      ReplicationSubscription::of(replicationTenants_, replicationCollections_); // validates
       if (auto value = findParam(urlParams_, "since")) cursor = *value;
       if (auto value = findParam(urlParams_, "follower")) follower = *value;
       if (auto value = findParam(urlParams_, "timeout_ms")) timeout = replicationNumber(*value);
@@ -2411,7 +2507,7 @@ private:
             net::post(executor, [weak, pin, epoch] {
               if (auto session = weak.lock()) session->finishReplicationWatch(epoch);
             });
-          }, replicationTenants_);
+          }, replicationTenants_, replicationCollections_);
       replicationTimer_->async_wait([self = shared_from_this(), epoch](beast::error_code ec) {
         if (!ec) self->finishReplicationWatch(epoch);
       });
@@ -2860,7 +2956,7 @@ private:
     for (const auto& [name, val] : payload.fields) {
       unused(val);
       if (name == "request_id" || name == "commit") continue;
-      if (name == "collection" || name == "allow_dups" || name == "all_or_none" ||
+      if (name == "collection" || name == "tenant" || name == "allow_dups" || name == "all_or_none" ||
           name == "return_ids" || name == "docs" || name == "delete_ids" ||
           name == "field_map" || name == "drop_unmapped") {
         err = "_end_ control cannot carry submit-time field '" + std::string(name) + "'";
@@ -2875,7 +2971,7 @@ private:
   static bool validateUpdateControlPayload(const luxir::api::Map& payload, std::string& err) {
     for (const auto& [name, val] : payload.fields) {
       unused(val);
-      if (name == "collection" || name == "allow_dups" || name == "all_or_none" ||
+      if (name == "collection" || name == "tenant" || name == "allow_dups" || name == "all_or_none" ||
           name == "return_ids" || name == "request_id" || name == "commit" ||
           name == "docs" || name == "delete_ids" || name == "field_map" ||
           name == "drop_unmapped") {
@@ -3279,6 +3375,11 @@ private:
     // The stream holds a cached writer, so a collection deleted mid-stream is only
     // visible here.  A batch that races the close is instead rejected inside the
     // graph and folded as a batch error; the batch after it ends the stream here.
+    if (target->indexWriter->isSealed()) {
+      failStreamingUpdate({ErrorKind::FAILED_PRECONDITION, "read_only",
+                           "NDJSON batch rejected: collection '" + state->batch->collectionName + "' is read-only"});
+      return false;
+    }
     if (target->indexWriter->isClosed()) {
       failStreamingUpdate({ErrorKind::UNAVAILABLE, "writer_closed",
                            "NDJSON batch rejected: index writer for collection '" +
@@ -3466,6 +3567,13 @@ private:
     state->group = {};
     state->group.request = std::move(control.request);
     const auto& request = state->group.request->proto;
+    // One stream, one tenant: its writer cache and commit results are keyed by
+    // collection name.
+    if (!request.tenant.empty() && request.tenant != state->tenant) {
+      failStreamingUpdate(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
+          "tenant '" + std::string(request.tenant) + "' belongs in a /tenants/" + std::string(request.tenant) + " route"));
+      return false;
+    }
     state->group.collectionName = streamTargetKey(request.collection, state->defaultCollectionName);
     state->group.requestId = std::string(request.request_id);
     state->group.open = true;

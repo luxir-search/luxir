@@ -407,6 +407,12 @@ TEST_F(PluginExtensionTest, httpRoutes) {
   auto badSample = post("/collections/main/_sample", R"({"idz":["d2"]})");
   EXPECT_EQ(400, badSample.result_int()) << badSample.body();
   EXPECT_NE(std::string::npos, badSample.body().find("unknown parameter 'idz'")) << badSample.body();
+
+  // Under /tenants/{t}, plugin routes act in that tenant: acme has no main.
+  auto tenantPing = httpRequest(server->getPort(), http::verb::get, "/tenants/acme/_plugins/example/ping?echo=t");
+  EXPECT_EQ(200, tenantPing.result_int()) << tenantPing.body();
+  auto tenantSample = post("/tenants/acme/collections/main/_sample", R"({"ids":["d2"]})");
+  EXPECT_EQ(404, tenantSample.result_int()) << tenantSample.body();
 }
 
 TEST(PluginQueryTest, makersReachTheirOwnNodeState) {

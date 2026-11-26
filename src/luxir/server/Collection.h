@@ -124,7 +124,10 @@ class Collection {
   std::string failure;
   // Shared with the writer, whose work can outlive this object.
   std::shared_ptr<CollectionMetrics> metrics = std::make_shared<CollectionMetrics>();
+  // The catalog marked this incarnation read-only when it was opened.
+  bool readOnly = false;
 public:
+  bool isReadOnly() const { return readOnly; }
   CollectionId getId() const { std::lock_guard lock(idMutex); return id; }
   void setId(CollectionId next) { std::lock_guard lock(idMutex); id = std::move(next); }
   CollectionMetrics& getMetrics() const { return *metrics; }

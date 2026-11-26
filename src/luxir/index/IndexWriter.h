@@ -140,6 +140,10 @@ class IndexWriter {
   // Set once when closing, never cleared.
   std::atomic<bool> closed = false;
   std::atomic<bool> failed = false;
+  // seal(): the commit that seals admission, and whether it has been sequenced.
+  // Both are set once, never cleared.
+  std::atomic<const UpdateMessage*> sealing = nullptr;
+  std::atomic<bool> sealed = false;
   std::shared_ptr<const std::string> failureReason; // immutable once failed is published
   std::mutex closeMutex;
   std::mutex publicationMutex; // held only while constructing and publishing a manifest
@@ -684,6 +688,13 @@ public:
   bool isClosed() const {
     return closed.load(std::memory_order_relaxed) || failed.load(std::memory_order_acquire);
   }
+  // The collection was made read-only: admission is sealed for good.
+  bool isSealed() const { return sealed.load(std::memory_order_acquire); }
+
+  // Makes the writer's collection read-only: commits every update admitted
+  // before the call, refuses later ones with read_only, then closes. A commit
+  // failure is rethrown after the close.
+  std::optional<CommitId> seal();
 
   // Obtains an inverter for writing documents and sets its updateVersion.
   // Messages supply their admission pin. Without a pin, use the current schema.
@@ -735,10 +746,13 @@ private:
     // Rejection must come before the sequence numbers are assigned: they must stay
     // dense for the sequencer nodes. Merge continuations belong to already
     // admitted work, including automatic merges whose commits also flush.
-    if (failed.load(std::memory_order_acquire) || (closed.load(std::memory_order_relaxed)
-        && dynamic_cast<MergeCommitMessage*>(&msg) == nullptr)) {
-      throw IndexWriterClosedError("index writer is closed");
-    }
+    bool continuation = dynamic_cast<MergeCommitMessage*>(&msg) != nullptr;
+    if (failed.load(std::memory_order_acquire)) throw IndexWriterClosedError("index writer is closed");
+    // This serial node orders the seal: everything before its commit is in it.
+    // A sealed writer is also closed; its refusal names the reason.
+    if (sealed.load(std::memory_order_acquire) && !continuation) throw ReadOnlyError("collection is read-only");
+    if (closed.load(std::memory_order_relaxed) && !continuation) throw IndexWriterClosedError("index writer is closed");
+    if (&msg == sealing.load(std::memory_order_acquire)) sealed.store(true, std::memory_order_release);
     msg.schema = lastSnapshot.load()->schema;
     // Sequences must start at 0 for the sequencer nodes.
     msg.updateVersion = updateNumber.fetch_add(1, std::memory_order_relaxed) + 1;

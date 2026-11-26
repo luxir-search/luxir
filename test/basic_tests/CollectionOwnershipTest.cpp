@@ -663,3 +663,49 @@ TEST_F(CollectionOwnershipTest, untouchedTenantBelongsToItsFirstProcessUntilRest
   CollectionHelper c(*b, CollectionId{"late", "c"});
   EXPECT_TRUE(c.index(flatdoc("id", "after"), UpdateMessage::COMMIT).success);
 }
+
+TEST_F(CollectionOwnershipTest, readOnlyCommitsAdmittedUpdatesAndSurvivesRestart) {
+  startA();
+  auto id = CollectionId::of("c");
+  {
+    CollectionHelper c(*a, "c");
+    ASSERT_TRUE(c.index(flatdoc("id", "x")).success); // admitted, not committed
+    a->setCollectionReadOnly(id, true);
+    // The sealed writer refuses what arrives after the seal.
+    EXPECT_FALSE(c.index(flatdoc("id", "late")).success);
+  }
+  auto frozen = a->getCollection(id);
+  EXPECT_EQ(nullptr, frozen->getShard()->iw);
+  EXPECT_TRUE(frozen->isReadOnly());
+  EXPECT_EQ(1, frozen->getReaderManager().getReader()->liveDocs());
+  EXPECT_THROW(frozen->getShard()->requireIndexWriter(), ReadOnlyError);
+  EXPECT_THROW(a->getOrCreateCollection(id)->getShard()->requireIndexWriter(), ReadOnlyError);
+  a->setCollectionReadOnly(id, true); // already read-only: no change
+
+  a.reset();
+  startA();
+  EXPECT_EQ(nullptr, a->getCollection(id)->getShard()->iw);
+  a->setCollectionReadOnly(id, false);
+  CollectionHelper again(*a, "c");
+  ASSERT_TRUE(again.index(flatdoc("id", "y"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ(2, again.collection().getReaderManager().getReader()->liveDocs());
+}
+
+TEST_F(CollectionOwnershipTest, readOnlyFollowsTheDataNotTheName) {
+  startA();
+  { CollectionHelper c(*a, "c"); ASSERT_TRUE(c.index(flatdoc("id", "x"), UpdateMessage::COMMIT).success); }
+  a->setCollectionReadOnly(CollectionId::of("c"), true);
+  EXPECT_THROW(a->detachCollection("c", "B"), ReadOnlyError);
+  a->renameCollection(CollectionId::of("c"), CollectionId::of("d"));
+  EXPECT_EQ(nullptr, a->getCollection("d")->getShard()->iw);
+  // Another node taking the collection over also opens it read-only.
+  startB();
+  b->attachCollection("d", true);
+  EXPECT_EQ(nullptr, b->getCollection("d")->getShard()->iw);
+  EXPECT_THROW(a->setCollectionReadOnly(CollectionId::of("d"), false), CollectionUnavailableError);
+  b->deleteCollection("d");
+  EXPECT_THROW(b->getCollection("d"), CollectionNotFoundError);
+  // A recreated collection starts writable.
+  CollectionHelper d(*b, "d");
+  EXPECT_NE(nullptr, d.collection().getShard()->iw);
+}

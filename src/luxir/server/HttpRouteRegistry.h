@@ -18,8 +18,8 @@ class LuxirNode;
 struct HttpPluginRequest {
   LuxirNode& node;
   std::string_view method;  // "GET", "POST", ...
-  std::string_view path;    // without the query string
-  // The default tenant: plugin routes are not reachable under /tenants/{t}/.
+  std::string_view path;    // without the query string; keeps any /tenants/{tenant} prefix
+  // The tenant of a /tenants/{tenant}/... request, otherwise the default tenant.
   std::string_view tenant;
   std::string_view body;
   // {name} segments of the route pattern, by name.

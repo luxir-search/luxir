@@ -8,6 +8,7 @@ void CollectionPublication::refresh() {
   auto owner = collection.lock();
   if (!owner) return;
   error = owner->getUnavailableReason();
+  readOnly = owner->isReadOnly();
   auto shard = owner->getShard();
   auto snapshot = shard ? shard->getSnapshots().snapshot() : nullptr;
   if (snapshot && (!commit || snapshot->id.incarnation != commit->incarnation

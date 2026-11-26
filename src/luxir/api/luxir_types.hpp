@@ -83,7 +83,7 @@ struct ColFloat; struct ColDouble; struct AnalyzerComponent; struct AnalyzerDef;
 struct FieldVariants; struct FieldDefaults; struct NormalizerDef; struct VectorAnnDef; struct StoredResourceDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
-struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
+struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsRequest; struct ListCollectionsResponse; struct ListTenantsRequest; struct ListTenantsResponse; struct SetReadOnlyRequest; struct SetReadOnlyResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct RowSpaceStats; struct AuxStats;
 struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats;
@@ -499,6 +499,7 @@ struct CollectionStats {
   uint64_t schema_gen = 0;
   std::span<const ShardStats> shards;
   std::optional<Error> error;
+  bool read_only = false;
 };
 struct StatsRequest {
   std::string_view collection;
@@ -508,6 +509,20 @@ struct StatsRequest {
   bool files = false;
   bool system = false;
   bool host = false;
+};
+struct FollowerSubscription {
+  std::string_view source;
+  std::span<const std::string_view> tenants;
+  std::span<const std::string_view> collections;
+};
+struct GetFollowerSubscriptionRequest {};
+struct FollowerFilter {
+  std::span<const std::string_view> tenants;
+  std::span<const std::string_view> collections;
+};
+struct SetFollowerSubscriptionRequest {
+  std::string_view source;
+  std::optional<FollowerFilter> filter;
 };
 struct FollowerStatus {
   std::string_view follower;
@@ -523,6 +538,7 @@ struct ReplicationCatalogEntry {
   std::string_view tenant;
   std::string_view collection;
   bool available = false;
+  bool read_only = false;
 };
 struct ReplicationTenant { std::string_view tenant; uint64_t revision = 0; };
 struct ReplicationCatalog {
@@ -557,6 +573,7 @@ struct ReplicationStatus {
   std::optional<bool> connected;
   uint64_t last_contact = 0;
   std::span<const ReplicationCollectionStatus> collections;
+  std::optional<FollowerSubscription> subscription;
 };
 struct HistogramStats {
   std::span<const uint64_t> counts;
@@ -933,9 +950,13 @@ struct RenameCollectionRequest { std::string_view from; std::string_view to; std
 struct RenameCollectionResponse { std::string_view from; std::string_view to; };
 struct SwapCollectionsRequest { std::string_view a; std::string_view b; std::string_view tenant; };
 struct SwapCollectionsResponse { std::string_view a; std::string_view b; };
+struct SetReadOnlyRequest { std::string_view name; std::string_view tenant; bool read_only = false; };
+struct SetReadOnlyResponse { std::string_view name; bool read_only = false; };
 struct DeleteCollectionRequest { std::string_view name; std::string_view tenant; };
 struct DeleteCollectionResponse { std::string_view name; };
+struct ListCollectionsRequest { std::string_view tenant; };
 struct ListCollectionsResponse { std::span<const std::string_view> collections; };
+struct ListTenantsRequest {};
 struct ListTenantsResponse { std::span<const std::string_view> tenants; };
 struct MultiVector { std::span<const ArrVector> v; };
 struct ArrVal { std::span<const Val> v; };                       // span<incomplete Val> OK
@@ -1052,6 +1073,7 @@ struct QueryFacet {
 struct SearchRequest {
   std::string_view request_id;
   std::string_view collection;
+  std::string_view tenant;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   uint64_t freshness_ms = 0;
   std::string_view time_zone;
@@ -1295,6 +1317,7 @@ struct Query {                                                 // needs Match,An
 struct UpdateRequest {                                         // needs CommitParams
   std::string_view request_id;
   std::string_view collection;
+  std::string_view tenant;
   std::span<const Map> docs;
   std::span<const std::string_view> delete_ids;
   std::optional<CommitParams> commit;
@@ -1332,8 +1355,8 @@ LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocEr
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(RenameCollectionRequest) LUXIR_TD(RenameCollectionResponse) LUXIR_TD(SwapCollectionsRequest) LUXIR_TD(SwapCollectionsResponse)
-LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
-LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(OutcomeStats) LUXIR_TD(CollectionActivityStats) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
+LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsRequest) LUXIR_TD(ListCollectionsResponse) LUXIR_TD(ListTenantsRequest) LUXIR_TD(SetReadOnlyRequest) LUXIR_TD(SetReadOnlyResponse)
+LUXIR_TD(ReplicationStatus) LUXIR_TD(FollowerSubscription) LUXIR_TD(GetFollowerSubscriptionRequest) LUXIR_TD(FollowerFilter) LUXIR_TD(SetFollowerSubscriptionRequest) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(OutcomeStats) LUXIR_TD(CollectionActivityStats) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(RowSpaceStats) LUXIR_TD(AuxStats)
 LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
 LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats) LUXIR_TD(ScrubStats)
@@ -1381,9 +1404,9 @@ LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(RenameCollectionRequest) LUXIR_ENTRY(RenameCollectionResponse) LUXIR_ENTRY(SwapCollectionsRequest) LUXIR_ENTRY(SwapCollectionsResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
-LUXIR_ENTRY(ListCollectionsResponse)
+LUXIR_ENTRY(ListCollectionsRequest) LUXIR_ENTRY(ListCollectionsResponse) LUXIR_ENTRY(ListTenantsRequest) LUXIR_ENTRY(SetReadOnlyRequest) LUXIR_ENTRY(SetReadOnlyResponse)
 LUXIR_ENTRY(ListTenantsResponse)
-LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStatus) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(OutcomeStats) LUXIR_ENTRY(CollectionActivityStats) LUXIR_ENTRY(StatsTotals)
+LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(FollowerSubscription) LUXIR_ENTRY(GetFollowerSubscriptionRequest) LUXIR_ENTRY(FollowerFilter) LUXIR_ENTRY(SetFollowerSubscriptionRequest) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStatus) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(OutcomeStats) LUXIR_ENTRY(CollectionActivityStats) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(RowSpaceStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
 LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(ArenaStats)

@@ -12,6 +12,7 @@ struct CollectionPublication {
   std::optional<CommitId> commit;
   uint64_t digest = 0; // of commit's manifest
   std::string error;
+  bool readOnly = false;
 
   void refresh();
 };

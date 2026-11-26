@@ -16,7 +16,43 @@ curl http://reader:9400/_replication/status
 ```
 
 A follower follows every tenant by default. Use
-`--replication.tenants alpha,beta` to follow only those tenants.
+`--replication.tenants alpha,beta` to follow every collection of those tenants,
+and `--replication.collections gamma/docs,main` to follow single collections
+(`tenant/name`; a bare name is in `t0`). With either set, the follower copies
+the union of both lists and nothing else. Collections match by name: a source
+rename out of the list removes the follower's copy as a delete would, and a
+rename into it copies the data. A follower serves every tenant it copies
+through the usual `/tenants/{tenant}/collections/...` routes.
+
+### Change the subscription at runtime
+
+A running follower changes its source or subscription without a restart:
+
+```sh
+curl http://reader:9400/_replication/subscription
+curl -X POST http://reader:9400/_replication/subscription \
+  -d '{"filter":{"tenants":["alpha"],"collections":["beta/docs"]}}'
+curl -X POST http://reader:9400/_replication/subscription \
+  -d '{"source":"http://writer2:9400"}'
+```
+
+The gRPC equivalents are `luxir.Admin/GetFollowerSubscription` and
+`SetFollowerSubscription`. An empty `source` keeps the current one, and an
+absent `filter` keeps both lists; a present `filter` replaces both, and two
+empty lists follow everything. The follower stops its transfers, records the
+change in `node/replication.json`, and resumes; transfers in progress continue
+from the bytes they already have. The response, and `subscription` in
+`/_replication/status`, show what is now in force.
+
+A collection left out becomes an [orphan](#diagnose-status): kept as it is and
+no longer updated. A collection brought in is copied. A new source is treated
+like a restart pointed elsewhere: copies whose files the new source also has
+are reused, and collections the new source does not list become orphans.
+
+On restart the follower keeps a runtime change, unless `--replicate-from`,
+`--replication.tenants` or `--replication.collections` differs from the
+configuration of its previous start. A changed configuration wins.
+Writer and read-only nodes answer `not_follower`.
 
 Start a follower with an empty directory or an existing follower directory.
 Repointing `--replicate-from` to another
@@ -295,10 +331,15 @@ lag.
 
 A follower deletes a local collection only when the source it has followed
 since that source's last restart no longer lists it. A collection missing after
-a source restart, or outside a narrowed `--replication.tenants`, becomes an
-orphan instead. Delete orphans with `/tenants/TENANT/collections/_delete`;
-excluded tenants can be deleted while disconnected, other orphans need the
-source connected.
+a source restart, or left out of a narrowed subscription, becomes an orphan
+instead. Delete orphans with `/tenants/TENANT/collections/_delete`; excluded
+collections can be deleted while disconnected, other orphans need the source
+connected.
+
+A collection made [read-only](operations.md#read-only-collections) on the
+source is recorded read-only in the follower's catalog, so `luxir promote`
+keeps it read-only. `luxir promote` promotes every local collection, orphans
+included; delete orphans first to leave them out.
 
 Use `--store.backend=ram` for a RAM writer or follower. RAM data is lost on
 restart, and RAM followers refetch. `--store.ram-limit-mb`
@@ -330,7 +371,8 @@ All replication settings use `--replication.` (configuration keys use underscore
 | Setting | Default | Purpose |
 |---|---:|---|
 | `source` | empty | Source HTTP URL; `--replicate-from` is shorthand |
-| `tenants` | empty (all) | Comma-separated tenant subscription |
+| `tenants` | empty | Comma-separated tenants copied whole; with `collections` also empty, every tenant |
+| `collections` | empty | Comma-separated `tenant/name` collections copied; a bare name is in `t0` |
 | `peers` | empty | Comma-separated nodes serving file copies, tried before the source |
 | `max-acknowledgments` | 262144 | Node-wide follower/collection acknowledgment budget |
 | `downloads` | 2 | Concurrent collection transfers |
@@ -352,12 +394,13 @@ A source tracks up to 4096 live followers and `max-acknowledgments`
 
 | Endpoint | Contract |
 |---|---|
-| `GET /_replication/watch?since=CURSOR&timeout_ms=30000&follower=ID` | Long-polls the catalog `{boot, cursor, tenants, collections}`, one `{tenant, collection, commit, manifest_xxh3, available}` entry per collection and `{tenant, revision}` per tenant. Repeat `tenant=` to restrict it; pass the returned cursor back. |
+| `GET /_replication/watch?since=CURSOR&timeout_ms=30000&follower=ID` | Long-polls the catalog `{boot, cursor, tenants, collections}`, one `{tenant, collection, commit, manifest_xxh3, available, read_only}` entry per collection and `{tenant, revision}` per tenant. Repeat `tenant=` and `collection=TENANT/NAME` to restrict it to a subscription; pass the returned cursor back. |
 | `GET /tenants/TENANT/collections/COLLECTION/_snapshot` | Pins the current snapshot; binary manifest and `X-Luxir-Commit`. Add `?format=json` to inspect files, sizes and digests. |
 | `GET /tenants/TENANT/collections/COLLECTION/_snapshot/files/NAME?commit=TOKEN` | A file from a pinned snapshot; single byte Range supported. 410 `snapshot_expired` when the pin is gone. |
 | `GET /tenants/TENANT/collections/COLLECTION/_snapshot/files/NAME?size=BYTES&xxh3=HEX16` | The file with that identity from the current or a pinned snapshot, without pinning; 404 `file_not_held` otherwise. Peers serve followers this way. |
 | `POST /_replication/installed` | `{follower, tenant, collection, commit}` acknowledges a serving snapshot. |
 | `GET /_replication/status` | Status described above. |
+| `GET` or `POST /_replication/subscription` | A follower's [subscription](#change-the-subscription-at-runtime). |
 
 Snapshot and file requests accept `follower=ID`, which keeps the follower live.
 The message shapes are
@@ -371,7 +414,6 @@ and
 - Luxir has no authentication, authorization or TLS. Restrict both ordinary
   APIs and replication endpoints to trusted networks.
 - Failover is manual (`luxir promote`).
-- The tenant subscription is fixed for the life of the process.
 - `luxir pull` does not capture all collections at one instant.
 - Pins and acknowledgments are process-local, and a partially downloaded file
   resumes only within the same follower process.

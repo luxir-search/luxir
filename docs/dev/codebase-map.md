@@ -26,6 +26,9 @@ locations, browse `src/luxir/<area>/`.
      tenant/incarnation. Stages missing data, then applies each tenant mapping
      through `Collections` for ready bindings, leaving dependent names unavailable
      when their old data now belongs to another name
+   - `ReplicationSubscription`: What a follower copies (whole tenants plus single
+     collections); the follower changes it at runtime (`resubscribe`), and the
+     source filters catalogs and replica barriers by it
    - `Scrubber`: Paced background re-verification of published snapshot files; a mismatch
      fails the collection (`Collections::fail`) and a follower repairs it
    - `ReplicationSource`: Local discovery catalog, cursors, follower liveness and acknowledgments,

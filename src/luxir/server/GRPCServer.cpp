@@ -25,6 +25,7 @@
 
 #include "GRPCServer.h"
 #include "LuxirNode.h"
+#include "ReplicationFollower.h"
 #include "luxir/api/padded_input.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/util/TaggedPtr.h"
@@ -657,13 +658,10 @@ public:
 };
 
 
-// Data-plane calls act in the caller's tenant: the default tenant until calls
-// carry credentials. Administration requests may name a tenant.
-static constexpr std::string_view kCallerTenant = {};
-
+// Every request names its tenant; empty is the default tenant.
 template <typename Request>
 static std::shared_ptr<Collection> resolveUpdateCollection(GRPCServer& server, const Request& request) {
-  return server.getLuxirNode().getOrCreateCollection(LuxirNode::target(kCallerTenant, request.collection));
+  return server.getLuxirNode().getOrCreateCollection(LuxirNode::target(request.tenant, request.collection));
 }
 
 static void finishWithError(GenericCallData& call, const ErrorInfo& info) {
@@ -772,6 +770,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena, startTime);
   req.requestState = std::move(requestState);
   req.parent = &call;
+  req.tenant = std::string(req.proto.tenant);
   if (!req.proto.min_commit.empty()) {
     call.enableWaitCancellation();
     req.waitCancellation = call.waitCancellation;
@@ -936,6 +935,96 @@ static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& read
         finishWithException(call, e);
       }
     });
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
+}
+
+static void handleSetReadOnly(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto request = std::make_shared<HppRequestState<api::SetReadOnlyRequest>>();
+  if (!parseRequest(readBuf, *request, "SetReadOnly")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "SetReadOnly: malformed request"));
+    return;
+  }
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  try {
+    call.server.getLuxirNode().getControlExecutor().enqueue([request, &call] {
+      try {
+        auto id = LuxirNode::adminTarget(request->proto.tenant, request->proto.name);
+        call.server.getLuxirNode().setCollectionReadOnly(id, request->proto.read_only);
+        api::SetReadOnlyResponse response{request->proto.name, request->proto.read_only};
+        call.respondRaw(serializeToByteBuffer(response), 1);
+      } catch (const std::exception& e) {
+        finishWithException(call, e);
+      }
+    });
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
+}
+
+// A change stops and joins the follower's transfers: a control thread runs it.
+template <bool Change>
+static void handleFollowerSubscription(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  using Request = std::conditional_t<Change, api::SetFollowerSubscriptionRequest, api::GetFollowerSubscriptionRequest>;
+  auto request = std::make_shared<HppRequestState<Request>>();
+  constexpr auto method = Change ? "SetFollowerSubscription" : "GetFollowerSubscription";
+  if (!parseRequest(readBuf, *request, method)) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, std::string(method) + ": malformed request"));
+    return;
+  }
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  try {
+    call.server.getLuxirNode().getControlExecutor().enqueue([request, &call] {
+      try {
+        auto& follower = call.server.getLuxirNode().requireFollower();
+        if constexpr (Change) follower.resubscribe(request->proto);
+        std::pmr::monotonic_buffer_resource arena;
+        api::FollowerSubscription response;
+        follower.describe(response, arena);
+        call.respondRaw(serializeToByteBuffer(response), 1);
+      } catch (const std::exception& e) {
+        finishWithException(call, e);
+      }
+    });
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
+}
+
+// Pure in-memory snapshots, answered inline like their HTTP twins.
+static void handleListCollections(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  HppRequestState<api::ListCollectionsRequest> request;
+  if (!parseRequest(readBuf, request, "ListCollections")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "ListCollections: malformed request"));
+    return;
+  }
+  try {
+    std::string tenant(request.proto.tenant.empty() ? CollectionId::kDefaultTenant : request.proto.tenant);
+    Collections::validateName(tenant, "tenant");
+    auto entries = call.server.getLuxirNode().collectionEntries(tenant);
+    std::vector<std::string_view> names;
+    for (const auto& entry : entries) names.push_back(entry.id.name);
+    api::ListCollectionsResponse response;
+    response.collections = names;
+    call.respondRaw(serializeToByteBuffer(response), 1);
+  } catch (const std::exception& e) {
+    finishWithException(call, e, ErrorKind::INVALID_REQUEST);
+  }
+}
+
+static void handleListTenants(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  HppRequestState<api::ListTenantsRequest> request;
+  if (!parseRequest(readBuf, request, "ListTenants")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "ListTenants: malformed request"));
+    return;
+  }
+  try {
+    auto tenants = call.server.getLuxirNode().tenants();
+    std::vector<std::string_view> names(tenants.begin(), tenants.end());
+    api::ListTenantsResponse response;
+    response.tenants = names;
+    call.respondRaw(serializeToByteBuffer(response), 1);
   } catch (const std::exception& e) {
     finishWithException(call, e);
   }
@@ -1110,6 +1199,11 @@ static const MethodEntry* lookupMethod(const std::string& method) {
     {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true, MetricOperation::COLLECTIONS}},
     {"/luxir.Admin/Stats",              {handleStats, false, MetricOperation::STATS}},
     {"/luxir.Admin/CacheControl",       {handleCacheControl, false, MetricOperation::OTHER}},
+    {"/luxir.Admin/ListCollections",    {handleListCollections, false, MetricOperation::COLLECTIONS}},
+    {"/luxir.Admin/ListTenants",        {handleListTenants, false, MetricOperation::COLLECTIONS}},
+    {"/luxir.Admin/SetReadOnly",        {handleSetReadOnly, true, MetricOperation::COLLECTIONS}},
+    {"/luxir.Admin/GetFollowerSubscription", {handleFollowerSubscription<false>, false, MetricOperation::OTHER}},
+    {"/luxir.Admin/SetFollowerSubscription", {handleFollowerSubscription<true>, false, MetricOperation::OTHER}},
   };
   auto it = table.find(method);
   return it == table.end() ? nullptr : &it->second;
