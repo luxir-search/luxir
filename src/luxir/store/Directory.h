@@ -187,16 +187,23 @@ public:
   // Install an immutable file without copying its bytes (same storage backend).
   virtual void linkFile(Directory& source, std::string_view name) = 0;
 
+  // Bytes a copy holds of its source at once.
+  static constexpr uint64_t kCopyChunk = uint64_t{4} << 20;
+
   // Installs a copy of `source`'s file `name` under the same name. The fallback
   // for backends that cannot link; the caller syncs it like any created file.
+  // Copies in chunks, each released before the next is acquired, so a copy
+  // from a remote backend never holds the whole source.
   void copyFile(Directory& source, std::string_view name) {
     auto input = source.openFile(name, {.expectSynced = true});
     if (!input) throw std::runtime_error("copy source missing: " + std::string(name));
-    auto hold = input->acquire({0, input->size()});
-    auto data = hold.bytes();
+    uint64_t size = input->size();
     auto file = createFile(name);
     OutputStream out(file.get());
-    out.write(data.data(), data.size());
+    for (uint64_t offset = 0; offset < size; offset += kCopyChunk) {
+      auto hold = input->acquire({offset, std::min(kCopyChunk, size - offset)});
+      out.write(hold.getData(), hold.getLength());
+    }
     out.close();
     finishFile(*file);
   }

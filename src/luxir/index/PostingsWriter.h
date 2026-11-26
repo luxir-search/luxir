@@ -202,9 +202,12 @@ private:
     if (!fits(base, bytes)) throw std::length_error("segment offset exceeds seg_location");
   }
 
+  // Every part starts here, after its file's header, so no part starts at
+  // offset 0: the location {0, 0} stays free to mean "no part".
   static seg_location beginSlice(DataFile& file, size_t bytes) {
     checkSliceSize(alignedTail(file.out), bytes);
     file.out.align(MAX_ALIGN);
+    assert(file.out.size() >= Postings::LUXIR_HEADER.size());
     return {file.fileNum, file.out.size()};
   }
 

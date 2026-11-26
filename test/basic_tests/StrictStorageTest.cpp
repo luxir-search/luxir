@@ -178,7 +178,8 @@ TEST(StrictStorageTest, rejectsAPartAcquiredUnderBothClasses) {
 }
 
 // Reads no part makes count as whole-file reads: from offset 0 past the
-// header, and to EOF outside file 0, whose catalog runs to EOF.
+// header, to EOF outside file 0, and any that leaves out at most a header's
+// worth of bytes, which includes file 0 past its header.
 TEST(StrictStorageTest, deniesReadsNoSegmentPartMakes) {
   auto counters = std::make_shared<StrictStorageCounters>();
   StrictDirectory dir(std::make_shared<RAMDir>(), counters, StrictWholeFiles::DENY);
@@ -190,10 +191,54 @@ TEST(StrictStorageTest, deniesReadsNoSegmentPartMakes) {
     auto size = file->size();
     EXPECT_NO_THROW(file->acquire({0, header}));
     EXPECT_THROW(file->acquire({0, header + 1}), FileIOException);
+    EXPECT_THROW(file->acquire({header, size - header}), FileIOException);
+    EXPECT_THROW(file->acquire({1, size - header}), FileIOException);
     EXPECT_NO_THROW(file->acquire({header, size - header - 1}));
-    if (number == 0) EXPECT_NO_THROW(file->acquire({header, size - header}));
-    else EXPECT_THROW(file->acquire({header, size - header}), FileIOException);
+    if (number == 0) EXPECT_NO_THROW(file->acquire({header + 1, size - header - 1}));
+    else EXPECT_THROW(file->acquire({header + 1, size - header - 1}), FileIOException);
   }
+}
+
+// Other files count reads leaving out at most a header's worth of bytes as
+// whole, and deny does not apply to them.
+TEST(StrictStorageTest, countsNearWholeReadsOfAnyFile) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters, StrictWholeFiles::DENY);
+  auto header = Postings::LUXIR_HEADER.size();
+  auto name = Postings::getLiveDocsFileName(Postings::segmentKey(1, 1), 1, 1);
+  put(dir, name);
+  auto file = dir.openFile(name);
+  auto size = file->size();
+  ByteRange whole[] = {{0, size}, {header, size - header}, {0, size - header}, {1, size - 2}};
+  for (auto range : whole) EXPECT_NO_THROW(file->acquire(range));
+  EXPECT_NO_THROW(file->acquire({header, size - header - 1}));
+  EXPECT_NO_THROW(file->acquire({0, size - header - 1}));
+  EXPECT_EQ(4u, counters->fileStats(name).wholeFileAccesses);
+}
+
+TEST(StrictStorageTest, copyHoldsBoundedChunksOfItsSource) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory source(std::make_shared<RAMDir>(), counters);
+  RAMDir dest;
+  std::string bytes(2 * Directory::kCopyChunk + 100, '\0');
+  for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (char)(i * 31 % 251);
+  {
+    auto file = source.createFile("data");
+    OutputStream out(file.get());
+    out.write(bytes.data(), bytes.size());
+    out.close();
+    source.finishFile(*file);
+  }
+  dest.copyFile(source, "data");
+  auto copied = dest.openFile("data");
+  ASSERT_NE(nullptr, copied);
+  auto hold = copied->acquire({0, copied->size()});
+  EXPECT_EQ(bytes, contents(hold));
+  auto stats = counters->fileStats("data");
+  EXPECT_EQ(3u, stats.acquires);
+  EXPECT_EQ(0u, stats.wholeFileAccesses);
+  EXPECT_EQ(Directory::kCopyChunk, counters->liveStats().peakBytes);
+  EXPECT_EQ(1u, counters->liveStats().peakHolds);
 }
 
 TEST(StrictStorageTest, wrapsVerifiedMappingAfterDirectoryCloses) {

@@ -625,10 +625,13 @@ classes is an error in either mode. The default
 `strict.whole_segment_files=count` allows whole-file reads for tests that copy
 or replicate files. Use
 `--store.option strict.whole_segment_files=deny` in focused reader tests to
-reject whole-file reads of base segment data files. In those files a read no
-part makes also counts as whole-file: one from offset 0 past the header, or
-one to EOF outside file 0, since the writer pads every other file after its
-last part.
+reject whole-file reads of base segment data files. A read is whole-file when
+it leaves out at most a header's worth of bytes (8), wherever they are, in any
+file; deny applies only to base segment data files, since live docs bitmaps
+and overlays are read whole by design. In segment data files a read no part
+makes also counts as whole-file: one from offset 0 past the header, or one to
+EOF outside file 0, since the writer pads every other file after its last
+part.
 
 ## Result decorators
 
