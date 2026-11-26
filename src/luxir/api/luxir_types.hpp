@@ -604,6 +604,13 @@ struct ServiceStats {
   HistogramStats search_execution;
   uint64_t search_resource_exhausted = 0;
   uint64_t search_warnings = 0;
+  uint64_t search_io_acquires = 0;
+  uint64_t search_io_acquired_bytes = 0;
+  uint64_t search_io_requests = 0;
+  uint64_t search_io_rounds = 0;
+  uint64_t search_io_fetched_bytes = 0;
+  uint64_t search_io_acquire_batches = 0;
+  uint64_t search_io_acquire_rounds = 0;
   ActivityStats index_batches;
   uint64_t documents_accepted = 0;
   uint64_t documents_rejected = 0;
@@ -1176,7 +1183,16 @@ struct ExecutionProfileOp {
   std::string_view name;
   std::span<const ExecutionProfilePiece> pieces;
 };
-struct ExecutionProfile { std::span<const ExecutionProfileOp> ops; };
+struct ExecutionProfile {
+  std::span<const ExecutionProfileOp> ops;
+  std::uint64_t io_acquires = 0;
+  std::uint64_t io_acquired_bytes = 0;
+  std::uint64_t io_requests = 0;
+  std::uint64_t io_rounds = 0;
+  std::uint64_t io_fetched_bytes = 0;
+  std::uint64_t io_acquire_batches = 0;
+  std::uint64_t io_acquire_rounds = 0;
+};
 struct SearchResponse {
   std::string_view commit;
   std::string_view request_id;

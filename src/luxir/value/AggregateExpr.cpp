@@ -310,17 +310,24 @@ void writeAggregateValue(api::Val& target, const BucketScalar& value) {
   target.kind.emplace<int64_t>((int64_t)value.intValue);
 }
 
-std::span<const AggregateFieldInfos> resolveAggregateFields(
+std::span<AggregateFieldInfos> resolveAggregateFields(
     const AggregateProgram& program, MemPool& pool, IndexReader& reader) {
   auto fields = pool.make_span<AggregateFieldInfos>(program.producers.size());
   for (size_t i = 0; i < fields.size(); i++) {
+    fields[i].values = program.producers[i].input->resolveFields(pool, reader);
+  }
+  return fields;
+}
+
+void bindAggregateOrdinals(const AggregateProgram& program, IndexReader& reader,
+    std::span<AggregateFieldInfos> fields) {
+  assert(fields.size() == program.producers.size());
+  for (size_t i = 0; i < fields.size(); i++) {
     const ValueProgram& input = *program.producers[i].input;
-    fields[i].values = input.resolveFields(pool, reader);
     if (input.root().type == ValueType::COLUMN_ONLY) {
       fields[i].ords = (input.root().source ? *input.root().source : reader).getOrdMap(input.root().text).get();
     }
   }
-  return fields;
 }
 
 std::vector<BoundAggregateInput> bindAggregateInputs(

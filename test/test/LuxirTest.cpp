@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/query/ReadDeclarer.h"
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -323,6 +324,9 @@ int main(int argc, char **argv) {
   int myargc = (int)(myargv.size() - 1);
 
   luxir::unit_tests = !bench;
+#ifndef NDEBUG
+  luxir::Query::verifyReadDeclarationsForTests = std::getenv("LUXIR_VERIFY_READ_DECLARATIONS") != nullptr;
+#endif
 
   // Init gtest so things like --gtest_break_on_failure work even in benchmark-only mode.
   testing::InitGoogleTest(&myargc, &(myargv[0]));
@@ -354,6 +358,8 @@ int main(int argc, char **argv) {
   });
 
   luxir::GrpcLuxirTest::stopServer();
+  if (luxir::Query::verifyReadDeclarationsForTests
+      && !luxir::ReadVerification::report(std::cout)) ret = 1;
 
   return ret;
 }

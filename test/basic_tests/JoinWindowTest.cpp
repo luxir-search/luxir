@@ -55,6 +55,7 @@ TEST_F(JoinWindowTest, exposureSelectsPullOrWindowedFilteredRanking) {
   MemPool pool;
   Query::Context context(pool, *many);
   OwnershipRelation relation(*many, *root, context.planningContext().memoryTracker);
+  relation.bindMappers();
   TermQuery term("items_nested.color_s", "red");
   for (bool maximum : {false, true}) {
     auto* weight = term.createWeight(context, maximum ? Query::NEED_SCORES : 0);
@@ -182,6 +183,7 @@ TEST_F(JoinWindowTest, boundedFillsCrossFamiliesEmptyWindowsAndDeletedOwners) {
     MemPool pool;
     Query::Context context(pool, *many);
     OwnershipRelation relation(*many, *root, context.planningContext().memoryTracker);
+    relation.bindMappers();
     std::string field = std::string(path) + ".color_s", price = std::string(path) + ".price_i";
     std::string text = std::string(path) + ".text_w";
     TermQuery term(field, "red");
@@ -269,6 +271,7 @@ TEST_F(JoinWindowTest, composedFillsStayBoundedAcrossLargeAndEmptyIntermediateFa
     MemPool pool;
     Query::Context context(pool, *many);
     OwnershipRelation relation(*many, *one, context.planningContext().memoryTracker);
+    relation.bindMappers();
     std::string field = std::string(many->path()) + ".color_s", text = std::string(many->path()) + ".text_w";
     TermQuery term(field, "red");
     std::string_view terms[]{"hit", "here"}; int32_t positions[]{0, 1};

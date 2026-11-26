@@ -461,8 +461,10 @@ TEST_F(FieldMetadataTest, untouchedFieldsStayUnallocated) {
 
 TEST_F(FieldMetadataTest, missingTermKeepsDictionaryAlive) {
   test::CollectionHelper helper;
-  ASSERT_TRUE(helper.index(test::flatdoc("id", "one", "name_s", "present"),
-                           UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(std::array{
+      test::flatdoc("id", "one", "name_s", "early"),
+      test::flatdoc("id", "two", "name_s", "present"),
+  }, UpdateMessage::COMMIT).success);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   MemPool pool;
   Query::Context context(pool, *reader);
@@ -473,6 +475,14 @@ TEST_F(FieldMetadataTest, missingTermKeepsDictionaryAlive) {
   auto* term = context.getCachedTerminfo(*field, "present");
   ASSERT_NE(nullptr, term);
   EXPECT_EQ(1, term->termStats.docFreq);
+
+  Query::Context standalone(pool, *reader);
+  auto* otherField = standalone.getCachedFieldInfo("name_s");
+  ASSERT_NE(nullptr, otherField);
+  auto* otherTerm = standalone.getCachedTerminfo(*otherField, "present");
+  ASSERT_NE(nullptr, otherTerm);
+  EXPECT_NE(term, otherTerm);
+  EXPECT_EQ(term->termStats.docFreq, otherTerm->termStats.docFreq);
 }
 
 TEST_F(FieldMetadataTest, coreNamesAreSharedAndLazy) {

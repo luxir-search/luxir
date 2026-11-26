@@ -107,6 +107,8 @@ public:
     return hasInjectedTermStats ? injectedTermStats : cachedTermInfo.termStats;
   }
 
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
+
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
 
@@ -152,6 +154,7 @@ public:
                   hasNorms));
           if (!query.hasInjectedStats()) cachedTermInfo->simScorer = simScorer;
         }
+        context.planRead(PlannedRead::Kind::NORMS, *cachedFieldInfo, cachedTermInfo);
       }
     }
 

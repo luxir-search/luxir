@@ -12,6 +12,8 @@
 
 namespace luxir::test {
 
+class BatchGate;
+
 enum class StrictWholeFiles { COUNT, DENY };
 
 // Shared by the views of a factory. Parts and accesses are keyed by file name.
@@ -44,6 +46,7 @@ public:
 private:
   mutable std::mutex mutex;
   std::map<std::string, FileStats, std::less<>> files;
+  std::map<std::string, std::shared_ptr<BatchGate>, std::less<>> batchGates;
   LiveStats live;
   uint64_t submissions = 0;
   uint8_t pattern = 0;
@@ -66,7 +69,9 @@ public:
 
   void wholeFile(std::string_view name);
   void sizeRequested(std::string_view name);
-  void submitted(std::string_view name, bool batch);
+  // Gate future batches on a named file, including handles already open.
+  void gateBatches(std::string name, std::shared_ptr<BatchGate> gate);
+  std::shared_ptr<BatchGate> submitted(std::string_view name, bool batch);
   uint8_t acquired(std::string_view name, ByteRange range);
   void released(uint64_t length) noexcept;
 };

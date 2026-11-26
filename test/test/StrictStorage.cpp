@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "StrictStorage.h"
+#include "GatedStorage.h"
 
 #include <atomic>
 #include <cstdio>
@@ -66,12 +67,20 @@ void StrictStorageCounters::sizeRequested(std::string_view name) {
   ++files[std::string(name)].sizeRequests;
 }
 
-void StrictStorageCounters::submitted(std::string_view name, bool batch) {
+void StrictStorageCounters::gateBatches(std::string name, std::shared_ptr<BatchGate> gate) {
+  std::lock_guard lock(mutex);
+  batchGates.emplace(std::move(name), std::move(gate));
+}
+
+std::shared_ptr<BatchGate> StrictStorageCounters::submitted(std::string_view name, bool batch) {
   std::lock_guard lock(mutex);
   auto& file = files[std::string(name)];
   file.lastSubmission = ++submissions;
   if (!file.submissions++) file.firstSubmission = submissions;
-  if (batch) ++file.batches;
+  if (!batch) return {};
+  ++file.batches;
+  auto it = batchGates.find(name);
+  return it == batchGates.end() ? nullptr : it->second;
 }
 
 uint8_t StrictStorageCounters::acquired(std::string_view name, ByteRange range) {
@@ -136,9 +145,9 @@ public:
   void sizeRequested() {
     if (!sized) counters->sizeRequested(name);
   }
-  void submitted(bool batch) {
+  std::shared_ptr<BatchGate> submitted(bool batch) {
     if (counters->takeInjectedFailure()) throw FileIOException("strict: injected acquire failure on " + name);
-    counters->submitted(name, batch);
+    return counters->submitted(name, batch);
   }
 
   // A part's bytes are metadata or data whoever reads them, so a cache hint
@@ -265,7 +274,10 @@ public:
         sources.clear();
         done(std::move(holds), std::move(failure));
       };
-      state->submitted(true);
+      if (auto gate = state->submitted(true)) {
+        GatedInputFile(delegate, *gate, false).acquireBatch(ranges, std::move(forward));
+        return;
+      }
     } catch (...) {
       done({}, std::current_exception());
       return;

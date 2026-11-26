@@ -10,19 +10,26 @@
 #include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/CatalogSummaryView.h"
 #include "luxir/query/Query.h"
+#include "luxir/query/ReadDeclarer.h"
 
 namespace luxir {
 
 Query::Weight* Query::Context::createRootWeight(Query& query, int32_t flags, float multiplier) {
   if (!planning.pruning) planning.pruning = std::make_shared<QueryPruning>();
-  auto [mask, inserted] = planning.pruning->membership(query, planning);
-  bool emptyWeight = !planning.mayPrepare && mask.none();
+  auto& membership = planning.pruning->membership(query, planning);
+  const auto& mask = membership.mask;
+  bool firstWeight = !std::exchange(membership.weightAttempted, true);
+  bool mayPrepare = query.mayRequirePreparation();
+  bool emptyWeight = !mayPrepare && mask.none();
+#ifndef NDEBUG
+  ReadVerification::RootScope verify(query, planning, flags, multiplier, emptyWeight);
+#endif
   auto* weight = emptyWeight ? pool.make<MatchNoDocsQuery::Weight>(*this, query, flags)
-                             : query.createWeight(*this, flags, multiplier);
-  assert(!weight->needsPrepare() || planning.mayPrepare);
+                             : query.buildWeight(*this, flags, multiplier);
+  assert(!weight->needsPrepare() || mayPrepare);
   if (mask.prunesAny()) {
     weight->membership = &mask;
-    if (inserted && planning.proofNotes) {
+    if (firstWeight && planning.proofNotes) {
       auto segments = planning.topReader.segments();
       if (emptyWeight) {
         planning.proofNotes->push_back(std::format("op {}: empty weight for the collection (segment 0, {})",
@@ -39,9 +46,9 @@ Query::Weight* Query::Context::createRootWeight(Query& query, int32_t flags, flo
   return weight;
 }
 
-QueryPruning::Membership QueryPruning::membership(const Query& query, const Query::PlanningContext& planning) {
+QueryPruning::Membership& QueryPruning::membership(const Query& query, const Query::PlanningContext& planning) {
   auto found = membershipMemo.find({&planning, &query});
-  if (found != membershipMemo.end()) return {found->second, false};
+  if (found != membershipMemo.end()) return found->second;
   auto segments = planning.topReader.segments();
   SegmentMask mask(segments.size());
   if (!disableForTests) {
@@ -59,7 +66,7 @@ QueryPruning::Membership QueryPruning::membership(const Query& query, const Quer
       }
     }
   }
-  return {membershipMemo.emplace(PlanKey{&planning, &query}, std::move(mask)).first->second, true};
+  return membershipMemo.emplace(PlanKey{&planning, &query}, Membership{std::move(mask)}).first->second;
 }
 
 std::optional<const DecodedFieldRecord*> CatalogSummaryView::record(std::string_view field) const {
@@ -76,7 +83,7 @@ std::optional<const DecodedFieldRecord*> CatalogSummaryView::record(std::string_
   return std::nullopt;
 }
 
-bool Query::Context::termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term) {
+bool TermFactsCache::termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term) {
   if (QueryPruning::disableForTests || !proof::recordExcludesTerm(field.segInfos.at(segnum), term)) return false;
   if (QueryPruning::verifyTermAbsenceForTests) {
     auto* terms = getTermsEnum(field, segnum);

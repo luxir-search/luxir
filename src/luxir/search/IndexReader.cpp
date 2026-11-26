@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "IndexReader.h"
+#include "luxir/store/AcquireJoin.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
 #include "luxir/index/LiveDocsWriter.h"
@@ -16,6 +17,7 @@
 #include "luxir/schema/SchemaCache.h"
 #include "luxir/util/ApiError.h"
 #include "luxir/util/MemPool.h"
+#include "luxir/util/IoContext.h"
 #include "luxir/util/log.h"
 
 #include "luxir/api/padded_input.h"
@@ -233,6 +235,24 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
   return live.file ? decode(std::move(live.file), live.size, live.name, live.segment, maxDoc, -1) : nullptr;
 }
 
+std::vector<IndexReader::ListedPart> IndexReader::listParts(std::span<const std::string_view> dataFields,
+                                                            bool allData) {
+  std::vector<ListedPart> parts;
+  auto data = [&](std::string_view, std::string_view field) {
+    return allData || std::ranges::find(dataFields, field) != dataFields.end();
+  };
+  for (auto& segment : segments()) {
+    auto& core = segment.segmentCore();
+    auto name = core.segmentName();
+    core.listParts(data, [&](const SegmentCore::ListedPart& part) {
+      parts.push_back({Postings::getIndexFileName(name, part.slice.location.filenum()), part.slice.location.offset(),
+                       part.slice.bytes, part.readClass, part.kind, std::string(part.space),
+                       std::string(part.field)});
+    });
+  }
+  return parts;
+}
+
 std::shared_ptr<LiveDocs> SegmentLive::shared() {
   return value.getOrCreate([this] {
     auto docs = LiveDocs::decode(file, fileSize, name, segment, maxDoc, liveCount);
@@ -242,14 +262,39 @@ std::shared_ptr<LiveDocs> SegmentLive::shared() {
   });
 }
 
+bool SegmentLive::acquireAhead(AcquireBatches& batches) {
+  if (!file || decoded() || file->holdsFree() || fileSize < Postings::LUXIR_HEADER.size()) return false;
+  ByteRange whole[] = {{0, fileSize}};
+  countAcquire(fileSize);
+  batches.acquire(*file, whole, [this](std::vector<HeldRange>&& holds) {
+    if (holds.size() != 1) return;
+    try {
+      value.getOrCreate([&] { return LiveDocs::decode(file, std::move(holds[0]), name, segment, maxDoc, liveCount); });
+    } catch (const std::exception& e) {
+      LOG_DEBUG("live docs '{}' acquired ahead failed to decode; the first use retries: {}", name, e.what());
+    }
+  });
+  return true;
+}
+
 std::shared_ptr<LiveDocs> LiveDocs::decode(std::shared_ptr<InputFile> file, uint64_t size, std::string_view name,
+                                           std::string_view segment, int32_t maxDoc, int32_t numLive) {
+  constexpr auto headerSize = Postings::LUXIR_HEADER.size() + sizeof(uint64_t) + sizeof(int32_t) + sizeof(int32_t);
+  if (size < headerSize) corruptSegment(segment, std::format("live docs file '{}': too small: {} bytes", name, size));
+  auto hold = file->acquire({0, size});
+  // `file` outlives the call, so the hold, released in it or kept by the
+  // bitmap, never outlives its file.
+  return decode(file, std::move(hold), name, segment, maxDoc, numLive);
+}
+
+std::shared_ptr<LiveDocs> LiveDocs::decode(std::shared_ptr<InputFile> file, HeldRange hold, std::string_view name,
                                            std::string_view segment, int32_t maxDoc, int32_t numLive) {
   auto invalid = [&](std::string_view reason) {
     corruptSegment(segment, std::format("live docs file '{}': {}", name, reason));
   };
+  uint64_t size = hold.bytes().size();
   constexpr auto headerSize = Postings::LUXIR_HEADER.size() + sizeof(uint64_t) + sizeof(int32_t) + sizeof(int32_t);
   if (size < headerSize) invalid(std::format("too small: {} bytes", size));
-  auto hold = file->acquire({0, size});
   InputStream in = hold.stream();
   if (std::memcmp(in.ptr(), Postings::LUXIR_HEADER.data(), Postings::LUXIR_HEADER.size()) != 0) {
     invalid("invalid magic number");
@@ -290,7 +335,9 @@ std::shared_ptr<LiveDocs> LiveDocs::decode(std::shared_ptr<InputFile> file, uint
       words[doc >> 6] &= ~(1ULL << (doc & 63));
       prev = doc;
     }
-    return std::make_shared<LiveDocs>(std::move(words), maxDoc, numLive, liveDocsMemory.sparseRoots);
+    auto docs = std::make_shared<LiveDocs>(std::move(words), maxDoc, numLive, liveDocsMemory.sparseRoots);
+    hold = HeldRange();  // before `file`, which may be the last reference
+    return docs;
   }
 
   // The bitmap borrows the bytes from the hold.

@@ -15,6 +15,25 @@ class ToParentQuery final : public Query {
   RowRelation& relation;
   RowReduction reduction;
 
+  int32_t childWeightMode(int32_t flags, RowReduction& reduction, float& multiplier) const {
+    if (!(flags & NEED_SCORES) || reduction.kind == RowReduction::NONE) {
+      reduction.kind = RowReduction::FIXED;
+      multiplier = 0;
+    }
+    auto constant = reduction.kind != RowReduction::FIXED
+            && reduction.kind != RowReduction::SUM
+        ? uniformScore(*child) : std::nullopt;
+    if (constant) {
+      // Uniform reductions retain the child's rounding before the multiplier.
+      multiplier = *constant * multiplier;
+      reduction.kind = RowReduction::FIXED;
+    }
+    int32_t childFlags = flags;
+    if (reduction.kind == RowReduction::FIXED) childFlags &= ~(ALLOW_PRUNING | NEED_SCORES);
+    else if (reduction.kind != RowReduction::MAXIMUM || reduction.bounded()) childFlags &= ~ALLOW_PRUNING;
+    return childFlags;
+  }
+
 public:
   // The score every match receives, when the tree alone fixes it exactly.
   static std::optional<float> uniformScore(Query& query, float multiplier = 1.0f);
@@ -51,7 +70,7 @@ public:
   }
   void validateLogicalImpl(PlanningContext& context, float multiplier) const override {
     child->validateLogical(source, reduction.kind != RowReduction::NONE ? multiplier : 1.0f);
-    if (source.mayPrepare) context.mayPrepare = true;
+    if (child->mayRequirePreparation()) context.requirePreparation();
   }
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out, const FilterKeyContext& context) const override {
     out.appendKind(getKind());
@@ -131,22 +150,8 @@ public:
           relation(query.relation),
           reduction(query.reduction), multiplier(constantWhenScored(flags, multiplier)) {
       auto* childContext = Query::Context::create(&context.arena(), query.source);
-      if (!(flags & NEED_SCORES) || reduction.kind == RowReduction::NONE) {
-        reduction.kind = RowReduction::FIXED;
-        this->multiplier = 0;
-      }
-      auto constant = reduction.kind != RowReduction::FIXED
-              && reduction.kind != RowReduction::SUM
-          ? uniformScore(*query.child) : std::nullopt;
-      if (constant) {
-        // Uniform reductions retain the child's rounding before the multiplier.
-        this->multiplier = *constant * this->multiplier;
-        reduction.kind = RowReduction::FIXED;
-      }
-      int32_t childFlags = flags;
-      if (reduction.kind == RowReduction::FIXED) childFlags &= ~(ALLOW_PRUNING | NEED_SCORES);
-      else if (reduction.kind != RowReduction::MAXIMUM || reduction.bounded()) childFlags &= ~ALLOW_PRUNING;
-      child = query.child->createWeight(*childContext, childFlags, 1.0f);
+      int32_t childFlags = query.childWeightMode(flags, reduction, this->multiplier);
+      child = query.child->buildWeight(*childContext, childFlags, 1.0f);
       if (reduction.kind != RowReduction::FIXED && reduction.kind != RowReduction::SUM
           && child->isConstantScoring()) reduction.kind = RowReduction::CONSTANT;
       // Every row of the path is not a set worth materializing or caching.
@@ -204,6 +209,8 @@ public:
     }
     bool hasReleasableSegmentState() const noexcept override { return child->hasReleasableSegmentState(); }
   };
+
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
 
   Query::Weight* createWeight(Context& context, int32_t flags, float multiplier) override;
 };

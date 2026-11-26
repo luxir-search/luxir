@@ -382,6 +382,7 @@ TEST_F(GrowingDistinctTupleTest, workerTupleIdsRemappedBothOrders) {
   key.fields.push_back({"key_s", api::GroupComponent_::Type::STRING, FieldType::Storage::TERMS, reader->getOrdMap("key_s"), reader->field("key_s")});
   key.fields.push_back({"key_i", api::GroupComponent_::Type::INT, FieldType::Storage::INT64, {}, reader->field("key_i")});
   FacetGroupPlan plan(key);
+  plan.bindDimensions();
   ASSERT_TRUE(plan.internTuples);
   CollapseKey first, second;
   first.components = {{true, 0}, {true, INT64_MIN}};

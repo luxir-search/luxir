@@ -17,6 +17,23 @@
 
 namespace luxir {
 
+/// Where batched acquires go: a caller issues one batch per file and each
+/// batch's holds reach its `take`, on the thread that completed the batch;
+/// `take` gets exactly one hold per range requested. AcquireJoin waits for
+/// them on the caller's thread; AcquireRound resumes a request once they
+/// complete, without a thread waiting.
+class AcquireBatches {
+public:
+  using Take = std::function<void(std::vector<HeldRange>&&)>;
+
+  /// Starts one batch on `file`, which must stay open until the batch
+  /// completed.
+  virtual void acquire(InputFile& file, std::span<const ByteRange> ranges, Take take) = 0;
+
+protected:
+  ~AcquireBatches() = default;
+};
+
 /// Joins batched acquires across files, so a caller issues them together and
 /// waits once for all of them.
 ///
@@ -33,7 +50,7 @@ namespace luxir {
 ///
 /// The destructor waits for batches still in flight, so a caller that throws
 /// between acquire() and wait() leaves no completion running on freed state.
-class AcquireJoin {
+class AcquireJoin final : public AcquireBatches {
   std::mutex mutex;
   std::condition_variable finished;
   size_t pending = 0;
@@ -52,8 +69,6 @@ class AcquireJoin {
   }
 
 public:
-  using Take = std::function<void(std::vector<HeldRange>&&)>;
-
   AcquireJoin() = default;
   AcquireJoin(const AcquireJoin&) = delete;
   AcquireJoin& operator=(const AcquireJoin&) = delete;
@@ -63,7 +78,10 @@ public:
   /// to `slot` when given, unless it already holds one; the join writes it
   /// under its lock, and it must outlive wait(). A throw (only allocation)
   /// leaves the batch unissued.
-  void acquire(InputFile& file, std::span<const ByteRange> ranges, Take take, std::exception_ptr* slot = nullptr) {
+  void acquire(InputFile& file, std::span<const ByteRange> ranges, Take take) override {
+    acquire(file, ranges, std::move(take), nullptr);
+  }
+  void acquire(InputFile& file, std::span<const ByteRange> ranges, Take take, std::exception_ptr* slot) {
     // Built before the batch counts as pending: the conversion can allocate.
     AcquireDone done = [this, count = ranges.size(), take = std::move(take), slot](
                            std::vector<HeldRange>&& delivered, std::exception_ptr failure) noexcept {

@@ -46,6 +46,10 @@ locations, browse `src/luxir/<area>/`.
      - Per-space field name lists identify available columns and stored resources.
        Logical retrieval discovery is cached per reader and schema identity.
    - `SearchEngine`: Coordinates query parsing, execution, and result collection
+     - On a reader whose files do not all hand out free views, `DeclaredReads` declares the
+       term lookups' parts before parse and the weights' `PlannedRead`s after planning, and
+       the engine acquires each round as an `AcquireRound`, resuming a dispatched request on
+       the arena when it completes instead of holding a worker
      - Implements parallel segment searching using TBB
      - Ordinary preparation is shared with HTTP `?explain=resolved`;
        `?explain=request` only parses and serializes
@@ -67,11 +71,17 @@ locations, browse `src/luxir/<area>/`.
      separately. Codec cursors borrow the space reader and its acquired bytes.
      Opens from a manifest check the catalog against the manifest's xxh3 first;
      invalid segment bytes throw `SegmentCorruptError`, an internal `ApiError`
+   - A term lookup holds the routing data, then the block it lands in, then the found term's
+     postings; a part of at most `WHOLE_READ_BYTES` or on a file with free holds is held whole.
+     `SegmentCore::acquireParts` batches parts of mixed read classes per file, `held()` says
+     whether a slice needs no acquire, and `listParts()` lists catalog, navigation and data
+     parts for warming (`IndexReader::listParts`)
    - `IdFilter`: the root id field's FILTER part, a membership filter over its
      dictionary terms that names its own kind (split-block Bloom or binary fuse) and
      parameters. `IdFilter::Options` picks what a writer builds (none by default).
      `SegmentCore::idFilter` reads it; the writer's delete application skips ids
-     and segments it excludes
+     and segments it excludes. After core open it prefetches whole filters, then
+     survivors' whole lookup parts.
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
      its first use reads metadata and endpoints without scanning child rows.
@@ -223,6 +233,11 @@ locations, browse `src/luxir/<area>/`.
      delegates. `DirectoryFactory::find<T>()` reaches per-node storage state through the wrappers;
      `Directory::capabilities()` (`HARD_LINK`, `ATOMIC_RENAME`, `DURABLE_SYNC`, `MEMORY_MAPPED`,
      `REMOTE`) lets callers fall back (`reuseFiles` copies when links are unavailable)
+   - `IoContext` / `IoScope` / `IoCounters` (`util/IoContext.h`): the thread-local request I/O
+     context (query id, deadline, cancellation, fill hint, per-request I/O counters) that storage
+     layers and backends read and count into; `SearchRequest::io` is installed by `submitBody`,
+     carried into tasks by `FanoutScope` (`bindIoContext`), counted by `SegmentCore` acquires and
+     reported in the profile
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)
