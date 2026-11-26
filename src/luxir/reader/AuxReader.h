@@ -10,6 +10,8 @@
 
 namespace luxir {
 
+class TermMembership;
+
 // What the first use of a segment overlay does when the overlay's bytes are
 // invalid. Segment overlays open on first use, never with the segment, from
 // files the snapshot opened, and a kind's open reports invalid bytes as
@@ -50,6 +52,9 @@ public:
   virtual std::string_view getName() const = 0;
   uint64_t getGen() const noexcept { return gen; }
   uint64_t getBuiltCoreGen() const noexcept { return builtCoreGen; }
+
+  // Non-null when this overlay can prove terms absent from its segment.
+  virtual const TermMembership* termMembership() const noexcept { return nullptr; }
 
 protected:
   AuxReader(uint64_t gen, uint64_t builtCoreGen) noexcept

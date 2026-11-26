@@ -8,6 +8,7 @@
 #include <tuple>
 
 #include "luxir/analysis/Analyzer.h"
+#include "luxir/query/QueryPruning.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/schema/ValCoerce.h"
@@ -181,16 +182,61 @@ DeclaredReads::DeclaredReads(IndexReader& reader, const Schema& schema, const ap
     for (size_t i = 0; i < segments.size(); ++i) {
       const auto* record = present.at(i);
       if (!record || !record->terms()) continue;
-      lookups.push_back({&segments[i], record, mode, term});
+      lookups.push_back({&segments[i], record, mode, term, nullptr, false, false, present.name()});
     }
   }
+  countMany();
+}
+
+void DeclaredReads::countMany() {
   // A lookup reads a block and a term's docs: an enum that seeks more terms
   // than POINT_READS allows holds the dictionary and run docs whole.
   std::map<const DecodedFieldRecord*, int32_t> terms;
   for (const auto& lookup : lookups) {
-    if (lookup.mode == Mode::TERM) ++terms[lookup.record];
+    if (lookup.mode == Mode::TERM && !lookup.done) ++terms[lookup.record];
   }
   for (auto& lookup : lookups) lookup.many = 2 * terms[lookup.record] > TermsEnum::POINT_READS;
+}
+
+namespace {
+
+// Counts the batches an overlay issues, which go on to the round.
+class CountingBatches final : public AcquireBatches {
+  AcquireBatches& inner;
+
+public:
+  size_t count = 0;
+  explicit CountingBatches(AcquireBatches& inner) : inner(inner) {}
+  void acquire(InputFile& file, std::span<const ByteRange> ranges, Take take) override {
+    ++count;
+    inner.acquire(file, ranges, std::move(take));
+  }
+};
+
+}  // namespace
+
+bool DeclaredReads::declareMembership(AcquireRound& round) {
+  CountingBatches batches(round);
+  std::vector<std::shared_ptr<AuxReader>> readers;
+  std::set<std::tuple<const Segment*, std::string_view, std::string_view>> seen;
+  for (const auto& lookup : lookups) {
+    if (lookup.mode != Mode::TERM || !lookup.segment->hasTermMembership()) continue;
+    if (!seen.emplace(lookup.segment, lookup.field, lookup.term).second) continue;
+    lookup.segment->acquireMembershipProbes(lookup.field, lookup.term, batches, readers);
+  }
+  for (auto& reader : readers) round.keep(std::move(reader));
+  return batches.count > 0;
+}
+
+void DeclaredReads::applyMembership() {
+  if (QueryPruning::disableForTests) return;
+  bool dropped = false;
+  for (auto& lookup : lookups) {
+    if (lookup.mode != Mode::TERM || !lookup.segment->hasTermMembership()) continue;
+    // A proven-absent term has no block or postings to read here.
+    if (lookup.segment->membershipProvesAbsent(lookup.field, lookup.term)) dropped = lookup.done = true;
+  }
+  if (dropped) countMany();
 }
 
 DeclaredReads::~DeclaredReads() = default;
@@ -260,6 +306,19 @@ bool DeclaredReads::next(AcquireRound& acquire) {
         auto& root = segment.rootLive();
         if (root && segment.hasDeletes()) live.push_back(root);
       }
+    }
+    // Membership overlays first: their probes are small, and a segment
+    // proven to lack a term has no dictionary or postings read for it.
+    if (!membershipDeclared) {
+      membershipDeclared = true;
+      if (declareMembership(acquire)) {
+        countAcquireRound();
+        return true;
+      }
+    }
+    if (!membershipApplied) {
+      membershipApplied = true;
+      applyMembership();
     }
     // Routing data, blocks, postings: three rounds at most. A part a failed
     // batch left unheld is read on demand, not declared again and again.

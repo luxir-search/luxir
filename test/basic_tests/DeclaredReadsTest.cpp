@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "luxir/reader/TermsEnum.h"
+#include "luxir/plugin/Registries.h"
 #include "luxir/store/DelegatingDirectory.h"
 #include "luxir/store/StorageRegistry.h"
 #include "luxir/util/IoContext.h"
@@ -20,6 +21,8 @@
 using namespace luxir;
 using namespace luxir::test;
 using namespace std::chrono_literals;
+
+int exampleMembershipProbeBatches();
 
 namespace {
 
@@ -256,4 +259,32 @@ TEST_F(DeclaredReadsTest, missingSliceDoesNotBlockHeldParts) {
   deferral.set(false);
   EXPECT_EQ(missing.bytes, blocked.get().size());
   EXPECT_TRUE(core.held(missing));
+}
+
+// Overlay probes are the first round: a segment proven to lack the term has
+// no dictionary or postings declared, so the search issues fewer batches.
+TEST_F(DeclaredReadsTest, membershipProbesDropSegmentsBeforeTheDictionaryRounds) {
+  initPlugins(addConfiguredPlugins);
+  LuxirConfig config;
+  config.store.backend = "ram";
+  config.store.layers = {"io_deferred"};
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  ASSERT_TRUE(api::read_json(def, R"({"segment_overlays":[
+      {"name":"m","kind":"example_absent_prefix","fields":["body_w"],"params":{"prefix":"mm"}}]})", arena));
+  h.collection().updateSchema(def, api::SchemaRequest_::Mode::SET);
+  index(h, 3);
+  auto batches = [&](std::string_view term) {
+    auto req = localReq(h.getSearchEngine());
+    req->collection("main").profile().topDocs("q").matchQuery("body_w", term).fields({"id"});
+    req->execute(0);
+    EXPECT_OK(req);
+    return req->responses.back()->proto.profile.value_or(api::ExecutionProfile{}).io_acquire_batches;
+  };
+  auto probes = exampleMembershipProbeBatches();
+  auto proven = batches("mmgone");
+  EXPECT_GT(exampleMembershipProbeBatches(), probes);
+  EXPECT_LT(proven, batches("nngone"));
 }

@@ -719,7 +719,8 @@ public:
   // Whether this query can match any document in the segment. EMPTY proves
   // absence over live and deleted rows alike. UNKNOWN is always legal;
   // NONEMPTY gives no proof of absence. Proofs read the physical fields'
-  // catalog records. An EMPTY node supplies its reason with view.prove()
+  // catalog records, and never a segment's data; a term membership overlay
+  // behind the view may read its own bytes. An EMPTY node supplies its reason with view.prove()
   // or forwards its child's proof. Queries without a rule return UNKNOWN.
   //
   // Only absence is proven today. The opposite proof, that every row of the
@@ -1726,6 +1727,12 @@ public:
       if (verifyReadDeclarationsForTests) checkRead(field, std::nullopt);
 #endif
       return termFacts.getCachedFieldInfo(field);
+    }
+
+    // Whether the catalogs or membership overlays prove `term` absent from
+    // every segment. Reads no segment data.
+    bool termAbsentEverywhere(CachedFieldInfo& field, std::string_view term) {
+      return termFacts.termAbsentEverywhere(field, term);
     }
 
     CachedTermInfo* getCachedTerminfo(CachedFieldInfo& field, std::string_view term) {

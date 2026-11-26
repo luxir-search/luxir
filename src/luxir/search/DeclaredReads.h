@@ -25,6 +25,9 @@ namespace api { struct SearchRequest; }
 /// part per segment, and each round is one batch per segment file, issued
 /// together across segments:
 ///
+///  0. Membership probes: a segment overlay that can prove a term absent
+///     (TermMembership) has its probe bytes acquired first, and a lookup it
+///     proves absent declares nothing in the rounds below.
 ///  1. Before parse: the routing data of every term lookup the request's
 ///     queries make in every segment (term offsets and trie), and the live
 ///     docs of segments with deletes. A dictionary a lookup reads whole (one
@@ -60,6 +63,7 @@ public:
     TermsEnum* terms = nullptr;  // built once the routing data is held
     bool many = false;  // one of many lookups on the field: holds it whole, as TermsEnum does
     bool done = false;
+    std::string_view field;  // the physical field name
   };
 
 private:
@@ -69,6 +73,8 @@ private:
   uint64_t dropped = 0;  // left to on-demand acquires by the cap
   bool planned = false;
   bool liveDeclared = false;
+  bool membershipDeclared = false;
+  bool membershipApplied = false;
   int termRounds = 0;
   MemPool pool;
   std::vector<Lookup> lookups;
@@ -77,6 +83,12 @@ private:
   struct Round;
   void advance(Lookup& lookup, Round& round);
   void declarePlanned(const PlannedRead& read, Round& round);
+  void countMany();
+  // Acquires the membership overlays' probes for the TERM lookups; false when
+  // there are none to read.
+  bool declareMembership(AcquireRound& round);
+  // Ends the TERM lookups that a held probe proves absent.
+  void applyMembership();
 
 public:
   // Collects the term lookups that parsing `request` will make, with their

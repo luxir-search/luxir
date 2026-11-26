@@ -508,6 +508,27 @@ A kind (`SegmentOverlayKindInfo`) has:
   `ADVISORY` overlay for the life of that snapshot.
 - `policy`: an `OverlayPolicy`. `ADVISORY` (the default) overlays with invalid bytes read
   as absent instead of taking the segment out of service; `REQUIRED` ones fail every use.
+- `termMembership`: the opened reader implements `TermMembership`
+  (`src/luxir/reader/TermMembership.h`) and can prove a term absent from its segment's
+  dictionary. The kind must be `ADVISORY`; `add()` rejects anything else.
+
+### Term membership
+
+A term membership overlay joins the catalog's term bounds in pruning. Term, phrase,
+terms-in-set, combined-field, dis-max and Boolean queries get it through their existing
+composition: a segment proven to lack a term is pruned, contributes no statistics (BM25
+scoring is unchanged) and is never opened for it, and a phrase with a term absent from every
+segment stops before the statistics lookups of its other terms. `provesAbsent(field, term)`
+takes the physical field and the term in dictionary form, may read only the overlay's own
+bytes, and answers true only when certain: it must cover every dictionary term of the
+field, deleted documents included. A wrong "absent" silently loses hits, so an uncovered
+field, a failed read or a checksum mismatch must answer false. An overlay that fails to open,
+or whose bytes are invalid, proves nothing and the segment is searched as without it.
+
+When the store makes acquires requests, the probes are the first declared round
+(`DeclaredReads`): `acquireProbe` issues the probe's reads on the round's batches and keeps
+their holds, then the lookups of proven-absent segments declare no dictionary, block or
+postings reads in the later rounds.
 
 Overlays are built when a merge finishes and, at commits, for segments that lack one: at
 most 8 builds per commit, newest segments first, skipping segments that are inputs of a

@@ -425,7 +425,9 @@ errors. Weight construction checks the fields that execution uses.
 | match-no-docs | always |
 
 Term comparisons use the analyzed and fitted bytes used for the dictionary
-seek. An exact lower or inclusive upper endpoint may itself be present. A
+seek. A segment overlay that implements `TermMembership` may also prove a term
+absent; its proof is consulted wherever the term bounds are, and shares their
+rules (see docs/dev/plugins.md). An exact lower or inclusive upper endpoint may itself be present. A
 `ROUNDED` lower endpoint is a strict prefix of the smallest term. An
 `EXCLUSIVE` upper endpoint is greater than every term. An `UNBOUNDED` upper
 endpoint supplies no upper limit.

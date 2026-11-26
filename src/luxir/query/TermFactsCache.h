@@ -169,6 +169,15 @@ private:
   bool termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term);
 
 public:
+  // Whether every segment's catalog or membership overlay proves `term` absent,
+  // so the term matches nothing and no segment need be opened for it.
+  bool termAbsentEverywhere(CachedFieldInfo& field, std::string_view term) {
+    for (size_t i = 0; i < numSegments(); ++i) {
+      if (!termAbsent(field, i, term)) return false;
+    }
+    return true;
+  }
+
   CachedTermInfo* getCachedTerminfo(CachedFieldInfo& cachedFieldInfo, std::string_view term) {
     auto [iter, inserted] = cachedFieldInfo.termInfos.try_emplace(term);
     CachedTermInfo& result = iter->second;

@@ -69,6 +69,13 @@ QueryPruning::Membership& QueryPruning::membership(const Query& query, const Que
   return membershipMemo.emplace(PlanKey{&planning, &query}, Membership{std::move(mask)}).first->second;
 }
 
+bool CatalogSummaryView::membershipExcludes(std::string_view field, std::string_view term) const {
+  const auto& segment = planning.topReader.segments()[(size_t)ord];
+  if (QueryPruning::disableForTests || !segment.hasTermMembership() || !record(field).value_or(nullptr)) return false;
+  // record() resolved the field, so its memo holds the physical name.
+  return segment.membershipProvesAbsent(fields.find(field)->second->name(), term, reason);
+}
+
 std::optional<const DecodedFieldRecord*> CatalogSummaryView::record(std::string_view field) const {
   auto [entry, inserted] = fields.try_emplace(field);
   try {
@@ -84,7 +91,11 @@ std::optional<const DecodedFieldRecord*> CatalogSummaryView::record(std::string_
 }
 
 bool TermFactsCache::termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term) {
-  if (QueryPruning::disableForTests || !proof::recordExcludesTerm(field.segInfos.at(segnum), term)) return false;
+  if (QueryPruning::disableForTests) return false;
+  if (!proof::recordExcludesTerm(field.segInfos.at(segnum), term)
+      && !reader.segments()[segnum].membershipProvesAbsent(field.segInfos.name(), term)) {
+    return false;
+  }
   if (QueryPruning::verifyTermAbsenceForTests) {
     auto* terms = getTermsEnum(field, segnum);
     if (terms && terms->seek(term)) {

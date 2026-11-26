@@ -122,6 +122,7 @@ inline MatchState termMatch(const CatalogSummaryView& view, std::string_view fie
     view.prove("term outside term bounds");
     return MatchState::EMPTY;
   }
+  if (view.membershipExcludes(field, term)) return MatchState::EMPTY;
   return state;
 }
 

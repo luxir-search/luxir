@@ -30,6 +30,10 @@ public:
   // nullopt means unusable evidence. A null record is proven field absence.
   std::optional<const DecodedFieldRecord*> record(std::string_view field) const;
 
+  // Whether a term membership overlay of the segment proves `term` absent from
+  // `field`. Reads only the overlay's own bytes, never the segment's data.
+  bool membershipExcludes(std::string_view field, std::string_view term) const;
+
   std::optional<CatalogSummaryView> inSpace(const Query::PlanningContext& space) const {
     assert(space.topReader.segments().size() == planning.topReader.segments().size());
     if (space.topReader.segments()[(size_t)ord].maxDoc() == 0) return std::nullopt;

@@ -173,15 +173,17 @@ public:
 class SegmentOverlay {
   AuxInfo info;
   OverlayPolicy policy;
+  bool membership;  // its reader proves terms absent (TermMembership)
   std::string segment;
   std::vector<std::shared_ptr<InputFile>> files;
   SharedLazyCell<AuxReader> reader;
   std::atomic<bool> unusable = false;  // An advisory overlay whose bytes were found invalid.
 
 public:
-  SegmentOverlay(AuxInfo info, OverlayPolicy policy, std::string segment,
+  SegmentOverlay(AuxInfo info, OverlayPolicy policy, bool membership, std::string segment,
                  std::vector<std::shared_ptr<InputFile>> files)
-      : info(std::move(info)), policy(policy), segment(std::move(segment)), files(std::move(files)) {}
+      : info(std::move(info)), policy(policy), membership(membership), segment(std::move(segment)),
+        files(std::move(files)) {}
 
   // Whether readers open overlays of this kind; others are left out.
   static bool knownKind(std::string_view kind);
@@ -195,6 +197,7 @@ public:
   uint64_t gen() const noexcept { return info.gen; }
   uint64_t builtCoreGen() const noexcept { return info.built_core_gen; }
   OverlayPolicy openPolicy() const noexcept { return policy; }
+  bool provesTerms() const noexcept { return membership; }
   bool isOpen() const noexcept { return reader.peek() != nullptr; }
   bool isUnusable() const noexcept { return unusable.load(std::memory_order_relaxed); }
   // The reader, opened on first use; null for an advisory overlay whose bytes are invalid.
@@ -312,6 +315,20 @@ public:
     std::span<const std::shared_ptr<SegmentOverlay>> overlays() const noexcept {
       return sharedOverlays;
     }
+
+    // Whether an overlay of this segment can prove terms absent.
+    bool hasTermMembership() const noexcept {
+      return std::ranges::any_of(sharedOverlays, [](const auto& overlay) { return overlay->provesTerms(); });
+    }
+    // Whether an overlay proves `term` (dictionary form) absent from the
+    // physical `field`. Fills `why` with the proof's label when it does. Never
+    // throws: an overlay that fails to open or to answer proves nothing.
+    bool membershipProvesAbsent(std::string_view field, std::string_view term, std::string* why = nullptr) const noexcept;
+    // Acquires, on `batches`, what those probes will read. The overlays
+    // involved go to `readers`, which the caller keeps until the batches
+    // complete. Never throws.
+    void acquireMembershipProbes(std::string_view field, std::string_view term, AcquireBatches& batches,
+                                 std::vector<std::shared_ptr<AuxReader>>& readers) const noexcept;
 
     // The overlay `name`, opened on first use. Null when the segment has none,
     // or has an advisory one whose bytes are invalid. Throws when its open

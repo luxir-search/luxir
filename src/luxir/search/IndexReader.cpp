@@ -3,6 +3,7 @@
 
 #include "IndexReader.h"
 #include "luxir/store/AcquireJoin.h"
+#include "luxir/reader/TermMembership.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
 #include "luxir/index/LiveDocsWriter.h"
@@ -102,7 +103,9 @@ std::shared_ptr<SegmentOverlay> SegmentOverlay::open(Directory& dir, const luxir
     }
     files.push_back(std::move(file));
   }
-  return std::make_shared<SegmentOverlay>(fromWire(entry), overlayPolicyOf(entry.kind), std::move(segment),
+  const auto* registered = SegmentOverlayRegistry::global().find(entry.kind);
+  bool membership = registered != nullptr && registered->termMembership;
+  return std::make_shared<SegmentOverlay>(fromWire(entry), overlayPolicyOf(entry.kind), membership, std::move(segment),
                                           std::move(files));
 }
 
@@ -133,6 +136,39 @@ std::shared_ptr<AuxReader> SegmentOverlay::get() {
       return nullptr;
     }
   });
+}
+
+bool Segment::membershipProvesAbsent(std::string_view field, std::string_view term, std::string* why) const noexcept {
+  for (const auto& overlay : sharedOverlays) {
+    if (!overlay->provesTerms()) continue;
+    try {
+      auto reader = overlay->get();  // null: advisory overlay with invalid bytes
+      const auto* membership = reader ? reader->termMembership() : nullptr;
+      if (membership == nullptr || !membership->provesAbsent(field, term)) continue;
+      if (why != nullptr) why->assign(membership->label());
+      return true;
+    } catch (const std::exception& e) {
+      LOG_DEBUG("Overlay '{}' proves nothing for a term probe: {}", overlay->name(), e.what());
+    } catch (...) {
+    }
+  }
+  return false;
+}
+
+void Segment::acquireMembershipProbes(std::string_view field, std::string_view term, AcquireBatches& batches,
+                                      std::vector<std::shared_ptr<AuxReader>>& readers) const noexcept {
+  for (const auto& overlay : sharedOverlays) {
+    if (!overlay->provesTerms()) continue;
+    try {
+      auto reader = overlay->get();
+      const auto* membership = reader ? reader->termMembership() : nullptr;
+      if (membership == nullptr) continue;
+      membership->acquireProbe(field, term, batches);
+      readers.push_back(std::move(reader));
+    } catch (...) {
+      // The probe reads on first touch, or proves nothing.
+    }
+  }
 }
 
 LiveDocs::LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive, LiveDocsMemory::Counter& counter)

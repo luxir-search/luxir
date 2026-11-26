@@ -64,6 +64,9 @@ void SegmentOverlayRegistry::add(std::string kind, SegmentOverlayKindInfo info) 
   if (isFrozen) throw std::logic_error("segment overlay registry is frozen; register during startup");
   if (!validName(kind)) throw std::invalid_argument("invalid segment overlay kind '" + kind + "'; use [a-z0-9_]+");
   if (!info.maker || !info.open) throw std::invalid_argument("segment overlay kind '" + kind + "' needs a maker and an opener");
+  if (info.termMembership && info.policy != OverlayPolicy::ADVISORY) {
+    throw std::invalid_argument("segment overlay kind '" + kind + "' proves terms absent, so it must be ADVISORY");
+  }
   if (kinds.contains(kind)) throw std::invalid_argument("duplicate segment overlay kind '" + kind + "'");
   kinds.emplace(std::move(kind), std::move(info));
 }
