@@ -5,9 +5,10 @@ are independent of the index format. This is for reindexing and recovery: any
 collection, however damaged or old, can be rebuilt from its sources. The store
 is **off by default**, declared as the reserved stored resource `_source_`, and
 costs search nothing: no search or warmup reads a source file, and opening a
-segment reads only the segment's small source map and takes a handle on each
-source file. A file's header and footer are parsed on the first fetch that
-needs it.
+segment reads nothing from them. It takes a handle on the segment's source map
+and on each source file its manifest entry lists, sized from the manifest. The
+map is read on the first fetch, and a file's header and footer on the first
+fetch that needs that file.
 
 **Status: experimental.** The file format is meant to freeze, but there is no
 compatibility promise until `luxir-source-dump` reads it and golden files and a

@@ -48,6 +48,7 @@
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/query/VectorEngine.h"
+#include "luxir/query/VectorScorer.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/Collapse.h"
 #include "luxir/util/AtomicMerger.h"
@@ -259,6 +260,26 @@ public:
     counts.unfiltered = unfiltered;
     return counts;
   }
+
+  // A row in the presence bitmap has at least one vector. The domain is live-filtered.
+  static bool hasEligibleVector(VectorReader& vr, DocSet* domain) {
+    if (!domain) return vr.numVectors() > 0;
+    const auto& docs = vr.strColReader().docsReader();
+    const auto* bitmap = docs.bitset();
+    // Without a bitmap every row has a vector; assume so for any other shape too.
+    if (!bitmap) return !docs.allRows() || domain->card() > 0;
+    if (domain->type == DocSet::BITSET) {
+      return bitmap->intersectionCardinality(((const BitDocSet*)domain)->bits()) > 0;
+    }
+    auto present = docs.bitmapIterator();
+    for (int32_t doc : ((const ArrDocSet*)domain)->docs()) {
+      if (present.val() < doc) present.advance(doc);
+      if (present.val() == doc) return true;
+      if (present.val() == PostingsReader::END) break;
+    }
+    return false;
+  }
+
   // Test/benchmark seam only. Zero selects the measured default; positive
   // values are clamped to R/k so k groups remain reachable in R documents.
   static inline int32_t membersPerGroupForTests = 0;
@@ -842,9 +863,9 @@ public:
 
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
-    unused(context);
     checkedBoostProduct(multiplier, 1.0f);
     validateKnnLogical();
+    context.requirePreparation();
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
@@ -969,7 +990,7 @@ public:
       explicit KnnPreparedWeight(std::vector<std::vector<Hit>>&& perSegHits)
         : perSegHits(std::move(perSegHits)) {}
 
-      Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) override {
+      Query::Scorer* createScorerImpl(MemPool& target, IndexReader::Segment& segment) override {
         if ((size_t)segment.ord >= perSegHits.size()) return nullptr;
         auto& hits = perSegHits[(size_t)segment.ord];
         if (hits.empty()) return nullptr;
@@ -1015,7 +1036,7 @@ public:
     };
 
   public:
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& ctx) override {
       if (query.resultPath != query.sourcePath)
         return query.groups ? prepareUnit<true, true>(ctx) : prepareUnit<false, true>(ctx);
       return query.groups ? prepareUnit<true, false>(ctx) : prepareUnit<false, false>(ctx);
@@ -1118,6 +1139,21 @@ public:
           VectorReader vr(reader.segments()[i].postingsReader(), *info);
           segCount = vr.numVectors();
           if (segCount > 0) {
+            if (!VectorScorer::isScorable(vr.encoding(), metric)) {
+              auto& seg = reader.segments()[i];
+              bool hasEligible;
+              if constexpr (Owned) {
+                auto binding = v2dPerSeg[i];
+                int64_t physicalUnits, eligibleUnits;
+                hasEligible = countOwned(vr, binding, seg.postingsReader(), *info, scratch,
+                    nullptr, query.resultPath, physicalUnits, eligibleUnits).eligibleVectors > 0;
+              } else {
+                DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
+                hasEligible = hasEligibleVector(vr, domain ? domain : seg.liveDocSet());
+              }
+              if (!hasEligible) continue;
+              VectorScorer::checkScorable(vr.encoding(), metric, query.getField());
+            }
             if (vr.dims() != dims) {
               throw std::runtime_error(std::format(
                 "KnnQuery: query vector dims {} do not match segment dims {} for field '{}'",
@@ -1152,7 +1188,8 @@ public:
             input.docsWithField = vr.docsWithField(); input.eligibleDocs = eligible.eligibleDocs;
             input.eligibleVectors = eligible.eligibleVectors; input.vectorsEstimated = eligible.vectorsEstimated;
             input.maxDoc = seg.maxDoc();
-            input.dims = dims; input.l2 = metric == (int32_t)api::VectorMetric::L2;
+            input.dims = dims; input.encoding = vr.encoding(); input.l2 = metric == (int32_t)api::VectorMetric::L2;
+            input.cosine = metric == (int32_t)api::VectorMetric::COSINE;
             input.unfiltered = eligible.unfiltered;
             input.sparse = vr.strColReader().docsReader().bitset() != nullptr; input.multi = vr.multiValued();
             if (auto* vaux = vauxPerSeg[i]) {
@@ -1325,7 +1362,7 @@ public:
             .ivfEngine = std::make_unique<SegmentIvfScanner<Groups, Owned>>(
                 *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
                 metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
-                vaux->getAmplitudes(), interval ? &intervals : nullptr),
+                vaux->getLists(), vaux->getAmplitudes(), interval ? &intervals : nullptr),
           });
         } else {
           slots.push_back({
@@ -1938,7 +1975,7 @@ public:
       return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
     }
 
-    Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(MemPool& target, IndexReader::Segment& segment) override {
       unused(target, segment);
       return nullptr;
     }
@@ -1991,6 +2028,9 @@ public:
 
       faiss::IndexIVF& ivf;
       faiss::IndexIVFRaBitQ* rabitq;
+      // The overlay's file-backed lists (VectorAuxReader::getLists); ids are
+      // read as uint32 through ids32(), never through the widening get_ids().
+      const MmapInvertedLists& lists;
       int32_t segOrd;
       const Binding<Owned>& v2d;
       LiveDocs* liveDocs;
@@ -2166,19 +2206,21 @@ public:
                         IndexReader::Segment& seg, const Binding<Owned>& v2d, DocSet* domain,
                         std::shared_ptr<const RankLiveBitmap> rankLive, int32_t metric,
                         const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
-                        RaBitQAmplitudes amplitudes, KnnIntervalCollector<Groups>* intervals)
+                        const MmapInvertedLists& lists, RaBitQAmplitudes amplitudes,
+                        KnnIntervalCollector<Groups>* intervals)
           : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
-            segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
+            lists(lists), segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
             domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
                                         && domain == &liveDocs->docset()),
             metric(metric), preparedQuery(preparedQuery) {
         assert(preparedQuery.query != nullptr);
         assert((liveDocs != nullptr) == (this->rankLive != nullptr));
+        assert(ivf.invlists == &lists);
       }
 
       bool usesIntervals() const { return intervals != nullptr; }
       int32_t getNList() const noexcept { return (int32_t)ivf.nlist; }
-      int64_t physicalListSize(faiss::idx_t id) const { return (int64_t)ivf.invlists->list_size((size_t)id); }
+      int64_t physicalListSize(faiss::idx_t id) const { return (int64_t)lists.list_size((size_t)id); }
 
       void coarseRun(int32_t dims,
                      std::vector<faiss::idx_t>& listIds,
@@ -2201,19 +2243,14 @@ public:
       /// denominator.
       int64_t liveListSize(faiss::idx_t listId, VectorSearchWork& work) const {
         if (listId < 0 || (size_t)listId >= ivf.nlist) return 0;
-        size_t rawSize = ivf.invlists->list_size((size_t)listId);
-        if (rawSize == 0) return 0;
-        if (liveDocs == nullptr) return (int64_t)rawSize;
+        auto listIds = lists.ids32((size_t)listId);
+        if (listIds.empty()) return 0;
+        if (liveDocs == nullptr) return (int64_t)listIds.size();
 
-        work.allocatorEntries += (int64_t)rawSize;
+        work.allocatorEntries += (int64_t)listIds.size();
         const uint8_t* bits = rankLive->bits;
         int64_t liveSize = 0;
-        const faiss::idx_t* listIds = ivf.invlists->get_ids((size_t)listId);
-        for (size_t i = 0; i < rawSize; i++) {
-          uint64_t r = (uint64_t)listIds[i];
-          liveSize += (bits[r >> 3] >> (r & 7)) & 1;
-        }
-        ivf.invlists->release_ids((size_t)listId, listIds);
+        for (uint32_t r : listIds) liveSize += (bits[r >> 3] >> (r & 7)) & 1;
         return liveSize;
       }
 
@@ -2270,7 +2307,7 @@ public:
         bool keepMax = metric != (int32_t)api::VectorMetric::L2;
         const float* listAmplitudes = nullptr;
         double selectionScale = 0;
-        const faiss::idx_t* rowIds = nullptr;
+        const uint32_t* rowIds = nullptr;
         // The candidate test after any scoring: the handler's threshold moves
         // as results arrive, so rows are admitted strictly in order.
         auto admit = [&](float distance, size_t row) LUXIR_INLINE {
@@ -2287,11 +2324,12 @@ public:
         for (size_t list = 0; list < listIds.size(); list++) {
           auto id = listIds[list];
           if (id < 0) continue;
-          faiss::InvertedLists::ScopedIds ids(ivf.invlists, (size_t)id);
-          faiss::InvertedLists::ScopedCodes codes(ivf.invlists, (size_t)id);
-          size_t count = ivf.invlists->list_size((size_t)id);
+          auto listRows = lists.ids32((size_t)id);
+          const uint32_t* ids = listRows.data();
+          const uint8_t* codes = lists.get_codes((size_t)id);
+          size_t count = listRows.size();
           visited += (int64_t)count;
-          rowIds = ids.get();
+          rowIds = ids;
           std::unique_ptr<faiss::FlatCodesDistanceComputer> distanceComputer;
           faiss::RaBitQDistanceComputer* dc = nullptr;
           float gError = 0;
@@ -2321,7 +2359,7 @@ public:
             handler.updateThreshold();
             if (oneBitScorer) {
               alignas(64) float distances[RaBitQScorer::BLOCK_ROWS];
-              const uint8_t* block = codes.get() + begin * ivf.code_size;
+              const uint8_t* block = codes + begin * ivf.code_size;
               if constexpr (std::is_same_v<Probe, std::nullptr_t>) {
                 size_t rows = end - begin;
                 oneBitScorer->score(block, ivf.code_size, rows, distances);
@@ -2339,13 +2377,18 @@ public:
                 for (size_t k = 0; k < rows; k++) admit(distances[k], begin + selected[k]);
               }
             } else if (dc == nullptr) {
-              if constexpr (!Interval) pqScanner->scan_codes(end - begin, codes.get() + begin * ivf.code_size,
-                                    ids.get() + begin, handler);
+              if constexpr (!Interval) {
+                // FAISS's PQ scan_codes takes idx_t ids: widen one block.
+                faiss::idx_t wideIds[RaBitQScorer::BLOCK_ROWS];
+                std::copy(ids + begin, ids + end, wideIds);
+                pqScanner->scan_codes(end - begin, codes + begin * ivf.code_size,
+                                      wideIds, handler);
+              }
             } else for (size_t i = begin; i < end; i++) {
               if constexpr (!std::is_same_v<Probe, std::nullptr_t>) {
                 if (!probe(ids[i])) continue;
               }
-              const uint8_t* code = codes.get() + i * ivf.code_size;
+              const uint8_t* code = codes + i * ivf.code_size;
               scanned++;
               float distance = dc->distance_to_code_1bit(code);
               if (multiBit) {
@@ -2409,21 +2452,20 @@ public:
         return false;
       }
       template <bool Multi, class Emit>
-      LUXIR_INLINE void scoreRun(VectorReader& vr, const VectorSearchRequest& request, Emit& emit,
+      LUXIR_INLINE void scoreRun(VectorReader& vr, const VectorScorer& scorer, Emit& emit,
                                 int64_t& scored, int32_t doc, int64_t begin, int64_t end) {
         emit(doc, [&]() LUXIR_INLINE {
           scored += end - begin;
           if constexpr (Multi) {
             auto [rank, score] = bestInRun(begin, end, [&](int64_t r) LUXIR_INLINE {
-              return exactScore(request.query, vr.vectorAtRank(r), dims, metric, normalizeColumnOnCosineRescore, 0.0f);
+              return scorer.score(vr.rowAtRank(r), 0.0f);
             });
             return VectorEngineHit{score, segOrd, rank};
-          } else return VectorEngineHit{exactScore(request.query, vr.vectorAtRank(begin), dims, metric,
-              normalizeColumnOnCosineRescore, 0.0f), segOrd, begin};
+          } else return VectorEngineHit{scorer.score(vr.rowAtRank(begin), 0.0f), segOrd, begin};
         });
       }
       template <bool Multi, bool Sparse, class Emit>
-      LUXIR_NOINLINE VectorSearchWork scanDomain(VectorReader& vr, const VectorSearchRequest& request,
+      LUXIR_NOINLINE VectorSearchWork scanDomain(VectorReader& vr, const VectorSearchRequest& request, const VectorScorer& scorer,
                                                 std::span<const uint8_t> elig, Emit emit) {
         auto& col = vr.strColReader();
         RowReadAhead::Gate gate;
@@ -2518,7 +2560,7 @@ public:
               multiMaps++;
               auto run = queuedRanges->front();
               queuedRanges->pop_front();
-              if (!pooledInRun(elig, run.begin, run.end)) scoreRun<true>(vr, request, emit, vectorsScored, doc, run.begin, run.end);
+              if (!pooledInRun(elig, run.begin, run.end)) scoreRun<true>(vr, scorer, emit, vectorsScored, doc, run.begin, run.end);
               return;
             }
           }
@@ -2526,7 +2568,7 @@ public:
           if (rank < 0) return;
           if constexpr (Multi) multiMaps++;
           auto [begin, end] = valueRange(rank);
-          if (!pooledInRun(elig, begin, end)) scoreRun<Multi>(vr, request, emit, vectorsScored, doc, begin, end);
+          if (!pooledInRun(elig, begin, end)) scoreRun<Multi>(vr, scorer, emit, vectorsScored, doc, begin, end);
         });
         VectorSearchWork work;
         work.domainDocs = count; work.exactVectors = vectorsScored;
@@ -2534,7 +2576,7 @@ public:
         return work;
       }
       template <bool Filtered, bool Multi, bool Sparse, class Emit>
-      LUXIR_NOINLINE VectorSearchWork scanSequential(VectorReader& vr, const VectorSearchRequest& request,
+      LUXIR_NOINLINE VectorSearchWork scanSequential(VectorReader& vr, const VectorSearchRequest& request, const VectorScorer& scorer,
                                                     std::span<const uint8_t> elig, Emit emit) {
         auto& col = vr.strColReader();
         int64_t numVectors = vr.numVectors(), vectorsScored = 0, domainProbes = 0, sparseMaps = 0, multiMaps = 0;
@@ -2576,7 +2618,7 @@ public:
               owners.next();
             } while (end < numVectors && (int32_t)owners.value() == doc);
             readAhead(rank);
-            if (eligibleDoc(doc) && !pooledInRun(elig, rank, end)) scoreRun<true>(vr, request, emit, vectorsScored, doc, rank, end);
+            if (eligibleDoc(doc) && !pooledInRun(elig, rank, end)) scoreRun<true>(vr, scorer, emit, vectorsScored, doc, rank, end);
             rank = end;
           }
         } else {
@@ -2587,7 +2629,7 @@ public:
             if (pooledInRun(elig, rank, rank + 1)) continue;
             if constexpr (Sparse) sparseMaps++;
             int32_t doc = Sparse ? v2d.resolve(rank) : (int32_t)rank;
-            if (eligibleDoc(doc)) scoreRun<false>(vr, request, emit, vectorsScored, doc, rank, rank + 1);
+            if (eligibleDoc(doc)) scoreRun<false>(vr, scorer, emit, vectorsScored, doc, rank, rank + 1);
           }
         }
         VectorSearchWork work;
@@ -2597,7 +2639,7 @@ public:
       }
       template <bool Multi, bool Sparse, class Emit>
       VectorSearchWork scan(VectorReader& vr, const VectorSearchRequest& request,
-                            std::span<const uint8_t> elig, bool walk, Emit emit) {
+                            const VectorScorer& scorer, std::span<const uint8_t> elig, bool walk, Emit emit) {
         if constexpr (Owned) {
           ColumnShape shape(seg.postingsReader(), *segInfo);
           ColumnShape::Cursor values(shape);
@@ -2612,7 +2654,7 @@ public:
             auto [begin, end] = values.range(family.first, family.end);
             if (begin == end || pooledInRun(elig, begin, end)) return;
             ahead.scanAt(begin);
-            scoreRun<true>(vr, request, emit, scored, unit, begin, end);
+            scoreRun<true>(vr, scorer, emit, scored, unit, begin, end);
           };
           if (v2d.unitDomain) v2d.unitDomain->forEach(visit);
           else for (int32_t unit = 0; unit < v2d.units; unit++) visit(unit);
@@ -2621,10 +2663,10 @@ public:
           work.domainDocs = visits;
           return work;
         }
-        else if (walk) return scanDomain<Multi, Sparse>(vr, request, elig, emit);
+        else if (walk) return scanDomain<Multi, Sparse>(vr, request, scorer, elig, emit);
         else {
-          if (domain) return scanSequential<true, Multi, Sparse>(vr, request, elig, emit);
-          return scanSequential<false, Multi, Sparse>(vr, request, elig, emit);
+          if (domain) return scanSequential<true, Multi, Sparse>(vr, request, scorer, elig, emit);
+          return scanSequential<false, Multi, Sparse>(vr, request, scorer, elig, emit);
         }
       }
 
@@ -2675,6 +2717,8 @@ public:
             "KnnQuery: query vector dims {} do not match segment dims {}",
             dims, vr.dims()));
         }
+        VectorScorer scorer(request.query, dims, metric, normalizeColumnOnCosineRescore,
+                            vr.encoding());
 
         // Flat exclusions are doc-granular: an emitted rank is that doc's maximum.
         std::span<const uint8_t> elig = (size_t)segOrd < request.eligible.size()
@@ -2684,11 +2728,11 @@ public:
             domain ? domain->card() : 0, vr.docsWithField(), tuning.flatDomainDensityThreshold);
         auto dispatch = [&](auto emit) {
           if (vr.multiValued()) {
-            if (sparse) return scan<true, true>(vr, request, elig, walk, emit);
-            return scan<true, false>(vr, request, elig, walk, emit);
+            if (sparse) return scan<true, true>(vr, request, scorer, elig, walk, emit);
+            return scan<true, false>(vr, request, scorer, elig, walk, emit);
           }
-          if (sparse) return scan<false, true>(vr, request, elig, walk, emit);
-          return scan<false, false>(vr, request, elig, walk, emit);
+          if (sparse) return scan<false, true>(vr, request, scorer, elig, walk, emit);
+          return scan<false, false>(vr, request, scorer, elig, walk, emit);
         };
         if constexpr (Groups) {
           CollapseKeyReader keys(*groupPlan);
@@ -2707,7 +2751,7 @@ public:
           unused(doc);
           heap.offer(makeHit());
         });
-        result.work.scoreBytes = result.work.exactVectors * dims * (int64_t)sizeof(float);
+        result.work.scoreBytes = result.work.exactVectors * (int64_t)vr.valueBytes();
         result.hits = heap.take();
         std::sort(result.hits.begin(), result.hits.end(), betterHit);
         result.boundedSelection = VectorSelection::COMPLETE;
@@ -3407,13 +3451,18 @@ private:
         buckets.emplace_back(b, e);
         b = e;
       }
-      std::vector<int64_t> readsByBucket(buckets.size());
+      std::vector<int64_t> readsByBucket(buckets.size()), bytesByBucket(buckets.size());
       auto readBucket = [&](size_t bucket) {
         return [&, bucket]() {
           auto [b, e] = buckets[bucket];
           int32_t segOrd = records[selected[b]].hit.segOrd;
           const auto& info = *segInfos.at((size_t)segOrd);
           VectorReader column(reader.segments()[(size_t)segOrd].postingsReader(), info);
+          if (column.dims() != dims) {
+            throw std::runtime_error(std::format(
+              "KnnQuery: query vector dims {} do not match segment dims {}", dims, column.dims()));
+          }
+          VectorScorer scorer(queryPtr, dims, metric, normalizeColumnOnCosineRescore, column.encoding());
           RowReadAhead::Gate gate;
           RowReadAhead ahead(gate, column.strColReader());
           auto rankAt = [&](int64_t i) { return records[selected[b + (size_t)i]].hit.valueRank; };
@@ -3425,8 +3474,7 @@ private:
             // may already have established a better exact member.
             if (!seed && record.upper < record.unit->exact.load(std::memory_order_relaxed)) continue;
             ahead.sparseAt((int64_t)(i - b), count, [&](int64_t pos) { auto rank = rankAt(pos); ahead.queueRows(rank, rank + 1); });
-            float score = exactScore(queryPtr, column.vectorAtRank(record.hit.valueRank), dims,
-                metric, normalizeColumnOnCosineRescore, record.hit.score);
+            float score = scorer.score(column.rowAtRank(record.hit.valueRank), record.hit.score);
             record.hit.score = score;
             record.exact = true;
             float best = record.unit->exact.load(std::memory_order_relaxed);
@@ -3434,6 +3482,7 @@ private:
             reads++;
           }
           readsByBucket[bucket] = reads;
+          bytesByBucket[bucket] = reads * (int64_t)column.valueBytes();
         };
       };
       std::pmr::vector<size_t> tasks(resource), local(resource);
@@ -3451,7 +3500,7 @@ private:
         int32_t segOrd = records[selected[buckets[i].first]].hit.segOrd;
         auto& work = workBySeg[(size_t)segOrd];
         (seed ? work.seedReads : work.remainingReads) += readsByBucket[i];
-        work.scoreBytes += readsByBucket[i] * dims * (int64_t)sizeof(float);
+        work.scoreBytes += bytesByBucket[i];
       }
     };
     readStage(true, KnnIntervalCollector<Groups>::NO_FLOOR);
@@ -3501,50 +3550,8 @@ private:
     std::sort(docHits.begin(), docHits.end(), betterDoc);
   }
 
-  // Query and stored vectors share inputError's element bound, which keeps
-  // every exact and FAISS distance finite.  A NaN score would break the
-  // strict-total-order contract (betterHit/betterDoc) that makes the bounded
-  // cuts deterministic and std::sort defined, so any NaN that slips past the
-  // bound maps to a worst-rank score at the point where scores are produced.  One ULP above lowest(): TopScoreCollector's
-  // minCompetitiveVal starts at lowest() and admits only strictly greater
-  // scores, and a kNN hit must rank last, not be counted in matches yet
-  // vanish from the returned docs.
   static float finiteScore(float score) {
-    if (!std::isnan(score)) [[likely]] return score;
-    return std::nextafter(std::numeric_limits<float>::lowest(), 0.0f);
-  }
-
-  // Keep L2's nonnegative branch and IP in sync with scoreFromDist below.
-  // COSINE has a separate stored-vector norm branch for raw-column rescore mode.
-  static LUXIR_INLINE float exactScore(const float* queryPtr,
-                          std::span<const float> vec,
-                          int32_t dims,
-                          int32_t metric,
-                          bool normalizeColumnOnCosineRescore,
-                          float fallbackScore) {
-    assert(queryPtr != nullptr);
-    assert((int32_t)vec.size() == dims);
-    switch (metric) {
-      case (int32_t)luxir::api::VectorMetric::L2: {
-        float dist = faiss::fvec_L2sqr(queryPtr, vec.data(), (size_t)dims);
-        return finiteScore(1.0f / (1.0f + dist));
-      }
-      case (int32_t)luxir::api::VectorMetric::IP:
-        return finiteScore(faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims));
-      case (int32_t)luxir::api::VectorMetric::COSINE: {
-        float sum = faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims);
-        if (!normalizeColumnOnCosineRescore) return finiteScore(sum);
-
-        // Raw-column cosine pays the vector norm at query time.  This is the
-        // explicit tradeoff for preserving the originally submitted bytes when
-        // normalize_on_write=false; the default cosine path stores unit vectors.
-        float normSq = faiss::fvec_norm_L2sqr(vec.data(), (size_t)dims);
-        if (!std::isfinite(normSq) || normSq <= VectorFieldType::MIN_COSINE_NORM_SQ) return 0.0f;
-        return finiteScore(sum / std::sqrt(normSq));
-      }
-      default:
-        return fallbackScore;
-    }
+    return VectorScorer::finiteScore(score);
   }
 
   static void sortCandidatesByScore(std::vector<VectorEngineHit>& candidates) {

@@ -10,6 +10,8 @@ namespace luxir {
 
 class OwnershipRelation final : public RowRelation {
   std::vector<std::optional<OwnershipMapper>> mappers;
+  // True once every leaf has a mapper or is known to lack the child space.
+  bool bound = false;
 
   class Scorer;
   class Supplier;
@@ -17,7 +19,11 @@ class OwnershipRelation final : public RowRelation {
 public:
   OwnershipRelation(IndexReader& many, IndexReader& one, RequestMemTracker& memory);
 
+  // Bind the ownership shapes for the validated pair of views.
+  void bindMappers();
+
   const OwnershipMapper* mapper(size_t leaf) const {
+    assert(bound);
     return mappers[leaf] ? &*mappers[leaf] : nullptr;
   }
 

@@ -75,8 +75,10 @@ void expectParseError(ArenaOwner& memory, Schema& schema,
 BucketScalar evaluate(AggregateProgram& program, IndexReader& reader, IndexReader::Segment& segment) {
   MemPool pool;
   AggregateAccumulator accumulator(program);
+  auto fields = resolveAggregateFields(program, pool, reader);
+  bindAggregateOrdinals(program, reader, fields);
   std::vector<BoundAggregateInput> bindings =
-      bindAggregateInputs(program, pool, segment, resolveAggregateFields(program, pool, reader));
+      bindAggregateInputs(program, pool, segment, fields);
   int32_t maxDoc = segment.maxDoc();
   for (int32_t doc = 0; doc < maxDoc; doc++) {
     for (size_t producer = 0; producer < bindings.size(); producer++) {

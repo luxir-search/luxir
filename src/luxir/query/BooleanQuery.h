@@ -12,6 +12,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
+#include "CatalogSummaryView.h"
 #include "Query.h"
 #include "AllQuery.h"
 #include "BoostQuery.h"
@@ -101,6 +102,30 @@ private:
         minShouldMatch(query.minShouldMatch) {}
   };
 
+  static int32_t filterWeightFlags(int32_t flags) {
+    return flags & ~(NEED_SCORES | ALLOW_PRUNING);
+  }
+
+  static int32_t exclusionWeightFlags(int32_t flags) {
+    return filterWeightFlags(flags) | EXCLUSION_WINDOW_FILL;
+  }
+
+  struct MandatoryWeightMode {
+    int32_t flags;
+    bool contributes;
+  };
+
+  static MandatoryWeightMode mandatoryWeightMode(const Query& query, int32_t flags) {
+    bool contributes = (flags & NEED_SCORES) != 0
+        && luxir::scoreProfile(query).kind != ScoreProfile::Kind::AUTO_UNIFORM;
+    return {contributes ? flags : flags & ~NEED_SCORES, contributes};
+  }
+
+  static bool mandatoryCacheEnabled(const IndexReader& reader) {
+    auto* cache = reader.filterCache();
+    return !disableMandatoryCacheForTests && cache && cache->enabled();
+  }
+
   struct CompiledBoolean {
     std::span<Query*> mandatory;
     std::span<Query*> optional;
@@ -110,10 +135,17 @@ private:
     Query* singleChild = nullptr;
     uint32_t ruleMask = 0;
 
+    // A weight may also compile a generated Boolean outside the validated tree.
+    bool validated = false;
+
     bool dropsOptional(bool needsScores) const {
       return !disableUnscoredOptionalDropForTests && !needsScores
           && (!mandatory.empty() || !filter.empty())
           && minShouldMatch < 1;
+    }
+
+    std::span<Query*> optionalForWeight(int32_t flags) const {
+      return dropsOptional((flags & NEED_SCORES) != 0) ? std::span<Query*>{} : optional;
     }
 
     // The one clause that alone determines unscored membership, or null.
@@ -631,13 +663,9 @@ private:
   // into the mandatory clause; a prohibited duplicate of a required clause
   // matches nothing).
   static std::span<Query*> mergeDuplicateScoringClauses(
-      luxir::MemPool& pool, std::span<Query*> clauses,
-      int32_t* removedOut = nullptr) {
+      luxir::MemPool& pool, std::span<Query*> clauses) {
     DuplicateGroups duplicates = findDuplicateScoringGroups(pool, clauses);
-    if (duplicates.duplicateSlots == 0) {
-      if (removedOut != nullptr) *removedOut = 0;
-      return clauses;
-    }
+    if (duplicates.duplicateSlots == 0) return clauses;
 
     boost::container::small_vector<Query*, 16> out;
     for (size_t i = 0; i < clauses.size(); i++) {
@@ -660,12 +688,24 @@ private:
       }
       out.push_back(core);
     }
-    if (removedOut != nullptr) {
-      *removedOut = (int32_t) (clauses.size() - out.size());
-    }
     auto* kept = pool.make_arr<Query*>(out.size());
     std::copy(out.begin(), out.end(), kept);
     return {kept, out.size()};
+  }
+
+  // Luxir-defined min_match semantics under duplicate removal, split by the
+  // intent the value expresses (Lucene instead refuses to dedup when
+  // min_match > 1 and lets duplicates satisfy multiple match slots):
+  // - Above half the raw clauses, preserve the miss budget.
+  // - At or below half, preserve the absolute distinct-term count.
+  static int32_t dedupedMinShouldMatch(
+      int32_t minShouldMatch, size_t rawOptional, size_t distinctOptional) {
+    int32_t removed = (int32_t) (rawOptional - distinctOptional);
+    if (minShouldMatch <= 1 || removed <= 0) return minShouldMatch;
+    if ((int64_t) minShouldMatch * 2 > (int64_t) rawOptional) {
+      return std::max(1, minShouldMatch - removed);
+    }
+    return std::min(minShouldMatch, (int32_t) distinctOptional);
   }
 
   static std::span<Query*> persistClauses(
@@ -687,25 +727,11 @@ private:
 
       auto mandatoryClauses = mergeDuplicateScoringClauses(
           context.pool, normalized.mandatory);
-      int32_t removedOptional = 0;
       auto optionalClauses = mergeDuplicateScoringClauses(
-          context.pool, normalized.optional, &removedOptional);
+          context.pool, normalized.optional);
 
-      // Luxir-defined min_match semantics under duplicate removal, split by
-      // the intent the value expresses (Lucene instead refuses to dedup when
-      // min_match > 1 and lets duplicates satisfy multiple match slots):
-      // - Above half the raw clauses, preserve the miss budget.
-      // - At or below half, preserve the absolute distinct-term count.
-      if (compiled->minShouldMatch > 1 && removedOptional > 0) {
-        if ((int64_t) compiled->minShouldMatch * 2
-            > (int64_t) normalized.optional.size()) {
-          compiled->minShouldMatch = std::max(
-              1, compiled->minShouldMatch - removedOptional);
-        } else {
-          compiled->minShouldMatch = std::min(
-              compiled->minShouldMatch, (int32_t) optionalClauses.size());
-        }
-      }
+      compiled->minShouldMatch = dedupedMinShouldMatch(
+          compiled->minShouldMatch, normalized.optional.size(), optionalClauses.size());
 
       // NormalizedBoolean owns small_vector storage. Persist every final span
       // in the request pool so all Weights for this Query share one plan.
@@ -715,6 +741,13 @@ private:
       compiled->filter = persistClauses(context.pool, normalized.filter);
       return compiled;
     });
+  }
+
+  template <class Single, class Composite>
+  decltype(auto) dispatchWeight(PlanningContext& planning, Single&& single, Composite&& composite) const {
+    auto& plan = logicalPlan(planning);
+    if (plan.singleChild != nullptr) return single(*plan.singleChild);
+    return composite(plan);
   }
 
 public:
@@ -1066,6 +1099,33 @@ public:
                    : VerificationWork::ABSENT;
   }
 
+  // One impossible required clause empties the conjunction; an optional
+  // group needs enough possible members (UNKNOWN counts as possible);
+  // prohibited clauses never prove anything. A query with no positive
+  // clause is the planner's match-all and stays unknown. Duplicate optional
+  // clauses count once, against the min_match logicalPlan executes.
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    const auto* plan = view.planning.findLogicalPlan<CompiledBoolean>(*this);
+    if (!plan || !plan->validated) return MatchState::UNKNOWN;
+    if (plan->singleChild) return plan->singleChild->mayMatch(view);
+    for (auto clauses : {plan->mandatory, plan->filter}) {
+      for (Query* clause : clauses) {
+        if (clause->mayMatch(view) == MatchState::EMPTY) return MatchState::EMPTY;
+      }
+    }
+    if (plan->optional.empty()) return MatchState::UNKNOWN;
+    int needed = plan->minShouldMatch;
+    if (plan->mandatory.empty() && plan->filter.empty()) {
+      needed = std::max(1, needed);
+    }
+    if (needed <= 0) return MatchState::UNKNOWN;
+    for (Query* clause : plan->optional) {
+      if (clause->mayMatch(view) != MatchState::EMPTY && --needed == 0) return MatchState::UNKNOWN;
+    }
+    view.prove("too few possible optional clauses");
+    return MatchState::EMPTY;
+  }
+
   // Every match satisfies every MUST and FILTER clause, so their envelopes
   // intersect. Optional clauses (even under minShouldMatch) and prohibited
   // clauses require nothing of a single field here. Normalization only
@@ -1120,7 +1180,7 @@ public:
     checkedBoostProduct(multiplier, 1.0f);
     // Build the logical plan here so its errors surface as validation
     // errors; nodes it generates are marked and skip the validation check.
-    logicalPlan(context);
+    auto& plan = logicalPlan(context);
 
     auto validate = [&](std::span<Query*> clauses, float childMultiplier) {
       for (Query* clause : clauses) {
@@ -1131,6 +1191,7 @@ public:
     validate(optional, multiplier);
     validate(prohibited, 1.0f);
     validate(filter, 1.0f);
+    plan.validated = true;
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
@@ -1250,6 +1311,8 @@ public:
       .filter = {plan.filter.data(), plan.filter.size()},
     };
   }
+
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;

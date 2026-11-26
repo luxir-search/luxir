@@ -115,7 +115,7 @@ public:
 
   // A BKD count can decode crossing leaves, so probes only report that level;
   // the walk belongs to execution after the supplier has been selected.
-  Query::CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+  Query::CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
     const DecodedFieldRecord* info = nullptr;
     if (query.isEmpty() || !segmentInfo(segment, info) || PointSource::pointCount(*info) == 0) {
       return {0, Query::CountHow::METADATA};
@@ -420,7 +420,7 @@ public:
         *this, targetPool, segment, *reader, bkd, estimate);
   }
 
-  Query::Scorer* createScorer(MemPool& targetPool,
+  Query::Scorer* createScorerImpl(MemPool& targetPool,
                               IndexReader::Segment& segment) override {
     auto* supplier = scorerSupplier(targetPool, segment);
     if (supplier == nullptr) return nullptr;

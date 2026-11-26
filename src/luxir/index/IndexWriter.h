@@ -638,6 +638,9 @@ public:
   // orders of magnitude sooner; tests lower it to flush at exact doc boundaries.
   size_t perInverterRamBytes = 64 * 1024 * 1024;
   size_t perInverterMaxDocs = PostingsReader::MAX_SEGMENT_DOCS;
+  // The id filter that flushes and merges write (IdFilter.h). Set before the
+  // first write; a merge moves its output to the current choice.
+  IdFilter::Options idFilterOptions;
   // Delete ids per application task within one segment.
   size_t deleteApplyChunkEntries = 64 * 1024;
   // Small indexes still batch delete-only buffers: per-id cost was about 2x the
@@ -883,8 +886,13 @@ private:
                             std::vector<std::string>& outFilesToSync);
   // The published reader's copy of `seg`, or null; `reader` keeps it valid.
   const Segment* publishedSegment(const SegInfo& seg, std::shared_ptr<IndexReader>& reader);
-  // The segment's core: its slot's, else the published reader's, else a new one; the
-  // slot keeps it.
+  // Live docs generation `gen` of `seg`: the published reader's when it holds that
+  // generation, else loaded from its file.
+  std::shared_ptr<LiveDocs> loadLiveDocs(const SegInfo& seg, uint64_t gen, uint64_t epoch);
+  // The segment's core: its slot's, else the published reader's, else a new one.
+  // The slot is left as it was.
+  std::shared_ptr<SegmentCore> acquireSegmentCore(const SegInfo& seg);
+  // acquireSegmentCore, and the slot keeps it.
   std::shared_ptr<SegmentCore> getSegmentCore(SegInfo& seg);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
@@ -910,7 +918,9 @@ private:
   void retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void releaseSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void moveSegmentToDelete(uint64_t segId);
-  uint64_t applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
+  struct SegmentDeletes;
+  void prepareDeletes(SegmentDeletes& target);
+  uint64_t applyDeletes(const SegmentDeletes& target);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
   bool mergeSegmentsBody(MergeMessage& msg);
   std::once_flag dictionariesSeeded;

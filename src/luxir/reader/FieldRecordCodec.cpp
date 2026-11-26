@@ -4,6 +4,7 @@
 #include "FieldRecordCodec.h"
 
 #include "CatalogIO.h"
+#include "IdFilter.h"
 #include "Space.h"
 #include "luxir/index/IndexFieldInfo.h"
 
@@ -16,6 +17,7 @@
 
 #include "luxir/codec/OrdColumnFormat.h"
 #include "luxir/codec/StreamVByte.h"
+#include "luxir/codec/VectorCodec.h"
 #include "luxir/codec/NumColumnFormat.h"
 #include "luxir/util/screaming.h"
 
@@ -68,6 +70,8 @@ struct OrdOptions {
 
 // A bytes column with variable values carries the end offsets slice.
 constexpr uint8_t HAS_END_OFFSETS = 1u << 0;
+// A vector column in an encoding other than f32 carries the encoding byte.
+constexpr uint8_t HAS_VECTOR_ENCODING = 1u << 1;
 // Sparse norm bytes are indexed by docs-with-field rank.
 constexpr uint8_t SPARSE_NORMS = 1u << 0;
 
@@ -234,6 +238,9 @@ void checkHeader(const Errors& errors, const FieldRecordHeader& header, int32_t 
   }
   if (parts.has(FieldPart::OWNERS) && (!parts.has(FieldPart::COLUMN)
       || type != FieldType::VECTOR || !(flags & FieldType::MULTI_VALUED))) errors.invalid("reverse owners on non-multivalue vector");
+  if (parts.has(FieldPart::FILTER) && (type != FieldType::ID || !parts.has(FieldPart::TERMS))) {
+    errors.invalid("id filter without an id dictionary");
+  }
 
   auto storage = FieldType::storage(type);
   bool lexical = storage == FieldType::Storage::TERMS || storage == FieldType::Storage::TEXT;
@@ -415,8 +422,13 @@ public:
     extents.add(io, column.values);
     if (header.type == FieldType::VECTOR) {
       if (column.endOffsets) io.invalid("vector column must use fixed stride");
+      if (!vcodec::valid(column.vectorEncoding)) io.invalid("unknown vector encoding");
       auto stride = bytesStride(column, header.numValues);
-      if (stride <= 0 || stride % sizeof(float)) io.invalid("vector stride must be a positive multiple of float size");
+      if (stride <= 0 || vcodec::dimsFromBytes((VectorEncoding)column.vectorEncoding, stride) <= 0) {
+        io.invalid("vector stride is not a whole vector in the column's encoding");
+      }
+    } else if (column.vectorEncoding) {
+      io.invalid("vector encoding on a non-vector column");
     } else if (column.endOffsets) {
       mono(io, column.endOffsets, header.numValues, "end offsets index layout");
     } else if (bytesStride(column, header.numValues) < 0) {
@@ -471,6 +483,10 @@ public:
         break;
       case FieldPart::OWNERS:
         mono(io, slice, header.numValues, "reverse owners index layout");
+        break;
+      case FieldPart::FILTER:
+        extents.add(io, slice);
+        if (slice.bytes < IdFilter::HEADER_BYTES) io.invalid("id filter size");
         break;
       default: std::unreachable();
     }
@@ -636,15 +652,21 @@ void readOrdColumn(Reader& in, OrdColumn& column, const FieldRecordHeader& heade
 }
 
 void writePart(Writer& out, const BytesColumn& column) {
-  out.writeByte(column.endOffsets ? HAS_END_OFFSETS : 0);
+  out.writeByte((column.endOffsets ? HAS_END_OFFSETS : 0) | (column.vectorEncoding ? HAS_VECTOR_ENCODING : 0));
+  if (column.vectorEncoding) out.writeByte(column.vectorEncoding);
   writeSlice(out, column.values);
   if (column.endOffsets) writeSlice(out, column.endOffsets);
 }
 
 void readPart(Reader& in, BytesColumn& column) {
-  bool hasOffsets = in.readOptions(HAS_END_OFFSETS) & HAS_END_OFFSETS;
+  auto options = in.readOptions(HAS_END_OFFSETS | HAS_VECTOR_ENCODING);
+  if (options & HAS_VECTOR_ENCODING) {
+    // f32 is recorded by leaving the byte out; the shared check validates the rest.
+    column.vectorEncoding = in.readByte();
+    if (!column.vectorEncoding) in.invalid("explicit f32 vector encoding");
+  }
   column.values = readSlice(in);
-  if (hasOffsets) column.endOffsets = readSlice(in);
+  if (options & HAS_END_OFFSETS) column.endOffsets = readSlice(in);
 }
 
 void writePart(Writer& out, const Points& points) {
@@ -709,7 +731,8 @@ constexpr size_t descriptorBytes() {
 
 constexpr std::array partBytes{
     descriptorBytes<Terms>(), size_t(0), descriptorBytes<Points>(), descriptorBytes<Norms>(),
-    descriptorBytes<Stored>(), descriptorBytes<Slice>(), descriptorBytes<Slice>(), descriptorBytes<Slice>()
+    descriptorBytes<Stored>(), descriptorBytes<Slice>(), descriptorBytes<Slice>(), descriptorBytes<Slice>(),
+    descriptorBytes<Slice>()
 };
 static_assert(partBytes.size() == NUM_PARTS);
 
@@ -806,6 +829,7 @@ void outputParts(Writer& out, const IndexFieldInfo& field, PartChecks* checks) {
   if (parts.has(FieldPart::DOCS)) outputSlice(out, checks, FieldPart::DOCS, field.docs);
   if (parts.has(FieldPart::VALUE_RANKS)) outputSlice(out, checks, FieldPart::VALUE_RANKS, field.endValueRanks);
   if (parts.has(FieldPart::OWNERS)) outputSlice(out, checks, FieldPart::OWNERS, field.owners);
+  if (parts.has(FieldPart::FILTER)) outputSlice(out, checks, FieldPart::FILTER, field.idFilter);
 }
 
 } // namespace
@@ -939,6 +963,7 @@ FieldRecordPtr FieldRecordCodec::decode(std::span<const char> bytes, int32_t max
   if (parts.has(FieldPart::DOCS)) read(FieldPart::DOCS);
   if (parts.has(FieldPart::VALUE_RANKS)) read(FieldPart::VALUE_RANKS);
   if (parts.has(FieldPart::OWNERS)) read(FieldPart::OWNERS);
+  if (parts.has(FieldPart::FILTER)) read(FieldPart::FILTER);
   checks.finish(in);
   in.requireEnd();
   return record;

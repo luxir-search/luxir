@@ -264,7 +264,7 @@ private:
     auto& entry = it->second;
     if (inserted) {
       try {
-        entry.input = dir.openFile(file.name);
+        entry.input = dir.openFile(file.name, {.size = file.bytes});
         if (!entry.input) {
           LOG_WARN("source file {} is missing", file.name);
         } else {
@@ -344,7 +344,7 @@ std::string trainSourceDictionary(Directory& dir, const SourceSettings& settings
   uint64_t blocks = 0;
   for (const auto& [name, bytes] : names) {
     try {
-      auto input = dir.openFile(name);
+      auto input = dir.openFile(name, {.size = bytes});
       if (!input) continue;
       auto hold = input->acquire({0, input->size()});
       auto reader = source::FileReader::open(std::string_view(hold.getData(), hold.getLength()));

@@ -943,6 +943,8 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.normalize_on_write, ctx, vit, vend);
           } else if (key == "scale") {
             util::from_json<V>(value.scale, ctx, vit, vend);
+          } else if (key == "encoding") {
+            util::from_json<V>(value.encoding, ctx, vit, vend);
           } else if (key == "ann") {
             util::from_json<V>(value.ann, ctx, vit, vend);
           } else if (key == "ignore_malformed") {

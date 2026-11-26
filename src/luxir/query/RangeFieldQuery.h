@@ -13,6 +13,7 @@
 
 #include "luxir/query/BKDQueryWeight.h"
 #include "luxir/query/RangePointSource.h"
+#include "luxir/query/CatalogPredicates.h"
 #include "luxir/query/Query.h"
 
 namespace luxir {
@@ -91,6 +92,10 @@ public:
   const RangeBoxRelation& getBox() const { return box; }
   const RangeBoxRelation& makeRelation() const { return box; }
   bool isEmpty() const { return false; }
+
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return proof::intervalMatch(view, field, box.lo, box.hi);
+  }
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const RangeFieldQuery&>(other);

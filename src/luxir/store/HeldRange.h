@@ -4,16 +4,28 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <span>
 #include <utility>
+#include <vector>
 
 #include "InputStream.h"
 
 namespace luxir {
 
+// What a range holds. METADATA is what a reader navigates by before it reads
+// data: file headers, the catalog, version runs, term block offsets and tries,
+// the stored-field chunk index, and directories and indexes over column and
+// point blocks. Everything else is DATA. Whoever keeps a hold decides how long
+// it lives; the class is a hint a cache or backend may use for residency and
+// scheduling after release. It never changes the bytes returned.
+enum class ReadClass : uint8_t { DATA, METADATA };
+
 struct ByteRange {
   uint64_t offset = 0;
   uint64_t length = 0;
+  ReadClass readClass = ReadClass::DATA;
 };
 
 inline constexpr size_t kReadSlack = 16;
@@ -72,5 +84,9 @@ public:
   InputStream stream() const & noexcept { return {data, data + length}; }
   InputStream stream() const && = delete;
 };
+
+// Completes a batched acquire exactly once: with one hold per range in the
+// order requested and a null error, or with no holds and the error.
+using AcquireDone = std::function<void(std::vector<HeldRange>&&, std::exception_ptr)>;
 
 } // namespace luxir

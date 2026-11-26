@@ -5,9 +5,24 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace luxir {
+
+// What the first use of a segment overlay does when the overlay's bytes are
+// invalid. Segment overlays open on first use, never with the segment, from
+// files the snapshot opened, and a kind's open reports invalid bytes as
+// SegmentCorruptError. Any other failure (a failed read, running out of
+// memory) fails that use under either policy, and the next use retries.
+enum class OverlayPolicy {
+  // Queries need what the overlay holds: invalid bytes fail every use.
+  REQUIRED,
+  // An accelerator with an exact fallback: an overlay whose bytes are invalid
+  // reads as absent, as on a segment that never had one, and the segment
+  // stays in service.
+  ADVISORY,
+};
 
 /// Read-side handle for one entry in IndexInfo.aux_indexes.  Subclasses own
 /// whatever the underlying aux kind needs to answer queries (e.g. a

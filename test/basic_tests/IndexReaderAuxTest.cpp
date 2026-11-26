@@ -27,8 +27,10 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/server/LuxirNode.h"
+#include "luxir/store/FileIOException.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
+#include "test/StrictStorage.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
@@ -163,7 +165,7 @@ TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
     auto& dir = h.getIndexWriter()->dir;
     auto durable = readDurableIndexInfo(dir);
     auto info = onlyVectorOverlay(durable.info);
-    auto file = dir.openFile(info.files[0].name, true);
+    auto file = dir.openFile(info.files[0].name, {.expectSynced = true});
     auto hold = file->acquire({0, file->size()});
     std::string payload(hold.getData(), hold.getLength());
     auto footer = VectorAuxListsFooter::fromFileTail(payload.data(), payload.size(), info.name);
@@ -182,6 +184,8 @@ TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
       os.close();
       dir.finishFile(*out);
       EXPECT_THROW(VectorAuxReader::open(dir, info, false), std::runtime_error);
+      // Opened for a segment, invalid bytes are that segment's corruption.
+      EXPECT_THROW(VectorAuxReader::open(dir.openFile("invalid-amplitude"), info, "s1"), SegmentCorruptError);
       dir.deleteFile("invalid-amplitude");
     }
   }
@@ -225,6 +229,9 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
           EXPECT_NE(message.find("opaque_meta says " + std::to_string(bits ? changed.rabitqBits : changed.nlist)), std::string::npos);
         }
       }
+      // Opened for a segment, a header found invalid at first search is that segment's corruption.
+      auto owned = VectorAuxReader::open(dir.openFile(copied.files[0].name, {.expectSynced = true}), copied, "s1");
+      EXPECT_THROW(owned->getFaissIndex(), SegmentCorruptError);
     }
     if (ann.codec == api::VectorAnnDef::Codec::RABITQ) {
       auto changed = meta;
@@ -237,7 +244,7 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
     }
     auto healthy = VectorAuxReader::open(dir, original, false);
     EXPECT_NE(healthy->getFaissIndex(), nullptr);
-    auto file = dir.openFile(original.files[0].name, true);
+    auto file = dir.openFile(original.files[0].name, {.expectSynced = true});
     auto hold = file->acquire({0, file->size()});
     std::string payload(hold.getData(), hold.getLength());
     auto footer = VectorAuxListsFooter::fromFileTail(payload.data(), payload.size(), original.name);
@@ -265,7 +272,7 @@ TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
 
-  constexpr int N = 80;
+  constexpr int N = 81;  // odd, so the uint32 id section is padded before the codes
   for (int i = 0; i < N; i++) {
     h.index(flatdoc("id", "doc" + std::to_string(i), "embedding_v",
                     std::vector<float>{(float)(i % 10), (float)(i / 10), 1.0f, 0.5f}));
@@ -286,17 +293,31 @@ TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
 
   std::vector<int> seen(N, 0);
   for (size_t l = 0; l < lists->nlist; l++) {
-    size_t sz = lists->list_size(l);
-    const faiss::idx_t* ids = lists->get_ids(l);
-    for (size_t j = 0; j < sz; j++) {
-      ASSERT_GE(ids[j], 0);
-      ASSERT_LT(ids[j], N);
-      seen[(size_t)ids[j]]++;
+    auto ids = lists->ids32(l);
+    faiss::InvertedLists::ScopedIds wide(lists, l);
+    for (size_t j = 0; j < ids.size(); j++) {
+      ASSERT_LT(ids[j], (uint32_t)N);
+      EXPECT_EQ(wide[j], (faiss::idx_t)ids[j]);
+      EXPECT_EQ(lists->get_single_id(l, j), (faiss::idx_t)ids[j]);
+      seen[ids[j]]++;
     }
   }
   for (int i = 0; i < N; i++) {
     EXPECT_EQ(seen[i], 1) << "valueRank " << i;
   }
+
+  // 81 four-byte ids leave 4 pad bytes before the 8-aligned codes. The 81
+  // one-byte codes end unaligned, so the footer's exact-size check rejects a
+  // file written without that padding.
+  auto& dir = h.getIndexWriter()->dir;
+  auto durable = readDurableIndexInfo(dir);
+  const auto& info = onlyVectorOverlay(durable.info);
+  auto file = dir.openFile(info.files[0].name, {.expectSynced = true});
+  auto hold = file->acquire({0, file->size()});
+  auto footer = VectorAuxListsFooter::fromFileTail(hold.getData(), hold.getLength(), info.name);
+  EXPECT_EQ(footer.ntotal, N);
+  EXPECT_EQ(footer.codeSize, 1);
+  EXPECT_EQ(footer.codesOffset(), footer.idsOffset() + N * sizeof(uint32_t) + 4);
 }
 
 // Pins the per-index RAM contract the memory story relies on: faiss::read_index
@@ -615,8 +636,8 @@ TEST_F(IndexReaderAuxTest, schemaOnlyReaderSharesPhysicalState) {
     auto& next = after->segments()[i];
     EXPECT_EQ(&old.postingsReader(), &next.postingsReader());
     EXPECT_EQ(old.liveDocs(), next.liveDocs());
-    ASSERT_FALSE(old.auxReaders().empty());
-    EXPECT_EQ(old.auxReaders().data(), next.auxReaders().data());
+    ASSERT_FALSE(old.overlays().empty());
+    EXPECT_EQ(old.overlays().data(), next.overlays().data());
   }
   // Populate lazily through the replacement, then observe the same objects
   // through the old reader. This checks sharing of the caches themselves.
@@ -758,4 +779,107 @@ TEST_F(IndexReaderAuxTest, inventoryReopensWithOverlaysAndDeletes) {
   auto after = readDurableIndexInfo(writer->dir);
   expectValidInventory(writer->dir, *after);
   EXPECT_EQ(fileInventory(*before), fileInventory(*after));
+}
+
+namespace {
+
+// The test overlay's policy for one test.
+class OverlayPolicyGuard {
+public:
+  explicit OverlayPolicyGuard(OverlayPolicy policy) { TestOverlayAuxReader::policyForTests = policy; }
+  ~OverlayPolicyGuard() { TestOverlayAuxReader::policyForTests = OverlayPolicy::REQUIRED; }
+};
+
+void commitWithTestOverlay(CollectionHelper& h) {
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+  h.commit({std::string(TestOverlayAuxReader::NAME)});
+}
+
+// Copies the collection's files, with the first byte of the test overlay's file changed.
+void copyWithInvalidOverlay(Directory& dir, RAMDir& copy) {
+  auto durable = readDurableIndexInfo(dir);
+  std::string overlay(durable.info.segments.front().overlays.front().files.front().name);
+  std::vector<Directory::FileInfo> files;
+  dir.listFiles(files);
+  for (const auto& descriptor : files) {
+    auto input = dir.openFile(descriptor.name);
+    auto hold = input->acquire({0, input->size()});
+    std::string bytes(hold.getData(), hold.getLength());
+    if (descriptor.name == overlay) bytes[0] ^= 1;
+    auto file = copy.createFile(descriptor.name);
+    OutputStream out(file.get());
+    out.write(bytes.data(), bytes.size());
+    out.close();
+    copy.finishFile(*file);
+  }
+}
+
+}  // namespace
+
+// The snapshot opens the overlay's file; its reader opens on first use, and a
+// reopen shares the overlay as it is, opened or not.
+TEST_F(IndexReaderAuxTest, overlayOpensOnFirstUse) {
+  CollectionHelper h("main");
+  commitWithTestOverlay(h);
+  auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
+  const auto& segment = reader->segments()[0];
+  ASSERT_EQ(1u, segment.overlays().size());
+  const auto& overlay = segment.overlays()[0];
+  EXPECT_EQ(TestOverlayAuxReader::NAME, overlay->name());
+  EXPECT_FALSE(overlay->isOpen());
+  auto aux = segment.getAuxReader(TestOverlayAuxReader::NAME);
+  ASSERT_NE(nullptr, dynamic_cast<TestOverlayAuxReader*>(aux.get()));
+  EXPECT_TRUE(overlay->isOpen());
+  EXPECT_EQ(aux, segment.getAuxReader(TestOverlayAuxReader::NAME));
+  IndexReader reopened(h.getIndexWriter()->dir, reader.get());
+  EXPECT_EQ(overlay, reopened.segments()[0].overlays()[0]);
+}
+
+// An advisory overlay whose bytes are invalid reads as absent, and stays so.
+TEST_F(IndexReaderAuxTest, advisoryOverlayWithInvalidBytesReadsAsAbsent) {
+  CollectionHelper h("main");
+  commitWithTestOverlay(h);
+  RAMDir copy;
+  copyWithInvalidOverlay(h.getIndexWriter()->dir, copy);
+  OverlayPolicyGuard guard(OverlayPolicy::ADVISORY);
+  IndexReader reader(copy);
+  const auto& segment = reader.segments()[0];
+  ASSERT_EQ(1u, segment.overlays().size());
+  EXPECT_FALSE(segment.overlays()[0]->isUnusable());
+  for (int use = 0; use < 2; ++use) {
+    EXPECT_EQ(nullptr, segment.getAuxReader(TestOverlayAuxReader::NAME));
+    EXPECT_TRUE(segment.overlays()[0]->isUnusable());
+  }
+}
+
+// A required overlay whose bytes are invalid fails its uses as corruption.
+TEST_F(IndexReaderAuxTest, requiredOverlayWithInvalidBytesIsCorruption) {
+  CollectionHelper h("main");
+  commitWithTestOverlay(h);
+  RAMDir copy;
+  copyWithInvalidOverlay(h.getIndexWriter()->dir, copy);
+  IndexReader reader(copy);
+  const auto& segment = reader.segments()[0];
+  for (int use = 0; use < 2; ++use) {
+    EXPECT_THROW(segment.getAuxReader(TestOverlayAuxReader::NAME), SegmentCorruptError);
+  }
+  EXPECT_FALSE(segment.overlays()[0]->isUnusable());
+}
+
+// A failed read fails the use under either policy, and the next use retries.
+TEST_F(IndexReaderAuxTest, overlayReadFailureIsRetried) {
+  CollectionHelper h("main");
+  commitWithTestOverlay(h);
+  auto writer = h.getIndexWriter();
+  for (auto policy : {OverlayPolicy::REQUIRED, OverlayPolicy::ADVISORY}) {
+    OverlayPolicyGuard guard(policy);
+    auto counters = std::make_shared<StrictStorageCounters>();
+    StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters);
+    auto reader = std::make_shared<IndexReader>(dir);
+    const auto& segment = reader->segments()[0];
+    counters->failNextRounds(1);
+    EXPECT_THROW(segment.getAuxReader(TestOverlayAuxReader::NAME), FileIOException);
+    EXPECT_FALSE(segment.overlays()[0]->isOpen());
+    EXPECT_NE(nullptr, dynamic_cast<TestOverlayAuxReader*>(segment.getAuxReader(TestOverlayAuxReader::NAME).get()));
+  }
 }

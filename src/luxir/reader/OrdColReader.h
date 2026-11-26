@@ -140,7 +140,7 @@ public:
     mask = LinearPack::mask32(width);
     blocks = reader.core().slice(ord->values()).data();
     if (auto metadata = fieldInfo.ordBlockMetadata(maxDoc)) {
-      blockMeta = reader.core().slice(metadata).data();
+      blockMeta = reader.core().slice(metadata, ReadClass::METADATA).data();
     }
     endValueRanks = MonoReader::openEndValueRanks(reader, fieldInfo);
   }

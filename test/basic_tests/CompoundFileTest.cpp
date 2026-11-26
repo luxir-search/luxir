@@ -286,7 +286,7 @@ TEST_F(CompoundFileTest, MergeWithDeletesOmitsDensePresenceBitmap) {
   constexpr int32_t missing = numDocs / 2;
   auto words = screaming::FixedBitSet::allocate(numDocs + 1, true);
   screaming::FixedBitSet(words.get(), numDocs + 1).clear(missing);
-  LiveDocs liveDocs(std::move(words), numDocs + 1, numDocs);
+  LiveDocs liveDocs(std::move(words), numDocs + 1, numDocs, liveDocsMemory.sparseRoots);
   std::array<size_t, 2> sizes;
 
   for (bool sparse : {false, true}) {

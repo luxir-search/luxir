@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "CatalogSummaryView.h"
 #include "QueryPrep.h"
 #include "luxir/search/RowRelation.h"
 
@@ -13,6 +14,25 @@ class ToParentQuery final : public Query {
   PlanningContext& source;
   RowRelation& relation;
   RowReduction reduction;
+
+  int32_t childWeightMode(int32_t flags, RowReduction& reduction, float& multiplier) const {
+    if (!(flags & NEED_SCORES) || reduction.kind == RowReduction::NONE) {
+      reduction.kind = RowReduction::FIXED;
+      multiplier = 0;
+    }
+    auto constant = reduction.kind != RowReduction::FIXED
+            && reduction.kind != RowReduction::SUM
+        ? uniformScore(*child) : std::nullopt;
+    if (constant) {
+      // Uniform reductions retain the child's rounding before the multiplier.
+      multiplier = *constant * multiplier;
+      reduction.kind = RowReduction::FIXED;
+    }
+    int32_t childFlags = flags;
+    if (reduction.kind == RowReduction::FIXED) childFlags &= ~(ALLOW_PRUNING | NEED_SCORES);
+    else if (reduction.kind != RowReduction::MAXIMUM || reduction.bounded()) childFlags &= ~ALLOW_PRUNING;
+    return childFlags;
+  }
 
 public:
   // The score every match receives, when the tree alone fixes it exactly.
@@ -26,6 +46,18 @@ public:
   const RowReduction& getReduction() const { return reduction; }
   bool recoverableAsPredicate() const noexcept override { return child->recoverableAsPredicate(); }
 
+  // A parent matches only through at least one matching child row
+  // (min_children >= 1), so a segment without the child space, or whose
+  // child rows the child query cannot match, holds no match.
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    auto rows = view.inSpace(source);
+    if (!rows) {
+      view.prove("nested space absent");
+      return MatchState::EMPTY;
+    }
+    return child->mayMatch(*rows) == MatchState::EMPTY ? MatchState::EMPTY : MatchState::UNKNOWN;
+  }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = (const ToParentQuery&)other;
     return reduction == rhs.reduction && source.topReader.path() == rhs.source.topReader.path()
@@ -36,8 +68,9 @@ public:
         mixHash(Hash::hash(source.topReader.path().data(), source.topReader.path().size()),
             mixHash((int)reduction.kind, mixHash(reduction.min, reduction.max))));
   }
-  void validateLogicalImpl(PlanningContext&, float multiplier) const override {
+  void validateLogicalImpl(PlanningContext& context, float multiplier) const override {
     child->validateLogical(source, reduction.kind != RowReduction::NONE ? multiplier : 1.0f);
+    if (child->mayRequirePreparation()) context.requirePreparation();
   }
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out, const FilterKeyContext& context) const override {
     out.appendKind(getKind());
@@ -94,7 +127,7 @@ public:
         return weight.supplier(pool, segment, child,
             mode == Query::SupplierExecutionMode::RAW_MEMBERSHIP ? nullptr : segment.liveDocSet(), mode);
       }
-      Query::Scorer* createScorer(MemPool& pool, IndexReader::Segment& segment) override {
+      Query::Scorer* createScorerImpl(MemPool& pool, IndexReader::Segment& segment) override {
         return QueryPrep::createScorer(pool, segment, *this);
       }
       PreparedDomainDependence domainDependence() const noexcept override {
@@ -117,22 +150,8 @@ public:
           relation(query.relation),
           reduction(query.reduction), multiplier(constantWhenScored(flags, multiplier)) {
       auto* childContext = Query::Context::create(&context.arena(), query.source);
-      if (!(flags & NEED_SCORES) || reduction.kind == RowReduction::NONE) {
-        reduction.kind = RowReduction::FIXED;
-        this->multiplier = 0;
-      }
-      auto constant = reduction.kind != RowReduction::FIXED
-              && reduction.kind != RowReduction::SUM
-          ? uniformScore(*query.child) : std::nullopt;
-      if (constant) {
-        // Uniform reductions retain the child's rounding before the multiplier.
-        this->multiplier = *constant * this->multiplier;
-        reduction.kind = RowReduction::FIXED;
-      }
-      int32_t childFlags = flags;
-      if (reduction.kind == RowReduction::FIXED) childFlags &= ~(ALLOW_PRUNING | NEED_SCORES);
-      else if (reduction.kind != RowReduction::MAXIMUM || reduction.bounded()) childFlags &= ~ALLOW_PRUNING;
-      child = query.child->createWeight(*childContext, childFlags, 1.0f);
+      int32_t childFlags = query.childWeightMode(flags, reduction, this->multiplier);
+      child = query.child->buildWeight(*childContext, childFlags, 1.0f);
       if (reduction.kind != RowReduction::FIXED && reduction.kind != RowReduction::SUM
           && child->isConstantScoring()) reduction.kind = RowReduction::CONSTANT;
       // Every row of the path is not a set worth materializing or caching.
@@ -151,7 +170,7 @@ public:
       return reduction.kind == RowReduction::FIXED
           ? std::optional<float>(multiplier) : std::nullopt;
     }
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& prepareContext) override {
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& prepareContext) override {
       std::vector<DomainHandle> eligibility;
       std::vector<DocSet*> views;
       if (child->consumesDomain()) {
@@ -182,7 +201,7 @@ public:
       return supplier(pool, segment, input,
           mode == Query::SupplierExecutionMode::RAW_MEMBERSHIP ? nullptr : segment.liveDocSet(), mode);
     }
-    Query::Scorer* createScorer(MemPool& pool, IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(MemPool& pool, IndexReader::Segment& segment) override {
       return QueryPrep::createScorer(pool, segment, *this);
     }
     void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
@@ -190,6 +209,8 @@ public:
     }
     bool hasReleasableSegmentState() const noexcept override { return child->hasReleasableSegmentState(); }
   };
+
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
 
   Query::Weight* createWeight(Context& context, int32_t flags, float multiplier) override;
 };

@@ -6,11 +6,12 @@
 
 namespace luxir {
 
-MonoReader::MonoReader(SegmentCore& core, field_parts::Slice slice, int64_t numValues, PackedTerm field) {
+MonoReader::MonoReader(SegmentCore& core, field_parts::Slice slice, int64_t numValues, PackedTerm field,
+                       ReadClass readClass) {
   if (!slice) return;
   auto split = field_parts::monotonicBlocksBytes(slice, numValues);
   if (!split) SegmentReadContext{&core, field, slice.location.filenum()}.invalid("invalid monotonic index layout");
-  auto bytes = core.slice(slice);
+  auto bytes = core.slice(slice, readClass);
   values = MonoColumn(bytes.data(), bytes.data() + *split, numValues);
 }
 

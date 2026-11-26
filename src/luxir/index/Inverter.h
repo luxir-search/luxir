@@ -113,6 +113,8 @@ public:
   // Populated after flush() if there were deleted documents
   uint64_t liveGen = 0;
   int32_t liveDocs = 0;
+  // Size of the live docs file written for liveGen; 0 when there is none.
+  uint64_t liveDocsBytes = 0;
 
   // Allocates sequence numbers for source files ("v<seq>.<epoch>"): the
   // IndexWriter's durable counter. Required before a segment with sources flushes.

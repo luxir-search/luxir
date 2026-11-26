@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <set>
@@ -11,6 +12,8 @@
 
 namespace luxir::test {
 
+class BatchGate;
+
 enum class StrictWholeFiles { COUNT, DENY };
 
 // Shared by the views of a factory. Parts and accesses are keyed by file name.
@@ -18,9 +21,19 @@ class StrictStorageCounters {
 public:
   struct FileStats {
     uint64_t acquires = 0;
+    uint64_t metadataAcquires = 0;
     uint64_t acquiredBytes = 0;
     uint64_t wholeFileAccesses = 0;
+    uint64_t sizeRequests = 0;  // InputFile::size() calls on files opened without a size.
+    // A submission is one single acquire or one batch, whatever its size,
+    // numbered in issue order across all files. The layer completes inline,
+    // so the numbers show order only, never which requests waited on others.
+    uint64_t batches = 0;
+    uint64_t submissions = 0;
+    uint64_t firstSubmission = 0;
+    uint64_t lastSubmission = 0;
     std::set<std::pair<uint64_t, uint64_t>> parts;
+    std::set<std::pair<uint64_t, uint64_t>> metadataParts;
   };
 
   struct LiveStats {
@@ -33,15 +46,32 @@ public:
 private:
   mutable std::mutex mutex;
   std::map<std::string, FileStats, std::less<>> files;
+  std::map<std::string, std::shared_ptr<BatchGate>, std::less<>> batchGates;
   LiveStats live;
+  uint64_t submissions = 0;
   uint8_t pattern = 0;
+  std::atomic<uint64_t> injectedFailures{0};
 
 public:
   FileStats fileStats(std::string_view name) const;
   LiveStats liveStats() const;
+  uint64_t totalSubmissions() const;
   void logSummary() const;
 
+  // The next `count` rounds (single acquires or batches) throw
+  // FileIOException instead of reaching the delegate, as a failed request would.
+  void failNextRounds(uint64_t count) { injectedFailures.store(count); }
+  bool takeInjectedFailure() noexcept {
+    auto left = injectedFailures.load();
+    while (left && !injectedFailures.compare_exchange_weak(left, left - 1)) {}
+    return left != 0;
+  }
+
   void wholeFile(std::string_view name);
+  void sizeRequested(std::string_view name);
+  // Gate future batches on a named file, including handles already open.
+  void gateBatches(std::string name, std::shared_ptr<BatchGate> gate);
+  std::shared_ptr<BatchGate> submitted(std::string_view name, bool batch);
   uint8_t acquired(std::string_view name, ByteRange range);
   void released(uint64_t length) noexcept;
 };
@@ -55,7 +85,7 @@ public:
                   StrictWholeFiles mode = StrictWholeFiles::COUNT)
       : DelegatingDirectory(std::move(inner)), counters(std::move(counters)), mode(mode) {}
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override;
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) override;
   std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override;
   Capabilities capabilities() const override { return delegate->capabilities() & ~HARD_LINK; }
 };

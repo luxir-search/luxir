@@ -78,7 +78,13 @@ struct Manifest {
         && Postings::parseEpoch(suffix.substr(dot + 1));
   }
 
-  static bool segmentDataFile(std::string_view name) { return sortable(segmentFileSuffix(name)); }
+  // A base segment data file's number, or nullopt for any other name.
+  static std::optional<uint64_t> segmentDataFileNumber(std::string_view name) {
+    auto suffix = segmentFileSuffix(name);
+    if (!sortable(suffix)) return std::nullopt;
+    return Postings::parseSortableString(suffix);
+  }
+  static bool segmentDataFile(std::string_view name) { return segmentDataFileNumber(name).has_value(); }
 
 private:
   static bool sortable(std::string_view text) {
@@ -108,6 +114,8 @@ public:
       if (segment.merge_rows && *segment.merge_rows < segment.max_doc) {
         throw std::runtime_error("Invalid segment merge row count");
       }
+      // Opens verify the catalog against the range's hash, so every segment needs one.
+      if (!segment.catalog.length) throw std::runtime_error("Segment has no catalog range");
     }
     return info;
   }

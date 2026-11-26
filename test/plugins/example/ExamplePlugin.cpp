@@ -37,6 +37,43 @@ public:
   }
 };
 
+// Filter: sets positionLength to 2 on tokens that start with 'x', as a filter
+// emitting a two-word synonym would.
+class Span2Filter : public TokenFilter {
+public:
+  explicit Span2Filter(std::unique_ptr<TokenStream> source) : TokenFilter(std::move(source)) {}
+
+  bool incrementToken() override {
+    if (!source().incrementToken()) return false;
+    if (!token.text.empty() && token.text[0] == 'x') token.positionLength = 2;
+    return true;
+  }
+};
+
+// Filter: rewrites every token to "text|wordClass|script|positionLength", what
+// a downstream plugin filter can read of a token's attributes. wordClass() and
+// script() classify the input word on the first read unless the tokenizer
+// already stored them.
+class DescribeFilter : public TokenFilter {
+  std::string buf;
+
+public:
+  explicit DescribeFilter(std::unique_ptr<TokenStream> source) : TokenFilter(std::move(source)) {}
+
+  bool incrementToken() override {
+    if (!source().incrementToken()) return false;
+    buf.assign(token.text);
+    buf += '|';
+    buf += wordClassName(token.wordClass());
+    buf += '|';
+    buf += scriptName(token.script());
+    buf += '|';
+    buf += std::to_string(token.positionLength);
+    token.text = buf;
+    return true;
+  }
+};
+
 // Char filter: removes every 'x'. The base class records each deletion, so
 // token offsets map back to the source.
 class StripXFilter : public CharFilter {
@@ -55,6 +92,23 @@ void noParams(const api::AnalyzerComponent& def) {
 class ExamplePlugin : public Plugin {
 public:
   static inline std::atomic<bool> throwOnNodeStateCreation{false};
+
+  static void registerFilter(Registries& r, std::string name,
+                             std::unique_ptr<TokenStream> (*make)(std::unique_ptr<TokenStream>)) {
+    r.analysis.addFilter(name, [name, make](const api::AnalyzerComponent& def) {
+      noParams(def);
+      struct Factory : TokenFilterFactory {
+        std::unique_ptr<TokenStream> (*make)(std::unique_ptr<TokenStream>);
+        std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
+          return make(std::move(source));
+        }
+      };
+      auto factory = std::make_unique<Factory>();
+      factory->name = name;
+      factory->make = make;
+      return std::unique_ptr<TokenFilterFactory>(std::move(factory));
+    });
+  }
 
   PluginInfo info() const override { return {"example", "1.0", "exercises the plugin framework"}; }
 
@@ -95,6 +149,13 @@ public:
     example.filters = filters;
     r.analysis.addAnalyzer("example", example);
 
+    registerFilter(r, "span2", [](std::unique_ptr<TokenStream> source) -> std::unique_ptr<TokenStream> {
+      return std::make_unique<Span2Filter>(std::move(source));
+    });
+    registerFilter(r, "describe", [](std::unique_ptr<TokenStream> source) -> std::unique_ptr<TokenStream> {
+      return std::make_unique<DescribeFilter>(std::move(source));
+    });
+
     r.storage.addBackend("counting_ram", [](const StorageContext& ctx) -> std::unique_ptr<DirectoryFactory> {
       return std::make_unique<CountingRamBackend>(ctx);
     });
@@ -115,6 +176,7 @@ public:
     r.query.add("field_value_alias", ::example::fieldValueDef());
     r.query.add("unscoped_value", ::example::unscopedDef());
     r.searchOps.add("sample_docs", ::example::makeSampleDocs);
+    r.searchOps.add("query_count", ::example::makeQueryCount);
     // Adds a "label" column holding the configured text to every emitted hit.
     r.hitDecorators.add("label", [](DecoratorContext&, const ParamReader& params) {
       struct Label : HitDecorator {
@@ -134,10 +196,15 @@ public:
       return label;
     });
     // A request-wide term summary, collected once during serial planning.
-    r.hitDecorators.add("ranking_terms", [](DecoratorContext& ctx, const ParamReader&) {
+    r.hitDecorators.add("ranking_terms", [](DecoratorContext&, const ParamReader&) {
       struct Terms : HitDecorator, QueryVisitor {
         std::string text;
         std::string_view columnName() const override { return "ranking_terms"; }
+        void bind(std::span<const QuerySource> sources) override {
+          for (const auto& source : sources) {
+            if (source.query) source.query->visit(*this, source.context);
+          }
+        }
         QueryVisitor* sub(Occur occur, const Query&) override {
           return occur == Occur::MUST || occur == Occur::SHOULD ? this : nullptr;
         }
@@ -156,11 +223,7 @@ public:
           }
         }
       };
-      auto terms = std::make_shared<Terms>();
-      for (const auto& source : ctx.queries) {
-        if (source.query) source.query->visit(*terms, source.context);
-      }
-      return terms;
+      return std::make_shared<Terms>();
     });
     r.http.add("GET", "/_plugins/example/ping", [](HttpPluginRequest& request, HttpPluginResponse& response) {
       request.node.pluginState<::example::NodeState>("example")->routes++;

@@ -19,6 +19,8 @@ class ConstantScoreQuery final : public luxir::Query {
   Query* child;
   ScoreProfile profile;
 
+  static int32_t childFlags(int32_t flags) { return flags & ~NEED_SCORES; }
+
   // setMinCompetitiveScore is not forwarded to the child: it was built
   // scoreless, so the wrapper owns all score semantics. The exhaustion
   // latch is honored here (unlike leaf constant scorers) because the branch
@@ -234,6 +236,10 @@ public:
       std::string_view field) const override {
     return child->requiredValueEnvelope(field);
   }
+
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return child->mayMatch(view);
+  }
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     if (!std::isfinite(profile.value)) {
@@ -246,6 +252,8 @@ public:
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
   }
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
+
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
 
@@ -264,7 +272,7 @@ public:
       Prepared(QueryPrep::PreparedSource&& child, float constantScore, bool needsScores)
         : child(std::move(child)), constantScore(constantScore), needsScores(needsScores) {}
 
-      Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+      Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) override {
         auto* childScorer = QueryPrep::createScorer(targetPool, segment, child.segmentSource());
         if (childScorer == nullptr) return nullptr;
         return targetPool.make<ConstantScoreQuery::Scorer>(childScorer, constantScore);
@@ -302,7 +310,7 @@ public:
       : Query::Weight(context, query, flags),
         constantScore(constantWhenScored(flags, multiplier, query.getConstantScore())) {
       // The child constrains matches; this wrapper replaces its score.
-      childWeight = query.child->createWeight(context, flags & ~NEED_SCORES, 1.0f);
+      childWeight = query.child->buildWeight(context, childFlags(flags), 1.0f);
       // The wrapper is constant-scoring; prepare still follows the child.
       traits |= IS_CONSTANT_SCORING
           | (childWeight->getFlags() & (NEEDS_PREPARE | CONSUMES_DOMAIN | OBSERVED_FILTER_CACHE));
@@ -312,7 +320,7 @@ public:
       return constantScore;
     }
 
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& ctx) override {
       QueryPrep::PreparedSource source;
       source.weight = childWeight;
       if (childWeight->needsPrepare()) {
@@ -321,7 +329,7 @@ public:
       return std::make_unique<Prepared>(std::move(source), constantScore, needsScores());
     }
 
-    Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) override {
       auto* childScorer = QueryPrep::createScorer(targetPool, segment, *childWeight);
       if (childScorer == nullptr) return nullptr;
       return targetPool.make<ConstantScoreQuery::Scorer>(childScorer, constantScore);
@@ -345,7 +353,7 @@ public:
       return childWeight->hasReleasableSegmentState();
     }
 
-    CountShortcut countShortcut(
+    CountShortcut countShortcutImpl(
         IndexReader::Segment& segment, DocSet* domain) override {
       return childWeight->countShortcut(segment, domain);
     }

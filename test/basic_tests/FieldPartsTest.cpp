@@ -346,9 +346,9 @@ class ProtectedDirectory : public DelegatingDirectory {
 public:
   using DelegatingDirectory::DelegatingDirectory;
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced) override {
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options) override {
     if (sealed) throw std::runtime_error("unexpected segment file open");
-    auto source = delegate->openFile(name, expectSynced);
+    auto source = delegate->openFile(name, options);
     if (!source) return nullptr;
     auto hold = source->acquire({0, source->size()});
     auto file = std::make_shared<ProtectedInputFile>(std::string_view(hold.bytes()));
@@ -690,7 +690,19 @@ TEST_P(FieldPartsTest, IndexAndColumnSlices) {
     reject("vec", [&](auto& record) { record.field.bytes.endOffsets = vectors.endValueRanks; },
            "vector column must use fixed stride");
     reject("vec", [](auto& record) { record.field.bytes.values.bytes = 3; },
-           "vector stride must be a positive multiple of float size");
+           "vector stride is not a whole vector in the column's encoding");
+    reject("vec", [](auto& record) { record.field.bytes.vectorEncoding = (uint8_t)VectorEncoding::BIT + 1; },
+           "unknown vector encoding");
+    reject("bytes", [](auto& record) { record.field.bytes.vectorEncoding = (uint8_t)VectorEncoding::F16; },
+           "vector encoding on a non-vector column");
+    reject("vec", [](auto& record) {
+      record.field.bytes.vectorEncoding = (uint8_t)VectorEncoding::F16;
+      record.field.bytes.values.bytes = 7;
+    }, "vector stride is not a whole vector in the column's encoding");
+    reject("vec", [](auto& record) {
+      record.field.bytes.vectorEncoding = (uint8_t)VectorEncoding::SQ8;
+      record.field.bytes.values.bytes = vcodec::SQ8_HEADER_BYTES;
+    }, "vector stride is not a whole vector in the column's encoding");
     reject("ord", [](auto& record) {
       record.field.header.parts.set(FieldPart::TERMS, false);
       record.field.header.indexedTotals = {};

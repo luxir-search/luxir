@@ -72,6 +72,8 @@ public:
 
   // Reads and verifies `name`; throws std::runtime_error when it is damaged or inconsistent.
   static SourceMap read(Directory& dir, const std::string& name, int32_t maxDoc);
+  // As above, from `file`, an open handle on `name`.
+  static SourceMap read(InputFile& file, const std::string& name, int32_t maxDoc);
 };
 
 }  // namespace luxir

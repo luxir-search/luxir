@@ -16,6 +16,7 @@
 #include "Query.h"
 #include "luxir/reader/NormsReader.h"
 #include "luxir/reader/PosEnum.h"
+#include "CatalogPredicates.h"
 
 namespace luxir {
 
@@ -337,6 +338,14 @@ public:
   [[nodiscard]] std::span<const int32_t> getPositions() const { return positions; }
   [[nodiscard]] int32_t getSlop() const { return slop; }
 
+  // A phrase needs every term: one provably absent term empties the segment.
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    for (std::string_view term : terms) {
+      if (proof::termMatch(view, field, term) == MatchState::EMPTY) return MatchState::EMPTY;
+    }
+    return MatchState::UNKNOWN;
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
@@ -349,6 +358,8 @@ public:
     out.appendInt32(slop);
     return FilterKeyScope::SEGMENT_STABLE;
   }
+
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
 
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
@@ -735,7 +746,7 @@ public:
 
     };
 
-    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+    CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
       if (cachedFieldInfo == nullptr) return {0, CountHow::METADATA};
       int64_t ceiling = segment.maxDoc();
       for (auto* info : cachedTermInfos) {
@@ -751,7 +762,7 @@ public:
       return targetPool.make<Supplier>(*this, segment);
     }
 
-    Query::Scorer* createScorer(
+    Query::Scorer* createScorerImpl(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       auto* supplier = scorerSupplier(targetPool, segment);
       Query::PlanContext planContext = scorerBuildContext(

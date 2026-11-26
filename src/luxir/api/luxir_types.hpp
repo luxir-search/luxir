@@ -129,7 +129,8 @@ namespace CalendarGap_ {
 enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR = 5 };
 }
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
-enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
+enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3, HAMMING = 4 };
+enum class VectorEncoding { F32 = 0, F16 = 1, BF16 = 2, SQ8 = 3, BIT = 4 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
 enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64_STR_BIT = 2, ESTIMATE_COUNT_BIT = 3, DECIMAL_SCALED_BIT = 4 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
@@ -302,6 +303,7 @@ struct FieldDef {
   using LongTerms = luxir::api::FieldDef_::LongTerms;
   using DateUnit = luxir::api::FieldDef_::DateUnit;
   using Metric = luxir::api::VectorMetric;
+  using Encoding = luxir::api::VectorEncoding;
   std::string_view parent;
   std::optional<AnalyzerDef> analyzer;                          // align 8
   std::optional<std::string_view> stored_resource;
@@ -317,6 +319,7 @@ struct FieldDef {
   std::optional<std::int32_t> dims;                             // align 4
   std::optional<std::int32_t> truncate_dims;                    // align 4
   std::optional<Metric> metric;                                 // align 4 (enum)
+  std::optional<Encoding> encoding;                             // align 4 (enum)
   std::optional<MultiMode> multi;
   std::optional<bool> column;                                   // align 1 (optional<bool>s)
   std::optional<bool> stored;
@@ -416,6 +419,8 @@ struct MemoryStats {
   uint64_t node_budget_bytes = 0;
   uint64_t search_request_limit_bytes = 0;
   uint64_t schema_cache_bytes = 0;
+  uint64_t live_docs_heaps = 0;
+  uint64_t live_docs_heap_bytes = 0;
 };
 struct StatsTotals {
   uint64_t collections = 0;

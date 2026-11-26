@@ -126,10 +126,14 @@ void SourceMap::write(Directory& dir, const std::string& name, std::vector<std::
 }
 
 SourceMap SourceMap::read(Directory& dir, const std::string& name, int32_t maxDoc) {
-  auto bad = [&](const char* why) { return std::runtime_error("source map " + name + ": " + why); };
   auto file = dir.openFile(name);
-  if (!file) throw bad("missing");
-  auto hold = file->acquire({0, file->size()});
+  if (!file) throw std::runtime_error("source map " + name + ": missing");
+  return read(*file, name, maxDoc);
+}
+
+SourceMap SourceMap::read(InputFile& file, const std::string& name, int32_t maxDoc) {
+  auto bad = [&](const char* why) { return std::runtime_error("source map " + name + ": " + why); };
+  auto hold = file.acquire({0, file.size(), ReadClass::METADATA});
   std::string_view data(hold.getData(), hold.getLength());
   constexpr size_t fixed = 8 + 8 + 4 + 4;
   if (data.size() < fixed + 8 || data.substr(0, 8) != Postings::LUXIR_HEADER) throw bad("not a source map");

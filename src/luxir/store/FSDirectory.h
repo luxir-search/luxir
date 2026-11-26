@@ -424,8 +424,8 @@ public:
               [](const FileInfo& a, const FileInfo& b) { return a.name < b.name; });
   }
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
-    unused(expectSynced);
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) override {
+    unused(options);
     auto path = filePath(name);
     // Only absence is a null result; an unreadable file is an error, never
     // evidence that the file does not exist.
