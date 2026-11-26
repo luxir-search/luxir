@@ -84,7 +84,7 @@ protected:
 TEST_F(NestedQueryTest, implicitExplicitAndSingletonGroupHaveOneIdentityAndCacheEntry) {
   auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
       .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 2});
-  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.testSetFilterCache(cache);
   auto req = localReq(helper.getSearchEngine());
   auto explicitQuery = qb::toParent(req->mr, "items", qb::match(req->mr, "color", "red"));
   auto* explicitTree = parse(*req, explicitQuery);
@@ -116,7 +116,7 @@ TEST_F(NestedQueryTest, ownerProductionDoesNotFundChildExperiments) {
   // Whole-owner production excludes child observations; owner hits skip the child.
   auto cache = std::make_shared<FilterCache>(FilterCacheConfig{
       .maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 1});
-  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.testSetFilterCache(cache);
   for (int round = 0; round < 4; round++) {
     EXPECT_EQ(3, count("items.color:red", false, true));
     EXPECT_EQ(4, count("items.size:L", false, true));

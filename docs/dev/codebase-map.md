@@ -38,6 +38,12 @@ locations, browse `src/luxir/<area>/`.
 2. **Search Engine** (`src/luxir/search/`)
    - `ReaderManager`: Per-collection snapshot publication, reader refresh, and filter cache;
      searches do not require an `IndexWriter`. Schema-only snapshots share physical cores.
+     Publishers `prepare()` the reader and `publish()` it before advertising the snapshot,
+     so `getReader` normally returns from its lock-free path. `prepare()` takes no lock;
+     `publish()` holds `indexReaderMutex` only for the swap. When that open was skipped
+     (no search within `idleAfterUs`, a writer reopening an existing index) or failed,
+     one search reopens under `indexReaderMutex`; requests the old reader satisfies
+     (freshness and schema) keep it, the rest wait (`READER_WAIT`).
    - `ResolvedSchema.cpp`: Declared representations and segment-generation coverage
    - `IndexReader` is a view of one path in a snapshot, with a leaf per bundle;
      a reopen shares each unchanged `SegmentCore`, live docs and overlay with the

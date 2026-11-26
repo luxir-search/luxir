@@ -619,7 +619,14 @@ TEST_F(ReplicationHttpTest, createSchemaAndSearchReturnPublicationTokens) {
   EXPECT_EQ(initial, collection->getShard()->requireIndexWriter()->initialCommit());
   auto reader = collection->getReaderManager().getReader(0);
   CollectionHelper helper(*node, "tokens");
-  ASSERT_TRUE(helper.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success);
+  {
+    // The commit's reader fails to open, so a tolerant search keeps the old one.
+    Signal::listen("indexReaderPreparing", [](void*, void*, void*) -> void* {
+      throw std::runtime_error("injected publication open failure");
+    });
+    auto unlisten = scope_guard([] { Signal::unlisten("indexReaderPreparing"); });
+    ASSERT_TRUE(helper.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success);
+  }
   auto search = get("/collections/tokens/_search?freshness_ms=60000");
   ASSERT_EQ(200, search.result_int()) << search.body();
   ASSERT_FALSE(glz::read_json(result, search.body()));

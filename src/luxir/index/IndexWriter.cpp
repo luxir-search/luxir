@@ -2611,11 +2611,27 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       lastCommitTime = info.commit_time;
       commitCount.fetch_add(1, std::memory_order_relaxed);
     }
+    // Open the reader on the publishing thread (the commit node or the schema
+    // caller), once durable so a failed publication does not pay for it, and
+    // before advertising, so searches find it on their lock-free path. An idle
+    // collection skips it and its next search reopens. Best-effort and
+    // nothrow: on failure searches reopen.
+    std::shared_ptr<IndexReader> opened;
+    auto& readers = snapshots.readers;
+    if (!readers.isClosed() && readers.searchedRecently()) {
+      try {
+        opened = readers.prepare(*snapshot);
+      } catch (const std::exception& e) {
+        if (!readers.isClosed()) LOG_WARN("Reader open on publication failed; searches will reopen: {}", e.what());
+      } catch (...) {
+        if (!readers.isClosed()) LOG_WARN("Reader open on publication failed; searches will reopen: unknown exception");
+      }
+    }
     // The remaining stores/notification do not throw. Advance registry formats
     // first, so observing the new schema cannot admit an old-format CAS.
     if (dictionarySlots) storedDictionaries.setSchema(std::move(*dictionarySlots));
     lastSnapshot.store(snapshot);
-    snapshots.publish(snapshot);
+    snapshots.publish(snapshot, std::move(opened));
   } catch (...) {
     if (durable || stateAttempted) {
       try { throw; } catch (const WriterSupersededError&) {

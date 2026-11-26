@@ -354,10 +354,10 @@ TEST_F(IndexFormatTest, catalogSurvivesPublicationDeleteAndMerge) {
   ASSERT_TRUE(snapshot);
   ASSERT_EQ(2u, snapshot->openCores.size());
   ASSERT_TRUE(snapshot->openCores.back().expired());
-  // Merge admission must open this segment while holding the writer mutex.
+  // Publication opened the new segment's reader off the search path.
   auto published = writer->snapshots.readers.indexReader.load();
   ASSERT_TRUE(published);
-  ASSERT_EQ(nullptr, published->findSegment(durable->segments.back().seg_id));
+  ASSERT_NE(nullptr, published->findSegment(durable->segments.back().seg_id));
   writer->mergeSegments();
   durable = readDurableIndexInfo(writer->dir);
   ASSERT_EQ(1u, durable->segments.size());

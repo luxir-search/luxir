@@ -94,7 +94,8 @@ void service(Renderer& r, const api::ServiceStats& s) {
               (double)count, PrometheusText::label("kind", kind));
   r.counter("luxir_ingest_delete_ids_total", "Accepted delete IDs, not the number of matching documents removed.", (double)s.delete_ids_accepted);
   for (auto [kind, activity] : {std::pair{"flush", &s.flush}, {"commit", &s.commit}, {"delete_pass", &s.delete_pass}, {"merge", &s.merge},
-                                {"vector_build", &s.vector_build}, {"reader_refresh", &s.reader_refresh}})
+                                {"vector_build", &s.vector_build}, {"reader_refresh", &s.reader_refresh},
+                                {"reader_wait", &s.reader_wait}})
     r.activity("luxir_background", "luxir_background_duration_seconds", *activity, s.background_duration_bounds,
                PrometheusText::label("kind", kind));
   r.gauge("luxir_control_threads", "Control executor threads (administration, replication transfers, detailed stats).", (double)s.control_threads);
