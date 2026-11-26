@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -30,6 +31,9 @@
 #include "luxir/store/FileIOException.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
+#include "test/KnnTestUtils.h"
+#include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "test/StrictStorage.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
@@ -151,7 +155,7 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   EXPECT_EQ(idx->metric_type, faiss::METRIC_L2);
 }
 
-TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
+TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnFirstListUse) {
   IvfTestGuard guard;
   for (int bits : {1, 4}) {
     CollectionHelper h("main");
@@ -183,9 +187,19 @@ TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
       os.write(payload.data(), payload.size());
       os.close();
       dir.finishFile(*out);
-      EXPECT_THROW(VectorAuxReader::open(dir, info, false), std::runtime_error);
+      std::string synced[] = {"invalid-amplitude"};
+      dir.sync(synced);
+      // Opening reads no amplitudes; the first scan of the list rejects them.
+      auto aux = VectorAuxReader::open(dir, info, false);
+      const auto& lists = aux->getLists();
+      size_t list = 0;
+      while (lists.list_size(list) == 0) list++;
+      EXPECT_THROW(HeldInvertedLists::Amplitudes(lists, list), std::runtime_error);
+      aux.reset();
       // Opened for a segment, invalid bytes are that segment's corruption.
-      EXPECT_THROW(VectorAuxReader::open(dir.openFile("invalid-amplitude"), info, "s1"), SegmentCorruptError);
+      auto inSegment = VectorAuxReader::open(dir.openFile("invalid-amplitude"), info, "s1");
+      EXPECT_THROW(HeldInvertedLists::Amplitudes(inSegment->getLists(), list), SegmentCorruptError);
+      inSegment.reset();
       dir.deleteFile("invalid-amplitude");
     }
   }
@@ -207,15 +221,17 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
     const auto& original = onlyVectorOverlay(durable.info);
     auto meta = VectorAuxMeta::fromBytes(std::string_view(
         (const char*)original.opaque_meta.data(), original.opaque_meta.size()), original.name);
-    for (bool bits : {false, true}) {
-      if (bits && ann.codec == api::VectorAnnDef::Codec::PQ) continue;
-      auto changed = meta;
-      if (bits) changed.rabitqBits++;
-      else changed.nlist++;
-      std::string bytes = changed.toBytes();
+    auto withMeta = [&](const VectorAuxMeta& changed, std::string& bytes) {
+      bytes = changed.toBytes();
       auto copied = original;
       copied.opaque_meta = std::as_bytes(std::span(bytes.data(), bytes.size()));
-      auto aux = VectorAuxReader::open(dir, copied, false);
+      return copied;
+    };
+    if (ann.codec == api::VectorAnnDef::Codec::RABITQ) {
+      auto changed = meta;
+      changed.rabitqBits++;
+      std::string bytes;
+      auto aux = VectorAuxReader::open(dir, withMeta(changed, bytes), false);
       // callOnce retries must leave the partially loaded index safe.
       for (int attempt = 0; attempt < 2; attempt++) {
         try {
@@ -223,23 +239,37 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
           FAIL() << "Accepted mismatched metadata";
         } catch (const std::runtime_error& e) {
           std::string message = e.what();
-          EXPECT_NE(message.find(bits ? "RaBitQ bits mismatch" : "nlist mismatch"), std::string::npos);
+          EXPECT_NE(message.find("RaBitQ bits mismatch"), std::string::npos);
           EXPECT_NE(message.find(original.name), std::string::npos);
-          EXPECT_NE(message.find("index has " + std::to_string(bits ? meta.rabitqBits : meta.nlist)), std::string::npos);
-          EXPECT_NE(message.find("opaque_meta says " + std::to_string(bits ? changed.rabitqBits : changed.nlist)), std::string::npos);
+          EXPECT_NE(message.find("index has " + std::to_string(meta.rabitqBits)), std::string::npos);
+          EXPECT_NE(message.find("opaque_meta says " + std::to_string(changed.rabitqBits)), std::string::npos);
         }
       }
       // Opened for a segment, a header found invalid at first search is that segment's corruption.
+      auto copied = withMeta(changed, bytes);
       auto owned = VectorAuxReader::open(dir.openFile(copied.files[0].name, {.expectSynced = true}), copied, "s1");
       EXPECT_THROW(owned->getFaissIndex(), SegmentCorruptError);
+    }
+    // The metadata places the header and the list sizes; the footer must agree.
+    for (bool header : {false, true}) {
+      auto changed = meta;
+      if (header) changed.faissHeaderBytes += 8;
+      else changed.nlist++;
+      std::string bytes;
+      try {
+        VectorAuxReader::open(dir, withMeta(changed, bytes), false);
+        FAIL() << "Accepted mismatched metadata";
+      } catch (const std::runtime_error& e) {
+        std::string message = e.what();
+        EXPECT_NE(message.find("does not match opaque_meta"), std::string::npos) << message;
+        EXPECT_NE(message.find(original.name), std::string::npos);
+      }
     }
     if (ann.codec == api::VectorAnnDef::Codec::RABITQ) {
       auto changed = meta;
       changed.rotationKind = 99;
-      std::string bytes = changed.toBytes();
-      auto copied = original;
-      copied.opaque_meta = std::as_bytes(std::span(bytes.data(), bytes.size()));
-      auto aux = VectorAuxReader::open(dir, copied, false);
+      std::string bytes;
+      auto aux = VectorAuxReader::open(dir, withMeta(changed, bytes), false);
       EXPECT_THROW(aux->getFaissIndex(), std::runtime_error);
     }
     auto healthy = VectorAuxReader::open(dir, original, false);
@@ -261,9 +291,9 @@ TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
   }
 }
 
-// mmap residency: only the IVF header (coarse quantizer + PQ codebooks) is
-// deserialized into RAM; the list payloads are served zero-copy from the aux
-// file's memory view through MmapInvertedLists.  Guards against silently
+// Residency: only the IVF header (coarse quantizer + PQ codebooks) is
+// deserialized into RAM; the list payloads are read from the aux file
+// through HeldInvertedLists.  Guards against silently
 // falling back to a RAM-resident ArrayInvertedLists, and verifies the list
 // payloads written in Luxir's own layout round-trip (every segment-local
 // valueRank appears exactly once across the lists).
@@ -287,13 +317,13 @@ TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
 
   auto* ivf = dynamic_cast<faiss::IndexIVF*>(vaux->getFaissIndex());
   ASSERT_NE(ivf, nullptr);
-  auto* lists = dynamic_cast<MmapInvertedLists*>(ivf->invlists);
+  auto* lists = dynamic_cast<HeldInvertedLists*>(ivf->invlists);
   ASSERT_NE(lists, nullptr);  // ArrayInvertedLists here = deserialized copy
   EXPECT_EQ((int64_t)lists->compute_ntotal(), (int64_t)N);
 
   std::vector<int> seen(N, 0);
   for (size_t l = 0; l < lists->nlist; l++) {
-    auto ids = lists->ids32(l);
+    HeldInvertedLists::Ids ids(*lists, l);
     faiss::InvertedLists::ScopedIds wide(lists, l);
     for (size_t j = 0; j < ids.size(); j++) {
       ASSERT_LT(ids[j], (uint32_t)N);
@@ -318,6 +348,71 @@ TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
   EXPECT_EQ(footer.ntotal, N);
   EXPECT_EQ(footer.codeSize, 1);
   EXPECT_EQ(footer.codesOffset(), footer.idsOffset() + N * sizeof(uint32_t) + 4);
+}
+
+// A cold kNN query on lazily read storage: the overlay's open acquires its
+// footer, FAISS header and list sizes in one round, the scan acquires the
+// probed lists in one more, and no whole file is read. Lists are held only
+// while the query searches. Under deletes, the round that reads the ids for
+// live list sizes also holds the codes, so the count stays the same.
+TEST_F(IndexReaderAuxTest, coldKnnHoldsOnlyProbedListsWhileSearching) {
+  IvfTestGuard guard;
+  ForceIvfGuard ivf;
+  CollectionHelper h("main");
+  enableL2OnVecSuffix(h.collection(), rabitqAnn(16), 4);
+  for (int i = 0; i < 400; i++) {
+    h.index(flatdoc("id", std::to_string(i), "embedding_v",
+                    std::vector<float>{(float)(i % 20), (float)(i / 20), 1.0f, 0.5f}));
+  }
+  h.commit({"*"});
+  auto writer = h.getIndexWriter();
+  auto durable = readDurableIndexInfo(writer->dir);
+  const auto& overlay = onlyVectorOverlay(durable.info);
+  const auto& file = overlay.files[0];
+  // The list layout, read from an uncounted open of the same file.
+  auto layout = VectorAuxReader::open(writer->dir, overlay, false);
+  const auto& lists = layout->getLists();
+  for (bool deletes : {false, true}) {
+    if (deletes) {
+      ASSERT_TRUE(h.deleteByIds({"7", "8", "9"}, UpdateMessage::COMMIT).success);
+    }
+    auto counters = std::make_shared<StrictStorageCounters>();
+    StrictDirectory dir(std::shared_ptr<Directory>(writer, &writer->dir), counters, StrictWholeFiles::DENY);
+    auto reader = std::make_shared<IndexReader>(dir);
+    auto req = localReq(h.getSearchEngine());
+    auto& cur = req->topDocs();
+    cur.limit(5).fields({"id"});
+    cur.rawQuery() = qb::knn(cur.mr(), "embedding_v", {3, 7, 1, 0.5f}, 5, /*nprobe=*/2);
+    req->execute(reader);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(5u, req->getDocs().size());
+    auto stats = counters->fileStats(file.name);
+    EXPECT_EQ(0u, stats.wholeFileAccesses);
+    EXPECT_EQ(2u, stats.submissions);
+    EXPECT_EQ(stats.submissions, stats.batches);
+    uint64_t bytes = 0;
+    for (auto [offset, length] : stats.parts) bytes += length;
+    EXPECT_LT(bytes, file.size / 2);
+    // Every part beyond the open's metadata is one section of one list, and
+    // the query touched only a few of the lists.
+    std::set<size_t> touched;
+    for (auto part : stats.parts) {
+      if (stats.metadataParts.contains(part)) continue;
+      bool found = false;
+      for (size_t list = 0; list < lists.nlist && !found; list++) {
+        for (auto section : {HeldInvertedLists::IDS, HeldInvertedLists::CODES, HeldInvertedLists::AMPLITUDES}) {
+          ByteRange range = lists.rangeOf(list, section);
+          if (range.length > 0 && range.offset == part.first && range.length == part.second) found = true;
+        }
+        if (found) touched.insert(list);
+      }
+      EXPECT_TRUE(found) << "part [" << part.first << ", +" << part.second << ") is not a list section";
+    }
+    EXPECT_FALSE(touched.empty());
+    EXPECT_LT(touched.size(), lists.nlist / 2);
+    EXPECT_GT(stats.peakLiveHolds, 0u);
+    EXPECT_EQ(0u, stats.liveHolds);
+  }
 }
 
 // Pins the per-index RAM contract the memory story relies on: faiss::read_index

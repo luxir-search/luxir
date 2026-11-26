@@ -99,7 +99,7 @@ public:
 // faiss::write_index, so the serialized blob carries only the index "header"
 // (params + coarse quantizer + PQ codebooks); the list payloads are written
 // separately in Luxir's own layout (VectorAuxListsFooter) and served
-// zero-copy from the mmapped file by MmapInvertedLists at read time.  RAII:
+// from the file by HeldInvertedLists at read time.  RAII:
 // the real lists pointer is restored even if write_index throws (the index
 // must never own the stack-resident empty lists).
 struct EmptyInvlistsSwap {
@@ -684,12 +684,12 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   outFilesToSync.push_back(faissFile);
 
   FileDescriptor descriptor;
+  int64_t faissHeaderBytes;
   {
     auto file = dir_.createFile(faissFile);
     OutputStream os;
     os.setFile(&*file);
     FaissOutAdapter adapter(os);
-    int64_t faissHeaderBytes;
     {
       EmptyInvlistsSwap swap(*index);
       faiss::write_index(index.get(), &adapter);
@@ -774,6 +774,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     meta.rabitqBits = rabitq ? rabitqBits : 0;
     meta.rotationKind = rabitq ? VectorRotation::FHT_KAC : 0;
     meta.rotationSeed = rabitq ? RABITQ_ROTATION_SEED : 0;
+    meta.faissHeaderBytes = faissHeaderBytes;
     std::string bytes = meta.toBytes();
     info.opaque_meta.assign((const std::byte*)bytes.data(),
                             (const std::byte*)bytes.data() + bytes.size());

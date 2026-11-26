@@ -32,6 +32,8 @@ public:
     uint64_t submissions = 0;
     uint64_t firstSubmission = 0;
     uint64_t lastSubmission = 0;
+    uint64_t liveHolds = 0;
+    uint64_t peakLiveHolds = 0;
     std::set<std::pair<uint64_t, uint64_t>> parts;
     std::set<std::pair<uint64_t, uint64_t>> metadataParts;
   };
@@ -73,7 +75,7 @@ public:
   void gateBatches(std::string name, std::shared_ptr<BatchGate> gate);
   std::shared_ptr<BatchGate> submitted(std::string_view name, bool batch);
   uint8_t acquired(std::string_view name, ByteRange range);
-  void released(uint64_t length) noexcept;
+  void released(std::string_view name, uint64_t length) noexcept;
 };
 
 class StrictDirectory : public DelegatingDirectory {

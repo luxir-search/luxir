@@ -32,6 +32,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
 #include "Query.h"
@@ -45,6 +46,7 @@
 #include "luxir/reader/OwnershipMapper.h"
 #include "luxir/search/OwnershipRelation.h"
 #include "luxir/reader/RowReadAhead.h"
+#include "luxir/store/AcquireJoin.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/query/VectorEngine.h"
@@ -1362,7 +1364,7 @@ public:
             .ivfEngine = std::make_unique<SegmentIvfScanner<Groups, Owned>>(
                 *ivf, (int32_t)i, seg, v2dPerSeg[i], domain, rankLivePerSeg[i],
                 metric, query.groups, PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits},
-                vaux->getLists(), vaux->getAmplitudes(), interval ? &intervals : nullptr),
+                vaux->getLists(), interval ? &intervals : nullptr),
           });
         } else {
           slots.push_back({
@@ -1993,7 +1995,7 @@ public:
     // task-local, while the bounded cut spans every chunk and segment.
     template <bool Groups, bool Owned> class SegmentIvfScanner {
       const CollapsePlan* groupPlan;
-      RaBitQAmplitudes amplitudes;
+      const HeldInvertedLists& lists;
       KnnIntervalCollector<Groups>* intervals;
 
       /// Resolve-based eligibility selector over the live-filtered query
@@ -2028,9 +2030,6 @@ public:
 
       faiss::IndexIVF& ivf;
       faiss::IndexIVFRaBitQ* rabitq;
-      // The overlay's file-backed lists (VectorAuxReader::getLists); ids are
-      // read as uint32 through ids32(), never through the widening get_ids().
-      const MmapInvertedLists& lists;
       int32_t segOrd;
       const Binding<Owned>& v2d;
       LiveDocs* liveDocs;
@@ -2206,10 +2205,9 @@ public:
                         IndexReader::Segment& seg, const Binding<Owned>& v2d, DocSet* domain,
                         std::shared_ptr<const RankLiveBitmap> rankLive, int32_t metric,
                         const CollapsePlan* groupPlan, PreparedQuery preparedQuery,
-                        const MmapInvertedLists& lists, RaBitQAmplitudes amplitudes,
-                        KnnIntervalCollector<Groups>* intervals)
-          : groupPlan(groupPlan), amplitudes(amplitudes), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
-            lists(lists), segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
+                        const HeldInvertedLists& lists, KnnIntervalCollector<Groups>* intervals)
+          : groupPlan(groupPlan), lists(lists), intervals(intervals), ivf(ivf), rabitq(dynamic_cast<faiss::IndexIVFRaBitQ*>(&ivf)),
+            segOrd(segOrd), v2d(v2d), liveDocs(seg.liveDocs()), rankLive(std::move(rankLive)),
             domain(domain), domainIsLive(domain != nullptr && liveDocs != nullptr
                                         && domain == &liveDocs->docset()),
             metric(metric), preparedQuery(preparedQuery) {
@@ -2219,7 +2217,9 @@ public:
       }
 
       bool usesIntervals() const { return intervals != nullptr; }
+      bool needsLiveSizes() const noexcept { return liveDocs != nullptr; }
       int32_t getNList() const noexcept { return (int32_t)ivf.nlist; }
+      const HeldInvertedLists& heldLists() const noexcept { return lists; }
       int64_t physicalListSize(faiss::idx_t id) const { return (int64_t)lists.list_size((size_t)id); }
 
       void coarseRun(int32_t dims,
@@ -2243,9 +2243,11 @@ public:
       /// denominator.
       int64_t liveListSize(faiss::idx_t listId, VectorSearchWork& work) const {
         if (listId < 0 || (size_t)listId >= ivf.nlist) return 0;
-        auto listIds = lists.ids32((size_t)listId);
-        if (listIds.empty()) return 0;
-        if (liveDocs == nullptr) return (int64_t)listIds.size();
+        size_t size = lists.list_size((size_t)listId);
+        if (size == 0) return 0;
+        if (liveDocs == nullptr) return (int64_t)size;
+        HeldInvertedLists::Ids held(lists, (size_t)listId);
+        auto listIds = held.span();
 
         work.allocatorEntries += (int64_t)listIds.size();
         const uint8_t* bits = rankLive->bits;
@@ -2276,6 +2278,8 @@ public:
         if (rabitq == nullptr) return scan(nullptr); // Keep FAISS's PQ kernel and selector.
         return selector.withProbe(ivf.ntotal, scan);
       }
+
+      static constexpr uint32_t MAX_PROBE_BACKOFF = 6;
 
       template <bool Interval, class Probe>
       LUXIR_NOINLINE VectorSearchWork scanListsWithProbe(const VectorSearchRequest& request,
@@ -2308,6 +2312,30 @@ public:
         const float* listAmplitudes = nullptr;
         double selectionScale = 0;
         const uint32_t* rowIds = nullptr;
+        // Cold lists on a mapped file fault page by page, each a blocking
+        // device read, so a round reads its lists ahead. A round is shorter
+        // than the gate's fault checks, so a sampled page of the unit's first
+        // list turns advice on. The gate is the thread's, so short units add
+        // up to its checks. A probe costs two getrusage calls, so after n
+        // warm probes in a row a thread probes every 2^n units (at most 64).
+        // Held lists were acquired before the round.
+        thread_local RowReadAhead::Gate gate;
+        thread_local uint32_t warmProbes = 0, unitsSinceProbe = 0;
+        InputFile* viewFile = lists.viewFile();
+        RowReadAhead ahead(gate, viewFile, 0, 1, viewFile ? (int64_t)viewFile->size() : 0);
+        bool probeCold = viewFile != nullptr && !ahead.active()
+            && ++unitsSinceProbe >= (1u << std::min(warmProbes, MAX_PROBE_BACKOFF));
+        auto queueList = [&](int64_t k) {
+          auto id = listIds[(size_t)k];
+          if (id < 0) return;
+          auto section = [&](HeldInvertedLists::Section part) {
+            ByteRange range = lists.rangeOf((size_t)id, part);
+            ahead.queueRows((int64_t)range.offset, (int64_t)(range.offset + range.length));
+          };
+          section(HeldInvertedLists::IDS);
+          section(HeldInvertedLists::CODES);
+          if constexpr (Interval) section(HeldInvertedLists::AMPLITUDES);
+        };
         // The candidate test after any scoring: the handler's threshold moves
         // as results arrive, so rows are admitted strictly in order.
         auto admit = [&](float distance, size_t row) LUXIR_INLINE {
@@ -2324,10 +2352,21 @@ public:
         for (size_t list = 0; list < listIds.size(); list++) {
           auto id = listIds[list];
           if (id < 0) continue;
-          auto listRows = lists.ids32((size_t)id);
-          const uint32_t* ids = listRows.data();
-          const uint8_t* codes = lists.get_codes((size_t)id);
-          size_t count = listRows.size();
+          size_t count = lists.list_size((size_t)id);
+          if (probeCold && count > 0) {
+            probeCold = false;
+            ByteRange codeRange = lists.rangeOf((size_t)id, HeldInvertedLists::CODES);
+            ahead.probe({(int64_t)(codeRange.offset + codeRange.length / 2)});
+            unitsSinceProbe = 0;
+            warmProbes = ahead.active() ? 0 : warmProbes + 1;
+          }
+          ahead.sparseAt((int64_t)list, (int64_t)listIds.size(), queueList);
+          // Ids are read as uint32 through Ids, never through the widening get_ids().
+          HeldInvertedLists::Ids heldIds(lists, (size_t)id);
+          faiss::InvertedLists::ScopedCodes heldCodes(&lists, (size_t)id);
+          const uint32_t* ids = heldIds.span().data();
+          const uint8_t* codes = heldCodes.get();
+          std::optional<HeldInvertedLists::Amplitudes> heldAmplitudes;
           visited += (int64_t)count;
           rowIds = ids;
           std::unique_ptr<faiss::FlatCodesDistanceComputer> distanceComputer;
@@ -2347,7 +2386,7 @@ public:
               gError = dc->g_error;
             }
           } else pqScanner->set_list(id, centroidDists[list]);
-          if constexpr (Interval) listAmplitudes = amplitudes.list((size_t)id).data();
+          if constexpr (Interval) listAmplitudes = heldAmplitudes.emplace(lists, (size_t)id).data();
           double gateScale = (double)gError * (RABITQ_GATE_EPSILON / 1.9f);
           selectionScale = (double)gError * RABITQ_SELECTION_EPSILON;
 
@@ -2848,6 +2887,15 @@ public:
       std::vector<size_t> scannedListCount;
       bool coarseReady = false;
       bool coarseScanned = false;
+      // Lists held for this search on files whose holds are not free, per
+      // slot: the sections held for each list (HOLD_*) and the batch holding
+      // them. They stay held until the search ends, so a DEPTH rescan or a
+      // later round's live-size lookup reads nothing again.
+      static constexpr uint8_t HOLD_IDS = 1, HOLD_SCAN = 2;
+      std::vector<boost::unordered_flat_map<faiss::idx_t, uint8_t>> heldSections;
+      std::vector<std::unique_ptr<HeldInvertedLists::Batch>> heldBatches;
+      bool anyHeld = false;        // some slot's lists are not on a free view
+      bool heldLiveSizes = false;  // and its live sizes read ids
 
       CoarseHead makeHead(int32_t slotOrd, const Allocation& state) const {
         const auto& run = runs[(size_t)slotOrd];
@@ -2900,6 +2948,11 @@ public:
       // dispatch visit those physical ids again. Their work is charged now.
       template <typename Append>
       void allocate(Allocation& state, const VectorSearchRequest& request, Append&& append) {
+        allocate(state, request, [&](size_t slot, size_t cursor) { return liveSize(slot, cursor); }, append);
+      }
+
+      template <typename Size, typename Append>
+      void allocate(Allocation& state, const VectorSearchRequest& request, Size&& sizeOf, Append&& append) {
         if (request.round != VectorSearchRound::BREADTH || state.heapSize <= 0) return;
         bool advance = coarseScanned;
         if (!advance && state.cost + 1.0e-15 >= request.scanFraction) return;
@@ -2908,7 +2961,7 @@ public:
           advance = false;
           int32_t slot = pq.indexOfTop();
           size_t cursor = state.cursors[(size_t)slot];
-          int64_t live = liveSize((size_t)slot, cursor);
+          int64_t live = sizeOf((size_t)slot, cursor);
           append((size_t)slot, cursor, live);
           if (ivfLiveTotal > 0) state.cost += (double)live / ivfLiveTotal;
           auto& pos = state.cursors[(size_t)slot];
@@ -2921,8 +2974,70 @@ public:
         state.heapSize = (int32_t)pq.size();
       }
 
+      // Holds lists before they are read: one batch per slot's file, all
+      // issued before waiting on any, so a backend serves them in one round.
+      // A scan holds ids and codes, and amplitudes for interval scans.
+      void holdLists(std::span<const std::vector<faiss::idx_t>> wanted, bool scan) {
+        uint8_t need = scan ? HOLD_IDS | HOLD_SCAN : HOLD_IDS;
+        AcquireJoin join;
+        std::vector<faiss::idx_t> lists;
+        for (size_t i = 0; i < slots.size(); i++) {
+          auto* ivf = slots[i].ivfEngine.get();
+          if (ivf == nullptr || wanted[i].empty() || ivf->heldLists().holdsFree()) continue;
+          lists.clear();
+          for (auto list : wanted[i]) {
+            uint8_t& have = heldSections[i][list];
+            if ((have | need) == have) continue;
+            have |= need;
+            lists.push_back(list);
+          }
+          if (lists.empty()) continue;
+          if (!heldBatches[i]) heldBatches[i] = std::make_unique<HeldInvertedLists::Batch>();
+          using L = HeldInvertedLists;
+          if (!scan) ivf->heldLists().retain(lists, {L::IDS}, *heldBatches[i], join);
+          else if (ivf->usesIntervals()) ivf->heldLists().retain(lists, {L::IDS, L::CODES, L::AMPLITUDES}, *heldBatches[i], join);
+          else ivf->heldLists().retain(lists, {L::IDS, L::CODES}, *heldBatches[i], join);
+        }
+        join.wait();
+      }
+
+      // Under deletes the allocator prices a list by its live ids, which held
+      // lists would read one list at a time. Instead, project the allocation
+      // with physical sizes standing in for unknown live sizes. They are never
+      // smaller, so the projection is a prefix of the real allocation. Hold
+      // the projected lists of unknown size and the next head in one round,
+      // count their live ids, and repeat until the projection knows every
+      // size; the allocation then reads nothing.
+      void resolveLiveSizes(const Allocation& state, const VectorSearchRequest& request, bool scan) {
+        if (!heldLiveSizes || request.round != VectorSearchRound::BREADTH) return;
+        std::vector<std::vector<faiss::idx_t>> wanted(slots.size());
+        std::vector<std::pair<size_t, size_t>> unknown;
+        for (;;) {
+          unknown.clear();
+          auto sizeOf = [&](size_t slot, size_t cursor) {
+            int64_t live = runs[slot].liveSizes[cursor];
+            if (live >= 0) return live;
+            unknown.emplace_back(slot, cursor);
+            return (int64_t)slots[slot].ivfEngine->physicalListSize(runs[slot].listIds[cursor]);
+          };
+          Allocation projected = state;
+          allocate(projected, request, sizeOf, [](size_t, size_t, int64_t) {});
+          if (projected.heapSize > 0) {
+            IndexedPQ<CoarseHead, CoarseHeadLess, int32_t> pq(projected.heads, projected.heapIndexes, projected.heapSize);
+            size_t slot = (size_t)pq.indexOfTop();
+            sizeOf(slot, projected.cursors[slot]);
+          }
+          if (unknown.empty()) return;
+          for (auto& lists : wanted) lists.clear();
+          for (auto [slot, cursor] : unknown) wanted[slot].push_back(runs[slot].listIds[cursor]);
+          holdLists(wanted, scan);
+          for (auto [slot, cursor] : unknown) liveSize(slot, cursor);
+        }
+      }
+
       void allocateToBudget(const VectorSearchRequest& request) {
         ensureCoarseReady(request);
+        resolveLiveSizes(allocation, request, true);
         allocate(allocation, request, [&](size_t slot, size_t cursor, int64_t live) {
           selectedListIds[slot].push_back(runs[slot].listIds[cursor]);
           selectedCentroidDists[slot].push_back(runs[slot].centroidDists[cursor]);
@@ -2976,9 +3091,17 @@ public:
                             int64_t ivfLiveTotal, int64_t kDocs, int32_t metric,
                             FanoutScope* fanout, const CollapsePlan* groupPlan,
                             std::span<const Binding<Owned>> groupV2d, KnnIntervalCollector<Groups>& intervals,
-                            std::span<VectorSearchWork> workBySeg) noexcept
+                            std::span<VectorSearchWork> workBySeg)
         : intervals(intervals), groupPlan(groupPlan), groupV2d(groupV2d), slots(std::move(slots)),
-          workBySeg(workBySeg), ivfLiveTotal(ivfLiveTotal), kDocs(kDocs), metric(metric), fanout(fanout) {}
+          workBySeg(workBySeg), ivfLiveTotal(ivfLiveTotal), kDocs(kDocs), metric(metric), fanout(fanout) {
+        heldSections.resize(this->slots.size());
+        heldBatches.resize(this->slots.size());
+        for (const auto& slot : this->slots) {
+          if (slot.ivfEngine == nullptr || slot.ivfEngine->heldLists().holdsFree()) continue;
+          anyHeld = true;
+          heldLiveSizes |= slot.ivfEngine->needsLiveSizes();
+        }
+      }
 
       double coveredFraction() const { return std::min(1.0, allocation.cost); }
       std::vector<size_t> listsProbedBySegment() const {
@@ -3013,6 +3136,7 @@ public:
           for (size_t i = 0; i < slots.size(); i++) if (slots[i].ivfEngine && !slots[i].ivfEngine->usesIntervals())
             for (auto list : selectedListIds[i]) add(i, list);
         } else {
+          resolveLiveSizes(allocation, request, false);
           Allocation projected = allocation;
           allocate(projected, request, [&](size_t slot, size_t cursor, int64_t) { add(slot, runs[slot].listIds[cursor]); });
         }
@@ -3088,6 +3212,16 @@ public:
             slot.flatPending = false;
             units.push_back({(int32_t)i, 0, 0, slot.liveVectorCount});
           }
+        }
+
+        if (anyHeld) {
+          std::vector<std::vector<faiss::idx_t>> wanted(slots.size());
+          for (const auto& unit : units) {
+            const auto& selected = selectedListIds[(size_t)unit.slotOrd];
+            auto& lists = wanted[(size_t)unit.slotOrd];
+            lists.insert(lists.end(), selected.begin() + (ptrdiff_t)unit.listBegin, selected.begin() + (ptrdiff_t)unit.listEnd);
+          }
+          holdLists(wanted, true);
         }
 
         if (!units.empty()) {

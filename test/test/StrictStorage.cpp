@@ -93,6 +93,7 @@ uint8_t StrictStorageCounters::acquired(std::string_view name, ByteRange range) 
     ++file.metadataAcquires;
   }
   file.acquiredBytes += range.length;
+  file.peakLiveHolds = std::max(file.peakLiveHolds, ++file.liveHolds);
   ++live.holds;
   live.bytes += range.length;
   live.peakHolds = std::max(live.peakHolds, live.holds);
@@ -100,8 +101,10 @@ uint8_t StrictStorageCounters::acquired(std::string_view name, ByteRange range) 
   return ++pattern;
 }
 
-void StrictStorageCounters::released(uint64_t length) noexcept {
+void StrictStorageCounters::released(std::string_view name, uint64_t length) noexcept {
   std::lock_guard lock(mutex);
+  auto it = files.find(name);
+  if (it != files.end()) --it->second.liveHolds;
   --live.holds;
   live.bytes -= length;
 }
@@ -206,7 +209,7 @@ public:
     ASAN_UNPOISON_MEMORY_REGION(buffer, allocationSize(hold.getLength()));
 #endif
     delete[] buffer;
-    counters->released(hold.getLength());
+    counters->released(name, hold.getLength());
     liveHolds.fetch_sub(1, std::memory_order_relaxed);
   }
 };
