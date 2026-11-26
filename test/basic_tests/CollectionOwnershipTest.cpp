@@ -663,3 +663,66 @@ TEST_F(CollectionOwnershipTest, untouchedTenantBelongsToItsFirstProcessUntilRest
   CollectionHelper c(*b, CollectionId{"late", "c"});
   EXPECT_TRUE(c.index(flatdoc("id", "after"), UpdateMessage::COMMIT).success);
 }
+
+TEST_F(CollectionOwnershipTest, demotedWriterServesReadsAndRefusesUpdates) {
+  startA();
+  CollectionHelper c(*a, "c");
+  ASSERT_TRUE(c.index(flatdoc("id", "first"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(c.index(flatdoc("id", "buffered")).success);
+  a->demoteCollection(CollectionId::of("c"));
+  a->demoteCollection(CollectionId::of("c")); // idempotent
+  EXPECT_TRUE(c.getIndexWriter()->isClosed());
+  EXPECT_EQ(2, c.collection().getReaderManager().getReader()->liveDocs()); // demote committed the buffered doc
+  EXPECT_THROW(c.collection().getShard()->requireIndexWriter(), ReadOnlyError);
+  a->detachCollection("c", "B"); // a demoted writer is handed off without a second commit
+  servedBy([&] { a->getCollection("c"); }, "B");
+}
+
+TEST_F(CollectionOwnershipTest, readOnlyAttachServesTheSelectedSnapshotWithoutTheAssignment) {
+  startA();
+  { CollectionHelper c(*a, "c"); ASSERT_TRUE(c.index(flatdoc("id", "durable"), UpdateMessage::COMMIT).success); }
+  startB();
+  auto collection = b->attachCollection(CollectionId::of("c"), Collections::Role::READ_ONLY);
+  EXPECT_EQ(1, collection->getReaderManager().getReader()->liveDocs());
+  EXPECT_TRUE(collection->getShard()->isReadOnly());
+  EXPECT_EQ("A", b->collections().catalog().find("c")->node);
+}
+
+TEST_F(CollectionOwnershipTest, demotedShardRefusesSchemaUpdates) {
+  startA();
+  CollectionHelper c(*a, "c");
+  ASSERT_TRUE(c.index(flatdoc("id", "first"), UpdateMessage::COMMIT).success);
+  a->demoteCollection(CollectionId::of("c"));
+  EXPECT_THROW(c.collection().setSchema(std::make_shared<Schema>()), ReadOnlyError);
+  api::SchemaDef def;
+  EXPECT_THROW(c.collection().updateSchema(def, api::SchemaRequest_::Mode::SET), ReadOnlyError);
+}
+
+TEST_F(CollectionOwnershipTest, readOnlyAttachOnAWriterNodeRefusesUpdates) {
+  startA();
+  { CollectionHelper c(*a, "c"); ASSERT_TRUE(c.index(flatdoc("id", "durable"), UpdateMessage::COMMIT).success); }
+  startB();
+  auto attached = b->attachCollection(CollectionId::of("c"), Collections::Role::READ_ONLY);
+  EXPECT_THROW(attached->getShard()->requireIndexWriter(), ReadOnlyError);
+  auto& catalog = b->collections().catalog();
+  EXPECT_EQ("A", catalog.find("c")->node);
+}
+
+TEST_F(CollectionOwnershipTest, closeKeepsTheAssignmentAndForceAttachTakesIt) {
+  startA();
+  CollectionHelper c(*a, "c");
+  ASSERT_TRUE(c.index(flatdoc("id", "first"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(c.index(flatdoc("id", "buffered")).success);
+  a->closeCollection(CollectionId::of("c"));
+  EXPECT_TRUE(c.getIndexWriter()->isClosed());
+  EXPECT_THROW(c.collection().getShard()->requireIndexWriter(), ReadOnlyError); // refused before the final commit
+  EXPECT_EQ("A", a->collections().catalog().find("c")->node);
+  startB();
+  auto view = b->attachCollection(CollectionId::of("c"), Collections::Role::READ_ONLY);
+  EXPECT_EQ(2, view->getReaderManager().getReader()->liveDocs()); // close committed the buffered doc
+  b->closeCollection(CollectionId::of("c"));
+  EXPECT_THROW(b->closeCollection(CollectionId::of("c")), CollectionNotFoundError);
+  auto writer = b->attachCollection(CollectionId::of("c"), Collections::Role::WRITER, true);
+  EXPECT_EQ("B", b->collections().catalog().find("c")->node);
+  EXPECT_EQ(2, writer->getReaderManager().getReader()->liveDocs());
+}

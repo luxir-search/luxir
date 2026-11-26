@@ -96,6 +96,7 @@ struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump; 
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
 namespace KnnQuery_ { struct Ivf; }
+namespace SchemaDef_ { struct IndexSort; }
 namespace VectorAnnDef_ { struct RaBitQ; struct Pq; }
 
 // ---- nested enums (Foo_ namespace; matches generated metadata refs) ----
@@ -896,6 +897,14 @@ struct KnnQuery {                                                // needs Vector
   bool exact = false;
   std::string_view unit;
 };
+namespace SchemaDef_ {
+namespace IndexSort_ { enum class Order { ASC = 0, DESC = 1 }; }
+struct IndexSort {
+  using Order = luxir::api::SchemaDef_::IndexSort_::Order;
+  std::string_view field;
+  Order order = Order::ASC;
+};
+} // namespace SchemaDef_
 struct StoredResourceDef {
   using Codec = luxir::api::StoredResourceDef_::Codec;
   std::optional<Codec> codec;                                   // align 4 (enum)
@@ -906,15 +915,18 @@ struct StoredResourceDef {
   std::optional<bool> zstd_dictionary;                          // align 1
 };
 struct SchemaDef {                                                // needs StoredResourceDef
+  using IndexSort = luxir::api::SchemaDef_::IndexSort;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> templates;
+  std::optional<IndexSort> index_sort;
   map_view<std::string_view, StoredResourceDef> stored_resources;
 };
 struct ColVal { std::span<const Val> v; };                        // span<incomplete Val> OK
 struct ColVector { std::span<const Vector> v; };
 struct ArrVector { std::span<const Vector> v; };
 struct SchemaResponse {
-  std::string_view commit; std::optional<SchemaDef> schema; std::optional<ReplicaResult> replicas; };  // needs SchemaDef
+  std::string_view commit; std::optional<SchemaDef> schema; std::optional<ReplicaResult> replicas;
+  std::span<const Warning> warnings; };  // needs SchemaDef
 struct SchemaRequest {                                           // needs SchemaDef
   using Mode = luxir::api::SchemaRequest_::Mode;
   std::string_view collection;
@@ -1329,7 +1341,7 @@ LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(Sc
 LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef) LUXIR_TD(StoredResourceDef)
 LUXIR_TD(VectorAnnDef) LUXIR_TD(VectorAnnDef_::RaBitQ) LUXIR_TD(VectorAnnDef_::Pq)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
-LUXIR_TD(KnnQuery_::Ivf)
+LUXIR_TD(KnnQuery_::Ivf) LUXIR_TD(SchemaDef_::IndexSort)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(RenameCollectionRequest) LUXIR_TD(RenameCollectionResponse) LUXIR_TD(SwapCollectionsRequest) LUXIR_TD(SwapCollectionsResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)

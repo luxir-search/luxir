@@ -48,15 +48,21 @@ std::string Collection::getUnavailableReason() const {
 
 std::shared_ptr<const CommitSnapshot> Collection::updateSchema(const luxir::api::SchemaDef& def,
                                                  luxir::api::SchemaRequest_::Mode mode) {
-  if (!shard->iw) throw ReadOnlyError("collection has no writer");
-  return shard->iw->updateSchema([&](const Schema* current) {
-    return Schema::fromProto(def, mode == api::SchemaRequest_::Mode::SET ? current : nullptr);
+  return shard->requireIndexWriter()->updateSchema([&](const Schema* current) {
+    bool replace = mode != api::SchemaRequest_::Mode::SET;
+    auto schema = Schema::fromProto(def, replace ? nullptr : current);
+    // REPLACE_ALL rebuilds the schema from the request alone, so leaving out
+    // index_sort clears it: say so rather than silently changing merge order.
+    if (replace && current != nullptr && !current->indexSortField.empty() && !def.index_sort) {
+      schema->updateWarnings.emplace_back("index_sort_cleared",
+          "REPLACE_ALL without index_sort cleared the index sort; future merges keep arrival order");
+    }
+    return schema;
   });
 }
 
 void Collection::setSchema(std::shared_ptr<Schema> newSchema) {
-  if (!shard->iw) throw ReadOnlyError("collection has no writer");
-  shard->iw->setSchema(std::move(newSchema));
+  shard->requireIndexWriter()->setSchema(std::move(newSchema));
 }
 
 void Collections::validateName(std::string_view name, std::string_view kind) {
@@ -691,7 +697,8 @@ void Collections::detach(const CollectionId& key, std::string_view target) {
   auto snapshot = shard->snapshots->snapshot();
   if (!snapshot || snapshot->id.incarnation != entry->id) throw CollectionUnavailableError("loaded incarnation is no longer selected");
   std::exception_ptr commitFailure;
-  try { shard->iw->commit(); }
+  // A demoted writer committed and closed already.
+  try { if (!shard->readOnly.load(std::memory_order_acquire)) shard->iw->commit(); }
   catch (...) { commitFailure = std::current_exception(); }
   try { shard->iw->close(); }
   catch (...) { if (!commitFailure) commitFailure = std::current_exception(); }
@@ -716,8 +723,59 @@ void Collections::detach(const CollectionId& key, std::string_view target) {
   if (commitFailure) std::rethrow_exception(commitFailure);
 }
 
-std::shared_ptr<Collection> Collections::attach(const CollectionId& key, bool force) {
-  if (config.read_only || !config.replication.source.empty()) throw ReadOnlyError("cannot attach collections on a read-only node or follower");
+void Collections::close(const CollectionId& key) {
+  if (!config.replication.source.empty()) throw ReadOnlyError("cannot close collections on a follower");
+  validate(key);
+  Transition transition(*this, key);
+  auto collection = map.get(key);
+  auto shard = collection ? collection->getShard() : nullptr;
+  if (!shard) throw CollectionNotFoundError("collection '" + key.label() + "' is not loaded here");
+  {
+    std::lock_guard lock(slotsMutex);
+    if (!slots[key].leased.empty()) throw CollectionUnavailableError("collection '" + key.label() + "' has a staged replacement");
+  }
+  std::exception_ptr commitFailure;
+  // A demoted writer committed and closed already. Otherwise refuse new
+  // updates before the final commit, as demote does, so nothing is
+  // admitted between the commit and the close and then dropped.
+  if (shard->iw && !shard->readOnly.exchange(true, std::memory_order_acq_rel)) {
+    try { shard->iw->commit(); }
+    catch (...) { commitFailure = std::current_exception(); }
+    try { shard->iw->close(); }
+    catch (...) { if (!commitFailure) commitFailure = std::current_exception(); }
+  }
+  unload(transition, collection, "collection '" + key.label() + "' was closed on this node");
+  LOG_INFO("Closed collection: {}", key.label());
+  if (commitFailure) std::rethrow_exception(commitFailure);
+}
+
+void Collections::demote(const CollectionId& key) {
+  validate(key);
+  Transition transition(*this, key);
+  auto collection = map.get(key);
+  if (!collection) throw CollectionNotFoundError("collection '" + key.label() + "' does not exist");
+  auto shard = collection->getShard();
+  if (!shard || !shard->iw || shard->readOnly.load(std::memory_order_acquire)) return;
+  // Refuse new updates first, then make what was accepted durable, then
+  // let the writer go. The registry and its readers stay: searches go on.
+  shard->readOnly.store(true, std::memory_order_release);
+  // An update admitted before the flag was set may still land between the
+  // commit and the close; the close fails or drops it, never a later commit.
+  try { shard->iw->commit(); }
+  catch (...) {
+    shard->readOnly.store(false, std::memory_order_release);
+    throw;
+  }
+  // Once the close has begun the writer is unusable, so the flag stays set.
+  shard->iw->close();
+  LOG_INFO("Demoted collection to read-only: {}", key.label());
+}
+
+std::shared_ptr<Collection> Collections::attach(const CollectionId& key, Role role, bool force) {
+  if (role == Role::FOLLOWER) throw std::invalid_argument("attach opens a writer or a read-only collection");
+  if (!config.replication.source.empty() || (config.read_only && role == Role::WRITER)) {
+    throw ReadOnlyError("cannot attach collections on a read-only node or follower");
+  }
   validate(key);
   Transition transition(*this, key);
   auto& storage = catalog(key.tenant);
@@ -725,12 +783,13 @@ std::shared_ptr<Collection> Collections::attach(const CollectionId& key, bool fo
   if (!entry || entry->state != "active") throw CollectionNotFoundError("collection '" + key.label() + "' does not exist");
   auto expected = map.get(key);
   if (expected && expected->getShard()) throw CollectionExistsError("collection '" + key.label() + "' is already loaded");
-  if (entry->node != config.node.id) {
+  if (role == Role::WRITER && entry->node != config.node.id) {
     if (!force) throw CollectionServedByError(entry->node);
     if (!storage.assign(entry->id, entry->node, config.node.id)) throw CollectionUnavailableError("collection assignment changed before attach");
   }
-  Opened row{key, nullptr, entry->id, {}};
-  openOne(row, Role::WRITER, expected);
+  // A read-only view follows the catalog selection; owned() would refuse another node's incarnation.
+  Opened row{key, nullptr, role == Role::WRITER ? std::optional(entry->id) : std::nullopt, {}};
+  openOne(row, role, expected);
   return row.collection;
 }
 

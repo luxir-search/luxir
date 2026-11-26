@@ -3,6 +3,7 @@
 
 #include "Schema.h"
 #include "luxir/reader/Space.h"
+#include "luxir/util/log.h"
 #include <algorithm>
 #include <memory_resource>
 #include "luxir/api/build.h"
@@ -946,6 +947,16 @@ static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name
   return std::make_shared<StoredFieldType>(name, format);
 }
 
+std::span<const api::Warning> Schema::responseWarnings(std::pmr::memory_resource& arena) const {
+  std::span<const api::Warning> out;
+  auto* warnings = api::build::allocArray(out, updateWarnings.size(), arena);
+  for (size_t i = 0; i < updateWarnings.size(); i++) {
+    warnings[i].code = api::build::arenaStr(arena, updateWarnings[i].first);
+    warnings[i].message = api::build::arenaStr(arena, updateWarnings[i].second);
+  }
+  return out;
+}
+
 std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, const Schema* base) {
   return compile(def, base, InvalidStopWords::REJECT);
 }
@@ -1048,6 +1059,13 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
       (e.isTemplate ? templatePairs : fieldPairs).push_back({e.name, &e.def});
     }
     luxir::api::SchemaDef src;
+    // A SET without index_sort keeps the base setting; an empty field clears it.
+    auto indexSort = def.index_sort ? def.index_sort : baseSrc.index_sort;
+    if (indexSort && !indexSort->field.empty()) {
+      src.index_sort = indexSort;
+      schema->indexSortField = indexSort->field;
+      schema->indexSortOrder = indexSort->order;
+    }
     src.fields = luxir::api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(fieldPairs.data(), fieldPairs.size()));
     src.templates = luxir::api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
@@ -1171,6 +1189,20 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
       for (const auto& [label, ft] : logical->variants) schema->fieldTypeMap.emplace(ft->name(), ft);
     }
     schema->logicalFields.emplace(e.name, std::move(logical));
+  }
+
+  if (!schema->indexSortField.empty()) {
+    const auto& field = schema->indexSortField;
+    auto* ft = schema->findPhysical(field);
+    if (ft == nullptr) {
+      throw SchemaError("index_sort field is not defined by a field or template: " + field);
+    }
+    auto type = (*ft)->type();
+    if ((type != FieldType::INT && type != FieldType::DATE) || !(*ft)->hasColumn()) {
+      throw SchemaError("index_sort field must be an int or date field with a column: " + field);
+    }
+    bool nested = std::ranges::any_of(schema->fieldTypeMap, [](const auto& e) { return e.second->type() == FieldType::NESTED; });
+    if (nested) LOG_INFO("index_sort '{}' accepted on a schema with nested fields: merges of segments with nested docs keep arrival order", field);
   }
 
   // Stored-fields resources share the field registry (a segment registers

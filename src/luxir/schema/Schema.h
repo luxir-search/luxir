@@ -69,8 +69,16 @@ public:
   FileDescriptor file;
   uint64_t gen_ = 0;          // schema generation, set when persisted
   std::string sourceDef_;     // serialized authored SchemaDef, before inheritance
+  // SchemaDef.index_sort: merges write their documents in this int/date
+  // column's order (see SegmentMerger). Empty keeps arrival order.
+  std::string indexSortField;
+  api::SchemaDef::IndexSort::Order indexSortOrder = api::SchemaDef::IndexSort::Order::ASC;
   // Introduction generations for declared concrete and template representations.
   std::map<std::string, api::SchemaVersion, std::less<>> introducedGen;
+  // Nonfatal notes from the schema update that produced this schema, for its
+  // response (code, message); not persisted.
+  std::vector<std::pair<std::string, std::string>> updateWarnings;
+  std::span<const api::Warning> responseWarnings(std::pmr::memory_resource& arena) const;
 
 private:
   using logical_map = boost::unordered_flat_map<std::string, std::shared_ptr<const LogicalField>,

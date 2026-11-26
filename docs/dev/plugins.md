@@ -598,6 +598,22 @@ the factory's lifetime; process-wide plugin objects must not retain it.
 
 Placement plugins call the engine hooks `LuxirNode::detachCollection(id, target)`
 and `LuxirNode::attachCollection(id, force)` to hand off writers or force a takeover.
+`LuxirNode::demoteCollection(id)` commits and closes a collection's writer while it
+keeps serving its last snapshot (updates get `ReadOnlyError`), the first half of a
+handoff. `attachCollection(id, Collections::Role::READ_ONLY)` opens the selected
+snapshot without a writer and without touching the assignment, also on a read-only
+node. Updates to it get `ReadOnlyError`. It does not advance on its own: a
+publisher such as a replica refresher resolves the newest commit of the same
+incarnation and publishes it into the shard's snapshot registry
+(`Shard::getSnapshots()`). `Collections::stage`, `prepare` and `install` are for the
+node that owns the collection and refuse another node's incarnation, so a view
+of a new incarnation is closed and attached again. `LuxirNode::closeCollection(id)`
+closes a loaded collection on this node without a handoff: a writer commits
+(unless demoted) and closes, a read-only view just closes, and the catalog
+entry and its assignment stay as they are. A plugin that coordinates ownership
+itself closes on one node and opens on another with `attachCollection(id,
+Collections::Role::WRITER, true)`, which takes the assignment. `CommitWaits::setParkHook` runs a callback whenever a commit wait parks on
+a collection, so such a publisher can fetch at once instead of on its next interval.
 
 ### Capabilities
 

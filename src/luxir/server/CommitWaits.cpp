@@ -103,6 +103,29 @@ void CommitWaits::admit(std::shared_ptr<Wait> wait, std::stop_token stop) {
   if (!ready.empty()) { finish(ready); return; }
   wait->cancellation.emplace(stop, [this, name = wait->name, id = wait->id] { cancel(name, id); });
   Signal::emit("replicationWaitParked");
+  ParkHook hook;
+  {
+    std::lock_guard lock(hookMutex);
+    hook = parkHook;
+    if (hook) hookCalls++;
+  }
+  if (!hook) return;
+  // The wait is parked and live: a failing hook must not turn into an error
+  // for the caller, who would then abandon a wait the scheduler still owns.
+  try { hook(wait->name); }
+  catch (const std::exception& e) { LOG_WARN("Commit wait park hook failed for '{}': {}", wait->name.label(), e.what()); }
+  catch (...) { LOG_WARN("Commit wait park hook failed for '{}'", wait->name.label()); }
+  hook = nullptr;
+  { std::lock_guard lock(hookMutex); hookCalls--; }
+  hookIdle.notify_all();
+}
+
+void CommitWaits::setParkHook(ParkHook hook) {
+  std::unique_lock lock(hookMutex);
+  parkHook = std::move(hook);
+  // Returns once no call of the previous hook is running, so the caller may
+  // then destroy what it captured. Must not be called from inside a hook.
+  hookIdle.wait(lock, [&] { return hookCalls == 0; });
 }
 
 void CommitWaits::awaitCommit(CollectionId name, CommitId floor, Clock::time_point deadline,
@@ -245,6 +268,7 @@ void CommitWaits::close() {
   }
   DeadlineScheduler::global().detach(timer);
   finish(ready);
+  setParkHook(nullptr);
 }
 CommitWaits::~CommitWaits() { close(); }
 }

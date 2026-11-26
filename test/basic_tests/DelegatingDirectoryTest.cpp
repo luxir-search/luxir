@@ -8,6 +8,7 @@
 #include "luxir/store/DelegatingDirectory.h"
 #include "luxir/store/FSDirectory.h"
 #include "luxir/store/ReadOnlyDirectory.h"
+#include "luxir/store/ScratchBytes.h"
 
 using namespace luxir;
 
@@ -196,4 +197,82 @@ TEST(DelegatingDirectoryTest, reuseFilesLinksOrCopiesByCapability) {
   // Present files are left to the caller to verify, as before.
   EXPECT_TRUE(copied.reuseFiles(source, files, files).empty());
   EXPECT_THROW(copied.copyFile(source, "absent"), std::runtime_error);
+}
+
+// Scratch spills where the backend has local disk; RAM and read-only
+// directories keep it in RAM, wrappers forward.
+TEST(DelegatingDirectoryTest, scratchPathAndScratchBytes) {
+  auto ram = std::make_shared<RAMDir>();
+  EXPECT_EQ("", ram->scratchPath());
+  std::string path = (std::filesystem::temp_directory_path() / "luxir_scratch_XXXXXX").string();
+  ASSERT_NE(nullptr, ::mkdtemp(path.data()));
+  {
+    auto fs = std::make_shared<FSDirectory>(path);
+    EXPECT_EQ(path, fs->scratchPath());
+    EXPECT_EQ(path, DelegatingDirectory(fs).scratchPath());
+    EXPECT_EQ("", ReadOnlyDirectory(fs, "r").scratchPath());
+
+    for (std::string dir : {std::string(), path}) {
+      SCOPED_TRACE(dir);
+      ScratchBytes scratch(dir, 100);
+      std::vector<std::pair<uint64_t, std::string>> records;
+      for (int i = 0; i < 2000; i++) {
+        std::string record(1 + (size_t)(i * 37) % 3000, (char)('a' + i % 26));
+        records.push_back({scratch.append(record), record});
+      }
+      scratch.finish();
+      EXPECT_EQ(!dir.empty(), scratch.spilled());
+      for (const auto& [offset, record] : records) ASSERT_EQ(record, scratch.view(offset, record.size()));
+    }
+    // RAM held stays within the spill limit (the write buffer once spilled);
+    // without a scratch path it is every byte appended.
+    for (std::string dir : {std::string(), path}) {
+      SCOPED_TRACE(dir);
+      constexpr size_t LIMIT = 10000;
+      ScratchBytes scratch(dir, LIMIT);
+      size_t peak = 0;
+      for (int i = 0; i < 400; i++) {
+        scratch.append(std::string(97, 'x'));
+        peak = std::max(peak, scratch.ramBytes());
+      }
+      if (dir.empty()) EXPECT_GE(peak, scratch.size());
+      else EXPECT_LE(peak, std::max(LIMIT, ScratchBytes::WRITE_BUFFER_BYTES));
+    }
+    // The spill file has no name.
+    for (const auto& entry : std::filesystem::directory_iterator(path)) {
+      EXPECT_FALSE(entry.path().filename().string().starts_with(".luxir-scratch")) << entry.path();
+    }
+  }
+  std::filesystem::remove_all(path);
+}
+
+// Spill edges: the RAM to file transition mid-append, a single append at or
+// over the write buffer, an empty spill, and an unusable directory.
+TEST(ScratchBytesTest, spillTransitionsAndEdges) {
+  std::string path = (std::filesystem::temp_directory_path() / "luxir_scratch_XXXXXX").string();
+  ASSERT_NE(nullptr, ::mkdtemp(path.data()));
+  {
+    ScratchBytes scratch(path, 10);
+    std::string small(8, 's'), big(ScratchBytes::WRITE_BUFFER_BYTES, 'b'), tail(5, 't');
+    EXPECT_EQ(0u, scratch.append(small));
+    EXPECT_FALSE(scratch.spilled());
+    EXPECT_EQ(8u, scratch.append(std::string(5, 'x'))); // crosses the limit: RAM moves to the file
+    EXPECT_TRUE(scratch.spilled());
+    uint64_t bigOffset = scratch.append(big);
+    uint64_t tailOffset = scratch.append(tail);
+    scratch.finish();
+    EXPECT_EQ(small, scratch.view(0, 8));
+    EXPECT_EQ(big, scratch.view(bigOffset, big.size()));
+    EXPECT_EQ(tail, scratch.view(tailOffset, tail.size()));
+  }
+  {
+    ScratchBytes empty(path, 0);
+    empty.append("");
+    empty.finish();
+    EXPECT_EQ(0u, empty.size());
+    EXPECT_EQ("", empty.view(0, 0));
+  }
+  std::filesystem::remove_all(path);
+  ScratchBytes missing(path + "/absent", 0);
+  EXPECT_ANY_THROW(missing.append("x"));
 }

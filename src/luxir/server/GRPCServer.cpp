@@ -1002,6 +1002,7 @@ static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
         auto newSchema = collection->updateSchema(*proto.schema, proto.mode);
         newSchema->schema->toProto(&state->response.schema.emplace(), state->arena);
         state->response.commit = api::build::arenaStr(state->arena, newSchema->id.token());
+        state->response.warnings = newSchema->schema->responseWarnings(state->arena);
         respondPublished(call, state, collection->getId(), newSchema->id, proto.wait_for_replicas,
                          proto.wait_for_replicas_timeout_ms, ReplicationSource::Members::SERVING, stop);
       } catch (const std::exception& e) {

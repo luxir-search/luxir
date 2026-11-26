@@ -204,8 +204,27 @@ public:
   // Final commit (best effort), close, and hand off the existing incarnation.
   // A commit failure is thrown after the handoff; assignment failures also unload.
   void detach(const CollectionId& id, std::string_view target);
-  // Open an active catalog entry, optionally taking its assignment first.
-  std::shared_ptr<Collection> attach(const CollectionId& id, bool force = false);
+  // Final commit of a writer (best effort, skipped when demoted), close, and
+  // unload, leaving the catalog entry and its assignment as they are: for a
+  // caller that coordinates ownership itself and reopens with attach (force
+  // to take the assignment). A read-only view just closes. A commit failure
+  // is thrown after the unload.
+  void close(const CollectionId& id);
+  // Closes the writer of a registered collection after a commit and keeps
+  // serving its last snapshot read-only (updates get ReadOnlyError). The
+  // first half of a writer handoff. Idempotent.
+  void demote(const CollectionId& id);
+  // Open an active catalog entry. As WRITER, optionally taking its assignment
+  // first. As READ_ONLY the selected snapshot is served without a writer and
+  // without touching the assignment; this is also allowed on a read-only
+  // node. The view does not advance by itself: a publisher other than a
+  // writer (a replica refresher) publishes newer commits of the same
+  // incarnation into the shard's snapshot registry. stage/prepare/install
+  // are for the node that owns the collection and refuse another node's
+  // incarnation. Registered as read-only (Shard::isReadOnly), updates are
+  // refused.
+  std::shared_ptr<Collection> attach(const CollectionId& id, Role role, bool force = false);
+  std::shared_ptr<Collection> attach(const CollectionId& id, bool force = false) { return attach(id, Role::WRITER, force); }
 
   void rename(const CollectionId& from, const CollectionId& to) { changeNames(from, to, false); }
   void swap(const CollectionId& a, const CollectionId& b) { changeNames(a, b, true); }

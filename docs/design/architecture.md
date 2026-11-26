@@ -46,6 +46,18 @@ Most of what follows depends on segments being immutable:
   index reopens at a complete commit.
 - Compaction is concurrent merging: merges produce new segments in the
   background and never stall ingest or search.
+- A merge concatenates whole source segments and keeps each source's
+  documents in arrival order, unless the schema sets an `index_sort`: then
+  the merge writes its documents in key order, and every per-doc structure
+  (postings with their positions, norms, stored fields, every column kind,
+  points, request-version runs) follows the new doc ids. Merges whose
+  sources hold nested child rows still concatenate, since child families
+  would have to move with their owners. Correctness never
+  depends on doc order: deletes resolve by `_version_`, and deletes that
+  arrive during a merge map through the merge's doc map, monotone or not.
+  Order does shape the layout (tied hit order, column zones, postings and
+  points encodings), which is why it is configurable. Flushed segments keep
+  arrival order, so a reordering merge reads its sources at random.
 
 ## Designed for modern hardware
 

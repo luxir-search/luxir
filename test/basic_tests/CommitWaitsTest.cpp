@@ -57,6 +57,33 @@ TEST_F(CommitWaitsTest, injectedClockDrivesFloorsReplicasAndCapturedLiveness) {
   ASSERT_TRUE(all); EXPECT_EQ(Outcome::SATISFIED, all->outcome); EXPECT_EQ(0u, all->wanted);
 }
 
+TEST_F(CommitWaitsTest, parkHookRunsWhenAWaitParksAndItsFailureIsContained) {
+  LuxirNode node(LuxirConfig{});
+  auto id = node.getCollection("main")->getShard()->getSnapshots().snapshot()->id;
+  id.index_gen++;
+  auto& waits = node.getCommitWaits();
+  std::vector<std::string> parked;
+  bool fail = false;
+  waits.setParkHook([&](const CollectionId& name) {
+    parked.push_back(name.name);
+    if (fail) throw std::runtime_error("hook failure");
+  });
+  std::optional<CommitWaits::CommitResult> result;
+  auto await = [&] { waits.awaitCommit(CollectionId::of("main"), id, waits.deadlineAfter(30000), {}, [&](auto value) { result = std::move(value); }); };
+  await();
+  EXPECT_EQ(std::vector<std::string>{"main"}, parked);
+  EXPECT_FALSE(result);
+  fail = true;
+  EXPECT_NO_THROW(await()); // the wait stays parked behind a throwing hook
+  EXPECT_EQ(2u, parked.size());
+  waits.setParkHook(nullptr);
+  await();
+  EXPECT_EQ(2u, parked.size());
+  CollectionHelper h(node, "main");
+  ASSERT_TRUE(h.index(flatdoc("id", "x"), UpdateMessage::COMMIT).success);
+  EXPECT_TRUE(result);
+}
+
 TEST_F(CommitWaitsTest, cancellationAndRemovalPreserveOwningCompletion) {
   LuxirNode node(LuxirConfig{});
   auto id = node.getCollection("main")->getShard()->getSnapshots().snapshot()->id;
