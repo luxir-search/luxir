@@ -730,10 +730,16 @@ void Collections::close(const CollectionId& key) {
   auto collection = map.get(key);
   auto shard = collection ? collection->getShard() : nullptr;
   if (!shard) throw CollectionNotFoundError("collection '" + key.label() + "' is not loaded here");
+  {
+    std::lock_guard lock(slotsMutex);
+    if (!slots[key].leased.empty()) throw CollectionUnavailableError("collection '" + key.label() + "' has a staged replacement");
+  }
   std::exception_ptr commitFailure;
-  if (shard->iw) {
-    // A demoted writer committed and closed already.
-    try { if (!shard->readOnly.load(std::memory_order_acquire)) shard->iw->commit(); }
+  // A demoted writer committed and closed already. Otherwise refuse new
+  // updates before the final commit, as demote does, so nothing is
+  // admitted between the commit and the close and then dropped.
+  if (shard->iw && !shard->readOnly.exchange(true, std::memory_order_acq_rel)) {
+    try { shard->iw->commit(); }
     catch (...) { commitFailure = std::current_exception(); }
     try { shard->iw->close(); }
     catch (...) { if (!commitFailure) commitFailure = std::current_exception(); }

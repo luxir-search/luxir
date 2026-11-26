@@ -715,6 +715,7 @@ TEST_F(CollectionOwnershipTest, closeKeepsTheAssignmentAndForceAttachTakesIt) {
   ASSERT_TRUE(c.index(flatdoc("id", "buffered")).success);
   a->closeCollection(CollectionId::of("c"));
   EXPECT_TRUE(c.getIndexWriter()->isClosed());
+  EXPECT_THROW(c.collection().getShard()->requireIndexWriter(), ReadOnlyError); // refused before the final commit
   EXPECT_EQ("A", a->collections().catalog().find("c")->node);
   startB();
   auto view = b->attachCollection(CollectionId::of("c"), Collections::Role::READ_ONLY);
