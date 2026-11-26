@@ -832,22 +832,32 @@ the node unlimited. The resolved values are logged at startup.
 Applying a delete or an update by id looks up the id in every segment whose
 id range could hold it. An id filter on each segment rules most of those
 segments out without reading their id dictionaries, which matters most when
-those segments are on remote storage. Segments get no filter by default.
+those segments are on remote storage. New segments get a `fuse16` filter by
+default.
 
 ```bash
 ./luxir --indexing.id-filter=bloom
 ```
 
-- `indexing.id-filter` picks what new segments get: `none` (default),
-  `bloom`, `fuse8` or `fuse16`. Each segment records its own filter, so a
-  change needs no reindex; merged segments move to the current choice.
+- `indexing.id-filter` picks what new segments get: `none`, `bloom`, `fuse8`
+  or `fuse16` (default). Each segment records its own filter, so a change
+  needs no reindex; merged segments move to the current choice.
+- `fuse16` costs about 18-20 bits per id and lets 0.0015% of absent ids through,
+  so even a batch of thousands of ids usually skips a segment. Building it
+  holds about 34 bytes per id while a segment's id dictionary is written.
+- Key cap: a `fuse8` or `fuse16` builder whose segment can hold more than
+  min(2^24, `indexing.max-ram-mb` / 4 / 34 bytes) ids (16.8M ids, about
+  570 MB, once the indexing budget is 2.2 GB or more or unlimited) builds a
+  `bloom` filter instead, at max(32, `indexing.id-filter-bits-per-key`) bits
+  per id. That skips segments nearly as well (about 0.003% of absent ids pass)
+  at 4 bytes per document and needs no builder memory. Each such fallback is
+  logged at info level.
 - `indexing.id-filter-bits-per-key` (default 16) and `indexing.id-filter-min-kb`
-  (default 16) size a `bloom` filter. More bits per id lower its false
+  (default 16) size a `bloom` filter only: one chosen explicitly, the fallback
+  above the key cap (which uses at least 32 bits per id), and the rare fallback
+  when a fuse filter cannot be built. More bits per id lower its false
   positive rate (about 1.3% at 10, 0.13% at 16, 0.004% at 32) at that many
   bits of RAM and disk per document.
-- `fuse16` costs about 18-20 bits per id and lets 0.0015% of absent ids through,
-  so even a large batch of ids usually skips a segment. Building it holds
-  about 35 bytes per id while a segment's id dictionary is written.
 - With `none`, deletes look up every segment whose id range overlaps the
   batch.
 

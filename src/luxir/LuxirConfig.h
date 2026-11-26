@@ -134,8 +134,11 @@ struct IndexConfig {
   // The membership filter flushes and merges write over each segment's ids
   // (reader/IdFilter.h): none, bloom, fuse8 or fuse16. Each segment records its
   // own choice, so changing it needs no reindex and merges move segments to it.
-  std::string id_filter = "none";
-  uint32_t id_filter_bits_per_key = 16;  // bloom only
+  // A fuse builder sized for more ids than IdFilter::maxFuseKeysFor(max_ram_mb)
+  // builds bloom at 32 or more bits per id instead.
+  std::string id_filter = "fuse16";
+  // Bloom only (an explicit bloom, and the fallback above the fuse key cap).
+  uint32_t id_filter_bits_per_key = 16;
   uint32_t id_filter_min_kb = 16;  // bloom only: smallest filter per segment
 };
 

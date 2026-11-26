@@ -5,12 +5,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <xxhash.h>
+
+#include "luxir/util/log.h"
 
 namespace luxir {
 
@@ -264,6 +267,8 @@ uint64_t fuseFinishBytes(uint64_t keys, uint32_t fingerprintBits) noexcept {
   return fuse::scratchBytes(keys, shape) + IdFilter::HEADER_BYTES + shape.arrayLength() * (fingerprintBits / 8);
 }
 
+std::atomic<uint64_t> capFallbacks{0};
+
 void bloomAdd(std::vector<uint32_t>& words, uint64_t hash) noexcept {
   auto* block = words.data() + blockOf(hash, words.size() / IdFilter::BLOCK_WORDS) * IdFilter::BLOCK_WORDS;
   for (size_t w = 0; w < IdFilter::BLOCK_WORDS; w++) block[w] |= bitOf(hash, w);
@@ -279,7 +284,23 @@ uint64_t IdFilter::bloomBlocksFor(const Options& options, uint64_t keys) noexcep
   return std::clamp<uint64_t>((bits + BLOCK_BYTES * 8 - 1) / (BLOCK_BYTES * 8), 1, MAX_BLOCKS);
 }
 
-uint64_t IdFilter::buildBytes(const Options& options, uint64_t keys) noexcept {
+uint64_t IdFilter::maxFuseKeysFor(int64_t ramBudgetBytes) noexcept {
+  if (ramBudgetBytes <= 0) return MAX_FUSE_KEYS;
+  return std::min<uint64_t>(MAX_FUSE_KEYS, (uint64_t)ramBudgetBytes / 4 / FUSE_BUILD_BYTES_PER_KEY);
+}
+
+IdFilter::Options IdFilter::optionsFor(const Options& options, uint64_t maxKeys) noexcept {
+  if (options.kind != Kind::FUSE || maxKeys <= options.maxFuseKeys) return options;
+  Options bloom = options;
+  bloom.kind = Kind::BLOOM;
+  bloom.bitsPerKey = std::max(options.bitsPerKey, CAP_FALLBACK_BITS_PER_KEY);
+  return bloom;
+}
+
+uint64_t IdFilter::fuseCapFallbacks() noexcept { return capFallbacks.load(std::memory_order_relaxed); }
+
+uint64_t IdFilter::buildBytes(const Options& requested, uint64_t keys) noexcept {
+  auto options = optionsFor(requested, keys);
   switch (options.kind) {
     case Kind::BLOOM: return bloomBlocksFor(options, keys) * BLOCK_BYTES;
     case Kind::FUSE: return keys * sizeof(uint64_t) + fuseFinishBytes(keys, options.fingerprintBits);
@@ -341,7 +362,12 @@ bool IdFilter::mayContainHash(uint64_t hash) const noexcept {
   }
 }
 
-IdFilter::Builder::Builder(const Options& options, uint64_t maxKeys) : options(options) {
+IdFilter::Builder::Builder(const Options& requested, uint64_t maxKeys) : options(optionsFor(requested, maxKeys)) {
+  if (options.kind != requested.kind) {
+    capFallbacks.fetch_add(1, std::memory_order_relaxed);
+    LOG_INFO("id filter: up to {} keys is above the fuse cap of {}; building bloom at {} bits per key", maxKeys,
+             requested.maxFuseKeys, options.bitsPerKey);
+  }
   switch (options.kind) {
     case Kind::BLOOM: words.resize(bloomBlocksFor(options, maxKeys) * BLOCK_WORDS); break;
     case Kind::FUSE:
