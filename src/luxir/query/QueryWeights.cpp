@@ -80,7 +80,7 @@ Query::Weight* AutomatonQuery::createWeight(
     if (rewritten == nullptr) return MultiTermQuery::createWeight(context, flags, multiplier);
     auto* filter = context.pool.make<ConstantScoreQuery>(rewritten);
     filter->markPlannerGenerated();
-    return filter->createWeight(context, flags, multiplier);
+    return filter->buildWeight(context, flags, multiplier);
   }
   if (rewritten == nullptr) rewritten = rewriteCaseVariants(context);
 #ifndef NDEBUG
@@ -88,7 +88,7 @@ Query::Weight* AutomatonQuery::createWeight(
     rewritten->validateLogical(context.planningContext(), multiplier);
   }
 #endif
-  return rewritten->createWeight(context, flags, multiplier);
+  return rewritten->buildWeight(context, flags, multiplier);
 }
 
 Query* AutomatonQuery::rewriteCaseVariants(Context& context) {
@@ -153,7 +153,7 @@ Query* AutomatonQuery::rewriteCaseVariants(Context& context) {
 
 Query::Weight* BoostQuery::createWeight(Context& context, int32_t flags,
                                         float multiplier) {
-  return child->createWeight(context, flags, multiplier * boost);
+  return child->buildWeight(context, flags, multiplier * boost);
 }
 
 Query::Weight* ConstantScoreQuery::createWeight(Context& context, int32_t flags,
@@ -264,7 +264,7 @@ Query::Weight* CombinedFieldQuery::createWeight(
     rewritten->validateLogical(context.planningContext(), multiplier);
   }
 #endif
-  return rewritten->createWeight(context, flags, multiplier);
+  return rewritten->buildWeight(context, flags, multiplier);
 }
 
 Query& FuzzyQuery::logicalRewrite(Context& context) const {
@@ -287,7 +287,7 @@ Query::Weight* FuzzyQuery::createWeight(
     rewritten->validateLogical(context.planningContext(), multiplier);
   }
 #endif
-  return rewritten->createWeight(context, flags, multiplier);
+  return rewritten->buildWeight(context, flags, multiplier);
 }
 
 Query::Weight* GeoBoxQuery::createWeight(Context& context, int32_t flags,

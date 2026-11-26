@@ -3,6 +3,7 @@
 
 #include "luxir/reader/SegmentCore.h"
 #include "IndexWriter.h"
+#include "luxir/store/AcquireJoin.h"
 #include "luxir/store/Manifest.h"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <typeinfo>
 
 #include <boost/unordered/unordered_flat_set.hpp>
+#include <oneapi/tbb/parallel_for.h>
 #include <oneapi/tbb/task_group.h>
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/api/padded_input.h"
@@ -3734,10 +3736,39 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
   return out;
 }
 
+// One target's delete spans and reader state, kept through prefetch and application.
+struct IndexWriter::SegmentDeletes {
+  SegInfo& seg;
+  boost::container::small_vector<SortedDeletes::EntrySpan, 8> spans;
+  std::shared_ptr<SegmentCore> core;
+  const DecodedFieldRecord* field = nullptr;
+  std::optional<IdFilter> filter;
+  bool lookup = false;
+  std::exception_ptr error;
+
+  explicit SegmentDeletes(SegInfo& seg) : seg(seg) {}
+
+  void clip(const IdRange& range) {
+    for (auto& span : spans) span = clipDeletes(span, range);
+    auto empty = std::ranges::remove_if(spans, [](auto span) { return span.empty(); });
+    spans.erase(empty.begin(), empty.end());
+  }
+
+  bool mayHold(const SortedDeletes::Entry& entry) const {
+    return entry.val().deleteWatermark != 0 && (!filter || filter->mayContain((std::string_view)entry));
+  }
+};
+
 // This is where seg.liveGen can change. A snapshot segment's personal deletes
 // stay put meanwhile: a merge attaches them to a new output under indexMutex,
 // and the snapshot holds that output whole or not at all. Returns the ids
 // looked up in segment dictionaries, summed over segments.
+// Select spans and prepare cores, prefetch filters, then prefetch lookup parts
+// for surviving segments and apply their deletes. Once the cores are open,
+// base-file reads have at most two potentially nonempty prefetch rounds, each
+// issuing across all segments and waiting once. Every backend runs these stages.
+// Files with free views issue nothing. A failed batch is logged and the parts
+// it left unheld are acquired on use.
 uint64_t IndexWriter::applyDeletes(const DeleteApplication& app) {
   std::atomic<uint64_t> applications = 0;
   // Apply deletes to segments in parallel.  Each task writes new liveDocs
@@ -3748,21 +3779,73 @@ uint64_t IndexWriter::applyDeletes(const DeleteApplication& app) {
   // data and overlay files.
   // The waiting commit thread must not execute an unrelated merge or flush.
   oneapi::tbb::this_task_arena::isolate([&] {
-    oneapi::tbb::task_group tg;
+    std::vector<SegmentDeletes> work;
+    work.reserve(app.targets.size());
     for (SegInfo* seg : app.targets) {
-      tg.run([this, seg, &app, &applications]() {
-        // Packets apply span by span, unmerged: a document goes when any fact for
-        // its id outranks its birth, which is what a merged maximum would decide.
-        boost::container::small_vector<SortedDeletes::EntrySpan, 8> spans;
-        auto add = [&](const SortedDeletes& packet) {
-          if (packet.sourceSegId == seg->segId || !mayApplyDeletes(*seg, packet)) return;
-          for (auto& span : packet.lists()) spans.push_back(span);
-        };
-        for (const auto& packet : app.pending.deletes) add(*packet);
-        for (const auto& packet : seg->personalDeletes.deletes) {
-          if (!app.pending.deletes.contains(packet) && app.selected.deletes.contains(packet)) add(*packet);
+      // Packets apply span by span, unmerged: a document goes when any fact for
+      // its id outranks its birth, which is what a merged maximum would decide.
+      auto& target = work.emplace_back(*seg);
+      auto add = [&](const SortedDeletes& packet) {
+        if (packet.sourceSegId == seg->segId || !mayApplyDeletes(*seg, packet)) return;
+        for (auto span : packet.lists()) target.spans.push_back(span);
+      };
+      for (const auto& packet : app.pending.deletes) add(*packet);
+      for (const auto& packet : seg->personalDeletes.deletes) {
+        if (!app.pending.deletes.contains(packet) && app.selected.deletes.contains(packet)) add(*packet);
+      }
+      if (target.spans.empty()) work.pop_back();
+    }
+    if (work.empty()) return;
+    // A core open or filter retry can block. Keep each segment in its own task.
+    const oneapi::tbb::simple_partitioner perSegment;
+    oneapi::tbb::parallel_for(size_t(0), work.size(), [&](size_t i) { prepareDeletes(work[i]); }, perSegment);
+
+    auto round = [&](const char* name, auto issue) {
+      AcquireJoin join;
+      for (auto& target : work) issue(target, join);
+      join.wait();
+      for (auto& target : work) {
+        if (target.error) {
+          LOG_DEBUG("Delete prefetch ({}) failed for segment {}; retrying needed parts on use", name, target.seg.name());
+          target.error = nullptr;
         }
-        applications.fetch_add(applyDeletes(*seg, spans), std::memory_order_relaxed);
+      }
+    };
+    round("filters", [](SegmentDeletes& target, AcquireJoin& join) {
+      if (!target.field) return;
+      if (auto part = target.field->idFilter()) {
+        target.core->acquireSlices(std::span(&part, 1), ReadClass::METADATA, join, &target.error);
+      }
+    });
+    oneapi::tbb::parallel_for(size_t(0), work.size(), [&](size_t i) {
+      auto& target = work[i];
+      if (!target.field) return;
+      // The id filter proves most absent ids absent: those skip the dictionary,
+      // and a segment that can hold none of them is not touched further.
+      target.filter = target.core->idFilter();
+      target.lookup = std::ranges::any_of(target.spans, [&](auto span) {
+        return std::ranges::any_of(span, [&](const auto& entry) { return target.mayHold(entry); });
+      });
+      if (target.lookup) Signal::emit("deleteLookupInSegment", (void*)(int64_t)target.seg.segId);
+    }, perSegment);
+
+    boost::container::small_vector<field_parts::Slice, 4> metadata, data;
+    round("terms", [&](SegmentDeletes& target, AcquireJoin& join) {
+      if (!target.lookup) return;
+      metadata.clear();
+      data.clear();
+      TermsEnum::wholeReadParts(*target.field, [&](auto part, ReadClass readClass) {
+        (readClass == ReadClass::METADATA ? metadata : data).push_back(part);
+      });
+      if (auto part = target.core->versionRunsPart()) metadata.push_back(part);
+      target.core->acquireSlices(metadata, ReadClass::METADATA, join, &target.error);
+      target.core->acquireSlices(data, ReadClass::DATA, join, &target.error);
+    });
+
+    oneapi::tbb::task_group tg;
+    for (const auto& target : work) {
+      if (target.lookup) tg.run([this, &target, &applications] {
+        applications.fetch_add(applyDeletes(target), std::memory_order_relaxed);
       });
     }
     tg.wait();
@@ -3770,54 +3853,29 @@ uint64_t IndexWriter::applyDeletes(const DeleteApplication& app) {
   return applications.load(std::memory_order_relaxed);
 }
 
-uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans) {
-  if (spans.empty()) {
-    return 0;
-  }
-
+void IndexWriter::prepareDeletes(SegmentDeletes& target) {
+  auto& seg = target.seg;
   // Test hook: reports each segment selected for delete application this commit.
   // Called in parallel for different segments, so consumers should synchronize when applicable.
-  luxir::Signal::emit("deleteAppliedToSegment", (void*)(int64_t)seg.segId);
-
-  boost::container::small_vector<SortedDeletes::EntrySpan, 8> clipped;
-  auto clip = [&](const IdRange& range) {
-    clipped.clear();
-    for (auto span : spans) {
-      span = clipDeletes(span, range);
-      if (!span.empty()) clipped.push_back(span);
-    }
-  };
+  Signal::emit("deleteAppliedToSegment", (void*)(int64_t)seg.segId);
   auto range = seg.idRange.load();
   if (range) {
-    clip(*range);
-    if (clipped.empty()) return 0;
+    target.clip(*range);
+    if (target.spans.empty()) return;
   }
-
-  // Read the segment to find documents that should be deleted
-  auto core = getSegmentCore(seg);
-  PostingsReader& reader = core->rootReader();
-  int32_t maxDocId = reader.maxDoc();
-
+  target.core = getSegmentCore(seg);
   if (!range) {
-    clip(*seg.idRange.load());
-    if (clipped.empty()) return 0;
+    target.clip(*seg.idRange.load());
+    if (target.spans.empty()) return;
   }
+  target.field = target.core->rootReader().fieldInfo("id");
+  if (!target.field) LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.name());
+}
 
-  // Read the "id" field using TermsEnum
-  auto* idFieldInfo = reader.fieldInfo("id");
-  if (!idFieldInfo) {
-    LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.name());
-    return 0;
-  }
-
-  // The id filter proves most absent ids absent: those skip the dictionary,
-  // and a segment that can hold none of them is not touched further.
-  auto idFilter = core->idFilter();
-  auto mayHold = [&](const auto& entry) {
-    return entry.val().deleteWatermark != 0 && (!idFilter || idFilter->mayContain((std::string_view)entry));
-  };
-  if (std::ranges::none_of(clipped, [&](auto span) { return std::ranges::any_of(span, mayHold); })) return 0;
-  Signal::emit("deleteLookupInSegment", (void*)(int64_t)seg.segId);
+uint64_t IndexWriter::applyDeletes(const SegmentDeletes& target) {
+  auto& seg = target.seg;
+  auto& reader = target.core->rootReader();
+  int32_t maxDocId = reader.maxDoc();
 
   // Load existing LiveDocs if they exist: the published reader's when it
   // holds this generation
@@ -3879,12 +3937,12 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
   };
   auto apply = [&](SortedDeletes::EntrySpan span) {
     auto guard = MemPool::threadLocalPoolGuard();
-    TermsEnum termsEnum(guard.pool(), reader, *idFieldInfo);
+    TermsEnum termsEnum(guard.pool(), reader, *target.field);
     std::vector<DeleteCandidate> hits;
     auto scratch = indexRamBudget->forceAcquire(0);
     uint64_t probed = 0;
     for (auto& entry : span) {
-      if (!mayHold(entry)) continue;
+      if (!target.mayHold(entry)) continue;
       probed++;
       uint64_t deleteVersion = entry.val().deleteWatermark;
       std::string_view deleteId = (std::string_view)entry;
@@ -3911,7 +3969,7 @@ uint64_t IndexWriter::applyDeletes(SegInfo& seg, std::span<const SortedDeletes::
   // Split large spans into id-ordered chunks so a few big segments still use every
   // worker; each chunk seeks forward from its own enum.
   boost::container::small_vector<SortedDeletes::EntrySpan, 8> pieces;
-  for (auto span : clipped) {
+  for (auto span : target.spans) {
     for (size_t at = 0; at < span.size(); at += chunk) {
       pieces.push_back(span.subspan(at, std::min(chunk, span.size() - at)));
     }

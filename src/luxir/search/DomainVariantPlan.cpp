@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/query/ReadDeclarer.h"
 #include "DomainVariantPlan.h"
 #include "luxir/search/SearchOverrides.h"
 
@@ -366,9 +367,15 @@ bool DomainVariantPlan::addChild(std::string_view key, std::function_ref<bool(si
   return created;
 }
 
+void DomainVariantPlan::declareReads(ReadDeclarer& reads, Query::PlanningContext& planning,
+                                     int32_t requestFlags) const {
+  int32_t flags = Query::membershipWeightFlags(requestFlags);
+  for (const auto& source : querySources) reads.root(*source.query, planning, flags);
+}
+
 void DomainVariantPlan::buildWeights(Query::Context& context, Query::PlanningContext& planning,
                                      int32_t requestFlags) {
-  int32_t filterFlags = requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  int32_t filterFlags = Query::membershipWeightFlags(requestFlags);
   for (auto& source : querySources) {
     source.weight = context.createRootWeight(*source.query, filterFlags);
     source.use = planning.getFilterUse(*source.query);

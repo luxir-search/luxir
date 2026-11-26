@@ -908,7 +908,9 @@ private:
   void retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void releaseSegments(std::vector<std::unique_ptr<SegInfo>>& segments);
   void moveSegmentToDelete(uint64_t segId);
-  uint64_t applyDeletes(SegInfo& seg, std::span<const SortedDeletes::EntrySpan> spans);
+  struct SegmentDeletes;
+  void prepareDeletes(SegmentDeletes& target);
+  uint64_t applyDeletes(const SegmentDeletes& target);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
   bool mergeSegmentsBody(MergeMessage& msg);
 

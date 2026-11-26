@@ -707,6 +707,7 @@ TEST_F(DistinctFacetTest, wideTupleWorkerIdsAreRemappedBeforeUnion) {
                         reader->field("key_s")});
   key.fields.push_back({"key_i", api::GroupComponent_::Type::INT, FieldType::Storage::INT64, {}, reader->field("key_i")});
   FacetGroupPlan plan(key);
+  plan.bindDimensions();
   CollapseKey first, second;
   first.components = {{true, 0}, {true, INT64_MIN}};
   second.components = {{true, 1}, {true, INT64_MAX}};

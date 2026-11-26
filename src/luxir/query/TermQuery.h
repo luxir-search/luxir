@@ -107,6 +107,8 @@ public:
     return hasInjectedTermStats ? injectedTermStats : cachedTermInfo.termStats;
   }
 
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
+
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
 

@@ -71,7 +71,8 @@ locations, browse `src/luxir/<area>/`.
      dictionary terms that names its own kind (split-block Bloom or binary fuse) and
      parameters. `IdFilter::Options` picks what a writer builds (none by default).
      `SegmentCore::idFilter` reads it; the writer's delete application skips ids
-     and segments it excludes
+     and segments it excludes. After core open it prefetches whole filters, then
+     survivors' whole lookup parts.
    - `OwnershipShape` maps immediate parent rows to contiguous child ranges, with an
      optional child-to-parent mono column. Shape descriptors live in the bundle catalog;
      its first use reads metadata and endpoints without scanning child rows.

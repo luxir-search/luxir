@@ -32,6 +32,7 @@ public:
   // queries to produce. Both the pool and any parsed protobuf objects must outlive the tree.
   explicit ProtobufSearchParser(SearchRequest& req);
 
+  // Build the logical op tree and record its materialization order.
   RootOp* parse();
 };
 

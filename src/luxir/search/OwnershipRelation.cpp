@@ -695,6 +695,10 @@ OwnershipRelation::OwnershipRelation(IndexReader& many, IndexReader& one, Reques
   if (path == one.path()) throw RequestError("domain transform requires different spaces");
   while (!path.empty() && path != one.path()) path = spaceParentPath(path);
   if (path != one.path()) throw RequestError("domain transform requires ancestor and descendant paths");
+}
+
+void OwnershipRelation::bindMappers() {
+  assert(!bound);
   mappers.reserve(many.segments().size());
   for (size_t leaf = 0; leaf < many.segments().size(); leaf++) {
     auto& child = many.segments()[leaf];
@@ -702,10 +706,12 @@ OwnershipRelation::OwnershipRelation(IndexReader& many, IndexReader& one, Reques
     if (child.hasSpace()) mappers.emplace_back(std::in_place, child.segmentCore(), one.path(), many.path());
     else mappers.emplace_back(std::nullopt);
   }
+  bound = true;
 }
 
 Query::ScorerSupplier* OwnershipRelation::reduce(MemPool& pool, size_t leaf,
     Query::ScorerSupplier& input, DocSet* domain, RowReduction reduction, float multiplier) {
+  assert(bound);
   assert(reduction.kind != RowReduction::NONE);
   return mappers[leaf] ? pool.make<Supplier>(input, *mappers[leaf], domain,
       one.segments()[leaf].maxDoc(), many.segments()[leaf].maxDoc(), reduction, multiplier) : nullptr;
@@ -746,6 +752,7 @@ LUXIR_NOINLINE void addFamilyRuns(const OwnershipMapper& mapper, DocSet& owners,
 } // namespace
 
 DomainHandle OwnershipRelation::expand(size_t leaf, DomainHandle domain) {
+  assert(bound);
   auto& source = one.segments()[leaf];
   auto& destination = many.segments()[leaf];
   domain.assertScope(source);
@@ -768,6 +775,7 @@ DomainHandle OwnershipRelation::expand(size_t leaf, DomainHandle domain) {
 }
 
 DomainHandle OwnershipRelation::project(size_t leaf, DomainHandle domain) {
+  assert(bound);
   auto& source = many.segments()[leaf];
   auto& destination = one.segments()[leaf];
   domain.assertScope(source);
