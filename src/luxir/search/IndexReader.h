@@ -64,11 +64,13 @@ public:
   // negative, throw SegmentCorruptError.
   static std::shared_ptr<LiveDocs> decode(std::shared_ptr<InputFile> file, uint64_t size, std::string_view name,
                                           std::string_view segment, int32_t maxDoc, int32_t numLive);
-  // Opens and decodes generation `liveGen` at once, for the writer. Null when
-  // the file is missing and missingFileOK is set.
+  // Opens and decodes generation `liveGen` at once, for the writer. `size`
+  // and `numLive` are what the writer recorded for the generation (0 and -1
+  // when unknown); a known size opens the file without a size request. Null
+  // when the file is missing and missingFileOK is set.
   static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
-                                          uint64_t liveEpoch, int32_t maxDoc, bool missingFileOK = true,
-                                          bool expectSynced = false);
+                                          uint64_t liveEpoch, int32_t maxDoc, int32_t numLive, uint64_t size,
+                                          bool missingFileOK = true, bool expectSynced = false);
 
   // Field names identify immutable physical columns across ANN overlay replacements.
   // Callers must retain this LiveDocs and alias its shared_ptr to the returned

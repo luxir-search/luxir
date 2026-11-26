@@ -1807,11 +1807,11 @@ TEST_F(IndexWriterTest, testMissingFiles) {
 
   // Test missingFileOK = false (should throw on missing files)
   EXPECT_THROW({
-      auto liveDocs1 = LiveDocs::create(testDir, 999, 1, 1, 1, 10, false);  // non-existent segment
+      auto liveDocs1 = LiveDocs::create(testDir, 999, 1, 1, 1, 10, -1, 0, false);  // non-existent segment
   }, std::filesystem::filesystem_error);
 
   // Test missingFileOK = true (should return nullptr on missing files)
-  auto liveDocs2 = LiveDocs::create(testDir, 999, 1, 1, 1, 10, true);
+  auto liveDocs2 = LiveDocs::create(testDir, 999, 1, 1, 1, 10, -1, 0, true);
   EXPECT_EQ(liveDocs2, nullptr);
 }
 
