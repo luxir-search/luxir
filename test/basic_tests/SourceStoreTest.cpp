@@ -25,6 +25,7 @@
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/SchemaBuilder.h"
+#include "test/StrictStorage.h"
 #include "test/TestUtils.h"
 
 namespace luxir::test {
@@ -143,6 +144,40 @@ TEST_F(SourceStoreTest, keepsMapsAcrossMergesAndRetiresReplacedFiles) {
   EXPECT_FALSE(std::ranges::contains(before, after[0]));
   EXPECT_EQ((std::vector<std::string>{R"({"id":"b","s_s":"x y"})", R"({"id":"c","k_is":[1,2]})"}), sources(helper));
   for (const auto& name : before) EXPECT_TRUE(waitGone(iw->dir, name)) << name;
+}
+
+// Opening a snapshot reads nothing of the source store: the map and the source
+// files are opened with their manifest sizes, and the first fetch reads them.
+TEST_F(SourceStoreTest, snapshotOpenReadsNoSourceFile) {
+  CollectionHelper helper;
+  auto iw = helper.getIndexWriter();
+  enableSource(helper);
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "n_i", 42)}, UpdateMessage::COMMIT).success);
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::shared_ptr<Directory>(iw, &iw->dir), counters, StrictWholeFiles::COUNT);
+  auto reader = std::make_shared<IndexReader>(dir);
+  ASSERT_EQ(1u, reader->segments().size());
+  const auto* source = reader->segments()[0].source();
+  ASSERT_NE(nullptr, source);
+  auto info = readDurableIndexInfo(iw->dir);
+  std::vector<std::string> names;
+  for (const auto& file : manifestFiles(*info)) {
+    if (isSourceFile(file.name)) names.emplace_back(file.name);
+  }
+  ASSERT_EQ(2u, names.size());  // the map and one source file
+  for (const auto& name : names) {
+    auto stats = counters->fileStats(name);
+    EXPECT_EQ(0u, stats.acquires) << name;
+    EXPECT_EQ(0u, stats.sizeRequests) << name;
+  }
+  SourceReader::Cursor cursor;
+  source::Record record;
+  ASSERT_EQ(SourceReader::Status::OK, source->fetch(0, cursor, record));
+  std::string json;
+  ASSERT_TRUE(SourceReader::renderJson(record, json));
+  EXPECT_EQ(R"({"id":"a","n_i":42})", json);
+  for (const auto& name : names) EXPECT_NE(0u, counters->fileStats(name).acquires) << name;
+  EXPECT_TRUE(source->healthy());
 }
 
 TEST_F(SourceStoreTest, mergeReferencesFilesWorthKeeping) {
