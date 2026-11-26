@@ -65,6 +65,11 @@ void SearchEngine::submitBody(SearchRequest& req) {
   LoadScope load(LoadKind::REQUEST);
   std::optional<FanoutCreditScope> credit;
   if (req.tg) credit.emplace(execution.startNs());
+  // Reads done for the request see its context, here and in every task it
+  // fans out (FanoutScope::spawn carries it). The scope only touches this
+  // thread's slot, so it may end after bodyDone() has released the request.
+  req.io.requestId = req.proto.request_id;
+  IoScope io(&req.io);
   // Until the calculators start, an unclassified failure is the request's
   // fault: parsers and planners reject authored input with bare exceptions.
   // Once execution is under way it is the engine's.  Throw sites that know
@@ -161,6 +166,7 @@ void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
 void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver) {
   req.counting = true;
   req.submitted = std::chrono::steady_clock::now();
+  if (req.waitCancellation.stop_possible()) req.io.stop = req.waitCancellation.get_token();
   metrics().start(metricActivity(MetricStage::SEARCH));
   if (!req.proto.min_commit.empty()) {
     try {
@@ -226,7 +232,13 @@ void SearchEngine::getResources(SearchRequest& req) {
     constexpr uint64_t maxUs = std::numeric_limits<uint64_t>::max();
     uint64_t freshnessUs = request.freshness_ms > maxUs / 1000
         ? maxUs : request.freshness_ms * 1000;
-    req.reader = collection->getReaderManager().getReader(freshnessUs);
+    // A search with a deadline does not wait out a reopen past it: it searches
+    // the published reader. The wait ends at the request's wait deadline, a
+    // margin before the transport's, so a fallback search or a reader_opening
+    // error still reaches the client. One that names a min_commit needs the
+    // reopen and waits for it, as its floor check below requires.
+    auto deadline = request.min_commit.empty() ? req.io.waitDeadline() : std::chrono::steady_clock::time_point::max();
+    req.reader = collection->getReaderManager().getReader(freshnessUs, deadline);
     if (!request.min_commit.empty()) {
       auto floor = CommitId::parse(request.min_commit);
       if (req.reader->incarnation() != floor.incarnation || req.reader->commitId() < floor.index_gen)

@@ -42,8 +42,13 @@ locations, browse `src/luxir/<area>/`.
      so `getReader` normally returns from its lock-free path. `prepare()` takes no lock;
      `publish()` holds `indexReaderMutex` only for the swap. When that open was skipped
      (no search within `idleAfterUs`, a writer reopening an existing index) or failed,
-     one search reopens under `indexReaderMutex`; requests the old reader satisfies
-     (freshness and schema) keep it, the rest wait (`READER_WAIT`).
+     one search reopens, outside `indexReaderMutex` (which guards only publication and
+     the `opening` flag); requests the old reader satisfies (freshness and schema) keep
+     it, the rest wait (`READER_WAIT`) until the reopen or a `publish()` serves them,
+     `close()`, or their `IoContext::waitDeadline()`. At the deadline a waiter searches
+     the published reader (a cancelled `READER_WAIT`), or fails `reader_opening` if none
+     or if it predates a schema change. The opener waits for its own open, which runs
+     under no request's deadline; a `min_commit` request passes no deadline.
    - `ResolvedSchema.cpp`: Declared representations and segment-generation coverage
    - `IndexReader` is a view of one path in a snapshot, with a leaf per bundle;
      a reopen shares each unchanged `SegmentCore`, live docs and overlay with the
@@ -230,6 +235,11 @@ locations, browse `src/luxir/<area>/`.
      delegates. `DirectoryFactory::find<T>()` reaches per-node storage state through the wrappers;
      `Directory::capabilities()` (`HARD_LINK`, `ATOMIC_RENAME`, `DURABLE_SYNC`, `MEMORY_MAPPED`,
      `REMOTE`) lets callers fall back (`reuseFiles` copies when links are unavailable)
+   - `IoContext` / `IoScope` / `IoCounters` (`util/IoContext.h`): the thread-local request I/O
+     context (query id, deadline, cancellation, fill hint, per-request I/O counters) that storage
+     layers and backends read and count into; `SearchRequest::io` is installed by `submitBody`,
+     carried into tasks by `FanoutScope` (`bindIoContext`), counted by `SegmentCore` acquires and
+     reported in the profile
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)
