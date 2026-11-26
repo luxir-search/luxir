@@ -248,6 +248,10 @@ void LuxirNode::detachCollection(const CollectionId& id, std::string_view target
   collections_->detach(id, target);
 }
 
+void LuxirNode::closeCollection(const CollectionId& id) {
+  collections_->close(id);
+}
+
 std::shared_ptr<Collection> LuxirNode::attachCollection(const CollectionId& id, bool force) {
   return collections_->attach(id, force);
 }

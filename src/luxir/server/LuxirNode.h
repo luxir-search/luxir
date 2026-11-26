@@ -111,6 +111,9 @@ public:
   void deleteCollection(std::string_view name) { deleteCollection(CollectionId::of(name)); }
   void detachCollection(const CollectionId& id, std::string_view target);
   void detachCollection(std::string_view name, std::string_view target) { detachCollection(CollectionId::of(name), target); }
+  // Closes a loaded collection here without a handoff (Collections::close).
+  void closeCollection(const CollectionId& id);
+  void closeCollection(std::string_view name) { closeCollection(CollectionId::of(name)); }
   std::shared_ptr<Collection> attachCollection(const CollectionId& id, bool force = false);
   std::shared_ptr<Collection> attachCollection(std::string_view name, bool force = false) { return attachCollection(CollectionId::of(name), force); }
   // READ_ONLY attaches are allowed on a read-only node too; a writer attach

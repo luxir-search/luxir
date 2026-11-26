@@ -607,7 +607,12 @@ publisher such as a replica refresher resolves the newest commit of the same
 incarnation and publishes it into the shard's snapshot registry
 (`Shard::getSnapshots()`). `Collections::stage`, `prepare` and `install` are for the
 node that owns the collection and refuse another node's incarnation, so a view
-of a new incarnation is detached and attached again. `CommitWaits::setParkHook` runs a callback whenever a commit wait parks on
+of a new incarnation is closed and attached again. `LuxirNode::closeCollection(id)`
+closes a loaded collection on this node without a handoff: a writer commits
+(unless demoted) and closes, a read-only view just closes, and the catalog
+entry and its assignment stay as they are. A plugin that coordinates ownership
+itself closes on one node and opens on another with `attachCollection(id,
+Collections::Role::WRITER, true)`, which takes the assignment. `CommitWaits::setParkHook` runs a callback whenever a commit wait parks on
 a collection, so such a publisher can fetch at once instead of on its next interval.
 
 ### Capabilities

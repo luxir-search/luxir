@@ -723,6 +723,26 @@ void Collections::detach(const CollectionId& key, std::string_view target) {
   if (commitFailure) std::rethrow_exception(commitFailure);
 }
 
+void Collections::close(const CollectionId& key) {
+  if (!config.replication.source.empty()) throw ReadOnlyError("cannot close collections on a follower");
+  validate(key);
+  Transition transition(*this, key);
+  auto collection = map.get(key);
+  auto shard = collection ? collection->getShard() : nullptr;
+  if (!shard) throw CollectionNotFoundError("collection '" + key.label() + "' is not loaded here");
+  std::exception_ptr commitFailure;
+  if (shard->iw) {
+    // A demoted writer committed and closed already.
+    try { if (!shard->readOnly.load(std::memory_order_acquire)) shard->iw->commit(); }
+    catch (...) { commitFailure = std::current_exception(); }
+    try { shard->iw->close(); }
+    catch (...) { if (!commitFailure) commitFailure = std::current_exception(); }
+  }
+  unload(transition, collection, "collection '" + key.label() + "' was closed on this node");
+  LOG_INFO("Closed collection: {}", key.label());
+  if (commitFailure) std::rethrow_exception(commitFailure);
+}
+
 void Collections::demote(const CollectionId& key) {
   validate(key);
   Transition transition(*this, key);

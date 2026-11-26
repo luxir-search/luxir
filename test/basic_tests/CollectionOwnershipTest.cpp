@@ -707,3 +707,21 @@ TEST_F(CollectionOwnershipTest, readOnlyAttachOnAWriterNodeRefusesUpdates) {
   auto& catalog = b->collections().catalog();
   EXPECT_EQ("A", catalog.find("c")->node);
 }
+
+TEST_F(CollectionOwnershipTest, closeKeepsTheAssignmentAndForceAttachTakesIt) {
+  startA();
+  CollectionHelper c(*a, "c");
+  ASSERT_TRUE(c.index(flatdoc("id", "first"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(c.index(flatdoc("id", "buffered")).success);
+  a->closeCollection(CollectionId::of("c"));
+  EXPECT_TRUE(c.getIndexWriter()->isClosed());
+  EXPECT_EQ("A", a->collections().catalog().find("c")->node);
+  startB();
+  auto view = b->attachCollection(CollectionId::of("c"), Collections::Role::READ_ONLY);
+  EXPECT_EQ(2, view->getReaderManager().getReader()->liveDocs()); // close committed the buffered doc
+  b->closeCollection(CollectionId::of("c"));
+  EXPECT_THROW(b->closeCollection(CollectionId::of("c")), CollectionNotFoundError);
+  auto writer = b->attachCollection(CollectionId::of("c"), Collections::Role::WRITER, true);
+  EXPECT_EQ("B", b->collections().catalog().find("c")->node);
+  EXPECT_EQ(2, writer->getReaderManager().getReader()->liveDocs());
+}

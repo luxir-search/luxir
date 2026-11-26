@@ -204,6 +204,12 @@ public:
   // Final commit (best effort), close, and hand off the existing incarnation.
   // A commit failure is thrown after the handoff; assignment failures also unload.
   void detach(const CollectionId& id, std::string_view target);
+  // Final commit of a writer (best effort, skipped when demoted), close, and
+  // unload, leaving the catalog entry and its assignment as they are: for a
+  // caller that coordinates ownership itself and reopens with attach (force
+  // to take the assignment). A read-only view just closes. A commit failure
+  // is thrown after the unload.
+  void close(const CollectionId& id);
   // Closes the writer of a registered collection after a commit and keeps
   // serving its last snapshot read-only (updates get ReadOnlyError). The
   // first half of a writer handoff. Idempotent.
