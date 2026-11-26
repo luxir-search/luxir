@@ -51,8 +51,9 @@ POST /collections/books/_search
 `k` is how many nearest documents the query node produces; `limit` is how
 many the request returns. The score is the similarity under the field's
 metric. Until you build an approximate index, every search scans the
-full-precision vector column, so a collection is searchable as soon as its
-vectors are indexed and the results are exact. [Approximate search](#approximate-search)
+stored vector column, so a collection is searchable as soon as its
+vectors are indexed and the results are exact over the stored vectors
+(see [Column encoding](#column-encoding)). [Approximate search](#approximate-search)
 is a commit-time option for large collections; the query does not change.
 
 A list's [diversify cap](searching.md#diversifying-a-document-list) applies
@@ -147,7 +148,8 @@ POST /collections/books/_schema
 }
 ```
 
-Metrics are `l2`, `ip` (inner product), and `cosine`. Set a positive `dims`
+Metrics are `l2`, `ip` (inner product), `cosine`, and `hamming` for
+[binary vectors](#binary-vectors). Set a positive `dims`
 to fix the dimension for indexed and query vectors across the collection.
 When omitted, the first vector in each segment establishes the dimension.
 
@@ -157,6 +159,127 @@ to one hit per document, scored by that document's best vector.
 
 An optional `ann` object chooses how [approximate indexes](#index-settings)
 for the field are built; the defaults suit most embedding models.
+
+### Column encoding
+
+The vector column is the largest part of a vector field on disk and in the
+page cache, and every exact search and every approximate-search rescore reads
+it. `encoding` chooses how each vector is stored:
+
+| `encoding` | Bytes per vector | Stored value |
+|---|---|---|
+| `f32` (default) | `4 * dims` | the float32 values |
+| `f16` | `2 * dims` | IEEE half precision per element: 11 significant bits, magnitudes up to 65504 |
+| `bf16` | `2 * dims` | bfloat16 per element: 8 significant bits, the float32 range |
+| `sq8` | `8 + dims` | per-vector scalar quantization: a float offset and scale, plus one byte per dimension |
+| `bit` | `dims / 8` | one bit per dimension, set when the element is positive; for `metric: hamming` only (see [Binary vectors](#binary-vectors)) |
+
+At 768 dimensions that is 3072, 1536, 1536, 776, and 96 bytes per vector.
+
+```json
+{
+  "fields": {
+    "embedding_v": {
+      "type": "vector",
+      "dims": 768,
+      "metric": "cosine",
+      "encoding": "sq8"
+    }
+  }
+}
+```
+
+`sq8` quantizes each vector on its own, between its minimum and maximum
+element, so a stored vector never depends on other vectors, segments, or
+statistics, and a constant vector is stored exactly. Cosine vectors are
+normalized before they are encoded, unless `normalize_on_write` is `false`.
+
+`f16` rejects a vector with an element whose magnitude exceeds 65504; `bf16`
+and `sq8` accept every valid vector. A cosine field with
+`normalize_on_write: false` skips a vector that has no direction once encoded,
+as it skips a zero vector: under `f16`, elements below about 3e-8 are stored
+as zero.
+
+Search scores the query, which stays float32, against the stored values:
+`exact: true`, the scan of segments without an overlay, and the rescore of
+approximate candidates are all exact over the stored vectors, not over the
+vectors you submitted, and a `similarity` threshold compares those scores.
+Cosine over `f16`, `bf16` and `sq8` divides by the norm of the stored vector,
+so scores remain cosines. Vectors read back in `fields` are the stored values
+decoded to float32.
+
+`encoding` applies to segments written after the change. A merge writes the
+field's current encoding: it copies the vectors of inputs already in it and
+re-encodes the others, so the field converges to its declared encoding as its
+segments merge. A segment that is never merged keeps the encoding it was
+written with; a forced merge (`max_segments` on a
+[commit](indexing.md#visibility-and-commits)) re-encodes the segments it
+merges. Moving to a narrower encoding is lossy. Re-encoding to `f16` clamps
+elements beyond 65504 and logs a warning with their count; `bf16` and `sq8`
+never clamp.
+
+To keep two precisions of one input, such as `sq8` for search beside an
+`f32` copy, declare a [variant](schema.md#field-variants). A variant may set
+its own `encoding` and `truncate_dims`, and must share the primary's input
+`dims`. Query the copy by its variant name, `embedding_v__full` here:
+
+```json
+"embedding_v": {
+  "type": "vector", "dims": 768, "metric": "cosine", "encoding": "sq8",
+  "variants": {
+    "full": { "type": "vector", "dims": 768, "metric": "cosine" }
+  }
+}
+```
+
+With
+[`truncate_dims`](#truncate-matryoshka-embeddings), `dims` in the table
+above is the truncated dimension.
+
+### Binary vectors
+
+Binary embeddings (models with a binary or "ubinary" output, or float
+embeddings quantized to their signs) and bit fingerprints such as SimHash
+compare by Hamming distance, the number of bits that differ. `metric:
+hamming` stores one bit per dimension and defaults `encoding` to `bit`:
+
+```json
+{
+  "fields": {
+    "fingerprint_v": {
+      "type": "vector",
+      "dims": 1024,
+      "metric": "hamming"
+    }
+  }
+}
+```
+
+Vectors are sent as numbers, like any other vector: a dimension's bit is set
+when its value is greater than zero, so the float output of a model is
+binarized by its signs, and a 0/1 bit array is stored as is. Reading the
+field back returns 0s and 1s. The score is `1 - hamming distance / dims`:
+1 for identical bits, 0 for complementary ones, and `similarity` is a minimum
+score on that scale.
+
+- `dims` (or `truncate_dims`, when set) must be a multiple of 8. Without
+  `dims`, a vector whose length is not is rejected.
+- `hamming` requires `encoding: bit`, and `bit` requires `hamming` or `none`
+  (storage only).
+- Search scans the column exactly, with or without `exact: true`; no
+  approximate index is built for a `hamming` field. At 96 bytes per
+  768-dimension vector the column is a thirty-second of `f32`, and comparing a
+  row costs a few popcount instructions.
+- `truncate_dims` keeps the signs of the leading components, for binary
+  quantization of Matryoshka embeddings.
+- An empty field can change between `bit` and the float encodings. A schema
+  update is rejected if it makes a field's definition incompatible with
+  values in a published segment. This includes removing a declaration that
+  exposes an incompatible template. To switch a field with existing values,
+  reindex into a new field.
+- Buffered writes can still land on the old side after a schema change.
+  Merges keep the two sides apart. kNN fails while it has old-side vectors
+  to score and can query the new vectors once the old documents are deleted.
 
 ### Truncate Matryoshka embeddings
 
@@ -199,7 +322,8 @@ and scan a quarter of the bytes of 1024.
   accepted as already truncated.
 - A vector whose truncated prefix is all zeros has no cosine direction, even
   when its tail does: it is skipped at index time and rejected as a query.
-- `truncate_dims` requires `metric: cosine`. The prefix of a unit vector is
+- `truncate_dims` requires `metric: cosine` (or `hamming`, which keeps the
+  prefix's signs). The prefix of a unit vector is
   shorter than 1, and MRL models compare renormalized prefixes, so Luxir
   renormalizes it. Cosine ignores length, so a full vector cut by Luxir and a
   prefix renormalized by the provider score the same. `normalized: true` is
@@ -655,9 +779,10 @@ Exact search costs one pass over the column per query. For large collections,
 a commit can build approximate nearest-neighbor indexes as segment overlays:
 an inverted-file (IVF) index whose lists hold RaBitQ codes by default, or
 explicit product-quantization (PQ) codes, built with FAISS. An overlay is built
-from the vector column, follows its segment through later commits and
-merges, and its candidates are always rescored from the full-precision column
-before they are returned. Building an overlay does not reindex documents.
+from the vector column (decoded from its encoding), follows its segment
+through later commits and merges, and its candidates are always rescored from
+the stored column before they are returned. Building an overlay does not
+reindex documents.
 
 ### Build at commit
 
@@ -734,9 +859,10 @@ positive `m` requires dimensions pinned in the schema.
 
 **RaBitQ** (default) stores sign bits of randomly rotated residuals from IVF
 centroids, plus correction factors. A 768-dimension 1-bit vector uses 104 code
-bytes plus a 4-byte error amplitude (108 bytes, excluding its id). Multi-bit
-codes use `ceil(D/8) + 12 + ceil(D*(bits-1)/8) + 8` bytes, plus one float32
-amplitude (4 bytes), stored in list order. Only the IVF centroids are trained.
+bytes plus a 4-byte error amplitude (108 bytes). Multi-bit codes use
+`ceil(D/8) + 12 + ceil(D*(bits-1)/8) + 8` bytes, plus one float32 amplitude
+(4 bytes), stored in list order. Every overlay vector, for either codec, also
+stores a 4-byte list id. Only the IVF centroids are trained.
 
 The default candidate selection uses empirical confidence intervals. It keeps
 values whose optimistic score can still beat the k-th distinct-unit witness,
@@ -808,7 +934,7 @@ every index type.
 | `query` | Query vector with `dims` components, or `truncate_dims` when set. Required. |
 | `k` | Nearest rows or groups of the view where the query is written. Required, positive; see [child vectors](nested.md#chunks-and-vectors). |
 | `unit` | `docs` (default) or `groups`; groups requires an enclosing collapse. |
-| `exact` | Require the true top-k. Uses the full-precision column scan and ignores overlays and the knobs below. |
+| `exact` | Require the true top-k over the stored vectors (exact over the field's `encoding`). Scans the column and ignores overlays and the knobs below. |
 | `similarity` | Minimum similarity of a hit, in the metric's own space; see [Similarity threshold](#similarity-threshold). |
 | `refine_candidates` | Select the bounded candidate policy for every approximate codec, with this document budget clamped up to `k`. Unset: RaBitQ uses intervals; PQ uses the count formula below. |
 | `ivf.nprobe` | IVF effort, merge-stable (see below). `0` or absent: adaptive, may deepen automatically. |
@@ -878,22 +1004,23 @@ thresholds per deployment.
 
 `similarity` drops the nearest neighbors that are not similar enough, with the
 semantics of Elasticsearch's `knn.similarity`. The value is in the metric's
-space, not the score's:
+space, not the score's (for `hamming` the two are the same):
 
 | Metric | `similarity` means | Hit kept when |
 |---|---|---|
 | `l2` | Maximum L2 distance (not squared); must be `>= 0` | `distance <= similarity` |
 | `ip` | Minimum dot product | `dot >= similarity` |
 | `cosine` | Minimum cosine similarity | `cosine >= similarity` |
+| `hamming` | Minimum score, `1 - hamming distance / dims` | `score >= similarity` |
 
 ```json
 {"query": {"knn": {"field": "embedding_v", "query": [0.75, 0.15, 0.10], "k": 20, "similarity": 0.8}}}
 ```
 
-The threshold trims the `k` nearest documents after the full-precision
-rescore; it does not search past them, so a request can match fewer than `k`
-documents. The comparison uses each document's best vector, before any
-enclosing `boost`. Trimmed documents are not matches: they leave `found`,
+The threshold trims the `k` nearest documents after the exact rescore from
+the stored column; it does not search past them, so a request can match fewer
+than `k` documents. The comparison uses each document's best vector, before
+any enclosing `boost`. Trimmed documents are not matches: they leave `found`,
 facets, and metrics as well as the returned list, on exact and approximate
 segments and in parallel execution alike.
 
@@ -945,11 +1072,14 @@ uniform random components, sit at nearly equal distance from every list and
 every code, so IVF coverage and 1-bit interval selection both lose their
 discrimination.
 
-`exact: true` uses a path that guarantees the true top-k and does not
-consult overlays. Everything else about
+`exact: true` uses a path that guarantees the true top-k over the stored
+vectors and does not consult overlays. Everything else about
 the query is identical (filters, multi-valued collapse, score scale), which
 makes it the built-in ground truth for measuring your ANN settings. Run the
-same query twice, once with `exact: true`, and compare the two lists.
+same query twice, once with `exact: true`, and compare the two lists. With
+an `f16`, `bf16` or `sq8` encoding this measures the approximate index against the
+encoding; to measure the encoding itself, compare against the same vectors
+in an `f32` field.
 
 Results are deterministic. A query run with intra-request parallelism returns
 bit-identical results to a serial run of the same query.
@@ -971,3 +1101,7 @@ bit-identical results to a serial run of the same query.
   not in the update response.
 - Vector fields are returned only when named in `fields`; they are excluded
   from default projection.
+- Changing `encoding` re-encodes a segment only when it merges; a segment
+  that never merges keeps its old encoding. A field cannot change between
+  `bit` and the other encodings.
+- `hamming` has no approximate index; it is always an exact scan.

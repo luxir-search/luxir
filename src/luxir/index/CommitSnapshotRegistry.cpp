@@ -233,7 +233,7 @@ std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, 
     if (cancellation) *cancellation = it->second.cancellation.get_token();
     owner->lease = it->second.openFiles;
   }
-  auto file = dir.openFile(name, true);
+  auto file = dir.openFile(name, {.expectSynced = true});
   if (!file) throw std::runtime_error("pinned snapshot file is missing");
   owner->file = file;
   return std::shared_ptr<InputFile>(std::move(owner), file.get());
@@ -260,7 +260,7 @@ std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const FileDescriptor
   // the check and the open; once open, its bytes outlive an unlink.
   std::lock_guard retirementLock(retirementMutex);
   requireHeld(descriptor);
-  auto file = dir.openFile(descriptor.name, true, descriptor.size);
+  auto file = dir.openFile(descriptor.name, {.expectSynced = true, .size = descriptor.size});
   if (!file) throw std::runtime_error("held snapshot file is missing");
   return file;
 }

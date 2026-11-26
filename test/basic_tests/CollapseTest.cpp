@@ -1007,6 +1007,37 @@ std::vector<GroupCard> groupCards(LocalReq& request) {
 }
 }
 
+TEST_F(CollapseTest, identityRecoveryWithAbsentStringKey) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& key = schema.field("key_i");
+  key.type = api::FieldDef::FieldClass::INT;
+  key.index = api::FieldDef::IndexMode::RANGE;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "key_i", (int64_t)7),
+      flatdoc("id", "b", "key_i", (int64_t)7),
+      flatdoc("id", "c", "key_i", (int64_t)9)}, UpdateMessage::COMMIT).success);
+  constexpr auto collapse = R"json({"field":["key_s","key_i"],"missing":"group","ops":{
+    "members":{"domain":{"query":"*:*"},"top_docs":{"fields":["id"],"sort":"id asc","limit":-1}}
+  }})json";
+  auto memberIds = [](LocalReq& req) {
+    const auto& members = *groupOp(*req.docList()->groups, "members", 0).docList();
+    auto ids = std::get<api::ColStr>(members.columns.at("id").kind).v;
+    return std::vector(ids.begin(), ids.end());
+  };
+  SearchOverridesGuard strategy(collapseMemberStrategy);
+  collapseMemberStrategy = CollapseMemberStrategy::DOMAIN_WALK;
+  auto expected = run("main", "id:a", collapse);
+  ASSERT_TRUE(expected->ok()) << expected->errorMsg();
+  ASSERT_EQ((std::vector<std::string_view>{"a", "b"}), memberIds(*expected));
+
+  collapseMemberStrategy = CollapseMemberStrategy::AUTO;
+  auto actual = run("main", "id:a", collapse);
+  ASSERT_TRUE(actual->ok()) << actual->errorMsg();
+  EXPECT_EQ(rows(*expected, true), rows(*actual, true));
+  EXPECT_EQ(memberIds(*expected), memberIds(*actual));
+}
+
 TEST_F(CollapseTest, groupOpsMemberOracle) {
   std::mt19937 random(2219);
   std::vector<Doc> docs;

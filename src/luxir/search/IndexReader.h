@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "DocSet.h"
+#include "LiveDocsMemory.h"
 #include "Similarity.h"
 #include "luxir/index/AuxInfo.h"
 #include "luxir/reader/AuxReader.h"
@@ -40,7 +41,8 @@ private:
   HeldRange deleteHold;
   std::unique_ptr<uint64_t[]> ownedWords;
   BitDocSet docSet;
-  size_t derivedBytes = 0;
+  // Charged with heapBytes() while this LiveDocs owns its bitmap; null when mapped.
+  LiveDocsMemory::Counter* memory = nullptr;
   mutable std::mutex rankLiveMutex;
   mutable std::vector<std::pair<std::string, std::unique_ptr<const RankLiveBitmap>>> rankLiveViews;
 
@@ -52,7 +54,9 @@ public:
       : deleteFile(std::move(file)), deleteHold(std::move(hold)),
         docSet(FixedBitSet(bits, maxDocCount), numLive) {}
 
-  LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive);
+  // A heap bitmap, charged to `counter` until destroyed: a child view derived from
+  // root deletes, or a root generation expanded from a SPARSE live docs file.
+  LiveDocs(std::unique_ptr<uint64_t[]> words, int32_t maxDoc, int32_t numLive, LiveDocsMemory::Counter& counter);
   ~LiveDocs();
 
   // Decodes the live docs file `name` of `segment`, `size` bytes long. Bytes
@@ -89,6 +93,11 @@ public:
   // Get the underlying BitDocSet for direct access
   BitDocSet& docset() {
     return docSet;
+  }
+
+  // Bytes this LiveDocs holds on the heap; 0 for a mapped DENSE file.
+  size_t heapBytes() const {
+    return ownedWords ? sizeof(*this) + FixedBitSet::sizeInWords(size()) * sizeof(uint64_t) : 0;
   }
 
   int32_t numDeletes() const {
@@ -129,8 +138,9 @@ public:
   }
 
   // Opens the file of generation `liveGen`, whose manifest records `size`
-  // bytes (zero when unknown) and `numLive` live rows. Null when the file is
-  // missing and missingFileOK is set, so the caller can reload the manifest.
+  // bytes (zero when unknown) and `numLive` live rows; a file of another size
+  // is corrupt. Null when the file is missing and missingFileOK is set, so
+  // the caller can reload the manifest.
   static std::shared_ptr<SegmentLive> open(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
                                            uint64_t liveEpoch, int32_t maxDoc, int32_t numLive, uint64_t size,
                                            bool missingFileOK, bool expectSynced);
@@ -147,14 +157,17 @@ public:
 
 // A segment overlay of known kind. Its files are opened with the snapshot,
 // which keeps their bytes readable; its reader is opened on first use, under
-// the kind's OverlayPolicy. A failed open publishes nothing unless the policy
-// leaves an UnavailableAuxReader, so the next use retries it.
+// the kind's OverlayPolicy. A kind opens from these files and never from the
+// directory, so no kind reads before its first use or after its files are
+// retired. A failed open publishes nothing, so the next use retries it,
+// except that an advisory overlay with invalid bytes stays absent.
 class SegmentOverlay {
   AuxInfo info;
   OverlayPolicy policy;
   std::string segment;
   std::vector<std::shared_ptr<InputFile>> files;
   SharedLazyCell<AuxReader> reader;
+  std::atomic<bool> unusable = false;  // An advisory overlay whose bytes were found invalid.
 
 public:
   SegmentOverlay(AuxInfo info, OverlayPolicy policy, std::string segment,
@@ -174,6 +187,8 @@ public:
   uint64_t builtCoreGen() const noexcept { return info.built_core_gen; }
   OverlayPolicy openPolicy() const noexcept { return policy; }
   bool isOpen() const noexcept { return reader.peek() != nullptr; }
+  bool isUnusable() const noexcept { return unusable.load(std::memory_order_relaxed); }
+  // The reader, opened on first use; null for an advisory overlay whose bytes are invalid.
   std::shared_ptr<AuxReader> get();
 };
 
@@ -286,9 +301,9 @@ public:
       return sharedOverlays;
     }
 
-    // The overlay `name`, opened on first use; null when the segment has none.
-    // Throws when its open fails, except where an advisory overlay leaves an
-    // UnavailableAuxReader.
+    // The overlay `name`, opened on first use. Null when the segment has none,
+    // or has an advisory one whose bytes are invalid. Throws when its open
+    // fails otherwise.
     std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const {
       for (const auto& overlay : sharedOverlays) {
         if (overlay->name() == name) return overlay->get();
@@ -617,6 +632,12 @@ public:
   // Validate this schema's type against the field's persisted segment types
   // on access. Unused fields never prevent opening or using a reader.
   FieldSegments field(std::string_view name) const;
+
+  struct FieldLookup {
+    FieldSegments segments;
+    FieldType* mismatchedSchemaType = nullptr;
+  };
+  FieldLookup lookupField(std::string_view name) const;
 
   std::shared_ptr<OrdMap> getOrdMap(std::string_view name);
 

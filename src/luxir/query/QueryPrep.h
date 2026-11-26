@@ -748,7 +748,7 @@ public:
     return targetPool.make<DocSetSupplier>(docSet(segment), segment);
   }
 
-  Query::Scorer* createScorer(
+  Query::Scorer* createScorerImpl(
       MemPool& targetPool, IndexReader::Segment& segment) override {
     return createDocSetScorer(targetPool, docSet(segment), segment);
   }

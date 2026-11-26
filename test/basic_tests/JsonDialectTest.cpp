@@ -684,7 +684,7 @@ TEST(JsonDialect, SchemaDefGoldenWire) {
   // The full friendly shape: name-keyed maps, lowercase enums, flattened
   // vector params, sparse presence. Literal text pins the public contract.
   constexpr std::string_view wire =
-      R"({"fields":{"title":{"type":"text","analyzer":{"tokenizer":"unicode_word","filters":["nfkc_cf","fold"]},"stored":true},"year":{"type":"int","index":"range"},"vec":{"type":"vector","dims":4,"metric":"cosine"}},"templates":{"_x":{"type":"string","multi":true}}})";
+      R"({"fields":{"title":{"type":"text","analyzer":{"tokenizer":"unicode_word","filters":["nfkc_cf","fold"]},"stored":true},"year":{"type":"int","index":"range"},"vec":{"type":"vector","dims":4,"metric":"cosine","encoding":"sq8"},"bits":{"type":"vector","dims":64,"metric":"hamming","encoding":"bit"}},"templates":{"_x":{"type":"string","multi":true}}})";
 
   std::pmr::monotonic_buffer_resource mr;
   P::SchemaDef def;
@@ -700,7 +700,10 @@ TEST(JsonDialect, SchemaDefGoldenWire) {
   ASSERT_NE(nullptr, vec);
   EXPECT_EQ(4, *vec->dims);
   EXPECT_EQ(P::VectorMetric::COSINE, *vec->metric);
+  EXPECT_EQ(P::VectorEncoding::SQ8, *vec->encoding);
   EXPECT_FALSE(vec->stored.has_value()) << "sparse presence preserved";
+  EXPECT_EQ(P::VectorMetric::HAMMING, *def.fields.at("bits")->metric);
+  EXPECT_EQ(P::VectorEncoding::BIT, *def.fields.at("bits")->encoding);
   const P::FieldDef* tmpl = def.templates.at("_x").operator->();
   ASSERT_NE(nullptr, tmpl);
   EXPECT_EQ(P::FieldDef::MultiMode::DEFAULT, *tmpl->multi);

@@ -3349,7 +3349,7 @@ TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
   writerSnapshots.onChange = [&]() noexcept { changes++; };
   Signal::listen("manifestDurable", [&](void* source, void*, void*) -> void* {
     if (source != &writer) return nullptr; // another test's background merge
-    EXPECT_NE(nullptr, dir.openFile(Manifest::name(before->index_gen + 1, before->writer_epoch), true));
+    EXPECT_NE(nullptr, dir.openFile(Manifest::name(before->index_gen + 1, before->writer_epoch), {.expectSynced = true}));
     throw std::runtime_error("injected publication failure");
   });
   auto unlisten = scope_guard([] { Signal::unlisten("manifestDurable"); });
@@ -3406,7 +3406,7 @@ TEST_F(IndexWriterTest, filesystemCommitsSyncSegmentDataAndDeletes) {
     if (source == &writer->dir.underlying()) {
       auto manifest = test::readDurableIndexInfo(writer->dir);
       for (const auto& file : test::manifestFiles(*manifest)) {
-        EXPECT_NE(nullptr, writer->dir.openFile(file.name, true));
+        EXPECT_NE(nullptr, writer->dir.openFile(file.name, {.expectSynced = true}));
       }
     }
     return nullptr;
@@ -3425,7 +3425,7 @@ TEST_F(IndexWriterTest, filesystemCommitsSyncSegmentDataAndDeletes) {
     EXPECT_TRUE(deletes);
     test::expectValidInventory(writer->dir, *manifest);
     for (const auto& file : test::manifestFiles(*manifest)) {
-      EXPECT_NE(nullptr, writer->dir.openFile(file.name, true));
+      EXPECT_NE(nullptr, writer->dir.openFile(file.name, {.expectSynced = true}));
     }
   }
   ASSERT_TRUE(helper.deleteById("replace", UpdateMessage::COMMIT).success);

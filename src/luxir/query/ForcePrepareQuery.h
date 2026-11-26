@@ -40,6 +40,7 @@ public:
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     child->validateLogical(context, multiplier);
+    context.requirePreparation();
   }
 
   std::optional<ValueEnvelope> requiredValueEnvelope(
@@ -47,10 +48,16 @@ public:
     return child->requiredValueEnvelope(field);
   }
 
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return child->mayMatch(view);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
   }
+
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
 
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
@@ -66,7 +73,7 @@ public:
     public:
       explicit Prepared(QueryPrep::PreparedSource&& child) : child(std::move(child)) {}
 
-      Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+      Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) override {
         return QueryPrep::createScorer(targetPool, segment, child.segmentSource());
       }
 
@@ -99,13 +106,13 @@ public:
   public:
     Weight(Context& context, ForcePrepareQuery& query, int32_t flags, float multiplier)
       : Query::Weight(context, query, flags) {
-      childWeight = query.child->createWeight(context, flags, multiplier);
+      childWeight = query.child->buildWeight(context, flags, multiplier);
       // Forces prepare; scoring behavior is otherwise the child's.
       traits |= NEEDS_PREPARE
           | (childWeight->getFlags() & (IS_CONSTANT_SCORING | CONSUMES_DOMAIN));
     }
 
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& ctx) override {
       prepareCallsForTests.fetch_add(1, std::memory_order_relaxed);
       QueryPrep::PreparedSource source;
       source.weight = childWeight;
@@ -115,7 +122,7 @@ public:
       return std::make_unique<Prepared>(std::move(source));
     }
 
-    Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) override {
       return QueryPrep::createScorer(targetPool, segment, *childWeight);
     }
 
@@ -134,7 +141,7 @@ public:
       return childWeight->hasReleasableSegmentState();
     }
 
-    CountShortcut countShortcut(
+    CountShortcut countShortcutImpl(
         IndexReader::Segment& segment, DocSet* domain) override {
       return childWeight->countShortcut(segment, domain);
     }

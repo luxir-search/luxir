@@ -7923,7 +7923,7 @@ class BooleanQuery::Weight final : public Query::Weight {
     }
     auto weights = targetPool.make_arr<Query::Weight*>(queries.size());
     for (size_t i = 0; i < queries.size(); ++i) {
-      weights[i] = queries[i]->createWeight(context, flags, multiplier);
+      weights[i] = queries[i]->buildWeight(context, flags, multiplier);
     }
     return {weights, queries.size()};
   }
@@ -7946,18 +7946,12 @@ class BooleanQuery::Weight final : public Query::Weight {
     if (queries.empty()) return;
     mandatoryWeights = context.pool.make_span<Query::Weight*>(queries.size());
     mandatoryScores = context.pool.make_span<uint8_t>(queries.size());
-    int32_t noScore = flags & ~NEED_SCORES;
-    bool parentNeedsScores = (flags & NEED_SCORES) != 0;
-    auto* cache = context.topReader.filterCache();
-    bool cacheEnabled = !disableMandatoryCacheForTests && cache && cache->enabled();
+    bool cacheEnabled = mandatoryCacheEnabled(context.topReader);
     size_t candidates = 0;
     for (size_t i = 0; i < queries.size(); i++) {
-      bool contributes = parentNeedsScores
-          && luxir::scoreProfile(*queries[i]).kind
-              != ScoreProfile::Kind::AUTO_UNIFORM;
+      auto [childFlags, contributes] = mandatoryWeightMode(*queries[i], flags);
       mandatoryScores[i] = contributes ? 1 : 0;
-      mandatoryWeights[i] = queries[i]->createWeight(
-          context, contributes ? flags : noScore, multiplier);
+      mandatoryWeights[i] = queries[i]->buildWeight(context, childFlags, multiplier);
       if (cacheEnabled && mandatoryConstant(*queries[i], *mandatoryWeights[i], contributes)) candidates++;
     }
     if (candidates == 0) return;
@@ -7970,7 +7964,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       if (!use) continue;
       if (mandatoryCache.empty()) mandatoryCache = context.pool.make_span<MandatoryCache>(candidates);
       auto* raw = !weight->needsScores() && !weight->allowsPruning() ? weight
-          : queries[i]->createWeight(context, flags & ~(NEED_SCORES | ALLOW_PRUNING), 1.0f);
+          : queries[i]->buildWeight(context, filterWeightFlags(flags), 1.0f);
       use->observe();
       mandatoryCache[used++] = {i, weight, raw, use, *constant};
     }
@@ -12852,7 +12846,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         uniformConstantCandidate, executionMode, scorePolicy);
     }
 
-    Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(MemPool& targetPool, IndexReader::Segment& segment) override {
       Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
       Query::Demand demand = Query::Demand::fromLeadCost(
           std::numeric_limits<int64_t>::max());
@@ -12907,7 +12901,6 @@ public:
                && query.optional.size() >= 2));
     allowsPruning = (flags & Query::ALLOW_PRUNING) != 0;
     // Only mandatory and optional clauses can contribute to score.
-    int32_t noScore = flags & ~NEED_SCORES;
     auto mandatoryClauses = query.mandatory;
     auto optionalClauses = query.optional;
     auto prohibitedClauses = query.prohibited;
@@ -12921,20 +12914,16 @@ public:
     // "+a b" count-only requests to the single-clause count shortcut.
     // minShouldMatch >= 1 makes the optional group a membership constraint
     // even under a mandatory clause, so it must be kept.
-    bool dropOptional = query.dropsOptional(needsScores);
-    optionalWeights = dropOptional
-      ? std::span<Query::Weight*>{}
-      : createWeights(context.pool, context, optionalClauses, flags, multiplier);
+    optionalWeights = createWeights(context.pool, context, query.optionalForWeight(flags), flags, multiplier);
     uniformConstantCandidate = !optionalWeights.empty()
         && std::all_of(
             optionalWeights.begin(), optionalWeights.end(),
             [](Query::Weight* weight) {
               return weight->isConstantScoring();
             });
-    int32_t exclusionFlags = noScore & ~ALLOW_PRUNING;
     prohibitedWeights = createWeights(
         context.pool, context, prohibitedClauses,
-        exclusionFlags | EXCLUSION_WINDOW_FILL, 1.0f);
+        exclusionWeightFlags(flags), 1.0f);
     auto* filterCache = context.topReader.filterCache();
     prohibitedCacheEnabled = !QueryPrep::disableProhibitedCacheForTests
         && filterCache != nullptr && filterCache->enabled();
@@ -13010,9 +12999,8 @@ public:
         }
       }
     }
-    int32_t exhaustiveFilterFlags = flags & ~(NEED_SCORES | ALLOW_PRUNING);
     filterWeights = createWeights(context.pool, context, filterClauses,
-                                  exhaustiveFilterFlags, 1.0f);
+                                  filterWeightFlags(flags), 1.0f);
     if (!filterClauses.empty()) {
       filterUses = context.pool.make_span<FilterCache::Use*>(filterClauses.size());
       for (size_t i = 0; i < filterClauses.size(); i++) {
@@ -13141,7 +13129,7 @@ public:
   // A lone required clause determines membership when optionals only score.
   // Required ceilings intersect; their floors use inclusion-exclusion.
   // Optional membership keeps its largest floor, and exclusions subtract ceilings.
-  CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+  CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
     auto bound = countBound(segment, domain, segment.maxDoc());
     if (bound.maxMatches == 0) return bound;
     size_t required = mandatoryWeights.size() + filterWeights.size();
@@ -13194,7 +13182,7 @@ public:
     return bound;
   }
 
-  std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+  std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& ctx) override {
     auto filterSources = QueryPrep::prepareFilterSources(
         filterWeights, filterUses, ctx);
     auto prohibitedSources = QueryPrep::prepareFilterSources(
@@ -13349,7 +13337,7 @@ public:
     return sparseFilteredTopKFamilyKind;
   }
 
-  Query::Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
+  Query::Scorer* createScorerImpl(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
     Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
     Query::Demand demand = Query::Demand::fromLeadCost(
         std::numeric_limits<int64_t>::max());

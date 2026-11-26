@@ -20,9 +20,10 @@ class TopDocsReq;
 struct ParseContext;
 class LuxirNode;
 
-// What a plugin search op maker receives while the request is parsed. The op
-// it returns is a SearchOp subclass allocated with luxir::arenaCreate in
-// req.arena; its calculator does the work (see docs/dev/plugins.md).
+// A plugin search op maker parses and validates inputs, then constructs its
+// SearchOp with luxir::arenaCreate in req.arena. The op may retain queries and
+// their PlanningContext for materialize(). This context and its ParseContext
+// belong to the stack parser and must not be retained.
 class PluginOpContext {
 public:
   SearchRequest& req;
@@ -42,8 +43,6 @@ public:
   // A planning context shared by every query this op parses. Queries from
   // parseQuery are already validated against it.
   virtual Query::PlanningContext& planning() = 0;
-  // The execution context for createWeight on those queries.
-  virtual Query::Context& weightContext() = 0;
 
   // Lower a nested api::Query, or a Query-shaped param value (an object or an
   // expression string), and validate it.
@@ -55,6 +54,7 @@ public:
   // dispatches it per segment, and receives the merged ranking through the
   // rankingSink it sets. The parser does not wire the source: the op must set
   // source->parent (itself) and source->rankingSink, as FusionOp.h describes.
+  // Returns a logical source. Its step runs before the plugin op's materialize().
   virtual TopDocsReq* parseSource(std::string_view sourceName, const api::Val& topDocs) = 0;
 
   // Parse proto.ops as `op`'s nested ops (op.subOps, parent = op). Nested ops

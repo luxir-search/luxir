@@ -518,6 +518,12 @@ cached version to its schema tenant and released with its last user. This is
 separate from RAM backing-file bytes and allocator RSS; it excludes allocator
 overhead and analysis factories' private resources.
 
+`memory.live_docs_heaps` and `memory.live_docs_heap_bytes` count the live docs
+generations loaded from sparse files and the heap they hold (segments with few
+deletes store the deleted doc ids, which are expanded to a bitmap of one bit per
+document when loaded). Generations with more deletes are memory-mapped bitmaps
+and appear as page cache instead.
+
 ### Prometheus scraping
 
 Prometheus scrapes `/metrics` by default, so a job needs only its targets.
@@ -823,17 +829,17 @@ the node unlimited. The resolved values are logged at startup.
 
 ### Id filters
 
-Applying a delete or an update by id looks up the id in every segment that
-could hold it. Each segment's id filter rules most segments out without
-reading their id dictionaries, which matters most when those segments are on
-remote storage.
+Applying a delete or an update by id looks up the id in every segment whose
+id range could hold it. An id filter on each segment rules most of those
+segments out without reading their id dictionaries, which matters most when
+those segments are on remote storage. Segments get no filter by default.
 
 ```bash
-./luxir --indexing.id-filter=fuse16
+./luxir --indexing.id-filter=bloom
 ```
 
-- `indexing.id-filter` picks what new segments get: `bloom` (default),
-  `fuse8`, `fuse16` or `none`. Each segment records its own filter, so a
+- `indexing.id-filter` picks what new segments get: `none` (default),
+  `bloom`, `fuse8` or `fuse16`. Each segment records its own filter, so a
   change needs no reindex; merged segments move to the current choice.
 - `indexing.id-filter-bits-per-key` (default 16) and `indexing.id-filter-min-kb`
   (default 16) size a `bloom` filter. More bits per id lower its false
@@ -842,8 +848,8 @@ remote storage.
 - `fuse16` costs about 18-20 bits per id and lets 0.0015% of absent ids through,
   so even a large batch of ids usually skips a segment. Building it holds
   about 35 bytes per id while a segment's id dictionary is written.
-- `none` writes no filter; deletes then look up every segment whose id range
-  overlaps the batch.
+- With `none`, deletes look up every segment whose id range overlaps the
+  batch.
 
 `--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
 transparent huge pages for whole-huge-page indexing allocations; disable it

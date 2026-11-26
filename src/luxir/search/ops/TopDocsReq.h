@@ -53,14 +53,172 @@ struct ParsedFilter {
   bool composesUnion() const { return !unionSources.empty(); }
 };
 
+// Build weights for a filter list after serial logical validation.
+std::span<Query::Weight*> buildFilterWeights(
+    std::span<ParsedFilter> filters, Query::Context& qcontext,
+    int32_t requestFlags);
+
+void declareFilterReads(ReadDeclarer& reads, std::span<ParsedFilter> filters,
+                        Query::PlanningContext& planning, int32_t requestFlags);
+
+enum class TopDocsPlacement : uint8_t {
+  ROOT_OP,
+  NESTED_OP,
+  FUSION_SOURCE,
+  ROW_OP,
+};
 
 class TopDocsReq : public SearchOp {
-protected:
+public:
+  // Carries parsed inputs used only while materializing the TopDocs execution plan.
+  struct Preparation {
+    // Query before op-level filters fold in, for exact-domain construction.
+    Query* domainQuery;
+    // Main weight flags other than NEED_SCORES, which is stored on the op.
+    int32_t weightFlags;
+    TopDocsPlacement placement;
+    // The main query already includes the op-level filters.
+    bool foldFilters;
+    // Child domain routes require a separate membership weight.
+    bool routedFilters;
+    // The request shape allows pruning before collapse/diversify constraints.
+    bool allowPruning;
+    // Score-ranked hits with a count, without grouping or child domains.
+    bool exactCountTopKShape;
+    // The request is eligible for bounded root top-K counting.
+    bool boundedCount;
+    // The request can answer a count from whole membership.
+    bool pureCountShape;
+    // The request permits estimating the count.
+    bool estimateCount;
+  };
+
+private:
+  struct SourceSelection {
+    // View cache used for resident selection and weight-time registration.
+    FilterCache* cache;
+    // Accepted whole-membership source for count or ranking.
+    FilterCache::Use* cacheFirstMembershipUse;
+    // Accepted sources for an exact child domain.
+    std::span<FilterCache::Use*> residentExactDomainUses;
+    // Original request weight flags, including scoring.
+    int32_t requestFlags;
+    // Initial main weight flags after choosing a resident route.
+    int32_t mainWeightFlags;
+    // The request asks for score-ranked hits and an unbounded exact count.
+    bool exactCountTopK;
+    // Ranked exact-domain hits can use constant scores.
+    bool constantExactDomainRanking;
+    // The exact-count top-K route accepted a resident count source.
+    bool cacheFirstTopKCount;
+    // The entire exact domain can use resident sources.
+    bool cacheFirstExactDomain;
+    // Field sort can rank directly from resident membership.
+    bool cacheFirstFieldSort;
+    // Resident top-K counting still needs a variable-score ranking weight.
+    bool cacheFirstVariableRanking;
+    // The selected route can skip the main weight and its context.
+    bool omitMainWeight;
+  };
+
+  // Additional inputs used only during materialization.
+  const Preparation preparation;
+  // Filled once before building the execution plan.
+  std::optional<SourceSelection> sourceSelection;
+
+  // Select and pin resident sources without building a context or weights.
+  void runSourceSelection();
+  bool buildsFilterWeights() const;
+  bool hasOrdinaryExactDomain() const;
+  bool buildsSeparateExactDomain() const;
+  bool mayRerouteMainWeight() const;
+  bool mayComposeExactCountTopK() const;
 
 public:
+  // Parsed inputs shared by planning and execution.
+  const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
+  Query::PlanningContext& planning;
+  Query* query;
+  Query* resultQuery;
+  std::span<ParsedFilter> filters;
+  // Logical variant routes with their weights and uses filled in at materialization.
+  DomainVariantPlan domainVariants;
+  CollectionRequirements requirements;
+  int64_t topCount; // Collection depth (offset + page size, capped by maxDoc).
+  SortPlan sortPlan;
+  CollapsePlan* collapse;
+  DiversifyPlan* diversify;
+  std::optional<SortPlan> headSort;
+  Query::ScoreProfile scoreProfile;
+  bool requestNeedsScores;
+
+  // Contexts, weights and routes bound during materialization.
+  Query::Context* weightContext = nullptr;
+  Query::Weight* weight = nullptr;
+  Query::Weight* variantMembershipWeight = nullptr;
+  Query::Weight* countWeight = nullptr;
+  Query::Weight* rankingWeight = nullptr;
+  Query::Weight* wholeRankingWeight = nullptr;
+  bool wholeConstantRanking = false;
+  bool forcedExactCountTopKComposition = false;
+  std::span<const uint8_t> provedDensitySegments;
+  std::span<Query::Weight*> filterWeights;
+  std::span<FilterCache::Use*> filterUses;
+  // The requested quantity stays in requirements; exact routes need no hold.
+  bool boundedCount = false;
+  // Unscored membership for a bounded count counted apart from ranking (see
+  // boundedCountThenCollectTopK); null keeps the held-threshold collection.
+  Query::Weight* boundedCountWeight = nullptr;
+  bool countLimitProven = false;
+  // The request permits an estimate of this bounded count. The estimator
+  // samples through the ranking weight, scored with pruning allowed, so lazy
+  // plans stay lazy: an unscored weight would materialize a multi-term union.
+  bool estimateCount = false;
+  QueryPrep::WholeMembershipPlan wholeMembershipPlan;
+  QueryPrep::ExactDomainPlan exactDomainPlan;
+  // Every field-sort collector's primaryValues (see sortValueEnvelope).
+  std::optional<Query::ValueEnvelope> sortValues;
+
   class CalcBase;
   std::vector<TopDocsReq*> rowOps;
   std::span<ReturnField> rowFields;
+  MetricGroupPlan* metricOrder = nullptr;
+  boost::unordered_flat_map<std::string_view, SearchOp*> groupOps;
+
+  // Optional sink for the merged top-K collector.  If set, the Calc invokes
+  // it instead of self-emitting via fillQueryTopNResponse, letting another
+  // op (e.g. FusionOp) consume this TopDocsReq's ranking.  `mc` is null on
+  // the empty-index path (no segments, no collector ever obtained); sinks
+  // must handle that case.
+  std::function<void(CalcBase&, MergeableCollector*)> rankingSink;
+
+  // Takes parsed, validated inputs only.
+  TopDocsReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view,
+             std::string_view name, const ReqTopDocs& topDocsProto,
+             Query::PlanningContext& planning, Query* query, Query* resultQuery,
+             std::span<ParsedFilter> filters, DomainVariantPlan&& domainVariants,
+             CollectionRequirements requirements, int64_t topCount,
+             SortPlan&& sortPlan, CollapsePlan* collapse, DiversifyPlan* diversify,
+             std::optional<SortPlan>&& headSort, Query::ScoreProfile scoreProfile,
+             bool requestNeedsScores, Preparation preparation);
+
+  // Complete source selection once before projecting or building weights.
+  void selectSources() override {
+    if (!sourceSelection) runSourceSelection();
+  }
+
+  // Project the possible root modes after source selection.
+  void declareReads(ReadDeclarer& reads) const override;
+  // Runs once after construction to build the contexts, weights, filter uses and execution routes.
+  void materialize() override;
+
+  // Bind the decorators against this source's materialized query.
+  void bindDecorators();
+  // Open the execution context on demand if cache-first selection omitted it.
+  Query::Context& decoratorQueryContext();
+  // Check execution traits after materializing a row operation.
+  void validateRowExecution() const;
+
   std::vector<ExtraColumn> rowColumns();
 
   // Exact COUNT + pruned TOP_100 over the 5M/301-union cohort crossed between
@@ -422,12 +580,6 @@ public:
     return admitted;
   }
 
-  CollapsePlan* collapse = nullptr;
-  DiversifyPlan* diversify = nullptr;
-  MetricGroupPlan* metricOrder = nullptr;
-  std::optional<SortPlan> headSort;
-  boost::unordered_flat_map<std::string_view, SearchOp*> groupOps;
-
   void init() override {
     SearchOp::init();
     for (auto* row : rowOps) row->init();
@@ -438,51 +590,6 @@ public:
     return collapse != nullptr && (topDocsProto.collapse->get_count || headSort.has_value() || !groupOps.empty())
         && topCount > topDocsProto.offset;
   }
-  const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
-  Query::PlanningContext& planning;
-  Query::Context* weightContext;
-  Query* resultQuery = nullptr;
-  Query* query;
-  Query::Weight* weight;
-  Query::Weight* variantMembershipWeight;
-  Query::Weight* countWeight;
-  Query::Weight* rankingWeight;
-  bool forcedExactCountTopKComposition = false;
-  std::span<const uint8_t> provedDensitySegments;
-  Query::Weight* wholeRankingWeight;
-  bool wholeConstantRanking;
-  Query::ScoreProfile scoreProfile;
-  bool requestNeedsScores;
-  int64_t topCount; // Collection depth (offset + page size, capped by maxDoc).
-  std::span<ParsedFilter> filters;
-  std::span<Query::Weight*> filterWeights;
-  std::span<FilterCache::Use*> filterUses;
-  DomainVariantPlan domainVariants;
-  CollectionRequirements requirements;
-  // The requested quantity stays in requirements; exact routes need no hold.
-  bool boundedCount = false;
-  // Unscored membership for a bounded count counted apart from ranking (see
-  // boundedCountThenCollectTopK); null keeps the held-threshold collection.
-  Query::Weight* boundedCountWeight = nullptr;
-  bool countLimitProven = false;
-  // The request permits an estimate of this bounded count. The estimator
-  // samples through the ranking weight, scored with pruning allowed, so lazy
-  // plans stay lazy: an unscored weight would materialize a multi-term union.
-  bool estimateCount = false;
-  QueryPrep::WholeMembershipPlan wholeMembershipPlan;
-  QueryPrep::ExactDomainPlan exactDomainPlan;
-  SortPlan sortPlan;
-  // Every field-sort collector's primaryValues (see sortValueEnvelope).
-  std::optional<Query::ValueEnvelope> sortValues;
-
-  // Optional sink for the merged top-K collector.  If set, the Calc invokes
-  // it instead of self-emitting via fillQueryTopNResponse, letting another
-  // op (e.g. FusionOp) consume this TopDocsReq's ranking.  `mc` is null on
-  // the empty-index path (no segments, no collector ever obtained); sinks
-  // must handle that case.
-  std::function<void(CalcBase&, MergeableCollector*)> rankingSink;
-
-
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;
     for (auto* source : {weight, variantMembershipWeight, countWeight,
@@ -525,7 +632,11 @@ public:
         });
   }
 
+  bool outputsEmpty(IndexReader::Segment& segment, DocSet* input,
+                    std::vector<std::string>* details) const;
+
   class CalcBase : public SearchOp::Calculator {
+    ExecutionProfileRun* pruningRun = nullptr;
 #ifndef NDEBUG
     bool prunedFanout = false;
 #endif
@@ -1758,6 +1869,42 @@ public:
       return accumulator;
     }
 
+    bool canRecordSegmentCount(IndexReader::Segment& seg, DocSet* domain) {
+      auto& op = thisOp();
+      return !op.sortPlan.useFieldSort && op.requirements.countLimit < 0 && op.filterWeights.empty()
+          && !requiresWholeIndexPrepare && op.wholeMembershipPlan.canRecordCount(seg, domain);
+    }
+
+    template <bool Collapsed, bool MetricGroups>
+    auto* skipSegment(IndexReader::Segment& seg, DomainHandle& domain, std::vector<std::string> details) {
+      auto& op = thisOp();
+      auto release = scope_guard([&]() noexcept { releaseSegmentState(seg); });
+      size_t ord = (size_t)seg.ord;
+      // Drop the inputs that prepareRoutedProduction would consume for this segment.
+      if (!preparedRoutedReservations.empty()) {
+        for (auto* inputs : {&preparedRoutedFilters, &preparedResetRoutedFilters, &preparedVariantInheritBases}) {
+          if (!inputs->empty()) (*inputs)[ord] = std::vector<DomainHandle>{};
+        }
+        preparedRoutedReservations[ord].reset();
+      }
+
+      // Only a proof for the key can publish raw empty membership.
+      if (op.weight && op.weight->provenEmpty(seg) && !op.wholeMembershipPlan.empty()) {
+        FilterCache::UseRegistry::SegmentScope cacheTiming(*op.planning.filterUses, ord);
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        op.wholeMembershipPlan.resolve(*op.view, seg, domain.get(), preparedWeight.get(),
+            [&](Query::Weight& resolver) { return resolver.scorerSupplier(poolGuard.pool(), seg); });
+        if (!Collapsed && canRecordSegmentCount(seg, domain.get())) op.wholeMembershipPlan.recordCount(seg, 0);
+      }
+      domain = DomainHandle::empty().scoped(seg);
+      if (!output.empty()) output[ord] = domain;
+      if (memberReplay) memberReplay->domains[ord] = domain;
+      Signal::emit("searchTopDocsSegmentPruned", this);
+      if (op.req.proto.profile) op.req.recordPrunedSegment(pruningRun, seg, std::move(details));
+      if constexpr (MetricGroups) return metricGroups->merger.obtain();
+      else return collectorMerger.obtain();
+    }
+
     // One collection ladder, specialized once per segment. Document requests
     // instantiate their original admission loop without per-hit group checks.
     template <bool Structural, bool Collapsed, bool MetricGroups = false,
@@ -1786,8 +1933,12 @@ public:
       DocSet* routedBaseDomain = nullptr;
       int64_t numSegs = (int64_t)op.view->segments().size();
 
-      {
-        auto& seg = op.planning.topReader.segments()[segnum];
+      auto& seg = op.planning.topReader.segments()[segnum];
+      std::vector<std::string> details;
+      bool skipped = op.outputsEmpty(seg, domain, op.req.proto.profile ? &details : nullptr);
+      if (skipped) {
+        data.reset(skipSegment<Collapsed, MetricGroups>(seg, domainHandle, std::move(details)));
+      } else {
         auto release = scope_guard([&]() noexcept { releaseSegmentState(seg); });
         auto poolGuard = MemPool::threadLocalPoolGuard();
         if (!op.domainVariants.empty()) {
@@ -1845,9 +1996,7 @@ public:
           auto* fieldCollector = data->template fields<Collapsed, Admission>();
           using ActiveFieldCollector = FieldCollector<Collapsed, Admission>;
 
-          bool recordCount = !Collapsed && !data->useFieldSort
-              && op.requirements.countLimit < 0 && op.filterWeights.empty()
-              && !requiresWholeIndexPrepare && op.wholeMembershipPlan.canRecordCount(seg, domain);
+          bool recordCount = !Collapsed && canRecordSegmentCount(seg, domain);
 
           // A segment ranking never pruned has its exact count already. Track
           // pruning per segment, restoring the collector's own flag afterward.
@@ -2676,7 +2825,7 @@ public:
             newDomain = routedProduction->domains[variant];
           }
         } else {
-          newDomain = matchEverything ? domainHandle : output[(size_t)segnum];
+          newDomain = skipped || matchEverything ? domainHandle : output[(size_t)segnum];
         }
         assert(newDomain.isDeliverable());
         return newDomain;
@@ -2718,107 +2867,6 @@ public:
   };
 
 
-  // ProtobufSearchParser resolves everything that can fail and passes the
-  // execution sources in. A fully resident validated membership plan may omit
-  // the main Weight entirely.
-  TopDocsReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view name, const ReqTopDocs& topDocsProto,
-    Query::PlanningContext& planning, Query::Context* weightContext,
-    Query* query, Query::Weight* weight,
-    Query::Weight* variantMembershipWeight,
-    Query::Weight* countWeight, Query::Weight* rankingWeight, int64_t topCount,
-    SortPlan&& sortPlan, CollectionRequirements requirements,
-    Query::Weight* wholeMembershipWeight,
-    Query::Weight* wholeRankingWeight,
-    FilterCache::Use* wholeMembershipUse,
-    bool wholeConstantRanking, Query::ScoreProfile scoreProfile,
-    bool requestNeedsScores,
-    std::span<ParsedFilter> filters,
-    std::span<Query::Weight*> filterWeights,
-    DomainVariantPlan&& domainVariants,
-    Query* domainQuery, Query::Weight* domainQueryWeight,
-    std::span<Query::Weight*> domainFilterWeights,
-    std::span<FilterCache::Use*> residentExactDomainUses)
-    : SearchOp(req, view, name), topDocsProto(topDocsProto), planning(planning),
-      weightContext(weightContext), query(query),
-      weight(weight), variantMembershipWeight(variantMembershipWeight),
-      countWeight(countWeight), rankingWeight(rankingWeight),
-      wholeRankingWeight(wholeRankingWeight),
-      wholeConstantRanking(wholeConstantRanking), scoreProfile(scoreProfile),
-      requestNeedsScores(requestNeedsScores),
-      topCount(topCount), filters(filters), filterWeights(filterWeights),
-      domainVariants(std::move(domainVariants)),
-      requirements(requirements),
-      sortPlan(std::move(sortPlan)),
-      sortValues(sortValueEnvelope(this->sortPlan, query, filters)) {
-    auto wholeConsumer = this->sortPlan.useFieldSort
-        ? QueryPrep::WholeMembershipConsumer::FIELD_SORT
-        : requirements.needRankedDocs
-              ? wholeConstantRanking ? QueryPrep::WholeMembershipConsumer::TOP_K_FIRST_IDS
-                    : requirements.countLimit >= 0
-                          ? QueryPrep::WholeMembershipConsumer::TOP_K_BOUNDED_COUNT
-                          : QueryPrep::WholeMembershipConsumer::TOP_K_COUNT
-              : QueryPrep::WholeMembershipConsumer::COUNT;
-    if (wholeMembershipWeight != nullptr) {
-      wholeMembershipPlan = QueryPrep::WholeMembershipPlan(
-          *wholeMembershipWeight, wholeMembershipUse,
-          planning.filterUses,
-          PreparedDomainDependence::QUERY_CANONICAL,
-          wholeConsumer);
-    } else if (wholeMembershipUse != nullptr) {
-      wholeMembershipPlan = QueryPrep::WholeMembershipPlan::acceptedExisting(
-          *wholeMembershipUse, planning.filterUses, wholeConsumer);
-    }
-    if (weight == nullptr) {
-      bool acceptedWhole = wholeMembershipUse != nullptr
-          && !requirements.needExactDomain
-          && ((this->sortPlan.useFieldSort
-                  && requirements.needRankedDocs && !requestNeedsScores)
-              || (requirements.needsCount()
-                  && (!requirements.needRankedDocs
-                      || scoreProfile.kind
-                          != Query::ScoreProfile::Kind::VARIABLE)));
-      bool residentExact = !residentExactDomainUses.empty()
-          && requirements.needExactDomain && !this->sortPlan.useFieldSort
-          && (!requirements.needRankedDocs
-              || scoreProfile.kind != Query::ScoreProfile::Kind::VARIABLE);
-      if ((!acceptedWhole && !residentExact) || !filterWeights.empty()) {
-        throw std::logic_error(
-            "Weight-free TopDocs requires a complete cached source");
-      }
-    }
-    if (!filterWeights.empty()) {
-      filterUses = planning.pool.make_span<FilterCache::Use*>(
-          filterWeights.size());
-      size_t source = 0;
-      for (const auto& filter : filters) {
-        for (size_t i = 0; i < filter.sourceCount(); i++) {
-          filterUses[source++] = planning.getFilterUse(*filter.source(i));
-        }
-      }
-      assert(source == filterWeights.size());
-    }
-    if (!residentExactDomainUses.empty()) {
-      for (auto* use : residentExactDomainUses) {
-        exactDomainPlan.addAcceptedExisting(*use);
-      }
-    } else if (domainQueryWeight != nullptr) {
-      if (!domainQueryWeight->matchesAllDocs()) {
-        exactDomainPlan.add(
-            *domainQueryWeight, planning.getFilterUse(*domainQuery));
-      }
-      size_t source = 0;
-      for (const auto& filter : filters) {
-        assert(!filter.composesUnion());
-        for (size_t i = 0; i < filter.sourceCount(); i++) {
-          exactDomainPlan.add(
-              *domainFilterWeights[source++],
-              planning.getFilterUse(*filter.source(i)));
-        }
-      }
-      assert(source == domainFilterWeights.size());
-    }
-  }
-
   template <bool Structural, bool MetricGroups = false, typename Admission = CollapseAdmission>
   class Calc final : public CalcBase {
   public:
@@ -2857,6 +2905,8 @@ public:
 
       domain.assertScope(op.view->segments()[segnum]);
       assert(segnum < (int32_t)inputDomains.size());
+      // Gather every input before testing segment outputs. A kNN weight
+      // chooses its global top k from all of these domains.
       inputDomains[(size_t)segnum] = std::move(domain);
       inputDomainViews[(size_t)segnum] = inputDomains[(size_t)segnum].get();
       auto count =

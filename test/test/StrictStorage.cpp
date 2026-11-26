@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "StrictStorage.h"
+#include "GatedStorage.h"
 
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <new>
+#include <stdexcept>
 
 #include "LuxirTest.h"
 #include "luxir/store/Manifest.h"
@@ -24,9 +27,9 @@ StrictStorageCounters::FileStats StrictStorageCounters::fileStats(std::string_vi
   return it == files.end() ? FileStats{} : it->second;
 }
 
-uint64_t StrictStorageCounters::totalRounds() const {
+uint64_t StrictStorageCounters::totalSubmissions() const {
   std::lock_guard lock(mutex);
-  return rounds;
+  return submissions;
 }
 
 StrictStorageCounters::LiveStats StrictStorageCounters::liveStats() const {
@@ -45,9 +48,9 @@ void StrictStorageCounters::logSummary() const {
     wholeFiles += file.wholeFileAccesses;
     sizes += file.sizeRequests;
   }
-  LOG_INFO("strict: acquires={} (metadata={}), rounds={} (batches={}), unique parts={}, peak live holds={}, "
+  LOG_INFO("strict: acquires={} (metadata={}), submissions={} (batches={}), unique parts={}, peak live holds={}, "
            "peak live bytes={}, whole-file accesses={}, size requests={}",
-           acquires, metadata, rounds, batches, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles, sizes);
+           acquires, metadata, submissions, batches, uniqueParts, live.peakHolds, live.peakBytes, wholeFiles, sizes);
 }
 
 StrictLayer::~StrictLayer() {
@@ -64,12 +67,20 @@ void StrictStorageCounters::sizeRequested(std::string_view name) {
   ++files[std::string(name)].sizeRequests;
 }
 
-void StrictStorageCounters::round(std::string_view name, bool batch) {
+void StrictStorageCounters::gateBatches(std::string name, std::shared_ptr<BatchGate> gate) {
+  std::lock_guard lock(mutex);
+  batchGates.emplace(std::move(name), std::move(gate));
+}
+
+std::shared_ptr<BatchGate> StrictStorageCounters::submitted(std::string_view name, bool batch) {
   std::lock_guard lock(mutex);
   auto& file = files[std::string(name)];
-  file.lastRound = ++rounds;
-  if (!file.rounds++) file.firstRound = rounds;
-  if (batch) ++file.batches;
+  file.lastSubmission = ++submissions;
+  if (!file.submissions++) file.firstSubmission = submissions;
+  if (!batch) return {};
+  ++file.batches;
+  auto it = batchGates.find(name);
+  return it == batchGates.end() ? nullptr : it->second;
 }
 
 uint8_t StrictStorageCounters::acquired(std::string_view name, ByteRange range) {
@@ -106,17 +117,25 @@ class StrictFileState : public HoldOwner {
   static constexpr size_t overhead = 3 * kHoldAlign + kReadSlack;
   std::shared_ptr<StrictStorageCounters> counters;
   std::string name;
+  std::optional<uint64_t> segmentFile;  // The number of a base segment data file.
   bool denyWhole;
+  bool sized;  // Opened with a size, so size() makes no request.
   std::atomic<uint64_t> liveHolds{0};
+  // Each part's class in this open file. Keyed per open file, not by name:
+  // names repeat across incarnations, and every reader of one segment shares
+  // its open files.
+  std::mutex classesMutex;
+  std::map<std::pair<uint64_t, uint64_t>, ReadClass> classes;
 
   static size_t allocationSize(size_t length) {
     return (length + overhead + kHoldAlign - 1) & ~(kHoldAlign - 1);
   }
 
 public:
-  StrictFileState(std::shared_ptr<StrictStorageCounters> counters, std::string_view name, StrictWholeFiles mode)
-      : counters(std::move(counters)), name(name),
-        denyWhole(mode == StrictWholeFiles::DENY && Manifest::segmentDataFile(name)) {}
+  StrictFileState(std::shared_ptr<StrictStorageCounters> counters, std::string_view name, StrictWholeFiles mode,
+                  bool sized)
+      : counters(std::move(counters)), name(name), segmentFile(Manifest::segmentDataFileNumber(name)),
+        denyWhole(mode == StrictWholeFiles::DENY && segmentFile), sized(sized) {}
 
   // A hold must not outlive its InputFile: its release would run on freed state.
   ~StrictFileState() {
@@ -126,10 +145,33 @@ public:
     }
   }
 
-  void sizeRequested() { counters->sizeRequested(name); }
-  void round(bool batch) {
+  void sizeRequested() {
+    if (!sized) counters->sizeRequested(name);
+  }
+  std::shared_ptr<BatchGate> submitted(bool batch) {
     if (counters->takeInjectedFailure()) throw FileIOException("strict: injected acquire failure on " + name);
-    counters->round(name, batch);
+    return counters->submitted(name, batch);
+  }
+
+  // A part's bytes are metadata or data whoever reads them, so a cache hint
+  // must not depend on which reader acquires the part first.
+  void checkClass(ByteRange range) {
+    std::lock_guard lock(classesMutex);
+    auto [found, added] = classes.try_emplace({range.offset, range.length}, range.readClass);
+    if (!added && found->second != range.readClass) {
+      throw std::logic_error(std::format("strict: {} [{}, +{}) acquired as both METADATA and DATA", name,
+                                         range.offset, range.length));
+    }
+  }
+
+  // A whole-file read, or in a segment data file a read no part makes: one
+  // from offset 0 past the header (no part starts at 0), or one to EOF outside
+  // file 0 (the writer pads every other file after its last part).
+  bool readsWholeFile(ByteRange range, uint64_t size) const {
+    if (range.offset == 0 && range.length == size) return true;
+    if (!segmentFile) return false;
+    if (range.offset == 0 && range.length > Postings::LUXIR_HEADER.size()) return true;
+    return *segmentFile != Postings::PRIMARY_FILE && range.length && range.offset + range.length == size;
   }
 
   void wholeFile() {
@@ -191,44 +233,59 @@ public:
   }
   bool holdsFree() const override { return false; }
 
-  using InputFile::acquire;
-
   HeldRange acquire(ByteRange range) override {
     auto fileSize = delegate->size();
     checkRange(range, fileSize);
-    if (range.offset == 0 && range.length == fileSize) state->wholeFile();
-    state->round(false);
+    state->checkClass(range);
+    if (state->readsWholeFile(range, fileSize)) state->wholeFile();
+    state->submitted(false);
     auto source = delegate->acquire(range);
     return state->copy(source, range, slack(range, fileSize));
   }
 
-  // Forwards the batch whole, so the delegate sees it as one round.
-  void acquire(std::span<const ByteRange> ranges, AcquireDone done) override {
-    auto fileSize = delegate->size();
-    for (auto range : ranges) {
-      checkRange(range, fileSize);
-      if (range.offset == 0 && range.length == fileSize) state->wholeFile();
-    }
-    state->round(true);
-    std::vector<ByteRange> requested(ranges.begin(), ranges.end());
-    delegate->acquire(ranges, [state = state, fileSize, requested = std::move(requested), done = std::move(done)](
-                                  std::vector<HeldRange>&& sources, std::exception_ptr failure) {
-      std::vector<HeldRange> holds;
-      if (!failure) {
-        try {
-          if (sources.size() != requested.size()) throw FileIOException("strict: batch returned the wrong number of holds");
-          holds.reserve(sources.size());
-          for (size_t i = 0; i < sources.size(); ++i) {
-            holds.push_back(state->copy(sources[i], requested[i], slack(requested[i], fileSize)));
-          }
-        } catch (...) {
-          holds.clear();
-          failure = std::current_exception();
-        }
+  // Checks every range as a single acquire would, then forwards the batch
+  // whole, so the delegate sees it as one submission. Each hold is copied under
+  // the strict rules and the delegate's holds release before `done` runs.
+  void acquireBatch(std::span<const ByteRange> ranges, AcquireDone done) noexcept override {
+    AcquireDone forward;
+    try {
+      auto fileSize = delegate->size();
+      for (auto range : ranges) {
+        checkRange(range, fileSize);
+        state->checkClass(range);
+        if (state->readsWholeFile(range, fileSize)) state->wholeFile();
       }
-      sources.clear();
-      done(std::move(holds), std::move(failure));
-    });
+      // Copies `done`, so it is still ours to fail if building `forward` throws.
+      forward = [state = state, fileSize, requested = std::vector(ranges.begin(), ranges.end()), done](
+                    std::vector<HeldRange>&& delivered, std::exception_ptr failure) noexcept {
+        auto sources = std::move(delivered);
+        std::vector<HeldRange> holds;
+        if (!failure) {
+          try {
+            if (sources.size() != requested.size()) {
+              throw FileIOException("strict: batch returned the wrong number of holds");
+            }
+            holds.reserve(sources.size());
+            for (size_t i = 0; i < sources.size(); ++i) {
+              holds.push_back(state->copy(sources[i], requested[i], slack(requested[i], fileSize)));
+            }
+          } catch (...) {
+            holds.clear();
+            failure = std::current_exception();
+          }
+        }
+        sources.clear();
+        done(std::move(holds), std::move(failure));
+      };
+      if (auto gate = state->submitted(true)) {
+        GatedInputFile(delegate, *gate, false).acquireBatch(ranges, std::move(forward));
+        return;
+      }
+    } catch (...) {
+      done({}, std::current_exception());
+      return;
+    }
+    delegate->acquireBatch(ranges, std::move(forward));
   }
 
   void prefetch(size_t offset, size_t length) override { delegate->prefetch(offset, length); }
@@ -257,17 +314,21 @@ public:
 
 } // namespace
 
-std::shared_ptr<InputFile> StrictDirectory::openFile(std::string_view name, bool expectSynced, uint64_t size) {
-  auto file = delegate->openFile(name, expectSynced, size);
+std::shared_ptr<InputFile> StrictDirectory::openFile(std::string_view name, OpenOptions options) {
+  auto file = delegate->openFile(name, options);
   if (!file) return {};
-  if (size && size != file->size()) throw FileIOException("strict: open size differs from file " + std::string(name));
-  return std::make_shared<StrictInputFile>(std::move(file), std::make_shared<StrictFileState>(counters, name, mode));
+  if (options.size && options.size != file->size()) {
+    throw FileIOException("strict: open size differs from file " + std::string(name));
+  }
+  auto state = std::make_shared<StrictFileState>(counters, name, mode, options.size != 0);
+  return std::make_shared<StrictInputFile>(std::move(file), std::move(state));
 }
 
 std::shared_ptr<ChecksumReader> StrictDirectory::openChecksum(std::string_view name, bool direct) {
   auto reader = delegate->openChecksum(name, direct);
   if (!reader) return {};
-  return std::make_shared<StrictChecksumReader>(std::move(reader), std::make_shared<StrictFileState>(counters, name, mode));
+  auto state = std::make_shared<StrictFileState>(counters, name, mode, false);
+  return std::make_shared<StrictChecksumReader>(std::move(reader), std::move(state));
 }
 
 } // namespace luxir::test

@@ -399,7 +399,7 @@ void BM_VectorColdOverlayOpen(benchmark::State& state) {
     state.SkipWithError("no overlay");
     return;
   }
-  auto file = dir.openFile(info->files[0].name, true);
+  auto file = dir.openFile(info->files[0].name, {.expectSynced = true});
   auto view = file->acquire({0, file->size()});
   size_t page = (size_t)sysconf(_SC_PAGESIZE);
   std::vector<std::pair<char*, size_t>> spans = {{(char*)view.getData(), file->size() & ~(page - 1)}};

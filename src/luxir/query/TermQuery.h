@@ -16,6 +16,7 @@
 #include "Query.h"
 #include "luxir/reader/NormsReader.h"
 #include "luxir/util/luxir_util.h"
+#include "CatalogPredicates.h"
 
 namespace luxir {
 
@@ -86,6 +87,10 @@ public:
     checkedBoostProduct(multiplier, boost);
   }
 
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return proof::termMatch(view, field, term);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
@@ -101,6 +106,8 @@ public:
   const Similarity::TermStats& scoringTermStats(const CachedTermInfo& cachedTermInfo) const {
     return hasInjectedTermStats ? injectedTermStats : cachedTermInfo.termStats;
   }
+
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
@@ -151,7 +158,7 @@ public:
     }
 
 
-    Query::Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
+    Query::Scorer* createScorerImpl(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
       if (cachedTermInfo == nullptr) {
         // term doesn't exist in any segment
         return nullptr;
@@ -182,7 +189,7 @@ public:
 
     // A missing term is empty under any domain; otherwise docFreq is exact
     // only when eligibility does not restrict the segment.
-    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+    CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
       int64_t docs = cachedTermInfo ? cachedTermInfo->docFreq(segment.ord) : 0;
       return countBound(segment, domain, docs, CountHow::METADATA);
     }

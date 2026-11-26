@@ -12,6 +12,8 @@
 #include <memory_resource>
 #include <mutex>
 
+#include <boost/container/small_vector.hpp>
+
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/api/build.h"
 #include "luxir/LuxirConfig.h"
@@ -33,8 +35,11 @@ namespace luxir {
 
 class FanoutScope;
 class SearchEngine;
+class SearchOp;
 class SearchResponse;
 class OwnershipRelation;
+class ProtobufSearchParser;
+class RootOp;
 
 // Cumulative count of emitter pauses caused by reply() flow control.
 // Process-wide; read by tests and (eventually) server stats.
@@ -60,13 +65,32 @@ namespace build = luxir::api::build;
 // The top-level request for the SearchEngine.
 class Collection;
 class SearchRequest : public ExecutionWarnings, public ExecutionProfileSink {
+  using Stage = Query::PlanningContext::Stage;
+
+  struct MaterializationStep {
+    // An arena-owned op or domain plan.
+    void* owner;
+    void (*run)(void*);
+  };
+  // The parser appends in execution construction order, including bindings.
+  boost::container::small_vector<MaterializationStep, 1> materializationSteps;
+  // The first unfinished step, including a failed step.
+  size_t materializationCursor = 0;
+  // Published after logical construction and kept through failure cleanup.
+  RootOp* logicalRoot = nullptr;
+  // INACTIVE permits standalone query planning before any op tree is parsed.
+  Stage stage = Stage::INACTIVE;
+
   struct ScopedState {
     std::shared_ptr<IndexReader> reader;
     std::shared_ptr<FilterCache::UseRegistry> uses;
+    // Populated only if a Context binds to this view.
+    std::optional<TermFactsCache> termFacts;
     // Request-arena owned; the pair of paths fixes the direction of reduction.
     std::map<std::pair<std::string, std::string>, OwnershipRelation*> relations;
   };
   friend class SearchEngine;
+  friend class ProtobufSearchParser;
   void count(MetricOutcome outcome, std::chrono::steady_clock::time_point end);
   void settleFilterUses(bool completed) noexcept;
 
@@ -92,6 +116,7 @@ public:
   // Shared by every query tree of the request: one allowance for all of its
   // prefix/wildcard/regex/range/fuzzy dictionary work.
   MultiTermBudget multiTermBudget;
+  std::shared_ptr<QueryPruning> pruning;
   const ReqProto& proto;            // borrowed non-owning view over the request bytes
   google::protobuf::Arena& arena;   // engine object allocator (NOT proto storage)
   std::shared_ptr<IndexReader> reader;
@@ -117,8 +142,9 @@ public:
   std::string timeZoneError;
   MemPool requestPool;
 private:
-  // Registries can retain request memory charges. Destroy them before the
-  // request pool and tracker, and before releasing their reader pins.
+  // Lazy term facts for the root view, using requestPool.
+  std::optional<TermFactsCache> termFacts;
+  // Destroy the view caches and registries before the request pool and tracker.
   std::unique_ptr<std::map<std::string, ScopedState, std::less<>>> scopedStates;
 public:
   FanoutScope* tg = nullptr; // optional top-level fan-out scope for this request.
@@ -141,6 +167,9 @@ public:
   // proto.profile=true during parsing.
   std::vector<std::unique_ptr<ExecutionProfileOpState>> executionProfileOps;
   std::mutex executionProfileMutex;
+  ExecutionProfileOpState* pruningProfile = nullptr;
+  void recordPrunedSegment(ExecutionProfileRun*& run, IndexReader::Segment& segment,
+                           std::vector<std::string> details);
 
   // Transport default for DocList field placement when an op leaves
   // document_format at DEFAULT: gRPC serves COLUMNS; the HTTP/JSON layer sets
@@ -159,11 +188,23 @@ public:
 
   virtual ~SearchRequest();
 
+  void addMaterializationStep(SearchOp& op);
+
+  template <auto Method, typename Owner>
+  void addMaterializationStep(Owner& owner) {
+    assert(stage == Stage::LOGICAL);
+    materializationSteps.push_back({&owner, [](void* object) {
+      (static_cast<Owner*>(object)->*Method)();
+    }});
+  }
+
+  // Run the logical plan's recorded steps serially before initialization.
+  void materialize();
+
   // Parsing and returned fields pin each additional view once, under mutex.
   // The map has no allocation until
   // a request crosses a space boundary; registry identities never cross it.
   const std::shared_ptr<IndexReader>& pinView(std::string_view path);
-  const std::shared_ptr<FilterCache::UseRegistry>& uses(IndexReader& view);
   OwnershipRelation& ownershipRelation(IndexReader& many, IndexReader& one);
   Query::PlanningContext* createPlanningContext(IndexReader& view);
   size_t scopedViewCountForTests() const noexcept { return scopedStates ? scopedStates->size() : 0; }

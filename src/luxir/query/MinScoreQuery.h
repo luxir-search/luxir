@@ -31,6 +31,10 @@ class MinScoreQuery final : public Query {
   Query* child;
   float minScore;
 
+  static int32_t childFlags(int32_t flags) {
+    return (flags & ~EXCLUSION_WINDOW_FILL) | NEED_SCORES | ALLOW_PRUNING;
+  }
+
   class Scorer final : public Query::Scorer {
     Query::Scorer* child;
     float minScore;
@@ -457,6 +461,10 @@ public:
     return child->requiredValueEnvelope(field);
   }
 
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return child->mayMatch(view);
+  }
+
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     checkedBoostProduct(multiplier, 1.0f);
@@ -469,6 +477,8 @@ public:
     unused(out, ctx);
     return FilterKeyScope::UNCACHEABLE;
   }
+
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
 
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
@@ -493,7 +503,7 @@ public:
         : child(std::move(child)), minScore(minScore), multiplier(multiplier),
           scored(scored) {}
 
-      Query::Scorer* createScorer(
+      Query::Scorer* createScorerImpl(
           MemPool& targetPool, IndexReader::Segment& segment) override {
         return buildPull(targetPool, scorerSupplier(targetPool, segment));
       }
@@ -524,8 +534,8 @@ public:
            float multiplier)
       : Query::Weight(context, query, flags), minScore(query.minScore),
         multiplier(multiplier), scored((flags & NEED_SCORES) != 0) {
-      childWeight = query.child->createWeight(
-          context, (flags & ~EXCLUSION_WINDOW_FILL) | NEED_SCORES | ALLOW_PRUNING,
+      childWeight = query.child->buildWeight(
+          context, childFlags(flags),
           1.0f);
       // Only preparation traits carry over: match-all, constant
       // counts, and count/top-k composition all describe the child's
@@ -534,7 +544,7 @@ public:
       if (!scored) traits |= IS_CONSTANT_SCORING;
     }
 
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(
         Query::Weight::PrepareContext& ctx) override {
       QueryPrep::PreparedSource source;
       source.weight = childWeight;
@@ -545,7 +555,7 @@ public:
                                         multiplier, scored);
     }
 
-    Query::Scorer* createScorer(
+    Query::Scorer* createScorerImpl(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       return buildPull(targetPool, scorerSupplier(targetPool, segment));
     }

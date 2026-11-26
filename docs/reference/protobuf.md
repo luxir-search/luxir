@@ -1096,7 +1096,8 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.defaults"></a>[`defaults`](#field-luxir.fielddef.defaults) | 14 | [`FieldDefaults`](#message-luxir.fielddefaults) | singular | default search and value representations |
 | <a id="field-luxir.fielddef.normalizer"></a>[`normalizer`](#field-luxir.fielddef.normalizer) | 15 | [`NormalizerDef`](#message-luxir.normalizerdef) | singular | whole-value STRING normalization |
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
-| <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix; normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits; 0 means no truncation. |
+| <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix, or HAMMING, which needs a multiple of 8. normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits. A value of 0 disables truncation. |
+| <a id="field-luxir.fielddef.encoding"></a>[`encoding`](#field-luxir.fielddef.encoding) | 20 | [`VectorEncoding`](#enum-luxir.vectorencoding) | optional | VECTOR only. Column storage encoding. Unset inherits, falling back to BIT for metric HAMMING and F32 otherwise. F16 rejects elements with a magnitude above 65504. Applies to newly written segments; merges rewrite older segments in it. Merges do not convert across the BIT boundary, and a schema change that makes a field resolve across it is rejected if a published segment holds values for the field on the other side. |
 | <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
 | <a id="field-luxir.fielddef.scale"></a>[`scale`](#field-luxir.fielddef.scale) | 25 | `int32` | optional | DECIMAL only, and required there: digits after the decimal point, 0 to 18. Excess fractional digits round half away from zero. |
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
@@ -1565,7 +1566,7 @@ Nearest-neighbor query against a searchable vector field. Search is exact when n
 | <a id="field-luxir.knnquery.refine_candidates"></a>[`refine_candidates`](#field-luxir.knnquery.refine_candidates) | 5 | `int32` | singular | Candidate-document pool size for full-precision rescoring of ANN results, in both units. Group search caps the number of candidates per group so repeated keys cannot consume the whole pool. Clamped up to k; 0 selects an adaptive default. Larger pools can improve recall at a cost in memory and latency. Fewer candidates may be available. |
 | <a id="field-luxir.knnquery.ivf"></a>[`ivf`](#field-luxir.knnquery.ivf) | 6 | [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf) | singular | ignored for exact search and segments without an IVF index |
 | <a id="field-luxir.knnquery.unit"></a>[`unit`](#field-luxir.knnquery.unit) | 7 | `string` | singular | docs (default): k counts documents. groups: k counts nearest groups under the enclosing top\_docs collapse key and missing policy; requires collapse. The match set contains one best scored witness per selected group. |
-| <a id="field-luxir.knnquery.similarity"></a>[`similarity`](#field-luxir.knnquery.similarity) | 8 | `float` | optional | Minimum vector similarity for a hit, in the metric's own space (not the transformed score): for l2 the maximum L2 distance (not squared), for ip the minimum dot product, for cosine the minimum cosine similarity. Hits beyond it are dropped from the k nearest, so fewer than k may match. Compared before any enclosing boost. Must be finite; l2 requires &gt;= 0. |
+| <a id="field-luxir.knnquery.similarity"></a>[`similarity`](#field-luxir.knnquery.similarity) | 8 | `float` | optional | Threshold for the k nearest hits, applied before any enclosing boost. For l2, the maximum unsquared L2 distance. For ip, the minimum dot product. For cosine, the minimum cosine similarity. For hamming, the minimum score (1 - hamming distance / dims). The threshold must be finite, and l2 requires a nonnegative value. Fewer than k hits may match. |
 
 <a id="message-luxir.knnquery.ivf"></a>
 
@@ -1659,6 +1660,8 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.node_budget_bytes"></a>[`node_budget_bytes`](#field-luxir.memorystats.node_budget_bytes) | 5 | `uint64` | singular | Configured budget for managed memory (max\_ram\_mb); not an RSS ceiling. Zero is unlimited. |
 | <a id="field-luxir.memorystats.search_request_limit_bytes"></a>[`search_request_limit_bytes`](#field-luxir.memorystats.search_request_limit_bytes) | 6 | `uint64` | singular | Per-request tracked search memory ceiling; zero disables rejection. |
 | <a id="field-luxir.memorystats.schema_cache_bytes"></a>[`schema_cache_bytes`](#field-luxir.memorystats.schema_cache_bytes) | 7 | `uint64` | singular | Estimated parsed schema payload held by snapshots/readers, not allocator RSS. |
+| <a id="field-luxir.memorystats.live_docs_heaps"></a>[`live_docs_heaps`](#field-luxir.memorystats.live_docs_heaps) | 8 | `uint64` | singular | Live docs generations loaded from sparse files and expanded to heap bitmaps, held by readers and in-flight writer work. Dense generations are mapped and not counted. |
+| <a id="field-luxir.memorystats.live_docs_heap_bytes"></a>[`live_docs_heap_bytes`](#field-luxir.memorystats.live_docs_heap_bytes) | 9 | `uint64` | singular | Heap bytes of those generations. |
 
 <a id="message-luxir.multimatchquery"></a>
 
@@ -2898,6 +2901,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec)
 - [`UpdateResponse.Status`](#enum-luxir.updateresponse.status)
 - [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec)
+- [`VectorEncoding`](#enum-luxir.vectorencoding)
 - [`VectorMetric`](#enum-luxir.vectormetric)
 
 <a id="enum-luxir.calendargap.unit"></a>
@@ -3250,11 +3254,27 @@ How facet selections filter the enclosing TopDocs results and its sub-operations
 | <a id="value-luxir.vectoranndef.codec.rabitq"></a>[`RABITQ`](#value-luxir.vectoranndef.codec.rabitq) | 0 | IVF + RaBitQ (randomly rotated, centroid-relative bit codes) |
 | <a id="value-luxir.vectoranndef.codec.pq"></a>[`PQ`](#value-luxir.vectoranndef.codec.pq) | 1 | IVF + product quantization |
 
+<a id="enum-luxir.vectorencoding"></a>
+
+### luxir.VectorEncoding
+
+Storage encoding of a vector field's column. Exact search and the rescoring of ANN candidates score against the stored encoding.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.vectorencoding.f32"></a>[`F32`](#value-luxir.vectorencoding.f32) | 0 | float32 per element (4 bytes per dimension) |
+| <a id="value-luxir.vectorencoding.f16"></a>[`F16`](#value-luxir.vectorencoding.f16) | 1 | IEEE half precision per element (2 bytes per dimension) |
+| <a id="value-luxir.vectorencoding.bf16"></a>[`BF16`](#value-luxir.vectorencoding.bf16) | 2 | bfloat16 per element (2 bytes per dimension) |
+| <a id="value-luxir.vectorencoding.sq8"></a>[`SQ8`](#value-luxir.vectorencoding.sq8) | 3 | Per-vector scalar quantization: a float offset and scale per vector plus one uint8 code per dimension (8 + dims bytes). |
+| <a id="value-luxir.vectorencoding.bit"></a>[`BIT`](#value-luxir.vectorencoding.bit) | 4 | One bit per dimension, set when the element is &gt; 0 (dims / 8 bytes; dims a multiple of 8). Searchable only with metric HAMMING, whose default encoding it is. |
+
 <a id="enum-luxir.vectormetric"></a>
 
 ### luxir.VectorMetric
 
-Vector similarity metric. NONE = storage-only, not kNN-searchable; L2 / IP / COSINE select the metric for exact column search and any ANN index.
+Vector similarity metric. NONE = storage-only, not kNN-searchable; L2 / IP / COSINE select the metric for exact column search and any ANN index. HAMMING scores BIT-encoded binary vectors by 1 - hamming distance / dims, by exact search only (no ANN index).
 
 [Source](../../protos/luxir_types.proto)
 
@@ -3264,6 +3284,7 @@ Vector similarity metric. NONE = storage-only, not kNN-searchable; L2 / IP / COS
 | <a id="value-luxir.vectormetric.l2"></a>[`L2`](#value-luxir.vectormetric.l2) | 1 |  |
 | <a id="value-luxir.vectormetric.ip"></a>[`IP`](#value-luxir.vectormetric.ip) | 2 |  |
 | <a id="value-luxir.vectormetric.cosine"></a>[`COSINE`](#value-luxir.vectormetric.cosine) | 3 |  |
+| <a id="value-luxir.vectormetric.hamming"></a>[`HAMMING`](#value-luxir.vectormetric.hamming) | 4 |  |
 
 ## Imported types
 

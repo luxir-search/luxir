@@ -4,6 +4,7 @@
 #pragma once
 
 #include "luxir/analysis/Analyzer.h"
+#include "luxir/codec/VectorCodec.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/StrRef.h"
@@ -628,7 +629,8 @@ struct VectorAnnConfig {
 //
 // metric_ controls whether the field is searchable by kNN / ANN.  NONE means
 // storage-only; L2 / IP / COSINE pick the similarity metric for exact column
-// scan and future aux-backed ANN engines.
+// scan and future aux-backed ANN engines.  HAMMING scores BIT columns by exact
+// scan only.
 class VectorFieldType : public FieldType {
 public:
   enum Metric {
@@ -636,6 +638,7 @@ public:
     METRIC_L2 = 1,
     METRIC_IP = 2,
     METRIC_COSINE = 3,
+    METRIC_HAMMING = 4,
   };
 
   // Squared norm at or below which a cosine vector has no direction.
@@ -654,6 +657,9 @@ public:
   // COSINE fields normalize vectors before column storage by default.  Ignored
   // for non-COSINE metrics.
   bool normalizeOnWrite_;
+  // Column storage encoding (f32 / f16 / bf16 / sq8 / bit).  Recorded per segment, so a
+  // later schema change never reinterprets existing segments.
+  VectorEncoding encoding_;
   // ANN overlay codec and parameters (schema "ann").
   VectorAnnConfig ann_;
 
@@ -662,6 +668,7 @@ public:
                   Metric metric = METRIC_NONE,
                   bool normalized = false,
                   bool normalizeOnWrite = true,
+                  VectorEncoding encoding = VectorEncoding::F32,
                   VectorAnnConfig ann = {},
                   int32_t truncateDims = 0)
     : FieldType(name, FieldType::VECTOR, flags),
@@ -670,6 +677,7 @@ public:
       metric_(metric),
       normalized_(normalized),
       normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized),
+      encoding_(encoding),
       ann_(ann) {
     assert(truncateDims == 0 || (truncateDims > 0 && truncateDims < dims));
   }
@@ -682,6 +690,7 @@ public:
   Metric metric() const { return metric_; }
   bool normalized() const { return normalized_; }
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
+  VectorEncoding encoding() const { return encoding_; }
   const VectorAnnConfig& ann() const { return ann_; }
 
   // The contract for every indexed and query vector: inputDims() components
@@ -695,6 +704,10 @@ public:
   // True iff this field supports kNN / ANN search.  Exact flat search can run
   // directly over the column; real ANN engines may also build aux artifacts.
   bool knnSearchable() const { return metric_ != METRIC_NONE; }
+
+  // True iff commits and merges may build an ANN overlay for this field.
+  // HAMMING has none: bit columns are small and scanned exactly.
+  bool annIndexable() const { return knnSearchable() && metric_ != METRIC_HAMMING; }
 };
 
 // How a stored-fields resource compresses its chunks.  codec, the two chunk

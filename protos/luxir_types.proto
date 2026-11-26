@@ -434,11 +434,12 @@ message KnnQuery {
   // The match set contains one best scored witness per selected group.
   string unit = 7;
 
-  // Minimum vector similarity for a hit, in the metric's own space (not the
-  // transformed score): for l2 the maximum L2 distance (not squared), for ip
-  // the minimum dot product, for cosine the minimum cosine similarity. Hits
-  // beyond it are dropped from the k nearest, so fewer than k may match.
-  // Compared before any enclosing boost. Must be finite; l2 requires >= 0.
+  // Threshold for the k nearest hits, applied before any enclosing boost.
+  // For l2, the maximum unsquared L2 distance. For ip, the minimum dot
+  // product. For cosine, the minimum cosine similarity. For hamming, the
+  // minimum score (1 - hamming distance / dims).
+  // The threshold must be finite, and l2 requires a nonnegative value.
+  // Fewer than k hits may match.
   optional float similarity = 8;
 
   // Search effort for IVF indexes.
@@ -2054,6 +2055,12 @@ message MemoryStats {
   uint64 search_request_limit_bytes = 6;
   // Estimated parsed schema payload held by snapshots/readers, not allocator RSS.
   uint64 schema_cache_bytes = 7;
+  // Live docs generations loaded from sparse files and expanded to heap bitmaps,
+  // held by readers and in-flight writer work. Dense generations are mapped and
+  // not counted.
+  uint64 live_docs_heaps = 8;
+  // Heap bytes of those generations.
+  uint64 live_docs_heap_bytes = 9;
 }
 
 // Full catalog for a discovery cursor, scoped to this source boot.
@@ -2506,12 +2513,29 @@ message NormalizerDef {
 
 // Vector similarity metric.  NONE = storage-only, not kNN-searchable;
 // L2 / IP / COSINE select the metric for exact column search and any
-// ANN index.
+// ANN index.  HAMMING scores BIT-encoded binary vectors by
+// 1 - hamming distance / dims, by exact search only (no ANN index).
 enum VectorMetric {
   NONE = 0;
   L2 = 1;
   IP = 2;
   COSINE = 3;
+  HAMMING = 4;
+}
+
+// Storage encoding of a vector field's column.  Exact search and the
+// rescoring of ANN candidates score against the stored encoding.
+enum VectorEncoding {
+  F32 = 0;   // float32 per element (4 bytes per dimension)
+  F16 = 1;   // IEEE half precision per element (2 bytes per dimension)
+  BF16 = 2;  // bfloat16 per element (2 bytes per dimension)
+  // Per-vector scalar quantization: a float offset and scale per vector plus
+  // one uint8 code per dimension (8 + dims bytes).
+  SQ8 = 3;
+  // One bit per dimension, set when the element is > 0 (dims / 8 bytes; dims
+  // a multiple of 8). Searchable only with metric HAMMING, whose default
+  // encoding it is.
+  BIT = 4;
 }
 
 // Approximate nearest-neighbor index settings for a VECTOR field: the codec
@@ -2673,11 +2697,20 @@ message FieldDef {
   // VECTOR only. Keep the first truncate_dims components of every indexed
   // and query vector, for Matryoshka (MRL) embeddings whose prefixes are
   // usable embeddings. Requires dims (the full input dimension, which must be
-  // larger) and metric COSINE, which renormalizes the prefix; normalized=true
-  // is rejected. Inputs carry dims components, or truncate_dims for a vector
-  // already truncated. The column, ANN overlays and kNN scoring use
-  // truncate_dims. Unset inherits; 0 means no truncation.
+  // larger) and metric COSINE, which renormalizes the prefix, or HAMMING,
+  // which needs a multiple of 8. normalized=true is rejected. Inputs carry
+  // dims components, or truncate_dims for a vector already truncated. The
+  // column, ANN overlays and kNN scoring use truncate_dims. Unset inherits.
+  // A value of 0 disables truncation.
   optional int32 truncate_dims = 19;
+
+  // VECTOR only. Column storage encoding. Unset inherits, falling back to
+  // BIT for metric HAMMING and F32 otherwise. F16 rejects elements with a
+  // magnitude above 65504. Applies to newly written segments; merges rewrite
+  // older segments in it. Merges do not convert across the BIT boundary, and a
+  // schema change that makes a field resolve across it is rejected if a
+  // published segment holds values for the field on the other side.
+  optional VectorEncoding encoding = 20;
 
   // VECTOR only: ANN overlay settings. Absent inherits the parent's whole
   // definition (no per-property merge), else every VectorAnnDef default.

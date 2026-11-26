@@ -12,6 +12,7 @@
 
 #include "luxir/query/BKDQueryWeight.h"
 #include "luxir/query/GeoPointSource.h"
+#include "luxir/query/CatalogPredicates.h"
 #include "luxir/query/Query.h"
 #include "luxir/reader/BKDReader.h"
 #include "luxir/util/MemPool.h"
@@ -148,6 +149,11 @@ public:
   }
 
   const BKDPolygonRelation& makeRelation() const { return relation; }
+
+  // The polygons' bounding box against the field's bounding box.
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    return proof::geoMatch(view, field, relation.latMin, relation.latMax, relation.lonMin, relation.lonMax);
+  }
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;

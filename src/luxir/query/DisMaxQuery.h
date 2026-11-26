@@ -29,6 +29,10 @@ class DisMaxQuery final : public Query {
   float tie;
   Query* membership;
 
+  Query* membershipForWeight(int32_t flags) const {
+    return (flags & NEED_SCORES) == 0 ? membership : nullptr;
+  }
+
 public:
   // membership must be the SHOULD-only BooleanQuery over the same disjuncts;
   // make() builds both.
@@ -45,6 +49,15 @@ public:
   static Query* make(MemPool& pool, std::span<Query*> disjuncts, float tie);
 
   std::span<Query*> getDisjuncts() const { return disjuncts; }
+
+  // A document matches when some disjunct does.
+  MatchState mayMatch(const CatalogSummaryView& view) const override {
+    if (disjuncts.empty()) return MatchState::UNKNOWN;
+    for (Query* disjunct : disjuncts) {
+      if (disjunct->mayMatch(view) != MatchState::EMPTY) return MatchState::UNKNOWN;
+    }
+    return MatchState::EMPTY;
+  }
   float getTie() const { return tie; }
   Query* getMembership() const { return membership; }
 
@@ -82,6 +95,8 @@ public:
     return membership->appendFilterKey(out, ctx);
   }
 
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
+
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
 
@@ -96,13 +111,13 @@ namespace luxir {
 
 inline Query::Weight* DisMaxQuery::createWeight(
     Context& context, int32_t flags, float multiplier) {
-  if ((flags & NEED_SCORES) == 0) {
+  if (auto* membership = membershipForWeight(flags)) {
 #ifndef NDEBUG
     if (context.logicalValidationActive()) {
       membership->validateLogical(context.planningContext(), multiplier);
     }
 #endif
-    return membership->createWeight(context, flags, multiplier);
+    return membership->buildWeight(context, flags, multiplier);
   }
   return BooleanQuery::makeDisjunctionWeight(
       context, *this, disjuncts, {BooleanQuery::ScorePolicy::DISMAX, tie},

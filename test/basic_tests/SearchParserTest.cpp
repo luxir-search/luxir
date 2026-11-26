@@ -422,6 +422,8 @@ TEST_F(SearchParserTest, normalizationScoreModesAndStringComparator) {
     auto* root = static_cast<RootOp*>(parser.parse());
     auto* parsed = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
     ASSERT_NE(parsed, nullptr);
+    EXPECT_EQ(nullptr, parsed->weightContext);
+    request->materialize();
     verify(*parsed);
   };
 
@@ -479,6 +481,7 @@ TEST_F(SearchParserTest, normalizationScoreModesAndStringComparator) {
   auto* root = static_cast<RootOp*>(parser.parse());
   auto* parsed = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
   ASSERT_NE(parsed, nullptr);
+  canonical->materialize();
   EXPECT_FALSE(parsed->sortPlan.useFieldSort);
   EXPECT_TRUE(parsed->weight->allowsPruning());
 }
@@ -505,6 +508,7 @@ TEST_F(SearchParserTest, getNumberControlsPruningWeightFlag) {
     if (it == root->subOps.end()) return std::nullopt;
     auto* parsed = dynamic_cast<TopDocsReq*>(it->second);
     if (parsed == nullptr) return std::nullopt;
+    request->materialize();
     return parsed->weight->allowsPruning();
   };
 

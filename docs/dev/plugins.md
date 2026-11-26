@@ -209,16 +209,40 @@ The maker receives a `PluginOpContext` while the request is parsed and returns a
 - `node()` returns the request's node by reference. Its `pluginState<T>(name)`
   accesses the same state that query makers and HTTP handlers see.
 - `parseQuery(...)` lowers and validates a query against the op's `planning()`
-  context; `weightContext()` is the `Query::Context` for `createWeight`, and
-  `planning().getFilterUse(query)` its filter cache entry.
+  context. Keep the returned query and the `Query::PlanningContext&` on the op.
+  The `PluginOpContext` and its `ParseContext` expire when the maker returns.
 - `parseSource(name, val)` parses a TopDocs-shaped param as a source the op runs
   itself, as `FusionOp` runs its sources: set its `rankingSink` and `parent`,
   create its calculator under the op's own, dispatch it per segment and receive
-  the merged collector.
+  the merged collector. The returned source is logical. Inspect its execution
+  state in the plugin op's `materialize()`, after the source's step has run.
 - `addSubs(op)` parses the nested ops into `op.subOps`. They run over whatever
   domain the op hands their calculators (`acceptAll` with one `DomainHandle` per
   segment; an empty set, never null, for a segment with no documents), and may not
   declare their own `domain`.
+
+A maker constructs the op from parsed, validated inputs. Override
+`SearchOp::materialize()` to create execution contexts, weights, and filter
+uses. The engine finishes logical parsing for the request before running
+materialization in recorded order. The hook runs once, serially, before
+`init()` and after the sources the maker parsed.
+The debug phase check covers contexts built from the request's planning state.
+A maker still violates the lifecycle by constructing a private standalone
+`Query::Context` during parsing, which the debug check cannot detect.
+
+`releaseSegmentState()` can be called if the op's `materialize()` never ran or
+threw partway through. It must tolerate unset execution state.
+
+For example, `query_count` stores the parsed query and planning context in its
+maker and builds the unscored weight in its materialization hook.
+
+```cpp
+void materialize() override {
+  auto* context = luxir::Query::Context::create(&req.arena, planning);
+  weight = context->createRootWeight(query, 0);
+  if (weight->needsPrepare()) throw luxir::RequestError("query_count requires a segment-local query");
+}
+```
 
 The op's calculator follows the `SearchOp::Calculator` contract (see
 `src/luxir/search/ops/SearchOp.h` and `FusionOp.h`). Results are a `Val` in the
@@ -235,7 +259,7 @@ field list to omit that physical field or select the extra by name. `_score_`
 and `_version_` are reserved output names and cannot be extras. Duplicate extra
 names are a plugin error (`std::logic_error`); field clashes are `RequestError`s.
 All checks run during resolution, before any column or loader is created.
-A free-form result is a `Map`. Nested op
+A plugin can also return a scalar or a `Map`. Nested op
 results go in the `DocList`'s `ops` (route them in `getTargetForSub`). `format=docs`
 accepts only `top_docs` and `fusion` ops.
 
@@ -279,8 +303,10 @@ r.http.add("POST", "/collections/{collection}/_sample",
 and `unscoped_value` to test rejection of a PLUGIN query without the base.
 It also registers a `sample_docs` search op
 (rank columns named by `rank_names`, defaulting to `_rank`, and nested ops over
-its documents), two HTTP routes and a per-node state with query, op and route
-counters. The makers and handlers reach that state through their contexts.
+its documents), and a `query_count` leaf op that counts a segment-local query
+within its input domain. The plugin has two HTTP routes and a per-node state
+with query, op and route counters. The makers and handlers reach that state
+through their contexts.
 `PluginExtensionTest` and `PluginQueryTest` exercise the plugin end to end,
 including independent live nodes; `PluginTest` covers registry validation and
 state creation/destruction order.
@@ -327,6 +353,10 @@ Rules:
   when it next loads, for queries and new documents alike.
 - The fused `unicode_word` + `nfkc_cf` fast path applies only to exactly those built-in
   components; plugin stages always run as written.
+- `Token` carries more than its text, offsets and `positionIncrement`. The whole chain shares
+  one `Token`, so a filter that rewrites or drops tokens in place forwards every attribute;
+  one that buffers tokens past the current pull saves and restores what it needs. See
+  [Token attributes](#token-attributes).
 - A collection whose persisted schema names a component this binary does not have fails to
   load with the "unknown ..." message; the node keeps serving its other collections.
 
@@ -366,6 +396,54 @@ A schema then uses the plugin by name (`"analyzer": "example"`) or composes its 
 (`"analyzer": {"tokenizer": "whitespace", "filters": ["example_reverse"]}`).
 Text is fed to a chain with `TokenChain::setValue`, never `head.setValue`, so char filters
 always run.
+
+### Token attributes
+
+Besides `text`, `positionIncrement` and the offsets, a `Token` carries `positionLength` and
+the class and script of its input word:
+
+| Attribute | Default | Meaning |
+|---|---|---|
+| `positionLength` | 1 | Positions the token spans: its arc length in the token graph (Lucene's `PositionLengthAttribute`), 2 for a synonym covering two source words. `uint16_t`, reset by `Token::clear()` when a tokenizer starts a token. |
+| `wordClass()` | | `WordClass`: `ALPHA` (letters, ideographs included), `NUMERIC` (digits), `ALNUM` (both), `OTHER` (neither, such as emoji). |
+| `script()` | | `Script` of the first letter that has one: `LATIN`, `HAN`, `HIRAGANA`, `KATAKANA`, `HANGUL`, `THAI`, `ARABIC`, `CYRILLIC`, `GREEK`, `OTHER`; `COMMON` when there is no letter (digits) or no letter belongs to a script. |
+
+Letters are the code points of general category L*, numbers those of N* (so U+2163 ROMAN
+NUMERAL FOUR is numeric); marks, symbols and punctuation inside a word are neither.
+`scriptOf(char32_t)` is the per-code-point script lookup.
+
+`wordClass()` and `script()` describe the token's input word: the tokenizer input bytes in
+`[startOffset, endOffset)`, which `Token::inputText()` returns (after char filters, before any
+token filter). A filter that rewrites `text` does not change them: U+2163 folded to `iv` by
+`nfkc_cf` is still `NUMERIC`. A filter that wants the class of some other bytes, such as the
+text it produced, calls `classifyWord(std::string_view)`, which returns both. A CJK bigram
+filter can branch on `token.script() == Script::HAN` instead of guessing from the first byte.
+
+Both are computed on the first read and cached in `knownClass` and `knownScript` (`UNKNOWN`
+until then), so a chain whose filters never ask pays nothing. `unicode_word` stores them for the
+words its ASCII scan already classified; every other word, and every token of `whitespace`,
+`keyword` or a plugin tokenizer, is classified from its input bytes when a filter first asks.
+A plugin tokenizer that knows a token's class can store both fields itself, after
+`setOffset`.
+
+`Token::setOffset` resets the cache: a new span is a new input word. A filter that splits or
+merges tokens gives each its span with `setOffset` (never by assigning the offsets), and
+readers then see the class of the new span. A buffering filter that restores a saved token restores its
+offsets with `setOffset` and gets the class recomputed on read, unless it also saved and
+restores `knownClass` and `knownScript` after the call.
+
+`positionLength`, `knownClass` and `knownScript` sit next to `positionIncrement`, so `clear()`
+resets all four with one 8-byte store (`Analyzer.h` has a `static_assert`).
+
+`positionLength` is carried and nothing reads it yet. Postings store only each term's start
+position (as Lucene's do), and phrase queries are built from position increments, so a
+token spanning several positions indexes and matches exactly like a one-position token.
+Honouring it needs a query-side graph (a phrase over alternative paths); a filter that
+produces graph tokens can set it today and a later query builder can consume it.
+
+`TokenAttributesExampleTest` shows a plugin filter (`describe`) reading all three, through
+`wordClass()` and `script()`, on fused and unfused chains, and the example `span2` filter
+setting `positionLength`.
 
 ## Storage backends and layers
 
@@ -454,27 +532,40 @@ token needed to release it. Destruction or replacement of the hold calls
 `HoldOwner::release(const HeldRange&)`, which must be thread-safe and
 `noexcept`. The caller releases the hold before destroying its `InputFile`.
 
+`openFile(name, OpenOptions)` returns null when the file does not exist,
+whether or not a size was given. A nonzero `OpenOptions::size` is the size
+the manifest records; after such an open, `size()` must not make a request.
+Answer it from the given size or from a cached listing. Wrappers forward the
+options.
+
 Keep an open `InputFile` readable until it is destroyed, even after its file
 is deleted. A snapshot opens its live docs and overlay files and reads them on
 first use, which may come after the writer has retired them for a newer
 commit. Local files get this from the open descriptor or mapping; a remote
 backend can pin the object, for example with a count of open readers.
 
-A nonzero `size` passed to `openFile` is the size the manifest records; a
-remote backend can answer `size()` from it instead of asking the store, and
-wrappers forward it. Each `ByteRange` also carries a `ReadClass`, `METADATA`
-or `DATA`, which a backend may use to cache or schedule reads; it does not
-change what the range returns.
+A remote directory can keep a cached listing of its prefix (names, sizes,
+ETags) and answer `openFile` and `size()` from it, listing again when a name
+is missing, so neither existence nor size costs a request per file. With a
+passed size it needs the listing only for existence.
 
-`acquire(ranges, done)` takes a batch of ranges on one file. The default
-acquires each range in turn and calls `done` inline, so a local backend needs
-nothing more. A remote backend can override it to merge the ranges and issue
-them as one round of requests. Call `done` exactly once, from any thread,
-with one hold per range in the order requested and a null error, or with no
-holds and the error; `done` does not throw. Throwing from `acquire` instead
-also counts as the batch failing. The ranges are valid only during the call,
-so copy what the completion needs. Wrappers forward the batch to their
-delegate rather than splitting it, so the backend sees it whole.
+Each `ByteRange` also carries a `ReadClass`, `METADATA` or `DATA`. Whoever
+keeps a hold decides how long it lives: the segment for what it keeps, a
+request for what it uses. The class is a hint a cache or backend may use for
+residency and scheduling after release, and it never changes the bytes
+returned.
+
+`acquireBatch(ranges, done)` takes a batch of ranges on one file. The
+default acquires each range in turn and calls `done` inline, so a local
+backend needs nothing more. A remote backend can override it to merge the
+ranges and issue them as one round of requests. It reports every outcome
+through `done`, which it calls exactly once, possibly before returning, from
+any thread: with one hold per range in the order requested and a null error,
+or with no holds and the error. `acquireBatch` is `noexcept`, so a failure to
+issue the batch (a bad range, an allocation) also goes to `done`, and `done`
+does not throw. The ranges are valid only during the call, so copy what the
+completion needs. Wrappers forward the batch to their delegate rather than
+splitting it, so the backend sees it whole.
 
 ### Storage layers
 
@@ -528,17 +619,33 @@ layer's counters. `StorageExampleTest` reaches `CountingRamBackend` and
 
 Run `luxir_test --store.layer=strict` to check readers against isolated range
 buffers with varying garbage in the slack. It reports acquisition counts
-(total and metadata), size requests, and peak live holds and bytes. The default
+(total and metadata), size requests on files opened without a size, and peak
+live holds and bytes. A part acquired from one open file under both read
+classes is an error in either mode. The default
 `strict.whole_segment_files=count` allows whole-file reads for tests that copy
-or replicate files. Use `--store.option strict.whole_segment_files=deny` in
-focused reader tests to reject whole-file reads of base segment data files.
+or replicate files. Use
+`--store.option strict.whole_segment_files=deny` in focused reader tests to
+reject whole-file reads of base segment data files. In those files a read no
+part makes also counts as whole-file: one from offset 0 past the header, or
+one to EOF outside file 0, since the writer pads every other file after its
+last part.
 
 ## Result decorators
 
-`Registries::hitDecorators` registers a maker receiving a `DecoratorContext`
-(request, query parse context, and original ranking queries with execution
-contexts) and a `ParamReader`. Return a shared `HitDecorator` with a unique output column name.
-Register during startup; the registry is frozen with the other registries.
+`Registries::hitDecorators` registers a logical maker receiving a
+`DecoratorContext` and a `ParamReader`. The context provides the request, the
+query parse context, and original ranking queries with their planning contexts.
+Validate parameters and return a shared `HitDecorator` with a fixed, unique
+`columnName()` so parsing can check name collisions. The maker context and
+source span expire when the maker returns. Register during startup before the
+registries freeze.
+
+`HitDecorator::bind(sources)` is called once, serially, before execution and
+after both request-wide logical validation and source materialization. Each
+source supplies its original ranking query and execution context. A cache-resident
+source that omitted its weight gets an execution context on demand. Binding can inspect
+the existing queries and copy borrowed data. Query parsing belongs in the
+maker. The default binding does nothing, which is sufficient for `label`.
 
 TopDocs and Fusion accept `decorate: {"registered_name": {params...}}` on the
 wire. JSON also accepts a registered name directly as a list key. Unknown names,
@@ -555,15 +662,15 @@ ADAPTIVE placement and streaming paths.
 
 Keep mutable readers and forward-only iterators call-local: sorting is per batch,
 and a later ranked batch can contain lower document IDs. Immutable per-request
-plans may be shared with synchronization during initialization. Decorators cannot
+plans may be shared by concurrent calls after binding. Decorators cannot
 change membership, order or scores. The output name must not collide with another
 extra column. Decorators are also invoked for nested top-doc lists, collapsed
 heads, and diversified lists.
 
 ### Inspecting the ranking queries
 
-In the maker, call `source.query->visit(visitor, source.context)` for each entry
-in `DecoratorContext::queries`; a null query means browse. `QueryVisitor`
+In `bind()`, call `source.query->visit(visitor, source.context)` for each
+source with a query. A null query means browse. `QueryVisitor`
 (`luxir/query/QueryVisitor.h`) reports indexed bytes through `term(field, text,
 boost)`. `sub(occur, parent)` chooses the visitor for a composite's children or
 returns null to skip them; the default skips MUST_NOT. Inspectors interested only
@@ -571,12 +678,12 @@ in ranking terms should also skip FILTER. `leaf(query)` means the term picture
 is incomplete. Plugin queries can override the protected `Query::visitImpl`
 to participate without exposing their concrete tree.
 
-Inspection runs only during serial planning, in the maker. It may expand fuzzy
+Inspection runs during serial binding. It may expand fuzzy
 terms, cache the expansion shared with execution, and throw the request's
 multi-term budget errors. Never call visit from concurrent `decorate()` calls.
 Term views borrow query/context storage; copy what decorate needs into the
-decorator. The example `ranking_terms` decorator does this (it lists request
-ranking terms, not the terms matched by each hit).
+decorator. The example `ranking_terms` decorator lists the terms of the request's
+ranking queries.
 
 Traversal preserves raw Boolean occurrences and authored dis_max disjuncts.
 Boosts mirror logical validation and execution: filter children reset the

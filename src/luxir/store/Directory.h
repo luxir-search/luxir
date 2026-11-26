@@ -54,6 +54,17 @@ public:
   virtual FileCheck checksum(const std::function<void(size_t)>& progress = {}) = 0;
 };
 
+// How Directory::openFile opens a file. Namespace scope, not nested, so a
+// default argument can value-initialize it inside Directory.
+struct OpenOptions {
+  // The caller asserts that this file should have been fsynced (e.g. it was
+  // referenced from a committed index). CheckedDirectory uses this to detect
+  // missing fsyncs.
+  bool expectSynced = false;
+  // Nonzero: the file's size as a manifest records it.
+  uint64_t size = 0;
+};
+
 // Implementations of Directory are thread safe.
 class Directory {
 public:
@@ -101,15 +112,15 @@ public:
   // snapshot and entries vanishing mid-scan are skipped, never thrown.
   virtual void listFiles(std::vector<FileInfo> &target) = 0;
 
-  // Open a file for reading.  If expectSynced is true, the caller asserts that
-  // this file should have been fsynced (e.g. it was referenced from a committed
-  // index).  CheckedDirectory uses this flag to detect missing fsyncs.
-  // A nonzero size is the file's size as a manifest records it; a backend may
-  // answer size() from it instead of asking the store. Wrappers forward it.
+  // Open a file for reading; null when it does not exist, sized or not. After
+  // an open with a nonzero options.size, InputFile::size() makes no request:
+  // a backend answers it from that size or from a cached listing. A backend
+  // that trusts the given size leaves a mismatch to surface at read time.
+  // Wrappers forward the options.
   // The open file keeps the file's bytes readable until it is released, even
   // if the file is deleted: a snapshot opens its live docs and overlay files
   // and reads them on first use, possibly after a newer commit retired them.
-  virtual std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) = 0;
+  virtual std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) = 0;
 
   // The caller asserts that `files` were fsynced: a root about to be published
   // references them (Manifest::commit). CheckedDirectory verifies it.
@@ -179,7 +190,7 @@ public:
   // Installs a copy of `source`'s file `name` under the same name. The fallback
   // for backends that cannot link; the caller syncs it like any created file.
   void copyFile(Directory& source, std::string_view name) {
-    auto input = source.openFile(name, true);
+    auto input = source.openFile(name, {.expectSynced = true});
     if (!input) throw std::runtime_error("copy source missing: " + std::string(name));
     auto hold = input->acquire({0, input->size()});
     auto data = hold.bytes();
@@ -272,8 +283,8 @@ public:
     }
   }
 
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false, uint64_t size = 0) override {
-    unused(expectSynced, size);
+  std::shared_ptr<InputFile> openFile(std::string_view name, OpenOptions options = {}) override {
+    unused(options);
     std::lock_guard<std::mutex> lock(mutex);
 
     auto find = files.find(name);
