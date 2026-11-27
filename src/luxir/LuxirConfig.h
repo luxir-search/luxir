@@ -74,6 +74,29 @@ struct ServerConfig {
     int port = 9400;
     int threads = 0;  // 0 = auto
 
+    // Client wait limits in milliseconds; 0 disables one. Each counts only
+    // time the server spends waiting on the client: a request the server is
+    // working on, a commit wait, or a stream it has paused for backpressure is
+    // never timed. A timeout closes the connection.
+    // Header: a new connection's first bytes, and a request's headers from
+    // their first byte.
+    int64_t header_timeout_ms = 10'000;
+    // Body: the longest gap between reads of a request body that make
+    // progress, buffered or streaming NDJSON. A long stream that keeps
+    // sending is never cut.
+    int64_t body_timeout_ms = 30'000;
+    // Idle: a keep-alive connection waiting for its next request.
+    int64_t idle_timeout_ms = 60'000;
+    // Open connections; past it a new connection is closed as accepted.
+    // 0 = auto: half the soft RLIMIT_NOFILE. -1 = unlimited.
+    int64_t max_connections = 0;
+    // Node-wide bytes of buffered (non-streaming) request bodies being read or
+    // served. A request that would exceed it is refused with 503 before its
+    // body is read; a request arriving while no other holds bytes is always
+    // admitted (indexing.max-request-body bounds it). 0 = auto: 8 x
+    // indexing.max-request-body.
+    int64_t max_buffered_body_bytes = 0;
+
     /// Resolve shards: 0 means auto (affinity-aware concurrency, minimum 1).
     int resolveThreads() const {
       if (threads > 0) return threads;

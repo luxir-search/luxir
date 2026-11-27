@@ -2693,6 +2693,13 @@ Request traffic on one transport. Replication routes are not counted.
 | <a id="field-luxir.transportstats.stream_pauses"></a>[`stream_pauses`](#field-luxir.transportstats.stream_pauses) | 5 | `uint64` | singular | response producers paused by flow control |
 | <a id="field-luxir.transportstats.connections"></a>[`connections`](#field-luxir.transportstats.connections) | 6 | `uint64` | singular | HTTP only: live sessions, including idle keep-alive |
 | <a id="field-luxir.transportstats.io_threads"></a>[`io_threads`](#field-luxir.transportstats.io_threads) | 7 | `int64` | singular | HTTP only: running connection shard threads |
+| <a id="field-luxir.transportstats.rejected_connections"></a>[`rejected_connections`](#field-luxir.transportstats.rejected_connections) | 8 | `uint64` | singular | HTTP only: connections closed on accept past server.http.max-connections. |
+| <a id="field-luxir.transportstats.accept_errors"></a>[`accept_errors`](#field-luxir.transportstats.accept_errors) | 9 | `uint64` | singular | HTTP only: failed accepts (such as EMFILE), each retried after a backoff. |
+| <a id="field-luxir.transportstats.header_timeouts"></a>[`header_timeouts`](#field-luxir.transportstats.header_timeouts) | 10 | `uint64` | singular | HTTP only: connections closed waiting on the client for request headers (or a new connection's first bytes), a request body, or the next request. |
+| <a id="field-luxir.transportstats.body_timeouts"></a>[`body_timeouts`](#field-luxir.transportstats.body_timeouts) | 11 | `uint64` | singular |  |
+| <a id="field-luxir.transportstats.idle_timeouts"></a>[`idle_timeouts`](#field-luxir.transportstats.idle_timeouts) | 12 | `uint64` | singular |  |
+| <a id="field-luxir.transportstats.buffered_body_bytes"></a>[`buffered_body_bytes`](#field-luxir.transportstats.buffered_body_bytes) | 13 | `uint64` | singular | HTTP only: bytes reserved by buffered request bodies being read or served. |
+| <a id="field-luxir.transportstats.buffered_body_rejections"></a>[`buffered_body_rejections`](#field-luxir.transportstats.buffered_body_rejections) | 14 | `uint64` | singular | HTTP only: requests refused with 503 at server.http.max-buffered-body-bytes. |
 
 <a id="message-luxir.updaterequest"></a>
 

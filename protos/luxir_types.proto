@@ -1712,6 +1712,19 @@ message TransportStats {
   uint64 stream_pauses = 5;  // response producers paused by flow control
   uint64 connections = 6;    // HTTP only: live sessions, including idle keep-alive
   int64 io_threads = 7;      // HTTP only: running connection shard threads
+  // HTTP only: connections closed on accept past server.http.max-connections.
+  uint64 rejected_connections = 8;
+  // HTTP only: failed accepts (such as EMFILE), each retried after a backoff.
+  uint64 accept_errors = 9;
+  // HTTP only: connections closed waiting on the client for request headers
+  // (or a new connection's first bytes), a request body, or the next request.
+  uint64 header_timeouts = 10;
+  uint64 body_timeouts = 11;
+  uint64 idle_timeouts = 12;
+  // HTTP only: bytes reserved by buffered request bodies being read or served.
+  uint64 buffered_body_bytes = 13;
+  // HTTP only: requests refused with 503 at server.http.max-buffered-body-bytes.
+  uint64 buffered_body_rejections = 14;
 }
 
 // Process-wide service counters since start. Counters reset on restart and

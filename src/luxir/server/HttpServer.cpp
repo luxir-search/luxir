@@ -32,6 +32,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <sys/resource.h>
 
 #include <oneapi/tbb/info.h>
 #include <boost/beast/core.hpp>
@@ -111,6 +112,7 @@ static http::status httpStatusFor(const ErrorInfo& info) {
   if (info.code == "commit_incarnation_mismatch") return http::status::conflict;
   if (info.code == "method_not_allowed") return http::status::method_not_allowed;
   if (info.code == "request_too_large") return http::status::payload_too_large;
+  if (info.code == "request_timeout") return http::status::request_timeout;
   if (info.code == "snapshot_expired") return http::status::gone;
   switch (info.kind) {
     case ErrorKind::INVALID_REQUEST: return http::status::bad_request;
@@ -467,13 +469,15 @@ public:
   uint64_t waitDisconnectEpoch_ = 0;
 
   HttpSession(std::shared_ptr<HttpIoShard> shard, tcp::socket&& sock, LuxirNode& node,
-              std::shared_ptr<HttpSessionRegistry> registry, int64_t streamBufferBytes)
+              std::shared_ptr<HttpSessionRegistry> registry, int64_t streamBufferBytes, const HttpLimits& limits)
     : shard_(std::move(shard)), stream_(std::move(sock)), node_(node), metrics(node.metrics), registry_(std::move(registry)),
+      limits_(limits), clientTimer_(stream_.get_executor()),
       highWater_(streamBufferBytes), lowWater_(streamBufferBytes / 2) {
       metrics->httpConnections.fetch_add(1, std::memory_order_relaxed);
     }
 
   ~HttpSession() {
+    releaseBufferedBody();
     metrics->httpConnections.fetch_sub(1, std::memory_order_relaxed);
     if (deregister_) deregister_();
     // Publish activity before publishing the transition to zero. The idle
@@ -500,6 +504,7 @@ public:
       self->aborted_.store(true, std::memory_order_relaxed);
       self->waitCancellation.request_stop();
       self->cancelReplicationWatch();
+      self->stopClientWait();
       self->stream_.socket().shutdown(tcp::socket::shutdown_both, ec);
       self->stream_.socket().close(ec);
     });
@@ -714,6 +719,26 @@ private:
   std::shared_ptr<Metrics> metrics;
   std::shared_ptr<HttpSessionRegistry> registry_;
   std::function<void()> deregister_;  // removes this session from the registry
+  HttpLimits limits_;
+  // The client wait deadline (see waitOnClient). One timer per connection,
+  // armed lazily: a read in progress only moves clientDeadline_, and the
+  // timer re-arms itself when it fires early.
+  net::steady_timer clientTimer_;
+  enum class ClientWait { HEADER, BODY, IDLE };
+  ClientWait clientWait_ = ClientWait::HEADER;
+  bool clientWaiting_ = false;
+  bool servedRequest_ = false;  // an earlier request has been read: waits for the next are idle
+  bool readingHeader_ = false;  // async_read_header outstanding: the request has begun
+  bool headerTimedOut_ = false; // that read was cancelled by the header timeout; answer 408
+  std::chrono::steady_clock::time_point clientDeadline_{};
+  // The pending timer wait's expiry (max when none) and generation, so a
+  // completion that raced a re-arm or cancel is ignored.
+  std::chrono::steady_clock::time_point clientTimerExpiry_ = std::chrono::steady_clock::time_point::max();
+  uint64_t clientTimerGen_ = 0;
+  // Bytes this request holds of server.http.max-buffered-body-bytes; given
+  // back when the next request starts or the connection ends.
+  int64_t bufferedBodyReserved_ = 0;
+  bool retryAfter_ = false;  // the next simple response carries Retry-After
   beast::flat_buffer buffer_;
   std::optional<http::request_parser<http::buffer_body>> parser_;
   std::array<char, 64 * 1024> bodyBuf_{};
@@ -917,13 +942,144 @@ private:
     parser_->body_limit(boost::none);
     buffer_.clear();
     bufferedBody_.clear();
+    releaseBufferedBody();
     streamUpdate_.reset();
     terminalStreamingFailure_ = false;
+    // Wait for the request's first byte under the idle timeout (a new
+    // connection's under the header timeout), then time its headers from
+    // there. Bytes already queued skip the wait.
+    beast::error_code availableError;
+    if (stream_.socket().available(availableError) > 0) {
+      readHeader();
+      return;
+    }
+    waitOnClient(servedRequest_ ? ClientWait::IDLE : ClientWait::HEADER);
+    stream_.socket().async_wait(tcp::socket::wait_read, [self = shared_from_this()](beast::error_code ec) {
+      self->clientProgress();
+      if (ec) { LOG_TRACE("http wait: {}", ec.message()); self->doClose(); return; }
+      self->readHeader();
+    });
+  }
+
+  void readHeader() {
+    readingHeader_ = true;
+    waitOnClient(ClientWait::HEADER);
     http::async_read_header(stream_, buffer_, *parser_,
         beast::bind_front_handler(&HttpSession::onRead, shared_from_this()));
   }
 
+  // --- client wait limits (server.http.*-timeout-ms) -------------------------
+  // Only a read the server issued and is waiting on is timed. Nothing is
+  // timed while a request is executing, a commit wait is parked, or a stream
+  // has paused its reads for backpressure: no read is outstanding then.
+
+  // Arms (or moves) the deadline for the read about to be issued.
+  void waitOnClient(ClientWait kind) {
+    auto timeout = kind == ClientWait::HEADER ? limits_.headerTimeout
+                 : kind == ClientWait::BODY ? limits_.bodyTimeout : limits_.idleTimeout;
+    if (timeout.count() <= 0) { clientWaiting_ = false; return; }
+    clientWait_ = kind;
+    clientWaiting_ = true;
+    clientDeadline_ = std::chrono::steady_clock::now() + timeout;
+    if (clientDeadline_ < clientTimerExpiry_) armClientTimer(clientDeadline_);
+  }
+
+  // The read completed (with data, an error, or the peer's close).
+  void clientProgress() { clientWaiting_ = false; }
+
+  void stopClientWait() {
+    clientWaiting_ = false;
+    if (clientTimerExpiry_ == std::chrono::steady_clock::time_point::max()) return;
+    clientTimerExpiry_ = std::chrono::steady_clock::time_point::max();
+    ++clientTimerGen_;
+    clientTimer_.cancel();
+  }
+
+  void armClientTimer(std::chrono::steady_clock::time_point at) {
+    clientTimerExpiry_ = at;
+    auto gen = ++clientTimerGen_;
+    clientTimer_.expires_at(at);
+    clientTimer_.async_wait([weak = weak_from_this(), gen](beast::error_code ec) {
+      auto self = weak.lock();
+      if (!self || ec || gen != self->clientTimerGen_) return;
+      self->clientTimerExpiry_ = std::chrono::steady_clock::time_point::max();
+      if (!self->clientWaiting_) return;
+      if (std::chrono::steady_clock::now() < self->clientDeadline_) {
+        self->armClientTimer(self->clientDeadline_);
+        return;
+      }
+      self->clientTimedOut();
+    });
+  }
+
+  // Closes the connection; the outstanding read fails and unwinds as a
+  // client disconnect would.
+  void clientTimedOut() {
+    clientWaiting_ = false;
+    static constexpr std::string_view names[] = {"header", "body", "idle"};
+    static constexpr MetricHttpEvent events[] = {
+        MetricHttpEvent::HEADER_TIMEOUT, MetricHttpEvent::BODY_TIMEOUT, MetricHttpEvent::IDLE_TIMEOUT};
+    metrics->add(events[(int)clientWait_]);
+    beast::error_code ec;
+    auto peer = stream_.socket().remote_endpoint(ec);
+    LOG_DEBUG("http: closing connection from {}: {} timeout", ec ? std::string("?") : peer.address().to_string(),
+              names[(int)clientWait_]);
+    if (clientWait_ == ClientWait::HEADER && readingHeader_) {
+      // A request has begun and nothing is being written (headers are read
+      // only once the previous response is out), so it can still be answered:
+      // cancel the read and let onRead send 408, then close.
+      headerTimedOut_ = true;
+      stream_.socket().cancel(ec);
+      return;
+    }
+    stream_.socket().shutdown(tcp::socket::shutdown_both, ec);
+    stream_.socket().close(ec);
+  }
+
+  // --- buffered body budget (server.http.max-buffered-body-bytes) ------------
+
+  // Reserves `bytes` more of the node-wide budget for this request's body.
+  // A request is always admitted while no other request holds bytes.
+  bool reserveBufferedBody(int64_t bytes) {
+    if (bytes <= 0) return true;
+    auto& used = metrics->httpBufferedBodyBytes;
+    int64_t current = used.load(std::memory_order_relaxed);
+    do {
+      if (current - bufferedBodyReserved_ > 0 && current + bytes > limits_.maxBufferedBodyBytes) return false;
+    } while (!used.compare_exchange_weak(current, current + bytes, std::memory_order_relaxed));
+    bufferedBodyReserved_ += bytes;
+    return true;
+  }
+
+  void releaseBufferedBody() {
+    if (bufferedBodyReserved_ == 0) return;
+    metrics->httpBufferedBodyBytes.fetch_sub(bufferedBodyReserved_, std::memory_order_relaxed);
+    bufferedBodyReserved_ = 0;
+  }
+
+  // A 503 for a body that would exceed the buffered body budget. The body is
+  // not read, so the connection closes after the answer.
+  void respondBufferedBodyBudget() {
+    metrics->add(MetricHttpEvent::BODY_REJECTED);
+    releaseBufferedBody();
+    retryAfter_ = true;
+    respondBeforeBodyError({ErrorKind::UNAVAILABLE, "buffered_body_limit",
+                            "too many request body bytes are buffered on this node "
+                            "(server.http.max-buffered-body-bytes); retry later"});
+  }
+
   void onRead(beast::error_code ec, std::size_t) {
+    clientProgress();
+    readingHeader_ = false;
+    servedRequest_ = true;
+    if (ec && headerTimedOut_) {
+      headerTimedOut_ = false;
+      keepAlive_ = false;
+      httpVersion_ = 11;
+      respondError({ErrorKind::INVALID_REQUEST, "request_timeout",
+                    "request headers not received within server.http.header-timeout-ms"});
+      return;
+    }
     if (ec == http::error::end_of_stream) { doClose(); return; }
     if (ec) { LOG_TRACE("http read: {}", ec.message()); doClose(); return; }
 
@@ -1004,6 +1160,13 @@ private:
       }
       return;
     }
+    // A body of known length reserves it whole before any is read; a chunked
+    // one reserves as it arrives.
+    if (!parser_->is_done() && parser_->content_length() &&
+        !reserveBufferedBody((int64_t)*parser_->content_length())) {
+      respondBufferedBodyBudget();
+      return;
+    }
     parser_->body_limit(bodyLimit);
     continueThenReadBody([this] { doBufferedBodyRead(); });
   }
@@ -1036,11 +1199,14 @@ private:
     }
     parser_->get().body().data = bodyBuf_.data();
     parser_->get().body().size = bodyBuf_.size();
-    http::async_read(stream_, buffer_, *parser_,
+    // One read at a time, so each that makes progress restarts the body timeout.
+    waitOnClient(ClientWait::BODY);
+    http::async_read_some(stream_, buffer_, *parser_,
         beast::bind_front_handler(&HttpSession::onBufferedBodyRead, shared_from_this()));
   }
 
   void onBufferedBodyRead(beast::error_code ec, std::size_t) {
+    clientProgress();
     bool needBuffer = ec == http::error::need_buffer;
     // A body that grows past the limit (e.g. chunked, no Content-Length) surfaces here.
     if (ec == http::error::body_limit) { respondPayloadTooLarge(); return; }
@@ -1048,6 +1214,10 @@ private:
 
     std::size_t produced = bodyBuf_.size() - parser_->get().body().size;
     metrics->add(MetricTransportCounter::RECEIVED_BYTES, MetricTransport::HTTP, produced);
+    if (!parser_->content_length() && !reserveBufferedBody((int64_t)produced)) {
+      respondBufferedBodyBudget();
+      return;
+    }
     bufferedBody_.append(bodyBuf_.data(), produced);
 
     if (parser_->is_done()) {
@@ -3029,11 +3199,15 @@ private:
     // ack would never arrive before EOF and the client would deadlock. Do not "optimize"
     // this to async_read.
     state->readInFlight = true;
+    // Timed only while this read is outstanding: a stream paused for
+    // backpressure, a barrier or a commit issues no read and waits untimed.
+    waitOnClient(ClientWait::BODY);
     http::async_read_some(stream_, buffer_, *parser_,
         beast::bind_front_handler(&HttpSession::onStreamBodyRead, shared_from_this()));
   }
 
   void onStreamBodyRead(beast::error_code ec, std::size_t) {
+    clientProgress();
     auto state = streamUpdate_;
     if (!state) return;
     state->readInFlight = false;
@@ -4093,6 +4267,8 @@ private:
     auto resp = std::make_shared<http::response<http::string_body>>(status, httpVersion_);
     resp->set(http::field::server, "luxir");
     resp->set(http::field::content_type, contentType);
+    if (retryAfter_) resp->set(http::field::retry_after, "1");
+    retryAfter_ = false;
     resp->keep_alive(keepAlive_);
     resp->body() = std::move(body);
     resp->prepare_payload();
@@ -4145,6 +4321,7 @@ private:
 
   void doClose() {
     finishRequestMetric(MetricOutcome::CANCELLED);
+    stopClientWait();
     waitCancellation.request_stop();
     replicationStopped_ = true;
     cancelReplicationWatch();
@@ -4154,6 +4331,7 @@ private:
 
   void doTerminalStreamingClose() {
     finishRequestMetric(MetricOutcome::ERROR);
+    stopClientWait();
     waitCancellation.request_stop();
     beast::error_code ec;
     stream_.socket().shutdown(tcp::socket::shutdown_both, ec);
@@ -4323,6 +4501,26 @@ void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
   session->whenDrained(std::move(resume));
 }
 
+HttpLimits HttpLimits::resolve(const LuxirConfig& config) {
+  const auto& http = config.server.http;
+  HttpLimits out;
+  out.headerTimeout = std::chrono::milliseconds(http.header_timeout_ms);
+  out.bodyTimeout = std::chrono::milliseconds(http.body_timeout_ms);
+  out.idleTimeout = std::chrono::milliseconds(http.idle_timeout_ms);
+  out.maxConnections = http.max_connections;
+  if (out.maxConnections == 0) {
+    // Half the descriptors: the rest serve index files, gRPC and replication.
+    rlimit limit{};
+    int64_t fds = getrlimit(RLIMIT_NOFILE, &limit) || limit.rlim_cur == RLIM_INFINITY
+        ? (int64_t)1 << 20 : (int64_t)limit.rlim_cur;
+    out.maxConnections = std::max<int64_t>(1, fds / 2);
+  }
+  out.maxBufferedBodyBytes = http.max_buffered_body_bytes > 0
+      ? http.max_buffered_body_bytes
+      : std::max<int64_t>(1, 8 * config.ingest.max_request_body);
+  return out;
+}
+
 HttpServer::HttpServer(LuxirNode& node, int threads, int port, int64_t streamBufferBytes,
                        std::chrono::milliseconds shardIdlePeriod)
   : node(node), nthreads(threads > 0 ? threads : std::max(1, oneapi::tbb::info::default_concurrency())),
@@ -4332,7 +4530,7 @@ HttpServer::HttpServer(LuxirNode& node, int threads, int port, int64_t streamBuf
     streamBufferBytes_(std::max<int64_t>(1,
         streamBufferBytes > 0 ? streamBufferBytes
                               : node.getConfig().server.stream_buffer_bytes)),
-    shardIdlePeriod(shardIdlePeriod) {}
+    shardIdlePeriod(shardIdlePeriod), limits(HttpLimits::resolve(node.getConfig())) {}
 
 
 HttpServer::~HttpServer() { shutdown(); }
@@ -4357,6 +4555,8 @@ void HttpServer::start() {
   acceptor->listen(net::socket_base::max_listen_connections);
   port_ = acceptor->local_endpoint().port();
 
+  acceptRetryTimer.emplace(acceptIoc);
+  acceptBackoff = std::chrono::milliseconds(0);
   doAccept();
   replicationTimer.emplace(acceptIoc);
   armReplicationExpiry();
@@ -4369,7 +4569,7 @@ void HttpServer::start() {
     acceptIoc.run();
   });
   started = true;
-  LOG_INFO("HTTP server listening on {}:{}", host, port_);
+  LOG_INFO("HTTP server listening on {}:{} (max {} connections)", host, port_, limits.maxConnections);
 }
 
 void HttpServer::armReplicationExpiry() {
@@ -4469,7 +4669,19 @@ void HttpServer::doAccept() {
   acceptor->async_accept(shard->ioc.get_executor(),
       [this, shard, idx](beast::error_code ec, tcp::socket sock) {
         if (ec == net::error::operation_aborted) return;  // shutting down
-        if (!ec) {
+        if (ec) { retryAccept(ec); return; }
+        acceptBackoff = std::chrono::milliseconds(0);
+        int64_t open = 0;
+        for (const auto& s : shards) open += s->liveConnections.load(std::memory_order_relaxed);
+        if (limits.maxConnections >= 0 && open >= limits.maxConnections) {
+          // Refuse without a session: closing at once frees the descriptor
+          // before any request state exists.
+          node.metrics->add(MetricHttpEvent::CONNECTION_REJECTED);
+          beast::error_code closeError;
+          sock.close(closeError);
+          logAcceptEvent("HTTP connection limit (server.http.max-connections=" +
+                         std::to_string(limits.maxConnections) + ") reached; closing new connections");
+        } else {
           shard->activityEpoch.fetch_add(1, std::memory_order_release);
           shard->liveConnections.fetch_add(1, std::memory_order_release);
           // Only the accept thread spawns and reaps. joinable() therefore means
@@ -4482,10 +4694,36 @@ void HttpServer::doAccept() {
           beast::error_code nde;
           sock.set_option(tcp::no_delay(true), nde);
           std::make_shared<HttpSession>(shard, std::move(sock), node, registry,
-                                        streamBufferBytes_)->run();
+                                        streamBufferBytes_, limits)->run();
         }
         if (acceptor && acceptor->is_open()) doAccept();
       });
+}
+
+// A failed accept (EMFILE, ENFILE, ENOBUFS, ...) leaves the connection
+// queued and the acceptor readable, so accepting again at once would spin a
+// core until descriptors free up. Back off exponentially, 10 ms to 1 s.
+void HttpServer::retryAccept(const boost::system::error_code& ec) {
+  node.metrics->add(MetricHttpEvent::ACCEPT_ERROR);
+  acceptBackoff = std::clamp(acceptBackoff * 2, std::chrono::milliseconds(10), std::chrono::milliseconds(1000));
+  logAcceptEvent("HTTP accept failed: " + ec.message() + "; retrying in " +
+                 std::to_string(acceptBackoff.count()) + " ms");
+  if (!acceptor || !acceptor->is_open()) return;
+  acceptRetryTimer->expires_after(acceptBackoff);
+  acceptRetryTimer->async_wait([this](beast::error_code waitError) {
+    if (waitError || shutdownRequested.load(std::memory_order_acquire)) return;
+    if (acceptor && acceptor->is_open()) doAccept();
+  });
+}
+
+// At most one warning per 10 s; the next one counts what was suppressed.
+void HttpServer::logAcceptEvent(const std::string& message) {
+  auto now = std::chrono::steady_clock::now();
+  if (now < nextAcceptLog) { ++unloggedAcceptEvents; return; }
+  nextAcceptLog = now + std::chrono::seconds(10);
+  if (unloggedAcceptEvents) LOG_WARN("{} ({} similar events not logged)", message, unloggedAcceptEvents);
+  else LOG_WARN("{}", message);
+  unloggedAcceptEvents = 0;
 }
 
 void HttpServer::shutdown() {
@@ -4535,6 +4773,7 @@ void HttpServer::shutdown() {
     net::post(acceptor->get_executor(), [this] {
       beast::error_code ec;
       if (replicationTimer) replicationTimer->cancel();
+      if (acceptRetryTimer) acceptRetryTimer->cancel();
       if (acceptor) acceptor->close(ec);
     });
   }
@@ -4582,6 +4821,7 @@ void HttpServer::shutdown() {
   // references them has drained. Sessions can briefly outlive this point on an
   // arena thread; they co-own the registry and shard they need for destruction.
   replicationTimer.reset();
+  acceptRetryTimer.reset();
   acceptor.reset();
   registry.reset();
   shards.clear();
