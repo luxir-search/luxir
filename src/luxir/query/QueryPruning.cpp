@@ -72,8 +72,18 @@ QueryPruning::Membership& QueryPruning::membership(const Query& query, const Que
 bool CatalogSummaryView::membershipExcludes(std::string_view field, std::string_view term) const {
   const auto& segment = planning.topReader.segments()[(size_t)ord];
   if (QueryPruning::disableForTests || !segment.hasTermMembership() || !record(field).value_or(nullptr)) return false;
-  // record() resolved the field, so its memo holds the physical name.
-  return segment.membershipProvesAbsent(fields.find(field)->second->name(), term, reason);
+  // record() resolved the field, so its memo holds the physical name. A term is
+  // asked about once per segment and field for the request.
+  std::string key(fields.find(field)->second->name());
+  key.append(1, '\0').append(term).append(1, '\0').append((const char*)&ord, sizeof(ord));
+  auto [entry, inserted] = pruning.membershipProofs.try_emplace(std::move(key));
+  if (inserted) {
+    std::string label;
+    entry->second.absent = segment.membershipProvesAbsent(fields.find(field)->second->name(), term, &label);
+    entry->second.label = std::move(label);
+  }
+  if (entry->second.absent && reason != nullptr) reason->assign(entry->second.label);
+  return entry->second.absent;
 }
 
 std::optional<const DecodedFieldRecord*> CatalogSummaryView::record(std::string_view field) const {
@@ -90,11 +100,21 @@ std::optional<const DecodedFieldRecord*> CatalogSummaryView::record(std::string_
   return std::nullopt;
 }
 
-bool TermFactsCache::termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term) {
+bool TermFactsCache::termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term, CachedTermInfo* node) {
   if (QueryPruning::disableForTests) return false;
-  if (!proof::recordExcludesTerm(field.segInfos.at(segnum), term)
-      && !reader.segments()[segnum].membershipProvesAbsent(field.segInfos.name(), term)) {
-    return false;
+  if (!proof::recordExcludesTerm(field.segInfos.at(segnum), term)) {
+    const auto& segment = reader.segments()[segnum];
+    if (!segment.hasTermMembership()) return false;
+    uint8_t* memo = nullptr;
+    if (node != nullptr) {
+      // Allocated while the term entry is still below any savepoint that may be rewound.
+      if (node->absence.empty()) node->absence = pool.make_span_zeroed<uint8_t>(numSegments());
+      memo = &node->absence[segnum];
+      if (*memo != 0) return *memo == 1;
+    }
+    bool proven = segment.membershipProvesAbsent(field.segInfos.name(), term);
+    if (memo != nullptr) *memo = proven ? 1 : 2;
+    if (!proven) return false;
   }
   if (QueryPruning::verifyTermAbsenceForTests) {
     auto* terms = getTermsEnum(field, segnum);

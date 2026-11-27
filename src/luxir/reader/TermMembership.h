@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <span>
 #include <string_view>
 
 #include "luxir/store/AcquireJoin.h"
@@ -18,13 +19,21 @@ namespace luxir {
 // an overlay that cannot open proves nothing.
 class TermMembership {
 public:
+  // One lookup a probe answers: a physical field and a dictionary-form term.
+  struct Probe {
+    std::string_view field;
+    std::string_view term;
+  };
+
   virtual ~TermMembership() = default;
 
-  // Issues on `batches` the reads provesAbsent will make for this term, and
-  // keeps their holds, so the probes that follow read resident bytes. Optional:
-  // a probe reads what it needs on first touch. The caller keeps the overlay
-  // alive until the batches complete.
-  virtual void acquireProbe(std::string_view physicalField, std::string_view term, AcquireBatches& batches) const {}
+  // Issues on `batches` the reads provesAbsent will make for these probes,
+  // one batch per overlay file, and keeps their holds, so the probes that
+  // follow read resident bytes. Optional: a probe reads what it needs on first
+  // touch. The caller keeps the overlay alive until the batches complete.
+  // Opening the overlay is not part of this: its first use reads its header
+  // synchronously, outside any declared round.
+  virtual void acquireProbes(std::span<const Probe> probes, AcquireBatches& batches) const {}
 
   // True only if `term`, in its dictionary form (long terms already fitted),
   // is absent from `physicalField` in this segment. An uncovered field, a

@@ -18,13 +18,13 @@
 #include "luxir/plugin/Registries.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
+#include "test/ExamplePluginHooks.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
 
-void exampleSetOverlayOpenMode(int mode);
 
 namespace {
 

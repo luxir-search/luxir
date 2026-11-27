@@ -525,10 +525,18 @@ field, deleted documents included. A wrong "absent" silently loses hits, so an u
 field, a failed read or a checksum mismatch must answer false. An overlay that fails to open,
 or whose bytes are invalid, proves nothing and the segment is searched as without it.
 
-When the store makes acquires requests, the probes are the first declared round
-(`DeclaredReads`): `acquireProbe` issues the probe's reads on the round's batches and keeps
-their holds, then the lookups of proven-absent segments declare no dictionary, block or
-postings reads in the later rounds.
+When the store makes acquires requests, the probes are round 0 of the reads a search declares
+(`DeclaredReads`), ahead of the term dictionaries: `acquireProbes` receives all the probes
+of one segment (field and term pairs) and issues their reads on the round's batches, one batch
+per overlay file, keeping the holds. The lookups of proven-absent segments then declare no
+routing data, block or postings reads in the later rounds. The live docs of segments with
+deletes go out with round 0.
+
+Opening the overlay is not part of that round: its first use runs the kind's `open` on the
+requesting thread, a synchronous read of whatever `open` reads (keep it to a small header). An
+open that fails is remembered for the life of the snapshot, so a failing overlay costs one
+attempt, not one per term and segment; running out of memory is not remembered. Each answer is
+asked for once per term and segment in a request.
 
 Overlays are built when a merge finishes and, at commits, for segments that lack one: at
 most 8 builds per commit, newest segments first, skipping segments that are inputs of a

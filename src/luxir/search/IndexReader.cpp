@@ -138,33 +138,49 @@ std::shared_ptr<AuxReader> SegmentOverlay::get() {
   });
 }
 
+std::shared_ptr<AuxReader> SegmentOverlay::membershipReader() {
+  if (cannotProve.load(std::memory_order_relaxed)) return nullptr;
+  try {
+    return get();  // null: advisory overlay with invalid bytes
+  } catch (const std::bad_alloc&) {
+    throw;
+  } catch (const std::exception& e) {
+    LOG_DEBUG("Overlay '{}' proves nothing for this snapshot: {}", name(), e.what());
+  } catch (...) {
+  }
+  cannotProve.store(true, std::memory_order_relaxed);
+  return nullptr;
+}
+
 bool Segment::membershipProvesAbsent(std::string_view field, std::string_view term, std::string* why) const noexcept {
-  for (const auto& overlay : sharedOverlays) {
-    if (!overlay->provesTerms()) continue;
-    try {
-      auto reader = overlay->get();  // null: advisory overlay with invalid bytes
+  try {
+    for (const auto& overlay : sharedOverlays) {
+      if (!overlay->provesTerms()) continue;
+      auto reader = overlay->membershipReader();
       const auto* membership = reader ? reader->termMembership() : nullptr;
       if (membership == nullptr || !membership->provesAbsent(field, term)) continue;
       if (why != nullptr) why->assign(membership->label());
       return true;
-    } catch (const std::exception& e) {
-      LOG_DEBUG("Overlay '{}' proves nothing for a term probe: {}", overlay->name(), e.what());
-    } catch (...) {
     }
+  } catch (const std::bad_alloc&) {
+    // Out of memory proves nothing, and is not remembered.
   }
   return false;
 }
 
-void Segment::acquireMembershipProbes(std::string_view field, std::string_view term, AcquireBatches& batches,
-                                      std::vector<std::shared_ptr<AuxReader>>& readers) const noexcept {
+void Segment::acquireMembershipProbes(std::span<const TermMembership::Probe> probes, AcquireBatches& batches,
+                                      std::vector<std::shared_ptr<AuxReader>>& readers) const {
   for (const auto& overlay : sharedOverlays) {
     if (!overlay->provesTerms()) continue;
+    auto reader = overlay->membershipReader();
+    const auto* membership = reader ? reader->termMembership() : nullptr;
+    if (membership == nullptr) continue;
+    // Kept before the probes are issued: their completions reach into the overlay.
+    readers.push_back(std::move(reader));
     try {
-      auto reader = overlay->get();
-      const auto* membership = reader ? reader->termMembership() : nullptr;
-      if (membership == nullptr) continue;
-      membership->acquireProbe(field, term, batches);
-      readers.push_back(std::move(reader));
+      membership->acquireProbes(probes, batches);
+    } catch (const std::bad_alloc&) {
+      throw;
     } catch (...) {
       // The probe reads on first touch, or proves nothing.
     }

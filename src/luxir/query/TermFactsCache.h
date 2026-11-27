@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <span>
@@ -35,6 +36,9 @@ struct CachedTermInfo {
   std::span<const TermsEnum::PostingsState*> postingsStates = {};
   // Requested products remain meaningful even after resolution or a miss.
   uint8_t requested = 0;
+  // Per segment, once asked: 1 a proof that the term is absent, 2 no proof.
+  // Empty until a segment with a membership overlay is asked about the term.
+  std::span<uint8_t> absence = {};
   // True until dictionary resolution succeeds, including a successful miss.
   // A resolved absent field settles all its terms regardless of this bit.
   bool unresolved = false;
@@ -166,14 +170,25 @@ private:
   }
 
   // A term outside this segment's catalog bounds contributes zero frequency.
-  bool termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term);
+  // `node`, the term's cache entry, memoizes the answer when given.
+  bool termAbsent(CachedFieldInfo& field, size_t segnum, std::string_view term, CachedTermInfo* node = nullptr);
 
 public:
   // Whether every segment's catalog or membership overlay proves `term` absent,
   // so the term matches nothing and no segment need be opened for it.
   bool termAbsentEverywhere(CachedFieldInfo& field, std::string_view term) {
+    CachedTermInfo* node = nullptr;
+    if (std::ranges::any_of(reader.segments(), &IndexReader::Segment::hasTermMembership)) {
+      // The answers are kept on the term's entry, which resolves later as usual.
+      auto iter = field.termInfos.find(term);
+      if (iter == field.termInfos.end()) {
+        iter = field.termInfos.try_emplace(ownKey(term)).first;
+        iter->second.unresolved = true;
+      }
+      node = &iter->second;
+    }
     for (size_t i = 0; i < numSegments(); ++i) {
-      if (!termAbsent(field, i, term)) return false;
+      if (!termAbsent(field, i, term, node)) return false;
     }
     return true;
   }
@@ -190,7 +205,7 @@ public:
       // Keep the term node and dictionary cursors below the savepoint. Only
       // the temporary postings data is rewound when the term is absent.
       for (size_t i = 0; i < numSegs; i++) {
-        if (!termAbsent(cachedFieldInfo, i, term)) getTermsEnum(cachedFieldInfo, i);
+        if (!termAbsent(cachedFieldInfo, i, term, &result)) getTermsEnum(cachedFieldInfo, i);
       }
       auto savepoint = pool.getSavePoint();
       bool found = false;
@@ -199,7 +214,7 @@ public:
         // Statistics cover the whole view. Only a proof about this term's
         // absence can skip a segment, regardless of the root's other predicates.
         auto* termsEnum = cachedFieldInfo.termsEnums[i];
-        if (!termsEnum || termAbsent(cachedFieldInfo, i, term) || !termsEnum->seek(term)) {
+        if (!termsEnum || termAbsent(cachedFieldInfo, i, term, &result) || !termsEnum->seek(term)) {
           postingsStates[i] = nullptr;
           continue;
         }

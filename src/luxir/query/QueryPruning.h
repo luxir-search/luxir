@@ -37,6 +37,14 @@ private:
                                                PackedTermHash, PackedTermEqual>;
   std::map<const IndexReader*, FieldMemo> fields;
 
+  // Membership overlay answers by segment, field and term, so a term is
+  // probed once however many clauses ask about it.
+  struct MembershipProof {
+    bool absent = false;
+    std::string label;
+  };
+  boost::unordered_flat_map<std::string, MembershipProof> membershipProofs;
+
 public:
   // Disables every proof, including the skipped statistics seeks, so pruned
   // and unpruned execution can be compared.

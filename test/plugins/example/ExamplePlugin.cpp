@@ -335,7 +335,7 @@ public:
   std::string_view getKind() const override { return "example_absent_prefix"; }
   std::string_view getName() const override { return name; }
   const TermMembership* termMembership() const noexcept override { return this; }
-  void acquireProbe(std::string_view, std::string_view, AcquireBatches& batches) const override {
+  void acquireProbes(std::span<const Probe>, AcquireBatches& batches) const override {
     {
       std::lock_guard lock(mutex);
       if (held.bytes().size() != 0) return;
@@ -569,6 +569,7 @@ public:
 // For the node-construction failure test.
 void exampleSetOverlayOpenMode(int mode) { luxir::example::overlayOpenMode = mode; }
 int exampleMembershipProbeBatches() { return luxir::example::probeBatches; }
+void exampleResetMembershipProbeBatches() { luxir::example::probeBatches = 0; }
 void exampleThrowOnNodeStateCreation(bool value) { luxir::example::ExamplePlugin::throwOnNodeStateCreation.store(value); }
 
 LUXIR_PLUGIN(example, luxir::example::ExamplePlugin)

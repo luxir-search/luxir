@@ -9,12 +9,15 @@
 #include <thread>
 #include <vector>
 
-#include "luxir/reader/TermsEnum.h"
 #include "luxir/plugin/Registries.h"
+#include "luxir/reader/TermsEnum.h"
+#include "luxir/search/DeclaredReads.h"
+#include "luxir/store/AcquireRound.h"
 #include "luxir/store/DelegatingDirectory.h"
 #include "luxir/store/StorageRegistry.h"
 #include "luxir/util/IoContext.h"
 #include "test/CollectionHelper.h"
+#include "test/ExamplePluginHooks.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
 
@@ -22,7 +25,6 @@ using namespace luxir;
 using namespace luxir::test;
 using namespace std::chrono_literals;
 
-int exampleMembershipProbeBatches();
 
 namespace {
 
@@ -261,30 +263,88 @@ TEST_F(DeclaredReadsTest, missingSliceDoesNotBlockHeldParts) {
   EXPECT_TRUE(core.held(missing));
 }
 
-// Overlay probes are the first round: a segment proven to lack the term has
-// no dictionary or postings declared, so the search issues fewer batches.
+namespace {
+
+constexpr std::string_view MEMBERSHIP_SCHEMA = R"({"segment_overlays":[
+    {"name":"m","kind":"example_absent_prefix","fields":["body_w"],"params":{"prefix":"mm"}}]})";
+
+void setMembershipSchema(CollectionHelper& h) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  ASSERT_TRUE(api::read_json(def, MEMBERSHIP_SCHEMA, arena));
+  h.collection().updateSchema(def, api::SchemaRequest_::Mode::SET);
+}
+
+// Whether any segment of `h` holds the routing data of body_w, which a search
+// that went on to read a term's dictionary leaves held.
+bool holdsRouting(CollectionHelper& h) {
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  for (auto& segment : reader->segments()) {
+    const auto* record = segment.postingsReader().fieldInfo("body_w");
+    if (record && record->terms() && segment.segmentCore().held(TermsEnum::navigationPart(*record))) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+// Overlay probes are the first round: a segment proven to lack the term has no
+// routing data, block or postings acquired for it. A term the overlay does not
+// prove still reads its dictionary, in an identical collection of the same node.
 TEST_F(DeclaredReadsTest, membershipProbesDropSegmentsBeforeTheDictionaryRounds) {
   initPlugins(addConfiguredPlugins);
   LuxirConfig config;
   config.store.backend = "ram";
   config.store.layers = {"io_deferred"};
   LuxirNode node(config);
-  CollectionHelper h(node, "main");
-  std::pmr::monotonic_buffer_resource arena;
-  api::SchemaDef def;
-  ASSERT_TRUE(api::read_json(def, R"({"segment_overlays":[
-      {"name":"m","kind":"example_absent_prefix","fields":["body_w"],"params":{"prefix":"mm"}}]})", arena));
-  h.collection().updateSchema(def, api::SchemaRequest_::Mode::SET);
-  index(h, 3);
-  auto batches = [&](std::string_view term) {
+  CollectionHelper proven(node, "proven");
+  CollectionHelper unproven(node, "unproven");
+  for (auto* h : {&proven, &unproven}) {
+    setMembershipSchema(*h);
+    index(*h, 3);
+    for (auto& segment : h->getIndexWriter()->snapshots.readers.getReader()->segments()) {
+      ASSERT_TRUE(segment.hasTermMembership());
+    }
+  }
+  exampleResetMembershipProbeBatches();
+  auto search = [&](CollectionHelper& h, std::string_view name, std::string_view term) {
     auto req = localReq(h.getSearchEngine());
-    req->collection("main").profile().topDocs("q").matchQuery("body_w", term).fields({"id"});
+    req->collection(name).topDocs("q").matchQuery("body_w", term).fields({"id"});
     req->execute(0);
     EXPECT_OK(req);
-    return req->responses.back()->proto.profile.value_or(api::ExecutionProfile{}).io_acquire_batches;
   };
-  auto probes = exampleMembershipProbeBatches();
-  auto proven = batches("mmgone");
-  EXPECT_GT(exampleMembershipProbeBatches(), probes);
-  EXPECT_LT(proven, batches("nngone"));
+  search(proven, "proven", "mmgone");
+  EXPECT_EQ(3, exampleMembershipProbeBatches());  // one batch per segment
+  search(unproven, "unproven", "nngone");
+  EXPECT_FALSE(holdsRouting(proven));
+  EXPECT_TRUE(holdsRouting(unproven));
+}
+
+// The membership round also carries the live docs of segments with deletes.
+TEST_F(DeclaredReadsTest, membershipRoundAcquiresLiveDocsAhead) {
+  initPlugins(addConfiguredPlugins);
+  LuxirConfig config;
+  config.store.backend = "ram";
+  config.store.layers = {"io_deferred"};
+  LuxirNode node(config);
+  CollectionHelper h(node, "main");
+  setMembershipSchema(h);
+  index(h, 2);
+  ASSERT_TRUE(h.deleteById("0", UpdateMessage::COMMIT).success);
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  auto req = localReq(h.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("body_w", "mmgone").fields({"id"});
+  DeclaredReads reads(*reader, *h.collection().getSchema(), req->rawRequest(), 0);
+  auto round = AcquireRound::create();
+  ASSERT_TRUE(reads.next(*round));  // the membership round
+  EXPECT_FALSE(round->wait());
+  size_t withDeletes = 0;
+  for (auto& segment : reader->segments()) {
+    if (!segment.hasDeletes()) continue;
+    ++withDeletes;
+    auto later = AcquireRound::create();
+    EXPECT_FALSE(segment.rootLive()->acquireAhead(*later)) << "live docs were not acquired in the membership round";
+    EXPECT_FALSE(later->wait());
+  }
+  EXPECT_GT(withDeletes, 0u);
 }

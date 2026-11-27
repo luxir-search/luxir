@@ -4,6 +4,7 @@
 #include "DeclaredReads.h"
 
 #include <map>
+#include <algorithm>
 #include <set>
 #include <tuple>
 
@@ -182,7 +183,8 @@ DeclaredReads::DeclaredReads(IndexReader& reader, const Schema& schema, const ap
     for (size_t i = 0; i < segments.size(); ++i) {
       const auto* record = present.at(i);
       if (!record || !record->terms()) continue;
-      lookups.push_back({&segments[i], record, mode, term, nullptr, false, false, present.name()});
+      // `field` views the reader's field registry, which outlives the lookups.
+      lookups.push_back({.segment = &segments[i], .record = record, .mode = mode, .term = term, .field = present.name()});
     }
   }
   countMany();
@@ -216,13 +218,33 @@ public:
 }  // namespace
 
 bool DeclaredReads::declareMembership(AcquireRound& round) {
+  // The probes by segment, each distinct one once.
+  struct Entry {
+    Segment* segment;
+    TermMembership::Probe probe;
+  };
+  std::vector<Entry> probes;
+  for (auto& lookup : lookups) {
+    if (lookup.mode == Mode::TERM && lookup.segment->hasTermMembership()) {
+      probes.push_back({lookup.segment, {lookup.field, lookup.term}});
+    }
+  }
+  std::ranges::sort(probes, [](const Entry& a, const Entry& b) {
+    return std::tuple(a.segment->ord, a.probe.field, a.probe.term) < std::tuple(b.segment->ord, b.probe.field, b.probe.term);
+  });
+  auto [tail, end] = std::ranges::unique(probes, [](const Entry& a, const Entry& b) {
+    return a.segment == b.segment && a.probe.field == b.probe.field && a.probe.term == b.probe.term;
+  });
+  probes.erase(tail, end);
   CountingBatches batches(round);
   std::vector<std::shared_ptr<AuxReader>> readers;
-  std::set<std::tuple<const Segment*, std::string_view, std::string_view>> seen;
-  for (const auto& lookup : lookups) {
-    if (lookup.mode != Mode::TERM || !lookup.segment->hasTermMembership()) continue;
-    if (!seen.emplace(lookup.segment, lookup.field, lookup.term).second) continue;
-    lookup.segment->acquireMembershipProbes(lookup.field, lookup.term, batches, readers);
+  std::vector<TermMembership::Probe> group;
+  for (size_t begin = 0; begin < probes.size();) {
+    size_t last = begin;
+    group.clear();
+    for (; last < probes.size() && probes[last].segment == probes[begin].segment; ++last) group.push_back(probes[last].probe);
+    probes[begin].segment->acquireMembershipProbes(group, batches, readers);
+    begin = last;
   }
   for (auto& reader : readers) round.keep(std::move(reader));
   return batches.count > 0;
@@ -295,6 +317,22 @@ void DeclaredReads::declarePlanned(const PlannedRead& read, Round& round) {
   }
 }
 
+namespace {
+
+bool issueLive(std::vector<std::shared_ptr<SegmentLive>>& live, AcquireRound& acquire) {
+  bool issued = false;
+  for (auto& root : live) {
+    if (root->acquireAhead(acquire)) {
+      acquire.keep(root);
+      issued = true;
+    }
+  }
+  live.clear();
+  return issued;
+}
+
+}  // namespace
+
 bool DeclaredReads::next(AcquireRound& acquire) {
   Round round{*this, {}, {}};
   std::vector<std::shared_ptr<SegmentLive>> live;
@@ -312,6 +350,8 @@ bool DeclaredReads::next(AcquireRound& acquire) {
     if (!membershipDeclared) {
       membershipDeclared = true;
       if (declareMembership(acquire)) {
+        // The live docs go out with the probes, not after them.
+        issueLive(live, acquire);
         countAcquireRound();
         return true;
       }
@@ -330,13 +370,7 @@ bool DeclaredReads::next(AcquireRound& acquire) {
   } else {
     for (const auto& read : registered.take()) declarePlanned(read, round);
   }
-  bool issued = false;
-  for (auto& root : live) {
-    if (root->acquireAhead(acquire)) {
-      acquire.keep(root);
-      issued = true;
-    }
-  }
+  bool issued = issueLive(live, acquire);
   for (auto& [segment, parts] : round.segments) {
     segment->segmentCore().acquireParts(parts, acquire);
     acquire.keep(segment->segmentCoreShared());
