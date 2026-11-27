@@ -1346,6 +1346,12 @@ message UpdateRequest {
   // If true, doc keys not present in field_map are dropped instead of indexed.
   // Requires a non-empty field_map (note "id" is dropped too unless mapped).
   bool drop_unmapped = 12;
+
+  // Override the collection's source includes/excludes (SourceDef) for this
+  // request's docs: setting either replaces both. At most one of the two, with
+  // the same path syntax. Ignored by a collection that does not store sources.
+  repeated string source_includes = 13;
+  repeated string source_excludes = 14;
 }
 
 // The response to an update request.  In streaming mode the server sends exactly one
@@ -2650,7 +2656,18 @@ message FieldDef {
 
   // Keep canonical source text before analysis/normalization for TEXT/STRING/ID
   // retrieval. Defaults to true for TEXT, false otherwise; unused on other types.
+  // With the collection's "_source_" store on, a stored TEXT/STRING value is
+  // served from the document's source instead of being written a second time
+  // (see stored_copy).
   optional bool stored = 7;
+
+  // With "_source_" on, a stored TEXT/STRING field is retrieved from each
+  // document's source and is written to stored fields only for documents whose
+  // source does not hold it as indexed (source includes/excludes, a request
+  // field_map). True also keeps the stored copy for every document: a fetch
+  // decompresses less but the value takes its bytes twice. Unset inherits the
+  // parent's setting, else false. Ignored without "_source_".
+  optional bool stored_copy = 31;
 
   // Stored-field group for stored TEXT/STRING/ID values, e.g. "_stored_body_",
   // declared in SchemaDef.stored_resources. Empty or unset inherits the
@@ -2749,40 +2766,89 @@ message FieldDef {
 // Every setting is optional; absent selects the default. Changes apply to
 // segments written afterwards. A merge recompresses its inputs unless their
 // codec and chunk limits already match; the level alone does not count.
+//
+// The reserved resource "_source_" is the optional store of every document as
+// it was submitted (see docs/design/source-store.md). It always uses the
+// SEPARATED layout: files of their own that no search, warmup or segment open
+// reads. Declaring it turns the store on for documents indexed afterwards;
+// retrieve a document with fields ["_source"], or export it with format=docs
+// and source=true. No field may name it as its stored_resource.
 message StoredResourceDef {
   enum Codec {
-    LZ4 = 0;  // fast compression and decompression
-    ZSTD = 1; // smaller chunks for repetitive text such as logs, at more CPU
+    LZ4 = 0;  // fastest compression and decompression, about 1.7 times the bytes of zstd
+    ZSTD = 1; // with a trained dictionary, about 40% smaller than lz4 at a few more us per chunk
   }
-  // Chunk compression; absent selects lz4.
+  // Chunk compression; absent selects zstd.
   optional Codec codec = 1;
 
   // ZSTD level from 1 (fastest) to 22 (smallest). Absent selects 3. Only valid
   // with codec zstd.
   optional int32 zstd_level = 2;
 
-  // Target uncompressed bytes per chunk, 1024 to 4194304; absent selects 16384,
-  // or 65536 with zstd. Larger chunks compress better, but each retrieval
+  // Target uncompressed bytes per chunk, 1024 to 4194304; absent selects 16384.
+  // Larger chunks compress better without a dictionary, but each retrieval
   // decompresses a whole chunk.
   optional int32 chunk_size_bytes = 3;
 
-  // Most documents per chunk, 1 to 65536; absent selects 128, or 1024 with
-  // zstd. A chunk closes at whichever of the byte and document limits comes
-  // first.
+  // Most documents per chunk, 1 to 65536; absent selects 128. A chunk closes at
+  // whichever of the byte and document limits comes first.
   optional int32 max_docs_per_chunk = 4;
 
-  // Enable one ZSTD dictionary per resource, shared by its segments. The first
-  // merge with at least 100 times the capacity (at most 8 MiB) of live stored
+  // One ZSTD dictionary per resource, shared by its segments (for "_source_",
+  // by its files). Absent means true with codec zstd; false turns it off. The
+  // first merge with at least 100 times the capacity (at most 8 MiB) of live
   // data trains it; earlier segments have none. Helps most with small chunks;
   // decoding can be slower with large chunks. No automatic retraining: changing
   // this setting, the capacity or codec clears it for a later merge to retrain.
   // After restart, use the dictionary from the largest live segment carrying one.
-  // Only valid with codec zstd.
+  // True is only valid with codec zstd.
   optional bool zstd_dictionary = 5;
 
   // Dictionary capacity upper bound, 1024 to 262144 bytes; absent selects 65536.
-  // Training can produce a smaller dictionary. Only valid with zstd_dictionary.
+  // Training can produce a smaller dictionary. Only valid with a dictionary on.
   optional int32 zstd_dictionary_bytes = 6;
+
+  // Where the resource's bytes live. INLINE (the default) keeps them in the
+  // segment's data files, copied by every merge. SEPARATED keeps them in files
+  // of their own that a merge references rather than copies, relocating only
+  // the mostly deleted or small ones. In this release only "_source_" may use
+  // SEPARATED, and it may use nothing else; the settings below apply to it.
+  enum Layout {
+    INLINE = 0;
+    SEPARATED = 1;
+  }
+  optional Layout layout = 7;
+
+  // "_source_" only. False keeps the entry but stops storing sources for
+  // documents indexed from now on, and deletes existing ones: the next merge of
+  // a segment drops that segment's sources for good. Absent means true.
+  optional bool enabled = 8;
+
+  // Separated layout: a merge keeps referencing a file while at least this
+  // fraction of its documents is live, and rewrites the live ones into a new
+  // file otherwise. Above 0 and at most 1; absent selects 0.5.
+  optional double min_live_ratio = 9;
+
+  // Separated layout: a merge also rewrites a file smaller than this, even when
+  // fully live, so small files fold together. 0 or more; absent selects 4194304.
+  optional int64 min_file_bytes = 10;
+
+  // Separated layout: a merged segment references at most this many files plus
+  // the one it writes. A file holding less than 1/max_files of the segment's
+  // live bytes is rewritten with the small ones. 1 or more; absent selects 32.
+  optional int32 max_files = 11;
+
+  // "_source_" only. Keep only these paths of each document's source (includes)
+  // or all but these (excludes); at most one of the two. The document is still
+  // indexed in full. A path joins object keys with '.' ("user.name") and
+  // reaches into arrays of objects without an index step; '*' in a pattern
+  // matches any run of characters, dots included. A matching path keeps or
+  // drops its whole value; with includes, an object or array left with nothing
+  // is dropped too. Paths name the keys as submitted, before field_map. An
+  // update request can override them for its own documents
+  // (UpdateRequest.source_includes).
+  repeated string includes = 12;
+  repeated string excludes = 13;
 }
 
 message SchemaDef {
@@ -2804,7 +2870,8 @@ message SchemaDef {
   // example "_stored_body_"), so it never matches a field or suffix template.
   // A field may name only an entry here or the default "_stored_", which uses
   // the defaults without one. mode=set replaces the named entries and keeps
-  // the others.
+  // the others. The reserved "_source_" entry is the document source store;
+  // mode=replace_all keeps the current one unless the replacement names it.
   map<string, StoredResourceDef> stored_resources = 4;
 }
 

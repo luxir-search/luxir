@@ -518,9 +518,23 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
         }
         if (retry) break;
 
+        // The previous snapshot's reader is shared while the map is the same and
+        // nothing it opened or read failed; a reader that failed is retried. A
+        // new one takes handles on its files and reads nothing yet.
+        std::shared_ptr<SourceReader> source;
+        if (segment.source_gen != 0) {
+          auto mapName = Postings::getSourceMapFileName(Postings::segmentKey(segId, segment.creator_epoch), segment.source_gen);
+          if (prevSeg && prevSeg->source && prevSeg->source->healthy() && prevSeg->source->name() == mapName) {
+            source = prevSeg->source;
+          } else {
+            source = std::make_shared<SourceReader>(dir, std::move(mapName), nDocs, files.files);
+          }
+        }
+
         Segment::SegmentInfo segmentInfo;
         segmentInfo.seg_id = segId;
         segmentInfo.live_gen = liveGen;
+        segmentInfo.source_gen = segment.source_gen;
         segmentInfo.min_version = segment.min_version;
         segmentInfo.max_version = segment.max_version;
         segmentInfo.max_doc = nDocs;
@@ -531,7 +545,7 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
             ? prevSeg->childLives : liveDocs && segmentCore->spaces().size() > 1
                 ? std::make_shared<PhysicalCore::ChildLives>() : nullptr;
         segs.push_back({std::move(segmentCore), std::move(liveDocs),
-                        std::move(segmentAuxReaders), segmentInfo, i, std::move(childLives)});
+                        std::move(segmentAuxReaders), segmentInfo, i, std::move(childLives), std::move(source)});
         assert(nDocs == segs.back().core->rootReader().maxDoc());
       }
 
@@ -593,7 +607,7 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
     assert(bundle.info.live_gen == 0 || bundle.info.live_docs < bundle.info.max_doc);
     assert(bundle.info.live_docs == (bundle.live ? bundle.live->numLive() : bundle.info.max_doc));
     core->root->segs.emplace_back(std::shared_ptr(bundle.core), std::shared_ptr(bundle.live),
-        std::vector(bundle.aux), bundle.info, totalMaxDoc, bundle.ord, &bundle.core->rootReader());
+        std::vector(bundle.aux), bundle.info, totalMaxDoc, bundle.ord, &bundle.core->rootReader(), nullptr, bundle.source);
     totalMaxDoc += bundle.info.max_doc;
     livedocs += bundle.info.live_docs;
   }

@@ -22,6 +22,7 @@
 #include "luxir/reader/PosEnum.h"
 #include "luxir/reader/NormsReader.h"
 #include "luxir/reader/PointsReader.h"
+#include "luxir/reader/SourceReader.h"
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/StrColReader.h"
 #include "luxir/reader/OrdColReader.h"
@@ -613,7 +614,18 @@ public:
     return deleted ? -1 : docId;
   }
 
+  // The mapping mapDocId applies to input `sourceOrd`: its remap table (empty
+  // when every doc survives in order) and its base in the merged segment.
+  std::pair<std::span<const int32_t>, int32_t> docMapping(size_t sourceOrd) const {
+    return {root.segs[sourceOrd].remap, root.segs[sourceOrd].base};
+  }
 
+
+
+  // Set when the merge drops the inputs' _source_ (the store is off): their
+  // source readers by input ordinal, null for an input without one. Values of
+  // source-backed stored fields are written out of them into stored fields.
+  std::vector<std::shared_ptr<SourceReader>> droppedSources;
 
   SegmentMerger(std::span<const std::shared_ptr<SegmentCore>> cores, std::span<LiveDocs*> liveDocs,
                 PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
@@ -2140,8 +2152,22 @@ private:
                               storedDictionary(space, resourceName, format, fieldInfos, bootstrap));
     std::vector<int64_t> srcChunkFirstDocs, srcChunkOffsets;
 
+    // Dropping the inputs' sources: source-backed values move into stored fields.
+    bool materialize = space.ordinal == SpaceOrdinal::ROOT && !droppedSources.empty();
+    auto sourceBackedNames = [](const StoredFieldsMetadata& metadata) {
+      std::vector<std::string_view> names;
+      auto all = metadata.fieldNames();
+      for (size_t i = 0; i < all.size(); i++) {
+        if (metadata.sourceBacked(i)) names.push_back(std::string_view(all[i]));
+      }
+      return names;
+    };
     auto copyable = [&](Segment& seg, const field_parts::Stored& part) {
       if (seg.hasDeletes() || StoredFieldsWriter::tooDirty(part.numChunks, part.numDirtyChunks)) return false;
+      if (materialize) {
+        const auto* metadata = seg.postingsReader->openStoredMetadata(*seg.postingsReader->fieldInfo(resourceName));
+        if (metadata && !sourceBackedNames(*metadata).empty()) return false;
+      }
       auto slice = part.dictionary();
       auto dictionary = slice ? std::string_view(seg.postingsReader->core().slice(slice)) : std::string_view();
       return writer.canCopyChunks(part.format(), dictionary);
@@ -2165,6 +2191,11 @@ private:
       const auto* fieldInfo = fieldInfos[seg.ord];
       if (!fieldInfo) continue;  // segment had no stored-fields; writer pads automatically
       const auto& metadata = *seg.postingsReader->openStoredMetadata(*fieldInfo);
+      // Values the docs' sources hold stay there unless the merge drops the sources.
+      auto backed = sourceBackedNames(metadata);
+      if (!materialize) {
+        for (auto name : backed) writer.markSourceBacked(name);
+      }
 
       // Verbatim chunk copy: with no deletions every local doc maps to
       // base + localId, and compressed chunk bodies are position-independent,
@@ -2193,18 +2224,43 @@ private:
         continue;
       }
 
+      SourceReader* source = materialize && !backed.empty() ? droppedSources[seg.ord].get() : nullptr;
+      SourceReader::Cursor cursor;
+      SourceReader::Fields fields;
+      source::Record record;
+      std::vector<bool> found(backed.size());
       int32_t maxDocIn = seg.postingsReader->maxDoc();
       for (int32_t localId = 0; localId < maxDocIn; localId++) {
         auto [mappedDoc, isDeleted] = seg.remapDocId(localId);
         if (isDeleted) continue;
+        found.assign(backed.size(), false);
         reader.readDoc(localId,
             [&](std::string_view name, std::span<const std::string_view> values) {
+          if (source) {
+            for (size_t i = 0; i < backed.size(); i++) found[i] = found[i] || backed[i] == name;
+          }
           if (values.size() == 1) {
             writer.addValue(mappedDoc, name, values[0]);
           } else {
             writer.addValues(mappedDoc, name, values);
           }
         });
+        if (!source || std::ranges::all_of(found, [](bool f) { return f; })) continue;
+        // The doc's source may hold the rest; one that does not had them stored.
+        // Unreadable must not mean garbage: dropping the source now would lose
+        // the values for good, so the merge fails and is retried.
+        auto status = source->fetch(localId, cursor, record);
+        if (status == SourceReader::Status::UNREADABLE) {
+          throw std::runtime_error(std::format("stored fields of doc {} live in source {}, which cannot be read",
+                                               localId, source->name()));
+        }
+        if (status != SourceReader::Status::OK || !fields.parse(record)) continue;
+        for (size_t i = 0; i < backed.size(); i++) {
+          if (found[i]) continue;
+          fields.values(backed[i], [&](std::span<const std::string_view> values) {
+            writer.addValues(mappedDoc, backed[i], values);
+          });
+        }
       }
     }
 

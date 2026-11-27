@@ -137,6 +137,12 @@ struct IndexConfig {
   std::string id_filter = "none";
   uint32_t id_filter_bits_per_key = 16;  // bloom only
   uint32_t id_filter_min_kb = 16;  // bloom only: smallest filter per segment
+  // Whether a new collection keeps each document as submitted (the "_source_"
+  // stored resource) when its schema does not declare it. Applied once, when the
+  // collection is created: the entry is then part of its schema, so changing this
+  // never alters an existing collection. A create request opts out with
+  // "_source_": {"enabled": false}.
+  bool source_default = false;
 };
 
 struct IngestConfig {
