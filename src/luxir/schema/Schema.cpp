@@ -1054,6 +1054,13 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(templatePairs.data(), templatePairs.size()));
     src.stored_resources = luxir::api::map_view<std::string_view, api::StoredResourceDef>(
       std::span<const ResourcePair>(resources.data(), resources.size()));
+    // A SET without append_only keeps the base setting; enabled=false clears it.
+    auto appendOnly = def.append_only ? def.append_only : baseSrc.append_only;
+    if (appendOnly && appendOnly->enabled) {
+      src.append_only = appendOnly;
+      schema->appendOnly = true;
+      schema->appendOnlyDropIds = appendOnly->ids == api::SchemaDef::AppendOnly::IdPolicy::DROP_IDS;
+    }
     schema->sourceDef_ = serializeSchemaDef(src);
   }
 

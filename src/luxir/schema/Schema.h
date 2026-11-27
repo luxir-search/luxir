@@ -71,6 +71,10 @@ public:
   std::string sourceDef_;     // serialized authored SchemaDef, before inheritance
   // Introduction generations for declared concrete and template representations.
   std::map<std::string, api::SchemaVersion, std::less<>> introducedGen;
+  // SchemaDef.append_only: update requests carry no delete_ids, and documents
+  // no ids (rejected or dropped, per appendOnlyDropIds).
+  bool appendOnly = false;
+  bool appendOnlyDropIds = false;
 
 private:
   using logical_map = boost::unordered_flat_map<std::string, std::shared_ptr<const LogicalField>,
