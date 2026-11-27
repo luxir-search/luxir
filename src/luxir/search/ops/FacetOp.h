@@ -47,6 +47,14 @@ public:
     return (needsStructuralScope && !subOps.empty()) || SearchOp::needsCompleteBucketInput();
   }
 
+  // A leaf facet counts each segment into its own merged state, as at the
+  // top level. Its segment pass may run query state (bucket weights, group
+  // keys) that only one task may use per segment.
+  FacetBucketConcurrency facetBucketConcurrency() const override {
+    return facetBucketSegmentLocal() ? FacetBucketConcurrency::SEGMENTS
+                                     : FacetBucketConcurrency::SERIAL;
+  }
+
   const CollapsePlan* countDistinct = nullptr;
   std::shared_ptr<const FacetGroupPlan> groupPlan;
   // RUN requires every group's matching docs to form one run in exactly one
@@ -545,8 +553,11 @@ public:
       std::vector<SearchOp*> children;
       children.reserve(fieldOp().subOps.size());
       for (auto& [name, child] : fieldOp().subOps) children.push_back(child);
+      // Column passes are per segment; term postings are per bucket.
       FacetBucketBlockExecutor::execute<Key>(
-          *this, children, buckets, fieldOp().reader, producer, source,
+          *this, children, buckets, fieldOp().reader, producer,
+          producer == FacetBucketProducer::JOINT ? FacetBucketConcurrency::SEGMENTS
+                                                 : FacetBucketConcurrency::BUCKETS, source,
           FacetBucketBlockExecutor::BINDING_BYTES,
           input, [this, &ordMap](size_t segnum, auto block, DomainHandle eligibility,
                                FacetBucketFeed feed) {
@@ -1647,6 +1658,11 @@ public:
     return FacetBucketBlockExecutor::BINDING_BYTES;
   }
   virtual FacetBucketProducer bucketProducer() const = 0;
+  // How a parallel block may call feedBucketDomains: a range pass is per
+  // segment, so concurrent calls are for distinct segments.
+  virtual FacetBucketConcurrency bucketProducerConcurrency() const {
+    return FacetBucketConcurrency::SEGMENTS;
+  }
 
   virtual bool requiresWholeReaderDomain() const { return false; }
 
@@ -1806,7 +1822,7 @@ public:
 
       FacetBucketBlockExecutor::execute<size_t>(
           *this, children, buckets, fixedOp().reader,
-          fixedOp().bucketProducer(),
+          fixedOp().bucketProducer(), fixedOp().bucketProducerConcurrency(),
           [this](size_t segnum, auto block, FacetBucketFeed feed) {
             feedBucketDomains(segnum, block, feed);
           },
@@ -2371,6 +2387,16 @@ public:
 
   FacetBucketProducer bucketProducer() const override {
     return FacetBucketProducer::INDEPENDENT;
+  }
+
+  // Each bucket materializes from its own weight. Weights with releasable
+  // segment state may share it (one multiterm memo per query and segment),
+  // and prepared sources span segments: those buckets share a segment task.
+  FacetBucketConcurrency bucketProducerConcurrency() const override {
+    bool shared = preparedBuckets || std::ranges::any_of(bucketWeights, [](const auto* weight) {
+      return weight->hasReleasableSegmentState();
+    });
+    return shared ? FacetBucketConcurrency::SEGMENTS : FacetBucketConcurrency::BUCKETS;
   }
 
   bool needsCompleteBucketInput() const override {
