@@ -394,8 +394,9 @@ shortest form is a bare expression string in an operation position:
 "average_price": "avg(price_f)"
 ```
 
-The aggregates are `avg`, `sum`, `min`, `max`, `cardinality`, `percentile`, and
-`percentile_rank`. Their value arguments use the same expression language as
+The aggregates are `avg`, `sum`, `min`, `max`, `cardinality`, `percentile`,
+`percentile_rank`, and the [mergeable sketch states](#mergeable-sketch-states)
+`cardinality_state` and `percentile_state`. Their value arguments use the same expression language as
 [sort expressions](searching.md#sorting):
 arithmetic, parentheses, `def`, unary math, and per-document array reducers.
 `sum(count(field))` counts values, like Elasticsearch `value_count`, for
@@ -432,6 +433,8 @@ POST /collections/books/_search
 | `cardinality(x [, threshold])` | int64 distinct count. | `threshold` defaults to 3000; an integer in [0, 40000]. |
 | `percentile(x, p [, compression])` | Double p-th percentile. | `p` in [0, 100]; `compression` defaults to 100, in [20, 1000]. |
 | `percentile_rank(x, v)` | Exact double percentage of values <= `v`. | `v` is the bound. |
+| `cardinality_state(x [, threshold])` | Bytes: serialized distinct-count sketch. | As `cardinality`. |
+| `percentile_state(x [, compression])` | Bytes: serialized t-digest. | As `percentile`. |
 
 Trailing arguments must be finite numeric constants or scalar `$vars`.
 
@@ -495,8 +498,11 @@ bucket whose metric is missing or failed sorts last either way. See
 
 The typing rules:
 
-- `cardinality` accepts numeric, boolean, or date expressions and indexed STRING/ID
-  columns, and flattens multi-valued inputs.
+- `cardinality` and `cardinality_state` accept numeric, boolean, or date
+  expressions and indexed STRING/ID columns.
+- `cardinality`, `percentile`, `percentile_rank`, and their state forms take
+  every value of a multi-valued input: `percentile(prices_fs, 50)` is the
+  median of all prices, not of one value per document.
 - Other aggregates require one scalar per document. Reduce multi-valued
   columns first: `avg(avg(prices_fs))` averages each document's prices,
   then averages those across the bucket.
@@ -538,12 +544,90 @@ no strict error bound. The minimum and maximum
 (`p` = 0 and 100) are exact. Results are deterministic for a fixed set of
 segments; segment merges can change estimates.
 
+A multi-valued input contributes each of its values, so a document with three
+prices adds three values to `percentile` and three to the `percentile_rank`
+denominator.
+
 Each bucket has its own state. Calls with the same function, input, and
 `compression` or `threshold` share one sketch within an expression, and
 sibling metrics that use exactly the same sketches share them too: `p50`,
 `p95`, and `p99` metrics on one field build a single t-digest. Sketch
 allocations count against the request memory limit. `percentile_rank` uses
 two counters and is exact regardless of the number of values.
+
+### Mergeable sketch states
+
+`cardinality_state` and `percentile_state` return the sketch behind
+`cardinality` and `percentile` as bytes instead of a number, so a caller that
+queries several collections or shards can merge the states and read one
+distinct count or quantile. A state must be the whole metric expression; it
+cannot be an operand of a bucket function or a facet sort key. With no
+contributing values the result is `null`. JSON responses carry the bytes as
+base64.
+
+```json
+"ops": {
+  "users": "cardinality_state(user_s)",
+  "latency": "percentile_state(latency_d, 200)"
+}
+```
+
+Both layouts are little-endian with no padding. The first byte is the format
+version (1) and the second the kind.
+
+`percentile_state` (kind 1):
+
+| Offset | Type | Field |
+|---|---|---|
+| 0 | u8 | version, 1 |
+| 1 | u8 | kind, 1 |
+| 2 | u8 | flags: bit 0 set when the digest is exact |
+| 3 | f64 | compression |
+| 11 | f64 | minimum value |
+| 19 | f64 | maximum value |
+| 27 | u32 | n, the number of centroids |
+| 31 | n x (f64, f64) | centroid mean and weight, ascending by mean |
+
+An exact digest (fewer than 5 x `compression` values) lists every value with
+weight 1, in ascending order; the quantile then interpolates linearly between
+adjacent ranks, as `percentile` does. The total count is the sum of the
+weights. Values are plain numbers: decimals are decoded, dates are in their
+field's unit.
+
+`cardinality_state` (kind 2 or 3):
+
+| Offset | Type | Field |
+|---|---|---|
+| 0 | u8 | version, 1 |
+| 1 | u8 | kind: 2 exact hash set, 3 HyperLogLog registers |
+| 2 | u8 | precision p, derived from the threshold |
+| 3 | u32 | threshold |
+| 7 | kind 2: u32 n, then n x u64 | the distinct 64-bit hashes, ascending |
+| 7 | kind 3: 2^p x u8 | the registers |
+
+The hash of a value is:
+
+- an integer, date, or boolean `v`: `fmix64(v)`, the MurmurHash3 64-bit
+  finalizer of its two's complement bits;
+- a double `v`: `fmix64` of its IEEE 754 bits, with -0.0 hashed as 0.0;
+  NaN and infinity are skipped;
+- a STRING or ID term: `XXH3_64bits` (seed 0) of the term's bytes. Each
+  distinct term is hashed once when the bucket finishes, so states from
+  different collections agree on a term's hash.
+
+A register state adds a hash `h` to register `h >> (64 - p)` with the value
+`min(clz(h << p) + 1, 64 - p + 1)` and keeps the maximum per register. To
+merge two states with the same threshold, take the union of exact hashes and
+switch to registers once the union holds more than `threshold` hashes, or take
+the per-register maximum. The distinct count of an exact state is n; a
+register state uses Ertl's improved raw estimator, as `cardinality` does.
+A numeric `cardinality` over the same values equals the count of the merged
+state; for STRING/ID inputs beyond the threshold the two can differ, because
+`cardinality` hashes reader-local ordinals.
+
+Memory: a string `cardinality_state` keeps each bucket's distinct ordinals
+exactly until it finishes, in at most one bit per term of the field, and
+charges them to the request memory limit.
 
 ## Nested facets
 
@@ -1143,7 +1227,8 @@ primary, the bare field name counts words without needing `__self`.
 
 ## Limits
 
-- Facets cannot yet sort by metrics containing `cardinality` or `percentile`.
+- Facets cannot sort by metrics containing `cardinality`, `percentile`, or
+  their state forms.
 - Field facet sorting takes one key, which must be a metric operation of that facet.
   Custom count or bucket-value sort orders are not yet supported; omit `sort`
   for the default count order.

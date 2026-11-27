@@ -86,8 +86,11 @@ class ExprStatsOp : public SearchOp {
   }
 
   template <typename Output>
-  static void writeOutputValue(api::Val& target, const BucketScalar& value, const Output& output) {
-    if constexpr (std::is_same_v<Output, NativeValueOutput>) {
+  static void writeOutputValue(api::Val& target, const BucketScalar& value, const Output& output,
+                               std::pmr::memory_resource& mr) {
+    if (value.type == BucketValueType::BYTES) {
+      writeAggregateValue(target, value, mr);
+    } else if constexpr (std::is_same_v<Output, NativeValueOutput>) {
       writeAggregateValue(target, integerAggregateOutput(value));
     } else if (!value.valid) {
       if constexpr (std::is_same_v<Output, IsoValueOutput>) {
@@ -131,6 +134,10 @@ public:
     for (auto* member : leader.members) {
       member->fields = leader.fields;
       member->fieldsBound = true;
+      // Followers hold copies of the leader's producers, taken before binding.
+      for (size_t i = 0; i < member->aggregate.producers.size(); i++) {
+        member->aggregate.producers[i].ordinalSource = leader.aggregate.producers[i].ordinalSource;
+      }
     }
   }
 
@@ -204,7 +211,7 @@ public:
         member.withOutput(member.flags, mr, [&](auto output) {
           getTarget(nullptr, member, [&](api::Val& val) {
             routeTarget<api::ArrVal>(val, mr, [&](api::Val& target) {
-              writeOutputValue(target, result, output);
+              writeOutputValue(target, result, output, mr);
             });
           });
         });
@@ -677,7 +684,7 @@ public:
               ? BucketScalar::missing(resultType, thisOp().aggregate.root().nature)
               : finishState(entries[i], counts[i]);
           thisOp().warnFailure(result);
-          writeOutputValue(const_cast<api::Val&>(arr.v[i]), result, output);
+          writeOutputValue(const_cast<api::Val&>(arr.v[i]), result, output, mr);
           if (entries[i] != nullptr) entries[i] += entryBytes;
         }
       });
@@ -883,7 +890,7 @@ public:
             assert(bucket.owner.value >= 0);
             assert(bucket.output.value >= 0);
             writeOutputValue(const_cast<api::Val&>(arr.v[(size_t)bucket.output.value]),
-                             results[(size_t)bucket.owner.value], output);
+                             results[(size_t)bucket.owner.value], output, mr);
           }
         });
       }

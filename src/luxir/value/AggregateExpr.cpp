@@ -6,6 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
+#include "luxir/api/build.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/value/AggregateFunctionRegistry.h"
@@ -16,6 +17,14 @@ bool AggregateProducer::sameState(const AggregateProducer& other) const {
       && resolved.type == other.resolved.type && resolved.nature == other.resolved.nature
       && function->sameStateArguments(arguments, other.arguments)
       && input->structurallyEqual(*other.input);
+}
+
+BucketScalar AggregateProducer::finish(
+    const void* state, std::span<const AggregateConstant> leafArguments) const {
+  if (resolved.state.finishOrdinals != nullptr) {
+    return resolved.state.finishOrdinals(state, leafArguments, ordinalSource);
+  }
+  return resolved.state.finish(state, leafArguments);
 }
 
 uint32_t AggregateProgram::addProducer(AggregateProducer producer, bool sharing) {
@@ -201,8 +210,7 @@ BucketScalar AggregateStateView::finish(AggregateEvalScratch& scratch) const {
   if (root.kind == AggregateNodeKind::AGGREGATE) {
     const AggregateLeaf& leaf = program->leaves[root.aggregate];
     const AggregateProducer& producer = program->producers[leaf.producer];
-    BucketScalar result = producer.resolved.state.finish(
-        producerState(producer), leaf.arguments);
+    BucketScalar result = producer.finish(producerState(producer), leaf.arguments);
     result.nature = producer.resolved.nature;
     return validateOutput(result);
   }
@@ -210,8 +218,7 @@ BucketScalar AggregateStateView::finish(AggregateEvalScratch& scratch) const {
   for (size_t i = 0; i < program->leaves.size(); i++) {
     const AggregateLeaf& leaf = program->leaves[i];
     const AggregateProducer& producer = program->producers[leaf.producer];
-    BucketScalar value = producer.resolved.state.finish(
-        producerState(producer), leaf.arguments);
+    BucketScalar value = producer.finish(producerState(producer), leaf.arguments);
     value.nature = producer.resolved.nature;
     scratch.aggregates[i] = value;
   }
@@ -295,7 +302,18 @@ AggregateAccumulator* AggregateAccumulator::merge(
   return target;
 }
 
+void writeAggregateValue(api::Val& target, const BucketScalar& value,
+                         std::pmr::memory_resource& mr) {
+  if (value.valid && value.type == BucketValueType::BYTES) {
+    target.kind.emplace<::hpp_proto::bytes_view>(api::build::arenaBytes(
+        mr, std::as_bytes(std::span<const char>(value.bytes.data(), value.bytes.size()))));
+    return;
+  }
+  writeAggregateValue(target, value);
+}
+
 void writeAggregateValue(api::Val& target, const BucketScalar& value) {
+  assert(!value.valid || value.type != BucketValueType::BYTES);
   if (!value.valid) {
     target.kind.emplace<google::protobuf::NullValue>(
         google::protobuf::NullValue::NULL_VALUE);
@@ -319,13 +337,17 @@ std::span<AggregateFieldInfos> resolveAggregateFields(
   return fields;
 }
 
-void bindAggregateOrdinals(const AggregateProgram& program, IndexReader& reader,
+void bindAggregateOrdinals(AggregateProgram& program, IndexReader& reader,
     std::span<AggregateFieldInfos> fields) {
   assert(fields.size() == program.producers.size());
   for (size_t i = 0; i < fields.size(); i++) {
-    const ValueProgram& input = *program.producers[i].input;
+    AggregateProducer& producer = program.producers[i];
+    const ValueProgram& input = *producer.input;
     if (input.root().type == ValueType::COLUMN_ONLY) {
-      fields[i].ords = (input.root().source ? *input.root().source : reader).getOrdMap(input.root().text).get();
+      IndexReader& source = input.root().source ? *input.root().source : reader;
+      OrdMap* ords = source.getOrdMap(input.root().text).get();
+      fields[i].ords = ords;
+      producer.ordinalSource = {&source, ords, input.root().text};
     }
   }
 }

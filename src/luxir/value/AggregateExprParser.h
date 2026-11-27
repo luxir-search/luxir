@@ -154,6 +154,9 @@ private:
     std::array<ResolvedValue, VALUE_MAX_ARITY> args{};
     for (size_t i = 0; i < children.size(); i++) {
       const AggregateNode& child = program->nodes[children[i]];
+      if (child.type == BucketValueType::BYTES) {
+        fail(child.sourcePos, "a serialized aggregate state must be the whole expression");
+      }
       args[i] = {
           child.type == BucketValueType::DOUBLE
               ? ValueType::DOUBLE : ValueType::INT64,
