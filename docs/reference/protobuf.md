@@ -193,6 +193,7 @@ defaults and constraints are described in the comments and guides.
 - [`SearchOp`](#message-luxir.searchop)
 - [`SearchRequest`](#message-luxir.searchrequest)
 - [`SearchResponse`](#message-luxir.searchresponse)
+- [`SegmentOverlayDef`](#message-luxir.segmentoverlaydef)
 - [`SegmentStats`](#message-luxir.segmentstats)
 - [`ServiceStats`](#message-luxir.servicestats)
 - [`ShardCacheControl`](#message-luxir.shardcachecontrol)
@@ -1101,9 +1102,10 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
 | <a id="field-luxir.fielddef.scale"></a>[`scale`](#field-luxir.fielddef.scale) | 25 | `int32` | optional | DECIMAL only, and required there: digits after the decimal point, 0 to 18. Excess fractional digits round half away from zero. |
 | <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
-| <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT only. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. Unset inherits, else false: a malformed point fails the document. |
+| <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT and plugin\_type fields. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate when ignore\_z\_value is false) and index the rest of the document; in a multi-valued field only the bad points are skipped. A plugin\_type field skips the whole value when the plugin rejects it. Unset inherits, else false: a malformed value fails the document. |
 | <a id="field-luxir.fielddef.ignore_z_value"></a>[`ignore_z_value`](#field-luxir.fielddef.ignore_z_value) | 29 | `bool` | optional | GEO\_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset inherits, else true. Set false to reject a point with a z coordinate. |
 | <a id="field-luxir.fielddef.reverse_map"></a>[`reverse_map`](#field-luxir.fielddef.reverse_map) | 30 | `bool` | optional | NESTED only. Store child-to-owner row lookups in segments written later. Unset inherits, else true. Changing it does not rewrite existing segments. |
+| <a id="field-luxir.fielddef.plugin_type"></a>[`plugin_type`](#field-luxir.fielddef.plugin_type) | 31 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | singular | A field type a plugin registered (Registries::fieldTypes): its name and params. The authored value is handed whole (objects and arrays included) to the plugin, which indexes it into hidden built-in sub-fields named &lt;field&gt;$&lt;suffix&gt;; those are queried, sorted and faceted by that name, and retrieving the field returns what the plugin projects from them. Excludes type and every other property except parent and ignore\_malformed (skip a value the plugin rejects and index the rest of the document). Absent inherits; a parent with a built-in type clears it. The name and params are part of the sub-fields' signatures. HTTP JSON also reads {"type": "&lt;name&gt;", "params": {...}} for a name that is not a built-in type. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -2227,6 +2229,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 | <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. \_version\_ is fixed and retrieval-only: it returns the update version of the request that indexed each document, including allow\_dups and documents without an ID. |
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
 | <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. |
+| <a id="field-luxir.schemadef.segment_overlays"></a>[`segment_overlays`](#field-luxir.schemadef.segment_overlays) | 7 | [`SegmentOverlayDef`](#message-luxir.segmentoverlaydef) | repeated | Per-segment overlays registered by plugins (for example term filters), built for the segments of this collection. Entries are keyed by name: mode=set sets the named overlays and keeps the others, and an entry with an empty kind removes that name (its existing files stay with their segments until those are merged away). An unknown kind or a bad param fails the schema request. Segments written earlier gain an overlay at later commits, and an overlay whose kind, fields or params changed is rebuilt. |
 
 <a id="message-luxir.schemarequest"></a>
 
@@ -2356,6 +2359,22 @@ Top-level response to a Search request
 | <a id="field-luxir.searchresponse.profile"></a>[`profile`](#field-luxir.searchresponse.profile) | 5 | [`ExecutionProfile`](#message-luxir.executionprofile) | singular | final response only, when SearchRequest.profile is true |
 | <a id="field-luxir.searchresponse.took_us"></a>[`took_us`](#field-luxir.searchresponse.took_us) | 8 | `uint64` | singular | Server-side wall time in microseconds from receipt of the complete request message until its final response is ready to serialize. Includes parsing, any min\_commit wait, execution, and earlier streamed batches, including any pause while the client reads them. Excludes serializing, queueing, and sending the final response. Final response only. |
 | <a id="field-luxir.searchresponse.more"></a>[`more`](#field-luxir.searchresponse.more) | 15 | `bool` | singular | if true, expect at least one more streaming response to the logical request. |
+
+<a id="message-luxir.segmentoverlaydef"></a>
+
+### luxir.SegmentOverlayDef
+
+One plugin overlay of a collection's segments (SchemaDef.segment\_overlays).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.segmentoverlaydef.name"></a>[`name`](#field-luxir.segmentoverlaydef.name) | 1 | `string` | singular | \[a-z0-9\_\]+, unique in the schema |
+| <a id="field-luxir.segmentoverlaydef.kind"></a>[`kind`](#field-luxir.segmentoverlaydef.kind) | 2 | `string` | singular | a kind registered by a plugin |
+| <a id="field-luxir.segmentoverlaydef.fields"></a>[`fields`](#field-luxir.segmentoverlaydef.fields) | 3 | `string` | repeated | The physical fields the overlay covers: exact names, or globs with one '\*'. |
+| <a id="field-luxir.segmentoverlaydef.params"></a>[`params`](#field-luxir.segmentoverlaydef.params) | 4 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | read by the kind's maker |
+| <a id="field-luxir.segmentoverlaydef.min_docs"></a>[`min_docs`](#field-luxir.segmentoverlaydef.min_docs) | 5 | `int32` | singular | segments with fewer documents get no overlay |
 
 <a id="message-luxir.segmentstats"></a>
 

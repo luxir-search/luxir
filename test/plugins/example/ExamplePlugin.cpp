@@ -2,13 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
+#include <glaze/glaze.hpp>
+
 #include "CountingStorage.h"
 #include "ExampleSearch.h"
+#include "ExampleSort.h"
+#include "luxir/api/build.h"
 #include "ExampleQuery.h"
 #include "luxir/plugin/Registries.h"
+#include "luxir/reader/ReaderErrors.h"
 #include "luxir/server/LuxirNode.h"
 #include "test/StrictStorage.h"
 
@@ -82,9 +88,211 @@ class StripXFilter : public CharFilter {
   }
 };
 
+// Field type "pair": {"a": <int>, "b": <int>} (with params {"multi": true},
+// an array of them). Derives two INT columns, a keyword "<a><separator><b>"
+// and the pair packed into 16 bytes in a column-only STRING, which is what
+// project() decodes back into the object.
+class PairType : public PluginFieldType {
+public:
+  enum Field { A, B, KEY, PACKED };
+  std::string separator;
+  bool multi;
+
+  PairType(std::string separator, bool multi) : separator(std::move(separator)), multi(multi) {
+    fields = {{.suffix = "a", .kind = DerivedField::Kind::INT, .multi = multi},
+              {.suffix = "b", .kind = DerivedField::Kind::INT, .multi = multi},
+              {.suffix = "key", .kind = DerivedField::Kind::STRING, .multi = multi},
+              {.suffix = "packed", .kind = DerivedField::Kind::STRING, .multi = multi, .index = false,
+               .opaque = true}};
+  }
+
+  // The defaults filled in, so {} and {"separator": ":"} are one definition.
+  std::string canonicalParams() const override {
+    glz::generic_sorted_u64 params;
+    params["separator"] = separator;
+    params["multi"] = multi;
+    return glz::write_json(params).value_or("");
+  }
+
+  void index(const api::Val& value, DerivedSink& sink) const override {
+    if (auto* list = std::get_if<api::ArrVal>(&value.kind); list && multi) {
+      for (const auto& element : list->v) indexPair(element, sink);
+    } else {
+      indexPair(value, sink);
+    }
+  }
+
+  bool projects() const override { return true; }
+
+  void project(const DerivedValues& values, api::Val& out, std::pmr::memory_resource& mr) const override {
+    const api::Val* packed = values.get(PACKED);
+    if (packed == nullptr) return;
+    if (!multi) {
+      out = pairValue(std::get<std::string_view>(packed->kind), mr);
+      return;
+    }
+    // A multi pair keeps a sorted set of packed values, so pairs come back in that order.
+    const auto& all = std::get<api::ArrStr>(packed->kind).v;
+    api::ArrVal list;
+    auto* items = api::build::allocArray(list.v, all.size(), mr);
+    for (size_t i = 0; i < all.size(); i++) items[i] = pairValue(all[i], mr);
+    out.kind = list;
+  }
+
+private:
+  static int64_t member(const api::Map& map, std::string_view name) {
+    const auto* found = map.fields.find(name);
+    if (found == nullptr) throw std::invalid_argument("'" + std::string(name) + "' is required");
+    if (auto* i = std::get_if<int64_t>(&(*found)->kind)) return *i;
+    throw std::invalid_argument("'" + std::string(name) + "' must be an integer");
+  }
+
+  void indexPair(const api::Val& value, DerivedSink& sink) const {
+    auto* map = std::get_if<api::Map>(&value.kind);
+    if (map == nullptr) throw std::invalid_argument("expected an object {\"a\": <int>, \"b\": <int>}");
+    for (const auto& entry : map->fields) {
+      if (entry.first != "a" && entry.first != "b") {
+        throw std::invalid_argument("unknown member '" + std::string(entry.first) + "'");
+      }
+    }
+    int64_t a = member(*map, "a"), b = member(*map, "b");
+    sink.integer(A, a);
+    sink.integer(B, b);
+    sink.string(KEY, std::to_string(a) + separator + std::to_string(b));
+    char bytes[16];
+    std::memcpy(bytes, &a, 8);
+    std::memcpy(bytes + 8, &b, 8);
+    sink.string(PACKED, std::string_view(bytes, 16));
+  }
+
+  // Null for bytes this type did not write.
+  static api::Val pairValue(std::string_view bytes, std::pmr::memory_resource& mr) {
+    if (bytes.size() != 16) return {};
+    int64_t a, b;
+    std::memcpy(&a, bytes.data(), 8);
+    std::memcpy(&b, bytes.data() + 8, 8);
+    api::Map map;
+    auto* va = api::build::mapSlot<api::Val>(map.fields, 2, "a", mr);
+    va->kind = a;
+    api::build::mapSlot<api::Val>(map.fields, 2, "b", mr)->kind = b;
+    api::Val out;
+    out.kind = map;
+    return out;
+  }
+};
+
+// Field type "spot": {"label": <text>, "lat": <num>, "lon": <num>, "tokens":
+// [[<term>, <position>], ...]}. Derives a geo point, the analyzed label, and
+// pre-analyzed tokens (a TEXT field): the given tokens, else the label's
+// letters at their offsets. Not retrievable. Given positions go to the sink
+// unchecked, so decreasing ones fail the document as a type fault.
+class SpotType : public PluginFieldType {
+public:
+  enum Field { AT, LABEL, LETTERS };
+
+  SpotType() {
+    fields = {{.suffix = "at", .kind = DerivedField::Kind::GEO_POINT},
+              {.suffix = "label", .kind = DerivedField::Kind::TEXT, .column = false, .analyzer = "english"},
+              {.suffix = "letters", .kind = DerivedField::Kind::TEXT, .column = false}};
+  }
+
+  void index(const api::Val& value, DerivedSink& sink) const override {
+    auto* map = std::get_if<api::Map>(&value.kind);
+    if (map == nullptr) throw std::invalid_argument("expected an object");
+    auto number = [&](std::string_view name) {
+      const auto* found = map->fields.find(name);
+      if (found == nullptr) throw std::invalid_argument("'" + std::string(name) + "' is required");
+      if (auto* d = std::get_if<double>(&(*found)->kind)) return *d;
+      if (auto* i = std::get_if<int64_t>(&(*found)->kind)) return (double)*i;
+      throw std::invalid_argument("'" + std::string(name) + "' must be a number");
+    };
+    sink.point(AT, number("lat"), number("lon"));
+    const auto* tokens = map->fields.find("tokens");
+    if (tokens != nullptr) {
+      const auto* list = std::get_if<api::ArrVal>(&(*tokens)->kind);
+      if (list == nullptr) throw std::invalid_argument("'tokens' must be an array");
+      for (const auto& token : list->v) {
+        const auto* pair = std::get_if<api::ArrVal>(&token.kind);
+        const std::string_view* term = pair && pair->v.size() == 2
+            ? std::get_if<std::string_view>(&pair->v[0].kind) : nullptr;
+        const int64_t* position = term ? std::get_if<int64_t>(&pair->v[1].kind) : nullptr;
+        if (position == nullptr) throw std::invalid_argument("each token must be [<term>, <position>]");
+        sink.token(LETTERS, *term, (int32_t)*position);
+      }
+    }
+    if (const auto* label = map->fields.find("label")) {
+      const auto* text = std::get_if<std::string_view>(&(*label)->kind);
+      if (text == nullptr) throw DocumentError("'label' must be a string", "invalid_label");
+      sink.text(LABEL, *text);
+      for (size_t i = 0; tokens == nullptr && i < text->size(); i++) {
+        if ((*text)[i] != ' ') sink.token(LETTERS, text->substr(i, 1), (int32_t)i);
+      }
+    }
+  }
+};
+
 void noParams(const api::AnalyzerComponent& def) {
   if (!def.params.empty()) throw std::invalid_argument("'" + std::string(def.name) + "' takes no parameters");
 }
+
+namespace {
+
+// How example_field_list overlays open: 0 normally, 1 throws SegmentCorruptError
+// (what invalid bytes do), 2 throws another exception.
+std::atomic<int> overlayOpenMode{0};
+
+std::shared_ptr<AuxReader> openFieldList(std::span<const std::shared_ptr<InputFile>> files, const api::AuxIndexInfo& info);
+
+class FieldListOverlay final : public SegmentOverlayKind {
+  bool fail;
+
+public:
+  explicit FieldListOverlay(bool fail) : fail(fail) {}
+  std::optional<SegmentOverlayOutput> build(const SegmentOverlayBuild& request) const override {
+    if (fail) throw std::runtime_error("example_field_list: failing as asked");
+    std::string text;
+    for (const auto& field : request.fields) text += field + "\n";
+    auto file = request.dir.createFile(request.fileName(0));
+    OutputStream os;
+    os.setFile(&*file);
+    os.write(text.data(), text.size());
+    os.close();
+    request.dir.finishFile(*file);
+    SegmentOverlayOutput output;
+    output.files.push_back(file->descriptor());
+    const std::string meta = std::to_string(request.fields.size());
+    output.meta.assign((const std::byte*)meta.data(), (const std::byte*)meta.data() + meta.size());
+    return output;
+  }
+};
+
+}  // namespace
+
+// Public to the example's tests: what an example_field_list overlay holds.
+class FieldListReader final : public AuxReader {
+  std::string name;
+
+public:
+  std::string fields;
+  std::string meta;
+  FieldListReader(const api::AuxIndexInfo& info, std::string fields)
+      : AuxReader(info.gen, info.built_core_gen), name(info.name), fields(std::move(fields)),
+        meta((const char*)info.opaque_meta.data(), info.opaque_meta.size()) {}
+  std::string_view getKind() const override { return "example_field_list"; }
+  std::string_view getName() const override { return name; }
+};
+
+namespace {
+
+std::shared_ptr<AuxReader> openFieldList(std::span<const std::shared_ptr<InputFile>> files, const api::AuxIndexInfo& info) {
+  if (overlayOpenMode == 1) throw SegmentCorruptError("example_field_list: invalid bytes");
+  if (overlayOpenMode == 2) throw std::runtime_error("example_field_list: storage failure");
+  auto held = files.front()->acquire({0, files.front()->size()});
+  auto bytes = held.bytes();
+  return std::make_shared<FieldListReader>(info, std::string(bytes.data(), bytes.size()));
+}
+
+}  // namespace
 
 // Test-only plugin that exercises the plugin framework: analysis components,
 // query types, search ops, HTTP routes, the node lifecycle, and storage
@@ -107,6 +315,17 @@ public:
       factory->name = name;
       factory->make = make;
       return std::unique_ptr<TokenFilterFactory>(std::move(factory));
+    });
+  }
+
+  static void registerFieldTypes(Registries& r) {
+    r.fieldTypes.add("pair", [](const ParamReader& params) -> std::unique_ptr<const PluginFieldType> {
+      std::string separator(params.getString("separator", ":"));
+      if (separator.empty()) params.fail("separator", "must not be empty");
+      return std::make_unique<PairType>(std::move(separator), params.getBool("multi", false));
+    });
+    r.fieldTypes.add("spot", [](const ParamReader&) -> std::unique_ptr<const PluginFieldType> {
+      return std::make_unique<SpotType>();
     });
   }
 
@@ -155,6 +374,7 @@ public:
     registerFilter(r, "describe", [](std::unique_ptr<TokenStream> source) -> std::unique_ptr<TokenStream> {
       return std::make_unique<DescribeFilter>(std::move(source));
     });
+    registerFieldTypes(r);
 
     r.storage.addBackend("counting_ram", [](const StorageContext& ctx) -> std::unique_ptr<DirectoryFactory> {
       return std::make_unique<CountingRamBackend>(ctx);
@@ -169,6 +389,23 @@ public:
       if (mode != "count" && mode != "deny") ctx.params.fail("whole_segment_files", "must be count or deny");
       return std::make_unique<test::StrictLayer>(std::move(inner),
           mode == "deny" ? test::StrictWholeFiles::DENY : test::StrictWholeFiles::COUNT);
+    });
+
+    // Writes a file naming the fields it covers; "fail" makes every build throw.
+    r.segmentOverlays.add("example_field_list", {
+      .maker = [](const SegmentOverlayContext& ctx) -> std::unique_ptr<SegmentOverlayKind> {
+        return std::make_unique<FieldListOverlay>(ctx.params.getBool("fail", false));
+      },
+      .open = openFieldList,
+    });
+
+    // The same kind, but queries need it: invalid bytes fail every use.
+    r.segmentOverlays.add("example_field_list_required", {
+      .maker = [](const SegmentOverlayContext& ctx) -> std::unique_ptr<SegmentOverlayKind> {
+        return std::make_unique<FieldListOverlay>(ctx.params.getBool("fail", false));
+      },
+      .open = openFieldList,
+      .policy = OverlayPolicy::REQUIRED,
     });
 
     r.query.add("doc_ids", ::example::docIdsDef());
@@ -225,6 +462,7 @@ public:
       };
       return std::make_shared<Terms>();
     });
+    r.sortKinds.add("abs_diff", ::example::makeAbsDiff);
     r.http.add("GET", "/_plugins/example/ping", [](HttpPluginRequest& request, HttpPluginResponse& response) {
       request.node.pluginState<::example::NodeState>("example")->routes++;
       const std::string* echo = request.queryParam("echo");
@@ -247,6 +485,7 @@ public:
 }  // namespace luxir::example
 
 // For the node-construction failure test.
+void exampleSetOverlayOpenMode(int mode) { luxir::example::overlayOpenMode = mode; }
 void exampleThrowOnNodeStateCreation(bool value) { luxir::example::ExamplePlugin::throwOnNodeStateCreation.store(value); }
 
 LUXIR_PLUGIN(example, luxir::example::ExamplePlugin)

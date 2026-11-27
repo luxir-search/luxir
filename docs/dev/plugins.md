@@ -263,6 +263,174 @@ A plugin can also return a scalar or a `Map`. Nested op
 results go in the `DocList`'s `ops` (route them in `getTargetForSub`). `format=docs`
 accepts only `top_docs` and `fusion` ops.
 
+## Sort kinds
+
+`Registries::sortKinds` (`src/luxir/search/SortKindRegistry.h`) lets a plugin
+sort with its own comparator. A plugin claims a function name; a sort clause
+whose whole expression is a call to that name, `name(args...)`, or that call
+under `min(...)` or `max(...)`, is the plugin's:
+
+```json
+{"sort": ["min(abs_diff(sizes_is, 42))", "id"]}
+{"sort": {"expr": "abs_diff(size_i, $target)", "vars": {"target": 42}, "dir": "desc"}}
+```
+
+- The claim decides only that root form. Anywhere else, including a larger
+  expression such as `abs_diff(size_i, 42) + 1`, the name is read by the value
+  language, so a plugin can claim the name of a value function and sort its
+  root form faster while the function keeps working inside expressions. Unclaimed
+  expressions sort as before.
+- Arguments are literals: a bare name (usually a field), a number, a quoted
+  string, or a `$variable` from the clause's `vars` holding a number or a
+  string. Anything else (a nested expression) is a request error naming the
+  argument.
+- `min` and `max` reach the maker as `ctx.mode` (`SortKindMode::MIN`, `MAX`;
+  `SINGLE` without one). What they mean is the kind's; for a multi-valued
+  field they usually pick the nearest or farthest value, and a kind can
+  require one there.
+- Names are `[a-z0-9_]+`, do not start with a digit, and may not be `min`,
+  `max` or `col`. A duplicate, a null maker, or an add after the freeze
+  throws.
+
+The maker receives a `SortKindContext`: the claimed `name`, the whole `expr`,
+`mode`, `descending` and the parsed `args`, with accessors that check and
+convert them (`arity`, `field(i)`, which resolves a field as value expressions
+do, `number`, `integer`, `string`), `fail(message)` for a request error naming
+the expression, `note(text)` for `?explain=resolved`, and the request's
+`schema` (read-only) and field resolver. Whitespace may separate a name from
+its `(`: `min (abs_diff (x, 1))` is claimed too. It returns a `SortKindSource`, shared by every
+collector the request makes (threads, collapse member folds, `head_sort`), so
+it is immutable:
+
+```cpp
+class AbsDiffSource : public luxir::SortKindSource {
+public:
+  std::unique_ptr<luxir::FieldComparator> createComparator(luxir::IndexReader& reader) const override;
+  void value(luxir::IndexReader& reader, const luxir::IndexReader::Segment& segment, int32_t doc,
+             luxir::api::Val& out, std::pmr::memory_resource& mr) const override;
+};
+
+r.sortKinds.add("abs_diff", [](luxir::SortKindContext& ctx) -> std::shared_ptr<const luxir::SortKindSource> {
+  ctx.arity(2, 2);
+  const auto& field = ctx.field(0);
+  // ... check the field type, refuse SINGLE on a multi-valued field ...
+  return std::make_shared<AbsDiffSource>(field.physicalName, ctx.integer(1), ctx.mode, ctx.descending);
+});
+```
+
+- `createComparator` makes a `FieldComparator` (`src/luxir/search/FieldComparator.h`)
+  over the reader, in the clause's direction. The collector calls
+  `setSegment`, then `copy`, `compare`, `compareBottom` and `setBottom` with
+  slots it grows through `growSlots`, and merges per-thread collectors through
+  the two-comparator `compare` and `copy`. Docs without a value rank last in
+  both directions, tied among themselves; ties fall to later clauses, then to
+  document order. `ValueSortComparator<T>` implements all of it for one
+  `int64_t` or `double` key per doc: the subclass sets up its readers in
+  `setSegment` and reads a doc's key in `read(doc, out)`, called in any doc
+  order.
+- `value` gives a doc's sort value (the key the comparator ranks by) for the
+  `_sort_` return field and collapse ranks (`_group_.rank`). Leave `out` unset
+  for a doc without one. It must agree with the comparator: the same key, and
+  no value exactly for the docs the comparator ranks as missing.
+- A plugin clause works as any other: as a primary or secondary clause, under
+  collapse, `head_sort` and diversify, and with `offset` paging. The routes
+  that read a sort column's leaf bounds and value envelope apply to column
+  clauses only; a plugin prunes through `competitiveDocs`.
+
+A comparator that knows where its competitive docs are can let the collector
+jump over the rest: it returns true from `offersCompetitiveDocs()` and answers
+`competitiveDocs(bottomSlot, from, sourceDocs, begin, end)`. When the plugin
+clause is the primary one, the heap is full and the query permits pruning, the
+collector asks it for the first run `[begin, end)` at or after `from` that may
+still enter the heap (`begin == END`: none in this segment), and advances the
+query to `begin`. Set both ends, with `from <= begin < end`; the collector
+clamps a run that starts before `from` or holds no doc, so a malformed answer
+cannot stall the query or repeat docs. The bottom comes as a slot, without its
+doc, so docs tied with it must stay in the run. `sourceDocs`
+estimates the docs the query would still produce, the work a lookup has to
+undercut. `PENDING` means not yet (no bound, or one too wide to pay off; an
+`end` past `from` names the doc to ask again at), and `UNSUPPORTED` means
+never in this segment.
+
+`competitiveDocs` is consulted only once the heap is full, and the bottom is
+only as good as the docs the scan has met. When doc order is unrelated to the
+key (or opposed to it, as in a spatially sorted segment whose nearest docs come
+last), the bottom matures late and the prune fires late. The comparator cannot
+seed a bound itself: it does not see the query, and the k-th best key over all
+docs is no bound over the matches. Instead it can offer seed windows: it
+returns true from `offersSeedWindows()` (asked after `setSegment`, so per
+segment) and answers `seedWindows(request, out)` with a few doc runs
+`[begin, end)` likely to hold the segment's best keys (a geo distance sort: the
+docs of the BKD leaves nearest the origin). Before a plain sweep of the segment
+the collector runs the query over those runs, so the heap fills with real
+matches only, then rewinds the same query to the segment start and sweeps it
+through `competitiveDocs`, jumping the runs it already collected. Only the visit
+order changes, so the results are the unseeded ones for any query, ties and
+document order included.
+
+- `request.matches` is the heap's depth and `request.sourceDocs` estimates the
+  docs the query produces in the segment: about
+  `matches * maxDoc / sourceDocs` docs hold the matches the heap needs.
+  `request.bottomSlot` is the heap bottom when earlier segments filled it,
+  else -1. Leave `out` empty to sweep unseeded.
+- Seeding runs in rounds. `sourceDocs` is an estimate (a range over a tenth of
+  the values may be estimated at half the docs), and a filter can be much
+  sparser near the best keys than overall, so a round's runs may leave the
+  heap short; then the sweep could not prune until it filled, and on a
+  segment ordered by the key it scans most of the segment. So while the heap
+  is not full, the collector asks again, up to four more rounds:
+  `request.round` counts from 0 and `request.collected` is the docs the heap
+  holds. A later round should offer the next ring beyond what the comparator
+  offered before, growing geometrically (at least doubling, or scaled by
+  `matches / collected`), rather than re-offering or over-seeding up front.
+  Runs an earlier round visited are dropped from the answer, and an empty
+  answer, or one with nothing new, ends the seeding. Between rounds the
+  collector rewinds the query and binds the later clauses again, and the
+  sweep jumps the runs of every round.
+- Any answer is safe: the collector clamps the runs to the segment, drops
+  empty ones, sorts and merges overlapping ones, and drops what earlier
+  rounds visited, so a doc is collected once.
+- The comparator reads docs out of order (the runs, then the sweep from doc 0);
+  `ValueSortComparator::read` must already allow that. The collector binds the
+  later clauses' comparators to the segment again before the sweep, and
+  collapse and diversify identities reset on a backward read, so a seeded
+  primary clause works under both.
+- The collector seeds a query-driven sweep it can rewind, with no score or
+  value-expression clause and no exact count or domain to produce. That is
+  the windowed sweep whose product can reposition (match-all, terms, Booleans,
+  ranges, cached filters), and the pull-scorer sweep a segment takes when the
+  query has no match-window product, such as an uncached filter over a
+  column-only field: the scorer advances through the runs, is reset to the
+  segment start (its plan must support reset) and sweeps through
+  `competitiveDocs`, jumping the runs. The column routes that seed from a column's
+  leaf bounds, and plans that cannot reposition or reset, stay unseeded. There
+  is no separate hook for a known exact domain (match-all, filter-only):
+  running the windows through the query already holds the heap to real
+  matches, and `sourceDocs` sizes the runs for the domain's density.
+  `SkipStats::fieldSortSeedWindowActivations` counts seeded segments,
+  `fieldSortSeedWindowPullActivations` those seeded on the pull path and
+  `fieldSortSeedWindowRounds` the rounds after the first.
+- `LUXIR_DISABLE_FIELD_SORT_SEEDING` (`disableFieldSortSeeding`) turns it off
+  along with the column seeding, for A/B runs.
+
+The example plugin registers `abs_diff(field, center)`, which sorts an INT
+field by `|x - center|` (`min()` and `max()` for a multi-valued field, which
+requires one). Ascending on the nearest value, its competitive docs lie within
+the bottom's distance of the center: it counts them from the field's points
+index (`"index": "range"`), reads them once they are under an eighth of
+`sourceDocs` and again each time the bottom distance halves, and counts the
+docs it ruled out in `example::AbsDiffStats` (`test/plugins/example/ExampleSort.h`).
+It seeds from the points index leaves holding the points nearest the center,
+enough for the heap at the query's density; each later round widens the
+leaves offered so far by `matches / collected`, at least doubling them, and
+offers the new ring. It counts the seeded segments, later rounds and windows
+there too.
+`PluginSortTest` checks it against brute force, against the value
+expression `abs(x - center)`, which sorts the same docs without pruning, and
+seeded against unseeded, including a corpus whose nearest docs come last,
+on both the windowed and the pull-scorer path, and one whose filter is
+sparse near the center, where round 0 leaves the heap short.
+
 ## HTTP routes
 
 `Registries::http` (`src/luxir/server/HttpRouteRegistry.h`) adds routes to the HTTP
@@ -301,7 +469,7 @@ r.http.add("POST", "/collections/{collection}/_sample",
 `luxir_test` only). It registers `doc_ids` (lowering to built-ins), `field_value`
 (two concrete PLUGIN query classes), an alias to test registered-name identity,
 and `unscoped_value` to test rejection of a PLUGIN query without the base.
-It also registers a `sample_docs` search op
+It also registers field types (see [Field types](#field-types)) and a `sample_docs` search op
 (rank columns named by `rank_names`, defaulting to `_rank`, and nested ops over
 its documents), and a `query_count` leaf op that counts a segment-local query
 within its input domain. The plugin has two HTTP routes and a per-node state
@@ -310,6 +478,51 @@ through their contexts.
 `PluginExtensionTest` and `PluginQueryTest` exercise the plugin end to end,
 including independent live nodes; `PluginTest` covers registry validation and
 state creation/destruction order.
+
+## Segment overlays
+
+`Registries::segmentOverlays` (`src/luxir/index/SegmentOverlayRegistry.h`) maps kind names
+to per-segment overlays: extra immutable files a plugin writes for each segment, which the
+manifest then tracks with the segment (replication, snapshots, retirement). A collection
+selects them in its schema:
+
+    "segment_overlays": [{"name": "ids", "kind": "my_kind", "fields": ["trace_id"],
+                          "params": {...}, "min_docs": 10000}]
+
+`fields` are physical field names or globs with one `*`, resolved against each segment; a
+segment with none of them gets no overlay. The schema request builds the kind once, so an
+unknown kind or a param the maker refuses is an `invalid_schema` error.
+
+A kind (`SegmentOverlayKindInfo`) has:
+
+- `maker`: reads `SegmentOverlayContext::params` and returns a `SegmentOverlayKind`, whose
+  `build(const SegmentOverlayBuild&)` writes the overlay's files, each named by
+  `request.fileName(fnum)`, and returns their descriptors and a small `meta` blob. `meta`
+  goes in the manifest and is available when the overlay opens, with no I/O. Returning
+  `nullopt` means the segment needs no overlay. A build that throws leaves the segment
+  without the overlay; indexing is not affected.
+- `open`: returns the `AuxReader` from the overlay's files, which the snapshot already
+  opened (in manifest order). It runs on first use. Any exception it throws counts as
+  invalid bytes: it becomes a `SegmentCorruptError` that names the segment and overlay (the
+  plugin need not), so a failure that may be transient (a failed read) also disables an
+  `ADVISORY` overlay for the life of that snapshot.
+- `policy`: an `OverlayPolicy`. `ADVISORY` (the default) overlays with invalid bytes read
+  as absent instead of taking the segment out of service; `REQUIRED` ones fail every use.
+
+Overlays are built when a merge finishes and, at commits, for segments that lack one: at
+most 8 builds per commit, newest segments first, skipping segments that are inputs of a
+running merge. Covered segments (an overlay built from the same kind, fields and params, which
+`AuxInfo.field` records as a hash) cost nothing, including after a restart; a segment whose
+overlay was built from another definition is rebuilt and the stale files are deleted with the
+segment. A build that fails or returns `nullopt` is not retried by this writer lifetime. Merge
+outputs get their overlays built from the merge's schema; overlay files of a merge that fails
+are deleted with the rest of its output.
+
+A manifest entry whose kind no plugin registers is skipped when a snapshot opens (a warning,
+once per kind) and its files stay. The writer keeps the entry across commits; a merge does not
+carry it to the output, so the entry goes when its segment merges away. Read a built overlay
+with `Segment::getAuxReader("<kind>.<name>")`. Register kinds during startup only: `add()`
+throws once the registry is frozen.
 
 ## Analysis components
 
@@ -444,6 +657,125 @@ produces graph tokens can set it today and a later query builder can consume it.
 `TokenAttributesExampleTest` shows a plugin filter (`describe`) reading all three, through
 `wordClass()` and `script()`, on fused and unfused chains, and the example `span2` filter
 setting `positionLength`.
+
+## Field types
+
+`Registries::fieldTypes` (`src/luxir/schema/FieldTypeRegistry.h`) maps names to makers of
+field types. A plugin field type maps one authored field to a set of *derived* built-in
+fields, so it needs no on-disk format of its own: indexing, merges, deletes, codecs and
+replication of the derived fields are those of ordinary fields.
+
+```cpp
+class PairType : public luxir::PluginFieldType {
+public:
+  PairType() {
+    fields = {{.suffix = "a", .kind = luxir::DerivedField::Kind::INT},
+              {.suffix = "b", .kind = luxir::DerivedField::Kind::INT},
+              {.suffix = "key", .kind = luxir::DerivedField::Kind::STRING},
+              {.suffix = "packed", .kind = luxir::DerivedField::Kind::STRING, .index = false,
+               .opaque = true}};
+  }
+  void index(const luxir::api::Val& value, luxir::DerivedSink& sink) const override {
+    // value is the raw document value: an object here. Throw
+    // std::invalid_argument for one the type cannot read.
+    sink.integer(0, a);
+    sink.integer(1, b);
+    sink.string(2, key);
+    sink.string(3, packedBytes);
+  }
+  bool projects() const override { return true; }
+  void project(const luxir::DerivedValues& values, luxir::api::Val& out,
+               std::pmr::memory_resource& mr) const override {
+    // rebuild {"a": ..., "b": ...} from values.get(3), allocating in mr
+  }
+};
+
+void registerComponents(luxir::Registries& r) override {
+  r.fieldTypes.add("pair", [](const luxir::ParamReader& params) -> std::unique_ptr<const luxir::PluginFieldType> {
+    auto separator = params.getString("separator", ":");  // unread params are refused afterwards
+    return std::make_unique<PairType>(/* ... */);
+  });
+}
+```
+
+A schema names the type in place of a built-in one, with its settings in `params`:
+
+```json
+{"fields": {"pt": {"type": "pair", "params": {"separator": "/"}, "ignore_malformed": true}}}
+```
+
+A type name that is not built in reads as `plugin_type` (`FieldDef.plugin_type`, a name
+and params), which is the canonical form the schema echoes:
+`{"plugin_type": {"name": "pair", "params": {"separator": "/"}}}`. Only `parent` and
+`ignore_malformed` combine with it, authored or inherited (a parent with built-in settings
+is refused); the type declares everything else. Templates work
+(`"templates": {"_pair": "pair"}` makes `x_pair$a` for a document key `x_pair`); variants
+and defaults do not.
+
+- **Registration.** Names are `[a-z0-9_]+`, not a built-in type name and not `plugin`; a
+  duplicate or an add after the freeze throws. The maker reads its params through
+  `ParamReader` (errors name the type and the parameter), and any param it did not read is
+  refused after it returns. Makers throw `std::invalid_argument` or `RequestError` with a
+  message that teaches; the schema adds the field name.
+- **Derived fields.** `PluginFieldType::fields` declares each `DerivedField`: a `suffix`
+  (`[a-z0-9_]+`, at most 32 bytes), a `kind` (`INT`, `DATE` with a `unit`, `STRING`, `TEXT`
+  with an optional registered `analyzer`, `GEO_POINT`), `multi`, `index` (the term index
+  for STRING and TEXT, the points index for the others), `column` and `opaque`. They are
+  compiled as built-in fields named `<field>$<suffix>`: hidden from catalogs, default
+  retrieval and field patterns, never document keys (a field name cannot contain `$`), but
+  queried, sorted, faceted, used in expressions (`pt$a:>=2`, `sort: "pt$b asc"`) and
+  retrieved by that name. Opaque bytes go in a column-only STRING (`index = false`), like a
+  binary key; mark it `opaque` and retrieving it by name fails, pointing at the field.
+  The authored field itself only retrieves: searching, sorting or faceting it fails with a
+  message naming its derived fields.
+- **Multi-valued derived fields are independent sets.** Each multi INT, DATE or STRING
+  field keeps a sorted set of its document's values (repeats dropped), TEXT and GEO_POINT
+  keep theirs in order, and nothing ties the i-th value of one derived field to the i-th
+  of another. A query on `ps$a` and `ps$b` matches a document whose pairs have those
+  values in any combination, and `project()` sees each field's set, not the order or
+  repeats `index()` emitted. Keep whatever must stay together in one value (the example's
+  `key` and `packed`).
+- **Ingest.** `index(value, sink)` receives the raw value of the document's field, whatever
+  arm it is (object, array, string, number; null is no value and skips the call). It emits
+  per derived field, addressed by its index in `fields`: `string()` (a term and/or column
+  value), `text()` (analyzed by the field's analyzer), `token(term, position)` (an analyzed
+  token, positions non-decreasing), `integer()` (INT, or DATE in its unit) and `point()`.
+  A single-valued derived field takes one value per document. The values reach the index
+  only after `index` returns, so a throw leaves nothing behind: `std::invalid_argument`
+  (or `DocumentError`, whose code the error keeps) rejects the document with "Field 'pt':
+  cannot read pair value: ...", or with `ignore_malformed` skips the field and indexes the
+  rest. Any other exception (a misuse of the sink, a bug) fails the document with "field
+  type 'x' failed to index the value", whatever `ignore_malformed` says. The sink applies
+  the built-in limits as values arrive (one value for a single-valued field, a point's
+  range), so they are malformed values too. A STRING or TEXT term over 255 bytes is not
+  an error: it is fitted (a prefix plus a hash, `long_terms: hash128`), as a built-in
+  string field's is, and a query for the same value fits it the same way.
+- **Retrieval.** When `projects()` is true, retrieving the field (explicitly, by an empty
+  field list, or by a pattern) loads the derived fields' columns and calls `project` with
+  a document's values (`DerivedValues::get(i)`: an int64, a string, or an `ArrInt` /
+  `ArrStr` when multi; TEXT and GEO_POINT fields and fields without a column are absent).
+  It is called only when some value is present and builds `out` in `mr`. An indexed
+  STRING's column holds the indexed term, so a value over 255 bytes comes back fitted;
+  `DerivedValues::exact(i)` is false when it may be. Decode from column-only fields, which
+  hold their bytes exactly, and treat bytes as untrusted (check their length). A type that
+  does not project is not retrievable as a whole; its non-opaque derived fields still are.
+- **Persistence.** The authored definition is in the persisted schema, and its canonical
+  form (the name, the params, sorted, and `version()` when not 0) is part of every derived
+  field's signature (`plugin_type`). A changed definition is reported as a new
+  representation of the derived fields in the resolved schema; segments written before
+  keep their derived data, which is still read under the new definition, so a type must
+  keep reading what older params wrote or the collection must be reindexed. Two hooks keep
+  the signature honest: `canonicalParams()` returns the effective params as a JSON object
+  (defaults filled in), so `{}` and `{"separator": ":"}` are one definition, and
+  `version()` (default 0) marks a change in what `index()` writes for the same params. A
+  collection whose schema names a type this binary lacks fails to load with "unknown field
+  type 'x'; valid types: ...; plugin types: ..."; the node keeps serving the rest.
+
+The example plugin registers `pair` (above, with `separator` and `multi` params and their
+`canonicalParams()`; `project` decodes the opaque packed column) and `spot` (a GEO_POINT,
+an analyzed TEXT and a pre-analyzed TEXT; not retrievable). `FieldTypeExampleTest` covers validation, HTTP and gRPC ingest,
+queries, sorts and facets on derived fields, projection, templates, malformed values,
+merges with deletes, persistence and the missing-type failure.
 
 ## Storage backends and layers
 

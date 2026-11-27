@@ -15,8 +15,12 @@
 #include "FieldSignature.h"
 #include "SchemaBinding.h"
 #include "luxir/store/OutputStream.h"
+#include "luxir/index/SegmentOverlayRegistry.h"
 
 namespace luxir {
+
+class CompositeFieldType;
+struct DerivedField;
 
 // A user error in a schema definition (unknown parent, bad analyzer name,
 // reserved-field violation, ...): INVALID_REQUEST / invalid_schema.
@@ -35,10 +39,15 @@ enum class FieldRole { PRIMARY, VARIANT };
 // One input shape, with source storage on the primary and independent physical bundles.
 // Dynamic roots use the template's prototypes; their actual names live in handles.
 struct LogicalField {
-  enum class Shape { SCALAR, VECTOR, GEO, NESTED, RANGE };
+  // PLUGIN: a plugin field type. The primary is a CompositeFieldType and the
+  // values live in the derived fields, never in variants.
+  enum class Shape { SCALAR, VECTOR, GEO, NESTED, RANGE, PLUGIN };
   std::string name;
   std::shared_ptr<FieldType> primary;
   std::map<std::string, std::shared_ptr<FieldType>, std::less<>> variants;
+  // A plugin field type's derived fields by suffix, in the type's declaration
+  // order (<name>$<suffix>; template prototypes for a template).
+  std::vector<std::pair<std::string, std::shared_ptr<FieldType>>> derived;
   std::string search = "self";
   std::string value = "self";
   Shape shape = Shape::SCALAR;
@@ -71,6 +80,8 @@ public:
   std::string sourceDef_;     // serialized authored SchemaDef, before inheritance
   // Introduction generations for declared concrete and template representations.
   std::map<std::string, api::SchemaVersion, std::less<>> introducedGen;
+  // The authored segment_overlays, validated against SegmentOverlayRegistry.
+  std::vector<std::shared_ptr<const SegmentOverlaySpec>> segmentOverlays;
 
 private:
   using logical_map = boost::unordered_flat_map<std::string, std::shared_ptr<const LogicalField>,
@@ -157,7 +168,12 @@ public:
   // pattern ("_s") or an abstract parent type ("_body_"; anything with a
   // second underscore can never suffix-match, since matching anchors on the
   // LAST underscore of a field name).
+  // A plugin field's derived fields are <field>$<suffix>: never valid field
+  // names, so they are not authorable and never document keys.
   static bool validFieldName(std::string_view name);
+  // The declaration of derived field `name` (<field>$<suffix>, also of a
+  // template instance), with its owner's type; null when it is none.
+  const DerivedField* derivedField(std::string_view name, const CompositeFieldType** owner = nullptr) const;
   static bool validTemplateName(std::string_view name);
   static bool validVariantLabel(std::string_view label);
 

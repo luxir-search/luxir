@@ -164,6 +164,23 @@ accepts explicitly named range fields and field weights;
 wildcard field selectors do not select range fields. Sort, facets, collapse,
 value expressions, and `any_of` are not supported on range fields.
 
+A plugin can register more field types. Name one as the type, with its
+settings in `params`: `{"shape": {"type": "geo_shape", "params": {...}}}`
+(canonically `{"plugin_type": {"name": "geo_shape", "params": {...}}}`, which
+is what the schema reads back as). The plugin receives each whole value,
+objects and arrays included, and indexes it into hidden built-in fields named
+`<field>$<suffix>`, such as `shape$cells`. Query, sort, facet and retrieve
+those by name (except ones the type marks opaque, its internal encoding);
+retrieving the field itself returns what the plugin rebuilds from them, when
+it does. Each multi-valued derived field is its own set of values: a query on
+two of them does not require the values to come from the same input element.
+Only `parent` and `ignore_malformed` (skip a value the plugin rejects instead
+of failing the document) apply beside `params`, and a parent may not bring
+built-in settings either. A
+collection whose schema names a type the server lacks fails to load with a
+message listing the available types. See
+[Plugin field types](../dev/plugins.md#field-types).
+
 ### `text` versus `string`
 
 Both accept text values, but they make different things searchable. Suppose
@@ -432,8 +449,9 @@ publication advances the schema generation.
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write`, `encoding` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `hamming`, `none`; `encoding`: `f32`, `f16`, `bf16`, `sq8`, `bit` (`hamming` defaults to and requires `bit`); see [Vector search](vector-search.md) |
-| `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). |
+| `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). `ignore_malformed` also applies to a plugin field type. |
 | `reverse_map` | `nested` only; defaults to `true`. Store each child row's owner in segments written from now on; see [Declaring nested paths](nested.md#declaring-nested-paths). |
+| `params` | beside a plugin field type's `type`: its settings, which the plugin validates. See [Field types](#field-types) |
 | `ann` | `vector` only; approximate index codec and parameters. RaBitQ is the default; PQ requires explicit `codec:"pq"`. See [Index settings](vector-search.md#index-settings). |
 
 Every property is optional. Absent means "inherit from `parent`, else the
@@ -561,6 +579,27 @@ There is no automatic retraining. Changing `zstd_dictionary`,
 `zstd_dictionary_bytes` or the codec clears the current dictionary so a later
 merge can train another. After a restart, the dictionary from the largest
 live segment carrying one is used.
+
+### Segment overlays
+
+Plugins can attach extra per-segment structures to a collection, for example
+filters that let a search skip segments. The top-level `segment_overlays`
+lists them: `name` is unique in the schema, `kind` is registered by a plugin,
+`fields` names the physical fields covered (exact names or globs with one
+`*`), `params` configures the kind, and segments with fewer than `min_docs`
+documents get no overlay.
+
+An overlay never affects indexing or results if it fails to build or read: the
+segment simply goes without it. Segments written before the overlay was added
+gain it over later commits, a few per commit. A segment whose overlay was
+built from another kind, `fields` or `params` is rebuilt the same way; changing
+only `name` or `min_docs` rebuilds nothing. An unknown kind or an invalid param
+fails the schema request.
+
+Overlays are keyed by `name`. `mode=set` sets the named overlays and keeps the
+others; an entry with only a `name` (no `kind`) removes that overlay, which
+stops new builds (files already written stay with their segments until those
+are merged away). `mode=replace_all` replaces the whole list.
 
 ## Text analysis
 

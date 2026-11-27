@@ -11,6 +11,7 @@
 #include "luxir/reader/ReaderErrors.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/reader/VectorAuxReader.h"
+#include "luxir/schema/FieldTypeRegistry.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/schema/SchemaCache.h"
 #include "luxir/util/ApiError.h"
@@ -25,6 +26,8 @@
 #include <bit>
 #include <cstring>
 #include <map>
+#include <mutex>
+#include <set>
 #include <memory_resource>
 #include <span>
 
@@ -56,13 +59,26 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
 
 OverlayPolicy overlayPolicyOf(std::string_view kind) {
   if (kind == TestOverlayAuxReader::KIND) return TestOverlayAuxReader::policyForTests;
+  if (const auto* registered = SegmentOverlayRegistry::global().find(kind)) return registered->policy;
   return OverlayPolicy::REQUIRED;
+}
+
+// Once per kind and process: the manifest keeps such entries, so every snapshot meets them again.
+void warnUnknownOverlayKind(std::string_view kind) {
+  static std::mutex mutex;
+  static std::set<std::string, std::less<>> warned;
+  {
+    std::lock_guard lock(mutex);
+    if (!warned.emplace(kind).second) return;
+  }
+  LOG_WARN("Segment overlays of kind '{}' are ignored: no plugin registers that kind. Their files are kept.", kind);
 }
 
 } // namespace
 
 bool SegmentOverlay::knownKind(std::string_view kind) {
-  return kind == VectorAuxReader::KIND || kind == TestOverlayAuxReader::KIND;
+  return kind == VectorAuxReader::KIND || kind == TestOverlayAuxReader::KIND
+      || SegmentOverlayRegistry::global().find(kind) != nullptr;
 }
 
 std::shared_ptr<SegmentOverlay> SegmentOverlay::open(Directory& dir, const luxir::api::AuxIndexInfo& entry,
@@ -89,10 +105,20 @@ std::shared_ptr<SegmentOverlay> SegmentOverlay::open(Directory& dir, const luxir
 }
 
 std::shared_ptr<AuxReader> SegmentOverlay::get() {
+  if (isUnusable()) return nullptr;
   return reader.getOrCreate([this]() -> std::shared_ptr<AuxReader> {
     std::pmr::monotonic_buffer_resource arena;
     auto entry = toWire(info, arena);
     try {
+      const auto* registered = SegmentOverlayRegistry::global().find(info.kind);
+      if (registered) {
+        // A plugin's failure of any kind counts as invalid bytes, named with the segment.
+        try {
+          return registered->open(files, entry);
+        } catch (const std::exception& e) {
+          corruptSegment(segment, std::format("overlay '{}' (kind '{}') did not open: {}", info.name, info.kind, e.what()));
+        }
+      }
       if (files.size() != 1) {
         corruptSegment(segment, std::format("overlay '{}': expected 1 file, got {}", info.name, files.size()));
       }
@@ -492,6 +518,7 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
         for (int j = 0; j < (int)segment.overlays.size(); j++) {
           const auto& info = segment.overlays[j];
           if (!SegmentOverlay::knownKind(info.kind)) {
+            warnUnknownOverlayKind(info.kind);
             IREADER_DEBUG("Skipping unknown overlay kind '{}' for '{}'", info.kind, info.name);
             continue;
           }
@@ -863,6 +890,22 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
   callOnce(retrievableOnce, [this] {
     std::vector<RetrievableField> fields;
     for (const auto& source : projectableFields()) {
+      // A plugin field's derived fields are hidden; the field itself is
+      // retrievable (in their place, which keeps the catalog sorted) when its
+      // type projects a value from them.
+      if (auto dollar = source.name.find(CompositeFieldType::SEPARATOR); dollar != std::string_view::npos) {
+        auto root = source.name.substr(0, dollar);
+        if (!fields.empty() && fields.back().name == root) continue;
+        FieldType* type = nullptr;
+        try {
+          type = snapshot->schema->getFieldTypePtr(root);
+        } catch (const RequestError&) {
+          continue;
+        }
+        auto* composite = dynamic_cast<CompositeFieldType*>(type);
+        if (composite && composite->impl().projects()) fields.push_back({root, type, false});
+        continue;
+      }
       auto split = source.name.rfind("__");
       bool derived = split != std::string_view::npos;
       auto root = derived ? source.name.substr(0, split) : source.name;

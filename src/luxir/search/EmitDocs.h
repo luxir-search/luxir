@@ -54,10 +54,13 @@
 #include "luxir/util/geo.h"
 #include "luxir/util/Signal.h"
 #include "luxir/schema/FieldPattern.h"
+#include "luxir/schema/FieldTypeRegistry.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/util/thread.h"
 
 namespace luxir {
+
+struct SortPlan;
 
 // Batch-local row index and segment run length. One batch holds at most
 // INT32_MAX rows (the DocList row_count is an int32); the same width serves
@@ -879,7 +882,7 @@ struct ExtraColumn {
 struct MappedReturnFields;
 
 struct ReturnField {
-  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA, MAPPED };
+  enum class Kind { PHYSICAL, SCORE, SORT, VERSION, EXTRA, MAPPED, PROJECT };
 
   std::string_view outputKey;
   std::string_view physicalName;
@@ -910,6 +913,66 @@ void loadMappedFields(SearchResponse& response, const ReturnField& field,
 bool appendMappedSelector(SearchRequest& req, IndexReader& reader, std::string_view selector,
                           std::vector<ReturnField>& picked);
 
+// A PROJECT field in one batch: its derived columns load like any field's
+// (columns[i] for PluginFieldType::fields[i]; left empty for a field without
+// a readable column), and projectFields builds the values once they are in.
+struct ProjectedField {
+  const ReturnField* field;
+  luxir::api::Val* out;
+  std::vector<luxir::api::Column> columns;
+};
+
+// Starts the loads of a PROJECT field's derived columns into projected.columns.
+inline void loadProjectedColumns(SearchRequest& req, IndexReader& reader, ProjectedField& projected,
+                                 std::span<const segdoc> segDocs, SegmentRuns runs, FieldLoaders* loaders,
+                                 PendingCols& pendingCols, std::pmr::memory_resource& mr, uint64_t flags) {
+  const auto& fields = static_cast<CompositeFieldType&>(*projected.field->fieldType).impl().fields;
+  // Sized once: the loaders and pending columns point into these.
+  projected.columns.resize(fields.size());
+  if (segDocs.empty()) return;
+  for (size_t i = 0; i < fields.size(); i++) {
+    const auto& spec = fields[i];
+    bool ints = spec.kind == DerivedField::Kind::INT || spec.kind == DerivedField::Kind::DATE;
+    if (!spec.column || (!ints && spec.kind != DerivedField::Kind::STRING)) continue;
+    auto name = CompositeFieldType::derivedName(projected.field->physicalName, spec.suffix);
+    FieldType* type = req.schema->getFieldTypePtr(name);
+    if (type == nullptr || !type->hasColumn()) continue;
+    auto infos = reader.field(name);
+    if (ints) {
+      // DATE values stay epoch units.
+      loadNumCol<ColEmit<int64_t>>(req, reader, infos, *type, segDocs, runs, projected.columns[i], loaders, pendingCols, mr);
+    } else {
+      loadStrCol(req, reader, infos, *type, segDocs, runs, projected.columns[i], loaders, pendingCols, mr, flags);
+    }
+  }
+}
+
+// After finishPendingCols: the value of every row with some derived value.
+inline void projectFields(std::deque<ProjectedField>& projected, size_t numDocs, std::pmr::memory_resource& mr) {
+  using namespace luxir::api;
+  std::vector<Val> row;
+  for (auto& p : projected) {
+    const auto& type = static_cast<CompositeFieldType&>(*p.field->fieldType).impl();
+    row.assign(p.columns.size(), Val{});
+    for (size_t r = 0; r < numDocs; r++) {
+      bool any = false;
+      for (size_t i = 0; i < p.columns.size(); i++) {
+        auto& value = row[i];
+        value = Val{};
+        std::visit([&](const auto& c) {
+          using T = std::decay_t<decltype(c)>;
+          if constexpr (std::is_same_v<T, ColInt> || std::is_same_v<T, ColStr>) {
+            if (c.v[r] != c.missing_val) value.kind = c.v[r];
+          } else if constexpr (std::is_same_v<T, ArrArrInt> || std::is_same_v<T, ArrArrStr>) {
+            if (!c.v[r].v.empty()) value.kind = c.v[r];
+          }
+        }, p.columns[i].kind);
+        any |= !value.isNull();
+      }
+      if (any) type.project(DerivedValues{row, type.fields}, p.out[r], mr);
+    }
+  }
+}
 
 inline void resolveReturnFieldMetadata(IndexReader& reader, std::span<ReturnField> fields) {
   boost::unordered_flat_map<std::pair<IndexReader*, std::string_view>, IndexReader::FieldSegments> resources;
@@ -1081,6 +1144,17 @@ struct DocLoadFanout {
         policy(scope ? std::optional(scope->getPolicy()) : std::nullopt) {}
 };
 
+// Writes one returned document's sort values (the synthetic _sort_ field):
+// one value per sort clause. Unset for a list ranked by score, whose sort
+// value is the score.
+using DocSortValues = std::function<void(luxir::api::ArrVal&, segdoc, float,
+                                         std::pmr::memory_resource&)>;
+
+// The _sort_ values under `sort` (CollapseMembers.cpp): emitCollapseRank's,
+// with dates rendered as groups.ranks renders them. The plan and the reader
+// must outlive the emission (the request's do).
+DocSortValues sortValuesUnder(const SortPlan& sort, IndexReader& reader, uint64_t flags);
+
 struct DocBatchOptions {
   uint64_t flags;
   DocLoadFanout fanout;
@@ -1089,6 +1163,7 @@ struct DocBatchOptions {
   int64_t start;
   bool scores;
   RequestMemResource* retained = nullptr;
+  const DocSortValues* sortValues = nullptr;
 };
 
 // Load and place one view's document batch. Mapped selections use the same
@@ -1159,6 +1234,8 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
   std::vector<StoredGroup> columnGroups;
   std::vector<RowIndex> fittedIdx;
   std::vector<std::span<RowIndex>> fittedRuns;
+  // PROJECT fields; the loaders write their columns.
+  std::deque<ProjectedField> projections;
   FieldLoaders loaders;
   auto* pendingLoaders = fanout.policy ? &loaders : nullptr;
 
@@ -1207,6 +1284,18 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
       case ReturnField::Kind::SCORE:
         returnScores = true;
         continue;
+      case ReturnField::Kind::SORT: {
+        auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
+        luxir::api::Val* values = build::allocArray(column.v, columnSize, mr);
+        for (int i = 0; i < columnSize; i++) {
+          auto& sortValue = values[i].kind.template emplace<luxir::api::ArrVal>();
+          float score = getScore(batchStart + i);
+          if (options.sortValues && *options.sortValues) (*options.sortValues)(sortValue, segDocs[(size_t)i], score, mr);
+          else build::allocArray(sortValue.v, 1, mr)[0].kind = score;
+        }
+        registerColumn();
+        continue;
+      }
       case ReturnField::Kind::VERSION:
         loadVersionRuns(req, sourceReader, sourceDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
         registerColumn();
@@ -1234,6 +1323,16 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
           loadMappedFields(response, rf, segDocs, rows, docListProto, flags, scopedMemory);
         });
         registerColumn();
+        continue;
+      }
+      case ReturnField::Kind::PROJECT: {
+        auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
+        auto& projected = projections.emplace_back(
+            ProjectedField{&rf, build::allocArray(column.v, columnSize, mr), {}});
+        loadProjectedColumns(req, sourceReader, projected, sourceDocs, runs, pendingLoaders, pendingCols, mr, flags);
+        // The derived columns' slot trackers are not this column's.
+        columnFields.push_back(&rf);
+        columnPresent.push_back(nullptr);
         continue;
       }
       case ReturnField::Kind::PHYSICAL:
@@ -1396,6 +1495,7 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
   // missing_val and fill its missing slots.  (ROWS mode relies on the
   // exact sentinels for its presence checks.)
   finishPendingCols(pendingCols);
+  projectFields(projections, (size_t)columnSize, mr);
   placeBatchColumns(placement, columnFields, columnPresent, docListProto.columns, rowColumns,
                     (size_t)columnSize, scoreRows, columnFate, rowCaps, mr);
 
@@ -1423,8 +1523,9 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
 // `getDoc(i)` and `getScore(i)` are invoked lazily, only for indices in the
 // current batch - no upfront materialization of a parallel array, so callers
 // can wire them directly to whatever layout they have (collector ScoreDoc /
-// SortDoc spans, RRF result vectors, etc.).  `getScore` is only called when
-// `getScores` is true.
+// SortDoc spans, RRF result vectors, etc.).  `getScore` is called when
+// `getScores` is true or the _sort_ field is returned (its score values), so
+// it must stay callable either way.
 //
 // Emission is resumable: each non-final batch goes out via req.reply(), and a
 // PAUSE status (connection over its buffer high-water mark) parks the emitter
@@ -1440,7 +1541,6 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
 // bodyDone) decides who sends it.  All but the final response have more=true.
 using DocBatchMetadata = std::function<void(luxir::api::DocList&, int64_t, int64_t,
                                            std::pmr::memory_resource&)>;
-
 class DocEmitter {
 public:
   virtual void produce() = 0;
@@ -1459,6 +1559,7 @@ public:
   int64_t numCollected;
   int64_t totalHits;
   DocBatchMetadata metadata;
+  DocSortValues sortValues;
   std::span<ReturnField> fields;  // resolved selectors
   int32_t maxBatchSize;
   int64_t offset;
@@ -1482,10 +1583,10 @@ public:
                  std::span<ReturnField> fields, int32_t maxBatchSize,
                  int64_t offset, bool emitCount, bool foundGte, bool foundEstimated,
                  bool getScores, luxir::api::DocFormat placement, FanoutScope* fanout, size_t colCap,
-                 DocBatchMetadata metadata)
+                 DocBatchMetadata metadata, DocSortValues sortValues)
       : req(req), reader(reader), flags(flags), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
-        metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
+        metadata(std::move(metadata)), sortValues(std::move(sortValues)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
         foundGte(foundGte), foundEstimated(foundEstimated), getScores(getScores),
         placement(placement),
         fanout(fanout), colCap(colCap),
@@ -1579,7 +1680,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     if (metadata) metadata(docListProto, batchStart, batchEnd, mr);
 
     loadDocuments(response, reader, segDocs, fields, docListProto, mr,
-                  {flags, fanout, placement, colCap, batchStart, getScores}, getScore, scratch);
+                  {flags, fanout, placement, colCap, batchStart, getScores, nullptr, &sortValues}, getScore, scratch);
 
     batchStart = batchEnd;
     if (!lastResponse) {
@@ -1635,7 +1736,7 @@ inline void appendReturnFields(SearchRequest& req, IndexReader& reader,
     }
   }
   // The emitter synthesizes scores; retrieval also exposes virtual versions.
-  for (std::string_view reserved : {"_score_", "_version_"}) {
+  for (std::string_view reserved : {"_score_", "_sort_", "_version_"}) {
     if (extraNames.contains(reserved)) {
       throw RequestError("Extra column '" + std::string(reserved)
                          + "' conflicts with a reserved output name; choose a different extra column name");
@@ -1647,6 +1748,9 @@ inline void appendReturnFields(SearchRequest& req, IndexReader& reader,
   auto relative = [&](std::string_view name) {
     return reader.path().empty() ? name : name.substr(reader.path().size() + 1);
   };
+  auto kindOf = [](FieldType* type) {
+    return dynamic_cast<CompositeFieldType*>(type) ? ReturnField::Kind::PROJECT : ReturnField::Kind::PHYSICAL;
+  };
   auto pushDiscovered = [&](const IndexReader::RetrievableField& field) {
     auto output = relative(field.name);
     if (extraNames.contains(output)) {
@@ -1654,7 +1758,7 @@ inline void appendReturnFields(SearchRequest& req, IndexReader& reader,
                          + "' conflicts with a returned field; use an explicit field list to omit the physical field"
                            " or select the extra by name");
     }
-    picked.push_back({output, field.name, field.type, ReturnField::Kind::PHYSICAL, true});
+    picked.push_back({output, field.name, field.type, kindOf(field.type), true});
   };
   auto pushMapped = [&](std::string_view f) {
     if (!appendMappedSelector(req, reader, f, picked)) return false;
@@ -1680,6 +1784,10 @@ inline void appendReturnFields(SearchRequest& req, IndexReader& reader,
       picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
       return;
     }
+    if (f == "_sort_") {
+      picked.push_back({f, {}, nullptr, ReturnField::Kind::SORT, false});
+      return;
+    }
     if (f.starts_with('/') || f.starts_with("..")) { pushMapped(f); return; }
     try {
       auto source = resolver.resolve(f, OpClass::RETRIEVE);
@@ -1687,6 +1795,15 @@ inline void appendReturnFields(SearchRequest& req, IndexReader& reader,
           || (source.path != resolver.path() && source.physicalName != "_version_")) {
         pushMapped(f);
         return;
+      }
+      const CompositeFieldType* owner = nullptr;
+      if (const auto* spec = req.schema->derivedField(source.physicalName, &owner); spec && spec->opaque) {
+        std::string root(f.substr(0, f.find(CompositeFieldType::SEPARATOR)));
+        throw RequestError("Field '" + std::string(f) + "' holds plugin type '" + owner->plugin->name +
+                           "''s internal encoding and is not retrievable; " +
+                           (owner->impl().projects() ? "retrieve '" + root + "' for its value"
+                                                     : std::string("query, sort or facet it instead")),
+                           "invalid_field");
       }
       if (source.fieldType->type() == FieldType::TEXT && !source.fieldType->isStored()) {
         auto* primary = source.owner ? source.owner->primary.get() : source.fieldType;
@@ -1700,7 +1817,13 @@ inline void appendReturnFields(SearchRequest& req, IndexReader& reader,
         }
         throw RequestError(message, "invalid_field");
       }
-      auto kind = source.physicalName == "_version_" ? ReturnField::Kind::VERSION : ReturnField::Kind::PHYSICAL;
+      if (auto* composite = dynamic_cast<CompositeFieldType*>(source.fieldType);
+          composite && !composite->impl().projects()) {
+        throw RequestError("Field '" + std::string(f) + "' has plugin type '" + composite->plugin->name +
+                           "', which returns no value; retrieve its derived fields (" + std::string(f) +
+                           "$<suffix>) instead", "invalid_field");
+      }
+      auto kind = source.physicalName == "_version_" ? ReturnField::Kind::VERSION : kindOf(source.fieldType);
       picked.push_back({f, build::arenaStr(mr, source.physicalName), source.fieldType, kind, false});
     } catch (const RequestError&) {
       // A real leaf error is reported in its destination view, just as when
@@ -1796,7 +1919,8 @@ void emitDocsResponse(SearchRequest& req, IndexReader& reader, uint64_t flags,
                       bool foundGte = false,
                       bool foundEstimated = false,
                       std::span<const ExtraColumn> extraColumns = {},
-                      std::span<const std::shared_ptr<HitDecorator>> decorators = {})
+                      std::span<const std::shared_ptr<HitDecorator>> decorators = {},
+                      DocSortValues sortValues = {})
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1849,7 +1973,7 @@ void emitDocsResponse(SearchRequest& req, IndexReader& reader, uint64_t flags,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
       maxBatchSize, offset, emitCount, foundGte, foundEstimated, getScores, placement,
-      req.tg, colCap, std::move(metadata));
+      req.tg, colCap, std::move(metadata), std::move(sortValues));
   req.streamStarted();
   emitter->produce();
 }

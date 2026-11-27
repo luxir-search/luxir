@@ -3,11 +3,14 @@
 
 #pragma once
 #include "luxir/analysis/AnalysisRegistry.h"
+#include "luxir/index/SegmentOverlayRegistry.h"
 #include "luxir/plugin/Plugin.h"
 #include "luxir/search/HitDecorator.h"
 #include "luxir/store/StorageRegistry.h"
 #include "luxir/query/QueryRegistry.h"
+#include "luxir/schema/FieldTypeRegistry.h"
 #include "luxir/search/SearchOpRegistry.h"
+#include "luxir/search/SortKindRegistry.h"
 #include "luxir/server/HttpRouteRegistry.h"
 
 namespace luxir {
@@ -18,13 +21,19 @@ struct Registries {
   AnalysisRegistry& analysis;
   // Storage backends and layers.
   StorageRegistry& storage;
+  // Plugin field types: one authored field indexed into derived built-in fields.
+  FieldTypeRegistry& fieldTypes;
   // Plugin query types (api::PluginQuery).
   QueryRegistry& query;
   // Plugin search operations (api::PluginOp).
   SearchOpRegistry& searchOps;
+  // Plugin sort kinds: name(args...) claimed at the root of a sort expression.
+  SortKindRegistry& sortKinds;
   // Plugin HTTP routes.
   HttpRouteRegistry& http;
   HitDecoratorRegistry& hitDecorators;
+  // Per-segment overlays, selected per collection (SchemaDef.segment_overlays).
+  SegmentOverlayRegistry& segmentOverlays;
 
   static Registries global();
   // Freezes every registry.
