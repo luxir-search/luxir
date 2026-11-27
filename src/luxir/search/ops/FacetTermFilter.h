@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -29,6 +30,48 @@ struct FacetTermFilterSpec {
   std::vector<std::string> exclude;
   uint32_t partition = 0;
   uint32_t numPartitions = 0;
+  // FieldFacet.after: keeps only terms after this one in ascending term order,
+  // or before it when afterDescending.
+  std::optional<std::string> after;
+  bool afterDescending = false;
+};
+
+// Which INT64 keys (encoded column values) of a numeric, date, or boolean
+// field facet may be ordinary buckets: term_filter include and exclude lists
+// and FieldFacet.after. Like FacetOrdFilter, it never changes counts.
+class FacetIntKeyFilter {
+  std::optional<std::vector<int64_t>> include;  // sorted, unique
+  std::vector<int64_t> exclude;                 // sorted, unique
+  int64_t lo = std::numeric_limits<int64_t>::min();  // inclusive
+  int64_t hi = std::numeric_limits<int64_t>::max();  // inclusive
+  bool none = false;
+
+  static std::vector<int64_t> sorted(std::vector<int64_t> keys) {
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
+  }
+
+public:
+  void keepOnly(std::vector<int64_t> keys) { include = sorted(std::move(keys)); }
+  void drop(std::vector<int64_t> keys) { exclude = sorted(std::move(keys)); }
+
+  // Keeps keys after `key` in ascending order, or before it when descending.
+  void startAfter(int64_t key, bool descending) {
+    if (descending) {
+      if (key == std::numeric_limits<int64_t>::min()) none = true;
+      else hi = key - 1;
+    } else {
+      if (key == std::numeric_limits<int64_t>::max()) none = true;
+      else lo = key + 1;
+    }
+  }
+
+  bool accepts(int64_t key) const {
+    if (none || key < lo || key > hi) return false;
+    if (include && !std::binary_search(include->begin(), include->end(), key)) return false;
+    return exclude.empty() || !std::binary_search(exclude.begin(), exclude.end(), key);
+  }
 };
 
 // Which global ords of a string facet may become ordinary buckets. Counting is
@@ -173,6 +216,17 @@ public:
       }
     }
     if (!holes.empty()) filter.removeAll(std::move(holes));
+    if (spec.after) {
+      // Global ords follow term order: the terms after `after` start at the
+      // ceiling, past `after` itself when it is indexed.
+      int64_t ceiling = lookup.ceilOrd(*spec.after);
+      if (spec.afterDescending) {
+        filter.keepOnly({{0, ceiling}});
+      } else {
+        bool indexed = ceiling < numOrds && lookup.strToOrd(*spec.after) == ceiling;
+        filter.keepOnly({{indexed ? ceiling + 1 : ceiling, numOrds}});
+      }
+    }
     if (spec.numPartitions > 1) {
       filter.partition = spec.partition;
       filter.numPartitions = spec.numPartitions;

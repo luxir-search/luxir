@@ -335,6 +335,30 @@ struct AcceptAnyFacetKey {
   constexpr bool operator()(int64_t) const { return true; }
 };
 
+// Feeds a count page's finalizer the keys `accept` keeps, summing their counts
+// for other_count when asked.
+template <typename Finalizer, typename Accept>
+struct FacetPageSink {
+  Finalizer& finalizer;
+  Accept accept;
+  bool countOther;
+  int64_t total = 0;
+
+  void add(FacetCandidate<int64_t> candidate) {
+    if (!accept(candidate.key)) return;
+    if (countOther) total += candidate.count;
+    finalizer.add(candidate);
+  }
+};
+
+// The summed counts of a finished page's buckets, before pins are merged in.
+template <typename Bucket>
+int64_t facetPageCount(const std::vector<Bucket>& page) {
+  int64_t sum = 0;
+  for (const auto& bucket : page) sum += bucket.count;
+  return sum;
+}
+
 class FieldFacetReq : public FacetReq {
 public:
   const ReqFieldFacet& fieldFacet;
@@ -343,6 +367,27 @@ public:
   // Which global ords may be ordinary buckets: a string facet's term_filter,
   // owned by StrFacetOp. Null keeps every key.
   const FacetOrdFilter* termFilter = nullptr;
+
+  // FieldFacet.sort, resolved by init(). Empty for the default order.
+  struct SortKey {
+    enum Kind : uint8_t { COUNT, KEY, METRIC };
+    Kind kind;
+    bool descending;
+    std::string_view metric;  // METRIC: the sub-operation name
+  };
+  std::vector<SortKey> sortKeys;
+  // The order when no key is a metric; count pages select with it.
+  FacetCountOrder countOrder;
+  // Numeric term_filter and after over INT64 keys; unset keeps every key.
+  std::optional<FacetIntKeyFilter> intKeyFilter;
+  // FieldFacet.other_count: report the counts left off the ordinary page.
+  bool otherCount = false;
+
+  // The default order without other_count: pages may stop counting once the
+  // highest counts are in hand.
+  bool pageFloorShortcuts() const {
+    return countOrder.countDescending() && !otherCount;
+  }
 
 protected:
   std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
@@ -358,38 +403,68 @@ protected:
     for (auto& name : moved) subOps.erase(name);
   }
 
+  // FieldFacet.sort keys: `_count`, `_key`, or a metric sub-operation, each
+  // at most once.
+  void resolveSortKeys() {
+    bool metric = false;
+    for (const auto& sort : fieldFacet.sort) {
+      bool descending = sort.dir == luxir::api::SortSpec_::SortDir::DESC;
+      SortKey key{SortKey::METRIC, descending, sort.expr};
+      if (sort.expr == "_count") key.kind = SortKey::COUNT;
+      else if (sort.expr == "_key") key.kind = SortKey::KEY;
+      for (const auto& seen : sortKeys) {
+        if (seen.kind == key.kind && seen.metric == key.metric) {
+          throw RequestError("facet '" + std::string(facetName)
+              + "': duplicate sort key '" + std::string(sort.expr) + "'");
+        }
+      }
+      metric |= key.kind == SortKey::METRIC;
+      sortKeys.push_back(key);
+    }
+    if (metric || sortKeys.empty()) return;
+    // Count and value keys only. Values are unique, so a value key decides.
+    countOrder.count = 0;
+    for (const auto& key : sortKeys) {
+      if (key.kind == SortKey::KEY) {
+        countOrder.keyDescending = key.descending;
+        break;
+      }
+      countOrder.count = key.descending ? -1 : 1;
+    }
+  }
+
+  bool metricSort() const {
+    return std::ranges::any_of(sortKeys, [](const auto& key) { return key.kind == SortKey::METRIC; });
+  }
+
 public:
   void init() override {
     FacetReq::init();
+    otherCount = fieldFacet.other_count;
+    resolveSortKeys();
     if (countDistinct != nullptr) {
       // Distinct counting feeds result children with ordinary bucket document
       // domains. Metrics fold those documents, never one witness per key.
-      if (!fieldFacet.sort.empty()) {
+      if (metricSort()) {
         throw RequestError("facet '" + std::string(facetName)
             + "': metric sort with count_distinct is not supported yet");
       }
       return;
     }
-    auto sorts = fieldFacet.sort;
-    if (!sorts.empty()) {
-      if (sorts.size() > 1) {
+    for (const auto& key : sortKeys) {
+      if (key.kind != SortKey::METRIC) continue;
+      auto iter = subOps.find(key.metric);
+      if (iter == subOps.end()) {
         throw std::runtime_error("facet '" + std::string(facetName)
-            + "': multiple sort fields are not yet supported");
+            + "': unknown sort field '" + std::string(key.metric) + "'");
       }
-      for (auto& sort : sorts) {
-        auto iter = subOps.find(sort.expr);
-        if (iter == subOps.end()) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': unknown sort field '" + std::string(sort.expr) + "'");
-        }
-        if (!iter->second->canInlineInBucket()) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': cannot sort by a subop without inline support: "
-              + std::string(iter->second->name));
-        }
-        inlineSubOps.push_back(*iter);
-        subOps.erase(iter);
+      if (!iter->second->canInlineInBucket()) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': cannot sort by a subop without inline support: "
+            + std::string(iter->second->name));
       }
+      inlineSubOps.push_back(*iter);
+      subOps.erase(iter);
     }
 
     bool inlineAll = limit == -1;
@@ -567,13 +642,28 @@ public:
       return buckets;
     }
 
+    // Selects a count page in the facet's order: enumerate(sink) adds every
+    // counted key, and keys the facet's INT64 key filter refuses never reach
+    // the page or other_count, which is set when the facet asks for it.
     template <typename Enumerate, typename Lookup>
     auto finishCountBuckets(Enumerate&& enumerate,
-                            std::span<const std::optional<int64_t>> pins, Lookup&& count) {
-      FieldBucketFinalizer<int64_t, std::monostate, decltype(countFieldBucketOrder)> finalizer(
-          fieldOp().minCount, 0, fieldOp().limit, countFieldBucketOrder);
-      enumerate(finalizer);
-      auto finalized = finalizer.finish();
+                            std::span<const std::optional<int64_t>> pins, Lookup&& count,
+                            std::optional<int64_t>& other) {
+      auto& facet = fieldOp();
+      const FacetIntKeyFilter* keys = facet.intKeyFilter ? &*facet.intKeyFilter : nullptr;
+      auto select = [&](auto order) {
+        FieldBucketFinalizer<int64_t, std::monostate, decltype(order)> finalizer(
+            facet.minCount, 0, facet.limit, order);
+        FacetPageSink sink{finalizer,
+            [keys](int64_t key) { return keys == nullptr || keys->accepts(key); },
+            facet.otherCount};
+        enumerate(sink);
+        auto page = finalizer.finish();
+        if (facet.otherCount) other = sink.total - facetPageCount(page);
+        return page;
+      };
+      auto finalized = facet.countOrder.countDescending() ? select(countFieldBucketOrder)
+          : select(CountKeyBucketOrder<std::less<int64_t>>{facet.countOrder, {}});
       std::vector<PinnedBucketValue<>> pinValues;
       for (auto key : pins) pinValues.push_back({key ? count(*key) : 0, {}});
       mergePinnedBuckets<int64_t, std::monostate>(finalized, pins, pinValues);
@@ -584,13 +674,15 @@ public:
     // routing. Their counter enumeration/lookup and domain producers differ.
     template <typename Label, typename ResolveLabel, typename ExecuteChildren>
     void emitCountPage(const std::vector<FinalizedFacetBucket<int64_t>>& finalized,
-                       int64_t missing, ResolveLabel&& label, ExecuteChildren&& executeChildren) {
+                       int64_t missing, std::optional<int64_t> other,
+                       ResolveLabel&& label, ExecuteChildren&& executeChildren) {
       std::vector<std::pair<Label, int64_t>> emitted;
       emitted.reserve(finalized.size());
       for (const auto& bucket : finalized) emitted.emplace_back(label(bucket), bucket.count);
       auto& out = *slotArm<luxir::api::FacetResult>(nullptr);
       fieldOp().emitFieldBuckets(out, emitted, op.req.lastResponse->mr);
       if (fieldOp().missing) out.missing = missing;
+      out.other_count = other;
       using ChildKey = std::conditional_t<std::is_same_v<Label, std::string>, std::string_view, Label>;
       auto buckets = selectedBuckets<ChildKey>(finalized,
           [&](size_t i) -> ChildKey { return emitted[i].first; },
@@ -642,35 +734,53 @@ public:
       auto& counts = mergedData->counts;
       auto missing_count = mergedData->missing_num;
 
-      // Count and bucket-value sorts are future work; sub-op sort is supported.
-      SearchOp::InlineCalculator* sortCalc = nullptr;
-      bool reversed = false;
-      if (!fieldOp().fieldFacet.sort.empty()) {
-        std::string_view field = fieldOp().fieldFacet.sort[0].expr;
-        for (auto* candidate : mergedData->inlineCalcs) {
-          if (candidate->getOp().name == field) {
-            sortCalc = candidate;
-            break;
+      // The sort keys, metric keys bound to their calculators. Empty for the
+      // default order. A bucket whose metric is missing sorts after one that
+      // has it in either direction; value ascending breaks any tie left.
+      struct BoundKey {
+        typename FieldFacetReq::SortKey::Kind kind;
+        bool descending;
+        SearchOp::InlineCalculator* calc;
+      };
+      std::vector<BoundKey> sortKeys;
+      for (const auto& key : fieldOp().sortKeys) {
+        BoundKey bound{key.kind, key.descending, nullptr};
+        if (key.kind == FieldFacetReq::SortKey::METRIC) {
+          for (auto* candidate : mergedData->inlineCalcs) {
+            if (candidate->getOp().name == key.metric) {
+              bound.calc = candidate;
+              break;
+            }
           }
+          assert(bound.calc != nullptr);
         }
-        assert(sortCalc != nullptr);
-        reversed =
-            fieldOp().fieldFacet.sort[0].dir == luxir::api::SortSpec_::SortDir::DESC;
+        sortKeys.push_back(bound);
       }
 
-      auto better = [sortCalc, reversed, keyLess](const auto& a, const auto& b) {
-        if (sortCalc == nullptr) {
+      auto better = [&sortKeys, keyLess](const auto& a, const auto& b) {
+        if (sortKeys.empty()) {
           if (a.count != b.count) return a.count > b.count;
           return keyLess(a.key, b.key);
         }
-        bool aMissing = sortCalc->isMissing(a.payload.finalizedSlot);
-        bool bMissing = sortCalc->isMissing(b.payload.finalizedSlot);
-        if (aMissing != bMissing) return !aMissing;
-        if (aMissing) return keyLess(a.key, b.key);
-        int cmp = sortCalc->compare(a.payload.finalizedSlot,
-                                    b.payload.finalizedSlot);
-        if (cmp == 0) return keyLess(a.key, b.key);
-        return reversed ? cmp > 0 : cmp < 0;
+        for (const auto& key : sortKeys) {
+          switch (key.kind) {
+            case FieldFacetReq::SortKey::COUNT:
+              if (a.count != b.count) return key.descending ? a.count > b.count : a.count < b.count;
+              break;
+            case FieldFacetReq::SortKey::KEY:
+              return key.descending ? keyLess(b.key, a.key) : keyLess(a.key, b.key);
+            case FieldFacetReq::SortKey::METRIC: {
+              bool aMissing = key.calc->isMissing(a.payload.finalizedSlot);
+              bool bMissing = key.calc->isMissing(b.payload.finalizedSlot);
+              if (aMissing != bMissing) return !aMissing;
+              if (aMissing) break;
+              int cmp = key.calc->compare(a.payload.finalizedSlot, b.payload.finalizedSlot);
+              if (cmp != 0) return key.descending ? cmp > 0 : cmp < 0;
+              break;
+            }
+          }
+        }
+        return keyLess(a.key, b.key);
       };
 
       FieldBucketFinalizer<int64_t, InlinePayload, decltype(better)> finalizer(
@@ -688,10 +798,15 @@ public:
       const bool capturePins = !pinByKey.empty();
 
       size_t finalizedSlot = 0;
-      if (finalizer.needsCandidates() || capturePins) {
+      const bool countOther = fieldOp().otherCount;
+      int64_t total = 0;
+      if (finalizer.needsCandidates() || capturePins || countOther) {
         counts.forEachEntry([&](int64_t key, char* entry) {
           int64_t count = loadUnaligned<int64_t>(entry);
-          if (accept(key)) finalizer.add({key, count, {entry, finalizedSlot}});
+          if (accept(key)) {
+            if (countOther) total += count;
+            finalizer.add({key, count, {entry, finalizedSlot}});
+          }
           if (capturePins) {
             auto pin = pinByKey.find(key);
             if (pin != pinByKey.end()) {
@@ -704,6 +819,7 @@ public:
         assert(finalizedSlot == counts.size());
       }
       auto finalized = finalizer.finish();
+      if (countOther) facetResultProto.other_count = total - facetPageCount(finalized);
       mergePinnedBuckets<int64_t, InlinePayload>(finalized, pinKeys, pinValues);
 
       // Resolve labels only for selected buckets. Owning strings, if needed,
@@ -833,8 +949,9 @@ public:
       terms.forEachAccepted([&](int64_t ord) {
         if (data.count(ord) != 0) return true;
         finalizer.add({ord, 0, {}});
-        // Zero counts tie, and the smaller ord wins a tie, so later ones lose.
-        return facet.limit < 0 || ++padded < facet.limit;
+        // Zero counts tie, and with value ascending the smaller ord wins a
+        // tie, so later ones lose.
+        return facet.limit < 0 || facet.countOrder.keyDescending || ++padded < facet.limit;
       });
     }
 
@@ -850,6 +967,7 @@ public:
           pins.push_back(labels->termStats(selected).globalOrd);
         }
       } else for (int64_t selected : facet.selectedInts) pins.push_back(selected);
+      std::optional<int64_t> other;
       auto finalized = this->finishCountBuckets([&](auto& finalizer) {
         if constexpr (Ordinal) if (facet.termFilter != nullptr) {
           selectFiltered(*data, *facet.termFilter, *labels, finalizer);
@@ -861,7 +979,7 @@ public:
             if (data->count((int64_t)value) == 0) finalizer.add({(int64_t)value, 0, {}});
           }
         }
-      }, pins, [&](int64_t key) { return data->count(key); });
+      }, pins, [&](int64_t key) { return data->count(key); }, other);
       int64_t missingCount = data->missing();
       data.reset();
       auto children = [&](auto& buckets) {
@@ -887,10 +1005,10 @@ public:
                 });
           }, ordMap);
       };
-      if constexpr (Ordinal) this->template emitCountPage<std::string>(finalized, missingCount,
+      if constexpr (Ordinal) this->template emitCountPage<std::string>(finalized, missingCount, other,
           [&](const auto& bucket) { return std::string(bucket.pinned() ? facet.selectedStrings[bucket.pinIndex]
               : labels->ordToStr(*bucket.key)); }, children);
-      else this->template emitCountPage<int64_t>(finalized, missingCount,
+      else this->template emitCountPage<int64_t>(finalized, missingCount, other,
           [](const auto& bucket) { return *bucket.key; }, children);
     }
 
@@ -1007,9 +1125,10 @@ public:
 
   IntFacetReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
-    std::span<const int64_t> selected) :
+    std::span<const int64_t> selected, std::optional<FacetIntKeyFilter> keyFilter = std::nullopt) :
   FieldFacetReq(req, view, fieldFacet, fieldName, facetName, limit, minCount, missing,
                 selected, {}) {
+    intKeyFilter = std::move(keyFilter);
     auto range = scanGlobalRange(reader, segInfos);
     globalMin = range.min;
     globalMax = range.max;
@@ -1159,6 +1278,7 @@ public:
       };
       std::vector<std::optional<int64_t>> pins;
       for (int64_t selected : thisOp().selectedInts) pins.push_back(selected);
+      std::optional<int64_t> other;
       auto finalized = finishCountBuckets([&](auto& finalizer) {
         if (auto* counts = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
           for (auto [value, count] : *counts) finalizer.add({value, count, {}});
@@ -1167,8 +1287,8 @@ public:
             finalizer.add({(int64_t)((uint64_t)merged.minValue + i), (*counts)[i], {}});
           }
         }
-      }, pins, lookup);
-      emitCountPage<int64_t>(finalized, merged.missing_num,
+      }, pins, lookup, other);
+      emitCountPage<int64_t>(finalized, merged.missing_num, other,
           [](const auto& bucket) { return *bucket.key; },
           [this](auto& buckets) { executeResultChildren(buckets); });
     }
@@ -1185,11 +1305,17 @@ public:
           pins.emplace_back(std::nullopt);
         }
       }
-      inlineResult<int64_t>(std::move(data), pins,
-          [this, keyBase](const auto& bucket) {
-            if (bucket.pinned()) return thisOp().selectedInts[bucket.pinIndex];
-            return *bucket.key + keyBase;
-          }, [this](auto& buckets) { executeResultChildren(buckets); });
+      auto label = [this, keyBase](const auto& bucket) {
+        if (bucket.pinned()) return thisOp().selectedInts[bucket.pinIndex];
+        return *bucket.key + keyBase;
+      };
+      auto children = [this](auto& buckets) { executeResultChildren(buckets); };
+      if (const auto* keys = thisOp().intKeyFilter ? &*thisOp().intKeyFilter : nullptr) {
+        inlineResult<int64_t>(std::move(data), pins, label, children, std::less<int64_t>{},
+            [keys, keyBase](int64_t key) { return keys->accepts(key + keyBase); });
+      } else {
+        inlineResult<int64_t>(std::move(data), pins, label, children);
+      }
     }
 
     std::vector<DomainHandle> bucketDomains(
@@ -1362,13 +1488,24 @@ class FullTextFacetReq : public FieldFacetReq {
     }
   };
 
+  // FieldFacet.after as an analyzed term, and its direction.
+  std::optional<std::string> afterTerm;
+  bool afterDescending = false;
+
+  bool acceptsTerm(std::string_view term) const {
+    if (!afterTerm) return true;
+    return afterDescending ? term < *afterTerm : term > *afterTerm;
+  }
+
 public:
   FullTextFacetReq(SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqFieldFacet& fieldFacet,
     std::string_view fieldName, std::string_view facetName, int64_t limit,
     int64_t minCount, bool missing,
-    std::span<const std::string_view> selected) :
+    std::span<const std::string_view> selected,
+    std::optional<std::string> afterTerm = std::nullopt, bool afterDescending = false) :
   FieldFacetReq(req, view, fieldFacet, fieldName, facetName, limit, minCount, missing,
-                {}, selected) {}
+                {}, selected),
+  afterTerm(std::move(afterTerm)), afterDescending(afterDescending) {}
 
   bool canEmitAsBucketChild() const override {
     return true;
@@ -1516,7 +1653,8 @@ public:
             return std::string(bucket.pinned()
                 ? thisOp().selectedStrings[bucket.pinIndex] : (*terms)[(size_t)*bucket.key]);
           }, [this](auto& buckets) { executeResultChildren(buckets); },
-          [terms](int64_t a, int64_t b) { return (*terms)[(size_t)a] < (*terms)[(size_t)b]; });
+          [terms](int64_t a, int64_t b) { return (*terms)[(size_t)a] < (*terms)[(size_t)b]; },
+          [this, terms](int64_t key) { return thisOp().acceptsTerm((*terms)[(size_t)key]); });
     }
 
     void executeResultChildren(
@@ -1542,7 +1680,10 @@ public:
       // TODO: stream into FieldBucketFinalizer instead of collecting every
       // counted value (see finalizeFieldBuckets in FacetEmit.h).
       std::vector<FacetCandidate<std::string>> candidates;
+      int64_t total = 0;
       for (auto [val, count] : merged.counts) {
+        if (!thisOp().acceptsTerm(val)) continue;
+        total += count;
         candidates.push_back({std::move(val), count, {}});
       }
       std::vector<std::optional<std::string>> pins;
@@ -1556,8 +1697,11 @@ public:
         if (it != merged.counts.end()) count = it->second;
         pinValues.push_back({count, {}});
       }
-      auto finalized = finalizeCountFieldBuckets(
-          std::move(candidates), minCount, 0, limit);
+      auto finalized = thisOp().countOrder.countDescending()
+          ? finalizeCountFieldBuckets(std::move(candidates), minCount, 0, limit)
+          : finalizeFieldBuckets(std::move(candidates), minCount, 0, limit,
+                CountKeyBucketOrder<std::less<std::string>>{thisOp().countOrder, {}});
+      if (thisOp().otherCount) facetResultProto.other_count = total - facetPageCount(finalized);
       mergePinnedBuckets<std::string, std::monostate>(finalized, pins, pinValues);
       std::vector<std::pair<std::string, int64_t>> countVec;
       countVec.reserve(finalized.size());

@@ -205,6 +205,30 @@ inline constexpr auto countFieldBucketOrder =
       return a.key < b.key;
     };
 
+// A field facet order made of count and bucket-value keys only (FieldFacet.sort
+// with `_count` and `_key`). Keys are unique, so a value key ends the order.
+struct FacetCountOrder {
+  int8_t count = -1;          // -1 descending, 1 ascending, 0 value only
+  bool keyDescending = false;
+
+  // The default: count descending, then value ascending.
+  bool countDescending() const { return count < 0 && !keyDescending; }
+};
+
+// FacetCountOrder over candidates; keyLess orders two keys ascending.
+template<typename KeyLess = std::less<>>
+struct CountKeyBucketOrder {
+  FacetCountOrder order;
+  [[no_unique_address]] KeyLess keyLess;
+
+  bool operator()(const auto& a, const auto& b) const {
+    if (order.count != 0 && a.count != b.count) {
+      return order.count < 0 ? a.count > b.count : a.count < b.count;
+    }
+    return order.keyDescending ? keyLess(b.key, a.key) : keyLess(a.key, b.key);
+  }
+};
+
 template<typename Key, typename Payload = std::monostate>
 std::vector<FinalizedFacetBucket<Key, Payload>> finalizeCountFieldBuckets(
     std::vector<FacetCandidate<Key, Payload>> candidates,
