@@ -6,6 +6,8 @@
 
 #include "bench/luxir_bench.h"
 #include "luxir/codec/Codec.h"
+#include "luxir/codec/PackedTail.h"
+#include "luxir/codec/StreamVByte.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/util/random.h"
 #include <gtest/gtest.h>
@@ -116,5 +118,93 @@ static void BM_postings_unpack(benchmark::State& state, uint8_t gapBits) {
       ->UseRealTime();
 
 REG(9) REG(13) REG(17)
+
+// Partial last block (a term's tail, under DOCS_BLOCK_SIZE docs): the
+// StreamVByte d1 layout the tails used before vs the bit-packed PackedTail
+// layout (gap - 1, scalar unpack) they use now, docs and tfs. Many short
+// lists back to back, as a low-df term mix reads them.
+static constexpr uint32_t TAIL_DOCS = 100;
+static constexpr uint32_t N_TAILS = 512;
+
+struct TailLists {
+  std::vector<uint8_t> svb;
+  std::vector<uint32_t> svbOffset;
+  std::vector<uint8_t> packed;
+  std::vector<uint32_t> packedOffset;
+
+  explicit TailLists(uint8_t gapBits) {
+    Rng rng(1);
+    uint32_t gapMask = (1u << gapBits) - 1u;
+    svb.assign((size_t) N_TAILS * TAIL_DOCS * 10 + 64, 0);
+    packed.assign((size_t) N_TAILS * PackedTail::MAX_BYTES + 64, 0);
+    uint32_t svbOff = 0;
+    uint32_t packedOff = 0;
+    for (uint32_t t = 0; t < N_TAILS; t++) {
+      int32_t docs[TAIL_DOCS];
+      int32_t tfs[TAIL_DOCS];
+      uint32_t cur = 0;
+      for (uint32_t i = 0; i < TAIL_DOCS; i++) {
+        cur += (uint32_t) (rng.rint(gapMask) & gapMask) + 1u;
+        docs[i] = (int32_t) cur;
+        tfs[i] = 1 + (int32_t) (rng.rint(8u) == 0 ? rng.rint(4u) : 0);
+      }
+      svbOffset.push_back(svbOff);
+      uint8_t* keys = svb.data() + svbOff;
+      uint32_t kb = svbKeyBytes(TAIL_DOCS);
+      uint8_t* end = svb_encode_scalar_d1_init((const uint32_t*) docs, keys, keys + kb,
+                                               TAIL_DOCS, 0);
+      uint8_t* tfKeys = end;
+      end = svb_encode_scalar((const uint32_t*) tfs, tfKeys, tfKeys + kb, TAIL_DOCS);
+      svbOff = (uint32_t) (end - svb.data());
+      packedOffset.push_back(packedOff);
+      packedOff += PackedTail::encode(docs, tfs, TAIL_DOCS, UINT32_MAX,
+                                      packed.data() + packedOff);
+    }
+    svb.resize(svbOff + 64);
+    packed.resize(packedOff + 64);
+  }
+};
+
+static void BM_tail_svb(benchmark::State& state, uint8_t gapBits) {
+  TailLists lists(gapBits);
+  uint32_t docs[Postings::DOCS_BLOCK_SIZE];
+  uint32_t tfs[Postings::DOCS_BLOCK_SIZE];
+  for (auto _ : state) {
+    for (uint32_t t = 0; t < N_TAILS; t++) {
+      uint8_t* p = lists.svb.data() + lists.svbOffset[t];
+      uint32_t kb = svbKeyBytes(TAIL_DOCS);
+      uint8_t* dataEnd = svb_decode_avx_d1_init(docs, p, p + kb, TAIL_DOCS, 0);
+      svb_decode_avx_simple(tfs, dataEnd, dataEnd + kb, TAIL_DOCS);
+      benchmark::DoNotOptimize(docs);
+      benchmark::DoNotOptimize(tfs);
+    }
+  }
+  state.SetItemsProcessed((int64_t) state.iterations() * N_TAILS * TAIL_DOCS);
+}
+
+static void BM_tail_packed(benchmark::State& state, uint8_t gapBits) {
+  TailLists lists(gapBits);
+  int32_t docs[Postings::DOCS_BLOCK_SIZE];
+  int32_t tfs[Postings::DOCS_BLOCK_SIZE];
+  for (auto _ : state) {
+    for (uint32_t t = 0; t < N_TAILS; t++) {
+      const uint8_t* p = lists.packed.data() + lists.packedOffset[t];
+      PackedTail::Header header = PackedTail::readHeader(p);
+      PackedTail::decodeDocs(p, header, TAIL_DOCS, UINT32_MAX, docs);
+      PackedTail::decodeTfs(p, header, TAIL_DOCS, tfs);
+      benchmark::DoNotOptimize(docs);
+      benchmark::DoNotOptimize(tfs);
+    }
+  }
+  state.SetItemsProcessed((int64_t) state.iterations() * N_TAILS * TAIL_DOCS);
+}
+
+#define REG_TAIL(g)                                                  \
+  TUNING_BENCHMARK_CAPTURE(BM_tail_svb, g/bit, (uint8_t)g)           \
+      ->UseRealTime();                                                \
+  TUNING_BENCHMARK_CAPTURE(BM_tail_packed, g/bit, (uint8_t)g)        \
+      ->UseRealTime();
+
+REG_TAIL(4) REG_TAIL(9) REG_TAIL(13)
 
 }  // namespace luxir

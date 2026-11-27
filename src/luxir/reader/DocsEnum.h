@@ -6,6 +6,7 @@
 #include "TermsEnum.h"
 #include "SkipStats.h"
 #include "luxir/codec/Codec.h"
+#include "luxir/codec/PackedTail.h"
 #include "luxir/codec/StreamVByte.h"
 #include "luxir/util/DecodedSuccessor.h"
 #include <algorithm>
@@ -184,7 +185,10 @@ protected:
         termImpactFrontierLen(state.termImpactFrontier.len),
         termPackedBlocks(state.packedBlockCount) {
     assert(endOfDocs >= startOfDocs);
-    if (docsSize != 0) {
+    // A headerless term (see headerless()) has no block headers to walk, so
+    // the cursors see no skippable blocks: they decode its one tail block
+    // like the last block of any term.
+    if (docsSize != 0 && docfreq >= Postings::DOCS_BLOCK_SIZE) {
       numDocBlocks =
           (docfreq + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
     }
@@ -194,6 +198,60 @@ protected:
 
   int32_t docGroupCount() const {
     return (numDocBlocks + L1_PERIOD - 1) / L1_PERIOD;
+  }
+
+  // A docs-stream term without a full doc block (docFreq < DOCS_BLOCK_SIZE)
+  // writes its tail body with no L1 or L0 header (PostingsWriter::endTerm).
+  // Every header field is derivable: the body length is docsSize, the tf sum
+  // is ttf, the positions offset is 0, and the impact bound is the term's own
+  // frontier.  The impact readers below present it as one synthesized block
+  // in one group whose lastDoc is the term's last doc (headerlessLastDoc).
+  bool headerless() const {
+    return docsSize != 0 && numDocBlocks == 0;
+  }
+
+  // The last doc of a headerless term: the sum of its tail's gaps, with no
+  // doc stored.  Impact consumers take a block's lastDoc as the end of its
+  // bound, so it has to be exact: block-max scoring drops the term once a
+  // window passes it.  Each impact reader calls this once per read (the lazy
+  // group cursor once per enum, visitGroupBlockImpacts once per group
+  // parse), over fewer than DOCS_BLOCK_SIZE gaps.
+  int32_t headerlessLastDoc() const {
+    assert(headerless());
+    const uint8_t* p = (const uint8_t*) docIS.ptr(startOfDocs);
+    return PackedTail::lastDoc(p, PackedTail::readHeader(p), (uint32_t) docfreq, UINT32_MAX);
+  }
+
+  // (maxTf, minNorm) corner of a headerless term's synthesized block.  With
+  // a term frontier it is the frontier's corner; a freqs-only field bounds
+  // maxTf by ttf - (docFreq - 1), since every other doc has tf >= 1.
+  void headerlessImpactCorner(int32_t& maxTf, int32_t& minNorm) const {
+    assert(headerless());
+    maxTf = 1;
+    minNorm = 0;
+    if (hasTermImpacts()) {
+      bool first = true;
+      visitTermImpactFrontier([&](int32_t tf, int32_t norm) {
+        if (first) {
+          minNorm = norm;
+          first = false;
+        }
+        maxTf = tf;
+      });
+    } else if (hasFreqs) {
+      maxTf = (int32_t) (ttf - docfreq + 1);
+    }
+  }
+
+  GroupImpactHeader headerlessGroupImpactHeader() const {
+    GroupImpactHeader header;
+    header.group = 0;
+    header.lastDoc = headerlessLastDoc();
+    header.packedBlockCount = 0;
+    headerlessImpactCorner(header.spanMaxTf, header.spanMinNorm);
+    header.bodyOffset = 0;
+    header.baseLastDoc = 0;
+    return header;
   }
 
   static uint32_t readVint15(const char*& pos, const char* end) {
@@ -383,6 +441,33 @@ public:
     if (docsSize == 0) {
       return;
     }
+    if (headerless()) {
+      int32_t maxTf;
+      int32_t minNorm;
+      headerlessImpactCorner(maxTf, minNorm);
+      blockMaxTf.push_back(maxTf);
+      if (groupSpanImpacts != nullptr) {
+        groupSpanImpacts->push_back(maxTf);
+      }
+      if (blockLastDocs != nullptr) {
+        blockLastDocs->push_back(headerlessLastDoc());
+      }
+      if (blockMinNorms != nullptr) {
+        blockMinNorms->push_back(minNorm);
+      }
+      if (groupSpanMinNorms != nullptr) {
+        groupSpanMinNorms->push_back(minNorm);
+      }
+      if (impactFrontiers != nullptr) {
+        impactFrontiers->offsets.push_back(0);
+        visitTermImpactFrontier([&](int32_t tf, int32_t norm) {
+          impactFrontiers->norms.push_back(norm);
+          impactFrontiers->tfs.push_back(tf);
+        });
+        impactFrontiers->offsets.push_back((int32_t) impactFrontiers->tfs.size());
+      }
+      return;
+    }
 
     blockMaxTf.reserve(numDocBlocks);
     if (groupSpanImpacts != nullptr) {
@@ -525,8 +610,8 @@ public:
   }
 
 
-  int32_t numImpactBlocks() const { return numDocBlocks; }
-  int32_t numImpactGroups() const { return docGroupCount(); }
+  int32_t numImpactBlocks() const { return headerless() ? 1 : numDocBlocks; }
+  int32_t numImpactGroups() const { return headerless() ? 1 : docGroupCount(); }
 
   template <typename Visitor>
   int32_t readGroupImpactHeadersThrough(GroupImpactCursor& cursor,
@@ -535,6 +620,15 @@ public:
                                         Visitor&& visitor) const {
     if (docsSize == 0 || throughGroup < 0) {
       return 0;
+    }
+    if (headerless()) {
+      cursor.initialized = true;
+      if (cursor.nextGroup > 0) {
+        return 0;
+      }
+      cursor.nextGroup = 1;
+      visitor(headerlessGroupImpactHeader());
+      return 1;
     }
     if (!cursor.initialized) {
       initGroupImpactCursor(cursor);
@@ -564,6 +658,22 @@ public:
     out.baseLastDocs.resize(0);
     out.frontiers.clear();
     if (docsSize == 0) {
+      return;
+    }
+    if (headerless()) {
+      GroupImpactHeader header = headerlessGroupImpactHeader();
+      out.baseLastDocs.push_back(header.baseLastDoc);
+      out.lastDocs.push_back(header.lastDoc);
+      out.packedBlockCounts.push_back(header.packedBlockCount);
+      out.spanMaxTfs.push_back(header.spanMaxTf);
+      out.spanMinNorms.push_back(header.spanMinNorm);
+      out.bodyOffsets.push_back(header.bodyOffset);
+      out.frontiers.offsets.push_back(0);
+      visitTermImpactFrontier([&](int32_t tf, int32_t norm) {
+        out.frontiers.norms.push_back(norm);
+        out.frontiers.tfs.push_back(tf);
+      });
+      out.frontiers.offsets.push_back((int32_t) out.frontiers.tfs.size());
       return;
     }
     out.lastDocs.reserve(docGroupCount());
@@ -600,6 +710,32 @@ public:
                               int32_t baseLastDoc,
                               GroupBlockImpactScratch& scratch,
                               Visitor&& visitor) const {
+    if (headerless()) {
+      assert(groupIndex == 0 && bodyOffset == 0 && baseLastDoc == 0);
+      int32_t maxTf;
+      int32_t minNorm;
+      headerlessImpactCorner(maxTf, minNorm);
+      int32_t frontierStored = 0;
+      bool frontierSpilled = false;
+      visitTermImpactFrontier([&](int32_t tf, int32_t norm) {
+        if (frontierStored == GroupBlockImpactScratch::FRONTIER_CAP) {
+          frontierSpilled = true;
+          return;
+        }
+        scratch.frontierTfs[frontierStored] = tf;
+        scratch.frontierNorms[frontierStored] = norm;
+        frontierStored++;
+      });
+      if (frontierSpilled) {
+        skipCount(SkipStats::impactL0GroupParseScratchSpills);
+        frontierStored = 0;
+      }
+      visitor(0, headerlessLastDoc(), maxTf, minNorm,
+              std::span<const int32_t>(scratch.frontierTfs, (size_t) frontierStored),
+              std::span<const int32_t>(scratch.frontierNorms, (size_t) frontierStored),
+              frontierSpilled);
+      return;
+    }
     int32_t groupStartBlock = groupIndex * L1_PERIOD;
     int32_t groupBlockCount =
         std::min(L1_PERIOD, numDocBlocks - groupStartBlock);
@@ -801,8 +937,13 @@ private:
   // Position docIS at the current block body: skip the group header on an L1
   // boundary and the L0 header, unless an L0 walk already left the stream at
   // the body (bodyReady).
+  // A headerless term's one block has no headers to skip.
   void seekToBlockBody() {
     if (!bodyReady) {
+      if (numDocBlocks == 0) {
+        assert(headerless());
+        return;
+      }
       if (isL1Boundary(nextL0Block)) {
         auto groupHeaderLen = docIS.readVint();
         docIS.skip(groupHeaderLen);
@@ -1080,7 +1221,7 @@ private:
     assert(hasFreqs);
     assert(!scoredProbeFreqsDecoded());
     uint32_t outSz = Postings::DOCS_BLOCK_SIZE;
-    auto bytesRead = IndexCodec::tfreqCodec.decodeBlock(
+    auto bytesRead = IndexCodec::tfreqCodec.decodeBlockPlusOne(
         freqPtr, bytesAvailable, (uint32_t*) tfreqBuf, outSz);
     assert(outSz == Postings::DOCS_BLOCK_SIZE);
     scoredProbeState |= SCORED_PROBE_FREQS_DECODED;
@@ -1247,14 +1388,15 @@ protected:
     docid = -1;
 
     if (docsSize == 0) {
-      // postings pulsed
-      assert(docfreq == 1);
+      // postings pulsed: a single doc whose tf is the term's ttf (1 for
+      // docs-only fields).  Fill the doc/freq buffers once; no block
+      // follows to overwrite them.  PosEnum initializes the pulsed position
+      // lazily.
+      assert(Postings::pulses(docfreq));
       tfreq = 1;
-      assert(ttf == 1);
-      // Fill the doc/freq buffers. PosEnum initializes the pulsed position lazily.
       docBuf[0] = state.pulsedDoc;
       docBufEnd = 1;
-      tfreqBuf[0] = 1;
+      tfreqBuf[0] = (int32_t) ttf;
       tfreqBufEnd = 1;
       cumulativeTermFreq = 0;  // this will be incremented in nextDoc()
 
@@ -1357,8 +1499,8 @@ public:
 
 private:
   // Shared block-decode walk behind nextDoc()/nextDocOnly(). DOCS_ONLY skips
-  // freq blocks undecoded via the codec (StreamVByte tails carry no length
-  // prefix, so tail freqs still decode), pins tfreq to 1, and maintains no
+  // freq blocks undecoded (by the codec's block length for full blocks, by
+  // the PackedTail widths byte for the tail), pins tfreq to 1, and maintains no
   // position/cumulative-tf state (a docs-only enum can never serve positions).
   // Decode the next docs block into docBuf without publishing a doc: on
   // return docBufIdx == 0 and docOrd is untouched, so block-boundary peeks
@@ -1381,7 +1523,7 @@ private:
 
     // Cross-block delta base: the previous block's last id (still in docBuf,
     // not yet overwritten), or 0 for the first block.  Mirrors PostingsWriter
-    // (full blocks via the docs codec, the partial tail via StreamVByte d1).
+    // (full blocks via the docs codec, the partial tail via PackedTail).
     const uint32_t base = (docOrd == 0) ? 0 : (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
     const int32_t blockStartOrd = docOrd;
 
@@ -1425,7 +1567,7 @@ private:
           skipCount(SkipStats::docsOnlyFreqBlocksSkipped);
         } else {
           uint32_t outSz = Postings::DOCS_BLOCK_SIZE;  // currently parallel to docs, so must be same block size
-          auto bytesRead = IndexCodec::tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
+          auto bytesRead = IndexCodec::tfreqCodec.decodeBlockPlusOne(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
           docIS.skip(bytesRead);
           assert(outSz == Postings::DOCS_BLOCK_SIZE);
           skipCount(SkipStats::tfreqBlocksDecoded);
@@ -1447,22 +1589,23 @@ private:
         }
       }
     } else {
-      // StreamVByte tail layout written by PostingsWriter::endTerm:
-      //   [docKeys][docData] followed, for fields with freqs, by [tfreqKeys][tfreqData].
-      // Docs are d1 decoded; freqs are plain StreamVByte values with no length
-      // prefix, so even docs-only consumption decodes them. The AVX decoders
-      // may read up to SVB_OVERREAD_PAD bytes past the encoded data, covered by
-      // the trailing padding PostingsWriter::finish() reserves on the docs file.
+      // PackedTail block written by PostingsWriter::endTerm: its widths byte
+      // gives the encoded length, so docs-only consumption leaves the tfs
+      // undecoded.  The decoder may read PackedTail::OVERREAD bytes past the
+      // encoded data, covered by the trailing padding PostingsWriter::finish()
+      // reserves on the docs file.
       const uint32_t n = (uint32_t) leftToRead;
-      const uint32_t kb = svbKeyBytes(n);
-      uint8_t* p = (uint8_t*) docIS.ptr();
-      uint8_t* dataEnd = svb_decode_avx_d1_init((uint32_t*) docBuf, p, p + kb, n, base);
+      const uint8_t* p = (const uint8_t*) docIS.ptr();
+      const PackedTail::Header header = PackedTail::readHeader(p);
+      PackedTail::decodeDocs(p, header, n, blockStartOrd == 0 ? UINT32_MAX : base, docBuf);
       if (hasFreqs) {
-        dataEnd = svb_decode_avx_simple((uint32_t*) tfreqBuf, dataEnd, dataEnd + kb, n);
+        if constexpr (!DOCS_ONLY) {
+          PackedTail::decodeTfs(p, header, n, tfreqBuf);
+        }
         tfreqBufIdx = 0;
         tfreqBufEnd = leftToRead;
       }
-      docIS.skip(dataEnd - p);
+      docIS.skip(header.encodedBytes(n));
 
       docBufIdx = 0;
       docBufEnd = leftToRead;
@@ -2881,8 +3024,13 @@ class BasicDocsEnum<DocsEnumTier::DOCS> final : public DocsEnumMeta {
     return word;
   }
 
+  // A headerless term's one block has no headers to skip.
   void seekToBlockBody() {
     if (!bodyReady) {
+      if (numDocBlocks == 0) {
+        assert(headerless());
+        return;
+      }
       if (isL1Boundary(nextL0Block)) {
         auto groupHeaderLen = docIS.readVint();
         docIS.skip(groupHeaderLen);
@@ -3589,8 +3737,7 @@ public:
   explicit BasicDocsEnum(const TermsEnum::PostingsState& state)
       : DocsEnumMeta(state) {
     if (docsSize == 0) {
-      assert(docfreq == 1);
-      assert(ttf == 1);
+      assert(Postings::pulses(docfreq));
       db[0] = state.pulsedDoc;
       docBufEnd = 1;
     } else {
@@ -3620,7 +3767,7 @@ public:
 
   // Cheap lower bound on the first doc of a term's postings: no enum
   // construction, no block decode. Exact for pulsed terms and for terms
-  // whose docs fit one StreamVByte tail (docFreq < DOCS_BLOCK_SIZE); terms
+  // whose docs fit one PackedTail block (docFreq < DOCS_BLOCK_SIZE); terms
   // with full blocks return 0, since reaching their first doc would mean
   // unpacking part of a coded block.
   static int32_t firstDocLowerBound(const TermsEnum::PostingsState& state) {
@@ -3631,22 +3778,9 @@ public:
     if (state.docFreq >= Postings::DOCS_BLOCK_SIZE) {
       return 0;
     }
-    // One StreamVByte tail: [group header][L0 header][keys][data], docs d1
-    // coded from base 0, so the first coded value is the first doc.
-    InputStream is = state.docIS;
-    auto groupHeaderLen = is.readVint();
-    is.skip(groupHeaderLen);
-    auto headerLen = is.readVint();
-    is.skip(headerLen);
-    const uint8_t* keys = (const uint8_t*) is.ptr();
-    const uint8_t* data = keys + svbKeyBytes((uint32_t) state.docFreq);
-    const int32_t len = (keys[0] & 3) + 1;
-    assert((const char*) (data + len) <= is.ptr() + is.left());
-    uint32_t doc = 0;
-    for (int32_t i = 0; i < len; i++) {
-      doc |= (uint32_t) data[i] << (8 * i);
-    }
-    return (int32_t) doc;
+    // One headerless PackedTail block coded from base -1, so its first
+    // value is the first doc.
+    return PackedTail::firstDoc((const uint8_t*) state.docIS.ptr());
   }
 
   int32_t docId() const { return docid; }
@@ -3698,14 +3832,10 @@ public:
       }
     } else {
       const uint32_t n = (uint32_t) leftToRead;
-      const uint32_t keyBytes = svbKeyBytes(n);
-      uint8_t* p = (uint8_t*) docIS.ptr();
-      uint8_t* dataEnd = svb_decode_avx_d1_init((uint32_t*) db, p, p + keyBytes,
-                                                n, base);
-      if (hasFreqs) {
-        dataEnd += svbEncodedBytes(dataEnd, n);
-      }
-      docIS.skip(dataEnd - p);
+      const uint8_t* p = (const uint8_t*) docIS.ptr();
+      const PackedTail::Header header = PackedTail::readHeader(p);
+      PackedTail::decodeDocs(p, header, n, blockStartOrd == 0 ? UINT32_MAX : base, db);
+      docIS.skip(header.encodedBytes(n));
       docBufIdx = 0;
       docBufEnd = leftToRead;
     }

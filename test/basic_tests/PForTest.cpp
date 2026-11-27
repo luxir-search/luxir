@@ -102,14 +102,18 @@ void encodeBlockPForScalar(uint32_t* in, char* outc, uint32_t& outSz) {
       }
     }
   }
-  while (((char*) bc - outc) % sizeof(uint32_t) != 0) *bc++ = 0;
-  uint32_t* out = (uint32_t*) bc;
+  // The packed words follow the header with no pad; pack them word-aligned
+  // here and copy them after the header.
+  alignas(16) uint32_t body[4 * BLK];
+  uint32_t* out = body;
   FastPForLib::simdpack(in, (__m128i*) out, bestb);
   out += 4 * bestb;
   if (bestcexcept > 0 && (uint32_t) (maxb - bestb) > 1) {
     out = bpacker.writeLane(out, maxb - bestb - 1);
   }
-  outSz = (uint32_t) ((char*) out - outc);
+  size_t bodyBytes = (size_t) (out - body) * sizeof(uint32_t);
+  memcpy(bc, body, bodyBytes);
+  outSz = (uint32_t) ((char*) bc - outc + bodyBytes);
 }
 
 uint32_t valueWithWidth(uint32_t width, uint32_t lowBits) {
@@ -146,17 +150,17 @@ std::vector<char> encodePFor(std::array<uint32_t, BLK> in) {
 }
 
 // Bits of the last exception residual word past cexcept * (maxb - bestb).
-// Layout: [bestb][cexcept][maxb][positions] word-padded, 4*bestb base words,
-// then the residual lane.
+// Layout: [bestb][cexcept][maxb][positions], 4*bestb base words, then the
+// residual lane, with no padding between them.
 uint32_t residualPaddingBits(const std::vector<char>& enc) {
   uint32_t bestb = (uint8_t) enc[0];
   uint32_t exceptions = (uint8_t) enc[1];
   uint32_t maxb = (uint8_t) enc[2];
-  uint32_t headerWords = (3 + exceptions + 3) / 4;
+  uint32_t headerBytes = 3 + exceptions;
   uint32_t residualBits = exceptions * (maxb - bestb);
-  uint32_t lastWord = headerWords + 4 * bestb + (residualBits - 1) / 32;
+  uint32_t lastWord = 4 * bestb + (residualBits - 1) / 32;
   uint32_t word;
-  memcpy(&word, enc.data() + lastWord * 4, 4);
+  memcpy(&word, enc.data() + headerBytes + lastWord * 4, 4);
   uint32_t used = residualBits % 32;
   return used == 0 ? 0 : word & ~((1U << used) - 1);
 }
@@ -193,15 +197,15 @@ protected:
       uint32_t validLastBits = ((uint32_t) exceptions * residualWidth) & 31;
       if (residualWidth > 1 && validLastBits != 0) {
         uint32_t headerBytes = 3 + exceptions;
-        uint32_t headerWords = (headerBytes + sizeof(uint32_t) - 1) / sizeof(uint32_t);
-        uint32_t* scalarResiduals = (uint32_t*) scalar.data() + headerWords + 4 * bestb;
-        const uint32_t* actualResiduals = (const uint32_t*) actual.data()
-            + headerWords + 4 * bestb;
         uint32_t residualWords = ((uint32_t) exceptions * residualWidth + 31) / 32;
+        size_t lastOffset = headerBytes + (4 * (size_t) bestb + residualWords - 1) * 4;
+        uint32_t scalarLast;
+        uint32_t actualLast;
+        memcpy(&scalarLast, scalar.data() + lastOffset, 4);
+        memcpy(&actualLast, actual.data() + lastOffset, 4);
         uint32_t validMask = (1U << validLastBits) - 1;
-        uint32_t last = residualWords - 1;
-        scalarResiduals[last] = (scalarResiduals[last] & validMask)
-            | (actualResiduals[last] & ~validMask);
+        scalarLast = (scalarLast & validMask) | (actualLast & ~validMask);
+        memcpy(scalar.data() + lastOffset, &scalarLast, 4);
       }
     }
     ASSERT_EQ(0, memcmp(scalar.data(), actual.data(), actualSize));

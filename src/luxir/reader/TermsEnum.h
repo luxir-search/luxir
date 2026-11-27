@@ -273,7 +273,8 @@ public:
         PackedTerm first = input.readPackedTerm();
         blocks.push_back({std::string(first.data(), first.size()), 0});
         docsOffsets[(size_t) i] = input.readVlong();
-        posOffsets[(size_t) i] = input.readVlong();
+        posOffsets[(size_t) i] =
+            FieldType::hasPositions(flags) ? input.readVlong() : 0;
       }
 
       for (int32_t i = 0; i < samples; i++) {
@@ -434,23 +435,29 @@ public:
     state.docsStart = locOfDocsForTermBlock + (int64_t) startOffset;
     state.docsEnd = locOfDocsForTermBlock + (int64_t) endOffset;
 
-    if (state.docsStart == state.docsEnd) {
+    // A pulsed term (Postings::pulses) has no docs stream; its doc is
+    // pulsedDoc, and its position is pulsedPos when it has only one.  Any
+    // other positions are read from posIS like a docs-stream term's.
+    bool pulsed = state.docsStart == state.docsEnd;
+    bool inlinePosition = pulsed && state.totalTermFreq == 1;
+    if (pulsed) {
       assert((pulsedMask & (1u << (uint32_t) ordInBlock)) != 0);
+      assert(Postings::pulses(state.docFreq));
       uint32_t pulsedOrd = std::popcount(
           pulsedMask & ((1u << (uint32_t) ordInBlock) - 1));
       uint32_t valueIndex = pulsedOrd * (state.hasPositions ? 2u : 1u);
       state.pulsedDoc = (int32_t) pulsedValues[valueIndex];
-      if (state.hasPositions) {
+      if (state.hasPositions && inlinePosition) {
         state.pulsedPos = (int32_t) pulsedValues[valueIndex + 1];
       }
     } else {
       state.docIS = runDocs;
       state.docIS.seek(state.docsStart);
-      if (state.hasPositions) {
-        state.posStart = locOfPositionsForTermBlock + (int64_t) posOffsets[(size_t) ordInBlock];
-        state.posIS = runPositions;
-        state.posIS.seek(state.posStart);
-      }
+    }
+    if (state.hasPositions && !inlinePosition) {
+      state.posStart = locOfPositionsForTermBlock + (int64_t) posOffsets[(size_t) ordInBlock];
+      state.posIS = runPositions;
+      state.posIS.seek(state.posStart);
     }
     return state;
   }
@@ -752,10 +759,20 @@ protected:
     // see TextWriter::flushTerms
     startingTerm = termsIS.readPackedTerm();
     locOfDocsForTermBlock = (int64_t)termsIS.readVlong();
-    locOfPositionsForTermBlock = (int64_t)termsIS.readVlong();
+    locOfPositionsForTermBlock = 0;
+    if (FieldType::hasPositions(flags)) {
+      locOfPositionsForTermBlock = (int64_t) termsIS.readVlong();
+    }
     blockPrefixLen = (uint8_t) termsIS.readByte();
-    memcpy(&pulsedMask, termsIS.ptr(), sizeof(pulsedMask));
-    termsIS.skip(sizeof(pulsedMask));
+    uint8_t pulsedMaskCode = (uint8_t) termsIS.readByte();
+    if (pulsedMaskCode == Postings::PULSED_MASK_EXPLICIT) {
+      memcpy(&pulsedMask, termsIS.ptr(), sizeof(pulsedMask));
+      termsIS.skip(sizeof(pulsedMask));
+    } else {
+      assert(pulsedMaskCode == Postings::PULSED_MASK_NONE
+             || pulsedMaskCode == Postings::PULSED_MASK_ALL);
+      pulsedMask = pulsedMaskCode == Postings::PULSED_MASK_ALL ? validPulsedMask() : 0;
+    }
     suffixBytesTotal = termsIS.readVint();
 
     copyIntoTerm((char*) currTerm.ptr(), (const char*) startingTerm.ptr(), startingTerm.memorySize());

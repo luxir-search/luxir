@@ -146,7 +146,10 @@ void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
         std::string term = termName(termBase + doc * 8 + i);
         value += " " + term + " " + term;
       }
+      // Two docs per value, so the per-doc terms keep docs-stream postings
+      // instead of pulsing into the dictionary, and every range has docs.
       body.add(doc * 16, value);
+      body.add(doc * 16 + 1, value);
     }
     if ((segment & 1) == 0) index.deleteDoc(segment);
     index.flush();

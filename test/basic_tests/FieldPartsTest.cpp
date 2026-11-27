@@ -777,11 +777,18 @@ TEST_P(FieldPartsTest, IndexAndColumnSlices) {
   const auto& t = terms.terms;
   ASSERT_EQ(1u, t.runs.size());
   const auto& run = t.runs.front();
-  ASSERT_TRUE(run.docs && run.positions);
+  // With a single doc (alternate), "word" is pulsed: it lives in the term
+  // dictionary and writes nothing to the docs stream.
+  ASSERT_TRUE(run.positions);
+  ASSERT_EQ(!alternate, (bool) run.docs);
   auto offsets = textInfo.termBlockOffsets();
   auto dictionaryBlocks = t.dictionaryBlocks();
   auto trie = textInfo.termTrie();
-  checkSlices(core, {dictionaryBlocks, offsets, trie, run.docs, run.positions});
+  if (alternate) {
+    checkSlices(core, {dictionaryBlocks, offsets, trie, run.positions});
+  } else {
+    checkSlices(core, {dictionaryBlocks, offsets, trie, run.docs, run.positions});
+  }
   EXPECT_LE(offsets.location.offset() - dictionaryBlocks.end().offset(), field_parts::Terms::OFFSETS_ALIGN - 1);
   EXPECT_EQ(sizeof(field_parts::Terms::BlockOffset), offsets.bytes);
   EXPECT_LT(t.trieRootOffset, trie.bytes);
@@ -790,8 +797,10 @@ TEST_P(FieldPartsTest, IndexAndColumnSlices) {
     TermsEnum en(inverter.pool, postings, textInfo);
     ASSERT_TRUE(en.seek("word"));
     const auto state = en.postingsState();
-    ASSERT_LT(state.docsStart, state.docsEnd);
-    EXPECT_EQ(run.docs.bytes, (uint64_t)state.docIS.size());
+    if (!alternate) {
+      ASSERT_LT(state.docsStart, state.docsEnd);
+      EXPECT_EQ(run.docs.bytes, (uint64_t)state.docIS.size());
+    }
     EXPECT_EQ(run.positions.bytes, (uint64_t)state.posIS.size());
     DocsPosEnum docs(en);
     PosEnum pos(docs);

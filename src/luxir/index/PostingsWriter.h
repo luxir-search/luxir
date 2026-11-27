@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdint>
 #include <cstdlib>
@@ -36,6 +37,7 @@
 #include "luxir/reader/Space.h"
 #include "ScreamingBuilder.h"
 #include "luxir/codec/Codec.h"
+#include "luxir/codec/PackedTail.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/util/screaming.h"
 #include "LiveDocsWriter.h"
@@ -470,7 +472,8 @@ public:
     primaryFile();
     writeCatalog();
 
-    // The StreamVByte AVX tail decoder used by postings iteration, and the
+    // The PackedTail decoder used by postings iteration (PackedTail::OVERREAD),
+    // the StreamVByte AVX decoder of the term dictionary runs, and the
     // LinearPack bulk decoder used by ord columns, may read up to
     // SVB_OVERREAD_PAD bytes past the encoded data. Reserve that slack at the end of
     // every pure-data file so the read stays in bounds (ord columns write no pad
@@ -717,15 +720,15 @@ struct NormSurface {
 class TextWriterSettings {
 protected:
   // Leave enough space in a run for one more block at a 32-bit offset.
-  // A block of 32 terms uses at most 8,285 bytes for the packed first term,
-  // two vlong bases, prefix length, pulse mask, suffix length vint, hashes,
+  // A block of 32 terms uses at most 8,286 bytes for the packed first term,
+  // two vlong bases, prefix length, pulse mask code and mask, suffix length vint, hashes,
   // prefix/suffix lengths and 31 full suffixes. Seven run lengths take 35
   // bytes. Docs ends, TTF and positions take 960 bytes (three vlongs per
   // term). Packed-block counts and doc frequencies take 272 bytes (two SVB
   // runs). Pulsed docs and positions take another 272 (64 SVB values).
   // Each impact frontier has a two-byte count and up to 256 points of one
   // norm byte and a five-byte TF delta, or 49,216 bytes for the block.
-  // The sum is at most 59,040 bytes, even charging all lanes at once.
+  // The sum is at most 59,041 bytes, even charging all lanes at once.
   static constexpr uint32_t MAX_TERM_BLOCK_BYTES = 64 * 1024;
   static constexpr uint32_t RUN_SPLIT_BYTES =
       std::numeric_limits<field_parts::Terms::BlockOffset>::max() - MAX_TERM_BLOCK_BYTES;
@@ -733,7 +736,7 @@ protected:
 private:
   static constexpr uint32_t TERMS = Postings::TERMS_BLOCK_SIZE;
   static constexpr uint32_t HEADER_BYTES = PackedTerm::MAX_BYTES + 2 * MAX_VLONG_SIZE
-      + 1 + sizeof(uint32_t) + MAX_VINT_SIZE;
+      + 1 + 1 + sizeof(uint32_t) + MAX_VINT_SIZE;
   static constexpr uint32_t TERM_BYTES = TERMS + (TERMS - 1) * (2 + PackedTerm::MAX_LEN);
   static constexpr uint32_t MAX_BLOCK_BYTES = HEADER_BYTES + TERM_BYTES + 7 * MAX_VINT_SIZE
       + 3 * TERMS * MAX_VLONG_SIZE + 2 * (svbKeyBytes(TERMS) + TERMS * sizeof(uint32_t))
@@ -741,7 +744,7 @@ private:
       + TERMS * (2 + NormSurface::NUM_NORMS * (1 + MAX_VINT_SIZE));
   static_assert(NormSurface::NUM_NORMS >= 128 && NormSurface::NUM_NORMS < (1u << 14));
   static_assert(TERMS == std::numeric_limits<uint32_t>::digits);
-  static_assert(MAX_BLOCK_BYTES == 59040 && MAX_BLOCK_BYTES < MAX_TERM_BLOCK_BYTES);
+  static_assert(MAX_BLOCK_BYTES == 59041 && MAX_BLOCK_BYTES < MAX_TERM_BLOCK_BYTES);
 
 protected:
   inline static std::atomic<uint32_t> splitBytes = RUN_SPLIT_BYTES;  // Writer setting, sampled at construction.
@@ -801,6 +804,53 @@ public:
       }
     }
   };
+
+  // Bytes one term run put in the docs stream, by section, plus term counts
+  // by postings shape.  Every writer keeps this tally; finishTermRun() adds
+  // it to the per-field totals while collectDocsFileBytes is set, which is
+  // how size tests and measurements break the docs file down.
+  struct DocsFileBytes {
+    uint64_t l1Headers = 0;  // L1 group headers, with their vint lengths
+    uint64_t l0Headers = 0;  // L0 block headers, with their vint lengths
+    uint64_t fullDocs = 0;   // full blocks: token byte plus doc body
+    uint64_t fullFreqs = 0;  // full blocks: tf block
+    uint64_t tailDocs = 0;   // partial last block: docs
+    uint64_t tailFreqs = 0;  // partial last block: tfs
+    uint64_t pulsedTerms = 0;    // terms stored in the dictionary only
+    uint64_t tailOnlyTerms = 0;  // docs-stream terms without a full block
+    uint64_t blockTerms = 0;     // terms with at least one full block
+
+    uint64_t total() const {
+      return l1Headers + l0Headers + fullDocs + fullFreqs + tailDocs + tailFreqs;
+    }
+
+    DocsFileBytes& operator+=(const DocsFileBytes& other) {
+      l1Headers += other.l1Headers;
+      l0Headers += other.l0Headers;
+      fullDocs += other.fullDocs;
+      fullFreqs += other.fullFreqs;
+      tailDocs += other.tailDocs;
+      tailFreqs += other.tailFreqs;
+      pulsedTerms += other.pulsedTerms;
+      tailOnlyTerms += other.tailOnlyTerms;
+      blockTerms += other.blockTerms;
+      return *this;
+    }
+  };
+
+  static inline std::atomic<bool> collectDocsFileBytes{false};
+
+  // Per-field totals collected while collectDocsFileBytes is set, keyed by
+  // field name (ranged merge writers have none and report under "").
+  static std::unordered_map<std::string, DocsFileBytes> docsFileBytesByField() {
+    std::lock_guard lock(docsFileBytesMutex());
+    return docsFileBytesTotals();
+  }
+
+  static void clearDocsFileBytes() {
+    std::lock_guard lock(docsFileBytesMutex());
+    docsFileBytesTotals().clear();
+  }
 
   static std::string separatorKey(std::string_view previous, std::string_view first) {
     uint32_t minLen = (uint32_t) std::min(previous.size(), first.size());
@@ -931,8 +981,28 @@ private:
   std::vector<char> termImpactRun;  // per-term encoded frontiers for the current term block
   static inline bool disableL0CheckpointWrite =
       std::getenv("LUXIR_DISABLE_L0_CHECKPOINT_WRITE") != nullptr;
+  DocsFileBytes docsFileBytes;  // this term run's tally, see DocsFileBytes
 
 private:  // some internal utility methods... not for use by indexers
+  static std::mutex& docsFileBytesMutex() {
+    static std::mutex mutex;
+    return mutex;
+  }
+
+  static std::unordered_map<std::string, DocsFileBytes>& docsFileBytesTotals() {
+    static std::unordered_map<std::string, DocsFileBytes> totals;
+    return totals;
+  }
+
+  static uint64_t vintBytes(uint64_t val) {
+    uint64_t bytes = 1;
+    while (val > 0x7f) {
+      val >>= 7;
+      bytes++;
+    }
+    return bytes;
+  }
+
   void anchorPositionedDocBlock() {
     if (hasPositions && docs.empty()) {
       pendingBlockPosByteOff = posOutput.size();
@@ -1222,8 +1292,10 @@ private:  // some internal utility methods... not for use by indexers
     assert(pendingBlockPosByteOff >= locOfPositionsForTerm);
     uint64_t posByteOff = hasPositions
         ? (uint64_t) (pendingBlockPosByteOff - locOfPositionsForTerm) : 0;
+    size_t headerStart = group_output.size();
     appendL0Header(group_output, lastDoc, base, blockByteLen, docCount, tfSum, maxTf, minNorm,
                    posByteOff);
+    docsFileBytes.l0Headers += group_output.size() - headerStart;
     appendBytes(group_output, compressed_output.data(), blockByteLen);
     l1GroupLastDoc = lastDoc;
     l1GroupBlockCount++;
@@ -1302,6 +1374,7 @@ private:  // some internal utility methods... not for use by indexers
     docOutput.writeVint((uint32_t) header_output.size());
     docOutput.write(header_output.data(), header_output.size());
     docOutput.write(group_output.data(), group_output.size());
+    docsFileBytes.l1Headers += vintBytes(header_output.size()) + header_output.size();
 
     prevL1GroupLast = l1GroupLastDoc;
     group_output.resize(0);
@@ -1368,6 +1441,7 @@ public:
     posLoc = posOutput.size();
     numTerms = 0;
     segFlags = 0;
+    docsFileBytes = {};
     dropIdFilter();
     if (fieldType == FieldType::ID && rowSpace == SpaceOrdinal::ROOT) {
       // Ranges of a partitioned merge would each see part of the keys.
@@ -1482,14 +1556,24 @@ public:
       blockByteLen = 1 + numWords * 8;
     }
 
+    docsFileBytes.fullDocs += blockByteLen;
+
     //
-    // now the term freqs (omitted entirely for DOCS-only fields)
+    // now the term freqs (omitted entirely for DOCS-only fields), stored as
+    // tf - 1 so that a block of all-1 tfs packs to zero bits; readers restore
+    // them with LuxirPFOR::decodeBlockPlusOne
     //
     if (hasFreqs) {
+      uint32_t tfMinusOne[Postings::DOCS_BLOCK_SIZE];
+      for (size_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+        assert(tfreqs[i] >= 1);
+        tfMinusOne[i] = (uint32_t) tfreqs[i] - 1;
+      }
       uint32_t compressedSize = (uint32_t) compressed_output.size() - blockByteLen; // this gets changed to the actual size
-      IndexCodec::tfreqCodec.encodeBlock(reinterpret_cast<uint32_t *>(tfreqs.data()), tfreqs.size(), compressed_output.data() + blockByteLen,
+      IndexCodec::tfreqCodec.encodeBlock(tfMinusOne, Postings::DOCS_BLOCK_SIZE, compressed_output.data() + blockByteLen,
                                       compressedSize);
       blockByteLen += compressedSize;
+      docsFileBytes.fullFreqs += compressedSize;
     }
 
     appendL0Block(lastDoc, base, blockByteLen, Postings::DOCS_BLOCK_SIZE, tfSum, maxTf, minNorm);
@@ -1531,15 +1615,18 @@ public:
   //       The first term is stored whole.  Terms 1..n-1 are front-coded below.
   //     [docsLocDelta: vlong]
   //       Offset of this block's docs region from the run's docs start.
-  //     [posLocDelta: vlong]
+  //     [posLocDelta: vlong, only when the field indexes positions]
   //       Offset of this block's positions region from the run's positions start.
   //     [blockPrefixLen: u8]
   //       lcp(first term, last term).  These bytes are factored out of every
   //       in-block suffix and restored from the previous materialized term.
-  //     [pulsedMask: u32 little-endian]
-  //       Bit i is set when term i is pulsed, meaning its single doc, and
-  //       optional position, are stored in the pulsed metadata run instead of
-  //       occupying bytes in the docs stream.
+  //     [pulsedMaskCode: u8][pulsedMask: u32 little-endian, code 2 only]
+  //       Bit i of the mask is set when term i is pulsed (Postings::pulses):
+  //       its single doc, and its position when it has only one, are stored
+  //       in the pulsed metadata run instead of occupying bytes in the docs
+  //       stream.  Code 0 (PULSED_MASK_NONE): no term is pulsed.  Code 1
+  //       (PULSED_MASK_ALL): every term in the block is pulsed, the common
+  //       ID-field block.  Code 2 (PULSED_MASK_EXPLICIT): the mask follows.
   //     [suffixBytesTotal: vint]
   //       Total bytes in the dense suffix blob.  This lets the reader find the
   //       metadata section on block entry without summing suffix lengths.
@@ -1575,7 +1662,7 @@ public:
   //       term in the block is pulsed.
   //     [packedBlocks: StreamVByte run]
   //       Number of full doc blocks encoded with DOC_BLOCK_PACKED for every
-  //       term in the block.  Pulsed terms and StreamVByte tail blocks are 0.
+  //       term in the block.  Pulsed terms and tail blocks are 0.
   //       Default: every value is 0.
   //     [df: StreamVByte run]
   //       docFreq for every term in the block.
@@ -1585,8 +1672,9 @@ public:
   //       Default: every value is 0.
   //     [posOff: delta vlong run, only when the field indexes positions]
   //       Position-stream start offsets within this block's positions region.
-  //       Pulsed terms repeat the running value; readers ignore the offset for
-  //       pulsed terms.
+  //       Readers ignore the offset of a pulsed term whose single position
+  //       is inlined; a pulsed term with ttf > 1 keeps its positions in the
+  //       positions stream like any other term.
   //       Default: every delta is 0, so every offset is 0.
   //     [termImpact: frontier run, only when the field indexes freqs+norms]
   //       Per term, the whole-term (norm, maxTf) Pareto frontier as
@@ -1594,9 +1682,10 @@ public:
   //       scorer's global max score.  Never default-coded.
   //     [pulsed: StreamVByte run]
   //       Values for pulsed terms only, in term order.  Each pulsed term stores
-  //       doc, and also pos when positions are indexed.  The value index for
-  //       term i is popcount(pulsedMask below bit i), scaled by the per-term
-  //       value count.
+  //       its doc, and also a pos slot when positions are indexed: the
+  //       position delta when ttf == 1, else 0 (its positions are in the
+  //       positions stream).  The value index for term i is
+  //       popcount(pulsedMask below bit i), scaled by the per-term value count.
   //
   // The layout is column-stride on purpose.  Term scans, seekCeil, fuzzy
   // enumeration, and most miss paths need only hashes, lengths, and suffix
@@ -1681,9 +1770,18 @@ public:
     // locate metadata lazily without summing suffixLens on miss-only visits.
     termOutput.writePackedTerm(reference);
     termOutput.writeVlong(locOfDocsForTermBlock - docsLoc - run.docsStart);
-    termOutput.writeVlong(locOfPositionsForTermBlock - posLoc - run.positionsStart);
+    if (hasPositions) {
+      termOutput.writeVlong(locOfPositionsForTermBlock - posLoc - run.positionsStart);
+    }
     termOutput.write((char) blockPrefixLen);
-    termOutput.write(&termPulsedMask, sizeof(termPulsedMask));
+    if (termPulsedMask == 0) {
+      termOutput.write((char) Postings::PULSED_MASK_NONE);
+    } else if (termPulsedMask == termMaskForCount(nTerms)) {
+      termOutput.write((char) Postings::PULSED_MASK_ALL);
+    } else {
+      termOutput.write((char) Postings::PULSED_MASK_EXPLICIT);
+      termOutput.write(&termPulsedMask, sizeof(termPulsedMask));
+    }
     termOutput.writeVint((uint32_t) suffixBlob.size());
 
     // now write hashes of the terms; an id filter takes the whole hash
@@ -1820,64 +1918,59 @@ public:
     }
     // Only terms that reach the dictionary can stand in for long values.
     if (PackedTerm::mayBeFitted(std::string_view(termList.back()))) segFlags = FieldSegmentFlags::MAY_HAVE_FITTED;
-    if (totalTermFreq == 1) {
+    // A single-doc term is pulsed: its doc (and its position when it has only
+    // one) live in the term dictionary, so it writes nothing to the docs
+    // stream.  Its tf is the ttf the dictionary stores anyway.  Every other
+    // term writes its unblocked position deltas to the positions stream.
+    bool pulse = Postings::pulses(docfreq);
+    bool inlinePosition = pulse && hasPositions && totalTermFreq == 1;
+    if (hasPositions && !inlinePosition) {
+      // TODO: possibly block encode positions across terms?  For that we would want ttf encoded in the terms dict (or could also store sum of all prev in docs file)
+      //       Downside to this is that it could hurt block compression to mix terms (small + big deltas mixed)
+      for (auto posDelta : posdeltas) {
+        // TODO: try group varint
+        posOutput.writeVint(posDelta);
+      }
+    }
+
+    if (pulse) {
       assert(getDocFileSize()==0 && docs.size()==1 && tfreqs.size()==1);
-      assert(posdeltas.size() == (hasPositions ? 1u : 0u));
+      assert(!inlinePosition || posdeltas.size() == 1);
       int32_t blockTermOrd = (int32_t) termList.size() - 1;
       assert(blockTermOrd >= 0 && blockTermOrd < Postings::TERMS_BLOCK_SIZE);
       termPulsedMask |= 1u << (uint32_t) blockTermOrd;
-      sumDocFreq += 1;
+      docsFileBytes.pulsedTerms++;
       if (hasFreqs && hasNorms) {
-        // single-doc term: exact one-point frontier from its norm
+        // single-doc term: exact one-point frontier from its norm and tf
         termSurface.clear();
-        termSurface.raise(normForDoc(docs[0]), 1);
-        appendImpactFrontier(termImpactRun, termSurface);
+        termSurface.raise(normForDoc(docs[0]), (uint32_t) totalTermFreq);
       }
-      termPackedBlocks.push_back(0);
-      termDocFreqs.push_back(1);
-      termTtfCodes.push_back(0);
-      termDocsEnd.push_back((uint64_t) (docOutput.size() - locOfDocsForTermBlock));
-      if (hasPositions) {
-        termPosOffsets.push_back((uint64_t) (posOutput.size() - locOfPositionsForTermBlock));
-      }
-      // the doc (+ position, if indexed) will be remembered to be included directly in the term dictionary (i.e. pulsing)
+      // The doc, plus a position slot when positions are indexed, goes in
+      // the pulsed run: the position delta when it is the only one, else 0
+      // (the positions are in the positions stream).
       pulsed.push_back((uint32_t) docs[0]);
       if (hasPositions) {
-        pulsed.push_back((uint32_t) posdeltas.back());
-        posdeltas.pop_back();
+        pulsed.push_back(inlinePosition ? (uint32_t) posdeltas.back() : 0u);
       }
-
       docsFlushed += docs.size();
       docs.resize(0);
       tfreqs.resize(0);
-
     } else {
-      // Finish positions that were not block encoded (only when positions are indexed)
-      // TODO: possibly block encode positions across terms?  For that we would want ttf encoded in the terms dict (or could also store sum of all prev in docs file)
-      //       Downside to this is that it could hurt block compression to mix terms (small + big deltas mixed)
-      if (hasPositions) {
-        for (auto posDelta : posdeltas) {
-          // TODO: try group varint
-          posOutput.writeVint(posDelta);
-        }
-      }
-      posdeltas.resize(0);
-
       // Finish docs (and, for fields that index them, term freqs) that were not block encoded.
-      // StreamVByte tail layout (see DocsEnumImpl::nextDoc):
-      //   [docKeys][docData] followed, for fields with freqs, by [tfreqKeys][tfreqData].
-      // Docs are d1 encoded; freqs are plain StreamVByte values.
-      // TODO: when ttf==docfreq (all tf==1) the freq stream is constant 1 and can be dropped for
-      //   scoring fields too (plan A); needs the freq blocks deferred/separated since flushDocs is eager.
+      // The tail block follows its own L0 header in the term's last L1 group,
+      // except for a term with no full block, which writes the tail body alone.
+      // The tail is a PackedTail block (see luxir/codec/PackedTail.h): one
+      // widths byte, then the docs as gap - 1 and, for fields with freqs, the
+      // tfs as tf - 1, tightly bit-packed.  A tail whose tfs are all 1 stores
+      // no tf bits.
       assert(docs.size() == tfreqs.size());
       const uint32_t n = (uint32_t) docs.size();
       if (n > 0) {
-        const uint32_t kb = svbKeyBytes(n);
-        uint8_t dkeys[Postings::DOCS_BLOCK_SIZE / 4 + 1];
-        uint8_t ddata[Postings::DOCS_BLOCK_SIZE * 4];
-        // d1 base: continue the cross-block delta from the last full block (0 when
-        // the term is a single partial block), matching the docs codec convention.
+        assert(n <= PackedTail::MAX_VALUES);
+        // Gap base: the last doc of the last full block, or -1 for a term
+        // without one, so its first doc (which may be 0) is coded as is.
         const uint32_t base = prevDocBlockLast;
+        const uint32_t prevDoc = docsFlushed == 0 ? UINT32_MAX : base;
         const uint32_t lastDoc = (uint32_t) docs.back();
         uint64_t tfSum = 0;
         uint32_t maxTf = 0;
@@ -1889,50 +1982,56 @@ public:
             maxTf = std::max(maxTf, (uint32_t) tf);
           }
         }
-        uint32_t minNorm = buildImpactFrontier(n);
-        uint8_t* ddEnd = svb_encode_scalar_d1_init((const uint32_t*) docs.data(), dkeys, ddata, n, base);
-        compressed_output.resize(0);
-        appendBytes(compressed_output, dkeys, kb);
-        appendBytes(compressed_output, ddata, (size_t)(ddEnd - ddata));
-        if (hasFreqs) {
-          uint8_t tkeys[Postings::DOCS_BLOCK_SIZE / 4 + 1];
-          uint8_t tdata[Postings::DOCS_BLOCK_SIZE * 4];
-          uint8_t* tdEnd = svb_encode_scalar((const uint32_t*) tfreqs.data(), tkeys, tdata, n);
-          appendBytes(compressed_output, tkeys, kb);
-          appendBytes(compressed_output, tdata, (size_t)(tdEnd - tdata));
+        [[maybe_unused]] uint32_t minNorm = buildImpactFrontier(n);
+        compressed_output.resize(PackedTail::MAX_BYTES);
+        uint32_t tailBytes = PackedTail::encode(docs.data(), hasFreqs ? tfreqs.data() : nullptr,
+                                                n, prevDoc, (uint8_t*) compressed_output.data());
+        compressed_output.resize(tailBytes);
+        // The tf bits share the stream's last doc byte; count whole tf bytes.
+        uint32_t tfBytes = n * PackedTail::readHeader((const uint8_t*) compressed_output.data()).tfBits / 8;
+        docsFileBytes.tailDocs += tailBytes - tfBytes;
+        docsFileBytes.tailFreqs += tfBytes;
+        if (docsFlushed == 0) {
+          // A term without a full block writes its tail body alone: no L1
+          // or L0 header.  Every header field is derivable from the term
+          // dictionary (the body length from docsEnd, the tf sum from ttf,
+          // the positions offset is 0, the impacts are the term frontier),
+          // and with a single block there is nothing to skip to.
+          docOutput.write(compressed_output.data(), compressed_output.size());
+        } else {
+          appendL0Block(lastDoc, base, compressed_output.size(), n, tfSum, maxTf, minNorm);
         }
-        appendL0Block(lastDoc, base, compressed_output.size(), n, tfSum, maxTf, minNorm);
         prevDocBlockLast = lastDoc;
       }
       docsFlushed += docs.size();
       docs.resize(0);
       tfreqs.resize(0);
       flushL1Group();
-
-
-      sumDocFreq += docfreq;  // docfreq computed at the top of endTerm
-
-      uint64_t ttfCode = 0;
-      if (hasFreqs) {
-        ttfCode = (uint64_t) (totalTermFreq - docfreq);
+      if (docfreq < Postings::DOCS_BLOCK_SIZE) {
+        docsFileBytes.tailOnlyTerms++;
+      } else {
+        docsFileBytes.blockTerms++;
       }
-      uint64_t posOffset = 0;
-      if (hasPositions) {
-        // offset from start of positions in term dict block
-        posOffset = (uint64_t) (locOfPositionsForTerm - locOfPositionsForTermBlock);
-      }
-
-      termDocFreqs.push_back((uint32_t) docfreq);
-      termTtfCodes.push_back(ttfCode);
-      if (hasPositions) {
-        termPosOffsets.push_back(posOffset);
-      }
-      if (hasFreqs && hasNorms) {
-        appendImpactFrontier(termImpactRun, termSurface);
-      }
-      termPackedBlocks.push_back(termPackedBlockCount);
-      termDocsEnd.push_back((uint64_t) (docOutput.size() - locOfDocsForTermBlock));
     }
+    posdeltas.resize(0);
+
+    sumDocFreq += docfreq;  // docfreq computed at the top of endTerm
+    uint64_t ttfCode = 0;
+    if (hasFreqs) {
+      ttfCode = (uint64_t) (totalTermFreq - docfreq);
+    }
+    termDocFreqs.push_back((uint32_t) docfreq);
+    termTtfCodes.push_back(ttfCode);
+    if (hasPositions) {
+      // offset from start of positions in term dict block.  Readers ignore it
+      // for a pulsed term whose only position is inlined.
+      termPosOffsets.push_back((uint64_t) (locOfPositionsForTerm - locOfPositionsForTermBlock));
+    }
+    if (hasFreqs && hasNorms) {
+      appendImpactFrontier(termImpactRun, termSurface);
+    }
+    termPackedBlocks.push_back(termPackedBlockCount);
+    termDocsEnd.push_back((uint64_t) (docOutput.size() - locOfDocsForTermBlock));
 
     if (termList.size() == Postings::TERMS_BLOCK_SIZE) {
       flushTerms(false);
@@ -1959,6 +2058,12 @@ public:
     result.nBlocks = (int32_t) result.termBlockOffsets.size();
     result.segFlags = segFlags;
     assert((result.nTerms == 0) == (result.nBlocks == 0));
+    assert(docsFileBytes.total() == result.docsBytes);
+    if (collectDocsFileBytes.load(std::memory_order_relaxed)) {
+      std::lock_guard lock(docsFileBytesMutex());
+      docsFileBytesTotals()[std::string((std::string_view) name)] += docsFileBytes;
+    }
+    docsFileBytes = {};
     return result;
   }
 

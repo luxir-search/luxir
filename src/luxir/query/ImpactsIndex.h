@@ -117,7 +117,9 @@ private:
           groupLastDocs[idx] = header.lastDoc;
           groupBaseLastDocs[idx] = header.baseLastDoc;
           groupBodyOffs[idx] = header.bodyOffset;
-          groupUpper[idx] = scoreFrontier(header);
+          // The term frontier bounds every group; it is tighter than the
+          // corner bound of a headerless term's synthesized group.
+          groupUpper[idx] = std::min(scoreFrontier(header), globalMax);
           groupMaxTfs[idx] = header.spanMaxTf;
           groupMinNorms[idx] = header.spanMinNorm;
           chunks[idx] = nullptr;

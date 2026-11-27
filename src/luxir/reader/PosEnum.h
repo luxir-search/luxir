@@ -110,7 +110,9 @@ public:
     assert(!docsEnum.positionBatchActive);
     docsEnum.enablePositionTracking();
 
-    if (docsEnum.docsSize == 0) {
+    if (docsEnum.docsSize == 0 && docsEnum.ttf == 1) {
+      // A pulsed single-occurrence term inlines its position in the term
+      // dictionary; any other pulsed term reads the positions stream.
       posBuf[0] = docsEnum.pulsedPosition;
       posBufEnd = posBufLimit = 1;
     } else {
