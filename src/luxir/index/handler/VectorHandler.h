@@ -79,6 +79,9 @@ protected:
     column.vectorEncoding = (uint8_t)encoding;
   }
 
+  // Flat kNN scans read the values by range on lazy storage.
+  bool valuesFileApart() const override { return true; }
+
 public:
   void index(Inverter& inverter, const IndexVal& val) override {
     pendingDims_ = 0;  // dims learned by a previous (possibly failed) value don't carry over

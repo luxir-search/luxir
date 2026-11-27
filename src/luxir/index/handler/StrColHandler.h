@@ -171,6 +171,12 @@ protected:
     unused(column);
   }
 
+  /// Whether a large streamed value column keeps its segment file to itself
+  /// (PostingsWriter::getColumnOutputStream): queries read it by range from
+  /// lazy storage, and sharing a file with structures read whole would fetch
+  /// the column with them.
+  virtual bool valuesFileApart() const { return false; }
+
 private:
   void addValue(Inverter& inverter, std::string_view val) {
     int32_t valSize = (int32_t)val.size();
@@ -186,7 +192,8 @@ private:
       return bufferedValuesOut;
     }
     if (!streamedValuesOut) {
-      streamedValuesOut = inverter.getPostingsWriter().getOutputStream();
+      auto& writer = inverter.getPostingsWriter();
+      streamedValuesOut = valuesFileApart() ? writer.getColumnOutputStream() : writer.getOutputStream();
     }
     return *streamedValuesOut;
   }

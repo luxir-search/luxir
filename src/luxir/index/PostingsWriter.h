@@ -84,6 +84,7 @@ private:
     OutputStream out;
     uint32_t fileNum;
     bool available = false;
+    bool apart = false;  // holds a large column; no other stream shares it
 
     DataFile(Directory& dir, std::string_view segStr, uint32_t fileNum)
         : fileNum(fileNum) {
@@ -211,13 +212,16 @@ private:
   // Hands out the shortest spill file no stream is writing; a new file is created only
   // when every existing one is checked out, so a segment has at most as many spill
   // files as streams that spilled at the same time.
-  DataFile& claimSpillFile(size_t bytes) {
+  // A stream that keeps a column apart always gets a file of its own, and its file
+  // is never handed to another stream: a reader of the other structures takes whole
+  // files, which on lazy storage would fetch the column with them.
+  DataFile& claimSpillFile(size_t bytes, bool apart = false) {
     uint32_t number;
     {
       const std::lock_guard lock(spillMutex);
       DataFile* shortest = nullptr;
       for (const auto& file : spillFiles) {
-        if (file && file->available && fits(alignedTail(file->out), bytes)
+        if (!apart && file && file->available && !file->apart && fits(alignedTail(file->out), bytes)
             && (!shortest || file->out.size() < shortest->out.size())) {
           shortest = file.get();
         }
@@ -234,6 +238,7 @@ private:
     }
 
     auto file = std::make_unique<DataFile>(directory, segStr, number);
+    file->apart = apart;
     const std::lock_guard lock(spillMutex);
     return *(spillFiles[number - 1] = std::move(file));
   }
@@ -245,6 +250,7 @@ private:
     DataFile* spillFile = nullptr;
     seg_location base;
     size_t chargedBytes = 0;
+    bool apart = false;
 
     void accountCapacity(size_t bytes) noexcept {
       if (writer.onStagedRamDelta && bytes != chargedBytes) {
@@ -257,7 +263,7 @@ private:
       RAMFile::flushBuffer(out, 0);
       checkSliceSize(size(), additionalBytes);
       auto bytes = size() + additionalBytes;
-      spillFile = &writer.claimSpillFile(bytes);
+      spillFile = &writer.claimSpillFile(bytes, apart);
       base = beginSlice(*spillFile, bytes);
       if (size() != 0) spillFile->out.appendFile(*this);
       else clear();
@@ -426,6 +432,17 @@ public:
 
   OutputStreamPtr getOutputStream() {
     return OutputStreamPtr(*this);
+  }
+
+  // A stream for a column that queries read by range from lazy storage (vector
+  // values). Like any stream it stages in RAM and spills past RAM_SPILL_BYTES,
+  // but a spill goes to a new file that no other stream ever shares, so a reader
+  // of another structure never takes the column with its file. Smaller columns
+  // are unchanged.
+  OutputStreamPtr getColumnOutputStream() {
+    OutputStreamPtr stream(*this);
+    stream.stream->apart = true;
+    return stream;
   }
 
   template <std::size_t N>

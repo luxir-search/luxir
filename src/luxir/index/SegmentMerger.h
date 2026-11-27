@@ -2227,8 +2227,14 @@ private:
     assert(!(flags & FieldType::INDEX_DOCS));
     bool multiValued = (flags & FieldType::MULTI_VALUED) != 0;
 
-    // Output stream for the concatenated value bytes.
-    OutputStreamPtr valuesOut = postingsWriter.getOutputStream();
+    // Output stream for the concatenated value bytes. A large vector column
+    // keeps its file to itself, as at indexing (StrColHandler::valuesFileApart).
+    OutputStreamPtr valuesOut;
+    if (vectors != nullptr) {
+      valuesOut = postingsWriter.getColumnOutputStream();
+    } else {
+      valuesOut = postingsWriter.getOutputStream();
+    }
 
     PresenceWriter docsWriter(pool, postingsWriter, space.ordinal);
 
