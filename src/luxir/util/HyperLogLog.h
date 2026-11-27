@@ -9,8 +9,11 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory_resource>
+#include <optional>
+#include <string_view>
 #include <vector>
 
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -106,6 +109,89 @@ public:
     constexpr double ALPHA_INF = 0.721347520444481703680;
     double estimate = ALPHA_INF * m * m / z;
     return (int64_t)std::llround(estimate);
+  }
+
+  // Serialized state (cardinality_state), little-endian, no padding:
+  //   u8 version (1), u8 kind (2: exact hashes, 3: registers),
+  //   u8 precision p, u32 threshold, then
+  //   kind 2: u32 n, n x u64 hash in ascending order;
+  //   kind 3: 2^p x u8 register.
+  // Two states merge only when their thresholds (hence precisions) match.
+  static constexpr uint8_t STATE_VERSION = 1;
+  static constexpr uint8_t STATE_KIND_EXACT = 2;
+  static constexpr uint8_t STATE_KIND_DENSE = 3;
+  static constexpr size_t STATE_HEADER_BYTES = 7;
+
+  // Bytes is a contiguous byte container such as std::string.
+  template <class Bytes>
+  void writeState(Bytes& out) const {
+    static_assert(std::endian::native == std::endian::little);
+    size_t start = out.size();
+    size_t body = dense() ? registers.size() : sizeof(uint32_t) + exact.size() * sizeof(uint64_t);
+    out.resize(start + STATE_HEADER_BYTES + body);
+    char* p = out.data() + start;
+    *p++ = (char)STATE_VERSION;
+    *p++ = (char)(dense() ? STATE_KIND_DENSE : STATE_KIND_EXACT);
+    *p++ = (char)precision;
+    uint32_t limit = (uint32_t)threshold;
+    std::memcpy(p, &limit, sizeof limit);
+    p += sizeof limit;
+    if (dense()) {
+      std::memcpy(p, registers.data(), registers.size());
+      return;
+    }
+    uint32_t n = (uint32_t)exact.size();
+    std::memcpy(p, &n, sizeof n);
+    p += sizeof n;
+    // Ascending order keeps the bytes independent of the set's iteration order.
+    std::pmr::vector<uint64_t> hashes(exact.begin(), exact.end(), exact.get_allocator().resource());
+    std::sort(hashes.begin(), hashes.end());
+    if (n != 0) std::memcpy(p, hashes.data(), n * sizeof(uint64_t));
+  }
+
+  // Parses writeState output. Returns nullopt on a malformed state.
+  static std::optional<HyperLogLog> readState(
+      std::string_view bytes,
+      std::pmr::memory_resource* resource = std::pmr::get_default_resource()) {
+    static_assert(std::endian::native == std::endian::little);
+    if (bytes.size() < STATE_HEADER_BYTES) return std::nullopt;
+    const char* p = bytes.data();
+    uint8_t kind = (uint8_t)p[1];
+    int p0 = (uint8_t)p[2];
+    uint32_t limit;
+    std::memcpy(&limit, p + 3, sizeof limit);
+    if ((uint8_t)p[0] != STATE_VERSION || (kind != STATE_KIND_EXACT && kind != STATE_KIND_DENSE)
+        || limit > MAX_PRECISION_THRESHOLD || p0 != precisionForThreshold(limit)) {
+      return std::nullopt;
+    }
+    HyperLogLog sketch(limit, resource);
+    p += STATE_HEADER_BYTES;
+    size_t rest = bytes.size() - STATE_HEADER_BYTES;
+    if (kind == STATE_KIND_DENSE) {
+      if (rest != (size_t)1 << sketch.precision) return std::nullopt;
+      sketch.registers.assign((const uint8_t*)p, (const uint8_t*)p + rest);
+      for (uint8_t rank : sketch.registers) {
+        if (rank > 64 - sketch.precision + 1) return std::nullopt;
+      }
+      // An all-zero register file would read as empty dense state.
+      if (std::ranges::all_of(sketch.registers, [](uint8_t rank) { return rank == 0; })) {
+        return std::nullopt;
+      }
+      return sketch;
+    }
+    uint32_t n;
+    if (rest < sizeof n) return std::nullopt;
+    std::memcpy(&n, p, sizeof n);
+    p += sizeof n;
+    if (rest != sizeof n + (size_t)n * sizeof(uint64_t) || n > limit) return std::nullopt;
+    for (uint32_t i = 0; i < n; i++) {
+      uint64_t hash;
+      std::memcpy(&hash, p, sizeof hash);
+      p += sizeof hash;
+      sketch.exact.insert(hash);
+    }
+    if (sketch.exact.size() != n) return std::nullopt;
+    return sketch;
   }
 
 private:

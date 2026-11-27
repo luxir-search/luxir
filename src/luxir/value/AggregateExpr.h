@@ -24,6 +24,9 @@ namespace luxir {
 enum class BucketValueType : uint8_t {
   INT128,
   DOUBLE,
+  // Serialized aggregate state (percentile_state, cardinality_state). Only
+  // valid as a whole expression: bucket functions take no bytes.
+  BYTES,
 };
 
 enum class AggregateFailure : uint8_t {
@@ -46,6 +49,9 @@ struct BucketScalar {
   bool valid = false;
   __int128 intValue = 0;
   double doubleValue = 0.0;
+  // BYTES: borrowed from the aggregate state; valid until the state changes
+  // or is destroyed.
+  std::string_view bytes;
 
   static BucketScalar missing(BucketValueType type, ValueNature nature) {
     BucketScalar value;
@@ -79,6 +85,14 @@ struct BucketScalar {
     value.nature = nature;
     return value;
   }
+
+  static BucketScalar serialized(std::string_view state) {
+    BucketScalar value;
+    value.type = BucketValueType::BYTES;
+    value.valid = true;
+    value.bytes = state;
+    return value;
+  }
 };
 
 struct AggregateConstant {
@@ -94,6 +108,16 @@ inline BucketScalar integerAggregateOutput(BucketScalar value) {
   }
   return value;
 }
+
+// The term dictionary behind a string column producer's global ordinals,
+// bound per request with the ordinal maps. A finish that must emit state
+// independent of this reader (cardinality_state) resolves ordinals to terms
+// through it.
+struct AggregateOrdinalSource {
+  IndexReader* reader = nullptr;
+  OrdMap* ords = nullptr;
+  std::string_view field;
+};
 
 struct AggregateStateOps {
   using Init = void (*)(void* state,
@@ -120,6 +144,10 @@ struct AggregateStateOps {
                          std::span<const AggregateConstant> arguments);
   using Finish = BucketScalar (*)(
       const void* state, std::span<const AggregateConstant> arguments);
+  // Replaces finish when set, for states that hold reader-local ordinals.
+  using FinishOrdinals = BucketScalar (*)(
+      const void* state, std::span<const AggregateConstant> arguments,
+      const AggregateOrdinalSource& source);
   // accumulateRawPoint(states + keys[i] * stride, raw[i]) for every i: one
   // call folds a batch whose values belong to different keyed states.
   using AccumulateKeyedRawBatch = void (*)(
@@ -141,6 +169,7 @@ struct AggregateStateOps {
   bool replayCapable = true;
   bool orderSensitive = false;
   AccumulateOrdBatch accumulateOrdBatch = nullptr;
+  FinishOrdinals finishOrdinals = nullptr;
 };
 
 // Optional packed state for a bare, single-valued column that is present on
@@ -181,8 +210,11 @@ struct AggregateProducer {
   ResolvedAggregate resolved;
   std::span<const AggregateConstant> arguments;
   uint32_t stateOffset = 0;
+  // Bound by bindAggregateOrdinals for a string column input.
+  AggregateOrdinalSource ordinalSource{};
 
   bool sameState(const AggregateProducer& other) const;
+  BucketScalar finish(const void* state, std::span<const AggregateConstant> leafArguments) const;
 };
 
 struct AggregateLeaf {
@@ -319,6 +351,9 @@ public:
 };
 
 void writeAggregateValue(api::Val& target, const BucketScalar& value);
+// As above; BYTES values are copied into mr.
+void writeAggregateValue(api::Val& target, const BucketScalar& value,
+                         std::pmr::memory_resource& mr);
 struct BoundAggregateInput {
   BoundValueProgram* values = nullptr;
   const AggregateProducer* producer = nullptr;
@@ -424,7 +459,7 @@ std::span<AggregateFieldInfos> resolveAggregateFields(
     const AggregateProgram& program, MemPool& pool, IndexReader& reader);
 
 // Bind the runtime ordinal maps for the producers that read string columns.
-void bindAggregateOrdinals(const AggregateProgram& program, IndexReader& reader,
+void bindAggregateOrdinals(AggregateProgram& program, IndexReader& reader,
     std::span<AggregateFieldInfos> fields);
 
 std::vector<BoundAggregateInput> bindAggregateInputs(

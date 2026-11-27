@@ -275,7 +275,7 @@ void MetricGroupData::renderRanks(std::span<const api::ArrVal> ranks, std::span<
         auto value = static_cast<ExprStatsOp::InlineCalc*>(impl->calcs[i])->finalizedValue(
             impl->selected[order[r].slot].metricSlot);
         metric.warnFailure(value, flags);
-        ExprStatsOp::writeOutputValue(const_cast<api::Val&>(ranks[r].v[i]), value, output);
+        ExprStatsOp::writeOutputValue(const_cast<api::Val&>(ranks[r].v[i]), value, output, mr);
       }
     });
   }

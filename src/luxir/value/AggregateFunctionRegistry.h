@@ -23,7 +23,8 @@ struct AggregateFunction {
   uint8_t minArguments = 0;
   uint8_t maxArguments = 0;
   Resolve resolve = nullptr;
-  // Set-valued aggregates flatten arrays and accept ordinal columns.
+  // Value-level aggregates flatten arrays, so every element counts, and may
+  // take ordinal (string) columns; resolve rejects inputs a function cannot use.
   bool acceptsValues = false;
   // Bits name trailing arguments used only by finish, starting at zero.
   uint32_t readoutArguments = 0;

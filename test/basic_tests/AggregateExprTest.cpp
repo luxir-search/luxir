@@ -1165,7 +1165,6 @@ TEST_F(AggregateExprTest, sketchRowsValidateArgumentsCapabilitiesAndEmptyResults
   expectParseError(memory, *schema, "cardinality(x_sc)", "indexed STRING or ID");
   expectParseError(memory, *schema, "cardinality(x_t)", "value expression is not supported on text field");
   expectParseError(memory, *schema, "cardinality(x_i, x_i)", "numeric constants");
-  expectParseError(memory, *schema, "percentile_rank(x_is, 1)", "one scalar per document");
   expectParseError(memory, *schema, "percentile_rank(x_s, 1)", "numeric expression");
   expectParseError(memory, *schema, "percentile_rank(x_i, 1, 2)", "arguments");
   auto* cardinality = parseAggregate(memory, *schema, "cardinality(x_i, 0)");
@@ -1460,7 +1459,6 @@ TEST_F(AggregateExprTest, percentileValidationNatureAndExactInputs) {
   for (std::string_view expr : {"percentile(x_i,50,19)", "percentile(x_i,50,1001)"}) {
     expectParseError(memory, *schema, expr, "in [20, 1000]");
   }
-  expectParseError(memory, *schema, "percentile(x_is,50)", "one scalar per document");
   expectParseError(memory, *schema, "percentile(x_s,50)", "numeric expression");
   expectParseError(memory, *schema, "percentile(x_i)", "arguments");
   expectParseError(memory, *schema, "percentile(x_i, x_i)", "numeric constants");
@@ -3024,4 +3022,163 @@ TEST_F(AggregateExprTest, dateUnitIsPartOfProducerIdentityAndSameUnitTreesAreUnc
       EXPECT_FALSE(differentOutput.sameState(millis->producers[0]));
     }
   }
+}
+
+namespace {
+
+std::string stateBytes(const api::Val& value) {
+  const auto* bytes = std::get_if<::hpp_proto::bytes_view>(&value.kind);
+  if (bytes == nullptr) {
+    ADD_FAILURE() << "expected a serialized state";
+    return {};
+  }
+  return std::string((const char*)bytes->data(), bytes->size());
+}
+
+const api::Val& opValue(const LocalReq& req, std::string_view name) {
+  return *req.responses[0]->proto.ops.at(name);
+}
+
+std::string mergedCardinality(const std::string& left, const std::string& right) {
+  auto merged = HyperLogLog::readState(left);
+  auto other = HyperLogLog::readState(right);
+  EXPECT_TRUE(merged && other);
+  if (!merged || !other) return {};
+  merged->merge(*other);
+  std::string bytes;
+  merged->writeState(bytes);
+  return bytes;
+}
+
+} // namespace
+
+TEST_F(AggregateExprTest, sketchStatesMergeToTheSingleRunResult) {
+  // Two collections with different term dictionaries, and one holding both.
+  CollectionHelper left("sketch_left"), right("sketch_right"), both("sketch_both");
+  std::mt19937_64 random(7);
+  for (int segment = 0; segment < 2; segment++) {
+    std::vector<Doc> leftDocs, rightDocs;
+    for (int i = 0; i < 90; i++) {
+      bool toLeft = random() % 2 == 0;
+      auto doc = flatdoc("id", std::to_string(segment * 1000 + i),
+          "user_s", "u" + std::to_string((toLeft ? 0 : 40) + random() % 120),
+          "n_i", (int64_t)(random() % 150), "x_d", (double)(random() % 1000) / 8.0,
+          "cat_s", i % 3 == 0 ? "a" : "b");
+      (toLeft ? leftDocs : rightDocs).push_back(doc);
+    }
+    left.indexAll(leftDocs, UpdateMessage::COMMIT);
+    right.indexAll(rightDocs, UpdateMessage::COMMIT);
+    both.indexAll(leftDocs, UpdateMessage::COMMIT);
+    both.indexAll(rightDocs, UpdateMessage::COMMIT);
+  }
+  auto run = [](CollectionHelper& helper, std::string_view name) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& root = req->collection(name);
+    root.expr("users", "cardinality_state(user_s)");
+    root.expr("users_dense", "cardinality_state(user_s, 0)");
+    root.expr("numbers", "cardinality_state(n_i)");
+    root.expr("numbers_dense", "cardinality_state(n_i, 0)");
+    root.expr("latency", "percentile_state(x_d)");
+    root.expr("p90", "percentile(x_d, 90)");
+    root.expr("distinct_numbers", "cardinality(n_i, 0)");
+    root.facet("cats", "cat_s").limit(-1).expr("users", "cardinality_state(user_s)")
+        .expr("exact", "cardinality(user_s, 40000)");
+    req->execute(-1);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(0u, req->memoryTracker.bytes());
+    return req;
+  };
+  auto l = run(left, "sketch_left");
+  auto r = run(right, "sketch_right");
+  auto all = run(both, "sketch_both");
+  auto state = [](auto& req, std::string_view op) { return stateBytes(opValue(*req, op)); };
+
+  for (std::string_view op : {"users", "users_dense", "numbers", "numbers_dense"}) {
+    EXPECT_EQ(state(all, op), mergedCardinality(state(l, op), state(r, op))) << op;
+  }
+  auto dense = HyperLogLog::readState(state(all, "numbers_dense"));
+  ASSERT_TRUE(dense && dense->dense());
+  EXPECT_EQ(all->scalar<int64_t>("distinct_numbers"), dense->estimate());
+
+  // Under 500 values the digests are exact, so the merge reproduces percentile().
+  auto digest = TDigest::readState(state(l, "latency"));
+  auto other = TDigest::readState(state(r, "latency"));
+  ASSERT_TRUE(digest && other);
+  EXPECT_TRUE(digest->exact());
+  digest->merge(*other);
+  digest->finish();
+  EXPECT_DOUBLE_EQ(all->scalar<double>("p90"), digest->quantile(0.9));
+  std::string merged;
+  digest->writeState(merged);
+  EXPECT_EQ(state(all, "latency"), merged);
+
+  const auto* facet = opValue(*all, "cats").facetResult();
+  ASSERT_NE(nullptr, facet);
+  const auto& users = std::get<api::ArrVal>(facet->ops.at("users")->kind).v;
+  const auto& exact = std::get<api::ArrVal>(facet->ops.at("exact")->kind).v;
+  ASSERT_EQ(2u, users.size());
+  for (size_t i = 0; i < users.size(); i++) {
+    auto sketch = HyperLogLog::readState(stateBytes(users[i]));
+    ASSERT_TRUE(sketch.has_value());
+    EXPECT_EQ(exact[i].asInt(), sketch->estimate());
+  }
+}
+
+TEST_F(AggregateExprTest, sketchAggregatesTakeEveryValueOfMultiValuedInputs) {
+  CollectionHelper helper;
+  helper.indexAll({
+      flatdoc("id", "a", "n_is", vec_i(1, 2, 3), "x_ds", std::vector<double>{0.5, 4.5}),
+      flatdoc("id", "b", "n_is", vec_i(10)),
+      flatdoc("id", "c")}, UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  root.expr("median", "percentile(n_is, 50)");
+  root.expr("rank", "percentile_rank(n_is, 2)");
+  root.expr("doubles", "percentile(x_ds, 100)");
+  root.expr("computed", "percentile(n_is * 2, 0)");
+  root.expr("state", "percentile_state(n_is)");
+  root.expr("empty", "percentile_state(missing_i)");
+  req->execute(-1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  // {1, 2, 3, 10}: the median interpolates between 2 and 3.
+  EXPECT_DOUBLE_EQ(2.5, req->scalar<double>("median"));
+  EXPECT_DOUBLE_EQ(50, req->scalar<double>("rank"));
+  EXPECT_DOUBLE_EQ(4.5, req->scalar<double>("doubles"));
+  EXPECT_DOUBLE_EQ(2, req->scalar<double>("computed"));
+  auto digest = TDigest::readState(stateBytes(opValue(*req, "state")));
+  ASSERT_TRUE(digest.has_value());
+  EXPECT_EQ(4.0, digest->count());
+  EXPECT_TRUE(opValue(*req, "empty").isNull());
+
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  expectParseError(memory, *schema, "percentile(s_s, 50)", "percentile() requires a numeric expression");
+  expectParseError(memory, *schema, "percentile_state(s_s)", "requires a numeric expression");
+  expectParseError(memory, *schema, "cardinality_state(n_i) + 1", "must be the whole expression");
+  expectParseError(memory, *schema, "percentile_state(n_i, 5)", "compression must be finite");
+  expectParseError(memory, *schema, "cardinality_state(n_i, 40001)", "threshold must be an integer");
+}
+
+TEST_F(AggregateExprTest, sketchStatesRejectMalformedBytes) {
+  TDigest digest(20);
+  for (int i = 0; i < 300; i++) digest.add((double)(i % 37));
+  std::string bytes;
+  digest.writeState(bytes);
+  auto read = TDigest::readState(bytes);
+  ASSERT_TRUE(read.has_value());
+  EXPECT_FALSE(read->exact());
+  EXPECT_EQ(digest.count(), read->count());
+  EXPECT_EQ(digest.quantile(0.5), read->quantile(0.5));
+  EXPECT_FALSE(TDigest::readState(bytes.substr(0, bytes.size() - 1)));
+  EXPECT_FALSE(TDigest::readState(std::string_view{}));
+
+  HyperLogLog sketch(10);
+  for (uint64_t i = 0; i < 5; i++) sketch.add(HyperLogLog::mix(i));
+  std::string hll;
+  sketch.writeState(hll);
+  ASSERT_EQ(HyperLogLog::STATE_HEADER_BYTES + 4 + 5 * 8, hll.size());
+  EXPECT_EQ(5, HyperLogLog::readState(hll)->estimate());
+  EXPECT_FALSE(HyperLogLog::readState(hll.substr(0, hll.size() - 8)));
+  hll[2] = 5; // precision that does not match the threshold
+  EXPECT_FALSE(HyperLogLog::readState(hll));
 }

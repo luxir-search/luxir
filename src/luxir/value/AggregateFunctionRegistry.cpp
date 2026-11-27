@@ -17,6 +17,7 @@
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/HyperLogLog.h"
 #include "luxir/util/TDigest.h"
+#include "luxir/value/AggregateSketchState.h"
 
 namespace luxir {
 namespace {
@@ -1148,19 +1149,7 @@ BucketScalar finishOrdinalCardinality(const void* source,
 
 ResolvedAggregate resolveCardinality(
     const ValueNode* input, std::span<AggregateConstant> arguments) {
-  if (input->type == ValueType::COLUMN_ONLY && !input->columnIndexed) {
-    throw std::runtime_error("cardinality() requires an indexed STRING or ID column");
-  }
-  if (!arguments.empty()) {
-    const auto& value = arguments[0];
-    double threshold = value.type == ValueType::INT64
-        ? (double)value.intValue : value.doubleValue;
-    if (!std::isfinite(threshold) || threshold < 0
-        || threshold > HyperLogLog::MAX_PRECISION_THRESHOLD
-        || threshold != std::floor(threshold)) {
-      throw std::runtime_error("cardinality() threshold must be an integer in [0, 40000]");
-    }
-  }
+  validateCardinality(input, arguments, "cardinality");
   AggregateStateOps ops{sizeof(SketchState<HyperLogLog>), initSketch<HyperLogLog>,
       addSketch<HyperLogLog, cardinalityThreshold>,
       valueDouble(input->type) ? addSketchBatch<HyperLogLog, cardinalityThreshold, true>
@@ -1297,6 +1286,7 @@ BucketScalar finishRank(const void* source,
 
 ResolvedAggregate resolveRank(
     const ValueNode* input, std::span<AggregateConstant> arguments) {
+  requireNumericInput(input, "percentile_rank");
   if (arguments[0].type == ValueType::DOUBLE && !std::isfinite(arguments[0].doubleValue)) {
     throw std::runtime_error("percentile_rank() value must be finite");
   }
@@ -1341,6 +1331,7 @@ BucketScalar finishPercentile(const void* source,
 
 ResolvedAggregate resolvePercentile(
     const ValueNode* input, std::span<AggregateConstant> arguments) {
+  requireNumericInput(input, "percentile");
   double percent = constantDouble(arguments[0]);
   if (!std::isfinite(percent) || percent < 0 || percent > 100) {
     throw std::runtime_error("percentile() percent must be finite and in [0, 100]");
@@ -1380,8 +1371,11 @@ constexpr AggregateFunction FUNCTIONS[] = {
     {"min", 1, 1, resolveMin, false, 0, nullptr, NaturePolicy::SAME},
     {"max", 1, 1, resolveMax, false, 0, nullptr, NaturePolicy::SAME},
     {"cardinality", 1, 2, resolveCardinality, true, 0, canonicalCardinalityArgument, NaturePolicy::RAW},
-    {"percentile_rank", 2, 2, resolveRank},
-    {"percentile", 2, 3, resolvePercentile, false, 1, canonicalPercentileArgument, NaturePolicy::DECIMAL},
+    {"percentile_rank", 2, 2, resolveRank, true},
+    {"percentile", 2, 3, resolvePercentile, true, 1, canonicalPercentileArgument, NaturePolicy::DECIMAL},
+    {"cardinality_state", 1, 2, resolveCardinalityState, true, 0, canonicalCardinalityArgument,
+     NaturePolicy::RAW},
+    {"percentile_state", 1, 2, resolvePercentileState, true, 0, canonicalPercentileStateArgument},
 };
 
 } // namespace

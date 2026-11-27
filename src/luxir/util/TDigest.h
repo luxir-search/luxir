@@ -4,13 +4,18 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <iterator>
 #include <limits>
 #include <memory_resource>
 #include <numbers>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace luxir {
@@ -174,6 +179,97 @@ public:
     }
     return interpolate(c[n - 1].mean, max,
                        (index - weightSoFar) / (c[n - 1].weight / 2.0));
+  }
+
+  // Serialized state (percentile_state), little-endian, no padding:
+  //   u8 version (1), u8 kind (1), u8 flags (bit 0: exact),
+  //   f64 compression, f64 min, f64 max, u32 n,
+  //   n x {f64 mean, f64 weight}, ascending by mean.
+  // An exact digest writes its raw values in ascending order, each with
+  // weight 1; readState restores them as raw values, so exact digests stay
+  // exact across a write and read.
+  static constexpr uint8_t STATE_VERSION = 1;
+  static constexpr uint8_t STATE_KIND = 1;
+  static constexpr uint8_t STATE_EXACT = 1;
+  static constexpr size_t STATE_HEADER_BYTES = 31;
+
+  // Calls finish(). Bytes is a contiguous byte container such as std::string.
+  template <class Bytes>
+  void writeState(Bytes& out) {
+    static_assert(std::endian::native == std::endian::little);
+    finish();
+    const bool raw = exact();
+    const size_t n = raw ? buffer.size() : centroids.size();
+    assert(n <= UINT32_MAX);
+    size_t start = out.size();
+    out.resize(start + STATE_HEADER_BYTES + n * 2 * sizeof(double));
+    char* p = out.data() + start;
+    *p++ = (char)STATE_VERSION;
+    *p++ = (char)STATE_KIND;
+    *p++ = (char)(raw ? STATE_EXACT : 0);
+    auto put = [&](auto value) {
+      std::memcpy(p, &value, sizeof value);
+      p += sizeof value;
+    };
+    put(compression);
+    put(min);
+    put(max);
+    put((uint32_t)n);
+    for (size_t i = 0; i < n; i++) {
+      put(raw ? buffer[i] : centroids[i].mean);
+      put(raw ? 1.0 : centroids[i].weight);
+    }
+  }
+
+  // Parses writeState output. Returns nullopt on a malformed state.
+  static std::optional<TDigest> readState(
+      std::string_view bytes,
+      std::pmr::memory_resource* resource = std::pmr::get_default_resource()) {
+    static_assert(std::endian::native == std::endian::little);
+    if (bytes.size() < STATE_HEADER_BYTES) return std::nullopt;
+    const char* p = bytes.data();
+    if ((uint8_t)p[0] != STATE_VERSION || (uint8_t)p[1] != STATE_KIND) return std::nullopt;
+    bool raw = ((uint8_t)p[2] & STATE_EXACT) != 0;
+    p += 3;
+    auto get = [&](auto& value) {
+      std::memcpy(&value, p, sizeof value);
+      p += sizeof value;
+    };
+    double compression, min, max;
+    uint32_t n;
+    get(compression);
+    get(min);
+    get(max);
+    get(n);
+    if (!(compression >= MIN_COMPRESSION && compression <= MAX_COMPRESSION) || n == 0
+        || bytes.size() != STATE_HEADER_BYTES + (size_t)n * 2 * sizeof(double)
+        || !std::isfinite(min) || !std::isfinite(max) || min > max) {
+      return std::nullopt;
+    }
+    TDigest digest(compression, resource);
+    raw = raw && n < digest.bufferLimit();
+    double previous = -std::numeric_limits<double>::infinity();
+    for (uint32_t i = 0; i < n; i++) {
+      Centroid centroid;
+      get(centroid.mean);
+      get(centroid.weight);
+      if (!std::isfinite(centroid.mean) || centroid.mean < previous
+          || !(centroid.weight > 0.0) || !std::isfinite(centroid.weight)) {
+        return std::nullopt;
+      }
+      previous = centroid.mean;
+      if (raw) {
+        if (centroid.weight != 1.0) return std::nullopt;
+        digest.buffer.push_back(centroid.mean);
+      } else {
+        digest.centroids.push_back(centroid);
+        digest.centroidWeight += centroid.weight;
+      }
+    }
+    digest.min = min;
+    digest.max = max;
+    digest.sortedBuffer = true;
+    return digest;
   }
 
 private:
