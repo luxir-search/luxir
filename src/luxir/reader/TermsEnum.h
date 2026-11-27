@@ -158,20 +158,31 @@ public:
       : segmentCore(reader.core()), termData(fieldInfo.terms()), totals(fieldInfo.indexedTotals()),
         flags(fieldInfo.flags), currTerm(pool.alloc(TERM_BUFFER_BYTES), 0) {
     if (!termData) return;
-    auto blockOffsets = fieldInfo.termBlockOffsets();
-    auto trie = field_parts::termTrie(blockOffsets, termData->trieBytes);
+    auto routing = fieldInfo.termNavigation();
     // The blocks are data; the offsets and trie that route to them are
     // metadata and follow the blocks, so the 16 bytes past a hold cover the
     // decoders' over-read.
     termsIS = streamThrough(termData->dictionaryBlocks());
-    auto navigation = segmentCore.slice(
-        {blockOffsets.location, trie.end().offset() - blockOffsets.location.offset()}, ReadClass::METADATA);
+    auto navigation = segmentCore.slice(routing, ReadClass::METADATA);
+    auto offsetsBytes = routing.bytes - termData->trieBytes;
     termBlockOffsets = reinterpret_cast<const field_parts::Terms::BlockOffset*>(navigation.data());
-    numTermBlocks = (int32_t)(blockOffsets.bytes / sizeof(field_parts::Terms::BlockOffset));
-    trieBase = navigation.data() + blockOffsets.bytes;
+    numTermBlocks = (int32_t)(offsetsBytes / sizeof(field_parts::Terms::BlockOffset));
+    trieBase = navigation.data() + offsetsBytes;
     runCount = (int32_t)termData->runs.size();
     runs = termData->runs.data();
     selectRun(runs);
+  }
+
+  // Parts a forward walk can hold, including the streams selected on run changes.
+  static void wholeReadParts(const DecodedFieldRecord& field, auto&& emit) {
+    auto* terms = field.terms();
+    if (!terms) return;
+    emit(field.termNavigation(), ReadClass::METADATA);
+    emit(terms->dictionaryBlocks(), ReadClass::DATA);
+    for (const auto& run : terms->runs) {
+      if (run.docs) emit(run.docs, ReadClass::DATA);
+      if (run.positions) emit(run.positions, ReadClass::DATA);
+    }
   }
 
   int64_t numTerms() const {

@@ -31,6 +31,10 @@ class MinScoreQuery final : public Query {
   Query* child;
   float minScore;
 
+  static int32_t childFlags(int32_t flags) {
+    return (flags & ~EXCLUSION_WINDOW_FILL) | NEED_SCORES | ALLOW_PRUNING;
+  }
+
   class Scorer final : public Query::Scorer {
     Query::Scorer* child;
     float minScore;
@@ -474,6 +478,8 @@ public:
     return FilterKeyScope::UNCACHEABLE;
   }
 
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
+
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
 
@@ -528,8 +534,8 @@ public:
            float multiplier)
       : Query::Weight(context, query, flags), minScore(query.minScore),
         multiplier(multiplier), scored((flags & NEED_SCORES) != 0) {
-      childWeight = query.child->createWeight(
-          context, (flags & ~EXCLUSION_WINDOW_FILL) | NEED_SCORES | ALLOW_PRUNING,
+      childWeight = query.child->buildWeight(
+          context, childFlags(flags),
           1.0f);
       // Only preparation traits carry over: match-all, constant
       // counts, and count/top-k composition all describe the child's

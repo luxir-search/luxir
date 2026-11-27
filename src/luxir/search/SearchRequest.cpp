@@ -3,6 +3,7 @@
 
 #include "SearchRequest.h"
 #include "luxir/query/QueryPruning.h"
+#include "luxir/query/ReadDeclarer.h"
 
 #include <cassert>
 
@@ -10,6 +11,7 @@
 #include "OwnershipRelation.h"
 #include "luxir/api/build.h"
 #include "luxir/search/SearchOverrides.h"
+#include "luxir/search/ops/SearchOp.h"
 
 namespace luxir {
 
@@ -24,14 +26,8 @@ const std::shared_ptr<IndexReader>& SearchRequest::pinView(std::string_view path
   // A view shares the request's segment observations once the request has them.
   auto uses = filterUses ? std::make_shared<FilterCache::UseRegistry>(scoped->filterCache(), *scoped, *filterUses)
       : std::make_shared<FilterCache::UseRegistry>(scoped->filterCache(), *scoped);
-  return scopedStates->emplace(std::string(path), ScopedState{std::move(scoped), std::move(uses), {}}).first->second.reader;
-}
-
-const std::shared_ptr<FilterCache::UseRegistry>& SearchRequest::uses(IndexReader& scoped) {
-  if (&scoped == reader.get()) return filterUses;
-  pinView(scoped.path());
-  const std::lock_guard lock(mutex);
-  return scopedStates->find(scoped.path())->second.uses;
+  return scopedStates->emplace(std::string(path), ScopedState{std::move(scoped), std::move(uses), {}, {}})
+      .first->second.reader;
 }
 
 OwnershipRelation& SearchRequest::ownershipRelation(IndexReader& many, IndexReader& one) {
@@ -45,19 +41,65 @@ OwnershipRelation& SearchRequest::ownershipRelation(IndexReader& many, IndexRead
   auto found = state.relations.find(key);
   if (found != state.relations.end()) return *found->second;
   auto* relation = arenaCreate<OwnershipRelation>(arena, many, one, memoryTracker);
+  if (stage == Stage::LOGICAL) {
+    addMaterializationStep<&OwnershipRelation::bindMappers>(*relation);
+  } else {
+    // Standalone query planning has no logical op tree or step list to run.
+    relation->bindMappers();
+  }
   state.relations.emplace(std::move(key), relation);
   return *relation;
 }
 
 Query::PlanningContext* SearchRequest::createPlanningContext(IndexReader& view) {
+  ScopedState* scoped = nullptr;
+  if (&view != reader.get()) {
+    const auto& pinned = pinView(view.path());
+    assert(pinned.get() == &view);
+    const std::lock_guard lock(mutex);
+    scoped = &scopedStates->find(pinned->path())->second;
+  }
   Query::PlanningContext::Limits limits;
   limits.multiTermBudget = &multiTermBudget;
   auto* planning = arenaCreate<Query::PlanningContext>(arena, requestPool, view, limits, &warnings,
       FilterKeyContext{.schemaGen = schema->gen_, .timeZone = proto.time_zone},
-      uses(view), &memoryTracker, proto.profile ? this : nullptr);
+      scoped ? scoped->uses : filterUses, &memoryTracker, proto.profile ? this : nullptr);
   planning->pruning = pruning;
   planning->proofNotes = resolvedFields;
+  planning->sharedTermFacts = scoped ? &scoped->termFacts : &termFacts;
+#ifndef NDEBUG
+  planning->requestStage = &stage;
+#endif
   return planning;
+}
+
+void SearchRequest::addMaterializationStep(SearchOp& op) {
+  assert(stage == Stage::LOGICAL);
+  materializationSteps.push_back({&op, [](void* object) {
+    auto& op = *static_cast<SearchOp*>(object);
+    if (auto* reads = ReadVerification::active()) {
+      op.selectSources();
+      op.declareReads(*reads);
+    }
+    op.materialize();
+  }});
+}
+
+void SearchRequest::materialize() {
+  assert(stage == Stage::LOGICAL && logicalRoot != nullptr);
+  stage = Stage::MATERIALIZING;
+  for (; materializationCursor < materializationSteps.size(); ++materializationCursor) {
+    const auto& step = materializationSteps[materializationCursor];
+#ifndef NDEBUG
+    if (Query::verifyReadDeclarationsForTests && ReadVerification::active() == nullptr) {
+      ReadVerification verify;
+      step.run(step.owner);
+      continue;
+    }
+#endif
+    step.run(step.owner);
+  }
+  stage = Stage::MATERIALIZED;
 }
 
 // One profile op for the request and one run per calculator that actually skips.

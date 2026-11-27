@@ -11,6 +11,7 @@
 #include "luxir/plugin/Registries.h"
 #include "luxir/query/ProtobufQueryParser.h"
 #include "luxir/query/QueryPrep.h"
+#include "luxir/query/TermQuery.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/util/luxir_util.h"
 #include "test/CollectionHelper.h"
@@ -291,6 +292,20 @@ TEST_F(PluginExtensionTest, searchOpWithExtraColumnAndNestedOps) {
   EXPECT_NE(std::string::npos, unknown.body().find("sample_docs")) << unknown.body();
 }
 
+TEST_F(PluginExtensionTest, queryCountUsesMaterializedWeightAndInputDomain) {
+  auto req = localReq(helper.getSearchEngine());
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"ops":{
+    "n":{"query_count":{"query":"cat_s:x"}},
+    "q":{"top_docs":{"query":"id:d1","limit":0,
+      "ops":{"n":{"query_count":{"query":"cat_s:x"}}}}}
+  }})", req->mr));
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ(2, req->responses.back()->proto.ops.at("n")->asInt());
+  ASSERT_NE(nullptr, req->docList("q"));
+  EXPECT_EQ(1, req->docList("q")->ops.at("n")->asInt());
+}
+
 TEST_F(PluginExtensionTest, hitDecoratorAddsColumnToEmittedHits) {
   for (std::string_view decorate : {R"("decorate":{"label":{"text":"hi"}})", R"("label":{"text":"hi"})"}) {
     SCOPED_TRACE(decorate);
@@ -303,6 +318,11 @@ TEST_F(PluginExtensionTest, hitDecoratorAddsColumnToEmittedHits) {
   auto unknownName = search(R"({"ops":{"q":{"top_docs":{"decorate":{"nope":{}}}}}})");
   EXPECT_EQ(400, unknownName.result_int()) << unknownName.body();
   EXPECT_NE(std::string::npos, unknownName.body().find("unknown hit decorator 'nope'")) << unknownName.body();
+  auto collision = search(R"({"ops":{"q":{"top_docs":{"decorate":{"label":{"text":"hi"}},
+    "row_ops":{"label":{"top_docs":{"limit":0}}}}}}})");
+  EXPECT_EQ(400, collision.result_int()) << collision.body();
+  EXPECT_NE(std::string::npos, collision.body().find("row operation 'label' conflicts with a decorator"))
+      << collision.body();
 }
 
 TEST_F(PluginExtensionTest, extraColumnRejectsDiscoveredFieldCollisions) {
@@ -477,11 +497,47 @@ TEST_F(PluginExtensionTest, decoratorInspectsFuzzyRankingTerms) {
 TEST_F(PluginExtensionTest, decoratorInspectsBrowseNestedAndFusionSources) {
   const std::pair<std::string_view, std::string_view> cases[] = {
       {R"({"ops":{"q":{"top_docs":{"fields":["id"],"decorate":{"ranking_terms":{}}}}}})", ""},
+      {R"({"ops":{"q":{"top_docs":{"query":{"boolean":{"required":["id:d1"],"optional":["cat_s:x","id:d1"],"filter":["cat_s:x"],"prohibited":["id:d2"]}},"fields":["id"],"decorate":{"ranking_terms":{}}}}}})", "id:d1,cat_s:x,id:d1"},
       {R"({"ops":{"cats":{"field_facet":{"field":"cat_s","ops":{"q":{"top_docs":{"query":"id:d1","fields":["id"],"decorate":{"ranking_terms":{}}}}}}}}})", "id:d1"},
-      {R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{"a":{"query":"id:d1"},"b":{"query":"id:d2"}},"fields":["id"],"decorate":{"ranking_terms":{}}}}}})", "id:d1,id:d2"}};
+      {R"({"ops":{"f":{"fusion":{"rrf":{},"sources":{"a":{"query":"id:d1"},"b":{"query":"id:d2"}},"filter":["*:*"],"fields":["id"],"decorate":{"ranking_terms":{}}}}}})", "id:d1,id:d2"}};
   for (const auto& [request, terms] : cases) {
     auto res = search(std::string(request));
     ASSERT_EQ(200, res.result_int()) << res.body();
     EXPECT_NE(std::string::npos, res.body().find("\"ranking_terms\":\"" + std::string(terms) + "\"")) << res.body();
+  }
+}
+
+TEST_F(PluginExtensionTest, decoratorBindsWithAContextForAResidentSource) {
+  CollectionHelper resident("decorator_resident");
+  auto writer = resident.getIndexWriter();
+  writer->snapshots.readers.filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  ASSERT_TRUE(resident.indexAll({
+      flatdoc("id", "a", "cat_s", "x", "rank_i", 3),
+      flatdoc("id", "b", "cat_s", "y", "rank_i", 1),
+      flatdoc("id", "c", "cat_s", "y", "rank_i", 2)}, UpdateMessage::COMMIT).success);
+  TermQuery query("cat_s", "x");
+  publishWholeMembershipForTests(*writer->snapshots.readers.getReader(), query);
+
+  for (bool valid : {true, false}) {
+    auto req = localReq(resident.getSearchEngine());
+    auto json = std::string(R"({"ops":{"q":{"top_docs":{
+      "query":"cat_s:x","sort":"rank_i asc","fields":["id"],"decorate":{"ranking_terms":{)")
+        + (valid ? "" : R"("unused":1)") + "}}}}}}";
+    ASSERT_TRUE(api::read_json(req->rawRequest(), api::build::arenaStr(req->mr, json), req->mr));
+    req->collection("decorator_resident");
+    SkipStatsScope stats;
+    req->execute(false);
+    EXPECT_EQ(valid ? 1 : 0, SkipStats::cacheFirstQueryContextsOmitted);
+    EXPECT_EQ(valid ? 1 : 0, SkipStats::queryContextsCreated);
+    if (!valid) {
+      EXPECT_FALSE(req->ok());
+      EXPECT_TRUE(req->errorMsg().contains("unused")) << req->errorMsg();
+      continue;
+    }
+    ASSERT_OK(req);
+    auto docs = req->getDocs("q");
+    ASSERT_EQ(1u, docs.size());
+    EXPECT_CONTAINS_DOC(docs, flatdoc("id", "a", "ranking_terms", "cat_s:x"));
   }
 }

@@ -213,6 +213,7 @@ public:
   int32_t termBlockCount() const noexcept;
   field_parts::Slice termBlockOffsets() const;
   field_parts::Slice termTrie() const;
+  field_parts::Slice termNavigation() const;  // Offset table and trie, held together.
   uint64_t pointCount() const noexcept;
   uint64_t pointLeafCount() const noexcept;
   field_parts::Slice pointsDirectory() const;

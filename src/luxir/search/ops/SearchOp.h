@@ -140,15 +140,37 @@ struct StructuralConstraint {
 };
 
 struct BucketDomainPlan {
+private:
+  // Request arena that owns the execution context.
+  google::protobuf::Arena& arena;
+
+public:
   DomainVariantPlan variants;
   Query::PlanningContext* planning = nullptr;
+
+  explicit BucketDomainPlan(google::protobuf::Arena& arena) : arena(arena) {}
+
+  void declareReads(ReadDeclarer& reads) const;
+  // Build the context, weights and filter uses for the bucket domain variants.
+  void materialize();
 };
 
 struct InputDomainPlan {
+private:
+  // Request arena that owns the execution context.
+  google::protobuf::Arena& arena;
+
+public:
   RowRelation::Mapping mapping;
   DomainVariantPlan variants;
   Query::PlanningContext* planning = nullptr;
   bool applyParentFilters = false;
+
+  explicit InputDomainPlan(google::protobuf::Arena& arena) : arena(arena) {}
+
+  void declareReads(ReadDeclarer& reads) const;
+  // Build the context, weights and filter uses for the mapped input variants.
+  void materialize();
 };
 
 class SearchOp {
@@ -174,6 +196,22 @@ public:
     : segmentStateRetentions(view->segments().size()), req(req), view(view), name(name) {
   }
 
+  // Runs once, serially, after construction from parsed, validated inputs and
+  // before init(). Create query contexts and weights and make weight-dependent
+  // choices here. The caller orders materialization for each op.
+  virtual void materialize() {}
+
+  // Choose sources that make a weight unnecessary (resident filter-cache
+  // entries) and keep the decision for materialize(). Runs at most once per
+  // op, serially, before declareReads() and materialize(); materialize() runs
+  // it if nobody did. It builds no context and no weight.
+  virtual void selectSources() {}
+
+  // Project the op's possible root modes before building weights, after
+  // selectSources(). The default is opaque.
+  virtual void declareReads(ReadDeclarer& reads) const;
+
+  // Initialize the materialized op tree for execution.
   virtual void init() {
     for (auto& [name, subOp] : subOps) {
       subOp->init();
@@ -189,6 +227,7 @@ public:
     return false;
   }
 
+  // Release any state present, including after incomplete materialization.
   virtual void releaseSegmentState(IndexReader::Segment& segment) noexcept {
     if (segmentStateRetained(segment)) return;
     if (inputDomain) inputDomain->variants.releaseSegmentState(view->segments()[(size_t)segment.ord]);

@@ -39,10 +39,14 @@ class ExprStatsOp : public SearchOp {
   static constexpr size_t MAX_ORD_SET_BYTES = 256 * 1024;
 
   AggregateProgram& aggregate;
-  std::span<const AggregateFieldInfos> fields;
+  // Catalog handles during parsing, with runtime ordinals filled at binding.
+  std::span<AggregateFieldInfos> fields;
+  // True after this op has received its final producer field span.
+  bool fieldsBound = false;
   const DenseFacetStateOps* denseFacetState = nullptr;
   bool orderSensitive = false;
-  bool passive = false;
+  // Followers use the producer set and bound fields of this leader.
+  ExprStatsOp* producerLeader = nullptr;
   std::vector<ExprStatsOp*> members;
 
   const DenseFacetStateOps* resolveDenseFacetState() {
@@ -114,8 +118,21 @@ class ExprStatsOp : public SearchOp {
 
 public:
   ExprStatsOp(SearchRequest& req, const std::shared_ptr<IndexReader>& view, std::string_view name,
-              AggregateProgram& aggregate, std::span<const AggregateFieldInfos> fields)
+              AggregateProgram& aggregate, std::span<AggregateFieldInfos> fields)
       : SearchOp(req, view, name), aggregate(aggregate), fields(fields) {}
+
+  // Bind the final producer set and publish its field span to the whole group.
+  void bindFields() {
+    auto& leader = producerLeader ? *producerLeader : *this;
+    if (leader.fieldsBound) return;
+    // The first recorded step in the group may belong to a follower.
+    bindAggregateOrdinals(leader.aggregate, *leader.view, leader.fields);
+    leader.fieldsBound = true;
+    for (auto* member : leader.members) {
+      member->fields = leader.fields;
+      member->fieldsBound = true;
+    }
+  }
 
   bool nativeOutput(uint64_t outputFlags) const {
     return nativeValueOutput(aggregate.root().nature, outputFlags);
@@ -143,13 +160,13 @@ public:
   }
 
   bool shareProducersFrom(ExprStatsOp& leader) {
-    assert(!passive && members.empty() && !leader.passive && &leader != this);
+    assert(!producerLeader && members.empty() && !leader.producerLeader && &leader != this);
     if (view != leader.view || inputDomain != leader.inputDomain) return false;
     if (!aggregate.adoptProducers(leader.aggregate)) return false;
-    fields = leader.fields;
+    fields = {};
     if (leader.members.empty()) leader.members.push_back(&leader);
     leader.members.push_back(this);
-    passive = true;
+    producerLeader = &leader;
     if (aggregateExecutionStatsForTests != nullptr) {
       aggregateExecutionStatsForTests->followers.fetch_add(1, std::memory_order_relaxed);
     }
@@ -157,6 +174,7 @@ public:
   }
 
   void init() override {
+    assert(fieldsBound);
     SearchOp::init();
     denseFacetState = resolveDenseFacetState();
     orderSensitive = std::ranges::any_of(aggregate.producers, [](const AggregateProducer& producer) {
@@ -981,7 +999,7 @@ public:
   Calculator* createCalculator(
       Calculator* parent, int64_t slot = -1, int64_t numSlots = -1,
       const StructuralConstraint* structural = nullptr) override {
-    if (passive) return new PassiveCalc(*this, parent, slot, numSlots, structural);
+    if (producerLeader) return new PassiveCalc(*this, parent, slot, numSlots, structural);
     if (orderSensitive) return new Calc<true>(*this, parent, slot, numSlots, structural);
     return new Calc<false>(*this, parent, slot, numSlots, structural);
   }
@@ -1021,14 +1039,14 @@ public:
   }
 
   size_t facetBucketResidentBytes() const override {
-    return passive ? 0 : AggregateStateView::bytes(aggregate);
+    return producerLeader ? 0 : AggregateStateView::bytes(aggregate);
   }
 
-  bool facetBucketGrows() const override { return !passive && aggregate.hasIndirectStates; }
+  bool facetBucketGrows() const override { return !producerLeader && aggregate.hasIndirectStates; }
 
   FacetChildExecutor* bindFacetChild(
       const FacetChildContext& context) override {
-    if (passive || !members.empty()) return nullptr;
+    if (producerLeader || !members.empty()) return nullptr;
     if (inputDomain != nullptr || bucketDomain != nullptr || needsStructuralScope) return nullptr;
     if (context.stringColumn == nullptr) return nullptr;
     if (!std::ranges::all_of(aggregate.producers, [](const AggregateProducer& producer) {
