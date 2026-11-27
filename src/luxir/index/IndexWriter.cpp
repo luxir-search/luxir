@@ -2217,13 +2217,15 @@ const Segment* IndexWriter::publishedSegment(const SegInfo& seg, std::shared_ptr
   return segment != nullptr && segment->maxDoc() == seg.maxDoc ? segment : nullptr;
 }
 
-std::shared_ptr<LiveDocs> IndexWriter::loadLiveDocs(const SegInfo& seg, uint64_t gen, uint64_t epoch) {
+std::shared_ptr<LiveDocs> IndexWriter::loadLiveDocs(const SegInfo& seg, const SegInfo::LiveRecord& live,
+                                                   uint64_t epoch) {
   std::shared_ptr<IndexReader> reader;
   const auto* published = publishedSegment(seg, reader);
-  if (published != nullptr && published->segInfo.live_gen == gen) {
-    if (auto live = published->liveDocsShared()) return live;
+  if (published != nullptr && published->segInfo.live_gen == live.gen) {
+    if (auto docs = published->liveDocsShared()) return docs;
   }
-  return LiveDocs::create(dir, seg.segId, seg.creatorEpoch, gen, epoch, seg.maxDoc, false, false);
+  return LiveDocs::create(dir, seg.segId, seg.creatorEpoch, live.gen, epoch, seg.maxDoc, live.live, live.size, false,
+                          false);
 }
 
 void IndexWriter::seedActiveVectorOverlayNamesFromManifestLocked() {
@@ -2958,6 +2960,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         INDEX_DEBUG("mergeSegmentsBody: will merge {}", *seg);
         seg->merging = true;
         seg->mergedLiveGen = seg->liveGen;
+        seg->mergedLive = seg->liveRecord();
         markedSegmentCount++;
       }
 
@@ -3025,7 +3028,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     for (auto segInfo : segs) {
       if (segInfo->mergedLiveGen > 0) {
         // Load liveDocs for this segment
-        auto liveDocs = loadLiveDocs(*segInfo, segInfo->mergedLiveGen, segInfo->liveEpochFor(segInfo->mergedLiveGen, writerEpoch));
+        assert(segInfo->mergedLive.gen == (uint64_t)segInfo->mergedLiveGen);
+        auto liveDocs = loadLiveDocs(*segInfo, segInfo->mergedLive, segInfo->liveEpochFor(segInfo->mergedLiveGen, writerEpoch));
         if (!liveDocs) {
           throw std::runtime_error("Failed to load liveDocs for segment " + std::to_string(segInfo->segId) +
                                    " gen=" + std::to_string(segInfo->mergedLiveGen));
@@ -3080,12 +3084,12 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       boost::unordered_flat_set<std::string> attemptedOverlays, matchedSelectors;
       for (;;) {
         prepareMergedVectorOverlays(*newSegInfo, attemptedOverlays, matchedSelectors, phase);
-        std::vector<uint64_t> currentGens;
-        currentGens.reserve(segs.size());
+        std::vector<SegInfo::LiveRecord> currentLive;
+        currentLive.reserve(segs.size());
         {
           const std::lock_guard<std::mutex> lock(indexMutex);
           for (auto* seg : segs) {
-            currentGens.push_back(seg->liveGen);
+            currentLive.push_back(seg->liveRecord());
             // Pin the generation until it has been loaded outside the lock.
             seg->mergeDiffLiveGen = seg->liveGen;
           }
@@ -3093,12 +3097,12 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         phase = "merge_live_docs_diff";
         bool changed = false;
         for (size_t i = 0; i < segs.size(); i++) {
-          if (currentGens[i] == coveredGens[i]) continue;
+          if (currentLive[i].gen == coveredGens[i]) continue;
           auto* seg = segs[i];
           // Rescan from the merged generation on every retry. Clearing an
           // already-clear output bit is a no-op, so only the generation the
           // diff covered needs to be remembered.
-          auto current = loadLiveDocs(*seg, currentGens[i], seg->liveEpochFor(currentGens[i], writerEpoch));
+          auto current = loadLiveDocs(*seg, currentLive[i], seg->liveEpochFor(currentLive[i].gen, writerEpoch));
           const auto* merged = liveDocsVec[i] ? &liveDocsVec[i]->bitset() : nullptr;
           const auto& now = current->bitset();
           for (int32_t word = 0; word < (int32_t)screaming::FixedBitSet::sizeInWords(seg->maxDoc); word++) {
@@ -3119,7 +3123,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
               changed = true;
             }
           }
-          coveredGens[i] = currentGens[i];
+          coveredGens[i] = currentLive[i].gen;
         }
         if (changed) {
           // Each retry writes a new immutable bitmap for this private output.
@@ -3825,7 +3829,7 @@ uint64_t IndexWriter::applyDeletes(const SegmentDeletes& target) {
   // Load existing LiveDocs if they exist: the published reader's when it
   // holds this generation
   std::shared_ptr<LiveDocs> existingLiveDocs;
-  if (seg.liveGen > 0) existingLiveDocs = loadLiveDocs(seg, seg.liveGen, seg.liveEpoch);
+  if (seg.liveGen > 0) existingLiveDocs = loadLiveDocs(seg, seg.liveRecord(), seg.liveEpoch);
 
   // The new generation's bits: copied from the existing liveDocs at the first
   // delete, or before chunk tasks start so they only clear bits.
