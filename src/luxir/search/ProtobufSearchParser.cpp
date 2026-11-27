@@ -809,6 +809,38 @@ public:
     return spec;
   }
 
+  // FieldFacet.term_filter on a numeric, date, or boolean field: only the
+  // include and exclude lists, coerced as the field's query values.
+  template <typename Canonical>
+  FacetIntKeyFilter parseNumericTermFilter(std::string_view facetName,
+                                           const luxir::api::TermFilter& termFilter,
+                                           Canonical&& canonicalValues) {
+    std::string context = std::format("facet '{}': term_filter", facetName);
+    if (!termFilter.prefix.empty() || !termFilter.regex.empty()
+        || !termFilter.exclude_regex.empty() || termFilter.num_partitions != 0
+        || termFilter.partition != 0) {
+      throw RequestError(context + ": numeric fields accept only include and exclude");
+    }
+    auto values = [&](std::span<const std::string_view> literals, std::string_view name) {
+      std::vector<api::Val> vals(literals.size());
+      for (size_t i = 0; i < literals.size(); i++) vals[i].kind = literals[i];
+      std::string where = std::format("{} {}", context, name);
+      try {
+        auto canonical = canonicalValues(ValueSequence(std::span<const api::Val>(vals), where));
+        auto numerics = canonical.empty() ? std::span<const int64_t>{} : canonical.numerics();
+        return std::vector<int64_t>(numerics.begin(), numerics.end());
+      } catch (const RequestError&) {
+        throw;
+      } catch (const std::runtime_error& e) {
+        throw RequestError(std::format("{}: {}", where, e.what()));
+      }
+    };
+    FacetIntKeyFilter filter;
+    if (!termFilter.include.empty()) filter.keepOnly(values(termFilter.include, "include"));
+    filter.drop(values(termFilter.exclude, "exclude"));
+    return filter;
+  }
+
   FacetReq* createFieldFacetReq(
       std::string_view facetName, const luxir::api::FieldFacet& facetReq,
       OpsPlacement placement,
@@ -833,9 +865,33 @@ public:
     // results into the op ctors (see TopDocsReq's ctor comment).
     auto* ftype = target.fieldType;
     ftype->requireCapability(FieldType::FIELD_FACET, "field_facet", facetField);
-    if (facetReq.term_filter.has_value()) {
+    bool numericKeys = FieldType::storage(ftype->type()) == FieldType::Storage::INT64;
+    if (facetReq.term_filter.has_value() && !numericKeys) {
       ftype->requireCapability(FieldType::TERM_FILTER,
                                std::format("facet '{}': term_filter", facetName), facetField);
+    }
+    // One scalar or a list of values, coerced as the field's query values.
+    auto canonicalValues = [&](const ValueSequence& values) {
+      QueryBuilder builder(req.requestPool, *req.schema, coerceContext(*req.timeZone),
+                           facetName, &req.warnings, &parseView.fields);
+      return builder.canonicalizeFieldValues(target, values, true);
+    };
+    // FieldFacet.after: the start-after key of a page in value order.
+    std::optional<CanonicalValueSet> after;
+    bool afterDescending = false;
+    if (facetReq.after.has_value()) {
+      std::string name = std::format("facet '{}': after", facetName);
+      if (facetReq.sort.empty() || facetReq.sort[0].expr != "_key") {
+        throw RequestError(name + " requires sort to begin with _key");
+      }
+      afterDescending = facetReq.sort[0].dir == api::SortSpec_::SortDir::DESC;
+      ValueSequence value(*facetReq.after, name, ValueSequence::NullError::MUST_NOT_BE_NULL);
+      if (value.size() != 1) throw RequestError(name + " must be a single value");
+      after = canonicalValues(value);
+      // A value the field cannot hold (no terms after analysis) keeps nothing
+      // out; one that analyzes to several terms has no single position.
+      if (after->size() > 1) throw RequestError(name + " must be a single value");
+      if (after->empty()) after.reset();
     }
 
     std::span<const int64_t> selectedInts;
@@ -872,8 +928,17 @@ public:
         if (facetReq.mincount.has_value() && *facetReq.mincount < 1) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for numeric field facets");
         }
+        std::optional<FacetIntKeyFilter> keyFilter;
+        if (facetReq.term_filter.has_value()) {
+          keyFilter = parseNumericTermFilter(facetName, *facetReq.term_filter, canonicalValues);
+        }
+        if (after) {
+          if (!keyFilter) keyFilter.emplace();
+          keyFilter->startAfter(after->numerics()[0], afterDescending);
+        }
         facet = luxir::arenaCreate<IntFacetReq>(req.arena, req, view(), facetReq,
-            facetField, facetName, limit, minCount, missing, selectedInts);
+            facetField, facetName, limit, minCount, missing, selectedInts,
+            std::move(keyFilter));
         break;
       }
       case FieldType::Storage::TERMS: {
@@ -898,6 +963,11 @@ public:
         if (facetReq.term_filter.has_value()) {
           termFilter = parseTermFilter(facetName, target, *facetReq.term_filter);
         }
+        if (after) {
+          if (!termFilter) termFilter.emplace();
+          termFilter->after = std::string(after->terms()[0]);
+          termFilter->afterDescending = afterDescending;
+        }
         auto* stringFacet = luxir::arenaCreate<StrFacetOp>(req.arena, req, view(), facetReq,
             facetField, facetName, limit, minCount, missing,
             selectedStrings, std::move(termFilter));
@@ -908,7 +978,9 @@ public:
       case FieldType::Storage::TEXT:
         if (measure != nullptr) throw RequestError("TEXT field_facet distinct counts are not supported yet");
         facet = luxir::arenaCreate<FullTextFacetReq>(req.arena, req, view(), facetReq,
-            facetField, facetName, limit, minCount, missing, selectedStrings);
+            facetField, facetName, limit, minCount, missing, selectedStrings,
+            after ? std::optional<std::string>(after->terms()[0]) : std::nullopt,
+            afterDescending);
         break;
       default: ;
     }

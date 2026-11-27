@@ -414,7 +414,7 @@ TEST_F(FacetTermFilterTest, invalidFilters) {
     EXPECT_NE(std::string::npos, result.error.find(needle)) << result.error;
   };
   expectError(R"json({"field":"n_i","term_filter":{"prefix":"1"}})json",
-              "term_filter is not supported on int field 'n_i'");
+              "numeric fields accept only include and exclude");
   expectError(R"json({"field":"cat_s","term_filter":{"regex":"(unclosed"}})json",
               "term_filter regex: Regex query for field 'cat_s' pattern '(unclosed'");
   expectError(R"json({"field":"cat_s","term_filter":{"partition":3,"num_partitions":3}})json",

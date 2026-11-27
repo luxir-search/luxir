@@ -289,14 +289,16 @@ the facet's `limit: 10` returns up to ten categories.
 | `limit` | Maximum returned buckets. Default `5`; `-1` returns all. |
 | `mincount` | Drop buckets below this count. |
 | `missing` | Also return the count of documents with no value in the field. |
-| `sort` | Sort buckets by one of the facet's metric sub-operations: a one-element list such as `["name desc"]` or `["name asc"]`. Default: count descending. |
+| `sort` | Bucket order: a list of keys, each `_count`, `_key` (the bucket value), or a metric sub-operation name, with `asc` (default) or `desc`. See [Bucket order and paging](#bucket-order-and-paging). Default: count descending. |
 | `ops` | Per-bucket sub-facets, metrics, or `top_docs` / `fusion` lists. |
 | `selected` | Values that refine the result set and stay visible as buckets. See [Multi-select navigation](#multi-select-navigation). |
 | `selection_mode` | `any` (default) or `all`: match any selected value, or require every one. |
-| `term_filter` | String and ID fields only. Restricts which terms can become buckets; counts stay exact. See [Filtering bucket terms](#filtering-bucket-terms). |
+| `term_filter` | Restricts which values can become buckets; counts stay exact. Numeric, boolean, and date fields accept only `include` and `exclude`. See [Filtering bucket terms](#filtering-bucket-terms). |
+| `after` | Start the page after this bucket value. Requires `sort` to begin with `_key`. |
+| `other_count` | Also return `other_count`, the summed counts of the values left off the page. |
 
-String and ID facets return buckets in count-descending order, with bucket
-value ascending as a deterministic tie break. Default bucket counts are
+By default buckets return in count-descending order, with bucket value
+ascending as a deterministic tie break. Default bucket counts are
 document counts in either [multi-valued mode](schema.md#multi-valued-modes).
 `mincount: 0` includes values that exist in the collection but have zero
 matches in the current result set, which keeps a sidebar stable while the user
@@ -333,6 +335,39 @@ should be bucketed rather than enumerated.
 A string facet needs indexed terms and a column. Facets return the term as
 stored. For fields with multiple representations, see
 [Field variants](#field-variants).
+
+### Bucket order and paging
+
+`sort` lists the keys that order the buckets. `_count` is the bucket count,
+`_key` the bucket value, and any other name a metric sub-operation (see
+[Expression metrics](#expression-metrics)). Each key may appear once; a later
+key breaks ties of the earlier ones, and value ascending breaks any tie left.
+Strings order by their indexed bytes, numbers, dates, and booleans by value.
+
+```json
+{"field": "category_s", "limit": 10, "sort": ["_count asc", "_key desc"]}
+```
+
+The count-descending default can stop reading counts as soon as the page is
+certain; other orders read every counted value. `mincount: 0` zero-count
+buckets compete for the page in any order, so `_count asc` returns them first.
+
+To walk all values in value order, sort by `_key` and pass the last value of
+the previous page as `after`. The next page holds the values after it in the
+sort direction; the value itself need not exist. `after` is coerced like a
+`selected` value.
+
+```json
+{"field": "category_s", "limit": 100, "sort": ["_key"], "after": "classic"}
+```
+
+`other_count: true` adds `other_count` to the result: the summed counts of
+the values that could be buckets but are not on the page. Values that pass
+`term_filter` and `after` count at any count, including those below
+`mincount`, while selected buckets appended after the page are counted as
+other. With `missing`, documents without a value are not part of it. The
+count-descending default skips some shortcuts when `other_count` is set, as
+it must read every count.
 
 ### Filtering bucket terms
 
@@ -383,7 +418,9 @@ The filter changes only the ordinary buckets:
 - `selected` buckets are always returned, whether or not they pass the filter.
 - Sub-operations and nested facets run on the buckets that pass.
 
-`term_filter` is rejected on numeric, boolean, date, and text fields.
+Numeric, boolean, and date fields accept `include` and `exclude` only; their
+values are strings coerced as the field's query values, such as `"42"` or a
+date string. `term_filter` is rejected on text fields.
 
 ## Expression metrics
 
@@ -489,9 +526,10 @@ Sort a field facet by one of its metrics:
 ```
 
 Field facet `sort` names a sort-capable metric operation of that facet; `asc`
-and `desc` are both supported. `percentile_rank` supports metric sorting. A
-bucket whose metric is missing or failed sorts last either way. See
-[Limits](#limits) for restrictions.
+and `desc` are both supported, and further keys (another metric, `_count`, or
+`_key`) break ties. `percentile_rank` supports metric sorting. A bucket whose
+metric is missing or failed sorts last either way. See [Limits](#limits) for
+restrictions.
 
 The typing rules:
 
@@ -1144,9 +1182,8 @@ primary, the bare field name counts words without needing `__self`.
 ## Limits
 
 - Facets cannot yet sort by metrics containing `cardinality` or `percentile`.
-- Field facet sorting takes one key, which must be a metric operation of that facet.
-  Custom count or bucket-value sort orders are not yet supported; omit `sort`
-  for the default count order.
+- Metric sort keys are not supported with distinct counts (`count_distinct`
+  or `count_unit: groups`); `_count` and `_key` are.
 - `selected` is not accepted at the root of a full-form request, under a
   `fusion`, or on a nested facet.
 - Range facets may generate at most 100,000 buckets. With sub-operations,

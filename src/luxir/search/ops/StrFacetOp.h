@@ -367,8 +367,11 @@ public:
       if (termFilterSpec) {
         resolvedTermFilter = FacetOrdFilter::resolve(std::move(*termFilterSpec), lookup,
             ordMap ? ordMap->numOrds() : 0);
-        // With limit 0 there are no ordinary buckets for it to choose.
-        if (resolvedTermFilter && limit != 0) termFilter = &*resolvedTermFilter;
+        // With limit 0 there are no ordinary buckets for it to choose, but
+        // other_count still counts only the terms it keeps.
+        if (resolvedTermFilter && (limit != 0 || fieldFacet.other_count)) {
+          termFilter = &*resolvedTermFilter;
+        }
       }
     }
     termFilterSpec.reset();
@@ -430,12 +433,23 @@ public:
   // over a 10M-doc domain would otherwise allocate and fill tens of MB per
   // request to return one page.
   class OrdCountSink {
+    using Order = CountKeyBucketOrder<std::less<int64_t>>;
     const StrFacetOp& op;
-    FieldBucketFinalizer<int64_t, std::monostate,
-                         decltype(countFieldBucketOrder)> finalizer;
-    // Zero-count padding (mincount=0) is only needed while the counted ords do
-    // not fill the page, so only that many of them are remembered.
+    FieldBucketFinalizer<int64_t, std::monostate, Order> finalizer;
+    Order order;
+    // The default order, whose floor test below is spelled out.
+    bool countDescending;
+    // other_count: every ord is tested and summed, so none skips past the
+    // floor; total is the sum of the counts that passed term_filter.
+    bool countOther;
+    int64_t total = 0;
+    int64_t pageCount = 0;
+    // Zero-count padding (mincount=0). Under count descending it is only
+    // needed while the counted ords do not fill the page, so only that many of
+    // them are remembered; any other order can rank a zero count on the page,
+    // so it always pads and remembers every counted ord.
     size_t paddingTarget = 0;
+    bool padAlways = false;
     std::vector<int64_t> countedOrds;
     size_t counted = 0;
     // Once the page is full, the bucket a newcomer must beat. Nearly every
@@ -466,9 +480,13 @@ public:
 
     LUXIR_NOINLINE void addSlow(int64_t ord, int64_t count) {
       if (filter != nullptr && !accepts(ord)) return;
-      if (counted < paddingTarget) countedOrds.push_back(ord);
+      total += count;
+      if (counted < paddingTarget || padAlways) countedOrds.push_back(ord);
       counted++;
       finalizer.add({ord, count, {}});
+      // other_count and always-padded pages see every ord, so they never
+      // skip past the floor.
+      if (countOther || padAlways) return;
       if (const auto* worst = finalizer.worst()) {
         full = true;
         floorCount = worst->count;
@@ -477,19 +495,34 @@ public:
     }
 
     LUXIR_NOINLINE void padFiltered(const boost::unordered_flat_set<int64_t>& present) {
-      size_t emitted = counted;
+      // Accepted ords come in ascending order: with value descending every
+      // one is a candidate, otherwise the first `limit` zero counts win.
+      size_t emitted = padAlways ? 0 : counted;
       auto pad = [&](int64_t ord) {
         if (present.contains(ord)) return true;
         finalizer.add({ord, 0, {}});
-        return ++emitted < paddingTarget;
+        return order.order.keyDescending || ++emitted < paddingTarget;
       };
       if (sharedTerms == nullptr) {
         ownTerms->forEachAccepted(pad);
         return;
       }
-      for (size_t i = 0; emitted < paddingTarget; i++) {
+      for (size_t i = 0; order.order.keyDescending || emitted < paddingTarget; i++) {
         auto ord = sharedTerms->acceptedAt(i);
         if (!ord || !pad(*ord)) break;
+      }
+    }
+
+    // Unfiltered padding: the first `paddingTarget` absent ords in value
+    // order are the best zero counts.
+    LUXIR_NOINLINE void padAll(const boost::unordered_flat_set<int64_t>& present) {
+      int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
+      size_t emitted = padAlways ? 0 : counted;
+      for (int64_t i = 0; i < numGlobalOrds && emitted < paddingTarget; i++) {
+        int64_t ord = order.order.keyDescending ? numGlobalOrds - 1 - i : i;
+        if (present.contains(ord)) continue;
+        finalizer.add({ord, 0, {}});
+        emitted++;
       }
     }
 
@@ -498,7 +531,10 @@ public:
                  const FacetOrdFilter::Selection* selection = nullptr,
                  FacetOrdFilter::Terms* terms = nullptr)
       : op(op),
-        finalizer(op.minCount, 0, op.limit, countFieldBucketOrder),
+        finalizer(op.minCount, 0, op.limit, Order{op.countOrder, {}}),
+        order{op.countOrder, {}},
+        countDescending(op.countOrder.countDescending()),
+        countOther(op.otherCount),
         filter(op.termFilter), selection(selection), sharedTerms(terms) {
       if (filter != nullptr && sharedTerms == nullptr) {
         if (filter->hasTermTier()) {
@@ -510,16 +546,19 @@ public:
       if (allowZeroPadding && op.minCount == 0) {
         int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
         paddingTarget = op.limit < 0 ? (size_t)numGlobalOrds : (size_t)op.limit;
+        padAlways = op.countOrder.count >= 0;
       }
     }
 
     LUXIR_INLINE void add(int64_t ord, int64_t count) {
-      // countFieldBucketOrder: a newcomer must beat the page's worst bucket
+      // A newcomer must beat the page's worst bucket: under count descending,
       // on count, or tie it with a smaller ord. Losing implies a full page,
       // so counted already covers paddingTarget and the ord needs neither
       // remembering nor a term_filter test.
-      if (full && (count < floorCount
-                   || (count == floorCount && ord > floorOrd))) {
+      if (full && (countDescending
+                   ? (count < floorCount || (count == floorCount && ord > floorOrd))
+                   : !order(FacetCandidate<int64_t>{ord, count, {}},
+                            FacetCandidate<int64_t>{floorOrd, floorCount, {}}))) {
         counted++;
         return;
       }
@@ -537,23 +576,23 @@ public:
     // how many are set.
     std::vector<FinalizedFacetBucket<int64_t>> finish(
         std::span<const int64_t> pinCounts = {}) {
-      if (counted < paddingTarget) {
+      if (counted < paddingTarget || (padAlways && paddingTarget != 0)) {
         boost::unordered_flat_set<int64_t> present(
             countedOrds.begin(), countedOrds.end());
-        if (filter != nullptr) {
-          padFiltered(present);
-        } else {
-          int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
-          size_t emitted = counted;
-          for (int64_t ord = 0;
-               ord < numGlobalOrds && emitted < paddingTarget; ord++) {
-            if (present.contains(ord)) continue;
-            finalizer.add({ord, 0, {}});
-            emitted++;
-          }
-        }
+        if (filter != nullptr) padFiltered(present);
+        else padAll(present);
       }
-      return op.finishPage(finalizer.finish(), pinCounts);
+      auto page = finalizer.finish();
+      pageCount = facetPageCount(page);
+      return op.finishPage(std::move(page), pinCounts);
+    }
+
+    // other_count once finish() has run: the counts the filter kept, less the
+    // ordinary page. `total` replaces the summed counts when the caller knows
+    // them without visiting every ord.
+    std::optional<int64_t> other(std::optional<int64_t> knownTotal = std::nullopt) const {
+      if (!op.otherCount) return std::nullopt;
+      return knownTotal.value_or(total) - pageCount;
     }
   };
 
@@ -918,6 +957,7 @@ public:
                 .domainHasBitset = domainView.bits != nullptr,
                 .missingRequested = thisOp().missing,
                 .topTermsLegal = allowTopTerms && thisOp().termFilter == nullptr && thisOp().ordMap
+                    && thisOp().countOrder.countDescending()
                     && domainView.compCard == 0 && thisOp().reader.liveDocs() == thisOp().reader.maxDoc()
                     && thisOp().limit >= 0
                     && (int64_t)thisOp().ordMap->topTerms().entries.size() >= thisOp().limit,
@@ -1428,12 +1468,14 @@ public:
         }
         // Collect nonzero counts first. Explicit mincount=0 pads zero-count
         // buckets after sorting/truncating the competitive nonzero buckets.
-        auto min = std::max<int64_t>(thisOp().minCount, 1);
+        // other_count sums counts below mincount too; the page drops them.
+        auto min = thisOp().otherCount ? 1 : std::max<int64_t>(thisOp().minCount, 1);
+        bool shortcuts = thisOp().pageFloorShortcuts();
 
         if (thisOp().termFilter != nullptr) {
           // TOP_TERMS is never planned under a filter (countSegment).
           assert(!allTopTerms);
-          collectFiltered(*mergedData, *thisOp().termFilter, min, limit, ordCounts);
+          collectFiltered(*mergedData, *thisOp().termFilter, min, shortcuts ? limit : -1, ordCounts);
         } else if (allTopTerms) {
           assert(thisOp().ordMap != nullptr);
           for (const auto& entry : thisOp().ordMap->topTerms().entries) {
@@ -1465,9 +1507,7 @@ public:
 
           // if we are sorting by count descending and have a limit, we can stop if the overflow
           // counts are enough to fill the limit.
-          bool sortingByCountDesc = true;  // FUTURE
-
-          if (sortingByCountDesc && limit != -1
+          if (shortcuts && limit != -1
               && (int64_t)ordCounts.size() >= limit) {
             // already have enough counts, from overflow, and they are guaranteed to be larger than anything that didn't overflow.
           } else {
@@ -1479,7 +1519,7 @@ public:
             }
           }
         } else if (spanCounts) {
-          collectSparseCounts(*spanCounts, min, limit, ordCounts);
+          collectSparseCounts(*spanCounts, min, limit, ordCounts, shortcuts);
         } else {
           assert(false);
         }
@@ -1515,7 +1555,17 @@ public:
       }
 
       mergedData.reset();
-      emitPage(ordCounts.finish(pinCounts), missing_count);
+      auto page = ordCounts.finish(pinCounts);
+      std::optional<int64_t> total;
+      if (allTopTerms && thisOp().otherCount) {
+        // The page came from the index-wide list: no deletes and no filter,
+        // so every value's count is its document frequency.
+        total = 0;
+        for (int32_t segnum = 0; segnum < numSegments; segnum++) {
+          if (const auto* info = thisOp().ordFieldInfo(segnum)) *total += info->indexedTotals().sumDocFreq;
+        }
+      }
+      emitPage(std::move(page), missing_count, ordCounts.other(total));
     }
 
     // Streams the counted ords term_filter can keep into the sink, which
@@ -1579,11 +1629,11 @@ public:
     }
 
     void emitPage(std::vector<FinalizedFacetBucket<int64_t>> finalized,
-                  int64_t missingCount) {
+                  int64_t missingCount, std::optional<int64_t> other) {
 
       auto pool = MemPool::threadLocalPoolGuard();
       OrdMapStr labels(pool.pool(), thisOp().ordMap.get(), thisOp().reader, thisOp().segInfos);
-      emitCountPage<std::string>(finalized, missingCount,
+      emitCountPage<std::string>(finalized, missingCount, other,
           [&](const auto& bucket) { return std::string(bucket.pinned()
               ? thisOp().pinnedBuckets[bucket.pinIndex].key : labels.ordToStr(*bucket.key)); },
           [this](auto& buckets) { executeResultChildren(buckets); });
@@ -2151,7 +2201,8 @@ public:
       const FacetChildContext& context) override {
     if (inputDomain != nullptr || bucketDomain != nullptr || needsStructuralScope) return nullptr;
     if (countDistinct != nullptr || context.stringColumn == nullptr || ordMap == nullptr
-        || !subOps.empty() || !inlineSubOps.empty() || !fieldFacet.sort.empty()) {
+        || !subOps.empty() || !inlineSubOps.empty() || !fieldFacet.sort.empty()
+        || fieldFacet.other_count) {
       return nullptr;
     }
     for (const auto& bucket : context.stringColumn->buckets) {

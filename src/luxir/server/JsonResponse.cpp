@@ -566,6 +566,10 @@ void appendFacetResult(std::string& out, const luxir::api::FacetResult& facet) {
     out += R"(,"missing":)";
     appendInt<Int64Str>(out, *facet.missing);
   }
+  if (facet.other_count.has_value()) {
+    out += R"(,"other_count":)";
+    appendInt<Int64Str>(out, *facet.other_count);
+  }
   out += '}';
 }
 

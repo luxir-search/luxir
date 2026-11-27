@@ -4176,11 +4176,11 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
     {"int_unknown_sort", [](LocalReq& req) {
       qb::sort(req.facet("f", "foo_i"), "avg", qb::ASC);
     }, "unknown sort field 'avg'"},
-    {"int_two_sorts", [](LocalReq& req) {
+    {"int_duplicate_sort", [](LocalReq& req) {
       auto& facet = req.facet("f", "foo_i");
-      qb::sort(facet, "first", qb::ASC);
-      qb::sort(facet, "second", qb::DESC);
-    }, "multiple sort fields"},
+      qb::sort(facet, "_key", qb::ASC);
+      qb::sort(facet, "_key", qb::DESC);
+    }, "duplicate sort key"},
     {"int_noninline_sort", [](LocalReq& req) {
       auto& facet = req.facet("f", "foo_i");
       facet.facet("nested", "cat_s");
@@ -4204,11 +4204,11 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
       auto& facet = req.facet("f", "cat_s");
       qb::sort(facet, "not_a_subop", qb::ASC);
     }, "unknown sort field"},
-    {"string_two_sorts", [](LocalReq& req) {
+    {"string_duplicate_sort", [](LocalReq& req) {
       auto& facet = req.facet("f", "cat_s");
-      qb::sort(facet, "first", qb::ASC);
-      qb::sort(facet, "second", qb::DESC);
-    }, "multiple sort fields"},
+      qb::sort(facet, "_key", qb::ASC);
+      qb::sort(facet, "_key", qb::DESC);
+    }, "duplicate sort key"},
     // A _sc field is column-stored with no term dictionary, so there are no
     // ordinals to count. This used to reach StrFacetOp and crash there.
     {"string_column_only", [](LocalReq& req) {

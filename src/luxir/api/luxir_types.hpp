@@ -1034,8 +1034,10 @@ struct FieldFacet {
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   ::hpp_proto::optional_indirect_view<Val> selected;
   std::optional<TermFilter> term_filter;
+  ::hpp_proto::optional_indirect_view<Val> after;
   SelectionMode selection_mode = SelectionMode::ANY;
   bool missing = false;
+  bool other_count = false;
 };
 struct QueryBucket {
   std::string_view name;
@@ -1104,6 +1106,7 @@ struct FacetResult {                                           // needs Column (
   std::optional<std::int64_t> missing;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
   int64_t offset = 0;
+  std::optional<std::int64_t> other_count;
 };
 struct Val {                                                   // needs Map,ArrVal,Arr*,Vector,ArrVector,DocList,FacetResult
   std::variant<std::monostate, google::protobuf::NullValue, std::string_view, std::int64_t,

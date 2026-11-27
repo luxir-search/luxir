@@ -888,6 +888,8 @@ enum SelectionMode {
 // it is not the same as adding a filter to the search. Terms are tested as
 // indexed: prefix, regex, include, and exclude values are normalized the way
 // the field normalizes query text, and ID fields use them verbatim.
+// INT/DATE/FLOAT/DOUBLE fields accept only include and exclude, whose values
+// are coerced as the field's query values (a DATE value may be a date string).
 message TermFilter {
   // Keeps terms starting with this prefix. Empty = unset.
   string prefix = 1;
@@ -916,7 +918,7 @@ message TermFilter {
 
 // Buckets of distinct field values, using the field's value binding.
 // STRING/ID, INT/DATE/FLOAT/DOUBLE, and TEXT support counts, limits, mincount,
-// missing, selections, sub-operations, and metric sorts. Distinct counts are
+// missing, selections, sub-operations, and sorts. Distinct counts are
 // supported except on TEXT; metric sorts with distinct counts are unsupported.
 message FieldFacet {
   enum CountUnit {
@@ -935,8 +937,12 @@ message FieldFacet {
   optional int64 mincount = 3;
   bool missing = 4; // Return the count without a value, in the chosen count unit.
 
-  // One metric sub-operation name. Unset sorts by count
-  // descending, then bucket value ascending.
+  // Order of the ordinary buckets. Each key's expr is `_count` (the bucket
+  // count), `_key` (the bucket value), or the name of a metric sub-operation;
+  // dir DESC sorts descending, otherwise ascending. Later keys break ties, and
+  // the bucket value ascending breaks any tie left. A key may appear once.
+  // Unset sorts by count descending, then bucket value ascending. Strings
+  // order by indexed bytes; numbers, dates, and booleans by value.
   repeated SortSpec sort = 5;
   map<string, SearchOp> ops = 6;  // sub-facets or search operations performed per bucket
 
@@ -960,6 +966,15 @@ message FieldFacet {
   // without a value, and selected buckets are returned whether or not they
   // pass the filter.
   TermFilter term_filter = 11;
+
+  // Starts the ordinary page after this bucket value, for paging in value
+  // order: requires sort to begin with `_key`, and keeps only values after it
+  // in that key's direction. Coerced as a selected value; the value need not
+  // exist.
+  Val after = 12;
+
+  // Return FacetResult.other_count.
+  bool other_count = 13;
 }
 
 message CalendarGap {
@@ -1227,6 +1242,10 @@ message FacetResult {
   optional int64 missing = 4; // the number of documents that do not have this field
   map<string, Val> ops = 22;  // sub-operation results performed per bucket, like a sub-facet or statistics.
   int64 offset = 6;
+  // With FieldFacet.other_count: the summed counts of the values that could be
+  // ordinary buckets (passing term_filter and after, at any count) but are not
+  // on the ordinary page. Selected buckets appended after the page count here.
+  optional int64 other_count = 7;
 }
 
 //
