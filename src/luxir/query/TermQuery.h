@@ -341,6 +341,10 @@ public:
     // simScorer is absent when scores are not needed; score() is then 0.
     std::optional<luxir::NormsReader::Iterator> normsIter;
     const uint8_t* flatNormsBase = nullptr;
+    // CONSTANT or docid-addressed PACKED norms: O(1) by docid, no iterator.
+    // CONSTANT also caches its byte in constantNorm (-1 otherwise).
+    const luxir::NormsReader* byDocNorms = nullptr;
+    int32_t constantNorm = -1;
     luxir::Similarity::BM25Scorer* simScorer;
     ImpactsIndex impacts;
     float minCompetitiveScore = 0.0f;
@@ -377,6 +381,12 @@ public:
       if (normsReader != nullptr) {
         normsIter.emplace(*normsReader);
         flatNormsBase = normsReader->flatBase();
+        if (normsReader->isConstant()) {
+          byDocNorms = normsReader;
+          constantNorm = normsReader->constantValue();
+        } else if (normsReader->isPackedByDoc()) {
+          byDocNorms = normsReader;
+        }
       }
       competitiveBound = std::numeric_limits<float>::infinity();
     }
@@ -515,8 +525,7 @@ public:
       if (!docsEnum.matchScoredProbe(target, tf)) {
         return false;
       }
-      int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[target]
-                                                     : advanceNorm(target);
+      int64_t encodedNorm = inlineNorm(target);
       score = boost * simScorer->score((float) tf, encodedNorm);
       return true;
     }
@@ -554,6 +563,12 @@ public:
       if (flatNormsBase != nullptr) {
         return flatNormsBase[doc];
       }
+      if (constantNorm >= 0) {
+        return constantNorm;
+      }
+      if (byDocNorms != nullptr) {
+        return byDocNorms->packedByDocValue(doc);
+      }
       if (normsIter) {
         [[maybe_unused]] int32_t normDoc = normsIter->advance(doc);
         assert(normDoc == doc);
@@ -568,15 +583,21 @@ public:
       return lookupNorm(doc);
     }
 
+    // Keep the flat-norms load and the cached constant inline (one indexed
+    // byte read, or none); the NOINLINE advanceNorm wrapper stays for the
+    // other norm layouts, which is the inliner-sensitive code pulled into
+    // score().
+    int64_t inlineNorm(int32_t doc) LUXIR_INLINE {
+      if (flatNormsBase != nullptr) return flatNormsBase[doc];
+      if (constantNorm >= 0) return constantNorm;
+      return advanceNorm(doc);
+    }
+
     float score() override {
       if (simScorer == nullptr) return 0.0f;
       auto docid = docsEnum.docId();
       int32_t tf = docsEnum.termFreq();
-      // Keep the flat-norms load inline (it is one indexed byte read); the
-      // NOINLINE advanceNorm wrapper stays for the sparse iterator walk only,
-      // which is the inliner-sensitive code pulled into score().
-      int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[docid]
-                                                     : advanceNorm(docid);
+      int64_t encodedNorm = inlineNorm(docid);
       return boost * simScorer->score((float) tf, encodedNorm);
     }
 
@@ -627,8 +648,7 @@ public:
         }
         if (matched && simScorer != nullptr) {
           int32_t tf = docsEnum.termFreq();
-          int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[target]
-                                                         : advanceNorm(target);
+          int64_t encodedNorm = inlineNorm(target);
           scores[i] += boost * simScorer->score((float) tf, encodedNorm);
         }
         if (required && matched) {
@@ -753,6 +773,17 @@ public:
         for (int32_t i = 0; i < count; i++) {
           int32_t doc = blockDocs[(size_t) i];
           normBuf[i] = flatNormsBase[doc];
+        }
+        simScorer->scoreBlock(blockFreqs.data(), normBuf, boost, scores, count);
+        return;
+      }
+      if (byDocNorms != nullptr) {
+        assert(count <= Postings::DOCS_BLOCK_SIZE);
+        uint8_t normBuf[Postings::DOCS_BLOCK_SIZE];
+        if (constantNorm >= 0) {
+          std::fill(normBuf, normBuf + count, (uint8_t) constantNorm);
+        } else {
+          byDocNorms->byDocValues(blockDocs.data(), count, normBuf);
         }
         simScorer->scoreBlock(blockFreqs.data(), normBuf, boost, scores, count);
         return;

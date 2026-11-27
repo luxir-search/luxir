@@ -5,6 +5,7 @@
 
 #include "CatalogIO.h"
 #include "IdFilter.h"
+#include "NormsLayout.h"
 #include "Space.h"
 #include "luxir/index/IndexFieldInfo.h"
 
@@ -72,8 +73,6 @@ struct OrdOptions {
 constexpr uint8_t HAS_END_OFFSETS = 1u << 0;
 // A vector column in an encoding other than f32 carries the encoding byte.
 constexpr uint8_t HAS_VECTOR_ENCODING = 1u << 1;
-// Sparse norm bytes are indexed by docs-with-field rank.
-constexpr uint8_t SPARSE_NORMS = 1u << 0;
 
 template <class Mode>
 Mode readMode(Reader& in, uint8_t value, const char* reason) {
@@ -450,6 +449,10 @@ public:
     if (norms.mode == NormsMode::SPARSE && header.docsWithField == maxDoc) {
       io.invalid("sparse norms require a docs bitmap");
     }
+    // The header and codes are checked against this size when read (NormsReader).
+    if (norms.mode == NormsMode::PACKED && norms.packedBytes <= NormsLayout::PACKED_HEADER_BYTES) {
+      io.invalid("packed norms shorter than their header");
+    }
     extents.add(io, normsValues(norms, maxDoc, header.docsWithField));
   }
 
@@ -682,13 +685,15 @@ void readPart(Reader& in, Points& points) {
 }
 
 void writePart(Writer& out, const Norms& norms) {
-  out.writeByte(norms.mode == NormsMode::SPARSE ? SPARSE_NORMS : 0);
+  out.writeByte((uint8_t)norms.mode);
   writeLocation(out, norms.location);
+  if (norms.mode == NormsMode::PACKED) out.writeVarUInt(norms.packedBytes);
 }
 
 void readPart(Reader& in, Norms& norms) {
-  norms.mode = in.readOptions(SPARSE_NORMS) & SPARSE_NORMS ? NormsMode::SPARSE : NormsMode::FLAT;
+  norms.mode = readMode<NormsMode>(in, in.readByte(), "unknown norms mode");
   norms.location = readLocation(in);
+  if (norms.mode == NormsMode::PACKED) norms.packedBytes = in.readVarUInt();
 }
 
 void writePart(Writer& out, const Stored& stored) {
