@@ -327,7 +327,7 @@ TEST_F(PluginExtensionTest, hitDecoratorAddsColumnToEmittedHits) {
 
 TEST_F(PluginExtensionTest, extraColumnRejectsDiscoveredFieldCollisions) {
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "d1", "cat_s", "x", "price_i", 17)},
-                              UpdateMessage::COMMIT, true).success);
+                              UpdateMessage::COMMIT).success);
   for (auto format : {api::DocFormat::COLUMNS, api::DocFormat::ROWS}) {
     SCOPED_TRACE((int)format);
     for (std::string_view fields : {"", R"(,"fields":["*"])", R"(,"fields":["price*"])"}) {
@@ -362,7 +362,7 @@ TEST_F(PluginExtensionTest, extraColumnNamesMustBeUniqueAndNotReserved) {
 
 TEST_F(PluginExtensionTest, explicitSelectorKeepsExtraAndOtherFields) {
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "d1", "cat_s", "x", "price_i", 17)},
-                              UpdateMessage::COMMIT, true).success);
+                              UpdateMessage::COMMIT).success);
   for (auto format : {api::DocFormat::COLUMNS, api::DocFormat::ROWS}) {
     SCOPED_TRACE((int)format);
     for (auto [fields, size] : {std::pair{R"(["price_i"])", 1u}, {R"(["price_i","cat_s"])", 2u},

@@ -738,7 +738,7 @@ TEST_F(IndexWriterTest, autoMerge) {
     iw.commit(std::move(finishCommit), UpdateMessage::CommitType::COMMIT);
     /* not needed to avoid deadlock... using a callback and not a blocker that could work-steal was enough.
     arena.execute([&](){
-      iw.commit(UpdateMessage::CommitType::COMMIT, false, std::move(finishCommit));
+      iw.commit(UpdateMessage::CommitType::COMMIT, std::move(finishCommit));
     });
     */
 
@@ -1145,23 +1145,23 @@ TEST_F(IndexWriterTest, multiThreaded) {
 }
 
 
-TEST_F(IndexWriterTest, deleteThenAllowDupsInSameInverter) {
+TEST_F(IndexWriterTest, deleteThenReindexInSameInverter) {
   using namespace luxir::test;
   LuxirNode node;
   CollectionHelper helper(node);
-  ASSERT_TRUE(helper.index(flatdoc("id", "older"), UpdateMessage::NO_COMMIT, false).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "older"), UpdateMessage::NO_COMMIT).success);
   ASSERT_TRUE(helper.deleteById("x").success);
-  ASSERT_TRUE(helper.index(flatdoc("id", "x"), UpdateMessage::COMMIT, false).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "x"), UpdateMessage::COMMIT).success);
   EXPECT_EQ(2, helper.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
 }
 
-TEST_F(IndexWriterTest, localDeleteThenAllowDupsRemovesOlderContent) {
+TEST_F(IndexWriterTest, localDeleteThenReindexRemovesOlderContent) {
   using namespace luxir::test;
   LuxirNode node;
   CollectionHelper helper(node);
-  ASSERT_TRUE(helper.index(flatdoc("id", "x", "text_w", "old"), UpdateMessage::NO_COMMIT, true).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "x", "text_w", "old"), UpdateMessage::NO_COMMIT).success);
   ASSERT_TRUE(helper.deleteById("x").success);
-  ASSERT_TRUE(helper.index(flatdoc("id", "x", "text_w", "new"), UpdateMessage::COMMIT, false).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "x", "text_w", "new"), UpdateMessage::COMMIT).success);
   EXPECT_EQ(1, helper.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q").matchQuery("text_w", "old").fields({"id"});
@@ -1186,9 +1186,9 @@ TEST_F(IndexWriterTest, localDeletePreservesNewerArrivalBeforeOlderOverwrite) {
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
   CollectionHelper::UpdateBuilder oldRequest, deleteRequest, newRequest;
-  oldRequest.add(flatdoc("id", "x", "text_w", "old")).overwrite();
+  oldRequest.add(flatdoc("id", "x", "text_w", "old"));
   deleteRequest.remove("x");
-  newRequest.add(flatdoc("id", "x", "text_w", "new")).allowDups();
+  newRequest.add(flatdoc("id", "x", "text_w", "new"));
   SignaledUpdate older(&oldRequest.finish()), deletion(&deleteRequest.finish()), newer(&newRequest.finish());
   std::latch releaseOlder(1);
   std::promise<void> olderEntered, deleteComplete, newerComplete;
@@ -1236,7 +1236,7 @@ TEST_F(IndexWriterTest, packetSkipsItsOwnSegment) {
   std::atomic<int> applied = 0;
   Signal::listen("deleteAppliedToSegment", [&](void*, void*, void*) -> void* { applied++; return nullptr; });
   auto unlisten = scope_guard([] { Signal::unlisten("deleteAppliedToSegment"); });
-  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT, true).success);
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
   EXPECT_EQ(1, applied.load());
   EXPECT_EQ(2, iw->snapshots.readers.getReader()->liveDocs());
 }
@@ -1262,7 +1262,7 @@ TEST_F(IndexWriterTest, chunkedDeleteApplicationDeletesExactlyTheIds) {
   EXPECT_EQ(even, publishedIds(helper));
 }
 
-TEST_F(IndexWriterTest, unrelatedDeleteDoesNotDeleteLaterAllowDups) {
+TEST_F(IndexWriterTest, unrelatedDeleteDoesNotDeleteLaterReindex) {
   using namespace luxir::test;
   LuxirNode node;
   CollectionHelper helper(node);
@@ -1273,7 +1273,7 @@ TEST_F(IndexWriterTest, unrelatedDeleteDoesNotDeleteLaterAllowDups) {
   iw->updateGraph->wait_for_all();
   ASSERT_EQ(1, iw->pendingDeletes.size());
   iw->perInverterRamBytes = SIZE_MAX;
-  ASSERT_TRUE(helper.index(flatdoc("id", "x"), UpdateMessage::NO_COMMIT, false).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "x"), UpdateMessage::NO_COMMIT).success);
   ASSERT_TRUE(helper.deleteById("y", UpdateMessage::COMMIT).success);
   EXPECT_EQ(1, iw->snapshots.readers.getReader()->liveDocs());
 }
@@ -1371,12 +1371,12 @@ TEST_F(IndexWriterTest, requestBirthBlocksRejectCorruption) {
 TEST_F(IndexWriterTest, requestBirthRollbackAcrossSealedBlock) {
   using namespace luxir::test;
   CollectionHelper helper;
-  for (uint32_t i = 0; i < VersionRuns::BLOCK_SIZE; i++) ASSERT_TRUE(helper.index(Doc{}, UpdateMessage::NO_COMMIT, false).success);
+  for (uint32_t i = 0; i < VersionRuns::BLOCK_SIZE; i++) ASSERT_TRUE(helper.index(Doc{}, UpdateMessage::NO_COMMIT).success);
   CollectionHelper::UpdateBuilder request;
   request.add(Doc{}).add(flatdoc("no_such_field", "fail")).allOrNone();
   auto failed = helper.submit(request);
   ASSERT_FALSE(failed.success);
-  auto last = helper.index(Doc{}, UpdateMessage::COMMIT, false);
+  auto last = helper.index(Doc{}, UpdateMessage::COMMIT);
   ASSERT_TRUE(last.success);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(VersionRuns::BLOCK_SIZE + 1, reader->liveDocs());
@@ -1391,9 +1391,9 @@ TEST_F(IndexWriterTest, requestBirthsPreserveFieldlessDocuments) {
   using namespace luxir::test;
   LuxirNode node;
   CollectionHelper helper(node);
-  auto result = helper.index(Doc{}, UpdateMessage::COMMIT, false);
+  auto result = helper.index(Doc{}, UpdateMessage::COMMIT);
   ASSERT_TRUE(result.success);
-  ASSERT_TRUE(helper.index(Doc{}, UpdateMessage::COMMIT, false).success);
+  ASSERT_TRUE(helper.index(Doc{}, UpdateMessage::COMMIT).success);
   helper.getIndexWriter()->mergeSegments();
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q").allQuery().fields({"_version_"});
@@ -1407,7 +1407,7 @@ TEST_F(IndexWriterTest, requestBirthsCoverRollbackAndEmptyAcquisitions) {
   LuxirNode node;
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
-  auto first = helper.index(flatdoc("id", "keep"), UpdateMessage::NO_COMMIT, false);
+  auto first = helper.index(flatdoc("id", "keep"), UpdateMessage::NO_COMMIT);
   ASSERT_TRUE(first.success);
   auto previousVersion = first.updateVersion;
   for (int i = 0; i < 20; i++) {
@@ -1423,7 +1423,7 @@ TEST_F(IndexWriterTest, requestBirthsCoverRollbackAndEmptyAcquisitions) {
   request.add(flatdoc("id", "rolled-back")).add(flatdoc("no_such_field", "fail")).allOrNone();
   auto failed = helper.submit(request);
   EXPECT_FALSE(failed.success);
-  auto last = helper.index(flatdoc("text_w", "anonymous"), UpdateMessage::COMMIT, false);
+  auto last = helper.index(flatdoc("text_w", "anonymous"), UpdateMessage::COMMIT);
   ASSERT_TRUE(last.success);
   auto reader = iw->snapshots.readers.getReader();
   ASSERT_EQ(1, reader->segments().size());
@@ -1451,11 +1451,11 @@ TEST_F(IndexWriterTest, requestBirthsMergeDeletedRuns) {
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
   iw->mergePolicy->setMergeFactor(1000);
-  auto first = helper.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT, false);
+  auto first = helper.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT);
   ASSERT_TRUE(first.success);
   ASSERT_TRUE(helper.deleteById("a").success);
-  ASSERT_TRUE(helper.index(flatdoc("id", "c"), UpdateMessage::NO_COMMIT, false).success);
-  auto last = helper.index(flatdoc("id", "d"), UpdateMessage::COMMIT, false);
+  ASSERT_TRUE(helper.index(flatdoc("id", "c"), UpdateMessage::NO_COMMIT).success);
+  auto last = helper.index(flatdoc("id", "d"), UpdateMessage::COMMIT);
   ASSERT_TRUE(last.success);
   ASSERT_TRUE(helper.deleteById("c", UpdateMessage::COMMIT).success);
   iw->mergeSegments();
@@ -1477,7 +1477,7 @@ TEST_F(IndexWriterTest, requestBirthMergeMixedBlocks) {
   for (int mode = 0; mode < 3; mode++) {
     for (uint32_t i = 0; i < VersionRuns::BLOCK_SIZE + 3; i++) {
       int count = mode == 0 ? 1 : mode == 1 ? 3 : (int)(i % 3) + 1;
-      auto result = helper.indexAll(std::vector<Doc>((size_t)count), UpdateMessage::NO_COMMIT, false);
+      auto result = helper.indexAll(std::vector<Doc>((size_t)count), UpdateMessage::NO_COMMIT);
       ASSERT_TRUE(result.success);
       births.insert(births.end(), (size_t)count, result.updateVersion);
     }
@@ -1512,20 +1512,20 @@ TEST_F(IndexWriterTest, versionIsRetrievalOnly) {
   }
 }
 
-// Every document exposes its request birth, including allow_dups documents.
+// Every document exposes its request birth.
 TEST_F(IndexWriterTest, versionFieldOverwrite) {
   using namespace luxir::test;
   
   CollectionHelper helper("main");
 
   Doc doc1 = flatdoc("id", "doc1", "text_w", "hello world");
-  auto result1 = helper.index(doc1, UpdateMessage::COMMIT, false);
+  auto result1 = helper.index(doc1, UpdateMessage::COMMIT);
 
   Doc doc2 = flatdoc("id", "doc2", "text_w", "hello version world");
-  auto result2 = helper.index(doc2, UpdateMessage::COMMIT, true);
+  auto result2 = helper.index(doc2, UpdateMessage::COMMIT);
 
   Doc doc3 = flatdoc("id", "doc3", "text_w", "hello third world");
-  auto result3 = helper.index(doc3, UpdateMessage::COMMIT, true);
+  auto result3 = helper.index(doc3, UpdateMessage::COMMIT);
   
   EXPECT_GT(result3.updateVersion, result2.updateVersion);
 
@@ -1556,7 +1556,7 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
 
   // Now index doc2 again with overwrite
   Doc doc2Overwrite = flatdoc("id", "doc2", "text_w", "hello version world again");
-  helper.index(doc2Overwrite, UpdateMessage::COMMIT, true);
+  helper.index(doc2Overwrite, UpdateMessage::COMMIT);
   req = LocalReq::create(helper.getSearchEngine());
   req->collection("main").topDocs("q").allQuery().fields({"id", "text_w", "_version_"}).limit(-1);
   req->execute();
@@ -1583,7 +1583,7 @@ TEST_F(IndexWriterTest, requestBirthsCoverIdlessSlots) {
     flatdoc("text_w", "anonymous filler"),
     flatdoc("id", "sv1", "text_w", "versioned target"),
   };
-  helper.indexAll(docs, UpdateMessage::COMMIT, true);
+  helper.indexAll(docs, UpdateMessage::COMMIT);
 
   // Deleting the versioned doc reads its version during applyDeletes.
   helper.deleteById("sv1", UpdateMessage::COMMIT);
@@ -1616,15 +1616,15 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
 
   // Add 3 documents with versions (overwrite=true adds _version_ field)
   Doc doc1 = flatdoc("id", "doc1", "text_w", "hello world");
-  helper.index(doc1, UpdateMessage::COMMIT, true);
+  helper.index(doc1, UpdateMessage::COMMIT);
 
   // for now, put the doc to be deleted in a seg with another doc since we
   // haven't implemented the logic to drop an entire segment!
   Doc doc2 = flatdoc("id", "doc2", "text_w", "goodbye world");
-  helper.index(doc2, UpdateMessage::NO_COMMIT, true);
+  helper.index(doc2, UpdateMessage::NO_COMMIT);
 
   Doc doc3 = flatdoc("id", "doc3", "text_w", "test document");
-  auto result3 = helper.index(doc3, UpdateMessage::COMMIT, true);
+  auto result3 = helper.index(doc3, UpdateMessage::COMMIT);
 
   
   // Delete doc2
@@ -1763,7 +1763,7 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
   
   // Add another document to force another commit, which should wait long enough for the segment to be deleted.
   Doc doc4 = flatdoc("id", "doc4", "text_w", "final document");
-  helper.index(doc4, UpdateMessage::COMMIT, true);
+  helper.index(doc4, UpdateMessage::COMMIT);
   
   // Verify that the index files for the deleted segment have actually been removed
   // The deletePrefix method should have removed all files starting with the segment prefix
@@ -1947,7 +1947,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
           if (operation == 0) { // Index
             uint32_t maxSegments = nextCommitMaxSegments(r);
             Doc doc = flatdoc("id", docId);
-            auto result = helper.index(doc, UpdateMessage::COMMIT, true, maxSegments);
+            auto result = helper.index(doc, UpdateMessage::COMMIT, maxSegments);
             checkCommittedResponse(maxSegments, result);
             // TODO: expose and get LuxirError for actual error message / stack trace.
             docVersions[localDoc] = result.updateVersion;
@@ -2017,7 +2017,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
             if (r.rint(2) == 0) {
               // Single doc that fails on an unknown field.
               Doc doc = flatdoc("id", docId, "no_such_field", "boom");
-              auto result = helper.index(doc, UpdateMessage::COMMIT, true, maxSegments);
+              auto result = helper.index(doc, UpdateMessage::COMMIT, maxSegments);
               recordForceMergeResponse(maxSegments, result);
               ASSERT_FALSE(result.success);
               ASSERT_EQ(luxir::api::UpdateResponse_::Status::ERROR, result.status);
@@ -2031,7 +2031,6 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
               CollectionHelper::UpdateBuilder b;
               b.add(flatdoc("id", otherId));
               b.add(flatdoc("id", docId, "no_such_field", "boom"));
-              b.overwrite(true);  // allow_dups = false
               b.allOrNone(true);
               b.commit(false, maxSegments);
               auto result = helper.submit(b);
@@ -2046,7 +2045,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
           }
 
           Doc doc = flatdoc("id", docId);
-          auto result = helper.index(doc, UpdateMessage::COMMIT, true, maxSegments);
+          auto result = helper.index(doc, UpdateMessage::COMMIT, maxSegments);
           checkCommittedResponse(maxSegments, result);
           // TODO: expose and get LuxirError for actual error message / stack trace.
           docVersions[localDoc] = result.updateVersion;
@@ -2152,13 +2151,13 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
   
   // Create first segment with doc1
   Doc doc1 = flatdoc("id", "doc1", "text_w", "hello world");
-  helper.index(doc1, UpdateMessage::COMMIT, true);
+  helper.index(doc1, UpdateMessage::COMMIT);
   
   // Create second segment with doc2 and doc3 together (tests reordering when doc2 is deleted)
   Doc doc2 = flatdoc("id", "doc2", "text_w", "goodbye world");
   Doc doc3 = flatdoc("id", "doc3", "text_w", "test document");
-  helper.index(doc2, UpdateMessage::NO_COMMIT, true);
-  helper.index(doc3, UpdateMessage::COMMIT, true);
+  helper.index(doc2, UpdateMessage::NO_COMMIT);
+  helper.index(doc3, UpdateMessage::COMMIT);
   
   // Verify we have 2 segments
   auto reader1 = indexWriter->snapshots.readers.getReader();
@@ -2185,7 +2184,7 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
   
   // Add third segment to trigger merge (3 segments total, mergeFactor=3)
   Doc doc4 = flatdoc("id", "doc4", "text_w", "trigger merge");
-  helper.index(doc4, UpdateMessage::COMMIT, true);
+  helper.index(doc4, UpdateMessage::COMMIT);
   
   // Wait for merge to complete
   indexWriter->updateGraph->wait_for_all();
@@ -2268,7 +2267,7 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
       textField += idStr;
       Doc d = flatdoc("id", idStr, "text_w", textField);
       // LOG_DEBUG("Indexing doc:{} text_w:{}", idStr, textField);
-      helper.index(d, UpdateMessage::NO_COMMIT, true);
+      helper.index(d, UpdateMessage::NO_COMMIT);
     }
     // now delete some random document in this segment
     // don't delete all of them since we want enough segments to merge together.
@@ -2548,7 +2547,7 @@ TEST_F(IndexWriterTest, idRangeUsesFittedTerms) {
   test::CollectionHelper helper;
   std::string first = std::string(300, 'x') + "first", second = std::string(300, 'x') + "second";
   ASSERT_TRUE(helper.indexAll({test::flatdoc("id", first, "state_s", "first"),
-                               test::flatdoc("id", second, "state_s", "second")}, UpdateMessage::COMMIT, true).success);
+                               test::flatdoc("id", second, "state_s", "second")}, UpdateMessage::COMMIT).success);
   auto range = helper.getIndexWriter()->segInfos.begin()->second->idRange.load();
   ASSERT_NE(nullptr, range);
   EXPECT_LT(range->max.size(), first.size());
@@ -2620,8 +2619,8 @@ TEST_F(IndexWriterTest, overwriteSurvivesCommitAheadOfOlderUpdate) {
 
   TimedCommitMessage earlyCommit;
   CollectionHelper::UpdateBuilder olderRequest, newerRequest;
-  olderRequest.add(flatdoc("id", "dup")).overwrite().commitWithin(60000);
-  newerRequest.add(flatdoc("id", "dup")).overwrite();
+  olderRequest.add(flatdoc("id", "dup")).commitWithin(60000);
+  newerRequest.add(flatdoc("id", "dup"));
   GatedUpdate older(&olderRequest.finish()), newer(&newerRequest.finish());
   std::latch releaseCommit(1), releaseOlder(1);
   std::promise<void> commitEntered;
@@ -2709,7 +2708,7 @@ TEST_F(IndexWriterTest, publicationSnapshotsDeletesAndRetainsUnflushedPrefix) {
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
   iw->mergePolicy->setMergeFactor(1000);
-  ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT, true).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT).success);
 
   auto& older = iw->obtainInverter(2);
   auto& newer = iw->obtainInverter(3);
@@ -2747,7 +2746,7 @@ TEST_F(IndexWriterTest, failedDeleteApplicationRetainsDeletesForRetry) {
   LuxirNode node;
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
-  ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT, true).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT).success);
   Signal::listen("deleteAppliedToSegment", [](void*, void*, void*) -> void* {
     throw std::runtime_error("injected delete application failure");
   });
@@ -2773,7 +2772,7 @@ TEST_F(IndexWriterTest, liveDocsCreationFailureRetainsDeletesForRetry) {
   auto iw = helper.getIndexWriter();
   iw->mergePolicy->setMergeFactor(1000);
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup"), flatdoc("id", "keep")},
-                             UpdateMessage::COMMIT, true).success);
+                             UpdateMessage::COMMIT).success);
   iw->updateGraph->wait_for_all();
   ASSERT_EQ(1, iw->segInfos.size());
   auto& seg = *iw->segInfos.begin()->second;
@@ -2805,11 +2804,11 @@ TEST_F(IndexWriterTest, liveDocsCreationFailureAbortsFlush) {
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
   iw->mergePolicy->setMergeFactor(1000);
-  ASSERT_TRUE(helper.index(flatdoc("id", "keep"), UpdateMessage::COMMIT, true).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "keep"), UpdateMessage::COMMIT).success);
   iw->updateGraph->wait_for_all();
   int64_t reserved = node.getIndexRamBudget().reservedBytes();
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup")},
-                             UpdateMessage::NO_COMMIT, true).success);
+                             UpdateMessage::NO_COMMIT).success);
   iw->updateGraph->wait_for_all();
   ASSERT_EQ(1, iw->idleInverters.size());
   auto* inverter = iw->idleInverters.begin()->first;
@@ -2836,7 +2835,7 @@ TEST_F(IndexWriterTest, liveDocsCreationFailureAbortsFlush) {
   EXPECT_EQ(0, node.getIndexRamBudget().drainingBytesCount());
   EXPECT_EQ(0, node.getIndexRamBudget().retainedDeleteBytesCount());
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup")},
-                             UpdateMessage::COMMIT, true).success);
+                             UpdateMessage::COMMIT).success);
   expectValidInventory(iw->dir, *readDurableIndexInfo(iw->dir));
 }
 
@@ -2886,7 +2885,7 @@ TEST_F(IndexWriterTest, mergingDeleteListsPreservesSharedInputs) {
     LuxirNode node;
     CollectionHelper helper(node);
     auto iw = helper.getIndexWriter();
-    ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT, true).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT).success);
     iw->updateGraph->wait_for_all();
     ASSERT_EQ(1, iw->segInfos.size());
 
@@ -2929,11 +2928,11 @@ TEST_F(IndexWriterTest, removeFields) {
     "int_i", 42,
     "int_is", std::vector<int64_t>{100, 200, 300}
   );
-  helper.index(bigDoc, UpdateMessage::COMMIT, true);
+  helper.index(bigDoc, UpdateMessage::COMMIT);
   
   // Add dummy document to prevent empty segment
   Doc dummyDoc = flatdoc("id", "doc2");
-  helper.index(dummyDoc, UpdateMessage::NO_COMMIT, true);
+  helper.index(dummyDoc, UpdateMessage::NO_COMMIT);
   
   // Delete the big document
   helper.deleteById("doc1", UpdateMessage::NO_COMMIT);
@@ -3060,7 +3059,7 @@ TEST_F(IndexWriterTest, testCoreGen) {
   firstBatch.push_back(flatdoc("id", "doc1"));
   firstBatch.push_back(flatdoc("id", "doc2"));
   firstBatch.push_back(flatdoc("id", "doc3"));
-  helper.indexAll(firstBatch, UpdateMessage::COMMIT, true);
+  helper.indexAll(firstBatch, UpdateMessage::COMMIT);
 
   auto reader2 = iw->snapshots.readers.getReader();
   EXPECT_EQ(initialCoreGen + 1, reader2->coreGen()); // First segment added
@@ -3082,7 +3081,7 @@ TEST_F(IndexWriterTest, testCoreGen) {
   std::vector<Doc> secondBatch;
   secondBatch.push_back(flatdoc("id", "doc4"));
   secondBatch.push_back(flatdoc("id", "doc5"));
-  helper.indexAll(secondBatch, UpdateMessage::COMMIT, true);
+  helper.indexAll(secondBatch, UpdateMessage::COMMIT);
 
   auto reader3 = iw->snapshots.readers.getReader();
   EXPECT_EQ(initialCoreGen + 2, reader3->coreGen()); // Second segment added
@@ -3124,7 +3123,7 @@ TEST_F(IndexWriterTest, testCoreGen) {
 
   // Add a doc to trigger commit after merge
   Doc doc6 = flatdoc("id", "doc6", field, "test document 6");
-  helper.index(doc6, UpdateMessage::COMMIT, true);
+  helper.index(doc6, UpdateMessage::COMMIT);
 
   auto reader5 = iw->snapshots.readers.getReader();
   EXPECT_GT(reader5->coreGen(), coreGenBeforeDelete); // Merge changed segments
@@ -3416,7 +3415,7 @@ TEST_F(IndexWriterTest, filesystemCommitsSyncSegmentDataAndDeletes) {
                            UpdateMessage::COMMIT).success);
   for (int i = 0; i < 3; i++) {
     ASSERT_TRUE(helper.index(test::flatdoc("id", "replace", "body_t", "valid"),
-                             UpdateMessage::COMMIT, true).success);
+                             UpdateMessage::COMMIT).success);
     auto reader = writer->snapshots.readers.getReader();
     EXPECT_EQ(2, reader->liveDocs());
     auto manifest = test::readDurableIndexInfo(writer->dir);
@@ -4274,7 +4273,7 @@ TEST_F(IndexWriterTest, deleteOnlyBufferDoesNotPinDocumentFrontier) {
   auto& deletes = iw->obtainInverter(0);
   deletes.deleteId("held", 1);
   iw->perInverterRamBytes = 1;
-  ASSERT_TRUE(helper.index(flatdoc("id", "hot"), UpdateMessage::NO_COMMIT, true).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "hot"), UpdateMessage::NO_COMMIT).success);
   iw->updateGraph->wait_for_all();
   EXPECT_EQ(UINT64_MAX, iw->stats(false, false).minInverterDocVersion);
   runDeletePass(*iw);
@@ -4373,12 +4372,12 @@ TEST_F(IndexWriterTest, deletePassRetiresWithoutPublishing) {
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup"), flatdoc("id", "keep")},
-                             UpdateMessage::COMMIT, true).success);
+                             UpdateMessage::COMMIT).success);
   auto published = iw->snapshots.readers.getReader();
   auto generation = readDurableIndexInfo(iw->dir)->index_gen;
   enableDeletePasses(node, *iw);
   for (int i = 0; i < 8; i++) {
-    ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::NO_COMMIT, true).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::NO_COMMIT).success);
     iw->updateGraph->wait_for_all();
   }
   iw->updateGraph->wait_for_all();
@@ -4406,7 +4405,7 @@ TEST_F(IndexWriterTest, deletePassRemovesEmptySegmentsWithoutPublishing) {
   auto committed = readDurableIndexInfo(iw->dir);
   enableDeletePasses(node, *iw);
   for (int i = 0; i < 20; i++) {
-    ASSERT_TRUE(helper.index(flatdoc("id", "hot"), UpdateMessage::NO_COMMIT, true).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "hot"), UpdateMessage::NO_COMMIT).success);
     iw->updateGraph->wait_for_all();
     EXPECT_EQ(1, iw->stats(false, false).segments);
   }
@@ -4451,7 +4450,7 @@ TEST_F(IndexWriterTest, deletePassReclaimsUnpublishedLiveDocs) {
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup"), flatdoc("id", "a"),
-      flatdoc("id", "b"), flatdoc("id", "c"), flatdoc("id", "d"), flatdoc("id", "keep")}, UpdateMessage::COMMIT, true).success);
+      flatdoc("id", "b"), flatdoc("id", "c"), flatdoc("id", "d"), flatdoc("id", "keep")}, UpdateMessage::COMMIT).success);
   auto& seg = *iw->segInfos.begin()->second;
   auto prefix = seg.name() + "__L";
   enableDeletePasses(node, *iw);
@@ -4595,7 +4594,7 @@ TEST_F(IndexWriterTest, deletePassRetiresDuringMergeAndCarriesRetiredVersion) {
   CollectionHelper helper(node);
   auto iw = helper.getIndexWriter();
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "dup"), flatdoc("id", "a"),
-      flatdoc("id", "b"), flatdoc("id", "c"), flatdoc("id", "keep")}, UpdateMessage::COMMIT, true).success);
+      flatdoc("id", "b"), flatdoc("id", "c"), flatdoc("id", "keep")}, UpdateMessage::COMMIT).success);
   holdDeletePasses(node);
   iw->mergePolicy->setMergeFactor(1000);
   iw->perInverterRamBytes = 1;
@@ -4615,7 +4614,7 @@ TEST_F(IndexWriterTest, deletePassRetiresDuringMergeAndCarriesRetiredVersion) {
   });
   Signal::listen("mergeStart", [&](void*, void*, void*) -> void* { started.count_down(); release.wait(); return nullptr; });
   iw->mergePolicy->setMergeFactor(2);
-  trigger = std::async(std::launch::async, [&] { return helper.index(flatdoc("id", "d"), UpdateMessage::NO_COMMIT, true); });
+  trigger = std::async(std::launch::async, [&] { return helper.index(flatdoc("id", "d"), UpdateMessage::NO_COMMIT); });
   ASSERT_TRUE(eventually([&] { return started.try_wait(); }));
   Signal::listen("commitWaitingForMerges", [&](void*, void*, void*) -> void* { waiting.count_down(); return nullptr; });
   oldCommit.waitForMerges = true;
@@ -4813,32 +4812,6 @@ TEST_F(IndexWriterTest, overlappingPacketsApplyTheirMaximumWatermark) {
   ASSERT_EQ(4, iw->pendingDeletes.size());
   helper.commit();
   EXPECT_EQ((std::multiset<std::string>{"pad", "lowEqual", "low"}), publishedIds(helper));
-  EXPECT_EQ(3, iw->snapshots.readers.getReader()->liveDocs());
-}
-
-// One fact reaches every duplicate posting of its id, here merged into one
-// segment and drained one hit at a time; only older births go.
-TEST_F(IndexWriterTest, deleteFactReachesMergedDuplicatePostings) {
-  using namespace luxir::test;
-  LuxirNode node;
-  CollectionHelper helper(node);
-  auto iw = helper.getIndexWriter();
-  iw->mergePolicy->setMergeFactor(1000);
-  // An inverter keeps one document per id, so each duplicate gets its own segment.
-  ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT).success);
-  ASSERT_TRUE(helper.indexAll({flatdoc("id", "dup"), flatdoc("id", "keep")}, UpdateMessage::COMMIT).success);
-  auto watermark = helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT).updateVersion;
-  ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT).success);
-  iw->mergeSegments();
-  ASSERT_EQ(1, iw->segInfos.size());
-  ASSERT_EQ(5, iw->snapshots.readers.getReader()->liveDocs());
-  holdDeletePasses(node);
-  iw->deleteApplyChunkEntries = 1;
-  auto& inverter = iw->obtainInverter(watermark);
-  inverter.deleteId("dup", watermark);
-  iw->releaseInverter(inverter, true);
-  helper.commit();
-  EXPECT_EQ((std::multiset<std::string>{"dup", "dup", "keep"}), publishedIds(helper));
   EXPECT_EQ(3, iw->snapshots.readers.getReader()->liveDocs());
 }
 

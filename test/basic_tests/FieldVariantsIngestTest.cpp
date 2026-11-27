@@ -175,7 +175,7 @@ TEST_F(FieldVariantsIngestTest, laterBranchFailureRollsBackAndReusesInverter) {
     batch.add(flatdoc("id", "old", "value", "10"));
     batch.add(flatdoc("id", "retry", "value", "badnumber"));
     batch.add(flatdoc("id", "tail", "value", "20"));
-    batch.allOrNone(allOrNone).overwrite();
+    batch.allOrNone(allOrNone);
     auto result = helper.submit(batch);
     ASSERT_EQ(allOrNone ? Status::ERROR : Status::PARTIAL, result.status);
     ASSERT_EQ(1u, result.errors.size());
@@ -187,7 +187,7 @@ TEST_F(FieldVariantsIngestTest, laterBranchFailureRollsBackAndReusesInverter) {
     EXPECT_EQ(seg, reused.getSegId());
     EXPECT_EQ(allOrNone ? 2 : 3, reused.getMaxDoc());
     writer->releaseInverter(reused, false);
-    ASSERT_TRUE(helper.index(flatdoc("id", "retry", "value", "30"), UpdateMessage::COMMIT, true).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "retry", "value", "30"), UpdateMessage::COMMIT).success);
     EXPECT_TRUE(match(helper, "value", "badnumber").empty());
     EXPECT_TRUE(match(helper, "value__a", "badnumber").empty());
     EXPECT_EQ(allOrNone ? 0u : 1u, match(helper, "value__z", "10").size());
@@ -361,11 +361,11 @@ TEST_F(FieldVariantsIngestTest, longIdsSeparateOrMergeAccordingToPolicy) {
       std::string second = std::string(260, 'x') + std::string(40, 'b');
       bool hash = policy == api::FieldDef::LongTerms::HASH128;
       ASSERT_TRUE(helper.index(flatdoc("id", first, "state_s", "first"), commit, true).success);
-      ASSERT_TRUE(helper.index(flatdoc("id", second, "state_s", "second"), UpdateMessage::COMMIT, true).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", second, "state_s", "second"), UpdateMessage::COMMIT).success);
       EXPECT_EQ(hash ? 1u : 0u, match(helper, "state_s", "first").size());
       EXPECT_TRUE(containsDoc(match(helper, "id", first), flatdoc("id", hash ? first : second)));
       EXPECT_TRUE(containsDoc(match(helper, "id", second), flatdoc("id", second)));
-      ASSERT_TRUE(helper.index(flatdoc("id", first, "state_s", "replacement"), UpdateMessage::COMMIT, true).success);
+      ASSERT_TRUE(helper.index(flatdoc("id", first, "state_s", "replacement"), UpdateMessage::COMMIT).success);
       EXPECT_EQ(hash ? 1u : 0u, match(helper, "state_s", "second").size());
       EXPECT_EQ(1u, match(helper, "state_s", "replacement").size());
       ASSERT_TRUE(helper.deleteById(first, UpdateMessage::COMMIT).success);
@@ -383,14 +383,14 @@ TEST_F(FieldVariantsIngestTest, rejectedLongIdAndDeletePreservePendingDocuments)
   id.type = FieldClass::ID;
   id.long_terms = api::FieldDef::LongTerms::REJECT;
   b.set(helper.collection());
-  ASSERT_TRUE(helper.index(flatdoc("id", "pending"), UpdateMessage::NO_COMMIT, true).success);
-  auto rejected = helper.index(flatdoc("id", std::string(300, 'x')), UpdateMessage::NO_COMMIT, true);
+  ASSERT_TRUE(helper.index(flatdoc("id", "pending"), UpdateMessage::NO_COMMIT).success);
+  auto rejected = helper.index(flatdoc("id", std::string(300, 'x')), UpdateMessage::NO_COMMIT);
   ASSERT_EQ(Status::ERROR, rejected.status);
   ASSERT_EQ(1u, rejected.errors.size());
   EXPECT_NE(std::string::npos, rejected.errors[0].error_message.find("id value is 300 bytes"));
   std::vector<std::string> deletes{"pending", std::string(300, 'x')};
   EXPECT_EQ(Status::ERROR, helper.deleteByIds(deletes).status);
-  ASSERT_TRUE(helper.index(flatdoc("id", "after"), UpdateMessage::COMMIT, true).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "after"), UpdateMessage::COMMIT).success);
   EXPECT_EQ(1u, match(helper, "id", "pending").size());
   EXPECT_EQ(1u, match(helper, "id", "after").size());
   auto req = localReq(helper.getSearchEngine());
@@ -564,7 +564,7 @@ TEST_F(FieldVariantsIngestTest, storedAuthorSurvivesLaterStringBranchFailure) {
   CollectionHelper::UpdateBuilder batch;
   batch.add(flatdoc("id", "same", "author", std::string(256, 'x')));
   batch.add(flatdoc("id", "same", "author", "Valid Author"));
-  batch.overwrite().commit();
+  batch.commit();
   auto result = helper.submit(batch);
   ASSERT_EQ(Status::PARTIAL, result.status);
   ASSERT_EQ(1u, result.errors.size());

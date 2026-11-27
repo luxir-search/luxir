@@ -1748,7 +1748,7 @@ TEST_F(HttpApiTest, ndjsonPipelinedMatchesSerialIncludingOverwrites) {
 
     static constexpr int kIds = 12;
     static constexpr int kRounds = 20;
-    std::string overwriteBody = R"({"_update_":{"allow_dups":false}})" "\n";
+    std::string overwriteBody = R"({"_update_":{}})" "\n";
     for (int round = 0; round < kRounds; round++) {
       for (int id = 0; id < kIds; id++) {
         overwriteBody += R"({"id":"overwrite-)" + std::to_string(id) +
@@ -2469,7 +2469,7 @@ TEST_F(HttpApiTest, ndjsonUpdateControlDecodesFullRequestAndInlineDeletes) {
   ASSERT_EQ(200, seed.result_int()) << seed.body();
 
   std::string body =
-      R"({"_update_":{"allow_dups":true,"return_ids":true}})" "\n"
+      R"({"_update_":{"return_ids":true}})" "\n"
       R"({"id":"dup-full","title_w":"fulldecode one"})" "\n"
       R"({"id":"dup-full","title_w":"fulldecode two"})" "\n"
       R"({"_update_":{"delete_ids":["del-mid"],"commit":{}}})" "\n";
@@ -2486,7 +2486,7 @@ TEST_F(HttpApiTest, ndjsonUpdateControlDecodesFullRequestAndInlineDeletes) {
   dupReq.collection("main").matchQuery("title_w", "fulldecode").fields({"id"})
       .limit(10).withStats().execute();
   ASSERT_EQ(200, dupReq.status()) << dupReq.rawResponse();
-  // Local id collisions keep the later document, including with allow_dups.
+  // Local id collisions keep the later document.
   EXPECT_EQ((int64_t)1, dupReq.found()) << dupReq.rawResponse();
 
   HttpReq delReq(port());

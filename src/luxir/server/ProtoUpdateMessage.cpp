@@ -8,6 +8,7 @@
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/ObjectFields.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/schema/ValCoerce.h"
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <new>
@@ -64,33 +65,39 @@ static void validateFieldMap(const luxir::api::UpdateRequest& req) {
 }
 
 
-// The value of the doc's unique id field, or empty if not present.
-// "id" is the schema-defined name for the unique id field.
-static std::string_view docId(const luxir::api::Map& doc, const FieldNameMap& fieldMap) {
-  std::string_view result;
+// The doc's value for the unique id field after field mapping, or null if the
+// doc has none. "id" is the schema-defined name for the unique id field.
+static const IndexVal* idValue(const luxir::api::Map& doc, const FieldNameMap& fieldMap) {
+  const IndexVal* result = nullptr;
   for (const auto& [name, valView] : doc.fields) {
-    if (fieldMap.resolve(name) != std::string_view("id")) {
-      continue;
-    }
-    const IndexVal& val = *valView;
-    if (const auto* s = std::get_if<std::string_view>(&val.kind)) {
-      result = *s;
-    } else if (const auto* bin = std::get_if<BytesView>(&val.kind)) {
-      result = std::string_view((const char*)bin->data(), bin->size());
-    } else {
-      result = {};
-    }
+    if (fieldMap.resolve(name) == std::string_view("id")) result = &*valView;
   }
   return result;  // last "id" wins (protobuf map dedup semantics)
 }
 
+// The id as indexed (numbers in canonical text), or empty if absent, null, or
+// not a scalar. Valid while buf lives.
+static std::string_view docId(const IndexVal* val, std::span<char> buf) {
+  if (val == nullptr) return {};
+  try {
+    return coerce::idText(*val, buf).value_or(std::string_view());
+  } catch (const RequestError&) {
+    return {};
+  }
+}
 
-static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::UndoMark& requestMark) {
+
+static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::UndoMark& requestMark,
+                   IdGenerator& idGenerator) {
   auto& request = *msg.req;
   const bool allOrNone = request.all_or_none;
   const bool returnIds = request.return_ids;
   const FieldNameMap fieldMap(request);
   ObjectFields objectFields;
+  using IdMode = api::SchemaDef::IdMode;
+  const IdMode idMode = inverter.schema->idMode;
+  char idBuf[coerce::TEXT_BUF_SIZE];
+  char generatedBuf[IdGenerator::ENCODED_LEN];
 
   // first docid this request's adds will use; needed for all_or_none rollback.
   const int32_t firstDoc = inverter.getMaxDoc();
@@ -102,9 +109,21 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 
     auto docMark = inverter.undoMark();
     inverter.startDoc();
+    const IndexVal* id = idValue(doc, fieldMap);
+    bool missingId = true;
+    std::string_view generatedId;
 
     try {
+      // An array or map id throws its coercion error here.
+      missingId = id == nullptr || !coerce::idText(*id, idBuf);
+      if (missingId && idMode == IdMode::REQUIRE) {
+        throw DocumentError("Document has no id; the collection's id_mode is REQUIRE", "missing_id");
+      }
       objectFields.index(inverter, doc, fieldMap);
+      if (missingId && idMode == IdMode::GENERATE) {
+        generatedId = IdGenerator::encode(idGenerator.next(), generatedBuf);
+        inverter.indexGeneratedId(generatedId);
+      }
 
       inverter.finishDoc();
     } catch (const FileIOException&) {
@@ -123,12 +142,12 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       failed++;
       ErrorInfo info = currentExceptionInfo(ErrorKind::INTERNAL);
       if (info.kind == ErrorKind::INTERNAL) {
-        LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, docId(doc, fieldMap),
+        LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, docId(id, idBuf),
                   info.message);
       }
       auto* response = msg.getResponse();
       auto& err = msg.addError();
-      err.id = luxir::api::build::arenaStr(msg.responseArena(), docId(doc, fieldMap));
+      err.id = luxir::api::build::arenaStr(msg.responseArena(), docId(id, idBuf));
       err.index = docIndex;
       err.error = luxir::api::build::arenaError(msg.responseArena(), info);
 
@@ -153,7 +172,7 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
     }
 
     if (returnIds) {
-      msg.addId(docId(doc, fieldMap));
+      msg.addId(missingId ? generatedId : docId(id, idBuf));
     }
   }
 
@@ -213,7 +232,9 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   }
 
   Inverter& inverter = iw.obtainInverter(this->updateVersion, this->schema);
-  inverter.overwrite = !req->allow_dups;
+  // A document with an id replaces the live document with that id. Generated
+  // ids skip this (Inverter::indexGeneratedId): they are new by construction.
+  inverter.overwrite = true;
   inverter.coerceContext.dateMathNowEpochMillis = dateMathNowEpochMillis;
 
   // Captured before deletes are queued so an all_or_none failure rolls them back too.
@@ -267,7 +288,7 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   try {
     // Process document additions
     if (!req->docs.empty()) {
-      update(*this, inverter, requestMark);
+      update(*this, inverter, requestMark, iw.idGenerator);
     }
 
     // Size-based auto-flush is checked ONCE here, at the end of the batch - never

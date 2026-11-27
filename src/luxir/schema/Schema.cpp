@@ -1054,6 +1054,12 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(templatePairs.data(), templatePairs.size()));
     src.stored_resources = luxir::api::map_view<std::string_view, api::StoredResourceDef>(
       std::span<const ResourcePair>(resources.data(), resources.size()));
+    // A SET without id_mode keeps the base setting.
+    src.id_mode = def.id_mode ? def.id_mode : baseSrc.id_mode;
+    if (src.id_mode && (int)*src.id_mode > (int)api::SchemaDef::IdMode::REQUIRE) {
+      throw SchemaError("unknown id_mode " + std::to_string((int)*src.id_mode));
+    }
+    schema->idMode = src.id_mode.value_or(api::SchemaDef::IdMode::ALLOW_MISSING);
     schema->sourceDef_ = serializeSchemaDef(src);
   }
 

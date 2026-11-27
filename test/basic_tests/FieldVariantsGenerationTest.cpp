@@ -103,7 +103,7 @@ TEST_F(FieldVariantsGenerationTest, cachedRootVariantCoverageSurvivesReopenAndMe
     EXPECT_EQ((std::vector<std::string>{"new"}), hits(helper, "author__s:=\"le guin\""));
     ASSERT_TRUE(helper.deleteById("old", UpdateMessage::COMMIT).success);
     // Delete + overwrite is real reindexing; merging alone did not fill the variant.
-    ASSERT_TRUE(helper.index(flatdoc("id", "new", "author", "Le Guin"), UpdateMessage::COMMIT, true).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "new", "author", "Le Guin"), UpdateMessage::COMMIT).success);
     EXPECT_TRUE(view(*writer)["fields"]["author"]["representations"]["s"]["coverage_complete"].get<bool>());
   }
   {

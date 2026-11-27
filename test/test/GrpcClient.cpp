@@ -64,6 +64,12 @@ std::string grpcSerialize(const luxir::api::DeleteCollectionRequest& msg, grpc::
 std::string grpcSerialize(const luxir::api::SchemaRequest& msg, grpc::ByteBuffer& out) {
   return serialize(msg, out);
 }
+std::string grpcSerialize(const luxir::api::GetRequest& msg, grpc::ByteBuffer& out) {
+  return serialize(msg, out);
+}
+std::string grpcSerialize(const luxir::api::DeleteRequest& msg, grpc::ByteBuffer& out) {
+  return serialize(msg, out);
+}
 
 std::string grpcParse(luxir::api::SearchResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena) {

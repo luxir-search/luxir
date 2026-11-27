@@ -75,6 +75,7 @@ struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece
 struct TermFilter; struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult;
 struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct Map;
+struct GetRequest; struct DeleteRequest;
 struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
 struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrArrFloat;
 struct ArrArrDouble; struct Vector; struct ArrVector;
@@ -146,6 +147,7 @@ enum class DateUnit { MS = 0, NS = 1 };
 namespace VectorAnnDef_ { enum class Codec { RABITQ = 0, PQ = 1 }; }
 namespace StoredResourceDef_ { enum class Codec { LZ4 = 0, ZSTD = 1 }; }
 namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
+namespace SchemaDef_ { enum class IdMode { ALLOW_MISSING = 0, GENERATE = 1, REQUIRE = 2 }; }
 
 // ===================== message definitions (strict topological order) =====================
 
@@ -906,9 +908,11 @@ struct StoredResourceDef {
   std::optional<bool> zstd_dictionary;                          // align 1
 };
 struct SchemaDef {                                                // needs StoredResourceDef
+  using IdMode = luxir::api::SchemaDef_::IdMode;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> templates;
   map_view<std::string_view, StoredResourceDef> stored_resources;
+  std::optional<IdMode> id_mode;                                // align 4 (enum)
 };
 struct ColVal { std::span<const Val> v; };                        // span<incomplete Val> OK
 struct ColVector { std::span<const Vector> v; };
@@ -1300,10 +1304,23 @@ struct UpdateRequest {                                         // needs CommitPa
   std::optional<CommitParams> commit;
   // Input doc key -> schema field for this request's docs ("" target = drop the key).
   map_view<std::string_view, std::string_view> field_map;
-  bool allow_dups = false;
   bool all_or_none = false;
   bool return_ids = false;
   bool drop_unmapped = false;
+};
+struct GetRequest {
+  std::string_view request_id;
+  std::string_view collection;
+  std::span<const std::string_view> ids;
+  std::span<const std::string_view> fields;
+  std::string_view min_commit;
+  std::optional<uint64_t> min_commit_timeout_ms;
+};
+struct DeleteRequest {                                         // needs CommitParams
+  std::string_view request_id;
+  std::string_view collection;
+  std::span<const std::string_view> ids;
+  std::optional<CommitParams> commit;
 };
 
 // ===================== trivial-destructibility checks =====================
@@ -1319,7 +1336,7 @@ LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionP
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(TermFilter) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
 LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult)
-LUXIR_TD(CollectionCommit) LUXIR_TD(ReplicaResult) LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
+LUXIR_TD(CollectionCommit) LUXIR_TD(ReplicaResult) LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(GetRequest) LUXIR_TD(DeleteRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
 LUXIR_TD(Val) LUXIR_TD(ArrVal) LUXIR_TD(ArrStr) LUXIR_TD(ArrInt) LUXIR_TD(ArrFloat)
 LUXIR_TD(ArrDouble) LUXIR_TD(ArrBin) LUXIR_TD(ArrArrStr) LUXIR_TD(ArrArrInt) LUXIR_TD(ArrArrFloat)
 LUXIR_TD(ArrArrDouble) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
@@ -1367,7 +1384,7 @@ LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTR
 LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(TermFilter) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)
 LUXIR_ENTRY(Domain) LUXIR_ENTRY(SearchResponse) LUXIR_ENTRY(DocList)
-LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(CollectionCommit) LUXIR_ENTRY(ReplicaResult) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
+LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(CollectionCommit) LUXIR_ENTRY(ReplicaResult) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest) LUXIR_ENTRY(GetRequest) LUXIR_ENTRY(DeleteRequest)
 LUXIR_ENTRY(UpdateResponse) LUXIR_ENTRY(Map)
 LUXIR_ENTRY(Val) LUXIR_ENTRY(ArrVal) LUXIR_ENTRY(ArrStr) LUXIR_ENTRY(ArrInt) LUXIR_ENTRY(ArrFloat)
 LUXIR_ENTRY(ArrDouble) LUXIR_ENTRY(ArrBin) LUXIR_ENTRY(ArrArrStr) LUXIR_ENTRY(ArrArrInt)

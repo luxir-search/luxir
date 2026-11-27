@@ -71,9 +71,10 @@ void HttpRouteRegistry::add(std::string method, std::string pattern, HttpHandler
   if (segments.size() >= 2 && segments[0] == "_plugins") {
     if (isCapture(segments[1])) fail("the segment after /_plugins/ must be literal");
   } else if (segments.size() >= 3 && segments[0] == "collections" && segments[1] == "{collection}") {
-    constexpr std::array<std::string_view, 4> builtins = {"_search", "_update", "_schema", "_stats"};
+    constexpr std::array<std::string_view, 6> builtins = {"_search", "_update", "_schema", "_stats", "_mget", "_delete"};
     if (std::ranges::find(builtins, std::string_view(segments.back())) != builtins.end())
       fail("a built-in endpoint name cannot end a plugin route");
+    if (segments[2] == "_doc") fail("_doc paths are reserved");
     if (std::ranges::find(segments, std::string("_snapshot")) != segments.end())
       fail("_snapshot paths are reserved");
     if (isCapture(segments[2])) fail("the segment after {collection} must be literal");

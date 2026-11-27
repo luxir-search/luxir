@@ -46,7 +46,7 @@ Links use a symbol-kind prefix and the lowercase fully qualified name:
 
 ```markdown
 [UpdateRequest](../reference/protobuf.md#message-luxir.updaterequest)
-[allow_dups](../reference/protobuf.md#field-luxir.updaterequest.allow_dups)
+[return_ids](../reference/protobuf.md#field-luxir.updaterequest.return_ids)
 [Update RPC](../reference/protobuf.md#method-luxir.indexer.update)
 ```
 

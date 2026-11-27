@@ -23,7 +23,6 @@ void addJson(CollectionHelper::UpdateBuilder& input, std::string_view json) {
 IndexResult ingest(CollectionHelper& helper, std::initializer_list<std::string_view> docs, bool commit = true) {
   CollectionHelper::UpdateBuilder input;
   for (auto doc : docs) addJson(input, doc);
-  input.overwrite();
   if (commit) input.commit();
   return helper.submit(input);
 }
@@ -158,7 +157,7 @@ TEST_F(NestedIngestTest, duplicateIdsAndAllOrNoneKeepRootUndoAndOwnership) {
   ASSERT_TRUE(ingest(helper, {R"({"id":"x","items_nested":{"label_s":"first"}})",
                              R"({"id":"x","items_nested":{"label_s":"last"}})"}, false).success);
   CollectionHelper::UpdateBuilder input;
-  input.remove("x").overwrite().allOrNone().returnIds().commit();
+  input.remove("x").allOrNone().returnIds().commit();
   addJson(input, R"({"id":"x","items_nested":{"label_s":"replacement"}})");
   addJson(input, R"({"id":"bad","items_nested":[{}, {"unknown":"bad"}]})");
   auto result = helper.submit(input);

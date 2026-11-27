@@ -27,7 +27,6 @@ public:
   struct SubmitOpts {
     bool allOrNone = false;
     bool returnIds = false;
-    bool overwrite = true;
     std::vector<std::string> deleteIds;
   };
 
@@ -44,7 +43,6 @@ public:
     for (const auto& id : opts.deleteIds) {
       b.remove(id);
     }
-    b.overwrite(opts.overwrite);
     b.allOrNone(opts.allOrNone);
     b.returnIds(opts.returnIds);
     b.commit();
@@ -101,7 +99,7 @@ TEST_F(UpdateErrorTest, engineVersionInputIsRejected) {
   for (bool mapped : {false, true}) {
     CollectionHelper::UpdateBuilder b;
     b.add(flatdoc("id", "bad", mapped ? "client_version" : "_version_", (int64_t)42))
-        .overwrite().commit();
+        .commit();
     if (mapped) b.fieldMap({{"client_version", "_version_"}});
     auto result = helper.submit(b);
     EXPECT_FALSE(result.success);
@@ -130,7 +128,7 @@ TEST_F(UpdateErrorTest, engineVersionInputRollsBackAllOrNone) {
 TEST_F(UpdateErrorTest, failedOverwriteKeepsOldVersion) {
   CollectionHelper helper("main");
 
-  helper.index(flatdoc("id", "x1", "text_w", "original content"), UpdateMessage::COMMIT, true);
+  helper.index(flatdoc("id", "x1", "text_w", "original content"), UpdateMessage::COMMIT);
 
   Doc badUpdate = flatdoc("id", "x1", "text_w", "updated content", BAD_FIELD, "boom");
   auto result = submitDocs(helper, {&badUpdate, 1});
@@ -149,8 +147,8 @@ TEST_F(UpdateErrorTest, failedOverwriteKeepsOldVersion) {
 TEST_F(UpdateErrorTest, allOrNoneRollsBackBatch) {
   CollectionHelper helper("main");
 
-  helper.index(flatdoc("id", "a", "text_w", "aye one"), UpdateMessage::COMMIT, true);
-  helper.index(flatdoc("id", "b", "text_w", "bee one"), UpdateMessage::COMMIT, true);
+  helper.index(flatdoc("id", "a", "text_w", "aye one"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "b", "text_w", "bee one"), UpdateMessage::COMMIT);
 
   std::vector<Doc> docs = {
     flatdoc("id", "a", "text_w", "aye two"),                       // indexed, then rolled back
@@ -181,7 +179,7 @@ TEST_F(UpdateErrorTest, allOrNoneRollsBackBatch) {
 TEST_F(UpdateErrorTest, allOrNoneRollsBackDeletes) {
   CollectionHelper helper("main");
 
-  helper.index(flatdoc("id", "y1", "text_w", "keep me"), UpdateMessage::COMMIT, true);
+  helper.index(flatdoc("id", "y1", "text_w", "keep me"), UpdateMessage::COMMIT);
 
   Doc bad = flatdoc("id", "z", "text_w", "zee", BAD_FIELD, "boom");
 
@@ -268,7 +266,7 @@ TEST_F(UpdateErrorTest, inSegmentDuplicateOverwrite) {
     flatdoc("id", "dup", "text_w", "second version"),
   };
 
-  auto result = helper.indexAll(docs, UpdateMessage::COMMIT, true);
+  auto result = helper.indexAll(docs, UpdateMessage::COMMIT);
   EXPECT_TRUE(result.success);
   EXPECT_EQ(ResponseStatus::OK, result.status);
 
@@ -312,8 +310,8 @@ TEST_F(UpdateErrorTest, failedDocDoesNotLockVectorDims) {
 TEST_F(UpdateErrorTest, crossRequestDuplicateOverwrite) {
   CollectionHelper helper("main");
 
-  helper.index(flatdoc("id", "dup", "text_w", "first version"), UpdateMessage::NO_COMMIT, true);
-  helper.index(flatdoc("id", "dup", "text_w", "second version"), UpdateMessage::COMMIT, true);
+  helper.index(flatdoc("id", "dup", "text_w", "first version"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "dup", "text_w", "second version"), UpdateMessage::COMMIT);
 
   EXPECT_EQ(1u, allDocs(helper).size());
   EXPECT_EQ(1u, matchDocs(helper, "second").size());
@@ -326,7 +324,7 @@ TEST_F(UpdateErrorTest, rollbackRestoresLocalOccupantAndWatermark) {
     CollectionHelper helper(node);
     auto iw = helper.getIndexWriter();
     node.getIndexRamBudget().setTotalBytes(0); // uncapped: no delete pass, the packet waits for the commit
-    auto original = helper.index(flatdoc("id", "x", "text_w", "original"), UpdateMessage::NO_COMMIT, true);
+    auto original = helper.index(flatdoc("id", "x", "text_w", "original"), UpdateMessage::NO_COMMIT);
     ASSERT_TRUE(original.success);
     CollectionHelper::UpdateBuilder request;
     if (allOrNone) {
@@ -335,7 +333,6 @@ TEST_F(UpdateErrorTest, rollbackRestoresLocalOccupantAndWatermark) {
     } else {
       request.add(flatdoc("id", "x", "text_w", "changed", "int_i", "invalid"));
     }
-    request.overwrite();
     EXPECT_FALSE(helper.submit(request).success);
     auto& inverter = iw->obtainInverter();
     iw->releaseInverter(inverter, true);
@@ -354,10 +351,10 @@ TEST_F(UpdateErrorTest, rollbackRestoresLocalOccupantAndWatermark) {
 
 TEST_F(UpdateErrorTest, deleteAndRepeatedOverwriteInOneRequestKeepLastDocument) {
   CollectionHelper helper;
-  ASSERT_TRUE(helper.index(flatdoc("id", "x", "text_w", "old"), UpdateMessage::NO_COMMIT, true).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "x", "text_w", "old"), UpdateMessage::NO_COMMIT).success);
   CollectionHelper::UpdateBuilder request;
   request.remove("x").add(flatdoc("id", "x", "text_w", "first"))
-      .add(flatdoc("id", "x", "text_w", "last")).overwrite().commit();
+      .add(flatdoc("id", "x", "text_w", "last")).commit();
   ASSERT_TRUE(helper.submit(request).success);
   EXPECT_EQ(1, allDocs(helper).size());
   EXPECT_EQ(1, matchDocs(helper, "last").size());

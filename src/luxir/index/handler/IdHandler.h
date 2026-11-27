@@ -38,22 +38,11 @@ public:
   }
 
   void index(Inverter& inverter, const IndexVal& val) override {
-    if (auto s = std::get_if<std::string_view>(&val.kind)) {
-      indexId(inverter, *s);
-      return;
-    }
-    if (auto b = std::get_if<::hpp_proto::bytes_view>(&val.kind)) {
-      indexId(inverter, std::string_view((const char*)b->data(), b->size()));
-      return;
-    }
-    // TODO: Missing/null id value is silently ignored - same as other fields.
-    // Validation should happen at a higher level?
-    if (coerce::isNull(val)) return;
-    // Numeric ids index their canonical rendering, so {"id": 123} and
-    // {"id": "123"} are the same document (a numeric JSON id used to index
-    // NOTHING, leaving the doc without an id and thus not overwritable).
+    // A null or empty id indexes nothing. Whether a document may lack an id, or gets a
+    // generated one, is the collection's id_mode, applied by the update path
+    // (ProtoUpdateMessage) before and after the document's fields are indexed.
     char buf[coerce::TEXT_BUF_SIZE];
-    indexId(inverter, fieldType->coerceTerm(val, std::string_view(fieldName), buf));
+    if (auto id = coerce::idText(val, buf)) indexId(inverter, *id);
   }
 
   void index(Inverter& inverter, std::string_view val) override {

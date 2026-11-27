@@ -72,6 +72,13 @@ void Inverter::deleteId(std::string_view id, uint64_t version) {
   static_cast<handler::IdHandler&>(*idHandler_).addDelete(*this, id, version);
 }
 
+void Inverter::indexGeneratedId(std::string_view id) {
+  bool previous = overwrite;
+  overwrite = false;
+  auto restore = scope_guard([&] { overwrite = previous; });
+  getIndexHandler("id").index(*this, id);
+}
+
 size_t Inverter::retainedDeleteBytes() const {
   if (failed() || idHandler_ == nullptr) return 0;
   return static_cast<handler::IdHandler&>(*idHandler_).retainedDeleteBytes();

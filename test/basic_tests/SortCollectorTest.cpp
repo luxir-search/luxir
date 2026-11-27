@@ -4875,7 +4875,7 @@ TEST_F(SortCollectorTest, stringCandidateGateReadsEachDocFreqOnce) {
     docs.push_back(flatdoc("id_s", id, "body_w", inDomain ? "alpha" : "other",
                            "rand_s", value));
   }
-  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT, false, 1).success);
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT, 1).success);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
 

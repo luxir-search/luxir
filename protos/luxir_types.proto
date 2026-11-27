@@ -1316,10 +1316,8 @@ message UpdateRequest {
   // is a no-op.
   repeated string delete_ids = 6;
 
-  // Skip overwrite/dedupe for faster indexing when incoming IDs are known to be
-  // unique and do not already exist in the collection.
-  // Default (false) overwrites any existing document with the same ID.
-  bool allow_dups = 7;
+  reserved 7;  // allow_dups, removed: a document with an id always replaces the
+               // live document with that id
 
   // If true, all documents in this request must be successfully indexed or none will be.
   // Processing stops at the first failing document: documents already indexed by this
@@ -1348,6 +1346,39 @@ message UpdateRequest {
   bool drop_unmapped = 12;
 }
 
+// Fetch documents by id. Runs as a search with one top_docs op, "docs", whose
+// query is an any_of term lookup on the id field, so it sees what searches
+// see (documents become visible when committed) and returns the search
+// response shape. Documents come back in index order; an id with no live
+// document is absent from the results.
+message GetRequest {
+  // Optional opaque identifier, echoed in the response for correlation.
+  string request_id = 1;
+  string collection = 2; // empty selects the default collection, "main"
+  // Ids to fetch, in their indexed form (a numeric id as its canonical string,
+  // "123"). At least one.
+  repeated string ids = 3;
+  // Returned fields, as TopDocs.fields; empty returns the default set, and a
+  // list without "id" gains it.
+  repeated string fields = 4;
+  // As SearchRequest.min_commit and min_commit_timeout_ms: wait until the
+  // collection has published this commit token (from an UpdateResponse).
+  string min_commit = 5;
+  optional uint64 min_commit_timeout_ms = 6;
+}
+
+// Delete documents by id: an update with only delete_ids.
+message DeleteRequest {
+  // Optional opaque identifier, echoed in the response for correlation.
+  string request_id = 1;
+  string collection = 2; // empty selects the default collection, "main"
+  // Ids to delete, in their indexed form. Deleting an id with no document is a
+  // no-op. At least one.
+  repeated string ids = 3;
+  // Commit parameters.  If present, this request will commit.
+  CommitParams commit = 4;
+}
+
 // The response to an update request.  In streaming mode the server sends exactly one
 // response per request.
 message UpdateResponse {
@@ -1372,14 +1403,17 @@ message UpdateResponse {
 
   // ids of documents that were successfully indexed, if return_ids was set to true in the
   // request.  In request order; failed documents are omitted (align against docs by
-  // skipping errors[].index).  A successfully indexed doc without a string/bytes id
-  // contributes an empty string.  Only meaningful when status is OK or PARTIAL; on a
-  // request-level ERROR the listed documents may have been rolled back.
+  // skipping errors[].index).  Numbers are in their canonical string form, and a document
+  // indexed without an id in a collection with SchemaDef.id_mode GENERATE reports its
+  // generated id.  A document indexed without an id (id_mode ALLOW_MISSING) contributes
+  // an empty string.  An id over 255 bytes is reported as given; it is indexed and
+  // returned by searches in its long_terms form unless the id field is stored.  Only meaningful when status is
+  // OK or PARTIAL; on a request-level ERROR the listed documents may have been rolled back.
   repeated string ids = 4;
 
   message DocError {
-    // the id of the failed document as given in the request (empty if absent or not a
-    // string/bytes value)
+    // the id of the failed document as given in the request, numbers in their canonical
+    // string form (empty if absent, null, or not a scalar)
     string id = 1;
 
     // position of the failed document within the request's document list
@@ -2791,7 +2825,7 @@ message SchemaDef {
   // REPLACE_ALL that omits them gets the defaults; redefining them incompatibly, or
   // defining a second ID-class field, is an error. _version_ is fixed and
   // retrieval-only: it returns the update version of the request that indexed
-  // each document, including allow_dups and documents without an ID.
+  // each document, including documents without an ID.
   map<string, FieldDef> fields = 1;
 
   // Abstract definitions, keyed by template name.  Never directly usable as a
@@ -2806,6 +2840,24 @@ message SchemaDef {
   // the defaults without one. mode=set replaces the named entries and keeps
   // the others.
   map<string, StoredResourceDef> stored_resources = 4;
+
+  // What a document without an id (absent, JSON null, or the empty string) does. Explicit ids are
+  // used as given (numbers in their canonical string form) and a document with
+  // an id replaces the live document with that id. Absent in a SET request
+  // keeps the current setting.
+  enum IdMode {
+    // The document is indexed without an id: it can be searched, but not
+    // fetched, overwritten or deleted by id.
+    ALLOW_MISSING = 0;
+    // The engine assigns a unique id (13 characters, Crockford base32 of a
+    // 64-bit snowflake: 41 bits of milliseconds since 2026-01-01, 10 bits of
+    // writer lifetime, 12 bits of sequence; string order is creation order).
+    // Generated ids are returned by return_ids.
+    GENERATE = 1;
+    // The document is rejected with a document error.
+    REQUIRE = 2;
+  }
+  optional IdMode id_mode = 9;
 }
 
 message SchemaRequest {

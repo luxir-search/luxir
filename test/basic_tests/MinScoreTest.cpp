@@ -336,7 +336,7 @@ TEST_F(MinScoreTest, jsonShorthandAndFusionSource) {
   EXPECT_EQ(2, fused->getMatchCount());
 }
 
-// Elasticsearch-style shorthand bodies as a gateway sends them: a match query
+// Elasticsearch-style shorthand bodies as a client sends them: a match query
 // with a top-level min_score, as a float or an integer, beside ops.
 TEST_F(MinScoreTest, jsonShorthandMatchQueryWithOps) {
   CollectionHelper h;

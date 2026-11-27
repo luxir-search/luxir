@@ -25,6 +25,7 @@
 #include "luxir/search/ReaderManager.h"
 #include "luxir/server/LuxirError.h"
 #include "luxir/util/DeadlineScheduler.h"
+#include "IdGenerator.h"
 #include "Inverter.h"
 #include "StoredDictionaryRegistry.h"
 #include "UpdateMessage.h"
@@ -406,6 +407,10 @@ public:
   // increment needs no lock.  Relaxed atomic solely so stats() can read it while
   // an update is in flight without a formal data race.
   std::atomic<uint64_t> updateNumber = 0;
+
+  // Ids for documents indexed without one in an id_mode GENERATE collection.
+  // Seeded from the writer epoch and the last commit's id_clock_ms.
+  IdGenerator idGenerator;
 
   // Next session-local tag for updateSequencerNode.
   uint64_t updateOrdinal = 0;

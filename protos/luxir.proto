@@ -17,12 +17,19 @@ service Indexer {
 
   // One response per request; request_id correlates responses with requests.
   rpc UpdateStream(stream UpdateRequest) returns (stream UpdateResponse) {}
+
+  // Delete documents by id, with an optional commit.
+  rpc Delete(DeleteRequest) returns (UpdateResponse) {}
 }
 
 service Searcher {
   // Each request produces one or more responses, ending with more=false.
   // Use request_id to correlate responses when sending multiple requests.
   rpc Search(stream SearchRequest) returns (stream SearchResponse) {}
+
+  // Fetch documents by id. Runs as a search (see GetRequest) and answers like
+  // Search: one or more responses per request, ending with more=false.
+  rpc Get(stream GetRequest) returns (stream SearchResponse) {}
 }
 
 service Admin {

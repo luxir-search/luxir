@@ -195,8 +195,6 @@ public:
       deleteIds_.push_back(build::arenaStr(mr_, id));
       return *this;
     }
-    UpdateBuilder& overwrite(bool v = true) { request_.allow_dups = !v; return *this; }
-    UpdateBuilder& allowDups(bool v = true) { request_.allow_dups = v; return *this; }
     UpdateBuilder& allOrNone(bool v = true) { request_.all_or_none = v; return *this; }
     UpdateBuilder& returnIds(bool v = true) { request_.return_ids = v; return *this; }
     UpdateBuilder& fieldMap(std::initializer_list<std::pair<std::string_view, std::string_view>> entries) {
@@ -270,8 +268,8 @@ public:
   }
 
   IndexResult index(const Doc& doc, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT,
-                    bool overwrite = false, uint32_t maxSegments = 0) {
-    return indexAll({&doc, 1}, commitType, overwrite, maxSegments);
+                    uint32_t maxSegments = 0) {
+    return indexAll({&doc, 1}, commitType, maxSegments);
   }
 
   // Submit a fully-built UpdateBuilder (for cases the convenience methods don't cover:
@@ -282,18 +280,17 @@ public:
   // Consume initializer lists synchronously, before their backing array expires.
   IndexResult indexAll(std::initializer_list<Doc> docs,
                        UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT,
-                       bool overwrite = false, uint32_t maxSegments = 0) {
+                       uint32_t maxSegments = 0) {
     return indexAll(std::span<const Doc>(docs.begin(), docs.size()),
-                    commitType, overwrite, maxSegments);
+                    commitType, maxSegments);
   }
 
   IndexResult indexAll(std::span<const Doc> docs,
                        UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT,
-                       bool overwrite = false, uint32_t maxSegments = 0) {
+                       uint32_t maxSegments = 0) {
     UpdateBuilder b;
     for (const auto& doc : docs) b.add(doc);
     if (commitType != UpdateMessage::NO_COMMIT) b.commit(false, maxSegments);
-    b.overwrite(overwrite);
     return runSync(b.finish());
   }
 
@@ -321,31 +318,30 @@ public:
 
   // Async version of index.  Docs are copied into the update message's arena.
   void index(Doc&& doc, std::function<void(const IndexResult& result)>&& callback,
-             UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {
-    index(std::vector<Doc>{std::move(doc)}, std::move(callback), commitType, overwrite);
+             UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
+    index(std::vector<Doc>{std::move(doc)}, std::move(callback), commitType);
   }
 
   void index(std::vector<Doc>&& docs, std::function<void(const IndexResult& result)>&& callback,
-             UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {
+             UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
     auto writer = collection().getShard()->getIndexWriter();
 
     // Builds (and owns) the concrete request + its arena BEFORE the ProtoUpdateMessage base
     // ctor runs (it reads req->commit), so the builder is a base-from-member holder.
     struct ReqHolder {
       UpdateBuilder builder;
-      ReqHolder(std::span<const Doc> docs, bool commit, bool overwrite) {
+      ReqHolder(std::span<const Doc> docs, bool commit) {
         for (const auto& doc : docs) builder.add(doc);
         if (commit) builder.commit();
-        builder.overwrite(overwrite);
       }
     };
 
     class ProtoUpdateMessageWithCallback : ReqHolder, public ProtoUpdateMessage {
     public:
       std::function<void(const IndexResult& result)> callback;
-      ProtoUpdateMessageWithCallback(std::span<const Doc> docs, bool commit, bool overwrite,
+      ProtoUpdateMessageWithCallback(std::span<const Doc> docs, bool commit,
                                      std::function<void(const IndexResult& result)> cb)
-        : ReqHolder(docs, commit, overwrite),
+        : ReqHolder(docs, commit),
           ProtoUpdateMessage(&this->builder.finish()), callback(std::move(cb)) {}
       void done(IndexWriter& iw) override {
         unused(iw);
@@ -356,8 +352,7 @@ public:
       }
     };
 
-    auto* msg = new ProtoUpdateMessageWithCallback(docs, commitType != UpdateMessage::NO_COMMIT,
-                                                   overwrite, std::move(callback));
+    auto* msg = new ProtoUpdateMessageWithCallback(docs, commitType != UpdateMessage::NO_COMMIT, std::move(callback));
     bool ok = writer->submitUpdate(msg);
     assert(ok);
     unused(ok);

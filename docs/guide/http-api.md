@@ -17,6 +17,10 @@ credentials. Administration and snapshot routes may name another tenant under
 | `GET /health` | Process liveness. |
 | `GET` or `POST /collections/{collection}/_search` | Search; URL request fields and optional POST JSON body, chunked NDJSON response. |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
+| `GET /collections/{collection}/_doc/{id}` | Fetch one document by ID, in the search response shape. See [Get by ID](indexing.md#get-by-id). |
+| `POST /collections/{collection}/_mget` | Fetch documents by ID (`{"ids":[...],"fields":[...]}`). |
+| `DELETE /collections/{collection}/_doc/{id}` | Delete one document by ID; takes the `_update` URL options such as `commit=true`. |
+| `POST /collections/{collection}/_delete` | Delete documents by ID (`{"ids":[...]}`). See [Delete by ID](indexing.md#delete-by-id). |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
 | `GET /collections/{collection}/_schema?view=resolved` | Read physical representations, bindings, and conservative schema coverage; HTTP only. |
 | `POST /collections/{collection}/_schema` | Set definitions or replace the schema; `wait_for_replicas` waits for [followers](replication.md#2-commit-and-wait-for-followers). |

@@ -529,6 +529,41 @@ TEST_F(GrpcIndexTest, maxSegmentsCommitDurablyPublishesMergedLayout) {
 }
 
 
+TEST_F(GrpcIndexTest, getAndDeleteById) {
+  auto rows = [&](std::vector<std::string_view> ids) -> int64_t {
+    grpc::ClientContext context;
+    HppClientReaderWriter<luxir::api::GetRequest, luxir::api::SearchResponse> stream(channel.get(), rpc::Get, &context);
+    luxir::api::GetRequest get;
+    get.ids = ids;
+    EXPECT_TRUE(stream.Write(get));
+    EXPECT_TRUE(stream.WritesDone());
+    Reply<luxir::api::SearchResponse> reply;
+    EXPECT_TRUE(stream.Read(&reply));
+    int64_t count = std::get<luxir::api::DocList>(reply.msg.ops.at("docs")->kind).row_count;
+    EXPECT_TRUE(stream.Finish().ok());
+    return count;
+  };
+  {
+    Reply<luxir::api::UpdateResponse> response;
+    grpc::ClientContext context;
+    CollectionHelper::UpdateBuilder b;
+    b.add(flatdoc("id", "ga")).add(flatdoc("id", "gb")).commit();
+    ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::Update, &context, b.finish(), &response).ok());
+  }
+  EXPECT_EQ(2, rows({"ga", "gb", "missing"}));
+
+  Reply<luxir::api::UpdateResponse> deleted;
+  grpc::ClientContext context;
+  luxir::api::DeleteRequest del;
+  std::array<std::string_view, 1> ids = {"ga"};
+  del.ids = ids;
+  del.commit.emplace();
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::Delete, &context, del, &deleted).ok());
+  EXPECT_EQ(luxir::api::UpdateResponse_::Status::OK, deleted.msg.status);
+  EXPECT_FALSE(deleted.msg.commit.empty());
+  EXPECT_EQ(1, rows({"ga", "gb"}));
+}
+
 TEST_F(GrpcIndexTest, streamingSearch) {
   TrivialSearchRequest fixture;
   Reply<luxir::api::SearchResponse> result;

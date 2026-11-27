@@ -187,7 +187,7 @@ TEST_F(NestedTransportTest, unaryAndStreamingProtobufCarryNestedValues) {
     }
     grpcQueries();
     CollectionHelper::UpdateBuilder invalid;
-    invalid.collection("main").overwrite().commit();
+    invalid.collection("main").commit();
     nested_test::add(invalid, R"({"id":"a","items":[{"color":"discard"},{"parts":[1]}]})");
     grpc::ClientContext context; Reply<api::UpdateResponse> response;
     if (streaming) {

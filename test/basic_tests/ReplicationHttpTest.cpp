@@ -254,7 +254,7 @@ TEST_F(ReplicationHttpTest, expiryBudgetAndInstalledStats) {
   EXPECT_EQ(410, get(fileUrl(*first, first->files.front().name)).result_int());
   registry.setPolicy({60s, UINT64_MAX});
   first = snapshot();
-  ASSERT_TRUE(h->index(flatdoc("id", "b"), UpdateMessage::COMMIT, false, 1).success);
+  ASSERT_TRUE(h->index(flatdoc("id", "b"), UpdateMessage::COMMIT, 1).success);
   registry.setPolicy({60s, 0});
   EXPECT_EQ(410, get(fileUrl(*first, first->files.front().name)).result_int());
   auto current = snapshot();
@@ -297,7 +297,7 @@ TEST_F(ReplicationHttpTest, slowDownloadSurvivesMerge) {
   response.body_limit(32 * 1024 * 1024);
   http::read_header(stream, buffer, response);
   ASSERT_EQ(200, response.get().result_int());
-  ASSERT_TRUE(h->index(flatdoc("id", "large", "payload", "replacement"), UpdateMessage::COMMIT, false, 1).success);
+  ASSERT_TRUE(h->index(flatdoc("id", "large", "payload", "replacement"), UpdateMessage::COMMIT, 1).success);
   auto& registry = h->collection().getShard()->getSnapshots();
   EXPECT_GT(registry.stats().retainedBytes, 0u);
   EXPECT_EQ(206, download(*first, file.name, "bytes=0-127").result_int());
@@ -321,7 +321,7 @@ TEST_F(ReplicationHttpTest, deleteAbortsStalledReader) {
 
 TEST_F(ReplicationHttpTest, budgetEvictionAbortsStalledReader) {
   stalledTransfer([&](const auto&) {
-    ASSERT_TRUE(h->index(flatdoc("id", "large", "payload", "replacement"), UpdateMessage::COMMIT, false, 1).success);
+    ASSERT_TRUE(h->index(flatdoc("id", "large", "payload", "replacement"), UpdateMessage::COMMIT, 1).success);
     h->collection().getShard()->getSnapshots().setPolicy({60s, 0});
   });
 }

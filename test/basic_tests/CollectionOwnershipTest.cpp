@@ -446,14 +446,14 @@ TEST_F(CollectionOwnershipTest, newOwnerRetainsThePreviousOwnersSnapshots) {
     ASSERT_TRUE(c.index(flatdoc("id", "first"), UpdateMessage::COMMIT).success);
     old = c.collection().getShard()->getSnapshots().snapshot();
     dir = c.collection().getShard()->getDirectory();
-    ASSERT_TRUE(c.index(flatdoc("id", "second"), UpdateMessage::COMMIT, false, 1).success);
+    ASSERT_TRUE(c.index(flatdoc("id", "second"), UpdateMessage::COMMIT, 1).success);
     incarnation = *a->collections().catalog().current("c");
   }
   ASSERT_TRUE(a->collections().catalog().assign(incarnation, "A", "B"));
   a.reset(); startB();
   ASSERT_TRUE(dir->openFile(old->manifestName()));
   CollectionHelper c(*b, "c");
-  ASSERT_TRUE(c.index(flatdoc("id", "third"), UpdateMessage::COMMIT, false, 1).success);
+  ASSERT_TRUE(c.index(flatdoc("id", "third"), UpdateMessage::COMMIT, 1).success);
   EXPECT_TRUE(dir->openFile(old->manifestName()));
   for (const auto& file : old->files) EXPECT_TRUE(dir->openFile(file.name));
   EXPECT_EQ(1, IndexReader(*dir, *old).liveDocs());

@@ -137,7 +137,7 @@ TEST_F(CommitSnapshotTest, slowTransferSurvivesDeletesAndMerge) {
   ASSERT_TRUE(h.deleteById("a", UpdateMessage::COMMIT).success);
   auto pin = w->snapshots.acquire();
   ASSERT_TRUE(h.deleteById("b", UpdateMessage::COMMIT).success);
-  ASSERT_TRUE(h.index(flatdoc("id", "d"), UpdateMessage::COMMIT, false, 1).success);
+  ASSERT_TRUE(h.index(flatdoc("id", "d"), UpdateMessage::COMMIT, 1).success);
   ASSERT_EQ(1u, w->snapshots.readers.getReader()->segments().size());
   uint64_t bytes = 0;
   for (const auto& desc : pin->files) {
@@ -178,7 +178,7 @@ TEST_F(CommitSnapshotTest, budgetCountsUniqueRetiredBytesAndEvictsOldest) {
   auto desc = first->files.front();
   auto inFlight = w->snapshots.openFile(first->id, desc.name);
   w->snapshots.setPolicy({60s, UINT64_MAX});
-  ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT, false, 1).success);
+  ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT, 1).success);
   uint64_t bytes = 0;
   for (const auto& file : first->files) {
     if (std::ranges::find(w->snapshots.snapshot()->files, file) == w->snapshots.snapshot()->files.end()) bytes += file.size;
@@ -295,7 +295,7 @@ TEST_F(CommitSnapshotTest, restartReclaimsFilesOfLostPins) {
     auto w = h.getIndexWriter();
     ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
     auto pin = w->snapshots.acquire();
-    ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT, false, 1).success);
+    ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT, 1).success);
     ASSERT_GT(w->snapshots.stats().retainedBytes, 0u);
     // Capture the real directory before orderly shutdown releases pins.
     std::vector<Directory::FileInfo> files;
@@ -333,7 +333,7 @@ TEST_F(CommitSnapshotTest, droppedPinCannotUnlinkRecreatedCollection) {
   ASSERT_TRUE(old.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success);
   auto pin = writer->snapshots.acquire();
   auto name = pin->files.front().name;
-  ASSERT_TRUE(old.index(flatdoc("id", "merged"), UpdateMessage::COMMIT, false, 1).success);
+  ASSERT_TRUE(old.index(flatdoc("id", "merged"), UpdateMessage::COMMIT, 1).success);
   std::latch collected(1), resume(1);
   Signal::listen("snapshotPinDropped", [&](void* source, void*, void*) -> void* {
     if (source == &writer->snapshots) {
@@ -381,7 +381,7 @@ TEST_F(CommitSnapshotTest, concurrentBudgetEviction) {
   auto& snapshots = h.collection().getShard()->getSnapshots();
   ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
   auto first = snapshots.acquire();
-  ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT, false, 1).success);
+  ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT, 1).success);
   std::latch start(2);
   std::thread release([&] { start.count_down(); start.wait(); snapshots.testEvictOldest(); });
   start.count_down();
@@ -526,7 +526,7 @@ TEST_F(CommitSnapshotTest, storagePressureDropsOldestPin) {
   for (auto* h : {&first, &second}) {
     ASSERT_TRUE(h->index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
     h->collection().getShard()->getSnapshots().acquire();
-    ASSERT_TRUE(h->index(flatdoc("id", "b"), UpdateMessage::COMMIT, false, 1).success);
+    ASSERT_TRUE(h->index(flatdoc("id", "b"), UpdateMessage::COMMIT, 1).success);
     h->collection().getReaderManager().getReader();
   }
   auto& snapshots = first.collection().getShard()->getSnapshots();
@@ -551,7 +551,7 @@ TEST_F(CommitSnapshotTest, storagePressureSkipsOpenTransfersAndCurrent) {
     ASSERT_TRUE(h->index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
     auto old = snapshots.acquire();
     if (h == &first) transfer = snapshots.openFile(old->id, old->files.front().name);
-    ASSERT_TRUE(h->index(flatdoc("id", "b"), UpdateMessage::COMMIT, false, 1).success);
+    ASSERT_TRUE(h->index(flatdoc("id", "b"), UpdateMessage::COMMIT, 1).success);
     h->collection().getReaderManager().getReader();
   }
   auto& snapshots = first.collection().getShard()->getSnapshots();
