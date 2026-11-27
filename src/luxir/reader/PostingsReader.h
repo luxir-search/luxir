@@ -38,7 +38,16 @@ class PostingsReader {
   // Ordinals follow the sorted field table. The array of page pointers is
   // allocated at open. Pages and field records are published on first use.
   struct FieldPage;
-  using OpenedField = std::atomic<const NumColumnFormat::LeafMeta*>;
+  // A single-valued numeric column's leaf metadata with the parts derived
+  // from its zones on first open (the visit orders, a zone sketch), kept for
+  // the reader's life so planners sort once per segment.
+  struct OpenedLeafMeta {
+    NumColumnFormat::LeafDerived derived;
+    NumColumnFormat::LeafMeta meta;
+
+    size_t bytes() const { return sizeof(*this) - sizeof(derived) + derived.bytes(); }
+  };
+  using OpenedField = std::atomic<const OpenedLeafMeta*>;
   struct StoredResource;
   std::atomic<StoredResource*> storedResources = nullptr;  // Published resource states, keyed by field ordinal.
   static constexpr size_t FIELDS_PER_PAGE = 64;
@@ -103,6 +112,10 @@ public:
 
   // Acquired views are shared for the reader's lifetime.
   const NumColumnFormat::LeafMeta* openNumericLeafMeta(const DecodedFieldRecord& fieldInfo);
+  // The same cached view for any single-valued numeric column, leaf-bounded
+  // or not (IntColReader shares it); nullptr for the others, which never
+  // read visit orders or a sketch.
+  const NumColumnFormat::LeafMeta* openColumnLeafMeta(const DecodedFieldRecord& fieldInfo);
   const StoredFieldsMetadata* openStoredMetadata(const DecodedFieldRecord& fieldInfo);
   const StoredDecompressionDictionary* openStoredDictionary(const field_parts::Stored& stored,
                                                              const StoredFieldsMetadata& metadata);

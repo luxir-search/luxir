@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -20,8 +21,34 @@
 #include "LinearFit.h"
 #include "Codec.h"
 #include "luxir/util/encoding.h"
+#include "luxir/util/NumericUtils.h"
+#include "luxir/util/luxir_util.h"
 
 namespace luxir {
+
+// Block encodings, persisted in the top 4 bits of the descriptor's first
+// word: append only.
+//   FOR          frame of reference: base + gcd * (slopeTerm(rank) +
+//                residual), or RAW (bits() == RAW_BITS) plain int64s
+//   DELTA        FOR-packed anchors, one per 128-value frame, then the
+//                bit-packed in-frame deltas
+//   DICT         a sorted per-block dictionary, then bit-packed codes
+//   ALP_DOUBLE   decimal-scaled doubles (ALP), then patched exceptions
+//   ALP_FLOAT    the same for floats
+//   FOR_PATCHED  constant FOR over all but a few outliers, which are patched
+//                exceptions
+// Every kind decodes to the column's int64 values (sortable bits for
+// FLOAT/DOUBLE), so consumers above the decode layer never see the kind.
+// Only general field value columns write the kinds other than FOR
+// (NumColumnFormat::BlockCodecs).
+enum class NumBlockKind : uint8_t {
+  FOR = 0,
+  DELTA = 1,
+  DICT = 2,
+  ALP_DOUBLE = 3,
+  ALP_FLOAT = 4,
+  FOR_PATCHED = 5,
+};
 
 // Naturally aligned, and read in place off the mapping: every writer 8-aligns
 // the block-meta array (NumColumnWriter::finish), and every reader asserts it
@@ -30,21 +57,37 @@ namespace luxir {
 // reason.  Do not make this LUXIR_UNALIGNED to paper over a new relocator;
 // pad the relocator instead, or the assert will point at it.
 struct NumBlockInfo {
-  // Payload offset in the low 56 bits, packed width in the top 8. One load
-  // yields both, and it lands the descriptor on 32 bytes: two per cache line,
-  // never straddling one, indexed by a shift. 2^56 bytes of payload per column
-  // is not a limit anything can reach.
+  // Payload offset in the low 52 bits, packed width in the next 8, block
+  // kind in the top 4. One load yields all three, and it lands the
+  // descriptor on 32 bytes: two per cache line, never straddling one,
+  // indexed by a shift. 2^52 bytes of payload per column is not a limit
+  // anything can reach. Kind above width keeps "a FOR block with a packed
+  // payload", the hot case, one compare of the top 12 bits (forPacked).
   //
   // A general block can use gcd and scaledSlope together - a sorted
   // day-granularity date column is a ramp over values sharing a divisor - so
   // the two are separate fields. Monotonic columns pin gcd to 1 and
   // NumColumnT<false> never reads it.
+  //
+  // The other kinds reuse the three value fields:
+  //   DELTA        baseBits = the least in-frame delta (mod 2^64), gcd =
+  //                the least anchor, scaledSlope = the anchors' width
+  //   DICT         gcd = dictionary size
+  //   ALP_*        baseBits = the least scaled integer, gcd = exponent |
+  //                factor << 8, scaledSlope = exception count
+  //   FOR_PATCHED  baseBits and gcd as a constant FOR block, scaledSlope =
+  //                exception count
+  // so every reader of scaledSlope as a slope, and of baseBits/gcd as a FOR
+  // frame, must first test the kind (forPacked, linearFit,
+  // residualComparable all do).
   uint64_t offsetAndBits = 0;
   uint64_t baseBits = 0;
   uint64_t gcd = 1;
   int64_t scaledSlope = 0;
 
-  static constexpr uint64_t OFFSET_MASK = (1ULL << 56) - 1;
+  static constexpr uint32_t OFFSET_BITS = 52;
+  static constexpr uint32_t KIND_SHIFT = OFFSET_BITS + 8;
+  static constexpr uint64_t OFFSET_MASK = (1ULL << OFFSET_BITS) - 1;
   static constexpr uint8_t MAX_PACKED_BITS = 57;
   static constexpr uint8_t RAW_BITS = 64;
 
@@ -53,11 +96,21 @@ struct NumBlockInfo {
   }
 
   uint8_t bits() const {
-    return (uint8_t)(offsetAndBits >> 56);
+    return (uint8_t)(offsetAndBits >> OFFSET_BITS);
   }
 
+  NumBlockKind kind() const {
+    return (NumBlockKind)(offsetAndBits >> KIND_SHIFT);
+  }
+
+  // A FOR block with a bit-packed payload: not RAW, not another kind.
   bool forPacked() const {
-    return bits() <= MAX_PACKED_BITS;
+    return (offsetAndBits >> OFFSET_BITS) <= MAX_PACKED_BITS;
+  }
+
+  // A FOR block of plain int64s.
+  bool raw() const {
+    return (offsetAndBits >> OFFSET_BITS) == RAW_BITS;
   }
 
   bool linearFit() const {
@@ -70,9 +123,54 @@ struct NumBlockInfo {
     return forPacked() && bits() <= 32 && scaledSlope == 0;
   }
 
-  void setPayload(uint64_t payloadOffset, uint8_t bits) {
+  // Packed slots ordered like the values they decode to, at most 32 bits:
+  // range queries compare them against bounds mapped into the slot domain
+  // (NumColumnT::slotBounds), and check exceptions() apart. DELTA slots
+  // are not ordered, and a sloped or wide FOR block is not either.
+  bool slotComparable() const {
+    if (residualComparable()) return true;
+    NumBlockKind k = kind();
+    return bits() <= 32
+        && (k == NumBlockKind::DICT || k == NumBlockKind::FOR_PATCHED
+            || k == NumBlockKind::ALP_DOUBLE || k == NumBlockKind::ALP_FLOAT);
+  }
+
+  // Patched kinds: values stored apart from the packed slots, whose own
+  // slot reads as 0.
+  bool patched() const {
+    NumBlockKind k = kind();
+    return k == NumBlockKind::FOR_PATCHED || k == NumBlockKind::ALP_DOUBLE
+        || k == NumBlockKind::ALP_FLOAT;
+  }
+
+  uint64_t exceptions() const {
+    return patched() ? (uint64_t)scaledSlope : 0;
+  }
+
+  uint64_t dictSize() const {
+    assert(kind() == NumBlockKind::DICT);
+    return gcd;
+  }
+
+  uint8_t alpExponent() const {
+    return (uint8_t)gcd;
+  }
+
+  uint8_t alpFactor() const {
+    return (uint8_t)(gcd >> 8);
+  }
+
+  uint8_t anchorBits() const {
+    assert(kind() == NumBlockKind::DELTA);
+    return (uint8_t)scaledSlope;
+  }
+
+  void setPayload(uint64_t payloadOffset, uint8_t bits,
+                  NumBlockKind kind = NumBlockKind::FOR) {
     assert(payloadOffset <= OFFSET_MASK);
-    offsetAndBits = payloadOffset | ((uint64_t)bits << 56);
+    assert(kind == NumBlockKind::FOR || bits <= MAX_PACKED_BITS);
+    offsetAndBits = payloadOffset | ((uint64_t)bits << OFFSET_BITS)
+        | ((uint64_t)kind << KIND_SHIFT);
   }
 };
 static_assert(sizeof(NumBlockInfo) == 32);
@@ -163,6 +261,19 @@ struct NumColumnFormat {
     static constexpr ResidualBounds empty() { return {1, 0}; }
   };
 
+  // How a column's int64 values read as numbers, for the ALP kinds: FLOAT
+  // and DOUBLE columns hold sortable bits (NumericUtils.h), FLOAT ones
+  // sign-extended from int32.
+  enum class ValueDomain : uint8_t { INT, FLOAT, DOUBLE };
+
+  // Which block kinds a writer weighs beyond FOR (NumBlockPlanner). Off by
+  // default: internal point-read columns (monotonic sidecars, an OrdMap's
+  // global columns) stay FOR, and field value columns opt in.
+  struct BlockCodecs {
+    bool enabled = false;
+    ValueDomain domain = ValueDomain::INT;
+  };
+
   struct BlockPlan {
     NumBlockInfo info;
     NumBlockZone zone;
@@ -172,12 +283,13 @@ struct NumColumnFormat {
     uint32_t leafCount = 0;
     LinearFit::Plan fit;
     uint64_t count = 0;
-    // Held outside info until the writer knows the payload offset; the two
-    // share a word on disk.
+    // Held outside info until the writer knows the payload offset; the
+    // three share a word on disk.
     uint8_t bits = 0;
+    NumBlockKind kind = NumBlockKind::FOR;
 
     bool raw() const {
-      return bits > MAX_PACKED_BITS;
+      return kind == NumBlockKind::FOR && bits > MAX_PACKED_BITS;
     }
   };
 
@@ -236,7 +348,7 @@ struct NumColumnFormat {
 
     auto constant = LinearFit::evaluate(q, 0, 0, SLOPE_SHIFT);
     assert(constant);
-    auto linear = LinearFit::planLinearFit(q, SLOPE_SHIFT);
+    auto linear = LinearFit::planBestLinearFit(q, SLOPE_SHIFT);
     plan.fit = linear &&
         constant->bits >= linear->bits + MIN_LINEAR_BITS_SAVED
         ? *linear : *constant;
@@ -256,10 +368,10 @@ struct NumColumnFormat {
     return plan;
   }
 
-  // Leaf visit orders, persisted after the leaf zones. A field sort over the
-  // column visits leaves best bound first, and that bound is a pure function
-  // of the leaf zones and the sort direction - never of the query - so the
-  // writer sorts once instead of every query rederiving the order. `out`
+  // Leaf visit orders. A field sort over the column visits leaves best bound
+  // first, and that bound is a pure function of the leaf zones and the sort
+  // direction - never of the query - so a reader sorts once per column
+  // (LeafMeta) instead of every query rederiving the order. `out`
   // receives the leaf ids ascending by (zone.min, leaf), the ascending-sort
   // order, or with `byMaxDescending`, descending by zone.max with ties by
   // ascending leaf: ascending ~max, the descending transformed key. The leaf
@@ -284,7 +396,7 @@ struct NumColumnFormat {
     }
   }
 
-  // Value sketch, persisted after the leaf visit orders: points (rank,
+  // Value sketch, persisted after the leaf zones: points (rank,
   // value) of the column's values in sorted order, ranks strictly
   // increasing from 0 (the minimum) to numValues - 1 (the maximum). A field
   // sort reads it to estimate where its k-th best key falls (ValueSketch),
@@ -302,6 +414,16 @@ struct NumColumnFormat {
   static constexpr int64_t SKETCH_DENSE = 64;
   static constexpr int64_t SKETCH_TAIL = 16384;
   static constexpr int64_t SKETCH_SAMPLES = 1024;
+  // Columns under this many values do not persist their sketch, nor do
+  // BOOLEAN ones (two values): a reader derives one from the leaf zones
+  // (zoneSketch), which costs nothing on disk and is near exact for so few
+  // leaves. The persisted count reads SKETCH_FROM_ZONES for them, and 0 for
+  // a column that has no sketch at all.
+  static constexpr int64_t SKETCH_MIN_VALUES = 65536;
+  static constexpr uint32_t SKETCH_FROM_ZONES = UINT32_MAX;
+
+  // Whether a column keeps a value sketch, and where it comes from.
+  enum class SketchMode : uint8_t { NONE, FROM_ZONES, PERSIST };
 
   struct SketchPoint {
     int64_t rank;
@@ -532,29 +654,118 @@ struct NumColumnFormat {
     }
   };
 
+  // A value sketch from leaf zones alone, for a column that persists none
+  // (SKETCH_FROM_ZONES): each leaf holds a value at either end of its zone
+  // and the rest spread evenly between (all of them at one value where the
+  // zone is one). The column's expected
+  // count below a value is then piecewise linear between the zones' ends,
+  // and those ends become the points, each at the expected count below
+  // it. Coarser than a persisted sketch, but monotone with the exact
+  // extremes, which is all ValueSketch needs.
+  static std::vector<SketchPoint> zoneSketch(std::span<const NumBlockZone> leaves,
+                                             int64_t population) {
+    std::vector<SketchPoint> points;
+    if (population == 0) return points;
+    struct Event {
+      int64_t at;
+      double slope;  // change in values per unit of value from here on
+      double mass;   // values that sit exactly here
+    };
+    std::vector<Event> events;
+    events.reserve(2 * leaves.size());
+    int64_t leafCount = (int64_t)leaves.size();
+    for (int64_t l = 0; l < leafCount; l++) {
+      NumBlockZone zone = leaves[(size_t)l];
+      double n = (double)std::min<int64_t>(LEAF_ZONE_SIZE,
+                                           population - l * LEAF_ZONE_SIZE);
+      if (zone.min == zone.max) {
+        events.push_back({zone.min, 0, n});
+        continue;
+      }
+      // The zone's ends are values of the leaf: one at each, the rest
+      // spread between, which keeps the sketch's extreme ranks near exact.
+      double density = (n - 2) / (double)((uint64_t)zone.max - (uint64_t)zone.min);
+      events.push_back({zone.min, density, 1});
+      events.push_back({zone.max, -density, 1});
+    }
+    std::sort(events.begin(), events.end(),
+              [](const Event& a, const Event& b) { return a.at < b.at; });
+    double below = 0;
+    double slope = 0;
+    for (size_t i = 0; i < events.size();) {
+      int64_t at = events[i].at;
+      if (i > 0) below += slope * (double)((uint64_t)at - (uint64_t)events[i - 1].at);
+      int64_t rank = std::clamp<int64_t>((int64_t)std::llround(below), 0,
+                                         population - 1);
+      if (points.empty() || rank > points.back().rank) points.push_back({rank, at});
+      double mass = 0;
+      for (; i < events.size() && events[i].at == at; i++) {
+        slope += events[i].slope;
+        mass += events[i].mass;
+      }
+      // Values sitting here hold every rank they cover.
+      int64_t last = std::clamp<int64_t>((int64_t)std::llround(below + mass - 1), 0,
+                                         population - 1);
+      if (mass >= 2 && last > points.back().rank) points.push_back({last, at});
+      below += mass;
+    }
+    // The last point holds the maximum at the last rank.
+    int64_t max = events.back().at;
+    if (points.back().rank == population - 1) points.back().value = max;
+    else points.push_back({population - 1, max});
+    return points;
+  }
+
+  // What a reader derives from a column's leaf zones, held by whoever keeps
+  // the view (the PostingsReader field cache): the two leaf visit orders
+  // (leafVisitOrder), ascending-min then descending-max, and the value
+  // sketch of a column that left it to the reader (zoneSketch).
+  struct LeafDerived {
+    std::vector<uint32_t> orders;
+    std::vector<SketchPoint> points;
+
+    size_t bytes() const {
+      return sizeof(*this) + orders.capacity() * sizeof(uint32_t)
+          + points.capacity() * sizeof(SketchPoint);
+    }
+  };
+
   // Read view of a column's leaf metadata as NumColumnWriter::finish lays
-  // it out after the block zones: the leaf zones, the two leaf visit orders
-  // (leafVisitOrder), and the value sketch. Copyable, so a planner can keep
-  // one per segment; valid while the column's bytes are.
+  // it out after the block zones: the leaf zones, then the value sketch.
+  // The leaf visit orders are not persisted: they are a pure function of
+  // the zones, which derive() sorts once into storage its caller keeps (the
+  // PostingsReader field cache does, per numeric column). A view without
+  // them answers summarizeRange by scanning the zones instead and has no
+  // visit order; one without a derived zone sketch reports none. Copyable
+  // and trivially destructible, so a planner can keep one per segment;
+  // valid while the column's bytes and the derived storage are.
   class LeafMeta {
-    const char* zones = nullptr;  // NumBlockZones, then the uint32 orders
+    const char* zones = nullptr;  // NumBlockZones
     int64_t count = 0;
     int64_t values = 0;
     ValueSketch sketch;
+    const LeafDerived* derived = nullptr;
+    bool sketchFromZones = false;
 
     int64_t orderAt(int64_t order, int64_t rank) const {
       assert(rank >= 0 && rank < count);
-      uint32_t leaf;
-      memcpy(&leaf,
-             zones + count * (int64_t)sizeof(NumBlockZone)
-                 + (order * count + rank) * (int64_t)sizeof(leaf),
-             sizeof(leaf));
-      return leaf;
+      // A reader built without the field cache has no orders; a caller
+      // must use one that derived them (hasVisitOrders).
+      if (derived == nullptr) throw std::logic_error("leaf visit orders were not derived");
+      return derived->orders[(size_t)(order * count + rank)];
+    }
+
+    // Leaves whose zone satisfies `keep`, by scanning.
+    template <class Keep>
+    int64_t countLeaves(Keep keep) const {
+      int64_t n = 0;
+      for (int64_t leaf = 0; leaf < count; leaf++) n += keep(leafZone(leaf));
+      return n;
     }
 
   public:
     static int64_t sketchOffset(int64_t leafCount) {
-      return leafCount * (int64_t)(sizeof(NumBlockZone) + 2 * sizeof(uint32_t));
+      return leafCount * (int64_t)sizeof(NumBlockZone);
     }
 
     static int64_t sketchPointsBytes(uint32_t points) {
@@ -591,6 +802,25 @@ struct NumColumnFormat {
     // The index contains block metadata, block zones and leaf metadata.
     static std::expected<LeafMeta, const char*> decode(std::span<const char> index, int64_t numValues);
 
+    // Sorts the visit orders and derives any zone sketch into `into`, which
+    // must outlive this view and its copies.
+    void derive(LeafDerived& into) {
+      std::vector<NumBlockZone> copy((size_t)count);
+      if (count > 0) memcpy(copy.data(), zones, (size_t)count * sizeof(NumBlockZone));
+      into.orders.resize((size_t)(2 * count));
+      std::span<uint32_t> all(into.orders);
+      leafVisitOrder(copy, false, all.first((size_t)count));
+      leafVisitOrder(copy, true, all.last((size_t)count));
+      if (sketchFromZones) {
+        into.points = zoneSketch(copy, values);
+        sketch = ValueSketch((const char*)into.points.data(),
+                             (int64_t)into.points.size(), values);
+      }
+      derived = &into;
+    }
+
+    bool hasVisitOrders() const { return derived != nullptr || count == 0; }
+
     int64_t numLeafZones() const { return count; }
 
     NumBlockZone leafZone(int64_t leaf) const {
@@ -625,24 +855,43 @@ struct NumColumnFormat {
       auto population = [&](int64_t leaves, bool includesTail) {
         return leaves * LEAF_ZONE_SIZE - (includesTail ? padding : 0);
       };
-      int64_t below = population(count - prefixCount([&](int64_t rank) {
-        return leafZone(leafByMaxDescending(rank)).max >= lo;
-      }), tail.max < lo);
-      int64_t above = population(count - prefixCount([&](int64_t rank) {
-        return leafZone(leafByMinAscending(rank)).min <= hi;
-      }), tail.min > hi);
-      int64_t maxInside = population(count - prefixCount([&](int64_t rank) {
-        return leafZone(leafByMaxDescending(rank)).max > hi;
-      }), tail.max <= hi);
-      int64_t minInside = population(count - prefixCount([&](int64_t rank) {
-        return leafZone(leafByMinAscending(rank)).min < lo;
-      }), tail.min >= lo);
+      // Leaves with max < x, min > x, max <= x and min >= x: suffixes of
+      // the visit orders, or a scan without them.
+      auto maxBelow = [&](int64_t x) {
+        if (!derived) return countLeaves([&](NumBlockZone z) { return z.max < x; });
+        return count - prefixCount([&](int64_t rank) {
+          return leafZone(leafByMaxDescending(rank)).max >= x;
+        });
+      };
+      auto minAbove = [&](int64_t x) {
+        if (!derived) return countLeaves([&](NumBlockZone z) { return z.min > x; });
+        return count - prefixCount([&](int64_t rank) {
+          return leafZone(leafByMinAscending(rank)).min <= x;
+        });
+      };
+      auto maxAtMost = [&](int64_t x) {
+        if (!derived) return countLeaves([&](NumBlockZone z) { return z.max <= x; });
+        return count - prefixCount([&](int64_t rank) {
+          return leafZone(leafByMaxDescending(rank)).max > x;
+        });
+      };
+      auto minAtLeast = [&](int64_t x) {
+        if (!derived) return countLeaves([&](NumBlockZone z) { return z.min >= x; });
+        return count - prefixCount([&](int64_t rank) {
+          return leafZone(leafByMinAscending(rank)).min < x;
+        });
+      };
+      int64_t below = population(maxBelow(lo), tail.max < lo);
+      int64_t above = population(minAbove(hi), tail.min > hi);
+      int64_t maxInside = population(maxAtMost(hi), tail.max <= hi);
+      int64_t minInside = population(minAtLeast(lo), tail.min >= lo);
       return {below + above,
           std::max<int64_t>(0, maxInside + minInside - values),
           std::min(maxInside - below, minInside - above)};
     }
 
-    // Empty for a column without values or written without a sketch.
+    // Empty for a column without values or written without a sketch, and
+    // for one that left it to the reader until derive().
     const ValueSketch& valueSketch() const { return sketch; }
   };
 
@@ -672,7 +921,10 @@ struct NumColumnFormat {
       const NumBlockInfo& block, int64_t value0, uint32_t count,
       int64_t lo, int64_t hi) {
     assert(count > 0 && count <= BLOCK_SIZE);
+    // The envelope math reads bits/gcd/scaledSlope as a FOR fit; the other
+    // kinds give those fields other meanings.
     if (!block.linearFit()) return std::nullopt;
+    assert(block.kind() == NumBlockKind::FOR);
     if (hi < lo) return RankBounds{0, 0, 0, 0};
     uint64_t gcd = block.gcd;
     assert(gcd != 0);
@@ -722,19 +974,84 @@ struct NumColumnFormat {
   // overflow. Clip before narrowing so empty lattice intervals stay empty.
   static ResidualBounds residualBounds(
       const NumBlockInfo& block, int64_t lo, int64_t hi) {
-    assert(block.residualComparable() && block.gcd != 0);
-    int64_t base = (int64_t)block.baseBits;
+    assert(block.residualComparable() && block.kind() == NumBlockKind::FOR);
+    return latticeBounds(block.baseBits, block.gcd, block.bits(), lo, hi);
+  }
+
+  // The slots s < 2^bits with base + gcd * s in [lo, hi], for a block that
+  // reconstructs that way: constant FOR, and FOR_PATCHED off its
+  // exceptions.
+  static ResidualBounds latticeBounds(uint64_t baseBits, uint64_t gcd,
+                                      uint8_t bits, int64_t lo, int64_t hi) {
+    assert(gcd != 0 && bits <= 32);
+    int64_t base = (int64_t)baseBits;
     if (hi < lo || hi < base) return ResidualBounds::empty();
     uint64_t lower = 0;
     if (lo > base) {
       uint64_t delta = (uint64_t)lo - (uint64_t)base;
-      lower = delta / block.gcd + (delta % block.gcd != 0);
+      lower = delta / gcd + (delta % gcd != 0);
     }
     uint64_t upper = std::min<uint64_t>(
-        ((uint64_t)hi - (uint64_t)base) / block.gcd,
-        (1ULL << block.bits()) - 1);
+        ((uint64_t)hi - (uint64_t)base) / gcd, (1ULL << bits) - 1);
     if (lower > upper) return ResidualBounds::empty();
     return {(uint32_t)lower, (uint32_t)upper};
+  }
+
+  // ALP (Afroozeh, Kuffo, Boncz, SIGMOD 2024): a decimal-origin value v is
+  // stored as the integer n = round(v * 10^e / 10^f) and read back as
+  // n * 10^f / 10^e. The writer keeps n only when that read reproduces the
+  // stored bits exactly, through this same function, so the encoding is
+  // lossless by construction; any other value is an exception. ALP itself
+  // multiplies by an inexact 10^-e; dividing by the exact 10^e instead
+  // costs a division per value but makes the read the correctly rounded
+  // quotient, which is what a parser produced for a decimal with at most
+  // e - f fraction digits, so such values never become exceptions. Floats
+  // decode through double and round once more, which is innocuous for a
+  // quotient (53 >= 2 * 24 + 2 bits). The result is nondecreasing in n
+  // (each step rounds monotonically), which is what lets range queries map
+  // bounds to an interval of n. Never NaN, so the sortable flip needs no
+  // NaN canonicalization and the loop stays branch free.
+  static constexpr uint8_t ALP_MAX_EXPONENT_DOUBLE = 18;
+  static constexpr uint8_t ALP_MAX_EXPONENT_FLOAT = 10;
+  static constexpr double ALP_POW10[] = {
+      1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
+      1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18};
+
+  // Encoded integers stay within +-ALP_MAX_SCALED: inside the double
+  // mantissa, so round() is exact, and inside the range where alpNumber
+  // converts exactly.
+  static constexpr double ALP_MAX_SCALED = 1125899906842624.0;  // 2^50
+
+  // (double)n for |n| <= 2^51 without the int64 conversion, which AVX2 has
+  // no instruction for: n added to the bits of 1.5 * 2^52 is the double
+  // 1.5 * 2^52 + n exactly (unit ulp there), so subtracting 1.5 * 2^52
+  // leaves n. This is what lets the frame decode loop vectorize.
+  static LUXIR_INLINE double alpNumber(int64_t n) {
+    constexpr double MAGIC = 6755399441055744.0;  // 1.5 * 2^52
+    return std::bit_cast<double>(std::bit_cast<int64_t>(MAGIC) + n) - MAGIC;
+  }
+
+  static LUXIR_INLINE int64_t alpDecodeDouble(double n, double factor,
+                                              double exponent) {
+    double value = n * factor / exponent;
+    return sortableDoubleBits(std::bit_cast<int64_t>(value));
+  }
+
+  static LUXIR_INLINE int64_t alpDecodeFloat(double n, double factor,
+                                             double exponent) {
+    float value = (float)(n * factor / exponent);
+    return (int64_t)sortableFloatBits(std::bit_cast<int32_t>(value));
+  }
+
+  // The value of n for every n, encoded or not: the slot bound search
+  // probes integers past the encoded range, where alpNumber would not be
+  // exact. On encoded integers it agrees with the frame decode bit for bit,
+  // both converting n exactly.
+  static int64_t alpDecode(int64_t n, uint8_t e, uint8_t f, NumBlockKind kind) {
+    assert(kind == NumBlockKind::ALP_DOUBLE || kind == NumBlockKind::ALP_FLOAT);
+    return kind == NumBlockKind::ALP_FLOAT
+        ? alpDecodeFloat((double)n, ALP_POW10[f], ALP_POW10[e])
+        : alpDecodeDouble((double)n, ALP_POW10[f], ALP_POW10[e]);
   }
 };
 
@@ -751,6 +1068,10 @@ inline std::expected<NumColumnFormat::LeafMeta, const char*> NumColumnFormat::Le
   }
   uint32_t points;
   memcpy(&points, index.data() + sketchStart, sizeof(points));
+  if (points == SKETCH_FROM_ZONES) {
+    result.sketchFromZones = true;
+    points = 0;
+  }
   if ((uint64_t)points > (uint64_t)numValues
       || index.size() - sketchStart - sizeof(points) != (uint64_t)sketchPointsBytes(points)) {
     return std::unexpected("invalid numeric sketch size");

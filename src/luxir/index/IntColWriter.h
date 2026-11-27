@@ -22,6 +22,26 @@ namespace luxir {
 //
 
 
+// The block kinds a field's value column may take: all of them, with ALP
+// for FLOAT/DOUBLE. Internal columns keep the default (FOR only).
+inline NumColumnFormat::BlockCodecs fieldColumnCodecs(FieldType::Type type) {
+  NumColumnFormat::BlockCodecs codecs;
+  codecs.enabled = true;
+  codecs.domain = type == FieldType::FLOAT ? NumColumnFormat::ValueDomain::FLOAT
+      : type == FieldType::DOUBLE ? NumColumnFormat::ValueDomain::DOUBLE
+      : NumColumnFormat::ValueDomain::INT;
+  return codecs;
+}
+
+// The value sketch a field's value column keeps (NumColumnWriter): one for
+// the columns field-sort planning reads, `sortable`, persisted unless the
+// column is BOOLEAN or small.
+inline NumColumnFormat::SketchMode fieldColumnSketch(FieldType::Type type, bool sortable) {
+  if (!sortable) return NumColumnFormat::SketchMode::NONE;
+  return type == FieldType::BOOLEAN ? NumColumnFormat::SketchMode::FROM_ZONES
+                                    : NumColumnFormat::SketchMode::PERSIST;
+}
+
 class IntColWriter {
 public:
   static constexpr uint32_t BLOCK_SIZE = NumColumnFormat::BLOCK_SIZE;
@@ -35,8 +55,12 @@ public:
     return FieldType::isNumericColumn(type) && !hasEndValueRanks;
   }
 
-  explicit IntColWriter(OutputStream& target, bool sketch = false)
-      : writer(target, true, true, sketch) {}
+  // `sketch`: whether the column persists a value sketch, and `codecs`
+  // which block kinds it may take (NumColumnWriter).
+  explicit IntColWriter(OutputStream& target,
+                        NumColumnFormat::SketchMode sketch = NumColumnFormat::SketchMode::NONE,
+                        NumColumnFormat::BlockCodecs codecs = {})
+      : writer(target, true, true, sketch, codecs) {}
 
   void addInt64(int64_t val) {
     writer.addInt64(val);

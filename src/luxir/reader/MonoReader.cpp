@@ -28,11 +28,13 @@ int64_t MonoReader::checkedValueAt(int64_t rank, SegmentReadContext context) con
   auto block = rank / BLOCK_SIZE;
   const auto& info = values.blockInfo(block);
   auto bits = info.bits();
-  if (info.gcd != 1 || (bits > NumBlockInfo::MAX_PACKED_BITS && bits != NumBlockInfo::RAW_BITS)) {
+  // Monotonic columns are FOR only (forPacked and raw both test the kind):
+  // the bits/gcd tests read the descriptor as a FOR frame.
+  if (info.gcd != 1 || (!info.forPacked() && !info.raw())) {
     context.invalid("invalid monotonic endpoint block encoding");
   }
   auto count = values.valuesInBlock(block);
-  auto bytes = bits == NumBlockInfo::RAW_BITS ? count * sizeof(int64_t) : LinearPack::packedByteSize(count, bits);
+  auto bytes = info.raw() ? count * sizeof(int64_t) : LinearPack::packedByteSize(count, bits);
   auto limit = values.payloadBytes();
   if (info.payloadOffset() > limit || bytes > limit - info.payloadOffset()) {
     context.invalid("monotonic endpoint block payload exceeds its index");

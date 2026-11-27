@@ -1245,7 +1245,7 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
 // every doc for match-all with no deletes); ExactDomainSortCosts picks one,
 // and re-picks for whatever is left at checkpoints.
 enum class ExactDomainSortPhase : uint8_t {
-  // Leaves in the column's persisted bound order, until a bound proves the
+  // Leaves in the column's derived bound order, until a bound proves the
   // rest out.
   BOUND_ORDER,
   // The walk: the leaves holding domain docs in doc order, against the
@@ -1894,7 +1894,7 @@ int64_t walkInDocOrder(int32_t segnum, Collector& collector,
 }
 
 // The driver's state within a segment: the leaves bound order has settled
-// (visited), its next rank in the persisted order and the rank at which it
+// (visited), its next rank in the derived order and the rank at which it
 // next re-decides; the walk's next leaf and the gathered count at which it
 // next re-decides; and the one floor estimate both read - the prior, then
 // whatever bound order's checkpoints read (ExactDomainSortCosts, Re-
@@ -1934,7 +1934,7 @@ ExactDomainSortCosts::Rest exactDomainRest(
 }
 
 // Bound order: leaves in ascending (bound, leaf) order, which the column
-// persists per direction (KeyBatch::boundOrderLeaf), so the phase is a scan
+// derives per direction (KeyBatch::boundOrderLeaf), so the phase is a scan
 // of that order, resumed at state.rank. A SKIP_STRICT leaf proves global
 // termination (every later leaf's bound is at least as bad, and the bottom
 // only improves); a SKIP_TIE leaf is skipped alone, and stays settled for
@@ -2177,7 +2177,7 @@ void collectTopKMatchWindowedSeeded(
       break;
     }
     // Select the round's best-bounded unvisited leaves - the next stretch
-    // of the column's persisted bound order, the order the exact-domain
+    // of the column's derived bound order, the order the exact-domain
     // driver walks - then visit them in ascending doc order so the seed
     // scorer only moves forward. Selection is metadata-only: no
     // classification, no postings work.

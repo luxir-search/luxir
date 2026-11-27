@@ -448,6 +448,8 @@ public:
     char packedTermData[PackedTerm::MAX_BYTES];
     PackedTerm packedTerm(packedTermData,0);  // the current term while iterating over all terms
 
+    // Point-read columns: IntColWriter's default keeps them FOR, without the
+    // field value columns' other block kinds.
     RAMFile firstSegsFile("firstSegs");
     OutputStream firstSegsOut(&firstSegsFile);
     IntColWriter firstSegs(firstSegsOut);

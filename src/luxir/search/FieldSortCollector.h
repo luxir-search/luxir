@@ -447,7 +447,7 @@ public:
 
   // Where a doc-order walk of the current segment meets its best keys: the
   // earliest leaf among the floor's best-bounded ones (the head of the
-  // persisted bound order past the leaves outside the envelope, which hold
+  // derived bound order past the leaves outside the envelope, which hold
   // no domain doc; up to kHeadLeaves of them), or -1 when the floor holds
   // none. The column's bound order announces it; no traversal does.
   static constexpr int64_t kHeadLeaves = 64;

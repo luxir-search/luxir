@@ -56,7 +56,12 @@ public:
     auto blocks = reader.core().slice(number->blocks());
     auto indexSlice = number->index();
     auto index = reader.core().slice(indexSlice, ReadClass::METADATA);
-    leaves = readNumericLeafMeta(index, fieldInfo.numValues,
+    // A single-valued column's cached view carries the visit orders and any
+    // zone sketch, derived once for the segment; a multi-valued one reads its
+    // leaf metadata here, and its range summaries scan the zones.
+    const NumColumnFormat::LeafMeta* cached = reader.fieldInfo(fieldInfo.ordinal) == &fieldInfo
+        ? reader.openColumnLeafMeta(fieldInfo) : nullptr;
+    leaves = cached ? *cached : readNumericLeafMeta(index, fieldInfo.numValues,
         segmentReadContext(reader.core(), fieldInfo, indexSlice.location.filenum()));
     open(blocks.data(), index, fieldInfo.numValues);
     endValueRanks = MonoReader::openEndValueRanks(reader, fieldInfo);
@@ -117,8 +122,8 @@ public:
     return leaves.numLeafZones();
   }
 
-  // The leaf zones, the persisted leaf visit orders and the value sketch
-  // as one copyable view (NumColumnFormat::LeafMeta).
+  // The leaf zones, the leaf visit orders derived from them and the value
+  // sketch as one copyable view (NumColumnFormat::LeafMeta).
   const NumColumnFormat::LeafMeta& leafMeta() const { return leaves; }
 
   // Whether the leaf zones bound docs' keys: a dense single-valued column,
@@ -130,12 +135,27 @@ public:
   }
 
   // Decode the 128-value codec sub-block containing valueRank without restoring
-  // block min/gcd. The returned residuals are directly comparable with query
-  // bounds transformed into the block's residual domain. Returns the global
-  // value rank of decoded[0] and writes the number of valid values to count.
+  // values. The returned slots are directly comparable with query bounds
+  // mapped into the block's slot domain (slotBounds), exceptions aside.
+  // Returns the global value rank of decoded[0] and writes the number of
+  // valid values to count.
   int64_t decodeResidualSubBlock(int64_t valueRank, uint32_t* decoded,
                                  uint32_t& count) const {
     return values.decodeResidualFrame(valueRank, decoded, count);
+  }
+
+  // The slot interval of [lo, hi] in a slotComparable block (NumColumn::
+  // slotBounds); nullopt when the block's slots are not comparable.
+  std::optional<NumColumnFormat::ResidualBounds> slotBounds(
+      int64_t blockNum, int64_t lo, int64_t hi) const {
+    return values.slotBounds(blockNum, lo, hi);
+  }
+
+  // Calls f(valueRank, value) for each exception at value ranks [rank,
+  // rank + n), which lie in one block.
+  template <class F>
+  void forEachException(int64_t rank, uint32_t n, F&& f) const {
+    values.forEachException(rank, n, f);
   }
 
   // Decode reconstructed values for packed predicted/wide or raw blocks.
