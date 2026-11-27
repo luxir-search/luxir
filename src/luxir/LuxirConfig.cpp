@@ -121,6 +121,18 @@ void ReplicationConfig::validate() const {
   if (retry_ms < 1) throw std::invalid_argument("replication.retry-ms must be positive");
 }
 
+void ServerConfig::validate() const {
+  if (memory_limit_mb < 0) throw std::invalid_argument("server.memory-limit-mb must not be negative");
+  if (memory_pressure_sample_ms < 0) throw std::invalid_argument("server.memory-pressure-sample-ms must not be negative");
+  if (memory_pressure_soft_percent < 1 || memory_pressure_soft_percent > memory_pressure_hard_percent ||
+      memory_pressure_hard_percent > 100) {
+    throw std::invalid_argument("memory pressure thresholds need 1 <= soft <= hard <= 100 percent");
+  }
+  if (memory_pressure_hysteresis_percent < 0 || memory_pressure_hysteresis_percent >= memory_pressure_soft_percent) {
+    throw std::invalid_argument("server.memory-pressure-hysteresis-percent must be in [0, soft)");
+  }
+}
+
 void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--node.id", node.id, "Node identity (default host:port, otherwise a random UUID)");
   app.add_option("--replicate-from,--replication.source", replication.source, "Follow this HTTP source namespace");
@@ -168,6 +180,26 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Task-arena worker threads for indexing, merges and parallel search "
                  "(0 = auto: all CPUs on nodes of up to 4, else all but one)")
       ->default_val(server.workers)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--server.memory-limit-mb", server.memory_limit_mb,
+                 "Memory limit (MiB) for memory pressure admission (0 = cgroup limit, else system RAM)")
+      ->default_val(server.memory_limit_mb)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--server.memory-pressure-soft-percent", server.memory_pressure_soft_percent,
+                 "Memory use (% of the limit) at which new update requests are refused")
+      ->default_val(server.memory_pressure_soft_percent)
+      ->check(CLI::Range(1, 100));
+  app.add_option("--server.memory-pressure-hard-percent", server.memory_pressure_hard_percent,
+                 "Memory use (% of the limit) at which new searches and update batches are refused")
+      ->default_val(server.memory_pressure_hard_percent)
+      ->check(CLI::Range(1, 100));
+  app.add_option("--server.memory-pressure-hysteresis-percent", server.memory_pressure_hysteresis_percent,
+                 "Points below a threshold that memory use must drop to leave its level")
+      ->default_val(server.memory_pressure_hysteresis_percent)
+      ->check(CLI::Range(0, 99));
+  app.add_option("--server.memory-pressure-sample-ms", server.memory_pressure_sample_ms,
+                 "Memory pressure sampling interval in milliseconds (0 = off)")
+      ->default_val(server.memory_pressure_sample_ms)
       ->check(CLI::NonNegativeNumber);
   app.add_option("--server.control-threads", server.control_threads,
                  "Control-plane threads for administration, schema changes, replication transfers "
@@ -315,6 +347,13 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Per-request query-memory breaker ceiling (0 = unlimited)")
       ->default_val(search.request_memory_max_bytes)
       ->check(CLI::NonNegativeNumber);
+  // No default_val: the -1 sentinel asks resolveRamBudgets() for the share.
+  app.add_option("--search.node-request-memory-max-bytes",
+                 search.node_request_memory_max_bytes,
+                 "Node-wide ceiling on query memory tracked across running requests (0 = unlimited)")
+      ->transform(CLI::AsSizeValue(false))
+      ->check(CLI::NonNegativeNumber)
+      ->default_str("half of --max-ram-mb");
   app.add_option("--search.multiterm-max-expansions",
                  search.multiterm_max_expansions,
                  "Operator opt-in term cap per segment for prefix/wildcard/regex/range; "
@@ -359,6 +398,11 @@ void LuxirConfig::resolveRamBudgets() {
     index.max_ram_mb = (read_only || !replication.source.empty()) ? 0 : max_ram_mb / 2;
   }
 
+  if (search.node_request_memory_max_bytes < 0) {
+    // The half of the node budget indexing does not take.
+    search.node_request_memory_max_bytes = max_ram_mb > 0 ? max_ram_mb * 1024 * 1024 / 2 : 0;
+  }
+
   if (index.max_inverter_ram_mb < 0) {
     // One inverter may hold the whole indexing budget - with a single stream
     // there is nothing else to hold it - but never more, and never more than
@@ -372,6 +416,7 @@ void LuxirConfig::resolveRamBudgets() {
 void LuxirConfig::normalize() {
   if (!node.id.empty()) node.validate();
   replication.validate();
+  server.validate();
   resolveRamBudgets();
 
   // Only an explicitly set share can exceed the node budget; a derived one is

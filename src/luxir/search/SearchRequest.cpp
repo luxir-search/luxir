@@ -123,7 +123,8 @@ SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
     : engine(engine), searchConfig(engine.searchConfig()),
       memoryTracker(forcedRequestMemoryMaxBytes != 0
                         ? forcedRequestMemoryMaxBytes
-                        : searchConfig.request_memory_max_bytes),
+                        : searchConfig.request_memory_max_bytes,
+                    &engine.nodeRequestMemory()),
       multiTermBudget(MultiTermLimits{
           .maxExpansions = searchConfig.multiterm_max_expansions,
           .maxTermsExamined = searchConfig.multiterm_max_terms_examined,

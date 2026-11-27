@@ -105,6 +105,26 @@ void service(Renderer& r, const api::ServiceStats& s) {
 
 void memory(Renderer& r, const api::MemoryStats& m) {
   r.gauge("luxir_search_request_memory_limit_bytes", "Per-request tracked search memory ceiling; zero disables rejection.", (double)m.search_request_limit_bytes);
+  r.gauge("luxir_search_node_request_memory_bytes", "Query memory tracked across all running searches.", (double)m.search_node_request_bytes);
+  r.gauge("luxir_search_node_request_memory_limit_bytes", "Node-wide ceiling on tracked search memory; zero means unlimited.", (double)m.search_node_request_limit_bytes);
+  const auto& p = m.pressure;
+  for (auto state : {"normal", "soft", "hard"})
+    r.gauge("luxir_memory_pressure_state", "Memory pressure admission state; 1 for the current one.", p.state == state,
+            PrometheusText::label("state", state));
+  r.gauge("luxir_memory_pressure_used_bytes", "Memory pressure measure: unreclaimable cgroup usage, or process anonymous RSS.", (double)p.used_bytes);
+  r.gauge("luxir_memory_pressure_limit_bytes", "Limit the memory pressure thresholds are fractions of.", (double)p.limit_bytes);
+  for (auto [level, ratio] : {std::pair{"soft", p.soft_ratio}, {"hard", p.hard_ratio}})
+    r.gauge("luxir_memory_pressure_threshold_ratio", "Memory pressure thresholds as fractions of the limit.", ratio,
+            PrometheusText::label("level", level));
+  r.counter("luxir_memory_pressure_transitions_total", "Memory pressure state changes.", (double)p.transitions);
+  constexpr std::string_view rejections = "Requests refused at admission, by the work refused and its cause.";
+  for (auto [work, cause, count] : {std::tuple{"update", "memory_pressure_soft", p.rejected_updates_soft},
+                                    {"update", "memory_pressure_hard", p.rejected_updates_hard},
+                                    {"update_batch", "memory_pressure_hard", p.rejected_update_batches},
+                                    {"search", "memory_pressure_hard", p.rejected_searches},
+                                    {"search", "node_request_memory", m.search_node_request_rejected}})
+    r.counter("luxir_admission_rejections_total", rejections, (double)count,
+              PrometheusText::label("work", work) + "," + PrometheusText::label("cause", cause));
   r.gauge("luxir_node_memory_budget_bytes", "Configured budget for managed memory; not an RSS ceiling. Zero means unlimited.", (double)m.node_budget_bytes);
   const auto& ram = m.indexing_budget;
   r.gauge("luxir_index_ram_reserved_bytes", "Indexing RAM reservations, which may temporarily exceed the soft cap.", (double)ram.reserved_bytes);

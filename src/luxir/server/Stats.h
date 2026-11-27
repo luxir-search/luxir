@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <filesystem>
 #include <memory_resource>
 #include <string_view>
 
@@ -31,6 +32,10 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
 // unavailable. Same borrowing contract as gatherStats.
 void gatherSystemStats(api::SystemStats* system, api::HostStats* host, std::string_view dataDirectory,
                        std::pmr::memory_resource& resource);
+
+// This process's cgroup v2 directory, matched to its cgroup2 mount (cgroup
+// namespaces and bind mounts included). Throws when there is none.
+std::filesystem::path cgroupV2Directory();
 
 // Apply the requested filter-cache actions (max_bytes resize / flush /
 // reset_admission / reset_counters) and gather post-action stats plus an

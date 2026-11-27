@@ -615,9 +615,9 @@ public:
   // not streamed anything yet (docs format, failure before the first flush).
   // Dropped if the connection has failed or a streaming response already
   // started (the abortStream contract covers that case).
-  void respondErrorFromEngine(http::status status, std::string body) {
+  void respondErrorFromEngine(http::status status, std::string body, int retryAfter = 0) {
     net::post(stream_.get_executor(),
-        [self = shared_from_this(), status, body = std::move(body)]() mutable {
+        [self = shared_from_this(), status, body = std::move(body), retryAfter]() mutable {
           if (self->errored_) return;
           if (self->ticketLost_.load(std::memory_order_relaxed)) {
             // The lost line never arrives, so this connection cannot stream in
@@ -632,7 +632,7 @@ public:
             self->abandonOutput();
           }
           if (self->headerSent_) return;
-          self->respondJson(status, std::move(body));
+          self->respondJson(status, std::move(body), retryAfter);
         });
   }
 
@@ -964,6 +964,10 @@ private:
       std::string paramErr;
       if (!parseUpdateUrlParams(params, updateUrl_, paramErr)) {
         respondBeforeBodyError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, paramErr));
+        return;
+      }
+      if (auto rejected = node_.getMemoryPressure().admit(MemoryPressure::Work::UPDATE)) {
+        respondBeforeBodyError(*rejected);  // refused before its body is read
         return;
       }
     }
@@ -3285,6 +3289,10 @@ private:
                                state->batch->collectionName + "' is closed"});
       return false;
     }
+    if (auto rejected = node_.getMemoryPressure().admit(MemoryPressure::Work::UPDATE_BATCH)) {
+      failStreamingUpdate(std::move(*rejected));
+      return false;
+    }
 
     std::shared_ptr<HttpStreamBatchState> batch(std::move(state->batch));
     state->batch = std::make_unique<HttpStreamBatchState>(state->batchMaxDocs);
@@ -4082,17 +4090,21 @@ private:
 
   // --- one-shot (non-streaming) responses: health, 404, 400 -----------------
 
-  void respondJson(http::status status, std::string compact) {
-    respondSimple(status, "application/json", finishJson(std::move(compact)));
+  void respondJson(http::status status, std::string compact, int retryAfter = 0) {
+    respondSimple(status, "application/json", finishJson(std::move(compact)), false, retryAfter);
   }
 
-  void respondSimple(http::status status, std::string_view contentType, std::string body, bool head = false) {
+  // retryAfter > 0 adds a Retry-After header (seconds) to a refusal the client
+  // should retry: see retryAfterSeconds().
+  void respondSimple(http::status status, std::string_view contentType, std::string body, bool head = false,
+                     int retryAfter = 0) {
     stopWaitDisconnect();
     if ((unsigned)status >= 400) metricError();
     metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::HTTP, body.size());
     auto resp = std::make_shared<http::response<http::string_body>>(status, httpVersion_);
     resp->set(http::field::server, "luxir");
     resp->set(http::field::content_type, contentType);
+    if (retryAfter > 0) resp->set(http::field::retry_after, std::to_string(retryAfter));
     resp->keep_alive(keepAlive_);
     resp->body() = std::move(body);
     resp->prepare_payload();
@@ -4119,7 +4131,8 @@ private:
   void respondError(const ErrorInfo& info) { respondError(info, requestId_); }
   void respondError(const ErrorInfo& info, std::string_view requestId, bool head = false) {
     metricError(info.kind);
-    respondSimple(httpStatusFor(info), "application/json", finishJson(renderErrorBody(info, requestId)), head);
+    respondSimple(httpStatusFor(info), "application/json", finishJson(renderErrorBody(info, requestId)), head,
+                  retryAfterSeconds(info.code));
   }
   // An unread body cannot be reused as the next request. Answer, then close.
   void respondBeforeBodyError(const ErrorInfo& info) {
@@ -4207,7 +4220,8 @@ SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
     } else if (response.proto.error && !outputCommitted) {
       auto info = api::build::errorInfo(*response.proto.error);
       session->respondErrorFromEngine(httpStatusFor(info),
-          renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions));
+          renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions),
+          retryAfterSeconds(info.code));
     } else {
       int64_t queued = session->enqueueJson(
           renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions), last);
@@ -4243,7 +4257,8 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
       } else {
         ErrorInfo info = luxir::api::build::errorInfo(*response.proto.error);
         session->respondErrorFromEngine(httpStatusFor(info),
-            renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions));
+            renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions),
+            retryAfterSeconds(info.code));
       }
     } else {
       // Document bodies are a pure function of the batch: render them OUTSIDE

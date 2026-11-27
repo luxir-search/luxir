@@ -16,6 +16,8 @@ struct SearchConfig;
 //
 class SearchEngine {
   LuxirNode& node;
+  // Query memory of every running request, against the node-wide ceiling.
+  NodeRequestMemory requestMemory;
 
   void submitBody(SearchRequest& req);
   // Runs submit() on an arena worker, isolating its waits.
@@ -26,8 +28,8 @@ class SearchEngine {
   void getResources(SearchRequest& req);
 
 public:
-  SearchEngine(LuxirNode& node): node(node) {
-  }
+  explicit SearchEngine(LuxirNode& node);
+  NodeRequestMemory& nodeRequestMemory() { return requestMemory; }
 
   const SearchConfig& searchConfig() const;
   LuxirNode& getNode() const { return node; }
