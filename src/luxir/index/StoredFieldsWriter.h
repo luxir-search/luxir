@@ -44,7 +44,11 @@ namespace luxir {
 //   ...
 //   <optional compression dictionary>
 //   <[varint numFields] then numFields PackedTerms (field names keyed by
-//    segment-local stored-field id)>
+//    segment-local stored-field id), then [varint numSourceBacked] and that
+//    many varint field ids>
+//
+// A source-backed field (see markSourceBacked) is left out of a doc whose
+// _source_ record holds its value as indexed; a reader finds it there.
 //
 // The field record carries the codec and chunk limits for merge admission.
 // The writer pins an optional prepared ZSTD dictionary and uses it from the
@@ -83,6 +87,9 @@ private:
   boost::unordered_flat_map<std::string, uint32_t,
                             PackedTermHash, PackedTermEqual> fieldNameToId;
   std::vector<PackedTerm> fieldNames;  // indexed by stored-field id
+  // Fields whose values may live in the docs' source instead, resolved to ids
+  // at finish() so that merges can adopt a source's field table first.
+  std::vector<std::string> sourceBackedNames;
 
   // Currently-accumulating doc state.
   int32_t currentDoc = -1;
@@ -155,11 +162,24 @@ public:
     }
   }
 
+  // List fieldName as source-backed: docs whose _source_ record holds their
+  // field values (source::holdsFieldValues) leave its values out.
+  void markSourceBacked(std::string_view fieldName) {
+    if (std::ranges::find(sourceBackedNames, fieldName) == sourceBackedNames.end()) {
+      sourceBackedNames.emplace_back(fieldName);
+    }
+  }
+  std::span<const std::string> sourceBacked() const { return sourceBackedNames; }
+
   // Finalize: close the pending doc, pad any skipped docs up to maxDoc with
   // empty entries, flush the last chunk, write metadata and monotonic columns,
   // and return the stored resource. No resource is produced if no field was
   // added or adopted.
   [[nodiscard]] std::optional<field_parts::Stored> finish(int32_t maxDoc) {
+    std::vector<uint32_t> sourceBackedIds;
+    sourceBackedIds.reserve(sourceBackedNames.size());
+    for (const auto& name : sourceBackedNames) sourceBackedIds.push_back(getOrAssignFieldId(name));
+    std::ranges::sort(sourceBackedIds);
     // No fields were added or adopted from a merge source.
     if (fieldNames.empty()) {
       postingsWriter.finishStream(std::move(chunkOutput));
@@ -189,6 +209,8 @@ public:
     for (const auto& name : fieldNames) {
       chunkOutput->writePackedTerm(name);
     }
+    chunkOutput->writeVint((uint32_t)sourceBackedIds.size());
+    for (uint32_t id : sourceBackedIds) chunkOutput->writeVint(id);
 
     auto namesBytes = chunkOutput.pos() - namesStart;
     auto slice = postingsWriter.finishStream(std::move(chunkOutput));

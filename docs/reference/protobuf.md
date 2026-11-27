@@ -157,6 +157,10 @@ defaults and constraints are described in the comments and guides.
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
 - [`OutcomeStats`](#message-luxir.outcomestats)
+- [`Patch`](#message-luxir.patch)
+- [`PatchCondition`](#message-luxir.patchcondition)
+- [`PatchOp`](#message-luxir.patchop)
+- [`PatchResult`](#message-luxir.patchresult)
 - [`PhraseOptions`](#message-luxir.phraseoptions)
 - [`PhraseQuery`](#message-luxir.phrasequery)
 - [`PluginOp`](#message-luxir.pluginop)
@@ -1086,7 +1090,8 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.column"></a>[`column`](#field-luxir.fielddef.column) | 4 | `bool` | optional | store values in a per-field column |
 | <a id="field-luxir.fielddef.multi"></a>[`multi`](#field-luxir.fielddef.multi) | 5 | [`FieldDef.MultiMode`](#enum-luxir.fielddef.multimode) | optional | unset inherits, falling back to SINGLE |
 | <a id="field-luxir.fielddef.analyzer"></a>[`analyzer`](#field-luxir.fielddef.analyzer) | 6 | [`AnalyzerDef`](#message-luxir.analyzerdef) | singular | TEXT only. Unset or empty inherits; a nonempty definition replaces the entire analyzer. Without an inherited analyzer, defaults to whitespace. |
-| <a id="field-luxir.fielddef.stored"></a>[`stored`](#field-luxir.fielddef.stored) | 7 | `bool` | optional | Keep canonical source text before analysis/normalization for TEXT/STRING/ID retrieval. Defaults to true for TEXT, false otherwise; unused on other types. |
+| <a id="field-luxir.fielddef.stored"></a>[`stored`](#field-luxir.fielddef.stored) | 7 | `bool` | optional | Keep canonical source text before analysis/normalization for TEXT/STRING/ID retrieval. Defaults to true for TEXT, false otherwise; unused on other types. With the collection's "\_source\_" store on, a stored TEXT/STRING value is served from the document's source instead of being written a second time (see stored\_copy). |
+| <a id="field-luxir.fielddef.stored_copy"></a>[`stored_copy`](#field-luxir.fielddef.stored_copy) | 31 | `bool` | optional | With "\_source\_" on, a stored TEXT/STRING field is retrieved from each document's source and is written to stored fields only for documents whose source does not hold it as indexed (source includes/excludes, a request field\_map). True also keeps the stored copy for every document: a fetch decompresses less but the value takes its bytes twice. Unset inherits the parent's setting, else false. Ignored without "\_source\_". |
 | <a id="field-luxir.fielddef.stored_resource"></a>[`stored_resource`](#field-luxir.fielddef.stored_resource) | 8 | `string` | optional | Stored-field group for stored TEXT/STRING/ID values, e.g. "\_stored\_body\_", declared in SchemaDef.stored\_resources. Empty or unset inherits the parent's group, falling back to "\_stored\_". |
 | <a id="field-luxir.fielddef.dims"></a>[`dims`](#field-luxir.fielddef.dims) | 9 | `int32` | optional | Vector dimensionality. Unset inherits, falling back to 0 (infer from the first indexed value). A positive value enforces dimensions at ingest. With truncate\_dims, this is the full input dimension. |
 | <a id="field-luxir.fielddef.metric"></a>[`metric`](#field-luxir.fielddef.metric) | 10 | [`VectorMetric`](#enum-luxir.vectormetric) | optional | Vector similarity metric. Absent means inherit, else NONE (storage-only). |
@@ -1748,6 +1753,66 @@ Completed work by outcome, and its summed duration.
 | <a id="field-luxir.outcomestats.cancelled"></a>[`cancelled`](#field-luxir.outcomestats.cancelled) | 3 | `uint64` | singular |  |
 | <a id="field-luxir.outcomestats.seconds"></a>[`seconds`](#field-luxir.outcomestats.seconds) | 4 | `double` | singular |  |
 
+<a id="message-luxir.patch"></a>
+
+### luxir.Patch
+
+One partial update of a document. The engine reads the newest document with this id, checks the preconditions, applies the ops in order to the document's source and indexes the result in place of the document, under the request's update version. A result equal to the document writes nothing (NOOP). Patches are applied once, in update version order: a later overwrite or delete of the id wins over an earlier patch, and a later patch sees the result of an earlier one.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.patch.id"></a>[`id`](#field-luxir.patch.id) | 1 | `string` | singular | The document id. Ops cannot change it. |
+| <a id="field-luxir.patch.ops"></a>[`ops`](#field-luxir.patch.ops) | 2 | [`PatchOp`](#message-luxir.patchop) | repeated |  |
+| <a id="field-luxir.patch.when"></a>[`when`](#field-luxir.patch.when) | 3 | [`PatchCondition`](#message-luxir.patchcondition) | repeated | Every condition must hold, or the patch is SKIPPED. |
+| <a id="field-luxir.patch.exists"></a>[`exists`](#field-luxir.patch.exists) | 4 | [`Patch.Exists`](#enum-luxir.patch.exists) | singular |  |
+| <a id="field-luxir.patch.if_version"></a>[`if_version`](#field-luxir.patch.if_version) | 5 | `uint64` | optional | Optimistic concurrency: the document's \_version\_ must equal this, or the patch is a CONFLICT (also when the document is missing). |
+| <a id="field-luxir.patch.upsert"></a>[`upsert`](#field-luxir.patch.upsert) | 6 | `bool` | singular | A missing document starts as {"id": id} and the ops apply to it. |
+| <a id="field-luxir.patch.upsert_doc"></a>[`upsert_doc`](#field-luxir.patch.upsert_doc) | 7 | [`Map`](#message-luxir.map) | singular | A missing document is created as this body (with the id added), and the ops do not apply. Implies upsert. |
+| <a id="field-luxir.patch.delete_doc"></a>[`delete_doc`](#field-luxir.patch.delete_doc) | 8 | `bool` | singular | Delete the document when the preconditions hold. No ops. |
+
+<a id="message-luxir.patchcondition"></a>
+
+### luxir.PatchCondition
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.patchcondition.path"></a>[`path`](#field-luxir.patchcondition.path) | 1 | `string` | singular |  |
+| <a id="field-luxir.patchcondition.op"></a>[`op`](#field-luxir.patchcondition.op) | 2 | [`PatchCondition.Op`](#enum-luxir.patchcondition.op) | singular |  |
+| <a id="field-luxir.patchcondition.value"></a>[`value`](#field-luxir.patchcondition.value) | 3 | [`Val`](#message-luxir.val) | singular |  |
+| <a id="field-luxir.patchcondition.missing"></a>[`missing`](#field-luxir.patchcondition.missing) | 4 | [`Val`](#message-luxir.val) | singular | Compared in place of a missing field. Without it, a missing field fails every comparison except NE. |
+
+<a id="message-luxir.patchop"></a>
+
+### luxir.PatchOp
+
+A path names a value by dotted object keys ("a.b"); it never descends into arrays. Paths start at the document root and cannot name "id" or a reserved "\_name\_" field.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.patchop.op"></a>[`op`](#field-luxir.patchop.op) | 1 | [`PatchOp.Op`](#enum-luxir.patchop.op) | singular |  |
+| <a id="field-luxir.patchop.path"></a>[`path`](#field-luxir.patchop.path) | 2 | `string` | singular |  |
+| <a id="field-luxir.patchop.value"></a>[`value`](#field-luxir.patchop.value) | 3 | [`Val`](#message-luxir.val) | singular |  |
+
+<a id="message-luxir.patchresult"></a>
+
+### luxir.PatchResult
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.patchresult.id"></a>[`id`](#field-luxir.patchresult.id) | 1 | `string` | singular |  |
+| <a id="field-luxir.patchresult.index"></a>[`index`](#field-luxir.patchresult.index) | 2 | `int32` | singular | Position of the patch in the request. |
+| <a id="field-luxir.patchresult.status"></a>[`status`](#field-luxir.patchresult.status) | 3 | [`PatchResult.Status`](#enum-luxir.patchresult.status) | singular |  |
+| <a id="field-luxir.patchresult.version"></a>[`version`](#field-luxir.patchresult.version) | 4 | `uint64` | singular | The document's \_version\_ after the patch: the request's update version when it wrote, else the current document's version (0 when there is none). |
+| <a id="field-luxir.patchresult.error"></a>[`error`](#field-luxir.patchresult.error) | 5 | [`Error`](#message-luxir.error) | singular |  |
+
 <a id="message-luxir.phraseoptions"></a>
 
 ### luxir.PhraseOptions
@@ -2226,7 +2291,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 |---|---|---|---|---|
 | <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. \_version\_ is fixed and retrieval-only: it returns the update version of the request that indexed each document, including allow\_dups and documents without an ID. |
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
-| <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. |
+| <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. The reserved "\_source\_" entry is the document source store; mode=replace\_all keeps the current one unless the replacement names it. |
 
 <a id="message-luxir.schemarequest"></a>
 
@@ -2550,18 +2615,25 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 
 ### luxir.StoredResourceDef
 
-Chunk settings for one stored-field group (a FieldDef stored\_resource). Every setting is optional; absent selects the default. Changes apply to segments written afterwards. A merge recompresses its inputs unless their codec and chunk limits already match; the level alone does not count.
+Chunk settings for one stored-field group (a FieldDef stored\_resource). Every setting is optional; absent selects the default. Changes apply to segments written afterwards. A merge recompresses its inputs unless their codec and chunk limits already match; the level alone does not count.<br><br>The reserved resource "\_source\_" is the optional store of every document as it was submitted (see docs/design/source-store.md). It always uses the SEPARATED layout: files of their own that no search, warmup or segment open reads. Declaring it turns the store on for documents indexed afterwards; retrieve a document with fields \["\_source"\], or export it with format=docs and source=true. No field may name it as its stored\_resource.
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.storedresourcedef.codec"></a>[`codec`](#field-luxir.storedresourcedef.codec) | 1 | [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec) | optional | Chunk compression; absent selects lz4. |
+| <a id="field-luxir.storedresourcedef.codec"></a>[`codec`](#field-luxir.storedresourcedef.codec) | 1 | [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec) | optional | Chunk compression; absent selects zstd. |
 | <a id="field-luxir.storedresourcedef.zstd_level"></a>[`zstd_level`](#field-luxir.storedresourcedef.zstd_level) | 2 | `int32` | optional | ZSTD level from 1 (fastest) to 22 (smallest). Absent selects 3. Only valid with codec zstd. |
-| <a id="field-luxir.storedresourcedef.chunk_size_bytes"></a>[`chunk_size_bytes`](#field-luxir.storedresourcedef.chunk_size_bytes) | 3 | `int32` | optional | Target uncompressed bytes per chunk, 1024 to 4194304; absent selects 16384, or 65536 with zstd. Larger chunks compress better, but each retrieval decompresses a whole chunk. |
-| <a id="field-luxir.storedresourcedef.max_docs_per_chunk"></a>[`max_docs_per_chunk`](#field-luxir.storedresourcedef.max_docs_per_chunk) | 4 | `int32` | optional | Most documents per chunk, 1 to 65536; absent selects 128, or 1024 with zstd. A chunk closes at whichever of the byte and document limits comes first. |
-| <a id="field-luxir.storedresourcedef.zstd_dictionary"></a>[`zstd_dictionary`](#field-luxir.storedresourcedef.zstd_dictionary) | 5 | `bool` | optional | Enable one ZSTD dictionary per resource, shared by its segments. The first merge with at least 100 times the capacity (at most 8 MiB) of live stored data trains it; earlier segments have none. Helps most with small chunks; decoding can be slower with large chunks. No automatic retraining: changing this setting, the capacity or codec clears it for a later merge to retrain. After restart, use the dictionary from the largest live segment carrying one. Only valid with codec zstd. |
-| <a id="field-luxir.storedresourcedef.zstd_dictionary_bytes"></a>[`zstd_dictionary_bytes`](#field-luxir.storedresourcedef.zstd_dictionary_bytes) | 6 | `int32` | optional | Dictionary capacity upper bound, 1024 to 262144 bytes; absent selects 65536. Training can produce a smaller dictionary. Only valid with zstd\_dictionary. |
+| <a id="field-luxir.storedresourcedef.chunk_size_bytes"></a>[`chunk_size_bytes`](#field-luxir.storedresourcedef.chunk_size_bytes) | 3 | `int32` | optional | Target uncompressed bytes per chunk, 1024 to 4194304; absent selects 16384. Larger chunks compress better without a dictionary, but each retrieval decompresses a whole chunk. |
+| <a id="field-luxir.storedresourcedef.max_docs_per_chunk"></a>[`max_docs_per_chunk`](#field-luxir.storedresourcedef.max_docs_per_chunk) | 4 | `int32` | optional | Most documents per chunk, 1 to 65536; absent selects 128. A chunk closes at whichever of the byte and document limits comes first. |
+| <a id="field-luxir.storedresourcedef.zstd_dictionary"></a>[`zstd_dictionary`](#field-luxir.storedresourcedef.zstd_dictionary) | 5 | `bool` | optional | One ZSTD dictionary per resource, shared by its segments (for "\_source\_", by its files). Absent means true with codec zstd; false turns it off. The first merge with at least 100 times the capacity (at most 8 MiB) of live data trains it; earlier segments have none. Helps most with small chunks; decoding can be slower with large chunks. No automatic retraining: changing this setting, the capacity or codec clears it for a later merge to retrain. After restart, use the dictionary from the largest live segment carrying one. True is only valid with codec zstd. |
+| <a id="field-luxir.storedresourcedef.zstd_dictionary_bytes"></a>[`zstd_dictionary_bytes`](#field-luxir.storedresourcedef.zstd_dictionary_bytes) | 6 | `int32` | optional | Dictionary capacity upper bound, 1024 to 262144 bytes; absent selects 65536. Training can produce a smaller dictionary. Only valid with a dictionary on. |
+| <a id="field-luxir.storedresourcedef.layout"></a>[`layout`](#field-luxir.storedresourcedef.layout) | 7 | [`StoredResourceDef.Layout`](#enum-luxir.storedresourcedef.layout) | optional |  |
+| <a id="field-luxir.storedresourcedef.enabled"></a>[`enabled`](#field-luxir.storedresourcedef.enabled) | 8 | `bool` | optional | "\_source\_" only. False keeps the entry but stops storing sources for documents indexed from now on, and deletes existing ones: the next merge of a segment drops that segment's sources for good. Absent means true. |
+| <a id="field-luxir.storedresourcedef.min_live_ratio"></a>[`min_live_ratio`](#field-luxir.storedresourcedef.min_live_ratio) | 9 | `double` | optional | Separated layout: a merge keeps referencing a file while at least this fraction of its documents is live, and rewrites the live ones into a new file otherwise. Above 0 and at most 1; absent selects 0.5. |
+| <a id="field-luxir.storedresourcedef.min_file_bytes"></a>[`min_file_bytes`](#field-luxir.storedresourcedef.min_file_bytes) | 10 | `int64` | optional | Separated layout: a merge also rewrites a file smaller than this, even when fully live, so small files fold together. 0 or more; absent selects 4194304. |
+| <a id="field-luxir.storedresourcedef.max_files"></a>[`max_files`](#field-luxir.storedresourcedef.max_files) | 11 | `int32` | optional | Separated layout: a merged segment references at most this many files plus the one it writes. A file holding less than 1/max\_files of the segment's live bytes is rewritten with the small ones. 1 or more; absent selects 32. |
+| <a id="field-luxir.storedresourcedef.includes"></a>[`includes`](#field-luxir.storedresourcedef.includes) | 12 | `string` | repeated | "\_source\_" only. Keep only these paths of each document's source (includes) or all but these (excludes); at most one of the two. The document is still indexed in full. A path joins object keys with '.' ("user.name") and reaches into arrays of objects without an index step; '\*' in a pattern matches any run of characters, dots included. A matching path keeps or drops its whole value; with includes, an object or array left with nothing is dropped too. Paths name the keys as submitted, before field\_map. An update request can override them for its own documents (UpdateRequest.source\_includes). |
+| <a id="field-luxir.storedresourcedef.excludes"></a>[`excludes`](#field-luxir.storedresourcedef.excludes) | 13 | `string` | repeated |  |
 
 <a id="message-luxir.swapcollectionsrequest"></a>
 
@@ -2706,7 +2778,7 @@ Index or delete documents, with an optional commit.
 |---|---|---|---|---|
 | <a id="field-luxir.updaterequest.request_id"></a>[`request_id`](#field-luxir.updaterequest.request_id) | 1 | `string` | singular | Optional opaque identifier, echoed in the response for correlation. |
 | <a id="field-luxir.updaterequest.collection"></a>[`collection`](#field-luxir.updaterequest.collection) | 3 | `string` | singular | empty selects the default collection, "main" |
-| <a id="field-luxir.updaterequest.docs"></a>[`docs`](#field-luxir.updaterequest.docs) | 4 | [`Map`](#message-luxir.map) | repeated | Documents to index. Input fields named \_version\_ after field mapping are rejected with a document error: the field is assigned by the engine and optimistic concurrency is not supported. |
+| <a id="field-luxir.updaterequest.docs"></a>[`docs`](#field-luxir.updaterequest.docs) | 4 | [`Map`](#message-luxir.map) | repeated | Documents to index. Input fields named \_version\_ after field mapping are rejected with a document error: the field is assigned by the engine (see Patch.if\_version for optimistic concurrency). |
 | <a id="field-luxir.updaterequest.delete_ids"></a>[`delete_ids`](#field-luxir.updaterequest.delete_ids) | 6 | `string` | repeated | Document IDs to delete. Deletes never fail per-id; deleting a nonexistent id is a no-op. |
 | <a id="field-luxir.updaterequest.allow_dups"></a>[`allow_dups`](#field-luxir.updaterequest.allow_dups) | 7 | `bool` | singular | Skip overwrite/dedupe for faster indexing when incoming IDs are known to be unique and do not already exist in the collection. Default (false) overwrites any existing document with the same ID. |
 | <a id="field-luxir.updaterequest.all_or_none"></a>[`all_or_none`](#field-luxir.updaterequest.all_or_none) | 8 | `bool` | singular | If true, all documents in this request must be successfully indexed or none will be. Processing stops at the first failing document: documents already indexed by this request are rolled back, queued delete\_ids from this request are rolled back, and later documents are not attempted (and not listed in errors). Atomicity is per-request; it does not span multiple requests in a stream. |
@@ -2714,6 +2786,9 @@ Index or delete documents, with an optional commit.
 | <a id="field-luxir.updaterequest.commit"></a>[`commit`](#field-luxir.updaterequest.commit) | 10 | [`CommitParams`](#message-luxir.commitparams) | singular | Commit parameters. If present, this request will commit; if absent, no commit is performed. |
 | <a id="field-luxir.updaterequest.field_map"></a>[`field_map`](#field-luxir.updaterequest.field_map) | 11 | map&lt;`string`, `string`&gt; | map | Renames input document keys onto schema fields for this request's docs, applied before schema lookup: a doc key found in the map indexes under the mapped name. An entry mapping to "" drops that input key. After mapping, a name appearing more than once in a doc keeps the last occurrence (the same last-wins rule as duplicate keys). Keys not in the map index under their own name unless drop\_unmapped is set. This reshapes a foreign document stream per request, without editing the input or the schema. |
 | <a id="field-luxir.updaterequest.drop_unmapped"></a>[`drop_unmapped`](#field-luxir.updaterequest.drop_unmapped) | 12 | `bool` | singular | If true, doc keys not present in field\_map are dropped instead of indexed. Requires a non-empty field\_map (note "id" is dropped too unless mapped). |
+| <a id="field-luxir.updaterequest.source_includes"></a>[`source_includes`](#field-luxir.updaterequest.source_includes) | 13 | `string` | repeated | Override the collection's source includes/excludes (SourceDef) for this request's docs: setting either replaces both. At most one of the two, with the same path syntax. Ignored by a collection that does not store sources. |
+| <a id="field-luxir.updaterequest.source_excludes"></a>[`source_excludes`](#field-luxir.updaterequest.source_excludes) | 14 | `string` | repeated |  |
+| <a id="field-luxir.updaterequest.patches"></a>[`patches`](#field-luxir.updaterequest.patches) | 15 | [`Patch`](#message-luxir.patch) | repeated | Partial updates of existing documents, resolved against each document's stored source (the collection must keep \_source\_). See Patch. A request with patches always commits before it responds, and its response carries one patch\_results entry per patch. Rejected with all\_or\_none, field\_map, drop\_unmapped, or allow\_dups, and when one request names an id both in patches and in docs or delete\_ids. |
 
 <a id="message-luxir.updateresponse"></a>
 
@@ -2736,6 +2811,7 @@ The response to an update request. In streaming mode the server sends exactly on
 | <a id="field-luxir.updateresponse.replicas"></a>[`replicas`](#field-luxir.updateresponse.replicas) | 9 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
 | <a id="field-luxir.updateresponse.commits"></a>[`commits`](#field-luxir.updateresponse.commits) | 10 | map&lt;`string`, [`CollectionCommit`](#message-luxir.collectioncommit)&gt; | map | NDJSON URL EOF commit outcomes, including for a single collection. Any collection error sets the response status to ERROR and a top-level error; every admitted collection outcome is retained. HTTP status remains 200. |
 | <a id="field-luxir.updateresponse.took_us"></a>[`took_us`](#field-luxir.updateresponse.took_us) | 11 | `uint64` | singular | Server-side wall time in microseconds from receipt of the complete request message until its response is ready to serialize, including parsing and any commit and replica wait. Excludes serializing, queueing, and sending the response. HTTP NDJSON stream acknowledgments do not carry this field. |
+| <a id="field-luxir.updateresponse.patch_results"></a>[`patch_results`](#field-luxir.updateresponse.patch_results) | 12 | [`PatchResult`](#message-luxir.patchresult) | repeated | One entry per UpdateRequest.patches entry, in request order. |
 
 <a id="message-luxir.updateresponse.docerror"></a>
 
@@ -2889,6 +2965,10 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
 - [`Match.Operator`](#enum-luxir.match.operator)
 - [`MultiMatchQuery.Mode`](#enum-luxir.multimatchquery.mode)
+- [`Patch.Exists`](#enum-luxir.patch.exists)
+- [`PatchCondition.Op`](#enum-luxir.patchcondition.op)
+- [`PatchOp.Op`](#enum-luxir.patchop.op)
+- [`PatchResult.Status`](#enum-luxir.patchresult.status)
 - [`RangeFacet.Bounds`](#enum-luxir.rangefacet.bounds)
 - [`RangeQuery.Relation`](#enum-luxir.rangequery.relation)
 - [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome)
@@ -2899,6 +2979,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`SelectionMode`](#enum-luxir.selectionmode)
 - [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir)
 - [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec)
+- [`StoredResourceDef.Layout`](#enum-luxir.storedresourcedef.layout)
 - [`UpdateResponse.Status`](#enum-luxir.updateresponse.status)
 - [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec)
 - [`VectorEncoding`](#enum-luxir.vectorencoding)
@@ -3104,6 +3185,74 @@ SINGLE is one value; DEFAULT enables the type's default multi mode. SET sorts an
 | <a id="value-luxir.multimatchquery.mode.combined"></a>[`COMBINED`](#value-luxir.multimatchquery.mode.combined) | 0 | TEXT weights scale term frequency and document length at every group size. Other fields are singleton groups with multiplicative weights. |
 | <a id="value-luxir.multimatchquery.mode.per_field"></a>[`PER_FIELD`](#value-luxir.multimatchquery.mode.per_field) | 1 | One match or phrase per field; each weight multiplies its score. |
 
+<a id="enum-luxir.patch.exists"></a>
+
+### luxir.Patch.Exists
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.patch.exists.any"></a>[`ANY`](#value-luxir.patch.exists.any) | 0 | a missing document is NOT\_FOUND unless upsert is set |
+| <a id="value-luxir.patch.exists.must"></a>[`MUST`](#value-luxir.patch.exists.must) | 1 | a missing document is NOT\_FOUND |
+| <a id="value-luxir.patch.exists.must_not"></a>[`MUST_NOT`](#value-luxir.patch.exists.must_not) | 2 | an existing document is a CONFLICT; a missing one is created |
+
+<a id="enum-luxir.patchcondition.op"></a>
+
+### luxir.PatchCondition.Op
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.patchcondition.op.eq"></a>[`EQ`](#value-luxir.patchcondition.op.eq) | 0 |  |
+| <a id="value-luxir.patchcondition.op.ne"></a>[`NE`](#value-luxir.patchcondition.op.ne) | 1 |  |
+| <a id="value-luxir.patchcondition.op.lt"></a>[`LT`](#value-luxir.patchcondition.op.lt) | 2 |  |
+| <a id="value-luxir.patchcondition.op.lte"></a>[`LTE`](#value-luxir.patchcondition.op.lte) | 3 |  |
+| <a id="value-luxir.patchcondition.op.gt"></a>[`GT`](#value-luxir.patchcondition.op.gt) | 4 |  |
+| <a id="value-luxir.patchcondition.op.gte"></a>[`GTE`](#value-luxir.patchcondition.op.gte) | 5 |  |
+| <a id="value-luxir.patchcondition.op.exists"></a>[`EXISTS`](#value-luxir.patchcondition.op.exists) | 6 | the path has a value |
+| <a id="value-luxir.patchcondition.op.missing"></a>[`MISSING`](#value-luxir.patchcondition.op.missing) | 7 | the path has no value |
+
+<a id="enum-luxir.patchop.op"></a>
+
+### luxir.PatchOp.Op
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.patchop.op.set"></a>[`SET`](#value-luxir.patchop.op.set) | 0 | value at path, creating missing objects on the way |
+| <a id="value-luxir.patchop.op.unset"></a>[`UNSET`](#value-luxir.patchop.op.unset) | 1 | remove path (every duplicate key) |
+| <a id="value-luxir.patchop.op.merge"></a>[`MERGE`](#value-luxir.patchop.op.merge) | 2 | RFC 7396 merge patch of the object value at path (root if empty); null removes |
+| <a id="value-luxir.patchop.op.replace"></a>[`REPLACE`](#value-luxir.patchop.op.replace) | 3 | the whole body becomes value (a Map; path must be empty) |
+| <a id="value-luxir.patchop.op.increment"></a>[`INCREMENT`](#value-luxir.patchop.op.increment) | 4 | add the number value; a missing field counts as 0 |
+| <a id="value-luxir.patchop.op.multiply"></a>[`MULTIPLY`](#value-luxir.patchop.op.multiply) | 5 | multiply by the number value; a missing field counts as 0 |
+| <a id="value-luxir.patchop.op.min"></a>[`MIN`](#value-luxir.patchop.op.min) | 6 | keep the smaller of the field and value; a missing field takes value |
+| <a id="value-luxir.patchop.op.max"></a>[`MAX`](#value-luxir.patchop.op.max) | 7 | keep the larger of the field and value; a missing field takes value |
+| <a id="value-luxir.patchop.op.append"></a>[`APPEND`](#value-luxir.patchop.op.append) | 8 | add value (each element of a list value) to the field's list |
+| <a id="value-luxir.patchop.op.append_unique"></a>[`APPEND_UNIQUE`](#value-luxir.patchop.op.append_unique) | 9 | APPEND, skipping values already present |
+| <a id="value-luxir.patchop.op.remove_values"></a>[`REMOVE_VALUES`](#value-luxir.patchop.op.remove_values) | 10 | remove every element equal to value (or to an element of a list value) |
+
+<a id="enum-luxir.patchresult.status"></a>
+
+### luxir.PatchResult.Status
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.patchresult.status.unknown"></a>[`UNKNOWN`](#value-luxir.patchresult.status.unknown) | 0 |  |
+| <a id="value-luxir.patchresult.status.updated"></a>[`UPDATED`](#value-luxir.patchresult.status.updated) | 1 | the document was replaced by the patched one |
+| <a id="value-luxir.patchresult.status.created"></a>[`CREATED`](#value-luxir.patchresult.status.created) | 2 | upsert created the document |
+| <a id="value-luxir.patchresult.status.noop"></a>[`NOOP`](#value-luxir.patchresult.status.noop) | 3 | the patched document equals the current one; nothing was written |
+| <a id="value-luxir.patchresult.status.deleted"></a>[`DELETED`](#value-luxir.patchresult.status.deleted) | 4 | delete\_doc removed the document |
+| <a id="value-luxir.patchresult.status.skipped"></a>[`SKIPPED`](#value-luxir.patchresult.status.skipped) | 5 | a when condition did not hold |
+| <a id="value-luxir.patchresult.status.not_found"></a>[`NOT_FOUND`](#value-luxir.patchresult.status.not_found) | 6 | no document with this id |
+| <a id="value-luxir.patchresult.status.conflict"></a>[`CONFLICT`](#value-luxir.patchresult.status.conflict) | 7 | if\_version or exists did not hold |
+| <a id="value-luxir.patchresult.status.superseded"></a>[`SUPERSEDED`](#value-luxir.patchresult.status.superseded) | 8 | a newer write of this id already replaced the document |
+| <a id="value-luxir.patchresult.status.error"></a>[`ERROR`](#value-luxir.patchresult.status.error) | 9 | see error; the document is unchanged |
+
 <a id="enum-luxir.rangefacet.bounds"></a>
 
 ### luxir.RangeFacet.Bounds
@@ -3227,8 +3376,21 @@ How facet selections filter the enclosing TopDocs results and its sub-operations
 
 | Value | Number | Description |
 |---|---|---|
-| <a id="value-luxir.storedresourcedef.codec.lz4"></a>[`LZ4`](#value-luxir.storedresourcedef.codec.lz4) | 0 | fast compression and decompression |
-| <a id="value-luxir.storedresourcedef.codec.zstd"></a>[`ZSTD`](#value-luxir.storedresourcedef.codec.zstd) | 1 | smaller chunks for repetitive text such as logs, at more CPU |
+| <a id="value-luxir.storedresourcedef.codec.lz4"></a>[`LZ4`](#value-luxir.storedresourcedef.codec.lz4) | 0 | fastest compression and decompression, about 1.7 times the bytes of zstd |
+| <a id="value-luxir.storedresourcedef.codec.zstd"></a>[`ZSTD`](#value-luxir.storedresourcedef.codec.zstd) | 1 | with a trained dictionary, about 40% smaller than lz4 at a few more us per chunk |
+
+<a id="enum-luxir.storedresourcedef.layout"></a>
+
+### luxir.StoredResourceDef.Layout
+
+Where the resource's bytes live. INLINE (the default) keeps them in the segment's data files, copied by every merge. SEPARATED keeps them in files of their own that a merge references rather than copies, relocating only the mostly deleted or small ones. In this release only "\_source\_" may use SEPARATED, and it may use nothing else; the settings below apply to it.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.storedresourcedef.layout.inline"></a>[`INLINE`](#value-luxir.storedresourcedef.layout.inline) | 0 |  |
+| <a id="value-luxir.storedresourcedef.layout.separated"></a>[`SEPARATED`](#value-luxir.storedresourcedef.layout.separated) | 1 |  |
 
 <a id="enum-luxir.updateresponse.status"></a>
 

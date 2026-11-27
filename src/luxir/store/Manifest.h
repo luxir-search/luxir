@@ -10,6 +10,7 @@
 #include "IncarnationState.h"
 #include "luxir/reader/Postings.h"
 #include "IndexFormat.h"
+#include "SourceFiles.h"
 #include "luxir/api/index_files.h"
 #include "luxir/api/padded_input.h"
 
@@ -59,7 +60,7 @@ struct Manifest {
 
   static bool indexFile(std::string_view name) {
     if (name.ends_with(".tmp")) return false;
-    if (candidate(name).first || SchemaBinding::isFile(name)) return true;
+    if (candidate(name).first || SchemaBinding::isFile(name) || isSourceFile(name)) return true;
     auto suffix = segmentFileSuffix(name);
     if (!suffix.starts_with('_')) return sortable(suffix);
     suffix.remove_prefix(1);

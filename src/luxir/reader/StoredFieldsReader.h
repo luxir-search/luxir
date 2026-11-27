@@ -230,6 +230,18 @@ public:
 
   int32_t numChunks() const { return stored->numChunks; }
 
+  // Whether a doc without values for field `fid` may hold them in its
+  // _source_ record (see StoredFieldsWriter::markSourceBacked).
+  bool sourceBacked(int32_t fid) const { return fid >= 0 && metadata->sourceBacked((size_t)fid); }
+  // The names of every source-backed field.
+  template <class Callback>
+  void forEachSourceBacked(Callback&& callback) const {
+    auto names = metadata->fieldNames();
+    for (size_t i = 0; i < names.size(); i++) {
+      if (metadata->sourceBacked(i)) callback(std::string_view(names[i]));
+    }
+  }
+
   // Encoded document views borrow the one decompressed chunk. Returning false
   // from the callback stops the visit; views expire on the next chunk read.
   template <class Callback>

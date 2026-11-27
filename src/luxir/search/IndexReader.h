@@ -19,6 +19,7 @@
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/SegmentCore.h"
 #include "luxir/reader/RankLiveBitmap.h"
+#include "luxir/reader/SourceReader.h"
 #include "luxir/util/screaming.h"
 #include "luxir/util/Once.h"
 #include "luxir/util/SharedLazyCell.h"
@@ -216,12 +217,14 @@ public:
     const std::shared_ptr<SegmentLive> sharedLiveDocs;
     const std::shared_ptr<ChildLiveDocs> childLiveDocs;
     const std::vector<std::shared_ptr<SegmentOverlay>> sharedOverlays;
+    const std::shared_ptr<SourceReader> sharedSource;
   public:
     friend class IndexReader;
 
     struct SegmentInfo {
       uint64_t seg_id;          // Unique identifier for the segment
       uint64_t live_gen;        // What deletes version to use for the segment (0 if no deletes)
+      uint64_t source_gen = 0;  // Generation of the segment's source map (0 if its docs keep no source)
       uint64_t min_version;     // Minimum update version in this segment
       uint64_t max_version;     // Maximum update version in this segment
       uint64_t commit_time;     // first time this segment was committed as part of the index
@@ -236,15 +239,24 @@ public:
     Segment(std::shared_ptr<SegmentCore>&& segmentCore, std::shared_ptr<SegmentLive>&& liveDocs,
               std::vector<std::shared_ptr<SegmentOverlay>>&& overlays,
               SegmentInfo segInfo, int64_t base, int ord, PostingsReader* spaceReader,
-              std::shared_ptr<ChildLiveDocs> childLiveDocs = {})
+              std::shared_ptr<ChildLiveDocs> childLiveDocs = {},
+              std::shared_ptr<SourceReader> source = {})
             :  sharedSegmentCore(std::move(segmentCore)), spaceReader(spaceReader),
                 rowCount(spaceReader ? spaceReader->maxDoc() : 0),
                 liveCount(liveDocs ? liveDocs->numLive() : rowCount),
                 sharedLiveDocs(std::move(liveDocs)),
                 childLiveDocs(std::move(childLiveDocs)),
-                sharedOverlays(std::move(overlays)),
+                sharedOverlays(std::move(overlays)), sharedSource(std::move(source)),
                 segInfo(segInfo), base(base), ord(ord) {
       assert(!sharedLiveDocs || sharedLiveDocs->size() == rowCount);
+    }
+
+    // The segment's stored documents, or null if none of its docs keep a source.
+    SourceReader* source() const noexcept {
+      return sharedSource.get();
+    }
+    std::shared_ptr<SourceReader> sourceShared() const noexcept {
+      return sharedSource;
     }
 
     PostingsReader& postingsReader() const noexcept {
@@ -478,6 +490,7 @@ private:
       Segment::SegmentInfo info;
       int32_t ord;
       std::shared_ptr<ChildLives> childLives;
+      std::shared_ptr<SourceReader> source;
     };
     std::vector<Bundle> bundles;
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;

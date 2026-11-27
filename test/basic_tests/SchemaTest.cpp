@@ -1442,8 +1442,13 @@ TEST_F(SchemaTest, storedResourcesRoundTripAndSetMerge) {
 
   // mode=set replaces named entries and keeps the rest; replace_all drops them.
   auto set = schemaJson(R"({"stored_resources":{"_stored_":{"codec":"zstd"}}})", s.get());
-  // zstd without chunk limits takes its own defaults: 64KB, 1024 docs.
-  EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 3, 65536, 1024}), storedType(*set, "_stored_").format_);
+  // zstd is the default: 16KB, 128 docs and a 64KB dictionary.
+  EXPECT_EQ(StoredChunkFormat{}, storedType(*set, "_stored_").format_);
+  auto lz4 = schemaJson(R"({"stored_resources":{"_stored_":{"codec":"lz4"}}})");
+  EXPECT_EQ(StoredChunkFormat::defaults(StoredChunkFormat::LZ4), storedType(*lz4, "_stored_").format_);
+  EXPECT_EQ(0u, storedType(*lz4, "_stored_").format_.dictionaryBytes);
+  auto plain = schemaJson(R"({"stored_resources":{"_stored_":{"zstd_dictionary":false}}})");
+  EXPECT_EQ(0u, storedType(*plain, "_stored_").format_.dictionaryBytes);
   EXPECT_EQ(9, storedType(*set, "_stored_logs_").format_.zstdLevel);
   EXPECT_EQ(nullptr, schemaJson(R"({"fields":{}})")->getFieldTypePtr("_stored_logs_"));
 
@@ -1456,15 +1461,16 @@ TEST_F(SchemaTest, storedResourcesRoundTripAndSetMerge) {
 
 TEST_F(SchemaTest, storedResourcesValidation) {
   for (auto json : {
-      R"({"stored_resources":{"_stored_":{"zstd_level":3}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"lz4","zstd_level":3}}})",
       R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_level":0}}})",
       R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_level":23}}})",
       R"({"stored_resources":{"_stored_":{"chunk_size_bytes":1023}}})",
       R"({"stored_resources":{"_stored_":{"chunk_size_bytes":4194305}}})",
       R"({"stored_resources":{"_stored_":{"max_docs_per_chunk":0}}})",
       R"({"stored_resources":{"_stored_":{"max_docs_per_chunk":65537}}})",
-      R"({"stored_resources":{"_stored_":{"zstd_dictionary":true}}})",
-      R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_dictionary_bytes":4096}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"lz4","zstd_dictionary":true}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"lz4","zstd_dictionary_bytes":4096}}})",
+      R"({"stored_resources":{"_stored_":{"zstd_dictionary":false,"zstd_dictionary_bytes":4096}}})",
       R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_dictionary":true,"zstd_dictionary_bytes":1023}}})",
       R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_dictionary":true,"zstd_dictionary_bytes":262145}}})",
       R"({"stored_resources":{"bad-name":{}}})",
@@ -1499,7 +1505,7 @@ TEST_F(SchemaTest, storedResourcesSurviveRestart) {
   CommitSnapshotRegistry reopenedSnapshots(*ch.collection().getShard()->getDirectory());
   IndexWriter reopened(reopenedSnapshots);
   auto& stored = storedType(*reopened.getSchema(), "_stored_");
-  EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 3, 32768, 1024}), stored.format_);
+  EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 3, 32768, 128}), stored.format_);
 }
 
 TEST_F(SchemaTest, variantsResolveByOperationAndExplicitSelectors) {

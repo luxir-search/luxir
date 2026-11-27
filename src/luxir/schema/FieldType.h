@@ -170,6 +170,10 @@ public:
   // with this name (default: Postings::STORED_DEFAULT_RESOURCE).  Shared by
   // TEXT, STRING, and ID.  Ignored by field types that don't support STORED.
   std::string storedResource_ = std::string(Postings::STORED_DEFAULT_RESOURCE);
+  // With the collection's _source_ store on, a stored TEXT/STRING value is
+  // served from each document's source unless this asks for a stored copy too
+  // (FieldDef.stored_copy).
+  bool storedCopy_ = false;
 
   // constructor
   FieldType(std::string_view name, FieldType::Type type, int flags, bool rawTextTerms = false) :
@@ -717,15 +721,14 @@ struct StoredChunkFormat {
   // Recorded on disk as one byte.
   enum Codec : uint8_t { LZ4 = 0, ZSTD = 1, LAST = ZSTD };
   static constexpr int DEFAULT_ZSTD_LEVEL = 3;
+  // Small chunks keep a top-k fetch cheap. With a trained dictionary they
+  // compress about as well as 64KB chunks without one, at a third of the
+  // per-chunk decompression cost.
   static constexpr uint32_t DEFAULT_CHUNK_TARGET = 16 * 1024;
   static constexpr uint32_t DEFAULT_MAX_DOCS_PER_CHUNK = 128;
-  // ZSTD is chosen for size, so its defaults trade some per-document read
-  // cost for larger chunks.
-  static constexpr uint32_t DEFAULT_ZSTD_CHUNK_TARGET = 64 * 1024;
-  static constexpr uint32_t DEFAULT_ZSTD_MAX_DOCS_PER_CHUNK = 1024;
   static constexpr uint32_t DEFAULT_DICTIONARY_BYTES = 64 * 1024;
 
-  Codec codec = LZ4;
+  Codec codec = ZSTD;
   int zstdLevel = DEFAULT_ZSTD_LEVEL;
   // Target uncompressed bytes per chunk before flushing.
   uint32_t chunkTarget = DEFAULT_CHUNK_TARGET;
@@ -733,7 +736,7 @@ struct StoredChunkFormat {
   // target or this doc count is reached, whichever comes first.
   uint32_t maxDocsPerChunk = DEFAULT_MAX_DOCS_PER_CHUNK;
   // ZSTD only: dictionary training capacity; 0 disables dictionaries.
-  uint32_t dictionaryBytes = 0;
+  uint32_t dictionaryBytes = DEFAULT_DICTIONARY_BYTES;
 
   // Same chunk bytes and boundaries: compressed chunks of one format can be
   // copied verbatim into a writer of the other, provided both segments hold
@@ -743,10 +746,10 @@ struct StoredChunkFormat {
   }
   bool operator==(const StoredChunkFormat&) const = default;
 
-  // The defaults for a codec.
+  // The defaults for a codec: zstd trains a dictionary, lz4 has none.
   static StoredChunkFormat defaults(Codec codec) {
-    if (codec == LZ4) return {};
-    return {ZSTD, DEFAULT_ZSTD_LEVEL, DEFAULT_ZSTD_CHUNK_TARGET, DEFAULT_ZSTD_MAX_DOCS_PER_CHUNK};
+    if (codec == ZSTD) return {};
+    return {LZ4, DEFAULT_ZSTD_LEVEL, DEFAULT_CHUNK_TARGET, DEFAULT_MAX_DOCS_PER_CHUNK, 0};
   }
 };
 

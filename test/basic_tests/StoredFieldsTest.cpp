@@ -1533,6 +1533,7 @@ TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveChunkRegionThenLowestId) {
     {
       CommitSnapshotRegistry snapshots(test::reserveIncarnation(dir));
       IndexWriter iw(snapshots);
+      iw.seedDictionaries();
       pin = iw.storedDictionaries.lookup("_stored_", DICT_FORMAT);
       ASSERT_NE(nullptr, pin);
       EXPECT_EQ((tie ? a : b)->bytes(), pin->bytes());
@@ -1551,8 +1552,9 @@ TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveChunkRegionThenLowestId) {
   }
 }
 
-// A writer open picks the seed dictionary from catalog records and reads only
-// the winner's dictionary; plain adds afterwards read no old segment data.
+// A writer open reads no segment data. Recovery, before the first merge, picks
+// the seed dictionary from catalog records and reads only the winner's
+// dictionary; plain adds afterwards read no old segment data.
 TEST_F(StoredFieldsTest, writerOpenReadsOnlyTheSeedDictionary) {
   auto ram = std::make_shared<RAMDir>();
   auto seed = std::make_shared<const StoredDictionary>(trainStoredDictionary());
@@ -1581,6 +1583,8 @@ TEST_F(StoredFieldsTest, writerOpenReadsOnlyTheSeedDictionary) {
   };
   CommitSnapshotRegistry snapshots(*dir);
   IndexWriter iw(snapshots);
+  EXPECT_EQ(0u, dataParts());
+  iw.seedDictionaries();
   auto pin = iw.storedDictionaries.lookup("_stored_", DICT_FORMAT);
   ASSERT_NE(nullptr, pin);
   EXPECT_EQ(seed->bytes(), pin->bytes());
@@ -1683,7 +1687,8 @@ TEST_F(StoredFieldsTest, corruptStoredNamesRejected) {
     const char* reason;
   };
   for (auto [offset, value, reason] : {Case{0, 127, "member count exceeds names bytes"},
-                                      Case{1, 0, "trailing name bytes"}}) {
+                                      // An empty name leaves its bytes to read as the source-backed list.
+                                      Case{1, 0, "source-backed field id out of range"}}) {
     SCOPED_TRACE(reason);
     RAMDir dir;
     std::vector<std::string> docs{"log line status=200 path=/api/v1/items"};

@@ -48,6 +48,8 @@ public:
         next[name].format = stored->format_;
       }
     }
+    // The source store trains its own dictionary under its resource name.
+    if (schema.source.enabled) next[std::string(Postings::SOURCE_RESOURCE)].format = schema.source.dictionaryFormat();
     return next;
   }
 

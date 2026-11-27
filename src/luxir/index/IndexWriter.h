@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+
+#include <set>
 #include "luxir/util/Metrics.h"
 
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <string>
+#include <map>
 #include <mutex>
 #include <span>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -26,6 +30,7 @@
 #include "luxir/server/LuxirError.h"
 #include "luxir/util/DeadlineScheduler.h"
 #include "Inverter.h"
+#include "SourceMerge.h"
 #include "StoredDictionaryRegistry.h"
 #include "UpdateMessage.h"
 #include "VectorIndexBuilder.h"
@@ -59,6 +64,7 @@ public:
     int32_t mergeRows;         // largest physical row space, for merge sizing
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
+    uint64_t sourceGen = 0;  // generation of the segment's source map, or 0 if its documents keep no source.
     int64_t mergedLiveGen = -1;  // source generation covered by the merge
     int64_t mergeDiffLiveGen = -1; // generation pinned while loading a swap diff, protected by indexMutex
     uint32_t preparationPins = 0; // protected by indexMutex
@@ -101,6 +107,15 @@ public:
     std::vector<FileDescriptor> baseFiles;
     CatalogRange catalog;
     std::optional<FileDescriptor> liveFile;
+    // The files in `baseFiles` that are not under this segment's name prefix:
+    // files held by reference (today the source files, "v<seq>.<epoch>"), which a
+    // merge output inherits from its inputs instead of copying. Their lifetime
+    // follows the segments listing them, not a name: a committed one is retired
+    // when no segment of the next snapshot lists it (the commit's set
+    // difference), and one a never-committed segment held is retired when that
+    // segment dies without passing it on (unreferencedSharedFilesLocked). Set
+    // once, when the segment is flushed, loaded or merged, and never changed after.
+    std::vector<FileDescriptor> sharedFiles;
 
     // Segment-local aux overlays recorded in SegmentInfo.overlays.  Vector
     // ANN entries are carried by segment liveness; coreGen does not
@@ -348,6 +363,7 @@ public:
 
   // the last segId generated. Atomic since we don't grab any lock in the merge code to generate a new segment id.
   std::atomic_uint64_t lastSegId;
+  std::atomic_uint64_t nextSourceSeq{0};  // sequence number of the next source file ("v<seq>.<epoch>")
 
   CommitSnapshotRegistry& snapshots;
   CommitId openingCommit; // Captured before this writer becomes externally visible.
@@ -406,6 +422,9 @@ public:
   // increment needs no lock.  Relaxed atomic solely so stats() can read it while
   // an update is in flight without a formal data race.
   std::atomic<uint64_t> updateNumber = 0;
+  // How far a writer reopening an index advances its update versions past the
+  // manifest's (see the constructor).
+  static constexpr uint64_t VERSION_CLAIM_GAP = (uint64_t)1 << 32;
 
   // Next session-local tag for updateSequencerNode.
   uint64_t updateOrdinal = 0;
@@ -479,6 +498,25 @@ public:
   // Smallest minDocVersion over busy, idle and flushing inverters: lowered at
   // release, recomputed when the inverter holding it leaves. indexMutex.
   uint64_t minInverterDocVersion = UINT64_MAX;
+  // Update versions of messages whose patches are not yet indexed and
+  // published. Each holds delete packets newer than it from retiring: a patch
+  // indexes its document later, under its own version, and a newer overwrite or
+  // delete of that id must still reach it. indexMutex.
+  std::multiset<uint64_t> pinnedPatchVersions;
+  // Documents a commit produced from patches that are not yet published, by
+  // id: the newest state of the id for a later message's patches, which a
+  // commit can resolve before the earlier follow-up indexes its documents.
+  // indexMutex.
+  struct UnpublishedPatch {
+    const UpdateMessage* owner = nullptr;
+    uint64_t version = 0;
+    std::optional<std::string> body;  // nullopt: deleted
+  };
+  boost::unordered_flat_map<std::string, UnpublishedPatch> unpublishedPatches;
+  void forgetUnpublishedPatches(const UpdateMessage& msg);
+  uint64_t patchPinFloorLocked() const {
+    return pinnedPatchVersions.empty() ? UINT64_MAX : *pinnedPatchVersions.begin();
+  }
   // Version of the newest commit to complete, published or not. Commits
   // complete in version order: startUpdateNode is serial and assigns versions
   // and ordinals together, and initiateCommit assigns commitNum in ordinal
@@ -717,6 +755,23 @@ private:
     void done(IndexWriter& iw) override;
   };
 
+  // Indexes the documents a commit produced from a message's patches, under
+  // that message's update version, and commits them. Completes the message.
+  class PatchApplyMessage final : public UpdateMessage {
+  public:
+    UpdateMessage* origMessage = nullptr;
+
+    void handle(IndexWriter& iw) override;
+    void done(IndexWriter& iw) override;
+  };
+  void pinPatches(UpdateMessage& msg);
+  void unpinPatches(UpdateMessage& msg);
+  // Resolves msg's patches against the application's segments (after its
+  // deletes): fills msg.patchOutcomes and msg.patchedDocs.
+  void resolvePatches(UpdateMessage& msg, DeleteApplication& app);
+  // Submits the follow-up message for msg.patchedDocs. False when it could not.
+  bool submitPatchApply(UpdateMessage& msg);
+
   class MergeCommitMessage final : public UpdateMessage {
   public:
     MergeMessage* origMessage = nullptr;
@@ -736,7 +791,8 @@ private:
     // dense for the sequencer nodes. Merge continuations belong to already
     // admitted work, including automatic merges whose commits also flush.
     if (failed.load(std::memory_order_acquire) || (closed.load(std::memory_order_relaxed)
-        && dynamic_cast<MergeCommitMessage*>(&msg) == nullptr)) {
+        && dynamic_cast<MergeCommitMessage*>(&msg) == nullptr
+        && dynamic_cast<PatchApplyMessage*>(&msg) == nullptr)) {
       throw IndexWriterClosedError("index writer is closed");
     }
     msg.schema = lastSnapshot.load()->schema;
@@ -772,6 +828,8 @@ private:
   void processUpdateBody(UpdateMessage& msg) {
     INDEX_DEBUG("processUpdateBody: msg={}", (void*)&msg);
     try {
+      // Before the message completes, so the delete frontier cannot pass it.
+      if (!msg.patches.empty()) pinPatches(msg);
       msg.handle(*this);
     } catch (std::exception& e) {
       // setException logs the failure at the level its classification deserves.
@@ -808,6 +866,7 @@ private:
     }
 
     if (doneWithMessage) {
+      unpinPatches(msg);
       try {
         msg.done(*this);
       } catch (const std::exception& e) {
@@ -909,8 +968,18 @@ private:
   uint64_t applyDeletes(const SegmentDeletes& target);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
   bool mergeSegmentsBody(MergeMessage& msg);
+  std::once_flag dictionariesSeeded;
+  std::map<std::string, StoredDictionaryRegistry::Token, std::less<>> seedTokens;  // set at open, then read-only
+  void seedDictionariesOnce();
+  void seedSourceDictionary(const Schema& schema, IndexReader& reader);
+  void mergeSourceFiles(const std::vector<SegInfo*>& segs, SourceDocMap docMap,
+                        const Schema& schema, SegInfo& out, std::string& relocatedFile);
+  std::vector<std::string> unreferencedSharedFilesLocked(const std::vector<std::unique_ptr<SegInfo>>& dead);
 
 public:
+  // Recovers the dictionaries trained before the writer opened (once; every
+  // merge calls it first). Opening does not, so that it reads no segment data.
+  void seedDictionaries();
   /// THIS SECTION ONLY FOR TEST CODE!
 
 

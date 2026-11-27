@@ -75,6 +75,7 @@ struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece
 struct TermFilter; struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult;
 struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct Map;
+struct Patch; struct PatchOp; struct PatchCondition; struct PatchResult;
 struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
 struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrArrFloat;
 struct ArrArrDouble; struct Vector; struct ArrVector;
@@ -129,6 +130,20 @@ namespace CalendarGap_ {
 enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR = 5 };
 }
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
+namespace Patch_ { enum class Exists { ANY = 0, MUST = 1, MUST_NOT = 2 }; }
+namespace PatchOp_ {
+enum class Op {
+  SET = 0, UNSET = 1, MERGE = 2, REPLACE = 3, INCREMENT = 4, MULTIPLY = 5, MIN = 6, MAX = 7,
+  APPEND = 8, APPEND_UNIQUE = 9, REMOVE_VALUES = 10
+};
+}
+namespace PatchCondition_ { enum class Op { EQ = 0, NE = 1, LT = 2, LTE = 3, GT = 4, GTE = 5, EXISTS = 6, MISSING = 7 }; }
+namespace PatchResult_ {
+enum class Status {
+  UNKNOWN = 0, UPDATED = 1, CREATED = 2, NOOP = 3, DELETED = 4, SKIPPED = 5, NOT_FOUND = 6,
+  CONFLICT = 7, SUPERSEDED = 8, ERROR = 9
+};
+}
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3, HAMMING = 4 };
 enum class VectorEncoding { F32 = 0, F16 = 1, BF16 = 2, SQ8 = 3, BIT = 4 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
@@ -144,7 +159,10 @@ enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
 enum class DateUnit { MS = 0, NS = 1 };
 }
 namespace VectorAnnDef_ { enum class Codec { RABITQ = 0, PQ = 1 }; }
-namespace StoredResourceDef_ { enum class Codec { LZ4 = 0, ZSTD = 1 }; }
+namespace StoredResourceDef_ {
+enum class Codec { LZ4 = 0, ZSTD = 1 };
+enum class Layout { INLINE = 0, SEPARATED = 1 };
+}
 namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
 
 // ===================== message definitions (strict topological order) =====================
@@ -234,6 +252,15 @@ struct CollectionCommit {
   std::optional<Error> error;
 };
 
+struct PatchResult {
+  using Status = luxir::api::PatchResult_::Status;
+  std::string_view id;
+  uint64_t version = 0;
+  std::optional<Error> error;
+  int32_t index = 0;
+  Status status = Status::UNKNOWN;                              // align 4 (enum)
+};
+
 struct UpdateResponse {
   using Status = luxir::api::UpdateResponse_::Status;
   using DocError = luxir::api::UpdateResponse_::DocError;
@@ -246,6 +273,7 @@ struct UpdateResponse {
   std::span<const DocError> errors;
   int64_t total_errors = 0;
   uint64_t took_us = 0;
+  std::span<const PatchResult> patch_results;
   std::optional<Error> error;
   Status status = Status::UNKNOWN;                              // align 4 (enum)
 };
@@ -325,6 +353,7 @@ struct FieldDef {
   std::optional<bool> ignore_malformed;
   std::optional<bool> ignore_z_value;
   std::optional<bool> reverse_map;
+  std::optional<bool> stored_copy;
 };
 struct AuxStats {
   std::string_view kind;
@@ -607,6 +636,7 @@ struct ServiceStats {
   uint64_t documents_accepted = 0;
   uint64_t documents_rejected = 0;
   uint64_t delete_ids_accepted = 0;
+  map_view<std::string_view, uint64_t> patches;
   ActivityStats flush;
   ActivityStats commit;
   ActivityStats delete_pass;
@@ -898,12 +928,20 @@ struct KnnQuery {                                                // needs Vector
 };
 struct StoredResourceDef {
   using Codec = luxir::api::StoredResourceDef_::Codec;
+  using Layout = luxir::api::StoredResourceDef_::Layout;
+  std::optional<std::int64_t> min_file_bytes;                   // align 8
+  std::optional<double> min_live_ratio;
+  std::span<const std::string_view> includes;
+  std::span<const std::string_view> excludes;
   std::optional<Codec> codec;                                   // align 4 (enum)
+  std::optional<Layout> layout;
   std::optional<std::int32_t> zstd_level;                       // align 4
   std::optional<std::int32_t> chunk_size_bytes;
   std::optional<std::int32_t> max_docs_per_chunk;
   std::optional<std::int32_t> zstd_dictionary_bytes;
+  std::optional<std::int32_t> max_files;
   std::optional<bool> zstd_dictionary;                          // align 1
+  std::optional<bool> enabled;
 };
 struct SchemaDef {                                                // needs StoredResourceDef
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;
@@ -1292,6 +1330,30 @@ struct Query {                                                 // needs Match,An
                AnyOfQuery, MultiMatchQuery, GeoPolygonQuery, DisMaxQuery, PluginQuery, ToParentQuery>
       kind;
 };
+struct PatchOp {
+  using Op = luxir::api::PatchOp_::Op;
+  std::string_view path;
+  ::hpp_proto::optional_indirect_view<Val> value;
+  Op op = Op::SET;                                              // align 4 (enum)
+};
+struct PatchCondition {
+  using Op = luxir::api::PatchCondition_::Op;
+  std::string_view path;
+  ::hpp_proto::optional_indirect_view<Val> value;
+  ::hpp_proto::optional_indirect_view<Val> missing;
+  Op op = Op::EQ;                                               // align 4 (enum)
+};
+struct Patch {                                                  // needs Map
+  using Exists = luxir::api::Patch_::Exists;
+  std::string_view id;
+  std::span<const PatchOp> ops;
+  std::span<const PatchCondition> when;
+  std::optional<uint64_t> if_version;
+  std::optional<Map> upsert_doc;
+  Exists exists = Exists::ANY;                                  // align 4 (enum)
+  bool upsert = false;
+  bool delete_doc = false;
+};
 struct UpdateRequest {                                         // needs CommitParams
   std::string_view request_id;
   std::string_view collection;
@@ -1300,6 +1362,10 @@ struct UpdateRequest {                                         // needs CommitPa
   std::optional<CommitParams> commit;
   // Input doc key -> schema field for this request's docs ("" target = drop the key).
   map_view<std::string_view, std::string_view> field_map;
+  // Source includes/excludes for this request's docs, replacing the collection's.
+  std::span<const std::string_view> source_includes;
+  std::span<const std::string_view> source_excludes;
+  std::span<const Patch> patches;
   bool allow_dups = false;
   bool all_or_none = false;
   bool return_ids = false;
@@ -1329,7 +1395,7 @@ LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(Sc
 LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef) LUXIR_TD(StoredResourceDef)
 LUXIR_TD(VectorAnnDef) LUXIR_TD(VectorAnnDef_::RaBitQ) LUXIR_TD(VectorAnnDef_::Pq)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
-LUXIR_TD(KnnQuery_::Ivf)
+LUXIR_TD(KnnQuery_::Ivf) LUXIR_TD(Patch) LUXIR_TD(PatchOp) LUXIR_TD(PatchCondition) LUXIR_TD(PatchResult)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(RenameCollectionRequest) LUXIR_TD(RenameCollectionResponse) LUXIR_TD(SwapCollectionsRequest) LUXIR_TD(SwapCollectionsResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
