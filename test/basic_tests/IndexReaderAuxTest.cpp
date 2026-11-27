@@ -151,7 +151,7 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   EXPECT_EQ(idx->metric_type, faiss::METRIC_L2);
 }
 
-TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
+TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnFirstListUse) {
   IvfTestGuard guard;
   for (int bits : {1, 4}) {
     CollectionHelper h("main");
@@ -183,9 +183,20 @@ TEST_F(IndexReaderAuxTest, invalidAmplitudesFailOnOpen) {
       os.write(payload.data(), payload.size());
       os.close();
       dir.finishFile(*out);
-      EXPECT_THROW(VectorAuxReader::open(dir, info, false), std::runtime_error);
-      // Opened for a segment, invalid bytes are that segment's corruption.
-      EXPECT_THROW(VectorAuxReader::open(dir.openFile("invalid-amplitude"), info, "s1"), SegmentCorruptError);
+      std::string synced[] = {"invalid-amplitude"};
+      dir.sync(synced);
+      // Opening reads no amplitudes; the first scan of the list rejects them.
+      auto aux = VectorAuxReader::open(dir.openFile("invalid-amplitude", {.expectSynced = true}), info, "seg-bad");
+      const auto& amplitudes = aux->getAmplitudes();
+      size_t list = 0;
+      while (amplitudes.list(list).empty()) list++;
+      try {
+        amplitudes.checkedList(list);
+        ADD_FAILURE() << "expected SegmentCorruptError";
+      } catch (const SegmentCorruptError& e) {
+        EXPECT_NE(std::string(e.what()).find("seg-bad"), std::string::npos) << e.what();
+      }
+      aux.reset();
       dir.deleteFile("invalid-amplitude");
     }
   }
