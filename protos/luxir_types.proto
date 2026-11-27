@@ -1308,8 +1308,8 @@ message UpdateRequest {
   string collection = 3; // empty selects the default collection, "main"
 
   // Documents to index. Input fields named _version_ after field mapping are
-  // rejected with a document error: the field is assigned by the engine and
-  // optimistic concurrency is not supported.
+  // rejected with a document error: the field is assigned by the engine (see
+  // Patch.if_version for optimistic concurrency).
   repeated Map docs = 4;
 
   // Document IDs to delete.  Deletes never fail per-id; deleting a nonexistent id
@@ -1352,6 +1352,109 @@ message UpdateRequest {
   // the same path syntax. Ignored by a collection that does not store sources.
   repeated string source_includes = 13;
   repeated string source_excludes = 14;
+
+  // Partial updates of existing documents, resolved against each document's
+  // stored source (the collection must keep _source_). See Patch. A request
+  // with patches always commits before it responds, and its response carries
+  // one patch_results entry per patch. Rejected with all_or_none, field_map,
+  // drop_unmapped, or allow_dups, and when one request names an id both in
+  // patches and in docs or delete_ids.
+  repeated Patch patches = 15;
+}
+
+// One partial update of a document. The engine reads the newest document with
+// this id, checks the preconditions, applies the ops in order to the document's
+// source and indexes the result in place of the document, under the request's
+// update version. A result equal to the document writes nothing (NOOP).
+// Patches are applied once, in update version order: a later overwrite or
+// delete of the id wins over an earlier patch, and a later patch sees the
+// result of an earlier one.
+message Patch {
+  // The document id. Ops cannot change it.
+  string id = 1;
+  repeated PatchOp ops = 2;
+  // Every condition must hold, or the patch is SKIPPED.
+  repeated PatchCondition when = 3;
+  enum Exists {
+    ANY = 0;       // a missing document is NOT_FOUND unless upsert is set
+    MUST = 1;      // a missing document is NOT_FOUND
+    MUST_NOT = 2;  // an existing document is a CONFLICT; a missing one is created
+  }
+  Exists exists = 4;
+  // Optimistic concurrency: the document's _version_ must equal this, or the
+  // patch is a CONFLICT (also when the document is missing).
+  optional uint64 if_version = 5;
+  // A missing document starts as {"id": id} and the ops apply to it.
+  bool upsert = 6;
+  // A missing document is created as this body (with the id added), and the
+  // ops do not apply. Implies upsert.
+  Map upsert_doc = 7;
+  // Delete the document when the preconditions hold. No ops.
+  bool delete_doc = 8;
+}
+
+// A path names a value by dotted object keys ("a.b"); it never descends into
+// arrays. Paths start at the document root and cannot name "id" or a reserved
+// "_name_" field.
+message PatchOp {
+  enum Op {
+    SET = 0;            // value at path, creating missing objects on the way
+    UNSET = 1;          // remove path (every duplicate key)
+    MERGE = 2;          // RFC 7396 merge patch of the object value at path (root if empty); null removes
+    REPLACE = 3;        // the whole body becomes value (a Map; path must be empty)
+    INCREMENT = 4;      // add the number value; a missing field counts as 0
+    MULTIPLY = 5;       // multiply by the number value; a missing field counts as 0
+    MIN = 6;            // keep the smaller of the field and value; a missing field takes value
+    MAX = 7;            // keep the larger of the field and value; a missing field takes value
+    APPEND = 8;         // add value (each element of a list value) to the field's list
+    APPEND_UNIQUE = 9;  // APPEND, skipping values already present
+    REMOVE_VALUES = 10; // remove every element equal to value (or to an element of a list value)
+  }
+  Op op = 1;
+  string path = 2;
+  Val value = 3;
+}
+
+message PatchCondition {
+  enum Op {
+    EQ = 0;
+    NE = 1;
+    LT = 2;
+    LTE = 3;
+    GT = 4;
+    GTE = 5;
+    EXISTS = 6;   // the path has a value
+    MISSING = 7;  // the path has no value
+  }
+  string path = 1;
+  Op op = 2;
+  Val value = 3;
+  // Compared in place of a missing field. Without it, a missing field fails
+  // every comparison except NE.
+  Val missing = 4;
+}
+
+message PatchResult {
+  enum Status {
+    UNKNOWN = 0;
+    UPDATED = 1;     // the document was replaced by the patched one
+    CREATED = 2;     // upsert created the document
+    NOOP = 3;        // the patched document equals the current one; nothing was written
+    DELETED = 4;     // delete_doc removed the document
+    SKIPPED = 5;     // a when condition did not hold
+    NOT_FOUND = 6;   // no document with this id
+    CONFLICT = 7;    // if_version or exists did not hold
+    SUPERSEDED = 8;  // a newer write of this id already replaced the document
+    ERROR = 9;       // see error; the document is unchanged
+  }
+  string id = 1;
+  // Position of the patch in the request.
+  int32 index = 2;
+  Status status = 3;
+  // The document's _version_ after the patch: the request's update version
+  // when it wrote, else the current document's version (0 when there is none).
+  uint64 version = 4;
+  Error error = 5;
 }
 
 // The response to an update request.  In streaming mode the server sends exactly one
@@ -1419,6 +1522,9 @@ message UpdateResponse {
   // commit and replica wait. Excludes serializing, queueing, and sending the
   // response. HTTP NDJSON stream acknowledgments do not carry this field.
   uint64 took_us = 11;
+
+  // One entry per UpdateRequest.patches entry, in request order.
+  repeated PatchResult patch_results = 12;
 }
 
 
@@ -1756,6 +1862,10 @@ message ServiceStats {
   uint64 documents_accepted = 11;
   uint64 documents_rejected = 12;
   uint64 delete_ids_accepted = 13;
+  // Patches (UpdateRequest.patches) by outcome: "written" (updated, created
+  // or deleted the document), "unchanged" (noop, skipped, not_found,
+  // conflict or superseded) and "failed" (error, or the request failed).
+  map<string, uint64> patches = 64;
   // Documents rejected with an error of their own, keyed by error kind. The
   // rest of documents_rejected were rolled back with a failed batch.
   map<string, uint64> document_errors = 19;

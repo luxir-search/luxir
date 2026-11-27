@@ -371,8 +371,9 @@ TEST_F(IndexWriterTest, firstCommitAfterReloadCompletes) {
   }
   writer->updateGraph->wait_for_all();
   EXPECT_FALSE(msg->result.errored());
-  EXPECT_EQ(msg->updateVersion, 11u);
-  EXPECT_EQ(luxir::test::readDurableIndexInfo(*dir)->update_version, 11u);
+  // A reopened writer continues past a gap, so no version is handed out twice.
+  EXPECT_EQ(msg->updateVersion, 11u + IndexWriter::VERSION_CLAIM_GAP);
+  EXPECT_EQ(luxir::test::readDurableIndexInfo(*dir)->update_version, 11u + IndexWriter::VERSION_CLAIM_GAP);
 }
 
 
@@ -2877,7 +2878,7 @@ TEST_F(IndexWriterTest, durableVersionIncludesDeletesAndNeverRegresses) {
   CommitSnapshotRegistry reopenedSnapshots(dir);
   IndexWriter reopened(reopenedSnapshots);
   reopened.commit();
-  EXPECT_EQ(21, readDurableIndexInfo(dir)->update_version);
+  EXPECT_EQ(21 + IndexWriter::VERSION_CLAIM_GAP, readDurableIndexInfo(dir)->update_version);
 }
 
 TEST_F(IndexWriterTest, mergingDeleteListsPreservesSharedInputs) {

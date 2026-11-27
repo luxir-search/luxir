@@ -173,6 +173,15 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   dst.documents_accepted = counter(MetricCounter::DOCUMENTS_ACCEPTED);
   dst.documents_rejected = counter(MetricCounter::DOCUMENTS_REJECTED);
   dst.delete_ids_accepted = counter(MetricCounter::DELETE_IDS_ACCEPTED);
+  {
+    using Entry = std::pair<std::string_view, uint64_t>;
+    std::span<const Entry> entries;
+    auto* patches = api::build::allocArray(entries, 3, resource);
+    patches[0] = {"written", counter(MetricCounter::PATCHES_WRITTEN)};
+    patches[1] = {"unchanged", counter(MetricCounter::PATCHES_UNCHANGED)};
+    patches[2] = {"failed", counter(MetricCounter::PATCHES_FAILED)};
+    dst.patches = {entries};
+  }
   dst.document_errors = errorKinds(counts.documentErrors, resource);
   fillActivity(dst.flush, counts, metricActivity(MetricStage::FLUSH), resource);
   fillActivity(dst.commit, counts, metricActivity(MetricStage::COMMIT), resource);

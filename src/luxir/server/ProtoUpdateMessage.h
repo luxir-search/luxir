@@ -82,6 +82,14 @@ public:
     } else {
       commit = NO_COMMIT;
     }
+    if (!req->patches.empty()) {
+      // A patch is resolved by its own message's commit, and its outcome is
+      // known only then: a request with patches always commits before it responds.
+      patches = req->patches;
+      commit = COMMIT;
+      commit_within_ms = 0;
+      dateMathNowMillis = dateMathNowEpochMillis;
+    }
   }
 
   ResponseProto* getResponse() {
@@ -109,6 +117,32 @@ public:
     rsp->errors = errors_.finish();
     rsp->total_errors = (int64_t)rsp->errors.size();
     rsp->ids = ids_.finish();
+    // Patch outcomes exist once the resolving commit ran; a failed request
+    // reports none (its patches had no effect).
+    if (!req->patches.empty() && !result.errored() && patchOutcomes.size() == req->patches.size()) {
+      // Failed patches count like failed documents: the request is PARTIAL,
+      // or ERROR when nothing in it took effect.
+      size_t failedPatches = (size_t)std::ranges::count_if(patchOutcomes, [](const auto& outcome) {
+        return outcome.status == luxir::api::PatchResult::Status::ERROR;
+      });
+      if (failedPatches > 0 || !rsp->errors.empty()) {
+        bool anyEffect = failedPatches < patchOutcomes.size() || !req->delete_ids.empty() ||
+                         rsp->errors.size() < req->docs.size();
+        rsp->status = anyEffect ? ResponseStatus::PARTIAL : ResponseStatus::ERROR;
+      }
+      auto* results = api::build::allocArray(rsp->patch_results, patchOutcomes.size(), *mr_);
+      for (size_t i = 0; i < patchOutcomes.size(); i++) {
+        auto& out = results[i];
+        const auto& outcome = patchOutcomes[i];
+        out.id = luxir::api::build::arenaStr(*mr_, req->patches[i].id);
+        out.index = (int32_t)i;
+        out.status = outcome.status;
+        out.version = outcome.version;
+        if (!outcome.error.empty()) {
+          out.error = luxir::api::build::arenaError(*mr_, ErrorInfo::of(ErrorKind::INVALID_REQUEST, outcome.error));
+        }
+      }
+    }
     return rsp;
   }
 
@@ -138,6 +172,7 @@ public:
   // For now, we will allow the handler to obtain/release an inverter.  We could also optionally pass it
   // as a param in the future if obtain/release becomes more complex.
   virtual void handle(IndexWriter& iw);
+  void indexPatchedDocs(IndexWriter& iw, Inverter& inverter) override;
 
   // This defaults to messages allocated with new, but can be overridden to use a pool or other allocator.
   virtual void done(IndexWriter& iw) {

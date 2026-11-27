@@ -186,7 +186,11 @@ and is retrieval-only: name it explicitly in the returned fields (`fl`) to read
 it. Sorting, filtering, faceting, functions, collapse and value statistics on
 `_version_` are not supported. Default and wildcard projections exclude it.
 Documents that supply it, directly or through field mapping, are rejected
-with a document error. Optimistic concurrency is not supported.
+with a document error. A [patch](indexing.md#partial-updates) with
+`if_version` applies only while the document's `_version_` is unchanged
+(optimistic concurrency). A writer that reopens an index continues its
+versions well past the last committed one, so a version is never handed out
+twice.
 
 ## Multi-valued fields
 

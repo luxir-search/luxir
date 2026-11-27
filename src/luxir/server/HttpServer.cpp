@@ -2961,7 +2961,7 @@ private:
       if (name == "collection" || name == "allow_dups" || name == "all_or_none" ||
           name == "return_ids" || name == "docs" || name == "delete_ids" ||
           name == "field_map" || name == "drop_unmapped" || name == "source_includes" ||
-          name == "source_excludes") {
+          name == "source_excludes" || name == "patches") {
         err = "_end_ control cannot carry submit-time field '" + std::string(name) + "'";
         return false;
       }
@@ -2979,6 +2979,11 @@ private:
           name == "docs" || name == "delete_ids" || name == "field_map" ||
           name == "drop_unmapped" || name == "source_includes" || name == "source_excludes") {
         continue;
+      }
+      if (name == "patches") {
+        // A stream acknowledges groups without per-patch outcomes.
+        err = "patches are not supported in an NDJSON stream; send them in a JSON update";
+        return false;
       }
       err = "unsupported _update_ control field '" + std::string(name) + "'";
       return false;

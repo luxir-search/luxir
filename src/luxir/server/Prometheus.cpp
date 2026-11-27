@@ -93,6 +93,9 @@ void service(Renderer& r, const api::ServiceStats& s) {
     r.counter("luxir_ingest_document_errors_total", "Documents rejected with an error of their own, by error kind.",
               (double)count, PrometheusText::label("kind", kind));
   r.counter("luxir_ingest_delete_ids_total", "Accepted delete IDs, not the number of matching documents removed.", (double)s.delete_ids_accepted);
+  for (const auto& [outcome, count] : s.patches)
+    r.counter("luxir_ingest_patches_total", "Patches by outcome: written, unchanged or failed.", (double)count,
+              PrometheusText::label("outcome", outcome));
   for (auto [kind, activity] : {std::pair{"flush", &s.flush}, {"commit", &s.commit}, {"delete_pass", &s.delete_pass}, {"merge", &s.merge},
                                 {"vector_build", &s.vector_build}, {"reader_refresh", &s.reader_refresh}})
     r.activity("luxir_background", "luxir_background_duration_seconds", *activity, s.background_duration_bounds,

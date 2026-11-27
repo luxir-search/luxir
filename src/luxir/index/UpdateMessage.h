@@ -4,6 +4,10 @@
 #pragma once
 
 #include <deque>
+#include <span>
+#include <string>
+#include <vector>
+#include "luxir/api/luxir_types.hpp"
 #include "CommitSnapshot.h"
 #include "Inverter.h"
 #include "luxir/server/LuxirError.h"
@@ -97,6 +101,35 @@ public:
   std::unique_ptr<CommitInfo> commitInfo;  // Commit info for this update, if any.  This is set by the IndexWriter when the commit is processed.
 
   ErrorHolder result;
+
+  // Partial updates (UpdateRequest.patches). They are resolved by this
+  // message's own commit, against the documents that commit applied deletes
+  // to, and the documents they produce are indexed by a follow-up message
+  // under this message's update version (see IndexWriter::resolvePatches).
+  std::span<const api::Patch> patches;
+  struct PatchOutcome {
+    api::PatchResult::Status status = api::PatchResult::Status::UNKNOWN;
+    uint64_t version = 0;
+    std::string error;
+  };
+  std::vector<PatchOutcome> patchOutcomes;  // one per patch, set by the resolving commit
+  // The final state of each id the patches changed, indexed under updateVersion.
+  struct PatchedDoc {
+    std::string id;
+    std::string body;    // JSON; empty when deleted
+    bool deleted = false;
+    std::vector<uint32_t> patchIndexes;  // the patches that produced it
+  };
+  std::vector<PatchedDoc> patchedDocs;
+  int64_t dateMathNowMillis = 0;  // request clock for date math in patched documents
+  bool patchPinned = false;       // IndexWriter::pinPatches holds delete retirement for it
+
+  // Indexes patchedDocs into `inverter`, each under updateVersion, recording a
+  // per-document failure in patchOutcomes. Messages that carry patches implement it.
+  virtual void indexPatchedDocs(IndexWriter& iw, Inverter& inverter) {
+    unused(iw);
+    unused(inverter);
+  }
 };
 
 class MergeMessage : public UpdateMessage {

@@ -11,6 +11,10 @@
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/source/SourceFilter.h"
 #include "luxir/source/SourceJson.h"
+#include "luxir/source/SourcePatch.h"
+
+#include <boost/unordered/unordered_flat_set.hpp>
+#include <fmt/format.h>
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <memory_resource>
@@ -101,6 +105,75 @@ static std::string_view docId(const luxir::api::Map& doc, const FieldNameMap& fi
     }
   }
   return result;  // last "id" wins (protobuf map dedup semantics)
+}
+
+
+// Rejects patches that cannot be resolved, before the message takes effect.
+static void validatePatches(const luxir::api::UpdateRequest& req, const Schema& schema) {
+  using Op = luxir::api::PatchOp::Op;
+  using C = luxir::api::PatchCondition::Op;
+  if (req.patches.empty()) return;
+  if (!schema.source.enabled) throw RequestError("patches need a collection that stores _source_");
+  if (req.all_or_none) throw RequestError("patches cannot be combined with all_or_none");
+  if (req.allow_dups) throw RequestError("patches cannot be combined with allow_dups");
+  if (!req.field_map.empty() || req.drop_unmapped) {
+    throw RequestError("patches cannot be combined with field_map or drop_unmapped");
+  }
+  if (!req.source_includes.empty() || !req.source_excludes.empty()) {
+    throw RequestError("patches cannot be combined with source_includes or source_excludes");
+  }
+  if (req.commit && (req.commit->max_segments > 0 || req.commit->wait_for_merges ||
+                     !req.commit->build_aux_indexes.empty())) {
+    throw RequestError("patches cannot be combined with max_segments, wait_for_merges or build_aux_indexes");
+  }
+  boost::unordered_flat_set<std::string_view> ids;
+  for (size_t i = 0; i < req.patches.size(); i++) {
+    const auto& patch = req.patches[i];
+    auto fail = [&](std::string_view why) {
+      throw RequestError(fmt::format("patch {} (id '{}'): {}", i, patch.id, why));
+    };
+    if (patch.id.empty()) fail("no id");
+    if (patch.delete_doc && !patch.ops.empty()) fail("delete_doc takes no ops");
+    if (patch.delete_doc && (patch.upsert || patch.upsert_doc)) fail("delete_doc cannot upsert");
+    if (patch.exists == luxir::api::Patch::Exists::MUST && (patch.upsert || patch.upsert_doc)) {
+      fail("exists MUST cannot upsert");
+    }
+    for (const auto& op : patch.ops) {
+      bool isMap = op.value.has_value() && std::holds_alternative<luxir::api::Map>(op.value->kind);
+      if (op.op != Op::UNSET && !op.value.has_value()) fail(fmt::format("op on '{}' has no value", op.path));
+      if (op.op == Op::REPLACE) {
+        if (!op.path.empty()) fail("replace takes no path");
+        if (!isMap) fail("replace takes an object value");
+        continue;
+      }
+      if (op.op == Op::MERGE) {
+        if (!isMap) fail("merge takes an object value");
+        if (op.path.empty()) continue;
+      }
+      if (auto bad = source::invalidPatchPath(op.path)) fail(*bad);
+    }
+    for (const auto& cond : patch.when) {
+      if (cond.path.empty()) fail("a condition has no path");
+      if (cond.op != C::EXISTS && cond.op != C::MISSING && !cond.value.has_value()) {
+        fail(fmt::format("condition on '{}' has no value", cond.path));
+      }
+    }
+    ids.insert(patch.id);
+  }
+  // A document and a patch of one id in one request would share a version,
+  // which leaves no order between them.
+  for (const auto& id : req.delete_ids) {
+    if (ids.contains(id)) throw RequestError(fmt::format("id '{}' is both deleted and patched", id));
+  }
+  const FieldNameMap fieldMap(req);
+  const FieldType& idType = *schema.getFieldTypeEx("id");
+  char idBuf[coerce::TEXT_BUF_SIZE];
+  for (const auto& doc : req.docs) {
+    auto id = docId(doc, fieldMap, idType, idBuf);
+    if (!id.empty() && ids.contains(id)) {
+      throw RequestError(fmt::format("id '{}' is both indexed and patched", id));
+    }
+  }
 }
 
 
@@ -251,7 +324,7 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
     ProtoUpdateMessage& msg;
     Metrics& node;
     CollectionMetrics& collection;
-    bool active = !msg.req->docs.empty() || !msg.req->delete_ids.empty();
+    bool active = !msg.req->docs.empty() || !msg.req->delete_ids.empty() || !msg.req->patches.empty();
     int exceptions = std::uncaught_exceptions();
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     Count(ProtoUpdateMessage& msg, Metrics& node, CollectionMetrics& collection)
@@ -281,6 +354,7 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
     }
   } count{*this, *iw.metrics, *iw.collectionMetrics};
   validateFieldMap(*req);
+  validatePatches(*req, *schema);
 
   // Check if we need an inverter for either deletes or adds
   bool needInverter = !req->delete_ids.empty() || !req->docs.empty();
@@ -365,6 +439,55 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   } catch (...) {
     releaseGuard.failure = std::current_exception();
     throw;
+  }
+}
+
+
+// Runs on the follow-up message that indexes this message's patched
+// documents, with the inverter already at this message's update version.
+void ProtoUpdateMessage::indexPatchedDocs(IndexWriter& iw, Inverter& inverter) {
+  unused(iw);
+  const FieldNameMap fieldMap(*req);
+  ObjectFields objectFields;
+  const bool keepSource = inverter.schema->source.enabled;
+  std::pmr::monotonic_buffer_resource arena;
+  for (const auto& doc : patchedDocs) {
+    auto fail = [&](const std::string& message) {
+      for (uint32_t index : doc.patchIndexes) {
+        auto& outcome = patchOutcomes[index];
+        outcome.status = luxir::api::PatchResult::Status::ERROR;
+        outcome.version = 0;
+        outcome.error = message;
+      }
+    };
+    if (doc.deleted) {
+      inverter.deleteId(doc.id, updateVersion);
+      continue;
+    }
+    arena.release();
+    luxir::api::Map map;
+    std::string err;
+    if (!luxir::api::read_json(map, doc.body, arena, &err)) {
+      fail("the patched document does not parse: " + err);
+      continue;
+    }
+    auto mark = inverter.undoMark();
+    inverter.startDoc();
+    try {
+      if (keepSource) inverter.addSource(doc.id, doc.body, updateVersion, source::kFlagMinifiedJson);
+      objectFields.index(inverter, map, fieldMap);
+      inverter.finishDoc();
+    } catch (const FileIOException&) {
+      throw;
+    } catch (const std::bad_alloc&) {
+      throw;
+    } catch (...) {
+      // The patched document does not index: the current one stays.
+      ErrorInfo info = currentExceptionInfo(ErrorKind::INTERNAL);
+      inverter.rollbackTo(mark);
+      inverter.deleteDoc(inverter.getDoc());
+      fail(info.message);
+    }
   }
 }
 

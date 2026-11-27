@@ -198,11 +198,54 @@ merge returns before reading anything when no input has a source map, and
 nothing else is reached without the schema flag. `test/bench/SourceBM.cpp`
 measures the ingest and fetch costs when it is on.
 
+## Partial updates
+
+`UpdateRequest.patches` ([indexing guide](../guide/indexing.md#partial-updates))
+edit a document's record and index the result in place of the document. They
+travel with their request's update version and are resolved by that
+request's own commit, which has applied every earlier update:
+
+1. **Resolve.** After the commit applies its deletes, each patched id's base
+   is its newest live document born before the request's version, found with
+   the id filter and a term seek in every segment of the commit's snapshot. A
+   live document born later means a newer write already replaced it
+   (`superseded`), or a newer unpublished patch result is the base (below).
+   The base's record is fetched and rendered as JSON; a
+   filtered, mapped, damaged or missing record fails the patch.
+2. **Apply.** `source::PatchDoc` edits the JSON in place: it splits only the
+   objects and arrays an operation descends into, so every untouched value
+   keeps its bytes. Patches of one id in one request chain in order. A result
+   equal to the base writes nothing.
+3. **Index.** After the commit publishes, a follow-up message indexes each
+   changed document through the ordinary ingest path (the record becomes its
+   new source), with the request's update version as its birth and overwrite
+   on, so its delete watermark retires the base like any overwrite. The
+   follow-up's commit publishes them and completes the request.
+
+Between the request's admission and that publication, the request's version
+pins delete retirement: the delete frontier and every commit's retirement stop
+below it. A newer overwrite or delete of a patched id, committed before the
+patched document reaches a segment, would otherwise retire its packet and
+leave the patched document live beside it; pinned, the packet stays pending
+and reaches the patched document's segment. A commit that fails before it
+publishes discards its resolution, so the request's patches had no effect.
+
+A message admitted while an earlier one's patched documents are resolved but
+not yet indexed must build on them. The writer keeps those documents by id
+(`unpublishedPatches`) until their follow-up completes; resolution takes such
+a document as the base when it is newer than every segment document of the
+id and no packet the commit applied deletes the id after it.
+
+Writers start their update versions `2^32` past the manifest's when they reopen
+an index, so a version acknowledged before a crash, or by a primary a
+promoted follower never saw, is never handed out again: `if_version` compares
+against document births, and a reused version could match a different state.
+
 ## Not yet implemented
 
 Retraining the dictionary, source-only compaction of a segment, degraded-file statistics, the offline
-`luxir-source-dump` tool, tombstone files, source-only fields and partial updates
-(phases 2 to 4 of the plan in issue 97). A flush buffers the segment's whole
+`luxir-source-dump` tool, tombstone files, source-only fields, and partial updates
+that skip reindexing (phases 2 to 4 of the plan in issue 97). A flush buffers the segment's whole
 compressed source file in memory until the segment flushes (RAM-accounted, so
 the budget stays honest, but with the store on a segment's RAM is roughly its
 index plus its compressed sources, which means earlier flushes and more merges);

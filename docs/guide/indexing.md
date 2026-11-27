@@ -55,6 +55,7 @@ are:
 | `request_id` | Opaque correlation value echoed in the response. |
 | `docs` | Row-oriented JSON documents. |
 | `delete_ids` | IDs to delete; an absent ID is a successful no-op. |
+| `patches` | Partial updates of existing documents; see [Partial updates](#partial-updates). |
 | `allow_dups` | Skip ID overwrite/deduplication for faster indexing when IDs are known to be unique. Default `false`. |
 | `all_or_none` | Roll back the whole request if one document fails. Default `false`. |
 | `return_ids` | Include successfully indexed IDs in request order. |
@@ -218,7 +219,8 @@ interval.
 
 By default, indexing a document whose `id` already exists replaces the old
 document. Replacement is whole-document replacement, not a field patch: a
-field omitted by the new version is absent from the new document.
+field omitted by the new version is absent from the new document. To change
+some fields of a document, see [partial updates](#partial-updates).
 
 When you know the incoming IDs are unique and do not already exist in the
 collection, set `allow_dups: true` to improve indexing performance by skipping
@@ -237,6 +239,114 @@ POST /collections/books/_update
 ```json
 {"update_version":2,"status":"ok"}
 ```
+
+## Partial updates
+
+A collection that stores its source (`_source_`, see
+[keeping documents as submitted](documents.md#keeping-documents-as-submitted-_source)) can patch documents in place:
+the engine reads the newest version of the document, applies the
+operations to its source, and indexes the result instead, so indexed fields
+can change too. In a source kept as JSON, values the patch does not touch keep
+their submitted bytes; a source received as a protobuf `Map` is kept as JSON
+once patched.
+
+```http
+POST /collections/books/_update
+
+{"patches":[
+  {"id":"b1","ops":[
+    {"op":"set","path":"price","value":12},
+    {"op":"increment","path":"stock","value":-1},
+    {"op":"append_unique","path":"tags","value":["sale"]},
+    {"op":"unset","path":"promo"}]},
+  {"id":"b2","upsert":true,"ops":[{"op":"increment","path":"views","value":1}]}]}
+```
+
+```json
+{"update_version":7,"status":"ok","commit":"...","patch_results":[
+  {"id":"b1","status":"updated","version":7},
+  {"id":"b2","index":1,"status":"created","version":7}]}
+```
+
+Operations apply in order. A path names a value by dotted object keys
+(`meta.color`); it never descends into arrays, and it cannot name `id` or a
+reserved `_name_` field.
+
+| Op | Effect |
+| --- | --- |
+| `set` | Sets the value, creating missing objects on the way. |
+| `unset` | Removes the field (every duplicate key). |
+| `merge` | RFC 7396 merge patch of the object at `path` (the document when `path` is empty); `null` removes a key. |
+| `replace` | Replaces the whole document with `value` (no `path`); the id stays. |
+| `increment` | Adds a number (negative to decrement). A missing field counts as 0. |
+| `multiply` | Multiplies by a number. A missing field counts as 0. |
+| `min`, `max` | Keeps the smaller or larger of the field and `value`; a missing field takes `value`. |
+| `append` | Adds `value`, or each element of a list `value`, to the field's list; a single value becomes a list. |
+| `append_unique` | `append`, skipping values already present. |
+| `remove_values` | Removes every element equal to `value` (or to an element of a list `value`). |
+
+Arithmetic works on single-valued integers and doubles; integers stay
+integers and an overflow fails the patch.
+
+Preconditions decide whether a patch applies:
+
+- `when`: conditions on the current document, `{"path", "op", "value"}` with
+  `op` one of `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `exists`, `missing`. A
+  missing field fails every comparison except `ne`, unless the condition gives
+  a `missing` value to compare instead. A false condition makes the patch
+  `skipped`.
+- `exists`: `must` (a missing document is `not_found`) or `must_not` (an
+  existing document is a `conflict`; a missing one is created).
+- `if_version`: optimistic concurrency. The document's `_version_` must equal
+  it, or the patch is a `conflict`.
+- `upsert: true` starts a missing document from `{"id": ...}`;
+  `upsert_doc` creates it as that body instead, without applying the ops.
+- `delete_doc: true` deletes the document when the preconditions hold.
+
+Each patch reports `updated`, `created`, `deleted`, `noop` (the result equals
+the current document, so nothing is written), `skipped`, `not_found`,
+`conflict`, `superseded` (a newer write of the id already replaced the
+document) or `error`. `version` is the document's `_version_` after the patch:
+the request's update version when it wrote, else the current document's (0
+when there is none, and for `deleted`, `superseded` and `error`). A later
+delete of the id can make a patch report `not_found` or `created` although
+the delete still wins.
+
+Some recipes:
+
+```json
+{"id":"p","when":[{"path":"stock","op":"eq","value":0,"missing":0}],
+ "ops":[{"op":"increment","path":"stock","value":1}]}
+```
+
+increments only from a known value (the `IncrementFrom` of some APIs), and
+
+```json
+{"id":"p","when":[{"path":"src_version","op":"lt","value":42,"missing":0}],
+ "ops":[{"op":"merge","value":{"price":10,"src_version":42}}]}
+```
+
+applies an external system's change only if it is newer than the one indexed.
+
+Ordering: patches take the update version of their request, like every other
+update, and apply once, in version order. A patch sees every earlier write of
+its id, a later overwrite or delete wins over it, and several patches of one
+id in one request apply in turn. A request with patches always commits
+before it responds, because a patch's outcome is known only once the commit
+that resolves it has applied every earlier update; batch many patches per
+request rather than sending one at a time.
+
+A request with patches cannot also index or delete the same id, and cannot
+use `all_or_none`, `allow_dups`, `field_map`, `drop_unmapped`, or request
+source includes/excludes. A document
+whose source was narrowed by includes/excludes or renamed by a `field_map`,
+or that was indexed before the store was enabled, cannot be patched (its
+patch is an `error`). A patched document is indexed under the schema current
+when it is patched, and date math such as `now` in its source is evaluated
+again. Patches are not accepted in an NDJSON stream; send them in a JSON
+update. Like any update, if the commit that publishes the patched documents
+fails, the request reports an error but those documents may still be
+published by a later commit.
 
 ## Field mapping
 
@@ -381,7 +491,7 @@ The relevant server controls are:
 
 ## Limits
 
-- Delete-by-query and field-level partial updates are not implemented.
+- Delete-by-query is not implemented.
 - Each admitted update message pins the schema in force at admission, and a
   schema change never rewrites or backfills existing documents; see
   [changes to a live collection](schema.md#changes-to-a-live-collection).

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+
+#include <set>
 #include "luxir/util/Metrics.h"
 
 #include <atomic>
@@ -420,6 +422,9 @@ public:
   // increment needs no lock.  Relaxed atomic solely so stats() can read it while
   // an update is in flight without a formal data race.
   std::atomic<uint64_t> updateNumber = 0;
+  // How far a writer reopening an index advances its update versions past the
+  // manifest's (see the constructor).
+  static constexpr uint64_t VERSION_CLAIM_GAP = (uint64_t)1 << 32;
 
   // Next session-local tag for updateSequencerNode.
   uint64_t updateOrdinal = 0;
@@ -493,6 +498,25 @@ public:
   // Smallest minDocVersion over busy, idle and flushing inverters: lowered at
   // release, recomputed when the inverter holding it leaves. indexMutex.
   uint64_t minInverterDocVersion = UINT64_MAX;
+  // Update versions of messages whose patches are not yet indexed and
+  // published. Each holds delete packets newer than it from retiring: a patch
+  // indexes its document later, under its own version, and a newer overwrite or
+  // delete of that id must still reach it. indexMutex.
+  std::multiset<uint64_t> pinnedPatchVersions;
+  // Documents a commit produced from patches that are not yet published, by
+  // id: the newest state of the id for a later message's patches, which a
+  // commit can resolve before the earlier follow-up indexes its documents.
+  // indexMutex.
+  struct UnpublishedPatch {
+    const UpdateMessage* owner = nullptr;
+    uint64_t version = 0;
+    std::optional<std::string> body;  // nullopt: deleted
+  };
+  boost::unordered_flat_map<std::string, UnpublishedPatch> unpublishedPatches;
+  void forgetUnpublishedPatches(const UpdateMessage& msg);
+  uint64_t patchPinFloorLocked() const {
+    return pinnedPatchVersions.empty() ? UINT64_MAX : *pinnedPatchVersions.begin();
+  }
   // Version of the newest commit to complete, published or not. Commits
   // complete in version order: startUpdateNode is serial and assigns versions
   // and ordinals together, and initiateCommit assigns commitNum in ordinal
@@ -731,6 +755,23 @@ private:
     void done(IndexWriter& iw) override;
   };
 
+  // Indexes the documents a commit produced from a message's patches, under
+  // that message's update version, and commits them. Completes the message.
+  class PatchApplyMessage final : public UpdateMessage {
+  public:
+    UpdateMessage* origMessage = nullptr;
+
+    void handle(IndexWriter& iw) override;
+    void done(IndexWriter& iw) override;
+  };
+  void pinPatches(UpdateMessage& msg);
+  void unpinPatches(UpdateMessage& msg);
+  // Resolves msg's patches against the application's segments (after its
+  // deletes): fills msg.patchOutcomes and msg.patchedDocs.
+  void resolvePatches(UpdateMessage& msg, DeleteApplication& app);
+  // Submits the follow-up message for msg.patchedDocs. False when it could not.
+  bool submitPatchApply(UpdateMessage& msg);
+
   class MergeCommitMessage final : public UpdateMessage {
   public:
     MergeMessage* origMessage = nullptr;
@@ -750,7 +791,8 @@ private:
     // dense for the sequencer nodes. Merge continuations belong to already
     // admitted work, including automatic merges whose commits also flush.
     if (failed.load(std::memory_order_acquire) || (closed.load(std::memory_order_relaxed)
-        && dynamic_cast<MergeCommitMessage*>(&msg) == nullptr)) {
+        && dynamic_cast<MergeCommitMessage*>(&msg) == nullptr
+        && dynamic_cast<PatchApplyMessage*>(&msg) == nullptr)) {
       throw IndexWriterClosedError("index writer is closed");
     }
     msg.schema = lastSnapshot.load()->schema;
@@ -786,6 +828,8 @@ private:
   void processUpdateBody(UpdateMessage& msg) {
     INDEX_DEBUG("processUpdateBody: msg={}", (void*)&msg);
     try {
+      // Before the message completes, so the delete frontier cannot pass it.
+      if (!msg.patches.empty()) pinPatches(msg);
       msg.handle(*this);
     } catch (std::exception& e) {
       // setException logs the failure at the level its classification deserves.
@@ -822,6 +866,7 @@ private:
     }
 
     if (doneWithMessage) {
+      unpinPatches(msg);
       try {
         msg.done(*this);
       } catch (const std::exception& e) {

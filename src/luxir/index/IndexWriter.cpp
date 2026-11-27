@@ -30,6 +30,10 @@
 #include "SegmentMerger.h"
 #include "SourceMerge.h"
 #include "luxir/reader/SourceReader.h"
+#include "luxir/reader/DocsEnum.h"
+#include "luxir/reader/TermsEnum.h"
+#include "luxir/source/SourcePatch.h"
+#include <boost/unordered/unordered_flat_map.hpp>
 #include "luxir/store/SourceFiles.h"
 #include "VectorIndexBuilder.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
@@ -200,7 +204,11 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     coreGen = indexInfo.core_gen;
     schemaGen_ = indexInfo.schema->version.generation();
     nextSchemaVersion = indexInfo.schema->version.local;
-    updateNumber.store(indexInfo.update_version, std::memory_order_relaxed);
+    // A version acknowledged before a crash, or by a primary whose last
+    // commit a promoted follower never saw, is not in this manifest. Starting
+    // past a gap means no version is ever handed out twice, so a version a
+    // client holds (Patch.if_version) names one document state.
+    updateNumber.store(indexInfo.update_version + VERSION_CLAIM_GAP, std::memory_order_relaxed);
     completedUpdateVersion = indexInfo.update_version;
     durableUpdateVersion = indexInfo.update_version;
     segInfos.reserve(indexInfo.segments.size());
@@ -405,6 +413,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
 
       metric.finish(dispatchCompletion && msg->result.errored() ? MetricOutcome::ERROR : MetricOutcome::OK);
       if (dispatchCompletion) {
+        unpinPatches(*msg);
         try {
           msg->done(*this);
         }
@@ -522,6 +531,280 @@ void IndexWriter::MergeCommitMessage::done(IndexWriter& iw) {
   }
   delete this;
   mergeMessage->done(iw);
+}
+
+void IndexWriter::PatchApplyMessage::handle(IndexWriter& iw) {
+  UpdateMessage& orig = *origMessage;
+  // The current schema, like any new document. The inverter takes the
+  // original message's version for every document it indexes here.
+  Inverter& inverter = iw.obtainInverter(orig.updateVersion, {});
+  inverter.overwrite = true;
+  inverter.coerceContext.dateMathNowEpochMillis = orig.dateMathNowMillis;
+  try {
+    orig.indexPatchedDocs(iw, inverter);
+  } catch (...) {
+    inverter.fail(std::current_exception());
+    iw.releaseInverter(inverter, true);
+    throw;
+  }
+  iw.releaseInverter(inverter, inverter.shouldFlush(iw.perInverterRamBytes, iw.perInverterMaxDocs));
+}
+
+void IndexWriter::PatchApplyMessage::done(IndexWriter& iw) {
+  UpdateMessage* orig = origMessage;
+  orig->resultingCommit = resultingCommit;
+  if (result.errored()) {
+    std::runtime_error error("indexing the patched documents failed: " + std::string(result.what()));
+    orig->result.setException(error);
+  }
+  iw.unpinPatches(*orig);
+  delete this;
+  orig->done(iw);
+}
+
+void IndexWriter::forgetUnpublishedPatches(const UpdateMessage& msg) {
+  const std::lock_guard lock(indexMutex);
+  boost::unordered::erase_if(unpublishedPatches, [&](const auto& entry) { return entry.second.owner == &msg; });
+}
+
+void IndexWriter::pinPatches(UpdateMessage& msg) {
+  const std::lock_guard lock(indexMutex);
+  if (msg.patchPinned) return;
+  pinnedPatchVersions.insert(msg.updateVersion);
+  msg.patchPinned = true;
+}
+
+void IndexWriter::unpinPatches(UpdateMessage& msg) {
+  if (!msg.patchPinned) return;
+  // Published, or never to be: later patches read the segments again.
+  forgetUnpublishedPatches(msg);
+  // Every patch message completes through here exactly once: count outcomes.
+  if (msg.result.errored() || msg.patchOutcomes.size() != msg.patches.size()) {
+    metrics->add(MetricCounter::PATCHES_FAILED, msg.patches.size());
+  } else {
+    using Status = api::PatchResult::Status;
+    for (const auto& outcome : msg.patchOutcomes) {
+      switch (outcome.status) {
+        case Status::UPDATED:
+        case Status::CREATED:
+        case Status::DELETED: metrics->add(MetricCounter::PATCHES_WRITTEN); break;
+        case Status::ERROR:
+        case Status::UNKNOWN: metrics->add(MetricCounter::PATCHES_FAILED); break;
+        default: metrics->add(MetricCounter::PATCHES_UNCHANGED); break;
+      }
+    }
+  }
+  const std::lock_guard lock(indexMutex);
+  if (auto it = pinnedPatchVersions.find(msg.updateVersion); it != pinnedPatchVersions.end()) {
+    pinnedPatchVersions.erase(it);
+  }
+  msg.patchPinned = false;
+  markRetirableLocked();
+  requestDeletePassLocked();
+}
+
+bool IndexWriter::submitPatchApply(UpdateMessage& msg) {
+  auto apply = std::make_unique<PatchApplyMessage>();
+  apply->origMessage = &msg;
+  apply->commit = UpdateMessage::COMMIT;
+  // On a refused submission the caller completes msg; a submission the start
+  // node rejects completes it through PatchApplyMessage::done.
+  if (!submitUpdate(apply.get())) {
+    forgetUnpublishedPatches(msg);
+    return false;
+  }
+  apply.release();
+  return true;
+}
+
+// Each patched id's base is its newest live document born before msg's
+// version, among the segments this commit applied every earlier update to.
+// A live document born after it means a newer write of the id already
+// replaced it. Newer writes still in inverters need no check: the packets that
+// carry them outlive msg's pin and reach the document indexed for the patch.
+void IndexWriter::resolvePatches(UpdateMessage& msg, DeleteApplication& app) {
+  using Status = api::PatchResult::Status;
+  const uint64_t version = msg.updateVersion;
+  msg.patchOutcomes.assign(msg.patches.size(), {});
+  msg.patchedDocs.clear();
+
+  std::vector<std::string_view> ids;
+  boost::unordered_flat_map<std::string_view, std::vector<uint32_t>> byId;
+  for (uint32_t i = 0; i < (uint32_t)msg.patches.size(); i++) {
+    auto& indexes = byId[msg.patches[i].id];
+    if (indexes.empty()) ids.push_back(msg.patches[i].id);
+    indexes.push_back(i);
+  }
+
+  struct Source {
+    std::shared_ptr<SourceReader> reader;
+    SourceReader::Cursor cursor;
+  };
+  boost::unordered_flat_map<SegInfo*, std::unique_ptr<Source>> sources;
+  // Live docs as this commit left them, read once per segment.
+  boost::unordered_flat_map<SegInfo*, std::shared_ptr<LiveDocs>> liveDocs;
+  auto liveOf = [&](SegInfo* seg) -> const LiveDocs* {
+    auto [it, inserted] = liveDocs.try_emplace(seg);
+    if (inserted) {
+      uint64_t gen, epoch;
+      {
+        const std::lock_guard lock(indexMutex);
+        gen = seg->liveGen;
+        epoch = seg->liveEpoch;
+      }
+      if (gen > 0) {
+        it->second = loadLiveDocs(*seg, gen, epoch);
+        if (!it->second) throw std::runtime_error("live docs of segment " + seg->name() + " are unreadable");
+      }
+    }
+    return it->second.get();
+  };
+  // A delete or overwrite of `id` newer than `after` among the packets this
+  // commit applied: it ended any document of the id born at or before `after`.
+  auto deletedAfter = [&](std::string_view id, uint64_t after) {
+    for (const auto& packet : app.selected.deletes) {
+      if (packet->getLargestVersion() <= after) continue;
+      for (auto span : packet->lists()) {
+        for (const auto& entry : span) {
+          if (entry.val().deleteWatermark > after && (std::string_view)entry == id) return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  for (auto id : ids) {
+    const auto& indexes = byId[id];
+    SegInfo* baseSeg = nullptr;
+    int32_t baseDoc = -1;
+    uint64_t baseVersion = 0;
+    bool superseded = false;
+    std::optional<std::string> base;
+    std::string failure;
+    try {
+      for (SegInfo* seg : app.segs) {
+        auto core = getSegmentCore(*seg);
+        const auto* field = core->rootReader().fieldInfo("id");
+        if (!field) continue;
+        if (auto filter = core->idFilter(); filter && !filter->mayContain(id)) continue;
+        auto guard = MemPool::threadLocalPoolGuard();
+        TermsEnum terms(guard.pool(), core->rootReader(), *field);
+        if (!terms.seek(id)) continue;
+        const LiveDocs* live = liveOf(seg);
+        VersionRuns::Cursor versions(core->versionRuns());
+        DocsOnlyEnum docs(terms);
+        for (int32_t doc = docs.next(); doc != DocsEnumMeta::END; doc = docs.next()) {
+          if (live && !live->bitset().get(doc)) continue;
+          uint64_t birth = versions.birth(doc);
+          if (birth >= version) {
+            superseded = true;
+          } else if (!baseSeg || birth > baseVersion) {
+            baseSeg = seg;
+            baseDoc = doc;
+            baseVersion = birth;
+          }
+        }
+      }
+      // An earlier message's patched state of the id, resolved but not yet
+      // indexed, is newer than any segment document it replaces, unless a
+      // write after it ended it.
+      bool fromUnpublished = false;
+      if (!superseded) {
+        const std::lock_guard lock(indexMutex);
+        if (auto it = unpublishedPatches.find(std::string(id)); it != unpublishedPatches.end()) {
+          const auto& pending = it->second;
+          if (pending.version < version && (!baseSeg || pending.version > baseVersion)) {
+            fromUnpublished = true;
+            baseSeg = nullptr;
+            if (pending.body && !deletedAfter(id, pending.version)) {
+              base = *pending.body;
+              baseVersion = pending.version;
+            }
+          }
+        }
+      }
+      if (baseSeg && !superseded && !fromUnpublished) {
+        auto& slot = sources[baseSeg];
+        if (!slot) slot = std::make_unique<Source>();
+        auto& source = *slot;
+        if (!source.reader) {
+          if (baseSeg->sourceGen == 0) throw std::runtime_error("the document has no stored source");
+          source.reader = std::make_shared<SourceReader>(
+              dir, Postings::getSourceMapFileName(Postings::segmentKey(baseSeg->segId, baseSeg->creatorEpoch),
+                                                  baseSeg->sourceGen),
+              baseSeg->maxDoc, baseSeg->baseFiles);
+        }
+        source::Record record;
+        auto status = source.reader->fetch(baseDoc, source.cursor, record);
+        if (status == SourceReader::Status::UNREADABLE) throw std::runtime_error("the document's source is unreadable");
+        if (status != SourceReader::Status::OK || (record.flags & source::kFlagMissing)) {
+          throw std::runtime_error("the document has no stored source");
+        }
+        if (record.flags & source::kFlagFiltered) {
+          throw std::runtime_error("the document's source was narrowed by includes or excludes");
+        }
+        if (record.flags & source::kFlagMapped) {
+          throw std::runtime_error("the document's source keys were renamed by a field_map");
+        }
+        std::string json;
+        if (!source::holdsFieldValues(record.flags) || !SourceReader::renderJson(record, json)) {
+          throw std::runtime_error("the document has no stored source");
+        }
+        base = std::move(json);
+      }
+    } catch (const std::exception& e) {
+      failure = e.what();
+    }
+
+    if (!failure.empty() || superseded) {
+      for (uint32_t i : indexes) {
+        auto& outcome = msg.patchOutcomes[i];
+        outcome.status = superseded && failure.empty() ? Status::SUPERSEDED : Status::ERROR;
+        outcome.error = failure;
+      }
+      continue;
+    }
+
+    // Patches of one id apply in request order, each to the previous result.
+    std::optional<std::string> current = base;
+    uint64_t currentVersion = base ? baseVersion : 0;
+    bool changed = false;
+    UpdateMessage::PatchedDoc patched;
+    for (uint32_t i : indexes) {
+      auto applied = source::applyPatch(msg.patches[i], current, currentVersion);
+      auto& outcome = msg.patchOutcomes[i];
+      outcome.status = applied.status;
+      outcome.error = std::move(applied.error);
+      switch (applied.status) {
+        case Status::UPDATED:
+        case Status::CREATED:
+          current = std::move(applied.body);
+          currentVersion = version;
+          changed = true;
+          patched.patchIndexes.push_back(i);
+          break;
+        case Status::DELETED:
+          current.reset();
+          currentVersion = 0;
+          changed = true;
+          patched.patchIndexes.push_back(i);
+          break;
+        default:
+          break;
+      }
+      outcome.version = currentVersion;
+    }
+    // A document created and deleted within the request leaves nothing to do.
+    if (!changed || (!current && !base)) continue;
+    patched.id = std::string(id);
+    patched.deleted = !current;
+    if (current) patched.body = std::move(*current);
+    {
+      const std::lock_guard lock(indexMutex);
+      unpublishedPatches[patched.id] = {&msg, version, current ? std::optional<std::string>(patched.body) : std::nullopt};
+    }
+    msg.patchedDocs.push_back(std::move(patched));
+  }
 }
 
 // Caller must hold indexMutex.
@@ -1348,7 +1631,7 @@ uint64_t IndexWriter::minDocumentVersionLocked() const {
 // lowered eagerly and raised only by a recompute, so a stale one can delay a
 // pass but never retire a packet early.
 uint64_t IndexWriter::deleteFrontierLocked() const {
-  return std::min(completedUpdateVersion, minInverterDocVersion);
+  return std::min({completedUpdateVersion, minInverterDocVersion, patchPinFloorLocked()});
 }
 
 uint64_t IndexWriter::deleteOnlyFlushCapLocked() const {
@@ -1803,7 +2086,9 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     for (const auto& [_, seg] : segInfos) {
       for (const auto& packet : seg->personalDeletes.deletes) app.select(packet, false);
     }
-    app.retireThrough = msg.publishOnly ? 0 : msg.updateVersion;
+    // A message whose patches are not yet indexed keeps newer packets: they
+    // must still reach the documents it will index under its version.
+    app.retireThrough = msg.publishOnly ? 0 : std::min(msg.updateVersion, patchPinFloorLocked());
     msg.commitInfo->highestUpdateVersion =
       std::max({durableUpdateVersion, preparedDeleteVersion, msg.updateVersion, app.pending.getLargestVersion()});
     pinSnapshotLocked(app);
@@ -1815,6 +2100,12 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
               app.targets.size(), app.segs.size());
   applyDeletes(app);
   reconcileDeletes(app);
+  // Every update through this commit's version is applied above, so each
+  // patched id's newest document is now known.
+  if (!msg.publishOnly && !msg.patches.empty()) {
+    resolvePatches(msg, app);
+    Signal::emit("patchesResolved", &msg);
+  }
 
   // Collect filenames that need to be fsynced before the commit point.
   std::vector<std::string> filesToSync;
@@ -1939,6 +2230,12 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   if (msg.maxSegments > 0) {
     enqueueForceMerge(msg); // completion ownership transfers here; don't access msg below.
     return false;
+  }
+  if (!msg.patchedDocs.empty()) {
+    // The patched documents are indexed and published by a follow-up message,
+    // which completes msg; completion ownership transfers with it.
+    if (submitPatchApply(msg)) return false;
+    msg.result.setException(IndexWriterClosedError("index writer is closed"));
   }
   return true;
 }
