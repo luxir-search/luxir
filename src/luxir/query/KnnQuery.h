@@ -221,11 +221,17 @@ public:
     // Dense single-valued crossover; -1 forces sequential, infinity walks.
     double flatDomainDensityThreshold = 0.6;
     // Default effort scans about N^-1/4 of an index (sqrt(N) lists, sqrt of
-    // them probed); applying that rule to the eligible population sN scales
-    // the fraction by s^-1/4, which keeps filtered recall near unfiltered.
+    // them probed) up to the reference cap; applying that rule to the
+    // eligible population sN scales the fraction by s^-1/4, which keeps
+    // filtered recall near unfiltered.
     double filteredCoverageAlpha = 0.25;
     // Both zero select next-list-only growth.
     double breadthHeadroom = 1.25, breadthGrowth = 2.0;
+    // Reference list count above which default effort is an examined-code
+    // target (KnnPlanner::defaultExamined) rather than a scan fraction, and
+    // that target's relative growth per doubling of N and of k.
+    int32_t referenceCap = KnnPlanner::DEFAULT_REFERENCE_CAP;
+    double examinedGrowth = KnnPlanner::DEFAULT_EXAMINED_GROWTH;
   };
   static Tuning tuning;
   static constexpr double FLAT_RANGE_POINT_DENSITY = 1.0 / 128.0;
@@ -338,7 +344,7 @@ public:
   }
 
   // Dimension-aware default IVF effort.  The nprobe=0 scan fraction
-  // (1/sqrt(referenceBreadth), see defaultBudget) is scaled by
+  // (KnnPlanner::initialScanFraction) is scaled by
   //   clamp(sqrt(dims / defaultAnnBreadthReferenceDims), 1, ANN_BREADTH_MAX_DIM_FACTOR).
   // Coarse partitions localize neighbors worse as dimension grows (distances
   // to centroids concentrate, so a query's true neighbors spill over many
@@ -909,6 +915,8 @@ public:
     out.appendDouble(tuning.filteredCoverageAlpha);
     out.appendDouble(tuning.breadthHeadroom);
     out.appendDouble(tuning.breadthGrowth);
+    out.appendInt32(tuning.referenceCap);
+    out.appendDouble(tuning.examinedGrowth);
     out.appendInt32(defaultAnnBreadthReferenceDims);
     // Test wrappers may alter candidate selection without a keyable semantic
     // contract.
@@ -1253,9 +1261,10 @@ public:
         .boundedTarget = query.getRefineCandidates() > 0
             ? std::max((int64_t)query.getK(), std::min(planCap, (int64_t)query.getRefineCandidates()))
             : std::max((int64_t)query.getK(), boundedDefaultCandidates(query.getK(), planCap)),
-        .nprobe = query.getNProbe(), .referenceBreadth = defaultIvfNList(liveNTotal),
+        .liveVectors = liveNTotal, .nprobe = query.getNProbe(), .referenceCap = tuning.referenceCap,
         .minScanFraction = query.getMinScanFraction(), .dimFactor = defaultAnnBreadthDimFactor(dims),
-        .alpha = tuning.filteredCoverageAlpha, .flatDensity = tuning.flatDomainDensityThreshold, .selector = tuning.selector};
+        .alpha = tuning.filteredCoverageAlpha, .flatDensity = tuning.flatDomainDensityThreshold,
+        .examinedGrowth = tuning.examinedGrowth, .selector = tuning.selector};
       auto plan = KnnPlanner::choose(planSegments, planRequest, tuning.plannerCosts,
                                     query.getExact() ? Routing::FORCE_EXACT : tuning.routing);
       ExecutionProfileRun* profile = context.planningContext().profiles
@@ -1491,9 +1500,11 @@ public:
       double selectivity = ivfLiveTotal > 0 ? (double)ivfEligibleVectors / ivfLiveTotal : 1;
       liveNTotal = std::accumulate(segLiveVectorCounts.begin(), segLiveVectorCounts.end(), (int64_t)0);
       auto executionEffort = planRequest;
-      executionEffort.referenceBreadth = defaultIvfNList(liveNTotal);
+      executionEffort.liveVectors = liveNTotal;
       double initialFraction = KnnPlanner::initialScanFraction(executionEffort, selectivity);
-      const double initialNprobe = initialFraction * executionEffort.referenceBreadth;
+      double coverageFloor = KnnPlanner::coverageFloor(executionEffort, selectivity);
+      const double referenceBreadth = KnnPlanner::referenceBreadth(executionEffort);
+      const double initialNprobe = initialFraction * referenceBreadth;
       for (size_t i = 0; i < numSegs; i++) {
         if (activeIvf[i] && !eligibilityPerSeg[i].unfiltered
             && KnnPlanner::foldFirst(planSegments[i], initialFraction, tuning.selector, tuning.plannerCosts)) foldDomainAt(i);
@@ -1633,6 +1644,8 @@ public:
         }
         initialFraction = ivfLiveTotal ? KnnPlanner::initialScanFraction(executionEffort,
             (double)ivfEligibleVectors / ivfLiveTotal) : 0;
+        coverageFloor = ivfLiveTotal ? KnnPlanner::coverageFloor(executionEffort,
+            (double)ivfEligibleVectors / ivfLiveTotal) : 0;
         targetExamined = initialFraction * ivfEligibleVectors;
         coveredFraction = baseEngine->coveredFraction();
         refreshTargets();
@@ -1758,7 +1771,7 @@ public:
         // FORCE exercises completion even when round one already filled or
         // exhausted the ANN arm. Production completion only prices more work.
         if (tuning.completion == Completion::FORCE && tryComplete(request)) continue;
-        bool coverageDone = coveredFraction + 1e-15 >= initialFraction || result.breadthExhausted;
+        bool coverageDone = coveredFraction + 1e-15 >= coverageFloor || result.breadthExhausted;
         if (boundedDone && unitsFilled && examinedDone && coverageDone) break;
         // A full candidate pool cannot take another hit, so wider scans would
         // be wasted work whatever the remaining obligations.
@@ -1911,8 +1924,10 @@ public:
                 plan.ivf[i] ? (double)work.newListLiveVectors / std::max((int64_t)1, segLiveVectorCounts[i]) : 1,
                 work.physicalEntries, work.selectorPasses, work.seedReads + work.remainingReads));
             if (firstIvfPiece)
-              piece.details.push_back(std::format("reference_nlist={}; initial_nprobe={:.6g}",
-                  executionEffort.referenceBreadth, initialNprobe));
+              piece.details.push_back(std::format("reference_nlist={:.0f}; initial_nprobe={:.6g}; effort={}; target_examined={:.0f}; eligible_examined={}",
+                  referenceBreadth, initialNprobe, query.getNProbe() > 0 ? "nprobe"
+                      : KnnPlanner::examinedEffort(executionEffort) ? "examined" : "fraction",
+                  targetExamined, eligibleExamined));
             if (work.ivfRounds > 0)
               piece.details.push_back(std::format("segment_nlist={}; lists_probed={}", input.nlist, listsProbed[i]));
             for (size_t f = 0; f < features.size(); f++)

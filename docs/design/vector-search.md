@@ -686,7 +686,8 @@ add the completion round, reason and costs; work counters include the
 abandoned IVF work and the exact pass.
 
 Internally, an `ivf.nprobe` request becomes a scan fraction
-`nprobe / sqrt(live_vector_count)` applied across the current per-segment
+`nprobe / floor(sqrt(live_vector_count))` (not capped at the builder's 4096
+lists, so it means about `nprobe * sqrt(N)` examined codes at any N) applied across the current per-segment
 indexes; that is what makes the knob merge-stable. Engine-specific knobs are
 grouped under a per-engine sub-message on the wire (`ivf` today) so a second
 engine adds a sibling with its own units instead of overloading these; the
@@ -708,7 +709,26 @@ allocation denominator uses exact live counts.
 With default probes, the initial fraction expands by `s^(-1/4)`, where
 `s` is the eligible-vector fraction over the searched IVF slots. Default effort
 scans about `N^(-1/4)` of an index (`sqrt(N)` lists, `sqrt` of them probed), and
-the same rule applied to the `sN` eligible vectors gives the exponent. On SIFT
+the same rule applied to the `sN` eligible vectors gives the exponent.
+
+The default reference index has at most `tuning.referenceCap` (4096) lists,
+the builder's cap, so the fraction rule holds up to 4096^2 (16.7M) live
+vectors. Above it the rule would fix the fraction at `dimFactor / 64` and scan
+a constant share of the index, so default effort switches to an examined-code
+target, `KnnPlanner::defaultExamined`:
+`dimFactor * cap^1.5 * (1 + g * log2(N / cap^2)) * (1 + g * log2(max(1, k / 10)))`
+with `g = tuning.examinedGrowth` (0.25). It equals the rule's count at the cap,
+so smaller collections are unchanged and the transition is continuous; above
+it the count grows like `log N` instead of `N`. That fraction (target / N)
+expands by `s^(-1/4)` as before. There it is only the round-one fraction and
+the ceiling of the initial request: the stop no longer requires reaching it as
+coverage, only the examined-code obligation below (plus bounded fill, units
+and `min_scan_fraction`). Production IVF systems behave the same way, scanning
+an absolute candidate count set by k and recall (a few hundred leaves per
+machine, or a few thousand postings at 1B in SPANN). `g` and the cap-continuity
+anchor are placeholders until a scale sweep above 16.7M vectors fits them.
+Profiles report the rule as `effort=fraction|examined|nprobe` with
+`target_examined`. On SIFT
 1M and miracl 1M it keeps independent-filter recall at or above unfiltered
 recall at default effort; `s^(-1/2)` bought recall above that at about twice
 the latency for 10-30% filters. The fraction is floored by `min_scan_fraction` and capped

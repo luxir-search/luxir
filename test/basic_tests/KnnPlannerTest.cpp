@@ -71,7 +71,7 @@ TEST(KnnPlannerTest, substitutionMustLowerWholeConfiguration) {
   // A local substitution raises coverage on the other slot. Keep all-IVF
   // when that increase costs more than the local saving.
   std::vector<KnnPlanner::Segment> segments{segment(500), segment(1000)};
-  KnnPlanner::Request req{.k = 20, .boundedTarget = 300, .referenceBreadth = 1024, .alpha = 0, .selector = KnnPlanner::Selector::RESOLVE};
+  KnnPlanner::Request req{.k = 20, .boundedTarget = 300, .liveVectors = 1 << 20, .alpha = 0, .selector = KnnPlanner::Selector::RESOLVE};
   KnnPlanner::Costs costs;
   costs.units.fill(0);
   costs.units[KnnPlanner::EXACT_DIM] = 1;
@@ -117,7 +117,7 @@ TEST(KnnPlannerTest, exhaustiveAndBaselineBounds) {
         segments.push_back(s);
       }
       KnnPlanner::Request req{.k = k, .boundedTarget = target,
-          .nprobe = pinned ? 16 : 0, .referenceBreadth = 1024};
+          .liveVectors = 1 << 20, .nprobe = pinned ? 16 : 0};
       double best = INFINITY;
       for (uint64_t mask = 0; mask < (1ull << n); mask++) best = std::min(best, cost(segments, req, costs, mask));
       {
@@ -218,7 +218,7 @@ TEST(KnnPlannerTest, encodingScalesScoreDims) {
 }
 
 TEST(KnnPlannerTest, predictedRoundGrowthAndPin) {
-  KnnPlanner::Request req{.k = 20, .boundedTarget = 100, .referenceBreadth = 1024, .alpha = 0};
+  KnnPlanner::Request req{.k = 20, .boundedTarget = 100, .liveVectors = 1 << 20, .alpha = 0};
   KnnPlanner::Costs costs;
   std::vector<KnnPlanner::Segment> segments{segment()};
   auto p = KnnPlanner::price(segments[0], req, costs);
@@ -236,7 +236,7 @@ TEST(KnnPlannerTest, predictedRoundGrowthAndPin) {
 
 TEST(KnnPlannerTest, pinnedSharedPoolWithUnequalMultiplicity) {
   KnnPlanner::Costs costs;
-  KnnPlanner::Request req{.k = 20, .boundedTarget = 500, .nprobe = 64, .referenceBreadth = 1024};
+  KnnPlanner::Request req{.k = 20, .boundedTarget = 500, .liveVectors = 1 << 20, .nprobe = 64};
   std::mt19937 random(125);
   for (int trial = 0; trial < 100; trial++) {
     std::vector<KnnPlanner::Segment> segments;
@@ -291,7 +291,7 @@ TEST(KnnPlannerTest, sharedIvfRequestCanFavorExact) {
   KnnPlanner::Costs costs;
   double requestCost = costs.units[KnnPlanner::IVF_REQUEST];
   for (int nprobe : {0, 16}) {
-    KnnPlanner::Request req{.k = 3, .boundedTarget = 100, .nprobe = nprobe, .referenceBreadth = 256};
+    KnnPlanner::Request req{.k = 3, .boundedTarget = 100, .liveVectors = 1 << 16, .nprobe = nprobe};
     costs.units[KnnPlanner::IVF_REQUEST] = 0;
     auto without = KnnPlanner::choose(segments, req, costs);
     ASSERT_TRUE(without.ivf[0]);
@@ -420,4 +420,44 @@ TEST(KnnPlannerTest, unitTargetsDoNotReplaceSourceWorkPopulations) {
   KnnPlanner::addIvf(totals, owned, mapped, 1);
   EXPECT_EQ(0, totals.exactDocs); EXPECT_EQ(100, totals.eligibleDocs);
   EXPECT_EQ(100, totals.boundedDocs); EXPECT_EQ(1000, totals.eligibleVectors);
+}
+
+// Above the reference cap the default is an examined-code target, continuous
+// with the fraction rule at the cap and growing logarithmically after it.
+TEST(KnnPlannerTest, defaultEffortIsExaminedTargetAboveReferenceCap) {
+  auto request = [](double live, int64_t k = 10, int32_t nprobe = 0) {
+    return KnnPlanner::Request{.k = k, .liveVectors = (int64_t)live, .nprobe = nprobe,
+                               .dimFactor = std::sqrt(6.0)};
+  };
+  auto examined = [&](double live, int64_t k = 10) {
+    return KnnPlanner::initialScanFraction(request(live, k), 1) * live;
+  };
+  // Below the cap: the fraction rule, and it is a coverage floor.
+  auto small = request(1e6);
+  EXPECT_FALSE(KnnPlanner::examinedEffort(small));
+  EXPECT_DOUBLE_EQ(std::sqrt(6.0) / std::sqrt(1000.0), KnnPlanner::initialScanFraction(small, 1));
+  EXPECT_DOUBLE_EQ(KnnPlanner::initialScanFraction(small, 1), KnnPlanner::coverageFloor(small, 1));
+  // Continuous at the cap (4096^2 vectors, 3.83% at 768d).
+  double cap = 4096.0 * 4096.0;
+  EXPECT_NEAR(examined(cap), examined(4097.0 * 4097.0), examined(cap) * 0.001);
+  // Above it: no coverage floor, sublinear growth, k raises the target.
+  auto large = request(1e9);
+  EXPECT_TRUE(KnnPlanner::examinedEffort(large));
+  EXPECT_EQ(0, KnnPlanner::coverageFloor(large, 1));
+  EXPECT_LE(examined(1e8), 3 * examined(1e7));
+  EXPECT_LT(examined(1e9), 0.1 * 0.0383 * 1e9);
+  EXPECT_NEAR(examined(4e9) - examined(2e9), examined(2e9) - examined(1e9), 1);
+  EXPECT_GT(examined(1e9, 100), examined(1e9));
+  EXPECT_EQ(examined(1e9, 5), examined(1e9));
+  // Filters keep the s^-1/4 expansion relative to the target.
+  EXPECT_DOUBLE_EQ(KnnPlanner::initialScanFraction(large, 1) * std::pow(0.1, -0.25),
+                   KnnPlanner::initialScanFraction(large, 0.1));
+  // Explicit nprobe: lists of an uncapped sqrt(N) reference, floor and pin.
+  auto pinned = request(1e12, 10, 64);
+  EXPECT_FALSE(KnnPlanner::examinedEffort(pinned));
+  EXPECT_DOUBLE_EQ(64 / 1e6, KnnPlanner::initialScanFraction(pinned, 1));
+  EXPECT_DOUBLE_EQ(64 / 1e6, KnnPlanner::coverageFloor(pinned, 1));
+  // min_scan_fraction stays a floor in both regimes.
+  large.minScanFraction = 0.5;
+  EXPECT_EQ(0.5, KnnPlanner::coverageFloor(large, 1));
 }
