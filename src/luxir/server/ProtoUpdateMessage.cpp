@@ -7,6 +7,7 @@
 #include "CommitWaits.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/ObjectFields.h"
+#include "luxir/util/Signal.h"
 #include "luxir/schema/Schema.h"
 
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -167,6 +168,7 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 
 
 void ProtoUpdateMessage::handle(IndexWriter& iw) {
+  Signal::emit("protoUpdateHandle", this);
   // Counts the batch for the node and its collection as it leaves, however
   // it leaves. A message with no documents and no delete ids (a commit-only
   // message) is not a batch; its commit counts under the COMMIT stage.

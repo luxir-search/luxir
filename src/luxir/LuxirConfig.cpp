@@ -155,6 +155,15 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->transform(CLI::AsSizeValue(false))
       ->check(CLI::NonNegativeNumber)
       ->default_str("--indexing.max-request-body");
+  app.add_option("--server.grpc.max-concurrent-streams", server.grpc.max_concurrent_streams,
+                 "Max concurrent gRPC calls per client connection (0 = unlimited)")
+      ->default_val(server.grpc.max_concurrent_streams)
+      ->check(CLI::Range((int64_t)0, (int64_t)(std::numeric_limits<int>::max)()));
+  // No default_val: the -1 sentinel is resolved by resolveRamBudgets().
+  app.add_option("--server.grpc.resource-quota-mb", server.grpc.resource_quota_mb,
+                 "Memory gRPC may use for transport buffers (MiB, 0 = unlimited)")
+      ->check(CLI::NonNegativeNumber)
+      ->default_str("25% of --max-ram-mb, at least 64");
 
   app.add_flag("--server.http.enabled,!--no-http", server.http.enabled, "Enable the HTTP/JSON server")
       ->default_val(server.http.enabled);
@@ -289,9 +298,19 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(ingest.stream_batch_docs)
       ->check(CLI::PositiveNumber);
   app.add_option("--indexing.max-inflight-batches", ingest.max_inflight_batches,
-                 "Streaming NDJSON: batches decoding or indexing at once per connection (0 = server.workers + 2)")
+                 "Streaming NDJSON batches per connection, and gRPC UpdateStream updates per call, in flight at once (0 = server.workers + 2)")
       ->default_val(ingest.max_inflight_batches)
       ->check(CLI::NonNegativeNumber);
+  // No default_val: the -1 sentinels are resolved by resolveRamBudgets().
+  app.add_option("--indexing.max-inflight-updates", ingest.max_inflight_updates,
+                 "Node-wide updates admitted and not yet complete; past it updates are "
+                 "refused or streams pause (0 = unlimited)")
+      ->check(CLI::NonNegativeNumber)
+      ->default_str("32 per server.workers, at least 256");
+  app.add_option("--indexing.max-inflight-update-bytes", ingest.max_inflight_update_bytes,
+                 "Node-wide raw request bytes of admitted updates (e.g. 512MB, 0 = unlimited)")
+      ->transform(CLI::AsSizeValue(false))
+      ->default_str("25% of --indexing.max-ram-mb, at least 2x --indexing.max-request-body");
   app.add_flag("--indexing.auto-create-collection,!--no-indexing.auto-create-collection",
                ingest.auto_create_collection, "Create missing collections on first use")
       ->default_val(ingest.auto_create_collection);
@@ -366,6 +385,24 @@ void LuxirConfig::resolveRamBudgets() {
     index.max_inverter_ram_mb =
         index.max_ram_mb > 0 ? (std::min)(index.max_ram_mb, IndexConfig::MAX_INVERTER_RAM_CAP_MB)
                              : IndexConfig::MAX_INVERTER_RAM_CAP_MB;
+  }
+
+  constexpr int64_t MiB = 1024 * 1024;
+  if (ingest.max_inflight_updates < 0) {
+    // Enough to keep every worker fed by many small pipelined updates; the
+    // byte limit is what bounds memory.
+    ingest.max_inflight_updates = (std::max)((int64_t)256, (int64_t)32 * server.resolveWorkers());
+  }
+  if (ingest.max_inflight_update_bytes < 0) {
+    // Queued request bytes compete with the inverters they feed for the same
+    // indexing RAM, so they take a minority share.  Two whole buffered
+    // requests always fit, so one maximal request never waits on the limit
+    // for long.
+    int64_t share = index.max_ram_mb > 0 ? index.max_ram_mb * MiB / 4 : max_ram_mb * MiB / 8;
+    ingest.max_inflight_update_bytes = share > 0 ? (std::max)(share, 2 * ingest.max_request_body) : 0;
+  }
+  if (server.grpc.resource_quota_mb < 0) {
+    server.grpc.resource_quota_mb = max_ram_mb > 0 ? (std::max)((int64_t)64, max_ram_mb / 4) : 0;
   }
 }
 

@@ -141,6 +141,15 @@ queueing, and sending the response.
 Send documents through the repeated `docs` row maps. Row maps use the field
 coercion, update, and commit semantics described in [Indexing](indexing.md).
 
+A stream has at most `--indexing.max-inflight-batches` updates (default: the
+worker count plus two) admitted and not yet answered, and reads a further
+message only while the node's update admission has room. Otherwise the server
+stops reading until updates complete, and the client's writes back up through
+HTTP/2 flow control; a stream is never failed for load. A unary `Update` past
+the node's limit instead fails with `RESOURCE_EXHAUSTED` and code
+`too_many_updates`; retry it after a short backoff. See
+[Update admission](operations.md#update-admission).
+
 ## Message size
 
 Each received message, a unary request or one message of a stream, is
@@ -214,6 +223,11 @@ set the relevant oneof fields and maps rather than those JSON conveniences.
 becomes, which is the message a generated client should build.
 
 ## Transport and deployment boundary
+
+The server caps the calls one client connection may have open at once
+(`--server.grpc.max-concurrent-streams`, default 1024) and the memory gRPC's
+own buffers may use (`--server.grpc.resource-quota-mb`); see
+[Update admission](operations.md#update-admission).
 
 The configured gRPC port listens on all interfaces with insecure server
 credentials. There is no built-in TLS, authentication, authorization, or

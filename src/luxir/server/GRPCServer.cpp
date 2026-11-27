@@ -17,6 +17,7 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/generic/async_generic_service.h>
 #include <grpcpp/health_check_service_interface.h>
+#include <grpcpp/resource_quota.h>
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/support/byte_buffer.h>
 #include <hpp_proto/grpc/serialization.hpp>
@@ -84,6 +85,19 @@ void luxir::GRPCServer::run() {
                            : config.ingest.max_request_body;
   maxReceive = std::clamp<int64_t>(maxReceive, 1, std::numeric_limits<int>::max());
   builder.SetMaxReceiveMessageSize((int)maxReceive);
+
+  // Transport-level bounds, below update admission: calls per connection,
+  // and the memory gRPC's own buffers may take across connections.
+  const auto& grpcConfig = config.server.grpc;
+  if (grpcConfig.max_concurrent_streams > 0) {
+    builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS,
+        (int)std::min<int64_t>(grpcConfig.max_concurrent_streams, std::numeric_limits<int>::max()));
+  }
+  if (grpcConfig.resource_quota_mb > 0) {
+    grpc::ResourceQuota quota("luxir_grpc");
+    quota.Resize((size_t)grpcConfig.resource_quota_mb * 1024 * 1024);
+    builder.SetResourceQuota(quota);
+  }
 
   // One generic service handles every method as raw bytes; dispatch is by RPC
   // path inside GenericCallData.  registerLuxirDescriptors() makes describe and
@@ -175,6 +189,10 @@ struct MethodEntry {
   // Many request messages on one call; a message's in-band failure does not
   // fail the call (searches and index batches count each message).
   bool clientStream = false;
+  // Requests are updates admitted through the node's UpdateAdmission: a
+  // streaming call reads its next message only while its own window and
+  // the node have room.
+  bool admitsUpdates = false;
 };
 
 static const MethodEntry* lookupMethod(const std::string& method);
@@ -327,6 +345,10 @@ public:
   // was deferred to the active request's completion.
   bool requestActive = false;
   bool rearmPending = false;
+  // Update streams: updates submitted and not yet answered (bounded by
+  // updateWindow), and whether a resume is parked on the node's admission.
+  int64_t updatesInFlight = 0;
+  bool admissionWaiting = false;
   int32_t responsesExpected = 0;
   grpc::Status finishStatus = grpc::Status::OK;
   // Engaged when a non-cq thread needs maybeSendFinish() to run: the KICK tag
@@ -340,11 +362,30 @@ public:
   bool finishReceived = false;
   enum CallTags { READ = 1, WRITE = 2, FINISH = 3, CONNECT = 4, KICK = 5, DONE = 6 };
 
+  // A resume parked on the node's UpdateAdmission outlives nothing: the
+  // call clears `call` under the slot's mutex as it is deleted, and a resume
+  // holds that mutex while it touches the call.
+  struct AdmissionSlot {
+    std::mutex mutex;
+    GenericCallData* call;
+    explicit AdmissionSlot(GenericCallData* call) : call(call) {}
+  };
+  std::shared_ptr<AdmissionSlot> admissionSlot;
+  const int64_t updateWindow;
+
   GenericCallData(GRPCServer& server, grpc::AsyncGenericService& genericService, GRPCServer::ThreadInfo& threadInfo)
       : CallData(server, threadInfo), genericService(genericService), readerWriter(&genericCtx),
-        highWater(server.streamBufferBytes()), lowWater(server.streamBufferBytes() / 2) {
+        highWater(server.streamBufferBytes()), lowWater(server.streamBufferBytes() / 2),
+        updateWindow(std::max<int64_t>(1, server.getLuxirNode().getConfig().ingest.inflightBatches(
+            server.getLuxirNode().getWorkers()))) {
     genericCtx.AsyncNotifyWhenDone(make_tag(DONE));
     genericService.RequestCall(&genericCtx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
+  }
+
+  ~GenericCallData() override {
+    if (!admissionSlot) return;
+    const std::lock_guard<std::mutex> lock(admissionSlot->mutex);
+    admissionSlot->call = nullptr;
   }
 
   // Records the call's first error; any thread may report it.
@@ -438,13 +479,47 @@ public:
 
   // mutex held.  The active async request sent its final response: allow the
   // next pipelined request to be read, re-arming the READ if proceed() already
-  // deferred one to us.
+  // deferred one to us.  On an update stream every final response answers
+  // one of its updates in flight.
   void requestCompleted() {
     requestActive = false;
-    if (rearmPending && !readsDone && !finishSent) {
+    if (updatesInFlight > 0) updatesInFlight--;
+    maybeRearm();
+  }
+
+  // mutex held.  Re-arms a deferred READ once nothing holds it back.
+  void maybeRearm() {
+    if (rearmPending && !readsDone && !finishSent && !requestActive && mayReadNext()) {
       rearmPending = false;
       readRequest();
     }
+  }
+
+  // mutex held.  Whether the next message may be read now.  An update stream
+  // reads only while it has fewer than updateWindow updates in flight (an
+  // answer re-arms it) and the node's admission has room; otherwise it parks
+  // a resume there and reads nothing - the client's sends back up through
+  // HTTP/2 flow control, and no thread waits.
+  bool mayReadNext() {
+    if (!methodEntry || !methodEntry->admitsUpdates || !methodEntry->clientStream) return true;
+    if (updatesInFlight >= updateWindow || admissionWaiting) return false;
+    if (!admissionSlot) {
+      try {
+        admissionSlot = std::make_shared<AdmissionSlot>(this);
+      } catch (...) {
+        return true;  // read on rather than strand the stream
+      }
+    }
+    auto resume = [slot = admissionSlot] {
+      const std::lock_guard<std::mutex> slotLock(slot->mutex);
+      if (slot->call == nullptr) return;
+      const std::lock_guard<std::mutex> lock(slot->call->mutex);
+      slot->call->admissionWaiting = false;
+      slot->call->maybeRearm();
+    };
+    if (server.getLuxirNode().getUpdateAdmission().whenAvailable(std::move(resume))) return true;
+    admissionWaiting = true;
+    return false;
   }
 
   // Callable from any thread.  Parks a paused producer's resume callback; it is
@@ -599,7 +674,12 @@ public:
               make_tag(FINISH));
           break;
         }
-        readRequest();
+        {
+          // A new update stream waits for room like the next message would.
+          const std::lock_guard<std::mutex> lock(mutex);
+          if (!mayReadNext()) { rearmPending = true; break; }
+          readRequest();
+        }
         break;
       case READ: {
         bool discard;
@@ -618,10 +698,11 @@ public:
         {
           const std::lock_guard<std::mutex> lock(mutex);
           if (readsDone || finishSent) break;
-          if (requestActive) {
+          if (requestActive || !mayReadNext()) {
             // Async request still running (or paused on flow control): defer
             // the next READ to its completion so pipelined requests on this
-            // stream execute, and respond, in order.
+            // stream execute, and respond, in order.  An update stream past
+            // its window or the node's admission defers it the same way.
             rearmPending = true;
             break;
           }
@@ -838,6 +919,24 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     }
   };
 
+  // Node-wide admission, charged with the raw message bytes.  A stream's
+  // message was read only because admission had room (mayReadNext), so it
+  // goes ahead even if others filled it since; a unary call is refused.
+  auto& admission = call.server.getLuxirNode().getUpdateAdmission();
+  const auto size = (int64_t)(request->wire.size() - luxir::api::PADDED_PROTO_INPUT_BYTES);
+  const bool stream = call.methodEntry->clientStream;
+  UpdateAdmission::Ticket ticket;
+  if (stream) {
+    ticket = admission.admit(size);
+  } else if (auto admitted = admission.tryAdmit(size)) {
+    ticket = std::move(*admitted);
+  } else {
+    finishWithError(call, {ErrorKind::RESOURCE_EXHAUSTED, "too_many_updates",
+                           "Update: the node has too many updates in flight; retry later"});
+    return;
+  }
+
+  bool counted = false;
   try {
     auto collection = resolveUpdateCollection(call.server, request->proto);
     auto shard = collection->getShard();
@@ -846,15 +945,26 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     if (request->proto.commit && request->proto.commit->wait_for_replicas.has_value()) call.enableWaitCancellation();
     Update* updateMessage = new Update(std::move(request), &call, startTime);
     updateMessage->target = collection->getId();
+    updateMessage->admission = std::move(ticket);
+    if (stream) {
+      // Counted before submission: the answer can arrive first.
+      const std::lock_guard<std::mutex> lock(call.mutex);
+      call.updatesInFlight++;
+      counted = true;
+    }
     try {
       if (!iw->submitUpdate(updateMessage)) {
         throw std::runtime_error("update was not admitted");
       }
     } catch (...) {
-      delete updateMessage;
+      delete updateMessage;  // releases its admission
       throw;
     }
   } catch (const std::exception& e) {
+    if (counted) {
+      const std::lock_guard<std::mutex> lock(call.mutex);
+      call.updatesInFlight--;
+    }
     finishWithException(call, e);
   }
 }
@@ -1100,8 +1210,8 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
 static const MethodEntry* lookupMethod(const std::string& method) {
   static const std::unordered_map<std::string, MethodEntry> table = {
     {"/luxir.Searcher/Search",          {handleSearch, false, MetricOperation::SEARCH, true}},
-    {"/luxir.Indexer/Update",           {handleUpdate, true, MetricOperation::UPDATE}},
-    {"/luxir.Indexer/UpdateStream",     {handleUpdate, true, MetricOperation::UPDATE, true}},
+    {"/luxir.Indexer/Update",           {handleUpdate, true, MetricOperation::UPDATE, false, true}},
+    {"/luxir.Indexer/UpdateStream",     {handleUpdate, true, MetricOperation::UPDATE, true, true}},
     {"/luxir.Admin/SetSchema",          {handleSetSchema, true, MetricOperation::SCHEMA}},
     {"/luxir.Admin/GetSchema",          {handleGetSchema, false, MetricOperation::SCHEMA}},
     {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true, MetricOperation::COLLECTIONS}},
