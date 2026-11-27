@@ -159,6 +159,8 @@ public:
   // this writer.
   std::shared_ptr<Metrics> metrics = Metrics::detached();
   std::shared_ptr<CollectionMetrics> collectionMetrics = CollectionMetrics::detached();
+  // The collection's label in log lines; set by the collection that opens this writer.
+  std::string logName = "-";
   struct MergeFailureInfo {
     std::vector<uint64_t> sourceSegIds;
     uint64_t outputSegId = 0;

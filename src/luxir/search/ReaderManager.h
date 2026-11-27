@@ -27,6 +27,7 @@ class ReaderManager {
 public:
   // The node's service counters; set by the collection that owns this manager.
   std::shared_ptr<Metrics> metrics = Metrics::detached();
+  std::string logName = "-";  // the collection's label in log lines
   std::shared_ptr<FilterCache> filterCache;
   alignas(64) std::atomic<std::shared_ptr<IndexReader>> indexReader;
 

@@ -92,6 +92,7 @@ class SearchRequest : public ExecutionWarnings, public ExecutionProfileSink {
   friend class SearchEngine;
   friend class ProtobufSearchParser;
   void count(MetricOutcome outcome, std::chrono::steady_clock::time_point end);
+  void logIfSlow(std::chrono::steady_clock::time_point end);
   void settleFilterUses(bool completed) noexcept;
 
 public:

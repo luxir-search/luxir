@@ -14,7 +14,7 @@
 #include <algorithm>
 #include <fstream>
 #include <limits>
-#include "spdlog/spdlog.h"
+#include "luxir/util/log.h"
 
 namespace luxir {
 
@@ -131,8 +131,28 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--replication.downloads", replication.downloads, "Concurrent collection downloads per follower")->check(CLI::Range(1, 64));
   app.add_flag("--read-only", read_only,
                "Serve an existing data directory without the write lock; rejects all updates");
-  app.add_option("--log-level", log_level, "Log level (trace, debug, info, warn, error, critical)")
+  app.add_option("--log-level,--log.level", log_level, "Log level (trace, debug, info, warn, error, critical)")
       ->default_val(log_level);
+  app.add_option("--log.format", log.format, "Log line format: text or json (one object per line); timestamps are UTC")
+      ->default_val(log.format);
+  app.add_option("--log.slow-search-ms", log.slow_search_ms,
+                 "Log searches slower than this, with their timing, I/O and request (<0 disables)")
+      ->default_val(log.slow_search_ms);
+  app.add_option("--log.slow-search-source-chars", log.slow_search_source_chars,
+                 "Request JSON characters kept in a slow-search line (0 omits the request)")
+      ->default_val(log.slow_search_source_chars);
+  app.add_option("--log.slow-index-ms", log.slow_index_ms,
+                 "Log flushes, commits, delete passes, merges, vector builds and reader refreshes slower than this (<0 disables)")
+      ->default_val(log.slow_index_ms);
+  app.add_option("--log.slow-storage-ms", log.slow_storage_ms,
+                 "Threshold for storage plugins to log slow remote requests (<0 disables)")
+      ->default_val(log.slow_storage_ms);
+  app.add_option("--log.rate-limit-ms", log.rate_limit_ms,
+                 "Minimum gap between two lines of one repeating warning; the next line counts those held back")
+      ->default_val(log.rate_limit_ms);
+  app.add_option("--log.summary-interval-s", log.summary_interval_s,
+                 "Seconds between node activity summary lines (0 disables)")
+      ->default_val(log.summary_interval_s);
   app.add_option("--query-cache-bytes", queryCacheBytes,
                  "Per-shard query cache payload budget (0 disables it)")
       ->transform(CLI::AsSizeValue(false))
@@ -369,8 +389,16 @@ void LuxirConfig::resolveRamBudgets() {
   }
 }
 
+void LogConfig::validate() const {
+  if (format != "text" && format != "json") throw std::invalid_argument("log.format must be text or json");
+  if (slow_search_source_chars < 0) throw std::invalid_argument("log.slow-search-source-chars must not be negative");
+  if (rate_limit_ms < 0) throw std::invalid_argument("log.rate-limit-ms must not be negative");
+  if (summary_interval_s < 0) throw std::invalid_argument("log.summary-interval-s must not be negative");
+}
+
 void LuxirConfig::normalize() {
   if (!node.id.empty()) node.validate();
+  log.validate();
   replication.validate();
   resolveRamBudgets();
 
@@ -378,11 +406,11 @@ void LuxirConfig::normalize() {
   // half of it.  Warned here rather than in resolveRamBudgets(), which runs
   // again per node and must stay quiet on repeat.
   if (max_ram_mb > 0 && index.max_ram_mb > max_ram_mb) {
-    spdlog::warn("indexing.max-ram-mb={} exceeds the node budget max-ram-mb={}",
+    LOG_WARN("indexing.max-ram-mb={} exceeds the node budget max-ram-mb={}",
                  index.max_ram_mb, max_ram_mb);
   }
   if (index.max_ram_mb > 0 && index.max_ram_mb < index.max_inverter_ram_mb) {
-    spdlog::warn("indexing.max-ram-mb={} is below indexing.max-inverter-ram-mb={}: one inverter "
+    LOG_WARN("indexing.max-ram-mb={} is below indexing.max-inverter-ram-mb={}: one inverter "
                  "can fill the whole shared budget", index.max_ram_mb, index.max_inverter_ram_mb);
   }
 
@@ -390,14 +418,14 @@ void LuxirConfig::normalize() {
   if (server.grpc.port < 0) server.grpc.port = server.http.port + 1;
 
   if (store.backend == "ram" && store.data_dir != "luxir_data") {
-    spdlog::warn("store.data-dir is ignored when store.backend=ram");
+    LOG_WARN("store.data-dir is ignored when store.backend=ram");
   }
 
   // Only an explicit value can be over the pool's addressability; the derived
   // one is already clamped (MemPool itself throws at the hard ceiling if a
   // pathological batch overshoots even the headroom the clamp leaves).
   if (index.max_inverter_ram_mb > IndexConfig::MAX_INVERTER_RAM_CAP_MB) {
-    spdlog::warn("indexing.max-inverter-ram-mb={} exceeds the inverter pool's addressability; clamping to {}",
+    LOG_WARN("indexing.max-inverter-ram-mb={} exceeds the inverter pool's addressability; clamping to {}",
                  index.max_inverter_ram_mb, IndexConfig::MAX_INVERTER_RAM_CAP_MB);
     index.max_inverter_ram_mb = IndexConfig::MAX_INVERTER_RAM_CAP_MB;
   }
@@ -412,6 +440,13 @@ void LuxirConfig::apply() const {
   LoadRegistry::enabled.store(search.fanout_grain_us >= 1, std::memory_order_relaxed);
   auto level = spdlog::level::from_str(log_level);
   spdlog::set_level(level);
+  logs::setFormat(log.format);
+  auto& settings = logs::settings();
+  settings.slowSearchMs = log.slow_search_ms;
+  settings.slowSearchSourceChars = log.slow_search_source_chars;
+  settings.slowIndexMs = log.slow_index_ms;
+  settings.slowStorageMs = log.slow_storage_ms;
+  settings.rateLimitMs = log.rate_limit_ms;
 }
 
 } // namespace luxir

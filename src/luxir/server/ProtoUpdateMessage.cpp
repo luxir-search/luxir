@@ -123,8 +123,8 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       failed++;
       ErrorInfo info = currentExceptionInfo(ErrorKind::INTERNAL);
       if (info.kind == ErrorKind::INTERNAL) {
-        LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, docId(doc, fieldMap),
-                  info.message);
+        LOG_LIMITED(LOG_ERROR, "document {} (id '{}') failed to index: {}", docIndex, docId(doc, fieldMap),
+                    info.message);
       }
       auto* response = msg.getResponse();
       auto& err = msg.addError();
@@ -174,11 +174,12 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
     ProtoUpdateMessage& msg;
     Metrics& node;
     CollectionMetrics& collection;
+    const std::string& collectionName;
     bool active = !msg.req->docs.empty() || !msg.req->delete_ids.empty();
     int exceptions = std::uncaught_exceptions();
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-    Count(ProtoUpdateMessage& msg, Metrics& node, CollectionMetrics& collection)
-        : msg(msg), node(node), collection(collection) {
+    Count(ProtoUpdateMessage& msg, Metrics& node, CollectionMetrics& collection, const std::string& collectionName)
+        : msg(msg), node(node), collection(collection), collectionName(collectionName) {
       if (active) node.start(metricActivity(MetricStage::INDEX_BATCH));
     }
     ~Count() {
@@ -201,8 +202,24 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
         node.documentError(error.error ? (ErrorKind)error.error->kind : ErrorKind::UNKNOWN);
       }
       collection.batch(outcome, nanos, accepted, rejected, deleteIds);
+      if (rejected) {
+        std::string_view code, message;
+        for (const auto& error : errors) {
+          if (error.error) {
+            code = error.error->code;
+            message = error.error->message;
+            break;
+          }
+        }
+        LOG_LIMITED(LOG_WARN, "index batch for '{}' rejected {} of {} documents (first: {} {})", collectionName,
+                    rejected, req.docs.size(), code, message);
+      }
+      if (logs::slow(logs::settings().slowIndexMs, nanos)) {
+        LOG_INFO("slow index batch: collection='{}' took={:.0f}ms docs={} accepted={} rejected={} delete_ids={}",
+                 collectionName, logs::millis(nanos), req.docs.size(), accepted, rejected, req.delete_ids.size());
+      }
     }
-  } count{*this, *iw.metrics, *iw.collectionMetrics};
+  } count{*this, *iw.metrics, *iw.collectionMetrics, iw.logName};
   validateFieldMap(*req);
 
   // Check if we need an inverter for either deletes or adds

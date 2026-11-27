@@ -6,6 +6,7 @@
 #include "luxir/store/Manifest.h"
 #include "luxir/util/ApiError.h"
 #include "luxir/util/Signal.h"
+#include "luxir/util/log.h"
 
 namespace luxir {
 
@@ -18,10 +19,16 @@ void ReaderManager::throwClosed() {
 
 std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot, Directory& source) {
   MetricWork metric(*metrics, MetricStage::READER_REFRESH);
+  auto started = std::chrono::steady_clock::now();
   std::lock_guard lock(indexReaderMutex);
   checkOpen();
   auto previous = indexReader.load();
-  return std::make_shared<IndexReader>(source, snapshot, previous.get(), filterCache);
+  auto prepared = std::make_shared<IndexReader>(source, snapshot, previous.get(), filterCache);
+  if (auto nanos = nanosSince(started); logs::slow(logs::settings().slowIndexMs, nanos)) {
+    LOG_INFO("slow reader prepare: collection='{}' took={:.0f}ms segments={}", logName, logs::millis(nanos),
+             prepared->segments().size());
+  }
+  return prepared;
 }
 
 void ReaderManager::publishReader(std::shared_ptr<IndexReader> reader) {
@@ -79,6 +86,7 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
   reader = indexReader.load(std::memory_order_acquire);
   if (!reader || stale(*reader) || schemaChanged(*reader)) {
     MetricWork metric(*metrics, MetricStage::READER_REFRESH);
+    auto started = std::chrono::steady_clock::now();
     auto openPublished = [&](IndexReader* previous) {
       for (;;) {
         checkOpen();
@@ -98,6 +106,11 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
     while (published.load()->schema->gen_ > opened->schema()->gen_) opened = openPublished(opened.get());
     reader = std::move(opened);
     publishReader(reader);
+    // Searches that need the new reader wait on this reopen.
+    if (auto nanos = nanosSince(started); logs::slow(logs::settings().slowIndexMs, nanos)) {
+      LOG_INFO("slow reader refresh: collection='{}' took={:.0f}ms segments={} (searches needing it waited)",
+               logName, logs::millis(nanos), reader->segments().size());
+    }
   }
   return reader;
 }

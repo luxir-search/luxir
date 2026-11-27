@@ -36,6 +36,16 @@ namespace luxir {
 
 namespace {
 
+// A segment's on-disk size, for log lines: base files, live docs and overlays.
+uint64_t segmentBytes(const SegInfo& seg) {
+  uint64_t bytes = seg.liveFile ? seg.liveFile->size : 0;
+  for (const auto& file : seg.baseFiles) bytes += file.size;
+  for (const auto& overlay : seg.auxOverlays) {
+    for (const auto& file : overlay.files) bytes += file.size;
+  }
+  return bytes;
+}
+
 void setForceMergeError(UpdateMessage& origin, std::string_view detail) {
   std::string message =
     "Data commit succeeded, but the merged layout was not durably published: ";
@@ -385,6 +395,8 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       bool dispatchCompletion = true;
       // Delete passes share this serial node with commits, not their metrics.
       MetricScope metric(*metrics, metricActivity(msg->applyOnly ? MetricStage::DELETE_PASS : MetricStage::COMMIT));
+      auto started = std::chrono::steady_clock::now();
+      bool applyOnly = msg->applyOnly;
       // Read before the body: a max_segments commit hands msg to the force
       // merge, which may complete and free it concurrently.
       bool forceIntent = !msg->applyOnly && !msg->publishOnly && msg->maxSegments > 0;
@@ -409,7 +421,12 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
         _resumePolicyMergesLocked();
       }
 
-      metric.finish(dispatchCompletion && msg->result.errored() ? MetricOutcome::ERROR : MetricOutcome::OK);
+      bool errored = dispatchCompletion && msg->result.errored();
+      metric.finish(errored ? MetricOutcome::ERROR : MetricOutcome::OK);
+      if (auto nanos = nanosSince(started); logs::slow(logs::settings().slowIndexMs, nanos)) {
+        LOG_INFO("slow {}: collection='{}' took={:.0f}ms errored={}", applyOnly ? "delete pass" : "commit",
+                 logName, logs::millis(nanos), errored);
+      }
       if (dispatchCompletion) {
         try {
           msg->done(*this);
@@ -956,8 +973,15 @@ void IndexWriter::pressureShedIdleLocked() {
       }
     }
     if (victim == nullptr) victim = deferred;
+    size_t victimBytes = victim ? victim->memSize() : 0;
     if (victim == nullptr || !startIdleFlushLocked(*victim, true)) return;
     INDEX_DEBUG("indexing RAM pressure, flushing idle inverter={}", *victim);
+    LOG_LIMITED(LOG_INFO, "indexing RAM pressure: flushing an idle buffer of '{}' early ({:.1f}MiB); "
+                "budget reserved {:.0f} of {:.0f}MiB, draining {:.0f}MiB, merge demand {:.0f}MiB", logName,
+                logs::mib(victimBytes), logs::mib((uint64_t)std::max<int64_t>(0, indexRamBudget->reservedBytes())),
+                logs::mib((uint64_t)std::max<int64_t>(0, indexRamBudget->totalBytes())),
+                logs::mib((uint64_t)std::max<int64_t>(0, indexRamBudget->drainingBytesCount())),
+                logs::mib((uint64_t)std::max<int64_t>(0, indexRamBudget->pendingMergeDemandBytes())));
   }
 }
 
@@ -1504,6 +1528,7 @@ void IndexWriter::deletePassRetryFired() {
 // This is called in parallel.  The inverter will be deleted.
 void IndexWriter::segmentFlushBody(Inverter& inverter) {
   MetricWork metric(*metrics, MetricStage::FLUSH);
+  auto flushStarted = std::chrono::steady_clock::now();
   INDEX_DEBUG("segmentFlushBody: inverter={} commitInfo={} msg.leftToFlush={}", inverter,
               (void*)inverter.commitInfo,
               inverter.commitInfo == nullptr ? -1 : inverter.commitInfo->leftToFlush);
@@ -1570,6 +1595,11 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     } else {
       segInfo->liveDocs = segInfo->maxDoc;
     }
+  }
+  if (auto nanos = nanosSince(flushStarted); logs::slow(logs::settings().slowIndexMs, nanos)) {
+    LOG_INFO("slow flush: collection='{}' seg={} docs={} size={:.1f}MiB took={:.0f}ms aborted={}", logName,
+             segInfo ? segInfo->name() : std::string("-"), segInfo ? segInfo->maxDoc : 0,
+             logs::mib(segInfo ? segmentBytes(*segInfo) : 0), logs::millis(nanos), aborted);
   }
 
   // A segment born with no live docs (every doc failed and was marked deleted)
@@ -2347,7 +2377,12 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
                           schema, overlayGen, writerEpoch, indexRamBudget);
     std::vector<std::string> oneSelector{overlayName};
     MetricWork metric(*metrics, MetricStage::VECTOR_BUILD);
+    auto started = std::chrono::steady_clock::now();
     auto newlyBuilt = vb.build(oneSelector, existingNames, outFiles, buildSite);
+    if (auto nanos = nanosSince(started); logs::slow(logs::settings().slowIndexMs, nanos)) {
+      LOG_INFO("slow vector build: collection='{}' seg={} overlay='{}' docs={} took={:.0f}ms built={}", logName,
+               seg.name(), overlayName, seg.maxDoc, logs::millis(nanos), newlyBuilt.size());
+    }
     for (auto& info : newlyBuilt) {
       existingNames.emplace(info.name);
       built.push_back(std::move(info));
@@ -2755,6 +2790,9 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   // Started once there are sources to merge (or on a failure), so a pass that
   // finds nothing to merge does not count as a merge.
   std::optional<MetricWork> metric;
+  std::chrono::steady_clock::time_point mergeStarted;
+  uint64_t mergeInputDocs = 0, mergeInputBytes = 0, mergeOutputDocs = 0, mergeOutputBytes = 0;
+  std::string mergeOutputName = "-";
   auto metricFailed = [&] {
     if (!metric) metric.emplace(*metrics, MetricStage::MERGE);
     metric->failed = true;
@@ -2987,6 +3025,11 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       INDEX_DEBUG("mergeSegmentsBody: only one mergeable segment at level {}; skipping", msg.mergeLevel);
     } else {
       metric.emplace(*metrics, MetricStage::MERGE);
+      mergeStarted = std::chrono::steady_clock::now();
+      for (auto* seg : segs) {
+        mergeInputDocs += (uint64_t)seg->maxDoc;
+        mergeInputBytes += segmentBytes(*seg);
+      }
       sourceSegIds.reserve(segs.size());
       for (auto* seg : segs) {
         sourceSegIds.push_back(seg->segId);
@@ -3161,6 +3204,9 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
             if (overlay.kind == VectorIndexBuilder::KIND) activeVectorOverlayNames.emplace(overlay.name);
           }
         }
+        mergeOutputDocs = (uint64_t)newSegInfo->liveDocs;
+        mergeOutputBytes = segmentBytes(*newSegInfo);
+        mergeOutputName = newSegInfo->name();
 
         size_t personalDeleteCount = newSegInfo->personalDeletes.size();
         for (auto segInfo : segs) {
@@ -3218,6 +3264,12 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         break;
       } // end swap retry
       Signal::emit("mergeSwap", (void*)outputSegId);
+      if (auto nanos = nanosSince(mergeStarted); logs::slow(logs::settings().slowIndexMs, nanos)) {
+        LOG_INFO("slow merge: collection='{}' sources={} input_docs={} input={:.1f}MiB -> seg={} live_docs={} "
+                 "output={:.1f}MiB took={:.0f}ms forced={}", logName, segs.size(), mergeInputDocs,
+                 logs::mib(mergeInputBytes), mergeOutputName, mergeOutputDocs,
+                 logs::mib(mergeOutputBytes), logs::millis(nanos), clientOrigin);
+      }
     }
   } catch (const std::exception& e) {
     mergeFailed = true;

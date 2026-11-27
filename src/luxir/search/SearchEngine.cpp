@@ -109,10 +109,13 @@ void SearchEngine::submitBody(SearchRequest& req) {
       try { req.tg->join(); } catch (...) {}
     }
     ErrorInfo info = classifyException(e, fallback);
+    // Rejections are the client's doing and can arrive in storms: rate-limit them.
     if (info.kind == ErrorKind::INTERNAL) {
-      LOG_ERROR("Search request failed: {}", info.message);
+      LOG_ERROR("Search request failed: tenant='{}' collection='{}' request_id='{}': {}", req.tenant,
+                req.proto.collection, req.proto.request_id, info.message);
     } else {
-      LOG_WARN("Search request rejected ({}): {}", info.code, info.message);
+      LOG_LIMITED(LOG_WARN, "Search request rejected ({}): tenant='{}' collection='{}' request_id='{}': {}",
+                  info.code, req.tenant, req.proto.collection, req.proto.request_id, info.message);
     }
     req.setError(info);
   }

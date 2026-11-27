@@ -12,6 +12,7 @@
 #include "luxir/api/build.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/search/ops/SearchOp.h"
+#include "luxir/util/log.h"
 
 namespace luxir {
 
@@ -150,6 +151,38 @@ void SearchRequest::count(MetricOutcome outcome, std::chrono::steady_clock::time
   if (collectionMetrics) collectionMetrics->search(outcome, nanos);
 }
 
+// One WARN line for a search slower than --log.slow-search-ms: where the time
+// went (queued before dispatch vs. running) and the request itself, truncated
+// to --log.slow-search-source-chars.
+void SearchRequest::logIfSlow(std::chrono::steady_clock::time_point end) {
+  auto& settings = logs::settings();
+  uint64_t nanos = nanosSince(startTime, end);
+  if (!logs::slow(settings.slowSearchMs, nanos)) return;
+  uint64_t queuedNanos = counting && submitted > startTime ? nanosSince(startTime, submitted) : 0;
+  std::string ops;
+  for (const auto& entry : proto.ops) {
+    if (!ops.empty()) ops += ',';
+    ops += entry.first;
+  }
+  std::string source;
+  if (auto limit = settings.slowSearchSourceChars.load(std::memory_order_relaxed); limit > 0) {
+    std::string json;
+    if (api::write_json(proto, json)) {
+      if (json.size() > (size_t)limit) {
+        json.resize((size_t)limit);
+        json += "...";
+      }
+      source = std::move(json);
+    }
+  }
+  const auto& error = lastResponse->proto.error;
+  LOG_WARN("slow search: tenant='{}' collection='{}' request_id='{}' took={:.1f}ms queued={:.1f}ms "
+           "outcome={} segments={} max_parallel={} ops=[{}] warnings={} request={}",
+           tenant, proto.collection, proto.request_id, logs::millis(nanos), logs::millis(queuedNanos),
+           error ? std::string(error->code) : std::string("ok"), reader ? reader->segments().size() : 0,
+           maxParallel, ops, warnings.size(), source);
+}
+
 void SearchRequest::replyCallback(SearchResponse& response) {
   bool last = response.last;
   // if this response used a different Arena, release it.
@@ -204,6 +237,7 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
     lastResponse->proto.took_us = microsSince(startTime, end);
     if (!warnings.empty()) engine.metrics().add(MetricCounter::SEARCH_WARNINGS);
     if (counting) count(lastResponse->proto.error ? MetricOutcome::ERROR : MetricOutcome::OK, end);
+    logIfSlow(end);
     reply(*lastResponse);  // may delete *this*; nothing after this call
   }
 }
