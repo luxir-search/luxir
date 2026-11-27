@@ -8,6 +8,7 @@
 #include <memory_resource>
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <string>
 
 #include "luxir/index/UpdateMessage.h"
@@ -54,9 +55,12 @@ public:
   // The collection the transport resolved and submitted to; replica waits
   // target it rather than re-resolving req->collection.
   CollectionId target;
+  // The clock NOW-relative date values resolve against; the current time
+  // unless the caller supplies one.
   const int64_t dateMathNowEpochMillis;
-  explicit ProtoUpdateMessage(const RequestProto* req)
-    : req(req), dateMathNowEpochMillis(currentEpochMillis()) {
+  explicit ProtoUpdateMessage(const RequestProto* req,
+                              std::optional<int64_t> forcedDateMathNowEpochMillis = std::nullopt)
+    : req(req), dateMathNowEpochMillis(forcedDateMathNowEpochMillis.value_or(currentEpochMillis())) {
     if (req->commit.has_value()) {
       commit = COMMIT;
       const auto& params = *req->commit;

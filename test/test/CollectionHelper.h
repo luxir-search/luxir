@@ -14,6 +14,7 @@
 #include "LocalReq.h"
 #include <initializer_list>
 #include <memory_resource>
+#include <optional>
 
 #include "luxir/util/thread.h"
 
@@ -80,15 +81,15 @@ private:
 
   // Run a fully-built (arena-backed) concrete UpdateRequest synchronously. `request` and its
   // backing arena must outlive this call (they do: the caller holds them on the stack).
-  IndexResult runSync(const luxir::api::UpdateRequest& request) {
+  IndexResult runSync(const luxir::api::UpdateRequest& request, std::optional<int64_t> dateMathNow = std::nullopt) {
     auto writer = collection().getShard()->getIndexWriter();
 
     class BlockingProtoUpdateMessage : public ProtoUpdateMessage {
     public:
       Blocker blocker;
       IndexResult* out;
-      BlockingProtoUpdateMessage(const RequestProto* req, IndexResult* out)
-        : ProtoUpdateMessage(req), out(out) {}
+      BlockingProtoUpdateMessage(const RequestProto* req, IndexResult* out, std::optional<int64_t> dateMathNow)
+        : ProtoUpdateMessage(req, dateMathNow), out(out) {}
       void done(IndexWriter& iw) override {
         unused(iw);
         fillResult(*this, *out);
@@ -97,7 +98,7 @@ private:
     };
 
     IndexResult result;
-    BlockingProtoUpdateMessage msg(&request, &result);
+    BlockingProtoUpdateMessage msg(&request, &result, dateMathNow);
     bool ok = writer->submitUpdate(&msg);
     assert(ok);
     unused(ok);
@@ -276,7 +277,10 @@ public:
 
   // Submit a fully-built UpdateBuilder (for cases the convenience methods don't cover:
   // all_or_none, return_ids, mixed adds + deletes); build docs with builder.add().
-  IndexResult submit(UpdateBuilder& builder) { return runSync(builder.finish()); }
+  // dateMathNow, when set, is the clock NOW-relative dates resolve against.
+  IndexResult submit(UpdateBuilder& builder, std::optional<int64_t> dateMathNow = std::nullopt) {
+    return runSync(builder.finish(), dateMathNow);
+  }
 
   // Distinct names keep a single document's braced fields unambiguous.
   // Consume initializer lists synchronously, before their backing array expires.
