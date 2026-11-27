@@ -487,7 +487,11 @@ public:
     int none = -1;
     metricErrorKind.compare_exchange_strong(none, (int)kind, std::memory_order_relaxed);
   }
-  void metricPause() { metrics->add(MetricTransportCounter::STREAM_PAUSES, MetricTransport::HTTP); }
+  void metricPause() {
+    metrics->add(MetricTransportCounter::STREAM_PAUSES, MetricTransport::HTTP);
+    LOG_LIMITED(LOG_INFO, "HTTP response stream paused: a client reads slower than its results are produced "
+                "(buffer full at server.stream-buffer-bytes)");
+  }
 
   void run();  // defined after HttpSessionRegistry (touches the registry)
 

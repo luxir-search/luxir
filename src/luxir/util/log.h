@@ -12,6 +12,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <climits>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,6 +39,79 @@ namespace luxir {
 #define LOG_TRACE SPDLOG_TRACE
 #define LOG_WARN SPDLOG_WARN
 #define LOG_ERROR SPDLOG_ERROR
+
+namespace luxir::logs {
+
+// Operational logging knobs (--log.*), set by LuxirConfig::apply() and read
+// lock-free on hot paths, plugins included. A negative threshold disables its
+// lines; zero logs every occurrence.
+struct Settings {
+  std::atomic<int64_t> slowSearchMs{1000};           // whole search, submit to final response
+  std::atomic<int64_t> slowSearchSourceChars{1024};  // request JSON in a slow-search line; 0 omits it
+  std::atomic<int64_t> slowIndexMs{5000};            // flush, commit, delete pass, merge, vector build, reader refresh
+  std::atomic<int64_t> slowStorageMs{1000};          // one remote storage request; read by storage plugins
+  std::atomic<int64_t> rateLimitMs{10000};           // gap between two lines of one rate-limited call site
+};
+
+inline Settings& settings() {
+  static Settings instance;
+  return instance;
+}
+
+inline bool slow(const std::atomic<int64_t>& thresholdMs, uint64_t nanos) {
+  int64_t ms = thresholdMs.load(std::memory_order_relaxed);
+  return ms >= 0 && nanos >= (uint64_t)ms * 1'000'000;
+}
+
+inline double millis(uint64_t nanos) { return (double)nanos / 1e6; }
+inline double mib(uint64_t bytes) { return (double)bytes / (1024.0 * 1024.0); }
+
+// Lets one call site log at most once per settings().rateLimitMs and counts
+// the occurrences it held back, so a storm (a misbehaving client, a throttling
+// remote store) leaves a trail without burying everything else.
+class RateLimit {
+  std::atomic<int64_t> next{INT64_MIN};  // steady-clock ms before which lines are held back
+  std::atomic<uint64_t> held{0};
+
+public:
+  // True when this occurrence should be logged; `skipped` receives how many
+  // were held back since the previous logged one.
+  bool allow(uint64_t& skipped) noexcept {
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t due = next.load(std::memory_order_relaxed);
+    if (now < due || !next.compare_exchange_strong(due, now + settings().rateLimitMs.load(std::memory_order_relaxed),
+                                                   std::memory_order_relaxed)) {
+      held.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    skipped = held.exchange(0, std::memory_order_relaxed);
+    return true;
+  }
+};
+
+// Line formats for the default logger: "text" (one human-readable line) or
+// "json" (one JSON object per line). Timestamps are UTC, ISO 8601 with
+// microseconds. Throws std::invalid_argument for any other name.
+void setFormat(std::string_view format);
+
+// Appends `text` to `out` escaped for a JSON string body.
+void appendJsonEscaped(std::string& out, std::string_view text);
+
+} // namespace luxir::logs
+
+// LOG_* at most once per rate-limit interval from this call site; a line that
+// follows held-back ones says how many. The format must be a string literal.
+#define LOG_LIMITED(LOG_MACRO, fmt_, ...)                                                          \
+  do {                                                                                              \
+    static ::luxir::logs::RateLimit luxirLogLimit_;                                                \
+    uint64_t luxirLogSkipped_ = 0;                                                                  \
+    if (luxirLogLimit_.allow(luxirLogSkipped_)) {                                                   \
+      if (luxirLogSkipped_) LOG_MACRO(fmt_ " (+{} similar held back)" __VA_OPT__(,) __VA_ARGS__,   \
+                                      luxirLogSkipped_);                                            \
+      else LOG_MACRO(fmt_ __VA_OPT__(,) __VA_ARGS__);                                               \
+    }                                                                                               \
+  } while (0)
 
 namespace luxir {
 

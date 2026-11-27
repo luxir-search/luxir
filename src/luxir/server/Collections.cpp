@@ -329,6 +329,7 @@ std::shared_ptr<Collection> Collections::makeCollection(const CollectionId& name
       FilterCacheConfig{.maxBytes = bytes}, CommitSnapshotRegistry::Clock::now, schemas, name.tenant,
       factory->retention);
   col->shard->getReaderManager().metrics = metrics;
+  col->shard->getReaderManager().logName = name.label();
   const auto& policy = config.replication;
   col->shard->snapshots->setPolicy({std::chrono::milliseconds(policy.pin_idle_timeout_ms), policy.pin_retained_bytes});
   return col;
@@ -415,6 +416,7 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   col->shard->iw->onSuperseded = storage.supersededLogger(selected);
   col->shard->iw->metrics = metrics;
   col->shard->iw->collectionMetrics = col->metrics;
+  col->shard->iw->logName = name.label();
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
   col->shard->iw->idFilterOptions = idFilterOptions(config.index);

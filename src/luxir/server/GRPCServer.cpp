@@ -456,6 +456,8 @@ public:
       const std::lock_guard<std::mutex> lock(mutex);
       if (!errored && queuedBytes > lowWater) {
         server.getLuxirNode().metrics->add(MetricTransportCounter::STREAM_PAUSES, MetricTransport::GRPC);
+        LOG_LIMITED(LOG_INFO, "gRPC response stream paused: a client reads slower than its results are produced "
+                    "(buffer full at server.stream-buffer-bytes)");
         drainWaiters.push_back(std::move(resume));
         return;
       }

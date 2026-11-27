@@ -376,7 +376,51 @@ Set log verbosity with:
 ```
 
 Valid spdlog levels include `trace`, `debug`, `info`, `warn`, `error`, and
-`critical`. Startup logs include the loaded time-zone database version.
+`critical` (release builds compile `trace` out). Startup logs include the
+loaded time-zone database version and the logging settings.
+
+### Log format
+
+Each line starts with a UTC timestamp in ISO 8601 with microseconds, the
+level, the thread id and the source location:
+
+```text
+2026-11-12T18:04:31.120488Z warning T4182 SearchRequest.cpp:180 slow search: tenant='t0' collection='logs' ...
+```
+
+`--log.format=json` writes one JSON object per line instead, for log
+collectors:
+
+```json
+{"ts":"2026-11-12T18:04:31.120488Z","level":"warning","thread":4182,"src":"SearchRequest.cpp:180","msg":"slow search: ..."}
+```
+
+`--log.level` is an alias of `--log-level`.
+
+### Operational logs
+
+These lines are meant for diagnosing a slow or struggling node. Thresholds are
+in milliseconds; a negative value disables a line and `0` logs every
+occurrence.
+
+| Option | Default | Lines |
+|---|---|---|
+| `--log.slow-search-ms` | 1000 | `slow search` (WARN): tenant, collection, `request_id`, total and queued time, outcome, segments, op names, warnings, and the request JSON |
+| `--log.slow-search-source-chars` | 1024 | Request JSON kept in a slow-search line; `0` omits it (requests can carry user data) |
+| `--log.slow-index-ms` | 5000 | `slow index batch`, `slow flush`, `slow commit`, `slow delete pass`, `slow merge`, `slow vector build`, `slow reader refresh` / `prepare` (INFO), with collection, sizes and duration |
+| `--log.slow-storage-ms` | 1000 | Threshold for storage plugins (a remote directory implementation) to log slow requests; the core engine does not log against it |
+| `--log.summary-interval-s` | 60 | `node summary` (INFO): search rate, mean and p50/p99 bucket, errors; ingest rate and rejections; background stage counts and mean times; indexing RAM, RSS, PSI `some avg10` for CPU, I/O and memory, and cgroup CPU throttling over the interval. `0` disables it |
+| `--log.rate-limit-ms` | 10000 | Minimum gap between two lines of one repeating warning. The next line reports how many were held back (`(+N similar held back)`) |
+
+Rate-limited lines: search rejections, update rejections, per-document engine
+faults, index batches with rejected documents (with the first error), indexing
+RAM pressure flushes, and HTTP/gRPC response stream pauses (a slow client).
+Plugins can rate-limit their own lines with `LOG_LIMITED` and read the
+thresholds from `logs::settings()` (`src/luxir/util/log.h`).
+
+Read `node summary` with the host's metrics: rising `psi_some_avg10 io` with
+flat search volume points at the disk's throughput or IOPS limits, and
+`cpu_throttled` and `psi cpu` at the container's CPU limit or CPU credits.
 
 ## Stats and monitoring
 

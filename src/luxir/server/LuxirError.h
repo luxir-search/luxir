@@ -145,7 +145,7 @@ public:
   LuxirError* setException(const std::exception& e, ErrorKind fallback = ErrorKind::INTERNAL) {
     auto err = std::make_unique<LuxirError>(e, fallback);
     if (dynamic_cast<const ApiError*>(&e) != nullptr) {
-      LOG_WARN("update rejected: {}", err->what());
+      LOG_LIMITED(LOG_WARN, "update rejected: {}", err->what());
     } else {
       LOG_ERROR("update failed: {}\nStack trace:\n{}", err->what(), getStackTrace());
     }

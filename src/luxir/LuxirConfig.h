@@ -229,6 +229,19 @@ struct ReplicationConfig {
   void validate() const;
 };
 
+struct LogConfig {
+  std::string format = "text";  // text | json
+  // Thresholds for the slow-operation lines; <0 disables one, 0 logs every
+  // occurrence. Copied into logs::settings() by LuxirConfig::apply().
+  int64_t slow_search_ms = 1000;
+  int64_t slow_search_source_chars = 1024;  // request JSON in a slow-search line; 0 omits it
+  int64_t slow_index_ms = 5000;
+  int64_t slow_storage_ms = 1000;
+  int64_t rate_limit_ms = 10000;  // gap between two lines of one rate-limited call site
+  int64_t summary_interval_s = 60;  // node activity summary line; 0 disables it
+  void validate() const;
+};
+
 struct LuxirConfig {
   NodeConfig node;
   ReplicationConfig replication;
@@ -247,6 +260,7 @@ struct LuxirConfig {
   int64_t max_ram_mb = -1;
 
   std::string log_level = "info";
+  LogConfig log;
   size_t queryCacheBytes = 64ULL * 1024 * 1024;
   ServerConfig server;
   StoreConfig store;
@@ -266,7 +280,7 @@ struct LuxirConfig {
   /// Normalize and validate config after parsing.
   void normalize();
 
-  /// Apply non-node settings (e.g. spdlog level). Call after parse.
+  /// Apply non-node settings (spdlog level and format, logs::settings()). Call after parse.
   void apply() const;
 };
 

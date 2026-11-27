@@ -20,6 +20,7 @@
 #include "luxir/util/thread.h"
 #include "luxir/server/GRPCServer.h"
 #include "luxir/server/HttpServer.h"
+#include "luxir/server/NodeSummary.h"
 #include "luxir/server/ReplicationFollower.h"
 #include "luxir/LuxirConfig.h"
 #include <CLI/CLI.hpp>
@@ -77,7 +78,7 @@ public:
 } // namespace
 
 int luxir_main(int argc, char** argv, void (*addPlugins)(PluginRegistry&)) {
-  spdlog::set_pattern("%L %H:%M:%S.%f T%t %s:%# %v");
+  logs::setFormat("text");  // until config.apply() sets the configured one
 
   CLI::App app{"Luxir search engine"};
   const auto& build = buildInfo();
@@ -165,15 +166,21 @@ int luxir_main(int argc, char** argv, void (*addPlugins)(PluginRegistry&)) {
            config.max_ram_mb, config.index.max_ram_mb, config.index.max_inverter_ram_mb,
            systemRamBytes() / (1024 * 1024));
 
-  LOG_INFO("Logging: compile-time={}, runtime={}",
+  LOG_INFO("Logging: compile-time={}, runtime={}, format={}, slow-search-ms={}, slow-index-ms={}, "
+           "slow-storage-ms={}, rate-limit-ms={}, summary-interval-s={}",
            spdlog::level::to_string_view((spdlog::level::level_enum)SPDLOG_ACTIVE_LEVEL),
-           spdlog::level::to_string_view(spdlog::get_level()));
+           spdlog::level::to_string_view(spdlog::get_level()), config.log.format, config.log.slow_search_ms,
+           config.log.slow_index_ms, config.log.slow_storage_ms, config.log.rate_limit_ms,
+           config.log.summary_interval_s);
 
   bool started = false;
   try {
     // Released by the first SIGTERM/SIGINT, or when gRPC run() returns early.
     std::binary_semaphore stop{0};
     LuxirNode node{config};
+    // Destroyed (and joined) before the node it reads.
+    std::optional<NodeSummary> summary;
+    if (config.log.summary_interval_s > 0) summary.emplace(node, std::chrono::seconds(config.log.summary_interval_s));
 
     // The HTTP/JSON server runs on its own connection-I/O shards and accept
     // thread; start it (non-blocking) before gRPC.
