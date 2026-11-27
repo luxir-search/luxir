@@ -169,6 +169,13 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
                 requestBounds, resource);
   dst.search_resource_exhausted = counter(MetricCounter::SEARCH_RESOURCE_EXHAUSTED);
   dst.search_warnings = counter(MetricCounter::SEARCH_WARNINGS);
+  dst.search_io_acquires = counter(MetricCounter::SEARCH_IO_ACQUIRES);
+  dst.search_io_acquired_bytes = counter(MetricCounter::SEARCH_IO_ACQUIRED_BYTES);
+  dst.search_io_requests = counter(MetricCounter::SEARCH_IO_REQUESTS);
+  dst.search_io_rounds = counter(MetricCounter::SEARCH_IO_ROUNDS);
+  dst.search_io_fetched_bytes = counter(MetricCounter::SEARCH_IO_FETCHED_BYTES);
+  dst.search_io_acquire_batches = counter(MetricCounter::SEARCH_IO_ACQUIRE_BATCHES);
+  dst.search_io_acquire_rounds = counter(MetricCounter::SEARCH_IO_ACQUIRE_ROUNDS);
   fillActivity(dst.index_batches, counts, metricActivity(MetricStage::INDEX_BATCH), resource);
   dst.documents_accepted = counter(MetricCounter::DOCUMENTS_ACCEPTED);
   dst.documents_rejected = counter(MetricCounter::DOCUMENTS_REJECTED);

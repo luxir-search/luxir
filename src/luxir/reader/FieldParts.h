@@ -21,6 +21,11 @@ namespace luxir::field_parts {
 // Zero marks an absent file. File 0's data ends at the catalog.
 using FileSizes = std::span<const uint64_t>;
 
+// A part at most this large is read whole rather than in pieces (a term
+// dictionary block by block, a run's docs term by term): on a backend where an
+// acquire is a request, its bytes cost less than another round.
+inline constexpr uint64_t WHOLE_READ_BYTES = 64 * 1024;
+
 // A byte range in one of the segment's files: everything needed to map or
 // range-read one piece of data.
 struct Slice {

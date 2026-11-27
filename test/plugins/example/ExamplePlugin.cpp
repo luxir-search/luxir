@@ -15,6 +15,7 @@
 #include "ExampleQuery.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/reader/ReaderErrors.h"
+#include "luxir/reader/TermMembership.h"
 #include "luxir/server/LuxirNode.h"
 #include "test/StrictStorage.h"
 
@@ -294,6 +295,79 @@ std::shared_ptr<AuxReader> openFieldList(std::span<const std::shared_ptr<InputFi
 
 }  // namespace
 
+namespace {
+
+std::atomic<int> probeBatches{0};
+
+// Claims every term with its prefix is absent from the covered fields, true or
+// not: the tests use it to show what pruning does with a proof. The proof
+// reads the overlay's own file, which must hold the byte it was built with.
+class AbsentPrefixOverlay final : public SegmentOverlayKind {
+  std::string prefix;
+
+public:
+  explicit AbsentPrefixOverlay(std::string prefix) : prefix(std::move(prefix)) {}
+  std::optional<SegmentOverlayOutput> build(const SegmentOverlayBuild& request) const override {
+    auto file = request.dir.createFile(request.fileName(0));
+    OutputStream os;
+    os.setFile(&*file);
+    os.write("-", 1);
+    os.close();
+    request.dir.finishFile(*file);
+    SegmentOverlayOutput output;
+    output.files.push_back(file->descriptor());
+    output.meta.assign((const std::byte*)prefix.data(), (const std::byte*)prefix.data() + prefix.size());
+    return output;
+  }
+};
+
+class AbsentPrefixReader final : public AuxReader, public TermMembership {
+  std::string name;
+  std::string prefix;
+  std::shared_ptr<InputFile> file;
+  mutable std::mutex mutex;
+  mutable HeldRange held;
+
+public:
+  AbsentPrefixReader(const api::AuxIndexInfo& info, std::shared_ptr<InputFile> file)
+      : AuxReader(info.gen, info.built_core_gen), name(info.name),
+        prefix((const char*)info.opaque_meta.data(), info.opaque_meta.size()), file(std::move(file)) {}
+  std::string_view getKind() const override { return "example_absent_prefix"; }
+  std::string_view getName() const override { return name; }
+  const TermMembership* termMembership() const noexcept override { return this; }
+  void acquireProbe(std::string_view, std::string_view, AcquireBatches& batches) const override {
+    {
+      std::lock_guard lock(mutex);
+      if (held.bytes().size() != 0) return;
+    }
+    probeBatches++;
+    ByteRange range{0, 1, ReadClass::METADATA};
+    batches.acquire(*file, std::span(&range, 1), [this](std::vector<HeldRange>&& holds) {
+      std::lock_guard lock(mutex);
+      held = std::move(holds.front());
+    });
+  }
+  bool provesAbsent(std::string_view, std::string_view term) const noexcept override {
+    try {
+      std::lock_guard lock(mutex);
+      if (held.bytes().size() == 0) held = file->acquire({0, 1, ReadClass::METADATA});
+      if (held.bytes().size() != 1 || held.bytes()[0] != '-') return false;  // the integrity check
+      return term.starts_with(prefix);
+    } catch (...) {
+      return false;
+    }
+  }
+  std::string_view label() const noexcept override { return "example absent prefix"; }
+};
+
+std::shared_ptr<AuxReader> openAbsentPrefix(std::span<const std::shared_ptr<InputFile>> files, const api::AuxIndexInfo& info) {
+  if (overlayOpenMode == 1) throw SegmentCorruptError("example_absent_prefix: invalid bytes");
+  if (overlayOpenMode == 2) throw std::runtime_error("example_absent_prefix: storage failure");
+  return std::make_shared<AbsentPrefixReader>(info, files.front());
+}
+
+}  // namespace
+
 // Test-only plugin that exercises the plugin framework: analysis components,
 // query types, search ops, HTTP routes, the node lifecycle, and storage
 // backends and layers.
@@ -408,11 +482,20 @@ public:
       .policy = OverlayPolicy::REQUIRED,
     });
 
+    r.segmentOverlays.add("example_absent_prefix", {
+      .maker = [](const SegmentOverlayContext& ctx) -> std::unique_ptr<SegmentOverlayKind> {
+        return std::make_unique<AbsentPrefixOverlay>(std::string(ctx.params.requireString("prefix")));
+      },
+      .open = openAbsentPrefix,
+      .termMembership = true,
+    });
+
     r.query.add("doc_ids", ::example::docIdsDef());
     r.query.add("field_value", ::example::fieldValueDef());
     r.query.add("field_value_alias", ::example::fieldValueDef());
     r.query.add("unscoped_value", ::example::unscopedDef());
     r.searchOps.add("sample_docs", ::example::makeSampleDocs);
+    r.searchOps.add("query_count", ::example::makeQueryCount);
     // Adds a "label" column holding the configured text to every emitted hit.
     r.hitDecorators.add("label", [](DecoratorContext&, const ParamReader& params) {
       struct Label : HitDecorator {
@@ -432,10 +515,15 @@ public:
       return label;
     });
     // A request-wide term summary, collected once during serial planning.
-    r.hitDecorators.add("ranking_terms", [](DecoratorContext& ctx, const ParamReader&) {
+    r.hitDecorators.add("ranking_terms", [](DecoratorContext&, const ParamReader&) {
       struct Terms : HitDecorator, QueryVisitor {
         std::string text;
         std::string_view columnName() const override { return "ranking_terms"; }
+        void bind(std::span<const QuerySource> sources) override {
+          for (const auto& source : sources) {
+            if (source.query) source.query->visit(*this, source.context);
+          }
+        }
         QueryVisitor* sub(Occur occur, const Query&) override {
           return occur == Occur::MUST || occur == Occur::SHOULD ? this : nullptr;
         }
@@ -454,11 +542,7 @@ public:
           }
         }
       };
-      auto terms = std::make_shared<Terms>();
-      for (const auto& source : ctx.queries) {
-        if (source.query) source.query->visit(*terms, source.context);
-      }
-      return terms;
+      return std::make_shared<Terms>();
     });
     r.sortKinds.add("abs_diff", ::example::makeAbsDiff);
     r.http.add("GET", "/_plugins/example/ping", [](HttpPluginRequest& request, HttpPluginResponse& response) {
@@ -484,6 +568,7 @@ public:
 
 // For the node-construction failure test.
 void exampleSetOverlayOpenMode(int mode) { luxir::example::overlayOpenMode = mode; }
+int exampleMembershipProbeBatches() { return luxir::example::probeBatches; }
 void exampleThrowOnNodeStateCreation(bool value) { luxir::example::ExamplePlugin::throwOnNodeStateCreation.store(value); }
 
 LUXIR_PLUGIN(example, luxir::example::ExamplePlugin)

@@ -200,6 +200,10 @@ struct SearchConfig {
   // reservation tails, is 158,536,389 bytes - so 160 MiB covers it.
   // Early-merge degradation is future work.
   size_t request_memory_max_bytes = 0;
+  // Bytes one request may declare ahead of its reads, across its rounds, on
+  // storage whose files do not hand out free views (DeclaredReads); what is
+  // left out is acquired on demand. Zero is unlimited.
+  uint64_t read_ahead_max_bytes = 256ULL << 20;
   // Term-dictionary expansion guards for prefix, wildcard, regex, string
   // range, and fuzzy queries (see MultiTermLimits). Zero is unlimited; a
   // request can never raise or disable them.

@@ -26,7 +26,7 @@ class TermsEnum {
   friend class DocsEnum;
   friend class ScanTermsEnum;
 
-  InputStream termsIS;  // Dictionary blocks for this field.
+  InputStream termsIS;  // The loaded term block.
   SegmentCore& segmentCore;
 
   const field_parts::Terms* termData;  // Null for a field without a dictionary.
@@ -106,6 +106,10 @@ class TermsEnum {
   bool postingsDecoded = false;
   bool metadataRunsParsed = false;
 
+  // The dictionary blocks when held whole, else null and each block is held
+  // on its own; see readsWhole().
+  mutable const char* dictionary = nullptr;
+
   // Dictionary routing data.
   const field_parts::Terms::BlockOffset* termBlockOffsets = nullptr;
   const char* trieBase = nullptr;  // Start of the trie bytes.
@@ -118,8 +122,17 @@ class TermsEnum {
   // Cached offsets within termsIS for the current run.
   int64_t runTermsBase = 0;
   int64_t runTermsEnd = 0;
+  // The current run's postings streams, held on first use.
   InputStream runDocs;
   InputStream runPositions;
+  bool runDocsHeld = false;
+  bool runPositionsHeld = false;
+  bool runDocsWhole = true;  // see termDocsPart()
+  // Blocks and term docs held one at a time so far. Past POINT_READS the
+  // enum is looking up many terms, and holds the dictionary and each run's
+  // docs whole instead, so its acquires stay bounded.
+  int32_t pointReads = 0;
+  bool wholeReads = false;
 
 public:
   struct BlockEstimate {
@@ -158,24 +171,87 @@ public:
       : segmentCore(reader.core()), termData(fieldInfo.terms()), totals(fieldInfo.indexedTotals()),
         flags(fieldInfo.flags), currTerm(pool.alloc(TERM_BUFFER_BYTES), 0) {
     if (!termData) return;
-    auto blockOffsets = fieldInfo.termBlockOffsets();
-    auto trie = field_parts::termTrie(blockOffsets, termData->trieBytes);
+    auto offsetsBytes = fieldInfo.termBlockOffsets().bytes;
     // The blocks are data; the offsets and trie that route to them are
-    // metadata and follow the blocks, so the 16 bytes past a hold cover the
-    // decoders' over-read.
-    termsIS = streamThrough(termData->dictionaryBlocks());
-    auto navigation = segmentCore.slice(
-        {blockOffsets.location, trie.end().offset() - blockOffsets.location.offset()}, ReadClass::METADATA);
+    // metadata. A lookup holds the routing data and then only the block it
+    // lands in, unless the dictionary is read whole.
+    auto navigation = segmentCore.slice(navigationPart(fieldInfo), ReadClass::METADATA);
+    if (readsWhole(segmentCore, termData->dictionaryBlocks())) holdDictionary();
     termBlockOffsets = reinterpret_cast<const field_parts::Terms::BlockOffset*>(navigation.data());
-    numTermBlocks = (int32_t)(blockOffsets.bytes / sizeof(field_parts::Terms::BlockOffset));
-    trieBase = navigation.data() + blockOffsets.bytes;
+    numTermBlocks = (int32_t)(offsetsBytes / sizeof(field_parts::Terms::BlockOffset));
+    trieBase = navigation.data() + offsetsBytes;
     runCount = (int32_t)termData->runs.size();
     runs = termData->runs.data();
     selectRun(runs);
   }
 
+  // Parts a forward walk can hold, including the streams selected on run changes.
+  static void wholeReadParts(const DecodedFieldRecord& field, auto&& emit) {
+    auto* terms = field.terms();
+    if (!terms) return;
+    emit(field.termNavigation(), ReadClass::METADATA);
+    emit(terms->dictionaryBlocks(), ReadClass::DATA);
+    for (const auto& run : terms->runs) {
+      if (run.docs) emit(run.docs, ReadClass::DATA);
+      if (run.positions) emit(run.positions, ReadClass::DATA);
+    }
+  }
+
   int64_t numTerms() const {
     return totals.numTerms;
+  }
+
+  /// The routing data a lookup reads first: the block offset table and the
+  /// trie, one metadata part.
+  static field_parts::Slice navigationPart(const DecodedFieldRecord& fieldInfo) {
+    return fieldInfo.termNavigation();
+  }
+
+  /// Point reads (blocks, term docs) an enum holds one at a time before it
+  /// holds the dictionary and run docs whole.
+  static constexpr int32_t POINT_READS = 8;
+
+  /// From now on, hold the dictionary and each run's docs whole, as an enum
+  /// does past POINT_READS: for a reader ahead of many lookups.
+  void readWhole() noexcept {
+    wholeReads = true;
+    if (run) runDocsWhole = true;
+  }
+
+  /// Whether the enum holds `part` whole rather than in pieces: a file with
+  /// free holds costs nothing per byte, and a small part costs less whole
+  /// than a round of its own (field_parts::WHOLE_READ_BYTES). Holds are
+  /// keyed by range, so whoever acquires a part ahead of the enum (see
+  /// seekPart() and postingsParts()) must ask the same question.
+  static bool readsWhole(const SegmentCore& core, field_parts::Slice part) noexcept {
+    return part.bytes <= field_parts::WHOLE_READ_BYTES || core.holdsFree(part.location.filenum());
+  }
+
+  /// The dictionary part a seek of `target` reads: the block the trie routes
+  /// it to, or the whole dictionary when that is read whole. Reads only the
+  /// routing data, which the enum already holds.
+  field_parts::Slice seekPart(std::string_view target) {
+    if (!termData) return {};
+    if (dictionary || wholeReads) return termData->dictionaryBlocks();
+    TrieReader trie(trieBase, (uint64_t)termData->trieRootOffset, numTermBlocks);
+    int32_t blockOrd = trie.floorBlock(target);
+    if (blockOrd < run->firstBlockOrd || blockOrd >= runEndBlockOrd) reselectRunForBlock(blockOrd);
+    auto [start, end] = blockExtent(blockOrd);
+    return termData->dictionaryBlocks().subSlice(start, end - start);
+  }
+
+  /// The postings parts postingsState() holds for the current term: none for
+  /// a term with inline postings, else its docs (or the run's, when read
+  /// whole) and the run's positions.
+  template <class Out>
+  void postingsParts(Out&& out) {
+    assert(ordInBlock >= 0);
+    decodePostings();
+    uint64_t start = ordInBlock == 0 ? 0 : docsEnds[(size_t)ordInBlock - 1];
+    uint64_t end = docsEnds[(size_t)ordInBlock];
+    if (start == end) return;  // inline postings
+    out(termDocsPart((uint64_t)locOfDocsForTermBlock + start, end - start));
+    if (FieldType::hasPositions(flags) && run->positions) out(run->positions);
   }
 
   /// sumDocFreq is a field-level stat:
@@ -208,6 +284,7 @@ public:
   // through a seek (every one of which reloads a block) before advancing.
   template <class F>
   void forEachDocFreq(F&& callback) {
+    if (!dictionary) holdDictionary();  // a scan reads every block
     for (termBlockIndex = 0; termBlockIndex < numTermBlocks; termBlockIndex++) {
       readTermBlock();
       decodeStats();
@@ -254,7 +331,7 @@ public:
 
       std::vector<uint64_t> docsOffsets((size_t) samples);
       std::vector<uint64_t> posOffsets((size_t) samples);
-      InputStream input = termsIS;
+      InputStream input = wholeDictionary();
       size_t outputBase = blocks.size();
       for (int32_t i = 0; i < samples; i++) {
         int32_t blockOrd = firstBlock + i * stride;
@@ -433,10 +510,26 @@ public:
         state.pulsedPos = (int32_t) pulsedValues[valueIndex + 1];
       }
     } else {
-      state.docIS = runDocs;
-      state.docIS.seek(state.docsStart);
+      if (!runDocsWhole && pointRead(run->docs)) runDocsWhole = true;
+      if (runDocsWhole) {
+        if (!runDocsHeld) {
+          runDocs = streamThrough(run->docs);
+          runDocsHeld = true;
+        }
+        state.docIS = runDocs;
+        state.docIS.seek(state.docsStart);
+      } else {
+        // Only this term's docs are held, so its offsets start at zero.
+        state.docIS = streamThrough(termDocsPart((uint64_t)state.docsStart, endOffset - startOffset));
+        state.docsEnd -= state.docsStart;
+        state.docsStart = 0;
+      }
       if (state.hasPositions) {
         state.posStart = locOfPositionsForTermBlock + (int64_t) posOffsets[(size_t) ordInBlock];
+        if (!runPositionsHeld) {
+          runPositions = run->positions ? streamThrough(run->positions) : InputStream();
+          runPositionsHeld = true;
+        }
         state.posIS = runPositions;
         state.posIS.seek(state.posStart);
       }
@@ -682,6 +775,42 @@ protected:
     return {bytes.data(), bytes.data() + bytes.size()};
   }
 
+  void holdDictionary() const {
+    dictionary = segmentCore.slice(termData->dictionaryBlocks()).data();
+  }
+
+  // Before holding a piece of `whole`: true when the enum should hold
+  // `whole` instead, because the enum is past POINT_READS or `whole` is held
+  // already (a reader ahead of the enum acquired it).
+  bool pointRead(field_parts::Slice whole) {
+    if (wholeReads) return true;
+    if (++pointReads > POINT_READS) {
+      readWhole();
+      return true;
+    }
+    return segmentCore.held(whole);
+  }
+
+  InputStream wholeDictionary() const {
+    if (!dictionary) holdDictionary();
+    return {dictionary, dictionary + termData->dictionaryBytes};
+  }
+
+  // The docs of `bytes` bytes at `offset` in the current run's docs: the
+  // run's whole docs part when that is read whole, else the term's own.
+  field_parts::Slice termDocsPart(uint64_t offset, uint64_t bytes) const {
+    return runDocsWhole ? run->docs : run->docs.subSlice(offset, bytes);
+  }
+
+  // A block's offsets within the dictionary; it must be in the current run.
+  std::pair<uint64_t, uint64_t> blockExtent(int32_t blockOrd) const {
+    assert(blockOrd >= run->firstBlockOrd && blockOrd < runEndBlockOrd);
+    auto start = (uint64_t)runTermsBase + termBlockOffsets[blockOrd];
+    auto end = blockOrd + 1 < runEndBlockOrd ? (uint64_t)runTermsBase + termBlockOffsets[blockOrd + 1]
+                                             : (uint64_t)runTermsEnd;
+    return {start, end};
+  }
+
   // Kept out of line so switching runs adds nothing to the block decode path.
   [[gnu::noinline]] void reselectRunForBlock(int32_t blockOrd) {
     auto key = blockOrd + 1;
@@ -707,13 +836,14 @@ protected:
     runEndBlockOrd = hasNext ? (run + 1)->firstBlockOrd : numTermBlocks;
     runTermsBase = (int64_t)run->dictionaryStart;
     runTermsEnd = (int64_t)(hasNext ? (run + 1)->dictionaryStart : termData->dictionaryBytes);
-    runDocs = run->docs ? streamThrough(run->docs) : InputStream();
-    runPositions = run->positions ? streamThrough(run->positions) : InputStream();
+    runDocsHeld = false;
+    runPositionsHeld = false;
+    runDocsWhole = wholeReads || !run->docs || readsWhole(segmentCore, run->docs);
   }
 
   PackedTerm firstTermForNextBlock(int32_t nextBlock) const {
     auto base = nextBlock < runEndBlockOrd ? runTermsBase : runTermsEnd;
-    return termsIS.readPackedTerm(base + termBlockOffsets[nextBlock]);
+    return wholeDictionary().readPackedTerm(base + termBlockOffsets[nextBlock]);
   }
 
   // Seeks to termBlockIndex and reads the eager block-entry state from the
@@ -723,20 +853,23 @@ protected:
   // metadata.  Those happen on demand in decodeStats and decodePostings.
   void readTermBlock() {
     // Common case (and always, for a single run): the block stays on the
-    // current run; only re-resolve on a run boundary.  Every run's blocks
-    // live in one stream, so termsIS never needs reopening - only seeking.
+    // current run; only re-resolve on a run boundary.
     if (termBlockIndex < run->firstBlockOrd
         || termBlockIndex >= runEndBlockOrd) [[unlikely]] {
       reselectRunForBlock(termBlockIndex);
     }
-    termsIS.seek(runTermsBase + (int64_t) termBlockOffsets[termBlockIndex]);
+    auto [start, end] = blockExtent(termBlockIndex);
+    if (!dictionary && pointRead(termData->dictionaryBlocks())) [[unlikely]] holdDictionary();
+    if (dictionary) [[likely]] {
+      termsIS = InputStream(dictionary + start, dictionary + end);
+    } else {
+      termsIS = streamThrough(termData->dictionaryBlocks().subSlice(start, end - start));
+    }
     startingOrd = run->firstTermForBlock(termBlockIndex);
     ordInBlock = 0;
     maxOrdInBlock = (int32_t) std::min<int64_t>(Postings::TERMS_BLOCK_SIZE - 1,
                                                 runLastTermOrd - startingOrd);
-    int64_t blockEndOffset = termBlockIndex + 1 < runEndBlockOrd
-        ? runTermsBase + (int64_t)termBlockOffsets[termBlockIndex + 1] : runTermsEnd;
-    blockEnd = termsIS.ptr(blockEndOffset);
+    blockEnd = termsIS.ptr(termsIS.size());
 
     // see TextWriter::flushTerms
     startingTerm = termsIS.readPackedTerm();
@@ -789,6 +922,7 @@ private:
         return false;
       }
       termBlockIndex++;
+      if (!dictionary) [[unlikely]] holdDictionary();  // a scan reads on
       readTermBlock();
       return true;
     }
@@ -857,12 +991,23 @@ public:
     return found;
   }
 
+  /// Positions on `target` like seek(), without counting a dictionary seek:
+  /// for reads ahead of the lookups that count.
+  bool probe(std::string_view target) {
+    if (!termData) return false;
+    seekBlock(target, 0);
+    bool found = seekInBlock(target);
+    sharedLen = 0;
+    return found;
+  }
+
   /// Forward-only ceil for sorted iteration. Target must be >= the current
   /// term. Positions on the smallest term >= target and returns true, or
   /// returns false at dictionary exhaustion. Unlike seekCeil, this never
   /// restarts before the current block.
   bool seekCeilForward(std::string_view target) {
     if (!termData) return false;
+    if (!dictionary) holdDictionary();  // forward iteration reads on
     if (termBlockIndex < 0) {
       termBlockIndex = 0;
       readTermBlock();

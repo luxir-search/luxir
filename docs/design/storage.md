@@ -212,6 +212,43 @@ use:
   throw `SegmentCorruptError` on every use. The scrubber still checks every
   file of a snapshot, read or not.
 
+A query declares what it will read in each segment before it reads it
+(`search/DeclaredReads.h`), so that its cold reads cost a few rounds rather
+than one acquire per part per segment:
+
+- A term lookup acquires the term routing data (block offsets and trie), then
+  only the block it lands in (`dictionaryStart + offsets[b]`), then the
+  postings of a term it found: that term's docs, and the run's positions. A
+  dictionary or a run's docs of at most 64 KiB (`WHOLE_READ_BYTES`) is
+  acquired whole instead, and so is anything on a file with free holds. A scan
+  (enumerating terms, or a forward seek past its block) holds the dictionary
+  whole, and so does an enum past eight point reads (`POINT_READS`: blocks
+  and term docs), which then holds each run's docs whole too, so looking up
+  many terms (an id batch, a term set) stays a bounded number of acquires.
+- Before parse, a search walks its request for the term lookups parsing will
+  make, in every segment, and acquires their parts in up to three rounds:
+  routing data and live docs, blocks, postings. A part already held, or
+  declared whole, merges rounds. After planning, the weights' registered reads
+  (the norms of a scored field where its term was found) go in one more round.
+  Each round is one batch per segment file (`SegmentCore::acquireParts`),
+  issued together across segments.
+- No search worker waits for a round on a dispatched request: the request
+  resumes on the node's arena when the last batch completes
+  (`AcquireRound`). A round that completes inline (RAM, mmap, the default
+  batch) goes on on the same thread. A synchronous `submit()` waits on its
+  rounds instead.
+- A round pending at the request's wait deadline fails the search with
+  `deadline_exceeded`, and a cancelled request fails with `cancelled`. Its
+  batches still complete, and the segment keeps their holds. Any other failed
+  round is no failed search: the parts are acquired on demand.
+- `search.read_ahead_max_bytes` (256 MiB) caps what a request declares; past
+  it, parts are acquired on demand. Each batch and each on-demand acquire is
+  counted (`io_acquire_batches`), and so is each round the request waits on
+  in sequence (`io_acquire_rounds`).
+- `IndexReader::listParts()` lists each segment's catalog, every field's
+  navigation parts and, on request, fields' data extents, so a backend can
+  warm metadata or listed fields.
+
 Two more properties of the open path:
 
 - A manifest open passes each file's recorded size to `Directory::openFile`
@@ -283,6 +320,14 @@ physical endpoint pairs. The state byte carries the segment-specific
 `MAY_HAVE_FITTED` flag and records the presence of bounds and an explicit
 column value count. The field type determines the bounds kind.
 
+A search counts the holds its segments take while it runs: every range a
+segment acquires from a file that is not `holdsFree()` adds to the request's
+`IoCounters` (`src/luxir/util/IoContext.h`), and the totals appear in the
+search profile as `io_acquires` and `io_acquired_bytes`. The search installs
+its `IoContext` on the threads that work for it, so storage code also sees the
+request's deadline, stop token and fill hint, and a backend counts its own
+store requests and rounds there.
+
 The first step-4 work is a prototype of range reads against MinIO or S3. It
 should show that eviction stays bounded with more data than the cache holds
 and that fetch failures propagate correctly. Its measurements set chunk
@@ -323,6 +368,15 @@ needs:
   filter part, a small metadata read, skips most of what the bounds keep;
 - the syncer reporting which files are published, so that eviction knows
   what it may drop.
+
+Delete application uses at most two potentially nonempty prefetch rounds for
+base-file reads after the target cores are open. Core opens, live docs and
+retries after a failed batch are outside that count. The first round acquires
+whole id filters across segments. For segments with a surviving id, the second
+acquires routing data, the whole dictionary, run streams and version runs.
+The core retains these whole parts, including speculative reads a lookup may
+never use. RAM and mmap follow the same selection and declaration stages with
+no prefetch submissions. Sparse reads for cold updates are future work.
 
 ## Pruning metadata
 
@@ -371,7 +425,9 @@ errors. Weight construction checks the fields that execution uses.
 | match-no-docs | always |
 
 Term comparisons use the analyzed and fitted bytes used for the dictionary
-seek. An exact lower or inclusive upper endpoint may itself be present. A
+seek. A segment overlay that implements `TermMembership` may also prove a term
+absent; its proof is consulted wherever the term bounds are, and shares their
+rules (see docs/dev/plugins.md). An exact lower or inclusive upper endpoint may itself be present. A
 `ROUNDED` lower endpoint is a strict prefix of the smallest term. An
 `EXCLUSIVE` upper endpoint is greater than every term. An `UNBOUNDED` upper
 endpoint supplies no upper limit.

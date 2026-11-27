@@ -64,6 +64,9 @@ public:
   // negative, throw SegmentCorruptError.
   static std::shared_ptr<LiveDocs> decode(std::shared_ptr<InputFile> file, uint64_t size, std::string_view name,
                                           std::string_view segment, int32_t maxDoc, int32_t numLive);
+  // As above, from a hold of the whole file acquired ahead.
+  static std::shared_ptr<LiveDocs> decode(std::shared_ptr<InputFile> file, HeldRange hold, std::string_view name,
+                                          std::string_view segment, int32_t maxDoc, int32_t numLive);
   // Opens and decodes generation `liveGen` at once, for the writer. Null when
   // the file is missing and missingFileOK is set.
   static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t creatorEpoch, uint64_t liveGen,
@@ -149,6 +152,12 @@ public:
   int32_t size() const noexcept { return maxDoc; }
   bool decoded() const noexcept { return value.peek() != nullptr; }
   std::shared_ptr<LiveDocs> shared();
+  // Starts acquiring the file on `batches` and decodes it once the hold
+  // arrives, unless it is decoded already or its file hands out free views.
+  // A failed acquire or decode publishes nothing: the first use retries.
+  // The caller keeps this alive until the batch completed. False when it
+  // issued nothing.
+  bool acquireAhead(AcquireBatches& batches);
   LiveDocs* get() {
     auto* decodedDocs = value.peek();
     return decodedDocs ? decodedDocs : shared().get();
@@ -164,15 +173,17 @@ public:
 class SegmentOverlay {
   AuxInfo info;
   OverlayPolicy policy;
+  bool membership;  // its reader proves terms absent (TermMembership)
   std::string segment;
   std::vector<std::shared_ptr<InputFile>> files;
   SharedLazyCell<AuxReader> reader;
   std::atomic<bool> unusable = false;  // An advisory overlay whose bytes were found invalid.
 
 public:
-  SegmentOverlay(AuxInfo info, OverlayPolicy policy, std::string segment,
+  SegmentOverlay(AuxInfo info, OverlayPolicy policy, bool membership, std::string segment,
                  std::vector<std::shared_ptr<InputFile>> files)
-      : info(std::move(info)), policy(policy), segment(std::move(segment)), files(std::move(files)) {}
+      : info(std::move(info)), policy(policy), membership(membership), segment(std::move(segment)),
+        files(std::move(files)) {}
 
   // Whether readers open overlays of this kind; others are left out.
   static bool knownKind(std::string_view kind);
@@ -186,6 +197,7 @@ public:
   uint64_t gen() const noexcept { return info.gen; }
   uint64_t builtCoreGen() const noexcept { return info.built_core_gen; }
   OverlayPolicy openPolicy() const noexcept { return policy; }
+  bool provesTerms() const noexcept { return membership; }
   bool isOpen() const noexcept { return reader.peek() != nullptr; }
   bool isUnusable() const noexcept { return unusable.load(std::memory_order_relaxed); }
   // The reader, opened on first use; null for an advisory overlay whose bytes are invalid.
@@ -260,6 +272,9 @@ public:
 
     SegmentCore& segmentCore() const noexcept { return *sharedSegmentCore; }
 
+    // The root live docs generation, null without deletes.
+    const std::shared_ptr<SegmentLive>& rootLive() const noexcept { return sharedLiveDocs; }
+
     // Pins the immutable bundle and all of its space readers.
     std::shared_ptr<SegmentCore> segmentCoreShared() const noexcept {
       return sharedSegmentCore;
@@ -300,6 +315,20 @@ public:
     std::span<const std::shared_ptr<SegmentOverlay>> overlays() const noexcept {
       return sharedOverlays;
     }
+
+    // Whether an overlay of this segment can prove terms absent.
+    bool hasTermMembership() const noexcept {
+      return std::ranges::any_of(sharedOverlays, [](const auto& overlay) { return overlay->provesTerms(); });
+    }
+    // Whether an overlay proves `term` (dictionary form) absent from the
+    // physical `field`. Fills `why` with the proof's label when it does. Never
+    // throws: an overlay that fails to open or to answer proves nothing.
+    bool membershipProvesAbsent(std::string_view field, std::string_view term, std::string* why = nullptr) const noexcept;
+    // Acquires, on `batches`, what those probes will read. The overlays
+    // involved go to `readers`, which the caller keeps until the batches
+    // complete. Never throws.
+    void acquireMembershipProbes(std::string_view field, std::string_view term, AcquireBatches& batches,
+                                 std::vector<std::shared_ptr<AuxReader>>& readers) const noexcept;
 
     // The overlay `name`, opened on first use. Null when the segment has none,
     // or has an advisory one whose bytes are invalid. Throws when its open
@@ -638,6 +667,24 @@ public:
     FieldType* mismatchedSchemaType = nullptr;
   };
   FieldLookup lookupField(std::string_view name) const;
+
+  // A part of a segment file, as listParts() lists it.
+  struct ListedPart {
+    std::string file;  // The segment file's name.
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    ReadClass readClass = ReadClass::METADATA;  // The class the readers acquire it with.
+    SegmentCore::ListedPart::Kind kind = SegmentCore::ListedPart::Kind::CATALOG;
+    std::string space;  // Row space path, empty for the root.
+    std::string field;  // Physical field name, empty for a part of the segment.
+  };
+  // Lists, for each segment of the snapshot, its file headers and catalog,
+  // the navigation parts of every field in every row space (term routing
+  // data, column indexes, points directories, ...), and the data extents of
+  // the fields named in `dataFields` (physical names, in any row space), or
+  // of every field with allData. For a storage backend that warms metadata
+  // or listed fields: the parts are the ranges reads acquire. Reads nothing.
+  std::vector<ListedPart> listParts(std::span<const std::string_view> dataFields = {}, bool allData = false);
 
   std::shared_ptr<OrdMap> getOrdMap(std::string_view name);
 

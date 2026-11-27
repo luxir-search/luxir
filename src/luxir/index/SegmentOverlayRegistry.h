@@ -71,6 +71,9 @@ struct SegmentOverlayKindInfo {
   Open open;
   // ADVISORY: an overlay with invalid bytes reads as absent; REQUIRED fails its uses.
   OverlayPolicy policy = OverlayPolicy::ADVISORY;
+  // The opened reader implements TermMembership, so term pruning consults it.
+  // Requires ADVISORY: an overlay that cannot open or verify proves nothing.
+  bool termMembership = false;
 };
 
 // One entry of a collection's segment_overlays, owning its strings.

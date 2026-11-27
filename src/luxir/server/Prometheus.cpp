@@ -85,6 +85,13 @@ void service(Renderer& r, const api::ServiceStats& s) {
                                 {"siblings_only", f.siblings_only}, {"saturated", f.saturated}})
     r.counter("luxir_search_fanout_decisions_total", fanoutDecisions, (double)count, PrometheusText::label("outcome", outcome));
   r.counter("luxir_search_fanout_shares_total", "Fan-out shares submitted by adaptive evaluations.", (double)f.shares);
+  r.counter("luxir_search_io_acquires_total", "Ranges searches acquired from storage that hands out held copies.", (double)s.search_io_acquires);
+  r.counter("luxir_search_io_acquired_bytes_total", "Bytes of the ranges searches acquired from storage.", (double)s.search_io_acquired_bytes);
+  r.counter("luxir_search_io_requests_total", "Store requests storage backends issued for searches.", (double)s.search_io_requests);
+  r.counter("luxir_search_io_rounds_total", "Sequential store waits of searches; requests awaited together count once.", (double)s.search_io_rounds);
+  r.counter("luxir_search_io_fetched_bytes_total", "Bytes store requests returned to searches.", (double)s.search_io_fetched_bytes);
+  r.counter("luxir_search_io_acquire_batches_total", "Batched acquires of searches; a single acquire counts as one.", (double)s.search_io_acquire_batches);
+  r.counter("luxir_search_io_acquire_rounds_total", "Sequential acquire waits of searches; batches issued together count once.", (double)s.search_io_acquire_rounds);
   r.activity("luxir_index_batches", "luxir_index_batch_duration_seconds", s.index_batches, s.request_duration_bounds);
   constexpr std::string_view docs = "Documents accepted into indexing or rejected/rolled back; acceptance is not durable acknowledgment.";
   r.counter("luxir_ingest_documents_total", docs, (double)s.documents_accepted, "outcome=\"accepted\"");

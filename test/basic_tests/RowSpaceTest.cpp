@@ -1164,6 +1164,7 @@ TEST_F(ScopedRowSpaceTest, noneReducerKeepsReadsStableAcrossNextAndAdvance) {
   MemPool pool;
   Query::Context context(pool, *many);
   OwnershipRelation relation(*many, *root, context.planningContext().memoryTracker);
+  relation.bindMappers();
   AllQuery all;
   auto* weight = all.createWeight(context, 0);
   for (bool seek : {false, true}) {

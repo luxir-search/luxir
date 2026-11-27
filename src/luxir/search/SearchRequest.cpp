@@ -3,13 +3,16 @@
 
 #include "SearchRequest.h"
 #include "luxir/query/QueryPruning.h"
+#include "luxir/query/ReadDeclarer.h"
 
 #include <cassert>
 
 #include "SearchEngine.h"
+#include "DeclaredReads.h"
 #include "OwnershipRelation.h"
 #include "luxir/api/build.h"
 #include "luxir/search/SearchOverrides.h"
+#include "luxir/search/ops/SearchOp.h"
 
 namespace luxir {
 
@@ -24,14 +27,8 @@ const std::shared_ptr<IndexReader>& SearchRequest::pinView(std::string_view path
   // A view shares the request's segment observations once the request has them.
   auto uses = filterUses ? std::make_shared<FilterCache::UseRegistry>(scoped->filterCache(), *scoped, *filterUses)
       : std::make_shared<FilterCache::UseRegistry>(scoped->filterCache(), *scoped);
-  return scopedStates->emplace(std::string(path), ScopedState{std::move(scoped), std::move(uses), {}}).first->second.reader;
-}
-
-const std::shared_ptr<FilterCache::UseRegistry>& SearchRequest::uses(IndexReader& scoped) {
-  if (&scoped == reader.get()) return filterUses;
-  pinView(scoped.path());
-  const std::lock_guard lock(mutex);
-  return scopedStates->find(scoped.path())->second.uses;
+  return scopedStates->emplace(std::string(path), ScopedState{std::move(scoped), std::move(uses), {}, {}})
+      .first->second.reader;
 }
 
 OwnershipRelation& SearchRequest::ownershipRelation(IndexReader& many, IndexReader& one) {
@@ -45,19 +42,66 @@ OwnershipRelation& SearchRequest::ownershipRelation(IndexReader& many, IndexRead
   auto found = state.relations.find(key);
   if (found != state.relations.end()) return *found->second;
   auto* relation = arenaCreate<OwnershipRelation>(arena, many, one, memoryTracker);
+  if (stage == Stage::LOGICAL) {
+    addMaterializationStep<&OwnershipRelation::bindMappers>(*relation);
+  } else {
+    // Standalone query planning has no logical op tree or step list to run.
+    relation->bindMappers();
+  }
   state.relations.emplace(std::move(key), relation);
   return *relation;
 }
 
 Query::PlanningContext* SearchRequest::createPlanningContext(IndexReader& view) {
+  ScopedState* scoped = nullptr;
+  if (&view != reader.get()) {
+    const auto& pinned = pinView(view.path());
+    assert(pinned.get() == &view);
+    const std::lock_guard lock(mutex);
+    scoped = &scopedStates->find(pinned->path())->second;
+  }
   Query::PlanningContext::Limits limits;
   limits.multiTermBudget = &multiTermBudget;
   auto* planning = arenaCreate<Query::PlanningContext>(arena, requestPool, view, limits, &warnings,
       FilterKeyContext{.schemaGen = schema->gen_, .timeZone = proto.time_zone},
-      uses(view), &memoryTracker, proto.profile ? this : nullptr);
+      scoped ? scoped->uses : filterUses, &memoryTracker, proto.profile ? this : nullptr);
   planning->pruning = pruning;
   planning->proofNotes = resolvedFields;
+  if (declaredReads) planning->plannedReads = &declaredReads->plannedReads();
+  planning->sharedTermFacts = scoped ? &scoped->termFacts : &termFacts;
+#ifndef NDEBUG
+  planning->requestStage = &stage;
+#endif
   return planning;
+}
+
+void SearchRequest::addMaterializationStep(SearchOp& op) {
+  assert(stage == Stage::LOGICAL);
+  materializationSteps.push_back({&op, [](void* object) {
+    auto& op = *static_cast<SearchOp*>(object);
+    if (auto* reads = ReadVerification::active()) {
+      op.selectSources();
+      op.declareReads(*reads);
+    }
+    op.materialize();
+  }});
+}
+
+void SearchRequest::materialize() {
+  assert(stage == Stage::LOGICAL && logicalRoot != nullptr);
+  stage = Stage::MATERIALIZING;
+  for (; materializationCursor < materializationSteps.size(); ++materializationCursor) {
+    const auto& step = materializationSteps[materializationCursor];
+#ifndef NDEBUG
+    if (Query::verifyReadDeclarationsForTests && ReadVerification::active() == nullptr) {
+      ReadVerification verify;
+      step.run(step.owner);
+      continue;
+    }
+#endif
+    step.run(step.owner);
+  }
+  stage = Stage::MATERIALIZED;
 }
 
 // One profile op for the request and one run per calculator that actually skips.
@@ -93,6 +137,8 @@ SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
       startTime(startTime),
       timeZone(resolveTimeZone(proto.time_zone)) {
   if (!timeZone) timeZoneError = timeZoneResolutionError(proto.time_zone);
+  io.queryId = IoContext::newQueryId();
+  io.counters = &ioCounters;
 }
 
 // A dispatched search that never sent its final response was abandoned.
@@ -160,6 +206,28 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
     // lastResponse once finalSent is decided.
     auto end = std::chrono::steady_clock::now();
     lastResponse->proto.took_us = microsSince(startTime, end);
+    // Every task and stream has ended: the I/O counters are final.
+    auto ioTotals = ioCounters.snapshot();
+    if (lastResponse->proto.profile) {
+      auto& profile = *lastResponse->proto.profile;
+      profile.io_acquires = ioTotals.acquires;
+      profile.io_acquired_bytes = ioTotals.acquiredBytes;
+      profile.io_requests = ioTotals.requests;
+      profile.io_rounds = ioTotals.rounds;
+      profile.io_fetched_bytes = ioTotals.fetchedBytes;
+      profile.io_acquire_batches = ioTotals.acquireBatches;
+      profile.io_acquire_rounds = ioTotals.acquireRounds;
+    }
+    if (!ioTotals.empty()) {
+      auto& metrics = engine.metrics();
+      metrics.add(MetricCounter::SEARCH_IO_ACQUIRES, ioTotals.acquires);
+      metrics.add(MetricCounter::SEARCH_IO_ACQUIRED_BYTES, ioTotals.acquiredBytes);
+      metrics.add(MetricCounter::SEARCH_IO_REQUESTS, ioTotals.requests);
+      metrics.add(MetricCounter::SEARCH_IO_ROUNDS, ioTotals.rounds);
+      metrics.add(MetricCounter::SEARCH_IO_FETCHED_BYTES, ioTotals.fetchedBytes);
+      metrics.add(MetricCounter::SEARCH_IO_ACQUIRE_BATCHES, ioTotals.acquireBatches);
+      metrics.add(MetricCounter::SEARCH_IO_ACQUIRE_ROUNDS, ioTotals.acquireRounds);
+    }
     if (!warnings.empty()) engine.metrics().add(MetricCounter::SEARCH_WARNINGS);
     if (counting) count(lastResponse->proto.error ? MetricOutcome::ERROR : MetricOutcome::OK, end);
     reply(*lastResponse);  // may delete *this*; nothing after this call

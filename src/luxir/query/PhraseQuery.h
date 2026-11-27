@@ -359,6 +359,8 @@ public:
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
+  void declareReads(ReadDeclarer&, PlanningContext&, int32_t, float) const override;
+
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
 
@@ -447,6 +449,15 @@ public:
       if (needScores && query.getSlop() == 0) traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
       if (cachedFieldInfo == nullptr) return;
+
+      // A term no segment can hold empties the phrase: ask for all of them
+      // before the statistics lookups, which seek the others in each segment.
+      for (std::string_view term : query.getTerms()) {
+        if (context.termAbsentEverywhere(*cachedFieldInfo, term)) {
+          cachedFieldInfo = nullptr;
+          return;
+        }
+      }
 
       cachedTermInfos = context.pool.make_span<CachedTermInfo*>(query.getTerms().size());
       Similarity similarity;

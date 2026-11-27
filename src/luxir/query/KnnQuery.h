@@ -863,9 +863,9 @@ public:
 
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
-    unused(context);
     checkedBoostProduct(multiplier, 1.0f);
     validateKnnLogical();
+    context.requirePreparation();
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,

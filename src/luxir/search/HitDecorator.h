@@ -22,22 +22,30 @@ struct ParseContext;
 // Mutable readers/iterators must be call-local: the next batch can have lower doc IDs.
 class HitDecorator {
 public:
+  // Original ranking query (null for browse) and its execution context.
+  struct QuerySource { const Query* query; Query::Context& context; };
+
   virtual ~HitDecorator() = default;
   virtual std::string_view columnName() const = 0;
+
+  // Runs once, serially, after materialization and before execution. Inspect
+  // queries with Query::visit here and copy any borrowed data needed later.
+  // Query parsing belongs to the maker. The source span is call-local.
+  virtual void bind(std::span<const QuerySource> sources) { unused(sources); }
+
+  // May run concurrently. Query::visit is only valid during serial planning.
   virtual void decorate(std::span<const segdoc> docs, std::span<const uint32_t> rows,
                         std::span<api::Val> out, std::pmr::memory_resource& mr) const = 0;
 };
 
-// Makers run during serial request parsing, after ranking weight construction
-// when execution needs a weight. Inspect queries here and copy borrowed views
-// needed later. Concurrent decorate() calls must never call Query::visit.
+// Makers run in the logical phase. They validate parameters and fix
+// columnName() before binding. This context and its source span are call-local.
 struct DecoratorContext {
   SearchRequest& req;
   ParseContext& parse;
   // Original ranking queries, before separately supplied filters are folded in.
-  // Null query means browse. Context is the source's execution context;
-  // resident sources get one on demand from the same planning state.
-  struct QuerySource { const Query* query; Query::Context& context; };
+  // Null query means browse.
+  struct QuerySource { const Query* query; Query::PlanningContext& planning; };
   std::span<const QuerySource> queries;
 };
 

@@ -14,6 +14,7 @@
 #include "luxir/store/AcquireJoin.h"
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/util/ApiError.h"
+#include "luxir/util/IoContext.h"
 
 namespace luxir {
 
@@ -76,45 +77,80 @@ SegmentCore::SegmentCore(uint64_t segId, uint64_t creatorEpoch)
 
 SegmentCore::~SegmentCore() = default;
 
-void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join,
-                                std::exception_ptr* error) {
+template <class Issue>
+void SegmentCore::issueParts(std::span<const Part> parts, Issue&& issue) {
   using Key = std::pair<uint64_t, uint64_t>;
-  std::vector<Key> keys;
-  for (auto part : parts) {
+  std::vector<std::pair<Key, ReadClass>> keys;
+  for (auto [part, readClass] : parts) {
     auto number = part.location.filenum();
     assert(number < files.size() && files[number].file);
-    if (!files[number].holdsFree) keys.emplace_back(part.location.raw(), part.bytes);  // See BaseFile.
+    if (!files[number].holdsFree) keys.push_back({{part.location.raw(), part.bytes}, readClass});  // See BaseFile.
   }
   if (keys.empty()) return;
   // raw() keeps the file number in its high bits, so sorted keys run by file.
-  std::ranges::sort(keys);
-  keys.erase(std::ranges::unique(keys).begin(), keys.end());
+  // A part listed twice goes out once, with the class it was first listed with.
+  auto key = &std::pair<Key, ReadClass>::first;
+  std::ranges::stable_sort(keys, {}, key);
+  keys.erase(std::ranges::unique(keys, {}, key).begin(), keys.end());
   {
     std::lock_guard lock(holdsMutex);
-    std::erase_if(keys, [&](const Key& key) { return holds.contains(key); });
+    std::erase_if(keys, [&](const auto& entry) { return holds.contains(entry.first); });
   }
-  auto fileOf = [](const Key& key) { return seg_location::fromRaw(key.first).filenum(); };
+  auto fileOf = [](const auto& entry) { return seg_location::fromRaw(entry.first.first).filenum(); };
   for (auto begin = keys.begin(); begin != keys.end();) {
     auto number = fileOf(*begin);
-    auto end = std::find_if(begin, keys.end(), [&](const Key& key) { return fileOf(key) != number; });
+    auto end = std::find_if(begin, keys.end(), [&](const auto& entry) { return fileOf(entry) != number; });
     std::vector<ByteRange> ranges;
+    std::vector<Key> batch;
     ranges.reserve((size_t)(end - begin));
-    for (auto key = begin; key != end; ++key) {
-      ranges.push_back({seg_location::fromRaw(key->first).offset(), key->second, readClass});
+    batch.reserve((size_t)(end - begin));
+    uint64_t total = 0;
+    for (auto entry = begin; entry != end; ++entry) {
+      auto [raw, bytes] = entry->first;
+      ranges.push_back({seg_location::fromRaw(raw).offset(), bytes, entry->second});
+      batch.push_back(entry->first);
+      total += bytes;
     }
-    auto take = [this, batch = std::vector(begin, end)](std::vector<HeldRange>&& acquired) {
+    // One batch: the request counts its ranges and one call.
+    countAcquire(total, ranges.size());
+    auto take = [this, batch = std::move(batch)](std::vector<HeldRange>&& acquired) {
       std::lock_guard lock(holdsMutex);
       for (size_t i = 0; i < batch.size(); ++i) holds.try_emplace(batch[i], std::move(acquired[i]));
     };
-    join.acquire(*files[number].file, ranges, std::move(take), error);
+    issue(*files[number].file, std::span<const ByteRange>(ranges), std::move(take));
     begin = end;
   }
+}
+
+void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass, AcquireJoin& join,
+                                std::exception_ptr* error) {
+  std::vector<Part> classed;
+  classed.reserve(parts.size());
+  for (auto part : parts) classed.push_back({part, readClass});
+  issueParts(classed, [&](InputFile& file, std::span<const ByteRange> ranges, AcquireBatches::Take take) {
+    join.acquire(file, ranges, std::move(take), error);
+  });
 }
 
 void SegmentCore::acquireSlices(std::span<const field_parts::Slice> parts, ReadClass readClass) {
   AcquireJoin join;
   acquireSlices(parts, readClass, join);
+  countAcquireRound();
   join.wait();
+}
+
+void SegmentCore::acquireParts(std::span<const Part> parts, AcquireBatches& batches) {
+  issueParts(parts, [&](InputFile& file, std::span<const ByteRange> ranges, AcquireBatches::Take take) {
+    batches.acquire(file, ranges, std::move(take));
+  });
+}
+
+bool SegmentCore::held(field_parts::Slice part) {
+  auto number = part.location.filenum();
+  assert(number < files.size() && files[number].file);
+  if (files[number].holdsFree) return true;
+  std::lock_guard lock(holdsMutex);
+  return holds.contains({part.location.raw(), part.bytes});
 }
 
 std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice part, ReadClass readClass) {
@@ -128,6 +164,8 @@ std::span<const char> SegmentCore::retain(InputFile& file, field_parts::Slice pa
   // miss must not hold up other slices of the segment, hits included. Two
   // threads missing the same part both acquire it; the first to store wins.
   auto hold = file.acquire({part.location.offset(), part.bytes, readClass});
+  countAcquire(part.bytes);
+  countAcquireRound();
   // Declared after `hold`, so it unlocks before a duplicate hold releases.
   std::lock_guard lock(holdsMutex);
   return holds.try_emplace(key, std::move(hold)).first->second.bytes();
@@ -247,6 +285,7 @@ bool SegmentCore::openBaseFile(Directory& dir, std::string_view segment, uint32_
   }
   if (checkHeader) {
     auto header = file->acquire({0, Postings::LUXIR_HEADER.size(), ReadClass::METADATA});
+    if (!file->holdsFree()) countAcquire(header.getLength());
     validateSegmentFileHeader(header.bytes(), segment, number);
   }
   bool holdsFree = file->holdsFree();
@@ -364,6 +403,7 @@ bool SegmentCore::initializeFromFiles(Directory& dir, bool missingFileOK, bool e
 // Reads nothing beyond the catalog: version runs and ownership shapes are
 // built on first use.
 void SegmentCore::initializeSpaces() {
+  everyHoldFree = std::ranges::all_of(files, [](const BaseFile& base) { return !base.file || base.holdsFree; });
   root.initialize(spaces()[0].maxDoc, spaces()[0].fields.size());
   children.reserve(spaces().size() - 1);
   for (size_t i = 1; i < spaces().size(); ++i) {
@@ -372,6 +412,81 @@ void SegmentCore::initializeSpaces() {
     auto child = std::make_unique<ChildSpace>(*this, (SpaceOrdinal)i, *parent);
     child->reader.initialize(space.maxDoc, space.fields.size());
     children.push_back(std::move(child));
+  }
+}
+
+void SegmentCore::listParts(const std::function<bool(std::string_view space, std::string_view field)>& data,
+                            const std::function<void(const ListedPart&)>& visit) {
+  using Kind = ListedPart::Kind;
+  auto emit = [&](Kind kind, ReadClass readClass, field_parts::Slice slice, std::string_view space,
+                  std::string_view field = {}) {
+    if (slice) visit({kind, readClass, slice, space, field});
+  };
+  forEachBaseFile([&](uint32_t number, uint64_t) {
+    // File 0's header sits at the null location, which emit() skips.
+    visit({Kind::CATALOG, ReadClass::METADATA, {{number, 0}, Postings::LUXIR_HEADER.size()}, {}, {}});
+  });
+  emit(Kind::CATALOG, ReadClass::METADATA, {{Postings::PRIMARY_FILE, range.offset}, range.length}, {});
+  emit(Kind::NAVIGATION, ReadClass::METADATA, catalog.versionRuns().slice, {});
+  std::vector<std::pair<SpaceOrdinal, std::vector<const DecodedFieldRecord*>>> listed;
+  for (size_t ordinal = 0; ordinal < spaces().size(); ++ordinal) {
+    const auto& space = spaces()[ordinal];
+    std::string_view path = space.path;
+    if (ordinal) {
+      emit(Kind::NAVIGATION, ReadClass::DATA, space.ownership.ends, path);
+      emit(Kind::NAVIGATION, ReadClass::DATA, space.ownership.owners, path);
+    }
+    auto* reader = spaceReader((SpaceOrdinal)ordinal);
+    auto& selected = listed.emplace_back((SpaceOrdinal)ordinal, std::vector<const DecodedFieldRecord*>()).second;
+    for (int32_t i = 0; i < reader->numFields(); ++i) {
+      const auto* record = reader->fieldInfo(i);
+      if (!record) continue;
+      std::string_view name(record->name);
+      auto navigation = [&](field_parts::Slice slice, ReadClass readClass = ReadClass::METADATA) {
+        emit(Kind::NAVIGATION, readClass, slice, path, name);
+      };
+      navigation(record->termNavigation());
+      if (const auto* number = record->numberColumn()) navigation(number->index());
+      navigation(record->ordBlockMetadata(space.maxDoc));
+      if (record->points()) navigation(record->pointsDirectory());
+      if (const auto* stored = record->stored()) {
+        navigation(stored->names());
+        navigation(stored->firstDocs);  // the chunk index
+        navigation(stored->chunkOffsets);
+      }
+      navigation(record->idFilter());
+      if (data(path, name)) selected.push_back(record);
+    }
+  }
+  for (auto& [ordinal, records] : listed) {
+    const auto& space = spaces()[(size_t)ordinal];
+    std::string_view path = space.path;
+    for (const auto* record : records) {
+      std::string_view name(record->name);
+      auto extent = [&](field_parts::Slice slice) { emit(Kind::DATA, ReadClass::DATA, slice, path, name); };
+      if (const auto* terms = record->terms()) {
+        extent(terms->dictionaryBlocks());
+        for (const auto& run : terms->runs) {
+          extent(run.docs);
+          extent(run.positions);
+        }
+      }
+      extent(record->docsBitmap());
+      extent(record->normsValues(space.maxDoc));
+      if (const auto* number = record->numberColumn()) extent(number->blocks());
+      if (const auto* ord = record->ordColumn()) extent(ord->values());
+      if (const auto* bytes = record->bytesColumn()) {
+        extent(bytes->values);
+        extent(bytes->endOffsets);
+      }
+      if (const auto* points = record->points()) extent(points->leaves());
+      if (const auto* stored = record->stored()) {
+        extent(stored->chunks());
+        extent(stored->dictionary());
+      }
+      extent(record->endValueRanks());
+      extent(record->owners());
+    }
   }
 }
 

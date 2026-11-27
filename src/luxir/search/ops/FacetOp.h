@@ -53,7 +53,10 @@ public:
   // segment. Index sorting alone is insufficient: it also needs ownership or
   // a key-ordered merge across segments.
   static constexpr bool isContiguous = false;
-  FacetDimension groupDimension() const { return groupPlan->dimension; }
+  FacetDimension groupDimension() const {
+    assert(groupPlan->bound);
+    return groupPlan->dimension;
+  }
 
   template <bool Growing = false, typename Visit>
   void collectGroups(DistinctFacetCounts& data, int32_t segnum, DocSet* domain, Visit&& visit) {
@@ -2329,25 +2332,29 @@ public:
 class QueryFacetReq : public FixedBucketFacetReq {
   const ReqQueryFacet& queryFacet;
   std::span<Query*> bucketQueries;
-  std::span<Query::Weight*> bucketWeights;
   Query::PlanningContext& planning;
-  // Empty outside bucket placements. A query with no usable key has a null Use.
+  // Bucket children can reuse predicate membership in their planning view.
+  bool bucketChildInPlanningView;
+  std::span<Query::Weight*> bucketWeights;
+  // Empty unless the facet is a bucket child in the planning view.
   std::span<FilterCache::Use*> bucketUses;
-  bool preparedBuckets;
+  bool preparedBuckets = false;
 
 public:
   QueryFacetReq(
       SearchRequest& req, const std::shared_ptr<IndexReader>& view, const ReqQueryFacet& queryFacet,
-      std::string_view facetName, std::span<Query*> bucketQueries, std::span<Query::Weight*> bucketWeights,
-      Query::PlanningContext& planning, std::span<FilterCache::Use*> bucketUses)
+      std::string_view facetName, std::span<Query*> bucketQueries,
+      Query::PlanningContext& planning, bool bucketChild)
     : FixedBucketFacetReq(
           req, view, {}, facetName, 0, false, queryFacet.buckets.size(), {}),
-      queryFacet(queryFacet), bucketQueries(bucketQueries), bucketWeights(bucketWeights),
-      planning(planning), bucketUses(bucketUses), preparedBuckets(QueryPrep::anyNeedsPrepare(bucketWeights)) {
+      queryFacet(queryFacet), bucketQueries(bucketQueries), planning(planning),
+      bucketChildInPlanningView(bucketChild && &planning.topReader == view.get()) {
     assert(bucketQueries.size() == queryFacet.buckets.size());
-    assert(bucketWeights.size() == queryFacet.buckets.size());
-    assert(bucketUses.empty() || bucketUses.size() == bucketWeights.size());
   }
+
+  void declareReads(ReadDeclarer& reads) const override;
+  // Build the bucket context, weights, filter uses and preparation state.
+  void materialize() override;
 
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;

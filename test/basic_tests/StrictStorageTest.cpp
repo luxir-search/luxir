@@ -5,6 +5,9 @@
 #include <thread>
 
 #include "luxir/store/AcquireJoin.h"
+#include "luxir/store/AcquireRound.h"
+#include "luxir/util/IoContext.h"
+#include <future>
 #include "luxir/store/Manifest.h"
 #include "luxir/store/VerifiedDirectory.h"
 #include "test/GatedStorage.h"
@@ -55,6 +58,33 @@ public:
     }
   }
 };
+
+// Parks each batch until release(), as a request that has not returned yet.
+class ParkedInputFile : public InputFile {
+  std::shared_ptr<InputFile> delegate;
+  std::vector<std::pair<std::vector<ByteRange>, AcquireDone>> parked;
+
+public:
+  explicit ParkedInputFile(std::shared_ptr<InputFile> delegate) : delegate(std::move(delegate)) {}
+  size_t size() override { return delegate->size(); }
+  HeldRange acquire(ByteRange range) override { return delegate->acquire(range); }
+  void acquireBatch(std::span<const ByteRange> ranges, AcquireDone done) noexcept override {
+    parked.emplace_back(std::vector<ByteRange>(ranges.begin(), ranges.end()), std::move(done));
+  }
+  void release() {
+    for (auto& [ranges, done] : std::exchange(parked, {})) delegate->acquireBatch(ranges, std::move(done));
+  }
+};
+
+template <class Error>
+bool failsWith(std::exception_ptr failure) {
+  try {
+    if (failure) std::rethrow_exception(failure);
+  } catch (const Error&) {
+    return true;
+  } catch (...) {}
+  return false;
+}
 
 } // namespace
 
@@ -337,4 +367,67 @@ TEST(StrictStorageTest, joinDestroyedWithoutWaitWaitsForItsBatches) {
   }
   EXPECT_EQ(1u, taken.size());
   EXPECT_TRUE(dir.gate.timedOut());
+}
+
+TEST(StrictStorageTest, roundResumesOnArenaOrInline) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters);
+  put(dir, "a");
+  ByteRange ranges[] = {{0, 2}, {10, 1}};
+  oneapi::tbb::task_arena arena(2);
+
+  // Batches completing elsewhere, after the round ended issuing, resume the
+  // request on the arena. Parked, so the batch cannot complete first.
+  ParkedInputFile parked(dir.openFile("a"));
+  std::vector<HeldRange> holds;
+  std::promise<std::exception_ptr> resumed;
+  auto round = AcquireRound::create();
+  round->acquire(parked, ranges, [&](auto&& acquired) { holds = std::move(acquired); });
+  EXPECT_FALSE(round->resumeOn(arena, [&](std::exception_ptr failure) { resumed.set_value(failure); }));
+  std::jthread([&] { parked.release(); }).join();
+  EXPECT_EQ(nullptr, resumed.get_future().get());
+  ASSERT_EQ(2u, holds.size());
+  EXPECT_EQ("a", contents(holds[1]));
+
+  // Batches completing inline go on on the issuing thread; `then` never runs.
+  auto direct = dir.openFile("a");
+  round = AcquireRound::create();
+  round->acquire(*direct, ranges, [&](auto&& acquired) { holds = std::move(acquired); });
+  EXPECT_TRUE(round->resumeOn(arena, [](std::exception_ptr) { FAIL(); }));
+  EXPECT_EQ(nullptr, round->failure());
+  ByteRange outside[] = {{1, UINT64_MAX}};
+  round = AcquireRound::create();
+  round->acquire(*direct, outside, [](auto&&) { FAIL(); });
+  EXPECT_TRUE(round->resumeOn(arena, [](std::exception_ptr) { FAIL(); }));
+  EXPECT_NE(nullptr, round->failure());
+  holds.clear();
+}
+
+TEST(StrictStorageTest, roundEndsAtDeadlineOrStopAndKeepsLateHolds) {
+  auto counters = std::make_shared<StrictStorageCounters>();
+  StrictDirectory dir(std::make_shared<RAMDir>(), counters);
+  put(dir, "a");
+  ParkedInputFile parked(dir.openFile("a"));
+  ByteRange ranges[] = {{3, 4}};
+  auto late = std::make_shared<std::vector<HeldRange>>();
+  std::weak_ptr<std::vector<HeldRange>> owner = late;
+
+  auto round = AcquireRound::create(AcquireRound::Clock::now() + std::chrono::milliseconds(20));
+  round->acquire(parked, ranges, [late = late.get()](auto&& acquired) { *late = std::move(acquired); });
+  round->keep(std::move(late));
+  EXPECT_TRUE(failsWith<DeadlineExceededError>(round->wait()));
+  // The batch still lands where its take writes, which the round kept alive.
+  ASSERT_FALSE(owner.expired());
+  parked.release();
+  EXPECT_TRUE(owner.expired());
+
+  std::stop_source stop;
+  oneapi::tbb::task_arena arena(1);
+  std::promise<std::exception_ptr> resumed;
+  round = AcquireRound::create(AcquireRound::Clock::time_point::max(), stop.get_token());
+  round->acquire(parked, ranges, [](auto&&) {});
+  EXPECT_FALSE(round->resumeOn(arena, [&](std::exception_ptr failure) { resumed.set_value(failure); }));
+  stop.request_stop();
+  EXPECT_TRUE(failsWith<RequestCancelledError>(resumed.get_future().get()));
+  parked.release();
 }
