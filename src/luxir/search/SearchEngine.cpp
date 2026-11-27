@@ -1,7 +1,10 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstring>
+#include <iterator>
 #include <limits>
+#include <variant>
 #include <optional>
 
 #include "luxir/api/padded_input.h"
@@ -13,6 +16,30 @@
 #include "luxir/reader/SkipStats.h"
 
 namespace luxir {
+
+namespace {
+
+// "name:kind,..." for the in-flight table, truncated to its field.
+void summarizeOps(const ReqProto& proto, char (&out)[InflightRegistry::kOperationBytes]) {
+  static constexpr const char* kinds[] = {"none", "top_docs", "fusion", "field_facet", "range_facet",
+                                          "query_facet", "expr", "plugin"};
+  static_assert(std::size(kinds) == std::variant_size_v<decltype(api::SearchOp::kind)>);
+  size_t n = 0;
+  auto append = [&](std::string_view text) {
+    size_t take = std::min(text.size(), sizeof(out) - 1 - n);
+    memcpy(out + n, text.data(), take);
+    n += take;
+  };
+  for (const auto& [name, op] : proto.ops) {
+    if (n) append(",");
+    append(name);
+    append(":");
+    append(kinds[op->kind.index()]);
+  }
+  out[n] = '\0';
+}
+
+} // namespace
 
 const SearchConfig& SearchEngine::searchConfig() const {
   return node.getConfig().search;
@@ -61,6 +88,7 @@ std::vector<std::string> SearchEngine::explain(const ReqProto& proto, std::strin
 Metrics& SearchEngine::metrics() const { return *node.metrics; }
 
 void SearchEngine::submitBody(SearchRequest& req) {
+  req.inflight.phase(InflightPhase::RUNNING);
   MetricScope execution(*node.metrics, metricActivity(MetricStage::SEARCH_EXECUTION));
   LoadScope load(LoadKind::REQUEST);
   std::optional<FanoutCreditScope> credit;
@@ -162,6 +190,15 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver re
   req.counting = true;
   req.submitted = std::chrono::steady_clock::now();
   metrics().start(metricActivity(MetricStage::SEARCH));
+  {
+    char operation[InflightRegistry::kOperationBytes];
+    summarizeOps(req.proto, operation);
+    req.inflight = node.inflight().track({
+        .tenant = req.tenant.empty() ? CollectionId::kDefaultTenant : std::string_view(req.tenant),
+        .collection = req.proto.collection.empty() ? LuxirNode::kDefaultCollectionName : req.proto.collection,
+        .requestId = req.proto.request_id, .operation = operation, .maxParallel = maxParallel,
+        .kind = InflightKind::SEARCH, .transport = req.transport, .phase = InflightPhase::QUEUED});
+  }
   if (!req.proto.min_commit.empty()) {
     try {
       auto floor = CommitId::parse(req.proto.min_commit);

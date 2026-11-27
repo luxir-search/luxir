@@ -738,6 +738,27 @@ private:
   RouteMatch route_;
   MetricScope requestMetric;
   std::atomic<int> metricErrorKind{-1};  // the first ErrorKind, or -1
+  // An administration request's in-flight slot (searches and updates hold
+  // their own), from its headers until it finishes.
+  InflightRegistry::Entry adminInflight_;
+
+  void startAdminInflight() {
+    adminInflight_.release();
+    const char* operation = nullptr;
+    switch (route_.route) {
+      case Route::COLLECTION_CREATE: operation = "create_collection"; break;
+      case Route::COLLECTION_DELETE: operation = "delete_collection"; break;
+      case Route::COLLECTION_RENAME: operation = "rename_collection"; break;
+      case Route::COLLECTION_SWAP: operation = "swap_collections"; break;
+      case Route::SCHEMA: operation = "schema"; break;
+      case Route::STATS: case Route::METRICS: operation = "stats"; break;
+      case Route::PLUGIN: operation = "plugin"; break;
+      default: return;
+    }
+    adminInflight_ = node_.inflight().track({.tenant = tenant_, .collection = route_.coll, .requestId = requestId_,
+                                             .operation = operation, .kind = InflightKind::ADMIN,
+                                             .transport = InflightTransport::HTTP});
+  }
 
   void startRequestMetric() {
     metricErrorKind.store(-1, std::memory_order_relaxed);
@@ -761,6 +782,7 @@ private:
   // A request with a recorded error failed; a failed request counts its error
   // kind. Untracked (replication) requests count nothing.
   void finishRequestMetric(MetricOutcome outcome = MetricOutcome::OK) {
+    adminInflight_.release();
     if (!requestMetric.active()) return;
     int kind = metricErrorKind.load(std::memory_order_relaxed);
     if (outcome == MetricOutcome::OK && kind >= 0) outcome = MetricOutcome::ERROR;
@@ -949,6 +971,7 @@ private:
     // The request's scope is settled with its route, before the buffered and
     // streaming paths split; nothing carries over from an earlier request.
     tenant_ = route_.tenantRoute ? route_.tenant : std::string(CollectionId::kDefaultTenant);
+    startAdminInflight();
     pretty_ = route_.prettyDefault;
     if (const std::string* pretty = findParam(params, "pretty"); pretty && pretty->empty()) {
       pretty_ = true;  // A bare ?pretty also means true.
@@ -1944,6 +1967,7 @@ private:
     // context survives the request's teardown on the task-arena thread.
     sreq->shardPin = makeShardPin();
     sreq->tenant = tenant_;
+    sreq->transport = InflightTransport::HTTP;
 
     // Route by max_parallel: the default (0) starts the query here on the
     // shard thread and publishes segment shares to the task arena only once
@@ -2030,6 +2054,7 @@ private:
       fallback = ErrorKind::INTERNAL;
       auto collection = self->node_.getOrCreateCollection(LuxirNode::target(tenant, admission->req->collection));
       admission->target = collection->getId();
+      admission->track(self->node_, InflightTransport::HTTP);
       auto iw = collection->getShard()->requireIndexWriter();
       msg = admission.release();
       if (!iw->submitUpdate(msg)) throw std::runtime_error("update was not admitted");
@@ -3294,6 +3319,7 @@ private:
     auto message = std::make_shared<StreamingUpdateMessage>(
         &batch->proto, shared_from_this(), state, ordinal, batch);
     message->target = target->collection->getId();
+    message->track(node_, InflightTransport::HTTP);
     batch->message = message;
     auto [entry, inserted] =
         state->inFlightBatches.emplace(ordinal, HttpStreamUpdateState::InFlightBatch{batch});
@@ -3315,6 +3341,7 @@ private:
       submitError = currentExceptionInfo(ErrorKind::INTERNAL);
     }
     if (!success) {
+      message->inflight.release();
       HttpStreamBatchResult result;
       result.docCount = batch->docCount;
       result.deleteCount = batch->deleteCount;
@@ -3894,6 +3921,7 @@ private:
       auto message = std::make_unique<Commit>(std::move(request), shared_from_this(), state, writers, index);
       message->target = (*writers)[index].second.collection->getId();
       auto* msg = message.release();
+      msg->track(node_, InflightTransport::HTTP);
       try {
         bool admitted = false;
         node_.getTaskArena().execute([&] { admitted = (*writers)[index].second.indexWriter->submitUpdate(msg); });

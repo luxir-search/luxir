@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory_resource>
+#include <string>
 #include <string_view>
 
 #include "luxir/api/luxir_types.hpp"
@@ -31,6 +32,9 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
 // unavailable. Same borrowing contract as gatherStats.
 void gatherSystemStats(api::SystemStats* system, api::HostStats* host, std::string_view dataDirectory,
                        std::pmr::memory_resource& resource);
+
+// This process's cgroup v2 directory, or empty when it cannot be found.
+std::string cgroupDirectoryPath();
 
 // Apply the requested filter-cache actions (max_bytes resize / flush /
 // reset_admission / reset_counters) and gather post-action stats plus an

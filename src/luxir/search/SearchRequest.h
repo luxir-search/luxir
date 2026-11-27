@@ -29,6 +29,7 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
+#include "luxir/util/InflightRegistry.h"
 #include "luxir/util/proto.h"
 
 namespace luxir {
@@ -109,6 +110,11 @@ public:
   // An explain is prepared but never dispatched, so it does not count.
   std::chrono::steady_clock::time_point submitted;
   bool counting = false;
+  // The transport that received the request, as the in-flight table shows it.
+  InflightTransport transport = InflightTransport::INTERNAL;
+  // The request's slot in the node's in-flight table, claimed by dispatch()
+  // and released with the request.
+  InflightRegistry::Entry inflight;
   SearchEngine& engine;
   const SearchConfig searchConfig;
   RequestMemTracker memoryTracker;

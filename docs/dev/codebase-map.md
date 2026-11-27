@@ -26,6 +26,9 @@ locations, browse `src/luxir/<area>/`.
      tenant/incarnation. Stages missing data, then applies each tenant mapping
      through `Collections` for ready bindings, leaving dependent names unavailable
      when their old data now belongs to another name
+   - `util/InflightRegistry`: Fixed table of running requests (search, update, admin), claimed
+     lock-free per request and readable from a signal handler; file-backed under `node/inflight`
+     (MAP_SHARED) so the next start reports an unclean exit, with `CrashHandler` dumping it on a fatal signal
    - `Scrubber`: Paced background re-verification of published snapshot files; a mismatch
      fails the collection (`Collections::fail`) and a follower repairs it
    - `ReplicationSource`: Local discovery catalog, cursors, follower liveness and acknowledgments,
