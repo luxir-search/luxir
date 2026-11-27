@@ -208,7 +208,7 @@ private:
       maxDocid = std::max(maxDocid, docid);
     }
     header.docBits = (uint8_t)std::bit_width(maxResidual);
-    BKDForCodec::encode(scratch, header.docBits, encodedDocs);
+    ForCodec::encode(scratch, header.docBits, encodedDocs);
 
     uint64_t firstWord = (uint64_t)docBase >> 6;
     uint64_t lastWord = (uint64_t)maxDocid >> 6;
@@ -365,7 +365,7 @@ public:
     uint64_t directory = (leaves - 1) * sizeof(InnerNode)
         + leaves * 4 * sizeof(Scalar) + (leaves + 1) * sizeof(uint64_t);
     uint32_t size = DEFAULT_MAX_POINTS_PER_LEAF;
-    uint64_t docs = BKDForCodec::byteSize(size, 31);
+    uint64_t docs = ForCodec::byteSize(size, 31);
     uint64_t payload = docs + 2 * CoordinateCodec::byteSize(size, std::numeric_limits<Unsigned>::digits);
     uint64_t scratch = (uint64_t)size * (sizeof(uint32_t) + sizeof(Unsigned))
         + docs + CoordinateCodec::encodeScratchBytes(size);

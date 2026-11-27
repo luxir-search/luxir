@@ -86,7 +86,10 @@ locations, browse `src/luxir/<area>/`.
      the schema permits multiple values. Interval endpoints always carry ranks.
    - `PointsReader` reads the optional 1-D sorted-leaf points index of a
      `RANGE`-indexed numeric field (value-sorted leaves + fence directory;
-     exact ordinal counts). `BasicBKDReader<PointTraits>` shares 2-D tree
+     exact ordinal counts). A leaf is a 5-byte header (docBase, delta width;
+     plus a u64 gcd when it exceeds 1), then docids, then FOR-packed deltas
+     of `(value - leafMin) / gcd` (low/high streams past 32 bits); leaf
+     count, docid codec and leafMin come from the directory. `BasicBKDReader<PointTraits>` shares 2-D tree
      traversal and leaf decoding: `BKDInt32Traits` serves geo coordinates
      (`BKDReader`), and `BKDInt64Traits` serves range endpoints. Traits own
      scalar types, format layouts, and coordinate codecs. The record

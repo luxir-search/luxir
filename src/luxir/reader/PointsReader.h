@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "PostingsReader.h"
-#include "luxir/codec/Codec.h"
+#include "luxir/codec/ForCodec.h"
 #include "luxir/index/PointsWriter.h"
 #include "luxir/util/screaming.h"
 
@@ -215,15 +215,19 @@ public:
     bool operator==(const Point&) const = default;
   };
 
+  // Leaf layout. count and the docid fields derive from the directory; the
+  // rest is read from the leaf header.
   struct LeafInfo {
     uint16_t count;
     uint8_t docCodec;
     uint8_t docBits;
-    uint8_t valueFormat;
+    uint8_t valueFormat;  // Bit width of the residual deltas.
     uint32_t docBase;
     uint32_t docBytes;
-    int64_t valueMin;
     uint64_t valueGcd;
+    uint32_t headerBytes;
+
+    uint64_t valueBytes() const { return SplitForCodec::byteSize(count, valueFormat); }
   };
 
   PointsReader(PostingsReader& reader, const DecodedFieldRecord& fieldInfo)
@@ -338,47 +342,15 @@ public:
 
   LeafValueBounds valueBounds(uint32_t leafIndex, int64_t lo, int64_t hi,
                               std::span<uint32_t> residualScratch,
-                              std::span<int64_t> rawScratch) const {
-    LeafInfo info = leafInfo(leafIndex);
+                              std::span<int64_t> valueScratch) const {
     LeafValueBounds bounds;
     int64_t min = leafMin(leafIndex);
     int64_t max = leafMax(leafIndex);
     if (hi < min || max < lo) return bounds;
-    if (lo <= min && max <= hi) return {0, info.count};
+    if (lo <= min && max <= hi) return {0, leafPointCount(leafIndex)};
 
-    const char* payload = points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE
-                        + info.docBytes;
-    if (info.valueFormat <= 32) {
-      if (residualScratch.size() < info.count) {
-        throw std::invalid_argument("PointsReader: residual scratch is too small");
-      }
-      IndexCodec::numericCodec.decodeWithMeta(payload, residualScratch.data(),
-                                               info.count, info.valueFormat);
-      uint64_t lower = 0;
-      if (lo > min) {
-        uint64_t delta = (uint64_t)lo - (uint64_t)min;
-        lower = delta / info.valueGcd + (delta % info.valueGcd != 0);
-      }
-      uint64_t upper = ((uint64_t)max - (uint64_t)min) / info.valueGcd;
-      if (hi < max) {
-        upper = ((uint64_t)hi - (uint64_t)min) / info.valueGcd;
-      }
-      if (lower > UINT32_MAX) return bounds;
-      uint32_t lowerResidual = (uint32_t)lower;
-      uint32_t upperResidual = upper > UINT32_MAX ? UINT32_MAX : (uint32_t)upper;
-      auto values = residualScratch.first(info.count);
-      bounds.lower = (uint16_t)(std::lower_bound(values.begin(), values.end(),
-                                                  lowerResidual) - values.begin());
-      bounds.upper = (uint16_t)(std::upper_bound(values.begin(), values.end(),
-                                                  upperResidual) - values.begin());
-      return bounds;
-    }
-
-    if (rawScratch.size() < info.count) {
-      throw std::invalid_argument("PointsReader: raw scratch is too small");
-    }
-    memcpy(rawScratch.data(), payload, (size_t)info.count * sizeof(int64_t));
-    auto values = rawScratch.first(info.count);
+    uint16_t count = decodeLeafValuesInto(leafIndex, valueScratch, residualScratch);
+    auto values = valueScratch.first(count);
     bounds.lower = (uint16_t)(std::lower_bound(values.begin(), values.end(), lo)
                                - values.begin());
     bounds.upper = (uint16_t)(std::upper_bound(values.begin(), values.end(), hi)
@@ -454,9 +426,8 @@ public:
         uint16_t begin;
         uint16_t end;
         if (range.lo <= leafLo && leafHi <= range.hi) {
-          LeafInfo info = leafInfo(leaf);
           begin = 0;
-          end = info.count;
+          end = leafPointCount(leaf);
         } else {
           if (count == 0) {
             count = decodeLeafValuesInto(
@@ -512,8 +483,7 @@ public:
       emitRun((int32_t)(info.docBase + begin), (int32_t)(info.docBase + end));
       return;
     }
-    const char* payload =
-        points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE;
+    const char* payload = points + leafFP(leafIndex) + info.headerBytes;
     if (info.docCodec == PointsWriter::DOC_BITSET) {
       uint32_t wordCount = info.docBytes / sizeof(uint64_t);
       int32_t wordBase = (int32_t)(info.docBase >> 6);
@@ -591,6 +561,8 @@ public:
     }
   }
 
+  // Values of one leaf in ordinal order. residualScratch holds the unpacked
+  // deltas when they fit 32 bits; wider deltas unpack in place in values.
   uint16_t decodeLeafValuesInto(
       uint32_t leafIndex, std::span<int64_t> values,
       std::span<uint32_t> residualScratch) const {
@@ -599,19 +571,7 @@ public:
       throw std::invalid_argument(
           "PointsReader: leaf value scratch is too small");
     }
-    const char* docPayload =
-        points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE;
-    const char* valuePayload = docPayload + info.docBytes;
-    if (info.valueFormat <= 32) {
-      IndexCodec::numericCodec.decodeWithMeta(valuePayload, residualScratch.data(),
-                                               info.count, info.valueFormat);
-      for (uint32_t i = 0; i < info.count; i++) {
-        values[i] = (int64_t)((uint64_t)residualScratch[i] * info.valueGcd
-                              + (uint64_t)info.valueMin);
-      }
-    } else {
-      memcpy(values.data(), valuePayload, (size_t)info.count * sizeof(int64_t));
-    }
+    decodeValues(leafIndex, info, values.first(info.count), residualScratch);
     return info.count;
   }
 
@@ -624,7 +584,7 @@ public:
       throw std::invalid_argument("PointsReader: leaf decode scratch is too small");
     }
 
-    const char* docPayload = points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE;
+    const char* docPayload = points + leafFP(leafIndex) + info.headerBytes;
     if (info.docCodec == PointsWriter::DOC_CONTIG) {
       for (uint32_t i = 0; i < info.count; i++) docids[i] = info.docBase + i;
     } else if (info.docCodec == PointsWriter::DOC_FOR) {
@@ -658,59 +618,50 @@ public:
       invalid("reserved docid codec");
     }
 
-    return decodeLeafValuesInto(leafIndex, values, residualScratch);
+    decodeValues(leafIndex, info, values.first(info.count), residualScratch);
+    return info.count;
   }
 
   void validate() const {
     uint64_t countedPoints = 0;
+    std::vector<int64_t> values(leafSizeMax);
+    std::vector<uint32_t> residuals(leafSizeMax);
     for (uint32_t i = 0; i < leavesCount; i++) {
       uint64_t start = leafFP(i);
       uint64_t end = leafFP(i + 1);
       if (start >= end) invalid("leaf pointers must be strictly increasing");
       if (end > metaOffset) invalid("leaf overlaps metadata");
-      if (end - start < PointsWriter::LEAF_HEADER_SIZE) invalid("truncated leaf header");
+      if (end - start < PointsWriter::LEAF_HEADER_MIN_SIZE) invalid("truncated leaf header");
       if (i > 0 && leafMin(i) < leafMin(i - 1)) invalid("leafMin is not non-decreasing");
       if (leafMax(i) < leafMin(i)) invalid("leafMax is below leafMin");
       if (i > 0 && leafMin(i) < leafMax(i - 1)) invalid("leaf value ranges are out of order");
 
+      uint32_t encoding = leafEncoding(i);
+      uint32_t detail = encoding >> 2;
+      if ((encoding & 3) == PointsWriter::DOC_FOR && detail > 31) invalid("FOR docBits exceeds 31");
+      if ((encoding & 3) == PointsWriter::DOC_BITSET
+          && (uint64_t)detail * sizeof(uint64_t) > end - start) {
+        invalid("docid payload exceeds leaf");
+      }
+      if (end - start < PointsWriter::leafHeaderSize((uint8_t)points[start + 4])) invalid("truncated leaf header");
       auto info = leafInfo(i);
-      uint32_t detail = info.docCodec == PointsWriter::DOC_CONTIG ? info.docBase & 63
-          : info.docCodec == PointsWriter::DOC_FOR ? info.docBits : info.docBytes / 8;
-      if (leafEncoding(i) != (detail << 2 | info.docCodec)) {
-        invalid("leaf encoding summary does not match header");
+      if ((points[start + 4] & PointsWriter::VALUE_GCD) && info.valueGcd <= 1) {
+        invalid("stored valueGcd must exceed one");
       }
-      if (info.count == 0 || info.count > leafSizeMax) invalid("invalid leaf point count");
-      if (i + 1 < leavesCount && info.count != leafSizeMax) {
-        invalid("non-final leaf is not full");
-      }
-      if (info.valueMin != leafMin(i)) invalid("leaf valueMin does not match directory");
-      if (info.valueGcd == 0) invalid("valueGcd must be positive");
       if (info.docBase > (uint32_t)std::numeric_limits<int32_t>::max()) invalid("docBase exceeds int32");
       if (info.valueFormat > 64) invalid("invalid value format");
-      if ((uint8_t)points[start + 5] != 0x11 || (uint8_t)points[start + 6] != 0x11
-          || (uint8_t)points[start + 7] != 0x11) {
-        invalid("bad leaf reserved bytes");
-      }
-      if ((uint64_t)PointsWriter::LEAF_HEADER_SIZE + info.docBytes > end - start) {
+      if ((uint64_t)info.headerBytes + info.docBytes > end - start) {
         invalid("docid payload exceeds leaf");
       }
       if (info.docCodec == PointsWriter::DOC_CONTIG) {
-        if (info.docBits != 0 || info.docBytes != 0) invalid("invalid CONTIG metadata");
+        if (detail != (info.docBase & 63)) invalid("leaf encoding summary does not match header");
         if ((uint64_t)info.docBase + info.count - 1
             > (uint64_t)std::numeric_limits<int32_t>::max()) {
           invalid("CONTIG docids exceed int32");
         }
-      } else if (info.docCodec == PointsWriter::DOC_FOR) {
-        if (info.docBits > 31) invalid("FOR docBits exceeds 31");
-        if (info.docBytes != LuxirSIMDFor::byteSize(info.count, info.docBits)) {
-          invalid("invalid FOR byte length");
-        }
       } else if (info.docCodec == PointsWriter::DOC_BITSET) {
-        if (info.docBits != 0) invalid("BITSET docBits must be zero");
-        if (info.docBytes == 0 || info.docBytes % sizeof(uint64_t) != 0) {
-          invalid("invalid BITSET byte length");
-        }
-        const char* payload = points + start + PointsWriter::LEAF_HEADER_SIZE;
+        if (info.docBytes == 0) invalid("invalid BITSET byte length");
+        const char* payload = points + start + info.headerBytes;
         uint32_t wordCount = info.docBytes / sizeof(uint64_t);
         uint64_t firstWord = load<uint64_t>(payload);
         uint32_t baseBit = info.docBase & 63;
@@ -737,26 +688,18 @@ public:
         if (maxDocid > (uint64_t)std::numeric_limits<int32_t>::max()) {
           invalid("BITSET docid exceeds int32");
         }
-        uint64_t expectedBytes =
-            (((maxDocid >> 6) - ((uint64_t)info.docBase >> 6)) + 1)
-            * sizeof(uint64_t);
-        if (expectedBytes != info.docBytes) {
-          invalid("BITSET byte length does not match docid span");
-        }
-      } else {
-        invalid("reserved docid codec");
       }
-      uint64_t valueBytes = end - start - PointsWriter::LEAF_HEADER_SIZE - info.docBytes;
-      uint64_t expectedValueBytes = info.valueFormat <= 32
-        ? LuxirSIMDFor::byteSize(info.count, info.valueFormat)
-        : (uint64_t)info.count * sizeof(int64_t);
-      if (valueBytes != expectedValueBytes) invalid("invalid value payload length");
-      if (valueAt(i, 0) != leafMin(i) || valueAt(i, info.count - 1) != leafMax(i)) {
+      uint64_t valueBytes = end - start - info.headerBytes - info.docBytes;
+      uint64_t padding = i + 1 == leavesCount ? MAX_ALIGN - 1 : 0;
+      if (valueBytes < info.valueBytes() || valueBytes - info.valueBytes() > padding) {
+        invalid("invalid value payload length");
+      }
+      auto leafValues = std::span(values).first(info.count);
+      decodeValues(i, info, leafValues, residuals);
+      if (leafValues.front() != leafMin(i) || leafValues.back() != leafMax(i)) {
         invalid("leaf values do not match directory fences");
       }
-      if (std::numeric_limits<uint64_t>::max() - countedPoints < info.count) {
-        invalid("pointCount overflow");
-      }
+      if (!std::is_sorted(leafValues.begin(), leafValues.end())) invalid("leaf values are not sorted");
       countedPoints += info.count;
     }
     if (countedPoints != pointsCount) invalid("leaf counts do not sum to pointCount");
@@ -777,83 +720,40 @@ public:
     return load<uint64_t>(leafPointers + (uint64_t)leafIndex * sizeof(uint64_t));
   }
 
-  LeafInfo leafInfo(uint32_t leafIndex) const {
-    if (leafIndex >= leavesCount) throw std::out_of_range("PointsReader: leaf index");
-    const char* header = points + leafFP(leafIndex);
-    return {load<uint16_t>(header), (uint8_t)header[2], (uint8_t)header[3],
-            (uint8_t)header[4], load<uint32_t>(header + 8), load<uint32_t>(header + 12),
-            load<int64_t>(header + 16), load<uint64_t>(header + 24)};
+  uint16_t leafPointCount(uint32_t leafIndex) const {
+    return (uint16_t)(leafOrdinalEnd(leafIndex) - leafOrdinalStart(leafIndex));
   }
 
-  int64_t valueAt(uint32_t leafIndex, uint16_t pointIndex) const {
-    LeafInfo info = leafInfo(leafIndex);
-    if (pointIndex >= info.count) throw std::out_of_range("PointsReader: point index");
-    const char* values = points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE + info.docBytes;
-    if (info.valueFormat <= 32) {
-      uint32_t residual = IndexCodec::numericCodec.selectWithMeta(
-        values, info.count, pointIndex, 0, info.valueFormat);
-      return (int64_t)((uint64_t)residual * info.valueGcd + (uint64_t)info.valueMin);
+  LeafInfo leafInfo(uint32_t leafIndex) const {
+    uint32_t encoding = leafEncoding(leafIndex);
+    uint32_t detail = encoding >> 2;
+    LeafInfo info{};
+    info.count = leafPointCount(leafIndex);
+    info.docCodec = (uint8_t)(encoding & 3);
+    if (info.docCodec == PointsWriter::DOC_FOR) {
+      info.docBits = (uint8_t)detail;
+      info.docBytes = (uint32_t)ForCodec::byteSize(info.count, info.docBits);
+    } else if (info.docCodec == PointsWriter::DOC_BITSET) {
+      info.docBytes = detail * (uint32_t)sizeof(uint64_t);
+    } else if (info.docCodec != PointsWriter::DOC_CONTIG) {
+      invalid("reserved docid codec");
     }
-    return load<int64_t>(values + (uint64_t)pointIndex * sizeof(int64_t));
+    const char* header = points + leafFP(leafIndex);
+    info.docBase = load<uint32_t>(header);
+    auto valueByte = (uint8_t)header[4];
+    info.valueFormat = valueByte & PointsWriter::VALUE_BITS_MASK;
+    info.valueGcd = valueByte & PointsWriter::VALUE_GCD ? load<uint64_t>(header + 5) : 1;
+    info.headerBytes = PointsWriter::leafHeaderSize(valueByte);
+    return info;
   }
 
   std::vector<Point> decodeLeaf(uint32_t leafIndex) const {
-    LeafInfo info = leafInfo(leafIndex);
-    const char* docPayload = points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE;
-    const char* valuePayload = docPayload + info.docBytes;
-    std::vector<uint32_t> docs(info.count);
-    std::vector<uint32_t> values;
-    std::vector<Point> decoded(info.count);
-
-    if (info.docCodec == PointsWriter::DOC_CONTIG) {
-      for (uint32_t i = 0; i < info.count; i++) docs[i] = info.docBase + i;
-    } else if (info.docCodec == PointsWriter::DOC_FOR) {
-      uint32_t read = IndexCodec::numericCodec.decodeWithMeta(docPayload, docs.data(),
-                                                               info.count, info.docBits);
-      if (read != info.docBytes) invalid("FOR decoder byte length mismatch");
-      for (auto& doc : docs) {
-        uint64_t restored = (uint64_t)doc + info.docBase;
-        if (restored > (uint64_t)std::numeric_limits<int32_t>::max()) invalid("decoded docid exceeds int32");
-        doc = (uint32_t)restored;
-      }
-    } else if (info.docCodec == PointsWriter::DOC_BITSET) {
-      uint32_t size = 0;
-      uint32_t wordBase = info.docBase >> 6;
-      uint32_t wordCount = info.docBytes / sizeof(uint64_t);
-      for (uint32_t wordIndex = 0; wordIndex < wordCount; wordIndex++) {
-        uint64_t word = load<uint64_t>(
-            docPayload + (uint64_t)wordIndex * sizeof(uint64_t));
-        while (word != 0) {
-          if (size == info.count) {
-            invalid("BITSET popcount exceeds count");
-          }
-          uint32_t bit = (uint32_t)std::countr_zero(word);
-          docs[size++] = (wordBase + wordIndex) * 64 + bit;
-          word &= word - 1;
-        }
-      }
-      if (size != info.count) invalid("BITSET popcount does not match count");
-    } else {
-      invalid("reserved docid codec");
-    }
-
-    if (info.valueFormat <= 32) {
-      values.resize(info.count);
-      uint32_t read = IndexCodec::numericCodec.decodeWithMeta(valuePayload, values.data(),
-                                                               info.count, info.valueFormat);
-      uint64_t expected = leafFP(leafIndex + 1) - leafFP(leafIndex)
-                        - PointsWriter::LEAF_HEADER_SIZE - info.docBytes;
-      if (read != expected) invalid("value decoder byte length mismatch");
-      for (uint32_t i = 0; i < info.count; i++) {
-        decoded[i] = {(int64_t)((uint64_t)values[i] * info.valueGcd + (uint64_t)info.valueMin),
-                      (int32_t)docs[i]};
-      }
-    } else {
-      for (uint32_t i = 0; i < info.count; i++) {
-        decoded[i] = {load<int64_t>(valuePayload + (uint64_t)i * sizeof(int64_t)),
-                      (int32_t)docs[i]};
-      }
-    }
+    std::vector<int64_t> values(leafSizeMax);
+    std::vector<uint32_t> docids(leafSizeMax);
+    std::vector<uint32_t> residuals(leafSizeMax);
+    uint16_t count = decodeLeafInto(leafIndex, values, docids, residuals);
+    std::vector<Point> decoded(count);
+    for (uint16_t i = 0; i < count; i++) decoded[i] = {values[i], (int32_t)docids[i]};
     return decoded;
   }
 
@@ -865,6 +765,38 @@ public:
       decoded.insert(decoded.end(), leafPoints.begin(), leafPoints.end());
     }
     return decoded;
+  }
+
+private:
+  // Unpack the residual deltas, prefix-sum them and restore values from the
+  // directory leafMin and the leaf gcd.
+  void decodeValues(uint32_t leafIndex, const LeafInfo& info, std::span<int64_t> values,
+                    std::span<uint32_t> residualScratch) const {
+    uint64_t min = (uint64_t)leafMin(leafIndex);
+    uint64_t gcd = info.valueGcd;
+    uint32_t count = info.count;
+    if (info.valueFormat == 0) {
+      std::fill(values.begin(), values.end(), (int64_t)min);
+      return;
+    }
+    if (info.valueFormat > 64) invalid("invalid value format");
+    const char* payload = points + leafFP(leafIndex) + info.headerBytes + info.docBytes;
+    uint64_t residual = 0;
+    if (info.valueFormat <= 32) {
+      ForCodec::decode(payload, count, info.valueFormat, residualScratch);
+      for (uint32_t i = 0; i < count; i++) {
+        residual += residualScratch[i];
+        values[i] = (int64_t)(min + residual * gcd);
+      }
+      return;
+    }
+    // int64_t and uint64_t may alias, so wide deltas unpack in place.
+    std::span<uint64_t> deltas{reinterpret_cast<uint64_t*>(values.data()), count};
+    SplitForCodec::decode(payload, count, info.valueFormat, deltas);
+    for (uint32_t i = 0; i < count; i++) {
+      residual += deltas[i];
+      deltas[i] = min + residual * gcd;
+    }
   }
 };
 
