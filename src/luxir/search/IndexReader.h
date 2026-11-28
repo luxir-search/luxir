@@ -225,6 +225,7 @@ public:
       uint64_t seg_id;          // Unique identifier for the segment
       uint64_t live_gen;        // What deletes version to use for the segment (0 if no deletes)
       uint64_t source_gen = 0;  // Generation of the segment's source map (0 if its docs keep no source)
+      bool source_versions = false;  // the source map holds versions of patched docs (SourceMap::versions)
       uint64_t min_version;     // Minimum update version in this segment
       uint64_t max_version;     // Maximum update version in this segment
       uint64_t commit_time;     // first time this segment was committed as part of the index

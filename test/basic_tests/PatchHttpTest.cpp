@@ -156,6 +156,21 @@ TEST_F(PatchHttpTest, rejectsWhatCannotResolve) {
   EXPECT_TRUE(has(res.body(), "narrowed")) << res.body();
 }
 
+// A source-only field is returned from the source when named, and only then.
+TEST_F(PatchHttpTest, sourceOnlyFieldsAreRetrievedFromTheSource) {
+  post("/collections/_create", R"({"name":"p_only","schema":{"stored_resources":{"_source_":{}},)"
+                               R"("fields":{"note":{"type":"string","index":"none","column":false,"multi":true}}}})");
+  update("p_only", R"({"docs":[{"id":"a","n_i":1,"note":"x"}],"commit":{}})");
+  auto res = update("p_only", R"({"patches":[{"id":"a","ops":[{"op":"append","path":"note","value":"y"}]}]})");
+  EXPECT_TRUE(has(res, R"("status":"updated")")) << res;
+  auto body = post("/collections/p_only/_search?format=docs", R"({"query":{"all":true},"fields":["id","note"]})");
+  EXPECT_TRUE(has(body, R"("note":["x","y"])")) << body;
+  body = post("/collections/p_only/_search?format=docs", R"({"query":{"all":true},"fields":["*"]})");
+  EXPECT_FALSE(has(body, "note")) << body;
+  auto stats = httpRequest(server->getPort(), http::verb::get, "/_stats").body();
+  EXPECT_TRUE(has(stats, R"("source_only":)")) << stats;
+}
+
 TEST_F(PatchHttpTest, ndjsonStreamsRejectPatches) {
   create("p_ndjson");
   auto res = request("/collections/p_ndjson/_update?commit=true",

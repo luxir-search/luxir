@@ -348,6 +348,33 @@ update. Like any update, if the commit that publishes the patched documents
 fails, the request reports an error but those documents may still be
 published by a later commit.
 
+### Source-only fields
+
+A field that is not indexed, has no column and keeps no stored copy lives
+only in the document's source:
+
+```json
+{"fields":{"note":{"type":"string","index":"none","column":false}}}
+```
+
+It takes any JSON value (with `multi` set, any number of them) and is
+returned when a request names it in `fields` (read from the source, so a
+document without a stored source has none), but not by `*`. It cannot be
+searched, sorted, faceted or used in an expression; those requests fail and
+name the field. Use one for data that only rides along with a document:
+notes, display payloads, values another system reads back.
+
+A patch that changes only source-only fields does not reindex the document:
+the engine writes its new source to a new file and points the document at it,
+so the postings, columns and segment statistics stay as they were, no new
+segment is written and no merge follows. Its `_version_` becomes the
+request's update version, as for any patch, so `if_version` keeps working. A
+patch that also changes an indexed field reindexes the document as above.
+Some patches reindex although they change only source-only fields: the
+document's segment is being merged at that moment, or the document's newest
+version is itself a patch result not yet indexed. They give the same result,
+at the cost of reindexing.
+
 ## Field mapping
 
 `field_map` renames input keys at ingest, so an existing NDJSON dump can be

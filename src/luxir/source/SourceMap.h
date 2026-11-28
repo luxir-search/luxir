@@ -5,7 +5,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "luxir/store/Directory.h"
@@ -24,6 +26,7 @@ namespace luxir {
 //   LUXIR header | u64 format=1 | u32 n_files | u32 n_runs
 //   | n_files * (u32 len, name, u32 docs, u64 bytes)
 //   | n_runs * (u32 doc_start, count, file, ordinal)
+//   | u32 n_versions | n_versions * (u32 doc, u64 version)
 //   | u64 xxh3 of everything before
 struct SourceRun {
   int32_t docStart = 0;
@@ -40,10 +43,22 @@ struct SourceFileRef {
   uint64_t bytes = 0;  // file size
 };
 
+// A doc pointed at a new record by a patch (SourceMap::replace).
+struct SourceReplacement {
+  int32_t doc = 0;
+  uint32_t file = 0;
+  uint32_t ordinal = 0;
+  uint64_t version = 0;  // 0 keeps the doc's recorded version, if any
+};
+
 class SourceMap {
 public:
   std::vector<SourceFileRef> files;  // in first-use order
   std::vector<SourceRun> runs;       // ascending docStart, non-overlapping
+  // Docs whose record a patch replaced without reindexing them, with the
+  // patch's update version, which is their _version_ (their birth in the
+  // segment is the version they were indexed with). Ascending doc.
+  std::vector<std::pair<int32_t, uint64_t>> versions;
 
   // Index of the file named `ref.name` in files, adding it when new.
   uint32_t fileIndex(const SourceFileRef& ref);
@@ -58,6 +73,19 @@ public:
   // the run after it are tried before the binary search, so lookups in doc
   // order cost no search. Set to the run found.
   bool locate(int32_t doc, size_t& hint, uint32_t& file, uint32_t& ordinal) const;
+
+  // Points `doc` at `ordinal` of `file` and records `version` as its version,
+  // splitting the run that covered it.
+  void replace(int32_t doc, uint32_t file, uint32_t ordinal, uint64_t version);
+  // As above for many docs in one pass over the runs; `sorted` is in
+  // ascending doc order without repeats.
+  void replace(std::span<const SourceReplacement> sorted);
+
+  // Drops the files no run refers to.
+  void dropUnreferencedFiles();
+
+  // The version a patch recorded for doc, or 0.
+  uint64_t version(int32_t doc) const;
 
   // Orders the runs by docStart and joins adjacent ones, for runs added out of
   // order (a merge that reorders documents).

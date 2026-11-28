@@ -535,6 +535,7 @@ IndexReader::OpenedSnapshot IndexReader::openSnapshot(Directory& dir, const Inde
         segmentInfo.seg_id = segId;
         segmentInfo.live_gen = liveGen;
         segmentInfo.source_gen = segment.source_gen;
+        segmentInfo.source_versions = segment.source_versions;
         segmentInfo.min_version = segment.min_version;
         segmentInfo.max_version = segment.max_version;
         segmentInfo.max_doc = nDocs;

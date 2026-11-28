@@ -29,7 +29,8 @@ encoding, which needs a frozen copy of its own before that.
   durable only at commit, so a writer reopened after an uncommitted flush or merge
   hands the same `seq` out again; the writer epoch in the name keeps the name
   fresh, and the startup sweep removes the older epoch's orphan. The segment
-  records the map's generation in `SegmentInfo.source_gen`.
+  records the map's generation in `SegmentInfo.source_gen`; a source-only
+  patch publishes a later one (see [Source-only patches](#source-only-patches)).
 - Record *i* of a flush is doc *i*: `Inverter::addSource` pads documents indexed
   without a source with placeholders and throws if a call would put a record
   anywhere else (a second call for one doc, or one before `startDoc`).
@@ -72,6 +73,11 @@ goes with the last segment that lists it.
   lists it; a merge output that inherits it keeps it alive by listing it.
 - A file only never-committed segments held is retired when those segments die
   without passing it on (`IndexWriter::unreferencedSharedFilesLocked`).
+- A source-only patch's file is held by reference by each segment whose map
+  names it, and leaves a segment's list once a later patch replaced all of
+  its records there; it is retired when no segment or snapshot lists it.
+  After a reopen such a file is part of the segment's loaded file list and
+  stays listed until a merge.
 - `Manifest::indexFile` recognizes source file and map names, and
   `Manifest::fileEpoch` reads their epoch, so orphan sweeps reach them.
 
@@ -228,13 +234,67 @@ below it. A newer overwrite or delete of a patched id, committed before the
 patched document reaches a segment, would otherwise retire its packet and
 leave the patched document live beside it; pinned, the packet stays pending
 and reaches the patched document's segment. A commit that fails before it
-publishes discards its resolution, so the request's patches had no effect.
+publishes discards the resolution of the patches it would reindex, so they
+had no effect; a source-only patch (below) is already attached to its segment
+and is published by the next commit, like documents a failed commit flushed.
 
 A message admitted while an earlier one's patched documents are resolved but
 not yet indexed must build on them. The writer keeps those documents by id
 (`unpublishedPatches`) until their follow-up completes; resolution takes such
 a document as the base when it is newer than every segment document of the
 id and no packet the commit applied deletes the id after it.
+
+### Source-only patches
+
+A field with no postings, column, stored copy or variant (a STRING-like field
+with `index: none`, `column: false`, `stored: false`) leaves nothing in a
+segment but its source: ingest only checks its shape. A patch whose result
+differs from its base only in such fields (`source::changedKeys` compares the
+last value of each top-level key byte for byte) needs no reindexing, so
+resolution replaces the record instead (`IndexWriter::writeSourcePatches`):
+
+1. The commit writes the new records of all such patches to one new source
+   file, without a dictionary (a file carries its dictionary, which would
+   outweigh a few records; the next merge relocates them into one that has it).
+2. Each segment holding a patched document gets the next generation of its
+   map: the document's run is split to point at its new record, and the map's
+   version table (`SourceMap::versions`) records the patch's update version.
+   Files no run refers to any more drop out of the map. Each commit that
+   patches a segment adds a file to it, so when the map would name more than
+   `2 * max_files` files, the records of the files it uses least are copied
+   into the commit's file as well (a fold, read in file order and written in
+   doc order so neighbouring docs join one run), down to `max_files`; they
+   keep their versions. A map is rewritten whole, so a commit's cost grows
+   with the runs and versions of each segment it patches; per-commit override
+   files would make it proportional to the patches instead.
+3. Under `indexMutex`, the new map and file are attached to the segment
+   (`SegInfo::patchedSourceMap`, `patchedSourceFiles`; `baseFiles` stays
+   immutable), its `sourceGen` advances, and the same commit publishes them:
+   the manifest lists them with the segment's files and sets
+   `SegmentInfo.source_versions`. A reader opens a new `SourceReader` when the
+   map name changes. The replaced map goes once no snapshot lists it
+   (`SegInfo::obsoleteSourceFiles`, retired with the obsolete live-docs
+   generations after each commit).
+
+The document keeps its birth, so delete watermarks treat it as before: any
+later overwrite or delete of the id is newer than the patch and retires it
+with the document. Its `_version_` is the recorded version: retrieval reads
+the map's version table for segments with `source_versions`, and resolution
+takes it as the base version, so `if_version` holds. A merge carries the
+version table through its document mapping (`mergeSources`), and its
+liveness accounting sees the replaced records as garbage, which relocation
+reclaims under `min_live_ratio`.
+
+A merge that has read a segment's map would not carry a newer generation into
+its output, so a segment that is merging (or was merged into a segment not yet
+published) is not patched this way: its documents take the reindexing path,
+decided again under `indexMutex` when the map is installed. So is a document
+whose base is an unpublished patch result. A failure writing the file or a
+map, or reading a record to fold, also falls back to reindexing. Like documents a failed commit flushed, a map installed by a
+commit that fails later is published by the next commit.
+
+A source-only field is retrieved only when a request names it, by the same
+path as a source-backed stored field (`loadSourceBackedValues`).
 
 Writers start their update versions `2^32` past the manifest's when they reopen
 an index, so a version acknowledged before a crash, or by a primary a
@@ -244,8 +304,8 @@ against document births, and a reused version could match a different state.
 ## Not yet implemented
 
 Retraining the dictionary, source-only compaction of a segment, degraded-file statistics, the offline
-`luxir-source-dump` tool, tombstone files, source-only fields, and partial updates
-that skip reindexing (phases 2 to 4 of the plan in issue 97). A flush buffers the segment's whole
+`luxir-source-dump` tool and tombstone files (phases 2 and 3 of the plan in issue 97), and
+column updates without reindexing. A flush buffers the segment's whole
 compressed source file in memory until the segment flushes (RAM-accounted, so
 the budget stays honest, but with the store on a segment's RAM is roughly its
 index plus its compressed sources, which means earlier flushes and more merges);

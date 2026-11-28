@@ -176,10 +176,11 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   {
     using Entry = std::pair<std::string_view, uint64_t>;
     std::span<const Entry> entries;
-    auto* patches = api::build::allocArray(entries, 3, resource);
+    auto* patches = api::build::allocArray(entries, 4, resource);
     patches[0] = {"written", counter(MetricCounter::PATCHES_WRITTEN)};
     patches[1] = {"unchanged", counter(MetricCounter::PATCHES_UNCHANGED)};
     patches[2] = {"failed", counter(MetricCounter::PATCHES_FAILED)};
+    patches[3] = {"source_only", counter(MetricCounter::PATCHES_SOURCE_ONLY)};
     dst.patches = {entries};
   }
   dst.document_errors = errorKinds(counts.documentErrors, resource);

@@ -140,6 +140,20 @@ TEST(SourcePatchTest, paths) {
   EXPECT_FALSE(source::invalidPatchPath("a.idx"));
 }
 
+TEST(SourcePatchTest, changedKeysCompareTheLastValueByBytes) {
+  auto changed = source::changedKeys(R"({"id":"a","n":1,"d":1,"d":2,"x":1.0,"gone":3})",
+                                     R"({"id":"a","d":5,"d":2,"x":1,"n":1,"new":[1]})");
+  ASSERT_EQ(3u, changed.size());
+  EXPECT_EQ("gone", changed[0].key);
+  EXPECT_FALSE(changed[0].value);
+  EXPECT_EQ("new", changed[1].key);
+  EXPECT_EQ("[1]", changed[1].value);
+  EXPECT_EQ("x", changed[2].key);  // equal numbers, different bytes
+  EXPECT_EQ(2u, source::valueShape("[1, 2]").values);
+  EXPECT_TRUE(source::valueShape("[1,[2]]").nestedArray);
+  EXPECT_EQ(1u, source::valueShape(R"({"a":[1]})").values);
+}
+
 TEST(SourcePatchTest, compareJson) {
   EXPECT_EQ(0, source::compareJson("1", "1.0"));
   EXPECT_EQ(-1, source::compareJson("\"a\"", "\"b\""));
