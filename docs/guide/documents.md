@@ -181,7 +181,8 @@ but it cannot be overwritten or deleted by ID and has no useful external
 identity.
 
 `_version_` is the update version of the request that indexed the document,
-including `allow_dups` and documents without an ID. It is assigned by the engine
+including `allow_dups` and documents without an ID, or of the patch that last
+changed only its [source-only fields](indexing.md#source-only-fields). It is assigned by the engine
 and is retrieval-only: name it explicitly in the returned fields (`fl`) to read
 it. Sorting, filtering, faceting, functions, collapse and value statistics on
 `_version_` are not supported. Default and wildcard projections exclude it.

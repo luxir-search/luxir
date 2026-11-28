@@ -112,6 +112,52 @@ TEST(SourceMapRead, rejectsARunPastItsFilesRecords) {
   EXPECT_THROW(SourceMap::read(dir, "s02.1__S01", 4), std::runtime_error);
 }
 
+TEST(SourceMapRead, replaceSplitsRunsAndKeepsVersions) {
+  RAMDir dir;
+  SourceMap map;
+  uint32_t base = map.fileIndex({"v01.1", 5, 100});
+  map.addRun(0, 5, base, 0);
+  uint32_t patch = map.fileIndex({"v02.1", 2, 100});
+  map.replace(2, patch, 1, 9);
+  map.replace(4, patch, 0, 8);
+  map.replace(2, patch, 0, 10);  // again: the newest record and version win
+  ASSERT_EQ(4u, map.runs.size());
+  uint32_t file = 0, ordinal = 0;
+  ASSERT_TRUE(map.locate(1, file, ordinal));
+  EXPECT_EQ(base, file);
+  EXPECT_EQ(1u, ordinal);
+  ASSERT_TRUE(map.locate(3, file, ordinal));
+  EXPECT_EQ(3u, ordinal);
+  ASSERT_TRUE(map.locate(2, file, ordinal));
+  EXPECT_EQ(patch, file);
+  EXPECT_EQ(0u, ordinal);
+  map.write(dir, "s01.1__S02", nullptr, nullptr);
+  auto read = SourceMap::read(dir, "s01.1__S02", 5);
+  EXPECT_EQ(10u, read.version(2));
+  EXPECT_EQ(8u, read.version(4));
+  EXPECT_EQ(0u, read.version(3));
+  // Replacing every doc of the first file leaves it unreferenced.
+  for (int32_t doc : {0, 1, 3}) read.replace(doc, 1, 0, 11);
+  read.dropUnreferencedFiles();
+  ASSERT_EQ(1u, read.files.size());
+  EXPECT_EQ("v02.1", read.files[0].name);
+  EXPECT_THROW(SourceMap::read(dir, "s01.1__S02", 2), std::runtime_error);  // a version past maxDoc
+}
+
+TEST(SourceMapRead, replaceKeepsRunsOrderedAcrossGaps) {
+  SourceMap map;
+  uint32_t base = map.fileIndex({"v01.1", 6, 100});
+  map.addRun(0, 2, base, 0);
+  map.addRun(4, 2, base, 4);
+  uint32_t patch = map.fileIndex({"v02.1", 3, 100});
+  SourceReplacement replaced[] = {{1, patch, 0, 5}, {3, patch, 1, 5}, {7, patch, 2, 5}};
+  map.replace(replaced);
+  std::vector<int32_t> starts;
+  for (const auto& run : map.runs) starts.push_back(run.docStart);
+  EXPECT_EQ((std::vector<int32_t>{0, 1, 3, 4, 7}), starts);
+  EXPECT_EQ(1, map.runs[1].count);  // docs 1 and 3 hold consecutive ordinals but are not adjacent
+}
+
 TEST(SourceFiles, namesAreStrict) {
   EXPECT_EQ("v01.3", Postings::getSourceFileName(1, 3));
   EXPECT_EQ("s02.3__S01", Postings::getSourceMapFileName(Postings::segmentKey(2, 3), 1));

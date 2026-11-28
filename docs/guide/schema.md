@@ -608,6 +608,12 @@ back into stored fields as merges drop the sources, so stored fields stay
 retrievable. To keep neither the source nor stored values, turn `_source_` off
 and set `"stored": false` on the fields.
 
+A `string` field with `"index": "none"` and `"column": false` (and no stored
+copy) is a *source-only* field: it exists only in each document's source, is
+returned when a request names it, and a [patch](indexing.md#source-only-fields)
+that changes only such fields rewrites the source without reindexing the
+document.
+
 `mode=set` adds or
 replaces the entry like any other resource. `mode=replace_all` keeps the current
 `_source_` entry unless the replacement names it, because dropping it would make

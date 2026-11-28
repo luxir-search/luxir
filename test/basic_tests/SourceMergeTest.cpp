@@ -92,6 +92,23 @@ TEST(SourceMergeTest, referencesLiveFilesAndRelocatesMostlyDeletedOnes) {
   EXPECT_EQ("vout", result.written->name);
 }
 
+// A record a patch replaced: its run points into the patch file and its
+// version follows the doc through the merge; the replaced record is garbage.
+TEST(SourceMergeTest, carriesPatchedRecordsAndVersions) {
+  SourceFileRef file{"v1", 4, 4000}, patch{"v2", 1, 4000};
+  auto a = mapOf(file, 4);
+  a.replace(2, a.fileIndex(patch), 0, 77);
+  const SourceMap* inputs[] = {&a};
+  CountingRelocation relocation;
+  auto result = mergeSources(settings(0.5, 0), inputs, sequential({{-1, 0, 1, 2}}), relocation);
+  uint32_t at = 0, ordinal = 0;
+  ASSERT_TRUE(result.map.locate(1, at, ordinal));
+  EXPECT_EQ("v2", result.map.files[at].name);
+  EXPECT_EQ(0u, ordinal);
+  EXPECT_EQ((std::vector<std::pair<int32_t, uint64_t>>{{1, 77}}), result.map.versions);
+  EXPECT_EQ(0u, result.map.version(0));
+}
+
 TEST(SourceMergeTest, followsAReorderingDocMap) {
   SourceFileRef file{"v1", 4, 4000};
   auto a = mapOf(file, 4);

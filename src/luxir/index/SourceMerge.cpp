@@ -93,7 +93,13 @@ private:
           open = pieces.size() - 1;
         }
       }
+      // A patched record's version follows its doc.
+      for (const auto& [doc, version] : map->versions) {
+        int32_t mapped = mapping(doc);
+        if (mapped >= 0) result.map.versions.emplace_back(mapped, version);
+      }
     }
+    std::ranges::sort(result.map.versions);
   }
 
   // Estimated bytes of the file's records that are still live.

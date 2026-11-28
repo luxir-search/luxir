@@ -50,6 +50,8 @@ public:
   // JSON text of a value.
   std::string text(const Node& node) const;
   std::string serialize() const { return text(root); }
+  // The document's top-level object.
+  const Node& document() const { return root; }
 
   void set(std::string_view path, std::string_view json);
   void unset(std::string_view path);
@@ -85,6 +87,24 @@ std::string valJson(const api::Val& val);
 // Whether a patch path may be written: not empty, not "id" or under it, and
 // no segment a reserved "_name_" field. Nullopt when valid, else the reason.
 std::optional<std::string> invalidPatchPath(std::string_view path);
+
+// The top-level keys (decoded) whose value differs between the JSON objects
+// `before` and `after`, as indexing reads them: the last of duplicate keys,
+// compared byte for byte. With each, its value in `after` (nullopt when it
+// has none). Sorted by key.
+struct ChangedKey {
+  std::string key;
+  std::optional<std::string> value;
+};
+std::vector<ChangedKey> changedKeys(std::string_view before, std::string_view after);
+
+// The number of values a JSON value holds as a field value (an array's
+// elements, else 1), and whether an array holds an array.
+struct ValueShape {
+  size_t values = 1;
+  bool nestedArray = false;
+};
+ValueShape valueShape(std::string_view json);
 
 struct PatchOutcome {
   api::PatchResult::Status status = api::PatchResult::Status::UNKNOWN;

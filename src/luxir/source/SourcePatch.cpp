@@ -3,9 +3,12 @@
 
 #include "luxir/source/SourcePatch.h"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <fmt/format.h>
+
+#include <boost/unordered/unordered_flat_map.hpp>
 
 #include "luxir/source/SourceJson.h"
 
@@ -243,6 +246,41 @@ std::string valJson(const api::Val& val) {
   std::string out;
   if (!api::write_json(val, out)) throw PatchError("value cannot be written as JSON");
   return out;
+}
+
+std::vector<ChangedKey> changedKeys(std::string_view before, std::string_view after) {
+  PatchDoc a(before), b(after);
+  // Last value of each key, by its token: a key spelled with escapes differs
+  // from one without, which only costs a reindex.
+  auto lastValues = [](const PatchDoc& doc) {
+    boost::unordered_flat_map<std::string_view, std::string_view> out;
+    for (const auto& [key, value] : doc.document().members) out[key] = value.raw;
+    return out;
+  };
+  auto va = lastValues(a), vb = lastValues(b);
+  std::vector<ChangedKey> out;
+  for (const auto& [key, value] : va) {
+    auto it = vb.find(key);
+    if (it == vb.end()) out.push_back({decodeString(key), std::nullopt});
+    else if (it->second != value) out.push_back({decodeString(key), std::string(it->second)});
+  }
+  for (const auto& [key, value] : vb) {
+    if (!va.contains(key)) out.push_back({decodeString(key), std::string(value)});
+  }
+  std::ranges::sort(out, {}, &ChangedKey::key);
+  return out;
+}
+
+ValueShape valueShape(std::string_view json) {
+  json = trimJson(json);
+  if (json.empty() || json.front() != '[') return {};
+  ValueShape shape;
+  auto items = elements(json);
+  shape.values = items.size();
+  for (auto item : items) {
+    if (!item.empty() && item.front() == '[') shape.nestedArray = true;
+  }
+  return shape;
 }
 
 std::optional<std::string> invalidPatchPath(std::string_view path) {

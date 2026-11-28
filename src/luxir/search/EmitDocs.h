@@ -638,15 +638,23 @@ inline void loadVersionRuns(SearchRequest& req, IndexReader& reader, std::span<c
   };
   addFieldLoader(loaders, runs, [&req, &reader, segDocs, target](std::span<RowIndex> indices) {
     auto segment = segDocs[indices[0]].segment();
-    auto& core = reader.segments()[segment].segmentCore();
+    auto& seg = reader.segments()[segment];
+    auto& core = seg.segmentCore();
     VersionRuns::Cursor cursor(core.versionRuns());
+    // A doc whose record a patch replaced without reindexing it has the
+    // patch's version, which its source map records.
+    const SourceMap* patched = seg.segInfo.source_versions && seg.source() ? seg.source()->sourceMap() : nullptr;
+    auto version = [&](int32_t doc) {
+      uint64_t recorded = patched ? patched->version(doc) : 0;
+      return (int64_t)(recorded ? recorded : cursor.birth(doc));
+    };
     if (reader.path().empty()) {
-      for (auto index : indices) target[index] = (int64_t)cursor.birth(segDocs[index].docId());
+      for (auto index : indices) target[index] = version(segDocs[index].docId());
     } else {
       OwnershipMapper mapper(core, "", reader.path());
       MemPool pool;
       OwnershipMapper::Cursor owners(mapper, pool);
-      for (auto index : indices) target[index] = (int64_t)cursor.birth(owners.owner(segDocs[index].docId()).owner);
+      for (auto index : indices) target[index] = version(owners.owner(segDocs[index].docId()).owner);
     }
   });
 }
@@ -798,6 +806,16 @@ inline void loadSourceBackedValues(SourceReader* source, std::span<const StoredR
       });
     }
   }
+}
+
+// A source-only field (STRING-like with no index, column or stored copy) is
+// read from each doc's _source_ record, as a source-backed one is.
+inline void loadSourceOnlyValues(IndexReader& reader, StoredReq r, std::span<const segdoc> segDocs, SegmentRuns runs,
+                                 FieldLoaders* loaders, std::pmr::memory_resource& mr) {
+  addFieldLoader(loaders, runs, [&reader, r, segDocs, &mr](std::span<RowIndex> idxSpan) {
+    const StoredReq* reqs[] = {&r};
+    loadSourceBackedValues(reader.segments()[segDocs[idxSpan[0]].segment()].source(), reqs, idxSpan, segDocs, mr);
+  });
 }
 
 // Dispatch stored-fields retrieval for all fields that share one
@@ -1394,6 +1412,14 @@ void loadDocuments(SearchResponse& response, IndexReader& reader,
           recordStoredReq(fieldType.storedResource_);
         } else if (fieldType.hasColumn() && columnSize != 0) {
           loadStrCol(req, sourceReader, rf.infos, fieldType, sourceDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr, flags);
+        } else if (!fieldType.hasColumn() && !fieldType.indexed() && fieldType.type() != FieldType::ID &&
+                   sourceReader.path().empty() && columnSize != 0) {
+          std::span<std::string_view> starget;
+          std::span<luxir::api::ArrStr> mtarget;
+          uint8_t* present = allocStringColumn(outputColumn(), columnSize, fieldType.multiValued(), starget, mtarget,
+                                               pendingCols, mr);
+          loadSourceOnlyValues(sourceReader, {field, &fieldType, rf.infos, fieldType.multiValued(), starget, mtarget, present},
+                               sourceDocs, runs, pendingLoaders, mr);
         }
         break;
       }

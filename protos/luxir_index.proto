@@ -103,4 +103,8 @@ message SegmentInfo {
   // Generation of the segment's source map ("s<seg>.<epoch>__S<gen>"), 0 = no source
   // store for this segment. The map lists the source files holding its documents.
   uint64 source_gen = 30;
+
+  // The source map records versions of documents a patch replaced without
+  // reindexing them (their _version_), so retrieving _version_ reads the map.
+  bool source_versions = 31;
 }

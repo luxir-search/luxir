@@ -1,7 +1,10 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <future>
+#include <sys/resource.h>
 #include <map>
+#include <memory_resource>
 #include <string>
 #include <vector>
 
@@ -9,6 +12,7 @@
 #include "bench/luxir_bench.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/reader/Postings.h"
+#include "luxir/server/ProtoUpdateMessage.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
@@ -32,6 +36,13 @@ using namespace luxir::test;
 //                                 zstd     the default stored fields, no source
 //                                 source   _source_ on, text served from it
 //                                 copy     _source_ on, every text field also stored
+//   BM_SourcePatch/{reindex,source_only} - a request of 1000 patches to random
+//                               documents of a 200k-document collection, each
+//                               committed: an increment of an indexed field
+//                               (the document is reindexed) versus a set of a
+//                               source-only field (only its record is rewritten).
+//                               cpu_us_per_patch counts the whole process, so
+//                               the flushes and merges reindexing causes count.
 
 namespace {
 
@@ -144,6 +155,86 @@ void BM_StoredBytes(benchmark::State& state, StoredConfig config) {
   }
 }
 
+// An update request written as JSON, run to completion.
+struct JsonRequest {
+  std::pmr::monotonic_buffer_resource arena;
+  api::UpdateRequest request;
+  explicit JsonRequest(std::string_view json) {
+    std::string err;
+    if (!api::read_json(request, json, arena, &err)) throw std::runtime_error(err);
+  }
+};
+
+class WaitedUpdate final : public ProtoUpdateMessage {
+public:
+  std::promise<void> completed;
+  using ProtoUpdateMessage::ProtoUpdateMessage;
+  void done(IndexWriter&) override { completed.set_value(); }
+};
+
+void BM_SourcePatch(benchmark::State& state, bool sourceOnly) {
+  CollectionHelper helper;
+  helper.clear();
+  SchemaBuilder b;
+  b.storedResource(Postings::SOURCE_RESOURCE);
+  auto& note = b.field("note");
+  note.type = api::FieldDef::FieldClass::STRING;
+  note.index = api::FieldDef::IndexMode::NONE;
+  note.column = false;
+  b.set(helper.collection());
+  int64_t count = luxir::unit_tests ? LuxirTest::scaleTestWork(300) : 200'000;
+  int64_t batch = 5000;
+  for (int64_t offset = 0; offset < count; offset += batch) {
+    auto docs = makeDocs(std::min(batch, count - offset), offset);
+    for (auto& doc : docs) doc.push_back({"note", std::string("initial note")});
+    if (!helper.indexAll(docs, UpdateMessage::NO_COMMIT).success) {
+      state.SkipWithError("indexing failed");
+      return;
+    }
+  }
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  helper.submit(merge);
+  auto iw = helper.getIndexWriter();
+  auto sourceOnlyCount = [&] { return iw->metrics->counts().counters[(size_t)MetricCounter::PATCHES_SOURCE_ONLY]; };
+  uint64_t sourceOnlyBefore = sourceOnlyCount();
+  // CPU of the whole process, background flushes and merges included.
+  auto processCpuUs = [] {
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    return (double)(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1e6 + (double)(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec);
+  };
+  double cpuBefore = processCpuUs();
+  int64_t patches = luxir::unit_tests ? 20 : 1000;
+  uint64_t next = 1;
+  for (auto _ : state) {
+    state.PauseTiming();
+    std::string json = R"({"patches":[)";
+    for (int64_t i = 0; i < patches; i++) {
+      next = next * 6364136223846793005ull + 1442695040888963407ull;
+      if (i) json += ',';
+      json += R"({"id":")" + std::to_string((next >> 33) % (uint64_t)count) + R"(","ops":[)";
+      json += sourceOnly ? R"({"op":"set","path":"note","value":"note )" + std::to_string(next % 100000) + R"("})"
+                         : std::string(R"({"op":"increment","path":"n_i","value":1})");
+      json += "]}";
+    }
+    json += "]}";
+    JsonRequest parsed(json);
+    WaitedUpdate update(&parsed.request);
+    state.ResumeTiming();
+    if (!iw->submitUpdate(&update)) state.SkipWithError("submit failed");
+    update.completed.get_future().wait();
+    if (update.result.errored()) state.SkipWithError(std::string(update.result.what()));
+  }
+  state.SetItemsProcessed(state.iterations() * patches);
+  // The share of patches written without reindexing.
+  state.counters["cpu_us_per_patch"] = (processCpuUs() - cpuBefore) / (double)std::max<int64_t>(1, state.iterations() * patches);
+  state.counters["source_only"] = (double)(sourceOnlyCount() - sourceOnlyBefore) /
+                                  (double)std::max<int64_t>(1, state.iterations() * patches);
+  state.counters["patches_per_s"] = benchmark::Counter((double)state.iterations() * (double)patches,
+                                                       benchmark::Counter::kIsRate);
+}
+
 }  // namespace
 
 LUXIR_BENCHMARK_CAPTURE(BM_StoredBytes, none, StoredConfig::NONE)->Iterations(1);
@@ -155,3 +246,5 @@ LUXIR_BENCHMARK_CAPTURE(BM_SourceIngest, off, false);
 LUXIR_BENCHMARK_CAPTURE(BM_SourceIngest, on, true);
 LUXIR_BENCHMARK_CAPTURE(BM_SourceFetch, stored, false);
 LUXIR_BENCHMARK_CAPTURE(BM_SourceFetch, source, true);
+LUXIR_BENCHMARK_CAPTURE(BM_SourcePatch, reindex, false);
+LUXIR_BENCHMARK_CAPTURE(BM_SourcePatch, source_only, true);

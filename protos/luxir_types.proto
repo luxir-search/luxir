@@ -1865,6 +1865,8 @@ message ServiceStats {
   // Patches (UpdateRequest.patches) by outcome: "written" (updated, created
   // or deleted the document), "unchanged" (noop, skipped, not_found,
   // conflict or superseded) and "failed" (error, or the request failed).
+  // "source_only" counts the written patches that changed only source-only
+  // fields, so their document's record was replaced without reindexing it.
   map<string, uint64> patches = 64;
   // Documents rejected with an error of their own, keyed by error kind. The
   // rest of documents_rejected were rolled back with a failed batch.

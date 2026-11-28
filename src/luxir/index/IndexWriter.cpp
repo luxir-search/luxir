@@ -22,6 +22,7 @@
 
 #include "luxir/index/AuxInfo.h"
 #include <memory_resource>
+#include <numeric>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include "luxir/util/Signal.h"
@@ -29,6 +30,7 @@
 #include "luxir/util/thread.h"
 #include "SegmentMerger.h"
 #include "SourceMerge.h"
+#include "SourceWriter.h"
 #include "luxir/reader/SourceReader.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/TermsEnum.h"
@@ -52,6 +54,19 @@ static std::vector<FileDescriptor> sharedFilesOf(uint64_t segId, uint64_t creato
   return out;
 }
 
+
+std::vector<FileDescriptor> SegInfo::segmentFiles() const {
+  if (!patchedSourceMap && patchedSourceFiles.empty()) return baseFiles;
+  std::string mapPrefix = std::string(Postings::PREFIX_FNAME) + Postings::segmentKey(segId, creatorEpoch) + "__S";
+  std::vector<FileDescriptor> out;
+  out.reserve(baseFiles.size() + patchedSourceFiles.size() + 1);
+  for (const auto& file : baseFiles) {
+    if (!patchedSourceMap || !file.name.starts_with(mapPrefix)) out.push_back(file);
+  }
+  if (patchedSourceMap) out.push_back(*patchedSourceMap);
+  out.insert(out.end(), patchedSourceFiles.begin(), patchedSourceFiles.end());
+  return out;
+}
 
 namespace {
 
@@ -227,6 +242,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       seg.liveGen = seg.publishedLiveGen = seg.initialLiveGen = segment.live_gen;
       seg.liveEpoch = seg.initialLiveEpoch = segment.live_epoch;
       seg.sourceGen = segment.source_gen;
+      seg.sourceVersions = segment.source_versions;
       seg.minVersion = segment.min_version;
       seg.maxVersion = segment.max_version;
       seg.liveDocs = segment.live_docs;
@@ -617,6 +633,280 @@ bool IndexWriter::submitPatchApply(UpdateMessage& msg) {
   return true;
 }
 
+namespace {
+
+// Whether indexing `value` (JSON; nullopt when the key is gone) under document
+// key `key` writes nothing a segment keeps: a STRING-like field with no index,
+// column, stored copy or variant, which ingest validates only for its shape.
+// Such a field lives only in the source.
+bool sourceOnlyField(const Schema& schema, std::string_view key, const std::optional<std::string>& value) {
+  // A dotted key can name a field under a nested path, which a root document
+  // may not hold: ingest decides.
+  if (key.find('.') != std::string_view::npos) return false;
+  std::optional<ResolvedFieldHandle> resolved;
+  try {
+    resolved = schema.resolveInput(key);
+  } catch (const std::exception&) {
+    return false;
+  }
+  const auto& type = resolved->owner ? resolved->owner->primary : schema.getFieldTypeEx(resolved->physicalName);
+  if (!type || FieldType::storage(type->type()) != FieldType::Storage::TERMS || type->type() == FieldType::ID) {
+    return false;
+  }
+  if (type->indexed() || type->hasColumn() || type->isStored()) return false;
+  if (resolved->owner && (!resolved->owner->variants.empty() || resolved->owner->shape != LogicalField::Shape::SCALAR)) {
+    return false;
+  }
+  if (!value) return true;
+  // The checks ingest makes of a scalar field (Inverter::InputHandler::checkShape);
+  // a value failing them is left to reindexing, which reports the error.
+  bool multi = resolved->owner ? resolved->owner->multi : type->multiValued();
+  auto shape = source::valueShape(*value);
+  return !shape.nestedArray && (multi || shape.values <= 1);
+}
+
+// Whether `before` and `after` differ only in source-only fields.
+bool sourceOnlyChange(const Schema& schema, std::string_view before, std::string_view after) {
+  if (!schema.source.enabled) return false;
+  std::vector<source::ChangedKey> changed;
+  try {
+    changed = source::changedKeys(before, after);
+  } catch (const std::exception&) {
+    return false;
+  }
+  if (changed.empty()) return false;
+  for (const auto& [key, value] : changed) {
+    if (!sourceOnlyField(schema, key, value)) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+void IndexWriter::writeSourcePatches(UpdateMessage& msg, const Schema& schema, std::vector<SourceOnlyPatch>& patches) {
+  std::ranges::sort(patches, [](const SourceOnlyPatch& a, const SourceOnlyPatch& b) {
+    return std::pair(a.seg->segId, a.doc) < std::pair(b.seg->segId, b.doc);
+  });
+  // A merge reading a segment would not carry a new map into its output, and
+  // a merged segment is on its way out: their patches are reindexed instead.
+  auto merging = [](const SegInfo* seg) { return seg->merging || seg->mergedIntoSegId != 0; };
+  std::vector<bool> reindex(patches.size(), false);
+  {
+    const std::lock_guard lock(indexMutex);
+    for (size_t i = 0; i < patches.size(); i++) reindex[i] = merging(patches[i].seg);
+  }
+
+  struct Staged {
+    SegInfo* seg;
+    uint64_t gen;
+    FileDescriptor map;
+    std::vector<std::string> files;  // the source files the map names
+  };
+  std::vector<Staged> staged;
+  std::optional<FileDescriptor> file;
+  std::vector<std::string> created;
+  // Files of a failed write, maps a merge overtook, and replaced maps.
+  std::vector<std::string> obsolete;
+  try {
+    std::vector<size_t> order;
+    for (size_t i = 0; i < patches.size(); i++) {
+      if (!reindex[i]) order.push_back(i);
+    }
+    if (!order.empty()) {
+      // No dictionary: a file carries the one it uses, which would outweigh a
+      // few patched records. A merge relocates them into a file that has it.
+      SourceWriter writer(schema.source, "patch");
+      std::string name = Postings::getSourceFileName(nextSourceSeq.fetch_add(1), writerEpoch);
+      // The records' count and size are known once all are added; the maps
+      // name the file by placeholder until then.
+      SourceFileRef ref{name, 0, 0};
+      size_t maxFiles = std::max<uint32_t>(schema.source.maxFiles, 1);
+      uint32_t records = 0;
+      struct Group {
+        SegInfo* seg;
+        SourceMap map;
+      };
+      std::vector<Group> groups;
+      for (size_t k = 0; k < order.size();) {
+        SegInfo* seg = patches[order[k]].seg;
+        size_t end = k;
+        while (end < order.size() && patches[order[end]].seg == seg) end++;
+        auto mapName = Postings::getSourceMapFileName(Postings::segmentKey(seg->segId, seg->creatorEpoch), seg->sourceGen);
+        try {
+          auto map = SourceMap::read(dir, mapName, seg->maxDoc);
+          uint32_t fileIndex = map.fileIndex(ref);
+          std::vector<SourceReplacement> replaced;
+          replaced.reserve(end - k);
+          for (size_t j = k; j < end; j++) replaced.push_back({patches[order[j]].doc, fileIndex, records + (uint32_t)(j - k), msg.updateVersion});
+          map.replace(replaced);
+          map.dropUnreferencedFiles();
+          // Each commit that patches a segment adds a file to its map. Past
+          // twice the files a merge leaves a segment, the records of the files
+          // it uses least move into this commit's file too (a fold), down to
+          // max_files, keeping their versions.
+          std::vector<SourceReplacement> folded;
+          std::vector<source::Record> foldedRecords;
+          std::vector<std::string> foldedBytes;
+          if (map.files.size() > 2 * maxFiles) {
+            fileIndex = map.fileIndex(ref);
+            std::vector<int64_t> uses(map.files.size(), 0);
+            for (const auto& run : map.runs) uses[run.file] += run.count;
+            std::vector<uint32_t> byUse;
+            for (uint32_t f = 0; f < map.files.size(); f++) {
+              if (f != fileIndex) byUse.push_back(f);
+            }
+            std::ranges::sort(byUse, {}, [&](uint32_t f) { return uses[f]; });
+            std::vector<bool> fold(map.files.size(), false);
+            for (size_t n = 0; n + maxFiles < map.files.size(); n++) fold[byUse[n]] = true;
+            // Fetched in file order, so each block is decompressed once.
+            struct At {
+              uint32_t file, ordinal;
+              int32_t doc;
+            };
+            std::vector<At> at;
+            for (const auto& run : map.runs) {
+              if (!fold[run.file]) continue;
+              for (int32_t doc = run.docStart; doc < run.docStart + run.count; doc++) {
+                at.push_back({run.file, run.ordinal + (uint32_t)(doc - run.docStart), doc});
+              }
+            }
+            std::ranges::sort(at, [](const At& a, const At& b) { return std::pair(a.file, a.ordinal) < std::pair(b.file, b.ordinal); });
+            SourceReader reader(dir, mapName, seg->maxDoc, seg->segmentFiles());
+            SourceReader::Cursor cursor;
+            foldedBytes.reserve(at.size() * 2);
+            for (const auto& where : at) {
+              source::Record record;
+              if (reader.fetch(where.doc, cursor, record) != SourceReader::Status::OK) {
+                throw std::runtime_error("source record " + std::to_string(where.doc) + " cannot be read to fold it");
+              }
+              foldedBytes.emplace_back(record.id);
+              foldedBytes.emplace_back(record.body);
+              foldedRecords.push_back({{}, {}, record.version, record.flags});
+              folded.push_back({where.doc, fileIndex, 0, 0});  // 0: the doc keeps its recorded version
+            }
+          }
+          // Nothing failed: the records join the file.
+          for (size_t j = k; j < end; j++) {
+            auto& patch = patches[order[j]];
+            writer.add(patch.recordId, patch.patched.body, msg.updateVersion, source::kFlagMinifiedJson);
+          }
+          records += (uint32_t)(end - k);
+          // Added in doc order, so neighbouring docs join one run and a fold
+          // also compacts the map.
+          std::vector<size_t> byDoc(folded.size());
+          std::iota(byDoc.begin(), byDoc.end(), 0);
+          std::ranges::sort(byDoc, {}, [&](size_t f) { return folded[f].doc; });
+          for (size_t f : byDoc) {
+            writer.add(foldedBytes[2 * f], foldedBytes[2 * f + 1], foldedRecords[f].version, foldedRecords[f].flags);
+            folded[f].ordinal = records++;
+          }
+          if (!folded.empty()) {
+            std::ranges::sort(folded, {}, &SourceReplacement::doc);
+            map.replace(folded);
+            map.dropUnreferencedFiles();
+          }
+          groups.push_back({seg, std::move(map)});
+        } catch (const std::exception& e) {
+          LOG_WARN("Source-only patches of segment {} are reindexed instead: {}", seg->name(), e.what());
+          for (size_t j = k; j < end; j++) reindex[order[j]] = true;
+        }
+        k = end;
+      }
+      if (!groups.empty()) {
+        FileDescriptor descriptor;
+        created.push_back(name);
+        writer.flush(dir, name, descriptor);
+        file = descriptor;
+        for (auto& group : groups) {
+          auto named = std::ranges::find(group.map.files, name, &SourceFileRef::name);
+          named->docs = records;
+          named->bytes = descriptor.size;
+          uint64_t gen = group.seg->sourceGen + 1;
+          std::string mapName =
+              Postings::getSourceMapFileName(Postings::segmentKey(group.seg->segId, group.seg->creatorEpoch), gen);
+          std::vector<FileDescriptor> descriptors;
+          created.push_back(mapName);
+          group.map.write(dir, mapName, nullptr, &descriptors);
+          std::vector<std::string> files;
+          for (const auto& listed : group.map.files) files.push_back(listed.name);
+          staged.push_back({group.seg, gen, descriptors.front(), std::move(files)});
+        }
+      }
+    }
+  } catch (const std::exception& e) {
+    LOG_WARN("Source-only patches of {} documents are reindexed instead: {}", patches.size(), e.what());
+    staged.clear();
+    file.reset();
+    obsolete = created;
+    std::ranges::fill(reindex, true);
+  }
+
+  size_t installed = 0;
+  {
+    const std::lock_guard lock(indexMutex);
+    for (auto& stage : staged) {
+      SegInfo* seg = stage.seg;
+      if (merging(seg)) {
+        obsolete.push_back(stage.map.name);
+        for (size_t i = 0; i < patches.size(); i++) {
+          if (patches[i].seg == seg) reindex[i] = true;
+        }
+        continue;
+      }
+      // The replaced map and dropped patch files go once no snapshot lists
+      // them; one never published needs no sync.
+      if (seg->patchedSourceMap) {
+        std::erase(seg->unsyncedFiles, seg->patchedSourceMap->name);
+        seg->obsoleteSourceFiles.push_back(seg->patchedSourceMap->name);
+      }
+      seg->patchedSourceMap = stage.map;
+      seg->sourceGen = stage.gen;
+      seg->sourceVersions = true;
+      // An earlier patch file whose records were all replaced again is not
+      // listed any more; a published one is retired by the next commit.
+      std::vector<std::string> dropped;
+      for (const auto& patched : seg->patchedSourceFiles) {
+        if (!std::ranges::contains(stage.files, patched.name)) dropped.push_back(patched.name);
+      }
+      auto isDropped = [&](const FileDescriptor& listed) { return std::ranges::contains(dropped, listed.name); };
+      std::erase_if(seg->sharedFiles, isDropped);
+      std::erase_if(seg->patchedSourceFiles, isDropped);
+      for (const auto& name : dropped) std::erase(seg->unsyncedFiles, name);
+      seg->obsoleteSourceFiles.insert(seg->obsoleteSourceFiles.end(), dropped.begin(), dropped.end());
+      seg->patchedSourceFiles.push_back(*file);
+      seg->sharedFiles.push_back(*file);
+      seg->unsyncedFiles.push_back(stage.map.name);
+      seg->unsyncedFiles.push_back(file->name);
+      installed++;
+    }
+  }
+  if (file && installed == 0) obsolete.push_back(file->name);
+  for (const auto& name : obsolete) {
+    try {
+      dir.deleteFile(name);
+    } catch (const std::exception& e) {
+      LOG_WARN("Failed to delete unused source patch file {}: {}", name, e.what());
+    } catch (...) {
+      LOG_WARN("Failed to delete unused source patch file {}", name);
+    }
+  }
+
+  size_t written = 0;
+  for (size_t i = 0; i < patches.size(); i++) {
+    auto& patch = patches[i];
+    if (!reindex[i]) {
+      written += patch.patched.patchIndexes.size();
+      continue;
+    }
+    {
+      const std::lock_guard lock(indexMutex);
+      unpublishedPatches[patch.patched.id] = {&msg, msg.updateVersion, patch.patched.body};
+    }
+    msg.patchedDocs.push_back(std::move(patch.patched));
+  }
+  metrics->add(MetricCounter::PATCHES_SOURCE_ONLY, written);
+}
+
 // Each patched id's base is its newest live document born before msg's
 // version, among the segments this commit applied every earlier update to.
 // A live document born after it means a newer write of the id already
@@ -641,6 +931,19 @@ void IndexWriter::resolvePatches(UpdateMessage& msg, DeleteApplication& app) {
     SourceReader::Cursor cursor;
   };
   boost::unordered_flat_map<SegInfo*, std::unique_ptr<Source>> sources;
+  auto sourceOf = [&](SegInfo* seg) -> Source& {
+    auto& slot = sources[seg];
+    if (!slot) {
+      if (seg->sourceGen == 0) throw std::runtime_error("the document has no stored source");
+      slot = std::make_unique<Source>();
+      slot->reader = std::make_shared<SourceReader>(
+          dir, Postings::getSourceMapFileName(Postings::segmentKey(seg->segId, seg->creatorEpoch), seg->sourceGen),
+          seg->maxDoc, seg->segmentFiles());
+    }
+    return *slot;
+  };
+  auto schema = getSchema();
+  std::vector<SourceOnlyPatch> sourceOnly;
   // Live docs as this commit left them, read once per segment.
   boost::unordered_flat_map<SegInfo*, std::shared_ptr<LiveDocs>> liveDocs;
   auto liveOf = [&](SegInfo* seg) -> const LiveDocs* {
@@ -680,6 +983,8 @@ void IndexWriter::resolvePatches(UpdateMessage& msg, DeleteApplication& app) {
     uint64_t baseVersion = 0;
     bool superseded = false;
     std::optional<std::string> base;
+    std::string recordId;
+    bool fromUnpublished = false;
     std::string failure;
     try {
       for (SegInfo* seg : app.segs) {
@@ -705,10 +1010,16 @@ void IndexWriter::resolvePatches(UpdateMessage& msg, DeleteApplication& app) {
           }
         }
       }
+      // A record a source-only patch replaced carries that patch's version.
+      if (baseSeg && !superseded && baseSeg->sourceVersions) {
+        const SourceMap* map = sourceOf(baseSeg).reader->sourceMap();
+        if (!map) throw std::runtime_error("the document's source is unreadable");
+        if (uint64_t patched = map->version(baseDoc)) baseVersion = patched;
+      }
       // An earlier message's patched state of the id, resolved but not yet
       // indexed, is newer than any segment document it replaces, unless a
       // write after it ended it.
-      bool fromUnpublished = false;
+      fromUnpublished = false;
       if (!superseded) {
         const std::lock_guard lock(indexMutex);
         if (auto it = unpublishedPatches.find(std::string(id)); it != unpublishedPatches.end()) {
@@ -724,16 +1035,7 @@ void IndexWriter::resolvePatches(UpdateMessage& msg, DeleteApplication& app) {
         }
       }
       if (baseSeg && !superseded && !fromUnpublished) {
-        auto& slot = sources[baseSeg];
-        if (!slot) slot = std::make_unique<Source>();
-        auto& source = *slot;
-        if (!source.reader) {
-          if (baseSeg->sourceGen == 0) throw std::runtime_error("the document has no stored source");
-          source.reader = std::make_shared<SourceReader>(
-              dir, Postings::getSourceMapFileName(Postings::segmentKey(baseSeg->segId, baseSeg->creatorEpoch),
-                                                  baseSeg->sourceGen),
-              baseSeg->maxDoc, baseSeg->baseFiles);
-        }
+        auto& source = sourceOf(baseSeg);
         source::Record record;
         auto status = source.reader->fetch(baseDoc, source.cursor, record);
         if (status == SourceReader::Status::UNREADABLE) throw std::runtime_error("the document's source is unreadable");
@@ -751,6 +1053,7 @@ void IndexWriter::resolvePatches(UpdateMessage& msg, DeleteApplication& app) {
           throw std::runtime_error("the document has no stored source");
         }
         base = std::move(json);
+        recordId = std::string(record.id);
       }
     } catch (const std::exception& e) {
       failure = e.what();
@@ -799,12 +1102,19 @@ void IndexWriter::resolvePatches(UpdateMessage& msg, DeleteApplication& app) {
     patched.id = std::string(id);
     patched.deleted = !current;
     if (current) patched.body = std::move(*current);
+    // A change to source-only fields of a segment document replaces its
+    // record and leaves the index as it is.
+    if (baseSeg && !fromUnpublished && base && current && sourceOnlyChange(*schema, *base, patched.body)) {
+      sourceOnly.push_back({baseSeg, baseDoc, std::move(recordId), std::move(patched)});
+      continue;
+    }
     {
       const std::lock_guard lock(indexMutex);
       unpublishedPatches[patched.id] = {&msg, version, current ? std::optional<std::string>(patched.body) : std::nullopt};
     }
     msg.patchedDocs.push_back(std::move(patched));
   }
+  if (!sourceOnly.empty()) writeSourcePatches(msg, *schema, sourceOnly);
 }
 
 // Caller must hold indexMutex.
@@ -2300,6 +2610,15 @@ void IndexWriter::collectObsoleteLiveDocsLocked(SegInfo& seg, std::vector<std::s
   });
 }
 
+void IndexWriter::collectObsoleteSourceFilesLocked(SegInfo& seg, const boost::unordered_flat_set<std::string_view>& listed,
+                                                   std::vector<std::string>& names) {
+  std::erase_if(seg.obsoleteSourceFiles, [&](const std::string& name) {
+    if (listed.contains(name)) return false;
+    names.push_back(name);
+    return true;
+  });
+}
+
 // Attempts to actually remove the files for segments in the deletion list.
 // Segments that are being merged will not be deleted.
 // Segments that are in the last commit will not be deleted.
@@ -2318,6 +2637,17 @@ void IndexWriter::tryDeleteSegments() {
       unreferencedSharedFiles = unreferencedSharedFilesLocked(localDeleteList);
       for (auto& [id, seg] : segInfos) collectObsoleteLiveDocsLocked(*seg, liveDocsToDelete);
       for (auto& seg : segmentsToDelete) collectObsoleteLiveDocsLocked(*seg, liveDocsToDelete);
+      boost::unordered_flat_set<std::string_view> listed;
+      for (const auto& [id, seg] : segInfos) for (const auto& file : seg->sharedFiles) listed.insert(file.name);
+      for (const auto& seg : segmentsToDelete) for (const auto& file : seg->sharedFiles) listed.insert(file.name);
+      auto published = lastSnapshot.load();
+      if (published) for (const auto& file : published->files) listed.insert(file.name);
+      for (auto& [id, seg] : segInfos) collectObsoleteSourceFilesLocked(*seg, listed, liveDocsToDelete);
+      for (auto& seg : segmentsToDelete) collectObsoleteSourceFilesLocked(*seg, listed, liveDocsToDelete);
+      for (auto& seg : localDeleteList) if (seg) collectObsoleteSourceFilesLocked(*seg, listed, liveDocsToDelete);
+      // Segments sharing a patch file each list it as obsolete.
+      std::ranges::sort(liveDocsToDelete);
+      liveDocsToDelete.erase(std::unique(liveDocsToDelete.begin(), liveDocsToDelete.end()), liveDocsToDelete.end());
     }
 
     // No publication or index lock is held during filesystem cleanup.
@@ -2385,6 +2715,7 @@ void IndexWriter::retireSegments(std::vector<std::unique_ptr<SegInfo>>& segments
       }
     }
     if (seg->liveFile) names.push_back(seg->liveFile->name);
+    if (seg->patchedSourceMap) names.push_back(seg->patchedSourceMap->name);
     for (const auto& overlay : seg->auxOverlays) for (const auto& file : overlay.files) names.push_back(file.name);
     for (auto gen : seg->obsoleteLiveGens) names.push_back(Postings::getLiveDocsFileName(
         Postings::segmentKey(seg->segId, seg->creatorEpoch), gen, seg->liveEpochFor(gen, writerEpoch)));
@@ -3006,6 +3337,8 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
   info.update_version = commitInfo.highestUpdateVersion;
   info.core_gen = commitInfo.coreGen;
   auto* segments = api::build::allocArray(info.segments, segs.size(), arena);
+  // The wire views each segment's file names until publish() encodes them.
+  std::vector<std::vector<FileDescriptor>> segmentFiles(segs.size());
   // publish() owns the publication timestamp. New physical objects use the
   // same timestamp, patched there before encoding.
   for (size_t i = 0; i < segs.size(); i++) {
@@ -3024,8 +3357,10 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
     wire.live_docs = seg.liveDocs;
     wire.schema = seg.schema.wire();
     wire.next_overlay_gen = seg.nextOverlayGen;
-    auto* files = api::build::allocArray(wire.files, seg.baseFiles.size() + seg.liveFile.has_value(), arena);
-    for (const auto& file : seg.baseFiles) *files++ = {file.name, file.size, file.xxh3};
+    wire.source_versions = seg.sourceVersions;
+    segmentFiles[i] = seg.segmentFiles();
+    auto* files = api::build::allocArray(wire.files, segmentFiles[i].size() + seg.liveFile.has_value(), arena);
+    for (const auto& file : segmentFiles[i]) *files++ = {file.name, file.size, file.xxh3};
     if (const auto& live = seg.liveFile) *files = {live->name, live->size, live->xxh3};
     wire.catalog = catalogRangeToManifest(seg.catalog);
     auto* overlays = api::build::allocArray(wire.overlays, seg.auxOverlays.size(), arena);
@@ -3256,6 +3591,7 @@ void IndexWriter::mergeSourceFiles(const std::vector<SegInfo*>& segs,
     }
   }
   out.sharedFiles = sharedFilesOf(out.segId, out.creatorEpoch, out.baseFiles);
+  out.sourceVersions = !merged.map.versions.empty();
 }
 
 bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
@@ -3573,7 +3909,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           sources[i] = std::make_shared<SourceReader>(
               dir, Postings::getSourceMapFileName(Postings::segmentKey(segs[i]->segId, segs[i]->creatorEpoch),
                                                   segs[i]->sourceGen),
-              segs[i]->maxDoc, segs[i]->baseFiles);
+              segs[i]->maxDoc, segs[i]->segmentFiles());
           if (!sources[i]->mapLoaded()) throw std::runtime_error("source map " + sources[i]->name() + " is unreadable");
           any = true;
         }

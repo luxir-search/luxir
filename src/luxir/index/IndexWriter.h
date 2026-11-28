@@ -114,8 +114,23 @@ public:
     // when no segment of the next snapshot lists it (the commit's set
     // difference), and one a never-committed segment held is retired when that
     // segment dies without passing it on (unreferencedSharedFilesLocked). Set
-    // once, when the segment is flushed, loaded or merged, and never changed after.
+    // when the segment is flushed, loaded or merged; after that only a
+    // source-only patch adds to it (patchedSourceFiles), under indexMutex.
     std::vector<FileDescriptor> sharedFiles;
+
+    // What source-only patches (IndexWriter::writeSourcePatches) changed after
+    // the segment was registered, which baseFiles, being immutable, does not
+    // show: the map that replaces the one in baseFiles and the source files
+    // holding the patched records. Written by the commit thread under
+    // indexMutex, never for a segment a merge is reading; listed in the
+    // manifest with baseFiles (segmentFiles()), where a reopen finds them.
+    std::optional<FileDescriptor> patchedSourceMap;
+    std::vector<FileDescriptor> patchedSourceFiles;
+    bool sourceVersions = false;  // the source map records patched versions (SourceMap::versions)
+    // Maps a later patch replaced and patch files no map names any more,
+    // retired once no snapshot or segment lists them
+    // (collectObsoleteSourceFilesLocked). indexMutex.
+    std::vector<std::string> obsoleteSourceFiles;
 
     // Segment-local aux overlays recorded in SegmentInfo.overlays.  Vector
     // ANN entries are carried by segment liveness; coreGen does not
@@ -134,6 +149,10 @@ public:
       if (mergeRows == maxDoc) return liveDocs;
       return (int64_t)mergeRows * liveDocs / maxDoc;
     }
+
+    // The segment's files as the manifest lists them, the live docs file
+    // excepted: baseFiles with the patched source map and files.
+    std::vector<FileDescriptor> segmentFiles() const;
 
     // Friendly name for logs that matches the segment filenames.
     std::string name() const {
@@ -769,6 +788,23 @@ private:
   // Resolves msg's patches against the application's segments (after its
   // deletes): fills msg.patchOutcomes and msg.patchedDocs.
   void resolvePatches(UpdateMessage& msg, DeleteApplication& app);
+  // Moves seg's obsolete source files that neither the published snapshot nor
+  // any segment lists into `names`. Call with indexMutex held.
+  void collectObsoleteSourceFilesLocked(SegInfo& seg, const boost::unordered_flat_set<std::string_view>& listed,
+                                        std::vector<std::string>& names);
+  // A patched document that changed only source-only fields: its new record
+  // replaces the old one in the segment's source map, without reindexing.
+  struct SourceOnlyPatch {
+    SegInfo* seg = nullptr;
+    int32_t doc = -1;
+    std::string recordId;  // the base record's id
+    UpdateMessage::PatchedDoc patched;
+  };
+  // Writes the records of `patches` to one new source file and gives each
+  // segment holding one a new map generation, published by msg's commit.
+  // A patch it cannot write that way (its segment is being merged, or a write
+  // failed) joins msg.patchedDocs to be reindexed instead.
+  void writeSourcePatches(UpdateMessage& msg, const Schema& schema, std::vector<SourceOnlyPatch>& patches);
   // Submits the follow-up message for msg.patchedDocs. False when it could not.
   bool submitPatchApply(UpdateMessage& msg);
 
